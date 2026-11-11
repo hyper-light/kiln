@@ -1,0 +1,45 @@
+
+running 40 tests
+test agent::tests::state_delivery_survives_a_queue_larger_than_a_frame ... ok
+test harness::admission::tests::a_different_session_wakes_on_pool_release_but_not_unchanged_resize ... ok
+test harness::admission::tests::every_stage_retains_the_same_credit_and_repeats_acquire_none ... ok
+test harness::admission::tests::only_a_real_busy_cycle_and_correlated_refill_learn_depth ... ok
+test harness::admission::tests::peers_divide_bootstrap_roles_and_lifecycle_invalidates_samples ... ok
+test harness::admission::tests::physical_authority_is_aggregate_and_has_no_oversize_exception ... ok
+test harness::admission::tests::restoration_and_unavailable_input_never_advertise_a_bootstrap_grant ... ok
+test harness::codex::tests::w20_r01_only_exact_emitted_skill_echo_projects_the_original_user_message ... ok
+test harness::mail::tests::bodyless_receipt_requires_complete_identity_and_keeps_exact_current_custody ... ok
+test harness::mail::tests::cancellation_is_retained_without_claiming_consumption ... ok
+test harness::mail::tests::consumption_before_admission_ack_never_regresses ... ok
+test harness::mail::tests::freeze_holds_one_latest_successor_until_consumed ... ok
+test harness::mail::tests::fresh_retry_proof_does_not_replace_first_accepted_original ... ok
+test harness::mail::tests::history_and_pending_pages_fit_exact_encoded_budget ... ok
+test harness::mail::tests::immutable_retry_and_capacity_refusal_preserve_custody ... ok
+test harness::mail::tests::large_history_has_scoped_utf8_body_ranges ... ok
+test harness::mail::tests::logical_authority_includes_server_custody_and_refusal_does_not_supersede ... ok
+test harness::mail::tests::ordinary_messages_and_distinct_stream_scopes_do_not_coalesce ... ok
+test harness::mail::tests::original_status_revisions_survive_pending_coalescing ... ok
+test harness::mail::tests::retries_require_new_source_events_and_replay_preserves_uncertain_token ... ok
+test harness::mail::tests::source_projection_binds_original_sender_id_attempt_and_waiting_disposition ... ok
+test harness::mail::tests::stale_attempt_and_epoch_cannot_release_newer_work ... ok
+test harness::mail::tests::transfer_fences_old_attempt_and_requeues_same_original_at_destination ... ok
+test harness::mail::tests::transferred_projection_still_binds_old_token_after_destination_claim ... ok
+test harness::queued::tests::durable_sender_custody_never_expires_from_receiver_absence ... ok
+test harness::registry::tests::an_owner_open_updates_lifecycle_for_current_and_later_viewers ... ok
+test memory::room::tests::source_input_pools_share_authority_instead_of_multiplying_it ... ok
+test skills::bridge::tests::catalogue_changes_refresh_once_without_adding_prompts_and_literal_tags_stay_human ... ok
+test skills::bridge::tests::empty_existing_skill_folder_does_not_prepend_internal_guidance ... ok
+test skills::bridge::tests::provider_context_readiness_readvertises_once_and_explicit_manual_invocations_remain_available ... ok
+test skills::bridge::tests::w20_r01_discovery_is_progressive_and_control_traffic_is_unchanged ... ok
+test skills::bridge::tests::w20_r01_every_harness_receives_scoped_skills_and_assets ... ok
+test store::storage::tests::storage_scratch_accounts_for_database_pages_and_wal ... ok
+test wire::contract::docs_say_what_the_tables_say ... ok
+test wire::ts::a_field_added_in_rust_without_its_binding_names_the_file ... ok
+test wire::ts::bindings_are_current ... ok
+test wire::ts::every_update_goes_down_as_a_session_frame ... ok
+test wire::ts::hand_written_finds_definitions_not_re_exports ... ok
+test wire::ts::no_generated_type_is_written_by_hand ... ok
+test wire::ts::tags_are_serdes_and_what_kiln_leaves_out_is_optional ... ok
+
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 4127 filtered out; finished in 1.05s
+

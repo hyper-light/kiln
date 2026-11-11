@@ -41,6 +41,7 @@ impl Owned {
             | ServerMsg::HarnessArchive { session, .. }
             | ServerMsg::HarnessRestoreCopy { session }
             | ServerMsg::HarnessPackage { session, .. }
+            | ServerMsg::HarnessFile { session, .. }
             | ServerMsg::HarnessRelease { session }
             | ServerMsg::HarnessFileRead { session, .. }
             | ServerMsg::StreamOpen { session, .. }
@@ -328,6 +329,12 @@ impl Instances {
 
     pub fn get(&self, peer: PeerId) -> Option<&Instance> {
         self.by_peer.get(&peer)
+    }
+
+    /// Its Hello belongs to the current authenticated connection, rather than the previous
+    /// connection under the same certificate which Connected has invalidated.
+    pub(crate) fn current_connection(&self, peer: PeerId) -> bool {
+        self.by_peer.contains_key(&peer) && !self.rejoining.contains(&peer)
     }
 
     pub fn get_mut(&mut self, peer: PeerId) -> Option<&mut Instance> {

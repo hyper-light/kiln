@@ -1,0 +1,2674 @@
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/about.test.ts (32.69975ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/agent-limit.test.ts (24.627459ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/agent-navigation.test.ts (25.528125ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/asked-commands.test.ts (24.126375ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/attention-exposure.test.ts (24.595375ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/attention-list.test.ts (23.942875ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/attention-state.test.ts (23.642041ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/bp-shared.test.ts (24.996958ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/bp-vectors.test.ts (23.408334ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/build-logs.test.ts (25.816542ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/bulk-acts.test.ts (25.195417ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/change-state.test.ts (25.093875ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/chat-state.test.ts (25.389ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/cold-auth.test.ts (24.105083ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/comment-markdown.test.ts (23.871833ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/compaction.test.ts (24.367958ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/condense-light.test.ts (23.579458ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/download.test.ts (24.236666ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/drafts.test.ts (22.88725ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/early-reads.test.ts (28.258417ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/effort-light.test.ts (25.093334ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/entry-preloads.test.ts (25.350417ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/event-topics.test.ts (24.491542ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/experiment-setup.test.ts (28.336ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/facet-fold.test.ts (24.907959ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/goal-plan.test.ts (24.006208ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/goal-stack.test.ts (23.788417ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/held-uploads.test.ts (23.048792ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/held.test.ts (23.782917ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/holds.test.ts (23.630791ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/keep-words.test.ts (24.321959ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/keyed-requests.test.ts (25.192958ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/kiln-sdk.test.ts (25.141708ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/line-diff.test.ts (25.572333ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/live-source.test.ts (24.276125ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/liveness-traces.test.ts (23.543916ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/machine-labels.test.ts (23.288625ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/markdown-blocks.test.ts (24.65325ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/mission-rows.test.ts (23.813625ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/mock-history.test.ts (24.025708ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/offers-words.test.ts (23.487958ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/page-of.test.ts (23.90375ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/permission-light.test.ts (25.293958ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/pipeline-spot.test.ts (24.163875ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/plan-browse.test.ts (23.487625ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/plan-diff.test.ts (25.831875ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/plan-graph.test.ts (24.004167ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/plan-resource-events.test.ts (25.747125ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/plan-review.test.ts (24.04325ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/private-bootstrap.test.ts (24.430458ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/queue-shown.test.ts (25.755375ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/reap.test.ts (24.474959ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/refused.test.ts (23.64425ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/replication.test.ts (24.837625ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/request-cards.test.ts (26.562041ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/research-calls.test.ts (26.336667ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/resource-bootstrap.test.ts (27.084417ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/restore-place.test.ts (31.381166ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/retry-choices.test.ts (29.220917ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/review-byline.test.ts (23.648667ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/review-composer.test.ts (24.490083ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/review-thread-fix.test.ts (23.868792ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/row-window.test.ts (24.168541ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/runner-lost.test.ts (24.714042ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/runner-stale.test.ts (24.463333ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/sending.test.ts (24.966542ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/server-pages.test.ts (24.90075ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/session-availability.test.ts (24.934958ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/session-history.test.ts (25.399542ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/session-initial-publication.test.ts (23.497209ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/session-prefetch.test.ts (25.734458ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/session-store.test.ts (24.57475ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/session-window.test.ts (25.038333ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/ship-live.test.ts (24.729709ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/ship-model.test.ts (25.067875ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/ship-review-fold.test.ts (25.683708ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/ship-syntax.test.ts (24.312542ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/signing.test.ts (24.374125ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/spawn-efforts.test.ts (25.075708ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/spawn-setup.test.ts (24.265583ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/speed.test.ts (23.274083ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/stands-dots.test.ts (24.137792ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/stands-light.test.ts (23.624292ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/starting.test.ts (24.273583ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/state-pages.test.ts (23.6185ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/static-assets.test.ts (25.624083ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/status-glyph.test.ts (24.708291ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/subagent-tree.test.ts (25.737459ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/subagents.test.ts (24.385875ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/syntax-samples-1.test.ts (23.518666ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/syntax-samples-2.test.ts (23.688167ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/syntax-samples-3.test.ts (23.916875ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/syntax-samples-4.test.ts (23.331292ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/syntax-samples-5.test.ts (22.882292ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/syntax-samples-6.test.ts (23.067167ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/syntax-worker.test.ts (23.891625ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/syntax.test.ts (24.636167ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/tasks.test.ts (26.093917ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/thinking.test.ts (25.739209ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/tries.test.ts (25.161166ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/turns-from.test.ts (26.637667ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/typed-groups.test.ts (25.644167ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/unread-frames.test.ts (25.302875ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/unsend.test.ts (24.461917ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/update.test.ts (24.375917ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/updates-scene.test.ts (25.127167ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/updates-words.test.ts (23.285292ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/wait-adopted.test.ts (24.647791ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/wait-reserved.test.ts (23.6125ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/window-fit.test.ts (24.557583ms)
+node:internal/modules/package_json_reader:301
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /private/tmp/kiln-queue-prevention-20261111/
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:301:9)
+    at packageResolve (node:internal/modules/esm/resolve:768:81)
+    at moduleResolve (node:internal/modules/esm/resolve:859:18)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:719:20)
+    at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:736:38)
+    at ModuleLoader.resolveSync (node:internal/modules/esm/loader:765:52)
+    at #resolve (node:internal/modules/esm/loader:701:17)
+    at ModuleLoader.getOrCreateModuleJob (node:internal/modules/esm/loader:621:35)
+    at onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:650:32) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v24.14.1
+✖ ui/tests/workflow-doc-triggers.test.ts (24.466458ms)
+ℹ tests 111
+ℹ suites 0
+ℹ pass 0
+ℹ fail 111
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2770.919292
+
+✖ failing tests:
+
+test at ui/tests/about.test.ts:1:1
+✖ ui/tests/about.test.ts (32.69975ms)
+  'test failed'
+
+test at ui/tests/agent-limit.test.ts:1:1
+✖ ui/tests/agent-limit.test.ts (24.627459ms)
+  'test failed'
+
+test at ui/tests/agent-navigation.test.ts:1:1
+✖ ui/tests/agent-navigation.test.ts (25.528125ms)
+  'test failed'
+
+test at ui/tests/asked-commands.test.ts:1:1
+✖ ui/tests/asked-commands.test.ts (24.126375ms)
+  'test failed'
+
+test at ui/tests/attention-exposure.test.ts:1:1
+✖ ui/tests/attention-exposure.test.ts (24.595375ms)
+  'test failed'
+
+test at ui/tests/attention-list.test.ts:1:1
+✖ ui/tests/attention-list.test.ts (23.942875ms)
+  'test failed'
+
+test at ui/tests/attention-state.test.ts:1:1
+✖ ui/tests/attention-state.test.ts (23.642041ms)
+  'test failed'
+
+test at ui/tests/bp-shared.test.ts:1:1
+✖ ui/tests/bp-shared.test.ts (24.996958ms)
+  'test failed'
+
+test at ui/tests/bp-vectors.test.ts:1:1
+✖ ui/tests/bp-vectors.test.ts (23.408334ms)
+  'test failed'
+
+test at ui/tests/build-logs.test.ts:1:1
+✖ ui/tests/build-logs.test.ts (25.816542ms)
+  'test failed'
+
+test at ui/tests/bulk-acts.test.ts:1:1
+✖ ui/tests/bulk-acts.test.ts (25.195417ms)
+  'test failed'
+
+test at ui/tests/change-state.test.ts:1:1
+✖ ui/tests/change-state.test.ts (25.093875ms)
+  'test failed'
+
+test at ui/tests/chat-state.test.ts:1:1
+✖ ui/tests/chat-state.test.ts (25.389ms)
+  'test failed'
+
+test at ui/tests/cold-auth.test.ts:1:1
+✖ ui/tests/cold-auth.test.ts (24.105083ms)
+  'test failed'
+
+test at ui/tests/comment-markdown.test.ts:1:1
+✖ ui/tests/comment-markdown.test.ts (23.871833ms)
+  'test failed'
+
+test at ui/tests/compaction.test.ts:1:1
+✖ ui/tests/compaction.test.ts (24.367958ms)
+  'test failed'
+
+test at ui/tests/condense-light.test.ts:1:1
+✖ ui/tests/condense-light.test.ts (23.579458ms)
+  'test failed'
+
+test at ui/tests/download.test.ts:1:1
+✖ ui/tests/download.test.ts (24.236666ms)
+  'test failed'
+
+test at ui/tests/drafts.test.ts:1:1
+✖ ui/tests/drafts.test.ts (22.88725ms)
+  'test failed'
+
+test at ui/tests/early-reads.test.ts:1:1
+✖ ui/tests/early-reads.test.ts (28.258417ms)
+  'test failed'
+
+test at ui/tests/effort-light.test.ts:1:1
+✖ ui/tests/effort-light.test.ts (25.093334ms)
+  'test failed'
+
+test at ui/tests/entry-preloads.test.ts:1:1
+✖ ui/tests/entry-preloads.test.ts (25.350417ms)
+  'test failed'
+
+test at ui/tests/event-topics.test.ts:1:1
+✖ ui/tests/event-topics.test.ts (24.491542ms)
+  'test failed'
+
+test at ui/tests/experiment-setup.test.ts:1:1
+✖ ui/tests/experiment-setup.test.ts (28.336ms)
+  'test failed'
+
+test at ui/tests/facet-fold.test.ts:1:1
+✖ ui/tests/facet-fold.test.ts (24.907959ms)
+  'test failed'
+
+test at ui/tests/goal-plan.test.ts:1:1
+✖ ui/tests/goal-plan.test.ts (24.006208ms)
+  'test failed'
+
+test at ui/tests/goal-stack.test.ts:1:1
+✖ ui/tests/goal-stack.test.ts (23.788417ms)
+  'test failed'
+
+test at ui/tests/held-uploads.test.ts:1:1
+✖ ui/tests/held-uploads.test.ts (23.048792ms)
+  'test failed'
+
+test at ui/tests/held.test.ts:1:1
+✖ ui/tests/held.test.ts (23.782917ms)
+  'test failed'
+
+test at ui/tests/holds.test.ts:1:1
+✖ ui/tests/holds.test.ts (23.630791ms)
+  'test failed'
+
+test at ui/tests/keep-words.test.ts:1:1
+✖ ui/tests/keep-words.test.ts (24.321959ms)
+  'test failed'
+
+test at ui/tests/keyed-requests.test.ts:1:1
+✖ ui/tests/keyed-requests.test.ts (25.192958ms)
+  'test failed'
+
+test at ui/tests/kiln-sdk.test.ts:1:1
+✖ ui/tests/kiln-sdk.test.ts (25.141708ms)
+  'test failed'
+
+test at ui/tests/line-diff.test.ts:1:1
+✖ ui/tests/line-diff.test.ts (25.572333ms)
+  'test failed'
+
+test at ui/tests/live-source.test.ts:1:1
+✖ ui/tests/live-source.test.ts (24.276125ms)
+  'test failed'
+
+test at ui/tests/liveness-traces.test.ts:1:1
+✖ ui/tests/liveness-traces.test.ts (23.543916ms)
+  'test failed'
+
+test at ui/tests/machine-labels.test.ts:1:1
+✖ ui/tests/machine-labels.test.ts (23.288625ms)
+  'test failed'
+
+test at ui/tests/markdown-blocks.test.ts:1:1
+✖ ui/tests/markdown-blocks.test.ts (24.65325ms)
+  'test failed'
+
+test at ui/tests/mission-rows.test.ts:1:1
+✖ ui/tests/mission-rows.test.ts (23.813625ms)
+  'test failed'
+
+test at ui/tests/mock-history.test.ts:1:1
+✖ ui/tests/mock-history.test.ts (24.025708ms)
+  'test failed'
+
+test at ui/tests/offers-words.test.ts:1:1
+✖ ui/tests/offers-words.test.ts (23.487958ms)
+  'test failed'
+
+test at ui/tests/page-of.test.ts:1:1
+✖ ui/tests/page-of.test.ts (23.90375ms)
+  'test failed'
+
+test at ui/tests/permission-light.test.ts:1:1
+✖ ui/tests/permission-light.test.ts (25.293958ms)
+  'test failed'
+
+test at ui/tests/pipeline-spot.test.ts:1:1
+✖ ui/tests/pipeline-spot.test.ts (24.163875ms)
+  'test failed'
+
+test at ui/tests/plan-browse.test.ts:1:1
+✖ ui/tests/plan-browse.test.ts (23.487625ms)
+  'test failed'
+
+test at ui/tests/plan-diff.test.ts:1:1
+✖ ui/tests/plan-diff.test.ts (25.831875ms)
+  'test failed'
+
+test at ui/tests/plan-graph.test.ts:1:1
+✖ ui/tests/plan-graph.test.ts (24.004167ms)
+  'test failed'
+
+test at ui/tests/plan-resource-events.test.ts:1:1
+✖ ui/tests/plan-resource-events.test.ts (25.747125ms)
+  'test failed'
+
+test at ui/tests/plan-review.test.ts:1:1
+✖ ui/tests/plan-review.test.ts (24.04325ms)
+  'test failed'
+
+test at ui/tests/private-bootstrap.test.ts:1:1
+✖ ui/tests/private-bootstrap.test.ts (24.430458ms)
+  'test failed'
+
+test at ui/tests/queue-shown.test.ts:1:1
+✖ ui/tests/queue-shown.test.ts (25.755375ms)
+  'test failed'
+
+test at ui/tests/reap.test.ts:1:1
+✖ ui/tests/reap.test.ts (24.474959ms)
+  'test failed'
+
+test at ui/tests/refused.test.ts:1:1
+✖ ui/tests/refused.test.ts (23.64425ms)
+  'test failed'
+
+test at ui/tests/replication.test.ts:1:1
+✖ ui/tests/replication.test.ts (24.837625ms)
+  'test failed'
+
+test at ui/tests/request-cards.test.ts:1:1
+✖ ui/tests/request-cards.test.ts (26.562041ms)
+  'test failed'
+
+test at ui/tests/research-calls.test.ts:1:1
+✖ ui/tests/research-calls.test.ts (26.336667ms)
+  'test failed'
+
+test at ui/tests/resource-bootstrap.test.ts:1:1
+✖ ui/tests/resource-bootstrap.test.ts (27.084417ms)
+  'test failed'
+
+test at ui/tests/restore-place.test.ts:1:1
+✖ ui/tests/restore-place.test.ts (31.381166ms)
+  'test failed'
+
+test at ui/tests/retry-choices.test.ts:1:1
+✖ ui/tests/retry-choices.test.ts (29.220917ms)
+  'test failed'
+
+test at ui/tests/review-byline.test.ts:1:1
+✖ ui/tests/review-byline.test.ts (23.648667ms)
+  'test failed'
+
+test at ui/tests/review-composer.test.ts:1:1
+✖ ui/tests/review-composer.test.ts (24.490083ms)
+  'test failed'
+
+test at ui/tests/review-thread-fix.test.ts:1:1
+✖ ui/tests/review-thread-fix.test.ts (23.868792ms)
+  'test failed'
+
+test at ui/tests/row-window.test.ts:1:1
+✖ ui/tests/row-window.test.ts (24.168541ms)
+  'test failed'
+
+test at ui/tests/runner-lost.test.ts:1:1
+✖ ui/tests/runner-lost.test.ts (24.714042ms)
+  'test failed'
+
+test at ui/tests/runner-stale.test.ts:1:1
+✖ ui/tests/runner-stale.test.ts (24.463333ms)
+  'test failed'
+
+test at ui/tests/sending.test.ts:1:1
+✖ ui/tests/sending.test.ts (24.966542ms)
+  'test failed'
+
+test at ui/tests/server-pages.test.ts:1:1
+✖ ui/tests/server-pages.test.ts (24.90075ms)
+  'test failed'
+
+test at ui/tests/session-availability.test.ts:1:1
+✖ ui/tests/session-availability.test.ts (24.934958ms)
+  'test failed'
+
+test at ui/tests/session-history.test.ts:1:1
+✖ ui/tests/session-history.test.ts (25.399542ms)
+  'test failed'
+
+test at ui/tests/session-initial-publication.test.ts:1:1
+✖ ui/tests/session-initial-publication.test.ts (23.497209ms)
+  'test failed'
+
+test at ui/tests/session-prefetch.test.ts:1:1
+✖ ui/tests/session-prefetch.test.ts (25.734458ms)
+  'test failed'
+
+test at ui/tests/session-store.test.ts:1:1
+✖ ui/tests/session-store.test.ts (24.57475ms)
+  'test failed'
+
+test at ui/tests/session-window.test.ts:1:1
+✖ ui/tests/session-window.test.ts (25.038333ms)
+  'test failed'
+
+test at ui/tests/ship-live.test.ts:1:1
+✖ ui/tests/ship-live.test.ts (24.729709ms)
+  'test failed'
+
+test at ui/tests/ship-model.test.ts:1:1
+✖ ui/tests/ship-model.test.ts (25.067875ms)
+  'test failed'
+
+test at ui/tests/ship-review-fold.test.ts:1:1
+✖ ui/tests/ship-review-fold.test.ts (25.683708ms)
+  'test failed'
+
+test at ui/tests/ship-syntax.test.ts:1:1
+✖ ui/tests/ship-syntax.test.ts (24.312542ms)
+  'test failed'
+
+test at ui/tests/signing.test.ts:1:1
+✖ ui/tests/signing.test.ts (24.374125ms)
+  'test failed'
+
+test at ui/tests/spawn-efforts.test.ts:1:1
+✖ ui/tests/spawn-efforts.test.ts (25.075708ms)
+  'test failed'
+
+test at ui/tests/spawn-setup.test.ts:1:1
+✖ ui/tests/spawn-setup.test.ts (24.265583ms)
+  'test failed'
+
+test at ui/tests/speed.test.ts:1:1
+✖ ui/tests/speed.test.ts (23.274083ms)
+  'test failed'
+
+test at ui/tests/stands-dots.test.ts:1:1
+✖ ui/tests/stands-dots.test.ts (24.137792ms)
+  'test failed'
+
+test at ui/tests/stands-light.test.ts:1:1
+✖ ui/tests/stands-light.test.ts (23.624292ms)
+  'test failed'
+
+test at ui/tests/starting.test.ts:1:1
+✖ ui/tests/starting.test.ts (24.273583ms)
+  'test failed'
+
+test at ui/tests/state-pages.test.ts:1:1
+✖ ui/tests/state-pages.test.ts (23.6185ms)
+  'test failed'
+
+test at ui/tests/static-assets.test.ts:1:1
+✖ ui/tests/static-assets.test.ts (25.624083ms)
+  'test failed'
+
+test at ui/tests/status-glyph.test.ts:1:1
+✖ ui/tests/status-glyph.test.ts (24.708291ms)
+  'test failed'
+
+test at ui/tests/subagent-tree.test.ts:1:1
+✖ ui/tests/subagent-tree.test.ts (25.737459ms)
+  'test failed'
+
+test at ui/tests/subagents.test.ts:1:1
+✖ ui/tests/subagents.test.ts (24.385875ms)
+  'test failed'
+
+test at ui/tests/syntax-samples-1.test.ts:1:1
+✖ ui/tests/syntax-samples-1.test.ts (23.518666ms)
+  'test failed'
+
+test at ui/tests/syntax-samples-2.test.ts:1:1
+✖ ui/tests/syntax-samples-2.test.ts (23.688167ms)
+  'test failed'
+
+test at ui/tests/syntax-samples-3.test.ts:1:1
+✖ ui/tests/syntax-samples-3.test.ts (23.916875ms)
+  'test failed'
+
+test at ui/tests/syntax-samples-4.test.ts:1:1
+✖ ui/tests/syntax-samples-4.test.ts (23.331292ms)
+  'test failed'
+
+test at ui/tests/syntax-samples-5.test.ts:1:1
+✖ ui/tests/syntax-samples-5.test.ts (22.882292ms)
+  'test failed'
+
+test at ui/tests/syntax-samples-6.test.ts:1:1
+✖ ui/tests/syntax-samples-6.test.ts (23.067167ms)
+  'test failed'
+
+test at ui/tests/syntax-worker.test.ts:1:1
+✖ ui/tests/syntax-worker.test.ts (23.891625ms)
+  'test failed'
+
+test at ui/tests/syntax.test.ts:1:1
+✖ ui/tests/syntax.test.ts (24.636167ms)
+  'test failed'
+
+test at ui/tests/tasks.test.ts:1:1
+✖ ui/tests/tasks.test.ts (26.093917ms)
+  'test failed'
+
+test at ui/tests/thinking.test.ts:1:1
+✖ ui/tests/thinking.test.ts (25.739209ms)
+  'test failed'
+
+test at ui/tests/tries.test.ts:1:1
+✖ ui/tests/tries.test.ts (25.161166ms)
+  'test failed'
+
+test at ui/tests/turns-from.test.ts:1:1
+✖ ui/tests/turns-from.test.ts (26.637667ms)
+  'test failed'
+
+test at ui/tests/typed-groups.test.ts:1:1
+✖ ui/tests/typed-groups.test.ts (25.644167ms)
+  'test failed'
+
+test at ui/tests/unread-frames.test.ts:1:1
+✖ ui/tests/unread-frames.test.ts (25.302875ms)
+  'test failed'
+
+test at ui/tests/unsend.test.ts:1:1
+✖ ui/tests/unsend.test.ts (24.461917ms)
+  'test failed'
+
+test at ui/tests/update.test.ts:1:1
+✖ ui/tests/update.test.ts (24.375917ms)
+  'test failed'
+
+test at ui/tests/updates-scene.test.ts:1:1
+✖ ui/tests/updates-scene.test.ts (25.127167ms)
+  'test failed'
+
+test at ui/tests/updates-words.test.ts:1:1
+✖ ui/tests/updates-words.test.ts (23.285292ms)
+  'test failed'
+
+test at ui/tests/wait-adopted.test.ts:1:1
+✖ ui/tests/wait-adopted.test.ts (24.647791ms)
+  'test failed'
+
+test at ui/tests/wait-reserved.test.ts:1:1
+✖ ui/tests/wait-reserved.test.ts (23.6125ms)
+  'test failed'
+
+test at ui/tests/window-fit.test.ts:1:1
+✖ ui/tests/window-fit.test.ts (24.557583ms)
+  'test failed'
+
+test at ui/tests/workflow-doc-triggers.test.ts:1:1
+✖ ui/tests/workflow-doc-triggers.test.ts (24.466458ms)
+  'test failed'

@@ -34,7 +34,27 @@ impl kiln_seams::HarnessPort for Hub {
 
     fn send<'a>(&'a self, id: &'a str, command: Command) -> BoxFuture<'a, Sent> {
         Box::pin(async move {
-            match self.harness.command(self, id, command).await {
+            from_registry(self.harness.command(self, id, command).await)
+        })
+    }
+
+    fn send_status<'a>(&'a self, id: &'a str, command: Command, key: &'a str) -> BoxFuture<'a, Sent> {
+        Box::pin(async move {
+            from_registry(self.harness.command_status(self, id, command, super::mail::StatusKey { task: None, key: key.to_owned() }).await)
+        })
+    }
+}
+
+fn from_registry(sent: registry::Sent) -> Sent {
+    match sent {
+                registry::Sent::Published(receipt) => match receipt.disposition {
+                    super::mail::Disposition::Admitted | super::mail::Disposition::Consumed => Sent::Delivered,
+                    super::mail::Disposition::Waiting | super::mail::Disposition::Dispatched | super::mail::Disposition::Transferred => Sent::Retained,
+                    super::mail::Disposition::Cancelled | super::mail::Disposition::Superseded => Sent::Cancelled,
+                },
+                registry::Sent::PublicationRefused(super::mail::Error::Capacity { .. } | super::mail::Error::Backpressure { .. } | super::mail::Error::StorageFull) => Sent::Full,
+                registry::Sent::PublicationRefused(super::mail::Error::NoSession) => Sent::NoSession,
+                registry::Sent::PublicationRefused(super::mail::Error::Invalid { .. } | super::mail::Error::Reused { .. } | super::mail::Error::Unavailable { .. } | super::mail::Error::Stale { .. } | super::mail::Error::TooLarge { .. }) => Sent::Unreachable,
                 registry::Sent::Ok | registry::Sent::Accepted(_) | registry::Sent::Taken | registry::Sent::Parked => Sent::Delivered,
                 registry::Sent::Rejected { code: crate::wire::channel::Refusal::Unknown, .. } => Sent::NoSession,
                 registry::Sent::Rejected { .. } | registry::Sent::Unanswered(_) => Sent::Unreachable,
@@ -45,8 +65,6 @@ impl kiln_seams::HarnessPort for Hub {
                 registry::Sent::Refused(Refusal::NoSession { .. }) | registry::Sent::NoSession => Sent::NoSession,
                 registry::Sent::Refused(_) | registry::Sent::Unreachable => Sent::Unreachable,
             }
-        })
-    }
 }
 
 /// kiln's registry against kiln-seams' HarnessPort suite, every clause, on sessions of the hub's own
@@ -74,6 +92,7 @@ mod tests {
         ids: Mutex<HashMap<String, String>>,
         /// The words of each message said, by its id.
         said: Mutex<HashMap<String, String>>,
+        heard: Mutex<HashMap<String, std::path::PathBuf>>,
     }
 
     impl Named {
@@ -96,7 +115,17 @@ mod tests {
         }
         fn send<'a>(&'a self, name: &'a str, command: Command) -> BoxFuture<'a, Sent> {
             let id = self.real(name);
-            Box::pin(async move { HarnessPort::send(self.hub.as_ref(), &id, command).await })
+            Box::pin(async move {
+                let message = crate::harness::host::message_of(&command).map(|(message, _)| message);
+                let sent = HarnessPort::send(self.hub.as_ref(), &id, command).await;
+                if sent.has_custody() {
+                    let message = message.expect("fixture communications have an original ID");
+                    // Preserve the returned custody state. Only an exact native result can
+                    // release credit before the next conformance send; HTTP retention cannot.
+                    crate::harness::ops::end_to_end::source_disposition(&self.hub, &id, &message, true).await.expect("the native fixture's correlated successful result was not committed");
+                }
+                sent
+            })
         }
     }
 
@@ -113,17 +142,21 @@ mod tests {
         }
         fn open<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
+                let cwd = self.cwd.join(name);
+                let (program, heard) = crate::harness::ops::end_to_end::recording_program(&cwd, true).map_err(|error| format!("{error:#}"))?;
                 let spec = Spec {
                     kind: "claude".into(),
                     name: Some(name.to_owned()),
-                    cwd: Some(self.cwd.to_string_lossy().into_owned()),
-                    program: Some(self.cwd.join("no-such-claude").to_string_lossy().into_owned()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    program: Some(program.to_string_lossy().into_owned()),
                     ..Spec::default()
                 };
                 let hub = &self.port.hub;
                 let opened = hub.harness.open(hub, "local", spec, 1).await.map_err(|e| format!("{e:#}"))?;
                 let info = opened.into_iter().next().ok_or("nothing opened")?;
-                self.port.ids.lock().insert(name.to_owned(), info.id);
+                self.port.ids.lock().insert(name.to_owned(), info.id.clone());
+                self.port.heard.lock().insert(info.id.clone(), heard);
+                crate::harness::ops::end_to_end::source_ready(hub, &info.id).await.map_err(|error| format!("{error:#}"))?;
                 Ok(())
             })
         }
@@ -139,12 +172,12 @@ mod tests {
             Command::Send { id, text: text.to_owned(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }
         }
         fn heard<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Option<Vec<String>>> {
-            // What its inbox took, in order (CP-T3.2): what reached the agent.
             Box::pin(async move {
                 let id = self.port.real(name);
-                let taken = self.port.hub.harness.local.inbox()?.taken(&id, 1000).await.ok()?;
+                let path = self.port.heard.lock().get(&id).cloned()?;
+                let messages = crate::harness::ops::end_to_end::prompts(&path);
                 let said = self.port.said.lock();
-                Some(taken.iter().map(|m| said.get(m).cloned().unwrap_or_else(|| m.clone())).collect())
+                Some(messages.iter().map(|message| said.get(message).cloned().unwrap_or_else(|| message.clone())).collect())
             })
         }
         fn id_of(&self, agent: &Info) -> String {
@@ -152,9 +185,9 @@ mod tests {
         }
     }
 
-    /// The registry is kiln's HarnessPort: it holds every clause of kiln-seams' suite (CP-M2's
-    /// AC-M2.2). HARNESS-3 and -5, which need what reached an agent, hold since its inbox says so
-    /// (CP-T3.2).
+    /// Native successful results settle each exact publication. HARNESS-3 and -5 still
+    /// prove actual native order, exactly once and recipient isolation from the subprocess log;
+    /// the port's returned Retained/Delivered state is never rewritten by the fixture.
     #[test]
     fn kiln_s_registry_holds_every_harness_port_clause() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -168,6 +201,10 @@ mod tests {
                 crate::rt::spawn(async move {
                     let _ = crate::harness::registry::Registry::run_local(h).await;
                 });
+                let h = Arc::clone(hub);
+                crate::rt::spawn(async move {
+                    let _ = crate::harness::mail_delivery::run(h).await;
+                });
             }
             // Their folders, removed once it's done (a scratch hub leaves its own behind).
             let folders: Vec<std::path::PathBuf> = hubs.iter().map(|h| h.cfg.server.data_dir.clone()).collect();
@@ -176,8 +213,8 @@ mod tests {
             let make = || {
                 // There are as many hubs as cases: the last is never handed out twice.
                 let hub = hubs.pop_front().unwrap_or_else(|| Arc::clone(&last));
-                let cwd = dir.path().to_path_buf();
-                async move { RegistryFixture { port: Named { hub, ids: Mutex::new(HashMap::new()), said: Mutex::new(HashMap::new()) }, cwd } }
+                let cwd = dir.path().join(crate::util::new_id());
+                async move { RegistryFixture { port: Named { hub, ids: Mutex::new(HashMap::new()), said: Mutex::new(HashMap::new()), heard: Mutex::new(HashMap::new()) }, cwd } }
             };
             // Each case fails, named, if the registry hasn't answered it in 30 s (by kiln's runtime).
             let clock = crate::rt::clock();

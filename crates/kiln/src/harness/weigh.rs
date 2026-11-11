@@ -78,6 +78,15 @@ impl Weigh for Update {
             Update::State { .. } => size_of::<super::model::State>(),
             Update::Meta { .. } => size_of::<super::model::Meta>(),
             Update::Inbox { .. } => size_of::<super::inbox::Said>(),
+            Update::MailFlow { event } => {
+                use super::admission::FlowEvent;
+                let capacity = match &**event {
+                    FlowEvent::Accepted { capacity, .. } | FlowEvent::Consumed { capacity, .. }
+                    | FlowEvent::Waiting { capacity, .. } | FlowEvent::Capacity { capacity }
+                    | FlowEvent::Disposed { capacity, .. } | FlowEvent::Fault { capacity, .. } => capacity,
+                };
+                size_of::<super::admission::FlowEvent>().saturating_add(capacity.eligible_peer.as_ref().map_or(0, String::capacity))
+            }
             Update::Events { events } => events.iter().map(event).fold(0usize, usize::saturating_add),
             Update::Changes { files } => files.iter().map(change).fold(0usize, usize::saturating_add),
             Update::ChangesPatch { set, gone } => set.iter().map(change).chain(gone.iter().map(key)).fold(0usize, usize::saturating_add),

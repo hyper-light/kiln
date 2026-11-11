@@ -1,0 +1,586 @@
+
+> kiln-ui@0.2.0 test:ci
+> tsx --tsconfig tsconfig.app.json --test --test-concurrency=1 tests/*.test.ts
+
+✔ a tap picks the name under it, or nothing on space and punctuation (0.93ms)
+✔ an answer's parts come by their headings, as they stream (0.228541ms)
+✔ lines asked about are named as one stretch, whichever was tapped first (0.051ms)
+✔ an agent answering itself: its words after the question, not its subagents', until the next message (0.091ms)
+✔ a runner's agent limit says how many of its agents are at work, its most at once, and where that comes from (0.350333ms)
+✔ what became of what's set here: in use says nothing, the rest say why (0.131125ms)
+✔ a limit is set from here for every runner that runs agents, and the server's own (0.059958ms)
+✔ a limit typed is a whole number from 1 to the most there can be (0.140958ms)
+✔ a runner's agent limit loads again for what changes it, and only that (0.091542ms)
+✔ W21-R02: first held Plan navigation starts selected code, canonical session, goal stack and review together (0.83775ms)
+✔ W21-R02: cancellation prevents late plan discovery and Work navigation never reads review data (0.130208ms)
+✖ a command waits for its ack or nack, and goes again once on the next socket under its id (5.775458ms)
+✖ tests/asked-commands.test.ts (781725.980167ms)
+✖ tests/attention-exposure.test.ts
+✖ tests/attention-list.test.ts
+✖ tests/attention-state.test.ts
+✖ tests/bp-shared.test.ts
+✖ tests/bp-vectors.test.ts
+✖ tests/build-logs.test.ts
+✖ tests/bulk-acts.test.ts
+✖ tests/change-state.test.ts
+✖ tests/chat-state.test.ts
+✖ tests/cold-auth.test.ts
+✖ tests/comment-markdown.test.ts
+✖ tests/compaction.test.ts
+✖ tests/condense-light.test.ts
+✖ tests/download.test.ts
+✖ tests/drafts.test.ts
+✖ tests/early-reads.test.ts
+✖ tests/effort-light.test.ts
+✖ tests/entry-preloads.test.ts
+✖ tests/event-topics.test.ts
+✖ tests/experiment-setup.test.ts
+✖ tests/facet-fold.test.ts
+✖ tests/goal-plan.test.ts
+✖ tests/goal-stack.test.ts
+✖ tests/held-uploads.test.ts
+✖ tests/held.test.ts
+✖ tests/holds.test.ts
+✖ tests/keep-words.test.ts
+✖ tests/keyed-requests.test.ts
+✖ tests/kiln-sdk.test.ts
+✖ tests/line-diff.test.ts
+✖ tests/live-source.test.ts
+✖ tests/liveness-traces.test.ts
+✖ tests/machine-labels.test.ts
+✖ tests/markdown-blocks.test.ts
+✖ tests/mission-rows.test.ts
+✖ tests/mock-history.test.ts
+✖ tests/offers-words.test.ts
+✖ tests/page-of.test.ts
+✖ tests/permission-light.test.ts
+✖ tests/pipeline-spot.test.ts
+✖ tests/plan-browse.test.ts
+✖ tests/plan-diff.test.ts
+✖ tests/plan-graph.test.ts
+✖ tests/plan-resource-events.test.ts
+✖ tests/plan-review.test.ts
+✖ tests/private-bootstrap.test.ts
+✖ tests/queue-shown.test.ts
+✖ tests/reap.test.ts
+✖ tests/refused.test.ts
+✖ tests/replication.test.ts
+✖ tests/request-cards.test.ts
+✖ tests/research-calls.test.ts
+✖ tests/resource-bootstrap.test.ts
+✖ tests/restore-place.test.ts
+✖ tests/retry-choices.test.ts
+✖ tests/review-byline.test.ts
+✖ tests/review-composer.test.ts
+✖ tests/review-thread-fix.test.ts
+✖ tests/row-window.test.ts
+✖ tests/runner-lost.test.ts
+✖ tests/runner-stale.test.ts
+✖ tests/sending.test.ts
+✖ tests/server-pages.test.ts
+✖ tests/session-availability.test.ts
+✖ tests/session-history.test.ts
+✖ tests/session-initial-publication.test.ts
+✖ tests/session-prefetch.test.ts
+✖ tests/session-store.test.ts
+✖ tests/session-window.test.ts
+✖ tests/ship-live.test.ts
+✖ tests/ship-model.test.ts
+✖ tests/ship-review-fold.test.ts
+✖ tests/ship-syntax.test.ts
+✖ tests/signing.test.ts
+✖ tests/spawn-efforts.test.ts
+✖ tests/spawn-setup.test.ts
+✖ tests/speed.test.ts
+✖ tests/stands-dots.test.ts
+✖ tests/stands-light.test.ts
+✖ tests/starting.test.ts
+✖ tests/state-pages.test.ts
+✖ tests/static-assets.test.ts
+✖ tests/status-glyph.test.ts
+✖ tests/subagent-tree.test.ts
+✖ tests/subagents.test.ts
+✖ tests/syntax-samples-1.test.ts
+✖ tests/syntax-samples-2.test.ts
+✖ tests/syntax-samples-3.test.ts
+✖ tests/syntax-samples-4.test.ts
+✖ tests/syntax-samples-5.test.ts
+✖ tests/syntax-samples-6.test.ts
+✖ tests/syntax-worker.test.ts
+✖ tests/syntax.test.ts
+✖ tests/tasks.test.ts
+✖ tests/thinking.test.ts
+✖ tests/tries.test.ts
+✖ tests/turns-from.test.ts
+✖ tests/typed-groups.test.ts
+✖ tests/unread-frames.test.ts
+✖ tests/unsend.test.ts
+✖ tests/update.test.ts
+✖ tests/updates-scene.test.ts
+✖ tests/updates-words.test.ts
+✖ tests/wait-adopted.test.ts
+✖ tests/wait-reserved.test.ts
+✖ tests/window-fit.test.ts
+✖ tests/workflow-doc-triggers.test.ts
+ℹ tests 120
+ℹ suites 0
+ℹ pass 11
+ℹ fail 1
+ℹ cancelled 108
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 782448.062
+
+✖ failing tests:
+
+test at tests/asked-commands.test.ts:1:1453
+✖ a command waits for its ack or nack, and goes again once on the next socket under its id (5.775458ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + '01a1c922060375e3ba17472c5cda7a68'
+  - 'm-1'
+  
+      at TestContext.<anonymous> (/private/tmp/kiln-queue-prevention-20261111/ui/tests/asked-commands.test.ts:91:12)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:358:3)
+      at async <anonymous> (/private/tmp/kiln-queue-prevention-20261111/ui/tests/asked-commands.test.ts:41:1) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: '01a1c922060375e3ba17472c5cda7a68',
+    expected: 'm-1',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/asked-commands.test.ts:1:1
+✖ tests/asked-commands.test.ts (781725.980167ms)
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/attention-exposure.test.ts:1:1
+✖ tests/attention-exposure.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/attention-list.test.ts:1:1
+✖ tests/attention-list.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/attention-state.test.ts:1:1
+✖ tests/attention-state.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/bp-shared.test.ts:1:1
+✖ tests/bp-shared.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/bp-vectors.test.ts:1:1
+✖ tests/bp-vectors.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/build-logs.test.ts:1:1
+✖ tests/build-logs.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/bulk-acts.test.ts:1:1
+✖ tests/bulk-acts.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/change-state.test.ts:1:1
+✖ tests/change-state.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/chat-state.test.ts:1:1
+✖ tests/chat-state.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/cold-auth.test.ts:1:1
+✖ tests/cold-auth.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/comment-markdown.test.ts:1:1
+✖ tests/comment-markdown.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/compaction.test.ts:1:1
+✖ tests/compaction.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/condense-light.test.ts:1:1
+✖ tests/condense-light.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/download.test.ts:1:1
+✖ tests/download.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/drafts.test.ts:1:1
+✖ tests/drafts.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/early-reads.test.ts:1:1
+✖ tests/early-reads.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/effort-light.test.ts:1:1
+✖ tests/effort-light.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/entry-preloads.test.ts:1:1
+✖ tests/entry-preloads.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/event-topics.test.ts:1:1
+✖ tests/event-topics.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/experiment-setup.test.ts:1:1
+✖ tests/experiment-setup.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/facet-fold.test.ts:1:1
+✖ tests/facet-fold.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/goal-plan.test.ts:1:1
+✖ tests/goal-plan.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/goal-stack.test.ts:1:1
+✖ tests/goal-stack.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/held-uploads.test.ts:1:1
+✖ tests/held-uploads.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/held.test.ts:1:1
+✖ tests/held.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/holds.test.ts:1:1
+✖ tests/holds.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/keep-words.test.ts:1:1
+✖ tests/keep-words.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/keyed-requests.test.ts:1:1
+✖ tests/keyed-requests.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/kiln-sdk.test.ts:1:1
+✖ tests/kiln-sdk.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/line-diff.test.ts:1:1
+✖ tests/line-diff.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/live-source.test.ts:1:1
+✖ tests/live-source.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/liveness-traces.test.ts:1:1
+✖ tests/liveness-traces.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/machine-labels.test.ts:1:1
+✖ tests/machine-labels.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/markdown-blocks.test.ts:1:1
+✖ tests/markdown-blocks.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/mission-rows.test.ts:1:1
+✖ tests/mission-rows.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/mock-history.test.ts:1:1
+✖ tests/mock-history.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/offers-words.test.ts:1:1
+✖ tests/offers-words.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/page-of.test.ts:1:1
+✖ tests/page-of.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/permission-light.test.ts:1:1
+✖ tests/permission-light.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/pipeline-spot.test.ts:1:1
+✖ tests/pipeline-spot.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/plan-browse.test.ts:1:1
+✖ tests/plan-browse.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/plan-diff.test.ts:1:1
+✖ tests/plan-diff.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/plan-graph.test.ts:1:1
+✖ tests/plan-graph.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/plan-resource-events.test.ts:1:1
+✖ tests/plan-resource-events.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/plan-review.test.ts:1:1
+✖ tests/plan-review.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/private-bootstrap.test.ts:1:1
+✖ tests/private-bootstrap.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/queue-shown.test.ts:1:1
+✖ tests/queue-shown.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/reap.test.ts:1:1
+✖ tests/reap.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/refused.test.ts:1:1
+✖ tests/refused.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/replication.test.ts:1:1
+✖ tests/replication.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/request-cards.test.ts:1:1
+✖ tests/request-cards.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/research-calls.test.ts:1:1
+✖ tests/research-calls.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/resource-bootstrap.test.ts:1:1
+✖ tests/resource-bootstrap.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/restore-place.test.ts:1:1
+✖ tests/restore-place.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/retry-choices.test.ts:1:1
+✖ tests/retry-choices.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/review-byline.test.ts:1:1
+✖ tests/review-byline.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/review-composer.test.ts:1:1
+✖ tests/review-composer.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/review-thread-fix.test.ts:1:1
+✖ tests/review-thread-fix.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/row-window.test.ts:1:1
+✖ tests/row-window.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/runner-lost.test.ts:1:1
+✖ tests/runner-lost.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/runner-stale.test.ts:1:1
+✖ tests/runner-stale.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/sending.test.ts:1:1
+✖ tests/sending.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/server-pages.test.ts:1:1
+✖ tests/server-pages.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/session-availability.test.ts:1:1
+✖ tests/session-availability.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/session-history.test.ts:1:1
+✖ tests/session-history.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/session-initial-publication.test.ts:1:1
+✖ tests/session-initial-publication.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/session-prefetch.test.ts:1:1
+✖ tests/session-prefetch.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/session-store.test.ts:1:1
+✖ tests/session-store.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/session-window.test.ts:1:1
+✖ tests/session-window.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/ship-live.test.ts:1:1
+✖ tests/ship-live.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/ship-model.test.ts:1:1
+✖ tests/ship-model.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/ship-review-fold.test.ts:1:1
+✖ tests/ship-review-fold.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/ship-syntax.test.ts:1:1
+✖ tests/ship-syntax.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/signing.test.ts:1:1
+✖ tests/signing.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/spawn-efforts.test.ts:1:1
+✖ tests/spawn-efforts.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/spawn-setup.test.ts:1:1
+✖ tests/spawn-setup.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/speed.test.ts:1:1
+✖ tests/speed.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/stands-dots.test.ts:1:1
+✖ tests/stands-dots.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/stands-light.test.ts:1:1
+✖ tests/stands-light.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/starting.test.ts:1:1
+✖ tests/starting.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/state-pages.test.ts:1:1
+✖ tests/state-pages.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/static-assets.test.ts:1:1
+✖ tests/static-assets.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/status-glyph.test.ts:1:1
+✖ tests/status-glyph.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/subagent-tree.test.ts:1:1
+✖ tests/subagent-tree.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/subagents.test.ts:1:1
+✖ tests/subagents.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/syntax-samples-1.test.ts:1:1
+✖ tests/syntax-samples-1.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/syntax-samples-2.test.ts:1:1
+✖ tests/syntax-samples-2.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/syntax-samples-3.test.ts:1:1
+✖ tests/syntax-samples-3.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/syntax-samples-4.test.ts:1:1
+✖ tests/syntax-samples-4.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/syntax-samples-5.test.ts:1:1
+✖ tests/syntax-samples-5.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/syntax-samples-6.test.ts:1:1
+✖ tests/syntax-samples-6.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/syntax-worker.test.ts:1:1
+✖ tests/syntax-worker.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/syntax.test.ts:1:1
+✖ tests/syntax.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/tasks.test.ts:1:1
+✖ tests/tasks.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/thinking.test.ts:1:1
+✖ tests/thinking.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/tries.test.ts:1:1
+✖ tests/tries.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/turns-from.test.ts:1:1
+✖ tests/turns-from.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/typed-groups.test.ts:1:1
+✖ tests/typed-groups.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/unread-frames.test.ts:1:1
+✖ tests/unread-frames.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/unsend.test.ts:1:1
+✖ tests/unsend.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/update.test.ts:1:1
+✖ tests/update.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/updates-scene.test.ts:1:1
+✖ tests/updates-scene.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/updates-words.test.ts:1:1
+✖ tests/updates-words.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/wait-adopted.test.ts:1:1
+✖ tests/wait-adopted.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/wait-reserved.test.ts:1:1
+✖ tests/wait-reserved.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/window-fit.test.ts:1:1
+✖ tests/window-fit.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'
+
+test at tests/workflow-doc-triggers.test.ts:1:1
+✖ tests/workflow-doc-triggers.test.ts
+  'Promise resolution is still pending but the event loop has already resolved'

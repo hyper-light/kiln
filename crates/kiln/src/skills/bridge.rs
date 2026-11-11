@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 
 use crate::harness::kinds::Protocol;
 
@@ -77,6 +78,7 @@ pub fn needed(protocol: Protocol, writes: &[String]) -> bool {
 }
 
 fn metadata(skills: &[Skill]) -> String {
+    if !skills.iter().any(|s| s.automatic) { return String::new(); }
     let mut text = String::from("<kiln_installed_skills>\nThis is the current skill catalogue for this session; it replaces earlier catalogues. Use a skill when its description matches the task or the user names it. Read its SKILL.md before using it, then load only the supporting files needed. Resolve relative files and scripts from that skill's directory. Explicit user instructions take priority over skill guidance. Skills omitted from this current catalogue are no longer active.\n");
     for skill in skills.iter().filter(|s| s.automatic) {
         text.push_str(&json!({"name": skill.name, "description": skill.description, "path": skill.path}).to_string());
@@ -86,10 +88,10 @@ fn metadata(skills: &[Skill]) -> String {
     text
 }
 
-fn adapt(protocol: Protocol, native: bool, mut value: Value, skills: &[Skill]) -> Value {
-    if !is_prompt(protocol, &value) { return value }
-    let Some(pointer) = input_pointer(protocol) else { return value };
-    let Some(input) = value.pointer_mut(pointer) else { return value };
+fn adapt(protocol: Protocol, native: bool, mut value: Value, skills: &[Skill], catalogue: Option<&str>) -> (Value, bool) {
+    if !is_prompt(protocol, &value) { return (value, false) }
+    let Some(pointer) = input_pointer(protocol) else { return (value, false) };
+    let Some(input) = value.pointer_mut(pointer) else { return (value, false) };
     let resolve = |text: &str| {
         text.strip_prefix(['/', '$']).and_then(|r| r.split_once(char::is_whitespace).or(Some((r, ""))))
             .and_then(|(name, args)| skills.iter().find(|s| s.name == name).map(|s| (s, args.trim().to_owned())))
@@ -105,8 +107,9 @@ fn adapt(protocol: Protocol, native: bool, mut value: Value, skills: &[Skill]) -
     };
     // Native slash commands (notably ACP /compact) must still be first in the prompt.
     let native_command = |text: &str| text.starts_with(['/', '$']);
-    if selected.is_none() && (input.as_str().is_some_and(native_command) || input.as_array().is_some_and(|a| a.iter().any(|v| v.get("type").and_then(Value::as_str) == Some("text") && v.get("text").and_then(Value::as_str).is_some_and(native_command)))) { return value }
-    let mut prefix = metadata(skills);
+    if selected.is_none() && (input.as_str().is_some_and(native_command) || input.as_array().is_some_and(|a| a.iter().any(|v| v.get("type").and_then(Value::as_str) == Some("text") && v.get("text").and_then(Value::as_str).is_some_and(native_command)))) { return (value, false) }
+    let mut prefix = catalogue.unwrap_or_default().to_owned();
+    let changed = !prefix.is_empty() || selected.is_some();
     if let Some((skill, args, index)) = selected {
         let invocation = format!("Use the installed skill {}. Its base directory is {}.\nUser arguments: {args}", skill.name, skill.path.parent().unwrap_or_else(|| Path::new("")).display());
         if let Some(items) = input.as_array_mut() {
@@ -123,30 +126,189 @@ fn adapt(protocol: Protocol, native: bool, mut value: Value, skills: &[Skill]) -
             *input = Value::String(invocation);
         }
     }
-    // Even an empty catalogue revokes a previous turn's skills after disable/remove.
+    if !changed { return (value, false); }
     if let Some(items) = input.as_array_mut() {
         items.insert(0, json!({"type": "text", "text": prefix}));
     } else if let Some(text) = input.as_str() {
         *input = Value::String(format!("{prefix}\n\n{text}"));
     }
-    value
+    (value, true)
 }
 
-/// Read the session's current package links at delivery, including queued prompts. Blocking.
-pub fn deliver(folder: &Path, protocol: Protocol, native: bool, writes: Vec<String>) -> Vec<String> {
-    // Sessions that never had installed skills keep their original wire messages unchanged.
-    if !folder.is_dir() { return writes }
+/// Provenance for a prompt the bridge itself changed. The consumer must correlate the exact
+/// native request/client identity before projecting an echoed effective prompt for display.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Projection {
+    pub request_id: Option<Value>,
+    pub client_id: Option<String>,
+    pub effective_digest: String,
+}
+
+impl Projection {
+    pub fn matches(&self, client_id: &str, effective: &str) -> bool {
+        self.client_id.as_deref() == Some(client_id) && self.effective_digest == digest(effective)
+    }
+}
+
+pub fn digest(text: &str) -> String { super::hex(&Sha256::digest(text.as_bytes())) }
+
+pub struct Delivered { pub writes: Vec<String>, pub projections: Vec<Projection> }
+
+struct Catalogue { skills: Vec<Skill>, revision: String, metadata: String }
+
+fn snapshot(folder: &Path) -> Catalogue {
     let skills = catalogue(folder);
-    writes.into_iter().map(|w| {
-        let Ok(value) = serde_json::from_str(&w) else { return w };
-        if !is_prompt(protocol, &value) { return w }
-        adapt(protocol, native, value, &skills).to_string()
-    }).collect()
+    let mut hash = Sha256::new();
+    for skill in &skills {
+        for part in [&skill.name, &skill.native_name, &skill.description, &skill.body] {
+            hash.update(part.len().to_le_bytes()); hash.update(part.as_bytes());
+        }
+        let path = skill.path.to_string_lossy();
+        hash.update(path.len().to_le_bytes()); hash.update(path.as_bytes());
+        hash.update([u8::from(skill.automatic)]);
+    }
+    let metadata = metadata(&skills);
+    Catalogue { skills, revision: super::hex(&hash.finalize()), metadata }
+}
+
+/// Extract the text exactly as native userMessage echoes join it, before attachment rendering.
+/// This is for equality/correlation, never for detecting tags in arbitrary human content.
+pub fn prompt_text(protocol: Protocol, value: &Value) -> Option<String> {
+    let input = value.pointer(input_pointer(protocol)?)?;
+    if let Some(text) = input.as_str() { return Some(text.to_owned()); }
+    Some(input.as_array()?.iter().filter_map(|item| item.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"))
+}
+
+/// One provider context's loaded catalogue. Refresh only when installed files change; ordinary
+/// prompts use this snapshot. Native readiness resets only what that provider has been told.
+#[derive(Default)]
+pub struct Session {
+    catalogue: Option<Catalogue>,
+    advertised: Option<(String, bool)>,
+}
+
+impl Session {
+    pub fn changed(&mut self) { self.catalogue = None; }
+    pub fn provider_ready(&mut self) { self.advertised = None; }
+    pub fn advertised(&self) -> Option<(String, bool)> { self.advertised.clone() }
+    /// Adopting the same live provider preserves its acknowledgement across a kiln upgrade;
+    /// installed files are loaded again lazily, without retaining their bodies in Frozen.
+    pub fn restore(advertised: Option<(String, bool)>) -> Self { Self { catalogue: None, advertised } }
+
+    /// Blocking: called on the existing delivery pool, never by a timer or as another user turn.
+    pub fn deliver(&mut self, folder: &Path, protocol: Protocol, native: bool, writes: Vec<String>) -> Delivered {
+        if !needed(protocol, &writes) { return Delivered { writes, projections: Vec::new() }; }
+        let catalogue = self.catalogue.get_or_insert_with(|| snapshot(folder));
+        let mut delivered = Delivered { writes: Vec::new(), projections: Vec::new() };
+        for original in writes {
+            let Ok(value) = serde_json::from_str::<Value>(&original) else { delivered.writes.push(original); continue };
+            if !is_prompt(protocol, &value) { delivered.writes.push(original); continue }
+            let changed = self.advertised.as_ref().is_none_or(|(revision, _)| revision != &catalogue.revision);
+            let active = !catalogue.metadata.is_empty();
+            let revoked = changed && !active && self.advertised.as_ref().is_some_and(|(_, active)| *active);
+            let metadata = if changed && active { Some(catalogue.metadata.as_str()) }
+                else if revoked { Some("<kiln_installed_skills>\nNo automatically invokable installed skills are active in this session.\n</kiln_installed_skills>") }
+                else { None };
+            // An initially empty catalogue has nothing to advertise or revoke.
+            if changed && !active && !revoked { self.advertised = Some((catalogue.revision.clone(), false)); }
+            let request_id = value.get("id").cloned();
+            let client_id = value.pointer("/params/clientUserMessageId").and_then(Value::as_str).map(str::to_owned);
+            let (value, adapted) = adapt(protocol, native, value, &catalogue.skills, metadata);
+            if adapted {
+                if metadata.is_some() { self.advertised = Some((catalogue.revision.clone(), active)); }
+                if let Some(text) = prompt_text(protocol, &value) {
+                    delivered.projections.push(Projection { request_id, client_id, effective_digest: digest(&text) });
+                }
+                delivered.writes.push(value.to_string());
+            } else { delivered.writes.push(original); }
+        }
+        delivered
+    }
+}
+
+/// Compatibility entry point for one-shot callers. Session drivers retain Session across actual
+/// prompt deliveries and invalidate it only at install/reload and provider readiness boundaries.
+pub fn deliver(folder: &Path, protocol: Protocol, native: bool, writes: Vec<String>) -> Vec<String> {
+    Session::default().deliver(folder, protocol, native, writes).writes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_existing_skill_folder_does_not_prepend_internal_guidance() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let human = "Please ensure all lanes report material changes.";
+        let prompt = json!({"id":9,"method":"turn/start","params":{"threadId":"thread","clientUserMessageId":"human-1","input":[{"type":"text","text":human}]}}).to_string();
+        let actual = deliver(root.path(), Protocol::CodexAppServer, false, vec![prompt.clone()]);
+        assert_eq!(actual, vec![prompt], "an existing empty session folder must not prepend <kiln_installed_skills> to the provider's echoed human message");
+        Ok(())
+    }
+
+    #[test]
+    fn catalogue_changes_refresh_once_without_adding_prompts_and_literal_tags_stay_human() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let skill = root.path().join("tools/skills/review");
+        std::fs::create_dir_all(&skill)?;
+        std::fs::write(skill.join("SKILL.md"), "---\nname: review\ndescription: Review changes.\n---\nRead the diff.")?;
+        let prompt = |id: &str, text: &str| json!({"id":id,"method":"turn/start","params":{"threadId":"thread","clientUserMessageId":id,"input":[{"type":"text","text":text}]}}).to_string();
+        let mut session = Session::default();
+        let first = session.deliver(root.path(), Protocol::CodexAppServer, false, vec![prompt("one", "First human request")]);
+        assert_eq!(first.writes.len(), 1);
+        assert_eq!(first.projections.len(), 1);
+        let effective = first.writes.first().ok_or_else(|| anyhow::anyhow!("no provider prompt"))?;
+        let effective: Value = serde_json::from_str(effective)?;
+        let echoed = prompt_text(Protocol::CodexAppServer, &effective).ok_or_else(|| anyhow::anyhow!("no prompt text"))?;
+        let projection = first.projections.first().ok_or_else(|| anyhow::anyhow!("no generated provenance"))?;
+        assert!(projection.matches("one", &echoed));
+        assert!(!projection.matches("different-human", &echoed));
+        let same = prompt("two", "Second human request");
+        let second = session.deliver(root.path(), Protocol::CodexAppServer, false, vec![same.clone()]);
+        assert_eq!(second.writes, vec![same]);
+        assert!(second.projections.is_empty());
+        session.changed();
+        let unchanged = prompt("three", "Unchanged installed catalogue");
+        assert_eq!(session.deliver(root.path(), Protocol::CodexAppServer, false, vec![unchanged.clone()]).writes, vec![unchanged]);
+        let literal = prompt("different-human", &echoed);
+        let literal = session.deliver(root.path(), Protocol::CodexAppServer, false, vec![literal.clone()]);
+        assert!(literal.projections.is_empty(), "a real user pasted catalogue-looking text; it is not generated provenance");
+        let wire: Value = serde_json::from_str(literal.writes.first().ok_or_else(|| anyhow::anyhow!("literal user prompt missing"))?)?;
+        assert_eq!(prompt_text(Protocol::CodexAppServer, &wire).as_deref(), Some(echoed.as_str()));
+        std::fs::remove_dir_all(root.path().join("tools"))?;
+        session.changed();
+        let revoke = session.deliver(root.path(), Protocol::CodexAppServer, false, vec![prompt("four", "After uninstall")]);
+        assert_eq!(revoke.writes.len(), 1);
+        assert!(revoke.writes.first().is_some_and(|w| w.contains("No automatically invokable installed skills")));
+        let empty = prompt("five", "Still empty");
+        assert_eq!(session.deliver(root.path(), Protocol::CodexAppServer, false, vec![empty.clone()]).writes, vec![empty]);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_context_readiness_readvertises_once_and_explicit_manual_invocations_remain_available() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let skill = root.path().join("tools/skills/manual");
+        std::fs::create_dir_all(&skill)?;
+        std::fs::write(skill.join("SKILL.md"), "---\nname: manual\ndescription: Manual.\ndisable-model-invocation: true\n---\nExplicit selected instructions.")?;
+        let prompt = |text: &str| json!({"method":"session/prompt","params":{"prompt":[{"type":"text","text":text}]}}).to_string();
+        let mut session = Session::default();
+        let human = prompt("Ordinary human request");
+        assert_eq!(session.deliver(root.path(), Protocol::Acp(&[]), false, vec![human.clone()]).writes, vec![human]);
+        let explicit = session.deliver(root.path(), Protocol::Acp(&[]), false, vec![prompt("/tools:manual supplied arguments")]);
+        assert!(explicit.writes.first().is_some_and(|w| w.contains("Explicit selected instructions.") && w.contains("supplied arguments")));
+        assert!(!explicit.writes.first().is_some_and(|w| w.contains("<kiln_installed_skills>")), "manual-only invocation does not need empty catalogue guidance");
+        std::fs::write(skill.join("SKILL.md"), "---\nname: manual\ndescription: Automatic now.\n---\nUpdated instructions.")?;
+        session.changed();
+        let first = session.deliver(root.path(), Protocol::Acp(&[]), false, vec![prompt("After catalogue change")]);
+        assert!(first.writes.first().is_some_and(|w| w.contains("<kiln_installed_skills>")));
+        session.provider_ready();
+        let ready = session.deliver(root.path(), Protocol::Acp(&[]), false, vec![prompt("A real new provider context")]);
+        assert!(ready.writes.first().is_some_and(|w| w.contains("<kiln_installed_skills>")));
+        let later = prompt("Same provider context");
+        assert_eq!(session.deliver(root.path(), Protocol::Acp(&[]), false, vec![later.clone()]).writes, vec![later]);
+        Ok(())
+    }
 
     #[test]
     fn w20_r01_discovery_is_progressive_and_control_traffic_is_unchanged() -> anyhow::Result<()> {

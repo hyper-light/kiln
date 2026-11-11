@@ -132,7 +132,7 @@ struct Seen {
 }
 
 enum Job {
-    Commit(Tx, oneshot::Sender<Result<Rev, Refusal>>),
+    Commit(Tx, Option<Box<dyn Send + Sync>>, oneshot::Sender<Result<Rev, Refusal>>),
     Get(String, Vec<u8>, Consistency, oneshot::Sender<Result<Option<Row>, Refusal>>),
     Scan(String, Scan, oneshot::Sender<Result<Page, Refusal>>),
     Changes(String, Rev, usize, oneshot::Sender<Result<Changes, Refusal>>),
@@ -237,7 +237,14 @@ impl Records for TursoRecords {
     fn commit<'a>(&'a self, tx: Tx) -> BoxFuture<'a, Result<Rev, Refusal>> {
         Box::pin(async move {
             check_tx(&tx)?;
-            self.ask(|r| Job::Commit(tx, r)).await
+            self.ask(|r| Job::Commit(tx, None, r)).await
+        })
+    }
+
+    fn commit_owned<'a>(&'a self, tx: Tx, owner: Box<dyn Send + Sync>) -> BoxFuture<'a, Result<Rev, Refusal>> {
+        Box::pin(async move {
+            check_tx(&tx)?;
+            self.ask(|reply| Job::Commit(tx, Some(owner), reply)).await
         })
     }
 
@@ -314,7 +321,7 @@ fn serve(mut db: Db, jobs: &crate::memory::queue::Receiver<Job>, seen: &Mutex<Se
         let mut rest = Vec::new();
         for j in batch {
             match j {
-                Job::Commit(tx, reply) => commits.push((tx, reply)),
+                Job::Commit(tx, owner, reply) => commits.push((tx, (owner, reply))),
                 other => rest.push(other),
             }
         }
@@ -322,6 +329,7 @@ fn serve(mut db: Db, jobs: &crate::memory::queue::Receiver<Job>, seen: &Mutex<Se
             let n = u64::try_from(commits.len()).unwrap_or(u64::MAX);
             let (txs, replies): (Vec<Tx>, Vec<_>) = commits.into_iter().unzip();
             let (answers, synced) = db.commit_batch(&txs, stats);
+            drop(txs); // The job owns its payload until the database no longer borrows it.
             stats.writes.fetch_add(1, Ordering::AcqRel);
             stats.commits.fetch_add(n, Ordering::AcqRel);
             // Each of its transactions waited for its sync, beside the rest of its group: on a runner, each a message its
@@ -332,7 +340,7 @@ fn serve(mut db: Db, jobs: &crate::memory::queue::Receiver<Job>, seen: &Mutex<Se
             // What's durable is said before anyone is answered: a caller told its commit is in
             // finds it in the head and the feed.
             db.publish(seen);
-            for (reply, answer) in replies.into_iter().zip(answers) {
+            for ((_owner, reply), answer) in replies.into_iter().zip(answers) {
                 let _ = reply.send(answer);
             }
             changed.notify();
@@ -390,7 +398,7 @@ impl crate::memory::queue::Weigh for Job {
             Job::Scan(family, scan, _) => family.len().saturating_add(scan.prefix.len()).saturating_add(scan.after.as_ref().map_or(0, Vec::len)),
             Job::Changes(family, ..) => family.len(),
             // Its conditions' and writes' names: their keys and values are `job_bytes`'.
-            Job::Commit(tx, _) => tx
+            Job::Commit(tx, ..) => tx
                 .conds
                 .iter()
                 .map(|c| match c {
@@ -410,7 +418,7 @@ impl crate::memory::queue::Weigh for Job {
 
 fn job_bytes(job: &Job) -> usize {
     match job {
-        Job::Commit(tx, _) => tx
+        Job::Commit(tx, ..) => tx
             .writes
             .iter()
             .map(|w| match w {
@@ -540,6 +548,16 @@ impl Db {
         run_while(&self.io, stmt, params, each)
     }
 
+    /// PUT owns its parameters: moving the blob into its binding avoids the second body copy
+    /// made by the borrowed query path. run_values clears bindings on every exit.
+    fn put(&mut self, params: [Value; 5]) -> anyhow::Result<()> {
+        let stmt = match self.statements.entry(PUT) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(self.conn.prepare(PUT).map_err(fail)?),
+        };
+        run_values(&self.io, stmt, params.into_iter(), |_| Ok(true))
+    }
+
     fn set_meta(&mut self, name: &str, value: Rev) -> anyhow::Result<()> {
         self.query(META_SET, &[Value::from_text(name.to_owned()), num(value)?], |_| Ok(true))
     }
@@ -654,7 +672,7 @@ impl Db {
                 Write::Put { family, key, value } => (family, key, blob(value)?, true),
                 Write::Delete { family, key } => (family, key, Value::Null, false),
             };
-            self.query(PUT, &[text(family), blob(key)?, num(rev)?, num(u64::try_from(n)?)?, value], |_| Ok(true))?;
+            self.put([text(family), blob(key)?, num(rev)?, num(u64::try_from(n)?)?, value])?;
             self.seen.insert((family.clone(), key.clone()), Some((rev, live)));
             changed.push((family.clone(), rev));
         }
@@ -867,12 +885,18 @@ impl Db {
 }
 
 /// Runs `stmt` with `params`, handing each row to `each` until it says no more.
-fn run_while(io: &Arc<dyn IO>, stmt: &mut Statement, params: &[Value], mut each: impl FnMut(&turso_core::Row) -> anyhow::Result<bool>) -> anyhow::Result<()> {
-    stmt.reset().map_err(fail)?;
-    for (i, p) in params.iter().enumerate() {
-        let at = NonZero::new(i.saturating_add(1)).ok_or_else(|| anyhow::anyhow!("SQL parameters count from 1"))?;
-        stmt.bind_at(at, p.clone()).map_err(fail)?;
-    }
+fn run_while(io: &Arc<dyn IO>, stmt: &mut Statement, params: &[Value], each: impl FnMut(&turso_core::Row) -> anyhow::Result<bool>) -> anyhow::Result<()> {
+    run_values(io, stmt, params.iter().cloned(), each)
+}
+
+fn run_values(io: &Arc<dyn IO>, stmt: &mut Statement, params: impl Iterator<Item = Value>, mut each: impl FnMut(&turso_core::Row) -> anyhow::Result<bool>) -> anyhow::Result<()> {
+    let result = (|| {
+        stmt.reset().map_err(fail)?;
+        stmt.clear_bindings();
+        for (index, value) in params.enumerate() {
+            let at = NonZero::new(index.checked_add(1).ok_or_else(|| anyhow::anyhow!("SQL parameter count overflowed"))?).ok_or_else(|| anyhow::anyhow!("SQL parameters count from 1"))?;
+            stmt.bind_at(at, value).map_err(fail)?;
+        }
     let mut busy = 0u32;
     loop {
         match stmt.step().map_err(fail)? {
@@ -903,6 +927,10 @@ fn run_while(io: &Arc<dyn IO>, stmt: &mut Statement, params: &[Value], mut each:
             }
         }
     }
+    })();
+    let reset = stmt.reset().map_err(fail);
+    stmt.clear_bindings();
+    result.and(reset)
 }
 
 fn fail(e: impl std::fmt::Display) -> anyhow::Error {
@@ -1008,6 +1036,47 @@ mod tests {
     use kiln_seams::conformance::run;
     use kiln_seams::records::{RecordsFixture, cases};
 
+    #[test]
+    fn owned_commit_keeps_authority_after_caller_cancellation_until_worker_drops_payload() -> anyhow::Result<()> {
+        use std::future::Future as _;
+        use std::task::Context;
+        struct Owner(Arc<AtomicU64>);
+        impl Drop for Owner { fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); } }
+        struct Start(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for Start { fn drop(&mut self) { if let Some(start) = self.0.take() { let _ = start.send(()); } } }
+        let dir = tempfile::tempdir()?;
+        let (start, gate) = std::sync::mpsc::channel();
+        let records = TursoRecords::open_with(&dir.path().join("records.db"), Limits::default(), Some(gate))?;
+        let mut start = Start(Some(start));
+        let drops = Arc::new(AtomicU64::new(0));
+        let mut commit = records.commit_owned(tx(vec![put("inbox", "original", "all retained words")]), Box::new(Owner(Arc::clone(&drops))));
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(commit.as_mut().poll(&mut context).is_pending());
+        drop(commit);
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "the queued worker, not the cancelled caller, owns the payload authority");
+        start.0.take().ok_or_else(|| anyhow::anyhow!("fixture start sender missing"))?.send(())?;
+        let kept = block(records.get("inbox", b"original", Consistency::Linearizable))?;
+        assert!(kept.is_some());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_put_clears_large_cached_bindings_after_success_and_error() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(&dir.path().join("records.db"), Limits::default())?;
+        let stats = Stats::default();
+        let (answers, _) = db.commit_batch(&[tx(vec![put("inbox", "original", &"x".repeat(1024))])], &stats);
+        assert!(answers.first().is_some_and(Result::is_ok));
+        let stmt = db.statements.get(PUT).ok_or_else(|| anyhow::anyhow!("PUT statement was not cached"))?;
+        assert_eq!(stmt.expanded_sql().matches("NULL").count(), 5);
+        assert!(db.put([Value::Null, blob(b"invalid")?, num(2)?, num(0)?, blob(b"retained")?]).is_err());
+        let stmt = db.statements.get(PUT).ok_or_else(|| anyhow::anyhow!("PUT statement was not cached after error"))?;
+        assert_eq!(stmt.expanded_sql().matches("NULL").count(), 5, "error cleanup releases its bindings too");
+        Ok(())
+    }
+
     /// Goal 11, plan 01a1a87b2e56 step 3: a request waiting for the thread weighs what it writes (its keys,
     /// values and names) and what it names, so the queue's bound is one write's worth of values, whatever
     /// the count; a store open shows the bound on `/metrics`.
@@ -1015,7 +1084,7 @@ mod tests {
     fn g11_s3_requests_weigh_what_they_write() -> anyhow::Result<()> {
         let put = |n: usize| {
             let (tx, _) = oneshot::channel();
-            Job::Commit(Tx { conds: vec![Cond::Absent { family: "f".into(), key: b"k".to_vec() }], writes: vec![Write::Put { family: "f".into(), key: b"k".to_vec(), value: vec![0; n] }] }, tx)
+            Job::Commit(Tx { conds: vec![Cond::Absent { family: "f".into(), key: b"k".to_vec() }], writes: vec![Write::Put { family: "f".into(), key: b"k".to_vec(), value: vec![0; n] }] }, None, tx)
         };
         anyhow::ensure!(put(VALUE_MAX).weight() - put(0).weight() == VALUE_MAX);
         let (tx, _) = oneshot::channel();

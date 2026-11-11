@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { Command } from "../src/api/wire";
+
+let channelsOpened = 0;
 
 /** A browser's socket, opened when the test says, keeping what's sent on it. */
 class Socket {
@@ -13,15 +16,36 @@ class Socket {
   onopen?: () => void;
   onmessage?: (ev: { data: string | ArrayBuffer }) => void;
   onclose?: () => void;
-  constructor(url?: string) { this.url = url ?? ""; Socket.all.push(this); }
-  open() { this.readyState = Socket.OPEN; this.onopen?.(); }
-  send(text: string) { this.sent.push(text); }
-  close() { this.readyState = Socket.CLOSED; this.onclose?.(); }
-  frame(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }); }
-  said() { return this.sent.map((s) => JSON.parse(s) as { t: string; id: string; c: unknown }); }
+  constructor(url?: string) {
+    this.url = url ?? "";
+    Socket.all.push(this);
+  }
+  open() {
+    this.readyState = Socket.OPEN;
+    this.onopen?.();
+  }
+  send(text: string) {
+    this.sent.push(text);
+  }
+  close() {
+    this.readyState = Socket.CLOSED;
+    this.onclose?.();
+  }
+  frame(value: unknown) {
+    this.onmessage?.({ data: JSON.stringify(value) });
+  }
+  said() {
+    return this.sent.map((s) => JSON.parse(s) as { t: string; id: string; c: unknown });
+  }
 }
 
 Object.assign(globalThis, {
+  BroadcastChannel: class {
+    constructor() {
+      channelsOpened++;
+    }
+    postMessage() {}
+  },
   WebSocket: Socket,
   location: { protocol: "http:", host: "localhost" },
   document: new EventTarget(),
@@ -33,9 +57,12 @@ Object.assign(globalThis, {
   cancelAnimationFrame: clearImmediate,
 });
 const { SessionStore, ASKED_FOR_MS } = await import("../src/api/harness.ts");
+const { setMailScope } = await import("../src/api/client.ts");
+const { useHeld } = await import("../src/api/held.ts");
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 const attached = (ws: Socket, id: string) => {
-  for (const f of [{ t: "open", info: { id, status: "idle" } }, { t: "state", state: { status: "idle", tasks: [], delivery: {}, dropped: 0 } }, { t: "events", events: [] }, { t: "synced" }]) ws.frame(f);
+  for (const f of [{ t: "open", info: { id, status: "idle" } }, { t: "state", state: { status: "idle", tasks: [], delivery: {}, dropped: 0 } }, { t: "events", events: [] }, { t: "synced" }])
+    ws.frame(f);
 };
 
 await test("a command waits for its ack or nack, and goes again once on the next socket under its id", async () => {
@@ -53,7 +80,10 @@ await test("a command waits for its ack or nack, and goes again once on the next
     const id = first!.id;
     assert.ok(id, "it goes under an id");
     await tick();
-    assert.deepEqual(store.get().asked.map((a) => [a.id, a.state]), [[id, "pending"]]);
+    assert.deepEqual(
+      store.get().asked.map((a) => [a.id, a.state]),
+      [[id, "pending"]],
+    );
 
     // Its socket drops before its answer: the next one sends it again, once, under its id.
     ws.close();
@@ -64,7 +94,11 @@ await test("a command waits for its ack or nack, and goes again once on the next
     assert.deepEqual(next.said(), [{ t: "cmd", id, c: { type: "set_model", model: "m1" } }]);
     attached(next, "asked");
     await tick();
-    assert.deepEqual(store.get().asked.map((a) => a.state), ["pending"], "still waiting for its answer");
+    assert.deepEqual(
+      store.get().asked.map((a) => a.state),
+      ["pending"],
+      "still waiting for its answer",
+    );
 
     // Its answer: no longer waiting, and not sent again on the socket after.
     next.frame({ t: "ack", id, outcome: "taken" });
@@ -82,29 +116,22 @@ await test("a command waits for its ack or nack, and goes again once on the next
     const refused = third.said().at(-1)!.id;
     third.frame({ t: "nack", id: refused, code: "refused", why: "its runner refused it: no such effort" });
     await tick();
-    assert.deepEqual(store.get().asked.map((a) => [a.id, a.state, a.code, a.why]), [[refused, "refused", "refused", "its runner refused it: no such effort"]]);
+    assert.deepEqual(
+      store.get().asked.map((a) => [a.id, a.state, a.code, a.why]),
+      [[refused, "refused", "refused", "its runner refused it: no such effort"]],
+    );
     assert.equal(store.get().error, "its runner refused it: no such effort");
 
-    // A message goes under its own id, which its inbox takes once. Not through this time (its
-    // machine away), it waits, and goes again on the next socket; parked, likewise.
-    store.send({ type: "send", id: "m-1", text: "hello" });
-    assert.equal(third.said().at(-1)?.id, "m-1");
-    third.frame({ t: "nack", id: "m-1", code: "unreachable", why: "the session's machine is not connected", again: true });
-    await tick();
-    assert.ok(store.get().asked.some((a) => a.id === "m-1" && a.state === "pending" && a.why === "the session's machine is not connected"), "not through yet isn't refused");
-    // Its inbox not having said yet, it waits too; to a runner without inboxes, it's done with.
-    store.send({ type: "send", id: "m-2", text: "again?" });
-    third.frame({ t: "ack", id: "m-2", outcome: "pending" });
-    store.send({ type: "send", id: "m-3", text: "unchecked" });
-    third.frame({ t: "ack", id: "m-3", outcome: "unchecked" });
-    await tick();
-    assert.ok(store.get().asked.some((a) => a.id === "m-2" && a.state === "pending" && a.why?.includes("inbox")), "pending waits");
-    assert.ok(!store.get().asked.some((a) => a.id === "m-3"), "unchecked is final");
+    // Communication custody and event-driven retries are covered by session-store.test.ts;
+    // this fixture exercises the distinct command request/answer channel.
     store.send({ type: "approve", id: "a-1", decision: "allow" });
     const approve = third.said().at(-1)!.id;
     third.frame({ t: "ack", id: approve, outcome: "parked" });
     await tick();
-    assert.ok(store.get().asked.some((a) => a.id === approve && a.state === "pending" && a.why?.includes("away")), "parked waits");
+    assert.ok(
+      store.get().asked.some((a) => a.id === approve && a.state === "pending" && a.why?.includes("away")),
+      "parked waits",
+    );
     // And one not answered at all.
     store.send({ type: "interrupt" });
     const unheard = third.said().at(-1)!.id;
@@ -119,16 +146,22 @@ await test("a command waits for its ack or nack, and goes again once on the next
     } finally {
       Date.now = realNow;
     }
-    assert.ok(["m-1", "m-2", approve].every((id) => fourth.said().some((f) => f.id === id)), "each sent again under its id");
-    assert.ok(!fourth.said().some((f) => f.id === "m-3"), "never a second prompt");
+    assert.ok(
+      [approve].every((id) => fourth.said().some((f) => f.id === id)),
+      "each sent again under its id",
+    );
     assert.ok(!fourth.said().some((f) => f.id === unheard), "not sent again");
-    assert.deepEqual(store.get().asked.filter((a) => a.id === unheard).map((a) => [a.state, a.code]), [["refused", "unanswered"]]);
+    assert.deepEqual(
+      store
+        .get()
+        .asked.filter((a) => a.id === unheard)
+        .map((a) => [a.state, a.code]),
+      [["refused", "unanswered"]],
+    );
     attached(fourth, "asked");
-    fourth.frame({ t: "ack", id: "m-1", outcome: "accepted" });
-    fourth.frame({ t: "ack", id: "m-2", outcome: "accepted", accepted: { repeat: true } });
     fourth.frame({ t: "ack", id: approve, outcome: "taken" });
     await tick();
-    assert.ok(!store.get().asked.some((a) => ["m-1", "m-2", approve].includes(a.id)), "its inbox took the messages, its runner the other");
+    assert.ok(!store.get().asked.some((a) => a.id === approve), "the acknowledged command no longer waits for an answer");
 
     // Without a socket: not sent, and nothing waits for an answer.
     fourth.close();
@@ -138,5 +171,43 @@ await test("a command waits for its ack or nack, and goes again once on the next
     assert.equal(store.get().asked.length, before);
   } finally {
     off();
+  }
+});
+
+await test("unsupported durable storage opens no cross-tab channel and refuses mail before sending", async () => {
+  assert.equal(typeof indexedDB, "undefined", "this command-only browser fixture has no durable mail store");
+  assert.equal(channelsOpened, 0, "importing Held must not open a channel when its storage is unsupported");
+  setMailScope("unsupported-storage-test");
+  const store = new SessionStore("unsupported-storage");
+  const off = store.subscribe(() => {});
+  const command: Extract<Command, { type: "send" }> = {
+    type: "send",
+    id: "keep-original",
+    text: "Keep these words 日本語",
+    mode: "queue",
+    attachments: [{ name: "original.txt", mime: "text/plain", data_base64: "b3JpZ2luYWw=" }],
+    reply_to: "prior-event",
+  };
+  const original = structuredClone(command);
+  const files = [{ name: "original.txt", mime: "text/plain", blob: new Blob(["original"]) }];
+  try {
+    const ws = Socket.all.at(-1)!;
+    ws.open();
+    attached(ws, store.id);
+    await tick();
+    assert.equal(store.send(command), false, "the ordinary request channel cannot bypass durable mail custody");
+    assert.equal(await store.sendMail(command, files), false, "unsupported storage transfers no custody from the caller");
+    await tick();
+    assert.deepEqual(ws.said(), [], "no original reaches the wire before its durable save");
+    assert.deepEqual(store.get().asked, []);
+    assert.deepEqual(store.get().outgoing, []);
+    assert.equal(useHeld.getState().held[store.id], undefined);
+    assert.match(store.get().error ?? "", /could not be saved/);
+    assert.deepEqual(command, original, "the caller keeps the exact original command");
+    assert.equal(await files[0]!.blob.text(), "original", "the caller keeps the complete original file");
+    assert.equal(channelsOpened, 0);
+  } finally {
+    off();
+    setMailScope(null);
   }
 });

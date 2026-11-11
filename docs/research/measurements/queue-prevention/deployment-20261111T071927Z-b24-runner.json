@@ -1,0 +1,206 @@
+{
+  "logs": {
+    "captured_at": "2026-11-11T07:18:34.098054+00:00",
+    "service": {
+      "path": "/Users/adalundhe/Library/LaunchAgents/io.github.hyper-light.kiln-agent.plist",
+      "label": "io.github.hyper-light.kiln-agent",
+      "arguments": [
+        "/Users/adalundhe/.local/share/kiln/launcher/kiln-agent",
+        "supervise",
+        "--exe",
+        "/Users/adalundhe/.local/bin/kiln",
+        "--",
+        "agent",
+        "--server",
+        "<argument>",
+        "--name",
+        "<argument>",
+        "--labels",
+        "<argument>",
+        "--quic",
+        "<argument>"
+      ],
+      "log_paths": [
+        "/Users/adalundhe/.local/share/kiln/agent/kiln.log"
+      ]
+    },
+    "logs": [
+      {
+        "path": "/Users/adalundhe/.local/share/kiln/agent/kiln.log",
+        "size": 4904464,
+        "mtime": 1794381266.236155,
+        "matched_tail": [
+          "2026-11-11T06:59:06.074393Z  INFO a newer kiln is available for this runner: the server upgrades it as its policy there says commit=f555736bd887a4196c8841564cb9b4d6c1ede95f build=be797cf09ec9 from=uploaded here"
+        ]
+      }
+    ],
+    "instance_entries": [
+      {
+        "name": "connected",
+        "is_dir": false,
+        "size": 10,
+        "mtime": 1794380344.5019906
+      },
+      {
+        "name": "instance.json",
+        "is_dir": false,
+        "size": 74,
+        "mtime": 1793981441.205964
+      },
+      {
+        "name": "kiln-upgrade.log",
+        "is_dir": false,
+        "size": 155,
+        "mtime": 1794381241.8949444
+      },
+      {
+        "name": "update-available.json",
+        "is_dir": false,
+        "size": 115,
+        "mtime": 1794380346.0744734
+      }
+    ]
+  },
+  "specific": {
+    "captured_at": "2026-11-11T07:18:49.741249+00:00",
+    "upgrade_log": {
+      "path": "/Users/adalundhe/.local/share/kiln/agent/instances/01a1b1a064b576a5aa2d24275bba91f9/kiln-upgrade.log",
+      "lines": [
+        "",
+        "Upgrading the kiln agent beside the running one",
+        "",
+        "  runner      /Users/adalundhe/.local/bin/kiln (taken up once its jobs are done; it keeps its terminals)"
+      ]
+    },
+    "directories": [
+      {
+        "parent": "/Users/adalundhe/.local/share/kiln/agent",
+        "name": "kiln.log",
+        "is_dir": false,
+        "size": 4904464,
+        "mtime": 1794381266.236155
+      },
+      {
+        "parent": "/Users/adalundhe/.local/share/kiln/agent",
+        "name": "supervise-8a2942cb3c43.json",
+        "is_dir": false,
+        "size": 332,
+        "mtime": 1793822946.1427124
+      },
+      {
+        "parent": "/Users/adalundhe/.local/share/kiln/agent",
+        "name": "versions",
+        "is_dir": true,
+        "size": 128,
+        "mtime": 1793981441.20563
+      },
+      {
+        "parent": "/Users/adalundhe/.local/share/kiln/agent/instances",
+        "name": "01a1b1a064b576a5aa2d24275bba91f9",
+        "is_dir": true,
+        "size": 448,
+        "mtime": 1794381242.0650554
+      }
+    ],
+    "installed": {
+      "path": "/Users/adalundhe/.local/bin/kiln",
+      "sha256": "1ae92b19b6acf6a2f5e91e7efeffe0f249236fa26c30c5c5d6b71d73f2a04ad9",
+      "version": "kiln 0.2.0",
+      "version_exit": 0
+    },
+    "processes": [
+      " 1495     1 /Users/adalundhe/.local/share/kiln/launcher/kiln",
+      " 1516     1 /Users/adalundhe/.local/share/kiln/launcher/kiln-agent",
+      " 2240  1516 /Users/adalundhe/.local/share/kiln/agent/versions/4dfd3bb19754/kiln",
+      " 3352  2830 /Users/adalundhe/.local/share/kiln/agent/versions/4dfd3bb19754/kiln",
+      "43400  2240 /Users/adalundhe/.local/share/kiln/agent/versions/4dfd3bb19754/kiln",
+      "49717  1495 /Users/adalundhe/.local/bin/kiln",
+      "50135 49717 /Users/adalundhe/.local/share/kiln/ui-server/0ce080dbbe900a5d4e56/bun"
+    ]
+  },
+  "selection": {
+    "captured_at": "2026-11-11T07:19:27.156140+00:00",
+    "supervisor_saved": {
+      "path": "/Users/adalundhe/.local/share/kiln/agent/supervise-8a2942cb3c43.json",
+      "exe": "/Users/adalundhe/.local/share/kiln/agent/versions/6dc84de1b7aa/kiln",
+      "args": [
+        "--config=/Users/adalundhe/.config/kiln/kiln.toml",
+        "<argument>",
+        "--server",
+        "<argument>",
+        "--name",
+        "<argument>",
+        "--labels",
+        "<argument>",
+        "--quic",
+        "<argument>",
+        "--instance",
+        "01a1a82cd03275c1a7715b913638e70e"
+      ]
+    },
+    "installed_mtime": 1794381243.0225985,
+    "entries": [
+      {
+        "parent": "/Users/adalundhe/.local/share/kiln/agent/versions",
+        "name": "4dfd3bb19754",
+        "is_dir": true,
+        "size": 128,
+        "mtime": 1793981441.20563
+      },
+      {
+        "parent": "/Users/adalundhe/.local/share/kiln/agent/versions",
+        "name": "6dc84de1b7aa",
+        "is_dir": true,
+        "size": 128,
+        "mtime": 1793822871.6022627
+      },
+      {
+        "parent": "/Users/adalundhe/.local/share/kiln/agent/front-door",
+        "name": "settings.json",
+        "is_dir": false,
+        "size": 344,
+        "mtime": 1794380346.0699391
+      }
+    ],
+    "supervisor_log_matches": [
+      "2026-11-08T19:58:13.783337Z  INFO upgrading this runner job=01a1bcbd2823739b9df12c1b716bd74f path=/dl/kiln/aarch64-apple-darwin/9c6a14e640fb",
+      "2026-11-08T23:29:52.091729Z  INFO upgrading this runner job=01a1bd7f1bcd77ec8b75a82977e63844 path=/dl/kiln/aarch64-apple-darwin/9c6a14e640fb",
+      "2026-11-08T23:29:57.095604Z  WARN upgrade failed job=01a1bd7f1bcd77ec8b75a82977e63844 error=connect 192.168.1.90:7070: timed out",
+      "2026-11-10T23:59:01.580499Z  INFO upgrading this runner job=01a1c7e69b47778d99cf3b1f3508bd95 path=/dl/kiln/aarch64-apple-darwin/f6246da174bd",
+      "2026-11-10T23:59:10.397059Z  WARN upgrade failed job=01a1c7e69b47778d99cf3b1f3508bd95 error=request body: connection closed",
+      "2026-11-11T00:00:34.495320Z  INFO upgrading this runner job=01a1c7e806d87302abe0e7f04bd8fcf5 path=/dl/kiln/aarch64-apple-darwin/f6246da174bd",
+      "2026-11-11T00:02:35.677511Z  WARN upgrade failed job=01a1c7e806d87302abe0e7f04bd8fcf5 error=request body: connection closed",
+      "2026-11-11T00:11:32.586388Z  INFO upgrading this runner job=01a1c7f21003739695b5a901ac063e43 path=/dl/kiln/aarch64-apple-darwin/f6246da174bd",
+      "2026-11-11T04:43:50.971179Z  INFO upgrading this runner job=01a1c8eb5f4a7478a1ecc14fcd673e65 path=/dl/kiln/aarch64-apple-darwin/48d63ecf843f",
+      "2026-11-11T06:59:06.074393Z  INFO a newer kiln is available for this runner: the server upgrades it as its policy there says commit=f555736bd887a4196c8841564cb9b4d6c1ede95f build=be797cf09ec9 from=uploaded here",
+      "2026-11-11T06:59:48.505639Z  INFO upgrading this runner job=01a1c967d7b374a8a45d42685c8a174d path=/dl/kiln/aarch64-apple-darwin/be797cf09ec9"
+    ],
+    "old_runner_children": [
+      " 2240  1516 /Users/adalundhe/.local/share/kiln/agent/versions/4dfd3bb19754/kiln",
+      " 2830  2240 /Users/adalundhe/.local/bin/claude",
+      "43400  2240 /Users/adalundhe/.local/share/kiln/agent/versions/4dfd3bb19754/kiln",
+      "52507  2240 /bin/bash",
+      "52551  2240 <defunct>"
+    ]
+  },
+  "policy": {
+    "revision": "7d7e0855a5073ed5163b4fe7ed3355c9ed7c2506",
+    "rules_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+    "role": "implementer"
+  },
+  "scope": {
+    "runner": "b24c5c951260dcdfd0972f2aeaf3cf51",
+    "read_only": true,
+    "needs": "cpus=1,mem=1g,disk=1g",
+    "sync": false,
+    "mutations": []
+  },
+  "findings": [
+    "At 07:18–07:19 UTC the only kiln-agent LaunchAgent was the original service, PID1516; its connected child PID2240 still executed agent/versions/4dfd3bb19754/kiln.",
+    "The exact upgrade log reports only installer heading and replacement of /Users/adalundhe/.local/bin/kiln for later uptake. No new instance or new service appears in the inspected instance/LaunchAgent metadata.",
+    "PID2240 retained a Claude child PID2830; server zero job count does not establish an idle process tree. No shell or agent was stopped.",
+    "The installed path was modified at 1794381243.0225985, --version exits0. Its current SHA/size differ from downloaded artifact; signing/other writer cause has not been established.",
+    "The saved supervise-8a2942cb3c43.json points to older6dc84de1b7aa/instance01a1a82c...; this args-derived record is not asserted to be the currently active supervisor key.",
+    "Exact cause of failure to select/start/report the target build is unproven. Observed failure is installer completion followed by old versioned process retention and report-in timeout; no active build/download. Do not restart live child processes from this evidence alone."
+  ]
+}

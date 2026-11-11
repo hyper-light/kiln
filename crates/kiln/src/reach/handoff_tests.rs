@@ -87,6 +87,7 @@ async fn lab3() -> anyhow::Result<Lab3> {
             accept: true,
             mirrors: mirrors.clone(),
             adopt: None,
+            adopt_policy: crate::harness::moving::stream::StoragePolicy::Off,
             using: Arc::default(),
             objects: None,
             sense: false,

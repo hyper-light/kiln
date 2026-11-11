@@ -1119,7 +1119,7 @@ const Sending = React.memo(function Sending({
             <span className="hx-dim">
               ·{" "}
               <span className="hx-delivery" data-delivery={m.state}>
-                {failed ? "failed to send" : m.state === "sent" ? "sent" : "sending…"}
+                {failed ? "failed to send" : m.state === "sent" ? "sent" : m.state === "retained" ? "retained by Kiln" : m.state === "waiting" ? "waiting for capacity" : "sending…"}
               </span>
             </span>
             {m.attachments.length > 0 && (
@@ -1131,6 +1131,11 @@ const Sending = React.memo(function Sending({
           </div>
           {m.reply_to && <Quote id={m.reply_to} />}
           <div className="hx-prompt-text">{m.text}</div>
+          {(m.state === "waiting" || m.state === "retained") && m.why && (
+            <div className="hx-dim" role="status">
+              {m.why}
+            </div>
+          )}
           {failed && (
             <div className="hx-send-failed" role="alert">
               <span>{why}</span>
@@ -1835,7 +1840,9 @@ export const Timeline = React.memo(function Timeline({
   const mine = React.useMemo(() => outgoing.filter((m) => (thread ? m.task === thread : !m.task)), [outgoing, thread]);
   const resend = React.useCallback(
     (id: string) => {
-      if (!store.resend(id)) toast.error("Not connected", "The page is reconnecting to the agent; try again in a moment.");
+      void store.resend(id).then((accepted) => {
+        if (!accepted) toast.error("Message stayed here", "The original remains saved; check the connection and browser storage.");
+      });
     },
     [store],
   );

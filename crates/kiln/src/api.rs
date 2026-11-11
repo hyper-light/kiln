@@ -1362,9 +1362,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         // would be read).
         (&Method::GET, ["api", "harness", "agents", "wait"]) => Err(err(StatusCode::METHOD_NOT_ALLOWED, "agents.wait takes delivery of your messages, so it's a POST: send its input as a JSON body")),
         (&Method::GET, ["api", "harness", "agents", id]) => boxed(|| own_op(&hub, &caller, "agents.get", json!({ "agent": id }))).await,
-        (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children")]) => {
-            let op = format!("agents.{what}");
-            boxed(|| own_op(&hub, &caller, &op, json!({ "agent": id }))).await
+        (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children" | "messages" | "message-body")]) => {
+            let op = format!("agents.{}", what.replace('-', "_"));
+            let mut input = query_value(&q);
+            if let Some(input) = input.as_object_mut() { input.insert("agent".into(), json!(id)); }
+            boxed(|| own_op(&hub, &caller, &op, input)).await
         }
         (&Method::GET, ["api", "harness", "changes"]) => boxed(|| own_op(&hub, &caller, "agents.changes", query_value(&q))).await,
         (&Method::GET, ["api", "harness", "agents", id, "workspace"]) => boxed(|| own_op(&hub, &caller, "agents.workspace", json!({ "agent": id }))).await,
@@ -3062,6 +3064,7 @@ fn me_json(hub: &Hub, caller: Option<&crate::authz::Caller>, groups: Vec<String>
         // Who (W10-R01): `admin` for the owner, `user:<name>`, a token, a job; and what they
         // hold, when that isn't everything.
         "principal": caller.map(|c| c.name.clone()),
+        "mail_scope": caller.map(|c| crate::util::sha256_hex(format!("mail-scope-v1:{}", crate::harness::ops::key_scope(c)).as_bytes())),
         "kind": caller.map(|c| c.kind),
         "grants": caller.and_then(crate::authz::Caller::grants),
         "groups": groups,
@@ -6508,6 +6511,10 @@ async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
 /// The API's answer to a command: what became of it, as an HTTP status.
 fn answer_command(sent: crate::harness::registry::Sent, message: Option<String>) -> R {
     match sent {
+        crate::harness::registry::Sent::Published(publication) => Ok(srv::json(StatusCode::ACCEPTED, &json!({"retained": true, "publication": publication, "message": message}))),
+        crate::harness::registry::Sent::PublicationRefused(error) => {
+            Ok(srv::json(error.status_code(), &json!({"retained": false, "error": error, "message": message})))
+        }
         crate::harness::registry::Sent::Ok | crate::harness::registry::Sent::Taken => Ok(srv::status(StatusCode::NO_CONTENT)),
         // Waits for its runner, which is away: it goes once the runner is back.
         crate::harness::registry::Sent::Parked => Ok(srv::json(StatusCode::ACCEPTED, &json!({"parked": true}))),
@@ -6525,8 +6532,7 @@ fn answer_command(sent: crate::harness::registry::Sent, message: Option<String>)
     }
 }
 
-/// A file for a message (larger than fits inline): kept briefly, sent with the message that
-/// names its `file_id`. `?name=&mime=`; the body is the file.
+/// A file for a message: immutable bytes and metadata commit before returning its upload id.
 async fn harness_upload(hub: &Hub, q: &HashMap<String, String>, req: Request) -> R {
     let limit = usize::try_from(crate::harness::host::ATTACHMENT_MAX).unwrap_or(usize::MAX);
     let data = srv::body_bytes(req.into_body(), limit).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
@@ -6536,7 +6542,7 @@ async fn harness_upload(hub: &Hub, q: &HashMap<String, String>, req: Request) ->
     let name = q.get("name").cloned().unwrap_or_else(|| "file".to_owned());
     let mime = q.get("mime").cloned().unwrap_or_else(|| "application/octet-stream".to_owned());
     let size = data.len();
-    let id = hub.harness.upload(name, mime, data).map_err(|e| err(StatusCode::INSUFFICIENT_STORAGE, format!("{e:#}")))?;
+    let id = hub.harness.upload(hub, name, mime, data).await.map_err(|e| err(e.status_code(), serde_json::to_string(&e).unwrap_or_else(|_| "attachment custody was not accepted".into())))?;
     Ok(srv::json(StatusCode::OK, &json!({"file_id": id, "size": size})))
 }
 
@@ -7240,6 +7246,8 @@ fn refusal_frame(sent: crate::harness::registry::Sent) -> Option<String> {
     use crate::harness::registry::Sent;
     match sent {
         Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => None,
+        Sent::Published(publication) => Some(session_error(format!("communication {} is retained, awaiting receiver capacity", publication.id))),
+        Sent::PublicationRefused(error) => Some(session_error(format!("communication not accepted: {error}"))),
         Sent::Refused(r) => Some(SessionDown::from(SessionFrame::Error { error: r.to_string(), refused: Some(r) }).text()),
         s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => s.failure().map(|(_, why)| session_error(why)),
         Sent::NoSession => Some(session_error("this session is gone".into())),

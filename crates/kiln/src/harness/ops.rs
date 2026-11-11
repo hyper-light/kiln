@@ -216,6 +216,7 @@ async fn about(cx: Cx, v: Value) -> Out {
 async fn send(cx: Cx, v: Value) -> Out {
     let id = agent_of(&v)?;
     let words = text(&v, "text")?;
+    let status = status_of(&v)?;
     let body = words.clone();
     // CP-T3.2: agent-to-agent messages enter the turn under way instead of waiting behind it.
     let default_mode = if cx.caller.agent.is_some() { "steer" } else { "queue" };
@@ -246,7 +247,6 @@ async fn send(cx: Cx, v: Value) -> Out {
         Some(sender) => super::queued::from_agent_as(sender, &made),
         None => made,
     };
-    wait::sent(&id, info.last_turn.as_ref().map(|t| t.at));
     // An agent's words, its call relayed signed by its runner and taken: kiln passes them on too,
     // its record and the ones before it going with them, for the recipient's runner to check end to
     // end (docs/ci.md W27-R08's relays).
@@ -254,54 +254,89 @@ async fn send(cx: Cx, v: Value) -> Out {
         Some(c) => crate::relays::words(&cx.hub, &id, c).await,
         None => None,
     };
-    let mut c = Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
-    let mut record = None;
-    let sent = match relayed {
-        Some((relayed, seq, digest)) => {
-            record = Some(digest);
-            // A test build's faulty relay (`relay_words`): every second one dropped, swapped for the
-            // one before, or a byte of it changed, after kiln recorded passing it on.
-            use crate::runner::chaos::RelayFault;
-            let relayed = match crate::runner::chaos::get().and_then(|f| f.relay_words).filter(|_| RelayFault::strikes(seq)) {
-                Some(RelayFault::Drop) => return Ok(json!({"sent": true, "message": message})),
-                Some(RelayFault::Alter) => {
-                    if let Command::Send { text, .. } = &mut c {
-                        text.push('!');
-                    }
-                    relayed
-                }
-                Some(RelayFault::Swap) => match cx.hub.relays.swapped(&relayed) {
-                    Some((other, words)) => {
-                        if let Command::Send { text, .. } = &mut c {
-                            *text = words;
-                        }
-                        other
-                    }
-                    None => relayed,
-                },
-                None => relayed,
-            };
-            cx.hub.harness.command_relayed(&cx.hub, &id, c, relayed).await
-        }
-        None => cx.hub.harness.command(&cx.hub, &id, c).await,
+    let command = Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+    let owner = mail_owner(&cx).await;
+    let sender = key_scope(&cx.caller);
+    let provenance = relayed.map(|(relayed, seq, digest)| json!({"relayed": relayed, "seq": seq, "digest": digest}));
+    // Fault injection belongs after durable custody, at wire delivery. The ledger keeps these
+    // exact original words and their original proof, even when a test corrupts the transmission.
+    let receipt = cx.hub.harness.command_published(&cx.hub, &id, command, provenance, owner, sender, status).await.map_err(mail_failed)?;
+    wait::sent(&id, info.last_turn.as_ref().map(|t| t.at));
+    publication_answer(&receipt)
+}
+
+fn publication_answer(receipt: &super::mail::Receipt) -> Out {
+    // `sent` already covered offline forwarding. Keep those public aliases while the receipt
+    // states custody precisely; a receiver's `accepted` answer cannot be inferred from it.
+    #[derive(serde::Serialize)]
+    struct Published<'a> {
+        sent: bool,
+        retained: bool,
+        message: &'a str,
+        #[serde(flatten)]
+        publication: &'a super::mail::Receipt,
+    }
+    serde_json::to_value(Published { sent: true, retained: true, message: &receipt.id, publication: receipt }).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn status_of(v: &Value) -> Result<Option<super::mail::StatusKey>, Fail> {
+    let Some(status) = v.get("status").filter(|v| !v.is_null()) else { return Ok(None) };
+    let status: super::mail::StatusKey = serde_json::from_value(status.clone()).map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid explicit status scope: {e}")))?;
+    if status.key.is_empty() || status.key.chars().any(char::is_control) || status.task.as_deref().is_some_and(|s| s.is_empty() || s.chars().any(char::is_control)) {
+        return Err((StatusCode::BAD_REQUEST, "status key/task are nonempty labels without control characters".into()));
+    }
+    Ok(Some(status))
+}
+
+async fn mail_owner(cx: &Cx) -> String {
+    if let Some(agent) = &cx.caller.agent && let Some(owner) = crate::mcp::acts_for(&cx.hub, agent).await { return owner; }
+    cx.caller.user.as_ref().map(|u| format!("user:{u}")).or_else(|| cx.caller.opener()).unwrap_or_else(|| key_scope(&cx.caller))
+}
+
+fn mail_failed(error: super::mail::Error) -> Fail {
+    (error.status_code(), serde_json::to_string(&error).unwrap_or_else(|_| "communication custody failed".into()))
+}
+
+fn mail_number(v: &Value, key: &str) -> Result<Option<u64>, Fail> {
+    let Some(value) = v.get(key).filter(|v| !v.is_null()) else { return Ok(None) };
+    value.as_u64().or_else(|| value.as_str().and_then(|s| s.parse().ok())).map(Some).ok_or_else(|| (StatusCode::BAD_REQUEST, format!("{key} must be a nonnegative integer")))
+}
+
+fn mail_budget(v: &Value) -> Result<usize, Fail> {
+    let bytes = mail_number(v, "bytes")?.unwrap_or(super::state_view::FRAME as u64);
+    usize::try_from(bytes).ok().filter(|n| *n > 0 && *n <= super::state_view::FRAME).ok_or_else(|| (StatusCode::BAD_REQUEST, format!("bytes must fit the {} byte control frame", super::state_view::FRAME)))
+}
+
+async fn mail_scope(cx: &Cx, v: &Value) -> Result<(String, String, String), Fail> {
+    let recipient = known(cx, &agent_of(v)?)?.id;
+    lineage::may_message(&cx.hub, &cx.caller, &recipient).await?;
+    let own_sender = key_scope(&cx.caller);
+    let sender = v.get("from").and_then(Value::as_str).unwrap_or(&own_sender).to_owned();
+    // Outgoing history is the sender's. Reading another sender's incoming history requires
+    // permission to see the recipient's conversation, not merely permission to send it a note.
+    if sender != own_sender { lineage::may_see(&cx.hub, &cx.caller, &recipient).await?; }
+    if sender.is_empty() || sender.chars().any(char::is_control) { return Err((StatusCode::BAD_REQUEST, "from must be an authenticated sender identity".into())); }
+    Ok((mail_owner(cx).await, sender, recipient))
+}
+
+async fn messages(cx: Cx, v: Value) -> Out {
+    let (owner, sender, recipient) = mail_scope(&cx, &v).await?;
+    let status = match v.get("status_key").and_then(Value::as_str) {
+        Some(key) => Some(super::mail::StatusKey { task: v.get("task").and_then(Value::as_str).map(str::to_owned), key: key.to_owned() }),
+        None if v.get("task").is_some() => return Err((StatusCode::BAD_REQUEST, "task requires status_key".into())),
+        None => None,
     };
-    // Words kiln recorded passing on that it couldn't deliver: said so at once, not left for a
-    // receipt that won't come.
-    if let Some(record) = record
-        && matches!(sent, Sent::NoSession | Sent::Unreachable | Sent::Rejected { .. } | Sent::Unanswered(_))
-    {
-        crate::relays::undelivered(&cx.hub, &record, &format!("{sent:?}")).await;
-    }
-    match sent {
-        Sent::Ok | Sent::Taken => Ok(json!({"sent": true, "message": message})),
-        // Its machine is away: it goes once that's back, once.
-        Sent::Parked => Ok(json!({"sent": true, "parked": true, "message": message})),
-        Sent::Accepted(a) => Ok(super::registry::accepted(&message, &a)),
-        Sent::Refused(r) => Err(refused(&r)),
-        s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => Err(s.failure().unwrap_or((StatusCode::CONFLICT, "its runner refused it".to_owned()))),
-        Sent::NoSession => Err((StatusCode::NOT_FOUND, format!("no agent {id}"))),
-        Sent::Unreachable => Err((StatusCode::BAD_GATEWAY, format!("{}'s machine isn't connected right now: try again once it's back", info.name))),
-    }
+    let page = super::mail::history(&cx.hub.store, owner, sender, recipient, status, mail_number(&v, "after")?.unwrap_or(0), mail_budget(&v)?).await.map_err(mail_failed)?;
+    serde_json::to_value(page).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn message_body(cx: Cx, v: Value) -> Out {
+    let (owner, sender, recipient) = mail_scope(&cx, &v).await?;
+    let revision = mail_number(&v, "revision")?.ok_or_else(|| (StatusCode::BAD_REQUEST, "revision is required".into()))?;
+    let offset = usize::try_from(mail_number(&v, "offset")?.unwrap_or(0)).map_err(|_| (StatusCode::BAD_REQUEST, "offset exceeds this platform's range".into()))?;
+    let read = super::mail::BodyRead { revision, path: v.get("path").and_then(Value::as_str).unwrap_or("").to_owned(), offset };
+    let reply = super::mail::body(&cx.hub.store, owner, sender, recipient, read, mail_budget(&v)?).await.map_err(mail_failed)?;
+    serde_json::to_value(reply).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 /// Longest idempotency key.
@@ -380,39 +415,54 @@ pub fn peer_words(text: &str) -> &str {
     body_of(text)
 }
 
-/// The messages other agents sent the agent that waits, waiting behind the turn its wait began in
-/// (`wait::mail`), handed over: each taken for this wait alone and out of its queue (one that can't
-/// be stays, for after its turn), with who sent it and its words.
-async fn hand_over(hub: &crate::hub::Hub, me: &wait::Waiter) -> Vec<Value> {
-    let mut out = Vec::new();
-    let Some(mut info) = hub.harness.info(&me.id) else { return out };
-    let mail = match super::state_reads::mail(hub, me, &info).await {
-        Ok(mail) => mail,
-        Err(_) => return out,
-    };
-    if mail.is_empty() {
-        return out;
+fn clear_handoff(out: &mut Value) {
+    if let Some(object) = out.as_object_mut() { object.remove("messages"); object.remove("mail_handoff"); }
+}
+
+fn stage_handoff(out: &mut Value, handoff: &str, turn: Option<i64>, messages: Vec<Value>) -> Result<String, super::state_reads::Failure> {
+    use super::state_reads::Failure;
+    let digest = wait::handoff_digest(handoff, turn, &messages)?;
+    let object = out.as_object_mut().ok_or(Failure::Malformed)?;
+    if object.contains_key("messages") || object.contains_key("mail_handoff") { return Err(Failure::Malformed); }
+    object.insert("messages".into(), Value::Array(messages));
+    object.insert("mail_handoff".into(), json!({"id": handoff, "turn": turn}));
+    if super::state_view::encode(out, super::state_view::FRAME).is_err() {
+        clear_handoff(out);
+        return Err(Failure::Source(super::state_view::Error::Budget));
     }
+    Ok(digest)
+}
+
+/// Register one exact response while the source retains its queue bodies and input leases.
+/// Neither this HTTP return nor a source registration ACK proves native tool-result delivery.
+async fn hand_over(hub: &crate::hub::Hub, me: &wait::Waiter, out: &mut Value) -> Result<(), super::state_reads::Failure> {
+    use super::state_reads::Failure;
+    let Some(info) = hub.harness.info(&me.id) else { return Ok(()) };
+    let mail = super::state_reads::mail(hub, me, &info).await?;
+    if mail.is_empty() { return Ok(()); }
+    let revision = info.queue_revision.as_ref().ok_or(Failure::NotReady)?;
+    let (mut messages, mut ids, mut claims) = (Vec::new(), Vec::new(), Vec::new());
+    let mut files_wait = false;
     for id in mail {
-        let Ok(Some(observed)) = super::state_reads::item(hub, &me.id, &info, &id).await else { continue };
-        let q = &observed.value;
-        let Some(from) = super::queued::sender_of(&q.id).map(str::to_owned) else { continue };
-        let Some(claim) = wait::claim_for(&q.id) else { continue };
-        let next = match super::state_reads::remove(hub, &me.id, &observed).await {
-            Ok(super::state_reads::Removal::Applied { revision }) => revision,
-            Ok(super::state_reads::Removal::Unchanged)
-                | Err(super::state_reads::Failure::Source(super::state_view::Error::Stale | super::state_view::Error::InvalidPath)) => {
-                    claim.release();
-                    continue;
-                }
-            Err(_) => continue,
-        };
+        let Some(observed) = super::state_reads::item(hub, &me.id, &info, &id).await? else { continue };
+        if observed.revision.as_ref() != Some(revision) { return Err(Failure::NotReady); }
+        let q = observed.value;
+        // A text-only native result cannot prove delivery of attached files.
+        if !q.attachments.is_empty() { files_wait = true; continue; }
+        let Some(from) = super::queued::sender_of(&q.id).filter(|from| *from != me.id).map(str::to_owned) else { continue };
+        let Some(claim) = wait::claim_for(me, &q.id) else { continue };
         let name = hub.harness.info(&from).map(|i| i.name);
-        out.push(json!({"from": from, "name": name, "text": body_of(&q.text), "at": q.at}));
-        if observed.revision.is_some() && next.is_none() { break; }
-        info.queue_revision = next;
+        messages.push(json!({"id": q.id, "from": from, "name": name, "text": body_of(&q.text), "at": q.at}));
+        ids.push(q.id);
+        claims.push(claim);
     }
-    out
+    if messages.is_empty() { return if files_wait { Err(Failure::Source(super::state_view::Error::Unreadable)) } else { Ok(()) }; }
+    let handoff = crate::util::new_id();
+    let digest = stage_handoff(out, &handoff, me.turn(), messages)?;
+    let result = super::state_reads::register_handoff(hub, &me.id, revision.clone(), handoff, me.turn(), ids, digest).await;
+    if result.is_err() { clear_handoff(out); }
+    drop(claims);
+    result
 }
 
 /// The agents a wait is for: `agent`, or `agents`.
@@ -473,15 +523,9 @@ async fn wait_for(cx: Cx, v: Value) -> Out {
             super::told::saw(&cx.hub, &info).await;
         }
     }
-    // The messages other agents sent it: delivered here, not after its turn.
-    if let Some(me) = &me {
-        let handed = hand_over(&cx.hub, me).await;
-        if !handed.is_empty()
-            && let Some(o) = out.as_object_mut()
-        {
-            o.insert("messages".into(), json!(handed));
-        }
-    }
+    // Only registered mail is returned. The source still owns each original until it proves
+    // native result delivery; failed or lost registration never becomes queue removal.
+    if let Some(me) = &me && let Err(error) = hand_over(&cx.hub, me, &mut out).await && let Some(object) = out.as_object_mut() { object.insert("mail_handoff_error".into(), json!(error)); }
     Ok(out)
 }
 
@@ -647,6 +691,8 @@ async fn interrupt(cx: Cx, v: Value) -> Out {
     let id = info.id.clone();
     may_steer(&cx, &id).await?;
     match cx.hub.harness.command(&cx.hub, &id, Command::Interrupt).await {
+        Sent::Published(receipt) => Ok(json!({"publication": receipt})),
+        Sent::PublicationRefused(error) => Err(mail_failed(error)),
         Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => Ok(json!({"interrupted": true})),
         Sent::Refused(r) => Err(refused(&r)),
         s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => Err(s.failure().unwrap_or((StatusCode::CONFLICT, "its runner refused it".to_owned()))),
@@ -754,7 +800,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.send",
-            summary: "Send an agent a message: `steer` into the turn under way (the default when an agent sends), or `queue` after its turn (the default when a person sends). To an agent you started (and theirs), `now` stops its turn. Any other agent that works for the same person may receive steered or queued messages, and is told the message is from you and how to answer you. Give a `key` to send it safely again: a call with the same key is the same message, which the agent gets once, and every such call is answered as the first was.",
+            summary: "Send an agent a distinct instruction, decision request or result: steer into its turn (agents' default), queue after it (people's default), or now to stop a turn of an agent you started. Same-person peers may receive steered/queued messages and are told who sent them. Give a new immutable key per publication; retry with that key and exact content for the same receipt. Only explicitly replaceable progress may set status:{key,task?}: latest never-dispatched status replaces prior pending presentation in that stream, while every accepted original stays in agents.messages. A dispatched revision is frozen until actual consumption. Publish progress when it changes what the recipient can do; do not send repeated unchanged checkpoints. Instructions and final results use ordinary sends. A durable waiting receipt means retained custody, not model delivery; typed backpressure/storage failure means no acceptance and you retain the original.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsSend>(),
@@ -762,8 +808,26 @@ pub fn list_ops() -> Vec<Op> {
             run: |cx, v| Box::pin(send(cx, v)),
         },
         Op {
+            name: "agents.messages",
+            summary: "Read byte-bounded pages of your accepted original communications to an agent, including superseded explicit statuses. after is the prior page cursor; status_key/task optionally select one status stream. from defaults to your authenticated sender identity; reading another sender requires permission to see the recipient's conversation. A too-large revision can be inspected with agents.message_body.",
+            read_only: true,
+            destructive: false,
+            input: Input::of::<input::AgentsMessages>(),
+            route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "messages"]))),
+            run: |cx, v| Box::pin(messages(cx, v)),
+        },
+        Op {
+            name: "agents.message_body",
+            summary: "Inspect an immutable communication revision by JSON pointer (empty path starts at its envelope; /command/text reads its words). Objects page keys, arrays expose length, strings return UTF-8 ranges with next offsets. bytes bounds the complete reply; original content is never clipped or replaced. Uses the same recipient/sender authorization as agents.messages.",
+            read_only: true,
+            destructive: false,
+            input: Input::of::<input::AgentsMessageBody>(),
+            route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "message-body"]))),
+            run: |cx, v| Box::pin(message_body(cx, v)),
+        },
+        Op {
             name: "agents.wait",
-            summary: "Wait until agents settle (`until: settled`, the default: each is idle, needs a person, is paused for a usage limit, has stopped or has ended) or until anything about them changes (`until: change`), all of them or with `any` the first, up to `timeout_s` (default 300, at most 600; call again to wait longer). Returns where each stands. A message sent just before counts: an agent isn't settled until it has had its turn. Messages other agents send you don't wait behind your turn while you wait: it returns early once one is in your queue, with them in `messages` (who sent each, `from` and `name`, and its `text`), taken out of your queue since they're delivered now (a program's waits in code mode don't hand them over unless they pass `hand_over: true`, and then must return them). So a wait is a change, not a read: what it hands over leaves your queue. You needn't wait: kiln tells you when each agent you started settles; wait when you can't go on without it.",
+            summary: "Wait until agents settle (`until: settled`, the default: idle, needing a person, paused, stopped or ended) or anything about them changes (`until: change`), all of them or with `any` the first. `timeout_s` defaults to 300, at most 600. A message sent just before counts until its agent has had its turn. Your peer mail may return early in `messages`, with exact `id`, sender `from`/`name`, `text` and `at`, plus `mail_handoff`. The source keeps each original queued until it proves the exact native tool result reached your turn; an HTTP return does not consume mail. Missing proof and attachment-bearing messages remain for normal delivery. Code-mode waits hand over only with `hand_over: true`; return the complete messages and marker unchanged. You needn't wait: kiln tells you when an agent you started settles. Wait when you can't continue without it.",
             // Not read-only: it takes delivery of the waiter's own messages, which then live only in
             // its answer. A client may run a read-only tool beside others, again or ahead of time and
             // drop the answer; this one's would be lost with it.
@@ -1008,6 +1072,31 @@ pub mod input {
         /// with it (its answer lost), the message is the same one, delivered once. Without it, each
         /// call is another message: pass it whenever you may send it again.
         pub key: Option<String>,
+        /// Explicitly replaceable progress only. This is separate from the immutable retry key;
+        /// task is a workflow label, not source task routing or additional permission.
+        pub status: Option<super::super::mail::StatusKey>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsMessages {
+        pub agent: String,
+        pub from: Option<String>,
+        pub status_key: Option<String>,
+        pub task: Option<String>,
+        pub after: Option<u64>,
+        pub bytes: Option<usize>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsMessageBody {
+        pub agent: String,
+        pub from: Option<String>,
+        pub revision: u64,
+        pub path: Option<String>,
+        pub offset: Option<usize>,
+        pub bytes: Option<usize>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1237,6 +1326,32 @@ mod tests {
     }
 
     #[test]
+    fn status_is_only_explicit_and_does_not_reuse_the_publication_key() -> anyhow::Result<()> {
+        assert_eq!(status_of(&json!({"text":"status: tests pass", "key":"publication"})).ok(), Some(None));
+        let status = status_of(&json!({"status":{"key":"build", "task":"task-a"}, "key":"publication-a"})).map_err(|(_, e)| anyhow::anyhow!(e))?.ok_or_else(|| anyhow::anyhow!("missing explicit status"))?;
+        assert_eq!(status.key, "build");
+        assert_eq!(status.task.as_deref(), Some("task-a"));
+        assert!(status_of(&json!({"status":{"key":""}})).is_err());
+        assert!(status_of(&json!({"status":{"key":"build", "unknown":true}})).is_err());
+        assert!(mail_number(&json!({"after":"18446744073709551615"}), "after").is_ok_and(|v| v == Some(u64::MAX)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_publication_keeps_send_aliases_without_inventing_receiver_acceptance() -> anyhow::Result<()> {
+        let receipt = super::super::mail::Receipt { id: "original".into(), revision: 7, generation: 2, disposition: super::super::mail::Disposition::Waiting, repeat: true };
+        let answer = publication_answer(&receipt).map_err(|(_, e)| anyhow::anyhow!(e))?;
+        assert_eq!(answer.get("sent"), Some(&json!(true)));
+        assert_eq!(answer.get("retained"), Some(&json!(true)));
+        assert_eq!(answer.get("message"), answer.get("id"));
+        assert_eq!(answer.get("revision"), Some(&json!(7)));
+        assert_eq!(answer.get("repeat"), Some(&json!(true)));
+        assert_eq!(answer.get("disposition"), Some(&json!("waiting")));
+        assert!(answer.get("accepted").is_none(), "server custody cannot establish receiver admission");
+        Ok(())
+    }
+
+    #[test]
     fn waits_say_whom_they_wait_for() {
         assert_eq!(ids_of(&json!({"agent": "a"})).ok(), Some(vec!["a".to_owned()]));
         assert_eq!(ids_of(&json!({"agents": ["a", "b"]})).ok(), Some(vec!["a".to_owned(), "b".to_owned()]));
@@ -1268,15 +1383,17 @@ mod tests {
 /// the registry). No harness ever runs: the children's folder doesn't exist, so they can't start,
 /// and the parent's program is missing.
 #[cfg(test)]
-mod end_to_end {
+pub(crate) mod end_to_end {
     use std::sync::Arc;
     use std::time::Duration;
 
     use serde_json::{Value, json};
 
     use crate::harness::session::Spec;
+    use crate::harness::wait;
     use crate::hub::Hub;
     use crate::ops::{Cx, call};
+    use super::{clear_handoff, stage_handoff};
 
     /// A parent agent kiln runs on the server, in mode `mode`.
     async fn parent(hub: &Arc<Hub>, mode: &str, allow_bypass: bool) -> anyhow::Result<String> {
@@ -1322,6 +1439,10 @@ mod end_to_end {
         let h = Arc::clone(&hub);
         crate::rt::spawn(async move {
             let _ = crate::harness::registry::Registry::run_local(h).await;
+        });
+        let h = Arc::clone(&hub);
+        crate::rt::spawn(async move {
+            let _ = crate::harness::mail_delivery::run(h).await;
         });
         hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
         Ok(hub)
@@ -1437,29 +1558,123 @@ mod end_to_end {
         })
     }
 
-    /// An agent kiln runs on the server whose harness keeps every line it's sent, in `heard`.
+    /// Protocol fixture only: Busy never reports completed work; Complete records each exact
+    /// input before emitting the correlated successful result that the production adapter needs.
     #[cfg(unix)]
-    async fn recording(hub: &Arc<Hub>, dir: &std::path::Path) -> anyhow::Result<(String, std::path::PathBuf)> {
+    pub(crate) fn recording_program(dir: &std::path::Path, complete: bool) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
         use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir)?;
         let heard = dir.join("heard.jsonl");
+        let script = dir.join("recording.py");
+        std::fs::write(&script, r##"import hashlib, json, math, os, select, sys, time, uuid
+result_gate = os.environ.get("KILN_TEST_RESULT_GATE")
+heard, complete = sys.argv[1], sys.argv[2] == "complete"
+if "--version" in sys.argv[3:]:
+    print("2.1.296 (Claude Code)")
+    sys.exit(0)
+session = str(uuid.uuid4())
+def out(value):
+    print(json.dumps(value), flush=True)
+for line in sys.stdin:
+    value = json.loads(line)
+    if value.get("type") == "control_request":
+        response = {}
+        if (value.get("request") or {}).get("subtype") == "initialize":
+            response = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": "2.1.296"}
+        out({"type": "control_response", "response": {"subtype": "success", "request_id": value.get("request_id"), "response": response}})
+    elif value.get("type") == "user":
+        started = time.monotonic_ns()
+        with open(heard, "a") as file:
+            file.write(json.dumps(value) + "\n")
+            file.flush()
+            os.fsync(file.fileno())
+        result = hashlib.sha256(json.dumps(value.get("message"), sort_keys=True).encode()).hexdigest()
+        elapsed_ms = math.ceil((time.monotonic_ns() - started) / 1000000)
+        uid = value.get("uuid")
+        gate = os.open(result_gate, os.O_RDONLY | os.O_NONBLOCK) if complete and result_gate else None
+        gate_writer = os.open(result_gate, os.O_WRONLY | os.O_NONBLOCK) if gate is not None else None
+        result_gate = None
+        out({"type": "command_lifecycle", "command_uuid": uid, "state": "started", "session_id": session})
+        out({"type": "system", "subtype": "init", "cwd": ".", "session_id": session, "tools": [], "mcp_servers": [], "model": "fixture", "permissionMode": "default", "claude_code_version": "2.1.296"})
+        if complete:
+            if gate is not None:
+                select.select([gate], [], [])
+                if os.read(gate, 1) != b"1":
+                    raise RuntimeError("private result gate closed without release")
+                os.close(gate)
+                os.close(gate_writer)
+            out({"type": "assistant", "message": {"id": str(uuid.uuid4()), "type": "message", "role": "assistant", "model": "fixture", "content": [{"type": "text", "text": result}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}}, "parent_tool_use_id": None, "session_id": session})
+            out({"type": "result", "subtype": "success", "terminal_reason": "completed", "is_error": False, "duration_ms": elapsed_ms, "duration_api_ms": elapsed_ms, "num_turns": 1, "user_message_uuid": uid, "result": result, "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+            out({"type": "command_lifecycle", "command_uuid": uid, "state": "completed", "session_id": session})
+"##)?;
         let program = dir.join("recording-claude");
-        std::fs::write(&program, format!("#!/bin/sh\nexec cat >> '{}'\n", heard.display()))?;
+        std::fs::write(&program, format!("#!/bin/sh\nexec python3 '{}' '{}' '{}' \"$@\"\n", script.display(), heard.display(), if complete { "complete" } else { "busy" }))?;
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+        Ok((program, heard))
+    }
+
+    /// Listen before checking both source state and durable receipts. The protocol deadline is
+    /// a hang bound; no timer retries a predicate or grants source capacity.
+    pub(crate) async fn source_until<F, Fut>(hub: &Hub, id: &str, what: &str, mut check: F) -> anyhow::Result<()>
+    where F: FnMut() -> Fut, Fut: std::future::Future<Output = anyhow::Result<bool>> {
+        use futures::{FutureExt as _, future::{Either, select}};
+        use kiln_seams::Bus as _;
+        let attached = hub.harness.attach(id).ok_or_else(|| anyhow::anyhow!("{what}: no source"))?;
+        let mut at = attached.at.ok_or_else(|| anyhow::anyhow!("{what}: no source feed"))?;
+        let committed = hub.store.changes().watch(crate::harness::mail::TABLES);
+        let operation = async {
+            loop {
+                let revision = hub.store.changes().of(crate::harness::mail::TABLES);
+                if check().await? { return Ok(()); }
+                anyhow::ensure!(attached.viewer.refusals() == attached.refusals, "{what}: source feed lost");
+                let batch = hub.bus.read(&attached.topic, at, 1).await.map_err(|e| anyhow::anyhow!("{what}: {e:?}"))?;
+                at = batch.next;
+                if !batch.messages.is_empty() || revision != hub.store.changes().of(crate::harness::mail::TABLES) { continue; }
+                futures::select_biased! {
+                    result = hub.bus.wait(&attached.topic, at).fuse() => result.map_err(|e| anyhow::anyhow!("{what}: {e:?}"))?,
+                    () = committed.notified().fuse() => {},
+                }
+            }
+        };
+        let clock = crate::rt::clock();
+        let deadline = clock.sleep(crate::harness::registry::ANSWER_WAIT);
+        futures::pin_mut!(operation, deadline);
+        match select(operation, deadline).await {
+            Either::Left((result, _)) => result,
+            Either::Right(_) => anyhow::bail!("{what}: source protocol deadline"),
+        }
+    }
+
+    pub(crate) async fn source_ready(hub: &Hub, id: &str) -> anyhow::Result<()> {
+        source_until(hub, id, "authoritative source capacity", || async {
+            Ok(crate::harness::mail_delivery::capacity(hub, id).is_some_and(|capacity| capacity.target > 0))
+        }).await
+    }
+
+    pub(crate) async fn source_disposition(hub: &Hub, id: &str, message: &str, consumed: bool) -> anyhow::Result<()> {
+        source_until(hub, id, "correlated durable source receipt", || {
+            let recipient = id.to_owned();
+            let message = message.to_owned();
+            async move {
+                hub.store.read(move |connection| {
+                    Ok(connection.query_row("SELECT COUNT(*) FROM agent_mail WHERE recipient=?1 AND id=?2 AND (disposition='consumed' OR (NOT ?3 AND disposition='admitted'))", rusqlite::params![recipient, message, consumed], |row| row.get::<_, i64>(0))? == 1)
+                }).await
+            }
+        }).await
+    }
+
+    #[cfg(unix)]
+    async fn recording(hub: &Arc<Hub>, dir: &std::path::Path, complete: bool) -> anyhow::Result<(String, std::path::PathBuf)> {
+        let (program, heard) = recording_program(dir, complete)?;
         let spec = Spec { kind: "claude".into(), cwd: Some(dir.to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
         let id = hub.harness.open(hub, "local", spec, 1).await?.first().map(|i| i.id.clone()).ok_or_else(|| anyhow::anyhow!("no agent"))?;
-        // Its harness running, its adapter started.
-        for _ in 0..500 {
-            if hub.harness.local.get(&id).is_some_and(|s| s.pid.lock().is_some() && !s.core.lock().meta.features.is_empty()) {
-                return Ok((id, heard));
-            }
-            crate::rt::sleep(Duration::from_millis(20)).await;
-        }
-        anyhow::bail!("the recording harness never started")
+        source_ready(hub, &id).await?;
+        Ok((id, heard))
     }
 
     /// The prompts a recording harness was sent, by their message ids.
     #[cfg(unix)]
-    fn prompts(heard: &std::path::Path) -> Vec<String> {
+    pub(crate) fn prompts(heard: &std::path::Path) -> Vec<String> {
         std::fs::read_to_string(heard)
             .unwrap_or_default()
             .lines()
@@ -1477,43 +1692,59 @@ mod end_to_end {
         run(async {
             let hub = hub_with(|_| {}).await?;
             let dir = tempfile::tempdir()?;
-            let (id, heard) = recording(&hub, dir.path()).await?;
-            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
-            let first = call(person.clone(), "agents.send", json!({"agent": id, "text": "keep working"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
-            until(|| prompts(&heard).len() == 1, "the harness's first prompt").await?;
             let sender = parent(&hub, "default", true).await?;
             let peer = as_agent(&hub, &sender).await?;
-            let own = as_agent(&hub, &id).await?;
-            let mut delivered = vec![first.get("message").and_then(Value::as_str).unwrap_or_default().to_owned()];
-            for (caller, mode, key) in [(peer.clone(), None, "peer-default"), (peer.clone(), Some("steer"), "peer-steer"), (own, None, "own-default")] {
-                let mut input = json!({"agent": id, "text": key, "key": key});
-                if let (Some(mode), Some(o)) = (mode, input.as_object_mut()) {
-                    o.insert("mode".into(), json!(mode));
-                }
-                let sent = call(caller.clone(), "agents.send", input.clone()).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
-                let message = sent.get("message").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no message: {sent}"))?.to_owned();
-                let session = hub.harness.local.get(&id).ok_or_else(|| anyhow::anyhow!("no recording session"))?;
-                anyhow::ensure!(session.core.lock().state.queue.is_empty(), "{key} queued behind a turn that never ends");
-                drop(session);
-                delivered.push(message);
-                until(|| prompts(&heard) == delivered, "the message steered into the busy turn").await?;
-                let again = call(caller, "agents.send", input).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
-                anyhow::ensure!(again.get("message") == sent.get("message") && again.pointer("/accepted/repeat") == Some(&json!(true)), "{sent} / {again}");
-            }
-            let lines = std::fs::read_to_string(&heard)?;
-            let steered = lines.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v.get("uuid").and_then(Value::as_str) == delivered.get(1).map(String::as_str)).ok_or_else(|| anyhow::anyhow!("no peer prompt"))?;
-            let content = steered.pointer("/message/content").and_then(Value::as_str).unwrap_or_default();
-            anyhow::ensure!(content.contains(&sender) && content.contains("It's from a fellow agent, not from your person.") && content.ends_with("peer-default"), "{content}");
-            anyhow::ensure!(steered.get("priority").is_none(), "a peer must not stop the turn: {steered}");
-            for (caller, input) in [
-                (peer, json!({"agent": id, "text": "after this turn", "mode": "queue"})),
-                (person, json!({"agent": id, "text": "a person's default"})),
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            // Each case has one in-service input and one refill. Busy emits no consumption;
+            // independent cases cannot borrow credit from a turn that never completes.
+            for (key, mode, own, queued) in [
+                ("peer-default", None, false, false),
+                ("peer-steer", Some("steer"), false, false),
+                ("own-default", None, true, false),
+                ("peer-queue", Some("queue"), false, true),
+                ("person-default", None, false, true),
             ] {
-                call(caller, "agents.send", input).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                let (id, heard) = recording(&hub, &dir.path().join(key), false).await?;
+                let first = call(person.clone(), "agents.send", json!({"agent": id, "text": "keep working"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                let first_id = first.get("id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no publication: {first}"))?.to_owned();
+                source_until(&hub, &id, "the first busy prompt", || async { Ok(prompts(&heard) == [first_id.clone()]) }).await?;
+                source_disposition(&hub, &id, &first_id, false).await?;
+                let caller = if own { as_agent(&hub, &id).await? } else if key == "person-default" { person.clone() } else { peer.clone() };
+                let mut input = json!({"agent": id, "text": key, "key": key});
+                if let (Some(mode), Some(object)) = (mode, input.as_object_mut()) { object.insert("mode".into(), json!(mode)); }
+                let sent = call(caller.clone(), "agents.send", input.clone()).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                let message = sent.get("id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no publication: {sent}"))?.to_owned();
+                source_disposition(&hub, &id, &message, false).await?;
+                source_until(&hub, &id, "busy steer or explicit queue", || async {
+                    Ok(if queued {
+                        hub.harness.local.get(&id).is_some_and(|session| session.core.lock().state.queue.iter().any(|item| item.id == message))
+                    } else { prompts(&heard) == [first_id.clone(), message.clone()] })
+                }).await?;
+                let again = call(caller, "agents.send", input).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                anyhow::ensure!(sent.get("retained") == Some(&json!(true)) && sent.get("id") == again.get("id") && sent.get("revision") == again.get("revision") && again.get("repeat") == Some(&json!(true)), "{sent} / {again}");
+                let session = hub.harness.local.get(&id).ok_or_else(|| anyhow::anyhow!("no recording session"))?;
+                let queue = session.core.lock().state.queue.clone();
+                if queued {
+                    anyhow::ensure!(queue.len() == 1 && queue.first().is_some_and(|item| item.id == message && item.text.ends_with(key)), "{key}: exact pending original: {queue:?}");
+                    anyhow::ensure!(prompts(&heard) == [first_id], "{key}: queued input reached the busy provider");
+                } else {
+                    anyhow::ensure!(queue.is_empty(), "{key} queued behind a turn that never ends: {queue:?}");
+                    anyhow::ensure!(prompts(&heard) == [first_id, message.clone()], "{key}: repeated native input");
+                    let lines = std::fs::read_to_string(&heard)?;
+                    let steered = lines.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).find(|value| value.get("uuid").and_then(Value::as_str) == Some(message.as_str())).ok_or_else(|| anyhow::anyhow!("no steered prompt"))?;
+                    anyhow::ensure!(steered.get("priority").is_none(), "a steer must not stop the turn: {steered}");
+                    if !own {
+                        let content = steered.pointer("/message/content").and_then(Value::as_str).unwrap_or_default();
+                        anyhow::ensure!(content.contains(&sender) && content.contains("It's from a fellow agent, not from your person.") && content.ends_with(key), "{content}");
+                    }
+                }
+                // This fixture never produced a successful result for either input.
+                let recipient = id.clone();
+                let consumed = hub.store.read(move |connection| Ok(connection.query_row("SELECT COUNT(*) FROM agent_mail WHERE recipient=?1 AND disposition='consumed'", [recipient], |row| row.get::<_, i64>(0))?)).await?;
+                anyhow::ensure!(consumed == 0, "busy fixture fabricated consumption");
+                drop(session);
+                anyhow::ensure!(hub.harness.close(&hub, &id).await, "recording session did not close");
             }
-            let session = hub.harness.local.get(&id).ok_or_else(|| anyhow::anyhow!("no recording session"))?;
-            anyhow::ensure!(session.core.lock().state.queue.len() == 2, "explicit queues and the person's default still wait");
-            anyhow::ensure!(prompts(&heard) == delivered, "queued messages reached the harness: {:?}", prompts(&heard));
             Ok(())
         })
     }
@@ -1527,42 +1758,33 @@ mod end_to_end {
         run(async {
             let hub = hub_with(|_| {}).await?;
             let dir = tempfile::tempdir()?;
-            let (id, heard) = recording(&hub, dir.path()).await?;
-            let person = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let (id, heard) = recording(&hub, dir.path(), true).await?;
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let send = |key: Option<&str>| {
                 let mut input = json!({"agent": id, "text": "deploy the fix"});
-                if let (Some(k), Some(o)) = (key, input.as_object_mut()) {
-                    o.insert("key".into(), json!(k));
-                }
+                if let (Some(key), Some(object)) = (key, input.as_object_mut()) { object.insert("key".into(), json!(key)); }
                 call(person.clone(), "agents.send", input)
             };
             let first = send(Some("deploy-1")).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
             let again = send(Some("deploy-1")).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
-            let message = first.get("message").and_then(Value::as_str).unwrap_or_default().to_owned();
-            anyhow::ensure!(!message.is_empty() && again.get("message") == first.get("message"), "the same message: {first} {again}");
-            // The same answer, the first time's, the second marked a repeat.
-            let answer = |v: &Value, k: &str| v.pointer(&format!("/accepted/{k}")).cloned();
-            for k in ["seq", "at", "epoch", "session", "message"] {
-                anyhow::ensure!(answer(&first, k).is_some() && answer(&first, k) == answer(&again, k), "{k}: {first} {again}");
-            }
-            anyhow::ensure!(answer(&first, "repeat").is_none() && answer(&again, "repeat") == Some(json!(true)), "{first} {again}");
-            // One prompt reached the harness, and no second copy waits behind it.
-            for _ in 0..500 {
-                if !prompts(&heard).is_empty() {
-                    break;
-                }
-                crate::rt::sleep(Duration::from_millis(20)).await;
-            }
-            anyhow::ensure!(prompts(&heard) == [message.clone()], "the harness was sent {:?}", prompts(&heard));
-            let queued: Vec<String> = hub.harness.local.get(&id).map(|s| s.core.lock().state.queue.iter().map(|q| q.id.clone()).collect()).unwrap_or_default();
+            let message = first.get("id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no publication: {first}"))?.to_owned();
+            anyhow::ensure!(first.get("retained") == Some(&json!(true)) && first.get("message") == first.get("id") && first.get("id") == again.get("id") && first.get("revision").is_some() && first.get("revision") == again.get("revision"), "immutable publication: {first} / {again}");
+            anyhow::ensure!(first.get("repeat") == Some(&json!(false)) && again.get("repeat") == Some(&json!(true)), "{first} / {again}");
+            anyhow::ensure!(first.get("accepted").is_none() && again.get("accepted").is_none(), "server custody is not a receiver inbox acknowledgement");
+            source_disposition(&hub, &id, &message, true).await?;
+            anyhow::ensure!(prompts(&heard) == [message.clone()], "one native prompt: {:?}", prompts(&heard));
+            let queued: Vec<String> = hub.harness.local.get(&id).map(|session| session.core.lock().state.queue.iter().map(|item| item.id.clone()).collect()).unwrap_or_default();
             anyhow::ensure!(!queued.contains(&message), "a copy waits in its queue: {queued:?}");
-            // Without a key, each call is a message of its own.
             let a = send(None).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let a_id = a.get("id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no publication: {a}"))?.to_owned();
+            source_disposition(&hub, &id, &a_id, true).await?;
             let b = send(None).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
-            anyhow::ensure!(a.get("message") != b.get("message") && b.pointer("/accepted/repeat").is_none(), "{a} {b}");
-            // A key reused for other words is refused, saying so.
-            let refused = call(person.clone(), "agents.send", json!({"agent": id, "text": "something else", "key": "deploy-1"})).await;
-            anyhow::ensure!(matches!(&refused, Err((http::StatusCode::CONFLICT, why)) if why.contains("already used")), "{refused:?}");
+            let b_id = b.get("id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no publication: {b}"))?.to_owned();
+            source_disposition(&hub, &id, &b_id, true).await?;
+            anyhow::ensure!(a_id != b_id && a.get("repeat") == Some(&json!(false)) && b.get("repeat") == Some(&json!(false)), "{a} / {b}");
+            anyhow::ensure!(prompts(&heard) == [message.clone(), a_id, b_id], "distinct publications reach the native provider in order once");
+            let refused = call(person, "agents.send", json!({"agent": id, "text": "something else", "key": "deploy-1"})).await;
+            anyhow::ensure!(matches!(&refused, Err((http::StatusCode::CONFLICT, why)) if serde_json::from_str::<crate::harness::mail::Error>(why).is_ok_and(|error| matches!(error, crate::harness::mail::Error::Reused { id } if id == message))), "{refused:?}");
             Ok(())
         })
     }
@@ -1571,22 +1793,25 @@ mod end_to_end {
     /// moved to another machine (its calls come through that machine's runner now, under another
     /// name), is the same message: answered as a repeat, never a second prompt.
     #[test]
+    #[cfg(unix)]
     fn a_keyed_send_retried_after_its_sender_moved_is_the_same_message() -> anyhow::Result<()> {
         run(async {
             let hub = hub_with(|_| {}).await?;
-            let to = parent(&hub, "default", true).await?;
+            let dir = tempfile::tempdir()?;
+            let (to, heard) = recording(&hub, dir.path(), false).await?;
             let from = parent(&hub, "default", true).await?;
             let before = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &from, Some("box-a")).await.map_err(anyhow::Error::msg)? };
             let after = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &from, Some("box-b")).await.map_err(anyhow::Error::msg)? };
             let input = json!({"agent": to, "text": "deploy the fix", "key": "deploy-1"});
             let first = call(before, "agents.send", input.clone()).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let message = first.get("id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no publication: {first}"))?.to_owned();
+            source_disposition(&hub, &to, &message, false).await?;
+            source_until(&hub, &to, "one moved-sender native prompt", || async { Ok(prompts(&heard) == [message.clone()]) }).await?;
             let again = call(after, "agents.send", input).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
             let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
             let taken = inbox.taken(&to, 100).await?;
-            anyhow::ensure!(
-                again.get("message") == first.get("message") && again.pointer("/accepted/repeat") == Some(&json!(true)) && taken.len() == 1,
-                "a retry under its key after its sender moved was another message: {first} then {again}; its agent's inbox took {taken:?}"
-            );
+            anyhow::ensure!(again.get("id") == first.get("id") && again.get("revision") == first.get("revision") && again.get("repeat") == Some(&json!(true)) && taken == [message.clone()], "same immutable publication after sender move: {first} / {again}; inbox: {taken:?}");
+            anyhow::ensure!(prompts(&heard) == [message], "sender move repeated the native prompt");
             Ok(())
         })
     }
@@ -1595,19 +1820,29 @@ mod end_to_end {
     /// under the key after the agent moved to another machine, is the same run: its messages reach
     /// it once.
     #[test]
+    #[cfg(unix)]
     fn a_keyed_plan_run_retried_after_its_agent_moved_is_the_same_run() -> anyhow::Result<()> {
         run(async {
             let hub = hub_with(|_| {}).await?;
-            let me = parent(&hub, "default", true).await?;
+            let dir = tempfile::tempdir()?;
+            let (me, heard) = recording(&hub, dir.path(), true).await?;
+            struct Owned(Arc<Hub>);
+            impl Drop for Owned { fn drop(&mut self) { self.0.harness.local.stop_all(); self.0.shutdown.cancel(); } }
+            let _owned = Owned(Arc::clone(&hub));
             let p = crate::plans::create(&hub, crate::plans::New { title: "Tidy".into(), body: "- one\n- two\n".into(), ..Default::default() }, "admin").await?;
             let before = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &me, Some("box-a")).await.map_err(anyhow::Error::msg)? };
             let after = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &me, Some("box-b")).await.map_err(anyhow::Error::msg)? };
             let input = json!({"id": p.id, "mode": "steps", "key": "tidy-1"});
             let first = call(before, "plans.run", input.clone()).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let run_id = first.get("run").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no run: {first}"))?;
+            let messages: Vec<String> = ["0", "1"].iter().map(|step| crate::util::derive_id(&["plan-run", run_id, step])).collect();
+            for message in &messages { source_disposition(&hub, &me, message, true).await?; }
             let again = call(after, "plans.run", input).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
             let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
             let taken = inbox.taken(&me, 100).await?;
-            anyhow::ensure!(again.get("run") == first.get("run") && taken.len() == 2, "asked again under its key after its agent moved: {first} then {again}; its inbox took {} messages: {taken:?}", taken.len());
+            anyhow::ensure!(again.get("run") == first.get("run") && again.get("session") == first.get("session") && taken == messages, "asked again under its key after its agent moved: {first} then {again}; inbox: {taken:?}");
+            anyhow::ensure!(first.get("sent").and_then(Value::as_u64).unwrap_or(0) + first.get("retained").and_then(Value::as_u64).unwrap_or(0) == 2 && again.get("sent") == Some(&json!(2)) && again.get("retained") == Some(&json!(0)), "{first} then {again}");
+            anyhow::ensure!(prompts(&heard) == messages, "moving the caller repeated native plan inputs");
             Ok(())
         })
     }
@@ -1616,29 +1851,51 @@ mod end_to_end {
     /// again under its key for other steps, or in another mode, is refused 409, saying so, and
     /// sends nothing; so is a run of one agent per step asked again under its key for other steps.
     #[test]
+    #[cfg(unix)]
     fn a_key_given_to_another_plan_run_is_refused() -> anyhow::Result<()> {
         run(async {
             let hub = hub_with(|_| {}).await?;
-            let me = parent(&hub, "default", true).await?;
+            let dir = tempfile::tempdir()?;
+            let (me, heard) = recording(&hub, dir.path(), true).await?;
+            let children = tempfile::tempdir()?;
+            let (program, child_heard) = recording_program(children.path(), true)?;
+            hub.harness.set_test_program(&program.to_string_lossy());
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move { let _ = crate::goals::run(h).await; });
+            struct Owned(Arc<Hub>);
+            impl Drop for Owned { fn drop(&mut self) { self.0.harness.local.stop_all(); self.0.shutdown.cancel(); } }
+            let _owned = Owned(Arc::clone(&hub));
             let p = crate::plans::create(&hub, crate::plans::New { title: "Tidy".into(), body: "- one\n- two\n".into(), ..Default::default() }, "admin").await?;
             let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let first = call(person.clone(), "plans.run", json!({"id": p.id, "session": me, "mode": "steps", "only": [1], "key": "k"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let run_id = first.get("run").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no run: {first}"))?;
+            let message = crate::util::derive_id(&["plan-run", run_id, "0"]);
+            source_disposition(&hub, &me, &message, true).await?;
             let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
             for other in [json!({"id": p.id, "session": me, "mode": "steps", "only": [2], "key": "k"}), json!({"id": p.id, "session": me, "mode": "message", "only": [1], "key": "k"})] {
                 let refused = call(person.clone(), "plans.run", other.clone()).await;
                 anyhow::ensure!(matches!(&refused, Err((c, m)) if c.as_u16() == 409 && m.contains("another request")), "{other} after {first}: {refused:?}");
             }
             let taken = inbox.taken(&me, 100).await?;
-            anyhow::ensure!(taken.len() == 1, "only step 1's message went: {taken:?}");
+            anyhow::ensure!(taken == [message.clone()] && prompts(&heard) == [message.clone()], "only step 1's native message went: {taken:?}");
             // The same request again is the same run, answered as it was.
             let again = call(person.clone(), "plans.run", json!({"id": p.id, "session": me, "mode": "steps", "only": [1], "key": "k"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
-            anyhow::ensure!(again == first, "{first} then {again}");
+            anyhow::ensure!(again.get("run") == first.get("run") && again.get("session") == first.get("session") && again.get("split") == first.get("split"), "{first} then {again}");
+            anyhow::ensure!(first.get("sent").and_then(Value::as_u64).unwrap_or(0) + first.get("retained").and_then(Value::as_u64).unwrap_or(0) == 1 && again.get("sent") == Some(&json!(1)) && again.get("retained") == Some(&json!(0)), "{first} then {again}");
+            anyhow::ensure!(inbox.taken(&me, 100).await? == [message.clone()] && prompts(&heard) == [message], "same-key retry repeated native work");
             // One agent per step: the same key, other steps.
             let cwd = tempfile::tempdir()?;
             let new = json!({"on": "local", "kind": "claude", "cwd": cwd.path().to_string_lossy()});
-            call(person.clone(), "plans.run", json!({"id": p.id, "new": new, "mode": "agents", "only": [1], "key": "a"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let agents = call(person.clone(), "plans.run", json!({"id": p.id, "new": new, "mode": "agents", "only": [1], "key": "a"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let run_id = agents.get("run").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no agents run: {agents}"))?;
+            let child = crate::plans::agents::view(&hub, run_id).await?.steps.first().and_then(|step| step.agent_id.clone()).ok_or_else(|| anyhow::anyhow!("no step agent: {agents}"))?;
+            source_ready(&hub, &child).await?;
+            source_until(&hub, &child, "the step's one native input", || async { Ok(prompts(&child_heard).len() == 1) }).await?;
+            let child_message = prompts(&child_heard).into_iter().next().ok_or_else(|| anyhow::anyhow!("no native step input"))?;
+            source_disposition(&hub, &child, &child_message, true).await?;
             let refused = call(person, "plans.run", json!({"id": p.id, "new": new, "mode": "agents", "only": [2], "key": "a"})).await;
             anyhow::ensure!(matches!(&refused, Err((c, m)) if c.as_u16() == 409 && m.contains("another request")), "{refused:?}");
+            anyhow::ensure!(inbox.taken(&child, 100).await? == [child_message.clone()] && prompts(&child_heard) == [child_message], "another request repeated the step agent's native input");
             Ok(())
         })
     }
@@ -1647,44 +1904,79 @@ mod end_to_end {
     /// given to a run of one agent per step is refused (409) for the same plan run as steps on an
     /// agent, and one given to a run as steps is refused for one agent per step.
     #[test]
+    #[cfg(unix)]
     fn a_key_given_to_a_plan_run_in_one_mode_is_refused_in_another() -> anyhow::Result<()> {
         run(async {
             let hub = hub_with(|_| {}).await?;
-            let me = parent(&hub, "default", true).await?;
+            let dir = tempfile::tempdir()?;
+            let (me, heard) = recording(&hub, dir.path(), true).await?;
+            let children = tempfile::tempdir()?;
+            let (program, child_heard) = recording_program(children.path(), true)?;
+            hub.harness.set_test_program(&program.to_string_lossy());
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move { let _ = crate::goals::run(h).await; });
+            struct Owned(Arc<Hub>);
+            impl Drop for Owned { fn drop(&mut self) { self.0.harness.local.stop_all(); self.0.shutdown.cancel(); } }
+            let _owned = Owned(Arc::clone(&hub));
             let p = crate::plans::create(&hub, crate::plans::New { title: "Tidy".into(), body: "- one\n- two\n".into(), ..Default::default() }, "admin").await?;
             let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let cwd = tempfile::tempdir()?;
             let new = json!({"on": "local", "kind": "claude", "cwd": cwd.path().to_string_lossy()});
-            call(person.clone(), "plans.run", json!({"id": p.id, "new": new, "mode": "agents", "key": "k"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let agents = call(person.clone(), "plans.run", json!({"id": p.id, "new": new, "mode": "agents", "key": "k"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let run_id = agents.get("run").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no agents run: {agents}"))?;
+            let child = crate::plans::agents::view(&hub, run_id).await?.steps.first().and_then(|step| step.agent_id.clone()).ok_or_else(|| anyhow::anyhow!("no step agent: {agents}"))?;
+            source_ready(&hub, &child).await?;
+            source_until(&hub, &child, "the step's one native input", || async { Ok(prompts(&child_heard).len() == 1) }).await?;
+            let child_message = prompts(&child_heard).into_iter().next().ok_or_else(|| anyhow::anyhow!("no native step input"))?;
+            source_disposition(&hub, &child, &child_message, true).await?;
             let other = call(person.clone(), "plans.run", json!({"id": p.id, "session": me, "mode": "steps", "key": "k"})).await;
             anyhow::ensure!(matches!(&other, Err((c, m)) if c.as_u16() == 409 && m.contains("another request")), "the same key in another mode ran: {other:?}");
-            call(person.clone(), "plans.run", json!({"id": p.id, "session": me, "mode": "steps", "key": "j"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let first = call(person.clone(), "plans.run", json!({"id": p.id, "session": me, "mode": "steps", "key": "j"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let run_id = first.get("run").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no run: {first}"))?;
+            let messages: Vec<String> = ["0", "1"].iter().map(|step| crate::util::derive_id(&["plan-run", run_id, step])).collect();
+            for message in &messages { source_disposition(&hub, &me, message, true).await?; }
             let other = call(person, "plans.run", json!({"id": p.id, "new": new, "mode": "agents", "key": "j"})).await;
             anyhow::ensure!(matches!(&other, Err((c, m)) if c.as_u16() == 409 && m.contains("another request")), "the same key in another mode ran: {other:?}");
+            let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
+            anyhow::ensure!(inbox.taken(&me, 100).await? == messages && prompts(&heard) == messages, "cross-mode conflict added native work");
+            anyhow::ensure!(inbox.taken(&child, 100).await? == [child_message.clone()] && prompts(&child_heard) == [child_message], "cross-mode conflict repeated the step agent's native input");
             Ok(())
         })
     }
 
-    /// CP-T3.2, AC-T3.2.4: a message the server sends for an epoch its agent has left is refused
-    /// by the agent's inbox, naming the epoch it's at; the server learns it, sends it again for that
-    /// epoch, once, and it's taken. Sent again after, it's a repeat.
+    /// Inbox state alone cannot promote an owner. A mismatched persisted epoch refuses native
+    /// delivery while the exact committed publication remains retryable under its original ID.
     #[test]
-    fn a_message_for_an_epoch_its_agent_left_goes_again_for_the_one_it_is_at() -> anyhow::Result<()> {
-        use crate::harness::registry::Sent;
+    #[cfg(unix)]
+    fn a_stale_inbox_epoch_preserves_custody_without_changing_the_current_owner() -> anyhow::Result<()> {
+        use crate::harness::{mail, model::Command, registry::Sent};
         run(async {
             let hub = hub_with(|_| {}).await?;
-            let id = parent(&hub, "default", true).await?;
-            let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("the server's sessions have no inboxes"))?;
-            // Its inbox has gone on to epoch 3 (as a session that moved back here would have it);
-            // the server last heard 0.
+            let dir = tempfile::tempdir()?;
+            let (id, heard) = recording(&hub, dir.path(), true).await?;
+            let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
             inbox.open(&id, 3).await?;
-            anyhow::ensure!(hub.harness.epoch_of(&id) == 0);
-            let send = || crate::harness::model::Command::Send { id: "m1".into(), text: "hello".into(), mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None };
-            let sent = hub.harness.command(&hub, &id, send()).await;
-            anyhow::ensure!(matches!(&sent, Sent::Accepted(a) if a.epoch == 3 && !a.repeat), "{sent:?}");
-            anyhow::ensure!(hub.harness.epoch_of(&id) == 3, "the server knows the epoch it's at now");
-            let again = hub.harness.command(&hub, &id, send()).await;
-            anyhow::ensure!(matches!(&again, Sent::Accepted(a) if a.epoch == 3 && a.repeat), "{again:?}");
+            let owner_epoch = hub.harness.epoch_of(&id);
+            let command = || Command::Send { id: "m1".into(), text: "hello".into(), mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+            let sent = hub.harness.command(&hub, &id, command()).await;
+            let Sent::Published(first) = sent else { anyhow::bail!("no committed original: {sent:?}") };
+            source_until(&hub, &id, "mismatched inbox refuses source admission", || {
+                let recipient = id.clone();
+                let hub = Arc::clone(&hub);
+                let revision = first.revision;
+                async move {
+                    let receipt = mail::receipt(&hub.store, "server".into(), "server".into(), recipient, "m1".into()).await?;
+                    Ok(receipt.is_some_and(|receipt| receipt.revision == revision && receipt.generation > 0 && receipt.disposition == mail::Disposition::Waiting))
+                }
+            }).await?;
+            let again = hub.harness.command(&hub, &id, command()).await;
+            anyhow::ensure!(matches!(again, Sent::Published(ref receipt) if receipt.repeat && receipt.revision == first.revision && receipt.id == first.id), "exact custody retry: {again:?}");
+            anyhow::ensure!(hub.harness.epoch_of(&id) == owner_epoch, "an inbox cannot impersonate a new authenticated owner");
+            anyhow::ensure!(inbox.taken(&id, 100).await?.is_empty() && prompts(&heard).is_empty(), "no delivery under a mismatched epoch");
+            let recipient = id.clone();
+            let body: String = hub.store.read(move |connection| Ok(connection.query_row("SELECT body FROM agent_mail WHERE recipient=?1 AND id='m1'", [recipient], |row| row.get(0))?)).await?;
+            let original: mail::Publish = serde_json::from_str(&body)?;
+            anyhow::ensure!(original.command == serde_json::to_value(command())?, "the complete original survives the refusal");
             Ok(())
         })
     }
@@ -1706,143 +1998,106 @@ mod end_to_end {
         assert_eq!(super::body_of("Rebase on main, then go on.\n\nThanks."), "Rebase on main, then go on.\n\nThanks.", "a parent's own words, as they are");
     }
 
-    /// Until `f` holds (the registry hears from the sessions' machines a moment later), looking every 20 ms, up to a
-    /// hang's bound: never a pace (500 looks, 10 s, ran out under load).
-    #[cfg(unix)]
-    async fn until(f: impl Fn() -> bool, what: &str) -> anyhow::Result<()> {
-        let end = std::time::Instant::now() + Duration::from_secs(300);
-        while std::time::Instant::now() < end {
-            if f() {
-                return Ok(());
-            }
-            crate::rt::sleep(Duration::from_millis(20)).await;
-        }
-        anyhow::bail!("{what}: never")
-    }
-
-    /// The incident, whole. A coordinator spends one long turn (its harness took its first message
-    /// and never ends the turn) while its three helpers, on a machine of their own, settle again
-    /// and again; two fellow agents send it messages; its goal stack is resumed now and then and
-    /// its first goal said met. When it waits for a helper still at work, the fellow agents'
-    /// messages come back with the wait and leave its queue. What's left there for when its turn
-    /// ends is one message of news, each helper's latest line in it once, and its goal under way,
-    /// once.
+    /// Hold one actual result, exhaust cold-start authority, retain a refused communication
+    /// at its caller, then prove exact retry and immutable state history after real completion.
     #[test]
     #[cfg(unix)]
-    fn a_coordinator_in_one_long_turn_ends_it_with_one_message_of_news_its_goal_once_and_its_mail_handed_over() -> anyhow::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        use crate::harness::core::Update;
-        use crate::harness::model::{State, Status, TurnEnd};
-        use crate::harness::registry::Location;
-        use crate::harness::session::Info;
+    fn a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication() -> anyhow::Result<()> {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        use std::io::Write as _;
+        use crate::harness::{admission::Learning, mail, model::Status};
         run(async {
-            let hub = hub_with(|c| c.conversations.off = true).await?;
-            // A stand-in for Claude Code that takes what it's sent and never answers.
-            let dir = tempfile::tempdir()?.keep();
-            let busy = dir.join("busy-claude");
-            std::fs::write(&busy, "#!/bin/sh\nexec cat > /dev/null\n")?;
-            std::fs::set_permissions(&busy, std::fs::Permissions::from_mode(0o755))?;
-            let spec = Spec {
-                kind: "claude".into(),
-                name: Some("Coordinator".into()),
-                cwd: Some(dir.to_string_lossy().into_owned()),
-                program: Some(busy.to_string_lossy().into_owned()),
-                prompt: Some("Work the program's goals with your helpers.".into()),
-                ..Spec::default()
-            };
-            let p = hub.harness.open(&hub, "local", spec, 1).await?.first().map(|i| i.id.clone()).ok_or_else(|| anyhow::anyhow!("no coordinator"))?;
-            until(|| hub.harness.info(&p).is_some_and(|i| i.status == Status::Running), "the coordinator's turn").await?;
-            let me = as_agent(&hub, &p).await?;
-            // Two agents of the same person, apart from it: they only send.
-            let (a, b) = (parent(&hub, "default", true).await?, parent(&hub, "default", true).await?);
-            // Its helpers, as their machine reports them.
-            let there = Location::Machine("helpers".into());
-            let kids: Vec<String> = (0..3).map(|_| crate::util::new_id()).collect();
-            for (n, k) in kids.iter().enumerate() {
-                let info = Info { id: k.clone(), kind: "claude".into(), name: format!("Helper {}", n + 1), parent: Some(p.clone()), status: Status::Running, ..Info::default() };
-                hub.harness.ingest(&there, k, Update::Open { info: Box::new(info), since: None }).await;
+            let hub = hub_with(|config| config.conversations.off = true).await?;
+            let dir = tempfile::tempdir()?;
+            let (program, heard) = recording_program(dir.path(), true)?;
+            let gate = dir.path().join("first-result.fifo");
+            nix::unistd::mkfifo(gate.as_path(), nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR)?;
+            let wrapper = dir.path().join("gated-claude");
+            std::fs::write(&wrapper, format!("#!/bin/sh\nKILN_TEST_RESULT_GATE='{}' exec '{}' \"$@\"\n", gate.display(), program.display()))?;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+            let spec = Spec { kind: "claude".into(), name: Some("Coordinator".into()), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(wrapper.to_string_lossy().into_owned()), ..Spec::default() };
+            let coordinator = hub.harness.open(&hub, "local", spec, 1).await?.first().map(|info| info.id.clone()).ok_or_else(|| anyhow::anyhow!("no coordinator"))?;
+            source_ready(&hub, &coordinator).await?;
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let initial = call(person.clone(), "agents.send", json!({"agent": coordinator, "text": "Work the program's goals with your helpers.", "key": "initial-work"})).await.map_err(|(status, error)| anyhow::anyhow!("{status}: {error}"))?;
+            let initial_id = initial.get("id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no initial receipt: {initial}"))?.to_owned();
+            source_until(&hub, &coordinator, "initial actual native input at the result gate", || async {
+                Ok(prompts(&heard) == [initial_id.clone()] && hub.harness.info(&coordinator).is_some_and(|info| info.status == Status::Running)
+                    && hub.harness.local.get(&coordinator).is_some_and(|session| session.core.lock().state.delivery.get(&initial_id) == Some(&crate::harness::model::Delivery::Started)))
+            }).await?;
+            source_disposition(&hub, &coordinator, &initial_id, false).await?;
+            crate::goals::add(&hub, &coordinator, vec!["the lab program passes".into(), "the view loads in 300 ms".into()], true).await?;
+            source_until(&hub, &coordinator, "one real refill goal", || async {
+                Ok(hub.harness.local.get(&coordinator).is_some_and(|session| session.core.lock().state.queue.len() == 1)
+                    && crate::harness::mail_delivery::capacity(&hub, &coordinator).is_some_and(|capacity| capacity.admitted == capacity.target))
+            }).await?;
+            let capacity = crate::harness::mail_delivery::capacity(&hub, &coordinator).ok_or_else(|| anyhow::anyhow!("no capacity"))?;
+            anyhow::ensure!(capacity.learning == Learning::Bootstrap && capacity.target == 2 && capacity.admitted == 2, "only the two actual cold-start roles: {capacity:?}");
+            let goal_id = hub.harness.local.get(&coordinator).and_then(|session| session.core.lock().state.queue.first().map(|item| item.id.clone())).ok_or_else(|| anyhow::anyhow!("no queued goal"))?;
+            let original_recipient = coordinator.clone();
+            let originals: Vec<(String, String)> = hub.store.read(move |connection| {
+                let mut statement = connection.prepare("SELECT id,body FROM agent_mail WHERE recipient=?1 ORDER BY revision")?;
+                Ok(statement.query_map([original_recipient], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
+            }).await?;
+            anyhow::ensure!(originals.len() == 2 && originals.iter().any(|(id, _)| id == &initial_id) && originals.iter().any(|(id, _)| id == &goal_id), "every accepted original is in SQLite");
+            let sender = parent(&hub, "default", true).await?;
+            let peer = as_agent(&hub, &sender).await?;
+            let key = "registry-tests-pass";
+            let blocked = json!({"agent": coordinator, "text": "The registry's tests pass on my side.", "mode": "queue", "key": key});
+            let blocked_id = crate::harness::queued::from_agent_as(&sender, &super::keyed_id(&peer, "agents.send", &coordinator, key));
+            for _ in 0..3 {
+                let refused = call(peer.clone(), "agents.send", blocked.clone()).await;
+                anyhow::ensure!(matches!(&refused, Err((http::StatusCode::TOO_MANY_REQUESTS, error)) if matches!(serde_json::from_str::<mail::Error>(error), Ok(mail::Error::Backpressure { .. }))), "pre-custody backpressure retains the caller's original: {refused:?}");
+                let current = crate::harness::mail_delivery::capacity(&hub, &coordinator).ok_or_else(|| anyhow::anyhow!("no capacity"))?;
+                anyhow::ensure!(current.admitted <= current.target && current.admitted == capacity.admitted && prompts(&heard) == [initial_id.clone()], "refusal cannot grow source admission or fabricate consumption");
+                let recipient = coordinator.clone();
+                let absent = blocked_id.clone();
+                anyhow::ensure!(hub.store.read(move |connection| Ok(connection.query_row("SELECT COUNT(*) FROM agent_mail WHERE recipient=?1 AND id=?2", rusqlite::params![recipient, absent], |row| row.get::<_, i64>(0))? == 0)).await?, "refused publication silently took custody");
             }
-            let report = async |k: &str, status: Status, said: String, at: i64| {
-                let state = State { status, summary: said, last_turn: (at > 0).then(|| TurnEnd { at, how: "done".into(), ..TurnEnd::default() }), ..State::default() };
-                hub.harness.ingest(&there, k, Update::State { state: Box::new(state) }).await;
-            };
-            let queue = || hub.harness.queue(&p);
-            let news = || queue().into_iter().filter(|q| q.text.contains("which you started")).collect::<Vec<_>>();
-            let goals = || queue().into_iter().filter(|q| q.text.starts_with("Your goal")).count();
-            // Its goals: the first goes behind its turn at once.
-            crate::goals::add(&hub, &p, vec!["the lab program passes".into(), "the view loads in 300 ms".into()], true).await?;
-            until(|| goals() == 1, "its first goal, queued").await?;
-            let mut now = 1_792_000_000_000_i64;
-            crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
-            for round in 0..6 {
-                // Each helper goes to work and ends a turn, and stands so a while.
-                for k in &kids {
-                    report(k, Status::Running, String::new(), 0).await;
-                }
-                now += 1_000;
-                crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
-                for (n, k) in kids.iter().enumerate() {
-                    report(k, Status::Idle, format!("Helper {} finished round {round}.", n + 1), now + i64::try_from(n).unwrap_or(0)).await;
-                }
-                now += 1_000;
-                crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
-                now += 4_000;
-                crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
-                let latest = |q: &crate::harness::model::QueueItem| (1..=3).all(|n| q.text.contains(&format!("Helper {n} finished round {round}.")));
-                until(|| news().iter().any(latest), "the round's news, waiting").await?;
-                anyhow::ensure!(news().len() == 1, "round {round}: one message of news, not {:?}", news());
-                match round {
-                    // Fellow agents write.
-                    1 => {
-                        call(as_agent(&hub, &a).await?, "agents.send", json!({"agent": p, "text": "The registry's tests pass on my side.", "mode": "queue"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
-                    }
-                    3 => {
-                        call(as_agent(&hub, &b).await?, "agents.send", json!({"agent": p, "text": "I'm holding fedora until 14:00.", "mode": "queue"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
-                    }
-                    _ => {}
-                }
-                // Its stack resumed (its goal sent again, behind the turn); its first goal met.
-                if round % 2 == 0 {
-                    crate::goals::control(&hub, &p, crate::goals::Action::Start).await?;
-                }
-                if round == 4 {
-                    crate::goals::done(&hub, &p, None, Some("the lab program passed"), &crate::goals::By::Itself).await?;
-                    until(|| queue().iter().any(|q| q.text.starts_with("Your goal: the view loads")), "its next goal").await?;
-                }
-                anyhow::ensure!(goals() == 1, "round {round}: its goal once, not {}: {:?}", goals(), queue());
-                // It read the second helper's result: that line comes out of the news (and back once it settles again).
-                if round == 2 {
-                    let read = call(me.clone(), "agents.result", json!({"agent": kids.get(1)})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
-                    anyhow::ensure!(read.get("agent").is_some(), "{read}");
-                    until(|| news().iter().all(|q| !q.text.contains("Helper 2 finished")), "the line it saw, out of the news").await?;
-                }
+            // The gate reader was opened before native Started, so this nonblocking writer
+            // cannot wait on a missing provider or strand a blocking pool job on cancellation.
+            let mut release = std::fs::OpenOptions::new().write(true).custom_flags(nix::libc::O_NONBLOCK).open(&gate)?;
+            release.write_all(b"1")?;
+            drop(release);
+            source_disposition(&hub, &coordinator, &initial_id, true).await?;
+            source_disposition(&hub, &coordinator, &goal_id, true).await?;
+            let accepted = call(peer.clone(), "agents.send", blocked.clone()).await.map_err(|(status, error)| anyhow::anyhow!("{status}: {error}"))?;
+            anyhow::ensure!(accepted.get("id") == Some(&json!(blocked_id)) && accepted.get("repeat") == Some(&json!(false)), "the blocked caller reoffers its exact key/body: {accepted}");
+            source_disposition(&hub, &coordinator, &blocked_id, true).await?;
+            let repeated = call(peer, "agents.send", blocked).await.map_err(|(status, error)| anyhow::anyhow!("{status}: {error}"))?;
+            anyhow::ensure!(repeated.get("id") == accepted.get("id") && repeated.get("revision") == accepted.get("revision") && repeated.get("repeat") == Some(&json!(true)), "{accepted} / {repeated}");
+            anyhow::ensure!(prompts(&heard) == [initial_id.clone(), goal_id.clone(), blocked_id.clone()], "one actual native delivery per accepted original");
+            let recipient = coordinator.clone();
+            let after: Vec<(String, String)> = hub.store.read(move |connection| {
+                let mut statement = connection.prepare("SELECT id,body FROM agent_mail WHERE recipient=?1 ORDER BY revision")?;
+                Ok(statement.query_map([recipient], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
+            }).await?;
+            anyhow::ensure!(after.starts_with(&originals), "completion/retry changed or deleted accepted original history");
+            // Explicit news states retain both originals. Depending on actual dispatch, the
+            // first is either consumed frozen work or an undispatched superseded successor.
+            let news1 = call(person.clone(), "agents.send", json!({"agent": coordinator, "text": "Helper finished round 1.", "key": "news-round-1", "status": {"key": "incident-helper-news"}})).await.map_err(|(status, error)| anyhow::anyhow!("{status}: {error}"))?;
+            let news2 = call(person, "agents.send", json!({"agent": coordinator, "text": "Helper finished round 2.", "key": "news-round-2", "status": {"key": "incident-helper-news"}})).await.map_err(|(status, error)| anyhow::anyhow!("{status}: {error}"))?;
+            let latest = news2.get("id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no latest news"))?.to_owned();
+            source_disposition(&hub, &coordinator, &latest, true).await?;
+            let recipient = coordinator.clone();
+            let news: Vec<(String, String, String)> = hub.store.read(move |connection| {
+                let mut statement = connection.prepare("SELECT id,disposition,body FROM agent_mail WHERE recipient=?1 AND status_key='incident-helper-news' ORDER BY revision")?;
+                Ok(statement.query_map([recipient], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?.collect::<rusqlite::Result<_>>()?)
+            }).await?;
+            anyhow::ensure!(news.len() == 2 && news.first().is_some_and(|(id, disposition, body)| Some(&json!(id)) == news1.get("id") && matches!(disposition.as_str(), "consumed" | "superseded") && body.contains("Helper finished round 1."))
+                && news.last().is_some_and(|(id, disposition, body)| id == &latest && disposition == "consumed" && body.contains("Helper finished round 2.")), "original and latest news history: {news:?}");
+            let native = prompts(&heard);
+            for (id, disposition, _) in &news {
+                anyhow::ensure!(native.iter().filter(|native| *native == id).count() == usize::from(disposition == "consumed"), "a superseded original is not model consumption; a consumed original goes once");
             }
-            until(|| queue().iter().filter(|q| crate::harness::queued::sender_of(&q.id).is_some()).count() == 2, "the fellow agents' messages, waiting").await?;
-            // The third helper goes back to work; it waits for it, and the wait returns at once with its mail.
-            if let Some(k) = kids.get(2) {
-                report(k, Status::Running, String::new(), 0).await;
-            }
-            // (A wait that says not to, as a program's in code mode does, hands nothing over.)
-            let program = call(me.clone(), "agents.wait", json!({"agent": kids.get(2), "timeout_s": 1, "hand_over": false})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
-            anyhow::ensure!(program.get("timed_out") == Some(&json!(true)) && program.get("messages").is_none(), "{program}");
-            anyhow::ensure!(queue().iter().filter(|q| crate::harness::queued::sender_of(&q.id).is_some()).count() == 2, "{:?}", queue());
-            let waited = call(me.clone(), "agents.wait", json!({"agent": kids.get(2), "timeout_s": 30})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
-            anyhow::ensure!(waited.get("timed_out") == Some(&json!(false)) && waited.pointer("/agents/0/stand") == Some(&json!("working")), "{waited}");
-            let mail: Vec<(String, String)> = waited.get("messages").and_then(Value::as_array).into_iter().flatten().map(|m| (m.get("from").and_then(Value::as_str).unwrap_or("").to_owned(), m.get("text").and_then(Value::as_str).unwrap_or("").to_owned())).collect();
-            anyhow::ensure!(mail == [(a.clone(), "The registry's tests pass on my side.".to_owned()), (b.clone(), "I'm holding fedora until 14:00.".to_owned())], "{waited}");
-            until(|| queue().iter().all(|q| crate::harness::queued::sender_of(&q.id).is_none()), "the messages handed over, out of its queue").await?;
-            // What waits for the end of its turn: one message of news, each helper's latest line once, and its goal once.
-            let left = queue();
-            let news = news();
-            anyhow::ensure!(left.len() == 2 && news.len() == 1 && goals() == 1, "{left:?}");
-            let text = news.first().map(|q| q.text.clone()).unwrap_or_default();
-            anyhow::ensure!(text.matches("which you started").count() == 3, "each helper once: {text}");
-            for n in 1..=3 {
-                anyhow::ensure!(text.contains(&format!("Helper {n} finished round 5.")), "helper {n}'s latest: {text}");
-                anyhow::ensure!(!text.contains(&format!("Helper {n} finished round 4.")), "helper {n}'s older line: {text}");
-            }
-            anyhow::ensure!(left.iter().any(|q| q.text.starts_with("Your goal: the view loads in 300 ms")), "{left:?}");
+            let stack = crate::goals::done(&hub, &coordinator, None, Some("the lab program passed"), &crate::goals::By::You).await?;
+            anyhow::ensure!(stack.items.iter().any(|item| item.text == "the lab program passes" && item.status == "met") && stack.items.iter().any(|item| item.text == "the view loads in 300 ms" && item.status == "active"), "latest goal state preserves its completed predecessor");
+            let recipient = coordinator.clone();
+            let next: Option<String> = hub.store.read(move |connection| Ok(connection.query_row("SELECT sent_id FROM goal_items WHERE agent=?1 AND text='the view loads in 300 ms'", [recipient], |row| row.get(0))?)).await?;
+            let next = next.ok_or_else(|| anyhow::anyhow!("no next-goal publication"))?;
+            anyhow::ensure!(next != goal_id, "changed goal reused an immutable ID");
+            source_disposition(&hub, &coordinator, &next, true).await?;
+            anyhow::ensure!(prompts(&heard).iter().filter(|id| *id == &next).count() == 1, "latest goal reaches native input once");
             Ok(())
         })
     }
@@ -1893,6 +2148,40 @@ mod end_to_end {
         for text in ["Agent Smith is here.\n\nHello", "hello", "Agent \n\n"] {
             assert_eq!(super::peer_words(text), text);
         }
+    }
+
+    #[test]
+    fn wait_response_stages_exact_ids_and_can_withdraw_unregistered_mail() -> anyhow::Result<()> {
+        let base=json!({"done":false,"timed_out":false,"agents":[]});
+        let mut response=base.clone();
+        let message=json!({"id":"exact-original","from":"peer","name":null,"text":"unchanged 日本語 \"\\\nbody","at":7});
+        let expected=wait::handoff_digest("handoff",Some(1),std::slice::from_ref(&message)).map_err(|e|anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(stage_handoff(&mut response,"handoff",Some(1),vec![message.clone()]),Ok(expected));
+        assert_eq!(response.get("messages"),Some(&json!([message])));
+        assert_eq!(response.get("mail_handoff"),Some(&json!({"id":"handoff","turn":1})));
+        assert!(!response.to_string().contains("response_digest"),"the returned subtree contains no circular digest");
+        clear_handoff(&mut response);
+        assert_eq!(response,base,"failed or lost registration returns no mail and preserves the rest of the response");
+        Ok(())
+    }
+
+    #[test]
+    fn wait_handoff_budget_includes_the_complete_wait_response() -> anyhow::Result<()> {
+        use super::super::state_reads::Failure;
+        let mut response=json!({"agents":[],"padding":""});
+        let overhead=serde_json::to_vec(&response)?.len();
+        let padding=super::super::state_view::FRAME.checked_sub(overhead).ok_or_else(||anyhow::anyhow!("frame is smaller than fixture"))?;
+        response.as_object_mut().ok_or_else(||anyhow::anyhow!("fixture is not an object"))?.insert("padding".into(),json!("x".repeat(padding)));
+        assert_eq!(serde_json::to_vec(&response)?.len(),super::super::state_view::FRAME);
+        let original=response.clone();
+        let message=json!({"id":"original","from":"peer","name":null,"text":"body","at":1});
+        assert_eq!(stage_handoff(&mut response,"handoff",Some(1),vec![message]),Err(Failure::Source(super::super::state_view::Error::Budget)));
+        assert_eq!(response,original,"no registration can follow a response that does not fit");
+        let mut reserved=json!({"messages":"existing data"});
+        let before=reserved.clone();
+        assert_eq!(stage_handoff(&mut reserved,"handoff",Some(1),vec![json!({"id":"original","from":"peer","name":null,"text":"body","at":1})]),Err(Failure::Malformed));
+        assert_eq!(reserved,before,"preexisting response data is not overwritten");
+        Ok(())
     }
 
     #[test]

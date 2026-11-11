@@ -5,12 +5,14 @@
  */
 import * as React from "react";
 import { ownAgentAction } from "@/lib/own-agent-action";
-import { ApiError, onAuthChange, request, wsUrl } from "@/api/client";
+import { ApiError, mailScope, onAuthChange, onMailScopeChange, request, wsUrl } from "@/api/client";
 import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import { readFrame, unread } from "./frames";
 import type { TerminalSessionInfo } from "./types";
 import { stateFieldRevision, stateMetadata, stateMessageIds, stateMutationError, statePageMessageIds, stateReply, type StatePage, type StateStep } from "./state-pages";
+import { stateAtOpen } from "./session-availability";
+import { heldCommand, heldFrom, publicationReceipt, useHeld, type Held, type PublicationReceipt } from "./held";
 import type {
   Account,
   AccountFlow,
@@ -224,13 +226,14 @@ export interface BroadcastOutcome {
   name: string;
   machine: string;
   kind: string;
-  result: "sent" | "skipped" | "failed";
+  result: "sent" | "retained" | "skipped" | "failed";
   reason?: string;
 }
 
 export interface BroadcastReport {
   id: string;
   sent: number;
+  retained?: number;
   skipped: number;
   failed: number;
   results: BroadcastOutcome[];
@@ -662,6 +665,9 @@ export interface Asked {
   why?: string;
   /** How many times it was answered for now (parked, or to send again), and sent again for it. */
   tries?: number;
+  /** Durable mail waits for owner events, never the legacy retry timer. */
+  mail?: boolean;
+  waiting?: boolean;
 }
 
 /** How long a command waits for an answer, sent again on each socket meanwhile: past it, it's said to have had none. One answered for now (parked, or to send again) has had one, and goes on. */
@@ -750,7 +756,7 @@ export interface Outgoing {
   mode?: SendMode;
   /** When it was sent (ms). */
   at: number;
-  state: "sending" | "sent" | "failed";
+  state: "sending" | "waiting" | "retained" | "sent" | "failed";
   why?: string;
   /**
    * Refused for good by the server, which keeps that answer under its id: a retry is a new message.
@@ -766,6 +772,7 @@ const ENDED = "the agent ended before it got there";
 interface Going {
   o: Outgoing;
   c: Extract<Command, { type: "send" }>;
+  publication?: PublicationReceipt;
 }
 
 /**
@@ -907,9 +914,10 @@ function share<T>(was: T, now: T): T {
 /** The agent's info with its state's words (a new name included), the same object while they're the same. */
 const withState = (info: AgentInfo | null, s: State): AgentInfo | null => {
   const name = s.name || info?.name;
-  return !info || (info.status === s.status && info.title === s.title && info.model === s.model && info.mode === s.mode && info.name === name)
+  const admission = share(info?.admission, s.admission);
+  return !info || (info.status === s.status && info.title === s.title && info.model === s.model && info.mode === s.mode && info.name === name && info.admission === admission)
     ? info
-    : { ...info, name: name ?? info.name, status: s.status, title: s.title, model: s.model, mode: s.mode };
+    : { ...info, name: name ?? info.name, status: s.status, title: s.title, model: s.model, mode: s.mode, admission };
 };
 
 /** The state with a patch applied: what it sets, without what's gone, every other field the same object. */
@@ -946,6 +954,7 @@ const TAKES = `${GUNZIP ? "?z=gzip&" : "?"}patch=state&patch=changes&window=1&le
 
 /** The session socket's frames, by tag: a frame with another isn't applied (`frames.ts`). */
 const SESSION_FRAMES = {
+  mail_flow: true,
   open: true,
   resumed: true,
   meta: true,
@@ -985,6 +994,8 @@ interface Incoming {
   more: boolean;
   /** It adds to what's held (`resumed`), rather than replacing it. */
   resumed: boolean;
+  /** Source revision captured by its header; later live lifecycle must not wait behind it. */
+  revision?: number;
 }
 
 /**
@@ -1086,7 +1097,178 @@ export class SessionStore {
   /** Every lean event's body, being asked for (find in the conversation reads them all). */
   private wholes: Promise<void> | null = null;
 
-  constructor(readonly id: string) {}
+  private mailConnection = "";
+
+  constructor(readonly id: string) {
+    this.restoreMail();
+    void useHeld
+      .getState()
+      .ready()
+      .then((ready) => {
+        if (ready && !this.disposed) {
+          this.restoreMail();
+          this.schedule();
+        }
+      });
+  }
+
+  private saveMail(write: Promise<boolean>) {
+    void write.then((saved) => {
+      if (!saved && !this.disposed) this.patch({ error: useHeld.getState().error });
+    });
+  }
+
+  private originals(): Held[] {
+    const owner = mailScope();
+    return owner ? (useHeld.getState().held[this.id] ?? []).filter((message) => message.owner === owner) : [];
+  }
+
+  /** Reconstruct original outgoing bodies from the same Held storage after a real reload. */
+  private restoreMail() {
+    for (const message of this.originals()) {
+      if (!message.custody || message.uploading?.length) continue;
+      const known = this.out.get(message.id);
+      if (known) {
+        if (known.o.state === "sending" && message.custody === "retained")
+          this.out.set(message.id, { ...known, publication: message.publication, o: { ...known.o, state: "retained", why: message.why } });
+        continue;
+      }
+      if (this.shows(message.id)) {
+        this.saveMail(useHeld.getState().settled(this.id, message.id));
+        continue;
+      }
+      const c = heldCommand(message);
+      const state = message.custody === "retained" ? "retained" : message.custody === "waiting" ? "waiting" : message.custody === "failed" ? "failed" : "sending";
+      this.out.set(message.id, {
+        c,
+        publication: message.publication,
+        o: { id: c.id, text: c.text, attachments: (c.attachments ?? []).map((file) => file.name), reply_to: c.reply_to, task: c.task, mode: c.mode, at: message.at, state, why: message.why },
+      });
+      this.asked.set(message.id, { id: message.id, command: c, at: message.at, state: "pending", mail: true, waiting: true, why: message.why });
+    }
+    this.snap = { ...this.snap, outgoing: [...this.out.values()].map((message) => message.o), asked: [...this.asked.values()] };
+  }
+
+  /** A concrete connection and pushed source generation, not elapsed time, authorize a retry. */
+  private mailWake(): string | null {
+    const capacity = this.snap.info?.admission;
+    return capacity && capacity.epoch === (this.snap.info?.epoch ?? 0) ? `${this.mailConnection}:${capacity.epoch}:${capacity.generation}` : null;
+  }
+
+  private async retryMail(connection = false) {
+    const owner = mailScope();
+    if (!(await useHeld.getState().ready()) || owner !== mailScope()) return;
+    if (this.disposed || this.speculation || this.ws?.readyState !== WebSocket.OPEN || !this.opened) return;
+    this.restoreMail();
+    const wake = this.mailWake();
+    for (const message of this.originals()) {
+      if (!message.custody || message.custody === "failed" || message.uploading?.length) continue;
+      if ((message.custody === "retained" || this.out.get(message.id)?.publication) && !connection) continue;
+      if (message.custody !== "retained" && !wake) continue;
+      const stamp = wake ?? `connection:${this.mailConnection}`;
+      if (message.wait === stamp) continue;
+      // Persist the event already answered before transmission: a repeated unchanged event
+      // cannot run the legacy retry timer or submit this same original again.
+      if (!(await useHeld.getState().attempt(this.id, message.id, stamp))) continue;
+      if (this.disposed || owner !== mailScope()) return;
+      this.offerMail(heldCommand(message), message.at);
+    }
+  }
+
+  private offerMail(c: Extract<Command, { type: "send" }>, at: number) {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.asked.set(c.id, { id: c.id, command: c, at, state: "pending", mail: true, waiting: true });
+    try {
+      this.ws.send(JSON.stringify({ t: "cmd", id: c.id, c } satisfies SessionUp));
+    } catch {
+      this.patch({ error: "The connection ended; the original message and files remain saved here." });
+    }
+    this.patch({ asked: [...this.asked.values()] });
+  }
+
+  private mailWaiting(id: string, reason: string) {
+    const original = this.originals().find((message) => message.id === id);
+    const going = this.out.get(id);
+    if (!original || !going) return;
+    const retained = going.publication ?? original.publication;
+    const why = retained ? "Kiln retained the original; its receiver is not ready yet" : "Waiting for capacity; the original message and files are saved here";
+    this.saveMail(
+      useHeld.getState().hold(this.id, { ...original, custody: retained ? "retained" : "waiting", publication: retained, wait: this.mailWake() ?? `connection:${this.mailConnection}`, why }),
+    );
+    const asked = this.asked.get(id);
+    if (asked) this.asked.set(id, { ...asked, mail: true, waiting: true, why });
+    this.out.set(id, { ...going, o: { ...going.o, state: retained ? "retained" : "waiting", why } });
+    this.outChanged();
+    this.patch({ asked: [...this.asked.values()] });
+    // The source's typed refusal remains on the command; presentation does not expose raw SQL
+    // or internal resource structures as a user action.
+    void reason;
+  }
+
+  private published(id: string, receipt: PublicationReceipt) {
+    if (!publicationReceipt(receipt)) {
+      this.patch({ error: "The server returned an invalid custody receipt; the original remains saved here." });
+      return;
+    }
+    const original = this.originals().find((message) => message.id === id);
+    const going = this.out.get(id);
+    if (!original || !going || receipt.id !== id) return;
+    const known = going.publication ?? original.publication;
+    if (known && (known.revision !== receipt.revision || known.generation > receipt.generation)) return;
+    this.out.set(id, { ...going, publication: receipt });
+    if (receipt.disposition === "admitted" || receipt.disposition === "consumed") {
+      this.took(id);
+      this.asked.delete(id);
+      this.patch({ asked: [...this.asked.values()] });
+      return;
+    }
+    const terminal = receipt.disposition === "cancelled" || receipt.disposition === "superseded";
+    const why = terminal
+      ? "This communication ended before model handoff; its original remains in Kiln history"
+      : receipt.disposition === "transferred"
+        ? "Kiln retained the original while its owner moves"
+        : "Kiln retained the original; waiting for receiver capacity";
+    this.saveMail(useHeld.getState().hold(this.id, { ...original, custody: terminal ? "failed" : "retained", publication: receipt, why }));
+    this.out.set(id, { ...going, publication: receipt, o: { ...going.o, state: terminal ? "failed" : "retained", why, fresh: terminal } });
+    const asked = this.asked.get(id);
+    if (terminal) this.asked.delete(id);
+    else if (asked) this.asked.set(id, { ...asked, mail: true, waiting: true, why });
+    this.outChanged();
+    this.patch({ asked: [...this.asked.values()] });
+  }
+
+  private mailFlow(frame: Extract<SessionDown, { t: "mail_flow" }>) {
+    const event = frame.event;
+    const capacity = event.capacity;
+    const info = this.snap.info;
+    if (!info || capacity.epoch !== (info.epoch ?? 0)) return;
+    const old = info.admission;
+    if (event.event === "fault" || !old || old.epoch !== capacity.epoch || old.generation <= capacity.generation) {
+      const admission = event.event === "fault" ? undefined : capacity;
+      this.snap = { ...this.snap, info: { ...info, admission }, state: this.snap.state ? { ...this.snap.state, admission } : null };
+    }
+    if (frame.publication && frame.mail_scope === mailScope()) {
+      this.published(frame.publication.id, frame.publication);
+    } else if (!frame.publication && "token" in event) {
+      for (const [id, going] of this.out) {
+        const receipt = going.publication;
+        if (!receipt || receipt.revision !== event.token.revision || receipt.generation > event.token.generation) continue;
+        const disposition =
+          event.event === "accepted"
+            ? "admitted"
+            : event.event === "consumed"
+              ? "consumed"
+              : event.event === "disposed" && event.disposition.disposition === "cancelled"
+                ? "cancelled"
+                : event.event === "disposed"
+                  ? "transferred"
+                  : "waiting";
+        this.published(id, { ...receipt, generation: event.token.generation, disposition, repeat: false });
+      }
+    }
+    this.retryMail();
+    this.schedule();
+  }
 
   subscribe = (fn: () => void) => {
     this.promote();
@@ -1315,11 +1497,41 @@ export class SessionStore {
     this.promote();
     if (this.disposed) return false;
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
+    if (c.type === "send") return false;
     const id = commandId(c);
     this.asked.set(id, { id, command: c, at: Date.now(), state: "pending" });
     this.ws.send(JSON.stringify({ t: "cmd", id, c } satisfies SessionUp));
     this.patch({ asked: [...this.asked.values()] });
-    if (c.type === "send") this.track(c);
+    return true;
+  };
+
+  /** Only transaction completion transfers the caller's original into browser custody. */
+  sendMail = async (c: Extract<Command, { type: "send" }>, originals?: Held["originals"]): Promise<boolean> => {
+    const owner = mailScope();
+    this.promote();
+    if (this.disposed || !owner) return false;
+    if (!(await useHeld.getState().ready())) {
+      this.patch({ error: useHeld.getState().error });
+      return false;
+    }
+    if (this.disposed || owner !== mailScope()) return false;
+    const previous = this.originals().find((message) => message.id === c.id);
+    if (previous?.custody && JSON.stringify(heldCommand(previous)) !== JSON.stringify(c)) {
+      this.patch({ error: "That message identity already belongs to different saved words or files. Keep the original and send the edit as a new message." });
+      return false;
+    }
+    const at = previous?.at ?? Date.now();
+    if (!(await useHeld.getState().hold(this.id, heldFrom(c, at, { custody: "offered", wait: this.mailWake() ?? undefined, publication: previous?.publication, originals })))) {
+      this.patch({ error: useHeld.getState().error });
+      return false;
+    }
+    if (owner !== mailScope() || this.disposed) return true;
+    this.track(c);
+    if (this.ws?.readyState === WebSocket.OPEN) this.offerMail(c, at);
+    else {
+      this.want();
+      this.restoreMail();
+    }
     return true;
   };
 
@@ -1329,18 +1541,19 @@ export class SessionStore {
    * under its own id, as it may have got there and its inbox takes it once (CP-T3.2). False while
    * the session isn't connected.
    */
-  resend = (id: string): boolean => {
+  resend = async (id: string): Promise<boolean> => {
     const m = this.out.get(id);
     if (m?.o.state !== "failed") return false;
-    if (!m.o.fresh) return this.send(m.c);
-    if (!this.send({ ...m.c, id: clientId() })) return false;
+    if (!m.o.fresh) return this.sendMail(m.c);
+    if (!(await this.sendMail({ ...m.c, id: clientId() }))) return false;
     this.out.delete(id);
     this.outChanged();
     return true;
   };
 
   /** Lets go of a message that didn't get there: it isn't sent again. */
-  discard = (id: string) => {
+  discard = async (id: string) => {
+    if (!(await useHeld.getState().drop(this.id, id))) return;
     if (this.out.delete(id)) this.outChanged();
   };
 
@@ -1350,6 +1563,7 @@ export class SessionStore {
     let changed = false;
     for (const a of this.asked.values()) {
       if (a.state !== "pending") continue;
+      if (a.mail) continue;
       if (!a.tries && now - a.at > ASKED_FOR_MS) {
         this.refuse(a.id, "unanswered", "no answer came");
         changed = true;
@@ -1363,7 +1577,7 @@ export class SessionStore {
   /** Command `id` was answered for now: it waits, and goes again under its id in a while, on this socket if it's still open (or on the next as any waiting one does). */
   private later(id: string, why?: string) {
     const a = this.asked.get(id);
-    if (!a || a.state !== "pending") return;
+    if (!a || a.state !== "pending" || a.mail) return;
     const tries = (a.tries ?? 0) + 1;
     this.asked.set(id, { ...a, tries, why });
     this.patch({ asked: [...this.asked.values()] });
@@ -1371,7 +1585,8 @@ export class SessionStore {
     window.setTimeout(
       () => {
         const now = this.asked.get(id);
-        if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && now.tries === tries) ws.send(JSON.stringify({ t: "cmd", id, c: now.command } satisfies SessionUp));
+        if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && !now.mail && now.tries === tries)
+          ws.send(JSON.stringify({ t: "cmd", id, c: now.command } satisfies SessionUp));
       },
       AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1],
     );
@@ -1675,6 +1890,7 @@ export class SessionStore {
     }
     ws.binaryType = "arraybuffer";
     this.ws = ws;
+    this.mailConnection = clientId();
     this.wsAt = Date.now();
     this.unpacking = 0;
     this.packedBytes = 0;
@@ -1855,6 +2071,10 @@ export class SessionStore {
         this.patch({ error: u.error });
         return;
       case "ack":
+        if (u.publication) {
+          this.published(u.id, u.publication);
+          return;
+        }
         // Parked for its machine, which is away: it waits, asked again in a while.
         if (u.outcome === "parked") return this.later(u.id, "its machine is away, and it goes once that's back");
         // A message its inbox hasn't answered yet: asked again, its inbox answers a repeat if it took it.
@@ -1864,6 +2084,10 @@ export class SessionStore {
         if (this.asked.delete(u.id)) this.patch({ asked: [...this.asked.values()] });
         return;
       case "nack":
+        if (u.id != null && ["mail_backpressure", "mail_capacity", "mail_unavailable"].includes(u.code)) {
+          this.mailWaiting(u.id, u.why);
+          return;
+        }
         // Not this time (its machine away, its inbox full ...): it waits, and goes again.
         if (u.id != null && u.again) return this.later(u.id, u.why);
         // Its id was taken before, its inbox says: this page's own message got there (something of
@@ -1888,8 +2112,15 @@ export class SessionStore {
         this.misses = 0;
         // Sent as the socket opens: the server's own snapshot, which it ends with "synced"; or
         // only what came after what's shown (resumed), taken in with it.
-        this.begin(u.info, this.frames === 1, u.t === "resumed");
+        {
+          const revision = (u as { rev?: unknown }).rev;
+          this.begin(u.info, this.frames === 1, u.t === "resumed", typeof revision === "number" ? revision : undefined);
+        }
         if (this.snap.ready && this.snap.conn !== "open") this.patch({ conn: "open" });
+        this.retryMail(true);
+        return;
+      case "mail_flow":
+        this.mailFlow(u);
         return;
       case "synced":
         this.commit();
@@ -1908,8 +2139,10 @@ export class SessionStore {
     }
     const inc = this.incoming;
     if (inc) {
+      const revision = (u as { rev?: unknown }).rev;
+      const laterState = (u.t === "state" || u.t === "state_patch") && inc.revision !== undefined && typeof revision === "number" && revision > inc.revision;
       // A snapshot holds nothing after its events but more events: anything else is live, so it's complete.
-      if (u.t !== "stream" && !(inc.events && u.t !== "events")) {
+      if (!laterState && u.t !== "stream" && !(inc.events && u.t !== "events")) {
         this.gather(inc, u);
         return;
       }
@@ -1919,7 +2152,7 @@ export class SessionStore {
     this.schedule();
   }
 
-  private begin(info: AgentInfo | null, told: boolean, resumed = false) {
+  private begin(info: AgentInfo | null, told: boolean, resumed = false, revision?: number) {
     window.clearTimeout(this.hold);
     this.cancelHistory();
     if (!resumed) {
@@ -1934,10 +2167,11 @@ export class SessionStore {
     const floor = w === undefined ? (resumed ? this.floor : null) : (w?.before ?? null);
     const more = w === undefined ? (resumed ? this.snap.more : false) : (w?.more ?? false);
     this.windowed = undefined;
+    const state = stateAtOpen(this.snap.state, info);
     this.incoming = {
       info,
       meta: this.snap.meta,
-      state: this.snap.state,
+      state,
       changes: resumed ? this.snap.changes : null,
       files: null,
       byId,
@@ -1947,7 +2181,11 @@ export class SessionStore {
       floor,
       more,
       resumed,
+      revision,
     };
+    // Owner lifecycle is control data: it must not wait behind pending detail/history.
+    // The source snapshot's Info also fences a cached State's stale offline overlay below.
+    if (info) this.patch({ info: share(this.snap.info, info), state });
     this.hold = window.setTimeout(() => {
       if (this.incoming?.history) {
         this.patch({ error: "The conversation snapshot was interrupted; reconnecting." });
@@ -1970,7 +2208,8 @@ export class SessionStore {
         break;
       case "state":
       case "state_patch":
-        inc.state = u.t === "state" ? u.state : patched(inc.state, u);
+        inc.state = stateAtOpen(u.t === "state" ? u.state : patched(inc.state, u), inc.info);
+        if (!inc.state) break;
         inc.info = withState(inc.info, inc.state);
         break;
       case "changes":
@@ -2101,6 +2340,7 @@ export class SessionStore {
         // A stop asked of a turn holds while one runs; once none does, it's done with.
         const stopAsked = state.status === "running" || state.status === "waiting" ? this.snap.stopAsked : null;
         this.snap = { ...this.snap, state, info: withState(this.snap.info, state), stopAsked, ranFrom: state.turn_started ?? this.snap.ranFrom };
+        this.retryMail();
         break;
       }
       case "meta":
@@ -2177,16 +2417,28 @@ export class SessionStore {
 
   /** Lets go of the messages sent from here that the session shows now: among `events` (those that came; all of them, after a snapshot), or in its queues. */
   private arrived(events: Iterable<HEvent>) {
-    if (this.out.size === 0) return;
+    if (this.out.size === 0 && this.originals().length === 0) return;
     const before = this.out.size;
+    const present = new Set<string>();
     for (const e of events) {
       if (e.kind !== "user") continue;
+      present.add(e.id);
+      if (e.client_id) present.add(e.client_id);
       this.out.delete(e.id);
       if (e.client_id) this.out.delete(e.client_id);
     }
     const s = this.snap.state;
-    for (const id of stateMessageIds(s)) this.out.delete(id);
-    for (const page of Object.values(this.snap.statePages)) if (page.read.revision === stateFieldRevision(s, page.read.field)) for (const id of statePageMessageIds(page)) this.out.delete(id);
+    for (const id of stateMessageIds(s)) present.add(id);
+    for (const page of Object.values(this.snap.statePages)) if (page.read.revision === stateFieldRevision(s, page.read.field)) for (const id of statePageMessageIds(page)) present.add(id);
+    for (const id of present) {
+      this.out.delete(id);
+      this.asked.delete(id);
+    }
+    const settled = this.originals()
+      .filter((message) => present.has(message.id))
+      .map((message) => message.id);
+    if (settled.length) this.saveMail(useHeld.getState().settled(this.id, ...settled));
+    this.snap = { ...this.snap, asked: [...this.asked.values()] };
     if (this.out.size !== before) this.outChanged();
   }
 
@@ -2198,7 +2450,8 @@ export class SessionStore {
   /** Message `id`'s machine has it (its inbox took it, or its runner did): it shows as sent until the conversation shows it. */
   private took(id: string) {
     const m = this.out.get(id);
-    if (m?.o.state !== "sending") return;
+    if (!m || m.o.state === "sent") return;
+    this.saveMail(useHeld.getState().settled(this.id, id));
     this.out.set(id, { ...m, o: { ...m.o, state: "sent" } });
     this.outChanged();
   }
@@ -2209,6 +2462,13 @@ export class SessionStore {
     for (const id of ids) {
       const m = this.out.get(id);
       if (!m || m.o.state === "sent") continue;
+      const original = this.originals().find((message) => message.id === id);
+      if (original) this.saveMail(useHeld.getState().hold(this.id, { ...original, custody: m.publication && !fresh ? "retained" : "failed", publication: m.publication, why }));
+      if (m.publication && !fresh) {
+        this.out.set(id, { ...m, o: { ...m.o, state: "retained", why: "Kiln retained the original while its receiver is unavailable" } });
+        changed = true;
+        continue;
+      }
       this.out.set(id, { ...m, o: { ...m.o, state: "failed", why, fresh } });
       changed = true;
     }
@@ -2326,6 +2586,17 @@ export class SessionStore {
 export const beforeWindow = (floor: number | null, held: ReadonlyMap<string, HEvent>, e: HEvent): boolean => floor !== null && e.seq < floor && !held.has(e.id);
 
 const stores = new Map<string, SessionStore>();
+let currentMailScope = mailScope();
+onMailScopeChange(() => {
+  const next = mailScope();
+  if (currentMailScope !== null && currentMailScope !== next) {
+    sessionEpoch += 1;
+    const previous = [...stores.values()];
+    stores.clear();
+    previous.forEach((store) => store.dispose());
+  }
+  currentMailScope = next;
+});
 
 /** Drops the conversations left longest ago beyond the few kept. */
 function prune() {

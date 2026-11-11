@@ -1,0 +1,22 @@
+{
+  "results": [
+    {
+      "name": "install",
+      "exit_code": 0
+    },
+    {
+      "name": "types",
+      "exit_code": 0
+    },
+    {
+      "name": "lint",
+      "exit_code": 0
+    },
+    {
+      "name": "build",
+      "exit_code": 0
+    }
+  ],
+  "source_unchanged": true,
+  "record": "/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/kiln-queue-prevention-20261111-4c14b0697e/docs/research/measurements/queue-prevention/ui-production-1794381766185424485"
+}

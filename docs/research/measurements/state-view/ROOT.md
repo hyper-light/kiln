@@ -2,7 +2,7 @@
 
 Coordinator owns integration, audits, profiling, evidence and deployment. Source base is
 `812e968e2a182e11075e355a437183f8491530b1`, isolated checkout `/private/tmp/kiln-offline-fix-20261110`.
-Product changes are uncommitted and **not deployed**. The original dirty Kiln checkout is untouched.
+Product changes are signed in **f555736bd887a4196c8841564cb9b4d6c1ede95f** and **not deployed**. Historical checkpoints below are superseded by the latest checkpoint. The original dirty Kiln checkout is untouched.
 Policy readback is in POLICY_READ.json; current Shards rules SHA256 is
 `df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3`.
 
@@ -149,3 +149,135 @@ wire::ts6passed/0failed (schema-final.log), and UI page/session31passed/0failed
 binding its temporary localhost prerender listener under the sandbox; normal-loopback-access
 build is now running. convo/resume.rs final guard/test source was written after r15 compilation;
 that one added test is unrun, release compilation will check its production guard.
+
+## Background release checkpoint
+
+Signed local commit **f555736bd887a4196c8841564cb9b4d6c1ede95f** (not pushed); gits commit
+succeeded with Kiln signature. Final UI production build with loopback access exited0. Raw
+schema-final6pass and ui-page-final31pass are retained. No full gate run.
+
+ROOT release runs use full KILN_COMMIT=f555736bd887a4196c8841564cb9b4d6c1ede95f:
+- **r20 STARTED** on this Mac e301: native ARM64 release; 2CPU/32GiB/16GiB, 5400s,
+  target `~/.cache/kiln-offline-release-20261111/mac-arm64-target`, normal admission, nice10,
+  initial actual free52,280,324,096B; precheck requires16GiB plus30GiB floor. Rebuilds UI then
+  standard release script with real Bun pack. Watch free space during build; keep >=30GiB.
+- **r21 QUEUED**, Linuxamd64 2CPU/32GiB/64GiB,5400s; normal placement says Linux under strain.
+  Builds x86_64musl, aarch64musl, Windowsamd64 via standard release script after UI; target
+  `~/.cache/kiln-offline-release-20261111/linux-cross-target`. Not yet executing.
+- Earlier r18 was stopped during early dependency compilation, r19 cancellation requested while
+  queued: their KILN_COMMIT mistakenly had short SHA; superseded by full-SHA r20/r21. Do not ship
+  any artifact of r18/r19. r17 metadata queue cancellation requested; no successful execution result.
+
+Both live release runs say told: they notify on completion; do not busy-poll. Build and deployment
+continue in background at user's explicit request. Shards rollout independently grew from4,755,104B
+at03:37:30UTC to5,848,925B at03:41:33UTC while performing tools; no causal claim wake-up alone did it.
+Its Offline/Starting UI status is stale, not authoritative process liveness. No restart performed.
+
+Manual deployment path investigation: server user service supervises `/home/adalundhe/.local/bin/kiln
+supervise server`; equivalent validated binary atomic replacement is existing updates::replace_binary
+mechanism. Runner needs established blue/green preservation, not plain Mac in-place idle restart.
+updates binaries now live in Blobs CAS (keys binaries/kiln-target and matching.json), so do NOT blindly
+copy legacy binary files/metadata or edit live DB. `updates::take_in` adopts legacy files at startup
+only according to its compatibility rules; inspect exact source before relying on this. Prefer
+supported local CLI or intended endpoint credentials already available through Reach; no process
+environment credential reads. Ask no repeated deployment permission, user has authorized it.
+
+
+## Current authoritative checkpoint: recovery complete, deployment pending
+
+POLICY_READ coordinator after compaction: Shards origin/main
+0a6d91b3de0f10a8397868aa3794adab1e09afdc; full AGENTS/rules/evidence reread,
+rules SHA256 df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3 unchanged.
+Kiln AGENTS/ci section0, current ROOT and diagnosing-bugs skill reread.
+
+The user explicitly authorized clearing the backed-up backlog with “CLEAR IT”. Reach r32
+completed exit0: requested761, removed761, failures0. Private mode0600 backup is
+/private/tmp/shards-queue-recovery-z7s82owz/quarantined-messages.json; receipt.json beside it.
+Do not delete, commit, or bulk-print that backup. All selected IDs and exact bodies were distinct;
+760 were peer messages, one was news, zero were person messages. New arrivals were not purged.
+After recovery both API Info.status and State.status were Running; current check again confirms
+Running with only one queued message. This is API proof, not browser/screenshot proof.
+Earlier restart accepted204 but was effectively a no-op; explicit reconnect later authorized supported
+ForceStop r31 (204), preserving conversation and queue. No runner was restarted.
+
+D04 observed amplification:17 agent senders supplied the peer backlog. The three busiest had
+96,86,83 messages (265 total). A bounded first/middle/last sample from each shows distinct policy
+readbacks, waiting/build reports and evidence checkpoints. Nonexclusive case-insensitive keyword
+counts over the body after the peer envelope: POLICY_READ143; check/build/run631; held/waiting251;
+evidence/checkpoint/receipt478. These are keyword counts, not semantic labels or proof of a particular
+prompt loop. No identical-body or duplicate-ID retry explanation fits this captured backlog.
+
+Confirmed source gaps: deployed server88a68fbeda5bde35dd61c9d8b4fea3c5c20a6fdb defaults
+peer sends to queue and refuses peer steer; deployed Mac runnercdc5f01ec5f1fb404043fcc2ea13faf5429fc2bd
+loses general Send steering intent during readiness gaps. Both predate f81d304fd (included in f555).
+Host LANE1024 bounds command transit only. Session::command forwards into an unbounded ctl channel;
+Core.state.queue is a Vec without pending byte/count admission. inbox KEEP4096 bounds dedup history,
+not pending work. Durable acceptance does not mean the model consumed the message. f555 fixes bounded
+state transport, not queue admission or coordination noise. Never claim it fully prevents this class.
+
+Primary references read 2026-11-11 for pending-work design: RabbitMQ4.4 queue max-length/max-length-bytes
+and reject-publish publisher nack (https://www.rabbitmq.com/docs/maxlength); Reactive Streams1.0.4
+non-blocking receiver backpressure (https://www.reactive-streams.org/); Akka2.10.24 mailboxes
+(https://doc.akka.io/libraries/akka-core/current/typed/mailboxes.html), whose deadLetters overflow is
+inappropriate for preserving accepted user work. A safe next change needs source-owned admission
+before success, retained reservations until consumption/removal, typed resource pressure, and explicit
+replaceable progress semantics. Do not invent an unexplained byte cap, silently drop accepted work,
+or coalesce arbitrary distinct instructions/results. Sender-side freshness probes alone race; a limit
+on the command lane alone does not bound retained work. Retry/move/restore/steer/edit transitions need
+coverage at the actual owner seam. No admission production changes have been made yet.
+
+Deployment auth IS solved: actual system unit kiln-server.service runs
+/home/adalundhe/.local/share/kiln-server/bin/kiln, --config /home/adalundhe/.config/kiln/server.toml,
+data /home/adalundhe/.local/share/kiln-server/data, with explicit configured EnvironmentFile
+/home/adalundhe/.config/kiln/server.env. Use that file's KILN_ADMIN_TOKEN in memory only for loopback API;
+never print it or read /proc process environments. The unrelated user unit is inactive. Primary
+Linux runner451397fcc585f7f7cb9aaf00e42064bb; Mac e30189ea29182644fe5a4b2e06c7dac2.
+Server currentbuild0a0c258ead68; Mac build48d63ecf843f. Terminal inventory was empty; repeat before promotion.
+
+r33 currently STARTED native Mac ARM64 release of full f555 source, 2CPU/32GiB/8GiB, jobs2,
+/private/tmp/kiln-offline-fix-20261110, private mac-arm64-target under
+~/.cache/kiln-offline-release-20261111. Last output compiles kiln; no completed artifact yet.
+r34 is QUEUED Linuxamd64 release, jobs1,1CPU/24GiB/16GiB, normal headroom; not running.
+Earlier user “kill the update” meant the oversized queued input, not the builds; canceled own builds
+were restored as r33/r34. Do not stop these again absent actual resource failure. Mac currently38GiB
+free; keep30GiB minimum. No headroom bypass. Remaining LinuxARM64 and Windows release builds pending.
+
+Manual publication preserves artifact hash/size and full source provenance. Publisher helper
+/private/tmp/kiln-offline-publish-20261111.py was prepared, not executed. Existing upload endpoint
+stores sha=None, whereas fleet::binary_for requires exact source commit and fleet target requires
+release-branch containment. Do not fake source/run metadata or blindly edit DB/CAS to bypass that.
+Reviewed updates::take_in_from supports checked legacy binary+metadata import at startup; a finite
+staging helper is being prepared offline, not executed. Root must still resolve branch/fleet and
+promotion ordering safely. Existing user permission is manual build/deploy, skip full gate.
+
+
+Additional finite coordinator checks: publisher and legacy staging helper ast.parse pass;
+staging helper fresh-pair, hash-mismatch preservation, two-backup replacement, exact source metadata
+and symlink refusal pass in /private/tmp/kiln-stage-check-20261111-ica3mk4n/result.json. First fixture
+wrapper incorrectly parsed expected refusal from stdout instead of stderr; harness corrected, fresh
+fixture passed. No actual service/store files mutated by these checks. Stager SHA256
+b76c7fa8d485efbb139f83b7ae84d0ac97fecd91366a2ae21f4144a76058a35f.
+
+Live authenticated read confirms fleet target cdc5f01ec5f1fb404043fcc2ea13faf5429fc2bd;
+Mac is policy notify, native, unlocked and current at that commit, running build f6246da174bd
+(the earlier binary catalog build48d63ecf843f is not necessarily the signed running hash).
+Terminals remain0. Linux admission reports I/O pressure26%, despite idle cores/free RAM; keep normal
+headroom and do not hide a build in an unbudgeted administration command.
+
+Windows native artifact run **r37 STARTED** via Reach on f766f09294f2e17e3b8a631ffd4e6a4b,
+normal2CPU/32GiB/16GiB admission, full f555 source. Verifies HEAD and product diff, then npmci/UIbuild,
+required Windows Bun pack and native x86_64-pc-windows-msvc cargo release, private target under
+~/.cache/kiln-offline-release-20261111/windows-native-target. This is an artifact build, not fullgate.
+No compiler-start/completion proof yet (Reach source sync may still be underway); no artifact claimed.
+Native MSVC differs from standard release workflow's Linux GNU cross leg, so validate output on
+Windows and report that distinction. Existing idle Windows runner meets budget. LinuxARM64 still pending.
+
+
+Windows r37 ended1 before rustc: Windows filesystem mode differences tripped the strict Git diff.
+It also exposed a copied alternate-objects path pointing back to the original Mac checkout. ROOT
+preserved own-clone alternates as .git/objects/info/alternates.original-not-active and ran
+`git fsck --full --no-reflogs --no-dangling` without it: exit0, complete local object closure.
+Original source checkout unaffected. Windows retry **r38 STARTED** with same source/budget/target,
+only preflight Git command now uses per-command core.filemode=false/core.autocrlf=false so platform
+executable mode bits do not masquerade as source edits. Product content diff remains mandatory.
+No global Git config changed. r33 remains active; r34 queued fourth per notification. No deploy yet.

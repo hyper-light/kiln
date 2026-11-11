@@ -1,0 +1,257 @@
+{
+  "policy": {
+    "revision": "3830327b6c8d7ac22452a5e32ffa32799263132c",
+    "rules_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+    "role": "implementer"
+  },
+  "scope": {
+    "read_only": true,
+    "native_cli": true,
+    "needs": "cpus=1,mem=1g,disk=1g",
+    "sync": false,
+    "mutations": 0,
+    "windows_new_requests": 0
+  },
+  "b24": {
+    "service_and_log": {
+      "captured_at": "2026-11-11T08:35:45.679794+00:00",
+      "launchctl": [
+        {
+          "domain": "gui/501",
+          "exit": 0,
+          "metadata": [
+            "active count = 1",
+            "path = /Users/adalundhe/Library/LaunchAgents/io.github.hyper-light.kiln-agent-15429e44.plist",
+            "type = LaunchAgent",
+            "state = running",
+            "program = /Users/adalundhe/.local/bin/kiln",
+            "runs = 1",
+            "pid = 72620",
+            "last exit code = (never exited)",
+            "type = resource",
+            "state = active",
+            "active count = 1",
+            "type = jetsam",
+            "state = active",
+            "active count = 1",
+            "spawn type = daemon (3)"
+          ]
+        },
+        {
+          "domain": "user/501",
+          "exit": 113,
+          "metadata": []
+        }
+      ],
+      "own": "/Users/adalundhe/.local/share/kiln/agent/instances/15429e44-08b4-43b0-a9b8-71652114543e",
+      "files": [
+        {
+          "name": "manual-rollout.json",
+          "size": 299,
+          "mtime": 1794385235.3334477
+        },
+        {
+          "name": "instance.json",
+          "size": 72,
+          "mtime": 1794385235.333112
+        },
+        {
+          "name": "kiln.log",
+          "size": 4984,
+          "mtime": 1794386109.3515825
+        }
+      ],
+      "log_tail": [
+        "2026-11-11T08:20:35.471797Z  INFO child started generation=1 pid=Some(72621) exe=/Users/adalundhe/.local/bin/kiln",
+        "2026-11-11T08:20:35.525414Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:20:36.531973Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:20:38.776609Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:20:43.047071Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:20:52.057409Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:21:08.432043Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:21:44.819414Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:22:54.274602Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:24:02.057842Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:25:06.057696Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:26:17.856083Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:27:18.083748Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:28:30.316873Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:29:43.152166Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:30:48.075460Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:31:48.233758Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:32:55.763729Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:33:56.088375Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)",
+        "2026-11-11T08:35:09.349492Z  WARN no certificate for this runner process yet; retrying error=reach <url> connect 192.168.1.90:7070: No route to host (os error 65)"
+      ],
+      "kiln_processes": [
+        " 1495     1 /Users/adalundhe/.local/share/kiln/launcher/kiln",
+        " 1516     1 /Users/adalundhe/.local/share/kiln/launcher/kiln-agent",
+        " 2240  1516 /Users/adalundhe/.local/share/kiln/agent/versions/4dfd3bb19754/kiln",
+        " 3352  2830 /Users/adalundhe/.local/share/kiln/agent/versions/4dfd3bb19754/kiln",
+        "43400  2240 /Users/adalundhe/.local/share/kiln/agent/versions/4dfd3bb19754/kiln",
+        "49717  1495 /Users/adalundhe/.local/bin/kiln",
+        "50135 49717 /Users/adalundhe/.local/share/kiln/ui-server/0ce080dbbe900a5d4e56/bun",
+        "72620     1 /Users/adalundhe/.local/bin/kiln",
+        "72621 72620 /Users/adalundhe/.local/bin/kiln"
+      ]
+    },
+    "route": {
+      "unparsed": true
+    },
+    "policy_metadata": {
+      "unparsed": true
+    }
+  },
+  "authoritative_instances": {
+    "captured_at": "2026-11-11T08:38:54.462440+00:00",
+    "updates": [
+      {
+        "name": "b24c5c951260dcdfd0972f2aeaf3cf51",
+        "hostname": "Mac",
+        "connected": true,
+        "build": "4dfd3bb19754",
+        "commit": "32f174b2c46a634ae0b072f3dc73764919523327",
+        "target": "aarch64-apple-darwin",
+        "up_to_date": false,
+        "instances": [
+          {
+            "id": "01a1b1a064b576a5aa2d24275bba91f9",
+            "pid": 2240,
+            "version": "0.2.0",
+            "created_at": 1793981441,
+            "newest": true,
+            "jobs": 0,
+            "agents": 1,
+            "terminals": 0,
+            "build": "4dfd3bb19754"
+          }
+        ]
+      },
+      {
+        "name": "f766f09294f2e17e3b8a631ffd4e6a4b",
+        "hostname": "Jupiter",
+        "connected": true,
+        "build": "14ad7179f912",
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "target": "x86_64-pc-windows-msvc",
+        "up_to_date": true,
+        "instances": [
+          {
+            "id": "main",
+            "pid": 17420,
+            "version": "0.2.0",
+            "created_at": 0,
+            "newest": true,
+            "jobs": 0,
+            "agents": 4,
+            "terminals": 0,
+            "build": "14ad7179f912"
+          }
+        ]
+      }
+    ]
+  },
+  "windows": {
+    "primary_log_source": {
+      "captured_at": "2026-11-11T08:39:25.266125+00:00",
+      "listen_exit": 0,
+      "listen_metadata": [
+        "State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess",
+        "LISTEN 0      128          0.0.0.0:7070      0.0.0.0:*    users:((\"kiln\",pid=4128726,fd=70))"
+      ],
+      "server_processes": [
+        {
+          "pid": 4128726,
+          "exe": "/home/adalundhe/.local/share/kiln-server/bin/kiln",
+          "fd/1": "socket:[113387116]",
+          "fd/2": "socket:[113387116]",
+          "cgroup": [
+            "0::/kiln.slice/kiln-server.service"
+          ]
+        }
+      ]
+    },
+    "refusal_journal": {
+      "captured_at": "2026-11-11T08:40:07.669945+00:00",
+      "unit": "kiln-server.service",
+      "window": [
+        "2026-11-11T07:37:00Z",
+        "2026-11-11T07:42:00Z"
+      ],
+      "query_exit": 0,
+      "stderr": "",
+      "events": [
+        {
+          "time_us": "1794382835863091",
+          "message": "2026-11-11T07:40:35.809746Z  INFO a runner process found a break in what a relay passed on machine=f766f09294f2e17e3b8a631ffd4e6a4b instance=main relay=kiln://hyper-light/server detail=kiln://hyper-light/server changed frames 2 to 2 of reach link 01a1c98ca742732d837d6f19275a690b from e30189ea29182644fe5a4b2e06c7dac2 on the way: its kiln-frames-v1 was 3197474fd5ec603945f0c0ed90f2a7f7a52dc531f13f51c64cdfc731c37c5d92 as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived"
+        },
+        {
+          "time_us": "1794382835863091",
+          "message": "2026-11-11T07:40:35.809171Z  INFO refused reach link 01a1c98ca742732d837d6f19275a690b: its frames as they came (0 of the 1 kiln's record names), which its end couldn't read digest=sha256:394a65cf9b08c2c1559c1e901e5b29c3cfffc6c22dd5903be6124207a43c4424 signer=kiln://hyper-light/server why=kiln://hyper-light/server changed frames 2 to 2 of reach link 01a1c98ca742732d837d6f19275a690b from e30189ea29182644fe5a4b2e06c7dac2 on the way: its kiln-frames-v1 was 3197474fd5ec603945f0c0ed90f2a7f7a52dc531f13f51c64cdfc731c37c5d92 as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived (as runner f766f09294f2e17e3b8a631ffd4e6a4b (instance main) found it)"
+        },
+        {
+          "time_us": "1794382835863091",
+          "message": "2026-11-11T07:40:35.808937Z  WARN a chain of custody doesn't hold record=sha256:394a65cf9b08c2c1559c1e901e5b29c3cfffc6c22dd5903be6124207a43c4424 detail=kiln://hyper-light/server changed frames 2 to 2 of reach link 01a1c98ca742732d837d6f19275a690b from e30189ea29182644fe5a4b2e06c7dac2 on the way: its kiln-frames-v1 was 3197474fd5ec603945f0c0ed90f2a7f7a52dc531f13f51c64cdfc731c37c5d92 as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived (as runner f766f09294f2e17e3b8a631ffd4e6a4b (instance main) found it)"
+        },
+        {
+          "time_us": "1794382835863091",
+          "message": "2026-11-11T07:40:35.805958Z  INFO took a custody record machine=f766f09294f2e17e3b8a631ffd4e6a4b instance=main digest=sha256:1a6eb3ee3ac58e41dcfb0a3e449aa5316578d54c8ecf18c720d537a916bd6efa again=false broke=\"frames 2 to 2 of reach link 01a1c98ca742732d837d6f19275a690b from e30189ea29182644fe5a4b2e06c7dac2 changed between sha256:394a65cf9b08c2c1559c1e901e5b29c3cfffc6c22dd5903be6124207a43c4424 and sha256:1a6eb3ee3ac58e41dcfb0a3e449aa5316578d54c8ecf18c720d537a916bd6efa: its kiln-frames-v1 was 3197474fd5ec603945f0c0ed90f2a7f7a52dc531f13f51c64cdfc731c37c5d92, and is 0000000000000000000000000000000000000000000000000000000000000000\""
+        },
+        {
+          "time_us": "1794382833883041",
+          "message": "2026-11-11T07:40:33.578165Z  INFO a runner process found a break in what a relay passed on machine=f766f09294f2e17e3b8a631ffd4e6a4b instance=main relay=kiln://hyper-light/server detail=kiln://hyper-light/server changed frames 1 to 1 of reach link 01a1c98ca742732d837d6f19275a690b from e30189ea29182644fe5a4b2e06c7dac2 on the way: its kiln-frames-v1 was 2d67d7c48f6312b6dd0160744e4788e421675738fc41215e45e2cf83f8c8652a as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived"
+        },
+        {
+          "time_us": "1794382833883041",
+          "message": "2026-11-11T07:40:33.507583Z  INFO refused reach link 01a1c98ca742732d837d6f19275a690b: its frames as they came (0 of the 1 kiln's record names), which its end couldn't read digest=sha256:18c31218a555b13d56c55ba6a37648ee7ceefa5d6d84bce52f1033a4cb0d9563 signer=kiln://hyper-light/server why=kiln://hyper-light/server changed frames 1 to 1 of reach link 01a1c98ca742732d837d6f19275a690b from e30189ea29182644fe5a4b2e06c7dac2 on the way: its kiln-frames-v1 was 2d67d7c48f6312b6dd0160744e4788e421675738fc41215e45e2cf83f8c8652a as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived (as runner f766f09294f2e17e3b8a631ffd4e6a4b (instance main) found it)"
+        },
+        {
+          "time_us": "1794382833883041",
+          "message": "2026-11-11T07:40:33.507320Z  WARN a chain of custody doesn't hold record=sha256:18c31218a555b13d56c55ba6a37648ee7ceefa5d6d84bce52f1033a4cb0d9563 detail=kiln://hyper-light/server changed frames 1 to 1 of reach link 01a1c98ca742732d837d6f19275a690b from e30189ea29182644fe5a4b2e06c7dac2 on the way: its kiln-frames-v1 was 2d67d7c48f6312b6dd0160744e4788e421675738fc41215e45e2cf83f8c8652a as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived (as runner f766f09294f2e17e3b8a631ffd4e6a4b (instance main) found it)"
+        },
+        {
+          "time_us": "1794382833883041",
+          "message": "2026-11-11T07:40:33.506924Z  INFO took a custody record machine=f766f09294f2e17e3b8a631ffd4e6a4b instance=main digest=sha256:79847b873d45f6fea3f16b18454563ae33e620ab28831fc36d6304faab39be51 again=false broke=\"frames 1 to 1 of reach link 01a1c98ca742732d837d6f19275a690b from e30189ea29182644fe5a4b2e06c7dac2 changed between sha256:18c31218a555b13d56c55ba6a37648ee7ceefa5d6d84bce52f1033a4cb0d9563 and sha256:79847b873d45f6fea3f16b18454563ae33e620ab28831fc36d6304faab39be51: its kiln-frames-v1 was 2d67d7c48f6312b6dd0160744e4788e421675738fc41215e45e2cf83f8c8652a, and is 0000000000000000000000000000000000000000000000000000000000000000\""
+        },
+        {
+          "time_us": "1794382776332306",
+          "message": "2026-11-11T07:39:36.331268Z  INFO a runner process found a break in what a relay passed on machine=f766f09294f2e17e3b8a631ffd4e6a4b instance=main relay=kiln://hyper-light/server detail=kiln://hyper-light/server changed frames 2 to 2 of reach link 01a1c98bbdb5758e87ba98a649ea9350 from e30189ea29182644fe5a4b2e06c7dac2 on the way: its kiln-frames-v1 was 3197474fd5ec603945f0c0ed90f2a7f7a52dc531f13f51c64cdfc731c37c5d92 as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived"
+        },
+        {
+          "time_us": "1794382776330999",
+          "message": "2026-11-11T07:39:36.330572Z  INFO refused reach link 01a1c98bbdb5758e87ba98a649ea9350: its frames as they came (0 of the 1 kiln's record names), which its end couldn't read digest=sha256:728d9912e542acd57651de758faa136edaf13ba3231833624c16c79fa68304b5 signer=kiln://hyper-light/server why=kiln://hyper-light/server changed frames 2 to 2 of reach link 01a1c98bbdb5758e87ba98a649ea9350 from e30189ea29182644fe5a4b2e06c7dac2 on the way: its kiln-frames-v1 was 3197474fd5ec603945f0c0ed90f2a7f7a52dc531f13f51c64cdfc731c37c5d92 as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived (as runner f766f09294f2e17e3b8a631ffd4e6a4b (instance main) found it)"
+        },
+        {
+          "time_us": "1794382776330308",
+          "message": "2026-11-11T07:39:36.330163Z  WARN a chain of custody doesn't hold record=sha256:728d9912e542acd57651de758faa136edaf13ba3231833624c16c79fa68304b5 detail=kiln://hyper-light/server changed frames 2 to 2 of reach link 01a1c98bbdb5758e87ba98a649ea9350 from e30189ea29182644fe5a4b2e06c7dac2 on the way: its kiln-frames-v1 was 3197474fd5ec603945f0c0ed90f2a7f7a52dc531f13f51c64cdfc731c37c5d92 as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived (as runner f766f09294f2e17e3b8a631ffd4e6a4b (instance main) found it)"
+        },
+        {
+          "time_us": "1794382776329656",
+          "message": "2026-11-11T07:39:36.329621Z  INFO took a custody record machine=f766f09294f2e17e3b8a631ffd4e6a4b instance=main digest=sha256:027830d2462f828078785b114ad1e8d7681dcf30a90627db36393b6c16e8353b again=false broke=\"frames 2 to 2 of reach link 01a1c98bbdb5758e87ba98a649ea9350 from e30189ea29182644fe5a4b2e06c7dac2 changed between sha256:728d9912e542acd57651de758faa136edaf13ba3231833624c16c79fa68304b5 and sha256:027830d2462f828078785b114ad1e8d7681dcf30a90627db36393b6c16e8353b: its kiln-frames-v1 was 3197474fd5ec603945f0c0ed90f2a7f7a52dc531f13f51c64cdfc731c37c5d92, and is 0000000000000000000000000000000000000000000000000000000000000000\""
+        },
+        {
+          "time_us": "1794382773546563",
+          "message": "2026-11-11T07:39:33.524405Z  INFO a runner process found a break in what a relay passed on machine=f766f09294f2e17e3b8a631ffd4e6a4b instance=main relay=kiln://hyper-light/server detail=kiln://hyper-light/server changed frames 1 to 1 of reach link 01a1c98bbdb5758e87ba98a649ea9350 from e30189ea29182644fe5a4b2e06c7dac2 on the way: its kiln-frames-v1 was 00c41abf64a0500a4f8059ba2ea80a494f7ac1612a92f399fb043546c9497a2b as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived"
+        },
+        {
+          "time_us": "1794382773546563",
+          "message": "2026-11-11T07:39:33.523223Z  INFO refused reach link 01a1c98bbdb5758e87ba98a649ea9350: its frames as they came (0 of the 1 kiln's record names), which its end couldn't read digest=sha256:a7b06fae85afcabe27504fd328330be64fab348441da05033413115175fd3d06 signer=kiln://hyper-light/server why=kiln://hyper-light/server changed frames 1 to 1 of reach link 01a1c98bbdb5758e87ba98a649ea9350 from e30189ea29182644fe5a4b2e06c7dac2 on the way: its kiln-frames-v1 was 00c41abf64a0500a4f8059ba2ea80a494f7ac1612a92f399fb043546c9497a2b as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived (as runner f766f09294f2e17e3b8a631ffd4e6a4b (instance main) found it)"
+        },
+        {
+          "time_us": "1794382773546563",
+          "message": "2026-11-11T07:39:33.522841Z  WARN a chain of custody doesn't hold record=sha256:a7b06fae85afcabe27504fd328330be64fab348441da05033413115175fd3d06 detail=kiln://hyper-light/server changed frames 1 to 1 of reach link 01a1c98bbdb5758e87ba98a649ea9350 from e30189ea29182644fe5a4b2e06c7dac2 on the way: its kiln-frames-v1 was 00c41abf64a0500a4f8059ba2ea80a494f7ac1612a92f399fb043546c9497a2b as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived (as runner f766f09294f2e17e3b8a631ffd4e6a4b (instance main) found it)"
+        },
+        {
+          "time_us": "1794382773546563",
+          "message": "2026-11-11T07:39:33.522632Z  INFO took a custody record machine=f766f09294f2e17e3b8a631ffd4e6a4b instance=main digest=sha256:b7537132695b283b5cd8a8a2a7e4e27c716527ffc2a92f1977d992e87d83524d again=false broke=\"frames 1 to 1 of reach link 01a1c98bbdb5758e87ba98a649ea9350 from e30189ea29182644fe5a4b2e06c7dac2 changed between sha256:a7b06fae85afcabe27504fd328330be64fab348441da05033413115175fd3d06 and sha256:b7537132695b283b5cd8a8a2a7e4e27c716527ffc2a92f1977d992e87d83524d: its kiln-frames-v1 was 00c41abf64a0500a4f8059ba2ea80a494f7ac1612a92f399fb043546c9497a2b, and is 0000000000000000000000000000000000000000000000000000000000000000\""
+        }
+      ]
+    }
+  },
+  "limits": [
+    "B24 certificate request fails EHOSTUNREACH; no readable explicit macOS privacy denial was found. launchctl procinfo refused read. Local Network privacy remains a hypothesis.",
+    "B24 new connected file/certificate absence does not establish empty owned work. Server updates lists only the old connected instance; new ownership is unknown.",
+    "Windows0of1frames custody refusal is observed. It does not establish malicious frame mutation. Its runtime/cache could not be inspected from Windows because commands do not pass TLS handshake.",
+    "First journal query reader failed on list-valued MESSAGE; rerun normalized typed list representation and retained the actual bounded events. No service mutation or new network probe occurred."
+  ]
+}

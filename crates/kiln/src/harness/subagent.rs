@@ -89,6 +89,8 @@ pub fn show(core: &mut Core, task: &str, m: &QueueItem, d: Delivery) {
 
 /// Where a message shown in a subagent's thread stands now (a later word on it, from its harness).
 pub fn delivered(core: &mut Core, id: &str, d: Delivery) {
+    // A relay/tool acceptance is presentation evidence, not proof the child's model dequeued
+    // the original. Adapters with exact native user-input identity record that boundary.
     if core.state.delivery.contains_key(id) {
         core.state.delivery.insert(id.to_owned(), d);
         core.touch_state();

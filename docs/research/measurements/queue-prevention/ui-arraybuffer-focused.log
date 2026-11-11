@@ -1,0 +1,45 @@
+✔ a command waits for its ack or nack, and goes again once on the next socket under its id (6.193292ms)
+✔ W20: legacy migration commits valid originals, quarantines their unbound scope and retains invalid raw bytes (1.873125ms)
+✔ W20: overlapping simulated readwrite transactions preserve both writers instead of replacing another original (2.292291ms)
+✔ W20: a multi-recipient original commits for every recipient or none (2.309834ms)
+✔ W20: original Blob bytes survive a committed pending upload and a fresh projection read (3.673125ms)
+✔ W20: an aborted write transfers no ownership and leaves all earlier originals intact (0.755416ms)
+✔ W20: account changes preserve separate originals and cannot edit or settle another account's body (2.1585ms)
+✔ W21-R02 an indexed event reader exposes published frames and preserves unrelated identities (4.974042ms)
+✔ live history stays bounded and retained events still update in place (11.570167ms)
+✔ a previous connection's unpack cannot let text overtake a new snapshot (8.553791ms)
+✔ a reconnect resumes from what's shown, a resume adds to it, a snapshot replaces it (2.208166ms)
+✔ cached resources do not process live events while nothing shows them (304.90725ms)
+✔ what of its messages was refused comes with its events, on the socket it has: no new snapshot, no reload (0.785625ms)
+✔ a message's id is a UUIDv7 made once: 32 hex digits, its time first, and never another's (CP-T3.2) (26.992209ms)
+✔ a changeset comes whole, then as what changed in it, taken in place in the server's order (3.186459ms)
+✔ W21-R02: data-only prefetch closes at a complete snapshot, sends no commands, and expires without reviving (0.712ms)
+✔ W21-R02: acquiring a prefetched store promotes before a child can suspend; late hover cancellation cannot close it (1.321083ms)
+✔ W21-R02: a completed prefetched snapshot promotes into normal revision resume, with no history truncation (1.436417ms)
+✔ W21-R02: speculative text uses a UTF-8 byte budget and rejects before parsing oversized frames (2.7115ms)
+✔ W21-R02: speculative gzip expansion is stopped while decoding, before parsing an expanded snapshot (2.983792ms)
+✔ W21-R02: queued packed frames are bounded even while the first decoder is blocked (3.555417ms)
+✔ W21-R02: auth loss clears private stores and commands, and late packed frames or wakeups cannot restore them (2.322792ms)
+✔ events about a session don't connect a socket that just died again at once, each its own snapshot (1.646334ms)
+✔ an event about a session taken as gone connects it at once: its machine came back (2.121208ms)
+✔ W20: owner Open and resume publish fresh lifecycle before pending details (7.263875ms)
+✔ W20: first attach preserves owner Starting, Paused and Exited without inventing State (0.6535ms)
+✔ W20: a newer live lifecycle is not held behind resumed snapshot details (0.419375ms)
+✔ W20: bounded status recovers on an open socket while the queue stays deferred (0.612541ms)
+✔ W20: one field page replaces its predecessor and ignores superseded reads (0.541916ms)
+✔ W20: paged queue edits carry a revision and stale refusals stay in place (0.421625ms)
+✔ W20: unrelated status changes preserve a queue page and its in-flight read (0.488666ms)
+✔ W20: bounded queue metadata acknowledges listed messages without losing unseen ones (4.260542ms)
+✔ W20: a complete small state preserves ordinary queue data and command behavior (0.467417ms)
+✔ W20: a retained pending receipt preserves full originals across store retirement and only source admission settles them (4.263167ms)
+✔ W20: pre-custody pressure waits for a changed source event without retrying on an unchanged event storm (7.065291ms)
+✔ W20: an early committed source receipt binds only the authenticated sender scope (1.2805ms)
+✔ W20: browser storage refusal retains caller ownership and sends no new communication (0.497792ms)
+ℹ tests 37
+ℹ suites 0
+ℹ pass 37
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 569.127375

@@ -99,7 +99,7 @@ pub struct Settings {
     pub notice: Option<Notice>,
 }
 
-/// A message to a program's coordinator, kept until it's delivered (tried again every 15 s).
+/// A settings notice. Durable custody is distinct from admission at the coordinator.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Notice {
@@ -107,6 +107,9 @@ pub struct Notice {
     pub at: i64,
     /// kiln queued it for its session (the session, or its machine, took it), and the message's id.
     pub delivered: bool,
+    /// The ledger owns retry once this receipt exists; source events advance it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publication: Option<crate::harness::mail::Receipt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// Why it hasn't yet.
@@ -490,7 +493,11 @@ pub async fn settings(hub: &Hub, program: &str) -> anyhow::Result<Settings> {
 
 /// Keeps a program's settings.
 pub async fn save_settings(hub: &Hub, program: &str, s: &Settings) -> anyhow::Result<()> {
-    kv_save(&hub.store, settings_key(program), s).await
+    kv_save(&hub.store, settings_key(program), s).await?;
+    if s.notice.as_ref().is_some_and(|n| !n.delivered && n.publication.is_none()) {
+        hub.harness.mail_delivery.changed();
+    }
+    Ok(())
 }
 
 /// A program's assignments, by track (`T7`).
@@ -740,7 +747,7 @@ async fn build(hub: &Hub, m: &Master, agents: &[std::sync::Arc<Info>]) -> anyhow
 
 /// Holds each program's workers to their thresholds (`pause_at`: 95, or 80 for the lowest-weight
 /// track at work), leaving one a person set; takes back kiln's from an agent no longer a worker;
-/// and delivers a settings notice its coordinator hasn't had. The goal driver runs it every 15 s.
+/// The goal driver retains its existing threshold schedule. Notice retries use owner events.
 pub async fn enforce(hub: &Hub) {
     if let Err(e) = enforce_all(hub).await {
         tracing::warn!(error = %format!("{e:#}"), "programs: thresholds and notices not held this time");
@@ -786,17 +793,7 @@ async fn enforce_all(hub: &Hub) -> anyhow::Result<()> {
         if changed {
             kv_save(&hub.store, thresholds_key(&p.id), &last).await?;
         }
-        if let (Some(c), Some(n)) = (&p.coordinator_id, p.settings.notice.as_ref().filter(|n| !n.delivered)) {
-            let sent = deliver(hub, c, n.clone()).await;
-            // Kept only if it's still the notice the settings hold: a change of the person's made
-            // meanwhile (and its own notice) stands.
-            let _w = WRITING.turn().await;
-            let mut s = settings(hub, &p.id).await?;
-            if s.notice.as_ref() == Some(n) {
-                s.notice = Some(sent);
-                save_settings(hub, &p.id, &s).await?;
-            }
-        }
+
     }
     Ok(())
 }
@@ -806,7 +803,7 @@ async fn enforce_all(hub: &Hub) -> anyhow::Result<()> {
 pub async fn deliver(hub: &Hub, to: &str, mut n: Notice) -> Notice {
     // Its id is made once, from the notice (CP-T3.2): tried again, it's the same message, which the
     // coordinator's inbox takes once.
-    let message = crate::util::derive_id(&["programs.notice", to, &n.at.to_string(), &n.text]);
+    let message = notice_id(to, &n);
     let send = Command::Send { id: message.clone(), text: n.text.clone(), mode: crate::harness::model::SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
     match hub.harness.command(hub, to, send).await {
         // Parked, it goes once the coordinator's machine is back, once: not sent again from here.
@@ -815,12 +812,80 @@ pub async fn deliver(hub: &Hub, to: &str, mut n: Notice) -> Notice {
             n.message = Some(message);
             n.why = None;
         }
+        crate::harness::registry::Sent::Published(receipt) => apply_receipt(&mut n, receipt),
+        crate::harness::registry::Sent::PublicationRefused(error) => n.why = Some(error.to_string()),
         crate::harness::registry::Sent::Refused(r) => n.why = Some(r.to_string()),
         s @ (crate::harness::registry::Sent::Rejected { .. } | crate::harness::registry::Sent::Unanswered(_)) => n.why = s.failure().map(|(_, why)| why),
         crate::harness::registry::Sent::NoSession => n.why = Some("kiln doesn't know the coordinator's session right now".into()),
         crate::harness::registry::Sent::Unreachable => n.why = Some("the coordinator's machine isn't connected right now".into()),
     }
     n
+}
+
+fn notice_id(to: &str, n: &Notice) -> String {
+    crate::util::derive_id(&["programs.notice", to, &n.at.to_string(), &n.text])
+}
+
+fn apply_receipt(notice: &mut Notice, receipt: crate::harness::mail::Receipt) {
+    use crate::harness::mail::Disposition;
+    notice.delivered = matches!(receipt.disposition, Disposition::Admitted | Disposition::Consumed);
+    notice.message = Some(receipt.id.clone());
+    notice.why = match receipt.disposition {
+        Disposition::Admitted | Disposition::Consumed => None,
+        Disposition::Waiting | Disposition::Dispatched | Disposition::Transferred => Some("Kiln retained the notice; receiver admission is pending".into()),
+        Disposition::Cancelled | Disposition::Superseded => Some("The notice ended before delivery; its original remains in history".into()),
+    };
+    notice.publication = Some(receipt);
+}
+
+/// Called under WRITING after the notice is saved. A source event that raced the publication
+/// reply is either already committed here or waits on this same gate and applies after us.
+pub(crate) async fn reconcile_notice(hub: &Hub, program: &str, to: &str) -> anyhow::Result<()> {
+    let mut settings = settings(hub, program).await?;
+    let Some(notice) = settings.notice.as_mut() else { return Ok(()) };
+    let id = notice_id(to, notice);
+    if let Some(receipt) = crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), to.to_owned(), id).await? {
+        apply_receipt(notice, receipt);
+        save_settings(hub, program, &settings).await?;
+    }
+    Ok(())
+}
+
+/// Event-driven recovery of legacy unsent notices; retained originals belong to the relay.
+pub async fn resume_notices(hub: &Hub) -> anyhow::Result<()> {
+    for p in masters(&hub.store).await? {
+        let Some(to) = p.coordinator else { continue };
+        let before = settings(hub, &p.id).await?;
+        let Some(notice) = before.notice.as_ref().filter(|n| !n.delivered && n.publication.is_none()) else { continue };
+        let sent = deliver(hub, &to, notice.clone()).await;
+        let _writing = WRITING.turn().await;
+        let mut current = settings(hub, &p.id).await?;
+        if current.notice.as_ref() == Some(notice) {
+            if current.notice.as_ref() != Some(&sent) {
+                current.notice = Some(sent);
+                save_settings(hub, &p.id, &current).await?;
+            }
+            reconcile_notice(hub, &p.id, &to).await?;
+        }
+    }
+    Ok(())
+}
+
+/// A verified ledger transition, never a socket write, advances an internal notice.
+pub async fn mail_progress(hub: &Hub, recipient: &str, receipt: &crate::harness::mail::Receipt, mail_scope: &str) -> anyhow::Result<()> {
+    if mail_scope != crate::util::sha256_hex(b"mail-scope-v1:server") { return Ok(()); }
+    for p in masters(&hub.store).await?.into_iter().filter(|p| p.coordinator.as_deref() == Some(recipient)) {
+        let _writing = WRITING.turn().await;
+        let mut current = settings(hub, &p.id).await?;
+        let Some(notice) = current.notice.as_mut().filter(|n| notice_id(recipient, n) == receipt.id) else { continue };
+        // Read after taking the writer gate: a delayed Accepted event cannot overwrite a
+        // newer Consumed/Cancelled transition already committed by another source event.
+        if let Some(latest) = crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), recipient.to_owned(), receipt.id.clone()).await? {
+            apply_receipt(notice, latest);
+            save_settings(hub, &p.id, &current).await?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

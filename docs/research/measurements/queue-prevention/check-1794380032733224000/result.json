@@ -1,0 +1,40 @@
+{
+  "exit_code": 101,
+  "source_unchanged": false,
+  "errors": [
+    {
+      "message": "type mismatch resolving `<Option<usize> as Try>::Output == Option<usize>`",
+      "rendered": "error[E0271]: type mismatch resolving `<Option<usize> as Try>::Output == Option<usize>`\n    --> crates/kiln/src/harness/host.rs:2112:84\n     |\n2112 | ...   let bytes = core.writes.iter().filter(|wire| flight.matches(wire)).try_fold(std::mem::size_of::<super::admission::LegacyFlig...\n     |                                                                          ^^^^^^^^ expected `Option<usize>`, found `usize`\n     |\n     = note: expected enum `std::option::Option<usize>`\n                found type `usize`\nnote: required by a bound in `std::iter::Iterator::try_fold`\n    --> /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/iter/traits/iterator.rs:2482:4\n\n"
+    },
+    {
+      "message": "no method named `flatten` found for enum `Option<Result<Option<Box<Handed>>, String>>` in the current scope",
+      "rendered": "error[E0599]: no method named `flatten` found for enum `Option<Result<Option<Box<Handed>>, String>>` in the current scope\n    --> crates/kiln/src/harness/host.rs:2488:171\n     |\n2488 | ...tion::from_secs(15), s.hand_over()).await.ok().flatten()) })).await;\n     |                                                   ^^^^^^^ `std::option::Option<std::result::Result<std::option::Option<Box<harness::session::Handed>>, std::string::String>>` is not an iterator\n     |\n     = note: the full name for the type has been written to '/Users/adalundhe/.cache/kiln-offline-state-fix-20261110/red-target/debug/deps/kiln-1fc1e9b561c74669.long-type-12738730653889004195.txt'\n     = note: consider using `--verbose` to print the full type name to the console\nhelp: call `.into_iter()` first\n     |\n2488 |         let handed = futures::future::join_all(sessions.iter().map(|s| async move { (Arc::clone(s), crate::rt::timeout(Duration::from_secs(15), s.hand_over()).await.ok().into_iter().flatten()) })).await;\n     |                                                                                                                                                                           ++++++++++++\n\n"
+    },
+    {
+      "message": "the size for values of type `[harness::model::Event]` cannot be known at compilation time",
+      "rendered": "error[E0277]: the size for values of type `[harness::model::Event]` cannot be known at compilation time\n    --> crates/kiln/src/harness/host.rs:2534:52\n     |\n2534 | ...   let hand_on = signed.and_then(|(epoch, events)| crate::runner::custody::hand_on(&s.id, epoch, &events, \"handed to this machi...\n     |                                              ^^^^^^ doesn't have a size known at compile-time\n     |\n     = help: the trait `std::marker::Sized` is not implemented for `[harness::model::Event]`\n     = note: all local variables must have a statically known size\n\n"
+    },
+    {
+      "message": "no method named `flatten` found for enum `Option<Result<Option<Box<Handed>>, String>>` in the current scope",
+      "rendered": "error[E0599]: no method named `flatten` found for enum `Option<Result<Option<Box<Handed>>, String>>` in the current scope\n    --> crates/kiln/src/harness/host.rs:2429:171\n     |\n2429 | ...tion::from_secs(15), s.hand_over()).await.ok().flatten()) })).await;\n     |                                                   ^^^^^^^ `std::option::Option<std::result::Result<std::option::Option<Box<harness::session::Handed>>, std::string::String>>` is not an iterator\n     |\n     = note: the full name for the type has been written to '/Users/adalundhe/.cache/kiln-offline-state-fix-20261110/red-target/debug/deps/kiln-1fc1e9b561c74669.long-type-12738730653889004195.txt'\n     = note: consider using `--verbose` to print the full type name to the console\nhelp: call `.into_iter()` first\n     |\n2429 |         let handed = futures::future::join_all(sessions.iter().map(|s| async move { (Arc::clone(s), crate::rt::timeout(Duration::from_secs(15), s.hand_over()).await.ok().into_iter().flatten()) })).await;\n     |                                                                                                                                                                           ++++++++++++\n\n"
+    },
+    {
+      "message": "the trait bound `Array<u8, UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>>: LowerHex` is not satisfied",
+      "rendered": "error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>>: LowerHex` is not satisfied\n    --> crates/kiln/src/harness/host.rs:1107:54\n     |\n1107 | ...           if copied != size || format!(\"{:x}\", hash.0.finalize()) != expected { return Err(std::io::Error::other(\"completed at...\n     |                                             ----   ^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>, B0>>`\n     |                                             |\n     |                                             required by this formatting parameter\n     |\n     = help: the following other types implement trait `LowerHex`:\n               &T\n               &mut T\n               AccessFlags\n               BTreeCharacteristics\n               BigUint\n               Braced\n               BytesMut\n               CloneFlags\n             and 238 others\n     = note: the full name for the type has been written to '/Users/adalundhe/.cache/kiln-offline-state-fix-20261110/red-target/debug/deps/kiln-1fc1e9b561c74669.long-type-11431711996564772303.txt'\n     = note: consider using `--verbose` to print the full type name to the console\n\n"
+    }
+  ],
+  "free_before": 44053864448,
+  "free_after": 41847697408,
+  "command": [
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "check",
+    "--locked",
+    "-p",
+    "kiln",
+    "--lib",
+    "--message-format=json"
+  ]
+}

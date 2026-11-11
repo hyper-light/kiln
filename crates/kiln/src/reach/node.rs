@@ -71,6 +71,9 @@ pub struct Config {
     /// Who takes over what another runner hands this one (an agent session moving here); None:
     /// hand-overs are refused. A lock-free queue (`crate::memory::queue`; goal 5, plan 01a1a59c2aae).
     pub adopt: Option<crate::memory::queue::Sender<Adoption>>,
+    /// Effective authenticated transfer policy. Unknown refuses storage; Off is an explicit
+    /// unset operator reserve, never a guessed free-space allowance.
+    pub adopt_policy: crate::harness::moving::stream::StoragePolicy,
     /// The copies' uses, for their keeper (`super::keeper`, docs/reach.md §5.1): each sync and run
     /// holds its copy in use while it's at it.
     pub using: Arc<super::keeper::Using>,
@@ -100,7 +103,7 @@ pub struct Config {
 pub struct Adoption {
     /// The runner it comes from.
     pub from: String,
-    pub data: Vec<u8>,
+    pub data: crate::harness::moving::stream::Spool,
     pub reply: oneshot::Sender<Result<(), String>>,
 }
 
@@ -156,7 +159,7 @@ const ADOPT_PIECE: usize = 1 << 20;
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), place: kiln_ci::place::runner::Settings::default(), version: wire::VERSION, root: Vec::new() }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, adopt_policy: crate::harness::moving::stream::StoragePolicy::Unknown, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), place: kiln_ci::place::runner::Settings::default(), version: wire::VERSION, root: Vec::new() }
     }
 }
 
@@ -176,6 +179,9 @@ pub enum In {
     /// Whether the server takes word of a message a link couldn't read (it says
     /// [`crate::proto::CAP_UNREAD`]: [`crate::proto::AgentMsg::LinkUnread`]).
     Unread(bool),
+    /// Persisted authenticated Offered policy, enqueued before destination Ready. This event
+    /// precedes any package the source is then allowed to send, even on a different link.
+    AdoptPolicy(crate::harness::moving::stream::StoragePolicy),
     Local(Local),
     /// An event of a run this node does for another runner.
     Ran { key: (String, String), id: u64, ev: serve::Event },
@@ -1075,7 +1081,7 @@ struct Session {
     /// Syncs, each its own worker (file system work stays off this task).
     syncs: HashMap<String, crate::memory::queue::Sender<(SyncAsk, Option<Commit>)>>,
     /// Hand-overs arriving, by id: the bytes so far.
-    adopting: HashMap<u64, Vec<u8>>,
+    adopting: HashMap<u64, crate::harness::moving::stream::Spool>,
     detached: Option<Instant>,
     /// The features its asker speaks on links ([`Ask::Features`], docs/wire.md): none until it
     /// says, and then a link variant past the first twelve goes to it only if it named it.
@@ -1191,6 +1197,7 @@ impl Node {
             }
             In::Answer { req, answer } => self.on_answer(req, answer).await,
             In::Unread(takes) => self.server_unread = takes,
+            In::AdoptPolicy(policy) => self.cfg.adopt_policy = policy,
             In::Server(up) => {
                 self.server = up;
                 // It says again whether it takes hints once it's back (`Features`).
@@ -1207,6 +1214,7 @@ impl Node {
                 // Whatever the directory said may have changed while away: ask again.
                 self.directory = None;
                 if !up {
+                    self.cfg.adopt_policy = crate::harness::moving::stream::StoragePolicy::Unknown;
                     let ids: Vec<String> = self.links.keys().cloned().collect();
                     for id in ids {
                         self.drop_link(&id, "the connection to the kiln server dropped", false).await;
@@ -2710,20 +2718,30 @@ impl Node {
         let Some(s) = self.served.get_mut(key) else { return };
         let Some(link) = s.link.clone() else { return };
         if offset == 0 {
-            s.adopting.insert(id, Vec::new());
+            s.adopting.remove(&id);
+            let spool = self.cfg.adopt_policy.floor().and_then(|floor| crate::harness::moving::stream::Spool::create(&self.cfg.dir.join("transfers"), ADOPT_MAX as u64, floor));
+            match spool {
+                Ok(spool) => { s.adopting.insert(id, spool); },
+                Err(_) => {
+                    self.say_on(&link, &Say::Adopted { id, error: Some(format!("{NOT_TAKEN}transfer storage policy or volume authority is unavailable")) }).await;
+                    return;
+                }
+            }
         }
         let refusal = match s.adopting.get_mut(&id) {
             None => Some(format!("{NOT_TAKEN}a hand-over that never began")),
-            Some(buf) if buf.len() as u64 != offset => Some(format!("{NOT_TAKEN}a piece at {offset} where {} was due", buf.len())),
-            Some(buf) if buf.len() + data.len() > ADOPT_MAX => Some(format!("{NOT_TAKEN}more than a hand-over carries")),
+            Some(buf) if buf.len() != offset => Some(format!("{NOT_TAKEN}a piece at {offset} where {} was due", buf.len())),
             Some(buf) => {
                 let before = buf.len() >> 20;
-                buf.extend_from_slice(&data);
+                if buf.append(offset, &data, last).is_err() {
+                    Some(format!("{NOT_TAKEN}the exact transfer piece could not be retained within its storage authority"))
+                } else {
                 let now = buf.len();
                 if !last && now >> 20 > before {
-                    self.say_on(&link, &Say::AdoptGot { id, bytes: now as u64 }).await;
+                    self.say_on(&link, &Say::AdoptGot { id, bytes: now }).await;
                 }
                 None
+                }
             }
         };
         if let Some(why) = refusal {

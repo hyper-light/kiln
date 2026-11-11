@@ -9,14 +9,14 @@
  */
 import * as React from "react";
 import { ArrowDown, ArrowUp, Check, ChevronDown, Clock, CornerDownLeft, Navigation, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
-import { clientId, FORCE_STOP_AFTER_MS, useSession, useStopAt, type Attachment, type QueueItem, type SendMode, type SessionStore, type SlashCommand } from "@/api/harness";
+import { clientId, harnessApi, FORCE_STOP_AFTER_MS, useSession, useStopAt, type Attachment, type QueueItem, type SendMode, type SessionStore, type SlashCommand } from "@/api/harness";
 import { sendingProps } from "@/lib/action";
 import { labelOf, useLabels } from "@/lib/data";
 import { useMediaQuery, useNow } from "@/lib/hooks";
 import { Tip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { attachedPreview, useAttachments, type Attachments } from "./controls";
+import { attachedPreview, useAttachments, type Attachments, type Taken } from "./controls";
 import type { ReplyTarget } from "./timeline";
 import { CommandList, findCommand, matchCommands, parseSlash, ReplyPanel, runCommand, slashAt, type Reply } from "./palette";
 import { commandNames } from "./marks";
@@ -31,6 +31,8 @@ import { KindGlyph } from "./kind-glyph";
 import type { SubagentRow } from "./subagent-tree";
 import { deferredState, queuePageRows, stateCount } from "@/api/state-pages";
 import { DeferredState } from "./deferred-state";
+import { sessionAvailability, sessionStatus } from "@/api/session-availability";
+import { mailScope, onMailScopeChange } from "@/api/client";
 
 export const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
@@ -48,6 +50,7 @@ interface RowActs {
   onAttach?: (attachments: Attachment[]) => void;
   /** It no longer waits for the `i`th of its files still to come (one whose upload went with an earlier page). */
   onWithout?: (i: number) => void;
+  onRetryFiles?: () => void;
   onMove?: (index: number) => void;
   onSteer?: () => void;
   onNow?: () => void;
@@ -64,7 +67,7 @@ const queueAttachSrc = (a: Attachment): string | undefined => {
 type Waiting = { id: string; text: string; attachments?: Attachment[]; uploading?: string[] };
 
 /** One waiting message: its words (tap to read them whole), its files (add or drop until it goes), and what can be done with it. */
-function QueueRow({ q, index, count, onEdit, onAttach, onWithout, onRemove, onMove, onSteer, onNow }: { q: Waiting; index: number; count: number } & RowActs) {
+function QueueRow({ q, index, count, onEdit, onAttach, onWithout, onRetryFiles, onRemove, onMove, onSteer, onNow }: { q: Waiting; index: number; count: number } & RowActs) {
   const text = q.text;
   const attach = useAttachments("any");
   const picker = React.useRef<HTMLInputElement>(null);
@@ -177,6 +180,11 @@ function QueueRow({ q, index, count, onEdit, onAttach, onWithout, onRemove, onMo
         </span>
       )}
       <span className="qd-acts">
+        {onRetryFiles && (
+          <button type="button" className="hx-attach-chip" onClick={onRetryFiles}>
+            Retry files
+          </button>
+        )}
         <Tip content="Edit">
           <button type="button" className="hx-icon" aria-label="Edit" onClick={() => setEditing(true)}>
             <Pencil size={13} />
@@ -447,21 +455,37 @@ const StopSubagent = React.memo(function StopSubagent({ store, task }: { store: 
  * What was kept here for `agent` goes, in order, if it can take it now (connected, its machine
  * there). Those that went are dropped at once, after: a send that fails stops the rest.
  */
-function sendHeld(store: SessionStore, agent: string) {
-  const s = store.get();
-  if (s.conn !== "open" || s.state?.status === "disconnected") return;
-  const went: string[] = [];
-  for (const m of useHeld.getState().held[agent] ?? []) {
-    // One whose files are still on their way waits for them, and those after it behind it.
-    if (m.uploading?.length) break;
-    // As it was to go: a "now" kept through a reconnection still stops what runs. One for a
-    // subagent keeps its way too (the agent sends it the nearest way that one takes then).
-    const running = s.state?.status === "running" || s.state?.status === "waiting";
-    const mode = m.task || running ? (m.mode ?? "queue") : "queue";
-    if (!store.send({ type: "send", id: m.id, text: m.text, mode, attachments: m.attachments, overrides: m.overrides, reply_to: m.reply_to, ...(m.task ? { task: m.task } : {}) })) break;
-    went.push(m.id);
+const heldSending = new WeakSet<SessionStore>();
+async function sendHeld(store: SessionStore, agent: string) {
+  if (heldSending.has(store)) return;
+  heldSending.add(store);
+  try {
+    const s = store.get();
+    if (sessionAvailability(s) !== "available") return;
+    for (const m of useHeld.getState().held[agent] ?? []) {
+      if (m.owner !== mailScope()) continue;
+      // Earlier originals retain their place through durable server waiting. Source admission
+      // removes their browser copy, then the next queued original can go under its own id.
+      if (m.custody) break;
+      // One whose files are still on their way waits for them, and those after it behind it.
+      if (m.uploading?.length) break;
+      // As it was to go: a "now" kept through a reconnection still stops what runs. One for a
+      // subagent keeps its way too (the agent sends it the nearest way that one takes then).
+      const status = sessionStatus(s);
+      const running = status === "running" || status === "waiting";
+      const mode = m.task || running ? (m.mode ?? "queue") : "queue";
+      if (
+        !(await store.sendMail(
+          { type: "send", id: m.id, text: m.text, mode, attachments: m.attachments, overrides: m.overrides, reply_to: m.reply_to, ...(m.task ? { task: m.task } : {}) },
+          m.originals,
+        ))
+      )
+        break;
+      break;
+    }
+  } finally {
+    heldSending.delete(store);
   }
-  if (went.length) useHeld.getState().drop(agent, ...went);
 }
 
 const NO_QUEUE: QueueItem[] = [];
@@ -541,7 +565,7 @@ export function Composer({
   to?: readonly SubagentRow[];
   /** Where the last message to them stands, each by its row's key: delivered, waiting, or not sent. */
   toMarks?: ReadonlyMap<string, ToMark>;
-  onSendTo?: (m: { text: string; attachments?: Attachment[] }) => void;
+  onSendTo?: (m: { text: string; taken: Taken }) => Promise<boolean>;
   onClearTo?: () => void;
 }) {
   const [text, setText] = useDraft(agent);
@@ -549,16 +573,20 @@ export function Composer({
   const setMode = useSendMode((s) => s.setMode);
   // The connection's down: what needs the server (the mic, commands' replies) waits for it.
   const disabled = useSession(store, (s) => s.conn !== "open");
-  const status = useSession(store, (s) => s.state?.status);
+  const status = useSession(store, sessionStatus);
   // The agent can't take a message now (its machine away, or the connection down): what you
   // send is kept here, and goes once it can. Typing never stops.
-  const reachable = !disabled && status !== "disconnected";
+  const reachable = useSession(store, (s) => sessionAvailability(s) === "available");
   // The machine it runs on, as people know it (none for one on the kiln server itself).
   const on = useSession(store, (s) => (s.info?.target?.startsWith("agent:") ? s.info.target.slice(6) : ""));
   const labels = useLabels();
   const machine = on && labelOf(on, labels);
   const paused = useSession(store, (s) => (s.state?.pause ? (s.state.pause.auto ? "auto" : "manual") : null));
-  const held = useHeld((s) => s.held[agent] ?? NO_HELD);
+  const allHeld = useHeld((s) => s.held[agent] ?? NO_HELD);
+  const owner = React.useSyncExternalStore(onMailScopeChange, mailScope, () => null);
+  const pendingOriginals = React.useMemo(() => allHeld.filter((message) => owner !== null && message.owner === owner), [allHeld, owner]);
+  const held = React.useMemo(() => pendingOriginals.filter((message) => !message.custody), [pendingOriginals]);
+  const custodyError = useHeld((s) => s.error);
   const queue = useSession(store, (s) => s.state?.queue ?? NO_QUEUE);
   const queueDeferred = useSession(store, (s) => deferredState(s.state, "queue"));
   const queueTotal = useSession(store, (s) => stateCount(s.state, "queue", s.state?.queue.length ?? 0));
@@ -613,7 +641,9 @@ export function Composer({
   const sendsHeld = React.useCallback(
     (el: HTMLDivElement | null) => {
       if (!el) return;
-      const go = () => sendHeld(store, agent);
+      const go = () => {
+        void sendHeld(store, agent);
+      };
       go();
       const offSession = store.subscribe(go);
       const offHeld = useHeld.subscribe(go);
@@ -756,37 +786,55 @@ export function Composer({
     sendText(raw);
   };
 
-  const sendText = (body: string) => {
+  const sending = React.useRef(false);
+  const sendText = async (body: string) => {
+    if (sending.current) return;
     if (!body && files.length === 0 && pending === 0) return;
-    // Its files go with it, those still uploading too: Send doesn't wait for them (W21-R15).
-    const taken = attachments.take();
-    // To the subagents picked: one message each, sent by the page (agent.tsx), none to the agent;
-    // files still on their way go with it once they're up.
-    if (!toSub && picked.length > 0 && onSendTo) {
-      const send = (files: Attachment[]) => {
-        if (body || files.length) onSendTo({ text: body, attachments: files.length ? files : undefined });
-      };
-      if (taken.uploading.length) void taken.up.then(send);
-      else send(taken.files);
+    sending.current = true;
+    setNote("Saving message…");
+    try {
+      // Its files go with it, those still uploading too: Send doesn't wait for them (W21-R15).
+      const taken = attachments.take();
+      // To the subagents picked: one message each, sent by the page (agent.tsx), none to the agent;
+      // files still on their way go with it once they're up.
+      if (!toSub && picked.length > 0 && onSendTo) {
+        if (!(await onSendTo({ text: body, taken }))) {
+          taken.back();
+          setNote("The message stayed in this box because its originals could not all be saved.");
+          return;
+        }
+        write("");
+        setNote(null);
+        setOverride({});
+        setWithOpen(false);
+        onClearReply?.();
+        return;
+      }
+      const m = { id: clientId(), text: body, attachments: taken.files.length ? taken.files : undefined, overrides: override.model || override.effort ? override : undefined, reply_to: replyTo?.id };
+      // It can't take it now (or what was kept here hasn't all gone yet): kept here, sent once it
+      // can, in order — never lost, never blocked. "Now" and "steer" don't wait behind what's kept:
+      // they're for the turn under way. One whose files are still on their way is kept till they're up.
+      const go = running ? mode : "queue";
+      const behind = pendingOriginals.length > 0 && go === "queue";
+      const to = toSub ? { task: toSub.id } : {};
+      let accepted: boolean;
+      if (taken.uploading.length) accepted = await holdWith(agent, { ...m, mode: go, at: Date.now(), ...to }, taken);
+      else if (behind || !reachable) accepted = await useHeld.getState().hold(agent, { ...m, mode: go, at: Date.now(), ...to, originals: taken.originals });
+      else accepted = await store.sendMail({ type: "send", ...m, mode: go, ...to }, taken.originals);
+      if (!accepted) {
+        if (!taken.uploading.length) taken.back();
+        setNote(useHeld.getState().error ?? store.get().error ?? "The message stayed in this box. Keep its text and files and try when the connection returns.");
+        return;
+      }
+      taken.commit?.();
       write("");
+      setNote(null);
       setOverride({});
       setWithOpen(false);
       onClearReply?.();
-      return;
+    } finally {
+      sending.current = false;
     }
-    const m = { id: clientId(), text: body, attachments: taken.files.length ? taken.files : undefined, overrides: override.model || override.effort ? override : undefined, reply_to: replyTo?.id };
-    // It can't take it now (or what was kept here hasn't all gone yet): kept here, sent once it
-    // can, in order — never lost, never blocked. "Now" and "steer" don't wait behind what's kept:
-    // they're for the turn under way. One whose files are still on their way is kept till they're up.
-    const go = running ? mode : "queue";
-    const behind = held.length > 0 && go === "queue";
-    const to = toSub ? { task: toSub.id } : {};
-    if (taken.uploading.length) holdWith(agent, { ...m, mode: go, at: Date.now(), ...to }, taken);
-    else if (behind || !(reachable && store.send({ type: "send", ...m, mode: go, ...to }))) useHeld.getState().hold(agent, { ...m, mode: go, at: Date.now(), ...to });
-    write("");
-    setOverride({});
-    setWithOpen(false);
-    onClearReply?.();
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -845,6 +893,16 @@ export function Composer({
 
   return (
     <div ref={sendsHeld} className="hx-composer cp">
+      {custodyError && (
+        <div className="pl-note" role="alert">
+          {custodyError}
+        </div>
+      )}
+      {owner && allHeld.some((message) => !message.owner) && (
+        <div className="pl-note" role="status">
+          Saved messages need their original account verified before sending. Their originals remain stored.
+        </div>
+      )}
       {held.length > 0 && (
         <Queued
           queue={held}
@@ -854,6 +912,24 @@ export function Composer({
             onEdit: (t) => useHeld.getState().edit(agent, id, t),
             onWithout: (i) => useHeld.getState().without(agent, id, i),
             onRemove: () => useHeld.getState().drop(agent, id),
+            onRetryFiles:
+              held.find((message) => message.id === id)?.originals?.length && !uploadingHere.has(id)
+                ? () => {
+                    const message = held.find((item) => item.id === id);
+                    if (!message) return;
+                    uploadingHere.add(id);
+                    void Promise.all((message.originals ?? []).map(async (file) => ({ name: file.name, mime: file.mime, file_id: await harnessApi.upload(file.blob, file.name, file.mime) })))
+                      .then(
+                        (files) => useHeld.getState().uploaded(agent, id, files, message.owner, message.originals),
+                        () => {
+                          setNote("The files could not upload yet; their originals remain saved here.");
+                        },
+                      )
+                      .finally(() => {
+                        uploadingHere.delete(id);
+                      });
+                  }
+                : undefined,
           })}
         />
       )}

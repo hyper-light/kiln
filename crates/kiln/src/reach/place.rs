@@ -546,7 +546,7 @@ impl EpochDisk for EpochFs<'_> {
     }
 
     fn sync_new(&self) -> std::io::Result<()> {
-        std::fs::File::open(self.new_path())?.sync_all()
+        std::fs::OpenOptions::new().write(true).open(self.new_path())?.sync_all()
     }
 
     fn rename_new(&self) -> std::io::Result<()> {
@@ -2278,6 +2278,16 @@ mod durable_tests {
         let planted = case();
         EPOCH_UNSYNCED.with(|c| c.set(false));
         assert!(planted.is_err(), "planted: an unsynced epoch is taken up again after a crash: {planted:?}");
+    }
+
+    #[test]
+    fn lb03_real_epoch_file_advances_and_leaves_only_the_committed_epoch() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert_eq!(next_epoch(dir.path())?, 1);
+        assert_eq!(next_epoch(dir.path())?, 2);
+        assert_eq!(std::fs::read_to_string(dir.path().join("place-epoch"))?, "2");
+        assert!(!dir.path().join("place-epoch.new").exists());
+        Ok(())
     }
 
     /// LB03: an owner gone from the directory is forgotten at its runner, its ended records let go

@@ -1,0 +1,303 @@
+{
+  "policy": {
+    "revision": "7d7e0855a5073ed5163b4fe7ed3355c9ed7c2506",
+    "rules_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+    "role": "implementer"
+  },
+  "scope": {
+    "read_only": true,
+    "needs": "cpus=1,mem=1g,disk=1g",
+    "sync": false,
+    "builds_started": 0,
+    "service_mutations": 0
+  },
+  "mac": {
+    "runner": "d1323898b255a3ed435eb83fa0f7b0cf",
+    "metadata": {
+      "captured_at": "2026-11-11T07:38:27.116059+00:00",
+      "home": "/Users/adalundhe",
+      "platform": {
+        "exit": 0,
+        "stdout": "Darwin arm64",
+        "stderr": ""
+      },
+      "free_bytes": 2330319577088,
+      "paths": [
+        {
+          "path": "/Users/adalundhe/.cache/kiln-offline-release-20261111",
+          "exists": true,
+          "is_dir": true,
+          "size": 128
+        },
+        {
+          "path": "/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-linux-target",
+          "exists": true,
+          "is_dir": true,
+          "size": 192
+        },
+        {
+          "path": "/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-zig",
+          "exists": true,
+          "is_dir": true,
+          "size": 224
+        },
+        {
+          "path": "/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-zig/bin/python",
+          "exists": true,
+          "is_dir": false,
+          "size": 102352
+        },
+        {
+          "path": "/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-zig/bin/cargo-zigbuild",
+          "exists": true,
+          "is_dir": false,
+          "size": 7156416
+        }
+      ],
+      "cache_entries": [
+        {
+          "name": "mac-linux-target",
+          "is_dir": true,
+          "size": 192
+        },
+        {
+          "name": "mac-zig",
+          "is_dir": true,
+          "size": 224
+        }
+      ],
+      "tools": {
+        "python3": "/usr/bin/python3",
+        "cargo": "/Users/adalundhe/.cargo/bin/cargo",
+        "rustc": "/Users/adalundhe/.cargo/bin/rustc",
+        "cargo-zigbuild": null,
+        "node": "/Users/adalundhe/.nvm/versions/node/v26.13.0/bin/node",
+        "npm": "/Users/adalundhe/.nvm/versions/node/v26.13.0/bin/npm",
+        "bun": null,
+        "git": "/usr/bin/git"
+      },
+      "rustc": {
+        "exit": 0,
+        "stdout": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: aarch64-apple-darwin\nrelease: 1.99.1\nLLVM version: 23.1.1",
+        "stderr": ""
+      },
+      "cargo": {
+        "exit": 0,
+        "stdout": "cargo 1.99.1 (5f94df478 2026-08-27)",
+        "stderr": ""
+      },
+      "pinned_zig_packages": {
+        "exit": 0,
+        "stdout": "Name: ziglang\nVersion: 0.17.0\nSummary: Zig is a general-purpose programming language and toolchain for maintaining robust, optimal, and reusable software.\nHome-page: \nAuthor: \nAuthor-email: \nLicense: \nLocation: /Users/adalundhe/.cache/kiln-offline-release-20261111/mac-zig/lib/python3.9/site-packages\nRequires: \nRequired-by: cargo-zigbuild\n---\nName: cargo-zigbuild\nVersion: 0.23.4\nSummary: \nHome-page: \nAuthor: \nAuthor-email: \nLicense: \nLocation: /Users/adalundhe/.cache/kiln-offline-release-20261111/mac-zig/lib/python3.9/site-packages\nRequires: ziglang\nRequired-by:",
+        "stderr": ""
+      }
+    },
+    "fingerprint": {
+      "captured_at": "2026-11-11T07:40:47.471822+00:00",
+      "source": "/Users/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/kiln-offline-fix-20261110-8a5ae447ef",
+      "source_helpers": [],
+      "env_fingerprint": [
+        {
+          "path": "/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-linux-target/x86_64-unknown-linux-musl/release/.fingerprint/tikv-jemalloc-sys-e6cba4955ddf98aa/run-build-script-build-script-build.json",
+          "env": [
+            {
+              "var": "X86_64_UNKNOWN_LINUX_MUSL_JEMALLOC_OVERRIDE",
+              "val": null
+            },
+            {
+              "var": "JEMALLOC_OVERRIDE",
+              "val": null
+            },
+            {
+              "var": "CC_x86_64-unknown-linux-musl",
+              "val": null
+            },
+            {
+              "var": "CC_x86_64_unknown_linux_musl",
+              "val": "/Users/adalundhe/Library/Caches/cargo-zigbuild/0.23.4/wrappers/6a87/zigcc-x86_64-unknown-linux-musl-e859.sh"
+            },
+            {
+              "var": "CC_ENABLE_DEBUG_OUTPUT",
+              "val": null
+            },
+            {
+              "var": "CFLAGS",
+              "val": null
+            },
+            {
+              "var": "CFLAGS_x86_64_unknown_linux_musl",
+              "val": null
+            },
+            {
+              "var": "CFLAGS_x86_64-unknown-linux-musl",
+              "val": null
+            },
+            {
+              "var": "X86_64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_MALLOC_CONF",
+              "val": null
+            },
+            {
+              "var": "JEMALLOC_SYS_WITH_MALLOC_CONF",
+              "val": null
+            },
+            {
+              "var": "X86_64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_LG_PAGE",
+              "val": null
+            },
+            {
+              "var": "JEMALLOC_SYS_WITH_LG_PAGE",
+              "val": null
+            },
+            {
+              "var": "X86_64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_LG_HUGEPAGE",
+              "val": null
+            },
+            {
+              "var": "JEMALLOC_SYS_WITH_LG_HUGEPAGE",
+              "val": null
+            },
+            {
+              "var": "X86_64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_LG_QUANTUM",
+              "val": null
+            },
+            {
+              "var": "JEMALLOC_SYS_WITH_LG_QUANTUM",
+              "val": null
+            },
+            {
+              "var": "X86_64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_LG_VADDR",
+              "val": null
+            },
+            {
+              "var": "JEMALLOC_SYS_WITH_LG_VADDR",
+              "val": null
+            }
+          ],
+          "rustflags": []
+        }
+      ],
+      "rustflags": [
+        {
+          "path": "/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-linux-target/x86_64-unknown-linux-musl/release/.fingerprint/kiln-79c2dd92e108cadc/bin-kiln.json",
+          "rustflags": [],
+          "features": "[\"jemalloc\"]"
+        }
+      ],
+      "archives": [
+        {
+          "path": "/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-linux-target/x86_64-unknown-linux-musl/release/build/tikv-jemalloc-sys-e6cba4955ddf98aa/out/lib/libjemalloc.a",
+          "size": 7345622
+        },
+        {
+          "path": "/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-linux-target/x86_64-unknown-linux-musl/release/build/tikv-jemalloc-sys-e6cba4955ddf98aa/out/lib/libjemalloc_pic.a",
+          "size": 7345812
+        }
+      ],
+      "zig_wrapper": "#!/bin/sh\nexec \"$KILN_TASK_ZIGROOT/bin/python\" -m ziglang \"$@\"\n"
+    },
+    "archives": {
+      "captured_at": "2026-11-11T07:41:29.596515+00:00",
+      "archives": [
+        {
+          "path": "/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-linux-target/x86_64-unknown-linux-musl/release/build/tikv-jemalloc-sys-e6cba4955ddf98aa/out/lib/libjemalloc.a",
+          "sha256": "a46a50443f66cca793241ef2ce94f55e2569e82c0dcc8ecc647a010cb244c6ef",
+          "size": 7345622,
+          "ar_exit": 0,
+          "members_count": 62,
+          "first_members": [
+            "jemalloc.o",
+            "arena.o",
+            "background_thread.o",
+            "base.o",
+            "bin.o"
+          ]
+        },
+        {
+          "path": "/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-linux-target/x86_64-unknown-linux-musl/release/build/tikv-jemalloc-sys-e6cba4955ddf98aa/out/lib/libjemalloc_pic.a",
+          "sha256": "88ecb7419a5d08f7d184abcbc0553a852480674301384fff8aa7bb2ae3288396",
+          "size": 7345812,
+          "ar_exit": 0,
+          "members_count": 62,
+          "first_members": [
+            "jemalloc.pic.o",
+            "arena.pic.o",
+            "background_thread.pic.o",
+            "base.pic.o",
+            "bin.pic.o"
+          ]
+        }
+      ],
+      "cc_wrapper": {
+        "path": "/Users/adalundhe/Library/Caches/cargo-zigbuild/0.23.4/wrappers/6a87/zigcc-x86_64-unknown-linux-musl-e859.sh",
+        "text": "#!/bin/sh\nexport CARGO_ZIGBUILD_ZIG_VERSION=0.17.0\nexport CARGO_ZIGBUILD_ZIG_COMMAND=/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-zig/bin/python-zig\nif [ -n \"$SDKROOT\" ]; then export SDKROOT; fi\nexec \"/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-zig/bin/cargo-zigbuild\" zig cc -- -g '-fno-sanitize=all' -target x86_64-linux-musl \"$@\"\n"
+      },
+      "source_ui": [
+        {
+          "path": "/Users/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/kiln-offline-fix-20261110-8a5ae447ef/ui/dist/client/_shell.html",
+          "exists": true,
+          "size": 29130,
+          "is_symlink": false
+        },
+        {
+          "path": "/Users/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/kiln-offline-fix-20261110-8a5ae447ef/ui/node_modules",
+          "exists": true,
+          "size": 8992,
+          "is_symlink": false
+        },
+        {
+          "path": "/Users/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/kiln-offline-fix-20261110-8a5ae447ef/ui/dist/server",
+          "exists": true,
+          "size": 192,
+          "is_symlink": false
+        },
+        {
+          "path": "/Users/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/kiln-offline-fix-20261110-8a5ae447ef/ui/.output/server",
+          "exists": false,
+          "size": null,
+          "is_symlink": false
+        },
+        {
+          "path": "/Users/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/kiln-offline-fix-20261110-8a5ae447ef/dist/kiln-x86_64-unknown-linux-musl",
+          "exists": true,
+          "size": 353177136,
+          "is_symlink": false
+        }
+      ]
+    },
+    "wrappers": {
+      "captured_at": "2026-11-11T07:41:41.757581+00:00",
+      "wrappers": [
+        {
+          "path": "/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-zig/bin/python-zig",
+          "text": "#!/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-zig/bin/python3\n# -*- coding: utf-8 -*-\nimport re\nimport sys\nfrom ziglang.__main__ import dummy\nif __name__ == '__main__':\n    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n    sys.exit(dummy())\n"
+        }
+      ]
+    }
+  },
+  "windows": {
+    "runner": "f766f09294f2e17e3b8a631ffd4e6a4b",
+    "native_cli": {
+      "ended_at": "2026-11-11T07:39:15.971981Z",
+      "exit_code": 1,
+      "error": "f766f09294f2e17e3b8a631ffd4e6a4b did not answer in 15s"
+    },
+    "mcp": {
+      "error": "f766f09294f2e17e3b8a631ffd4e6a4b did not answer in 15s",
+      "output": "",
+      "running": false
+    },
+    "paths_verified": false
+  },
+  "canonical": {
+    "command": "git ls-remote https://github.com/hyper-light/kiln.git refs/heads/main",
+    "local": {
+      "exit_code": 128,
+      "error": "Could not resolve host: github.com"
+    },
+    "via_mac": {
+      "captured_at": "2026-11-11T07:39:34.026764+00:00",
+      "exit_code": 0,
+      "stdout": "f555736bd887a4196c8841564cb9b4d6c1ede95f\trefs/heads/main"
+    }
+  }
+}

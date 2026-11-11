@@ -15,7 +15,8 @@ import "./harness.css";
 import "./console.css";
 import { ArrowUp, Check, ChevronDown, CircleAlert, Paperclip } from "lucide-react";
 import { api } from "@/api/client";
-import { clientId, harnessApi, type AgentInfo, type KindInfo, type PastSession, type WorkspacesAvailable } from "@/api/harness";
+import { clientId, harnessApi, sessionStore, type AgentInfo, type KindInfo, type PastSession, type WorkspacesAvailable } from "@/api/harness";
+import { heldCommand, useHeld } from "@/api/held";
 import type { Agent, ReachRunner, TerminalSessionInfo } from "@/api/types";
 import { Loadable } from "@/components/ui/loading";
 import { Tip } from "@/components/ui/tooltip";
@@ -56,7 +57,7 @@ import {
   type Chosen,
 } from "./spawn-setup";
 import { putBack, showsLine, startAgain, startAgents, useStart, type Start } from "./starting";
-import { holdWith } from "./state";
+import { holdManyWith } from "./state";
 import { MicButton } from "./voice";
 
 /** What starting agents needs to know: each machine's harnesses, the machines, their shells, the runners its commands can go to, and where it can have a workspace of its own. */
@@ -738,7 +739,7 @@ export function NewAgent({
 
   // Start doesn't wait for the server (starting.ts): the agents are listed starting at once, under
   // ids made here, and one opens at once.
-  const run = (s: Setup) => {
+  const run = async (s: Setup) => {
     if (!s.target) return;
     const body = text.trim();
     // Files go with the first message (those still uploading too: Start doesn't wait for them), so
@@ -763,7 +764,16 @@ export function NewAgent({
     // they're up). Several: sent to them all once they've started and the files are up.
     const only = ids.length === 1 ? ids[0] : undefined;
     const heldFirst = sending && only ? clientId() : undefined;
-    if (sending && heldFirst && only) holdWith(only, { id: heldFirst, text: body, at: Date.now(), mode: "queue" }, sending);
+    const heldIds = ids.map((id) => ({ agent: id, message: only && heldFirst ? heldFirst : clientId() }));
+    if (sending) {
+      if (
+        !(await holdManyWith(
+          heldIds.map((item) => ({ agent: item.agent, message: { id: item.message, text: body, at: Date.now(), mode: "queue" } })),
+          sending,
+        ))
+      )
+        return;
+    }
     // Once they've all started, the machine and folder are the next start's, and several agents'
     // files go to them all; a start that couldn't changes nothing kept.
     const dirs = c.shell ? undefined : withDir(c.dirs, s.target, s.cwd);
@@ -771,10 +781,14 @@ export function NewAgent({
     const after = () => {
       setLastTarget(s.target);
       if (dirs) setDirs(dirs);
-      if (sending && !only)
-        return sending.up.then((up) =>
-          body || up.length ? harnessApi.broadcastTo({ to: { ids }, text: body, attachments: up.length ? up : undefined, key: clientId() }).then(() => undefined) : undefined,
-        );
+      if (sending)
+        return sending.up.then(async () => {
+          await useHeld.getState().ready();
+          for (const item of heldIds) {
+            const original = useHeld.getState().held[item.agent]?.find((message) => message.id === item.message);
+            if (original && !original.uploading?.length) await sessionStore(item.agent).sendMail(heldCommand(original), original.originals);
+          }
+        });
     };
     startAgents({
       ids,

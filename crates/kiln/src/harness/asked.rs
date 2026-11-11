@@ -49,6 +49,9 @@ pub fn stand(sent: &Sent, kind: Kind) -> Stand {
     use super::inbox::Refusal as Inbox;
     use crate::wire::channel::Refusal as Code;
     match sent {
+        Sent::Published(_) => Stand::Interim,
+        Sent::PublicationRefused(super::mail::Error::Capacity { .. } | super::mail::Error::StorageFull | super::mail::Error::Backpressure { .. } | super::mail::Error::Unavailable { .. }) => Stand::Again,
+        Sent::PublicationRefused(_) => Stand::Final,
         Sent::Taken | Sent::Accepted(_) | Sent::NoSession => Stand::Final,
         Sent::Parked => Stand::Interim,
         // Its inbox didn't say in time (`pending`): sent again, the inbox answers a repeat if it
@@ -198,6 +201,17 @@ impl Asked {
     pub fn forget(&self, session: &str) {
         self.sessions.lock().remove(session);
     }
+
+    /// A committed source disposition updates only the exact publication already answered here.
+    pub fn published(&self, session: &str, receipt: super::mail::Receipt) {
+        let mut sessions = self.sessions.lock();
+        let Some(log) = sessions.get_mut(session) else { return };
+        for entry in log.entries.values_mut() {
+            if let State::Answered(Sent::Published(previous)) = &mut entry.state
+                && previous.revision == receipt.revision && previous.generation <= receipt.generation
+            { *previous = receipt.clone(); }
+        }
+    }
 }
 
 /// The frame that answers command `id` (of `kind`) on a viewer's socket: `ack`, with what became of
@@ -210,7 +224,7 @@ pub fn frame(id: &str, sent: &Sent, kind: Kind) -> String {
 pub fn answer(id: &str, sent: &Sent, kind: Kind) -> SessionDown {
     let again = stand(sent, kind) == Stand::Again;
     let id = id.to_owned();
-    let ack = |outcome, accepted| SessionFrame::Ack { id: id.clone(), outcome, accepted };
+    let ack = |outcome, accepted| SessionFrame::Ack { id: id.clone(), outcome, accepted, publication: None };
     let nack = |code: String, why: String, refused| SessionFrame::Nack { id: Some(id.clone()), code, why, again, refused };
     let code_of = |v: Option<serde_json::Value>, field: Option<&str>| {
         v.and_then(|v| match field {
@@ -220,6 +234,17 @@ pub fn answer(id: &str, sent: &Sent, kind: Kind) -> SessionDown {
         .unwrap_or_else(|| "refused".to_owned())
     };
     match sent {
+        Sent::Published(receipt) => SessionFrame::Ack { id: id.clone(), outcome: Outcome::Pending, accepted: None, publication: Some(receipt.clone()) },
+        Sent::PublicationRefused(error) => {
+            let code = match error {
+                super::mail::Error::Backpressure { .. } => "mail_backpressure",
+                super::mail::Error::Capacity { .. } | super::mail::Error::StorageFull => "mail_capacity",
+                super::mail::Error::Unavailable { .. } => "mail_unavailable",
+                super::mail::Error::NoSession => "no_session",
+                _ => "mail_refused",
+            };
+            nack(code.into(), format!("custody was not accepted: {error}"), None)
+        }
         Sent::Taken => ack(Outcome::Taken, None),
         Sent::Parked => ack(Outcome::Parked, None),
         Sent::Ok if kind.deduped => ack(Outcome::Pending, None),

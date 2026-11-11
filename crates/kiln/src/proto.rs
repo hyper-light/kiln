@@ -352,6 +352,9 @@ pub enum AgentMsg {
     /// SHA-256; `done` on the last. Only to a server that named [`feature::SKILLS`]. Appended
     /// last, after `Skills`: postcard encodes variants by index.
     SkillFile { req: u64, sha256: String, offset: u64, #[serde(with = "wire_bytes")] data: Vec<u8>, done: bool },
+    /// Exact source offer or destination receipt for journal custody. Only when both peers
+    /// name mail-transfer; appended to preserve postcard variant indices. Control lane only.
+    HarnessMailTransfer { json: String },
 }
 
 /// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
@@ -774,7 +777,10 @@ pub mod feature {
     pub const SKILLS: &str = "skills";
     /// Bounded session control projections and revisioned, on-demand detail reads.
     pub const STATE_PAGES: &str = "state-pages";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES];
+    /// Durable communications with consumption-driven receiver credit.
+    pub const MAIL_FLOW: &str = "mail-flow";
+    pub const MAIL_TRANSFER: &str = "mail-transfer";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1161,6 +1167,9 @@ pub enum ServerMsg {
     /// `want`), at `offset`, by its SHA-256; `done` on the last. Only to runners that named
     /// [`feature::SKILLS`]. Appended last, after `Skills`: postcard encodes variants by index.
     SkillFile { sha256: String, offset: u64, #[serde(with = "wire_bytes")] data: Vec<u8>, done: bool },
+    /// Authoritative durable transfer phase for the exact manifest, on Control. A receiver
+    /// keeps its imported journal fenced until Committed. Only with mail-transfer.
+    HarnessMailTransfer { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests

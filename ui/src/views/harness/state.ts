@@ -8,7 +8,10 @@
 import * as React from "react";
 import { create } from "zustand";
 import { createJSONStorage, persist, type PersistStorage, type StorageValue } from "zustand/middleware";
-import type { Attachment, SendMode } from "@/api/harness";
+import type { SendMode } from "@/api/harness";
+import { useHeld, type Held } from "@/api/held";
+import { mailScope } from "@/api/client";
+export { useHeld, type Held } from "@/api/held";
 import type { Taken } from "./controls";
 
 /* ------------------------------------------------------------------ send mode */
@@ -141,112 +144,40 @@ export function useDraft(key: string): [string, (text: string | ((was: string) =
  * A message written while its agent couldn't take one (its machine away, the connection down): it
  * waits in this browser and goes, in order, once the agent can take it.
  */
-export interface Held {
-  id: string;
-  text: string;
-  at: number;
-  attachments?: Attachment[];
-  overrides?: { model?: string; effort?: string };
-  /** How it was to go: "now" and "steer" keep that when it goes (older ones: queued). */
-  mode?: SendMode;
-  /** The event it answers (a messenger-style reply). */
-  reply_to?: string;
-  /** For one of its subagents (its task's id). */
-  task?: string;
-  /**
-   * Its files still on their way up, by name (it was sent before they were, W21-R15): it waits for
-   * them, and what's kept after it waits behind it. Kept from before a reload, they never come (their
-   * uploads went with that page: `uploadingHere`), and it waits for its person to let each go.
-   */
-  uploading?: string[];
-}
-
-/** The kept messages whose files this page is uploading (one kept from before a reload isn't). */
+/** The kept messages whose files this page is uploading (one kept from before a reload is not). */
 export const uploadingHere = new Set<string>();
-
-interface HeldState {
-  held: Record<string, Held[]>;
-  hold: (agent: string, m: Held) => void;
-  edit: (agent: string, id: string, text: string) => void;
-  /** Its files are up (`files`: all it carries now): it goes, in its turn; with neither words nor files, it's dropped. */
-  uploaded: (agent: string, id: string, files: Attachment[]) => void;
-  /** It no longer waits for the `i`th of its files still to come (one that never will): waiting for none, it goes. */
-  without: (agent: string, id: string, i: number) => void;
-  drop: (agent: string, ...ids: string[]) => void;
-}
-
-/** `held` with `agent`'s kept messages now `left` (none: it has none kept). */
-function keptAs(held: Record<string, Held[]>, agent: string, left: Held[]): Record<string, Held[]> {
-  const next = { ...held };
-  if (left.length) next[agent] = left;
-  else delete next[agent];
-  return next;
-}
-
-/** Kept message `m`'s change by `f` (none: it's dropped). */
-const changed = (held: Record<string, Held[]>, agent: string, id: string, f: (m: Held) => Held | null) =>
-  keptAs(
-    held,
-    agent,
-    (held[agent] ?? []).flatMap((m) => (m.id === id ? (f(m) ?? []) : [m])),
-  );
-
-/** Nothing left to send: no words, no files, none still to come. */
-const empty = (m: Held) => !m.text.trim() && !m.attachments?.length && !m.uploading?.length;
-
-/** Inline files (no upload to keep them by) stay in memory only: the browser's storage is small. */
-const keepable = (m: Held): Held => ({ ...m, attachments: m.attachments?.filter((a) => !a.data_base64) });
-
-/** The messages kept for each agent until it can take them: in this browser, across reloads. */
-export const useHeld = create<HeldState>()(
-  persist(
-    (set) => ({
-      held: {},
-      hold: (agent, m) => set((s) => ({ held: { ...s.held, [agent]: [...(s.held[agent] ?? []), m] } })),
-      edit: (agent, id, text) => set((s) => ({ held: { ...s.held, [agent]: (s.held[agent] ?? []).map((m) => (m.id === id ? { ...m, text } : m)) } })),
-      uploaded: (agent, id, files) =>
-        set((s) => ({
-          held: changed(s.held, agent, id, (m) => {
-            const up = { ...m, attachments: files.length ? files : undefined, uploading: undefined };
-            return empty(up) ? null : up;
-          }),
-        })),
-      without: (agent, id, i) =>
-        set((s) => ({
-          held: changed(s.held, agent, id, (m) => {
-            const left = (m.uploading ?? []).filter((_, j) => j !== i);
-            const now = { ...m, uploading: left.length ? left : undefined };
-            return empty(now) ? null : now;
-          }),
-        })),
-      drop: (agent, ...ids) =>
-        set((s) => ({
-          held: keptAs(
-            s.held,
-            agent,
-            (s.held[agent] ?? []).filter((m) => !ids.includes(m.id)),
-          ),
-        })),
-    }),
-    {
-      name: "kiln.agents.held",
-      storage: createJSONStorage(() => localStorage),
-      partialize: (s) => ({ held: Object.fromEntries(Object.entries(s.held).map(([k, v]) => [k, v.map(keepable)])) }),
-    },
-  ),
-);
 
 /**
  * Keeps message `m` for `agent` with the files `taken` from its box (W21-R15): those still on their
  * way it waits for, and goes once they're up, in its turn, with each that made it.
  */
-export function holdWith(agent: string, m: Held, taken: Taken) {
+export async function holdWith(agent: string, m: Held, taken: Taken) {
+  return holdManyWith([{ agent, message: m }], taken);
+}
+
+/** A send to several recipients transfers all browser originals in the same transaction. */
+export async function holdManyWith(messages: { agent: string; message: Held }[], taken: Taken) {
   const waits = taken.uploading.length > 0;
-  if (waits) uploadingHere.add(m.id);
-  useHeld.getState().hold(agent, { ...m, attachments: taken.files.length ? taken.files : undefined, uploading: waits ? taken.uploading : undefined });
-  if (!waits) return;
-  void taken.up.then((files) => {
-    uploadingHere.delete(m.id);
-    useHeld.getState().uploaded(agent, m.id, files);
+  const owner = mailScope();
+  if (
+    !(await useHeld.getState().holdMany(
+      messages.map(({ agent, message }) => ({
+        agent,
+        message: { ...message, attachments: taken.files.length ? taken.files : undefined, originals: taken.originals, uploading: waits ? taken.uploading : undefined },
+      })),
+    ))
+  ) {
+    taken.back();
+    return false;
+  }
+  taken.commit?.();
+  if (waits) for (const { message } of messages) uploadingHere.add(message.id);
+  if (!waits) return true;
+  void taken.up.then(async (files) => {
+    for (const { agent, message } of messages) {
+      uploadingHere.delete(message.id);
+      if (!(await useHeld.getState().uploaded(agent, message.id, files, owner ?? undefined, taken.originals))) taken.back();
+    }
   });
+  return true;
 }

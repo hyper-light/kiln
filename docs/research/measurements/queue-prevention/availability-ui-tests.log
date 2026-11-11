@@ -1,0 +1,37 @@
+✔ W20: a command route does not imply Running or erase owner lifecycle (0.335708ms)
+✔ W20: browser connection, owner availability and absent details stay distinct (0.061417ms)
+✔ W20: an owner lifecycle update replaces no queue, delivery or body values (0.051333ms)
+✔ W21-R02 an indexed event reader exposes published frames and preserves unrelated identities (3.800041ms)
+✔ live history stays bounded and retained events still update in place (6.246417ms)
+✔ a previous connection's unpack cannot let text overtake a new snapshot (5.01075ms)
+✔ a reconnect resumes from what's shown, a resume adds to it, a snapshot replaces it (0.929959ms)
+✔ cached resources do not process live events while nothing shows them (303.038833ms)
+✔ what of its messages was refused comes with its events, on the socket it has: no new snapshot, no reload (1.8955ms)
+✔ a message's id is a UUIDv7 made once: 32 hex digits, its time first, and never another's (CP-T3.2) (41.524583ms)
+✔ a changeset comes whole, then as what changed in it, taken in place in the server's order (2.259291ms)
+✔ W21-R02: data-only prefetch closes at a complete snapshot, sends no commands, and expires without reviving (0.320083ms)
+✔ W21-R02: acquiring a prefetched store promotes before a child can suspend; late hover cancellation cannot close it (0.431167ms)
+✔ W21-R02: a completed prefetched snapshot promotes into normal revision resume, with no history truncation (0.733917ms)
+✔ W21-R02: speculative text uses a UTF-8 byte budget and rejects before parsing oversized frames (0.107084ms)
+✔ W21-R02: speculative gzip expansion is stopped while decoding, before parsing an expanded snapshot (0.698084ms)
+✔ W21-R02: queued packed frames are bounded even while the first decoder is blocked (0.575459ms)
+✔ W21-R02: auth loss clears private stores and commands, and late packed frames or wakeups cannot restore them (0.986791ms)
+✔ events about a session don't connect a socket that just died again at once, each its own snapshot (0.359833ms)
+✔ an event about a session taken as gone connects it at once: its machine came back (0.376833ms)
+✔ W20: owner Open and resume publish fresh lifecycle before pending details (0.855625ms)
+✔ W20: first attach preserves owner Starting, Paused and Exited without inventing State (0.343458ms)
+✔ W20: a newer live lifecycle is not held behind resumed snapshot details (0.361334ms)
+✔ W20: bounded status recovers on an open socket while the queue stays deferred (0.583ms)
+✔ W20: one field page replaces its predecessor and ignores superseded reads (0.392167ms)
+✔ W20: paged queue edits carry a revision and stale refusals stay in place (0.364667ms)
+✔ W20: unrelated status changes preserve a queue page and its in-flight read (0.34275ms)
+✔ W20: bounded queue metadata acknowledges listed messages without losing unseen ones (0.41925ms)
+✔ W20: a complete small state preserves ordinary queue data and command behavior (0.381042ms)
+ℹ tests 29
+ℹ suites 0
+ℹ pass 29
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 516.708791

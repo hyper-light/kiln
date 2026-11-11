@@ -1,0 +1,86 @@
+{
+  "build_metadata": {
+    "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+    "behind": [
+      "aarch64-unknown-linux-musl"
+    ],
+    "in_step": false,
+    "pipeline": "release",
+    "run": {
+      "id": "01a1c90a52ef71d09d13063b97f7ed63",
+      "number": 2371,
+      "sha": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+      "status": "running",
+      "started_at": 1794380344,
+      "finished_at": null
+    }
+  },
+  "captured_at": "2026-11-11T07:16:06.502918+00:00",
+  "elapsed_seconds": 978,
+  "instances": [
+    {
+      "agents": 1,
+      "build": "4dfd3bb19754",
+      "id": "01a1b1a064b576a5aa2d24275bba91f9",
+      "jobs": 0,
+      "newest": true,
+      "terminals": 0,
+      "version": "0.2.0"
+    }
+  ],
+  "job": {
+    "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+    "ended_at": 1794381288,
+    "error": "the new runner didn't report in within 15 minutes; see the runner's log",
+    "from_build": "4dfd3bb19754",
+    "id": "01a1c967d7b374a8a45d42685c8a174d",
+    "kind": "runner",
+    "method": "native",
+    "reached": false,
+    "started_at": 1794380388,
+    "state": "failed",
+    "target": "b24c5c951260dcdfd0972f2aeaf3cf51",
+    "timed_out": "upgrade",
+    "to_build": "be797cf09ec9"
+  },
+  "log": [
+    "upgrading adas-mac-studio-2.local to build be797cf09ec9 (aarch64-apple-darwin); nothing it runs is stopped",
+    "asked the runner to upgrade itself",
+    "downloading <url>",
+    "verified build be797cf09ec9 (310278944 bytes)",
+    "kiln install --agent --upgrade --service kiln-agent",
+    "Upgrading the kiln agent beside the running one",
+    "  runner      /Users/adalundhe/.local/bin/kiln (taken up once its jobs are done; it keeps its terminals)",
+    "the runner finished installing",
+    "failed: the new runner didn't report in within 15 minutes; see the runner's log"
+  ],
+  "log_count": 9,
+  "path": "GET /api/updates/jobs/01a1c967d7b374a8a45d42685c8a174d",
+  "runner": {
+    "build": "4dfd3bb19754",
+    "commit": "32f174b2c46a634ae0b072f3dc73764919523327",
+    "connected": true,
+    "how": "download",
+    "name": "b24c5c951260dcdfd0972f2aeaf3cf51",
+    "next": "downloads build be797cf09ec9 (f555736bd887) when you upgrade it",
+    "target_build": "be797cf09ec9",
+    "up_to_date": false
+  },
+  "work": {
+    "busy": 0,
+    "connected": true,
+    "draining": false,
+    "running": []
+  },
+  "policy": {
+    "revision": "7d7e0855a5073ed5163b4fe7ed3355c9ed7c2506",
+    "rules_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+    "role": "implementer"
+  },
+  "interpretation": {
+    "download": "verified complete",
+    "installation": "log confirms finished",
+    "report_in": "timed out; no causal proof from API alone",
+    "job_blocker": "none reported on pending Mac"
+  }
+}

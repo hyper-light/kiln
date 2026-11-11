@@ -510,6 +510,11 @@ pub enum Frozen {
 }
 
 impl Adapter {
+    /// Actual retained provider requests during live-process adoption. Presentation delivery
+    /// maps are not evidence of a native flight, and a new provider starts with none.
+    pub(crate) fn retained_input_ids(&self) -> Vec<super::admission::LegacyFlight> {
+        match self { Self::Claude(adapter) => adapter.retained_input_ids(), Self::Codex(adapter) => adapter.retained_input_ids(), Self::Acp(adapter) => adapter.retained_input_ids(), Self::Agy(adapter) => adapter.retained_input_ids() }
+    }
     /// The MCP servers a session it opens gets, for an adapter that gives them over its protocol
     /// (ACP); the others get theirs as they start ([`Kind::launch`]).
     pub fn offer_mcp(&mut self, servers: Vec<serde_json::Value>) {

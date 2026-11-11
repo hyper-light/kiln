@@ -500,8 +500,7 @@ impl FieldSink for Project {
         }
         // Every possible descriptor was reserved first. An inline admission can only free that
         // metadata, so a later omitted field cannot push the control view over its budget.
-        if let Ok(v) = value(v, self.budget) {
-            if let Some(map) = self.view.state.as_object_mut() {
+        if let Ok(v) = value(v, self.budget) && let Some(map) = self.view.state.as_object_mut() {
                 let old = map.insert(key.to_owned(), v);
                 let descriptor = self.view.deferred.remove(key);
                 let index = if key == "queue" { self.view.queue_index.take() } else { None };
@@ -524,7 +523,6 @@ impl FieldSink for Project {
                         }
                     }
                 }
-            }
         }
         Ok(())
     }

@@ -1,0 +1,19 @@
+{
+  "role": "implementer",
+  "policy_revision": "749c3ca0602c43dac74976e8db713102f5b15874",
+  "policy_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+  "source": {
+    "crates/kiln/src/harness/registry.rs": "96fede4e7aab8d0f4a3c4a334335dea66c20336c10aa77066b6b65e506226bfc",
+    "crates/kiln/src/harness/mail_delivery.rs": "537111af460fedf811963aefc1231b8ca89abd10aab934e7fe4da0277391810e",
+    "crates/kiln/src/harness/inbox/faults.rs": "13171a95d192e31bd39785bd3eac78f6dadf8790d0f9721b669486ccfadf0c40",
+    "crates/kiln/src/harness/broadcast.rs": "1c0e2b85a3489937147a29363fb2e2637218c4ab13359ff1de2fabeedfda36e0",
+    "crates/kiln/src/api.rs": "48aa437428738b8cf187c13de522d8eb83bf54452996fdf80925b93c74eaf482",
+    "docs/research/measurements/queue-prevention/ATTACHMENT-CUSTODY.md": "3a105b3e8ee24f13a384db49a42524a2b0e60a962ec510dd4c9e1dcfddd2c4ab"
+  },
+  "checks": {
+    "rustfmt_parser": "5 files exit 0",
+    "diff_check": "exit 0",
+    "tests": "written, not executed",
+    "build": "not run"
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "policy": "7d7e0855a5073ed5163b4fe7ed3355c9ed7c2506",
+  "rules_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+  "role": "implementer",
+  "batch": "direct-native-policy-and-event-wake-closure",
+  "paths": [
+    {
+      "path": "crates/kiln/src/agent.rs",
+      "sha256": "03b224e158033f56f63e4557a5b6cd7eaaf5dbe2f5b7db5472aa7d438d94b9e2",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/bluegreen.rs",
+      "sha256": "bc06ce735b70431deeb5fc14d8ddd19433abda07949e546b37d9ca586e79782a",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/host.rs",
+      "sha256": "489a0226744223910687d9462673a98ef1098cecf9635ee0316c7a8ea3f26568",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/host/transfer.rs",
+      "sha256": "b20bae3529c4ef618bb60d0ee8e18035c7f1142df69f062224fbcc527827b790",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/host/transfer/native.rs",
+      "sha256": "9441645e94d2dcb7f28186e4bb021078f9b7ac879aac124a8aded0eb2e0ad162",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/inbox/transfer.rs",
+      "sha256": "76dd2fbfd2536209356a13ec1e3ce528a4c39d6e49ac8d1ee256890298eb44ff",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/core.rs",
+      "sha256": "9bcd6e3db84c0880086c2a5c871071ebe911a85a2038ba3627c9d92e7f2b8bfa",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/admission.rs",
+      "sha256": "f406d9430885fe11c548b7a5a8eb9fd413aaeefdcd167da716d760beccea06b2",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/inbox/faults.rs",
+      "sha256": "19b27aaf17426ad77bad4dd26ab07d0e9f530dbf8c5419dbe6923340b29fb7b7",
+      "parser_exit": 0,
+      "stderr": ""
+    }
+  ],
+  "diff_check_exit": 0,
+  "diff_check_output": "",
+  "rust_tests_executed": false,
+  "rust_builds_executed": false,
+  "fixtures_written": [
+    "w20_r09_native_abort_intent_survives_reload_and_cannot_replay_as_offer",
+    "w20_r09_durable_native_header_fences_restore_before_activation_and_rejects_changed_bytes",
+    "a_held_mail_replay_ignores_its_own_pool_pulse_and_retries_once_for_foreign_release"
+  ]
+}

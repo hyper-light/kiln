@@ -1,0 +1,9 @@
+
+Running 4 tests using 1 worker
+
+  ✓  1 [desktop] › e2e/session-availability.spec.ts:5:1 › owner lifecycle keeps the composer available while details arrive (3.2s)
+  ✓  2 [phone] › e2e/session-availability.spec.ts:5:1 › owner lifecycle keeps the composer available while details arrive (1.2s)
+  ✓  3 [desktop-webkit] › e2e/session-availability.spec.ts:5:1 › owner lifecycle keeps the composer available while details arrive (1.3s)
+  ✓  4 [phone-webkit] › e2e/session-availability.spec.ts:5:1 › owner lifecycle keeps the composer available while details arrive (540ms)
+
+  4 passed (15.0s)

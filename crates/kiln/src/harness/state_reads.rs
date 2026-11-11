@@ -76,7 +76,11 @@ async fn request(hub: &Hub, session: &str, client: String, command: Command) -> 
     drop(snapshot);
     let mut at = at.ok_or(Failure::FeedLost)?;
     let operation = async {
-        if !hub.harness.command(hub, session, command).await.went() { return Err(Failure::Unreachable); }
+        let sent = match command {
+            command @ Command::MailHandoff { .. } => super::mail_delivery::send(hub, session, command, None).await.map_err(|_| Failure::Unreachable)?,
+            command => hub.harness.command(hub, session, command).await.went(),
+        };
+        if !sent { return Err(Failure::Unreachable); }
         loop {
             if viewer.refusals() != refusals { return Err(Failure::FeedLost); }
             // One live frame at a time; no queue or whole-snapshot assembly for this reader.
@@ -108,6 +112,20 @@ pub async fn read(hub: &Hub, session: &str, read: Read) -> Result<Reply, Failure
     };
     if revision != &expected { return Err(Failure::Malformed); }
     Ok(reply)
+}
+
+fn registered(value: &Value, expected: &str) -> Result<(), Failure> {
+    if value.get("type").and_then(Value::as_str) != Some("registered") || value.get("revision").and_then(Value::as_str) != Some(expected) { return Err(Failure::Malformed); }
+    Ok(())
+}
+
+/// Register one bounded response at its current source owner. This records metadata only:
+/// queue contents and input custody remain until native provider delivery is proven.
+pub(super) async fn register_handoff(hub: &Hub, session: &str, revision: String, handoff: String, turn: Option<i64>, ids: Vec<String>, response_digest: String) -> Result<(), Failure> {
+    let client = crate::util::new_id();
+    let expected = revision.clone();
+    let value = request(hub, session, client.clone(), Command::MailHandoff { client, revision, handoff, turn, ids, response_digest }).await?;
+    registered(&value, &expected)
 }
 
 fn revision(info: &Info) -> Result<String, Failure> {
@@ -261,6 +279,14 @@ mod tests {
         assert_eq!(answer(r#"{"t":"reply","client":"other","value":{"result":{"type":"value","revision":"r","value":null}}}"#, "mine"), None);
         assert_eq!(answer(r#"{"t":"reply","client":"mine","value":{"error":{"code":"stale"}}}"#, "mine"), Some(Err(Failure::Source(Error::Stale))));
         assert!(matches!(answer(r#"{"t":"reply","client":"mine","value":{"result":{"type":"value","revision":"r","value":null}}}"#, "mine"), Some(Ok(_))));
+    }
+
+    #[test]
+    fn only_exact_owner_registration_acknowledges_a_handoff() {
+        assert_eq!(registered(&serde_json::json!({"type":"registered","revision":"queue-r"}),"queue-r"),Ok(()));
+        for reply in [serde_json::json!({"type":"applied","revision":"queue-r"}),serde_json::json!({"type":"registered","revision":"stale-r"}),serde_json::json!({"type":"registered","revision":null}),serde_json::json!({"type":"registered"}),serde_json::json!({"retained":true})] {
+            assert_eq!(registered(&reply,"queue-r"),Err(Failure::Malformed));
+        }
     }
 
     #[test]

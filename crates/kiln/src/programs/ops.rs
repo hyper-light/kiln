@@ -89,16 +89,23 @@ async fn set(cx: Cx, v: Value) -> Out {
     s.updated_at = now;
     s.by.clone_from(&cx.caller.name);
     // Its coordinator follows them at its next goal boundary: it's told what changed, the
-    // message kept until its session takes it (tried again every 15 s).
+    // ledger keeps each accepted original; owner events advance delivery.
     if let (Some(c), false) = (&before.coordinator_id, said.is_empty()) {
         let text = format!(
             "The person changed {}'s settings: {}. From your next goal boundary, follow them: kiln's programs.get (code mode: kiln.programs.get({{program: \"{id}\"}})) gives each track's slot by them.",
             before.title,
             said.join(", ")
         );
-        s.notice = Some(super::deliver(&cx.hub, c, Notice { text, at: now, ..Notice::default() }).await);
+        let notice = super::deliver(&cx.hub, c, Notice { text, at: now, ..Notice::default() }).await;
+        if !notice.delivered && notice.publication.is_none() {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, notice.why.unwrap_or_else(|| "receiver custody is unavailable; settings were not changed".into())));
+        }
+        s.notice = Some(notice);
     }
     super::save_settings(&cx.hub, &id, &s).await.map_err(failed)?;
+    if let Some(coordinator) = &before.coordinator_id {
+        super::reconcile_notice(&cx.hub, &id, coordinator).await.map_err(failed)?;
+    }
     drop(writing);
     cx.hub.store.audit(cx.caller.name.clone(), "programs.set".into(), id.clone()).await;
     cx.hub.emit(&crate::wire::events::ServerEvent::Program { program: id.clone() });

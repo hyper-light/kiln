@@ -3610,6 +3610,7 @@ impl Hub {
             AgentMsg::Features { names } => {
                 let skills = proto::feature::speaks(&names, crate::skills::FEATURE);
                 self.instances.update(|i| i.set_features(peer, names.clone()));
+                self.harness.mail_delivery.changed();
                 // One that installs skills is told what it lays out (docs/agents.md, "Skills kiln installs").
                 if skills {
                     let hub = Arc::clone(self);
@@ -3657,6 +3658,7 @@ impl Hub {
                 self.change_agent(&agent, |a| a.dropped.clone_from(&dropped));
             }
             // Hand-overs between a machine's runner processes (`crate::handovers`).
+            AgentMsg::HarnessMailTransfer { json } => crate::api::boxed(|| crate::harness::mail_transfer::heard(self, peer, json)).await,
             AgentMsg::HarnessHandOver { session, offset, data, done } => crate::api::boxed(|| self.handover_piece(&agent, peer, session, offset, data, done)).await,
             AgentMsg::HarnessAdopted { session, error } => crate::api::boxed(|| self.handover_adopted(&agent, peer, session, error)).await,
             // A frame of the server's this runner couldn't read: noted against it, and on the page
@@ -3892,7 +3894,17 @@ impl Hub {
     /// Runner process `peer`'s update to its agent session `session` (`FromRunner::Harness`), on a frame of its own or a
     /// channel item ([`Hub::on_wire`]), its runner `runner` heard. `arrived`: as [`Hub::on_net_at`]'s.
     async fn on_session_update(self: &Arc<Self>, peer: PeerId, runner: &Arc<str>, session: String, update: Box<crate::harness::core::Update>, taken: Option<Duration>, arrived: &mut Option<Arrived>) {
+        if let crate::harness::core::Update::Open { info, .. } = &*update && !crate::harness::mail_transfer::allows_claim(self, peer, &session, Some(info.epoch)).await { return; }
         match *update {
+            crate::harness::core::Update::MailFlow { event } => {
+                let owner = self.instances.load().owner(&crate::instances::Owned::Agent(session.clone()));
+                if owner == Some(peer) && self.peers.load().contains_key(&peer) && self.harness.runs_on(&session, runner) {
+                    let from = crate::harness::registry::Location::Machine(runner.to_string());
+                    if let Err(error) = crate::harness::mail_delivery::flow(self, &session, from, *event).await {
+                        tracing::warn!(session = %session, error = %error, "source communication receipt remains unacknowledged");
+                    }
+                }
+            }
             // An inbox's answer counts wherever it came from (it's for the message sent there),
             // and says nothing of where the session runs: whoever waits for it is told, and
             // the session's messages still go where it runs.
@@ -3925,6 +3937,7 @@ impl Hub {
                 self.harness.from_runner(r).await;
                 if let Some(id) = applied {
                     self.harness.applied(&id).await;
+                    self.harness.mail_delivery.changed();
                     // W20-R01: an Open supplies the actual cwd and machine (including a move).
                     // Only lifecycle updates rescope installed skills, never conversation chunks.
                     let hub = Arc::clone(self);
@@ -4224,6 +4237,11 @@ impl Hub {
             FromRunner::Harness { session, update, taken } => self.on_session_update(peer, runner, session, update, taken, arrived).await,
             FromRunner::HarnessInventory(inv) => {
                 let mut inv = *inv;
+                let mut allowed = Vec::new();
+                for id in std::mem::take(&mut inv.sessions) {
+                    if crate::harness::mail_transfer::allows_claim(self, peer, &id, None).await { allowed.push(id); }
+                }
+                inv.sessions = allowed;
                 // A copy it kept of a session that went on elsewhere since isn't its own: it's
                 // told to let go of it now, at its runner's first word since, not once the copy
                 // announces it again (W27-R08: the twin of 2026-10-25 ran on for ten minutes).

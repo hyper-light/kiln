@@ -1,0 +1,6 @@
+{
+  "exit_code": 101,
+  "executed_one": true,
+  "expected_guard_failure": true,
+  "log": "/private/tmp/kiln-queue-prevention-20261111/docs/research/measurements/queue-prevention/retry-red.log"
+}

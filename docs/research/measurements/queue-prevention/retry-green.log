@@ -1,0 +1,6 @@
+
+running 1 test
+test harness::mail::tests::preaccept_failure_cannot_turn_its_own_reservation_release_into_new_retry_credit ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4224 filtered out; finished in 0.07s
+

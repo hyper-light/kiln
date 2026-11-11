@@ -14,6 +14,7 @@ pub fn command_kind(command: &Command) -> Option<&'static str> {
     match command {
         Command::StateRead { .. } => None,
         Command::AtState { command, .. } => command_kind(command),
+        Command::Admit { .. } | Command::MailAck { .. } | Command::MailPeers { .. } | Command::MailHandoff { .. } => None,
         Command::Send { .. } | Command::SkillRun { .. } => Some("message"),
         Command::Approve { .. } | Command::Resume => Some("answer"),
         Command::Interrupt | Command::ForceStop | Command::Restart | Command::StopTask { .. } | Command::StopTasks

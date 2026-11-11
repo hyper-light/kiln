@@ -111,6 +111,7 @@ async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], 
         mirrors: mirrors.clone(),
         using: if name == "linux" { Arc::clone(&using) } else { Arc::default() },
         adopt,
+        adopt_policy: crate::harness::moving::stream::StoragePolicy::Off,
         objects: None,
         sense: false,
         on_battery: kiln_ci::pace::power::OnBattery::default(),
@@ -721,7 +722,10 @@ fn a_hand_over_arrives_whole_and_says_how_it_went() -> anyhow::Result<()> {
         let taker = lab.adoptions.clone();
         crate::rt::spawn(async move {
             if let Ok(a) = taker.recv().await {
-                let ok = a.from == "mac" && a.data.len() == 5_000_000 && a.data.iter().enumerate().all(|(i, b)| *b == (i % 253) as u8);
+                use std::io::Read as _;
+                let mut bytes = Vec::new();
+                let read = a.data.reader().and_then(|mut file| file.read_to_end(&mut bytes));
+                let ok = read.is_ok() && a.from == "mac" && a.data.len() == 5_000_000 && bytes.iter().enumerate().all(|(i, b)| *b == (i % 253) as u8);
                 let _ = a.reply.send(if ok { Ok(()) } else { Err(format!("arrived wrong: {} bytes from {}", a.data.len(), a.from)) });
             }
         });

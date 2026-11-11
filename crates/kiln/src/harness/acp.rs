@@ -236,6 +236,7 @@ pub(super) fn kiln_modes() -> Vec<ModeOption> {
 }
 
 impl Acp {
+    pub(crate) fn retained_input_ids(&self) -> Vec<super::admission::LegacyFlight> { self.pending.iter().filter_map(|(request, pending)| match pending { Pending::Prompt(id) => Some(super::admission::LegacyFlight { id: id.clone(), protocol: super::admission::FlightProtocol::Acp, request: Some(*request) }), _ => None }).collect() }
     pub fn new(resume: Option<String>) -> Self {
         let empty = resume.is_none();
         Self {
@@ -476,6 +477,9 @@ impl Acp {
         self.restore_waiting(core);
         core.shown_queued(&cmd);
         match cmd {
+            Command::Admit { token, epoch, .. } | Command::MailAck { token, epoch, .. } => core.refuse_owner_mail(Some(token), epoch),
+            Command::MailPeers { epoch, .. } => core.refuse_owner_mail(None, epoch),
+            Command::MailHandoff { client, .. } => { let epoch = core.state.epoch; core.refuse_owner_mail(None, epoch); core.reply(client, serde_json::json!({"error":{"code":super::state_view::Error::Unreadable}})); },
             Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => {
                 // Its go-back is kiln's (`harness::goback`): a checkpoint anchors the prompt's
                 // moment so "restore files to here" reaches back to it.
@@ -574,7 +578,8 @@ impl Acp {
                 None => self.notice(core, Level::Warn, UNSUPPORTED),
             },
             Command::McpEnable { .. } | Command::McpReconnect { .. } => self.notice(core, Level::Warn, UNSUPPORTED),
-            Command::McpRefresh | Command::SkillsReload => {}
+            Command::McpRefresh => {}
+            Command::SkillsReload => core.skills_changed(),
         }
     }
 
@@ -1279,7 +1284,9 @@ impl Acp {
         let response;
         let v = if let Pending::Prompt(client) = &kind {
             let cancelled = v.get("error").is_some() || v.pointer("/result/stopReason").and_then(Value::as_str) == Some("cancelled");
-            core.state.delivery.insert(client.clone(), if cancelled { Delivery::Cancelled } else { Delivery::Completed });
+            let refused = v.get("error").is_some() || v.pointer("/result/stopReason").and_then(Value::as_str) == Some("refusal");
+            if !cancelled && v.pointer("/result/stopReason").and_then(Value::as_str) == Some("end_turn") { core.input_consumed(client, super::admission::Consumption::ProviderCompleted); }
+            if !refused || !core.input_retained(client) { core.state.delivery.insert(client.clone(), if cancelled { Delivery::Cancelled } else { Delivery::Completed }); }
             core.touch_state();
             // Its `/compact` is over: its words say how it went (one it reports ends as it says).
             if self.compact_prompt.as_deref() == Some(client.as_str()) {
@@ -1377,6 +1384,7 @@ impl Acp {
             }
             Pending::Capabilities => self.capabilities(core, &result),
             Pending::Session | Pending::Refresh | Pending::RefreshNew => {
+                if new_session { core.skills_provider_ready(); }
                 self.close_streams(core);
                 self.replaying = false;
                 if let Some(s) = result.get("sessionId").and_then(Value::as_str) {
@@ -1726,6 +1734,7 @@ impl Acp {
                     _ => None,
                 });
                 let mut call = merge(known, u, &core.state.cwd);
+                if call.name == "mcp__kiln__agents_wait" && call.status == ToolStatus::Done && let Some(result) = u.get("rawOutput") { core.observe_handoff_result(&tid, result); }
                 // opencode's subagent tool names the subagent it started (or followed up) by its
                 // session id, as its child sessions are known (`child_update`).
                 if let Some(sid) = u.pointer("/rawOutput/sessionID").or_else(|| u.pointer("/rawInput/sessionID")).and_then(Value::as_str).filter(|sid| core.state.tasks.iter().any(|t| t.id == *sid)) {

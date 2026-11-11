@@ -181,6 +181,8 @@ pub enum Update {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         gone: Vec<super::model::FileKey>,
     },
+    /// Source-owned admission and provider acceptance evidence, for the durable relay.
+    MailFlow { event: Box<super::admission::FlowEvent> },
 }
 
 /// An update read as serde's derive reads an internally tagged enum (`#[serde(tag = "t")]`: the same updates, the
@@ -211,6 +213,7 @@ enum UpdateKind {
     Inbox,
     Reset,
     ChangesPatch,
+    MailFlow,
 }
 
 struct UpdateVisitor;
@@ -280,6 +283,10 @@ fn update_of<'de, D: serde::Deserializer<'de>>(kind: UpdateKind, rest: D) -> Res
         said: Box<super::inbox::Said>,
     }
     #[derive(Deserialize)]
+    struct MailFlowOf {
+        event: Box<super::admission::FlowEvent>,
+    }
+    #[derive(Deserialize)]
     struct ResetOf {
         #[serde(default)]
         from: Option<u64>,
@@ -313,6 +320,7 @@ fn update_of<'de, D: serde::Deserializer<'de>>(kind: UpdateKind, rest: D) -> Res
             Update::Reply { client, value }
         }
         UpdateKind::Inbox => Update::Inbox { said: InboxOf::deserialize(rest)?.said },
+        UpdateKind::MailFlow => Update::MailFlow { event: MailFlowOf::deserialize(rest)?.event },
         UpdateKind::Reset => Update::Reset { from: ResetOf::deserialize(rest)?.from },
         UpdateKind::ChangesPatch => {
             let ChangesPatchOf { set, gone } = ChangesPatchOf::deserialize(rest)?;
@@ -564,13 +572,48 @@ pub fn run_tag() -> String {
     crate::util::new_id().chars().skip(20).collect()
 }
 
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub enum SkillRefresh {
+    #[default]
+    Current,
+    InstalledChanged,
+    ProviderChanged,
+    Both,
+}
+
+impl SkillRefresh {
+    pub fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Current, event) | (event, Self::Current) => event,
+            (Self::InstalledChanged, Self::InstalledChanged) => Self::InstalledChanged,
+            (Self::ProviderChanged, Self::ProviderChanged) => Self::ProviderChanged,
+            _ => Self::Both,
+        }
+    }
+    pub fn apply(self, bridge: &mut crate::skills::bridge::Session) {
+        if matches!(self, Self::InstalledChanged | Self::Both) { bridge.changed(); }
+        if matches!(self, Self::ProviderChanged | Self::Both) { bridge.provider_ready(); }
+    }
+}
+
 pub struct Core {
     /// The agent session it is (kiln's id): headroom holds and lets in work by it.
     pub session_id: String,
     /// W20-R01: this Codex process acknowledged its session-local installed skill roots.
     /// Ephemeral: an adopted/older process safely receives portable instructions until acknowledged.
     pub installed_skill_roots: bool,
+    pub skill_bridge: std::sync::Arc<parking_lot::Mutex<crate::skills::bridge::Session>>,
+    pub skill_refresh: SkillRefresh,
+    skill_advertised: Option<(String, bool)>,
+    skill_projections: Vec<crate::skills::bridge::Projection>,
     pub state: State,
+    pub input: Option<super::admission::Input>,
+    pub input_receipts: Vec<super::admission::Receipt>,
+    pub input_stages: Vec<String>,
+    pub input_retained: Vec<String>,
+    pub input_replay: super::admission::Replay,
+    pub input_handoff_proofs: Vec<super::admission::HandoffProof>,
+    pub input_legacy_flights: Vec<super::admission::LegacyFlight>,
     /// mc_attention (01a199e1b177752e84dad5dc990e6a15): Reach owns these
     /// lifecycles. A provider's task inventory or exit cannot end them.
     pub(crate) owned_reach: HashMap<String, Task>,
@@ -645,6 +688,24 @@ impl Default for Core {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Frozen {
     state: State,
+    #[serde(default)]
+    skill_advertised: Option<(String, bool)>,
+    #[serde(default)]
+    skill_refresh: SkillRefresh,
+    #[serde(default)]
+    skill_projections: Vec<crate::skills::bridge::Projection>,
+    #[serde(default)]
+    input_receipts: Vec<super::admission::Receipt>,
+    #[serde(default)]
+    input_stages: Vec<String>,
+    #[serde(default)]
+    input_retained: Vec<String>,
+    #[serde(default)]
+    input_replay: super::admission::Replay,
+    #[serde(default)]
+    input_handoff_proofs: Vec<super::admission::HandoffProof>,
+    #[serde(default)]
+    input_legacy_flights: Vec<super::admission::LegacyFlight>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     owned_reach: HashMap<String, Task>,
     meta: Meta,
@@ -666,13 +727,42 @@ pub struct Frozen {
     harness: Option<String>,
 }
 
+impl Frozen {
+    pub(super) fn transfer_epoch(&mut self, from: u64, to: u64) -> Result<(), String> {
+        if self.state.epoch != from || from.checked_add(1) != Some(to) { return Err("native handover snapshot does not match its exact source/destination epoch".into()); }
+        self.state.epoch = to;
+        self.state.admission = None;
+        Ok(())
+    }
+
+    pub(in crate::harness) fn restart_after_transfer(mut self, from: u64, to: u64) -> Result<super::session::Seed, String> {
+        if self.state.epoch != from || !(to == from || from.checked_add(1) == Some(to)) { return Err("native recovery snapshot does not match its exact ownership epoch".into()); }
+        self.state.epoch = to;
+        self.state.status = Status::Exited;
+        self.state.manual_resume = true;
+        self.state.admission = None;
+        Ok(super::session::Seed { events: self.events, state: self.state, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: true })
+    }
+}
+
 
 impl Core {
     pub fn new() -> Self {
         Self {
             session_id: String::new(),
             installed_skill_roots: false,
+            skill_bridge: std::sync::Arc::new(parking_lot::Mutex::new(crate::skills::bridge::Session::default())),
+            skill_refresh: SkillRefresh::Current,
+            skill_advertised: None,
+            skill_projections: Vec::new(),
             state: State::default(),
+            input: None,
+            input_receipts: Vec::new(),
+            input_stages: Vec::new(),
+            input_retained: Vec::new(),
+            input_replay: super::admission::Replay::Waiting,
+            input_handoff_proofs: Vec::new(),
+            input_legacy_flights: Vec::new(),
             owned_reach: HashMap::new(),
             meta: Meta::default(),
             events: VecDeque::new(),
@@ -709,6 +799,7 @@ impl Core {
     /// Whether it may go to work now ([`Core::room`]): its state says since when it waits for room
     /// (`State::room_wait`), and that it no longer does once it may.
     pub fn has_room(&mut self) -> bool {
+        if !self.input_ready() { return false; }
         let Some(room) = &self.room else { return true };
         let ok = room();
         let wait = if ok { None } else { Some(self.state.room_wait.unwrap_or_else(Self::now)) };
@@ -719,11 +810,22 @@ impl Core {
         ok
     }
 
+    pub fn input_ready(&self) -> bool { self.input.as_ref().is_none_or(|input| input.controller.lock().writes_ready()) }
+
     /// Everything in it, for this process's next image ([`Core::thaw`]).
     pub fn freeze(&self) -> Frozen {
         use base64::Engine as _;
         Frozen {
             state: self.state.clone(),
+            skill_advertised: self.skill_advertised.clone(),
+            skill_refresh: self.skill_refresh,
+            skill_projections: self.skill_projections.clone(),
+            input_receipts: self.input_receipts.clone(),
+            input_stages: self.input_stages.clone(),
+            input_retained: self.input_retained.clone(),
+            input_replay: self.input_replay,
+            input_handoff_proofs: self.input_handoff_proofs.clone(),
+            input_legacy_flights: self.input_legacy_flights.clone(),
             owned_reach: self.owned_reach.clone(),
             meta: self.meta.clone(),
             events: self.events.iter().cloned().collect(),
@@ -751,6 +853,16 @@ impl Core {
         c.events = f.events.into();
         c.next_seq = f.next_seq;
         c.state = f.state;
+        c.skill_bridge = std::sync::Arc::new(parking_lot::Mutex::new(crate::skills::bridge::Session::restore(f.skill_advertised.clone())));
+        c.skill_advertised = f.skill_advertised;
+        c.skill_refresh = f.skill_refresh;
+        c.skill_projections = f.skill_projections;
+        c.input_receipts = f.input_receipts;
+        c.input_stages = f.input_stages;
+        c.input_retained = f.input_retained;
+        c.input_replay = f.input_replay;
+        c.input_handoff_proofs = f.input_handoff_proofs;
+        c.input_legacy_flights = f.input_legacy_flights;
         c.owned_reach = f.owned_reach;
         c.sync_owned_reach();
         c.meta = f.meta;
@@ -1099,6 +1211,7 @@ impl Core {
     /// `State::kept`; anyone else's starts the count again. One of kiln's own is noted given
     /// (`State::given`), with what it said then, in the state that shows it gone from the queue.
     pub fn note_sent(&mut self, client_id: &str, text: &str) {
+        if let Some(input) = &self.input && input.controller.lock().stage(client_id, super::admission::Stage::ProviderFlight).is_ok() && !self.input_stages.iter().any(|id| id == client_id) { self.input_stages.push(client_id.to_owned()); }
         let kept = if client_id.starts_with(KEEP_ID) { self.state.kept.saturating_add(1) } else { 0 };
         if kept != self.state.kept {
             self.state.kept = kept;
@@ -1110,9 +1223,146 @@ impl Core {
         }
     }
 
+    pub fn skills_changed(&mut self) { self.skill_refresh = self.skill_refresh.merge(SkillRefresh::InstalledChanged); }
+
+    pub fn skills_provider_ready(&mut self) {
+        self.skill_refresh = self.skill_refresh.merge(SkillRefresh::ProviderChanged);
+        self.skill_advertised = None;
+        self.input_replay = super::admission::Replay::ProviderReady;
+    }
+
+    /// A native refusal leaves the existing body and lease retriable. It is neither delivered
+    /// nor an archival cancellation, and a refusal cannot trigger its own immediate retry.
+    pub fn input_retained(&mut self, message: &str) -> bool {
+        let known = self.input.as_ref().is_some_and(|input| input.controller.lock().lease(message).is_some()) || self.input_legacy_flights.iter().any(|flight| flight.id == message);
+        if !known { return false; }
+        if !self.input_retained.iter().any(|id| id == message) { self.input_retained.push(message.to_owned()); }
+        self.input_replay = super::admission::Replay::Waiting;
+        self.state.delivery.insert(message.to_owned(), super::model::Delivery::Queued);
+        self.touch_state();
+        true
+    }
+
+    pub fn skills_delivered(&mut self, projections: Vec<crate::skills::bridge::Projection>, advertised: Option<(String, bool)>) {
+        self.skill_advertised = advertised;
+        self.skill_projections(projections);
+    }
+
+    /// Store only exact emitted provenance, beside originals already retained by the timeline.
+    /// A later human message containing the same literal tags has another client identity.
+    pub fn skill_projections(&mut self, projections: Vec<crate::skills::bridge::Projection>) {
+        let retained = &self.index;
+        self.skill_projections.retain(|p| p.client_id.as_deref().is_some_and(|id| retained.contains_key(id)));
+        for projection in projections {
+            let Some(client) = projection.client_id.as_deref().filter(|id| retained.contains_key(*id)) else { continue };
+            if let Some(previous) = self.skill_projections.iter_mut().find(|p| p.client_id.as_deref() == Some(client)) { *previous = projection; }
+            else { self.skill_projections.push(projection); }
+        }
+    }
+
+    pub fn skill_original(&self, client: &str, effective: &str) -> Option<Body> {
+        if !self.skill_projections.iter().any(|p| p.matches(client, effective)) { return None; }
+        self.get(client).and_then(|event| match &event.body { body @ Body::User { .. } => Some(body.clone()), _ => None })
+    }
+
+    /// Only adapters with a matching provider response/lifecycle call this. Presentation states
+    /// such as Sent/Started, stdin writes and the durable inbox ACK never enter this path.
+    pub fn input_consumed(&mut self, message: &str, boundary: super::admission::Consumption) {
+        self.inputs_consumed(std::slice::from_ref(&message), boundary);
+    }
+
+    pub fn inputs_consumed(&mut self, messages: &[&str], boundary: super::admission::Consumption) {
+        let controller = self.input.as_ref().map(|input| input.controller.lock());
+        let mut batch = Vec::new();
+        for message in messages {
+            if (controller.as_ref().is_some_and(|controller| controller.lease(message).is_some()) || self.input_legacy_flights.iter().any(|flight| flight.id == *message)) && !batch.iter().any(|id: &String| id.as_str() == *message) && !self.input_receipts.iter().any(|r| r.messages.iter().any(|id| id.as_str() == *message)) { batch.push((*message).to_owned()); }
+        }
+        drop(controller);
+        if batch.is_empty() { return; }
+        // Controller tracks whether accepted work stayed present between handoffs, including
+        // native pending input. State.queue alone excludes that charged provider-flight work.
+        // Per-item dequeue notifications can be emitted consecutively for one native drain;
+        // their spacing is not a model service interval. Only completed actual work/batches
+        // can train the estimator. Dequeue still returns the proven application credit.
+        let continuously_available = self.input.is_some() && boundary != super::admission::Consumption::ProviderAccepted && !self.hold && self.state.pause.is_none() && self.state.frozen.is_none();
+        self.input_receipts.push(super::admission::Receipt { messages: batch, disposition: super::admission::Disposition::Consumed { boundary }, at_ns: self.input.as_ref().map_or(0, super::admission::Input::now_ns), continuously_available });
+    }
+
+    pub fn input_cancelled(&mut self, message: &str, reason: super::admission::CancelReason) {
+        let Some(input) = &self.input else { return };
+        if input.controller.lock().lease(message).is_none() || self.input_receipts.iter().any(|r| r.messages.iter().any(|id| id == message)) { return; }
+        self.input_receipts.push(super::admission::Receipt { messages: vec![message.to_owned()], disposition: super::admission::Disposition::Cancelled { reason }, at_ns: input.now_ns(), continuously_available: false });
+    }
+
+    /// Called only for a completed, exactly named kiln agents_wait native tool result. The
+    /// matching source registration is authority; literal markers or HTTP return are not proof.
+    pub fn observe_handoff_result(&mut self, native_id: &str, result: &serde_json::Value) {
+        use serde_json::Value;
+        if native_id.is_empty() || result.get("isError").and_then(Value::as_bool) == Some(true) { return; }
+        let parsed;
+        let payload = if let Some(structured) = result.get("structuredContent").filter(|value| value.is_object()) { structured }
+        else if result.get("mail_handoff").is_some() { result }
+        else {
+            let Some(content) = result.get("content").and_then(Value::as_array).filter(|content| content.len() == 1) else { return };
+            let Some(text) = content.first().filter(|value| value.get("type").and_then(Value::as_str) == Some("text")).and_then(|value| value.get("text")).and_then(Value::as_str).filter(|text| text.len() <= super::state_view::FRAME) else { return };
+            let Ok(value) = serde_json::from_str::<Value>(text) else { return };
+            parsed = value;
+            &parsed
+        };
+        let Some(marker) = payload.get("mail_handoff") else { return };
+        if !marker.as_object().is_some_and(|marker| marker.len() == 2 && marker.contains_key("id") && marker.contains_key("turn")) { return; }
+        let Some(id) = marker.get("id").and_then(Value::as_str) else { return };
+        let Some(turn) = marker.get("turn").and_then(Value::as_i64) else { return };
+        if self.state.turn_started != Some(turn) { return; }
+        let Some(messages) = payload.get("messages").and_then(Value::as_array) else { return };
+        let Ok(digest) = super::wait::handoff_digest(id, Some(turn), messages) else { return };
+        let Some(input) = &self.input else { return };
+        let handoff = super::admission::Handoff { id: id.to_owned(), turn: Some(turn), digest };
+        let mut ids = Vec::new();
+        {
+            let controller = input.controller.lock();
+            for message in messages {
+                let Some(id) = message.get("id").and_then(Value::as_str) else { return };
+                if ids.iter().any(|current: &String| current == id) || !controller.lease(id).is_some_and(|lease| lease.epoch == self.state.epoch && lease.handoff.as_ref() == Some(&handoff)) { return; }
+                if !self.state.queue.iter().any(|queued| queued.id == id && queued.attachments.is_empty()) { return; }
+                ids.push(id.to_owned());
+            }
+        }
+        if ids.is_empty() || self.input_handoff_proofs.iter().any(|proof| proof.handoff == handoff) { return; }
+        self.input_handoff_proofs.push(super::admission::HandoffProof { handoff, messages: ids, native_id: native_id.to_owned() });
+    }
+
+    /// Admission envelopes belong to Host's durable owner path. A misroute leaves every
+    /// accepted lease/journal untouched and reports uncertainty instead of handing its body on.
+    pub fn refuse_owner_mail(&mut self, token: Option<super::mail::Token>, epoch: u64) {
+        use super::admission::{Capacity, Fault, FlowEvent, Learning, WaitCause};
+        let capacity = self.input.as_ref().map(|input| input.controller.lock().capacity()).or_else(|| self.state.admission.clone()).unwrap_or(Capacity {
+            epoch: self.state.epoch, generation: 0, retry_generation: None, learning: Learning::Bootstrap, target: 0, admitted: 0, bytes: 0, peers: 0, eligible_peer: None, feedback_generation: None,
+        });
+        let event = match token {
+            Some(token) => FlowEvent::Waiting { token, epoch, cause: WaitCause::SourceUnavailable, capacity },
+            None => FlowEvent::Fault { epoch, code: Fault::OwnerOnly, capacity },
+        };
+        self.out.push(Update::MailFlow { event: Box::new(event) });
+    }
+
     /// The turn under way ended (`how`, `why`: see [`TurnEnd`]). What it did is read from the
     /// timeline since it `started` (unknown: since the last thing said to it).
     pub fn end_turn(&mut self, started: Option<i64>, how: &str, why: Option<&str>) {
+        // A proven tool result followed by its actual successful native turn completion is a
+        // conservative handoff. Missing/result-lost/interrupted turns leave the queue untouched.
+        for proof in std::mem::take(&mut self.input_handoff_proofs) {
+            if how != "done" || proof.handoff.turn != started || started.is_none() || proof.native_id.is_empty() { continue; }
+            let valid = self.input.as_ref().is_some_and(|input| {
+                let controller = input.controller.lock();
+                proof.messages.iter().all(|id| controller.lease(id).is_some_and(|lease| lease.handoff.as_ref() == Some(&proof.handoff)))
+            });
+            if !valid { continue; }
+            let ids: Vec<_> = proof.messages.iter().map(String::as_str).collect();
+            self.inputs_consumed(&ids, super::admission::Consumption::WaitHandoff);
+            self.state.queue.retain(|queued| !proof.messages.contains(&queued.id));
+            for id in proof.messages { self.state.delivery.insert(id, super::model::Delivery::Completed); }
+        }
         let since = started.unwrap_or_else(|| self.events.iter().rev().find(|e| e.parent.is_none() && matches!(e.body, Body::User { .. })).map_or(0, |e| e.at));
         let (tools, after_error, asks) = {
             let mut tools = 0u32;
@@ -1169,6 +1419,7 @@ impl Core {
     /// goes where the conversation is now, as `compaction:<key>` (said again with the same key, the
     /// same marker, where it was).
     pub fn compacted(&mut self, key: &str, parent: Option<String>, level: Level, text: String) {
+        if parent.is_none() && level == Level::Info && self.get(&format!("{COMPACTION}{key}")).is_none() { self.skills_provider_ready(); }
         self.compacting_over(parent.as_deref());
         self.upsert(&format!("{COMPACTION}{key}"), parent, Body::Notice { level, text });
     }
@@ -1262,6 +1513,19 @@ impl Core {
     }
 
     pub fn touch_state(&mut self) {
+        if let Some(input) = &self.input {
+            let capacity = {
+                let mut controller = input.controller.lock();
+                match controller.available(!self.hold && self.state.pause.is_none() && self.state.frozen.is_none()) {
+                    Ok(true) => { controller.advertised_ready(input.now_ns()); Some(controller.capacity()) }
+                    _ => None,
+                }
+            };
+            if let Some(capacity) = capacity {
+                self.state.admission = Some(capacity.clone());
+                self.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) });
+            }
+        }
         self.state_dirty = true;
     }
 
@@ -1386,6 +1650,7 @@ impl Core {
         use super::model::{Command, Delivery};
         let (Command::QueueRemove { id } | Command::QueueEdit { id, .. }) = c else { return };
         let waits = self.state.queue.iter().chain(self.state.tasks.iter().flat_map(|t| t.queue.iter())).any(|q| &q.id == id);
+        if waits && matches!(c, Command::QueueRemove { .. }) { self.input_cancelled(id, super::admission::CancelReason::User); }
         if !waits || !matches!(self.state.delivery.get(id), Some(Delivery::Sent | Delivery::Queued | Delivery::Started)) {
             return;
         }
@@ -1569,6 +1834,51 @@ impl Core {
 mod tests {
     use super::*;
 
+    #[test]
+    fn exact_legacy_native_proof_survives_before_journal_attachment() {
+        let mut core = Core::new();
+        core.input_legacy_flights.push(super::super::admission::LegacyFlight { id: "actual".into(), protocol: super::super::admission::FlightProtocol::Codex, request: None });
+        core.inputs_consumed(&["guess", "actual", "actual"], super::super::admission::Consumption::ProviderAccepted);
+        assert_eq!(core.input_receipts.len(), 1);
+        assert!(core.input_receipts.first().is_some_and(|receipt| receipt.messages == ["actual"] && !receipt.continuously_available));
+        assert!(core.input_retained("actual"));
+        assert_eq!(core.state.delivery.get("actual"), Some(&super::super::model::Delivery::Queued));
+        assert!(matches!(core.input_replay, super::super::admission::Replay::Waiting));
+        core.skills_provider_ready();
+        assert!(matches!(core.input_replay, super::super::admission::Replay::ProviderReady));
+    }
+
+    #[test]
+    fn wait_handoff_needs_exact_registered_result_and_its_successful_native_turn() -> anyhow::Result<()> {
+        use std::sync::Arc;
+        use crate::harness::admission::{Handoff, Input, Lease, PhysicalBudget, Stage, Disposition, Consumption};
+        for (altered, native, ending, attachment, consumed) in [(false, "native-tool", "done", false, true), (true, "native-tool", "done", false, false), (false, "", "done", false, false), (false, "native-tool", "stopped", false, false), (false, "native-tool", "done", true, false)] {
+            let mut core = Core::new();
+            core.state.turn_started = Some(20);
+            let mut messages = vec![serde_json::json!({"id":"original","from":"peer","name":null,"text":"actual words","at":1})];
+            let handoff_id = crate::util::new_id();
+            let digest = crate::harness::wait::handoff_digest(&handoff_id, Some(20), &messages).map_err(|error| anyhow::anyhow!("fixture digest: {error:?}"))?;
+            let handoff = Handoff { id: handoff_id.clone(), turn: Some(20), digest };
+            let records = Arc::new(kiln_seams::records::SimRecords::new());
+            let inbox = Arc::new(crate::harness::inbox::Inbox::new(records, crate::harness::inbox::Limits::default()));
+            let input = Input::new(0, PhysicalBudget::new(1024), inbox);
+            input.controller.lock().restore(Lease { message: "original".into(), peer: "peer".into(), epoch: 0, bytes: 128, stage: Stage::Queued, token: None, handoff: Some(handoff) }).map_err(|error| anyhow::anyhow!("fixture restore: {error:?}"))?;
+            core.input = Some(input.clone());
+            let attachments = if attachment { vec![crate::harness::model::Attachment { name: "original.txt".into(), mime: "text/plain".into(), data_base64: "eA==".into(), file_id: None, path: None }] } else { Vec::new() };
+            core.state.queue.push(crate::harness::model::QueueItem { id: "original".into(), text: "actual words".into(), at: 1, attachments, overrides: None, reply_to: None });
+            if altered && let Some(message) = messages.first_mut().and_then(serde_json::Value::as_object_mut) { message.insert("text".into(), serde_json::json!("different words")); }
+            let result = serde_json::json!({"structuredContent":{"mail_handoff":{"id":handoff_id,"turn":20},"messages":messages},"isError":false});
+            core.observe_handoff_result(native, &result);
+            assert_eq!(core.state.queue.len(), 1, "tool result observation alone does not consume before actual turn completion");
+            core.end_turn(Some(20), ending, None);
+            assert_eq!(core.state.queue.is_empty(), consumed);
+            assert_eq!(core.input_receipts.len(), usize::from(consumed));
+            if consumed { assert!(core.input_receipts.first().is_some_and(|receipt| receipt.disposition == Disposition::Consumed { boundary: Consumption::WaitHandoff })); }
+            assert!(input.controller.lock().lease("original").is_some(), "only the durable owner flush may release credit");
+        }
+        Ok(())
+    }
+
     /// Goal 9, plan 01a1a87b2cec step 5: an update reads as serde's derive for an internally tagged enum read it (the
     /// derive kept here for it): every variant as it's written (its tag first), its tag last, from a JSON value, and
     /// with a field it doesn't know; and the same refusals: an unknown variant (the same words), no tag, a missing field,
@@ -1604,6 +1914,7 @@ mod tests {
                 #[serde(default)]
                 gone: Vec<FileKey>,
             },
+            MailFlow { event: Box<super::super::admission::FlowEvent> },
         }
         let derived = |json: &str| -> Result<Update, serde_json::Error> {
             Ok(match serde_json::from_str::<Derived>(json)? {
@@ -1616,6 +1927,7 @@ mod tests {
                 Derived::Stream { id, text } => Update::Stream { id, text },
                 Derived::Reply { client, value } => Update::Reply { client, value },
                 Derived::Inbox { said } => Update::Inbox { said },
+                Derived::MailFlow { event } => Update::MailFlow { event },
                 Derived::Reset { from } => Update::Reset { from },
                 Derived::ChangesPatch { set, gone } => Update::ChangesPatch { set, gone },
             })
@@ -1633,6 +1945,7 @@ mod tests {
             Update::Stream { id: "e1".into(), text: " and more".into() },
             Update::Reply { client: "c1".into(), value: serde_json::json!({"items": [1, "a", null], "more": true}) },
             Update::Inbox { said: Box::new(Said { message: "m1".into(), answer: Err(Refusal::Moved { session: "s1".into(), epoch: 2 }) }) },
+            Update::MailFlow { event: Box::new(super::super::admission::FlowEvent::Capacity { capacity: super::super::admission::Capacity { epoch: 0, generation: 1, retry_generation: Some(0), learning: super::super::admission::Learning::Bootstrap, target: 2, admitted: 0, bytes: 0, peers: 1, eligible_peer: None, feedback_generation: None } }) },
             Update::Reset { from: Some(3) },
             Update::Reset { from: None },
             Update::ChangesPatch { set: vec![file], gone: vec![FileKey { path: "src/b.rs".into(), tree: None }] },

@@ -735,7 +735,9 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state}` (its state without the catalogs) |
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
 | `agents.about` | `POST /api/harness/agents/:id/about` | `{path, code, line?, end_line?, selection?, change?, question?, now?}` → `{agents: [Agent], itself}`: a child of the agent, reading only, answers what a person tapped in its conversation (a name, a line, a change) in four parts (what it is, what it does here, where else it's used, what's worth knowing); when the agent runs no subagents (`max_subagents` 0) it answers itself (`itself: true`, `sent` as `agents.send` answers), after its turn or with `now` between its steps. The child is a helper (`helper: "about"` on it): no row of Mission Control, its parent not told of it, ended once no card has read it (`agents.result`) for 90 seconds |
-| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?}` (or the `Idempotency-Key` header) → `{sent, message, accepted?}`: mode defaults to `steer` for agents, `queue` for people; `accepted` is the agent's inbox's answer, `repeat` on every one after the first ("Sending again", below) |
+| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?, status?: {key, task?}}` (or the `Idempotency-Key` header) → durable receipt `{sent: true, retained: true, message, id, revision, generation, disposition, repeat}`: retained custody is separate from actual model consumption; mode defaults to `steer` for agents, `queue` for people ("Sending again" and "Replaceable progress", below) |
+| `agents.messages` | `GET /api/harness/agents/:id/messages` | `{from?, status_key?, task?, after?, bytes?}` → byte-bounded `{items, next}` of accepted originals, including superseded statuses; another sender's incoming history requires permission to see the recipient conversation |
+| `agents.message_body` | `GET /api/harness/agents/:id/message-body` | `{revision, from?, path?, offset?, bytes?}` → bounded original-value inspection: JSON-pointer object keys, array length, scalar or UTF-8 string range; `/$transfers` inspects custody-transfer receipts |
 | `agents.wait` | `POST /api/harness/agents/wait` | `{agent?` or `agents?` (a list, or `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?}` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
@@ -809,7 +811,7 @@ agent that can't start there.
 A message's id is made once, by whoever sends it, and every retry carries it: the agent's inbox
 takes each id once (docs/sends.md). Give `agents.send` a `key` of yours (1 to 256 bytes; over HTTP
 the `Idempotency-Key` header does too) and a call with the same key is the same message: the agent
-gets it once, and every call is answered as the first was, `accepted.repeat` on the ones after.
+gets it once, and every call names the same committed publication, `repeat` on the ones after.
 A key is its caller's: an agent's is the same on whichever machine it runs, so its retry after it
 moves is the same message. Without a key, each call is a message of its own. A key given to other
 words is refused (409). From a kiln shell: `kiln agents send <id> --key <key> <text>`.
@@ -830,6 +832,28 @@ during a turn; a harness without that support queues it. A receiver waiting for 
 (`agents_wait`) gets queued messages with the wait ("Waiting", below). Control stays with
 the agents an agent started: sending now, interrupting, ending, and their
 goals and plan runs are theirs alone. Agents that work for different people aren't sent to.
+
+### Replaceable progress
+
+Use `status: {task, key}` only for progress whose latest pending value may replace an earlier
+value of the same purpose. The stream belongs to the authenticated sender and recipient;
+`task` is your workflow label, not source task routing or extra permission. For example:
+
+```json
+{"agent":"receiver-id","text":"The focused check is running.","key":"check-publication-1","status":{"task":"parser-fix","key":"validation"}}
+```
+
+A later changed progress report uses a new publication `key` and the same `status`. Retrying
+the same publication uses its original `key` and exact content. Every accepted original stays
+in `agents.messages`; only never-dispatched status presentation is replaced. A dispatched
+revision is frozen, and its latest successor waits for actual consumption. A retained receipt
+does not say that the model has read the message. Typed backpressure/storage failure means
+no custody was accepted, so keep the original and wait for the actual readiness event.
+
+Publish progress when it changes what the recipient can do. Send required policy readbacks once
+per task/policy revision; unchanged “still waiting” or build checkpoints do not need repeated
+messages. Instructions, requests for decisions and final results use ordinary distinct sends.
+Kiln never infers replaceability from those words or silently merges them.
 
 ### No more than its parent
 

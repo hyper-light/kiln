@@ -241,7 +241,9 @@ function Recall({ id, session, draft, onDraft, onSaved }: { id: string; session:
             ? `Approved instead (its goals waited on your review of it): its ${ran.sent} step${ran.sent === 1 ? "" : "s"} go to it as its goal's parts.`
             : mode === "goals" && n
               ? `${ran.sent} goals lined up in its goal stack, below.`
-              : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}.`}
+              : ran.retained
+                ? `${ran.retained} message${ran.retained === 1 ? "" : "s"} retained, waiting for receiver admission${ran.sent ? ` · ${ran.sent} sent` : ""}`
+                : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}.`}
         </p>
       )}
       {error && <p className="plan-error">{error}</p>}

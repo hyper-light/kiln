@@ -1,0 +1,60 @@
+{
+  "exit_code": 101,
+  "source_unchanged": false,
+  "errors": [
+    {
+      "message": "cannot find type `Demand` in module `super::admission`",
+      "rendered": "error[E0425]: cannot find type `Demand` in module `super::admission`\n   --> crates/kiln/src/harness/mail.rs:156:122\n    |\n156 | ...get: usize) -> Result<Page<super::admission::Demand>, Error> {\n    |                                                 ^^^^^^ not found in `super::admission`\n    |\nhelp: consider importing this struct\n    |\n  5 + use crate::offers::demand::Demand;\n    |\nhelp: if you import `Demand`, refer to it directly\n    |\n156 - pub async fn waiting_peers(store: &Store, recipient: String, after: u64, budget: usize) -> Result<Page<super::admission::Demand>, Error> {\n156 + pub async fn waiting_peers(store: &Store, recipient: String, after: u64, budget: usize) -> Result<Page<Demand>, Error> {\n    |\n\n"
+    },
+    {
+      "message": "cannot find type `Demand` in module `super::admission`",
+      "rendered": "error[E0425]: cannot find type `Demand` in module `super::admission`\n   --> crates/kiln/src/harness/mail.rs:160:114\n    |\n160 | fn waiting_peers_on(c: &Connection, recipient: &str, after: u64, budget: usize) -> Result<Page<super::admission::Demand>, Error> {\n    |                                                                                                                  ^^^^^^ not found in `super::admission`\n    |\nhelp: consider importing this struct\n    |\n  5 + use crate::offers::demand::Demand;\n    |\nhelp: if you import `Demand`, refer to it directly\n    |\n160 - fn waiting_peers_on(c: &Connection, recipient: &str, after: u64, budget: usize) -> Result<Page<super::admission::Demand>, Error> {\n160 + fn waiting_peers_on(c: &Connection, recipient: &str, after: u64, budget: usize) -> Result<Page<Demand>, Error> {\n    |\n\n"
+    },
+    {
+      "message": "cannot find struct, variant or union type `Demand` in module `super::admission`",
+      "rendered": "error[E0422]: cannot find struct, variant or union type `Demand` in module `super::admission`\n   --> crates/kiln/src/harness/mail.rs:166:40\n    |\n166 |         let demand = super::admission::Demand { peer: row.get(0).map_err(sql_error)?, revision: cursor };\n    |                                        ^^^^^^ not found in `super::admission`\n    |\nhelp: consider importing this struct\n    |\n  5 + use crate::offers::demand::Demand;\n    |\nhelp: if you import `Demand`, refer to it directly\n    |\n166 -         let demand = super::admission::Demand { peer: row.get(0).map_err(sql_error)?, revision: cursor };\n166 +         let demand = Demand { peer: row.get(0).map_err(sql_error)?, revision: cursor };\n    |\n\n"
+    },
+    {
+      "message": "cannot find type `Demand` in module `super::admission`",
+      "rendered": "error[E0425]: cannot find type `Demand` in module `super::admission`\n    --> crates/kiln/src/harness/model.rs:2448:39\n     |\n2448 |         demand: Vec<super::admission::Demand>,\n     |                                       ^^^^^^ not found in `super::admission`\n     |\nhelp: consider importing this struct\n     |\n   7 + use crate::offers::demand::Demand;\n     |\nhelp: if you import `Demand`, refer to it directly\n     |\n2448 -         demand: Vec<super::admission::Demand>,\n2448 +         demand: Vec<Demand>,\n     |\n\n"
+    },
+    {
+      "message": "no method named `count` found for struct `std::vec::Vec<usize>` in the current scope",
+      "rendered": "error[E0599]: no method named `count` found for struct `std::vec::Vec<usize>` in the current scope\n    --> crates/kiln/src/harness/registry.rs:4130:59\n     |\n4130 |             let chunks = kiln_ci::store::cdc::cuts(&data).count();\n     |                                                           ^^^^^\n     |                                                           |\n     |                                                           method cannot be called on `std::vec::Vec<usize>` due to unsatisfied trait bounds\n     |                                                           help: consider using `len` instead\n     |\n     = note: `count` is defined on `std::iter::Iterator`, which `std::vec::Vec<usize>` does not implement\n\n"
+    },
+    {
+      "message": "no method named `count` found for struct `std::vec::Vec<usize>` in the current scope",
+      "rendered": "error[E0599]: no method named `count` found for struct `std::vec::Vec<usize>` in the current scope\n    --> crates/kiln/src/harness/registry.rs:4135:67\n     |\n4135 |         let metadata_chunks = kiln_ci::store::cdc::cuts(&encoded).count();\n     |                                                                   ^^^^^\n     |                                                                   |\n     |                                                                   method cannot be called on `std::vec::Vec<usize>` due to unsatisfied trait bounds\n     |                                                                   help: consider using `len` instead\n     |\n     = note: `count` is defined on `std::iter::Iterator`, which `std::vec::Vec<usize>` does not implement\n\n"
+    },
+    {
+      "message": "mismatched types",
+      "rendered": "error[E0308]: mismatched types\n    --> crates/kiln/src/harness/session.rs:4792:17\n     |\n4657 |                 Ev::Ctl(Some(Ctl::Cmd(c))) => match journal_edit(&s, &files, *c).await {\n     |                                                     ---------------------------------- this expression has type `std::option::Option<harness::model::Command>`\n...\n4792 |                 Ev::Ctl(Some(Ctl::HandOver(reply))) => {\n     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Option<Command>`, found `Ev`\n     |\n     = note: expected enum `std::option::Option<harness::model::Command>`\n                found enum `harness::session::Ev`\n\n"
+    },
+    {
+      "message": "mismatched types",
+      "rendered": "error[E0308]: mismatched types\n    --> crates/kiln/src/harness/session.rs:4796:17\n     |\n4657 |                 Ev::Ctl(Some(Ctl::Cmd(c))) => match journal_edit(&s, &files, *c).await {\n     |                                                     ---------------------------------- this expression has type `std::option::Option<harness::model::Command>`\n...\n4796 |                 Ev::Ctl(Some(Ctl::Hook(_, reply))) => {\n     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Option<Command>`, found `Ev`\n     |\n     = note: expected enum `std::option::Option<harness::model::Command>`\n                found enum `harness::session::Ev`\n\n"
+    },
+    {
+      "message": "the trait bound `usize: ToSql` is not satisfied",
+      "rendered": "error[E0277]: the trait bound `usize: ToSql` is not satisfied\n   --> crates/kiln/src/harness/told.rs:755:162\n    |\n755 | ...OM kv WHERE k=?1\", rusqlite::params![format!(\"{PRODUCER_PREFIX}{parent}\"), super::state_view::FRAME], |r| Ok((r.get(0)?, r.get(1...\n    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `ToSql` is not implemented for `usize`\n    |\n    = help: the following other types implement trait `ToSql`:\n              f32\n              f64\n              i16\n              i32\n              i64\n              i8\n              isize\n              u16\n            and 2 others\n    = note: required for the cast from `&usize` to `&dyn ToSql`\n    = note: this error originates in the macro `rusqlite::params` (in Nightly builds, run with -Z macro-backtrace for more info)\n\n"
+    },
+    {
+      "message": "borrow of moved value: `parent`",
+      "rendered": "error[E0382]: borrow of moved value: `parent`\n    --> crates/kiln/src/harness/told.rs:1371:44\n     |\n1303 | ...   for parent in parents {\n     |           ------ move occurs because `parent` has type `std::string::String`, which does not implement the `Copy` trait\n...\n1365 | ...               out.push((parent, Command::Send { id: id.clone(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::n...\n     |                             ------ value moved here\n...\n1371 | ...               self.news_dirty.insert(parent.clone());\n     |                                          ^^^^^^ value borrowed here after move\n     |\nhelp: consider cloning the value if the performance cost is acceptable\n     |\n1365 |                     out.push((parent.clone(), Command::Send { id: id.clone(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }));\n     |                                     ++++++++\n\n"
+    }
+  ],
+  "free_before": 47471632384,
+  "free_after": 46630785024,
+  "command": [
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "check",
+    "--locked",
+    "-p",
+    "kiln",
+    "--lib",
+    "--message-format=json"
+  ]
+}

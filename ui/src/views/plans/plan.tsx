@@ -501,7 +501,9 @@ function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; 
               ? `Approved instead (its goals waited on your review of it): its ${ran.sent} step${ran.sent === 1 ? "" : "s"} go to it as its goal's parts`
               : mode === "goals"
                 ? `${ran.sent} goal${ran.sent === 1 ? "" : "s"} lined up${ran.split ? `, ${ran.split} as goal stacks of their criteria and tests` : ""}`
-                : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`}{" "}
+                : ran.retained
+                  ? `${ran.retained} message${ran.retained === 1 ? "" : "s"} retained, waiting for receiver admission${ran.sent ? ` · ${ran.sent} sent` : ""}`
+                  : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`}{" "}
             · <Link to={`/agents/${encodeURIComponent(ran.session)}`}>open the agent</Link>
           </span>
         )}

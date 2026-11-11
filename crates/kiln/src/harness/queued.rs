@@ -146,6 +146,8 @@ pub struct Kept {
     pub held: String,
     /// Its queue was seen holding it.
     seen: bool,
+    /// Server custody alone cannot establish absence from a receiver's queue.
+    custody: Custody,
     /// Its agent was free when it was sent, so it took it at once: it never waited.
     direct: bool,
     /// When it was sent (unix ms).
@@ -165,24 +167,31 @@ pub enum Now {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Custody { Sender, Receiver }
+
 impl Kept {
     /// Message `id` was just sent to `to`, saying `text`.
     pub fn sent(id: String, text: String, to: &Info, now: i64) -> Self {
-        Self { id, held: text.clone(), text, seen: false, direct: free(to), at: now, gone_at: None }
+        Self { id, held: text.clone(), text, seen: false, custody: Custody::Receiver, direct: free(to), at: now, gone_at: None }
     }
 
     /// Message `id`, found waiting at `now` (queued before this server started), saying `holds`
     /// (empty: words not known).
     pub fn found(id: String, holds: String, now: i64) -> Self {
-        Self { id, held: holds.clone(), text: holds, seen: true, direct: false, at: now, gone_at: None }
+        Self { id, held: holds.clone(), text: holds, seen: true, custody: Custody::Receiver, direct: false, at: now, gone_at: None }
     }
+
+    pub fn awaiting_source(&mut self) { self.custody = Custody::Sender; self.direct = false; self.gone_at = None; }
+
+    pub fn at_sender(&self) -> bool { self.custody == Custody::Sender }
 
     /// Where it is, by the agent's queue as `info` has it (none: the agent is gone), at `now`; what
     /// the queue holds of it is noted, and, once its harness was handed it, what it was handed (its
     /// timeline says it before its queue says it's gone): an edit applied and taken between two
     /// looks held, one that came too late not (CP-T3.2, the thirteenth adversarial check's).
     pub fn look(&mut self, info: Option<&Info>, now: i64) -> Now {
-        let Some(info) = info else { return Now::Gone };
+        let Some(info) = info else { return if self.custody == Custody::Sender { Now::Unknown } else { Now::Gone } };
         let found = info.queue.iter().find(|q| q.id == self.id);
         self.look_at(info, found, found.is_some() || !info.queue_partial, now)
     }
@@ -196,6 +205,7 @@ impl Kept {
     fn look_at(&mut self, info: &Info, found: Option<&Queued>, complete: bool, now: i64) -> Now {
         match found {
             Some(q) => {
+                self.custody = Custody::Receiver;
                 self.seen = true;
                 if q.digest == digest(&self.text) {
                     self.held.clone_from(&self.text);
@@ -204,10 +214,11 @@ impl Kept {
             }
             None => match info.said.iter().find(|g| g.id == self.id) {
                 Some(handed) => {
+                    self.custody = Custody::Receiver;
                     self.held = if handed.digest == stable(&self.text) { self.text.clone() } else { String::new() };
                     Now::Gone
                 }
-                None if !complete => Now::Unknown,
+                None if !complete || self.custody == Custody::Sender => Now::Unknown,
                 None if !self.seen && !self.direct && now.saturating_sub(self.at) < SHOW_MS => Now::Waiting,
                 None => Now::Gone,
             },
@@ -280,6 +291,26 @@ mod tests {
         assert_eq!(message.look_known(&info, Some(&Queued::of("another-id", "same words")), SHOW_MS * 4), Now::Unknown);
         info.said.push(super::super::model::Given { id: "outside-prefix".into(), digest: stable("same words") });
         assert_eq!(message.look(Some(&info), SHOW_MS * 5), Now::Gone, "the harness's receipt remains authoritative");
+    }
+
+    #[test]
+    fn durable_sender_custody_never_expires_from_receiver_absence() {
+        let info = Info { status: Status::Idle, ..Info::default() };
+        let mut message = Kept::sent("held".into(), "original".into(), &info, 0);
+        message.awaiting_source();
+        for now in [SHOW_MS, SHOW_MS * 10, i64::MAX] {
+            assert_eq!(message.look(Some(&info), now), Now::Unknown);
+            assert_eq!(message.look_heard_known(&info, None, now), Now::Unknown);
+            assert_eq!(message.look(None, now), Now::Unknown);
+            assert_eq!(message.text, "original");
+        }
+        let mut admitted = info.clone();
+        admitted.queue = vec![Queued::of("held", "original")];
+        assert_eq!(message.look(Some(&admitted), i64::MAX), Now::Waiting);
+        assert!(!message.at_sender());
+        admitted.queue.clear();
+        admitted.said.push(super::super::model::Given { id: "held".into(), digest: stable("original") });
+        assert_eq!(message.look_heard(Some(&admitted), i64::MAX), Now::Gone);
     }
 
     #[test]

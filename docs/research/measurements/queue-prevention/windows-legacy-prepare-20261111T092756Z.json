@@ -1,0 +1,153 @@
+{
+  "policy": {
+    "revision": "3830327b6c8d7ac22452a5e32ffa32799263132c",
+    "rules_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+    "role": "implementer"
+  },
+  "scope": "Read-only existing repository/workflow metadata and pure workflow validation; no run/configuration changes",
+  "captures": {
+    "windows_legacy_repo_metadata": {
+      "runner": "451397fcc585f7f7cb9aaf00e42064bb",
+      "exit_code": 0,
+      "data": {
+        "captured_at": "2026-11-11T09:23:16.938282+00:00",
+        "repo": {
+          "id": "01a13865558f700ea2b5bc931a4637f3",
+          "name": "hyper-light/kiln",
+          "enabled": true,
+          "mode": "upstream",
+          "branches": [],
+          "default_branch": null,
+          "last_error": null,
+          "clone_host": "github.com",
+          "clone_path": "/hyper-light/kiln.git"
+        },
+        "workflow_response_type": "dict",
+        "workflow_response_keys": [
+          "ref",
+          "sha",
+          "github",
+          "workflows",
+          "actions"
+        ],
+        "workflows": [
+          {
+            "path": ".github/workflows/ci.yml",
+            "name": "ci",
+            "dialect": "gha",
+            "valid": null,
+            "error": null,
+            "runs": false
+          },
+          {
+            "path": ".github/workflows/release.yml",
+            "name": "release",
+            "dialect": "gha",
+            "valid": null,
+            "error": null,
+            "runs": false
+          },
+          {
+            "path": ".kiln/bench.yaml",
+            "name": "bench",
+            "dialect": "kiln",
+            "valid": null,
+            "error": null,
+            "runs": true
+          },
+          {
+            "path": ".kiln/ci.yaml",
+            "name": "ci",
+            "dialect": "kiln",
+            "valid": null,
+            "error": null,
+            "runs": true
+          },
+          {
+            "path": ".kiln/custody-lab.yaml",
+            "name": "custody-lab",
+            "dialect": "kiln",
+            "valid": null,
+            "error": null,
+            "runs": true
+          },
+          {
+            "path": ".kiln/e2e.yaml",
+            "name": "e2e",
+            "dialect": "kiln",
+            "valid": null,
+            "error": null,
+            "runs": true
+          },
+          {
+            "path": ".kiln/h3-fuzz.yaml",
+            "name": "h3-fuzz",
+            "dialect": "kiln",
+            "valid": null,
+            "error": null,
+            "runs": true
+          },
+          {
+            "path": ".kiln/image.yaml",
+            "name": "image",
+            "dialect": "kiln",
+            "valid": null,
+            "error": null,
+            "runs": true
+          },
+          {
+            "path": ".kiln/release.yaml",
+            "name": "release",
+            "dialect": "kiln",
+            "valid": null,
+            "error": null,
+            "runs": true
+          },
+          {
+            "path": ".kiln/sim.yaml",
+            "name": "sim",
+            "dialect": "kiln",
+            "valid": null,
+            "error": null,
+            "runs": true
+          },
+          {
+            "path": ".kiln/stress.yaml",
+            "name": "stress",
+            "dialect": "kiln",
+            "valid": null,
+            "error": null,
+            "runs": true
+          },
+          {
+            "path": ".kiln/wire-lab.yaml",
+            "name": "wire-lab",
+            "dialect": "kiln",
+            "valid": null,
+            "error": null,
+            "runs": true
+          }
+        ]
+      }
+    },
+    "windows_legacy_validation": {
+      "runner": "451397fcc585f7f7cb9aaf00e42064bb",
+      "exit_code": 0,
+      "data": {
+        "captured_at": "2026-11-11T09:27:56.534923+00:00",
+        "http": 200,
+        "response_keys": [
+          "kind",
+          "dialect",
+          "diagnostics",
+          "outline"
+        ],
+        "kind": "workflow",
+        "dialect": "kiln",
+        "diagnostics": [],
+        "runs_started": false,
+        "configuration_changed": false
+      }
+    }
+  }
+}

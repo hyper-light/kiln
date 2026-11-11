@@ -151,13 +151,17 @@ export interface Outcome {
   id: string;
   name: string;
   machine: string;
-  result: "done" | "skipped" | "failed";
+  result: "done" | "retained" | "skipped" | "failed";
   reason?: string;
 }
 
 /** How it went, in a line: `done` says what was done to how many ("Resumed 2 agents"), then how many were skipped or failed. */
 export function outcomeLine(done: (agents: string) => string, outcomes: readonly Outcome[]): string {
   const n = (r: Outcome["result"]) => outcomes.filter((o) => o.result === r).length;
-  const [ok, skipped, failed] = [n("done"), n("skipped"), n("failed")];
-  return [ok > 0 ? done(count(ok, "agent")) : "", skipped > 0 ? `${skipped} skipped` : "", failed > 0 ? `${failed} failed` : ""].filter(Boolean).join(" · ") || "Nothing to do";
+  const [ok, retained, skipped, failed] = [n("done"), n("retained"), n("skipped"), n("failed")];
+  return (
+    [ok > 0 ? done(count(ok, "agent")) : "", retained > 0 ? `${retained} retained, waiting for receiver` : "", skipped > 0 ? `${skipped} skipped` : "", failed > 0 ? `${failed} failed` : ""]
+      .filter(Boolean)
+      .join(" · ") || "Nothing to do"
+  );
 }

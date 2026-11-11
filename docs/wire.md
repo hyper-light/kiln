@@ -186,6 +186,15 @@ content plus the session epoch, so unrelated status changes do not invalidate qu
 while that owner is away. These messages are enabled only after named-feature negotiation;
 the runner refreshes its resumable session streams when that negotiation completes.
 
+`mail-flow` adds receiver-owned application credit, independent of transport connection.
+Accepted publications first transfer durable server custody (`Published`, HTTP202 with a receipt).
+Receiver admission and correlated provider handoff are subsequent owner events; neither a socket
+write nor a durable inbox ACK is model consumption. Only explicitly keyed replaceable status
+revisions coalesce before dispatch; every original remains in history. Actual consumption/refill
+and peer lifecycle events change learned logical credit. The host-wide physical authority remains
+separate. A new publication refused before custody stays the sender's responsibility; a previously
+committed retry returns its same receipt even if the owner is offline or capacity has shrunk.
+
 The parked and live ones' callers get the runner's answer:
 
 | Answer (the registry's `Sent`) | The API | A viewer's socket |
@@ -627,6 +636,8 @@ run out, and two lines can't take the same one by accident as they could a bit.
   `state-pages`: bounded session state views retain status and counts when details exceed the
   existing frame cap; deferred fields and queue indexes are read at their owner's field revision
   using `StateRead`. `AtState` applies queue actions only while that revision is current.
+  `mail-flow`: receiver-owned admission and exact durable custody receipts.
+  `mail-transfer`: event-driven Offered, Prepared, Committed or Aborted journal handover, with authenticated exact manifests and unchanged attempt tokens.
 
 ## Registry
 
@@ -670,6 +681,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `AgentMsg` | 69 | `Placed` | | this line: an owner's word on an agent session's start the server asked it to place, JSON |
 | `AgentMsg` | 70 | `Skills` | | this line: installed skills on a runner (files it wants, its packages' states, a folder's files), JSON, to a server that named `skills` |
 | `AgentMsg` | 71 | `SkillFile` | | this line: a piece of a folder's file for skills, to a server that named `skills` |
+| `AgentMsg` | 72 | `HarnessMailTransfer` | | this line: exact journal transfer phase, to a server that named `mail-transfer` |
 | `AgentMsg` | 58–62 | `Amphora`, `JobFinishedV2`, `RunnerProcess`, `JobLogChunkV1`, `JobLogEndV1` | | in flight (fb1bf362), on a main older than 861bbe60: each collides, and goes after main's last when it lands |
 | `AgentMsg` | 58 | `SampleWithPressure` | | in flight (`placement/pressure`), on an older main: goes after the last when it lands |
 | `ServerMsg` | 0–66 | `Welcome` … `Custody` | | main |
@@ -685,6 +697,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 76 | `Copies` | | this line: a runner's rules for the copies it keeps and its ask to let go now, JSON, to a runner that named `reach.keep` |
 | `ServerMsg` | 77 | `Skills` | | this line: installed skills (what a machine lays out, which session has which) or a folder to read, JSON, to a runner that named `skills` |
 | `ServerMsg` | 78 | `SkillFile` | | this line: a piece of an installed package's file a runner asked for, to a runner that named `skills` |
+| `ServerMsg` | 79 | `HarnessMailTransfer` | | this line: durable journal transfer phase, to a runner that named `mail-transfer` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -855,6 +868,7 @@ Four edges are left, and the lab steers clear of each:
 | `Placed` | answer | An owner's word on an agent session's start the server asked it to place (`ServerMsg::Place` `req`): its answer as it changes, `go` with its runner and claim, or `fallback`. | New: from runners that named `place.sessions`. |
 | `Skills` | state | Installed skills on the runner (`crate::skills::heard`, JSON): the files it lacks (`want`), each package's state there (`states`: fetching, setting up, ready, needs a tool, failed), or a folder's files it was asked to read (`read`). The newest states win; a want is asked again as each manifest comes. | New: to a server that named `skills`. |
 | `SkillFile` | answer | A piece of a file of a folder the server asked the runner to read for skills, by its SHA-256, at its offset; the last says so. | New: to a server that named `skills`. |
+| `HarnessMailTransfer` | command, refused while away | Offer, readiness, adoption or abort for one exact fenced journal manifest. | Current authenticated custodian and expected destination only; durable phase acknowledges it. |
 
 ## Server to runner: `ServerMsg`
 
@@ -939,6 +953,7 @@ Four edges are left, and the lab steers clear of each:
 | `Copies` | state | This runner's rules for the copies of other runners' trees it keeps and the last ask to let go now, as its keeper's report's answer carries them (`reach::keep::Answer`, JSON; docs/reach.md §5.1): its keeper looks at once. The newest wins. | New: to runners that named `reach.keep`, when rules are set or an ask is made. |
 | `Skills` | state | Installed skills (`crate::skills::place::Manifest`, JSON): every package the machine lays out and which of its sessions has which; or a folder to read for skills, answered by `AgentMsg::Skills` and `AgentMsg::SkillFile`. The newest wins. | New: to runners that named `skills`, as installs and sessions change and on every connect. |
 | `SkillFile` | answer | A piece of an installed package's file the runner asked for (`AgentMsg::Skills` `want`), by its SHA-256, at its offset; the last says so. | New: to runners that named `skills`, in pieces of 512 KiB. |
+| `HarnessMailTransfer` | command, refused while away | Apply the authoritative durable transfer phase for one exact manifest. | Persisted destination readiness precedes source permission to send; Committed precedes activation. |
 
 ## Commands to a session: `Command`
 
@@ -970,6 +985,10 @@ travels in `HarnessCmd`.
 | `Snapshot` | ask | The whole session, for a server that lost track of it. A resume by revision replaces it. | Asked for by a server that restarted. |
 | `StateRead` | ask | A bounded page or range of deferred session detail, at its field revision. | Reply to the requesting client; stale reads are refused. |
 | `AtState` | command, refused while away | A queue action conditional on the owner's current queue revision. | Live owner only; stale actions are refused. |
+| `Admit` | command, refused while away | An authenticated relay offers one immutable publication under current receiver credit. | Owner-only; the source commits body and lease before Accepted. |
+| `MailAck` | command, refused while away | The relay committed this exact source receipt. | Owner-only; source keeps terminal journal until acknowledged. |
+| `MailPeers` | command, refused while away | Authenticated peers with unresolved custody divide current receiver authority. | Owner-only; no peer creates extra byte authority. |
+| `MailHandoff` | command, refused while away | Register an exact bounded wait response while preserving its original queue and lease. | Owner-only; native tool-result evidence establishes handoff. |
 | `McpEnable` | command, refused while away | Switches an MCP server now. | Fire-and-forget. |
 | `McpReconnect` | command, refused while away | As `McpEnable`. | Fire-and-forget. |
 | `McpRefresh` | command, refused while away | As `McpEnable`. | Fire-and-forget. |
@@ -1007,6 +1026,7 @@ From wherever a session runs to the server, inside `Harness`, and on to its view
 | `Stream` | stream | Text appended to a streaming event. | As `Harness`. |
 | `Reply` | answer | Answers one client's ask. | As its class says. |
 | `Inbox` | answer | What a session's inbox made of a message (`HarnessSend`): taken, a repeat with the first time's answer, or refused and why (CP-T3.2). | T3: rides the session's stream. Sent again after a server restart, it finds no waiter, or a retry's own waiter (CP-T3.3 gives each send a nonce). |
+| `MailFlow` | answer | Current owner capacity and correlated admission, consumption, waiting or terminal receipt. | Named mail-flow peers; each event is fenced by publication token and source epoch. |
 | `Reset` | stream | The timeline starts over (a snapshot follows). | As `Harness`. |
 | `ChangesPatch` | stream | What changed in its changeset since the last one the server's copy took: the files set (each in place of the one with its key, or after the rest) and those gone. Only to a server that says `CAP_CHANGES_PATCH`, so a file an agent touches doesn't send every file's diff again; a snapshot has the whole changeset, its first frame whole and the rest as patches when it doesn't fit one. | As `Harness`. The server stores the whole changeset it makes. |
 
@@ -1093,6 +1113,7 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | down | `synced` | stream | Follows a snapshot. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `closed` | stream | The session is gone. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `error` | answer | A command's refusal. | Says a bare command's refusals, to clients from before ids. |
+| `/api/harness/sessions/:id/ws` | down | `mail_flow` | answer | A committed owner capacity or publication progress event. | Optional exact publication receipt and opaque sender scope bind progress before its initial ACK. |
 | `/api/events` | up | `unread` | ack | As the session socket's. | Noted (`events_down`). |
 | `/api/events` | up | `topics` | state | The event types the page wants from now on, and where it was when it asked for more. | The newest wins; of the types new to it, what came since is sent too. |
 | `/api/events` | down | `event` | stream | Kiln's events for the UI, each its own frame. | To a page that didn't ask for batches: not resumed after a reconnect. |

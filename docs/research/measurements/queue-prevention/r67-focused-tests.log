@@ -1,0 +1,106 @@
+
+running 84 tests
+test agent::tests::state_delivery_survives_a_queue_larger_than_a_frame ... ok
+test harness::admission::tests::a_different_session_wakes_on_pool_release_but_not_unchanged_resize ... ok
+test harness::admission::tests::a_restore_finished_while_moving_still_has_no_admission_authority ... ok
+test harness::admission::tests::an_actual_batch_supplies_its_service_quantum_and_seventeen_peers_divide_the_window ... ok
+test harness::admission::tests::an_outstanding_feedback_witness_survives_other_capacity_updates ... ok
+test harness::admission::tests::draining_the_last_accepted_item_cannot_bridge_a_producer_idle_service_interval ... ok
+test harness::admission::tests::every_stage_retains_the_same_credit_and_repeats_acquire_none ... ok
+test harness::admission::tests::only_a_real_busy_cycle_and_correlated_refill_learn_depth ... ok
+test harness::admission::tests::only_waiting_demand_can_start_feedback_and_holds_end_the_cycle_without_eviction ... ok
+test harness::admission::tests::peers_divide_bootstrap_roles_and_lifecycle_invalidates_samples ... ok
+test harness::admission::tests::physical_authority_is_aggregate_and_has_no_oversize_exception ... ok
+test harness::admission::tests::real_waiting_claim_withdrawal_admit_and_native_handoffs_can_leave_bootstrap ... ok
+test harness::admission::tests::restoration_and_unavailable_input_never_advertise_a_bootstrap_grant ... ok
+test harness::codex::tests::native_user_input_dequeue_returns_credit_but_rpc_ack_and_unidentified_items_do_not ... ok
+test harness::codex::tests::w20_r01_only_exact_emitted_skill_echo_projects_the_original_user_message ... ok
+test harness::inbox::faults::w20_a_durable_upload_routes_to_the_same_wire_command_after_registry_reopen ... FAILED
+test harness::inbox::faults::w20_an_oversized_inline_original_is_refused_before_custody_and_a_partial_upload_has_no_metadata ... ok
+test harness::inbox::faults::w20_attachment_content_and_recipient_fence_stable_receiver_ids ... FAILED
+test harness::inbox::faults::w20_missing_upload_refuses_new_custody_but_an_exact_committed_original_keeps_its_receipt ... ok
+test harness::inbox::faults::w20_upload_bytes_and_metadata_survive_the_actual_store_reopening ... FAILED
+test harness::inbox::tests::a_carry_holds_the_newest_ids ... ok
+test harness::inbox::tests::a_copy_left_behind_cannot_lift_a_fence_its_inbox_lagged_behind ... ok
+test harness::inbox::tests::a_fenced_inbox_refuses_until_its_session_comes_back_higher ... ok
+test harness::inbox::tests::a_forgotten_session_keeps_nothing ... ok
+test harness::inbox::tests::a_handoff_batch_retains_every_original_before_any_terminal_receipt ... ok
+test harness::inbox::tests::a_message_is_taken_once_and_a_repeat_gets_the_first_answer ... ok
+test harness::inbox::tests::a_message_taken_back_is_taken_again_on_its_retry ... ok
+test harness::inbox::tests::a_send_from_a_stale_epoch_is_refused_naming_the_epochs ... ok
+test harness::inbox::tests::a_session_past_what_is_read_at_once_is_tidied_a_read_at_a_time ... ok
+test harness::inbox::tests::a_session_taken_back_at_its_epoch_takes_messages_again_and_a_copy_left_behind_does_not ... ok
+test harness::inbox::tests::an_ack_has_atomic_body_custody_and_unaccept_cannot_erase_it ... ok
+test harness::inbox::tests::an_edit_versions_current_words_without_rewriting_the_accepted_original_or_receipt ... ok
+test harness::inbox::tests::an_id_reused_for_another_message_is_refused ... ok
+test harness::inbox::tests::an_import_keeps_the_newest_distinct_ids_however_often_they_are_listed ... ok
+test harness::inbox::tests::an_inbox_keeps_its_last_ids_and_the_oldest_go ... ok
+test harness::inbox::tests::another_message_under_a_carried_id_is_refused_reused ... ok
+test harness::inbox::tests::bad_sessions_and_ids_are_refused_typed ... ok
+test harness::inbox::tests::docs_sends_says_what_the_code_does ... ok
+test harness::inbox::tests::ids_brought_from_another_machine_count_as_taken ... ok
+test harness::inbox::tests::ids_brought_together_are_let_go_oldest_first ... ok
+test harness::inbox::tests::its_transactions_fit ... ok
+test harness::inbox::tests::pending_custody_outlives_dedup_tidy_and_repeats_original_receipt ... ok
+test harness::inbox::tests::terminal_custody_stays_until_exact_server_ack ... ok
+test harness::inbox::tests::what_was_taken_is_still_taken_after_a_restart ... ok
+test harness::mail::tests::bodyless_receipt_requires_complete_identity_and_keeps_exact_current_custody ... ok
+test harness::mail::tests::cancellation_is_retained_without_claiming_consumption ... ok
+test harness::mail::tests::consumption_before_admission_ack_never_regresses ... ok
+test harness::mail::tests::freeze_holds_one_latest_successor_until_consumed ... ok
+test harness::mail::tests::fresh_retry_proof_does_not_replace_first_accepted_original ... ok
+test harness::mail::tests::history_and_pending_pages_fit_exact_encoded_budget ... ok
+test harness::mail::tests::immutable_retry_and_capacity_refusal_preserve_custody ... ok
+test harness::mail::tests::large_history_has_scoped_utf8_body_ranges ... ok
+test harness::mail::tests::logical_authority_includes_server_custody_and_refusal_does_not_supersede ... ok
+test harness::mail::tests::ordinary_messages_and_distinct_stream_scopes_do_not_coalesce ... ok
+test harness::mail::tests::original_status_revisions_survive_pending_coalescing ... ok
+test harness::mail::tests::retries_require_new_source_events_and_replay_preserves_uncertain_token ... ok
+test harness::mail::tests::source_projection_binds_original_sender_id_attempt_and_waiting_disposition ... ok
+test harness::mail::tests::stale_attempt_and_epoch_cannot_release_newer_work ... ok
+test harness::mail::tests::transfer_fences_old_attempt_and_requeues_same_original_at_destination ... ok
+test harness::mail::tests::transferred_projection_still_binds_old_token_after_destination_claim ... ok
+test harness::mail::tests::waiting_peer_demand_excludes_admitted_only_but_keeps_frozen_waiting ... ok
+test harness::session::state_command_tests::a_detail_reply_fits_the_cap_with_its_stamp_and_wire_envelope ... ok
+test harness::session::state_command_tests::a_paged_edit_is_checked_by_the_owner_before_the_real_adapter_changes_it ... ok
+test harness::told::tests::archived_original_can_advance_but_stale_write_is_not_acknowledged ... ok
+test harness::told::tests::durable_news_keeps_unaccepted_original_and_revises_only_after_custody ... ok
+test harness::told::tests::in_flight_newer_capture_fences_equal_older_acknowledgement ... ok
+test harness::told::tests::only_exact_committed_consumption_retires_durable_news ... ok
+test harness::told::tests::persistence_failure_keeps_dirty_keys_and_does_not_mutate_owned_original ... ok
+test harness::told::tests::producer_original_and_run_ack_commit_together_and_restore_exact_bytes ... ok
+test harness::told::tests::stale_producer_capture_cannot_resurrect_a_deleted_newer_run_row ... ok
+test harness::told::tests::unarchived_original_cannot_be_replaced_or_acknowledge_a_run ... ok
+test memory::room::tests::source_input_pools_share_authority_instead_of_multiplying_it ... ok
+test skills::bridge::tests::catalogue_changes_refresh_once_without_adding_prompts_and_literal_tags_stay_human ... ok
+test skills::bridge::tests::empty_existing_skill_folder_does_not_prepend_internal_guidance ... ok
+test skills::bridge::tests::provider_context_readiness_readvertises_once_and_explicit_manual_invocations_remain_available ... ok
+test skills::bridge::tests::w20_r01_discovery_is_progressive_and_control_traffic_is_unchanged ... ok
+test skills::bridge::tests::w20_r01_every_harness_receives_scoped_skills_and_assets ... ok
+test wire::contract::docs_say_what_the_tables_say ... ok
+test wire::ts::a_field_added_in_rust_without_its_binding_names_the_file ... ok
+test wire::ts::bindings_are_current ... ok
+test wire::ts::every_update_goes_down_as_a_session_frame ... ok
+test wire::ts::hand_written_finds_definitions_not_re_exports ... ok
+test wire::ts::no_generated_type_is_written_by_hand ... ok
+test wire::ts::tags_are_serdes_and_what_kiln_leaves_out_is_optional ... ok
+
+failures:
+
+---- harness::inbox::faults::w20_a_durable_upload_routes_to_the_same_wire_command_after_registry_reopen stdout ----
+Error: Unavailable { reason: "attachment storage authority is unavailable; custody was not accepted" }
+
+---- harness::inbox::faults::w20_attachment_content_and_recipient_fence_stable_receiver_ids stdout ----
+Error: Unavailable { reason: "attachment storage authority is unavailable; custody was not accepted" }
+
+---- harness::inbox::faults::w20_upload_bytes_and_metadata_survive_the_actual_store_reopening stdout ----
+Error: Unavailable { reason: "attachment storage authority is unavailable; custody was not accepted" }
+
+
+failures:
+    harness::inbox::faults::w20_a_durable_upload_routes_to_the_same_wire_command_after_registry_reopen
+    harness::inbox::faults::w20_attachment_content_and_recipient_fence_stable_receiver_ids
+    harness::inbox::faults::w20_upload_bytes_and_metadata_survive_the_actual_store_reopening
+
+test result: FAILED. 81 passed; 3 failed; 0 ignored; 0 measured; 4102 filtered out; finished in 2.22s
+

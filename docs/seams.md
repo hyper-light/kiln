@@ -89,7 +89,11 @@ Every record kiln keeps, by family and key, each at the revision of the commit t
 - **Bounds:** family names 1 to 64 of `a-z 0-9 _ - .`; keys 1 to 1024 bytes; values to 1 MiB;
   1000 conditions and 1000 writes a transaction; 1000 rows a page or a change read.
 
-Methods: `get`, `scan`, `commit`, `changes`, `wait`, `head`.
+Methods: `get`, `scan`, `commit`, `commit_owned`, `changes`, `wait`, `head`.
+
+`commit_owned` keeps the supplied allocation owner with the transaction and transient driver
+bindings until the worker releases them, including when the caller cancels its wait. An
+implementation without this guarantee refuses `Unavailable` before enqueueing the transaction.
 
 - **RECORDS-1** a row written is read back with its value and its commit's revision; a key never written reads as none
 - **RECORDS-2** every commit's revision is higher than every one before it, and head() is the newest
@@ -468,7 +472,12 @@ command catalog), and commands to them. Generic over kiln's types: an agent is k
   test, each clause on a hub of its own). A message reaches an agent when its inbox takes it
   (CP-T3.2: once, whatever retried it); what reached one is what its inbox took, in order.
 
-Methods: `agents`, `agent`, `catalog`, `send`.
+Methods: `agents`, `agent`, `catalog`, `send`, `send_status`.
+
+`send_status` marks an explicitly replaceable status stream. Implementations that support durable
+replacement retain every accepted original in history; other implementations deliver each original
+normally. `Retained` means durable sender custody, while `Delivered` means the receiver has it.
+An explicit `Cancelled` outcome preserves the original in history without claiming consumption.
 
 - **HARNESS-1** an open agent is listed once by agents() and found by agent(id); one never opened is neither
 - **HARNESS-2** a command to an agent the port doesn't know is refused NoSession

@@ -18,6 +18,7 @@ function identity(value: unknown): Me | null {
     hostname: v.hostname,
   };
   if (v.kind === null || ["owner", "user", "pat", "agent", "job", "peer"].includes(String(v.kind))) me.kind = v.kind as Me["kind"];
+  if (v.authenticated && typeof v.mail_scope === "string" && v.mail_scope.length > 0) me.mail_scope = v.mail_scope;
   if (typeof v.public_url === "string") me.public_url = v.public_url;
   if (v.pages_url === null || typeof v.pages_url === "string") me.pages_url = v.pages_url;
   if (Array.isArray(v.origins) && v.origins.every((s) => typeof s === "string")) me.origins = v.origins;

@@ -11,15 +11,18 @@
 //!
 //! An agent that waits is in a turn, and what's queued for it waits behind that turn. A message
 //! another agent sent it doesn't: its wait returns as soon as one is in its queue ([`mail`]), and
-//! `agents.wait` hands it over then (`super::ops`), to the turn the wait began in only, each message
-//! once, as many as one answer holds.
+//! `agents.wait` registers an exact bounded response (`super::ops`) for that original turn. Source
+//! queue bodies and input leases remain until native tool-result delivery is proven.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::Digest as _;
 
 use super::model::Status;
 use super::session::Info;
@@ -32,9 +35,6 @@ pub const DEFAULT: Duration = Duration::from_secs(300);
 /// How long a message an agent was sent counts as on its way when its harness never says its turn
 /// ended (one idle with nothing queued that long has taken it).
 const ON_ITS_WAY: Duration = Duration::from_secs(30);
-/// How often a wait reads the agents again without an event of theirs.
-const RECHECK: Duration = Duration::from_secs(5);
-
 /// Messages sent to agents and not yet answered: how the agent's last turn had ended when it went
 /// (its `last_turn.at`), and when it went.
 static SENT: LazyLock<Mutex<HashMap<String, (Option<i64>, Instant)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -43,13 +43,9 @@ static SENT: LazyLock<Mutex<HashMap<String, (Option<i64>, Instant)>>> = LazyLock
 /// wait for the next wait, or the turn's end (one longer than that on its own, too).
 const HAND_MAX: usize = 16;
 const HAND_BYTES: usize = 48 * 1024;
-/// How long a message handed over is remembered: the server's view of the queue, a moment behind,
-/// doesn't hand it over again.
-const HANDED_FOR: Duration = Duration::from_secs(120);
-/// The most handed over remembered at once.
-const HANDED_MAX: usize = 4096;
-/// The messages handed over lately, by id, and when.
-static HANDED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Only concurrent response assembly is claimed here. Durable source handoff metadata, not a
+/// timed server cache, owns duplicate delivery and native result proof.
+static CLAIMED: LazyLock<Mutex<HashMap<String, HashSet<String>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Agent `id` was just sent a message (or started with a prompt): `last_turn` is how its last turn
 /// had ended then.
@@ -178,6 +174,40 @@ impl Waiter {
     pub fn of(hub: &Hub, id: &str) -> Self {
         Self { id: id.to_owned(), turn: hub.harness.info(id).and_then(|i| i.turn_started) }
     }
+
+    pub(super) fn turn(&self) -> Option<i64> { self.turn }
+}
+
+/// The source verifier uses this same schema and byte order, independent of JSON object key
+/// insertion order. Only this subtree is proven; outer wait status and timing are not mail.
+pub(super) fn handoff_digest(handoff: &str, turn: Option<i64>, messages: &[Value]) -> Result<String, super::state_reads::Failure> {
+    use super::state_reads::Failure;
+    if handoff.is_empty() || messages.is_empty() || messages.len() > HAND_MAX { return Err(Failure::Malformed); }
+    #[derive(Serialize)]
+    struct Message<'a> { id: &'a str, from: &'a str, name: Option<&'a str>, text: &'a str, at: i64 }
+    #[derive(Serialize)]
+    struct Response<'a> { handoff: &'a str, turn: Option<i64>, messages: Vec<Message<'a>> }
+    let mut canonical = Vec::new();
+    canonical.try_reserve_exact(messages.len()).map_err(|_| Failure::Source(super::state_view::Error::Budget))?;
+    for message in messages {
+        let object = message.as_object().ok_or(Failure::Malformed)?;
+        if object.len() != 5 { return Err(Failure::Malformed); }
+        let text = |key: &str| object.get(key).and_then(Value::as_str).ok_or(Failure::Malformed);
+        let name = match object.get("name") { Some(Value::Null) => None, Some(Value::String(name)) => Some(name.as_str()), _ => return Err(Failure::Malformed) };
+        canonical.push(Message { id: text("id")?, from: text("from")?, name, text: text("text")?, at: object.get("at").and_then(Value::as_i64).ok_or(Failure::Malformed)? });
+    }
+    struct Hasher { digest: sha2::Sha256, bytes: usize }
+    impl Write for Hasher {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self.bytes.checked_add(bytes.len()).filter(|size| *size <= super::state_view::FRAME).ok_or_else(|| std::io::Error::other("handoff response budget"))?;
+            self.digest.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut hash = Hasher { digest: sha2::Sha256::new(), bytes: 0 };
+    serde_json::to_writer(&mut hash, &Response { handoff, turn, messages: canonical }).map_err(|_| Failure::Source(super::state_view::Error::Budget))?;
+    Ok(hex::encode(hash.digest.finalize()))
 }
 
 /// One wait checks each source queue revision once. A failed check remains uncertain and does
@@ -232,12 +262,12 @@ pub fn mail(waiter: &Waiter, info: &Info) -> Vec<String> {
 /// A single index page contributes to the same existing handoff count and text-byte budget.
 pub(super) fn mail_page(waiter: &Waiter, info: &Info, queue: &[super::queued::Queued], out: &mut Vec<String>, bytes: &mut usize) -> bool {
     if info.status != Status::Running || info.turn_started != waiter.turn { return true; }
-    let handed = HANDED.lock();
+    let claimed = CLAIMED.lock();
     for q in queue {
         if out.len() >= HAND_MAX {
             return true;
         }
-        let ok = super::queued::sender_of(&q.id).is_some_and(|from| from != waiter.id) && !handed.contains_key(&q.id) && !out.contains(&q.id) && bytes.saturating_add(q.len) <= HAND_BYTES;
+        let ok = super::queued::sender_of(&q.id).is_some_and(|from| from != waiter.id) && !claimed.get(&waiter.id).is_some_and(|ids| ids.contains(&q.id)) && !out.contains(&q.id) && bytes.saturating_add(q.len) <= HAND_BYTES;
         if ok {
             *bytes = bytes.saturating_add(q.len);
             out.push(q.id.clone());
@@ -246,43 +276,30 @@ pub(super) fn mail_page(waiter: &Waiter, info: &Info, queue: &[super::queued::Qu
     out.len() >= HAND_MAX
 }
 
-/// Takes message `id` for one wait to hand over: false when it's handed over already (by a wait
-/// beside this one, or one a moment ago).
-pub fn claim(id: &str) -> bool {
-    claim_for(id).is_some()
-}
+pub(super) struct Claim { owner: String, id: String }
 
-pub(super) struct Claim<'a> { id: &'a str, at: Instant }
-
-impl Claim<'_> {
-    /// A definite source refusal permits another wait to try; an uncertain removal does not.
-    pub fn release(self) {
-        let mut handed = HANDED.lock();
-        if handed.get(self.id) == Some(&self.at) { handed.remove(self.id); }
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut claimed = CLAIMED.lock();
+        if claimed.get_mut(&self.owner).is_some_and(|ids| { ids.remove(&self.id); ids.is_empty() }) { claimed.remove(&self.owner); }
     }
 }
 
-pub(super) fn claim_for(id: &str) -> Option<Claim<'_>> {
-    let mut g = HANDED.lock();
-    g.retain(|_, at| at.elapsed() < HANDED_FOR);
-    if g.len() >= HANDED_MAX || g.contains_key(id) {
-        return None;
-    }
-    let at = Instant::now();
-    g.insert(id.to_owned(), at);
-    Some(Claim { id, at })
+pub(super) fn claim_for(waiter: &Waiter, id: &str) -> Option<Claim> {
+    if !CLAIMED.lock().entry(waiter.id.clone()).or_default().insert(id.to_owned()) { return None; }
+    Some(Claim { owner: waiter.id.clone(), id: id.to_owned() })
 }
 
 /// Wait up to `timeout` (at most [`MAX`]) for agents `ids` to stand where `until` says (all of
 /// them, or with `any` the first), then say where each stands. An agent that's gone (closed) has
 /// ended. `waiter`, the agent that waits, if one does: the wait ends early once a message from
 /// another agent waits behind its turn ([`mail`]).
-#[allow(clippy::disallowed_methods)] // (e) agents.wait looks again at RECHECK when its events can't be had
+#[allow(clippy::disallowed_methods)] // The protocol deadline still bounds a wait whose event channel is unavailable.
 pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: Duration, waiter: Option<&Waiter>) -> Value {
     // Listening before the first look: a change between the two isn't missed. An agent's info changing,
     // or its end, is on its owner's lane of the sessions' events (`Hub::harness_events`; goal 4, plan
     // 01a1a59c2a9c step 5), each lane holding its share of what the hub's ring held. None to be had (the
-    // runtime's channels all in use): it looks again at each `RECHECK`.
+    // runtime's channels all in use): only the final protocol deadline triggers another snapshot.
     let mut events = hub.harness_events.subscribe(crate::hub::EVENTS.div_ceil(hub.harness_events.lanes())).ok();
     let started = Instant::now();
     let timeout = timeout.min(MAX);
@@ -310,8 +327,7 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
         let (mut now, mut done) = snapshot();
         let mut waiter_info = waiter.and_then(|w| hub.harness.info(&w.id));
         let mut mailed = waiter.zip(waiter_info.as_ref()).is_some_and(|(w, i)| !mail(w, i).is_empty());
-        if !done && !mailed {
-            if let Some((w, info, revision)) = waiter.zip(waiter_info.as_ref()).and_then(|(w, i)| mail_probe.needed(w, i).map(|r| (w, i, r.to_owned()))) {
+        if !done && !mailed && let Some((w, info, revision)) = waiter.zip(waiter_info.as_ref()).and_then(|(w, i)| mail_probe.needed(w, i).map(|r| (w, i, r.to_owned()))) {
                 let remaining = timeout.saturating_sub(started.elapsed());
                 if !remaining.is_zero() {
                     let result = crate::rt::timeout(remaining, super::state_reads::has_mail(hub, w, info)).await.unwrap_or(Err(super::state_reads::Failure::TimedOut));
@@ -324,7 +340,6 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
                         !mail(w, i).is_empty() || (found && i.status == Status::Running && i.turn_started == w.turn && i.queue_revision.as_deref() == Some(revision.as_str()))
                     });
                 }
-            }
         }
         let elapsed = started.elapsed();
         if done || mailed || elapsed >= timeout {
@@ -337,11 +352,7 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
                 "until": if until == Until::Settled { "settled" } else { "change" },
                 "agents": agents,
             });
-            if !mailed {
-                if let Some(error) = waiter.zip(waiter_info.as_ref()).and_then(|(w, i)| mail_probe.unresolved(w, i)) {
-                    if let Some(o) = said.as_object_mut() { o.insert("mail_read_error".into(), json!(error)); }
-                }
-            }
+            if !mailed && let Some(error) = waiter.zip(waiter_info.as_ref()).and_then(|(w, i)| mail_probe.unresolved(w, i)) && let Some(o) = said.as_object_mut() { o.insert("mail_read_error".into(), json!(error)); }
             #[cfg(test)]
             if let Some(o) = said.as_object_mut() {
                 o.insert("looks".into(), json!(looks));
@@ -349,8 +360,8 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
             }
             return said;
         }
-        // An event of theirs (or the waiter's: a message in its queue), or the next look anyway.
-        let next = Instant::now() + RECHECK.min(timeout.saturating_sub(elapsed));
+        // Owner events wake the predicate; the only timer is the caller's final deadline.
+        let next = started + timeout;
         loop {
             let rest = next.saturating_duration_since(Instant::now());
             if rest.is_zero() {
@@ -392,6 +403,21 @@ mod tests {
     }
 
     #[test]
+    fn a_quiet_wait_has_only_its_initial_and_final_snapshot() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("fixture".into());
+            hub.harness.ingest(&there, "quiet", crate::harness::core::Update::Open { info: Box::new(info("quiet", Status::Running)), since: None }).await;
+            // Cross the former five-second sampling interval without any owner event.
+            let result = wait(&hub, &["quiet".into()], Until::Settled, false, Duration::from_secs(6), None).await;
+            assert_eq!(result.get("timed_out"), Some(&json!(true)));
+            assert_eq!(result.get("heard"), Some(&json!(0)));
+            assert_eq!(result.get("looks"), Some(&json!(2)));
+            Ok(())
+        })
+    }
+
+    #[test]
     fn where_an_agent_stands_in_a_word() {
         assert_eq!(stand(&info("w1", Status::Running)), "working");
         assert_eq!(stand(&info("w2", Status::Starting)), "working");
@@ -424,6 +450,52 @@ mod tests {
         assert_eq!(stand(&agent), "working", "an empty approval array needs no answer");
         agent.deferred.insert("approvals".into(), Descriptor { kind: Kind::Text, len: 1 });
         assert_eq!(stand(&agent), "working", "only an array descriptor counts approvals");
+    }
+
+    #[test]
+    fn handoff_digest_binds_exact_response_and_normalizes_object_order() -> anyhow::Result<()> {
+        let message = json!({"id":"original-1","from":"peer-1","name":null,"text":"exact 日本語 \"\\\nbody","at":7});
+        let reordered: Value = serde_json::from_str(r#"{"at":7,"text":"exact 日本語 \"\\\nbody","name":null,"from":"peer-1","id":"original-1"}"#)?;
+        let digest = handoff_digest("handoff-1", Some(100), std::slice::from_ref(&message)).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(digest,"4f321f0d9414582e25d29dc364893ae2ea6caaf760b4335853894ba7706329d8");
+        assert_eq!(handoff_digest("handoff-1",Some(100),&[reordered]),Ok(digest.clone()));
+        for (key,value) in [("id",json!("other-id")),("from",json!("other-peer")),("name",json!("new name")),("text",json!("different original")),("at",json!(8))] {
+            let mut changed=message.clone();
+            changed.as_object_mut().ok_or_else(||anyhow::anyhow!("message is not an object"))?.insert(key.into(),value);
+            assert_ne!(handoff_digest("handoff-1",Some(100),&[changed]),Ok(digest.clone()),"{key} is part of the proof");
+        }
+        assert_ne!(handoff_digest("other-handoff",Some(100),std::slice::from_ref(&message)),Ok(digest.clone()));
+        assert_ne!(handoff_digest("handoff-1",Some(101),std::slice::from_ref(&message)),Ok(digest));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_or_oversized_handoff_payload_is_not_a_digest() {
+        use super::super::state_reads::Failure;
+        let message=json!({"id":"original","from":"peer","name":null,"text":"body","at":1});
+        assert_eq!(handoff_digest("",Some(1),std::slice::from_ref(&message)),Err(Failure::Malformed));
+        assert_eq!(handoff_digest("handoff",Some(1),&[]),Err(Failure::Malformed));
+        assert_eq!(handoff_digest("handoff",Some(1),&vec![message;HAND_MAX+1]),Err(Failure::Malformed));
+        assert_eq!(handoff_digest("handoff",Some(1),&[json!({"id":"original","from":"peer","name":null,"text":"body","at":1,"extra":"unproven"})]),Err(Failure::Malformed));
+        assert_eq!(handoff_digest("handoff",Some(1),&[json!({"id":"original","from":"peer","name":false,"text":"body","at":1})]),Err(Failure::Malformed));
+        let huge=json!({"id":"original","from":"peer","name":null,"text":"\"".repeat(super::super::state_view::FRAME),"at":1});
+        assert_eq!(handoff_digest("handoff",Some(1),&[huge]),Err(Failure::Source(super::super::state_view::Error::Budget)));
+    }
+
+    #[test]
+    fn concurrent_handoff_claims_are_recipient_scoped_and_end_with_request() -> anyhow::Result<()> {
+        let a=Waiter { id:"claim-owner-a".into(),turn:Some(1) };
+        let b=Waiter { id:"claim-owner-b".into(),turn:Some(1) };
+        let first=claim_for(&a,"same-original").ok_or_else(||anyhow::anyhow!("no first claim"))?;
+        assert!(claim_for(&a,"same-original").is_none());
+        let second=claim_for(&b,"same-original").ok_or_else(||anyhow::anyhow!("another recipient was blocked"))?;
+        drop(first);
+        assert!(!CLAIMED.lock().contains_key(&a.id));
+        assert!(claim_for(&a,"same-original").is_some(),"request cancellation releases only the transient claim");
+        assert!(claim_for(&b,"same-original").is_none());
+        drop(second);
+        assert!(!CLAIMED.lock().contains_key(&b.id));
+        Ok(())
     }
 
     #[test]
@@ -479,7 +551,7 @@ mod tests {
         let mut probe = MailProbe::Unchecked;
         assert!(probe.record("suffix-revision".into(), Ok(!out.is_empty())), "positive suffix metadata ends the wait");
         assert_eq!(out, [peer.clone()]);
-        assert!(!HANDED.lock().contains_key(&peer), "only the existing handoff path claims mail");
+        assert!(!CLAIMED.lock().get(&waiter.id).is_some_and(|ids| ids.contains(&peer)), "only the existing handoff path claims mail");
     }
 
     /// Attention plan 01a199e1b177: queued input and admission wait are work still to take up.
@@ -675,8 +747,11 @@ mod tests {
         let big = from_agent("01a1peer000000000000000000000000");
         assert_eq!(mail(&waiter, &at_work(vec![Queued::of(&big, &long), Queued::of(&peer, "the registry passes")])), std::slice::from_ref(&peer));
         // Each once: taken by one wait, it isn't another's, nor again while kiln's view lags.
-        assert!(claim(&peer) && !claim(&peer));
+        let claimed = claim_for(&waiter, &peer);
+        assert!(claimed.is_some() && claim_for(&waiter, &peer).is_none());
         assert!(mail(&waiter, &info).is_empty(), "handed over already");
+        drop(claimed);
+        assert_eq!(mail(&waiter, &info), [peer], "the source, not a timed server cache, owns delivery proof after response assembly");
     }
 
     /// An agent in a long wait for a child at work: a message from a person in its queue leaves the
@@ -712,7 +787,7 @@ mod tests {
                 // Not the waiter's own: it isn't woken by another's queue.
                 let other = wait(&hub, &ids, Until::Settled, false, Duration::from_millis(300), None).await;
                 anyhow::ensure!(other.get("timed_out") == Some(&json!(true)), "{other}");
-                // Coming during the wait: woken by it (its queue's change, an event), not the next look ([`RECHECK`]): told
+                // Coming during the wait: woken by it (its queue's change, an event), before the final deadline: told
                 // by what woke it, not by its time, which a loaded machine stretches past the next look's.
                 hub.harness.ingest(&there, "waiter", queue(vec![])).await;
                 let (woken, ()) = futures::join!(wait(&hub, &ids, Until::Settled, false, Duration::from_secs(30), Some(&me)), async {

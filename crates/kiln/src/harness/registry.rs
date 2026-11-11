@@ -1381,6 +1381,10 @@ pub(crate) fn again_for(r: &inbox::Refusal) -> Option<u64> {
 /// How a command fared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sent {
+    /// The server committed custody; this is not receiver admission or model consumption.
+    Published(super::mail::Receipt),
+    /// Custody was not accepted. The original sender must retain its complete communication.
+    PublicationRefused(super::mail::Error),
     /// On its way to the session's machine, which can't say more: a message whose inbox's answer
     /// didn't come in time, or a command or message to a runner from before the channel (or from
     /// before inboxes). Also what kiln does here itself (a name kept).
@@ -1453,6 +1457,10 @@ impl Sent {
         use crate::wire::channel::Refusal as Code;
         use http::StatusCode;
         match self {
+            Self::Published(_) => None,
+            Self::PublicationRefused(error) => {
+                Some((error.status_code(), serde_json::to_string(error).unwrap_or_else(|_| "communication custody was not accepted".into())))
+            }
             Self::Ok | Self::Accepted(_) | Self::Taken | Self::Parked => None,
             Self::Refused(r) => Some((StatusCode::CONFLICT, r.to_string())),
             Self::Rejected { code: Code::Unknown, why } => Some((StatusCode::NOT_FOUND, format!("its runner doesn't have it: {why}"))),
@@ -1670,22 +1678,32 @@ fn changes_patch(was: &Value, now: &Value) -> Option<String> {
     changes_patch_of(&was, &now).map(|(set, gone)| write::string(256, |b| write::changes_patch(b, &set, &gone, None)))
 }
 
-/// A file uploaded for a message, kept briefly until the message is sent.
-#[derive(Clone)]
+/// Immutable metadata for a durable uploaded file. Non-CAS namespace keys pin both objects
+/// through the existing Blobs store; no registry lifetime/TTL cache owns accepted file bytes.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Upload {
     name: String,
     mime: String,
-    data: bytes::Bytes,
-    at: std::time::Instant,
-    /// When a message first carried it: kept after, so a message sent again (its answer lost, or
-    /// sent once more for the epoch its session is at) carries it too, and reads as the same
-    /// message (CP-T3.2).
-    sent: Option<std::time::Instant>,
+    size: u64,
+    sha256: String,
 }
 
-/// Uploads kept at most this long, and this much in all.
-const UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-const UPLOADS_MAX: usize = 512 << 20;
+impl Upload {
+    fn bytes(id: &str) -> String { format!("attachments/uploads/{id}") }
+    fn metadata(id: &str) -> String { format!("attachments/uploads/{id}.json") }
+}
+
+fn upload_refused(error: kiln_seams::blobs::Refusal) -> super::mail::Error {
+    use kiln_seams::blobs::Refusal;
+    match error {
+        Refusal::Full { .. } => super::mail::Error::StorageFull,
+        Refusal::TooLarge { .. } => super::mail::Error::TooLarge { revision: 0, budget: usize::try_from(super::host::ATTACHMENT_MAX).unwrap_or(usize::MAX) },
+        Refusal::Invalid { .. } | Refusal::PreconditionFailed(_) => super::mail::Error::Invalid { reason: "attachment identity or content is invalid; custody was not accepted".into() },
+        Refusal::NotFound(_) => super::mail::Error::Unavailable { reason: "the original attachment is unavailable; keep its original bytes and upload it again before sending".into() },
+        Refusal::BadChecksum { .. } | Refusal::InvalidRange { .. } | Refusal::NoSuchUpload(_) | Refusal::BadParts(_) | Refusal::Expired | Refusal::Forbidden(_) | Refusal::Unavailable(_) => super::mail::Error::Unavailable { reason: "the original attachment could not be stored or verified; its communication remains held".into() },
+    }
+}
+
 /// Pieces a file is sent to a machine in (lane frames are bounded).
 const FILE_CHUNK: usize = 512 * 1024;
 
@@ -1713,10 +1731,6 @@ pub struct Registry {
     sessions: Copies,
     /// The bus each session's live feed rides (`super::live`).
     bus: Arc<dyn kiln_seams::Bus>,
-    /// Files uploaded for messages, by id. This and the registry's other maps but three are copies
-    /// read without a lock and changed by swapping a new copy in whole (`crate::rcu`; goal 5, plan
-    /// 01a1a59c2aae step 2): a session's updates, on the shard that owns its copy, read them.
-    uploads: Rcu<HashMap<String, Upload>>,
     /// What each machine offers ("local" included).
     kinds: Rcu<HashMap<String, Vec<KindInfo>>>,
     /// The server's own sessions.
@@ -1754,6 +1768,8 @@ pub struct Registry {
     keep_off: Rcu<std::collections::HashSet<String>>,
     /// The UI's commands by the ids their clients made, each taken once (`super::asked`).
     pub asked: super::asked::Asked,
+    /// One event pump over committed communication custody, with no blocked-body task list.
+    pub mail_delivery: super::mail_delivery::Relay,
     /// Which of its machine's runner processes holds each session on a machine (its instance:
     /// `main`, a uuid, `legacy`), kept in `holders.json` so it holds across restarts: a process
     /// that says what it holds speaks for its own sessions, never for another's that is away
@@ -1949,7 +1965,6 @@ impl Registry {
         Self {
             sessions,
             bus,
-            uploads: Rcu::default(),
             kinds: Rcu::default(),
             local,
             convo,
@@ -1965,6 +1980,7 @@ impl Registry {
             names: Rcu::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             keep_off: Rcu::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             asked: super::asked::Asked::default(),
+            mail_delivery: super::mail_delivery::Relay::default(),
             holders: Arc::new(Rcu::new(std::fs::read(dir.join("holders.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default())),
             holders_saving: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             holders_writing: Arc::new(Mutex::new(())),
@@ -2449,6 +2465,13 @@ impl Registry {
         let mut turns = crate::rt::Turns::new();
         loop {
             let Ok(said) = rx.recv().await else { return Ok(()) };
+            if let super::session::Local::Said(id, Update::MailFlow { event }) = &said {
+                if hub.harness.location(id) == Some(Location::Local)
+                    && let Err(error) = super::mail_delivery::flow(&hub, id, Location::Local, (**event).clone()).await
+                { tracing::warn!(session = %id, error = %error, "local communication receipt remains unacknowledged"); }
+                turns.end().await;
+                continue;
+            }
             let lifecycle = match &said {
                 super::session::Local::Said(id, Update::Open { .. } | Update::Closed) | super::session::Local::Gone(id) => Some(id.clone()),
                 _ => None,
@@ -2457,6 +2480,7 @@ impl Registry {
             if let Some(id) = lifecycle {
                 // W20-R01: restored, moved or closed local sessions get their current skill scope.
                 hub.harness.applied(&id).await;
+                hub.harness.mail_delivery.changed();
                 let h = Arc::clone(&hub);
                 crate::rt::spawn(async move { crate::api::boxed(|| crate::skills::sync(&h)).await });
             }
@@ -2773,6 +2797,7 @@ impl Registry {
     fn prepare(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) -> Option<Ingest> {
         // What became of a message: for whoever waits for it, wherever it was taken or refused.
         let u = match u {
+            Update::MailFlow { .. } => return None,
             Update::Inbox { said } => {
                 self.answered(id, *said);
                 return None;
@@ -2900,6 +2925,7 @@ impl Registry {
         // Its info changed as its pages see it: the events socket is told, its frame made of the bytes its
         // view encoded the info as (goal 10, plan 01a1a87b2dae step 5: it was encoded again for the socket).
         let mut changed = false;
+        let mut opened_lifecycle = false;
         // What of its info attention reads, before this update (`super::attention::signature`).
         let attention_before = s.get(id).map(|m| super::attention::signature(&m.info));
         // The same meta again (a harness says it at each turn): nothing to keep, encode or send.
@@ -2927,6 +2953,7 @@ impl Registry {
             && !held
         {
             let old = s.get(id);
+            opened_lifecycle = old.is_some_and(|m| m.info.status != info.status);
             // A runner that started again goes on from what this copy has of the same epoch:
             // its events through `since` stay; what's after them comes again.
             let keep = since.filter(|_| old.is_some_and(|m| m.info.epoch == info.epoch));
@@ -2956,6 +2983,12 @@ impl Registry {
             // Its machine announced it: what it reports from now on counts.
             m.opened_at = None;
             m.info = Arc::new(info);
+            // W20-R01: the owner's Open is newer than the disconnected overlay left on its
+            // cached State. Reconcile lifecycle without inventing a State or replacing details.
+            if m.state.is_object() && m.state.get::<Status>("status") != Some(m.info.status) {
+                opened_lifecycle = true;
+                Arc::make_mut(&mut m.state).set("status", &json!(m.info.status));
+            }
             m.reported = reported;
             m.location = Arc::new(from.clone());
             match keep {
@@ -3086,7 +3119,7 @@ impl Registry {
                 }
             }
             // An inbox's answer went to whoever waits for it, before any of this.
-            Update::Reply { .. } | Update::Inbox { .. } => {}
+            Update::Reply { .. } | Update::Inbox { .. } | Update::MailFlow { .. } => {}
             Update::Closed => {
                 gone = true;
                 // Its identities with it (docs/ci.md W27-R01).
@@ -3299,7 +3332,18 @@ impl Registry {
         } else {
             m.commit(|m| match &u {
                 _ if resync => Some(super::copies::payload_of(super::live::RESYNC, 0)),
+                Update::Open { since: Some(_), .. } if m.state.is_object() => m.state_frame(),
+                Update::Open { since: Some(_), .. } if opened_lifecycle => {
+                    // A header can precede the first State. Existing resumed carries it without
+                    // resetting the viewer's retained timeline or manufacturing default details.
+                    let info = serde_json::to_value(&*m.info).unwrap_or(Value::Null);
+                    let text = crate::wire::ui::SessionDown { frame: crate::wire::ui::SessionFrame::Resumed { info, born: Some(born()) }, rev: Some(m.rev) }.text();
+                    Some(super::copies::payload_of(&text, m.rev))
+                }
                 Update::Open { since: Some(_), .. } => None,
+                // A full Open starts the timeline over. Reattach to the coherent copy so an
+                // older viewer cannot retain its disconnected State while new details wait.
+                Update::Open { since: None, .. } if opened_lifecycle && m.state.is_object() => Some(super::copies::payload_of(super::live::RESYNC, 0)),
                 Update::State { .. } => m.state_frame(),
                 Update::Changes { .. } | Update::ChangesPatch { .. } => m.changes_frame(),
                 Update::Meta { .. } if meta_same => None,
@@ -3691,6 +3735,7 @@ impl Registry {
 
     /// The machine went away: its sessions keep running there and come back when it reconnects.
     pub async fn machine_lost(&self, hub: &Hub, machine: &str) {
+        self.mail_delivery.changed();
         self.streams.machine_lost(machine, &hub.shown(machine));
         self.ports.machine_lost(machine);
         let at = Location::Machine(machine.to_owned());
@@ -3705,6 +3750,7 @@ impl Registry {
     /// One runner process of a machine went away while another of the machine stays connected
     /// (see `crate::instances`): the sessions it held keep running there and come back with it.
     pub async fn sessions_lost(&self, hub: &Hub, ids: &[String]) {
+        self.mail_delivery.changed();
         let ids: Arc<std::collections::HashSet<String>> = Arc::new(ids.iter().cloned().collect());
         // A session at a time, as its owner's turns take them (goal 9, plan 01a1a87b2cec step 3: `Copies::on_each_session`).
         let infos: Vec<Info> = self.sessions.on_each_session(move |id, _| ids.contains(id), |s, id| s.get_mut(id).map(disconnected)).await;
@@ -3976,6 +4022,7 @@ impl Registry {
                     let info = Info {
                         id: id.clone(),
                         deferred: Default::default(), queue_partial: false, queue_revision: None, queue_next: None,
+                        admission: None,
                         kind: spec.kind.clone(),
                         kind_name: kind.map_or_else(|| spec.kind.clone(), |k| k.name.to_owned()),
                         target: loc.target(),
@@ -4070,147 +4117,146 @@ impl Registry {
         Ok(Claim { held: &self.opening, ids: ids.to_vec() })
     }
 
-    /// Keep an uploaded file for the messages that refer to it (by the returned id): until it
-    /// expires, also after a message carried it (one sent again carries it too). Short of room, the
-    /// files messages carried already go first, the oldest first.
-    pub fn upload(&self, name: String, mime: String, data: bytes::Bytes) -> anyhow::Result<String> {
+    /// Acknowledges an upload only after immutable bytes and their metadata have both committed.
+    /// A partial failure leaves the caller owning its original and never removes stored bytes.
+    pub async fn upload(&self, hub: &Hub, name: String, mime: String, data: bytes::Bytes) -> Result<String, super::mail::Error> {
+        use kiln_seams::blobs::{Cond, Put};
+        let unavailable = || super::mail::Error::Unavailable { reason: "attachment storage authority is unavailable; custody was not accepted".into() };
+        let size = u64::try_from(data.len()).map_err(|_| unavailable())?;
+        if size == 0 { return Err(super::mail::Error::Invalid { reason: "empty attachment".into() }); }
+        if size > super::host::ATTACHMENT_MAX { return Err(super::mail::Error::TooLarge { revision: 0, budget: usize::try_from(super::host::ATTACHMENT_MAX).map_err(|_| unavailable())? }); }
+        let (data, sha256, chunks) = crate::rt::blocking(move || {
+            let sha256 = crate::util::sha256_hex(&data);
+            let chunks = kiln_ci::store::cdc::cuts(&data).len();
+            (data, sha256, chunks)
+        }).await.map_err(|_| unavailable())?;
+        let metadata = Upload { name, mime, size, sha256 };
+        let encoded = super::state_view::encode(&metadata, super::state_view::FRAME).map_err(|_| super::mail::Error::TooLarge { revision: 0, budget: super::state_view::FRAME })?;
+        let metadata_chunks = kiln_ci::store::cdc::cuts(&encoded).len();
+        // LocalBlobs inserts each chunk and one object/key per blob; count both immutable puts.
+        let records = ["bytes-object", "bytes-key", "metadata-object", "metadata-key"];
+        let rows = chunks.checked_add(metadata_chunks).and_then(|n| n.checked_add(records.len())).and_then(|n| u64::try_from(n).ok()).ok_or_else(unavailable)?;
+        let payload = size.checked_add(u64::try_from(encoded.len()).map_err(|_| unavailable())?).ok_or_else(unavailable)?;
+        let reserve = hub.store.storage_reserve_tables(payload, vec!["blob_keys".into(), "cas_objects".into(), "cas_chunks".into()], rows).await.map_err(|_| unavailable())?;
+        let floor = super::mail_delivery::storage_floor(hub)?;
+        let path = hub.cfg.server.data_dir.clone();
+        let free = crate::rt::blocking(move || crate::os::disk_available(&path)).await.map_err(|_| unavailable())?.ok_or_else(unavailable)?;
+        let required = payload.checked_add(reserve).and_then(|n| n.checked_add(floor)).ok_or_else(unavailable)?;
+        if free < required { return Err(super::mail::Error::Capacity { required, authority: free }); }
         let id = crate::util::new_id();
-        let upload = Upload { name, mime, data, at: std::time::Instant::now(), sent: None };
-        let len = upload.data.len();
-        self.uploads.update(|g| {
-            g.retain(|_, u| u.at.elapsed() < UPLOAD_TTL);
-            let mut used: usize = g.values().map(|u| u.data.len()).sum();
-            if used.saturating_add(len) > UPLOADS_MAX {
-                let mut sent: Vec<(std::time::Instant, String)> = g.iter().filter_map(|(id, u)| u.sent.map(|t| (t, id.clone()))).collect();
-                sent.sort();
-                for (_, id) in sent {
-                    if used.saturating_add(len) <= UPLOADS_MAX {
-                        break;
-                    }
-                    if let Some(u) = g.remove(&id) {
-                        used = used.saturating_sub(u.data.len());
-                    }
-                }
-            }
-            if used.saturating_add(len) > UPLOADS_MAX {
-                anyhow::bail!("too many uploads waiting; send them first");
-            }
-            g.insert(id.clone(), upload.clone());
-            Ok(())
-        })?;
+        let kept = hub.blobs.blobs.put(&Upload::bytes(&id), data.to_vec(), Put { cond: Cond::IfNoneMatch, sha256: Some(metadata.sha256.clone()) }).await.map_err(upload_refused)?;
+        if kept.size != size || kept.etag != metadata.sha256 { return Err(unavailable()); }
+        let hash = crate::util::sha256_hex(&encoded);
+        let len = u64::try_from(encoded.len()).map_err(|_| unavailable())?;
+        let kept = hub.blobs.blobs.put(&Upload::metadata(&id), encoded, Put { cond: Cond::IfNoneMatch, sha256: Some(hash.clone()) }).await.map_err(upload_refused)?;
+        if kept.size != len || kept.etag != hash { return Err(unavailable()); }
         Ok(id)
     }
 
-    /// Upload `id`'s name, type and bytes, for a message that carries it: kept (marked sent), so a
-    /// message sent again carries it as well.
-    fn upload_of(&self, id: &str) -> Option<(String, String, bytes::Bytes)> {
-        // Marked sent the first time, a copy swapped in then; read off the copy.
-        if self.uploads.load().get(id)?.sent.is_none() {
-            let now = std::time::Instant::now();
-            self.uploads.update(|g| {
-                if let Some(u) = g.get_mut(id) {
-                    u.sent.get_or_insert(now);
+    async fn upload_of(&self, hub: &Hub, id: &str) -> Result<Upload, super::mail::Error> {
+        if !crate::util::is_id(id) { return Err(super::mail::Error::Invalid { reason: "invalid attachment identity".into() }); }
+        let (kept, encoded) = crate::blobs::io::get_all(hub.blobs.blobs.as_ref(), &Upload::metadata(id), super::state_view::FRAME as u64).await.map_err(upload_refused)?;
+        let invalid = || super::mail::Error::Unavailable { reason: "the original attachment metadata does not match its immutable bytes; communication remains held".into() };
+        if crate::util::sha256_hex(&encoded) != kept.etag { return Err(invalid()); }
+        let upload: Upload = serde_json::from_slice(&encoded).map_err(|_| invalid())?;
+        if upload.size == 0 || upload.size > super::host::ATTACHMENT_MAX { return Err(invalid()); }
+        let bytes = hub.blobs.blobs.head(&Upload::bytes(id)).await.map_err(upload_refused)?;
+        if bytes.size != upload.size || bytes.etag != upload.sha256 { return Err(invalid()); }
+        Ok(upload)
+    }
+
+    /// Preview the exact bounded wire command without transferring bytes or rewriting the
+    /// immutable original. New custody preflight reserves this shape; retries bypass lookup.
+    pub(super) async fn attachment_command(&self, hub: &Hub, recipient: &str, command: Command) -> Result<Command, super::mail::Error> {
+        use base64::Engine as _;
+        super::state_view::encode(&command, super::state_view::FRAME).map_err(|_| super::mail::Error::TooLarge { revision: 0, budget: super::state_view::FRAME })?;
+        let Command::Send { id, text, mode, attachments, overrides, reply_to, task } = command else { return Ok(command) };
+        let mut ready = Vec::new();
+        for (index, mut attachment) in attachments.into_iter().enumerate() {
+            if attachment.path.is_some() { return Err(super::mail::Error::Invalid { reason: "attachments require original bytes or a durable upload identity".into() }); }
+            let sha256 = match &attachment.file_id {
+                Some(file) => {
+                    if !attachment.data_base64.is_empty() { return Err(super::mail::Error::Invalid { reason: "attachment must name one complete original representation".into() }); }
+                    let upload = self.upload_of(hub, file).await?;
+                    if attachment.name.is_empty() { attachment.name = upload.name; }
+                    if attachment.mime.is_empty() { attachment.mime = upload.mime; }
+                    upload.sha256
                 }
-            });
+                None => {
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(attachment.data_base64.as_bytes()).map_err(|_| super::mail::Error::Invalid { reason: "attachment original is not valid base64".into() })?;
+                    if bytes.is_empty() || u64::try_from(bytes.len()).ok().is_none_or(|n| n > super::host::ATTACHMENT_MAX) { return Err(super::mail::Error::Invalid { reason: "attachment original is empty or exceeds its file limit".into() }); }
+                    crate::util::sha256_hex(&bytes)
+                }
+            };
+            attachment.file_id = Some(crate::util::derive_id(&["harness-attachment-v1", recipient, &id, &index.to_string(), &sha256]));
+            attachment.data_base64.clear();
+            ready.push(attachment);
         }
-        self.uploads.load().get(id).map(|u| (u.name.clone(), u.mime.clone(), u.data.clone()))
+        let command = Command::Send { id, text, mode, attachments: ready, overrides, reply_to, task };
+        super::state_view::encode(&command, super::state_view::FRAME).map_err(|_| super::mail::Error::TooLarge { revision: 0, budget: super::state_view::FRAME })?;
+        Ok(command)
     }
 
-    /// Attachments that refer to uploads, with the uploads' bytes in them instead: what one
-    /// message to many agents carries to each. One whose upload is gone (expired, let go for room,
-    /// or the server started again) keeps its name without its bytes, as [`Registry::route_attachments`]
-    /// does: the message is the one it was, so sent again under its key it's answered as its repeat
-    /// where it was taken (CP-T3.2, the twenty-second adversarial check's).
-    pub fn inline_uploads(&self, attachments: Vec<super::model::Attachment>) -> Vec<super::model::Attachment> {
+    /// Transfer bounded verified pieces before dispatch; retry identity is derived from immutable
+    /// recipient/message/index/content. Missing or corrupt files never become a name-only send.
+    pub(super) async fn route_attachments(&self, hub: &Hub, id: &str, loc: &Location, c: Command) -> Result<Command, Sent> {
         use base64::Engine as _;
-        let b64 = base64::engine::general_purpose::STANDARD;
-        attachments
-            .into_iter()
-            .filter_map(|mut a| {
-                a.path = None;
-                let Some(fid) = a.file_id.take() else { return (!a.data_base64.is_empty()).then_some(a) };
-                let Some((name, mime, data)) = self.upload_of(&fid) else {
-                    a.data_base64.clear();
-                    return (!a.name.is_empty()).then_some(a);
-                };
-                if a.name.is_empty() {
-                    a.name = name;
-                }
-                if a.mime.is_empty() {
-                    a.mime = mime;
-                }
-                a.data_base64 = b64.encode(&data);
-                Some(a)
-            })
-            .collect()
-    }
-
-    /// A message's attachments, made ready for where the session runs: uploads resolved, and
-    /// for a machine, every file sent ahead in pieces (the message then refers to them by id).
-    async fn route_attachments(&self, hub: &Hub, id: &str, loc: &Location, c: Command) -> Result<Command, Sent> {
-        use base64::Engine as _;
+        use sha2::Digest as _;
+        super::state_view::encode(&c, super::state_view::FRAME).map_err(|_| Sent::PublicationRefused(super::mail::Error::TooLarge { revision: 0, budget: super::state_view::FRAME }))?;
         let Command::Send { id: mid, text, mode, attachments, overrides, reply_to, task } = c else { return Ok(c) };
-        if attachments.is_empty() {
-            return Ok(Command::Send { id: mid, text, mode, attachments, overrides, reply_to, task });
-        }
-        let b64 = base64::engine::general_purpose::STANDARD;
+        let waiting = || Sent::PublicationRefused(super::mail::Error::Unavailable { reason: "the complete original attachment is waiting for verified storage at its owner".into() });
         let mut out = Vec::new();
-        for mut a in attachments {
-            a.path = None;
-            // The bytes: inline, or an upload.
-            let data: Option<bytes::Bytes> = match a.file_id.take().and_then(|f| self.upload_of(&f)) {
-                Some((name, mime, data)) => {
-                    if a.name.is_empty() {
-                        a.name = name;
-                    }
-                    if a.mime.is_empty() {
-                        a.mime = mime;
-                    }
-                    Some(data)
+        for (index, mut a) in attachments.into_iter().enumerate() {
+            if a.path.is_some() { return Err(waiting()); }
+            let (size, sha256, key, inline) = match &a.file_id {
+                Some(file) => {
+                    let upload = self.upload_of(hub, file).await.map_err(Sent::PublicationRefused)?;
+                    if a.name.is_empty() { a.name = upload.name; }
+                    if a.mime.is_empty() { a.mime = upload.mime; }
+                    (upload.size, upload.sha256, Some(Upload::bytes(file)), Vec::new())
                 }
-                None => b64.decode(a.data_base64.as_bytes()).ok().map(bytes::Bytes::from),
+                None => {
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(a.data_base64.as_bytes()).map_err(|_| waiting())?;
+                    let size = u64::try_from(bytes.len()).map_err(|_| waiting())?;
+                    let sha256 = crate::util::sha256_hex(&bytes);
+                    (size, sha256, None, bytes)
+                }
             };
-            let Some(data) = data.filter(|d| !d.is_empty()) else {
-                // Its upload is gone (the server started again, or let it go for room or age): its
-                // name still goes, so the message is the one it was (CP-T3.2, the twenty-second
-                // adversarial check's). Sent again after its first try was taken, it's answered as
-                // its repeat, never refused as another message under its id (whose Retry would be a
-                // second prompt). New, it goes without the file, which its runner leaves out, said.
-                a.data_base64.clear();
-                out.push(a);
-                continue;
-            };
-            match loc {
-                Location::Local => {
-                    let fid = crate::util::new_id();
-                    let (host, sid, f) = (Arc::clone(&self.local), id.to_owned(), fid.clone());
-                    let stored = crate::rt::blocking(move || host.receive(&sid, &f, 0, &data, true)).await;
-                    if !matches!(stored, Ok(Ok(()))) {
-                        continue;
+            if size == 0 || size > super::host::ATTACHMENT_MAX { return Err(waiting()); }
+            let fid = crate::util::derive_id(&["harness-attachment-v1", id, &mid, &index.to_string(), &sha256]);
+            let mut hash = sha2::Sha256::new();
+            let mut offset = 0u64;
+            while offset < size {
+                let end = offset.checked_add(FILE_CHUNK as u64).ok_or_else(waiting)?.min(size);
+                let data = match &key {
+                    Some(key) => {
+                        let (meta, bytes) = hub.blobs.blobs.get(key, Some(kiln_seams::blobs::Range { start: offset, end: end.checked_sub(1) })).await.map_err(|e| Sent::PublicationRefused(upload_refused(e)))?;
+                        if meta.etag != sha256 || meta.size != size { return Err(waiting()); }
+                        bytes
                     }
-                    a.data_base64.clear();
-                    a.file_id = Some(fid);
-                }
-                Location::Machine(machine) => {
-                    let fid = crate::util::new_id();
-                    let total = data.len();
-                    let mut offset = 0usize;
-                    while offset < total || total == 0 {
-                        let end = (offset + FILE_CHUNK).min(total);
-                        let piece = data.get(offset..end).map(<[u8]>::to_vec).unwrap_or_default();
-                        let msg = ServerMsg::HarnessFile { session: id.to_owned(), file: fid.clone(), offset: offset as u64, data: piece, done: end >= total };
-                        if !hub.send_to_agent(machine, LANE_TERM, &msg).await {
-                            return Err(Sent::Unreachable);
-                        }
-                        offset = end;
-                        if end >= total {
-                            break;
-                        }
+                    None => inline.get(usize::try_from(offset).map_err(|_| waiting())?..usize::try_from(end).map_err(|_| waiting())?).ok_or_else(waiting)?.to_vec(),
+                };
+                if u64::try_from(data.len()).ok() != end.checked_sub(offset) { return Err(waiting()); }
+                hash.update(&data);
+                let done = end == size;
+                if done && hex::encode(hash.clone().finalize()) != sha256 { return Err(waiting()); }
+                match loc {
+                    Location::Local => {
+                        let (host, sid, file) = (Arc::clone(&self.local), id.to_owned(), fid.clone());
+                        if !matches!(crate::rt::blocking(move || host.receive(&sid, &file, offset, &data, done)).await, Ok(Ok(()))) { return Err(waiting()); }
                     }
-                    a.data_base64.clear();
-                    a.file_id = Some(fid);
+                    Location::Machine(machine) => {
+                        let msg = ServerMsg::HarnessFile { session: id.to_owned(), file: fid.clone(), offset, data, done };
+                        // File pieces and their following Admit share the non-shedding lane;
+                        // QUIC lane ordering prevents a command from overtaking its originals.
+                        if !hub.send_to_agent(machine, crate::proto::LANE_CONTROL, &msg).await { return Err(Sent::Unreachable); }
+                    }
                 }
+                offset = end;
             }
+            a.path = None;
+            a.data_base64.clear();
+            a.file_id = Some(fid);
             out.push(a);
         }
         Ok(Command::Send { id: mid, text, mode, attachments: out, overrides, reply_to, task })
@@ -4233,6 +4279,22 @@ impl Registry {
     pub fn epoch_of(&self, id: &str) -> u64 {
         let seen = self.sessions.with(id, |v| v.info.epoch).unwrap_or(0);
         self.epochs.load().get(id).copied().unwrap_or(0).max(seen)
+    }
+
+    /// A real server incarnation and authenticated owner connection, stable across bookkeeping
+    /// writes and capacity updates. It changes only when restart/reconnect requires reconciliation.
+    pub fn mail_connection(&self, hub: &Hub, id: &str) -> Option<String> {
+        match self.location(id)? {
+            Location::Local => Some(format!("{}:{}:local", born(), hub.generation)),
+            Location::Machine(machine) => {
+                let instances = hub.instances.load();
+                let peer = instances.owner(&crate::instances::Owned::Agent(id.to_owned()))?;
+                let owner = instances.get(peer)?;
+                if owner.name != machine || !instances.current_connection(peer) { return None; }
+                let connection = hub.tunnels.connection_id(peer)?;
+                Some(format!("{}:{}:{peer}:{connection}", born(), hub.generation))
+            }
+        }
     }
 
     /// Waits for the answer to message `message` sent to session `id`: none when too many wait
@@ -4282,6 +4344,67 @@ impl Registry {
         self.resolve(hub, id, c, pending).await
     }
 
+    /// The shared publication path for authenticated producers. Receipt means durable server
+    /// custody only; actual source admission and consumption are separate owner events.
+    #[allow(clippy::too_many_arguments, reason = "authenticated custody binds the existing recipient, command, proof, principal, sender and explicit status together")]
+    pub async fn command_published(&self, hub: &Arc<Hub>, id: &str, command: Command, provenance: Option<Value>, owner: String, sender: String, status: Option<super::mail::StatusKey>) -> Result<super::mail::Receipt, super::mail::Error> {
+        self.publish_command(hub, id, command, provenance, owner, sender, status).await
+    }
+
+    pub async fn command_status(&self, hub: &Hub, id: &str, command: Command, status: super::mail::StatusKey) -> Sent {
+        match self.publish_command(hub, id, command, None, "server".into(), "server".into(), Some(status)).await {
+            Ok(receipt) => Sent::Published(receipt),
+            Err(error) => Sent::PublicationRefused(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "authenticated custody binds the existing recipient, command, proof, principal, sender and explicit status together")]
+    async fn publish_command(&self, hub: &Hub, id: &str, command: Command, provenance: Option<Value>, owner: String, sender: String, status: Option<super::mail::StatusKey>) -> Result<super::mail::Receipt, super::mail::Error> {
+        let message = message_id(&command).ok_or_else(|| super::mail::Error::Invalid { reason: "durable communications require an immutable nonempty message id".into() })?;
+        if !super::session::is_message(&command) { return Err(super::mail::Error::Invalid { reason: "only a communication can transfer durable mail custody".into() }); }
+        let command = serde_json::to_value(command).map_err(|_| super::mail::Error::Invalid { reason: "communication cannot be encoded".into() })?;
+        super::mail_delivery::publish(hub, super::mail::Publish { owner, sender, recipient: id.to_owned(), id: message, command, provenance, status }).await
+    }
+
+    /// Publish a current source event on its existing session feed and control projection.
+    /// Source epoch/location are checked again on the owner shard, after the ledger commit.
+    pub async fn mail_event(&self, hub: &Arc<Hub>, id: &str, source: Location, event: super::admission::FlowEvent, projection: Option<super::mail::Projection>) -> bool {
+        let (id, h) = (id.to_owned(), Arc::clone(hub));
+        self.sessions.on(&id.clone(), move |s| {
+            let capacity = super::mail_delivery::event_capacity(&event);
+            let Some(m) = s.get_mut(&id) else { return false };
+            if *m.location != source || m.info.epoch != capacity.epoch { return false; }
+            let fault = matches!(&event, super::admission::FlowEvent::Fault { .. });
+            let newer = fault || m.info.admission.as_ref().is_none_or(|was| was.epoch != capacity.epoch || was.generation <= capacity.generation);
+            let changed = newer && if fault { m.info.admission.is_some() } else { m.info.admission.as_ref() != Some(capacity) };
+            if newer {
+                Arc::make_mut(&mut m.info).admission = (!fault).then(|| capacity.clone());
+                if m.state.is_object() { Arc::make_mut(&mut m.state).set("admission", &if fault { Value::Null } else { json!(capacity) }); }
+            }
+            m.rev = m.rev.saturating_add(1);
+            m.commit(|m| {
+                let (publication, mail_scope) = projection.map(|p| (Some(p.publication), Some(p.mail_scope))).unwrap_or_default();
+                let text = crate::wire::ui::SessionDown { frame: crate::wire::ui::SessionFrame::MailFlow { event: Box::new(event), publication, mail_scope }, rev: Some(m.rev) }.text();
+                let mut payload = super::live::Payload::new(m.rev, text.len());
+                payload.text().extend_from_slice(text.as_bytes());
+                payload.done();
+                Some(payload)
+            });
+            let lent = h.emit_harness(&id, m.info_encoded());
+            m.harness_at = lent.seq();
+            m.harness = Some(lent);
+            if changed {
+                h.harness.mail_delivery.changed();
+                super::told::wake(&h, &id);
+            }
+            true
+        }).await.unwrap_or(false)
+    }
+
+    pub fn mail_receipt(&self, id: &str, receipt: super::mail::Receipt) {
+        self.asked.published(id, receipt);
+    }
+
     /// What command `c` to session `id` is, for what its answers mean (`super::asked`): a message,
     /// and whether it goes under its id to an inbox that takes it once.
     pub fn kind_of(&self, hub: &Hub, id: &str, c: &Command) -> super::asked::Kind {
@@ -4300,6 +4423,14 @@ impl Registry {
     /// hear them: one parked at once, then its runner's once it's back.
     pub async fn send_asked(&self, hub: &Arc<Hub>, id: &str, scope: &str, cmd: &str, c: Command) {
         use std::time::Instant;
+        if super::session::is_message(&c) {
+            let sent = match self.publish_command(hub, id, c, None, scope.to_owned(), scope.to_owned(), None).await {
+                Ok(receipt) => Sent::Published(receipt),
+                Err(error) => Sent::PublicationRefused(error),
+            };
+            self.asked.answered(id, scope, cmd, &sent, Instant::now());
+            return;
+        }
         let pending = self.dispatch(hub, id, c.clone()).await;
         let (h, session, scope, cmd) = (Arc::clone(hub), id.to_owned(), scope.to_owned(), cmd.to_owned());
         crate::rt::spawn(async move {
@@ -4408,6 +4539,16 @@ impl Registry {
     /// [`Registry::dispatch_one`], with what kiln and the relays before it record of passing it on
     /// (`relayed`, [`Registry::command_relayed`]) beside it in what goes to the runner.
     async fn dispatch_relayed(&self, hub: &Hub, id: &str, c: Command, relayed: Option<&Value>) -> Pending {
+        if matches!(&c, Command::Admit { .. } | Command::MailAck { .. } | Command::MailPeers { .. } | Command::MailHandoff { .. }) {
+            return Pending::Now(Sent::PublicationRefused(super::mail::Error::Invalid { reason: "mail grants and receipts belong to the authenticated server relay".into() }));
+        }
+        if super::session::is_message(&c) {
+            let provenance = relayed.map(|proof| json!({"relayed": proof}));
+            return Pending::Now(match self.publish_command(hub, id, c, provenance, "server".into(), "server".into(), None).await {
+                Ok(receipt) => Sent::Published(receipt),
+                Err(error) => Sent::PublicationRefused(error),
+            });
+        }
         let Some(loc) = self.location(id) else { return Pending::Now(Sent::NoSession) };
         // Kiln's own (`goals::keep`), kept here: its harness has nothing to do with it.
         if let Command::Control { id: control, value } = &c
@@ -6209,6 +6350,50 @@ mod tests {
             let held = ["quiet", "busy", "away", "unknown"].map(str::to_owned);
             let stale = hub.harness.still_disconnected("box", &held);
             anyhow::ensure!(stale == ["quiet"], "only its own quiet session: {stale:?}");
+            Ok(())
+        })
+    }
+
+    /// W20-R01: an owner's Open restores lifecycle while its full State is still on the way.
+    #[test]
+    fn an_owner_open_updates_lifecycle_for_current_and_later_viewers() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let open = |status, since| Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), status, epoch: 3, ..Info::default() }), since };
+            hub.harness.ingest(&there, "s", open(Status::Idle, None)).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(State { status: Status::Idle, epoch: 3, summary: "details retained".into(), ..State::default() }) }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: vec![Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: Body::Assistant { text: "existing event".into(), streaming: false } }] }).await;
+            let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
+            for status in [Status::Starting, Status::Idle, Status::Exited, Status::Waiting, Status::Running] {
+                hub.harness.machine_lost(&hub, "box").await;
+                let _ = sent(&hub, &topic, &mut at);
+                hub.harness.ingest(&there, "s", open(status, Some(1))).await;
+                anyhow::ensure!(hub.harness.info("s").is_some_and(|i| i.status == status), "the owner's actual lifecycle");
+                anyhow::ensure!(hub.harness.state("s").is_some_and(|s| s.status == status && s.summary == "details retained"), "stale offline status is reconciled without replacing details");
+                let heard = sent(&hub, &topic, &mut at);
+                anyhow::ensure!(heard.iter().filter_map(|f| serde_json::from_str::<Value>(f).ok()).any(|v| v.get("t").and_then(Value::as_str) == Some("state") && v.pointer("/state/status") == Some(&json!(status))), "the existing viewer receives the control change: {heard:?}");
+                anyhow::ensure!(!heard.iter().any(|f| f == super::super::live::RESYNC || f.contains(r#""t":"open""#)), "the resumed timeline is not reset: {heard:?}");
+                let next = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no later copy"))?;
+                let frames = next.frames().iter().map(|f| serde_json::from_str::<Value>(f)).collect::<Result<Vec<_>, _>>()?;
+                anyhow::ensure!(frames.iter().any(|v| v.pointer("/info/status") == Some(&json!(status))) && frames.iter().any(|v| v.pointer("/state/status") == Some(&json!(status))), "later attach sees coherent Info and State");
+                anyhow::ensure!(copy_of(&hub, "s") == ["e1"], "event history is retained");
+            }
+            hub.harness.machine_lost(&hub, "box").await;
+            let _ = sent(&hub, &topic, &mut at);
+            hub.harness.ingest(&there, "s", open(Status::Idle, None)).await;
+            anyhow::ensure!(sent(&hub, &topic, &mut at).iter().any(|f| f == super::super::live::RESYNC), "a full Open refreshes older viewers from the coherent copy");
+            anyhow::ensure!(hub.harness.state("s").is_some_and(|s| s.status == Status::Idle), "the replacement snapshot has fresh lifecycle");
+            // An owner can announce lifecycle before it has supplied any State at all.
+            hub.harness.ingest(&there, "header", Update::Open { info: Box::new(Info { id: "header".into(), kind: "claude".into(), status: Status::Exited, ..Info::default() }), since: None }).await;
+            let header = hub.harness.attach("header").ok_or_else(|| anyhow::anyhow!("no header copy"))?;
+            let (_watching, topic, mut at) = (header.viewer, header.topic, header.at.unwrap_or_default());
+            hub.harness.ingest(&there, "header", Update::Open { info: Box::new(Info { id: "header".into(), kind: "claude".into(), status: Status::Starting, ..Info::default() }), since: Some(0) }).await;
+            anyhow::ensure!(hub.harness.state("header").is_none(), "a header does not fabricate a State");
+            let heard = sent(&hub, &topic, &mut at);
+            anyhow::ensure!(heard.iter().filter_map(|f| serde_json::from_str::<Value>(f).ok()).any(|v| v.get("t").and_then(Value::as_str) == Some("resumed") && v.pointer("/info/status") == Some(&json!("starting"))), "the header-only viewer receives lifecycle: {heard:?}");
             Ok(())
         })
     }

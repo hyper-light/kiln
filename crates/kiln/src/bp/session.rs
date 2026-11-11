@@ -151,7 +151,7 @@ impl SessionFeed {
             // a reply to one viewer's ask and an inbox's word to its sender go to their asker as
             // `Answer`s, never to every viewer.
             // W21-R02: History is browser paging metadata; BP never negotiates that view.
-            SessionFrame::History { .. } | SessionFrame::Synced | SessionFrame::Reply { .. } | SessionFrame::Inbox { .. } | SessionFrame::Error { .. } | SessionFrame::Ack { .. } | SessionFrame::Nack { .. } => {}
+            SessionFrame::History { .. } | SessionFrame::Synced | SessionFrame::Reply { .. } | SessionFrame::Inbox { .. } | SessionFrame::MailFlow { .. } | SessionFrame::Error { .. } | SessionFrame::Ack { .. } | SessionFrame::Nack { .. } => {}
         }
         (out, false)
     }

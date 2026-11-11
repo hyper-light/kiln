@@ -13,7 +13,9 @@ import "./console.css";
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ArrowLeft, ChevronRight, GitFork, RotateCcw, Shield, X } from "lucide-react";
 import { clientId, harnessApi, lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt } from "@/api/harness";
-import type { AgentInfo, Approval, Attachment, Command, FileChange, HEvent, Meta, SendMode, SessionStore, Task, Todo } from "@/api/harness";
+import { heldCommand, useHeld } from "@/api/held";
+import { holdManyWith } from "./state";
+import type { AgentInfo, Approval, Command, FileChange, HEvent, Meta, SendMode, SessionStore, Task, Todo } from "@/api/harness";
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import { kilnSubagentsOf } from "./tasks";
 import { Button } from "@/components/ui/button";
@@ -28,7 +30,7 @@ import { DeferredFields } from "./deferred-state";
 import { deferredState, stateCount } from "@/api/state-pages";
 import { useAgentActions } from "./actions";
 import { MoveDialog, movable } from "./move";
-import { SettingsSheet, useAttachments, type Attachments } from "./controls";
+import { SettingsSheet, useAttachments, type Attachments, type Taken } from "./controls";
 import { agentLabel, changesetOf, editsOf, useSameList } from "./derive";
 import { inScope, useScope, type Sub } from "./changes";
 import { useListener } from "./dom";
@@ -519,7 +521,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
   const conn = useSession(store, (s) => s.conn);
   const stopAt = useStopAt(store);
   const lastFrom = useSession(store, lastTurnFrom);
-  const status = state?.status ?? info?.status ?? "starting";
+  const status = info?.status ?? state?.status ?? "starting";
   const actions = useAgentActions(
     {
       id: store.id,
@@ -780,22 +782,31 @@ function useSubagentPicks(store: SessionStore, id: string, info: AgentInfo | und
   );
   // Over a subagent's thread the composer writes to that one, whatever's picked.
   const to = React.useMemo(() => (task === null ? rows.filter((r) => picks.has(r.key) && takesMessage(r)) : []), [rows, picks, task]);
-  const sendTo = (m: { text: string; attachments?: Attachment[] }) => {
+  const sendTo = async (m: { text: string; taken: Taken }) => {
     const base = clientId();
+    const messages: Parameters<typeof holdManyWith>[0] = [];
     const out = to.map((r, i): SentTo => {
       const msg = `${base}-${i}`;
       const t = r.kind === "harness" && r.session === id ? tasks.find((x) => x.id === r.task) : undefined;
       const mode: SendMode = r.stand === "working" && (!t || (t.takes ?? []).includes("steer")) ? "steer" : "queue";
-      const c: Command = { type: "send", id: msg, text: m.text, mode, attachments: m.attachments, ...(r.kind === "harness" && r.task ? { task: r.task } : {}) };
-      if (r.session === id && store.send(c)) return { key: r.key, id: msg, session: r.session, how: "socket" };
-      const went = (how: SentTo["how"]) => setSent((s) => s.map((x) => (x.id === msg ? { ...x, how } : x)));
-      harnessApi.command(r.session, c).then(
-        () => went("sent"),
-        () => went("failed"),
-      );
+      messages.push({ agent: r.session, message: { id: msg, text: m.text, mode, at: Date.now(), ...(r.kind === "harness" && r.task ? { task: r.task } : {}) } });
       return { key: r.key, id: msg, session: r.session, how: "sending" };
     });
     setSent(out);
+    if (!(await holdManyWith(messages, m.taken))) {
+      setSent(out.map((row) => ({ ...row, how: "failed" })));
+      return false;
+    }
+    void m.taken.up.then(async () => {
+      await useHeld.getState().ready();
+      for (const item of messages) {
+        const original = useHeld.getState().held[item.agent]?.find((message) => message.id === item.message.id);
+        if (!original || original.uploading?.length) continue;
+        const saved = await (item.agent === id ? store : sessionStore(item.agent)).sendMail(heldCommand(original), original.originals);
+        setSent((rows) => rows.map((row) => (row.id === original.id ? { ...row, how: saved ? "socket" : "failed" } : row)));
+      }
+    });
+    return true;
   };
   const toMarks = React.useMemo(() => {
     const marks = new Map<string, ToMark>();
@@ -852,7 +863,7 @@ function Dock({
   onClearReply?: () => void;
 }) {
   const navigate = useNavigate();
-  const status = useSession(store, (s) => s.state?.status ?? s.info?.status ?? "starting");
+  const status = useSession(store, (s) => s.info?.status ?? s.state?.status ?? "starting");
   const exit = useSession(store, (s) => s.state?.exit);
   const empty = useSession(store, (s) => s.events.length === 0);
   const resume = useSession(store, (s) => (s.meta?.features ?? []).includes("resume"));

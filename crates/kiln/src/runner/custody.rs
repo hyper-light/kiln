@@ -887,6 +887,14 @@ static STARTED: LazyLock<i64> = LazyLock::new(crate::util::now_ms);
 /// The most records of relayed words a process remembers seeing, to refuse one sent again.
 const SEEN_MAX: usize = 1024;
 
+#[derive(Clone, PartialEq, Eq)]
+struct MailProof([u8; 32]);
+
+struct SeenWords {
+    digest: String,
+    mail: Option<MailProof>,
+}
+
 /// What this process relays, and is relayed (docs/ci.md W27-R08's relays).
 #[derive(Default)]
 struct Relaying {
@@ -902,8 +910,9 @@ struct Relaying {
     /// The runner process this one took over from recorded what it forwarded: each frame since
     /// comes with its record.
     forwards_recorded: bool,
-    /// Records of relayed words seen here, by digest, newest last: one again is refused.
-    seen: VecDeque<String>,
+    /// Proofs remain bounded by SEEN_MAX. Only an exact durable publication may repeat; an
+    /// unbound legacy/naked command still has the original anti-replay behavior.
+    seen: VecDeque<SeenWords>,
     /// Records of the runner process this one took over from of passing an agent's words on to
     /// this one (blue/green), by the act's digest: the last relay's of those words.
     forwarded_words: BTreeMap<String, Value>,
@@ -1048,16 +1057,44 @@ pub fn relay_due() {
 /// session; each relay's record in turn, the first following the act, each the one before it, of
 /// the act by its digest, from the relay before it, to the next; the last to this process (or to
 /// the one this process took over from, whose forwarder passed it on: its record of that, last); and
-/// none seen here before. Then this process's receipt, following the last relay's record, goes to
+/// none seen here before, except an exact durable publication retry. Every retry rechecks the
+/// complete signature chain before journal/inbox deduplication. This process's receipt goes to
 /// kiln. Why not: kiln is told (a break naming the relay), and the session isn't given them. A
 /// message with nothing relayed beside it (a person's, a server's from before) goes as before.
 pub fn relayed_words(session: &str, json: &str, root: &[u8], machine: &str, instance: &str) -> Result<(), String> {
     use kiln_ci::identity::custody::names;
     use kiln_ci::identity::relay::{Unrelayed, relayed};
     let Ok(v) = serde_json::from_str::<Value>(json) else { return Ok(()) };
+    // One server-owned admission wrapper carries the original words; the unchanged proof
+    // remains at the outer wire level and is checked by the same path below.
+    let words_command = if v.get("type").and_then(Value::as_str) == Some("admit") {
+        let inner = v.get("command").filter(|c| c.is_object()).ok_or_else(|| "malformed mail admission command".to_owned())?;
+        if !matches!(inner.get("type").and_then(Value::as_str), Some("send" | "skill_run")) {
+            return Err("nested or non-communication mail admission command".to_owned());
+        }
+        inner
+    } else { &v };
     let Some(r) = v.get("relayed") else { return Ok(()) };
+    let mail = if v.get("type").and_then(Value::as_str) == Some("admit") {
+        use sha2::Digest as _;
+        let revision = v.pointer("/token/revision").and_then(Value::as_u64).filter(|n| *n > 0).ok_or_else(|| "mail admission has no publication revision".to_owned())?;
+        let message = words_command.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| "mail admission has no original message identity".to_owned())?;
+        let command = crate::harness::state_view::encode(words_command, crate::harness::state_view::FRAME).map_err(|_| "mail admission command cannot be bound within its frame budget".to_owned())?;
+        let mut binding = sha2::Sha256::new();
+        binding.update(b"kiln-mail-proof-v1");
+        binding.update(revision.to_le_bytes());
+        // Variable fields are length-framed; the revision and SHA-256 command digest have
+        // fixed widths. Retain one digest rather than frame-sized attacker-controlled IDs.
+        for part in [session.as_bytes(), message.as_bytes()] {
+            let len = u64::try_from(part.len()).map_err(|_| "mail proof identity length does not fit".to_owned())?;
+            binding.update(len.to_le_bytes());
+            binding.update(part);
+        }
+        binding.update(sha2::Sha256::digest(&command));
+        Some(MailProof(binding.finalize().into()))
+    } else { None };
     let at = crate::util::now_unix();
-    let message = v.get("id").and_then(Value::as_str).unwrap_or_default();
+    let message = words_command.get("id").and_then(Value::as_str).unwrap_or_default();
     let refused = format!("message {message} to session {session}");
     let bundle = |x: Option<&Value>| x.and_then(Value::as_str).and_then(|s| serde_json::from_str::<Value>(s).ok());
     let mut records: Vec<Value> = r.get("passed_on").and_then(Value::as_array).into_iter().flatten().filter_map(|x| bundle(Some(x))).collect();
@@ -1090,7 +1127,7 @@ pub fn relayed_words(session: &str, json: &str, root: &[u8], machine: &str, inst
     let covers = signed.statement.subject.iter().any(|t| t.digest.get("sha256").is_some_and(|d| d.eq_ignore_ascii_case(&ask_digest)));
     let asked: Value = serde_json::from_str(ask).unwrap_or_default();
     let said = |p: &str| asked.pointer(p).and_then(Value::as_str).unwrap_or_default().to_owned();
-    let words = v.get("text").and_then(Value::as_str).map(crate::harness::ops::body_of).unwrap_or_default();
+    let words = words_command.get("text").and_then(Value::as_str).map(crate::harness::ops::body_of).unwrap_or_default();
     // For this session: as its sender named it (its id, or the start of it), or, named otherwise (by
     // its name), as kiln's record of passing them on says it found it.
     let to = said("/input/agent");
@@ -1125,17 +1162,20 @@ pub fn relayed_words(session: &str, json: &str, root: &[u8], machine: &str, inst
     }
     let Some(nearest) = checked.last() else { return fail(unreadable("no relay's record came with it".into())) };
     let before = (nearest.digest.clone(), nearest.custodian.clone());
-    // Sent again: refused.
+    // A retry changes transport/attempt metadata, never the signed original publication.
+    // Matching the proof alone would let a second publication impersonate this one.
     let again = {
         let mut st = RELAYING.lock();
-        let again = st.seen.contains(&before.0);
-        if !again {
-            st.seen.push_back(before.0.clone());
-            while st.seen.len() > SEEN_MAX {
-                st.seen.pop_front();
+        match st.seen.iter().find(|seen| seen.digest == before.0) {
+            Some(seen) => mail.is_none() || seen.mail.as_ref() != mail.as_ref(),
+            None => {
+                st.seen.push_back(SeenWords { digest: before.0.clone(), mail });
+                while st.seen.len() > SEEN_MAX {
+                    st.seen.pop_front();
+                }
+                false
             }
         }
-        again
     };
     if again {
         let last = checked.last();
@@ -1649,6 +1689,28 @@ mod tests {
         // For another process: refused.
         let elsewhere = relayed_words(a, &message(words, &relayed_of(&kilns(5, &act_b)?, &act_b)), &pki.ca_der, machine, "green");
         assert!(elsewhere.as_ref().is_err_and(|e| e.contains("not to runner relay-box (instance green)")), "{elsewhere:?}");
+        // An uncertain durable attempt retries the SAME publication and original inner command.
+        // Attempt generation is not a new grant to replay a signed act under another identity.
+        let proof = relayed_of(&kilns(6, &act_b)?, &act_b);
+        let admitted = |revision: u64, generation: u64, id: &str, mode: &str, proof: &Value| serde_json::json!({
+            "type": "admit", "peer": b, "token": { "revision": revision, "generation": generation },
+            "epoch": 0, "generation": generation, "peers": [b],
+            "command": { "type": "send", "id": id, "text": words, "mode": mode }, "relayed": proof,
+        }).to_string();
+        for generation in [1, 1, 2] {
+            relayed_words(a, &admitted(17, generation, "durable-m1", "queue", &proof), &pki.ca_der, machine, "blue").map_err(|e| anyhow::anyhow!(e))?;
+        }
+        for changed in [admitted(18, 2, "durable-m1", "queue", &proof), admitted(17, 2, "another-id", "queue", &proof), admitted(17, 2, "durable-m1", "now", &proof)] {
+            assert!(relayed_words(a, &changed, &pki.ca_der, machine, "blue").is_err(), "changed publication reused a proof");
+        }
+        assert!(relayed_words(&format!("{a}-other"), &admitted(17, 2, "durable-m1", "queue", &proof), &pki.ca_der, machine, "blue").is_err(), "recipient is part of the binding");
+        assert!(relayed_words(a, &message(words, &proof), &pki.ca_der, machine, "blue").is_err(), "durable retry cannot authorize a naked replay");
+        assert!(relayed_words(a, &admitted(17, 2, "durable-m1", "queue", &relayed_of(&p2, &act_b)), &pki.ca_der, machine, "blue").is_err(), "an old unbound seen record cannot be adopted");
+        let mut forged = proof.clone();
+        if let Some(object) = forged.as_object_mut() { object.insert("ask".into(), Value::String("{}".into())); }
+        assert!(relayed_words(a, &admitted(17, 2, "durable-m1", "queue", &forged), &pki.ca_der, machine, "blue").is_err(), "an exact retry still verifies its full signature");
+        let nested = serde_json::json!({ "type": "admit", "token": { "revision": 17, "generation": 2 }, "command": { "type": "admit" }, "relayed": proof }).to_string();
+        assert!(relayed_words(a, &nested, &pki.ca_der, machine, "blue").is_err(), "nested wrappers never skip proof verification");
         drain_all(&mut drained);
         let breaks: Vec<Value> = drained.iter().filter_map(|v| v.get("relay_break").cloned()).collect();
         let codes: Vec<(&str, &str)> = breaks.iter().map(|b| (b.get("code").and_then(Value::as_str).unwrap_or_default(), b.get("relay").and_then(Value::as_str).unwrap_or_default())).collect();

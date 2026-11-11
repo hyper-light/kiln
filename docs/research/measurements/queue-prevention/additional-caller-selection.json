@@ -1,0 +1,13 @@
+[
+  "harness::ops::end_to_end::a_keyed_send_retried_after_its_sender_moved_is_the_same_message",
+  "harness::ops::end_to_end::agents_send_twice_with_one_key_is_one_prompt_and_both_get_its_answer",
+  "harness::ops::end_to_end::cp_t3_2_agent_messages_steer_a_busy_peer_without_building_a_backlog",
+  "harness::ops::tests::a_wait_is_a_change_and_a_result_a_read",
+  "harness::ops::tests::status_is_only_explicit_and_does_not_reuse_the_publication_key",
+  "harness::session::tests::a_partial_index_revision_wakes_waiters_even_when_its_count_is_unchanged",
+  "harness::session::tests::accepted_queue_edit_reserves_growth_and_journals_before_adapter_mutation",
+  "harness::session::tests::accepted_queue_shrink_grants_retry_credit_only_after_cas_and_actual_owner_apply",
+  "harness::session::tests::attachment_materialization_is_all_or_error_and_never_clobbers_completed_input",
+  "harness::session::tests::deferred_bodies_retain_the_complete_compact_queue_index",
+  "harness::session::tests::the_local_queue_index_is_bounded_and_marks_its_unseen_suffix"
+]

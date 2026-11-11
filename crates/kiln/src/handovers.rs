@@ -329,6 +329,7 @@ impl Hub {
     /// The newest process took an agent session over, or couldn't (`error`): the older process
     /// that handed it over lets go of it, or goes on with it, or (the newest can't say) asks again.
     pub(crate) async fn handover_adopted(&self, agent: &str, peer: PeerId, session: String, error: Option<String>) {
+        if !crate::harness::mail_transfer::allows_generic_adoption(self, peer, &session, error.is_none()).await { return; }
         let pending = self.handovers.lock().adopted(&session, peer);
         let itself = error.is_none();
         let Some(h) = pending else {

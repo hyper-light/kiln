@@ -255,6 +255,8 @@ export interface PlanRunBrief {
 export interface PlanRan {
   session: string;
   sent: number;
+  /** Durable custody while receiver admission is pending. */
+  retained?: number;
   /** None when it was approved instead (`approved`). */
   run?: string;
   /** As goals, split into its acceptance criteria and tests: how many steps were. */

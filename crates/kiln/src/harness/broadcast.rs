@@ -69,7 +69,7 @@ pub struct Outcome {
     pub name: String,
     pub machine: String,
     pub kind: String,
-    /// "sent", "skipped" or "failed".
+    /// "sent", "retained", "skipped" or "failed".
     pub result: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -79,6 +79,8 @@ pub struct Outcome {
 pub struct Report {
     pub id: String,
     pub sent: usize,
+    /// Durable server custody, waiting for source admission.
+    pub retained: usize,
     pub skipped: usize,
     pub failed: usize,
     pub results: Vec<Outcome>,
@@ -198,10 +200,7 @@ pub async fn run(hub: &Arc<Hub>, b: &Broadcast, by: &str, among: &[Info]) -> any
     let prompt = b.text.as_deref().is_some_and(|t| !t.trim().is_empty()) || !b.attachments.is_empty();
     let given = [prompt, b.command.is_some(), b.approvals.is_some()].into_iter().filter(|x| *x).count();
     anyhow::ensure!(given == 1, "send one of text (or attachments), command or approvals");
-    // Each agent gets the files themselves: an upload goes with the first message that sends it.
-    let mut b = b.clone();
-    b.attachments = hub.harness.inline_uploads(std::mem::take(&mut b.attachments));
-    let b = &b;
+    // Durable upload references stay compact and unchanged for every recipient and exact retry.
     let id = match b.key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
         Some(k) => format!("bc-{}", crate::util::derive_id(&["broadcast", by, k])),
         None => format!("bc-{}", crate::util::new_id()),
@@ -227,21 +226,28 @@ pub async fn run(hub: &Arc<Hub>, b: &Broadcast, by: &str, among: &[Info]) -> any
                 Ok(c) => c,
                 Err(why) => return outcome("skipped", Some(why)),
             };
+            let mut retained = false;
             for c in commands {
                 match hub.harness.command(hub, &info.id, c).await {
                     Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => {}
+                    Sent::Published(receipt) => match receipt.disposition {
+                        super::mail::Disposition::Admitted | super::mail::Disposition::Consumed => {},
+                        super::mail::Disposition::Waiting | super::mail::Disposition::Dispatched | super::mail::Disposition::Transferred | super::mail::Disposition::Superseded => retained = true,
+                        super::mail::Disposition::Cancelled => return outcome("failed", Some("communication was cancelled; the original remains in history".into())),
+                    },
+                    Sent::PublicationRefused(error) => return outcome("failed", Some(error.to_string())),
                     Sent::Refused(r) => return outcome("failed", Some(r.to_string())),
                     s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => return outcome("failed", s.failure().map(|(_, why)| why)),
                     Sent::NoSession => return outcome("failed", Some("it has gone".to_owned())),
                     Sent::Unreachable => return outcome("failed", Some(format!("{} is not connected", hub.shown(machine(&info.target))))),
                 }
             }
-            outcome("sent", None)
+            outcome(if retained { "retained" } else { "sent" }, retained.then(|| "Kiln retained the original while receiver admission is pending".to_owned()))
         }
     });
     let results = futures::future::join_all(sends).await;
     let count = |r: &str| results.iter().filter(|o| o.result == r).count();
-    Ok(Report { id, sent: count("sent"), skipped: count("skipped"), failed: count("failed"), results, unreached })
+    Ok(Report { id, sent: count("sent"), retained: count("retained"), skipped: count("skipped"), failed: count("failed"), results, unreached })
 }
 
 #[cfg(test)]

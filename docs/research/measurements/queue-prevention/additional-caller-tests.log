@@ -1,0 +1,33 @@
+
+running 11 tests
+test harness::ops::end_to_end::a_keyed_send_retried_after_its_sender_moved_is_the_same_message ... FAILED
+test harness::ops::end_to_end::agents_send_twice_with_one_key_is_one_prompt_and_both_get_its_answer ... FAILED
+test harness::ops::end_to_end::cp_t3_2_agent_messages_steer_a_busy_peer_without_building_a_backlog ... FAILED
+test harness::ops::tests::a_wait_is_a_change_and_a_result_a_read ... ok
+test harness::ops::tests::status_is_only_explicit_and_does_not_reuse_the_publication_key ... ok
+test harness::session::tests::a_partial_index_revision_wakes_waiters_even_when_its_count_is_unchanged ... ok
+test harness::session::tests::accepted_queue_edit_reserves_growth_and_journals_before_adapter_mutation ... ok
+test harness::session::tests::accepted_queue_shrink_grants_retry_credit_only_after_cas_and_actual_owner_apply ... ok
+test harness::session::tests::attachment_materialization_is_all_or_error_and_never_clobbers_completed_input ... ok
+test harness::session::tests::deferred_bodies_retain_the_complete_compact_queue_index ... ok
+test harness::session::tests::the_local_queue_index_is_bounded_and_marks_its_unseen_suffix ... ok
+
+failures:
+
+---- harness::ops::end_to_end::a_keyed_send_retried_after_its_sender_moved_is_the_same_message stdout ----
+Error: a retry under its key after its sender moved was another message: {"id":"from-agent-01a1c9b89279722198eab3a768d7f191-7a4174a35a1f8061b6390016947eb3d8","revision":1,"generation":0,"disposition":"waiting","repeat":false} then {"id":"from-agent-01a1c9b89279722198eab3a768d7f191-7a4174a35a1f8061b6390016947eb3d8","revision":1,"generation":0,"disposition":"waiting","repeat":true}; its agent's inbox took []
+
+---- harness::ops::end_to_end::agents_send_twice_with_one_key_is_one_prompt_and_both_get_its_answer stdout ----
+Error: the same message: {"id":"61d3efdc5cd181bfafb440e4d823f913","revision":1,"generation":0,"disposition":"waiting","repeat":false} {"id":"61d3efdc5cd181bfafb440e4d823f913","revision":1,"generation":0,"disposition":"waiting","repeat":true}
+
+---- harness::ops::end_to_end::cp_t3_2_agent_messages_steer_a_busy_peer_without_building_a_backlog stdout ----
+Error: the harness's first prompt: never
+
+
+failures:
+    harness::ops::end_to_end::a_keyed_send_retried_after_its_sender_moved_is_the_same_message
+    harness::ops::end_to_end::agents_send_twice_with_one_key_is_one_prompt_and_both_get_its_answer
+    harness::ops::end_to_end::cp_t3_2_agent_messages_steer_a_busy_peer_without_building_a_backlog
+
+test result: FAILED. 8 passed; 3 failed; 0 ignored; 0 measured; 4214 filtered out; finished in 301.03s
+

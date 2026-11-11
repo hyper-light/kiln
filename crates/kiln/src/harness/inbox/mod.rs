@@ -32,6 +32,9 @@ use kiln_seams::records::{self, Cond, Consistency, Records, Rev, Scan, Tx, Write
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+pub mod transfer;
+mod accepting;
+
 /// Ids a session keeps: the duplicates of its last this many messages are known.
 pub const KEEP: u64 = 4096;
 /// Ids that go at once, once a session keeps [`KEEP`] and this many more.
@@ -53,6 +56,57 @@ const IMPORT_CHUNK: usize = 400;
 
 const HEADS: &str = "inbox-heads";
 const MESSAGES: &str = "inbox";
+const PENDING: &str = "inbox-pending";
+
+/// Replayable custody is separate from the bounded deduplication history. A terminal record is
+/// retained until the server durably acknowledges its disposition, including across restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pending {
+    pub lease: super::admission::Lease,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<super::model::Command>,
+    /// Only bytes actually retained by the old provider writer; an opaque flight never creates
+    /// an ordinary Send or automatically replays these uncertain native requests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opaque_writes: Vec<String>,
+    #[serde(default)]
+    pub origin: Origin,
+    /// Explicit current-body revision; the accepted original above is never rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<Current>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<super::admission::Disposition>,
+    #[serde(default)]
+    accepted_at: i64,
+    #[serde(default)]
+    digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_seq: Option<Rev>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin { #[default] Accepted, LegacyRetained, LegacyOpaque }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Current { pub revision: u64, pub command: super::model::Command }
+
+impl Pending {
+    pub fn new(lease: super::admission::Lease, command: super::model::Command) -> Self {
+        let body_bytes = super::admission::command_bytes(&command).ok();
+        Self { lease, command: Some(command), opaque_writes: Vec::new(), origin: Origin::Accepted, current: None, body_bytes, disposition: None, accepted_at: 0, digest: String::new(), accepted_seq: None }
+    }
+    pub fn legacy(lease: super::admission::Lease, command: super::model::Command) -> Self { Self { origin: Origin::LegacyRetained, ..Self::new(lease, command) } }
+    pub fn opaque(lease: super::admission::Lease, opaque_writes: Vec<String>) -> Self { Self { lease, command: None, opaque_writes, origin: Origin::LegacyOpaque, current: None, body_bytes: None, disposition: None, accepted_at: 0, digest: String::new(), accepted_seq: None } }
+    pub fn current_command(&self) -> Option<&super::model::Command> { self.current.as_ref().map(|current| &current.command).or(self.command.as_ref()) }
+}
+
+pub struct Disposed {
+    pub lease: super::admission::Lease,
+    pub disposition: super::admission::Disposition,
+}
 
 /// What a session's inbox keeps, and reads at once (the defaults: [`KEEP`], [`TRIM`], [`READ`]).
 #[derive(Debug, Clone, Copy)]
@@ -376,12 +430,34 @@ impl Inbox {
     /// same id; `epoch` is the one it was sent for (none from a sender that doesn't say); `at` is
     /// the host's time (unix ms). A take is one write.
     pub async fn accept(&self, session: &str, message: &str, digest: &str, epoch: Option<u64>, at: i64) -> Result<Answer, Refusal> {
+        self.accept_inner(session, message, digest, epoch, at, None, None).await
+    }
+
+    /// The original body and its admission lease commit with the inbox id, before any ACK or
+    /// session handoff. Ordinary deduplication cleanup never touches this family.
+    pub async fn accept_pending(&self, session: &str, message: &str, digest: &str, epoch: Option<u64>, at: i64, pending: &Pending) -> Result<Answer, Refusal> {
+        self.accept_inner(session, message, digest, epoch, at, Some(accepting::PendingWrite::borrowed(pending)), None).await
+    }
+
+    /// The owner borrows its immutable original; the counted encoded transaction, rather than
+    /// another Pending clone, takes temporary physical authority through the Records worker.
+    #[allow(clippy::too_many_arguments)] // Existing inbox identity/epoch/time plus the borrowed immutable body and its physical lease.
+    pub async fn accept_input(&self, session: &str, message: &str, digest: &str, epoch: u64, at: i64, lease: &super::admission::Lease, command: &super::model::Command, body_bytes: usize, budget: &super::admission::Input) -> Result<Answer, Refusal> {
+        self.accept_inner(session, message, digest, Some(epoch), at, Some(accepting::PendingWrite::original(lease, command, body_bytes)), Some(budget)).await
+    }
+
+    #[allow(clippy::too_many_arguments)] // Common legacy/durable acceptance path preserves independently validated protocol fields.
+    async fn accept_inner(&self, session: &str, message: &str, digest: &str, epoch: Option<u64>, at: i64, pending: Option<accepting::PendingWrite<'_>>, budget: Option<&super::admission::Input>) -> Result<Answer, Refusal> {
+        let storage_failed = |refusal: Refusal| {
+            if let Some(input) = budget { let _ = input.controller.lock().unavailable(); }
+            refusal
+        };
         check_session(session)?;
         // What it brought from where it was first: a retry of one of those is its repeat here.
-        self.take_in(session, at).await?;
+        self.take_in(session, at).await.map_err(storage_failed)?;
         check_message(message)?;
         for _ in 0..RETRIES {
-            let c = self.head(session).await?;
+            let c = self.head(session).await.map_err(storage_failed)?;
             if c.head.moved {
                 return Err(Refusal::Moved { session: session.to_owned(), epoch: c.head.epoch });
             }
@@ -390,16 +466,23 @@ impl Inbox {
                 Some(sent) if sent > c.head.epoch => return Err(Refusal::Behind { session: session.to_owned(), here: c.head.epoch, sent }),
                 _ => {}
             }
-            let kept = Kept { epoch: c.head.epoch, at, digest: digest.to_owned(), n: 0 };
-            let key = message_key(session, message);
-            let conds = vec![Cond::Absent { family: MESSAGES.into(), key: key.clone() }];
-            let writes = vec![Write::Put { family: MESSAGES.into(), key, value: json(session, &kept)? }];
-            // A session with no head here yet (none opened it) gets one with its first take.
-            let head = c.rev.is_none().then(|| c.head.clone());
-            match self.commit(session, &c, conds, writes, head).await {
+            // Pending custody outlives bounded deduplication history. It still answers the
+            // original message after an ordinary tidy removed its historical id.
+            if let Some(row) = self.records.get(PENDING, &message_key(session, message), Consistency::Linearizable).await.map_err(|e| storage_failed(unavailable(session, &e.to_string())))? {
+                let original: Pending = serde_json::from_slice(&row.value).map_err(|e| storage_failed(unavailable(session, &format!("its pending communication is unreadable: {e}"))))?;
+                if original.digest != digest { return Err(Refusal::Reused { session: session.to_owned(), message: message.to_owned() }); }
+                return Ok(Answer { session: session.to_owned(), message: message.to_owned(), epoch: original.lease.epoch, at: original.accepted_at, seq: original.accepted_seq.unwrap_or(row.rev), repeat: true });
+            }
+            let built = accepting::build(session, message, digest, at, &c, pending, budget)?;
+            let result = match built.owner {
+                Some(owner) => self.records.commit_owned(built.tx, owner).await,
+                None => self.records.commit(built.tx).await,
+            };
+            if matches!(&result, Err(records::Refusal::Unavailable(_))) && let Some(input) = budget { let _ = input.controller.lock().unavailable(); }
+            match self.committed(session, &c, built.head, result) {
                 Ok(rev) => {
                     self.counted(session, 1);
-                    return Ok(Answer { session: session.to_owned(), message: message.to_owned(), epoch: kept.epoch, at, seq: rev, repeat: false });
+                    return Ok(Answer { session: session.to_owned(), message: message.to_owned(), epoch: c.head.epoch, at, seq: rev, repeat: false });
                 }
                 Err(Retry::Again) => continue,
                 Err(Retry::Taken) => {
@@ -448,10 +531,177 @@ impl Inbox {
     pub async fn unaccept(&self, session: &str, message: &str) -> Result<(), Refusal> {
         check_session(session)?;
         check_message(message)?;
+        if self.pending(session, message).await?.is_some() {
+            return Err(unavailable(session, "its accepted communication remains in durable custody"));
+        }
         let tx = Tx { conds: Vec::new(), writes: vec![Write::Delete { family: MESSAGES.into(), key: message_key(session, message) }] };
         self.records.commit(tx).await.map_err(|e| unavailable(session, &e.to_string()))?;
         self.counted(session, -1);
         Ok(())
+    }
+
+    pub async fn pending(&self, session: &str, message: &str) -> Result<Option<Pending>, Refusal> {
+        check_session(session)?;
+        check_message(message)?;
+        let row = self.records.get(PENDING, &message_key(session, message), Consistency::Linearizable).await.map_err(|e| unavailable(session, &e.to_string()))?;
+        row.map(|row| serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &format!("its pending communication is unreadable: {e}")))).transpose()
+    }
+
+    /// Upgrade reconciliation of a complete retained legacy queue body. A prior journal wins;
+    /// old dedup IDs cannot suppress insertion of the missing replayable body. No mail token or
+    /// original-publication attestation is invented for this recovered current queue value.
+    pub async fn adopt_pending(&self, session: &str, mut pending: Pending, at: i64) -> Result<Pending, Refusal> {
+        check_session(session)?; check_message(&pending.lease.message)?;
+        let message = pending.lease.message.clone();
+        if let Some(existing) = self.pending(session, &message).await? { return Ok(existing); }
+        let cached = self.head(session).await?;
+        if cached.head.moved { return Err(Refusal::Moved { session: session.to_owned(), epoch: cached.head.epoch }); }
+        if cached.head.epoch != pending.lease.epoch { return Err(Refusal::StaleEpoch { session: session.to_owned(), sent: pending.lease.epoch, current: cached.head.epoch }); }
+        let kept = self.kept(session, &message).await?;
+        if pending.origin != Origin::LegacyOpaque { pending.origin = Origin::LegacyRetained; }
+        pending.lease.token = None;
+        match kept {
+            Some((kept, revision)) => { pending.accepted_at = kept.at; pending.digest = kept.digest; pending.accepted_seq = Some(revision); }
+            None => {
+                pending.accepted_at = at;
+                pending.digest = match &pending.command {
+                    Some(super::model::Command::Send { text, attachments, .. }) => digest(text, &attachments.iter().map(|attachment| attachment.name.as_str()).collect::<Vec<_>>()),
+                    None if pending.origin == Origin::LegacyOpaque => String::new(),
+                    _ => return Err(unavailable(session, "legacy queue custody requires its complete retained communication")),
+                };
+            }
+        }
+        let key = message_key(session, &message);
+        let head = cached.rev.is_none().then(|| cached.head.clone());
+        match self.commit(session, &cached, vec![Cond::Absent { family: PENDING.into(), key: key.clone() }], vec![Write::Put { family: PENDING.into(), key, value: json(session, &pending)? }], head).await {
+            Ok(revision) => { pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(revision)); Ok(pending) }
+            Err(Retry::Again | Retry::Taken) => self.pending(session, &message).await?.ok_or_else(|| unavailable(session, "legacy queue custody changed during reconciliation")),
+            Err(Retry::No(error)) => Err(error),
+        }
+    }
+
+    /// Current body is durable before the owner mutates an accepted queue item. The accepted
+    /// original, receipt digest/token and order remain unchanged. CAS failure retains the old row.
+    pub async fn edit_pending(&self, session: &str, message: &str, lease: super::admission::Lease, command: super::model::Command) -> Result<u64, Refusal> {
+        check_session(session)?; check_message(message)?;
+        if !matches!(&command, super::model::Command::Send { id, .. } if id == message) || lease.message != message { return Err(unavailable(session, "an edit cannot replace communication identity")); }
+        let key = message_key(session, message);
+        let row = self.records.get(PENDING, &key, Consistency::Linearizable).await.map_err(|error| unavailable(session, &error.to_string()))?.ok_or_else(|| unavailable(session, "the edited communication has no durable original"))?;
+        let mut pending: Pending = serde_json::from_slice(&row.value).map_err(|_| unavailable(session, "the edited communication is unreadable"))?;
+        if pending.lease.epoch != lease.epoch || pending.lease.token != lease.token || pending.disposition.is_some() { return Err(unavailable(session, "the edited communication changed custody")); }
+        let revision = pending.current.as_ref().map_or(0, |current| current.revision).checked_add(1).ok_or_else(|| unavailable(session, "the edited communication revision overflowed"))?;
+        pending.body_bytes = Some(super::admission::command_bytes(&command).map_err(|_| unavailable(session, "the edited communication's resident size is unknown"))?);
+        pending.current = Some(Current { revision, command });
+        pending.lease = lease;
+        pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
+        self.records.commit(Tx { conds: vec![Cond::At { family: PENDING.into(), key: key.clone(), rev: row.rev }], writes: vec![Write::Put { family: PENDING.into(), key, value: json(session, &pending)? }] }).await.map_err(|error| unavailable(session, &error.to_string()))?;
+        Ok(revision)
+    }
+
+    /// Metadata registration leaves queue/body/lease custody intact. A real native tool result
+    /// must later prove this exact handoff before any member is consumed or removed.
+    pub async fn register_handoff(&self, session: &str, leases: &[super::admission::Lease]) -> Result<(), Refusal> {
+        check_session(session)?;
+        if leases.len() > records::TX_MAX { return Err(unavailable(session, "handoff exceeds transaction capacity")); }
+        let mut tx = Tx::default();
+        for lease in leases {
+            check_message(&lease.message)?;
+            let key = message_key(session, &lease.message);
+            let row = self.records.get(PENDING, &key, Consistency::Linearizable).await.map_err(|_| unavailable(session, "handoff custody is unavailable"))?.ok_or_else(|| unavailable(session, "handoff has no replayable original"))?;
+            let mut pending: Pending = serde_json::from_slice(&row.value).map_err(|_| unavailable(session, "handoff custody is unreadable"))?;
+            if pending.disposition.is_some() || pending.lease.epoch != lease.epoch || pending.lease.token != lease.token || pending.lease.handoff.as_ref().is_some_and(|old| Some(old) != lease.handoff.as_ref()) { return Err(unavailable(session, "handoff custody changed")); }
+            pending.lease = lease.clone();
+            pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
+            tx.conds.push(Cond::At { family: PENDING.into(), key: key.clone(), rev: row.rev });
+            tx.writes.push(Write::Put { family: PENDING.into(), key, value: json(session, &pending)? });
+        }
+        if !tx.writes.is_empty() { self.records.commit(tx).await.map_err(|_| unavailable(session, "handoff metadata could not be committed"))?; }
+        Ok(())
+    }
+
+    /// Provider-flight intent is committed before the session flush writes that input. Thus an
+    /// accepted record without this stage is safely replayable after a crash; flight is unknown.
+    pub async fn stage_pending(&self, session: &str, message: &str, epoch: u64, stage: super::admission::Stage) -> Result<bool, Refusal> {
+        check_session(session)?;
+        check_message(message)?;
+        let key = message_key(session, message);
+        let Some(row) = self.records.get(PENDING, &key, Consistency::Linearizable).await.map_err(|e| unavailable(session, &e.to_string()))? else { return Ok(false) };
+        let mut pending: Pending = serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &format!("its pending communication is unreadable: {e}")))?;
+        if pending.lease.epoch != epoch { return Err(Refusal::StaleEpoch { session: session.to_owned(), sent: epoch, current: pending.lease.epoch }); }
+        if pending.disposition.is_some() || pending.lease.stage == stage { return Ok(true); }
+        pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
+        pending.lease.stage = stage;
+        self.records.commit(Tx { conds: vec![Cond::At { family: PENDING.into(), key: key.clone(), rev: row.rev }], writes: vec![Write::Put { family: PENDING.into(), key, value: json(session, &pending)? }] }).await.map_err(|e| unavailable(session, &e.to_string()))?;
+        Ok(true)
+    }
+
+    /// Restore/replay one atomic communication at a time; the journal has no deduplication cap.
+    pub async fn pending_next(&self, session: &str, after: Option<Vec<u8>>) -> Result<Option<(Vec<u8>, Pending)>, Refusal> {
+        check_session(session)?;
+        let page = self.records.scan(PENDING, Scan { prefix: session_prefix(session), after, limit: 1, at: Consistency::Linearizable }).await.map_err(|e| unavailable(session, &e.to_string()))?;
+        let Some(row) = page.rows.into_iter().next() else { return Ok(None) };
+        let pending = serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &format!("its pending communication is unreadable: {e}")))?;
+        Ok(Some((row.key, pending)))
+    }
+
+    /// Persist the exact terminal cause before publishing its receipt. Failure leaves the
+    /// original body and lease pending, rather than releasing credit on uncertain persistence.
+    pub async fn dispose_pending(&self, session: &str, message: &str, epoch: u64, disposition: super::admission::Disposition) -> Result<Option<Pending>, Refusal> {
+        check_session(session)?;
+        check_message(message)?;
+        let key = message_key(session, message);
+        let Some(row) = self.records.get(PENDING, &key, Consistency::Linearizable).await.map_err(|e| unavailable(session, &e.to_string()))? else { return Ok(None) };
+        let mut pending: Pending = serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &format!("its pending communication is unreadable: {e}")))?;
+        if pending.lease.epoch != epoch { return Err(Refusal::StaleEpoch { session: session.to_owned(), sent: epoch, current: pending.lease.epoch }); }
+        if pending.disposition.is_none() {
+            pending.disposition = Some(disposition);
+            pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
+            self.records.commit(Tx { conds: vec![Cond::At { family: PENDING.into(), key: key.clone(), rev: row.rev }], writes: vec![Write::Put { family: PENDING.into(), key, value: json(session, &pending)? }] }).await.map_err(|e| unavailable(session, &e.to_string()))?;
+        }
+        Ok(Some(pending))
+    }
+
+    /// A real handoff batch has one durable transition before any member returns credit or
+    /// publishes a receipt. The Records transaction limit is protocol authority, not a chosen
+    /// queue depth; an unsupported larger batch remains retained and visibly unavailable.
+    pub async fn dispose_pending_batch(&self, session: &str, messages: &[String], epoch: u64, disposition: &super::admission::Disposition) -> Result<Vec<Disposed>, Refusal> {
+        check_session(session)?;
+        if messages.len() > records::TX_MAX { return Err(unavailable(session, "one observed handoff batch exceeds the records transaction capacity")); }
+        let mut tx = Tx::default();
+        let mut disposed = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for message in messages {
+            check_message(message)?;
+            if !seen.insert(message.as_str()) { continue; }
+            let key = message_key(session, message);
+            let row = self.records.get(PENDING, &key, Consistency::Linearizable).await.map_err(|e| unavailable(session, &e.to_string()))?.ok_or_else(|| unavailable(session, "an observed handoff has no replayable custody record"))?;
+            let mut pending: Pending = serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &format!("its pending communication is unreadable: {e}")))?;
+            if pending.lease.epoch != epoch { return Err(Refusal::StaleEpoch { session: session.to_owned(), sent: epoch, current: pending.lease.epoch }); }
+            if pending.disposition.is_none() {
+                pending.disposition = Some(disposition.clone());
+                pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
+                tx.conds.push(Cond::At { family: PENDING.into(), key: key.clone(), rev: row.rev });
+                tx.writes.push(Write::Put { family: PENDING.into(), key, value: json(session, &pending)? });
+            }
+            let actual = pending.disposition.ok_or_else(|| unavailable(session, "its handoff disposition could not be retained"))?;
+            disposed.push(Disposed { lease: pending.lease, disposition: actual });
+        }
+        if !tx.writes.is_empty() { self.records.commit(tx).await.map_err(|e| unavailable(session, &e.to_string()))?; }
+        Ok(disposed)
+    }
+
+    /// Only a durable server acknowledgement may discard a terminal custody record. A stale
+    /// publication/attempt cannot delete a newer record under the same ordinary message id.
+    pub async fn acknowledge_pending(&self, session: &str, message: &str, epoch: u64, token: &super::mail::Token, disposition: Option<&super::admission::Disposition>) -> Result<bool, Refusal> {
+        check_session(session)?;
+        check_message(message)?;
+        let Some(disposition) = disposition else { return Ok(false) };
+        let key = message_key(session, message);
+        let Some(row) = self.records.get(PENDING, &key, Consistency::Linearizable).await.map_err(|e| unavailable(session, &e.to_string()))? else { return Ok(false) };
+        let pending: Pending = serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &format!("its pending communication is unreadable: {e}")))?;
+        if pending.lease.epoch != epoch || pending.lease.token.as_ref() != Some(token) || pending.disposition.as_ref() != Some(disposition) { return Ok(false); }
+        self.records.commit(Tx { conds: vec![Cond::At { family: PENDING.into(), key: key.clone(), rev: row.rev }], writes: vec![Write::Delete { family: PENDING.into(), key }] }).await.map_err(|e| unavailable(session, &e.to_string()))?;
+        Ok(true)
     }
 
     /// Ids session `session` had before it came here (the messages in its queue and its timeline,
@@ -734,7 +984,12 @@ impl Inbox {
         if let Some(h) = &head {
             writes.push(Write::Put { family: HEADS.into(), key, value: json(session, h).map_err(Retry::No)? });
         }
-        match self.records.commit(Tx { conds, writes }).await {
+        let result = self.records.commit(Tx { conds, writes }).await;
+        self.committed(session, was, head, result)
+    }
+
+    fn committed(&self, session: &str, was: &Cached, head: Option<Head>, result: Result<Rev, records::Refusal>) -> Result<Rev, Retry> {
+        match result {
             Ok(rev) => {
                 if let Some(h) = head {
                     self.cache(session, Cached { head: h, rev: Some(rev), kept: was.kept });
@@ -803,6 +1058,112 @@ mod tests {
 
     fn inbox() -> Inbox {
         Inbox::new(Arc::new(SimRecords::new()), Limits::default())
+    }
+
+    fn pending_message(message: &str, text: &str) -> Pending {
+        use crate::harness::{admission::{Lease, Stage}, mail::Token, model::{Command, SendMode}};
+        Pending::new(Lease { message: message.into(), peer: "peer".into(), epoch: 0, bytes: text.len(), stage: Stage::InboxAccepted, token: Some(Token { revision: 1, generation: 1 }), handoff: None }, Command::Send { id: message.into(), text: text.into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None })
+    }
+
+    #[test]
+    fn an_ack_has_atomic_body_custody_and_unaccept_cannot_erase_it() -> Result<(), Refusal> {
+        let i = inbox();
+        let pending = pending_message("journalled", "retain these words");
+        let answer = block(i.accept_pending("s1", "journalled", &digest("retain these words", &[]), Some(0), 10, &pending))?;
+        assert!(!answer.repeat);
+        let saved = block(i.pending("s1", "journalled"))?.ok_or_else(|| unavailable("s1", "test journal missing"))?;
+        assert!(matches!(saved.command, Some(crate::harness::model::Command::Send { text, .. }) if text == "retain these words"));
+        assert!(block(i.unaccept("s1", "journalled")).is_err());
+        assert!(block(i.pending("s1", "journalled"))?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn pending_custody_outlives_dedup_tidy_and_repeats_original_receipt() -> Result<(), Refusal> {
+        let i = Inbox::new(Arc::new(SimRecords::new()), Limits { keep: 1, trim: 1, read: 4 });
+        let first = block(i.accept_pending("s1", "old", &digest("original", &[]), Some(0), 10, &pending_message("old", "original")))?;
+        block(i.accept("s1", "new", &digest("new", &[]), Some(0), 20))?;
+        let _ = block(i.tidy("s1"));
+        let repeat = block(i.accept_pending("s1", "old", &digest("original", &[]), Some(0), 30, &pending_message("old", "original")))?;
+        assert_eq!(repeat, Answer { repeat: true, ..first });
+        assert!(block(i.pending("s1", "old"))?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_custody_stays_until_exact_server_ack() -> Result<(), Refusal> {
+        use crate::harness::{admission::{Consumption, Disposition}, mail::Token};
+        let i = inbox();
+        let first = block(i.accept_pending("s1", "m", &digest("words", &[]), Some(0), 10, &pending_message("m", "words")))?;
+        block(i.dispose_pending("s1", "m", 0, Disposition::Consumed { boundary: Consumption::ProviderAccepted }))?;
+        let repeat = block(i.accept("s1", "m", &digest("words", &[]), Some(0), 99))?;
+        assert_eq!(repeat, Answer { repeat: true, ..first });
+        assert!(!block(i.acknowledge_pending("s1", "m", 0, &Token { revision: 1, generation: 2 }, Some(&Disposition::Consumed { boundary: Consumption::ProviderAccepted })))?);
+        assert!(!block(i.acknowledge_pending("s1", "m", 1, &Token { revision: 1, generation: 1 }, Some(&Disposition::Consumed { boundary: Consumption::ProviderAccepted })))?);
+        assert!(!block(i.acknowledge_pending("s1", "m", 0, &Token { revision: 1, generation: 1 }, None))?, "a delayed nonterminal ACK must not clear a later terminal receipt");
+        assert!(!block(i.acknowledge_pending("s1", "m", 0, &Token { revision: 1, generation: 1 }, Some(&Disposition::Consumed { boundary: Consumption::WaitHandoff })))?, "an ACK must bind the exact observed terminal boundary");
+        assert!(block(i.pending("s1", "m"))?.is_some());
+        assert!(block(i.acknowledge_pending("s1", "m", 0, &Token { revision: 1, generation: 1 }, Some(&Disposition::Consumed { boundary: Consumption::ProviderAccepted })))?);
+        assert!(block(i.pending("s1", "m"))?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_handoff_batch_retains_every_original_before_any_terminal_receipt() -> Result<(), Refusal> {
+        use crate::harness::admission::{Consumption, Disposition};
+        let i = inbox();
+        for message in ["first", "second"] {
+            block(i.accept_pending("s1", message, &digest(message, &[]), Some(0), 10, &pending_message(message, message)))?;
+        }
+        let disposition = Disposition::Consumed { boundary: Consumption::WaitHandoff };
+        assert!(block(i.dispose_pending_batch("s1", &["first".into(), "missing".into()], 0, &disposition)).is_err());
+        let original = block(i.pending("s1", "first"))?.ok_or_else(|| unavailable("s1", "fixture original missing"))?;
+        assert!(original.disposition.is_none(), "a failed batch must not partially return credit");
+        assert!(matches!(original.command, Some(crate::harness::model::Command::Send { text, .. }) if text == "first"));
+        let disposed = block(i.dispose_pending_batch("s1", &["first".into(), "second".into(), "first".into()], 0, &disposition))?;
+        assert_eq!(disposed.len(), 2, "the actual batch quantum counts distinct source communications");
+        for message in ["first", "second"] {
+            let saved = block(i.pending("s1", message))?.ok_or_else(|| unavailable("s1", "fixture terminal custody missing"))?;
+            assert_eq!(saved.disposition, Some(disposition.clone()));
+            assert!(matches!(saved.command, Some(crate::harness::model::Command::Send { text, .. }) if text == message));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_edit_versions_current_words_without_rewriting_the_accepted_original_or_receipt() -> Result<(), Refusal> {
+        let i = inbox();
+        let original = pending_message("edited", "accepted original");
+        let answer = block(i.accept_pending("s1", "edited", &digest("accepted original", &[]), Some(0), 10, &original))?;
+        let mut changed = original.current_command().cloned().ok_or_else(|| unavailable("s1", "fixture command missing"))?;
+        if let crate::harness::model::Command::Send { text, .. } = &mut changed { *text = "current explicit edit".into(); }
+        assert_eq!(block(i.edit_pending("s1", "edited", original.lease.clone(), changed))?, 1);
+        let saved = block(i.pending("s1", "edited"))?.ok_or_else(|| unavailable("s1", "fixture current body missing"))?;
+        assert!(matches!(saved.command, Some(crate::harness::model::Command::Send { ref text, .. }) if text == "accepted original"));
+        assert!(matches!(saved.current_command(), Some(crate::harness::model::Command::Send { text, .. }) if text == "current explicit edit"));
+        let repeated = block(i.accept_pending("s1", "edited", &digest("accepted original", &[]), Some(0), 99, &original))?;
+        assert_eq!(repeated, Answer { repeat: true, ..answer }, "immutable publication retry still identifies the accepted original");
+        Ok(())
+    }
+
+    #[test]
+    fn upgrade_adopts_old_dedup_body_and_never_overwrites_a_prior_original() -> Result<(), Refusal> {
+        let i = inbox();
+        block(i.open("s1", 0))?;
+        block(i.accept("s1", "legacy", &digest("retained", &[]), Some(0), 1))?;
+        let recovered = block(i.adopt_pending("s1", pending_message("legacy", "retained"), 2))?;
+        assert_eq!(recovered.origin, Origin::LegacyRetained);
+        assert!(recovered.lease.token.is_none());
+        assert!(matches!(recovered.current_command(), Some(crate::harness::model::Command::Send { text, .. }) if text == "retained"));
+        let prior = block(i.adopt_pending("s1", pending_message("legacy", "later preview"), 3))?;
+        assert!(matches!(prior.current_command(), Some(crate::harness::model::Command::Send { text, .. }) if text == "retained"));
+        let mut lease = pending_message("native", "unused").lease;
+        lease.stage = crate::harness::admission::Stage::ProviderFlight;
+        let opaque = block(i.adopt_pending("s1", Pending::opaque(lease, vec![r#"{"event":"user"}"#.into()]), 4))?;
+        assert_eq!(opaque.origin, Origin::LegacyOpaque);
+        assert!(opaque.current_command().is_none(), "unknown native input is never fabricated as Send");
+        assert_eq!(opaque.opaque_writes.len(), 1);
+        Ok(())
     }
 
     /// CP-T3.2, AC-T3.2.1: a message is taken once. Sent again under its id, the sender gets the

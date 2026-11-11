@@ -224,11 +224,15 @@ export function startAgain(id: string) {
  * permissions, said to come from it); the start and what it kept to send are let go.
  */
 export function putBack(s: Start) {
+  if (s.files.length || s.ids.some((id) => (useHeld.getState().held[id] ?? []).some((message) => message.custody))) {
+    toast.error("The original stays with this start", "Its files or delivery are still held. Retry this start; returning only its text would leave those originals behind.");
+    return;
+  }
   const d = useDrafts.getState();
   if (s.text && !(d.drafts[MISSION_DRAFT] ?? "").trim()) d.setDraft(MISSION_DRAFT, s.text);
   const { kind, cwd, shell, mode, model, effort } = s.spec;
   usePrefill.getState().hand({ from: "As the start that couldn't asked", kind, target: s.target, cwd, shell, mode, model, effort });
-  for (const id of s.ids) useHeld.getState().drop(id, ...(useHeld.getState().held[id] ?? []).map((m) => m.id));
+  for (const id of s.ids) void useHeld.getState().drop(id, ...(useHeld.getState().held[id] ?? []).map((m) => m.id));
   dropStart(s.ids[0] ?? "");
 }
 

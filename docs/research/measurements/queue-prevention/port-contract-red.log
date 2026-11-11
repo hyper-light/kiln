@@ -1,0 +1,3 @@
+Captured actual Reach test 2026-11-11T08:36 UTC, compiled check-1794384968309236000
+Command: kiln run --on e30189ea29182644fe5a4b2e06c7dac2 --needs cpus=1,mem=4g,disk=1g --no-sync --timeout 180 -- /Users/adalundhe/.cache/kiln-offline-state-fix-20261110/red-target/debug/deps/kiln-a2cd230deb814ff5 --exact harness::port::tests::kiln_s_registry_holds_every_harness_port_clause --nocapture
+Exit101. held HARNESS-1; HARNESS-2 unknownUnreachablewantNoSession; HARNESS-3 sendoneUnreachablewantDelivered; HARNESS-4 closedUnreachablewantNoSession; HARNESS-5 sendtoaUnreachablewantDelivered.

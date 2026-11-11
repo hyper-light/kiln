@@ -344,6 +344,12 @@ impl Registry {
         self.inner.lock().peers.remove(&peer);
     }
 
+    /// Opaque identity of this actual authenticated QUIC connection. The exporter itself stays
+    /// private; a reconnect under the same certificate has a different binding.
+    pub(crate) fn connection_id(&self, peer: PeerId) -> Option<String> {
+        self.inner.lock().peers.get(&peer).map(|binding| crate::util::sha256_hex(binding))
+    }
+
     /// How `peer`'s connection reaches the listener: through a tunnel that named its binding, or
     /// directly.
     pub fn transport(&self, peer: PeerId) -> Transport {

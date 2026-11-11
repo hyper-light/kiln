@@ -680,7 +680,7 @@ fn kind_of(data: &[u8]) -> usize {
 
 /// Format: the kinds of agent session update whose reads are expected apart ([`UPDATE_COSTS`]), by the tag each is
 /// written with (`crate::harness::core::Update`'s `t`, in its order; a test holds them to what it writes).
-const UPDATE_TAGS: [&str; 11] = ["open", "closed", "state", "meta", "events", "changes", "stream", "reply", "inbox", "reset", "changes_patch"];
+const UPDATE_TAGS: [&str; 12] = ["open", "closed", "state", "meta", "events", "changes", "stream", "reply", "inbox", "reset", "changes_patch", "mail_flow"];
 
 /// What reading an agent session's update of each kind is expected to take, a byte a unit: one for each of [`UPDATE_TAGS`]
 /// (goal 9, plan 01a1a87b2cec step 3), as [`KIND_COSTS`] keeps one for each kind of message. Their JSON costs a byte
@@ -1084,7 +1084,8 @@ impl Carries for AgentMsg {
             | AgentMsg::Placed { .. }
             // Installed skills' JSON is read by `crate::skills`, which keeps what it can.
             | AgentMsg::Skills { .. }
-            | AgentMsg::SkillFile { .. }) => return Ok(Carried::Nothing(m)),
+            | AgentMsg::SkillFile { .. }
+            | AgentMsg::HarnessMailTransfer { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }
@@ -1240,6 +1241,7 @@ impl Carries for ServerMsg {
             | ServerMsg::Copies { .. }
             | ServerMsg::Skills { .. }
             | ServerMsg::SkillFile { .. }
+            | ServerMsg::HarnessMailTransfer { .. }
             | ServerMsg::Later { .. }
             | ServerMsg::Back { .. }) => return Ok(Carried::Nothing(m)),
         };

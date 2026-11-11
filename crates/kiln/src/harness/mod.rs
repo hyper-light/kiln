@@ -25,6 +25,7 @@
 
 pub mod about;
 pub mod acp;
+pub mod admission;
 pub mod answers;
 pub mod antigravity;
 pub mod archive;
@@ -57,6 +58,9 @@ pub mod kinds;
 pub mod limit;
 pub mod lineage;
 pub mod live;
+pub mod mail;
+pub mod mail_delivery;
+pub mod mail_transfer;
 pub mod model;
 pub mod moving;
 pub mod opened;

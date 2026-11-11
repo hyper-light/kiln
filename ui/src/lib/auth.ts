@@ -4,7 +4,7 @@
  * only while signed in.
  */
 import { create } from "zustand";
-import { ApiError, isAuthed, onAuthChange, setAuthed } from "@/api/client";
+import { ApiError, isAuthed, onAuthChange, setAuthed, setMailScope } from "@/api/client";
 import { events } from "@/api/events";
 import type { Me } from "@/api/types";
 import { bootstrapForPage, type PrivateBootstrap } from "./private-bootstrap";
@@ -38,6 +38,7 @@ export const fontsReady: Promise<unknown> =
 
 function accept(me: Me, at: number) {
   if (at !== epoch) return;
+  setMailScope(me.authenticated ? me.mail_scope : null);
   set(me.authenticated ? { kind: "authed", me } : { kind: "anon" });
   setAuthed(me.authenticated);
 }

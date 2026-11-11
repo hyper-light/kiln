@@ -771,6 +771,7 @@ mod tests {
             accept: false,
             mirrors: base.to_path_buf(),
             adopt: None,
+            adopt_policy: crate::harness::moving::stream::StoragePolicy::Off,
             using: Arc::clone(using),
             objects: None,
             sense: false,

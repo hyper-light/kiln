@@ -167,6 +167,7 @@ pub struct Agy {
 }
 
 impl Agy {
+    pub(crate) fn retained_input_ids(&self) -> Vec<super::admission::LegacyFlight> { self.turn.iter().cloned().map(|id| super::admission::LegacyFlight { id, protocol: super::admission::FlightProtocol::Agy, request: None }).collect() }
     pub fn new(spec: &Spec) -> Self {
         Self {
             resumed: spec.resume.clone().filter(|c| !c.trim().is_empty()),
@@ -244,6 +245,9 @@ impl Agy {
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         match cmd {
+            Command::Admit { token, epoch, .. } | Command::MailAck { token, epoch, .. } => core.refuse_owner_mail(Some(token), epoch),
+            Command::MailPeers { epoch, .. } => core.refuse_owner_mail(None, epoch),
+            Command::MailHandoff { client, .. } => { let epoch = core.state.epoch; core.refuse_owner_mail(None, epoch); core.reply(client, serde_json::json!({"error":{"code":super::state_view::Error::Unreadable}})); },
             Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => {
                 // Its go-back is kiln's (`harness::goback`): a checkpoint anchors the prompt's
                 // moment so "restore files to here" reaches back to it.
@@ -353,7 +357,8 @@ impl Agy {
                 None => self.notice(core, Level::Warn, UNSUPPORTED),
             },
             Command::McpEnable { .. } | Command::McpReconnect { .. } => self.notice(core, Level::Warn, UNSUPPORTED),
-            Command::McpRefresh | Command::SkillsReload => {}
+            Command::McpRefresh => {}
+            Command::SkillsReload => core.skills_changed(),
         }
     }
 
@@ -806,6 +811,7 @@ impl Agy {
     }
 
     fn init(&mut self, core: &mut Core, v: &Value) {
+        if !self.ready { core.skills_provider_ready(); }
         let init = v.get("init").unwrap_or(&Value::Null);
         if let Some(c) = v.get("conversation_id").or_else(|| init.get("conversation_id")).and_then(Value::as_str) {
             self.set_conversation(core, c);
@@ -828,6 +834,7 @@ impl Agy {
         if self.conversation.as_deref() == Some(c) {
             return;
         }
+        core.skills_provider_ready();
         if let Some(old) = self.resumed.take().filter(|old| old != c) {
             self.notice(core, Level::Warn, format!("Antigravity couldn't find its conversation {old} on this machine, so this is a new one (what it said before isn't in it)"));
         }
@@ -926,6 +933,7 @@ impl Agy {
                     "CANCELED" | "CANCELLED" => ToolStatus::Cancelled,
                     _ => ToolStatus::Error,
                 };
+                if name == "mcp__kiln__agents_wait" && call.status == ToolStatus::Done && let Some(result) = info.get("output").and_then(Value::as_str).filter(|text| text.len() <= super::state_view::FRAME).and_then(|text| serde_json::from_str::<Value>(text).ok()) { core.observe_handoff_result(&id, &result); }
                 if done {
                     call.ended = Some(Core::now());
                     if self.busy() {
@@ -1008,6 +1016,7 @@ impl Agy {
                 self.notice(core, Level::Error, clip_middle(&error, 2000).0);
             }
         }
+        if status == "SUCCESS" { core.input_consumed(&id, super::admission::Consumption::ProviderCompleted); }
         core.state.delivery.insert(id, if how == "stopped" { Delivery::Cancelled } else { Delivery::Completed });
         core.state.usage.turns += 1;
         core.end_turn(core.state.turn_started, how, Some(&why));

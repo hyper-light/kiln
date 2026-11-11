@@ -24,6 +24,7 @@ pub mod indexes;
 pub mod learner;
 pub mod migrations;
 pub mod runs;
+mod storage;
 
 #[derive(Clone)]
 pub struct Store {

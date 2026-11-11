@@ -239,6 +239,7 @@ classes! {
         AgentMsg::Placed { .. } => Class::Answer,
         AgentMsg::Skills { .. } => Class::State,
         AgentMsg::SkillFile { .. } => Class::Answer,
+        AgentMsg::HarnessMailTransfer { .. } => REFUSED,
     }
 }
 
@@ -324,6 +325,7 @@ classes! {
         ServerMsg::Copies { .. } => Class::State,
         ServerMsg::Skills { .. } => Class::State,
         ServerMsg::SkillFile { .. } => Class::Answer,
+        ServerMsg::HarnessMailTransfer { .. } => REFUSED,
     }
 }
 
@@ -355,6 +357,10 @@ classes! {
         Command::Snapshot => Class::Ask,
         Command::StateRead { .. } => Class::Ask,
         Command::AtState { .. } => REFUSED,
+        Command::Admit { .. } => REFUSED,
+        Command::MailAck { .. } => REFUSED,
+        Command::MailPeers { .. } => REFUSED,
+        Command::MailHandoff { .. } => REFUSED,
         Command::McpEnable { .. } => REFUSED,
         Command::McpReconnect { .. } => REFUSED,
         Command::McpRefresh => REFUSED,
@@ -394,6 +400,7 @@ classes! {
         Update::Inbox { .. } => Class::Answer,
         Update::Reset { .. } => Class::Stream,
         Update::ChangesPatch { .. } => Class::Stream,
+        Update::MailFlow { .. } => Class::Answer,
     }
 }
 
@@ -487,6 +494,7 @@ pub const SOCKETS: &[SocketMsg] = &[
     msg(SESSION, Way::Down, "synced", Class::Stream),
     msg(SESSION, Way::Down, "closed", Class::Stream),
     msg(SESSION, Way::Down, "error", Class::Answer),
+    msg(SESSION, Way::Down, "mail_flow", Class::Answer),
     msg(EVENTS, Way::Up, "unread", Class::Ack),
     msg(EVENTS, Way::Up, "topics", Class::State),
     msg(EVENTS, Way::Down, "event", Class::Stream),

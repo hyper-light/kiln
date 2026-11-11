@@ -1,0 +1,38 @@
+{
+  "role": "implementer",
+  "policy_revision": "749c3ca0602c43dac74976e8db713102f5b15874",
+  "policy_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+  "source": {
+    "ui/src/api/held.ts": "d9d95c8bd8bcf0f9e1a3cc0cccaefa0e9c344c0721eb714fab7900d5fb4bc126",
+    "ui/src/api/harness.ts": "ccf5a403d7eb79fb7807d3d6dfcb31138e52226c6ce24ad6f069f4d3e437826c",
+    "ui/src/api/client.ts": "8c3504c2f78c06cdaeaf527c0464fee910ffc67462ac9fb3eceeee541cd2c678",
+    "ui/src/api/types.ts": "a98451e5dd25264c01aea80df96e8ebc29aac6357da8c5a328f5371135966250",
+    "ui/src/api/session-availability.ts": "5703a871639563bfb313e0dc4570e9fa149df67b46cba4bbb92f7c212e86fad6",
+    "ui/src/lib/auth.ts": "7e1b5d6fa54fada31f18e1301b123a57440ce7c3fd60949c37c08b945606d27d",
+    "ui/src/server/private-bootstrap-data.server.ts": "87304ef69c9d7a447747300fabf1735d0bbe5cc07e6fd229f0219994353f2459",
+    "ui/src/views/harness/agent.tsx": "efe62a0c1b5a9346213d94b50f094584a262289725dc44187aa2c5c6b04b7b2a",
+    "ui/src/views/harness/composer.tsx": "0ba2666338aa44449d705ba046ade1fddfa4389a8c2339e50843e79d65bda63c",
+    "ui/src/views/harness/controls.tsx": "e230089a5e00e5743133eecb911403803025c020e6ec75888adc44c02fa3738a",
+    "ui/src/views/harness/early.tsx": "fc01f1cd05b76e97f942c84439cfe4c03d8c22751cf75f0256f1f98efc2b4203",
+    "ui/src/views/harness/new-agent.tsx": "e620000886d11bbd2351945ed34afaa79dcd057be41aca52bffadd9fb8af1026",
+    "ui/src/views/harness/state.ts": "37ac7d7b9c7e1d5a8c9a83583c0fd705742b299f7d08be8be1f6427b38b37193",
+    "ui/src/views/harness/starting.ts": "b932f0f01a55d0d41320c34a2b1a71862dbc4d40b69891d913f5120671d81219",
+    "ui/src/views/harness/subagent-branch.tsx": "23700dc7d39d0e738ff932f53cf959635179ebcacd15f53881e50b237cb6ce30",
+    "ui/src/views/harness/timeline.tsx": "669cb31b38d3692657d017c8abc54524458ff12391c72215c19043b984309b68",
+    "ui/tests/held.test.ts": "cd0df84baf70c2155c6ea2bc2f37d64f98d77ef6b4952b8ce4e20d94434a8ad5",
+    "ui/tests/held-uploads.test.ts": "e4c4d38eb5c82bb748fea1925a11b6f527603ec56b802380879375f632474b48",
+    "ui/tests/sending.test.ts": "6af47d9e473ca120b7f172c75171398bc92d46e37bd0f0329fc7f79ea8cb009a",
+    "ui/tests/session-store.test.ts": "176291c1e0337128032d9555ff3bb5b65bc7b78038fa52977e05237463ac2a90",
+    "ui/tests/session-availability.test.ts": "a8415d85a73929705921a4cd9f73de2e712612f8833d6b3a63ea071a22769475",
+    "docs/research/measurements/queue-prevention/held-browser-entry.ts": "688508ed51434a5c601e5ce6ef1b3d0a0182f8de0ad04ffda872d5a485057484",
+    "docs/research/measurements/queue-prevention/held-browser.mjs": "e46f09111899e318259cc5658d50e5aa777f1402cc730737d22e3c1d765b3ca4",
+    "docs/research/measurements/queue-prevention/PRODUCER-CUSTODY.md": "4603e6771077ef8342f24a9f567e2db6c64af3fa458fe76f1388b62fe1b3591e"
+  },
+  "checks": {
+    "focused_node": "52 pass, 0 fail, 0 skip; simulated IndexedDB only",
+    "typescript_app": "exit 0",
+    "eslint_named_paths": "exit 0",
+    "production_build": "not run",
+    "native_browser": "coordinator-owned; not run by implementer"
+  }
+}

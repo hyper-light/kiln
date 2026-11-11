@@ -1,0 +1,70 @@
+{
+  "captured_at": "2026-11-11T08:13:07.484523+00:00",
+  "canonical": {
+    "path": "/Users/adalundhe/.local/bin/kiln",
+    "is_symlink": false,
+    "resolved": "/Users/adalundhe/.local/bin/kiln",
+    "bytes": 308493200,
+    "mtime_ns": 1794381243022598400,
+    "sha256": "1ae92b19b6acf6a2f5e91e7efeffe0f249236fa26c30c5c5d6b71d73f2a04ad9",
+    "known_commit_byte_offsets": {
+      "f555736bd887a4196c8841564cb9b4d6c1ede95f": 154386012,
+      "32f174b2c46a634ae0b072f3dc73764919523327": -1
+    },
+    "file": {
+      "exit": 0,
+      "stdout": "/Users/adalundhe/.local/bin/kiln: Mach-O 64-bit executable arm64",
+      "stderr": ""
+    },
+    "codesign_verify": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "/Users/adalundhe/.local/bin/kiln: valid on disk\n/Users/adalundhe/.local/bin/kiln: satisfies its Designated Requirement"
+    },
+    "version": {
+      "exit": 0,
+      "stdout": "kiln 0.2.0",
+      "stderr": ""
+    }
+  },
+  "service": {
+    "plist": "/Users/adalundhe/Library/LaunchAgents/io.github.hyper-light.kiln-agent.plist",
+    "label": "io.github.hyper-light.kiln-agent",
+    "program": "/Users/adalundhe/.local/share/kiln/launcher/kiln-agent",
+    "has_supervise": true,
+    "has_agent": true,
+    "has_instance": false,
+    "argument_count": 14,
+    "environment_count": 2,
+    "has_join_token_argument": false,
+    "has_join_token_environment": false
+  },
+  "enrollment_paths": [
+    {
+      "path": "/Users/adalundhe/.local/share/kiln/agent/agent.pem",
+      "exists": true
+    },
+    {
+      "path": "/Users/adalundhe/.local/share/kiln/agent/agent.key",
+      "exists": true
+    },
+    {
+      "path": "/Users/adalundhe/.local/share/kiln/agent/ca.pem",
+      "exists": true
+    }
+  ],
+  "free_bytes": 65659174912,
+  "free_floor_plus_copy": 32520747920,
+  "loaded_service": {
+    "exit": 0,
+    "old_supervisor_pid": 1516,
+    "note": "Existing service query completed; raw plist/ProgramArguments/EnvironmentVariables omitted from retained receipt."
+  },
+  "scope": {
+    "read_only": true,
+    "runner": "b24c5c951260dcdfd0972f2aeaf3cf51",
+    "needs": "cpus=1,mem=1g,disk=1g",
+    "sync": false,
+    "service_mutations": 0
+  }
+}

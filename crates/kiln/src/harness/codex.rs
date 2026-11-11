@@ -466,6 +466,13 @@ pub struct Codex {
 }
 
 impl Codex {
+    pub(crate) fn retained_input_ids(&self) -> Vec<super::admission::LegacyFlight> {
+        self.turn_messages.iter().cloned().chain(self.pending.values().filter_map(|pending| match pending {
+            Pending::Turn(id) | Pending::Steer(id, _) => Some(id.clone()),
+            Pending::ChildTurn { m, .. } | Pending::ChildSteer { m, .. } => Some(m.id.clone()),
+            _ => None,
+        })).chain(self.relays.values().flat_map(|ids| ids.iter().cloned())).collect::<std::collections::BTreeSet<_>>().into_iter().map(|id| super::admission::LegacyFlight { id, protocol: super::admission::FlightProtocol::Codex, request: None }).collect()
+    }
     pub fn from_spec(spec: &super::session::Spec) -> Self {
         let mut c = Self::new(spec.resume.clone(), spec.model.clone(), spec.mode.clone(), spec.allow_bypass);
         c.effort = spec.effort.clone().filter(|e| !e.is_empty());
@@ -1302,7 +1309,7 @@ impl Codex {
     }
 
     fn accepting(&self, core: &Core) -> bool {
-        self.thread.is_some() && !self.reopen && !self.injecting
+        core.input_ready() && self.thread.is_some() && !self.reopen && !self.injecting
             && core.state.status != Status::Exited
             && !matches!(self.thread_status, Some(Status::Starting | Status::Exited))
             && !self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Thread | Pending::History | Pending::Inject | Pending::InstalledSkillRoots))
@@ -1451,6 +1458,9 @@ impl Codex {
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         self.restore_waiting(core);
         match cmd {
+            Command::Admit { token, epoch, .. } | Command::MailAck { token, epoch, .. } => core.refuse_owner_mail(Some(token), epoch),
+            Command::MailPeers { epoch, .. } => core.refuse_owner_mail(None, epoch),
+            Command::MailHandoff { client, .. } => { let epoch = core.state.epoch; core.refuse_owner_mail(None, epoch); core.reply(client, serde_json::json!({"error":{"code":super::state_view::Error::Unreadable}})); },
             Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => {
                 // A checkpoint anchors the prompt's moment: kiln's go-back file restore
                 // (`harness::goback`) reaches back to it (Codex's own rewind has no files side).
@@ -1669,6 +1679,7 @@ impl Codex {
                 self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, mode);
             }
             Command::SkillsReload => {
+                core.skills_changed();
                 self.installed_skill_roots(core);
                 let cwd = core.state.cwd.clone();
                 self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd], "forceReload": true}));
@@ -2511,13 +2522,14 @@ impl Codex {
                         core.state.turn_started = None;
                         core.state.doing = None;
                     }
-                    core.state.delivery.insert(id, Delivery::Cancelled);
-                    self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
+                    if !core.input_retained(&id) { core.state.delivery.insert(id, Delivery::Cancelled); }
+                    self.notice(core, Level::Error, format!("Codex refused the message; accepted work remains retained for retry: {msg}"));
                     core.touch_state();
                 }
                 Pending::Steer(id, _) => {
-                    core.state.delivery.insert(id, Delivery::Cancelled);
-                    self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
+                    self.turn_messages.retain(|message| message != &id);
+                    if !core.input_retained(&id) { core.state.delivery.insert(id, Delivery::Cancelled); }
+                    self.notice(core, Level::Error, format!("Codex refused the message; accepted work remains retained for retry: {msg}"));
                     core.touch_state();
                 }
                 // Codex takes nothing on that subagent's thread from kiln (a multi-agent v2 agent,
@@ -2715,6 +2727,7 @@ impl Codex {
                 }
                 let thread = result.get("thread").cloned().unwrap_or(Value::Null);
                 if let Some(id) = thread.get("id").and_then(Value::as_str) {
+                    if self.thread.as_deref() != Some(id) { core.skills_provider_ready(); }
                     self.thread = Some(id.to_owned());
                     core.state.harness_session = Some(id.to_owned());
                 }
@@ -4020,15 +4033,25 @@ impl Codex {
                     .and_then(Value::as_array)
                     .map(|c| c.iter().filter_map(|x| x.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"))
                     .unwrap_or_default();
-                let text = text.split("\n\nAttached files:\n").next().unwrap_or(&text).to_owned();
                 // A subagent's own: one kiln sent it for a person (its id, as Codex says it back).
                 let client = item.get("clientId").and_then(Value::as_str).map(str::to_owned).filter(|c| thread.is_none() || core.state.delivery.contains_key(c));
+                let original = client.as_deref().and_then(|client| core.skill_original(client, &text));
+                let text = text.split("\n\nAttached files:\n").next().unwrap_or(&text).to_owned();
                 let key = client.clone().unwrap_or_else(|| id.clone());
                 if let Some(c) = &client
                     && core.state.delivery.contains_key(c)
                 {
+                    // Codex 0.162.1 emits this after native pending input enters model history;
+                    // turn/start and turn/steer RPC replies happen before that boundary.
+                    if core.get(c).is_some_and(|event| matches!(&event.body, Body::User { client_id: Some(original), .. } if original == c)) {
+                        core.input_consumed(c, super::admission::Consumption::ProviderAccepted);
+                    }
                     core.state.delivery.insert(c.clone(), if done { Delivery::Completed } else { Delivery::Started });
                     core.touch_state();
+                }
+                if let Some(original) = original {
+                    core.upsert(&key, parent.clone(), original);
+                    return;
                 }
                 if thread.is_none() && core.state.goal.is_empty() && !text.trim().is_empty() {
                     core.state.goal = clip_middle(text.trim(), 600).0;
@@ -4200,6 +4223,7 @@ impl Codex {
                     "completed" | "failed" => ToolStatus::Error,
                     _ => ToolStatus::Running,
                 };
+                if thread.is_none() && server == "kiln" && tool_name == "agents_wait" && status == ToolStatus::Done && let Some(result) = item.get("result") { core.observe_handoff_result(&id, result); }
                 let output = item
                     .get("error")
                     .and_then(|e| e.get("message"))
@@ -5048,6 +5072,50 @@ fn file_changes(v: Option<&Value>, cwd: &str) -> Vec<FileDiff> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_user_input_dequeue_returns_credit_but_rpc_ack_and_unidentified_items_do_not() -> anyhow::Result<()> {
+        use crate::harness::admission::{Input, Lease, PhysicalBudget, Stage};
+        let mut c = Codex::new(None, None, None, false);
+        let mut core = Core::new();
+        let inbox = std::sync::Arc::new(crate::harness::inbox::Inbox::new(std::sync::Arc::new(kiln_seams::records::SimRecords::new()), crate::harness::inbox::Limits::default()));
+        let input = Input::new(0, PhysicalBudget::new(1024), inbox);
+        input.controller.lock().restore(Lease { message: "original".into(), peer: "peer".into(), epoch: 0, bytes: 8, stage: Stage::ProviderFlight, token: None, handoff: None }).map_err(|error| anyhow::anyhow!("fixture restore: {error:?}"))?;
+        core.input = Some(input.clone());
+        core.upsert("original", None, Body::User { text: "original".into(), images: 0, client_id: Some("original".into()), origin: Some("agent".into()), attachments: Vec::new(), reply_to: None });
+        c.request(&mut core, Pending::Turn("original".into()), "turn/start", json!({"clientUserMessageId":"original","input":[{"type":"text","text":"original"}]}));
+        let request = written(&mut core).into_iter().next().ok_or_else(|| anyhow::anyhow!("fixture request missing"))?;
+        c.response(&mut core, request.get("id").ok_or_else(|| anyhow::anyhow!("fixture request id missing"))?, &json!({"result":{"turn":{"id":"turn"}}}));
+        assert!(core.input_receipts.is_empty(), "native RPC routing acceptance is earlier than model-history dequeue");
+        c.item(&mut core, &json!({"id":"missing-client","type":"userMessage","content":[{"type":"text","text":"original"}]}), false);
+        assert!(core.input_receipts.is_empty(), "text without exact source identity is not proof");
+        c.item(&mut core, &json!({"id":"unrelated-client","type":"userMessage","clientId":"unrelated","content":[{"type":"text","text":"original"}]}), false);
+        assert!(core.input_receipts.is_empty());
+        let native = json!({"id":"native-original","type":"userMessage","clientId":"original","content":[{"type":"text","text":"original"}]});
+        c.item(&mut core, &native, false);
+        c.item(&mut core, &native, true);
+        assert_eq!(core.input_receipts.len(), 1, "item started/completed are one observed dequeue");
+        assert_eq!(core.input_receipts.first().map(|receipt| receipt.messages.as_slice()), Some(["original".to_owned()].as_slice()));
+        assert!(input.controller.lock().lease("original").is_some(), "durable receipt flush still owns final release");
+        Ok(())
+    }
+
+    #[test]
+    fn w20_r01_only_exact_emitted_skill_echo_projects_the_original_user_message() {
+        let mut c = Codex::new(None, None, None, false);
+        let mut core = Core::new();
+        let original = Body::User { text: "Report material changes.".into(), images: 1, client_id: Some("peer-message".into()), origin: Some("agent".into()), attachments: vec!["diagram.png".into()], reply_to: Some("prior-context".into()) };
+        core.upsert("peer-message", None, original.clone());
+        let effective = "<kiln_installed_skills>\nGenerated catalogue\n</kiln_installed_skills>\nReport material changes.\n\nAttached files:\n- diagram.png";
+        core.skill_projections(vec![crate::skills::bridge::Projection { request_id: Some(json!(42)), client_id: Some("peer-message".into()), effective_digest: crate::skills::bridge::digest(effective) }]);
+        c.item(&mut core, &json!({"id":"native-item","type":"userMessage","clientId":"peer-message","content":[{"type":"text","text":effective}]}), false);
+        assert_eq!(core.get("peer-message").and_then(|e| serde_json::to_value(&e.body).ok()), serde_json::to_value(&original).ok(), "projection before attachment splitting preserves original text, peer origin, files and reply");
+        let mut adopted = Core::thaw(core.freeze());
+        assert!(adopted.skill_original("peer-message", effective).is_some(), "same live-provider adoption retains exact emitted provenance");
+        let literal = "<kiln_installed_skills>\nA real person pasted these literal tags.\n</kiln_installed_skills>";
+        c.item(&mut adopted, &json!({"id":"another-native-item","type":"userMessage","clientId":"new-human-message","content":[{"type":"text","text":literal}]}), false);
+        assert!(matches!(adopted.get("new-human-message").map(|e| &e.body), Some(Body::User { text, .. }) if text == literal), "unregistered literal content is never stripped");
+    }
 
     #[test]
     fn mc_attention_codex_exit_does_not_end_reach_work() {

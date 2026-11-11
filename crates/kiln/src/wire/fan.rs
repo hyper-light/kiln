@@ -81,7 +81,7 @@ pub enum Head<'a> {
 /// what it can do, which sessions it holds, and a session going from one of its processes to another.
 /// A runner's admission (docs/resilience.md R5) is one too: what of it is taken hangs on its `Admit`, and its `Settled`
 /// ends it once its earlier updates are taken.
-const BARRIERS: &[&str] = &["Hello", "Machine", "Instance", "Build", "Caps", "HarnessInventory", "HarnessHandOver", "HarnessAdopted", "Admit", "Settled", "Features"];
+const BARRIERS: &[&str] = &["Hello", "Machine", "Instance", "Build", "Caps", "HarnessInventory", "HarnessHandOver", "HarnessAdopted", "Admit", "Settled", "Features", "HarnessMailTransfer"];
 
 /// Its variants that read what its runner's sessions said (where one runs, its epoch, its holder): word of a
 /// frame it couldn't read, about a session it holds; an identity it asks for one (answered at once once the
