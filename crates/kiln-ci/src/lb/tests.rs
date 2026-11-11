@@ -316,6 +316,87 @@ fn w05_r04_a_runner_that_lets_a_kind_down_doesnt_keep_it() -> Result<(), String>
     caught(Mutant::StaysOnALoser, a_bad_place_is_left)
 }
 
+/// A failure no one can explain is settled by comparison (W05-R04; docs/lb.md "Good places"). The
+/// kind's next run goes elsewhere once. When it goes well there, the first runner was at fault
+/// and is passed over for the kind from then on, though the turn comes to it. When it fails there
+/// too, the work was: it stays where it now is through its further failures, and moves again
+/// only at its first failure after it has gone well.
+fn settled_by_comparison() -> Result<(), String> {
+    for fast in [false, true] {
+        let new = || -> Result<(Owner, Vec<Runner>, SigId), String> {
+            if fast {
+                let (o, rs, s, _) = rig(4, 0).map_err(str::to_owned)?;
+                Ok((o, rs, s))
+            } else {
+                Ok(fleet(4, C8))
+            }
+        };
+        // A run of `kind` started and left running: where, and what ends it.
+        let start = |o: &mut Owner, rs: &mut [Runner], s: SigId, kind: KindId| -> Result<(u32, Handle, Handle), String> {
+            if fast {
+                fast_start_kind(o, rs, s, kind, CPU as u32)?.ok_or_else(|| "no pick".to_owned())
+            } else {
+                let (r, run, at) = ask_start_kind(o, rs, s, kind, [CPU, 0, 0, 0]).ok_or("no start")?;
+                Ok((r.0, at, run))
+            }
+        };
+        let end = |o: &mut Owner, rs: &mut [Runner], held: (u32, Handle, Handle)| -> Result<(), String> {
+            if fast {
+                fast_end(o, rs, held)
+            } else {
+                end_run(o, rs, RunnerId(held.0), held.1);
+                Ok(())
+            }
+        };
+        // The node's fault: it goes well on 0, fails there unexplained, goes well on 1.
+        let (mut o, mut rs, s) = new()?;
+        let mut seen = Vec::new();
+        for said in [Some(true), None, Some(true)] {
+            let held = start(&mut o, &mut rs, s, KIND)?;
+            seen.push(held.0);
+            end(&mut o, &mut rs, held)?;
+            match said {
+                Some(true) => o.won(RunnerId(held.0), KIND),
+                _ => o.unsure(RunnerId(held.0), KIND),
+            }
+        }
+        // Two runs of no kind take the turn round to runner 0 again; the kind's own run goes
+        // to its place, 1, and stays running there; its next finds the turn at 0 and passes it.
+        for _ in 0..2 {
+            let held = start(&mut o, &mut rs, s, KindId::NONE)?;
+            end(&mut o, &mut rs, held)?;
+        }
+        seen.push(start(&mut o, &mut rs, s, KIND)?.0);
+        seen.push(start(&mut o, &mut rs, s, KIND)?.0);
+        if seen != [0, 0, 1, 1, 2] {
+            return Err(format!("fast {fast}: a kind that failed on 0 and then went well on 1 ran on {seen:?}: 0, 0, 1, 1, then 2 with the turn at 0"));
+        }
+        // The work's own fault: it fails on 0 and then on 1 too, keeps failing, goes well,
+        // then fails once more.
+        let (mut o, mut rs, s) = new()?;
+        let mut seen = Vec::new();
+        for well in [true, false, false, false, false, true, false, true] {
+            let held = start(&mut o, &mut rs, s, KIND)?;
+            seen.push(held.0);
+            end(&mut o, &mut rs, held)?;
+            if well {
+                o.won(RunnerId(held.0), KIND);
+            } else {
+                o.unsure(RunnerId(held.0), KIND);
+            }
+        }
+        if seen != [0, 0, 1, 1, 1, 1, 1, 2] {
+            return Err(format!("fast {fast}: a kind failing for its own sake ran on {seen:?}: it moves once, from 0 to 1, keeps 1 while it fails, and moves again only at its first failure after going well"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn w05_r04_a_failure_no_one_can_explain_is_settled_by_comparison() -> Result<(), String> {
+    caught(Mutant::StaysOnALoser, settled_by_comparison)
+}
+
 /// W05-R04, W05-R23: on measured runners a kind goes back to its good place only while that
 /// runner's cores are as fast as the fastest with one free. Runners 0 and 1 have cores twice the
 /// reference's and runner 2 the reference's: the kind's narrow runs, let down on 0, go on to 1,
@@ -1440,7 +1521,8 @@ fn w05_r26_a_tied_pick_chooses_and_leaves_what_its_two_moves_do() -> Result<(), 
                     return Err(format!("case {case} step {step}: the twins hold {x:?} and {y:?}"));
                 }
                 // Of half of the runs their shell says they went well (of half of those with the
-                // end, in one), of a quarter that their runner let them down, of the rest nothing:
+                // end, in one), of a quarter that their runner let them down, of an eighth that
+                // they failed and it can't say whose fault it was, of the rest nothing:
                 // one twin keeps what that says of a runner whose move is put off with the move,
                 // the other makes every move first.
                 let said = rng.below(8);
@@ -1459,6 +1541,10 @@ fn w05_r26_a_tied_pick_chooses_and_leaves_what_its_two_moves_do() -> Result<(), 
                     4 | 5 => {
                         a.failed(RunnerId(x.0), kind);
                         with_two_moves(|| b.failed(RunnerId(y.0), kind));
+                    }
+                    6 => {
+                        a.unsure(RunnerId(x.0), kind);
+                        with_two_moves(|| b.unsure(RunnerId(y.0), kind));
                     }
                     _ => {}
                 }

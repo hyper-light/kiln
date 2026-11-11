@@ -137,18 +137,32 @@ const NO_KIND: u32 = NIL - 1;
 
 const NO_PEND: Pend = Pend { r: NIL, from: 0, to: 0, was: 0, kind: NO_KIND };
 
-/// What an owner keeps of each kind of work (docs/lb.md "Good places"): two runners.
+/// What an owner keeps of each kind of work (docs/lb.md "Good places"): two runners, and what
+/// its last ends left to settle.
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 struct Kind {
     /// The runner its work last went well on, by its shell's judgment ([`Owner::won`]), unless
     /// that runner has let it down since (NIL: none).
     good: u32,
-    /// The runner that last let its work down ([`Owner::failed`]), unless it has gone well there
+    /// [`SETTLED`], [`DOUBT`] or [`RED`]. Beside `good`, so a win writes the two at once.
+    state: u32,
+    /// The runner that last let its work down ([`Owner::failed`]), or that it failed on with no
+    /// one able to say whose fault it was ([`Owner::unsure`]), unless it has gone well there
     /// since (NIL: none): passed over when the turn comes to it and another is as free.
     shun: u32,
 }
 
-const NO_PLACES: Kind = Kind { good: NIL, shun: NIL };
+/// A kind's state: nothing to settle.
+const SETTLED: u32 = 0;
+/// A kind's state: its last run failed on `shun` and no one can say whose fault it was. Its next
+/// run goes elsewhere, and what becomes of that one settles it ([`Owner::unsure`]).
+const DOUBT: u32 = 1;
+/// A kind's state: its work fails wherever it runs (it failed on two runners running), so a
+/// failure no one can explain is its own, and is held against no runner until it goes well.
+const RED: u32 = 2;
+
+const NO_PLACES: Kind = Kind { good: NIL, state: SETTLED, shun: NIL };
 
 #[cfg(test)]
 thread_local! {
@@ -877,7 +891,7 @@ impl Owner {
             return None;
         }
         let last = self.last();
-        let Kind { good, shun } = self.places::<K>(kind);
+        let Kind { good, shun, .. } = self.places::<K>(kind);
         let s = self.sigs.get_mut(si as usize)?;
         if from >= kp || s.ix.top() != Some(kp) {
             return None;
@@ -940,7 +954,7 @@ impl Owner {
             return None;
         }
         let last = self.last;
-        let Kind { good, shun } = self.places::<K>(kind);
+        let Kind { good, shun, .. } = self.places::<K>(kind);
         let s = self.sigs.get_mut(si as usize)?;
         let o = s.orders.get_mut(orders::NARROW)?;
         let c = o.top()?;
@@ -1057,7 +1071,7 @@ impl Owner {
     #[inline(never)]
     fn ask_top<const K: bool>(&mut self, si: u32, kind: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
         let last = self.last();
-        let Kind { good, shun } = self.places::<K>(kind);
+        let Kind { good, shun, .. } = self.places::<K>(kind);
         let s = self.sigs.get_mut(si as usize)?;
         let top = s.ix.top()?;
         // The kind's good place when it is as free as the most free and has the room: the
@@ -1135,6 +1149,7 @@ impl Owner {
         }
         let Some(k) = self.kinds.get_mut(kind.0 as usize) else { return self.won_new(r, kind) };
         k.good = r.0;
+        k.state = SETTLED;
         if k.shun == r.0 {
             k.shun = NIL;
         }
@@ -1203,21 +1218,78 @@ impl Owner {
         }
         if let Some(k) = self.kinds.get_mut(kind.0 as usize) {
             k.shun = r.0;
+            k.state = SETTLED;
             if k.good == r.0 {
                 k.good = NIL;
             }
         }
-        if self.pend.r == r.0 && self.pend.kind == kind.0 {
+        self.left(r.0, kind.0);
+    }
+
+    /// Runner `r` is no longer kind `kind`'s good place: not in the move put off, nor in a
+    /// batch's rise.
+    fn left(&mut self, r: u32, kind: u32) {
+        if self.pend.r == r && self.pend.kind == kind {
             self.pend.kind = NO_KIND;
         }
         if self.pend.r == MANY
-            && let Some(rise) = self.put_off.iter_mut().rev().find(|x| x.r == r.0 && x.kind == kind.0)
+            && let Some(rise) = self.put_off.iter_mut().rev().find(|x| x.r == r && x.kind == kind)
         {
             rise.kind = NO_KIND;
         }
         #[cfg(test)]
         if TWO_MOVES.with(std::cell::Cell::get) {
             self.flush();
+        }
+    }
+
+    /// The run of kind `kind` this owner last heard end on runner `r` failed, and its shell
+    /// can't say whether the node or the work was at fault (no cause it knows, as
+    /// [`Owner::failed`] has). The kernel settles it by comparison, with no rate or count to set:
+    /// the kind's next run goes elsewhere once (`r` is passed over for it as a runner that let
+    /// it down is). If it goes well there, `r` was at fault and stays passed over; if it fails
+    /// there too, the work was: nothing is held against either runner, the kind stays where it
+    /// now is, and its further failures are its own until a run of it goes well. So work that is
+    /// failing for its own sake moves once and then keeps its place, and a node that fails a kind
+    /// of work that passes elsewhere loses it at the first failure.
+    pub fn unsure(&mut self, r: RunnerId, kind: KindId) {
+        #[cfg(test)]
+        if super::planted(super::Mutant::StaysOnALoser) {
+            return;
+        }
+        if !self.know(kind.0) {
+            return;
+        }
+        let Some(k) = self.kinds.get_mut(kind.0 as usize) else { return };
+        match k.state {
+            // The work is failing wherever it runs: this failure is its own, and it stays here.
+            RED => k.good = r.0,
+            // It failed on another runner just before: the work's fault, not either runner's.
+            DOUBT if k.shun != r.0 => *k = Kind { good: r.0, state: RED, shun: NIL },
+            // The same runner again (no other was as free): nothing new is known.
+            DOUBT => {}
+            // Its first failure after going well, or its first run: it goes elsewhere once.
+            _ => {
+                k.state = DOUBT;
+                k.shun = r.0;
+                if k.good == r.0 {
+                    k.good = NIL;
+                }
+            }
+        }
+        if k.good == r.0 {
+            // Its place is here (the work's own failure): as a win leaves it.
+            if self.pend.r == r.0 {
+                self.pend.kind = kind.0;
+            } else {
+                self.won_slow(r.0, kind.0);
+            }
+            #[cfg(test)]
+            if TWO_MOVES.with(std::cell::Cell::get) {
+                self.flush();
+            }
+        } else {
+            self.left(r.0, kind.0);
         }
     }
 
@@ -1413,7 +1485,7 @@ impl Owner {
         if super::planted(super::Mutant::MostLoaded) || super::planted(super::Mutant::Unordered) {
             return self.pick_mutant(sig, need);
         }
-        let Kind { good, shun } = self.kinds.get(kind as usize).copied().unwrap_or(NO_PLACES);
+        let Kind { good, shun, .. } = self.kinds.get(kind as usize).copied().unwrap_or(NO_PLACES);
         let fits = |r: u32| self.peers.get(r as usize).is_some_and(|p| u64::from(p.view) >= need[0]) && (cpu_only || self.rest_fits_at(r, need));
         // The kind's good place when it is as free as the most free and fits (the bucket's turn
         // moves only when it is the one there), else the next in turn, passing over the runner
@@ -1824,6 +1896,7 @@ impl Owner {
             // The kind's good place first, then the move put off with its kind, written once.
             let Some(k) = self.kinds.get_mut(kind as usize) else { return self.ended_won_new(r, from, to, was, kind) };
             k.good = r;
+            k.state = SETTLED;
             if k.shun == r {
                 k.shun = NIL;
             }

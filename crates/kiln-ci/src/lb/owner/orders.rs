@@ -385,7 +385,7 @@ impl Owner {
         if m == NIL {
             return self.pick(si, kind, need, cpu_only);
         }
-        let super::Kind { good, shun } = self.kinds.get(kind as usize).copied().unwrap_or(super::NO_PLACES);
+        let super::Kind { good, shun, .. } = self.kinds.get(kind as usize).copied().unwrap_or(super::NO_PLACES);
         if skip == 0
             && let Some(s) = self.sigs.get(si as usize)
             && let Some(top) = s.ix.top()

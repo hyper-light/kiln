@@ -290,15 +290,16 @@ impl World {
         let told = self.owners.get_mut(o as usize).ok_or("owner")?.hear(m, &mut out);
         self.note(format_args!("up {o} {r} {m:?} -> {told:?}"));
         // What an owner's shell says of an end it hears (W05-R04, docs/lb.md "Good places"): of
-        // half that the run's kind of work went well there, of a quarter that its runner let it
-        // down, of the rest nothing.
+        // two in five that the run's kind of work went well there, of one that its runner let it
+        // down, of one that it failed and no one can say whose fault it was, of the last nothing.
         if let ToOwner::Ended { runner, run, .. } = m {
             let kind = self.by.get(&(o, run)).and_then(|i| self.asks.get(*i)).map_or(KindId::NONE, |a| a.kind);
-            let said = self.wins.below(4);
+            let said = self.wins.below(5);
             let owner = self.owners.get_mut(o as usize).ok_or("owner")?;
             match said {
                 0 | 1 => owner.won(runner, kind),
                 2 => owner.failed(runner, kind),
+                3 => owner.unsure(runner, kind),
                 _ => {}
             }
             self.note(format_args!("said {o} {} {kind:?} {said}", runner.0));
