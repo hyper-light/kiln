@@ -149,9 +149,15 @@ decides as before. The buckets cover the most core-equivalents any runner's whol
 
 ## Orders
 
-Beside its index each signature keeps, once something is measured, an order by each rate a run's
-finish divides by: the key multiplier, per-core speed over slowness (narrow asks), disk, this
-owner's link, the runner's network (`lb::Order`). A member's class is its rate's place on a log scale: the octave (its top bit) and
+Beside its index each signature can keep an order by each rate a run's finish divides by: the key
+multiplier, per-core speed over slowness (narrow asks), disk, this owner's link, the runner's
+network (`lb::Order`). The first non-reference CPU measurement activates the CPU order once.
+Each byte-rate order is populated from current membership and facts when an ask first needs it;
+that first ask pays its construction cost. Subsequent facts, joins, departures and room changes
+maintain active orders. An unused order has no heap storage, and CPU-only updates do not load the
+separate byte-rate facts. No TTL, eviction threshold or guessed capacity controls these indexes
+(W05-R26). Cold construction and first-use timings are reported separately from warmed throughput
+by the benchmark's `--cold` mode. A member's class is its rate's place on a log scale: the octave (its top bit) and
 the six bits below it, 64 classes an octave, rates in one class within 1/64 of each other; 64
 octaves of a u64 times 64 is BUCKETS, so the highest class is two leading-zeros counts away, as
 the index's top bucket is. Members of a class take turns in a ring through their neighbours:

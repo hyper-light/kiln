@@ -157,6 +157,9 @@ impl Owner {
             }
             return self.ask_most(sig.0, need, out);
         }
+        // W05-R26: create only the rate indexes this ask reads; a CPU measurement need not
+        // prepay disk/link/network construction. Their first use pays the explicit build.
+        self.keep_orders([false, terms.io_bytes != 0, terms.bytes != 0, terms.net_bytes != 0]);
         self.flush();
         self.clean();
         let si = sig.0;
@@ -175,7 +178,7 @@ impl Owner {
         // The terms compared: those every member with a core free (none in its order's class 0,
         // a rate below 2 bytes a second) and every listed candidate has measured.
         let on = {
-            let order = |o: usize| self.orders_on && self.sigs.get(si as usize).and_then(|s| s.orders.get(o)).is_some_and(|x| !x.has(0));
+            let order = |o: usize| self.orders_kept & (1 << o) != 0 && self.sigs.get(si as usize).and_then(|s| s.orders.get(o)).is_some_and(|x| !x.has(0));
             let mut on = On { disk: order(DISK), net: order(NET), link: order(LINK) };
             for (r, _) in listed.iter().filter_map(|w| listed_at(self, w)) {
                 let c = self.cold.get(r as usize).copied().unwrap_or_default();

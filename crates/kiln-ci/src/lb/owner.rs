@@ -334,8 +334,8 @@ pub struct Owner {
     /// slowness that differs from it): bucket lower bounds don't promise CPUs, and a narrow ask's
     /// order is the narrow one, not the index's (docs/lb.md "Rank").
     ordered: bool,
-    /// The signatures keep their orders by measured rates.
-    orders_on: bool,
+    /// Which rate orders have actually been requested (one bit per order kind).
+    orders_kept: u8,
     /// The runners whose places in the disk, link and network orders are put off ([`DIRTY`]).
     dirty: Vec<u32>,
     /// The candidates an [`Owner::ask_with`] has seen, kept to reuse (a shared owner draws
@@ -407,7 +407,7 @@ fn mark(flags: &mut u32, dirty: &mut Vec<u32>, r: u32) {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, dirty: Vec::new(), seen: Vec::new(), counts: Counts::default(), draws: Draws::default(), weights: Weights::default(), eligible: Vec::new(), auction: false, prior: terms::Priors::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_kept: 0, dirty: Vec::new(), seen: Vec::new(), counts: Counts::default(), draws: Draws::default(), weights: Weights::default(), eligible: Vec::new(), auction: false, prior: terms::Priors::default() }
     }
 
     /// Grows every index to `want` buckets when that is more than they have.
@@ -476,9 +476,10 @@ impl Owner {
             *c = Cold { budget, word_rest: word.rest, inflight_rest: [0; 3], speed: word.speed, slowness: word.slowness, disk: word.disk, net: word.net, measured: word.measured, link: c.link, rates: c.rates };
         }
         self.restamp(r.0);
-        self.rerate(r.0);
         if word.measured != 0 {
             self.measures_heard(r.0);
+        } else {
+            self.rerate(r.0);
         }
     }
 
@@ -493,7 +494,7 @@ impl Owner {
         }
         let mut ix = Index::new(start);
         ix.grow(self.buckets, u32::try_from(self.peers.len()).unwrap_or(NIL));
-        let orders = if self.orders_on { orders::orders() } else { Vec::new() };
+        let orders = orders::orders(self.orders_kept);
         self.sigs.push(Sig { ix, orders, wait_head: NIL, wait_tail: NIL, waiting: 0 });
         SigId(id)
     }
@@ -525,7 +526,7 @@ impl Owner {
                 p.flags |= MORE;
             }
         }
-        if self.orders_on {
+        if self.orders_kept != 0 {
             self.sync_orders(ri);
         }
         if self.waiting != 0 {
@@ -713,7 +714,9 @@ impl Owner {
                 // No whole core left: out of its orders, the narrow one now, the rest when an ask
                 // reads them.
                 o.set(r, NIL);
-                mark(&mut p.flags, &mut self.dirty, r);
+                if self.orders_kept & orders::BYTES != 0 {
+                    mark(&mut p.flags, &mut self.dirty, r);
+                }
             }
         }
         Some((r, run, epoch))
@@ -773,7 +776,7 @@ impl Owner {
         p.inflight = p.inflight.saturating_add(cpu);
         let to = key(p.view, p.scale, self.last);
         s.ix.relink(r, bucket, to);
-        if to == 0 && bucket != 0 && self.orders_on {
+        if to == 0 && bucket != 0 && self.orders_kept & orders::BYTES != 0 {
             mark(&mut p.flags, &mut self.dirty, r);
         }
         Some((r, run, p.epoch()))
@@ -799,7 +802,7 @@ impl Owner {
         let to = key(p.view, p.scale, last);
         s.ix.relink(r, top, to);
         let epoch = p.epoch();
-        if to == 0 && top != 0 && self.orders_on {
+        if to == 0 && top != 0 && self.orders_kept != 0 {
             // No whole core left: out of its orders.
             self.gate(r);
         }
@@ -994,7 +997,7 @@ impl Owner {
                 p.view = p.view.saturating_sub(cpu);
                 p.inflight = p.inflight.saturating_add(cpu);
                 let (epoch, more) = (p.epoch(), p.flags & MORE != 0);
-                if b == step && self.orders_on {
+                if b == step && self.orders_kept & orders::BYTES != 0 {
                     // No whole core left: its orders follow when an ask reads them.
                     mark(&mut p.flags, &mut self.dirty, r);
                 }
@@ -1150,7 +1153,7 @@ impl Owner {
         if more {
             self.relink_more(r, from, to);
         }
-        if self.orders_on && (from == 0) != (to == 0) {
+        if self.orders_kept != 0 && (from == 0) != (to == 0) {
             self.gate(r);
         }
     }
@@ -1518,7 +1521,7 @@ impl Owner {
                 p.flags &= !PUT_OFF;
                 if now != from {
                     s.ix.relink(r, from, now);
-                    if self.orders_on && (from == 0) != (now == 0) {
+                    if self.orders_kept & orders::BYTES != 0 && (from == 0) != (now == 0) {
                         mark(&mut p.flags, &mut self.dirty, r);
                     }
                 }
@@ -1814,7 +1817,7 @@ impl Owner {
                 }
             }
         }
-        if self.orders_on {
+        if self.orders_kept != 0 {
             self.sync_orders(r);
         }
         for h in again {
@@ -1848,7 +1851,7 @@ impl Owner {
                     s.ix.unlink(ri, b);
                 }
             }
-            if self.orders_on {
+            if self.orders_kept != 0 {
                 self.sync_orders(ri);
             }
         }

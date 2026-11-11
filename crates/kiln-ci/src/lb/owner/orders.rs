@@ -15,10 +15,11 @@ pub(super) const DISK: usize = 1;
 pub(super) const LINK: usize = 2;
 pub(super) const NET: usize = 3;
 const ORDERS: usize = 4;
+pub(super) const BYTES: u8 = (1 << DISK) | (1 << LINK) | (1 << NET);
 
 /// A signature's orders, empty.
-pub(super) fn orders() -> Vec<Order> {
-    (0..ORDERS).map(|_| Order::new()).collect()
+pub(super) fn orders(kept: u8) -> Vec<Order> {
+    (0..(u8::BITS - kept.leading_zeros()) as usize).map(|_| Order::new()).collect()
 }
 
 #[cfg(test)]
@@ -44,6 +45,43 @@ mod cold_tests {
         if orders.get(DISK).and_then(Order::top).is_none() { return Err("requested disk order missing".into()); }
         for index in [LINK, NET] {
             if orders.get(index).and_then(Order::top).is_some() { return Err(format!("unrequested byte order built: {index}")); }
+        }
+        Ok(())
+    }
+
+    /// W05-R26: first use reads current facts; later measurements and joins update the active
+    /// order even when the CPU order is activated by the same word. Unused kinds stay empty.
+    #[test]
+    fn w05_r26_lazy_orders_follow_measurements_and_new_members() -> Result<(), String> {
+        let budget = [8 * CPU, 0, 0, 0];
+        let (mut owner, mut runners, sig) = crate::lb::tests::fleet(2, budget);
+        let mut out = Out::default();
+        let a = owner.ask_with(sig, [CPU, 0, 0, 0], &Terms { bytes: 1, ..Terms::default() }, &mut out).map_err(|e| format!("ask: {e:?}"))?;
+        let (to, start) = a.send.ok_or("no start")?;
+        let reply = runners.get_mut(to.0 as usize).ok_or("runner")?.hear(start, &mut RunnerOut::new()).ok_or("no reply")?;
+        owner.hear(reply, &mut out);
+        owner.set_link(RunnerId(1), Link { rate: 1 << 20, ..Link::default() });
+        let link = owner.sigs.get(sig.0 as usize).and_then(|s| s.orders.get(LINK)).ok_or("link order")?;
+        for r in 0..2 {
+            if link.class(r) != class_of(1 << 20) { return Err(format!("new link measurement missing for {r}")); }
+        }
+        let r = runners.get_mut(1).ok_or("runner")?;
+        r.measure(768, 1024);
+        r.measure_rates(1 << 21, 1 << 20);
+        owner.hear(ToOwner::Hint { runner: RunnerId(1), word: r.word() }, &mut out);
+        let mut added = Runner::new(RunnerId(2), budget, 1);
+        added.watch(OwnerId(0));
+        owner.join(RunnerId(2), budget, added.word(), &mut out);
+        owner.add(sig, RunnerId(2), &mut out);
+        let fresh = owner.sig();
+        owner.add(fresh, RunnerId(2), &mut out);
+        for id in [sig, fresh] {
+            let orders = &owner.sigs.get(id.0 as usize).ok_or("signature")?.orders;
+            if orders.get(LINK).map(|o| o.class(2)) != Some(class_of(1 << 20)) { return Err("new member's link order missing".into()); }
+            if orders.get(NARROW).map(|o| o.class(2)) != Some(class_of(u64::from(SCALE))) { return Err("new member's CPU order missing".into()); }
+            for index in [DISK, NET] {
+                if orders.get(index).and_then(Order::top).is_some() { return Err("unrequested byte order populated".into()); }
+            }
         }
         Ok(())
     }
@@ -110,15 +148,12 @@ impl Owner {
             self.cold.resize(i + 1, Cold::default());
             self.more.resize(i + 1, Vec::new());
         }
-        let was = self.cold.get(i).map_or(0, |c| c.link.rate);
         if let Some(c) = self.cold.get_mut(i) {
             c.link = link;
         }
         self.rerate(r.0);
-        if link.rate != 0 && !self.orders_on {
-            self.keep_orders();
-        } else if self.orders_on && class_of(self.prior.link.or(was)) != class_of(self.prior.link.or(link.rate)) {
-            self.sync_orders(r.0);
+        if self.orders_kept & (1 << LINK) != 0 {
+            self.set_orders(r.0, [false, false, true, false]);
         }
     }
 
@@ -133,7 +168,7 @@ impl Owner {
         self.prior.net.moved(was.net, now.net);
         self.prior.link.moved(was.link, now.link);
         // A runner not measured sits where the prior does: its class moves with it.
-        if self.orders_on && self.prior.classes() != before {
+        if self.orders_kept & BYTES != 0 && self.prior.classes() != before {
             self.refile_unmeasured(r);
         }
     }
@@ -146,7 +181,7 @@ impl Owner {
         for x in 0..u32::try_from(self.cold.len()).unwrap_or(NIL) {
             let c = self.cold.get(x as usize).copied().unwrap_or_default();
             if x != r && (c.disk == 0 || c.net == 0 || c.link.rate == 0) {
-                self.sync_orders(x);
+                self.set_orders(x, [false, c.disk == 0, c.link.rate == 0, c.net == 0]);
             }
         }
     }
@@ -156,36 +191,35 @@ impl Owner {
         self.cold.get(r.0 as usize).map_or_else(Link::default, |c| c.link)
     }
 
-    /// The signatures keep their orders from now on, each built from its members as they are.
-    fn keep_orders(&mut self) {
-        if self.orders_on {
-            return;
-        }
+    /// W05-R26: activate only the requested order kinds, from current membership and facts.
+    /// One bit per real order kind, no eviction, timeout or size threshold. New kinds are built
+    /// once; subsequent words maintain those kinds through the existing event paths.
+    pub(super) fn keep_orders(&mut self, wanted: [bool; ORDERS]) {
+        let mask = wanted.iter().enumerate().fold(0u8, |mask, (i, wanted)| mask | (u8::from(*wanted) << i));
+        let missing = mask & !self.orders_kept;
+        if missing == 0 { return; }
         self.flush();
-        self.orders_on = true;
+        self.orders_kept |= missing;
+        let len = (u8::BITS - self.orders_kept.leading_zeros()) as usize;
         for s in &mut self.sigs {
-            s.orders = orders();
+            s.orders.resize_with(len, Order::new);
         }
-        // Every move of a key to or from 0 keeps the gate from now on (relink_all, and the fast
-        // paths that move a key themselves).
+        let only = std::array::from_fn(|i| missing & (1 << i) != 0);
         for r in 0..u32::try_from(self.peers.len()).unwrap_or(NIL) {
-            self.sync_orders(r);
+            self.set_orders(r, only);
         }
     }
 
     /// Runner `r`'s word said something it measured changed: its classes move, and the first
-    /// measure turns the orders on (a multiplier not the reference's: the narrow order too).
+    /// non-reference CPU measure activates the narrow order; byte orders follow their first ask.
     pub(super) fn measures_heard(&mut self, r: u32) {
         self.rerate(r);
-        let Some(c) = self.cold.get(r as usize).copied() else { return };
         let cpu = self.peers.get(r as usize).is_some_and(|p| p.scale != SCALE);
-        if !self.orders_on && (cpu || c.disk != 0 || c.net != 0) {
-            self.keep_orders();
-        }
         if cpu && !self.ordered {
             self.order_narrow();
-        }
-        if self.orders_on {
+            // The same word may also change a byte rate whose index was already requested.
+            self.set_orders(r, [false, true, true, true]);
+        } else if self.orders_kept != 0 {
             self.sync_orders(r);
         }
     }
@@ -197,27 +231,35 @@ impl Owner {
         self.flush();
         self.ordered = true;
         self.pend.r = WIDE;
-        for r in 0..u32::try_from(self.peers.len()).unwrap_or(NIL) {
-            self.sync_orders(r);
-        }
+        self.keep_orders([true, false, false, false]);
     }
 
     /// Runner `r`'s class in each order: the narrow one by its key multiplier (per-core speed over
     /// slowness, as its key folds them), the rest by their rates.
-    fn classes(&self, r: u32) -> [u32; ORDERS] {
-        let c = self.cold.get(r as usize).copied().unwrap_or_default();
+    fn classes(&self, r: u32, only: [bool; ORDERS]) -> [u32; ORDERS] {
         let scale = self.peers.get(r as usize).map_or(SCALE, |p| p.scale);
-        [class_of(u64::from(scale)), class_of(self.prior.disk.or(c.disk)), class_of(self.prior.link.or(c.link.rate)), class_of(self.prior.net.or(c.net))]
+        let narrow = if only[NARROW] { class_of(u64::from(scale)) } else { NIL };
+        if !only[DISK] && !only[LINK] && !only[NET] {
+            // CPU-only updates never load the separate, much larger byte-rate facts.
+            return [narrow, NIL, NIL, NIL];
+        }
+        let c = self.cold.get(r as usize);
+        [narrow,
+         if only[DISK] { class_of(self.prior.disk.or(c.map_or(0, |c| c.disk))) } else { NIL },
+         if only[LINK] { class_of(self.prior.link.or(c.map_or(0, |c| c.link.rate))) } else { NIL },
+         if only[NET] { class_of(self.prior.net.or(c.map_or(0, |c| c.net))) } else { NIL }]
     }
 
     /// The classes runner `r` belongs in, order by order (NIL: out): its own while its link is up
     /// and it has a whole core free (its key not 0), so a pick walks no full runner; the narrow
     /// order only once that is kept. `only`: the orders to set (the rest are left as they are).
     fn set_orders(&mut self, r: u32, only: [bool; ORDERS]) {
+        let only = std::array::from_fn(|i| only.get(i).copied().unwrap_or(false) && self.orders_kept & (1 << i) != 0);
+        if !only.into_iter().any(|x| x) { return; }
         let Some(p) = self.peers.get(r as usize).copied() else { return };
         let up = p.flags & (KNOWN | UP) == KNOWN | UP;
         let core = key(p.view, p.scale, self.last) != 0;
-        let classes = if up && core { self.classes(r) } else { [NIL; ORDERS] };
+        let classes = if up && core { self.classes(r, only) } else { [NIL; ORDERS] };
         let narrow = self.ordered;
         let set = |s: &mut Sig| {
             for (o, order) in s.orders.iter_mut().enumerate() {
@@ -256,7 +298,9 @@ impl Owner {
             }
             self.set_orders(r, only);
         }
-        if let Some(p) = self.peers.get_mut(r as usize) {
+        if self.orders_kept & BYTES != 0
+            && let Some(p) = self.peers.get_mut(r as usize)
+        {
             mark(&mut p.flags, &mut self.dirty, r);
         }
     }
