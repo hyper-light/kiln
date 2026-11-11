@@ -457,7 +457,7 @@ impl Kiln {
     /// the owner); whatever they decline takes the general path whole.
     #[inline(always)]
     fn release_one(&mut self, s: u32) {
-        let Some(slot) = self.slots.get(s as usize).copied() else { return };
+        let Some(slot) = self.slots.get(s as usize) else { return };
         let Some(x) = self.runners.get_mut(slot.runner as usize) else { return };
         match x.end_fast(slot.at) {
             Some((_, b)) => {
@@ -465,7 +465,17 @@ impl Kiln {
                     self.ended_cold(slot.runner, slot.run);
                 }
             }
-            None => self.release_cold(slot),
+            None => self.release_cold_at(s),
+        }
+    }
+
+    /// W05-R26: materialize the full wire record only when the runner declines the fast path.
+    /// Passing its slot number here keeps the cold by-value argument off the warmed stack.
+    #[cold]
+    #[inline(never)]
+    fn release_cold_at(&mut self, s: u32) {
+        if let Some(slot) = self.slots.get(s as usize).copied() {
+            self.release_cold(slot);
         }
     }
 
