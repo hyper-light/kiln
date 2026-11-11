@@ -2259,6 +2259,32 @@ fn w05_r16_cpu_only_nodes_do_not_delay_gpu_lease_retry() {
 
 /// E1.5: compare all generated histories, retaining the original case count and invariants.
 #[test]
+fn debug_lb3261_reduced_history() {
+    let (cfg, epoch, steps) = case(3261);
+    let failed = run(&cfg, epoch, &steps, |_| {}).err();
+    let Some((applied, why)) = failed else { return };
+    let (steps, _) = shrink(&cfg, epoch, applied, why);
+    println!("[DEBUG-lb3261] lock_delay {} epoch {epoch}", cfg.lock_delay);
+    let mut s = Scheduler::with_epoch(cfg.clone(), epoch);
+    let mut r = Reference::new(cfg.clone(), epoch);
+    for (step, now) in &steps {
+        println!("[DEBUG-lb3261] INPUT {now} {step:?}");
+        for id in ["l6", "l8"] {
+            if let Some(l) = r.legs.get(id) {
+                if let At::Queued(q) = &l.at {
+                    println!("[DEBUG-lb3261] REFERENCE {id} {:?} standing {:?} own {}", q.class, r.standing(q.class, &l.input, [true, false, false, false]), q.own);
+                }
+            }
+            println!("[DEBUG-lb3261] ENGINE {:?}", s.debug_lb3261_pick(id, "r0"));
+        }
+        s.handle(step.input(), *now);
+        r.handle(step, *now);
+    }
+    assert_eq!(s.grants(), r.placement().0);
+}
+
+/// E1.5: compare all generated histories, retaining the original case count and invariants.
+#[test]
 fn e1_5_the_engine_agrees_with_the_reference() {
     if let Some(seed) = std::env::var("KILN_SCHED_REFERENCE_SEED").ok().and_then(|s| s.trim().parse::<u64>().ok()) {
         let (cfg, epoch, steps) = case(seed);
