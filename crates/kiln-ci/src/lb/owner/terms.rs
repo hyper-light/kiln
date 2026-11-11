@@ -250,7 +250,7 @@ impl Owner {
             self.seen = seen;
             // No member with a core free has room (nor a listed one): a need below a core may
             // still fit one with less.
-            let r = self.pick_cpu(si, &need, !multi(&need));
+            let r = self.pick_cpu(si, NIL, &need, !multi(&need));
             return if r == NIL { self.ask_waits(si, need, out) } else { self.start_at(si, need, r) };
         }
         // A shared owner draws among the seen within the bound of the soonest: each is within
@@ -439,12 +439,12 @@ impl Owner {
         if !multi(&need)
             && !planted
             && let Ok(cpu) = u32::try_from(need[0])
-            && let Some((r, run, epoch)) = self.ask_top(si, cpu)
+            && let Some((r, run, epoch)) = self.ask_top::<false>(si, NIL, cpu)
         {
             return Ok(Asked { run, send: Some((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch, need }))) });
         }
         self.flush();
-        let r = self.pick(si, &need, !multi(&need));
+        let r = self.pick(si, NIL, &need, !multi(&need));
         if r == NIL {
             return self.ask_waits(si, need, out);
         }

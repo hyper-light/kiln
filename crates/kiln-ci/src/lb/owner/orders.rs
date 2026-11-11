@@ -376,15 +376,16 @@ impl Owner {
     /// The pick a plain ask takes by CPU: on measured runners its order is the narrow one (its
     /// parallelism is its CPU need), the member of the highest class with room, and of those the
     /// index's most free when that one is in it; else the index's pick.
-    pub(super) fn pick_cpu(&mut self, si: u32, need: &Amounts, cpu_only: bool) -> u32 {
+    pub(super) fn pick_cpu(&mut self, si: u32, kind: u32, need: &Amounts, cpu_only: bool) -> u32 {
         if !self.ordered || mutant(M::NoNarrow) {
-            return self.pick(si, need, cpu_only);
+            return self.pick(si, kind, need, cpu_only);
         }
         let skip = if self.width > 1 { self.draw() } else { 0 };
-        let m = self.find_in(si, NARROW, need, skip);
+        let mut m = self.find_in(si, NARROW, need, skip);
         if m == NIL {
-            return self.pick(si, need, cpu_only);
+            return self.pick(si, kind, need, cpu_only);
         }
+        let super::Kind { good, shun } = self.kinds.get(kind as usize).copied().unwrap_or(super::NO_PLACES);
         if skip == 0
             && let Some(s) = self.sigs.get(si as usize)
             && let Some(top) = s.ix.top()
@@ -392,7 +393,20 @@ impl Owner {
             let w = s.ix.next_in(top);
             let order = s.orders.get(NARROW);
             let (wc, mc) = order.map_or((NIL, NIL), |o| (o.class(w), o.class(m)));
-            if w != m && wc != NIL && wc == mc && self.fits_at(w, need) {
+            // The kind's good place when its cores are as fast as the fastest that fits: no turn
+            // moves for it (as [`Owner::ask_narrow`]).
+            if good != NIL && mc != NIL && order.is_some_and(|o| o.class(good) == mc) && self.fits_at(good, need) {
+                return good;
+            }
+            // The runner that last let the kind down is passed over for the next of its class
+            // that fits.
+            if m == shun {
+                let n = order.map_or(NIL, |o| o.after(m));
+                if n != NIL && n != m && self.fits_at(n, need) {
+                    m = n;
+                }
+            }
+            if w != m && w != shun && wc != NIL && wc == mc && self.fits_at(w, need) {
                 if let Some(s) = self.sigs.get_mut(si as usize) {
                     s.ix.took(top, w);
                 }

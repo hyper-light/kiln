@@ -34,7 +34,7 @@ use std::io::Write as _;
 use std::process::Command;
 use std::time::Instant;
 
-use kiln_ci::lb::{Amounts, Brief, CPU, Handle, Link, Out, Owner, OwnerId, Runner, RunnerId, RunnerOut, SigId, Start, Terms, ToOwner, ToRunner, Warm};
+use kiln_ci::lb::{Amounts, Brief, CPU, Handle, KindId, Link, Out, Owner, OwnerId, Runner, RunnerId, RunnerOut, SigId, Start, Terms, ToOwner, ToRunner, Warm};
 
 /// Requests each backend takes at once (bench-spec.md: kiln's 8 CPUs, one a run).
 const C: u32 = 8;
@@ -383,16 +383,26 @@ struct Slot {
     runner: u32,
     at: Handle,
     run: Handle,
+    /// Its kind of work (`--kinds`), what its shell's word about its end is of: read by the
+    /// releases that say it, written by the picks that name one ([`Kiln::set_kind`]).
+    kind: u32,
 }
 
-/// The part of a slot's record a release reads last: its run's handle at its runner, and the
-/// run's generation at the owner. Sixteen bytes, four to a line, none across two.
+/// The part of a slot's record a release reads last: its run's handle at its runner, the run's
+/// generation at the owner, and its kind of work. Sixteen bytes, four to a line, none across two.
 #[derive(Clone, Copy)]
 #[repr(align(16))]
 struct Rest {
     at: Handle,
     generation: u32,
+    kind: u32,
 }
+
+/// `--kinds K` (or `KILN_LB_KINDS`): how many kinds of work the requests are of, each request's
+/// drawn from its key (0: they name none, and the shell says nothing of how runs end). With
+/// kinds, each run's end is followed by its shell's word that the work went well there
+/// (docs/lb.md "Good places"), which is part of the step.
+static KINDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Clone)]
 struct Kiln {
@@ -421,6 +431,10 @@ struct Kiln {
     waited: u64,
     /// The need's CPU when it asks nothing else (d = 1): the fast entries' argument.
     cpu: Option<u32>,
+    /// How many kinds of work the requests are of ([`KINDS`]), and the kind of the one being
+    /// placed (`u32::MAX`: none).
+    kinds: u32,
+    kind: u32,
 }
 
 impl Kiln {
@@ -443,8 +457,26 @@ impl Kiln {
             owner.add(sig, RunnerId(i), &mut out);
         }
         let cpu = if d == 1 { u32::try_from(need[0]).ok() } else { None };
-        let rest = Rest { at: Handle::NONE, generation: 0 };
-        Kiln { owner, runners, sig, need, slot_runner: vec![u32::MAX; slots], slot_run: vec![u32::MAX; slots], slot_rest: vec![rest; slots], out, rout: RunnerOut::new(), starts: Vec::new(), waits: Vec::new(), stage: Vec::new(), words: Vec::new(), admits: Vec::new(), waited: 0, cpu }
+        let rest = Rest { at: Handle::NONE, generation: 0, kind: u32::MAX };
+        let kinds = KINDS.load(std::sync::atomic::Ordering::Relaxed);
+        Kiln { owner, runners, sig, need, slot_runner: vec![u32::MAX; slots], slot_run: vec![u32::MAX; slots], slot_rest: vec![rest; slots], out, rout: RunnerOut::new(), starts: Vec::new(), waits: Vec::new(), stage: Vec::new(), words: Vec::new(), admits: Vec::new(), waited: 0, cpu, kinds, kind: u32::MAX }
+    }
+
+    /// The kind of the request whose key is `key`, the one being placed from now: one of
+    /// `kinds`, by multiplication (Lemire, TOMACS 2019, less its rejection); none without kinds.
+    #[inline(always)]
+    fn kind_of(&mut self, key: u64) -> KindId {
+        self.kind = ((u128::from(key) * u128::from(self.kinds)) >> 64) as u32;
+        KindId(self.kind)
+    }
+
+    /// What its shell says of a run of a batch that ended on runner `r`: its kind of work went
+    /// well there (`--kinds`; nothing without).
+    #[inline(always)]
+    fn said(&mut self, r: u32, kind: u32) {
+        if self.kinds != 0 {
+            self.owner.won(RunnerId(r), KindId(kind));
+        }
     }
 
     /// Carries whatever else was said, until nothing is (nothing is, in this workload).
@@ -473,17 +505,27 @@ impl Kiln {
     fn slot(&self, s: u32) -> Option<Slot> {
         let i = s as usize;
         let (runner, run, rest) = (*self.slot_runner.get(i)?, *self.slot_run.get(i)?, self.slot_rest.get(i)?);
-        Some(Slot { runner, at: rest.at, run: Handle { slot: run, generation: rest.generation } })
+        Some(Slot { runner, at: rest.at, run: Handle { slot: run, generation: rest.generation }, kind: rest.kind })
     }
 
     /// Slot `s` holds this run now.
     #[inline(always)]
     fn set_slot(&mut self, s: u32, slot: Slot) {
+        self.set_slot_of::<false>(s, slot);
+    }
+
+    /// [`Kiln::set_slot`]; `K`: its run is of the kind being placed, written with the rest.
+    #[inline(always)]
+    fn set_slot_of<const K: bool>(&mut self, s: u32, slot: Slot) {
         let i = s as usize;
         if let (Some(runner), Some(run), Some(rest)) = (self.slot_runner.get_mut(i), self.slot_run.get_mut(i), self.slot_rest.get_mut(i)) {
             *runner = slot.runner;
             *run = slot.run.slot;
-            *rest = Rest { at: slot.at, generation: slot.run.generation };
+            rest.at = slot.at;
+            rest.generation = slot.run.generation;
+            if K {
+                rest.kind = self.kind;
+            }
         }
     }
 
@@ -492,6 +534,12 @@ impl Kiln {
     #[inline(always)]
     fn release_one(&mut self, s: u32) {
         let Some(slot) = self.slot(s) else { return };
+        self.release_slot(s, slot);
+    }
+
+    /// [`Kiln::release_one`] of slot `s`, whose record is `slot`.
+    #[inline(always)]
+    fn release_slot(&mut self, s: u32, slot: Slot) {
         let Some(x) = self.runners.get_mut(slot.runner as usize) else { return };
         match x.end_fast(slot.at) {
             Some((_, b)) => {
@@ -500,6 +548,47 @@ impl Kiln {
                 }
             }
             None => self.release_cold_at(s),
+        }
+    }
+
+    /// [`Kiln::release_one`], then what its shell says of the end: the run's kind of work went
+    /// well there (`--kinds`). What the fast entries decline says so itself, last, so this
+    /// calls nothing it comes back from and keeps no frame (W05-R26).
+    #[inline(always)]
+    fn release_said(&mut self, s: u32) {
+        let Some(slot) = self.slot(s) else { return };
+        let Some(x) = self.runners.get_mut(slot.runner as usize) else { return };
+        match x.end_fast(slot.at) {
+            Some((_, b)) => {
+                if !self.owner.ended_won(slot.runner, slot.run, b, KindId(slot.kind)) {
+                    self.ended_cold_said(slot.runner, slot.run, slot.kind);
+                }
+            }
+            None => self.release_cold_said(s, slot.runner, slot.kind),
+        }
+    }
+
+    /// [`Kiln::ended_cold`], then its shell's word about the end.
+    #[cold]
+    #[inline(never)]
+    fn ended_cold_said(&mut self, r: u32, run: Handle, kind: u32) {
+        self.ended_cold(r, run);
+        self.owner.won(RunnerId(r), KindId(kind));
+    }
+
+    /// [`Kiln::release_cold_at`], then its shell's word about the end.
+    #[cold]
+    #[inline(never)]
+    fn release_cold_said(&mut self, s: u32, r: u32, kind: u32) {
+        self.release_cold_at(s);
+        self.owner.won(RunnerId(r), KindId(kind));
+    }
+
+    /// Slot `s`'s run is of the kind being placed.
+    #[inline(always)]
+    fn set_kind(&mut self, s: u32) {
+        if let Some(rest) = self.slot_rest.get_mut(s as usize) {
+            rest.kind = self.kind;
         }
     }
 
@@ -543,13 +632,41 @@ impl Kiln {
     /// kernel's fast entries. Where it started, or -1.
     #[inline(always)]
     fn admit_fast(&mut self, s: u32, r: u32, run: Handle, epoch: u32, cpu: u32) -> i32 {
+        self.admit_fast_of::<false>(s, r, run, epoch, cpu)
+    }
+
+    /// [`Kiln::admit_fast`]; `K`: the run is of the kind being placed, kept in its slot's record.
+    #[inline(always)]
+    fn admit_fast_of<const K: bool>(&mut self, s: u32, r: u32, run: Handle, epoch: u32, cpu: u32) -> i32 {
         let Some(x) = self.runners.get_mut(r as usize) else { return -1 };
-        let Some((at, b)) = x.start_fast(OwnerId(0), run, epoch, cpu) else { return self.admit_cold(s, r, run, epoch) };
+        let Some((at, b)) = x.start_fast(OwnerId(0), run, epoch, cpu) else { return self.admit_cold_of::<K>(s, r, run, epoch) };
         if !self.owner.started_fast(r, run, at, b) {
-            return self.started_cold(s, r, run, at);
+            return self.started_cold_of::<K>(s, r, run, at);
         }
-        self.set_slot(s, Slot { runner: r, at, run });
+        self.set_slot_of::<K>(s, Slot { runner: r, at, run, kind: u32::MAX });
         r as i32
+    }
+
+    /// [`Kiln::admit_cold`], then the slot's kind when the run is of one (`K`).
+    #[cold]
+    #[inline(never)]
+    fn admit_cold_of<const K: bool>(&mut self, s: u32, r: u32, run: Handle, epoch: u32) -> i32 {
+        let to = self.admit_cold(s, r, run, epoch);
+        if K && to >= 0 {
+            self.set_kind(s);
+        }
+        to
+    }
+
+    /// [`Kiln::started_cold`], then the slot's kind when the run is of one (`K`).
+    #[cold]
+    #[inline(never)]
+    fn started_cold_of<const K: bool>(&mut self, s: u32, r: u32, run: Handle, at: Handle) -> i32 {
+        let to = self.started_cold(s, r, run, at);
+        if K && to >= 0 {
+            self.set_kind(s);
+        }
+        to
     }
 
     /// The runner's fast path declined a start: the general path, as `hear` carries it.
@@ -571,7 +688,7 @@ impl Kiln {
         if !(self.out.to.is_empty() && self.rout.is_empty()) {
             self.deliver();
         }
-        self.set_slot(s, Slot { runner: r, at, run });
+        self.set_slot(s, Slot { runner: r, at, run, kind: u32::MAX });
         r as i32
     }
 
@@ -586,7 +703,7 @@ impl Kiln {
             self.deliver();
             return -1;
         }
-        self.set_slot(s, Slot { runner: to.0, at, run });
+        self.set_slot(s, Slot { runner: to.0, at, run, kind: u32::MAX });
         to.0 as i32
     }
 }
@@ -605,6 +722,42 @@ fn kiln_pick(k: &mut Kiln, s: u32, _key: u64) -> i32 {
     }
 }
 
+/// [`kiln_release`], with its shell's word about the end (`--kinds`).
+fn kiln_release_said(k: &mut Kiln, s: u32) {
+    k.release_said(s);
+}
+
+/// [`kiln_pick`] for a request of a kind of work, its key's (`--kinds`): the owner's entries
+/// that name a kind, and the slot's record of it.
+fn kiln_pick_of(k: &mut Kiln, s: u32, key: u64) -> i32 {
+    let kind = k.kind_of(key);
+    let Some(cpu) = k.cpu else { return kiln_pick_cold_of(k, s) };
+    match k.owner.ask_alone_of(k.sig, kind, cpu) {
+        Some((r, run, epoch)) => k.admit_fast_of::<true>(s, r, run, epoch, cpu),
+        None => kiln_pick_rest_of(k, s, kind, cpu),
+    }
+}
+
+/// [`kiln_pick_cold`] for a request of a kind: the slot's record of it too.
+#[cold]
+#[inline(never)]
+fn kiln_pick_cold_of(k: &mut Kiln, s: u32) -> i32 {
+    let to = kiln_pick_cold(k, s);
+    if to >= 0 {
+        k.set_kind(s);
+    }
+    to
+}
+
+/// [`kiln_pick_rest`] for a request of a kind.
+#[inline(never)]
+fn kiln_pick_rest_of(k: &mut Kiln, s: u32, kind: KindId, cpu: u32) -> i32 {
+    match k.owner.ask_rest_of(k.sig, kind, cpu) {
+        Some((r, run, epoch)) => k.admit_fast_of::<true>(s, r, run, epoch, cpu),
+        None => kiln_pick_cold_of(k, s),
+    }
+}
+
 /// A pick of CPU alone that didn't go back to the runner a run just ended on: the owner's other
 /// fast picks, then the general path.
 #[inline(never)]
@@ -620,7 +773,8 @@ fn kiln_pick_rest(k: &mut Kiln, s: u32, cpu: u32) -> i32 {
 #[cold]
 #[inline(never)]
 fn kiln_pick_cold(k: &mut Kiln, s: u32) -> i32 {
-    let Ok(a) = k.owner.ask(k.sig, k.need, &mut k.out) else { return -1 };
+    let asked = if k.kinds == 0 { k.owner.ask(k.sig, k.need, &mut k.out) } else { k.owner.ask_kind(k.sig, KindId(k.kind), k.need, &mut k.out) };
+    let Ok(a) = asked else { return -1 };
     match a.send {
         Some((to, m)) => k.admit(s, to, m),
         None => {
@@ -682,18 +836,24 @@ fn kiln_many_release(k: &mut Kiln, slots: &[u32]) {
         if !k.owner.ended_batch(slot.runner, slot.run, *b) {
             k.ended_cold(slot.runner, slot.run);
         }
+        k.said(slot.runner, slot.kind);
     }
     k.stage = stage;
     k.words = words;
 }
 
-fn kiln_many_pick(k: &mut Kiln, slots: &[u32], _keys: &[u64], out: &mut [i32]) {
+fn kiln_many_pick(k: &mut Kiln, slots: &[u32], keys: &[u64], out: &mut [i32]) {
+    // A batch is runs of one kind (a job's shards): its first key's.
+    let kind = match keys.first() {
+        Some(key) if k.kinds != 0 => k.kind_of(*key),
+        _ => KindId::NONE,
+    };
     let (mut starts, mut waits) = (std::mem::take(&mut k.starts), std::mem::take(&mut k.waits));
     let mut admits = std::mem::take(&mut k.admits);
     starts.clear();
     waits.clear();
     admits.clear();
-    if k.owner.ask_many(k.sig, k.need, slots.len(), &mut starts, &mut waits, &mut k.out).is_err() {
+    if k.owner.ask_many(k.sig, kind, k.need, slots.len(), &mut starts, &mut waits, &mut k.out).is_err() {
         for o in out.iter_mut() {
             *o = -1;
         }
@@ -714,10 +874,17 @@ fn kiln_many_pick(k: &mut Kiln, slots: &[u32], _keys: &[u64], out: &mut [i32]) {
         if !k.owner.started_fast(r, run, at, b) {
             k.started_cold(s, r, run, at);
         } else {
-            k.set_slot(s, Slot { runner: r, at, run });
+            k.set_slot(s, Slot { runner: r, at, run, kind: u32::MAX });
         }
         if let Some(o) = out.get_mut(ix as usize) {
             *o = r as i32;
+        }
+    }
+    if k.kinds != 0 {
+        for (&s, o) in slots.iter().zip(out.iter()) {
+            if *o >= 0 {
+                k.set_kind(s);
+            }
         }
     }
     k.waited += waits.len() as u64;
@@ -1136,7 +1303,10 @@ fn kiln_impl_on(n: u32, d: u32, slots: usize, measured: bool) -> Impl<Kiln> {
         }
         k.deliver();
     }
-    Impl { state: k, release: kiln_release, pick: kiln_pick, many_release: kiln_many_release, many_pick: kiln_many_pick, sb: vec![-1; slots] }
+    // Requests of kinds of work take the entries that name one, and say how each run ended;
+    // those of none take what they took before there were kinds.
+    let (release, pick): (fn(&mut Kiln, u32), fn(&mut Kiln, u32, u64) -> i32) = if k.kinds == 0 { (kiln_release, kiln_pick) } else { (kiln_release_said, kiln_pick_of) };
+    Impl { state: k, release, pick, many_release: kiln_many_release, many_pick: kiln_many_pick, sb: vec![-1; slots] }
 }
 
 /// F' (common.h's `lb_inflight`): rho in thousandths, so it is exact.
@@ -1244,6 +1414,9 @@ struct Args {
 fn args() -> std::result::Result<Args, String> {
     let mut a = Args { json: false, cold: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None, profile: false, null: false, terms: None, measured: false };
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(kinds) = std::env::var("KILN_LB_KINDS").ok().and_then(|v| v.parse().ok()) {
+        KINDS.store(kinds, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut i = 0usize;
     let rho = |v: &str| -> std::result::Result<u64, String> {
         // In thousandths, exactly: "0.9" is 900.
@@ -1289,6 +1462,7 @@ fn args() -> std::result::Result<Args, String> {
             "--run" => a.run = v.parse().map_err(|e| format!("--run {v}: {e}"))?,
             "--batch" => a.batch = v.parse().map_err(|e| format!("--batch {v}: {e}"))?,
             "--terms" => a.terms = Some(TermSet::parse(v)?),
+            "--kinds" => KINDS.store(v.parse().map_err(|e| format!("--kinds {v}: {e}"))?, std::sync::atomic::Ordering::Relaxed),
             "--impl" => match v {
                 "kiln" => a.floor = false,
                 "floor" => a.floor = true,

@@ -58,6 +58,8 @@ struct Ask {
     owner: u32,
     run: Handle,
     need: Amounts,
+    /// Its kind of work ([`KindId::NONE`]: none): what its shell's word about its end is of.
+    kind: KindId,
     /// The last thing its asker heard.
     told: Option<Told>,
     /// Where it started (runner, handle there), once.
@@ -78,6 +80,9 @@ struct World {
     /// What runs at each runner, by the model's own count of the starts it saw.
     live: Vec<BTreeMap<Handle, usize>>,
     rng: Rng,
+    /// What owners' shells say of the ends they hear ([`Owner::won`], [`Owner::failed`]): a
+    /// generator of its own, so the interleavings are the seed's whatever is said.
+    wins: Rng,
     trace: u64,
     /// Room tokens on at every runner and owner (docs/lb.md "Room tokens"), not hints; but for the
     /// owner in `World::new`'s `hints`, which hears hints at every runner (a mixed fleet).
@@ -129,7 +134,7 @@ impl World {
             os.push(ow);
         }
         let links = (0..owners * runners).map(|_| Link::default()).collect();
-        World { owners: os, runners: rs, sigs, links, asks: Vec::new(), by: BTreeMap::new(), live: vec![BTreeMap::new(); runners as usize], rng, trace: 0xcbf2_9ce4_8422_2325, tokens, measured: seed % 2 == 1 }
+        World { owners: os, runners: rs, sigs, links, asks: Vec::new(), by: BTreeMap::new(), live: vec![BTreeMap::new(); runners as usize], rng, wins: Rng(seed ^ 0x5741_4e53), trace: 0xcbf2_9ce4_8422_2325, tokens, measured: seed % 2 == 1 }
     }
 
     fn nr(&self) -> u32 {
@@ -228,17 +233,22 @@ impl World {
         let mut x = |n: u64| if self.rng.below(2) == 0 { 0 } else { self.rng.below(n) };
         let warm: Vec<Warm> = if with { (0..x(4)).map(|_| Warm { runner: RunnerId(x(nr) as u32), saved_ns: x(1 << 40), missing: x(1 << 33), wait_ns: x(1 << 36) }).collect() } else { Vec::new() };
         let terms = with.then(|| Terms { parallel: x(8 * CPU), cpu_ns: x(1 << 43), io_bytes: x(1 << 36), net_bytes: x(1 << 34), bytes: x(1 << 34), interactive: x(2) == 1, warm: &warm });
+        // Of one of three kinds of work, or of none (docs/lb.md "Good places").
+        let kind = match self.wins.below(4) {
+            3 => KindId::NONE,
+            k => KindId(k as u32),
+        };
         let ow = self.owners.get_mut(o as usize).ok_or("owner")?;
         let res = match terms {
             Some(t) => ow.ask_with(s, need, &t, &mut out),
-            None => ow.ask(s, need, &mut out),
+            None => ow.ask_kind(s, kind, need, &mut out),
         };
         self.note(format_args!("ask {o} {need:?} {res:?}"));
         match res {
             Ok(a) => {
                 let i = self.asks.len();
                 let told = if a.send.is_some() { None } else { Some(Told::Waiting { run: a.run }) };
-                self.asks.push(Ask { owner: o, run: a.run, need, told, started: None, done: false, cancelled: false });
+                self.asks.push(Ask { owner: o, run: a.run, need, kind, told, started: None, done: false, cancelled: false });
                 if self.by.insert((o, a.run), i).is_some() {
                     return Err(format!("owner {o} gave out handle {:?} twice", a.run));
                 }
@@ -279,6 +289,20 @@ impl World {
         let mut out = Out::default();
         let told = self.owners.get_mut(o as usize).ok_or("owner")?.hear(m, &mut out);
         self.note(format_args!("up {o} {r} {m:?} -> {told:?}"));
+        // What an owner's shell says of an end it hears (W05-R04, docs/lb.md "Good places"): of
+        // half that the run's kind of work went well there, of a quarter that its runner let it
+        // down, of the rest nothing.
+        if let ToOwner::Ended { runner, run, .. } = m {
+            let kind = self.by.get(&(o, run)).and_then(|i| self.asks.get(*i)).map_or(KindId::NONE, |a| a.kind);
+            let said = self.wins.below(4);
+            let owner = self.owners.get_mut(o as usize).ok_or("owner")?;
+            match said {
+                0 | 1 => owner.won(runner, kind),
+                2 => owner.failed(runner, kind),
+                _ => {}
+            }
+            self.note(format_args!("said {o} {} {kind:?} {said}", runner.0));
+        }
         if let Some(t) = told {
             out.told.insert(0, t);
         }

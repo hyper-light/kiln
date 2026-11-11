@@ -64,6 +64,10 @@ pub(super) fn ask_start(o: &mut Owner, rs: &mut [Runner], s: SigId, need: Amount
     }
 }
 
+fn end_run(o: &mut Owner, rs: &mut [Runner], r: RunnerId, at: Handle) {
+    end(o, rs, r, at);
+}
+
 fn end(o: &mut Owner, rs: &mut [Runner], r: RunnerId, at: Handle) {
     let mut out = Out::default();
     if let Some((_, m)) = rs.get_mut(r.0 as usize).and_then(|x| x.end(at, &mut RunnerOut::new())) {
@@ -128,6 +132,300 @@ fn turns() -> Result<(), String> {
 #[test]
 fn w05_r04_equals_take_turns() -> Result<(), String> {
     caught(Mutant::NoTurn, turns)
+}
+
+/// One kind of work, and another: what the shell numbers (a job, a tree).
+const KIND: KindId = KindId(0);
+const OTHER: KindId = KindId(1);
+
+/// Asks once for a run of `kind` and carries the start through to its runner and back.
+fn ask_start_kind(o: &mut Owner, rs: &mut [Runner], s: SigId, kind: KindId, need: Amounts) -> Option<(RunnerId, Handle, Handle)> {
+    let mut out = Out::default();
+    let a = o.ask_kind(s, kind, need, &mut out).ok()?;
+    let (to, m) = a.send?;
+    let reply = rs.get_mut(to.0 as usize)?.hear(m, &mut RunnerOut::new())?;
+    o.hear(reply, &mut out);
+    match reply {
+        ToOwner::Started { at, .. } => Some((to, a.run, at)),
+        _ => None,
+    }
+}
+
+/// A kind's work goes back to where it last went well. Of three runners with the same room: a
+/// kind's next run goes back to the runner its shell said it went well on, on to the next in turn
+/// when that runner let it down, and never, while another is as free, to the one that last did.
+/// Another kind's work, and work of no kind, don't take that place: each goes to its own, or in
+/// turn. On the general entries and on the fast ones.
+fn good_places() -> Result<(), String> {
+    // How each run of the kind ends: Some(true) well, Some(false) let down, None nothing said.
+    let ends = [Some(true), None, Some(true), Some(false), Some(true), Some(true), Some(false), Some(false), Some(true), None];
+    let want = vec![0u32, 0, 0, 0, 1, 1, 1, 2, 0, 0];
+    for fast in [false, true] {
+        let (mut o, mut rs, s) = if fast {
+            let (o, rs, s, _) = rig(3, 0).map_err(str::to_owned)?;
+            (o, rs, s)
+        } else {
+            fleet(3, C8)
+        };
+        let run = |o: &mut Owner, rs: &mut [Runner], kind: KindId, end: Option<bool>| -> Result<u32, String> {
+            let r = if fast {
+                let held = fast_start_kind(o, rs, s, kind, CPU as u32)?.ok_or("no pick")?;
+                fast_end(o, rs, held)?;
+                held.0
+            } else {
+                let (r, _, at) = ask_start_kind(o, rs, s, kind, [CPU, 0, 0, 0]).ok_or("no start")?;
+                end_run(o, rs, r, at);
+                r.0
+            };
+            match end {
+                Some(true) => o.won(RunnerId(r), kind),
+                Some(false) => o.failed(RunnerId(r), kind),
+                None => {}
+            }
+            Ok(r)
+        };
+        let mut seen = Vec::new();
+        for end in ends {
+            seen.push(run(&mut o, &mut rs, KIND, end)?);
+        }
+        if seen != want {
+            return Err(format!("fast {fast}: the kind's runs went to {seen:?}; going back to where it went well takes {want:?}"));
+        }
+        // The kind's good place is runner 0. Another kind takes the next in turn and makes that
+        // its own; work of no kind takes turns; the first kind still goes back to 0.
+        let mut seen = Vec::new();
+        for kind in [OTHER, KIND, KindId::NONE, OTHER, KIND, KindId::NONE, KindId::NONE, OTHER, KIND] {
+            seen.push(run(&mut o, &mut rs, kind, Some(true))?);
+        }
+        if seen != [1, 0, 2, 1, 0, 0, 1, 1, 0] {
+            return Err(format!("fast {fast}: three kinds' runs went to {seen:?}: each of two kinds to its own place, 1 and 0, and work of no kind in turn"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn w05_r04_a_kinds_work_goes_back_to_where_it_went_well() -> Result<(), String> {
+    caught(Mutant::NoStay, good_places)?;
+    caught(Mutant::NoTurn, good_places)
+}
+
+/// One run of one kind at a time on an idle fleet of `n` runners (every one as free as the others
+/// at each pick), `runs` of them. Runner 0 lets down every run. Of the others' runs, one in `1000
+/// / lose` (drawn) ends in a way its shell can't tell from a node's fault and says so
+/// ([`Owner::failed`]); the rest it says went well. With `says` false the shell says nothing of
+/// any run, so equals only take turns. The share of the runs that went to runner 0.
+fn failing_share(n: u32, lose: u64, runs: u32, says: bool, fast: bool) -> Result<f64, String> {
+    let mut rng = Rng(u64::from(n) * 1000 + lose);
+    let mut to_failing = 0u32;
+    let (mut o, mut rs, s) = if fast {
+        let (o, rs, s, _) = rig(n, 0).map_err(str::to_owned)?;
+        (o, rs, s)
+    } else {
+        fleet(n, C8)
+    };
+    for _ in 0..runs {
+        let r = if fast {
+            let held = fast_start_kind(&mut o, &mut rs, s, KIND, CPU as u32)?.ok_or("no pick")?;
+            fast_end(&mut o, &mut rs, held)?;
+            held.0
+        } else {
+            let (r, _, at) = ask_start_kind(&mut o, &mut rs, s, KIND, [CPU, 0, 0, 0]).ok_or("no start")?;
+            end_run(&mut o, &mut rs, r, at);
+            r.0
+        };
+        let well = r != 0 && rng.below(1000) >= lose;
+        if r == 0 {
+            to_failing += 1;
+        }
+        if says {
+            if well {
+                o.won(RunnerId(r), KIND);
+            } else {
+                o.failed(RunnerId(r), KIND);
+            }
+        }
+    }
+    Ok(f64::from(to_failing) / f64::from(runs))
+}
+
+/// A runner that lets a kind's work down doesn't keep it. One that went well and then goes bad
+/// loses the kind at its first let-down and isn't given it again while another is as free. One
+/// that never went well gets the kind's work only while the kind is looking for a place: when the
+/// shell can tell a node's fault from the work's own (no healthy runner is ever said to have let
+/// the work down), once; when it can't, and says of a share q of the others' runs that they were
+/// let down, one run a round of the others' good runs: q / (q + n - 1) of the runs (each of the n -
+/// 1 others keeps the kind 1 / q runs, the mean of a geometric count; for two runners Zelen's q_B
+/// / (q_A + q_B) with q_A = 1, JASA 64(325), 1969). Taking turns gives it 1 / n.
+fn a_bad_place_is_left() -> Result<(), String> {
+    for fast in [false, true] {
+        // It went well once, then lets every run down: two runs, the second its last.
+        let (mut o, mut rs, s) = if fast {
+            let (o, rs, s, _) = rig(4, 0).map_err(str::to_owned)?;
+            (o, rs, s)
+        } else {
+            fleet(4, C8)
+        };
+        let mut seen = Vec::new();
+        for i in 0..40u32 {
+            let r = if fast {
+                let held = fast_start_kind(&mut o, &mut rs, s, KIND, CPU as u32)?.ok_or("no pick")?;
+                fast_end(&mut o, &mut rs, held)?;
+                held.0
+            } else {
+                let (r, _, at) = ask_start_kind(&mut o, &mut rs, s, KIND, [CPU, 0, 0, 0]).ok_or("no start")?;
+                end_run(&mut o, &mut rs, r, at);
+                r.0
+            };
+            seen.push(r);
+            if r == 0 && i > 0 {
+                o.failed(RunnerId(r), KIND);
+            } else {
+                o.won(RunnerId(r), KIND);
+            }
+        }
+        if seen.iter().filter(|r| **r == 0).count() != 2 || seen.get(..2) != Some(&[0, 0]) {
+            return Err(format!("fast {fast}: a good place that went bad was given the kind's runs {seen:?}: its first two, and no more"));
+        }
+        for (n, lose) in [(2u32, 200u64), (3, 100), (3, 300), (10, 100), (64, 100)] {
+            let q = lose as f64 / 1000.0;
+            let expected = q / (q + f64::from(n - 1));
+            let runs = 200_000;
+            let share = failing_share(n, lose, runs, true, fast)?;
+            let turns = failing_share(n, lose, runs, false, fast)?;
+            let turn = 1.0 / f64::from(n);
+            // Its turn, exactly, when nothing is said: the runs divide evenly.
+            if (turns - turn).abs() > 1.0 / f64::from(runs) {
+                return Err(format!("{n} runners (fast {fast}): taking turns gave the failing runner {turns}, not its turn {turn}"));
+            }
+            if (share / expected - 1.0).abs() > 0.05 || share >= turn {
+                return Err(format!("{n} runners, {q} of the others' runs said let down (fast {fast}): the failing runner got {share} of the runs; one a round is {expected}, its turn {turn}"));
+            }
+        }
+        // The shell can tell: no healthy runner is said to have let the work down. One run.
+        let share = failing_share(10, 0, 10_000, true, fast)?;
+        if share > 1.0 / 10_000.0 {
+            return Err(format!("the others never letting the work down (fast {fast}), the failing runner got {share} of 10,000 runs: more than one"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn w05_r04_a_runner_that_lets_a_kind_down_doesnt_keep_it() -> Result<(), String> {
+    caught(Mutant::StaysOnALoser, a_bad_place_is_left)
+}
+
+/// W05-R04, W05-R23: on measured runners a kind goes back to its good place only while that
+/// runner's cores are as fast as the fastest with one free. Runners 0 and 1 have cores twice the
+/// reference's and runner 2 the reference's: the kind's narrow runs, let down on 0, go on to 1,
+/// stay there while they go well, and go back to 0 once 1 measures slower (heat, a power limit:
+/// its word says a lower speed), though the run there went well: the rank decides first.
+#[test]
+fn w05_r04_a_good_place_holds_only_among_cores_as_fast() -> Result<(), String> {
+    let budget = [8 * CPU, 0, 0, 0];
+    let mut o = Owner::new(OwnerId(0));
+    let mut out = Out::default();
+    let s = o.sig();
+    let mut rs = Vec::new();
+    for (i, speed) in [(0u32, 2 * SPEED_ONE), (1, 2 * SPEED_ONE), (2, SPEED_ONE)] {
+        let mut r = Runner::new(RunnerId(i), budget, 1);
+        r.watch(OwnerId(0));
+        r.measure(speed, SPEED_ONE);
+        o.join(RunnerId(i), budget, r.word(), &mut out);
+        o.add(s, RunnerId(i), &mut out);
+        rs.push(r);
+    }
+    let mut seen = Vec::new();
+    // How each run ends: let down, well, well, well as its runner slows; the fifth is only asked.
+    for (well, slows) in [(false, false), (true, false), (true, false), (true, true), (true, false)] {
+        let Some((r, _, at)) = ask_start_kind(&mut o, &mut rs, s, KIND, [CPU, 0, 0, 0]) else { return Err("no start".into()) };
+        seen.push(r.0);
+        if slows {
+            rs.get_mut(r.0 as usize).ok_or("runner")?.measure(3 * SPEED_ONE / 2, SPEED_ONE);
+        }
+        end_run(&mut o, &mut rs, r, at);
+        if well {
+            o.won(r, KIND);
+        } else {
+            o.failed(r, KIND);
+        }
+    }
+    if seen != [0, 1, 1, 1, 0] {
+        return Err(format!("the kind's narrow runs went to {seen:?}: 0, then 1 while they go well there, then 0 again once 1 slows"));
+    }
+    Ok(())
+}
+
+/// `inflight` runs of one kind on `n` idle runners of eight cores, then `steps` times one ends (on
+/// a runner drawn by how full it is, so twin fleets end alike) and another is asked, each run said
+/// to have gone well or nothing said (`says`). A digest of how many runners held each number of
+/// runs after each step, and how many runners were given a run after the first `inflight`.
+fn churn(n: u32, inflight: u32, steps: u32, says: bool) -> Result<(u64, u32), String> {
+    let (mut o, mut rs, s, _) = rig(n, 0).map_err(str::to_owned)?;
+    let mut held: Vec<Vec<(u32, Handle, Handle)>> = vec![Vec::new(); n as usize];
+    for _ in 0..inflight {
+        let x = fast_start_kind(&mut o, &mut rs, s, KIND, CPU as u32)?.ok_or("fill: no pick")?;
+        held.get_mut(x.0 as usize).ok_or("runner")?.push(x);
+    }
+    let mut rng = Rng(u64::from(n) << 32 | u64::from(inflight));
+    let (mut digest, mut given) = (0xcbf2_9ce4_8422_2325u64, vec![false; n as usize]);
+    for _ in 0..steps {
+        // The k-th fullest of the runners that hold a run: the same fullness in a twin fleet,
+        // whichever runner that is there.
+        let mut busy: Vec<(usize, u32)> = held.iter().zip(0u32..).filter(|(h, _)| !h.is_empty()).map(|(h, r)| (h.len(), r)).collect();
+        busy.sort_unstable_by_key(|x| (std::cmp::Reverse(x.0), x.1));
+        let &(_, r) = busy.get(rng.below(busy.len() as u64) as usize).ok_or("no run in flight")?;
+        let x = held.get_mut(r as usize).and_then(Vec::pop).ok_or("run")?;
+        fast_end(&mut o, &mut rs, x)?;
+        if says {
+            o.won(RunnerId(r), KIND);
+        }
+        let x = fast_start_kind(&mut o, &mut rs, s, KIND, CPU as u32)?.ok_or("no pick")?;
+        held.get_mut(x.0 as usize).ok_or("runner")?.push(x);
+        if let Some(g) = given.get_mut(x.0 as usize) {
+            *g = true;
+        }
+        let mut full = [0u32; 9];
+        for h in &held {
+            if let Some(c) = full.get_mut(h.len()) {
+                *c += 1;
+            }
+        }
+        for c in full {
+            digest = (digest ^ u64::from(c)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    Ok((digest, given.iter().filter(|g| **g).count() as u32))
+}
+
+/// W05-R04, W05-R23: a good place moves no load. With every run said to have gone well and with
+/// nothing said, the fleet is as full step by step (as many runners hold each number of runs):
+/// the pick goes to one of the most free either way, and only which of equals differs. What
+/// differs is where: with fewer runs in flight than runners, work that goes back to where it went
+/// well stays on as many runners as there are runs, where taking turns takes it round every
+/// runner. `cargo test -p kiln-ci lb::tests::w05_r04_a_good_place_moves_no_load -- --nocapture`
+/// prints the table in docs/lb.md.
+#[test]
+fn w05_r04_a_good_place_moves_no_load() -> Result<(), String> {
+    let n = 64u32;
+    println!("runs in flight | runners given runs, taking turns | going back to where it went well");
+    for inflight in [1u32, 4, 16, 32, 64, 128, 256, 460] {
+        let steps = 20 * n;
+        let (turns, round) = churn(n, inflight, steps, false)?;
+        let (stays, kept) = churn(n, inflight, steps, true)?;
+        println!("{inflight:>14} | {round:>32} | {kept:>32}");
+        if turns != stays {
+            return Err(format!("{inflight} runs in flight on {n} runners: the fleet isn't as full step by step with good places as without"));
+        }
+        if round != n {
+            return Err(format!("{inflight} runs in flight: taking turns gave runs to {round} of {n} runners in {steps} steps"));
+        }
+        if inflight <= n && kept != inflight {
+            return Err(format!("{inflight} runs in flight: good places kept the work on {kept} runners, not {inflight}"));
+        }
+    }
+    Ok(())
 }
 
 /// W05-R03: no runner is ever admitted past its budget, in any dimension: memory short here.
@@ -403,7 +701,7 @@ fn w05_r26_batched_rises_choose_as_one_at_a_time_up_to_equals() -> Result<(), &'
         }
     }
     let (mut starts, mut waits, mut out) = (Vec::new(), Vec::new(), Out::default());
-    many.ask_many(s2, need, 4, &mut starts, &mut waits, &mut out).map_err(|_| "ask_many")?;
+    many.ask_many(s2, KindId::NONE, need, 4, &mut starts, &mut waits, &mut out).map_err(|_| "ask_many")?;
     if starts.len() != 4 || !waits.is_empty() {
         return Err("the batch didn't start four");
     }
@@ -423,6 +721,47 @@ fn w05_r26_batched_rises_choose_as_one_at_a_time_up_to_equals() -> Result<(), &'
     Ok(())
 }
 
+/// W05-R04: of a batch's ends, only the runners on which the batch's kind of work just went well
+/// are gone back to among their equals. Runners 3 and 1 did the kind well, 2 another kind, 4 let
+/// it down and nothing is said of 0, all five as free as the rest of the fleet: the batch's runs
+/// go to 3 and 1 (in the order their ends came), then on in the bucket's turn, where the other
+/// three are with every other member.
+#[test]
+fn w05_r04_a_batch_goes_back_to_where_its_kind_went_well() -> Result<(), String> {
+    let (mut owner, mut runners, sig, held) = rig(8, 1)?;
+    for (r, said) in [(4u32, Some((false, KIND))), (3, Some((true, KIND))), (0, None), (1, Some((true, KIND))), (2, Some((true, OTHER)))] {
+        let &(_, at, run) = held.iter().find(|x| x.0 == r).ok_or("held")?;
+        let (_, word) = runners.get_mut(r as usize).ok_or("runner")?.end_fast(at).ok_or("end")?;
+        if !owner.ended_batch(r, run, word) { return Err("batch end declined".into()); }
+        match said {
+            Some((true, kind)) => owner.won(RunnerId(r), kind),
+            Some((false, kind)) => owner.failed(RunnerId(r), kind),
+            None => {}
+        }
+    }
+    let (mut starts, mut waits, mut out) = (Vec::new(), Vec::new(), Out::default());
+    owner.ask_many(sig, KIND, [CPU, 0, 0, 0], 5, &mut starts, &mut waits, &mut out).map_err(|e| format!("batch: {e:?}"))?;
+    let got: Vec<u32> = starts.iter().map(|x| x.0.0).collect();
+    // The fill took each of the eight once, so the full bucket's turn is at runner 0 again.
+    if got != [3, 1, 0, 2, 4] || !waits.is_empty() {
+        return Err(format!("the batch's runs went to {got:?}: 3 and 1 first, where its kind went well, then 0, 2 and 4 in the bucket's turn"));
+    }
+    // Nothing said of any: the bucket's turn alone, as if each end had been made at once.
+    let (mut owner, mut runners, sig, held) = rig(8, 1)?;
+    for r in [4u32, 3, 0, 1, 2] {
+        let &(_, at, run) = held.iter().find(|x| x.0 == r).ok_or("held")?;
+        let (_, word) = runners.get_mut(r as usize).ok_or("runner")?.end_fast(at).ok_or("end")?;
+        if !owner.ended_batch(r, run, word) { return Err("batch end declined".into()); }
+    }
+    let (mut starts, mut waits, mut out) = (Vec::new(), Vec::new(), Out::default());
+    owner.ask_many(sig, KIND, [CPU, 0, 0, 0], 5, &mut starts, &mut waits, &mut out).map_err(|e| format!("batch: {e:?}"))?;
+    let got: Vec<u32> = starts.iter().map(|x| x.0.0).collect();
+    if got != [0, 1, 2, 3, 4] || !waits.is_empty() {
+        return Err(format!("with nothing said of any run the batch's runs went to {got:?}, not on in the bucket's turn"));
+    }
+    Ok(())
+}
+
 /// W05-R26, W05-R04: sorting a batch's pending rises must retain arrival order within each
 /// room class, including when a smaller batch leaves some rises for the normal index to apply.
 #[test]
@@ -438,12 +777,14 @@ fn w05_r26_batch_overlay_preserves_equal_turns_and_remaining_rises() -> Result<(
     for &(r, at, run) in held.iter().rev().step_by(2).chain(held.iter().step_by(2)) {
         let (_, word) = runners.get_mut(r as usize).ok_or("runner")?.end_fast(at).ok_or("end")?;
         if !owner.ended_batch(r, run, word) { return Err("batch end declined".into()); }
+        // The kind's work went well on every one: its batch goes back to them (W05-R04).
+        owner.won(RunnerId(r), KIND);
         risen.push((r, word.cpu));
     }
     let most = risen.iter().map(|x| x.1).max().ok_or("no rises")?;
     let expected: Vec<u32> = risen.iter().filter(|x| x.1 == most).map(|x| x.0).collect();
     let (mut starts, mut waits, mut out) = (Vec::new(), Vec::new(), Out::default());
-    owner.ask_many(sig, [CPU, 0, 0, 0], expected.len(), &mut starts, &mut waits, &mut out).map_err(|e| format!("batch: {e:?}"))?;
+    owner.ask_many(sig, KIND, [CPU, 0, 0, 0], expected.len(), &mut starts, &mut waits, &mut out).map_err(|e| format!("batch: {e:?}"))?;
     let got: Vec<u32> = starts.iter().map(|x| x.0.0).collect();
     if got != expected || !waits.is_empty() { return Err(format!("turns: {got:?}, expected {expected:?}")); }
     for (to, start) in starts {
@@ -488,7 +829,7 @@ fn ask_many_chooses_as_one_at_a_time() -> Result<(), String> {
                 }
             }
             let (mut starts, mut waits) = (Vec::new(), Vec::new());
-            many.ask_many(s, need, k, &mut starts, &mut waits, &mut Out::default()).map_err(|e| format!("{e:?}"))?;
+            many.ask_many(s, KindId::NONE, need, k, &mut starts, &mut waits, &mut Out::default()).map_err(|e| format!("{e:?}"))?;
             let got: Vec<Option<RunnerId>> = starts.iter().map(|(r, _)| Some(*r)).chain(waits.iter().map(|_| None)).collect();
             if got != want {
                 return Err(format!("n {n} load {load} k {k} need {need:?}: one at a time {want:?}, at once {got:?}"));
@@ -1013,7 +1354,12 @@ fn w05_r23_reused_start_publishes_only_its_new_runner_handle() -> Result<(), Str
 /// there and its own (`None`: the fast entry had no pick). A runner with more runs than its inline
 /// records hold takes the start, and the owner its word, on the general entries.
 fn fast_start(o: &mut Owner, rs: &mut [Runner], s: SigId, cpu: u32) -> Result<Option<(u32, Handle, Handle)>, String> {
-    let Some((r, run, epoch)) = o.ask_fast(s, cpu) else { return Ok(None) };
+    fast_start_kind(o, rs, s, KindId::NONE, cpu)
+}
+
+/// [`fast_start`] for a run of `kind`.
+fn fast_start_kind(o: &mut Owner, rs: &mut [Runner], s: SigId, kind: KindId, cpu: u32) -> Result<Option<(u32, Handle, Handle)>, String> {
+    let Some((r, run, epoch)) = o.ask_fast_of(s, kind, cpu) else { return Ok(None) };
     let runner = rs.get_mut(r as usize).ok_or("runner")?;
     if let Some((at, b)) = runner.start_fast(OwnerId(0), run, epoch, cpu) {
         if !o.started_fast(r, run, at, b) {
@@ -1041,21 +1387,42 @@ fn fast_end(o: &mut Owner, rs: &mut [Runner], (r, at, run): (u32, Handle, Handle
     Ok(())
 }
 
+/// A run ended and its shell says with the end that its kind's work went well there: on the fast
+/// entry that takes the two in one where it takes them, the general end and the word after it
+/// where it doesn't.
+fn fast_end_won(o: &mut Owner, rs: &mut [Runner], (r, at, run): (u32, Handle, Handle), kind: KindId) -> Result<(), String> {
+    let runner = rs.get_mut(r as usize).ok_or("runner")?;
+    if let Some((_, b)) = runner.end_fast(at) {
+        if !o.ended_won(r, run, b, kind) {
+            return Err("an Ended word said with its win left the fast path".into());
+        }
+        return Ok(());
+    }
+    let (_, word) = runner.end(at, &mut RunnerOut::new()).ok_or("the runner knows no such run")?;
+    o.hear(word, &mut Out::default());
+    o.won(RunnerId(r), kind);
+    Ok(())
+}
+
 /// W05-R04, W05-R23, W05-R26: a pick whose freed runner only ties the most free (it swaps with
-/// the next in turn, or goes back to that runner when it is the next) chooses what its two moves
-/// made one after the other choose, and leaves the same picks to come and the same views. Twin
-/// owners over twin fleets, one each way, through the same ends and picks of one and two cores,
-/// on fleets within one membership word and across words.
+/// the next in turn, or goes back to that runner when it is the next or the good place of the kind
+/// asked) chooses what it would with every move made as it comes, and leaves the same picks to
+/// come and the same views. Twin owners over twin fleets, one each way, through the same ends,
+/// the same words of their shell about them (went well, let down, nothing) and the same picks, of
+/// three kinds and of none, of one and two cores and half a core, on fleets within one membership
+/// word and across words.
 #[test]
 fn w05_r26_a_tied_pick_chooses_and_leaves_what_its_two_moves_do() -> Result<(), String> {
     use super::owner::{turns, with_two_moves};
-    let (swaps0, backs0) = turns();
+    let (swaps0, backs0, stays0) = turns();
     let mut rng = Rng(11);
     for case in 0..64u32 {
         let n = [2u32, 3, 5, 63, 64, 65, 130, 257].get((case % 8) as usize).copied().unwrap_or(2);
         let each = (case / 8) % 4;
         let (mut a, mut ra, sa, mut ha) = rig(n, each).map_err(str::to_owned)?;
         let (mut b, mut rb, sb, mut hb) = rig(n, each).map_err(str::to_owned)?;
+        // Each run's kind (the fill's have none), in step with `ha` and `hb`.
+        let mut kinds = vec![KindId::NONE; ha.len()];
         for step in 0..500u32 {
             // Mostly an end and then a pick; now and then two ends, or a pick with none before it.
             let ends = match rng.below(8) {
@@ -1068,12 +1435,36 @@ fn w05_r26_a_tied_pick_chooses_and_leaves_what_its_two_moves_do() -> Result<(), 
                     break;
                 }
                 let i = rng.below(ha.len() as u64) as usize;
-                let (x, y) = (ha.swap_remove(i), hb.swap_remove(i));
+                let (x, y, kind) = (ha.swap_remove(i), hb.swap_remove(i), kinds.swap_remove(i));
                 if x != y {
                     return Err(format!("case {case} step {step}: the twins hold {x:?} and {y:?}"));
                 }
-                fast_end(&mut a, &mut ra, x)?;
+                // Of half of the runs their shell says they went well (of half of those with the
+                // end, in one), of a quarter that their runner let them down, of the rest nothing:
+                // one twin keeps what that says of a runner whose move is put off with the move,
+                // the other makes every move first.
+                let said = rng.below(8);
+                if said < 2 {
+                    fast_end_won(&mut a, &mut ra, x, kind)?;
+                } else {
+                    fast_end(&mut a, &mut ra, x)?;
+                }
                 fast_end(&mut b, &mut rb, y)?;
+                match said {
+                    0 | 1 => with_two_moves(|| b.won(RunnerId(y.0), kind)),
+                    2 | 3 => {
+                        a.won(RunnerId(x.0), kind);
+                        with_two_moves(|| b.won(RunnerId(y.0), kind));
+                    }
+                    4 | 5 => {
+                        a.failed(RunnerId(x.0), kind);
+                        with_two_moves(|| b.failed(RunnerId(y.0), kind));
+                    }
+                    _ => {}
+                }
+                if a.order(sa) != b.order(sb) {
+                    return Err(format!("case {case} step {step} ({n} runners): after an end on {}, the picks to come differ:\n{:?}\n{:?}", x.0, a.order(sa), b.order(sb)));
+                }
             }
             // One core mostly; two cores or half a core now and then, so a pick doesn't always take
             // what the last end gave back, and a view moves within its bucket.
@@ -1082,11 +1473,17 @@ fn w05_r26_a_tied_pick_chooses_and_leaves_what_its_two_moves_do() -> Result<(), 
                 1 => CPU as u32 / 2,
                 _ => CPU as u32,
             };
-            let pa = fast_start(&mut a, &mut ra, sa, cpu)?;
-            let pb = with_two_moves(|| fast_start(&mut b, &mut rb, sb, cpu))?;
+            // Of one of three kinds, or of none.
+            let kind = match rng.below(4) {
+                3 => KindId::NONE,
+                k => KindId(k as u32),
+            };
+            let pa = fast_start_kind(&mut a, &mut ra, sa, kind, cpu)?;
+            let pb = with_two_moves(|| fast_start_kind(&mut b, &mut rb, sb, kind, cpu))?;
             if pa != pb {
-                return Err(format!("case {case} step {step} ({n} runners): picked {pa:?}, its two moves pick {pb:?}"));
+                return Err(format!("case {case} step {step} ({n} runners): a run of {kind:?} picked {pa:?}, with every move made first {pb:?}"));
             }
+            kinds.extend(pa.map(|_| kind));
             ha.extend(pa);
             hb.extend(pb);
             if a.order(sa) != b.order(sb) {
@@ -1113,9 +1510,9 @@ fn w05_r26_a_tied_pick_chooses_and_leaves_what_its_two_moves_do() -> Result<(), 
             return Err(format!("case {case}: the twins part once every run has ended"));
         }
     }
-    let (swaps, backs) = turns();
-    if swaps <= swaps0 || backs <= backs0 {
-        return Err(format!("the trace made {} swaps and {} picks back to the runner put off: both are to be covered", swaps - swaps0, backs - backs0));
+    let (swaps, backs, stays) = turns();
+    if swaps <= swaps0 || backs <= backs0 || stays <= stays0 {
+        return Err(format!("the trace made {} swaps, {} picks back to the runner put off as the turn came to it and {} as its kind's good place: each is to be covered", swaps - swaps0, backs - backs0, stays - stays0));
     }
     Ok(())
 }
@@ -1128,7 +1525,7 @@ fn w05_r04_an_idle_fleets_picks_take_turns_by_swapping() -> Result<(), String> {
     for n in [2u32, 5, 64, 65, 200] {
         let (mut o, mut rs, s, _) = rig(n, 0).map_err(str::to_owned)?;
         let mut held = fast_start(&mut o, &mut rs, s, CPU as u32)?.ok_or("the first pick")?;
-        let (swaps0, _) = turns();
+        let (swaps0, _, _) = turns();
         for step in 0..3 * n {
             fast_end(&mut o, &mut rs, held)?;
             let next = fast_start(&mut o, &mut rs, s, CPU as u32)?.ok_or("a pick")?;

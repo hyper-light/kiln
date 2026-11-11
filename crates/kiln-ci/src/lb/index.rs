@@ -283,14 +283,18 @@ impl Index {
         Some(w * 64 + 63u32.checked_sub(bits.leading_zeros())?)
     }
 
-    /// Whether bucket `b` and every one above it are empty.
+    /// What holds a member from bucket `b` up: 0 when `b` and every bucket above it are empty, 1
+    /// when `b` alone holds any, more when a bucket above it does.
     #[inline(always)]
-    pub fn none_from(&self, b: u32) -> bool {
-        if b < 64 {
-            let low = self.words.first().copied().unwrap_or(0);
-            return self.summary <= 1 && low >> b == 0;
+    pub fn upward(&self, b: u32) -> u64 {
+        if b < 64 && self.summary <= 1 {
+            return self.words.first().copied().unwrap_or(0) >> b;
         }
-        self.top().is_none_or(|t| b > t)
+        match self.top() {
+            Some(t) if t > b => 2,
+            Some(t) if t == b => 1,
+            _ => 0,
+        }
     }
 
     /// The highest bucket below `b` that holds a member.

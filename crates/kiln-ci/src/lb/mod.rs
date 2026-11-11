@@ -84,6 +84,18 @@ pub struct OwnerId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SigId(pub u32);
 
+/// A kind of work at one owner: work whose runs leave a node equipped for the next of them (the
+/// same job, the same tree), numbered by the shell as signatures are: dense, from 0. The owner
+/// keeps where each kind's work last went well, and sends its next run back there when that node
+/// is among the best by rank (docs/lb.md "Good places").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KindId(pub u32);
+
+impl KindId {
+    /// No kind: an ask that names none is decided by rank and turn alone.
+    pub const NONE: KindId = KindId(NIL);
+}
+
 /// A u64 amount as a view (saturating: views top out at 4,294,967 thousandths, 4,294 CPUs; a
 /// bigger runner admits exactly, its owner just sees less of it).
 #[inline(always)]
@@ -220,6 +232,11 @@ pub enum Mutant {
     StaleKey,
     /// A key that goes to or from 0 doesn't move its runner into or out of the narrow order.
     NoGate,
+    /// A kind's good place is kept after its shell says the node let its work down: it goes on
+    /// getting that kind's work for as long as it is as free as any (docs/lb.md "Good places").
+    StaysOnALoser,
+    /// Where a kind's work went well isn't kept: its next run goes on to another of its equals.
+    NoStay,
 }
 
 #[cfg(test)]
