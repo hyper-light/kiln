@@ -1282,13 +1282,7 @@ fn main() -> std::process::ExitCode {
         for &n in &a.ns {
             for &d in &a.ds {
                 match cold_sample(n, d) {
-                    kiln_release(&mut k, 0);
-    let t = Instant::now();
-    let a = k.owner.ask_with(k.sig, k.need, &Terms { cpu_ns: 1, io_bytes: 1, ..Terms::default() }, &mut k.out).map_err(|_| "first byte ask refused")?;
-    let (to, msg) = a.send.ok_or("first byte ask did not start")?;
-    if k.admit(0, to, msg) < 0 { return Err("first byte placement refused"); }
-    let first_byte = t.elapsed().as_nanos();
-    Ok((build, first, measured, first_measured, first_byte)) => println!("{{\"commit\":\"{commit}\",\"n\":{n},\"d\":{d},\"build_ns\":{build},\"first_placement_ns\":{first},\"first_cpu_measure_ns\":{measured},\"first_measured_placement_ns\":{first_measured},\"first_byte_placement_ns\":{first_byte},\"runner_bytes\":{},\"owner_inline_bytes\":{},\"harness_slot_bytes\":{},\"scope\":\"fresh process/state; OS page cache uncontrolled\"}}", std::mem::size_of::<Runner>(), std::mem::size_of::<Owner>(), std::mem::size_of::<Slot>()),
+                    Ok((build, first, measured, first_measured, first_byte)) => println!("{{\"commit\":\"{commit}\",\"n\":{n},\"d\":{d},\"build_ns\":{build},\"first_placement_ns\":{first},\"first_cpu_measure_ns\":{measured},\"first_measured_placement_ns\":{first_measured},\"first_byte_placement_ns\":{first_byte},\"runner_bytes\":{},\"owner_inline_bytes\":{},\"harness_slot_bytes\":{},\"scope\":\"fresh process/state; OS page cache uncontrolled\"}}", std::mem::size_of::<Runner>(), std::mem::size_of::<Owner>(), std::mem::size_of::<Slot>()),
                     Err(why) => { eprintln!("{why}"); return std::process::ExitCode::FAILURE; }
                 }
             }
