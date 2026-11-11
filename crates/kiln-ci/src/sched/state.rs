@@ -1573,6 +1573,10 @@ pub struct Scheduler {
     promotions: BTreeMap<i64, Vec<(String, i64, Class)>>,
     /// Each queued leg's wait behind the work of the classes before its own ([`Behind`]).
     behind: BTreeMap<String, Behind>,
+    /// W05-AC08, W05-AC09: empty watches wait by class for earlier-class work to arrive;
+    /// only armed watches need their predecessors checked after every input.
+    behind_unarmed: BTreeMap<Class, BTreeSet<String>>,
+    behind_active: BTreeSet<String>,
     /// How many running legs each class has (by [`Class::index`]): whether work of a class before a
     /// leg's is running, so a [`Behind`] with nothing ahead yet starts its wait.
     running: [u64; 5],
@@ -1889,7 +1893,7 @@ impl Scheduler {
         // their wait behind it starts now ([`Behind`]). Then those whose work ahead no longer
         // waits: when each one's bound is due.
         self.arm_behind(now);
-        let watched: Vec<String> = self.behind.keys().cloned().collect();
+        let watched: Vec<String> = self.behind_active.iter().cloned().collect();
         for id in watched {
             self.ahead_due(&id, now);
         }
@@ -2543,12 +2547,35 @@ impl Scheduler {
     /// queued or running now are ahead of it ([`Behind`]). A class with none above (`critical`,
     /// `land`) keeps no such watch.
     fn watch_ahead(&mut self, id: &str, class: Class, queued: i64, since: i64) {
-        self.behind.remove(id);
+        self.unwatch_ahead(id);
         if class.up().is_none() {
             return;
         }
         let mut b = Behind { queued, class, since, ..Behind::default() };
-        self.fill_ahead(id, &mut b);
+        if self.first_class_present().is_some_and(|first| first < class) {
+            self.fill_ahead(id, &mut b);
+        }
+        self.keep_behind(id, b);
+    }
+
+    fn unwatch_ahead(&mut self, id: &str) {
+        let Some(b) = self.behind.remove(id) else { return };
+        self.behind_active.remove(id);
+        if let Some(ids) = self.behind_unarmed.get_mut(&b.class) {
+            ids.remove(id);
+            if ids.is_empty() {
+                self.behind_unarmed.remove(&b.class);
+            }
+        }
+    }
+
+    fn keep_behind(&mut self, id: &str, b: Behind) {
+        self.unwatch_ahead(id);
+        if b.ahead.is_empty() {
+            self.behind_unarmed.entry(b.class).or_default().insert(id.to_owned());
+        } else {
+            self.behind_active.insert(id.to_owned());
+        }
         self.behind.insert(id.to_owned(), b);
     }
 
@@ -2579,12 +2606,12 @@ impl Scheduler {
     /// such work is queued or running: its wait behind that work starts now.
     fn arm_behind(&mut self, now: i64) {
         let Some(first) = self.first_class_present() else { return };
-        let unarmed: Vec<String> = self.behind.iter().filter(|(_, b)| b.ahead.is_empty() && first < b.class).map(|(id, _)| id.clone()).collect();
+        let unarmed: Vec<String> = self.behind_unarmed.range((std::ops::Bound::Excluded(first), std::ops::Bound::Unbounded)).flat_map(|(_, ids)| ids.iter().cloned()).collect();
         for id in unarmed {
             let Some(mut b) = self.behind.get(&id).cloned() else { continue };
             b.since = now;
             self.fill_ahead(&id, &mut b);
-            self.behind.insert(id, b);
+            self.keep_behind(&id, b);
         }
     }
 
@@ -2609,9 +2636,11 @@ impl Scheduler {
     /// A leg started or ended (`now`): it's ahead of no leg's wait any more, and one of its own
     /// is over.
     fn ahead_left(&mut self, id: &str) {
-        self.behind.remove(id);
-        for b in self.behind.values_mut() {
-            b.waiting.remove(id);
+        self.unwatch_ahead(id);
+        for other in &self.behind_active {
+            if let Some(b) = self.behind.get_mut(other) {
+                b.waiting.remove(id);
+            }
         }
     }
 
