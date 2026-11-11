@@ -77,7 +77,9 @@ pub fn rank(needs: &Needs, facts: &RunnerFacts, labels: &[String], free: u64) ->
     if free < u64::from(needs.request.gpu) { return None; }
     if facts.gpus.is_empty() {
         bind(needs, facts, labels, |_, _| true)?;
-        return Some(u64::from(needs.request.gpu).saturating_mul(MILLION));
+        // W05-R23: old peers can declare capacity without observations. Preserve admission,
+        // but a count supplies no measured idle credit and no concrete device identity.
+        return Some(0);
     }
     // The existing wire carries reserved counts, not selected identities. Until Hex's durable
     // binding/attachment path is finished and ported, conservatively account for every held card.
@@ -162,7 +164,7 @@ mod tests {
         let f = RunnerFacts::default();
         let mut n = needs::parse("gpus=2")?;
         assert!(matches(&n, &f, &[]));
-        assert_eq!(rank(&n, &f, &[], 2), Some(2_000_000));
+        assert_eq!(rank(&n, &f, &[], 2), Some(0));
         assert_eq!(rank(&n, &f, &[], 1), None);
         n.requires.push("gpu.model == A100".into());
         assert!(!matches(&n, &f, &[]));

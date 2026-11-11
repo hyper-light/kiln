@@ -816,7 +816,8 @@ in the facts. Hex's later quality fix (`b5b67b383e3cb2746efa330687fdd911275b5d6c
 a card with a missing memory or compute reading, or an invalid utilization, cannot satisfy a
 fresh GPU reservation and earns no idle credit. Known zero remains idle; unread free memory
 is not fabricated. A later valid observation can make a queued ask fit, and CPU-only work still
-proceeds. Count-only peers without a device inventory retain their declared-count compatibility.
+proceeds. Count-only peers without a device inventory retain their declared-count compatibility, but earn
+no measured idle credit and cannot satisfy per-card predicates or supply concrete binding IDs.
 There is no separate kiln GPU prior. All four reservation dimensions
 are still checked and deducted by the existing ledger. Equal GPU ranks first compare measured per-core speed under contention, then retain CPU room
 and the bucket cursor. Only GPU asks pay for the full bounded candidate walk. GPU bids in an
