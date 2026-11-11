@@ -202,7 +202,7 @@ test("W21-R02 a bounded snapshot automatically restores a saved older row throug
   const older = await heldOlderPlace(page);
   try {
     await page.goto("/agents/tree-lead");
-    await expect(page.locator(".hx-restore-place")).toContainText("Restoring your saved place", { timeout: 30_000 });
+    await expect(page.locator(".hx-restore-place")).toContainText("Loading conversation", { timeout: 30_000 });
     await expect.poll(older.requests).toBe(1);
     await expect(page.locator(".hx-flow > .hx-turn")).toHaveCount(0);
     expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem("kiln.agents.places") ?? "{}").state.places["tree-lead"].id)).toBe("window-call-20");
@@ -238,7 +238,7 @@ test("W21-R02 Latest cancels the owned restore page and preserves the live bound
     await expect(page.locator(".hx-restore-place")).toBeVisible({ timeout: 30_000 });
     await expect.poll(older.requests).toBe(1);
     await expect.poll(async () => (await cancellation()).signals).toBe(1);
-    await page.getByRole("button", { name: "Latest messages", exact: true }).click();
+    await page.getByRole("button", { name: "Latest", exact: true }).click();
     await expect(page.locator(".hx-restore-place")).toHaveCount(0);
     await expect(page.locator(".hx-flow > .hx-turn")).toBeVisible();
     await expect.poll(async () => (await cancellation()).aborted).toBe(1);
