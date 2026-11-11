@@ -55,6 +55,17 @@ pub fn capacity(hub: &Hub, id: &str) -> Option<Capacity> {
     }
 }
 
+/// The session's current owner is a runner that predates mail-flow: it never pushes capacity, so
+/// [`capacity`] never admits mail to it until that runner is upgraded. A person's message, and
+/// kiln's own, go to its inbox as before W20 (`Registry::send_asked`, `Registry::dispatch`); an
+/// agent's stays in custody, bounded. An owner not known (its runner away) is not one.
+pub fn legacy_owner(hub: &Hub, id: &str) -> bool {
+    let Some(Location::Machine(machine)) = hub.harness.location(id) else { return false };
+    let instances = hub.instances.load();
+    let Some(owner) = instances.owner(&crate::instances::Owned::Agent(id.to_owned())).and_then(|peer| instances.get(peer)) else { return false };
+    owner.name == machine && !crate::proto::feature::speaks(&owner.features, crate::proto::feature::MAIL_FLOW)
+}
+
 async fn peers(hub: &Hub, id: &str) -> Result<Vec<String>, Error> {
     let page = mail::peer_heads(&hub.store, id.to_owned(), 0, super::state_view::FRAME).await?;
     if page.next.is_some() { return Err(Error::TooLarge { revision: page.next.unwrap_or(0), budget: super::state_view::FRAME }); }

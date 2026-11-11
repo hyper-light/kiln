@@ -998,6 +998,13 @@ interface Incoming {
   revision?: number;
 }
 
+/** What a message the server didn't take into custody waits for, by the refusal's `code`. */
+export function waitingFor(code: string): string {
+  if (code === "mail_backpressure") return "Waiting for the agent to take the messages before it";
+  if (code === "mail_capacity") return "Waiting for room on kiln's server";
+  return "Waiting for the agent's machine to take messages";
+}
+
 /**
  * One agent session, live: a websocket that receives the session's snapshot and then its updates,
  * and sends commands.
@@ -1164,7 +1171,9 @@ export class SessionStore {
     for (const message of this.originals()) {
       if (!message.custody || message.custody === "failed" || message.uploading?.length) continue;
       if ((message.custody === "retained" || this.out.get(message.id)?.publication) && !connection) continue;
-      if (message.custody !== "retained" && !wake) continue;
+      // A runner from before admission pushes no capacity, so no wake comes for it: a new
+      // connection is its one event, and the server sends a person's message to its inbox.
+      if (message.custody !== "retained" && !wake && !(connection && !this.snap.info?.admission)) continue;
       const stamp = wake ?? `connection:${this.mailConnection}`;
       if (message.wait === stamp) continue;
       // Persist the event already answered before transmission: a repeated unchanged event
@@ -1186,12 +1195,12 @@ export class SessionStore {
     this.patch({ asked: [...this.asked.values()] });
   }
 
-  private mailWaiting(id: string, reason: string) {
+  private mailWaiting(id: string, code: string) {
     const original = this.originals().find((message) => message.id === id);
     const going = this.out.get(id);
     if (!original || !going) return;
     const retained = going.publication ?? original.publication;
-    const why = retained ? "Kiln retained the original; its receiver is not ready yet" : "Waiting for capacity; the original message and files are saved here";
+    const why = retained ? "Kiln retained the original; its receiver is not ready yet" : `${waitingFor(code)}; the original message and files are saved here`;
     this.saveMail(
       useHeld.getState().hold(this.id, { ...original, custody: retained ? "retained" : "waiting", publication: retained, wait: this.mailWake() ?? `connection:${this.mailConnection}`, why }),
     );
@@ -1200,9 +1209,6 @@ export class SessionStore {
     this.out.set(id, { ...going, o: { ...going.o, state: retained ? "retained" : "waiting", why } });
     this.outChanged();
     this.patch({ asked: [...this.asked.values()] });
-    // The source's typed refusal remains on the command; presentation does not expose raw SQL
-    // or internal resource structures as a user action.
-    void reason;
   }
 
   private published(id: string, receipt: PublicationReceipt) {
@@ -2085,7 +2091,7 @@ export class SessionStore {
         return;
       case "nack":
         if (u.id != null && ["mail_backpressure", "mail_capacity", "mail_unavailable"].includes(u.code)) {
-          this.mailWaiting(u.id, u.why);
+          this.mailWaiting(u.id, u.code);
           return;
         }
         // Not this time (its machine away, its inbox full ...): it waits, and goes again.

@@ -1000,6 +1000,48 @@ await test("W20: pre-custody pressure waits for a changed source event without r
   }
 });
 
+await test("W20: a message an old runner's session refused says what it waits for and goes again on the next connection", async () => {
+  // A runner from before admission pushes no capacity: its session's info names none.
+  const store = new SessionStore("old-runner");
+  const off = store.subscribe(() => {});
+  const ws = Socket.all.at(-1)!;
+  const c = { type: "send", id: "to-old-runner", text: "what is this section?", mode: "queue", attachments: [{ name: "shot.jpeg", mime: "image/jpeg", data_base64: "YQ==" }] } as const;
+  try {
+    setMailScope("test-mail-scope");
+    ws.frame({ t: "open", info: { id: store.id, status: "idle", epoch: 0 } });
+    ws.frame({ t: "state", state: { ...state, status: "idle" } });
+    ws.frame({ t: "synced" });
+    await tick();
+    assert.equal(await store.sendMail({ ...c, attachments: [...c.attachments] }), true);
+    ws.frame({ t: "nack", id: c.id, code: "mail_unavailable", why: "custody was not accepted: current owner capacity is pending or unsupported", again: true });
+    await tick();
+    assert.equal(store.get().outgoing[0]?.state, "waiting");
+    assert.equal(store.get().outgoing[0]?.why, "Waiting for the agent's machine to take messages; the original message and files are saved here");
+    ws.frame({ t: "state", state: { ...state, status: "running" } });
+    await tick();
+    assert.equal(commands(ws).length, 1, "nothing on this connection sends it again");
+    ws.close();
+    store.wake();
+    const next = Socket.all.at(-1)!;
+    next.frame({ t: "open", info: { id: store.id, status: "idle", epoch: 0 } });
+    next.frame({ t: "state", state: { ...state, status: "idle" } });
+    next.frame({ t: "synced" });
+    await next.transmitted(1);
+    assert.deepEqual(
+      commands(next).map((wire) => wire.c),
+      [c],
+      "the next connection sends the same original, once",
+    );
+    next.frame({ t: "ack", id: c.id, outcome: "accepted" });
+    await tick();
+    assert.equal(store.get().outgoing[0]?.state, "sent");
+    assert.equal(await original(store.id, c.id), undefined, "its inbox took it: the saved original goes");
+  } finally {
+    store.dispose();
+    off();
+  }
+});
+
 await test("W20: an early committed source receipt binds only the authenticated sender scope", async () => {
   const store = new SessionStore("early-source-receipt");
   const off = store.subscribe(() => {});
