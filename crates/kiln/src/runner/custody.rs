@@ -18,6 +18,7 @@ use std::sync::LazyLock;
 use kiln_ci::identity::custody::{Body, Kind, to_value};
 use kiln_ci::identity::statement::{self, PAYLOAD_CUSTODY, Statement, Subject};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::custody::{at_epoch, timeline};
@@ -36,8 +37,11 @@ struct Waiting {
     /// Taken over blue/green: it goes on at the epoch it had until this process is promoted, its
     /// ask held till then, and it goes on at the next once that's certified ([`certified`]).
     held: bool,
-    blue_green: bool,
+    transition: EpochTransition,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EpochTransition { Taken, BlueGreen, DurablePromotion }
 
 /// A receipt to sign, of the hand-on it follows.
 struct Receipt {
@@ -49,6 +53,90 @@ struct Receipt {
     /// The session at the epoch it was taken at, without the process: its signer, as it says
     /// before kiln has certified the process's key.
     by: String,
+}
+
+/// The original hand-on and compact timeline retained before a legacy native session opens.
+/// It is request material, not locally verified ownership; the server checks its full trust chain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LegacyProof {
+    pub hand_on: Option<String>,
+    pub subject: Subject,
+}
+
+impl LegacyProof {
+    pub(crate) fn of(session: &str, from: u64, events: &[Event], hand_on: Option<&Value>) -> Result<Self, String> {
+        let to = from.checked_add(1).ok_or_else(|| "the legacy handover epoch cannot advance".to_owned())?;
+        let proof = Self { hand_on: hand_on.map(Value::to_string), subject: timeline(session, from, events) };
+        proof.validate(session, from, to)?;
+        Ok(proof)
+    }
+
+    pub(crate) fn validate(&self, session: &str, from: u64, to: u64) -> Result<(), String> {
+        use kiln_ci::identity::chain::{Actor, Identity};
+        if from.checked_add(1) != Some(to) || self.subject.name != format!("session {session} at epoch {from}")
+            || self.subject.annotations.get("epoch").and_then(Value::as_u64) != Some(from)
+            || self.subject.annotations.get("events").and_then(Value::as_u64).is_none()
+            || self.subject.digest.len() != 1 || self.subject.digest.get(crate::custody::TIMELINE).is_none_or(|hex| hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        { return Err("legacy custody proof does not name its exact source session and next epoch".into()); }
+        let Some(hand_on) = &self.hand_on else { return Ok(()) };
+        let bundle: Value = crate::wire::payload(crate::wire::unread::Wire::RunnerPayload, "LegacyHandOn", hand_on).map_err(|error| error.to_string())?;
+        let statement = statement_of(&bundle).ok_or_else(|| "legacy source hand-on has no readable statement".to_owned())?;
+        let body: Body = crate::wire::payload(crate::wire::unread::Wire::RunnerPayload, "LegacyHandOnBody", &statement.body.to_string()).map_err(|error| error.to_string())?;
+        let source = Identity::parse(&body.by).ok().is_some_and(|identity| matches!(identity.actor, Actor::Agent { agent, epoch, .. } if agent == session && epoch == from));
+        if !source || bundle.pointer("/dsseEnvelope/payloadType").and_then(Value::as_str) != Some(PAYLOAD_CUSTODY)
+            || statement.v != statement::VERSION || body.v != kiln_ci::identity::custody::VERSION
+            || body.kind != Kind::HandedOn || body.epoch != Some(to) || body.to != at_epoch(&body.by, to)
+            || statement.subject.as_slice() != std::slice::from_ref(&self.subject)
+        { return Err("legacy source hand-on differs from its retained timeline or destination epoch".into()); }
+        Ok(())
+    }
+
+    fn receipt(&self, epoch: u64) -> Option<Receipt> {
+        let hand_on = self.hand_on.as_ref()?;
+        let bundle: Value = crate::wire::payload(crate::wire::unread::Wire::RunnerPayload, "LegacyHandOn", hand_on).ok()?;
+        let from = giver_of(&bundle)?;
+        Some(Receipt { subject: self.subject.clone(), hand_on: hand_on.clone(), follows: digest_of(&bundle), by: at_epoch(&from, epoch)?, from })
+    }
+}
+
+/// Restores only the existing receipt waiter from its authoritative durable Head phase.
+pub(crate) fn legacy_waiting(session: &str, promotion: &crate::harness::inbox::Promotion) -> Result<(), String> {
+    use crate::harness::inbox::PromotionPhase;
+    promotion.proof.validate(session, promotion.from_epoch, promotion.to_epoch)?;
+    let key = (session.to_owned(), promotion.to_epoch);
+    let active = promotion.phase == PromotionPhase::Active && legacy_certificate_ready(session, promotion.to_epoch, &promotion.proof).is_ok();
+    let mut state = STATE.lock();
+    if active { state.waiting.remove(&key); return Ok(()); }
+    let signed = promotion.proof.receipt(promotion.to_epoch);
+    if promotion.proof.hand_on.is_some() && signed.is_none() { return Err("legacy source proof cannot form its exact custody receipt".into()); }
+    state.waiting.insert(key, Waiting { signed, held: promotion.phase == PromotionPhase::AwaitingPromotion, transition: EpochTransition::DurablePromotion });
+    Ok(())
+}
+
+pub(crate) fn legacy_certificate_ready(session: &str, to: u64, proof: &LegacyProof) -> Result<(), String> {
+    let from = to.checked_sub(1).ok_or_else(|| "a legacy promotion has no preceding epoch".to_owned())?;
+    proof.validate(session, from, to)?;
+    let source = match &proof.hand_on {
+        Some(hand_on) => {
+            let bundle: Value = crate::wire::payload(crate::wire::unread::Wire::RunnerPayload, "LegacyHandOn", hand_on).map_err(|error| error.to_string())?;
+            Some(kiln_ci::identity::chain::Identity::parse(&giver_of(&bundle).ok_or_else(|| "legacy source proof names no giver".to_owned())?).map_err(|error| error.to_string())?)
+        }
+        None if !signs() => None,
+        None => return Err("the retained legacy source has no signed identity proof".into()),
+    };
+    identity::agent_certificate_ready(session, to, source.as_ref())
+}
+
+/// Called only after the owner durably retires its completed Head transition.
+pub(crate) fn legacy_completed(session: &str, to: u64) {
+    let mut state = STATE.lock();
+    let key = (session.to_owned(), to);
+    if state.waiting.get(&key).is_some_and(|waiting| waiting.transition == EpochTransition::DurablePromotion) { state.waiting.remove(&key); }
+}
+
+/// A queued request may start only while this exact transition still awaits its certificate.
+pub(crate) fn legacy_identity_pending(session: &str, to: u64) -> bool {
+    STATE.lock().waiting.get(&(session.to_owned(), to)).is_some_and(|waiting| !waiting.held && waiting.transition == EpochTransition::DurablePromotion)
 }
 
 impl Receipt {
@@ -533,7 +621,7 @@ pub fn took(session: &str, epoch: u64, events: &[Event], hand_on: &Value) -> Res
         return Ok(());
     }
     let signed = Receipt::of(session, epoch, events, hand_on).ok_or_else(|| "the source hand-on cannot form this session's custody receipt".to_owned())?;
-    STATE.lock().waiting.insert((session.to_owned(), epoch), Waiting { signed: Some(signed), held: false, blue_green: false });
+    STATE.lock().waiting.insert((session.to_owned(), epoch), Waiting { signed: Some(signed), held: false, transition: EpochTransition::Taken });
     Ok(())
 }
 
@@ -548,7 +636,7 @@ pub fn took_blue_green(session: &str, epoch: u64, events: &[Event], hand_on: Opt
     }
     let next = epoch.saturating_add(1);
     let signed = hand_on.and_then(|h| Receipt::of(session, next, events, h));
-    STATE.lock().waiting.insert((session.to_owned(), next), Waiting { signed, held: true, blue_green: true });
+    STATE.lock().waiting.insert((session.to_owned(), next), Waiting { signed, held: true, transition: EpochTransition::BlueGreen });
 }
 
 /// This process was promoted (blue/green): the sessions it took over, each at the epoch it goes
@@ -603,8 +691,18 @@ fn sign_uncertified(slot: &str, s: &Statement) -> anyhow::Result<(Vec<u8>, Vec<u
 /// This process's identity at `epoch` of session `session` was certified: its receipt went with
 /// the ask, and kiln recorded it. Whether the session goes on at `epoch` now (a blue/green
 /// take-over's: it went on at the one before until then).
-pub fn certified(session: &str, epoch: u64) -> bool {
-    STATE.lock().waiting.remove(&(session.to_owned(), epoch)).is_some_and(|w| w.blue_green)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Certification { Untracked, Receipt, BlueGreen, DurablePromotion }
+
+pub(crate) fn certified(session: &str, epoch: u64) -> Certification {
+    let mut state = STATE.lock();
+    let key = (session.to_owned(), epoch);
+    if state.waiting.get(&key).is_some_and(|waiting| waiting.transition == EpochTransition::DurablePromotion) { return Certification::DurablePromotion; }
+    match state.waiting.remove(&key).map(|waiting| waiting.transition) {
+        Some(EpochTransition::BlueGreen) => Certification::BlueGreen,
+        Some(EpochTransition::Taken) => Certification::Receipt,
+        Some(EpochTransition::DurablePromotion) | None => Certification::Untracked,
+    }
 }
 
 /// A bundle (a signed statement, as JSON) as it came: a hand-on passed from the runner before this
@@ -1922,9 +2020,9 @@ mod tests {
         assert_eq!(to_ask("bg-unsigned", 3), Some(4), "then its next epoch's");
         let ask = carrying("bg-unsigned", 4, IdentityAsk::default());
         assert!(ask.hand_on.is_none() && ask.receipt.is_none(), "nothing signed to carry: kiln records it unsigned");
-        assert!(certified("bg-unsigned", 4), "certified, it goes on at epoch 4");
+        assert_eq!(certified("bg-unsigned", 4), Certification::BlueGreen, "certified, it goes on at epoch 4");
         assert_eq!(to_ask("bg-unsigned", 4), Some(4));
-        assert!(!certified("bg-unsigned", 4), "once");
+        assert_eq!(certified("bg-unsigned", 4), Certification::Untracked, "once");
     }
 }
 

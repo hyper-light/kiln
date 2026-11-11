@@ -169,6 +169,9 @@ pub fn given(g: IdentityGiven, state_dir: &Path, label: &str) -> anyhow::Result<
         tracing::debug!(identity = %g.uri, "a certificate came for a key let go of");
         return Ok(());
     }
+    if g.kind == "agent" {
+        check_agent_answer(&slot, &g.uri, &pem, g.of.as_deref(), g.epoch).map_err(anyhow::Error::msg)?;
+    }
     let path = cert_written(state_dir, label, &slot, &pem)?;
     if keep_cert(&slot, Given { uri: g.uri.clone(), under: g.delegation }, pem, path) {
         tracing::info!(identity = %g.uri, "identity certified");
@@ -208,7 +211,7 @@ fn cert_written(state_dir: &Path, label: &str, slot: &str, pem: &str) -> anyhow:
 fn keep_cert(slot: &str, given: Given, pem: String, path: PathBuf) -> bool {
     {
         let mut held = HELD.lock();
-        if held.keys.contains_key(slot) {
+        if held.keys.get(slot).is_some_and(|key| !slot.starts_with("agent/") || bound_certificate(key, &pem, &given.uri).is_ok()) {
             held.given.insert(slot.to_owned(), given);
             held.refused.remove(slot);
             held.certs.insert(slot.to_owned(), (pem, path));
@@ -217,6 +220,53 @@ fn keep_cert(slot: &str, given: Given, pem: String, path: PathBuf) -> bool {
     }
     let _ = std::fs::remove_file(path);
     false
+}
+
+/// Bind an authenticated server answer to the actual private key and certificate subject.
+/// Chain/revocation authorization remains the server's; this does not replace it.
+fn bound_certificate(key: &Key, pem: &str, uri: &str) -> Result<kiln_ci::identity::chain::Identity, String> {
+    use rcgen::PublicKeyData as _;
+    use x509_parser::extensions::GeneralName;
+    let der = crate::pki::der_of(pem).map_err(|_| "the installed identity is not a certificate".to_owned())?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|_| "the installed identity certificate is unreadable".to_owned())?;
+    if key.der_bytes() != cert.public_key().subject_public_key.data.as_ref() { return Err("the identity certificate is not for the current private key".into()); }
+    let now = crate::util::now_unix();
+    if now < cert.validity().not_before.timestamp() || now >= cert.validity().not_after.timestamp() { return Err("the installed identity certificate is not currently valid".into()); }
+    let san = cert.subject_alternative_name().map_err(|_| "the identity certificate has unreadable subjects".to_owned())?.ok_or_else(|| "the identity certificate has no subject URI".to_owned())?;
+    let mut uris = san.value.general_names.iter().filter_map(|name| match name { GeneralName::URI(uri) => Some(*uri), _ => None });
+    if uris.next() != Some(uri) || uris.next().is_some() { return Err("the identity certificate does not name the exact installed subject".into()); }
+    kiln_ci::identity::chain::Identity::parse(uri).map_err(|_| "the installed identity URI is invalid".into())
+}
+
+fn check_agent_answer(slot: &str, uri: &str, pem: &str, session: Option<&str>, epoch: Option<u64>) -> Result<(), String> {
+    use kiln_ci::identity::chain::Actor;
+    let held = HELD.lock();
+    let key = held.keys.get(slot).ok_or_else(|| "the agent identity key is no longer installed".to_owned())?;
+    let identity = bound_certificate(key, pem, uri)?;
+    if !matches!(identity.actor, Actor::Agent { agent, epoch: at, .. } if Some(agent.as_str()) == session && Some(at) == epoch) { return Err("the identity certificate is for a different agent or epoch".into()); }
+    Ok(())
+}
+
+pub(crate) fn agent_certificate_ready(session: &str, epoch: u64, source: Option<&kiln_ci::identity::chain::Identity>) -> Result<(), String> {
+    use kiln_ci::identity::chain::Actor;
+    let held = HELD.lock();
+    let slot = slot("agent", Some(session), Some(epoch));
+    let key = held.keys.get(&slot).ok_or_else(|| "the current agent private key is unavailable".to_owned())?;
+    let (pem, _) = held.certs.get(&slot).ok_or_else(|| "the current agent certificate is not installed".to_owned())?;
+    let given = held.given.get(&slot).ok_or_else(|| "the current agent identity was not installed".to_owned())?;
+    let agent = bound_certificate(key, pem, &given.uri)?;
+    let runner_key = held.keys.get("runner").ok_or_else(|| "the current runner private key is unavailable".to_owned())?;
+    let (runner_pem, _) = held.certs.get("runner").ok_or_else(|| "the current runner certificate is not installed".to_owned())?;
+    let runner_given = held.given.get("runner").ok_or_else(|| "the current runner identity was not installed".to_owned())?;
+    let runner = bound_certificate(runner_key, runner_pem, &runner_given.uri)?;
+    let Actor::Runner { machine, instance, .. } = runner.actor else { return Err("the current runner certificate names a different actor".into()); };
+    let Actor::Agent { agent: actual, epoch: at, person, held_by: Some(holder) } = &agent.actor else { return Err("the current agent certificate names no holder".into()); };
+    if actual != session || *at != epoch || holder.machine != machine || holder.instance != instance || agent.org != runner.org { return Err("the agent certificate does not belong to this current runner, session and epoch".into()); }
+    if let Some(source) = source {
+        let Actor::Agent { person: source_person, agent: source_session, .. } = &source.actor else { return Err("the retained legacy source identity is not an agent".into()); };
+        if source.org != agent.org || source_person != person || source_session != session { return Err("the current agent certificate differs from the retained source organization or person".into()); }
+    }
+    Ok(())
 }
 
 /// Whether a key is held under `slot` that kiln hasn't answered yet: asked for, and since neither

@@ -33,6 +33,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 pub mod transfer;
+pub mod promotion;
+pub use promotion::{Promotion, PromotionError, PromotionPhase};
 mod accepting;
 
 /// Ids a session keeps: the duplicates of its last this many messages are known.
@@ -212,6 +214,8 @@ struct Head {
     /// process was started again with it) takes it back. A move to another machine's fence isn't.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     handover: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    promotion: Option<Promotion>,
 }
 
 /// A head as this host last read or wrote it (none kept yet: `rev` is none), and how many messages'
@@ -358,13 +362,14 @@ impl Inbox {
         check_session(session)?;
         for _ in 0..RETRIES {
             let c = self.head(session).await?;
+            if c.head.promotion.as_ref().is_some_and(|p| p.phase != PromotionPhase::Active) { return Err(unavailable(session, "its legacy promotion is not active")); }
             // Handed to this machine's next runner process at this epoch, and that never finished:
             // this host goes on with it, so it takes messages again.
             let handed_back = c.head.moved && c.head.handover && epoch == c.head.epoch;
             if c.rev.is_some() && epoch <= c.head.epoch && !handed_back {
                 return Ok(c.head.epoch);
             }
-            let head = Head { epoch: epoch.max(c.head.epoch), moved: false, handover: false };
+            let head = Head { epoch: epoch.max(c.head.epoch), moved: false, handover: false, promotion: c.head.promotion.clone() };
             match self.commit(session, &c, Vec::new(), Vec::new(), Some(head.clone())).await {
                 Ok(_) => return Ok(head.epoch),
                 Err(Retry::Again | Retry::Taken) => continue,
@@ -382,10 +387,11 @@ impl Inbox {
         check_session(session)?;
         for _ in 0..RETRIES {
             let c = self.head(session).await?;
+            if c.head.promotion.as_ref().is_some_and(|p| p.phase != PromotionPhase::Active) { return Err(unavailable(session, "its legacy promotion is not active")); }
             if c.rev.is_some() && (epoch < c.head.epoch || (epoch == c.head.epoch && !c.head.moved)) {
                 return Ok(c.head.epoch);
             }
-            let head = Head { epoch: epoch.max(c.head.epoch), moved: false, handover: false };
+            let head = Head { epoch: epoch.max(c.head.epoch), moved: false, handover: false, promotion: c.head.promotion.clone() };
             match self.commit(session, &c, Vec::new(), Vec::new(), Some(head.clone())).await {
                 Ok(_) => return Ok(head.epoch),
                 Err(Retry::Again | Retry::Taken) => continue,
@@ -414,7 +420,7 @@ impl Inbox {
             if c.head.moved && (c.head.epoch > epoch || (c.head.epoch == epoch && (handover || !c.head.handover))) {
                 return Ok(());
             }
-            let head = Head { epoch: c.head.epoch.max(epoch), moved: true, handover: handover && c.head.epoch <= epoch };
+            let head = Head { epoch: c.head.epoch.max(epoch), moved: true, handover: handover && c.head.epoch <= epoch, promotion: c.head.promotion.clone() };
             match self.commit(session, &c, Vec::new(), Vec::new(), Some(head)).await {
                 Ok(_) => return Ok(()),
                 Err(Retry::Again | Retry::Taken) => continue,
@@ -555,7 +561,8 @@ impl Inbox {
         let message = pending.lease.message.clone();
         if let Some(existing) = self.pending(session, &message).await? { return Ok(existing); }
         let cached = self.head(session).await?;
-        if cached.head.moved { return Err(Refusal::Moved { session: session.to_owned(), epoch: cached.head.epoch }); }
+        let recovering = cached.head.promotion.as_ref().is_some_and(|p| p.from_epoch == pending.lease.epoch && matches!(p.phase, PromotionPhase::AwaitingPromotion | PromotionPhase::AwaitingCertificate));
+        if cached.head.moved && !recovering { return Err(Refusal::Moved { session: session.to_owned(), epoch: cached.head.epoch }); }
         if cached.head.epoch != pending.lease.epoch { return Err(Refusal::StaleEpoch { session: session.to_owned(), sent: pending.lease.epoch, current: cached.head.epoch }); }
         let kept = self.kept(session, &message).await?;
         if pending.origin != Origin::LegacyOpaque { pending.origin = Origin::LegacyRetained; }

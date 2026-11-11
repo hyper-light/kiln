@@ -26,6 +26,8 @@ struct Header<'a> { manifest: &'a TransferManifest, saved: &'a crate::harness::h
 pub(super) struct Stored { manifest: TransferManifest, pub saved: crate::harness::host::Saved, pub handed: Option<Box<session::Handed>> }
 #[derive(Serialize, Deserialize)]
 struct Fence { manifest: TransferManifest, role: Role }
+#[derive(Serialize, Deserialize)]
+struct LegacyFence { session: String, from: u64, to: u64 }
 
 #[derive(Default)]
 struct Encoding { count: crate::harness::inbox::transfer::Count, hash: sha2::Sha256 }
@@ -65,6 +67,43 @@ impl Host {
 
     fn native_fence_path(&self, session: &str) -> PathBuf { self.native_directory().join(format!("native-{}.fence", crate::util::sha256_hex(session.as_bytes()))) }
 
+    fn legacy_fence_path(&self, session: &str) -> PathBuf { self.native_directory().join(format!("legacy-{}.fence", crate::util::sha256_hex(session.as_bytes()))) }
+
+    fn read_legacy_fence(&self, path: &std::path::Path) -> Result<LegacyFence, String> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| "legacy promotion fence is unavailable".to_owned())?;
+        if !metadata.is_file() || metadata.len() > crate::harness::state_view::FRAME as u64 { return Err("legacy promotion fence has an invalid type or size".into()); }
+        let file = std::fs::File::open(path).map_err(|_| "legacy promotion fence cannot be opened".to_owned())?;
+        let fence: LegacyFence = serde_json::from_reader(std::io::BufReader::new(file)).map_err(|_| "legacy promotion fence is unreadable".to_owned())?;
+        if fence.from.checked_add(1) != Some(fence.to) || self.legacy_fence_path(&fence.session) != path { return Err("legacy promotion fence identity or epoch is invalid".into()); }
+        Ok(fence)
+    }
+
+    pub(in crate::harness::host) fn legacy_fence_epochs(&self, session: &str) -> Result<Option<(u64, u64)>, String> {
+        let path = self.legacy_fence_path(session);
+        if !path.try_exists().map_err(|_| "legacy promotion fence cannot be inspected".to_owned())? { return Ok(None); }
+        self.read_legacy_fence(&path).map(|fence| Some((fence.from, fence.to)))
+    }
+
+    pub(in crate::harness::host) fn persist_legacy_fence(&self, session: &str, from: u64, to: u64) -> Result<(), String> {
+        if from.checked_add(1) != Some(to) { return Err("legacy promotion requires the next epoch".into()); }
+        let path = self.legacy_fence_path(session);
+        if path.try_exists().map_err(|_| "legacy promotion fence cannot be inspected".to_owned())? {
+            let old = self.read_legacy_fence(&path)?;
+            return if old.session == session && old.from == from && old.to == to { Ok(()) } else { Err("another legacy promotion still fences this session".into()) };
+        }
+        std::fs::create_dir_all(self.native_directory()).map_err(|_| "legacy promotion directory cannot be created".to_owned())?;
+        let bytes = crate::harness::state_view::encode(&LegacyFence { session: session.to_owned(), from, to }, crate::harness::state_view::FRAME).map_err(|_| "legacy promotion fence exceeds its metadata frame".to_owned())?;
+        crate::util::write_secret(&path, &bytes, 0o600).and_then(|()| path.parent().map_or(Ok(()), crate::blobs::chunks::sync_dir)).map_err(|_| "legacy promotion fence could not be synced".to_owned())
+    }
+
+    pub(in crate::harness::host) fn clear_legacy_fence(&self, session: &str, from: u64, to: u64) -> Result<(), String> {
+        let path = self.legacy_fence_path(session);
+        if !path.try_exists().map_err(|_| "legacy promotion fence cannot be inspected".to_owned())? { return Ok(()); }
+        let fence = self.read_legacy_fence(&path)?;
+        if fence.session != session || fence.from != from || fence.to != to { return Err("legacy promotion fence does not match its completed owner".into()); }
+        std::fs::remove_file(&path).and_then(|()| path.parent().map_or(Ok(()), crate::blobs::chunks::sync_dir)).map_err(|_| "legacy promotion fence could not be retired".to_owned())
+    }
+
     fn read_native_fence(&self, path: &std::path::Path) -> Result<Fence, String> {
         let file = std::fs::File::open(path).map_err(|_| "a native ownership fence cannot be opened".to_owned())?;
         if file.metadata().map_err(|_| "a native ownership fence cannot be inspected".to_owned())?.len() > crate::harness::state_view::FRAME as u64 { return Err("a native ownership fence exceeds its metadata frame".into()); }
@@ -78,7 +117,10 @@ impl Host {
         let mut ids = std::collections::HashSet::new();
         for entry in entries {
             let path = entry.map_err(|_| "native ownership fences cannot be enumerated".to_owned())?.path();
-            if path.extension().is_some_and(|extension| extension == "fence") { ids.insert(self.read_native_fence(&path)?.manifest.session); }
+            if path.extension().is_some_and(|extension| extension == "fence") {
+                if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("legacy-")) { ids.insert(self.read_legacy_fence(&path)?.session); }
+                else { ids.insert(self.read_native_fence(&path)?.manifest.session); }
+            }
         }
         Ok(ids)
     }
@@ -130,7 +172,7 @@ impl Host {
         Ok(Some((stored, charge)))
     }
 
-    fn native_active_record(&self, id: &str) -> Result<crate::harness::host::Saved, String> {
+    pub(in crate::harness::host) fn native_active_record(&self, id: &str) -> Result<crate::harness::host::Saved, String> {
         struct Find<'a>(&'a str);
         impl<'de> serde::de::DeserializeSeed<'de> for Find<'_> {
             type Value = Option<crate::harness::host::Saved>;

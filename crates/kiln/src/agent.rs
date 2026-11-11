@@ -545,11 +545,85 @@ fn in_kind(ev: &Ev) -> crate::route_latency::InKind {
 enum HarnessApplied {
     Command { reply: Option<(String, u64)>, result: Result<(), (crate::wire::channel::Refusal, String)> },
     Native(NativePrepared),
+    #[cfg(unix)]
+    LegacyPromotion(Result<(), crate::harness::inbox::PromotionError>),
 }
 type HarnessOperations=futures::stream::FuturesUnordered<futures::future::BoxFuture<'static,HarnessApplied>>;
 
 async fn next_harness_operation(operations:&mut HarnessOperations)->HarnessApplied{
     match operations.next().await{Some(answer)=>answer,None=>futures::future::pending().await}
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum LegacyCause { Observe, Promoted }
+
+#[cfg(unix)]
+impl LegacyCause {
+    fn joined(self, other: Self) -> Self { if matches!(self, Self::Promoted) || matches!(other, Self::Promoted) { Self::Promoted } else { Self::Observe } }
+}
+
+/// One metadata operation in the existing owner. A failed promotion keeps its actual event
+/// until another real connection/identity event retries it; bookkeeping never self-retries.
+#[cfg(unix)]
+#[derive(Default)]
+enum LegacyProgress {
+    #[default]
+    Idle,
+    Reading { cause: LegacyCause, again: Option<LegacyCause> },
+    Held(LegacyCause),
+}
+
+#[cfg(unix)]
+impl LegacyProgress {
+    fn request(&mut self, host: Option<&Arc<crate::harness::host::Host>>, operations: &mut HarnessOperations, tx: &crate::memory::queue::Sender<Bg>, cause: LegacyCause) {
+        let cause = match self {
+            Self::Reading { again, .. } => { *again = Some(again.map_or(cause, |before| before.joined(cause))); return; }
+            Self::Held(before) => before.joined(cause),
+            Self::Idle => cause,
+        };
+        let Some(host) = host else { return };
+        let (host, tx) = (Arc::clone(host), tx.clone());
+        *self = Self::Reading { cause, again: None };
+        operations.push(async move { HarnessApplied::LegacyPromotion(legacy_promotion_progress(&host, cause, &tx).await) }.boxed());
+    }
+
+    fn finish(&mut self, result: &Result<(), crate::harness::inbox::PromotionError>, host: Option<&Arc<crate::harness::host::Host>>, operations: &mut HarnessOperations, tx: &crate::memory::queue::Sender<Bg>) {
+        let Self::Reading { cause, again } = std::mem::take(self) else { return };
+        if result.is_err() { *self = Self::Held(cause); }
+        if let Some(again) = again { self.request(host, operations, tx, again); }
+    }
+}
+
+#[cfg(unix)]
+async fn legacy_promotion_progress(host: &Arc<crate::harness::host::Host>, cause: LegacyCause, tx: &crate::memory::queue::Sender<Bg>) -> Result<(), crate::harness::inbox::PromotionError> {
+    let mut after = None;
+    let mut first_error = None;
+    while let Some((session, promotion)) = host.legacy_promotion_next(after).await? {
+        after = Some(session.clone());
+        if let Err(error) = legacy_session_progress(host, &session, promotion, cause, tx).await && first_error.is_none() { first_error = Some(error); }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(unix)]
+async fn legacy_session_progress(host: &Arc<crate::harness::host::Host>, session: &str, mut promotion: crate::harness::inbox::Promotion, cause: LegacyCause, tx: &crate::memory::queue::Sender<Bg>) -> Result<(), crate::harness::inbox::PromotionError> {
+    use crate::harness::inbox::{PromotionError, PromotionPhase};
+    if promotion.phase == PromotionPhase::Active && !host.legacy_recovery_pending(session, promotion.from_epoch, promotion.to_epoch).await? { return Ok(()); }
+    crate::runner::custody::legacy_waiting(session, &promotion).map_err(|why| PromotionError::Invalid { why })?;
+    if matches!(cause, LegacyCause::Promoted) && promotion.phase == PromotionPhase::AwaitingPromotion {
+        host.promote_legacy(session, promotion.to_epoch).await?;
+        promotion = host.legacy_promotion(session).await?.ok_or(PromotionError::Stale)?;
+        crate::runner::custody::legacy_waiting(session, &promotion).map_err(|why| PromotionError::Invalid { why })?;
+    }
+    if matches!(promotion.phase, PromotionPhase::AwaitingCertificate | PromotionPhase::Rebinding | PromotionPhase::Active) {
+        if crate::runner::custody::legacy_certificate_ready(session, promotion.to_epoch, &promotion.proof).is_ok() {
+            host.certify_legacy(session, promotion.to_epoch).await?;
+        } else {
+            tx.send(Bg::LegacyIdentity { session: session.to_owned(), epoch: promotion.to_epoch }).await.map_err(|_| PromotionError::Storage { why: "the existing runner control owner is closed; promotion remains retained".into() })?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -755,6 +829,9 @@ enum Bg {
     /// (The new build's runner.) It is the runner now: the server hears it's the newest.
     #[cfg(unix)]
     Promoted,
+    /// A durable promotion asks only its exact destination epoch, outside the metadata worker.
+    #[cfg(unix)]
+    LegacyIdentity { session: String, epoch: u64 },
     /// A server frame for [`Ev::Forwarded`].
     #[cfg(unix)]
     Forwarded(Vec<u8>),
@@ -1637,6 +1714,16 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, mut
     let native_count = if handed.is_some() { 3 } else { 0 };
     let expected = native_count + usize::from(rec.mail_manifest().is_some());
     if fds.len() != expected { return Err("the native handover did not carry its exact native/journal descriptors; the source retains custody".into()); }
+    let durable_legacy = manifest.is_none() && crate::runner::custody::signs();
+    if durable_legacy {
+        let frozen = &handed.as_ref().ok_or_else(|| "the legacy native handover has no retained source timeline; its source keeps custody".to_owned())?.core;
+        let given = given.as_ref().ok_or_else(|| "the legacy native handover has no source hand-on; its source keeps custody".to_owned())?;
+        let (from, events) = frozen.handover_source();
+        let to = from.checked_add(1).ok_or_else(|| "the legacy ownership epoch cannot advance".to_owned())?;
+        let mut proof = crate::runner::custody::LegacyProof::of(id, from, events, Some(given))?;
+        proof.hand_on = hand_on;
+        h.prepare_legacy_promotion(id, from, to, proof).await.map_err(|error| error.to_string())?;
+    }
     let mut fds = fds;
     if rec.mail_manifest().is_some() {
         let journal = fds.pop().ok_or_else(|| "the native journal descriptor is missing".to_owned())?;
@@ -1653,7 +1740,7 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, mut
     // Signed for by the runner it came from, or by none (one from before): it goes on at its epoch
     // until this runner is promoted, its receipt waiting till then (docs/ci.md W27-R08).
     let taken = |r: Result<(), String>| {
-        if manifest.is_none() && r.is_ok()
+        if manifest.is_none() && !durable_legacy && r.is_ok()
             && let Some(s) = h.get(id)
         {
             let (epoch, events) = {
@@ -2222,6 +2309,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut wire_current = crate::wire::commands::Current::new();
     let mut answer_after: Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)> = None;
     let mut harness_operations=HarnessOperations::new();
+    #[cfg(unix)]
+    let mut legacy_progress = LegacyProgress::default();
     let mut native_handover = NativeHandover::default();
     // When it says what it has of them again soon after a link came up, and how many more times.
     let mut have_soon: Option<(Instant, u32)> = None;
@@ -2337,6 +2426,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }}
     }
     if let Some(h)=&harness{h.restore_from(convo.as_ref());}
+    #[cfg(unix)]
+    legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Observe);
     // Which of the machine's processes are its agent sessions' own: a run they ask for elsewhere
     // is their act (docs/ci.md W27-R08).
     if let Some(h) = &harness {
@@ -2732,6 +2823,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         // What this loop holds from now (runner-fan), by what it is.
         holding = Some((Instant::now(), kind));
         match ev {
+            #[cfg(unix)]
+            Ev::HarnessApplied(HarnessApplied::LegacyPromotion(result)) => {
+                if let Err(error) = &result { tracing::warn!(%error, "legacy ownership promotion remains durably held"); }
+                legacy_progress.finish(&result, harness.as_ref(), &mut harness_operations, &bg_tx);
+            }
             Ev::MailReplayed(held) => mail_replay.finish(harness.as_ref(), held),
             Ev::MailBudget => mail_replay.budget_event(harness.as_ref()),
             Ev::HarnessApplied(HarnessApplied::Command { reply, result })=>{
@@ -3341,14 +3437,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(h) = &harness {
                             h.hold(false);
                         }
-                        if server_identity && connected {
-                            for (session, epoch) in crate::runner::custody::promoted() {
-                                ask_agent_identity(&own, &mut identity_asked, &session, epoch).await;
-                            }
-                        }
+                        legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Promoted);
                         instance_hello.created_at = real_created_at;
                         draining = false;
                         own.msg(AgentMsg::Instance(instance_hello.clone())).await;
+                    }
+                    Bg::LegacyIdentity { session, epoch } => {
+                        if server_identity && connected && crate::runner::custody::legacy_identity_pending(&session, epoch) {
+                            // The current waiter authorizes starting this request. A request already
+                            // in flight can finish later; completion prevents queued events starting one.
+                            ask_agent_identity(&own, &mut identity_asked, &session, epoch).await;
+                        }
                     }
                     // Turned into Ev::Forwarded as they're received.
                     Bg::Forwarded(_) | Bg::Again(..) => {}
@@ -3923,12 +4022,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // A certificate for a key this process holds (docs/ci.md W27-R01).
                     Carried::Read(FromServer::Identity(given)) => {
                         let label = o.instance.clone().unwrap_or_else(|| crate::upgrade::MAIN.to_owned());
-                        let taken_over = (given.kind == "agent" && given.cert_pem.is_some()).then(|| (given.of.clone(), given.epoch));
                         // Its certificate's file written on the blocking pool, waited for here so what follows finds it
                         // kept (goal 9, plan 01a1a87b2cec step 3: written and synced on this loop's shard).
-                        if let Err(e) = crate::runner::identity::given_off(given, o.state_dir.clone(), label).await {
-                            tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept");
-                        }
+                        let taken_over = match installed_identity(given, o.state_dir.clone(), label).await {
+                            Ok(installed) => installed,
+                            Err(e) => { tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept"); None }
+                        };
                         // The runner role handed to this process, signed for once its own
                         // identity is (W27-R08), what relays passed on to it, and the work its sessions
                         // took up before they held theirs: an identity given is what each waits on
@@ -3941,12 +4040,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // A session's identity at an epoch it was taken over at: its receipt went
                         // with the ask, and kiln recorded it. Taken over blue/green, it goes on at
                         // that epoch now.
-                        if let Some((Some(session), Some(epoch))) = taken_over
-                            && crate::runner::custody::certified(&session, epoch)
-                            && let Some(s) = harness.as_ref().and_then(|h| h.get(&session))
+                        if let Some((session, epoch)) = taken_over
                         {
-                            s.go_on_at(epoch);
+                            // Durable legacy waiters survive this notification. The session owner
+                            // commits Head/leases/Controller/Saved before retiring their witness.
+                                match crate::runner::custody::certified(&session, epoch) {
+                                    crate::runner::custody::Certification::BlueGreen => {
+                                        if let Some(session) = harness.as_ref().and_then(|host| host.get(&session)) { session.go_on_at(epoch); }
+                                    }
+                                    crate::runner::custody::Certification::DurablePromotion | crate::runner::custody::Certification::Receipt | crate::runner::custody::Certification::Untracked => {}
+                                }
                         }
+                        #[cfg(unix)]
+                        legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Observe);
                         if server_custody {
                             for json in crate::runner::custody::drain() {
                                 own.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
@@ -4387,6 +4493,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             have_soon = Some((Instant::now() + HAVE_SOON, HAVES_SOON));
                         }
                         #[cfg(unix)]
+                        legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Observe);
+                        #[cfg(unix)]
                         if let Some(path) = feature_negotiation.take_over(welcomed, &mut take_over) {
                             start_take_over(path, harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
                         }
@@ -4528,6 +4636,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         // Keep the existing takeover pending until this connection's feature
                         // answer is known; Welcome alone cannot advertise journal support.
+                        #[cfg(unix)]
+                        legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Observe);
                         #[cfg(unix)]
                         if let Some(path) = feature_negotiation.take_over(welcomed, &mut take_over) {
                             start_take_over(path, harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
@@ -4705,6 +4815,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         if replay || transfer_replay { request_mail_replay(&mut mail_replay, harness.as_ref(), &own, !updates_on).await; }
                         if !mail && !transfers { mail_replay = MailReplay::default(); }
+                        #[cfg(unix)]
+                        legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Observe);
                         #[cfg(unix)]
                         if let Some(path) = feature_negotiation.take_over(welcomed, &mut take_over) {
                             start_take_over(path, harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
@@ -6046,6 +6158,15 @@ fn note_announced(announced: &mut std::collections::HashSet<String>, session: &s
 /// after, twice as long, up to [`AGENT_IDENTITY_MOST`].
 const AGENT_IDENTITY_AGAIN: Duration = Duration::from_secs(5);
 const AGENT_IDENTITY_MOST: Duration = Duration::from_secs(600);
+
+/// A certificate notification counts only after the current key and exact subject were installed.
+async fn installed_identity(given: crate::proto::IdentityGiven, state_dir: PathBuf, label: String) -> anyhow::Result<Option<(String, u64)>> {
+    let expected = (given.kind == "agent").then(|| (given.of.clone(), given.epoch, given.uri.clone()));
+    crate::runner::identity::given_off(given, state_dir, label).await?;
+    let Some((Some(session), Some(epoch), uri)) = expected else { return Ok(None) };
+    let slot = crate::runner::identity::slot("agent", Some(&session), Some(epoch));
+    Ok((crate::runner::identity::cert(&slot).is_some() && crate::runner::identity::uri(&slot).as_deref() == Some(uri.as_str())).then_some((session, epoch)))
+}
 
 /// Asks for agent session `session`'s identity at `epoch` (docs/ci.md W27-R01), unless this
 /// process holds one or asked lately ([`AGENT_IDENTITY_AGAIN`], doubling each time). A session kiln
@@ -7497,10 +7618,55 @@ mod native_handover_tests {
         let body: Body = serde_json::from_value(receipt.body)?;
         assert_eq!(body.epoch, Some(1));
         assert_eq!(receipt.subject, vec![subject]);
-        assert!(!crate::runner::custody::certified(&session, 2), "no second-epoch identity transition exists");
-        assert!(!crate::runner::custody::certified(&session, 1), "the committed journal epoch needs no blue-green go_on_at increment");
+        assert_eq!(crate::runner::custody::certified(&session, 2), crate::runner::custody::Certification::Untracked, "no second-epoch identity transition exists");
+        assert_eq!(crate::runner::custody::certified(&session, 1), crate::runner::custody::Certification::Receipt, "the committed journal epoch needs no blue-green go_on_at increment");
+        let proof = crate::runner::custody::LegacyProof::of(&session, 0, events, Some(&hand_on)).map_err(anyhow::Error::msg)?;
+        let proof: crate::runner::custody::LegacyProof = serde_json::from_slice(&serde_json::to_vec(&proof)?)?;
+        proof.validate(&session, 0, 1).map_err(anyhow::Error::msg)?;
+        assert!(proof.validate("another-session", 0, 1).is_err());
+        assert!(proof.validate(&session, 1, 2).is_err());
+        let mut promotion = crate::harness::inbox::Promotion { from_epoch: 0, to_epoch: 1, phase: crate::harness::inbox::PromotionPhase::AwaitingPromotion, proof, after: None };
+        crate::runner::custody::legacy_waiting(&session, &promotion).map_err(anyhow::Error::msg)?;
+        assert_eq!(crate::runner::custody::to_ask(&session, 0), None, "persisted proof alone cannot authorize promotion");
+        promotion.phase = crate::harness::inbox::PromotionPhase::AwaitingCertificate;
+        crate::runner::custody::legacy_waiting(&session, &promotion).map_err(anyhow::Error::msg)?;
+        assert_eq!(crate::runner::custody::to_ask(&session, 0), Some(1));
+        assert_eq!(crate::runner::custody::certified(&session, 1), crate::runner::custody::Certification::DurablePromotion);
+        assert_eq!(crate::runner::custody::certified(&session, 1), crate::runner::custody::Certification::DurablePromotion, "certificate notifications cannot retire the durable transition");
+        let ask = crate::runner::custody::carrying(&session, 1, crate::runner::identity::request("agent", Some(&session), Some(1))?);
+        assert!(ask.receipt.is_some() && ask.hand_on.is_some(), "persisted compact proof recreates the exact receipt without event reassembly");
         crate::runner::identity::forget_prefix(&format!("agent/{session}/"));
         Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_wrong_key_or_uninstalled_identity_cannot_complete_a_legacy_promotion() -> anyhow::Result<()> {
+        use kiln_ci::identity::chain::{Actor, Holder, Identity};
+        crate::rt::block_on(async {
+            let directory = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open_scratch(&directory.path().join("pki"))?;
+            let session = format!("legacy-key-{}", crate::util::new_id());
+            let frozen = crate::harness::core::Core::new().freeze();
+            let (_, events) = frozen.handover_source();
+            let proof = crate::runner::custody::LegacyProof::of(&session, 0, events, None).map_err(anyhow::Error::msg)?;
+            let promotion = crate::harness::inbox::Promotion { from_epoch: 0, to_epoch: 1, phase: crate::harness::inbox::PromotionPhase::AwaitingCertificate, proof, after: None };
+            crate::runner::custody::legacy_waiting(&session, &promotion).map_err(anyhow::Error::msg)?;
+            let _requested = crate::runner::identity::request("agent", Some(&session), Some(1))?;
+            let identity = Identity::new(pki.organization(), Actor::Agent { person: "ada".into(), agent: session.clone(), epoch: 1, held_by: Some(Holder { machine: "box".into(), instance: "green".into() }) });
+            let wrong_key = crate::pki::new_key_pem()?;
+            let wrong_cert = pki.issue_identity(&crate::pki::make_csr_with_key("kiln-identity", &wrong_key)?, &identity, &[], time::Duration::hours(1))?;
+            let given = crate::proto::IdentityGiven { kind: "agent".into(), of: Some(session.clone()), epoch: Some(1), uri: identity.uri()?, cert_pem: Some(wrong_cert), ..Default::default() };
+            assert!(installed_identity(given.clone(), directory.path().to_path_buf(), "green".into()).await.is_err(), "a valid certificate for a different private key is not installed");
+            let slot = crate::runner::identity::slot("agent", Some(&session), Some(1));
+            assert!(crate::runner::identity::cert(&slot).is_none());
+            assert_eq!(crate::runner::custody::certified(&session, 1), crate::runner::custody::Certification::DurablePromotion);
+            crate::runner::identity::forget(&slot);
+            assert_eq!(installed_identity(given, directory.path().to_path_buf(), "green".into()).await?, None, "given_off Ok for a vanished key is no installed certificate notification");
+            assert_eq!(crate::runner::custody::to_ask(&session, 0), Some(1), "no certificate failure may retire the epoch witness or ask for epoch0");
+            assert!(crate::runner::custody::legacy_certificate_ready(&session, 1, &promotion.proof).is_err());
+            Ok(())
+        })
     }
 
     #[test]

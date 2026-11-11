@@ -51,7 +51,7 @@ impl io::Write for Count {
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
-fn count(session: &str, value: &impl Serialize) -> Result<usize, Refusal> {
+pub(super) fn count(session: &str, value: &impl Serialize) -> Result<usize, Refusal> {
     let mut count = Count(0);
     serde_json::to_writer(&mut count, value).map_err(|_| unavailable(session, "the accepted original exceeds record capacity"))?;
     Ok(count.0)
@@ -67,7 +67,7 @@ impl io::Write for Fixed {
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
-fn encode(session: &str, value: &impl Serialize, len: usize) -> Result<Vec<u8>, Refusal> {
+pub(super) fn encode(session: &str, value: &impl Serialize, len: usize) -> Result<Vec<u8>, Refusal> {
     let mut out = Fixed { bytes: Vec::new(), limit: len };
     out.bytes.try_reserve_exact(len).map_err(|_| unavailable(session, "the accepted original cannot allocate its counted encoding"))?;
     serde_json::to_writer(&mut out, value).map_err(|_| unavailable(session, "the accepted original cannot be encoded within its reservation"))?;

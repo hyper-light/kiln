@@ -72,7 +72,7 @@ jobs:
           [IO.File]::WriteAllBytes((Join-Path $artifacts 'coordinator-commit-verdict.json'), $receiptBytes)
           Set-Location $src
           $old = & git rev-parse HEAD
-          if ($LASTEXITCODE -ne 0 -or ($old -ne 'f555736bd887a4196c8841564cb9b4d6c1ede95f' -and $old -ne $sha)) { throw 'completed source HEAD changed' }
+          if ($LASTEXITCODE -ne 0 -or ($old -ne 'ef473cf5fa400ed567e189f86e1a8cf3a41084cd' -and $old -ne $sha)) { throw 'completed source HEAD changed' }
           $dirty = & git --no-optional-locks status --porcelain --untracked-files=all
           if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'preserve changed source before checkout' }
           $oldBinary = Join-Path $src 'dist\kiln-x86_64-pc-windows-msvc.exe'

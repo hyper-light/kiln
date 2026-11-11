@@ -13,7 +13,7 @@ use tracing::Instrument as _;
 
 use super::core::{Core, Update};
 use super::kinds::{Kind, Protocol};
-use super::model::{Command, ExitInfo, Level, State, Status, Task, ToolKind};
+use super::model::{Body, Command, ExitInfo, Level, State, Status, Task, ToolKind};
 
 fn is_zero_epoch(n: &u64) -> bool {
     *n == 0
@@ -831,6 +831,7 @@ pub type SettleFor = Arc<dyn Fn(String, String, bool) -> futures::future::BoxFut
 
 #[derive(Clone)]
 pub struct Files {
+    pub host: Option<std::sync::Weak<super::host::Host>>,
     pub dir: std::path::PathBuf,
     pub take: Arc<dyn Fn(&str) -> Option<std::path::PathBuf> + Send + Sync>,
     pub spawn: Arc<dyn Fn(Spec) + Send + Sync>,
@@ -1047,8 +1048,9 @@ async fn preparation_failed(s: &Session, failure: PreparationFailure) {
 enum Ctl {
     Cmd(Box<Command>),
     /// Owned Reach state changed; publish through this driver, never a stale parallel snapshot.
-    #[cfg(any(unix, test))]
     OwnedChanged,
+    /// A persisted legacy promotion changed; its body work stays on this owner.
+    Promotion,
     /// Automatic archive inspects after previously accepted commands reach this actor.
     ArchiveQuiet(futures::channel::oneshot::Sender<bool>),
     Close,
@@ -1126,6 +1128,7 @@ pub struct Session {
 }
 
 impl Session {
+    pub(crate) async fn promotion_changed(&self) -> Result<(), String> { self.ctl.send(Ctl::Promotion).await.map_err(|_| "the legacy session owner stopped before its persisted transition could progress".to_owned()) }
     pub(super) fn input_changed(&self) { let _ = self.ctl.try_send(Ctl::OwnedChanged); }
     /// Host receipts and ordinary State frames share the session owner's ordered output.
     pub(super) fn mail_flow(&self, event: super::admission::FlowEvent) {
@@ -1952,11 +1955,31 @@ fn queued(c: Command) -> Option<super::model::QueueItem> {
 }
 
 /// The session goes on at `epoch` (epochs only rise): its state says so, sent with its next flush.
-fn raise_epoch(core: &mut Core, epoch: u64) {
-    if core.state.epoch < epoch {
-        core.state.epoch = epoch;
+async fn progress_promotion(s: &Session, files: &Files) {
+    let Some(host) = files.host.as_ref().and_then(std::sync::Weak::upgrade) else { return };
+    // A callback already parsed before the owner event commits under its original lease epoch.
+    let _ = flush_input(s).await;
+    {
+        let mut core = s.core.lock();
+        if !core.input_stages.is_empty() || !core.input_retained.is_empty() || !core.input_receipts.is_empty() {
+            core.upsert("legacy-promotion-held", None, Body::Notice { level: Level::Warn, text: "Legacy ownership remains held until its existing input effects commit. The original work is retained.".into() });
+            core.touch_state();
+            return;
+        }
+    }
+    if let Err(error) = host.progress_legacy_promotion(s).await {
+        let mut core = s.core.lock();
+        if matches!(error, super::inbox::PromotionError::Invalid { .. } | super::inbox::PromotionError::Stale) && let Some(input) = &core.input { let _ = input.controller.lock().unavailable(); }
+        core.upsert("legacy-promotion-held", None, Body::Notice { level: Level::Warn, text: format!("Legacy ownership remains held: {error}") });
         core.touch_state();
     }
+}
+
+async fn raise_epoch(s: &Session, files: &Files, epoch: u64) {
+    if s.epoch() >= epoch { return; }
+    let Some(input) = s.core.lock().input.clone() else { return };
+    if input.inbox.promotion(&s.id).await.ok().flatten().is_some_and(|p| p.to_epoch == epoch) { progress_promotion(s, files).await; }
+    else { let mut core = s.core.lock(); let _ = input.controller.lock().unavailable(); core.upsert("legacy-promotion-held", None, Body::Notice { level: Level::Warn, text: "The certified epoch has no matching durable promotion intent; existing work remains retained.".into() }); core.touch_state(); }
 }
 
 /// Background work a step asked for.
@@ -2152,6 +2175,7 @@ async fn pipe(rx: &crate::memory::queue::Receiver<Vec<u8>>, open: bool) -> Optio
 
 enum Ev {
     InputBudget,
+    PromotionJournal,
     Change((String, super::diff::Found)),
     Out(Option<Vec<u8>>),
     Err(Option<Vec<u8>>),
@@ -2172,14 +2196,25 @@ async fn input_budget(s: &Session) {
     }
 }
 
-fn publish_input_budget(s: &Session) {
+fn promotion_pending(s: &Session) -> bool {
+    let input = s.core.lock().input.clone();
+    input.is_some_and(|input| { let controller = input.controller.lock(); controller.promoting() })
+}
+
+async fn promotion_journal(s: &Session) {
+    let input = s.core.lock().input.clone();
+    match input { Some(input) => input.promotion_journal_changed(&s.id).await, None => std::future::pending().await }
+}
+
+fn publish_input_budget(s: &Session) -> bool {
     let mut core = s.core.lock();
-    let Some(input) = core.input.clone() else { return };
-    let Some(improved) = input.take_budget_change() else { return };
+    let Some(input) = core.input.clone() else { return false };
+    let Some(improved) = input.take_budget_change() else { return false };
     let capacity = { let mut c = input.controller.lock(); if c.budget_changed(improved).is_err() { let _ = c.unavailable(); } c.advertised_ready(input.now_ns()); c.capacity() };
     core.state.admission = Some(capacity.clone());
     core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) });
     core.touch_state();
+    improved
 }
 
 /// What of a session's pause is kept on disk (`host::Saved`): a change is written there.
@@ -3484,6 +3519,8 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
         let msg = ctl_rx.recv().fuse();
         futures::pin_mut!(tick, msg);
         futures::select_biased! {
+            () = input_budget(s).fuse() => { if publish_input_budget(s) && promotion_pending(s) { progress_promotion(s, files).await; } flush(s,sink,None).await; },
+            () = promotion_journal(s).fuse() => { progress_promotion(s, files).await; flush(s,sink,None).await; },
             m = msg => match m {
                 Ok(Ctl::Cmd(c)) => match *c {
                     Command::Moving { text } => moving_note(s, &text),
@@ -3498,10 +3535,10 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
                 Ok(Ctl::Close) | Err(_) => return Arrived::End { let_go: false },
                 // What it carries goes once it's on, asking for room then.
                 Ok(Ctl::Room) => {}
-                #[cfg(any(unix, test))]
                 Ok(Ctl::OwnedChanged) => {flush(s,sink,None).await;}
+                Ok(Ctl::Promotion) => { progress_promotion(s, files).await; flush(s,sink,None).await; }
                 Ok(Ctl::ArchiveQuiet(reply)) => {let _=reply.send(false);}
-                Ok(Ctl::Epoch(e)) => raise_epoch(&mut s.core.lock(), e),
+                Ok(Ctl::Epoch(e)) => raise_epoch(s, files, e).await,
                 // No harness of its runs here to hold a call.
                 Ok(Ctl::Hook(_, reply)) => {
                     let _ = reply.send(serde_json::json!({}));
@@ -4220,6 +4257,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     let ev = futures::select_biased! {
                         c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
                         () = input_budget(&s).fuse() => Ev::InputBudget,
+                        () = promotion_journal(&s).fuse() => Ev::PromotionJournal,
                         c = changes.select_next_some() => Ev::Change(c),
                         o = pipe(&p.stdout, out_open).fuse() => Ev::Out(o),
                         e = pipe(&p.stderr, err_open).fuse() => Ev::Err(e),
@@ -4457,11 +4495,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             }
                             adapter.room(&mut core);
                         }
-                        #[cfg(any(unix, test))]
                         Ev::Ctl(Some(Ctl::OwnedChanged)) => {},
-                        Ev::InputBudget => publish_input_budget(&s),
+                        Ev::Ctl(Some(Ctl::Promotion)) => progress_promotion(&s, &files).await,
+                        Ev::InputBudget => { if publish_input_budget(&s) && promotion_pending(&s) { progress_promotion(&s, &files).await; } },
+                        Ev::PromotionJournal => progress_promotion(&s, &files).await,
                         Ev::Ctl(Some(Ctl::ArchiveQuiet(reply))) => {let _=reply.send(s.archive_quiet_now(!carry.is_empty() || !for_room.is_empty() || moving.is_some() || switching.is_some() || reloading));},
-                        Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
+                        Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&s, &files, e).await,
                         // Its harness's hook asks before a tool call: the adapter answers, at once or
                         // once a person lets the call go.
                         Ev::Ctl(Some(Ctl::Hook(input, reply))) => adapter.hook(&mut s.core.lock(), input, reply),
@@ -4817,6 +4856,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             let ev = futures::select_biased! {
                 c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
                 () = input_budget(&s).fuse() => Ev::InputBudget,
+                        () = promotion_journal(&s).fuse() => Ev::PromotionJournal,
                 f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
                 () = wake.fuse() => {
                     again_at = None;
@@ -4985,11 +5025,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         break;
                     }
                 }
-                #[cfg(any(unix, test))]
                 Ev::Ctl(Some(Ctl::OwnedChanged)) => {},
-                Ev::InputBudget => publish_input_budget(&s),
+                Ev::Ctl(Some(Ctl::Promotion)) => progress_promotion(&s, &files).await,
+                Ev::InputBudget => { if publish_input_budget(&s) && promotion_pending(&s) { progress_promotion(&s, &files).await; } },
+                        Ev::PromotionJournal => progress_promotion(&s, &files).await,
                 Ev::Ctl(Some(Ctl::ArchiveQuiet(reply))) => {let _=reply.send(s.archive_quiet_now(restart_wanted || !carry.is_empty() || !for_room.is_empty() || moving.is_some() || switching.is_some() || reloading));},
-                Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
+                Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&s, &files, e).await,
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
                     s.stop_owned_reach(None);
                     // Ending the agent ends what it left running that kiln took back over, and the
@@ -5108,7 +5149,71 @@ mod tests {
     }
 
     fn attachment_files(dir: std::path::PathBuf) -> Files {
-        Files { dir, take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}), carried: Arc::new(|_| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_, _| Box::pin(async { Ok(()) })), settle: Arc::new(|_, _, _| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}) }
+        Files { host: None, dir, take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}), carried: Arc::new(|_| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_, _| Box::pin(async { Ok(()) })), settle: Arc::new(|_, _, _| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}) }
+    }
+
+    #[test]
+    fn legacy_promotion_does_not_advance_past_uncommitted_input_effects() -> anyhow::Result<()> {
+        use super::super::{admission::{command_bytes, Input, Lease, PhysicalBudget, Stage}, host::{Host, Limits as HostLimits}, inbox::{Inbox, Limits as InboxLimits}};
+        use kiln_seams::{clock::SimClock, records::{Consistency, Records as _, SimRecords}};
+        crate::rt::block_on(async {
+            for pending_effect in [true, false] {
+                let directory = tempfile::tempdir()?;
+                let (session, _control) = idle(if pending_effect { "legacy-effect-held" } else { "legacy-effect-clear" });
+                let records = Arc::new(SimRecords::new());
+                let inbox = Arc::new(Inbox::new(records.clone(), InboxLimits::default()));
+                let (sink, _updates) = async_channel::unbounded();
+                let host = Host::with_records(sink, Some(directory.path().join("sessions.json")), HostLimits::default(), Arc::new(SimClock::new()), Some(records.clone()));
+                host.set_input_budget(super::super::state_view::FRAME);
+                inbox.open(&session.id, 0).await?;
+                let frozen = session.core.lock().freeze();
+                let (source_epoch, events) = frozen.handover_source();
+                let proof = crate::runner::custody::LegacyProof::of(&session.id, source_epoch, events, None).map_err(anyhow::Error::msg)?;
+                host.prepare_legacy_promotion(&session.id, 0, 1, proof).await?;
+                let before = records.get("inbox-heads", session.id.as_bytes(), Consistency::Linearizable).await?.ok_or_else(|| anyhow::anyhow!("promotion head missing"))?;
+                let pool = PhysicalBudget::new(super::super::state_view::FRAME);
+                let input = Input::new(0, pool, Arc::clone(&inbox));
+                let original = message("uncommitted-native-input", "retained original");
+                let bytes = command_bytes(&original).map_err(|error| anyhow::anyhow!("fixture input weight: {error:?}"))?;
+                if pending_effect {
+                    input.controller.lock().restore(Lease { message: "uncommitted-native-input".into(), peer: "legacy-peer".into(), epoch: 0, bytes, stage: Stage::InCtl, token: None, handoff: None }).map_err(|error| anyhow::anyhow!("fixture lease: {error:?}"))?;
+                    let mut core = session.core.lock();
+                    core.input = Some(input.clone());
+                    core.input_stages.push("uncommitted-native-input".into());
+                } else {
+                    input.controller.lock().begin_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("fixture promotion: {error:?}"))?;
+                    session.core.lock().input = Some(input.clone());
+                }
+                let mut files = attachment_files(directory.path().join("files"));
+                files.host = Some(Arc::downgrade(&host));
+                assert!(!flush_input(&session).await, "both an uncommitted effect and a deliberately gated Promoting owner withhold writes");
+                if pending_effect {
+                    assert!(inbox.pending(&session.id, "uncommitted-native-input").await?.is_none(), "the real journal cannot commit this stage callback without its pending row");
+                    assert_eq!(session.core.lock().input_stages, ["uncommitted-native-input"]);
+                }
+                progress_promotion(&session, &files).await;
+                let controller = input.controller.lock();
+                assert_eq!(controller.capacity().epoch, 0);
+                assert_eq!(session.epoch(), 0);
+                if pending_effect {
+                    assert!(!controller.promoting(), "ownership cannot enter Promoting ahead of an earlier uncommitted native effect");
+                    assert!(controller.lease("uncommitted-native-input").is_some_and(|lease| lease.epoch == 0 && lease.bytes == bytes && lease.stage == Stage::InCtl));
+                    let core = session.core.lock();
+                    assert_eq!(core.input_stages, ["uncommitted-native-input"], "the original callback remains retryable");
+                    assert!(core.events().any(|event| event.id == "legacy-promotion-held" && matches!(&event.body, Body::Notice { level: Level::Warn, .. })), "the person can see why ownership is held");
+                } else {
+                    assert!(controller.promoting());
+                    let core = session.core.lock();
+                    assert!(core.input_stages.is_empty() && core.input_retained.is_empty() && core.input_receipts.is_empty());
+                    assert!(core.out.iter().any(|update| matches!(update, Update::MailFlow { event } if matches!(event.as_ref(), super::super::admission::FlowEvent::Capacity { .. }))), "no unresolved effects: the deliberately gated owner must still execute its promotion step");
+                    assert!(!core.events().any(|event| event.id == "legacy-promotion-held"));
+                }
+                drop(controller);
+                let after = records.get("inbox-heads", session.id.as_bytes(), Consistency::Linearizable).await?.ok_or_else(|| anyhow::anyhow!("promotion head disappeared"))?;
+                assert_eq!((after.rev, after.value), (before.rev, before.value), "neither case has authority to advance the persisted head epoch yet");
+            }
+            Ok(())
+        })
     }
 
     #[test]
@@ -5409,6 +5514,7 @@ for line in sys.stdin:
                 std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
                 let (sink, updates) = async_channel::unbounded();
                 let files = Files {
+                    host: None,
                     dir: dir.path().to_owned(), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}),
                     carried: Arc::new(|_| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_, _| Box::pin(async { Ok(()) })),
                     settle: Arc::new(|_, _, _| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}),

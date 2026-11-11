@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -251,6 +251,8 @@ pub struct Input {
     physical: Arc<PhysicalBudget>,
     account: Arc<AtomicUsize>,
     observed_physical: Arc<Mutex<PhysicalSnapshot>>,
+    pub(super) promotion_cursor: Arc<AtomicU64>,
+    pub(super) promotion_head: Arc<AtomicU64>,
 }
 
 impl Input {
@@ -258,7 +260,18 @@ impl Input {
         let controller = Controller::new(epoch, Arc::clone(&physical));
         let account = Arc::clone(&controller.account);
         let counts = physical.snapshot(&account);
-        Self { controller: Arc::new(Mutex::new(controller)), inbox, born: std::time::Instant::now(), physical, account, observed_physical: Arc::new(Mutex::new(counts)) }
+        Self { controller: Arc::new(Mutex::new(controller)), inbox, born: std::time::Instant::now(), physical, account, observed_physical: Arc::new(Mutex::new(counts)), promotion_cursor: Arc::new(AtomicU64::new(0)), promotion_head: Arc::new(AtomicU64::new(0)) }
+    }
+    pub async fn promotion_journal_changed(&self, session: &str) {
+        let promoting = self.controller.lock().promoting();
+        if !promoting { return std::future::pending().await; }
+        loop {
+            let after = self.promotion_cursor.load(Ordering::Acquire);
+            let Ok(revision) = self.inbox.wait_promotion(after).await else { return std::future::pending().await };
+            let Ok(own) = self.inbox.promotion_head_revision(session).await else { return std::future::pending().await };
+            self.promotion_cursor.fetch_max(revision, Ordering::AcqRel);
+            if own != self.promotion_head.load(Ordering::Acquire) { return; }
+        }
     }
     pub fn now_ns(&self) -> u64 { u64::try_from(self.born.elapsed().as_nanos()).unwrap_or(u64::MAX) }
     pub fn reserve_buffer(&self, bytes: usize) -> Result<Option<BufferCharge>, Error> { self.physical.reserve_buffer_for(bytes, Some(Arc::clone(&self.account))) }
@@ -432,7 +445,7 @@ struct Observations {
 enum Readiness { Ready, Restoring, Unavailable }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Ownership { Here, Fenced }
+enum Ownership { Here, Fenced, Promoting { from: u64, to: u64 } }
 
 pub struct Controller {
     epoch: u64,
@@ -518,12 +531,55 @@ impl Controller {
         Ok(true)
     }
     pub fn writes_ready(&self) -> bool { self.readiness == Readiness::Ready && self.ownership == Ownership::Here }
+    pub fn promoting(&self) -> bool { matches!(self.ownership, Ownership::Promoting { .. }) }
+    pub fn promoting_epoch(&self, from: u64, to: u64) -> bool { self.ownership == (Ownership::Promoting { from, to }) }
+    pub fn promoting_epochs(&self) -> Option<(u64, u64)> { match self.ownership { Ownership::Promoting { from, to } => Some((from, to)), _ => None } }
     fn accepting(&self) -> bool { self.readiness == Readiness::Ready && self.ownership == Ownership::Here && self.available }
     fn next_peer(&self) -> Option<&String> { self.peers.iter().find(|peer| self.demand.contains_key(*peer)) }
     pub fn initial_epoch(&mut self, epoch: u64) -> Result<(), Error> {
         if !self.leases.is_empty() { return Err(Error::StaleEpoch); }
         self.epoch = epoch;
         Ok(())
+    }
+
+    pub fn begin_legacy_epoch(&mut self, from: u64, to: u64) -> Result<(), Error> {
+        if from.checked_add(1) != Some(to) || (self.epoch != from && self.epoch != to) { return Err(Error::StaleEpoch); }
+        if self.leases.values().any(|lease| lease.token.is_some() || (lease.epoch != from && lease.epoch != to)) { return Err(Error::InvalidTransition); }
+        if self.epoch == to && self.ownership == Ownership::Here { return Ok(()); }
+        let next = Ownership::Promoting { from, to };
+        if !matches!(self.ownership, Ownership::Here) && self.ownership != next { return Err(Error::InvalidTransition); }
+        if self.ownership != next { self.changed()?; self.ownership = next; self.observations = Observations::default(); }
+        Ok(())
+    }
+
+    pub fn rebind_legacy_epoch(&mut self, from: u64, to: u64) -> Result<(), Error> {
+        self.begin_legacy_epoch(from, to)?;
+        if self.epoch == to { return Ok(()); }
+        self.changed()?;
+        for lease in self.leases.values_mut() { lease.epoch = to; }
+        self.epoch = to;
+        self.observations = Observations::default();
+        Ok(())
+    }
+
+    pub fn restore_legacy_debt(&mut self, mut lease: Lease, from: u64, to: u64) -> Result<(), Error> {
+        if self.ownership != (Ownership::Promoting { from, to }) || lease.token.is_some() || (lease.epoch != from && lease.epoch != to) { return Err(Error::InvalidTransition); }
+        lease.epoch = self.epoch;
+        self.restore(lease)
+    }
+
+    pub fn complete_legacy_reconciliation(&mut self) -> Result<(), Error> {
+        if self.readiness == Readiness::Restoring { self.changed()?; self.readiness = Readiness::Ready; }
+        Ok(())
+    }
+
+    pub fn activate_legacy_epoch(&mut self, from: u64, to: u64) -> Result<(), Error> {
+        if self.epoch != to { return Err(Error::StaleEpoch); }
+        match self.ownership {
+            Ownership::Here => Ok(()),
+            Ownership::Promoting { from: old, to: new } if old == from && new == to => { self.changed()?; self.ownership = Ownership::Here; Ok(()) }
+            _ => Err(Error::InvalidTransition),
+        }
     }
 
     fn changed(&mut self) -> Result<(), Error> { self.generation = self.generation.checked_add(1).ok_or(Error::Overflow)?; Ok(()) }
@@ -574,6 +630,7 @@ impl Controller {
     }
 
     pub fn fence(&mut self, on: bool) -> Result<(), Error> {
+        if matches!(self.ownership, Ownership::Promoting { .. }) { return Err(Error::InvalidTransition); }
         let ownership = if on { Ownership::Fenced } else { Ownership::Here };
         if self.ownership != ownership {
             self.ownership = ownership;
@@ -620,7 +677,7 @@ impl Controller {
     fn offer_inner(&mut self, message: &str, peer: &str, epoch: u64, bytes: usize, feedback_generation: Option<u64>, revision: Option<u64>, now_ns: u64) -> Result<Admission, Error> {
         if epoch != self.epoch { return Err(Error::StaleEpoch); }
         if let Some(lease) = self.leases.get(message) { return Ok(Admission::Existing(lease.clone())); }
-        if self.ownership == Ownership::Fenced { return Ok(self.waiting(WaitCause::Fenced)); }
+        if self.ownership != Ownership::Here { return Ok(self.waiting(WaitCause::Fenced)); }
         if !self.available { return Ok(self.waiting(WaitCause::ConsumptionUnknown)); }
         match self.readiness {
             Readiness::Restoring => return Ok(self.waiting(WaitCause::Restoring)),
@@ -850,6 +907,53 @@ mod tests {
         assert!(flight.matches(r#"{"method":"turn/steer","params":{"clientUserMessageId":"original"}}"#));
         assert!(!flight.matches(r#"{"method":"turn/steer","params":{"clientUserMessageId":"other","text":"original"}}"#));
         assert!(!flight.matches(r#"{"method":"thread/read","params":{"clientUserMessageId":"original"}}"#));
+    }
+
+    #[test]
+    fn legacy_epoch_promotion_preserves_debt_and_retry_authority_until_real_completion() -> Result<(), Error> {
+        let pool = PhysicalBudget::new(1024);
+        let mut owner = Controller::new(0, Arc::clone(&pool));
+        for (message, bytes, stage) in [("flight", 80, Stage::ProviderFlight), ("queued", 40, Stage::Queued)] {
+            owner.restore(Lease { message: message.into(), peer: String::new(), epoch: 0, bytes, stage, token: None, handoff: None })?;
+        }
+        let before = owner.capacity();
+        owner.begin_legacy_epoch(0, 1)?;
+        assert_eq!(owner.capacity().target, 0);
+        owner.rebind_legacy_epoch(0, 1)?;
+        assert_eq!(owner.lease("flight").map(|lease| (lease.epoch, lease.bytes, lease.stage)), Some((1, 80, Stage::ProviderFlight)));
+        assert_eq!(owner.lease("queued").map(|lease| (lease.epoch, lease.bytes, lease.stage)), Some((1, 40, Stage::Queued)));
+        assert_eq!(pool.counts().0, 120);
+        assert_eq!(owner.capacity().retry_permission(), before.retry_permission());
+        owner.activate_legacy_epoch(0, 1)?;
+        assert_eq!(owner.capacity().target, before.target);
+        assert_eq!(owner.capacity().admitted, before.admitted);
+        assert_eq!(owner.capacity().retry_permission(), before.retry_permission());
+        owner.begin_legacy_epoch(0, 1)?;
+        owner.rebind_legacy_epoch(0, 1)?;
+        owner.activate_legacy_epoch(0, 1)?;
+        assert_eq!(owner.capacity().retry_permission(), before.retry_permission());
+        owner.finish("flight", Disposition::Consumed { boundary: Consumption::ProviderCompleted }, 1, false)?;
+        assert_eq!(pool.counts().0, 40);
+        assert!(owner.lease("queued").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_epoch_promotion_refuses_tokens_and_does_not_clear_unavailable() -> Result<(), Error> {
+        let mut owner = Controller::new(0, PhysicalBudget::new(1024));
+        owner.unavailable()?;
+        owner.begin_legacy_epoch(0, 1)?;
+        owner.rebind_legacy_epoch(0, 1)?;
+        owner.activate_legacy_epoch(0, 1)?;
+        assert_eq!(owner.capacity().target, 0);
+        assert!(!owner.writes_ready());
+        let mut token_owner = Controller::new(0, PhysicalBudget::new(1024));
+        token_owner.restore(Lease { message: "accepted".into(), peer: "peer".into(), epoch: 0, bytes: 80, stage: Stage::ProviderFlight, token: Some(super::super::mail::Token { revision: 1, generation: 1 }), handoff: None })?;
+        assert_eq!(token_owner.begin_legacy_epoch(0, 1), Err(Error::InvalidTransition));
+        assert_eq!(token_owner.lease("accepted").map(|lease| lease.epoch), Some(0));
+        assert_eq!(token_owner.capacity().target, 2);
+        assert_eq!(token_owner.begin_legacy_epoch(0, 2), Err(Error::StaleEpoch));
+        Ok(())
     }
 
     #[test]
