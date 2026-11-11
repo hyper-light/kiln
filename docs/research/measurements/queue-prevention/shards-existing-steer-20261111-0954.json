@@ -1,0 +1,14 @@
+{
+  "at": "2026-11-11T09:54:06.958092Z",
+  "method": "existing queue_steer by exact message ID",
+  "before_queued": 38,
+  "selected_peer_items": 37,
+  "body_bytes": 47347,
+  "all_command_status": 204,
+  "after_queued": 4,
+  "after_status": "running",
+  "queue_remove_or_new_send": false,
+  "identity_body_preserved": true,
+  "consumption_verified": false,
+  "raw_output": "coordinator tool session98695 completion"
+}

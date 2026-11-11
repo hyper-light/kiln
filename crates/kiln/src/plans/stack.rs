@@ -787,6 +787,8 @@ mod end_to_end {
                         Ok(consumed && idle)
                     }
                 }).await?;
+                let reported = hub.harness.info(&agent).ok_or_else(|| anyhow::anyhow!("the completed step lost its source"))?;
+                anyhow::ensure!(std::fs::canonicalize(&reported.cwd)? == std::fs::canonicalize(work.path())?, "the provider reported {} instead of its fixture repository {cwd}", reported.cwd);
                 // Before its step is met, its work isn't a change of its own.
                 let early = crate::ops::call(cx.clone(), "agents.change", json!({"agent": agent})).await.err().map(|(_, m)| m).unwrap_or_default();
                 anyhow::ensure!(early.contains("still going"), "{early}");

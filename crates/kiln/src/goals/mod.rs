@@ -597,8 +597,10 @@ async fn settled_native(hub: &Hub, id: &str) -> anyhow::Result<Vec<String>> {
             if pending != 0 { return Ok(false); }
             let Some(session) = hub.harness.local.get(id) else { return Ok(false) };
             let state = { let core = session.core.lock(); (core.state.status, core.state.last_turn.clone(), core.state.turn_started) };
-            Ok(total == 0 || (state.0 == Status::Idle && state.1.is_some()
-                && hub.harness.info(id).is_some_and(|info| info.status == state.0 && info.last_turn == state.1 && info.turn_started == state.2)))
+            // Empty custody does not mean native initialization completed. A pushed goal
+            // is intentionally held while Starting, and these fixtures run no goal driver.
+            Ok(state.0 == Status::Idle && (total == 0 || state.1.is_some())
+                && hub.harness.info(id).is_some_and(|info| info.status == state.0 && info.last_turn == state.1 && info.turn_started == state.2))
         }
     }).await?;
     let inbox = hub.harness.local.inbox().ok_or_else(|| anyhow::anyhow!("no source inbox"))?;
@@ -4112,7 +4114,7 @@ mod tests {
             };
             let opened = hub.harness.open(&hub, "local", spec, 1).await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
             let id = opened.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
-            crate::harness::ops::end_to_end::source_ready(&hub, &id).await?;
+            settled_native(&hub, &id).await?;
             let (a, now) = (id.clone(), hub.clock.unix_ms());
             hub.store
                 .call(move |c| {
@@ -4179,7 +4181,7 @@ mod tests {
             };
             let opened = hub.harness.open(&hub, "local", spec, 1).await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
             let id = opened.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
-            crate::harness::ops::end_to_end::source_ready(&hub, &id).await?;
+            settled_native(&hub, &id).await?;
             // A goal met earlier, cleared: something to bring back.
             let (a, now) = (id.clone(), hub.clock.unix_ms());
             hub.store
@@ -4255,7 +4257,7 @@ mod tests {
             };
             let opened = hub.harness.open(&hub, "local", spec, 1).await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
             let id = opened.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
-            crate::harness::ops::end_to_end::source_ready(&hub, &id).await?;
+            settled_native(&hub, &id).await?;
             let (a, now) = (id.clone(), hub.clock.unix_ms());
             hub.store
                 .call(move |c| {

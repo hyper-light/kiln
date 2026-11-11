@@ -703,7 +703,7 @@ mod tests {
             let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd.clone()), name: Some("A".into()), count: Some(1), ..Ask::default() };
             let a = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?;
-            crate::harness::ops::end_to_end::source_ready(&hub, &a.id).await?;
+            stopped(&hub, &a.id).await?;
             let p = crate::plans::create(&hub, crate::plans::New { title: "Tidy".into(), body: "- one\n- two\n".into(), ..Default::default() }, "admin").await?;
             let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let run = |input: Value| {
@@ -714,18 +714,34 @@ mod tests {
             let first = run(json!({"id": p.id, "session": a.id, "mode": "steps", "key": "tidy-1"})).await?;
             let again = run(json!({"id": p.id, "session": a.id, "mode": "steps", "key": "tidy-1"})).await?;
             assert_eq!(first, again, "answered as it was");
-            assert_eq!(first.get("sent"), Some(&json!(2)));
+            assert_eq!(first.get("sent").and_then(Value::as_u64).unwrap_or(0) + first.get("retained").and_then(Value::as_u64).unwrap_or(0), 2, "exactly two custody receipts: {first}");
             assert_eq!(taken_by(&hub, &a.id, 2).await?.len(), 2, "its two messages, once each");
             // Without a key, another run.
             let other = run(json!({"id": p.id, "session": a.id, "mode": "steps"})).await?;
             assert_ne!(other.get("run"), first.get("run"));
             assert_eq!(taken_by(&hub, &a.id, 4).await?.len(), 4, "each distinct run's two native inputs, in order once");
-            // On a new agent: one agent, once.
+            // A new recipient uses the same immutable index-zero publication as an existing
+            // recipient. Wait for actual native completion, then retry the key without another agent.
             let agents = hub.harness.list().len();
             let made = run(json!({"id": p.id, "new": {"target": "local", "kind": "claude", "cwd": cwd}, "mode": "message", "key": "tidy-2"})).await?;
+            let created = made.get("session").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no new recipient: {made}"))?.to_owned();
+            let created_run = made.get("run").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no new run: {made}"))?.to_owned();
+            let first_id = crate::util::derive_id(&["plan-run", &created_run, "0"]);
+            crate::harness::ops::end_to_end::source_disposition(&hub, &created, &first_id, true).await?;
+            let original = crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), created.clone(), first_id.clone()).await?.ok_or_else(|| anyhow::anyhow!("new-agent first input has no durable receipt"))?;
+            assert_eq!(original.disposition, crate::harness::mail::Disposition::Consumed);
             let made_again = run(json!({"id": p.id, "new": {"target": "local", "kind": "claude", "cwd": cwd}, "mode": "message", "key": "tidy-2"})).await?;
-            assert_eq!(made, made_again);
+            assert_eq!((made.get("run"), made.get("session")), (made_again.get("run"), made_again.get("session")), "immutable run/recipient identity");
+            for answer in [&made, &made_again] {
+                assert_eq!(answer.get("sent").and_then(Value::as_u64).unwrap_or(0) + answer.get("retained").and_then(Value::as_u64).unwrap_or(0), 1, "one actual custody receipt: {answer}");
+            }
+            let repeated = crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), created.clone(), first_id.clone()).await?.ok_or_else(|| anyhow::anyhow!("new-agent receipt disappeared"))?;
+            assert_eq!((original.id, original.revision), (repeated.id, repeated.revision));
             assert_eq!(hub.harness.list().len(), agents + 1, "one agent started");
+            let created_inbox = hub.harness.local.inbox().ok_or_else(|| anyhow::anyhow!("no source inbox"))?.taken(&created, 100).await?;
+            assert_eq!(created_inbox, [first_id.clone()], "one native publication under the run's canonical identity");
+            let native = crate::harness::ops::end_to_end::prompts(&folder.path().join("heard.jsonl"));
+            assert_eq!(native.iter().filter(|id| *id == &first_id).count(), 1, "new-target key retry repeated native input");
             // As goals: added once.
             let goals = run(json!({"id": p.id, "session": a.id, "mode": "goals", "key": "tidy-3"})).await?;
             let goals_again = run(json!({"id": p.id, "session": a.id, "mode": "goals", "key": "tidy-3"})).await?;
@@ -748,6 +764,47 @@ mod tests {
                 let again = run(input).await.map_err(|e| e.to_string());
                 anyhow::ensure!(first.is_err() && again == first, "{first:?}, then {again:?}");
             }
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: two parallel steps form one immutable round communication. A keyed replay
+    /// counts that communication, rather than inventing a missing second receipt from step count.
+    #[test]
+    fn a_keyed_parallel_plan_round_replays_its_one_immutable_publication() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, folder) = stopped_agent().await?;
+            let plan = crate::plans::create(&hub, crate::plans::New {
+                title: "Parallel round".into(),
+                items: vec![
+                    crate::plans::Item { title: "Build the engine".into(), ..Default::default() },
+                    crate::plans::Item { title: "Build the view".into(), ..Default::default() },
+                    crate::plans::Item { title: "Integrate both".into(), needs: vec![1, 2], ..Default::default() },
+                ],
+                ..Default::default()
+            }, "admin").await?;
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let input = json!({"id": plan.id, "session": id, "mode": "steps", "only": [1, 2], "key": "parallel-round"});
+            let first = call(person.clone(), "plans.run", input.clone()).await.map_err(|(status, error)| anyhow::anyhow!("first round: {status}: {error}"))?;
+            let run = first.get("run").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no run: {first}"))?.to_owned();
+            let message = crate::util::derive_id(&["plan-run", &run, "0"]);
+            crate::harness::ops::end_to_end::source_disposition(&hub, &id, &message, true).await?;
+            let original = crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), id.clone(), message.clone()).await?.ok_or_else(|| anyhow::anyhow!("no round receipt"))?;
+            assert_eq!(original.disposition, crate::harness::mail::Disposition::Consumed);
+            // This was the real bug: claim used selected step count=2 and looked for an
+            // index-one receipt, even though the native provider consumed the one round.
+            let again = call(person, "plans.run", input).await.map_err(|(status, error)| anyhow::anyhow!("keyed round replay: {status}: {error}"))?;
+            assert_eq!((first.get("run"), first.get("session")), (again.get("run"), again.get("session")));
+            for answer in [&first, &again] {
+                assert_eq!(answer.get("sent").and_then(Value::as_u64).unwrap_or(0) + answer.get("retained").and_then(Value::as_u64).unwrap_or(0), 1, "one round publication: {answer}");
+            }
+            let repeated = crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), id.clone(), message.clone()).await?.ok_or_else(|| anyhow::anyhow!("round receipt disappeared"))?;
+            assert_eq!((original.id, original.revision), (repeated.id, repeated.revision));
+            let missing = crate::util::derive_id(&["plan-run", &run, "1"]);
+            assert!(crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), id.clone(), missing).await?.is_none(), "there is no second communication in this round");
+            let taken = hub.harness.local.inbox().ok_or_else(|| anyhow::anyhow!("no source inbox"))?.taken(&id, 100).await?;
+            assert_eq!(taken, [message.clone()]);
+            assert_eq!(crate::harness::ops::end_to_end::prompts(&folder.path().join("heard.jsonl")), [message], "the native round is delivered once");
             Ok(())
         })
     }
@@ -827,7 +884,13 @@ mod tests {
 
     /// A real initialized provider and its current same-epoch source capacity.
     async fn stopped(hub: &Arc<crate::hub::Hub>, id: &str) -> anyhow::Result<()> {
-        crate::harness::ops::end_to_end::source_ready(hub, id).await
+        crate::harness::ops::end_to_end::source_ready(hub, id).await?;
+        // Bootstrap credit is advertised before native initialize completes. Goal pushes
+        // deliberately wait while Starting; this fixture has no background goal driver.
+        crate::harness::ops::end_to_end::source_until(hub, id, "initialized goal provider", || async {
+            Ok(hub.harness.info(id).is_some_and(|info| info.status == crate::harness::model::Status::Idle)
+                && hub.harness.local.get(id).is_some_and(|session| session.core.lock().state.status == crate::harness::model::Status::Idle))
+        }).await
     }
 
     async fn taken_by(hub: &Arc<crate::hub::Hub>, id: &str, n: usize) -> anyhow::Result<Vec<String>> {

@@ -1,0 +1,19 @@
+{
+  "script": "docs/research/measurements/queue-prevention/windows-recovery-checkout-prep.ps1",
+  "script_sha256": "558d4f874232b35df6ccf97bc346b3cd26214cf121183406fce0c50fdfbf1def",
+  "script_bytes": 10551,
+  "gzip_bytes": 3577,
+  "native_execution": "unrun; Root owns execution/cleanup",
+  "requests": {
+    "parser": {
+      "path": "docs/research/measurements/queue-prevention/windows-recovery-checkout-prep-v2.parser.json",
+      "sha256": "a377c0ce4376e6378b702940dc14526f0f3733d362d4268beae6a4ad70f0ffdc",
+      "command_characters": 16970
+    },
+    "apply": {
+      "path": "docs/research/measurements/queue-prevention/windows-recovery-checkout-prep-v2.apply.json",
+      "sha256": "cebe2bf69e3eda39503b01cccade8b7aad2ecf7c3e039b4f184e2f7161da7b76",
+      "command_characters": 16666
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "script": "docs/research/measurements/queue-prevention/windows-recovery-stash-proof.ps1",
+  "kind": "inspect",
+  "script_sha256": "911fbe6b4bc8040e1185da96c84f2ac70e1606a7766152611b093ae09fe5d242",
+  "script_bytes": 5766,
+  "gzip_bytes": 2353,
+  "native_execution": "unrun; Root owns execution/cleanup",
+  "requests": {
+    "parser": {
+      "path": "docs/research/measurements/queue-prevention/windows-recovery-stash-proof-v2.parser.json",
+      "sha256": "9e09372976ce29084c7e4f36ab1cbf2416bd16d7acc365dd66e32e56995e6a2b",
+      "command_characters": 12614
+    },
+    "inspect": {
+      "path": "docs/research/measurements/queue-prevention/windows-recovery-stash-proof-v2.inspect.json",
+      "sha256": "aaee05d60129425e983362f61f1f877ae4a0369ac21609a1816dcecbf9e1347b",
+      "command_characters": 12310
+    }
+  }
+}

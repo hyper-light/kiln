@@ -1394,6 +1394,47 @@ async fn gone_within(pid: u32, patience: Duration) -> bool {
     true
 }
 
+/// A Welcome does not settle named features: that reply follows independently on the
+/// same connection. Only an actual Caps-negative or Features reply releases native Ready.
+#[cfg(unix)]
+#[derive(Default, Debug, PartialEq, Eq)]
+enum FeatureNegotiation {
+    #[default]
+    AwaitingCaps,
+    AwaitingNames,
+    Legacy,
+    Named,
+}
+
+#[cfg(unix)]
+impl FeatureNegotiation {
+    fn caps(&mut self, caps: u64) {
+        if caps & proto::CAP_FEATURES == 0 {
+            *self = Self::Legacy;
+        } else if *self != Self::Named {
+            *self = Self::AwaitingNames;
+        }
+    }
+
+    fn names(&mut self) { *self = Self::Named; }
+
+    fn take_over(&self, welcomed: bool, pending: &mut Option<PathBuf>) -> Option<PathBuf> {
+        if welcomed && matches!(self, Self::Legacy | Self::Named) { pending.take() } else { None }
+    }
+}
+
+/// Uses the existing one-shot takeover owner after this connection's handshake is settled.
+#[cfg(unix)]
+fn start_take_over(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: crate::memory::queue::Sender<Bg>, me: Me, takes: bool) {
+    crate::rt::spawn(async move {
+        if let Err(e) = take_over_from(path, harness, tx.clone(), me, takes).await {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");
+        }
+        crate::reach::told::predecessor_ended();
+        let _ = tx.send(Bg::TakeOverEnded).await;
+    });
+}
+
 /// (The new build's runner, blue/green.) Take over from the runner being upgraded, at `path`: say
 /// it's ready, take each agent session and terminal it hands over (saying how each went), then the
 /// server's frames about them that reached it meanwhile, until that runner ends. Terminals are
@@ -2202,6 +2243,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The features the server speaks by name (docs/wire.md, "Named features"), said on this
     // connection after its caps say `CAP_FEATURES`: none from a server before them.
     let mut server_features: Vec<String> = Vec::new();
+    #[cfg(unix)]
+    let mut feature_negotiation = FeatureNegotiation::default();
     let mut grants: HashMap<String, proto::Grant> = HashMap::new();
     let mut renew_seq = 0u64;
     // Where each grant's lease ends by this machine's clock, which counts sleep, and which grants
@@ -3407,6 +3450,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Net(None) => anyhow::bail!("transport stopped"),
             Ev::Net(Some(NetEvent::Connected { binding, .. })) => {
+                #[cfg(unix)]
+                { feature_negotiation = FeatureNegotiation::default(); }
+                crate::harness::handing::mail_supported(false);
                 tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
                 chaos_drop = chaos.and_then(|c| c.drop_every).map(|d| Instant::now() + d);
                 // How long saying what it is takes (its build's probes, its facts), told below: the
@@ -3583,6 +3629,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 welcomed = false;
                 mail_replay = MailReplay::default();
                 crate::harness::handing::mail_supported(false);
+                #[cfg(unix)]
+                { feature_negotiation = FeatureNegotiation::default(); }
                 leases.away();
                 // The channel's items in flight go again once the server says what it has, and
                 // the server's from what this side says it has: the session loops' too (runner-fan).
@@ -4200,6 +4248,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_kept.extend(sessions.into_iter().map(|k| (k.session.clone(), k)));
                     }
                     ServerMsg::Caps { caps } => {
+                        #[cfg(unix)]
+                        feature_negotiation.caps(caps);
                         // An identity of this process's own, for a key it made and keeps, certified
                         // on each connection (docs/ci.md W27-R01); an ephemeral runner's too (a `k8s`
                         // pool's pod, a v1 job's), enrolled by kiln, so its leg signs as the leg.
@@ -4290,6 +4340,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if server_wire {
                             own.0.send(Up::Term(AgentMsg::Wire(loops::have_of(wire_in.have(), &shared)))).await.ok();
                             have_soon = Some((Instant::now() + HAVE_SOON, HAVES_SOON));
+                        }
+                        #[cfg(unix)]
+                        if let Some(path) = feature_negotiation.take_over(welcomed, &mut take_over) {
+                            start_take_over(path, harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
                         }
                     }
                     // The relay refused a frame of this runner's reach links: as a close, its code
@@ -4427,18 +4481,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if proto::feature::speaks(&server_features, proto::feature::MAIL_FLOW) {
                             request_mail_replay(&mut mail_replay, harness.as_ref(), &own, !updates_on).await;
                         }
-                        // A new build started to take over from the runner being upgraded (blue/green):
-                        // connected and welcomed, it says it's ready, and takes everything.
+                        // Keep the existing takeover pending until this connection's feature
+                        // answer is known; Welcome alone cannot advertise journal support.
                         #[cfg(unix)]
-                        if let Some(path) = take_over.take() {
-                            let (h, tx, me, takes) = (harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
-                            crate::rt::spawn(async move {
-                                if let Err(e) = take_over_from(path, h, tx.clone(), me, takes).await {
-                                    tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");
-                                }
-                                crate::reach::told::predecessor_ended();
-                                let _ = tx.send(Bg::TakeOverEnded).await;
-                            });
+                        if let Some(path) = feature_negotiation.take_over(welcomed, &mut take_over) {
+                            start_take_over(path, harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
                         }
                         // The server knows this runner now: reach may relay (its links resume).
                         if let Some(r) = &reach {
@@ -4589,6 +4636,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let transfers = proto::feature::speaks(&names, proto::feature::MAIL_TRANSFER);
                         let transfer_replay = welcomed && transfers && !proto::feature::speaks(&server_features, proto::feature::MAIL_TRANSFER);
                         crate::harness::handing::mail_supported(transfers);
+                        #[cfg(unix)]
+                        feature_negotiation.names();
                         sent_changes.state_pages = pages;
                         tracing::debug!(?names, "the server speaks these features");
                         crate::reach::told::server_features(&names);
@@ -4611,6 +4660,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         if replay || transfer_replay { request_mail_replay(&mut mail_replay, harness.as_ref(), &own, !updates_on).await; }
                         if !mail && !transfers { mail_replay = MailReplay::default(); }
+                        #[cfg(unix)]
+                        if let Some(path) = feature_negotiation.take_over(welcomed, &mut take_over) {
+                            start_take_over(path, harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
+                        }
                     }
                     ServerMsg::HarnessMailTransfer { json } => {
                         if !proto::feature::speaks(&server_features, proto::feature::MAIL_TRANSFER) {
@@ -7356,6 +7409,48 @@ mod attention_archive_ack_tests{
 #[cfg(test)]
 mod native_handover_tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn native_ready_waits_for_actual_features_on_the_current_connection() {
+        let pending = || Some(PathBuf::from("old-runner"));
+        let mut path = pending();
+        let mut features = FeatureNegotiation::default();
+        assert_eq!(features.take_over(true, &mut path), None, "Welcome before Caps is not a negative capability");
+        features.caps(proto::CAP_FEATURES);
+        assert_eq!(features.take_over(true, &mut path), None, "named features still pending");
+        features.names();
+        assert_eq!(features.take_over(true, &mut path), pending());
+        features.names();
+        features.caps(proto::CAP_FEATURES);
+        assert_eq!(features.take_over(true, &mut path), None, "duplicate handshake events cannot start a second owner");
+
+        let mut path = pending();
+        let mut features = FeatureNegotiation::default();
+        features.names();
+        assert_eq!(features.take_over(false, &mut path), None, "Features before Welcome does not start takeover");
+        assert_eq!(features.take_over(true, &mut path), pending());
+
+        let mut path = pending();
+        let mut features = FeatureNegotiation::default();
+        features.caps(0);
+        assert_eq!(features, FeatureNegotiation::Legacy);
+        assert_eq!(features.take_over(false, &mut path), None);
+        assert_eq!(features.take_over(true, &mut path), pending(), "an actual legacy Caps reply settles the handshake without inventing mail support");
+
+        let mut path = pending();
+        let mut features = FeatureNegotiation::default();
+        features.caps(proto::CAP_FEATURES);
+        features.names();
+        features = FeatureNegotiation::default();
+        assert_eq!(features.take_over(false, &mut path), None, "disconnect retains the pending operation");
+        assert_eq!(features.take_over(true, &mut path), None, "a reconnect Welcome cannot reuse previous named features");
+        features.caps(proto::CAP_FEATURES);
+        assert_eq!(features.take_over(true, &mut path), None);
+        features.names();
+        assert_eq!(features.take_over(true, &mut path), pending());
+    }
+
     use crate::harness::core::Update;
     use crate::harness::host::{Host, Limits};
     use crate::harness::model::{State, Status};

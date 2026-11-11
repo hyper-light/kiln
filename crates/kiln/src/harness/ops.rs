@@ -1595,7 +1595,7 @@ for line in sys.stdin:
         gate_writer = os.open(result_gate, os.O_WRONLY | os.O_NONBLOCK) if gate is not None else None
         result_gate = None
         out({"type": "command_lifecycle", "command_uuid": uid, "state": "started", "session_id": session})
-        out({"type": "system", "subtype": "init", "cwd": ".", "session_id": session, "tools": [], "mcp_servers": [], "model": "fixture", "permissionMode": "default", "claude_code_version": "2.1.296"})
+        out({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "fixture", "permissionMode": "default", "claude_code_version": "2.1.296"})
         if complete:
             if gate is not None:
                 select.select([gate], [], [])

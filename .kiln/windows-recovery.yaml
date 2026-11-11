@@ -1,0 +1,109 @@
+# Manual-only native recovery; Root must deliver the exact assigned-SHA crypto verdict first.
+# Manual legacy CI: existing CPU/memory/headroom checks, no claimed disk reservation.
+name: native-windows-recovery
+on:
+  manual: true
+jobs:
+  native:
+    name: Native Windows recovery build
+    runs-on: [f766f09294f2e17e3b8a631ffd4e6a4b]
+    requires: ["os == windows", "arch == x86_64", "tools has cargo", "tools has node", "tools has git"]
+    resources: { cpu: "2", memory: 32Gi }
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TARGET_DIR: 'C:\Users\corph\.cache\kiln-offline-release-20261111\windows-native-target'
+      GIT_TERMINAL_PROMPT: "0"
+    steps:
+      - name: Preserve completed artifact, verify signed source, build native Windows
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Checked-Native([string]$exe, [string[]]$arguments) {
+            & $exe @arguments
+            if ($LASTEXITCODE -ne 0) { throw "$exe failed: $LASTEXITCODE" }
+          }
+          $sha = $env:KILN_SHA
+          if ($sha -notmatch '^[0-9a-f]{40}$') { throw 'missing exact source SHA' }
+          if ($env:KILN_AGENT -ne 'f766f09294f2e17e3b8a631ffd4e6a4b') { throw 'wrong cache-owning runner' }
+          $src = 'C:\Users\corph\.kiln\reach\e30189ea29182644fe5a4b2e06c7dac2\kiln-offline-fix-20261110-8a5ae447ef'
+          $target = $env:CARGO_TARGET_DIR
+          $workspace = $env:KILN_WORKSPACE
+          if (-not [IO.Path]::IsPathRooted($workspace)) { throw 'missing legacy CI workspace' }
+          if ($workspace.StartsWith($src, [StringComparison]::OrdinalIgnoreCase)) { throw 'artifact workspace overlaps preserved source' }
+          $workspaceSha = & git -C $workspace rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $workspaceSha -ne $sha) { throw 'CI workspace is not the assigned Git commit; archive fallback cannot supply local objects' }
+          # Root places this exact verdict artifact through authenticated control before trigger.
+          # Signature verification is the coordinator's shipped-hook preflight, not Git's helper.
+          $verdictPath = Join-Path (Split-Path -Parent $target) ('commit-verdict-' + $sha + '.json')
+          $verdictFile = [IO.File]::Open($verdictPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+          try {
+            if ($verdictFile.Length -gt 524288) { throw 'verdict exceeds existing control-frame metadata bound' }
+            $receiptBytes = New-Object byte[] ([int]$verdictFile.Length)
+            $read = 0
+            while ($read -lt $receiptBytes.Length) {
+              $n = $verdictFile.Read($receiptBytes, $read, $receiptBytes.Length - $read)
+              if ($n -eq 0) { throw 'incomplete coordinator verdict' }
+              $read += $n
+            }
+          } finally { $verdictFile.Dispose() }
+          $hasher = [Security.Cryptography.SHA256]::Create()
+          try { $receiptHash = [BitConverter]::ToString($hasher.ComputeHash($receiptBytes)).Replace('-', '').ToLowerInvariant() }
+          finally { $hasher.Dispose() }
+          $receipt = [Text.Encoding]::UTF8.GetString($receiptBytes) | ConvertFrom-Json
+          if ($receipt.kind -ne 'kiln-coordinator-commit-verdict-v1' -or $receipt.method -ne 'kiln.__git-hook.update' -or $receipt.passed -ne $true -or $receipt.repository -ne 'hyper-light/kiln' -or $receipt.source_sha -ne $sha -or $receipt.org -ne 'hyper-light') { throw 'missing matching coordinator crypto verdict' }
+          $found = @($receipt.hook_verdict.commits)
+          if ($found.Count -ne 1 -or $found[0].sha -ne $sha -or $found[0].seen -ne 'by' -or $found[0].words -cne $receipt.signer -or $found[0].signature -notmatch '^[0-9a-f]{64}$' -or $receipt.hook_verdict.refused -ne $null -or @($receipt.hook_verdict.warnings).Count -ne 0) { throw 'coordinator verdict is not an exact positive signature result' }
+          $signer = [Uri]$receipt.signer
+          $identity = $signer.AbsolutePath.Trim('/').Split('/')
+          if ($signer.Scheme -ne 'kiln' -or $signer.Host -ne $receipt.org -or $identity.Length -lt 6 -or $identity[0] -ne 'person' -or $identity[2] -ne 'agent' -or $identity[3] -cne $receipt.expected_agent -or $identity[4] -ne 'epoch') { throw 'coordinator verdict signer does not match its authorized agent' }
+
+          # One actual free-space observation, not a reservation or a recurring probe.
+          $free = @()
+          $roots = @(@($src, $target, $workspace) | ForEach-Object { [IO.Path]::GetPathRoot($_) } | Sort-Object -Unique)
+          foreach ($root in $roots) {
+            $drive = New-Object -TypeName System.IO.DriveInfo -ArgumentList $root
+            $available = $drive.AvailableFreeSpace
+            $free += [ordered]@{ root = $root; available_bytes = $available }
+            if ($available -lt 17179869184) { throw 'less than the approved16GiB build scratch free' }
+          }
+          $artifacts = Join-Path $workspace 'recovery-artifacts'
+          [void][IO.Directory]::CreateDirectory($artifacts)
+          [IO.File]::WriteAllBytes((Join-Path $artifacts 'coordinator-commit-verdict.json'), $receiptBytes)
+          Set-Location $src
+          $old = & git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or ($old -ne 'f555736bd887a4196c8841564cb9b4d6c1ede95f' -and $old -ne $sha)) { throw 'completed source HEAD changed' }
+          $dirty = & git --no-optional-locks status --porcelain --untracked-files=all
+          if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'preserve changed source before checkout' }
+          $oldBinary = Join-Path $src 'dist\kiln-x86_64-pc-windows-msvc.exe'
+          if (-not (Test-Path -LiteralPath $oldBinary)) {
+            $cachedBinary = Join-Path $target 'x86_64-pc-windows-msvc\release\kiln.exe'
+            $cachedHash = (Get-FileHash -LiteralPath $cachedBinary -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($cachedHash -ne '14ad7179f912bf132fefd738d159ace4b3ae8bea1283bc9c2b80a613723f9c2d') { throw 'old release artifact unavailable; preserve and review before checkout' }
+            [void][IO.Directory]::CreateDirectory((Join-Path $src 'dist'))
+            Copy-Item -LiteralPath $cachedBinary -Destination $oldBinary
+          }
+          $oldHash = (Get-FileHash -LiteralPath $oldBinary -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($oldHash -ne '14ad7179f912bf132fefd738d159ace4b3ae8bea1283bc9c2b80a613723f9c2d') { throw 'completed cache artifact differs; preserve and review before checkout' }
+          Copy-Item -LiteralPath $oldBinary -Destination (Join-Path $artifacts 'previous-kiln-x86_64-pc-windows-msvc.exe')
+          $before = [ordered]@{ source_sha = $old; artifact_sha256 = $oldHash; target_dir = $target; free_space = $free }
+          $before | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath (Join-Path $artifacts 'before.json') -Encoding UTF8
+          Checked-Native git @('fetch', '--no-tags', $workspace, $sha)
+          Checked-Native git @('checkout', '--detach', $sha)
+          $actual = & git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $sha) { throw 'source SHA mismatch' }
+          $env:KILN_COMMIT = $sha
+          Checked-Native npm @('ci', '--prefix', 'ui', '--no-audit', '--no-fund')
+          $env:KILN_UI_SERVER = 'off'
+          Checked-Native npm @('run', '--prefix', 'ui', 'build')
+          Remove-Item Env:KILN_UI_SERVER
+          Checked-Native node @('ui/scripts/pack-ui-server.mjs', '--require', '--target', 'x86_64-pc-windows-msvc')
+          Checked-Native cargo @('build', '--release', '--locked', '-p', 'kiln', '--target', 'x86_64-pc-windows-msvc', '-j', '2')
+          $binary = Join-Path $target 'x86_64-pc-windows-msvc\release\kiln.exe'
+          Checked-Native $binary @('--version')
+          $hash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          Copy-Item -LiteralPath $binary -Destination (Join-Path $artifacts 'kiln-x86_64-pc-windows-msvc.exe')
+          $proof = [ordered]@{ source_sha = $sha; previous_sha = $old; target = 'x86_64-pc-windows-msvc'; runner = $env:KILN_AGENT; run = $env:KILN_RUN_ID; job = $env:KILN_JOB_ID; attempt = $env:KILN_ATTEMPT; sha256 = $hash; bytes = (Get-Item -LiteralPath $binary).Length; cargo_target_dir = $target; coordinator_verdict_sha256 = $receiptHash; commit_signer = $receipt.signer; commit_check_method = $receipt.method }
+          $proof | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $artifacts 'build.json') -Encoding UTF8
+          $proof | ConvertTo-Json -Compress
+    artifacts: ["recovery-artifacts/*"]

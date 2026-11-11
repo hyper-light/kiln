@@ -1,5 +1,14 @@
 # Windows Reach failure: retained evidence and proposed narrow repair
 
+Current build-verification procedure:
+[COORDINATOR-COMMIT-VERDICT.md](COORDINATOR-COMMIT-VERDICT.md).
+Older `git verify-commit` preparation below is superseded: Kiln's signing helper
+refuses it. The current manual review YAML requires a coordinator's exact positive
+shipped-hook verdict artifact. Root now reports the0ff338 checkpoint's exact CMS
+check passed; its receipt cannot cover a later checkpoint. Root approved the actual
+[manual workflow file](../../../../.kiln/windows-recovery.yaml), now created with
+the same receipt gate. Final-SHA verification/current API/native build remain pending.
+
 2026-11-11. Implementer: kiln_status_trace; coordinator: root. POLICY_READ:
 Shards origin/main `3830327b6c8d7ac22452a5e32ffa32799263132c`, rules SHA256
 `df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3`.
@@ -186,7 +195,7 @@ with no guessed defaults: this lane retained R38's63m05s/artifact proof but not 
 resource envelope. Root must use its actual R38/Windows budget evidence. The
 90-minute deadline follows the existing release job; it grants no extra resources.
 
-Reviewable workflow body for `.kiln/windows-recovery.yaml` at that signed SHA:
+Historical CI2 alternative (not selected; do not execute):
 
 ```yaml
 name: native-windows-recovery
@@ -215,6 +224,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          throw 'Historical CI2 alternative not selected; use the receipt-gated legacy review copy'
           function Checked-Native([string]$exe, [string[]]$arguments) {
             & $exe @arguments
             if ($LASTEXITCODE -ne 0) { throw "$exe failed: $LASTEXITCODE" }
@@ -236,7 +246,6 @@ jobs:
             if ($oldHash -ne '14ad7179f912bf132fefd738d159ace4b3ae8bea1283bc9c2b80a613723f9c2d') { throw 'old artifact differs; preserve separately' }
           }
           Checked-Native git @('fetch', 'https://github.com/hyper-light/kiln.git', $sha)
-          Checked-Native git @('verify-commit', $sha)
           Checked-Native git @('checkout', '--detach', $sha)
           $actual = & git rev-parse HEAD
           if ($LASTEXITCODE -ne 0 -or $actual -ne $sha) { throw 'source SHA mismatch' }
@@ -256,7 +265,8 @@ jobs:
     artifacts: ["recovery-artifacts/*"]
 ```
 
-This is an unparsed/unrun workflow proposal, not an installed file. The exact old
+This historical alternative is superseded and deliberately stops before building.
+It is not an installed file. The exact old
 dist filename still needs the normally admitted preflight to confirm it. Preserve
 old artifacts/receipts before checkout; this recipe writes new output into the CI
 workspace, leaving old dist output in place. Do not run a second time blindly if
@@ -405,8 +415,9 @@ the review copy uses exactly that schema. `KILN_WORKSPACE`, `KILN_SHA`, runner,
 run/job/attempt come from legacy `exec.rs`, not GitHub-only environment names.
 Native worker checkout must be Git-based, with HEAD exactly the assigned signed
 SHA. Archive fallback without `.git` is rejected before the owned cache changes.
-The script fetches objects **locally from that CI workspace**, verifies the commit,
-and non-force checks it out in the content-clean exact old Reach clone. It accepts
+The script fetches objects **locally from that CI workspace**, requires the
+coordinator's exact positive shipped-hook receipt, and non-force checks the commit
+out in the content-clean exact old Reach clone. It accepts
 only its expected f555 HEAD or the same target SHA; no reset/clean/force/discard,
 GitHub credential assumption, key read or custom trust bypass.
 

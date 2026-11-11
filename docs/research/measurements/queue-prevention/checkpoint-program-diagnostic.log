@@ -1,0 +1,158 @@
+
+running 1 test
+
+thread 'hyper-rt-shard-0' (58602152) panicked at crates/kiln/src/programs/tests.rs:413:9:
+None
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:679:5
+   1: core::panicking::panic_fmt
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panicking.rs:80:14
+   2: {async_block#0}
+             at ./crates/kiln/src/programs/tests.rs:413:9
+   3: poll<kiln::programs::tests::a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_rules::{async_block_env#0}>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panic/unwind_safe.rs:300:9
+   4: {closure#0}<core::panic::unwind_safe::AssertUnwindSafe<kiln::programs::tests::a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_rules::{async_block_env#0}>>
+             at /Users/adalundhe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.34/src/future/future/catch_unwind.rs:37:44
+   5: call_once<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, futures_util::future::future::catch_unwind::{impl#1}::poll::{closure_env#0}<core::panic::unwind_safe::AssertUnwindSafe<kiln::programs::tests::a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_rules::{async_block_env#0}>>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panic/unwind_safe.rs:275:9
+   6: do_call<core::panic::unwind_safe::AssertUnwindSafe<futures_util::future::future::catch_unwind::{impl#1}::poll::{closure_env#0}<core::panic::unwind_safe::AssertUnwindSafe<kiln::programs::tests::a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_rules::{async_block_env#0}>>>, core::task::poll::Poll<core::result::Result<(), anyhow::Error>>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:576:43
+   7: ___rust_try
+   8: catch_unwind<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, core::panic::unwind_safe::AssertUnwindSafe<futures_util::future::future::catch_unwind::{impl#1}::poll::{closure_env#0}<core::panic::unwind_safe::AssertUnwindSafe<kiln::programs::tests::a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_rules::{async_block_env#0}>>>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:544:19
+   9: catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<futures_util::future::future::catch_unwind::{impl#1}::poll::{closure_env#0}<core::panic::unwind_safe::AssertUnwindSafe<kiln::programs::tests::a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_rules::{async_block_env#0}>>>, core::task::poll::Poll<core::result::Result<(), anyhow::Error>>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panic.rs:359:14
+  10: poll<core::panic::unwind_safe::AssertUnwindSafe<kiln::programs::tests::a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_rules::{async_block_env#0}>>
+             at /Users/adalundhe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.34/src/future/future/catch_unwind.rs:37:9
+  11: {async_block#1}<(), kiln::programs::tests::a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_rules::{async_block_env#0}>
+             at ./crates/kiln/src/rt.rs:1457:74
+  12: poll<alloc::boxed::Box<(dyn core::future::future::Future<Output=()> + core::marker::Send), alloc::alloc::Global>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/future/future.rs:133:9
+  13: {async_block#0}
+             at ./crates/kiln/src/rt.rs:1194:17
+  14: poll
+             at ./crates/kiln-rt/src/task.rs:39:58
+  15: {closure#0}
+             at ./crates/kiln-rt/src/shard_loop.rs:2372:55
+  16: call_once<core::task::poll::Poll<()>, hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panic/unwind_safe.rs:275:9
+  17: do_call<core::panic::unwind_safe::AssertUnwindSafe<hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>, core::task::poll::Poll<()>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:576:43
+  18: ___rust_try
+  19: catch_unwind<core::task::poll::Poll<()>, core::panic::unwind_safe::AssertUnwindSafe<hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:544:19
+  20: catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>, core::task::poll::Poll<()>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panic.rs:359:14
+  21: contained<core::task::poll::Poll<()>, hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>
+             at ./crates/kiln-rt/src/unwind.rs:12:11
+  22: poll_slot
+             at ./crates/kiln-rt/src/shard_loop.rs:2372:20
+  23: poll_batch_in
+             at ./crates/kiln-rt/src/shard_loop.rs:1505:30
+  24: {closure#0}
+             at ./crates/kiln-rt/src/shard_loop.rs:1474:66
+  25: {closure#0}<hyper_rt::shard_loop::Shard, (bool, core::option::Option<u64>), hyper_rt::shard_loop::{impl#4}::poll_batch::{closure_env#0}>
+             at ./crates/kiln-rt/src/registry.rs:926:35
+  26: try_with<core::cell::Cell<*const hyper_rt::shard::ShardContext>, hyper_rt::registry::with_current_cell::{closure_env#0}<hyper_rt::shard_loop::Shard, (bool, core::option::Option<u64>), hyper_rt::shard_loop::{impl#4}::poll_batch::{closure_env#0}>, (bool, core::option::Option<u64>)>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/thread/local.rs:463:12
+  27: with_current_cell<hyper_rt::shard_loop::Shard, (bool, core::option::Option<u64>), hyper_rt::shard_loop::{impl#4}::poll_batch::{closure_env#0}>
+             at ./crates/kiln-rt/src/registry.rs:926:19
+  28: poll_batch
+             at ./crates/kiln-rt/src/shard_loop.rs:1474:9
+  29: step_after
+             at ./crates/kiln-rt/src/shard_loop.rs:1438:35
+  30: run
+             at ./crates/kiln-rt/src/shard_loop.rs:1030:40
+  31: run_worker
+             at ./crates/kiln-rt/src/runtime.rs:464:11
+  32: {closure#1}
+             at ./crates/kiln-rt/src/runtime.rs:595:32
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+Error: the task panicked: None
+
+Stack backtrace:
+   0: std::backtrace_rs::backtrace::libunwind::trace
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1: std::backtrace_rs::backtrace::trace_unsynchronized::<<std::backtrace::Backtrace>::create::{closure#0}>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2: <std::backtrace::Backtrace>::create
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/backtrace.rs:331:13
+   3: <std::backtrace::Backtrace>::capture
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/backtrace.rs:296:9
+   4: msg<alloc::string::String>
+             at /Users/adalundhe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.104/src/backtrace.rs:10:14
+   5: {async_block#1}<(), kiln::programs::tests::a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_rules::{async_block_env#0}>
+             at ./crates/kiln/src/rt.rs:1459:27
+   6: poll<alloc::boxed::Box<(dyn core::future::future::Future<Output=()> + core::marker::Send), alloc::alloc::Global>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/future/future.rs:133:9
+   7: {async_block#0}
+             at ./crates/kiln/src/rt.rs:1194:17
+   8: poll
+             at ./crates/kiln-rt/src/task.rs:39:58
+   9: {closure#0}
+             at ./crates/kiln-rt/src/shard_loop.rs:2372:55
+  10: call_once<core::task::poll::Poll<()>, hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panic/unwind_safe.rs:275:9
+  11: do_call<core::panic::unwind_safe::AssertUnwindSafe<hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>, core::task::poll::Poll<()>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:576:43
+  12: ___rust_try
+  13: catch_unwind<core::task::poll::Poll<()>, core::panic::unwind_safe::AssertUnwindSafe<hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:544:19
+  14: catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>, core::task::poll::Poll<()>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panic.rs:359:14
+  15: contained<core::task::poll::Poll<()>, hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>
+             at ./crates/kiln-rt/src/unwind.rs:12:11
+  16: poll_slot
+             at ./crates/kiln-rt/src/shard_loop.rs:2372:20
+  17: poll_batch_in
+             at ./crates/kiln-rt/src/shard_loop.rs:1505:30
+  18: {closure#0}
+             at ./crates/kiln-rt/src/shard_loop.rs:1474:66
+  19: {closure#0}<hyper_rt::shard_loop::Shard, (bool, core::option::Option<u64>), hyper_rt::shard_loop::{impl#4}::poll_batch::{closure_env#0}>
+             at ./crates/kiln-rt/src/registry.rs:926:35
+  20: try_with<core::cell::Cell<*const hyper_rt::shard::ShardContext>, hyper_rt::registry::with_current_cell::{closure_env#0}<hyper_rt::shard_loop::Shard, (bool, core::option::Option<u64>), hyper_rt::shard_loop::{impl#4}::poll_batch::{closure_env#0}>, (bool, core::option::Option<u64>)>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/thread/local.rs:463:12
+  21: with_current_cell<hyper_rt::shard_loop::Shard, (bool, core::option::Option<u64>), hyper_rt::shard_loop::{impl#4}::poll_batch::{closure_env#0}>
+             at ./crates/kiln-rt/src/registry.rs:926:19
+  22: poll_batch
+             at ./crates/kiln-rt/src/shard_loop.rs:1474:9
+  23: step_after
+             at ./crates/kiln-rt/src/shard_loop.rs:1438:35
+  24: run
+             at ./crates/kiln-rt/src/shard_loop.rs:1030:40
+  25: run_worker
+             at ./crates/kiln-rt/src/runtime.rs:464:11
+  26: {closure#1}
+             at ./crates/kiln-rt/src/runtime.rs:595:32
+  27: __rust_begin_short_backtrace<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/sys/backtrace.rs:166:18
+  28: {closure#0}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/thread/lifecycle.rs:70:13
+  29: call_once<core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>, std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panic/unwind_safe.rs:275:9
+  30: do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>>, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:576:43
+  31: ___rust_try
+  32: catch_unwind<core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>, core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:544:19
+  33: catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>>, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panic.rs:359:14
+  34: {closure#1}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/thread/lifecycle.rs:68:26
+  35: call_once<std::thread::lifecycle::spawn_unchecked::{closure_env#1}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>, ()>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ops/function.rs:250:5
+  36: <alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/boxed.rs:2320:9
+  37: <std::sys::thread::unix::Thread>::new::thread_start
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/sys/thread/unix.rs:123:17
+  38: __pthread_cond_wait
+test programs::tests::a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_rules ... FAILED
+
+failures:
+
+failures:
+    programs::tests::a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_rules
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4229 filtered out; finished in 3.19s
+

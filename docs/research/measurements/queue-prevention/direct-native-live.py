@@ -17,6 +17,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -61,6 +62,9 @@ def main():
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--source-receipt", required=True, type=Path)
+    parser.add_argument("--before-binary", type=Path)
+    parser.add_argument("--before-sha256")
+    parser.add_argument("--before-source-receipt", type=Path)
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path, help="New private directory on disk, preferably under ~/.cache")
     parser.add_argument("--timeout-seconds", required=True, type=float)
@@ -71,6 +75,15 @@ def main():
     binary = args.binary.resolve(strict=True)
     require(sha(binary) == args.sha256, "binary does not match the coordinator's expected SHA256")
     require(args.source_receipt.is_file(), "the build/source receipt is absent")
+    prior = args.before_binary.resolve(strict=True) if args.before_binary else None
+    if prior:
+        require(args.before_sha256 is not None and args.before_source_receipt is not None, "a prior artifact needs its exact hash and source receipt")
+        require(sha(prior) == args.before_sha256, "the prior artifact hash differs")
+        source = json.loads(args.before_source_receipt.read_bytes())
+        require(source.get("exit_code") == 0 and source.get("source_unchanged") is True and source.get("sha256") == args.before_sha256,
+                "the prior artifact lacks a successful unchanged-source build witness")
+    else:
+        require(args.before_sha256 is None and args.before_source_receipt is None, "a prior hash/receipt requires its artifact")
     root = args.out.absolute()
     root.parent.mkdir(parents=True, exist_ok=True)
     require(shutil.disk_usage(root.parent).free >= args.keep_free_bytes + binary.stat().st_size * 2,
@@ -79,6 +92,7 @@ def main():
     started = time.monotonic()
     deadline = started + args.timeout_seconds
     children = []
+    runtime = Path(tempfile.mkdtemp(prefix="kn-", dir="/private/tmp"))
     providers = {}
     admin = None
     session = None
@@ -86,7 +100,7 @@ def main():
     quic_port = port(socket.SOCK_DGRAM)
     report = {"binary_sha256": args.sha256, "source_receipt_sha256": sha(args.source_receipt),
               "source_receipt": str(args.source_receipt.resolve()), "out": str(root),
-              "kind": "actual-isolated-cli-native-scm", "checks": {}, "passed": False}
+              "kind": "actual-isolated-cli-native-scm", "checks": {}, "passed": False, "runtime": str(runtime)}
 
     def check(name, condition):
         require(condition, "failed witness: " + name)
@@ -182,11 +196,16 @@ def main():
         report["helper_original_sha256"] = sha(helper)
         report["helper_fixture_sha256"] = sha(root / "bin" / "claude")
         before = root / "kiln-before"
-        with open(binary, "rb") as source, open(before, "xb") as destination:
+        with open(prior or binary, "rb") as source, open(before, "xb") as destination:
             shutil.copyfileobj(source, destination, 1024 * 1024)
-            destination.write(b"\0")
+            if prior is None:
+                destination.write(b"\0")
         os.chmod(before, 0o700)
         report["before_sha256"] = sha(before)
+        require(report["before_sha256"] != args.sha256, "the before/after artifacts must differ to exercise upgrade")
+        if prior:
+            report["before_source_receipt_sha256"] = sha(args.before_source_receipt)
+            report["before_source_receipt"] = str(args.before_source_receipt.resolve())
         config = f'''[server]
 http_addr = "127.0.0.1:{http_port}"
 quic_addr = "127.0.0.1:{quic_port}"
@@ -221,7 +240,7 @@ headroom = false
         # signing configuration, or model account. PATH supplies only programs; the selected
         # harness program itself is the absolute owned fake path above.
         env = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "TZ", "TMPDIR") if key in os.environ}
-        env.update({"HOME": str(root / "home"), "NO_COLOR": "1", "KILN_MACHINE_ID": "native-proof-server-" + root.name})
+        env.update({"HOME": str(root / "home"), "TMPDIR": str(runtime), "XDG_RUNTIME_DIR": str(runtime), "NO_COLOR": "1", "KILN_MACHINE_ID": "native-proof-server-" + root.name})
         launch("server", [str(binary), "--config", str(root / "kiln.toml"), "server"], env)
         wait("isolated server health", lambda: (root / "data/admin.token").is_file() and api("GET", "/healthz"))
         admin = (root / "data/admin.token").read_text().strip()
@@ -265,7 +284,11 @@ headroom = false
         report["provider_pid"] = provider
         report["provider_start_identity"] = identity[:24]
         job = api("POST", "/api/updates/runners/" + machine)["id"]
-        handoff = wait("nonempty direct journal committed", committed)
+        def live_committed():
+            status = api("GET", "/api/updates/jobs/" + job)
+            require(status.get("state") != "failed", "the owned native upgrade refused before journal handover; inspect private fixture logs")
+            return committed()
+        handoff = wait("nonempty direct journal committed", live_committed)
         check("nonempty_manifest", handoff["manifest"]["count"] > 0)
         check("exact_source_epoch", handoff["manifest"]["source_epoch"] == initial["epoch"])
         check("next_epoch", handoff["manifest"]["destination_epoch"] == initial["epoch"] + 1)

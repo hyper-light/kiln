@@ -167,8 +167,15 @@ async fn until(what: &str, holds: impl Fn() -> bool) -> anyhow::Result<()> {
 
 /// Session `id`'s state changed as its machine would report it (its usage, a pause).
 async fn report(hub: &Hub, id: &str, f: impl FnOnce(&mut crate::harness::model::State)) -> anyhow::Result<()> {
-    let mut st = hub.harness.state(id).ok_or_else(|| anyhow::anyhow!("no session {id}"))?;
-    f(&mut st);
+    let session = hub.harness.local.get(id).ok_or_else(|| anyhow::anyhow!("no source session {id}"))?;
+    // The test's provider report is authoritative on its owner too; later real source
+    // events must not restore the usage that preceded this report.
+    let st = {
+        let mut core = session.core.lock();
+        f(&mut core.state);
+        core.touch_state();
+        core.state.clone()
+    };
     hub.harness.ingest(&crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(st) }).await;
     Ok(())
 }
