@@ -23,6 +23,15 @@ pub struct StatusKey {
     pub key: String,
 }
 
+/// Whether `sender` is a person, whose messages go in a queue of their own: the server's owner
+/// (`admin`) or a signed-in user (`user:<name>`), as `harness::ops::key_scope` names a caller.
+/// A person's messages are held to no other sender's bound and go first; agents', kiln's own
+/// (`server`) and any other caller's are held to the recipient's depth.
+pub fn person(sender: &str) -> bool { sender == "admin" || sender.starts_with("user:") }
+
+/// [`person`]'s complement over `agent_mail.sender`: the senders a recipient's depth holds.
+const BOUNDED: &str = "NOT (sender='admin' OR substr(sender,1,5)='user:')";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "MailPublish"))]
@@ -413,12 +422,16 @@ fn publish_on(c: &mut Connection, publication: &Publish, authority: u64, pending
     let body = String::from_utf8(body).map_err(|e| Error::Unavailable { reason: e.to_string() })?;
     if bytes > authority { return Err(Error::Capacity { required: bytes, authority }); }
     if handoff_active(&tx, &publication.recipient)? { return Err(Error::Unavailable { reason: "current owner handover retains all accepted communication; new custody is waiting".into() }); }
-    let unresolved: i64 = tx.query_row("SELECT COUNT(*) FROM agent_mail WHERE recipient=?1 AND disposition IN ('waiting','dispatched','admitted')", [&publication.recipient], |r| r.get(0)).map_err(sql_error)?;
-    let superseded = if let Some(status) = &publication.status {
-        tx.query_row("SELECT COUNT(*) FROM agent_mail WHERE owner=?1 AND sender=?2 AND recipient=?3 AND status_task IS ?4 AND status_key=?5 AND disposition='waiting' AND frozen=0", params![publication.owner, publication.sender, publication.recipient, status.task, status.key], |r| r.get::<_, i64>(0)).map_err(sql_error)?
-    } else { 0 };
-    let pending = unsigned(unresolved)?.checked_sub(unsigned(superseded)?).and_then(|n| n.checked_add(1)).ok_or_else(|| Error::Unavailable { reason: "communication pending accounting overflow".into() })?;
-    if pending > pending_authority { return Err(Error::Backpressure { pending, authority: pending_authority }); }
+    // A person's message goes in the person's own queue: no bound holds it, and it counts
+    // against none. Agents' and kiln's are held to the recipient's depth, counting theirs alone.
+    if !person(&publication.sender) {
+        let unresolved: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM agent_mail WHERE recipient=?1 AND disposition IN ('waiting','dispatched','admitted') AND {BOUNDED}"), [&publication.recipient], |r| r.get(0)).map_err(sql_error)?;
+        let superseded = if let Some(status) = &publication.status {
+            tx.query_row("SELECT COUNT(*) FROM agent_mail WHERE owner=?1 AND sender=?2 AND recipient=?3 AND status_task IS ?4 AND status_key=?5 AND disposition='waiting' AND frozen=0", params![publication.owner, publication.sender, publication.recipient, status.task, status.key], |r| r.get::<_, i64>(0)).map_err(sql_error)?
+        } else { 0 };
+        let pending = unsigned(unresolved)?.checked_sub(unsigned(superseded)?).and_then(|n| n.checked_add(1)).ok_or_else(|| Error::Unavailable { reason: "communication pending accounting overflow".into() })?;
+        if pending > pending_authority { return Err(Error::Backpressure { pending, authority: pending_authority }); }
+    }
     if let Some(status) = &publication.status {
         tx.execute("UPDATE agent_mail SET disposition='superseded' WHERE owner=?1 AND sender=?2 AND recipient=?3 AND status_task IS ?4 AND status_key=?5 AND disposition='waiting' AND frozen=0",
             params![publication.owner, publication.sender, publication.recipient, status.task, status.key]).map_err(sql_error)?;
@@ -1010,6 +1023,23 @@ mod tests {
         publish_on(&mut c, &to("b", "b1"), size, 2)?;
         publish_on(&mut c, &to("b", "b2"), size, 2)?;
         assert!(matches!(publish_on(&mut c, &to("b", "b3"), size - 1, 2), Err(Error::Capacity { .. })), "an original the disk has no room for still waits");
+        Ok(())
+    }
+
+    /// A person's messages queue apart: no depth holds them and they count against none, while
+    /// agents', kiln's and any other caller's count against the recipient's depth together.
+    #[test]
+    fn a_persons_messages_queue_apart_from_the_depth_agents_are_held_to() -> anyhow::Result<()> {
+        let mut c = db()?;
+        let from = |sender: &str, id: &str| Publish { sender: sender.into(), ..message(id, None, "words") };
+        publish_on(&mut c, &from("agent:a", "a1"), u64::MAX, 1)?;
+        assert!(matches!(publish_on(&mut c, &from("agent:b", "b1"), u64::MAX, 1), Err(Error::Backpressure { pending: 2, authority: 1 })), "agents' depth holds a second");
+        assert!(matches!(publish_on(&mut c, &from("server", "k1"), u64::MAX, 1), Err(Error::Backpressure { .. })), "kiln's own counts with agents'");
+        assert!(matches!(publish_on(&mut c, &from("ci-token", "t1"), u64::MAX, 1), Err(Error::Backpressure { .. })), "so does any other caller's");
+        for (sender, id) in [("user:ada", "p1"), ("user:ada", "p2"), ("admin", "p3")] {
+            publish_on(&mut c, &from(sender, id), u64::MAX, 0)?;
+        }
+        publish_on(&mut c, &from("agent:b", "b2"), u64::MAX, 2)?;
         Ok(())
     }
 

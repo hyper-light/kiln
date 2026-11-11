@@ -23,7 +23,7 @@ fn manifest(attempt: &str, session: &str, source_epoch: u64) -> anyhow::Result<T
 }
 
 fn capacity(epoch: u64) -> super::super::admission::Capacity {
-    super::super::admission::Capacity { epoch,generation:1,retry_generation:Some(1),learning:super::super::admission::Learning::Observed,target:1,admitted:1,bytes:1,peers:1,eligible_peer:None,feedback_generation:None }
+    super::super::admission::Capacity { epoch,generation:1,retry_generation:Some(1),learning:super::super::admission::Learning::Observed,target:1,admitted:1,bytes:1,peers:1,eligible_peer:None,feedback_generation:None,depth:None }
 }
 
 async fn commit(hub: &Hub, manifest: TransferManifest, source: Principal, destination: Principal) -> anyhow::Result<Record> {

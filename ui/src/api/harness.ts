@@ -1200,7 +1200,7 @@ export class SessionStore {
     const going = this.out.get(id);
     if (!original || !going) return;
     const retained = going.publication ?? original.publication;
-    const why = retained ? "Kiln retained the original; its receiver is not ready yet" : `${waitingFor(code)}; the original message and files are saved here`;
+    const why = retained ? "Queued in Kiln; it goes to the agent as soon as it takes messages" : `${waitingFor(code)}; the original message and files are saved here`;
     this.saveMail(
       useHeld.getState().hold(this.id, { ...original, custody: retained ? "retained" : "waiting", publication: retained, wait: this.mailWake() ?? `connection:${this.mailConnection}`, why }),
     );
@@ -1232,8 +1232,8 @@ export class SessionStore {
     const why = terminal
       ? "This communication ended before model handoff; its original remains in Kiln history"
       : receipt.disposition === "transferred"
-        ? "Kiln retained the original while its owner moves"
-        : "Kiln retained the original; waiting for receiver capacity";
+        ? "Queued in Kiln while the agent moves to another machine"
+        : "Queued in Kiln; it goes to the agent as soon as it takes messages";
     this.saveMail(useHeld.getState().hold(this.id, { ...original, custody: terminal ? "failed" : "retained", publication: receipt, why }));
     this.out.set(id, { ...going, publication: receipt, o: { ...going.o, state: terminal ? "failed" : "retained", why, fresh: terminal } });
     const asked = this.asked.get(id);
@@ -2471,7 +2471,7 @@ export class SessionStore {
       const original = this.originals().find((message) => message.id === id);
       if (original) this.saveMail(useHeld.getState().hold(this.id, { ...original, custody: m.publication && !fresh ? "retained" : "failed", publication: m.publication, why }));
       if (m.publication && !fresh) {
-        this.out.set(id, { ...m, o: { ...m.o, state: "retained", why: "Kiln retained the original while its receiver is unavailable" } });
+        this.out.set(id, { ...m, o: { ...m.o, state: "retained", why: "Queued in Kiln; it goes once the agent's machine is back" } });
         changed = true;
         continue;
       }

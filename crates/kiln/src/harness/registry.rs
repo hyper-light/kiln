@@ -4430,10 +4430,10 @@ impl Registry {
     /// hear them: one parked at once, then its runner's once it's back.
     pub async fn send_asked(&self, hub: &Arc<Hub>, id: &str, scope: &str, cmd: &str, c: Command) {
         use std::time::Instant;
-        // An agent's message goes into custody, bounded (W20). So does a person's, unless its
-        // session's runner predates mail-flow: then it goes to that runner's inbox, as before,
-        // through `dispatch` below ([`super::mail_delivery::legacy_owner`]).
-        if super::session::is_message(&c) && (scope.starts_with("agent:") || !super::mail_delivery::legacy_owner(hub, id)) {
+        // A message goes into custody (W20), a person's in a queue of its own, unless it's a
+        // person's and its session's runner predates mail-flow: then it goes to that runner's
+        // inbox, as before, through `dispatch` below ([`super::mail_delivery::legacy_owner`]).
+        if super::session::is_message(&c) && (!super::mail::person(scope) || !super::mail_delivery::legacy_owner(hub, id)) {
             let sent = match self.publish_command(hub, id, c, None, scope.to_owned(), scope.to_owned(), None).await {
                 Ok(receipt) => Sent::Published(receipt),
                 Err(error) => Sent::PublicationRefused(error),
@@ -8138,8 +8138,9 @@ mod tests {
     /// A person's message to an agent whose runner predates mail-flow goes to that runner's inbox,
     /// as it did before W20, and is answered there: the runner never pushes the capacity custody
     /// waits for, so custody refused it ("waiting for capacity") for as long as the runner was old.
-    /// An agent's message to it stays in custody's hands (W20's bound), and once the runner speaks
-    /// mail-flow a person's goes into custody too.
+    /// An agent's message to it stays in custody's hands (W20's bound). Once the runner speaks
+    /// mail-flow, a person's is queued in custody, in a queue of its own, before the agent's
+    /// capacity has come; an agent's and kiln's own wait for that capacity.
     #[test]
     fn w20_a_persons_message_reaches_a_runner_from_before_mail_flow_through_its_inbox() -> anyhow::Result<()> {
         use super::super::asked::Taken;
@@ -8174,14 +8175,19 @@ mod tests {
             hub.harness.send_asked(&hub, "s1", "agent:a1", "c3", send("m3")).await;
             let sent = agent.await?;
             anyhow::ensure!(matches!(sent, Sent::PublicationRefused(super::super::mail::Error::Unavailable { .. })), "an agent's is held to custody: {sent:?}");
-            // Its runner upgraded, speaking mail-flow: a person's goes into custody too.
+            // Its runner upgraded, speaking mail-flow, its capacity not come yet: a person's is
+            // queued in custody, in the person's own queue; an agent's and kiln's wait for it.
             hub.instances.update(|i| i.set_features(1, vec![crate::proto::feature::MAIL_FLOW.to_owned()]));
             anyhow::ensure!(!super::super::mail_delivery::legacy_owner(&hub, "s1"), "a runner naming mail-flow isn't from before it");
             let person = asked("user:ada", "c4", "m4")?;
             hub.harness.send_asked(&hub, "s1", "user:ada", "c4", send("m4")).await;
             let sent = person.await?;
-            anyhow::ensure!(matches!(sent, Sent::PublicationRefused(_) | Sent::Published(_)), "custody's, not the inbox's: {sent:?}");
-            anyhow::ensure!(matches!(hub.harness.dispatch(&hub, "s1", send("m5")).await, Pending::Now(Sent::PublicationRefused(_) | Sent::Published(_))), "custody's too");
+            anyhow::ensure!(matches!(sent, Sent::Published(ref r) if r.disposition == super::super::mail::Disposition::Waiting), "queued for the agent: {sent:?}");
+            let agent = asked("agent:a1", "c5", "m5")?;
+            hub.harness.send_asked(&hub, "s1", "agent:a1", "c5", send("m5")).await;
+            let sent = agent.await?;
+            anyhow::ensure!(matches!(sent, Sent::PublicationRefused(super::super::mail::Error::Unavailable { .. })), "an agent's waits for its capacity: {sent:?}");
+            anyhow::ensure!(matches!(hub.harness.dispatch(&hub, "s1", send("m6")).await, Pending::Now(Sent::PublicationRefused(_))), "and kiln's own");
             Ok(())
         })
     }
