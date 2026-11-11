@@ -411,15 +411,6 @@ impl PhysicalBudget {
         self.changed.notify();
     }
     pub fn counts(&self) -> (usize, usize) { let p = self.state.lock(); (p.held, p.bound) }
-    /// A coalesced transfer recovery owner observes actual pool changes. Subscribe before
-    /// reading so a release racing registration cannot leave a held header asleep.
-    pub(crate) async fn changed_since(&self, counts: (usize, usize)) {
-        loop {
-            let changed = self.changed.listen();
-            if self.counts() != counts { return; }
-            changed.await;
-        }
-    }
     fn snapshot(&self, account: &AtomicUsize) -> PhysicalSnapshot {
         let p = self.state.lock();
         PhysicalSnapshot { held: p.held, bound: p.bound, foreign: p.held.saturating_sub(account.load(Ordering::Relaxed)) }
