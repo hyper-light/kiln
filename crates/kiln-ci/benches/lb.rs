@@ -459,6 +459,7 @@ impl Kiln {
         let cpu = if d == 1 { u32::try_from(need[0]).ok() } else { None };
         let rest = Rest { at: Handle::NONE, generation: 0, kind: u32::MAX };
         let kinds = KINDS.load(std::sync::atomic::Ordering::Relaxed);
+        owner.kinds(kinds);
         Kiln { owner, runners, sig, need, slot_runner: vec![u32::MAX; slots], slot_run: vec![u32::MAX; slots], slot_rest: vec![rest; slots], out, rout: RunnerOut::new(), starts: Vec::new(), waits: Vec::new(), stage: Vec::new(), words: Vec::new(), admits: Vec::new(), waited: 0, cpu, kinds, kind: u32::MAX }
     }
 

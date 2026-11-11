@@ -1174,6 +1174,15 @@ impl Owner {
         }
     }
 
+    /// Room for the kinds numbered below `kinds`, made as the shell numbers them: none is made
+    /// on an end or a decision after that (a kind it wasn't told of gets its record at its
+    /// first word).
+    pub fn kinds(&mut self, kinds: u32) {
+        if kinds > 0 {
+            self.know(kinds - 1);
+        }
+    }
+
     /// Makes a record for kind `kind` when there is none. False: it names no kind.
     fn know(&mut self, kind: u32) -> bool {
         if kind >= NO_KIND {
@@ -1894,7 +1903,12 @@ impl Owner {
         let to = key(p.view, p.scale, last);
         if W {
             // The kind's good place first, then the move put off with its kind, written once.
-            let Some(k) = self.kinds.get_mut(kind as usize) else { return self.ended_won_new(r, from, to, was, kind) };
+            // What isn't the short case is one call made last, with nothing to come back to: a
+            // caller that does nothing after this keeps no frame for it (W05-R26).
+            let Some(k) = self.kinds.get_mut(kind as usize) else {
+                self.ended_won_new(r, from, to, was, kind);
+                return true;
+            };
             k.good = r;
             k.state = SETTLED;
             if k.shun == r {
@@ -1903,15 +1917,15 @@ impl Owner {
             if to != from {
                 if self.pend.r == NIL && to > from {
                     self.pend = Pend { r, from, to, was, kind };
-                    return true;
+                } else {
+                    self.moved_won(r, from, to, was, kind);
                 }
-                return self.moved_won(r, from, to, was, kind);
-            }
-            if self.pend.r == r {
+            } else if self.pend.r == r {
                 self.pend.kind = kind;
-                return true;
+            } else {
+                self.won_slow(r, kind);
             }
-            return self.won_elsewhere(r, kind);
+            return true;
         }
         if to != from {
             // Its move is put off: nothing reads its bucket before the next pick looks at it.
@@ -1928,28 +1942,20 @@ impl Owner {
     /// or puts it off, then the win's part in it.
     #[cold]
     #[inline(never)]
-    fn moved_won(&mut self, r: u32, from: u32, to: u32, was: u32, kind: u32) -> bool {
+    fn moved_won(&mut self, r: u32, from: u32, to: u32, was: u32, kind: u32) {
         self.moved_slow(r, from, to, was);
         if self.pend.r == r {
             self.pend.kind = kind;
-            return true;
+        } else {
+            self.won_slow(r, kind);
         }
-        self.won_elsewhere(r, kind)
-    }
-
-    /// [`Owner::ended_won`] on a runner whose rise isn't the one put off ([`Owner::won_slow`]).
-    #[cold]
-    #[inline(never)]
-    fn won_elsewhere(&mut self, r: u32, kind: u32) -> bool {
-        self.won_slow(r, kind);
-        true
     }
 
     /// [`Owner::ended_won`] for a kind this owner hasn't heard of, or none: the end, then
     /// [`Owner::won`] as for any.
     #[cold]
     #[inline(never)]
-    fn ended_won_new(&mut self, r: u32, from: u32, to: u32, was: u32, kind: u32) -> bool {
+    fn ended_won_new(&mut self, r: u32, from: u32, to: u32, was: u32, kind: u32) {
         if to != from {
             if self.pend.r == NIL && to > from {
                 self.pend = Pend { r, from, to, was, kind: NO_KIND };
@@ -1958,7 +1964,6 @@ impl Owner {
             }
         }
         self.won_new(RunnerId(r), KindId(kind));
-        true
     }
 
     /// [`Owner::ended_fast`] for a burst of ends: the rise a word brings is put off to the
