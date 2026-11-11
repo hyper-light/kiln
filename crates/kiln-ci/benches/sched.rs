@@ -11,7 +11,10 @@ use kiln_ci::sched::routing::{LegRoute, RunnerView};
 use kiln_ci::sched::state::{Command, Config, Input, LegIn, Outcome, RunnerIn, Scheduler};
 
 fn main() {
-    let runs: Vec<(f64, f64, f64)> = (0..3).map(|_| once()).collect();
+    // W05-AC08/W22-AC08: --cli reproduces `kiln ci bench`'s default configuration;
+    // the ordinary bench retains its grant-lease workload.
+    let cli = std::env::args().any(|arg| arg == "--cli");
+    let runs: Vec<(f64, f64, f64)> = (0..3).map(|_| once(cli)).collect();
     for (rate, p99, mean) in &runs {
         println!("sched: {rate:.0} assignments/s, input p99 {p99:.3} ms, mean {mean:.4} ms");
     }
@@ -19,9 +22,9 @@ fn main() {
     println!("sched: best {best:.0} assignments/s (W05-AC08 asks at least 2,000)");
 }
 
-fn once() -> (f64, f64, f64) {
+fn once(cli: bool) -> (f64, f64, f64) {
     // Grants as leases, as kiln has them (W05-R34).
-    let mut s = Scheduler::new(Config { lease: Some(60_000), ..Config::default() });
+    let mut s = Scheduler::new(Config { lease: if cli { None } else { Some(60_000) }, ..Config::default() });
     let facts = RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() };
     for i in 0..1_000 {
         let r = RunnerIn { id: format!("r{i}"), view: RunnerView { name: format!("r{i}"), label: None, labels: vec![format!("pool-{}", i % 50)], facts: facts.clone(), caps: 0, pool: None }, slots: 4, capacity: None, executor: None, draining: false };
