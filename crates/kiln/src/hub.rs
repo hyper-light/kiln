@@ -6573,12 +6573,15 @@ pub(crate) mod tests {
             let _answer = hub.cmds.ask(move |c| c.push(PEER, crate::wire::commands::Kind::Live, None, b"keys".to_vec(), now)).await;
             hub.commands_due.notify();
             until_held("the command sent at once", until, || sent(true) == 1).await?;
+            // W13-R01 / goal 9: read the sender's deadline before delaying its observer.
+            // Time spent scheduling this test must not restart the command's patience.
+            let retry_due = hub.cmds.ask(|c| c.due(Instant::now())).await.flatten().ok_or_else(|| anyhow::anyhow!("the sent command has no retry deadline"))?;
+            anyhow::ensure!(retry_due >= now + crate::wire::commands::PATIENCE, "retry due before the queued command's patience");
             // Goal 9 regression control: the observer may be delayed independently of the
             // sender. A retry's patience still starts when the command core sends it.
             crate::rt::sleep(crate::wire::commands::PATIENCE / 2).await;
-            let went = Instant::now();
             until_held("sent again at its patience", until, || sent(true) == 2).await?;
-            anyhow::ensure!(went.elapsed() + Duration::from_millis(50) >= crate::wire::commands::PATIENCE, "sent again before its patience: {:?}", went.elapsed());
+            anyhow::ensure!(Instant::now() >= retry_due, "sent again before its patience deadline");
             let haves = sent(false);
             net.dropped(PEER, proto::LANE_FILES, "shed", 1);
             until_held("its Have said again for a frame shed", until, || sent(false) == haves + 1).await?;

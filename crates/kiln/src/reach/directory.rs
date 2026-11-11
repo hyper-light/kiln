@@ -698,7 +698,8 @@ mod tests {
             f.disk.free = 500 << 30;
             f.custom.insert("rack".into(), "a3".into());
         });
-        let mut gpu = reported("gpu", 16, 32, |f| f.gpus = vec![kiln_ci::facts::Gpu::default()]);
+        // W13-R01: this case asks for fresh GPU capacity, so its fixture reports both counters.
+        let mut gpu = reported("gpu", 16, 32, |f| f.gpus = vec![kiln_ci::facts::Gpu { busy_per_mille: Some(0), memory_used: Some(0), ..Default::default() }]);
         gpu.labels = vec!["gpu".into()];
         gpu.busy = 2;
         let mac = RunnerInfo { facts: None, ..runner("mac", "macos", "aarch64", 12, 0.0, 24) };
@@ -879,11 +880,34 @@ mod hex_gpu_directory_tests {
     fn w05_r22_gpu_directory_requires_one_card_to_meet_all_predicates() -> anyhow::Result<()> {
         let mut r = node("mixed", 32, 0, 0);
         if let Some(facts) = &mut r.facts {
-            facts.gpus = vec![Gpu { model: "A100".into(), memory: 8 << 30, ..Gpu::default() }, Gpu { model: "H100".into(), memory: 80 << 30, ..Gpu::default() }];
+            // Both cards are observed: rejection must come from their incompatible predicates,
+            // rather than the absence of telemetry hiding an aggregate model/memory mistake.
+            facts.gpus = vec![Gpu { model: "A100".into(), memory: 8 << 30, busy_per_mille: Some(0), memory_used: Some(0), ..Gpu::default() }, Gpu { model: "H100".into(), memory: 80 << 30, busy_per_mille: Some(0), memory_used: Some(0), ..Gpu::default() }];
         }
         let (choices, passed) = rank(&[r], &Want::parse("gpus=1,gpu.model==A100,gpu.memory>=16Gi")?, "");
         assert!(choices.is_empty());
         assert_eq!(passed.len(), 1);
+        Ok(())
+    }
+
+    /// W13-R01: directory selection observes the same fresh-counter contract as admission.
+    #[test]
+    fn w13_r01_directory_gpu_choices_require_both_observed_counters() -> anyhow::Result<()> {
+        let want = Want::parse("gpus=1")?;
+        let cpu = Want::parse("cpus=1")?;
+        let observed = node("observed", 16, 0, 0);
+        let (choices, passed) = rank(std::slice::from_ref(&observed), &want, "");
+        assert_eq!(choices.len(), 1, "known observations must be usable: {passed:?}");
+        for (busy, used) in [(None, None), (Some(0), None), (None, Some(0)), (Some(1001), Some(0))] {
+            let mut r = observed.clone();
+            let card = r.facts.as_mut().and_then(|f| f.gpus.first_mut()).ok_or_else(|| anyhow::anyhow!("GPU fixture has no card"))?;
+            card.busy_per_mille = busy;
+            card.memory_used = used;
+            let (choices, passed) = rank(std::slice::from_ref(&r), &want, "");
+            assert!(choices.is_empty() && passed.len() == 1, "unread/invalid GPU was selected: {busy:?}, {used:?}");
+            let (choices, passed) = rank(&[r], &cpu, "");
+            assert_eq!(choices.len(), 1, "unknown GPU counters must not block CPU work: {passed:?}");
+        }
         Ok(())
     }
 }
