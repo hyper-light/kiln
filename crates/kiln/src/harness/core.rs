@@ -1342,7 +1342,7 @@ impl Core {
     pub fn refuse_owner_mail(&mut self, token: Option<super::mail::Token>, epoch: u64) {
         use super::admission::{Capacity, Fault, FlowEvent, Learning, WaitCause};
         let capacity = self.input.as_ref().map(|input| input.controller.lock().capacity()).or_else(|| self.state.admission.clone()).unwrap_or(Capacity {
-            epoch: self.state.epoch, generation: 0, retry_generation: None, learning: Learning::Bootstrap, target: 0, admitted: 0, bytes: 0, peers: 0, eligible_peer: None, feedback_generation: None,
+            epoch: self.state.epoch, generation: 0, retry_generation: None, learning: Learning::Bootstrap, target: 0, admitted: 0, bytes: 0, peers: 0, eligible_peer: None, feedback_generation: None, depth: None,
         });
         let event = match token {
             Some(token) => FlowEvent::Waiting { token, epoch, cause: WaitCause::SourceUnavailable, capacity },
