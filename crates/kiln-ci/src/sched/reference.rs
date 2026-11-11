@@ -2154,6 +2154,42 @@ fn report(seed: u64, cfg: &Config, steps: &[(Step, i64)], why: &str) -> String {
 /// E1.5: the engine places legs as the reference does, after every input of 10,000 small random
 /// cases, and keeps its invariants.
 #[test]
+fn w05_r03_slot_mode_still_reserves_declared_gpus() {
+    let cfg = Config { resources: false, ..Config::default() };
+    let mut engine = Scheduler::with_epoch(cfg.clone(), 0);
+    let mut reference = Reference::new(cfg, 0);
+    let mut runner = RunnerIn {
+        id: "gpu-node".into(),
+        view: RunnerView { name: "gpu-node".into(), labels: vec!["x".into()], ..RunnerView::default() },
+        slots: 3,
+        capacity: Some(Resources { cpu: Cpus::whole(4), mem: 11 * GIB, ..Resources::default() }),
+        ..RunnerIn::default()
+    };
+    let leg = |id: &str| LegIn {
+        id: id.into(), run: id.into(), repo: "acme/gpu".into(),
+        route: LegRoute { labels: vec!["x".into()], ..LegRoute::default() },
+        // CPU/memory are intentionally slot-accounted here; an exclusive GPU is still finite.
+        request: Resources { cpu: Cpus::whole(4), mem: 15 * GIB, gpu: 1, ..Resources::default() },
+        ..LegIn::default()
+    };
+    let mut apply = |step: Step, now, expected: &[&str]| {
+        engine.handle(step.input(), now);
+        reference.handle(&step, now);
+        let expected: BTreeSet<String> = expected.iter().map(|id| (*id).to_owned()).collect();
+        assert_eq!(engine.grants().keys().cloned().collect::<BTreeSet<_>>(), expected, "engine at {now}");
+        assert_eq!(reference.placement().0.keys().cloned().collect::<BTreeSet<_>>(), expected, "reference at {now}");
+    };
+    apply(Step::Up(runner.clone()), 0, &[]);
+    apply(Step::Queued(Box::new(leg("a"))), 1, &[]);
+    apply(Step::Drain(runner.id.clone()), 2, &[]);
+    if let Some(capacity) = &mut runner.capacity { capacity.gpu = 1; }
+    apply(Step::Undrain(runner), 3, &["a"]);
+    apply(Step::Queued(Box::new(leg("b"))), 4, &["a"]);
+    apply(Step::Ended { leg: "a".into(), attempt: 1, outcome: Outcome::Success }, 5, &["b"]);
+}
+
+/// E1.5: compare all generated histories, retaining the original case count and invariants.
+#[test]
 fn e1_5_the_engine_agrees_with_the_reference() {
     if let Some(seed) = std::env::var("KILN_SCHED_REFERENCE_SEED").ok().and_then(|s| s.trim().parse::<u64>().ok()) {
         let (cfg, epoch, steps) = case(seed);
