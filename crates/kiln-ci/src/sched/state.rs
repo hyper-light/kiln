@@ -2867,8 +2867,13 @@ impl Scheduler {
     /// Whether a runner is big enough to hold a leg (W05-R03): would it have room for it, idle. A
     /// share within its size; in resource mode, a leg's request within its capacity × overcommit.
     fn could_hold(&self, r: &Runner, l: &Leg) -> bool {
-        if l.req.pool.is_some() {
-            return true;
+        // W05-R16: a node without enough compatible physical GPUs is never an alternative,
+        // even when CPU/memory are slot-accounted. Pressure can clear once its other work ends.
+        if l.asked.gpu > 0 && (u64::from(l.asked.gpu) > Self::gpu_total(r) || !super::gpu::could_match(&Self::gpu_needs(l), &r.input.view.facts, &r.input.view.all_labels())) {
+            return false;
+        }
+        if let Some(pool) = &l.req.pool {
+            return self.pool(pool).is_some_and(|p| p.hosted || p.request.gpu >= l.asked.gpu);
         }
         let c = self.config();
         let size = size(r);
@@ -2920,10 +2925,13 @@ impl Scheduler {
         super::needs::Needs { request: l.asked, requires: l.req.constraints.iter().map(|(src, _)| src.clone()).collect(), ..Default::default() }
     }
 
+    fn gpu_total(r: &Runner) -> u64 {
+        size(r).map_or_else(|| u64::try_from(r.input.view.facts.gpus.len()).unwrap_or(u64::MAX), |s| u64::from(s.gpu))
+    }
+
     fn gpu_rank(r: &Runner, need: &super::needs::Needs, used: u32) -> Option<u64> {
         if need.request.gpu == 0 { return Some(0); }
-        let total = size(r).map_or_else(|| u64::try_from(r.input.view.facts.gpus.len()).unwrap_or(u64::MAX), |s| u64::from(s.gpu));
-        super::gpu::rank(need, &r.input.view.facts, &r.input.view.all_labels(), total.saturating_sub(u64::from(used)))
+        super::gpu::rank(need, &r.input.view.facts, &r.input.view.all_labels(), Self::gpu_total(r).saturating_sub(u64::from(used)))
     }
 
     /// W05-R03/W05-R40: physical GPUs stay finite in every CPU mode, including a projected gang
