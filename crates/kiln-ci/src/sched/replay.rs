@@ -13,6 +13,7 @@
 //! that moves it updates `replay.digest` on purpose.
 
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 
 use super::retry::{FailureClass, RetryOn, RetryPolicy, RunnerChoice};
 use super::routing::{LegRoute, RunnerView};
@@ -165,7 +166,7 @@ fn scenario(seed: u64, cfg: &Config) -> Vec<(i64, String)> {
     for r in &runners {
         sim.runner(0, r.clone());
     }
-    let (mut t, mut ids) = (0, Vec::new());
+    let (mut t, mut ids, mut gpu_asks) = (0, Vec::new(), BTreeMap::new());
     for n in 0..15 + d.below(30) {
         t += ms(&mut d, 20 * SECOND);
         let (mut l, duration, fails) = leg(&mut d, n);
@@ -173,6 +174,7 @@ fn scenario(seed: u64, cfg: &Config) -> Vec<(i64, String)> {
             l.on_lease_loss = LeaseLoss::Stop;
         }
         sim.fail(&l.id, &fails);
+        gpu_asks.insert(l.id.clone(), l.request.gpu);
         ids.push(l.id.clone());
         sim.leg(t, l, duration);
     }
@@ -200,7 +202,31 @@ fn scenario(seed: u64, cfg: &Config) -> Vec<(i64, String)> {
         }
     }
     sim.run(DAY);
-    sim.trace.take().unwrap_or_default().into_iter().map(|(at, c)| (at, line(&c))).collect()
+    let trace = sim.trace.take().unwrap_or_default();
+    // W05-R03/E1.4: audit logical GPU grants independently of the production matcher. Slot
+    // mode never creates devices, and a GPU held by another live grant is not spare capacity.
+    // Lost grants leave this ledger; physical identity/attachment recovery is a separate proof.
+    let mut held: BTreeMap<String, (String, u32)> = BTreeMap::new();
+    for (at, command) in &trace {
+        match command {
+            Command::Assign { leg, runner, .. } => {
+                let ask = gpu_asks.get(leg).copied().unwrap_or(0);
+                if ask == 0 { continue; }
+                let used = held.values().filter(|(r, _)| r == runner).fold(0u64, |n, (_, gpu)| n.saturating_add(u64::from(*gpu)));
+                let capacity = runners.iter().find(|r| &r.id == runner).and_then(|r| r.capacity).map_or(0, |r| u64::from(r.gpu));
+                assert!(used + u64::from(ask) <= capacity, "W05-R03 seed {seed} at {at}: {leg} asks {ask} GPUs on {runner}, already holding {used} of {capacity}");
+                assert!(held.insert(leg.clone(), (runner.clone(), ask)).is_none(), "W05-R03 seed {seed}: duplicate live GPU grant for {leg}");
+            }
+            Command::Lost { leg, .. } | Command::Retry { leg, .. } | Command::Settled { leg, .. } => { held.remove(leg); }
+            _ => {}
+        }
+    }
+    if std::env::var_os("KILN_SCHED_REPLAY_PRINT").is_some() {
+        let capacities: BTreeMap<_, _> = runners.iter().map(|r| (r.id.clone(), r.capacity.map_or(0, |c| c.gpu))).collect();
+        let demands: BTreeMap<_, _> = gpu_asks.into_iter().filter(|(_, gpu)| *gpu > 0).collect();
+        println!("GPU inputs {seed}: capacities={}, demands={}", serde_json::to_string(&capacities).unwrap_or_default(), serde_json::to_string(&demands).unwrap_or_default());
+    }
+    trace.into_iter().map(|(at, c)| (at, line(&c))).collect()
 }
 
 /// Every seed's commands, as lines, and their SHA-256.
