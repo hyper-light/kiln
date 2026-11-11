@@ -2359,13 +2359,23 @@ async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)
 
 /// The conversation as kiln's timeline keeps it, with the plan as it stands: what is carried out
 /// of a harness whose own record kiln doesn't read (`carried`). None for one whose record it does.
-fn timeline_of<'a>(from: &Kind, events: impl IntoIterator<Item = &'a super::model::Event>, todos: &[super::model::Todo]) -> Option<super::handoff::Conversation> {
+fn timeline_of<'a>(from: &Kind, events: impl IntoIterator<Item = &'a super::model::Event>, todos: &[super::model::Todo], queue: &[super::model::QueueItem]) -> Option<super::handoff::Conversation> {
     if from.own_record() {
         return None;
     }
-    let mut c = super::handoff::from_events(events);
+    let mut c = super::handoff::from_events(handed_events(events, queue));
     c.todos = todos.to_vec();
     Some(c)
+}
+
+/// CP-T3.2: shown queued input still travels in the durable queue, and must not also become
+/// past conversation in the next harness. The displayed timeline itself stays whole.
+fn handed_events<'a>(events: impl IntoIterator<Item = &'a super::model::Event>, queue: &[super::model::QueueItem]) -> Vec<&'a super::model::Event> {
+    let queued: std::collections::HashSet<&str> = queue.iter().map(|q| q.id.as_str()).collect();
+    events.into_iter().filter(|e| match &e.body {
+        super::model::Body::User { client_id, .. } => !queued.contains(e.id.as_str()) && !client_id.as_deref().is_some_and(|id| queued.contains(id)),
+        _ => true,
+    }).collect()
 }
 
 /// The permission mode and effort a session goes on with in harness `to`, carried from `from`: the
@@ -2456,7 +2466,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
     let (cwd, session, old_model, mode, effort, timeline) = {
         let core = s.core.lock();
         let st = &core.state;
-        (st.cwd.clone(), st.harness_session.clone(), st.model.clone(), st.mode.clone(), st.effort.clone(), timeline_of(from, core.events(), &st.todos))
+        (st.cwd.clone(), st.harness_session.clone(), st.model.clone(), st.mode.clone(), st.effort.clone(), timeline_of(from, core.events(), &st.todos, &st.queue))
     };
     let fail = |s: &Arc<Session>, text: String| {
         let mut core = s.core.lock();
@@ -3025,7 +3035,8 @@ where
     };
     let carry = match kind.protocol {
         super::kinds::Protocol::Acp(_) | super::kinds::Protocol::AgyStreamJson => {
-            super::moving::words(&events, "This conversation went on in this machine's newer kiln runner, which took the older one's place.")
+            let history: Vec<_> = handed_events(&events, &state.queue).into_iter().cloned().collect();
+            super::moving::words(&history, "This conversation went on in this machine's newer kiln runner, which took the older one's place.")
         }
         _ => Carry::Nothing,
     };
@@ -3141,7 +3152,7 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
         // Its record, and what its harness keeps for it in its home besides (`homes`).
         None => {
             let env = spec.env.clone();
-            let timeline = events.clone();
+            let timeline: Vec<_> = handed_events(&events, &state.queue).into_iter().cloned().collect();
             let (cwd, objective) = (from_cwd.clone(), state.objective.clone());
             crate::rt::blocking(move || {
                 let carry = super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)?;
@@ -3155,7 +3166,7 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
         // writes one (`carried`).
         Some(to) => {
             let model = mv.model.clone().unwrap_or_default();
-            let timeline = timeline_of(kind, &events, &state.todos);
+            let timeline = timeline_of(kind, &events, &state.todos, &state.queue);
             let c = carried(kind, to, &spec.env, session, timeline, &mv.cwd, &state.model, &state.mode, &state.effort, spec.allow_bypass, &model, Some(&note)).await?;
             let (carry, there) = match c.record {
                 Record::Claude { session, records } => (Carry::ClaudeLines { session: session.clone(), lines: records.iter().map(serde_json::Value::to_string).collect() }, Some(session)),
@@ -5052,7 +5063,7 @@ for line in sys.stdin:
         let nothing: Vec<Event> = Vec::new();
         crate::rt::block_on(async move {
             // Out of Devin into Claude Code: a transcript it resumes, the command its own Bash call.
-            let c = carried(devin, claude, &[], None, timeline_of(devin, &events, &todos), "/w", "", "smart", "high", true, "opus", None).await.map_err(anyhow::Error::msg)?;
+            let c = carried(devin, claude, &[], None, timeline_of(devin, &events, &todos, &[]), "/w", "", "smart", "high", true, "opus", None).await.map_err(anyhow::Error::msg)?;
             let Record::Claude { session, records } = &c.record else { anyhow::bail!("not a transcript") };
             let lines: Vec<String> = records.iter().map(serde_json::Value::to_string).collect();
             anyhow::ensure!(!session.is_empty() && lines.iter().any(|l| l.contains("what time is it?")) && lines.iter().any(|l| l.contains("\"Bash\"") && l.contains("date -u")), "{lines:?}");
@@ -5060,13 +5071,13 @@ for line in sys.stdin:
             assert_eq!((c.mode.as_deref(), c.effort.as_deref(), c.dropped, c.empty), (Some("auto"), Some("high"), 0, false));
             // Into Codex: its new thread's history (from kiln's timeline, its own session's id
             // notwithstanding).
-            let c = carried(devin, codex, &[], Some("devin-session".into()), timeline_of(devin, &events, &todos), "/w", "", "ask", "", true, "gpt-6.1-sol", None).await.map_err(anyhow::Error::msg)?;
+            let c = carried(devin, codex, &[], Some("devin-session".into()), timeline_of(devin, &events, &todos, &[]), "/w", "", "ask", "", true, "gpt-6.1-sol", None).await.map_err(anyhow::Error::msg)?;
             let Record::Codex(items) = &c.record else { anyhow::bail!("not a thread's history") };
             let all = serde_json::to_string(items)?;
             anyhow::ensure!(all.contains("<kiln_handoff>") && all.contains("began in Devin and now continues here in Codex") && all.contains("what time is it?") && all.contains("exec_command") && all.contains("date -u") && all.contains("noon"), "{all}");
             assert_eq!(c.mode.as_deref(), Some("untrusted"));
             // Out of Gemini CLI (an ACP agent's own mode, placed by its words) into Claude Code.
-            let c = carried(gemini, claude, &[], None, timeline_of(gemini, &events, &todos), "/w", "gemini-3-pro", "autoEdit", "", true, "opus", None).await.map_err(anyhow::Error::msg)?;
+            let c = carried(gemini, claude, &[], None, timeline_of(gemini, &events, &todos, &[]), "/w", "gemini-3-pro", "autoEdit", "", true, "opus", None).await.map_err(anyhow::Error::msg)?;
             let Record::Claude { records, .. } = &c.record else { anyhow::bail!("not a transcript") };
             let all = serde_json::to_string(records)?;
             anyhow::ensure!(all.contains("began in Gemini CLI (model gemini-3-pro)") && all.contains("It's noon, UTC."), "{all}");
@@ -5076,7 +5087,7 @@ for line in sys.stdin:
             let env = vec![("CLAUDE_CONFIG_DIR".to_owned(), dir.path().to_string_lossy().into_owned())];
             let recs = handoff::to_claude(&handoff::from_events(&events), None, "S1", "/w", "claude-opus-5-5");
             handoff::write_claude(&env, "/w", "S1", &recs)?;
-            anyhow::ensure!(timeline_of(claude, &events, &todos).is_none() && timeline_of(codex, &events, &todos).is_none(), "Claude Code's and Codex's own records are read, not kiln's timeline");
+            anyhow::ensure!(timeline_of(claude, &events, &todos, &[]).is_none() && timeline_of(codex, &events, &todos, &[]).is_none(), "Claude Code's and Codex's own records are read, not kiln's timeline");
             let c = carried(claude, devin, &env, Some("S1".into()), None, "/w", "claude-opus-5-5", "acceptEdits", "max", true, "", None).await.map_err(anyhow::Error::msg)?;
             let Record::Words(text) = &c.record else { anyhow::bail!("not in words") };
             anyhow::ensure!(text.starts_with("<kiln_handoff>\nThis conversation began in Claude Code (model claude-opus-5-5) and now continues here in Devin") && text.contains("each described in words"), "{text}");
@@ -5086,17 +5097,17 @@ for line in sys.stdin:
             let e = carried(claude, devin, &env, Some("missing".into()), None, "/w", "", "", "", true, "", None).await.err().unwrap_or_default();
             anyhow::ensure!(e.contains("could not read Claude Code's record"), "{e}");
             // Out of Devin into Antigravity: in words too, a move's note after the switch's.
-            let c = carried(devin, agy, &[], None, timeline_of(devin, &events, &todos), "/w", "", "plan", "", true, "", Some("It moved to mac.")).await.map_err(anyhow::Error::msg)?;
+            let c = carried(devin, agy, &[], None, timeline_of(devin, &events, &todos, &[]), "/w", "", "plan", "", true, "", Some("It moved to mac.")).await.map_err(anyhow::Error::msg)?;
             let Record::Words(text) = &c.record else { anyhow::bail!("not in words") };
             anyhow::ensure!(text.contains("continues here in Antigravity CLI") && text.contains("It moved to mac.") && text.contains("- [~] read the clock once"), "{text}");
             assert_eq!(c.mode.as_deref(), Some("plan"));
             // Nothing said yet: nothing to carry.
-            let c = carried(gemini, devin, &[], None, timeline_of(gemini, &nothing, &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
+            let c = carried(gemini, devin, &[], None, timeline_of(gemini, &nothing, &[], &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(c.empty && matches!(c.record, Record::Nothing));
             // A long one goes in words in less room than a harness's own record takes.
             let mut long = vec![ev("u0", said("the goal"))];
             long.extend((0..400).map(|i| ev(&format!("a{i}"), Body::Assistant { text: format!("{i} {}", "x".repeat(1000)), streaming: false })));
-            let c = carried(gemini, devin, &[], None, timeline_of(gemini, &long, &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
+            let c = carried(gemini, devin, &[], None, timeline_of(gemini, &long, &[], &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
             let Record::Words(text) = &c.record else { anyhow::bail!("not in words") };
             anyhow::ensure!(
                 c.dropped > 0 && text.len() < handoff::WORDS_BUDGET + 16 * 1024 && text.contains("the goal") && text.contains(&format!("{} older messages were left out", c.dropped)) && text.contains(&format!("[{} earlier message(s)", c.dropped)),
@@ -5104,8 +5115,70 @@ for line in sys.stdin:
                 text.len(),
                 c.dropped
             );
-            let c = carried(gemini, claude, &[], None, timeline_of(gemini, &long, &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
+            let c = carried(gemini, claude, &[], None, timeline_of(gemini, &long, &[], &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(c.dropped == 0, "{} left out of Claude Code's", c.dropped);
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: ACP shows startup input before handing it over. A switch or move carries the
+    /// genuine conversation as history and the unsent input only in its durable queue.
+    #[test]
+    fn cp_t3_2_shown_queued_input_is_not_carried_as_conversation_and_sent_again() -> anyhow::Result<()> {
+        use super::super::handoff::Entry;
+        use super::super::model::{Body, Delivery};
+        crate::rt::block_on(async {
+            let source = Kind::get("devin").ok_or_else(|| anyhow::anyhow!("no source harness"))?;
+            let mut core = Core::new();
+            core.state.cwd = "/work".into();
+            core.upsert("past", None, Body::User { text: "past-request".into(), images: 0, client_id: Some("past".into()), origin: None, attachments: Vec::new(), reply_to: None });
+            core.upsert("answer", None, Body::Assistant { text: "past-answer".into(), streaming: false });
+            // A harness's own queued label doesn't make already handed input kiln's queued input.
+            core.state.delivery.insert("past".into(), Delivery::Queued);
+            let mut before = source.adapter(&Spec { kind: source.id.into(), ..Spec::default() });
+            before.start(&mut core);
+            before.command(&mut core, Command::Send { id: "pending".into(), text: "pending-only".into(), mode: super::super::model::SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None });
+            assert!(core.get("pending").is_some());
+            assert_eq!(core.state.delivery.get("pending"), Some(&Delivery::Queued));
+            let timeline = timeline_of(source, core.events(), &core.state.todos, &core.state.queue).ok_or_else(|| anyhow::anyhow!("no carried timeline"))?;
+            assert_eq!(timeline.entries, [Entry::User { text: "past-request".into(), images: Vec::new() }, Entry::Assistant("past-answer".into())]);
+            for destination in ["claude", "codex", "antigravity"] {
+                let to = Kind::get(destination).ok_or_else(|| anyhow::anyhow!("no {destination}"))?;
+                let carried = carried(source, to, &[], None, Some(timeline.clone()), "/work", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
+                let history = match carried.record {
+                    Record::Claude { records, .. } => serde_json::to_string(&records)?,
+                    Record::Codex(items) => serde_json::to_string(&items)?,
+                    Record::Words(text) => text,
+                    Record::Nothing => anyhow::bail!("{destination} lost the sent conversation"),
+                };
+                anyhow::ensure!(history.contains("past-request") && history.contains("past-answer") && !history.contains("pending-only"), "{destination} carried queued input as history: {history}");
+            }
+            let history: Vec<_> = handed_events(core.events(), &core.state.queue).into_iter().cloned().collect();
+            for carry in [super::super::moving::words(&history, "handover"), super::super::moving::record(&source.protocol, &[], None, &history, "move").map_err(anyhow::Error::msg)?] {
+                let super::super::moving::Carry::Words { text } = carry else { anyhow::bail!("moving lost the sent conversation") };
+                anyhow::ensure!(text.contains("past-request") && text.contains("past-answer") && !text.contains("pending-only"), "moving carried queued input as history: {text}");
+            }
+            assert_eq!(core.state.queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), ["pending"]);
+            assert!(core.get("pending").is_some(), "carrying changed the displayed timeline");
+            before.exited(&mut core, None, None);
+            core.take_writes();
+            core.state.exit = None;
+            core.set_status(Status::Starting);
+            let destination = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no destination harness"))?;
+            let mut after = destination.adapter(&Spec { kind: destination.id.into(), ..Spec::default() });
+            after.start(&mut core);
+            let writes = core.take_writes().iter().map(|line| serde_json::from_str::<serde_json::Value>(line)).collect::<Result<Vec<_>, _>>()?;
+            let initialize = writes.iter().find(|v| v.pointer("/request/subtype").and_then(serde_json::Value::as_str) == Some("initialize")).ok_or_else(|| anyhow::anyhow!("no Claude initialization"))?;
+            after.line(&mut core, &serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": initialize.get("request_id"), "response": {}}}).to_string());
+            let writes = core.take_writes().iter().map(|line| serde_json::from_str::<serde_json::Value>(line)).collect::<Result<Vec<_>, _>>()?;
+            let prompts: Vec<_> = writes.iter().filter(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("user")).collect();
+            assert_eq!(prompts.len(), 1);
+            assert_eq!(prompts.first().and_then(|v| v.get("uuid")), Some(&serde_json::json!("pending")));
+            assert_eq!(prompts.first().and_then(|v| v.pointer("/message/content")), Some(&serde_json::json!("pending-only")));
+            assert!(core.state.queue.is_empty());
+            after.drain(&mut core);
+            after.tick(&mut core);
+            assert!(!core.take_writes().iter().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).any(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("user")), "queued input was sent twice");
             Ok(())
         })
     }

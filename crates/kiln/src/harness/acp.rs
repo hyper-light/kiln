@@ -117,9 +117,13 @@ pub struct Acp {
     /// Devin's injected prompts share the original turn's result and usage.
     #[serde(default)]
     prompt_result: Option<Value>,
+    /// CP-T3.2: a cancel notification ends only when every prompt in that turn has answered.
+    #[serde(default)]
+    cancelling: bool,
     #[serde(default)]
     steering: Option<bool>,
-    /// Messages to send once the session exists or the turn has been cancelled.
+    /// Legacy buffered messages, adopted into kiln's durable queue before doing more work
+    /// (CP-T3.2). New messages wait in `Core::state.queue`, never only in this adapter.
     waiting: Vec<QueueItem>,
     can_load: bool,
     /// The agent takes images in prompts.
@@ -168,6 +172,10 @@ pub struct Acp {
     /// Older images handed over sessions that were already open.
     #[serde(default = "ready")]
     ready: bool,
+    /// A startup request refused while the process still lives; a sign-in can retry it, while
+    /// Restart replaces the process. None once it exits (CP-T3.2).
+    #[serde(default)]
+    startup_refusal: Option<Pending>,
     #[serde(default)]
     replaying: bool,
     /// Its account can be managed through kiln's existing account card.
@@ -238,6 +246,7 @@ impl Acp {
             resume,
             prompting: None,
             prompt_result: None,
+            cancelling: false,
             steering: None,
             waiting: Vec::new(),
             can_load: false,
@@ -261,6 +270,7 @@ impl Acp {
             applying: None,
             failed_setting: None,
             ready: false,
+            startup_refusal: None,
             replaying: false,
             account: false,
             refresh: false,
@@ -332,6 +342,53 @@ impl Acp {
         core.settle_status(self.prompting.is_some());
     }
 
+    /// CP-T3.2: adopt an older image's startup/cancel buffer once. The durable queue's copy may
+    /// have been edited; a message already sent or taken back must never be brought back.
+    fn restore_waiting(&mut self, core: &mut Core) -> bool {
+        if self.waiting.is_empty() {
+            return false;
+        }
+        for m in std::mem::take(&mut self.waiting).into_iter().rev() {
+            if core.state.delivery.get(&m.id).is_some_and(|d| matches!(d, Delivery::Sent | Delivery::Started | Delivery::Completed | Delivery::Cancelled) || (*d == Delivery::Queued && core.get(&m.id).is_none())) {
+                core.state.queue.retain(|q| q.id != m.id);
+                continue;
+            }
+            let m = match core.state.queue.iter().position(|q| q.id == m.id) {
+                Some(pos) => core.state.queue.remove(pos),
+                None => m,
+            };
+            core.state.queue.retain(|q| q.id != m.id);
+            self.show(core, &m, Delivery::Queued);
+            core.state.queue.insert(0, m);
+        }
+        core.touch_state();
+        true
+    }
+
+    /// Waiting input is durable, and is shown queued until the harness actually gets it.
+    fn queue(&mut self, core: &mut Core, m: QueueItem, first: bool) {
+        self.show(core, &m, Delivery::Queued);
+        if first {
+            core.state.queue.insert(0, m);
+        } else {
+            core.state.queue.push(m);
+        }
+        core.touch_state();
+    }
+
+    /// CP-T3.2: startup can fail while the ACP process stays alive. Leave its durable input
+    /// queued and expose the same restartable state as a process that could not start.
+    fn startup_failed(&mut self, core: &mut Core, request: Pending, text: String) {
+        self.ready = false;
+        self.startup_refusal = Some(request);
+        self.replaying = false;
+        self.notice(core, Level::Error, text.clone());
+        core.state.exit = Some(ExitInfo::now(None, Some(text)));
+        core.state.doing = None;
+        core.set_status(Status::Exited);
+        core.touch_state();
+    }
+
     /// The streamed message or thought stops growing (a tool call or the turn's end came).
     fn close_streams(&mut self, core: &mut Core) {
         for id in [self.cur_agent.take(), self.cur_thought.take(), self.cur_user.take()].into_iter().flatten() {
@@ -345,6 +402,7 @@ impl Acp {
     }
 
     pub fn start(&mut self, core: &mut Core) {
+        self.restore_waiting(core);
         self.replaying = self.resume.is_some() && core.events().any(|e| matches!(e.body, Body::User { .. } | Body::Assistant { .. }));
         core.meta.features = FEATURES.iter().map(|s| (*s).to_owned()).collect();
         core.touch_meta();
@@ -382,6 +440,9 @@ impl Acp {
     }
 
     pub fn tick(&mut self, core: &mut Core) {
+        if self.restore_waiting(core) {
+            self.next(core);
+        }
         if self.account && self.steering.is_none() && self.session.is_some() && !self.pending.values().any(|p| matches!(p, Pending::Initialize)) && core.state.status != Status::Exited {
             // Older images did not retain this capability; initialize leaves Devin's session intact.
             self.steering = Some(false);
@@ -390,9 +451,12 @@ impl Acp {
     }
 
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
+        self.restore_waiting(core);
         self.close_streams(core);
         self.prompting = None;
         self.prompt_result = None;
+        self.cancelling = false;
+        self.startup_refusal = None;
         self.pending.clear();
         self.asks.clear();
         self.held_asks.clear();
@@ -409,6 +473,8 @@ impl Acp {
     // ------------------------------------------------------------------ commands
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
+        self.restore_waiting(core);
+        core.shown_queued(&cmd);
         match cmd {
             Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => {
                 // Its go-back is kiln's (`harness::goback`): a checkpoint anchors the prompt's
@@ -464,7 +530,7 @@ impl Acp {
                 core.reply(client, json!({"title": "Conversation", "text": core.export(), "format": "markdown", "filename": "conversation.md"}));
             }
             Command::Control { id, .. } if id == "account" && self.account => {
-                if core.state.status != Status::Exited {
+                if core.state.status != Status::Exited || self.startup_refusal.is_some() {
                     self.refresh = true;
                     self.next(core);
                 }
@@ -517,10 +583,19 @@ impl Acp {
         if !self.refresh {
             return false;
         }
-        if self.busy(core) || core.state.status == Status::Exited {
+        if self.busy(core) || (core.state.status == Status::Exited && self.startup_refusal.is_none()) {
             return true;
         }
         self.refresh = false;
+        if let Some(refused) = self.startup_refusal.take() {
+            core.state.exit = None;
+            core.set_status(Status::Starting);
+            core.touch_state();
+            if matches!(refused, Pending::Initialize) {
+                self.initialize(core, Pending::Initialize);
+                return true;
+            }
+        }
         if self.ready && self.startup_mode.is_none() && !core.state.mode.is_empty() && core.state.mode != KILN_ASK && core.state.mode != KILN_BYPASS {
             self.startup_mode = Some(core.state.mode.clone());
         }
@@ -858,6 +933,7 @@ impl Acp {
         if self.prompting.is_none() {
             return;
         }
+        self.cancelling = true;
         Self::notify(core, "session/cancel", json!({"sessionId": s}));
         // Pending permission requests are answered "cancelled", as the protocol asks.
         for (id, ask) in std::mem::take(&mut self.asks) {
@@ -878,21 +954,28 @@ impl Acp {
             core.state.goal = clip_middle(&m.text, 600).0;
         }
         if !self.ready || self.session.is_none() {
-            self.show(core, &m, Delivery::Queued);
-            self.waiting.push(m);
+            self.queue(core, m, false);
             return;
         }
         if self.busy(core) {
-            if mode == SendMode::Steer && self.steering == Some(true) && self.prompting.is_some() && self.prompt_result.is_none() {
+            if mode == SendMode::Steer && self.steering == Some(true) && self.prompting.is_some() && self.prompt_result.is_none() && !self.cancelling {
                 self.prompt(core, m);
             } else if mode == SendMode::Now {
-                self.show(core, &m, Delivery::Queued);
-                self.waiting.insert(0, m);
+                self.queue(core, m, true);
                 self.cancel(core);
+            } else if self.cancelling {
+                // CP-T3.2: injecting into the turn being cancelled could lose this message.
+                self.queue(core, m, false);
             } else {
                 core.state.queue.push(m);
                 core.touch_state();
             }
+            return;
+        }
+        if mode == SendMode::Queue && !core.state.queue.is_empty() {
+            core.state.queue.push(m);
+            core.touch_state();
+            self.next(core);
             return;
         }
         self.prompt(core, m);
@@ -938,12 +1021,15 @@ impl Acp {
     fn show(&mut self, core: &mut Core, m: &QueueItem, d: Delivery) {
         core.state.delivery.insert(m.id.clone(), d);
         let (images, names) = super::model::attachment_summary(&m.attachments);
-        core.note_sent(&m.id, &m.text);
+        if d != Delivery::Queued {
+            core.note_sent(&m.id, &m.text);
+        }
         core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
         core.touch_state();
     }
 
     pub(crate) fn next(&mut self, core: &mut Core) {
+        self.restore_waiting(core);
         if self.account_refresh(core) {
             return;
         }
@@ -954,13 +1040,10 @@ impl Acp {
             return;
         }
         // A pause (or a switch) holds what waits, and the stop point may start one here.
-        if (!self.waiting.is_empty() || !core.state.queue.is_empty()) && !super::pause::open(core) {
+        if !core.state.queue.is_empty() && !super::pause::open(core) {
             return;
         }
-        if !self.waiting.is_empty() {
-            let m = self.waiting.remove(0);
-            self.prompt(core, m);
-        } else if !core.state.queue.is_empty() {
+        if !core.state.queue.is_empty() {
             let item = core.state.queue.remove(0);
             core.touch_state();
             let id = item.id.clone();
@@ -1029,8 +1112,7 @@ impl Acp {
             && let Some(f) = message.filter(|m| !m.trim().is_empty())
         {
             let m = QueueItem { id: crate::util::new_id(), text: f, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None };
-            self.show(core, &m, Delivery::Queued);
-            self.waiting.insert(0, m);
+            self.queue(core, m, true);
         }
         self.settle(core);
         if self.refresh {
@@ -1164,6 +1246,7 @@ impl Acp {
     // ------------------------------------------------------------------ stdout
 
     pub fn line(&mut self, core: &mut Core, line: &str) {
+        self.restore_waiting(core);
         let line = line.trim();
         if line.is_empty() {
             return;
@@ -1211,6 +1294,7 @@ impl Acp {
             if self.pending.values().any(|p| matches!(p, Pending::Prompt(_))) {
                 return;
             }
+            self.cancelling = false;
             response = self.prompt_result.take().unwrap_or_else(|| v.clone());
             &response
         } else {
@@ -1240,8 +1324,7 @@ impl Acp {
                 }
                 Pending::Session => {
                     let hint = if msg.to_lowercase().contains("auth") { " (sign in to it in a terminal on this machine first)" } else { "" };
-                    self.notice(core, Level::Error, format!("The agent could not open a session: {msg}{hint}"));
-                    core.set_status(Status::Idle);
+                    self.startup_failed(core, Pending::Session, format!("The agent could not open a session: {msg}{hint}"));
                 }
                 Pending::Refresh if self.empty && err.get("code").and_then(Value::as_i64) == Some(-32016) => {
                     self.session = None;
@@ -1255,7 +1338,7 @@ impl Acp {
                     self.notice(core, Level::Error, format!("The agent could not reload its account: {msg}. Sign in again to retry."));
                     core.set_status(Status::Idle);
                 }
-                Pending::Initialize => self.notice(core, Level::Error, format!("The agent did not start: {msg}")),
+                Pending::Initialize => self.startup_failed(core, Pending::Initialize, format!("The agent did not start: {msg}")),
                 Pending::Capabilities => {}
                 Pending::SetMode(_) => self.setting_failed(core, id, Some("mode"), &msg),
                 Pending::SetModel(_) => self.setting_failed(core, id, Some("model"), &msg),
@@ -1936,6 +2019,213 @@ mod tests {
         }
     }
 
+    fn acp_kinds() -> impl Iterator<Item = &'static str> {
+        super::super::kinds::Kind::all().iter().filter(|k| matches!(k.protocol, super::super::kinds::Protocol::Acp(_))).map(|k| k.id)
+    }
+
+    fn request(core: &mut Core, method: &str) -> anyhow::Result<Value> {
+        let mut requests = written(core).into_iter().filter(|v| v.get("method").and_then(Value::as_str) == Some(method));
+        let request = requests.next().ok_or_else(|| anyhow::anyhow!("no {method} request"))?;
+        anyhow::ensure!(requests.next().is_none(), "more than one {method} request");
+        Ok(request)
+    }
+
+    /// CP-T3.2: every ACP profile (Devin included) keeps accepted startup input in the state
+    /// saved by the runner. Queue edits survive a crash, and each message is handed over once.
+    #[test]
+    fn cp_t3_2_startup_input_is_durable_for_every_acp_harness() -> anyhow::Result<()> {
+        for kind in acp_kinds() {
+            let spec = super::super::session::Spec { kind: kind.into(), ..Default::default() };
+            let mut core = Core::new();
+            let mut a = Acp::from_spec(&spec);
+            a.start(&mut core);
+            let attachments = vec![super::super::model::Attachment { name: "notes.txt".into(), mime: "text/plain".into(), data_base64: String::new(), file_id: None, path: Some("/work/notes.txt".into()) }];
+            let overrides = Some(super::super::model::Overrides { model: Some("chosen".into()), effort: Some("high".into()) });
+            a.command(&mut core, Command::Send { id: "news-first".into(), text: "original".into(), mode: SendMode::Queue, attachments: attachments.clone(), overrides: overrides.clone(), reply_to: Some("earlier".into()), task: None });
+            message(&mut a, &mut core, "removed", SendMode::Queue);
+            message(&mut a, &mut core, "second", SendMode::Steer);
+            a.command(&mut core, Command::QueueEdit { id: "news-first".into(), text: "edited".into(), attachments: None });
+            a.command(&mut core, Command::QueueRemove { id: "removed".into() });
+            assert!(a.waiting.is_empty(), "{kind} still holds input only in its adapter");
+            assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["news-first", "second"], "{kind}");
+            assert_eq!(core.state.delivery.get("removed"), Some(&Delivery::Cancelled), "{kind}");
+            assert!(core.state.given.is_empty(), "{kind} marked unsent startup input given");
+            // A sudden runner loss saves state, without first calling the adapter's exit hook.
+            let state = serde_json::from_value(serde_json::to_value(&core.state)?)?;
+            let mut restored = Core::new();
+            restored.restore(core.events().cloned().collect(), state);
+            let first = restored.state.queue.first().ok_or_else(|| anyhow::anyhow!("{kind} lost startup input"))?;
+            assert_eq!((&first.attachments, &first.overrides, first.reply_to.as_deref()), (&attachments, &overrides, Some("earlier")), "{kind}");
+            let mut a = Acp::from_spec(&spec);
+            a.start(&mut restored);
+            feed(&mut a, &mut restored, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"sessionId": "s1"}})]);
+            let prompt = request(&mut restored, "session/prompt")?;
+            assert_eq!(prompt.pointer("/params/prompt/0/text"), Some(&json!("edited")), "{kind}");
+            assert_eq!(prompt.pointer("/params/prompt/1/uri"), Some(&json!("file:///work/notes.txt")), "{kind}");
+            assert_eq!(restored.state.given.iter().filter(|m| m.id == "news-first").count(), 1, "{kind}");
+            assert_eq!(restored.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["second"], "{kind}");
+            feed(&mut a, &mut restored, &[json!({"id": prompt.get("id"), "result": {"stopReason": "end_turn"}})]);
+            let second = request(&mut restored, "session/prompt")?;
+            assert_eq!(second.pointer("/params/prompt/0/text"), Some(&json!("second")), "{kind}");
+            feed(&mut a, &mut restored, &[json!({"id": second.get("id"), "result": {"stopReason": "end_turn"}})]);
+            a.room(&mut restored);
+            a.tick(&mut restored);
+            assert!(!written(&mut restored).iter().any(|v| v.get("method") == Some(&json!("session/prompt"))), "{kind} sent an extra copy");
+            assert!(restored.state.queue.is_empty(), "{kind}");
+            for id in ["news-first", "second"] {
+                assert_eq!(restored.state.delivery.get(id), Some(&Delivery::Completed), "{kind}: {id}");
+                assert_eq!(restored.events().filter(|e| matches!(&e.body, Body::User { client_id: Some(client), .. } if client == id)).count(), 1, "{kind}: {id}");
+            }
+        }
+        Ok(())
+    }
+
+    /// CP-T3.2: an in-place upgrade takes an older adapter's private buffer into the durable
+    /// queue once. Its edited copy wins, removals work immediately, and sent input never returns.
+    #[test]
+    fn cp_t3_2_legacy_startup_buffers_honor_queue_edits_and_removals_once() -> anyhow::Result<()> {
+        for kind in acp_kinds() {
+            let mut a = Acp::from_spec(&super::super::session::Spec { kind: kind.into(), ..Default::default() });
+            let mut core = Core::new();
+            a.start(&mut core);
+            let item = |id: &str| QueueItem { id: id.into(), text: id.into(), at: 1, attachments: vec![], overrides: None, reply_to: None };
+            let legacy = vec![item("first"), item("removed"), item("cancelled"), item("already-sent")];
+            for m in &legacy {
+                a.show(&mut core, m, Delivery::Queued);
+            }
+            core.state.delivery.insert("cancelled".into(), Delivery::Cancelled);
+            core.state.delivery.insert("already-sent".into(), Delivery::Started);
+            core.state.queue.push(QueueItem { text: "durable edit".into(), reply_to: Some("earlier".into()), ..item("first") });
+            core.state.queue.push(item("cancelled"));
+            core.state.queue.push(item("already-sent"));
+            core.state.queue.push(item("later"));
+            let mut frozen = serde_json::to_value(&a)?;
+            let state = frozen.as_object_mut().ok_or_else(|| anyhow::anyhow!("{kind} adapter is not an object"))?;
+            state.insert("waiting".into(), serde_json::to_value(legacy)?);
+            let mut a: Acp = serde_json::from_value(frozen)?;
+            a.command(&mut core, Command::QueueRemove { id: "removed".into() });
+            a.command(&mut core, Command::QueueEdit { id: "first".into(), text: "latest edit".into(), attachments: None });
+            assert!(a.waiting.is_empty(), "{kind}");
+            assert_eq!(core.state.queue.iter().map(|m| (m.id.as_str(), m.text.as_str())).collect::<Vec<_>>(), [("first", "latest edit"), ("later", "later")], "{kind}");
+            assert_eq!(core.state.queue.first().and_then(|m| m.reply_to.as_deref()), Some("earlier"), "{kind}");
+            assert_eq!(core.state.delivery.get("removed"), Some(&Delivery::Cancelled), "{kind}");
+            a.tick(&mut core);
+            feed(&mut a, &mut core, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"sessionId": "s1"}})]);
+            let first = request(&mut core, "session/prompt")?;
+            assert_eq!(first.pointer("/params/prompt/0/text"), Some(&json!("latest edit")), "{kind}");
+            a.tick(&mut core);
+            a.room(&mut core);
+            assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("session/prompt"))), "{kind} duplicated adopted input");
+            feed(&mut a, &mut core, &[json!({"id": first.get("id"), "result": {"stopReason": "end_turn"}})]);
+            assert_eq!(request(&mut core, "session/prompt")?.pointer("/params/prompt/0/text"), Some(&json!("later")), "{kind}");
+        }
+        Ok(())
+    }
+
+    /// CP-T3.2: initialize, new-session and resumed-session refusals leave all accepted input
+    /// durable and put the live process in a restartable state, across every ACP profile.
+    #[test]
+    fn cp_t3_2_startup_refusals_keep_every_acp_harness_restartable() -> anyhow::Result<()> {
+        for kind in acp_kinds() {
+            for stage in ["initialize", "session/new", "session/load"] {
+                let spec = super::super::session::Spec { kind: kind.into(), resume: (stage == "session/load").then(|| "saved".into()), ..Default::default() };
+                let mut a = Acp::from_spec(&spec);
+                let mut core = Core::new();
+                a.start(&mut core);
+                message(&mut a, &mut core, "first", SendMode::Queue);
+                message(&mut a, &mut core, "second", SendMode::Steer);
+                let init = request(&mut core, "initialize")?;
+                let failed = if stage == "initialize" {
+                    init
+                } else {
+                    feed(&mut a, &mut core, &[json!({"id": init.get("id"), "result": {"agentCapabilities": {"loadSession": true}}})]);
+                    request(&mut core, stage)?
+                };
+                feed(&mut a, &mut core, &[json!({"id": failed.get("id"), "error": {"code": -32000, "message": "startup refused"}})]);
+                assert_eq!(core.state.status, Status::Exited, "{kind}: {stage}");
+                assert!(core.state.exit.as_ref().and_then(|e| e.error.as_deref()).is_some_and(|e| e.contains("startup refused")), "{kind}: {stage}");
+                assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["first", "second"], "{kind}: {stage}");
+                a.room(&mut core);
+                a.tick(&mut core);
+                assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("session/prompt"))), "{kind}: {stage}");
+                a.exited(&mut core, None, None);
+                core.state.exit = None;
+                core.set_status(Status::Starting);
+                let mut a = Acp::from_spec(&spec);
+                a.start(&mut core);
+                feed(&mut a, &mut core, &[json!({"id": 1, "result": {"agentCapabilities": {"loadSession": true}}}), json!({"id": 2, "result": {"sessionId": "s1"}})]);
+                assert_eq!(request(&mut core, "session/prompt")?.pointer("/params/prompt/0/text"), Some(&json!("first")), "{kind}: {stage}");
+                assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["second"], "{kind}: {stage}");
+            }
+        }
+        Ok(())
+    }
+
+    /// CP-T3.2: making a live startup refusal restartable must keep Devin's existing sign-in
+    /// retry working too. A rejected initialize is repeated before opening the session.
+    #[test]
+    fn cp_t3_2_devin_sign_in_retries_a_live_initialize_refusal_with_its_original_input() -> anyhow::Result<()> {
+        let mut a = Acp::from_spec(&super::super::session::Spec { kind: "devin".into(), ..Default::default() });
+        let mut core = Core::new();
+        a.start(&mut core);
+        message(&mut a, &mut core, "first", SendMode::Queue);
+        let init = request(&mut core, "initialize")?;
+        feed(&mut a, &mut core, &[json!({"id": init.get("id"), "error": {"message": "authentication required"}})]);
+        assert_eq!(core.state.status, Status::Exited);
+        a.command(&mut core, Command::Control { id: "account".into(), value: None });
+        let init = request(&mut core, "initialize")?;
+        assert!(core.state.exit.is_none());
+        feed(&mut a, &mut core, &[json!({"id": init.get("id"), "result": {}})]);
+        let session = request(&mut core, "session/new")?;
+        feed(&mut a, &mut core, &[json!({"id": session.get("id"), "result": {"sessionId": "s1"}})]);
+        assert_eq!(request(&mut core, "session/prompt")?.pointer("/params/prompt/0/text"), Some(&json!("first")));
+        assert!(core.state.queue.is_empty() && a.startup_refusal.is_none());
+        a.exited(&mut core, Some(1), None);
+        a.command(&mut core, Command::Control { id: "account".into(), value: None });
+        assert!(written(&mut core).is_empty(), "a dead process cannot reload its account");
+        Ok(())
+    }
+
+    /// CP-T3.2: a Send Now held while cancellation is outstanding survives the old process
+    /// ending; the next process receives it first, followed by ordinary queued input once.
+    #[test]
+    fn cp_t3_2_cancelled_turn_holds_are_durable_for_every_acp_harness() -> anyhow::Result<()> {
+        for kind in acp_kinds() {
+            let spec = super::super::session::Spec { kind: kind.into(), ..Default::default() };
+            let mut a = Acp::from_spec(&spec);
+            let mut core = Core::new();
+            a.start(&mut core);
+            feed(&mut a, &mut core, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"sessionId": "s1"}})]);
+            message(&mut a, &mut core, "main", SendMode::Queue);
+            core.take_writes();
+            message(&mut a, &mut core, "later", SendMode::Queue);
+            message(&mut a, &mut core, "now", SendMode::Now);
+            assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["now", "later"], "{kind}");
+            assert!(a.waiting.is_empty(), "{kind}");
+            assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("session/cancel"))), "{kind}");
+            let mut adapter = super::super::kinds::Adapter::Acp(Box::new(a));
+            adapter.exited(&mut core, Some(1), None);
+            assert_eq!(core.state.delivery.get("main"), Some(&Delivery::Cancelled), "{kind}");
+            let state = serde_json::from_value(serde_json::to_value(&core.state)?)?;
+            let mut restored = Core::new();
+            restored.restore(core.events().cloned().collect(), state);
+            restored.state.exit = None;
+            restored.set_status(Status::Starting);
+            let mut a = Acp::from_spec(&spec);
+            a.start(&mut restored);
+            feed(&mut a, &mut restored, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"sessionId": "s2"}})]);
+            let now = request(&mut restored, "session/prompt")?;
+            assert_eq!(now.pointer("/params/prompt/0/text"), Some(&json!("now")), "{kind}");
+            feed(&mut a, &mut restored, &[json!({"id": now.get("id"), "result": {"stopReason": "end_turn"}})]);
+            let later = request(&mut restored, "session/prompt")?;
+            assert_eq!(later.pointer("/params/prompt/0/text"), Some(&json!("later")), "{kind}");
+            feed(&mut a, &mut restored, &[json!({"id": later.get("id"), "result": {"stopReason": "end_turn"}})]);
+            a.room(&mut restored);
+            assert!(!written(&mut restored).iter().any(|v| v.get("method") == Some(&json!("session/prompt"))), "{kind}");
+        }
+        Ok(())
+    }
+
     /// kiln offers ACP's session compaction: a compaction the agent reports is under way until it
     /// says how it ended (claude-agent-acp's `_meta.contextCompaction` saying more); Devin's own
     /// `/compact`, which it says nothing else of, for its turn.
@@ -2413,6 +2703,81 @@ mod tests {
         assert_eq!(written(&mut core).iter().filter_map(|v| v.pointer("/params/prompt/0/text").and_then(Value::as_str)).collect::<Vec<_>>(), ["now"]);
     }
 
+    /// CP-T3.2: steering sent after a cancel belongs to the next turn, behind a pending Now,
+    /// even when the old shared turn's replies arrive separately or an upgrade happens between.
+    #[test]
+    fn cp_t3_2_devin_queues_steering_after_cancel_until_the_shared_turn_ends() -> anyhow::Result<()> {
+        for now in [false, true] {
+            for replies in [[3, 4], [4, 3]] {
+                let (mut a, mut core) = steering_session(Some(json!(true)), true);
+                message(&mut a, &mut core, "main", SendMode::Queue);
+                message(&mut a, &mut core, "old-steer", SendMode::Steer);
+                core.take_writes();
+                message(&mut a, &mut core, "waiting", SendMode::Queue);
+                if now {
+                    message(&mut a, &mut core, "now", SendMode::Now);
+                } else {
+                    a.command(&mut core, Command::Interrupt);
+                }
+                let cancel = written(&mut core);
+                assert_eq!(cancel.iter().filter_map(|v| v.get("method").and_then(Value::as_str)).collect::<Vec<_>>(), ["session/cancel"]);
+                message(&mut a, &mut core, "after-cancel", SendMode::Steer);
+                message(&mut a, &mut core, "after-cancel-2", SendMode::Steer);
+                let mut queued = vec!["waiting", "after-cancel", "after-cancel-2"];
+                if now {
+                    queued.insert(0, "now");
+                }
+                assert_eq!(core.state.queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), queued);
+                assert!(written(&mut core).is_empty(), "steering entered the cancelled turn");
+                for id in ["after-cancel", "after-cancel-2"] {
+                    assert_eq!(core.state.delivery.get(id), Some(&Delivery::Queued));
+                }
+                a = serde_json::from_value(serde_json::to_value(&a)?)?;
+                for (i, id) in replies.into_iter().enumerate() {
+                    feed(&mut a, &mut core, &[json!({"id": id, "result": {"stopReason": "cancelled"}})]);
+                    if i == 0 {
+                        message(&mut a, &mut core, "between-replies", SendMode::Steer);
+                        queued.push("between-replies");
+                        assert_eq!(core.state.queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), queued);
+                        assert_eq!(core.state.delivery.get("between-replies"), Some(&Delivery::Queued));
+                        assert!(written(&mut core).is_empty(), "a partial cancellation delivered new input");
+                    }
+                }
+                assert_eq!(core.state.delivery.get("main"), Some(&Delivery::Cancelled));
+                assert_eq!(core.state.delivery.get("old-steer"), Some(&Delivery::Cancelled));
+                let mut received = Vec::new();
+                for expected in &queued {
+                    let prompt = request(&mut core, "session/prompt")?;
+                    let text = prompt.pointer("/params/prompt/0/text").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no prompt text: {prompt}"))?;
+                    assert_eq!(text, *expected);
+                    received.push(text.to_owned());
+                    assert_eq!(core.state.delivery.get(*expected), Some(&Delivery::Started));
+                    a.room(&mut core);
+                    a.tick(&mut core);
+                    assert!(written(&mut core).is_empty(), "queued input was injected into the next turn");
+                    feed(&mut a, &mut core, &[json!({"id": prompt.get("id"), "result": {"stopReason": "end_turn"}})]);
+                }
+                assert_eq!(received, queued);
+                assert!(core.state.queue.is_empty());
+                for id in &queued {
+                    assert_eq!(core.state.delivery.get(*id), Some(&Delivery::Completed));
+                    assert_eq!(core.events().filter(|e| matches!(&e.body, Body::User { client_id: Some(client), .. } if client.as_str() == *id)).count(), 1);
+                }
+                a.room(&mut core);
+                a.tick(&mut core);
+                assert!(written(&mut core).is_empty(), "a delivered message was sent again");
+                // Cancellation no longer blocks steering once a fresh turn starts.
+                message(&mut a, &mut core, "fresh", SendMode::Queue);
+                message(&mut a, &mut core, "fresh-steer", SendMode::Steer);
+                assert_eq!(written(&mut core).iter().filter_map(|v| v.pointer("/params/prompt/0/text").and_then(Value::as_str)).collect::<Vec<_>>(), ["fresh", "fresh-steer"]);
+                a.command(&mut core, Command::Interrupt);
+                a.exited(&mut core, None, None);
+                assert!(!a.cancelling, "an ended process kept its cancellation hold");
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn adopted_devin_sessions_learn_steering_once_without_reopening_or_interrupting() -> anyhow::Result<()> {
         for busy in [false, true] {
@@ -2425,6 +2790,7 @@ mod tests {
             let object = frozen.as_object_mut().ok_or_else(|| anyhow::anyhow!("the frozen adapter is not an object"))?;
             object.remove("steering");
             object.remove("prompt_result");
+            object.remove("cancelling");
             let mut a: Acp = serde_json::from_value(frozen)?;
             let started = core.state.turn_started;
             a.tick(&mut core);
