@@ -377,12 +377,16 @@ impl Owner {
                 }
                 NARROW => cap = cap.min(u128::from(p) * u128::from(class_hi(c.at).min(u64::from(u32::MAX)))),
                 o => {
-                    let v = match o {
-                        DISK => t.io_bytes,
-                        LINK => t.bytes,
-                        _ => t.net_bytes,
+                    let (v, prior) = match o {
+                        DISK => (t.io_bytes, self.prior.disk),
+                        LINK => (t.bytes, self.prior.link),
+                        _ => (t.net_bytes, self.prior.net),
                     };
-                    tau = tau.saturating_add(mul_q32(u128::from(v), per_byte_q32(class_hi(c.at))));
+                    // W24-R18: one observed multiplier is also every unknown's exact prior.
+                    // Its bound avoids a whole class walk when rounding the class alone loses
+                    // enough of a tiny term to miss the 1/64 stopping rule.
+                    let q = per_byte_q32(class_hi(c.at)).max(prior.lower_q32());
+                    tau = tau.saturating_add(mul_q32(u128::from(v), q));
                 }
             }
         }
@@ -549,6 +553,13 @@ impl Mean {
     /// The mean multiplier (0: none measured).
     pub(crate) fn q32(self) -> u64 {
         self.sum.checked_div(u128::from(self.n)).map_or(0, |m| u64::try_from(m).unwrap_or(u64::MAX))
+    }
+
+    /// A lower bound on every effective multiplier, including unknowns taking the prior.
+    /// With one observation they all equal it. With several, the mean does not bound the
+    /// fastest observation from below, so only zero follows from this aggregate (W24-R18).
+    pub(crate) fn lower_q32(self) -> u64 {
+        if self.n == 1 { u64::try_from(self.sum).unwrap_or(u64::MAX) } else { 0 }
     }
 
     /// `rate` if it was measured, else the rate the mean multiplier is, bytes a second (0: none).
