@@ -385,7 +385,14 @@ struct Slot {
     run: Handle,
 }
 
-const EMPTY: Slot = Slot { runner: u32::MAX, at: Handle::NONE, run: Handle::NONE };
+/// The part of a slot's record a release reads last: its run's handle at its runner, and the
+/// run's generation at the owner. Sixteen bytes, four to a line, none across two.
+#[derive(Clone, Copy)]
+#[repr(align(16))]
+struct Rest {
+    at: Handle,
+    generation: u32,
+}
 
 #[derive(Clone)]
 struct Kiln {
@@ -393,7 +400,14 @@ struct Kiln {
     runners: Vec<Runner>,
     sig: SigId,
     need: Amounts,
-    slots: Vec<Slot>,
+    /// Each slot's record ([`Slot`]), in three parts by how soon a release reads them (W05-R26).
+    /// Its runner, and its run's slot at the owner, say where the runner's and the owner's own
+    /// records are: each is kept dense (sixteen slots to a 64-byte line, so a line is read again
+    /// four times sooner than a 20-byte record's and is likelier still near), and those records
+    /// are on their way while the rest of the slot's record is still being read.
+    slot_runner: Vec<u32>,
+    slot_run: Vec<u32>,
+    slot_rest: Vec<Rest>,
     out: Out,
     rout: RunnerOut,
     starts: Vec<(RunnerId, Start)>,
@@ -429,7 +443,8 @@ impl Kiln {
             owner.add(sig, RunnerId(i), &mut out);
         }
         let cpu = if d == 1 { u32::try_from(need[0]).ok() } else { None };
-        Kiln { owner, runners, sig, need, slots: vec![EMPTY; slots], out, rout: RunnerOut::new(), starts: Vec::new(), waits: Vec::new(), stage: Vec::new(), words: Vec::new(), admits: Vec::new(), waited: 0, cpu }
+        let rest = Rest { at: Handle::NONE, generation: 0 };
+        Kiln { owner, runners, sig, need, slot_runner: vec![u32::MAX; slots], slot_run: vec![u32::MAX; slots], slot_rest: vec![rest; slots], out, rout: RunnerOut::new(), starts: Vec::new(), waits: Vec::new(), stage: Vec::new(), words: Vec::new(), admits: Vec::new(), waited: 0, cpu }
     }
 
     /// Carries whatever else was said, until nothing is (nothing is, in this workload).
@@ -453,11 +468,30 @@ impl Kiln {
         }
     }
 
+    /// Slot `s`'s whole record.
+    #[inline(always)]
+    fn slot(&self, s: u32) -> Option<Slot> {
+        let i = s as usize;
+        let (runner, run, rest) = (*self.slot_runner.get(i)?, *self.slot_run.get(i)?, self.slot_rest.get(i)?);
+        Some(Slot { runner, at: rest.at, run: Handle { slot: run, generation: rest.generation } })
+    }
+
+    /// Slot `s` holds this run now.
+    #[inline(always)]
+    fn set_slot(&mut self, s: u32, slot: Slot) {
+        let i = s as usize;
+        if let (Some(runner), Some(run), Some(rest)) = (self.slot_runner.get_mut(i), self.slot_run.get_mut(i), self.slot_rest.get_mut(i)) {
+            *runner = slot.runner;
+            *run = slot.run.slot;
+            *rest = Rest { at: slot.at, generation: slot.run.generation };
+        }
+    }
+
     /// A release through the kernel's fast entries (the run ends at its runner, its word reaches
     /// the owner); whatever they decline takes the general path whole.
     #[inline(always)]
     fn release_one(&mut self, s: u32) {
-        let Some(slot) = self.slots.get(s as usize) else { return };
+        let Some(slot) = self.slot(s) else { return };
         let Some(x) = self.runners.get_mut(slot.runner as usize) else { return };
         match x.end_fast(slot.at) {
             Some((_, b)) => {
@@ -474,7 +508,7 @@ impl Kiln {
     #[cold]
     #[inline(never)]
     fn release_cold_at(&mut self, s: u32) {
-        if let Some(slot) = self.slots.get(s as usize).copied() {
+        if let Some(slot) = self.slot(s) {
             self.release_cold(slot);
         }
     }
@@ -514,9 +548,7 @@ impl Kiln {
         if !self.owner.started_fast(r, run, at, b) {
             return self.started_cold(s, r, run, at);
         }
-        if let Some(y) = self.slots.get_mut(s as usize) {
-            *y = Slot { runner: r, at, run };
-        }
+        self.set_slot(s, Slot { runner: r, at, run });
         r as i32
     }
 
@@ -539,9 +571,7 @@ impl Kiln {
         if !(self.out.to.is_empty() && self.rout.is_empty()) {
             self.deliver();
         }
-        if let Some(y) = self.slots.get_mut(s as usize) {
-            *y = Slot { runner: r, at, run };
-        }
+        self.set_slot(s, Slot { runner: r, at, run });
         r as i32
     }
 
@@ -556,9 +586,7 @@ impl Kiln {
             self.deliver();
             return -1;
         }
-        if let Some(x) = self.slots.get_mut(s as usize) {
-            *x = Slot { runner: to.0, at, run };
-        }
+        self.set_slot(s, Slot { runner: to.0, at, run });
         to.0 as i32
     }
 }
@@ -641,7 +669,7 @@ fn kiln_many_release(k: &mut Kiln, slots: &[u32]) {
     // three passes of independent steps, whose cache misses overlap.
     let (mut stage, mut words) = (std::mem::take(&mut k.stage), std::mem::take(&mut k.words));
     stage.clear();
-    stage.extend(slots.iter().filter_map(|&s| k.slots.get(s as usize).copied()));
+    stage.extend(slots.iter().filter_map(|&s| k.slot(s)));
     words.clear();
     for slot in &stage {
         let Some(x) = k.runners.get_mut(slot.runner as usize) else { continue };
@@ -685,8 +713,8 @@ fn kiln_many_pick(k: &mut Kiln, slots: &[u32], _keys: &[u64], out: &mut [i32]) {
     for &(ix, r, run, s, at, b) in &admits {
         if !k.owner.started_fast(r, run, at, b) {
             k.started_cold(s, r, run, at);
-        } else if let Some(y) = k.slots.get_mut(s as usize) {
-            *y = Slot { runner: r, at, run };
+        } else {
+            k.set_slot(s, Slot { runner: r, at, run });
         }
         if let Some(o) = out.get_mut(ix as usize) {
             *o = r as i32;
@@ -1307,7 +1335,7 @@ fn main() -> std::process::ExitCode {
         for &n in &a.ns {
             for &d in &a.ds {
                 match cold_sample(n, d) {
-                    Ok((build, first, measured, first_measured, first_byte)) => println!("{{\"commit\":\"{commit}\",\"n\":{n},\"d\":{d},\"build_ns\":{build},\"first_placement_ns\":{first},\"first_cpu_measure_ns\":{measured},\"first_measured_placement_ns\":{first_measured},\"first_byte_placement_ns\":{first_byte},\"runner_bytes\":{},\"owner_inline_bytes\":{},\"harness_slot_bytes\":{},\"scope\":\"fresh process/state; OS page cache uncontrolled\"}}", std::mem::size_of::<Runner>(), std::mem::size_of::<Owner>(), std::mem::size_of::<Slot>()),
+                    Ok((build, first, measured, first_measured, first_byte)) => println!("{{\"commit\":\"{commit}\",\"n\":{n},\"d\":{d},\"build_ns\":{build},\"first_placement_ns\":{first},\"first_cpu_measure_ns\":{measured},\"first_measured_placement_ns\":{first_measured},\"first_byte_placement_ns\":{first_byte},\"runner_bytes\":{},\"owner_inline_bytes\":{},\"harness_slot_bytes\":{},\"scope\":\"fresh process/state; OS page cache uncontrolled\"}}", std::mem::size_of::<Runner>(), std::mem::size_of::<Owner>(), 2 * std::mem::size_of::<u32>() + std::mem::size_of::<Rest>()),
                     Err(why) => { eprintln!("{why}"); return std::process::ExitCode::FAILURE; }
                 }
             }
