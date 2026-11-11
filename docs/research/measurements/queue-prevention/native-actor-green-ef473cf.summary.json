@@ -1,0 +1,55 @@
+{
+  "binary_sha256": "9f997ec839747abf3768300a1ff10b480b4fef00ead158671aa03ecca96737fa",
+  "source_receipt_sha256": "ac08aaf480a5b28573b630343be9a2ba493e439749a0e6f109b4033edce0dc91",
+  "kind": "actual-isolated-cli-native-scm",
+  "checks": {
+    "new_mail_schema_present": true,
+    "nonempty_manifest": true,
+    "exact_source_epoch": true,
+    "next_epoch": true,
+    "same_revision_and_generation": true,
+    "original_body_unchanged": true,
+    "not_consumed_before_gate": true,
+    "same_native_process_alive_after_handover": true,
+    "source_and_destination_durable_native_headers": true,
+    "snapshot_preserves_native_pid": true,
+    "verified_exact_destination_epoch_one": true,
+    "surviving_provider_child_command_succeeded": true,
+    "actor_result_names_exact_session": true,
+    "actor_authorized_before_original_completion": true,
+    "completion_kept_exact_attempt": true,
+    "one_native_prompt_after_exact_retry": true,
+    "retry_kept_terminal_receipt": true,
+    "no_unexpected_or_refused_destination_epoch": true
+  },
+  "passed": true,
+  "identity_log": {
+    "observed_epochs": [
+      0,
+      1
+    ],
+    "unexpected_epochs": [],
+    "refused_epochs": [],
+    "destination_refused": false,
+    "sha256": "d8c4245c02134903c46d9a20ba5b35d7f909bd97bff8b971b4f8d949472fb61e"
+  },
+  "elapsed_seconds": 27.43430225,
+  "owned_groups_exited": true,
+  "destination_certificate": {
+    "serial": "60be474665a66d0bb844cf119b1f280d",
+    "kind": "agent",
+    "subject": "kiln://hyper-light/person/admin/agent/01a1ca5a6a7b75dd84b9935389ad153b/epoch/1/machine/a3bb49d1cbfd85401942400d863d31df/instance/01a1ca5a6d3f77f4a864e002320e4445",
+    "key": "4591231bac132e1a33380afeb36c371482986f5b95e6ab8b45fbf4abfb6f5a95",
+    "verified": "agent 01a1ca5a6a7b75dd84b9935389ad153b, epoch 1, for admin, on runner a3bb49d1cbfd85401942400d863d31df (instance 01a1ca5a6d3f77f4a864e002320e4445), of hyper-light",
+    "refused": null
+  },
+  "final_mail": {
+    "revision": 1,
+    "generation": 1,
+    "epoch": 1,
+    "disposition": "consumed",
+    "body_sha256": "fb60f8d0b16b20cb75052f6d7a58f916781e0dd5fdd5981a70b46739c4abc753"
+  },
+  "actor_command_exit": 0,
+  "actor_marks_removed": true
+}

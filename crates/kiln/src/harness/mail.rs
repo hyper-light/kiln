@@ -807,15 +807,32 @@ mod tests {
             let offered = capacity(offered);
             let first = claim_at_on(&mut ledger, publication.revision, epoch, offered.retry_permission(), Some("one-actual-connection"), crate::harness::state_view::FRAME)?.ok_or_else(|| anyhow::anyhow!("the first publication was not claimable"))?;
             assert!(host.command(&id, Command::Admit { peer: "sender".into(), token: first.token, epoch, generation: offered.feedback_generation.unwrap_or(offered.generation), peers: vec!["sender".into()], command: Box::new(command.clone()) }));
-            let (waiting, accepted_ack) = flow(&rx, &id, |event| matches!(event, FlowEvent::Waiting { token, .. } if *token == first.token)).await?;
-            assert!(!accepted_ack, "a failed preaccept journal reservation cannot acknowledge custody");
-            assert!(matches!(&waiting, FlowEvent::Waiting { cause: admission::WaitCause::SourceUnavailable, .. }), "the original must fit; this fixture must reach the actual journal reservation failure");
-            let refused = crate::rt::timeout(crate::harness::registry::ANSWER_WAIT, async {
+            // The owner publishes Flow through Core; its direct Inbox answer may arrive first.
+            let (waiting, accepted_ack, refused) = crate::rt::timeout(crate::harness::registry::ANSWER_WAIT, async {
+                let mut waiting = None;
+                let mut refused = None;
+                let mut accepted_ack = false;
                 loop {
                     let (source, update) = rx.recv().await?;
-                    if source == id && let Update::Inbox { said } = update && said.message == "original" { return Ok::<_, anyhow::Error>(said.answer); }
+                    if source != id { continue; }
+                    match update {
+                        Update::Inbox { said } => {
+                            accepted_ack |= said.answer.is_ok();
+                            if said.message == "original" && refused.is_none() { refused = Some(said.answer); }
+                        }
+                        Update::MailFlow { event } if matches!(&*event, FlowEvent::Waiting { token, .. } if *token == first.token) => {
+                            if waiting.is_none() { waiting = Some(*event); }
+                        }
+                        _ => {}
+                    }
+                    match (waiting.take(), refused.take()) {
+                        (Some(waiting), Some(refused)) => return Ok::<_, anyhow::Error>((waiting, accepted_ack, refused)),
+                        (saved_waiting, saved_refused) => { waiting = saved_waiting; refused = saved_refused; }
+                    }
                 }
-            }).await.map_err(|_| anyhow::anyhow!("the source's explicit preaccept refusal did not arrive"))??;
+            }).await.map_err(|_| anyhow::anyhow!("the bounded source admission and refusal events did not arrive"))??;
+            assert!(!accepted_ack, "a failed preaccept journal reservation cannot acknowledge custody");
+            assert!(matches!(&waiting, FlowEvent::Waiting { cause: admission::WaitCause::SourceUnavailable, .. }), "the original must fit; this fixture must reach the actual journal reservation failure");
             assert!(matches!(&refused, Err(crate::harness::inbox::Refusal::Unavailable { why, .. }) if why == "inbox transaction has no physical byte authority"), "the actual source must refuse its counted journal allocation before any custody ACK");
             let waiting = capacity(waiting);
             let inbox = host.inbox().ok_or_else(|| anyhow::anyhow!("fixture source inbox missing"))?;
