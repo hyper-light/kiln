@@ -1,0 +1,19 @@
+
+running 14 tests
+test agent::native_handover_tests::a_native_journal_registers_its_one_epoch_receipt_before_the_first_open_ask ... ok
+test agent::native_handover_tests::a_wrong_key_or_uninstalled_identity_cannot_complete_a_legacy_promotion ... ok
+test harness::admission::tests::legacy_epoch_promotion_preserves_debt_and_retry_authority_until_real_completion ... ok
+test harness::admission::tests::legacy_epoch_promotion_refuses_tokens_and_does_not_clear_unavailable ... ok
+test harness::host::tests::legacy_reconciliation_retries_before_epoch_activation_after_original_only_budget ... ok
+test harness::inbox::promotion::tests::applied_then_error_and_cancelled_head_read_keep_the_promotion_wake ... ok
+test harness::inbox::promotion::tests::legacy_epoch_rebind_refuses_token_or_stale_rows_without_mutation ... ok
+test harness::inbox::promotion::tests::partial_legacy_epoch_rebind_reopens_without_changing_originals_or_debt ... ok
+test harness::session::tests::early_legacy_effect_waits_for_its_original_without_poisoning_readiness ... ok
+test harness::session::tests::legacy_promotion_does_not_advance_past_uncommitted_input_effects ... ok
+test harness::session::tests::partial_legacy_rebinding_retains_completion_until_epochs_match_and_retires_its_flight ... ok
+test runner::identity::tests::g9_s3_a_certificate_is_written_with_no_lock_held ... ok
+test runner::identity::tests::w27_r02_a_key_stays_here_signs_and_goes ... ok
+test runner::identity::tests::w27_r05_a_key_is_awaited_from_its_ask_until_kiln_answers_it ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 4230 filtered out; finished in 0.91s
+

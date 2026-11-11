@@ -1,0 +1,6 @@
+{
+  "capture": "/private/tmp/kiln-queue-prevention-20261111/docs/research/measurements/queue-prevention/check-1794403787664581000",
+  "exit_code": 101,
+  "expected_guard_failure": true,
+  "log": "/private/tmp/kiln-queue-prevention-20261111/docs/research/measurements/queue-prevention/legacy-import-partial-red.log"
+}

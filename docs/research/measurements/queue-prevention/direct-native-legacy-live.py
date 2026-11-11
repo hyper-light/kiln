@@ -118,6 +118,7 @@ def main():
     parser.add_argument("--candidate-source", required=True, help="Exact signed source commit in the actual candidate build receipt")
     parser.add_argument("--before-binary", required=True, type=Path)
     parser.add_argument("--before-sha256", required=True)
+    parser.add_argument("--before-linux-copy", type=Path, help="Root-verified immutable Linux f555 copy; exact preserved hash remains required")
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path, help="New private directory on disk, preferably under ~/.cache")
     parser.add_argument("--timeout-seconds", required=True, type=float)
@@ -130,10 +131,20 @@ def main():
     require(sha(binary) == args.sha256, "binary does not match the coordinator's expected SHA256")
     require(args.source_receipt.is_file(), "the build/source receipt is absent")
     prior = args.before_binary.resolve(strict=True)
-    require(str(prior) == "/private/tmp/kiln-offline-fix-20261110/dist/kiln-aarch64-apple-darwin",
-            "baseline must be the preserved f555 artifact; never the installed canonical file")
-    require(args.before_sha256 == "be797cf09ec95a61f0cb95dcb3d0714bbc6be258182a2a2f09f5f90ef1685a84"
-            and sha(prior) == args.before_sha256, "preserved deployed f555 baseline hash differs")
+    host = (sys.platform, os.uname().machine)
+    if host == ("darwin", "arm64"):
+        require(args.before_linux_copy is None and str(prior) == "/private/tmp/kiln-offline-fix-20261110/dist/kiln-aarch64-apple-darwin",
+                "Mac baseline must be the preserved f555 artifact; never the installed canonical file")
+        baseline_sha256 = "be797cf09ec95a61f0cb95dcb3d0714bbc6be258182a2a2f09f5f90ef1685a84"
+    elif host == ("linux", "x86_64"):
+        immutable = args.before_linux_copy.resolve(strict=True) if args.before_linux_copy is not None else None
+        require(str(prior) == "/home/adalundhe/.local/share/kiln-server/bin/kiln" or prior == immutable,
+                "Linux baseline must be the exact preserved service artifact or explicit Root-verified immutable copy")
+        baseline_sha256 = "87107f09976eb189264a7d1e5ee7fc7435797507a819be51ff89b4234044c8ff"
+    else:
+        raise Refused("no preserved f555 baseline pinned for this platform/architecture")
+    require(args.before_sha256 == baseline_sha256 and sha(prior) == baseline_sha256,
+            "preserved deployed f555 baseline hash differs")
     require(re.fullmatch("[0-9a-f]{40}", args.candidate_source) is not None, "candidate source must be an exact signed commit")
     source = json.loads(args.source_receipt.read_bytes())
     require(source.get("exit_code") == 0 and source.get("source_unchanged") is True and source.get("sha256") == args.sha256
@@ -147,7 +158,7 @@ def main():
     started = time.monotonic()
     deadline = started + args.timeout_seconds
     children = []
-    runtime = Path(tempfile.mkdtemp(prefix="kn-", dir="/private/tmp"))
+    runtime = Path(tempfile.mkdtemp(prefix="kn-", dir="/tmp" if sys.platform == "linux" else "/private/tmp"))
     providers = {}
     admin = None
     session = None
@@ -258,7 +269,7 @@ def main():
         return {"capacity": capacity, "observation": "public receiver debt while original native result gate is held; typed row deferred until writer closes"}
 
     def process_identity(pid):
-        result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="], capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"}, timeout=5)
+        result = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "lstart=", "-o", "command="], capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"}, timeout=5)
         text = result.stdout.strip()
         return text if result.returncode == 0 and str(root / "bin" / "claude") in text else None
 
@@ -528,7 +539,7 @@ headroom = false
                             and lease.get("message") == message and lease.get("token") is None
                             and lease.get("epoch") == destination_epoch and lease.get("stage") == "provider_flight",
                             "persisted legacy flight identity/origin/token/stage mismatch")
-                    require(pending.get("disposition") == {"type": "consumed", "boundary": "provider_completed"},
+                    require(pending.get("disposition") == {"disposition": "consumed", "boundary": "provider_completed"},
                             "persisted exact legacy flight has no real completion proof")
                     check("typed_legacy_persistence_after_writer_close", True)
                     report["passed"] = True

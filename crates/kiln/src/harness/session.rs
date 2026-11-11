@@ -1957,6 +1957,15 @@ fn queued(c: Command) -> Option<super::model::QueueItem> {
 /// The session goes on at `epoch` (epochs only rise): its state says so, sent with its next flush.
 async fn progress_promotion(s: &Session, files: &Files) {
     let Some(host) = files.host.as_ref().and_then(std::sync::Weak::upgrade) else { return };
+    // Prepare retained originals, or finish partial row/epoch alignment, before
+    // flushing callbacks. Ownership stays fenced until their journal effects commit.
+    if let Err(error) = host.reconcile_legacy_owner(s).await {
+        let mut core = s.core.lock();
+        if matches!(error, super::inbox::PromotionError::Invalid { .. } | super::inbox::PromotionError::Stale) && let Some(input) = &core.input { let _ = input.controller.lock().unavailable(); }
+        core.upsert("legacy-promotion-held", None, Body::Notice { level: Level::Warn, text: format!("Legacy ownership remains held: {error}") });
+        core.touch_state();
+        return;
+    }
     // A callback already parsed before the owner event commits under its original lease epoch.
     let _ = flush_input(s).await;
     {
@@ -1988,6 +1997,21 @@ struct Jobs {
     changes: Vec<super::core::ChangeJob>,
 }
 
+fn legacy_effect_waiting_for_original(s: &Session, input: &super::admission::Input, message: &str) -> bool {
+    let core = s.core.lock();
+    let controller = input.controller.lock();
+    let Some((from, _)) = controller.promoting_epochs() else { return false };
+    core.state.epoch == from && controller.capacity().epoch == from && controller.lease(message).is_none_or(|lease| lease.epoch == from && lease.token.is_none())
+        && (core.input_legacy_flights.iter().any(|flight| flight.id == message)
+            || core.state.queue.iter().chain(core.state.tasks.iter().flat_map(|task| &task.queue)).any(|item| item.id == message))
+}
+
+async fn legacy_effects_waiting_for_epoch(s: &Session, input: &super::admission::Input, messages: &[String], refusal: &super::inbox::Refusal) -> bool {
+    let super::inbox::Refusal::StaleEpoch { session, sent, current } = refusal else { return false };
+    if session != &s.id || !messages.iter().all(|message| legacy_effect_waiting_for_original(s, input, message)) || input.controller.lock().promoting_epochs() != Some((*sent, *current)) { return false; }
+    matches!(input.inbox.promotion(&s.id).await, Ok(Some(promotion)) if promotion.phase == super::inbox::PromotionPhase::Rebinding && (promotion.from_epoch, promotion.to_epoch) == (*sent, *current))
+}
+
 /// Hand out what the core produced: updates to the sink, lines to the process.
 async fn flush_input(s: &Session) -> bool {
     let (input, stages, retained, replay, receipts) = {
@@ -2017,19 +2041,34 @@ async fn flush_input(s: &Session) -> bool {
     let mut write_ready = input.controller.lock().writes_ready();
     for message in stages {
         let epoch = input.controller.lock().lease(&message).map(|l| l.epoch);
-        let Some(epoch) = epoch else { continue };
-        if !matches!(input.inbox.stage_pending(&s.id, &message, epoch, super::admission::Stage::ProviderFlight).await, Ok(true)) {
+        let Some(epoch) = epoch else {
+            if legacy_effect_waiting_for_original(s, &input, &message) { s.core.lock().input_stages.push(message); write_ready = false; }
+            continue;
+        };
+        let staged = input.inbox.stage_pending(&s.id, &message, epoch, super::admission::Stage::ProviderFlight).await;
+        if !matches!(&staged, Ok(true)) {
+            let deferred = match &staged {
+                Ok(false) => legacy_effect_waiting_for_original(s, &input, &message),
+                Err(error) => legacy_effects_waiting_for_epoch(s, &input, std::slice::from_ref(&message), error).await,
+                _ => false,
+            };
             s.core.lock().input_stages.push(message);
-            let _ = input.controller.lock().unavailable();
+            if !deferred { let _ = input.controller.lock().unavailable(); }
             write_ready = false;
         }
     }
     for message in retained {
         let lease = input.controller.lock().lease(&message).cloned();
         let Some(lease) = lease else { s.core.lock().input_retained.push(message); continue };
-        if !matches!(input.inbox.stage_pending(&s.id, &message, lease.epoch, super::admission::Stage::Carried).await, Ok(true)) {
+        let staged = input.inbox.stage_pending(&s.id, &message, lease.epoch, super::admission::Stage::Carried).await;
+        if !matches!(&staged, Ok(true)) {
+            let deferred = match &staged {
+                Ok(false) => legacy_effect_waiting_for_original(s, &input, &message),
+                Err(error) => legacy_effects_waiting_for_epoch(s, &input, std::slice::from_ref(&message), error).await,
+                _ => false,
+            };
             s.core.lock().input_retained.push(message);
-            let _ = input.controller.lock().unavailable();
+            if !deferred { let _ = input.controller.lock().unavailable(); }
             write_ready = false;
             continue;
         }
@@ -2086,6 +2125,9 @@ async fn flush_input(s: &Session) -> bool {
                 input.observe_physical();
                 let mut core = s.core.lock();
                 core.state.admission = Some(capacity.clone());
+                // The durable terminal row is the witness now; retaining this fallback ID
+                // would turn a repeated native callback into an unresolvable missing lease.
+                core.input_legacy_flights.retain(|flight| !pending.iter().any(|entry| entry.lease.message == flight.id));
                 for pending in pending {
                     let Some(token) = pending.lease.token else { continue };
                     let event = match pending.disposition {
@@ -2096,6 +2138,14 @@ async fn flush_input(s: &Session) -> bool {
                 }
                 core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) });
                 core.touch_state();
+            }
+            Err(super::inbox::CompletionError::MissingOriginal { message }) if legacy_effect_waiting_for_original(s, &input, &message) => {
+                write_ready = false;
+                s.core.lock().input_receipts.push(receipt);
+            }
+            Err(super::inbox::CompletionError::Refused(error)) if legacy_effects_waiting_for_epoch(s, &input, &receipt.messages, &error).await => {
+                write_ready = false;
+                s.core.lock().input_receipts.push(receipt);
             }
             Err(_) => {
                 write_ready = false;
@@ -5150,6 +5200,153 @@ mod tests {
 
     fn attachment_files(dir: std::path::PathBuf) -> Files {
         Files { host: None, dir, take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}), carried: Arc::new(|_| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_, _| Box::pin(async { Ok(()) })), settle: Arc::new(|_, _, _| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}) }
+    }
+
+    #[test]
+    fn partial_legacy_rebinding_retains_completion_until_epochs_match_and_retires_its_flight() -> anyhow::Result<()> {
+        use super::super::{admission::{Consumption, FlightProtocol, Input, Lease, LegacyFlight, PhysicalBudget, Stage}, inbox::{Inbox, Limits as InboxLimits, Pending, PromotionPhase, promotion::RebindStep}};
+        crate::rt::block_on(async {
+            for prior_unavailable in [false, true] {
+                let directory = tempfile::tempdir()?;
+                let records = crate::records::open(&directory.path().join("records.db"))?;
+                let inbox = Arc::new(Inbox::new(records, InboxLimits::default()));
+                let (session, _control) = idle("partial-legacy-effect");
+                inbox.open(&session.id, 0).await?;
+                let pool = PhysicalBudget::new(super::super::state_view::FRAME);
+                let input = Input::new(0, pool.clone(), inbox.clone());
+                let ids = ["0123456789abcdef0123456789abcde0a", "0123456789abcdef0123456789abcde0b"];
+                let [first, second] = ids;
+                let bytes = size_of::<LegacyFlight>() + first.len();
+                for id in ids {
+                    let lease = Lease { message: id.into(), peer: String::new(), epoch: 0, bytes, stage: Stage::ProviderFlight, token: None, handoff: None };
+                    input.controller.lock().restore(lease.clone()).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    inbox.adopt_pending(&session.id, Pending::opaque(lease, Vec::new()), 1).await?;
+                }
+                input.controller.lock().begin_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                if prior_unavailable { input.controller.lock().unavailable().map_err(|error| anyhow::anyhow!("{error:?}"))?; }
+                {
+                    let mut core = session.core.lock();
+                    core.input = Some(input.clone());
+                    core.input_legacy_flights = ids.iter().map(|id| LegacyFlight { id: (*id).into(), protocol: FlightProtocol::Claude, request: None }).collect();
+                }
+                let frozen = session.core.lock().freeze();
+                let (_, events) = frozen.handover_source();
+                let proof = crate::runner::custody::LegacyProof::of(&session.id, 0, events, None).map_err(anyhow::Error::msg)?;
+                inbox.prepare_promotion(&session.id, 0, 1, proof, &pool, Some(&input)).await?;
+                inbox.advance_promotion(&session.id, 1, PromotionPhase::AwaitingCertificate, &pool, Some(&input)).await?;
+                inbox.advance_promotion(&session.id, 1, PromotionPhase::Rebinding, &pool, Some(&input)).await?;
+                assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, RebindStep::Row);
+                pool.resize(pool.counts().0);
+                assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await, Err(super::super::inbox::PromotionError::ResourceHeld));
+                assert_eq!(inbox.pending(&session.id, first).await?.unwrap().lease.epoch, 1);
+                assert_eq!(input.controller.lock().capacity().epoch, 0);
+                // An exact native callback arrived between the real partial commit and its
+                // external budget wake. It is a component input, not a model-work claim.
+                session.core.lock().input_consumed(first, Consumption::ProviderCompleted);
+                assert!(!flush_input(&session).await);
+                assert_eq!(session.core.lock().input_receipts.len(), 1);
+                assert!(inbox.pending(&session.id, first).await?.unwrap().disposition.is_none(), "the epoch guard must not be weakened");
+                assert_eq!(pool.counts().0, bytes * 2);
+                pool.resize(super::super::state_view::FRAME);
+                assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, RebindStep::Row);
+                assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, RebindStep::Complete);
+                {
+                    let mut core = session.core.lock();
+                    input.controller.lock().rebind_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    core.state.epoch = 1;
+                }
+                assert!(!flush_input(&session).await, "the owner must stay Promoting until the receipt commits");
+                assert!(session.core.lock().input_receipts.is_empty());
+                assert!(inbox.pending(&session.id, first).await?.unwrap().disposition.is_some());
+                assert_eq!(inbox.promotion(&session.id).await?.unwrap().phase, PromotionPhase::Rebinding);
+                assert!(input.controller.lock().lease(second).is_some());
+                assert_eq!(pool.counts().0, bytes);
+                inbox.advance_promotion(&session.id, 1, PromotionPhase::Active, &pool, Some(&input)).await?;
+                inbox.retire_promotion(&session.id, 1, &pool, Some(&input)).await?;
+                {
+                    let mut controller = input.controller.lock();
+                    controller.complete_legacy_reconciliation().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    controller.activate_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    if prior_unavailable { assert_eq!(controller.capacity().target, 0, "genuine Unavailable remains held"); }
+                    else { assert!(controller.capacity().target > 0, "a callback during partial rebinding poisoned readiness"); }
+                }
+                session.core.lock().input_consumed(first, Consumption::ProviderCompleted);
+                let _ = flush_input(&session).await;
+                assert!(session.core.lock().input_receipts.is_empty(), "a committed legacy callback must not defer forever after its lease is gone");
+                assert!(session.core.lock().input_legacy_flights.iter().any(|flight| flight.id == second));
+                assert_eq!(input.controller.lock().capacity().admitted, 1, "a duplicate callback cannot release the other original");
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn early_legacy_effect_waits_for_its_original_without_poisoning_readiness() -> anyhow::Result<()> {
+        use super::super::{admission::{Consumption, FlightProtocol, Input, Lease, LegacyFlight, PhysicalBudget, Stage}, inbox::{Inbox, Limits as InboxLimits, Pending, PromotionPhase}};
+        crate::rt::block_on(async {
+            for effect in ["stage", "retained", "receipt"] {
+                for prior_unavailable in [false, true] {
+                    let directory = tempfile::tempdir()?;
+                    let records = crate::records::open(&directory.path().join("records.db"))?;
+                    let inbox = Arc::new(Inbox::new(records, InboxLimits::default()));
+                    let (session, _control) = idle("early-legacy-effect");
+                    inbox.open(&session.id, 0).await?;
+                    let pool = PhysicalBudget::new(super::super::state_view::FRAME);
+                    let input = Input::new(0, pool.clone(), inbox.clone());
+                    let id = "0123456789abcdef0123456789abcdef";
+                    let lease = Lease { message: id.into(), peer: String::new(), epoch: 0, bytes: size_of::<LegacyFlight>() + id.len(), stage: Stage::ProviderFlight, token: None, handoff: None };
+                    input.controller.lock().restore(lease.clone()).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    input.controller.lock().begin_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    if prior_unavailable { input.controller.lock().unavailable().map_err(|error| anyhow::anyhow!("{error:?}"))?; }
+                    {
+                        let mut core = session.core.lock();
+                        core.input = Some(input.clone());
+                        core.input_legacy_flights.push(LegacyFlight { id: id.into(), protocol: FlightProtocol::Claude, request: None });
+                        match effect {
+                            "stage" => core.input_stages.push(id.into()),
+                            "retained" => core.input_retained.push(id.into()),
+                            _ => core.input_consumed(id, Consumption::ProviderCompleted),
+                        }
+                    }
+                    let frozen = session.core.lock().freeze();
+                    let (_, events) = frozen.handover_source();
+                    let proof = crate::runner::custody::LegacyProof::of(&session.id, 0, events, None).map_err(anyhow::Error::msg)?;
+                    inbox.prepare_promotion(&session.id, 0, 1, proof, &pool, Some(&input)).await?;
+                    inbox.advance_promotion(&session.id, 1, PromotionPhase::AwaitingCertificate, &pool, Some(&input)).await?;
+                    assert!(!flush_input(&session).await);
+                    assert!(inbox.pending(&session.id, id).await?.is_none());
+                    {
+                        let core = session.core.lock();
+                        let deferred = match effect { "stage" => core.input_stages.len(), "retained" => core.input_retained.len(), _ => core.input_receipts.len() };
+                        assert_eq!(deferred, 1, "the exact early {effect} must remain retryable");
+                    }
+                    assert_eq!((input.controller.lock().capacity().epoch, pool.counts().0), (0, lease.bytes));
+                    // This is the component's exact source-journal boundary, not a fabricated
+                    // provider response or certificate. The native upgrade fixture proves those.
+                    inbox.adopt_pending(&session.id, Pending::opaque(lease.clone(), Vec::new()), 1).await?;
+                    assert!(!flush_input(&session).await, "Promoting still withholds new prompt writes");
+                    {
+                        let core = session.core.lock();
+                        assert!(core.input_stages.is_empty() && core.input_retained.is_empty() && core.input_receipts.is_empty());
+                    }
+                    let row = inbox.pending(&session.id, id).await?.unwrap();
+                    assert_eq!((row.lease.message.as_str(), row.lease.epoch, row.lease.token), (id, 0, None));
+                    assert_eq!(row.disposition.is_some(), effect == "receipt");
+                    {
+                        let mut controller = input.controller.lock();
+                        controller.rebind_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                        controller.complete_legacy_reconciliation().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                        controller.activate_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                        let capacity = controller.capacity();
+                        assert_eq!(capacity.admitted, usize::from(effect != "receipt"));
+                        assert_eq!(capacity.bytes, if effect == "receipt" { 0 } else { lease.bytes });
+                        if prior_unavailable { assert_eq!(capacity.target, 0, "genuine prior Unavailable must not be cleared"); }
+                        else { assert!(capacity.target > 0, "early {effect} missing its legacy row poisoned later successful reconciliation"); }
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     #[test]

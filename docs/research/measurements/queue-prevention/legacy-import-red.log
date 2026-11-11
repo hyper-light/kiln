@@ -1,0 +1,19 @@
+
+running 1 test
+test harness::host::tests::legacy_reconciliation_retries_before_epoch_activation_after_original_only_budget ... FAILED
+
+failures:
+
+---- harness::host::tests::legacy_reconciliation_retries_before_epoch_activation_after_original_only_budget stdout ----
+
+thread 'hyper-rt-shard-0' (60885330) panicked at crates/kiln/src/harness/host.rs:3738:28:
+successful owner reconciliation left promotion unavailable after a temporary copy refusal
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Error: the task panicked: successful owner reconciliation left promotion unavailable after a temporary copy refusal
+
+
+failures:
+    harness::host::tests::legacy_reconciliation_retries_before_epoch_activation_after_original_only_budget
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4241 filtered out; finished in 0.22s
+

@@ -110,6 +110,14 @@ pub struct Disposed {
     pub disposition: super::admission::Disposition,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CompletionError {
+    #[error("an observed handoff has no replayable custody record")]
+    MissingOriginal { message: String },
+    #[error(transparent)]
+    Refused(#[from] Refusal),
+}
+
 /// What a session's inbox keeps, and reads at once (the defaults: [`KEEP`], [`TRIM`], [`READ`]).
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -671,9 +679,9 @@ impl Inbox {
     /// A real handoff batch has one durable transition before any member returns credit or
     /// publishes a receipt. The Records transaction limit is protocol authority, not a chosen
     /// queue depth; an unsupported larger batch remains retained and visibly unavailable.
-    pub async fn dispose_pending_batch(&self, session: &str, messages: &[String], epoch: u64, disposition: &super::admission::Disposition) -> Result<Vec<Disposed>, Refusal> {
+    pub(crate) async fn dispose_pending_batch(&self, session: &str, messages: &[String], epoch: u64, disposition: &super::admission::Disposition) -> Result<Vec<Disposed>, CompletionError> {
         check_session(session)?;
-        if messages.len() > records::TX_MAX { return Err(unavailable(session, "one observed handoff batch exceeds the records transaction capacity")); }
+        if messages.len() > records::TX_MAX { return Err(unavailable(session, "one observed handoff batch exceeds the records transaction capacity").into()); }
         let mut tx = Tx::default();
         let mut disposed = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
@@ -681,9 +689,9 @@ impl Inbox {
             check_message(message)?;
             if !seen.insert(message.as_str()) { continue; }
             let key = message_key(session, message);
-            let row = self.records.get(PENDING, &key, Consistency::Linearizable).await.map_err(|e| unavailable(session, &e.to_string()))?.ok_or_else(|| unavailable(session, "an observed handoff has no replayable custody record"))?;
+            let row = self.records.get(PENDING, &key, Consistency::Linearizable).await.map_err(|e| unavailable(session, &e.to_string()))?.ok_or_else(|| CompletionError::MissingOriginal { message: message.clone() })?;
             let mut pending: Pending = serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &format!("its pending communication is unreadable: {e}")))?;
-            if pending.lease.epoch != epoch { return Err(Refusal::StaleEpoch { session: session.to_owned(), sent: epoch, current: pending.lease.epoch }); }
+            if pending.lease.epoch != epoch { return Err(Refusal::StaleEpoch { session: session.to_owned(), sent: epoch, current: pending.lease.epoch }.into()); }
             if pending.disposition.is_none() {
                 pending.disposition = Some(disposition.clone());
                 pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
@@ -1116,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn a_handoff_batch_retains_every_original_before_any_terminal_receipt() -> Result<(), Refusal> {
+    fn a_handoff_batch_retains_every_original_before_any_terminal_receipt() -> Result<(), CompletionError> {
         use crate::harness::admission::{Consumption, Disposition};
         let i = inbox();
         for message in ["first", "second"] {

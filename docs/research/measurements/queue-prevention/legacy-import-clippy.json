@@ -1,0 +1,1 @@
+{"exit_code": 0, "command": ["nice", "-n", "10", "cargo", "clippy", "--locked", "-p", "kiln", "--lib", "--", "-D", "warnings"]}

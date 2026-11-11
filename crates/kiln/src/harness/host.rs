@@ -37,6 +37,9 @@ pub struct Limits {
     pub per_machine: usize,
 }
 
+#[derive(Clone, Copy)]
+enum LegacyReconciliation { Debt { from: u64, to: u64 }, Journal }
+
 impl Default for Limits {
     fn default() -> Self {
         Self { per_machine: super::limit::DEFAULT }
@@ -783,10 +786,6 @@ impl Host {
         if promotion.to_epoch != to { return Err(inbox::PromotionError::Stale); }
         crate::runner::custody::legacy_certificate_ready(id, to, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
         if promotion.phase == inbox::PromotionPhase::AwaitingPromotion { return Err(inbox::PromotionError::WaitingForCertificate { why: "the destination has not been promoted".into() }); }
-        if promotion.phase == inbox::PromotionPhase::AwaitingCertificate {
-            let input = self.get(id).and_then(|session| session.core.lock().input.clone());
-            self.inbox.as_ref().ok_or(inbox::PromotionError::Stale)?.advance_promotion(id, to, inbox::PromotionPhase::Rebinding, &self.input_budget, input.as_ref()).await?;
-        }
         if self.get(id).is_none() {
             let host = self.me.upgrade().ok_or_else(|| inbox::PromotionError::Storage { why: HOST_GONE.into() })?;
             let session = id.to_owned();
@@ -833,6 +832,56 @@ impl Host {
         Ok(())
     }
 
+    pub(super) async fn reconcile_legacy_owner(&self, session: &Session) -> Result<(), inbox::PromotionError> {
+        let Some(input) = session.core.lock().input.clone() else { return Ok(()) };
+        let Some(promotion) = input.inbox.promotion(&session.id).await? else { return Ok(()) };
+        if promotion.phase == inbox::PromotionPhase::Active || !input.controller.lock().promoting_epoch(promotion.from_epoch, promotion.to_epoch) { return Ok(()) }
+        self.settled(&session.id).await;
+        input.observe_physical();
+        if promotion.phase == inbox::PromotionPhase::Rebinding {
+            crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
+            return self.rebind_legacy_owner(session, &input, &promotion).await;
+        }
+        if session.epoch() != promotion.from_epoch || input.controller.lock().capacity().epoch != promotion.from_epoch { return Err(inbox::PromotionError::Stale); }
+        self.reconcile_legacy_mail(session, &input, LegacyReconciliation::Debt { from: promotion.from_epoch, to: promotion.to_epoch }).await?;
+        if promotion.phase == inbox::PromotionPhase::AwaitingPromotion { return Ok(()) }
+        crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
+        self.reconcile_legacy_mail(session, &input, LegacyReconciliation::Journal).await
+    }
+
+    async fn rebind_legacy_owner(&self, session: &Session, input: &super::admission::Input, promotion: &inbox::Promotion) -> Result<(), inbox::PromotionError> {
+        let mut after = None;
+        while let Some((cursor, pending)) = input.inbox.pending_next(&session.id, after).await? {
+            if !matches!(pending.origin, inbox::Origin::LegacyRetained | inbox::Origin::LegacyOpaque) || pending.lease.token.is_some() { return Err(inbox::PromotionError::Invalid { why: "legacy journal custody changed".into() }); }
+            if pending.lease.epoch != promotion.from_epoch && pending.lease.epoch != promotion.to_epoch { return Err(inbox::PromotionError::Stale); }
+            if pending.disposition.is_none() { input.controller.lock().restore_legacy_debt(pending.lease, promotion.from_epoch, promotion.to_epoch).map_err(|error| inbox::PromotionError::Invalid { why: format!("{error:?}") })?; }
+            after = Some(cursor);
+        }
+        input.observe_physical();
+        let mut conflict = None;
+        loop {
+            match input.inbox.rebind_promotion_step(&session.id, input).await {
+                Ok(inbox::promotion::RebindStep::Row) => conflict = None,
+                Ok(inbox::promotion::RebindStep::Complete) => break,
+                Err(inbox::PromotionError::Conflict { revision }) if conflict.is_none_or(|prior| revision > prior) => conflict = Some(revision),
+                Err(error) => return Err(error),
+            }
+        }
+        {
+            let mut core = session.core.lock();
+            input.controller.lock().rebind_legacy_epoch(promotion.from_epoch, promotion.to_epoch).map_err(|error| inbox::PromotionError::Invalid { why: format!("{error:?}") })?;
+            core.state.epoch = promotion.to_epoch;
+            core.touch_state();
+        }
+        let mut after = None;
+        while let Some((cursor, pending)) = input.inbox.pending_next(&session.id, after).await? {
+            if pending.lease.epoch != promotion.to_epoch || pending.lease.token.is_some() || !matches!(pending.origin, inbox::Origin::LegacyRetained | inbox::Origin::LegacyOpaque) { return Err(inbox::PromotionError::Invalid { why: "legacy journal custody changed".into() }); }
+            if pending.disposition.is_none() { input.controller.lock().restore(pending.lease).map_err(|error| inbox::PromotionError::Invalid { why: format!("{error:?}") })?; }
+            after = Some(cursor);
+        }
+        Ok(())
+    }
+
     pub(super) async fn progress_legacy_promotion(&self, session: &Session) -> Result<(), inbox::PromotionError> {
         let input = session.core.lock().input.clone().ok_or_else(|| inbox::PromotionError::Storage { why: "legacy owner input is not initialized".into() })?;
         let (revision, promotion) = input.inbox.promotion_snapshot(&session.id).await?;
@@ -852,33 +901,15 @@ impl Host {
             return self.finish_legacy_promotion(session, &input, promotion.from_epoch, promotion.to_epoch).await;
         }
         input.controller.lock().begin_legacy_epoch(promotion.from_epoch, promotion.to_epoch).map_err(|error| inbox::PromotionError::Invalid { why: format!("{error:?}") })?;
-        if matches!(promotion.phase, inbox::PromotionPhase::AwaitingPromotion | inbox::PromotionPhase::AwaitingCertificate) {
+        if promotion.phase == inbox::PromotionPhase::AwaitingPromotion {
             let capacity = input.controller.lock().capacity(); session.mail_flow(super::admission::FlowEvent::Capacity { capacity }); return Ok(());
         }
         crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
         self.settled(&session.id).await;
-        input.observe_physical();
-        let mut conflict = None;
-        loop {
-            match input.inbox.rebind_promotion_step(&session.id, &input).await {
-                Ok(inbox::promotion::RebindStep::Row) => conflict = None,
-                Ok(inbox::promotion::RebindStep::Complete) => break,
-                Err(inbox::PromotionError::Conflict { revision }) if conflict.is_none_or(|prior| revision > prior) => conflict = Some(revision),
-                Err(error) => return Err(error),
-            }
+        if promotion.phase == inbox::PromotionPhase::AwaitingCertificate {
+            input.inbox.advance_promotion(&session.id, promotion.to_epoch, inbox::PromotionPhase::Rebinding, &self.input_budget, Some(&input)).await?;
         }
-        {
-            let mut core = session.core.lock();
-            input.controller.lock().rebind_legacy_epoch(promotion.from_epoch, promotion.to_epoch).map_err(|error| inbox::PromotionError::Invalid { why: format!("{error:?}") })?;
-            core.state.epoch = promotion.to_epoch;
-            core.touch_state();
-        }
-        let mut after = None;
-        while let Some((cursor, pending)) = input.inbox.pending_next(&session.id, after).await? {
-            if pending.lease.epoch != promotion.to_epoch || pending.lease.token.is_some() || !matches!(pending.origin, inbox::Origin::LegacyRetained | inbox::Origin::LegacyOpaque) { return Err(inbox::PromotionError::Invalid { why: "legacy journal custody changed".into() }); }
-            if pending.disposition.is_none() { input.controller.lock().restore(pending.lease).map_err(|error| inbox::PromotionError::Invalid { why: format!("{error:?}") })?; }
-            after = Some(cursor);
-        }
+        self.rebind_legacy_owner(session, &input, &promotion).await?;
         let host = self.me.upgrade().ok_or_else(|| inbox::PromotionError::Storage { why: HOST_GONE.into() })?;
         crate::rt::blocking(move || host.save_checked()).await.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?;
         crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
@@ -2187,24 +2218,17 @@ impl Host {
         };
         match input.inbox.promotion(&s.id).await {
             Ok(Some(promotion)) if promotion.phase != inbox::PromotionPhase::Active => {
-                if input.controller.lock().begin_legacy_epoch(promotion.from_epoch, promotion.to_epoch).is_err() { let _ = input.controller.lock().unavailable(); return; }
-                let _ = crate::runner::custody::legacy_waiting(&s.id, &promotion);
-                if promotion.phase == inbox::PromotionPhase::Rebinding {
-                    let mut after = None;
-                    loop {
-                        match input.inbox.pending_next(&s.id, after).await {
-                            Ok(Some((cursor, pending))) => {
-                                if pending.disposition.is_none() && (!matches!(pending.origin, inbox::Origin::LegacyRetained | inbox::Origin::LegacyOpaque) || input.controller.lock().restore_legacy_debt(pending.lease, promotion.from_epoch, promotion.to_epoch).is_err()) { let _ = input.controller.lock().unavailable(); break; }
-                                after = Some(cursor);
-                            }
-                            Ok(None) => break,
-                            Err(_) => { let _ = input.controller.lock().unavailable(); break; }
-                        }
-                    }
-                    let capacity = input.controller.lock().capacity(); s.mail_flow(super::admission::FlowEvent::Capacity { capacity });
-                    let _ = s.promotion_changed().await;
-                    return;
+                {
+                    let core = s.core.lock();
+                    let mut controller = input.controller.lock();
+                    // A Head read can finish after this actor completed the transition. It
+                    // cannot re-enter old promotion or restore a completed legacy flight.
+                    if core.state.epoch >= promotion.to_epoch && controller.capacity().epoch == core.state.epoch && !controller.promoting_epoch(promotion.from_epoch, promotion.to_epoch) { return; }
+                    if controller.begin_legacy_epoch(promotion.from_epoch, promotion.to_epoch).is_err() { let _ = controller.unavailable(); return; }
                 }
+                let capacity = input.controller.lock().capacity(); s.mail_flow(super::admission::FlowEvent::Capacity { capacity });
+                let _ = s.promotion_changed().await;
+                return;
             }
             Ok(Some(promotion)) if s.epoch() != promotion.to_epoch => { let _ = input.controller.lock().unavailable(); return; }
             Err(_) => { let _ = input.controller.lock().unavailable(); return; }
@@ -2212,7 +2236,7 @@ impl Host {
         }
         let mut after = None;
         let _ = input.controller.lock().restoring();
-        let reconciled = self.reconcile_legacy_mail(s, &input).await;
+        let reconciled = self.reconcile_legacy_mail(s, &input, LegacyReconciliation::Journal).await.is_ok();
         if !reconciled { let _ = input.controller.lock().unavailable(); }
         loop {
             if !reconciled { break; }
@@ -2242,8 +2266,9 @@ impl Host {
     /// An old live provider has no new journal yet. Its complete queue bodies and actual native
     /// flight identities become existing charged debt before an empty journal can grant room.
     /// At most one extra communication representation is held while its row is committed.
-    async fn reconcile_legacy_mail(&self, s: &Session, input: &super::admission::Input) -> bool {
+    async fn reconcile_legacy_mail(&self, s: &Session, input: &super::admission::Input, mode: LegacyReconciliation) -> Result<(), inbox::PromotionError> {
         use super::admission::{Lease, Stage};
+        let invalid = |error| inbox::PromotionError::Invalid { why: format!("{error:?}") };
         let mut after: Option<String> = None;
         loop {
             let next = {
@@ -2256,25 +2281,33 @@ impl Host {
             after = Some(message.clone());
             match input.inbox.pending(&s.id, &message).await {
                 Ok(Some(pending)) => {
-                    if pending.disposition.is_none() && input.controller.lock().restore(pending.lease).is_err() { return false; }
+                    if pending.disposition.is_none() { input.controller.lock().restore(pending.lease).map_err(invalid)?; }
                     continue;
                 }
                 Ok(None) => {}
-                Err(_) => return false,
+                Err(error) => return Err(error.into()),
             }
             let recovered = {
                 let core = s.core.lock();
                 let item = core.state.queue.iter().map(|item| (None, item)).chain(core.state.tasks.iter().flat_map(|task| task.queue.iter().map(move |item| (Some(task.id.as_str()), item)))).find(|(_, item)| item.id == message);
                 let Some((task, item)) = item else { continue };
-                let Ok(bytes) = super::admission::queued_command_bytes(item, task) else { return false };
+                let bytes = super::admission::queued_command_bytes(item, task).map_err(invalid)?;
                 let lease = Lease { message: message.clone(), peer: String::new(), epoch: core.state.epoch, bytes, stage: Stage::Queued, token: None, handoff: None };
-                if input.controller.lock().restore(lease.clone()).is_err() { return false; }
-                let Ok(Some(charge)) = input.reserve_buffer(bytes) else { return false };
+                {
+                    let mut controller = input.controller.lock();
+                    if let LegacyReconciliation::Debt { from, to } = mode {
+                        if core.state.epoch != from || controller.capacity().epoch != from || !controller.promoting_epoch(from, to) { return Ok(()); }
+                        controller.restore(lease).map_err(invalid)?;
+                        continue;
+                    }
+                    controller.restore(lease.clone()).map_err(invalid)?;
+                }
+                let charge = input.reserve_buffer(bytes).map_err(invalid)?.ok_or(inbox::PromotionError::ResourceHeld)?;
                 let command = Command::Send { id: item.id.clone(), text: item.text.clone(), mode: super::model::SendMode::Queue, attachments: item.attachments.clone(), overrides: item.overrides.clone(), reply_to: item.reply_to.clone(), task: task.map(str::to_owned) };
                 (inbox::Pending::legacy(lease, command), charge)
             };
             let (pending, _charge) = recovered;
-            if input.inbox.adopt_pending(&s.id, pending, self.clock.unix_ms()).await.is_err() { return false; }
+            input.inbox.adopt_pending(&s.id, pending, self.clock.unix_ms()).await?;
         }
         let mut after: Option<String> = None;
         loop {
@@ -2286,27 +2319,35 @@ impl Host {
             after = Some(message.clone());
             match input.inbox.pending(&s.id, &message).await {
                 Ok(Some(pending)) => {
-                    if pending.disposition.is_none() && input.controller.lock().restore(pending.lease).is_err() { return false; }
+                    if pending.disposition.is_none() { input.controller.lock().restore(pending.lease).map_err(invalid)?; }
                     continue;
                 }
                 Ok(None) => {}
-                Err(_) => return false,
+                Err(error) => return Err(error.into()),
             }
             let recovered = {
                 let core = s.core.lock();
                 let Some(flight) = core.input_legacy_flights.iter().find(|flight| flight.id == message) else { continue };
                 let bytes = core.writes.iter().filter(|wire| flight.matches(wire)).fold(std::mem::size_of::<super::admission::LegacyFlight>().checked_add(flight.id.capacity()), |bytes, wire| bytes.and_then(|bytes| bytes.checked_add(std::mem::size_of::<String>())).and_then(|bytes| bytes.checked_add(wire.capacity())));
-                let Some(bytes) = bytes else { return false };
+                let bytes = bytes.ok_or_else(|| inbox::PromotionError::Invalid { why: "legacy retained byte count overflowed".into() })?;
                 let lease = Lease { message: message.clone(), peer: String::new(), epoch: core.state.epoch, bytes, stage: Stage::ProviderFlight, token: None, handoff: None };
-                if input.controller.lock().restore(lease.clone()).is_err() { return false; }
-                let Ok(Some(charge)) = input.reserve_buffer(bytes) else { return false };
+                {
+                    let mut controller = input.controller.lock();
+                    if let LegacyReconciliation::Debt { from, to } = mode {
+                        if core.state.epoch != from || controller.capacity().epoch != from || !controller.promoting_epoch(from, to) { return Ok(()); }
+                        controller.restore(lease).map_err(invalid)?;
+                        continue;
+                    }
+                    controller.restore(lease.clone()).map_err(invalid)?;
+                }
+                let charge = input.reserve_buffer(bytes).map_err(invalid)?.ok_or(inbox::PromotionError::ResourceHeld)?;
                 let writes = core.writes.iter().filter(|wire| flight.matches(wire)).cloned().collect();
                 (inbox::Pending::opaque(lease, writes), charge)
             };
             let (pending, _charge) = recovered;
-            if input.inbox.adopt_pending(&s.id, pending, self.clock.unix_ms()).await.is_err() { return false; }
+            input.inbox.adopt_pending(&s.id, pending, self.clock.unix_ms()).await?;
         }
-        true
+        Ok(())
     }
 
     /// A message for session `id` this machine couldn't read, as its inbox answers it
@@ -3671,6 +3712,76 @@ fn free_claim(c: Option<crate::reach::place::Claim>) {
 mod tests {
     use super::*;
     use kiln_seams::clock::SimClock;
+
+    /// The journal failure is the real Host adoption path, not a synthetic consumption event.
+    /// Certificate verification is covered by the isolated native upgrade proof; this fixture
+    /// drives the owner/journal ordering beneath that boundary on real file-backed Records.
+    #[test]
+    fn legacy_reconciliation_retries_before_epoch_activation_after_original_only_budget() -> anyhow::Result<()> {
+        use super::super::admission::{FlightProtocol, Input, LegacyFlight, Stage};
+        use kiln_seams::records::Consistency;
+        crate::rt::block_on(async {
+            for prior_unavailable in [false, true] {
+                let directory = tempfile::tempdir()?;
+                let records = crate::records::open(&directory.path().join("records.db"))?;
+                let (sink, _updates) = async_channel::unbounded();
+                let host = Host::with_records(sink, None, Limits::default(), Arc::new(SimClock::new()), Some(records.clone()));
+                let session = host.open(Some("legacy-original-before-rebind".into()), no_harness(directory.path()))?;
+                host.settled(&session.id).await;
+                crate::rt::timeout(super::super::registry::ANSWER_WAIT, session.close_wait()).await.map_err(|_| anyhow::anyhow!("fixture owner did not stop"))?;
+                let inbox = host.inbox().cloned().ok_or_else(|| anyhow::anyhow!("fixture journal missing"))?;
+                let input = Input::new(0, Arc::clone(&host.input_budget), Arc::clone(&inbox));
+                let flight = LegacyFlight { id: "0123456789abcdef0123456789abcdef".into(), protocol: FlightProtocol::Claude, request: None };
+                let bytes = size_of::<LegacyFlight>() + flight.id.capacity();
+                {
+                    let mut core = session.core.lock();
+                    core.input = Some(input.clone());
+                    core.state.epoch = 0;
+                    core.state.status = Status::Running;
+                    core.state.manual_resume = false;
+                    core.input_legacy_flights = vec![flight.clone()];
+                    core.writes.clear();
+                }
+                if prior_unavailable { input.controller.lock().unavailable().map_err(|error| anyhow::anyhow!("{error:?}"))?; }
+                let frozen = session.core.lock().freeze();
+                let (_, events) = frozen.handover_source();
+                let proof = crate::runner::custody::LegacyProof::of(&session.id, 0, events, None).map_err(anyhow::Error::msg)?;
+                host.set_input_budget(super::super::state_view::FRAME);
+                inbox.prepare_promotion(&session.id, 0, 1, proof, &host.input_budget, Some(&input)).await?;
+                inbox.advance_promotion(&session.id, 1, inbox::PromotionPhase::AwaitingCertificate, &host.input_budget, Some(&input)).await?;
+                // Existing retained bytes fit; the temporary representation required by adoption
+                // does not. No original is removed to make a journal copy fit.
+                host.set_input_budget(bytes);
+                host.replay_session_mail(&session).await;
+                assert_eq!(input.controller.lock().capacity().epoch, 0);
+                assert!(inbox.pending(&session.id, &flight.id).await?.is_none());
+                assert_eq!(records.scan("inbox-pending", kiln_seams::records::Scan { prefix: Vec::new(), after: None, limit: 1, at: Consistency::Linearizable }).await?.rows.len(), 0);
+                // A real external budget improvement permits the existing owner to reconcile.
+                host.set_input_budget(super::super::state_view::FRAME);
+                assert!(host.reconcile_legacy_mail(&session, &input, LegacyReconciliation::Journal).await.is_ok(), "the complete retained original must become replayable before row rebinding");
+                let original = inbox.pending(&session.id, &flight.id).await?.ok_or_else(|| anyhow::anyhow!("original has no durable row before rebind"))?;
+                assert_eq!(original.origin, inbox::Origin::LegacyOpaque);
+                assert!(original.command.is_none() && original.lease.token.is_none() && original.disposition.is_none());
+                assert_eq!((original.lease.message.as_str(), original.lease.epoch, original.lease.bytes, original.lease.stage), (flight.id.as_str(), 0, bytes, Stage::ProviderFlight));
+                assert_eq!(input.controller.lock().capacity().epoch, 0, "durability must precede controller epoch change");
+                inbox.advance_promotion(&session.id, 1, inbox::PromotionPhase::Rebinding, &host.input_budget, Some(&input)).await?;
+                assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, inbox::promotion::RebindStep::Row);
+                assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, inbox::promotion::RebindStep::Complete);
+                assert_eq!(inbox.pending(&session.id, &flight.id).await?.unwrap().lease.epoch, 1);
+                {
+                    let mut controller = input.controller.lock();
+                    controller.rebind_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    controller.complete_legacy_reconciliation().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    controller.activate_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    let capacity = controller.capacity();
+                    assert_eq!((capacity.epoch, capacity.admitted, capacity.bytes), (1, 1, bytes));
+                    if prior_unavailable { assert_eq!(capacity.target, 0, "a genuine prior unavailable state must remain held"); }
+                    else { assert!(capacity.target > capacity.admitted, "successful owner reconciliation left promotion unavailable after a temporary copy refusal"); }
+                }
+            }
+            Ok(())
+        })
+    }
 
     /// A host on a simulated clock of its own, never moved: its watch never looks and its record
     /// is written only when a test says (`save_now`).
