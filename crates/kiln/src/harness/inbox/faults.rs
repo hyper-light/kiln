@@ -417,11 +417,11 @@ fn w20_an_oversized_inline_original_is_refused_before_custody_and_a_partial_uplo
         use kiln_seams::blobs::{Cond, Put};
         let hub = crate::hub::tests::scratch_hub().await?;
         let mut command = with_file(crate::util::new_id());
-        if let Command::Send { attachments, .. } = &mut command {
-            if let Some(file) = attachments.first_mut() {
-                file.file_id = None;
-                file.data_base64 = "a".repeat(crate::harness::state_view::FRAME);
-            }
+        if let Command::Send { attachments, .. } = &mut command
+            && let Some(file) = attachments.first_mut()
+        {
+            file.file_id = None;
+            file.data_base64 = "a".repeat(crate::harness::state_view::FRAME);
         }
         assert!(matches!(hub.harness.attachment_command(&hub, "recipient", command).await, Err(crate::harness::mail::Error::TooLarge { .. })));
         let id = crate::util::new_id();

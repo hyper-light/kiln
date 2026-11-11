@@ -69,7 +69,7 @@ impl Default for Order {
 
 impl Order {
     pub fn new() -> Order {
-        Order { head: vec![NIL; BUCKETS as usize], class: Vec::new(), next: Vec::new(), prev: Vec::new(), words: [0; 64], summary: 0 }
+        Order { head: Vec::new(), class: Vec::new(), next: Vec::new(), prev: Vec::new(), words: [0; 64], summary: 0 }
     }
 
     /// Runner `r`'s class (NIL: not in the order).
@@ -94,6 +94,9 @@ impl Order {
     }
 
     fn link(&mut self, r: u32, c: u32) {
+        // W05-R26: an unused order has no heap storage. Its first valid member activates
+        // the fixed class domain; the bound comes from the rate encoding, not a cache limit.
+        if self.head.is_empty() { self.head.resize(BUCKETS as usize, NIL); }
         let n = r as usize + 1;
         if self.class.len() < n {
             self.class.resize(n, NIL);

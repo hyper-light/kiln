@@ -25,6 +25,10 @@ pub struct RunnerFacts {
     /// The volume holding the runner's work directory.
     pub disk: Disk,
     pub gpus: Vec<Gpu>,
+    /// Why no native GPU counters can be read on this host, as the retained provider reports it.
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_unavailable: Option<String>,
     pub virt: Virt,
     /// Executors that work right now, each with its version and details.
     pub executors: BTreeMap<String, Executor>,
@@ -287,6 +291,18 @@ pub struct Gpu {
     pub model: String,
     pub memory: u64,
     pub driver: Option<String>,
+    /// Stable hardware identity when the provider reports one (PCI address or vendor UUID).
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Utilisation in thousandths, absent when unreadable; never an invented idle sample.
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub busy_per_mille: Option<u16>,
+    /// Device memory in use, bytes; absent when unreadable.
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_used: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -23,7 +23,7 @@ use super::msg::{self, Brief, NO_FAST, Of, Start, ToOwner, ToRunner, Why, Word};
 use super::order::Order;
 use super::slab::{Handle, Slab};
 use super::weights::{FellBack, Weights};
-use super::{Amounts, CPU, NIL, OwnerId, RunnerId, SigId, multi, narrow, rest, rest_fits};
+use super::{Amounts, CPU, KindId, NIL, OwnerId, RunnerId, SigId, multi, narrow, rest, rest_fits};
 
 /// How many runners a run that finds no room waits at: two. With two choices the most loaded of
 /// n bins holds log log n / ln 2 + O(1) instead of Θ(log n / log log n), and each choice past the
@@ -121,9 +121,90 @@ struct Pend {
     from: u32,
     /// The bucket its view says.
     to: u32,
+    /// Its view when it was put in the bucket it's in: a pick that brings its view back to this
+    /// leaves it there, with no key to work out.
+    was: u32,
+    /// The kind of work whose good place it is, as the last win said there ([`Owner::won`]; it
+    /// may be others' too, which their own records say): a run of that kind goes back to it when
+    /// it only ties the most free, read here with no record of the kind's to load. [`NO_KIND`]:
+    /// none.
+    kind: u32,
 }
 
-const NO_PEND: Pend = Pend { r: NIL, from: 0, to: 0 };
+/// In [`Pend::kind`] and [`Rise::kind`]: no kind. Not [`KindId::NONE`], which an ask that names
+/// no kind carries: the two never match.
+const NO_KIND: u32 = NIL - 1;
+
+const NO_PEND: Pend = Pend { r: NIL, from: 0, to: 0, was: 0, kind: NO_KIND };
+
+/// What an owner keeps of each kind of work (docs/lb.md "Good places"): two runners, and what
+/// its last ends left to settle.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct Kind {
+    /// The runner its work last went well on, by its shell's judgment ([`Owner::won`]), unless
+    /// that runner has let it down since (NIL: none).
+    good: u32,
+    /// [`SETTLED`], [`DOUBT`] or [`RED`]. Beside `good`, so a win writes the two at once.
+    state: u32,
+    /// The runner that last let its work down ([`Owner::failed`]), or that it failed on with no
+    /// one able to say whose fault it was ([`Owner::unsure`]), unless it has gone well there
+    /// since (NIL: none): passed over when the turn comes to it and another is as free.
+    shun: u32,
+}
+
+/// A kind's state: nothing to settle.
+const SETTLED: u32 = 0;
+/// A kind's state: its last run failed on `shun` and no one can say whose fault it was. Its next
+/// run goes elsewhere, and what becomes of that one settles it ([`Owner::unsure`]).
+const DOUBT: u32 = 1;
+/// A kind's state: its work fails wherever it runs (it failed on two runners running), so a
+/// failure no one can explain is its own, and is held against no runner until it goes well.
+const RED: u32 = 2;
+
+const NO_PLACES: Kind = Kind { good: NIL, state: SETTLED, shun: NIL };
+
+#[cfg(test)]
+thread_local! {
+    /// Tests alone: every move is made as it comes (none is put off past a win or a pick), a
+    /// tied pick's two one after the other as before [`Owner::ask_turn`], so the two ways can be
+    /// held against each other.
+    static TWO_MOVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests alone: how many tied picks swapped, how many went back to the runner put off as
+    /// its bucket's turn came to it, and how many went back to it as its kind's good place.
+    static TURNS: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// Runs `f` with every move made as it comes, a tied pick's two one after the other (tests
+/// alone).
+#[cfg(test)]
+pub(super) fn with_two_moves<T>(f: impl FnOnce() -> T) -> T {
+    TWO_MOVES.with(|c| c.set(true));
+    let v = f();
+    TWO_MOVES.with(|c| c.set(false));
+    v
+}
+
+/// How many tied picks swapped, how many went back to the runner put off as its bucket's turn
+/// came to it, and how many went back to it as its kind's good place, on this thread (tests
+/// alone).
+#[cfg(test)]
+pub(super) fn turns() -> (u64, u64, u64) {
+    TURNS.with(std::cell::Cell::get)
+}
+
+/// A batch's rise. W05-R26: `turn` records its arrival order before sorting, so an in-place
+/// unstable sort preserves equal-key turns without a stable sort's temporary allocation.
+/// Recomputed from the live list for each overlay; no lifetime or capacity policy is needed.
+#[derive(Debug, Clone, Copy)]
+struct Rise {
+    r: u32,
+    from: u32,
+    turn: u32,
+    /// The kind of work that last went well there in this batch ([`Owner::won`]; [`NO_KIND`]:
+    /// none): a batch's runs of that kind go back to it among its equals.
+    kind: u32,
+}
 
 /// In [`Pend::r`]: this owner shares its fleet with others and spreads its picks (no move is
 /// ever put off then). `NIL - 1`, so the fast paths' test for a runner pending is the one
@@ -157,16 +238,18 @@ struct Cold {
     rates: terms::Rates,
 }
 
-/// A run, 32 bytes. What a run needs beyond CPU, and where it waits, are in its [`Slow`] record.
-#[derive(Debug, Clone, Copy)]
+/// W05-R23: six u32 words per owner slot, including its complete generation. Before
+/// admission, `body` holds CPU and signature; once STARTED it holds the runner's handle.
+/// CPU/signature are never read after admission, and the handle is never read before it.
+/// Wider CPU demands remain in Slow until admission, as before. No demand or generation
+/// bits are discarded; the state selects which pair of u32 values the word represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 struct Run {
-    cpu: u64,
-    /// Its handle at its runner: an admitted run's there, or the room held for it.
-    at: Handle,
-    sig: u32,
+    body: u64,
+    generation: u32,
     runner: u32,
     state: u32,
-    /// Its slow record's slot (NIL: none).
     slow: u32,
 }
 
@@ -183,6 +266,8 @@ struct Place {
 const NO_PLACE: Place = Place { runner: NIL, at: Handle::NONE, epoch: 0 };
 
 mod orders;
+mod runs;
+use runs::Runs;
 pub(crate) mod terms;
 pub use orders::Link;
 pub use terms::{Terms, Warm};
@@ -190,6 +275,8 @@ pub use terms::{Terms, Warm};
 /// What a run needs of memory, disk and GPUs, and where it waits.
 #[derive(Debug, Clone, Copy)]
 struct Slow {
+    /// Full-width original CPU request; no narrowing on waiting or repeated placement.
+    cpu: u64,
     rest: [u64; 3],
     places: [Place; PLACES],
     /// Its neighbours in its signature's waiting runs (run slots), while it is in them.
@@ -299,7 +386,7 @@ pub struct Owner {
     /// Each runner's indexes past its first.
     more: Vec<Vec<u32>>,
     sigs: Vec<Sig>,
-    runs: Slab<Run>,
+    runs: Runs,
     slow: Slab<Slow>,
     /// How many buckets each index has: the most core-equivalents any runner's whole budget has
     /// at its multiplier, plus one, at most [`BUCKETS`] ([`buckets_for`]).
@@ -312,8 +399,10 @@ pub struct Owner {
     batch: Vec<(u32, u32)>,
     /// The runner whose room rose and whose bucket hasn't moved for it yet.
     pend: Pend,
+    /// Each kind of work's good place and the place it passes over ([`Kind`]), by [`KindId`].
+    kinds: Vec<Kind>,
     /// A batch's runners whose rises are put off and the buckets they're in (`MANY` in `pend`).
-    put_off: Vec<(u32, u32)>,
+    put_off: Vec<Rise>,
     /// Candidates a pick chooses among when other owners decide over this fleet: 1 is the exact
     /// best (one owner), the rest the expected herd (docs/lb.md "Several owners").
     width: u32,
@@ -324,8 +413,8 @@ pub struct Owner {
     /// slowness that differs from it): bucket lower bounds don't promise CPUs, and a narrow ask's
     /// order is the narrow one, not the index's (docs/lb.md "Rank").
     ordered: bool,
-    /// The signatures keep their orders by measured rates.
-    orders_on: bool,
+    /// Which rate orders have actually been requested (one bit per order kind).
+    orders_kept: u8,
     /// The runners whose places in the disk, link and network orders are put off ([`DIRTY`]).
     dirty: Vec<u32>,
     /// The candidates an [`Owner::ask_with`] has seen, kept to reuse (a shared owner draws
@@ -397,7 +486,7 @@ fn mark(flags: &mut u32, dirty: &mut Vec<u32>, r: u32) {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, dirty: Vec::new(), seen: Vec::new(), counts: Counts::default(), draws: Draws::default(), weights: Weights::default(), eligible: Vec::new(), auction: false, prior: terms::Priors::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Runs::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, batch: Vec::new(), pend: NO_PEND, kinds: Vec::new(), put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_kept: 0, dirty: Vec::new(), seen: Vec::new(), counts: Counts::default(), draws: Draws::default(), weights: Weights::default(), eligible: Vec::new(), auction: false, prior: terms::Priors::default() }
     }
 
     /// Grows every index to `want` buckets when that is more than they have.
@@ -419,7 +508,7 @@ impl Owner {
 
     /// Room for `runs` runs before its tables grow (none grows on a decision after that).
     pub fn reserve(&mut self, runs: usize) {
-        self.runs = Slab::with_capacity(runs);
+        self.runs = Runs::with_capacity(runs);
     }
 
     #[inline(always)]
@@ -466,9 +555,10 @@ impl Owner {
             *c = Cold { budget, word_rest: word.rest, inflight_rest: [0; 3], speed: word.speed, slowness: word.slowness, disk: word.disk, net: word.net, measured: word.measured, link: c.link, rates: c.rates };
         }
         self.restamp(r.0);
-        self.rerate(r.0);
         if word.measured != 0 {
             self.measures_heard(r.0);
+        } else {
+            self.rerate(r.0);
         }
     }
 
@@ -483,7 +573,7 @@ impl Owner {
         }
         let mut ix = Index::new(start);
         ix.grow(self.buckets, u32::try_from(self.peers.len()).unwrap_or(NIL));
-        let orders = if self.orders_on { orders::orders() } else { Vec::new() };
+        let orders = orders::orders(self.orders_kept);
         self.sigs.push(Sig { ix, orders, wait_head: NIL, wait_tail: NIL, waiting: 0 });
         SigId(id)
     }
@@ -515,7 +605,7 @@ impl Owner {
                 p.flags |= MORE;
             }
         }
-        if self.orders_on {
+        if self.orders_kept != 0 {
             self.sync_orders(ri);
         }
         if self.waiting != 0 {
@@ -611,7 +701,23 @@ impl Owner {
         {
             return Ok(Asked { run, send: Some((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch, need }))) });
         }
-        self.ask_general(sig, need, out)
+        self.ask_general(sig, NIL, need, out)
+    }
+
+    /// [`Owner::ask`] for a run of kind `kind` (docs/lb.md "Good places"): between members the
+    /// rank can't tell apart it goes back to where that kind's work last went well
+    /// ([`Owner::won`]), and passes over the runner that last let it down ([`Owner::failed`])
+    /// when another is as free. The rank decides first, and a kind with neither is decided as an
+    /// ask that names none.
+    #[inline(always)]
+    pub fn ask_kind(&mut self, sig: SigId, kind: KindId, need: Amounts, out: &mut Out) -> Result<Asked, Refused> {
+        if !multi(&need)
+            && let Ok(cpu) = u32::try_from(need[0])
+            && let Some((r, run, epoch)) = self.ask_fast_of(sig, kind, cpu)
+        {
+            return Ok(Asked { run, send: Some((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch, need }))) });
+        }
+        self.ask_general(sig, kind.0, need, out)
     }
 
     /// An ask of CPU alone on the fast path: the top bucket's next in turn has the room, in that
@@ -620,46 +726,220 @@ impl Owner {
     /// [`Owner::ask`]'s general path decides.
     #[inline(always)]
     pub fn ask_fast(&mut self, sig: SigId, cpu: u32) -> Option<(u32, Handle, u32)> {
+        if let Some(picked) = self.ask_alone(sig, cpu) {
+            return Some(picked);
+        }
+        self.ask_rest(sig, cpu)
+    }
+
+    /// [`Owner::ask_fast`] for a run of kind `kind` ([`Owner::ask_kind`]). The entries that name
+    /// a kind are compiled apart from those that name none, which carry none of a kind's checks:
+    /// an ask that names no kind is decided in what it took before there were kinds.
+    #[inline(always)]
+    pub fn ask_fast_of(&mut self, sig: SigId, kind: KindId, cpu: u32) -> Option<(u32, Handle, u32)> {
+        if let Some(picked) = self.ask_alone_of(sig, kind, cpu) {
+            return Some(picked);
+        }
+        self.ask_rest_of(sig, kind, cpu)
+    }
+
+    /// The first half of [`Owner::ask_fast`], by itself: the pick that goes back to the runner a
+    /// run just ended on, when it alone is the most free, or when it only ties the most free and
+    /// is the good place of the kind asked (that kind's work just went well there:
+    /// [`Owner::won`]). The assignment that is best by rank and by what the node holds for the
+    /// work is then also the one that takes the least to decide: nothing looked up, nothing
+    /// moved. It calls nothing on its way, so a caller that makes [`Owner::ask_rest`] its last act
+    /// when this has no pick keeps no frame for the commonest step (W05-R26). `None`: nothing
+    /// done.
+    #[inline(always)]
+    pub fn ask_alone(&mut self, sig: SigId, cpu: u32) -> Option<(u32, Handle, u32)> {
+        self.alone::<false>(sig, NIL, cpu)
+    }
+
+    /// [`Owner::ask_alone`] for a run of kind `kind` ([`Owner::ask_fast_of`]).
+    #[inline(always)]
+    pub fn ask_alone_of(&mut self, sig: SigId, kind: KindId, cpu: u32) -> Option<(u32, Handle, u32)> {
+        self.alone::<true>(sig, kind.0, cpu)
+    }
+
+    /// [`Owner::ask_alone`]; `K`: the ask names a kind.
+    #[inline(always)]
+    fn alone<const K: bool>(&mut self, sig: SigId, kind: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
         #[cfg(test)]
         if super::any_planted() {
             return None;
         }
         let si = sig.0;
-        let last = self.last();
-        let Pend { r: pr, from, to: kp } = self.pend;
-        if pr < MANY {
-            let s = self.sigs.get_mut(si as usize)?;
-            let p = self.peers.get_mut(pr as usize)?;
-            if p.view >= cpu && s.ix.none_from(kp) && (p.sig0 == si || s.ix.contains(pr)) {
-                // It alone is the most free: the pick goes back to it, and it needn't have moved.
-                let run = self.runs.insert(Run { cpu: u64::from(cpu), at: Handle::NONE, sig: si, runner: pr, state: STARTING, slow: NIL })?;
-                s.ix.took(kp, pr);
-                p.view -= cpu;
-                p.inflight = p.inflight.saturating_add(cpu);
-                let (to, epoch) = (key(p.view, p.scale, last), p.epoch());
-                self.pend.r = NIL;
-                if to != from {
-                    self.resettle(pr, from, to);
-                }
-                return Some((pr, run, epoch));
+        let Pend { r: pr, from, to: kp, was, kind: its } = self.pend;
+        if pr >= MANY {
+            return None;
+        }
+        let s = self.sigs.get_mut(si as usize)?;
+        let p = self.peers.get_mut(pr as usize)?;
+        // What holds a member from its bucket up: nothing (it alone is the most free), or that
+        // bucket alone (it ties the most free), which only its own kind's run is taken from.
+        let above = s.ix.upward(kp);
+        if p.view < cpu || above > u64::from(K && kind == its) || (p.sig0 != si && !s.ix.contains(pr)) {
+            return None;
+        }
+        // The pick goes back to it, and it needn't have moved.
+        let run = self.runs.insert(Run::new(u64::from(cpu), si, pr, STARTING, NIL))?;
+        if above == 0 {
+            // The only one there: the bucket's turn goes on past it, as its two moves leave it.
+            s.ix.took(kp, pr);
+        } else {
+            // Its kind's good place among its equals: their turn doesn't move.
+            #[cfg(test)]
+            TURNS.with(|c| c.set((c.get().0, c.get().1, c.get().2 + 1)));
+        }
+        p.view -= cpu;
+        p.inflight = p.inflight.saturating_add(cpu);
+        let epoch = p.epoch();
+        self.pend.r = NIL;
+        // The run takes what the last one gave back, the commonest by far: its view is what it
+        // was in the bucket it's in, and no key is worked out for it.
+        if p.view != was {
+            let to = key(p.view, p.scale, self.last);
+            if to != from {
+                self.resettle(pr, from, to);
             }
         }
-        self.ask_other(si, cpu)
+        Some((pr, run, epoch))
+    }
+
+    /// The second half of [`Owner::ask_fast`]: every fast pick [`Owner::ask_alone`] doesn't
+    /// decide. `None`: nothing done, [`Owner::ask`]'s general path decides.
+    #[inline(always)]
+    pub fn ask_rest(&mut self, sig: SigId, cpu: u32) -> Option<(u32, Handle, u32)> {
+        #[cfg(test)]
+        if super::any_planted() {
+            return None;
+        }
+        self.ask_other::<false>(sig.0, NIL, cpu)
+    }
+
+    /// [`Owner::ask_rest`] for a run of kind `kind` ([`Owner::ask_fast_of`]).
+    #[inline(always)]
+    pub fn ask_rest_of(&mut self, sig: SigId, kind: KindId, cpu: u32) -> Option<(u32, Handle, u32)> {
+        #[cfg(test)]
+        if super::any_planted() {
+            return None;
+        }
+        self.ask_other::<true>(sig.0, kind.0, cpu)
+    }
+
+    /// Kind `kind`'s places, when the ask names a kind (`K`); none when it names none, read
+    /// from no record.
+    #[inline(always)]
+    fn places<const K: bool>(&self, kind: u32) -> Kind {
+        if K { self.kinds.get(kind as usize).copied().unwrap_or(NO_PLACES) } else { NO_PLACES }
     }
 
     /// Every pick the put-off move didn't decide, the fast entry's one call off its path (so its
     /// path holds only what it uses): an owner that spreads draws among the top buckets; the
     /// exact best is the top bucket's next in turn.
     #[inline(never)]
-    fn ask_other(&mut self, si: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
+    fn ask_other<const K: bool>(&mut self, si: u32, kind: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
         if self.pend.r == WIDE {
             if self.ordered {
-                return self.ask_narrow(si, cpu);
+                return self.ask_narrow::<K>(si, kind, cpu);
             }
             return self.ask_wide(si, cpu);
         }
+        if self.pend.r < MANY {
+            // A runner's rise is put off and it isn't alone as the most free: out of this
+            // dispatcher, so the picks that have none put off, and a measured or shared fleet's,
+            // pay for no frame of its.
+            return self.ask_tied::<K>(si, kind, cpu);
+        }
         self.flush();
-        self.ask_top(si, cpu)
+        self.ask_top::<K>(si, kind, cpu)
+    }
+
+    /// The pick with a runner's rise put off that [`Owner::ask_fast`] didn't take: tied at the
+    /// top ([`Owner::ask_turn`]), or else its move made and the top bucket's next in turn taken.
+    #[inline(never)]
+    fn ask_tied<const K: bool>(&mut self, si: u32, kind: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
+        if let Some(picked) = self.ask_turn::<K>(si, kind, cpu) {
+            return Some(picked);
+        }
+        self.flush();
+        self.ask_top::<K>(si, kind, cpu)
+    }
+
+    /// The pick when the runner whose rise is put off only ties the most free (its view says the
+    /// top bucket, which holds others): what [`Owner::ask_top`] picks of that bucket with it
+    /// counted in. That is the good place of the kind asked when it is there with the room (the
+    /// runner put off, or another), and no turn moves; else the bucket's next in turn (W05-R04's
+    /// turns; W05-R23's most free). When the pick is the runner put off, it goes back to it and
+    /// nothing moves, as when it is alone at the top ([`Owner::ask_fast`]). When it is another,
+    /// which the run leaves where the first was, the two change places in one write
+    /// ([`Index::swap`]): what moving the first up ([`Owner::flush`]) and then taking the other
+    /// down leave, without each bucket's count going down and up again. The commonest pick on a
+    /// fleet with room to spare, where a run that ends leaves its runner one of many as free.
+    /// `None`: nothing done, and the two moves are made one after the other (a run of another
+    /// size, a runner in several indexes, orders kept, a top bucket above it, the next in turn
+    /// the runner that last let the kind down).
+    #[inline(always)]
+    fn ask_turn<const K: bool>(&mut self, si: u32, kind: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
+        #[cfg(test)]
+        if TWO_MOVES.with(std::cell::Cell::get) {
+            return None;
+        }
+        let Pend { r: pr, from, to: kp, .. } = self.pend;
+        if pr >= MANY || self.orders_kept != 0 {
+            return None;
+        }
+        let last = self.last();
+        let Kind { good, shun, .. } = self.places::<K>(kind);
+        let s = self.sigs.get_mut(si as usize)?;
+        if from >= kp || s.ix.top() != Some(kp) {
+            return None;
+        }
+        let pp = self.peers.get(pr as usize)?;
+        if pp.sig0 != si || pp.flags & MORE != 0 {
+            return None;
+        }
+        let at_good = K && good != NIL && (good == pr || s.ix.holds(kp, good)) && self.peers.get(good as usize).is_some_and(|p| p.view >= cpu);
+        let r = if at_good {
+            good
+        } else {
+            // The bucket's own next in turn, unless the runner put off comes before it.
+            let w = s.ix.next_in(kp);
+            let r = if s.ix.before(kp, pr, w) { pr } else { w };
+            if K && r == shun {
+                return None;
+            }
+            r
+        };
+        let p = self.peers.get_mut(r as usize)?;
+        if p.view < cpu || p.flags & MORE != 0 {
+            return None;
+        }
+        let to = key(p.view - cpu, p.scale, last);
+        if r != pr && to != from {
+            return None;
+        }
+        let run = self.runs.insert(Run::new(u64::from(cpu), si, r, STARTING, NIL))?;
+        if !at_good {
+            s.ix.took(kp, r);
+        }
+        p.view -= cpu;
+        p.inflight = p.inflight.saturating_add(cpu);
+        let epoch = p.epoch();
+        self.pend.r = NIL;
+        if r != pr {
+            s.ix.swap(pr, r, from, kp);
+            #[cfg(test)]
+            TURNS.with(|c| c.set((c.get().0 + 1, c.get().1, c.get().2)));
+        } else {
+            #[cfg(test)]
+            TURNS.with(|c| c.set((c.get().0, c.get().1 + 1, c.get().2)));
+            if to != from {
+                self.resettle(pr, from, to);
+            }
+        }
+        Some((r, run, epoch))
     }
 
     /// A plain ask on measured runners (narrow: its parallelism is its CPU need) on the fast
@@ -669,11 +949,12 @@ impl Owner {
     /// a need of one core never misses. `None`: [`Owner::ask`]'s general path decides (a shared
     /// owner's draw, a runner in several indexes, a head short of the need).
     #[inline(never)]
-    fn ask_narrow(&mut self, si: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
+    fn ask_narrow<const K: bool>(&mut self, si: u32, kind: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
         if self.width > 1 {
             return None;
         }
         let last = self.last;
+        let Kind { good, shun, .. } = self.places::<K>(kind);
         let s = self.sigs.get_mut(si as usize)?;
         let o = s.orders.get_mut(orders::NARROW)?;
         let c = o.top()?;
@@ -681,15 +962,28 @@ impl Owner {
         let top = s.ix.top();
         let w = top.map_or(NIL, |t| s.ix.next_in(t));
         let room = |r: u32| self.peers.get(r as usize).is_some_and(|p| p.view >= cpu);
-        let from_ix = w != head && w != NIL && o.class(w) == c && room(w);
-        let r = if from_ix { w } else { head };
+        // The kind's good place, when its cores are as fast as the fastest with one free: no
+        // turn moves for it. Else the turn, passing over the runner that last let the kind down
+        // when another of the class is there.
+        let at_good = K && good != NIL && o.class(good) == c && room(good);
+        let from_ix = !at_good && w != head && w != NIL && !(K && w == shun) && o.class(w) == c && room(w);
+        let r = if at_good {
+            good
+        } else if from_ix {
+            w
+        } else if K && head == shun {
+            o.after(head)
+        } else {
+            head
+        };
         let p = self.peers.get_mut(r as usize)?;
         if p.view < cpu || p.flags & MORE != 0 {
             return None;
         }
-        let run = self.runs.insert(Run { cpu: u64::from(cpu), at: Handle::NONE, sig: si, runner: r, state: STARTING, slow: NIL })?;
-        match (from_ix, top) {
-            (true, Some(t)) => s.ix.took(t, r),
+        let run = self.runs.insert(Run::new(u64::from(cpu), si, r, STARTING, NIL))?;
+        match (at_good, from_ix, top) {
+            (true, _, _) => {}
+            (_, true, Some(t)) => s.ix.took(t, r),
             _ => o.took(r),
         }
         let from = key(p.view, p.scale, last);
@@ -703,7 +997,9 @@ impl Owner {
                 // No whole core left: out of its orders, the narrow one now, the rest when an ask
                 // reads them.
                 o.set(r, NIL);
-                mark(&mut p.flags, &mut self.dirty, r);
+                if self.orders_kept & orders::BYTES != 0 {
+                    mark(&mut p.flags, &mut self.dirty, r);
+                }
             }
         }
         Some((r, run, epoch))
@@ -750,20 +1046,20 @@ impl Owner {
                 break (s.ix.nth_in(b, u), b);
             }
             u -= c;
-            let Some(x) = s.ix.below(b) else { return self.ask_top(si, cpu) };
+            let Some(x) = s.ix.below(b) else { return self.ask_top::<false>(si, NIL, cpu) };
             b = x;
         };
-        let Some(p) = self.peers.get_mut(r as usize) else { return self.ask_top(si, cpu) };
+        let Some(p) = self.peers.get_mut(r as usize) else { return self.ask_top::<false>(si, NIL, cpu) };
         if p.view < cpu || p.flags & MORE != 0 {
-            return self.ask_top(si, cpu);
+            return self.ask_top::<false>(si, NIL, cpu);
         }
-        let run = self.runs.insert(Run { cpu: u64::from(cpu), at: Handle::NONE, sig: si, runner: r, state: STARTING, slow: NIL })?;
+        let run = self.runs.insert(Run::new(u64::from(cpu), si, r, STARTING, NIL))?;
         s.ix.took(bucket, r);
         p.view -= cpu;
         p.inflight = p.inflight.saturating_add(cpu);
         let to = key(p.view, p.scale, self.last);
         s.ix.relink(r, bucket, to);
-        if to == 0 && bucket != 0 && self.orders_on {
+        if to == 0 && bucket != 0 && self.orders_kept & orders::BYTES != 0 {
             mark(&mut p.flags, &mut self.dirty, r);
         }
         Some((r, run, p.epoch()))
@@ -773,23 +1069,34 @@ impl Owner {
     /// release it follows paid for the rest, and the pick that goes back to its runner is the
     /// hot one.
     #[inline(never)]
-    fn ask_top(&mut self, si: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
+    fn ask_top<const K: bool>(&mut self, si: u32, kind: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
         let last = self.last();
+        let Kind { good, shun, .. } = self.places::<K>(kind);
         let s = self.sigs.get_mut(si as usize)?;
         let top = s.ix.top()?;
-        let r = s.ix.next_in(top);
+        // The kind's good place when it is as free as the most free and has the room: the
+        // bucket's turn doesn't move for it, unless it is the only one there. Else the next in
+        // turn, passing over the runner that last let the kind down when another is there.
+        let (r, turn) = if K && good != NIL && s.ix.holds(top, good) && self.peers.get(good as usize).is_some_and(|p| p.view >= cpu) {
+            (good, s.ix.count(top) == 1)
+        } else {
+            let r = s.ix.next_in(top);
+            (if K && r == shun { s.ix.after_in(top, r) } else { r }, true)
+        };
         let p = self.peers.get_mut(r as usize)?;
         if p.view < cpu || p.flags & MORE != 0 {
             return None;
         }
-        let run = self.runs.insert(Run { cpu: u64::from(cpu), at: Handle::NONE, sig: si, runner: r, state: STARTING, slow: NIL })?;
-        s.ix.took(top, r);
+        let run = self.runs.insert(Run::new(u64::from(cpu), si, r, STARTING, NIL))?;
+        if turn {
+            s.ix.took(top, r);
+        }
         p.view -= cpu;
         p.inflight = p.inflight.saturating_add(cpu);
         let to = key(p.view, p.scale, last);
         s.ix.relink(r, top, to);
         let epoch = p.epoch();
-        if to == 0 && top != 0 && self.orders_on {
+        if to == 0 && top != 0 && self.orders_kept != 0 {
             // No whole core left: out of its orders.
             self.gate(r);
         }
@@ -826,11 +1133,186 @@ impl Owner {
         }
     }
 
+    /// The run of kind `kind` this owner last heard end on runner `r` was a successful
+    /// assignment: its shell's judgment, made as the run ends and never while deciding (the work
+    /// completed there as quickly, efficiently, completely and correctly as it could have; the
+    /// kernel knows nothing of how runs end). `r` is that kind's good place from now: its next
+    /// run goes back there when `r` is among the best by rank (as free as the most free; on
+    /// measured runners, its cores as fast as the fastest with one free), where what the work
+    /// left is warm and the node has shown it can do it. The rank decides first; work of other
+    /// kinds, or of none, takes its turn as before (docs/lb.md "Good places").
+    #[inline(always)]
+    pub fn won(&mut self, r: RunnerId, kind: KindId) {
+        #[cfg(test)]
+        if super::planted(super::Mutant::NoStay) {
+            return;
+        }
+        let Some(k) = self.kinds.get_mut(kind.0 as usize) else { return self.won_new(r, kind) };
+        k.good = r.0;
+        k.state = SETTLED;
+        if k.shun == r.0 {
+            k.shun = NIL;
+        }
+        #[cfg(test)]
+        if TWO_MOVES.with(std::cell::Cell::get) {
+            // Tests' other way: no move is put off past a win.
+            return self.flush();
+        }
+        if self.pend.r == r.0 {
+            self.pend.kind = kind.0;
+        } else {
+            self.won_slow(r.0, kind.0);
+        }
+    }
+
+    /// [`Owner::won`] for a kind this owner hasn't heard of: a record for it, then as any.
+    #[cold]
+    #[inline(never)]
+    fn won_new(&mut self, r: RunnerId, kind: KindId) {
+        if self.know(kind.0) {
+            self.won(r, kind);
+        }
+    }
+
+    /// Room for the kinds numbered below `kinds`, made as the shell numbers them: none is made
+    /// on an end or a decision after that (a kind it wasn't told of gets its record at its
+    /// first word).
+    pub fn kinds(&mut self, kinds: u32) {
+        if kinds > 0 {
+            self.know(kinds - 1);
+        }
+    }
+
+    /// Kind `kind`'s good place now ([`Owner::won`]; `None`: none): for the shell to say why a run
+    /// went where it did.
+    pub fn good(&self, kind: KindId) -> Option<RunnerId> {
+        self.kinds.get(kind.0 as usize).map(|k| k.good).filter(|r| *r != NIL).map(RunnerId)
+    }
+
+    /// Makes a record for kind `kind` when there is none. False: it names no kind.
+    fn know(&mut self, kind: u32) -> bool {
+        if kind >= NO_KIND {
+            return false;
+        }
+        if self.kinds.len() <= kind as usize {
+            self.kinds.resize(kind as usize + 1, NO_PLACES);
+        }
+        true
+    }
+
+    /// [`Owner::won`] on a runner whose rise isn't the one put off.
+    #[cold]
+    #[inline(never)]
+    fn won_slow(&mut self, r: u32, kind: u32) {
+        // The kind's good place is no longer the runner whose move is put off, if it was.
+        if self.pend.kind == kind {
+            self.pend.kind = NO_KIND;
+        }
+        // One of a batch's rises: the batch's picks of this kind go back to it ([`Owner::overlay`]).
+        if self.pend.r == MANY
+            && let Some(rise) = self.put_off.iter_mut().rev().find(|x| x.r == r)
+        {
+            rise.kind = kind;
+        }
+    }
+
+    /// The run of kind `kind` this owner last heard end on runner `r` was not a successful
+    /// assignment: its shell's judgment that `r` let the work down (lost, killed, out of room, a
+    /// tool missing, far slower than it should have been, a result another node contradicts).
+    /// `r` is no longer that kind's good place, and is passed over for it when the turn comes to
+    /// `r` while another is as free, until the kind's work goes well there or is let down
+    /// elsewhere. A run that failed for its own sake (a test that fails anywhere) is no reason to
+    /// say this: the assignment was a good one.
+    pub fn failed(&mut self, r: RunnerId, kind: KindId) {
+        #[cfg(test)]
+        if super::planted(super::Mutant::StaysOnALoser) {
+            return;
+        }
+        if !self.know(kind.0) {
+            return;
+        }
+        if let Some(k) = self.kinds.get_mut(kind.0 as usize) {
+            k.shun = r.0;
+            k.state = SETTLED;
+            if k.good == r.0 {
+                k.good = NIL;
+            }
+        }
+        self.left(r.0, kind.0);
+    }
+
+    /// Runner `r` is no longer kind `kind`'s good place: not in the move put off, nor in a
+    /// batch's rise.
+    fn left(&mut self, r: u32, kind: u32) {
+        if self.pend.r == r && self.pend.kind == kind {
+            self.pend.kind = NO_KIND;
+        }
+        if self.pend.r == MANY
+            && let Some(rise) = self.put_off.iter_mut().rev().find(|x| x.r == r && x.kind == kind)
+        {
+            rise.kind = NO_KIND;
+        }
+        #[cfg(test)]
+        if TWO_MOVES.with(std::cell::Cell::get) {
+            self.flush();
+        }
+    }
+
+    /// The run of kind `kind` this owner last heard end on runner `r` failed, and its shell
+    /// can't say whether the node or the work was at fault (no cause it knows, as
+    /// [`Owner::failed`] has). The kernel settles it by comparison, with no rate or count to set:
+    /// the kind's next run goes elsewhere once (`r` is passed over for it as a runner that let
+    /// it down is). If it goes well there, `r` was at fault and stays passed over; if it fails
+    /// there too, the work was: nothing is held against either runner, the kind stays where it
+    /// now is, and its further failures are its own until a run of it goes well. So work that is
+    /// failing for its own sake moves once and then keeps its place, and a node that fails a kind
+    /// of work that passes elsewhere loses it at the first failure.
+    pub fn unsure(&mut self, r: RunnerId, kind: KindId) {
+        #[cfg(test)]
+        if super::planted(super::Mutant::StaysOnALoser) {
+            return;
+        }
+        if !self.know(kind.0) {
+            return;
+        }
+        let Some(k) = self.kinds.get_mut(kind.0 as usize) else { return };
+        match k.state {
+            // The work is failing wherever it runs: this failure is its own, and it stays here.
+            RED => k.good = r.0,
+            // It failed on another runner just before: the work's fault, not either runner's.
+            DOUBT if k.shun != r.0 => *k = Kind { good: r.0, state: RED, shun: NIL },
+            // The same runner again (no other was as free): nothing new is known.
+            DOUBT => {}
+            // Its first failure after going well, or its first run: it goes elsewhere once.
+            _ => {
+                k.state = DOUBT;
+                k.shun = r.0;
+                if k.good == r.0 {
+                    k.good = NIL;
+                }
+            }
+        }
+        if k.good == r.0 {
+            // Its place is here (the work's own failure): as a win leaves it.
+            if self.pend.r == r.0 {
+                self.pend.kind = kind.0;
+            } else {
+                self.won_slow(r.0, kind.0);
+            }
+            #[cfg(test)]
+            if TWO_MOVES.with(std::cell::Cell::get) {
+                self.flush();
+            }
+        } else {
+            self.left(r.0, kind.0);
+        }
+    }
+
     /// A word moved runner `r`'s view from key `from` to key `to`, and neither fast case held:
     /// no runner pending and the view risen, or `r` pending already.
     #[cold]
     #[inline(never)]
-    fn moved_slow(&mut self, r: u32, from: u32, to: u32) {
+    fn moved_slow(&mut self, r: u32, from: u32, to: u32, was: u32) {
         let Some(p) = self.peers.get(r as usize) else { return };
         let (sig0, more, listed) = (p.sig0, p.flags & MORE != 0, p.flags & PUT_OFF != 0);
         if self.pend.r == WIDE {
@@ -856,7 +1338,7 @@ impl Owner {
             }
         } else if to > from {
             self.flush();
-            self.pend = Pend { r, from, to };
+            self.pend = Pend { r, from, to, was, kind: NO_KIND };
         } else {
             self.relink_all(r, sig0, more, from, to);
         }
@@ -865,16 +1347,16 @@ impl Owner {
     /// Every other ask: memory, disk or GPUs, a walk, a runner in several indexes, a wait.
     #[cold]
     #[inline(never)]
-    fn ask_general(&mut self, sig: SigId, need: Amounts, out: &mut Out) -> Result<Asked, Refused> {
+    fn ask_general(&mut self, sig: SigId, kind: u32, need: Amounts, out: &mut Out) -> Result<Asked, Refused> {
         self.flush();
         let si = sig.0;
         let cpu_only = !multi(&need);
-        let r = self.pick_cpu(si, &need, cpu_only);
+        let r = self.pick_cpu(si, kind, &need, cpu_only);
         if r == NIL {
             return self.ask_waits(si, need, out);
         }
-        let slow = if cpu_only { NIL } else { self.slow_for(&need)? };
-        let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: si, runner: r, state: STARTING, slow }) else {
+        let slow = if Run::needs_slow(&need) { self.slow_for(&need)? } else { NIL };
+        let Some(run) = self.runs.insert(Run::new(need[0], si, r, STARTING, slow)) else {
             self.free_slow(slow);
             return Err(Refused::Full);
         };
@@ -888,6 +1370,41 @@ impl Owner {
         Ok(self.slow.insert(Slow::of(need)).ok_or(Refused::Full)?.slot)
     }
 
+    /// W05-R23: Hex's device-aware walk, adapted to kiln's CPU ordering. Only requests
+    /// with a GPU term pay for this walk. The callback ranks compatible GPU room; measured
+    /// per-core finish, then CPU room and its cursor, break ties. Admission deducts all dimensions.
+    pub fn ask_ranked(&mut self, sig: SigId, need: Amounts, mut rank: impl FnMut(RunnerId, Amounts) -> Option<u64>, out: &mut Out) -> Result<Asked, Refused> {
+        self.flush();
+        let Some(s) = self.sigs.get(sig.0 as usize) else { return Err(Refused::NoSig) };
+        let mut b = s.ix.top();
+        let mut best: Option<(u64, u32, u32, u32)> = None;
+        let mut walked = 0u64;
+        while let Some(bucket) = b {
+            for r in s.ix.bucket(bucket) {
+                walked = walked.saturating_add(1);
+                if !self.fits_at(r, &need) { continue; }
+                let Some(view) = self.view(RunnerId(r)) else { continue };
+                let cpu = self.multiplier(RunnerId(r));
+                if let Some(score) = rank(RunnerId(r), view)
+                    && best.is_none_or(|(old, old_cpu, _, _)| (score, cpu) > (old, old_cpu))
+                {
+                    best = Some((score, cpu, r, bucket));
+                }
+            }
+            b = s.ix.below(bucket);
+        }
+        self.counts.walked = self.counts.walked.saturating_add(walked);
+        let Some((_, _, r, bucket)) = best else { return self.ask_waits(sig.0, need, out) };
+        let slow = if Run::needs_slow(&need) { self.slow_for(&need)? } else { NIL };
+        let Some(run) = self.runs.insert(Run::new(need[0], sig.0, r, STARTING, slow)) else {
+            self.free_slow(slow);
+            return Err(Refused::Full);
+        };
+        if let Some(s) = self.sigs.get_mut(sig.0 as usize) { s.ix.took(bucket, r); }
+        let epoch = self.deduct(r, &need, !multi(&need));
+        Ok(Asked { run, send: Some((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch, need }))) })
+    }
+
     /// The ask found no member with room now: it waits, or never fits.
     #[cold]
     #[inline(never)]
@@ -897,7 +1414,7 @@ impl Owner {
             return Err(Refused::Never);
         }
         let slow = self.slow_for(&need)?;
-        let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: si, runner: NIL, state: WAITING, slow }) else {
+        let Some(run) = self.runs.insert(Run::new(need[0], si, NIL, WAITING, slow)) else {
             self.free_slow(slow);
             return Err(Refused::Full);
         };
@@ -914,8 +1431,11 @@ impl Owner {
     /// bucket b has b CPUs free and goes to bucket b - c, so the index alone decides the batch, in
     /// the order one at a time would; then each member's record is updated in a pass whose steps
     /// touch different runners, so their loads overlap. Anything else: one at a time. The starts
-    /// go in `starts`; runs that wait, in `waits` (what to send for them is in `out`).
-    pub fn ask_many(&mut self, sig: SigId, need: Amounts, n: usize, starts: &mut Vec<(RunnerId, Start)>, waits: &mut Vec<Handle>, out: &mut Out) -> Result<(), Refused> {
+    /// go in `starts`; runs that wait, in `waits` (what to send for them is in `out`). `kind`: the
+    /// batch's kind of work ([`KindId::NONE`]: none), whose good places its runs go back to among
+    /// their equals ([`Owner::ask_kind`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ask_many(&mut self, sig: SigId, kind: KindId, need: Amounts, n: usize, starts: &mut Vec<(RunnerId, Start)>, waits: &mut Vec<Handle>, out: &mut Out) -> Result<(), Refused> {
         starts.reserve(n);
         let mut left = n;
         #[cfg(test)]
@@ -925,7 +1445,7 @@ impl Owner {
         let c = need[0] / CPU;
         // A batch of whole CPUs after a batch of ends: the rises put off go first.
         if self.pend.r == MANY && !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.ordered && self.buckets < BUCKETS && !planted {
-            self.overlay(sig.0, need, &mut left, starts)?;
+            self.overlay(sig.0, kind.0, need, &mut left, starts)?;
         }
         self.flush();
         if !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.ordered && self.buckets < BUCKETS && !planted {
@@ -944,12 +1464,12 @@ impl Owner {
             }
             let cpu = narrow(need[0]);
             for &(r, b) in &batch {
-                let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: sig.0, runner: r, state: STARTING, slow: NIL }) else { return Err(Refused::Full) };
+                let Some(run) = self.runs.insert(Run::new(need[0], sig.0, r, STARTING, NIL)) else { return Err(Refused::Full) };
                 let Some(p) = self.peers.get_mut(r as usize) else { continue };
                 p.view = p.view.saturating_sub(cpu);
                 p.inflight = p.inflight.saturating_add(cpu);
                 let (epoch, more) = (p.epoch(), p.flags & MORE != 0);
-                if b == step && self.orders_on {
+                if b == step && self.orders_kept & orders::BYTES != 0 {
                     // No whole core left: its orders follow when an ask reads them.
                     mark(&mut p.flags, &mut self.dirty, r);
                 }
@@ -961,7 +1481,7 @@ impl Owner {
             self.batch = batch;
         }
         for _ in 0..left {
-            let a = self.ask(sig, need, out)?;
+            let a = self.ask_kind(sig, kind, need, out)?;
             match a.send {
                 Some((r, ToRunner::Start(s))) => starts.push((r, s)),
                 _ => waits.push(a.run),
@@ -973,17 +1493,28 @@ impl Owner {
     /// The member a need goes to: the next in turn of the highest bucket if it fits (CPU at the
     /// view, every other dimension exactly), else a walk (NIL: none fits).
     #[inline(always)]
-    fn pick(&mut self, sig: u32, need: &Amounts, cpu_only: bool) -> u32 {
+    fn pick(&mut self, sig: u32, kind: u32, need: &Amounts, cpu_only: bool) -> u32 {
         let Some(s) = self.sigs.get(sig as usize) else { return NIL };
         let Some(top) = s.ix.top() else { return NIL };
         #[cfg(test)]
         if super::planted(super::Mutant::MostLoaded) || super::planted(super::Mutant::Unordered) {
             return self.pick_mutant(sig, need);
         }
-        let r = s.ix.next_in(top);
-        let fits = self.peers.get(r as usize).is_some_and(|p| u64::from(p.view) >= need[0]);
-        if fits && (cpu_only || self.rest_fits_at(r, need)) {
-            if let Some(s) = self.sigs.get_mut(sig as usize) {
+        let Kind { good, shun, .. } = self.kinds.get(kind as usize).copied().unwrap_or(NO_PLACES);
+        let fits = |r: u32| self.peers.get(r as usize).is_some_and(|p| u64::from(p.view) >= need[0]) && (cpu_only || self.rest_fits_at(r, need));
+        // The kind's good place when it is as free as the most free and fits (the bucket's turn
+        // moves only when it is the one there), else the next in turn, passing over the runner
+        // that last let the kind down when another is there: as [`Owner::ask_top`].
+        let (r, turn) = if good != NIL && s.ix.holds(top, good) && fits(good) {
+            (good, s.ix.count(top) == 1)
+        } else {
+            let r = s.ix.next_in(top);
+            (if r == shun { s.ix.after_in(top, r) } else { r }, true)
+        };
+        if fits(r) {
+            if turn
+                && let Some(s) = self.sigs.get_mut(sig as usize)
+            {
                 s.ix.took(top, r);
             }
             return r;
@@ -1105,7 +1636,7 @@ impl Owner {
         if more {
             self.relink_more(r, from, to);
         }
-        if self.orders_on && (from == 0) != (to == 0) {
+        if self.orders_kept != 0 && (from == 0) != (to == 0) {
             self.gate(r);
         }
     }
@@ -1242,7 +1773,7 @@ impl Owner {
             let unsure = x.state & UNSURE != 0 && matches!(x.state & STATE, STARTING | GOING);
             if x.runner == r && unsure {
                 if x.state & STATE == STARTING {
-                    self.answered(r, x.cpu, x.slow);
+                    self.answered(r, x.cpu(), x.slow);
                 }
                 self.free_run(h);
                 if x.state & CANCELLED == 0 {
@@ -1309,7 +1840,7 @@ impl Owner {
         if x.runner != r || x.state != STARTING || x.slow != NIL {
             return false;
         }
-        let inflight = p.inflight.saturating_sub(narrow(x.cpu));
+        let inflight = p.inflight.saturating_sub(x.cpu());
         let view = b.cpu.saturating_sub(inflight);
         if view != p.view {
             // Commonest by far when the owner alone changes this runner's room: the view is what
@@ -1321,8 +1852,7 @@ impl Owner {
             }
             p.view = view;
         }
-        x.state = STARTED;
-        x.at = at;
+        x.started_at(at);
         p.inflight = inflight;
         true
     }
@@ -1332,9 +1862,34 @@ impl Owner {
     /// decides.
     #[inline(always)]
     pub fn ended_fast(&mut self, r: u32, run: Handle, b: Brief) -> bool {
+        self.ended_of::<false>(r, run, b, NIL)
+    }
+
+    /// [`Owner::ended_fast`] for an end whose shell says with it that the run's kind of work went
+    /// well there: the end heard and [`Owner::won`] said, in one, as they arrive (its judgment is
+    /// made as the run ends). Nothing is come back to between the two, and the move it puts off
+    /// is written once, with its kind. False: nothing done, neither heard nor said: the caller
+    /// hears the end on the general path and says [`Owner::won`] after it.
+    #[inline(always)]
+    pub fn ended_won(&mut self, r: u32, run: Handle, b: Brief, kind: KindId) -> bool {
+        self.ended_of::<true>(r, run, b, kind.0)
+    }
+
+    /// [`Owner::ended_fast`]; `W`: and its kind `kind`'s work went well there ([`Owner::ended_won`]).
+    #[inline(always)]
+    fn ended_of<const W: bool>(&mut self, r: u32, run: Handle, b: Brief, kind: u32) -> bool {
         #[cfg(test)]
         if super::any_planted() {
             return false;
+        }
+        #[cfg(test)]
+        if W && TWO_MOVES.with(std::cell::Cell::get) {
+            // Tests' other way: the end, then the win, each as it comes.
+            let heard = self.ended_of::<false>(r, run, b, NIL);
+            if heard {
+                self.won(RunnerId(r), KindId(kind));
+            }
+            return heard;
         }
         if self.waiting != 0 {
             return false;
@@ -1348,18 +1903,73 @@ impl Owner {
             return false;
         }
         p.heard = p.heard.wrapping_add(1);
-        let from = key(p.view, p.scale, last);
+        let was = p.view;
+        let from = key(was, p.scale, last);
         p.view = b.cpu.saturating_sub(p.inflight);
         let to = key(p.view, p.scale, last);
+        if W {
+            // The kind's good place first, then the move put off with its kind, written once.
+            // What isn't the short case is one call made last, with nothing to come back to: a
+            // caller that does nothing after this keeps no frame for it (W05-R26).
+            let Some(k) = self.kinds.get_mut(kind as usize) else {
+                self.ended_won_new(r, from, to, was, kind);
+                return true;
+            };
+            k.good = r;
+            k.state = SETTLED;
+            if k.shun == r {
+                k.shun = NIL;
+            }
+            if to != from {
+                if self.pend.r == NIL && to > from {
+                    self.pend = Pend { r, from, to, was, kind };
+                } else {
+                    self.moved_won(r, from, to, was, kind);
+                }
+            } else if self.pend.r == r {
+                self.pend.kind = kind;
+            } else {
+                self.won_slow(r, kind);
+            }
+            return true;
+        }
         if to != from {
             // Its move is put off: nothing reads its bucket before the next pick looks at it.
             if self.pend.r == NIL && to > from {
-                self.pend = Pend { r, from, to };
+                self.pend = Pend { r, from, to, was, kind: NO_KIND };
             } else {
-                self.moved_slow(r, from, to);
+                self.moved_slow(r, from, to, was);
             }
         }
         true
+    }
+
+    /// [`Owner::ended_won`] past its short case: the runner's move as [`Owner::moved_slow`] makes
+    /// or puts it off, then the win's part in it.
+    #[cold]
+    #[inline(never)]
+    fn moved_won(&mut self, r: u32, from: u32, to: u32, was: u32, kind: u32) {
+        self.moved_slow(r, from, to, was);
+        if self.pend.r == r {
+            self.pend.kind = kind;
+        } else {
+            self.won_slow(r, kind);
+        }
+    }
+
+    /// [`Owner::ended_won`] for a kind this owner hasn't heard of, or none: the end, then
+    /// [`Owner::won`] as for any.
+    #[cold]
+    #[inline(never)]
+    fn ended_won_new(&mut self, r: u32, from: u32, to: u32, was: u32, kind: u32) {
+        if to != from {
+            if self.pend.r == NIL && to > from {
+                self.pend = Pend { r, from, to, was, kind: NO_KIND };
+            } else {
+                self.moved_slow(r, from, to, was);
+            }
+        }
+        self.won_new(RunnerId(r), KindId(kind));
     }
 
     /// [`Owner::ended_fast`] for a burst of ends: the rise a word brings is put off to the
@@ -1387,15 +1997,16 @@ impl Owner {
             return false;
         }
         p.heard = p.heard.wrapping_add(1);
-        let from = key(p.view, p.scale, last);
+        let was = p.view;
+        let from = key(was, p.scale, last);
         p.view = b.cpu.saturating_sub(p.inflight);
         let to = key(p.view, p.scale, last);
         if to > from && p.flags & PUT_OFF == 0 {
             p.flags |= PUT_OFF;
-            self.put_off.push((r, from));
+            self.put_off.push(Rise { r, from, turn: 0, kind: NO_KIND });
             self.pend.r = MANY;
         } else if to < from && p.flags & PUT_OFF == 0 {
-            self.moved_slow(r, from, to);
+            self.moved_slow(r, from, to, was);
         }
         true
     }
@@ -1412,7 +2023,8 @@ impl Owner {
         self.pend.r = NIL;
         let mut list = std::mem::take(&mut self.put_off);
         let last = self.last;
-        for &(r, from) in &list {
+        for rise in &list {
+            let (r, from) = (rise.r, rise.from);
             let Some(p) = self.peers.get_mut(r as usize) else { continue };
             p.flags &= !PUT_OFF;
             let (to, sig0, more) = (key(p.view, p.scale, last), p.sig0, p.flags & MORE != 0);
@@ -1424,18 +2036,35 @@ impl Owner {
         self.put_off = list;
     }
 
-    /// A batch's picks of the runners whose rises are put off: while one of them is at least as
-    /// free as anything in the index, it takes the next run, and its bucket is written once, with
-    /// its net change. Each pick goes to the highest bucket, as one at a time; between equals (one
-    /// bucket) they go to the runners put off first, in the order their ends came, and the
-    /// bucket's turn doesn't move: that is the only way the choices differ from one at a time.
-    fn overlay(&mut self, sig: u32, need: Amounts, left: &mut usize, starts: &mut Vec<(RunnerId, Start)>) -> Result<(), Refused> {
+    /// A batch's picks of the runners whose rises are put off and on which work of the batch's
+    /// kind just went well ([`Owner::won`]): while one of them is at least as free as anything in
+    /// the index, it takes the next run, and its bucket is written once, with its net change. Each
+    /// pick goes to the highest bucket, as one at a time; between equals (one bucket) they go to
+    /// those runners first, in the order their ends came, and the bucket's turn doesn't move: that
+    /// order is the only way the choices differ from one at a time. Every other rise is made
+    /// first: its runner takes its turn among its equals as any member does.
+    fn overlay(&mut self, sig: u32, kind: u32, need: Amounts, left: &mut usize, starts: &mut Vec<(RunnerId, Start)>) -> Result<(), Refused> {
         let last = self.last;
         let mut list = std::mem::take(&mut self.put_off);
+        list.retain(|rise| {
+            if kind < NO_KIND && rise.kind == kind {
+                return true;
+            }
+            let Some(p) = self.peers.get_mut(rise.r as usize) else { return false };
+            p.flags &= !PUT_OFF;
+            let (to, sig0, more) = (key(p.view, p.scale, last), p.sig0, p.flags & MORE != 0);
+            if to != rise.from {
+                self.relink_all(rise.r, sig0, more, rise.from, to);
+            }
+            false
+        });
         let peers = &self.peers;
         let key_of = |r: u32| peers.get(r as usize).map_or(0, |p| key(p.view, p.scale, last));
-        list.sort_by_key(|&(r, _)| std::cmp::Reverse(key_of(r)));
-        let keys: Vec<u32> = list.iter().map(|&(r, _)| key_of(r)).collect();
+        for (i, rise) in list.iter_mut().enumerate() {
+            // There is at most one rise per dense u32 runner id (PUT_OFF).
+            rise.turn = u32::try_from(i).unwrap_or(u32::MAX);
+        }
+        list.sort_unstable_by_key(|rise| (std::cmp::Reverse(key_of(rise.r)), rise.turn));
         let Some(s) = self.sigs.get_mut(sig as usize) else {
             self.put_off = list;
             return Ok(());
@@ -1444,14 +2073,19 @@ impl Owner {
         let cpu = narrow(need[0]);
         let mut i = 0usize;
         while i < list.len() && *left > 0 {
-            let Some(&(r, from)) = list.get(i) else { break };
+            let Some(rise) = list.get(i).copied() else { break };
+            let (r, from) = (rise.r, rise.from);
+            // The next rise belongs to a different runner, not yet changed by this overlay.
+            // Read its key directly instead of constructing a temporary vector of keys.
+            let next = list.get(i + 1).and_then(|x| self.peers.get(x.r as usize)).map_or(0, |p| key(p.view, p.scale, last));
             let Some(p) = self.peers.get_mut(r as usize) else { break };
             let k = key(p.view, p.scale, last);
             if top.is_some_and(|t| k < t) || p.view < cpu || p.sig0 != sig || p.flags & MORE != 0 {
                 break;
             }
-            let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig, runner: r, state: STARTING, slow: NIL }) else {
-                self.put_off = list.split_off(i);
+            let Some(run) = self.runs.insert(Run::new(need[0], sig, r, STARTING, NIL)) else {
+                list.drain(..i);
+                self.put_off = list;
                 return Err(Refused::Full);
             };
             p.view -= cpu;
@@ -1459,13 +2093,12 @@ impl Owner {
             starts.push((RunnerId(r), Start { owner: self.id, run, epoch: p.epoch(), need }));
             *left -= 1;
             let now = key(p.view, p.scale, last);
-            let next = keys.get(i + 1).copied().unwrap_or(0);
             if *left == 0 || now < next || top.is_some_and(|t| now < t) || p.view < cpu {
                 // Done with this runner: its bucket moves once, by its net change.
                 p.flags &= !PUT_OFF;
                 if now != from {
                     s.ix.relink(r, from, now);
-                    if self.orders_on && (from == 0) != (now == 0) {
+                    if self.orders_kept & orders::BYTES != 0 && (from == 0) != (now == 0) {
                         mark(&mut p.flags, &mut self.dirty, r);
                     }
                 }
@@ -1473,7 +2106,10 @@ impl Owner {
             }
         }
         // Those it didn't reach stay put off: the caller applies them.
-        self.put_off = list.split_off(i);
+        // W05-R26: retain the original allocation even when every rise was consumed. split_off
+        // discarded its capacity, forcing the next batch of ends to allocate and grow again.
+        list.drain(..i);
+        self.put_off = list;
         if self.put_off.is_empty() {
             self.pend.r = NIL;
         }
@@ -1511,8 +2147,8 @@ impl Owner {
         let told = match self.runs.get_mut(run) {
             Some(x) if x.runner == r && x.state & STATE == STARTING && x.slow == NIL => {
                 // The fast path: a start answered, CPU alone.
-                let cpu = narrow(x.cpu);
-                *x = Run { state: STARTED, at, ..*x };
+                let cpu = x.cpu();
+                x.started_at(at);
                 if let Some(p) = self.peers.get_mut(r as usize) {
                     p.inflight = p.inflight.saturating_sub(cpu);
                 }
@@ -1532,16 +2168,16 @@ impl Owner {
         match x.state & STATE {
             STARTING | GOING => {
                 if x.state & STATE == STARTING {
-                    self.answered(r, x.cpu, x.slow);
+                    self.answered(r, x.cpu(), x.slow);
                 }
                 if let Some(y) = self.runs.get_mut(run) {
-                    *y = Run { state: STARTED, at, slow: NIL, ..*y };
+                    y.started_at(at);
                 }
                 self.free_slow(x.slow);
                 Some(Told::Started { run, runner: RunnerId(r) })
             }
             // Said again as its link came back: no longer unsure.
-            STARTED if x.at == at => {
+            STARTED if x.at() == at => {
                 if let Some(y) = self.runs.get_mut(run) {
                     y.state = STARTED;
                 }
@@ -1556,9 +2192,9 @@ impl Owner {
 
     /// A start sent to `r` is answered: what it asked is no longer in flight there.
     #[inline]
-    fn answered(&mut self, r: u32, cpu: u64, slow: u32) {
+    fn answered(&mut self, r: u32, cpu: u32, slow: u32) {
         if let Some(p) = self.peers.get_mut(r as usize) {
-            p.inflight = p.inflight.saturating_sub(narrow(cpu));
+            p.inflight = p.inflight.saturating_sub(cpu);
         }
         if let Some(rest) = self.slow.at(slow).map(|s| s.rest)
             && let Some(c) = self.cold.get_mut(r as usize)
@@ -1618,7 +2254,7 @@ impl Owner {
         };
         match (x.state & STATE, of) {
             (STARTING, Of::Start) if x.runner == r => {
-                self.answered(r, x.cpu, x.slow);
+                self.answered(r, x.cpu(), x.slow);
                 self.park(run);
                 self.apply(r, word, out);
                 #[cfg(test)]
@@ -1678,7 +2314,8 @@ impl Owner {
             if let Some(y) = self.runs.get_mut(run) {
                 y.state = GOING;
                 y.runner = r;
-                y.at = at;
+                // GOING still needs its CPU/signature if Go is refused. The Ready handle
+                // travels directly in Go; the admitted handle comes back in Started.
             }
             out.to.push((RunnerId(r), ToRunner::Go { owner: self.id, run, at, epoch }));
         } else {
@@ -1718,7 +2355,7 @@ impl Owner {
         for h in unknown {
             let Some(x) = self.runs.get(h).copied() else { continue };
             if x.state & STATE == STARTING {
-                self.answered(r, x.cpu, x.slow);
+                self.answered(r, x.cpu(), x.slow);
             }
             if ran == 0 {
                 // None of them ran: placed again.
@@ -1758,7 +2395,7 @@ impl Owner {
                 }
             }
         }
-        if self.orders_on {
+        if self.orders_kept != 0 {
             self.sync_orders(r);
         }
         for h in again {
@@ -1792,7 +2429,7 @@ impl Owner {
                     s.ix.unlink(ri, b);
                 }
             }
-            if self.orders_on {
+            if self.orders_kept != 0 {
                 self.sync_orders(ri);
             }
         }
@@ -1830,17 +2467,17 @@ impl Owner {
         }
         let need = self.need_of(&x);
         let cpu_only = !multi(&need);
-        let r = self.pick_cpu(x.sig, &need, cpu_only);
+        let r = self.pick_cpu(x.sig(), NIL, &need, cpu_only);
         if r == NIL {
             self.wait(run, out, true);
             return;
         }
-        self.unlist(x.sig, run.slot, x.slow);
+        self.unlist(x.sig(), run.slot, x.slow);
         let epoch = self.deduct(r, &need, cpu_only);
         if let Some(y) = self.runs.get_mut(run) {
             y.state = STARTING;
             y.runner = r;
-            y.at = Handle::NONE;
+            // Its CPU/signature remain live until a Started response.
         }
         out.to.push((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch, need })));
     }
@@ -1851,7 +2488,7 @@ impl Owner {
     fn wait(&mut self, run: Handle, out: &mut Out, tell: bool) {
         let Some(x) = self.runs.get(run).copied() else { return };
         let need = self.need_of(&x);
-        let Some(s) = self.sigs.get(x.sig as usize) else { return };
+        let Some(s) = self.sigs.get(x.sig() as usize) else { return };
         if !s.ix.could_fit(&need) {
             self.free_run(run);
             out.told.push(Told::Never { run });
@@ -1877,7 +2514,7 @@ impl Owner {
         // Drawn under tokens, or by learned weights while they help; else (and once they fell
         // back) the nearest to fitting, as before them.
         if self.draws.on || self.weights.drawing() {
-            places = self.drawn(x.sig, &need, places);
+            places = self.drawn(x.sig(), &need, places);
         }
         let slow = if x.slow == NIL {
             match self.slow.insert(Slow::of(&need)) {
@@ -1900,10 +2537,10 @@ impl Owner {
         if let Some(y) = self.runs.get_mut(run) {
             y.state = WAITING;
             y.runner = NIL;
-            y.at = Handle::NONE;
+            // Its CPU/signature remain live while waiting.
             y.slow = slow;
         }
-        self.list(x.sig, run.slot, slow);
+        self.list(x.sig(), run.slot, slow);
         for p in places.iter().filter(|p| p.runner != NIL) {
             let epoch = self.peers.get(p.runner as usize).map_or(0, |q| q.epoch());
             out.to.push((RunnerId(p.runner), ToRunner::Wait(Start { owner: self.id, run, epoch, need })));
@@ -1926,7 +2563,7 @@ impl Owner {
                 *p = NO_PLACE;
             }
         }
-        self.unlist(x.sig, run.slot, x.slow);
+        self.unlist(x.sig(), run.slot, x.slow);
     }
 
     /// Tries the oldest runs waiting for signature `sig`'s members while one has room for them.
@@ -1937,7 +2574,7 @@ impl Owner {
             let Some(x) = self.runs.get(run).copied() else { return };
             let need = self.need_of(&x);
             let cpu_only = !multi(&need);
-            let r = self.pick(sig, &need, cpu_only);
+            let r = self.pick(sig, NIL, &need, cpu_only);
             if r == NIL {
                 return;
             }
@@ -1993,7 +2630,7 @@ impl Owner {
         if let Some(x) = self.runs.get_mut(run) {
             x.state = WAITING | (x.state & CANCELLED);
             x.runner = NIL;
-            x.at = Handle::NONE;
+            // Its before-admission CPU/signature remain live while parked.
         }
     }
 
@@ -2087,15 +2724,17 @@ impl Owner {
 
     /// A run's whole need.
     fn need_of(&self, x: &Run) -> Amounts {
-        let [m, d, g] = self.slow.at(x.slow).map_or([0; 3], |s| s.rest);
-        [x.cpu, m, d, g]
+        self.slow.at(x.slow).map_or([u64::from(x.cpu()), 0, 0, 0], |s| {
+            let [m, d, g] = s.rest;
+            [s.cpu, m, d, g]
+        })
     }
 
     /// Forgets a run.
     fn free_run(&mut self, run: Handle) {
         let Some(x) = self.runs.get(run).copied() else { return };
         if x.slow != NIL {
-            self.unlist(x.sig, run.slot, x.slow);
+            self.unlist(x.sig(), run.slot, x.slow);
             self.free_slow(x.slow);
         }
         let _ = self.runs.remove(run);
@@ -2118,11 +2757,11 @@ impl Owner {
             return false;
         }
         let r = x.runner;
-        self.answered(r, x.cpu, x.slow);
+        self.answered(r, x.cpu(), x.slow);
         let last = self.last();
         if let Some(p) = self.peers.get_mut(r as usize) {
             let from = key(p.view, p.scale, last);
-            p.view = p.view.saturating_add(narrow(x.cpu));
+            p.view = p.view.saturating_add(x.cpu());
             let (to, sig0, more, up) = (key(p.view, p.scale, last), p.sig0, p.flags & MORE != 0, p.flags & UP != 0);
             if up && to != from {
                 self.relink_all(r, sig0, more, from, to);
@@ -2226,7 +2865,7 @@ impl Owner {
         let x = self.runs.get(run)?;
         Some(match x.state & STATE {
             STARTING => State::Starting { runner: RunnerId(x.runner) },
-            STARTED => State::Started { runner: RunnerId(x.runner), at: x.at },
+            STARTED => State::Started { runner: RunnerId(x.runner), at: x.at() },
             GOING => State::Going { runner: RunnerId(x.runner) },
             _ => {
                 let places = self.slow.at(x.slow).map_or([NO_PLACE; PLACES], |s| s.places);
@@ -2262,7 +2901,7 @@ impl Owner {
 
 impl Slow {
     fn of(need: &Amounts) -> Slow {
-        Slow { rest: rest(need), places: [NO_PLACE; PLACES], prev: NIL, next: NIL, listed: false }
+        Slow { cpu: need[0], rest: rest(need), places: [NO_PLACE; PLACES], prev: NIL, next: NIL, listed: false }
     }
 }
 
@@ -2480,8 +3119,8 @@ impl Owner {
             let cpu_only = !multi(&need);
             for c in a.of {
                 let Some(r) = at(c) else { continue };
-                let slow = if cpu_only { NIL } else { self.slow_for(&need)? };
-                let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: sig.0, runner: r, state: STARTING, slow }) else {
+                let slow = if Run::needs_slow(&need) { self.slow_for(&need)? } else { NIL };
+                let Some(run) = self.runs.insert(Run::new(need[0], sig.0, r, STARTING, slow)) else {
                     self.free_slow(slow);
                     return Err(Refused::Full);
                 };

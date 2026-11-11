@@ -389,6 +389,12 @@ fn cpus(c: Cpus) -> u128 {
 /// Whether a runner has room for `leg` beside the legs on it (`on`), as W05-R03 says.
 fn room(cfg: &Config, r: &RunnerIn, on: &[&LegIn], leg: &LegIn) -> bool {
     let size = size(r);
+    // W05-R03: CPU/memory slot accounting never creates physical GPUs. These cases
+    // declare counts without inventories, independently of the engine's per-card matcher.
+    if leg.request.gpu > 0 {
+        let wanted = on.iter().fold(u64::from(leg.request.gpu), |n, l| n.saturating_add(u64::from(l.request.gpu)));
+        if wanted > size.map_or(0, |s| u64::from(s.gpu)) { return false; }
+    }
     if on.iter().any(|l| claim(l, size) == Some(Claim::Whole)) {
         return false;
     }
@@ -2151,8 +2157,164 @@ fn report(seed: u64, cfg: &Config, steps: &[(Step, i64)], why: &str) -> String {
     )
 }
 
-/// E1.5: the engine places legs as the reference does, after every input of 10,000 small random
-/// cases, and keeps its invariants.
+/// W05-R03: slots may replace CPU/memory accounting, but never physical GPU accounting.
+#[test]
+fn w05_r03_slot_mode_still_reserves_declared_gpus() {
+    let cfg = Config { resources: false, ..Config::default() };
+    let mut engine = Scheduler::with_epoch(cfg.clone(), 0);
+    let mut reference = Reference::new(cfg, 0);
+    let mut runner = RunnerIn {
+        id: "gpu-node".into(),
+        view: RunnerView { name: "gpu-node".into(), labels: vec!["x".into()], ..RunnerView::default() },
+        slots: 3,
+        capacity: Some(Resources { cpu: Cpus::whole(4), mem: 11 * GIB, ..Resources::default() }),
+        ..RunnerIn::default()
+    };
+    let leg = |id: &str| LegIn {
+        id: id.into(), run: id.into(), repo: "acme/gpu".into(),
+        route: LegRoute { labels: vec!["x".into()], ..LegRoute::default() },
+        // CPU/memory are intentionally slot-accounted here; an exclusive GPU is still finite.
+        request: Resources { cpu: Cpus::whole(4), mem: 15 * GIB, gpu: 1, ..Resources::default() },
+        ..LegIn::default()
+    };
+    let mut apply = |step: Step, now, expected: &[&str]| {
+        engine.handle(step.input(), now);
+        reference.handle(&step, now);
+        let expected: BTreeSet<String> = expected.iter().map(|id| (*id).to_owned()).collect();
+        assert_eq!(engine.grants().keys().cloned().collect::<BTreeSet<_>>(), expected, "engine at {now}");
+        assert_eq!(reference.placement().0.keys().cloned().collect::<BTreeSet<_>>(), expected, "reference at {now}");
+    };
+    apply(Step::Up(runner.clone()), 0, &[]);
+    apply(Step::Queued(Box::new(leg("a"))), 1, &[]);
+    apply(Step::Drain(runner.id.clone()), 2, &[]);
+    if let Some(capacity) = &mut runner.capacity { capacity.gpu = 1; }
+    apply(Step::Undrain(runner), 3, &["a"]);
+    apply(Step::Queued(Box::new(leg("b"))), 4, &["a"]);
+    apply(Step::Ended { leg: "a".into(), attempt: 1, outcome: Outcome::Success }, 5, &["b"]);
+}
+
+/// W05-R03/W05-R40: planning a gang must count every sibling's GPU before any grant.
+#[test]
+fn w05_r40_a_gpu_gang_needs_every_siblings_gpu() {
+    for resources in [false, true] {
+        for gpus in [None, Some(0), Some(1), Some(2)] {
+            let cfg = Config { resources, ..Config::default() };
+            let mut engine = Scheduler::with_epoch(cfg.clone(), 0);
+            let mut reference = Reference::new(cfg, 0);
+            let runner = RunnerIn {
+                id: "r".into(), slots: 2,
+                view: RunnerView { name: "r".into(), labels: vec!["x".into()], ..RunnerView::default() },
+                capacity: gpus.map(|gpu| Resources { cpu: Cpus::whole(4), mem: 8 * GIB, gpu, ..Resources::default() }),
+                ..RunnerIn::default()
+            };
+            let up = Step::Up(runner);
+            engine.handle(up.input(), 0);
+            reference.handle(&up, 0);
+            for (id, at) in [("a", 1), ("b", 2)] {
+                let step = Step::Queued(Box::new(LegIn {
+                    id: id.into(), run: "gang-run".into(), repo: "acme/gpu".into(),
+                    route: LegRoute { labels: vec!["x".into()], ..LegRoute::default() },
+                    request: Resources { cpu: Cpus::whole(1), mem: GIB, gpu: 1, ..Resources::default() },
+                    gang: Some(Gang { id: "gpu-gang".into(), size: 2 }),
+                    ..LegIn::default()
+                }));
+                engine.handle(step.input(), at);
+                reference.handle(&step, at);
+                let expected: BTreeSet<String> = if at == 2 && gpus == Some(2) { ["a", "b"].into_iter().map(str::to_owned).collect() } else { BTreeSet::new() };
+                assert_eq!(engine.grants().keys().cloned().collect::<BTreeSet<_>>(), expected, "engine resources={resources}, GPUs={gpus:?}, at={at}");
+                assert_eq!(reference.placement().0.keys().cloned().collect::<BTreeSet<_>>(), expected, "reference resources={resources}, GPUs={gpus:?}, at={at}");
+            }
+        }
+    }
+}
+
+/// W05-R16/W05-R34: a CPU-only runner cannot keep an expired GPU grant off its only capable node.
+#[test]
+fn w05_r16_cpu_only_nodes_do_not_delay_gpu_lease_retry() {
+    for resources in [false, true] {
+        let cfg = Config { resources, lease: Some(120_000), ..Config::default() };
+        let mut engine = Scheduler::with_epoch(cfg.clone(), 0);
+        let mut reference = Reference::new(cfg, 0);
+        let runner = |id: &str, gpu| RunnerIn {
+            id: id.into(), slots: 2,
+            view: RunnerView { name: id.into(), ..RunnerView::default() },
+            capacity: Some(Resources { cpu: Cpus::whole(4), mem: 8 * GIB, gpu, ..Resources::default() }),
+            ..RunnerIn::default()
+        };
+        for (step, at) in [
+            (Step::Up(runner("gpu", 1)), 0),
+            (Step::Queued(Box::new(LegIn { id: "task".into(), run: "run".into(), repo: "acme/gpu".into(), request: Resources { cpu: Cpus::whole(1), mem: GIB, gpu: 1, ..Resources::default() }, ..LegIn::default() })), 1),
+            (Step::Up(runner("cpu", 0)), 2),
+            (Step::Tick, 2 * MINUTE + 1),
+        ] {
+            engine.handle(step.input(), at);
+            reference.handle(&step, at);
+        }
+        let expected = reference.placement().0.get("task").map(|(runner, attempt, _, _)| (runner.clone(), *attempt));
+        assert_eq!(expected, Some(("gpu".into(), 2)));
+        let actual = engine.grants().get("task").map(|(runner, attempt, _, _)| (runner.clone(), *attempt));
+        assert_eq!(actual, expected, "resources={resources}");
+    }
+}
+
+/// W05-R10/W05-R16/W05-R39: losing a runner releases a gang reservation elsewhere. The
+/// already queued tenant with the better standing must precede a newly eligible retry.
+/// Frozen from seed3261: no random generation or GPU demand participates in this regression.
+#[test]
+fn w05_r39_released_gang_room_keeps_fair_order_before_lost_retries() {
+    let cfg = Config { resources: true, fair_by: vec![FairBy::Repo, FairBy::Actor, FairBy::Lane], aging_per_minute: 1000, lock_delay: 0, backfill: true, ..Config::default() };
+    let runner = |id: &str| RunnerIn {
+        id: id.into(), slots: 1,
+        view: RunnerView { name: id.into(), labels: vec!["x".into(), "y".into()], facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, ..RunnerView::default() },
+        ..RunnerIn::default()
+    };
+    let initial = LegIn { id: "l1".into(), run: "run0".into(), repo: "acme/r1".into(), priority: 60, class: Class::Critical, actor: "a1".into(), lane: "l0".into(), on_lease_loss: LeaseLoss::Stop, ..LegIn::default() };
+    let sibling = |id: &str| LegIn {
+        id: id.into(), run: "run1".into(), repo: "acme/r2".into(), priority: 60, class: Class::Critical,
+        request: Resources { cpu: Cpus::whole(6), mem: 11 * GIB, ..Resources::default() },
+        cost: Some(120_000), p90: Some(15_000), actor: "a1".into(), lane: "l1".into(),
+        gang: Some(Gang { id: "g4".into(), size: 2 }), ..LegIn::default()
+    };
+    let retry = LegIn {
+        id: "l6".into(), run: "run2".into(), repo: "acme/r1".into(), priority: 20, class: Class::Land,
+        route: LegRoute { labels: vec!["y".into()], ..LegRoute::default() },
+        request: Resources { cpu: Cpus::whole(8), mem: 32 * GIB, ..Resources::default() },
+        cost: Some(350_000), timeout: Some(960_000), actor: "a1".into(), lane: "l1".into(), ..LegIn::default()
+    };
+    let exclusive = LegIn {
+        id: "l7".into(), run: "run2".into(), repo: "acme/r2".into(), priority: 80, class: Class::Interactive, exclusive: true,
+        route: LegRoute { labels: vec!["y".into()], ..LegRoute::default() },
+        request: Resources { cpu: Cpus::whole(5), mem: 29 * GIB, ..Resources::default() },
+        cost: Some(10_000), actor: "a1".into(), lane: "l1".into(), on_lease_loss: LeaseLoss::Stop, ..LegIn::default()
+    };
+    let waiting = LegIn {
+        id: "l8".into(), run: "run2".into(), repo: "acme/r2".into(), priority: 0, class: Class::Land,
+        route: LegRoute { labels: vec!["x".into()], ..LegRoute::default() },
+        request: Resources { cpu: Cpus::whole(7), mem: 30 * GIB, ..Resources::default() },
+        cost: Some(120_000), p90: Some(145_000), timeout: Some(1_140_000), actor: "a1".into(), lane: "l0".into(), ..LegIn::default()
+    };
+    let steps = [
+        (Step::Up(runner("r0")), 23_287),
+        (Step::Up(runner("r1")), 102_009),
+        (Step::Queued(Box::new(initial)), 1_130_257),
+        (Step::Ended { leg: "l1".into(), attempt: 1, outcome: Outcome::Success }, 1_287_584),
+        (Step::Queued(Box::new(sibling("l4"))), 1_618_807),
+        (Step::Queued(Box::new(sibling("l5"))), 1_967_503),
+        (Step::Queued(Box::new(retry)), 2_176_020),
+        (Step::Refused { leg: "l4".into(), fence: Fence { epoch: 3, n: 2 } }, 2_270_481),
+        (Step::Queued(Box::new(exclusive)), 2_372_814),
+        (Step::Queued(Box::new(waiting)), 2_679_740),
+        (Step::Lost("r1".into()), 2_805_529),
+        (Step::Up(runner("r1")), 2_980_441),
+        (Step::Refused { leg: "l8".into(), fence: Fence { epoch: 3, n: 7 } }, 3_116_864),
+        (Step::Ended { leg: "l6".into(), attempt: 1, outcome: runner_lost() }, 3_180_146),
+        (Step::Lost("r1".into()), 3_413_496),
+    ];
+    let result = run(&cfg, 3, &steps, |_| {});
+    assert!(result.is_ok(), "{}", result.err().map(|(_, why)| why).unwrap_or_default());
+}
+
+/// E1.5: compare all generated histories, retaining the original case count and invariants.
 #[test]
 fn e1_5_the_engine_agrees_with_the_reference() {
     if let Some(seed) = std::env::var("KILN_SCHED_REFERENCE_SEED").ok().and_then(|s| s.trim().parse::<u64>().ok()) {

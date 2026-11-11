@@ -40,9 +40,17 @@ impl TypeVisitor for Collect<'_> {
         let Some(path) = T::output_path() else { return };
         let text = match T::export_to_string(self.cfg) {
             Ok(t) => {
-                // W29-R26: this long protocol union stays the generator's declaration while
-                // the touched UI file can still pass its required Prettier formatting.
-                let t = if path.file_name().and_then(|n| n.to_str()) == Some("NoticeKind.ts") { t.replacen("export type NoticeKind", "// prettier-ignore\nexport type NoticeKind", 1) } else { t };
+                // W13-R01: ts-rs emits platform line endings; checked-in bindings use LF.
+                let t = t.replace("\r\n", "\n");
+                // W29-R26 / W13-R01: keep touched protocol declarations byte-for-byte with
+                // ts-rs while allowing Prettier on the generated UI files.
+                let t = match path.file_stem().and_then(|n| n.to_str()) {
+                    Some(name @ ("NoticeKind" | "Gpu" | "RunnerFacts")) => {
+                        let t = if name == "NoticeKind" { t } else { format!("{}\n", t.lines().map(str::trim_end).collect::<Vec<_>>().join("\n")) };
+                        t.replacen(&format!("export type {name}"), &format!("// prettier-ignore\nexport type {name}"), 1)
+                    }
+                    _ => t,
+                };
                 format!("{HEADER}{t}")
             }
             Err(e) => {
@@ -146,7 +154,7 @@ pub fn stale(dir: &Path, want: &BTreeMap<PathBuf, String>) -> Vec<String> {
     let mut out = Vec::new();
     for (path, text) in want {
         match std::fs::read_to_string(dir.join(path)) {
-            Ok(had) if had == *text => {}
+            Ok(had) if had.replace("\r\n", "\n") == *text => {}
             Ok(had) => out.push(format!("ui/src/api/wire/{}: {}", path.display(), first_difference(&had, text))),
             Err(_) => out.push(format!("ui/src/api/wire/{}: missing", path.display())),
         }
@@ -340,5 +348,20 @@ fn every_update_goes_down_as_a_session_frame() -> anyhow::Result<()> {
     for t in tags {
         anyhow::ensure!(down.contains(&format!("\"t\": \"{t}\"")), "`{t}`, an Update's, isn't a frame of the session socket's (SessionDown)");
     }
+    Ok(())
+}
+
+/// W13-R01: a native Windows checkout changes line endings, not the wire's type content.
+#[test]
+fn w13_r01_gpu_wire_bindings_survive_crlf_checkouts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let name = PathBuf::from("Gpu.ts");
+    let text = "export type Gpu = { memory_used?: number };\n";
+    let want = BTreeMap::from([(name.clone(), text.to_owned())]);
+    std::fs::write(dir.path().join(&name), text.replace('\n', "\r\n"))?;
+    anyhow::ensure!(stale(dir.path(), &want).is_empty(), "checkout line endings changed no type");
+    std::fs::write(dir.path().join(&name), "export type Gpu = {};\r\n")?;
+    anyhow::ensure!(!stale(dir.path(), &want).is_empty(), "a removed field must still fail");
+    anyhow::ensure!(render()?.values().all(|text| !text.contains("\r\n")), "generated wire text must use canonical LF on every platform");
     Ok(())
 }

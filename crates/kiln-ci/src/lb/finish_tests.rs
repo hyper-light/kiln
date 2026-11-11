@@ -11,6 +11,56 @@ use super::*;
 
 const C8: Amounts = [8 * CPU, 32 << 30, 400 << 30, 8];
 
+/// W24-R18: with one observed byte multiplier, every unknown uses that same prior. This tiny
+/// ask needs only one round over its two sorted lists, rather than reading the whole fleet
+/// because independent class bounds lose a nanosecond to integer rounding.
+#[test]
+fn w24_r18_one_observed_byte_rate_does_not_force_a_fleet_scan() -> Result<(), String> {
+    for n in [2, 64] {
+        for term in 0..3 {
+            let (mut owner, mut runners, sig) = fleet(n, C8);
+            let runner = runners.first_mut().ok_or("runner")?;
+            runner.measure(768, 1024);
+            runner.measure_rates(if term == 0 { 1 << 20 } else { 0 }, if term == 1 { 1 << 20 } else { 0 });
+            owner.hear(ToOwner::Hint { runner: RunnerId(0), word: runner.word() }, &mut Out::default());
+            if term == 2 { owner.set_link(RunnerId(0), Link { rate: 1 << 20, ..Link::default() }); }
+            let t = Terms { cpu_ns: 1, io_bytes: u64::from(term == 0), net_bytes: u64::from(term == 1), bytes: u64::from(term == 2), ..Terms::default() };
+            let before = owner.counts.read;
+            let a = owner.ask_with(sig, [CPU, 0, 0, 0], &t, &mut Out::default()).map_err(|e| format!("ask: {e:?}"))?;
+            if a.send.is_none() { return Err("no placement".into()); }
+            let read = owner.counts.read - before;
+            // The derived count for this fixture's CPU and byte lists, not a production cap;
+            // the general threshold must keep its quality bound.
+            if read > 2 { return Err(format!("{n} runners, term {term}: read {read} candidates, expected one round of two lists")); }
+        }
+    }
+    Ok(())
+}
+
+/// W24-R18: a prior's lower bound never exceeds any observed or imputed cost, including as
+/// observations arrive, change, and disappear. A mean of several observations is not a minimum.
+#[test]
+fn w24_r18_a_prior_bound_holds_through_observation_changes() -> Result<(), String> {
+    let mut rng = Rng(0x501e);
+    let (mut values, mut mean) = ([0u64; 4], Mean::default());
+    for step in 0..1000 {
+        let at = rng.below(values.len() as u64) as usize;
+        let value = match step % 4 { 0 => 0, 1 => 1, 2 => u64::MAX, _ => rng.next() };
+        let old = values.get_mut(at).ok_or("observation")?;
+        mean.moved(*old, value);
+        *old = value;
+        let observed: Vec<_> = values.iter().copied().filter(|v| *v != 0).collect();
+        let lower = mean.lower_q32();
+        if lower > mean.q32() || observed.iter().any(|v| lower > *v) {
+            return Err(format!("step {step}: bound {lower} exceeds an effective cost in {values:?}"));
+        }
+        if observed.len() == 1 && observed.first().copied() != Some(lower) {
+            return Err(format!("step {step}: sole observation lost its exact bound"));
+        }
+    }
+    Ok(())
+}
+
 /// One runner of a fleet as a case draws it.
 #[derive(Debug, Clone, Copy, Default)]
 struct Shape {

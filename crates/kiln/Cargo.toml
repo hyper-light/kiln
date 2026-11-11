@@ -34,6 +34,7 @@ name = "hostile"
 required-features = ["chaos"]
 
 [dependencies]
+kiln-gpu = { path = "../kiln-gpu" }
 kiln-bp = { path = "../kiln-bp" }
 kiln-cd = { path = "../kiln-cd" }
 kiln-ci = { path = "../kiln-ci" }

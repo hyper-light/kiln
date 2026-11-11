@@ -13,71 +13,76 @@ import type { Virt } from "./Virt";
 import type { WorkFacts } from "./WorkFacts";
 import type { Workspaces } from "./Workspaces";
 
-export type RunnerFacts = { 
+// prettier-ignore
+export type RunnerFacts = {
 /**
  * `linux`, `macos`, `windows`, … (lower case, Rust's `std::env::consts::OS` spelling).
  */
-os: string, os_version: string | null, 
+os: string, os_version: string | null,
 /**
  * e.g. `ubuntu`, `arch`, `debian`, from `/etc/os-release`'s `ID`.
  */
-os_distro: string | null, kernel: string | null, 
+os_distro: string | null, kernel: string | null,
 /**
  * `x86_64`, `aarch64`, … (Rust's `std::env::consts::ARCH` spelling).
  */
-arch: string, 
+arch: string,
 /**
  * e.g. `v8` for arm64, `v7` for arm.
  */
-arch_variant: string | null, cpu: Cpu, mem: Mem, 
+arch_variant: string | null, cpu: Cpu, mem: Mem,
 /**
  * The volume holding the runner's work directory.
  */
-disk: Disk, gpus: Array<Gpu>, virt: Virt, 
+disk: Disk, gpus: Array<Gpu>,
+/**
+ * Why no native GPU counters can be read on this host, as the retained provider reports it.
+ */
+gpu_unavailable?: string, virt: Virt,
 /**
  * Executors that work right now, each with its version and details.
  */
-executors: { [key in string]: ExecutorFacts }, 
+executors: { [key in string]: ExecutorFacts },
 /**
  * Platforms registered for QEMU user emulation (`linux/arm64`, …).
  */
-binfmt: Array<string>, 
+binfmt: Array<string>,
 /**
  * Tools found on `PATH`, name → version.
  */
-tools: { [key in string]: string }, net: Net, 
+tools: { [key in string]: string }, net: Net,
 /**
  * Facts an administrator declared, and the results of declared probes (W13-R02).
  */
-custom: { [key in string]: string }, 
+custom: { [key in string]: string },
 /**
  * When the facts were gathered (unix seconds).
  */
-probed_at: number, 
+probed_at: number,
 /**
  * The kiln the runner runs (kiln's `fleet`).
  */
-kiln: KilnFacts | null, 
+kiln: KilnFacts | null,
 /**
  * Whether its agents can have workspaces of their own (Slates volumes), and why not.
  */
-workspaces: Workspaces | null, 
+workspaces: Workspaces | null,
 /**
  * What W24's work needs to know of the machine (docs/ci.md W24, `RunnerFacts.work`).
  */
-work: WorkFacts | null, 
+work: WorkFacts | null,
 /**
  * The machine itself: a hash of the id its OS keeps for it (W13-R01). The server keeps it with
  * the runner's name, so another machine joining with the same host name isn't taken for it.
  */
-machine_id: string | null, 
+machine_id: string | null,
 /**
  * What the work directory's volume is made of: its file system and the devices under it,
  * each with its type, interconnect and health (docs/needs.md, W13-R01). Probed with the
  * other facts; the counters that change (throughput, latency, errors) are measured when a
  * decision needs them, not reported here.
  */
-storage: Storage | null, 
+storage: Storage | null,
 /**
  * Runs that finished on it since it last said (docs/needs.md): sent when one finishes, kept
  * by the server for the learned run-time model ([`crate::runtime`]), and not kept with the

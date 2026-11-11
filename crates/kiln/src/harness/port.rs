@@ -119,10 +119,14 @@ mod tests {
                 let message = crate::harness::host::message_of(&command).map(|(message, _)| message);
                 let sent = HarnessPort::send(self.hub.as_ref(), &id, command).await;
                 if sent.has_custody() {
-                    let message = message.expect("fixture communications have an original ID");
                     // Preserve the returned custody state. Only an exact native result can
                     // release credit before the next conformance send; HTTP retention cannot.
-                    crate::harness::ops::end_to_end::source_disposition(&self.hub, &id, &message, true).await.expect("the native fixture's correlated successful result was not committed");
+                    // The fixture's own steps (an original ID, its correlated successful result
+                    // committed) failing fail the case they serve: it hears no custody.
+                    let Some(message) = message else { return Sent::Unreachable };
+                    if crate::harness::ops::end_to_end::source_disposition(&self.hub, &id, &message, true).await.is_err() {
+                        return Sent::Unreachable;
+                    }
                 }
                 sent
             })

@@ -57,7 +57,7 @@ use super::ask::{self, Amounts, Ask, Peer, Sample};
 use super::keys::{FxMap, Interner};
 use super::line::{Item, Key, Line, Query};
 use super::link::Rtt;
-use super::msg::{Estimate, Place, Reason, ToOwner, Up, shortfall};
+use super::msg::{Estimate, How, Place, Reason, ToOwner, Up, shortfall};
 use crate::lb;
 use crate::facts::RunnerFacts;
 use crate::sched::routing::Constraint;
@@ -127,6 +127,14 @@ pub struct Settings {
     /// the room each run freed going back to the owner whose run it was; others keep hearing this
     /// runner's hints. Off until declared.
     pub tokens: bool,
+    /// The node's owner sends a run the kernel places back to where its kind of work (its ask's
+    /// key) last went well, when that runner is among the best by rank, and past the runner that
+    /// last let that kind down (`[reach] good_places`; docs/lb.md "Good places"; W05-R04,
+    /// W05-R23); a run's answer says when that was why. On by default, the user's exception to
+    /// opt-in automation (2026-11-11, docs/ci.md §0.3); off, runs take turns among equals, as
+    /// before. Its owner's, read by [`super::Owner::configure`]; the runner's admission doesn't
+    /// read it (it says how each kernel run ended either way).
+    pub good_places: bool,
 }
 
 impl Default for Settings {
@@ -146,6 +154,7 @@ impl Default for Settings {
             learned_weights: false,
             auction: false,
             tokens: false,
+            good_places: true,
         }
     }
 }
@@ -1756,6 +1765,9 @@ impl Admission {
     /// leg); a share fits in what's not held, never overcommitted; any other fits beside.
     fn can_start(&self, s: u32) -> bool {
         let Some(p) = self.get(s) else { return false };
+        if p.ask.needs.request.gpu > 0 && crate::sched::gpu::rank(&p.ask.needs, &self.facts, &self.labels, self.free_now()[3]).is_none() {
+            return false;
+        }
         if self.whole_claims > 0 {
             return false;
         }
@@ -2148,6 +2160,11 @@ impl Admission {
         self.wire(out, |a, r| a.ended_r(from, run, ok, now, r));
     }
 
+    /// [`Self::ended`] with its shell's judgment of how the run ended (docs/lb.md "Good places").
+    pub fn ended_as(&mut self, from: Peer<'_>, run: &str, ok: bool, how: How, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.ended_as_r(from, run, ok, how, now, r));
+    }
+
     pub fn measured(&mut self, sample: Sample, now: i64, out: &mut Vec<Said>) {
         self.wire(out, |a, r| a.measured_r(sample, now, r));
     }
@@ -2219,7 +2236,11 @@ impl Admission {
     /// don't meet, more than kiln may place here even idle, or a gang (commands start together with
     /// docs/needs.md E5's gangs, not yet). A disk whose size isn't measured is no reason.
     fn never(&self, ask: &Ask) -> Option<String> {
+        if ask.needs.request.gpu > 0 && !crate::sched::gpu::could_match(&ask.needs, &self.facts, &self.labels) {
+            return Some("too few GPUs matching the model, vendor and memory requirements".into());
+        }
         for src in &ask.needs.requires {
+            if ask.needs.request.gpu > 0 { break; } // Checked jointly on each GPU above.
             match Constraint::parse(src) {
                 Ok(c) if c.eval(&self.facts, &self.labels) => {}
                 Ok(c) => {
@@ -2471,7 +2492,8 @@ impl Admission {
         }
         if let Some(r) = self.record(from.name, from.epoch, &ask.run) {
             let msg = match r.ended {
-                Some(ok) => Up::FastEnded { kernel, ok, word: self.fast_word_for(o) },
+                // Said again as its link came back: its shell's judgment isn't kept with its record.
+                Some(ok) => Up::FastEnded { kernel, ok, word: self.fast_word_for(o), how: How::Unsaid },
                 None => Up::Ran,
             };
             out.push(Reply { owner: o, token, run, msg });
@@ -2484,6 +2506,11 @@ impl Admission {
             return None;
         }
         let need = ask::amounts(&ask.needs.request);
+        if need[3] > 0 && crate::sched::gpu::rank(&ask.needs, &self.facts, &self.labels, self.free_now()[3]).is_none() {
+            let word = self.fast_word_for(o);
+            out.push(Reply { owner: o, token, run, msg: Up::FastDeclined { kernel, why: lb::Why::Room, word } });
+            return None;
+        }
         // Through its word, so a start under room tokens comes out of its owner's token first.
         let answer = self.fast.hear(lb::ToRunner::Start(lb::Start { owner: lb::OwnerId(o), run: kernel, epoch, need }), &mut self.fast_out);
         let at = match answer {
@@ -2503,6 +2530,8 @@ impl Admission {
         }
         self.claim(s, now);
         self.charge(s, now);
+        // W05-R25: kernel starts must reach the shell's commit-before-spawn journal too.
+        self.changed.insert((from.name.to_owned(), from.epoch, run.to_string()));
         let record = Record { fence, ended: None };
         self.records.entry(from.name.to_owned()).or_default().entry(from.epoch).or_default().insert(run.to_string(), record);
         if let Some(p) = self.get(s) {
@@ -2727,15 +2756,21 @@ impl Admission {
     /// A run it started ended (`ok`: its process exited; not: it couldn't start, or was lost): its
     /// room is free in the same input, its tenant charged what it ran, and its owner told.
     pub fn ended_r(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Reply>) {
+        self.ended_as_r(from, run, ok, How::Unsaid, now, out);
+    }
+
+    /// [`Self::ended_r`] with its shell's judgment of how the run ended: said to its owner with
+    /// a kernel run's end, and of no other (a claim's end is answered as before).
+    pub fn ended_as_r(&mut self, from: Peer<'_>, run: &str, ok: bool, how: How, now: i64, out: &mut Vec<Reply>) {
         let mark = out.len();
         self.begin(now, out);
-        self.ended_in(from, run, ok, now, out);
+        self.ended_in(from, run, ok, how, now, out);
         self.close(now);
         self.fresh_words(out.get_mut(mark..).unwrap_or_default());
         self.tokens_out(out);
     }
 
-    fn ended_in(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Reply>) {
+    fn ended_in(&mut self, from: Peer<'_>, run: &str, ok: bool, how: How, now: i64, out: &mut Vec<Reply>) {
         let Some(s) = self.find(from, run) else { return };
         let Some(State::Running { fence, .. }) = self.state(s) else { return };
         // From its dispatch, as the engine settles a grant.
@@ -2753,8 +2788,8 @@ impl Admission {
         self.drop_probe(s);
         if let Some((owner, token, run)) = to {
             let msg = match (kernel, ended) {
-                (Some(kernel), Some(word)) => Up::FastEnded { kernel, ok, word: super::msg::FastWord::of(&word, self.fast.budget()) },
-                (Some(kernel), None) => Up::FastEnded { kernel, ok, word: self.fast_word() },
+                (Some(kernel), Some(word)) => Up::FastEnded { kernel, ok, word: super::msg::FastWord::of(&word, self.fast.budget()), how },
+                (Some(kernel), None) => Up::FastEnded { kernel, ok, word: self.fast_word(), how },
                 _ => Up::Ended { fence, ok },
             };
             out.push(Reply { owner, token, run, msg });
@@ -2921,6 +2956,15 @@ impl Admission {
                 (owner, epoch, run, rec, ask)
             })
             .collect()
+    }
+
+    /// W13-R01: refreshed inventory, preserving every live reservation.
+    pub fn refreshed(&mut self, facts: RunnerFacts, labels: Vec<String>, now: i64, out: &mut Vec<Said>) {
+        self.facts = facts;
+        self.labels = labels;
+        let mut sample = self.sample.clone();
+        sample.size.gpu = u32::try_from(self.facts.gpus.len()).unwrap_or(u32::MAX);
+        self.measured(sample, now, out);
     }
 
     /// A new sample: the room is worked out again, and what now fits is offered.

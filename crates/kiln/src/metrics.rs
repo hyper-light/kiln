@@ -799,6 +799,12 @@ pub struct NetMetrics {
     dropped_n: AtomicU64,
 }
 
+impl Default for NetMetrics {
+    fn default() -> Self {
+        Self { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: Rcu::default(), drops: crate::rt::Changed::new(), dropped_n: AtomicU64::new(0) }
+    }
+}
+
 impl NetMetrics {
     /// `n` frames of `lane` to `peer` dropped, for `reason`.
     pub fn dropped(&self, peer: u64, lane: u32, reason: &'static str, n: u64) {
@@ -948,7 +954,7 @@ fn render_tls(o: &mut String) {
 
 pub fn net() -> &'static NetMetrics {
     static M: OnceLock<NetMetrics> = OnceLock::new();
-    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: Rcu::default(), drops: crate::rt::Changed::new(), dropped_n: AtomicU64::new(0) })
+    M.get_or_init(NetMetrics::default)
 }
 
 /// The `kiln_net_*` families, in the exposition: this process's drops, and (the server's) what each

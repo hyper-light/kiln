@@ -203,6 +203,32 @@ pub fn hmac_hex(key: &[u8], msg: &[u8]) -> String {
     }
 }
 
+/// A test's step that must succeed: its value, or an error saying where it was missing (an
+/// `Option`'s none) or what it was instead (a `Result`'s error), where a test would otherwise
+/// unwrap: the workspace denies unwraps, tests' too (AGENTS.md, "No panics").
+#[cfg(test)]
+pub(crate) trait Must<T> {
+    fn must(self) -> anyhow::Result<T>;
+}
+
+#[cfg(test)]
+impl<T> Must<T> for Option<T> {
+    #[track_caller]
+    fn must(self) -> anyhow::Result<T> {
+        let at = std::panic::Location::caller();
+        self.ok_or_else(|| anyhow::anyhow!("nothing at {at}, where a value was needed"))
+    }
+}
+
+#[cfg(test)]
+impl<T, E: std::fmt::Debug> Must<T> for Result<T, E> {
+    #[track_caller]
+    fn must(self) -> anyhow::Result<T> {
+        let at = std::panic::Location::caller();
+        self.map_err(|e| anyhow::anyhow!("{e:?} at {at}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// CP-T3.2: an id made from a key is the same each time it's made from it, a UUID like any

@@ -172,6 +172,7 @@ mod tests {
     use kiln_seams::records::{Changes, Page, Records, Refusal, Rev, Row};
     use parking_lot::Mutex;
     use crate::harness::{admission::{Consumption, Disposition, Input, Lease, PhysicalBudget, Stage}, inbox::{Inbox, Limits, Pending}, mail::Token, model::{Command, SendMode}};
+    use crate::util::Must as _;
 
     struct ReadGate {
         entered: futures::channel::oneshot::Sender<()>,
@@ -248,10 +249,10 @@ mod tests {
             prepare(&inbox, &pool).await?;
             inbox.adopt_pending("s", pending("a"), 11).await?;
             inbox.adopt_pending("s", Pending::opaque(pending("b").lease, vec!["exact retained native bytes".into()]), 12).await?;
-            let first = inbox.pending("s", "a").await?.unwrap();
-            let second = inbox.pending("s", "b").await?.unwrap();
-            let first_revision = records.get(PENDING, &super::super::message_key("s", "a"), Consistency::Linearizable).await?.unwrap().rev;
-            let second_revision = records.get(PENDING, &super::super::message_key("s", "b"), Consistency::Linearizable).await?.unwrap().rev;
+            let first = inbox.pending("s", "a").await?.must()?;
+            let second = inbox.pending("s", "b").await?.must()?;
+            let first_revision = records.get(PENDING, &super::super::message_key("s", "a"), Consistency::Linearizable).await?.must()?.rev;
+            let second_revision = records.get(PENDING, &super::super::message_key("s", "b"), Consistency::Linearizable).await?.must()?.rev;
             let input = Input::new(0, pool.clone(), inbox.clone());
             input.controller.lock().restore(first.lease.clone()).map_err(|error| anyhow::anyhow!("{error:?}"))?;
             input.controller.lock().restore(second.lease.clone()).map_err(|error| anyhow::anyhow!("{error:?}"))?;
@@ -259,11 +260,11 @@ mod tests {
             certified(&inbox, &input, &pool).await?;
             assert_eq!(inbox.rebind_promotion_step("s", &input).await?, RebindStep::Row);
             let key = super::super::message_key("s", "b");
-            let before = records.get(PENDING, &key, Consistency::Linearizable).await?.unwrap();
+            let before = records.get(PENDING, &key, Consistency::Linearizable).await?.must()?;
             let head = inbox.promotion_snapshot("s").await?;
             records.commit_fault.store(1, Ordering::Release);
             assert!(matches!(inbox.rebind_promotion_step("s", &input).await, Err(PromotionError::Storage { .. })));
-            let after = records.get(PENDING, &key, Consistency::Linearizable).await?.unwrap();
+            let after = records.get(PENDING, &key, Consistency::Linearizable).await?.must()?;
             assert_eq!((after.rev, after.value), (before.rev, before.value), "failed CAS changed the accepted original");
             assert_eq!(inbox.promotion_snapshot("s").await?, head, "failed CAS advanced its resume cursor");
             pool.resize(0);
@@ -278,13 +279,13 @@ mod tests {
             let input = Input::new(0, pool.clone(), inbox.clone());
             input.controller.lock().begin_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
             for id in ["a", "b"] {
-                let retained = inbox.pending("s", id).await?.unwrap();
+                let retained = inbox.pending("s", id).await?.must()?;
                 input.controller.lock().restore_legacy_debt(retained.lease, 0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
             }
             while inbox.rebind_promotion_step("s", &input).await? != RebindStep::Complete {}
             for (original, revision) in [(first, first_revision), (second, second_revision)] {
                 let mut expected = original.clone(); expected.lease.epoch = 1; expected.accepted_seq = Some(original.accepted_seq.unwrap_or(revision));
-                let actual = inbox.pending("s", &original.lease.message).await?.unwrap();
+                let actual = inbox.pending("s", &original.lease.message).await?.must()?;
                 assert_eq!(serde_json::to_value(actual)?, serde_json::to_value(expected)?);
             }
             input.controller.lock().rebind_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
@@ -300,7 +301,7 @@ mod tests {
             inbox.dispose_pending("s", "a", 1, terminal.clone()).await?;
             assert!(input.controller.lock().finish("a", terminal, 1, false).map_err(|error| anyhow::anyhow!("{error:?}"))?);
             assert_eq!(pool.counts().0, 80, "completion must release only its own lease");
-            assert!(inbox.pending("s", "b").await?.unwrap().disposition.is_none());
+            assert!(inbox.pending("s", "b").await?.must()?.disposition.is_none());
             let mut ordinary = pending("new"); ordinary.origin = Origin::Accepted; ordinary.lease.epoch = 1; ordinary.lease.token = Some(Token { revision: 4, generation: 1 });
             inbox.accept_pending("s", "new", &super::super::digest("original new", &[]), Some(1), 20, &ordinary).await?;
             assert!(inbox.promotion("s").await?.is_none());
@@ -364,20 +365,20 @@ mod tests {
             let inbox = Arc::new(Inbox::new(records.clone(), Limits::default()));
             prepare(&inbox, &pool).await?;
             inbox.adopt_pending("s", pending("a"), 11).await?;
-            let original = inbox.pending("s", "a").await?.unwrap();
+            let original = inbox.pending("s", "a").await?.must()?;
             let input = Input::new(0, pool.clone(), inbox.clone());
             input.controller.lock().restore(original.lease.clone()).map_err(|error| anyhow::anyhow!("{error:?}"))?;
             certified(&inbox, &input, &pool).await?;
             let key = super::super::message_key("s", "a");
-            let saved = records.get(PENDING, &key, Consistency::Linearizable).await?.unwrap();
+            let saved = records.get(PENDING, &key, Consistency::Linearizable).await?.must()?;
             let mut token_row = original.clone(); token_row.lease.token = Some(Token { revision: 1, generation: 1 });
             let token_revision = records.commit(Tx { conds: vec![Cond::At { family: PENDING.into(), key: key.clone(), rev: saved.rev }], writes: vec![Write::Put { family: PENDING.into(), key: key.clone(), value: serde_json::to_vec(&token_row)? }] }).await?;
             assert!(matches!(inbox.rebind_promotion_step("s", &input).await, Err(PromotionError::Invalid { .. })));
-            assert_eq!(serde_json::to_value(inbox.pending("s", "a").await?.unwrap())?, serde_json::to_value(&token_row)?);
+            assert_eq!(serde_json::to_value(inbox.pending("s", "a").await?.must()?)?, serde_json::to_value(&token_row)?);
             let mut stale = original; stale.lease.epoch = 2;
             records.commit(Tx { conds: vec![Cond::At { family: PENDING.into(), key: key.clone(), rev: token_revision }], writes: vec![Write::Put { family: PENDING.into(), key, value: serde_json::to_vec(&stale)? }] }).await?;
             assert_eq!(inbox.rebind_promotion_step("s", &input).await, Err(PromotionError::Stale));
-            assert_eq!(serde_json::to_value(inbox.pending("s", "a").await?.unwrap())?, serde_json::to_value(stale)?);
+            assert_eq!(serde_json::to_value(inbox.pending("s", "a").await?.must()?)?, serde_json::to_value(stale)?);
             assert_eq!(pool.counts().0, 80);
             assert_eq!(input.controller.lock().capacity().epoch, 0);
             assert!(input.controller.lock().promoting());

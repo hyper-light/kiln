@@ -107,7 +107,8 @@ What a runner reports of itself (W13-R01; `kiln runners facts <name>` shows them
 | `cpu.cores`, `cpu.threads`, `cpu.model`, `cpu.flags` | cores, hardware threads (CPUs), model, flags (`avx2`) |
 | `mem.total`, `mem.free` | memory in all and free, bytes (`32Gi` in comparisons) |
 | `disk.total`, `disk.free` | the volume its work is on |
-| `gpu.count`, `gpu.model`, `gpu.vendor`, `gpu.memory` | its GPUs |
+| `gpu.count`, `gpu.model`, `gpu.vendor`, `gpu.memory` | its GPUs; for `gpus=N`, each requested card must meet the model/vendor/memory predicates |
+| `gpu.memory.total`, `gpu.memory.free`, `gpu.utilization` | measured device memory free (bytes) and utilization (thousandths); unknown when the provider cannot read it |
 | `virt.kvm`, `virt.hvf`, `virt.nested` | the virtualization it offers |
 | `executors`, `executors.<name>` | executors that work there (`docker`, `firecracker`), and each one's version |
 | `binfmt` | platforms it runs under emulation (`linux/arm64`) |

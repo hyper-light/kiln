@@ -196,6 +196,8 @@ pub enum In {
     /// A reading of this machine's host sampler: placement's room (docs/needs.md E5), or, where
     /// placement measures itself ([`Config::sense`]), a moment to measure again.
     Sampled(crate::metrics::HostSample),
+    /// W13-R01: this process's event-driven facts, without a round trip through the directory.
+    LocalFacts(Box<kiln_ci::facts::RunnerFacts>),
     /// The time placement's timer asked for (`super::place::Placer::timer`).
     PlaceTick,
     /// Whether the server takes this runner's admission hints (it named
@@ -1256,6 +1258,10 @@ impl Node {
             In::Tick => {
                 self.tick_at = None;
                 self.tick().await;
+            }
+            In::LocalFacts(facts) => {
+                let outs = self.place.refreshed(*facts, crate::util::now_ms());
+                self.place_do(outs).await;
             }
             In::Sampled(s) => {
                 self.measured = true;
@@ -2646,8 +2652,10 @@ impl Node {
             }
             serve::Event::Exit { code, error, used } => {
                 let error = if r.timed_out { Some(error.unwrap_or_else(|| "timed out".into())) } else { error };
-                // Its room is free in the same input (docs/needs.md E5): `ok`, its process exited.
-                let outs = self.place.ended(&key.0, id, error.is_none(), crate::util::now_ms());
+                // Its room is free in the same input (docs/needs.md E5): `ok`, its process exited;
+                // and how it ended, judged here as it ends (docs/lb.md "Good places").
+                let how = super::place::how(code, error.as_deref(), r.timed_out);
+                let outs = self.place.ended_as(&key.0, id, error.is_none(), how, crate::util::now_ms());
                 let Some(r) = self.served.get_mut(&key).and_then(|s| s.runs.get_mut(&id)) else {
                     self.place_do(outs).await;
                     return;

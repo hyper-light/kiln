@@ -1265,6 +1265,7 @@ impl SerializeMap for Scan<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::Must as _;
     use crate::harness::model::{QueueItem, Status};
 
     fn queued(text: String, i: usize) -> QueueItem {
@@ -1287,31 +1288,31 @@ mod tests {
     }
 
     #[test]
-    fn a_large_queue_is_referenced_and_each_page_keeps_its_exact_values() {
+    fn a_large_queue_is_referenced_and_each_page_keeps_its_exact_values() -> anyhow::Result<()> {
         let s = State {
             status: Status::Running,
             queue: (0..564).map(|i| queued("é\"\\\n".repeat(700), i)).collect(),
             ..State::default()
         };
-        assert!(serde_json::to_vec(&s).unwrap().len() > FRAME);
-        let head = view(&s, FRAME - 512).unwrap();
+        assert!(serde_json::to_vec(&s).must()?.len() > FRAME);
+        let head = view(&s, FRAME - 512).must()?;
         assert_eq!(head.state.get("status"), Some(&Value::from("running")));
         assert_eq!(head.counts.queue, 564);
-        assert_eq!(head.deferred.get("queue").unwrap().len, 564);
+        assert_eq!(head.deferred.get("queue").must()?.len, 564);
         assert!(bounded_view(&head, FRAME - 512).is_ok());
-        let index = head.queue_index.as_ref().unwrap();
+        let index = head.queue_index.as_ref().must()?;
         assert!(index.complete);
         assert_eq!(index.entries.len(), s.queue.len());
-        assert_eq!(index.entries.first().unwrap().id, s.queue.first().unwrap().id);
-        assert_eq!(index.entries.first().unwrap().len, s.queue.first().unwrap().text.len());
+        assert_eq!(index.entries.first().must()?.id, s.queue.first().must()?.id);
+        assert_eq!(index.entries.first().must()?.len, s.queue.first().must()?.text.len());
         let mut at = 0;
         let mut got = Vec::new();
         loop {
-            let reply = read(&s, &request(&s, "queue", Vec::new(), at), FRAME - 512).unwrap();
+            let reply = read(&s, &request(&s, "queue", Vec::new(), at), FRAME - 512).must()?;
             assert!(encoded(&reply, FRAME - 512).is_ok());
-            let Reply::Page { entries, next, .. } = reply else { panic!("not a queue page") };
+            let Reply::Page { entries, next, .. } = reply else { anyhow::bail!("not a queue page") };
             for e in entries {
-                got.push(serde_json::from_value::<QueueItem>(e.value.unwrap()).unwrap());
+                got.push(serde_json::from_value::<QueueItem>(e.value.must()?).must()?);
             }
             match next {
                 Some(next) => {
@@ -1322,27 +1323,28 @@ mod tests {
             }
         }
         assert_eq!(got, s.queue);
+        Ok(())
     }
 
     #[test]
-    fn one_oversized_item_is_inspected_as_nodes_and_utf8_text_ranges() {
+    fn one_oversized_item_is_inspected_as_nodes_and_utf8_text_ranges() -> anyhow::Result<()> {
         let text = "🙂\"\\é\n".repeat(FRAME / 8);
         let s = State {
             queue: vec![queued(text.clone(), 0)],
             ..State::default()
         };
-        let Reply::Page { entries, .. } = read(&s, &request(&s, "queue", Vec::new(), 0), 4096).unwrap() else {
-            panic!()
+        let Reply::Page { entries, .. } = read(&s, &request(&s, "queue", Vec::new(), 0), 4096).must()? else {
+            anyhow::bail!("an unexpected reply")
         };
-        assert!(entries.first().unwrap().value.is_none());
-        assert_eq!(entries.first().unwrap().node.as_ref().unwrap().kind, Kind::Object);
+        assert!(entries.first().must()?.value.is_none());
+        assert_eq!(entries.first().must()?.node.as_ref().must()?.kind, Kind::Object);
         let path = vec![Step::Index { index: 0 }, Step::Key { key: "text".to_owned() }];
         let mut bytes = String::new();
         let mut at = 0;
         loop {
-            let reply = read(&s, &request(&s, "queue", path.clone(), at), 4096).unwrap();
+            let reply = read(&s, &request(&s, "queue", path.clone(), at), 4096).must()?;
             assert!(encoded(&reply, 4096).is_ok());
-            let Reply::Text { text, next, .. } = reply else { panic!() };
+            let Reply::Text { text, next, .. } = reply else { anyhow::bail!("an unexpected reply") };
             bytes.push_str(&text);
             match next {
                 Some(next) => {
@@ -1353,6 +1355,7 @@ mod tests {
             }
         }
         assert_eq!(bytes, text);
+        Ok(())
     }
 
     #[test]
@@ -1376,33 +1379,35 @@ mod tests {
     }
 
     #[test]
-    fn map_entries_keep_large_keys_and_values_accessible_without_assembling_them() {
+    fn map_entries_keep_large_keys_and_values_accessible_without_assembling_them() -> anyhow::Result<()> {
         let key = "long".repeat(4096);
         let mut s = State::default();
         s.delivery.insert(key.clone(), crate::harness::model::Delivery::Queued);
         let req = request(&s, "delivery", vec![Step::Index { index: 0 }, Step::Key { key: "key".to_owned() }], 0);
-        let Reply::Text { text, next, .. } = read(&s, &req, 1024).unwrap() else { panic!() };
+        let Reply::Text { text, next, .. } = read(&s, &req, 1024).must()? else { anyhow::bail!("an unexpected reply") };
         assert!(key.starts_with(&text));
         assert!(next.is_some());
+        Ok(())
     }
 
     #[test]
-    fn an_id_lookup_reads_only_the_matching_item_and_absence_is_typed() {
+    fn an_id_lookup_reads_only_the_matching_item_and_absence_is_typed() -> anyhow::Result<()> {
         let s = State {
             queue: (0..564).map(|i| queued(format!("message {i}"), i)).collect(),
             ..State::default()
         };
         let path = vec![Step::Id { id: "message-563".to_owned() }, Step::Key { key: "text".to_owned() }];
-        let Reply::Text { text, next, .. } = read(&s, &request(&s, "queue", path, 0), 4096).unwrap() else {
-            panic!()
+        let Reply::Text { text, next, .. } = read(&s, &request(&s, "queue", path, 0), 4096).must()? else {
+            anyhow::bail!("an unexpected reply")
         };
         assert_eq!(text, "message 563");
         assert!(next.is_none());
         assert_eq!(read(&s, &request(&s, "queue", vec![Step::Id { id: "absent".to_owned() }], 0), 4096), Err(Error::InvalidPath));
+        Ok(())
     }
 
     #[test]
-    fn ordinary_states_keep_exact_nonempty_queues_and_approvals_inline() {
+    fn ordinary_states_keep_exact_nonempty_queues_and_approvals_inline() -> anyhow::Result<()> {
         use crate::harness::model::{Approval, ToolKind};
         let approval = Approval {
             id: "approval-one".to_owned(),
@@ -1429,19 +1434,20 @@ mod tests {
             approvals: vec![approval],
             ..State::default()
         };
-        let projection = view(&s, FRAME).unwrap();
+        let projection = view(&s, FRAME).must()?;
         assert!(projection.deferred.is_empty());
         assert!(projection.queue_index.is_none());
-        let state = projection.into_state().unwrap();
+        let state = projection.into_state().must()?;
         assert!(encoded(&state, FRAME).is_ok());
-        let parsed: State = serde_json::from_value(state).unwrap();
+        let parsed: State = serde_json::from_value(state).must()?;
         assert_eq!(parsed.queue, s.queue);
         assert_eq!(parsed.approvals, s.approvals);
         assert_eq!(parsed.status, Status::Waiting);
+        Ok(())
     }
 
     #[test]
-    fn a_large_queue_index_cannot_crowd_out_a_small_actionable_approval() {
+    fn a_large_queue_index_cannot_crowd_out_a_small_actionable_approval() -> anyhow::Result<()> {
         use crate::harness::model::{Approval, ToolKind};
         let approval = Approval {
             id: "approve-exact-command".to_owned(),
@@ -1469,23 +1475,24 @@ mod tests {
             ..State::default()
         };
         let budget = 16 * 1024;
-        let projection = view(&s, budget).unwrap();
+        let projection = view(&s, budget).must()?;
         assert!(projection.deferred.contains_key("queue"));
         assert!(!projection.deferred.contains_key("approvals"));
-        let index = projection.queue_index.as_ref().unwrap();
+        let index = projection.queue_index.as_ref().must()?;
         assert!(!index.complete);
         assert!(!index.entries.is_empty());
         assert!(index.next.is_some());
         assert!(index.entries.len() < s.queue.len());
-        let wire = projection.into_state().unwrap();
+        let wire = projection.into_state().must()?;
         assert!(encoded(&wire, budget).is_ok());
-        let parsed: State = serde_json::from_value(wire).unwrap();
+        let parsed: State = serde_json::from_value(wire).must()?;
         assert_eq!(parsed.approvals, s.approvals);
         assert_eq!(parsed.status, Status::Waiting);
+        Ok(())
     }
 
     #[test]
-    fn all_descriptor_space_is_reserved_before_optional_fields_can_fill_the_budget() {
+    fn all_descriptor_space_is_reserved_before_optional_fields_can_fill_the_budget() -> anyhow::Result<()> {
         let s = State {
             status: Status::Running,
             model: "m".repeat(12000),
@@ -1495,41 +1502,43 @@ mod tests {
             ..State::default()
         };
         let budget = 16 * 1024;
-        let projection = view(&s, budget).unwrap();
+        let projection = view(&s, budget).must()?;
         assert_eq!(projection.state.get("status"), Some(&Value::from("running")));
         assert_eq!(projection.counts.queue, 1);
         assert!(projection.deferred.contains_key("queue"));
         assert!(projection.deferred.contains_key("model") || projection.deferred.contains_key("goal"));
-        assert!(encoded(&projection.into_state().unwrap(), budget).is_ok());
+        assert!(encoded(&projection.into_state().must()?, budget).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn compact_queue_indexes_are_exact_and_partial_indexes_never_claim_absence() {
+    fn compact_queue_indexes_are_exact_and_partial_indexes_never_claim_absence() -> anyhow::Result<()> {
         let queue: Vec<_> = (0..564).map(|i| queued("é\"\\\n".repeat(700), i)).collect();
-        let complete = queue_index(&queue, 0, FRAME).unwrap();
+        let complete = queue_index(&queue, 0, FRAME).must()?;
         assert!(complete.complete);
         assert!(complete.next.is_none());
         assert_eq!(complete.entries.len(), queue.len());
         for (entry, item) in complete.entries.iter().zip(&queue) {
             assert_eq!(entry.id, item.id);
             assert_eq!(entry.len, item.text.len());
-            assert_eq!(u64::from_str_radix(&entry.digest, 16).unwrap(), super::super::queued::digest(&item.text));
+            assert_eq!(u64::from_str_radix(&entry.digest, 16).must()?, super::super::queued::digest(&item.text));
         }
-        let partial = queue_index(&queue, 0, 4096).unwrap();
+        let partial = queue_index(&queue, 0, 4096).must()?;
         assert!(!partial.complete);
         assert_eq!(partial.next, Some(partial.entries.len()));
         assert!(!partial.entries.is_empty());
         assert!(encoded(&partial, 4096).is_ok());
-        let suffix = queue_index(&queue, partial.next.unwrap(), FRAME).unwrap();
+        let suffix = queue_index(&queue, partial.next.must()?, FRAME).must()?;
         assert!(!suffix.complete);
         assert!(suffix.next.is_none());
-        assert_eq!(suffix.entries.first().unwrap().id, queue.get(partial.entries.len()).unwrap().id);
-        assert!(queue_index(&[], 0, 4096).unwrap().complete);
+        assert_eq!(suffix.entries.first().must()?.id, queue.get(partial.entries.len()).must()?.id);
+        assert!(queue_index(&[], 0, 4096).must()?.complete);
         assert_eq!(queue_index(&queue, queue.len() + 1, FRAME), Err(Error::InvalidCursor));
+        Ok(())
     }
 
     #[test]
-    fn queue_reads_survive_status_and_usage_changes_but_not_queue_or_epoch_changes() {
+    fn queue_reads_survive_status_and_usage_changes_but_not_queue_or_epoch_changes() -> anyhow::Result<()> {
         let mut s = State {
             queue: vec![queued("unchanged".to_owned(), 0)],
             ..State::default()
@@ -1540,21 +1549,22 @@ mod tests {
         s.status = Status::Running;
         s.usage.input_tokens = 400;
         assert!(matches!(read(&s, &body, 4096), Ok(Reply::Text { .. })));
-        let Reply::Value { value, .. } = read(&s, &index, 4096).unwrap() else { panic!() };
+        let Reply::Value { value, .. } = read(&s, &index, 4096).must()? else { anyhow::bail!("an unexpected reply") };
         assert_eq!(value.get("id").and_then(Value::as_str), Some("message-0"));
         assert_eq!(value.get("len").and_then(Value::as_u64), Some(9));
         let missing = request(&s, "$queue_index", vec![Step::Id { id: "absent".to_owned() }], 0);
         assert_eq!(read(&s, &missing, 4096), Err(Error::InvalidPath));
-        s.queue.first_mut().unwrap().text.push('!');
+        s.queue.first_mut().must()?.text.push('!');
         assert_eq!(read(&s, &body, 4096), Err(Error::Stale));
         assert_eq!(read(&s, &index, 4096), Err(Error::Stale));
         let updated = request(&s, "queue", Vec::new(), 0);
         s.epoch = 1;
         assert_eq!(read(&s, &updated, 4096), Err(Error::Stale));
+        Ok(())
     }
 
     #[test]
-    fn open_keeps_exact_identity_counts_and_marks_its_untransmitted_index_partial() {
+    fn open_keeps_exact_identity_counts_and_marks_its_untransmitted_index_partial() -> anyhow::Result<()> {
         let info = super::super::session::Info {
             id: "session-one".to_owned(),
             kind: "codex".to_owned(),
@@ -1565,7 +1575,7 @@ mod tests {
             limits: vec![crate::harness::model::Limit::default(); 10000],
             ..Default::default()
         };
-        let projected = info_view(&info, 4096).unwrap();
+        let projected = info_view(&info, 4096).must()?;
         assert_eq!(projected.get("id").and_then(Value::as_str), Some("session-one"));
         assert_eq!(projected.get("target").and_then(Value::as_str), Some("agent:box"));
         assert_eq!(projected.get("queued").and_then(Value::as_u64), Some(564));
@@ -1573,14 +1583,15 @@ mod tests {
         assert!(projected.get("queue").is_none());
         assert!(projected.get("deferred").and_then(|v| v.get("limits")).is_some());
         assert!(encoded(&projected, 4096).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn short_writes_never_reserve_capacity_above_the_budget() {
+    fn short_writes_never_reserve_capacity_above_the_budget() -> anyhow::Result<()> {
         for budget in [0, 1, 3, 17, 1023, FRAME - 1] {
             let mut writer = Bounded { bytes: Vec::new(), budget };
             for _ in 0..budget {
-                writer.write_all(b"x").unwrap();
+                writer.write_all(b"x").must()?;
                 assert!(writer.bytes.capacity() <= budget);
             }
             assert_eq!(writer.bytes.len(), budget);
@@ -1593,35 +1604,37 @@ mod tests {
         assert!(Bounded::target(1, 1, usize::MAX, usize::MAX).is_none());
         let over_half = usize::MAX / 2 + 1;
         assert_eq!(Bounded::target(over_half, over_half, 1, usize::MAX), Some(usize::MAX));
+        Ok(())
     }
 
     #[test]
-    fn exact_encoding_keeps_ordinary_state_bytes_and_refuses_over_budget_values() {
+    fn exact_encoding_keeps_ordinary_state_bytes_and_refuses_over_budget_values() -> anyhow::Result<()> {
         let s = State {
             queue: vec![queued("exact é\"\\\n bytes".to_owned(), 0)],
             ..State::default()
         };
-        let expected = serde_json::to_vec(&s).unwrap();
-        assert_eq!(encode(&s, expected.len()).unwrap(), expected);
+        let expected = serde_json::to_vec(&s).must()?;
+        assert_eq!(encode(&s, expected.len()).must()?, expected);
         assert_eq!(encode(&s, expected.len() - 1), Err(Error::Budget));
         assert_eq!(encode(&"x".repeat(FRAME), FRAME), Err(Error::Budget));
+        Ok(())
     }
 
     #[test]
-    fn queue_body_and_metadata_reads_select_the_existing_owner_action_entry() {
+    fn queue_body_and_metadata_reads_select_the_existing_owner_action_entry() -> anyhow::Result<()> {
         let mut s = State {
             queue: vec![queued("first owner entry".to_owned(), 0), queued("selected owner entry".to_owned(), 1)],
             ..State::default()
         };
         let id = "message-1";
-        let owner = s.queue.iter().position(|q| q.id == id).unwrap();
+        let owner = s.queue.iter().position(|q| q.id == id).must()?;
         let body_request = request(&s, "queue", vec![Step::Id { id: id.to_owned() }, Step::Key { key: "text".to_owned() }], 0);
         let metadata_request = request(&s, "$queue_index", vec![Step::Id { id: id.to_owned() }], 0);
         assert_eq!(body_request.revision, metadata_request.revision);
-        let Reply::Text { text, next, .. } = read(&s, &body_request, 4096).unwrap() else { panic!() };
+        let Reply::Text { text, next, .. } = read(&s, &body_request, 4096).must()? else { anyhow::bail!("an unexpected reply") };
         assert!(next.is_none());
-        assert_eq!(text, s.queue.get(owner).unwrap().text);
-        let Reply::Value { value, .. } = read(&s, &metadata_request, 4096).unwrap() else { panic!() };
+        assert_eq!(text, s.queue.get(owner).must()?.text);
+        let Reply::Value { value, .. } = read(&s, &metadata_request, 4096).must()? else { anyhow::bail!("an unexpected reply") };
         assert_eq!(value.get("id").and_then(Value::as_str), Some(id));
         assert_eq!(value.get("len").and_then(Value::as_u64), Some(text.len() as u64));
         let removed = s.queue.remove(owner);
@@ -1629,22 +1642,23 @@ mod tests {
         assert_eq!(removed.text, text);
         assert_eq!(read(&s, &body_request, 4096), Err(Error::Stale));
         assert_eq!(read(&s, &request(&s, "tasks", vec![Step::Id { id: id.to_owned() }], 0), 4096), Err(Error::InvalidPath));
+        Ok(())
     }
 
     #[test]
-    fn queue_index_size_accounts_exact_entry_bytes_and_cursor_digit_changes() {
+    fn queue_index_size_accounts_exact_entry_bytes_and_cursor_digit_changes() -> anyhow::Result<()> {
         let queue: Vec<_> = (0..12).map(|i| queued(format!("body {i}"), i)).collect();
-        let all = queue_index(&queue, 0, FRAME).unwrap();
+        let all = queue_index(&queue, 0, FRAME).must()?;
         let expected = QueueIndex {
             entries: all.entries.iter().take(10).cloned().collect(),
             complete: false,
             next: Some(10),
         };
-        let boundary = encoded(&expected, FRAME).unwrap().len();
-        let exact = queue_index(&queue, 0, boundary).unwrap();
+        let boundary = encoded(&expected, FRAME).must()?.len();
+        let exact = queue_index(&queue, 0, boundary).must()?;
         assert_eq!(exact, expected);
-        assert_eq!(encoded(&exact, boundary).unwrap().len(), boundary);
-        let below = queue_index(&queue, 0, boundary - 1).unwrap();
+        assert_eq!(encoded(&exact, boundary).must()?.len(), boundary);
+        let below = queue_index(&queue, 0, boundary - 1).must()?;
         assert_eq!(below.entries.len(), 9);
         assert_eq!(below.next, Some(9));
         assert!(!below.complete);
@@ -1654,16 +1668,17 @@ mod tests {
             complete: false,
             next: Some(10),
         };
-        let one_boundary = encoded(&one, FRAME).unwrap().len();
-        assert_eq!(queue_index(&queue, 9, one_boundary).unwrap(), one);
+        let one_boundary = encoded(&one, FRAME).must()?.len();
+        assert_eq!(queue_index(&queue, 9, one_boundary).must()?, one);
         assert_eq!(queue_index(&queue, 9, one_boundary - 1), Err(Error::Budget));
-        let complete_boundary = encoded(&all, FRAME).unwrap().len();
-        assert_eq!(queue_index(&queue, 0, complete_boundary).unwrap(), all);
-        assert!(!queue_index(&queue, 0, complete_boundary - 1).unwrap().complete);
+        let complete_boundary = encoded(&all, FRAME).must()?.len();
+        assert_eq!(queue_index(&queue, 0, complete_boundary).must()?, all);
+        assert!(!queue_index(&queue, 0, complete_boundary - 1).must()?.complete);
+        Ok(())
     }
 
     #[test]
-    fn borrowed_page_envelopes_encode_exactly_the_owned_wire_shape() {
+    fn borrowed_page_envelopes_encode_exactly_the_owned_wire_shape() -> anyhow::Result<()> {
         let entries = vec![Entry {
             key: Step::Index { index: 9 },
             value: Some(Value::from("é\"\\\n".repeat(1024))),
@@ -1680,8 +1695,9 @@ mod tests {
             entries: &entries,
             next: Some(10),
         };
-        let bytes = encoded(&owned, FRAME).unwrap();
-        assert_eq!(encoded(&borrowed, bytes.len()).unwrap(), bytes);
+        let bytes = encoded(&owned, FRAME).must()?;
+        assert_eq!(encoded(&borrowed, bytes.len()).must()?, bytes);
         assert_eq!(encoded(&borrowed, bytes.len() - 1), Err(Error::Budget));
+        Ok(())
     }
 }
