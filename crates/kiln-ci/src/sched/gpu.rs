@@ -211,4 +211,17 @@ mod tests {
         assert_eq!(rank(&n, &known, &[], 1), Some(1_000_000));
         Ok(())
     }
+
+    /// W05-R03/W05-R23: legacy counts preserve admission, but are not measured idle capacity.
+    #[test]
+    fn w05_r23_legacy_gpu_counts_do_not_earn_fabricated_idle_credit() -> Result<(), String> {
+        let n = needs::parse("gpus=1")?;
+        let legacy = RunnerFacts::default();
+        assert!(matches(&n, &legacy, &[]));
+        assert_eq!(bind(&n, &legacy, &[], |_, _| true), Some(Vec::new()), "no physical identity is invented");
+        assert_eq!(rank(&n, &legacy, &[], 1), Some(0), "a declared count is not an observed idle GPU");
+        let measured = RunnerFacts { gpus: vec![card("A100", 80, Some(0), Some(500))], ..RunnerFacts::default() };
+        assert_eq!(rank(&n, &measured, &[], 1), Some(500_000));
+        Ok(())
+    }
 }
