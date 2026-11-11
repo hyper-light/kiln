@@ -191,4 +191,22 @@ mod tests {
         assert_eq!(serde_json::from_value::<Gpu>(json).map_err(|e| e.to_string())?, old);
         Ok(())
     }
+
+    /// W13-R01/W05-R03: unknown is not an idle sample, at the same fresh-fit seam as Hex b5b67b38.
+    #[test]
+    fn w13_r01_unread_gpu_load_never_becomes_fresh_idle_capacity() -> Result<(), String> {
+        let n = needs::parse("gpus=1,gpu.model==A100,gpu.memory.free>=16Gi")?;
+        for (used, compute) in [(None, None), (None, Some(0)), (Some(0), None), (Some(0), Some(1001))] {
+            let f = RunnerFacts { gpus: vec![card("A100", 80, used, compute)], ..RunnerFacts::default() };
+            assert_eq!(busy(f.gpus.first().ok_or("no card")?), None, "used={used:?}, compute={compute:?}");
+            assert!(!matches(&n, &f, &[]), "unread card matched: used={used:?}, compute={compute:?}");
+            assert_eq!(bind(&n, &f, &[], |_, _| true), None);
+            assert_eq!(rank(&n, &f, &[], 1), None);
+            assert!(could_match(&n, &f, &[]), "a fresh reading can make the card usable");
+            assert!(matches(&Needs::default(), &f, &[]), "unread GPU counters must not block CPU work");
+        }
+        let known = RunnerFacts { gpus: vec![card("A100", 80, Some(0), Some(0))], ..RunnerFacts::default() };
+        assert_eq!(rank(&n, &known, &[], 1), Some(1_000_000));
+        Ok(())
+    }
 }
