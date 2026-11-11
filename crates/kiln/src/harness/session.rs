@@ -1127,6 +1127,17 @@ pub struct Session {
 
 impl Session {
     pub(super) fn input_changed(&self) { let _ = self.ctl.try_send(Ctl::OwnedChanged); }
+    /// Host receipts and ordinary State frames share the session owner's ordered output.
+    pub(super) fn mail_flow(&self, event: super::admission::FlowEvent) {
+        {
+            let mut core = self.core.lock();
+            let capacity = core.input.as_ref().map(|input| input.controller.lock().capacity()).unwrap_or_else(|| event.capacity().clone());
+            core.state.admission = Some(capacity);
+            core.out.push(Update::MailFlow { event: Box::new(event) });
+            core.touch_state();
+        }
+        self.input_changed();
+    }
     pub fn info(&self) -> Info {
         let mut i = self.info.lock().clone();
         let mut core = self.core.lock();

@@ -258,9 +258,7 @@ mod tests {
 }
 
 pub fn event_capacity(event: &FlowEvent) -> &Capacity {
-    match event {
-        FlowEvent::Accepted { capacity, .. } | FlowEvent::Consumed { capacity, .. } | FlowEvent::Waiting { capacity, .. } | FlowEvent::Disposed { capacity, .. } | FlowEvent::Capacity { capacity } | FlowEvent::Fault { capacity, .. } => capacity,
-    }
+    event.capacity()
 }
 
 /// Called only after current authenticated source ownership and epoch have been established.

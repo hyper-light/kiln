@@ -1628,6 +1628,12 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, mut
     if h.get(id).is_some() {
         return Ok(());
     }
+    let manifest = rec.mail_manifest().cloned();
+    let given = hand_on.as_deref().and_then(crate::runner::custody::bundle_of);
+    if let Some(manifest) = &manifest {
+        if manifest.session != id { return Err("the native journal names a different session".into()); }
+        native_journal_hand_on(manifest, handed.as_deref().map(|h| &h.core), given.as_ref())?;
+    }
     let native_count = if handed.is_some() { 3 } else { 0 };
     let expected = native_count + usize::from(rec.mail_manifest().is_some());
     if fds.len() != expected { return Err("the native handover did not carry its exact native/journal descriptors; the source retains custody".into()); }
@@ -1639,11 +1645,15 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, mut
     // This await occurs on the handover receiver, never the control loop draining its source
     // sink. Native descriptors are still owned and no process is stopped on precommit refusal.
     let mut prepared = h.prepare_native_import(rec, handed).await?;
+    if let Some(manifest) = &manifest {
+        // The journal commit already advanced ownership. Register its one receipt before Open
+        // can request the destination certificate; legacy promotion would advance it again.
+        native_journal_receipt(manifest, prepared.handed.as_deref().map(|h| &h.core), given.as_ref())?;
+    }
     // Signed for by the runner it came from, or by none (one from before): it goes on at its epoch
     // until this runner is promoted, its receipt waiting till then (docs/ci.md W27-R08).
-    let given = hand_on.as_deref().and_then(crate::runner::custody::bundle_of);
     let taken = |r: Result<(), String>| {
-        if r.is_ok()
+        if manifest.is_none() && r.is_ok()
             && let Some(s) = h.get(id)
         {
             let (epoch, events) = {
@@ -1663,6 +1673,41 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, mut
             handed.process.foreign = true;
     }
     taken(h.move_in_prepared(prepared).await.map_err(|e| format!("{e:#}")))
+}
+
+/// W27-R08: bind the untrusted hand-on to this retained timeline before building its receipt.
+/// The server alone validates its signer, root and complete revocations before certification.
+#[cfg(unix)]
+fn native_journal_hand_on(manifest: &crate::harness::mail::TransferManifest, frozen: Option<&crate::harness::core::Frozen>, hand_on: Option<&serde_json::Value>) -> Result<(), String> {
+    use kiln_ci::identity::{chain::{Actor, Identity}, custody, statement};
+    if !crate::runner::custody::signs() { return Ok(()); }
+    let frozen = frozen.ok_or_else(|| "the signed native journal has no retained source timeline; custody stays held".to_owned())?;
+    let (source_epoch, events) = frozen.handover_source();
+    if source_epoch != manifest.source_epoch || source_epoch.checked_add(1) != Some(manifest.destination_epoch) {
+        return Err("the signed native timeline does not match the journal ownership epochs".into());
+    }
+    let hand_on = hand_on.ok_or_else(|| "the signed native journal has no source hand-on; custody stays held".to_owned())?;
+    let given = crate::runner::custody::statement_of(hand_on).ok_or_else(|| "the native source hand-on has no readable statement".to_owned())?;
+    let body: custody::Body = crate::wire::payload(crate::wire::unread::Wire::RunnerPayload, "NativeHandOn", &given.body.to_string()).map_err(|error| format!("the native source hand-on has no readable custody body: {error}"))?;
+    let source = Identity::parse(&body.by).ok().is_some_and(|identity| matches!(identity.actor, Actor::Agent { agent, epoch, .. } if agent == manifest.session && epoch == source_epoch));
+    if !source || hand_on.pointer("/dsseEnvelope/payloadType").and_then(serde_json::Value::as_str) != Some(statement::PAYLOAD_CUSTODY)
+        || given.v != statement::VERSION || body.v != custody::VERSION || body.kind != custody::Kind::HandedOn || body.epoch != Some(manifest.destination_epoch)
+        || body.to != crate::custody::at_epoch(&body.by, manifest.destination_epoch)
+        || given.subject.as_slice() != [crate::custody::timeline(&manifest.session, source_epoch, events)]
+    {
+        return Err("the native source hand-on does not name this exact session timeline and destination epoch".into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn native_journal_receipt(manifest: &crate::harness::mail::TransferManifest, frozen: Option<&crate::harness::core::Frozen>, hand_on: Option<&serde_json::Value>) -> Result<(), String> {
+    native_journal_hand_on(manifest, frozen, hand_on)?;
+    if let (Some(frozen), Some(hand_on)) = (frozen, hand_on) {
+        let (_, events) = frozen.handover_source();
+        crate::runner::custody::took(&manifest.session, manifest.destination_epoch, events, hand_on)?;
+    }
+    Ok(())
 }
 
 /// Completes when the front door (if this runner has one) reports something new.
@@ -7409,6 +7454,54 @@ mod attention_archive_ack_tests{
 #[cfg(test)]
 mod native_handover_tests {
     use super::*;
+
+    /// W27-R08: Open's first identity ask carries the committed 0→1 receipt. Promotion must
+    /// never schedule epoch 2 for a native journal that already changed ownership to epoch 1.
+    #[test]
+    #[cfg(unix)]
+    fn a_native_journal_registers_its_one_epoch_receipt_before_the_first_open_ask() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        use kiln_ci::identity::{chain::{Actor, Holder, Identity}, custody::{Body, Kind}, statement::{self, PAYLOAD_CUSTODY, Statement}};
+        use rcgen::SigningKey as _;
+        let directory = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(&directory.path().join("pki"))?;
+        let session = format!("native-epoch-{}", crate::util::new_id());
+        let manifest = crate::harness::mail::TransferManifest { attempt: crate::util::new_id(), session: session.clone(), source_epoch: 0, destination_epoch: 1, count: 1, sha256: "a".repeat(64) };
+        let frozen = crate::harness::core::Core::new().freeze();
+        let (epoch, events) = frozen.handover_source();
+        let identity = Identity::new(pki.organization(), Actor::Agent { person: "ada".into(), agent: session.clone(), epoch, held_by: Some(Holder { machine: "native-box".into(), instance: "old".into() }) });
+        let by = identity.uri()?;
+        let key = crate::pki::new_key_pem()?;
+        let cert = pki.issue_identity(&crate::pki::make_csr_with_key("kiln-identity", &key)?, &identity, &[], time::Duration::hours(1))?;
+        let signing = rcgen::KeyPair::from_pem(&key)?;
+        let subject = crate::custody::timeline(&session, epoch, events);
+        let sign = |epoch: u64| -> anyhow::Result<serde_json::Value> {
+            let body = Body { to: crate::custody::at_epoch(&by, epoch), epoch: Some(epoch), ..Body::new(Kind::HandedOn, &by) };
+            let payload = statement::payload(&Statement { subject: vec![subject.clone()], ..Statement::new(serde_json::to_value(body)?) })?;
+            Ok(statement::bundle(PAYLOAD_CUSTODY, &payload, &signing.sign(&statement::to_sign(PAYLOAD_CUSTODY, &payload))?, &crate::pki::der_of(&cert)?))
+        };
+        let hand_on = sign(1)?;
+        assert!(native_journal_hand_on(&manifest, None, Some(&hand_on)).is_err(), "no invented empty timeline when native state is missing");
+        assert!(native_journal_hand_on(&manifest, Some(&frozen), None).is_err(), "signed custody cannot silently become unsigned");
+        assert!(native_journal_hand_on(&manifest, Some(&frozen), Some(&sign(2)?)).is_err(), "an epoch-2 statement cannot form the epoch-1 receipt");
+        native_journal_receipt(&manifest, Some(&frozen), Some(&hand_on)).map_err(anyhow::Error::msg)?;
+        let open_epoch = crate::runner::custody::to_ask(&session, manifest.destination_epoch);
+        assert_eq!(open_epoch, Some(1), "the receipt is installed before the first Open asks for its identity");
+        let ask = crate::runner::identity::request("agent", Some(&session), open_epoch)?;
+        let ask = crate::runner::custody::carrying(&session, 1, ask);
+        assert_eq!(ask.epoch, Some(1));
+        assert_eq!(ask.hand_on.as_deref(), Some(hand_on.to_string().as_str()));
+        let receipt = ask.receipt.ok_or_else(|| anyhow::anyhow!("Open would ask without its source custody receipt"))?;
+        let payload = base64::engine::general_purpose::STANDARD.decode(&receipt.payload)?;
+        let receipt: Statement = serde_json::from_slice(&payload)?;
+        let body: Body = serde_json::from_value(receipt.body)?;
+        assert_eq!(body.epoch, Some(1));
+        assert_eq!(receipt.subject, vec![subject]);
+        assert!(!crate::runner::custody::certified(&session, 2), "no second-epoch identity transition exists");
+        assert!(!crate::runner::custody::certified(&session, 1), "the committed journal epoch needs no blue-green go_on_at increment");
+        crate::runner::identity::forget_prefix(&format!("agent/{session}/"));
+        Ok(())
+    }
 
     #[test]
     #[cfg(unix)]

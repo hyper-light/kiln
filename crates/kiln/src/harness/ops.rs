@@ -2102,6 +2102,51 @@ for line in sys.stdin:
         })
     }
 
+    /// MailPeers changes the same owner's capacity that later ordinary State frames carry.
+    /// An unchanged demand must not need another publication or probe to recover eligibility.
+    #[test]
+    #[cfg(unix)]
+    fn mail_peers_capacity_survives_an_ordinary_owner_state() -> anyhow::Result<()> {
+        use crate::harness::{admission::Demand, mail, model::{Command, Status}, registry::Sent};
+        run(async {
+            let hub = crate::hub::tests::scratch_hub_with(|config| config.conversations.off = true).await?;
+            struct Owned(Arc<Hub>);
+            impl Drop for Owned { fn drop(&mut self) { self.0.harness.local.stop_all(); self.0.shutdown.cancel(); } }
+            let _owned = Owned(Arc::clone(&hub));
+            let owner = Arc::clone(&hub);
+            crate::rt::spawn(async move { let _ = crate::harness::registry::Registry::run_local(owner).await; });
+            let dir = tempfile::tempdir()?;
+            let (recipient, heard) = recording(&hub, dir.path(), true).await?;
+            source_until(&hub, &recipient, "native owner initialized", || async {
+                Ok(hub.harness.info(&recipient).is_some_and(|info| info.status == Status::Idle)
+                    && hub.harness.local.get(&recipient).is_some_and(|session| session.core.lock().state.status == Status::Idle))
+            }).await?;
+            let message = "mail-peers-state";
+            let command = Command::Send { id: message.into(), text: "retain the exact original until real completion".into(), mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+            let Sent::Published(original) = hub.harness.command(&hub, &recipient, command).await else { anyhow::bail!("the original was not committed") };
+            anyhow::ensure!(original.generation == 0 && original.disposition == mail::Disposition::Waiting && prompts(&heard).is_empty(), "custody alone is not native consumption: {original:?}");
+            let epoch = hub.harness.epoch_of(&recipient);
+            anyhow::ensure!(hub.harness.local.command(&recipient, Command::MailPeers { epoch, peers: vec!["server".into()], demand: vec![Demand { peer: "server".into(), revision: original.revision }] }), "MailPeers was not queued");
+            source_until(&hub, &recipient, "source grant for the retained publication", || async {
+                Ok(crate::harness::mail_delivery::capacity(&hub, &recipient).is_some_and(|capacity| capacity.eligible_peer.as_deref() == Some("server")))
+            }).await?;
+            let grant = crate::harness::mail_delivery::capacity(&hub, &recipient).ok_or_else(|| anyhow::anyhow!("source grant disappeared"))?;
+            let name = "ordinary-state-after-mail-peers";
+            anyhow::ensure!(hub.harness.local.command(&recipient, Command::Control { id: "rename".into(), value: Some(json!(name)) }), "ordinary owner control was not queued");
+            source_until(&hub, &recipient, "ordinary owner State after the grant", || async { Ok(hub.harness.info(&recipient).is_some_and(|info| info.name == name)) }).await?;
+            let local = hub.harness.local.get(&recipient).ok_or_else(|| anyhow::anyhow!("source disappeared"))?;
+            anyhow::ensure!(local.core.lock().state.admission.as_ref() == Some(&grant), "MailPeers did not update the authoritative State: {grant:?}");
+            anyhow::ensure!(crate::harness::mail_delivery::capacity(&hub, &recipient).as_ref() == Some(&grant), "an ordinary State revoked the live grant: {grant:?}");
+            anyhow::ensure!(hub.harness.state(&recipient).and_then(|state| state.admission).as_ref() == Some(&grant), "the raw State and admission projection disagree");
+            let worker = Arc::clone(&hub);
+            crate::rt::spawn(async move { let _ = crate::harness::mail_delivery::run(worker).await; });
+            source_disposition(&hub, &recipient, message, true).await?;
+            let receipt = mail::receipt(&hub.store, "server".into(), "server".into(), recipient.clone(), message.into()).await?.ok_or_else(|| anyhow::anyhow!("the committed original disappeared"))?;
+            anyhow::ensure!(receipt.revision == original.revision && receipt.disposition == mail::Disposition::Consumed && prompts(&heard) == [message], "one exact native delivery and actual consumption: {receipt:?}");
+            Ok(())
+        })
+    }
+
     #[test]
     fn an_agent_held_to_fewer_subagents_starts_no_more_through_kiln() -> anyhow::Result<()> {
         run(async {

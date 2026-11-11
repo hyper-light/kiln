@@ -3,6 +3,13 @@
 
 Uses the existing transfers.rs/common CLI setup and fake-claude helper. It does not build,
 install, change production, run a model, or claim cancellation/crash-boundary coverage.
+
+The post-handover acts() child removes both terminal and agent environment identities:
+socket.rs must recognize the surviving provider's process group/ancestry, then authorize
+agents.result through its actual runner certificate. Public Listed identity fields come
+from api.rs/identities.rs; no private key, actor mark or direct admin operation substitutes
+for that child call. This witnesses only the owned Unix fake-provider handover, not every
+provider/platform or production actor. Root owns executing this live fixture.
 """
 import argparse
 from contextlib import contextmanager
@@ -11,6 +18,8 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import shutil
 import signal
 import socket
@@ -20,6 +29,7 @@ import sys
 import tempfile
 import time
 import uuid
+from urllib.parse import unquote, urlsplit
 
 
 class Refused(Exception):
@@ -57,6 +67,51 @@ def rows(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+def agent_identity(subject):
+    """Parse the public Actor::Agent URI shape in kiln-ci identity/chain.rs."""
+    if not isinstance(subject, str):
+        return None
+    uri = urlsplit(subject)
+    parts = [unquote(part) for part in uri.path.strip("/").split("/")]
+    if (uri.scheme != "kiln" or not uri.netloc or uri.query or uri.fragment or len(parts) != 10
+            or parts[0] != "person" or parts[2] != "agent" or parts[4] != "epoch"
+            or parts[6] != "machine" or parts[8] != "instance" or not parts[5].isascii()
+            or not parts[5].isdigit() or str(int(parts[5])) != parts[5]):
+        return None
+    return {"session": parts[3], "epoch": int(parts[5]), "machine": parts[7], "instance": parts[9]}
+
+
+def identity_log_observations(text, session, allowed_epochs):
+    """Public URI and runner identity::slot formats; retain no raw private log lines."""
+    slot = re.compile(r"\bagent/" + re.escape(session) + r"/([0-9]+)\b")
+    uri = re.compile(r"/agent/" + re.escape(session) + r"/epoch/([0-9]+)(?=/|\b)")
+    identity_field = re.compile(r'\bidentity=(?:"([^"]+)"|([^\s]+))')
+    observed, refused = set(), set()
+    for line in text.splitlines():
+        line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
+        epochs = {int(value) for pattern in (slot, uri) for value in pattern.findall(line)}
+        observed.update(epochs)
+        if "kiln issued no identity" in line or "no identity issued" in line:
+            # The reason can reference a valid prior hand-on URI; only identity= was refused.
+            for quoted, bare in identity_field.findall(line):
+                value = quoted or bare
+                if match := slot.fullmatch(value):
+                    refused.add(int(match[1]))
+                elif value.startswith("kiln://"):
+                    refused.update(int(epoch) for epoch in uri.findall(value))
+    return {"observed_epochs": sorted(observed), "unexpected_epochs": sorted(observed - set(allowed_epochs)),
+            "refused_epochs": sorted(refused), "destination_refused": max(allowed_epochs) in refused}
+
+
+def verify_identity_log_parser():
+    line = ("WARN kiln issued no identity identity=agent/S/2 error=hand-on "
+            "kiln://fixture/person/admin/agent/S/epoch/1/machine/a/instance/old not to "
+            "kiln://fixture/person/admin/agent/S/epoch/2/machine/a/instance/new")
+    facts = identity_log_observations(line, "S", (0, 1))
+    require(facts["refused_epochs"] == [2] and facts["unexpected_epochs"] == [2]
+            and facts["destination_refused"] is False, "identity parser confused a referenced hand-on with a refused request")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
@@ -70,6 +125,7 @@ def main():
     parser.add_argument("--timeout-seconds", required=True, type=float)
     parser.add_argument("--keep-free-bytes", required=True, type=int, help="Coordinator's effective operational floor")
     args = parser.parse_args()
+    verify_identity_log_parser()
     require(os.name == "posix", "this direct SCM proof is Unix-only")
     require(args.timeout_seconds > 0 and args.keep_free_bytes >= 0, "invalid fixture envelope")
     binary = args.binary.resolve(strict=True)
@@ -96,6 +152,7 @@ def main():
     providers = {}
     admin = None
     session = None
+    handoff = None
     http_port = port(socket.SOCK_STREAM)
     quic_port = port(socket.SOCK_DGRAM)
     report = {"binary_sha256": args.sha256, "source_receipt_sha256": sha(args.source_receipt),
@@ -175,6 +232,35 @@ def main():
         result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="], capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"}, timeout=5)
         text = result.stdout.strip()
         return text if result.returncode == 0 and str(root / "bin" / "claude") in text else None
+
+    def identity_logs(expected_epoch):
+        raw = (root / "supervisor.log").read_bytes()
+        facts = identity_log_observations(raw.decode("utf-8", errors="replace"), session, (initial["epoch"], expected_epoch))
+        report["identity_log"] = {**facts, "sha256": hashlib.sha256(raw).hexdigest()}
+        require(not facts["unexpected_epochs"] and not facts["destination_refused"],
+                "owned supervisor requested or refused an unexpected destination identity epoch; inspect private log")
+        return facts
+
+    def destination_certificate(handoff):
+        epoch = handoff["manifest"]["destination_epoch"]
+        identity_logs(epoch)
+        value = api("GET", "/api/identities?kind=agent")
+        require(isinstance(value, dict) and isinstance(value.get("identities"), list), "public identities response shape changed")
+        matches = []
+        for certificate in value["identities"]:
+            subject = certificate.get("subject")
+            parsed = agent_identity(subject)
+            if isinstance(subject, str) and "/agent/" + session + "/" in subject:
+                require(parsed is not None, "owned agent certificate has an unreadable subject")
+            if not parsed or parsed["session"] != session:
+                continue
+            require(parsed["epoch"] in (initial["epoch"], epoch), "public agent identity has an unexpected epoch")
+            if parsed["epoch"] == epoch:
+                require(parsed["machine"] == handoff["destination"]["machine"]
+                        and parsed["instance"] == handoff["destination"]["instance"], "destination certificate names a different owner")
+                if certificate.get("refused") is None and isinstance(certificate.get("verified"), str) and certificate["verified"]:
+                    matches.append(certificate)
+        return matches[0] if matches else None
 
     def interrupted(_signal, _frame):
         raise Refused("the coordinator interrupted this owned fixture")
@@ -313,12 +399,39 @@ headroom = false
                     headers.append(value)
         check("source_and_destination_durable_native_headers", len(headers) >= 2)
         check("snapshot_preserves_native_pid", all((value.get("handed") or {}).get("process", {}).get("pid") == provider for value in headers))
+        certificate = wait("public verified destination certificate", lambda: destination_certificate(handoff))
+        check("verified_exact_destination_epoch_one", handoff["manifest"]["destination_epoch"] == 1 and certificate["kind"] == "agent")
+        report["destination_certificate"] = {key: certificate[key] for key in ("serial", "kind", "subject", "key", "verified", "refused")}
+        # socket::agent_of also accepts survivors::MARK (KILN_AGENT), so remove it as well
+        # as the person's terminal fallback. The acts() child must use process ownership.
+        actor_argv = ["env", "-u", "KILN_TERM_SESSION", "-u", "KILN_AGENT", str(binary), "agents", "result", session, "--json"]
+        actor_command = shlex.join(actor_argv)
+        report["actor_authorization"] = {"command": actor_command, "provider_pid": provider,
+                                          "terminal_and_agent_marks_removed": True, "result_gate_held": not gate.exists()}
+        require(not gate.exists(), "provider result gate opened before actor authorization witness")
+        private(root / "work-here" / (".fake-claude-acts-" + str(provider)), actor_command + "\n")
+        def actor_answer():
+            identity_logs(handoff["manifest"]["destination_epoch"])
+            matches = [row for row in rows(root / "work-here/.fake-claude-acted") if row.get("cmd") == actor_command]
+            require(len(matches) <= 1, "the exact actor command ran more than once")
+            return matches[0] if matches else None
+        acted = wait("surviving provider child authorized agents.result", actor_answer)
+        report["actor_authorization"]["record"] = acted
+        check("surviving_provider_child_command_succeeded", acted.get("cmd") == actor_command and acted.get("pid") == provider and acted.get("code") == 0)
+        actor_result = json.loads(acted["out"])
+        check("actor_result_names_exact_session", actor_result.get("agent", {}).get("id") == session
+              and actor_result["agent"].get("machine") == machine)
+        check("actor_authorized_before_original_completion", not gate.exists() and mail(message) == after and process_identity(provider) == identity)
+        identity_logs(handoff["manifest"]["destination_epoch"])
         gate.touch()
         consumed = wait("destination observed native completion", lambda: (value if (value := mail(message)) and value["disposition"] == "consumed" else None))
         check("completion_kept_exact_attempt", (consumed["revision"], consumed["generation"], consumed["epoch"]) == (after["revision"], after["generation"], after["epoch"]))
         api("POST", f"/api/harness/agents/{session}/send", {"text": text, "key": key})
         check("one_native_prompt_after_exact_retry", sum(row.get("uuid") == message for row in rows(heard)) == 1)
         check("retry_kept_terminal_receipt", mail(message) == consumed)
+        require(destination_certificate(handoff) is not None, "destination identity no longer verifies after completion")
+        facts = identity_logs(handoff["manifest"]["destination_epoch"])
+        check("no_unexpected_or_refused_destination_epoch", not facts["unexpected_epochs"] and not facts["destination_refused"])
         report["handoff"] = handoff
         report["final_mail"] = consumed
         report["passed"] = True
@@ -350,6 +463,15 @@ headroom = false
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+        # Include identity events flushed during owned shutdown, after the final API read.
+        if handoff is not None:
+            try:
+                identity_logs(handoff["manifest"]["destination_epoch"])
+            except Exception as error:
+                report["passed"] = False
+                report["checks"]["no_unexpected_or_refused_destination_epoch"] = False
+                report["failure_type"] = type(error).__name__
+                report["failure"] = str(error) if isinstance(error, Refused) else "final owned identity log could not be verified"
         report["owned_groups_exited"] = all(child.poll() is not None for _, child in children)
         report["elapsed_seconds"] = time.monotonic() - started
         private(root / "result.json", json.dumps(report, indent=2) + "\n")

@@ -528,12 +528,13 @@ pub fn hand_on(session: &str, epoch: u64, events: &[Event], why: &str) -> Option
 /// Session `session` taken over here at `epoch` (an epoch up from the one it left), its package
 /// carrying `events` and the giver's `hand_on`: this process's receipt waits to go with the ask
 /// for its identity at `epoch` ([`carrying`]).
-pub fn took(session: &str, epoch: u64, events: &[Event], hand_on: &Value) {
+pub fn took(session: &str, epoch: u64, events: &[Event], hand_on: &Value) -> Result<(), String> {
     if !signs() {
-        return;
+        return Ok(());
     }
-    let Some(signed) = Receipt::of(session, epoch, events, hand_on) else { return };
+    let signed = Receipt::of(session, epoch, events, hand_on).ok_or_else(|| "the source hand-on cannot form this session's custody receipt".to_owned())?;
     STATE.lock().waiting.insert((session.to_owned(), epoch), Waiting { signed: Some(signed), held: false, blue_green: false });
+    Ok(())
 }
 
 /// Session `session` taken over blue/green from this machine's runner process being upgraded, at

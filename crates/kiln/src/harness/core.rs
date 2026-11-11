@@ -728,6 +728,11 @@ pub struct Frozen {
 }
 
 impl Frozen {
+    /// The exact source timeline signed before a native journal changes ownership.
+    pub(crate) fn handover_source(&self) -> (u64, &[Event]) {
+        (self.state.epoch, &self.events)
+    }
+
     pub(super) fn transfer_epoch(&mut self, from: u64, to: u64) -> Result<(), String> {
         if self.state.epoch != from || from.checked_add(1) != Some(to) { return Err("native handover snapshot does not match its exact source/destination epoch".into()); }
         self.state.epoch = to;

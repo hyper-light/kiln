@@ -1392,7 +1392,7 @@ impl Host {
         // Its giver's signed hand-on goes on to the server, and this process's receipt waits for
         // its identity at the epoch it goes on at (docs/ci.md W27-R08).
         if let Some(h) = &pkg.hand_on {
-            crate::runner::custody::took(&pkg.id, epoch, &pkg.events, h);
+            crate::runner::custody::took(&pkg.id, epoch, &pkg.events, h).map_err(Refused::NotTaken)?;
         }
         let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced, local: pkg.handover };
         // Taken over, written so before anything of it runs here: no other process of the machine
@@ -1896,7 +1896,7 @@ impl Host {
                             c.advertised_ready(input.now_ns());
                             c.capacity()
                         };
-                        let _ = self.sink.send((id.to_owned(), Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) })).await;
+                        s.mail_flow(super::admission::FlowEvent::Capacity { capacity });
                     }
                 }
                 return;
@@ -1939,7 +1939,7 @@ impl Host {
         if self.is_held() || s.is_moving() {
             self.release_unaccepted(id, &Command::Admit { peer: lease.peer.clone(), token, epoch, generation: 0, peers: Vec::new(), command: Box::new(c) });
             let capacity = input.controller.lock().capacity();
-            let _ = self.sink.send((id.to_owned(), Update::MailFlow { event: Box::new(FlowEvent::Waiting { token, epoch, cause: WaitCause::Fenced, capacity }) })).await;
+            s.mail_flow(FlowEvent::Waiting { token, epoch, cause: WaitCause::Fenced, capacity });
             return;
         }
         lease.stage = Stage::InboxAccepted;
@@ -1949,7 +1949,7 @@ impl Host {
                 Ok(Some(original)) => Some(original),
                 _ => {
                     let capacity = { let mut controller = input.controller.lock(); let _ = controller.finish(&message, Disposition::Cancelled { reason: super::admission::CancelReason::BeforeAcceptance }, input.now_ns(), false); controller.capacity() };
-                    let _ = self.sink.send((id.to_owned(), Update::MailFlow { event: Box::new(FlowEvent::Waiting { token, epoch, cause: WaitCause::PhysicalBytes, capacity }) })).await;
+                    s.mail_flow(FlowEvent::Waiting { token, epoch, cause: WaitCause::PhysicalBytes, capacity });
                     return;
                 }
             }
@@ -1967,7 +1967,7 @@ impl Host {
                     if controller.lease(&message).is_some_and(|lease| lease.stage == Stage::Reserved) { let _ = controller.finish(&message, Disposition::Cancelled { reason: super::admission::CancelReason::BeforeAcceptance }, input.now_ns(), false); }
                     controller.capacity()
                 };
-                let _ = self.sink.send((id.to_owned(), Update::MailFlow { event: Box::new(FlowEvent::Waiting { token, epoch, cause: WaitCause::SourceUnavailable, capacity }) })).await;
+                s.mail_flow(FlowEvent::Waiting { token, epoch, cause: WaitCause::SourceUnavailable, capacity });
                 self.say(id, Said { message, answer: Err(inbox::Refusal::Unavailable { session: id.to_owned(), why: "attachment materialization or source custody is unavailable; original communication remains retained".into() }) }).await;
                 return;
             }
@@ -1981,7 +1981,7 @@ impl Host {
                     if controller.lease(&message).is_some_and(|lease| lease.stage == Stage::Reserved) { let _ = controller.finish(&message, Disposition::Cancelled { reason: super::admission::CancelReason::BeforeAcceptance }, input.now_ns(), false); }
                     controller.capacity()
                 };
-                let _ = self.sink.send((id.to_owned(), Update::MailFlow { event: Box::new(FlowEvent::Waiting { token, epoch, cause: WaitCause::PhysicalBytes, capacity }) })).await;
+                s.mail_flow(FlowEvent::Waiting { token, epoch, cause: WaitCause::PhysicalBytes, capacity });
                 return;
             }
             if let Some(current) = input.controller.lock().lease(&message) { lease.bytes = current.bytes; }
@@ -1998,20 +1998,20 @@ impl Host {
                     if s.command(c) { let _ = input.controller.lock().stage(&message, Stage::InCtl); }
                 }
                 if let Ok(Some(original)) = input.inbox.pending(id, &message).await {
-                    self.publish_pending(id, &input, original).await;
+                    self.publish_pending(id, &input, original);
                 }
                 self.say(id, Said { message, answer: Ok(answer) }).await;
             }
             Err(refusal) => {
                 let _ = input.controller.lock().finish(&message, Disposition::Cancelled { reason: super::admission::CancelReason::BeforeAcceptance }, input.now_ns(), false);
                 let capacity = input.controller.lock().capacity();
-                let _ = self.sink.send((id.to_owned(), Update::MailFlow { event: Box::new(FlowEvent::Waiting { token, epoch, cause: WaitCause::SourceUnavailable, capacity }) })).await;
+                s.mail_flow(FlowEvent::Waiting { token, epoch, cause: WaitCause::SourceUnavailable, capacity });
                 self.say(id, Said { message, answer: Err(refusal) }).await;
             }
         }
     }
 
-    async fn publish_pending(&self, id: &str, input: &super::admission::Input, pending: inbox::Pending) {
+    fn publish_pending(&self, id: &str, input: &super::admission::Input, pending: inbox::Pending) {
         use super::admission::{Disposition, FlowEvent};
         let Some(token) = pending.lease.token else { return };
         let capacity = { let mut c = input.controller.lock(); c.advertised_ready(input.now_ns()); c.capacity() };
@@ -2020,7 +2020,7 @@ impl Host {
             Some(disposition) => FlowEvent::Disposed { token, epoch: pending.lease.epoch, disposition, capacity },
             None => FlowEvent::Accepted { token, epoch: pending.lease.epoch, capacity },
         };
-        let _ = self.sink.send((id.to_owned(), Update::MailFlow { event: Box::new(event) })).await;
+        if let Some(s) = self.get(id) { s.mail_flow(event); }
     }
 
     /// A connection/open event replays durable custody receipts through the ordinary harness
@@ -2033,12 +2033,7 @@ impl Host {
     async fn replay_session_mail(&self, s: &Arc<Session>) {
         let Some(inbox) = self.inbox.clone() else {
             let capacity = { let mut c = super::admission::Controller::new(s.epoch(), Arc::clone(&self.input_budget)); let _ = c.unavailable(); c.capacity() };
-            {
-                let mut core = s.core.lock();
-                core.state.admission = Some(capacity.clone());
-                core.touch_state();
-            }
-            let _ = self.sink.send((s.id.clone(), Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) })).await;
+            s.mail_flow(super::admission::FlowEvent::Capacity { capacity });
             return;
         };
         let input = {
@@ -2068,16 +2063,10 @@ impl Host {
                 let already_queued = { let core = s.core.lock(); core.state.queue.iter().chain(core.state.tasks.iter().flat_map(|t| &t.queue)).any(|q| q.id == pending.lease.message) || core.input_stages.contains(&pending.lease.message) };
                 if let Some(command) = pending.current_command() && !already_queued && s.command(command.clone()) { let _ = input.controller.lock().stage(&pending.lease.message, super::admission::Stage::InCtl); }
             }
-            self.publish_pending(&s.id, &input, pending).await;
+            self.publish_pending(&s.id, &input, pending);
         }
         let capacity = { let mut c = input.controller.lock(); c.advertised_ready(input.now_ns()); c.capacity() };
-        {
-            let mut core = s.core.lock();
-            core.state.admission = Some(capacity.clone());
-            core.touch_state();
-        }
-        s.input_changed();
-        let _ = self.sink.send((s.id.clone(), Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) })).await;
+        s.mail_flow(super::admission::FlowEvent::Capacity { capacity });
     }
 
     /// An old live provider has no new journal yet. Its complete queue bodies and actual native

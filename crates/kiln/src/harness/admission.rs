@@ -73,6 +73,14 @@ pub enum FlowEvent {
     Fault { epoch: u64, code: Fault, capacity: Capacity },
 }
 
+impl FlowEvent {
+    pub fn capacity(&self) -> &Capacity {
+        match self {
+            Self::Accepted { capacity, .. } | Self::Consumed { capacity, .. } | Self::Waiting { capacity, .. } | Self::Capacity { capacity } | Self::Disposed { capacity, .. } | Self::Fault { capacity, .. } => capacity,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage { Reserved, InboxAccepted, InCtl, Carried, Queued, ProviderFlight }
