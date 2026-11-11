@@ -2257,30 +2257,61 @@ fn w05_r16_cpu_only_nodes_do_not_delay_gpu_lease_retry() {
     }
 }
 
-/// E1.5: compare all generated histories, retaining the original case count and invariants.
+/// W05-R10/W05-R16/W05-R39: losing a runner releases a gang reservation elsewhere. The
+/// already queued tenant with the better standing must precede a newly eligible retry.
+/// Frozen from seed3261: no random generation or GPU demand participates in this regression.
 #[test]
-fn debug_lb3261_reduced_history() {
-    let (cfg, epoch, steps) = case(3261);
-    let failed = run(&cfg, epoch, &steps, |_| {}).err();
-    let Some((applied, why)) = failed else { return };
-    let (steps, _) = shrink(&cfg, epoch, applied, why);
-    println!("[DEBUG-lb3261] lock_delay {} epoch {epoch}", cfg.lock_delay);
-    let mut s = Scheduler::with_epoch(cfg.clone(), epoch);
-    let mut r = Reference::new(cfg.clone(), epoch);
-    for (step, now) in &steps {
-        println!("[DEBUG-lb3261] INPUT {now} {step:?}");
-        for id in ["l6", "l8"] {
-            if let Some(l) = r.legs.get(id) {
-                if let At::Queued(q) = &l.at {
-                    println!("[DEBUG-lb3261] REFERENCE {id} {:?} standing {:?} own {}", q.class, r.standing(q.class, &l.input, [true, false, false, false]), q.own);
-                }
-            }
-            println!("[DEBUG-lb3261] ENGINE {:?}", s.debug_lb3261_pick(id, "r0"));
-        }
-        s.handle(step.input(), *now);
-        r.handle(step, *now);
-    }
-    assert_eq!(s.grants(), r.placement().0);
+fn w05_r39_released_gang_room_keeps_fair_order_before_lost_retries() {
+    let cfg = Config { resources: true, fair_by: vec![FairBy::Repo, FairBy::Actor, FairBy::Lane], aging_per_minute: 1000, lock_delay: 0, backfill: true, ..Config::default() };
+    let runner = |id: &str| RunnerIn {
+        id: id.into(), slots: 1,
+        view: RunnerView { name: id.into(), labels: vec!["x".into(), "y".into()], facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, ..RunnerView::default() },
+        ..RunnerIn::default()
+    };
+    let initial = LegIn { id: "l1".into(), run: "run0".into(), repo: "acme/r1".into(), priority: 60, class: Class::Critical, actor: "a1".into(), lane: "l0".into(), on_lease_loss: LeaseLoss::Stop, ..LegIn::default() };
+    let sibling = |id: &str| LegIn {
+        id: id.into(), run: "run1".into(), repo: "acme/r2".into(), priority: 60, class: Class::Critical,
+        request: Resources { cpu: Cpus::whole(6), mem: 11 * GIB, ..Resources::default() },
+        cost: Some(120_000), p90: Some(15_000), actor: "a1".into(), lane: "l1".into(),
+        gang: Some(Gang { id: "g4".into(), size: 2 }), ..LegIn::default()
+    };
+    let retry = LegIn {
+        id: "l6".into(), run: "run2".into(), repo: "acme/r1".into(), priority: 20, class: Class::Land,
+        route: LegRoute { labels: vec!["y".into()], ..LegRoute::default() },
+        request: Resources { cpu: Cpus::whole(8), mem: 32 * GIB, ..Resources::default() },
+        cost: Some(350_000), timeout: Some(960_000), actor: "a1".into(), lane: "l1".into(), ..LegIn::default()
+    };
+    let exclusive = LegIn {
+        id: "l7".into(), run: "run2".into(), repo: "acme/r2".into(), priority: 80, class: Class::Interactive, exclusive: true,
+        route: LegRoute { labels: vec!["y".into()], ..LegRoute::default() },
+        request: Resources { cpu: Cpus::whole(5), mem: 29 * GIB, ..Resources::default() },
+        cost: Some(10_000), actor: "a1".into(), lane: "l1".into(), on_lease_loss: LeaseLoss::Stop, ..LegIn::default()
+    };
+    let waiting = LegIn {
+        id: "l8".into(), run: "run2".into(), repo: "acme/r2".into(), priority: 0, class: Class::Land,
+        route: LegRoute { labels: vec!["x".into()], ..LegRoute::default() },
+        request: Resources { cpu: Cpus::whole(7), mem: 30 * GIB, ..Resources::default() },
+        cost: Some(120_000), p90: Some(145_000), timeout: Some(1_140_000), actor: "a1".into(), lane: "l0".into(), ..LegIn::default()
+    };
+    let steps = [
+        (Step::Up(runner("r0")), 23_287),
+        (Step::Up(runner("r1")), 102_009),
+        (Step::Queued(Box::new(initial)), 1_130_257),
+        (Step::Ended { leg: "l1".into(), attempt: 1, outcome: Outcome::Success }, 1_287_584),
+        (Step::Queued(Box::new(sibling("l4"))), 1_618_807),
+        (Step::Queued(Box::new(sibling("l5"))), 1_967_503),
+        (Step::Queued(Box::new(retry)), 2_176_020),
+        (Step::Refused { leg: "l4".into(), fence: Fence { epoch: 3, n: 2 } }, 2_270_481),
+        (Step::Queued(Box::new(exclusive)), 2_372_814),
+        (Step::Queued(Box::new(waiting)), 2_679_740),
+        (Step::Lost("r1".into()), 2_805_529),
+        (Step::Up(runner("r1")), 2_980_441),
+        (Step::Refused { leg: "l8".into(), fence: Fence { epoch: 3, n: 7 } }, 3_116_864),
+        (Step::Ended { leg: "l6".into(), attempt: 1, outcome: runner_lost() }, 3_180_146),
+        (Step::Lost("r1".into()), 3_413_496),
+    ];
+    let result = run(&cfg, 3, &steps, |_| {});
+    assert!(result.is_ok(), "{result:?}");
 }
 
 /// E1.5: compare all generated histories, retaining the original case count and invariants.

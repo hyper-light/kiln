@@ -1691,14 +1691,6 @@ struct Holding {
 }
 
 impl Scheduler {
-    #[cfg(test)]
-    pub(super) fn debug_lb3261_pick(&self, id: &str, runner: &str) -> Option<String> {
-        let (l, r) = (self.legs.get(id)?, self.runners.get(runner)?);
-        let class = l.key?.0;
-        let set = profile(&dims(&r.input, self.config().resources));
-        Some(format!("{id}: state {:?}, key {:?}, flow {:?}, standing {:?}, fits {}, allowed {}, avoid {:?}", l.state, l.key, l.flow, self.standing_of(class, &l.flow, set), self.fits(r, l), self.allowed(r, l), l.avoid))
-    }
-
     pub fn new(cfg: Config) -> Scheduler {
         Scheduler::with_epoch(cfg, 0)
     }
