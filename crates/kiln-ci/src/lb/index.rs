@@ -431,6 +431,80 @@ impl Index {
         }
     }
 
+    /// Whether runner `a` would come before runner `b` in bucket `k`'s turn, were both in it: by
+    /// id from the bucket's cursor, wrapping, as [`Index::first_from`] finds its members (a
+    /// cursor past the fleet starts at 0). True when there is no `b` (NIL).
+    #[inline(always)]
+    pub fn before(&self, k: u32, a: u32, b: u32) -> bool {
+        if b == NIL {
+            return true;
+        }
+        let c = self.slots.get(k as usize).map_or(0, |s| s.cursor);
+        let c = if c / 64 < self.nw { c } else { 0 };
+        a.wrapping_sub(c) < b.wrapping_sub(c)
+    }
+
+    /// Sets `mask` in bucket `b`'s membership word `w`, and the word's bit in the bucket's summary
+    /// when it held no member.
+    #[inline(always)]
+    fn add_bit(&mut self, w: u32, b: u32, mask: u64) {
+        let nb = self.nb;
+        let Some(x) = self.bits.get_mut(cell(w, nb, b)) else { return };
+        let was = *x;
+        *x = was | mask;
+        if was == 0
+            && let Some(s) = self.sum.get_mut(cell(w / 64, nb, b))
+        {
+            *s |= 1u64 << (w % 64);
+        }
+    }
+
+    /// Clears `mask` in bucket `b`'s membership word `w`, and the word's bit in the bucket's
+    /// summary when that leaves it no member.
+    #[inline(always)]
+    fn drop_bit(&mut self, w: u32, b: u32, mask: u64) {
+        let nb = self.nb;
+        let Some(x) = self.bits.get_mut(cell(w, nb, b)) else { return };
+        let left = *x & !mask;
+        *x = left;
+        if left == 0
+            && let Some(s) = self.sum.get_mut(cell(w / 64, nb, b))
+        {
+            *s &= !(1u64 << (w % 64));
+        }
+    }
+
+    /// Member `a` goes from bucket `lo` to bucket `hi` as member `b` goes from `hi` to `lo`: what
+    /// `relink(a, lo, hi)` then `relink(b, hi, lo)` leave, written once. Each bucket holds as many
+    /// as it did, so neither its count nor the buckets that hold any change; each bucket's last
+    /// put in is the one it gained. `a` is in `lo` and `b` in `hi` by the index's invariant.
+    #[inline(always)]
+    pub fn swap(&mut self, a: u32, b: u32, lo: u32, hi: u32) {
+        let nb = self.nb;
+        let (wa, wb) = (a / 64, b / 64);
+        let (ma, mb) = (1u64 << (a % 64), 1u64 << (b % 64));
+        if wa == wb {
+            // One word of each bucket, and each keeps one of the two: neither empties.
+            if let Some(x) = self.bits.get_mut(cell(wa, nb, lo)) {
+                *x = (*x & !ma) | mb;
+            }
+            if let Some(x) = self.bits.get_mut(cell(wa, nb, hi)) {
+                *x = (*x & !mb) | ma;
+            }
+        } else {
+            self.drop_bit(wa, lo, ma);
+            self.add_bit(wb, lo, mb);
+            self.add_bit(wa, hi, ma);
+            self.drop_bit(wb, hi, mb);
+        }
+        if let Some(k) = self.slots.get_mut(lo as usize) {
+            k.last = b;
+        }
+        if let Some(k) = self.slots.get_mut(hi as usize) {
+            k.last = a;
+        }
+    }
+
     /// Bucket `b`'s members from the next in turn on, once round (in id order, wrapping).
     pub fn bucket(&self, b: u32) -> impl Iterator<Item = u32> + '_ {
         let first = self.next_in(b);
@@ -489,5 +563,64 @@ mod hex_address_tests {
     fn w05_r04_interleaved_addresses_do_not_wrap_at_u32() {
         // Previously this legal address wrapped to 4095 (and panicked in debug builds).
         assert_eq!(super::cell(1 << 20, super::BUCKETS, 4095), usize::try_from((1u64 << 32) + 4095).unwrap_or(usize::MAX));
+    }
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use super::Index;
+    use crate::lb::model::Rng;
+
+    /// W05-R04, W05-R26: one swap leaves the index exactly as the two moves it stands for
+    /// (members, summaries, counts, cursors, each bucket's last put in), within one membership
+    /// word and across words and summary words; and a runner comes before a bucket's next in turn
+    /// exactly when, put in that bucket, it is the next.
+    #[test]
+    fn w05_r26_a_swap_leaves_what_its_two_moves_leave() -> Result<(), String> {
+        let mut rng = Rng(7);
+        let mut swapped = 0u32;
+        for case in 0..6000u32 {
+            let runners = [2u32, 3, 63, 64, 65, 130, 4097, 9000].get((case % 8) as usize).copied().unwrap_or(2);
+            let buckets = 2 + rng.below(8) as u32;
+            let mut ix = Index::new(rng.below(u64::from(u32::MAX)) as u32);
+            ix.grow(buckets, runners);
+            // Few members in the big fleets, so words and summary words empty and fill.
+            let members = runners.min(2 + rng.below(40) as u32);
+            let mut at: Vec<(u32, u32)> = Vec::new();
+            while (at.len() as u32) < members {
+                let r = rng.below(u64::from(runners)) as u32;
+                if at.iter().any(|x| x.0 == r) {
+                    continue;
+                }
+                let b = rng.below(u64::from(buckets)) as u32;
+                ix.join(r, &[8000, 0, 0, 0]);
+                ix.push(r, b);
+                at.push((r, b));
+            }
+            // A cursor anywhere, past the fleet too.
+            for b in 0..buckets {
+                ix.took(b, rng.below(u64::from(runners) + 70) as u32);
+            }
+            let Some(&(a, lo)) = at.get(rng.below(at.len() as u64) as usize) else { continue };
+            let Some(&(b, hi)) = at.iter().find(|x| x.1 != lo) else { continue };
+            let next = ix.next_in(hi);
+            let mut with = ix.clone();
+            with.push(a, hi);
+            if ix.before(hi, a, next) != (with.next_in(hi) == a) {
+                return Err(format!("case {case}: {a} before {next} in bucket {hi}: {}\n{ix:?}", ix.before(hi, a, next)));
+            }
+            let (mut one, mut two) = (ix.clone(), ix);
+            one.swap(a, b, lo, hi);
+            two.relink(a, lo, hi);
+            two.relink(b, hi, lo);
+            if format!("{one:?}") != format!("{two:?}") {
+                return Err(format!("case {case}: {runners} runners, {a} from {lo} to {hi} as {b} comes back:\n{one:?}\n{two:?}"));
+            }
+            swapped += 1;
+        }
+        if swapped < 5000 {
+            return Err(format!("only {swapped} cases had two buckets to swap between"));
+        }
+        Ok(())
     }
 }

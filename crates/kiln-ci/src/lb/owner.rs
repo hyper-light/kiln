@@ -125,6 +125,31 @@ struct Pend {
 
 const NO_PEND: Pend = Pend { r: NIL, from: 0, to: 0 };
 
+#[cfg(test)]
+thread_local! {
+    /// Tests alone: a tied pick makes its two moves one after the other, as before
+    /// [`Owner::ask_turn`], so the two ways can be held against each other.
+    static TWO_MOVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests alone: how many tied picks swapped, and how many went back to the runner put off.
+    static TURNS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Runs `f` with tied picks making their two moves one after the other (tests alone).
+#[cfg(test)]
+pub(super) fn with_two_moves<T>(f: impl FnOnce() -> T) -> T {
+    TWO_MOVES.with(|c| c.set(true));
+    let v = f();
+    TWO_MOVES.with(|c| c.set(false));
+    v
+}
+
+/// How many tied picks swapped, and how many went back to the runner put off, on this thread
+/// (tests alone).
+#[cfg(test)]
+pub(super) fn turns() -> (u64, u64) {
+    TURNS.with(std::cell::Cell::get)
+}
+
 /// A batch's rise. W05-R26: `turn` records its arrival order before sorting, so an in-place
 /// unstable sort preserves equal-key turns without a stable sort's temporary allocation.
 /// Recomputed from the live list for each overlay; no lifetime or capacity policy is needed.
@@ -675,8 +700,71 @@ impl Owner {
             }
             return self.ask_wide(si, cpu);
         }
+        if let Some(picked) = self.ask_turn(si, cpu) {
+            return Some(picked);
+        }
         self.flush();
         self.ask_top(si, cpu)
+    }
+
+    /// The pick when the runner whose rise is put off only ties the most free (its view says the
+    /// top bucket, which holds others): the next in turn of that bucket with it counted in
+    /// (W05-R04's turns; W05-R23's most free). When that is it, the pick goes back to it and
+    /// nothing moves, as when it is alone at the top ([`Owner::ask_fast`]). When it is another,
+    /// which the run leaves where the first was, the two change places in one write
+    /// ([`Index::swap`]): what moving the first up ([`Owner::flush`]) and then taking the other
+    /// down ([`Owner::ask_top`]) leave, without each bucket's count going down and up again. The
+    /// commonest pick on a fleet with room to spare, where a run that ends leaves its runner one
+    /// of many as free. `None`: nothing done, and the two moves are made one after the other (a
+    /// run of another size, a runner in several indexes, orders kept, a top bucket above it).
+    #[inline(always)]
+    fn ask_turn(&mut self, si: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
+        #[cfg(test)]
+        if TWO_MOVES.with(std::cell::Cell::get) {
+            return None;
+        }
+        let Pend { r: pr, from, to: kp } = self.pend;
+        if pr >= MANY || self.orders_kept != 0 {
+            return None;
+        }
+        let last = self.last();
+        let s = self.sigs.get_mut(si as usize)?;
+        if from >= kp || s.ix.top() != Some(kp) {
+            return None;
+        }
+        let pp = self.peers.get(pr as usize)?;
+        if pp.sig0 != si || pp.flags & MORE != 0 {
+            return None;
+        }
+        // The bucket's own next in turn, unless the runner put off comes before it.
+        let w = s.ix.next_in(kp);
+        let r = if s.ix.before(kp, pr, w) { pr } else { w };
+        let p = self.peers.get_mut(r as usize)?;
+        if p.view < cpu || p.flags & MORE != 0 {
+            return None;
+        }
+        let to = key(p.view - cpu, p.scale, last);
+        if r != pr && to != from {
+            return None;
+        }
+        let run = self.runs.insert(Run::new(u64::from(cpu), si, r, STARTING, NIL))?;
+        s.ix.took(kp, r);
+        p.view -= cpu;
+        p.inflight = p.inflight.saturating_add(cpu);
+        let epoch = p.epoch();
+        self.pend.r = NIL;
+        if r != pr {
+            s.ix.swap(pr, r, from, kp);
+            #[cfg(test)]
+            TURNS.with(|c| c.set((c.get().0 + 1, c.get().1)));
+        } else {
+            #[cfg(test)]
+            TURNS.with(|c| c.set((c.get().0, c.get().1 + 1)));
+            if to != from {
+                self.resettle(pr, from, to);
+            }
+        }
+        Some((r, run, epoch))
     }
 
     /// A plain ask on measured runners (narrow: its parallelism is its CPU need) on the fast

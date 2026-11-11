@@ -1008,3 +1008,114 @@ fn w05_r23_reused_start_publishes_only_its_new_runner_handle() -> Result<(), Str
     }
     Ok(())
 }
+
+/// A run of `cpu` asked on the fast entries and started where it's sent: its runner, its handle
+/// there and its own (`None`: the fast entry had no pick).
+fn fast_start(o: &mut Owner, rs: &mut [Runner], s: SigId, cpu: u32) -> Result<Option<(u32, Handle, Handle)>, String> {
+    let Some((r, run, epoch)) = o.ask_fast(s, cpu) else { return Ok(None) };
+    let (at, b) = rs.get_mut(r as usize).ok_or("runner")?.start_fast(OwnerId(0), run, epoch, cpu).ok_or("the runner declined a start its owner's view had room for")?;
+    if !o.started_fast(r, run, at, b) {
+        return Err("a Started word left the fast path".into());
+    }
+    Ok(Some((r, at, run)))
+}
+
+/// A run ended on the fast entries.
+fn fast_end(o: &mut Owner, rs: &mut [Runner], (r, at, run): (u32, Handle, Handle)) -> Result<(), String> {
+    let (_, b) = rs.get_mut(r as usize).ok_or("runner")?.end_fast(at).ok_or("the runner declined an end")?;
+    if !o.ended_fast(r, run, b) {
+        return Err("an Ended word left the fast path".into());
+    }
+    Ok(())
+}
+
+/// W05-R04, W05-R23, W05-R26: a pick whose freed runner only ties the most free (it swaps with
+/// the next in turn, or goes back to that runner when it is the next) chooses what its two moves
+/// made one after the other choose, and leaves the same picks to come and the same views. Twin
+/// owners over twin fleets, one each way, through the same ends and picks of one and two cores,
+/// on fleets within one membership word and across words.
+#[test]
+fn w05_r26_a_tied_pick_chooses_and_leaves_what_its_two_moves_do() -> Result<(), String> {
+    use super::owner::{turns, with_two_moves};
+    let (swaps0, backs0) = turns();
+    let mut rng = Rng(11);
+    for case in 0..64u32 {
+        let n = [2u32, 3, 5, 63, 64, 65, 130, 257].get((case % 8) as usize).copied().unwrap_or(2);
+        let each = (case / 8) % 4;
+        let (mut a, mut ra, sa, mut ha) = rig(n, each).map_err(str::to_owned)?;
+        let (mut b, mut rb, sb, mut hb) = rig(n, each).map_err(str::to_owned)?;
+        for step in 0..500u32 {
+            // Mostly an end and then a pick; now and then two ends, or a pick with none before it.
+            let ends = match rng.below(8) {
+                0 => 0,
+                1 => 2,
+                _ => 1,
+            };
+            for _ in 0..ends {
+                if ha.is_empty() {
+                    break;
+                }
+                let i = rng.below(ha.len() as u64) as usize;
+                let (x, y) = (ha.swap_remove(i), hb.swap_remove(i));
+                if x != y {
+                    return Err(format!("case {case} step {step}: the twins hold {x:?} and {y:?}"));
+                }
+                fast_end(&mut a, &mut ra, x)?;
+                fast_end(&mut b, &mut rb, y)?;
+            }
+            let cpu = if rng.below(6) == 0 { 2 * CPU as u32 } else { CPU as u32 };
+            let pa = fast_start(&mut a, &mut ra, sa, cpu)?;
+            let pb = with_two_moves(|| fast_start(&mut b, &mut rb, sb, cpu))?;
+            if pa != pb {
+                return Err(format!("case {case} step {step} ({n} runners): picked {pa:?}, its two moves pick {pb:?}"));
+            }
+            ha.extend(pa);
+            hb.extend(pb);
+            if a.order(sa) != b.order(sb) {
+                return Err(format!("case {case} step {step} ({n} runners): the picks to come differ:\n{:?}\n{:?}", a.order(sa), b.order(sb)));
+            }
+            if (0..n).any(|r| a.view(RunnerId(r)) != b.view(RunnerId(r))) {
+                return Err(format!("case {case} step {step}: views differ"));
+            }
+        }
+        // Every run ended: each view is its runner's whole room again, in both.
+        for (x, y) in ha.drain(..).zip(hb.drain(..)) {
+            fast_end(&mut a, &mut ra, x)?;
+            fast_end(&mut b, &mut rb, y)?;
+        }
+        a.settle();
+        b.settle();
+        if a.order(sa) != b.order(sb) || ra.iter().any(|r| a.view(r.id()).map(|v| v[0]) != Some(r.word().cpu)) {
+            return Err(format!("case {case}: the twins part once every run has ended"));
+        }
+    }
+    let (swaps, backs) = turns();
+    if swaps <= swaps0 || backs <= backs0 {
+        return Err(format!("the trace made {} swaps and {} picks back to the runner put off: both are to be covered", swaps - swaps0, backs - backs0));
+    }
+    Ok(())
+}
+
+/// W05-R04: on an idle fleet with one run in flight, each pick takes the next runner in turn,
+/// and does it by swapping it with the runner the last run just left.
+#[test]
+fn w05_r04_an_idle_fleets_picks_take_turns_by_swapping() -> Result<(), String> {
+    use super::owner::turns;
+    for n in [2u32, 5, 64, 65, 200] {
+        let (mut o, mut rs, s, _) = rig(n, 0).map_err(str::to_owned)?;
+        let mut held = fast_start(&mut o, &mut rs, s, CPU as u32)?.ok_or("the first pick")?;
+        let (swaps0, _) = turns();
+        for step in 0..3 * n {
+            fast_end(&mut o, &mut rs, held)?;
+            let next = fast_start(&mut o, &mut rs, s, CPU as u32)?.ok_or("a pick")?;
+            if next.0 != (held.0 + 1) % n {
+                return Err(format!("{n} runners, step {step}: after runner {} the pick went to {}", held.0, next.0));
+            }
+            held = next;
+        }
+        if turns().0 - swaps0 != u64::from(3 * n) {
+            return Err(format!("{n} runners: {} of {} picks swapped", turns().0 - swaps0, 3 * n));
+        }
+    }
+    Ok(())
+}

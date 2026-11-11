@@ -49,6 +49,15 @@ owner is told it).
   every other dimension exactly; when that member is short of what's asked, a walk member by
   member down to the bucket whose range holds the need, so an exact fit there is found (counted:
   `Counts::walked`).
+- **A run that ends, and the pick after it.** The rise of the runner a run just ended on is put
+  off until something reads the buckets. When it is then alone as the most free, the pick goes
+  back to it and neither move is made. When it only ties the most free (the top bucket holds
+  others: the usual pick on a fleet with room to spare), the pick is that bucket's next in turn
+  with it counted in. That is the runner itself, and again nothing moves; or another, which the
+  run leaves where the first was, and the two change places in one write (`Index::swap`), each
+  bucket's count and the bitmap of non-empty buckets untouched. Anything else (a run of another
+  size, a runner in several indexes, orders kept) makes the two moves one after the other. A
+  twin test holds the tied pick to those two moves, pick by pick (W05-R04, W05-R26).
 - **The rank key** is `(view * scale) >> 40`. At the reference speed `scale` is ceil(2^40 / 1000),
   and the key is whole free CPUs, exactly, for every view below 2^32: a multiply and a shift, no
   divide. A runner's measured speed and slowness are folded into its `scale` when its word says
