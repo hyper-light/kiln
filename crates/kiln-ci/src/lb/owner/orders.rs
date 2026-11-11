@@ -21,6 +21,34 @@ pub(super) fn orders() -> Vec<Order> {
     (0..ORDERS).map(|_| Order::new()).collect()
 }
 
+#[cfg(test)]
+mod cold_tests {
+    use super::*;
+
+    /// W05-R26: CPU-only measured ranking should not construct byte-rate indexes. An index
+    /// becomes populated when a request actually needs it, without a TTL or size heuristic.
+    #[test]
+    fn w05_r26_cpu_measure_does_not_build_unused_byte_orders() -> Result<(), String> {
+        let (mut owner, mut runners, sig) = crate::lb::tests::fleet(4, [8 * CPU, 0, 0, 0]);
+        let runner = runners.first_mut().ok_or("runner")?;
+        runner.measure(768, 1024);
+        owner.hear(ToOwner::Hint { runner: RunnerId(0), word: runner.word() }, &mut Out::default());
+        let orders = &owner.sigs.get(sig.0 as usize).ok_or("signature")?.orders;
+        if orders.get(NARROW).and_then(Order::top).is_none() { return Err("CPU order missing".into()); }
+        for index in [DISK, LINK, NET] {
+            if orders.get(index).and_then(Order::top).is_some() { return Err(format!("unused byte order built: {index}")); }
+        }
+        let terms = Terms { io_bytes: 1, cpu_ns: 1, ..Terms::default() };
+        owner.ask_with(sig, [CPU, 0, 0, 0], &terms, &mut Out::default()).map_err(|e| format!("I/O ask: {e:?}"))?;
+        let orders = &owner.sigs.get(sig.0 as usize).ok_or("signature")?.orders;
+        if orders.get(DISK).and_then(Order::top).is_none() { return Err("requested disk order missing".into()); }
+        for index in [LINK, NET] {
+            if orders.get(index).and_then(Order::top).is_some() { return Err(format!("unrequested byte order built: {index}")); }
+        }
+        Ok(())
+    }
+}
+
 /// What the owner knows of its link to a runner: the shell's measure of its own transfers there
 /// and of the link's drops (lb/wire). Owner-side, soft: set it when it is measured again.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
