@@ -2157,8 +2157,7 @@ fn report(seed: u64, cfg: &Config, steps: &[(Step, i64)], why: &str) -> String {
     )
 }
 
-/// E1.5: the engine places legs as the reference does, after every input of 10,000 small random
-/// cases, and keeps its invariants.
+/// W05-R03: slots may replace CPU/memory accounting, but never physical GPU accounting.
 #[test]
 fn w05_r03_slot_mode_still_reserves_declared_gpus() {
     let cfg = Config { resources: false, ..Config::default() };
@@ -2192,6 +2191,41 @@ fn w05_r03_slot_mode_still_reserves_declared_gpus() {
     apply(Step::Undrain(runner), 3, &["a"]);
     apply(Step::Queued(Box::new(leg("b"))), 4, &["a"]);
     apply(Step::Ended { leg: "a".into(), attempt: 1, outcome: Outcome::Success }, 5, &["b"]);
+}
+
+/// W05-R03/W05-R40: planning a gang must count every sibling's GPU before any grant.
+#[test]
+fn w05_r40_a_gpu_gang_needs_every_siblings_gpu() {
+    for resources in [false, true] {
+        for gpus in [None, Some(0), Some(1), Some(2)] {
+            let cfg = Config { resources, ..Config::default() };
+            let mut engine = Scheduler::with_epoch(cfg.clone(), 0);
+            let mut reference = Reference::new(cfg, 0);
+            let runner = RunnerIn {
+                id: "r".into(), slots: 2,
+                view: RunnerView { name: "r".into(), labels: vec!["x".into()], ..RunnerView::default() },
+                capacity: gpus.map(|gpu| Resources { cpu: Cpus::whole(4), mem: 8 * GIB, gpu, ..Resources::default() }),
+                ..RunnerIn::default()
+            };
+            let up = Step::Up(runner);
+            engine.handle(up.input(), 0);
+            reference.handle(&up, 0);
+            for (id, at) in [("a", 1), ("b", 2)] {
+                let step = Step::Queued(Box::new(LegIn {
+                    id: id.into(), run: "gang-run".into(), repo: "acme/gpu".into(),
+                    route: LegRoute { labels: vec!["x".into()], ..LegRoute::default() },
+                    request: Resources { cpu: Cpus::whole(1), mem: GIB, gpu: 1, ..Resources::default() },
+                    gang: Some(Gang { id: "gpu-gang".into(), size: 2 }),
+                    ..LegIn::default()
+                }));
+                engine.handle(step.input(), at);
+                reference.handle(&step, at);
+                let expected: BTreeSet<String> = if at == 2 && gpus == Some(2) { ["a", "b"].into_iter().map(str::to_owned).collect() } else { BTreeSet::new() };
+                assert_eq!(engine.grants().keys().cloned().collect::<BTreeSet<_>>(), expected, "engine resources={resources}, GPUs={gpus:?}, at={at}");
+                assert_eq!(reference.placement().0.keys().cloned().collect::<BTreeSet<_>>(), expected, "reference resources={resources}, GPUs={gpus:?}, at={at}");
+            }
+        }
+    }
 }
 
 /// E1.5: compare all generated histories, retaining the original case count and invariants.
