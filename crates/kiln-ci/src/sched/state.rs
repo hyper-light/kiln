@@ -2841,7 +2841,7 @@ impl Scheduler {
         let scores = self.scores(l, &rooms, None);
         let gpu_scores: Vec<u64> = if l.input.request.gpu > 0 {
             let need = Self::gpu_needs(l);
-            rooms.iter().map(|r| Self::gpu_rank(r, &need).unwrap_or(0)).collect()
+            rooms.iter().map(|r| Self::gpu_rank(r, &need, r.used.gpu).unwrap_or(0)).collect()
         } else { Vec::new() };
 
         let mut order: Vec<(usize, &Runner)> = rooms.into_iter().enumerate().collect();
@@ -2916,15 +2916,20 @@ impl Scheduler {
         super::needs::Needs { request: l.input.request, requires: l.req.constraints.iter().map(|(src, _)| src.clone()).collect(), ..Default::default() }
     }
 
-    fn gpu_rank(r: &Runner, need: &super::needs::Needs) -> Option<u64> {
+    fn gpu_rank(r: &Runner, need: &super::needs::Needs, used: u32) -> Option<u64> {
         let total = size(r).map_or_else(|| u64::try_from(r.input.view.facts.gpus.len()).unwrap_or(u64::MAX), |s| u64::from(s.gpu));
-        super::gpu::rank(need, &r.input.view.facts, &r.input.view.all_labels(), total.saturating_sub(u64::from(r.used.gpu)))
+        super::gpu::rank(need, &r.input.view.facts, &r.input.view.all_labels(), total.saturating_sub(u64::from(used)))
+    }
+
+    /// W05-R03/W05-R40: physical GPUs stay finite in every CPU mode, including a projected gang
+    /// or reservation. `used` includes the siblings that have been planned but not granted yet.
+    fn gpu_room(r: &Runner, l: &Leg, used: u32) -> bool {
+        l.input.request.gpu == 0 || Self::gpu_rank(r, &Self::gpu_needs(l), used).is_some()
     }
 
     /// Whether a runner takes a leg now: it could ([`Self::room`]); and for a leg that waits for a
     /// busy warm runner, it's that one or one where the leg would take no longer (W24-R18).
     fn fits(&self, r: &Runner, l: &Leg) -> bool {
-        if l.input.request.gpu > 0 && Self::gpu_rank(r, &Self::gpu_needs(l)).is_none() { return false; }
         !l.paused && self.room(r, l) && self.under_target(r, l) && l.hold.as_ref().is_none_or(|h| h.runner == r.input.id || self.estimate(l, &r.input.id, &Self::wants(l)).busy_ms() <= h.there_ms)
     }
 
@@ -2995,6 +3000,7 @@ impl Scheduler {
         // A pool's leg runs in one of its idle executors on that host: one made for it when it
         // needs that (W13-R07).
         if let Some(pool) = &l.req.pool {
+            if !Self::gpu_room(r, l, r.used.gpu) { return false; }
             let own = self.own_leg(l);
             return self.executors.values().any(|e| e.pool == *pool && e.runner == r.input.id && e.state == ExecState::Idle && e.leg.as_deref() == own);
         }
@@ -3006,7 +3012,7 @@ impl Scheduler {
     /// for nothing, else a share of what no other share holds and the ordinary legs there don't
     /// take; for an ordinary leg, a slot or the resources beside what's held.
     fn room_in(&self, r: &Runner, h: &Holding, l: &Leg) -> bool {
-        if h.whole {
+        if h.whole || !Self::gpu_room(r, l, h.used.gpu) {
             return false;
         }
         let c = self.config();
@@ -3064,7 +3070,9 @@ impl Scheduler {
         for l in plus {
             add(&mut h.used, &l.input.request);
             h.running += 1;
-            count(&mut h, l);
+            if l.req.pool.is_none() {
+                count(&mut h, l);
+            }
         }
         h
     }
@@ -4744,16 +4752,15 @@ impl Scheduler {
         for rid in &s.eligible {
             let Some(r) = self.runners.get(rid).filter(|r| self.admits(r, l)) else { continue };
             let mates: Vec<&Leg> = plan.iter().filter(|(_, on)| on == rid).filter_map(|(x, _)| self.legs.get(x)).collect();
+            let holding = self.holding_with(r, |_| true, &mates);
             let room = match &l.req.pool {
                 Some(pool) => {
+                    if !Self::gpu_room(r, l, holding.used.gpu) { continue; }
                     let own = self.own_leg(l);
                     let idle = self.executors.values().filter(|e| e.pool == *pool && e.runner == *rid && e.state == ExecState::Idle && e.leg.as_deref() == own).count();
                     idle > mates.iter().filter(|x| x.req.pool.as_ref() == Some(pool)).count()
                 }
-                None => {
-                    let beside: Vec<&Leg> = mates.iter().copied().filter(|x| x.req.pool.is_none()).collect();
-                    self.room_in(r, &self.holding_with(r, |_| true, &beside), l)
-                }
+                None => self.room_in(r, &holding, l),
             };
             if room && (!held || self.allowed_beside(r, l, &mates)) {
                 places.push((r.running.len() + mates.len(), rid));

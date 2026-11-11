@@ -4078,3 +4078,31 @@ fn w05_r23_ci_gpu_load_and_same_card_predicates() -> Result<(), String> {
     assert_eq!(assigned(&out), None, "two cards with incompatible predicates aren't a fit: {out:?}");
     Ok(())
 }
+
+/// W05-R03/W05-R40: pool executors and ordinary siblings consume the same physical GPU count.
+#[test]
+fn w05_r40_gpu_gangs_count_pooled_siblings() -> Result<(), String> {
+    for resources in [false, true] {
+        for pooled in [1, 2] {
+            for gpus in [0, 1, 2] {
+                let mut s = Scheduler::new(Config { resources, pools: vec![pool(2, 2, 2, "10m")?], ..Config::default() });
+                let mut host = docker_host("host");
+                host.capacity = Some(Resources { cpu: Cpus::whole(4), mem: 8 << 30, gpu: gpus, ..Resources::default() });
+                let commands = s.handle(Input::RunnerUp(Box::new(host)), 0);
+                let executors: Vec<_> = commands.iter().filter_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }).collect();
+                assert_eq!(executors.len(), 2, "{commands:?}");
+                for executor in executors { s.handle(Input::ExecutorReady { executor }, 1); }
+                for (id, at) in [("a", 2), ("b", 3)] {
+                    let mut l = pool_leg(id);
+                    if id == "b" && pooled == 1 { l.route.labels = vec!["linux".into()]; }
+                    l.request = Resources { cpu: Cpus::whole(1), mem: 1 << 30, gpu: 1, ..Resources::default() };
+                    l.gang = Some(Gang { id: "gpu-gang".into(), size: 2 });
+                    let commands = s.handle(Input::LegQueued(Box::new(l)), at);
+                    let expected = if at == 3 && gpus == 2 { 2 } else { 0 };
+                    assert_eq!(s.grants().len(), expected, "resources={resources}, pooled={pooled}, GPUs={gpus}, at={at}: {commands:?}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
