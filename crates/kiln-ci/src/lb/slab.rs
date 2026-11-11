@@ -72,6 +72,15 @@ impl<T: Copy> Slab<T> {
             s.val = val;
             return Some(Handle { slot, generation: s.generation });
         }
+        self.insert_new(val)
+    }
+
+    /// W05-R23: keep first-use growth out of the inlined free-slot reuse path. The same
+    /// generational slot is created here; allocation and the capacity check are paid only
+    /// when no freed slot is available.
+    #[cold]
+    #[inline(never)]
+    fn insert_new(&mut self, val: T) -> Option<Handle> {
         let slot = u32::try_from(self.slots.len()).ok().filter(|s| *s != NIL)?;
         self.slots.push(Slot { generation: 1, next: NIL, val });
         Some(Handle { slot, generation: 1 })
