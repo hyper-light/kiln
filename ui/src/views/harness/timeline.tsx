@@ -1117,7 +1117,7 @@ const Sending = React.memo(function Sending({
             <span className="hx-dim">
               ·{" "}
               <span className="hx-delivery" data-delivery={m.state}>
-                {failed ? "failed to send" : m.state === "sent" ? "sent" : m.state === "retained" ? "retained by Kiln" : m.state === "waiting" ? "waiting for capacity" : "sending…"}
+                {failed ? "failed to send" : m.state === "sent" ? "sent" : m.state === "retained" ? "queued" : m.state === "waiting" ? "waiting" : "sending…"}
               </span>
             </span>
             {m.attachments.length > 0 && (

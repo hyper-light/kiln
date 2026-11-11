@@ -1342,7 +1342,7 @@ impl Core {
     pub fn refuse_owner_mail(&mut self, token: Option<super::mail::Token>, epoch: u64) {
         use super::admission::{Capacity, Fault, FlowEvent, Learning, WaitCause};
         let capacity = self.input.as_ref().map(|input| input.controller.lock().capacity()).or_else(|| self.state.admission.clone()).unwrap_or(Capacity {
-            epoch: self.state.epoch, generation: 0, retry_generation: None, learning: Learning::Bootstrap, target: 0, admitted: 0, bytes: 0, peers: 0, eligible_peer: None, feedback_generation: None,
+            epoch: self.state.epoch, generation: 0, retry_generation: None, learning: Learning::Bootstrap, target: 0, admitted: 0, bytes: 0, peers: 0, eligible_peer: None, feedback_generation: None, depth: None,
         });
         let event = match token {
             Some(token) => FlowEvent::Waiting { token, epoch, cause: WaitCause::SourceUnavailable, capacity },
@@ -1950,7 +1950,7 @@ mod tests {
             Update::Stream { id: "e1".into(), text: " and more".into() },
             Update::Reply { client: "c1".into(), value: serde_json::json!({"items": [1, "a", null], "more": true}) },
             Update::Inbox { said: Box::new(Said { message: "m1".into(), answer: Err(Refusal::Moved { session: "s1".into(), epoch: 2 }) }) },
-            Update::MailFlow { event: Box::new(super::super::admission::FlowEvent::Capacity { capacity: super::super::admission::Capacity { epoch: 0, generation: 1, retry_generation: Some(0), learning: super::super::admission::Learning::Bootstrap, target: 2, admitted: 0, bytes: 0, peers: 1, eligible_peer: None, feedback_generation: None } }) },
+            Update::MailFlow { event: Box::new(super::super::admission::FlowEvent::Capacity { capacity: super::super::admission::Capacity { epoch: 0, generation: 1, retry_generation: Some(0), learning: super::super::admission::Learning::Bootstrap, target: 2, admitted: 0, bytes: 0, peers: 1, eligible_peer: None, feedback_generation: None, depth: None } }) },
             Update::Reset { from: Some(3) },
             Update::Reset { from: None },
             Update::ChangesPatch { set: vec![file], gone: vec![FileKey { path: "src/b.rs".into(), tree: None }] },

@@ -55,6 +55,17 @@ pub fn capacity(hub: &Hub, id: &str) -> Option<Capacity> {
     }
 }
 
+/// The session's current owner is a runner that predates mail-flow: it never pushes capacity, so
+/// [`capacity`] never admits mail to it until that runner is upgraded. A person's message, and
+/// kiln's own, go to its inbox as before W20 (`Registry::send_asked`, `Registry::dispatch`); an
+/// agent's stays in custody, bounded. An owner not known (its runner away) is not one.
+pub fn legacy_owner(hub: &Hub, id: &str) -> bool {
+    let Some(Location::Machine(machine)) = hub.harness.location(id) else { return false };
+    let instances = hub.instances.load();
+    let Some(owner) = instances.owner(&crate::instances::Owned::Agent(id.to_owned())).and_then(|peer| instances.get(peer)) else { return false };
+    owner.name == machine && !crate::proto::feature::speaks(&owner.features, crate::proto::feature::MAIL_FLOW)
+}
+
 async fn peers(hub: &Hub, id: &str) -> Result<Vec<String>, Error> {
     let page = mail::peer_heads(&hub.store, id.to_owned(), 0, super::state_view::FRAME).await?;
     if page.next.is_some() { return Err(Error::TooLarge { revision: page.next.unwrap_or(0), budget: super::state_view::FRAME }); }
@@ -73,6 +84,8 @@ fn encode_wire(command: Command, proof: Option<&Value>) -> Result<String, Error>
 
 /// Before custody, check both physical storage and the receiver-wide logical working set,
 /// including server-held work. An exact immutable retry is still answered when authority shrinks.
+/// A person's message is queued whatever its recipient's state, its owner's capacity pending or
+/// the agent paused: only the disk's room holds it ([`mail::person`]).
 pub async fn publish(hub: &Hub, publication: Publish) -> Result<Receipt, Error> {
     if mail::receipt(&hub.store, publication.owner.clone(), publication.sender.clone(), publication.recipient.clone(), publication.id.clone()).await?.is_some() {
         // The ledger checks the complete immutable command, including attachments. Neither a
@@ -84,37 +97,45 @@ pub async fn publish(hub: &Hub, publication: Publish) -> Result<Receipt, Error> 
     // A committed retry keeps its receipt even after closure; a new publication to an unknown
     // recipient has no owner to take custody and must preserve the port's typed absence.
     if hub.harness.location(&publication.recipient).is_none() { return Err(Error::NoSession); }
+    let person = mail::person(&publication.sender);
     let current = match capacity(hub, &publication.recipient) {
         Some(capacity) if super::mail_transfer::dispatch_ready(hub, &publication.recipient, &capacity).await.map_err(|_| unavailable("owner handover state is unavailable"))? => Some(capacity),
         _ => None,
     };
+    // Agents' and kiln's messages are held to the recipient's learned depth, even while it takes
+    // none (paused, its target is none: they wait here till it's back), less what it holds that
+    // the ledger doesn't.
     let authority = match &current {
         Some(current) => {
             let admitted = mail::admitted_count(&hub.store, publication.recipient.clone(), current.epoch).await?;
             let outside = u64::try_from(current.admitted).map_err(|_| unavailable("source admission count does not fit"))?.saturating_sub(admitted);
-            u64::try_from(current.target).map_err(|_| unavailable("source admission target does not fit"))?.saturating_sub(outside)
+            u64::try_from(current.depth.unwrap_or(current.target)).map_err(|_| unavailable("source admission target does not fit"))?.saturating_sub(outside)
         }
         None => 0,
     };
-    let physical = if current.is_some() {
+    let physical = if current.is_some() || person {
         let floor = storage_floor(hub)?;
         let data = hub.cfg.server.data_dir.clone();
         let free = crate::rt::blocking(move || crate::os::disk_available(&data)).await.map_err(|_| unavailable("data-volume free space could not be read"))?.ok_or_else(|| unavailable("data-volume free space is unknown"))?;
         let reserve = hub.store.storage_reserve(super::state_view::FRAME as u64).await.map_err(|_| unavailable("SQLite/WAL storage reserve is unknown"))?;
-        mail::retained_bytes(&hub.store).await?.checked_add(free.saturating_sub(floor).saturating_sub(reserve)).ok_or_else(|| unavailable("communication storage authority overflow"))?
+        // The room on disk for this one original: what's retained already is on disk, so
+        // nothing is counted across conversations.
+        free.saturating_sub(floor).saturating_sub(reserve)
     } else { 0 };
-    if let Some(current) = &current {
+    if current.is_some() || person {
         let mut population = peers(hub, &publication.recipient).await?;
         if !population.contains(&publication.sender) { population.push(publication.sender.clone()); }
         // The longest token is reserved before custody, so a newly accepted body can be sent
-        // under the existing frame cap without clipping or giant JSON reassembly.
-        let envelope = Command::Admit { peer: publication.sender.clone(), token: Token { revision: u64::MAX, generation: u64::MAX }, epoch: current.epoch, generation: current.feedback_generation.unwrap_or(current.generation), peers: population, command: Box::new(command) };
+        // under the existing frame cap without clipping or giant JSON reassembly; with no
+        // capacity yet, the longest epoch and generation too.
+        let (epoch, generation) = current.as_ref().map_or((u64::MAX, u64::MAX), |current| (current.epoch, current.feedback_generation.unwrap_or(current.generation)));
+        let envelope = Command::Admit { peer: publication.sender.clone(), token: Token { revision: u64::MAX, generation: u64::MAX }, epoch, generation, peers: population, command: Box::new(command) };
         let proof = publication.provenance.as_ref().and_then(|p| p.get("relayed"));
         let _ = encode_wire(envelope, proof)?;
     }
     let result = mail::publish(&hub.store, publication, physical, authority).await;
     match result {
-        Err(Error::Capacity { .. } | Error::Backpressure { .. }) if current.is_none() => Err(unavailable("current owner capacity is pending or unsupported; custody was not accepted")),
+        Err(Error::Capacity { .. } | Error::Backpressure { .. }) if current.is_none() && !person => Err(unavailable("current owner capacity is pending or unsupported; custody was not accepted")),
         other => other,
     }
 }
@@ -165,6 +186,7 @@ async fn drain_recipient(hub: &Arc<Hub>, recipient: &str) -> Result<(), Error> {
     let population = peers(hub, recipient).await?;
     let demand = mail::waiting_peers(&hub.store, recipient.to_owned(), 0, super::state_view::FRAME).await?;
     if demand.next.is_some() { return Err(Error::TooLarge { revision: demand.next.unwrap_or(0), budget: super::state_view::FRAME }); }
+    let persons: Vec<String> = demand.items.iter().filter(|head| mail::person(&head.peer)).map(|head| head.peer.clone()).collect();
     let _ = send(hub, recipient, Command::MailPeers { epoch: current.epoch, peers: population.clone(), demand: demand.items }, None).await?;
     {
         let mut after = 0;
@@ -183,20 +205,34 @@ async fn drain_recipient(hub: &Arc<Hub>, recipient: &str) -> Result<(), Error> {
             match page.next { Some(next) if next > after => after = next, _ => break }
         }
     }
+    // A person's messages go first, one each pass, ahead of every agent's turn, while the agent
+    // takes messages at all: paused, its target is none, and they wait here till it's back.
+    if current.target > 0 {
+        for person in &persons {
+            if deliver_next(hub, recipient, person, &current, &connection, &population).await? { return Ok(()); }
+        }
+    }
+    // Then an agent's, or kiln's, in its turn: the source names whose turn it is while it has
+    // room under its depth for theirs.
     let Some(peer) = current.eligible_peer.clone() else { return Ok(()) };
-    if current.admitted >= current.target { return Ok(()) }
+    deliver_next(hub, recipient, &peer, &current, &connection, &population).await.map(|_| ())
+}
+
+/// The first of `peer`'s waiting messages to `recipient` the source's capacity may take, claimed
+/// and sent: whether one went.
+async fn deliver_next(hub: &Arc<Hub>, recipient: &str, peer: &str, current: &Capacity, connection: &str, population: &[String]) -> Result<bool, Error> {
     let mut after = 0;
     loop {
-        let page = mail::pending_for(&hub.store, recipient.to_owned(), peer.clone(), after, super::state_view::FRAME).await?;
+        let page = mail::pending_for(&hub.store, recipient.to_owned(), peer.to_owned(), after, super::state_view::FRAME).await?;
         for receipt in page.items {
             // The persisted observed epoch/capacity/connection gate refuses bookkeeping wakes.
             // Only a proven preaccept Waiting attempt can gain a new delivery generation.
-            if let Some(delivery) = mail::claim_at(&hub.store, receipt.revision, current.epoch, current.retry_permission(), connection.clone(), super::state_view::FRAME).await? {
-                deliver(hub, delivery, &current, &population).await?;
-                return Ok(());
+            if let Some(delivery) = mail::claim_at(&hub.store, receipt.revision, current.epoch, current.retry_permission(), connection.to_owned(), super::state_view::FRAME).await? {
+                deliver(hub, delivery, current, population).await?;
+                return Ok(true);
             }
         }
-        match page.next { Some(next) if next > after => after = next, _ => return Ok(()) }
+        match page.next { Some(next) if next > after => after = next, _ => return Ok(false) }
     }
 }
 

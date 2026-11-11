@@ -645,7 +645,8 @@ const HOST_GONE: &str = "this runner's host of its sessions is gone, so it stays
 const CUT_BY_RESTART: &str = "kiln restarted on this machine part-way through your last turn, which stopped it. Pick up where you left off.";
 
 pub struct Host {
-    input_budget: Arc<super::admission::PhysicalBudget>,
+    /// Its sessions' byte authorities, one each (W20): none takes another's room.
+    input_budgets: super::admission::SessionBudgets,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     sink: Sink,
     /// What its sessions are held to, who's at work and who waits for room ([`Room`]): its most
@@ -767,7 +768,7 @@ impl Host {
         let session = id.to_owned();
         crate::rt::blocking(move || host.persist_legacy_fence(&session, from, to)).await.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?.map_err(|why| inbox::PromotionError::Storage { why })?;
         let input = self.get(id).and_then(|session| session.core.lock().input.clone());
-        self.inbox.as_ref().ok_or_else(|| inbox::PromotionError::Storage { why: "source journal is unavailable".into() })?.prepare_promotion(id, from, to, proof, &self.input_budget, input.as_ref()).await?;
+        self.inbox.as_ref().ok_or_else(|| inbox::PromotionError::Storage { why: "source journal is unavailable".into() })?.prepare_promotion(id, from, to, proof, &self.input_budgets.budget(), input.as_ref()).await?;
         self.wake_legacy_promotion(id).await
     }
 
@@ -776,7 +777,7 @@ impl Host {
         if promotion.to_epoch != to { return Err(inbox::PromotionError::Stale); }
         if promotion.phase == inbox::PromotionPhase::AwaitingPromotion {
             let input = self.get(id).and_then(|session| session.core.lock().input.clone());
-            self.inbox.as_ref().ok_or(inbox::PromotionError::Stale)?.advance_promotion(id, to, inbox::PromotionPhase::AwaitingCertificate, &self.input_budget, input.as_ref()).await?;
+            self.inbox.as_ref().ok_or(inbox::PromotionError::Stale)?.advance_promotion(id, to, inbox::PromotionPhase::AwaitingCertificate, &self.input_budgets.budget(), input.as_ref()).await?;
         }
         self.wake_legacy_promotion(id).await
     }
@@ -820,7 +821,7 @@ impl Host {
         let host = self.me.upgrade().ok_or_else(|| inbox::PromotionError::Storage { why: HOST_GONE.into() })?;
         let id = session.id.clone();
         crate::rt::blocking(move || { host.save_checked().map_err(|error| error.to_string())?; host.clear_legacy_fence(&id, from, to) }).await.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?.map_err(|why| inbox::PromotionError::Storage { why })?;
-        input.inbox.retire_promotion(&session.id, to, &self.input_budget, Some(input)).await?;
+        input.inbox.retire_promotion(&session.id, to, &self.input_budgets.budget(), Some(input)).await?;
         // No await between durable retirement and opening this exact controller's gate.
         crate::runner::custody::legacy_completed(&session.id, to);
         {
@@ -907,13 +908,13 @@ impl Host {
         crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
         self.settled(&session.id).await;
         if promotion.phase == inbox::PromotionPhase::AwaitingCertificate {
-            input.inbox.advance_promotion(&session.id, promotion.to_epoch, inbox::PromotionPhase::Rebinding, &self.input_budget, Some(&input)).await?;
+            input.inbox.advance_promotion(&session.id, promotion.to_epoch, inbox::PromotionPhase::Rebinding, &self.input_budgets.budget(), Some(&input)).await?;
         }
         self.rebind_legacy_owner(session, &input, &promotion).await?;
         let host = self.me.upgrade().ok_or_else(|| inbox::PromotionError::Storage { why: HOST_GONE.into() })?;
         crate::rt::blocking(move || host.save_checked()).await.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?;
         crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
-        input.inbox.advance_promotion(&session.id, promotion.to_epoch, inbox::PromotionPhase::Active, &self.input_budget, Some(&input)).await?;
+        input.inbox.advance_promotion(&session.id, promotion.to_epoch, inbox::PromotionPhase::Active, &self.input_budgets.budget(), Some(&input)).await?;
         crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
         self.finish_legacy_promotion(session, &input, promotion.from_epoch, promotion.to_epoch).await
     }
@@ -950,7 +951,7 @@ impl Host {
         );
         let handovers = file.as_ref().and_then(|f| f.parent()).map(Handovers::of);
         let host = Arc::new_cyclic(|me| Self {
-            input_budget: super::admission::PhysicalBudget::new(0),
+            input_budgets: super::admission::SessionBudgets::default(),
             sessions: Mutex::new(HashMap::new()),
             sink,
             room: Mutex::new(Room { limits, ..Room::default() }),
@@ -1750,7 +1751,7 @@ impl Host {
             return Ok(Arc::clone(s));
         }
         let input = prepared_input.or_else(|| self.inbox.clone().map(|inbox| {
-            let input = super::admission::Input::new(0, Arc::clone(&self.input_budget), inbox);
+            let input = super::admission::Input::new(0, self.input_budgets.budget(), inbox);
             let _ = input.controller.lock().restoring();
             input
         }));
@@ -1841,12 +1842,14 @@ impl Host {
         }
     }
 
-    /// One resource-derived strict pool covers every source input, through all session stages.
-    /// Root's resource events call this; no timer or per-session allowance is introduced.
+    /// Each session's input is held to a resource-derived strict budget of its own, through all
+    /// its stages: `bytes`, the share Root's resource events measure, is each one's bound. One
+    /// session's backlog never takes another's room. No timer is introduced.
     pub fn set_input_budget(&self, bytes: usize) {
-        self.input_budget.resize(bytes);
+        self.input_budgets.resize(bytes);
     }
-    pub(crate) fn reserve_input_buffer(&self, bytes: usize) -> Result<Option<super::admission::BufferCharge>, super::admission::Error> { self.input_budget.reserve_buffer(bytes) }
+    /// A transient copy's own budget, at the share: as any one session's, it takes no other's room.
+    pub(crate) fn reserve_input_buffer(&self, bytes: usize) -> Result<Option<super::admission::BufferCharge>, super::admission::Error> { self.input_budgets.budget().reserve_buffer(bytes) }
 
     fn prepare_admit(&self, id: &str, c: &Command) -> bool {
         let Command::Admit { peer, token, epoch, generation, peers, command } = c else { return true };
@@ -1855,7 +1858,7 @@ impl Host {
         let mut core = s.core.lock();
         let current_epoch = core.state.epoch;
         let Some(inbox) = self.inbox.clone() else {
-            let mut controller = super::admission::Controller::new(current_epoch, Arc::clone(&self.input_budget));
+            let mut controller = super::admission::Controller::new(current_epoch, self.input_budgets.budget());
             let _ = controller.unavailable();
             let capacity = controller.capacity();
             core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Waiting { token: *token, epoch: *epoch, cause: super::admission::WaitCause::SourceUnavailable, capacity }) });
@@ -1863,7 +1866,7 @@ impl Host {
             s.input_changed();
             return false;
         };
-        let input = core.input.get_or_insert_with(|| super::admission::Input::new(current_epoch, Arc::clone(&self.input_budget), inbox)).clone();
+        let input = core.input.get_or_insert_with(|| super::admission::Input::new(current_epoch, self.input_budgets.budget(), inbox)).clone();
         let bytes = match super::admission::command_bytes(command) {
             Ok(bytes) => bytes,
             Err(_) => {
@@ -1912,7 +1915,7 @@ impl Host {
     fn open_lane(&self, lanes: &mut HashMap<String, (crate::memory::queue::Sender<Lane>, crate::memory::queue::Receiver<()>)>, id: &str, epoch: u64, back: bool) {
         if let (Some(s), Some(inbox)) = (self.get(id), self.inbox.clone()) {
             let mut core = s.core.lock();
-            let input = core.input.get_or_insert_with(|| super::admission::Input::new(epoch, Arc::clone(&self.input_budget), inbox));
+            let input = core.input.get_or_insert_with(|| super::admission::Input::new(epoch, self.input_budgets.budget(), inbox));
             let _ = input.controller.lock().restoring();
         }
         // At most `LANE` waiting, whatever each carries, as the channel it was held.
@@ -2207,14 +2210,14 @@ impl Host {
 
     async fn replay_session_mail(&self, s: &Arc<Session>) {
         let Some(inbox) = self.inbox.clone() else {
-            let capacity = { let mut c = super::admission::Controller::new(s.epoch(), Arc::clone(&self.input_budget)); let _ = c.unavailable(); c.capacity() };
+            let capacity = { let mut c = super::admission::Controller::new(s.epoch(), self.input_budgets.budget()); let _ = c.unavailable(); c.capacity() };
             s.mail_flow(super::admission::FlowEvent::Capacity { capacity });
             return;
         };
         let input = {
             let mut core = s.core.lock();
             let epoch = core.state.epoch;
-            core.input.get_or_insert_with(|| super::admission::Input::new(epoch, Arc::clone(&self.input_budget), inbox)).clone()
+            core.input.get_or_insert_with(|| super::admission::Input::new(epoch, self.input_budgets.budget(), inbox)).clone()
         };
         match input.inbox.promotion(&s.id).await {
             Ok(Some(promotion)) if promotion.phase != inbox::PromotionPhase::Active => {
@@ -3730,7 +3733,7 @@ mod tests {
                 host.settled(&session.id).await;
                 crate::rt::timeout(super::super::registry::ANSWER_WAIT, session.close_wait()).await.map_err(|_| anyhow::anyhow!("fixture owner did not stop"))?;
                 let inbox = host.inbox().cloned().ok_or_else(|| anyhow::anyhow!("fixture journal missing"))?;
-                let input = Input::new(0, Arc::clone(&host.input_budget), Arc::clone(&inbox));
+                let input = Input::new(0, host.input_budgets.budget(), Arc::clone(&inbox));
                 let flight = LegacyFlight { id: "0123456789abcdef0123456789abcdef".into(), protocol: FlightProtocol::Claude, request: None };
                 let bytes = size_of::<LegacyFlight>() + flight.id.capacity();
                 {
@@ -3747,8 +3750,8 @@ mod tests {
                 let (_, events) = frozen.handover_source();
                 let proof = crate::runner::custody::LegacyProof::of(&session.id, 0, events, None).map_err(anyhow::Error::msg)?;
                 host.set_input_budget(super::super::state_view::FRAME);
-                inbox.prepare_promotion(&session.id, 0, 1, proof, &host.input_budget, Some(&input)).await?;
-                inbox.advance_promotion(&session.id, 1, inbox::PromotionPhase::AwaitingCertificate, &host.input_budget, Some(&input)).await?;
+                inbox.prepare_promotion(&session.id, 0, 1, proof, &host.input_budgets.budget(), Some(&input)).await?;
+                inbox.advance_promotion(&session.id, 1, inbox::PromotionPhase::AwaitingCertificate, &host.input_budgets.budget(), Some(&input)).await?;
                 // Existing retained bytes fit; the temporary representation required by adoption
                 // does not. No original is removed to make a journal copy fit.
                 host.set_input_budget(bytes);
@@ -3764,7 +3767,7 @@ mod tests {
                 assert!(original.command.is_none() && original.lease.token.is_none() && original.disposition.is_none());
                 assert_eq!((original.lease.message.as_str(), original.lease.epoch, original.lease.bytes, original.lease.stage), (flight.id.as_str(), 0, bytes, Stage::ProviderFlight));
                 assert_eq!(input.controller.lock().capacity().epoch, 0, "durability must precede controller epoch change");
-                inbox.advance_promotion(&session.id, 1, inbox::PromotionPhase::Rebinding, &host.input_budget, Some(&input)).await?;
+                inbox.advance_promotion(&session.id, 1, inbox::PromotionPhase::Rebinding, &host.input_budgets.budget(), Some(&input)).await?;
                 assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, inbox::promotion::RebindStep::Row);
                 assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, inbox::promotion::RebindStep::Complete);
                 assert_eq!(inbox.pending(&session.id, &flight.id).await?.unwrap().lease.epoch, 1);

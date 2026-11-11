@@ -41,6 +41,12 @@ pub struct Capacity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub feedback_generation: Option<u64>,
+    /// The depth agents' and kiln's messages are held to, learned, even while it takes none
+    /// (`target` is none then: paused): the server queues theirs to it meanwhile. A person's
+    /// messages are held to no depth. Absent from a source that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub depth: Option<usize>,
 }
 
 impl Capacity { pub fn retry_permission(&self) -> u64 { self.retry_generation.unwrap_or(self.generation) } }
@@ -320,9 +326,53 @@ impl Input {
     }
 }
 
-/// One host-wide strict byte authority, shared by every session. The coordinator supplies its
-/// bound from resource facts; no default allowance or oversized-item exception exists here.
+/// One session's strict byte authority ([`SessionBudgets`]). The coordinator supplies its bound
+/// from resource facts; no default allowance or oversized-item exception exists here.
 pub struct PhysicalBudget { state: Mutex<Physical>, changed: crate::rt::Changed }
+
+/// A host's sessions' byte authorities, one each, every one the share the memory room gives the
+/// host's input: one session's backlog, or the debt it restored, never takes another's room, as
+/// one pool over every session did. Each live one is resized to the share as it's measured again.
+pub struct SessionBudgets { state: Mutex<Budgets>, changed: crate::rt::Changed }
+
+#[derive(Default)]
+struct Budgets { share: usize, live: Vec<std::sync::Weak<PhysicalBudget>> }
+
+impl Default for SessionBudgets {
+    fn default() -> Self { Self { state: Mutex::new(Budgets::default()), changed: crate::rt::Changed::new() } }
+}
+
+impl SessionBudgets {
+    /// A budget of its own for one session (or for one transient copy of its), at the share now.
+    pub fn budget(&self) -> Arc<PhysicalBudget> {
+        let mut b = self.state.lock();
+        b.live.retain(|live| live.strong_count() > 0);
+        let budget = PhysicalBudget::new(b.share);
+        b.live.push(Arc::downgrade(&budget));
+        budget
+    }
+    /// The share measured again: each live session's budget takes it.
+    pub fn resize(&self, share: usize) {
+        let mut b = self.state.lock();
+        b.share = share;
+        b.live.retain(|live| live.strong_count() > 0);
+        for budget in b.live.iter().filter_map(std::sync::Weak::upgrade) { budget.resize(share); }
+        drop(b);
+        self.changed.notify();
+    }
+    /// What a budget of this host's holds at the least, and its bound: none, as each session holds
+    /// of its own, and the share. What a copy waiting for room watches ([`Self::changed_since`]).
+    pub fn counts(&self) -> (usize, usize) { (0, self.state.lock().share) }
+    /// Once [`Self::counts`] is other than `counts`: subscribed before reading, so a resize racing
+    /// the call can't leave a waiter asleep.
+    pub async fn changed_since(&self, counts: (usize, usize)) {
+        loop {
+            let changed = self.changed.listen();
+            if self.counts() != counts { return; }
+            changed.await;
+        }
+    }
+}
 
 /// Authority for one real temporary representation. Move this guard with its allocation; do
 /// not drop it when an encoded buffer is still in a bridge, transfer or provider queue.
@@ -473,9 +523,9 @@ impl Controller {
     }
 
     pub fn capacity(&self) -> Capacity {
-        let eligible_peer = (self.accepting() && self.leases.len() < self.target).then(|| self.next_peer().cloned()).flatten();
+        let eligible_peer = (self.accepting() && self.bounded_leases() < self.target).then(|| self.next_peer().cloned()).flatten();
         let feedback_generation = eligible_peer.as_ref().and_then(|peer| self.observations.outstanding.get(peer)).map(|feedback| feedback.generation);
-        Capacity { epoch: self.epoch, generation: self.generation, retry_generation: Some(self.retry_generation), learning: self.learning, target: if self.accepting() { self.target } else { 0 }, admitted: self.leases.len(), bytes: self.leases.values().map(|l| l.bytes).fold(0, usize::saturating_add), peers: self.peers.len(), eligible_peer, feedback_generation }
+        Capacity { epoch: self.epoch, generation: self.generation, retry_generation: Some(self.retry_generation), learning: self.learning, target: if self.accepting() { self.target } else { 0 }, admitted: self.leases.len(), bytes: self.leases.values().map(|l| l.bytes).fold(0, usize::saturating_add), peers: self.peers.len(), eligible_peer, feedback_generation, depth: Some(self.target) }
     }
 
     pub fn lease(&self, message: &str) -> Option<&Lease> { self.leases.get(message) }
@@ -535,7 +585,11 @@ impl Controller {
     pub fn promoting_epoch(&self, from: u64, to: u64) -> bool { self.ownership == (Ownership::Promoting { from, to }) }
     pub fn promoting_epochs(&self) -> Option<(u64, u64)> { match self.ownership { Ownership::Promoting { from, to } => Some((from, to)), _ => None } }
     fn accepting(&self) -> bool { self.readiness == Readiness::Ready && self.ownership == Ownership::Here && self.available }
-    fn next_peer(&self) -> Option<&String> { self.peers.iter().find(|peer| self.demand.contains_key(*peer)) }
+    /// The agent or kiln whose turn it is: a person's messages take no turn, going first.
+    fn next_peer(&self) -> Option<&String> { self.peers.iter().find(|peer| !super::mail::person(peer) && self.demand.contains_key(*peer)) }
+    /// The leases the depth holds: agents' and kiln's. A person's messages are a part of the
+    /// inbox of their own, held to none.
+    fn bounded_leases(&self) -> usize { self.leases.values().filter(|lease| !super::mail::person(&lease.peer)).count() }
     pub fn initial_epoch(&mut self, epoch: u64) -> Result<(), Error> {
         if !self.leases.is_empty() { return Err(Error::StaleEpoch); }
         self.epoch = epoch;
@@ -684,12 +738,18 @@ impl Controller {
             Readiness::Unavailable => return Ok(self.waiting(WaitCause::SourceUnavailable)),
             Readiness::Ready => {}
         }
-        if self.leases.len() >= self.target { return Ok(self.waiting(if self.learning == Learning::Bootstrap { WaitCause::Bootstrap } else { WaitCause::LogicalWindow })); }
-        let answered = self.observations.outstanding.get(peer).is_some_and(|feedback| Some(feedback.revision) == revision && Some(feedback.generation) == feedback_generation);
-        if !self.peers.is_empty() && self.next_peer().is_none_or(|first| first != peer) && !answered { return Ok(self.waiting(WaitCause::PeerTurn)); }
+        // A person's message goes in a part of the inbox of its own: no turn and no depth holds it,
+        // only its bytes. Agents' and kiln's take their turns under the learned depth.
+        let person = super::mail::person(peer);
+        if !person {
+            if self.bounded_leases() >= self.target { return Ok(self.waiting(if self.learning == Learning::Bootstrap { WaitCause::Bootstrap } else { WaitCause::LogicalWindow })); }
+            let answered = self.observations.outstanding.get(peer).is_some_and(|feedback| Some(feedback.revision) == revision && Some(feedback.generation) == feedback_generation);
+            if !self.peers.is_empty() && self.next_peer().is_none_or(|first| first != peer) && !answered { return Ok(self.waiting(WaitCause::PeerTurn)); }
+        }
         if !self.physical.reserve_for(bytes, Some(&self.account))? { return Ok(self.waiting(WaitCause::PhysicalBytes)); }
         let lease = Lease { message: message.to_owned(), peer: peer.to_owned(), epoch, bytes, stage: Stage::Reserved, token: None, handoff: None };
         self.leases.insert(message.to_owned(), lease.clone());
+        if person { self.changed()?; return Ok(Admission::Reserved(lease)); }
         if let Some(position) = self.peers.iter().position(|active| active == peer) && let Some(active) = self.peers.remove(position) { self.peers.push_back(active); }
         if let Some(feedback) = self.observations.outstanding.remove(peer)
             && feedback_generation == Some(feedback.generation) && revision == Some(feedback.revision)
@@ -765,7 +825,7 @@ impl Controller {
     }
 
     pub fn advertised_ready(&mut self, now_ns: u64) {
-        if self.leases.len() < self.target && self.accepting()
+        if self.bounded_leases() < self.target && self.accepting()
             && let Some(peer) = self.next_peer().cloned() { self.advertised(&peer, self.generation, now_ns); }
     }
 
@@ -795,6 +855,33 @@ mod tests {
     use super::*;
 
     fn waiting(peers: &[&str], revision: u64) -> Vec<Demand> { peers.iter().map(|peer| Demand { peer: (*peer).into(), revision }).collect() }
+
+    /// A person's message goes in a part of the inbox of its own: no turn and no depth holds it,
+    /// and it takes no agent's room. Paused, the source takes nothing, yet says the depth agents'
+    /// messages are held to, so the server queues theirs meanwhile.
+    #[test]
+    fn a_persons_message_takes_no_turn_or_depth_and_a_paused_source_says_its_depth() -> Result<(), Error> {
+        let mut controller = Controller::new(1, PhysicalBudget::new(1000));
+        controller.peers(&["agent:a".into(), "agent:b".into(), "user:ada".into()])?;
+        controller.demand(&waiting(&["agent:a", "agent:b", "user:ada"], 10))?;
+        let depth = controller.capacity().target;
+        assert_eq!(depth, 2);
+        assert_eq!(controller.capacity().eligible_peer.as_deref(), Some("agent:a"), "a person takes no turn");
+        assert!(matches!(controller.offer_publication("a1", "agent:a", 1, 10, None, 10, 1)?, Admission::Reserved(_)));
+        assert!(matches!(controller.offer_publication("b1", "agent:b", 1, 10, None, 10, 1)?, Admission::Reserved(_)));
+        assert!(matches!(controller.offer_publication("a2", "agent:a", 1, 10, None, 11, 1)?, Admission::Waiting { cause: WaitCause::Bootstrap, .. }), "the agents' depth is full");
+        assert_eq!(controller.capacity().eligible_peer, None);
+        for (revision, id) in [(20, "p1"), (21, "p2"), (22, "p3")] {
+            assert!(matches!(controller.offer_publication(id, "user:ada", 1, 10, None, revision, 1)?, Admission::Reserved(_)), "a person's goes in past the agents' depth");
+        }
+        controller.finish("a1", Disposition::Consumed { boundary: Consumption::ProviderAccepted }, 2, false)?;
+        assert_eq!(controller.capacity().eligible_peer.as_deref(), Some("agent:a"), "the person's three take none of the agents' room");
+        assert_eq!(controller.capacity().admitted, 4);
+        controller.available(false)?;
+        let paused = controller.capacity();
+        assert_eq!((paused.target, paused.depth), (0, Some(depth)), "paused it takes nothing, and says its depth");
+        Ok(())
+    }
 
     #[test]
     fn retry_permission_excludes_own_rollback_metadata_and_buffers_but_observes_foreign_release() -> Result<(), Error> {

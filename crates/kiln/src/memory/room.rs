@@ -104,8 +104,9 @@ impl Shares {
         self.register(&target, false);
     }
 
-    /// A source host adds one aggregate input pool to the physical resource split. Its sessions
-    /// share that pool; creating sessions or peers does not create extra byte authority.
+    /// A source host's input takes one cut of the physical resource split, and each of its
+    /// sessions is held to that share on its own (`harness::admission::SessionBudgets`): one
+    /// session's backlog takes no other's room.
     pub fn follow_input<T: ShareFollower + 'static>(&self, input: &Arc<T>) {
         let target: Arc<dyn ShareFollower> = input.clone();
         self.register(&target, true);

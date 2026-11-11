@@ -23,6 +23,15 @@ pub struct StatusKey {
     pub key: String,
 }
 
+/// Whether `sender` is a person, whose messages go in a queue of their own: the server's owner
+/// (`admin`) or a signed-in user (`user:<name>`), as `harness::ops::key_scope` names a caller.
+/// A person's messages are held to no other sender's bound and go first; agents', kiln's own
+/// (`server`) and any other caller's are held to the recipient's depth.
+pub fn person(sender: &str) -> bool { sender == "admin" || sender.starts_with("user:") }
+
+/// [`person`]'s complement over `agent_mail.sender`: the senders a recipient's depth holds.
+const BOUNDED: &str = "NOT (sender='admin' OR substr(sender,1,5)='user:')";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "MailPublish"))]
@@ -379,11 +388,13 @@ fn receipt_on(c: &Connection, owner: &str, sender: &str, recipient: &str, id: &s
     Ok(receipt)
 }
 
-/// Authority counts all immutable encoded publication bytes, including superseded originals.
-/// The caller supplies physical authority and separately reserves SQLite/WAL overhead; learning
-/// pending depth never enlarges it. A failed transaction does not transfer custody.
-pub async fn publish(store: &Store, publication: Publish, retained_bytes_authority: u64, pending_authority: u64) -> Result<Receipt, Error> {
-    store.call(move |c| Ok(publish_on(c, &publication, retained_bytes_authority, pending_authority))).await.map_err(store_error)?
+/// `bytes_authority` is the room this one encoded original may take on disk: the caller's
+/// physical authority, its SQLite/WAL overhead reserved separately. Nothing is summed over every
+/// conversation's mail, so one conversation's backlog takes no other's room; each recipient's
+/// own pending depth is its bound (`pending_authority`), which learning never enlarges. A failed
+/// transaction does not transfer custody.
+pub async fn publish(store: &Store, publication: Publish, bytes_authority: u64, pending_authority: u64) -> Result<Receipt, Error> {
+    store.call(move |c| Ok(publish_on(c, &publication, bytes_authority, pending_authority))).await.map_err(store_error)?
 }
 
 fn publish_on(c: &mut Connection, publication: &Publish, authority: u64, pending_authority: u64) -> Result<Receipt, Error> {
@@ -409,16 +420,18 @@ fn publish_on(c: &mut Connection, publication: &Publish, authority: u64, pending
     let body = encoded(publication, super::state_view::FRAME, 0)?;
     let bytes = u64::try_from(body.len()).map_err(|_| Error::Capacity { required: u64::MAX, authority })?;
     let body = String::from_utf8(body).map_err(|e| Error::Unavailable { reason: e.to_string() })?;
-    let retained: i64 = tx.query_row("SELECT bytes FROM agent_mail_usage WHERE singleton=1", [], |r| r.get(0)).map_err(sql_error)?;
-    let required = unsigned(retained)?.checked_add(bytes).ok_or(Error::Capacity { required: u64::MAX, authority })?;
-    if required > authority { return Err(Error::Capacity { required, authority }); }
+    if bytes > authority { return Err(Error::Capacity { required: bytes, authority }); }
     if handoff_active(&tx, &publication.recipient)? { return Err(Error::Unavailable { reason: "current owner handover retains all accepted communication; new custody is waiting".into() }); }
-    let unresolved: i64 = tx.query_row("SELECT COUNT(*) FROM agent_mail WHERE recipient=?1 AND disposition IN ('waiting','dispatched','admitted')", [&publication.recipient], |r| r.get(0)).map_err(sql_error)?;
-    let superseded = if let Some(status) = &publication.status {
-        tx.query_row("SELECT COUNT(*) FROM agent_mail WHERE owner=?1 AND sender=?2 AND recipient=?3 AND status_task IS ?4 AND status_key=?5 AND disposition='waiting' AND frozen=0", params![publication.owner, publication.sender, publication.recipient, status.task, status.key], |r| r.get::<_, i64>(0)).map_err(sql_error)?
-    } else { 0 };
-    let pending = unsigned(unresolved)?.checked_sub(unsigned(superseded)?).and_then(|n| n.checked_add(1)).ok_or_else(|| Error::Unavailable { reason: "communication pending accounting overflow".into() })?;
-    if pending > pending_authority { return Err(Error::Backpressure { pending, authority: pending_authority }); }
+    // A person's message goes in the person's own queue: no bound holds it, and it counts
+    // against none. Agents' and kiln's are held to the recipient's depth, counting theirs alone.
+    if !person(&publication.sender) {
+        let unresolved: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM agent_mail WHERE recipient=?1 AND disposition IN ('waiting','dispatched','admitted') AND {BOUNDED}"), [&publication.recipient], |r| r.get(0)).map_err(sql_error)?;
+        let superseded = if let Some(status) = &publication.status {
+            tx.query_row("SELECT COUNT(*) FROM agent_mail WHERE owner=?1 AND sender=?2 AND recipient=?3 AND status_task IS ?4 AND status_key=?5 AND disposition='waiting' AND frozen=0", params![publication.owner, publication.sender, publication.recipient, status.task, status.key], |r| r.get::<_, i64>(0)).map_err(sql_error)?
+        } else { 0 };
+        let pending = unsigned(unresolved)?.checked_sub(unsigned(superseded)?).and_then(|n| n.checked_add(1)).ok_or_else(|| Error::Unavailable { reason: "communication pending accounting overflow".into() })?;
+        if pending > pending_authority { return Err(Error::Backpressure { pending, authority: pending_authority }); }
+    }
     if let Some(status) = &publication.status {
         tx.execute("UPDATE agent_mail SET disposition='superseded' WHERE owner=?1 AND sender=?2 AND recipient=?3 AND status_task IS ?4 AND status_key=?5 AND disposition='waiting' AND frozen=0",
             params![publication.owner, publication.sender, publication.recipient, status.task, status.key]).map_err(sql_error)?;
@@ -428,7 +441,6 @@ fn publish_on(c: &mut Connection, publication: &Publish, authority: u64, pending
     tx.execute("INSERT INTO agent_mail(owner,sender,recipient,id,body,bytes,status_task,status_key,disposition) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'waiting')",
         params![publication.owner, publication.sender, publication.recipient, publication.id, body, number(bytes)?, status_task, status_key]).map_err(sql_error)?;
     let revision = unsigned(tx.last_insert_rowid())?;
-    tx.execute("UPDATE agent_mail_usage SET bytes=?1 WHERE singleton=1", [number(required)?]).map_err(sql_error)?;
     tx.commit().map_err(sql_error)?;
     Ok(Receipt { id: publication.id.clone(), revision, generation: 0, disposition: Disposition::Waiting, repeat: false })
 }
@@ -613,11 +625,6 @@ fn history_on(c: &Connection, owner: &str, sender: &str, recipient: &str, status
     Ok(page)
 }
 
-/// Exact retained body bytes; callers use this before deriving a physical storage authority.
-pub async fn retained_bytes(store: &Store) -> Result<u64, Error> {
-    store.read(|c| Ok(c.query_row("SELECT bytes FROM agent_mail_usage WHERE singleton=1", [], |r| r.get::<_, i64>(0))?)).await.map_err(store_error).and_then(unsigned)
-}
-
 /// Inspect one immutable envelope without requiring a near-frame body to fit beside history's
 /// metadata. Objects expose bounded key pages, arrays their length, strings UTF-8 ranges; callers
 /// address children by JSON pointer. This never emits chunks of an encoded JSON document.
@@ -792,7 +799,7 @@ mod tests {
             let (tx, rx) = async_channel::unbounded();
             let records = Arc::new(kiln_seams::records::SimRecords::new());
             let host = Host::with_records(tx, None, crate::harness::host::Limits::default(), Arc::new(kiln_seams::clock::SimClock::new()), Some(records));
-            // Real aggregate authority admits this original representation, but cannot also
+            // The session's real authority admits this original representation, but cannot also
             // allocate its counted transaction/driver representation. No Capacity is forged.
             host.set_input_budget(body_bytes);
             let _close = Close { host: Arc::clone(&host), id: id.clone() };
@@ -856,7 +863,7 @@ mod tests {
             let self_retry = claim_at_on(&mut ledger, publication.revision, epoch, bookkeeping.retry_permission(), Some("one-actual-connection"), crate::harness::state_view::FRAME)?;
             assert!(self_retry.is_none(), "a source's own failed reservation/release must not authorize the same publication again");
 
-            // Positive control: an actual aggregate bound increase produces the owner's normal
+            // Positive control: an actual increase of its bound produces the owner's normal
             // capacity event and permits one retry. The test dispatches at most two attempts.
             let additional = kiln_seams::records::VALUE_MAX.checked_mul(2).and_then(|bytes| bytes.checked_add(body_bytes)).ok_or_else(|| anyhow::anyhow!("fixture budget overflowed"))?;
             host.set_input_budget(additional);
@@ -999,9 +1006,40 @@ mod tests {
         assert!(matches!(publish_on(&mut c, &message("four", Some("build"), "must not supersede frozen"), u64::MAX, 1), Err(Error::Backpressure { .. })));
         assert_eq!(all(&c)?.items.len(), 2);
         assert_eq!(pending_on(&c, "recipient", 0, 4096)?.items.first().map(|r| r.id.as_str()), Some("two"));
-        let bytes: i64 = c.query_row("SELECT bytes FROM agent_mail_usage", [], |r| r.get(0))?;
-        let sum: i64 = c.query_row("SELECT SUM(bytes) FROM agent_mail", [], |r| r.get(0))?;
-        assert_eq!(bytes, sum);
+        Ok(())
+    }
+
+    /// Each conversation's queue is its own: what one recipient holds takes nothing of another's
+    /// room, and no count is kept over every conversation's mail. The room is one original's
+    /// on disk; each recipient's bound is its own pending depth.
+    #[test]
+    fn one_conversations_backlog_takes_no_other_conversations_room() -> anyhow::Result<()> {
+        let mut c = db()?;
+        let to = |recipient: &str, id: &str| Publish { recipient: recipient.into(), ..message(id, None, "words of one size") };
+        let size = u64::try_from(encoded(&to("a", "a1"), super::super::state_view::FRAME, 0)?.len())?;
+        publish_on(&mut c, &to("a", "a1"), size, 2)?;
+        publish_on(&mut c, &to("a", "a2"), size, 2)?;
+        assert!(matches!(publish_on(&mut c, &to("a", "a3"), size, 2), Err(Error::Backpressure { pending: 3, authority: 2 })), "a's own depth holds its third");
+        publish_on(&mut c, &to("b", "b1"), size, 2)?;
+        publish_on(&mut c, &to("b", "b2"), size, 2)?;
+        assert!(matches!(publish_on(&mut c, &to("b", "b3"), size - 1, 2), Err(Error::Capacity { .. })), "an original the disk has no room for still waits");
+        Ok(())
+    }
+
+    /// A person's messages queue apart: no depth holds them and they count against none, while
+    /// agents', kiln's and any other caller's count against the recipient's depth together.
+    #[test]
+    fn a_persons_messages_queue_apart_from_the_depth_agents_are_held_to() -> anyhow::Result<()> {
+        let mut c = db()?;
+        let from = |sender: &str, id: &str| Publish { sender: sender.into(), ..message(id, None, "words") };
+        publish_on(&mut c, &from("agent:a", "a1"), u64::MAX, 1)?;
+        assert!(matches!(publish_on(&mut c, &from("agent:b", "b1"), u64::MAX, 1), Err(Error::Backpressure { pending: 2, authority: 1 })), "agents' depth holds a second");
+        assert!(matches!(publish_on(&mut c, &from("server", "k1"), u64::MAX, 1), Err(Error::Backpressure { .. })), "kiln's own counts with agents'");
+        assert!(matches!(publish_on(&mut c, &from("ci-token", "t1"), u64::MAX, 1), Err(Error::Backpressure { .. })), "so does any other caller's");
+        for (sender, id) in [("user:ada", "p1"), ("user:ada", "p2"), ("admin", "p3")] {
+            publish_on(&mut c, &from(sender, id), u64::MAX, 0)?;
+        }
+        publish_on(&mut c, &from("agent:b", "b2"), u64::MAX, 2)?;
         Ok(())
     }
 

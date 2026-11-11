@@ -4204,6 +4204,13 @@ impl Registry {
     /// Transfer bounded verified pieces before dispatch; retry identity is derived from immutable
     /// recipient/message/index/content. Missing or corrupt files never become a name-only send.
     pub(super) async fn route_attachments(&self, hub: &Hub, id: &str, loc: &Location, c: Command) -> Result<Command, Sent> {
+        self.route_attachments_on(hub, id, loc, c, crate::proto::LANE_CONTROL).await
+    }
+
+    /// [`Registry::route_attachments`], its pieces sent on `lane`: the lane of the command they go
+    /// with, which can't overtake them there (an Admit's, the control lane; a message for a
+    /// runner's inbox, `LANE_TERM`, which drops a file that hasn't come yet).
+    async fn route_attachments_on(&self, hub: &Hub, id: &str, loc: &Location, c: Command, lane: u32) -> Result<Command, Sent> {
         use base64::Engine as _;
         use sha2::Digest as _;
         super::state_view::encode(&c, super::state_view::FRAME).map_err(|_| Sent::PublicationRefused(super::mail::Error::TooLarge { revision: 0, budget: super::state_view::FRAME }))?;
@@ -4251,9 +4258,9 @@ impl Registry {
                     }
                     Location::Machine(machine) => {
                         let msg = ServerMsg::HarnessFile { session: id.to_owned(), file: fid.clone(), offset, data, done };
-                        // File pieces and their following Admit share the non-shedding lane;
-                        // QUIC lane ordering prevents a command from overtaking its originals.
-                        if !hub.send_to_agent(machine, crate::proto::LANE_CONTROL, &msg).await { return Err(Sent::Unreachable); }
+                        // File pieces and the command after them share a lane; QUIC lane
+                        // ordering prevents the command from overtaking its originals.
+                        if !hub.send_to_agent(machine, lane, &msg).await { return Err(Sent::Unreachable); }
                     }
                 }
                 offset = end;
@@ -4427,7 +4434,10 @@ impl Registry {
     /// hear them: one parked at once, then its runner's once it's back.
     pub async fn send_asked(&self, hub: &Arc<Hub>, id: &str, scope: &str, cmd: &str, c: Command) {
         use std::time::Instant;
-        if super::session::is_message(&c) {
+        // A message goes into custody (W20), a person's in a queue of its own, unless it's a
+        // person's and its session's runner predates mail-flow: then it goes to that runner's
+        // inbox, as before, through `dispatch` below ([`super::mail_delivery::legacy_owner`]).
+        if super::session::is_message(&c) && (!super::mail::person(scope) || !super::mail_delivery::legacy_owner(hub, id)) {
             let sent = match self.publish_command(hub, id, c, None, scope.to_owned(), scope.to_owned(), None).await {
                 Ok(receipt) => Sent::Published(receipt),
                 Err(error) => Sent::PublicationRefused(error),
@@ -4546,7 +4556,10 @@ impl Registry {
         if matches!(&c, Command::Admit { .. } | Command::MailAck { .. } | Command::MailPeers { .. } | Command::MailHandoff { .. }) {
             return Pending::Now(Sent::PublicationRefused(super::mail::Error::Invalid { reason: "mail grants and receipts belong to the authenticated server relay".into() }));
         }
-        if super::session::is_message(&c) {
+        // A person's message, or kiln's own, to a runner that predates mail-flow goes to its
+        // inbox below, as before W20: that runner never pushes the capacity custody waits for.
+        // An agent's relayed words stay in custody, bounded, until it's upgraded.
+        if super::session::is_message(&c) && (relayed.is_some() || !super::mail_delivery::legacy_owner(hub, id)) {
             let provenance = relayed.map(|proof| json!({"relayed": proof}));
             return Pending::Now(match self.publish_command(hub, id, c, provenance, "server".into(), "server".into(), None).await {
                 Ok(receipt) => Sent::Published(receipt),
@@ -4569,7 +4582,7 @@ impl Registry {
         {
             self.rename(hub, id, value.as_ref()).await;
         }
-        let c = match self.route_attachments(hub, id, &loc, c).await {
+        let c = match self.route_attachments_on(hub, id, &loc, c, LANE_TERM).await {
             Ok(c) => c,
             Err(e) => return Pending::Now(e),
         };
@@ -8171,5 +8184,62 @@ mod tests {
         assert!(lean.2 < before.2 / 10, "a window costs a tenth of today's at most: {lean:?} against {before:?}");
         assert!(lean.2 <= super::super::window::BYTES + 64 * 1024, "about a window's bytes: {lean:?}");
         Ok(())
+    }
+
+    /// A person's message to an agent whose runner predates mail-flow goes to that runner's inbox,
+    /// as it did before W20, and is answered there: the runner never pushes the capacity custody
+    /// waits for, so custody refused it ("waiting for capacity") for as long as the runner was old.
+    /// An agent's message to it stays in custody's hands (W20's bound). Once the runner speaks
+    /// mail-flow, a person's is queued in custody, in a queue of its own, before the agent's
+    /// capacity has come; an agent's and kiln's own wait for that capacity.
+    #[test]
+    fn w20_a_persons_message_reaches_a_runner_from_before_mail_flow_through_its_inbox() -> anyhow::Result<()> {
+        use super::super::asked::Taken;
+        use super::super::model::SendMode;
+        use crate::proto::{AgentMsg, CAP_INBOX, CAP_UNREAD, CAP_WIRE};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::hub_with_runner(crate::rt::clock(), "old-mac", CAP_UNREAD | CAP_WIRE | CAP_INBOX).await?;
+            let open = Update::Open { info: Box::new(Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
+            crate::hub::tests::hear_item(&hub, 1, "s:s1#a1", 1, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&open)? }).await?;
+            anyhow::ensure!(hub.harness.located_on("s1", "old-mac"), "s1 opened on old-mac");
+            anyhow::ensure!(super::super::mail_delivery::legacy_owner(&hub, "s1"), "a runner that names no mail-flow is from before it");
+            let send = |id: &str| Command::Send { id: id.into(), text: "what is this section?".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+            let asked = |scope: &str, cmd: &str, id: &str| {
+                let kind = hub.harness.kind_of(&hub, "s1", &send(id));
+                match hub.harness.asked.take("s1", scope, cmd, kind, std::time::Instant::now()) {
+                    (_, Taken::New(rx)) => Ok(rx),
+                    (_, other) => Err(anyhow::anyhow!("{cmd} came before: {other:?}")),
+                }
+            };
+            // A person's, from the page's socket: on to its inbox, which answers it.
+            let person = asked("user:ada", "c1", "m1")?;
+            hub.harness.send_asked(&hub, "s1", "user:ada", "c1", send("m1")).await;
+            anyhow::ensure!(super::super::mail::receipt(&hub.store, "user:ada".into(), "user:ada".into(), "s1".into(), "m1".into()).await?.is_none(), "not held in custody");
+            let took = Update::Inbox { said: Box::new(Said { message: "m1".into(), answer: Ok(Answer { session: "s1".into(), message: "m1".into(), epoch: 0, at: 1, seq: 1, repeat: false }) }) };
+            crate::hub::tests::hear_item(&hub, 1, "s:s1#a1", 2, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&took)? }).await?;
+            let sent = person.await?;
+            anyhow::ensure!(matches!(sent, Sent::Accepted(ref a) if a.message == "m1"), "its inbox took it: {sent:?}");
+            // Kiln's own and a person's through the API go there too.
+            anyhow::ensure!(matches!(hub.harness.dispatch(&hub, "s1", send("m2")).await, Pending::Answer { ref message, .. } if message == "m2"), "to its inbox");
+            // An agent's stays with custody, which takes nothing for a runner that pushes no capacity.
+            let agent = asked("agent:a1", "c3", "m3")?;
+            hub.harness.send_asked(&hub, "s1", "agent:a1", "c3", send("m3")).await;
+            let sent = agent.await?;
+            anyhow::ensure!(matches!(sent, Sent::PublicationRefused(super::super::mail::Error::Unavailable { .. })), "an agent's is held to custody: {sent:?}");
+            // Its runner upgraded, speaking mail-flow, its capacity not come yet: a person's is
+            // queued in custody, in the person's own queue; an agent's and kiln's wait for it.
+            hub.instances.update(|i| i.set_features(1, vec![crate::proto::feature::MAIL_FLOW.to_owned()]));
+            anyhow::ensure!(!super::super::mail_delivery::legacy_owner(&hub, "s1"), "a runner naming mail-flow isn't from before it");
+            let person = asked("user:ada", "c4", "m4")?;
+            hub.harness.send_asked(&hub, "s1", "user:ada", "c4", send("m4")).await;
+            let sent = person.await?;
+            anyhow::ensure!(matches!(sent, Sent::Published(ref r) if r.disposition == super::super::mail::Disposition::Waiting), "queued for the agent: {sent:?}");
+            let agent = asked("agent:a1", "c5", "m5")?;
+            hub.harness.send_asked(&hub, "s1", "agent:a1", "c5", send("m5")).await;
+            let sent = agent.await?;
+            anyhow::ensure!(matches!(sent, Sent::PublicationRefused(super::super::mail::Error::Unavailable { .. })), "an agent's waits for its capacity: {sent:?}");
+            anyhow::ensure!(matches!(hub.harness.dispatch(&hub, "s1", send("m6")).await, Pending::Now(Sent::PublicationRefused(_))), "and kiln's own");
+            Ok(())
+        })
     }
 }

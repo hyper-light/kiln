@@ -8,11 +8,11 @@ use super::Store;
 mod wal_tests;
 
 impl Store {
-    /// Preflight the storage scratch for an inserted original, an optional superseded status
-    /// and its usage counter. Actual transaction failure never transfers custody.
+    /// Preflight the storage scratch for an inserted original and an optional superseded status.
+    /// Actual transaction failure never transfers custody.
     pub async fn storage_reserve(&self, max_publication_bytes: u64) -> anyhow::Result<u64> {
-        let changes = ["original", "pending-status", "usage"];
-        self.storage_reserve_tables(max_publication_bytes, vec!["agent_mail".into(), "agent_mail_usage".into()], u64::try_from(changes.len())?).await
+        let changes = ["original", "pending-status"];
+        self.storage_reserve_tables(max_publication_bytes, vec!["agent_mail".into()], u64::try_from(changes.len())?).await
     }
 
     /// Callers give the actual affected tables, total encoded payload and maximum changed rows.
