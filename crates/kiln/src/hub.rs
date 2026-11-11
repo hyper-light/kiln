@@ -3773,7 +3773,7 @@ impl Hub {
     /// back, for the owner to take first at its next turn.
     pub(crate) fn runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, r: crate::harness::copies::RunnerUpdate, over: &dyn Fn(u64) -> bool) -> Option<crate::harness::copies::Ingest> {
         let began = Instant::now();
-        let crate::harness::copies::RunnerUpdate { peer, agent, session, update, shipped, arrived, handed, taken } = r;
+        let crate::harness::copies::RunnerUpdate { peer, agent, session, update, shipped, arrived, handed, taken, fill } = r;
         // Its third leg: from the hub's loop handing it over to its owner taking it (goal 10, plan 01a1a87b2dae
         // step 4).
         if let Some(h) = handed {
@@ -3782,6 +3782,16 @@ impl Hub {
         // The frames it makes carry where it came from, for the viewers who ask (goal 10, plan 01a1a87b2dae step 5).
         let runner_us = taken.map(|t| u64::try_from(t.as_micros()).unwrap_or(u64::MAX));
         let _came = crate::harness::live::carrying(Some(crate::harness::live::Came { arrived_us: arrived.map(crate::harness::live::us_at), took_us: crate::harness::live::us_at(began), runner_us }));
+        // A state its runner sent bounded keeps the copy's values for what it left out, which the server reads from the
+        // runner itself; what's read comes in where the copy still lacks it (CP-T3.2's views filled in: `crate::harness::fill`).
+        let update = match update {
+            u @ (crate::harness::core::Update::State { .. } | crate::harness::core::Update::Closed) => {
+                let last = if matches!(u, crate::harness::core::Update::State { .. }) { s.get(&session).and_then(crate::harness::copies::Mirror::last_state) } else { None };
+                let source = crate::harness::fill::Source { peer, agent: Arc::clone(&agent), shipped };
+                crate::harness::fill::taken(self, last, &session, u, fill, source)?
+            }
+            u => u,
+        };
         let rest = self.judge_runner_update(s, peer, &agent, &session, update, shipped, over);
         let done = Instant::now();
         crate::route_latency::observe(crate::route_latency::Class::Runner, arrived.map(|at| began.saturating_duration_since(at)), done.saturating_duration_since(began));
@@ -3895,6 +3905,8 @@ impl Hub {
     /// channel item ([`Hub::on_wire`]), its runner `runner` heard. `arrived`: as [`Hub::on_net_at`]'s.
     async fn on_session_update(self: &Arc<Self>, peer: PeerId, runner: &Arc<str>, session: String, update: Box<crate::harness::core::Update>, taken: Option<Duration>, arrived: &mut Option<Arrived>) {
         if let crate::harness::core::Update::Open { info, .. } = &*update && !crate::harness::mail_transfer::allows_claim(self, peer, &session, Some(info.epoch)).await { return; }
+        // The answer to a read the server made of the session's state itself (`crate::harness::fill`): its, not its viewers'.
+        let Some(update) = self.harness.fills.answered(update) else { return };
         match *update {
             crate::harness::core::Update::MailFlow { event } => {
                 let owner = self.instances.load().owner(&crate::instances::Owned::Agent(session.clone()));
@@ -3933,7 +3945,7 @@ impl Hub {
                 // session's id for that: the rest hand theirs on, not a copy (goal 9, plan
                 // 01a1a87b2cec step 5).
                 let applied = lifecycle.then(|| session.clone());
-                let r = crate::harness::copies::RunnerUpdate { peer, agent: Arc::clone(runner), session, update: u, shipped, arrived: arrival.map(|a| a.at), handed: Some(handed), taken };
+                let r = crate::harness::copies::RunnerUpdate { peer, agent: Arc::clone(runner), session, update: u, shipped, arrived: arrival.map(|a| a.at), handed: Some(handed), taken, fill: false };
                 self.harness.from_runner(r).await;
                 if let Some(id) = applied {
                     self.harness.applied(&id).await;

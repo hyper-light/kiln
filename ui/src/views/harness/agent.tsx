@@ -26,8 +26,6 @@ import { toast } from "@/components/ui/toast";
 import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
 import { AccountDialog } from "./account-card";
 import { Composer, type ToMark } from "./composer";
-import { DeferredFields } from "./deferred-state";
-import { deferredState, stateCount } from "@/api/state-pages";
 import { useAgentActions } from "./actions";
 import { MoveDialog, movable } from "./move";
 import { SettingsSheet, useAttachments, type Attachments, type Taken } from "./controls";
@@ -875,7 +873,6 @@ function Dock({
   const [restart, restarting] = useAction(() => send({ type: "restart" }));
   return (
     <div className="hx-dock" ref={liftNotices} onPointerDown={keepTyping} onMouseDown={keepTyping}>
-      <DeferredFields store={store} except={["queue", "tasks", "approvals"]} />
       <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} inThread={task} rows={rows} picks={picks} onPick={pick} />
       {status === "exited" && exit?.error && empty ? (
         <div className="hx-startfail" role="alert">
@@ -971,9 +968,8 @@ function liftNotices(dock: HTMLElement | null) {
 /** A phone's tabs, with what each holds. */
 function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; onTab: (t: PhoneTab) => void }) {
   const asked = useSession(store, (s) => s.state?.approvals);
-  const approvalCount = useSession(store, (s) => (deferredState(s.state, "approvals") ? stateCount(s.state, "approvals", 0) : null));
   const done = useAnswered();
-  const approvals = approvalCount ?? (asked ? stillAsked(asked, done).length : 0);
+  const approvals = asked ? stillAsked(asked, done).length : 0;
   const changes = useSession(store, (s): FileChange[] | null => s.changes);
   // Counted from the conversation's edits only when the server sends no changeset.
   const events = useSession(store, (s) => (s.changes ? NO_EVENTS : s.events));
@@ -983,14 +979,12 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
   const fileCount = React.useMemo(() => (changes ? changes.filter((f) => inScope(f, scope)).length : changesetOf(edits).length), [changes, edits, scope]);
   const todos = useSession(store, (s) => s.state?.todos ?? NO_TODOS);
   const todosDone = todos.filter((t) => t.status === "completed").length;
-  const todoCount = useSession(store, (s) => stateCount(s.state, "todos", todos.length));
-  const todoDone = useSession(store, (s) => stateCount(s.state, "todos_done", todosDone));
   // A plan waiting on your review: its tab says so (review.tsx).
   const reviewing = useReviewWaits(store);
   const tabs: { id: PhoneTab; label: string; n?: string; warn?: boolean; waits?: boolean }[] = [
     { id: "work", label: "Work", n: approvals ? String(approvals) : undefined, warn: approvals > 0 },
     { id: "changes", label: "Changes", n: fileCount ? String(fileCount) : undefined },
-    { id: "plan", label: "Plan", n: todoCount ? `${todoDone}/${todoCount}` : undefined, waits: reviewing !== null },
+    { id: "plan", label: "Plan", n: todos.length ? `${todosDone}/${todos.length}` : undefined, waits: reviewing !== null },
     { id: "tools", label: "Tools" },
   ];
   return (

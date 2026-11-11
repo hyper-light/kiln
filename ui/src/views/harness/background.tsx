@@ -23,8 +23,6 @@ import { ENDED, RemoveButton, useRemoving } from "./subagent-remove";
 import { swipeRow } from "./swipe-away";
 import { TreePath } from "./tree-path";
 import { useNavigate } from "@/lib/router";
-import { deferredState } from "@/api/state-pages";
-import { DeferredState } from "./deferred-state";
 
 const NO_AGENTS: readonly AgentInfo[] = [];
 const NO_APPROVALS: Approval[] = [];
@@ -668,8 +666,6 @@ export function ActivityLine({
   const features = useSession(store, (s) => s.meta?.features ?? NO_FEATURES);
   const tasks = useSession(store, (s) => s.state?.tasks ?? NO_TASKS);
   const approvals = useSession(store, (s) => s.state?.approvals ?? NO_APPROVALS);
-  const deferredTasks = useSession(store, (s) => deferredState(s.state, "tasks"));
-  const deferredApprovals = useSession(store, (s) => deferredState(s.state, "approvals"));
   const done = useAnswered();
   const subs = subagentTasksAtWork(tasks);
   // The subagents kiln started for its goals or plan steps, with its harness's own.
@@ -689,13 +685,6 @@ export function ActivityLine({
     );
     remove(rs, els);
   };
-  if (deferredTasks || deferredApprovals)
-    return (
-      <div className="hx-stack">
-        <DeferredState store={store} field="tasks" />
-        <DeferredState store={store} field="approvals" />
-      </div>
-    );
   if (subs.length + others.length + bg.length === 0 && tree.length === 0) return null;
   // Those that wait on you: said on the line, and each (two at most) in a row of its own under it.
   const asks = subagentAsks(store.id, approvals, tasks, kiln, done);

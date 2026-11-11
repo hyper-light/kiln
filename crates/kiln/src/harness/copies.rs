@@ -2590,6 +2590,16 @@ fn warm_later(now: Arc<Chunk>, was: Arc<Chunk>, reach: usize) {
 }
 
 impl Mirror {
+    /// The state the copy has: as its machine last said it (filled in, `super::fill`), else read back from what it keeps
+    /// (a copy restored, its state's word not taken again since). None: it has none.
+    pub(crate) fn last_state(&self) -> Option<std::borrow::Cow<'_, super::model::State>> {
+        match &self.state_of {
+            Some((state, _)) => Some(std::borrow::Cow::Borrowed(&**state)),
+            None if self.state.is_object() => serde_json::from_value(self.state.to_value()).ok().map(std::borrow::Cow::Owned),
+            None => None,
+        }
+    }
+
     pub fn new(info: Info, location: Location, bus: Arc<dyn kiln_seams::Bus>) -> Self {
         let feed = Feed::open(bus, &info.id);
         let (info, location) = (Arc::new(info), Arc::new(location));
@@ -4048,6 +4058,9 @@ pub struct RunnerUpdate {
     /// runner's clock (`crate::wire::stamp`; goal 10, plan 01a1a87b2dae step 5), its leg beside the server's
     /// (`crate::route_latency::RunnerLeg::Runner`, `Server`).
     pub taken: Option<std::time::Duration>,
+    /// Not its runner's word but fields of its state the server read from it, left out of a view it sent
+    /// (`super::fill`): taken where the copy still lacks them.
+    pub fill: bool,
 }
 
 /// An agent session's update as it came from where the session runs, a machine or the server itself

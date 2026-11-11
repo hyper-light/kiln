@@ -40,7 +40,8 @@ pub fn none() -> Arc<StateDoc> {
 impl StateDoc {
     /// `state` as its JSON: written once (serde_json, compact), its top-level fields found in that text and kept as
     /// slices of it; their keys shared with `was`'s where they're the same (a state's are its type's fields). What
-    /// can't be written is `null`, as a tree made of it was.
+    /// can't be written is `null`, as a tree made of it was. A state's `view` (what its runner left out, which the
+    /// server fills in itself: `super::fill`) isn't kept: no page reads a state as left out.
     pub fn made<T: Serialize + ?Sized>(state: &T, was: &StateDoc) -> Self {
         let mut text = Vec::with_capacity(was.room());
         if serde_json::to_writer(&mut text, state).is_err() {
@@ -58,6 +59,7 @@ impl StateDoc {
         let mut from = 0;
         let fields = spans
             .into_iter()
+            .filter(|(key, _)| *key != b"view")
             .map(|(key, value)| {
                 let at = olds.get(from..).and_then(|rest| rest.iter().position(|(k, _)| k.as_bytes() == key)).map(|p| from + p);
                 let key = match at.and_then(|i| olds.get(i).map(|(k, _)| (i, k))) {

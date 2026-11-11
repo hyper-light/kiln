@@ -44,6 +44,7 @@ pub mod diff;
 pub mod elicit;
 pub mod elsewhere;
 pub mod files;
+pub mod fill;
 pub mod gitstate;
 pub mod goback;
 pub mod handing;

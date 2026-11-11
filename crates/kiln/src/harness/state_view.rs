@@ -465,6 +465,24 @@ impl FieldSink for Revisions<'_> {
         Ok(())
     }
 }
+struct Take<'a> {
+    wanted: &'a std::collections::BTreeSet<String>,
+    got: serde_json::Map<String, Value>,
+}
+impl FieldSink for Take<'_> {
+    fn field<T: Serialize + ?Sized>(&mut self, key: &'static str, v: &T) -> Result<(), Error> {
+        if self.wanted.contains(key) {
+            self.got.insert(key.to_owned(), serde_json::to_value(v).map_err(|_| Error::Unreadable)?);
+        }
+        Ok(())
+    }
+}
+/// `state`'s fields named in `wanted`, each as its JSON (what the server fills a view's left-out fields with,
+/// `super::fill`); one left out of its JSON (an empty one skipped) isn't there.
+pub(crate) fn fields_of(state: &State, wanted: &std::collections::BTreeSet<String>) -> Result<serde_json::Map<String, Value>, Error> {
+    Ok(state.serialize(Fields(Take { wanted, got: serde_json::Map::new() }))?.got)
+}
+
 pub fn field_revision(state: &State, field: &str) -> Result<String, Error> {
     let field = if field == "$queue_index" { "queue" } else { field };
     let mut found = state.serialize(Fields(Revisions {

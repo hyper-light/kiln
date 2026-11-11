@@ -186,6 +186,13 @@ content plus the session epoch, so unrelated status changes do not invalidate qu
 while that owner is away. These messages are enabled only after named-feature negotiation;
 the runner refreshes its resumable session streams when that negotiation completes.
 
+The server fills an oversized state in itself (`harness::fill`): its copy keeps the values it had
+for the fields the view left out and takes the view's own, reads the runner's with `StateRead`
+(their replies go to the server alone, not to the session's viewers), and takes each field in once
+read at the revision the view named; one read at another revision waits for the next view's. Pages
+get the whole state and never `view`. The copy's state keeps `view` naming the fields still being
+read, for the store and the server's own readers (an incomplete queue index still proves nothing).
+
 `mail-flow` adds receiver-owned application credit, independent of transport connection.
 Accepted publications first transfer durable server custody (`Published`, HTTP202 with a receipt).
 Receiver admission and correlated provider handoff are subsequent owner events; neither a socket
@@ -635,7 +642,8 @@ run out, and two lines can't take the same one by accident as they could a bit.
   files it was asked to read (`AgentMsg::Skills`, `AgentMsg::SkillFile`).
   `state-pages`: bounded session state views retain status and counts when details exceed the
   existing frame cap; deferred fields and queue indexes are read at their owner's field revision
-  using `StateRead`. `AtState` applies queue actions only while that revision is current.
+  using `StateRead`, by the server, which fills the state in before its pages see it.
+  `AtState` applies queue actions only while that revision is current.
   `mail-flow`: receiver-owned admission and exact durable custody receipts.
   `mail-transfer`: event-driven Offered, Prepared, Committed or Aborted journal handover, with authenticated exact manifests and unchanged attempt tokens.
 
