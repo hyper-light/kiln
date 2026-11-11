@@ -10,7 +10,7 @@ pub(crate) mod sys;
 #[cfg(test)]
 mod tests;
 
-use crate::{Absent, Gpu, Load, PciAddress, Skipped, Unread, Vendor};
+use crate::{Absent, Gpu, Identity, Load, PciAddress, Skipped, Unread, Vendor};
 use load::DynLoadError;
 
 /// nvml.h's buffers: `NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE`, `NVML_DEVICE_NAME_V2_BUFFER_SIZE` and
@@ -108,7 +108,7 @@ pub(crate) fn open<C: Calls>(calls: C) -> Result<Found<C>, Absent> {
             Err(why) => skipped.push(Skipped::Nvml { index, why }),
         }
     }
-    gpus.sort_by_key(|(gpu, _)| gpu.pci);
+    gpus.sort_by_key(|(gpu, _)| gpu.identity);
     Ok(Found { gpus, skipped })
 }
 
@@ -127,9 +127,11 @@ fn identify<C: Calls>(
         vendor: Vendor::Nvidia,
         model: text(&name).ok_or(Unread::Malformed)?.to_owned(),
         memory_total_bytes: memory.total,
-        pci: text(&bus_id)
-            .and_then(PciAddress::parse)
-            .ok_or(Unread::Malformed)?,
+        identity: Identity::Pci(
+            text(&bus_id)
+                .and_then(PciAddress::parse)
+                .ok_or(Unread::Malformed)?,
+        ),
         driver_version: driver_version.to_owned(),
     };
     Ok((gpu, Device { calls, device }))

@@ -1,30 +1,22 @@
-//! hex-gpu: a node's NVIDIA and AMD GPUs and their load, for Hex's scheduler to balance on beside CPU
-//! load (`AC-T7.3.1`, placement by CPU, memory, disk and devices; Ada, 2026-11-09: "make sure to
-//! incorporate GPU load in the balancing"). NVIDIA's are read through NVML, AMD's through amdgpu's
-//! sysfs counters on Linux and through ADL, AMD's Display Library, on Windows, each vendored and
-//! adapted from upstream (`vendor/cuda-rust`, `vendor/all-smi`; `docs/design/gpu-telemetry.md`).
+//! A node's NVIDIA, AMD and Apple Silicon GPUs and their load (`AC-T7.3.1`). NVIDIA uses NVML;
+//! AMD uses amdgpu sysfs on Linux and ADL on Windows; Apple uses Metal identity/budgets, exact-entry
+//! IOKit allocation counters and IOReport GPU residency. Sources: `docs/design/gpu-telemetry.md`
+//! and `docs/research/measurements/hex-macos-gpu/README.md`.
 //!
-//! [`Gpus::open`] does every costly thing once: it loads and initialises NVML (once for the process),
-//! lists the cards amdgpu drives or ADL's adapters, reads what doesn't change and opens every counter
-//! or context a sample reads through. Then:
+//! [`Gpus::open`] inventories native [`Identity`] values, models and memory once and retains native
+//! handles for [`Gpus::sample`]. Inventory and samples have the same order: vendor, then identity.
+//! [`NoGpus`] says why no inventory is readable; [`Skipped`] retains individual device failures,
+//! and each [`Load`] counter has its own typed [`Unread`] instead of a fabricated idle/zero reading.
 //!
-//! - [`Gpus::inventory`] gives each GPU's [`Gpu`]: its [`Vendor`], model, total memory in bytes,
-//!   [`PciAddress`] and driver version. NVIDIA's come first, then AMD's, each vendor's in PCI order.
-//! - [`Gpus::sample`] gives each GPU's [`Load`] now, in the inventory's order: the percent of the time
-//!   it is busy and the bytes of its memory in use. A counter costs one NVML or ADL call, or one read of
-//!   a file kept open; a sample allocates nothing, spawns nothing and walks no path.
+//! Bounds: one entry per native enumerated device; NVML/ADL use their driver's documented count
+//! bounds. Apple reserves fallibly from Metal's actual array count and subscribes only to its sole
+//! GPUPH GPU-performance channel. Its previous raw sample is the sole residency baseline, replaced
+//! on each sample with no timer/minimum interval. IOReport/IOKit allocate native snapshots; Apple's
+//! adapter makes no allocation-free claim. Linux/Windows retain their existing per-sample bounds.
 //!
-//! Both refuse with [`NoGpus`] when the node has no GPU this process can read, saying for each vendor
-//! why ([`Absent`]): on macOS that is [`Absent::Unsupported`] for both; where a vendor's library isn't
-//! installed (Windows on ARM64 has AMD's nowhere) it is [`Absent::NoLibrary`]. A device a driver
-//! counts that can't be read is in
-//! [`Gpus::skipped`] with why ([`Skipped`]), never dropped silently (CLAUDE.md §3). A counter that
-//! can't be read is an [`Unread`] in its place: [`Unread::Gone`] once a GPU is unplugged or falls off
-//! the bus, after which a new [`Gpus::open`] lists what is there now.
-//!
-//! Bounds (CLAUDE.md §2): one entry per device the drivers report, read at open, and nothing per sample;
-//! NVML's count is refused past the NVIDIA driver's own 248 devices, ADL's past its own 250 adapters,
-//! and each AMD card on Linux holds two file descriptors (`amd`).
+//! Apple's memory total is Metal's native recommended working-set budget, not dedicated VRAM or
+//! total RAM; its driver-reported mapped allocation can exceed that budget. The package-wide GPUPH
+//! counter is attributed only when Metal enumerates a sole device; ambiguous attribution is typed.
 
 #![cfg_attr(
     test,
@@ -42,6 +34,8 @@
 mod adl;
 #[cfg(target_os = "linux")]
 mod amd;
+#[cfg(any(target_os = "macos", test))]
+mod apple;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod nvml;
 #[cfg(test)]
@@ -56,6 +50,8 @@ pub enum Vendor {
     Nvidia,
     /// Read through amdgpu's sysfs counters on Linux, ADL on Windows.
     Amd,
+    /// Read through Metal, IOKit and IOReport on Apple Silicon.
+    Apple,
 }
 
 /// A PCI function's address, `domain:bus:device.function`: the GPU's identity on its node, the same
@@ -103,6 +99,45 @@ impl fmt::Display for PciAddress {
     }
 }
 
+/// A native GPU identity. Metal's registry ID is global to tasks, not a PCI address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Identity {
+    Pci(PciAddress),
+    Metal(u64),
+}
+
+impl Identity {
+    /// PCI's domain32/bus8/device5/function3 packed into 48 bits, or Metal's full native ID.
+    /// The identity's variant must be retained when interpreting the key.
+    pub fn key(self) -> u64 {
+        match self {
+            Self::Pci(pci) => {
+                (u64::from(pci.domain) << 16)
+                    | (u64::from(pci.bus) << 8)
+                    | (u64::from(pci.device) << 3)
+                    | u64::from(pci.function)
+            }
+            Self::Metal(id) => id,
+        }
+    }
+
+    pub fn pci(self) -> Option<PciAddress> {
+        match self {
+            Self::Pci(pci) => Some(pci),
+            Self::Metal(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for Identity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pci(pci) => pci.fmt(f),
+            Self::Metal(id) => write!(f, "metal:{id}"),
+        }
+    }
+}
+
 /// One GPU as [`Gpus::open`] found it: what doesn't change while it is plugged in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Gpu {
@@ -110,14 +145,25 @@ pub struct Gpu {
     /// NVIDIA's name for it (`NVIDIA GeForce RTX 5060 Ti`); for AMD's, libdrm's marketing name where
     /// its table has one, else the PCI ids as lspci prints them (`1002:13c0 rev e5`).
     pub model: String,
-    /// Its memory: NVIDIA's framebuffer; AMD's VRAM, which on an APU is the carve-out the firmware
-    /// gives it (the system memory it maps besides is not counted).
+    /// NVIDIA's framebuffer; AMD's VRAM (an APU's firmware carve-out); Apple's Metal
+    /// `recommendedMaxWorkingSetSize`, a working-set budget, not dedicated VRAM or total host RAM.
     pub memory_total_bytes: u64,
-    /// Where it is. On Windows an AMD GPU's is on segment 0: ADL names no segment.
-    pub pci: PciAddress,
+    /// Where it is. On Windows an AMD GPU's PCI segment is 0: ADL names no segment.
+    pub identity: Identity,
     /// NVIDIA's driver's version (`620.70.06`); amdgpu's: a DKMS module's own, else the kernel's
-    /// release, the in-tree driver's; on Windows, AMD's driver release (`25.20.32.06`).
+    /// release, the in-tree driver's; on Windows, AMD's driver release (`25.20.32.06`); on Apple,
+    /// the native Darwin release of the OS-bundled driver (not a guessed Metal version).
     pub driver_version: String,
+}
+
+impl Gpu {
+    pub fn key(&self) -> u64 {
+        self.identity.key()
+    }
+
+    pub fn pci(&self) -> Option<PciAddress> {
+        self.identity.pci()
+    }
 }
 
 /// One GPU's load at one sample. Each counter is read on its own, so one can fail while the other
@@ -127,10 +173,13 @@ pub struct Gpu {
 pub struct Load {
     /// The percent of the time the GPU is busy, 0 to 100: for NVIDIA, of NVML's last sample period
     /// (1/6 s to 1 s by product) that a kernel ran; for AMD, the SMU firmware's load over the GPU's IP
-    /// cores (`gpu_busy_percent` on Linux) or its graphics engine's activity (ADL's PMLog on Windows).
+    /// cores (`gpu_busy_percent` on Linux) or its graphics engine's activity (ADL's PMLog on Windows);
+    /// Apple's active / total GPUPH residency between the previous observation and this one.
     pub busy_percent: Result<u8, Unread>,
     /// The bytes of its memory in use: NVML's `used` (allocated and reserved), amdgpu's
-    /// `mem_info_vram_used`, ADL's VRAM usage (whole megabytes of 2^20 bytes).
+    /// `mem_info_vram_used`, ADL's VRAM usage (whole megabytes of 2^20 bytes), or the exact Apple
+    /// registry entry's `PerformanceStatistics` / `Alloc system memory` mapped allocation. This
+    /// last value is not whole-host RAM use or this process's Metal allocation.
     pub memory_used_bytes: Result<u64, Unread>,
 }
 
@@ -159,6 +208,18 @@ pub enum Unread {
     /// ADL refused, with its code.
     #[error("ADL refused: {}", adl_says(.code))]
     Adl { code: i32 },
+    /// No residency advanced in this window; it is not an idle reading.
+    #[error("no GPU residency sample has advanced yet")]
+    NoSample,
+    /// A native allocation or a fallible Rust reservation was refused.
+    #[error("there is no memory for the GPU reading")]
+    Allocation,
+    /// IOReport returned no subscription, sample or delta (it provides no status code).
+    #[error("IOReport could not produce the GPU reading")]
+    IoReport,
+    /// A package-wide counter cannot be attributed to one of several native GPU identities.
+    #[error("the package GPU counter cannot identify this GPU separately")]
+    Ambiguous,
 }
 
 /// A device a driver counts that [`Gpus::open`] couldn't read, and why.
@@ -170,6 +231,8 @@ pub enum Skipped {
     Drm { card: u32, why: Unread },
     /// ADL's adapter row at this position (`ADL2_Adapter_AdapterInfo_Get`'s order).
     Adl { adapter: u32, why: Unread },
+    /// Metal's device at this position in `MTLCopyAllDevices`.
+    Metal { index: usize, why: Unread },
 }
 
 /// Why one vendor's GPUs aren't read on this node.
@@ -202,14 +265,19 @@ pub enum Absent {
     /// ADL refused to start or to list, with its code.
     #[error("ADL refused: {}", adl_says(.code))]
     Adl { code: i32 },
+    #[error("Metal could not enumerate GPU devices")]
+    Metal,
+    #[error("there is no memory for the GPU inventory")]
+    Allocation,
 }
 
 /// The node has no GPU this process can read: why, for each vendor.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("no GPU to read: NVIDIA: {nvidia}; AMD: {amd}")]
+#[error("no GPU to read: NVIDIA: {nvidia}; AMD: {amd}; Apple: {apple}")]
 pub struct NoGpus {
     pub nvidia: Absent,
     pub amd: Absent,
+    pub apple: Absent,
 }
 
 /// What nvml.h says each `nvmlReturn_t` means, for a person reading a refusal.
@@ -271,6 +339,8 @@ pub struct Gpus {
     amd: Vec<amd::Card<std::fs::File>>,
     #[cfg(target_os = "windows")]
     adl: Option<adl::Amd<adl::sys::Session>>,
+    #[cfg(target_os = "macos")]
+    apple: Option<apple::sys::Apple>,
 }
 
 impl Gpus {
@@ -327,6 +397,7 @@ impl Gpus {
             Some(NoGpus {
                 nvidia: nvidia_absent,
                 amd: amd_absent,
+                apple: Absent::Unsupported,
             })
         } else {
             None
@@ -346,7 +417,7 @@ impl Gpus {
 
     /// Finds the node's GPUs: none here, where neither vendor's interface exists (NVIDIA's driver,
     /// amdgpu and ADL are Linux's and Windows').
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     pub fn open() -> Gpus {
         Gpus {
             gpus: Vec::new(),
@@ -355,11 +426,38 @@ impl Gpus {
             none: Some(NoGpus {
                 nvidia: Absent::Unsupported,
                 amd: Absent::Unsupported,
+                apple: Absent::Unsupported,
             }),
         }
     }
 
-    /// The GPUs found at open: NVIDIA's, then AMD's, each vendor's in PCI order. Or why there are none.
+    /// Reads native Apple Silicon GPU identities and budgets, then opens the GPU-only IOReport
+    /// subscription. Counter failure preserves the inventory and is returned per counter.
+    #[cfg(target_os = "macos")]
+    pub fn open() -> Gpus {
+        match apple::sys::open() {
+            Ok(found) => Gpus {
+                gpus: found.gpus,
+                loads: found.loads,
+                skipped: found.skipped,
+                none: None,
+                apple: Some(found.apple),
+            },
+            Err(why) => Gpus {
+                gpus: Vec::new(),
+                loads: Vec::new(),
+                skipped: why.skipped,
+                none: Some(NoGpus {
+                    nvidia: Absent::Unsupported,
+                    amd: Absent::Unsupported,
+                    apple: why.cause,
+                }),
+                apple: None,
+            },
+        }
+    }
+
+    /// The GPUs found at open in vendor/native-identity order. Or why there are none.
     pub fn inventory(&self) -> Result<&[Gpu], &NoGpus> {
         match &self.none {
             Some(none) => Err(none),
@@ -368,7 +466,8 @@ impl Gpus {
     }
 
     /// Each GPU's load now, in [`Gpus::inventory`]'s order: one NVML or ADL call, or one read of a
-    /// kept-open counter, per counter, into room reserved at open. Or why there are none.
+    /// kept-open counter, per counter, into room reserved at open. Apple creates native IOReport/
+    /// IOKit snapshots; a zero residency window is `Unread::NoSample`. Or why there are none.
     pub fn sample(&mut self) -> Result<&[Load], &NoGpus> {
         if let Some(none) = &self.none {
             return Err(none);
@@ -386,6 +485,10 @@ impl Gpus {
         #[cfg(target_os = "windows")]
         if let Some(adl) = &mut self.adl {
             adl.sample(&mut self.loads);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(apple) = &mut self.apple {
+            apple.sample(&mut self.loads);
         }
         Ok(&self.loads)
     }

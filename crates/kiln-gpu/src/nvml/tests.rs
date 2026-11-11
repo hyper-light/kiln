@@ -8,7 +8,7 @@ use std::cell::Cell;
 
 use super::load::{self, DynLoadError};
 use super::{BUS_ID_BYTES, Calls, DRIVER_VERSION_BYTES, Memory, NAME_BYTES, absent, open, sys};
-use crate::{Absent, Gpu, Load, PciAddress, Skipped, Unread, Vendor};
+use crate::{Absent, Gpu, Identity, Load, PciAddress, Skipped, Unread, Vendor};
 
 const INVALID_ARGUMENT: i32 = 2;
 const NOT_SUPPORTED: i32 = 3;
@@ -153,7 +153,7 @@ fn adacachy2s_gpu_is_listed_as_nvml_recorded_it() {
             vendor: Vendor::Nvidia,
             model: "NVIDIA GeForce RTX 5060 Ti".to_owned(),
             memory_total_bytes: 8_546_942_976,
-            pci: PciAddress::parse("0000:01:00.0").unwrap(),
+            identity: Identity::Pci(PciAddress::parse("0000:01:00.0").unwrap()),
             driver_version: "620.70.06".to_owned(),
         }]
     );
@@ -195,7 +195,10 @@ fn gpus_are_listed_in_pci_order() {
     late.bus_id = b"00000000:c1:00.0\0";
     let nvml = Nvml::with(vec![late, rtx_5060_ti()]);
     let found = open(&nvml).unwrap();
-    let order: Vec<String> = listed(&found).iter().map(|g| g.pci.to_string()).collect();
+    let order: Vec<String> = listed(&found)
+        .iter()
+        .map(|g| g.pci().unwrap().to_string())
+        .collect();
     assert_eq!(order, ["0000:01:00.0", "0000:c1:00.0"]);
 }
 

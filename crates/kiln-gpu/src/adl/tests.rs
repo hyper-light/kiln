@@ -12,7 +12,7 @@ use super::ffi::{
     AdlVersionsInfoX2,
 };
 use super::{Calls, Found, open};
-use crate::{Absent, Gpu, Load, PciAddress, Skipped, Unread, Vendor};
+use crate::{Absent, Gpu, Identity, Load, PciAddress, Skipped, Unread, Vendor};
 
 const INVALID_ADL_IDX: c_int = -5;
 const DISABLED_ADAPTER: c_int = -10;
@@ -172,7 +172,7 @@ fn the_8060s() -> Gpu {
         vendor: Vendor::Amd,
         model: "AMD Radeon(TM) 8060S Graphics".to_owned(),
         memory_total_bytes: 4_294_967_296,
-        pci: PciAddress::parse("0000:c4:00.0").unwrap(),
+        identity: Identity::Pci(PciAddress::parse("0000:c4:00.0").unwrap()),
         driver_version: "25.20.32.06".to_owned(),
     }
 }
@@ -285,7 +285,11 @@ fn rows_are_grouped_other_vendors_passed_over_and_garbage_skipped() {
     adl.rows = vec![row(0, 197), row(1, 196), row(2, 197), intel, garbled];
     adl.count = Ok(5);
     let found = open(adl).unwrap();
-    let order: Vec<String> = found.gpus.iter().map(|g| g.pci.to_string()).collect();
+    let order: Vec<String> = found
+        .gpus
+        .iter()
+        .map(|g| g.pci().unwrap().to_string())
+        .collect();
     assert_eq!(order, ["0000:c4:00.0", "0000:c5:00.0"]);
     assert_eq!(found.amd.adapters, vec![1, 0]);
     assert_eq!(

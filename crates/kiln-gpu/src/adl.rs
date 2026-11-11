@@ -16,7 +16,7 @@ mod tests;
 
 use std::ffi::c_int;
 
-use crate::{Absent, Gpu, Load, PciAddress, Skipped, Unread, Vendor};
+use crate::{Absent, Gpu, Identity, Load, PciAddress, Skipped, Unread, Vendor};
 use ffi::{
     ADL_MAX_ADAPTERS, AdapterInfo, AdapterInfoArray, AdlMemoryInfo2, AdlPmLogDataBuffer,
     AdlVersionsInfoX2, adl_string,
@@ -138,7 +138,7 @@ pub(crate) fn open<C: Calls>(mut calls: C) -> Result<Found<C>, Absent> {
                         vendor: Vendor::Amd,
                         model,
                         memory_total_bytes,
-                        pci,
+                        identity: Identity::Pci(pci),
                         driver_version: driver_version.clone(),
                     },
                     index,
@@ -147,7 +147,7 @@ pub(crate) fn open<C: Calls>(mut calls: C) -> Result<Found<C>, Absent> {
             }
         }
     }
-    gpus.sort_by_key(|(gpu, _)| gpu.pci);
+    gpus.sort_by_key(|(gpu, _)| gpu.identity);
     let (gpus, adapters) = gpus.into_iter().unzip();
     Ok(Found {
         gpus,

@@ -131,34 +131,18 @@ async fn executors() -> BTreeMap<String, Executor> {
     out
 }
 
-/// Retained native NVIDIA/AMD providers; macOS keeps its inventory-only system profiler.
+/// W13-R01: one retained native provider for NVIDIA, AMD and Apple Silicon.
 async fn gpus() -> (Vec<Gpu>, Option<String>) {
-    let (mut out, why) = match crate::rt::blocking(native_gpu_facts).await {
+    let (out, why) = match crate::rt::blocking(native_gpu_facts).await {
         Ok(Ok(cards)) => (cards, None),
         Ok(Err(why)) => (Vec::new(), Some(why)),
         Err(why) => (Vec::new(), Some(why.to_string())),
     };
-    if cfg!(target_os = "macos")
-        && let Some(text) = output("system_profiler", &["SPDisplaysDataType", "-json"]).await
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
-    {
-        for g in v.get("SPDisplaysDataType").and_then(serde_json::Value::as_array).into_iter().flatten() {
-            let model = g.get("sppci_model").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
-            if model.is_empty() {
-                continue;
-            }
-            let vendor = g.get("spdisplays_vendor").and_then(serde_json::Value::as_str).unwrap_or_default().to_ascii_lowercase();
-            let vendor = if vendor.contains("apple") || model.starts_with("Apple") { "apple" } else if vendor.contains("amd") || vendor.contains("ati") { "amd" } else if vendor.contains("intel") { "intel" } else { "other" };
-            // Discrete GPUs say their memory ("8 GB"); Apple silicon shares the machine's.
-            let memory = g.get("spdisplays_vram").or_else(|| g.get("spdisplays_vram_shared")).and_then(serde_json::Value::as_str).and_then(|s| s.split_whitespace().next()?.parse::<u64>().ok()).map_or(0, |gb| gb << 30);
-            out.push(Gpu { vendor: vendor.into(), model, memory, driver: g.get("spdisplays_mtlgpufamilysupport").and_then(serde_json::Value::as_str).map(|m| m.trim_start_matches("spdisplays_").to_owned()), ..Gpu::default() });
-        }
-    }
-    GPU_PRESENT.store(cfg!(any(target_os = "linux", target_os = "windows")) && !out.is_empty(), Ordering::Release);
+    GPU_PRESENT.store(!out.is_empty(), Ordering::Release);
     (out, why)
 }
 
-/// W13-R01: Hex's retained NVML / amdgpu / ADL providers, one instance per process.
+/// W13-R01: Hex's retained NVML / amdgpu / ADL / Apple providers, one instance per process.
 /// Sampling uses installed drivers and retained handles; it starts no subprocess.
 fn native_gpu_facts() -> Result<Vec<Gpu>, String> {
     static GPUS: std::sync::LazyLock<parking_lot::Mutex<kiln_gpu::Gpus>> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(kiln_gpu::Gpus::open()));
@@ -181,8 +165,8 @@ fn gpu_facts(inventory: &[kiln_gpu::Gpu], loads: &[kiln_gpu::Load]) -> Vec<Gpu> 
     inventory.iter().enumerate().map(|(i, g)| {
         let load = loads.get(i);
         Gpu {
-            vendor: match g.vendor { kiln_gpu::Vendor::Nvidia => "nvidia", kiln_gpu::Vendor::Amd => "amd" }.into(),
-            model: g.model.clone(), memory: g.memory_total_bytes, driver: Some(g.driver_version.clone()), id: Some(g.pci.to_string()),
+            vendor: match g.vendor { kiln_gpu::Vendor::Nvidia => "nvidia", kiln_gpu::Vendor::Amd => "amd", kiln_gpu::Vendor::Apple => "apple" }.into(),
+            model: g.model.clone(), memory: g.memory_total_bytes, driver: Some(g.driver_version.clone()), id: Some(g.identity.to_string()),
             busy_per_mille: load.and_then(|l| l.busy_percent.ok()).map(|p| u16::from(p) * 10),
             memory_used: load.and_then(|l| l.memory_used_bytes.ok()),
         }
@@ -675,7 +659,7 @@ mod gpu_port_tests {
     use super::*;
     #[test]
     fn w13_r01_native_gpu_facts_keep_identity_and_partial_counter_failure() -> Result<(), String> {
-        let inventory = vec![kiln_gpu::Gpu { vendor: kiln_gpu::Vendor::Nvidia, model: "A100".into(), memory_total_bytes: 80 << 30, pci: kiln_gpu::PciAddress::parse("0000:01:00.0").ok_or("expected test value")?, driver_version: "550.54".into() }];
+        let inventory = vec![kiln_gpu::Gpu { vendor: kiln_gpu::Vendor::Nvidia, model: "A100".into(), memory_total_bytes: 80 << 30, identity: kiln_gpu::Identity::Pci(kiln_gpu::PciAddress::parse("0000:01:00.0").ok_or("expected test value")?), driver_version: "550.54".into() }];
         let cards = gpu_facts(&inventory, &[kiln_gpu::Load { busy_percent: Err(kiln_gpu::Unread::Unsupported), memory_used_bytes: Ok(12 << 30) }]);
         let a = cards.first().ok_or("expected test value")?;
         assert_eq!(a.busy_per_mille, None);
@@ -684,6 +668,19 @@ mod gpu_port_tests {
         let missing = gpu_facts(&inventory, &[]);
         assert_eq!(missing.first().ok_or("expected test value")?.memory, 80 << 30);
         assert_eq!(missing.first().ok_or("expected test value")?.memory_used, None);
+        Ok(())
+    }
+
+    #[test]
+    fn w13_r01_apple_facts_keep_full_registry_id_and_native_memory_budget() -> Result<(), String> {
+        let inventory = vec![kiln_gpu::Gpu { vendor: kiln_gpu::Vendor::Apple, model: "Apple GPU".into(), memory_total_bytes: 80 << 30, identity: kiln_gpu::Identity::Metal(u64::MAX), driver_version: "Darwin".into() }];
+        let cards = gpu_facts(&inventory, &[kiln_gpu::Load { busy_percent: Err(kiln_gpu::Unread::NoSample), memory_used_bytes: Ok(96 << 30) }]);
+        let card = cards.first().ok_or("expected Apple facts")?;
+        assert_eq!(card.vendor, "apple");
+        assert_eq!(card.id.as_deref(), Some("metal:18446744073709551615"));
+        assert_eq!(card.memory, 80 << 30, "Metal's working-set budget is not host RAM");
+        assert_eq!(card.memory_used, Some(96 << 30), "retain the actual allocation even above its budget");
+        assert_eq!(card.busy_per_mille, None, "a zero-tick window is not idle");
         Ok(())
     }
 }

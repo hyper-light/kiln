@@ -117,11 +117,12 @@ fn a_refusal_says_each_vendors_reason() {
     let none = NoGpus {
         nvidia: Absent::Nvml { code: 9 },
         amd: Absent::Unsupported,
+        apple: Absent::Unsupported,
     };
     assert_eq!(
         none.to_string(),
         "no GPU to read: NVIDIA: NVML refused: nvmlReturn_t 9 (NVIDIA's driver isn't loaded); AMD: \
-         this platform has no interface Hex reads for them"
+         this platform has no interface Hex reads for them; Apple: this platform has no interface Hex reads for them"
     );
     assert_eq!(
         Unread::Nvml { code: 777 }.to_string(),
@@ -135,4 +136,29 @@ fn a_refusal_says_each_vendors_reason() {
 fn gpus_go_to_the_probes_thread() {
     fn owned_or_shared_across_threads<T: Send + Sync>() {}
     owned_or_shared_across_threads::<Gpus>();
+}
+
+/// AC-T7.3.1: do carry native Metal IDs with the high bits set; expect every bit retained and no
+/// invented PCI address. PCI's existing domain32/bus8/device5/function3 representation is unchanged.
+#[test]
+fn identities_keep_native_bits_and_their_address_kind() {
+    let address = PciAddress::parse("ffffffff:ff:1f.7").unwrap();
+    let pci = Identity::Pci(address);
+    let metal = Identity::Metal(0xfedc_ba98_7654_3210);
+    assert_eq!(pci.key(), 0xffff_ffff_ffff);
+    assert_eq!(pci.pci(), Some(address));
+    assert_eq!(metal.key(), 0xfedc_ba98_7654_3210);
+    assert_eq!(metal.pci(), None);
+    assert_eq!(metal.to_string(), "metal:18364758544493064720");
+    let gpu = Gpu {
+        vendor: Vendor::Apple,
+        model: "native fixture".into(),
+        memory_total_bytes: 1,
+        identity: metal,
+        driver_version: "fixture release".into(),
+    };
+    assert_eq!(gpu.key(), metal.key());
+    assert_eq!(gpu.pci(), None);
+    // Keys alone do not erase the address kind even when their numeric parts coincide.
+    assert_ne!(pci, Identity::Metal(pci.key()));
 }

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use super::{Card, Found, Paths, open};
 use crate::tests::hostile;
-use crate::{Absent, Gpu, Load, PciAddress, Skipped, Unread, Vendor};
+use crate::{Absent, Gpu, Identity, Load, PciAddress, Skipped, Unread, Vendor};
 
 /// The head of libdrm 2.4.134's `amdgpu.ids` and two of its entries, as adacachy2 has them.
 const IDS: &str = "# List of AMDGPU IDs\n#\n# Syntax:\n# device_id,\trevision_id,\tproduct_name        <-- \
@@ -122,7 +122,7 @@ fn the_610m() -> Gpu {
         vendor: Vendor::Amd,
         model: "1002:13c0 rev e5".to_owned(),
         memory_total_bytes: 2_147_483_648,
-        pci: PciAddress::parse("0000:79:00.0").unwrap(),
+        identity: Identity::Pci(PciAddress::parse("0000:79:00.0").unwrap()),
         driver_version: "7.3.3-1-cachyos".to_owned(),
     }
 }
@@ -187,7 +187,7 @@ fn cards_are_listed_in_pci_order() {
     sysfs.card(1, "0000:03:00.0", "amdgpu", &RADEON_610M);
     let order: Vec<String> = listed(&open(&sysfs.paths()).unwrap())
         .iter()
-        .map(|g| g.pci.to_string())
+        .map(|g| g.pci().unwrap().to_string())
         .collect();
     assert_eq!(order, ["0000:03:00.0", "0000:c1:00.0"]);
 }

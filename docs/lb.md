@@ -833,11 +833,15 @@ other warm executors' GPUs held. Ordinary gang siblings share the remaining host
 A hosted pool's pod instead needs its own runner to report enough GPU capacity before a grant.
 These admission checks do not establish physical attachment or device isolation.
 
-`crates/kiln-gpu` is Hex's retained `hex-gpu` provider at the same pin, taken as kiln's own with
-an `ORIGIN.md`. It opens NVIDIA NVML, Linux AMD amdgpu counters and Windows AMD ADL once,
-then samples through retained handles, file descriptors and contexts. Ordinary samples start no
-subprocess, reload no library and walk no path. The native crate's sample API allocates nothing.
-macOS keeps its existing inventory reader and reports unsupported native counters explicitly.
+`crates/kiln-gpu` is Hex's retained provider, updated at fixed source
+`c2da38cc363e7d53f6df8fb82ab7bbda5e2f1efe`; `ORIGIN.md` and `HEX-SOURCE.json` retain provenance.
+It opens NVIDIA NVML, Linux AMD amdgpu counters and Windows AMD ADL once, then samples through
+retained handles, file descriptors and contexts. Apple Silicon uses native Metal identity and
+working-set budgets, exact-entry IOKit mapped allocations and IOReport GPU residency. The full
+Metal registry ID survives in the optional facts ID; it is scoped to the host boot. Apple's memory
+budget is not dedicated VRAM or host RAM, and observed allocations may exceed it. Missing or
+ambiguous counters remain unknown. Sampling starts no subprocess or periodic worker. Linux/Windows
+samples retain their allocation-free contract; Apple's native snapshots may allocate.
 No installed driver is redistributed or replaced.
 
 The same vendored libraries and recorded changes are built from kiln's tree:
@@ -846,8 +850,8 @@ The same vendored libraries and recorded changes are built from kiln's tree:
 - `all-smi` `fe479ae675e39475a2eab1cfbb3f5432f705e12b`: adapted amdgpu counter reader and AMD ADL types/sensors.
 
 Their licenses, `UPSTREAM.md` files and patches travel with them. `scripts/vendor.py check
-cuda-rust all-smi` verifies both. Native FFI remains in the two original reviewed `sys.rs`
-modules; scheduling contains none. Hex's original rationale and primary sources are retained in
+cuda-rust all-smi` verifies both. Native FFI remains in the retained NVML/ADL `sys.rs` modules and the ported
+Apple `sys.rs`; scheduling contains none. Hex's original rationale and primary sources are retained in
 [gpu-telemetry-origin.md](gpu-telemetry-origin.md).
 
 One retained facts value and one coalescing publisher handle full inventory probes and GPU-only

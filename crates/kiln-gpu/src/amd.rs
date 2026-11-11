@@ -13,7 +13,7 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use crate::{Absent, Gpu, Load, PciAddress, Skipped, Unread, Vendor};
+use crate::{Absent, Gpu, Identity, Load, PciAddress, Skipped, Unread, Vendor};
 
 /// The kernel's longest release (`__NEW_UTS_LEN`, include/uapi/linux/utsname.h) and its newline: an
 /// in-tree amdgpu's version is the kernel release, and a DKMS one's is shorter. A longer version is
@@ -116,7 +116,7 @@ pub(crate) fn open(at: &Paths) -> Result<Found, Absent> {
             Err(why) => skipped.push(Skipped::Drm { card, why }),
         }
     }
-    gpus.sort_by_key(|(gpu, _)| gpu.pci);
+    gpus.sort_by_key(|(gpu, _)| gpu.identity);
     Ok(Found { gpus, skipped })
 }
 
@@ -171,7 +171,7 @@ fn identify(
         vendor: Vendor::Amd,
         model: model(at.ids, device_id, revision),
         memory_total_bytes,
-        pci,
+        identity: Identity::Pci(pci),
         driver_version,
     };
     Ok((gpu, card))
