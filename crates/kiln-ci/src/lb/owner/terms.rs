@@ -159,7 +159,10 @@ impl Owner {
         }
         // W05-R26: create only the rate indexes this ask reads; a CPU measurement need not
         // prepay disk/link/network construction. Their first use pays the explicit build.
-        self.keep_orders([false, terms.io_bytes != 0, terms.bytes != 0, terms.net_bytes != 0]);
+        // Link quality also contributes latency/stability and a listed candidate's own
+        // missing bytes. Those dependencies remain even when the default transfer is zero.
+        let link = terms.bytes != 0 || terms.interactive || terms.warm.iter().any(|w| w.missing != 0);
+        self.keep_orders([false, terms.io_bytes != 0, link, terms.net_bytes != 0]);
         self.flush();
         self.clean();
         let si = sig.0;
