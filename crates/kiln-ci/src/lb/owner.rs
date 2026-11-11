@@ -1183,6 +1183,12 @@ impl Owner {
         }
     }
 
+    /// Kind `kind`'s good place now ([`Owner::won`]; `None`: none): for the shell to say why a run
+    /// went where it did.
+    pub fn good(&self, kind: KindId) -> Option<RunnerId> {
+        self.kinds.get(kind.0 as usize).map(|k| k.good).filter(|r| *r != NIL).map(RunnerId)
+    }
+
     /// Makes a record for kind `kind` when there is none. False: it names no kind.
     fn know(&mut self, kind: u32) -> bool {
         if kind >= NO_KIND {

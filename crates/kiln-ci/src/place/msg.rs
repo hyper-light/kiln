@@ -75,6 +75,33 @@ pub enum ToRunner {
     FastRelease { epoch: u32, amount: lb::Amounts },
 }
 
+/// How a run ended on its runner, as that runner's shell judges it when the run ends (docs/lb.md
+/// "Good places"): what its owner's kernel is told of the assignment. The shell has what the
+/// judgment needs (the run's exit, what it printed, what its OS counted while it ran:
+/// `sense::health`); the kernel only remembers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum How {
+    /// Nothing said: a runner from before this, a run said again after its link came back, or
+    /// one its shell doesn't judge.
+    #[default]
+    Unsaid,
+    /// It ran to its end and succeeded.
+    Well,
+    /// The node let it down: it couldn't start here, was lost, or ended of a cause that is the
+    /// machine's (no space, killed for memory, a tool that isn't here).
+    LetDown,
+    /// It failed and its shell knows no cause: the node's fault or the work's own, settled by
+    /// where its kind's next run goes and what becomes of it (`lb::Owner::unsure`).
+    Unsure,
+}
+
+impl How {
+    pub fn is_unsaid(&self) -> bool {
+        *self == How::Unsaid
+    }
+}
+
 fn is_zero(x: &i64) -> bool {
     *x == 0
 }
@@ -151,8 +178,17 @@ pub enum ToOwner {
     /// The kernel's start wasn't taken, why, and the room here for a new run: its owner places it
     /// again by that room, or hands it to probing (docs/lb.md, "Off the fast path").
     FastDeclined { run: String, kernel: FastHandle, why: FastWhy, word: FastWord },
-    /// A run the kernel started here ended (`ok`: its process exited), and the room left.
-    FastEnded { run: String, kernel: FastHandle, ok: bool, word: FastWord },
+    /// A run the kernel started here ended (`ok`: its process exited), and the room left. `how`:
+    /// its shell's judgment of how it ended. Appended: optional, nothing said by a runner from
+    /// before it.
+    FastEnded {
+        run: String,
+        kernel: FastHandle,
+        ok: bool,
+        word: FastWord,
+        #[serde(default, skip_serializing_if = "How::is_unsaid")]
+        how: How,
+    },
     /// Every run of yours this runner holds a record of was said again since your `Sync` (W05-R25,
     /// LB03). Any other you had here it never started if its claim's epoch is `since` or later
     /// (the first of this runner's epochs whose records it keeps on its disk), and isn't known
@@ -345,7 +381,7 @@ pub enum Up {
     Ended { fence: Fence, ok: bool },
     FastStarted { kernel: lb::Handle, at: lb::Handle, word: FastWord },
     FastDeclined { kernel: lb::Handle, why: lb::Why, word: FastWord },
-    FastEnded { kernel: lb::Handle, ok: bool, word: FastWord },
+    FastEnded { kernel: lb::Handle, ok: bool, word: FastWord, how: How },
     /// [`ToOwner::Synced`]: about no run (its run is empty).
     Synced { ended: u32, since: Option<u64> },
     /// [`ToOwner::FastHint`]: about no run (its run is empty).
@@ -367,7 +403,7 @@ impl Up {
             Up::Ended { fence, ok } => ToOwner::Ended { run, fence, ok },
             Up::FastStarted { kernel, at, word } => ToOwner::FastStarted { run, kernel: FastHandle::of(kernel), at: FastHandle::of(at), word },
             Up::FastDeclined { kernel, why, word } => ToOwner::FastDeclined { run, kernel: FastHandle::of(kernel), why: FastWhy::of(why), word },
-            Up::FastEnded { kernel, ok, word } => ToOwner::FastEnded { run, kernel: FastHandle::of(kernel), ok, word },
+            Up::FastEnded { kernel, ok, word, how } => ToOwner::FastEnded { run, kernel: FastHandle::of(kernel), ok, word, how },
             Up::Synced { ended, since } => ToOwner::Synced { ended, since },
             Up::FastHint { word } => ToOwner::FastHint { word },
         }
@@ -389,7 +425,7 @@ impl ToOwner {
             ToOwner::Ended { run, fence, ok } => (run, Up::Ended { fence, ok }),
             ToOwner::FastStarted { run, kernel, at, word } => (run, Up::FastStarted { kernel: kernel.handle(), at: at.handle(), word }),
             ToOwner::FastDeclined { run, kernel, why, word } => (run, Up::FastDeclined { kernel: kernel.handle(), why: why.why(), word }),
-            ToOwner::FastEnded { run, kernel, ok, word } => (run, Up::FastEnded { kernel: kernel.handle(), ok, word }),
+            ToOwner::FastEnded { run, kernel, ok, word, how } => (run, Up::FastEnded { kernel: kernel.handle(), ok, word, how }),
             ToOwner::Synced { ended, since } => (String::new(), Up::Synced { ended, since }),
             ToOwner::FastHint { word } => (String::new(), Up::FastHint { word }),
         }

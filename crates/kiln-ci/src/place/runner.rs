@@ -57,7 +57,7 @@ use super::ask::{self, Amounts, Ask, Peer, Sample};
 use super::keys::{FxMap, Interner};
 use super::line::{Item, Key, Line, Query};
 use super::link::Rtt;
-use super::msg::{Estimate, Place, Reason, ToOwner, Up, shortfall};
+use super::msg::{Estimate, How, Place, Reason, ToOwner, Up, shortfall};
 use crate::lb;
 use crate::facts::RunnerFacts;
 use crate::sched::routing::Constraint;
@@ -2151,6 +2151,11 @@ impl Admission {
         self.wire(out, |a, r| a.ended_r(from, run, ok, now, r));
     }
 
+    /// [`Self::ended`] with its shell's judgment of how the run ended (docs/lb.md "Good places").
+    pub fn ended_as(&mut self, from: Peer<'_>, run: &str, ok: bool, how: How, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.ended_as_r(from, run, ok, how, now, r));
+    }
+
     pub fn measured(&mut self, sample: Sample, now: i64, out: &mut Vec<Said>) {
         self.wire(out, |a, r| a.measured_r(sample, now, r));
     }
@@ -2478,7 +2483,8 @@ impl Admission {
         }
         if let Some(r) = self.record(from.name, from.epoch, &ask.run) {
             let msg = match r.ended {
-                Some(ok) => Up::FastEnded { kernel, ok, word: self.fast_word_for(o) },
+                // Said again as its link came back: its shell's judgment isn't kept with its record.
+                Some(ok) => Up::FastEnded { kernel, ok, word: self.fast_word_for(o), how: How::Unsaid },
                 None => Up::Ran,
             };
             out.push(Reply { owner: o, token, run, msg });
@@ -2741,15 +2747,21 @@ impl Admission {
     /// A run it started ended (`ok`: its process exited; not: it couldn't start, or was lost): its
     /// room is free in the same input, its tenant charged what it ran, and its owner told.
     pub fn ended_r(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Reply>) {
+        self.ended_as_r(from, run, ok, How::Unsaid, now, out);
+    }
+
+    /// [`Self::ended_r`] with its shell's judgment of how the run ended: said to its owner with
+    /// a kernel run's end, and of no other (a claim's end is answered as before).
+    pub fn ended_as_r(&mut self, from: Peer<'_>, run: &str, ok: bool, how: How, now: i64, out: &mut Vec<Reply>) {
         let mark = out.len();
         self.begin(now, out);
-        self.ended_in(from, run, ok, now, out);
+        self.ended_in(from, run, ok, how, now, out);
         self.close(now);
         self.fresh_words(out.get_mut(mark..).unwrap_or_default());
         self.tokens_out(out);
     }
 
-    fn ended_in(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Reply>) {
+    fn ended_in(&mut self, from: Peer<'_>, run: &str, ok: bool, how: How, now: i64, out: &mut Vec<Reply>) {
         let Some(s) = self.find(from, run) else { return };
         let Some(State::Running { fence, .. }) = self.state(s) else { return };
         // From its dispatch, as the engine settles a grant.
@@ -2767,8 +2779,8 @@ impl Admission {
         self.drop_probe(s);
         if let Some((owner, token, run)) = to {
             let msg = match (kernel, ended) {
-                (Some(kernel), Some(word)) => Up::FastEnded { kernel, ok, word: super::msg::FastWord::of(&word, self.fast.budget()) },
-                (Some(kernel), None) => Up::FastEnded { kernel, ok, word: self.fast_word() },
+                (Some(kernel), Some(word)) => Up::FastEnded { kernel, ok, word: super::msg::FastWord::of(&word, self.fast.budget()), how },
+                (Some(kernel), None) => Up::FastEnded { kernel, ok, word: self.fast_word(), how },
                 _ => Up::Ended { fence, ok },
             };
             out.push(Reply { owner, token, run, msg });

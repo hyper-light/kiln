@@ -56,7 +56,7 @@ use super::answer::{self, Answer, At, Count, Nearest};
 use super::ask::{Ask, Peer};
 use super::keys::{Fx, FxMap, Interner, SplitMix};
 use super::link::{Offset, Rtt};
-use super::msg::{Dim, Down, Estimate, Place, Reason, ToOwner, ToRunner, Up};
+use super::msg::{Dim, Down, Estimate, How, Place, Reason, ToOwner, ToRunner, Up};
 use super::msg::FastWord;
 use super::runner::Settings;
 use crate::facts::RunnerFacts;
@@ -318,6 +318,9 @@ struct Ticket {
     /// How many runs the auction started together with it in its step, it among them (0: not
     /// placed by the auction): what its answer says of why it went there (LB08).
     joint: u32,
+    /// The kernel sent it back to where its kind of work last went well (docs/lb.md "Good
+    /// places"): what its answer says of why it went there.
+    back: bool,
 }
 
 /// How a ticket's first probes were drawn (docs/lb.md "Learned wait weights"; LB08).
@@ -474,6 +477,11 @@ struct Fast {
     /// (docs/lb.md "Room tokens"; LB08), by handle: the kernel epoch it said so in. Of that epoch
     /// its hints' word (the room every owner hears) isn't this owner's, and isn't taken.
     tokens: Vec<Option<u32>>,
+    /// Good places (docs/lb.md): whether a run goes back to where its kind of work last went
+    /// well ([`Owner::set_good_places`]; off until its shell turns it on), and each kind of
+    /// work's number in the kernel, by the ask's key (`cmd:…`, `leg:…`, `session:…`).
+    places: bool,
+    kinds: FxMap<String, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -486,7 +494,7 @@ struct FastSig {
 
 impl Default for Fast {
     fn default() -> Self {
-        Fast { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), joined: Vec::new(), era: 0, sigs: FxMap::default(), by_slot: Vec::new(), tokens: Vec::new() }
+        Fast { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), joined: Vec::new(), era: 0, sigs: FxMap::default(), by_slot: Vec::new(), tokens: Vec::new(), places: false, kinds: FxMap::default() }
     }
 }
 
@@ -626,6 +634,14 @@ impl Owner {
         // the kernel's waits are probing's here, so the draws this seeds decide nothing.
         fast.lb.set_tokens(true, seed);
         Owner { me: me.to_owned(), epoch, rng: SplitMix(seed), fast, ..Owner::default() }
+    }
+
+    /// Whether a run the kernel places goes back to where its kind of work last went well, when
+    /// that runner is among the best by rank, and passes over the runner that last let that kind
+    /// down (docs/lb.md "Good places"). Off until the shell turns it on (its setting): what kiln
+    /// decides on its own is declared, and a run's answer says when it was why.
+    pub fn set_good_places(&mut self, on: bool) {
+        self.fast.places = on;
     }
 
     /// [`Self::seeded`] with seed 0, for tests and tools: a shell passes its own.
@@ -1576,6 +1592,7 @@ impl Owner {
             fast: None,
             drawn: Drawn::Random,
             joint: 0,
+            back: false,
         };
         let t = match self.spare.pop() {
             Some(t) => {
@@ -2011,6 +2028,7 @@ impl Owner {
             second: None,
             drawn: Drawn::Random,
             joint: 0,
+            back: false,
         };
         let t = match self.spare.pop() {
             Some(t) => {
@@ -2251,6 +2269,7 @@ impl Owner {
             fast: None,
             drawn: Drawn::Random,
             joint: 0,
+            back: false,
         };
         let t = match self.spare.pop() {
             Some(t) => {
@@ -2668,10 +2687,29 @@ impl Owner {
         Some((self.fast_sig(suit_key(&ask), &suit), super::ask::amounts(&ask.needs.request)))
     }
 
+    /// Ticket `t`'s kind of work in the kernel: its ask's key's number, given at its first run
+    /// (docs/lb.md "Good places"). None while good places are off, or for an ask with no key.
+    fn fast_kind_of(&mut self, t: Tid) -> lb::KindId {
+        if !self.fast.places {
+            return lb::KindId::NONE;
+        }
+        let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return lb::KindId::NONE };
+        let Some(key) = ask.key.as_deref() else { return lb::KindId::NONE };
+        if let Some(k) = self.fast.kinds.get(key) {
+            return lb::KindId(*k);
+        }
+        let Ok(k) = u32::try_from(self.fast.kinds.len()) else { return lb::KindId::NONE };
+        self.fast.kinds.insert(key.to_owned(), k);
+        // Its record is made now, as it is numbered: not on an end or a decision.
+        self.fast.lb.kinds(k.saturating_add(1));
+        lb::KindId(k)
+    }
+
     /// The kernel's pick for ticket `t`, of signature `sig` needing `need`: started on a member
     /// with room now, its start that member's alone. False: none has room, and probing places it.
     fn fast_ask(&mut self, t: Tid, sig: lb::SigId, need: lb::Amounts, out: &mut Vec<Cmd>) -> bool {
         self.fast.out.clear();
+        let mut good = None;
         let asked = if need[3] > 0 {
             let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return false };
             let slots = &self.slots;
@@ -2680,11 +2718,18 @@ impl Owner {
                 crate::sched::gpu::rank(&ask.needs, &m.facts, &m.labels, free[3])
             }, &mut self.fast.out)
         } else {
-            self.fast.lb.ask(sig, need, &mut self.fast.out)
+            // Its kind of work goes back to where it last went well, between members the rank
+            // can't tell apart (docs/lb.md "Good places").
+            let kind = self.fast_kind_of(t);
+            good = self.fast.lb.good(kind);
+            self.fast.lb.ask_kind(sig, kind, need, &mut self.fast.out)
         };
         self.fast.out.clear();
         match asked {
             Ok(lb::Asked { run, send: Some((r, lb::ToRunner::Start(st))) }) => {
+                if let Some(tk) = self.t_mut(t) {
+                    tk.back = good == Some(r);
+                }
                 self.fast_go(t, run, r.0, st.epoch, out);
                 true
             }
@@ -2746,10 +2791,14 @@ impl Owner {
     /// place any more goes to probing with the same ask (W05-R16).
     fn fast_heard(&mut self, r: Rid, run_id: &Arc<str>, msg: Up, now: i64, out: &mut Vec<Cmd>) {
         let runner = lb::RunnerId(r);
+        let mut said = How::Unsaid;
         let (word, heard, ok, kernel) = match msg {
             Up::FastStarted { kernel, at, word } => (word, lb::ToOwner::Started { runner, run: kernel, at, word: word.word() }, None, Some(kernel)),
             Up::FastDeclined { kernel, why, word } => (word, lb::ToOwner::Declined { runner, run: kernel, word: word.word(), why, of: lb::Of::Start }, None, Some(kernel)),
-            Up::FastEnded { kernel, ok, word } => (word, lb::ToOwner::Ended { runner, run: kernel, word: word.word() }, Some(ok), Some(kernel)),
+            Up::FastEnded { kernel, ok, word, how } => {
+                said = how;
+                (word, lb::ToOwner::Ended { runner, run: kernel, word: word.word() }, Some(ok), Some(kernel))
+            }
             // Its word to this owner alone, under room tokens (docs/lb.md "Room tokens"; LB08):
             // heard as a hint is, about no run.
             Up::FastHint { word } => (word, lb::ToOwner::Hint { runner, word: word.word() }, None, None),
@@ -2767,9 +2816,22 @@ impl Owner {
             self.fast_join(r, &word);
         }
         let ticket = kernel.and_then(|k| self.fast_tid(k));
+        // Its kind of work, before the kernel hears the end and its ticket is done with.
+        let kind = match (said, ticket) {
+            (How::Unsaid, _) | (_, None) => lb::KindId::NONE,
+            (_, Some(t)) => self.fast_kind_of(t),
+        };
         let mut lbo = std::mem::take(&mut self.fast.out);
         lbo.clear();
         let told = self.fast.lb.hear(heard, &mut lbo);
+        // What its runner's shell says of how it ended, said to the kernel right after the end
+        // (docs/lb.md "Good places"): the judgment is made as a run ends, never while deciding.
+        match said {
+            How::Well => self.fast.lb.won(runner, kind),
+            How::LetDown => self.fast.lb.failed(runner, kind),
+            How::Unsure => self.fast.lb.unsure(runner, kind),
+            How::Unsaid => {}
+        }
         let news: Vec<lb::Told> = told.into_iter().chain(lbo.told.drain(..)).collect();
         let mut starts: Vec<(Rid, lb::Start)> = Vec::new();
         let mut releases: Vec<(Rid, u32, lb::Amounts)> = Vec::new();
@@ -2822,7 +2884,7 @@ impl Owner {
                 }
                 tk.stage = Stage::Running { fence: Some(fence) };
                 let (g, free) = tk.got.unwrap_or_default();
-                let joint = tk.joint;
+                let (joint, back) = (tk.joint, tk.back);
                 let name = self.name(runner.0);
                 // Kept as it runs (LB03): a restart holds it where it started, never starts it again.
                 self.keep(t);
@@ -2830,6 +2892,7 @@ impl Owner {
                 self.charge_started(t, runner.0, now);
                 // What kiln decided on its own says why (docs/ci.md §0.3): the auction, if it did.
                 let why = match joint {
+                    0 if back => format!("its kind of work last went well there, and no runner was freer; room for it there: {} free", words(&free)),
                     0 => format!("room for it there: {} free", words(&free)),
                     1 => format!("the auction put it there, the one run of those asked with it there was room for now; room for it there: {} free", words(&free)),
                     n => format!("the auction put it there with {} others asked with it, where their expected finishes total least; room for it there: {} free", n - 1, words(&free)),
