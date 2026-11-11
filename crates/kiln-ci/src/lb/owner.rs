@@ -700,6 +700,20 @@ impl Owner {
             }
             return self.ask_wide(si, cpu);
         }
+        if self.pend.r < MANY {
+            // A runner's rise is put off and it isn't alone as the most free: out of this
+            // dispatcher, so the picks that have none put off, and a measured or shared fleet's,
+            // pay for no frame of its.
+            return self.ask_tied(si, cpu);
+        }
+        self.flush();
+        self.ask_top(si, cpu)
+    }
+
+    /// The pick with a runner's rise put off that [`Owner::ask_fast`] didn't take: tied at the
+    /// top ([`Owner::ask_turn`]), or else its move made and the top bucket's next in turn taken.
+    #[inline(never)]
+    fn ask_tied(&mut self, si: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
         if let Some(picked) = self.ask_turn(si, cpu) {
             return Some(picked);
         }
