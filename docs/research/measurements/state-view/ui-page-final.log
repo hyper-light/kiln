@@ -1,0 +1,39 @@
+✔ W21-R02 an indexed event reader exposes published frames and preserves unrelated identities (3.732042ms)
+✔ live history stays bounded and retained events still update in place (9.154333ms)
+✔ a previous connection's unpack cannot let text overtake a new snapshot (8.681208ms)
+✔ a reconnect resumes from what's shown, a resume adds to it, a snapshot replaces it (1.752417ms)
+✔ cached resources do not process live events while nothing shows them (305.088292ms)
+✔ what of its messages was refused comes with its events, on the socket it has: no new snapshot, no reload (0.793125ms)
+✔ a message's id is a UUIDv7 made once: 32 hex digits, its time first, and never another's (CP-T3.2) (24.045291ms)
+✔ a changeset comes whole, then as what changed in it, taken in place in the server's order (0.683125ms)
+✔ W21-R02: data-only prefetch closes at a complete snapshot, sends no commands, and expires without reviving (0.318875ms)
+✔ W21-R02: acquiring a prefetched store promotes before a child can suspend; late hover cancellation cannot close it (0.475292ms)
+✔ W21-R02: a completed prefetched snapshot promotes into normal revision resume, with no history truncation (0.753417ms)
+✔ W21-R02: speculative text uses a UTF-8 byte budget and rejects before parsing oversized frames (0.100916ms)
+✔ W21-R02: speculative gzip expansion is stopped while decoding, before parsing an expanded snapshot (0.613167ms)
+✔ W21-R02: queued packed frames are bounded even while the first decoder is blocked (0.460583ms)
+✔ W21-R02: auth loss clears private stores and commands, and late packed frames or wakeups cannot restore them (0.836ms)
+✔ events about a session don't connect a socket that just died again at once, each its own snapshot (0.3945ms)
+✔ an event about a session taken as gone connects it at once: its machine came back (0.485708ms)
+✔ W20: bounded status recovers on an open socket while the queue stays deferred (0.872583ms)
+✔ W20: one field page replaces its predecessor and ignores superseded reads (0.532792ms)
+✔ W20: paged queue edits carry a revision and stale refusals stay in place (0.806792ms)
+✔ W20: unrelated status changes preserve a queue page and its in-flight read (0.783833ms)
+✔ W20: bounded queue metadata acknowledges listed messages without losing unseen ones (0.793458ms)
+✔ W20: a complete small state preserves ordinary queue data and command behavior (0.291542ms)
+✔ W20: projected empty arrays remain deferred and counts come from the owner (0.508709ms)
+✔ W20: state pages reject a stale response and preserve bounded node references (0.328125ms)
+✔ W20: queue pages use absolute indexes and partial rows never become editable text (0.318958ms)
+✔ W20: editing a paged message requires the owner's revision fence (0.058625ms)
+✔ W20: a partial queue index proves only the entries actually supplied (0.165625ms)
+✔ W20: complete deferred approval items keep exact request data while previews remain inert (0.542917ms)
+✔ W20: deferred task items retain typed stop identity only while their source page is current (0.221792ms)
+✔ W20: approval actions cannot survive an approval-field revision or path change (0.090709ms)
+ℹ tests 31
+ℹ suites 0
+ℹ pass 31
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 652.704334

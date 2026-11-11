@@ -901,6 +901,8 @@ impl Claude {
                 self.run(core, Run::McpRemove { name, client }, a);
             }
             Command::SkillView { name, client } => self.skill_view(core, &name, client),
+            Command::StateRead { client, .. } => core.reply(client, json!({"error": {"code": super::state_view::Error::Unreadable}})),
+            Command::AtState { client, .. } => core.reply(client, json!({"error": {"code": super::state_view::Error::Unreadable}})),
             Command::SkillRun { name, args, id, mode } => {
                 let name = name.trim().trim_start_matches('/').to_owned();
                 if name.is_empty() {

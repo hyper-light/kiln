@@ -572,3 +572,202 @@ await test("an event about a session taken as gone connects it at once: its mach
     off();
   }
 });
+
+const boundedView = (queueRevision: string, revision = queueRevision) => ({
+  revision,
+  revisions: { queue: queueRevision },
+  deferred: { queue: { kind: "array", len: 564 } },
+  counts: { queue: 564, approvals: 0, tasks: 0, tasks_running: 0, todos: 0, todos_done: 0 },
+});
+
+await test("W20: bounded status recovers on an open socket while the queue stays deferred", async () => {
+  const store = new SessionStore("bounded-status");
+  const off = store.subscribe(() => {});
+  const ws = Socket.all.at(-1)!;
+  try {
+    ws.frame({ t: "open", info: { id: store.id, status: "disconnected" } });
+    ws.frame({ t: "state", state: { ...state, status: "disconnected", queue: [] } });
+    ws.frame({ t: "synced" });
+    await tick();
+    ws.frame({ t: "state", state: { ...state, status: "idle", queue: [], view: boundedView("r1") } });
+    await tick();
+    assert.equal(store.get().state?.status, "idle");
+    assert.equal(store.get().info?.status, "idle");
+    assert.equal(store.get().conn, "open");
+    const read = store.readState("queue");
+    const command = JSON.parse(ws.sent.at(-1)!);
+    assert.equal(command.c.type, "state_read");
+    assert.equal(command.c.read.revision, "r1");
+    ws.frame({
+      t: "reply",
+      client: command.c.client,
+      value: { result: { type: "page", revision: "r1", entries: [{ key: { type: "index", index: 0 }, value: { id: "q0", text: "complete", at: 1 } }], next: 1 } },
+    });
+    await read;
+    assert.equal(store.get().statePages.queue?.phase, "ready");
+    assert.deepEqual(store.get().state?.queue, [], "a page never accumulates into the control state");
+  } finally {
+    store.dispose();
+    off();
+  }
+});
+
+await test("W20: one field page replaces its predecessor and ignores superseded reads", async () => {
+  const store = new SessionStore("bounded-page");
+  const off = store.subscribe(() => {});
+  const ws = Socket.all.at(-1)!;
+  try {
+    for (const frame of snapshot(store.id, [])) ws.frame(frame);
+    ws.frame({ t: "state", state: { ...state, queue: [], view: boundedView("r1") } });
+    await tick();
+    const first = store.readState("queue");
+    const firstCommand = JSON.parse(ws.sent.at(-1)!).c;
+    const second = store.readState("queue", [], 40);
+    const secondCommand = JSON.parse(ws.sent.at(-1)!).c;
+    ws.frame({
+      t: "reply",
+      client: secondCommand.client,
+      value: { result: { type: "page", revision: "r1", entries: [{ key: { type: "index", index: 40 }, value: { id: "q40", text: "later", at: 1 } }], next: 41 } },
+    });
+    await second;
+    ws.frame({
+      t: "reply",
+      client: firstCommand.client,
+      value: { result: { type: "page", revision: "r1", entries: [{ key: { type: "index", index: 0 }, value: { id: "q0", text: "earlier", at: 1 } }] } },
+    });
+    await first;
+    assert.equal(store.get().statePages.queue?.read.offset, 40);
+    assert.equal(Object.keys(store.get().statePages).length, 1);
+    const third = store.readState("queue", [], 41);
+    const thirdCommand = JSON.parse(ws.sent.at(-1)!).c;
+    ws.frame({ t: "state", state: { ...state, queue: [], view: boundedView("r2") } });
+    await tick();
+    ws.frame({ t: "reply", client: thirdCommand.client, value: { result: { type: "page", revision: "r1", entries: [] } } });
+    await third;
+    assert.deepEqual(store.get().statePages, {}, "a stale page cannot join a newer projection");
+  } finally {
+    store.dispose();
+    off();
+  }
+});
+
+await test("W20: paged queue edits carry a revision and stale refusals stay in place", async () => {
+  const store = new SessionStore("bounded-edit");
+  const off = store.subscribe(() => {});
+  const ws = Socket.all.at(-1)!;
+  try {
+    for (const frame of snapshot(store.id, [])) ws.frame(frame);
+    ws.frame({ t: "state", state: { ...state, queue: [], view: boundedView("r1") } });
+    await tick();
+    const read = store.readState("queue");
+    const command = JSON.parse(ws.sent.at(-1)!).c;
+    ws.frame({ t: "reply", client: command.client, value: { result: { type: "page", revision: "r1", entries: [{ key: { type: "index", index: 0 }, value: { id: "q", text: "full", at: 1 } }] } } });
+    await read;
+    const edit = store.changeState("queue", { type: "queue_edit", id: "q", text: "changed" });
+    const mutation = JSON.parse(ws.sent.at(-1)!).c;
+    assert.equal(mutation.type, "at_state");
+    assert.equal(mutation.revision, "r1");
+    assert.deepEqual(mutation.command, { type: "queue_edit", id: "q", text: "changed" });
+    ws.frame({ t: "reply", client: mutation.client, value: { error: { code: "stale" } } });
+    await edit;
+    assert.equal(store.get().statePages.queue?.phase, "error");
+    assert.match(store.get().statePages.queue?.error ?? "", /changed/);
+    const pending = store.readState("queue");
+    store.dispose();
+    await pending;
+    assert.deepEqual(store.get().statePages, {}, "disposal releases pages and pending readers");
+  } finally {
+    store.dispose();
+    off();
+  }
+});
+
+await test("W20: unrelated status changes preserve a queue page and its in-flight read", async () => {
+  const store = new SessionStore("field-revision");
+  const off = store.subscribe(() => {});
+  const ws = Socket.all.at(-1)!;
+  try {
+    for (const frame of snapshot(store.id, [])) ws.frame(frame);
+    ws.frame({ t: "state", state: { ...state, queue: [], view: boundedView("queue-1", "global-1") } });
+    await tick();
+    const first = store.readState("queue");
+    const command = JSON.parse(ws.sent.at(-1)!).c;
+    ws.frame({ t: "state", state: { ...state, status: "idle", queue: [], usage: { output_tokens: 20 }, view: boundedView("queue-1", "global-2") } });
+    await tick();
+    ws.frame({
+      t: "reply",
+      client: command.client,
+      value: { result: { type: "page", revision: "queue-1", entries: [{ key: { type: "index", index: 0 }, value: { id: "q", text: "unchanged", at: 1 } }] } },
+    });
+    await first;
+    const held = store.get().statePages.queue;
+    assert.equal(held?.phase, "ready");
+    ws.frame({ t: "state", state: { ...state, status: "running", queue: [], view: boundedView("queue-1", "global-3") } });
+    await tick();
+    assert.equal(store.get().statePages.queue, held);
+    ws.frame({ t: "state", state: { ...state, queue: [], view: boundedView("queue-2", "global-4") } });
+    await tick();
+    assert.equal(store.get().statePages.queue, undefined, "changing queue contents invalidates only its field page");
+  } finally {
+    store.dispose();
+    off();
+  }
+});
+
+await test("W20: bounded queue metadata acknowledges listed messages without losing unseen ones", async () => {
+  const store = new SessionStore("partial-index");
+  const off = store.subscribe(() => {});
+  const ws = Socket.all.at(-1)!;
+  try {
+    for (const frame of snapshot(store.id, [])) ws.frame(frame);
+    await tick();
+    store.send({ type: "send", id: "listed", text: "one", mode: "queue", attachments: [] });
+    store.send({ type: "send", id: "not-listed", text: "two", mode: "queue", attachments: [] });
+    ws.frame({ t: "state", state: { ...state, queue: [], view: { ...boundedView("queue-1"), queue_index: { entries: [{ id: "listed", digest: "abc", len: 3 }], complete: false, next: 1 } } } });
+    await tick();
+    assert.deepEqual(
+      store.get().outgoing.map((m) => m.id),
+      ["not-listed"],
+    );
+    ws.frame({ t: "state", state: { ...state, queue: [], view: { ...boundedView("queue-1"), queue_index: { entries: [], complete: false, next: 0 } } } });
+    await tick();
+    assert.deepEqual(
+      store.get().outgoing.map((m) => m.id),
+      ["not-listed"],
+      "an incomplete index's missing id does not drop or fail a message",
+    );
+    const read = store.readState("$queue_index", [{ type: "id", id: "not-listed" }]);
+    const command = JSON.parse(ws.sent.at(-1)!).c;
+    assert.deepEqual(command.read.path, [{ type: "id", id: "not-listed" }]);
+    assert.equal(command.read.revision, "queue-1");
+    ws.frame({ t: "reply", client: command.client, value: { result: { type: "value", revision: "queue-1", value: { id: "not-listed", digest: "def", len: 3 } } } });
+    await read;
+    assert.deepEqual(store.get().outgoing, [], "an exact index lookup is positive delivery evidence");
+  } finally {
+    store.dispose();
+    off();
+  }
+});
+
+await test("W20: a complete small state preserves ordinary queue data and command behavior", async () => {
+  const store = new SessionStore("small-state");
+  const off = store.subscribe(() => {});
+  const ws = Socket.all.at(-1)!;
+  try {
+    for (const frame of snapshot(store.id, [])) ws.frame(frame);
+    const queue = [{ id: "small", text: "complete text", at: 1 }];
+    const view = { ...boundedView("queue-1"), deferred: {}, counts: { queue: 1, approvals: 0, tasks: 0, tasks_running: 0, todos: 0, todos_done: 0 } };
+    ws.frame({ t: "state", state: { ...state, queue, approvals: [], view } });
+    await tick();
+    assert.deepEqual(store.get().state?.queue, queue);
+    assert.deepEqual(store.get().statePages, {});
+    const before = ws.sent.length;
+    await store.readState("queue");
+    assert.equal(ws.sent.length, before, "ordinary inline data needs no paging request");
+    store.send({ type: "queue_edit", id: "small", text: "edit" });
+    assert.equal(JSON.parse(ws.sent.at(-1)!).c.type, "queue_edit", "ordinary typed actions retain their existing protocol");
+  } finally {
+    store.dispose();
+    off();
+  }
+});

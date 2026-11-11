@@ -566,7 +566,13 @@ where
 /// before this one left waiting (`queued::from_before`) is the one waiting.
 fn waiting_word(info: Option<&Info>, agent: &str, text: &str, now: i64) -> Option<(String, bool)> {
     let mut said = SAID.lock();
-    let w = said.get_mut(agent).and_then(|w| (w.msg.look(info, now) == Now::Waiting).then(|| (w.msg.id.clone(), w.msg.text == text)));
+    let w = said.get_mut(agent).and_then(|w| match w.msg.look(info, now) {
+        Now::Waiting => Some((w.msg.id.clone(), w.msg.text == text)),
+        // Missing from a partial index is not a new-word opportunity. An edit retains the id;
+        // the production resay pass resolves presence before replacing a word.
+        Now::Unknown => Some((w.msg.id.clone(), false)),
+        Now::Gone => None,
+    });
     if w.is_none() {
         said.remove(agent);
     }
@@ -652,11 +658,28 @@ where
             info.map(|i| (a, i))
         })
         .collect();
+    let mut observed = Vec::new();
+    if let Some(hub) = hub {
+        for (agent, info) in &infos {
+            let message = SAID.lock().get(agent).map(|w| w.msg.id.clone());
+            if let Some(message) = message.filter(|id| info.queue_partial && !info.queue.iter().any(|q| &q.id == id) && !info.said.iter().any(|q| &q.id == id))
+                && let Ok(found) = crate::harness::state_reads::lookup(hub, agent, info, &message).await
+            {
+                observed.push((agent.clone(), message, found));
+            }
+        }
+    }
     let lost: Vec<(String, Word)> = {
         let mut said = SAID.lock();
         let mut lost = Vec::new();
         for (agent, info) in &infos {
-            if said.get_mut(agent).is_some_and(|w| w.msg.look_heard(Some(&**info), now) == Now::Gone)
+            if said.get_mut(agent).is_some_and(|w| {
+                let known = observed.iter().find(|(a, message, _)| a == agent && message == &w.msg.id);
+                match known {
+                    Some((_, _, found)) => w.msg.look_heard_known(info, found.as_ref(), now) == Now::Gone,
+                    None => w.msg.look_heard(Some(&**info), now) == Now::Gone,
+                }
+            })
                 && let Some(w) = said.remove(agent)
                 && w.msg.lost()
             {
@@ -2078,11 +2101,33 @@ async fn send_id_through(store: &crate::store::Store, item: &str, word: &str) ->
 /// The id a goal's message `c` goes under to `agent`, and the stack's word waiting it goes through
 /// (`say_with`): through a word waiting, that word's id ([`send_id_through`]); else the goal's own
 /// ([`send_id`]).
-async fn goal_message<P>(store: &crate::store::Store, port: &P, agent: &str, item: &str, c: &Command, now: i64) -> anyhow::Result<(String, Option<Info>, Option<(String, bool)>)>
+async fn goal_message<P>(store: &crate::store::Store, port: &P, hub: Option<&Hub>, agent: &str, item: &str, c: &Command, now: i64) -> anyhow::Result<(String, Option<Info>, Option<(String, bool)>)>
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
     let info = port.agent(agent);
+    if let (Command::Send { text, .. }, Some(info)) = (c, info.as_ref())
+        && info.queue_partial
+    {
+        let hub = hub.ok_or_else(|| anyhow::anyhow!("the partial queue's owner is unavailable to establish its waiting goal word"))?;
+        let tracked = SAID.lock().get(agent).map(|w| w.msg.id.clone());
+        if let Some(message) = tracked.filter(|id| !info.queue.iter().any(|q| &q.id == id)) {
+            let found = crate::harness::state_reads::lookup(hub, agent, info, &message).await.map_err(|e| anyhow::anyhow!("the queue's owner could not establish its waiting goal word: {e:?}"))?;
+            let mut said = SAID.lock();
+            if let Some(word) = said.get_mut(agent).filter(|w| w.msg.id == message)
+                && word.msg.look_known(info, found.as_ref(), now) == Now::Gone
+            {
+                said.remove(agent);
+            }
+        }
+        if !SAID.lock().contains_key(agent) {
+            let found = crate::harness::state_reads::first(hub, agent, info, |q| crate::harness::queued::from_before(&q.id, GOAL)).await.map_err(|e| anyhow::anyhow!("the queue's owner could not establish prior goal words: {e:?}"))?;
+            if let Some(q) = found {
+                let holds = if q.digest == crate::harness::queued::digest(text) { text.clone() } else { String::new() };
+                SAID.lock().insert(agent.to_owned(), Word { msg: Kept::found(q.id, holds, now), item: None });
+            }
+        }
+    }
     let waiting = match c {
         Command::Send { text, .. } => waiting_word(info.as_ref(), agent, text, now),
         _ => None,
@@ -3283,7 +3328,7 @@ where
             let how = how(port, agent);
             let stopped = info.as_ref().is_some_and(|i| i.status == Status::Exited);
             let c = first_command(how, &text, stopped);
-            let (message, found, waiting) = goal_message(store, port, agent, &id, &c, now).await?;
+            let (message, found, waiting) = goal_message(store, port, d.planner, agent, &id, &c, now).await?;
             let (went, sent) = say_with(port, agent, Some(id.as_str()), with_id(c, &message), found.as_ref(), waiting, now).await;
             match went {
                 Sent::Delivered => {
@@ -3307,7 +3352,7 @@ where
         }
         Next::Remind { id, text, how, worked, stopped, fresh } => {
             let c = if fresh { first_command(&how, &text, stopped) } else { reminder_command(&how, &text, stopped) };
-            let (message, found, waiting) = goal_message(store, port, agent, &id, &c, now).await?;
+            let (message, found, waiting) = goal_message(store, port, d.planner, agent, &id, &c, now).await?;
             let (went, sent) = say_with(port, agent, Some(id.as_str()), with_id(c, &message), found.as_ref(), waiting, now).await;
             match went {
                 Sent::Delivered => {
@@ -4310,6 +4355,23 @@ mod tests {
             i.queued = q.len();
         });
         q
+    }
+
+    #[test]
+    fn an_unseen_tracked_word_in_a_partial_index_is_not_replaced() -> anyhow::Result<()> {
+        use kiln_seams::clock::SimClock;
+        use kiln_seams::harness::SimHarness;
+        crate::rt::block_on(async {
+            let id = format!("partial-goal-{}", crate::util::new_id());
+            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(SimClock::new()));
+            assert!(port.open(&id, Info { id: id.clone(), status: Status::Running, queued: 100, queue_partial: true, ..Info::default() }));
+            SAID.lock().insert(id.clone(), Word { msg: Kept::found("same-goal-word".into(), "before".into(), 0), item: None });
+            let _ = say(&port, &id, Some("next"), send("after".into()), crate::harness::queued::SHOW_MS * 2).await;
+            let heard = port.heard(&id);
+            SAID.lock().remove(&id);
+            anyhow::ensure!(matches!(heard.as_slice(), [delivery] if matches!(&delivery.command, Command::QueueEdit { id, text, .. } if id == "same-goal-word" && text == "after")), "unknown presence must retain the same word rather than queue another: {heard:?}");
+            Ok(())
+        })
     }
 
     /// The incident's goals: an agent in one long turn, its stack resumed again and again, a goal

@@ -29,6 +29,8 @@ import { stopperOf, subagentPlaceholder, takesMessages } from "./tasks";
 import { notShown } from "./queue-shown";
 import { KindGlyph } from "./kind-glyph";
 import type { SubagentRow } from "./subagent-tree";
+import { deferredState, queuePageRows, stateCount } from "@/api/state-pages";
+import { DeferredState } from "./deferred-state";
 
 export const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
@@ -312,6 +314,60 @@ function Queued({ queue, label, hint, acts }: { queue: Waiting[]; label: string;
   );
 }
 
+/** Deferred queues stay on their owner; only one complete page is editable here. */
+function PagedQueue({ store, total, canSteer, canNow }: { store: SessionStore; total: number; canSteer: boolean; canNow: boolean }) {
+  const page = useSession(store, (s) => s.statePages.queue);
+  const rows = queuePageRows(page);
+  if (page?.read.path.length || page?.reply?.type !== "page" || page.phase !== "ready") return <DeferredState store={store} field="queue" label="Queued messages" />;
+  const next = page.reply.next;
+  return (
+    <section className="qd hx-stack" aria-label="Queued messages">
+      <div className="hx-section-head">
+        <span className="hx-eyebrow">Queued · {total}</span>
+        <Button size="xs" variant="ghost" onClick={() => void store.readState("queue")}>
+          Refresh
+        </Button>
+      </div>
+      <ol className="qd-list">
+        {rows.map(({ index, item }) =>
+          item ? (
+            <QueueRow
+              key={item.id}
+              q={item}
+              index={index}
+              count={total}
+              onEdit={(text) => void store.changeState("queue", { type: "queue_edit", id: item.id, text })}
+              onAttach={(attachments) => void store.changeState("queue", { type: "queue_edit", id: item.id, text: item.text, attachments })}
+              onRemove={() => void store.changeState("queue", { type: "queue_remove", id: item.id })}
+              onMove={(index) => void store.changeState("queue", { type: "queue_move", id: item.id, index })}
+              onSteer={canSteer ? () => void store.changeState("queue", { type: "queue_steer", id: item.id }) : undefined}
+              onNow={canNow ? () => void store.changeState("queue", { type: "queue_send_now", id: item.id }) : undefined}
+            />
+          ) : (
+            <li key={index} className="qd-row">
+              <span className="qd-n">{index + 1}</span>
+              <span>This message is available in parts. Editing and attachment changes need its complete contents.</span>
+              <Button size="xs" variant="secondary" onClick={() => void store.readState("queue", [{ type: "index", index }])}>
+                Read
+              </Button>
+            </li>
+          ),
+        )}
+      </ol>
+      <div className="hx-section-head">
+        <Button size="xs" variant="ghost" disabled={page.read.offset === 0} onClick={() => void store.readState("queue")}>
+          First page
+        </Button>
+        {next != null && (
+          <Button size="xs" variant="secondary" onClick={() => void store.readState("queue", [], next)}>
+            Next page
+          </Button>
+        )}
+      </div>
+    </section>
+  );
+}
+
 /** How a message goes while it works: kept until changed (the composer's typing doesn't render it). */
 export const SendModes = React.memo(function SendModes({ modes, mode, onMode }: { modes: typeof MODES; mode: SendMode; onMode: (m: SendMode) => void }) {
   return (
@@ -504,7 +560,9 @@ export function Composer({
   const paused = useSession(store, (s) => (s.state?.pause ? (s.state.pause.auto ? "auto" : "manual") : null));
   const held = useHeld((s) => s.held[agent] ?? NO_HELD);
   const queue = useSession(store, (s) => s.state?.queue ?? NO_QUEUE);
-  const approvals = useSession(store, (s) => s.state?.approvals.length ?? 0);
+  const queueDeferred = useSession(store, (s) => deferredState(s.state, "queue"));
+  const queueTotal = useSession(store, (s) => stateCount(s.state, "queue", s.state?.queue.length ?? 0));
+  const approvals = useSession(store, (s) => stateCount(s.state, "approvals", s.state?.approvals.length ?? 0));
   const model = useSession(store, (s) => s.state?.model ?? "");
   const effort = useSession(store, (s) => s.state?.effort ?? "");
   const meta = useSession(store, (s) => s.meta);
@@ -535,7 +593,19 @@ export function Composer({
   const longPressed = React.useRef(false);
   const shellLine = Boolean(onTerminal) && text.trimStart().startsWith("!");
   // To subagents picked, each takes it its own way (steered at work, else queued): it's sent, whatever the agent is doing.
-  const sendLabel = shellLine ? "Run" : !toSub && picked.length > 0 ? "Send" : !reachable || paused ? "Queue" : running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
+  const sendLabel = shellLine
+    ? "Run"
+    : !toSub && picked.length > 0
+      ? "Send"
+      : !reachable || paused
+        ? "Queue"
+        : running
+          ? mode === "queue"
+            ? "Queue"
+            : mode === "steer"
+              ? "Steer"
+              : "Send now"
+          : "Send";
   const away = machine ? `${machine} is back` : "it's back";
 
   // What was kept here goes, in order, once the agent can take it: whenever the session or what's
@@ -787,7 +857,8 @@ export function Composer({
           })}
         />
       )}
-      {shownQueue.length > 0 && (
+      {queueDeferred && !toSub && <PagedQueue store={store} total={queueTotal} canSteer={features.includes("queue_steer") && !paused} canNow={features.includes("send_now") && !paused} />}
+      {!queueDeferred && shownQueue.length > 0 && (
         <Queued
           queue={shownQueue}
           label="Queued"
@@ -884,18 +955,18 @@ export function Composer({
                 : !toSub && picked.length > 0
                   ? "Message them"
                   : toSub
-                  ? subagentPlaceholder(running ? mode : null, toSub.via === "parent")
-                  : toMain
-                    ? "Message the main agent"
-                    : running
-                      ? mode === "steer"
-                        ? "Steer it — it reads this at its next step"
-                        : mode === "now"
-                          ? approvals > 0
-                            ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
-                            : "Stop and say…"
-                          : "Queue a message for when it finishes"
-                      : "Tell the agent what to do"
+                    ? subagentPlaceholder(running ? mode : null, toSub.via === "parent")
+                    : toMain
+                      ? "Message the main agent"
+                      : running
+                        ? mode === "steer"
+                          ? "Steer it — it reads this at its next step"
+                          : mode === "now"
+                            ? approvals > 0
+                              ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
+                              : "Stop and say…"
+                            : "Queue a message for when it finishes"
+                        : "Tell the agent what to do"
           }
           onChange={(e) => write(e.target.value, e.target.selectionStart)}
           onSelect={(e) => setCaret(e.currentTarget.selectionStart)}

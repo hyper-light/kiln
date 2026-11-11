@@ -281,6 +281,10 @@ pub struct Held {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "AgentInfo"))]
 pub struct Info {
+    /// Omitted detail fields in the owner's bounded control projection.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<std::collections::BTreeMap<String, crate::harness::state_view::Descriptor>>", optional))]
+    pub deferred: std::collections::BTreeMap<String, super::state_view::Descriptor>,
     pub id: String,
     pub kind: String,
     pub kind_name: String,
@@ -317,6 +321,14 @@ pub struct Info {
     /// (`super::queued`). Lists don't show it.
     #[serde(skip)]
     pub queue: Vec<super::queued::Queued>,
+    /// The bounded index does not cover the whole queue: absence is not proof of removal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queue_partial: bool,
+    /// The owner's queue revision, for targeted reads when the bounded index is incomplete.
+    #[serde(skip)]
+    pub queue_revision: Option<String>,
+    #[serde(skip)]
+    pub queue_next: Option<usize>,
     /// kiln's own messages its harness was handed lately (a goal stack's words, a parent's news),
     /// each by its id and a digest of the words it had then, as its timeline shows them: the
     /// server's (`super::queued::Kept::look`). Lists don't show it.
@@ -488,6 +500,7 @@ impl Info {
 
     /// Refresh the live fields from the session's state.
     pub fn apply(&mut self, s: &State) {
+        self.deferred = s.view.as_ref().map(|v| v.deferred.clone()).unwrap_or_default();
         if !s.name.is_empty() {
             self.name.clone_from(&s.name);
         }
@@ -506,8 +519,44 @@ impl Info {
             .iter()
             .map(|a| ApprovalBrief { id: a.id.clone(), tool: a.tool, tool_name: a.tool_name.clone(), title: a.title.clone(), at: a.at, agent: a.agent.clone() })
             .collect();
-        self.queued = s.queue.len();
-        self.queue = s.queue.iter().map(|q| super::queued::Queued::of(&q.id, &q.text)).collect();
+        self.queued = s.view.as_ref().map_or(s.queue.len(), |v| v.counts.queue);
+        let deferred = s.view.as_ref().filter(|v| v.deferred.contains_key("queue"));
+        let made = if deferred.is_none() { super::state_view::queue_index(&s.queue, 0, super::state_view::FRAME).ok() } else { None };
+        let index = match deferred {
+            Some(view) => view.queue_index.as_ref(),
+            None => made.as_ref(),
+        };
+        self.queue = Vec::new();
+        self.queue_partial = true;
+        self.queue_next = None;
+        if let Some(index) = index {
+            self.queue_partial = !(index.complete && index.entries.len() == self.queued && index.next.is_none());
+            self.queue_next = index.next;
+            if self.queue.try_reserve(index.entries.len()).is_err() {
+                self.queue_partial = true;
+                self.queue_next = Some(0);
+            } else {
+                for entry in &index.entries {
+                    match u64::from_str_radix(&entry.digest, 16) {
+                        Ok(digest) => {
+                            let mut id = String::new();
+                            if id.try_reserve(entry.id.len()).is_err() {
+                                self.queue_partial = true;
+                                self.queue_next = Some(0);
+                                break;
+                            }
+                            id.push_str(&entry.id);
+                            self.queue.push(super::queued::Queued { id, digest, len: entry.len });
+                        }
+                        Err(_) => self.queue_partial = true,
+                    }
+                }
+            }
+        }
+        self.queue_revision = s.view.as_ref().and_then(|v| v.revisions.get("queue")).cloned();
+        if self.queue_partial && self.queue_revision.is_none() && s.view.is_none() {
+            self.queue_revision = super::state_view::field_revision(s, "queue").ok();
+        }
         // Attention plan 01a199e1b177752e84dad5dc990e6a15: pending/paused tasks
         // still hold work; Finished must never hide them.
         self.tasks_running = s.tasks.iter().filter(|t| t.live()).count();
@@ -522,6 +571,12 @@ impl Info {
         let total = u32::try_from(s.todos.len()).unwrap_or(u32::MAX);
         self.todos_total = total;
         self.todos_done = u32::try_from(s.todos.iter().filter(|t| t.status == "completed").count()).unwrap_or(total);
+        if let Some(view) = &s.view {
+            self.queued = view.counts.queue;
+            self.tasks_running = view.counts.tasks_running;
+            self.todos_total = u32::try_from(view.counts.todos).unwrap_or(u32::MAX);
+            self.todos_done = u32::try_from(view.counts.todos_done).unwrap_or(u32::MAX);
+        }
         self.files_changed = s.files_changed;
         self.lines_added = s.lines_added;
         self.lines_removed = s.lines_removed;
@@ -556,8 +611,11 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace } = self;
-        !(*id == o.id
+        let Self { deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace } = self;
+        !(*deferred == o.deferred
+            && *queue_partial == o.queue_partial
+            && (!*queue_partial || *queue_revision == o.queue_revision)
+            && *id == o.id
             && *kind == o.kind
             && *kind_name == o.kind_name
             && *target == o.target
@@ -1249,6 +1307,101 @@ fn read_unread_children(s: &Arc<Session>) {
     });
 }
 
+fn read_state(core: &mut Core, client: String, read: super::state_view::Read) {
+    let empty = serde_json::json!({"t":"reply", "client":client, "value":{"result":null}});
+    let envelope = serde_json::to_vec(&empty).map_or(super::state_view::FRAME, |v| v.len());
+    let stamp = format!(",\"taken_us\":{}", u64::MAX).len();
+    let room = crate::proto::harness_json_room(&core.session_id, super::state_view::FRAME);
+    let budget = room.saturating_sub(envelope).saturating_sub(stamp);
+    let value = match super::state_view::read(&core.state, &read, budget) {
+        Ok(result) => serde_json::json!({"result":result}),
+        Err(code) => serde_json::json!({"error":{"code":code}}),
+    };
+    core.reply(client, value);
+}
+
+fn at_state(core: &mut Core, client: String, revision: &str, command: Command, apply: impl FnOnce(&mut Core, Command)) {
+    use super::state_view::Error;
+    let id = match &command {
+        Command::QueueEdit { id, .. } | Command::QueueRemove { id } | Command::QueueMove { id, .. }
+        | Command::QueueSteer { id } | Command::QueueSendNow { id } => Some(id),
+        _ => None,
+    };
+    let check = super::state_view::field_revision(&core.state, "queue").and_then(|current| {
+        if current != revision { return Err(Error::Stale) }
+        if !id.is_some_and(|id| core.state.queue.iter().any(|q| &q.id == id)) { return Err(Error::InvalidPath) }
+        Ok(())
+    });
+    match check {
+        Ok(()) => {
+            apply(core, command);
+            let revision = super::state_view::field_revision(&core.state, "queue").ok();
+            core.reply(client, serde_json::json!({"result":{"type":"applied", "revision":revision}}));
+        }
+        Err(code) => core.reply(client, serde_json::json!({"error":{"code":code}})),
+    }
+}
+
+#[cfg(test)]
+mod state_command_tests {
+    use super::*;
+
+    fn queued() -> Core {
+        let mut core = Core::new();
+        core.session_id = "state-command".into();
+        core.state.queue.push(super::super::model::QueueItem {
+            id: "message".into(), text: "original".into(), at: 0,
+            attachments: Vec::new(), overrides: None, reply_to: None,
+        });
+        core
+    }
+
+    #[test]
+    fn a_paged_edit_is_checked_by_the_owner_before_the_real_adapter_changes_it() -> anyhow::Result<()> {
+        let mut core = queued();
+        let mut adapter = super::super::codex::Codex::new(None, None, None, false);
+        let revision = super::super::state_view::field_revision(&core.state, "queue")?;
+        core.state.queue.first_mut().ok_or_else(|| anyhow::anyhow!("no queue"))?.text = "changed elsewhere".into();
+        at_state(&mut core, "stale-edit".into(), &revision,
+            Command::QueueEdit { id: "message".into(), text: "stale replacement".into(), attachments: None },
+            |core, command| adapter.command(core, command));
+        assert_eq!(core.state.queue.first().map(|q| q.text.as_str()), Some("changed elsewhere"));
+        assert!(core.take_out().iter().any(|u| matches!(u, Update::Reply { client, value }
+            if client == "stale-edit" && value.pointer("/error/code").and_then(serde_json::Value::as_str) == Some("stale"))));
+
+        let revision = super::super::state_view::field_revision(&core.state, "queue")?;
+        core.state.status = Status::Running;
+        at_state(&mut core, "current-edit".into(), &revision,
+            Command::QueueEdit { id: "message".into(), text: "current replacement".into(), attachments: None },
+            |core, command| adapter.command(core, command));
+        assert_eq!(core.state.queue.first().map(|q| q.text.as_str()), Some("current replacement"));
+        let current = super::super::state_view::field_revision(&core.state, "queue")?;
+        assert!(core.take_out().iter().any(|u| matches!(u, Update::Reply { client, value }
+            if client == "current-edit" && value.pointer("/result/revision").and_then(serde_json::Value::as_str) == Some(current.as_str()))));
+        Ok(())
+    }
+
+    #[test]
+    fn a_detail_reply_fits_the_cap_with_its_stamp_and_wire_envelope() -> anyhow::Result<()> {
+        let mut core = queued();
+        core.state.queue.first_mut().ok_or_else(|| anyhow::anyhow!("no queue"))?.text = "é\\\"\n".repeat(super::super::state_view::FRAME);
+        let read = super::super::state_view::Read {
+            revision: super::super::state_view::field_revision(&core.state, "queue")?,
+            field: "queue".into(),
+            path: vec![super::super::state_view::Step::Id { id: "message".into() }, super::super::state_view::Step::Key { key: "text".into() }],
+            offset: 0,
+        };
+        read_state(&mut core, "viewer".into(), read);
+        let reply = core.take_out().into_iter().find(|u| matches!(u, Update::Reply { client, .. } if client == "viewer"))
+            .ok_or_else(|| anyhow::anyhow!("no page reply"))?;
+        let mut json = serde_json::to_string(&reply)?;
+        crate::wire::stamp::put(&mut json, Duration::MAX);
+        let bytes = crate::proto::encode(&crate::proto::AgentMsg::Harness { session: core.session_id, json })?;
+        assert!(bytes.len() <= super::super::state_view::FRAME);
+        Ok(())
+    }
+}
+
 /// The agent ended: what its harness ran ended with it, and so did what kiln took back over for it
 /// (stopped with the rest). Its last state, what an ended agent shows, says so.
 fn end_tasks(core: &mut Core) {
@@ -1398,6 +1551,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
     core.room = Some(Arc::clone(&files.room));
     let cwd = core.state.cwd.clone();
     let info = Info {
+        deferred: Default::default(),
         id: id.clone(),
         kind: kind.id.to_owned(),
         kind_name: kind.name.to_owned(),
@@ -1415,6 +1569,9 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         approvals: Vec::new(),
         queued: 0,
         queue: Vec::new(),
+        queue_partial: false,
+        queue_revision: None,
+        queue_next: None,
         said: Vec::new(),
         tasks_running: 0,
         subagents: Vec::new(),
@@ -3721,6 +3878,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             }
                         }
                         Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
+                            Command::StateRead { client, read } => read_state(&mut s.core.lock(), client, read),
+                            Command::AtState { client, revision, command } => {
+                                at_state(&mut s.core.lock(), client, &revision, *command, |core, command| adapter.command(core, command));
+                            }
                             Command::Restart => {
                                 if s.core.lock().state.status == Status::Exited {
                                     rewind_to = Some(None);
@@ -4245,6 +4406,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             };
             match ev {
                 Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
+                    Command::StateRead { client, read } => read_state(&mut s.core.lock(), client, read),
+                    Command::AtState { client, revision, command } => {
+                        at_state(&mut s.core.lock(), client, &revision, *command, |core, command| adapter.command(core, command));
+                    }
                     Command::Restart => {
                         if s.core.lock().has_room() {
                             break;
@@ -4439,6 +4604,58 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deferred_bodies_retain_the_complete_compact_queue_index() -> anyhow::Result<()> {
+        let state = State {
+            status: Status::Running,
+            queue: (0..600).map(|i| super::super::model::QueueItem {
+                id: format!("queued-{i}"), text: "payload".repeat(400), at: i,
+                attachments: Vec::new(), overrides: None, reply_to: None,
+            }).collect(),
+            ..State::default()
+        };
+        let view = super::super::state_view::view(&state, super::super::state_view::FRAME)?;
+        let projected: State = serde_json::from_value(view.into_state()?)?;
+        assert!(projected.queue.is_empty());
+        let mut info = Info::default();
+        info.apply(&projected);
+        assert_eq!(info.queued, state.queue.len());
+        assert_eq!(info.queue.len(), state.queue.len());
+        assert!(!info.queue_partial);
+        for (actual, original) in info.queue.iter().zip(&state.queue) {
+            assert_eq!(actual, &super::super::queued::Queued::of(&original.id, &original.text));
+        }
+        assert!(serde_json::to_value(&info)?.get("queue").is_none(), "the compact local index is not a wire body");
+        Ok(())
+    }
+
+    #[test]
+    fn the_local_queue_index_is_bounded_and_marks_its_unseen_suffix() -> anyhow::Result<()> {
+        let state = State { queue: (0..128).map(|i| super::super::model::QueueItem {
+            id: format!("{i}-{}", "x".repeat(8192)), text: "small".into(), at: i,
+            attachments: Vec::new(), overrides: None, reply_to: None,
+        }).collect(), ..State::default() };
+        let expected = super::super::state_view::queue_index(&state.queue, 0, super::super::state_view::FRAME)?;
+        assert!(serde_json::to_vec(&expected)?.len() <= super::super::state_view::FRAME);
+        let mut info = Info::default();
+        info.apply(&state);
+        assert!(info.queue_partial);
+        assert_eq!(info.queue.len(), expected.entries.len());
+        assert!(info.queue.len() < state.queue.len());
+        assert_eq!(info.queue_next, expected.next);
+        Ok(())
+    }
+
+    #[test]
+    fn a_partial_index_revision_wakes_waiters_even_when_its_count_is_unchanged() {
+        let before = Info { queued: 10, queue_partial: true, queue_revision: Some("first".into()), ..Info::default() };
+        let after = Info { queue_revision: Some("second".into()), ..before.clone() };
+        assert!(after.differs(&before));
+        let before = Info { queue_partial: false, ..before };
+        let after = Info { queue_partial: false, ..after };
+        assert!(!after.differs(&before), "ordinary complete-index notification rules are unchanged");
+    }
+
     /// A session that runs nothing, and the receiving end of its channel (what its task would read).
     fn idle(id: &str) -> (Session, crate::memory::queue::Receiver<Ctl>) {
         let (ctl, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
@@ -5485,6 +5702,7 @@ for line in sys.stdin:
     fn info_follows_state() {
         let mut i = Info {
             id: "a".into(),
+            deferred: Default::default(), queue_partial: false, queue_revision: None, queue_next: None,
             kind: "claude".into(),
             kind_name: "Claude Code".into(),
             target: "local".into(),

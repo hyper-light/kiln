@@ -631,12 +631,15 @@ async fn read_rows(store: &crate::store::Store) -> anyhow::Result<Vec<(String, R
 pub async fn tick(hub: &Arc<crate::hub::Hub>, all: &[Info], now: i64, driven: &[String], quiet: &[String]) {
     load(hub).await;
     // News a server before this one queued, waiting still: this one adds to it.
-    for p in all.iter().filter(|p| !matches!(p.status, Status::Exited | Status::Disconnected) && p.queue.iter().any(|q| super::queued::from_before(&q.id, NEWS))) {
+    for p in all.iter().filter(|p| !matches!(p.status, Status::Exited | Status::Disconnected) && (p.queue_partial || p.queue.iter().any(|q| super::queued::from_before(&q.id, NEWS)))) {
         if TOLD.lock().news.contains_key(&p.id) {
             continue;
         }
-        if let Some(q) = hub.harness.queue(&p.id).into_iter().find(|q| super::queued::from_before(&q.id, NEWS)) {
-            TOLD.lock().found(&p.id, q.id, q.text, now);
+        let found = super::state_reads::first(hub, &p.id, p, |q| super::queued::from_before(&q.id, NEWS)).await;
+        if let Ok(Some(found)) = found
+            && let Ok(Some(q)) = super::state_reads::item(hub, &p.id, p, &found.id).await
+        {
+            TOLD.lock().found(&p.id, q.value.id, q.value.text, now);
         }
     }
     // The runners up now: a run whose runner is away has no one to say how it ends until it's back

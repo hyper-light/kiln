@@ -83,7 +83,8 @@ fn on_its_way(info: &Info) -> bool {
 /// `stopped` (it crashed or couldn't start), `offline` (its machine is away), `ended`. One whose
 /// process ended while nobody ended it is working: kiln starts it again by itself.
 pub fn stand(info: &Info) -> &'static str {
-    if !info.approvals.is_empty() || info.status == Status::Waiting || info.held.is_some() {
+    let deferred_approvals = info.deferred.get("approvals").is_some_and(|d| d.kind == super::state_view::Kind::Array && d.len > 0);
+    if !info.approvals.is_empty() || deferred_approvals || info.status == Status::Waiting || info.held.is_some() {
         return "needs_you";
     }
     // Attention plan 01a199e1b177: a person's pause stops live processes where they are, including
@@ -179,40 +180,97 @@ impl Waiter {
     }
 }
 
+/// One wait checks each source queue revision once. A failed check remains uncertain and does
+/// not turn unrelated events or the existing fallback look into source retries.
+#[derive(Default)]
+enum MailProbe {
+    #[default]
+    Unchecked,
+    Checked { revision: String },
+    Failed { revision: String, error: super::state_reads::Failure },
+}
+
+impl MailProbe {
+    fn needed<'a>(&self, waiter: &Waiter, info: &'a Info) -> Option<&'a str> {
+        if !info.queue_partial || info.status != Status::Running || info.turn_started != waiter.turn { return None; }
+        let revision = info.queue_revision.as_deref()?;
+        let tried = match self {
+            Self::Unchecked => None,
+            Self::Checked { revision } | Self::Failed { revision, .. } => Some(revision.as_str()),
+        };
+        (tried != Some(revision)).then_some(revision)
+    }
+
+    fn record(&mut self, revision: String, result: Result<bool, super::state_reads::Failure>) -> bool {
+        match result {
+            Ok(found) => { *self = Self::Checked { revision }; found }
+            Err(error) => { *self = Self::Failed { revision, error }; false }
+        }
+    }
+
+    fn unresolved(&self, waiter: &Waiter, info: &Info) -> Option<super::state_reads::Failure> {
+        if !info.queue_partial || info.turn_started != waiter.turn || matches!(info.status, Status::Idle | Status::Exited) { return None; }
+        let Some(current) = info.queue_revision.as_deref() else { return Some(super::state_reads::Failure::NotReady) };
+        match self {
+            Self::Failed { revision, error } if revision == current => Some(*error),
+            _ => None,
+        }
+    }
+}
+
 /// What a wait would hand `waiter` now, its queue as `info` has it: the messages other agents sent
 /// it (not its own to itself) waiting behind the turn its wait began in, those not handed over
 /// already, as many as one answer holds ([`HAND_MAX`], [`HAND_BYTES`]), by id. Nothing once that
 /// turn is over: a wait left running past it (the turn interrupted, a wait in the background) hands
 /// nothing over, as the agent takes its queue a turn at a time.
 pub fn mail(waiter: &Waiter, info: &Info) -> Vec<String> {
-    if info.status != Status::Running || info.turn_started != waiter.turn {
-        return Vec::new();
-    }
-    let handed = HANDED.lock();
     let (mut out, mut bytes) = (Vec::new(), 0usize);
-    for q in &info.queue {
+    mail_page(waiter, info, &info.queue, &mut out, &mut bytes);
+    out
+}
+
+/// A single index page contributes to the same existing handoff count and text-byte budget.
+pub(super) fn mail_page(waiter: &Waiter, info: &Info, queue: &[super::queued::Queued], out: &mut Vec<String>, bytes: &mut usize) -> bool {
+    if info.status != Status::Running || info.turn_started != waiter.turn { return true; }
+    let handed = HANDED.lock();
+    for q in queue {
         if out.len() >= HAND_MAX {
-            break;
+            return true;
         }
-        let ok = super::queued::sender_of(&q.id).is_some_and(|from| from != waiter.id) && !handed.contains_key(&q.id) && bytes.saturating_add(q.len) <= HAND_BYTES;
+        let ok = super::queued::sender_of(&q.id).is_some_and(|from| from != waiter.id) && !handed.contains_key(&q.id) && !out.contains(&q.id) && bytes.saturating_add(q.len) <= HAND_BYTES;
         if ok {
-            bytes = bytes.saturating_add(q.len);
+            *bytes = bytes.saturating_add(q.len);
             out.push(q.id.clone());
         }
     }
-    out
+    out.len() >= HAND_MAX
 }
 
 /// Takes message `id` for one wait to hand over: false when it's handed over already (by a wait
 /// beside this one, or one a moment ago).
 pub fn claim(id: &str) -> bool {
+    claim_for(id).is_some()
+}
+
+pub(super) struct Claim<'a> { id: &'a str, at: Instant }
+
+impl Claim<'_> {
+    /// A definite source refusal permits another wait to try; an uncertain removal does not.
+    pub fn release(self) {
+        let mut handed = HANDED.lock();
+        if handed.get(self.id) == Some(&self.at) { handed.remove(self.id); }
+    }
+}
+
+pub(super) fn claim_for(id: &str) -> Option<Claim<'_>> {
     let mut g = HANDED.lock();
     g.retain(|_, at| at.elapsed() < HANDED_FOR);
     if g.len() >= HANDED_MAX || g.contains_key(id) {
-        return false;
+        return None;
     }
-    g.insert(id.to_owned(), Instant::now());
-    true
+    let at = Instant::now();
+    g.insert(id.to_owned(), at);
+    Some(Claim { id, at })
 }
 
 /// Wait up to `timeout` (at most [`MAX`]) for agents `ids` to stand where `until` says (all of
@@ -229,6 +287,17 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
     let started = Instant::now();
     let timeout = timeout.min(MAX);
     let first: Vec<Option<Info>> = ids.iter().map(|id| hub.harness.info(id)).collect();
+    let snapshot = || {
+        let now: Vec<Option<Info>> = ids.iter().map(|id| hub.harness.info(id)).collect();
+        let mut done_each = now.iter().zip(first.iter()).map(|(n, f)| match (until, n) {
+            (_, None) => true,
+            (Until::Settled, Some(i)) => settled(stand(i)),
+            (Until::Change, Some(i)) => f.as_ref().is_none_or(|f| i.differs(f)),
+        });
+        let done = if any { done_each.any(|d| d) } else { done_each.all(|d| d) };
+        (now, done)
+    };
+    let mut mail_probe = MailProbe::Unchecked;
     // How it went, said to a test build's tests: its looks, and the events that woke it for one. On a loaded machine
     // neither shows in its time (a wait that ended at its first look took 5.7 s under load).
     #[cfg(test)]
@@ -238,18 +307,25 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
         {
             looks += 1;
         }
-        let now: Vec<Option<Info>> = ids.iter().map(|id| hub.harness.info(id)).collect();
-        let done_each: Vec<bool> = now
-            .iter()
-            .zip(first.iter())
-            .map(|(n, f)| match (until, n) {
-                (_, None) => true,
-                (Until::Settled, Some(i)) => settled(stand(i)),
-                (Until::Change, Some(i)) => f.as_ref().is_none_or(|f| i.differs(f)),
-            })
-            .collect();
-        let done = if any { done_each.iter().any(|d| *d) } else { done_each.iter().all(|d| *d) };
-        let mailed = waiter.is_some_and(|w| hub.harness.info(&w.id).is_some_and(|i| !mail(w, &i).is_empty()));
+        let (mut now, mut done) = snapshot();
+        let mut waiter_info = waiter.and_then(|w| hub.harness.info(&w.id));
+        let mut mailed = waiter.zip(waiter_info.as_ref()).is_some_and(|(w, i)| !mail(w, i).is_empty());
+        if !done && !mailed {
+            if let Some((w, info, revision)) = waiter.zip(waiter_info.as_ref()).and_then(|(w, i)| mail_probe.needed(w, i).map(|r| (w, i, r.to_owned()))) {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if !remaining.is_zero() {
+                    let result = crate::rt::timeout(remaining, super::state_reads::has_mail(hub, w, info)).await.unwrap_or(Err(super::state_reads::Failure::TimedOut));
+                    let found = mail_probe.record(revision.clone(), result);
+                    // The targets and waiter may have changed while their source answered. A
+                    // positive result belongs only to the same queue revision and original turn.
+                    (now, done) = snapshot();
+                    waiter_info = hub.harness.info(&w.id);
+                    mailed = waiter_info.as_ref().is_some_and(|i| {
+                        !mail(w, i).is_empty() || (found && i.status == Status::Running && i.turn_started == w.turn && i.queue_revision.as_deref() == Some(revision.as_str()))
+                    });
+                }
+            }
+        }
         let elapsed = started.elapsed();
         if done || mailed || elapsed >= timeout {
             let agents: Vec<Value> = ids.iter().zip(now.iter()).map(|(id, n)| n.as_ref().map_or_else(|| json!({"id": id, "stand": "ended", "closed": true}), brief)).collect();
@@ -261,6 +337,11 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
                 "until": if until == Until::Settled { "settled" } else { "change" },
                 "agents": agents,
             });
+            if !mailed {
+                if let Some(error) = waiter.zip(waiter_info.as_ref()).and_then(|(w, i)| mail_probe.unresolved(w, i)) {
+                    if let Some(o) = said.as_object_mut() { o.insert("mail_read_error".into(), json!(error)); }
+                }
+            }
             #[cfg(test)]
             if let Some(o) = said.as_object_mut() {
                 o.insert("looks".into(), json!(looks));
@@ -330,6 +411,75 @@ mod tests {
         assert_eq!(stand(&paused), "paused");
         assert!(settled("idle") && settled("needs_you") && settled("ended") && settled("stopped") && settled("paused"));
         assert!(!settled("working") && !settled("offline"));
+    }
+
+    #[test]
+    fn deferred_approvals_still_need_a_person() {
+        use crate::harness::state_view::{Descriptor, Kind};
+        let mut agent = info("deferred-approvals", Status::Running);
+        assert_eq!(stand(&agent), "working");
+        agent.deferred.insert("approvals".into(), Descriptor { kind: Kind::Array, len: 1 });
+        assert_eq!(stand(&agent), "needs_you", "the source retained a pending approval");
+        agent.deferred.insert("approvals".into(), Descriptor { kind: Kind::Array, len: 0 });
+        assert_eq!(stand(&agent), "working", "an empty approval array needs no answer");
+        agent.deferred.insert("approvals".into(), Descriptor { kind: Kind::Text, len: 1 });
+        assert_eq!(stand(&agent), "working", "only an array descriptor counts approvals");
+    }
+
+    #[test]
+    fn a_partial_mail_probe_is_consumed_only_by_its_queue_revision() {
+        use crate::harness::state_reads::Failure;
+        let waiter = Waiter { id: "probe-waiter".into(), turn: Some(100) };
+        let mut agent = Info { queue_partial: true, queue_revision: Some("queue-1".into()), turn_started: waiter.turn, ..info(&waiter.id, Status::Running) };
+        let mut probe = MailProbe::Unchecked;
+        assert_eq!(probe.needed(&waiter, &agent), Some("queue-1"));
+        assert!(!probe.record("queue-1".into(), Ok(false)));
+        assert_eq!(probe.needed(&waiter, &agent), None, "an unchanged fallback look does not read again");
+        agent.summary = "unrelated status detail".into();
+        assert_eq!(probe.needed(&waiter, &agent), None);
+        agent.queue_revision = Some("queue-2".into());
+        assert_eq!(probe.needed(&waiter, &agent), Some("queue-2"));
+        assert!(!probe.record("queue-2".into(), Err(Failure::Unreachable)));
+        assert!(matches!(probe, MailProbe::Failed { .. }), "failure is not a successful negative");
+        assert_eq!(probe.unresolved(&waiter, &agent), Some(Failure::Unreachable));
+        assert_eq!(probe.needed(&waiter, &agent), None, "unrelated events do not retry a failed revision");
+        agent.status = Status::Disconnected;
+        assert_eq!(probe.unresolved(&waiter, &agent), Some(Failure::Unreachable));
+        agent.status = Status::Running;
+        assert_eq!(probe.needed(&waiter, &agent), None, "reconnection alone does not reset the revision key");
+        agent.queue_revision = Some("queue-3".into());
+        assert_eq!(probe.needed(&waiter, &agent), Some("queue-3"));
+        agent.queue_partial = false;
+        assert_eq!(probe.needed(&waiter, &agent), None);
+        assert_eq!(probe.unresolved(&waiter, &agent), None, "a complete index resolves the former uncertainty");
+        agent.queue_partial = true;
+        agent.turn_started = Some(200);
+        assert_eq!(probe.needed(&waiter, &agent), None, "never read mail for a later turn");
+        assert_eq!(probe.unresolved(&waiter, &agent), None);
+        agent.turn_started = waiter.turn;
+        agent.status = Status::Idle;
+        assert_eq!(probe.needed(&waiter, &agent), None);
+        agent.status = Status::Running;
+        agent.queue_revision = None;
+        assert_eq!(probe.needed(&waiter, &agent), None, "the owner must supply a queue fence first");
+        assert_eq!(probe.unresolved(&waiter, &agent), Some(Failure::NotReady));
+    }
+
+    #[test]
+    fn a_later_index_page_can_wake_a_wait_without_claiming_mail() {
+        use crate::harness::queued::{Queued, from_agent};
+        let waiter = Waiter { id: "suffix-waiter".into(), turn: Some(100) };
+        let agent = Info { queue_partial: true, queue_revision: Some("suffix-revision".into()), turn_started: waiter.turn, queue: vec![Queued::of("from-person", "later")], ..info(&waiter.id, Status::Running) };
+        assert!(mail(&waiter, &agent).is_empty(), "the bounded prefix has no sender mail");
+        let peer = from_agent("01a1suffixpeer000000000000000000");
+        let suffix = [Queued::of("more-from-person", "later"), Queued::of(&peer, "the source has replied")];
+        let (mut out, mut bytes) = (Vec::new(), 0);
+        mail_page(&waiter, &agent, &agent.queue, &mut out, &mut bytes);
+        mail_page(&waiter, &agent, &suffix, &mut out, &mut bytes);
+        let mut probe = MailProbe::Unchecked;
+        assert!(probe.record("suffix-revision".into(), Ok(!out.is_empty())), "positive suffix metadata ends the wait");
+        assert_eq!(out, [peer.clone()]);
+        assert!(!HANDED.lock().contains_key(&peer), "only the existing handoff path claims mail");
     }
 
     /// Attention plan 01a199e1b177: queued input and admission wait are work still to take up.
@@ -462,6 +612,44 @@ mod tests {
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok(r) => r,
             Err(_) => anyhow::bail!("the wait hung"),
+        }
+    }
+
+    #[test]
+    fn a_source_read_cannot_outlive_the_wait_deadline() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::State;
+        use crate::harness::state_view::{Counts, Descriptor, Kind, Metadata, QueueIndex};
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = crate::rt::block_on(async {
+                // This source never answers, and its protocol clock never advances. Only the
+                // caller's remaining wait duration can cancel its in-flight source read.
+                let hub = crate::hub::tests::hub_with_runner(std::sync::Arc::new(kiln_seams::clock::SimClock::new()), "wait-deadline-source", crate::proto::CAP_WIRE).await?;
+                let there = crate::harness::registry::Location::Machine("wait-deadline-source".into());
+                for id in ["deadline-target", "deadline-waiter"] {
+                    hub.harness.ingest(&there, id, Update::Open { info: Box::new(info(id, Status::Running)), since: None }).await;
+                }
+                let revision = "deadline-queue".to_owned();
+                let metadata = Metadata {
+                    revision: "deadline-state".into(),
+                    revisions: [("queue".into(), revision)].into(),
+                    deferred: [("queue".into(), Descriptor { kind: Kind::Array, len: 1 })].into(),
+                    counts: Counts { queue: 1, ..Counts::default() },
+                    queue_index: Some(QueueIndex { entries: Vec::new(), complete: false, next: Some(0) }),
+                };
+                hub.harness.ingest(&there, "deadline-waiter", Update::State { state: Box::new(State { status: Status::Running, view: Some(metadata), ..State::default() }) }).await;
+                let waiter = Waiter::of(&hub, "deadline-waiter");
+                let answer = wait(&hub, &["deadline-target".into()], Until::Settled, false, Duration::from_millis(50), Some(&waiter)).await;
+                anyhow::ensure!(answer.get("timed_out") == Some(&json!(true)), "{answer}");
+                anyhow::ensure!(answer.pointer("/mail_read_error/code") == Some(&json!("timed_out")), "a cancelled source read stays unknown: {answer}");
+                Ok(())
+            });
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!("the wait outlived its deadline while reading source mail"),
         }
     }
 

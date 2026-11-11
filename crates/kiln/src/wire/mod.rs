@@ -353,6 +353,8 @@ classes! {
         Command::Restart => REFUSED,
         Command::Suggest { .. } => Class::Ask,
         Command::Snapshot => Class::Ask,
+        Command::StateRead { .. } => Class::Ask,
+        Command::AtState { .. } => REFUSED,
         Command::McpEnable { .. } => REFUSED,
         Command::McpReconnect { .. } => REFUSED,
         Command::McpRefresh => REFUSED,

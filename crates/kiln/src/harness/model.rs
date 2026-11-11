@@ -1487,6 +1487,10 @@ impl Objective {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "AgentState"))]
 pub struct State {
+    /// Bounded transport projection: missing detail fields are read from their owner at this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub view: Option<super::state_view::Metadata>,
     /// Moved here: where its folder stood in its repo's sync log on the machine it left. It goes
     /// on once the folder here has taken the log that far, after a restart too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2228,6 +2232,17 @@ pub enum Command {
     },
     /// Announce the session again with its whole state (a server that lost track of it).
     Snapshot,
+    /// CP-T3.2: a bounded read of detail omitted from the live control view.
+    StateRead {
+        client: String,
+        read: super::state_view::Read,
+    },
+    /// Apply a queue action only while the exact state its page described is still current.
+    AtState {
+        client: String,
+        revision: String,
+        command: Box<Command>,
+    },
     /// Switch an MCP server on or off.
     McpEnable {
         name: String,

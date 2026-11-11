@@ -10,6 +10,7 @@ import type { Pause } from "./Pause";
 import type { Perms } from "./Perms";
 import type { RefusedMessages } from "./RefusedMessages";
 import type { SessionStatus } from "./SessionStatus";
+import type { StateDescriptor } from "./StateDescriptor";
 import type { SubagentBrief } from "./SubagentBrief";
 import type { TurnEnd } from "./TurnEnd";
 import type { Workspace } from "./Workspace";
@@ -17,7 +18,11 @@ import type { Workspace } from "./Workspace";
 /**
  * A session as lists show it.
  */
-export type AgentInfo = { id: string, kind: string, kind_name: string, 
+export type AgentInfo = { 
+/**
+ * Omitted detail fields in the owner's bounded control projection.
+ */
+deferred?: { [key in string]: StateDescriptor }, id: string, kind: string, kind_name: string, 
 /**
  * "local" or "agent:<machine>" (set by the server).
  */
@@ -26,7 +31,11 @@ target: string, name: string, shell?: string, cwd: string,
  * The working tree its work is in (`State::tree`): what's asked of git about its work is
  * asked there ([`Info::work_dir`]).
  */
-tree?: string, created_at: number, status: SessionStatus, title: string, model: string, mode: string, harness_session?: string, approvals: Array<ApprovalBrief>, queued: number, tasks_running: number, 
+tree?: string, created_at: number, status: SessionStatus, title: string, model: string, mode: string, harness_session?: string, approvals: Array<ApprovalBrief>, queued: number, 
+/**
+ * The bounded index does not cover the whole queue: absence is not proof of removal.
+ */
+queue_partial?: boolean, tasks_running: number, 
 /**
  * Native harness subagents, including finished work, for the list's child disclosure.
  */

@@ -2892,6 +2892,7 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
     let exit = super::model::ExitInfo::now(None, Some(error.to_owned()));
     let info = Info {
         id: id.to_owned(),
+        deferred: Default::default(), queue_partial: false, queue_revision: None, queue_next: None,
         kind: spec.kind.clone(),
         kind_name: kind.map_or_else(|| spec.kind.clone(), |k| k.name.to_owned()),
         target: String::new(),

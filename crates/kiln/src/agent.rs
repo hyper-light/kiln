@@ -3387,6 +3387,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 limit_said = None;
                 server_leases = false;
                 server_features.clear();
+                sent_changes.state_pages = false;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -4373,6 +4374,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     },
                     // The features the server speaks by name (docs/wire.md): each says them all.
                     ServerMsg::Features { names } => {
+                        let pages = proto::feature::speaks(&names, proto::feature::STATE_PAGES);
+                        let refresh = pages && !sent_changes.state_pages && welcomed;
+                        sent_changes.state_pages = pages;
                         tracing::debug!(?names, "the server speaks these features");
                         crate::reach::told::server_features(&names);
                         // Its admission's hints go to a server that takes them (AUDIT O1).
@@ -4380,6 +4384,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             r.feed(crate::reach::node::In::Offers(proto::feature::speaks(&names, proto::feature::OFFERS))).await;
                         }
                         server_features = names;
+                        // Welcome precedes the named feature reply. Re-send through the existing
+                        // resumable stream so a quiet session's first oversized state is recovered too.
+                        if refresh {
+                            if let Some(h) = &harness {
+                                for info in h.list() {
+                                    if let Some(s) = h.get(&info.id) {
+                                        start_stream(&mut updates, &info.id, &s, server_kept.get(&info.id), &mut sent_changes);
+                                    }
+                                }
+                            }
+                            flush_updates(&mut updates, &own).await;
+                        }
                     }
                     // Its rules for the copies of other runners' trees here, and an ask to let go
                     // now, as they change: its keeper looks at once (docs/reach.md §5.1, goal 9).
@@ -5417,6 +5433,7 @@ pub async fn enroll_only(o: &Opts) -> anyhow::Result<()> {
 /// again (a long session's changeset ran to 690 KB, sent whole for every edit).
 #[derive(Default)]
 struct SentChanges {
+    state_pages: bool,
     /// The server takes changesets as patches.
     patches: bool,
     sessions: HashMap<String, HashMap<crate::harness::model::FileKey, u64>>,
@@ -5551,6 +5568,7 @@ fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &cr
     use crate::harness::core::Update;
     let key = crate::wire::uplink::session_key(session);
     let frames = match u {
+        Update::State { .. } | Update::Open { .. } if !sent.state_pages => legacy_harness_frames(session, u),
         Update::Changes { files } => sent.frames(session, files, picture),
         // Its server's copy starts its changeset over (an Open), or lets the session go.
         Update::Open { .. } | Update::Closed => {
@@ -5750,7 +5768,7 @@ async fn send_term(net: &net::NetHandle, delay: Option<&crate::runner::chaos::De
 
 /// Most of one agent-session update a frame carries. They go on the interactive lane, which
 /// refuses frames past 1 MiB ([`net::Kiln`]); a resumed session's history can be several.
-const HARNESS_FRAME: usize = 512 * 1024;
+const HARNESS_FRAME: usize = crate::harness::state_view::FRAME;
 
 /// What a runner sends the server of a message of the server's whose payload it couldn't read
 /// (`crate::wire::payload`): word of it when `told` says (`Unread`, with the session it was about
@@ -5813,6 +5831,36 @@ fn refuse(answer_after: &mut Option<(String, u64, Option<(crate::wire::channel::
 /// their counts kept (`fit_changes`), and a changeset's patch goes in parts. Only what still doesn't
 /// fit is dropped, and logged.
 fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
+    let room = proto::harness_json_room(session, HARNESS_FRAME);
+    let stamp = format!(",\"taken_us\":{}", u64::MAX).len();
+    if matches!(u, crate::harness::core::Update::State { .. }) {
+        if let Ok(bytes) = crate::harness::state_view::encode(u, room.saturating_sub(stamp)) {
+            return String::from_utf8(bytes).ok().into_iter().collect();
+        }
+    }
+    if let crate::harness::core::Update::Open { info, since } = u {
+        let envelope = serde_json::to_vec(&serde_json::json!({"t":"open","info":null,"since":since})).map_or(HARNESS_FRAME, |v| v.len());
+        return crate::harness::state_view::info_view(info, room.saturating_sub(envelope).saturating_sub(stamp)).ok()
+            .and_then(|info| serde_json::to_string(&serde_json::json!({"t":"open","info":info,"since":since})).ok())
+            .filter(|json| json.len().saturating_add(stamp) <= HARNESS_FRAME).into_iter().collect();
+    }
+    let crate::harness::core::Update::State { state } = u else { return legacy_harness_frames(session, u) };
+    // The maximum stamp, rather than a guessed allowance: it is appended after encoding.
+    let envelope = r#"{"t":"state","state":null}"#.len();
+    let budget = room.saturating_sub(stamp).saturating_sub(envelope);
+    let view = match crate::harness::state_view::view(state, budget) {
+        Ok(view) => view,
+        Err(error) => {
+            tracing::warn!(session, ?error, "a bounded session view could not be encoded");
+            return Vec::new();
+        }
+    };
+    let Ok(projected) = view.into_state() else { return Vec::new() };
+    serde_json::to_string(&serde_json::json!({"t":"state", "state":projected})).ok()
+        .filter(|json| json.len().saturating_add(stamp) <= HARNESS_FRAME).into_iter().collect()
+}
+
+fn legacy_harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
     use crate::harness::core::Update;
     let Ok(json) = serde_json::to_string(u) else { return Vec::new() };
     if json.len() <= HARNESS_FRAME {
@@ -6203,6 +6251,43 @@ fn open_mirror(dir: &std::path::Path, up: &crate::memory::queue::Sender<Up>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ordinary_state_keeps_its_exact_existing_wire_representation() -> anyhow::Result<()> {
+        let update = crate::harness::core::Update::State { state: Box::default() };
+        assert_eq!(harness_frames("ordinary-state", &update), vec![serde_json::to_string(&update)?]);
+        Ok(())
+    }
+
+    /// CP-T3.2: Shards' queued messages must not prevent its owner from publishing its status.
+    #[test]
+    fn state_delivery_survives_a_queue_larger_than_a_frame() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{QueueItem, State, Status};
+        let state = State {
+            status: Status::Running,
+            queue: (0..600).map(|i| QueueItem {
+                id: format!("queued-{i}"), text: "same authoritative message ".repeat(100), at: i,
+                attachments: Vec::new(), overrides: None, reply_to: None,
+            }).collect(),
+            ..State::default()
+        };
+        let update = Update::State { state: Box::new(state.clone()) };
+        let frames = harness_frames("offline-regression", &update);
+        anyhow::ensure!(!frames.is_empty(), "an online session's state was dropped because its queue exceeded the frame cap");
+        anyhow::ensure!(frames.iter().all(|f| f.len() <= HARNESS_FRAME), "the frame cap must remain enforced");
+        let first: serde_json::Value = serde_json::from_str(frames.first().ok_or_else(|| anyhow::anyhow!("no state frame"))?)?;
+        anyhow::ensure!(first.pointer("/state/status").and_then(serde_json::Value::as_str) == Some("running"));
+        anyhow::ensure!(first.pointer("/state/view/deferred/queue").is_some(), "a deferred queue must never look empty or contain clipped messages");
+        anyhow::ensure!(matches!(&update, Update::State { state: original } if **original == state), "publishing a view must preserve the owner's queue");
+        let recorded = crate::convo::rows::of("offline-regression", &update, 0);
+        let stored = recorded.iter().find_map(|row| match row {
+            crate::convo::rows::Row::Session { state: Some(state), .. } => Some(state), _ => None,
+        }).ok_or_else(|| anyhow::anyhow!("no durable state row"))?;
+        let restored: State = serde_json::from_str(stored)?;
+        anyhow::ensure!(restored.queue == state.queue, "the durable source state must retain every complete message");
+        Ok(())
+    }
 
     /// Goal 9: an idle runner, connected, wakes for nothing. A server runs here with its own runner
     /// (the local agent, this process's `run`); once it's connected and settled, the timers armed in

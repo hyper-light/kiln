@@ -567,6 +567,8 @@ impl Acp {
                 self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, mode);
             }
             Command::SkillView { client, .. } | Command::McpAuth { client, .. } => core.reply(client, json!({"error": UNSUPPORTED})),
+            Command::StateRead { client, .. } => core.reply(client, json!({"error": {"code": super::state_view::Error::Unreadable}})),
+            Command::AtState { client, .. } => core.reply(client, json!({"error": {"code": super::state_view::Error::Unreadable}})),
             Command::McpAdd { client, .. } | Command::McpRemove { client, .. } => match client.filter(|c| !c.is_empty()) {
                 Some(c) => core.reply(c, json!({"ok": false, "error": UNSUPPORTED})),
                 None => self.notice(core, Level::Warn, UNSUPPORTED),

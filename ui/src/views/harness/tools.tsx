@@ -9,6 +9,8 @@ import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { useAction } from "@/lib/action";
 import { cn } from "@/lib/utils";
+import { deferredState } from "@/api/state-pages";
+import { DeferredState } from "./deferred-state";
 
 const MCP_DOT: Record<string, string> = { connected: "succeeded", pending: "queued", failed: "failed", needs_auth: "timed_out", disabled: "cancelled" };
 const MCP_LABEL: Record<string, string> = { connected: "connected", pending: "connecting", failed: "failed", needs_auth: "needs sign-in", disabled: "off" };
@@ -226,6 +228,13 @@ function ServerRow({ s, store }: { s: McpServer; store: SessionStore }) {
 
 export function McpPanel({ state, store }: { state: State | null; store: SessionStore }) {
   const [adding, setAdding] = React.useState(false);
+  if (deferredState(state, "mcp") || deferredState(state, "inventory"))
+    return (
+      <>
+        <DeferredState store={store} field="mcp" />
+        <DeferredState store={store} field="inventory" />
+      </>
+    );
   const known = state?.inventory?.mcp;
   const servers = state?.mcp;
   if (known === "unsupported" || (servers === undefined && !known)) return <p className="in-none">This agent's harness doesn't tell kiln about its MCP servers.</p>;

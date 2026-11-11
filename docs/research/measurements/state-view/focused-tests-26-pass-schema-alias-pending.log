@@ -1,0 +1,53 @@
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `kiln` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 06s
+     Running unittests src/lib.rs (/Users/adalundhe/.cache/kiln-offline-state-fix-20261110/red-target/debug/deps/kiln-a2cd230deb814ff5)
+
+running 27 tests
+test agent::tests::state_delivery_survives_a_queue_larger_than_a_frame ... ok
+test goals::tests::an_unseen_tracked_word_in_a_partial_index_is_not_replaced ... ok
+test harness::queued::tests::a_kept_message_waits_while_its_queue_holds_it_and_knows_what_it_held ... ok
+test harness::queued::tests::a_message_from_an_agent_says_who_sent_it_in_its_id ... ok
+test harness::queued::tests::a_partial_index_cannot_establish_a_message_is_gone ... ok
+test harness::queued::tests::kiln_tells_its_own_messages_from_those_queued_before_it_started ... ok
+test harness::queued::tests::the_wire_index_digest_matches_the_existing_receipt_digest ... ok
+test harness::queued::tests::uncertainty_restarts_the_existing_unheard_grace ... ok
+test harness::session::state_command_tests::a_detail_reply_fits_the_cap_with_its_stamp_and_wire_envelope ... ok
+test harness::session::state_command_tests::a_paged_edit_is_checked_by_the_owner_before_the_real_adapter_changes_it ... ok
+test harness::session::tests::a_partial_index_revision_wakes_waiters_even_when_its_count_is_unchanged ... ok
+test harness::session::tests::deferred_bodies_retain_the_complete_compact_queue_index ... ok
+test harness::session::tests::the_local_queue_index_is_bounded_and_marks_its_unseen_suffix ... ok
+test harness::state_reads::tests::failures_expose_only_typed_codes ... ok
+test harness::state_reads::tests::only_the_matching_reply_establishes_a_result ... ok
+test harness::state_reads::tests::unreadable_or_oversized_replies_do_not_establish_absence ... ok
+test harness::wait::tests::a_later_index_page_can_wake_a_wait_without_claiming_mail ... ok
+test harness::wait::tests::a_partial_mail_probe_is_consumed_only_by_its_queue_revision ... ok
+test harness::wait::tests::a_source_read_cannot_outlive_the_wait_deadline ... ok
+test harness::wait::tests::deferred_approvals_still_need_a_person ... ok
+test wire::contract::docs_say_what_the_tables_say ... ok
+test wire::ts::a_field_added_in_rust_without_its_binding_names_the_file ... ok
+test wire::ts::bindings_are_current ... ok
+test wire::ts::every_update_goes_down_as_a_session_frame ... ok
+test wire::ts::hand_written_finds_definitions_not_re_exports ... ok
+test wire::ts::no_generated_type_is_written_by_hand ... FAILED
+test wire::ts::tags_are_serdes_and_what_kiln_leaves_out_is_optional ... ok
+
+failures:
+
+---- wire::ts::no_generated_type_is_written_by_hand stdout ----
+Error: 4 hand-written definitions of types made from Rust (import them from ui/src/api/wire instead):
+ui/src/api/state-pages.ts:15: StateRead
+ui/src/api/state-pages.ts:3: StateStep
+ui/src/api/state-pages.ts:4: StateDescriptor
+ui/src/api/state-pages.ts:8: StateMetadata
+
+
+failures:
+    wire::ts::no_generated_type_is_written_by_hand
+
+test result: FAILED. 26 passed; 1 failed; 0 ignored; 0 measured; 4103 filtered out; finished in 1.03s
+
+error: test failed, to rerun pass `-p kiln --lib`

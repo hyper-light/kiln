@@ -385,17 +385,32 @@ pub fn peer_words(text: &str) -> &str {
 /// be stays, for after its turn), with who sent it and its words.
 async fn hand_over(hub: &crate::hub::Hub, me: &wait::Waiter) -> Vec<Value> {
     let mut out = Vec::new();
-    let mail = hub.harness.info(&me.id).map(|i| wait::mail(me, &i)).unwrap_or_default();
+    let Some(mut info) = hub.harness.info(&me.id) else { return out };
+    let mail = match super::state_reads::mail(hub, me, &info).await {
+        Ok(mail) => mail,
+        Err(_) => return out,
+    };
     if mail.is_empty() {
         return out;
     }
-    for q in hub.harness.queue(&me.id).into_iter().filter(|q| mail.contains(&q.id)) {
+    for id in mail {
+        let Ok(Some(observed)) = super::state_reads::item(hub, &me.id, &info, &id).await else { continue };
+        let q = &observed.value;
         let Some(from) = super::queued::sender_of(&q.id).map(str::to_owned) else { continue };
-        if !wait::claim(&q.id) || !hub.harness.command(hub, &me.id, Command::QueueRemove { id: q.id.clone() }).await.went() {
-            continue;
-        }
+        let Some(claim) = wait::claim_for(&q.id) else { continue };
+        let next = match super::state_reads::remove(hub, &me.id, &observed).await {
+            Ok(super::state_reads::Removal::Applied { revision }) => revision,
+            Ok(super::state_reads::Removal::Unchanged)
+                | Err(super::state_reads::Failure::Source(super::state_view::Error::Stale | super::state_view::Error::InvalidPath)) => {
+                    claim.release();
+                    continue;
+                }
+            Err(_) => continue,
+        };
         let name = hub.harness.info(&from).map(|i| i.name);
         out.push(json!({"from": from, "name": name, "text": body_of(&q.text), "at": q.at}));
+        if observed.revision.is_some() && next.is_none() { break; }
+        info.queue_revision = next;
     }
     out
 }

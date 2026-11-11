@@ -772,7 +772,9 @@ pub mod feature {
     /// packages' states, the files it wants and a folder's files ([`super::AgentMsg::Skills`],
     /// [`super::AgentMsg::SkillFile`]); a server that names it sends them.
     pub const SKILLS: &str = "skills";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS];
+    /// Bounded session control projections and revisioned, on-demand detail reads.
+    pub const STATE_PAGES: &str = "state-pages";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1297,6 +1299,15 @@ pub(crate) mod shared_str {
 pub fn encode<T: Serialize>(v: &T) -> anyhow::Result<Vec<u8>> {
     let size = postcard::experimental::serialized_size(v).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
     postcard::serialize_with_flavor::<T, Exact, Vec<u8>>(v, Exact(Vec::with_capacity(size))).map_err(|e| anyhow::anyhow!("encode: {e}"))
+}
+
+/// JSON room inside a Harness message, including the maximum postcard length prefix.
+pub(crate) fn harness_json_room(session: &str, cap: usize) -> usize {
+    if session.len() > cap { return 0 }
+    let empty = AgentMsg::Harness { session: session.to_owned(), json: String::new() };
+    let overhead = postcard::experimental::serialized_size(&empty).unwrap_or(cap);
+    let length = postcard::experimental::serialized_size(&cap).unwrap_or(cap);
+    cap.saturating_sub(overhead).saturating_sub(length)
 }
 
 /// postcard's output as one buffer made the size it will come to ([`encode`]).

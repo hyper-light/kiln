@@ -77,6 +77,8 @@ pub mod socket;
 /// Sealed chunks' segments kept on disk rather than in memory (goal 11, plan 01a1a87b2e56 step 5).
 pub mod spill;
 pub mod state_doc;
+pub mod state_reads;
+pub mod state_view;
 pub mod stores;
 pub mod streams;
 pub mod transcript;

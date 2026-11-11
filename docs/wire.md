@@ -170,10 +170,21 @@ An agent session's commands ride these streams too: `HarnessOpen`, `HarnessCmd`,
   ends it. Its sender sends it again under its id, wherever its session runs then; parked, it
   would go to the copy there with no epoch even after its session went on elsewhere (CP-T3.2,
   until CP-T3.3 parks it under its epoch).
-- **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `McpAuth`,
+- **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `StateRead`, `McpAuth`,
   `SkillView` and `OwnEdits`.
 - **Live**, refused at once while its runner is away: every other command (an interrupt, a model,
   effort or mode to change to, a move, a restart, the MCP servers' and skills' commands ...).
+
+`state-pages` keeps session control messages within the existing 512 KiB cap, including their
+stamp and wire envelope. A fitting state keeps its original representation. An oversized state
+keeps status and counts, preserves fields that fit, and explicitly describes deferred fields.
+`Info.queue` remains a bounded local ID/digest/length index; an incomplete index cannot prove
+that a message is gone. Complete message bodies remain in the owning session and its durable
+record. `StateRead` reads one bounded detail page or text range; its revision is the field's
+content plus the session epoch, so unrelated status changes do not invalidate queue pages.
+`AtState` applies a queue action only at the revision read, on its owner, and is never parked
+while that owner is away. These messages are enabled only after named-feature negotiation;
+the runner refreshes its resumable session streams when that negotiation completes.
 
 The parked and live ones' callers get the runner's answer:
 
@@ -613,6 +624,9 @@ run out, and two lines can't take the same one by accident as they could a bit.
   and which session has which (`ServerMsg::Skills`) and the files a runner asks for
   (`ServerMsg::SkillFile`); the runner says its packages' states, the files it wants and a folder's
   files it was asked to read (`AgentMsg::Skills`, `AgentMsg::SkillFile`).
+  `state-pages`: bounded session state views retain status and counts when details exceed the
+  existing frame cap; deferred fields and queue indexes are read at their owner's field revision
+  using `StateRead`. `AtState` applies queue actions only while that revision is current.
 
 ## Registry
 
@@ -954,6 +968,8 @@ travels in `HarnessCmd`.
 | `Restart` | command, refused while away | Starts the harness again now. | Fire-and-forget. |
 | `Suggest` | ask | Answered by a `Reply` to its client. | As its class says. |
 | `Snapshot` | ask | The whole session, for a server that lost track of it. A resume by revision replaces it. | Asked for by a server that restarted. |
+| `StateRead` | ask | A bounded page or range of deferred session detail, at its field revision. | Reply to the requesting client; stale reads are refused. |
+| `AtState` | command, refused while away | A queue action conditional on the owner's current queue revision. | Live owner only; stale actions are refused. |
 | `McpEnable` | command, refused while away | Switches an MCP server now. | Fire-and-forget. |
 | `McpReconnect` | command, refused while away | As `McpEnable`. | Fire-and-forget. |
 | `McpRefresh` | command, refused while away | As `McpEnable`. | Fire-and-forget. |

@@ -8,6 +8,8 @@
  * every agent of yours, or this repository's folder. Long lists turn a page at a time.
  */
 import * as React from "react";
+import { deferredState } from "@/api/state-pages";
+import { DeferredState } from "./deferred-state";
 import { ChevronRight, FileUp, Folder, Link2, PenLine, Plus, Trash2 } from "lucide-react";
 import { clientId, type SessionStore, type State } from "@/api/harness";
 import { skillsApi, type LookAnswer, type LookFrom, type SkillDraft, type SkillItem, type SkillPackage, type SkillPicks, type SkillScope, type SkillsList } from "@/api/skills";
@@ -579,6 +581,14 @@ function Found({ state, store, q, per, installed }: { state: State | null; store
   const pg = usePage(shown, q, per);
   // Its harness's plugins, but those kiln installed (listed above).
   const plugins = (state?.plugins ?? []).filter((p) => !installed.includes(p.name));
+  if (deferredState(state, "skills") || deferredState(state, "plugins") || deferredState(state, "inventory"))
+    return (
+      <>
+        <DeferredState store={store} field="skills" />
+        <DeferredState store={store} field="plugins" />
+        <DeferredState store={store} field="inventory" />
+      </>
+    );
   const none =
     known === "unsupported" || (state?.skills === undefined && !known)
       ? "This agent's harness doesn't tell kiln about its skills."

@@ -17,10 +17,10 @@
 //! the turn.
 
 use std::collections::{HashSet, VecDeque};
-use std::hash::{Hash as _, Hasher as _};
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
+use sha2::Digest as _;
 
 use super::model::Status;
 use super::session::Info;
@@ -111,11 +111,12 @@ pub fn note_given(given: &mut Vec<super::model::Given>, id: &str, digest: String
     given.push(super::model::Given { id: id.to_owned(), digest });
 }
 
-/// A digest of a message's words: whether what waits says what kiln last had it say.
+/// The same SHA-256 prefix as `stable`, in the compact index's existing integer form. Its
+/// value crosses runner builds now, so it cannot use `DefaultHasher`'s unspecified algorithm.
 pub fn digest(text: &str) -> u64 {
-    let mut h = std::hash::DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
+    let bytes: [u8; 32] = sha2::Sha256::digest(text.as_bytes()).into();
+    let [a, b, c, d, e, f, g, h, ..] = bytes;
+    u64::from_be_bytes([a, b, c, d, e, f, g, h])
 }
 
 /// A new id for a message agent `sender` sends another.
@@ -160,6 +161,8 @@ pub enum Now {
     Waiting,
     /// Not there (any more): its agent took it, or someone took it out.
     Gone,
+    /// Not in the bounded index; the owner's complete queue has not been checked.
+    Unknown,
 }
 
 impl Kept {
@@ -180,7 +183,18 @@ impl Kept {
     /// looks held, one that came too late not (CP-T3.2, the thirteenth adversarial check's).
     pub fn look(&mut self, info: Option<&Info>, now: i64) -> Now {
         let Some(info) = info else { return Now::Gone };
-        match info.queue.iter().find(|q| q.id == self.id) {
+        let found = info.queue.iter().find(|q| q.id == self.id);
+        self.look_at(info, found, found.is_some() || !info.queue_partial, now)
+    }
+
+    /// A targeted read at the owner's queue revision supplies authoritative presence or absence.
+    pub fn look_known(&mut self, info: &Info, found: Option<&Queued>, now: i64) -> Now {
+        if found.is_some_and(|q| q.id != self.id) { return Now::Unknown; }
+        self.look_at(info, found, true, now)
+    }
+
+    fn look_at(&mut self, info: &Info, found: Option<&Queued>, complete: bool, now: i64) -> Now {
+        match found {
             Some(q) => {
                 self.seen = true;
                 if q.digest == digest(&self.text) {
@@ -193,6 +207,7 @@ impl Kept {
                     self.held = if handed.digest == stable(&self.text) { self.text.clone() } else { String::new() };
                     Now::Gone
                 }
+                None if !complete => Now::Unknown,
                 None if !self.seen && !self.direct && now.saturating_sub(self.at) < SHOW_MS => Now::Waiting,
                 None => Now::Gone,
             },
@@ -206,6 +221,15 @@ impl Kept {
     /// [`Kept::look`] has it gone.
     pub fn look_heard(&mut self, info: Option<&Info>, now: i64) -> Now {
         let at = self.look(info, now);
+        self.heard(info, now, at)
+    }
+
+    pub fn look_heard_known(&mut self, info: &Info, found: Option<&Queued>, now: i64) -> Now {
+        let at = self.look_known(info, found, now);
+        self.heard(Some(info), now, at)
+    }
+
+    fn heard(&mut self, info: Option<&Info>, now: i64, at: Now) -> Now {
         let unheard = at == Now::Gone && self.seen && !self.direct && info.is_some_and(|i| !i.said.iter().any(|g| g.id == self.id));
         if !unheard {
             self.gone_at = None;
@@ -234,6 +258,39 @@ fn free(info: &Info) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_wire_index_digest_matches_the_existing_receipt_digest() {
+        assert_eq!(digest(""), 0xe3b0_c442_98fc_1c14);
+        assert_eq!(digest("abc"), 0xba78_16bf_8f01_cfea);
+        for text in ["", "abc", "same authoritative message", "🙂é\"\\\n"] {
+            assert_eq!(format!("{:016x}", digest(text)), stable(text));
+        }
+    }
+
+    #[test]
+    fn a_partial_index_cannot_establish_a_message_is_gone() {
+        let mut info = Info { status: Status::Running, queue_partial: true, queued: 10, ..Info::default() };
+        let mut message = Kept::found("outside-prefix".into(), "same words".into(), 0);
+        assert_eq!(message.look(Some(&info), SHOW_MS * 2), Now::Unknown);
+        assert_eq!(message.look_heard(Some(&info), SHOW_MS * 2 + HEARD_MS), Now::Unknown);
+        let present = Queued::of("outside-prefix", "same words");
+        assert_eq!(message.look_known(&info, Some(&present), SHOW_MS * 3), Now::Waiting);
+        assert_eq!(message.held, "same words");
+        assert_eq!(message.look_known(&info, None, SHOW_MS * 4), Now::Gone);
+        assert_eq!(message.look_known(&info, Some(&Queued::of("another-id", "same words")), SHOW_MS * 4), Now::Unknown);
+        info.said.push(super::super::model::Given { id: "outside-prefix".into(), digest: stable("same words") });
+        assert_eq!(message.look(Some(&info), SHOW_MS * 5), Now::Gone, "the harness's receipt remains authoritative");
+    }
+
+    #[test]
+    fn uncertainty_restarts_the_existing_unheard_grace() {
+        let info = Info { status: Status::Running, queue_partial: true, ..Info::default() };
+        let mut message = Kept::found("outside-prefix".into(), "same words".into(), 0);
+        assert_eq!(message.look_heard_known(&info, None, 1), Now::Waiting);
+        assert_eq!(message.look_heard(Some(&info), HEARD_MS * 2), Now::Unknown);
+        assert_eq!(message.look_heard_known(&info, None, HEARD_MS * 3), Now::Waiting);
+    }
+
     use super::*;
 
     fn agent(status: Status, queue: Vec<Queued>) -> Info {

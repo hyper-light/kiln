@@ -1651,6 +1651,8 @@ impl Codex {
                     self.run(core, Run::McpRemove { name: name.clone(), client }, vec!["mcp".into(), "remove".into(), "--".into(), name]);
                 }
             }
+            Command::StateRead { client, .. } => core.reply(client, json!({"error": {"code": super::state_view::Error::Unreadable}})),
+            Command::AtState { client, .. } => core.reply(client, json!({"error": {"code": super::state_view::Error::Unreadable}})),
             Command::SkillView { name, client } => match core.state.skills.iter().find(|s| s.name == name).and_then(|s| s.path.clone()) {
                 Some(path) => core.effects.push(Effect::Read { client, paths: vec![path] }),
                 None => core.reply(client, json!({"error": format!("This session has no skill named {name}.")})),

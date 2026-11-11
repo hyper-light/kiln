@@ -1,0 +1,46 @@
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `kiln` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 19s
+     Running unittests src/lib.rs (/Users/adalundhe/.cache/kiln-offline-state-fix-20261110/red-target/debug/deps/kiln-a2cd230deb814ff5)
+
+running 16 tests
+test harness::state_view::tests::a_large_queue_index_cannot_crowd_out_a_small_actionable_approval ... ok
+test harness::state_view::tests::a_large_queue_is_referenced_and_each_page_keeps_its_exact_values ... ok
+test harness::state_view::tests::all_descriptor_space_is_reserved_before_optional_fields_can_fill_the_budget ... ok
+test harness::state_view::tests::an_id_lookup_reads_only_the_matching_item_and_absence_is_typed ... ok
+test harness::state_view::tests::borrowed_page_envelopes_encode_exactly_the_owned_wire_shape ... ok
+test harness::state_view::tests::compact_queue_indexes_are_exact_and_partial_indexes_never_claim_absence ... ok
+test harness::state_view::tests::exact_encoding_keeps_ordinary_state_bytes_and_refuses_over_budget_values ... ok
+test harness::state_view::tests::map_entries_keep_large_keys_and_values_accessible_without_assembling_them ... ok
+test harness::state_view::tests::one_oversized_item_is_inspected_as_nodes_and_utf8_text_ranges ... ok
+test harness::state_view::tests::open_keeps_exact_identity_counts_and_marks_its_untransmitted_index_partial ... ok
+test harness::state_view::tests::ordinary_states_keep_exact_nonempty_queues_and_approvals_inline ... ok
+test harness::state_view::tests::queue_body_and_metadata_reads_select_the_existing_owner_action_entry ... ok
+test harness::state_view::tests::queue_index_size_accounts_exact_entry_bytes_and_cursor_digit_changes ... ok
+test harness::state_view::tests::queue_reads_survive_status_and_usage_changes_but_not_queue_or_epoch_changes ... ok
+test harness::state_view::tests::short_writes_never_reserve_capacity_above_the_budget ... ok
+test harness::state_view::tests::stale_and_invalid_reads_do_not_produce_partial_answers ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 4109 filtered out; finished in 17.63s
+
+      342.26 real       406.59 user        20.72 sys
+         22027403264  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             4199153  page reclaims
+              124121  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                 499  messages sent
+                 276  messages received
+                   2  signals received
+               25985  voluntary context switches
+              789709  involuntary context switches
+          4211566922  instructions retired
+          1861479102  cycles elapsed
+           109462176  peak memory footprint

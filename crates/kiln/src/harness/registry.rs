@@ -2785,6 +2785,9 @@ impl Registry {
         let mut reported = String::new();
         let u = match u {
             Update::Open { mut info, since } => {
+                // The wire announcement omits the local queue index. Until state arrives,
+                // absence from it cannot establish that a queued message is gone.
+                info.queue_partial |= info.queue.len() != info.queued;
                 info.target = from.target();
                 own_name(&info.name, &info.kind_name).unwrap_or_default().clone_into(&mut reported);
                 if let Some(n) = self.names.load().get(id) {
@@ -3972,6 +3975,7 @@ impl Registry {
                     let kind = super::kinds::Kind::get(&spec.kind);
                     let info = Info {
                         id: id.clone(),
+                        deferred: Default::default(), queue_partial: false, queue_revision: None, queue_next: None,
                         kind: spec.kind.clone(),
                         kind_name: kind.map_or_else(|| spec.kind.clone(), |k| k.name.to_owned()),
                         target: loc.target(),

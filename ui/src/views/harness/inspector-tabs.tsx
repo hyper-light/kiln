@@ -27,6 +27,9 @@ import { Fold, FoldOpen } from "./fold";
 import { Whole } from "./whole";
 import { SubagentOutput } from "./task-output";
 import type { useReviewWaits } from "@/views/plans/review";
+import { useSession } from "@/api/harness";
+import { deferredState, pageHasItem, taskItem } from "@/api/state-pages";
+import { DeferredState } from "./deferred-state";
 
 const NO_AGENTS: readonly AgentInfo[] = [];
 
@@ -73,7 +76,7 @@ const Runs = React.memo(function Runs({ runs: ran }: { runs: ToolEvent[] }) {
   );
 });
 
-function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number; canStop: boolean; store: SessionStore; onOpen?: (toolId: string) => void }) {
+function TaskRow({ t, depth, canStop, store, onOpen, onStop }: { t: Task; depth: number; canStop: boolean; store: SessionStore; onOpen?: (toolId: string) => void; onStop?: () => void }) {
   const live = taskLive(t);
   const [outputOpen, setOutputOpen] = React.useState(false);
   const sectionOpen = React.useContext(FoldOpen);
@@ -87,7 +90,7 @@ function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number;
           {t.description}
         </button>
         {canStop && live && t.stoppable !== false && (
-          <button type="button" className="hx-icon" aria-label={`Stop ${t.description}`} onClick={() => store.send({ type: "stop_task", task: t.id })}>
+          <button type="button" className="hx-icon" aria-label={`Stop ${t.description}`} onClick={() => (onStop ? onStop() : store.send({ type: "stop_task", task: t.id }))}>
             <Square size={10} fill="currentColor" />
           </button>
         )}
@@ -146,6 +149,33 @@ export function Subagents({
   kiln?: readonly AgentInfo[];
 }) {
   const tasks = (state?.tasks ?? []).filter((t) => !isBackground(t));
+  if (deferredState(state, "tasks"))
+    return (
+      <DeferredState
+        store={store}
+        field="tasks"
+        renderValue={(value, path) => {
+          const task = taskItem(value, path);
+          if (!task) return undefined;
+          return (
+            <ul className="hx-tasks">
+              <TaskRow
+                key={task.id}
+                t={task}
+                depth={0}
+                canStop={meta?.features.includes("stop_task") ?? false}
+                store={store}
+                onOpen={onOpen}
+                onStop={() => {
+                  const current = store.get();
+                  if (pageHasItem(current.state, current.statePages.tasks, "tasks", task.id)) store.send({ type: "stop_task", task: task.id });
+                }}
+              />
+            </ul>
+          );
+        }}
+      />
+    );
   if (tasks.length === 0 && kiln.length === 0) return <div className="hx-empty">No subagents yet.</div>;
   const canStop = meta?.features.includes("stop_task") ?? false;
   // Children under their parents.
@@ -251,6 +281,7 @@ export function PlanTab({
   working: boolean;
   onOpenTask?: (toolId: string) => void;
 }) {
+  const deferredTodos = useSession(store, (s) => deferredState(s.state, "todos"));
   return (
     <div className="in-secs">
       <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
@@ -283,7 +314,10 @@ export function PlanTab({
                   </div>
                 )
               )}
-              {todos.length === 0 && !proposed && <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>}
+              {deferredTodos && <DeferredState store={store} field="todos" />}
+              {!deferredTodos && todos.length === 0 && !proposed && (
+                <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>
+              )}
             </>
           }
         />
@@ -321,13 +355,17 @@ export function ToolsTab({
     <div className="in-secs">
       {/* What it has going: shells and monitors it left running, subagents; what it works with; then
             every command it ran, last, since that list only grows. */}
-      {agentId && send && <Background state={state} agent={agentId} send={send} />}
+      {agentId && send && (
+        <DeferredState store={store} field="tasks">
+          <Background state={state} agent={agentId} send={send} />
+        </DeferredState>
+      )}
       {agentId && (
         <Fold id="live-pages" title="Live pages">
           <LivePages session={agentId} />
         </Fold>
       )}
-      {subagents > 0 && (
+      {(subagents > 0 || deferredState(state, "tasks")) && (
         <ToolSection id="subagents" title="Subagents" count={subagents}>
           <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} kiln={kiln} />
         </ToolSection>
@@ -339,7 +377,10 @@ export function ToolsTab({
         <SkillsPanel state={state} store={store} agentId={agentId} />
       </ToolSection>
       <Fold id="usage" title="Usage and status">
-        <Status state={state} />
+        <DeferredState store={store} field="limits" />
+        <DeferredState store={store} field="harness_status" />
+        <DeferredState store={store} field="usage" />
+        {!["limits", "harness_status", "usage"].some((field) => deferredState(state, field)) && <Status state={state} />}
       </Fold>
       {runs.length > 0 && (
         <Fold id="commands" title="Commands it ran" count={runs.length}>

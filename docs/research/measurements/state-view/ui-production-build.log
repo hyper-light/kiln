@@ -1,0 +1,1039 @@
+
+> kiln-ui@0.2.0 build
+> tsc -p tsconfig.app.json --noEmit && vite build && node scripts/stable-names.mjs && node scripts/server-pages.mjs && node scripts/compress-assets.mjs && node scripts/pack-ui-server.mjs
+
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+  - import "./scripts/entry-preloads" without a file extension (vite.config.ts:11:31). Add the file extension
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+[1/5] analyze client references...
+vite v8.3.4 building rsc environment for production...
+transforming...
+✓ 22 modules transformed.
+rendering chunks...
+✓ built in 28ms
+[2/5] analyze server references...
+vite v8.3.4 building ssr environment for production...
+transforming...
+✓ 3308 modules transformed.
+rendering chunks...
+✓ built in 1.04s
+[3/5] build rsc environment...
+vite v8.3.4 building rsc environment for production...
+transforming...
+✓ 440 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/server/rsc/assets/shared.plans-DOAX_J4L.css         78.51 kB │ gzip:  15.65 kB
+dist/server/rsc/assets/private-bootstrap-BJIamw4C.js      7.55 kB │ gzip:   2.64 kB
+dist/server/rsc/assets/createServerRpc-CI_GgjJH.js       12.76 kB │ gzip:   3.94 kB
+dist/server/rsc/index.js                                178.55 kB │ gzip:  38.07 kB
+dist/server/rsc/assets/shared.plans._token-Da1jFgOe.js  614.47 kB │ gzip: 135.04 kB
+
+✓ built in 455ms
+[4/5] build client environment...
+vite v8.3.4 building client environment for production...
+transforming...
+[33m[EVAL] [0mUse of direct `eval` function is strongly discouraged as it poses security risks and may cause issues with minification.
+      [38;5;246m╭[0m[38;5;246m─[0m[38;5;246m[[0m node_modules/web-tree-sitter/web-tree-sitter.js:2400:31 [38;5;246m][0m
+      [38;5;246m│[0m
+ [38;5;246m2400 │[0m [38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249mA[0m[38;5;249mS[0m[38;5;249mM[0m[38;5;249m_[0m[38;5;249mC[0m[38;5;249mO[0m[38;5;249mN[0m[38;5;249mS[0m[38;5;249mT[0m[38;5;249mS[0m[38;5;249m[[0m[38;5;249ms[0m[38;5;249mt[0m[38;5;249ma[0m[38;5;249mr[0m[38;5;249mt[0m[38;5;249m][0m[38;5;249m [0m[38;5;249m=[0m[38;5;249m [0meval[38;5;249m([0m[38;5;249mf[0m[38;5;249mu[0m[38;5;249mn[0m[38;5;249mc[0m[38;5;249m)[0m[38;5;249m;[0m
+ [38;5;240m     │[0m                               ──┬─  
+ [38;5;240m     │[0m                                 ╰─── Use of direct `eval` here.
+ [38;5;240m     │[0m 
+ [38;5;240m     │[0m [38;5;115mHelp[0m: Consider using indirect eval. For more information, check the documentation: https://rolldown.rs/guide/troubleshooting#avoiding-direct-eval
+[38;5;246m──────╯[0m
+
+[33m[EVAL] [0mUse of direct `eval` function is strongly discouraged as it poses security risks and may cause issues with minification.
+      [38;5;246m╭[0m[38;5;246m─[0m[38;5;246m[[0m node_modules/web-tree-sitter/web-tree-sitter.js:2423:33 [38;5;246m][0m
+      [38;5;246m│[0m
+ [38;5;246m2423 │[0m [38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249mm[0m[38;5;249mo[0m[38;5;249md[0m[38;5;249mu[0m[38;5;249ml[0m[38;5;249me[0m[38;5;249mE[0m[38;5;249mx[0m[38;5;249mp[0m[38;5;249mo[0m[38;5;249mr[0m[38;5;249mt[0m[38;5;249ms[0m[38;5;249m[[0m[38;5;249mn[0m[38;5;249ma[0m[38;5;249mm[0m[38;5;249me[0m[38;5;249m][0m[38;5;249m [0m[38;5;249m=[0m[38;5;249m [0meval[38;5;249m([0m[38;5;249mf[0m[38;5;249mu[0m[38;5;249mn[0m[38;5;249mc[0m[38;5;249m)[0m[38;5;249m;[0m
+ [38;5;240m     │[0m                                 ──┬─  
+ [38;5;240m     │[0m                                   ╰─── Use of direct `eval` here.
+ [38;5;240m     │[0m 
+ [38;5;240m     │[0m [38;5;115mHelp[0m: Consider using indirect eval. For more information, check the documentation: https://rolldown.rs/guide/troubleshooting#avoiding-direct-eval
+[38;5;246m──────╯[0m
+
+✓ 3355 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/client/assets/syntax-worker-highlights-C2jqLqMv.js                                                                                  0.06 kB
+dist/client/assets/syntax-worker-web-tree-sitter-SV2TCsvM.js                                                                             0.08 kB
+dist/client/assets/syntax-worker-injections-text-D2V9Riqc.js                                                                             0.12 kB
+dist/client/assets/syntax-worker-__vite-browser-external-CXImG2tW.js                                                                     0.13 kB
+dist/client/assets/syntax-worker-injections-Dtu6PFt9.js                                                                                  0.14 kB
+dist/client/assets/syntax-worker-injections-DJjp_m2d.js                                                                                  0.17 kB
+dist/client/assets/syntax-worker-highlights-kzIria7C.js                                                                                  0.20 kB
+dist/client/assets/syntax-worker-injections-1hRXiEHT.js                                                                                  0.20 kB
+dist/client/assets/syntax-worker-dockerfile-injections-VFlcjDrD.js                                                                       0.22 kB
+dist/client/assets/syntax-worker-highlights-1lDIPJr3.js                                                                                  0.22 kB
+dist/client/assets/syntax-worker-kotlin-B1C5BMsi.js                                                                                      0.22 kB
+dist/client/assets/syntax-worker-injections-L7b6mPS1.js                                                                                  0.24 kB
+dist/client/assets/syntax-worker-vue-injections-_lAl5LRU.js                                                                              0.25 kB
+dist/client/assets/syntax-worker-highlights-D_lQzMri.js                                                                                  0.26 kB
+dist/client/assets/syntax-worker-injections-CP9YUjRI.js                                                                                  0.26 kB
+dist/client/assets/syntax-worker-injections-Nc13LuVM.js                                                                                  0.27 kB
+dist/client/assets/syntax-worker-rust-D0NDwGRO.js                                                                                        0.27 kB
+dist/client/assets/syntax-worker-injections-IWSGYMcD.js                                                                                  0.29 kB
+dist/client/assets/syntax-worker-toml-B-3L97Fj.js                                                                                        0.29 kB
+dist/client/assets/syntax-worker-highlights-params-pKAomxR7.js                                                                           0.32 kB
+dist/client/assets/syntax-worker-highlights-B9SVlr0P.js                                                                                  0.33 kB
+dist/client/assets/syntax-worker-sql-CwOnJEie.js                                                                                         0.34 kB
+dist/client/assets/syntax-worker-injections-1JjsuHeE.js                                                                                  0.38 kB
+dist/client/assets/syntax-worker-highlights-1cJFsXLu.js                                                                                  0.40 kB
+dist/client/assets/syntax-worker-highlights-jsx-DXAD7Dm4.js                                                                              0.46 kB
+dist/client/assets/syntax-worker-highlights-nFwP4WUT.js                                                                                  0.53 kB
+dist/client/assets/syntax-worker-highlights-CSn8C27L.js                                                                                  0.54 kB
+dist/client/assets/syntax-worker-injections-DHw6EzeQ.js                                                                                  0.58 kB
+dist/client/assets/syntax-worker-highlights-BHyYC7gf.js                                                                                  0.60 kB
+dist/client/assets/syntax-worker-highlights-BYl4Kcr_.js                                                                                  0.63 kB
+dist/client/assets/syntax-worker-highlights-D_BvS_DC.js                                                                                  0.75 kB
+dist/client/assets/syntax-worker-highlights-BBYW1OFp.js                                                                                  0.81 kB
+dist/client/assets/syntax-worker-injections-CLxf_U4R.js                                                                                  0.82 kB
+dist/client/assets/syntax-worker-highlights-DVfBqNl9.js                                                                                  0.87 kB
+dist/client/assets/syntax-worker-injections-5AjVp2gB.js                                                                                  0.92 kB
+dist/client/assets/syntax-worker-injections-Dqft2Yhg.js                                                                                  0.92 kB
+dist/client/assets/syntax-worker-highlights-Ch6OfObk.js                                                                                  0.96 kB
+dist/client/assets/syntax-worker-highlights-BZjrEwij.js                                                                                  0.99 kB
+dist/client/assets/syntax-worker-injections-DQ9qGjbh.js                                                                                  1.11 kB
+dist/client/_entry-preloads.json                                                                                                         1.20 kB │ gzip:   0.59 kB
+dist/client/assets/syntax-worker-highlights-BADX33Bq.js                                                                                  1.20 kB
+dist/client/assets/syntax-worker-injections-CUBEb3IL.js                                                                                  1.31 kB
+dist/client/assets/syntax-worker-graphql-CucIGEbp.js                                                                                     1.39 kB
+dist/client/assets/syntax-worker-highlights-jZRiKgrN.js                                                                                  1.45 kB
+dist/client/assets/syntax-worker-highlights-kxVENyri.js                                                                                  1.46 kB
+dist/client/assets/syntax-worker-injections-CHOKs3uz.js                                                                                  1.46 kB
+dist/client/assets/syntax-worker-hcl-DH_Vd4t4.js                                                                                         1.49 kB
+dist/client/assets/syntax-worker-highlights-BCAPA-wT.js                                                                                  1.98 kB
+dist/client/assets/syntax-worker-perl-Bg6txKBA.js                                                                                        2.01 kB
+dist/client/assets/syntax-worker-highlights-tgdwzbM3.js                                                                                  2.09 kB
+dist/client/assets/syntax-worker-highlights-CW8a6uvp.js                                                                                  2.21 kB
+dist/client/assets/syntax-worker-injections-B3wEXod6.js                                                                                  2.23 kB
+dist/client/assets/syntax-worker-highlights-B0ythymQ.js                                                                                  2.28 kB
+dist/client/assets/syntax-worker-highlights-BPbdEWJ0.js                                                                                  2.31 kB
+dist/client/assets/syntax-worker-highlights-7I-fEQFg.js                                                                                  2.40 kB
+dist/client/assets/syntax-worker-highlights-jRVsKcRA.js                                                                                  2.40 kB
+dist/client/assets/syntax-worker-highlights-uF-U93wP.js                                                                                  2.77 kB
+dist/client/assets/syntax-worker-highlights-DvjBR-v2.js                                                                                  2.80 kB
+dist/client/assets/syntax-worker-highlights-CzveUe24.js                                                                                  2.81 kB
+dist/client/assets/syntax-worker-highlights-R04Zky4c.js                                                                                  2.94 kB
+dist/client/assets/syntax-worker-highlights-KJhxVNIB.js                                                                                  3.19 kB
+dist/client/assets/syntax-worker-highlights-98yePrIp.js                                                                                  3.24 kB
+dist/client/assets/syntax-worker-highlights-CWuepchI.js                                                                                  3.33 kB
+dist/client/assets/syntax-worker-highlights-l-NQMaVw.js                                                                                  3.37 kB
+dist/client/assets/syntax-worker-highlights-B5l8_iOB.js                                                                                  3.50 kB
+dist/client/assets/syntax-worker-highlights-DYfIcZkC.js                                                                                  3.55 kB
+dist/client/assets/syntax-worker-highlights-6ScXaKkp.js                                                                                  4.26 kB
+dist/client/assets/syntax-worker-highlights-DWYqhYr0.js                                                                                  4.27 kB
+dist/client/assets/syntax-worker-highlights-DbquL91H.js                                                                                  4.38 kB
+dist/client/assets/syntax-worker-highlights-BKqm757b.js                                                                                  4.42 kB
+dist/client/assets/ini-5k1wPuSJ.wasm                                                                                                     4.85 kB │ gzip:   1.93 kB
+dist/client/assets/syntax-worker-ini-5k1wPuSJ.wasm                                                                                       4.85 kB │ gzip:   1.93 kB
+dist/client/assets/syntax-worker-highlights-DXioh12r.js                                                                                  4.96 kB
+dist/client/assets/geist-mono-symbols2-wght-normal-CO5SzqOn.woff2                                                                        5.81 kB
+dist/client/assets/json-C8MpfH0B.wasm                                                                                                    5.83 kB │ gzip:   2.36 kB
+dist/client/assets/syntax-worker-json-C8MpfH0B.wasm                                                                                      5.83 kB │ gzip:   2.36 kB
+dist/client/assets/syntax-worker-highlights-rarRi7Zo.js                                                                                  5.89 kB
+dist/client/assets/geist-mono-cyrillic-ext-wght-normal-X_5orZeX.woff2                                                                    6.17 kB
+dist/client/assets/syntax-worker-workflow-injections-DJUfPHA6.js                                                                         6.21 kB
+dist/client/assets/syntax-worker-highlights-D8_TeDFz.js                                                                                  6.42 kB
+dist/client/assets/syntax-worker-highlights-uf6Bcm5m.js                                                                                  6.92 kB
+dist/client/assets/geist-cyrillic-ext-wght-normal-DjL33-gN.woff2                                                                         7.42 kB
+dist/client/assets/geist-mono-vietnamese-wght-normal-DadHysG0.woff2                                                                      7.69 kB
+dist/client/assets/syntax-worker-highlights-42MCsvyn.js                                                                                  7.80 kB
+dist/client/assets/geist-vietnamese-wght-normal-6IgcOCM7.woff2                                                                           8.00 kB
+dist/client/assets/syntax-worker-highlights-BBIiNhEY.js                                                                                  8.33 kB
+dist/client/assets/syntax-worker-highlights-C5GSwnZx.js                                                                                 10.58 kB
+dist/client/assets/geist-mono-cyrillic-wght-normal-DiZS0aHC.woff2                                                                       12.94 kB
+dist/client/assets/geist-mono-latin-ext-wght-normal-Bwz-egvJ.woff2                                                                      14.69 kB
+dist/client/assets/geist-cyrillic-wght-normal-BEAKL7Jp.woff2                                                                            15.08 kB
+dist/client/assets/geist-latin-ext-wght-normal-DC-KSUi6.woff2                                                                           16.51 kB
+dist/client/assets/html-Cwy522Nv.wasm                                                                                                   18.51 kB │ gzip:   7.00 kB
+dist/client/assets/syntax-worker-html-Cwy522Nv.wasm                                                                                     18.51 kB │ gzip:   7.00 kB
+dist/client/assets/geist-mono-latin-wght-normal-XN7g48iV.woff2                                                                          23.12 kB
+dist/client/assets/toml-TVAvUSHG.wasm                                                                                                   24.63 kB │ gzip:   7.67 kB
+dist/client/assets/syntax-worker-toml-TVAvUSHG.wasm                                                                                     24.63 kB │ gzip:   7.67 kB
+dist/client/assets/astro-Dn-5TUt3.wasm                                                                                                  24.74 kB │ gzip:   8.76 kB
+dist/client/assets/syntax-worker-astro-Dn-5TUt3.wasm                                                                                    24.74 kB │ gzip:   8.76 kB
+dist/client/.kiln-chunks.json                                                                                                           24.99 kB │ gzip:   6.81 kB
+dist/client/assets/geist-latin-wght-normal-BgDaEnEv.woff2                                                                               29.40 kB
+dist/client/assets/jsdoc-CzG9Myah.wasm                                                                                                  30.39 kB │ gzip:   9.74 kB
+dist/client/assets/syntax-worker-jsdoc-CzG9Myah.wasm                                                                                    30.39 kB │ gzip:   9.74 kB
+dist/client/assets/syntax-worker-worker-Uxm4-BVp.js                                                                                     39.38 kB
+dist/client/assets/svelte-lsfxvx-l.wasm                                                                                                 45.06 kB │ gzip:  13.88 kB
+dist/client/assets/syntax-worker-svelte-lsfxvx-l.wasm                                                                                   45.06 kB │ gzip:  13.88 kB
+dist/client/assets/xml-BJ7d0Auj.wasm                                                                                                    47.18 kB │ gzip:  16.27 kB
+dist/client/assets/syntax-worker-xml-BJ7d0Auj.wasm                                                                                      47.18 kB │ gzip:  16.27 kB
+dist/client/assets/dockerfile-D-QAyKyR.wasm                                                                                             49.58 kB │ gzip:  17.50 kB
+dist/client/assets/syntax-worker-dockerfile-D-QAyKyR.wasm                                                                               49.58 kB │ gzip:  17.50 kB
+dist/client/assets/graphql-DqCFehRD.wasm                                                                                                52.33 kB │ gzip:  12.71 kB
+dist/client/assets/syntax-worker-graphql-DqCFehRD.wasm                                                                                  52.33 kB │ gzip:  12.71 kB
+dist/client/assets/lua-5YmIKKzC.wasm                                                                                                    53.20 kB │ gzip:  13.41 kB
+dist/client/assets/syntax-worker-lua-5YmIKKzC.wasm                                                                                      53.20 kB │ gzip:  13.41 kB
+dist/client/assets/vue-BLHf3m0U.wasm                                                                                                    61.15 kB │ gzip:  18.26 kB
+dist/client/assets/syntax-worker-vue-BLHf3m0U.wasm                                                                                      61.15 kB │ gzip:  18.26 kB
+dist/client/assets/cmake-BepY0Xsn.wasm                                                                                                  75.46 kB │ gzip:  16.45 kB
+dist/client/assets/syntax-worker-cmake-BepY0Xsn.wasm                                                                                    75.46 kB │ gzip:  16.45 kB
+dist/client/assets/nix-BqG2tF-3.wasm                                                                                                    78.65 kB │ gzip:  16.43 kB
+dist/client/assets/syntax-worker-nix-BqG2tF-3.wasm                                                                                      78.65 kB │ gzip:  16.43 kB
+dist/client/assets/proto-Dw0Gmwyd.wasm                                                                                                  79.10 kB │ gzip:  15.23 kB
+dist/client/assets/syntax-worker-proto-Dw0Gmwyd.wasm                                                                                    79.10 kB │ gzip:  15.23 kB
+dist/client/assets/syntax-worker-web-tree-sitter-D_6q3-tK.js                                                                            80.61 kB
+dist/client/assets/hcl-DkcpBPk_.wasm                                                                                                    94.87 kB │ gzip:  22.02 kB
+dist/client/assets/syntax-worker-hcl-DkcpBPk_.wasm                                                                                      94.87 kB │ gzip:  22.02 kB
+dist/client/assets/css-DSz2crqn.wasm                                                                                                   128.76 kB │ gzip:  21.82 kB
+dist/client/assets/syntax-worker-css-DSz2crqn.wasm                                                                                     128.76 kB │ gzip:  21.82 kB
+dist/client/assets/make-Dckjiazg.wasm                                                                                                  146.47 kB │ gzip:  35.35 kB
+dist/client/assets/syntax-worker-make-Dckjiazg.wasm                                                                                    146.47 kB │ gzip:  35.35 kB
+dist/client/assets/yaml-DKL62GuM.wasm                                                                                                  189.25 kB │ gzip:  36.18 kB
+dist/client/assets/syntax-worker-yaml-DKL62GuM.wasm                                                                                    189.25 kB │ gzip:  36.18 kB
+dist/client/assets/web-tree-sitter-CJcQnmR7.wasm                                                                                       210.41 kB │ gzip:  84.37 kB
+dist/client/assets/syntax-worker-web-tree-sitter-CJcQnmR7.wasm                                                                         210.41 kB │ gzip:  84.37 kB
+dist/client/assets/go-B3xDAl87.wasm                                                                                                    217.83 kB │ gzip:  40.87 kB
+dist/client/assets/syntax-worker-go-B3xDAl87.wasm                                                                                      217.83 kB │ gzip:  40.87 kB
+dist/client/assets/markdown_inline-TEIlbplS.wasm                                                                                       378.75 kB │ gzip:  63.80 kB
+dist/client/assets/syntax-worker-markdown_inline-TEIlbplS.wasm                                                                         378.75 kB │ gzip:  63.80 kB
+dist/client/assets/markdown-chtiRU8J.wasm                                                                                              380.05 kB │ gzip:  60.96 kB
+dist/client/assets/syntax-worker-markdown-chtiRU8J.wasm                                                                                380.05 kB │ gzip:  60.96 kB
+dist/client/assets/java-njgHcQ4A.wasm                                                                                                  415.50 kB │ gzip:  52.96 kB
+dist/client/assets/syntax-worker-java-njgHcQ4A.wasm                                                                                    415.50 kB │ gzip:  52.96 kB
+dist/client/assets/javascript-Dckfk8f3.wasm                                                                                            415.62 kB │ gzip:  51.71 kB
+dist/client/assets/syntax-worker-javascript-Dckfk8f3.wasm                                                                              415.62 kB │ gzip:  51.71 kB
+dist/client/assets/erlang-DbdBgHeM.wasm                                                                                                421.75 kB │ gzip:  50.36 kB
+dist/client/assets/syntax-worker-erlang-DbdBgHeM.wasm                                                                                  421.75 kB │ gzip:  50.36 kB
+dist/client/assets/python-f5ylbI0N.wasm                                                                                                458.71 kB │ gzip:  69.55 kB
+dist/client/assets/syntax-worker-python-f5ylbI0N.wasm                                                                                  458.71 kB │ gzip:  69.55 kB
+dist/client/assets/r-DIjWKNWe.wasm                                                                                                     484.87 kB │ gzip:  51.83 kB
+dist/client/assets/syntax-worker-r-DIjWKNWe.wasm                                                                                       484.87 kB │ gzip:  51.83 kB
+dist/client/assets/solidity-DBFqNGrN.wasm                                                                                              511.05 kB │ gzip:  48.30 kB
+dist/client/assets/syntax-worker-solidity-DBFqNGrN.wasm                                                                                511.05 kB │ gzip:  48.30 kB
+dist/client/assets/c-DU4Sh3ku.wasm                                                                                                     625.89 kB │ gzip:  75.36 kB
+dist/client/assets/syntax-worker-c-DU4Sh3ku.wasm                                                                                       625.89 kB │ gzip:  75.36 kB
+dist/client/assets/zig-DoO3_zRX.wasm                                                                                                   691.99 kB │ gzip:  53.85 kB
+dist/client/assets/syntax-worker-zig-DoO3_zRX.wasm                                                                                     691.99 kB │ gzip:  53.85 kB
+dist/client/assets/powershell-B09UYrZM.wasm                                                                                            990.44 kB │ gzip:  96.11 kB
+dist/client/assets/syntax-worker-powershell-B09UYrZM.wasm                                                                              990.44 kB │ gzip:  96.11 kB
+dist/client/assets/php_only-VgBdrY9G.wasm                                                                                            1,005.25 kB │ gzip:  97.07 kB
+dist/client/assets/syntax-worker-php_only-VgBdrY9G.wasm                                                                              1,005.25 kB │ gzip:  97.07 kB
+dist/client/assets/php-CO2J0kgb.wasm                                                                                                 1,060.53 kB │ gzip: 108.66 kB
+dist/client/assets/syntax-worker-php-CO2J0kgb.wasm                                                                                   1,060.53 kB │ gzip: 108.66 kB
+dist/client/assets/rust-Dn5NmoPe.wasm                                                                                                1,116.13 kB │ gzip: 119.62 kB
+dist/client/assets/syntax-worker-rust-Dn5NmoPe.wasm                                                                                  1,116.13 kB │ gzip: 119.62 kB
+dist/client/assets/dart-DdGe-p0_.wasm                                                                                                1,270.10 kB │ gzip: 123.01 kB
+dist/client/assets/syntax-worker-dart-DdGe-p0_.wasm                                                                                  1,270.10 kB │ gzip: 123.01 kB
+dist/client/assets/bash-BvuUEcYj.wasm                                                                                                1,358.37 kB │ gzip: 186.33 kB
+dist/client/assets/syntax-worker-bash-BvuUEcYj.wasm                                                                                  1,358.37 kB │ gzip: 186.33 kB
+dist/client/assets/elixir-CHAnn8eH.wasm                                                                                              1,412.39 kB │ gzip: 155.33 kB
+dist/client/assets/syntax-worker-elixir-CHAnn8eH.wasm                                                                                1,412.39 kB │ gzip: 155.33 kB
+dist/client/assets/typescript-p9-HFoRs.wasm                                                                                          1,415.27 kB │ gzip: 141.43 kB
+dist/client/assets/syntax-worker-typescript-p9-HFoRs.wasm                                                                            1,415.27 kB │ gzip: 141.43 kB
+dist/client/assets/tsx-BDYohy5r.wasm                                                                                                 1,447.19 kB │ gzip: 144.50 kB
+dist/client/assets/syntax-worker-tsx-BDYohy5r.wasm                                                                                   1,447.19 kB │ gzip: 144.50 kB
+dist/client/assets/ocaml_interface-CnsuysF9.wasm                                                                                     2,075.35 kB │ gzip: 215.05 kB
+dist/client/assets/syntax-worker-ocaml_interface-CnsuysF9.wasm                                                                       2,075.35 kB │ gzip: 215.05 kB
+dist/client/assets/ruby-Cp-Q0uoI.wasm                                                                                                2,106.86 kB │ gzip: 169.41 kB
+dist/client/assets/syntax-worker-ruby-Cp-Q0uoI.wasm                                                                                  2,106.86 kB │ gzip: 169.41 kB
+dist/client/assets/sql-1DPhIxVW.wasm                                                                                                 2,437.46 kB │ gzip: 330.17 kB
+dist/client/assets/syntax-worker-sql-1DPhIxVW.wasm                                                                                   2,437.46 kB │ gzip: 330.17 kB
+dist/client/assets/ocaml-S4iFaHpm.wasm                                                                                               2,495.65 kB │ gzip: 245.62 kB
+dist/client/assets/syntax-worker-ocaml-S4iFaHpm.wasm                                                                                 2,495.65 kB │ gzip: 245.62 kB
+dist/client/assets/perl-BI0-mLHs.wasm                                                                                                2,872.77 kB │ gzip: 187.13 kB
+dist/client/assets/syntax-worker-perl-BI0-mLHs.wasm                                                                                  2,872.77 kB │ gzip: 187.13 kB
+dist/client/assets/cpp-BvMq0oSp.wasm                                                                                                 3,435.86 kB │ gzip: 286.06 kB
+dist/client/assets/syntax-worker-cpp-BvMq0oSp.wasm                                                                                   3,435.86 kB │ gzip: 286.06 kB
+dist/client/assets/swift-Dx-9eoDr.wasm                                                                                               3,727.39 kB │ gzip: 337.54 kB
+dist/client/assets/syntax-worker-swift-Dx-9eoDr.wasm                                                                                 3,727.39 kB │ gzip: 337.54 kB
+dist/client/assets/haskell-DMFtprEm.wasm                                                                                             3,808.02 kB │ gzip: 305.72 kB
+dist/client/assets/syntax-worker-haskell-DMFtprEm.wasm                                                                               3,808.02 kB │ gzip: 305.72 kB
+dist/client/assets/scala-DsTWTWLd.wasm                                                                                               4,947.58 kB │ gzip: 619.89 kB
+dist/client/assets/syntax-worker-scala-DsTWTWLd.wasm                                                                                 4,947.58 kB │ gzip: 619.89 kB
+dist/client/assets/objc-BxUE5KJ_.wasm                                                                                                5,316.92 kB │ gzip: 290.67 kB
+dist/client/assets/syntax-worker-objc-BxUE5KJ_.wasm                                                                                  5,316.92 kB │ gzip: 290.67 kB
+dist/client/assets/c_sharp-51s6pSmQ.wasm                                                                                             5,328.72 kB │ gzip: 326.49 kB
+dist/client/assets/syntax-worker-c_sharp-51s6pSmQ.wasm                                                                               5,328.72 kB │ gzip: 326.49 kB
+dist/client/assets/kotlin-C9BQpfFb.wasm                                                                                              5,773.50 kB │ gzip: 395.80 kB
+dist/client/assets/syntax-worker-kotlin-C9BQpfFb.wasm                                                                                5,773.50 kB │ gzip: 395.80 kB
+dist/client/assets/julia-CvA1aGkB.wasm                                                                                               6,223.29 kB │ gzip: 583.06 kB
+dist/client/assets/syntax-worker-julia-CvA1aGkB.wasm                                                                                 6,223.29 kB │ gzip: 583.06 kB
+dist/client/assets/syntax-DPpknbwB.css                                                                                                   0.35 kB │ gzip:   0.21 kB
+dist/client/assets/pager-BOUr0ddQ.css                                                                                                    0.80 kB │ gzip:   0.40 kB
+dist/client/assets/clusters-9t6QDp-F.css                                                                                                 1.12 kB │ gzip:   0.56 kB
+dist/client/assets/_app-B23gtb7i.css                                                                                                     1.35 kB │ gzip:   0.59 kB
+dist/client/assets/index-CWlGCPL-.css                                                                                                    1.50 kB │ gzip:   0.52 kB
+dist/client/assets/approval-toasts-WZakZ2y_.css                                                                                          1.57 kB │ gzip:   0.69 kB
+dist/client/assets/_app.runners-Dncnfcnw.css                                                                                             1.61 kB │ gzip:   0.61 kB
+dist/client/assets/uplot-chart-CnsZ1jie.css                                                                                              1.64 kB │ gzip:   0.69 kB
+dist/client/assets/index-YqE3qwKu.css                                                                                                    1.80 kB │ gzip:   0.58 kB
+dist/client/assets/section-BV-oiAqB.css                                                                                                  1.98 kB │ gzip:   0.78 kB
+dist/client/assets/observe-DJ5Ib0YC.css                                                                                                  2.27 kB │ gzip:   0.93 kB
+dist/client/assets/stands-f1TcA9As.css                                                                                                   2.53 kB │ gzip:   0.94 kB
+dist/client/assets/board-B6mcbhXA.css                                                                                                    2.58 kB │ gzip:   0.82 kB
+dist/client/assets/attach-2VW--PxZ.css                                                                                                   2.74 kB │ gzip:   0.89 kB
+dist/client/assets/_app-LUC3wJAW.css                                                                                                     2.77 kB │ gzip:   0.92 kB
+dist/client/assets/prose-Iq-nl-qr.css                                                                                                    3.06 kB │ gzip:   1.03 kB
+dist/client/assets/xterm-setup-B1njb2Cr.css                                                                                              3.96 kB │ gzip:   1.02 kB
+dist/client/assets/research-BEscUvem.css                                                                                                 5.22 kB │ gzip:   1.47 kB
+dist/client/assets/about-BVtS5aI2.css                                                                                                    5.70 kB │ gzip:   1.69 kB
+dist/client/assets/diff-CKEJ-Aq-.css                                                                                                     7.13 kB │ gzip:   2.07 kB
+dist/client/assets/releases-Dm07-bW5.css                                                                                                 8.37 kB │ gzip:   1.94 kB
+dist/client/assets/settings-ci-CBf_uFbZ.css                                                                                              9.25 kB │ gzip:   2.39 kB
+dist/client/assets/signals-qK2eCoEq.css                                                                                                  9.89 kB │ gzip:   2.88 kB
+dist/client/assets/review-Bw7d3w-O.css                                                                                                   9.98 kB │ gzip:   2.53 kB
+dist/client/assets/seen-Cfk9PK_7.css                                                                                                    10.43 kB │ gzip:   2.80 kB
+dist/client/assets/_app.agents-C4Vd8BHl.css                                                                                             10.86 kB │ gzip:   2.71 kB
+dist/client/assets/_app.runners-iwgPajJh.css                                                                                            11.91 kB │ gzip:   3.16 kB
+dist/client/assets/_app-DVFNv5yz.css                                                                                                    13.00 kB │ gzip:   2.88 kB
+dist/client/assets/_app.runners-CpPHKhsH.css                                                                                            14.32 kB │ gzip:   3.57 kB
+dist/client/assets/index-CsEQlu8n.css                                                                                                   16.50 kB │ gzip:   3.71 kB
+dist/client/assets/jobs-BeYHWuC_.css                                                                                                    23.67 kB │ gzip:   5.71 kB
+dist/client/assets/approval-auwkuxlc.css                                                                                                24.40 kB │ gzip:   6.00 kB
+dist/client/assets/ship-C8CC9Wet.css                                                                                                    31.71 kB │ gzip:   7.05 kB
+dist/client/assets/_app.agents-NhOkZ3re.css                                                                                             31.73 kB │ gzip:   7.20 kB
+dist/client/assets/parts-Bi9Z4c5L.css                                                                                                   32.94 kB │ gzip:   7.39 kB
+dist/client/assets/review-KO4Xo_6R.css                                                                                                  32.95 kB │ gzip:   7.30 kB
+dist/client/assets/deployments-oW9KCrf5.css                                                                                             33.39 kB │ gzip:   7.17 kB
+dist/client/assets/_app-DDxKW-B9.css                                                                                                    40.64 kB │ gzip:   8.62 kB
+dist/client/assets/harness-rX8V7UQa.css                                                                                                 62.01 kB │ gzip:  12.73 kB
+dist/client/assets/shared.plans-DOAX_J4L.css                                                                                            78.51 kB │ gzip:  15.65 kB
+dist/client/assets/index-DBq2tFs4.css                                                                                                  108.33 kB │ gzip:  23.04 kB
+dist/client/assets/_app.terminal-DJ7LAi8J.js                                                                                             0.03 kB │ gzip:   0.05 kB
+dist/client/assets/highlights-C2jqLqMv.js                                                                                                0.06 kB │ gzip:   0.07 kB
+dist/client/assets/web-tree-sitter-BkwZXSRu.js                                                                                           0.06 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.apm.index-Cg23Uli4.js                                                                                    0.06 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.apm.services._name-wzFlwP8t.js                                                                           0.06 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.llm.index-BA5s2UyE.js                                                                                    0.06 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.llm.traces._id-B5y9bRvK.js                                                                               0.06 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.logs-Ht4cVrdm.js                                                                                         0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.slos.index-XUUl6V3p.js                                                                                   0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.review.hosts._repo._number-6pGq4Yek.js                                                                           0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.review.hosts._repo.index-Cy7kJja1.js                                                                             0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.agents.sessions-BYVGRcvk.js                                                                                      0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.deployments.environments.index-D0SdfuLn.js                                                                       0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.hosts.index-BCSiRYV9.js                                                                                  0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.deployments.releases.fleets._id-DZfWYJCo.js                                                                      0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.deployments.releases.fleets.new-BEaZmxmw.js                                                                      0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.errors._id-BAhUvySR.js                                                                                   0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.errors.index-CaSAH5P-.js                                                                                 0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.traces._id-Ccn0_2X3.js                                                                                   0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.traces.index-Dit1crWv.js                                                                                 0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.catalog.index-BSRWcbJH.js                                                                                0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.indexes-D5DPCwjG.js                                                                                      0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.agents.research._id-Df2f3v16.js                                                                                  0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.deployments.releases.index-VYzq01PA.js                                                                           0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.deployments.releases.templates._name-CZ539mki.js                                                                 0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.deployments.releases.templates.index-zQ6M0xmO.js                                                                 0.07 kB │ gzip:   0.09 kB
+dist/client/assets/_app.observe.incidents.index-CMCdoGCw.js                                                                              0.07 kB │ gzip:   0.09 kB
+dist/client/assets/_app.observe.notebooks.index-D1oB80Hg.js                                                                              0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.observe.containers.index-D0M9inc4.js                                                                             0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.runs._id.index-BFyZtG1I.js                                                                                       0.07 kB │ gzip:   0.08 kB
+dist/client/assets/_app.runs._id.jobs._jobId-BFyZtG1I.js                                                                                 0.07 kB │ gzip:   0.08 kB
+dist/client/assets/__vite-browser-external-2W3EstLn.js                                                                                   0.10 kB │ gzip:   0.11 kB
+dist/client/assets/injections-text-D2V9Riqc.js                                                                                           0.12 kB │ gzip:   0.11 kB
+dist/client/assets/injections-Dtu6PFt9.js                                                                                                0.14 kB │ gzip:   0.11 kB
+dist/client/assets/_app.observe.events-BaGFEdOC.js                                                                                       0.16 kB │ gzip:   0.15 kB
+dist/client/assets/injections-DJjp_m2d.js                                                                                                0.17 kB │ gzip:   0.12 kB
+dist/client/assets/types-BAxwRlfw.js                                                                                                     0.17 kB │ gzip:   0.15 kB
+dist/client/assets/tries-C88KJHG2.js                                                                                                     0.18 kB │ gzip:   0.14 kB
+dist/client/assets/highlights-kzIria7C.js                                                                                                0.20 kB │ gzip:   0.16 kB
+dist/client/assets/injections-1hRXiEHT.js                                                                                                0.20 kB │ gzip:   0.13 kB
+dist/client/assets/dockerfile-injections-VFlcjDrD.js                                                                                     0.22 kB │ gzip:   0.19 kB
+dist/client/assets/highlights-1lDIPJr3.js                                                                                                0.22 kB │ gzip:   0.17 kB
+dist/client/assets/kotlin-B1C5BMsi.js                                                                                                    0.22 kB │ gzip:   0.18 kB
+dist/client/assets/injections-L7b6mPS1.js                                                                                                0.24 kB │ gzip:   0.16 kB
+dist/client/assets/vue-injections-_lAl5LRU.js                                                                                            0.25 kB │ gzip:   0.20 kB
+dist/client/assets/highlights-D_lQzMri.js                                                                                                0.26 kB │ gzip:   0.20 kB
+dist/client/assets/injections-CP9YUjRI.js                                                                                                0.26 kB │ gzip:   0.14 kB
+dist/client/assets/shared.plans._token-DtksbdhC.js                                                                                       0.26 kB │ gzip:   0.19 kB
+dist/client/assets/injections-Nc13LuVM.js                                                                                                0.27 kB │ gzip:   0.14 kB
+dist/client/assets/rust-D0NDwGRO.js                                                                                                      0.27 kB │ gzip:   0.21 kB
+dist/client/assets/injections-IWSGYMcD.js                                                                                                0.29 kB │ gzip:   0.18 kB
+dist/client/assets/toml-B-3L97Fj.js                                                                                                      0.29 kB │ gzip:   0.19 kB
+dist/client/assets/shared.plans._token-B5GOEcyG.js                                                                                       0.30 kB │ gzip:   0.24 kB
+dist/client/assets/highlights-params-pKAomxR7.js                                                                                         0.32 kB │ gzip:   0.17 kB
+dist/client/assets/new-agent-draft-_SYY6IHN.js                                                                                           0.32 kB │ gzip:   0.24 kB
+dist/client/assets/highlights-B9SVlr0P.js                                                                                                0.33 kB │ gzip:   0.21 kB
+dist/client/assets/head-ITTYJreF.js                                                                                                      0.33 kB │ gzip:   0.23 kB
+dist/client/assets/sql-CwOnJEie.js                                                                                                       0.34 kB │ gzip:   0.23 kB
+dist/client/assets/shared.plans._token-j8rGHjd-.js                                                                                       0.36 kB │ gzip:   0.24 kB
+dist/client/assets/injections-1JjsuHeE.js                                                                                                0.38 kB │ gzip:   0.17 kB
+dist/client/assets/highlights-1cJFsXLu.js                                                                                                0.40 kB │ gzip:   0.24 kB
+dist/client/assets/jsx-runtime-NZYk81nU.js                                                                                               0.43 kB │ gzip:   0.30 kB
+dist/client/assets/highlights-jsx-DXAD7Dm4.js                                                                                            0.46 kB │ gzip:   0.19 kB
+dist/client/assets/views-CvINPjJp.js                                                                                                     0.50 kB │ gzip:   0.32 kB
+dist/client/assets/highlights-nFwP4WUT.js                                                                                                0.53 kB │ gzip:   0.28 kB
+dist/client/assets/highlights-CSn8C27L.js                                                                                                0.54 kB │ gzip:   0.30 kB
+dist/client/assets/injections-DHw6EzeQ.js                                                                                                0.58 kB │ gzip:   0.23 kB
+dist/client/assets/gates-Jl8fyEsr.js                                                                                                     0.58 kB │ gzip:   0.35 kB
+dist/client/assets/highlights-BHyYC7gf.js                                                                                                0.60 kB │ gzip:   0.32 kB
+dist/client/assets/highlights-BYl4Kcr_.js                                                                                                0.63 kB │ gzip:   0.40 kB
+dist/client/assets/shared.plans._token-BLk5WTPF.js                                                                                       0.64 kB │ gzip:   0.38 kB
+dist/client/assets/diagnostics-txIolKcf.js                                                                                               0.68 kB │ gzip:   0.40 kB
+dist/client/assets/rolldown-runtime-hePW80VL.js                                                                                          0.71 kB │ gzip:   0.42 kB
+dist/client/assets/chart-CYUFR8ur.js                                                                                                     0.72 kB │ gzip:   0.41 kB
+dist/client/assets/highlights-D_BvS_DC.js                                                                                                0.75 kB │ gzip:   0.34 kB
+dist/client/assets/refused-D9M1r6zY.js                                                                                                   0.81 kB │ gzip:   0.46 kB
+dist/client/assets/highlights-BBYW1OFp.js                                                                                                0.81 kB │ gzip:   0.35 kB
+dist/client/assets/injections-CLxf_U4R.js                                                                                                0.82 kB │ gzip:   0.26 kB
+dist/client/assets/attention-requests-Bu7th2tU.js                                                                                        0.82 kB │ gzip:   0.46 kB
+dist/client/assets/name-field-Dg9nmBUL.js                                                                                                0.87 kB │ gzip:   0.54 kB
+dist/client/assets/highlights-DVfBqNl9.js                                                                                                0.87 kB │ gzip:   0.38 kB
+dist/client/assets/injections-5AjVp2gB.js                                                                                                0.92 kB │ gzip:   0.27 kB
+dist/client/assets/injections-Dqft2Yhg.js                                                                                                0.92 kB │ gzip:   0.45 kB
+dist/client/assets/frames-yAN1-tcD.js                                                                                                    0.92 kB │ gzip:   0.45 kB
+dist/client/assets/highlights-Ch6OfObk.js                                                                                                0.96 kB │ gzip:   0.43 kB
+dist/client/assets/_app._-D5ZIYQto.js                                                                                                    0.97 kB │ gzip:   0.55 kB
+dist/client/assets/highlights-BZjrEwij.js                                                                                                0.99 kB │ gzip:   0.38 kB
+dist/client/assets/copy-block-DsIs2gfE.js                                                                                                1.00 kB │ gzip:   0.51 kB
+dist/client/assets/cards-D7QN3v7q.js                                                                                                     1.02 kB │ gzip:   0.58 kB
+dist/client/assets/hold-DT3XfMvn.js                                                                                                      1.10 kB │ gzip:   0.48 kB
+dist/client/assets/battery-ZQu0jVxg.js                                                                                                   1.10 kB │ gzip:   0.68 kB
+dist/client/assets/injections-DQ9qGjbh.js                                                                                                1.11 kB │ gzip:   0.26 kB
+dist/client/assets/pager-CcJv85DI.js                                                                                                     1.14 kB │ gzip:   0.55 kB
+dist/client/assets/agent-CD_TDUXI.js                                                                                                     1.16 kB │ gzip:   0.64 kB
+dist/client/assets/highlights-BADX33Bq.js                                                                                                1.20 kB │ gzip:   0.45 kB
+dist/client/assets/motion-rpi_Lowr.js                                                                                                    1.22 kB │ gzip:   0.69 kB
+dist/client/assets/attach-k-zYet6C.js                                                                                                    1.25 kB │ gzip:   0.60 kB
+dist/client/assets/keys-CrOBs6YI.js                                                                                                      1.28 kB │ gzip:   0.68 kB
+dist/client/assets/injections-CUBEb3IL.js                                                                                                1.31 kB │ gzip:   0.29 kB
+dist/client/assets/auth-PLp2AgQW.js                                                                                                      1.35 kB │ gzip:   0.78 kB
+dist/client/assets/graphql-CucIGEbp.js                                                                                                   1.39 kB │ gzip:   0.58 kB
+dist/client/assets/log-lazy-DHT0-fOZ.js                                                                                                  1.42 kB │ gzip:   0.75 kB
+dist/client/assets/highlights-jZRiKgrN.js                                                                                                1.45 kB │ gzip:   0.58 kB
+dist/client/assets/highlights-kxVENyri.js                                                                                                1.46 kB │ gzip:   0.50 kB
+dist/client/assets/injections-CHOKs3uz.js                                                                                                1.46 kB │ gzip:   0.44 kB
+dist/client/assets/hcl-DH_Vd4t4.js                                                                                                       1.49 kB │ gzip:   0.69 kB
+dist/client/assets/dom-BcGM8KCu.js                                                                                                       1.58 kB │ gzip:   0.73 kB
+dist/client/assets/tabs-BThUxTz5.js                                                                                                      1.59 kB │ gzip:   0.83 kB
+dist/client/assets/yaml-5E9_FNEq.js                                                                                                      1.69 kB │ gzip:   0.90 kB
+dist/client/assets/error-boundary-MEFaNvAS.js                                                                                            1.72 kB │ gzip:   0.87 kB
+dist/client/assets/logs-C6K9Jh_8.js                                                                                                      1.80 kB │ gzip:   0.87 kB
+dist/client/assets/signin-DUibN9UV.js                                                                                                    1.87 kB │ gzip:   0.84 kB
+dist/client/assets/highlights-BCAPA-wT.js                                                                                                1.98 kB │ gzip:   0.87 kB
+dist/client/assets/perl-Bg6txKBA.js                                                                                                      2.01 kB │ gzip:   0.89 kB
+dist/client/assets/highlights-tgdwzbM3.js                                                                                                2.09 kB │ gzip:   0.75 kB
+dist/client/assets/_app.review.stacks._id-Ckc3SByp.js                                                                                    2.11 kB │ gzip:   0.98 kB
+dist/client/assets/dropdown-BaxAqxXe.js                                                                                                  2.17 kB │ gzip:   1.10 kB
+dist/client/assets/highlights-CW8a6uvp.js                                                                                                2.21 kB │ gzip:   0.60 kB
+dist/client/assets/injections-B3wEXod6.js                                                                                                2.23 kB │ gzip:   0.53 kB
+dist/client/assets/plans-C3-IrTqg.js                                                                                                     2.24 kB │ gzip:   0.86 kB
+dist/client/assets/tooltip-CRhG4ktC.js                                                                                                   2.28 kB │ gzip:   1.18 kB
+dist/client/assets/highlights-B0ythymQ.js                                                                                                2.28 kB │ gzip:   1.03 kB
+dist/client/assets/highlights-BPbdEWJ0.js                                                                                                2.31 kB │ gzip:   0.96 kB
+dist/client/assets/highlighted-CrrpwH92.js                                                                                               2.32 kB │ gzip:   1.18 kB
+dist/client/assets/highlights-7I-fEQFg.js                                                                                                2.40 kB │ gzip:   0.81 kB
+dist/client/assets/highlights-jRVsKcRA.js                                                                                                2.40 kB │ gzip:   0.84 kB
+dist/client/assets/host-charts-DCuYYWuT.js                                                                                               2.59 kB │ gzip:   1.08 kB
+dist/client/assets/live-9RHt_QDU.js                                                                                                      2.60 kB │ gzip:   1.16 kB
+dist/client/assets/data-UFJmUYp9.js                                                                                                      2.61 kB │ gzip:   1.35 kB
+dist/client/assets/tasks-DTdpn0B6.js                                                                                                     2.64 kB │ gzip:   1.24 kB
+dist/client/assets/signing-I8eTD4z_.js                                                                                                   2.75 kB │ gzip:   1.48 kB
+dist/client/assets/highlights-uF-U93wP.js                                                                                                2.77 kB │ gzip:   0.92 kB
+dist/client/assets/highlights-DvjBR-v2.js                                                                                                2.80 kB │ gzip:   1.15 kB
+dist/client/assets/reach-TK1ROrWT.js                                                                                                     2.81 kB │ gzip:   1.40 kB
+dist/client/assets/highlights-CzveUe24.js                                                                                                2.81 kB │ gzip:   0.95 kB
+dist/client/assets/cd-s7nMxPKk.js                                                                                                        2.82 kB │ gzip:   0.98 kB
+dist/client/assets/parts-BXP2og7u.js                                                                                                     2.91 kB │ gzip:   1.40 kB
+dist/client/assets/highlights-R04Zky4c.js                                                                                                2.94 kB │ gzip:   0.94 kB
+dist/client/assets/_app.review.queue-BajJPBCA.js                                                                                         3.06 kB │ gzip:   1.38 kB
+dist/client/assets/highlights-KJhxVNIB.js                                                                                                3.19 kB │ gzip:   1.19 kB
+dist/client/assets/mission-rows-M4Fe9ZLV.js                                                                                              3.23 kB │ gzip:   1.36 kB
+dist/client/assets/highlights-98yePrIp.js                                                                                                3.24 kB │ gzip:   1.02 kB
+dist/client/assets/highlights-CWuepchI.js                                                                                                3.33 kB │ gzip:   1.19 kB
+dist/client/assets/highlights-l-NQMaVw.js                                                                                                3.37 kB │ gzip:   1.21 kB
+dist/client/assets/clipboard-CXoCYr7H.js                                                                                                 3.38 kB │ gzip:   1.45 kB
+dist/client/assets/highlights-B5l8_iOB.js                                                                                                3.50 kB │ gzip:   1.29 kB
+dist/client/assets/highlights-DYfIcZkC.js                                                                                                3.55 kB │ gzip:   0.99 kB
+dist/client/assets/compose-field-Cc4j9FEj.js                                                                                             3.60 kB │ gzip:   1.53 kB
+dist/client/assets/push-DyGiFzMW.js                                                                                                      3.73 kB │ gzip:   1.60 kB
+dist/client/assets/attention-state-B6l5KBGX.js                                                                                           3.82 kB │ gzip:   1.62 kB
+dist/client/assets/_app.observe.monitors.index-C_2WljvE.js                                                                               4.07 kB │ gzip:   1.68 kB
+dist/client/assets/patch-KcE3ctZF.js                                                                                                     4.21 kB │ gzip:   1.82 kB
+dist/client/assets/highlights-6ScXaKkp.js                                                                                                4.26 kB │ gzip:   1.28 kB
+dist/client/assets/highlights-DWYqhYr0.js                                                                                                4.27 kB │ gzip:   1.57 kB
+dist/client/assets/highlights-DbquL91H.js                                                                                                4.38 kB │ gzip:   1.27 kB
+dist/client/assets/highlights-BKqm757b.js                                                                                                4.42 kB │ gzip:   1.62 kB
+dist/client/assets/spawn-setup-CgDszHVP.js                                                                                               4.55 kB │ gzip:   1.98 kB
+dist/client/assets/state-DtlcYKq4.js                                                                                                     4.56 kB │ gzip:   1.97 kB
+dist/client/assets/notebooks-CnwXo5_L.js                                                                                                 4.66 kB │ gzip:   1.91 kB
+dist/client/assets/shared-VVInDE0Z.js                                                                                                    4.73 kB │ gzip:   1.77 kB
+dist/client/assets/steps-B7HTTc8U.js                                                                                                     4.73 kB │ gzip:   2.06 kB
+dist/client/assets/_app.review.index-DX6Wp3b4.js                                                                                         4.85 kB │ gzip:   1.57 kB
+dist/client/assets/change-bar-Bc5JHu_P.js                                                                                                4.87 kB │ gzip:   1.92 kB
+dist/client/assets/_app.observe.metrics-summary-CoY_-08G.js                                                                              4.92 kB │ gzip:   1.87 kB
+dist/client/assets/highlights-DXioh12r.js                                                                                                4.96 kB │ gzip:   1.62 kB
+dist/client/assets/_app.observe.dashboards.index-CWSDSrWH.js                                                                             4.97 kB │ gzip:   2.12 kB
+dist/client/assets/reap-B1DQub-M.js                                                                                                      5.02 kB │ gzip:   2.33 kB
+dist/client/assets/_app.observe.apm.map-CbHMjI6C.js                                                                                      5.08 kB │ gzip:   2.46 kB
+dist/client/assets/clusters-B2EDaOn8.js                                                                                                  5.09 kB │ gzip:   2.16 kB
+dist/client/assets/slos-DfRE2IJU.js                                                                                                      5.44 kB │ gzip:   2.20 kB
+dist/client/assets/_app.observe.containers._id-BnF4QF1G.js                                                                               5.44 kB │ gzip:   2.06 kB
+dist/client/assets/_app.logs-weM6NIvh.js                                                                                                 5.50 kB │ gzip:   2.37 kB
+dist/client/assets/_app.observe.scanner.index-D3spEudo.js                                                                                5.56 kB │ gzip:   2.19 kB
+dist/client/assets/hosts-CZSMsbwr.js                                                                                                     5.59 kB │ gzip:   2.08 kB
+dist/client/assets/_app.observe.pipelines.index-BFQwIOUS.js                                                                              5.70 kB │ gzip:   2.18 kB
+dist/client/assets/_app.observe.index-DOVJjE21.js                                                                                        5.75 kB │ gzip:   2.30 kB
+dist/client/assets/highlights-rarRi7Zo.js                                                                                                5.89 kB │ gzip:   1.84 kB
+dist/client/assets/icons__app.agents.plans.runs._run__app.agents.research._id__app.agents.sessions__app.repos__o8xvgxtv-C1hdSXBN.js      5.94 kB │ gzip:   2.14 kB
+dist/client/assets/_app.observe.live-CCHqQm9w.js                                                                                         6.09 kB │ gzip:   2.51 kB
+dist/client/assets/workflow-injections-DJUfPHA6.js                                                                                       6.21 kB │ gzip:   0.90 kB
+dist/client/assets/highlights-D8_TeDFz.js                                                                                                6.42 kB │ gzip:   2.17 kB
+dist/client/assets/events-DslyAOnJ.js                                                                                                    6.52 kB │ gzip:   2.63 kB
+dist/client/assets/graph-CUBdG3s4.js                                                                                                     6.52 kB │ gzip:   2.81 kB
+dist/client/assets/review-Chb8PUEg.js                                                                                                    6.58 kB │ gzip:   2.11 kB
+dist/client/assets/icons__app.___app.agents.plans.runs._run__app.agents.research._id__app.agents.sessions__app_jt9dnfgd-Csdk4V5P.js      6.61 kB │ gzip:   2.90 kB
+dist/client/assets/facet-box-B3pbr421.js                                                                                                 6.63 kB │ gzip:   2.60 kB
+dist/client/assets/containers-CJHWyTbs.js                                                                                                6.65 kB │ gzip:   2.43 kB
+dist/client/assets/highlights-uf6Bcm5m.js                                                                                                6.92 kB │ gzip:   1.56 kB
+dist/client/assets/deploy-Bz039-_s.js                                                                                                    7.04 kB │ gzip:   2.03 kB
+dist/client/assets/here-C6Lbnuct.js                                                                                                      7.05 kB │ gzip:   2.79 kB
+dist/client/assets/_app.runs._id.compare-CSFN43j9.js                                                                                     7.15 kB │ gzip:   2.48 kB
+dist/client/assets/log-viewer-DTYHfgwo.js                                                                                                7.27 kB │ gzip:   3.18 kB
+dist/client/assets/resource-CXdH6Lao.js                                                                                                  7.29 kB │ gzip:   2.71 kB
+dist/client/assets/found-D0nXUxOW.js                                                                                                     7.40 kB │ gzip:   2.87 kB
+dist/client/assets/prose-DAdyUt8k.js                                                                                                     7.42 kB │ gzip:   3.01 kB
+dist/client/assets/_app.observe.catalog._name-Dn8ynD0A.js                                                                                7.46 kB │ gzip:   2.59 kB
+dist/client/assets/approval-toasts-BdUJTnZN.js                                                                                           7.48 kB │ gzip:   2.89 kB
+dist/client/assets/templates-B0nqEbna.js                                                                                                 7.55 kB │ gzip:   2.73 kB
+dist/client/assets/icons__app.___app.agents.sessions__app.deployments.releases.environments._env__app.repos__a_c8efk786-DmKcRD1p.js      7.68 kB │ gzip:   2.87 kB
+dist/client/assets/dialog-B380bl8X.js                                                                                                    7.70 kB │ gzip:   2.95 kB
+dist/client/assets/catalog-kRNWZfXV.js                                                                                                   7.74 kB │ gzip:   2.87 kB
+dist/client/assets/icons__app.deployments.releases.fleets._id__app.deployments.releases.fleets.new__app.deploy_ofszgp6a-BQ0nDkpT.js      7.77 kB │ gzip:   2.72 kB
+dist/client/assets/highlights-42MCsvyn.js                                                                                                7.80 kB │ gzip:   2.05 kB
+dist/client/assets/_app.agents.plans.runs._run-3zPJG8z9.js                                                                               7.86 kB │ gzip:   2.98 kB
+dist/client/assets/react-Cvdyeg_0.js                                                                                                     7.87 kB │ gzip:   3.00 kB
+dist/client/assets/_app.deployments.releases._id-DA4OGFnb.js                                                                             7.96 kB │ gzip:   2.96 kB
+dist/client/assets/_app.runners.offers-BJRovUv1.js                                                                                       8.27 kB │ gzip:   3.05 kB
+dist/client/assets/_app.observe.metrics-DGyVtJGr.js                                                                                      8.32 kB │ gzip:   3.31 kB
+dist/client/assets/highlights-BBIiNhEY.js                                                                                                8.33 kB │ gzip:   2.17 kB
+dist/client/assets/board-CjeWXOIW.js                                                                                                     8.57 kB │ gzip:   3.34 kB
+dist/client/assets/misc-7F-rrwsI.js                                                                                                      8.61 kB │ gzip:   3.15 kB
+dist/client/assets/_app.index-BCi2-RP9.js                                                                                                8.67 kB │ gzip:   3.27 kB
+dist/client/assets/apm-BPwfYjcN.js                                                                                                       8.86 kB │ gzip:   2.83 kB
+dist/client/assets/attention-CQZJVPjR.js                                                                                                 8.86 kB │ gzip:   3.47 kB
+dist/client/assets/utils-CxPRdw7h.js                                                                                                     9.10 kB │ gzip:   3.27 kB
+dist/client/assets/_app.ship_._owner._name._sha-yjnk5XXb.js                                                                              9.29 kB │ gzip:   2.82 kB
+dist/client/assets/errors-QcxQ6FL8.js                                                                                                    9.38 kB │ gzip:   3.24 kB
+dist/client/assets/login-IAxcGXq-.js                                                                                                    10.01 kB │ gzip:   3.95 kB
+dist/client/assets/_app.deployments.plans-DrGQBze4.js                                                                                   10.28 kB │ gzip:   3.84 kB
+dist/client/assets/_app.deployments.releases.new-B3_HFSRV.js                                                                            10.45 kB │ gzip:   3.84 kB
+dist/client/assets/highlights-C5GSwnZx.js                                                                                               10.58 kB │ gzip:   2.24 kB
+dist/client/assets/_app.clusters-B9PcfHoF.js                                                                                            10.68 kB │ gzip:   3.33 kB
+dist/client/assets/_app.observe.slos._id-Ca9S_c5F.js                                                                                    10.84 kB │ gzip:   4.30 kB
+dist/client/assets/_app.observe.log-metrics-DsrpWMAx.js                                                                                 10.97 kB │ gzip:   3.99 kB
+dist/client/assets/_app.observe.hosts._name-DGlh4iUQ.js                                                                                 11.01 kB │ gzip:   3.83 kB
+dist/client/assets/parts-o8ceEJ2D.js                                                                                                    11.13 kB │ gzip:   4.60 kB
+dist/client/assets/incidents-ncillmDA.js                                                                                                11.23 kB │ gzip:   4.00 kB
+dist/client/assets/fleets-CJN5czpp.js                                                                                                   11.31 kB │ gzip:   3.99 kB
+dist/client/assets/about-CIhhA33K.js                                                                                                    11.39 kB │ gzip:   4.14 kB
+dist/client/assets/_app.deployments.environments._name-COm-IIHD.js                                                                      11.55 kB │ gzip:   4.16 kB
+dist/client/assets/session-CA9a73zp.js                                                                                                  11.60 kB │ gzip:   4.31 kB
+dist/client/assets/swipe-away-BRgZj4Nu.js                                                                                               11.77 kB │ gzip:   4.48 kB
+dist/client/assets/host-G5KcCCv9.js                                                                                                     11.83 kB │ gzip:   4.09 kB
+dist/client/assets/pause-CsJjNEx0.js                                                                                                    12.02 kB │ gzip:   4.62 kB
+dist/client/assets/diff-Dg3TOzzE.js                                                                                                     12.04 kB │ gzip:   5.04 kB
+dist/client/assets/ci-BLZ2kW3v.js                                                                                                       12.12 kB │ gzip:   3.77 kB
+dist/client/assets/flow-view-9LNzOV_I.js                                                                                                12.29 kB │ gzip:   3.90 kB
+dist/client/assets/releases-Cr0dqaog.js                                                                                                 12.34 kB │ gzip:   4.33 kB
+dist/client/assets/items-DQGFOTt_.js                                                                                                    12.75 kB │ gzip:   4.03 kB
+dist/client/assets/settings-ci-BhmKZRuK.js                                                                                              12.81 kB │ gzip:   4.07 kB
+dist/client/assets/_app.observe.notebooks._id-pouip2jU.js                                                                               12.84 kB │ gzip:   4.59 kB
+dist/client/assets/_app.observe.downtimes-DEBvE5i3.js                                                                                   13.18 kB │ gzip:   4.84 kB
+dist/client/assets/_app.observe.scanner._id-Bk8LhpKN.js                                                                                 13.22 kB │ gzip:   4.61 kB
+dist/client/assets/indexes-GE1sLHQn.js                                                                                                  13.27 kB │ gzip:   4.51 kB
+dist/client/assets/_app.review._key-C-T3Spmv.js                                                                                         13.28 kB │ gzip:   4.94 kB
+dist/client/assets/signals-DD9Rfbnw.js                                                                                                  13.65 kB │ gzip:   6.22 kB
+dist/client/assets/traces-B0LzN6yh.js                                                                                                   13.74 kB │ gzip:   4.43 kB
+dist/client/assets/_app.observe.delivery-C473G2Ze.js                                                                                    13.92 kB │ gzip:   4.73 kB
+dist/client/assets/jobs-Dsyx5pE4.js                                                                                                     14.32 kB │ gzip:   5.23 kB
+dist/client/assets/_app.observe.dashboards._id-JYAM0Mbc.js                                                                              14.46 kB │ gzip:   4.85 kB
+dist/client/assets/_app.deployments.new-C82OQCZg.js                                                                                     14.70 kB │ gzip:   5.19 kB
+dist/client/assets/_app.ship-BHehiP66.js                                                                                                14.81 kB │ gzip:   5.73 kB
+dist/client/assets/button-Bkxf8ZrS.js                                                                                                   14.93 kB │ gzip:   6.09 kB
+dist/client/assets/research-jWvnfumt.js                                                                                                 15.61 kB │ gzip:   5.04 kB
+dist/client/assets/derive-B8M4c3IS.js                                                                                                   16.27 kB │ gzip:   6.59 kB
+dist/client/assets/_app.observe.synthetics-IePl3s0w.js                                                                                  16.73 kB │ gzip:   5.60 kB
+dist/client/assets/diff-Bxe9nMSy.js                                                                                                     16.92 kB │ gzip:   5.73 kB
+dist/client/assets/section-CoNR6VbU.js                                                                                                  17.09 kB │ gzip:   5.65 kB
+dist/client/assets/logs-BFeXlfRU.js                                                                                                     17.28 kB │ gzip:   5.71 kB
+dist/client/assets/widgets-4ChfQmcu.js                                                                                                  17.87 kB │ gzip:   6.31 kB
+dist/client/assets/_app.deployments.releases.apps._app_.environments._env-CLCxRqOi.js                                                   17.95 kB │ gzip:   5.62 kB
+dist/client/assets/stands-BzZH1IoB.js                                                                                                   18.04 kB │ gzip:   7.57 kB
+dist/client/assets/ship-B9rMRMXa.js                                                                                                     19.27 kB │ gzip:   7.13 kB
+dist/client/assets/_app.agents.plans._id-BxVIgwov.js                                                                                    19.83 kB │ gzip:   6.60 kB
+dist/client/assets/_app.observe.monitors._id-3uq1jOmj.js                                                                                19.94 kB │ gzip:   6.55 kB
+dist/client/assets/words-CTYFFvG3.js                                                                                                    20.34 kB │ gzip:   7.41 kB
+dist/client/assets/_app.observe.pipelines._id-DG1TZUHL.js                                                                               20.71 kB │ gzip:   5.89 kB
+dist/client/assets/_app.observe.archives-Dbz8lB85.js                                                                                    20.84 kB │ gzip:   6.35 kB
+dist/client/assets/_app.observe.incidents._id-DfLDrUGn.js                                                                               21.05 kB │ gzip:   6.61 kB
+dist/client/assets/_app.workflows-CJlExc-o.js                                                                                           21.82 kB │ gzip:   8.16 kB
+dist/client/assets/llm-ekVCGgvO.js                                                                                                      22.26 kB │ gzip:   6.69 kB
+dist/client/assets/_app.deployments.releases.apps._app-CI_MhRxo.js                                                                      22.85 kB │ gzip:   7.07 kB
+dist/client/assets/_app.deployments.releases.environments._env-IrN5dCmg.js                                                              23.20 kB │ gzip:   7.29 kB
+dist/client/assets/_app.observe.profiles-B1E6anm9.js                                                                                    23.31 kB │ gzip:   7.58 kB
+dist/client/assets/_app-BgjpYlB2.js                                                                                                     23.40 kB │ gzip:   8.18 kB
+dist/client/assets/action-view-Du5IL9wu.js                                                                                              23.40 kB │ gzip:   8.08 kB
+dist/client/assets/parts-CtD7Ad8V.js                                                                                                    25.49 kB │ gzip:   7.93 kB
+dist/client/assets/browser-BHVHccAI.js                                                                                                  27.31 kB │ gzip:   8.96 kB
+dist/client/assets/_app.ship_.deploys-DCNLjMW2.js                                                                                       28.22 kB │ gzip:   9.08 kB
+dist/client/assets/_app.insights-BtrbYd39.js                                                                                            30.70 kB │ gzip:   7.21 kB
+dist/client/assets/es2015-CwnB2hdP.js                                                                                                   31.25 kB │ gzip:  10.98 kB
+dist/client/assets/_app.runners.add-g3DmSGa5.js                                                                                         31.46 kB │ gzip:   9.49 kB
+dist/client/assets/workspace-Np7QhBOB.js                                                                                                37.28 kB │ gzip:  11.69 kB
+dist/client/assets/syntax-Bttx0AkX.js                                                                                                   38.63 kB │ gzip:  11.44 kB
+dist/client/assets/harness-DVx7p2DK.js                                                                                                  39.61 kB │ gzip:  12.52 kB
+dist/client/assets/dist-DurGgWET.js                                                                                                     52.57 kB │ gzip:  18.01 kB
+dist/client/assets/uplot-chart-BsYtc-wq.js                                                                                              55.36 kB │ gzip:  24.19 kB
+dist/client/assets/inspector-tabs-SETCgqqh.js                                                                                           56.98 kB │ gzip:  16.67 kB
+dist/client/assets/sections-BgAE1sXP.js                                                                                                 61.02 kB │ gzip:  19.04 kB
+dist/client/assets/_app.observe.integrations-B_Yfz17f.js                                                                                62.97 kB │ gzip:  15.39 kB
+dist/client/assets/run-detail-yssrwxdj.js                                                                                               63.76 kB │ gzip:  18.72 kB
+dist/client/assets/approval-Cz4AYkpd.js                                                                                                 67.98 kB │ gzip:  22.25 kB
+dist/client/assets/hooks-Dg8a3WcP.js                                                                                                    69.12 kB │ gzip:  24.80 kB
+dist/client/assets/_app.repos-CRLnOybb.js                                                                                               70.07 kB │ gzip:  21.05 kB
+dist/client/assets/_app.deployments.apps._project._name-CLLio1Ig.js                                                                     73.60 kB │ gzip:  21.58 kB
+dist/client/assets/web-tree-sitter-C8_Si809.js                                                                                          78.78 kB │ gzip:  19.89 kB
+dist/client/assets/_app.ship_.pipelines-BaPXOY5d.js                                                                                     84.45 kB │ gzip:  26.17 kB
+dist/client/assets/_app.agents._id-BwH_kt_1.js                                                                                          85.85 kB │ gzip:  27.64 kB
+dist/client/assets/_app.runners.index-9OlT5eso.js                                                                                       91.38 kB │ gzip:  26.54 kB
+dist/client/assets/_app.settings-D3aLYeE8.js                                                                                            94.90 kB │ gzip:  25.57 kB
+dist/client/assets/browser-DhmxuVx4.js                                                                                                  96.61 kB │ gzip:  30.14 kB
+dist/client/assets/seen-Da2cGDvc.js                                                                                                     98.61 kB │ gzip:  35.16 kB
+dist/client/assets/_app.agents.index-wI50YySx.js                                                                                       105.33 kB │ gzip:  34.25 kB
+dist/client/assets/_app.system-CHJbnEvv.js                                                                                             109.60 kB │ gzip:  33.52 kB
+dist/client/assets/markdown-B495iDSW.js                                                                                                161.62 kB │ gzip:  48.71 kB
+dist/client/assets/review-Bx4m599t.js                                                                                                  175.79 kB │ gzip:  55.11 kB
+dist/client/assets/index-D1eF7MjZ.js                                                                                                   329.42 kB │ gzip: 102.21 kB
+dist/client/assets/editor-C3SM2tDD.js                                                                                                  430.44 kB │ gzip: 140.40 kB
+dist/client/assets/xterm-setup-uygUbiRQ.js                                                                                             507.83 kB │ gzip: 130.59 kB
+
+[33m[EVAL] [0mUse of direct `eval` function is strongly discouraged as it poses security risks and may cause issues with minification.
+      [38;5;246m╭[0m[38;5;246m─[0m[38;5;246m[[0m node_modules/web-tree-sitter/web-tree-sitter.js:2400:31 [38;5;246m][0m
+      [38;5;246m│[0m
+ [38;5;246m2400 │[0m [38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249mA[0m[38;5;249mS[0m[38;5;249mM[0m[38;5;249m_[0m[38;5;249mC[0m[38;5;249mO[0m[38;5;249mN[0m[38;5;249mS[0m[38;5;249mT[0m[38;5;249mS[0m[38;5;249m[[0m[38;5;249ms[0m[38;5;249mt[0m[38;5;249ma[0m[38;5;249mr[0m[38;5;249mt[0m[38;5;249m][0m[38;5;249m [0m[38;5;249m=[0m[38;5;249m [0meval[38;5;249m([0m[38;5;249mf[0m[38;5;249mu[0m[38;5;249mn[0m[38;5;249mc[0m[38;5;249m)[0m[38;5;249m;[0m
+ [38;5;240m     │[0m                               ──┬─  
+ [38;5;240m     │[0m                                 ╰─── Use of direct `eval` here.
+ [38;5;240m     │[0m 
+ [38;5;240m     │[0m [38;5;115mHelp[0m: Consider using indirect eval. For more information, check the documentation: https://rolldown.rs/guide/troubleshooting#avoiding-direct-eval
+[38;5;246m──────╯[0m
+
+[33m[EVAL] [0mUse of direct `eval` function is strongly discouraged as it poses security risks and may cause issues with minification.
+      [38;5;246m╭[0m[38;5;246m─[0m[38;5;246m[[0m node_modules/web-tree-sitter/web-tree-sitter.js:2423:33 [38;5;246m][0m
+      [38;5;246m│[0m
+ [38;5;246m2423 │[0m [38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249mm[0m[38;5;249mo[0m[38;5;249md[0m[38;5;249mu[0m[38;5;249ml[0m[38;5;249me[0m[38;5;249mE[0m[38;5;249mx[0m[38;5;249mp[0m[38;5;249mo[0m[38;5;249mr[0m[38;5;249mt[0m[38;5;249ms[0m[38;5;249m[[0m[38;5;249mn[0m[38;5;249ma[0m[38;5;249mm[0m[38;5;249me[0m[38;5;249m][0m[38;5;249m [0m[38;5;249m=[0m[38;5;249m [0meval[38;5;249m([0m[38;5;249mf[0m[38;5;249mu[0m[38;5;249mn[0m[38;5;249mc[0m[38;5;249m)[0m[38;5;249m;[0m
+ [38;5;240m     │[0m                                 ──┬─  
+ [38;5;240m     │[0m                                   ╰─── Use of direct `eval` here.
+ [38;5;240m     │[0m 
+ [38;5;240m     │[0m [38;5;115mHelp[0m: Consider using indirect eval. For more information, check the documentation: https://rolldown.rs/guide/troubleshooting#avoiding-direct-eval
+[38;5;246m──────╯[0m
+
+✓ built in 1.98s
+[5/5] build ssr environment...
+vite v8.3.4 building ssr environment for production...
+transforming...
+✓ 3392 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/server/assets/start-5Z2QO8AU.js                                                     0.14 kB │ gzip:   0.13 kB
+dist/server/assets/_app.observe.logs-Oe17GU78.js                                         0.19 kB │ gzip:   0.15 kB
+dist/server/assets/web-tree-sitter-Cq5KGkCj.js                                           0.19 kB │ gzip:   0.14 kB
+dist/server/assets/_app.observe.slos.index-DaLEpLs4.js                                   0.19 kB │ gzip:   0.16 kB
+dist/server/assets/_app.observe.hosts.index-DAoLV_pA.js                                  0.20 kB │ gzip:   0.16 kB
+dist/server/assets/_app.observe.indexes-Fm9Dvm3F.js                                      0.20 kB │ gzip:   0.15 kB
+dist/server/assets/highlights-L4e69Fg6.js                                                0.20 kB │ gzip:   0.16 kB
+dist/server/assets/_app.observe.apm.index-84sX0xr3.js                                    0.20 kB │ gzip:   0.16 kB
+dist/server/assets/_app.observe.catalog.index-CYxcoFj4.js                                0.20 kB │ gzip:   0.16 kB
+dist/server/assets/_app.observe.errors._id-Basxl9xi.js                                   0.20 kB │ gzip:   0.16 kB
+dist/server/assets/_app.observe.traces._id-CKBvGtAt.js                                   0.20 kB │ gzip:   0.16 kB
+dist/server/assets/_app.runs._id.index-DpDjMKRf.js                                       0.20 kB │ gzip:   0.16 kB
+dist/server/assets/_app.agents.sessions-_QqntjNn.js                                      0.21 kB │ gzip:   0.16 kB
+dist/server/assets/_app.runs._id.jobs._jobId-CUbM5r-P.js                                 0.21 kB │ gzip:   0.17 kB
+dist/server/assets/_app.observe.apm.services._name-BPm7rSp1.js                           0.21 kB │ gzip:   0.16 kB
+dist/server/assets/_app.observe.llm.traces._id-RwjM3-Uk.js                               0.21 kB │ gzip:   0.17 kB
+dist/server/assets/_app.deployments.releases.index-Dcp-E-tJ.js                           0.21 kB │ gzip:   0.16 kB
+dist/server/assets/_app.observe.incidents.index-DRkyGNrv.js                              0.21 kB │ gzip:   0.16 kB
+dist/server/assets/_app.observe.notebooks.index-C4eIw_Qq.js                              0.21 kB │ gzip:   0.16 kB
+dist/server/assets/_app.agents.research._id-CG-hNHd0.js                                  0.21 kB │ gzip:   0.16 kB
+dist/server/assets/_app.observe.errors.index-cWjjTeAd.js                                 0.21 kB │ gzip:   0.16 kB
+dist/server/assets/_app.observe.llm.index-Ca-T2Sha.js                                    0.21 kB │ gzip:   0.17 kB
+dist/server/assets/_app.observe.traces.index-DxhEOGK5.js                                 0.21 kB │ gzip:   0.17 kB
+dist/server/assets/_app.deployments.releases.fleets.new-GTl58VIm.js                      0.22 kB │ gzip:   0.17 kB
+dist/server/assets/_app.observe.containers.index-QMqH51a7.js                             0.22 kB │ gzip:   0.16 kB
+dist/server/assets/_app.review.hosts._repo._number-tEOqr4Il.js                           0.22 kB │ gzip:   0.17 kB
+dist/server/assets/_app.review.hosts._repo.index-BdHeWiH6.js                             0.22 kB │ gzip:   0.17 kB
+dist/server/assets/_app.deployments.releases.fleets._id-Dy_6nfO3.js                      0.22 kB │ gzip:   0.17 kB
+dist/server/assets/_app.deployments.releases.templates.index-DwYfsopi.js                 0.23 kB │ gzip:   0.17 kB
+dist/server/assets/_app.deployments.environments.index-DUjtnNzW.js                       0.23 kB │ gzip:   0.17 kB
+dist/server/assets/_app.deployments.releases.templates._name-D7zNLyOM.js                 0.23 kB │ gzip:   0.17 kB
+dist/server/assets/_app.terminal-CSW9N7l8.js                                             0.24 kB │ gzip:   0.19 kB
+dist/server/assets/injections-text-BruwpmfJ.js                                           0.28 kB │ gzip:   0.19 kB
+dist/server/assets/injections-D1AQjlJW.js                                                0.29 kB │ gzip:   0.18 kB
+dist/server/assets/kotlin-BtHHzxo8.js                                                    0.32 kB │ gzip:   0.23 kB
+dist/server/assets/injections-D0oAvCkT.js                                                0.34 kB │ gzip:   0.21 kB
+dist/server/assets/types-DMTKWp1-.js                                                     0.35 kB │ gzip:   0.26 kB
+dist/server/assets/highlights-DWK3UWDw.js                                                0.35 kB │ gzip:   0.24 kB
+dist/server/assets/injections-kssO29DX.js                                                0.35 kB │ gzip:   0.20 kB
+dist/server/assets/dockerfile-injections-BPrJz-TK.js                                     0.37 kB │ gzip:   0.25 kB
+dist/server/assets/rust-uj0gmfsa.js                                                      0.37 kB │ gzip:   0.26 kB
+dist/server/assets/vue-injections-D_b6gUIF.js                                            0.38 kB │ gzip:   0.26 kB
+dist/server/assets/highlights-CaxT56yh.js                                                0.38 kB │ gzip:   0.24 kB
+dist/server/assets/_app.observe.events-D_63g65D.js                                       0.39 kB │ gzip:   0.26 kB
+dist/server/assets/toml-cCLUB4e2.js                                                      0.39 kB │ gzip:   0.24 kB
+dist/server/assets/injections-AZQIASto.js                                                0.40 kB │ gzip:   0.23 kB
+dist/server/assets/injections-DTleg0Ha.js                                                0.41 kB │ gzip:   0.21 kB
+dist/server/assets/highlights-ChCq6XsQ.js                                                0.42 kB │ gzip:   0.27 kB
+dist/server/assets/injections-uCo1-le-.js                                                0.43 kB │ gzip:   0.21 kB
+dist/server/assets/sql-DFheV94m.js                                                       0.44 kB │ gzip:   0.28 kB
+dist/server/assets/injections-DGtft90R.js                                                0.45 kB │ gzip:   0.25 kB
+dist/server/assets/shared.plans._token-BdmiVG5o.js                                       0.49 kB │ gzip:   0.29 kB
+dist/server/assets/minus-DIRnywYi.js                                                     0.49 kB │ gzip:   0.34 kB
+dist/server/assets/check-CMTzwtqT.js                                                     0.50 kB │ gzip:   0.34 kB
+dist/server/assets/highlights-params-DC2n3AOt.js                                         0.50 kB │ gzip:   0.25 kB
+dist/server/assets/chevron-up-DtM0z8AP.js                                                0.51 kB │ gzip:   0.35 kB
+dist/server/assets/highlights-K3C8qRLN.js                                                0.51 kB │ gzip:   0.29 kB
+dist/server/assets/chevron-right-BCa_fSdd.js                                             0.52 kB │ gzip:   0.35 kB
+dist/server/assets/injections-YIGEvKas.js                                                0.53 kB │ gzip:   0.24 kB
+dist/server/assets/plus-VIMQ7M5x.js                                                      0.53 kB │ gzip:   0.36 kB
+dist/server/assets/square-BFe_Y7Ob.js                                                    0.54 kB │ gzip:   0.36 kB
+dist/server/assets/arrow-up-D13k3tZW.js                                                  0.55 kB │ gzip:   0.37 kB
+dist/server/assets/play-oh-PUj05.js                                                      0.56 kB │ gzip:   0.39 kB
+dist/server/assets/reply-DqBx6UFN.js                                                     0.56 kB │ gzip:   0.38 kB
+dist/server/assets/clock-CbAM1Kxt.js                                                     0.56 kB │ gzip:   0.37 kB
+dist/server/assets/arrow-down-BwdNRYyX.js                                                0.56 kB │ gzip:   0.37 kB
+dist/server/assets/arrow-right-CLTwNNcO.js                                               0.57 kB │ gzip:   0.37 kB
+dist/server/assets/search-DyyuxNd7.js                                                    0.57 kB │ gzip:   0.38 kB
+dist/server/assets/arrow-up-right-B_HMVQtN.js                                            0.57 kB │ gzip:   0.38 kB
+dist/server/assets/head-BN2fGryH.js                                                      0.58 kB │ gzip:   0.30 kB
+dist/server/assets/user-5J7MtCma.js                                                      0.59 kB │ gzip:   0.39 kB
+dist/server/assets/shared.plans._token-DGXghGAI.js                                       0.59 kB │ gzip:   0.34 kB
+dist/server/assets/undo-2-DkMfX35H.js                                                    0.59 kB │ gzip:   0.39 kB
+dist/server/assets/highlights-Bydox1D8.js                                                0.63 kB │ gzip:   0.33 kB
+dist/server/assets/pause-dgeRTlBV.js                                                     0.63 kB │ gzip:   0.38 kB
+dist/server/assets/copy-DCrFU6iF.js                                                      0.64 kB │ gzip:   0.42 kB
+dist/server/assets/eye-BlM7mdRN.js                                                       0.64 kB │ gzip:   0.41 kB
+dist/server/assets/highlights-jsx-DsCC5hEq.js                                            0.65 kB │ gzip:   0.28 kB
+dist/server/assets/upload-DDUOE7jS.js                                                    0.65 kB │ gzip:   0.41 kB
+dist/server/assets/download-C097Ba0J.js                                                  0.66 kB │ gzip:   0.41 kB
+dist/server/assets/arrow-down-to-line-BPOJ37Xs.js                                        0.66 kB │ gzip:   0.40 kB
+dist/server/assets/tries-CQhRZYen.js                                                     0.66 kB │ gzip:   0.39 kB
+dist/server/assets/pencil-D_GitKrq.js                                                    0.66 kB │ gzip:   0.44 kB
+dist/server/assets/send-Dc0ann-k.js                                                      0.67 kB │ gzip:   0.44 kB
+dist/server/assets/git-merge-BZfx0Q8b.js                                                 0.67 kB │ gzip:   0.41 kB
+dist/server/assets/git-branch-DKmu2YI4.js                                                0.68 kB │ gzip:   0.41 kB
+dist/server/assets/wrench-UJ5p7AEH.js                                                    0.68 kB │ gzip:   0.45 kB
+dist/server/assets/maximize-2-D6K3jg3o.js                                                0.68 kB │ gzip:   0.41 kB
+dist/server/assets/minimize-2-CX5HiDYT.js                                                0.68 kB │ gzip:   0.40 kB
+dist/server/assets/circle-arrow-up-BZJrO_Qb.js                                           0.70 kB │ gzip:   0.42 kB
+dist/server/assets/arrow-right-left-CAwB8BHp.js                                          0.71 kB │ gzip:   0.42 kB
+dist/server/assets/ellipsis-BzSVotGB.js                                                  0.71 kB │ gzip:   0.40 kB
+dist/server/assets/rotate-ccw-clock-CLOF1ZGn.js                                          0.71 kB │ gzip:   0.44 kB
+dist/server/assets/tag-ip79VS6j.js                                                       0.72 kB │ gzip:   0.46 kB
+dist/server/assets/highlights-BiWR3nA8.js                                                0.74 kB │ gzip:   0.36 kB
+dist/server/assets/square-terminal-JOFCLwdt.js                                           0.74 kB │ gzip:   0.44 kB
+dist/server/assets/circle-pause-B3JxfMiT.js                                              0.75 kB │ gzip:   0.42 kB
+dist/server/assets/circle-alert-BYSydyaT.js                                              0.75 kB │ gzip:   0.42 kB
+dist/server/assets/circle-question-mark-Cze6uGBf.js                                      0.76 kB │ gzip:   0.45 kB
+dist/server/assets/highlights-CnD1kmu6.js                                                0.76 kB │ gzip:   0.39 kB
+dist/server/assets/message-square-plus-S_7BH-kG.js                                       0.76 kB │ gzip:   0.46 kB
+dist/server/assets/refresh-cw-CPWjBXRn.js                                                0.77 kB │ gzip:   0.44 kB
+dist/server/assets/injections-DFNXzEE-.js                                                0.77 kB │ gzip:   0.30 kB
+dist/server/assets/git-commit-horizontal-CtRMbZsr.js                                     0.78 kB │ gzip:   0.43 kB
+dist/server/assets/chart-1b4TGSSu.js                                                     0.79 kB │ gzip:   0.42 kB
+dist/server/assets/trash-Zt83HKOi.js                                                     0.80 kB │ gzip:   0.44 kB
+dist/server/assets/bot-DZQi2NRJ.js                                                       0.81 kB │ gzip:   0.45 kB
+dist/server/assets/file-text-B0LIdcOF.js                                                 0.84 kB │ gzip:   0.47 kB
+dist/server/assets/highlights-BNoP9UQb.js                                                0.85 kB │ gzip:   0.41 kB
+dist/server/assets/server-uhRWA5_B.js                                                    0.85 kB │ gzip:   0.43 kB
+dist/server/assets/rocket-C_bkLt9h.js                                                    0.89 kB │ gzip:   0.53 kB
+dist/server/assets/highlights-qR5Q4JnS.js                                                0.89 kB │ gzip:   0.50 kB
+dist/server/assets/log-lazy-CmCgRBJ6.js                                                  0.97 kB │ gzip:   0.52 kB
+dist/server/assets/shared.plans._token-2QdJLh24.js                                       0.98 kB │ gzip:   0.51 kB
+dist/server/assets/highlights-SsdLp48M.js                                                1.00 kB │ gzip:   0.43 kB
+dist/server/assets/keyboard-uo9TVzGd.js                                                  1.00 kB │ gzip:   0.47 kB
+dist/server/assets/injections-BJz0Xw-j.js                                                1.01 kB │ gzip:   0.34 kB
+dist/server/assets/highlights-CStO_JaD.js                                                1.02 kB │ gzip:   0.43 kB
+dist/server/assets/gates-o1nhhHzb.js                                                     1.05 kB │ gzip:   0.48 kB
+dist/server/assets/highlights-q6QL1SiN.js                                                1.08 kB │ gzip:   0.46 kB
+dist/server/assets/injections-BqrG6MOx.js                                                1.10 kB │ gzip:   0.52 kB
+dist/server/assets/injections-gc6HgeTy.js                                                1.12 kB │ gzip:   0.35 kB
+dist/server/assets/diagnostics-Bb7b2jy4.js                                               1.15 kB │ gzip:   0.57 kB
+dist/server/assets/views-D23hegCe.js                                                     1.21 kB │ gzip:   0.65 kB
+dist/server/assets/circle-x-B2YlEFEg.js                                                  1.22 kB │ gzip:   0.49 kB
+dist/server/assets/highlights-Dev7iv2u.js                                                1.23 kB │ gzip:   0.51 kB
+dist/server/assets/highlights-Dcl1YAhq.js                                                1.23 kB │ gzip:   0.46 kB
+dist/server/assets/new-agent-draft-BbkZ59n5.js                                           1.26 kB │ gzip:   0.69 kB
+dist/server/assets/injections-lz5bDQwX.js                                                1.33 kB │ gzip:   0.33 kB
+dist/server/assets/shared.plans._token-Cq8ymwq9.js                                       1.39 kB │ gzip:   0.65 kB
+dist/server/assets/bell-wl47JjjR.js                                                      1.41 kB │ gzip:   0.60 kB
+dist/server/assets/name-field-CBE67DHZ.js                                                1.48 kB │ gzip:   0.72 kB
+dist/server/assets/highlights-Bgsn6IRP.js                                                1.49 kB │ gzip:   0.53 kB
+dist/server/assets/injections-gl2SMxiw.js                                                1.54 kB │ gzip:   0.37 kB
+dist/server/assets/graphql-BMgHFmpU.js                                                   1.58 kB │ gzip:   0.63 kB
+dist/server/assets/attention-requests-COSlm_OX.js                                        1.65 kB │ gzip:   0.74 kB
+dist/server/assets/injections-xWzP-upe.js                                                1.66 kB │ gzip:   0.52 kB
+dist/server/assets/_app._-CVuR4Fac.js                                                    1.66 kB │ gzip:   0.69 kB
+dist/server/assets/hcl-BLrRElJd.js                                                       1.69 kB │ gzip:   0.75 kB
+dist/server/assets/brand-YhaE2mzp.js                                                     1.73 kB │ gzip:   0.72 kB
+dist/server/assets/highlights-BF6bn1dw.js                                                1.77 kB │ gzip:   0.58 kB
+dist/server/assets/copy-block-DmXtgo5-.js                                                1.79 kB │ gzip:   0.70 kB
+dist/server/assets/highlights-BiM_MGKz.js                                                1.83 kB │ gzip:   0.67 kB
+dist/server/assets/motion-DTTGihSo.js                                                    2.01 kB │ gzip:   0.89 kB
+dist/server/assets/frames-DTgapMr9.js                                                    2.04 kB │ gzip:   0.84 kB
+dist/server/assets/agent-CtZ2Jokm.js                                                     2.05 kB │ gzip:   0.94 kB
+dist/server/assets/hold-Dm3aWB_t.js                                                      2.16 kB │ gzip:   0.71 kB
+dist/server/assets/yaml-4gFqt8wq.js                                                      2.19 kB │ gzip:   1.02 kB
+dist/server/assets/refused-DAjO6UHF.js                                                   2.20 kB │ gzip:   1.01 kB
+dist/server/assets/perl-ChRDKap6.js                                                      2.24 kB │ gzip:   0.95 kB
+dist/server/assets/battery-BIjmm6QV.js                                                   2.25 kB │ gzip:   1.10 kB
+dist/server/assets/auth-Dj1IdWDv.js                                                      2.26 kB │ gzip:   1.08 kB
+dist/server/assets/tabs-CUik7mJU.js                                                      2.31 kB │ gzip:   1.09 kB
+dist/server/assets/cards-D8wP2K9z.js                                                     2.32 kB │ gzip:   1.13 kB
+dist/server/assets/attach-FGRAmTf2.js                                                    2.35 kB │ gzip:   1.04 kB
+dist/server/assets/highlights-BIH-pxwm.js                                                2.42 kB │ gzip:   0.97 kB
+dist/server/assets/highlights-GF3W8fD0.js                                                2.50 kB │ gzip:   0.84 kB
+dist/server/assets/injections-DzpIaoKv.js                                                2.50 kB │ gzip:   0.60 kB
+dist/server/assets/pager-B-RPplGP.js                                                     2.53 kB │ gzip:   0.98 kB
+dist/server/assets/keys-BTXxJKnI.js                                                      2.53 kB │ gzip:   1.16 kB
+dist/server/assets/loading-Du9MZtLt.js                                                   2.56 kB │ gzip:   1.04 kB
+dist/server/assets/error-boundary-mbXlUy14.js                                            2.61 kB │ gzip:   1.06 kB
+dist/server/assets/highlights--sI_YTcf.js                                                2.63 kB │ gzip:   1.10 kB
+dist/server/assets/highlights-DHJNFMaL.js                                                2.67 kB │ gzip:   0.68 kB
+dist/server/assets/highlights-BJD_Pmwc.js                                                2.72 kB │ gzip:   1.05 kB
+dist/server/assets/highlights-CGJqV6T_.js                                                2.80 kB │ gzip:   0.94 kB
+dist/server/assets/highlights-zFaevy5s.js                                                2.81 kB │ gzip:   0.90 kB
+dist/server/assets/jsx-runtime-CsSE45fb.js                                               2.91 kB │ gzip:   1.23 kB
+dist/server/assets/logs-OvhuqIkC.js                                                      3.02 kB │ gzip:   1.34 kB
+dist/server/assets/highlights-14LthiVn.js                                                3.09 kB │ gzip:   1.24 kB
+dist/server/assets/goal-resources-CFu4WRVF.js                                            3.15 kB │ gzip:   1.35 kB
+dist/server/assets/highlights-BsBa7j6h.js                                                3.32 kB │ gzip:   1.02 kB
+dist/server/assets/highlights-DQ4MGR6X.js                                                3.39 kB │ gzip:   1.06 kB
+dist/server/assets/signin-B0jUaaL2.js                                                    3.40 kB │ gzip:   1.41 kB
+dist/server/assets/highlights-DKDZUb1B.js                                                3.44 kB │ gzip:   1.04 kB
+dist/server/assets/highlights-OG7Z-ZGG.js                                                3.69 kB │ gzip:   1.29 kB
+dist/server/assets/highlights-DomuMfnf.js                                                3.72 kB │ gzip:   1.11 kB
+dist/server/assets/dom-B7JTFUfH.js                                                       3.78 kB │ gzip:   1.53 kB
+dist/server/assets/highlights-CSGOhKzq.js                                                3.87 kB │ gzip:   1.29 kB
+dist/server/assets/highlights-D1d-YFYo.js                                                3.98 kB │ gzip:   1.08 kB
+dist/server/assets/_app-BydY_gLu.js                                                      4.00 kB │ gzip:   1.86 kB
+dist/server/assets/highlights-CC8Auy6s.js                                                4.01 kB │ gzip:   1.39 kB
+dist/server/assets/highlights-Baspr-Ou.js                                                4.05 kB │ gzip:   1.31 kB
+dist/server/assets/_app.review.stacks._id-EtokOJXH.js                                    4.18 kB │ gzip:   1.46 kB
+dist/server/assets/tooltip-D-K3Wtbw.js                                                   4.18 kB │ gzip:   1.75 kB
+dist/server/assets/clusters-BzJY2EqX.js                                                  4.48 kB │ gzip:   1.84 kB
+dist/server/assets/plan-resources-zENFqglU.js                                            4.51 kB │ gzip:   2.06 kB
+dist/server/assets/reach--hqv91rU.js                                                     4.68 kB │ gzip:   1.79 kB
+dist/server/assets/host-charts-4ebnGK19.js                                               4.80 kB │ gzip:   1.47 kB
+dist/server/assets/plans-DWZoDjE7.js                                                     4.81 kB │ gzip:   1.84 kB
+dist/server/assets/highlights-B6E4qhOt.js                                                4.81 kB │ gzip:   1.39 kB
+dist/server/assets/highlighted-DZsBA9ha.js                                               4.87 kB │ gzip:   1.91 kB
+dist/server/assets/highlights-CYRoeDpy.js                                                4.87 kB │ gzip:   1.68 kB
+dist/server/assets/highlights-BGAH3qBl.js                                                4.90 kB │ gzip:   1.37 kB
+dist/server/assets/highlights-DH9RhuUH.js                                                4.99 kB │ gzip:   1.71 kB
+dist/server/assets/dropdown-DxaAS4WB.js                                                  5.10 kB │ gzip:   2.06 kB
+dist/server/assets/data-5F1sZrNo.js                                                      5.24 kB │ gzip:   2.41 kB
+dist/server/assets/highlights-9MGW1Vvf.js                                                5.65 kB │ gzip:   1.72 kB
+dist/server/assets/_app.review.queue-2QvjRKUV.js                                         5.77 kB │ gzip:   1.92 kB
+dist/server/assets/cd-DzJvQtwt.js                                                        5.81 kB │ gzip:   1.97 kB
+dist/server/assets/signing-B4aBAQ4P.js                                                   5.91 kB │ gzip:   2.69 kB
+dist/server/assets/push-BuH4Bs0i.js                                                      5.93 kB │ gzip:   2.32 kB
+dist/server/assets/workflow-injections-C0TizOgq.js                                       6.55 kB │ gzip:   0.96 kB
+dist/server/assets/steps-DhsCRS7X.js                                                     6.68 kB │ gzip:   2.43 kB
+dist/server/assets/highlights-M8_lnXnp.js                                                6.72 kB │ gzip:   1.96 kB
+dist/server/assets/mission-rows-D8xHbj1L.js                                              6.73 kB │ gzip:   2.53 kB
+dist/server/assets/attention-state-DfQoXnoF.js                                           7.01 kB │ gzip:   2.56 kB
+dist/server/assets/highlights-DG25l8vO.js                                                7.25 kB │ gzip:   2.26 kB
+dist/server/assets/_app.observe.monitors.index-mOLq5cdq.js                               7.34 kB │ gzip:   2.21 kB
+dist/server/assets/live-xY4vsfnw.js                                                      7.46 kB │ gzip:   2.75 kB
+dist/server/assets/compose-field-ZSwXI6_J.js                                             7.47 kB │ gzip:   2.66 kB
+dist/server/assets/highlights-DEoDbESR.js                                                7.66 kB │ gzip:   1.66 kB
+dist/server/assets/tasks-Cxeu2L1w.js                                                     7.78 kB │ gzip:   3.05 kB
+dist/server/assets/patch-1reE45VN.js                                                     8.15 kB │ gzip:   2.96 kB
+dist/server/assets/notebooks-D4nIxCWW.js                                                 8.20 kB │ gzip:   2.45 kB
+dist/server/assets/highlights-CvJjoo7C.js                                                8.43 kB │ gzip:   2.16 kB
+dist/server/assets/_app.observe.metrics-summary-vE0wn6u9.js                              8.58 kB │ gzip:   2.49 kB
+dist/server/assets/data-C0Un0EXF.js                                                      9.08 kB │ gzip:   3.49 kB
+dist/server/assets/_app.observe.dashboards.index-DUTQy0Bk.js                             9.11 kB │ gzip:   2.79 kB
+dist/server/assets/highlights-BMNjtpy2.js                                                9.17 kB │ gzip:   2.29 kB
+dist/server/assets/_app.observe.apm.map-CLegJwYq.js                                      9.22 kB │ gzip:   3.40 kB
+dist/server/assets/_app.review.index-YFaVhaJu.js                                         9.23 kB │ gzip:   2.26 kB
+dist/server/assets/_app.logs-CSqLIYak.js                                                 9.37 kB │ gzip:   3.07 kB
+dist/server/assets/slos-B676HCLr.js                                                      9.72 kB │ gzip:   2.96 kB
+dist/server/assets/reap-CEA6XiMb.js                                                      9.84 kB │ gzip:   3.51 kB
+dist/server/assets/hosts-GSxhdVZh.js                                                     9.86 kB │ gzip:   2.79 kB
+dist/server/assets/_app.observe.containers._id-2oOQJzOM.js                               9.89 kB │ gzip:   2.77 kB
+dist/server/assets/shared-DNYcemYk.js                                                    9.98 kB │ gzip:   2.91 kB
+dist/server/assets/_app.observe.scanner.index-XdG2Rqr3.js                               10.22 kB │ gzip:   2.89 kB
+dist/server/assets/change-bar-3gU2WuvN.js                                               10.23 kB │ gzip:   3.29 kB
+dist/server/assets/parts-Bke0YB8Y.js                                                    10.26 kB │ gzip:   3.27 kB
+dist/server/assets/_app.observe.index-D_bRJptA.js                                       10.51 kB │ gzip:   3.17 kB
+dist/server/assets/spawn-setup-BhSnAcbw.js                                              10.51 kB │ gzip:   4.07 kB
+dist/server/assets/_app.observe.pipelines.index-D2bqkXbe.js                             10.53 kB │ gzip:   2.91 kB
+dist/server/assets/_app.observe.live-DgR5VilK.js                                        11.13 kB │ gzip:   3.32 kB
+dist/server/assets/highlights-zKjUE1e-.js                                               11.20 kB │ gzip:   2.36 kB
+dist/server/assets/state-CPMOpdcl.js                                                    11.38 kB │ gzip:   3.91 kB
+dist/server/assets/review-B_e5pXkh.js                                                   11.80 kB │ gzip:   3.52 kB
+dist/server/assets/containers-yk7sgZ7t.js                                               12.07 kB │ gzip:   3.42 kB
+dist/server/assets/deploy-BTvYp8oT.js                                                   12.22 kB │ gzip:   3.60 kB
+dist/server/assets/here-FgRYg1-8.js                                                     13.43 kB │ gzip:   4.16 kB
+dist/server/assets/catalog-De5RRh2y.js                                                  13.48 kB │ gzip:   3.71 kB
+dist/server/assets/_app.runs._id.compare-B_kccaWD.js                                    13.53 kB │ gzip:   3.62 kB
+dist/server/assets/facet-box-CVdSONog.js                                                13.56 kB │ gzip:   4.14 kB
+dist/server/assets/templates-BW_ebGJw.js                                                13.60 kB │ gzip:   3.65 kB
+dist/server/assets/_app.agents.plans.runs._run-4G3PDElX.js                              13.65 kB │ gzip:   3.95 kB
+dist/server/assets/_app.observe.catalog._name-C1qtBr1a.js                               13.72 kB │ gzip:   3.37 kB
+dist/server/assets/log-viewer-Biz-eK4X.js                                               13.99 kB │ gzip:   4.54 kB
+dist/server/assets/found-CX61GbFO.js                                                    13.99 kB │ gzip:   4.13 kB
+dist/server/assets/graph-C58SnaBh.js                                                    14.06 kB │ gzip:   4.93 kB
+dist/server/assets/_app.deployments.releases._id-lhyq1DpJ.js                            14.40 kB │ gzip:   3.99 kB
+dist/server/assets/resource-DRrSHtCD.js                                                 15.39 kB │ gzip:   5.08 kB
+dist/server/assets/_app.observe.metrics-CU4d7gYJ.js                                     15.46 kB │ gzip:   4.54 kB
+dist/server/assets/approval-toasts-Csg1ca92.js                                          15.58 kB │ gzip:   4.92 kB
+dist/server/assets/_app.runners.offers-vkVAbkbz.js                                      15.72 kB │ gzip:   4.58 kB
+dist/server/assets/board-z4NR8pXF.js                                                    15.87 kB │ gzip:   4.90 kB
+dist/server/assets/_app.index-m8bwrFTY.js                                               15.88 kB │ gzip:   4.32 kB
+dist/server/assets/react-oNH-Nv-N.js                                                    16.49 kB │ gzip:   4.46 kB
+dist/server/assets/apm-B3KKopzS.js                                                      16.54 kB │ gzip:   3.90 kB
+dist/server/assets/clipboard-ByjHcyV7.js                                                16.59 kB │ gzip:   4.71 kB
+dist/server/assets/errors-B59iwoX3.js                                                   16.81 kB │ gzip:   4.35 kB
+dist/server/assets/dialog-CFPe4dgH.js                                                   16.88 kB │ gzip:   4.37 kB
+dist/server/assets/misc-CBgURbEm.js                                                     17.78 kB │ gzip:   5.19 kB
+dist/server/assets/login-BYaPae8P.js                                                    17.82 kB │ gzip:   5.07 kB
+dist/server/assets/_app.deployments.plans-CBoyKR3U.js                                   18.29 kB │ gzip:   5.18 kB
+dist/server/assets/_app.deployments.releases.new-D6PXgk7s.js                            18.66 kB │ gzip:   4.99 kB
+dist/server/assets/_app.ship_._owner._name._sha-4zSJjIhY.js                             18.71 kB │ gzip:   4.24 kB
+dist/server/assets/attention-9zumxm1Q.js                                                18.81 kB │ gzip:   6.16 kB
+dist/server/assets/prose-ClzpXdFl.js                                                    19.42 kB │ gzip:   6.14 kB
+dist/server/assets/_app.observe.log-metrics-yHTY9iVE.js                                 19.91 kB │ gzip:   5.43 kB
+dist/server/assets/host-B33dDefK.js                                                     20.21 kB │ gzip:   5.10 kB
+dist/server/assets/_app.observe.slos._id-I92Nsnv5.js                                    20.53 kB │ gzip:   6.14 kB
+dist/server/assets/fleets-DYKd4Oes.js                                                   20.55 kB │ gzip:   5.34 kB
+dist/server/assets/_app.observe.hosts._name-Dc0CtQc6.js                                 20.57 kB │ gzip:   5.20 kB
+dist/server/assets/utils-BXnxe17m.js                                                    20.72 kB │ gzip:   7.34 kB
+dist/server/assets/_app.clusters-CxtrdHj2.js                                            20.74 kB │ gzip:   4.80 kB
+dist/server/assets/incidents-CQLuNu32.js                                                20.95 kB │ gzip:   5.47 kB
+dist/server/assets/_app.deployments.environments._name-CCUH3rNK.js                      21.32 kB │ gzip:   5.56 kB
+dist/server/assets/ci-CYsTJulZ.js                                                       21.33 kB │ gzip:   6.63 kB
+dist/server/assets/_app.observe.notebooks._id-F6ERycGv.js                               21.78 kB │ gzip:   6.06 kB
+dist/server/assets/_app.review._key-BT7uPCyA.js                                         22.47 kB │ gzip:   6.25 kB
+dist/server/assets/_app.observe.scanner._id-Clu8cAgA.js                                 22.59 kB │ gzip:   6.06 kB
+dist/server/assets/session-DhxJd_g-.js                                                  22.61 kB │ gzip:   6.92 kB
+dist/server/assets/flow-view-Dy0yi3ZG.js                                                22.81 kB │ gzip:   5.54 kB
+dist/server/assets/pause-DDxuO_9s.js                                                    23.34 kB │ gzip:   7.02 kB
+dist/server/assets/_app.observe.downtimes-eDNydRhN.js                                   23.52 kB │ gzip:   6.23 kB
+dist/server/assets/traces-DMK7XZ2Q.js                                                   23.53 kB │ gzip:   5.85 kB
+dist/server/assets/indexes-CCYq5nb_.js                                                  23.63 kB │ gzip:   6.00 kB
+dist/server/assets/releases-Dx93U-LH.js                                                 23.65 kB │ gzip:   6.10 kB
+dist/server/assets/parts-CESfhTy5.js                                                    24.23 kB │ gzip:   8.48 kB
+dist/server/assets/about-D3pSiWMa.js                                                    24.45 kB │ gzip:   7.02 kB
+dist/server/assets/_app.observe.delivery-DCtjHlw2.js                                    24.95 kB │ gzip:   6.53 kB
+dist/server/assets/swipe-away-M63wE_rm.js                                               25.22 kB │ gzip:   8.29 kB
+dist/server/assets/items-DxcHL33a.js                                                    25.73 kB │ gzip:   6.18 kB
+dist/server/assets/_app.deployments.new-BQf31Jha.js                                     26.31 kB │ gzip:   6.90 kB
+dist/server/assets/settings-ci-Bmw5hX8s.js                                              27.11 kB │ gzip:   6.62 kB
+dist/server/assets/diff-CLt8HdOH.js                                                     27.35 kB │ gzip:   9.04 kB
+dist/server/assets/_app.ship-DQnd-vyz.js                                                27.97 kB │ gzip:   8.47 kB
+dist/server/assets/_app.observe.dashboards._id-D19zMO_G.js                              28.36 kB │ gzip:   6.91 kB
+dist/server/assets/jobs-Bv1MYFay.js                                                     28.96 kB │ gzip:   8.65 kB
+dist/server/assets/button-DlhZs0Zg.js                                                   29.77 kB │ gzip:  10.11 kB
+dist/server/assets/_app.observe.synthetics-cs6zcq13.js                                  29.81 kB │ gzip:   7.41 kB
+dist/server/assets/signals-41zGNyH2.js                                                  31.05 kB │ gzip:  11.61 kB
+dist/server/assets/words-eRavOo2V.js                                                    31.66 kB │ gzip:   9.94 kB
+dist/server/assets/section-B3P90WsE.js                                                  31.69 kB │ gzip:   8.13 kB
+dist/server/assets/logs-CPoqlCoc.js                                                     31.90 kB │ gzip:   8.40 kB
+dist/server/assets/widgets-gDC3mkFS.js                                                  32.13 kB │ gzip:   9.27 kB
+dist/server/assets/diff-BeSwYEAf.js                                                     32.43 kB │ gzip:   8.42 kB
+dist/server/assets/research-6LHtcAlb.js                                                 32.66 kB │ gzip:   8.09 kB
+dist/server/assets/derive-pNIZ9OGY.js                                                   33.57 kB │ gzip:  12.15 kB
+dist/server/assets/_app.deployments.releases.apps._app_.environments._env-CwxqJH2B.js   34.24 kB │ gzip:   7.91 kB
+dist/server/assets/_app.observe.pipelines._id-5uhqQ-xU.js                               36.40 kB │ gzip:   7.88 kB
+dist/server/assets/_app.observe.incidents._id-B3IR51ws.js                               37.38 kB │ gzip:   8.94 kB
+dist/server/assets/ship-BnrocUbk.js                                                     37.38 kB │ gzip:  12.33 kB
+dist/server/assets/_app.observe.monitors._id-BlBJRaFQ.js                                37.57 kB │ gzip:   8.99 kB
+dist/server/assets/_app.workflows-Bj1DH4-v.js                                           37.72 kB │ gzip:  11.06 kB
+dist/server/assets/_app.observe.archives-e4ekNAl9.js                                    37.81 kB │ gzip:   8.52 kB
+dist/server/assets/_app.agents.plans._id-De9l7nAr.js                                    38.88 kB │ gzip:   9.59 kB
+dist/server/assets/llm-kGTRl9KI.js                                                      39.14 kB │ gzip:   9.42 kB
+dist/server/assets/stands-BX1VtDkK.js                                                   40.48 kB │ gzip:  14.07 kB
+dist/server/assets/_app.observe.profiles-BYUmYkOZ.js                                    41.84 kB │ gzip:  10.92 kB
+dist/server/assets/_app.deployments.releases.environments._env-CszsrYL2.js              42.06 kB │ gzip:   9.93 kB
+dist/server/assets/action-view-BsY-gqTH.js                                              42.69 kB │ gzip:  11.80 kB
+dist/server/assets/_app.deployments.releases.apps._app-DOiJOket.js                      43.34 kB │ gzip:   9.77 kB
+dist/server/assets/parts-nMYtuHDi.js                                                    46.19 kB │ gzip:  13.17 kB
+dist/server/assets/_app.ship_.deploys-xJAJZOpo.js                                       51.99 kB │ gzip:  12.86 kB
+dist/server/assets/_tanstack-start-manifest_v-D-xqSBPE.js                               52.46 kB │ gzip:   6.15 kB
+dist/server/assets/_app.insights-DMr7YPmk.js                                            58.59 kB │ gzip:  10.48 kB
+dist/server/assets/_app.runners.add-D9o_wmSE.js                                         61.41 kB │ gzip:  14.27 kB
+dist/server/assets/syntax-J00Bdc1V.js                                                   63.55 kB │ gzip:  16.80 kB
+dist/server/assets/es2015-CBdu5ViB.js                                                   73.16 kB │ gzip:  17.35 kB
+dist/server/assets/workspace-eK8tYQ49.js                                                73.39 kB │ gzip:  17.26 kB
+dist/server/assets/server-Cy8DZEWF.js                                                   80.21 kB │ gzip:  18.25 kB
+dist/server/assets/router-D3uC9Gte.js                                                   85.31 kB │ gzip:  18.37 kB
+dist/server/assets/hooks-De0br6P5.js                                                   107.97 kB │ gzip:  33.12 kB
+dist/server/assets/inspector-tabs-Ug3KveRT.js                                          112.73 kB │ gzip:  25.19 kB
+dist/server/assets/run-detail-BW8JOwzg.js                                              115.33 kB │ gzip:  28.15 kB
+dist/server/assets/_app.observe.integrations-C76ZsDlQ.js                               116.86 kB │ gzip:  21.38 kB
+dist/server/assets/uplot-chart-CsCMN29o.js                                             129.75 kB │ gzip:  35.81 kB
+dist/server/assets/sections-D-qBZuFj.js                                                130.09 kB │ gzip:  32.54 kB
+dist/server/assets/useSelector-COMGltrz.js                                             131.06 kB │ gzip:  33.70 kB
+dist/server/assets/dist-BRGw5tnT.js                                                    132.61 kB │ gzip:  28.16 kB
+dist/server/assets/_app.repos-CSDc_QC8.js                                              134.51 kB │ gzip:  31.69 kB
+dist/server/assets/approval-D4DssdZs.js                                                136.14 kB │ gzip:  37.65 kB
+dist/server/assets/_app.deployments.apps._project._name-D5ClqKwt.js                    137.84 kB │ gzip:  32.40 kB
+dist/server/assets/web-tree-sitter-BzHplj1W.js                                         138.45 kB │ gzip:  30.03 kB
+dist/server/assets/_app.ship_.pipelines-JX_jMkOJ.js                                    156.17 kB │ gzip:  40.25 kB
+dist/server/assets/_app.runners.index-43Vbze2m.js                                      170.05 kB │ gzip:  39.51 kB
+dist/server/assets/_app.agents._id-DAtQBcFn.js                                         180.17 kB │ gzip:  45.29 kB
+dist/server/assets/_app.settings-BIQatnz3.js                                           181.74 kB │ gzip:  36.96 kB
+dist/server/assets/_app.system-BeIPT-Jj.js                                             209.30 kB │ gzip:  49.06 kB
+dist/server/assets/seen-1WQyho_s.js                                                    210.93 kB │ gzip:  60.14 kB
+dist/server/assets/_app.agents.index-DAnyDR1b.js                                       216.30 kB │ gzip:  57.47 kB
+dist/server/assets/dist-BFYDV22w.js                                                    231.76 kB │ gzip:  53.21 kB
+dist/server/assets/review-CJXpKfgG.js                                                  362.43 kB │ gzip:  93.44 kB
+dist/server/assets/markdown-TbjbrMbV.js                                                600.01 kB │ gzip: 130.49 kB
+dist/server/assets/xterm-setup-DM7LsDrl.js                                             663.10 kB │ gzip: 164.62 kB
+dist/server/server.js                                                                  767.81 kB │ gzip: 160.46 kB
+dist/server/assets/editor-CqDAtrwU.js                                                  878.67 kB │ gzip: 234.44 kB
+
+[33m[EVAL] [0mUse of direct `eval` function is strongly discouraged as it poses security risks and may cause issues with minification.
+      [38;5;246m╭[0m[38;5;246m─[0m[38;5;246m[[0m node_modules/web-tree-sitter/web-tree-sitter.js:2400:31 [38;5;246m][0m
+      [38;5;246m│[0m
+ [38;5;246m2400 │[0m [38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249mA[0m[38;5;249mS[0m[38;5;249mM[0m[38;5;249m_[0m[38;5;249mC[0m[38;5;249mO[0m[38;5;249mN[0m[38;5;249mS[0m[38;5;249mT[0m[38;5;249mS[0m[38;5;249m[[0m[38;5;249ms[0m[38;5;249mt[0m[38;5;249ma[0m[38;5;249mr[0m[38;5;249mt[0m[38;5;249m][0m[38;5;249m [0m[38;5;249m=[0m[38;5;249m [0meval[38;5;249m([0m[38;5;249mf[0m[38;5;249mu[0m[38;5;249mn[0m[38;5;249mc[0m[38;5;249m)[0m[38;5;249m;[0m
+ [38;5;240m     │[0m                               ──┬─  
+ [38;5;240m     │[0m                                 ╰─── Use of direct `eval` here.
+ [38;5;240m     │[0m 
+ [38;5;240m     │[0m [38;5;115mHelp[0m: Consider using indirect eval. For more information, check the documentation: https://rolldown.rs/guide/troubleshooting#avoiding-direct-eval
+[38;5;246m──────╯[0m
+
+[33m[EVAL] [0mUse of direct `eval` function is strongly discouraged as it poses security risks and may cause issues with minification.
+      [38;5;246m╭[0m[38;5;246m─[0m[38;5;246m[[0m node_modules/web-tree-sitter/web-tree-sitter.js:2423:33 [38;5;246m][0m
+      [38;5;246m│[0m
+ [38;5;246m2423 │[0m [38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249m [0m[38;5;249mm[0m[38;5;249mo[0m[38;5;249md[0m[38;5;249mu[0m[38;5;249ml[0m[38;5;249me[0m[38;5;249mE[0m[38;5;249mx[0m[38;5;249mp[0m[38;5;249mo[0m[38;5;249mr[0m[38;5;249mt[0m[38;5;249ms[0m[38;5;249m[[0m[38;5;249mn[0m[38;5;249ma[0m[38;5;249mm[0m[38;5;249me[0m[38;5;249m][0m[38;5;249m [0m[38;5;249m=[0m[38;5;249m [0meval[38;5;249m([0m[38;5;249mf[0m[38;5;249mu[0m[38;5;249mn[0m[38;5;249mc[0m[38;5;249m)[0m[38;5;249m;[0m
+ [38;5;240m     │[0m                                 ──┬─  
+ [38;5;240m     │[0m                                   ╰─── Use of direct `eval` here.
+ [38;5;240m     │[0m 
+ [38;5;240m     │[0m [38;5;115mHelp[0m: Consider using indirect eval. For more information, check the documentation: https://rolldown.rs/guide/troubleshooting#avoiding-direct-eval
+[38;5;246m──────╯[0m
+
+✓ built in 1.23s
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+  - import "./scripts/entry-preloads" without a file extension (vite.config.ts:11:31). Add the file extension
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+error during build:
+Error: Failed to start the Vite preview server for prerendering
+    at startPreviewServer (file:///private/tmp/kiln-offline-fix-20261110/ui/node_modules/@tanstack/start-plugin-core/dist/esm/vite/prerender.js:45:9)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async prerenderWithVite (file:///private/tmp/kiln-offline-fix-20261110/ui/node_modules/@tanstack/start-plugin-core/dist/esm/vite/prerender.js:12:24)
+    at async postBuild (file:///private/tmp/kiln-offline-fix-20261110/ui/node_modules/@tanstack/start-plugin-core/dist/esm/post-build.js:27:37)
+    at async Object.postServerBuild (file:///private/tmp/kiln-offline-fix-20261110/ui/node_modules/@tanstack/start-plugin-core/dist/esm/vite/post-server-build.js:6:2)
+    at async BasicMinimalPluginContext.handler (file:///private/tmp/kiln-offline-fix-20261110/ui/node_modules/@tanstack/start-plugin-core/dist/esm/vite/plugins.js:46:5)
+    at async Object.buildApp (file:///private/tmp/kiln-offline-fix-20261110/ui/node_modules/vite/dist/node/chunks/node.js:35131:5)
+    at async CAC.<anonymous> (file:///private/tmp/kiln-offline-fix-20261110/ui/node_modules/vite/dist/node/cli.js:780:3) {
+  [cause]: Error: listen EPERM: operation not permitted 127.0.0.1
+      at Server.setupListenHandle [as _listen2] (node:net:1926:21)
+      at listenInCluster (node:net:2005:12)
+      at GetAddrInfoReqWrap.callback (node:net:2214:7)
+      at GetAddrInfoReqWrap.onlookupall [as oncomplete] (node:dns:134:8) {
+    code: 'EPERM',
+    errno: -1,
+    syscall: 'listen',
+    address: '127.0.0.1'
+  }
+}

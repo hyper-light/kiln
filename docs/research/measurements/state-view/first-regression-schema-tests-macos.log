@@ -1,0 +1,38 @@
+ok
+test wire::ts::bindings_are_current ... ok
+test wire::ts::every_update_goes_down_as_a_session_frame ... ok
+test wire::ts::hand_written_finds_definitions_not_re_exports ... ok
+test wire::ts::no_generated_type_is_written_by_hand ... FAILED
+test wire::ts::tags_are_serdes_and_what_kiln_leaves_out_is_optional ... ok
+
+failures:
+
+---- wire::contract::docs_say_what_the_tables_say stdout ----
+
+thread 'wire::contract::docs_say_what_the_tables_say' (53307046) panicked at crates/kiln/src/wire/mod.rs:581:9:
+docs/wire.md and crate::wire disagree:
+`Command`::AtState: docs/wire.md says "command, live", the table "command, refused while away"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- wire::ts::no_generated_type_is_written_by_hand stdout ----
+Error: 12 hand-written definitions of types made from Rust (import them from ui/src/api/wire instead):
+ui/src/api/bp/frames.ts:14: Read
+ui/src/api/frames.ts:12: Read
+ui/src/api/review.ts:302: QueueEntry
+ui/src/components/code/about.tsx:355: Step
+ui/src/views/ci/image-builder.tsx:24: Kind
+ui/src/views/harness/derive.ts:13: Step
+ui/src/views/harness/diff.tsx:23: Kind
+ui/src/views/harness/files.tsx:57: Kind
+ui/src/views/harness/run-settings.tsx:32: Kind
+ui/src/views/observe/llm.tsx:370: Step
+ui/src/views/observe/profiles.tsx:447: Kind
+ui/src/views/releases/new.tsx:37: Kind
+
+
+failures:
+    wire::contract::docs_say_what_the_tables_say
+    wire::ts::no_generated_type_is_written_by_hand
+
+test result: FAILED. 20 passed; 2 failed; 0 ignored; 0 measured; 4103 filtered out; finished in 1.13s
+

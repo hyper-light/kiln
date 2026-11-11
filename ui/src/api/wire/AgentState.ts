@@ -17,6 +17,7 @@ import type { Plugin } from "./Plugin";
 import type { QueueItem } from "./QueueItem";
 import type { SessionStatus } from "./SessionStatus";
 import type { Skill } from "./Skill";
+import type { StateMetadata } from "./StateMetadata";
 import type { StatusItem } from "./StatusItem";
 import type { Switching } from "./Switching";
 import type { Task } from "./Task";
@@ -29,6 +30,10 @@ import type { JsonValue } from "./serde_json/JsonValue";
  * Everything about a session that is not the timeline. Small; sent whole on change.
  */
 export type AgentState = { 
+/**
+ * Bounded transport projection: missing detail fields are read from their owner at this revision.
+ */
+view?: StateMetadata, 
 /**
  * Moved here: where its folder stood in its repo's sync log on the machine it left. It goes
  * on once the folder here has taken the log that far, after a restart too.

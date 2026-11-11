@@ -100,6 +100,10 @@ pub fn package(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown: (&
     let kept = store.kept(id, MAX_EVENTS)?.ok_or_else(|| anyhow::anyhow!("the server's store has nothing of this session"))?;
     let info: Info = kept.info.as_deref().and_then(|j| serde_json::from_str(j).ok()).ok_or_else(|| anyhow::anyhow!("the server's store doesn't say what this session is"))?;
     let state: State = kept.state.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+    anyhow::ensure!(
+        !state.view.as_ref().is_some_and(|view| !view.deferred.is_empty()),
+        "the server's store has an incomplete state view; resuming requires the owner's full state record"
+    );
     let events: Vec<Event> = kept.events.iter().filter_map(|e| serde_json::from_str(&e.body).ok()).collect();
     let kind = Kind::get(&info.kind).ok_or_else(|| anyhow::anyhow!("an unknown harness: {}", info.kind))?;
     let from_cwd = if state.cwd.is_empty() { info.cwd.clone() } else { state.cwd.clone() };
@@ -186,6 +190,37 @@ mod tests {
         empty.send("s2", &Update::Open { info: Box::new(info("claude", Some("cc-2"))?), since: None });
         empty.sync()?;
         assert!(package(&empty, "s2", "gone-box", None, ("gone-box", "here")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_projected_state_is_not_resumed_until_the_full_owner_state_is_kept() -> anyhow::Result<()> {
+        use crate::harness::model::QueueItem;
+        use crate::harness::state_view;
+        let (_d, store) = crate::convo::store::scratch()?;
+        let queue = vec![QueueItem {
+            id: "retained-message".into(), text: "kept body".repeat(state_view::FRAME / 8), at: 1,
+            attachments: Vec::new(), overrides: None, reply_to: None,
+        }];
+        let full = State { harness_session: Some("cc-1".into()), queue: queue.clone(), ..State::default() };
+        let projected: State = serde_json::from_value(state_view::view(&full, state_view::FRAME)?.into_state()?)?;
+        assert!(projected.view.as_ref().is_some_and(|view| view.deferred.contains_key("queue")));
+        assert!(projected.queue.is_empty());
+        store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?), since: None });
+        store.send("s1", &Update::State { state: Box::new(projected) });
+        let body = "{\"type\":\"assistant\",\"message\":\"retained transcript\"}";
+        store.put(vec![Row::Record(Box::new(RecordRow {
+            session: "s1".into(), source: "cc-1".into(), n: 0, end: 10, line: body.into(), kept: None,
+        }))]);
+        store.sync()?;
+        let before = store.kept("s1", MAX_EVENTS)?.and_then(|kept| kept.state);
+        let error = package(&store, "s1", "gone-box", None, ("gone-box", "here")).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(error.contains("full state record"), "{error}");
+        assert_eq!(store.kept("s1", MAX_EVENTS)?.and_then(|kept| kept.state), before);
+        assert_eq!(store.record("s1", "cc-1", 0, 1)?, vec![(0, body.to_owned())]);
+        store.send("s1", &Update::State { state: Box::new(full) });
+        store.sync()?;
+        assert_eq!(package(&store, "s1", "gone-box", None, ("gone-box", "here"))?.state.queue, queue);
         Ok(())
     }
 }
