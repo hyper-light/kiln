@@ -2311,7 +2311,7 @@ fn w05_r39_released_gang_room_keeps_fair_order_before_lost_retries() {
         (Step::Lost("r1".into()), 3_413_496),
     ];
     let result = run(&cfg, 3, &steps, |_| {});
-    assert!(result.is_ok(), "{result:?}");
+    assert!(result.is_ok(), "{}", result.err().map(|(_, why)| why).unwrap_or_default());
 }
 
 /// E1.5: compare all generated histories, retaining the original case count and invariants.
