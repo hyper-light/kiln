@@ -2232,7 +2232,7 @@ fn w05_r40_a_gpu_gang_needs_every_siblings_gpu() {
 #[test]
 fn w05_r16_cpu_only_nodes_do_not_delay_gpu_lease_retry() {
     for resources in [false, true] {
-        let cfg = Config { resources, lease: Some(2 * MINUTE as u64), ..Config::default() };
+        let cfg = Config { resources, lease: Some(120_000), ..Config::default() };
         let mut engine = Scheduler::with_epoch(cfg.clone(), 0);
         let mut reference = Reference::new(cfg, 0);
         let runner = |id: &str, gpu| RunnerIn {
@@ -2252,7 +2252,7 @@ fn w05_r16_cpu_only_nodes_do_not_delay_gpu_lease_retry() {
         }
         let expected = reference.placement().0.get("task").map(|(runner, attempt, _, _)| (runner.clone(), *attempt));
         assert_eq!(expected, Some(("gpu".into(), 2)));
-        let actual = engine.grants().get("task").map(|g| (g.runner.clone(), g.attempt));
+        let actual = engine.grants().get("task").map(|(runner, attempt, _, _)| (runner.clone(), *attempt));
         assert_eq!(actual, expected, "resources={resources}");
     }
 }
