@@ -984,3 +984,27 @@ fn w05_r23_gpu_ties_keep_measured_per_core_cpu_fit() -> Result<(), String> {
     assert_eq!(ask.send.ok_or("a start")?.0, RunnerId(1), "one core finishes sooner on the faster core, not on the node with more idle cores");
     Ok(())
 }
+
+/// W05-R23: an old admitted handle cannot become visible while its reused owner slot
+/// is starting, including a delayed old Started word before the actual new admission.
+#[test]
+fn w05_r23_reused_start_publishes_only_its_new_runner_handle() -> Result<(), String> {
+    let (mut owner, mut runners, sig) = crate::lb::tests::fleet(1, [8 * CPU, 0, 0, 0]);
+    let runner = runners.first_mut().ok_or("runner")?;
+    let (r, old, epoch) = owner.ask_fast(sig, CPU as u32).ok_or("first ask")?;
+    let (old_at, b) = runner.start_fast(owner.id(), old, epoch, CPU as u32).ok_or("first start")?;
+    if !owner.started_fast(r, old, old_at, b) { return Err("first Started declined".into()); }
+    let (ended, b) = runner.end_fast(old_at).ok_or("first end")?;
+    if ended != old || !owner.ended_fast(r, old, b) { return Err("first Ended declined".into()); }
+    let (r, new, epoch) = owner.ask_fast(sig, CPU as u32).ok_or("reused ask")?;
+    if new.slot != old.slot || new.generation == old.generation { return Err("slot was not reused with a new generation".into()); }
+    let starting = Some(State::Starting { runner: RunnerId(r) });
+    if owner.state(new) != starting || owner.started_fast(r, old, old_at, b) || owner.state(new) != starting {
+        return Err("old admission changed the reused start".into());
+    }
+    let (new_at, b) = runner.start_fast(owner.id(), new, epoch, CPU as u32).ok_or("new start")?;
+    if new_at == old_at || !owner.started_fast(r, new, new_at, b) || owner.state(new) != Some(State::Started { runner: RunnerId(r), at: new_at }) {
+        return Err("new admission did not replace the runner handle".into());
+    }
+    Ok(())
+}

@@ -167,16 +167,18 @@ struct Cold {
     rates: terms::Rates,
 }
 
-/// A run, 32 bytes. What a run needs beyond CPU, and where it waits, are in its [`Slow`] record.
-#[derive(Debug, Clone, Copy)]
+/// W05-R23: six u32 words per owner slot, including its complete generation. Before
+/// admission, `body` holds CPU and signature; once STARTED it holds the runner's handle.
+/// CPU/signature are never read after admission, and the handle is never read before it.
+/// Wider CPU demands remain in Slow until admission, as before. No demand or generation
+/// bits are discarded; the state selects which pair of u32 values the word represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 struct Run {
-    cpu: u64,
-    /// Its handle at its runner: an admitted run's there, or the room held for it.
-    at: Handle,
-    sig: u32,
+    body: u64,
+    generation: u32,
     runner: u32,
     state: u32,
-    /// Its slow record's slot (NIL: none).
     slow: u32,
 }
 
@@ -193,6 +195,8 @@ struct Place {
 const NO_PLACE: Place = Place { runner: NIL, at: Handle::NONE, epoch: 0 };
 
 mod orders;
+mod runs;
+use runs::Runs;
 pub(crate) mod terms;
 pub use orders::Link;
 pub use terms::{Terms, Warm};
@@ -200,6 +204,8 @@ pub use terms::{Terms, Warm};
 /// What a run needs of memory, disk and GPUs, and where it waits.
 #[derive(Debug, Clone, Copy)]
 struct Slow {
+    /// Full-width original CPU request; no narrowing on waiting or repeated placement.
+    cpu: u64,
     rest: [u64; 3],
     places: [Place; PLACES],
     /// Its neighbours in its signature's waiting runs (run slots), while it is in them.
@@ -309,7 +315,7 @@ pub struct Owner {
     /// Each runner's indexes past its first.
     more: Vec<Vec<u32>>,
     sigs: Vec<Sig>,
-    runs: Slab<Run>,
+    runs: Runs,
     slow: Slab<Slow>,
     /// How many buckets each index has: the most core-equivalents any runner's whole budget has
     /// at its multiplier, plus one, at most [`BUCKETS`] ([`buckets_for`]).
@@ -407,7 +413,7 @@ fn mark(flags: &mut u32, dirty: &mut Vec<u32>, r: u32) {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_kept: 0, dirty: Vec::new(), seen: Vec::new(), counts: Counts::default(), draws: Draws::default(), weights: Weights::default(), eligible: Vec::new(), auction: false, prior: terms::Priors::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Runs::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_kept: 0, dirty: Vec::new(), seen: Vec::new(), counts: Counts::default(), draws: Draws::default(), weights: Weights::default(), eligible: Vec::new(), auction: false, prior: terms::Priors::default() }
     }
 
     /// Grows every index to `want` buckets when that is more than they have.
@@ -429,7 +435,7 @@ impl Owner {
 
     /// Room for `runs` runs before its tables grow (none grows on a decision after that).
     pub fn reserve(&mut self, runs: usize) {
-        self.runs = Slab::with_capacity(runs);
+        self.runs = Runs::with_capacity(runs);
     }
 
     #[inline(always)]
@@ -643,7 +649,7 @@ impl Owner {
             let p = self.peers.get_mut(pr as usize)?;
             if p.view >= cpu && s.ix.none_from(kp) && (p.sig0 == si || s.ix.contains(pr)) {
                 // It alone is the most free: the pick goes back to it, and it needn't have moved.
-                let run = self.runs.insert(Run { cpu: u64::from(cpu), at: Handle::NONE, sig: si, runner: pr, state: STARTING, slow: NIL })?;
+                let run = self.runs.insert(Run::new(u64::from(cpu), si, pr, STARTING, NIL))?;
                 s.ix.took(kp, pr);
                 p.view -= cpu;
                 p.inflight = p.inflight.saturating_add(cpu);
@@ -698,7 +704,7 @@ impl Owner {
         if p.view < cpu || p.flags & MORE != 0 {
             return None;
         }
-        let run = self.runs.insert(Run { cpu: u64::from(cpu), at: Handle::NONE, sig: si, runner: r, state: STARTING, slow: NIL })?;
+        let run = self.runs.insert(Run::new(u64::from(cpu), si, r, STARTING, NIL))?;
         match (from_ix, top) {
             (true, Some(t)) => s.ix.took(t, r),
             _ => o.took(r),
@@ -770,7 +776,7 @@ impl Owner {
         if p.view < cpu || p.flags & MORE != 0 {
             return self.ask_top(si, cpu);
         }
-        let run = self.runs.insert(Run { cpu: u64::from(cpu), at: Handle::NONE, sig: si, runner: r, state: STARTING, slow: NIL })?;
+        let run = self.runs.insert(Run::new(u64::from(cpu), si, r, STARTING, NIL))?;
         s.ix.took(bucket, r);
         p.view -= cpu;
         p.inflight = p.inflight.saturating_add(cpu);
@@ -795,7 +801,7 @@ impl Owner {
         if p.view < cpu || p.flags & MORE != 0 {
             return None;
         }
-        let run = self.runs.insert(Run { cpu: u64::from(cpu), at: Handle::NONE, sig: si, runner: r, state: STARTING, slow: NIL })?;
+        let run = self.runs.insert(Run::new(u64::from(cpu), si, r, STARTING, NIL))?;
         s.ix.took(top, r);
         p.view -= cpu;
         p.inflight = p.inflight.saturating_add(cpu);
@@ -886,8 +892,8 @@ impl Owner {
         if r == NIL {
             return self.ask_waits(si, need, out);
         }
-        let slow = if cpu_only { NIL } else { self.slow_for(&need)? };
-        let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: si, runner: r, state: STARTING, slow }) else {
+        let slow = if Run::needs_slow(&need) { self.slow_for(&need)? } else { NIL };
+        let Some(run) = self.runs.insert(Run::new(need[0], si, r, STARTING, slow)) else {
             self.free_slow(slow);
             return Err(Refused::Full);
         };
@@ -926,8 +932,8 @@ impl Owner {
         }
         self.counts.walked = self.counts.walked.saturating_add(walked);
         let Some((_, _, r, bucket)) = best else { return self.ask_waits(sig.0, need, out) };
-        let slow = if multi(&need) { self.slow_for(&need)? } else { NIL };
-        let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: sig.0, runner: r, state: STARTING, slow }) else {
+        let slow = if Run::needs_slow(&need) { self.slow_for(&need)? } else { NIL };
+        let Some(run) = self.runs.insert(Run::new(need[0], sig.0, r, STARTING, slow)) else {
             self.free_slow(slow);
             return Err(Refused::Full);
         };
@@ -945,7 +951,7 @@ impl Owner {
             return Err(Refused::Never);
         }
         let slow = self.slow_for(&need)?;
-        let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: si, runner: NIL, state: WAITING, slow }) else {
+        let Some(run) = self.runs.insert(Run::new(need[0], si, NIL, WAITING, slow)) else {
             self.free_slow(slow);
             return Err(Refused::Full);
         };
@@ -992,7 +998,7 @@ impl Owner {
             }
             let cpu = narrow(need[0]);
             for &(r, b) in &batch {
-                let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: sig.0, runner: r, state: STARTING, slow: NIL }) else { return Err(Refused::Full) };
+                let Some(run) = self.runs.insert(Run::new(need[0], sig.0, r, STARTING, NIL)) else { return Err(Refused::Full) };
                 let Some(p) = self.peers.get_mut(r as usize) else { continue };
                 p.view = p.view.saturating_sub(cpu);
                 p.inflight = p.inflight.saturating_add(cpu);
@@ -1290,7 +1296,7 @@ impl Owner {
             let unsure = x.state & UNSURE != 0 && matches!(x.state & STATE, STARTING | GOING);
             if x.runner == r && unsure {
                 if x.state & STATE == STARTING {
-                    self.answered(r, x.cpu, x.slow);
+                    self.answered(r, x.cpu(), x.slow);
                 }
                 self.free_run(h);
                 if x.state & CANCELLED == 0 {
@@ -1357,7 +1363,7 @@ impl Owner {
         if x.runner != r || x.state != STARTING || x.slow != NIL {
             return false;
         }
-        let inflight = p.inflight.saturating_sub(narrow(x.cpu));
+        let inflight = p.inflight.saturating_sub(x.cpu());
         let view = b.cpu.saturating_sub(inflight);
         if view != p.view {
             // Commonest by far when the owner alone changes this runner's room: the view is what
@@ -1369,8 +1375,7 @@ impl Owner {
             }
             p.view = view;
         }
-        x.state = STARTED;
-        x.at = at;
+        x.started_at(at);
         p.inflight = inflight;
         true
     }
@@ -1506,7 +1511,7 @@ impl Owner {
             if top.is_some_and(|t| k < t) || p.view < cpu || p.sig0 != sig || p.flags & MORE != 0 {
                 break;
             }
-            let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig, runner: r, state: STARTING, slow: NIL }) else {
+            let Some(run) = self.runs.insert(Run::new(need[0], sig, r, STARTING, NIL)) else {
                 list.drain(..i);
                 self.put_off = list;
                 return Err(Refused::Full);
@@ -1570,8 +1575,8 @@ impl Owner {
         let told = match self.runs.get_mut(run) {
             Some(x) if x.runner == r && x.state & STATE == STARTING && x.slow == NIL => {
                 // The fast path: a start answered, CPU alone.
-                let cpu = narrow(x.cpu);
-                *x = Run { state: STARTED, at, ..*x };
+                let cpu = x.cpu();
+                x.started_at(at);
                 if let Some(p) = self.peers.get_mut(r as usize) {
                     p.inflight = p.inflight.saturating_sub(cpu);
                 }
@@ -1591,16 +1596,16 @@ impl Owner {
         match x.state & STATE {
             STARTING | GOING => {
                 if x.state & STATE == STARTING {
-                    self.answered(r, x.cpu, x.slow);
+                    self.answered(r, x.cpu(), x.slow);
                 }
                 if let Some(y) = self.runs.get_mut(run) {
-                    *y = Run { state: STARTED, at, slow: NIL, ..*y };
+                    y.started_at(at);
                 }
                 self.free_slow(x.slow);
                 Some(Told::Started { run, runner: RunnerId(r) })
             }
             // Said again as its link came back: no longer unsure.
-            STARTED if x.at == at => {
+            STARTED if x.at() == at => {
                 if let Some(y) = self.runs.get_mut(run) {
                     y.state = STARTED;
                 }
@@ -1615,9 +1620,9 @@ impl Owner {
 
     /// A start sent to `r` is answered: what it asked is no longer in flight there.
     #[inline]
-    fn answered(&mut self, r: u32, cpu: u64, slow: u32) {
+    fn answered(&mut self, r: u32, cpu: u32, slow: u32) {
         if let Some(p) = self.peers.get_mut(r as usize) {
-            p.inflight = p.inflight.saturating_sub(narrow(cpu));
+            p.inflight = p.inflight.saturating_sub(cpu);
         }
         if let Some(rest) = self.slow.at(slow).map(|s| s.rest)
             && let Some(c) = self.cold.get_mut(r as usize)
@@ -1677,7 +1682,7 @@ impl Owner {
         };
         match (x.state & STATE, of) {
             (STARTING, Of::Start) if x.runner == r => {
-                self.answered(r, x.cpu, x.slow);
+                self.answered(r, x.cpu(), x.slow);
                 self.park(run);
                 self.apply(r, word, out);
                 #[cfg(test)]
@@ -1737,7 +1742,8 @@ impl Owner {
             if let Some(y) = self.runs.get_mut(run) {
                 y.state = GOING;
                 y.runner = r;
-                y.at = at;
+                // GOING still needs its CPU/signature if Go is refused. The Ready handle
+                // travels directly in Go; the admitted handle comes back in Started.
             }
             out.to.push((RunnerId(r), ToRunner::Go { owner: self.id, run, at, epoch }));
         } else {
@@ -1777,7 +1783,7 @@ impl Owner {
         for h in unknown {
             let Some(x) = self.runs.get(h).copied() else { continue };
             if x.state & STATE == STARTING {
-                self.answered(r, x.cpu, x.slow);
+                self.answered(r, x.cpu(), x.slow);
             }
             if ran == 0 {
                 // None of them ran: placed again.
@@ -1889,17 +1895,17 @@ impl Owner {
         }
         let need = self.need_of(&x);
         let cpu_only = !multi(&need);
-        let r = self.pick_cpu(x.sig, &need, cpu_only);
+        let r = self.pick_cpu(x.sig(), &need, cpu_only);
         if r == NIL {
             self.wait(run, out, true);
             return;
         }
-        self.unlist(x.sig, run.slot, x.slow);
+        self.unlist(x.sig(), run.slot, x.slow);
         let epoch = self.deduct(r, &need, cpu_only);
         if let Some(y) = self.runs.get_mut(run) {
             y.state = STARTING;
             y.runner = r;
-            y.at = Handle::NONE;
+            // Its CPU/signature remain live until a Started response.
         }
         out.to.push((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch, need })));
     }
@@ -1910,7 +1916,7 @@ impl Owner {
     fn wait(&mut self, run: Handle, out: &mut Out, tell: bool) {
         let Some(x) = self.runs.get(run).copied() else { return };
         let need = self.need_of(&x);
-        let Some(s) = self.sigs.get(x.sig as usize) else { return };
+        let Some(s) = self.sigs.get(x.sig() as usize) else { return };
         if !s.ix.could_fit(&need) {
             self.free_run(run);
             out.told.push(Told::Never { run });
@@ -1936,7 +1942,7 @@ impl Owner {
         // Drawn under tokens, or by learned weights while they help; else (and once they fell
         // back) the nearest to fitting, as before them.
         if self.draws.on || self.weights.drawing() {
-            places = self.drawn(x.sig, &need, places);
+            places = self.drawn(x.sig(), &need, places);
         }
         let slow = if x.slow == NIL {
             match self.slow.insert(Slow::of(&need)) {
@@ -1959,10 +1965,10 @@ impl Owner {
         if let Some(y) = self.runs.get_mut(run) {
             y.state = WAITING;
             y.runner = NIL;
-            y.at = Handle::NONE;
+            // Its CPU/signature remain live while waiting.
             y.slow = slow;
         }
-        self.list(x.sig, run.slot, slow);
+        self.list(x.sig(), run.slot, slow);
         for p in places.iter().filter(|p| p.runner != NIL) {
             let epoch = self.peers.get(p.runner as usize).map_or(0, |q| q.epoch());
             out.to.push((RunnerId(p.runner), ToRunner::Wait(Start { owner: self.id, run, epoch, need })));
@@ -1985,7 +1991,7 @@ impl Owner {
                 *p = NO_PLACE;
             }
         }
-        self.unlist(x.sig, run.slot, x.slow);
+        self.unlist(x.sig(), run.slot, x.slow);
     }
 
     /// Tries the oldest runs waiting for signature `sig`'s members while one has room for them.
@@ -2052,7 +2058,7 @@ impl Owner {
         if let Some(x) = self.runs.get_mut(run) {
             x.state = WAITING | (x.state & CANCELLED);
             x.runner = NIL;
-            x.at = Handle::NONE;
+            // Its before-admission CPU/signature remain live while parked.
         }
     }
 
@@ -2146,15 +2152,17 @@ impl Owner {
 
     /// A run's whole need.
     fn need_of(&self, x: &Run) -> Amounts {
-        let [m, d, g] = self.slow.at(x.slow).map_or([0; 3], |s| s.rest);
-        [x.cpu, m, d, g]
+        self.slow.at(x.slow).map_or([u64::from(x.cpu()), 0, 0, 0], |s| {
+            let [m, d, g] = s.rest;
+            [s.cpu, m, d, g]
+        })
     }
 
     /// Forgets a run.
     fn free_run(&mut self, run: Handle) {
         let Some(x) = self.runs.get(run).copied() else { return };
         if x.slow != NIL {
-            self.unlist(x.sig, run.slot, x.slow);
+            self.unlist(x.sig(), run.slot, x.slow);
             self.free_slow(x.slow);
         }
         let _ = self.runs.remove(run);
@@ -2177,11 +2185,11 @@ impl Owner {
             return false;
         }
         let r = x.runner;
-        self.answered(r, x.cpu, x.slow);
+        self.answered(r, x.cpu(), x.slow);
         let last = self.last();
         if let Some(p) = self.peers.get_mut(r as usize) {
             let from = key(p.view, p.scale, last);
-            p.view = p.view.saturating_add(narrow(x.cpu));
+            p.view = p.view.saturating_add(x.cpu());
             let (to, sig0, more, up) = (key(p.view, p.scale, last), p.sig0, p.flags & MORE != 0, p.flags & UP != 0);
             if up && to != from {
                 self.relink_all(r, sig0, more, from, to);
@@ -2285,7 +2293,7 @@ impl Owner {
         let x = self.runs.get(run)?;
         Some(match x.state & STATE {
             STARTING => State::Starting { runner: RunnerId(x.runner) },
-            STARTED => State::Started { runner: RunnerId(x.runner), at: x.at },
+            STARTED => State::Started { runner: RunnerId(x.runner), at: x.at() },
             GOING => State::Going { runner: RunnerId(x.runner) },
             _ => {
                 let places = self.slow.at(x.slow).map_or([NO_PLACE; PLACES], |s| s.places);
@@ -2321,7 +2329,7 @@ impl Owner {
 
 impl Slow {
     fn of(need: &Amounts) -> Slow {
-        Slow { rest: rest(need), places: [NO_PLACE; PLACES], prev: NIL, next: NIL, listed: false }
+        Slow { cpu: need[0], rest: rest(need), places: [NO_PLACE; PLACES], prev: NIL, next: NIL, listed: false }
     }
 }
 
@@ -2539,8 +2547,8 @@ impl Owner {
             let cpu_only = !multi(&need);
             for c in a.of {
                 let Some(r) = at(c) else { continue };
-                let slow = if cpu_only { NIL } else { self.slow_for(&need)? };
-                let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: sig.0, runner: r, state: STARTING, slow }) else {
+                let slow = if Run::needs_slow(&need) { self.slow_for(&need)? } else { NIL };
+                let Some(run) = self.runs.insert(Run::new(need[0], sig.0, r, STARTING, slow)) else {
                     self.free_slow(slow);
                     return Err(Refused::Full);
                 };

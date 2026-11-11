@@ -455,8 +455,8 @@ impl Owner {
     /// path does once it has picked.
     fn start_at(&mut self, si: u32, need: Amounts, r: u32) -> Result<Asked, Refused> {
         let cpu_only = !multi(&need);
-        let slow = if cpu_only { NIL } else { self.slow_for(&need)? };
-        let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: si, runner: r, state: STARTING, slow }) else {
+        let slow = if Run::needs_slow(&need) { self.slow_for(&need)? } else { NIL };
+        let Some(run) = self.runs.insert(Run::new(need[0], si, r, STARTING, slow)) else {
             self.free_slow(slow);
             return Err(Refused::Full);
         };
@@ -476,7 +476,7 @@ impl Owner {
         }
         sl.places = places;
         let slow = self.slow.insert(sl).ok_or(Refused::Full)?.slot;
-        let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: si, runner: NIL, state: WAITING, slow }) else {
+        let Some(run) = self.runs.insert(Run::new(need[0], si, NIL, WAITING, slow)) else {
             self.free_slow(slow);
             return Err(Refused::Full);
         };

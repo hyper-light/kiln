@@ -61,8 +61,12 @@ owner is told it).
   without run times). Every word it sends carries its room and its epoch.
 - **Records:** the owner's record of a runner is 32 bytes, aligned (view, in flight, epoch, ends
   heard, key multiplier, first index, flags, measure count): four to a 128-byte line, none straddling
-  two. A runner's hot fields are its first 128 bytes. An admitted run is 24 bytes (its memory,
-  disk and GPU needs in a side slab when it has any). A run at the owner is 32 bytes.
+  two. A runner's fast fields and eight inline 16-byte admitted records occupy its first 160
+  bytes; overflow records are 24 bytes. Memory, disk and GPU needs use a side slab when needed.
+  An owner's whole run slot is 24 bytes, including its full generation. CPU and signature share
+  one word with the runner handle: CPU/signature remain live through waiting and Go refusal;
+  only Started replaces them with the admitted handle. Wider CPU demand stays exact in Slow
+  until admission. A freed slot reuses its runner field for the free-list link (W05-R23).
 - **Messages** are `Copy` values. A start or an end of CPU alone, for a runner's one owner, takes
   a short path on each side; anything else (memory, disk or GPUs asked, several owners, a line,
   another epoch) takes the general one.
