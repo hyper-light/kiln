@@ -389,6 +389,12 @@ fn cpus(c: Cpus) -> u128 {
 /// Whether a runner has room for `leg` beside the legs on it (`on`), as W05-R03 says.
 fn room(cfg: &Config, r: &RunnerIn, on: &[&LegIn], leg: &LegIn) -> bool {
     let size = size(r);
+    // W05-R03: CPU/memory slot accounting never creates physical GPUs. These cases
+    // declare counts without inventories, independently of the engine's per-card matcher.
+    if leg.request.gpu > 0 {
+        let wanted = on.iter().fold(u64::from(leg.request.gpu), |n, l| n.saturating_add(u64::from(l.request.gpu)));
+        if wanted > size.map_or(0, |s| u64::from(s.gpu)) { return false; }
+    }
     if on.iter().any(|l| claim(l, size) == Some(Claim::Whole)) {
         return false;
     }
