@@ -1768,6 +1768,9 @@ pub struct Registry {
     keep_off: Rcu<std::collections::HashSet<String>>,
     /// The UI's commands by the ids their clients made, each taken once (`super::asked`).
     pub asked: super::asked::Asked,
+    /// What sessions' copies lack of states their runners sent bounded, which the server reads from them
+    /// (`super::fill`).
+    pub fills: super::fill::Fills,
     /// One event pump over committed communication custody, with no blocked-body task list.
     pub mail_delivery: super::mail_delivery::Relay,
     /// Which of its machine's runner processes holds each session on a machine (its instance:
@@ -1980,6 +1983,7 @@ impl Registry {
             names: Rcu::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             keep_off: Rcu::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             asked: super::asked::Asked::default(),
+            fills: super::fill::Fills::default(),
             mail_delivery: super::mail_delivery::Relay::default(),
             holders: Arc::new(Rcu::new(std::fs::read(dir.join("holders.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default())),
             holders_saving: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -6603,7 +6607,7 @@ mod tests {
             for id in ids.clone() {
                 let (hub, sent) = (Arc::clone(&hub), sent_tx.clone());
                 crate::rt::spawn_spread(async move {
-                    let runner = |update: Update| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None, taken: None };
+                    let runner = |update: Update| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None, taken: None, fill: false };
                     let mut n = 0u64;
                     while n < per {
                         let run = if n.is_multiple_of(4) { 8.min(per - n) } else { 1 };
@@ -6635,6 +6639,53 @@ mod tests {
                 let summary = hub.harness.sessions.with(id, |v| v.info.summary.clone());
                 anyhow::ensure!(summary.as_deref() == Some(format!("through {per}").as_str()), "{id}'s last state: {summary:?}");
             }
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: a runner's state too large for its frame comes as a view, its queue left out. The copy keeps the
+    /// queue it had (no page sees a field left out, nor the view) and takes the view's own fields; the queue the server
+    /// read from the runner comes in at the revision the view said, and one read at another revision doesn't.
+    #[test]
+    fn cp_t3_2_a_bounded_view_keeps_the_copys_fields_until_read() -> anyhow::Result<()> {
+        use crate::harness::model::{QueueItem, State, Status};
+        use crate::harness::state_view::{FRAME, Metadata, view};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let id = "big".to_owned();
+            hub.harness.ingest(&there, &id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            let runner = |update: Update, fill: bool| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None, taken: None, fill };
+            let item = |i: usize| QueueItem { id: format!("q{i}"), text: "peer report ".repeat(200), at: 1, attachments: Vec::new(), overrides: None, reply_to: None };
+            let copy = || hub.harness.sessions.with(&id, |v| (v.state.to_value(), v.info.queued)).ok_or_else(|| anyhow::anyhow!("no copy"));
+            let first = State { status: Status::Running, queue: (0..400).map(item).collect(), ..State::default() };
+            hub.harness.from_runner(runner(Update::State { state: Box::new(first.clone()) }, false)).await;
+            hub.harness.settled().await;
+            let mut now = first.clone();
+            now.queue.push(item(400));
+            now.status = Status::Waiting;
+            let bounded: State = serde_json::from_value(view(&now, FRAME - 4096)?.into_state()?)?;
+            anyhow::ensure!(bounded.queue.is_empty(), "the view leaves the queue out");
+            hub.harness.from_runner(runner(Update::State { state: Box::new(bounded.clone()) }, false)).await;
+            hub.harness.settled().await;
+            let (doc, queued) = copy()?;
+            anyhow::ensure!(doc.get("view").is_none(), "a page never sees the view");
+            anyhow::ensure!(doc.get("status") == Some(&serde_json::json!("waiting")), "the view's own fields count");
+            anyhow::ensure!(doc.get("queue").and_then(Value::as_array).map(Vec::len) == Some(400), "the queue left out keeps the copy's");
+            anyhow::ensure!(queued == 401, "its count is the runner's: {queued}");
+            let revision = bounded.view.as_ref().and_then(|v| v.revisions.get("queue").cloned()).unwrap_or_default();
+            let read = |revision: String| {
+                let view = Metadata { revision: String::new(), revisions: std::collections::BTreeMap::from([("queue".to_owned(), revision)]), deferred: std::collections::BTreeMap::new(), counts: Default::default(), queue_index: None };
+                Update::State { state: Box::new(State { queue: now.queue.clone(), view: Some(view), ..State::default() }) }
+            };
+            hub.harness.from_runner(runner(read("another".into()), true)).await;
+            hub.harness.settled().await;
+            anyhow::ensure!(copy()?.0.get("queue").and_then(Value::as_array).map(Vec::len) == Some(400), "a read at another revision isn't taken");
+            hub.harness.from_runner(runner(read(revision), true)).await;
+            hub.harness.settled().await;
+            let (doc, queued) = copy()?;
+            anyhow::ensure!(doc.get("queue").and_then(Value::as_array).map(Vec::len) == Some(401) && queued == 401, "the queue read comes in");
+            anyhow::ensure!(doc.get("status") == Some(&serde_json::json!("waiting")) && doc.get("view").is_none(), "{:?}", doc.get("status"));
             Ok(())
         })
     }
@@ -7259,7 +7310,7 @@ mod tests {
 
     /// An update of session `session` as its runner sends it, for its owner to judge and take (`Registry::from_runner`).
     fn from_box(session: &str, update: Update) -> super::super::copies::RunnerUpdate {
-        super::super::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: session.to_owned(), update, shipped: false, arrived: None, handed: None, taken: None }
+        super::super::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: session.to_owned(), update, shipped: false, arrived: None, handed: None, taken: None, fill: false }
     }
 
     /// Event `q` of session `id` (named `{id}-e{q}`), saying `text`.

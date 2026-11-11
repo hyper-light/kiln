@@ -10,7 +10,6 @@ import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import { readFrame, unread } from "./frames";
 import type { TerminalSessionInfo } from "./types";
-import { stateFieldRevision, stateMetadata, stateMessageIds, stateMutationError, statePageMessageIds, stateReply, type StatePage, type StateStep } from "./state-pages";
 import { stateAtOpen } from "./session-availability";
 import { heldCommand, heldFrom, publicationReceipt, useHeld, type Held, type PublicationReceipt } from "./held";
 import type {
@@ -711,8 +710,6 @@ export interface Snapshot {
   info: AgentInfo | null;
   meta: Meta | null;
   state: State | null;
-  /** One replaceable page per deferred field; pages never accumulate into the control state. */
-  statePages: Record<string, StatePage>;
   /** In timeline order. */
   events: HEvent[];
   /** Null on legacy servers; earlier events are loaded only on request. */
@@ -804,7 +801,6 @@ const EMPTY: Snapshot = {
   info: null,
   meta: null,
   state: null,
-  statePages: {},
   events: [],
   history: null,
   changes: null,
@@ -927,6 +923,16 @@ const patched = (was: State | null, u: { set: Partial<State>; gone?: string[] })
   return now as unknown as State;
 };
 
+/** The messages the state shows: queued (its own or a subagent's), handed to its harness, or with a delivery said. */
+const shownIds = (s: State | null): Set<string> => {
+  const ids = new Set<string>();
+  for (const q of s?.queue ?? []) ids.add(q.id);
+  for (const t of s?.tasks ?? []) for (const q of t.queue ?? []) ids.add(q.id);
+  for (const g of s?.given ?? []) ids.add(g.id);
+  for (const id of Object.keys(s?.delivery ?? {})) ids.add(id);
+  return ids;
+};
+
 /** A changeset's file's key: its path, and the top of its working tree when it's in one. */
 const fileKey = (f: { path: string; tree?: string | null }) => `${f.tree ?? ""}\u0000${f.path}`;
 
@@ -1027,8 +1033,6 @@ export class SessionStore {
   private loadedHistory = false;
   /** A replacement snapshot invalidates pending body hydration, even if it shares event ids. */
   private snapshotGeneration = 0;
-  private stateReadGeneration = 0;
-  private stateReads = new Map<string, number>();
   /** Where each event is in `snap.events`. */
   private pos = new Map<string, number>();
   /** Since the last notification: events replaced, new ones, a new snapshot. */
@@ -1452,7 +1456,6 @@ export class SessionStore {
     this.cancelHistory();
     if (this.disposed) return;
     this.disposed = true;
-    this.invalidateStateReads();
     this.snapshotGeneration += 1;
     this.speculation?.resolve(false);
     this.speculation = null;
@@ -1640,66 +1643,6 @@ export class SessionStore {
       }
     });
 
-  /** Read one bounded part of the current state. A newer read replaces this field's page. */
-  readState = async (field: string, path: StateStep[] = [], offset = 0): Promise<void> => {
-    const view = stateMetadata(this.snap.state);
-    const revision = stateFieldRevision(this.snap.state, field);
-    const available = view?.deferred[field] || (field === "$queue_index" && view?.queue_index && !view.queue_index.complete);
-    if (!available || revision === undefined || this.disposed || !Number.isSafeInteger(offset) || offset < 0) return;
-    const generation = ++this.stateReadGeneration;
-    this.stateReads.set(field, generation);
-    const read = { revision, field, path: [...path], offset };
-    this.patch({ statePages: { ...this.snap.statePages, [field]: { phase: "loading", read } } });
-    const value = await this.request((client) => ({ type: "state_read", client, read }));
-    if (this.disposed || this.stateReads.get(field) !== generation || stateFieldRevision(this.snap.state, field) !== read.revision) return;
-    this.stateReads.delete(field);
-    const result = stateReply(value, read.revision);
-    this.patch({ statePages: { ...this.snap.statePages, [field]: { phase: result.reply ? "ready" : "error", read, ...result } } });
-    this.arrived([]);
-  };
-
-  /** A paged row may change on another device before an action arrives: its owner checks this revision. */
-  changeState = async (field: string, command: Command): Promise<void> => {
-    const page = this.snap.statePages[field];
-    const revision = stateFieldRevision(this.snap.state, field);
-    if (typeof revision !== "string" || page?.phase !== "ready" || page.read.revision !== revision || this.disposed) return;
-    const generation = ++this.stateReadGeneration;
-    this.stateReads.set(field, generation);
-    this.patch({ statePages: { ...this.snap.statePages, [field]: { phase: "loading", read: page.read } } });
-    const value = await this.request((client) => ({ type: "at_state", client, revision, command }));
-    if (this.disposed || this.stateReads.get(field) !== generation || stateFieldRevision(this.snap.state, field) !== revision) return;
-    this.stateReads.delete(field);
-    const error = stateMutationError(value);
-    const pages = { ...this.snap.statePages };
-    if (error) pages[field] = { phase: "error", read: page.read, error };
-    else delete pages[field];
-    this.patch({ statePages: pages });
-  };
-
-  private invalidateStateReads() {
-    this.stateReadGeneration += 1;
-    this.stateReads.clear();
-    if (Object.keys(this.snap.statePages).length) {
-      this.snap = { ...this.snap, statePages: {} };
-      if (!this.disposed) this.schedule();
-    }
-  }
-
-  private stateViewChanged(state: State | null) {
-    const fields = new Set([...Object.keys(this.snap.statePages), ...this.stateReads.keys()]);
-    const pages = { ...this.snap.statePages };
-    let changed = false;
-    for (const field of fields) {
-      if (stateFieldRevision(state, field) === stateFieldRevision(this.snap.state, field) && (field === "$queue_index" || stateMetadata(state)?.deferred[field])) continue;
-      this.stateReads.delete(field);
-      if (pages[field]) {
-        delete pages[field];
-        changed = true;
-      }
-    }
-    if (changed) this.snap = { ...this.snap, statePages: pages };
-  }
-
   /**
    * The page of events before what's held (docs/wire.md, "Windows"), merged in by number: what's
    * shown doesn't move (the timeline keeps its place as the page joins above it). One at a time;
@@ -1866,7 +1809,6 @@ export class SessionStore {
   }
 
   private connect() {
-    this.invalidateStateReads();
     window.clearTimeout(this.timer);
     this.timer = 0;
     if (!this.wanted) return;
@@ -2273,7 +2215,6 @@ export class SessionStore {
       this.rev = this.pending.rev;
       this.pending = null;
     }
-    this.stateViewChanged(inc.state);
     const s = this.snap;
     this.snap = {
       ...s,
@@ -2335,7 +2276,6 @@ export class SessionStore {
       case "state":
       case "state_patch": {
         const now = u.t === "state" ? u.state : patched(this.snap.state, u);
-        this.stateViewChanged(now);
         const state = share<State | null>(this.snap.state, now) ?? now;
         // A stop asked of a turn holds while one runs; once none does, it's done with.
         const stopAsked = state.status === "running" || state.status === "waiting" ? this.snap.stopAsked : null;
@@ -2407,9 +2347,7 @@ export class SessionStore {
 
   /** Whether the session shows message `id`: in its conversation, or waiting in its queue or a subagent's. */
   private shows(id: string): boolean {
-    const s = this.snap.state;
-    if (stateMessageIds(s).has(id)) return true;
-    if (Object.values(this.snap.statePages).some((page) => page.read.revision === stateFieldRevision(s, page.read.field) && statePageMessageIds(page).includes(id))) return true;
+    if (shownIds(this.snap.state).has(id)) return true;
     if (this.byId.get(id)?.kind === "user") return true;
     for (const e of this.byId.values()) if (e.kind === "user" && e.client_id === id) return true;
     return false;
@@ -2427,9 +2365,7 @@ export class SessionStore {
       this.out.delete(e.id);
       if (e.client_id) this.out.delete(e.client_id);
     }
-    const s = this.snap.state;
-    for (const id of stateMessageIds(s)) present.add(id);
-    for (const page of Object.values(this.snap.statePages)) if (page.read.revision === stateFieldRevision(s, page.read.field)) for (const id of statePageMessageIds(page)) present.add(id);
+    for (const id of shownIds(this.snap.state)) present.add(id);
     for (const id of present) {
       this.out.delete(id);
       this.asked.delete(id);

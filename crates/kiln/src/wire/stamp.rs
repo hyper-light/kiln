@@ -188,7 +188,7 @@ mod tests {
             let arrived = Instant::now().checked_sub(Duration::from_millis(5)).ok_or_else(|| anyhow::anyhow!("no time 5 ms ago"))?;
             let server0 = leg(RunnerLeg::Server);
             let update = said(2, "and its budget");
-            hub.harness.from_runner(crate::harness::copies::RunnerUpdate { peer: 1, agent: "fedora".into(), session: "s1".into(), update, shipped: false, arrived: Some(arrived), handed: Some(Instant::now()), taken: Some(Duration::from_micros(300)) }).await;
+            hub.harness.from_runner(crate::harness::copies::RunnerUpdate { peer: 1, agent: "fedora".into(), session: "s1".into(), update, shipped: false, arrived: Some(arrived), handed: Some(Instant::now()), taken: Some(Duration::from_micros(300)), fill: false }).await;
             hub.harness.applied("s1").await;
             let server = leg(RunnerLeg::Server);
             anyhow::ensure!(server.0 > server0.0 && server.1 >= server0.1 + 5_000, "from its arrival 5 ms before: {server0:?} to {server:?}");

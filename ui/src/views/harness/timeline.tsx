@@ -5,8 +5,6 @@
  * the files it read, the subagent it started.
  */
 import * as React from "react";
-import { DeferredState } from "./deferred-state";
-import { approvalItem, pageHasItem } from "@/api/state-pages";
 import {
   ArrowDown,
   ArrowUpLeft,
@@ -2092,30 +2090,6 @@ export const Timeline = React.memo(function Timeline({
           onKeyDownCapture={keeper.onTouch}
         >
           <div ref={marks} className="hx-flow">
-            <DeferredState
-              store={store}
-              field="approvals"
-              renderValue={(value, path) => {
-                const approval = approvalItem(value, path);
-                if (!approval || !onDecide) return undefined;
-                if (!stillAsked([approval], done).length) return <p className="in-none">Answered.</p>;
-                return (
-                  <ApprovalCard
-                    key={approval.id}
-                    a={approval}
-                    cwd={cwd}
-                    agentName={agentName}
-                    kind={agentLabel}
-                    agentId={agent}
-                    onReviewPlan={parent ? undefined : onReviewPlan}
-                    onDecide={(command) => {
-                      const current = store.get();
-                      if (pageHasItem(current.state, current.statePages.approvals, "approvals", command.id)) onDecide(command);
-                    }}
-                  />
-                );
-              }}
-            />
             {restoring ? (
               <RestoringPlace store={store} position={restoring} resolved={restored} latest={latest} />
             ) : (

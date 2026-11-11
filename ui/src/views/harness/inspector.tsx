@@ -18,7 +18,6 @@ import { BodiesContext } from "./whole";
 import { SessionChanges, fromServer, inScope, useScope, type OwnSource, type Sub } from "./changes";
 import type { CommitsSource } from "./commits";
 import type { CompareSource } from "./compare";
-import { deferredState, stateCount } from "@/api/state-pages";
 
 const NO_EVENTS: HEvent[] = [];
 const NO_AGENTS: readonly AgentInfo[] = [];
@@ -163,8 +162,6 @@ export function Inspector({
   const runs = useSameList(React.useMemo(() => (tab === "tools" ? runsOf(events) : []), [events, tab]));
   const todos = state?.todos ?? [];
   const done = todos.filter((t) => t.status === "completed").length;
-  const todoCount = stateCount(state, "todos", todos.length);
-  const todoDone = stateCount(state, "todos_done", done);
   // The plan it last proposed (plan mode), to read and keep.
   const proposed = React.useMemo(() => {
     if (tab !== "plan") return "";
@@ -178,19 +175,8 @@ export function Inspector({
   const reviewing = useReviewWaits(store);
   const tabs: { id: InspectorTab; label: string; count?: string; waits?: boolean }[] = [
     { id: "changes", label: "Changes", count: fileCount ? String(fileCount) : undefined },
-    { id: "plan", label: "Plan", count: todoCount ? `${todoDone}/${todoCount}` : undefined, waits: reviewing !== null },
-    {
-      id: "tools",
-      label: "Tools",
-      count:
-        deferredState(state, "tasks") || deferredState(state, "mcp")
-          ? "…"
-          : subagents
-            ? String(subagents)
-            : mcp.length
-              ? `${mcp.filter((m) => m.status === "connected").length}/${mcp.length}`
-              : undefined,
-    },
+    { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : undefined, waits: reviewing !== null },
+    { id: "tools", label: "Tools", count: subagents ? String(subagents) : mcp.length ? `${mcp.filter((m) => m.status === "connected").length}/${mcp.length}` : undefined },
   ];
   return (
     <BodiesContext.Provider value={store}>
