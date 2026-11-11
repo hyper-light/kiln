@@ -310,7 +310,7 @@ impl Index {
     }
 
     /// Bucket `b`'s member at or after runner `from`, wrapping (NIL: the bucket is empty).
-    #[inline]
+    #[inline(always)]
     fn first_from(&self, b: u32, from: u32) -> u32 {
         let (nb, nw) = (self.nb, self.nw);
         let (w0, from) = if from / 64 < nw { (from / 64, from) } else { (0, 0) };
@@ -324,7 +324,10 @@ impl Index {
 
     /// Bucket `b`'s first member in a word after `w0`, wrapping round to the words before it and
     /// `w0`'s own (by the summary: a word per 4,096 runners).
-    #[inline]
+    // W05-R23: the current membership word is the small common lookup. Keep the
+    // summary walk and wraparound out of that inlined path; its exact order is unchanged.
+    #[cold]
+    #[inline(never)]
     fn first_after(&self, b: u32, w0: u32) -> u32 {
         let nb = self.nb;
         let ns = self.nw.div_ceil(64);
