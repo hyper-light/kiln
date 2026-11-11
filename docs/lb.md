@@ -825,6 +825,14 @@ pass through VFIO devices or recover per-device runtime assignments. Hex's gener
 path still refused device-bearing asks at the source pin; its ongoing device recovery/attachment
 work is not imported here.
 
+For a local executor pool, declare its GPU count in the pool's resources. Each warm executor
+reserves that count when it starts, in slot mode as well as resource mode. A GPU leg must fit
+the selected executor's reservation; its original GPU request and per-card predicates are
+retained for that check. The grant credits its own executor's reservation once, leaving the
+other warm executors' GPUs held. Ordinary gang siblings share the remaining host capacity.
+A hosted pool's pod instead needs its own runner to report enough GPU capacity before a grant.
+These admission checks do not establish physical attachment or device isolation.
+
 `crates/kiln-gpu` is Hex's retained `hex-gpu` provider at the same pin, taken as kiln's own with
 an `ORIGIN.md`. It opens NVIDIA NVML, Linux AMD amdgpu counters and Windows AMD ADL once,
 then samples through retained handles, file descriptors and contexts. Ordinary samples start no

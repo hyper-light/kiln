@@ -4084,24 +4084,50 @@ fn w05_r23_ci_gpu_load_and_same_card_predicates() -> Result<(), String> {
 fn w05_r40_gpu_gangs_count_pooled_siblings() -> Result<(), String> {
     for resources in [false, true] {
         for pooled in [1, 2] {
-            for gpus in [0, 1, 2] {
-                let mut s = Scheduler::new(Config { resources, pools: vec![pool(2, 2, 2, "10m")?], ..Config::default() });
-                let mut host = docker_host("host");
-                host.capacity = Some(Resources { cpu: Cpus::whole(4), mem: 8 << 30, gpu: gpus, ..Resources::default() });
-                let commands = s.handle(Input::RunnerUp(Box::new(host)), 0);
-                let executors: Vec<_> = commands.iter().filter_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }).collect();
-                assert_eq!(executors.len(), 2, "{commands:?}");
-                for executor in executors { s.handle(Input::ExecutorReady { executor }, 1); }
-                for (id, at) in [("a", 2), ("b", 3)] {
-                    let mut l = pool_leg(id);
-                    if id == "b" && pooled == 1 { l.route.labels = vec!["linux".into()]; }
-                    l.request = Resources { cpu: Cpus::whole(1), mem: 1 << 30, gpu: 1, ..Resources::default() };
-                    l.gang = Some(super::state::Gang { id: "gpu-gang".into(), size: 2 });
-                    let commands = s.handle(Input::LegQueued(Box::new(l)), at);
-                    let expected = if at == 3 && gpus == 2 { 2 } else { 0 };
-                    assert_eq!(s.grants().len(), expected, "resources={resources}, pooled={pooled}, GPUs={gpus}, at={at}: {commands:?}");
-                }
+            for reserved in [0, 1] {
+                for gpus in [0, 1, 2] {
+                    let mut p = pool(pooled, pooled, pooled, "10m")?;
+                    // Only "burst" routes to this pool; the "linux" sibling runs on the host.
+                    p.labels = vec!["burst".into()];
+                    p.request.gpu = reserved;
+                    let mut s = Scheduler::new(Config { resources, pools: vec![p], ..Config::default() });
+                    let mut host = docker_host("host");
+                    host.capacity = Some(Resources { cpu: Cpus::whole(4), mem: 8 << 30, gpu: gpus, ..Resources::default() });
+                    let commands = s.handle(Input::RunnerUp(Box::new(host)), 0);
+                    let executors: Vec<_> = commands.iter().filter_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }).collect();
+                    let expected = if reserved == 0 { pooled } else { pooled.min(usize::try_from(gpus).map_err(|e| e.to_string())?) };
+                    assert_eq!(executors.len(), expected, "resources={resources}, pooled={pooled}, reserved={reserved}, GPUs={gpus}: {commands:?}");
+                    for executor in executors { s.handle(Input::ExecutorReady { executor }, 1); }
+                    for (id, at) in [("a", 2), ("b", 3)] {
+                        let mut l = pool_leg(id); l.route.labels = vec!["burst".into()];
+                        if id == "b" && pooled == 1 { l.route.labels = vec!["linux".into()]; }
+                        l.request = Resources { cpu: Cpus::whole(1), mem: 1 << 30, gpu: 1, ..Resources::default() };
+                        l.gang = Some(super::state::Gang { id: "gpu-gang".into(), size: 2 });
+                        let commands = s.handle(Input::LegQueued(Box::new(l)), at);
+                        let expected = if at == 3 && gpus == 2 && reserved == 1 { 2 } else { 0 };
+                        assert_eq!(s.grants().len(), expected, "resources={resources}, pooled={pooled}, reserved={reserved}, GPUs={gpus}, at={at}: {commands:?}");
+                    }
             }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// W05-R03/W13-R07: a pod must report GPU capacity before its GPU leg is admitted.
+#[test]
+fn w13_r07_gpu_pods_need_reported_device_capacity() -> Result<(), String> {
+    for resources in [false, true] {
+        for gpus in [0, 1] {
+            let mut s = Scheduler::new(Config { resources, pools: vec![pod_pool(0, 1)?], ..Config::default() });
+            let mut l = pod_leg("gpu"); l.request.gpu = 1;
+            let commands = s.handle(Input::LegQueued(Box::new(l)), 0);
+            let executor = commands.iter().find_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }).ok_or_else(|| format!("no pod boot: {commands:?}"))?;
+            let mut r = linux("gpu-pod", 1);
+            r.executor = Some(executor);
+            r.capacity = Some(Resources { cpu: Cpus::whole(1), mem: 1 << 30, gpu: gpus, ..Resources::default() });
+            let commands = s.handle(Input::RunnerUp(Box::new(r)), 1);
+            assert_eq!(s.grants().contains_key("gpu"), gpus == 1, "resources={resources}, GPUs={gpus}: {commands:?}");
         }
     }
     Ok(())

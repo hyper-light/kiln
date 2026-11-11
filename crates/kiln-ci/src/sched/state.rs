@@ -2065,7 +2065,8 @@ impl Scheduler {
         let asked = input.request;
         // A pool's leg takes what its executor holds already.
         if req.pool.is_some() {
-            input.request = Resources::default();
+            let gpu = req.pool.as_deref().and_then(|name| self.pool(name)).filter(|p| p.hosted).map_or(0, |_| asked.gpu);
+            input.request = Resources { gpu, ..Resources::default() };
         }
         req.prefer.extend(input.prefer.iter().cloned());
         let sig = req.signature();
@@ -2839,9 +2840,12 @@ impl Scheduler {
         let Some(s) = self.sigs.get(&l.sig) else { return Vec::new() };
         let rooms: Vec<&Runner> = s.eligible.iter().filter_map(|r| self.runners.get(r)).filter(|r| self.fits(r, l)).collect();
         let scores = self.scores(l, &rooms, None);
-        let gpu_scores: Vec<u64> = if l.input.request.gpu > 0 {
+        let gpu_scores: Vec<u64> = if l.asked.gpu > 0 {
             let need = Self::gpu_needs(l);
-            rooms.iter().map(|r| Self::gpu_rank(r, &need, r.used.gpu).unwrap_or(0)).collect()
+            rooms.iter().map(|r| {
+                if l.req.pool.is_some() { self.pool_slots(r, l, r.used.gpu).next().map_or(0, |(_, score)| score) }
+                else { Self::gpu_rank(r, &need, r.used.gpu).unwrap_or(0) }
+            }).collect()
         } else { Vec::new() };
 
         let mut order: Vec<(usize, &Runner)> = rooms.into_iter().enumerate().collect();
@@ -2913,10 +2917,11 @@ impl Scheduler {
 
     // W05-R03, W05-R23: CI legs use the same per-device checks as reach and sessions.
     fn gpu_needs(l: &Leg) -> super::needs::Needs {
-        super::needs::Needs { request: l.input.request, requires: l.req.constraints.iter().map(|(src, _)| src.clone()).collect(), ..Default::default() }
+        super::needs::Needs { request: l.asked, requires: l.req.constraints.iter().map(|(src, _)| src.clone()).collect(), ..Default::default() }
     }
 
     fn gpu_rank(r: &Runner, need: &super::needs::Needs, used: u32) -> Option<u64> {
+        if need.request.gpu == 0 { return Some(0); }
         let total = size(r).map_or_else(|| u64::try_from(r.input.view.facts.gpus.len()).unwrap_or(u64::MAX), |s| u64::from(s.gpu));
         super::gpu::rank(need, &r.input.view.facts, &r.input.view.all_labels(), total.saturating_sub(u64::from(used)))
     }
@@ -2925,6 +2930,21 @@ impl Scheduler {
     /// or reservation. `used` includes the siblings that have been planned but not granted yet.
     fn gpu_room(r: &Runner, l: &Leg, used: u32) -> bool {
         l.input.request.gpu == 0 || Self::gpu_rank(r, &Self::gpu_needs(l), used).is_some()
+    }
+
+    /// W05-R03/W13-R09: a local executor has already reserved its pool's GPUs. Its leg must
+    /// fit that reservation; credit only this executor, never the other warm executors. Hosted
+    /// executors have their own runner and reserve the leg's GPUs when it is granted there.
+    fn pool_slots<'a>(&'a self, r: &'a Runner, l: &'a Leg, used: u32) -> impl Iterator<Item = (&'a Executor, u64)> {
+        let own = self.own_leg(l);
+        let hosted = l.req.pool.as_deref().and_then(|name| self.pool(name)).is_some_and(|p| p.hosted);
+        let need = (l.asked.gpu > 0).then(|| Self::gpu_needs(l));
+        self.executors.values().filter(move |e| l.req.pool.as_deref() == Some(e.pool.as_str()) && e.runner == r.input.id && e.state == ExecState::Idle && e.leg.as_deref() == own)
+            .filter_map(move |e| {
+                if !hosted && l.asked.gpu > e.reserved.gpu { return None; }
+                let used = if hosted { used } else { used.saturating_sub(e.reserved.gpu) };
+                need.as_ref().map_or(Some(0), |need| Self::gpu_rank(r, need, used)).map(|score| (e, score))
+            })
     }
 
     /// Whether a runner takes a leg now: it could ([`Self::room`]); and for a leg that waits for a
@@ -2999,10 +3019,8 @@ impl Scheduler {
         }
         // A pool's leg runs in one of its idle executors on that host: one made for it when it
         // needs that (W13-R07).
-        if let Some(pool) = &l.req.pool {
-            if !Self::gpu_room(r, l, r.used.gpu) { return false; }
-            let own = self.own_leg(l);
-            return self.executors.values().any(|e| e.pool == *pool && e.runner == r.input.id && e.state == ExecState::Idle && e.leg.as_deref() == own);
+        if l.req.pool.is_some() {
+            return self.pool_slots(r, l, r.used.gpu).next().is_some();
         }
         self.room_in(r, &Holding { held, whole, ordinary, used: r.used, running: r.running.len() }, l)
     }
@@ -3319,6 +3337,11 @@ impl Scheduler {
     }
 
     fn assign(&mut self, id: &str, runner: &str, now: i64, out: &mut Vec<Command>) {
+        let slot = if let Some(l) = self.legs.get(id).filter(|l| l.req.pool.is_some()) {
+            let Some(r) = self.runners.get(runner) else { return };
+            let Some((e, _)) = self.pool_slots(r, l, r.used.gpu).next() else { return };
+            Some(e.id.clone())
+        } else { None };
         self.granted_over(id, runner);
         self.charge(id, runner, now);
         self.unqueue(id);
@@ -3370,12 +3393,10 @@ impl Scheduler {
             executor = req.executors.iter().find(|e| super::routing::usable(&req, &r.input.view.facts, e)).cloned();
         }
         // Its pool's idle executor there, which it alone uses.
-        let own = self.legs.get(id).and_then(|l| self.own_leg(l)).map(str::to_owned);
-        let slot = req.pool.as_ref().and_then(|p| self.executors.values_mut().find(|e| e.pool == *p && e.runner == runner && e.state == ExecState::Idle && e.leg == own)).map(|e| {
+        if let Some(e) = slot.as_ref().and_then(|id| self.executors.get_mut(id)) {
             e.state = ExecState::Busy { leg: id.to_owned() };
             e.since = now;
-            e.id.clone()
-        });
+        }
         out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image, docker, slot, fence, expires, lease_loss });
     }
 
@@ -4755,9 +4776,7 @@ impl Scheduler {
             let holding = self.holding_with(r, |_| true, &mates);
             let room = match &l.req.pool {
                 Some(pool) => {
-                    if !Self::gpu_room(r, l, holding.used.gpu) { continue; }
-                    let own = self.own_leg(l);
-                    let idle = self.executors.values().filter(|e| e.pool == *pool && e.runner == *rid && e.state == ExecState::Idle && e.leg.as_deref() == own).count();
+                    let idle = self.pool_slots(r, l, holding.used.gpu).count();
                     idle > mates.iter().filter(|x| x.req.pool.as_ref() == Some(pool)).count()
                 }
                 None => self.room_in(r, &holding, l),
@@ -4968,6 +4987,10 @@ impl Scheduler {
                     return None;
                 }
                 let c = self.config();
+                if p.request.gpu > 0 {
+                    let need = super::needs::Needs { request: p.request, requires: p.hosts.iter().map(|(src, _)| src.clone()).collect(), ..Default::default() };
+                    if Self::gpu_rank(r, &need, r.used.gpu).is_none() { return None; }
+                }
                 if let (true, Some(cap)) = (c.resources, r.input.capacity) {
                     // Beside what exclusive legs hold there, never in it.
                     let q = &p.request;
