@@ -478,7 +478,7 @@ struct Fast {
     /// its hints' word (the room every owner hears) isn't this owner's, and isn't taken.
     tokens: Vec<Option<u32>>,
     /// Good places (docs/lb.md): whether a run goes back to where its kind of work last went
-    /// well ([`Owner::set_good_places`]; off until its shell turns it on), and each kind of
+    /// well ([`Owner::set_good_places`]; on unless its shell turns it off), and each kind of
     /// work's number in the kernel, by the ask's key (`cmd:…`, `leg:…`, `session:…`).
     places: bool,
     kinds: FxMap<String, u32>,
@@ -494,7 +494,7 @@ struct FastSig {
 
 impl Default for Fast {
     fn default() -> Self {
-        Fast { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), joined: Vec::new(), era: 0, sigs: FxMap::default(), by_slot: Vec::new(), tokens: Vec::new(), places: false, kinds: FxMap::default() }
+        Fast { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), joined: Vec::new(), era: 0, sigs: FxMap::default(), by_slot: Vec::new(), tokens: Vec::new(), places: true, kinds: FxMap::default() }
     }
 }
 
@@ -638,8 +638,9 @@ impl Owner {
 
     /// Whether a run the kernel places goes back to where its kind of work last went well, when
     /// that runner is among the best by rank, and passes over the runner that last let that kind
-    /// down (docs/lb.md "Good places"). Off until the shell turns it on (its setting): what kiln
-    /// decides on its own is declared, and a run's answer says when it was why.
+    /// down (docs/lb.md "Good places"). On unless the shell turns it off (its setting; the user's
+    /// exception to opt-in automation, 2026-11-11, docs/ci.md §0.3), and a run's answer says when
+    /// it was why.
     pub fn set_good_places(&mut self, on: bool) {
         self.fast.places = on;
     }
@@ -2983,9 +2984,9 @@ impl Owner {
 impl Owner {
     /// What this node's owner decides by of its node's settings (`[reach]`, the runner's
     /// [`Settings`]): probes drawn by learned weights (`learned_weights`), asks that come in one
-    /// step placed by the auction (`auction`), and runs sent back to where their kind of work
-    /// last went well (`good_places`), each off until declared. Learning starts afresh as the
-    /// weights are turned on, from the weights as they are.
+    /// step placed by the auction (`auction`), each off until declared, and runs sent back to
+    /// where their kind of work last went well (`good_places`), on unless turned off. Learning
+    /// starts afresh as the weights are turned on, from the weights as they are.
     pub fn configure(&mut self, s: &Settings) {
         self.set_good_places(s.good_places);
         if s.learned_weights != self.learned.weights.on {

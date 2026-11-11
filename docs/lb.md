@@ -281,7 +281,9 @@ efficiently, as completely and as correctly as it can. What the kernel holds dow
 and work of deciding. One rule serves both: **work goes back to where its kind last went well,
 when the rank can't tell that node from the best.** What that kind left there is warm and the
 node has shown it can do the work; and when it is the runner a run just ended on, going back is
-also the decision that takes least: nothing looked up, nothing moved.
+also the decision that takes least: nothing looked up, nothing moved. It is on by default, the
+user's exception to opt-in automation (2026-11-11, docs/ci.md §0.3): `[reach] good_places =
+false` turns it off, and a run it sends back says so.
 
 - **Kinds.** The shell numbers kinds of work (`KindId`: work whose runs leave a node equipped
   for the next of them: the same job, the same tree), as it numbers signatures. `Owner::ask_kind`

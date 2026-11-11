@@ -454,17 +454,18 @@ fn one(lab: &mut Lab, n: usize, key: &str, how: How) -> Result<(usize, String), 
     Ok((i, why))
 }
 
-/// W05-R04, W05-R23 (docs/lb.md "Good places"): once its shell turns good places on, a run the
-/// kernel places goes back to where its kind of work (its ask's key) last went well, and its
-/// answer says that is why; a runner that let the kind down loses it, and one it failed on with
-/// no known cause loses it for one run, then keeps it when the kind fails elsewhere too (the
-/// work's own fault). Another kind of work has its own place. Off, as it is until declared, or
-/// with nothing said of how runs end, runs take turns as before.
+/// W05-R04, W05-R23 (docs/lb.md "Good places"): with good places on, as they are unless their
+/// shell turns them off, a run the kernel places goes back to where its kind of work (its ask's
+/// key) last went well, and its answer says that is why; a runner that let the kind down loses
+/// it, and one it failed on with no known cause loses it for one run, then keeps it when the kind
+/// fails elsewhere too (the work's own fault). Another kind of work has its own place. Turned
+/// off, or with nothing said of how runs end, runs take turns as before.
 #[test]
-fn w05_r04_a_kinds_work_goes_back_to_where_it_went_well_once_declared() -> Result<(), String> {
+fn w05_r04_the_place_core_sends_a_kinds_work_back_to_where_it_went_well() -> Result<(), String> {
     let back = "its kind of work last went well there";
-    // Off: three runs of one kind, each ending well, take turns.
+    // Turned off: three runs of one kind, each ending well, take turns.
     let mut lab = Lab::new(3, 8, true);
+    lab.owner.set_good_places(false);
     let mut seen = Vec::new();
     for n in 0..3 {
         let (i, why) = one(&mut lab, n, "leg:build", How::Well)?;
@@ -478,9 +479,8 @@ fn w05_r04_a_kinds_work_goes_back_to_where_it_went_well_once_declared() -> Resul
     if seen.len() != 3 {
         return Err(format!("off, three runs of one kind went to {seen:?}: not one each"));
     }
-    // On, with nothing said of how runs end: the same.
+    // On (the default), with nothing said of how runs end: the same.
     let mut lab = Lab::new(3, 8, true);
-    lab.owner.set_good_places(true);
     let mut seen = Vec::new();
     for n in 0..3 {
         seen.push(one(&mut lab, n, "leg:build", How::Unsaid)?.0);
@@ -490,9 +490,8 @@ fn w05_r04_a_kinds_work_goes_back_to_where_it_went_well_once_declared() -> Resul
     if seen.len() != 3 {
         return Err(format!("with nothing said of how runs end, three runs went to {seen:?}: not one each"));
     }
-    // On: the kind goes back to where it went well, and says so.
+    // On (the default): the kind goes back to where it went well, and says so.
     let mut lab = Lab::new(3, 8, true);
-    lab.owner.set_good_places(true);
     let (first, why) = one(&mut lab, 0, "leg:build", How::Well)?;
     if why.contains(back) {
         return Err(format!("its first run had no place to go back to, and says: {why}"));

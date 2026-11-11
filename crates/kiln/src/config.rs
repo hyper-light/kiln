@@ -84,7 +84,7 @@ pub struct RunnerSettings {
 /// tokens = true            # owners told what they hold here, each its own
 /// learned_weights = true   # probes drawn by learned wait weights
 /// auction = true           # runs arriving together placed by the auction
-/// good_places = true       # a run goes back to where its kind of work last went well
+/// good_places = false      # among equals runs take turns, not back to where their kind went well
 /// ```
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -134,9 +134,10 @@ pub struct Reach {
     /// command, leg or session) last went well on, when that runner is as free and its cores as
     /// fast as any, and past the runner that last let that kind down (docs/lb.md "Good places";
     /// W05-R04, W05-R23). What it left there is warm, and going back is the decision that takes
-    /// least. A run's answer says when that was why it went there. Off until declared: among
-    /// equals runs take turns, as before.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    /// least. A run's answer says when that was why it went there. On by default, the user's
+    /// exception to opt-in automation (2026-11-11, docs/ci.md §0.3); `false`: among equals runs
+    /// take turns, as before.
+    #[serde(skip_serializing_if = "is_true")]
     pub good_places: bool,
 }
 
@@ -144,9 +145,13 @@ fn is_one(x: &f64) -> bool {
     *x == 1.0
 }
 
+fn is_true(x: &bool) -> bool {
+    *x
+}
+
 impl Default for Reach {
     fn default() -> Self {
-        Reach { sizes: kiln_ci::sizes::Source::default(), retry_oom: false, learned_weights: false, auction: false, overcommit_cpu: 1.0, backfill: false, predicted_order: None, tokens: false, good_places: false }
+        Reach { sizes: kiln_ci::sizes::Source::default(), retry_oom: false, learned_weights: false, auction: false, overcommit_cpu: 1.0, backfill: false, predicted_order: None, tokens: false, good_places: true }
     }
 }
 
@@ -1026,9 +1031,13 @@ mod reach_tests {
             anyhow::ensure!(c.reach.place().is_err_and(|e| e.contains(says)), "{bad}");
         }
         anyhow::ensure!(toml::from_str::<Config>("[reach]\ntoken = true\n").is_err(), "an unknown key is an error");
+        // Good places: on unless turned off (the user's exception to opt-in, docs/ci.md §0.3).
+        anyhow::ensure!(none.reach.place().is_ok_and(|p| p.good_places), "good places are on by default");
+        let off: Config = toml::from_str("[reach]\ngood_places = false\n")?;
+        anyhow::ensure!(off.reach.place().is_ok_and(|p| !p.good_places), "good_places = false turns them off");
         // Said back as written: nothing undeclared is.
         let said = toml::to_string(&Reach::default())?;
-        anyhow::ensure!(!said.contains("overcommit_cpu") && !said.contains("tokens") && !said.contains("backfill") && !said.contains("predicted_order"), "{said}");
+        anyhow::ensure!(!said.contains("overcommit_cpu") && !said.contains("tokens") && !said.contains("backfill") && !said.contains("predicted_order") && !said.contains("good_places"), "{said}");
         Ok(())
     }
 }

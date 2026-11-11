@@ -271,16 +271,18 @@ saying why it decided as it did:
   engine (E4), and commands can't be one of a gang yet.
 
 **Where a kind of work goes again** (docs/lb.md, "Good places"; W05-R04, W05-R23). One `[reach]`
-setting, off until declared (§21), saying why it decided as it did:
+setting, on unless turned off (§21: the user's exception to opt-in, 2026-11-11, docs/ci.md §0.3),
+saying why it decided as it did:
 
-- `good_places = true`: a run the kernel places goes back to the runner its kind of work (the
+- `good_places` (on): a run the kernel places goes back to the runner its kind of work (the
   same command, leg or session: its ask's key) last went well on, when that runner is as free and
   its cores as fast as any, and past the runner that last let that kind down. Each runner says how
   a run ended as it ends: well (it exited 0), let down by the node (it couldn't start there, or a
   program it ran isn't there), or failed with no cause the runner knows. That last is settled by
   comparison: the kind's next run goes elsewhere once; if it goes well there the first runner was
   at fault, if it fails there too the work was, and it keeps its place. A run sent back says "its
-  kind of work last went well there, and no runner was freer". Off: among equals runs take turns.
+  kind of work last went well there, and no runner was freer". `good_places = false`: among
+  equals runs take turns.
 
 **Big items don't starve.** With `[sched] backfill` declared (§21), the first item of each class
 that waits only for room keeps room on the runner where its room frees soonest, from the expected
@@ -893,7 +895,7 @@ Each decision kiln makes on its own is off until declared, and says why it did w
 | a run held back for its tenant's budget, rights moved between owners | `[ci.budgets."<tenant>"]` | off: each budget is the person's |
 | where a run with no room is probed: in proportion to learned weights | `[reach] learned_weights` | off until compared with two random probes at scale |
 | runs that arrive in one step placed together by the auction | `[reach] auction` | off until compared with one at a time at scale |
-| a run sent back to where its kind of work last went well | `[reach] good_places` | off: among equals runs take turns |
+| a run sent back to where its kind of work last went well | `[reach] good_places` | on (the user's exception, 2026-11-11, docs/ci.md §0.3): it chooses only between runners the rank can't tell apart; `false`, they take turns |
 
 ## 22. In code
 
