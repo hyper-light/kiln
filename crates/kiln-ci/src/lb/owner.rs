@@ -125,6 +125,16 @@ struct Pend {
 
 const NO_PEND: Pend = Pend { r: NIL, from: 0, to: 0 };
 
+/// A batch's rise. W05-R26: `turn` records its arrival order before sorting, so an in-place
+/// unstable sort preserves equal-key turns without a stable sort's temporary allocation.
+/// Recomputed from the live list for each overlay; no lifetime or capacity policy is needed.
+#[derive(Debug, Clone, Copy)]
+struct Rise {
+    r: u32,
+    from: u32,
+    turn: u32,
+}
+
 /// In [`Pend::r`]: this owner shares its fleet with others and spreads its picks (no move is
 /// ever put off then). `NIL - 1`, so the fast paths' test for a runner pending is the one
 /// they make anyway (no runner has this number).
@@ -313,7 +323,7 @@ pub struct Owner {
     /// The runner whose room rose and whose bucket hasn't moved for it yet.
     pend: Pend,
     /// A batch's runners whose rises are put off and the buckets they're in (`MANY` in `pend`).
-    put_off: Vec<(u32, u32)>,
+    put_off: Vec<Rise>,
     /// Candidates a pick chooses among when other owners decide over this fleet: 1 is the exact
     /// best (one owner), the rest the expected herd (docs/lb.md "Several owners").
     width: u32,
@@ -1427,7 +1437,7 @@ impl Owner {
         let to = key(p.view, p.scale, last);
         if to > from && p.flags & PUT_OFF == 0 {
             p.flags |= PUT_OFF;
-            self.put_off.push((r, from));
+            self.put_off.push(Rise { r, from, turn: 0 });
             self.pend.r = MANY;
         } else if to < from && p.flags & PUT_OFF == 0 {
             self.moved_slow(r, from, to);
@@ -1447,7 +1457,8 @@ impl Owner {
         self.pend.r = NIL;
         let mut list = std::mem::take(&mut self.put_off);
         let last = self.last;
-        for &(r, from) in &list {
+        for rise in &list {
+            let (r, from) = (rise.r, rise.from);
             let Some(p) = self.peers.get_mut(r as usize) else { continue };
             p.flags &= !PUT_OFF;
             let (to, sig0, more) = (key(p.view, p.scale, last), p.sig0, p.flags & MORE != 0);
@@ -1469,8 +1480,11 @@ impl Owner {
         let mut list = std::mem::take(&mut self.put_off);
         let peers = &self.peers;
         let key_of = |r: u32| peers.get(r as usize).map_or(0, |p| key(p.view, p.scale, last));
-        list.sort_by_key(|&(r, _)| std::cmp::Reverse(key_of(r)));
-        let keys: Vec<u32> = list.iter().map(|&(r, _)| key_of(r)).collect();
+        for (i, rise) in list.iter_mut().enumerate() {
+            // There is at most one rise per dense u32 runner id (PUT_OFF).
+            rise.turn = u32::try_from(i).unwrap_or(u32::MAX);
+        }
+        list.sort_unstable_by_key(|rise| (std::cmp::Reverse(key_of(rise.r)), rise.turn));
         let Some(s) = self.sigs.get_mut(sig as usize) else {
             self.put_off = list;
             return Ok(());
@@ -1479,14 +1493,19 @@ impl Owner {
         let cpu = narrow(need[0]);
         let mut i = 0usize;
         while i < list.len() && *left > 0 {
-            let Some(&(r, from)) = list.get(i) else { break };
+            let Some(rise) = list.get(i).copied() else { break };
+            let (r, from) = (rise.r, rise.from);
+            // The next rise belongs to a different runner, not yet changed by this overlay.
+            // Read its key directly instead of constructing a temporary vector of keys.
+            let next = list.get(i + 1).and_then(|x| self.peers.get(x.r as usize)).map_or(0, |p| key(p.view, p.scale, last));
             let Some(p) = self.peers.get_mut(r as usize) else { break };
             let k = key(p.view, p.scale, last);
             if top.is_some_and(|t| k < t) || p.view < cpu || p.sig0 != sig || p.flags & MORE != 0 {
                 break;
             }
             let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig, runner: r, state: STARTING, slow: NIL }) else {
-                self.put_off = list.split_off(i);
+                list.drain(..i);
+                self.put_off = list;
                 return Err(Refused::Full);
             };
             p.view -= cpu;
@@ -1494,7 +1513,6 @@ impl Owner {
             starts.push((RunnerId(r), Start { owner: self.id, run, epoch: p.epoch(), need }));
             *left -= 1;
             let now = key(p.view, p.scale, last);
-            let next = keys.get(i + 1).copied().unwrap_or(0);
             if *left == 0 || now < next || top.is_some_and(|t| now < t) || p.view < cpu {
                 // Done with this runner: its bucket moves once, by its net change.
                 p.flags &= !PUT_OFF;
@@ -1508,7 +1526,10 @@ impl Owner {
             }
         }
         // Those it didn't reach stay put off: the caller applies them.
-        self.put_off = list.split_off(i);
+        // W05-R26: retain the original allocation even when every rise was consumed. split_off
+        // discarded its capacity, forcing the next batch of ends to allocate and grow again.
+        list.drain(..i);
+        self.put_off = list;
         if self.put_off.is_empty() {
             self.pend.r = NIL;
         }

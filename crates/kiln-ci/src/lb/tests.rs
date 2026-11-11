@@ -423,6 +423,43 @@ fn w05_r26_batched_rises_choose_as_one_at_a_time_up_to_equals() -> Result<(), &'
     Ok(())
 }
 
+/// W05-R26, W05-R04: sorting a batch's pending rises must retain arrival order within each
+/// room class, including when a smaller batch leaves some rises for the normal index to apply.
+#[test]
+fn w05_r26_batch_overlay_preserves_equal_turns_and_remaining_rises() -> Result<(), String> {
+    let (mut owner, mut runners, sig, held) = rig(64, 1)?;
+    // Give half the runners one extra run, making two distinct room classes.
+    for _ in 0..held.len() / 2 {
+        ask_start(&mut owner, &mut runners, sig, [CPU, 0, 0, 0]).ok_or("extra fill")?;
+    }
+    // Odds descending, then evens ascending: arrival order differs from runner-id order and
+    // mixes both room classes. Each runner appears once.
+    let mut risen = Vec::new();
+    for &(r, at, run) in held.iter().rev().step_by(2).chain(held.iter().step_by(2)) {
+        let (_, word) = runners.get_mut(r as usize).ok_or("runner")?.end_fast(at).ok_or("end")?;
+        if !owner.ended_batch(r, run, word) { return Err("batch end declined".into()); }
+        risen.push((r, word.cpu));
+    }
+    let most = risen.iter().map(|x| x.1).max().ok_or("no rises")?;
+    let expected: Vec<u32> = risen.iter().filter(|x| x.1 == most).map(|x| x.0).collect();
+    let (mut starts, mut waits, mut out) = (Vec::new(), Vec::new(), Out::default());
+    owner.ask_many(sig, [CPU, 0, 0, 0], expected.len(), &mut starts, &mut waits, &mut out).map_err(|e| format!("batch: {e:?}"))?;
+    let got: Vec<u32> = starts.iter().map(|x| x.0.0).collect();
+    if got != expected || !waits.is_empty() { return Err(format!("turns: {got:?}, expected {expected:?}")); }
+    for (to, start) in starts {
+        let (at, word) = runners.get_mut(to.0 as usize).ok_or("runner")?.start_fast(start.owner, start.run, start.epoch, CPU as u32).ok_or("start")?;
+        if !owner.started_fast(to.0, start.run, at, word) { return Err("start word declined".into()); }
+    }
+    // The unconsumed lower-class rises were applied, so every runner's exact view still agrees
+    // with its ledger after the pending buffer was compacted and reused.
+    for runner in &runners {
+        if owner.view(runner.id()).map(|v| v[0]) != Some(runner.word().cpu) {
+            return Err(format!("view differs on {:?}", runner.id()));
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn ask_many_chooses_as_one_at_a_time() -> Result<(), String> {
     for (n, load, k) in [(5u32, 7u32, 3usize), (7, 19, 11), (3, 0, 30), (16, 40, 64), (9, 3, 2)] {

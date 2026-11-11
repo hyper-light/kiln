@@ -693,6 +693,8 @@ struct Batch {
     slots: Vec<u32>,
     keys: Vec<u64>,
     picked: Vec<i32>,
+    /// W05-R26: only the selected slots that still hold a run, reused between batches.
+    released: Vec<u32>,
     stamp: Vec<u64>,
     id: u64,
 }
@@ -720,20 +722,17 @@ fn steps_many<S: Clone>(rng: &mut Rng, im: &mut Impl<S>, f: u32, n: u64, bt: &mu
             bt.keys.push(key);
         }
         // Release those that hold a request.
-        let mut held = std::mem::take(&mut bt.picked);
-        held.clear();
-        held.extend(bt.slots.iter().filter_map(|&s| im.sb.get(s as usize).filter(|b| **b >= 0).map(|_| s as i32)));
-        let rel: Vec<u32> = held.iter().map(|&s| s as u32).collect();
-        release(&mut im.state, &rel);
-        held.clear();
-        held.resize(take, -1);
-        pick(&mut im.state, &bt.slots, &bt.keys, &mut held);
-        for (&s, &b) in bt.slots.iter().zip(&held) {
+        bt.released.clear();
+        bt.released.extend(bt.slots.iter().copied().filter(|&s| im.sb.get(s as usize).is_some_and(|b| *b >= 0)));
+        release(&mut im.state, &bt.released);
+        bt.picked.clear();
+        bt.picked.resize(take, -1);
+        pick(&mut im.state, &bt.slots, &bt.keys, &mut bt.picked);
+        for (&s, &b) in bt.slots.iter().zip(&bt.picked) {
             if let Some(x) = im.sb.get_mut(s as usize) {
                 *x = b;
             }
         }
-        bt.picked = held;
         done += take as u64;
     }
 }
