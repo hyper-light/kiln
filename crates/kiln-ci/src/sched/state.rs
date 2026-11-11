@@ -3968,6 +3968,13 @@ impl Scheduler {
         }
         let mut changed: BTreeSet<String> = self.requeued.take().unwrap_or_default().into_iter().collect();
         changed.extend(self.legs.iter().filter(|(_, l)| l.state == State::Queued && l.avoid.as_ref().is_some_and(|(_, off)| *off == Off::Lost)).map(|(id, _)| id.clone()));
+        // W05-R10/W05-R39: losing a gang's runner can release its reservation on another.
+        // Those runners' existing waiters compete in this same ordered batch, before a retry
+        // takes their newly released room. Waiting until the final unkept fill lets it jump them.
+        self.drop_stale_reservations();
+        if !self.unkept.is_empty() {
+            changed.extend(self.sigs.values().filter(|s| s.eligible.iter().any(|r| self.unkept.contains(r))).flat_map(|s| s.ids().cloned()));
+        }
         // The next in queue order goes, its place taken again each time: a leg placed moves its
         // flow's standing, and so the order of the rest (docs/needs.md E2.1).
         loop {
