@@ -1038,7 +1038,6 @@ mod tests {
 
     #[test]
     fn owned_commit_keeps_authority_after_caller_cancellation_until_worker_drops_payload() -> anyhow::Result<()> {
-        use std::future::Future as _;
         use std::task::Context;
         struct Owner(Arc<AtomicU64>);
         impl Drop for Owner { fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); } }

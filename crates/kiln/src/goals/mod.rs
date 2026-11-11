@@ -4622,12 +4622,6 @@ mod tests {
         })
     }
 
-    /// Puts the goals done first, as `done` leaves them.
-    async fn renumber_in(store: &crate::store::Store, agent: &str) -> anyhow::Result<()> {
-        let a = agent.to_owned();
-        store.call(move |c| renumber(c, &a)).await
-    }
-
     /// A stack paused for a while resumes by itself when its time is up, by the driver's clock: not
     /// a tick before, and its goal under way goes to the agent at once. One resumed or paused again
     /// since (its time gone) is left as it is.

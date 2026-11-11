@@ -550,7 +550,7 @@ mod tests {
         mail_page(&waiter, &agent, &suffix, &mut out, &mut bytes);
         let mut probe = MailProbe::Unchecked;
         assert!(probe.record("suffix-revision".into(), Ok(!out.is_empty())), "positive suffix metadata ends the wait");
-        assert_eq!(out, [peer.clone()]);
+        assert_eq!(out, std::slice::from_ref(&peer));
         assert!(!CLAIMED.lock().get(&waiter.id).is_some_and(|ids| ids.contains(&peer)), "only the existing handoff path claims mail");
     }
 

@@ -5122,6 +5122,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
 
 #[cfg(test)]
 mod tests {
+    use crate::util::Must as _;
     #[test]
     fn deferred_bodies_retain_the_complete_compact_queue_index() -> anyhow::Result<()> {
         let state = State {
@@ -5238,14 +5239,14 @@ mod tests {
                 assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, RebindStep::Row);
                 pool.resize(pool.counts().0);
                 assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await, Err(super::super::inbox::PromotionError::ResourceHeld));
-                assert_eq!(inbox.pending(&session.id, first).await?.unwrap().lease.epoch, 1);
+                assert_eq!(inbox.pending(&session.id, first).await?.must()?.lease.epoch, 1);
                 assert_eq!(input.controller.lock().capacity().epoch, 0);
                 // An exact native callback arrived between the real partial commit and its
                 // external budget wake. It is a component input, not a model-work claim.
                 session.core.lock().input_consumed(first, Consumption::ProviderCompleted);
                 assert!(!flush_input(&session).await);
                 assert_eq!(session.core.lock().input_receipts.len(), 1);
-                assert!(inbox.pending(&session.id, first).await?.unwrap().disposition.is_none(), "the epoch guard must not be weakened");
+                assert!(inbox.pending(&session.id, first).await?.must()?.disposition.is_none(), "the epoch guard must not be weakened");
                 assert_eq!(pool.counts().0, bytes * 2);
                 pool.resize(super::super::state_view::FRAME);
                 assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, RebindStep::Row);
@@ -5257,8 +5258,8 @@ mod tests {
                 }
                 assert!(!flush_input(&session).await, "the owner must stay Promoting until the receipt commits");
                 assert!(session.core.lock().input_receipts.is_empty());
-                assert!(inbox.pending(&session.id, first).await?.unwrap().disposition.is_some());
-                assert_eq!(inbox.promotion(&session.id).await?.unwrap().phase, PromotionPhase::Rebinding);
+                assert!(inbox.pending(&session.id, first).await?.must()?.disposition.is_some());
+                assert_eq!(inbox.promotion(&session.id).await?.must()?.phase, PromotionPhase::Rebinding);
                 assert!(input.controller.lock().lease(second).is_some());
                 assert_eq!(pool.counts().0, bytes);
                 inbox.advance_promotion(&session.id, 1, PromotionPhase::Active, &pool, Some(&input)).await?;
@@ -5329,7 +5330,7 @@ mod tests {
                         let core = session.core.lock();
                         assert!(core.input_stages.is_empty() && core.input_retained.is_empty() && core.input_receipts.is_empty());
                     }
-                    let row = inbox.pending(&session.id, id).await?.unwrap();
+                    let row = inbox.pending(&session.id, id).await?.must()?;
                     assert_eq!((row.lease.message.as_str(), row.lease.epoch, row.lease.token), (id, 0, None));
                     assert_eq!(row.disposition.is_some(), effect == "receipt");
                     {

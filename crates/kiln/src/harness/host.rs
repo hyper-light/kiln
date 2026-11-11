@@ -3715,6 +3715,7 @@ fn free_claim(c: Option<crate::reach::place::Claim>) {
 mod tests {
     use super::*;
     use kiln_seams::clock::SimClock;
+    use crate::util::Must as _;
 
     /// The journal failure is the real Host adoption path, not a synthetic consumption event.
     /// Certificate verification is covered by the isolated native upgrade proof; this fixture
@@ -3770,7 +3771,7 @@ mod tests {
                 inbox.advance_promotion(&session.id, 1, inbox::PromotionPhase::Rebinding, &host.input_budgets.budget(), Some(&input)).await?;
                 assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, inbox::promotion::RebindStep::Row);
                 assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, inbox::promotion::RebindStep::Complete);
-                assert_eq!(inbox.pending(&session.id, &flight.id).await?.unwrap().lease.epoch, 1);
+                assert_eq!(inbox.pending(&session.id, &flight.id).await?.must()?.lease.epoch, 1);
                 {
                     let mut controller = input.controller.lock();
                     controller.rebind_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;

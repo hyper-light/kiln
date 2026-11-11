@@ -739,7 +739,7 @@ mod tests {
             assert_eq!((original.id, original.revision), (repeated.id, repeated.revision));
             assert_eq!(hub.harness.list().len(), agents + 1, "one agent started");
             let created_inbox = hub.harness.local.inbox().ok_or_else(|| anyhow::anyhow!("no source inbox"))?.taken(&created, 100).await?;
-            assert_eq!(created_inbox, [first_id.clone()], "one native publication under the run's canonical identity");
+            assert_eq!(created_inbox, std::slice::from_ref(&first_id), "one native publication under the run's canonical identity");
             let native = crate::harness::ops::end_to_end::prompts(&folder.path().join("heard.jsonl"));
             assert_eq!(native.iter().filter(|id| *id == &first_id).count(), 1, "new-target key retry repeated native input");
             // As goals: added once.
@@ -803,7 +803,7 @@ mod tests {
             let missing = crate::util::derive_id(&["plan-run", &run, "1"]);
             assert!(crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), id.clone(), missing).await?.is_none(), "there is no second communication in this round");
             let taken = hub.harness.local.inbox().ok_or_else(|| anyhow::anyhow!("no source inbox"))?.taken(&id, 100).await?;
-            assert_eq!(taken, [message.clone()]);
+            assert_eq!(taken, std::slice::from_ref(&message));
             assert_eq!(crate::harness::ops::end_to_end::prompts(&folder.path().join("heard.jsonl")), [message], "the native round is delivered once");
             Ok(())
         })

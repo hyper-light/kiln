@@ -269,30 +269,6 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unknown_recipient_refuses_new_custody_but_keeps_an_existing_exact_receipt() -> anyhow::Result<()> {
-        crate::rt::block_on(async {
-            let hub = crate::hub::tests::scratch_hub().await?;
-            let command = Command::Send { id: "one".into(), text: "original words".into(), mode: super::super::model::SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
-            let publication = Publish { owner: "fixture".into(), sender: "fixture".into(), recipient: "unknown".into(), id: "one".into(), command: serde_json::to_value(command)?, provenance: None, status: None };
-            assert_eq!(publish(&hub, publication.clone()).await, Err(Error::NoSession));
-            assert!(mail::receipt(&hub.store, "fixture".into(), "fixture".into(), "unknown".into(), "one".into()).await?.is_none());
-            // A committed original predating closure remains authoritative; absence cannot
-            // turn its exact retry into new custody or a different publication.
-            let original = mail::publish(&hub.store, publication.clone(), u64::MAX, 1).await?;
-            let repeated = publish(&hub, publication).await?;
-            assert!(repeated.repeat);
-            assert_eq!(repeated.revision, original.revision);
-            assert_eq!(repeated.disposition, original.disposition);
-            Ok(())
-        })
-    }
-}
-
 pub fn event_capacity(event: &FlowEvent) -> &Capacity {
     event.capacity()
 }
@@ -373,4 +349,28 @@ pub async fn flow(hub: &Arc<Hub>, recipient: &str, source: Location, event: Flow
         hub.harness.mail_receipt(recipient, receipt);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_recipient_refuses_new_custody_but_keeps_an_existing_exact_receipt() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let command = Command::Send { id: "one".into(), text: "original words".into(), mode: super::super::model::SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+            let publication = Publish { owner: "fixture".into(), sender: "fixture".into(), recipient: "unknown".into(), id: "one".into(), command: serde_json::to_value(command)?, provenance: None, status: None };
+            assert_eq!(publish(&hub, publication.clone()).await, Err(Error::NoSession));
+            assert!(mail::receipt(&hub.store, "fixture".into(), "fixture".into(), "unknown".into(), "one".into()).await?.is_none());
+            // A committed original predating closure remains authoritative; absence cannot
+            // turn its exact retry into new custody or a different publication.
+            let original = mail::publish(&hub.store, publication.clone(), u64::MAX, 1).await?;
+            let repeated = publish(&hub, publication).await?;
+            assert!(repeated.repeat);
+            assert_eq!(repeated.revision, original.revision);
+            assert_eq!(repeated.disposition, original.disposition);
+            Ok(())
+        })
+    }
 }

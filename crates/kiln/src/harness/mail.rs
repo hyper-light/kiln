@@ -827,8 +827,8 @@ mod tests {
                             accepted_ack |= said.answer.is_ok();
                             if said.message == "original" && refused.is_none() { refused = Some(said.answer); }
                         }
-                        Update::MailFlow { event } if matches!(&*event, FlowEvent::Waiting { token, .. } if *token == first.token) => {
-                            if waiting.is_none() { waiting = Some(*event); }
+                        Update::MailFlow { event } if waiting.is_none() && matches!(&*event, FlowEvent::Waiting { token, .. } if *token == first.token) => {
+                            waiting = Some(*event);
                         }
                         _ => {}
                     }
