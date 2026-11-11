@@ -11,6 +11,28 @@ use super::*;
 
 const C8: Amounts = [8 * CPU, 32 << 30, 400 << 30, 8];
 
+/// W24-R18: with one observed disk multiplier, every unknown uses that same prior. This tiny
+/// ask must need only one round over its two sorted lists, rather than reading the whole fleet
+/// because independent class bounds lose a nanosecond to integer rounding.
+#[test]
+fn w24_r18_one_observed_byte_rate_does_not_force_a_fleet_scan() -> Result<(), String> {
+    for n in [2, 64] {
+        let (mut owner, mut runners, sig) = fleet(n, C8);
+        let runner = runners.first_mut().ok_or("runner")?;
+        runner.measure(768, 1024);
+        runner.measure_rates(1 << 20, 0);
+        owner.hear(ToOwner::Hint { runner: RunnerId(0), word: runner.word() }, &mut Out::default());
+        let before = owner.counts.read;
+        let a = owner.ask_with(sig, [CPU, 0, 0, 0], &Terms { cpu_ns: 1, io_bytes: 1, ..Terms::default() }, &mut Out::default()).map_err(|e| format!("ask: {e:?}"))?;
+        if a.send.is_none() { return Err("no placement".into()); }
+        let read = owner.counts.read - before;
+        // This is the derived count for this fully determined fixture's CPU and disk lists,
+        // not a production candidate limit; the general threshold must keep its quality bound.
+        if read > 2 { return Err(format!("{n} runners: read {read} candidates, expected one round of two lists")); }
+    }
+    Ok(())
+}
+
 /// One runner of a fleet as a case draws it.
 #[derive(Debug, Clone, Copy, Default)]
 struct Shape {
