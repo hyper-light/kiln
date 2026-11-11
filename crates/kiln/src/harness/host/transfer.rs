@@ -212,7 +212,7 @@ impl Host {
         let mut file = saved.journal.as_ref().ok_or_else(|| "native journal descriptor did not accompany its manifest".to_owned())?.try_clone().map_err(|e| e.to_string())?;
         file.rewind().map_err(|e| e.to_string())?;
         if file.metadata().map_err(|e| e.to_string())?.len() > super::PACKAGE_MAX { return Err("native journal exceeds the existing package bound".into()); }
-        let input = crate::harness::admission::Input::new(manifest.destination_epoch, Arc::clone(&self.input_budget), Arc::clone(inbox));
+        let input = crate::harness::admission::Input::new(manifest.destination_epoch, self.input_budgets.budget(), Arc::clone(inbox));
         input.controller.lock().restoring().map_err(|_| "native destination cannot enter restoring".to_owned())?;
         if matches!(state.phase, Phase::Offered | Phase::Imported) {
             for row in serde_json::Deserializer::from_reader(std::io::BufReader::new(file)).into_iter::<crate::harness::inbox::Pending>() {
@@ -307,7 +307,7 @@ impl Host {
         {
             return Err("the same handover attempt carried a different package; its original remains retained".into());
         }
-        let input = admission::Input::new(manifest.destination_epoch, std::sync::Arc::clone(&self.input_budget), std::sync::Arc::clone(inbox));
+        let input = admission::Input::new(manifest.destination_epoch, self.input_budgets.budget(), std::sync::Arc::clone(inbox));
         input.controller.lock().restoring().map_err(|_| "destination input could not enter restoring".to_owned())?;
         if matches!(state.phase, Phase::Offered | Phase::Imported) {
             if state.package.is_none() {

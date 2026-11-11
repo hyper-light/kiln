@@ -112,7 +112,9 @@ pub async fn publish(hub: &Hub, publication: Publish) -> Result<Receipt, Error> 
         let data = hub.cfg.server.data_dir.clone();
         let free = crate::rt::blocking(move || crate::os::disk_available(&data)).await.map_err(|_| unavailable("data-volume free space could not be read"))?.ok_or_else(|| unavailable("data-volume free space is unknown"))?;
         let reserve = hub.store.storage_reserve(super::state_view::FRAME as u64).await.map_err(|_| unavailable("SQLite/WAL storage reserve is unknown"))?;
-        mail::retained_bytes(&hub.store).await?.checked_add(free.saturating_sub(floor).saturating_sub(reserve)).ok_or_else(|| unavailable("communication storage authority overflow"))?
+        // The room on disk for this one original: what's retained already is on disk, so
+        // nothing is counted across conversations.
+        free.saturating_sub(floor).saturating_sub(reserve)
     } else { 0 };
     if let Some(current) = &current {
         let mut population = peers(hub, &publication.recipient).await?;

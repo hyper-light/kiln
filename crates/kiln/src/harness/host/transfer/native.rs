@@ -50,8 +50,8 @@ fn verified(snapshot: &NativeSnapshot) -> Result<std::fs::File, String> {
 }
 
 impl Host {
-    pub(crate) fn native_budget_counts(&self) -> (usize, usize) { self.input_budget.counts() }
-    pub(crate) async fn native_budget_changed(&self, counts: (usize, usize)) { self.input_budget.changed_since(counts).await; }
+    pub(crate) fn native_budget_counts(&self) -> (usize, usize) { self.input_budgets.counts() }
+    pub(crate) async fn native_budget_changed(&self, counts: (usize, usize)) { self.input_budgets.changed_since(counts).await; }
 
     fn native_directory(&self) -> PathBuf {
         match self.file.as_ref().and_then(|path| path.parent()) {
@@ -221,7 +221,7 @@ impl Host {
         let Some((mut stored, _charge)) = self.read_native_snapshot(state)? else { return Ok(Recovered::ResourceHeld) };
         if state.role == Role::Destination { inbox.verify_import(&state.manifest).await.map_err(|e| e.to_string())?; inbox.activate_transfer(&state.manifest).await.map_err(|e| e.to_string())?; }
         else { inbox.take_back(&state.manifest.session, epoch).await.map_err(|e| e.to_string())?; }
-        let input = admission::Input::new(epoch, std::sync::Arc::clone(&self.input_budget), std::sync::Arc::clone(inbox));
+        let input = admission::Input::new(epoch, self.input_budgets.budget(), std::sync::Arc::clone(inbox));
         input.controller.lock().restoring().map_err(|_| "native recovery cannot enter Restoring".to_owned())?;
         let mut after = None;
         loop {

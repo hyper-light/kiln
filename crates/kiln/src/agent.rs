@@ -7716,16 +7716,20 @@ mod native_handover_tests {
     use crate::harness::session::Spec;
     use kiln_seams::clock::SimClock;
 
+    /// W20: a held mail replay waits for room of its own, the share each session's budget is.
+    /// Another session's copy, held or let go of, changes nothing of it (no pool spans every
+    /// session), its own pulse schedules nothing, and the share measured larger lets it go once.
     #[test]
-    fn a_held_mail_replay_ignores_its_own_pool_pulse_and_retries_once_for_foreign_release() -> anyhow::Result<()> {
+    fn a_held_mail_replay_retries_once_its_share_grows_never_for_another_sessions_release() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let (sink, _updates) = async_channel::unbounded();
             let host = Host::with_records(sink, None, Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())));
             host.set_input_budget(100);
-            let foreign = host.reserve_input_buffer(10).map_err(|_| anyhow::anyhow!("foreign fixture reserve failed"))?.ok_or_else(|| anyhow::anyhow!("foreign fixture reserve refused"))?;
+            let other = host.reserve_input_buffer(90).map_err(|_| anyhow::anyhow!("another session's reserve failed"))?.ok_or_else(|| anyhow::anyhow!("another session's reserve refused"))?;
             let before = host.native_budget_counts();
             let own = Arc::clone(&host);
             let mut replay = MailReplay::Reading { before, read: Box::pin(async move {
+                // Its own room is whole, whatever another session holds.
                 let charge = own.reserve_input_buffer(20).ok().flatten();
                 assert!(charge.is_some());
                 drop(charge);
@@ -7736,23 +7740,25 @@ mod native_handover_tests {
             replay.finish(Some(&host), held);
             assert!(matches!(replay, MailReplay::Idle { budget: Some(_) }), "own temporary drop cannot schedule another attempt");
             assert!(MailReplay::budget_changed(Some(&host), replay.budget_observed()).now_or_never().is_none(), "own net-unchanged pulse cannot wake idle recovery");
-            drop(foreign);
+            drop(other);
+            assert!(MailReplay::budget_changed(Some(&host), replay.budget_observed()).now_or_never().is_none(), "another session's release is no room of its own");
+            host.set_input_budget(200);
             assert_eq!(MailReplay::budget_changed(Some(&host), replay.budget_observed()).now_or_never(), Some(()));
             replay.budget_event(Some(&host));
-            assert!(matches!(replay, MailReplay::Reading { .. }), "actual foreign release permits one existing-owner attempt");
+            assert!(matches!(replay, MailReplay::Reading { .. }), "a larger share permits one existing-owner attempt");
             replay.budget_event(Some(&host));
             assert!(matches!(replay, MailReplay::Reading { .. }), "an in-flight budget event cannot enqueue a second attempt");
             let held = replay.completed().await;
             replay.finish(Some(&host), held);
             assert!(matches!(replay, MailReplay::Idle { budget: None }));
 
-            // A release during the replay cannot be lost while its budget waiter is disabled.
-            let foreign = host.reserve_input_buffer(10).map_err(|_| anyhow::anyhow!("foreign fixture reserve failed"))?.ok_or_else(|| anyhow::anyhow!("foreign fixture reserve refused"))?;
+            // A share measured larger during the replay cannot be lost while its budget waiter is disabled.
             let before = host.native_budget_counts();
-            let mut replay = MailReplay::Reading { before, read: Box::pin(async move { drop(foreign); true }) };
+            let grows = Arc::clone(&host);
+            let mut replay = MailReplay::Reading { before, read: Box::pin(async move { grows.set_input_budget(300); true }) };
             let held = replay.completed().await;
             replay.finish(Some(&host), held);
-            assert!(matches!(replay, MailReplay::Reading { .. }), "post-operation comparison catches a real net release during replay");
+            assert!(matches!(replay, MailReplay::Reading { .. }), "post-operation comparison catches a larger share during replay");
             let held = replay.completed().await;
             replay.finish(Some(&host), held);
             assert!(matches!(replay, MailReplay::Idle { budget: None }));

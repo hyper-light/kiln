@@ -320,9 +320,53 @@ impl Input {
     }
 }
 
-/// One host-wide strict byte authority, shared by every session. The coordinator supplies its
-/// bound from resource facts; no default allowance or oversized-item exception exists here.
+/// One session's strict byte authority ([`SessionBudgets`]). The coordinator supplies its bound
+/// from resource facts; no default allowance or oversized-item exception exists here.
 pub struct PhysicalBudget { state: Mutex<Physical>, changed: crate::rt::Changed }
+
+/// A host's sessions' byte authorities, one each, every one the share the memory room gives the
+/// host's input: one session's backlog, or the debt it restored, never takes another's room, as
+/// one pool over every session did. Each live one is resized to the share as it's measured again.
+pub struct SessionBudgets { state: Mutex<Budgets>, changed: crate::rt::Changed }
+
+#[derive(Default)]
+struct Budgets { share: usize, live: Vec<std::sync::Weak<PhysicalBudget>> }
+
+impl Default for SessionBudgets {
+    fn default() -> Self { Self { state: Mutex::new(Budgets::default()), changed: crate::rt::Changed::new() } }
+}
+
+impl SessionBudgets {
+    /// A budget of its own for one session (or for one transient copy of its), at the share now.
+    pub fn budget(&self) -> Arc<PhysicalBudget> {
+        let mut b = self.state.lock();
+        b.live.retain(|live| live.strong_count() > 0);
+        let budget = PhysicalBudget::new(b.share);
+        b.live.push(Arc::downgrade(&budget));
+        budget
+    }
+    /// The share measured again: each live session's budget takes it.
+    pub fn resize(&self, share: usize) {
+        let mut b = self.state.lock();
+        b.share = share;
+        b.live.retain(|live| live.strong_count() > 0);
+        for budget in b.live.iter().filter_map(std::sync::Weak::upgrade) { budget.resize(share); }
+        drop(b);
+        self.changed.notify();
+    }
+    /// What a budget of this host's holds at the least, and its bound: none, as each session holds
+    /// of its own, and the share. What a copy waiting for room watches ([`Self::changed_since`]).
+    pub fn counts(&self) -> (usize, usize) { (0, self.state.lock().share) }
+    /// Once [`Self::counts`] is other than `counts`: subscribed before reading, so a resize racing
+    /// the call can't leave a waiter asleep.
+    pub async fn changed_since(&self, counts: (usize, usize)) {
+        loop {
+            let changed = self.changed.listen();
+            if self.counts() != counts { return; }
+            changed.await;
+        }
+    }
+}
 
 /// Authority for one real temporary representation. Move this guard with its allocation; do
 /// not drop it when an encoded buffer is still in a bridge, transfer or provider queue.
