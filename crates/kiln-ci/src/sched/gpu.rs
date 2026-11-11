@@ -1,5 +1,6 @@
 //! W05-R03, W05-R22, W13-R01: GPU placement adapted from Hex 37021c35,
 //! hex-sim/src/model.rs (matches/bind) and index.rs (gpu_busy/gpu_idle).
+//! Fresh-reading quality follows Hex b5b67b38: unknown is never idle or unused memory.
 //! Rank requested GPUs by their dominant utilisation/memory share (DRF, NSDI 2011).
 //! This reserves node capacity; it does not attach a device to a process or container.
 
@@ -10,14 +11,13 @@ const MILLION: u64 = 1_000_000;
 
 /// Per-device pressure, millionths. Missing telemetry remains unknown.
 pub fn busy(g: &Gpu) -> Option<u64> {
-    let memory = g.memory_used.filter(|_| g.memory > 0).map(|used| {
-        u64::try_from(u128::from(used.min(g.memory)) * u128::from(MILLION) / u128::from(g.memory)).unwrap_or(MILLION)
-    });
-    let compute = g.busy_per_mille.map(|b| u64::from(b.min(1000)) * 1000);
-    match (compute, memory) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
-    }
+    let (compute, used) = observed(g)?;
+    let memory = (u128::from(used) * u128::from(MILLION)).checked_div(u128::from(g.memory)).map_or(0, |share| u64::try_from(share).unwrap_or(u64::MAX));
+    Some(memory.max(u64::from(compute) * 1000))
+}
+
+fn observed(g: &Gpu) -> Option<(u16, u64)> {
+    Some((g.busy_per_mille.filter(|busy| *busy <= 1000)?, g.memory_used?))
 }
 
 fn read(facts: &RunnerFacts, g: &Gpu, name: &str) -> Fact {
@@ -25,8 +25,8 @@ fn read(facts: &RunnerFacts, g: &Gpu, name: &str) -> Fact {
         "gpu.model" => Fact::List(vec![g.model.clone(), g.model.split_whitespace().collect::<Vec<_>>().join("-")]),
         "gpu.vendor" => Fact::List(vec![g.vendor.clone()]),
         "gpu.memory.total" => Fact::Num(g.memory as f64),
-        "gpu.memory" | "gpu.memory.free" => Fact::Num(g.memory.saturating_sub(g.memory_used.unwrap_or(0)) as f64),
-        "gpu.utilization" => g.busy_per_mille.map_or(Fact::Missing, |b| Fact::Num(f64::from(b.min(1000)))),
+        "gpu.memory" | "gpu.memory.free" => g.memory_used.map_or(Fact::Missing, |used| Fact::Num(g.memory.saturating_sub(used) as f64)),
+        "gpu.utilization" => g.busy_per_mille.filter(|busy| *busy <= 1000).map_or(Fact::Missing, |busy| Fact::Num(f64::from(busy))),
         _ => routing::fact(facts, name),
     }
 }
@@ -51,7 +51,7 @@ fn device_predicates(cs: &[(String, Constraint)]) -> bool {
 }
 
 fn matching<'a>(cs: &'a [(String, Constraint)], facts: &'a RunnerFacts, labels: &'a [String]) -> impl Iterator<Item = &'a Gpu> {
-    facts.gpus.iter().filter(move |g| cs.iter().all(|(_, c)| c.eval_with(&|name| read(facts, g, name), labels)))
+    facts.gpus.iter().filter(move |g| observed(g).is_some() && cs.iter().all(|(_, c)| c.eval_with(&|name| read(facts, g, name), labels)))
 }
 
 /// Hex model::bind: compatible free cards, utilization then used-memory then inventory position.
@@ -65,13 +65,13 @@ pub fn bind(needs: &Needs, facts: &RunnerFacts, labels: &[String], free: impl Fn
     }
     let mut fit: Vec<(u16, u64, usize)> = facts.gpus.iter().enumerate()
         .filter(|(i, g)| free(*i, g) && cs.iter().all(|(_, c)| c.eval_with(&|name| read(facts, g, name), labels)))
-        .map(|(i, g)| (g.busy_per_mille.unwrap_or(0), g.memory_used.unwrap_or(0), i)).collect();
+        .filter_map(|(i, g)| observed(g).map(|(compute, used)| (compute, used, i))).collect();
     fit.sort_unstable();
     (fit.len() >= n).then(|| fit.into_iter().take(n).map(|(_, _, i)| i).collect())
 }
 
-/// Hex index::gpu_idle: sum the selected cards' idle dominant shares. A failed counter contributes
-/// no component, exactly as Hex's gpu_facts conversion; it remains optional in the reported facts.
+/// Hex index::gpu_idle: sum the selected cards' idle dominant shares. Both independent counters
+/// must have been observed for fresh selection; unread cards earn no idle credit.
 pub fn rank(needs: &Needs, facts: &RunnerFacts, labels: &[String], free: u64) -> Option<u64> {
     if needs.request.gpu == 0 { return Some(0); }
     if free < u64::from(needs.request.gpu) { return None; }
@@ -85,7 +85,7 @@ pub fn rank(needs: &Needs, facts: &RunnerFacts, labels: &[String], free: u64) ->
     let mut capacity = needs.clone();
     capacity.request.gpu = capacity.request.gpu.checked_add(u32::try_from(held).ok()?)?;
     let selected = bind(&capacity, facts, labels, |_, _| true)?;
-    Some(selected.into_iter().skip(held).filter_map(|i| facts.gpus.get(i)).map(|g| MILLION.saturating_sub(busy(g).unwrap_or(0))).fold(0, u64::saturating_add))
+    Some(selected.into_iter().skip(held).filter_map(|i| facts.gpus.get(i)).filter_map(busy).map(|busy| MILLION.saturating_sub(busy)).fold(0, u64::saturating_add))
 }
 
 /// A pressure predicate can become true after other work ends; it must queue rather than be Never.
@@ -133,7 +133,8 @@ mod tests {
         assert_eq!(rank(&n, &f, &[], 2), Some(100_000));
         assert_eq!(rank(&n, &f, &[], 1), None); // Conservative until identities are on the live path.
         assert_eq!(busy(&card("A100", 80, Some(8), Some(900))), Some(900_000));
-        assert_eq!(busy(&card("A100", 80, Some(100), Some(2000))), Some(1_000_000));
+        assert_eq!(busy(&card("A100", 80, Some(100), Some(200))), Some(1_250_000));
+        assert_eq!(busy(&card("A100", 80, Some(100), Some(2000))), None);
         Ok(())
     }
     #[test]
@@ -142,8 +143,9 @@ mod tests {
         assert_eq!(busy(&unknown), None);
         let f = RunnerFacts { gpus: vec![unknown], ..RunnerFacts::default() };
         let n = needs::parse("gpus=1")?;
-        assert_eq!(rank(&n, &f, &[], 1), Some(1_000_000));
-        assert!(matches(&needs::parse("gpus=1,gpu.memory.free>=1Gi")?, &f, &[]));
+        assert_eq!(rank(&n, &f, &[], 1), None);
+        assert!(!matches(&needs::parse("gpus=1,gpu.memory.free>=1Gi")?, &f, &[]));
+        assert!(could_match(&n, &f, &[]));
         Ok(())
     }
     #[test]
