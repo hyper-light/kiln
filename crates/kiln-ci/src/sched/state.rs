@@ -4997,7 +4997,7 @@ impl Scheduler {
                 let c = self.config();
                 if p.request.gpu > 0 {
                     let need = super::needs::Needs { request: p.request, requires: p.hosts.iter().map(|(src, _)| src.clone()).collect(), ..Default::default() };
-                    if Self::gpu_rank(r, &need, r.used.gpu).is_none() { return None; }
+                    Self::gpu_rank(r, &need, r.used.gpu)?;
                 }
                 if let (true, Some(cap)) = (c.resources, r.input.capacity) {
                     // Beside what exclusive legs hold there, never in it.
