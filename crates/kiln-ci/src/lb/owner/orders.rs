@@ -56,7 +56,7 @@ mod cold_tests {
         let budget = [8 * CPU, 0, 0, 0];
         let (mut owner, mut runners, sig) = crate::lb::tests::fleet(2, budget);
         let mut out = Out::default();
-        let a = owner.ask_with(sig, [CPU, 0, 0, 0], &Terms { bytes: 1, ..Terms::default() }, &mut out).map_err(|e| format!("ask: {e:?}"))?;
+        let a = owner.ask_with(sig, [CPU, 0, 0, 0], &Terms { bytes: 1, io_bytes: 1, ..Terms::default() }, &mut out).map_err(|e| format!("ask: {e:?}"))?;
         let (to, start) = a.send.ok_or("no start")?;
         let reply = runners.get_mut(to.0 as usize).ok_or("runner")?.hear(start, &mut RunnerOut::new()).ok_or("no reply")?;
         owner.hear(reply, &mut out);
@@ -69,6 +69,7 @@ mod cold_tests {
         r.measure(768, 1024);
         r.measure_rates(1 << 21, 1 << 20);
         owner.hear(ToOwner::Hint { runner: RunnerId(1), word: r.word() }, &mut out);
+        if owner.sigs.get(sig.0 as usize).and_then(|s| s.orders.get(DISK)).map(|o| o.class(1)) != Some(class_of(1 << 21)) { return Err("CPU activation lost an active disk update".into()); }
         let mut added = Runner::new(RunnerId(2), budget, 1);
         added.watch(OwnerId(0));
         owner.join(RunnerId(2), budget, added.word(), &mut out);
@@ -79,9 +80,8 @@ mod cold_tests {
             let orders = &owner.sigs.get(id.0 as usize).ok_or("signature")?.orders;
             if orders.get(LINK).map(|o| o.class(2)) != Some(class_of(1 << 20)) { return Err("new member's link order missing".into()); }
             if orders.get(NARROW).map(|o| o.class(2)) != Some(class_of(u64::from(SCALE))) { return Err("new member's CPU order missing".into()); }
-            for index in [DISK, NET] {
-                if orders.get(index).and_then(Order::top).is_some() { return Err("unrequested byte order populated".into()); }
-            }
+            if orders.get(DISK).map(|o| o.class(2)) != Some(class_of(1 << 21)) { return Err("new member's disk order missing".into()); }
+            if orders.get(NET).and_then(Order::top).is_some() { return Err("unrequested network order populated".into()); }
         }
         Ok(())
     }

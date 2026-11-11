@@ -579,7 +579,7 @@ fn kiln_pick_cold(k: &mut Kiln, s: u32) -> i32 {
 
 /// W05-R26: fresh-state construction and first-use costs, outside the warmed throughput grid.
 /// This makes no claim to cold OS page caches: the coordinator never flushes shared caches.
-fn cold_sample(n: u32, d: u32) -> std::result::Result<(u128, u128, u128, u128), &'static str> {
+fn cold_sample(n: u32, d: u32) -> std::result::Result<(u128, u128, u128, u128, u128), &'static str> {
     let t = Instant::now();
     let mut k = Kiln::new(n, d, 1);
     let build = t.elapsed().as_nanos();
@@ -592,13 +592,22 @@ fn cold_sample(n: u32, d: u32) -> std::result::Result<(u128, u128, u128, u128), 
     // tuning threshold. Its first non-reference CPU word activates measured-core ranking.
     let runner = k.runners.first_mut().ok_or("no cold runner")?;
     runner.measure(768, 1024);
+    // The same word also reports byte rates, so the cold comparison includes the later
+    // first I/O ask and exposes the cost deliberately deferred to that ask.
+    runner.measure_rates(1 << 20, 1 << 20);
     runner.drain(&mut k.rout);
     k.deliver();
     let measured = t.elapsed().as_nanos();
     let t = Instant::now();
     if kiln_pick(&mut k, 0, SEED) < 0 { return Err("first measured placement refused"); }
     let first_measured = t.elapsed().as_nanos();
-    Ok((build, first, measured, first_measured))
+    kiln_release(&mut k, 0);
+    let t = Instant::now();
+    let a = k.owner.ask_with(k.sig, k.need, &Terms { cpu_ns: 1, io_bytes: 1, ..Terms::default() }, &mut k.out).map_err(|_| "first byte ask refused")?;
+    let (to, msg) = a.send.ok_or("first byte ask did not start")?;
+    if k.admit(0, to, msg) < 0 { return Err("first byte placement refused"); }
+    let first_byte = t.elapsed().as_nanos();
+    Ok((build, first, measured, first_measured, first_byte))
 }
 
 fn kiln_many_release(k: &mut Kiln, slots: &[u32]) {
@@ -1273,7 +1282,13 @@ fn main() -> std::process::ExitCode {
         for &n in &a.ns {
             for &d in &a.ds {
                 match cold_sample(n, d) {
-                    Ok((build, first, measured, first_measured)) => println!("{{\"commit\":\"{commit}\",\"n\":{n},\"d\":{d},\"build_ns\":{build},\"first_placement_ns\":{first},\"first_cpu_measure_ns\":{measured},\"first_measured_placement_ns\":{first_measured},\"runner_bytes\":{},\"owner_inline_bytes\":{},\"harness_slot_bytes\":{},\"scope\":\"fresh process/state; OS page cache uncontrolled\"}}", std::mem::size_of::<Runner>(), std::mem::size_of::<Owner>(), std::mem::size_of::<Slot>()),
+                    kiln_release(&mut k, 0);
+    let t = Instant::now();
+    let a = k.owner.ask_with(k.sig, k.need, &Terms { cpu_ns: 1, io_bytes: 1, ..Terms::default() }, &mut k.out).map_err(|_| "first byte ask refused")?;
+    let (to, msg) = a.send.ok_or("first byte ask did not start")?;
+    if k.admit(0, to, msg) < 0 { return Err("first byte placement refused"); }
+    let first_byte = t.elapsed().as_nanos();
+    Ok((build, first, measured, first_measured, first_byte)) => println!("{{\"commit\":\"{commit}\",\"n\":{n},\"d\":{d},\"build_ns\":{build},\"first_placement_ns\":{first},\"first_cpu_measure_ns\":{measured},\"first_measured_placement_ns\":{first_measured},\"first_byte_placement_ns\":{first_byte},\"runner_bytes\":{},\"owner_inline_bytes\":{},\"harness_slot_bytes\":{},\"scope\":\"fresh process/state; OS page cache uncontrolled\"}}", std::mem::size_of::<Runner>(), std::mem::size_of::<Owner>(), std::mem::size_of::<Slot>()),
                     Err(why) => { eprintln!("{why}"); return std::process::ExitCode::FAILURE; }
                 }
             }
