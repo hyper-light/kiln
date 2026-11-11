@@ -4096,7 +4096,7 @@ fn w05_r40_gpu_gangs_count_pooled_siblings() -> Result<(), String> {
                     let mut l = pool_leg(id);
                     if id == "b" && pooled == 1 { l.route.labels = vec!["linux".into()]; }
                     l.request = Resources { cpu: Cpus::whole(1), mem: 1 << 30, gpu: 1, ..Resources::default() };
-                    l.gang = Some(Gang { id: "gpu-gang".into(), size: 2 });
+                    l.gang = Some(super::state::Gang { id: "gpu-gang".into(), size: 2 });
                     let commands = s.handle(Input::LegQueued(Box::new(l)), at);
                     let expected = if at == 3 && gpus == 2 { 2 } else { 0 };
                     assert_eq!(s.grants().len(), expected, "resources={resources}, pooled={pooled}, GPUs={gpus}, at={at}: {commands:?}");
