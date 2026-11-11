@@ -27,6 +27,33 @@ mod cold_tests {
     use super::*;
     use crate::lb::{Runner, RunnerOut};
 
+    /// W24-R18: an interactive ask needs link latency/stability even with no byte transfer.
+    #[test]
+    fn w24_r18_lazy_link_is_needed_for_interactive_only() -> Result<(), String> {
+        let (mut owner, _, sig) = crate::lb::tests::fleet(2, [8 * CPU, 0, 0, 0]);
+        owner.set_link(RunnerId(0), Link { rate: 1 << 20, latency_ns: 1_000_000, ..Link::default() });
+        owner.set_link(RunnerId(1), Link { rate: 1 << 20, latency_ns: 1, ..Link::default() });
+        let a = owner.ask_with(sig, [CPU, 0, 0, 0], &Terms { interactive: true, ..Terms::default() }, &mut Out::default()).map_err(|e| format!("ask: {e:?}"))?;
+        if a.send.map(|x| x.0) != Some(RunnerId(1)) { return Err("interactive-only ask ignored link latency".into()); }
+        Ok(())
+    }
+
+    /// W24-R18: a listed runner may need bytes even when the unlisted default needs none.
+    #[test]
+    fn w24_r18_lazy_link_is_needed_for_listed_missing_bytes() -> Result<(), String> {
+        let (mut owner, mut runners, sig) = crate::lb::tests::fleet(2, [8 * CPU, 0, 0, 0]);
+        let runner = runners.get_mut(1).ok_or("runner")?;
+        runner.measure(512, 1024);
+        owner.hear(ToOwner::Hint { runner: RunnerId(1), word: runner.word() }, &mut Out::default());
+        for r in 0..2 { owner.set_link(RunnerId(r), Link { rate: 1 << 20, ..Link::default() }); }
+        let warm = [Warm { runner: RunnerId(1), saved_ns: 900_000_000, missing: 1 << 20, wait_ns: 0 }];
+        // The reference runner takes1s. The half-speed listed runner takes0.2s CPU +1s
+        // transfer; dropping its transfer falsely makes it the winner at0.2s.
+        let a = owner.ask_with(sig, [CPU, 0, 0, 0], &Terms { cpu_ns: 1_000_000_000, warm: &warm, ..Terms::default() }, &mut Out::default()).map_err(|e| format!("ask: {e:?}"))?;
+        if a.send.map(|x| x.0) != Some(RunnerId(0)) { return Err("listed missing bytes ignored when default bytes are zero".into()); }
+        Ok(())
+    }
+
     /// W05-R26: CPU-only measured ranking should not construct byte-rate indexes. An index
     /// becomes populated when a request actually needs it, without a TTL or size heuristic.
     #[test]
