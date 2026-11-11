@@ -25,6 +25,7 @@ pub(super) fn orders(kept: u8) -> Vec<Order> {
 #[cfg(test)]
 mod cold_tests {
     use super::*;
+    use crate::lb::{Runner, RunnerOut};
 
     /// W05-R26: CPU-only measured ranking should not construct byte-rate indexes. An index
     /// becomes populated when a request actually needs it, without a TTL or size heuristic.
