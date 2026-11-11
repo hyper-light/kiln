@@ -11,7 +11,7 @@ pub struct Promotion {
     pub from_epoch: u64,
     pub to_epoch: u64,
     pub phase: PromotionPhase,
-    pub proof: crate::runner::custody::LegacyProof,
+    pub(crate) proof: crate::runner::custody::LegacyProof,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<Vec<u8>>,
 }
@@ -93,7 +93,7 @@ impl Inbox {
         self.committed(session, cached, Some(head), result).map(|_| ()).map_err(|error| match error { Retry::No(error) => error.into(), _ => storage("promotion head changed concurrently") })
     }
 
-    pub async fn prepare_promotion(&self, session: &str, from: u64, to: u64, proof: crate::runner::custody::LegacyProof, pool: &Arc<PhysicalBudget>, input: Option<&Input>) -> Result<(), PromotionError> {
+    pub(crate) async fn prepare_promotion(&self, session: &str, from: u64, to: u64, proof: crate::runner::custody::LegacyProof, pool: &Arc<PhysicalBudget>, input: Option<&Input>) -> Result<(), PromotionError> {
         check_session(session)?;
         proof.validate(session, from, to).map_err(|why| PromotionError::Invalid { why })?;
         if from.checked_add(1) != Some(to) { return Err(PromotionError::Stale); }
@@ -241,7 +241,7 @@ mod tests {
     fn partial_legacy_epoch_rebind_reopens_without_changing_originals_or_debt() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("records.db");
-        crate::rt::block_on(async {
+        crate::rt::block_on(async move {
             let records = Arc::new(FaultRecords::new(crate::records::open(&path)?));
             let pool = PhysicalBudget::new(kiln_seams::records::VALUE_MAX * 2);
             let inbox = Arc::new(Inbox::new(records.clone(), Limits::default()));
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn applied_then_error_and_cancelled_head_read_keep_the_promotion_wake() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        crate::rt::block_on(async {
+        crate::rt::block_on(async move {
             let records = Arc::new(FaultRecords::new(crate::records::open(&dir.path().join("records.db"))?));
             let pool = PhysicalBudget::new(kiln_seams::records::VALUE_MAX * 2);
             let inbox = Arc::new(Inbox::new(records.clone(), Limits::default()));
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn legacy_epoch_rebind_refuses_token_or_stale_rows_without_mutation() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        crate::rt::block_on(async {
+        crate::rt::block_on(async move {
             let records = crate::records::open(&dir.path().join("records.db"))?;
             let pool = PhysicalBudget::new(kiln_seams::records::VALUE_MAX * 2);
             let inbox = Arc::new(Inbox::new(records.clone(), Limits::default()));
