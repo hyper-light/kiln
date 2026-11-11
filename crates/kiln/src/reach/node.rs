@@ -2644,8 +2644,10 @@ impl Node {
             }
             serve::Event::Exit { code, error, used } => {
                 let error = if r.timed_out { Some(error.unwrap_or_else(|| "timed out".into())) } else { error };
-                // Its room is free in the same input (docs/needs.md E5): `ok`, its process exited.
-                let outs = self.place.ended(&key.0, id, error.is_none(), crate::util::now_ms());
+                // Its room is free in the same input (docs/needs.md E5): `ok`, its process exited;
+                // and how it ended, judged here as it ends (docs/lb.md "Good places").
+                let how = super::place::how(code, error.as_deref(), r.timed_out);
+                let outs = self.place.ended_as(&key.0, id, error.is_none(), how, crate::util::now_ms());
                 let Some(r) = self.served.get_mut(&key).and_then(|s| s.runs.get_mut(&id)) else {
                     self.place_do(outs).await;
                     return;

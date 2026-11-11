@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use kiln_ci::facts::RunnerFacts;
 use kiln_ci::place::answer::Answer;
 use kiln_ci::place::ask::{Ask, Peer, Sample};
-use kiln_ci::place::msg::{ToOwner, ToRunner};
+use kiln_ci::place::msg::{How, ToOwner, ToRunner};
 use kiln_ci::place::owner::{Act, Kept, Machine, Owner, Size};
 use kiln_ci::place::runner::{Admission, Init, Record, Records, Settings, Start};
 use kiln_seams::records::{Scan, TX_MAX, Tx, Write};
@@ -608,6 +608,28 @@ pub fn sample_of_measure(m: &crate::sense::Measure, last: Option<&crate::sense::
 /// every run works in the work volume, so a full one, or its device's errors rising, bars all
 /// work; a run of its kind killed for memory here, or missing a tool here, bars it whatever it
 /// asks; memory and tools as asked bar the rest.
+/// How a run that exited here ended, as this runner judges it when it ends (docs/lb.md "Good
+/// places"), from its exit alone (`code`; `error`: it couldn't start, or `timed_out`, its own
+/// limit ran out). It went well when it exited 0. The node let it down when it couldn't start
+/// here, or exited as a shell does of a program that isn't here (`sense::health::classify`'s
+/// missing tool). Any other failure has no cause this runner knows from its exit: the node's
+/// fault or the work's own, which its owner settles by where its kind's next run goes and what
+/// becomes of it. A run a signal ended (its asker stopped it, as far as an exit says) is judged
+/// by no one.
+pub fn how(code: Option<i32>, error: Option<&str>, timed_out: bool) -> How {
+    use crate::sense::health::{Ending, Failure, classify};
+    match (code, error) {
+        (_, Some(_)) if timed_out => How::Unsure,
+        (_, Some(_)) => How::LetDown,
+        (Some(0), None) => How::Well,
+        (Some(c), None) => match classify(&Ending { exit_code: Some(c), ..Ending::default() }) {
+            Some(Failure::MissingTool { .. }) => How::LetDown,
+            _ => How::Unsure,
+        },
+        (None, None) => How::Unsaid,
+    }
+}
+
 fn barred(ask: &Ask, key: Option<String>, m: &crate::sense::Measure) -> Option<crate::sense::health::Refusal> {
     let tools = ask.needs.requires.iter().filter_map(|r| r.strip_prefix("tools has ")).map(|t| t.trim_matches(|c| c == '\'' || c == '"').to_owned()).collect();
     let a = crate::sense::health::Ask { key, disk: ask.needs.request.disk.max(1), mem: ask.needs.request.mem, tools };
@@ -1290,10 +1312,16 @@ impl Placer {
 
     /// A run started here for `peer` (spec `id`) ended.
     pub fn ended(&mut self, peer: &str, id: u64, ok: bool, now: i64) -> Vec<Out> {
+        self.ended_as(peer, id, ok, How::Unsaid, now)
+    }
+
+    /// [`Self::ended`], with this runner's judgment of how the run ended ([`how`]): what its
+    /// owner's kernel is told of the assignment (docs/lb.md "Good places").
+    pub fn ended_as(&mut self, peer: &str, id: u64, ok: bool, how: How, now: i64) -> Vec<Out> {
         let Some((epoch, run)) = self.started.remove(&(peer.to_owned(), id)) else { return Vec::new() };
         self.ungrouped(peer, epoch, &run);
         let mut said = Vec::new();
-        self.admission.ended(Peer { name: peer, epoch }, &run, ok, now, &mut said);
+        self.admission.ended_as(Peer { name: peer, epoch }, &run, ok, how, now, &mut said);
         let mut out = self.said(said, now);
         // Its end to its claimant, or handed off if its owner can't be reached; the room it freed
         // may be what a waiting run of such an owner needs (LB03).

@@ -127,6 +127,13 @@ pub struct Settings {
     /// the room each run freed going back to the owner whose run it was; others keep hearing this
     /// runner's hints. Off until declared.
     pub tokens: bool,
+    /// The node's owner sends a run the kernel places back to where its kind of work (its ask's
+    /// key) last went well, when that runner is among the best by rank, and past the runner that
+    /// last let that kind down (`[reach] good_places`; docs/lb.md "Good places"; W05-R04,
+    /// W05-R23); a run's answer says when that was why. Off: runs take turns among equals, as
+    /// before. Its owner's, read by [`super::Owner::configure`]; the runner's admission doesn't
+    /// read it (it says how each kernel run ended either way).
+    pub good_places: bool,
 }
 
 impl Default for Settings {
@@ -146,6 +153,7 @@ impl Default for Settings {
             learned_weights: false,
             auction: false,
             tokens: false,
+            good_places: false,
         }
     }
 }

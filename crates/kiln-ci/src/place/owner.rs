@@ -2982,10 +2982,12 @@ impl Owner {
 // and "Adopted"; LB08, W05-R23, W05-R26): each off until declared.
 impl Owner {
     /// What this node's owner decides by of its node's settings (`[reach]`, the runner's
-    /// [`Settings`]): probes drawn by learned weights (`learned_weights`) and asks that come in one
-    /// step placed by the auction (`auction`), each off until declared. Learning starts afresh as
-    /// the weights are turned on, from the weights as they are.
+    /// [`Settings`]): probes drawn by learned weights (`learned_weights`), asks that come in one
+    /// step placed by the auction (`auction`), and runs sent back to where their kind of work
+    /// last went well (`good_places`), each off until declared. Learning starts afresh as the
+    /// weights are turned on, from the weights as they are.
     pub fn configure(&mut self, s: &Settings) {
+        self.set_good_places(s.good_places);
         if s.learned_weights != self.learned.weights.on {
             self.learned.weights.on = s.learned_weights;
             self.learned.weights.begin();
