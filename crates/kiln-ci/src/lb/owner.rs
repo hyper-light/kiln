@@ -121,9 +121,12 @@ struct Pend {
     from: u32,
     /// The bucket its view says.
     to: u32,
+    /// Its view when it was put in the bucket it's in: a pick that brings its view back to this
+    /// leaves it there, with no key to work out.
+    was: u32,
 }
 
-const NO_PEND: Pend = Pend { r: NIL, from: 0, to: 0 };
+const NO_PEND: Pend = Pend { r: NIL, from: 0, to: 0, was: 0 };
 
 #[cfg(test)]
 thread_local! {
@@ -662,31 +665,59 @@ impl Owner {
     /// [`Owner::ask`]'s general path decides.
     #[inline(always)]
     pub fn ask_fast(&mut self, sig: SigId, cpu: u32) -> Option<(u32, Handle, u32)> {
+        if let Some(picked) = self.ask_alone(sig, cpu) {
+            return Some(picked);
+        }
+        self.ask_rest(sig, cpu)
+    }
+
+    /// The first half of [`Owner::ask_fast`], by itself: the pick that goes back to the runner a
+    /// run just ended on, when it alone is the most free. It calls nothing on its way, so a caller
+    /// that makes [`Owner::ask_rest`] its last act when this has no pick keeps no frame for the
+    /// commonest step (W05-R26). `None`: nothing done.
+    #[inline(always)]
+    pub fn ask_alone(&mut self, sig: SigId, cpu: u32) -> Option<(u32, Handle, u32)> {
         #[cfg(test)]
         if super::any_planted() {
             return None;
         }
         let si = sig.0;
-        let last = self.last();
-        let Pend { r: pr, from, to: kp } = self.pend;
-        if pr < MANY {
-            let s = self.sigs.get_mut(si as usize)?;
-            let p = self.peers.get_mut(pr as usize)?;
-            if p.view >= cpu && s.ix.none_from(kp) && (p.sig0 == si || s.ix.contains(pr)) {
-                // It alone is the most free: the pick goes back to it, and it needn't have moved.
-                let run = self.runs.insert(Run::new(u64::from(cpu), si, pr, STARTING, NIL))?;
-                s.ix.took(kp, pr);
-                p.view -= cpu;
-                p.inflight = p.inflight.saturating_add(cpu);
-                let (to, epoch) = (key(p.view, p.scale, last), p.epoch());
-                self.pend.r = NIL;
-                if to != from {
-                    self.resettle(pr, from, to);
-                }
-                return Some((pr, run, epoch));
+        let Pend { r: pr, from, to: kp, was } = self.pend;
+        if pr >= MANY {
+            return None;
+        }
+        let s = self.sigs.get_mut(si as usize)?;
+        let p = self.peers.get_mut(pr as usize)?;
+        if p.view < cpu || !s.ix.none_from(kp) || (p.sig0 != si && !s.ix.contains(pr)) {
+            return None;
+        }
+        // It alone is the most free: the pick goes back to it, and it needn't have moved.
+        let run = self.runs.insert(Run::new(u64::from(cpu), si, pr, STARTING, NIL))?;
+        s.ix.took(kp, pr);
+        p.view -= cpu;
+        p.inflight = p.inflight.saturating_add(cpu);
+        let epoch = p.epoch();
+        self.pend.r = NIL;
+        // The run takes what the last one gave back, the commonest by far: its view is what it
+        // was in the bucket it's in, and no key is worked out for it.
+        if p.view != was {
+            let to = key(p.view, p.scale, self.last);
+            if to != from {
+                self.resettle(pr, from, to);
             }
         }
-        self.ask_other(si, cpu)
+        Some((pr, run, epoch))
+    }
+
+    /// The second half of [`Owner::ask_fast`]: every fast pick [`Owner::ask_alone`] doesn't
+    /// decide. `None`: nothing done, [`Owner::ask`]'s general path decides.
+    #[inline(always)]
+    pub fn ask_rest(&mut self, sig: SigId, cpu: u32) -> Option<(u32, Handle, u32)> {
+        #[cfg(test)]
+        if super::any_planted() {
+            return None;
+        }
+        self.ask_other(sig.0, cpu)
     }
 
     /// Every pick the put-off move didn't decide, the fast entry's one call off its path (so its
@@ -737,7 +768,7 @@ impl Owner {
         if TWO_MOVES.with(std::cell::Cell::get) {
             return None;
         }
-        let Pend { r: pr, from, to: kp } = self.pend;
+        let Pend { r: pr, from, to: kp, .. } = self.pend;
         if pr >= MANY || self.orders_kept != 0 {
             return None;
         }
@@ -951,7 +982,7 @@ impl Owner {
     /// no runner pending and the view risen, or `r` pending already.
     #[cold]
     #[inline(never)]
-    fn moved_slow(&mut self, r: u32, from: u32, to: u32) {
+    fn moved_slow(&mut self, r: u32, from: u32, to: u32, was: u32) {
         let Some(p) = self.peers.get(r as usize) else { return };
         let (sig0, more, listed) = (p.sig0, p.flags & MORE != 0, p.flags & PUT_OFF != 0);
         if self.pend.r == WIDE {
@@ -977,7 +1008,7 @@ impl Owner {
             }
         } else if to > from {
             self.flush();
-            self.pend = Pend { r, from, to };
+            self.pend = Pend { r, from, to, was };
         } else {
             self.relink_all(r, sig0, more, from, to);
         }
@@ -1503,15 +1534,16 @@ impl Owner {
             return false;
         }
         p.heard = p.heard.wrapping_add(1);
-        let from = key(p.view, p.scale, last);
+        let was = p.view;
+        let from = key(was, p.scale, last);
         p.view = b.cpu.saturating_sub(p.inflight);
         let to = key(p.view, p.scale, last);
         if to != from {
             // Its move is put off: nothing reads its bucket before the next pick looks at it.
             if self.pend.r == NIL && to > from {
-                self.pend = Pend { r, from, to };
+                self.pend = Pend { r, from, to, was };
             } else {
-                self.moved_slow(r, from, to);
+                self.moved_slow(r, from, to, was);
             }
         }
         true
@@ -1542,7 +1574,8 @@ impl Owner {
             return false;
         }
         p.heard = p.heard.wrapping_add(1);
-        let from = key(p.view, p.scale, last);
+        let was = p.view;
+        let from = key(was, p.scale, last);
         p.view = b.cpu.saturating_sub(p.inflight);
         let to = key(p.view, p.scale, last);
         if to > from && p.flags & PUT_OFF == 0 {
@@ -1550,7 +1583,7 @@ impl Owner {
             self.put_off.push(Rise { r, from, turn: 0 });
             self.pend.r = MANY;
         } else if to < from && p.flags & PUT_OFF == 0 {
-            self.moved_slow(r, from, to);
+            self.moved_slow(r, from, to, was);
         }
         true
     }

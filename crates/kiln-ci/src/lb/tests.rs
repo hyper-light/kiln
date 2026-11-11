@@ -1009,23 +1009,35 @@ fn w05_r23_reused_start_publishes_only_its_new_runner_handle() -> Result<(), Str
     Ok(())
 }
 
-/// A run of `cpu` asked on the fast entries and started where it's sent: its runner, its handle
-/// there and its own (`None`: the fast entry had no pick).
+/// A run of `cpu` asked on the fast entry and started where it's sent: its runner, its handle
+/// there and its own (`None`: the fast entry had no pick). A runner with more runs than its inline
+/// records hold takes the start, and the owner its word, on the general entries.
 fn fast_start(o: &mut Owner, rs: &mut [Runner], s: SigId, cpu: u32) -> Result<Option<(u32, Handle, Handle)>, String> {
     let Some((r, run, epoch)) = o.ask_fast(s, cpu) else { return Ok(None) };
-    let (at, b) = rs.get_mut(r as usize).ok_or("runner")?.start_fast(OwnerId(0), run, epoch, cpu).ok_or("the runner declined a start its owner's view had room for")?;
-    if !o.started_fast(r, run, at, b) {
-        return Err("a Started word left the fast path".into());
+    let runner = rs.get_mut(r as usize).ok_or("runner")?;
+    if let Some((at, b)) = runner.start_fast(OwnerId(0), run, epoch, cpu) {
+        if !o.started_fast(r, run, at, b) {
+            return Err("a Started word left the fast path".into());
+        }
+        return Ok(Some((r, at, run)));
     }
+    let reply = runner.start(Start { owner: OwnerId(0), run, epoch, need: [u64::from(cpu), 0, 0, 0] });
+    let ToOwner::Started { at, .. } = reply else { return Err(format!("the runner declined a start its owner's view had room for: {reply:?}")) };
+    o.hear(reply, &mut Out::default());
     Ok(Some((r, at, run)))
 }
 
-/// A run ended on the fast entries.
+/// A run ended, on the fast entries where they take it and the general ones where they don't.
 fn fast_end(o: &mut Owner, rs: &mut [Runner], (r, at, run): (u32, Handle, Handle)) -> Result<(), String> {
-    let (_, b) = rs.get_mut(r as usize).ok_or("runner")?.end_fast(at).ok_or("the runner declined an end")?;
-    if !o.ended_fast(r, run, b) {
-        return Err("an Ended word left the fast path".into());
+    let runner = rs.get_mut(r as usize).ok_or("runner")?;
+    if let Some((_, b)) = runner.end_fast(at) {
+        if !o.ended_fast(r, run, b) {
+            return Err("an Ended word left the fast path".into());
+        }
+        return Ok(());
     }
+    let (_, word) = runner.end(at, &mut RunnerOut::new()).ok_or("the runner knows no such run")?;
+    o.hear(word, &mut Out::default());
     Ok(())
 }
 
@@ -1063,7 +1075,13 @@ fn w05_r26_a_tied_pick_chooses_and_leaves_what_its_two_moves_do() -> Result<(), 
                 fast_end(&mut a, &mut ra, x)?;
                 fast_end(&mut b, &mut rb, y)?;
             }
-            let cpu = if rng.below(6) == 0 { 2 * CPU as u32 } else { CPU as u32 };
+            // One core mostly; two cores or half a core now and then, so a pick doesn't always take
+            // what the last end gave back, and a view moves within its bucket.
+            let cpu = match rng.below(6) {
+                0 => 2 * CPU as u32,
+                1 => CPU as u32 / 2,
+                _ => CPU as u32,
+            };
             let pa = fast_start(&mut a, &mut ra, sa, cpu)?;
             let pb = with_two_moves(|| fast_start(&mut b, &mut rb, sb, cpu))?;
             if pa != pb {
@@ -1076,6 +1094,12 @@ fn w05_r26_a_tied_pick_chooses_and_leaves_what_its_two_moves_do() -> Result<(), 
             }
             if (0..n).any(|r| a.view(RunnerId(r)) != b.view(RunnerId(r))) {
                 return Err(format!("case {case} step {step}: views differ"));
+            }
+            // Every runner is in the bucket its view says: down the order of picks to come, whole
+            // free cores never rise (a move wrongly skipped leaves one out of place).
+            let free: Vec<u64> = a.order(sa).iter().filter_map(|r| a.view(*r)).map(|v| v[0] / CPU).collect();
+            if free.iter().zip(free.iter().skip(1)).any(|(x, y)| x < y) {
+                return Err(format!("case {case} step {step} ({n} runners): a runner is out of its bucket: free cores in pick order {free:?}"));
             }
         }
         // Every run ended: each view is its runner's whole room again, in both.

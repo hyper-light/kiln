@@ -512,7 +512,7 @@ impl Kiln {
         let Some(x) = self.runners.get_mut(r as usize) else { return -1 };
         let Some((at, b)) = x.start_fast(OwnerId(0), run, epoch, cpu) else { return self.admit_cold(s, r, run, epoch) };
         if !self.owner.started_fast(r, run, at, b) {
-            self.started_cold(r, run, at);
+            return self.started_cold(s, r, run, at);
         }
         if let Some(y) = self.slots.get_mut(s as usize) {
             *y = Slot { runner: r, at, run };
@@ -529,15 +529,20 @@ impl Kiln {
     }
 
     /// The runner started it but the owner's fast path declined its word: the general path, with
-    /// the word whole.
+    /// the word whole, and the slot's record, so the pick that comes here has nothing left to do
+    /// (W05-R26: its fast path then calls nothing it has to come back from).
     #[cold]
     #[inline(never)]
-    fn started_cold(&mut self, r: u32, run: Handle, at: Handle) {
-        let Some(word) = self.runners.get(r as usize).map(Runner::word) else { return };
+    fn started_cold(&mut self, s: u32, r: u32, run: Handle, at: Handle) -> i32 {
+        let Some(word) = self.runners.get(r as usize).map(Runner::word) else { return -1 };
         self.owner.hear(ToOwner::Started { runner: RunnerId(r), run, at, word }, &mut self.out);
         if !(self.out.to.is_empty() && self.rout.is_empty()) {
             self.deliver();
         }
+        if let Some(y) = self.slots.get_mut(s as usize) {
+            *y = Slot { runner: r, at, run };
+        }
+        r as i32
     }
 
     /// The runner admits what the owner sent; the owner takes its word. Where it started, or -1.
@@ -563,12 +568,23 @@ fn kiln_release(k: &mut Kiln, s: u32) {
 }
 
 fn kiln_pick(k: &mut Kiln, s: u32, _key: u64) -> i32 {
-    if let Some(cpu) = k.cpu
-        && let Some((r, run, epoch)) = k.owner.ask_fast(k.sig, cpu)
-    {
-        return k.admit_fast(s, r, run, epoch, cpu);
+    let Some(cpu) = k.cpu else { return kiln_pick_cold(k, s) };
+    // The pick that goes back to the runner a run just ended on calls nothing it comes back
+    // from; every other pick is one call made last, so this one keeps no frame (W05-R26).
+    match k.owner.ask_alone(k.sig, cpu) {
+        Some((r, run, epoch)) => k.admit_fast(s, r, run, epoch, cpu),
+        None => kiln_pick_rest(k, s, cpu),
     }
-    kiln_pick_cold(k, s)
+}
+
+/// A pick of CPU alone that didn't go back to the runner a run just ended on: the owner's other
+/// fast picks, then the general path.
+#[inline(never)]
+fn kiln_pick_rest(k: &mut Kiln, s: u32, cpu: u32) -> i32 {
+    match k.owner.ask_rest(k.sig, cpu) {
+        Some((r, run, epoch)) => k.admit_fast(s, r, run, epoch, cpu),
+        None => kiln_pick_cold(k, s),
+    }
 }
 
 /// A pick the owner's fast path declined (d past 1, a walk, nothing to pick), or that the fast
@@ -668,9 +684,8 @@ fn kiln_many_pick(k: &mut Kiln, slots: &[u32], _keys: &[u64], out: &mut [i32]) {
     }
     for &(ix, r, run, s, at, b) in &admits {
         if !k.owner.started_fast(r, run, at, b) {
-            k.started_cold(r, run, at);
-        }
-        if let Some(y) = k.slots.get_mut(s as usize) {
+            k.started_cold(s, r, run, at);
+        } else if let Some(y) = k.slots.get_mut(s as usize) {
             *y = Slot { runner: r, at, run };
         }
         if let Some(o) = out.get_mut(ix as usize) {
