@@ -168,8 +168,10 @@ impl Owner {
         self.prior.net.moved(was.net, now.net);
         self.prior.link.moved(was.link, now.link);
         // A runner not measured sits where the prior does: its class moves with it.
-        if self.orders_kept & BYTES != 0 && self.prior.classes() != before {
-            self.refile_unmeasured(r);
+        let after = self.prior.classes();
+        let changed = [false, before[0] != after[0], before[2] != after[2], before[1] != after[1]];
+        if changed.iter().enumerate().any(|(i, changed)| *changed && self.orders_kept & (1 << i) != 0) {
+            self.refile_unmeasured(r, changed);
         }
     }
 
@@ -177,11 +179,11 @@ impl Owner {
     /// filed again. O(runners), only when a mean crosses a class.
     #[cold]
     #[inline(never)]
-    fn refile_unmeasured(&mut self, r: u32) {
+    fn refile_unmeasured(&mut self, r: u32, changed: [bool; ORDERS]) {
         for x in 0..u32::try_from(self.cold.len()).unwrap_or(NIL) {
             let c = self.cold.get(x as usize).copied().unwrap_or_default();
             if x != r && (c.disk == 0 || c.net == 0 || c.link.rate == 0) {
-                self.set_orders(x, [false, c.disk == 0, c.link.rate == 0, c.net == 0]);
+                self.set_orders(x, [false, changed[DISK] && c.disk == 0, changed[LINK] && c.link.rate == 0, changed[NET] && c.net == 0]);
             }
         }
     }
