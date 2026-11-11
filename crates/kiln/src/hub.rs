@@ -1998,7 +1998,11 @@ impl Hub {
     /// toward that runner go on a live link (shed, or a test build's chaos: `metrics::net().drops`),
     /// where it was said every 5 s. Nothing wakes it while nothing is due.
     pub async fn commands_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let net = crate::metrics::net();
+        self.commands_loop_with(crate::metrics::net()).await
+    }
+
+    /// W13-R01 / goal 9: a fixture owns its drop notifications; production uses the process's.
+    async fn commands_loop_with(self: Arc<Self>, net: &crate::metrics::NetMetrics) -> anyhow::Result<()> {
         let mut seen = lost_toward(&net.toward_all());
         let (mut at, mut look) = (None, true);
         loop {
@@ -6588,7 +6592,9 @@ pub(crate) mod tests {
                 })
                 .await;
             let polls = Arc::new(AtomicU64::new(0));
-            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Arc::clone(&hub).commands_loop())));
+            let net = Arc::new(crate::metrics::NetMetrics::default());
+            let (h, metrics) = (Arc::clone(&hub), Arc::clone(&net));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), async move { h.commands_loop_with(&metrics).await })));
             crate::rt::settled(&polls, until).await?;
             let sent = |item: bool| {
                 hub.sent.lock().iter().filter(|(p, m)| *p == PEER && matches!((m, item), (ServerMsg::Wire(Frame::Item { .. }), true) | (ServerMsg::Wire(Frame::Have(_)), false))).count()
@@ -6597,13 +6603,19 @@ pub(crate) mod tests {
             let _answer = hub.cmds.ask(move |c| c.push(PEER, crate::wire::commands::Kind::Live, None, b"keys".to_vec(), now)).await;
             hub.commands_due.notify();
             until_held("the command sent at once", until, || sent(true) == 1).await?;
-            let went = Instant::now();
+            // W13-R01 / goal 9: read the sender's deadline before delaying its observer.
+            // Time spent scheduling this test must not restart the command's patience.
+            let retry_due = hub.cmds.ask(|c| c.due(Instant::now())).await.flatten().ok_or_else(|| anyhow::anyhow!("the sent command has no retry deadline"))?;
+            anyhow::ensure!(retry_due >= now + crate::wire::commands::PATIENCE, "retry due before the queued command's patience");
+            // Goal 9 regression control: the observer may be delayed independently of the
+            // sender. A retry's patience still starts when the command core sends it.
+            crate::rt::sleep(crate::wire::commands::PATIENCE / 2).await;
             until_held("sent again at its patience", until, || sent(true) == 2).await?;
-            anyhow::ensure!(went.elapsed() + Duration::from_millis(50) >= crate::wire::commands::PATIENCE, "sent again before its patience: {:?}", went.elapsed());
+            anyhow::ensure!(Instant::now() >= retry_due, "sent again before its patience deadline");
             let haves = sent(false);
-            crate::metrics::net().dropped(PEER, proto::LANE_FILES, "shed", 1);
+            net.dropped(PEER, proto::LANE_FILES, "shed", 1);
             until_held("its Have said again for a frame shed", until, || sent(false) == haves + 1).await?;
-            crate::metrics::net().dropped(PEER, proto::LANE_FILES, "refused", 1);
+            net.dropped(PEER, proto::LANE_FILES, "refused", 1);
             crate::rt::sleep(Duration::from_millis(300)).await;
             anyhow::ensure!(sent(false) == haves + 1, "said again for a frame refused");
             hub.shutdown.cancel();
@@ -6679,10 +6691,9 @@ pub(crate) mod tests {
         })
     }
 
-    /// Goal 9: an idle server's commands, terminals, retention and fleet loops wake for nothing. Do: a scratch hub with
-    /// nothing queued, running, listed or due; each loop started and counted by its polls, settled; three seconds in
-    /// which no frame anywhere was let go (a test beside it that drops one wakes the commands loop, as it should: the span
-    /// is taken again). Expect: no poll of any (they woke every second, 30 s, hour and minute).
+    /// Goal 9: the scratch server's idle loops never poll without an input or due item. Its
+    /// command loop uses its own transport metrics, so another fixture cannot wake it between
+    /// the settled snapshot and the quiet window (W13-R01).
     #[test]
     fn g9_an_idle_servers_commands_terminals_retention_and_fleet_loops_wake_for_nothing() -> anyhow::Result<()> {
         let until = Instant::now() + Duration::from_secs(300);
@@ -6690,26 +6701,20 @@ pub(crate) mod tests {
             let hub = scratch_hub().await?;
             let loops = [("commands", Arc::new(AtomicU64::new(0))), ("terminals", Arc::new(AtomicU64::new(0))), ("retention", Arc::new(AtomicU64::new(0))), ("fleet", Arc::new(AtomicU64::new(0)))];
             let [(_, commands), (_, terminals), (_, retention), (_, fleet)] = &loops;
-            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(commands), Arc::clone(&hub).commands_loop())));
+            let net = Arc::new(crate::metrics::NetMetrics::default());
+            let h = Arc::clone(&hub);
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(commands), async move { h.commands_loop_with(&net).await })));
             drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(terminals), Arc::clone(&hub).terminal_loop())));
             drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(retention), Arc::clone(&hub).retention_loop())));
             drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(fleet), crate::fleet::follow_loop(Arc::clone(&hub)))));
-            loop {
-                for (_, polls) in &loops {
-                    crate::rt::settled(polls, until).await?;
-                }
-                let seen: Vec<u64> = loops.iter().map(|(_, polls)| polls.load(Ordering::Relaxed)).collect();
-                let drops = crate::metrics::net().toward_all();
-                crate::rt::sleep(Duration::from_secs(3)).await;
-                if !Arc::ptr_eq(&drops, &crate::metrics::net().toward_all()) {
-                    anyhow::ensure!(Instant::now() < until, "never a quiet span: frames let go all along");
-                    continue;
-                }
-                for ((name, polls), was) in loops.iter().zip(&seen) {
-                    let polled = polls.load(Ordering::Relaxed).saturating_sub(*was);
-                    anyhow::ensure!(polled == 0, "{name}: {polled} polls in 3 s, idle");
-                }
-                break;
+            for (_, polls) in &loops {
+                crate::rt::settled(polls, until).await?;
+            }
+            let seen: Vec<u64> = loops.iter().map(|(_, polls)| polls.load(Ordering::Relaxed)).collect();
+            crate::rt::sleep(Duration::from_secs(3)).await;
+            for ((name, polls), was) in loops.iter().zip(&seen) {
+                let polled = polls.load(Ordering::Relaxed).saturating_sub(*was);
+                anyhow::ensure!(polled == 0, "{name}: {polled} polls in 3 s, idle");
             }
             hub.shutdown.cancel();
             Ok(())

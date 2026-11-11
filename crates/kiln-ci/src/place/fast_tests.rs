@@ -6,7 +6,7 @@
 
 use super::answer::Answer;
 use super::ask::{Ask, Peer, Sample};
-use super::msg::{Down, Up};
+use super::msg::{Down, How, Up};
 use super::owner::{Cmd, Kept, Machine, Owner, Size};
 use super::runner::{Admission, Init, Records, Reply, Settings, Start};
 use crate::facts::RunnerFacts;
@@ -89,9 +89,14 @@ impl Lab {
 
     /// Run `run` on runner `i` ended (its process exited).
     fn end(&mut self, i: usize, run: &str, now: i64) {
+        self.end_as(i, run, How::Unsaid, now);
+    }
+
+    /// Run `run` on runner `i` ended (its process exited), and its runner's shell says how.
+    fn end_as(&mut self, i: usize, run: &str, how: How, now: i64) {
         let mut out = Vec::new();
         if let Some(r) = self.runners.get_mut(i) {
-            r.ended_r(Peer { name: OWNER, epoch: 1 }, run, true, now, &mut out);
+            r.ended_as_r(Peer { name: OWNER, epoch: 1 }, run, true, how, now, &mut out);
         }
         self.started.retain(|(x, j)| !(x == run && *j == i));
         let mut cmds = Vec::new();
@@ -381,6 +386,162 @@ fn lb03_a_run_kept_waiting_across_a_restart_is_probed_not_started_by_the_kernel(
     lab.ask(ask("f", "cpus=2")?, 2);
     if lab.count("fast") != 1 {
         return Err(format!("a fresh ask: said {:?}", lab.said));
+    }
+    Ok(())
+}
+
+fn gpu_lab(fast: bool) -> Result<Lab, String> {
+    use crate::facts::Gpu;
+    let mut lab = Lab::new(2, 8, fast);
+    let mut machines = Vec::new();
+    for i in 0..2 {
+        let name = format!("r{i}");
+        let size = Resources { cpu: Cpus::whole(if i == 0 { 16 } else { 4 }), mem: 64 * GIB, disk: 100 * GIB, gpu: 2 };
+        let facts = RunnerFacts { os: "linux".into(), arch: "x86_64".into(), gpus: vec![Gpu { vendor: "nvidia".into(), model: "A100".into(), memory: 80 * GIB, memory_used: Some(if i == 0 { 64 } else { 8 } * GIB), busy_per_mille: Some(if i == 0 { 900 } else { 100 }), ..Gpu::default() }; 2], ..RunnerFacts::default() };
+        *lab.runners.get_mut(i).ok_or("fixture runner")? = Admission::new(Init { me: name.clone(), epoch: 1, facts: facts.clone(), sample: Sample { size, ..Sample::default() }, ..Init::default() }, 0);
+        machines.push(Machine { name, facts, size: Size::known(&size), epoch: 1, connected: true, places: true, fast, ..Machine::default() });
+    }
+    lab.owner.machines(machines);
+    lab.hint();
+    Ok(lab)
+}
+
+#[test]
+fn w05_r23_gpu_placement_prefers_idle_gpu_over_emptier_cpu() -> Result<(), String> {
+    for fast in [false, true] {
+        let mut lab = gpu_lab(fast)?;
+        lab.ask(ask("gpu", "cpus=1,gpus=1,gpu.model==A100,gpu.memory.free>=16Gi")?, 1);
+        assert_eq!(lab.started, vec![("gpu".into(), 1)], "fast={fast}");
+        lab.end(1, "gpu", 2);
+        assert!(lab.started.is_empty());
+        lab.ask(ask("again", "cpus=1,gpus=2,gpu.model==A100")?, 3);
+        assert_eq!(lab.started, vec![("again".into(), 1)], "fast={fast}");
+    }
+    Ok(())
+}
+
+#[test]
+fn w05_r03_gpu_requests_wait_and_release_without_oversubscription() -> Result<(), String> {
+    let mut lab = gpu_lab(true)?;
+    for i in 0..3 { lab.ask(ask(&format!("g{i}"), "cpus=1,gpus=2")?, i + 1); }
+    assert_eq!(lab.started.len(), 2);
+    let (run, node) = lab.started.first().cloned().ok_or("started GPU run")?;
+    lab.end(node, &run, 5);
+    assert_eq!(lab.started.len(), 2);
+    assert!(lab.started.iter().any(|(r, _)| r == "g2"));
+    Ok(())
+}
+
+#[test]
+fn w05_r25_fast_start_marks_its_record_before_spawn() -> Result<(), String> {
+    let mut lab = Lab::new(1, 8, true);
+    lab.ask(ask("kept-fast", "cpus=1")?, 1);
+    assert_eq!(lab.started, vec![("kept-fast".into(), 0)]);
+    let changed = lab.runners.first_mut().ok_or("runner")?.record_changes();
+    assert!(changed.iter().any(|(owner, epoch, run, record, ask)| owner == OWNER && *epoch == 1 && run == "kept-fast" && record.is_some_and(|r| r.ended.is_none()) && ask.is_some()), "the shell must receive the new runner record before spawning: {changed:?}");
+    Ok(())
+}
+
+/// One run of kind `key` asked, started by the kernel and ended as `how` says: where it ran, and
+/// why its answer says it went there.
+fn one(lab: &mut Lab, n: usize, key: &str, how: How) -> Result<(usize, String), String> {
+    let run = format!("run-{n}");
+    let now = 10 * n as i64;
+    lab.ask(Ask { key: Some(key.into()), ..ask(&run, "cpus=1")? }, now);
+    let Some(i) = lab.started.iter().find(|(x, _)| *x == run).map(|(_, i)| *i) else { return Err(format!("{run} didn't start: {:?}", lab.answers)) };
+    let Some(Answer::Started { why, .. }) = lab.last(&run).cloned() else { return Err(format!("{run}: {:?}", lab.last(&run))) };
+    lab.end_as(i, &run, how, now + 1);
+    Ok((i, why))
+}
+
+/// W05-R04, W05-R23 (docs/lb.md "Good places"): once its shell turns good places on, a run the
+/// kernel places goes back to where its kind of work (its ask's key) last went well, and its
+/// answer says that is why; a runner that let the kind down loses it, and one it failed on with
+/// no known cause loses it for one run, then keeps it when the kind fails elsewhere too (the
+/// work's own fault). Another kind of work has its own place. Off, as it is until declared, or
+/// with nothing said of how runs end, runs take turns as before.
+#[test]
+fn w05_r04_a_kinds_work_goes_back_to_where_it_went_well_once_declared() -> Result<(), String> {
+    let back = "its kind of work last went well there";
+    // Off: three runs of one kind, each ending well, take turns.
+    let mut lab = Lab::new(3, 8, true);
+    let mut seen = Vec::new();
+    for n in 0..3 {
+        let (i, why) = one(&mut lab, n, "leg:build", How::Well)?;
+        if why.contains(back) {
+            return Err(format!("good places are off, and run {n}'s answer says: {why}"));
+        }
+        seen.push(i);
+    }
+    seen.sort_unstable();
+    seen.dedup();
+    if seen.len() != 3 {
+        return Err(format!("off, three runs of one kind went to {seen:?}: not one each"));
+    }
+    // On, with nothing said of how runs end: the same.
+    let mut lab = Lab::new(3, 8, true);
+    lab.owner.set_good_places(true);
+    let mut seen = Vec::new();
+    for n in 0..3 {
+        seen.push(one(&mut lab, n, "leg:build", How::Unsaid)?.0);
+    }
+    seen.sort_unstable();
+    seen.dedup();
+    if seen.len() != 3 {
+        return Err(format!("with nothing said of how runs end, three runs went to {seen:?}: not one each"));
+    }
+    // On: the kind goes back to where it went well, and says so.
+    let mut lab = Lab::new(3, 8, true);
+    lab.owner.set_good_places(true);
+    let (first, why) = one(&mut lab, 0, "leg:build", How::Well)?;
+    if why.contains(back) {
+        return Err(format!("its first run had no place to go back to, and says: {why}"));
+    }
+    for n in 1..4 {
+        let (i, why) = one(&mut lab, n, "leg:build", How::Well)?;
+        if i != first || !why.contains(back) {
+            return Err(format!("run {n} of the kind went to runner {i} ({why}), not back to {first} where it went well"));
+        }
+    }
+    // Another kind of work doesn't take that place: it finds its own and goes back to it.
+    let (other, _) = one(&mut lab, 4, "leg:test", How::Well)?;
+    let (again, why) = one(&mut lab, 5, "leg:test", How::Well)?;
+    if other == first || again != other || !why.contains(back) {
+        return Err(format!("another kind's runs went to {other} then {again} ({why}): its own place, not {first}"));
+    }
+    // The node lets the first kind down (a cause its shell knows): the kind leaves it.
+    let (i, _) = one(&mut lab, 6, "leg:build", How::LetDown)?;
+    let (next, why) = one(&mut lab, 7, "leg:build", How::Well)?;
+    if i != first || next == first || why.contains(back) {
+        return Err(format!("after runner {first} let the kind down its next run went to {next} ({why})"));
+    }
+    // It fails there with no known cause: its next run goes elsewhere once; it fails there too,
+    // so the work is at fault, and it stays.
+    let (i, _) = one(&mut lab, 8, "leg:build", How::Unsure)?;
+    let (moved, _) = one(&mut lab, 9, "leg:build", How::Unsure)?;
+    let (stays, why) = one(&mut lab, 10, "leg:build", How::Unsure)?;
+    if i != next || moved == next || stays != moved || !why.contains(back) {
+        return Err(format!("a kind failing for its own sake ran on {i}, {moved}, {stays} ({why}): it moves once from {next}, then keeps its place"));
+    }
+    Ok(())
+}
+
+/// The wire only grows: a kernel run's end says nothing of how it ended when there is nothing to
+/// say, which is what a runner from before good places sends and reads as nothing said; a
+/// judgment is said by its name.
+#[test]
+fn w05_r04_how_a_run_ended_is_optional_on_the_wire() -> Result<(), serde_json::Error> {
+    let end = |how: How| Up::FastEnded { kernel: crate::lb::Handle { slot: 1, generation: 1 }, ok: true, word: super::msg::FastWord::default(), how };
+    // As a runner from before sends it: no `how`.
+    let before = serde_json::to_string(&end(How::Unsaid).wire("a"))?;
+    assert!(before.starts_with(r#"{"op":"fast_ended""#) && !before.contains("how"), "{before}");
+    let (run, up) = serde_json::from_str::<super::msg::ToOwner>(&before)?.split();
+    assert_eq!(run, "a");
+    assert_eq!(up, end(How::Unsaid));
+    for (how, name) in [(How::Well, "well"), (How::LetDown, "let_down"), (How::Unsure, "unsure")] {
+        let said = serde_json::to_string(&end(how).wire("a"))?;
+        assert!(said.contains(&format!(r#""how":"{name}""#)), "{said}");
+        assert_eq!(serde_json::from_str::<super::msg::ToOwner>(&said)?.split().1, end(how));
     }
     Ok(())
 }

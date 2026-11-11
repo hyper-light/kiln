@@ -131,33 +131,46 @@ async fn executors() -> BTreeMap<String, Executor> {
     out
 }
 
-/// GPUs: NVIDIA's through `nvidia-smi`, a Mac's through `system_profiler`.
-async fn gpus() -> Vec<Gpu> {
-    let mut out = Vec::new();
-    if let Some(text) = output("nvidia-smi", &["--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"]).await {
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let parts: Vec<&str> = line.split(',').map(str::trim).collect();
-            let (Some(model), Some(mib)) = (parts.first(), parts.get(1)) else { continue };
-            out.push(Gpu { vendor: "nvidia".into(), model: (*model).to_owned(), memory: mib.parse::<u64>().unwrap_or(0) << 20, driver: parts.get(2).map(|d| (*d).to_owned()) });
-        }
+/// W13-R01: one retained native provider for NVIDIA, AMD and Apple Silicon.
+async fn gpus() -> (Vec<Gpu>, Option<String>) {
+    let (out, why) = match crate::rt::blocking(native_gpu_facts).await {
+        Ok(Ok(cards)) => (cards, None),
+        Ok(Err(why)) => (Vec::new(), Some(why)),
+        Err(why) => (Vec::new(), Some(why.to_string())),
+    };
+    GPU_PRESENT.store(!out.is_empty(), Ordering::Release);
+    (out, why)
+}
+
+/// W13-R01: Hex's retained NVML / amdgpu / ADL / Apple providers, one instance per process.
+/// Sampling uses installed drivers and retained handles; it starts no subprocess.
+fn native_gpu_facts() -> Result<Vec<Gpu>, String> {
+    static GPUS: std::sync::LazyLock<parking_lot::Mutex<kiln_gpu::Gpus>> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(kiln_gpu::Gpus::open()));
+    let mut found = GPUS.lock();
+    // A driver installed after startup is discovered on the next facts event, as Hex permits.
+    if found.inventory().is_err() { *found = kiln_gpu::Gpus::open(); }
+    let mut inventory = found.inventory().map(<[_]>::to_vec).map_err(ToString::to_string)?;
+    let mut loads = found.sample().map(<[_]>::to_vec).map_err(ToString::to_string)?;
+    if loads.iter().any(|l| l.busy_percent == Err(kiln_gpu::Unread::Gone) || l.memory_used_bytes == Err(kiln_gpu::Unread::Gone)) {
+        *found = kiln_gpu::Gpus::open();
+        let fresh = found.inventory().map(<[_]>::to_vec).map_err(ToString::to_string)?;
+        inventory = fresh;
+        let fresh = found.sample().map(<[_]>::to_vec).map_err(ToString::to_string)?;
+        loads = fresh;
     }
-    if cfg!(target_os = "macos")
-        && let Some(text) = output("system_profiler", &["SPDisplaysDataType", "-json"]).await
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
-    {
-        for g in v.get("SPDisplaysDataType").and_then(serde_json::Value::as_array).into_iter().flatten() {
-            let model = g.get("sppci_model").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
-            if model.is_empty() {
-                continue;
-            }
-            let vendor = g.get("spdisplays_vendor").and_then(serde_json::Value::as_str).unwrap_or_default().to_ascii_lowercase();
-            let vendor = if vendor.contains("apple") || model.starts_with("Apple") { "apple" } else if vendor.contains("amd") || vendor.contains("ati") { "amd" } else if vendor.contains("intel") { "intel" } else { "other" };
-            // Discrete GPUs say their memory ("8 GB"); Apple silicon shares the machine's.
-            let memory = g.get("spdisplays_vram").or_else(|| g.get("spdisplays_vram_shared")).and_then(serde_json::Value::as_str).and_then(|s| s.split_whitespace().next()?.parse::<u64>().ok()).map_or(0, |gb| gb << 30);
-            out.push(Gpu { vendor: vendor.into(), model, memory, driver: g.get("spdisplays_mtlgpufamilysupport").and_then(serde_json::Value::as_str).map(|m| m.trim_start_matches("spdisplays_").to_owned()) });
+    Ok(gpu_facts(&inventory, &loads))
+}
+
+fn gpu_facts(inventory: &[kiln_gpu::Gpu], loads: &[kiln_gpu::Load]) -> Vec<Gpu> {
+    inventory.iter().enumerate().map(|(i, g)| {
+        let load = loads.get(i);
+        Gpu {
+            vendor: match g.vendor { kiln_gpu::Vendor::Nvidia => "nvidia", kiln_gpu::Vendor::Amd => "amd", kiln_gpu::Vendor::Apple => "apple" }.into(),
+            model: g.model.clone(), memory: g.memory_total_bytes, driver: Some(g.driver_version.clone()), id: Some(g.identity.to_string()),
+            busy_per_mille: load.and_then(|l| l.busy_percent.ok()).map(|p| u16::from(p) * 10),
+            memory_used: load.and_then(|l| l.memory_used_bytes.ok()),
         }
-    }
-    out
+    }).collect()
 }
 
 /// Whether the internet is reachable directly, and the proxy the environment names (its
@@ -336,7 +349,7 @@ pub async fn gather(work_dir: &Path, declared: &Declared, looked: bool) -> Runne
     if cfg!(target_os = "macos") {
         f.virt.hvf = output("sysctl", &["-n", "kern.hv_support"]).await.is_some_and(|v| v.trim() == "1");
     }
-    (f.executors, f.tools, f.gpus, f.net) = futures::join!(executors(), tools(), gpus(), net());
+    (f.executors, f.tools, (f.gpus, f.gpu_unavailable), f.net) = futures::join!(executors(), tools(), gpus(), net());
     f.custom = declared.facts.clone();
     for (name, script) in &declared.probes {
         let (program, args) = crate::os::default_step_shell(script);
@@ -372,43 +385,117 @@ pub fn tool_missing() {
     MISSING.notify();
 }
 
+/// W13-R01: coalesced workload-change events; a CPU-only host never invokes a GPU probe.
+static GPU_CHANGED: std::sync::LazyLock<crate::rt::Notify> = std::sync::LazyLock::new(crate::rt::Notify::new);
+static GPU_PRESENT: AtomicBool = AtomicBool::new(false);
+
+pub fn gpu_changed() {
+    if GPU_PRESENT.load(Ordering::Acquire) { GPU_CHANGED.notify(); }
+}
+
+pub async fn gpu_change() { GPU_CHANGED.notified().await; }
+
 /// A runner's facts' probes, one at a time (W13-R01): an ask that comes while one runs gives one
 /// more after it, a look if any of those asks was one.
 #[derive(Debug, Default)]
 pub struct Probing {
-    busy: AtomicBool,
-    again: AtomicBool,
-    looked: AtomicBool,
+    state: parking_lot::Mutex<ProbeState>,
+    facts: parking_lot::Mutex<Option<RunnerFacts>>,
+}
+
+/// W13-R01: publish pending work and transfer the single publisher in one critical section.
+/// Separate atomic flags allow a finishing publisher to miss an in-flight request.
+#[derive(Debug, Default)]
+struct ProbeState {
+    busy: bool,
+    again: bool,
+    looked: bool,
+    full: bool,
 }
 
 impl Probing {
     /// Asked for a probe (a look at the machine anew when `looked`): whether this caller runs it,
     /// none running. One running takes the ask as its next.
     pub fn take(&self, looked: bool) -> bool {
-        if looked {
-            self.looked.store(true, Ordering::SeqCst);
+        let mut state = self.state.lock();
+        state.full = true;
+        state.looked |= looked;
+        Self::claim(&mut state)
+    }
+
+    pub fn take_gpu(&self) -> bool { Self::claim(&mut self.state.lock()) }
+
+    fn claim(state: &mut ProbeState) -> bool {
+        if state.busy {
+            // W13-R01: let a finisher contend while the next request is being published.
+            #[cfg(test)]
+            std::thread::yield_now();
+            state.again = true;
+            false
+        } else {
+            state.busy = true;
+            true
         }
-        if self.busy.swap(true, Ordering::SeqCst) {
-            self.again.store(true, Ordering::SeqCst);
-            return false;
-        }
-        true
+    }
+
+    /// The local CI admission reads the same retained inventory as placement.
+    pub fn sized(&self, base: Option<kiln_ci::sched::state::Resources>) -> Option<kiln_ci::sched::state::Resources> {
+        base.map(|mut size| {
+            if let Some(facts) = self.facts.lock().as_ref() { size.gpu = u32::try_from(facts.gpus.len()).unwrap_or(u32::MAX); }
+            size
+        })
+    }
+
+    /// One publisher and one retained facts value. GPU events refresh counters and live room;
+    /// a full probe requested meanwhile is never lost or overwritten by an older GPU snapshot.
+    pub async fn read(&self, dir: &Path, declared: &Declared, looked: bool) -> RunnerFacts {
+        let previous = self.facts.lock().clone();
+        let (full, looked) = self.read_kind(looked);
+        let facts = if full || previous.is_none() {
+            gather(dir, declared, looked).await
+        } else {
+            let mut facts = previous.unwrap_or_default();
+            let dir = dir.to_path_buf();
+            if let Ok(fresh) = crate::rt::blocking(move || machine(&dir)).await {
+                (facts.mem, facts.disk, facts.work, facts.storage) = (fresh.mem, fresh.disk, fresh.work, fresh.storage);
+            }
+            (facts.gpus, facts.gpu_unavailable) = gpus().await;
+            facts.probed_at = crate::util::now_unix();
+            facts
+        };
+        self.remember(&facts);
+        facts
+    }
+
+    fn read_kind(&self, looked: bool) -> (bool, bool) {
+        let mut state = self.state.lock();
+        let full = std::mem::take(&mut state.full);
+        let pending_look = full && std::mem::take(&mut state.looked);
+        (full, looked || pending_look)
+    }
+
+    fn remember(&self, facts: &RunnerFacts) {
+        let mut retained = facts.clone();
+        // Runtime observations are a drained batch, published once, not part of retained facts.
+        retained.runs.clear();
+        *self.facts.lock() = Some(retained);
     }
 
     /// The probe that ran ends: whether another is to run now (asked meanwhile, and taken here),
     /// and whether it's a look.
     pub fn done(&self) -> Option<bool> {
-        self.busy.store(false, Ordering::SeqCst);
-        if !self.again.swap(false, Ordering::SeqCst) || self.busy.swap(true, Ordering::SeqCst) {
-            return None;
+        let mut state = self.state.lock();
+        if std::mem::take(&mut state.again) {
+            Some(std::mem::take(&mut state.looked))
+        } else {
+            state.busy = false;
+            None
         }
-        Some(self.looked.swap(false, Ordering::SeqCst))
     }
 
     /// Whether the probe about to run is a look (taken once).
-    pub fn looks(&self) -> bool {
-        self.looked.swap(false, Ordering::SeqCst)
-    }
+    pub fn looks(&self) -> bool { std::mem::take(&mut self.state.lock().looked) }
+
 }
 
 /// What asks for a runner's facts again as it changes (W13-R01; goal 9: it was every 10 minutes):
@@ -564,5 +651,113 @@ mod tests {
         if cfg!(target_os = "linux") && std::path::Path::new("/proc/pressure/io").exists() {
             assert!(io_pressure().is_some_and(|p| (0.0..=100.0).contains(&p)), "{:?}", io_pressure());
         }
+    }
+}
+
+#[cfg(test)]
+mod gpu_port_tests {
+    use super::*;
+    #[test]
+    fn w13_r01_native_gpu_facts_keep_identity_and_partial_counter_failure() -> Result<(), String> {
+        let inventory = vec![kiln_gpu::Gpu { vendor: kiln_gpu::Vendor::Nvidia, model: "A100".into(), memory_total_bytes: 80 << 30, identity: kiln_gpu::Identity::Pci(kiln_gpu::PciAddress::parse("0000:01:00.0").ok_or("expected test value")?), driver_version: "550.54".into() }];
+        let cards = gpu_facts(&inventory, &[kiln_gpu::Load { busy_percent: Err(kiln_gpu::Unread::Unsupported), memory_used_bytes: Ok(12 << 30) }]);
+        let a = cards.first().ok_or("expected test value")?;
+        assert_eq!(a.busy_per_mille, None);
+        assert_eq!(a.memory_used, Some(12 << 30));
+        assert_eq!(a.id.as_deref(), Some("0000:01:00.0"));
+        let missing = gpu_facts(&inventory, &[]);
+        assert_eq!(missing.first().ok_or("expected test value")?.memory, 80 << 30);
+        assert_eq!(missing.first().ok_or("expected test value")?.memory_used, None);
+        Ok(())
+    }
+
+    #[test]
+    fn w13_r01_apple_facts_keep_full_registry_id_and_native_memory_budget() -> Result<(), String> {
+        let inventory = vec![kiln_gpu::Gpu { vendor: kiln_gpu::Vendor::Apple, model: "Apple GPU".into(), memory_total_bytes: 80 << 30, identity: kiln_gpu::Identity::Metal(u64::MAX), driver_version: "Darwin".into() }];
+        let cards = gpu_facts(&inventory, &[kiln_gpu::Load { busy_percent: Err(kiln_gpu::Unread::NoSample), memory_used_bytes: Ok(96 << 30) }]);
+        let card = cards.first().ok_or("expected Apple facts")?;
+        assert_eq!(card.vendor, "apple");
+        assert_eq!(card.id.as_deref(), Some("metal:18446744073709551615"));
+        assert_eq!(card.memory, 80 << 30, "Metal's working-set budget is not host RAM");
+        assert_eq!(card.memory_used, Some(96 << 30), "retain the actual allocation even above its budget");
+        assert_eq!(card.busy_per_mille, None, "a zero-tick window is not idle");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gpu_events_tests {
+    use super::*;
+    #[test]
+    fn w13_r01_gpu_events_and_full_probe_share_one_publisher() -> Result<(), String> {
+        let p = Probing::default();
+        assert!(p.take_gpu());
+        assert!(!p.state.lock().full);
+        assert!(!p.take(true)); // A full read arriving during GPU I/O is retained.
+        assert!(p.state.lock().full);
+        assert_eq!(p.done(), Some(true));
+        assert_eq!(p.done(), None);
+        *p.facts.lock() = Some(RunnerFacts { gpus: vec![Gpu::default(); 2], ..RunnerFacts::default() });
+        let base = kiln_ci::sched::state::Resources { cpu: kiln_ci::sched::state::Cpus::whole(8), ..Default::default() };
+        assert_eq!(p.sized(Some(base)).ok_or("expected test value")?.gpu, 2);
+        assert_eq!(p.sized(Some(base)).ok_or("expected test value")?.cpu, base.cpu);
+        let facts = RunnerFacts { runs: vec![kiln_ci::runtime::Observation::default()], ..RunnerFacts::default() };
+        p.remember(&facts);
+        assert_eq!(facts.runs.len(), 1);
+        assert!(p.facts.lock().as_ref().ok_or("expected test value")?.runs.is_empty(), "GPU refreshes must not train the same observation twice");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gpu_publisher_handoff_tests {
+    use super::*;
+
+    #[test]
+    fn w13_r01_gpu_publisher_keeps_a_look_requested_before_its_read() {
+        let p = Probing::default();
+        assert!(p.take_gpu());
+        let looked = p.looks();
+        assert!(!p.take(true));
+        assert_eq!(p.read_kind(looked), (true, true), "the full read must include the pending look, even when the GPU worker started first");
+    }
+
+    #[test]
+    fn w13_r01_gpu_publisher_never_strands_a_request_at_handoff() {
+        use std::sync::{Barrier, atomic::AtomicBool};
+        let p = Probing::default();
+        let barrier = Barrier::new(3);
+        let claimed = AtomicBool::new(false);
+        let continued = AtomicBool::new(false);
+        let rounds = 20_000;
+        let mut wrong = 0;
+        std::thread::scope(|scope| {
+            let (shared, latch, claimed_out, continued_out) = (&p, &barrier, &claimed, &continued);
+            scope.spawn(move || {
+                for _ in 0..rounds {
+                    latch.wait();
+                    claimed_out.store(shared.take(true), Ordering::SeqCst);
+                    latch.wait();
+                }
+            });
+            scope.spawn(move || {
+                for _ in 0..rounds {
+                    latch.wait();
+                    continued_out.store(shared.done().is_some(), Ordering::SeqCst);
+                    latch.wait();
+                }
+            });
+            for _ in 0..rounds {
+                if !p.take(false) { wrong += 1; }
+                let _ = p.read_kind(p.looks());
+                barrier.wait();
+                barrier.wait();
+                if usize::from(claimed.load(Ordering::SeqCst)) + usize::from(continued.load(Ordering::SeqCst)) != 1 { wrong += 1; }
+                // One active read and at most one coalesced request: two finishes drain both.
+                let _ = p.done();
+                let _ = p.done();
+            }
+        });
+        assert_eq!(wrong, 0, "exactly one publisher must own the request after its predecessor finishes");
     }
 }

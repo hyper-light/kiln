@@ -1,6 +1,6 @@
 # The placement kernel
 
-`kiln_ci::lb` decides where a run goes: in O(1), at the node that asks for it (its owner), and
+`kiln_ci::lb` decides where a run goes: in O(1) for plain CPU asks, at the node that asks for it (its owner), and
 admitted by the runner whose room it takes, never past that runner's budget. The place core's
 owner picks through it and its runner keeps its ledger in it; the shell (`crates/kiln`,
 `reach/place.rs` on lb/wire) carries the messages. It serves docs/ci.md W05-R03 (capacity, never
@@ -11,7 +11,7 @@ then most free; a run's expected finish), W05-R26 (speed) and W24-R18 (warm stat
 move, in the expected finish).
 
 Like the rest of kiln-ci it is pure: no clock, disk, network or randomness; integer amounts;
-nothing hashed, and nothing allocated on a decision once its tables have grown to the fleet.
+nothing hashed on a plain CPU decision, and no allocation there once its tables have grown to the fleet. GPU requests use the bounded device-aware walk described below.
 
 ## What it decides
 
@@ -49,6 +49,18 @@ owner is told it).
   every other dimension exactly; when that member is short of what's asked, a walk member by
   member down to the bucket whose range holds the need, so an exact fit there is found (counted:
   `Counts::walked`).
+- **A run that ends, and the pick after it.** The rise of the runner a run just ended on is put
+  off until something reads the buckets. When it is then alone as the most free, the pick goes
+  back to it and neither move is made. When it only ties the most free (the top bucket holds
+  others: the usual pick on a fleet with room to spare), the pick is what the top bucket gives
+  with it counted in: the good place of the kind asked when that is there ("Good places",
+  below), else the bucket's next in turn. That is the runner itself, and again nothing moves
+  (when it is its kind's good place, with nothing looked up either: the move put off carries
+  the kind); or another, which the run leaves where the first was, and the two change places in
+  one write (`Index::swap`), each bucket's count and the bitmap of non-empty buckets untouched.
+  Anything else (a run of another size, a runner in several indexes, orders kept) makes the two
+  moves one after the other. A twin test holds the put-off form to every move made as it comes,
+  pick by pick (W05-R04, W05-R26).
 - **The rank key** is `(view * scale) >> 40`. At the reference speed `scale` is ceil(2^40 / 1000),
   and the key is whole free CPUs, exactly, for every view below 2^32: a multiply and a shift, no
   divide. A runner's measured speed and slowness are folded into its `scale` when its word says
@@ -61,8 +73,12 @@ owner is told it).
   without run times). Every word it sends carries its room and its epoch.
 - **Records:** the owner's record of a runner is 32 bytes, aligned (view, in flight, epoch, ends
   heard, key multiplier, first index, flags, measure count): four to a 128-byte line, none straddling
-  two. A runner's hot fields are its first 128 bytes. An admitted run is 24 bytes (its memory,
-  disk and GPU needs in a side slab when it has any). A run at the owner is 32 bytes.
+  two. A runner's fast fields and eight inline 16-byte admitted records occupy its first 160
+  bytes; overflow records are 24 bytes. Memory, disk and GPU needs use a side slab when needed.
+  An owner's whole run slot is 24 bytes, including its full generation. CPU and signature share
+  one word with the runner handle: CPU/signature remain live through waiting and Go refusal;
+  only Started replaces them with the admitted handle. Wider CPU demand stays exact in Slow
+  until admission. A freed slot reuses its runner field for the free-list link (W05-R23).
 - **Messages** are `Copy` values. A start or an end of CPU alone, for a runner's one owner, takes
   a short path on each side; anything else (memory, disk or GPUs asked, several owners, a line,
   another epoch) takes the general one.
@@ -103,10 +119,12 @@ owner is told it).
   held only when what's left covers it. `Runner::set_budget` and `Owner::set_budget` follow a budget
   that changes: what's free is worked out again from what's held, and runs past a smaller budget run
   on, nothing new admitted until they fit.
-- **Batches.** `ask_many` decides `n` runs of one need in the order one at a time would. For whole
-  CPUs alone on runners whose keys are whole free CPUs, a member of bucket b goes to b - c, so the
-  index alone decides the batch and the members' records are then updated in a pass of
-  independent steps.
+- **Batches.** `ask_many` decides `n` runs of one need and one kind in the order one at a time
+  would. For whole CPUs alone on runners whose keys are whole free CPUs, a member of bucket b
+  goes to b - c, so the index alone decides the batch and the members' records are then updated
+  in a pass of independent steps. After a batch of ends (`ended_batch`), its runs go first, among
+  equals, to the runners that kind's work just went well on, in the order their ends came; every
+  other rise is made first and takes its turn.
 
 ## Rank: expected finish
 
@@ -149,9 +167,15 @@ decides as before. The buckets cover the most core-equivalents any runner's whol
 
 ## Orders
 
-Beside its index each signature keeps, once something is measured, an order by each rate a run's
-finish divides by: the key multiplier, per-core speed over slowness (narrow asks), disk, this
-owner's link, the runner's network (`lb::Order`). A member's class is its rate's place on a log scale: the octave (its top bit) and
+Beside its index each signature can keep an order by each rate a run's finish divides by: the key
+multiplier, per-core speed over slowness (narrow asks), disk, this owner's link, the runner's
+network (`lb::Order`). The first non-reference CPU measurement activates the CPU order once.
+Each byte-rate order is populated from current membership and facts when an ask first needs it;
+that first ask pays its construction cost. Subsequent facts, joins, departures and room changes
+maintain active orders. An unused order has no heap storage, and CPU-only updates do not load the
+separate byte-rate facts. No TTL, eviction threshold or guessed capacity controls these indexes
+(W05-R26). Cold construction and first-use timings are reported separately from warmed throughput
+by the benchmark's `--cold` mode. A member's class is its rate's place on a log scale: the octave (its top bit) and
 the six bits below it, 64 classes an octave, rates in one class within 1/64 of each other; 64
 octaves of a u64 times 64 is BUCKETS, so the highest class is two leading-zeros counts away, as
 the index's top bucket is. Members of a class take turns in a ring through their neighbours:
@@ -249,6 +273,76 @@ another runner too) and are held when it opens again. The place core cordons its
 runner takes no work: draining (an upgrade pending, or `[runner] on_battery`) or under strain.
 Under room tokens a cordon leaves no room to hold, so every token is cut to none and each owner
 that held some is told; the room that comes back is no owner's run's, so the first watcher's.
+
+## Good places
+
+An assignment succeeds when the work lands on the node that lets it complete as quickly, as
+efficiently, as completely and as correctly as it can. What the kernel holds down is the time
+and work of deciding. One rule serves both: **work goes back to where its kind last went well,
+when the rank can't tell that node from the best.** What that kind left there is warm and the
+node has shown it can do the work; and when it is the runner a run just ended on, going back is
+also the decision that takes least: nothing looked up, nothing moved.
+
+- **Kinds.** The shell numbers kinds of work (`KindId`: work whose runs leave a node equipped
+  for the next of them: the same job, the same tree), as it numbers signatures. `Owner::ask_kind`
+  names one. `Owner::ask` names none and is decided as before, through entries compiled apart
+  that carry none of a kind's checks: it takes what it took before there were kinds.
+- **The shell judges, as a run ends and never while deciding.** It has what the four tests
+  need (how long the run took against its history, what it used, whether it ran to its end, a
+  cause it knows when it didn't); the kernel knows nothing of how runs end. Of an end it says one
+  of three things, or nothing:
+  - `Owner::won`: a successful assignment (`Owner::ended_won` hears the end and says it in one).
+    A run that failed for its own sake, a test that fails anywhere, was assigned well.
+  - `Owner::failed`: the node let the work down, by a cause the shell knows (lost, killed for
+    memory, out of room, a tool missing).
+  - `Owner::unsure`: it failed and no cause is known.
+- **What the owner keeps** of a kind is twelve bytes: the runner its work last went well on (its
+  good place), the runner that last let it down, and whether a doubt is open.
+- **The pick** of a kind's run: its good place, when that runner is among the best by rank (in
+  the top bucket, with the room; on measured runners, in the narrow order's highest class with a
+  core free), and no turn moves for it; else the next in turn, passing over the runner that let
+  it down when another is as free. The rank decides first. A good place that is less free isn't
+  gone back to, nor one whose cores have measured slower since (heat, a power limit: its word
+  says a lower speed, above), though its last run went well.
+- **A failure no one can explain is settled by comparison,** with no rate, count or timer. The
+  kind's next run goes elsewhere once. If it goes well there, the first runner was at fault and
+  stays passed over. If it fails there too, the work was: nothing is held against either runner,
+  the kind stays where it now is, and its further failures are its own until a run of it goes
+  well. So work that fails for its own sake moves once and then keeps its place (and its warm
+  state), and a node that fails work that passes elsewhere loses it at its first failure.
+- **It moves no load.** The pick goes to one of the most free either way; only which of equals
+  differs. With every run said to have gone well and with nothing said, a fleet is as full step
+  by step (as many runners hold each number of runs). What differs is where: 64 runners of eight
+  cores, one kind, a run ending and another asked at each step (`cargo test -p kiln-ci
+  lb::tests::w05_r04_a_good_place_moves_no_load -- --nocapture`):
+
+  | Runs in flight | Runners given runs, taking turns | Going back to where it went well |
+  |---|---|---|
+  | 1 | 64 | 1 |
+  | 4 | 64 | 4 |
+  | 16 | 64 | 16 |
+  | 32 | 64 | 32 |
+  | 64 and more | 64 | 64 |
+
+  A kind's work stays on as many runners as it has runs in flight; taking turns takes it round
+  every runner, each cold for it.
+- **A runner that lets a kind down doesn't keep it.** One that went well and then goes bad
+  loses the kind at its first let-down and isn't given it again while another is as free. One
+  that never went well gets the kind's work only while the kind is looking for a place: once,
+  when the shell can tell a node's fault from the work's own. When it can't, and says of a share
+  q of the other runners' runs that they were let down, the kind stays 1 / q runs on each of them
+  (the mean of a geometric count) and the failing runner gets one run a round: q / (q + n - 1) of
+  the runs on n runners, against 1 / n taking turns. That is staying on a winner (Robbins, "Some
+  aspects of the sequential design of experiments", Bull. AMS 58(5), 1952) as Zelen's play the
+  winner rule counts it ("Play the winner rule and the controlled clinical trial", JASA 64(325),
+  1969: for two, q_B / (q_A + q_B)); a test holds the share to it within 5% over 200,000 runs,
+  for 2, 3, 10 and 64 runners. The comparison above is why the shell seldom has to say it of a
+  healthy runner.
+
+What the rule doesn't reach: an ask with terms (`ask_with`) ranks by its own finish, where the
+shell's warm list already says what a runner saves; a shared owner's draw (`set_spread`) spreads
+first; and a node that is the best by rank and fails every run is still picked when no other is
+as free or as fast, since the rank knows speed and room, not failure.
 
 ## Several owners
 
@@ -620,7 +714,17 @@ DropDeclined, NoFence, NoGeneration, NoHint and Unordered; unit tests catch NoDe
 starts herding), NoKeep (the first in line starves), NoTurn (equals don't take turns) and
 MostLoaded. The model also drives askers giving up and room taken outside the ledger, and in half
 its seeds runners that measure their speed, slowness, disk and network and owners that measure
-their links.
+their links; its asks are of three kinds of work and of none, and of each end an owner hears its
+shell says that it went well, that its runner let it down, that no one can say, or nothing.
+
+Good places (`lb::tests`, each with its planted bug): a kind's work goes back to where it went
+well, another kind's and work of no kind don't take that place (NoStay, NoTurn); a runner that
+lets a kind down doesn't keep it, and a failure no one can explain is settled by comparison
+(StaysOnALoser: what the shell says against a runner is dropped); a good place holds only among
+cores as fast; it moves no load. The twin test runs two owners over twin fleets through the same
+ends, the same words of their shell and the same picks, of three kinds and of none, one putting
+moves off and one making every move as it comes, and holds them to the same pick, the same
+picks to come and the same views at each of 32,000 steps on fleets of 2 to 257 runners.
 
 The plain path on measured runners (`w05_r26_plain_asks_on_measured_runners_take_the_fast_path`):
 4,000 random fleets of 2 to 8 runners, speed and slowness measured, then measured again (every key
@@ -791,3 +895,91 @@ without admission oversubscribe (static-rr 372 picks onto full backends in this 
   still passes each runner's word on to every owner (owners that hear hints, and its own kernel,
   need it), and an owner that hears tokens drops it. Cutting that fan-out needs the server to know
   which owners hear tokens from which runners.
+
+## GPU fit and load (W05-R03, W05-R22, W05-R23, W13-R01)
+
+GPU asks use Hex's per-device fit and dominant-load rule, ported from the fixed source
+`37021c35e64b2a8bab1d35f20f92a0042d874a44`: `hex-sim/src/model.rs`'s `matches`/`bind`
+and `hex-sim/src/index.rs`'s `gpu_busy`/`gpu_idle`. The kiln adaptation is
+`sched/gpu.rs`, used by CI's scheduler, the place owner's kernel start and offer comparison,
+and the receiving runner's admission, plus directory ranking and the pre-placement fallback. The same facts serve commands, MCP runs and sessions.
+
+For `gpus=2,gpu.model==A100,gpu.memory.free>=16Gi`, two cards must each meet both predicates.
+A model on one card and enough memory on a different card do not suffice. Boolean constraints
+retain their meaning and host facts (OS, labels, GPU count) retain their host scope. `gpu.memory` and `gpu.memory.free` constrain each card's free memory for GPU reservations,
+as Hex does; `gpu.memory.total` constrains its hardware total. Without `gpus=N`, the existing
+`gpu.memory` fact still describes the largest hardware total. GPU model
+names also accept Hex's whitespace-joined spelling, e.g. `NVIDIA-A100`.
+
+Hex's `bind` first chooses compatible cards by utilization, then used memory, then inventory
+position. It then scores those selected cards by the sum of their idle dominant shares: the
+greater of utilization and used-memory share, in millionths (DRF, Ghodsi et al., NSDI 2011).
+Sorting the cards directly by dominant pressure would be a different policy. GPU rank precedes
+CPU headroom; explicit CI preferences still apply first. Counters stay independently optional
+in the facts. Hex's later quality fix (`b5b67b383e3cb2746efa330687fdd911275b5d6c`) is retained:
+a card with a missing memory or compute reading, or an invalid utilization, cannot satisfy a
+fresh GPU reservation and earns no idle credit. Known zero remains idle; unread free memory
+is not fabricated. A later valid observation can make a queued ask fit, and CPU-only work still
+proceeds. Count-only peers without a device inventory retain their declared-count compatibility, but earn
+no measured idle credit and cannot satisfy per-card predicates or supply concrete binding IDs.
+There is no separate kiln GPU prior. All four reservation dimensions
+are still checked and deducted by the existing ledger. Equal GPU ranks first compare measured per-core speed under contention, then retain CPU room
+and the bucket cursor. Only GPU asks pay for the full bounded candidate walk. GPU bids in an
+optional auction take this same individual path.
+
+Reservations remain node-level GPU counts. In a mixed-device node, availability is conservative:
+already-held count is removed from the compatible pool, since no physical assignment is known.
+This may wait despite spare cards. Kiln does not set CUDA visibility, create CDI attachments,
+pass through VFIO devices or recover per-device runtime assignments. Hex's generic live Runtime
+path still refused device-bearing asks at the source pin; its ongoing device recovery/attachment
+work is not imported here.
+
+For a local executor pool, declare its GPU count in the pool's resources. Each warm executor
+reserves that count when it starts, in slot mode as well as resource mode. A GPU leg must fit
+the selected executor's reservation; its original GPU request and per-card predicates are
+retained for that check. The grant credits its own executor's reservation once, leaving the
+other warm executors' GPUs held. Ordinary gang siblings share the remaining host capacity.
+A hosted pool's pod instead needs its own runner to report enough GPU capacity before a grant.
+These admission checks do not establish physical attachment or device isolation.
+
+`crates/kiln-gpu` is Hex's retained provider, updated at fixed source
+`c2da38cc363e7d53f6df8fb82ab7bbda5e2f1efe`; `ORIGIN.md` and `HEX-SOURCE.json` retain provenance.
+It opens NVIDIA NVML, Linux AMD amdgpu counters and Windows AMD ADL once, then samples through
+retained handles, file descriptors and contexts. Apple Silicon uses native Metal identity and
+working-set budgets, exact-entry IOKit mapped allocations and IOReport GPU residency. The full
+Metal registry ID survives in the optional facts ID; it is scoped to the host boot. Apple's memory
+budget is not dedicated VRAM or host RAM, and observed allocations may exceed it. Missing or
+ambiguous counters remain unknown. Sampling starts no subprocess or periodic worker. Linux/Windows
+samples retain their allocation-free contract; Apple's native snapshots may allocate.
+No installed driver is redistributed or replaced.
+
+The same vendored libraries and recorded changes are built from kiln's tree:
+
+- NVIDIA `cuda-rust` `a0a4dc78a20e06ec90827f597e950bdc49f723e2`: adapted runtime loader.
+- `all-smi` `fe479ae675e39475a2eab1cfbb3f5432f705e12b`: adapted amdgpu counter reader and AMD ADL types/sensors.
+
+Their licenses, `UPSTREAM.md` files and patches travel with them. `scripts/vendor.py check
+cuda-rust all-smi` verifies both. Native FFI remains in the retained NVML/ADL `sys.rs` modules and the ported
+Apple `sys.rs`; scheduling contains none. Hex's original rationale and primary sources are retained in
+[gpu-telemetry-origin.md](gpu-telemetry-origin.md).
+
+One retained facts value and one coalescing publisher handle full inventory probes and GPU-only
+refreshes. GPU hosts refresh on workload start/end through the existing recorder, without a
+periodic timer. Local placement receives facts directly; remote owners receive the existing
+optional JSON facts fields through the directory. Host CPU/memory samples do not erase GPU
+inventory. A full probe requested during GPU I/O is retained for the same publisher's next read.
+On known GPU hosts, external load changes are observed at the next facts/workload event; a newly installed GPU or driver is discovered by the next full inventory probe.
+
+Two other Hex fixes are ported: interleaved bucket offsets and the cursor's rounded fleet width
+use widened arithmetic; reservation-size parsing uses checked integer bytes, refusing overflow
+and fractional bytes instead of rounding through `f64`. Sources are Hex's `lb/index.rs` and
+`needs.rs` at the pin above. Packing and box-runtime recovery changes are specific to Hex's
+long-lived boxes; kiln retains its expected-finish placement and existing session recovery.
+
+The follow-up is explicitly gated on Hex's completed **durable GPU bindings, actual runtime
+attachment and validation of that combined path** (Ada, 2026-11-10). Bring over the accepted
+pinned changes and their recovery/attachment evidence together, including the load-swap/reboot
+case, exact selected-identity persistence before launch, lost/duplicate attachment controls and
+native platform validation. The current port carries neither an independent attachment design
+nor a claim that this unfinished path is proven. Hex has been asked to provide the ready SHA and
+combined validation; until then the existing count ledger remains authoritative and conservative.

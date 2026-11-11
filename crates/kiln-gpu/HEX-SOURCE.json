@@ -1,0 +1,73 @@
+{
+  "source": "c2da38cc363e7d53f6df8fb82ab7bbda5e2f1efe",
+  "scope": "native provider source only; same Apple identity/counters, no runtime attachment import",
+  "byte_identical_source_files": [
+    {
+      "hex": "crates/hex-gpu/src/adl.rs",
+      "kiln": "crates/kiln-gpu/src/adl.rs",
+      "sha256": "91141395a50bcf42dbc4d2ec88099f50f1c774b0cf4d438469c4f39c515a3915"
+    },
+    {
+      "hex": "crates/hex-gpu/src/adl/sys.rs",
+      "kiln": "crates/kiln-gpu/src/adl/sys.rs",
+      "sha256": "f84ace5f5b202862a53cea8bb3d89e929688aa8cb3ec918b446726db532a6375"
+    },
+    {
+      "hex": "crates/hex-gpu/src/adl/tests.rs",
+      "kiln": "crates/kiln-gpu/src/adl/tests.rs",
+      "sha256": "34e7b38b6f053513f1adb9b8057aa2ef1550efb17baa62977c470d80776f3e72"
+    },
+    {
+      "hex": "crates/hex-gpu/src/amd.rs",
+      "kiln": "crates/kiln-gpu/src/amd.rs",
+      "sha256": "0e0c45d6ab9246a27bfac271e1903917f5d5a8a82eade1329a0a6c649547faf3"
+    },
+    {
+      "hex": "crates/hex-gpu/src/amd/tests.rs",
+      "kiln": "crates/kiln-gpu/src/amd/tests.rs",
+      "sha256": "a5586389639035096899efafc39daddfa480b2424d2ea34cfea1335fd423ba51"
+    },
+    {
+      "hex": "crates/hex-gpu/src/apple.rs",
+      "kiln": "crates/kiln-gpu/src/apple.rs",
+      "sha256": "2cecf73c90d287df65fe06011bfc1db6d1687516d147b24548e2ae08c277a72f"
+    },
+    {
+      "hex": "crates/hex-gpu/src/apple/LICENSE.all-smi",
+      "kiln": "crates/kiln-gpu/src/apple/LICENSE.all-smi",
+      "sha256": "4a9d4c87968eec9fe3b13fefe0d482ed09909875951a416704c5c9ac8c692bb5"
+    },
+    {
+      "hex": "crates/hex-gpu/src/apple/sys.rs",
+      "kiln": "crates/kiln-gpu/src/apple/sys.rs",
+      "sha256": "18380524e95aa91d0446c9b32df070b66d729c0cf053573ab56adfe0f1ef116f"
+    },
+    {
+      "hex": "crates/hex-gpu/src/lib.rs",
+      "kiln": "crates/kiln-gpu/src/lib.rs",
+      "sha256": "334fb4601fb429161fdcf5e2f7df729bb03c785ba82bbfb43c04de0f238bbbb2"
+    },
+    {
+      "hex": "crates/hex-gpu/src/nvml.rs",
+      "kiln": "crates/kiln-gpu/src/nvml.rs",
+      "sha256": "ec65e2dabd57cfbc2fd47b0ed4035f88a7353558c8f3f9947a82c9abe33a5753"
+    },
+    {
+      "hex": "crates/hex-gpu/src/nvml/sys.rs",
+      "kiln": "crates/kiln-gpu/src/nvml/sys.rs",
+      "sha256": "b3ec00988390e21c1984d3d180b6b3c841bcfdb830f7432909d7101026af2cfe"
+    },
+    {
+      "hex": "crates/hex-gpu/src/nvml/tests.rs",
+      "kiln": "crates/kiln-gpu/src/nvml/tests.rs",
+      "sha256": "f1018898e137bc279320e654e56786724b91061d1b4c3798ba8552a64c21f5ba"
+    },
+    {
+      "hex": "crates/hex-gpu/src/tests.rs",
+      "kiln": "crates/kiln-gpu/src/tests.rs",
+      "sha256": "2616fc947c26eb785ecb1e5612f672334f361919e6c171b39d0df04ca4c0b617"
+    }
+  ],
+  "hardware_fixture_adaptation": "hex_gpu crate imports renamed kiln_gpu",
+  "upstream_light_evidence": "Hex0e625a45 r40:18 pure passes, native all-target clippy0; own native validation required"
+}

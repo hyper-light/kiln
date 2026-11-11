@@ -100,8 +100,9 @@ pub struct RunnerCounts {
     pub held: u64,
 }
 
-/// A runner's ledger. Everything a start, an end or a word reads comes first, together
-/// (`repr(C)`), in its first 128 bytes (one cache line of Apple silicon's, two of x86's).
+/// A runner's ledger. Its fast metadata and eight inline admitted records come first,
+/// together (`repr(C)`), in 160 bytes: the first six records share the metadata's 128-byte
+/// Apple silicon line, with the remaining two afterward (three 64-byte x86 lines in all).
 #[derive(Debug, Clone)]
 #[repr(C, align(64))]
 pub struct Runner {

@@ -1620,8 +1620,8 @@ fn ask_as(dir: &Path, runner: &str, id: &str, name: &str, input: Value) -> anyho
 }
 
 /// A runner `name` connected to the server at `port`, its own identity certified, with a session
-/// open on it whose acts are signed (its identity at its first epoch certified): the runner and
-/// the session.
+/// open on it whose acts are signed (its identity at its first epoch certified, and its
+/// certificate kept by the runner process: [`kept`]): the runner and the session.
 fn signing_session(dir: &Path, port: u16, admin: &str, name: &str, chaos: Option<&str>) -> anyhow::Result<(agents::Runner, String)> {
     let (r, log) = agents::runner_with(dir, port, name, chaos, TALK, &[])?;
     agents::connected(port, admin, name, &log, Duration::from_secs(120))?;
@@ -1634,8 +1634,25 @@ fn signing_session(dir: &Path, port: u16, admin: &str, name: &str, chaos: Option
         Ok(v.get("identities").and_then(Value::as_array).is_some_and(|l| l.iter().any(|i| field(i, "subject").contains(&mark) && !field(i, "verified").is_empty())).then_some(()))
     })?;
     let id = agents::open_session(port, admin, name, &dir.join("work-here"), Duration::from_secs(60))?;
-    first_epoch(port, admin, &id)?;
+    let epoch = first_epoch(port, admin, &id)?;
+    kept(&log, &id, epoch)?;
     Ok((r, id))
+}
+
+/// Until the runner process whose log is `log` keeps session `id`'s certificate at `epoch` (it
+/// logs `identity certified`): only from then does it sign the session's acts. kiln lists the
+/// identity as soon as it certifies it, while its certificate is still on its way to that process
+/// (written and waited for on its disk first), and an act the process sends in between goes
+/// unsigned and is refused (W27-R08): what [`first_epoch`] alone let a loaded machine's test meet.
+fn kept(log: &Path, id: &str, epoch: u64) -> anyhow::Result<()> {
+    let mark = format!("/agent/{id}/epoch/{epoch}");
+    until(Duration::from_secs(60), || {
+        let said = std::fs::read_to_string(log)?;
+        // Its epoch whole: `…/epoch/1` isn't `…/epoch/10`.
+        let certified = |l: &str| l.contains("identity certified") && l.split_once(mark.as_str()).is_some_and(|(_, rest)| !rest.starts_with(|c: char| c.is_ascii_digit()));
+        Ok(said.lines().any(certified).then_some(()))
+    })
+    .map_err(|e| anyhow::anyhow!("session {id}'s certificate at epoch {epoch} wasn't kept by its runner process: {e}"))
 }
 
 /// W27-R08's relays (the Transfers plan's step 13): a runner relays its agent's calls to kiln. Each

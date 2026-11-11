@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use kiln_ci::facts::RunnerFacts;
 use kiln_ci::place::answer::Answer;
 use kiln_ci::place::ask::{Ask, Peer, Sample};
-use kiln_ci::place::msg::{ToOwner, ToRunner};
+use kiln_ci::place::msg::{How, ToOwner, ToRunner};
 use kiln_ci::place::owner::{Act, Kept, Machine, Owner, Size};
 use kiln_ci::place::runner::{Admission, Init, Record, Records, Settings, Start};
 use kiln_seams::records::{Scan, TX_MAX, Tx, Write};
@@ -608,6 +608,28 @@ pub fn sample_of_measure(m: &crate::sense::Measure, last: Option<&crate::sense::
 /// every run works in the work volume, so a full one, or its device's errors rising, bars all
 /// work; a run of its kind killed for memory here, or missing a tool here, bars it whatever it
 /// asks; memory and tools as asked bar the rest.
+/// How a run that exited here ended, as this runner judges it when it ends (docs/lb.md "Good
+/// places"), from its exit alone (`code`; `error`: it couldn't start, or `timed_out`, its own
+/// limit ran out). It went well when it exited 0. The node let it down when it couldn't start
+/// here, or exited as a shell does of a program that isn't here (`sense::health::classify`'s
+/// missing tool). Any other failure has no cause this runner knows from its exit: the node's
+/// fault or the work's own, which its owner settles by where its kind's next run goes and what
+/// becomes of it. A run a signal ended (its asker stopped it, as far as an exit says) is judged
+/// by no one.
+pub fn how(code: Option<i32>, error: Option<&str>, timed_out: bool) -> How {
+    use crate::sense::health::{Ending, Failure, classify};
+    match (code, error) {
+        (_, Some(_)) if timed_out => How::Unsure,
+        (_, Some(_)) => How::LetDown,
+        (Some(0), None) => How::Well,
+        (Some(c), None) => match classify(&Ending { exit_code: Some(c), ..Ending::default() }) {
+            Some(Failure::MissingTool { .. }) => How::LetDown,
+            _ => How::Unsure,
+        },
+        (None, None) => How::Unsaid,
+    }
+}
+
 fn barred(ask: &Ask, key: Option<String>, m: &crate::sense::Measure) -> Option<crate::sense::health::Refusal> {
     let tools = ask.needs.requires.iter().filter_map(|r| r.strip_prefix("tools has ")).map(|t| t.trim_matches(|c| c == '\'' || c == '"').to_owned()).collect();
     let a = crate::sense::health::Ask { key, disk: ask.needs.request.disk.max(1), mem: ask.needs.request.mem, tools };
@@ -631,7 +653,7 @@ pub fn sample_of(s: &crate::metrics::HostSample) -> Sample {
 /// and whether it places.
 pub fn machine_of(r: &RunnerInfo) -> Machine {
     let facts = r.facts.as_deref().cloned().unwrap_or_else(|| RunnerFacts { os: r.os.clone(), arch: r.arch.clone(), ..RunnerFacts::default() });
-    let size = Size { cpu: (r.cpus > 0).then(|| Cpus::whole(u64::from(r.cpus))), mem: (r.mem_total > 0).then_some(r.mem_total), disk: None, gpu: None };
+    let size = Size { cpu: (r.cpus > 0).then(|| Cpus::whole(u64::from(r.cpus))), mem: (r.mem_total > 0).then_some(r.mem_total), disk: None, gpu: r.facts.as_ref().map(|f| u32::try_from(f.gpus.len()).unwrap_or(u32::MAX)) };
     Machine { name: r.name.clone(), facts, labels: r.labels.clone(), size, epoch: 0, connected: r.connected && r.reach, places: feature::speaks(&r.features, feature::PLACE), idle: None, syncs: feature::speaks(&r.features, feature::PLACE_SYNC), fast: feature::speaks(&r.features, feature::FAST) }
 }
 
@@ -828,7 +850,8 @@ impl Placer {
     }
 
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
-    pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
+    pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, mut sample: Sample, settings: Settings, now: i64) -> Placer {
+        sample.size.gpu = u32::try_from(facts.gpus.len()).unwrap_or(u32::MAX);
         // Its owner decides by its node's settings too (`[reach] learned_weights`, `auction`; LB08).
         let mut owner = Owner::seeded(me, epoch, rand::random());
         owner.configure(&settings);
@@ -857,6 +880,7 @@ impl Placer {
         let window = sensor.strain().cloned();
         let mut sample = sample_of_measure(&m, self.last.as_ref());
         sample.pace = self.pace;
+        sample.size.gpu = u32::try_from(self.facts.gpus.len()).unwrap_or(u32::MAX);
         // What each placed run here uses, from its own group, in the same moment.
         sample.runs = self.groups.iter_mut().map(|((owner, epoch, run), h)| kiln_ci::place::ask::RunUse { owner: owner.clone(), epoch: *epoch, run: run.clone(), used: group_use(h) }).collect();
         self.admission.measured(sample, now, said);
@@ -1288,15 +1312,38 @@ impl Placer {
 
     /// A run started here for `peer` (spec `id`) ended.
     pub fn ended(&mut self, peer: &str, id: u64, ok: bool, now: i64) -> Vec<Out> {
+        self.ended_as(peer, id, ok, How::Unsaid, now)
+    }
+
+    /// [`Self::ended`], with this runner's judgment of how the run ended ([`how`]): what its
+    /// owner's kernel is told of the assignment (docs/lb.md "Good places").
+    pub fn ended_as(&mut self, peer: &str, id: u64, ok: bool, how: How, now: i64) -> Vec<Out> {
         let Some((epoch, run)) = self.started.remove(&(peer.to_owned(), id)) else { return Vec::new() };
         self.ungrouped(peer, epoch, &run);
         let mut said = Vec::new();
-        self.admission.ended(Peer { name: peer, epoch }, &run, ok, now, &mut said);
+        self.admission.ended_as(Peer { name: peer, epoch }, &run, ok, how, now, &mut said);
         let mut out = self.said(said, now);
         // Its end to its claimant, or handed off if its owner can't be reached; the room it freed
         // may be what a waiting run of such an owner needs (LB03).
         out.extend(self.hand_ended(peer, epoch, &run, now));
         out.extend(self.hand_room(now));
+        out
+    }
+
+    /// W13-R01: local facts go straight to admission, preserving the room ledger.
+    pub fn refreshed(&mut self, facts: RunnerFacts, now: i64) -> Vec<Out> {
+        if facts == self.facts { return Vec::new(); }
+        self.facts = facts;
+        let mut said = Vec::new();
+        self.admission.refreshed(self.facts.clone(), self.labels.clone(), now, &mut said);
+        let mut out = self.said(said, now);
+        if let Some(me) = self.machines.iter_mut().find(|m| m.name == self.me) {
+            me.facts = self.facts.clone();
+            me.size.gpu = Some(u32::try_from(self.admission.cap()[3]).unwrap_or(u32::MAX));
+        }
+        let mut acts = self.owner.machines(self.machines.clone());
+        acts.extend(self.owner.reask(now));
+        out.extend(self.acts(acts, now));
         out
     }
 
@@ -1323,7 +1370,8 @@ impl Placer {
 
     /// A reading of this machine: the room it admits against; where it measures itself, a measure
     /// due once this input is done (the reading's figures aren't taken).
-    pub fn measured(&mut self, sample: Sample, now: i64) -> Vec<Out> {
+    pub fn measured(&mut self, mut sample: Sample, now: i64) -> Vec<Out> {
+        sample.size.gpu = u32::try_from(self.facts.gpus.len()).unwrap_or(u32::MAX);
         let mut said = Vec::new();
         if self.sensor.is_some() {
             self.machine_changed();
@@ -2380,5 +2428,20 @@ mod topo_tests {
         let hint: crate::offers::hint::Hint = serde_json::from_str(&json)?;
         anyhow::ensure!(hint.topo == Some(word(900_000)), "{:?}", hint.topo);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hex_gpu_port_tests {
+    use super::*;
+    #[test]
+    fn w13_r01_gpu_inventory_survives_host_samples_and_changes_on_local_facts() {
+        let facts = RunnerFacts { gpus: vec![kiln_ci::facts::Gpu { model: "A100".into(), memory: 80 << 30, ..Default::default() }; 2], ..RunnerFacts::default() };
+        let mut p = Placer::new("gpu-node", 1, facts, Vec::new(), Sample::default(), Settings::default(), 0);
+        assert_eq!(p.admission.cap()[3], 2);
+        p.measured(Sample::default(), 1);
+        assert_eq!(p.admission.cap()[3], 2);
+        p.refreshed(RunnerFacts::default(), 2);
+        assert_eq!(p.admission.cap()[3], 0);
     }
 }

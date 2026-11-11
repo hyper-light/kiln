@@ -84,6 +84,7 @@ pub struct RunnerSettings {
 /// tokens = true            # owners told what they hold here, each its own
 /// learned_weights = true   # probes drawn by learned wait weights
 /// auction = true           # runs arriving together placed by the auction
+/// good_places = true       # a run goes back to where its kind of work last went well
 /// ```
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -129,6 +130,14 @@ pub struct Reach {
     /// free going back to it; the others hear this runner's hints, as before. Off until declared.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub tokens: bool,
+    /// A run the placement kernel places goes back to the runner its kind of work (the same
+    /// command, leg or session) last went well on, when that runner is as free and its cores as
+    /// fast as any, and past the runner that last let that kind down (docs/lb.md "Good places";
+    /// W05-R04, W05-R23). What it left there is warm, and going back is the decision that takes
+    /// least. A run's answer says when that was why it went there. Off until declared: among
+    /// equals runs take turns, as before.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub good_places: bool,
 }
 
 fn is_one(x: &f64) -> bool {
@@ -137,7 +146,7 @@ fn is_one(x: &f64) -> bool {
 
 impl Default for Reach {
     fn default() -> Self {
-        Reach { sizes: kiln_ci::sizes::Source::default(), retry_oom: false, learned_weights: false, auction: false, overcommit_cpu: 1.0, backfill: false, predicted_order: None, tokens: false }
+        Reach { sizes: kiln_ci::sizes::Source::default(), retry_oom: false, learned_weights: false, auction: false, overcommit_cpu: 1.0, backfill: false, predicted_order: None, tokens: false, good_places: false }
     }
 }
 
@@ -165,6 +174,7 @@ impl Reach {
             tokens: self.tokens,
             learned_weights: self.learned_weights,
             auction: self.auction,
+            good_places: self.good_places,
             // The rest kiln's own.
             ..kiln_ci::place::runner::Settings::default()
         })
