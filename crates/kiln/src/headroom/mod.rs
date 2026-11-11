@@ -655,6 +655,12 @@ fn run(ctx: Ctx, mut settings: Settings) {
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn w20_r01_an_anonymous_protocol_core_never_joins_runner_admission() {
+        assert!(admit("", Class::Agent));
+        assert!(!held(""), "an anonymous core has no runner session to wait for");
+    }
+
     pub(crate) struct Admission {
         session: String,
     }

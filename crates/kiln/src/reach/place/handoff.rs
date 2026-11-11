@@ -670,3 +670,33 @@ impl Placer {
 fn hand_asker(ask: &Ask) -> Option<crate::reach::told::Answers> {
     ask.asker.as_deref().and_then(|s| serde_json::from_str(s).ok())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kiln_ci::place::ask::Sample;
+    use kiln_ci::place::msg::ToOwner;
+    use kiln_ci::place::runner::{Settings, Start};
+    use kiln_ci::sched::state::Cpus;
+
+    #[test]
+    fn w05_r25_an_ended_run_adopted_by_its_own_runner_tells_its_agent_once() -> anyhow::Result<()> {
+        let sample = Sample { size: Resources { cpu: Cpus::whole(8), mem: 16 << 30, disk: 100 << 30, gpu: 0 }, ..Sample::default() };
+        let mut p = Placer::new("linux", 1, kiln_ci::facts::RunnerFacts::default(), Vec::new(), sample, Settings::default(), 0);
+        let req = crate::reach::local::RunReq { asker: Some("handoff-self".into()), detach: true, command: "echo ran".into(), ..Default::default() };
+        let answers = crate::reach::told::Answers::of(&req, "r1").ok_or_else(|| anyhow::anyhow!("a detached agent run has an asker"))?;
+        let ask = Ask { run: "r1".into(), asker: Some(serde_json::to_string(&answers)?), ..Ask::default() };
+        let mac = Peer { name: "mac", epoch: 1 };
+        let mut said = Vec::new();
+        p.admission.probe(mac, ask, None, 0, &mut said);
+        let fence = said.iter().find_map(|(_, m)| match m { ToOwner::Offer { fence, .. } => Some(*fence), _ => None }).ok_or_else(|| anyhow::anyhow!("the runner didn't offer room"))?;
+        anyhow::ensure!(p.admission.start(mac, "r1", fence, 1, &mut said) == Some(Start::New));
+        p.admission.ended(mac, "r1", true, 2, &mut said);
+        let held = p.admission.holding(mac, "r1").ok_or_else(|| anyhow::anyhow!("the runner lost its completed run"))?;
+        let out = p.hand_adopt(None, Handle::new("mac", 1, "r1"), vec!["linux".into()], Some(("linux".into(), held)), None, Some("mac".into()), 3);
+        let news: Vec<&Answer> = out.iter().filter_map(|o| match o { Out::Told { answer, .. } => Some(answer), _ => None }).collect();
+        anyhow::ensure!(matches!(news.as_slice(), [Answer::Started { .. }, Answer::Ended { ok: true, .. }]), "the start, then its one successful end: {out:?}");
+        anyhow::ensure!(p.admission.records().is_empty(), "its end was acknowledged: {:?}", p.admission.records());
+        Ok(())
+    }
+}

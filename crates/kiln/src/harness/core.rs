@@ -567,6 +567,9 @@ pub fn run_tag() -> String {
 pub struct Core {
     /// The agent session it is (kiln's id): headroom holds and lets in work by it.
     pub session_id: String,
+    /// W20-R01: this Codex process acknowledged its session-local installed skill roots.
+    /// Ephemeral: an adopted/older process safely receives portable instructions until acknowledged.
+    pub installed_skill_roots: bool,
     pub state: State,
     /// mc_attention (01a199e1b177752e84dad5dc990e6a15): Reach owns these
     /// lifecycles. A provider's task inventory or exit cannot end them.
@@ -668,6 +671,7 @@ impl Core {
     pub fn new() -> Self {
         Self {
             session_id: String::new(),
+            installed_skill_roots: false,
             state: State::default(),
             owned_reach: HashMap::new(),
             meta: Meta::default(),

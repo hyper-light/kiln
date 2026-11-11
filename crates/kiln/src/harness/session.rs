@@ -1587,6 +1587,15 @@ async fn flush(s: &Session, sink: &Sink, stdin: Option<&crate::memory::queue::Se
         (u, core.take_writes(), std::mem::take(&mut core.previews), core.take_change_jobs())
     };
     if let Some(stdin) = stdin {
+        // W20-R01: bridge the current scoped skills at actual delivery, after queueing/holds.
+        // The blocking pool reads files; adapters and the runtime shard do no filesystem work.
+        let protocol = Kind::get(&s.info.lock().kind).map(|kind| kind.protocol);
+        let writes = if let Some(protocol) = protocol.filter(|p| crate::skills::bridge::needed(*p, &writes)) {
+            let folder = crate::skills::place::root().join("sessions").join(&s.id);
+            let pending = writes.clone();
+            let native = s.core.lock().installed_skill_roots;
+            crate::rt::blocking(move || crate::skills::bridge::deliver(&folder, protocol, native, pending)).await.unwrap_or(writes)
+        } else { writes };
         for w in writes {
             let mut line = w.into_bytes();
             line.push(b'\n');
@@ -4512,6 +4521,36 @@ mod tests {
 
     fn message(id: &str, text: &str) -> Command {
         Command::Send { id: id.into(), text: text.into(), mode: super::super::model::SendMode::Now, attachments: Vec::new(), overrides: None, reply_to: None, task: None }
+    }
+
+    #[test]
+    fn w20_r01_driver_delivers_installed_skills_and_revokes_them() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let sessions = crate::skills::place::root().join("sessions");
+            std::fs::create_dir_all(&sessions)?;
+            let folder = tempfile::tempdir_in(&sessions)?;
+            let id = folder.path().file_name().ok_or_else(|| anyhow::anyhow!("no session folder"))?.to_string_lossy().into_owned();
+            let skill = folder.path().join("tools/skills/audit");
+            std::fs::create_dir_all(&skill)?;
+            std::fs::write(skill.join("SKILL.md"), "---\nname: audit\ndescription: Audit a diff.\n---\nCheck the invariants.")?;
+            let (s, _) = idle(&id);
+            s.info.lock().kind = "devin".into();
+            let (sink, _) = async_channel::unbounded();
+            let sink: Sink = sink.into();
+            let (stdin, delivered) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+            let prompt = serde_json::json!({"id": 9, "method":"session/prompt", "params":{"sessionId":"native", "prompt":[{"type":"text", "text":"/tools:audit the diff"}]}});
+            s.core.lock().write(&prompt);
+            flush(&s, &sink, Some(&stdin)).await;
+            let line: serde_json::Value = serde_json::from_slice(&delivered.recv().await?)?;
+            anyhow::ensure!(line.get("id") == Some(&serde_json::json!(9)));
+            anyhow::ensure!(line.to_string().contains("Check the invariants."), "the actual driver omitted the selected instructions");
+            std::fs::remove_dir_all(folder.path().join("tools"))?;
+            s.core.lock().write(&prompt);
+            flush(&s, &sink, Some(&stdin)).await;
+            let line: serde_json::Value = serde_json::from_slice(&delivered.recv().await?)?;
+            anyhow::ensure!(!line.to_string().contains("Check the invariants."), "removal left old instructions in a later delivery");
+            Ok(())
+        })
     }
 
     #[test]

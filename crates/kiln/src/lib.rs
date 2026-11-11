@@ -98,6 +98,7 @@ pub mod shard_health;
 #[cfg(test)]
 mod sim;
 pub mod skew;
+pub mod skills;
 pub mod store;
 pub mod sync;
 pub mod sup;

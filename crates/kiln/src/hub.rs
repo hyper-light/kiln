@@ -3611,7 +3611,18 @@ impl Hub {
                 }
             }
             // The features it speaks by name: each says them all, superseding the last.
-            AgentMsg::Features { names } => self.instances.update(|i| i.set_features(peer, names.clone())),
+            AgentMsg::Features { names } => {
+                let skills = proto::feature::speaks(&names, crate::skills::FEATURE);
+                self.instances.update(|i| i.set_features(peer, names.clone()));
+                // One that installs skills is told what it lays out (docs/agents.md, "Skills kiln installs").
+                if skills {
+                    let hub = Arc::clone(self);
+                    crate::rt::spawn(async move { crate::skills::sync(&hub).await });
+                }
+            }
+            // Installed skills on its machine: the files it wants, its packages' states, a folder's files.
+            AgentMsg::Skills { json } => crate::api::boxed(|| crate::skills::heard(self, &agent, peer, &json)).await,
+            AgentMsg::SkillFile { req, sha256, offset, data, done } => crate::skills::heard_file(peer, req, &sha256, offset, &data, done),
             // A runner's admission hint (docs/needs.md E5, AUDIT O1): the offers view takes it, and
             // its room goes on to the other runners' owners.
             // An owner's word on an agent session's start it was asked to place (AUDIT M4): to
@@ -3918,6 +3929,10 @@ impl Hub {
                 self.harness.from_runner(r).await;
                 if let Some(id) = applied {
                     self.harness.applied(&id).await;
+                    // W20-R01: an Open supplies the actual cwd and machine (including a move).
+                    // Only lifecycle updates rescope installed skills, never conversation chunks.
+                    let hub = Arc::clone(self);
+                    crate::rt::spawn(async move { crate::api::boxed(|| crate::skills::sync(&hub)).await });
                 }
             }
         }

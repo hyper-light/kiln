@@ -1081,7 +1081,10 @@ impl Carries for AgentMsg {
             | AgentMsg::Features { .. }
             // The offers hint's JSON is read by its view (lb/offers-ui), which keeps what it can.
             | AgentMsg::Offers { .. }
-            | AgentMsg::Placed { .. }) => return Ok(Carried::Nothing(m)),
+            | AgentMsg::Placed { .. }
+            // Installed skills' JSON is read by `crate::skills`, which keeps what it can.
+            | AgentMsg::Skills { .. }
+            | AgentMsg::SkillFile { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }
@@ -1235,6 +1238,8 @@ impl Carries for ServerMsg {
             | ServerMsg::Offers { .. }
             | ServerMsg::Place { .. }
             | ServerMsg::Copies { .. }
+            | ServerMsg::Skills { .. }
+            | ServerMsg::SkillFile { .. }
             | ServerMsg::Later { .. }
             | ServerMsg::Back { .. }) => return Ok(Carried::Nothing(m)),
         };

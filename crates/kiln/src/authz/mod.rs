@@ -744,6 +744,9 @@ pub static ROUTES: &[Rule] = &[
     // Research (docs/research.md): agents' and people's, each finding graded.
     any("/api/research", "agents.run", At::Server),
     any("/api/research/**", "agents.run", At::Server),
+    // W20-R01: installed skills use the agent operations' authorization and scope checks.
+    any("/api/skills", "agents.run", At::Server),
+    any("/api/skills/**", "agents.run", At::Server),
     any("/api/places", "agents.run", At::Server),
     any("/api/places/**", "agents.run", At::Server),
     any("/api/voice", "agents.run", At::Server),

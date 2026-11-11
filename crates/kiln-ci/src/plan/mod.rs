@@ -758,7 +758,10 @@ impl RunPlan {
     /// The leg keyed `key`, as the plan made it (its workflow, a called one's included): what a
     /// restarted dispatcher gives the legs it takes back (W05-R25).
     pub fn spec_of(&self, key: &str) -> Option<&LegSpec> {
-        self.nodes.iter().flat_map(|n| n.legs.iter()).find(|l| l.spec.key == key).map(|l| &l.spec)
+        // W05-AC09: restore asks once per leg; use the same index as completion rather
+        // than scanning every earlier matrix cell for each lookup.
+        let &(n, l) = self.keys.get(key)?;
+        self.leg(n, l).map(|leg| &leg.spec)
     }
 
     /// The combinations `exclude` and `where:` removed, by job, with why (W04-R29).

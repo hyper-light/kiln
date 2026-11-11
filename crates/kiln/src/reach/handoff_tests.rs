@@ -235,6 +235,7 @@ fn lb03_w05_r25_an_owner_killed_mid_run_has_its_run_adopted_and_its_agent_told()
             }
         }
         // mac is killed mid-run, for good; then the run ends.
+        anyhow::ensure!(evs.iter().any(|e| matches!(e, Ev::Placed { .. })), "the run bypassed placement: {evs:?}");
         lab.kill("mac").await?;
         // The relay has queued every loss frame. These ordered node requests observe those
         // inputs before the process may end: a killed owner mid-run, not a race with the kill.
@@ -244,7 +245,17 @@ fn lb03_w05_r25_an_owner_killed_mid_run_has_its_run_adopted_and_its_agent_told()
         std::fs::write(&go, b"")?;
         let told = eventually(|| crate::reach::told::heard_of(&session).iter().any(|n| matches!(n.event, crate::reach::told::RunEvent::Ended) && n.error.is_none())).await;
         let news = crate::reach::told::heard_of(&session);
-        anyhow::ensure!(told, "its agent was told how it ended: {news:?}");
+        if !told {
+            let mut views = Vec::new();
+            for h in [&mac, &linux, &studio] {
+                let view = crate::rt::timeout(HANG, h.place_view()).await.map_err(|_| anyhow::anyhow!("{} did not answer the handoff diagnostic", h.name()))??;
+                views.push((h.name().to_owned(), view));
+            }
+            while let Ok(e) = ev_rx.try_recv() {
+                evs.push(e);
+            }
+            anyhow::bail!("its agent was told how it ended: {news:?}; placement: {views:?}; events: {evs:?}");
+        }
         anyhow::ensure!(news.iter().any(|n| matches!(n.event, crate::reach::told::RunEvent::Started) && n.on.contains("linux")), "and that it runs on at linux under its adopter: {news:?}");
         let v = linux.place_view().await?;
         anyhow::ensure!(v.get("held").cloned() == Some(serde_json::json!([0, 0, 0, 0])), "its room is free on linux: {v}");

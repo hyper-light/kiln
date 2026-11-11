@@ -237,6 +237,8 @@ classes! {
         AgentMsg::Features { .. } => Class::Handshake,
         AgentMsg::Offers { .. } => Class::State,
         AgentMsg::Placed { .. } => Class::Answer,
+        AgentMsg::Skills { .. } => Class::State,
+        AgentMsg::SkillFile { .. } => Class::Answer,
     }
 }
 
@@ -320,6 +322,8 @@ classes! {
         ServerMsg::Offers { .. } => Class::State,
         ServerMsg::Place { .. } => Class::Ask,
         ServerMsg::Copies { .. } => Class::State,
+        ServerMsg::Skills { .. } => Class::State,
+        ServerMsg::SkillFile { .. } => Class::Answer,
     }
 }
 
