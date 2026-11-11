@@ -2228,6 +2228,35 @@ fn w05_r40_a_gpu_gang_needs_every_siblings_gpu() {
     }
 }
 
+/// W05-R16/W05-R34: a CPU-only runner cannot keep an expired GPU grant off its only capable node.
+#[test]
+fn w05_r16_cpu_only_nodes_do_not_delay_gpu_lease_retry() {
+    for resources in [false, true] {
+        let cfg = Config { resources, lease: Some(2 * MINUTE as u64), ..Config::default() };
+        let mut engine = Scheduler::with_epoch(cfg.clone(), 0);
+        let mut reference = Reference::new(cfg, 0);
+        let runner = |id: &str, gpu| RunnerIn {
+            id: id.into(), slots: 2,
+            view: RunnerView { name: id.into(), ..RunnerView::default() },
+            capacity: Some(Resources { cpu: Cpus::whole(4), mem: 8 * GIB, gpu, ..Resources::default() }),
+            ..RunnerIn::default()
+        };
+        for (step, at) in [
+            (Step::Up(runner("gpu", 1)), 0),
+            (Step::Queued(Box::new(LegIn { id: "task".into(), run: "run".into(), repo: "acme/gpu".into(), request: Resources { cpu: Cpus::whole(1), mem: GIB, gpu: 1, ..Resources::default() }, ..LegIn::default() })), 1),
+            (Step::Up(runner("cpu", 0)), 2),
+            (Step::Tick, 2 * MINUTE + 1),
+        ] {
+            engine.handle(step.input(), at);
+            reference.handle(&step, at);
+        }
+        let expected = reference.placement().0.get("task").map(|(runner, attempt, _, _)| (runner.clone(), *attempt));
+        assert_eq!(expected, Some(("gpu".into(), 2)));
+        let actual = engine.grants().get("task").map(|g| (g.runner.clone(), g.attempt));
+        assert_eq!(actual, expected, "resources={resources}");
+    }
+}
+
 /// E1.5: compare all generated histories, retaining the original case count and invariants.
 #[test]
 fn e1_5_the_engine_agrees_with_the_reference() {
