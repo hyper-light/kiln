@@ -1873,6 +1873,26 @@ impl Placer {
 }
 
 #[cfg(test)]
+mod how_tests {
+    use super::{How, how};
+
+    /// W05-R04 (docs/lb.md "Good places"): a run that exited here is judged by its exit. It went
+    /// well when it exited 0; the node let it down when it couldn't start here or a program it
+    /// ran isn't here; any other failure has no cause the runner knows; a run a signal ended (its
+    /// asker stopped it, as far as an exit says) is judged by no one.
+    #[test]
+    fn w05_r04_a_run_is_judged_by_its_exit() {
+        assert_eq!(how(Some(0), None, false), How::Well, "it exited 0");
+        assert_eq!(how(Some(1), None, false), How::Unsure, "a failure with no cause known here: the node's or the work's");
+        assert_eq!(how(Some(127), None, false), How::LetDown, "a shell's \"command not found\": a program it ran isn't here");
+        assert_eq!(how(Some(9009), None, false), How::LetDown, "cmd's \"is not recognized\"");
+        assert_eq!(how(None, Some("cannot keep the shell's state"), false), How::LetDown, "it couldn't start here");
+        assert_eq!(how(None, Some("timed out"), true), How::Unsure, "its own limit ran out: the node's slowness or the work's");
+        assert_eq!(how(None, None, false), How::Unsaid, "a signal ended it: stopped by its asker as far as its exit says");
+    }
+}
+
+#[cfg(test)]
 mod key_tests {
     use super::*;
 
