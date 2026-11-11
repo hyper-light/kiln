@@ -5192,23 +5192,24 @@ mod tests {
                     assert_eq!(session.core.lock().input_stages, ["uncommitted-native-input"]);
                 }
                 progress_promotion(&session, &files).await;
-                let controller = input.controller.lock();
-                assert_eq!(controller.capacity().epoch, 0);
-                assert_eq!(session.epoch(), 0);
-                if pending_effect {
-                    assert!(!controller.promoting(), "ownership cannot enter Promoting ahead of an earlier uncommitted native effect");
-                    assert!(controller.lease("uncommitted-native-input").is_some_and(|lease| lease.epoch == 0 && lease.bytes == bytes && lease.stage == Stage::InCtl));
-                    let core = session.core.lock();
-                    assert_eq!(core.input_stages, ["uncommitted-native-input"], "the original callback remains retryable");
-                    assert!(core.events().any(|event| event.id == "legacy-promotion-held" && matches!(&event.body, Body::Notice { level: Level::Warn, .. })), "the person can see why ownership is held");
-                } else {
-                    assert!(controller.promoting());
-                    let core = session.core.lock();
-                    assert!(core.input_stages.is_empty() && core.input_retained.is_empty() && core.input_receipts.is_empty());
-                    assert!(core.out.iter().any(|update| matches!(update, Update::MailFlow { event } if matches!(event.as_ref(), super::super::admission::FlowEvent::Capacity { .. }))), "no unresolved effects: the deliberately gated owner must still execute its promotion step");
-                    assert!(!core.events().any(|event| event.id == "legacy-promotion-held"));
+                {
+                    let controller = input.controller.lock();
+                    assert_eq!(controller.capacity().epoch, 0);
+                    assert_eq!(session.epoch(), 0);
+                    if pending_effect {
+                        assert!(!controller.promoting(), "ownership cannot enter Promoting ahead of an earlier uncommitted native effect");
+                        assert!(controller.lease("uncommitted-native-input").is_some_and(|lease| lease.epoch == 0 && lease.bytes == bytes && lease.stage == Stage::InCtl));
+                        let core = session.core.lock();
+                        assert_eq!(core.input_stages, ["uncommitted-native-input"], "the original callback remains retryable");
+                        assert!(core.events().any(|event| event.id == "legacy-promotion-held" && matches!(&event.body, Body::Notice { level: Level::Warn, .. })), "the person can see why ownership is held");
+                    } else {
+                        assert!(controller.promoting());
+                        let core = session.core.lock();
+                        assert!(core.input_stages.is_empty() && core.input_retained.is_empty() && core.input_receipts.is_empty());
+                        assert!(core.out.iter().any(|update| matches!(update, Update::MailFlow { event } if matches!(event.as_ref(), super::super::admission::FlowEvent::Capacity { .. }))), "no unresolved effects: the deliberately gated owner must still execute its promotion step");
+                        assert!(!core.events().any(|event| event.id == "legacy-promotion-held"));
+                    }
                 }
-                drop(controller);
                 let after = records.get("inbox-heads", session.id.as_bytes(), Consistency::Linearizable).await?.ok_or_else(|| anyhow::anyhow!("promotion head disappeared"))?;
                 assert_eq!((after.rev, after.value), (before.rev, before.value), "neither case has authority to advance the persisted head epoch yet");
             }

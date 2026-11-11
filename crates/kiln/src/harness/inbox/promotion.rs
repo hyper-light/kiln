@@ -231,7 +231,7 @@ mod tests {
     }
 
     async fn certified(inbox: &Inbox, input: &Input, pool: &Arc<PhysicalBudget>) -> anyhow::Result<()> {
-        input.controller.lock().begin_legacy_epoch(0, 1)?;
+        input.controller.lock().begin_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
         inbox.advance_promotion("s", 1, PromotionPhase::AwaitingCertificate, pool, Some(input)).await?;
         inbox.advance_promotion("s", 1, PromotionPhase::Rebinding, pool, Some(input)).await?;
         Ok(())
@@ -253,8 +253,8 @@ mod tests {
             let first_revision = records.get(PENDING, &super::super::message_key("s", "a"), Consistency::Linearizable).await?.unwrap().rev;
             let second_revision = records.get(PENDING, &super::super::message_key("s", "b"), Consistency::Linearizable).await?.unwrap().rev;
             let input = Input::new(0, pool.clone(), inbox.clone());
-            input.controller.lock().restore(first.lease.clone())?;
-            input.controller.lock().restore(second.lease.clone())?;
+            input.controller.lock().restore(first.lease.clone()).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            input.controller.lock().restore(second.lease.clone()).map_err(|error| anyhow::anyhow!("{error:?}"))?;
             let credit = input.controller.lock().capacity().retry_permission();
             certified(&inbox, &input, &pool).await?;
             assert_eq!(inbox.rebind_promotion_step("s", &input).await?, RebindStep::Row);
@@ -276,10 +276,10 @@ mod tests {
             assert!(inbox.open("s", 1).await.is_err());
             pool.resize(kiln_seams::records::VALUE_MAX * 2);
             let input = Input::new(0, pool.clone(), inbox.clone());
-            input.controller.lock().begin_legacy_epoch(0, 1)?;
+            input.controller.lock().begin_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
             for id in ["a", "b"] {
                 let retained = inbox.pending("s", id).await?.unwrap();
-                input.controller.lock().restore_legacy_debt(retained.lease, 0, 1)?;
+                input.controller.lock().restore_legacy_debt(retained.lease, 0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
             }
             while inbox.rebind_promotion_step("s", &input).await? != RebindStep::Complete {}
             for (original, revision) in [(first, first_revision), (second, second_revision)] {
@@ -287,18 +287,18 @@ mod tests {
                 let actual = inbox.pending("s", &original.lease.message).await?.unwrap();
                 assert_eq!(serde_json::to_value(actual)?, serde_json::to_value(expected)?);
             }
-            input.controller.lock().rebind_legacy_epoch(0, 1)?;
+            input.controller.lock().rebind_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
             assert_eq!(pool.counts().0, 160);
             assert_eq!(input.controller.lock().capacity().retry_permission(), credit);
             inbox.advance_promotion("s", 1, PromotionPhase::Active, &pool, Some(&input)).await?;
             assert_eq!(inbox.epoch("s").await?, Some((1, false)));
             assert_eq!(inbox.advance_promotion("s", 2, PromotionPhase::Active, &pool, Some(&input)).await, Err(PromotionError::Stale));
             inbox.retire_promotion("s", 1, &pool, Some(&input)).await?;
-            input.controller.lock().complete_legacy_reconciliation()?;
-            input.controller.lock().activate_legacy_epoch(0, 1)?;
+            input.controller.lock().complete_legacy_reconciliation().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            input.controller.lock().activate_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
             let terminal = Disposition::Consumed { boundary: Consumption::ProviderAccepted };
             inbox.dispose_pending("s", "a", 1, terminal.clone()).await?;
-            assert!(input.controller.lock().finish("a", terminal, 1, false)?);
+            assert!(input.controller.lock().finish("a", terminal, 1, false).map_err(|error| anyhow::anyhow!("{error:?}"))?);
             assert_eq!(pool.counts().0, 80, "completion must release only its own lease");
             assert!(inbox.pending("s", "b").await?.unwrap().disposition.is_none());
             let mut ordinary = pending("new"); ordinary.origin = Origin::Accepted; ordinary.lease.epoch = 1; ordinary.lease.token = Some(Token { revision: 4, generation: 1 });
@@ -321,7 +321,7 @@ mod tests {
             let input = Input::new(0, pool.clone(), inbox.clone());
             certified(&inbox, &input, &pool).await?;
             assert_eq!(inbox.rebind_promotion_step("s", &input).await?, RebindStep::Complete);
-            input.controller.lock().rebind_legacy_epoch(0, 1)?;
+            input.controller.lock().rebind_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
             inbox.advance_promotion("s", 1, PromotionPhase::Active, &pool, Some(&input)).await?;
             let (revision, _) = inbox.promotion_snapshot("s").await?;
             assert_eq!(input.promotion_cursor.load(Ordering::Acquire), revision);
@@ -347,8 +347,8 @@ mod tests {
             assert!(retired_revision > revision && promotion.is_none());
             assert_eq!(inbox.epoch("s").await?, Some((1, false)));
             inbox.retire_promotion("s", 1, &pool, Some(&input)).await?;
-            input.controller.lock().complete_legacy_reconciliation()?;
-            input.controller.lock().activate_legacy_epoch(0, 1)?;
+            input.controller.lock().complete_legacy_reconciliation().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            input.controller.lock().activate_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
             assert!(!input.controller.lock().promoting());
             assert_eq!(input.controller.lock().capacity().epoch, 1);
             Ok(())
@@ -366,7 +366,7 @@ mod tests {
             inbox.adopt_pending("s", pending("a"), 11).await?;
             let original = inbox.pending("s", "a").await?.unwrap();
             let input = Input::new(0, pool.clone(), inbox.clone());
-            input.controller.lock().restore(original.lease.clone())?;
+            input.controller.lock().restore(original.lease.clone()).map_err(|error| anyhow::anyhow!("{error:?}"))?;
             certified(&inbox, &input, &pool).await?;
             let key = super::super::message_key("s", "a");
             let saved = records.get(PENDING, &key, Consistency::Linearizable).await?.unwrap();
