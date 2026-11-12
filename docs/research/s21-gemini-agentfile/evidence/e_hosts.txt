@@ -1,0 +1,6 @@
+# Hosts named in @google/gemini-cli 0.68.0's bundle (npm tarball sha256 325099dd...a006), 2026-11-12T08:04:21Z
+https://generativelanguage.googleapis.com occurrences=3
+https://cloudcode-pa.googleapis.com occurrences=3
+https://oauth2.googleapis.com/token occurrences=36
+https://play.googleapis.com/log occurrences=3
+https://registry.npmjs.org occurrences=6
