@@ -29,12 +29,10 @@ pub(crate) type Pick = (String, lb::Handle);
 pub(crate) struct Legs {
     lb: lb::Owner,
     out: lb::Out,
-    /// Runners by name, interned to the kernel's dense ids, and their budgets and paces as last
-    /// said.
+    /// Runners by name, interned to the kernel's dense ids, and their budgets as last said.
     ids: HashMap<String, u32>,
     names: Vec<String>,
     budgets: Vec<Option<lb::Amounts>>,
-    paces: Vec<kiln_ci::sched::balance::Pace>,
     /// Each kind of leg's signature.
     sigs: HashMap<u64, Sig>,
     /// Each leg the kernel sent and not yet heard of (started, refused, ended): its handle.
@@ -53,7 +51,67 @@ struct Sig {
 
 impl Default for Legs {
     fn default() -> Self {
-        Legs { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), ids: HashMap::new(), names: Vec::new(), budgets: Vec::new(), paces: Vec::new(), sigs: HashMap::new(), sent: HashMap::new(), auction: false }
+        Legs { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), ids: HashMap::new(), names: Vec::new(), budgets: Vec::new(), sigs: HashMap::new(), sent: HashMap::new(), auction: false }
+    }
+}
+
+/// What runners' connections say to the server's kernel between the scheduling loop's looks
+/// (docs/lb.md "At scale"): each runner's newest word, the jobs heard of at their runners, and each
+/// runner's pace as last passed to the CI engine. A connection puts its runner's word here under a
+/// lock held for a map insert, never the kernel's own: the scheduling loop takes it whole as it looks
+/// ([`Mail::take`]) and applies it ([`Legs::apply`]), so the kernel's records are written by that
+/// loop alone and stay in its core's cache. A lock the connections' cores wrote the records through
+/// cost a decision 2.2x to 58x as one to eight of them hammered it (`kiln_ci`'s bench,
+/// `--hinters`). Bounded by the fleet: one word a runner, the newest.
+#[derive(Debug, Default)]
+pub(crate) struct Mail {
+    words: HashMap<String, FastWord>,
+    heard: Vec<String>,
+    paces: HashMap<String, kiln_ci::sched::balance::Pace>,
+}
+
+/// What [`Mail::take`] took: the jobs heard of, in order, and each runner's newest word.
+#[derive(Debug, Default)]
+pub(crate) struct Taken {
+    heard: Vec<String>,
+    words: HashMap<String, FastWord>,
+}
+
+impl Taken {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.heard.is_empty() && self.words.is_empty()
+    }
+}
+
+impl Mail {
+    /// Runner `runner`'s newest word, in place of what it said before since the last look. Its
+    /// measured pace when that changed, for the CI engine's load balancer (docs/lb.md "The CI
+    /// engine"): the same runner's speed, whichever kernel ranks it.
+    pub(crate) fn word(&mut self, runner: &str, w: &FastWord) -> Option<kiln_ci::sched::balance::Pace> {
+        let pace = kiln_ci::sched::balance::Pace { speed: w.speed, slowness: w.slowness, measured: w.measured, disk: w.disk, net: w.net };
+        let changed = match self.paces.get_mut(runner) {
+            Some(p) if *p == pace => None,
+            Some(p) => {
+                *p = pace;
+                Some(pace)
+            }
+            None => {
+                self.paces.insert(runner.to_owned(), pace);
+                (pace != kiln_ci::sched::balance::Pace::default()).then_some(pace)
+            }
+        };
+        self.words.insert(runner.to_owned(), *w);
+        changed
+    }
+
+    /// Job `job` was heard of at its runner (started, refused, or left it).
+    pub(crate) fn heard(&mut self, job: &str) {
+        self.heard.push(job.to_owned());
+    }
+
+    /// What was said since the last look, all of it, leaving the paces.
+    pub(crate) fn take(&mut self) -> Taken {
+        Taken { heard: std::mem::take(&mut self.heard), words: std::mem::take(&mut self.words) }
     }
 }
 
@@ -66,7 +124,6 @@ impl Legs {
         self.ids.insert(name.to_owned(), r);
         self.names.push(name.to_owned());
         self.budgets.push(None);
-        self.paces.push(kiln_ci::sched::balance::Pace::default());
         r
     }
 
@@ -75,16 +132,9 @@ impl Legs {
     }
 
     /// Runner `runner`'s kernel word, from its hint: it joins the kernel at its first, its budget
-    /// followed, its room what the kernel picks by from now. O(1) but on joining. Its measured
-    /// pace when that changed with this word, for the CI engine's load balancer (docs/lb.md "The
-    /// CI engine"): the same runner's speed, whichever kernel ranks it.
-    pub(crate) fn hint(&mut self, runner: &str, w: &FastWord) -> Option<kiln_ci::sched::balance::Pace> {
+    /// followed, its room what the kernel picks by from now. O(1) but on joining.
+    pub(crate) fn hint(&mut self, runner: &str, w: &FastWord) {
         let r = self.id(runner);
-        let pace = kiln_ci::sched::balance::Pace { speed: w.speed, slowness: w.slowness, measured: w.measured, disk: w.disk, net: w.net };
-        let changed = self.paces.get_mut(r as usize).filter(|p| **p != pace).map(|p| {
-            *p = pace;
-            pace
-        });
         self.out.clear();
         match self.budgets.get(r as usize).copied().flatten() {
             None => {
@@ -108,7 +158,18 @@ impl Legs {
             }
         }
         self.out.clear();
-        changed
+    }
+
+    /// What runners' connections said between two of the scheduling loop's looks ([`Mail`]), taken
+    /// in: the jobs heard of at their runners first, then each runner's newest word, which leaves the
+    /// kernel as each said in order would.
+    pub(crate) fn apply(&mut self, mail: Taken) {
+        for job in &mail.heard {
+            self.heard(job);
+        }
+        for (runner, w) in &mail.words {
+            self.hint(runner, w);
+        }
     }
 
     /// The kernel's signature for kind `key`, its members synced with `agents`: each record that
@@ -357,6 +418,51 @@ mod tests {
         for (_, run) in picks.into_iter().flatten() {
             on.unsent(run);
         }
+        Ok(())
+    }
+
+    /// docs/lb.md "At scale": words come by mail, and taking it in leaves the kernel as hearing each
+    /// as it came would: a runner's older word gives way to its newest, and a job heard of between
+    /// gives back the room the kernel took for it. A pace is passed on only when it changes.
+    #[test]
+    fn mail_leaves_the_kernel_as_each_word_in_order_would() -> anyhow::Result<()> {
+        let agents = fleet(&[("a", true), ("b", true)]);
+        let key = Legs::kind(&[], &[], "");
+        let mut direct = Legs::default();
+        let mut mailed = Legs::default();
+        let mut mail = Mail::default();
+        for legs in [&mut direct, &mut mailed] {
+            legs.hint("a", &word(8));
+            legs.hint("b", &word(4));
+        }
+        // A pick on each: a has the most room.
+        let (p1, r1) = direct.pick(key, [4000, 0, 0, 0], &agents, |r| &r.name, |r| r.ok).ok_or_else(|| anyhow::anyhow!("no pick"))?;
+        direct.sent("j1", r1);
+        let (p2, r2) = mailed.pick(key, [4000, 0, 0, 0], &agents, |r| &r.name, |r| r.ok).ok_or_else(|| anyhow::anyhow!("no pick"))?;
+        mailed.sent("j1", r2);
+        anyhow::ensure!(p1 == "a" && p2 == "a", "{p1} {p2}");
+        // a says 6, then j1 is heard of, then a says 4; b says 2. Directly, in order; by mail, taken at once.
+        direct.hint("a", &word(6));
+        direct.heard("j1");
+        direct.hint("a", &word(4));
+        direct.hint("b", &word(2));
+        let _ = mail.word("a", &word(6));
+        mail.heard("j1");
+        let _ = mail.word("a", &word(4));
+        let _ = mail.word("b", &word(2));
+        mailed.apply(mail.take());
+        anyhow::ensure!(mail.take().is_empty(), "mail left after it was taken");
+        for legs in [&mut direct, &mut mailed] {
+            let (p, run) = legs.pick(key, [3000, 0, 0, 0], &agents, |r| &r.name, |r| r.ok).ok_or_else(|| anyhow::anyhow!("no pick"))?;
+            anyhow::ensure!(p == "a", "picked {p}");
+            legs.unsent(run);
+            anyhow::ensure!(legs.pick(key, [5000, 0, 0, 0], &agents, |r| &r.name, |r| r.ok).is_none(), "room past every runner's word");
+        }
+        // Paces: none said yet is the reference, not passed on; a change is; the same again isn't.
+        let faster = FastWord { speed: 2048, measured: 1, ..word(4) };
+        anyhow::ensure!(mail.word("c", &word(4)).is_none());
+        anyhow::ensure!(mail.word("c", &faster).is_some_and(|p| p.speed == 2048));
+        anyhow::ensure!(mail.word("c", &faster).is_none());
         Ok(())
     }
 
