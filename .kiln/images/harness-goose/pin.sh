@@ -19,7 +19,11 @@
 # The pin also records the base image the Agentfile builds on by default: step 19's default base,
 # buildpack-deps:trixie-scm (git, an ssh client, curl and CA certificates on both arches, which
 # Goose's TLS needs: f18), read by digest with a manifest HEAD, which doesn't count as a Docker Hub
-# pull. Big files go under ~/.cache (kiln's AGENTS.md: /tmp on its Linux machines is a RAM disk).
+# pull. And it records the smoke an image's Goose must pass, for whatever runs it (step 19's image
+# lookup, CI's legs), in the shape the other harnesses' pins give theirs: `bin/goose --version`
+# prints its version after a space, the line 1.59.0's musl build wrote as 20 31 2e 35 39 2e 30 0a
+# (f12); `stdout` is that line without its newline, its leading space kept.
+# Big files go under ~/.cache (kiln's AGENTS.md: /tmp on its Linux machines is a RAM disk).
 
 set -euo pipefail
 
@@ -218,7 +222,9 @@ main() {
         --arg base "$base" --argjson builds "$(printf '%s\n' "${builds[@]}" | jq -s '.')" \
         '{version: $version, channel: $channel, read_at: $read_at,
           verified: {method: "github-attestation", repo: $repo, signer_workflow: $signer, source_ref: $ref, commit: $commit, predicate: $predicate},
-          base: $base, builds: $builds}')
+          base: $base,
+          smoke: {program: "bin/goose", args: ["--version"], stdout: (" " + $version)},
+          builds: $builds}')
     # Written beside its place and renamed into it, so a failure never leaves half a pin.
     partial="$out.partial.$$"
     printf '%s\n' "$pin" >"$partial"
