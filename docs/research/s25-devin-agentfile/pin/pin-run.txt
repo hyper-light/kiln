@@ -1,38 +1,39 @@
 # pin.sh current on a Linux runner, then pin-tests.sh verify: kiln run, placed with --needs linux/amd64 --on adacachy2 --no-sync -i,
-# on runner 00aad8daff2fa3c9daa65d53c425d450 (adacachy2), started 2026-11-12T08:30:27Z. Two earlier tries (08:28:18Z, 08:29:28Z) ended
-# before placement: "the kiln server did not answer in time". Command: pin.sh and pin-tests.sh sent over stdin as base64 lines,
-# decoded into a fresh ~/.cache/s25-step1.XXXXXX/h (their SHA-256 printed on arrival), then `bash ./pin.sh current` there and
-# `bash h/pin-tests.sh verify h/pin.json`; the directory removed afterwards. pin.json was printed, then sent back as one base64
-# line (left out here), from which the committed .kiln/images/harness-devin/pin.json was written: its sha256
-# 88b28e7ca1ed40f6d7d66737709b595ae1a951a347cf2dec3ea351a41cd7031d equals the one pin.sh reports. kiln exit 0.
+# on runner 00aad8daff2fa3c9daa65d53c425d450 (adacachy2), started 2026-11-12T08:48:32Z, placed on the first try. Command: pin.sh and
+# pin-tests.sh sent over stdin as base64 lines, decoded into a fresh ~/.cache/s25-step1.XXXXXX/h (their SHA-256 printed on arrival),
+# then `bash ./pin.sh current` there and `bash h/pin-tests.sh verify h/pin.json`; the directory removed afterwards. pin.json was
+# printed, then sent back as one base64 line (left out here), from which the committed .kiln/images/harness-devin/pin.json was
+# written: its sha256 5a378fb22bedd031563fffef2e6c861c03ebe6e4ab1e2950543ef1ea9fb39dc6 equals the one pin.sh reports. Files:
+# pin.sh sha256 71db93d2c8660bf6d475d9c5dee028bab5ce98ae356f6aa108f404edd9dcb940, pin-tests.sh sha256
+# 8eaa8f24d78f3ed90b1f5219b3d86edac3be44336b80ebd0878ac6afbc460897 (the committed files). kiln exit 0.
 # The runner's output stream as kiln returned it, ANSI colours removed.
-[kiln] on 00aad8daff2fa3c9daa65d53c425d450 · linux/x86_64 · 24 of 32 cores idle · 50 GB free
-runner adacachy2 Linux 7.3.3-1-cachyos x86_64, dir /home/adalundhe/.cache/s25-step1.ErlMi0, 2026-11-12T08:30:27Z
-c34217789c19262a8b93909c50674d4ba2cb172cad5d56b00636cdf56daad32c  pin.sh
-04a8eca5c601a08696092bcedee358e906d93f152d27851d65dd2e6b8c382485  pin-tests.sh
+[kiln] on 00aad8daff2fa3c9daa65d53c425d450 · linux/x86_64 · 20 of 32 cores idle · 52 GB free
+runner adacachy2 Linux 7.3.3-1-cachyos x86_64, dir /home/adalundhe/.cache/s25-step1.OFWvaD, 2026-11-12T08:48:32Z
+71db93d2c8660bf6d475d9c5dee028bab5ce98ae356f6aa108f404edd9dcb940  pin.sh
+8eaa8f24d78f3ed90b1f5219b3d86edac3be44336b80ebd0878ac6afbc460897  pin-tests.sh
 == pin.sh current
-pin.sh: current/ names 3000.12.43; https://static.devin.ai/cli/3000.12.43/manifest.json (sha256 093e9492b3227bfc7be8a57114448611bf8af6573af7ac3866d3ff85abadb1c1) is byte for byte current/, read 2026-11-12T08:30:27Z
-pin.sh: no signature: each of 13 URLs answers 403 (https://static.devin.ai/cli/3000.12.43/SHA256SUMS, and .sig, .asc, .sha256 and .sigstore.json beside the manifest and both bundles)
+pin.sh: current/ names 3000.12.43; https://static.devin.ai/cli/3000.12.43/manifest.json (sha256 093e9492b3227bfc7be8a57114448611bf8af6573af7ac3866d3ff85abadb1c1) is byte for byte current/, read 2026-11-12T08:48:32Z
+pin.sh: no signature: each of 13 URLs answers 403 or 404 (13 answered 403, 0 answered 404): https://static.devin.ai/cli/3000.12.43/SHA256SUMS, and .sig, .asc, .sha256 and .sigstore.json beside the manifest and both bundles
 pin.sh: linux/amd64 (x86_64-unknown-linux): https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-x86_64-unknown-linux.tar.gz, sha256 6a19997b5fc2d6ba1a8c341d4e2b12f1b78cad5d415ee9c0ca413a8d52a99562 as the manifest gives it, 71424183 bytes; 234 regular files and 16 directories, bin/devin -rwxr-xr-x, 209662952 bytes
 pin.sh: linux/arm64 (aarch64-unknown-linux): https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-aarch64-unknown-linux.tar.gz, sha256 1eaa07d2181ed26f5789cf6b3617d39a2459c25f1bc5a51cc5cc703db7f95274 as the manifest gives it, 67806876 bytes; 234 regular files and 16 directories, bin/devin -rwxr-xr-x, 191963936 bytes
-pin.sh: wrote /home/adalundhe/.cache/s25-step1.ErlMi0/h/pin.json (sha256 88b28e7ca1ed40f6d7d66737709b595ae1a951a347cf2dec3ea351a41cd7031d): devin 3000.12.43 for linux/amd64 linux/arm64
+pin.sh: wrote /home/adalundhe/.cache/s25-step1.OFWvaD/h/pin.json (sha256 5a378fb22bedd031563fffef2e6c861c03ebe6e4ab1e2950543ef1ea9fb39dc6): devin 3000.12.43 for linux/amd64 linux/arm64
 pin.sh exit=0
 == pin-tests.sh verify pin.json
 PASS https://static.devin.ai/cli/3000.12.43/manifest.json downloaded again: sha256 093e9492b3227bfc7be8a57114448611bf8af6573af7ac3866d3ff85abadb1c1, as pin.json records
-PASS linux/amd64 (x86_64-unknown-linux): https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-x86_64-unknown-linux.tar.gz downloaded again: sha256sum 6a19997b5fc2d6ba1a8c341d4e2b12f1b78cad5d415ee9c0ca413a8d52a99562 and stat 71424183 bytes equal pin.json's, and the manifest gives this URL and SHA-256
-PASS linux/arm64 (aarch64-unknown-linux): https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-aarch64-unknown-linux.tar.gz downloaded again: sha256sum 1eaa07d2181ed26f5789cf6b3617d39a2459c25f1bc5a51cc5cc703db7f95274 and stat 67806876 bytes equal pin.json's, and the manifest gives this URL and SHA-256
+PASS linux/amd64 (x86_64-unknown-linux): https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-x86_64-unknown-linux.tar.gz downloaded again: sha256sum 6a19997b5fc2d6ba1a8c341d4e2b12f1b78cad5d415ee9c0ca413a8d52a99562 and stat 71424183 bytes equal pin.json's, the manifest gives this URL and SHA-256, and unpack is {"format":"tar.gz"}
+PASS linux/arm64 (aarch64-unknown-linux): https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-aarch64-unknown-linux.tar.gz downloaded again: sha256sum 1eaa07d2181ed26f5789cf6b3617d39a2459c25f1bc5a51cc5cc703db7f95274 and stat 67806876 bytes equal pin.json's, the manifest gives this URL and SHA-256, and unpack is {"format":"tar.gz"}
 builds whose SHA-256 and size match both the manifest and a fresh download: 2 of 2
 verify exit=0
 == pin.json
 {
   "harness": "devin",
   "version": "3000.12.43",
-  "verified": "sha256 from Cognition's versioned manifest over HTTPS, equal to current/ when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403)",
+  "verified": "sha256 from Cognition's versioned manifest over HTTPS, equal to current/ when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403 or 404)",
   "manifest": {
     "url": "https://static.devin.ai/cli/3000.12.43/manifest.json",
     "sha256": "093e9492b3227bfc7be8a57114448611bf8af6573af7ac3866d3ff85abadb1c1"
   },
-  "read_at": "2026-11-12T08:30:27Z",
+  "read_at": "2026-11-12T08:48:32Z",
   "base": {
     "ref": "buildpack-deps:trixie-scm",
     "digest": "sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10"
@@ -46,7 +47,9 @@ verify exit=0
           "sha256": "6a19997b5fc2d6ba1a8c341d4e2b12f1b78cad5d415ee9c0ca413a8d52a99562",
           "size": 71424183,
           "path": ".",
-          "unpack": "tar.gz"
+          "unpack": {
+            "format": "tar.gz"
+          }
         }
       ]
     },
@@ -58,12 +61,14 @@ verify exit=0
           "sha256": "1eaa07d2181ed26f5789cf6b3617d39a2459c25f1bc5a51cc5cc703db7f95274",
           "size": 67806876,
           "path": ".",
-          "unpack": "tar.gz"
+          "unpack": {
+            "format": "tar.gz"
+          }
         }
       ]
     }
   ]
 }
-== pin.json sha256 88b28e7ca1ed40f6d7d66737709b595ae1a951a347cf2dec3ea351a41cd7031d
+== pin.json sha256 5a378fb22bedd031563fffef2e6c861c03ebe6e4ab1e2950543ef1ea9fb39dc6
 devin-pin work dirs left under ~/.cache: 0
-[kiln] used memory not measured, 2 s of CPU (counted by the system, 0.271 CPUs on average) over 9 s; OOM kills not seen here
+[kiln] used memory not measured, 2 s of CPU (counted by the system, 0.307 CPUs on average) over 8 s; OOM kills not seen here

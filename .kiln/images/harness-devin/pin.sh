@@ -5,15 +5,16 @@
 #   pin.sh [current|VERSION]    current, the default, pins the version current/manifest.json names
 #
 # Cognition signs nothing here: no signature or checksum file sits beside a release's manifest or
-# its bundles (each answers 403). What can be checked is checked: the SHA-256 the versioned
+# its bundles (each answers 403 or 404). What can be checked is checked: the SHA-256 the versioned
 # manifest gives each Linux bundle, read over HTTPS; current/ byte for byte equal to that manifest
 # when it names that version; and each bundle's entries, which must be directories and regular
 # files on relative paths with no `..` and no set-ID bit, bin/devin among them. pin.json is
-# written only once every check has passed. Should a signature file appear, pin.sh refuses, so
-# that checking it gets added rather than skipped.
+# written only once every check has passed. Should a signature file appear, or whether one exists
+# be unknown, pin.sh refuses, so that checking it gets added rather than skipped.
 #
-# Needs bash, curl, sha256sum and GNU tar. DEVIN_PIN_BASE replaces https://static.devin.ai/cli
-# for pin-tests.sh alone, which serves its fixtures as file:// URLs.
+# Needs Linux: bash, curl, sha256sum and GNU tar. DEVIN_PIN_BASE replaces
+# https://static.devin.ai/cli for pin-tests.sh alone, which serves its fixtures over HTTPS from
+# 127.0.0.1, its certificate trusted through CURL_CA_BUNDLE.
 set -euo pipefail
 export LC_ALL=C
 
@@ -36,8 +37,7 @@ targets=(x86_64-unknown-linux aarch64-unknown-linux)
 platforms=(linux/amd64 linux/arm64)
 
 # Only characters pin.json can hold unescaped.
-[[ $base =~ ^(https|file)://[A-Za-z0-9._~%+:@/-]+$ ]] || die "base: DEVIN_PIN_BASE must be an https:// URL (file:// for pin-tests.sh), not $base"
-proto=${BASH_REMATCH[1]}
+[[ $base =~ ^https://[A-Za-z0-9._~%+:@/-]+$ ]] || die "base: DEVIN_PIN_BASE must be an https:// URL, not $base"
 for c in curl sha256sum tar; do
     command -v "$c" >/dev/null 2>&1 || die "tools: pin.sh needs $c"
 done
@@ -53,7 +53,7 @@ tmp=
 trap 'rm -rf "$work"; [[ -z $tmp ]] || rm -f "$tmp"' EXIT
 
 get() { # URL FILE
-    curl -fsSL --proto "=$proto" --proto-redir =https -o "$2" "$1" || die "fetch: could not download $1"
+    curl -fsSL --proto =https --proto-redir =https -o "$2" "$1" || die "fetch: could not download $1"
 }
 sha256() { # FILE: its SHA-256 in hex
     local line
@@ -102,11 +102,11 @@ manifest_sha=$(sha256 "$work/manifest.json")
 current_sha=$(sha256 "$work/current.json")
 if [[ $cv == "$v" ]]; then
     [[ $current_sha == "$manifest_sha" ]] || die "current: $base/current/manifest.json (sha256 $current_sha) names $v but differs from $manifest_url (sha256 $manifest_sha)"
-    verified="sha256 from Cognition's versioned manifest over HTTPS, equal to current/ when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403)"
+    verified="sha256 from Cognition's versioned manifest over HTTPS, equal to current/ when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403 or 404)"
     say "current/ names $v; $manifest_url (sha256 $manifest_sha) is byte for byte current/, read $read_at"
 else
     [[ $cv =~ ^[0-9]+(\.[0-9]+)*$ ]] || die "version-format: current/ names $cv, which is not a version of dotted numbers"
-    verified="sha256 from Cognition's versioned manifest over HTTPS; current/ named $cv when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403)"
+    verified="sha256 from Cognition's versioned manifest over HTTPS; current/ named $cv when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403 or 404)"
     say "pinning $v while current/ names $cv; $manifest_url (sha256 $manifest_sha), read $read_at"
 fi
 
@@ -125,22 +125,26 @@ for t in "${targets[@]}"; do
     urls+=("$url") shas+=("$sha")
 done
 
-# Cognition publishes no signature or checksum file beside a release; should one appear, refuse.
+# Cognition publishes no signature or checksum file beside a release, and a CDN answers 403 or 404
+# for what it doesn't hold. One that exists (200) needs its verification written before pinning;
+# any other answer leaves unknown whether one exists.
 probes=("$base/$v/SHA256SUMS")
 for u in "$manifest_url" "${urls[@]}"; do
     for s in .sig .asc .sha256 .sigstore.json; do
         probes+=("$u$s")
     done
 done
+n403=0 n404=0
 for u in "${probes[@]}"; do
-    if [[ $proto == file ]]; then
-        if [[ -e ${u#file://} ]]; then code=200; else code=403; fi
-    else
-        code=$(curl -sS -o /dev/null -w '%{http_code}' --proto =https "$u") || die "signature: could not ask for $u"
-    fi
-    [[ $code == 403 ]] || die "signature: $u answers $code, not 403: verify what Cognition publishes there and teach pin.sh to check it"
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --proto =https "$u") || die "signature-unknown: could not ask for $u, so whether Cognition publishes a signature there is unknown"
+    case $code in
+    403) n403=$((n403 + 1)) ;;
+    404) n404=$((n404 + 1)) ;;
+    200) die "signature: $u answers 200: Cognition publishes a signature or checksum there now; add its verification to pin.sh before pinning" ;;
+    *) die "signature-unknown: $u answers $code, so whether Cognition publishes a signature there is unknown" ;;
+    esac
 done
-say "no signature: each of ${#probes[@]} URLs answers 403 ($base/$v/SHA256SUMS, and .sig, .asc, .sha256 and .sigstore.json beside the manifest and both bundles)"
+say "no signature: each of ${#probes[@]} URLs answers 403 or 404 ($n403 answered 403, $n404 answered 404): $base/$v/SHA256SUMS, and .sig, .asc, .sha256 and .sigstore.json beside the manifest and both bundles"
 
 sizes=()
 for i in "${!targets[@]}"; do
@@ -187,7 +191,7 @@ json() {
         ((i + 1 < ${#targets[@]})) || sep=
         printf '    {\n      "platform": "%s",\n      "files": [\n        {\n' "${platforms[i]}"
         printf '          "url": "%s",\n          "sha256": "%s",\n          "size": %s,\n' "${urls[i]}" "${shas[i]}" "${sizes[i]}"
-        printf '          "path": ".",\n          "unpack": "tar.gz"\n        }\n      ]\n    }%s\n' "$sep"
+        printf '          "path": ".",\n          "unpack": {\n            "format": "tar.gz"\n          }\n        }\n      ]\n    }%s\n' "$sep"
     done
     printf '  ]\n}\n'
 }
