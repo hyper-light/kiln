@@ -23,7 +23,7 @@ import { commandNames } from "./marks";
 import { ComposeField } from "./compose-field";
 import { SendWith } from "./run-settings";
 import { MicButton } from "./voice";
-import { modelLabel } from "./derive";
+import { isInternal, modelLabel } from "./derive";
 import { holdWith, uploadingHere, useDraft, useHeld, useSendMode, type Held } from "./state";
 import { stopperOf, subagentPlaceholder, takesMessages } from "./tasks";
 import { notShown } from "./queue-shown";
@@ -541,7 +541,8 @@ export function Composer({
   const subTakes = sub?.takes ?? NO_MODES;
   const toSub = takesMessages(sub) ? sub : undefined;
   const delivery = useSession(store, (s) => s.state?.delivery);
-  const shownQueue = React.useMemo(() => notShown(toSub ? (toSub.queue ?? NO_QUEUE) : queue, delivery), [toSub, queue, delivery]);
+  // What agents send each other and kiln's news to the agent wait in its queue unseen (derive.ts `isInternal`).
+  const shownQueue = React.useMemo(() => notShown(toSub ? (toSub.queue ?? NO_QUEUE) : queue, delivery).filter((q) => !isInternal(q.id)), [toSub, queue, delivery]);
   const [suggest, setSuggest] = React.useState<{ kind: "/" | "@"; items: { label: string; hint?: string }[]; index: number } | null>(null);
   const ta = React.useRef<HTMLTextAreaElement | null>(null);
   // Where the caret is, as the field last said; null: at the end (text put in, not typed).

@@ -108,7 +108,8 @@ fn step30_agentfiles_on_every_surface() -> anyhow::Result<()> {
     anyhow::ensure!(st == 409, "{st} {dup}");
     let (_, listed) = call(&srv, &ada, "GET", "/api/agentfiles", None)?;
     let names: Vec<String> = listed.get("agentfiles").and_then(Value::as_array).into_iter().flatten().map(|a| s(a, "/name")).collect();
-    anyhow::ensure!(names == ["claude"] && listed.get("builtin") == Some(&json!([])) && listed.get("reaches_all") == Some(&json!(false)), "{listed}");
+    let builtin = serde_json::to_value(kiln::agentfiles::builtin::views())?;
+    anyhow::ensure!(names == ["claude"] && listed.get("builtin") == Some(&builtin) && listed.get("reaches_all") == Some(&json!(false)), "{listed}");
 
     // Bo reaches none of Ada's: as no Agentfile, on every surface; his list is his own.
     for (method, path, body) in [

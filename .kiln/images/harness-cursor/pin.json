@@ -1,0 +1,52 @@
+{
+  "harness": "cursor",
+  "version": "2026.11.11-b912975",
+  "version_read": {
+    "from": "installer",
+    "url": "https://cursor.com/install",
+    "sha256": "e8c7a37d74b27a4beedf2dc5fc3b4c83627b2dc5c05a51d34f95ffec3cc0a247",
+    "at": "2026-11-12T14:02:52Z"
+  },
+  "verified": {
+    "checksum": "same-origin",
+    "signed": false,
+    "how": "Each archive's SHA-256 equals the one in the .sha256 Cursor publishes beside it (the archive's URL with .sha256 added, on the same origin, over HTTPS). Cursor publishes no signature for its CLI, so this shows a download is the archive that origin serves, not who built it."
+  },
+  "base": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+  "builds": [
+    {
+      "platform": "linux/amd64",
+      "files": [
+        {
+          "url": "https://downloads.cursor.com/lab/2026.11.11-b912975/linux/x64/agent-cli-package.tar.gz",
+          "sha256": "be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91",
+          "size": 176703341,
+          "path": ".",
+          "unpack": {
+            "format": "tar.gz",
+            "strip": 1,
+            "unpacked_bytes": 562236246,
+            "entries": 435
+          }
+        }
+      ]
+    },
+    {
+      "platform": "linux/arm64",
+      "files": [
+        {
+          "url": "https://downloads.cursor.com/lab/2026.11.11-b912975/linux/arm64/agent-cli-package.tar.gz",
+          "sha256": "f068af64ed91b5304605976586f690579679f740a41f388091a6b3a2e776987c",
+          "size": 175384019,
+          "path": ".",
+          "unpack": {
+            "format": "tar.gz",
+            "strip": 1,
+            "unpacked_bytes": 552211752,
+            "entries": 435
+          }
+        }
+      ]
+    }
+  ]
+}

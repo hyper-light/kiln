@@ -1,0 +1,151 @@
+/* Agentfiles (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31): the list, one Agentfile, its
+   editor and its versions, each in the page's flow, as a plan's page lays its own out. */
+.af-page {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+}
+.af-title {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 26px;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+.af-dim {
+  margin: 0;
+  color: var(--color-meta);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.af-lead {
+  max-width: 72ch;
+  color: var(--color-secondary);
+  font-size: 13.5px;
+}
+.af-section {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-line);
+}
+.af-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+.af-h {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 15px;
+  font-weight: 500;
+}
+.af-rows {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.af-rows > li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--color-line);
+}
+.af-rows > li:last-child {
+  border-bottom: 0;
+}
+.af-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  min-height: 32px;
+}
+.af-name {
+  min-width: 0;
+  color: var(--color-foreground);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+a.af-name:hover {
+  color: var(--color-link);
+}
+.af-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-left: auto;
+}
+.af-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.af-error {
+  margin: 0;
+  color: #d8b9bb;
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.af-ok {
+  margin: 0;
+  color: var(--color-ok);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+/* A new one, written in place at the head of yours. */
+.af-new {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  padding: 4px 0 12px;
+}
+.af-name-field {
+  max-width: 420px;
+}
+.af-name-field input {
+  font-family: var(--font-mono);
+}
+
+/* The editor, framed, with what Shards said under it. */
+.af-editor {
+  border: 1px solid rgb(255 255 255 / 10%);
+  border-radius: 10px;
+}
+.af-editor .code-editor,
+.af-editor .code-editor .cm-editor {
+  min-height: 320px;
+}
+.af-said {
+  margin: 0;
+  padding: 8px 16px;
+  border-top: 1px solid rgb(255 255 255 / 7%);
+  color: var(--color-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.af-said[data-tone="error"] {
+  color: #d8b9bb;
+}
+
+/* A text to read, as it is: its lines wrap, so nothing scrolls sideways on a phone. */
+.af-read {
+  margin: 0;
+  padding: 10px 12px;
+  border-left: 2px solid var(--color-line-strong);
+  color: #d4dde8;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

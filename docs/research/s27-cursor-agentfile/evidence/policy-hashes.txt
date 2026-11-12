@@ -1,0 +1,5 @@
+# 2026-11-12T07:47:26Z policy hashes
+## shards origin/main 08cf6ec5d72a6d48a9c36232f27f801932907140: git show origin/main:docs/development-rules.md | shasum -a 256
+df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3  -
+## kiln origin/main efb40ea0f4b28ef1f05f4d7e7f47af28e353e166: git show origin/main:AGENTS.md | shasum -a 256
+16b05ef80db024a7b54b0e703d42c8cf5c1f330a626d6bd85ae4525609447a4c  -

@@ -1,0 +1,14 @@
+# adacachy2 ~/.cache/s23-goose-ev2/tls-empty.out (goose run with SSL_CERT_FILE an empty file, SSL_CERT_DIR an empty folder), 2026-11-12T07:48:18Z
+
+  error: Error builder error.
+Please check your system keychain and run 'goose configure' again.
+If your system is unable to use the keyring, please try setting secret key(s) via environment variables.
+For more info, see: https://goose-docs.ai/docs/troubleshooting/#keychainkeyring-errors
+
+# tls-system.out, last lines
+
+Please retry if you think this is a transient or recoverable error.
+
+Error: Ran into this error: Request failed: Request failed with status 405 Method Not Allowed at https://example.com/v1/chat/completions: .
+
+Please retry if you think this is a transient or recoverable error.

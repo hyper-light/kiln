@@ -1068,6 +1068,28 @@ composer → More options → Workspace → Own volume; `agents.start` with `wor
   loopback on macOS. `GET /api/harness/workspaces` says which machines can, and why each other
   can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
 
+## From an Agentfile, in a microVM of its own
+
+An agent can start in **a microVM of its own, made from an Agentfile** (kiln plan
+01a1cd8e862e7169a074db3d5fa33f3d, step 31): Mission control's composer → More options →
+Agentfile, which offers kiln's for its harness (`harness-claude` …) and each of yours. The choice
+is kept in this browser per harness and per project (the folder it starts in, as typed; its home
+and a shell's folder are none), so the next agent of that harness there starts from the same one;
+None is a process on its machine, as agents start without one. Its start names it as the
+microVM's image (`spec.isolation: {kind: "microvm", image}`, docs/api.md "Agentfiles"). It goes
+only to a runner that says it starts microVMs (its facts' `virt.microvm`), and anywhere else it's
+refused, never run as a process; where the machine picked would refuse it, the composer says so
+under the row. A runner's kiln starts no microVM itself until it carries Shards (the plan's steps
+16 and 17), so until then such a start is refused there, saying so.
+
+**Agentfiles** (Agents → Agentfiles, `/agents/agentfiles`) keeps yours: each opened on its own page
+in the code editor's Agentfile mode, checked by Shards as it's typed (`POST /api/agentfiles/check`,
+what it finds marked on its lines and said under the editor), saved with a new version for each new
+text (one Shards refuses isn't kept, and its words say why), renamed (no new version), each version
+read and any made current again (as a new version), and deleted with its versions after a question
+asked in place. A new one is written in place on the list; kiln's are read there and copied as
+yours, under a name that isn't kiln's, to change.
+
 ## The Changes tab
 
 An agent's Changes tab shows what it changed, its change request above (see "Change requests from
@@ -2068,6 +2090,42 @@ mock-up, a small tool) as a page: see docs/previews.md.
 - **Codex**: stdio servers are added with `codex mcp add`; http servers are written to its
   configuration through its own API (the CLI would sign in at once, in a browser on the agent's
   machine). Removing an http server signs it out first. Effort and model are set per turn.
+- **Antigravity CLI (agy) in a Shards microVM**: kiln's built-in Agentfile `harness-antigravity`
+  (`.kiln/images/harness-antigravity/`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 26).
+  - **Its pin.** pin.sh takes Google's static musl builds for linux/amd64 and linux/arm64. It checks
+    each archive's SHA-512 against the manifest Google's updater serves over HTTPS, as Google's
+    install.sh does (Google publishes no signature). The updater keeps a manifest for its current
+    version alone, so pin.sh pins that version and refuses any other. pin.json records each
+    archive and its one member, `antigravity`, which becomes `bin/agy`, and the smoke
+    (`bin/agy --version` prints the version).
+  - **Its base.** The build needs no loader or libc. It does need CA certificates, because agy
+    checks TLS against the system's bundle and carries no roots: on debian:trixie-slim and busybox
+    its HTTPS fails with "certificate signed by unknown authority". The default,
+    buildpack-deps:trixie-scm by digest, has them, as Alpine does.
+  - **Its HOME.** agy keeps its settings, MCP servers, conversations and, with no D-Bus, its
+    sign-in tokens under `$HOME`, and no variable of its own moves them. A harness sees its image
+    read-only, so harness.json's run.env sets `HOME=/home/antigravity`, and that whole home is a
+    harness volume, the person's. It also sets `AGY_CLI_DISABLE_AUTO_UPDATE=true` (the pin is the
+    version that runs) and `XDG_CACHE_HOME=/tmp/.cache` (caches on the harness's scratch).
+  - **The Shards it needs.** A shards at or after Shards main 997f4e47e, where run.env's HOME
+    replaces init's `HOME=/tmp`. v0.8.0 is the first release with it. No `env HOME=` launcher is
+    kept, since no earlier release starts a harness from its harness.json at all: that came with
+    Shards main 1da9132b7, after v0.7.0.
+  - **Volumes and grants.** `/workspace` and `/home/antigravity`, both outside `/tmp`, which each
+    harness's scratch covers. The network grants are the bring-up's: names through the microVM's
+    resolver and TCP 443 out, nothing in. agy speaks HTTPS alone, including its telemetry to
+    play.googleapis.com. A connect over IPv6 fails on Shards 8f3cd5b7, so names reach out over IPv4.
+  - **What later steps change.**
+    - Step 7 gives every harness a writable HOME of Shards' own.
+    - Step 8 plugs the project at its host path in place of `/workspace`.
+    - Step 9 grants providers by name instead of TCP 443 to anywhere.
+    - Steps 17 and 18 have kiln start agy in the microVM through Hex, with its config on a volume
+      kiln reads.
+    - Step 33 brings its sign-in as placeholders filled in at the microVM's egress, so no token
+      is ever kept in its volume.
+  - **Records.** pin.sh's record is `pin.log`, beside it. docs/research/s26-agy-agentfile/ holds
+    the rest: the tests' runs, the microVM build, smokes and probe on both platforms
+    (`evidence/step4/`), and what stayed unverified (its README).
 - **ACP agents** report no MCP servers, skills or plan limits; their slash commands run with
   `skill_run`.
 - **Cursor CLI** offers subagents as sessions of their own only to a client that takes ACP's

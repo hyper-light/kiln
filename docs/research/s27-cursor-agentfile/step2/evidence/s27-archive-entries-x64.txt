@@ -1,0 +1,11 @@
+# tar -tvzf agent-cli-package.tar.gz (linux/x64, sha256 be01f42a...) summary, Thu Nov 12 07:38:10 UTC 2026
+entries:      435
+by type:  353 -   82 d 
+outside dist-package/: 0
+dotdot or absolute: 0
+setuid/setgid: 0
+modes:  329 -rw-r--r--   24 -rwxr-xr-x   82 drwxr-xr-x 
+
+# 2026-11-12T10:31:45Z the counts the unpacker checks, x64 archive sha256 be01f42a... (python3 -I tarfile over the archive)
+first entry: drwxr-xr-x dist-package/ (a directory entry, exactly once, position 1)
+python tarfile: regular=353 dirs=82 other=0 entries(files+dirs)=435 unpacked_bytes(regular sizes)=562236246

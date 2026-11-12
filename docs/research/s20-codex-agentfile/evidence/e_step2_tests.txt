@@ -1,0 +1,1071 @@
+# Plan step 20 [kiln] step 2's tests on kiln-a094a12d.attlocal.net, Linux 6.19.10-300.fc44.x86_64 x86_64, 2026-11-12T14:43:31Z
+# kiln c09d232074950062b0a1b2e87ed373c4d02f9840 (git archive of /home/adalundhe/Projects/kiln), overlay sha256 94a8a2d7740349dc0f0a3789d729e09de93d7bb76530087b988d768415e34a97
+0cab44c633f3b0a2f976fdadd2c04fd4d8e6c1cac28f138a3d858d587ad1220f  .kiln/images/harness-codex/Agentfile
+1e6129a4ef54b07eecd134d0c34d8cd612b8cefac4793d23a324abcecdf712f5  .kiln/images/harness-codex/harness.json
+291c3f115aa1137a14827942e00f06bccfa32a23515be716743d201d5b86fb8f  .kiln/images/harness-codex/pin.json
+04833b32ac845d535eed77e5a076e982ae71c6463002e1b1baded504e180ba71  .kiln/images/harness-codex/pin.sh
+861267b716d4412b747c376bdadd109f5f644045fb4bd7eb4f0427531606efab  crates/kiln/src/agentfiles/builtin.rs
+642dc724fb099fbd22fce8e48d2b965c73abd6a93187f4724820821ddd46fbcf  crates/kiln/src/agentfiles/builtin/codex_tests.rs
+d7daa323d1162958d2544e24d9f2619cf9ba599128f254a80616f7771bcf4b4c  Dockerfile
+3a5d6a4700e3bcfe1f976cdcfee47114553569cb262a4cf75712c49137c0a411  .dockerignore
+cargo 1.99.1 (5f94df478 2026-08-27)
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+## cargo clippy --locked -p kiln --all-targets -- -D warnings
+    Updating crates.io index
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling libc v0.2.190
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.14
+    Checking cfg-if v1.0.5
+   Compiling serde_core v1.0.229
+    Checking memchr v2.8.3
+    Checking zeroize v1.9.1
+    Checking typenum v1.20.1
+   Compiling thiserror v2.0.21
+   Compiling pkg-config v0.3.34
+   Compiling version_check v0.9.5
+   Compiling serde v1.0.229
+   Compiling tree-sitter-language v0.1.9
+   Compiling generic-array v0.14.7
+   Compiling autocfg v1.5.1
+   Compiling syn v3.0.9
+   Compiling syn v2.0.119
+    Checking pin-project-lite v0.2.17
+    Checking foldhash v0.2.0
+   Compiling dunce v1.0.5
+   Compiling fs_extra v1.3.0
+   Compiling jobserver v0.1.35
+    Checking allocator-api2 v0.2.21
+    Checking equivalent v1.0.3
+   Compiling zmij v1.0.23
+   Compiling cc v1.8.0
+    Checking hashbrown v0.17.1
+   Compiling aws-lc-rs v1.18.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/aws-lc-rs/aws-lc-rs)
+    Checking cpufeatures v0.3.1
+    Checking itoa v1.0.18
+   Compiling crossbeam-utils v0.8.23
+    Checking rand_core v0.10.1
+   Compiling serde_json v1.0.154
+    Checking subtle v2.6.1
+   Compiling getrandom v0.4.3
+    Checking untrusted v0.7.1
+    Checking getrandom v0.2.17
+   Compiling crossbeam-epoch v0.9.21
+   Compiling semver v1.0.28
+    Checking log v0.4.34
+    Checking rand_core v0.6.4
+   Compiling num-traits v0.2.19
+    Checking crypto-common v0.1.7
+   Compiling rustc_version v0.4.1
+    Checking indexmap v2.14.2
+   Compiling crossbeam-deque v0.8.8
+   Compiling cmake v0.1.58
+    Checking bitflags v2.13.2
+   Compiling rustix v1.1.5
+    Checking once_cell v1.21.4
+    Checking linux-raw-sys v0.12.1
+    Checking aho-corasick v1.1.5
+    Checking rustls-pki-types v1.15.1
+    Checking regex-syntax v0.8.11
+   Compiling crc32c v0.6.8
+   Compiling aws-lc-sys v0.46.0
+   Compiling num-conv v0.2.2
+   Compiling time-core v0.1.9
+    Checking slab v0.4.12
+   Compiling time-macros v0.2.32
+    Checking deranged v0.5.9
+    Checking minimal-lexical v0.2.1
+    Checking cmov v0.5.4
+    Checking powerfmt v0.2.1
+    Checking regex-automata v0.4.18
+   Compiling synstructure v0.13.2
+    Checking ctutils v0.4.3
+    Checking nom v7.1.3
+    Checking num-integer v0.1.47
+    Checking time v0.3.55
+   Compiling synstructure v0.14.0
+    Checking hybrid-array v0.4.15
+    Checking base64 v0.23.1
+    Checking stable_deref_trait v1.2.1
+    Checking rusticata-macros v4.1.0
+   Compiling asn1-rs-derive v0.6.0
+   Compiling asn1-rs-impl v0.2.0
+    Checking num-bigint v0.4.8
+    Checking tracing-core v0.1.36
+    Checking chacha20 v0.10.2
+    Checking base64ct v1.8.3
+   Compiling thiserror-impl v2.0.21
+   Compiling serde_derive v1.0.229
+   Compiling displaydoc v0.2.7
+    Checking lazy_static v1.5.1
+   Compiling getrandom v0.3.4
+    Checking bytes v1.12.1
+    Checking rand v0.10.3
+   Compiling zerofrom-derive v0.1.8
+    Checking crypto-common v0.2.2
+    Checking block-buffer v0.12.1
+    Checking arrayvec v0.7.8
+    Checking data-encoding v2.11.1
+    Checking futures-core v0.3.34
+    Checking const-oid v0.10.2
+   Compiling oid-registry v0.8.1
+    Checking asn1-rs v0.7.2
+   Compiling yoke-derive v0.8.4
+    Checking digest v0.11.3
+   Compiling tracing-attributes v0.1.31
+    Checking block-buffer v0.10.4
+    Checking zerofrom v0.1.8
+    Checking inout v0.1.4
+   Compiling libm v0.2.16
+   Compiling strsim v0.11.1
+   Compiling ident_case v1.0.1
+    Checking cpufeatures v0.2.17
+   Compiling darling_core v0.24.1
+    Checking cipher v0.4.4
+    Checking hyper-rt v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-rt)
+    Checking digest v0.10.7
+    Checking regex v1.13.1
+    Checking der-parser v10.0.0
+    Checking yoke v0.8.3
+    Checking tracing v0.1.44
+    Checking rustc-hash v2.1.3
+   Compiling rayon-core v1.13.0
+    Checking pem-rfc7468 v0.7.0
+   Compiling zerovec-derive v0.11.6
+   Compiling der_derive v0.7.3
+    Checking alloc-no-stdlib v2.0.4
+   Compiling zerocopy v0.8.63
+    Checking futures-sink v0.3.34
+    Checking const-oid v0.9.6
+    Checking hyper-timing v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-timing)
+    Checking scopeguard v1.2.0
+    Checking flagset v0.4.7
+    Checking lock_api v0.4.14
+    Checking zerovec v0.11.8
+    Checking futures-channel v0.3.34
+    Checking smallvec v1.15.2
+    Checking alloc-stdlib v0.2.4
+    Checking der v0.7.10
+    Checking yasna v0.6.0
+    Checking pem v4.0.0
+    Checking siphasher v1.0.4
+   Compiling portable-atomic v1.15.0
+   Compiling darling_macro v0.24.1
+    Checking futures-io v0.3.34
+   Compiling darling v0.24.1
+    Checking brotli-decompressor v5.0.3
+   Compiling serde_with_macros v3.24.0
+   Compiling bytemuck_derive v1.12.1
+   Compiling futures-macro v0.3.34
+    Checking bstr v1.13.1
+   Compiling parking_lot_core v0.9.12
+    Checking futures-task v0.3.34
+    Checking parking v2.2.1
+    Checking untrusted v0.9.0
+    Checking writeable v0.6.4
+    Checking event-listener v5.4.2
+    Checking bytemuck v1.25.2
+    Checking futures-util v0.3.34
+    Checking serde_with v3.24.0
+    Checking brotli v8.0.4
+    Checking spki v0.7.3
+    Checking rand_core v0.9.5
+   Compiling blake3 v1.8.7
+    Checking aead v0.5.2
+    Checking zlib-rs v0.6.8
+    Checking spin v0.10.1
+    Checking either v1.19.0
+    Checking bit-vec v0.9.1
+   Compiling tree-sitter v0.26.10 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/vendor/tree-sitter)
+    Checking crc-fast v1.10.0
+    Checking bit-set v0.10.0
+    Checking qlog v0.15.2
+    Checking fastbloom v0.17.0
+    Checking hyper-block v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-block)
+    Checking tinystr v0.8.4
+    Checking ctr v0.9.2
+    Checking rand_pcg v0.10.2
+   Compiling rustversion v1.0.23
+    Checking constant_time_eq v0.4.2
+    Checking lru-slab v0.1.3
+    Checking streaming-iterator v0.1.9
+   Compiling unicase v2.10.0
+    Checking tinyvec v1.13.3
+    Checking ryu v1.0.23
+    Checking litemap v0.8.3
+   Compiling mime_guess v2.0.5
+    Checking icu_locale_core v2.3.0
+    Checking futures-executor v0.3.34
+    Checking ppv-lite86 v0.2.21
+    Checking parking_lot v0.12.5
+    Checking x509-cert v0.2.5
+    Checking potential_utf v0.1.6
+    Checking rand_chacha v0.9.0
+    Checking globset v0.4.20
+    Checking zerotrie v0.2.5
+    Checking rand v0.9.5
+    Checking aes v0.8.4
+    Checking sha2 v0.11.1
+    Checking bumpalo v3.20.3
+    Checking xxhash-rust v0.8.19
+   Compiling ref-cast v1.0.27
+    Checking same-file v1.0.6
+    Checking unsafe-libyaml v0.2.11
+    Checking walkdir v2.5.0
+    Checking icu_provider v2.3.1
+    Checking vorpal-core v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/core)
+    Checking futures v0.3.34
+    Checking twox-hash v2.1.5
+   Compiling ref-cast-impl v1.0.27
+   Compiling serde_derive_internals v0.30.0
+    Checking universal-hash v0.5.1
+    Checking serde_yaml v0.9.34+deprecated
+    Checking memmap2 v0.9.12
+   Compiling which v8.0.6
+   Compiling icu_locale_fallback_data v2.3.0
+   Compiling heck v0.5.0
+   Compiling cfg_aliases v0.2.2
+    Checking byteorder v1.5.0
+    Checking base16ct v0.2.0
+    Checking utf8_iter v1.0.4
+    Checking opaque-debug v0.3.1
+    Checking fastrand v2.5.0
+    Checking icu_collections v2.3.0
+    Checking sec1 v0.7.3
+   Compiling luajit-src v210.7.4+c6ffc14
+    Checking vorpal-mem v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/mem)
+    Checking ccm v0.5.0
+    Checking rayon v1.12.0
+    Checking pkcs8 v0.10.2
+    Checking hyper-raft v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-raft)
+   Compiling schemars_derive v1.2.3
+    Checking hyper-liveness v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-liveness)
+    Checking http v1.5.0
+   Compiling tree-sitter-yaml v0.7.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-yaml)
+   Compiling tree-sitter-html v0.23.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-html)
+   Compiling tree-sitter-python v0.25.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-python)
+   Compiling tree-sitter-c v0.24.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-c)
+   Compiling tree-sitter-json v0.24.8 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-json)
+   Compiling tree-sitter-typescript v0.23.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-typescript)
+   Compiling tree-sitter-go v0.25.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-go)
+   Compiling tree-sitter-md v0.5.3 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-md)
+   Compiling tree-sitter-bash v0.25.1 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-bash)
+   Compiling tree-sitter-javascript v0.25.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-javascript)
+   Compiling tree-sitter-toml-ng v0.7.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-toml-ng)
+   Compiling tree-sitter-css v0.25.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-css)
+   Compiling tree-sitter-java v0.23.5 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-java)
+   Compiling tree-sitter-rust v0.24.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-rust)
+   Compiling tree-sitter-cpp v0.23.4 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-cpp)
+   Compiling lua-src v551.0.2
+   Compiling memoffset v0.9.1
+    Checking nom v8.0.0
+   Compiling alloc-no-stdlib v3.0.0
+   Compiling unicode-general-category v1.1.0
+    Checking signature v2.2.0
+   Compiling mime v0.3.17
+    Checking dyn-clone v1.0.20
+   Compiling httparse v1.10.1
+   Compiling crc32fast v1.5.2
+    Checking winnow v1.0.4
+   Compiling typeid v1.0.3
+   Compiling icu_normalizer_data v2.3.0
+    Checking schemars v1.2.3
+   Compiling alloc-stdlib v0.3.0
+   Compiling mlua-sys v0.13.0
+    Checking toml_parser v1.1.5+spec-1.1.0
+    Checking serde_regex v1.2.0
+   Compiling rquickjs-sys v0.14.0
+   Compiling heapless v0.7.17
+    Checking toml_datetime v1.1.2+spec-1.1.0
+    Checking jiff-tzdb v0.1.9
+   Compiling thiserror v1.0.69
+   Compiling simd-adler32 v0.3.10
+    Checking adler2 v2.0.1
+   Compiling anyhow v1.0.104
+    Checking utf8parse v0.2.2
+   Compiling cfg_aliases v0.1.1
+    Checking jiff-core v0.1.1
+    Checking hex v0.4.3
+   Compiling termcolor v1.4.1
+   Compiling icu_collator_data v2.3.0
+   Compiling vcpkg v0.2.15
+   Compiling erased-serde v0.4.10
+    Checking toml_writer v1.1.3+spec-1.1.0
+    Checking crc-catalog v2.5.0
+   Compiling icu_locale_data v2.3.0
+    Checking miniz_oxide v0.9.1
+   Compiling libsqlite3-sys v0.38.2
+    Checking crc v3.4.0
+    Checking jiff v0.2.38
+   Compiling ts-rs-macros v12.0.1
+   Compiling nix v0.28.0
+    Checking anstyle-parse v1.0.0
+    Checking vorpal-config v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/config)
+    Checking icu_locale_fallback v2.3.0
+   Compiling brotli-decompressor v6.2.0
+    Checking vorpal-segment v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/segment)
+    Checking hash32 v0.2.1
+    Checking polyval v0.6.2
+   Compiling strum_macros v0.26.4
+    Checking ignore v0.4.33
+    Checking mantle-crc v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/mantle/crates/crc)
+    Checking event-listener-strategy v0.5.4
+    Checking spin v0.9.9
+    Checking focal-platform v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/focal-bus/crates/focal-platform)
+   Compiling turso_macros v0.9.0-pre.1 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/turso/macros)
+   Compiling miette-derive v7.6.0
+   Compiling thiserror-impl v1.0.69
+   Compiling aegis v0.9.20
+    Checking ordered-float v2.10.1
+   Compiling branches v0.4.6
+    Checking hashlink v0.12.2
+    Checking serde_spanned v1.1.2
+   Compiling bigdecimal v0.4.11
+   Compiling uncased v0.9.10
+    Checking write16 v1.0.0
+    Checking colorchoice v1.0.5
+    Checking anstyle v1.0.14
+    Checking utf16_iter v1.0.5
+   Compiling turso_ext v0.9.0-pre.1 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/turso/extensions/core)
+    Checking anstyle-query v1.1.5
+    Checking bit-vec v0.8.0
+    Checking is_terminal_polyfill v1.70.2
+    Checking unicode-width v0.1.14
+    Checking iana-time-zone v0.1.65
+   Compiling k8s-openapi v0.28.0
+    Checking strum v0.26.3
+    Checking miette v7.6.0
+    Checking chrono v0.4.45
+    Checking bit-set v0.8.0
+    Checking anstream v1.0.0
+    Checking icu_normalizer v2.3.0
+    Checking toml v1.1.8+spec-1.1.0
+    Checking serde-value v0.7.0
+    Checking vorpal-language v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/language)
+   Compiling brotli v9.1.1
+    Checking ghash v0.5.1
+    Checking vorpal-outline v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/outline)
+    Checking flate2 v1.1.10
+    Checking vorpal-canonical v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/canonical)
+    Checking ts-rs v12.0.1
+   Compiling rust-embed-utils v8.13.0
+    Checking vorpal-graph v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/graph)
+    Checking http-body v1.1.0
+    Checking icu_properties v2.3.0
+   Compiling turso_core v0.9.0-pre.1 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/turso/core)
+   Compiling nix v0.31.3
+    Checking tracing-serde v0.2.0
+    Checking hmac v0.12.1
+    Checking salsa20 v0.10.2
+    Checking xattr v1.6.1
+    Checking sha1 v0.11.0
+    Checking cobs v0.3.0
+    Checking sharded-slab v0.1.7
+    Checking phc v0.6.1
+    Checking matchers v0.2.0
+    Checking tracing-log v0.2.0
+   Compiling aristo-macros v0.4.1
+    Checking filetime v0.2.29
+    Checking thread_local v1.1.10
+    Checking encoding_rs v0.8.35
+    Checking softaes v0.1.7
+    Checking arraydeque v0.5.1
+    Checking mantle-codec v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/mantle/crates/codec)
+    Checking nu-ansi-term v0.50.3
+    Checking clap_lex v1.1.1
+    Checking fallible-iterator v0.3.0
+    Checking focal-memory v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/focal-bus/crates/focal-memory)
+    Checking sha1_smol v1.0.1
+   Compiling kiln-cd v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-cd)
+    Checking uuid v1.28.0
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+    Checking tracing-subscriber v0.3.23
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+    Checking clap_builder v4.6.7
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+    Checking yaml-rust2 v0.13.0
+    Checking rquickjs-core v0.14.0
+    Checking aristo v0.4.1
+    Checking icu_collator v2.3.1
+   Compiling kiln v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln)
+    Checking tar v0.4.46
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+    Checking password-hash v0.6.1
+    Checking tungstenite v0.30.0
+    Checking postcard v1.1.3
+    Checking pbkdf2 v0.12.2
+    Checking vorpal-kg v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/kg)
+    Checking icu_locale v2.3.1
+   Compiling rust-embed-impl v8.13.0
+    Checking mlua v0.12.2
+    Checking turso_parser v0.9.0-pre.1 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/turso/sqlite/parser)
+    Checking aes-gcm v0.10.3
+    Checking fancy-regex v0.19.2
+    Checking filedescriptor v0.8.3
+    Checking intrusive-collections v0.9.7
+    Checking sctp-proto v0.10.7
+    Checking tempfile v3.27.0
+    Checking roaring v0.11.5
+    Checking poly1305 v0.8.0
+   Compiling clap_derive v4.6.7
+    Checking rapidhash v4.5.1
+    Checking arc-swap v1.9.3
+    Checking lz4_flex v0.14.0
+    Checking quiver-api v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/quiver/crates/quiver-api)
+    Checking cms v0.2.3
+    Checking pack1 v1.1.0
+    Checking fastbloom v0.14.1
+    Checking sha2 v0.10.9
+    Checking polling v3.11.0
+    Checking blake2 v0.11.0
+    Checking vte v0.15.0
+    Checking combine v4.6.9
+    Checking concurrent-queue v2.5.0
+    Checking serial2 v0.2.38
+    Checking rtoolbox v0.0.6
+    Checking libloading v0.8.9
+    Checking downcast-rs v1.2.1
+    Checking fallible-streaming-iterator v0.1.9
+    Checking typed-path v0.12.3
+   Compiling pastey v0.2.3
+    Checking shell-words v1.1.1
+    Checking simdutf8 v0.1.5
+    Checking unicode-width v0.2.2
+    Checking base64 v0.22.1
+    Checking glob v0.3.4
+    Checking cfg_block v0.1.1
+    Checking atomic-waker v1.1.2
+    Checking allocator-api2 v0.4.0
+    Checking async-tungstenite v0.35.0
+    Checking vt100 v0.16.2
+    Checking clap v4.6.7
+    Checking portable-pty v0.9.0
+    Checking zip v9.0.5
+    Checking rpassword v7.5.4
+    Checking async-channel v2.5.0
+    Checking argon2 v0.6.0
+    Checking scrypt v0.11.0
+    Checking rust-embed v8.13.0
+    Checking crypto_secretbox v0.1.1
+    Checking rquickjs v0.14.0
+    Checking http-body-util v0.1.5
+    Checking kiln-bp v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-bp)
+    Checking async-lock v3.4.2
+    Checking async-broadcast v0.7.2
+    Checking toml_edit v0.25.17+spec-1.1.0
+    Checking hmac v0.13.0
+    Checking kiln-gpu v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-gpu)
+    Checking webpki-roots v1.0.9
+    Checking socket2 v0.6.5
+    Checking sysinfo v0.39.6
+    Checking serde_path_to_error v0.1.20
+    Checking hyper-measure v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-measure)
+    Checking x509-parser v0.18.1
+    Checking rustls-webpki v0.103.15
+    Checking hyper-seal v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-seal)
+    Checking hyper-datagram v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-datagram)
+    Checking mantle-s3 v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/mantle/crates/s3)
+    Checking hyper-log v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-log)
+    Checking focal-seal v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/focal-bus/crates/focal-seal)
+    Checking hyper-tls v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-tls)
+    Checking rcgen v0.14.10
+    Checking kiln-ci v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-ci)
+    Checking hyper-durable v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-durable)
+    Checking dimpl v0.7.6
+    Checking kiln-seams v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-seams)
+    Checking kiln-obs v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-obs)
+    Checking str0m-proto v0.7.0
+    Checking is v0.11.1
+    Checking hyper-quic v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-quic)
+    Checking str0m-aws-lc-rs v0.6.0
+    Checking str0m v0.24.1
+    Checking hyper-transport v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-transport)
+    Checking hyper-rt-transport v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-rt-transport)
+    Checking focal-bus v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/focal-bus/crates/focal-bus)
+    Checking mantle-protocol v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/mantle/crates/protocol)
+    Checking kiln-search v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-search)
+    Checking quiver v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/quiver/crates/quiver)
+    Checking mantle-client v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/mantle/crates/client)
+    Checking kiln-http v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-http)
+    Checking kiln-sim v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-sim)
+    Checking rusqlite v0.40.2
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6m 33s
+## cargo test --locked -p kiln --lib agentfiles
+    Updating crates.io index
+   Compiling cfg-if v1.0.5
+   Compiling zeroize v1.9.1
+   Compiling memchr v2.8.3
+   Compiling libc v0.2.190
+   Compiling typenum v1.20.1
+   Compiling serde_core v1.0.229
+   Compiling thiserror v2.0.21
+   Compiling equivalent v1.0.3
+   Compiling itoa v1.0.18
+   Compiling cpufeatures v0.3.1
+   Compiling pin-project-lite v0.2.17
+   Compiling foldhash v0.2.0
+   Compiling allocator-api2 v0.2.21
+   Compiling rand_core v0.10.1
+   Compiling zmij v1.0.23
+   Compiling crossbeam-utils v0.8.23
+   Compiling aws-lc-sys v0.46.0
+   Compiling hashbrown v0.17.1
+   Compiling untrusted v0.7.1
+   Compiling subtle v2.6.1
+   Compiling log v0.4.34
+   Compiling crossbeam-epoch v0.9.21
+   Compiling aws-lc-rs v1.18.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/aws-lc-rs/aws-lc-rs)
+   Compiling num-traits v0.2.19
+   Compiling bitflags v2.13.2
+   Compiling crossbeam-deque v0.8.8
+   Compiling generic-array v0.14.7
+   Compiling indexmap v2.14.2
+   Compiling hybrid-array v0.4.15
+   Compiling tree-sitter-language v0.1.9
+   Compiling once_cell v1.21.4
+   Compiling linux-raw-sys v0.12.1
+   Compiling const-oid v0.10.2
+   Compiling aho-corasick v1.1.5
+   Compiling rustls-pki-types v1.15.1
+   Compiling crypto-common v0.2.2
+   Compiling block-buffer v0.12.1
+   Compiling regex-syntax v0.8.11
+   Compiling time-core v0.1.9
+   Compiling slab v0.4.12
+   Compiling getrandom v0.2.17
+   Compiling getrandom v0.4.3
+   Compiling rand_core v0.6.4
+   Compiling num-conv v0.2.2
+   Compiling crypto-common v0.1.7
+   Compiling cmov v0.5.4
+   Compiling time-macros v0.2.32
+   Compiling minimal-lexical v0.2.1
+   Compiling powerfmt v0.2.1
+   Compiling nom v7.1.3
+   Compiling ctutils v0.4.3
+   Compiling crc32c v0.6.8
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.154
+   Compiling rustix v1.1.5
+   Compiling regex-automata v0.4.18
+   Compiling deranged v0.5.9
+   Compiling smallvec v1.15.2
+   Compiling num-integer v0.1.47
+   Compiling base64 v0.23.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling num-bigint v0.4.8
+   Compiling rusticata-macros v4.1.0
+   Compiling tracing-core v0.1.36
+   Compiling chacha20 v0.10.2
+   Compiling strsim v0.11.1
+   Compiling bytes v1.12.1
+   Compiling time v0.3.55
+   Compiling base64ct v1.8.3
+   Compiling lazy_static v1.5.1
+   Compiling rand v0.10.3
+   Compiling arrayvec v0.7.8
+   Compiling data-encoding v2.11.1
+   Compiling futures-core v0.3.34
+   Compiling zerofrom v0.1.8
+   Compiling getrandom v0.3.4
+   Compiling digest v0.11.3
+   Compiling block-buffer v0.10.4
+   Compiling inout v0.1.4
+   Compiling cpufeatures v0.2.17
+   Compiling darling_core v0.24.1
+   Compiling tracing v0.1.44
+   Compiling digest v0.10.7
+   Compiling cipher v0.4.4
+   Compiling yoke v0.8.3
+   Compiling rustc-hash v2.1.3
+   Compiling libm v0.2.16
+   Compiling pem-rfc7468 v0.7.0
+   Compiling const-oid v0.9.6
+   Compiling scopeguard v1.2.0
+   Compiling flagset v0.4.7
+   Compiling futures-sink v0.3.34
+   Compiling alloc-no-stdlib v2.0.4
+   Compiling hyper-timing v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-timing)
+   Compiling alloc-stdlib v0.2.4
+   Compiling asn1-rs v0.7.2
+   Compiling der v0.7.10
+   Compiling yasna v0.6.0
+   Compiling regex v1.13.1
+   Compiling futures-channel v0.3.34
+   Compiling lock_api v0.4.14
+   Compiling hyper-rt v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-rt)
+   Compiling zerovec v0.11.8
+   Compiling pem v4.0.0
+   Compiling futures-io v0.3.34
+   Compiling siphasher v1.0.4
+   Compiling der-parser v10.0.0
+   Compiling oid-registry v0.8.1
+   Compiling brotli-decompressor v5.0.3
+   Compiling zerocopy v0.8.63
+   Compiling darling_macro v0.24.1
+   Compiling x509-parser v0.18.1
+   Compiling rayon-core v1.13.0
+   Compiling darling v0.24.1
+   Compiling serde_with_macros v3.24.0
+   Compiling bstr v1.13.1
+   Compiling writeable v0.6.4
+   Compiling untrusted v0.9.0
+   Compiling parking v2.2.1
+   Compiling futures-task v0.3.34
+   Compiling event-listener v5.4.2
+   Compiling futures-util v0.3.34
+   Compiling rustls-webpki v0.103.15
+   Compiling brotli v8.0.4
+   Compiling serde_with v3.24.0
+   Compiling bytemuck v1.25.2
+   Compiling tree-sitter v0.26.10 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/vendor/tree-sitter)
+   Compiling portable-atomic v1.15.0
+   Compiling rcgen v0.14.10
+   Compiling spki v0.7.3
+   Compiling rand_core v0.9.5
+   Compiling aead v0.5.2
+   Compiling zlib-rs v0.6.8
+   Compiling spin v0.10.1
+   Compiling either v1.19.0
+   Compiling bit-vec v0.9.1
+   Compiling same-file v1.0.6
+   Compiling crc-fast v1.10.0
+   Compiling walkdir v2.5.0
+   Compiling bit-set v0.10.0
+   Compiling fastbloom v0.17.0
+   Compiling qlog v0.15.2
+   Compiling parking_lot_core v0.9.12
+   Compiling tinystr v0.8.4
+   Compiling ctr v0.9.2
+   Compiling rand_pcg v0.10.2
+   Compiling streaming-iterator v0.1.9
+   Compiling lru-slab v0.1.3
+   Compiling litemap v0.8.3
+   Compiling constant_time_eq v0.4.2
+   Compiling ryu v1.0.23
+   Compiling tinyvec v1.13.3
+   Compiling hyper-block v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-block)
+   Compiling ppv-lite86 v0.2.21
+   Compiling blake3 v1.8.7
+   Compiling rand_chacha v0.9.0
+   Compiling icu_locale_core v2.3.0
+   Compiling rand v0.9.5
+   Compiling futures-executor v0.3.34
+   Compiling parking_lot v0.12.5
+   Compiling x509-cert v0.2.5
+   Compiling globset v0.4.20
+   Compiling potential_utf v0.1.6
+   Compiling zerotrie v0.2.5
+   Compiling hyper-tls v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-tls)
+   Compiling hyper-seal v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-seal)
+   Compiling aes v0.8.4
+   Compiling sha2 v0.11.1
+   Compiling simd-adler32 v0.3.10
+   Compiling adler2 v2.0.1
+   Compiling unsafe-libyaml v0.2.11
+   Compiling xxhash-rust v0.8.19
+   Compiling bumpalo v3.20.3
+   Compiling unicase v2.10.0
+   Compiling miniz_oxide v0.9.1
+   Compiling mime_guess v2.0.5
+   Compiling icu_provider v2.3.1
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling futures v0.3.34
+   Compiling vorpal-core v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/core)
+   Compiling twox-hash v2.1.5
+   Compiling universal-hash v0.5.1
+   Compiling memmap2 v0.9.12
+   Compiling base16ct v0.2.0
+   Compiling byteorder v1.5.0
+   Compiling fastrand v2.5.0
+   Compiling utf8_iter v1.0.4
+   Compiling opaque-debug v0.3.1
+   Compiling vorpal-mem v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/mem)
+   Compiling sec1 v0.7.3
+   Compiling icu_collections v2.3.0
+   Compiling ref-cast v1.0.27
+   Compiling hyper-log v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-log)
+   Compiling ccm v0.5.0
+   Compiling rayon v1.12.0
+   Compiling pkcs8 v0.10.2
+   Compiling hyper-raft v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-raft)
+   Compiling hyper-liveness v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-liveness)
+   Compiling http v1.5.0
+   Compiling hyper-datagram v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-datagram)
+   Compiling nom v8.0.0
+   Compiling signature v2.2.0
+   Compiling mime v0.3.17
+   Compiling alloc-no-stdlib v3.0.0
+   Compiling winnow v1.0.4
+   Compiling dyn-clone v1.0.20
+   Compiling schemars v1.2.3
+   Compiling alloc-stdlib v0.3.0
+   Compiling mlua-sys v0.13.0
+   Compiling hyper-durable v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-durable)
+   Compiling icu_locale_fallback_data v2.3.0
+   Compiling serde_regex v1.2.0
+   Compiling toml_datetime v1.1.2+spec-1.1.0
+   Compiling toml_writer v1.1.3+spec-1.1.0
+   Compiling hex v0.4.3
+   Compiling toml_parser v1.1.5+spec-1.1.0
+   Compiling hyper-quic v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-quic)
+   Compiling utf8parse v0.2.2
+   Compiling jiff-tzdb v0.1.9
+   Compiling crc-catalog v2.5.0
+   Compiling jiff-core v0.1.1
+   Compiling crc v3.4.0
+   Compiling anstyle-parse v1.0.0
+   Compiling vorpal-config v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/config)
+   Compiling icu_locale_fallback v2.3.0
+   Compiling memoffset v0.9.1
+   Compiling tree-sitter-java v0.23.5 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-java)
+   Compiling tree-sitter-rust v0.24.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-rust)
+   Compiling tree-sitter-cpp v0.23.4 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-cpp)
+   Compiling tree-sitter-yaml v0.7.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-yaml)
+   Compiling tree-sitter-html v0.23.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-html)
+   Compiling tree-sitter-python v0.25.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-python)
+   Compiling tree-sitter-c v0.24.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-c)
+   Compiling tree-sitter-json v0.24.8 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-json)
+   Compiling vorpal-segment v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/segment)
+   Compiling tree-sitter-typescript v0.23.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-typescript)
+   Compiling tree-sitter-go v0.25.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-go)
+   Compiling tree-sitter-md v0.5.3 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-md)
+   Compiling tree-sitter-bash v0.25.1 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-bash)
+   Compiling tree-sitter-javascript v0.25.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-javascript)
+   Compiling tree-sitter-toml-ng v0.7.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-toml-ng)
+   Compiling dimpl v0.7.6
+   Compiling tree-sitter-css v0.25.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/grammars/tree-sitter-css)
+   Compiling crc32fast v1.5.2
+   Compiling jiff v0.2.38
+   Compiling icu_normalizer_data v2.3.0
+   Compiling brotli-decompressor v6.2.0
+   Compiling typeid v1.0.3
+   Compiling unicode-general-category v1.1.0
+   Compiling httparse v1.10.1
+   Compiling polyval v0.6.2
+   Compiling hash32 v0.2.1
+   Compiling ignore v0.4.33
+   Compiling mantle-crc v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/mantle/crates/crc)
+   Compiling event-listener-strategy v0.5.4
+   Compiling spin v0.9.9
+   Compiling focal-platform v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/focal-bus/crates/focal-platform)
+   Compiling serde_spanned v1.1.2
+   Compiling ordered-float v2.10.1
+   Compiling hashlink v0.12.2
+   Compiling write16 v1.0.0
+   Compiling colorchoice v1.0.5
+   Compiling utf16_iter v1.0.5
+   Compiling anstyle v1.0.14
+   Compiling anstyle-query v1.1.5
+   Compiling unicode-width v0.1.14
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling bit-vec v0.8.0
+   Compiling iana-time-zone v0.1.65
+   Compiling miette v7.6.0
+   Compiling bit-set v0.8.0
+   Compiling chrono v0.4.45
+   Compiling anstream v1.0.0
+   Compiling hyper-transport v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-transport)
+   Compiling icu_normalizer v2.3.0
+   Compiling str0m-proto v0.7.0
+   Compiling thiserror v1.0.69
+   Compiling serde-value v0.7.0
+   Compiling vorpal-language v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/language)
+   Compiling focal-seal v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/focal-bus/crates/focal-seal)
+   Compiling toml v1.1.8+spec-1.1.0
+   Compiling heapless v0.7.17
+   Compiling mantle-s3 v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/mantle/crates/s3)
+   Compiling hyper-rt-transport v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-rt-transport)
+   Compiling vorpal-outline v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/outline)
+   Compiling strum v0.26.3
+   Compiling ghash v0.5.1
+   Compiling brotli v9.1.1
+   Compiling erased-serde v0.4.10
+   Compiling flate2 v1.1.10
+   Compiling vorpal-canonical v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/canonical)
+   Compiling rquickjs-sys v0.14.0
+   Compiling anyhow v1.0.104
+   Compiling icu_locale_data v2.3.0
+   Compiling icu_collator_data v2.3.0
+   Compiling ts-rs v12.0.1
+   Compiling kiln-seams v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-seams)
+   Compiling vorpal-graph v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/graph)
+   Compiling http-body v1.1.0
+   Compiling rust-embed-utils v8.13.0
+   Compiling icu_properties v2.3.0
+   Compiling xattr v1.6.1
+   Compiling matchers v0.2.0
+   Compiling salsa20 v0.10.2
+   Compiling hmac v0.12.1
+   Compiling sha1 v0.11.0
+   Compiling phc v0.6.1
+   Compiling sharded-slab v0.1.7
+   Compiling tracing-serde v0.2.0
+   Compiling tracing-log v0.2.0
+   Compiling filetime v0.2.29
+   Compiling cobs v0.3.0
+   Compiling thread_local v1.1.10
+   Compiling encoding_rs v0.8.35
+   Compiling sha1_smol v1.0.1
+   Compiling nu-ansi-term v0.50.3
+   Compiling focal-memory v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/focal-bus/crates/focal-memory)
+   Compiling softaes v0.1.7
+   Compiling clap_lex v1.1.1
+   Compiling kiln-cd v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-cd)
+   Compiling fallible-iterator v0.3.0
+   Compiling arraydeque v0.5.1
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+   Compiling mantle-codec v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/mantle/crates/codec)
+   Compiling clap_builder v4.6.7
+   Compiling mantle-protocol v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/mantle/crates/protocol)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+   Compiling aegis v0.9.20
+   Compiling yaml-rust2 v0.13.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling uuid v1.28.0
+   Compiling aristo v0.4.1
+   Compiling tar v0.4.46
+   Compiling kiln v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln)
+   Compiling postcard v1.1.3
+   Compiling icu_collator v2.3.1
+   Compiling focal-bus v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/focal-bus/crates/focal-bus)
+   Compiling password-hash v0.6.1
+   Compiling tungstenite v0.30.0
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+   Compiling pbkdf2 v0.12.2
+   Compiling vorpal-kg v0.10.2 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/vorpal/crates/kg)
+   Compiling rust-embed-impl v8.13.0
+   Compiling icu_locale v2.3.1
+   Compiling libsqlite3-sys v0.38.2
+   Compiling nix v0.28.0
+   Compiling rquickjs-core v0.14.0
+   Compiling mlua v0.12.2
+   Compiling aes-gcm v0.10.3
+   Compiling turso_parser v0.9.0-pre.1 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/turso/sqlite/parser)
+   Compiling turso_ext v0.9.0-pre.1 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/turso/extensions/core)
+   Compiling branches v0.4.6
+   Compiling bigdecimal v0.4.11
+   Compiling uncased v0.9.10
+   Compiling filedescriptor v0.8.3
+   Compiling str0m-aws-lc-rs v0.6.0
+   Compiling is v0.11.1
+   Compiling fancy-regex v0.19.2
+   Compiling intrusive-collections v0.9.7
+   Compiling sctp-proto v0.10.7
+   Compiling tempfile v3.27.0
+   Compiling poly1305 v0.8.0
+   Compiling roaring v0.11.5
+   Compiling lz4_flex v0.14.0
+   Compiling arc-swap v1.9.3
+   Compiling rapidhash v4.5.1
+   Compiling quiver-api v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/quiver/crates/quiver-api)
+   Compiling cms v0.2.3
+   Compiling pack1 v1.1.0
+   Compiling fastbloom v0.14.1
+   Compiling polling v3.11.0
+   Compiling sha2 v0.10.9
+   Compiling blake2 v0.11.0
+   Compiling vte v0.15.0
+   Compiling combine v4.6.9
+   Compiling rtoolbox v0.0.6
+   Compiling serial2 v0.2.38
+   Compiling concurrent-queue v2.5.0
+   Compiling libloading v0.8.9
+   Compiling cfg_block v0.1.1
+   Compiling allocator-api2 v0.4.0
+   Compiling shell-words v1.1.1
+   Compiling base64 v0.22.1
+   Compiling atomic-waker v1.1.2
+   Compiling downcast-rs v1.2.1
+   Compiling typed-path v0.12.3
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling glob v0.3.4
+   Compiling simdutf8 v0.1.5
+   Compiling unicode-width v0.2.2
+   Compiling vt100 v0.16.2
+   Compiling turso_core v0.9.0-pre.1 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/turso/core)
+   Compiling rusqlite v0.40.2
+   Compiling zip v9.0.5
+   Compiling k8s-openapi v0.28.0
+   Compiling portable-pty v0.9.0
+   Compiling async-tungstenite v0.35.0
+   Compiling async-channel v2.5.0
+   Compiling rpassword v7.5.4
+   Compiling scrypt v0.11.0
+   Compiling argon2 v0.6.0
+   Compiling kiln-ci v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-ci)
+   Compiling quiver v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/quiver/crates/quiver)
+   Compiling rust-embed v8.13.0
+   Compiling clap v4.6.7
+   Compiling crypto_secretbox v0.1.1
+   Compiling kiln-search v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-search)
+   Compiling kiln-sim v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-sim)
+   Compiling rquickjs v0.14.0
+   Compiling nix v0.31.3
+   Compiling str0m v0.24.1
+   Compiling mantle-client v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/mantle/crates/client)
+   Compiling http-body-util v0.1.5
+   Compiling kiln-http v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-http)
+   Compiling kiln-bp v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-bp)
+   Compiling kiln-obs v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-obs)
+   Compiling async-lock v3.4.2
+   Compiling async-broadcast v0.7.2
+   Compiling toml_edit v0.25.17+spec-1.1.0
+   Compiling hmac v0.13.0
+   Compiling serde_path_to_error v0.1.20
+   Compiling hyper-measure v0.1.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/vendor/hyper-raft/crates/hyper-measure)
+   Compiling socket2 v0.6.5
+   Compiling sysinfo v0.39.6
+   Compiling kiln-gpu v0.2.0 (/home/adalundhe/.cache/s20-step2/run-20261112T144331Z/src/crates/kiln-gpu)
+   Compiling webpki-roots v1.0.9
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9m 51s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s20-step2/target/debug/deps/kiln-721748ad308a6d67)
+
+running 23 tests
+test agentfiles::builtin::codex_tests::codex_embedded_files_hold_no_credential ... ok
+test agentfiles::builtin::tests::every_builtin_is_a_valid_agentfile_once ... ok
+test agentfiles::builtin::codex_tests::codex_agentfile_is_exactly_its_base_harness_grants_and_volumes ... ok
+test agentfiles::builtin::codex_tests::codex_harness_json_runs_kilns_command_with_codex_home_in_its_volume ... ok
+test agentfiles::check::tests::step30_a_real_shards_checks_without_resolving_bases ... ok
+test agentfiles::check::tests::step30_a_refusal_without_a_line_in_its_words_names_it ... ok
+test agentfiles::check::tests::step30_no_result_is_unchecked_saying_shards_last_error ... ok
+test agentfiles::check::tests::step30_the_target_that_stops_shards_says_the_text_passed ... ok
+test agentfiles::check::tests::step30_any_other_error_refuses_it_in_shards_words_at_its_line ... ok
+test agentfiles::check::tests::step30_warnings_are_diagnostics_that_refuse_nothing ... ok
+test agentfiles::builtin::codex_tests::codex_pin_holds_both_platforms_with_arm64s_rg_in_place ... ok
+test agentfiles::check::tests::step30_shards_is_asked_for_its_check_in_a_folder_of_its_own ... ok
+test agentfiles::tests::step30_a_delete_lets_go_of_texts_no_record_names ... ok
+test agentfiles::tests::step30_a_text_read_back_is_held_to_its_digest ... ok
+test agentfiles::tests::step30_ls_tree_entries ... ok
+test agentfiles::tests::step30_names_and_texts ... ok
+test agentfiles::tests::step30_a_project_is_listed_for_its_readers_alone ... ok
+test agentfiles::tests::step30_the_migration_makes_its_tables ... ok
+test agentfiles::tests::step30_a_text_the_store_cant_keep_writes_no_record ... ok
+test agentfiles::tests::step30_a_person_reaches_only_their_own ... ok
+test agentfiles::tests::step30_texts_are_kept_once_in_the_store_of_bytes ... ok
+test agentfiles::tests::step30_who_reaches_everyones ... ok
+test agentfiles::tests::step30_versions_restore_and_delete ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 4365 filtered out; finished in 0.83s
+
+# exits: archive=0 overlay=0 clippy=0 test=0
+# done 2026-11-12T15:00:00Z

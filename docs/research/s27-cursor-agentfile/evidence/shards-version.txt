@@ -1,0 +1,9 @@
+# 2026-11-12T08:56:22Z the version shards reports, at Shards origin/main bbd908197
+## git show origin/main:crates/shards/Cargo.toml | grep -m1 '^version'
+version = "0.7.0"
+## git tag --contains 997f4e47e (release tags carrying the run.env fix)
+none
+## git tag --list 'v*' | sort -V | tail -3
+v0.5.0
+v0.6.0
+v0.7.0

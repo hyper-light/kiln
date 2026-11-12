@@ -1,0 +1,58 @@
+[2m[kiln] on d1323898b255a3ed435eb83fa0f7b0cf · macos/aarch64 · 29 of 32 cores idle · 58 GB free · room for 4 CPUs, 12 GiB of memory[0m
+== host: Darwin 25.4.0 arm64 Adas-Mac-Studio.local 2026-11-12T15:03:13Z
+== tree: 94639db7b83076143ff48fe5dac6edb9d3a33743
+c839318f8d148e5b23106aaf1af5b8050606df9a8987ca15b8a77da5ddfe2838  crates/kiln/src/agentfiles/unpack.rs
+c0f93809d48f83aeb047afb15e1e457ed43e4a0e7b3611c665bf75b7513cf1cb  crates/kiln/src/agentfiles/unpack/tests.rs
+8ec98e51c3a87ea0fdc6c0e43c50cbbf13d30c4bcba22359b469b984665866cb  docs/research/s27-cursor-agentfile/step2/mutate.py
+staging-is-the-target: KILLED (exit 101)
+entries-bound-removed: KILLED (exit 101)
+bytes-bound-removed: KILLED (exit 101)
+entries-total-removed: KILLED (exit 101)
+bytes-total-removed: KILLED (exit 101)
+sticky-allowed: KILLED (exit 101)
+prefix-unchecked: KILLED (exit 101)
+duplicates-allowed: KILLED (exit 101)
+harness-file-allowed: KILLED (exit 101)
+nameless-file-dropped: KILLED (exit 101)
+modes-as-archived: KILLED (exit 101)
+target-there-unchecked: KILLED (exit 101)
+neither-taken: KILLED (exit 101)
+discard-unsearched: KILLED (exit 101)
+
+== mutants
+KILLED       staging-is-the-target    the_per_arch_directory_appears_only_once_the_whole_archive_is_in  thread 'agentfiles::unpack::tests::the_per_arch_directory_appears_only_once_the_whole_archive_is_in' (28580289) panicked at crates/kiln/src/agentfiles/unpack/tests.rs:272:5: | error: test failed, to rerun pass `-p kiln --lib`
+KILLED       entries-bound-removed    nothing_of_a_tree_shows_until_all_of_it_is_in  thread 'agentfiles::unpack::tests::nothing_of_a_tree_shows_until_all_of_it_is_in' (28582188) panicked at crates/kiln/src/agentfiles/unpack/tests.rs:314:9: | assertion `left == right` failed: 3 entries and 12 bytes pinned | error: test failed, to rerun pass `-p kiln --lib`
+KILLED       bytes-bound-removed      nothing_of_a_tree_shows_until_all_of_it_is_in  thread 'agentfiles::unpack::tests::nothing_of_a_tree_shows_until_all_of_it_is_in' (28583516) panicked at crates/kiln/src/agentfiles/unpack/tests.rs:314:9: | assertion `left == right` failed: 4 entries and 11 bytes pinned | error: test failed, to rerun pass `-p kiln --lib`
+KILLED       entries-total-removed    nothing_of_a_tree_shows_until_all_of_it_is_in  error: test failed, to rerun pass `-p kiln --lib`
+KILLED       bytes-total-removed      nothing_of_a_tree_shows_until_all_of_it_is_in  error: test failed, to rerun pass `-p kiln --lib`
+KILLED       sticky-allowed           each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing  error: test failed, to rerun pass `-p kiln --lib`
+KILLED       prefix-unchecked         each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing  error: test failed, to rerun pass `-p kiln --lib`
+KILLED       duplicates-allowed       each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing  thread 'agentfiles::unpack::tests::each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing' (28591431) panicked at crates/kiln/src/agentfiles/unpack/tests.rs:366:9: | error: test failed, to rerun pass `-p kiln --lib`
+KILLED       harness-file-allowed     each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing  error: test failed, to rerun pass `-p kiln --lib`
+KILLED       nameless-file-dropped    each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing  thread 'agentfiles::unpack::tests::each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing' (28594629) panicked at crates/kiln/src/agentfiles/unpack/tests.rs:366:9: | error: test failed, to rerun pass `-p kiln --lib`
+KILLED       modes-as-archived        a_strip_1_tree_appears_whole_with_its_files_directories_and_modes  thread 'agentfiles::unpack::tests::a_strip_1_tree_appears_whole_with_its_files_directories_and_modes' (28595504) panicked at crates/kiln/src/agentfiles/unpack/tests.rs:211:5: | assertion `left == right` failed | error: test failed, to rerun pass `-p kiln --lib`
+KILLED       target-there-unchecked   a_target_already_there_is_refused_and_left_as_it_was  error: test failed, to rerun pass `-p kiln --lib`
+KILLED       neither-taken            the_unpack_object_is_one_form_or_refused  error: test failed, to rerun pass `-p kiln --lib`
+KILLED       discard-unsearched       a_directory_its_owner_may_not_search_is_kept_and_still_discarded_whole  thread 'agentfiles::unpack::tests::a_directory_its_owner_may_not_search_is_kept_and_still_discarded_whole' (28598514) panicked at crates/kiln/src/agentfiles/unpack/tests.rs:702:5: | assertion failed: !staging.exists() | error: test failed, to rerun pass `-p kiln --lib`
+
+== unmutated: exit 0
+test agentfiles::unpack::tests::what_is_not_a_gzip_tar_is_refused_whole ... ok
+test agentfiles::unpack::tests::the_unpack_object_is_one_form_or_refused ... ok
+test agentfiles::unpack::tests::a_target_already_there_is_refused_and_left_as_it_was ... ok
+test agentfiles::unpack::tests::the_per_arch_directory_appears_only_once_the_whole_archive_is_in ... ok
+test agentfiles::unpack::tests::a_tree_at_a_path_inside_appears_whole_beside_what_is_there ... ok
+test agentfiles::unpack::tests::a_directory_its_owner_may_not_search_is_kept_and_still_discarded_whole ... ok
+test agentfiles::unpack::tests::devins_shape_unpacks_at_strip_0_with_nothing_beside_it ... ok
+test agentfiles::unpack::tests::a_pi_shaped_build_unpacks_its_tree_then_picks_its_members ... ok
+test agentfiles::unpack::tests::a_strip_1_tree_appears_whole_with_its_files_directories_and_modes ... ok
+test agentfiles::unpack::tests::a_member_is_one_regular_file_held_to_its_pin ... ok
+test agentfiles::unpack::tests::nothing_of_a_tree_shows_until_all_of_it_is_in ... ok
+test agentfiles::unpack::tests::each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing ... ok
+test agentfiles::unpack::tests::an_archive_cut_short_leaves_nothing_behind ... ok
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 4326 filtered out; finished in 0.12s
+
+== 14 of 14 mutants killed; unmutated suite exit 0
+== mutate exit: 0
+c839318f8d148e5b23106aaf1af5b8050606df9a8987ca15b8a77da5ddfe2838  crates/kiln/src/agentfiles/unpack.rs
+[2m[kiln] used memory not measured over 19 min 11 s; OOM kills not seen here[0m
+kiln run exit 0

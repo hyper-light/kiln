@@ -203,6 +203,8 @@ export interface Choices {
   prompt: string;
   reach: string;
   volume: boolean;
+  /** The Agentfile its microVM is made from (`Spec.isolation.image`); none: a process on its machine. */
+  agentfile?: string;
 }
 
 /** The spec that starts it. In a shell it starts where the shell is; "~" (or nothing) is the machine's home. */
@@ -220,6 +222,8 @@ export function specOf(c: Choices): Spec {
     shell: c.shell || undefined,
     reach: c.reach || undefined,
     workspace: c.volume && !c.shell ? { kind: "volume" } : undefined,
+    // A microVM of its own, made from its Agentfile (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31).
+    ...(c.agentfile ? { isolation: { kind: "microvm", image: c.agentfile } } : {}),
   };
 }
 

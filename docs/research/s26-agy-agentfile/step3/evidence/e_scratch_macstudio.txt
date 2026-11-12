@@ -1,0 +1,77 @@
+# kiln run r11 (MCP run, needs macos,cpus>=20,cpus=4,mem=6g; carrier ~/.cache/s26-step3/carrier, scratch-run.sh sha256 8c7e2db9...): the unpack module as a scratch crate (kiln's dependency versions and workspace lints) at s26-unpack-core 0911f08ee's unpack.rs and unpack/tests.rs; tests, clippy -D warnings, docs/research/s26-agy-agentfile/step3/mutate.py. Extracted byte-exact from the session transcript.
+{"exit_code": 0, "placement": {"answer": "started", "got": {"cpu": 4, "disk": 0, "gpu": 0, "mem": 6442450944}, "runner": "d1323898b255a3ed435eb83fa0f7b0cf", "why": "room for it there: 11.118 CPUs, 32.7 GiB, 1 GPU free"}, "runner": "d1323898b255a3ed435eb83fa0f7b0cf", "running": false}
+8c7e2db99e25167327d9c2448be340a37bd693715ec69f930839ba74b19b916c  scratch-run.sh
+START host Adas-Mac-Studio.local Darwin 25.4.0 arm64 at 2026-11-12T17:52:00Z
+payload sha256 30ca263fec3704eaadca9fa8a3d275f7fb7e4d7b12c14d83eb5dde3bac6556e5 (want 30ca263fec3704eaadca9fa8a3d275f7fb7e4d7b12c14d83eb5dde3bac6556e5)
+344b17f786d4c2bc38b20a4edb6d032b11bc50b5be25f2a02b35603bafd01ad6  src/unpack.rs
+a3952b022afea79f92486102aaaebe0c708e97a9863a64abe9b284dbc5fd3898  src/unpack/tests.rs
+afc2745a6ddf89b9e62d5706ef525059d7195ed84ea08f28703f7458627bb3c4  mutate.py
+cargo 1.99.1 (5f94df478 2026-08-27)
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+clippy 0.1.99 (58cf8f9c35 2026-10-13)
+test unpack::tests::alone_is_a_members_field ... ok
+test unpack::tests::a_target_already_there_is_refused_and_left_as_it_was ... ok
+test unpack::tests::what_is_not_a_gzip_tar_is_refused_whole ... ok
+test unpack::tests::the_unpack_object_is_one_form_or_refused ... ok
+test unpack::tests::a_member_held_alone_unpacks_as_its_file_and_nothing_else ... ok
+test unpack::tests::the_per_arch_directory_appears_only_once_the_whole_archive_is_in ... ok
+test unpack::tests::devins_shape_unpacks_at_strip_0_with_nothing_beside_it ... ok
+test unpack::tests::a_member_held_alone_is_held_to_its_size_and_digest ... ok
+test unpack::tests::a_member_not_held_alone_passes_over_what_is_beside_it ... ok
+test unpack::tests::a_pi_shaped_build_unpacks_its_tree_then_picks_its_members ... ok
+test unpack::tests::a_tree_at_a_path_inside_appears_whole_beside_what_is_there ... ok
+test unpack::tests::a_directory_its_owner_may_not_search_is_kept_and_still_discarded_whole ... ok
+test unpack::tests::a_strip_1_tree_appears_whole_with_its_files_directories_and_modes ... ok
+test unpack::tests::a_member_is_one_regular_file_held_to_its_pin ... ok
+test unpack::tests::nothing_of_a_tree_shows_until_all_of_it_is_in ... ok
+test unpack::tests::an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing ... ok
+test unpack::tests::each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing ... ok
+test unpack::tests::an_archive_cut_short_leaves_nothing_behind ... ok
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+TEST EXIT 0 after 23 s
+CLIPPY EXIT 0 after 1 s
+hostile-unchecked: KILLED (exit 101)
+extra-after-taken: KILLED (exit 101)
+extra-before-taken: KILLED (exit 101)
+duplicate-taken: KILLED (exit 101)
+beside-passed-over: KILLED (exit 101)
+stops-after-member: KILLED (exit 101)
+written-member-kept: KILLED (exit 101)
+missing-told-as-extra: KILLED (exit 101)
+alone-ignored: KILLED (exit 101)
+alone-not-a-member-field: KILLED (exit 101)
+== mutants
+KILLED       hostile-unchecked          an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing  thread 'unpack::tests::an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing' (29072187) panicked at src/unpack/tests.rs:768:9: | error: test failed, to rerun pass `--lib`
+KILLED       extra-after-taken          an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing  Error: a file after it: unpacked, not refused | error: test failed, to rerun pass `--lib`
+KILLED       extra-before-taken         an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing  Error: a file before it: unpacked, not refused | error: test failed, to rerun pass `--lib`
+KILLED       duplicate-taken            an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing  thread 'unpack::tests::an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing' (29073025) panicked at src/unpack/tests.rs:768:9: | error: test failed, to rerun pass `--lib`
+KILLED       beside-passed-over         an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing  Error: a file after it: unpacked, not refused | error: test failed, to rerun pass `--lib`
+KILLED       stops-after-member         an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing  Error: a file after it: unpacked, not refused | error: test failed, to rerun pass `--lib`
+KILLED       written-member-kept        an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing  thread 'unpack::tests::an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing' (29073861) panicked at src/unpack/tests.rs:769:9: | assertion `left == right` failed: a file after it: nothing is left | error: test failed, to rerun pass `--lib`
+KILLED       missing-told-as-extra      an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing  thread 'unpack::tests::an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing' (29074140) panicked at src/unpack/tests.rs:767:9: | assertion `left == right` failed: another file, no member | error: test failed, to rerun pass `--lib`
+KILLED       alone-ignored              alone_is_a_members_field  thread 'unpack::tests::alone_is_a_members_field' (29074420) panicked at src/unpack/tests.rs:834:5: | assertion `left == right` failed | error: test failed, to rerun pass `--lib`
+KILLED       alone-not-a-member-field   alone_is_a_members_field  Error: {"format": "tar.gz", "alone": true, "strip": 1, "unpacked_bytes": 1, "entries": 1}: taken, not refused | error: test failed, to rerun pass `--lib`
+== unmutated: exit 0
+test unpack::tests::alone_is_a_members_field ... ok
+test unpack::tests::a_tree_at_a_path_inside_appears_whole_beside_what_is_there ... ok
+test unpack::tests::a_target_already_there_is_refused_and_left_as_it_was ... ok
+test unpack::tests::what_is_not_a_gzip_tar_is_refused_whole ... ok
+test unpack::tests::a_member_held_alone_is_held_to_its_size_and_digest ... ok
+test unpack::tests::a_member_held_alone_unpacks_as_its_file_and_nothing_else ... ok
+test unpack::tests::a_member_not_held_alone_passes_over_what_is_beside_it ... ok
+test unpack::tests::the_per_arch_directory_appears_only_once_the_whole_archive_is_in ... ok
+test unpack::tests::the_unpack_object_is_one_form_or_refused ... ok
+test unpack::tests::a_directory_its_owner_may_not_search_is_kept_and_still_discarded_whole ... ok
+test unpack::tests::devins_shape_unpacks_at_strip_0_with_nothing_beside_it ... ok
+test unpack::tests::a_strip_1_tree_appears_whole_with_its_files_directories_and_modes ... ok
+test unpack::tests::a_pi_shaped_build_unpacks_its_tree_then_picks_its_members ... ok
+test unpack::tests::a_member_is_one_regular_file_held_to_its_pin ... ok
+test unpack::tests::nothing_of_a_tree_shows_until_all_of_it_is_in ... ok
+test unpack::tests::an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing ... ok
+test unpack::tests::each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing ... ok
+test unpack::tests::an_archive_cut_short_leaves_nothing_behind ... ok
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+== 10 of 10 mutants killed; unmutated suite exit 0
+MUTATE EXIT 0 after 22 s
+END 2026-11-12T17:52:47Z, removed /Users/adalundhe/.cache/s26-scratch.c5xtFH

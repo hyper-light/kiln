@@ -15,7 +15,7 @@ export function privatePage(pathname: string): boolean {
 }
 
 export function needsSessions(pathname: string): boolean {
-  return /^\/agents(?:\/?$|\/(?!(?:plans|research|sessions)(?:\/|$))[^/]+\/?$)/.test(pathname);
+  return /^\/agents(?:\/?$|\/(?!(?:plans|research|sessions|agentfiles)(?:\/|$))[^/]+\/?$)/.test(pathname);
 }
 
 /** A bootstrap belongs only to this initial page, never another route or a later login. */

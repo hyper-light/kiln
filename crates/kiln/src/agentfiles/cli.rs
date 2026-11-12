@@ -131,4 +131,89 @@ mod tests {
             Ok(())
         })
     }
+
+    /// Live, where a test names a folder for it (`KILN_TEST_LIVE_CONTEXT`, under `~/.cache` on kiln's Linux
+    /// machines): `kiln agentfiles context antigravity` makes agy's context for linux/amd64 and
+    /// linux/arm64 from Google's storage. It holds the Agentfile and the two harness directories alone,
+    /// each with the embedded harness.json and bin/agy, unpacked from its archive's one entry, hashing to
+    /// the pin's member SHA-256 at 0755; and this machine's own, run, prints the pin's version as its
+    /// first line (kiln plan 01a1ce705e55753182217afdfe607de9, step 3's live test: 2 of 2).
+    #[test]
+    fn step26_a_live_antigravity_context_holds_the_pinned_builds() -> anyhow::Result<()> {
+        use serde_json::Value;
+        let Some(root) = std::env::var_os("KILN_TEST_LIVE_CONTEXT") else {
+            eprintln!("skipped: KILN_TEST_LIVE_CONTEXT names no folder");
+            return Ok(());
+        };
+        let agy = builtin::ALL.iter().find(|b| b.harness == "antigravity").ok_or_else(|| anyhow::anyhow!("no antigravity built-in"))?;
+        let pin: Value = serde_json::from_str(agy.pin)?;
+        let version = pin.get("version").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no version pinned"))?.to_owned();
+        let harness_json = agy.files.iter().find(|(name, _)| *name == "harness.json").map(|(_, text)| *text).ok_or_else(|| anyhow::anyhow!("no harness.json"))?;
+        let names = |dir: &std::path::Path| -> anyhow::Result<Vec<String>> {
+            let mut names = std::fs::read_dir(dir)?.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned())).collect::<Result<Vec<_>, _>>()?;
+            names.sort();
+            Ok(names)
+        };
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir_in(&root)?;
+            let cmd = AgentfilesCmd::Context { harness: "antigravity".into(), dir: dir.path().to_owned(), platform: vec!["linux/amd64".into(), "linux/arm64".into()], variant: None, base: None };
+            run(AgentfilesArgs { cmd }).await?;
+            anyhow::ensure!(names(dir.path())? == ["Agentfile", "antigravity-amd64", "antigravity-arm64"], "the context holds {:?}", names(dir.path())?);
+            anyhow::ensure!(std::fs::read_to_string(dir.path().join("Agentfile"))? == agy.text, "the Agentfile isn't the embedded one");
+            let mut matched = 0;
+            for (platform, arch) in [("linux/amd64", "amd64"), ("linux/arm64", "arm64")] {
+                let want = pin
+                    .get("builds")
+                    .and_then(Value::as_array)
+                    .and_then(|b| b.iter().find(|b| b.get("platform").and_then(Value::as_str) == Some(platform)))
+                    .and_then(|b| b.pointer("/files/0/unpack/sha256"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("no {platform} member pinned"))?;
+                let harness = dir.path().join(format!("antigravity-{arch}"));
+                anyhow::ensure!(names(&harness)? == ["bin", "harness.json"] && names(&harness.join("bin"))? == ["agy"], "{platform}: {:?}", names(&harness)?);
+                anyhow::ensure!(std::fs::read_to_string(harness.join("harness.json"))? == harness_json, "{platform}: harness.json isn't the embedded one");
+                let binary = harness.join("bin/agy");
+                let mut hash = Sha256::new();
+                let mut file = std::fs::File::open(&binary)?;
+                let mut buf = vec![0u8; 1 << 20];
+                loop {
+                    let n = std::io::Read::read(&mut file, &mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hash.update(buf.get(..n).unwrap_or_default());
+                }
+                let got = hex::encode(hash.finalize());
+                anyhow::ensure!(got == want, "{}: SHA-256 {got}, the pin's member {want}", binary.display());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mode = std::fs::metadata(&binary)?.permissions().mode() & 0o7777;
+                    anyhow::ensure!(mode == 0o755, "{}: mode {mode:o}, not 755", binary.display());
+                }
+                println!("MATCH {platform} {got}");
+                matched += 1;
+            }
+            anyhow::ensure!(matched == 2, "{matched} of 2 binaries match their pins");
+            let own = match (std::env::consts::OS, std::env::consts::ARCH) {
+                ("linux", "x86_64") => Some("amd64"),
+                ("linux", "aarch64") => Some("arm64"),
+                _ => None,
+            };
+            if let Some(arch) = own {
+                // Its own HOME, and no self-update (harness.json's AGY_CLI_DISABLE_AUTO_UPDATE).
+                let home = tempfile::tempdir_in(&root)?;
+                let out = std::process::Command::new(dir.path().join(format!("antigravity-{arch}/bin/agy")))
+                    .arg("--version")
+                    .env("HOME", home.path())
+                    .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
+                    .output()?;
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let first = stdout.lines().next().unwrap_or_default();
+                anyhow::ensure!(out.status.success() && first == version, "antigravity-{arch}/bin/agy --version: {} {stdout:?}", out.status);
+                println!("VERSION linux/{arch} {first}");
+            }
+            Ok(())
+        })
+    }
 }

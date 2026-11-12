@@ -1,0 +1,35 @@
+# pin.sh's record (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 26), 2026-11-12T16:06:21Z, on a Linux runner (Linux 6.19.10-300.fc44.x86_64 x86_64; PRETTY_NAME="Fedora Linux 44 (KDE Plasma Desktop Edition)")
+# run from the kiln worktree s26-agy-agentfile's commit 2130dad30e6f9c9346eb3b68ec03725136050bbc: git archive of .kiln/images/harness-antigravity at that commit, its commit id read back from the archive (git get-tar-commit-id)
+# the scripts as run: a0f1c4f2070e5d86a58c9d3bd477feb8643362e37c3e58dd8e192b5eb4637836 pin.sh, b7d24f6c778ac50abd2e1e449b92e5aa30bf31d90912e86e020a4d6e8152ee1a pin_test.sh
+$ bash pin_test.sh
+ok - good
+ok - good-asked-current
+ok - asked-other-version
+ok - byte-flipped
+ok - versions-differ
+ok - releases-newer
+ok - other-eid
+ok - http-url
+ok - bad-sha512
+ok - second-entry
+ok - symlink
+ok - renamed
+all cases passed
+(exit 0)
+$ bash pin.sh
+pin.sh: /releases: newest 1.5.7, execution id 6190022064472064
+pin.sh: linux/amd64: https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.7-6190022064472064/linux-x64-musl/cli_linux_x64_musl.tar.gz
+pin.sh:   SHA-512 equals the manifest's; archive SHA-256 5000036342e1269ff91624a9eb49890613e8b88ab24de22081546f5ec625c654, 97192936 bytes; antigravity SHA-256 bd643ae267d521b8febe5cd9fbce6533a1c7c0831aa0b28325401cb3e3b2035d, 252013896 bytes
+pin.sh: linux/arm64: https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.7-6190022064472064/linux-arm-musl/cli_linux_arm64_musl.tar.gz
+pin.sh:   SHA-512 equals the manifest's; archive SHA-256 0bfe412983268d6e5fc24c3946135dc458aae17185cacfb31fa59fbaaa7604c7, 91199919 bytes; antigravity SHA-256 a96c0ecd1edabfb7e9736f25404601dc8002aea5d627dafe5c34e1aff37a442b, 238891264 bytes
+pin.sh: pinned agy 1.5.7 (execution id 6190022064472064) for linux/amd64 and linux/arm64 in /home/adalundhe/.cache/s26-pin-record.qjQbYz/.kiln/images/harness-antigravity/pin.json, sha256 6102386d7aa9233f065dfc47c8a54ac19fedcc5defb0677a069b894a268c98ce
+(exit 0)
+$ PIN_OUT=~/.cache/s26-asked.json bash pin.sh 1.5.6    # a version the manifests do not serve
+pin.sh: /releases: newest 1.5.7, execution id 6190022064472064
+pin.sh: agy 1.5.6 has no publisher checksum: Google's updater serves a manifest for its current version, 1.5.7, alone
+(exit 2; no pin written)
+$ each pinned URL downloaded again, apart from pin.sh, against pin.json
+match: https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.7-6190022064472064/linux-x64-musl/cli_linux_x64_musl.tar.gz (97192936 bytes)
+match: https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.7-6190022064472064/linux-arm-musl/cli_linux_arm64_musl.tar.gz (91199919 bytes)
+archives whose SHA-256, SHA-512 and size equal pin.json's: 2 of 2
+# pin.json as written: 6102386d7aa9233f065dfc47c8a54ac19fedcc5defb0677a069b894a268c98ce
