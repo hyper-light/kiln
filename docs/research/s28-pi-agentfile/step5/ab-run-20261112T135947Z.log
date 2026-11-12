@@ -1,0 +1,110 @@
+# step 5 A/B on adacachy2 (Linux 7.3.3-1-cachyos x86_64), ldd (GNU libc) 2.44, 2026-11-12T13:59:47Z
+# pin.json sha256 66dd822e16b2fd5e66cf22f221cc79e6ed3f23d828d484a6567dd3fa183a0888; ab.sh 01d54cd4335ef1bd50564ac620527404292282684202eca8c708f93f01009228; drive.py cd2fa5fd1d2736928c64f4d6f4b9a5bb3ad527b92e233d93712553f9f3bc7021; mock_provider.py efe8fb60e4cf666a1a4fa7672300019745ce951030fbf2f23286082534568633
+## harness-pi's linux/amd64 directory, from pin.json
+checked and laid out: pi-linux-x64.tar.gz -> .
+checked and laid out: ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz -> bin/rg
+checked and laid out: fd-v10.5.2-x86_64-unknown-linux-musl.tar.gz -> bin/fd
+pi --version: 1.5.2; bin: fd rg 
+## A-offline: network off, PATH=/home/adalundhe/.cache/s28-step5/20261112T135947Z/sysbin
+tool find: error: fd is not available and could not be downloaded
+tool grep: error: ripgrep (rg) is not available and could not be downloaded
+settled: True; pi exit: 0
+driver exit: 0
+config bin/: absent
+pi's own words: fd is not available and could not be downloaded|ripgrep (rg) is not available and could not be downloaded|
+mock requests: 2
+## A-online: network on, PATH=/home/adalundhe/.cache/s28-step5/20261112T135947Z/sysbin
+tool find: ok: notes.txt
+tool grep: ok: notes.txt:1: the needle is here
+settled: True; pi exit: 0
+driver exit: 0
+config bin/: fd rg 
+downloaded rg: ripgrep 15.2.0 (rev e89fff89ac)
+downloaded fd: fd 10.5.2
+pi's own words: 
+mock requests: 2
+## B-offline: network off, PATH=/home/adalundhe/.cache/s28-step5/20261112T135947Z/ctx/bin:/home/adalundhe/.cache/s28-step5/20261112T135947Z/sysbin
+tool grep: ok: notes.txt:1: the needle is here
+tool find: ok: notes.txt
+settled: True; pi exit: 0
+driver exit: 0
+config bin/: absent
+pi's own words: 
+mock requests: 2
+## B-online: network on, PATH=/home/adalundhe/.cache/s28-step5/20261112T135947Z/ctx/bin:/home/adalundhe/.cache/s28-step5/20261112T135947Z/sysbin
+tool grep: ok: notes.txt:1: the needle is here
+tool find: ok: notes.txt
+settled: True; pi exit: 0
+driver exit: 0
+config bin/: absent
+pi's own words: 
+mock requests: 2
+## B-norg: network on, PATH=/home/adalundhe/.cache/s28-step5/20261112T135947Z/ctx-norg/bin:/home/adalundhe/.cache/s28-step5/20261112T135947Z/sysbin
+tool find: ok: notes.txt
+tool grep: ok: notes.txt:1: the needle is here
+settled: True; pi exit: 0
+driver exit: 0
+config bin/: rg 
+downloaded rg: ripgrep 15.2.0 (rev e89fff89ac)
+pi's own words: 
+mock requests: 2
+## verdicts
+PASS A-offline: grep fails as rg can't be had
+PASS A-offline: find fails as fd can't be had
+PASS A-offline: nothing downloaded
+PASS A-online: pi downloads rg and fd into its config's bin/
+PASS A-online: grep and find then run
+PASS B-offline: grep finds the needle with the pinned rg
+PASS B-offline: find lists notes.txt with the pinned fd
+PASS B-offline: nothing downloaded
+PASS B-online: grep finds the needle with the pinned rg
+PASS B-online: find lists notes.txt with the pinned fd
+PASS B-online: nothing downloaded
+PASS B-norg (mutation): rg is downloaded again, fd is not
+12 of 12 expectations hold
+=====CASE A-offline
+--- tools.json
+[{"tool": "find", "error": true, "first_line": "fd is not available and could not be downloaded"}, {"tool": "grep", "error": true, "first_line": "ripgrep (rg) is not available and could not be downloaded"}]
+--- mock.log
+{"method": "POST", "path": "/v1/chat/completions", "stream": true, "tool_result_in": false, "tools": ["read", "grep", "find", "ls"]}
+{"method": "POST", "path": "/v1/chat/completions", "stream": true, "tool_result_in": true, "tools": ["read", "grep", "find", "ls"]}
+--- stderr.txt (last 15 lines)
+Warning: No project session found with id 's5-A-offline'; creating a new session with that id.
+--- events: 33 lines; types: {'response': 1, 'agent_start': 1, 'turn_start': 2, 'message_start': 6, 'message_end': 6, 'message_update': 9, 'tool_execution_start': 2, 'tool_execution_end': 2, 'turn_end': 2, 'agent_end': 1, 'agent_settled': 1}
+=====CASE A-online
+--- tools.json
+[{"tool": "find", "error": false, "first_line": "notes.txt"}, {"tool": "grep", "error": false, "first_line": "notes.txt:1: the needle is here"}]
+--- mock.log
+{"method": "POST", "path": "/v1/chat/completions", "stream": true, "tool_result_in": false, "tools": ["read", "grep", "find", "ls"]}
+{"method": "POST", "path": "/v1/chat/completions", "stream": true, "tool_result_in": true, "tools": ["read", "grep", "find", "ls"]}
+--- stderr.txt (last 15 lines)
+Warning: No project session found with id 's5-A-online'; creating a new session with that id.
+--- events: 33 lines; types: {'response': 1, 'agent_start': 1, 'turn_start': 2, 'message_start': 6, 'message_end': 6, 'message_update': 9, 'tool_execution_start': 2, 'tool_execution_end': 2, 'turn_end': 2, 'agent_end': 1, 'agent_settled': 1}
+=====CASE B-offline
+--- tools.json
+[{"tool": "grep", "error": false, "first_line": "notes.txt:1: the needle is here"}, {"tool": "find", "error": false, "first_line": "notes.txt"}]
+--- mock.log
+{"method": "POST", "path": "/v1/chat/completions", "stream": true, "tool_result_in": false, "tools": ["read", "grep", "find", "ls"]}
+{"method": "POST", "path": "/v1/chat/completions", "stream": true, "tool_result_in": true, "tools": ["read", "grep", "find", "ls"]}
+--- stderr.txt (last 15 lines)
+Warning: No project session found with id 's5-B-offline'; creating a new session with that id.
+--- events: 33 lines; types: {'response': 1, 'agent_start': 1, 'turn_start': 2, 'message_start': 6, 'message_end': 6, 'message_update': 9, 'tool_execution_start': 2, 'tool_execution_end': 2, 'turn_end': 2, 'agent_end': 1, 'agent_settled': 1}
+=====CASE B-online
+--- tools.json
+[{"tool": "grep", "error": false, "first_line": "notes.txt:1: the needle is here"}, {"tool": "find", "error": false, "first_line": "notes.txt"}]
+--- mock.log
+{"method": "POST", "path": "/v1/chat/completions", "stream": true, "tool_result_in": false, "tools": ["read", "grep", "find", "ls"]}
+{"method": "POST", "path": "/v1/chat/completions", "stream": true, "tool_result_in": true, "tools": ["read", "grep", "find", "ls"]}
+--- stderr.txt (last 15 lines)
+Warning: No project session found with id 's5-B-online'; creating a new session with that id.
+--- events: 33 lines; types: {'response': 1, 'agent_start': 1, 'turn_start': 2, 'message_start': 6, 'message_end': 6, 'message_update': 9, 'tool_execution_start': 2, 'tool_execution_end': 2, 'turn_end': 2, 'agent_end': 1, 'agent_settled': 1}
+=====CASE B-norg
+--- tools.json
+[{"tool": "find", "error": false, "first_line": "notes.txt"}, {"tool": "grep", "error": false, "first_line": "notes.txt:1: the needle is here"}]
+--- mock.log
+{"method": "POST", "path": "/v1/chat/completions", "stream": true, "tool_result_in": false, "tools": ["read", "grep", "find", "ls"]}
+{"method": "POST", "path": "/v1/chat/completions", "stream": true, "tool_result_in": true, "tools": ["read", "grep", "find", "ls"]}
+--- stderr.txt (last 15 lines)
+Warning: No project session found with id 's5-B-norg'; creating a new session with that id.
+--- events: 33 lines; types: {'response': 1, 'agent_start': 1, 'turn_start': 2, 'message_start': 6, 'message_end': 6, 'message_update': 9, 'tool_execution_start': 2, 'tool_execution_end': 2, 'turn_end': 2, 'agent_end': 1, 'agent_settled': 1}
+ab exit: 0  dir: /home/adalundhe/.cache/s28-step5/20261112T135947Z
