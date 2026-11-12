@@ -1,0 +1,19 @@
+# kiln origin/main efb40ea0f4b28ef1f05f4d7e7f47af28e353e166: archive crates and tar.gz unpacking, 2026-11-12T08:02:12Z
+## Cargo.lock package names
+name = "flate2"
+name = "miniz_oxide"
+name = "tar"
+name = "zip"
+## git grep tar::Archive / GzDecoder
+origin/main:crates/kiln/src/api.rs:8559:            flate2::read::GzDecoder::new(packed.as_slice()).read_to_string(&mut text)?;
+origin/main:crates/kiln/src/api.rs:8589:                flate2::read::GzDecoder::new(b).read_to_string(&mut text)?;
+origin/main:crates/kiln/src/cd/targets/aws_static.rs:135:        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+origin/main:crates/kiln/src/ci/registry/proxy.rs:495:                flate2::read::GzDecoder::new(raw.as_slice()).read_to_end(&mut plain)?;
+origin/main:crates/kiln/src/ci/rest/scanning.rs:80:        flate2::read::GzDecoder::new(bytes.as_slice()).take(MAX_SARIF + 1).read_to_end(&mut text).map_err(|e| format!("rejecting SARIF: it isn't gzip: {e}"))?;
+origin/main:crates/kiln/src/ci/services/pipelines.rs:287:            std::io::copy(&mut flate2::read::GzDecoder::new(src), &mut w)?;
+origin/main:crates/kiln/src/deploy/init.rs:256:        for entry in tar::Archive::new(flate2::read::GzDecoder::new(a.as_slice())).entries()? {
+origin/main:crates/kiln/src/exec.rs:414:            tar::Archive::new(std::io::BufReader::new(f)).unpack(&ws)?;
+origin/main:crates/kiln/src/harness/packed.rs:190:        flate2::read::GzDecoder::new(b).read_to_end(&mut out)?;
+origin/main:crates/kiln/src/harness/registry.rs:7882:        flate2::read::GzDecoder::new(packed.as_slice()).read_to_string(&mut decoded)?;
+origin/main:crates/kiln/src/harness/registry.rs:8147:            std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(gz.as_slice()), &mut text)?;
+origin/main:crates/kiln/src/http/compress.rs:649:        flate2::read::GzDecoder::new(b).read_to_end(&mut out)?;

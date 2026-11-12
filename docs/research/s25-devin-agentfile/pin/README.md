@@ -7,6 +7,9 @@ f24). Implementer under step 25's coordinator `01a1ce6f55c3749ca87f3ef3393ec8b0`
 review changes on top of it. The policy read is in [../POLICY_READ.json](../POLICY_READ.json) (Shards
 `docs/development-rules.md` sha256 `df2acf47…`, kiln `AGENTS.md` sha256 `16b05ef8…`).
 
+Step 2 has since re-pinned 3000.12.43 in the form kiln's one unpacker takes, a tree with its totals, by the
+pin.sh it changed: [../step2/README.md](../step2/README.md). This file records step 1's run.
+
 ## Files
 
 | File | What |

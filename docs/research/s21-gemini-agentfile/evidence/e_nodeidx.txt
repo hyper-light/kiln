@@ -1,0 +1,11 @@
+# Node.js release data, 2026-11-12T08:02:10Z, on Adas-MacBook-Pro-2.local
+## https://raw.githubusercontent.com/nodejs/Release/main/schedule.json
+v20 {"start": "2023-04-18", "lts": "2023-10-24", "maintenance": "2024-10-22", "end": "2026-04-30", "codename": "Iron"}
+v22 {"start": "2024-04-24", "lts": "2024-10-29", "maintenance": "2025-10-21", "end": "2027-04-30", "codename": "Jod"}
+v24 {"start": "2025-05-06", "lts": "2025-10-28", "maintenance": "2026-10-20", "end": "2028-04-30", "codename": "Krypton"}
+v26 {"start": "2026-05-05", "lts": "2026-10-28", "maintenance": "2027-10-20", "end": "2029-04-30", "codename": "Lithium"}
+## https://nodejs.org/dist/index.json: the newest release of each major
+v20.20.2 2026-03-24 Iron security= True ['linux-arm64', 'linux-x64']
+v22.23.5 2026-11-11 Jod security= True ['linux-arm64', 'linux-x64', 'linux-x64-musl']
+v24.22.3 2026-11-10 Krypton security= True ['linux-arm64', 'linux-x64', 'linux-x64-musl']
+v26.13.1 2026-11-10 Lithium security= True ['linux-arm64', 'linux-x64', 'linux-x64-musl']

@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -90,12 +91,20 @@ impl All {
     }
 }
 
-/// What a runner last said, and when the server heard it (unix seconds).
+/// What a runner last said, and when the server heard it (unix seconds). Shared: what's weighed off the shards, and what
+/// a save writes there, hold it as it is ([`Copies::heard`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct Heard {
-    report: Report,
+    report: Arc<Report>,
     at: i64,
+}
+
+/// Whether reports `a` and `b` say the same but for what changes all the time (a runner's clock, the room on its disk):
+/// every other field compared, so a field added to a report is weighed here or said not to be.
+fn same_but_clock(a: &Report, b: &Report) -> bool {
+    let Report { at: _, base, disk: _, copies, gone, done, error } = a;
+    *base == b.base && *copies == b.copies && *gone == b.gone && *done == b.done && *error == b.error
 }
 
 /// A copy as a view shows it: what the rules say of it now, and where it is.
@@ -178,8 +187,8 @@ impl Copies {
             if peers.is_empty() {
                 continue;
             }
-            let copies = self.heard.lock().get(&name).map(|h| h.report.copies.clone()).unwrap_or_default();
-            let answer = Answer { set: all.set_for(&name, &copies), asked: self.asked.lock().get(&name).copied().unwrap_or(0) };
+            let report = self.heard.lock().get(&name).map(|h| Arc::clone(&h.report)).unwrap_or_default();
+            let answer = Answer { set: all.set_for(&name, &report.copies), asked: self.asked.lock().get(&name).copied().unwrap_or(0) };
             let Ok(json) = serde_json::to_string(&answer) else { continue };
             let msg = crate::proto::ServerMsg::Copies { json };
             for p in peers {
@@ -197,26 +206,36 @@ impl Copies {
         }
     }
 
-    /// Runner `runner`'s report of its copies: kept, and answered with the rules it's to weigh them
-    /// with and the last ask to let go now.
-    pub async fn heard(&self, hub: &Hub, runner: &str, report: Option<&Value>) -> Value {
-        let Some(report) = report.and_then(|r| serde_json::from_value::<Report>(r.clone()).ok()) else {
-            return json!({ "error": "a report of copies was expected" });
+    /// Runner `runner`'s report of its copies (none: it sent none): kept, and answered with the rules it's to weigh them
+    /// with and the last ask to let go now, as the answer's JSON. It's weighed on the compute pool (the rules for its
+    /// copies, whether it says anything new, the answer written), and the report it replaces let go of there: a runner
+    /// holds many copies (goal 9, plan 01a1a87b2cec step 3: read on the hub's shard from a JSON tree of it, copied whole to
+    /// be read and twice more to be compared, a report held the shard 0.55 ms on the CPU in probe 19's Linux rounds).
+    pub async fn heard(&self, hub: &Hub, runner: &str, report: Option<Report>) -> String {
+        let Some(report) = report else {
+            return json!({ "error": "a report of copies was expected" }).to_string();
         };
-        let set = self.all(hub).await.set_for(runner, &report.copies);
-        // What changes all the time (its clock, the room on its disk) is kept, but no change.
-        let changed = {
-            let mut heard = self.heard.lock();
-            let same = heard.get(runner).is_some_and(|h| Report { at: 0, disk: None, ..h.report.clone() } == Report { at: 0, disk: None, ..report.clone() });
-            heard.insert(runner.to_owned(), Heard { report, at: crate::util::now_unix() });
-            !same
+        let all = self.all(hub).await;
+        let before = self.heard.lock().get(runner).map(|h| Arc::clone(&h.report));
+        let asked = self.asked.lock().get(runner).copied().unwrap_or(0);
+        let name = runner.to_owned();
+        let weighed = crate::rt::compute(move || {
+            let answer = serde_json::to_string(&Answer { set: all.set_for(&name, &report.copies), asked }).unwrap_or_default();
+            // What changes all the time (its clock, the room on its disk) is kept, but no change.
+            let same = before.is_some_and(|b| same_but_clock(&b, &report));
+            (Arc::new(report), same, answer)
+        })
+        .await;
+        let Ok((report, same, answer)) = weighed else {
+            return json!({ "error": "the report of copies couldn't be weighed" }).to_string();
         };
-        if changed {
+        let replaced = self.heard.lock().insert(runner.to_owned(), Heard { report, at: crate::util::now_unix() });
+        let _ = crate::rt::compute(move || drop(replaced)).await;
+        if !same {
             self.save().await;
             hub.emit(&crate::wire::events::ServerEvent::Keep);
         }
-        let asked = self.asked.lock().get(runner).copied().unwrap_or(0);
-        serde_json::to_value(Answer { set, asked }).unwrap_or_default()
+        answer
     }
 
     /// Ask `runner` (or every runner kiln knows) to let go now of what its rules don't keep: the
@@ -259,7 +278,7 @@ impl Copies {
             .map(|(name, connected)| {
                 let h = heard.get(name);
                 let empty = Report::default();
-                let report = h.map_or(&empty, |h| &h.report);
+                let report = h.map_or(&empty, |h| &*h.report);
                 let set = all.set_for(name, &report.copies);
                 let look = Look { now, since: now, disk: report.disk, asked: false, copies: &report.copies };
                 let verdicts = keep::verdicts(&set, &look);
@@ -303,10 +322,12 @@ impl Copies {
         json!({ "rules": all.agents.get(id).cloned().unwrap_or_default(), "copies": copies })
     }
 
+    /// What every runner last said, written to its file: written out with the file's write, off the shards (what each said
+    /// is shared, not copied, to get there).
     async fn save(&self) {
-        let bytes = serde_json::to_vec(&*self.heard.lock()).unwrap_or_default();
+        let heard = self.heard.lock().clone();
         let file = self.file.clone();
-        if let Ok(Err(e)) = crate::rt::blocking(move || crate::sync::group::save_atomic(&file, &bytes)).await {
+        if let Ok(Err(e)) = crate::rt::blocking(move || crate::sync::group::save_atomic(&file, &serde_json::to_vec(&heard).unwrap_or_default())).await {
             tracing::warn!(target: "kiln.reach", error = %e, "what runners said of their copies couldn't be saved");
         }
     }
@@ -343,6 +364,32 @@ mod tests {
         assert!(set.repos.contains_key("github.com/a/b"));
         assert_eq!(set.agents.keys().collect::<Vec<_>>(), ["a1"], "only the agents its copies were used by");
         assert_eq!(all.set_for("mac", &[]).runner, Rules::default());
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a runner's report of its copies comes read with its question (no JSON tree of it to
+    /// read again on the hub's shard), and is weighed on the compute pool: the answer it's given and whether it says
+    /// anything new, the report it replaces let go of there too. One that changes only its clock and disk is kept as said,
+    /// and is no change.
+    #[test]
+    fn g9_s3_a_report_of_copies_is_read_with_its_question_and_weighed_off_the_shard() -> anyhow::Result<()> {
+        let q: crate::reach::Question = serde_json::from_str(r#"{"op": "keep", "report": {"at": 5, "base": "/c", "copies": [{"from": "mac", "key": "k1", "agents": ["a1"]}]}}"#)?;
+        let crate::reach::Question::Keep { report: Some(report) } = q else { anyhow::bail!("a keep question with its report read: {q:?}") };
+        anyhow::ensure!(report.copies.first().is_some_and(|c| c.key == "k1" && c.agents == ["a1"]), "{report:?}");
+        anyhow::ensure!(same_but_clock(&report, &Report { at: 9, disk: Some(keep::Disk { total: 10, free: 4 }), ..report.clone() }), "its clock and disk are no change");
+        anyhow::ensure!(!same_but_clock(&report, &Report { done: 3, ..report.clone() }), "what it carried out is");
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let asked = crate::rt::COMPUTE_ASKED.with(std::cell::Cell::get);
+            let answer: Value = serde_json::from_str(&hub.copies.heard(&hub, "fedora", Some(report.clone())).await)?;
+            anyhow::ensure!(crate::rt::COMPUTE_ASKED.with(std::cell::Cell::get) > asked, "weighed on the compute pool");
+            anyhow::ensure!(answer.get("asked") == Some(&json!(0)) && answer.get("set").is_some_and(Value::is_object), "{answer}");
+            let later = Report { at: 9, ..report.clone() };
+            hub.copies.heard(&hub, "fedora", Some(later)).await;
+            anyhow::ensure!(hub.copies.heard.lock().get("fedora").is_some_and(|h| h.report.at == 9), "kept as said");
+            let none: Value = serde_json::from_str(&hub.copies.heard(&hub, "fedora", None).await)?;
+            anyhow::ensure!(none.get("error").is_some(), "{none}");
+            Ok(())
+        })
     }
 
     #[test]

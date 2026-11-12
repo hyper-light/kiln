@@ -1,0 +1,15 @@
+M11 run 2026-11-12T07:53:20Z
+No runner suits os == linux, arch == aarch64.
+
+[2madacachy2: x86_64 is not aarch64[0m
+[2madas-mac-studio-3.local: macos is not linux[0m
+[2madacachy: x86_64 is not aarch64[0m
+[2madalundhe-macbook-pro: macos is not linux[0m
+[2mkiln-a094a12d.attlocal.net: x86_64 is not aarch64[0m
+[2madas-mac-studio-2.local: macos is not linux[0m
+[2madas-mac-studio.local: macos is not linux[0m
+[2madas-mac-studio.local-2: macos is not linux[0m
+[2madas-macbook-pro-2.local: macos is not linux[0m
+[2madas-macbook-pro.local: macos is not linux[0m
+[2mjupiter: windows is not linux[0m
+[2mfedora.attlocal.net: x86_64 is not aarch64[0m

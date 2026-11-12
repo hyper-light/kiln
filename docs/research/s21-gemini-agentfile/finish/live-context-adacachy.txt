@@ -1,0 +1,19 @@
+# The live context test and the real Shards check on adacachy (Linux 7.2.9-2-cachyos x86_64), 2026-11-12T22:16:59Z,
+# tree 6e814bff8 (the test binary of tests-adacachy.txt), umask 0022:
+#   KILN_TEST_LIVE_CONTEXT=~/.cache/s21-finish/live cargo test --locked -q -p kiln --lib step21_a_live_gemini_context -- --nocapture
+#   KILN_TEST_SHARDS=~/.cache/s21-finish/shards-v0.7.0/shards-linux-amd64 cargo test --locked -q -p kiln --lib real_shards
+#   cargo test --locked -q -p kiln --lib docs_agents_md
+== live context
+running 1 test
+MATCH linux/amd64 node/bin/node a7ec1b37e6ff9d187e4198c5b6df9a4eb1c74dd31804fb3bac55cc4ceca1ac01
+MATCH linux/amd64 node/LICENSE 5888dbb9a1d2b18f2c3e6c5f6af1b39de658372b402a0577b002777f14c62ace
+TREE linux/amd64 449 files 99143752 bytes
+MATCH linux/arm64 node/bin/node 8f9c2a55879e9705cb285b6cdd649d95df642c6720f052cb30f300d2677da99f
+MATCH linux/arm64 node/LICENSE 5888dbb9a1d2b18f2c3e6c5f6af1b39de658372b402a0577b002777f14c62ace
+TREE linux/arm64 449 files 99143752 bytes
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4471 filtered out; finished in 12.16s
+== real shards (v0.7.0, sha256 a9c9092ac5f6a7c6b306a47ef5c9d27f48f6541885abe823c0063abc2d549388, as its SHA256SUMS lists it)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4470 filtered out; finished in 0.20s
+== docs/agents.md's metrics
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4471 filtered out; finished in 0.01s

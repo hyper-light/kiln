@@ -1,0 +1,7 @@
+pin.sh 2026-11-12T08:24:39Z on Darwin arm64, gh 2.98.0
+linux/amd64 gnu: opencode-linux-x64-baseline.tar.gz and its opencode match the pin; provenance 5f76acb12572932297cbce81bd0026e59b16e7ac, run 42778325289
+linux/amd64 musl: opencode-linux-x64-baseline-musl.tar.gz and its opencode match the pin; provenance 5f76acb12572932297cbce81bd0026e59b16e7ac, run 42778325289
+linux/arm64 gnu: opencode-linux-arm64.tar.gz and its opencode match the pin; provenance 5f76acb12572932297cbce81bd0026e59b16e7ac, run 42778325289
+linux/arm64 musl: opencode-linux-arm64-musl.tar.gz and its opencode match the pin; provenance 5f76acb12572932297cbce81bd0026e59b16e7ac, run 42778325289
+CHECKED 4 of 4 builds
+exit=0

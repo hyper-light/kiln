@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "name": "gemini",
+  "version": "0.68.0",
+  "run": {
+    "command": ["/harness/gemini/node/bin/node", "/harness/gemini/bundle/gemini.js", "--acp"],
+    "env": [
+      "HOME=/home/gemini",
+      "GEMINI_CLI_SYSTEM_SETTINGS_PATH=/harness/gemini/system-settings.json"
+    ]
+  }
+}

@@ -1,0 +1,65 @@
+M8 run 2026-11-12T07:31:19Z host adacachy2 Linux 7.3.3-1-cachyos x86_64
+ARCHIVE opencode-linux-x64-musl.tar.gz sha256=c1801a36bf61e03eafac8d7f4521a200e4d3cd76cf43b36621cb78b460b851ee
+ROOTFS alpine-minirootfs-3.22.2-x86_64.tar.gz sha256=412454ed98025ad9cd910d13f3d448b184e81502baa83180e89f98d0f13674be published=412454ed98025ad9cd910d13f3d448b184e81502baa83180e89f98d0f13674be
+--- musl build on Alpine, no libstdc++
+Error loading shared library libstdc++.so.6: No such file or directory (needed by /oc/opencode-musl)
+Error relocating /oc/opencode-musl: _ZSt20__throw_length_errorPKc: symbol not found
+Error relocating /oc/opencode-musl: _ZSt28__throw_bad_array_new_lengthv: symbol not found
+Error relocating /oc/opencode-musl: _ZSt17__throw_bad_allocv: symbol not found
+Error relocating /oc/opencode-musl: __once_proxy: symbol not found
+Error relocating /oc/opencode-musl: _ZSt20__throw_system_errori: symbol not found
+Error relocating /oc/opencode-musl: _ZNKSt8__detail20_Prime_rehash_policy11_M_next_bktEm: symbol not found
+Error relocating /oc/opencode-musl: _ZSt11_Hash_bytesPKvmm: symbol not found
+Error relocating /oc/opencode-musl: _ZNKSt8__detail20_Prime_rehash_policy14_M_need_rehashEmmm: symbol not found
+Error relocating /oc/opencode-musl: _ZSt18_Rb_tree_incrementPSt18_Rb_tree_node_base: symbol not found
+Error relocating /oc/opencode-musl: _ZSt18_Rb_tree_decrementPSt18_Rb_tree_node_base: symbol not found
+Error relocating /oc/opencode-musl: _ZSt29_Rb_tree_insert_and_rebalancebPSt18_Rb_tree_node_baseS0_RS_: symbol not found
+Error relocating /oc/opencode-musl: __cxa_pure_virtual: symbol not found
+Error relocating /oc/opencode-musl: __cxa_guard_acquire: symbol not found
+Error relocating /oc/opencode-musl: __cxa_guard_release: symbol not found
+Error relocating /oc/opencode-musl: _ZSt9terminatev: symbol not found
+Error relocating /oc/opencode-musl: _ZNSt6chrono3_V212steady_clock3nowEv: symbol not found
+Error relocating /oc/opencode-musl: _ZSt24__throw_out_of_range_fmtPKcz: symbol not found
+Error relocating /oc/opencode-musl: _ZNSt8__detail15_List_node_base7_M_hookEPS0_: symbol not found
+Error relocating /oc/opencode-musl: _ZNSt8__detail15_List_node_base9_M_unhookEv: symbol not found
+Error relocating /oc/opencode-musl: _ZSt19__throw_logic_errorPKc: symbol not found
+Error relocating /oc/opencode-musl: _ZSt25__throw_bad_function_callv: symbol not found
+Error relocating /oc/opencode-musl: _ZSt28_Rb_tree_rebalance_for_erasePSt18_Rb_tree_node_baseRS_: symbol not found
+Error relocating /oc/opencode-musl: _ZSt13set_terminatePFvvE: symbol not found
+Error relocating /oc/opencode-musl: _ZSt21__glibcxx_assert_failPKciS0_S0_: symbol not found
+Error relocating /oc/opencode-musl: __cxa_demangle: symbol not found
+Error relocating /oc/opencode-musl: _ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE: symbol not found
+Error relocating /oc/opencode-musl: _ZNSt18condition_variable10notify_oneEv: symbol not found
+Error relocating /oc/opencode-musl: _ZNSt18condition_variableC1Ev: symbol not found
+Error relocating /oc/opencode-musl: _ZNSt18condition_variableD1Ev: symbol not found
+EXIT 127
+--- apk add libstdc++
+Error relocating /oc/opencode-musl: __dynamic_cast: symbol not found
+Error relocating /oc/opencode-musl: __cxa_bad_typeid: symbol not found
+Error relocating /oc/opencode-musl: _ZNSt18condition_variable10notify_allEv: symbol not found
+Error relocating /oc/opencode-musl: _ZSt15get_new_handlerv: symbol not found
+Error relocating /oc/opencode-musl: _ZSt15__once_callable: symbol not found
+Error relocating /oc/opencode-musl: _ZSt11__once_call: symbol not found
+Error relocating /oc/opencode-musl: _ZTVN10__cxxabiv121__vmi_class_type_infoE: symbol not found
+Error relocating /oc/opencode-musl: _ZTVN10__cxxabiv120__si_class_type_infoE: symbol not found
+Error relocating /oc/opencode-musl: _ZTVN10__cxxabiv117__class_type_infoE: symbol not found
+fetch https://dl-cdn.alpinelinux.org/alpine/v3.22/community/x86_64/APKINDEX.tar.gz
+(1/2) Installing libgcc (14.2.0-r6)
+(2/2) Installing libstdc++ (14.2.0-r6)
+OK: 10 MiB in 18 packages
+WARNING: opening from cache https://dl-cdn.alpinelinux.org/alpine/v3.22/main: No such file or directory
+WARNING: opening from cache https://dl-cdn.alpinelinux.org/alpine/v3.22/community: No such file or directory
+libstdc++-14.2.0-r6 depends on:
+so:libc.musl-x86_64.so.1
+so:libgcc_s.so.1
+
+--- musl build on Alpine with libstdc++
+Error: ENOENT: no such file or directory, realpath '/tmp/opencode'
+EXIT 1
+--- glibc build on Alpine
+env: can't execute '/oc/opencode-gnu': No such file or directory
+EXIT 127
+--- musl build on the glibc host
+env: ‘/home/adalundhe/.cache/s22-opencode-research/dl/musl/opencode’: No such file or directory
+EXIT 127
+kiln_exit=0 tries=1

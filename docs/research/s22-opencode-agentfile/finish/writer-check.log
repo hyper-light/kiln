@@ -1,0 +1,6 @@
+writer-check.py on Darwin arm64, Python 3.9.6, 2026-11-12T22:04:56Z, on kiln p/s22-finish-v1 at c60b30f93 with pin.sh sha256 b8f91cd09203cc11 and pin.json sha256 f58fac4f799110fe as committed next
+SHA256SUMS 72c73a07124c65662239facaa7da2f3fe474078bbd4cbfa68bf90ae8fdca3b8b pinned 72c73a07124c65662239facaa7da2f3fe474078bbd4cbfa68bf90ae8fdca3b8b
+LICENSE 625f0f619133f89bbbb2abe37369613dfa1885eba1e50d02170deb62bb42cb6b 1065 pinned 625f0f619133f89bbbb2abe37369613dfa1885eba1e50d02170deb62bb42cb6b
+SMOKE {"program": "bin/opencode", "args": ["--version"], "stdout": "opencode v2.2.7"}
+WRITES_THE_PIN_AGAIN True
+EXIT 0

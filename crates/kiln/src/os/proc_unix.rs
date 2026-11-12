@@ -706,7 +706,8 @@ mod tests {
             // Past 256 of the reader's largest chunks (`CHUNK` * 2) and the pipe's own buffer.
             let lines = 3_000_000u32;
             let mut cmd = Command::new("sh");
-            cmd.args(["-c", &format!("seq 1 {lines}; echo done >&2")]);
+            // Integers on every seq: macOS's (BSD's) prints with %g by default, 1000000 as `1e+06`.
+            cmd.args(["-c", &format!("seq -f %.0f 1 {lines}; echo done >&2")]);
             let p = spawn_duplex(cmd)?;
             let full = crate::rt::timeout(Duration::from_secs(30), async {
                 while p.stdout.len() < 256 {

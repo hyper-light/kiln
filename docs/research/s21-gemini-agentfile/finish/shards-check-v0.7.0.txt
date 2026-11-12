@@ -1,0 +1,17 @@
+# Shards v0.7.0's static check of harness-gemini's Agentfile, as kiln's check.rs runs it (shards build --call=check,format=json --progress=quiet --target kiln:static-check), on adacachy 2026-11-12T22:13:42Z
+# shards: shards version 0.7.0, build 94838b8, sha256 a9c9092ac5f6a7c6b306a47ef5c9d27f48f6541885abe823c0063abc2d549388 (v0.7.0's SHA256SUMS: a9c9092ac5f6a7c6b306a47ef5c9d27f48f6541885abe823c0063abc2d549388)
+# Agentfile sha256 aa1cb7626025d2f7e1ab6084c0fed29f12468efca48badc00b4b656e23b2ef9d
+{
+  "warnings": null,
+  "sources": [
+    {
+      "filename": "Agentfile",
+      "data": "(the Agentfile, base64)",
+      "language": "Agentfile"
+    }
+  ],
+  "buildError": {
+    "message": "target stage \"kiln:static-check\" could not be found",
+    "location": {}
+  }
+}

@@ -1,0 +1,6 @@
+GHPAR 2026-11-12T08:40:32Z gh 2.98.0 on opencode-linux-x64-baseline.tar.gz
+round 1 call 7: exit 1 after 11s:  Error: failed to choose verifier based on provided bundle issuer: public good verifier is not available (initialization may have failed) 
+round 1 call 14: exit 1 after 10s:  Error: failed to choose verifier based on provided bundle issuer: public good verifier is not available (initialization may have failed) 
+ROUND 1: 2 of 16 failed; times 10 10 10 10 11 11 11 11 11 11 11 11 11 11 12 13 
+round 2 call 7: exit 1 after 8s:  Error: failed to choose verifier based on provided bundle issuer: public good verifier is not available (initialization may have failed) 
+ROUND 2: 1 of 16 failed; times 8 8 8 8 9 9 10 10 10 10 10 11 11 11 11 12 
