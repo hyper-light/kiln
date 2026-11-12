@@ -1,12 +1,12 @@
 # Vendoring
 
 kiln builds from its own copies of the projects it's made of: Turso, Bun, Quiver with what it's
-built on (Focal's bus and hyper-raft, CP-T2.1, docs/bus.md), and vorpal (the search across a change,
-docs/ci.md W26-R07; `vendor/vorpal/UPSTREAM.md`) today, and the other hyper-light
-products (Amphora, Hex, Veil, Reliquary, Mantle, and what they take from Focal, Shards, Slates and
-hyper-raft) as the critical path brings them in (its master plan §5, CP-M1). Each
-copy is its upstream at one revision plus kiln's recorded changes, and one command takes a new
-revision.
+built on (Focal's bus and hyper-raft, CP-T2.1, docs/bus.md), vorpal (the search across a change,
+docs/ci.md W26-R07; `vendor/vorpal/UPSTREAM.md`), Mantle, and Shards and Hex (kiln's harnesses'
+microVMs and their runtime, at one Shards revision: docs/shards.md) today, and the other hyper-light
+products (Amphora, Veil, Reliquary, and what they take from Focal and Slates) as the critical path
+brings them in (its master plan §5, CP-M1). Each copy is its upstream at one revision plus kiln's
+recorded changes, and one command takes a new revision.
 
 ## The rules
 
@@ -27,7 +27,12 @@ revision.
   the product's own copy out (`exclude`), its dependency on it pointed at kiln's copy by `[patch]`.
   Third-party code only one product vendors stays inside that product's copy
   (`vendor/<product>/vendor/<project>`): that copy is kiln's one. The re-vendor checks all of
-  this against the product's own `vendor/MANIFEST.toml` and `vendor/patches/`.
+  this against the product's own `vendor/MANIFEST.toml` and `vendor/patches/`: upstream's, or, where
+  kiln's copy of the product takes them (its `take` brings in `vendor/MANIFEST.toml`), kiln's copy's,
+  its recorded changes applied. A product whose upstream pins another revision than kiln's is so held
+  to kiln's by a recorded change that moves its pins (Hex's, to kiln's Shards and hyper-raft;
+  `vendor/hex/UPSTREAM.md`): its first take is written with the pins that disagree named, the gate not
+  run, for that change to be recorded.
 - **One revision linked.** `crates/kiln/tests/vendored.rs` fails the gate when `Cargo.lock` links a
   crate a vendored project provides more than once, or from crates.io or git instead of its folder.
 - **Taken as kiln's own.** A crate kiln changes as its own code leaves its project for `crates/`,
