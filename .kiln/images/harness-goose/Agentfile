@@ -1,0 +1,28 @@
+# Goose (aaif-goose/goose) as a harness in a Shards microVM: the Agentfile kiln ships for it (plan
+# 01a1cd8e862e7169a074db3d5fa33f3d, step 23; research 01a1ce705e3d72af8563e07fa92a7460, f1-f28).
+# Its build context is what `kiln agentfiles context goose DIR` writes: this file, and for each
+# platform goose-<arch>/ with harness.json and pin.json's goose, checked and unpacked to bin/goose.
+# It holds no credential: a person's provider keys stay on their own volume (below).
+
+# The default base: Debian with git, an ssh client, curl and CA certificates on both arches, the
+# digest pin.sh read (pin.json's base). Any base works, as Goose's build is static (f10), but Goose
+# checks TLS against the base's CA bundle, so a base without one can't reach a provider (f18).
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+FROM ${BASE}
+
+# Goose's own static build for the platform being built: no RUN, and no libc variant (f10, f23).
+ARG TARGETARCH
+HARNESS goose FROM ./goose-${TARGETARCH}
+
+# Its providers over HTTPS, as the bring-up proved them (f21): a network for Goose alone, names
+# resolved by the microVM (--dns), and TCP 443 out at the network's boundary and the microVM's;
+# nothing in, and no other port or protocol out. Step 9's grants by name replace these three lines.
+NETWORK --dns --egress=443/tcp provider FOR goose
+EXPOSE --harnesses=goose 443/tcp AS egress FOR provider
+CONNECT goose WITH goose ON provider
+
+# Two volumes of Goose's alone (D109): the project, and the person's Goose root, GOOSE_PATH_ROOT in
+# harness.json, which holds its config, sessions, logs and the keys its owner saved, and which kiln
+# keeps per person and reads on the host (f14, f15, f5).
+VOLUME --target-kind=harness /workspace FOR goose
+VOLUME --target-kind=harness /home/goose/.local/share/goose FOR goose
