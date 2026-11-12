@@ -1,14 +1,14 @@
 [
     {
-        "Id": "sha256:dfcb1095ec134aaa1c67bc9ec7ee16def7d8f3e4bd6c9af8fe999e1cf8efd1da",
+        "Id": "sha256:a6f4470188c7fe127562e9f7802e6256078ecce37a9f855f3412354597b06869",
         "RepoTags": [
             "harness-antigravity:s26"
         ],
         "RepoDigests": [
-            "harness-antigravity@sha256:dfcb1095ec134aaa1c67bc9ec7ee16def7d8f3e4bd6c9af8fe999e1cf8efd1da"
+            "harness-antigravity@sha256:a6f4470188c7fe127562e9f7802e6256078ecce37a9f855f3412354597b06869"
         ],
         "Comment": "buildkit.dockerfile.v0",
-        "Created": "2026-11-12T15:38:43.870601Z",
+        "Created": "2026-11-12T16:16:00.994025Z",
         "Config": {
             "Env": [
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -29,24 +29,24 @@
         },
         "Architecture": "amd64",
         "Os": "linux",
-        "Size": 241145225,
+        "Size": 241442052,
         "RootFS": {
             "Type": "layers",
             "Layers": [
                 "sha256:f487d0da9ce0cd3b17ddb89deff39644274b08f2ff71e321a9e0e476ec2d46fe",
                 "sha256:d854713c22704d1fe77bbec5d21c0ac052d26fc4aae53794849d1027e0bfac7a",
                 "sha256:afb0368a2a32f312f7c9f43e3375a54e1a5c3946a76293426362f17120f49c0c",
-                "sha256:03ea5cc5383155514c24dce3e5fe6401bf53caf0771310db7d9503a6389a1487",
-                "sha256:58c271ac4e2ed31c1799b2207326a391680d4f799dd9ad6eeae4c87e6bc699a4",
-                "sha256:8da8b6ec0cc2b5a5f7f956023fa6303b48a19fc1fd38eb1f74b4f75a4991908f"
+                "sha256:2d05e93ba0a9327456d114697aee47d4e111852d44b0da623123e394fa122e27",
+                "sha256:2901f2255390c85d7f2b6932cb143aaace9441c0e09adf8651b5ca17478ede15",
+                "sha256:5aa34ae208363ade7d1248bc5ae2b09b25d4c19e3c35c2feb285d220e5bfafee"
             ]
         },
         "Metadata": {
-            "LastTagTime": "2026-11-12T15:41:10.581866966Z"
+            "LastTagTime": "2026-11-12T16:18:44.939676972Z"
         },
         "Descriptor": {
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "digest": "sha256:a6fd2d8a7bfeb6824c0cd4cbabd6f9e535bbd256babcafbed5c48e02a87d3f3e",
+            "digest": "sha256:0b70741d51323c4eb5215bd78449d2a2796a0dae09abb0db9e25651ab5f68c99",
             "size": 1617,
             "platform": {
                 "architecture": "amd64",

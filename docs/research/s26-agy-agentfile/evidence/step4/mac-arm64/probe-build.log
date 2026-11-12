@@ -15,7 +15,7 @@
 #4 DONE 0.0s
 
 #5 [internal] load build context
-#5 read 2 files, 237.9MB done
+#5 read 2 files, 238.9MB done
 #5 DONE 0.0s
 
 #6 [internal] load ./antigravity-arm64
@@ -44,6 +44,6 @@
 
 #14 exporting to image
 #14 exporting layers done
-#14 writing image sha256:c48da8052ff82e1e6c59c68fce9c6e53efedbee26ecf7da1c780d9369c43e27f done
+#14 writing image sha256:bda36622c9493eee980048967c728d22933f1c9ec03eed35db5550c2c61ce3ec done
 #14 naming to docker.io/library/harness-antigravity-probe:s26 done
 #14 DONE 0.2s

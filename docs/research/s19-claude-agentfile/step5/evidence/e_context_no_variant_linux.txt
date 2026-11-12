@@ -1,0 +1,6 @@
+== shards: shards version 0.7.0, build 7ad28fa, sha256 9b460c47ca38dbc5f8c1bde704a3ef5a72692e3788d93d41ef3f52ecf37d89f7
+== kiln: kiln 0.2.0, built from ce63fc099977323d8e27cb7a035234515a3c1c74, sha256 05fbd978febdc50f84fd183c6647b84cdb521e5f4dad518e9cf2885eb6a3edea
+== host: kiln-a094a12d.attlocal.net Linux 6.19.10-300.fc44.x86_64 x86_64; mode all; pin.json sha256 b98f01ae3d9632c51091c885ff874a36ef3ac8866215ae93041f9eae990bd10c
+== context: kiln agentfiles context claude, linux/amd64 and linux/arm64, the Agentfile's own base, gnu
+context: exit 1 in 39 ms
+[2m2026-11-12T16:27:21.540855Z[0m [31mERROR[0m harness-claude: its pin has no build for linux/amd64; it has linux/amd64 gnu, linux/amd64 musl, linux/arm64 gnu, linux/arm64 musl

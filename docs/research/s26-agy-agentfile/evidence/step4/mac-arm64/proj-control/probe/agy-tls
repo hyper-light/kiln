@@ -1,1 +1,1 @@
-E1112 15:42:55.353648     250 server.go:4237] Failed to shutdown telemetry client: Post "https://play.googleapis.com/log": dial tcp: lookup play.googleapis.com on 1.0.0.1:53: dial udp 1.0.0.1:53: connect: network is unreachable
+E1112 16:20:33.611594     388 server.go:4324] Failed to shutdown telemetry client: Post "https://play.googleapis.com/log": dial tcp: lookup play.googleapis.com on 1.0.0.1:53: dial udp 1.0.0.1:53: connect: network is unreachable

@@ -28,6 +28,7 @@ pub mod kept;
 pub mod observe;
 pub mod lease;
 pub mod probe;
+pub mod reap_projects;
 #[cfg(target_os = "linux")]
 pub mod rootfs;
 pub mod rustc;
