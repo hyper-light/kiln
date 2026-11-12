@@ -47,11 +47,24 @@ unsafe extern "system" {
     fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32;
     fn GetExitCodeProcess(process: *mut c_void, code: *mut u32) -> i32;
     fn TerminateJobObject(job: *mut c_void, code: u32) -> i32;
+    fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
 }
 
 /// `DUPLICATE_SAME_ACCESS`.
 const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
 const WAIT_OBJECT_0: u32 = 0;
+/// `HANDLE_FLAG_INHERIT`.
+const HANDLE_FLAG_INHERIT: u32 = 0x1;
+
+/// Clear a handle's inherit flag: an adopted session's handles come inheritable (the supervisor
+/// made them so, for this process to inherit), and nothing this runner starts from now on should
+/// take them.
+fn clear_inherit(raw: RawHandle) {
+    if !raw.is_null() {
+        // SAFETY: a handle this process owns.
+        unsafe { SetHandleInformation(raw, HANDLE_FLAG_INHERIT, 0) };
+    }
+}
 
 /// A handle value as it travels in a [`Detached`] (serialized, and carried in the supervisor's
 /// environment list): Windows handle values are 32 significant bits even on 64-bit Windows, and a
@@ -565,6 +578,10 @@ pub fn adopt_duplex(d: Detached) -> anyhow::Result<Duplex> {
     let stderr = pipe(d.stderr, "stderr")?;
     let process = owned(d.process).context("the harness process handle didn't come across the upgrade")?;
     let job = owned(d.job).context("the harness job handle didn't come across the upgrade")?;
+    // The supervisor handed these inheritable; nothing this runner starts from now on takes them.
+    for raw in [d.stdin, d.stdout, d.stderr, d.process, d.job] {
+        clear_inherit(i64_to_handle(raw));
+    }
     serve(d.pid, Some(stdin), Some(stdout), Some(stderr), true, Held::Adopted { process, job })
 }
 

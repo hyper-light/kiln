@@ -2541,7 +2541,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // upgrades read again as it changes, a new kiln on disk taken up as it lands. They were read
     // every 10 s and every 5 s.
     let config_watch = o.config.as_deref().and_then(watch_file);
-    let exe_watch = if !o.ephemeral && standalone && crate::os::IN_PLACE_UPGRADE { exe.as_deref().and_then(watch_file) } else { None };
+    let exe_watch = if !o.ephemeral && standalone && (crate::os::IN_PLACE_UPGRADE || crate::os::UPGRADE_BY_SUCCESSOR) { exe.as_deref().and_then(watch_file) } else { None };
     // An older server (no `CAP_LEASES`) renews a leg's grant only from a heartbeat naming it, on a
     // lease it doesn't say: to it alone, while legs run, a heartbeat goes at that server's own
     // cadence (`OLD_BEAT`), and as what it says changes.
@@ -3494,7 +3494,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             },
             Ev::Watchdog => {
                 legs_gone_seen = crate::runner::kept::gones();
-                if !o.ephemeral && standalone && crate::os::IN_PLACE_UPGRADE && started.elapsed() >= WATCHDOG_SETTLE {
+                if !o.ephemeral && standalone && (crate::os::IN_PLACE_UPGRADE || crate::os::UPGRADE_BY_SUCCESSOR) && started.elapsed() >= WATCHDOG_SETTLE {
                     let now = exe.as_deref().and_then(binary_mtime);
                     if !upgrade_pending && now.is_some() && now != exe_mtime {
                         upgrade_pending = true;
