@@ -2263,8 +2263,8 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
         return Err(err(StatusCode::UNAUTHORIZED, "bad cluster token"));
     }
     let dir = hub.cfg.data("cluster").join("copies");
-    let _one = CLUSTER_COPIES.turn().await;
-    // Copies a stop left behind.
+    let one = CLUSTER_COPIES.turn().await;
+    // Copies a stop left behind: none is being made while the turn is here (below).
     if let Ok(old) = std::fs::read_dir(&dir) {
         for e in old.flatten() {
             std::fs::remove_file(e.path()).ok();
@@ -2273,7 +2273,16 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
     std::fs::create_dir_all(&dir).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("making {}: {e}", dir.display())))?;
     let path = dir.join(format!("{}.db", crate::util::new_id()));
     let started = Instant::now();
-    if let Err(e) = hub.store.copy_for_learner(path.clone()).await {
+    // A copy holds the turn for as long as it's being made, whether its runner waits for it or not: one that gave up and
+    // asked again waits for it rather than a second being made beside it, and the turn comes back here with the copy, given
+    // up once the copy is open to be sent (plan 01a1cc09, step 4). A copy is made on the blocking pool, and once started nothing stops
+    // it: on 2026-11-11 four of production's 32 GB kiln.db were being written at once, three of them deleted already by
+    // the asks after, about 100 MiB/s of its disk.
+    let (store, made) = (hub.store.clone(), path.clone());
+    let (copied, _one) = crate::rt::spawn(async move { (store.copy_for_learner(made).await, one) })
+        .await
+        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "the copy of kiln.db stopped before it was made"))?;
+    if let Err(e) = copied {
         std::fs::remove_file(&path).ok();
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")));
     }
