@@ -1,0 +1,101 @@
+# pin-tests.sh, then pin-tests.sh verify on the committed pin.json, on a Linux runner: kiln run, placed with --needs linux/amd64
+# --on adacachy2 --no-sync -i, started 2026-11-12T08:32:04Z on runner 00aad8daff2fa3c9daa65d53c425d450 (adacachy2). Command: pin.sh,
+# pin-tests.sh and pin.json sent over stdin as base64 lines, decoded into a fresh ~/.cache/s25-step1.XXXXXX/h there (their
+# SHA-256 printed on arrival), then `bash h/pin-tests.sh` and `bash h/pin-tests.sh verify h/pin.json`; the directory removed
+# afterwards. Files: pin.sh sha256 c34217789c19262a8b93909c50674d4ba2cb172cad5d56b00636cdf56daad32c, pin-tests.sh sha256
+# 5d5d5ba9571741fc56e0da05d2540d1303611f6bab017c08647485de8be4e45d, pin.json sha256
+# 88b28e7ca1ed40f6d7d66737709b595ae1a951a347cf2dec3ea351a41cd7031d (each the committed file). kiln exit 0.
+# The runner's output stream as kiln returned it, ANSI colours removed.
+[kiln] on 00aad8daff2fa3c9daa65d53c425d450 · linux/x86_64 · 28 of 32 cores idle · 51 GB free
+runner adacachy2 Linux 7.3.3-1-cachyos x86_64, dir /home/adalundhe/.cache/s25-step1.qvkOKE, 2026-11-12T08:32:44Z
+c34217789c19262a8b93909c50674d4ba2cb172cad5d56b00636cdf56daad32c  pin.sh
+5d5d5ba9571741fc56e0da05d2540d1303611f6bab017c08647485de8be4e45d  pin-tests.sh
+88b28e7ca1ed40f6d7d66737709b595ae1a951a347cf2dec3ea351a41cd7031d  pin.json
+=== pin-tests.sh
+== host adacachy2 Linux 7.3.3-1-cachyos x86_64; GNU bash, version 5.3.20(1)-release (x86_64-pc-linux-gnu); tar (GNU tar) 1.35; curl 8.23.0; Python 3.14.9
+== pin.sh sha256 c34217789c19262a8b93909c50674d4ba2cb172cad5d56b00636cdf56daad32c; pin-tests.sh sha256 5d5d5ba9571741fc56e0da05d2540d1303611f6bab017c08647485de8be4e45d
+== pins that must succeed
+PASS pin.sh (default): exit 0; pin.json holds devin 3000.0.1, both builds' URL, SHA-256 and size, path . and unpack tar.gz, the manifest's URL and SHA-256, read_at, the base digest and: sha256 from Cognition's versioned manifest over HTTPS, equal to current/ when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403)
+PASS pin.sh current (current): exit 0; pin.json holds devin 3000.0.1, both builds' URL, SHA-256 and size, path . and unpack tar.gz, the manifest's URL and SHA-256, read_at, the base digest and: sha256 from Cognition's versioned manifest over HTTPS, equal to current/ when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403)
+PASS pin.sh 3000.0.1 (version-same): exit 0; pin.json holds devin 3000.0.1, both builds' URL, SHA-256 and size, path . and unpack tar.gz, the manifest's URL and SHA-256, read_at, the base digest and: sha256 from Cognition's versioned manifest over HTTPS, equal to current/ when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403)
+PASS pin.sh 3000.0.1 (version-old): exit 0; pin.json holds devin 3000.0.1, both builds' URL, SHA-256 and size, path . and unpack tar.gz, the manifest's URL and SHA-256, read_at, the base digest and: sha256 from Cognition's versioned manifest over HTTPS; current/ named 3000.0.2 when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403)
+PASS pin.sh (pretty): exit 0; pin.json holds devin 3000.0.1, both builds' URL, SHA-256 and size, path . and unpack tar.gz, the manifest's URL and SHA-256, read_at, the base digest and: sha256 from Cognition's versioned manifest over HTTPS, equal to current/ when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403)
+PASS pin.sh (dotslash): exit 0; pin.json holds devin 3000.0.1, both builds' URL, SHA-256 and size, path . and unpack tar.gz, the manifest's URL and SHA-256, read_at, the base digest and: sha256 from Cognition's versioned manifest over HTTPS, equal to current/ when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403)
+== refusals: each must exit non-zero naming its check, with pin.json left as it was
+PASS base-http (pin.json there): exit 1, pin.sh: base: DEVIN_PIN_BASE must be an https:// URL (file:// for pin-tests.sh), not http://127.0.0.1:9/cli
+PASS base-http (pin.json absent): exit 1, pin.sh: base: DEVIN_PIN_BASE must be an https:// URL (file:// for pin-tests.sh), not http://127.0.0.1:9/cli
+PASS version-other (pin.json there): exit 1, pin.sh: manifest-version: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-version-other/cli/3000.0.1/manifest.json names version 3000.0.2, not 3000.0.1
+PASS version-other (pin.json absent): exit 1, pin.sh: manifest-version: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-version-other/cli/3000.0.1/manifest.json names version 3000.0.2, not 3000.0.1
+PASS version-format (pin.json there): exit 1, pin.sh: version-format: ../3000.0.1 is not a version of dotted numbers
+PASS version-format (pin.json absent): exit 1, pin.sh: version-format: ../3000.0.1 is not a version of dotted numbers
+PASS manifest-nul (pin.json there): exit 1, pin.sh: manifest-text: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-manifest-nul/cli/current/manifest.json is not all printable ASCII (1 other byte(s))
+PASS manifest-nul (pin.json absent): exit 1, pin.sh: manifest-text: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-manifest-nul/cli/current/manifest.json is not all printable ASCII (1 other byte(s))
+PASS current-byte (pin.json there): exit 1, pin.sh: current: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-current-byte/cli/current/manifest.json (sha256 5ef68d9bbb02dd2fb1c04eba9c97cf4cb5e7d8b2955dfd9442761bb8d2a87837) names 3000.0.1 but differs from file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-current-byte/cli/3000.0.1/manifest.json (sha256 fdc522087c9b624738bc8271b14661d6bbd49d9a72abe2ff24cafdc61074b485)
+PASS current-byte (pin.json absent): exit 1, pin.sh: current: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-current-byte/cli/current/manifest.json (sha256 5ef68d9bbb02dd2fb1c04eba9c97cf4cb5e7d8b2955dfd9442761bb8d2a87837) names 3000.0.1 but differs from file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-current-byte/cli/3000.0.1/manifest.json (sha256 fdc522087c9b624738bc8271b14661d6bbd49d9a72abe2ff24cafdc61074b485)
+PASS no-aarch64 (pin.json there): exit 1, pin.sh: platform: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-no-aarch64/cli/3000.0.1/manifest.json has 0 aarch64-unknown-linux entries, not one
+PASS no-aarch64 (pin.json absent): exit 1, pin.sh: platform: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-no-aarch64/cli/3000.0.1/manifest.json has 0 aarch64-unknown-linux entries, not one
+PASS dup-x86 (pin.json there): exit 1, pin.sh: platform: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-dup-x86/cli/3000.0.1/manifest.json has 2 x86_64-unknown-linux entries, not one
+PASS dup-x86 (pin.json absent): exit 1, pin.sh: platform: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-dup-x86/cli/3000.0.1/manifest.json has 2 x86_64-unknown-linux entries, not one
+PASS url-dir (pin.json there): exit 1, pin.sh: url: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-url-dir/cli/3000.0.1/manifest.json gives x86_64-unknown-linux the URL file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-url-dir/cli/3000.0.0/devin-3000.0.1-x86_64-unknown-linux.tar.gz, not file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-url-dir/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz
+PASS url-dir (pin.json absent): exit 1, pin.sh: url: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-url-dir/cli/3000.0.1/manifest.json gives x86_64-unknown-linux the URL file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-url-dir/cli/3000.0.0/devin-3000.0.1-x86_64-unknown-linux.tar.gz, not file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-url-dir/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz
+PASS url-host (pin.json there): exit 1, pin.sh: url: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-url-host/cli/3000.0.1/manifest.json gives x86_64-unknown-linux the URL https://example.com/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz, not file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-url-host/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz
+PASS url-host (pin.json absent): exit 1, pin.sh: url: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-url-host/cli/3000.0.1/manifest.json gives x86_64-unknown-linux the URL https://example.com/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz, not file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-url-host/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz
+PASS sha-upper (pin.json there): exit 1, pin.sh: sha256-form: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-sha-upper/cli/3000.0.1/manifest.json gives x86_64-unknown-linux the sha256 1C3424127C67A3B13567977CB70D3ADA6F0FE4C5BE9B0AC8AA92BDDD5C534E45, not 64 lowercase hex digits
+PASS sha-upper (pin.json absent): exit 1, pin.sh: sha256-form: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-sha-upper/cli/3000.0.1/manifest.json gives x86_64-unknown-linux the sha256 1C3424127C67A3B13567977CB70D3ADA6F0FE4C5BE9B0AC8AA92BDDD5C534E45, not 64 lowercase hex digits
+PASS signature (pin.json there): exit 1, pin.sh: signature: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-signature/cli/3000.0.1/manifest.json.sig answers 200, not 403: verify what Cognition publishes there and teach pin.sh to check it
+PASS signature (pin.json absent): exit 1, pin.sh: signature: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-signature/cli/3000.0.1/manifest.json.sig answers 200, not 403: verify what Cognition publishes there and teach pin.sh to check it
+PASS digest-flip (pin.json there): exit 1, pin.sh: digest: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-digest-flip/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz has SHA-256 7b48f8e5fe449c4ad3f793ccfe6fced5cd7c01323afb69d427cecaf96865a50e; file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-digest-flip/cli/3000.0.1/manifest.json gives 1c3424127c67a3b13567977cb70d3ada6f0fe4c5be9b0ac8aa92bddd5c534e45
+PASS digest-flip (pin.json absent): exit 1, pin.sh: digest: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-digest-flip/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz has SHA-256 7b48f8e5fe449c4ad3f793ccfe6fced5cd7c01323afb69d427cecaf96865a50e; file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-digest-flip/cli/3000.0.1/manifest.json gives 1c3424127c67a3b13567977cb70d3ada6f0fe4c5be9b0ac8aa92bddd5c534e45
+PASS symlink (pin.json there): exit 1, pin.sh: entry-type: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-symlink/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds share/devin/link, which is neither a directory nor a regular file (lrwxrwxrwx)
+PASS symlink (pin.json absent): exit 1, pin.sh: entry-type: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-symlink/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds share/devin/link, which is neither a directory nor a regular file (lrwxrwxrwx)
+PASS hardlink (pin.json there): exit 1, pin.sh: entry-type: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-hardlink/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds share/devin/hard, which is neither a directory nor a regular file (hrw-r--r--)
+PASS hardlink (pin.json absent): exit 1, pin.sh: entry-type: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-hardlink/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds share/devin/hard, which is neither a directory nor a regular file (hrw-r--r--)
+PASS device (pin.json there): exit 1, pin.sh: entry-type: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-device/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds share/devin/null, which is neither a directory nor a regular file (crw-rw-rw-)
+PASS device (pin.json absent): exit 1, pin.sh: entry-type: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-device/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds share/devin/null, which is neither a directory nor a regular file (crw-rw-rw-)
+PASS fifo (pin.json there): exit 1, pin.sh: entry-type: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-fifo/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds share/devin/fifo, which is neither a directory nor a regular file (prw-r--r--)
+PASS fifo (pin.json absent): exit 1, pin.sh: entry-type: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-fifo/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds share/devin/fifo, which is neither a directory nor a regular file (prw-r--r--)
+PASS arm64-symlink (pin.json there): exit 1, pin.sh: entry-type: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-arm64-symlink/cli/3000.0.1/devin-3000.0.1-aarch64-unknown-linux.tar.gz holds share/devin/link, which is neither a directory nor a regular file (lrwxrwxrwx)
+PASS arm64-symlink (pin.json absent): exit 1, pin.sh: entry-type: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-arm64-symlink/cli/3000.0.1/devin-3000.0.1-aarch64-unknown-linux.tar.gz holds share/devin/link, which is neither a directory nor a regular file (lrwxrwxrwx)
+PASS absolute (pin.json there): exit 1, pin.sh: absolute: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-absolute/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds the absolute path /x
+PASS absolute (pin.json absent): exit 1, pin.sh: absolute: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-absolute/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds the absolute path /x
+PASS dotdot (pin.json there): exit 1, pin.sh: dotdot: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-dotdot/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds ../x, whose path has a .. component
+PASS dotdot (pin.json absent): exit 1, pin.sh: dotdot: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-dotdot/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds ../x, whose path has a .. component
+PASS setuid (pin.json there): exit 1, pin.sh: set-id: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-setuid/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds bin/helper with a set-ID bit (-rwsr-xr-x)
+PASS setuid (pin.json absent): exit 1, pin.sh: set-id: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-setuid/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds bin/helper with a set-ID bit (-rwsr-xr-x)
+PASS setgid (pin.json there): exit 1, pin.sh: set-id: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-setgid/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds bin/helper with a set-ID bit (-rwxr-sr-x)
+PASS setgid (pin.json absent): exit 1, pin.sh: set-id: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-setgid/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds bin/helper with a set-ID bit (-rwxr-sr-x)
+PASS no-devin (pin.json there): exit 1, pin.sh: bin-devin: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-no-devin/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds no bin/devin
+PASS no-devin (pin.json absent): exit 1, pin.sh: bin-devin: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-no-devin/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz holds no bin/devin
+== each guard removed from a copy of pin.sh: its tests must now fail
+PASS without its 1 absolute guard(s), absolute is caught: pin.sh exits 0 and writes pin.json
+PASS without its 1 base guard(s), base-http is caught: exit 1, /home/adalundhe/.cache/devin-pin-tests.kop0j9/run.KGydwd/pin.sh: line 40: BASH_REMATCH[1]: unbound variable
+PASS without its 1 bin-devin guard(s), no-devin is caught: pin.sh exits 0 and writes pin.json
+PASS without its 1 current guard(s), current-byte is caught: pin.sh exits 0 and writes pin.json
+PASS without its 1 digest guard(s), digest-flip is caught: exit 1, pin.sh: list: tar could not list file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-digest-flip/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz: 
+PASS without its 1 dotdot guard(s), dotdot is caught: pin.sh exits 0 and writes pin.json
+PASS without its 1 entry-type guard(s), symlink is caught: pin.sh exits 0 and writes pin.json
+PASS without its 1 entry-type guard(s), hardlink is caught: pin.sh exits 0 and writes pin.json
+PASS without its 1 entry-type guard(s), device is caught: pin.sh exits 0 and writes pin.json
+PASS without its 1 entry-type guard(s), fifo is caught: pin.sh exits 0 and writes pin.json
+PASS without its 1 entry-type guard(s), arm64-symlink is caught: pin.sh exits 0 and writes pin.json
+PASS without its 1 manifest-text guard(s), manifest-nul is caught: pin.sh exits 0 and writes pin.json
+PASS without its 3 manifest-version guard(s), version-other is caught: exit 1, pin.sh: current: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-version-other/cli/current/manifest.json (sha256 fb20a2dded12a1eb18c416396f74bba62bc1e9e11a6a0a60fe3e79f75a770a1b) names 3000.0.1 but differs from file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-version-other/cli/3000.0.1/manifest.json (sha256 a7a6efbf5b2bc93457a94aa268e43c202fafec0fe6db62750ac80f9bc881a6a3)
+PASS without its 4 platform guard(s), no-aarch64 is caught: exit 1, /home/adalundhe/.cache/devin-pin-tests.kop0j9/run.4aWdtX/pin.sh: line 120: BASH_REMATCH[1]: unbound variable
+PASS without its 4 platform guard(s), dup-x86 is caught: exit 1, pin.sh: digest: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-dup-x86/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz has SHA-256 1c3424127c67a3b13567977cb70d3ada6f0fe4c5be9b0ac8aa92bddd5c534e45; file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-dup-x86/cli/3000.0.1/manifest.json gives 0000000000000000000000000000000000000000000000000000000000000000
+PASS without its 1 set-id guard(s), setuid is caught: pin.sh exits 0 and writes pin.json
+PASS without its 1 set-id guard(s), setgid is caught: pin.sh exits 0 and writes pin.json
+PASS without its 1 sha256-form guard(s), sha-upper is caught: exit 1, pin.sh: digest: file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-sha-upper/cli/3000.0.1/devin-3000.0.1-x86_64-unknown-linux.tar.gz has SHA-256 1c3424127c67a3b13567977cb70d3ada6f0fe4c5be9b0ac8aa92bddd5c534e45; file:///home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-sha-upper/cli/3000.0.1/manifest.json gives 1C3424127C67A3B13567977CB70D3ADA6F0FE4C5BE9B0AC8AA92BDDD5C534E45
+PASS without its 2 signature guard(s), signature is caught: pin.sh exits 0 and writes pin.json
+PASS without its 1 url guard(s), url-dir is caught: exit 1, curl: (37) Could not open file /home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-url-dir/cli/3000.0.0/devin-3000.0.1-x86_64-unknown-linux.tar.gz
+PASS without its 1 url guard(s), url-host is caught: exit 1, curl: (1) Protocol "https" is disabled
+PASS without its 2 version-format guard(s), version-format is caught: exit 1, curl: (37) Could not open file /home/adalundhe/.cache/devin-pin-tests.kop0j9/fx-version-format/3000.0.1/manifest.json
+== 72 passed, 0 failed
+pin-tests exit=0
+=== pin-tests.sh verify pin.json
+PASS https://static.devin.ai/cli/3000.12.43/manifest.json downloaded again: sha256 093e9492b3227bfc7be8a57114448611bf8af6573af7ac3866d3ff85abadb1c1, as pin.json records
+PASS linux/amd64 (x86_64-unknown-linux): https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-x86_64-unknown-linux.tar.gz downloaded again: sha256sum 6a19997b5fc2d6ba1a8c341d4e2b12f1b78cad5d415ee9c0ca413a8d52a99562 and stat 71424183 bytes equal pin.json's, and the manifest gives this URL and SHA-256
+PASS linux/arm64 (aarch64-unknown-linux): https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-aarch64-unknown-linux.tar.gz downloaded again: sha256sum 1eaa07d2181ed26f5789cf6b3617d39a2459c25f1bc5a51cc5cc703db7f95274 and stat 67806876 bytes equal pin.json's, and the manifest gives this URL and SHA-256
+builds whose SHA-256 and size match both the manifest and a fresh download: 2 of 2
+verify exit=0
+devin-pin work dirs left under ~/.cache: 0
+[kiln] used memory not measured, 3 s of CPU (counted by the system, 0.551 CPUs on average) over 6 s; OOM kills not seen here
