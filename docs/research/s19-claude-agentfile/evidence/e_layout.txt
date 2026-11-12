@@ -1,0 +1,27 @@
+# kiln layout evidence, 2026-11-12T06:55:06Z: kiln origin/main 1a5a5f00d5dc056e70e998eb23ab0b3b315ad1e9; step 30's branch p/agentfile-store-v1 at 03b2a9c77f7e96afbb5e006e385607b514f026cd
+## docs/ci.md (origin/main)
+  4414	  (`.kiln/images/<name>/Dockerfile` or `.kiln/images/<name>/Agentfile`) or are made in the UI
+  4417	  shards' `agentfile` crate. Images are built by `kiln/build-image@v1`: `docker buildx` for
+## crates/kiln/src/runner/runtime.rs (origin/main)
+  3946	        let context = get("context").unwrap_or_else(|| format!(".kiln/images/{name}"));
+  3965	        let tags = if tag == "latest" { vec![format!("{base}:latest")] } else { vec![format!("{base}:{tag}"), format!("{base}:latest")] };
+  3987	            runs.extend(tags.iter().map(|t| vec!["push".to_owned(), t.clone()]));
+## crates/kiln/src/agentfiles/builtin.rs (p/agentfile-store-v1, committed)
+     1	//! The Agentfiles kiln ships, one per harness it runs in a Shards microVM (kiln plan
+     2	//! 01a1cd8e862e7169a074db3d5fa33f3d, "Every kiln harness in Shards microVMs"): each embedded in kiln's
+     3	//! one binary, listed read-only beside a person's own, and copied to make one theirs. None yet: each
+     4	//! harness's own step adds its Agentfile here (`include_str!`).
+     5	
+     6	use serde::Serialize;
+     7	
+     8	/// An Agentfile kiln ships.
+     9	pub struct Builtin {
+    10	    /// Its name, an image's (as a person's Agentfile's is: [`super::name_problem`]).
+    11	    pub name: &'static str,
+    12	    /// The harness it runs (`crate::harness::kinds::Kind`'s id: `claude`, `codex` ...).
+    13	    pub harness: &'static str,
+    14	    pub text: &'static str,
+    15	}
+    16	
+    17	/// Every one, in the order they're listed.
+    18	pub const ALL: &[Builtin] = &[];

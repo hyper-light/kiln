@@ -42,6 +42,13 @@ pub const SCRUB_ENV: &[&str] = &[
     "AI_AGENT",
 ];
 
+/// What kiln sets for every Claude Code session it starts: file snapshots before edits, so a rewind can
+/// restore them. The SDK sets this itself; a bare `claude -p` has to be given it
+/// (code.claude.com/docs/en/agent-sdk/file-checkpointing). The built-in Agentfile's harness.json sets the
+/// same, so a session in a microVM rewinds as one on the host does (kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d, step 19).
+pub const FIXED_ENV: &[(&str, &str)] = &[("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1")];
+
 /// How kiln starts a Claude Code session.
 pub fn args(spec: &super::session::Spec, session_id: Option<&str>) -> Vec<String> {
     let (model, mode, resume, allow_bypass) = (spec.model.as_deref(), spec.mode.as_deref(), spec.resume.as_deref(), spec.allow_bypass);

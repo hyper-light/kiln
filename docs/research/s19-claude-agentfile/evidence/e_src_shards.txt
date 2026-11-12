@@ -1,0 +1,23 @@
+# Shards origin/main c4ae59ee094dcdf99e5dcd47ed46952d53e4f1e6 excerpts, 2026-11-12T06:28:52Z
+## crates/init/src/domains.rs
+   493	        cstr("HOME=/tmp")?,
+   496	    for e in run.get("env").and_then(Value::strings).unwrap_or_default() {
+   522	    let workdir = cstr(&format!("{dir}/{workdir}"))?;
+  1479	        // A volume given one agent or harness alone, as a `VOLUME … FOR` scopes it, or the
+  2272	        // Every other domain, and /sys, hidden.
+## docs/design/architecture.md
+ 10911	build for both (`--platform linux/amd64,linux/arm64`, D87) runs each platform's RUN steps.
+ 10932	  From the host's side, an emulated run costs 4.6 and 5.5 times the cycles of a native one
+ 11114	and `a_builds_platform_defaults_to_the_default_platforms` (an index of two platforms: the
+ 19115	- `shards push image` sends the index together with every platform's manifest.
+ 17056	### D115. A run's command reaches none of its image's agents and harnesses
+ 17916	- A volume the Agentfile names is that named volume, made where it is missing, kept from
+ 17924	- A run's own `-v` or `--mount` of a volume or a directory at one of them stands in for it,
+## crates/agentfile/src/lint.rs
+   132	    name: "SecretsUsedInArgOrEnv",
+## harness.json startup against v0.7.0
+startup.rs added: c3b7bde8b 2026-11-09 Start supplied agents and harnesses from their root startup descriptors
+startup.rs NOT in v0.7.0
+1da9132b7 IN origin/main
+## gh release view -R hyper-light/shards
+{"assets":["SHA256SUMS","shards-darwin-amd64","shards-darwin-arm64","shards-linux-amd64","shards-linux-amd64-musl","shards-linux-arm64","shards-linux-arm64-musl","shards-windows-amd64.exe","shards-windows-arm64.exe"],"at":"2026-11-05T22:48:00Z","tag":"v0.7.0"}

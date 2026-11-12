@@ -31,6 +31,19 @@ pub const ALL: &[Builtin] = &[
         pin: include_str!("../../../../.kiln/images/harness-goose/pin.json"),
         files: &[("harness.json", include_str!("../../../../.kiln/images/harness-goose/harness.json"))],
     },
+    // Claude Code, Anthropic's own Linux build for each platform and libc, over stream-json as kiln's
+    // Claude kind drives it (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 19). Its musl harness
+    // file (CLAUDE_LIBC=musl) also takes the system's ripgrep.
+    Builtin {
+        name: "harness-claude",
+        harness: "claude",
+        text: include_str!("../../../../.kiln/images/harness-claude/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-claude/pin.json"),
+        files: &[
+            ("harness.json", include_str!("../../../../.kiln/images/harness-claude/harness.json")),
+            ("harness.musl.json", include_str!("../../../../.kiln/images/harness-claude/harness.musl.json")),
+        ],
+    },
 ];
 
 /// One as the list shows it.
@@ -50,6 +63,9 @@ pub fn views() -> Vec<View> {
 
 #[cfg(test)]
 mod goose_tests;
+
+#[cfg(test)]
+mod claude_tests;
 
 #[cfg(test)]
 mod tests {
@@ -117,5 +133,41 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    /// What breaks a harness's HOME in `text` (an Agentfile) and `harness_json`. A harness sees its image
+    /// read-only, so a HOME its harness file sets must be one of its volumes; and no volume may be at or
+    /// under /tmp, each harness's own scratch (step 19's research 01a1cf48e8157494b048e1fb2c437f08, f22
+    /// and f23).
+    fn home_problems(text: &str, harness_json: &str, harness: &str) -> anyhow::Result<Vec<String>> {
+        let tail = format!(" FOR {harness}");
+        let volumes: Vec<&str> = text.lines().map(str::trim).filter_map(|l| l.strip_prefix("VOLUME --target-kind=harness ")?.strip_suffix(tail.as_str())).collect();
+        let mut found: Vec<String> = volumes.iter().filter(|v| **v == "/tmp" || v.starts_with("/tmp/")).map(|v| format!("a volume at {v}")).collect();
+        let h: serde_json::Value = serde_json::from_str(harness_json)?;
+        let env = h.pointer("/run/env").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+        if let Some(home) = env.iter().filter_map(serde_json::Value::as_str).find_map(|e| e.strip_prefix("HOME="))
+            && !volumes.contains(&home)
+        {
+            found.push(format!("HOME={home} is none of its volumes {volumes:?}"));
+        }
+        Ok(found)
+    }
+
+    /// Every built-in keeps its harness's HOME on one of its volumes, if it sets one, and no volume under
+    /// /tmp; a HOME off its volumes and a volume under /tmp are each caught.
+    #[test]
+    fn step19_a_harness_home_is_its_volume_and_none_is_under_tmp() -> anyhow::Result<()> {
+        for b in super::ALL {
+            for (name, text) in b.files.iter().filter(|(n, _)| n.starts_with("harness.") && n.ends_with(".json")) {
+                let found = home_problems(b.text, text, b.harness)?;
+                anyhow::ensure!(found.is_empty(), "{} {name}: {found:?}", b.name);
+            }
+        }
+        let text = "VOLUME --target-kind=harness /workspace FOR h\nVOLUME --target-kind=harness /home/h FOR h\n";
+        let json = r#"{"run":{"command":["h"],"env":["HOME=/home/h"]}}"#;
+        anyhow::ensure!(home_problems(text, json, "h")?.is_empty());
+        anyhow::ensure!(!home_problems(&text.replace("/home/h FOR", "/tmp/h FOR"), json, "h")?.is_empty(), "a volume under /tmp passed");
+        anyhow::ensure!(!home_problems(text, &json.replace("/home/h", "/root"), "h")?.is_empty(), "a HOME off its volumes passed");
+        Ok(())
     }
 }

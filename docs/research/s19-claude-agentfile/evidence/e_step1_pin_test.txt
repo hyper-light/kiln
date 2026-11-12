@@ -1,0 +1,15 @@
+PASS channels: stable 2.1.311, latest 2.1.322
+PASS real manifest 2.1.311: [GNUPG:] VALIDSIG 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE 2026-10-26 1793042338 0 4 0 1 10 00 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
+PASS real manifest 2.1.311 lists the four Linux builds
+PASS base: buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+PASS a byte of manifest.json changed: pin.sh: refused: manifest.json's signature: [GNUPG:] BADSIG BAA929FF1A7ECACE Anthropic Claude Code Release Signing <security@anthropic.com>
+PASS the signature of 2.1.322 on 2.1.311's manifest: pin.sh: refused: manifest.json's signature: [GNUPG:] BADSIG BAA929FF1A7ECACE Anthropic Claude Code Release Signing <security@anthropic.com>
+PASS Anthropic's signature against another key: pin.sh: refused: manifest.json's signature: [GNUPG:] ERRSIG BAA929FF1A7ECACE 1 10 00 1793042338 9 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
+PASS a manifest another key signed: pin.sh: refused: manifest.json is signed by a key whose primary is 10BE16D8C8747A852D29744290D4161B8AB1A8D1, not Anthropic's 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
+PASS a manifest of another version: pin.sh: refused: manifest.json is version "2.1.311", not 0.0.1
+PASS a manifest missing linux-arm64-musl: pin.sh: refused: manifest.json lists no claude binary for linux-arm64-musl ("")
+PASS main, a manifest changed in transit: pin.sh: refused: manifest.json's signature: [GNUPG:] BADSIG BAA929FF1A7ECACE Anthropic Claude Code Release Signing <security@anthropic.com>
+PASS main, a manifest changed in transit: no pin written
+PASS main, a signed manifest missing linux-x64: pin.sh: refused: manifest.json lists no claude binary for linux-x64 ("")
+PASS main, a manifest missing linux-x64: no pin written
+pin_test: all passed

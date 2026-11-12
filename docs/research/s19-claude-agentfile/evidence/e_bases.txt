@@ -1,0 +1,7 @@
+# Docker Hub base images, 2026-11-12T06:34:09Z (each manifest fetched to its own file; a failed fetch is printed as FAILED)
+== buildpack-deps:trixie-scm index digest: sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+  amd64 sha256:712f969c9d81a35f9f00cce701faae521891d42a20b592b61bd0e6c5328fad7c layers=3 compressed_bytes=142865592
+  arm64/v8 sha256:4256ac3dbf04b630b9082d15c426b1982ceed0b071b2abe76a40ad028d323636 layers=3 compressed_bytes=142449890
+== debian:trixie-slim index digest: sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+  amd64 sha256:7378260c0a098d27ac206225db5e7d92b8c7c84ea7afccc86eeb513756bbd392 layers=1 compressed_bytes=29856132
+  arm64/v8 sha256:24a01011d10eba3a023bc8585b9650b8b29021240d4217c05b905e09ef4a5232 layers=1 compressed_bytes=30214037
