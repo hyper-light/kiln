@@ -68,7 +68,7 @@ fn sent_ids(store: &Store, session: &str) -> anyhow::Result<Vec<String>> {
 /// The harness's record of `session` as the harness on the machine it goes to takes it; `events`,
 /// kiln's timeline, for a harness whose own record kiln doesn't keep.
 fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str>, events: &[Event], note: &str) -> anyhow::Result<Carry> {
-    if matches!(kind.protocol, Protocol::Acp(_) | Protocol::AgyStreamJson) {
+    if matches!(kind.protocol, Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc) {
         return Ok(moving::words(events, note));
     }
     let Some(own) = harness_session.filter(|h| !h.is_empty()) else { return Ok(Carry::Nothing) };
@@ -88,7 +88,7 @@ fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str
             let conv = crate::harness::handoff::codex_of_lines(&files, own).ok_or_else(|| anyhow::anyhow!("the server has no copy of Codex's record of this thread (its machine never sent it)"))?;
             Ok(Carry::Seed { items: crate::harness::handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>"))) })
         }
-        Protocol::Acp(_) | Protocol::AgyStreamJson => Ok(moving::words(events, note)),
+        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc => Ok(moving::words(events, note)),
         Protocol::Terminal => anyhow::bail!("{}'s sessions can't go on on another machine yet", kind.name),
     }
 }

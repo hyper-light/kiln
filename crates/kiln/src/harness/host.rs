@@ -285,7 +285,7 @@ impl ArchivedSession {
         let found = match kind.protocol {
             Protocol::ClaudeStreamJson => super::handoff::read_claude(&self.saved.spec.env, native).is_some_and(usable),
             Protocol::CodexAppServer => super::handoff::read_codex(&self.saved.spec.env, native).is_some_and(usable),
-            Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => return Err("This harness's native conversation cannot be verified. Choose Continue from kiln's copy to use the retained conversation.".into()),
+            Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc | Protocol::Terminal => return Err("This harness's native conversation cannot be verified. Choose Continue from kiln's copy to use the retained conversation.".into()),
         };
         if found { Ok(()) } else { Err("The native conversation is missing or unreadable. Choose Continue from kiln's copy to use the retained conversation.".into()) }
     }
@@ -323,7 +323,7 @@ impl ArchivedSession {
                 None
             }
             Protocol::CodexAppServer => Some(super::handoff::to_codex(&conversation, Some(note))),
-            Protocol::Acp(_) | Protocol::AgyStreamJson => Some(vec![serde_json::json!({"type":super::moving::CONTEXT,"text":super::handoff::as_words(conversation,note,usize::MAX)})]),
+            Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc => Some(vec![serde_json::json!({"type":super::moving::CONTEXT,"text":super::handoff::as_words(conversation,note,usize::MAX)})]),
             Protocol::Terminal => return Err("This harness cannot take a retained conversation. The archive is kept.".into()),
         };
         self.saved.spec = spec;

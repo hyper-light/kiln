@@ -3275,7 +3275,12 @@ async fn agents_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response 
             }
         }
     }
-    srv::json(StatusCode::OK, &crate::doctor::runners_for(hub, caller).await)
+    match crate::doctor::runners_made_for(hub, caller, |runners| crate::reads::encode(&runners)).await {
+        Some(Ok(json)) => pre_encoded(json),
+        Some(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("the runners' list couldn't be encoded: {e:#}")).into_response(),
+        // Where the pool's job is lost (it panicked), here.
+        None => srv::json(StatusCode::OK, &crate::doctor::runners_for(hub, caller).await),
+    }
 }
 
 /// The owner's `GET /api/agents` as `key` says it, made on the compute pool (each runner's record copied, the list
@@ -10246,6 +10251,24 @@ mod tests {
                 anyhow::ensure!(woken.0 >= woken0.0 + FED && woken.1 >= woken0.1 + FED * BEFORE_US, "{}: {FED} frames each {BEFORE_US} µs: {woken0:?} to {woken:?}", taken.name());
                 anyhow::ensure!(write.0 >= write0.0 + FED, "the batch's write, each frame's: {write0:?} to {write:?}");
             }
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: `GET /api/agents` read while no kept list can say it (none made yet, as here, or the
+    /// store's rows moved on from it) has its runners' list made and encoded on the compute pool, none of it on the request's
+    /// shard, and says what the store's path says. Its list was made and encoded where the request was: 0.64 ms of a shard on
+    /// the CPU in the lab's production layout on Linux.
+    #[test]
+    fn g9_s3_a_runners_list_no_kept_one_says_is_made_off_the_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let owner = crate::authz::Caller::owner();
+            let (r, took) = crate::reads::trace::traced(agents_read(&hub, &owner)).await;
+            anyhow::ensure!(r.status() == StatusCode::OK, "{}", r.status());
+            let body = body_of(r).await?;
+            anyhow::ensure!(body == serde_json::to_vec(&crate::doctor::runners_for(&hub, &owner).await)?, "the store's path's bytes");
+            anyhow::ensure!(took.encoded == 0, "encoded {} times on the request's shard", took.encoded);
             Ok(())
         })
     }

@@ -42,6 +42,11 @@ fn ready(kind: &Kind, adapter: &mut Adapter, core: &mut Core) -> anyhow::Result<
             line(adapter, core, json!({"id": opening.get("id"), "result": result}));
         }
         Protocol::AgyStreamJson => line(adapter, core, json!({"event": "init", "conversation_id": "destination", "init": {}})),
+        // Pi says its session when asked (`get_state`): it takes prompts from then on.
+        Protocol::PiRpc => {
+            let state = initial.iter().find(|v| v.get("type").and_then(Value::as_str) == Some("get_state")).ok_or_else(|| anyhow::anyhow!("no get_state: {initial:?}"))?;
+            line(adapter, core, json!({"id": state.get("id"), "type": "response", "command": "get_state", "success": true, "data": {"sessionId": "destination", "thinkingLevel": "medium", "isStreaming": false, "messageCount": 0}}));
+        }
         Protocol::Terminal => anyhow::bail!("{} has no structured message protocol", kind.id),
     }
     writes(core)
@@ -49,7 +54,7 @@ fn ready(kind: &Kind, adapter: &mut Adapter, core: &mut Core) -> anyhow::Result<
 
 fn messages(writes: &[Value]) -> Vec<&Value> {
     writes.iter().filter(|v| {
-        v.get("type").and_then(Value::as_str) == Some("user")
+        matches!(v.get("type").and_then(Value::as_str), Some("user" | "prompt"))
             || v.get("event").and_then(Value::as_str) == Some("user")
             || matches!(v.get("method").and_then(Value::as_str), Some("turn/start" | "session/prompt"))
     }).collect()
@@ -69,6 +74,11 @@ fn finish(kind: &Kind, adapter: &mut Adapter, core: &mut Core, id: &str, sent: &
         }
         Protocol::Acp(_) => line(adapter, core, json!({"id": sent.get("id"), "result": {"stopReason": "end_turn"}})),
         Protocol::AgyStreamJson => line(adapter, core, json!({"event": "result", "result": {"conversation_id": "destination", "status": "SUCCESS", "response": "done", "num_turns": 1}})),
+        Protocol::PiRpc => {
+            line(adapter, core, json!({"id": sent.get("id"), "type": "response", "command": "prompt", "success": true, "data": {"disposition": "started"}}));
+            line(adapter, core, json!({"type": "agent_start"}));
+            line(adapter, core, json!({"type": "agent_settled", "aborted": false}));
+        }
         Protocol::Terminal => {}
     }
 }
@@ -116,8 +126,8 @@ fn cp_t3_2_every_registered_harness_delivers_retained_messages_once() -> anyhow:
             let first = first.first().ok_or_else(|| anyhow::anyhow!("{} sent no first message", kind.id))?;
             let payload = first.to_string();
             anyhow::ensure!(payload.contains("edited") && payload.contains("/work/edited.txt") && !payload.contains("original") && !payload.contains("before.txt") && !payload.contains("removed") && !payload.contains("second"), "{} sent the wrong first payload: {payload}", kind.id);
-            if matches!(kind.protocol, Protocol::ClaudeStreamJson | Protocol::CodexAppServer) {
-                assert_eq!(first.get("uuid").or_else(|| first.pointer("/params/clientUserMessageId")), Some(&json!("first")), "{}", kind.id);
+            if matches!(kind.protocol, Protocol::ClaudeStreamJson | Protocol::CodexAppServer | Protocol::PiRpc) {
+                assert_eq!(first.get("uuid").or_else(|| first.pointer("/params/clientUserMessageId")).or_else(|| first.get("id").filter(|_| kind.protocol == Protocol::PiRpc)), Some(&json!("first")), "{}", kind.id);
             }
             assert!(matches!(retained.get("first").map(|e| &e.body), Some(Body::User { text, attachments, reply_to: Some(reply), client_id: Some(id), .. }) if text == "edited" && attachments == &["edited.txt"] && reply == "earlier" && id == "first"), "{} lost message metadata", kind.id);
             assert_eq!(retained.state.queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), ["second"], "{}", kind.id);
