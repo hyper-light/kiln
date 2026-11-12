@@ -1,0 +1,23 @@
+# step 27's merge, mode clippy, 2026-11-12T19:44:18Z, host Jupiter MINGW64_NT-10.0-26200 3.6.10-5a1665c8.x86_64 x86_64, rustc 1.99.0 (b940084d7 2026-09-28), cargo 1.99.0 (5f94df478 2026-08-27)
+# branch b85b17c1640907cb38f67b6595a68ffc2a270cdb, kiln main 507069d4bea883c616d644f82e414990ad969d62
+# merged: 862bce0c2a165fc1ba4b93db3de133e0bd9e6333, tree 005013f624a9b2c2672f962cf100e1f19ece3d64, wanted 005013f624a9b2c2672f962cf100e1f19ece3d64
+## CLIPPY_GATE: ci/gate.sh -p kiln --cpus 8 --mem 16g --target-dir /c/Users/corph/.cache/s27gate/target clippy (from 19:44:39)
+ci/gate.sh: the gate of /c/Users/corph/.cache/s27gate/kiln at 862bce0c2, natively on windows/x86_64
+asked: 8 CPUs, 16G of memory (from --cpus and --mem)
+caps: MemoryMax=16G CPUWeight=1 Nice=19 IOWeight=1 would apply, but this machine has no systemd user manager: it runs uncapped, at nice 19 (Idle priority)
+cargo: -j 8, 8 test threads
+env: AWS_LC_SYS_PREBUILT_NASM=1
+memory: none measured: from Git Bash, cargo's own children (rustc, the tests) and their memory aren't visible
+guard: none (no systemd here: no cgroups of its own to watch from)
+scope: kiln
+  kiln: asked for (-p)
+steps:
+  1. clippy: cargo clippy --locked -p kiln --all-targets -j 8 -- -D warnings
+build: /c/Users/corph/.cache/s27gate/target; this run's git config and logs in /c/Users/corph/.cache/kiln-gate/6d817bcc6395/runs/20261112T194439Z-14862, its TMPDIR in /c/Users/corph/.cache/kiln-gate/6d817bcc6395/t
+nice: cannot set niceness: Permission denied
+::: clippy: cargo clippy --locked -p kiln --all-targets -j 8 -- -D warnings
+    passed in 937 s
+GATE: PASS
+CLIPPY_GATE_EXIT=0 at 20:00:18
+# tree clean: 0 changes
+# done 2026-11-12T20:00:19Z

@@ -1,0 +1,2 @@
+# Shards origin/main c4ae59ee094dcdf99e5dcd47ed46952d53e4f1e6 docs/architecture/AGENTFILE_ARCH.md excerpt, 2026-11-12T06:29:09Z
+   602	**The run's own command is confined from the domains too** (D115). The workload a run's

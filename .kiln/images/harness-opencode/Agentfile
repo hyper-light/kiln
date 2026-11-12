@@ -3,13 +3,16 @@
 # 01a1ce705e2f7773af54b299f1de42f5, on the layout steps 19 to 28 share; fN are its research's
 # findings (research 01a1ce705e307593bd11f26bf9f7b9a9).
 #
-# `kiln agentfiles context opencode DIR` writes the opencode-<arch>-<libc> directories HARNESS
-# takes, each file checked against pin.json (HARNESS would take an http(s) source with no
-# checksum). No credential is in the image: a user's sign-in lives in their own volume (f19).
+# `kiln agentfiles context opencode DIR --variant gnu` (or musl) writes the opencode-<arch>-<libc>
+# directories HARNESS takes, each file checked against pin.json (HARNESS would take an http(s)
+# source with no checksum), and prints the recipe its image is tagged with. No credential is in
+# the image: a user's sign-in lives in their own volume (f19).
 #
-#   kiln agentfiles context opencode DIR --platform linux/amd64,linux/arm64
+#   kiln agentfiles context opencode DIR --variant gnu
 #   shards build --platform linux/amd64,linux/arm64 DIR
-#   shards build --build-arg BASE=<a musl image> --build-arg OPENCODE_LIBC=musl DIR
+#   kiln agentfiles context opencode DIR --variant musl --base <a musl image>
+#   shards build --platform linux/amd64,linux/arm64 --build-arg BASE=<a musl image> \
+#     --build-arg OPENCODE_LIBC=musl DIR
 
 # Any base will do, so a project's own toolchain image works. The default carries git, an ssh
 # client, curl and CA certificates; opencode's glibc builds need only glibc 2.17 or later, so it

@@ -43,8 +43,8 @@ COPY Cargo.toml Cargo.lock ./
 # Cargo's config for every build of the workspace (SQLite's compile-time options: .cargo/config.toml).
 COPY .cargo/ .cargo/
 COPY crates/ crates/
-# The Agentfiles kiln ships, which crates/kiln/src/agentfiles/builtin.rs embeds from kiln's home for
-# image definitions (docs/ci.md W13-R11).
+# The Agentfiles kiln ships, which crates/kiln/src/agentfiles/builtin.rs embeds with include_str!: each
+# harness's .kiln/images/harness-<id>/, outside crates/.
 COPY .kiln/images/ .kiln/images/
 # Turso, vendored for the conversation store (vendor/turso/UPSTREAM.md); kiln depends on it by path.
 COPY vendor/turso/ vendor/turso/

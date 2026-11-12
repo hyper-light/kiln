@@ -739,16 +739,25 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
         Some((u64::from(s.blocks()).saturating_mul(frag), u64::from(s.blocks_available()).saturating_mul(frag)))
     }
     // Asked of the volume itself: `sysinfo`'s mount points (`C:\`) don't prefix the `\\?\` path
-    // `canonicalize` gives.
+    // `canonicalize` gives. GetDiskFreeSpaceExW takes "a directory on the disk" (Microsoft's
+    // reference) and refuses a file, which statvfs answers of: a file is asked of its folder.
     #[cfg(windows)]
     {
-        win32::disk_space(path).ok()
+        let dir = if path.is_file() { path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")) } else { path };
+        win32::disk_space(dir).ok()
     }
 }
 
 /// Bytes this user may still write on the volume holding `path` (None: unknown).
 pub fn disk_available(path: &Path) -> Option<u64> {
     disk_space(path).map(|(_, available)| available)
+}
+
+/// A file's change time and its index on its volume, as Windows keeps them: what a stat's ctime
+/// and inode are on Unix (None: unknown).
+#[cfg(windows)]
+pub fn file_change(path: &Path) -> Option<(i64, u64)> {
+    win32::file_change(path).ok()
 }
 
 /// Keep git from ever prompting (terminal, askpass helper, or Git Credential Manager's window):
@@ -985,6 +994,18 @@ mod tests {
             }
         }
         anyhow::ensure!(found.is_empty(), "{found:?}");
+        Ok(())
+    }
+
+    /// The volume holding a file is its folder's, on every platform: a transfer's spool asks of
+    /// its file, which Windows' GetDiskFreeSpaceExW refuses.
+    #[test]
+    fn disk_space_answers_of_a_file_as_of_its_folder() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("spool");
+        std::fs::write(&file, b"x")?;
+        let (total, _) = disk_space(&file).ok_or_else(|| anyhow::anyhow!("no answer of a file"))?;
+        assert_eq!(Some(total), disk_space(dir.path()).map(|(total, _)| total));
         Ok(())
     }
 

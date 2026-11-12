@@ -199,6 +199,11 @@ pub fn make_executable(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
 }
 
+/// Give a file the permission bits `mode` (a pinned file's, as its pin says them).
+pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
 /// Open `path` to read it. (Windows keeps others from changing it meanwhile; Unix has no share
 /// modes, and nothing here hands a file to a more privileged process.)
 pub fn open_unchangeable(path: &Path) -> io::Result<File> {

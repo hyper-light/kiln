@@ -167,8 +167,11 @@ impl Saved {
         &self.id
     }
 
+    #[cfg(unix)]
     pub(crate) fn mail_manifest(&self) -> Option<&super::mail::TransferManifest> { self.mail.as_ref() }
+    #[cfg(unix)]
     pub(crate) fn journal(&self) -> Option<&Arc<std::fs::File>> { self.journal.as_ref() }
+    #[cfg(unix)]
     pub(crate) fn attach_journal(&mut self, file: std::fs::File) { self.journal = Some(Arc::new(file)); }
 }
 
@@ -748,20 +751,24 @@ impl Host {
         Self::with_clock(sink, file, limits, crate::rt::clock())
     }
 
+    #[cfg(unix)]
     pub(crate) async fn legacy_recovery_pending(&self, id: &str, from: u64, to: u64) -> Result<bool, inbox::PromotionError> {
         if let Some(session) = self.get(id) { return Ok(session.core.lock().input.as_ref().is_some_and(|input| input.controller.lock().promoting_epoch(from, to))); }
         let host = self.me.upgrade().ok_or_else(|| inbox::PromotionError::Storage { why: HOST_GONE.into() })?;
         let id = id.to_owned();
         crate::rt::blocking(move || host.legacy_fence_epochs(&id)).await.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?.map(|epochs| epochs == Some((from, to))).map_err(|why| inbox::PromotionError::Storage { why })
     }
+    #[cfg(unix)]
     pub(crate) async fn legacy_promotion(&self, id: &str) -> Result<Option<inbox::Promotion>, inbox::PromotionError> {
         self.inbox.as_ref().ok_or_else(|| inbox::PromotionError::Storage { why: "source journal is unavailable".into() })?.promotion(id).await
     }
 
+    #[cfg(unix)]
     pub(crate) async fn legacy_promotion_next(&self, after: Option<String>) -> Result<Option<(String, inbox::Promotion)>, inbox::PromotionError> {
         self.inbox.as_ref().ok_or_else(|| inbox::PromotionError::Storage { why: "source journal is unavailable".into() })?.promotion_next(after).await
     }
 
+    #[cfg(unix)]
     pub(crate) async fn prepare_legacy_promotion(&self, id: &str, from: u64, to: u64, proof: crate::runner::custody::LegacyProof) -> Result<(), inbox::PromotionError> {
         proof.validate(id, from, to).map_err(|why| inbox::PromotionError::Invalid { why })?;
         let host = self.me.upgrade().ok_or_else(|| inbox::PromotionError::Storage { why: HOST_GONE.into() })?;
@@ -772,6 +779,7 @@ impl Host {
         self.wake_legacy_promotion(id).await
     }
 
+    #[cfg(unix)]
     pub(crate) async fn promote_legacy(&self, id: &str, to: u64) -> Result<(), inbox::PromotionError> {
         let promotion = self.legacy_promotion(id).await?.ok_or(inbox::PromotionError::Stale)?;
         if promotion.to_epoch != to { return Err(inbox::PromotionError::Stale); }
@@ -782,6 +790,7 @@ impl Host {
         self.wake_legacy_promotion(id).await
     }
 
+    #[cfg(unix)]
     pub(crate) async fn certify_legacy(&self, id: &str, to: u64) -> Result<(), inbox::PromotionError> {
         let promotion = self.legacy_promotion(id).await?.ok_or(inbox::PromotionError::Stale)?;
         if promotion.to_epoch != to { return Err(inbox::PromotionError::Stale); }
@@ -795,6 +804,7 @@ impl Host {
         self.wake_legacy_promotion(id).await
     }
 
+    #[cfg(unix)]
     async fn wake_legacy_promotion(&self, id: &str) -> Result<(), inbox::PromotionError> {
         let promotion = self.legacy_promotion(id).await?.ok_or(inbox::PromotionError::Stale)?;
         crate::runner::custody::legacy_waiting(id, &promotion).map_err(|why| inbox::PromotionError::Invalid { why })?;
@@ -802,6 +812,7 @@ impl Host {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn recover_legacy_owner(&self, id: &str, promotion: &inbox::Promotion) -> Result<(), inbox::PromotionError> {
         if self.get(id).is_some() { return Ok(()); }
         let mut saved = self.native_active_record(id).map_err(|why| inbox::PromotionError::Storage { why })?;
@@ -3100,6 +3111,18 @@ impl Host {
             }
             None => seed,
         };
+        // The epoch its record keeps is the least it goes on at: the conversation store's copy of
+        // its state can be from before a hand-over raised it, and a session the store kept nothing
+        // of has no state at all. Started below it, the server takes it for a copy left behind and
+        // has this machine let it go, and no machine runs it (Hex, 2026-11-11: at 0, the server at 3).
+        let seed = match seed {
+            Some(mut seed) => {
+                seed.state.epoch = seed.state.epoch.max(s.epoch);
+                Some(seed)
+            }
+            None if s.epoch > 0 => Some(session::Seed { events: Vec::new(), state: super::model::State { epoch: s.epoch, cwd: session::resolve_cwd(s.spec.cwd.as_deref()), ..Default::default() }, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: true }),
+            None => None,
+        };
         let cut = s.cut;
         // What it started that still runs, taken back over (its stopped harness not among it).
         let mut alive = apart;
@@ -4506,6 +4529,47 @@ mod tests {
         })
     }
 
+    /// A restart in place keeps the epoch its record says, whether the conversation store kept an
+    /// older copy of its state or nothing of it (Hex, 2026-11-11: back at 0 while the server had it
+    /// at 3, so the server let it go and no machine ran it).
+    #[test]
+    fn a_restarted_session_goes_on_at_its_records_epoch() -> anyhow::Result<()> {
+        use super::super::core::Update;
+        use super::super::model::{Body, Event, State};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let spec = |id: &str| Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()), name: Some(id.into()), ..Spec::default() };
+            {
+                let (tx, _rx) = async_channel::unbounded();
+                let host = sim(tx, Some(file.clone()), Limits::default());
+                host.open(Some("kept".into()), spec("kept"))?;
+                host.open(Some("bare".into()), spec("bare"))?;
+                host.save_now();
+            }
+            // Its record says epoch 3 (hand-overs raised it); the store's copy of one is from before.
+            let mut saved: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&file)?)?;
+            for s in &mut saved {
+                if let Some(o) = s.as_object_mut() {
+                    o.insert("epoch".into(), serde_json::json!(3));
+                }
+            }
+            std::fs::write(&file, serde_json::to_vec(&saved)?)?;
+            let (_dir, store) = crate::convo::store::scratch()?;
+            store.send("kept", &Update::State { state: Box::new(State { title: "older".into(), ..State::default() }) });
+            store.send("kept", &Update::Events { events: vec![Event { id: "m1".into(), seq: 1, at: 1_001, parent: None, by: None, body: Body::Assistant { text: "first".into(), streaming: false } }] });
+            store.sync()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let again = sim(tx, Some(file.clone()), Limits::default());
+            again.restore_from(Some(&store));
+            for id in ["kept", "bare"] {
+                let s = again.sessions.lock().get(id).cloned().ok_or_else(|| anyhow::anyhow!("{id} not restored"))?;
+                assert_eq!(s.epoch(), 3, "{id}");
+            }
+            Ok(())
+        })
+    }
+
     /// On a simulated clock of its own, as every host in these tests is (CP-M2, AC-M2.1).
     #[test]
     fn a_turn_a_restart_cut_short_goes_on_first_thing() -> anyhow::Result<()> {
@@ -5496,22 +5560,49 @@ while True:
         })
     }
 
-    /// CP-T3.2: handing sessions over ends even when their lanes wait on a sink nobody drains (the
-    /// runner's loop that drains it is the one handing them over): it waits for them a while at most.
+    /// CP-T3.2: handing sessions over ends even when their lanes wait on a sink nobody drains: it
+    /// waits for them [`SETTLE_WAIT`] at most. The runner's loop polls the hand-over beside the sink
+    /// it drains (`agent.rs`, `HarnessApplied::Native`), so there its lanes settle and it goes on;
+    /// here nothing drains it, and it ends refused, the session kept where it is and taking messages
+    /// (W20, 0ff338877): moved while its lane still takes a message, it could carry an id whose
+    /// message the inbox then takes back, and that message's retry would be taken where it went as a
+    /// repeat, never delivered (the hand-over review's point 2, as [`Host::carried`] has it).
     #[test]
     fn a_handover_ends_when_its_sessions_lanes_wait_on_a_full_sink() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let dir = tempfile::tempdir()?;
             let (tx, rx) = async_channel::bounded(4);
-            let host = Host::with_records(tx, None, Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())));
+            let host = with_inbox(tx);
             host.open(Some("full".into()), no_harness(dir.path()))?;
             for n in 0..16 {
                 let _ = host.command("full", message(&format!("m{n}"), "x"));
             }
             crate::rt::sleep(Duration::from_secs(1)).await;
-            let out = crate::rt::timeout(Duration::from_secs(45), host.move_out()).await;
-            drop(rx);
-            anyhow::ensure!(out.is_ok_and(|m| m.is_ok_and(|m| m.len() == 1)), "the handover hung on a full sink");
+            match crate::rt::timeout(Duration::from_secs(45), host.move_out()).await {
+                Err(_) => anyhow::bail!("the handover hung on a full sink"),
+                Ok(Ok(moved)) => anyhow::bail!("{} moved with a lane unsettled", moved.len()),
+                Ok(Err(why)) => anyhow::ensure!(why == "source lanes did not settle; the current owner is retained", "refused otherwise: {why}"),
+            }
+            anyhow::ensure!(host.get("full").is_some(), "the refused hand-over let its session go");
+            // Drained, its lane settles where it is, and it takes the next message as its own.
+            let settled = {
+                let drain = async { while rx.recv().await.is_ok() {} };
+                let settled = host.settled("full");
+                futures::pin_mut!(drain, settled);
+                crate::rt::timeout(Duration::from_secs(30), futures::future::select(settled, drain)).await.is_ok_and(|first| matches!(first, futures::future::Either::Left(_)))
+            };
+            anyhow::ensure!(settled, "the kept session's lane didn't settle once drained");
+            anyhow::ensure!(host.command("full", message("after", "x")), "the kept session refused a message");
+            let after = crate::rt::timeout(Duration::from_secs(30), async {
+                while let Ok((_, update)) = rx.recv().await {
+                    if let super::super::core::Update::Inbox { said } = update && said.message == "after" { return Some(said.answer); }
+                }
+                None
+            })
+            .await
+            .ok()
+            .flatten();
+            anyhow::ensure!(after.as_ref().is_some_and(|answer| answer.as_ref().is_ok_and(|a| !a.repeat && a.session == "full")), "the kept session didn't take a message: {after:?}");
             Ok(())
         })
     }

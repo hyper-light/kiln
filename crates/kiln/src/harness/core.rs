@@ -111,9 +111,16 @@ fn merge_owned_reach(tasks: &mut Vec<Task>, owned: &HashMap<String, Task>) -> bo
     changed
 }
 
-/// Who a sent message is from, by its id: one of kiln's own keep-going ones, or a person's.
+/// Who a sent message is from, by its id: one of kiln's own (a keep-going one, a parent's news of
+/// its children and runs), another agent's, or a person's.
 pub fn origin_of(client_id: &str) -> &'static str {
-    if client_id.starts_with(KEEP_ID) { "kiln" } else { "human" }
+    if client_id.starts_with(KEEP_ID) || client_id.starts_with(super::queued::NEWS) {
+        "kiln"
+    } else if super::queued::sender_of(client_id).is_some() {
+        "agent"
+    } else {
+        "human"
+    }
 }
 
 /// Words that end by asking something (their last line ends with a question mark).
@@ -729,6 +736,7 @@ pub struct Frozen {
 
 impl Frozen {
     /// The exact source timeline signed before a native journal changes ownership.
+    #[cfg(any(unix, test))]
     pub(crate) fn handover_source(&self) -> (u64, &[Event]) {
         (self.state.epoch, &self.events)
     }
@@ -1838,6 +1846,14 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_of_tells_kiln_and_agents_from_a_person() {
+        assert_eq!(origin_of(&super::super::queued::made(super::super::queued::NEWS)), "kiln");
+        assert_eq!(origin_of(&format!("{KEEP_ID}1")), "kiln");
+        assert_eq!(origin_of(&super::super::queued::from_agent("01a1d07d0bff71179835e1526868a53a")), "agent");
+        assert_eq!(origin_of("01a1d0b4c3f5"), "human");
+    }
 
     #[test]
     fn exact_legacy_native_proof_survives_before_journal_attachment() {

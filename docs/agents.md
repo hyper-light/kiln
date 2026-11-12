@@ -236,6 +236,33 @@ machine holds as many agents at work as it may, it starts again once there's roo
 A runner that starts again (an upgrade, a crash, the system stopping it) starts each of its agents
 again the same way, from its record (above).
 
+**Not on Windows yet** (owed, Windows parity: kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, 2026-11-12).
+W20's native hand-over moves a native session between kiln processes with its descriptors passed
+over Unix sockets (`SCM_RIGHTS`), so these exist on Linux and macOS alone, their callers Unix's
+(`#[cfg(unix)]`), and a Windows runner has none of them:
+
+- **The session's mail journal, handed over with it:** its transfer manifest and journal file go to
+  the process that takes it (`harness::host::Saved::mail_manifest`, `journal`, `attach_journal`),
+  and the source timeline is signed before the journal changes owner
+  (`harness::core::Frozen::handover_source`).
+- **Promoting a session an older kiln opened** to the hand-over's epoch, blue/green:
+  - its proof (`runner::custody::LegacyProof::of`, and the receipt that settles it, `receipt`);
+  - its durable promotion record (`harness::inbox::Inbox::prepare_promotion`, `Host::prepare_legacy_promotion`);
+  - the step to the new epoch, and its certificate from the server (`Host::promote_legacy`,
+    `certify_legacy`);
+  - the waits on that certificate (`runner::custody::legacy_waiting`, `legacy_identity_pending`);
+  - finding a promotion under way, or one cut short, after a restart (`Host::legacy_promotion`,
+    `legacy_promotion_next`, `legacy_recovery_pending`, `wake_legacy_promotion`,
+    `recover_legacy_owner`);
+  - the native transfer's fence of the two epochs (`legacy_fence_epochs`, `persist_legacy_fence`).
+- **Their tests on Unix alone:** three of goal messages across a restart, which run a native fake
+  agent (`goals::native_goal_program`, `settled_native`): a message refused on its retry keeps its
+  id, and one sent before a restart keeps its id, and reaches its agent once, when cleared goals are
+  brought back; and one of the host's promotion, through the native fence and wake
+  (`harness::session`'s `legacy_promotion_does_not_advance_past_uncommitted_input_effects`). The
+  promotion's proof, its source timeline and the inbox's promotion record are kept in Windows'
+  test builds, so the rest of their tests run there too.
+
 ## How many agents a machine runs
 
 A machine has at most so many agent sessions at work at once (`crate::harness::limit`). Only
@@ -2041,6 +2068,42 @@ mock-up, a small tool) as a page: see docs/previews.md.
 - **Codex**: stdio servers are added with `codex mcp add`; http servers are written to its
   configuration through its own API (the CLI would sign in at once, in a browser on the agent's
   machine). Removing an http server signs it out first. Effort and model are set per turn.
+- **Antigravity CLI (agy) in a Shards microVM**: kiln's built-in Agentfile `harness-antigravity`
+  (`.kiln/images/harness-antigravity/`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 26).
+  - **Its pin.** pin.sh takes Google's static musl builds for linux/amd64 and linux/arm64. It checks
+    each archive's SHA-512 against the manifest Google's updater serves over HTTPS, as Google's
+    install.sh does (Google publishes no signature). The updater keeps a manifest for its current
+    version alone, so pin.sh pins that version and refuses any other. pin.json records each
+    archive and its one member, `antigravity`, which becomes `bin/agy`, and the smoke
+    (`bin/agy --version` prints the version).
+  - **Its base.** The build needs no loader or libc. It does need CA certificates, because agy
+    checks TLS against the system's bundle and carries no roots: on debian:trixie-slim and busybox
+    its HTTPS fails with "certificate signed by unknown authority". The default,
+    buildpack-deps:trixie-scm by digest, has them, as Alpine does.
+  - **Its HOME.** agy keeps its settings, MCP servers, conversations and, with no D-Bus, its
+    sign-in tokens under `$HOME`, and no variable of its own moves them. A harness sees its image
+    read-only, so harness.json's run.env sets `HOME=/home/antigravity`, and that whole home is a
+    harness volume, the person's. It also sets `AGY_CLI_DISABLE_AUTO_UPDATE=true` (the pin is the
+    version that runs) and `XDG_CACHE_HOME=/tmp/.cache` (caches on the harness's scratch).
+  - **The Shards it needs.** A shards at or after Shards main 997f4e47e, where run.env's HOME
+    replaces init's `HOME=/tmp`. v0.8.0 is the first release with it. No `env HOME=` launcher is
+    kept, since no earlier release starts a harness from its harness.json at all: that came with
+    Shards main 1da9132b7, after v0.7.0.
+  - **Volumes and grants.** `/workspace` and `/home/antigravity`, both outside `/tmp`, which each
+    harness's scratch covers. The network grants are the bring-up's: names through the microVM's
+    resolver and TCP 443 out, nothing in. agy speaks HTTPS alone, including its telemetry to
+    play.googleapis.com. A connect over IPv6 fails on Shards 8f3cd5b7, so names reach out over IPv4.
+  - **What later steps change.**
+    - Step 7 gives every harness a writable HOME of Shards' own.
+    - Step 8 plugs the project at its host path in place of `/workspace`.
+    - Step 9 grants providers by name instead of TCP 443 to anywhere.
+    - Steps 17 and 18 have kiln start agy in the microVM through Hex, with its config on a volume
+      kiln reads.
+    - Step 33 brings its sign-in as placeholders filled in at the microVM's egress, so no token
+      is ever kept in its volume.
+  - **Records.** pin.sh's record is `pin.log`, beside it. docs/research/s26-agy-agentfile/ holds
+    the rest: the tests' runs, the microVM build, smokes and probe on both platforms
+    (`evidence/step4/`), and what stayed unverified (its README).
 - **ACP agents** report no MCP servers, skills or plan limits; their slash commands run with
   `skill_run`.
 - **Cursor CLI** offers subagents as sessions of their own only to a client that takes ACP's

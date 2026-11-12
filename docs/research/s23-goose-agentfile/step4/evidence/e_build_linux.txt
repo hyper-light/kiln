@@ -1,0 +1,27 @@
+# build-shards.sh's log on the linux runner, its cargo Compiling and Downloaded lines left out (145 of them)
+# build-shards, host kiln-a094a12d.attlocal.net Linux 6.19.10-300.fc44.x86_64 x86_64, at 2026-11-12T14:47:27Z
+shards 8f3cd5b7411dfeea47956a5143eec2c3466b058f 2026-11-12T05:44:46-08:00
+/home/adalundhe/.cache/s23-step4/tmp/zig-x86_64-linux-0.16.0.tar.xz: OK
+zig 0.16.0 at /home/adalundhe/.cache/s23-step4/tmp/zig-x86_64-linux-0.16.0
+rustc 1.98.1 (48a229cea 2026-09-01)
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=x86_64_unknown_linux_gnu
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/adalundhe/.cache/s23-step4/target/test-release/build/aws-lc-sys-6fb58a9b0064b9c1/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Using flag: -ffile-prefix-map=/home/adalundhe/.cache/s23-step4/shards/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Using assembler flag: -Wa,--debug-prefix-map=/home/adalundhe/.cache/s23-step4/shards/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/adalundhe/.cache/s23-step4/target/test-release/build/aws-lc-sys-6fb58a9b0064b9c1/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/adalundhe/.cache/s23-step4/target/test-release/build/aws-lc-sys-6fb58a9b0064b9c1/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/adalundhe/.cache/s23-step4/target/test-release/build/aws-lc-sys-6fb58a9b0064b9c1/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+    Finished `test-release` profile [optimized + debuginfo] target(s) in 3m 25s
+built in 206 s
+shards version 0.7.0, build 8f3cd5b
+36583ddeed8d0502ae7bf2a3bf00b0c7c93000720754a237ffa5bb6cc54efe0b  /home/adalundhe/.cache/s23-step4/target/test-release/shards
+BUILD_DONE
+BUILD_EXIT=0

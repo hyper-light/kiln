@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "name": "claude",
+  "version": "2.1.311",
+  "description": "Claude Code 2.1.311's musl build over stream-json, as kiln's Claude adapter drives it",
+  "run": {
+    "command": ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--replay-user-messages", "--forward-subagent-text", "--permission-prompt-tool", "stdio"],
+    "env": ["HOME=/home/claude", "DISABLE_UPDATES=1", "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=1", "USE_BUILTIN_RIPGREP=0"]
+  }
+}

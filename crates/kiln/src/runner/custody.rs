@@ -64,6 +64,7 @@ pub(crate) struct LegacyProof {
 }
 
 impl LegacyProof {
+    #[cfg(any(unix, test))]
     pub(crate) fn of(session: &str, from: u64, events: &[Event], hand_on: Option<&Value>) -> Result<Self, String> {
         let to = from.checked_add(1).ok_or_else(|| "the legacy handover epoch cannot advance".to_owned())?;
         let proof = Self { hand_on: hand_on.map(Value::to_string), subject: timeline(session, from, events) };
@@ -91,6 +92,7 @@ impl LegacyProof {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn receipt(&self, epoch: u64) -> Option<Receipt> {
         let hand_on = self.hand_on.as_ref()?;
         let bundle: Value = crate::wire::payload(crate::wire::unread::Wire::RunnerPayload, "LegacyHandOn", hand_on).ok()?;
@@ -100,6 +102,7 @@ impl LegacyProof {
 }
 
 /// Restores only the existing receipt waiter from its authoritative durable Head phase.
+#[cfg(unix)]
 pub(crate) fn legacy_waiting(session: &str, promotion: &crate::harness::inbox::Promotion) -> Result<(), String> {
     use crate::harness::inbox::PromotionPhase;
     promotion.proof.validate(session, promotion.from_epoch, promotion.to_epoch)?;
@@ -135,6 +138,7 @@ pub(crate) fn legacy_completed(session: &str, to: u64) {
 }
 
 /// A queued request may start only while this exact transition still awaits its certificate.
+#[cfg(unix)]
 pub(crate) fn legacy_identity_pending(session: &str, to: u64) -> bool {
     STATE.lock().waiting.get(&(session.to_owned(), to)).is_some_and(|waiting| !waiting.held && waiting.transition == EpochTransition::DurablePromotion)
 }

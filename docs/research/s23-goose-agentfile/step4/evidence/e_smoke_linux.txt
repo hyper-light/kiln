@@ -1,0 +1,665 @@
+# step 4 run, 2026-11-12T14:52:20Z, host kiln-a094a12d.attlocal.net Linux 6.19.10-300.fc44.x86_64 x86_64, mode all
+c97682e05da9864b4678107d340521ce971f511ed908ba5f1c7cfd8b51401e04  smoke.sh
+abcf53e7d94f5dad92ac0083bc60f856e53be55ddba11788e949cc4183caecd1  pin.json
+509626e26acd81697fe9237d91bdc1941808369f86296e414229225873578c48  Agentfile
+50df9c4a15c946dedb2fd4df967ef36ca97ac5ec42414cec3284ca8b2d688321  harness.json
+# shards shards version 0.7.0, build 8f3cd5b, sha256 36583ddeed8d0502ae7bf2a3bf00b0c7c93000720754a237ffa5bb6cc54efe0b
+== shards shards version 0.7.0, build 8f3cd5b; host Linux 6.19.10-300.fc44.x86_64 x86_64; mode all
+== context
+linux/amd64: https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-x86_64-unknown-linux-musl.tar.gz sha256 6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31 size 50181341; member goose to goose-amd64/bin/goose, sha256 461ea83fc8736fa0ad608661a8e5ef8c704da886d38500441ba2b91f7184d9f5 size 154218008 mode 0755
+linux/arm64: https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-aarch64-unknown-linux-musl.tar.gz sha256 63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7 size 48814292; member goose to goose-arm64/bin/goose, sha256 c27e6ea558a39a9af96dcc04368296ca636e40a67c96cdac56a6f644488fb673 size 148726128 mode 0755
+== build: one image for linux/amd64 and linux/arm64
+build-real: exit 0 in 28413 ms
+images-tree: exit 0 in 76 ms
+IMAGE                                                                                               ID             DISK USAGE   CONTENT SIZE   EXTRA
+buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10   4f34e1d673fd        684MB          293MB        
+├─ linux/amd64                                                                                      712f969c9d81        533MB          143MB        
+├─ linux/arm/v5                                                                                     b6f4d55db57d           0B             0B        
+├─ linux/arm/v7                                                                                     00f00a8dd29a           0B             0B        
+├─ linux/arm64/v8                                                                                   4256ac3dbf04        142MB          142MB        
+├─ linux/386                                                                                        7b4073f252f3           0B             0B        
+├─ linux/ppc64le                                                                                    79e8f9212087           0B             0B        
+├─ linux/riscv64                                                                                    f2781902e83f           0B             0B        
+└─ linux/s390x                                                                                      2585d46a7246           0B             0B        
+
+harness-goose:smoke                                                                                 936cdfe0a043        387MB          387MB        
+├─ linux/amd64                                                                                      4d9664d1e49c        194MB          194MB        
+└─ linux/arm64                                                                                      19478165a2a9        193MB          193MB        
+
+inspect linux/amd64: linux/amd64 sha256:936cdfe0a0435a3fa50ba64a13664e6dad33b5a38e30af3982a06f5428a21683 size 194010006
+inspect linux/arm64: linux/arm64 sha256:936cdfe0a0435a3fa50ba64a13664e6dad33b5a38e30af3982a06f5428a21683 size 192909315
+== the smoke: Goose's own --version on linux/amd64, stdout held to the pin's line
+run-version: exit 0 in 4450 ms
+SMOKE_STDOUT_HEX  20 31 2e 35 39 2e 30 0a 
+SMOKE_EXACT True
+Downloading the guest kernel vmlinux-6.18.48-x86_64-17c3ba205400 from https://github.com/hyper-light/shards/releases/download/kernel-6.18.48-17c3ba205400/vmlinux-6.18.48-x86_64
+Guest kernel: sha256:48a3824b7467dee7d82f36401fed99626e91c5dc5fefc432bc354a69ec616aa7
+WARNING: CAP_NET_RAW withheld from the command: the image's Agentfile runs agents and harnesses beside the command, and CAP_NET_RAW reads and writes the packets of their flows past the microVM, which cross the command's network namespace
+== the real image: its harness as harness.json declares, Goose's root a host folder
+run-real: exit 0 in 99 ms
+processes-real: exit 0 in 16 ms
+TIME                            MEMBER         PID  EVENT  WHAT
+2026-11-12T14:52:59.647519858Z  command        921  exec   sleep 120
+2026-11-12T14:52:59.652109498Z  harness goose  928  fork   from 1
+2026-11-12T14:52:59.655312634Z  harness goose  928  exec   shards-server "harness goose" /proc/self/fd/6 200000 3 4 "" [] 7
+2026-11-12T14:52:59.657546054Z  harness goose  934  fork   from 928
+2026-11-12T14:52:59.658069386Z  harness goose  934  exec   shards-server sandbox
+2026-11-12T14:52:59.660125116Z  harness goose  938  fork   from 1
+2026-11-12T14:52:59.660663030Z  harness goose  940  fork   from 938
+2026-11-12T14:52:59.661015210Z  harness goose  938  exec   shards-init managed-reaper
+2026-11-12T14:52:59.681359926Z  harness goose  940  exec   /harness/goose/bin/goose acp
+2026-11-12T14:52:59.708433324Z  harness goose  940  exit   code 0
+2026-11-12T14:52:59.709231943Z  harness goose  938  exit   code 0
+2026-11-12T14:52:59.709360656Z  harness goose  928  exit   signal 9 (SIGKILL)
+2026-11-12T14:52:59.709376051Z  harness goose  934  exit   signal 9 (SIGKILL)
+--- what goose acp wrote under GOOSE_PATH_ROOT (the host folder)
+.
+./config
+./data
+./data/sessions
+./data/sessions/sessions.db
+./state
+./state/logs
+./state/logs/cli
+== probe: the real Agentfile with a test-only harness.json
+linux/amd64: https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-x86_64-unknown-linux-musl.tar.gz sha256 6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31 size 50181341; member goose to goose-amd64/bin/goose, sha256 461ea83fc8736fa0ad608661a8e5ef8c704da886d38500441ba2b91f7184d9f5 size 154218008 mode 0755
+linux/arm64: https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-aarch64-unknown-linux-musl.tar.gz sha256 63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7 size 48814292; member goose to goose-arm64/bin/goose, sha256 c27e6ea558a39a9af96dcc04368296ca636e40a67c96cdac56a6f644488fb673 size 148726128 mode 0755
+build-probe: exit 0 in 5390 ms
+run-probe: exit 0 in 1045 ms
+processes-probe: exit 0 in 18 ms
+== probe: what the harness wrote
+--- uid
+200000
+--- id
+uid=200000 gid=200000 groups=200000
+--- env
+GOOSE_PATH_ROOT=/home/goose/.local/share/goose
+HOME=/tmp
+PATH=/harness/goose:/harness/goose/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+--- version.out
+ 1.59.0
+--- version.exit
+exit 0
+--- info
+goose Version:
+  Version:                  1.59.0
+
+Paths:
+Config dir:              /home/goose/.local/share/goose/config                       missing (can create)
+Config yaml:             /home/goose/.local/share/goose/config/config.yaml           missing (can create)
+Sessions DB (sqlite):    /home/goose/.local/share/goose/data/sessions/sessions.db    missing (can create)
+Logs dir:                /home/goose/.local/share/goose/state/logs                   
+
+goose Configuration:
+  extensions:
+    skills:
+      enabled: true
+      type: platform
+      name: skills
+      description: Discover and provide skill instructions from filesystem and builtins
+      display_name: Skills
+      bundled: true
+    scheduler:
+      enabled: true
+      type: platform
+      name: scheduler
+      description: Create and manage scheduled recipe execution
+      display_name: Scheduler
+      bundled: true
+    chatrecall:
+      enabled: false
+      type: platform
+      name: chatrecall
+      description: Search past conversations and load session summaries for contextual memory
+      display_name: Chat Recall
+      bundled: true
+    analyze:
+      enabled: true
+      type: platform
+      name: analyze
+      description: 'Analyze code structure with tree-sitter: directory overviews, file details, symbol call graphs'
+      display_name: Analyze
+      bundled: true
+    extensionmanager:
+      enabled: true
+      type: platform
+      name: Extension Manager
+      description: Enable extension management tools for discovering, enabling, and disabling extensions
+      display_name: Extension Manager
+      bundled: true
+    summon:
+      enabled: true
+      type: platform
+      name: summon
+      description: Load knowledge and delegate tasks to subagents
+      display_name: Summon
+      bundled: true
+    developer:
+      enabled: true
+      type: platform
+      name: developer
+      description: Write and edit files, and execute shell commands
+      display_name: Developer
+      bundled: true
+    tom:
+      enabled: true
+      type: platform
+      name: tom
+      description: Inject custom context into every turn via GOOSE_MOIM_MESSAGE_TEXT and GOOSE_MOIM_MESSAGE_FILE environment variables
+      display_name: Top Of Mind
+      bundled: true
+    apps:
+      enabled: true
+      type: platform
+      name: apps
+      description: Create and manage custom Goose apps through chat. Apps are HTML/CSS/JavaScript and run in sandboxed windows.
+      display_name: Apps
+      bundled: true
+    summarize:
+      enabled: false
+      type: platform
+      name: summarize
+      description: Load files/directories and get an LLM summary in a single call
+      display_name: Summarize
+      bundled: true
+    todo:
+      enabled: false
+      type: platform
+      name: todo
+      description: Enable a todo list for goose so it can keep track of what it is doing
+      display_name: Todo
+      bundled: true
+exit 0
+--- run.exit
+exit 1
+--- port80
+port 80 closed (exit 124)
+--- dns
+2606:4700:7::f3 api.openai.com
+2a06:98c1:58::f3 api.openai.com
+--- root-tree
+/home/goose/.local/share/goose
+/home/goose/.local/share/goose/state
+/home/goose/.local/share/goose/state/logs
+/home/goose/.local/share/goose/config
+/home/goose/.local/share/goose/data
+/home/goose/.local/share/goose/data/sessions
+/home/goose/.local/share/goose/data/apps
+--- done
+done
+--- run.out (its last 12 lines)
+
+    __( O)>  ● new session · openai gpt-4o-mini
+   \____)    20261112_1 · /harness/goose
+     L L     goose is ready
+
+error: Ran into this error: Authentication error: Authentication failed for https://api.openai.com/v1/responses. Status: 401 Unauthorized. Response: Incorrect API key provided: placehol*********-key. You can find your API key at https://platform.openai.com/account/api-keys. (provider request id: req_349af1ff5d74485fb9d71299554735f8).
+
+Please retry if you think this is a transient or recoverable error.
+
+Error: Ran into this error: Authentication error: Authentication failed for https://api.openai.com/v1/responses. Status: 401 Unauthorized. Response: Incorrect API key provided: placehol*********-key. You can find your API key at https://platform.openai.com/account/api-keys. (provider request id: req_349af1ff5d74485fb9d71299554735f8).
+
+Please retry if you think this is a transient or recoverable error.
+--- host: Goose root volume
+.
+./config
+./data
+./data/apps
+./data/sessions
+./state
+./state/logs
+== control: the probe without its three network lines
+linux/amd64: https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-x86_64-unknown-linux-musl.tar.gz sha256 6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31 size 50181341; member goose to goose-amd64/bin/goose, sha256 461ea83fc8736fa0ad608661a8e5ef8c704da886d38500441ba2b91f7184d9f5 size 154218008 mode 0755
+linux/arm64: https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-aarch64-unknown-linux-musl.tar.gz sha256 63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7 size 48814292; member goose to goose-arm64/bin/goose, sha256 c27e6ea558a39a9af96dcc04368296ca636e40a67c96cdac56a6f644488fb673 size 148726128 mode 0755
+build-control: exit 0 in 1616 ms
+run-control: exit 0 in 674 ms
+processes-control: exit 0 in 16 ms
+== control: what the harness wrote
+--- uid
+200000
+--- id
+uid=200000 gid=200000 groups=200000
+--- env
+GOOSE_PATH_ROOT=/home/goose/.local/share/goose
+HOME=/tmp
+PATH=/harness/goose:/harness/goose/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+--- version.out
+ 1.59.0
+--- version.exit
+exit 0
+--- info
+goose Version:
+  Version:                  1.59.0
+
+Paths:
+Config dir:              /home/goose/.local/share/goose/config                       missing (can create)
+Config yaml:             /home/goose/.local/share/goose/config/config.yaml           missing (can create)
+Sessions DB (sqlite):    /home/goose/.local/share/goose/data/sessions/sessions.db    missing (can create)
+Logs dir:                /home/goose/.local/share/goose/state/logs                   
+
+goose Configuration:
+  extensions:
+    todo:
+      enabled: false
+      type: platform
+      name: todo
+      description: Enable a todo list for goose so it can keep track of what it is doing
+      display_name: Todo
+      bundled: true
+    developer:
+      enabled: true
+      type: platform
+      name: developer
+      description: Write and edit files, and execute shell commands
+      display_name: Developer
+      bundled: true
+    summon:
+      enabled: true
+      type: platform
+      name: summon
+      description: Load knowledge and delegate tasks to subagents
+      display_name: Summon
+      bundled: true
+    tom:
+      enabled: true
+      type: platform
+      name: tom
+      description: Inject custom context into every turn via GOOSE_MOIM_MESSAGE_TEXT and GOOSE_MOIM_MESSAGE_FILE environment variables
+      display_name: Top Of Mind
+      bundled: true
+    skills:
+      enabled: true
+      type: platform
+      name: skills
+      description: Discover and provide skill instructions from filesystem and builtins
+      display_name: Skills
+      bundled: true
+    analyze:
+      enabled: true
+      type: platform
+      name: analyze
+      description: 'Analyze code structure with tree-sitter: directory overviews, file details, symbol call graphs'
+      display_name: Analyze
+      bundled: true
+    extensionmanager:
+      enabled: true
+      type: platform
+      name: Extension Manager
+      description: Enable extension management tools for discovering, enabling, and disabling extensions
+      display_name: Extension Manager
+      bundled: true
+    chatrecall:
+      enabled: false
+      type: platform
+      name: chatrecall
+      description: Search past conversations and load session summaries for contextual memory
+      display_name: Chat Recall
+      bundled: true
+    apps:
+      enabled: true
+      type: platform
+      name: apps
+      description: Create and manage custom Goose apps through chat. Apps are HTML/CSS/JavaScript and run in sandboxed windows.
+      display_name: Apps
+      bundled: true
+    summarize:
+      enabled: false
+      type: platform
+      name: summarize
+      description: Load files/directories and get an LLM summary in a single call
+      display_name: Summarize
+      bundled: true
+    scheduler:
+      enabled: true
+      type: platform
+      name: scheduler
+      description: Create and manage scheduled recipe execution
+      display_name: Scheduler
+      bundled: true
+exit 0
+--- run.exit
+exit 1
+--- port80
+bash: connect: Permission denied
+bash: line 1: /dev/tcp/1.1.1.1/80: Permission denied
+port 80 closed (exit 1)
+--- dns
+/usr/bin/sh: 17: nslookup: not found
+name lookup failed
+--- root-tree
+/home/goose/.local/share/goose
+/home/goose/.local/share/goose/state
+/home/goose/.local/share/goose/state/logs
+/home/goose/.local/share/goose/config
+/home/goose/.local/share/goose/data
+/home/goose/.local/share/goose/data/sessions
+/home/goose/.local/share/goose/data/apps
+--- done
+done
+--- run.out (its last 12 lines)
+
+    __( O)>  ● new session · openai gpt-4o-mini
+   \____)    20261112_1 · /harness/goose
+     L L     goose is ready
+
+error: Network error: Could not connect to api.openai.com — check your network connection and try again.
+
+Please resend your message to try again.
+
+Error: Network error: Could not connect to api.openai.com — check your network connection and try again.
+
+Please resend your message to try again.
+--- host: Goose root volume
+.
+./config
+./data
+./data/apps
+./data/sessions
+./state
+./state/logs
+== probe on Alpine, alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+build-alpine: exit 0 in 3136 ms
+run-alpine: exit 0 in 2696 ms
+processes-alpine: exit 0 in 16 ms
+== alpine: what the harness wrote
+--- uid
+200000
+--- id
+uid=200000 gid=200000
+--- env
+GOOSE_PATH_ROOT=/home/goose/.local/share/goose
+HOME=/tmp
+PATH=/harness/goose:/harness/goose/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+--- version.out
+ 1.59.0
+--- version.exit
+exit 0
+--- info
+goose Version:
+  Version:                  1.59.0
+
+Paths:
+Config dir:              /home/goose/.local/share/goose/config                       missing (can create)
+Config yaml:             /home/goose/.local/share/goose/config/config.yaml           missing (can create)
+Sessions DB (sqlite):    /home/goose/.local/share/goose/data/sessions/sessions.db    missing (can create)
+Logs dir:                /home/goose/.local/share/goose/state/logs                   
+
+goose Configuration:
+  extensions:
+    apps:
+      enabled: true
+      type: platform
+      name: apps
+      description: Create and manage custom Goose apps through chat. Apps are HTML/CSS/JavaScript and run in sandboxed windows.
+      display_name: Apps
+      bundled: true
+    extensionmanager:
+      enabled: true
+      type: platform
+      name: Extension Manager
+      description: Enable extension management tools for discovering, enabling, and disabling extensions
+      display_name: Extension Manager
+      bundled: true
+    scheduler:
+      enabled: true
+      type: platform
+      name: scheduler
+      description: Create and manage scheduled recipe execution
+      display_name: Scheduler
+      bundled: true
+    todo:
+      enabled: false
+      type: platform
+      name: todo
+      description: Enable a todo list for goose so it can keep track of what it is doing
+      display_name: Todo
+      bundled: true
+    summon:
+      enabled: true
+      type: platform
+      name: summon
+      description: Load knowledge and delegate tasks to subagents
+      display_name: Summon
+      bundled: true
+    summarize:
+      enabled: false
+      type: platform
+      name: summarize
+      description: Load files/directories and get an LLM summary in a single call
+      display_name: Summarize
+      bundled: true
+    developer:
+      enabled: true
+      type: platform
+      name: developer
+      description: Write and edit files, and execute shell commands
+      display_name: Developer
+      bundled: true
+    skills:
+      enabled: true
+      type: platform
+      name: skills
+      description: Discover and provide skill instructions from filesystem and builtins
+      display_name: Skills
+      bundled: true
+    analyze:
+      enabled: true
+      type: platform
+      name: analyze
+      description: 'Analyze code structure with tree-sitter: directory overviews, file details, symbol call graphs'
+      display_name: Analyze
+      bundled: true
+    chatrecall:
+      enabled: false
+      type: platform
+      name: chatrecall
+      description: Search past conversations and load session summaries for contextual memory
+      display_name: Chat Recall
+      bundled: true
+    tom:
+      enabled: true
+      type: platform
+      name: tom
+      description: Inject custom context into every turn via GOOSE_MOIM_MESSAGE_TEXT and GOOSE_MOIM_MESSAGE_FILE environment variables
+      display_name: Top Of Mind
+      bundled: true
+exit 0
+--- run.exit
+exit 1
+--- port80
+nc: bind: Permission denied
+port 80 closed (exit 1)
+--- dns
+2606:4700:7::f3   api.openai.com  api.openai.com
+--- root-tree
+/home/goose/.local/share/goose
+/home/goose/.local/share/goose/state
+/home/goose/.local/share/goose/state/logs
+/home/goose/.local/share/goose/config
+/home/goose/.local/share/goose/data
+/home/goose/.local/share/goose/data/sessions
+/home/goose/.local/share/goose/data/apps
+--- done
+done
+--- run.out (its last 12 lines)
+
+    __( O)>  ● new session · openai gpt-4o-mini
+   \____)    20261112_1 · /harness/goose
+     L L     goose is ready
+
+error: Ran into this error: Authentication error: Authentication failed for https://api.openai.com/v1/responses. Status: 401 Unauthorized. Response: Incorrect API key provided: placehol*********-key. You can find your API key at https://platform.openai.com/account/api-keys. (provider request id: req_aabfabe968894dcc9dd28f7025da8455).
+
+Please retry if you think this is a transient or recoverable error.
+
+Error: Ran into this error: Authentication error: Authentication failed for https://api.openai.com/v1/responses. Status: 401 Unauthorized. Response: Incorrect API key provided: placehol*********-key. You can find your API key at https://platform.openai.com/account/api-keys. (provider request id: req_aabfabe968894dcc9dd28f7025da8455).
+
+Please retry if you think this is a transient or recoverable error.
+--- host: Goose root volume
+.
+./config
+./data
+./data/apps
+./data/sessions
+./state
+./state/logs
+== probe on debian:trixie-slim, debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+build-slim: exit 0 in 4636 ms
+run-slim: exit 0 in 1072 ms
+processes-slim: exit 0 in 15 ms
+== slim: what the harness wrote
+--- uid
+200000
+--- id
+uid=200000 gid=200000 groups=200000
+--- env
+GOOSE_PATH_ROOT=/home/goose/.local/share/goose
+HOME=/tmp
+PATH=/harness/goose:/harness/goose/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+--- version.out
+ 1.59.0
+--- version.exit
+exit 0
+--- info
+goose Version:
+  Version:                  1.59.0
+
+Paths:
+Config dir:              /home/goose/.local/share/goose/config                       missing (can create)
+Config yaml:             /home/goose/.local/share/goose/config/config.yaml           missing (can create)
+Sessions DB (sqlite):    /home/goose/.local/share/goose/data/sessions/sessions.db    missing (can create)
+Logs dir:                /home/goose/.local/share/goose/state/logs                   
+
+goose Configuration:
+  extensions:
+    developer:
+      enabled: true
+      type: platform
+      name: developer
+      description: Write and edit files, and execute shell commands
+      display_name: Developer
+      bundled: true
+    scheduler:
+      enabled: true
+      type: platform
+      name: scheduler
+      description: Create and manage scheduled recipe execution
+      display_name: Scheduler
+      bundled: true
+    chatrecall:
+      enabled: false
+      type: platform
+      name: chatrecall
+      description: Search past conversations and load session summaries for contextual memory
+      display_name: Chat Recall
+      bundled: true
+    summon:
+      enabled: true
+      type: platform
+      name: summon
+      description: Load knowledge and delegate tasks to subagents
+      display_name: Summon
+      bundled: true
+    extensionmanager:
+      enabled: true
+      type: platform
+      name: Extension Manager
+      description: Enable extension management tools for discovering, enabling, and disabling extensions
+      display_name: Extension Manager
+      bundled: true
+    tom:
+      enabled: true
+      type: platform
+      name: tom
+      description: Inject custom context into every turn via GOOSE_MOIM_MESSAGE_TEXT and GOOSE_MOIM_MESSAGE_FILE environment variables
+      display_name: Top Of Mind
+      bundled: true
+    skills:
+      enabled: true
+      type: platform
+      name: skills
+      description: Discover and provide skill instructions from filesystem and builtins
+      display_name: Skills
+      bundled: true
+    apps:
+      enabled: true
+      type: platform
+      name: apps
+      description: Create and manage custom Goose apps through chat. Apps are HTML/CSS/JavaScript and run in sandboxed windows.
+      display_name: Apps
+      bundled: true
+    analyze:
+      enabled: true
+      type: platform
+      name: analyze
+      description: 'Analyze code structure with tree-sitter: directory overviews, file details, symbol call graphs'
+      display_name: Analyze
+      bundled: true
+    todo:
+      enabled: false
+      type: platform
+      name: todo
+      description: Enable a todo list for goose so it can keep track of what it is doing
+      display_name: Todo
+      bundled: true
+    summarize:
+      enabled: false
+      type: platform
+      name: summarize
+      description: Load files/directories and get an LLM summary in a single call
+      display_name: Summarize
+      bundled: true
+exit 0
+--- run.exit
+exit 1
+--- port80
+port 80 closed (exit 124)
+--- dns
+2a06:98c1:58::f3 api.openai.com
+2606:4700:7::f3 api.openai.com
+--- root-tree
+/home/goose/.local/share/goose
+/home/goose/.local/share/goose/state
+/home/goose/.local/share/goose/state/logs
+/home/goose/.local/share/goose/config
+/home/goose/.local/share/goose/data
+/home/goose/.local/share/goose/data/sessions
+--- done
+done
+--- run.out (its last 12 lines)
+
+  error: Error builder error.
+Please check your system keychain and run 'goose configure' again.
+If your system is unable to use the keyring, please try setting secret key(s) via environment variables.
+For more info, see: https://goose-docs.ai/docs/troubleshooting/#keychainkeyring-errors
+
+--- host: Goose root volume
+.
+./config
+./data
+./data/sessions
+./state
+./state/logs
+== secrets: the image's env and the files it adds, then a copy of the Agentfile with ENV OPENAI_API_KEY
+env of harness-goose:smoke: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+env names like a credential: []
+SCAN harness-goose:smoke clean
+linux/amd64: https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-x86_64-unknown-linux-musl.tar.gz sha256 6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31 size 50181341; member goose to goose-amd64/bin/goose, sha256 461ea83fc8736fa0ad608661a8e5ef8c704da886d38500441ba2b91f7184d9f5 size 154218008 mode 0755
+linux/arm64: https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-aarch64-unknown-linux-musl.tar.gz sha256 63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7 size 48814292; member goose to goose-arm64/bin/goose, sha256 c27e6ea558a39a9af96dcc04368296ca636e40a67c96cdac56a6f644488fb673 size 148726128 mode 0755
+build-secret: exit 0 in 1064 ms
+build warns SecretsUsedInArgOrEnv: 1
+ - SecretsUsedInArgOrEnv: Do not use ARG or ENV instructions for sensitive data (ENV "OPENAI_API_KEY") (line 29)
+env of harness-goose:secret: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin","OPENAI_API_KEY=placeholder-not-a-key"]
+env names like a credential: ['OPENAI_API_KEY']
+files holding one: /home/adalundhe/.cache/s23-step4/run-20261112T145220Z/ctx-secret/Agentfile 
+SCAN harness-goose:secret FOUND
+== sizes and times (single observations)
+289M	/home/adalundhe/.cache/s23-step4/run-20261112T145220Z/ctx
+harness-goose:slim 322MB
+harness-goose:alpine 218MB
+harness-goose:control 1.13GB
+harness-goose:probe 740MB
+harness-goose:smoke 932MB
+harness-goose:secret 739MB
+== done /home/adalundhe/.cache/s23-step4/run-20261112T145220Z
+SMOKE_EXIT=0
+SMOKE_RUN_EXIT=0

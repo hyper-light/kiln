@@ -1,0 +1,287 @@
+# kiln origin/main 94639db7b83076143ff48fe5dac6edb9d3a33743 excerpts (git -C /Users/adalundhe/Projects/kiln show 94639db7b83076143ff48fe5dac6edb9d3a33743:<path> | cat -n), 2026-11-12T13:48:01Z
+## crates/kiln/src/agentfiles/builtin.rs
+     1	//! The Agentfiles kiln ships, one per harness it runs in a Shards microVM (kiln plan
+     2	//! 01a1cd8e862e7169a074db3d5fa33f3d, "Every kiln harness in Shards microVMs"): each embedded in kiln's
+     3	//! one binary, listed read-only beside a person's own, and copied to make one theirs. None yet: each
+     4	//! harness's own step adds its Agentfile here (`include_str!`).
+     5	
+     6	use serde::Serialize;
+     7	
+     8	/// An Agentfile kiln ships.
+     9	pub struct Builtin {
+    10	    /// Its name, an image's (as a person's Agentfile's is: [`super::name_problem`]).
+    11	    pub name: &'static str,
+    12	    /// The harness it runs (`crate::harness::kinds::Kind`'s id: `claude`, `codex` ...).
+    13	    pub harness: &'static str,
+    14	    pub text: &'static str,
+    15	}
+    16	
+    17	/// Every one, in the order they're listed.
+    18	pub const ALL: &[Builtin] = &[];
+    19	
+    20	/// One as the list shows it.
+    21	#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    22	#[cfg_attr(test, derive(ts_rs::TS))]
+    23	#[cfg_attr(test, ts(rename = "AgentfileBuiltin"))]
+    24	pub struct View {
+    25	    pub name: String,
+    26	    pub harness: String,
+    27	    pub text: String,
+    28	}
+    29	
+    30	/// Every one, as the list shows them.
+    31	pub fn views() -> Vec<View> {
+    32	    ALL.iter().map(|b| View { name: b.name.to_owned(), harness: b.harness.to_owned(), text: b.text.to_owned() }).collect()
+    33	}
+    34	
+    35	#[cfg(test)]
+    36	mod tests {
+    37	    /// Each is what a person's Agentfile must be (a name an image may have, a text Shards may read), and
+    38	    /// no two share a name.
+    39	    #[test]
+    40	    fn every_builtin_is_a_valid_agentfile_once() {
+    41	        let mut names = std::collections::BTreeSet::new();
+    42	        for b in super::ALL {
+    43	            assert_eq!(super::super::name_problem(b.name), None, "{}", b.name);
+    44	            assert_eq!(super::super::text_problem(b.text), None, "{}", b.name);
+    45	            assert!(crate::harness::kinds::Kind::get(b.harness).is_some(), "{}: no harness {}", b.name, b.harness);
+    46	            assert!(names.insert(b.name), "{} twice", b.name);
+    47	        }
+    48	    }
+    49	}
+## crates/kiln/src/harness/claude.rs 1-10
+     1	//! Claude Code, driven the way its Agent SDK drives it: `claude -p` with stream-json in both
+     2	//! directions and the control protocol on top. kiln is the whole front end: it sends prompts (with
+     3	//! a uuid each, so it can follow their fate), answers permission requests (`can_use_tool`),
+     4	//! interrupts, switches modes and models, stops subagent tasks and asks for file suggestions, and
+     5	//! renders everything the CLI streams back: replies as they are written, thinking, tool calls with
+     6	//! their results and real diffs, subagents with their own messages, usage.
+     7	//!
+     8	//! Message shapes were taken from Claude Code 2.1.296 (`system/init`, `command_lifecycle`,
+     9	//! `task_*`, `control_request`/`control_response`/`control_cancel_request`, `stream_event`,
+    10	//! `result`). Unknown messages and fields are ignored, so newer CLIs keep working.
+## crates/kiln/src/harness/claude.rs 45-62
+    45	/// How kiln starts a Claude Code session.
+    46	pub fn args(spec: &super::session::Spec, session_id: Option<&str>) -> Vec<String> {
+    47	    let (model, mode, resume, allow_bypass) = (spec.model.as_deref(), spec.mode.as_deref(), spec.resume.as_deref(), spec.allow_bypass);
+    48	    let mut a: Vec<String> = [
+    49	        "-p",
+    50	        "--input-format",
+    51	        "stream-json",
+    52	        "--output-format",
+    53	        "stream-json",
+    54	        "--verbose",
+    55	        "--include-partial-messages",
+    56	        "--replay-user-messages",
+    57	        "--forward-subagent-text",
+    58	        "--permission-prompt-tool",
+    59	        "stdio",
+    60	    ]
+    61	    .iter()
+    62	    .map(|s| (*s).to_owned())
+## crates/kiln/src/harness/claude.rs 1490-1500
+  1490	        if parts.iter().any(|p| p.is_empty() || *p == "." || *p == ".." || p.contains(['/', '\\'])) {
+  1491	            return Vec::new();
+  1492	        }
+  1493	        let mut roots: Vec<std::path::PathBuf> = std::path::Path::new(cwd).ancestors().take(8).map(|d| d.join(".claude")).collect();
+  1494	        if !self.config_dir.is_empty() {
+  1495	            roots.push(std::path::PathBuf::from(&self.config_dir));
+  1496	        }
+  1497	        let mut out = Vec::new();
+  1498	        let rest = parts.join("/");
+  1499	        let cfg = std::path::PathBuf::from(&self.config_dir);
+  1500	        // Skills synced from claude.ai: "anthropic-skills:<name>", under skills/synced/<account>/
+## crates/kiln/src/harness/claude.rs 3156
+  3156	            core.effects.push(Effect::TranscriptTail { job, config: self.config_dir.clone(), session, bytes: 512 * 1024 });
+## crates/kiln/src/harness/kinds.rs 51
+    51	    Kind { id: "claude", name: "Claude Code", program: "claude", verified: true, protocol: Protocol::ClaudeStreamJson, screen: &["claude"], screen_takes_command: true },
+## crates/kiln/src/harness/kinds.rs 118-148
+   118	        match self.protocol {
+   119	            Protocol::ClaudeStreamJson => {
+   120	                let session_id = spec.resume.is_none().then(|| uuid::Uuid::now_v7().to_string());
+   121	                p.args(super::claude::args(spec, session_id.as_deref()));
+   122	                // kiln's MCP server: on a runner, its own (code mode over the kiln's machines and
+   123	                // kiln's operations, through the runner); else the server's, where this machine's
+   124	                // kiln serves it.
+   125	                let local = local_tools(spec);
+   126	                match (&local, crate::mcp::kit()) {
+   127	                    #[cfg(unix)]
+   128	                    (Some((kiln, sock, prefer)), _) => {
+   129	                        p.arg("--mcp-config").arg(crate::reach::mcp::claude_config(kiln, sock, *prefer, session));
+   130	                    }
+   131	                    // Its own token: kiln knows which agent calls, and whom it acts for.
+   132	                    (_, Some(kit)) => {
+   133	                        p.arg("--mcp-config").arg(kit.config_for(session));
+   134	                    }
+   135	                    _ => {}
+   136	                }
+   137	                // kiln's skills.
+   138	                if let Some(dir) = crate::mcp::kit().map(|k| k.plugin_dir.as_path()).or_else(crate::mcp::plugin_dir) {
+   139	                    p.arg("--plugin-dir").arg(dir);
+   140	                }
+   141	                // The skills kiln installed for it (docs/agents.md, "Skills kiln installs"): a folder
+   142	                // of plugins its machine fills as they're laid out, loaded again as they change.
+   143	                if let Some(dir) = crate::skills::place::session_folder(session) {
+   144	                    p.arg("--plugin-dir").arg(dir);
+   145	                }
+   146	                // File snapshots before edits, so a rewind can restore them.
+   147	                p.env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1");
+   148	            }
+## crates/kiln/src/harness/kinds.rs 498-509
+   498	/// Where Claude Code keeps its configuration for this session: `CLAUDE_CONFIG_DIR` from the
+   499	/// session's environment or the machine's, else `~/.claude`.
+   500	fn claude_config_dir(spec: &Spec) -> String {
+   501	    spec.env
+   502	        .iter()
+   503	        .rev()
+   504	        .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+   505	        .map(|(_, v)| v.clone())
+   506	        .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
+   507	        .filter(|d| !d.trim().is_empty())
+   508	        .unwrap_or_else(|| crate::os::home_dir().join(".claude").to_string_lossy().into_owned())
+   509	}
+## Dockerfile 36-79
+    36	# ------------------------------------------------------------------------- build
+    37	FROM ${RUST_IMAGE} AS build
+    38	# aws-lc-sys (rustls/quinn crypto) wants cmake/clang/perl; rusqlite "bundled" compiles sqlite with cc.
+    39	RUN apk add --no-cache musl-dev gcc g++ make cmake perl clang clang-dev linux-headers pkgconf git
+    40	ARG TARGETARCH
+    41	WORKDIR /src
+    42	COPY Cargo.toml Cargo.lock ./
+    43	# Cargo's config for every build of the workspace (SQLite's compile-time options: .cargo/config.toml).
+    44	COPY .cargo/ .cargo/
+    45	COPY crates/ crates/
+    46	# Turso, vendored for the conversation store (vendor/turso/UPSTREAM.md); kiln depends on it by path.
+    47	COPY vendor/turso/ vendor/turso/
+    48	# Quiver, Focal's bus and hyper-raft, vendored (vendor/MANIFEST.toml): the live feed's bus, kiln's
+    49	# transport, runtime and replicated stores, each a workspace of its own that Cargo.toml's [patch]
+    50	# points kiln's names at.
+    51	COPY vendor/quiver/ vendor/quiver/
+    52	COPY vendor/focal-bus/ vendor/focal-bus/
+    53	COPY vendor/hyper-raft/ vendor/hyper-raft/
+    54	COPY --from=ui /src/ui/dist ui/dist
+    55	# The UI is already built in the `ui` stage; a build.rs must not try to run npm again.
+    56	# The final binary must be fully static (checked below): job pods copy /kiln into arbitrary images.
+    57	# KILN_COMMIT is the commit it's built from (the context has no .git): the server builds every
+    58	# other platform's binary from the same one, so every runner can run what it runs.
+    59	ARG KILN_COMMIT=""
+    60	ENV KILN_SKIP_UI_BUILD=1 \
+    61	    KILN_COMMIT=${KILN_COMMIT} \
+    62	    CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    63	    CARGO_INCREMENTAL=0
+    64	RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    65	    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    66	    --mount=type=cache,target=/src/target,sharing=locked \
+    67	    set -eux; \
+    68	    case "${TARGETARCH:-amd64}" in \
+    69	      amd64) triple=x86_64-unknown-linux-musl ;; \
+    70	      arm64) triple=aarch64-unknown-linux-musl ;; \
+    71	      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    72	    esac; \
+    73	    rustup target add "$triple" >/dev/null 2>&1 || true; \
+    74	    RUSTFLAGS="-C target-feature=+crt-static" \
+    75	      cargo build --locked --release --target "$triple" -p kiln; \
+    76	    mkdir -p /out; \
+    77	    cp "target/$triple/release/kiln" /out/kiln; \
+    78	    if readelf -l /out/kiln | grep -q 'INTERP'; then echo "kiln is not static" >&2; exit 1; fi
+    79	
+## .dockerignore
+     1	# Build context for the top-level Dockerfile: only Cargo workspace, crates/, ui/, vendor/ and deploy/docker/.
+     2	.git
+     3	.github
+     4	**/target
+     5	target/
+     6	ui/node_modules
+     7	ui/dist
+     8	**/node_modules
+     9	**/*.log
+    10	**/.DS_Store
+    11	**/.env
+    12	**/.env.*
+    13	.idea
+    14	.vscode
+    15	docs/
+    16	deploy/
+    17	!deploy/docker/
+## include_str!/include_bytes! in crates/kiln/src reaching outside crates/ (git grep), and what encloses each
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/harness/inbox/mod.rs:1477:        let doc = include_str!("../../../../../docs/sends.md");
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/proto.rs:2202:        let doc = include_str!("../../../docs/wire.md");
+### crates/kiln/src/harness/inbox/mod.rs 1470-1477
+  1470	        Ok(())
+  1471	    }
+  1472	
+  1473	    /// docs/sends.md says what the code does: every refusal, by its reason; every bound, as the code
+  1474	    /// has it; and every sends metric, by its name, and no other.
+  1475	    #[test]
+  1476	    fn docs_sends_says_what_the_code_does() {
+  1477	        let doc = include_str!("../../../../../docs/sends.md");
+### crates/kiln/src/proto.rs 2196-2202
+  2196	    /// capability bit is one bit, held by one name, and the registry has its row; the variants
+  2197	    /// appended after main's last (c9c48f77's `AgentMsg::Settled`, 63, and `ServerMsg::Back`, 68)
+  2198	    /// are at their indexes, in the order the registry lists them; named features come after the
+  2199	    /// last bit. A new capability is a name in [`feature`], never a bit: none is left.
+  2200	    #[test]
+  2201	    fn wire_registry_holds_every_bit_and_variant_once() -> anyhow::Result<()> {
+  2202	        let doc = include_str!("../../../docs/wire.md");
+## crates/kiln/src/runner/runtime.rs, build_image's lines (git grep -n -F)
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/runner/runtime.rs:3938:    /// the builder can), an Agentfile through `shards build` and `shards push` (shards' own, never
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/runner/runtime.rs:3946:        let context = get("context").unwrap_or_else(|| format!(".kiln/images/{name}"));
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/runner/runtime.rs:3964:        let base = format!("{own}/{}/images/{name}", self.a.repo.to_ascii_lowercase());
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/runner/runtime.rs:3965:        let tags = if tag == "latest" { vec![format!("{base}:latest")] } else { vec![format!("{base}:{tag}"), format!("{base}:latest")] };
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/runner/runtime.rs:3981:            args.extend(["--platform".into(), platforms.join(",")]);
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/runner/runtime.rs:3987:            runs.extend(tags.iter().map(|t| vec!["push".to_owned(), t.clone()]));
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/runner/runtime.rs:3960:        let found = on_path(&env, prog).ok_or_else(|| anyhow::anyhow!("{file} is built by {prog}, which isn't on this runner{}", if shards { " (an Agentfile is never built with Docker)" } else { "" }))?;
+## crates/kiln/src/ci/images.rs 1-12
+     1	//! Runner images kiln built (docs/ci.md W13-R11): what `kiln/build-image@v1` pushed to kiln's
+     2	//! registry (W12), registered (`ci_images`) with their platforms, for pools and routing rules.
+     3	//!
+     4	//! - A leg reports each image it built (`JobEventV2::ImageBuilt`). The server registers one only
+     5	//!   as its own registry has it: under the leg's own repository (`<repo>/images/<name>`), the
+     6	//!   digest one of its manifests there, the platforms read from that manifest (an index's
+     7	//!   members, else its config's `os` and `architecture`), never taken from the report.
+     8	//! - `GET /api/ci/images?repo=&name=`: the images, newest first.
+     9	//! - `POST /api/ci/images?repo=` `{ name, kind?, content }`: a definition made in the UI ("Save
+    10	//!   to repo"), checked, then proposed as a diff adding `.kiln/images/<name>/Dockerfile` (or
+    11	//!   `Agentfile`): never written directly.
+    12	//! - `POST /api/ci/images/validate` `{ path?, kind?, content }`: an image's definition checked
+## crates/kiln/src/ci/registry/mod.rs (git grep)
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/ci/registry/mod.rs:1://! kiln's own OCI registry (docs/ci.md W12-R01): the OCI Distribution Specification v1.1 at
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/ci/registry/mod.rs:38:const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+## .kiln/image.yaml (git grep)
+94639db7b83076143ff48fe5dac6edb9d3a33743:.kiln/image.yaml:33:      # One x86_64-unknown-linux-musl build per commit for release and the image (W28-R78): the
+94639db7b83076143ff48fe5dac6edb9d3a33743:.kiln/image.yaml:37:        run: KILN_COMMIT=$KILN_SHA nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl
+## crates/kiln/src/runner/probe.rs (git grep)
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/runner/probe.rs:84:    ("shards", "shards", &["--version"]),
+## crates/kiln/src/http/client.rs (git grep)
+94639db7b83076143ff48fe5dac6edb9d3a33743:crates/kiln/src/http/client.rs:347:    /// Stream the body chunk by chunk (`None` at the end), e.g. for large downloads.
+## docs/ci.md (git grep)
+94639db7b83076143ff48fe5dac6edb9d3a33743:docs/ci.md:4415:  (`.kiln/images/<name>/Dockerfile` or `.kiln/images/<name>/Agentfile`) or are made in the UI
+94639db7b83076143ff48fe5dac6edb9d3a33743:docs/ci.md:4428:  silicon Macs Linux arm64 microVMs; QEMU emulation as a declared fact (W04-R13).
+## the CLI's agentfiles words (git grep)
+
+## How a kiln subcommand is wired: crates/kiln/src/blobs/cli.rs 12-30 and crates/kiln/src/entry.rs 279, 1210-1212 at 94639db7b83076143ff48fe5dac6edb9d3a33743
+    12	#[derive(clap::Args)]
+    13	pub struct BlobsArgs {
+    14	    #[command(subcommand)]
+    15	    cmd: BlobsCmd,
+    16	}
+    17	
+    18	#[derive(clap::Subcommand)]
+    19	enum BlobsCmd {
+    20	    /// Copy every object of this server's local store into the S3 store `[blobs.s3]` names. With
+    21	    /// the server stopped: copy, set `[blobs] store = "s3"`, start it. Objects the S3 store holds
+    22	    /// already (the same SHA-256) are skipped; run it again to finish a copy cut short.
+    23	    Copy,
+    24	}
+    25	
+    26	pub async fn run(args: BlobsArgs, cfg: &Config) -> Result<()> {
+    27	    match args.cmd {
+    28	        BlobsCmd::Copy => copy(cfg).await,
+    29	    }
+    30	}
+   279	    Blobs(kiln::blobs::cli::BlobsArgs),
+  1210	        Cmd::Blobs(a) => {
+  1211	            let cfg = config::Config::load(&config_path)?;
+  1212	            boxed(|| kiln::blobs::cli::run(a, &cfg)).await
+## kiln CI workflows under .kiln/ that name shards at 94639db7b83076143ff48fe5dac6edb9d3a33743 (git grep -l -w shards)
+kiln CI workflows that name shards: 0

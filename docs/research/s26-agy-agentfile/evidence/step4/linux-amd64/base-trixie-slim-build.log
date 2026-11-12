@@ -1,0 +1,49 @@
+#0 building with "shards" instance using shards driver
+
+#1 [internal] load build definition from Agentfile
+#1 read 2.916kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+#2 DONE 2.4s
+
+#3 [internal] load .agentignore
+#3 DONE 0.0s
+
+#4 [1/2] FROM docker.io/library/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+#4 resolve docker.io/library/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 done
+#4 DONE 0.3s
+
+#5 [internal] load build context
+#5 read 2 files, 252MB done
+#5 DONE 0.0s
+
+#6 [internal] load ./antigravity-amd64
+#6 CACHED
+
+#7 [2/2] HARNESS antigravity FROM ./antigravity-amd64
+#7 CACHED
+
+#8 [2/2] LINK HARNESS antigravity FROM ./antigravity-amd64
+#8 DONE 0.2s
+
+#9 [internal] read harness config from ./antigravity-amd64
+#9 CACHED
+
+#10 [3/2] HARNESS antigravity FROM ./antigravity-amd64
+#10 CACHED
+
+#11 [3/2] LINK HARNESS antigravity FROM ./antigravity-amd64
+#11 DONE 0.0s
+
+#12 [agentfile] the normalized Agentfile
+#12 DONE 0.0s
+
+#13 [internal] checking the domains' isolation
+#13 DONE 0.0s
+
+#14 exporting to image
+#14 exporting layers done
+#14 writing image sha256:f6966dad87446bcf038dd83fe8c8fd4530b6f7f44da49d44d6c4a135a21443de done
+#14 naming to docker.io/library/harness-antigravity-base-trixie-slim:s26 done
+#14 DONE 0.4s

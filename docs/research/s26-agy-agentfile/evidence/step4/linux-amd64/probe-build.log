@@ -1,0 +1,49 @@
+#0 building with "shards" instance using shards driver
+
+#1 [internal] load build definition from Agentfile
+#1 read 2.916kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+#2 DONE 0.0s
+
+#3 [internal] load .agentignore
+#3 DONE 0.0s
+
+#4 [1/2] FROM docker.io/library/buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+#4 resolve docker.io/library/buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10 done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 read 2 files, 252MB done
+#5 DONE 0.0s
+
+#6 [internal] load ./antigravity-amd64
+#6 DONE 0.2s
+
+#7 [2/2] HARNESS antigravity FROM ./antigravity-amd64
+#7 DONE 0.2s
+
+#8 [2/2] LINK HARNESS antigravity FROM ./antigravity-amd64
+#8 DONE 0.2s
+
+#9 [internal] read harness config from ./antigravity-amd64
+#9 DONE 0.0s
+
+#10 [3/2] HARNESS antigravity FROM ./antigravity-amd64
+#10 DONE 0.0s
+
+#11 [3/2] LINK HARNESS antigravity FROM ./antigravity-amd64
+#11 DONE 0.0s
+
+#12 [agentfile] the normalized Agentfile
+#12 DONE 0.0s
+
+#13 [internal] checking the domains' isolation
+#13 DONE 0.0s
+
+#14 exporting to image
+#14 exporting layers done
+#14 writing image sha256:6e81f0bf9133da9f9ffbad86d51c743786c3b90b4f0251e2931ba8a8109a6907 done
+#14 naming to docker.io/library/harness-antigravity-probe:s26 done
+#14 DONE 0.4s
