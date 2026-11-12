@@ -5,7 +5,7 @@ use super::pools::PoolSpec;
 use super::reserve::ReservationSpec;
 use super::retry::{FailureClass, RetryPolicy};
 use super::routing::{LegRoute, Preference, RunnerView, github_label_rules};
-use super::balance::Pace;
+use super::balance::{Pace, Profile};
 use super::sim::Sim;
 use super::state::{Command, Config, Cpus, Fence, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason, room};
 use crate::facts::{Disk, RunnerFacts};
@@ -4175,7 +4175,7 @@ fn w05_r26_cores_at_their_measured_speed() {
     let mut sim = Sim::new(Config::default());
     sim.runner(0, of_cpus("a", 8, 2));
     sim.runner(0, of_cpus("b", 8, 2));
-    sim.input(0, Input::RunnerPace { runner: "b".into(), pace: Pace { speed: 2048, slowness: 0, measured: 1 } });
+    sim.input(0, Input::RunnerPace { runner: "b".into(), pace: Pace { speed: 2048, measured: 1, ..Pace::default() } });
     sim.leg(1, leg("l0", "acme/x", 60), MIN);
     sim.run(2);
     assert_eq!(ran_on(&sim, &["l0"]), ["b"]);
@@ -4247,4 +4247,32 @@ fn a_legs_explanation_marks_its_kinds_good_place() {
         let good: Vec<String> = sim.sched.explain("k1").into_iter().filter(|e| e.good_place).map(|e| e.runner).collect();
         assert_eq!(good, if on { vec!["a".to_owned()] } else { Vec::new() }, "good places {on}");
     }
+}
+
+/// docs/lb.md "The CI engine": a leg is placed by when its kind's runs say it will finish. a has
+/// 32 cores at the reference's speed, b 4 cores measured twice as fast. A kind that keeps one core
+/// busy (60 s of the reference core's work) finishes sooner on b's faster core, 30 s to 60 s; one
+/// that keeps 16 busy, on a's many cores, 3.75 s to 7.5 s. A kind no run has taught follows what
+/// the kinds so far taught (their median): after the narrow kind, b.
+#[test]
+fn a_leg_goes_where_its_kinds_runs_say_it_finishes_first() {
+    let profile = |parallel: u64| Some(Profile { cpu_ms: 60_000, parallel, io_bytes: 0 });
+    let place = |legs: Vec<LegIn>| -> Vec<String> {
+        let mut sim = Sim::new(Config::default());
+        sim.runner(0, of_cpus("a", 32, 4));
+        sim.runner(0, of_cpus("b", 4, 4));
+        sim.input(0, Input::RunnerPace { runner: "b".into(), pace: Pace { speed: 2048, measured: 1, ..Pace::default() } });
+        let ids: Vec<String> = legs.iter().map(|l| l.id.clone()).collect();
+        for (i, l) in (1i64..).zip(legs) {
+            sim.leg(i * 2 * MIN, l, MIN);
+        }
+        sim.run(100 * MIN);
+        ids.iter().map(|id| sim.assigned.iter().find(|a| a.leg == *id).map_or("-".to_owned(), |a| a.runner.clone())).collect()
+    };
+    assert_eq!(place(vec![LegIn { profile: profile(1_000), ..kinded("narrow", "one-core") }]), ["b"]);
+    assert_eq!(place(vec![LegIn { profile: profile(16_000), ..kinded("wide", "sixteen") }]), ["a"]);
+    // Nothing taught: the most cores free at their speed, a's 32 to b's 8 core-equivalents.
+    assert_eq!(place(vec![kinded("new", "unknown")]), ["a"]);
+    // Once a narrow kind has taught, a kind with nothing of its own is expected to be like it.
+    assert_eq!(place(vec![LegIn { profile: profile(1_000), ..kinded("narrow", "one-core") }, kinded("new", "unknown")]), ["b", "b"]);
 }

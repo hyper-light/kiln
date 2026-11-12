@@ -210,6 +210,24 @@ impl Fleet {
         self.keys.insert(key.to_owned(), cells);
     }
 
+    /// Kind `key`'s work, ln of its CPU-seconds on the reference core (the model's `a_k`): over
+    /// its runs on every machine, each run's `y` less its machine's θ as `fit` has it (shrunk
+    /// toward the fleet; 0, the reference, for a machine it doesn't measure), weighted by runs. A
+    /// kind that ran on one machine has it too: its runs there, that machine's speed taken out.
+    /// `None`: no run of it kept. What the CI engine's load balancer ranks a leg's runners by
+    /// (`crate::sched::balance::Profile`).
+    #[allow(clippy::cast_precision_loss)]
+    pub fn work(&self, key: &str, fit: &Fit) -> Option<f64> {
+        let cells = self.keys.get(key)?;
+        let (mut n, mut sum) = (0u64, 0.0);
+        for (m, c) in cells {
+            let theta = self.names.get(*m).and_then(|name| fit.machines.get(name)).map_or(0.0, |x| x.shrunk);
+            sum += c.sum - c.n as f64 * theta;
+            n = n.saturating_add(c.n);
+        }
+        (n > 0).then(|| sum / n as f64)
+    }
+
     /// A finished run of kind `key` on `machine`, its `y` ([`y_of`]).
     pub fn observe(&mut self, key: &str, machine: &str, y: f64) {
         let mut cell = Cell::default();
@@ -369,6 +387,42 @@ mod tests {
             }
         }
         f
+    }
+
+    /// docs/lb.md "The CI engine": a kind's work on the reference core is its runs' CPU-seconds
+    /// with each machine's speed taken out: run on machines of every speed, it comes back within
+    /// the noise of the work that made it; a kind run on one machine alone, likewise.
+    #[test]
+    fn a_kinds_work_comes_back_with_each_machines_speed_taken_out() -> Result<(), String> {
+        let speeds = [0.5, 1.0, 2.0, 3.0];
+        let mut f = fleet(&speeds, 40, 6, 0.02, 11);
+        // A kind of 30 reference CPU-seconds: on m3 (3x the unit) it takes 10.
+        let want = 30f64.ln();
+        let centre = centred(&speeds);
+        for m in 0..4 {
+            let s = speeds.get(m).copied().unwrap_or(1.0);
+            for _ in 0..5 {
+                f.observe("probe", &format!("m{m}"), want - s.ln());
+            }
+        }
+        f.observe("alone", "m3", 10f64.ln());
+        let fit = f.fit();
+        // The fit's reference is the fleet's geometric-mean core g: 30 unit CPU-seconds are 30/g
+        // of its (`centre` is each speed over g, so its first over the first speed is 1/g).
+        let per_g = centre.first().copied().unwrap_or(1.0) / speeds.first().copied().unwrap_or(1.0);
+        let got = f.work("probe", &fit).ok_or("no work")?;
+        let expect = want + per_g.ln();
+        if (got - expect).abs() > 0.05 {
+            return Err(format!("probe: {got} against {expect}"));
+        }
+        let alone = f.work("alone", &fit).ok_or("no work alone")?;
+        if (alone - expect).abs() > 0.05 {
+            return Err(format!("alone on m3: {alone} against {expect}"));
+        }
+        if f.work("never", &fit).is_some() {
+            return Err("a kind never run has work".into());
+        }
+        Ok(())
     }
 
     /// The known speeds against their geometric mean, the fit's reference.

@@ -67,4 +67,12 @@ impl Speeds {
     pub async fn start(&self, store: &crate::store::Store) {
         self.loaded(store).await;
     }
+
+    /// Kind `key`'s work, ln of its CPU-seconds on the reference core, as the fit stands
+    /// (`kiln_ci::pace::speed::Fleet::work`): `None` before the store is read, or for a kind none
+    /// of whose runs is kept.
+    pub fn work(&self, key: &str) -> Option<f64> {
+        let fit = self.fit();
+        self.fleet.lock().as_ref().and_then(|f| f.work(key, &fit))
+    }
 }

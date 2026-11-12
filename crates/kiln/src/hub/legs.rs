@@ -80,7 +80,7 @@ impl Legs {
     /// CI engine"): the same runner's speed, whichever kernel ranks it.
     pub(crate) fn hint(&mut self, runner: &str, w: &FastWord) -> Option<kiln_ci::sched::balance::Pace> {
         let r = self.id(runner);
-        let pace = kiln_ci::sched::balance::Pace { speed: w.speed, slowness: w.slowness, measured: w.measured };
+        let pace = kiln_ci::sched::balance::Pace { speed: w.speed, slowness: w.slowness, measured: w.measured, disk: w.disk, net: w.net };
         let changed = self.paces.get_mut(r as usize).filter(|p| **p != pace).map(|p| {
             *p = pace;
             pace

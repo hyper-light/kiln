@@ -148,15 +148,31 @@ impl Owner {
     /// parallelism the ask is decided by its order alone; with none at all it is [`Owner::ask`],
     /// the same instructions.
     pub fn ask_with(&mut self, sig: SigId, need: Amounts, terms: &Terms, out: &mut Out) -> Result<Asked, Refused> {
+        self.ask_with_of(sig, NIL, need, terms, out)
+    }
+
+    /// [`Owner::ask_with`] for a run of kind `kind` (docs/lb.md "Good places"): between members
+    /// the expected finish can't tell apart (within 1/64 of the soonest, the orders' resolution)
+    /// it goes back to where that kind's work last went well, and passes over the runner that last
+    /// let it down while another is that close. The expected finish decides first. The CI
+    /// engine's legs ask so (`crate::sched::balance`), with the terms their kind's runs taught.
+    pub fn ask_with_kind(&mut self, sig: SigId, kind: KindId, need: Amounts, terms: &Terms, out: &mut Out) -> Result<Asked, Refused> {
+        self.ask_with_of(sig, kind.0, need, terms, out)
+    }
+
+    fn ask_with_of(&mut self, sig: SigId, kind: u32, need: Amounts, terms: &Terms, out: &mut Out) -> Result<Asked, Refused> {
         let cpu = need[0];
         let p = if terms.parallel == 0 { cpu } else { terms.parallel };
         let wide = p > cpu || mutant(M::NoNarrow);
         if !terms.costs() {
-            if !wide || !self.ordered {
-                return self.ask(sig, need, out);
-            }
-            return self.ask_most(sig.0, need, out);
+            return match (wide && self.ordered, kind == NIL) {
+                (false, true) => self.ask(sig, need, out),
+                (false, false) => self.ask_kind(sig, KindId(kind), need, out),
+                (true, true) => self.ask_most(sig.0, need, out),
+                (true, false) => self.ask_most_of::<true>(sig.0, kind, need, out),
+            };
         }
+        let super::Kind { good, shun, .. } = self.kinds.get(kind as usize).copied().unwrap_or(super::NO_PLACES);
         // W05-R26: create only the rate indexes this ask reads; a CPU measurement need not
         // prepay disk/link/network construction. Their first use pays the explicit build.
         // Link quality also contributes latency/stability and a listed candidate's own
@@ -195,11 +211,23 @@ impl Owner {
         let mut seen = std::mem::take(&mut self.seen);
         seen.clear();
         let mut best = Seen { e: u128::MAX, r: NIL, src: Source::Index(0) };
+        // The runner that last let the kind down, kept apart: the soonest of the rest is taken
+        // over it when within the resolution of it.
+        let mut shunned = Seen { e: u128::MAX, r: NIL, src: Source::Index(0) };
+        let mut keep = |best: &mut Seen, seen: &mut Vec<Seen>, x: Seen| {
+            if x.r != NIL && x.r == shun {
+                if x.e < shunned.e {
+                    shunned = x;
+                }
+                return;
+            }
+            keep(best, seen, spread, x);
+        };
         for w in listed {
             if let Some((r, f)) = listed_at(self, w)
                 && let Source::Listed { wait, saved, missing } = f
             {
-                keep(&mut best, &mut seen, spread, Seen { e: self.finish(r, terms, cpu, p, wide, on, wait, saved, missing), r, src: f });
+                keep(&mut best, &mut seen, Seen { e: self.finish(r, terms, cpu, p, wide, on, wait, saved, missing), r, src: f });
             }
         }
         // The lists: by CPU, the narrow order on measured runners and, for a wide ask (or none
@@ -235,7 +263,7 @@ impl Owner {
                     continue;
                 }
                 let src = if c.list == IX { Source::Index(c.took) } else { Source::Order(c.list) };
-                keep(&mut best, &mut seen, spread, Seen { e: self.finish(r, terms, cpu, p, wide, on, 0, 0, terms.bytes), r, src });
+                keep(&mut best, &mut seen, Seen { e: self.finish(r, terms, cpu, p, wide, on, 0, 0, terms.bytes), r, src });
                 if !others {
                     break;
                 }
@@ -246,6 +274,10 @@ impl Owner {
         }
         self.counts.walked = self.counts.walked.saturating_add(walked);
         self.counts.read = self.counts.read.saturating_add(read);
+        // The runner that let the kind down, when no other comes within the resolution of it.
+        if shunned.r != NIL && (best.r == NIL || best.e > within_bound(tau, shunned.e)) {
+            best = shunned;
+        }
         if best.r == NIL {
             self.seen = seen;
             // No member with a core free has room (nor a listed one): a need below a core may
@@ -262,6 +294,12 @@ impl Owner {
             seen.iter().filter(|x| x.e <= bound).nth(k as usize).copied().unwrap_or(best)
         } else {
             best
+        };
+        // The kind's good place, when its finish is within the resolution of the soonest: the
+        // expected finish can't tell them apart. No turn moves for it.
+        let chosen = match self.good_within(si, good, &need, terms, (cpu, p, wide, on), within_bound(tau, best.e)) {
+            Some(e) if good != chosen.r => Seen { e, r: good, src: Source::Listed { wait: 0, saved: 0, missing: 0 } },
+            _ => chosen,
         };
         self.seen = seen;
         let Seen { r, src: f, .. } = chosen;
@@ -280,6 +318,16 @@ impl Owner {
             Source::Listed { .. } => {}
         }
         self.start_at(si, need, r)
+    }
+
+    /// The expected finish of kind's good place `good` when it's a member with room for `need`
+    /// whose finish is within `bound`: `None` otherwise (none, or the rank tells it apart).
+    fn good_within(&self, si: u32, good: u32, need: &Amounts, terms: &Terms, (cpu, p, wide, on): (u64, u64, bool, On), bound: u128) -> Option<u128> {
+        if good == NIL || !self.sigs.get(si as usize).is_some_and(|s| s.ix.contains(good)) || self.peers.get(good as usize).is_none_or(|x| x.flags & UP == 0) || !self.fits_at(good, need) {
+            return None;
+        }
+        let e = self.finish(good, terms, cpu, p, wide, on, 0, 0, terms.bytes);
+        (e <= bound).then_some(e)
     }
 
     /// Whether a shared owner has seen enough to draw: `width` candidates within the bound of the

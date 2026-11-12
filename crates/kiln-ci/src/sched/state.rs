@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use super::demand::{self, Ask, Demand, Demands, End, Fate, Next, Running, Work};
 use super::admit::{self, Admit, Held, Skipped};
-use super::balance::{Balance, Pace};
+use super::balance::{Balance, Pace, Profile};
 use super::groups::{GroupAction, GroupConfig, Groups};
 use super::needs;
 use super::pools::{self, ExecState, Executor, Pool, PoolView};
@@ -645,6 +645,9 @@ pub struct LegIn {
     /// (`sense::run::leg_key`: its repository, workflow, job and matrix), so the load balancer
     /// sends it back to where its kind last went well. Empty: none, placed by rank and turn alone.
     pub kind: String,
+    /// What its kind's runs taught of its work (docs/lb.md "The CI engine"): the load balancer
+    /// ranks runners for it by when it's expected to finish there. None: nothing taught yet.
+    pub profile: Option<Profile>,
 }
 
 /// Where a person's retry asked a leg to run (W05-R28): only on `runner`, or on any runner but
@@ -2883,6 +2886,16 @@ impl Scheduler {
     /// signature's members as the engine's records stand: its eligible runners that aren't
     /// draining (W05-R04).
     fn balance_sync(&mut self, sig: &str) {
+        self.balance_told();
+        let Some(s) = self.sigs.get(sig) else { return };
+        let runners = &self.runners;
+        let members = s.eligible.iter().filter(|id| runners.get(*id).is_some_and(|r| r.connected && !r.draining));
+        self.balance.sync(sig, self.fleet_gen, members);
+    }
+
+    /// Each runner whose room changed told the load balancer ([`Self::word_of`]); one whose link
+    /// is down leaves it.
+    fn balance_told(&mut self) {
         let told: Vec<(String, Option<(lb::Amounts, lb::Word)>)> = std::mem::take(&mut self.dirty).into_iter().map(|id| {
             let w = self.runners.get(&id).filter(|r| r.connected).map(|r| self.word_of(r));
             (id, w)
@@ -2893,10 +2906,6 @@ impl Scheduler {
                 None => self.balance.gone(&id),
             }
         }
-        let Some(s) = self.sigs.get(sig) else { return };
-        let runners = &self.runners;
-        let members = s.eligible.iter().filter(|id| runners.get(*id).is_some_and(|r| r.connected && !r.draining));
-        self.balance.sync(sig, self.fleet_gen, members);
     }
 
     /// What the load balancer is told of runner `r` (docs/lb.md "The CI engine"): its whole budget,
@@ -2922,7 +2931,7 @@ impl Scheduler {
         let (held, whole, ordinary) = self.holding(r);
         let cpu = self.room_of(r, &Holding { held, whole, ordinary, used: r.used, running: r.running.len() }, Cpus::ZERO);
         let rest = [budget[1].saturating_sub(r.used.mem), budget[2].saturating_sub(r.used.disk), budget[3].saturating_sub(u64::from(r.used.gpu))];
-        let word = lb::Word { epoch: 1, whole: false, cpu, rest, speed: r.pace.speed, slowness: r.pace.slowness, disk: 0, net: 0, measured: r.pace.measured, wants: false };
+        let word = lb::Word { epoch: 1, whole: false, cpu, rest, speed: r.pace.speed, slowness: r.pace.slowness, disk: r.pace.disk, net: r.pace.net, measured: r.pace.measured, wants: false };
         (budget, word)
     }
 
@@ -2984,18 +2993,20 @@ impl Scheduler {
     /// the load balancer's pick between those: where they rank none above another, as a leg
     /// without. `None`: no runner takes it now.
     fn choose(&mut self, id: &str, but: &BTreeSet<String>) -> Option<String> {
-        let (sig, kind, ranked) = {
+        let (sig, kind, ranked, own, taught) = {
             let l = self.legs.get(id)?;
             let kind = if self.cfg.good_places { l.input.kind.clone() } else { String::new() };
-            (l.sig.clone(), kind, Self::ranked(l))
+            (l.sig.clone(), kind, Self::ranked(l), l.input.kind.clone(), l.input.profile)
         };
         self.balance_sync(&sig);
         let first = if ranked { Some(self.ranked_first(id, but)?) } else { None };
+        // What its kind's runs taught, else what other kinds' did.
+        let profile = self.balance.profile(&own, taught);
         // The load balancer proposes, the engine's rules dispose: a runner that doesn't take it
         // now is set aside for this pick alone, and the next proposal is the one after it.
         let mut aside: Vec<String> = Vec::new();
         let picked = loop {
-            let Some(r) = self.balance.propose(&sig, &kind) else { break None };
+            let Some(r) = self.balance.propose(&sig, &kind, profile) else { break None };
             let ok = !but.contains(&r) && first.as_ref().is_none_or(|f| f.contains(&r)) && self.legs.get(id).zip(self.runners.get(&r)).is_some_and(|(l, x)| self.takes_now(x, l));
             if ok {
                 break Some(r);
@@ -3737,12 +3748,13 @@ impl Scheduler {
             self.review_admission(now, out);
             return;
         }
-        // How it went there is the load balancer's to know (docs/lb.md "Good places").
+        // How it went there, and how long it took from its grant, is the load balancer's to know
+        // (docs/lb.md "Good places").
         if self.cfg.good_places
             && let Some(r) = &runner
-            && let Some(kind) = self.legs.get(id).map(|l| l.input.kind.clone())
+            && let Some((kind, took)) = self.legs.get(id).map(|l| (l.input.kind.clone(), l.started.map(|at| u64::try_from(now.saturating_sub(at)).unwrap_or(0))))
         {
-            self.balance.ended(r, &kind, Self::how(&outcome));
+            self.balance.ended(r, &kind, Self::how(&outcome), took);
         }
         let decision = match &outcome {
             Outcome::Failed(f) if retry => retry::decide(self.legs.get(id).and_then(|l| l.input.retry.as_ref()), attempt, f),
@@ -5220,39 +5232,57 @@ impl Scheduler {
         self.sigs.values().filter(|s| s.req.pool.as_deref() == Some(pool)).map(Sig::len).sum()
     }
 
-    /// The hosts that may run `pool`'s executors now, with room for another: connected, not
-    /// draining, eligible for its legs, under `per_host_max`, with the resources in resource
-    /// mode, and not backing off; the least loaded with the pool first.
-    fn hosts_for(&self, p: &Pool, now: i64) -> Vec<String> {
+    /// The host `pool`'s next executor starts on (W13-R09), the load balancer's pick (docs/lb.md
+    /// "The CI engine"): of the hosts that may run its executors (connected, not draining,
+    /// eligible for its legs), the most free by its rank, and between hosts as free, back to the
+    /// one its executors last started on well, past the one where one last failed to start, else
+    /// the next in turn. One that can't take another now is set aside for this pick: under
+    /// `per_host_max`, its GPUs' fit, room beside its exclusive legs in resource mode, and not
+    /// backing off. `None`: no host can.
+    fn host_for(&mut self, p: &Pool, now: i64) -> Option<String> {
         let req = Requirement { constraints: p.hosts.clone(), caps: p.caps, executors: vec![p.executor.clone()], pool: Some(p.name.clone()), ..Requirement::default() };
-        let mut hosts: Vec<(usize, String)> = self
-            .runners
-            .values()
-            .filter(|r| r.connected && !r.draining && routing::eligible(&req, &r.input.view))
-            .filter(|r| self.backoff.get(&(p.name.clone(), r.input.id.clone())).is_none_or(|(until, _)| *until <= now))
-            .filter_map(|r| {
-                let here = self.executors.values().filter(|e| e.pool == p.name && e.runner == r.input.id).count();
-                if here >= p.per_host_max {
-                    return None;
-                }
-                let c = self.config();
-                if p.request.gpu > 0 {
-                    let need = super::needs::Needs { request: p.request, requires: p.hosts.iter().map(|(src, _)| src.clone()).collect(), ..Default::default() };
-                    Self::gpu_rank(r, &need, r.used.gpu)?;
-                }
-                if let (true, Some(cap)) = (c.resources, r.input.capacity) {
-                    // Beside what exclusive legs hold there, never in it.
-                    let q = &p.request;
-                    let (held, whole, _) = self.holding(r);
-                    if whole || !fits_beside(&r.used, &held, &cap, q, c) {
-                        return None;
-                    }
-                }
-                Some((here, r.input.id.clone()))
-            })
-            .collect();
-        hosts.sort();
-        hosts.into_iter().map(|(_, h)| h).collect()
+        let (sig, kind) = (format!("pool\0{}\0{}", p.name, p.caps), format!("pool:{}", p.name));
+        self.balance_told();
+        let hosts: Vec<String> = self.runners.values().filter(|r| r.connected && !r.draining && routing::eligible(&req, &r.input.view)).map(|r| r.input.id.clone()).collect();
+        self.balance.sync(&sig, self.fleet_gen, hosts.iter());
+        let kind = if self.cfg.good_places { kind } else { String::new() };
+        let mut aside: Vec<String> = Vec::new();
+        let picked = loop {
+            let Some(h) = self.balance.propose(&sig, &kind, None) else { break None };
+            if self.runners.get(&h).is_some_and(|r| self.takes_executor(p, r, now)) {
+                break Some(h);
+            }
+            self.balance.set_aside(&sig, &h);
+            aside.push(h);
+        };
+        self.balance.restore(&sig, &aside);
+        picked
+    }
+
+    /// Whether host `r` can take another of `pool`'s executors now: under `per_host_max`, not
+    /// backing off, its GPUs' fit, and in resource mode room beside what exclusive legs hold there.
+    fn takes_executor(&self, p: &Pool, r: &Runner, now: i64) -> bool {
+        if self.backoff.get(&(p.name.clone(), r.input.id.clone())).is_some_and(|(until, _)| *until > now) {
+            return false;
+        }
+        if self.executors.values().filter(|e| e.pool == p.name && e.runner == r.input.id).count() >= p.per_host_max {
+            return false;
+        }
+        let c = self.config();
+        if p.request.gpu > 0 {
+            let need = super::needs::Needs { request: p.request, requires: p.hosts.iter().map(|(src, _)| src.clone()).collect(), ..Default::default() };
+            if Self::gpu_rank(r, &need, r.used.gpu).is_none() {
+                return false;
+            }
+        }
+        if let (true, Some(cap)) = (c.resources, r.input.capacity) {
+            // Beside what exclusive legs hold there, never in it.
+            let (held, whole, _) = self.holding(r);
+            if whole || !fits_beside(&r.used, &held, &cap, &p.request, c) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Starts as many of `pool`'s executors as its waiting legs and `min_idle` want.
@@ -5297,8 +5327,8 @@ impl Scheduler {
         protected.caps |= p.locked_caps;
         for (leg, _) in waiting.iter().filter(|(_, own)| *own) {
             if self.executors.values().any(|e| e.leg.as_deref() == Some(leg.as_str())) { continue; }
-            let mut host = self.hosts_for(&protected, now).into_iter().next();
-            if host.is_none() && self.retire_shared(&protected, true, out) { room += 1; host = self.hosts_for(&protected, now).into_iter().next(); }
+            let mut host = self.host_for(&protected, now);
+            if host.is_none() && self.retire_shared(&protected, true, out) { room += 1; host = self.host_for(&protected, now); }
             let Some(host) = host else { break };
             if room == 0 && self.retire_shared(&p, false, out) { room += 1; }
             if room == 0 { break; }
@@ -5310,7 +5340,7 @@ impl Scheduler {
         let others = waiting.iter().filter(|(_, own)| !*own).count();
         let mut want = pools::wanted(&p, starting, idle, busy, others).min(room);
         while want > 0 {
-            let Some(host) = self.hosts_for(&p, now).into_iter().next() else { break };
+            let Some(host) = self.host_for(&p, now) else { break };
             self.start_on_host(&p, host, None, now, out);
             want -= 1;
         }
@@ -5375,6 +5405,10 @@ impl Scheduler {
         e.since = now;
         let (pool, runner) = (e.pool.clone(), e.runner.clone());
         self.backoff.remove(&(pool.clone(), runner.clone()));
+        // Its host started it well: where the pool's executors go back to (docs/lb.md "Good places").
+        if self.cfg.good_places {
+            self.balance.ended(&runner, &format!("pool:{pool}"), How::Well, None);
+        }
         self.try_runner(&runner, now, out);
         self.scale(&pool, now, out);
         self.idle_timer(&pool, now, out);
@@ -5389,7 +5423,11 @@ impl Scheduler {
         if matches!(e.state, ExecState::Busy { .. }) {
             return;
         }
-        // The host is left alone a while, longer each time it fails.
+        // Its host let it down: passed over for the pool's executors while another is as free
+        // (docs/lb.md "Good places"), and left alone a while, longer each time it fails.
+        if self.cfg.good_places {
+            self.balance.ended(&e.runner, &format!("pool:{}", e.pool), How::LetDown, None);
+        }
         let key = (e.pool.clone(), e.runner.clone());
         let delay = self.backoff.get(&key).map_or(pools::FIRST_BACKOFF_MS, |(_, d)| *d);
         self.backoff.insert(key, (now + delay, (delay * 2).min(pools::MAX_BACKOFF_MS)));

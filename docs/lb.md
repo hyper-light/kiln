@@ -462,52 +462,87 @@ most free slots), is gone. The queue still decides which leg goes next (classes,
 priorities, W05-R09 to R10, R30, R31); routing, which runners may take it (W05-R19 to R22); the
 engine's rules, whether one takes it now (its room, a slot or its request within capacity ×
 overcommit, W05-R03; its target use by its live sample; room kept for another, W05-R39; a runner a
-retry stays off or is pinned to, W05-R16, R28); and the kernel, which of those it goes to.
+retry stays off or is pinned to, W05-R16, R28); and the kernel, which of those it goes to. What a
+winner is decides it: the runner where the leg completes as quickly, efficiently, completely and
+correctly as it can.
 
 - **What the kernel is told.** Each runner joins it at its first word, with its whole budget (its
   CPUs, memory, disk and GPUs as it offers them or its facts say, else its CPUs as its latest
   sample says, else one for each slot; CPUs overcommitted in resource mode), and its room for an
-  ordinary leg now, whenever that
-  changes (a leg granted or ended there, an executor started or stopped, a sample, the runner up or
-  changed): the least of what each of the engine's measures leaves, its free slots' share of the
-  CPUs no exclusive leg holds (slot mode) or what its capacity leaves (resource mode), and, by its
-  live sample, what it can still take within its target use, less its CPUs' share of the time its
-  tasks all stalled on memory and on I/O (PSI's `full`: time lost, not used). None while a leg holds
-  it whole. Its pace is what its own kernel's words say (`speed`, `slowness`): the server passes
-  it on when it changes (`Input::RunnerPace`), so its free cores are ranked at its speed. A
-  signature's members are its eligible runners that aren't draining, synced when which runners
-  those are may have changed. The runner leaves the kernel with its link, and joins it again,
-  under its next epoch, when it's back.
-- **The pick.** The kernel proposes the signature's members in its order: the most free by its
-  rank first (free cores at each runner's speed, docs/lb.md "Rank"), and between runners it can't
-  tell apart, the leg's kind's good place, else the next in turn, passing over the runner that
-  last let its kind down when another is as free ("Good places"). The first that takes the leg now
-  by the engine's rules gets it; one that doesn't is set aside for that pick alone. The pick takes
-  its turn; nothing of the kernel's view is left changed by it, since the engine tells the kernel
-  the runner's room once the leg is granted. Memory is a fit, not a rank: it makes no leg finish
-  sooner until it runs short, which its stalls say.
+  ordinary leg now, whenever that changes (a leg granted or ended there, an executor started or
+  stopped, a sample, the runner up or changed): the least of what each of the engine's measures
+  leaves, its free slots' share of the CPUs no exclusive leg holds (slot mode) or what its capacity
+  leaves (resource mode), and, by its live sample, what it can still take within its target use,
+  less its CPUs' share of the time its tasks all stalled on memory and on I/O (PSI's `full`: time
+  lost, not used). None while a leg holds it whole. Its pace is what its own kernel's words say
+  (the fleet's fitted per-core speed, its slowness under contention now, its disk's and network's
+  rates): the server passes it on when it changes (`Input::RunnerPace`; one said before the runner
+  is up is kept for it). A signature's members are its eligible runners that aren't draining,
+  synced when which runners those are may have changed. A runner leaves the kernel with its link,
+  and joins it again, under its next epoch, when it's back.
+- **Each leg by when it will finish there.** A leg comes with what its kind's runs taught
+  (`Profile`): its CPU time on the reference core (the fleet's speed fit, `pace::speed`, every run
+  of it kept, each machine's speed taken out: `Fleet::work`), the most cores a run of it kept busy
+  (CPU time over wall time, the most of its newest runs: a lower bound of what it can use, that only
+  rises as runs find more cores free), and its bytes. The kernel ranks each runner by when the leg
+  is expected to finish there ("Per-ask terms", `Owner::ask_with_kind`): its CPU time over the
+  cores it would get, no more than it can use, at that runner's speed under contention, and its
+  bytes at the runner's disk rate. So a leg that keeps one core busy goes to the fastest cores,
+  and a build that uses every core it finds to the most of them at their speed. A kind no run has
+  taught is expected to be like the kinds so far, the median of their profiles, each term apart
+  (an empirical prior: Robbins, 1956); before any kind has taught one, a leg ranks runners by
+  their free cores at their speed (`Owner::ask_kind_wide`). Legs rebuilt after a restart take the
+  prior until their kind's next leg is queued.
+- **The pick.** The kernel proposes the signature's members in its order: the soonest finish
+  first, and between runners it can't tell apart (within 1/64, the orders' resolution), the leg's
+  kind's good place, else the next in turn, passing over the runner that last let its kind down
+  when another is that close ("Good places"). The first that takes the leg now by the engine's
+  rules gets it; one that doesn't is set aside for that pick alone. The pick takes its turn; nothing
+  of the kernel's view is left changed by it, since the engine tells the kernel the runner's room
+  once the leg is granted.
 - **Where it's asked.** A runner with room takes its best legs in queue order (W05-R04), and each
-  goes where the kernel puts it: that runner, or one as free or freer, or its kind's good place
-  among equals. A leg queued is offered to the runners with room for it in the kernel's rank (the
-  most whole cores free first, by id among equals), each taking its best legs, as before. A
-  runner's lost legs, coming back together, each go straight where the kernel puts it.
+  goes where the kernel puts it: that runner, or one where it finishes as soon or sooner, or its
+  kind's good place among equals. A leg queued is offered to the runners with room for it in the
+  kernel's rank (the most whole cores free first, by id among equals), each taking its best legs,
+  as before. A runner's lost legs, coming back together, each go straight where the kernel puts it.
+- **A run's critical path first.** What people wait on is the run. Legs that become ready
+  together go to the scheduler in order of their jobs' upward ranks (HEFT's `rank_u`: Topcuoglu,
+  Hariri & Wu, IEEE TPDS 13(3), 2002): a job's median duration and the longest chain of medians
+  among the jobs that need it, from the workflow's `needs` and its jobs' history
+  (`ci::dispatch::critical_first`). The leg the run waits on longest takes the best runner first;
+  in the queue, legs queued together keep that order among those of one priority.
 - **Preferences and GPUs.** A leg whose job or a rule declares preferences (W05-R23's terms over
   facts and labels, W24-R18's `warm` and `affinity`), or that asks for GPUs (W05-R22's device fit),
   goes to the runners those rank first, of those that take it now, and between them where the
   kernel puts it: where they rank none above another (a cold fleet), exactly as a leg without.
 - **Kinds and ends.** A leg's kind is the key its runner keys its runs of it by
   (`sense::run::leg_key`: its repository, its job's workflow, its job and its matrix), so the
-  engine and the runner name the same work alike. As an attempt ends on its runner, the kernel is
-  told how it went: success, it went well (its kind's good place from now); lost with its runner,
-  its infrastructure, its image, killed for memory or its disk full, the runner let it down;
-  failed in its steps or timed out, no one knows whose fault it was, which the kernel settles by
-  comparison; cancelled, nothing. `[reach] good_places = false` turns kinds off for CI legs too:
-  equals take turns alone.
-- **Pools and gangs.** A pool's leg (W13-R09) runs in an idle executor of its pool: of the hosts
-  with one, where the kernel puts it, as any leg (its GPUs' fit first when it asks for GPUs). A
-  gang's members (W05-R40) start together or not at all, placed by the engine's all-or-nothing
-  planner, which tries the runners for each member in the kernel's rank as well (the most whole
-  cores free with the members put there before it, then by id).
+  engine, the runner and the run-time model name the same work alike. As an attempt ends on its
+  runner, the kernel is told how it went: success, it went well (its kind's good place from now);
+  lost with its runner, its infrastructure, its image, killed for memory or its disk full, the
+  runner let it down; failed in its steps or timed out, no one knows whose fault it was, which the
+  kernel settles by comparison; cancelled, nothing.
+- **Quickly.** A winner completes quickly as well as correctly. A leg that succeeded but took
+  longer from its grant than every earlier run of its kind that went well on that runner is a
+  record: something there may have slowed it (a throttled or contended machine, a failing disk) or
+  its work grew, and no one can say which, so it's judged as a failure no one can explain, and the
+  comparison settles it: its kind's next leg goes elsewhere once; going well there, the runner was
+  at fault and is passed over; a record there too, the work grew, and it keeps its place. No
+  threshold is picked: of n exchangeable runs the last is the longest with probability 1/n
+  (Foster & Stuart, JRSS B 16(1), 1954), so a runner that hasn't slowed sees about ln N such moves
+  over N runs of a kind there (H_N - 1: Rényi, 1962; Glick, Amer. Math. Monthly 85(1), 1978),
+  fewer the longer the kind has run there. `[reach] good_places = false` turns kinds off for CI
+  legs too: equals take turns alone, and no end is judged.
+- **Pools.** A pool's leg (W13-R09) runs in an idle executor of its pool: of the hosts with one,
+  where the kernel puts it, as any leg (its GPUs' fit first when it asks for GPUs). Where a pool
+  starts its next executor is the kernel's pick as well (`host_for`): of the hosts that may run
+  them, the most free by the rank, and between hosts as free, back to the one where the pool's
+  executors last started well (an executor ready is its good place's win), past one where a start
+  last failed; one at its `per_host_max`, backing off, without the GPUs or the room beside its
+  exclusive legs is set aside for that pick.
+- **Gangs.** A gang's members (W05-R40) start together or not at all, placed by the engine's
+  all-or-nothing planner, which tries the runners for each member in the kernel's rank (the most
+  whole cores free with the members put there before it, then by id).
 
 The reference scheduler (`sched::reference`, docs/needs.md E1.5) holds the engine to this: a leg
 goes to a runner with the most whole cores free of those that take it now, and of runners as free,

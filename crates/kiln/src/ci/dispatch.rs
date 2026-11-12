@@ -660,6 +660,75 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
     }
 }
 
+/// What leg kind `kind`'s runs taught of its work (docs/lb.md "The CI engine"): its CPU time on
+/// the reference core from the fleet's speed fit (every run of it kept, each machine's speed taken
+/// out), and from its newest runs how wide it ran and its bytes. `None`: nothing kept of it yet.
+async fn profile_of(hub: &Hub, kind: &str) -> Option<kiln_ci::sched::balance::Profile> {
+    let work = hub.pace.work(kind)?;
+    let rows = hub.store.run_observations(kind.to_owned()).await.inspect_err(|e| tracing::debug!(kind, error = %format!("{e:#}"), "a leg's runs couldn't be read: it's placed by what other kinds taught")).ok()?;
+    kiln_ci::sched::balance::Profile::learn(Some(work), &rows)
+}
+
+/// Each job's upward rank, ms (W05-R23; HEFT's `rank_u`: Topcuoglu, Hariri & Wu, "Performance-
+/// effective and low-complexity task scheduling for heterogeneous computing", IEEE TPDS 13(3),
+/// 2002): its median duration (its history's, `costs`) and the longest chain of medians among the
+/// jobs that need it, transitively: how long the run goes on after the job starts, at the least.
+/// A job with no history adds nothing of its own; its chain still counts.
+fn upward_ranks(wf: &Workflow, costs: &HashMap<String, super::insights::JobCost>) -> HashMap<String, u64> {
+    let mut after: HashMap<&str, Vec<&str>> = HashMap::new();
+    for j in &wf.jobs {
+        for n in &j.needs {
+            after.entry(n.job()).or_default().push(j.id.as_str());
+        }
+    }
+    let own = |job: &str| costs.get(job).map_or(0, |c| kiln_ci::sched::units::ms_of_secs(c.p50).unwrap_or(0));
+    let mut ranks: HashMap<String, u64> = HashMap::new();
+    // Depth first, each job once; a job met again on its own chain (a cycle validation refuses)
+    // counts nothing more.
+    fn rank<'a>(job: &'a str, after: &HashMap<&'a str, Vec<&'a str>>, own: &dyn Fn(&str) -> u64, ranks: &mut HashMap<String, u64>, on: &mut HashSet<&'a str>) -> u64 {
+        if let Some(r) = ranks.get(job) {
+            return *r;
+        }
+        if !on.insert(job) {
+            return 0;
+        }
+        let tail = after.get(job).map_or(0, |next| next.iter().map(|n| rank(n, after, own, ranks, on)).max().unwrap_or(0));
+        on.remove(job);
+        let r = own(job).saturating_add(tail);
+        ranks.insert(job.to_owned(), r);
+        r
+    }
+    let mut on = HashSet::new();
+    for j in &wf.jobs {
+        rank(j.id.as_str(), &after, &own, &mut ranks, &mut on);
+    }
+    ranks
+}
+
+/// `actions` with each stretch of legs queued together put in order of their jobs' upward ranks,
+/// the highest first, legs of one rank as the plan gave them; every other action where it was. A
+/// called workflow's leg (`call/test`) ranks as its caller's job does.
+fn critical_first(actions: Vec<PlanAction>, ranks: &HashMap<String, u64>) -> Vec<PlanAction> {
+    let rank_of = |spec: &LegSpec| ranks.get(&spec.job).or_else(|| spec.job.split('/').next().and_then(|caller| ranks.get(caller))).copied().unwrap_or(0);
+    let mut out: Vec<PlanAction> = Vec::with_capacity(actions.len());
+    let mut stretch: Vec<(u64, PlanAction)> = Vec::new();
+    let flush = |stretch: &mut Vec<(u64, PlanAction)>, out: &mut Vec<PlanAction>| {
+        stretch.sort_by_key(|(r, _)| std::cmp::Reverse(*r));
+        out.extend(stretch.drain(..).map(|(_, a)| a));
+    };
+    for a in actions {
+        match &a {
+            PlanAction::Queue(spec) => stretch.push((rank_of(spec), a)),
+            _ => {
+                flush(&mut stretch, &mut out);
+                out.push(a);
+            }
+        }
+    }
+    flush(&mut stretch, &mut out);
+    out
+}
+
 /// The gang a leg is a member of (W05-R40): a job's `together: true` makes its legs, its matrix,
 /// one, named by the run and the job, as big as the job's legs are many (two at least).
 fn gang_of(run: &str, spec: &LegSpec) -> Option<kiln_ci::sched::state::Gang> {
@@ -2339,6 +2408,12 @@ impl Dispatch {
 
     /// Carries out what a plan decided (W04-R02).
     async fn actions(&mut self, run: &str, actions: Vec<PlanAction>) -> anyhow::Result<()> {
+        // Legs ready together go to the scheduler critical path first (W05-R23): the one the run
+        // waits on longest takes the load balancer's best runner first.
+        let actions = match self.runs.get(run) {
+            Some(r) => critical_first(actions, &upward_ranks(&r.wf, &r.costs)),
+            None => actions,
+        };
         for a in actions {
             match a {
                 PlanAction::Queue(spec) => {
@@ -2742,6 +2817,8 @@ impl Dispatch {
             LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0, gone: false, fence: Fence::default() },
         );
         self.hub.emit_job(&id).await;
+        // What its kind's runs taught of its work, for the load balancer's expected finish.
+        leg.profile = profile_of(&self.hub, &leg.kind).await;
         if let Some(m) = dockerless {
             runs::annotation(&self.hub, &id, None, "error", Some("executor".into()), &m, None, None, None, None, None).await?;
             return Box::pin(self.settled(&id, Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() }), Some(m))).await;
@@ -4529,6 +4606,31 @@ pub(crate) fn sample_of(s: &crate::metrics::HostSample, facts: Option<&kiln_ci::
 
 #[cfg(test)]
 mod tests {
+    /// W05-R23 (HEFT's upward rank): legs ready together go to the scheduler critical path first.
+    /// b needs a and c needs b: a's rank is its 60 s and the chain's 150 s, 210 s; d, 300 s alone,
+    /// goes first; e, with no history and no one needing it, last. An action that isn't a leg
+    /// queued keeps its place, each stretch of legs ordered on its own, and legs of one rank keep
+    /// the plan's order. A called workflow's leg ranks as its caller's job.
+    #[test]
+    fn w05_r23_legs_ready_together_go_critical_path_first() -> anyhow::Result<()> {
+        use super::super::insights::JobCost;
+        use kiln_ci::plan::PlanAction;
+        let src = "on: push\njobs:\n  a:\n    runs-on: linux\n    steps:\n      - run: x\n  b:\n    needs: a\n    runs-on: linux\n    steps:\n      - run: x\n  c:\n    needs: [b]\n    runs-on: linux\n    steps:\n      - run: x\n  d:\n    runs-on: linux\n    steps:\n      - run: x\n  e:\n    runs-on: linux\n    steps:\n      - run: x\n";
+        let (wf, diags) = kiln_ci::wf::parse_workflow(".kiln/ci.yaml", src, kiln_ci::expr::Dialect::Kiln);
+        let wf = std::sync::Arc::new(wf.ok_or_else(|| anyhow::anyhow!("{diags:?}"))?);
+        let costs: std::collections::HashMap<String, JobCost> = [("a", 60.0), ("b", 120.0), ("c", 30.0), ("d", 300.0)].into_iter().map(|(j, s)| (j.to_owned(), JobCost { p50: s, p90: s })).collect();
+        let ranks = super::upward_ranks(&wf, &costs);
+        let want: std::collections::HashMap<String, u64> = [("a", 210_000), ("b", 150_000), ("c", 30_000), ("d", 300_000), ("e", 0)].into_iter().map(|(j, r)| (j.to_owned(), r)).collect();
+        anyhow::ensure!(ranks == want, "{ranks:?}");
+        let q = |job: &str| PlanAction::Queue(Box::new(super::placeholder_spec(&wf, job)));
+        let order = |acts: Vec<PlanAction>| -> Vec<String> { acts.iter().map(|a| if let PlanAction::Queue(s) = a { s.job.clone() } else { "·".to_owned() }).collect() };
+        anyhow::ensure!(order(super::critical_first(vec![q("e"), q("a"), q("d")], &ranks)) == ["d", "a", "e"]);
+        let warn = PlanAction::Warn { leg: "x".into(), message: "m".into() };
+        anyhow::ensure!(order(super::critical_first(vec![q("c"), q("b"), warn, q("e"), q("a/inner"), q("d")], &ranks)) == ["b", "c", "·", "d", "a/inner", "e"]);
+        anyhow::ensure!(order(super::critical_first(vec![q("e"), q("e/x")], &ranks)) == ["e", "e/x"], "one rank: the plan's order");
+        Ok(())
+    }
+
     #[test]
     fn w29_r24_wide_enforcement_capabilities_reach_the_schedulers_runner_view() -> anyhow::Result<()> {
         crate::rt::block_on(async {
