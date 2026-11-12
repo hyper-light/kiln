@@ -199,7 +199,8 @@ coordinator's.
    ce8ad3845 (15:20Z), while this step's request to it was still refused. This step's own re-pin, with an
    independent change to pin.sh, agreed with it exactly (see "The pin's totals" above). s20-unpack now
    sits on ce8ad3845, with this step's pin edits dropped for the coordinator's.
-3. Once the fetcher exists, two checks through it:
+3. ~~Once the fetcher exists, two checks through it~~ (done on kiln main: "Step 20's finish on kiln main"
+   below):
    - kiln's HTTP server in a test serving the hostile fixtures (`..`, /abs, symlink, hard link, device,
      truncated gzip, a missing member or skip path, a collision without skip). Each must return its
      typed error and leave 0 files, counted by a directory walk;
@@ -222,3 +223,94 @@ Sent:
 
 Dropped: the relay to step 28's implementer of step 19's acceptance, which it took up itself at 14:42Z
 (s19-fetcher's POLICY_READ, 92fa514d4).
+
+## Step 20's finish on kiln main (2026-11-12, 22:00Z on)
+
+Step 3's agent stalled with the skip on s20-unpack-v3, its last commits rebased there at 19:34Z (f195624f6),
+a branch that conflicted with kiln main. ROOT (session g121-a0, kiln agent 01a148884a4770fdaf0111f3f792a248) gave the finish to an implementer
+subagent: work out what step 20's and step 26's unpack branches hold that main lacks, port what's needed onto
+main's unpacker, show Codex's context through the fetcher for both platforms, and land it.
+
+### Identity
+
+- Role: implementer, under ROOT (coordinator). Branches p/s20-finish-skip-v1 (this landing) and
+  p/s20-finish-v1 (the fetcher slice after it), from kiln origin/main 3a4b09005, in their own worktrees
+  (.claude/worktrees/s20-skip and s20-finish).
+- Policy readback, sent to ROOT before any edit: kiln origin/main 3a4b09005, AGENTS.md (blob bff8c147e,
+  sha256 16b05ef8…, unchanged from step 3's), CLAUDE.md (`@AGENTS.md`), docs/ci.md §0 read whole (§0.3
+  binds); and Shards origin/main d13253e4b, AGENTS.md f66d304c…, development-rules.md df2acf47…,
+  development-evidence.md 61613a24…, the hashes step 3 recorded.
+
+### What each old branch held that main lacked
+
+`git cherry` against origin/main, then each branch, and each of its merges, trial-merged into main with
+`git merge-tree`: the branches have several merge bases each, so no merge-base diffstat was trusted.
+Nothing was deleted; every branch below is left as it was.
+
+| branch, commit | fate |
+|---|---|
+| s26-unpack-core 10a6ffe1f, 0911f08ee, f845ece8c | On main as 1dd6ccf94, bdec7ebc9 and 36cb87650, the same patches (patch-ids f89e65f9…, 0765f863…, 786490f6…), landed by 6e48ee58b (Merge s26-unpack, step 26). The branch merged into main 3a4b09005 makes main's own tree (3eec541a0): nothing is left. |
+| s20-unpack-v3 324add5ab (the tree's skip) | Landed here as 3ec2deab4, cherry-picked onto main's unpacker, whose unpack.rs and unpack/tests.rs were byte for byte its parent 1c6e1b91d's. Its every-built-in test is as it was written (f31f5c31e put it back after 3ec2deab4 had narrowed it to Codex while Devin's pin wasn't a tree). |
+| s20-unpack-v3 f195624f6 (macOS and Windows) | Landed here as 7d4254af8, as it was. |
+| s20-unpack-v3 d4fb2de6f, 1c6e1b91d (merges) | d4fb2de6f merged into main is main's tree. 1c6e1b91d's inputs are on main (b5cceafb0 by b1a822568); merged into main it differs only in builtin.rs's table, where main's rows stand. Nothing of their own. |
+| s20-unpack-v2 e2dd18a8f, 59b954ad9 | The same patches as s20-unpack's c2f5e6e5e and a9d29d11a (patch-ids d3c4b3cf… and 0ea9f6a1…): c2f5e6e5e is the skip before the member's `alone`, superseded by 324add5ab (3ec2deab4); a9d29d11a is f195624f6's (7d4254af8). |
+| s20-unpack-v2 d45285626 (the fetcher's hook, Codex's fetcher tests, modes) | The hook is main's own since 73fc55df9 (step 28: the fetcher unpacks pinned archives through the one unpacker, trees first) and 8e571d7d8 (a failed context discarded as the unpacker discards). Its Codex-shaped fetcher tests are ported here (8d519acd5), less the hostile entries steps 26 and 28 already test through the same fetcher. Its modes said whatever the umask are the fetcher slice's (p/s20-finish-v1). |
+| s20-unpack-v2 8a29779b6, 8bfa3c805 (merges) | Their inputs are on main: b5cceafb0 (by b1a822568) and 4d1f96a5d (by 6e48ee58b). |
+| s20-unpack b41d1f018 (merge of s27-unpack) | 4d1f96a5d is on main (6e48ee58b). |
+| s20-unpack 92fa514d4, 0b9063445, 704d9696d | Step 19's fetcher as step 28's implementer first wrote it, merged in: main took its own, 00198eee7. Superseded. |
+| s20-unpack 40af1af26 (the hook on that fetcher) | Superseded by main's 73fc55df9. |
+| s20-unpack b9da4675d (Codex's live context; the context directory 0755) | On that fetcher's `open_dir`: superseded. The live check is this landing's step20_a_live_codex_context_holds_the_pinned_builds and the CLI run below; the directory's mode is the fetcher slice's. |
+| s20-unpack 457e5c81a (that branch's record of its messages) | This record. |
+| s20-step2-agentfile a97340b79, s20-codex-agentfile-pre-rebase bed0057d3 | Step 2's earlier branches, superseded by s20-codex-agentfile (b5cceafb0, landed by b1a822568). s20-codex-agentfile and s20-surface-fix merged into main make main's own tree. |
+
+### R09: main refused Codex's arm64 pin
+
+Main's unpacker reads a pin's `unpack` as `unpack::Fields`, which refuses an unknown field, and had no
+`skip`; Codex's linux/arm64 pin (b1a822568) carries `"skip": ["codex-path/rg"]`. codex_tests.rs passed,
+since it reads the pin's JSON itself. So `kiln agentfiles context codex` refused that platform before
+fetching anything:
+- ROOT, live, at kiln e3f137930 on adas-mac-studio.local-2 (macOS arm64), `kiln agentfiles context codex
+  <dir> --platform linux/arm64`: "ERROR harness-codex: its pin: .'s unpack: unknown field `skip`,
+  expected one of `format`, `member`, `sha256`, `size`, `alone`, `strip`, `unpacked_bytes`, `entries`".
+- M0 below: main's own unpack.rs and unpack/tests.rs under this landing's fetcher tests, the same words.
+
+### What lands
+
+- 3ec2deab4 and 7d4254af8: 324add5ab and f195624f6, cherry-picked (`-x`).
+- 8d519acd5: Codex's context through the fetcher, served by kiln's own HTTP server in the test
+  (step20_a_codex_shaped_context_holds_ripgreps_rg_in_place_of_arm64s, step20_a_codex_skip_that_fails_
+  leaves_nothing), and the live test step20_a_live_codex_context_holds_the_pinned_builds; the runs'
+  scripts (step3-finish-linux.sh, step3-finish-macos.sh).
+- 1d9f44d11: step3-finish-mutants.sh (M0, M9 to M11).
+- f31f5c31e: every_builtins_pinned_unpack_is_a_spec as 324add5ab wrote it: every built-in's every
+  `unpack` read through unpack::Spec, so a pin the unpacker refuses can't land unseen (ROOT's word). It
+  waited for Devin's tree pin (a14191747, on main with 3bd05755d), until which Devin's {"format": "tar.gz"}
+  alone was neither form.
+
+### Runs
+
+- macOS arm64, adas-mac-studio.local-2 (Darwin 25.4.0, rustc 1.99.1), kiln run r308, the tree of 1d9f44d11
+  (40bdea8a…) unpacked from a git archive and held to the commit's tree: `cargo test -p kiln --lib
+  agentfiles::` 96 passed; `cargo clippy -p kiln --all-targets -- -D warnings` exit 0; then the mutants,
+  each applied alone, each failing for its reason ([evidence/e_step3_finish_macos.txt](evidence/e_step3_finish_macos.txt)):
+  - M0, main's unpack.rs and unpack/tests.rs (3a4b09005): the two Codex fetcher tests fail with "its pin:
+    .'s unpack: unknown field `skip` …" (88 passed, 2 failed);
+  - M9, a skipped file written anyway: codex_arm64s_tree_skips… and the Codex-shaped context fail;
+  - M10, no Missing for a skip path the archive lacks: a_skipped_path_is_one_regular_file… and the Codex
+    skip test fail;
+  - M11, a directory at a skip path taken: the same two fail;
+  - restored byte for byte (RESTORED_SAME), and the control 96 passed.
+- Linux x86_64 and the live context through `kiln agentfiles context codex`: run on the landing's merge
+  with kiln main, recorded below once they're in.
+
+### Two things this landing found
+
+- kiln-a094a12d.attlocal.net's /home went read-only during this step's first Linux run there: its btrfs
+  had 1 MiB unallocated, metadata at 122.28 of 127.50 GiB and its global reserve at 475.6 of 512 MiB, and
+  the run had seeded its cargo target with `cp -a --reflink=always` of another step's 58 GB target. A
+  reflink adds metadata for every extent it shares, so that copy is the likely trigger. ROOT confirmed
+  the state and took it to the person: the fix needs root. This step's Linux runs moved to adacachy with
+  a cold target, and no run seeds a target by reflink again.
+- Devin's pin on main was neither of the unpacker's forms until a14191747; the every-built-in test is what
+  shows such a pin, and now does on every built-in.
+
