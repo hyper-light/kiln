@@ -1,7 +1,7 @@
 {
   "version": "2.1.311",
   "channel": "stable",
-  "read_at": "2026-11-12T14:27:49Z",
+  "read_at": "2026-11-12T15:37:20Z",
   "verified": {
     "method": "gpg-signed-manifest",
     "manifest": {
@@ -74,5 +74,12 @@
         }
       ]
     }
-  ]
+  ],
+  "smoke": {
+    "program": "bin/claude",
+    "args": [
+      "--version"
+    ],
+    "stdout": "2.1.311 (Claude Code)"
+  }
 }

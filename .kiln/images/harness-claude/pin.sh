@@ -18,8 +18,11 @@
 #
 # The pin also records the base image the Agentfile builds on by default, buildpack-deps:trixie-scm
 # (git, an ssh client, curl and CA certificates on both arches, with no RUN: f46), read by digest with
-# a manifest HEAD, which doesn't count as a Docker Hub pull. Work files go under ~/.cache (kiln's
-# AGENTS.md: /tmp on its Linux machines is a RAM disk).
+# a manifest HEAD, which doesn't count as a Docker Hub pull. And its smoke, as every harness's pin
+# writes it: bin/claude --version, which prints the version and " (Claude Code)" (2.1.311 wrote
+# "2.1.311 (Claude Code)\n": docs/research/s19-claude-agentfile/evidence/e_step2_version_bytes.txt),
+# stdout being that line without its newline. Work files go under ~/.cache (kiln's AGENTS.md: /tmp on
+# its Linux machines is a RAM disk).
 
 set -euo pipefail
 
@@ -181,7 +184,8 @@ main() {
         '{version: $version, channel: $channel, read_at: $read_at,
           verified: {method: "gpg-signed-manifest", manifest: {url: $murl, sha256: $msha}, signature: {url: ($murl + ".sig"), sha256: $ssha},
             signer: {url: $key_url, fingerprint: $fpr}, status: $validsig, commit: $commit, built: $built},
-          base: $base, builds: $builds}')
+          base: $base, builds: $builds,
+          smoke: {program: "bin/claude", args: ["--version"], stdout: ($version + " (Claude Code)")}}')
     # Written beside its place and renamed into it, so a failure never leaves half a pin.
     partial="$out.partial.$$"
     printf '%s\n' "$pin" >"$partial"
