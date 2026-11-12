@@ -150,3 +150,52 @@ landing).
 **Told:** step 19 and ROOT could not be reached (their inboxes refused messages, 429). For step 19:
 the Dockerfile's COPY (a production `include_str!` of `.kiln/images/` fails `docker build` without
 it), the two fields, and the smoke's form in pin.json. To send when they take messages.
+
+## On kiln main: the finish
+
+This step's agent stalled, and ROOT stood it down. ROOT gave the step to its own subagent, an
+implementer in session g121, which landed it on kiln main. That agent read kiln origin/main
+ed0c9d3bd's `AGENTS.md` (sha256 `16b05ef8…`), `CLAUDE.md` (`@AGENTS.md`, sha256 `336cc4fb…`) and
+`docs/ci.md` §0, and worked on branch `p/s22-finish-v1` from ed0c9d3bd.
+
+**What it took:** this branch whole, at 3953bb057 (merge f2f9aedf7), except `.dockerignore`.
+- The Dockerfile change in step 2 isn't needed on main. Main's build stage has copied
+  `.kiln/images/` since 8756c22bb (step 23), and `step23_kilns_dockerfile_copies_what_builtins_embed`
+  holds it. 3953bb057 had already taken main's Dockerfile.
+- The `.dockerignore` comment change went with that COPY, so main's file was kept. Main then made
+  the same change itself (3a4b09005's history), and the merges brought it in.
+- The uncommitted `step22_kiln_writes_each_build_where_harness_takes_it` was left out. Main's
+  `step19_harness_dirs_are_named_as_each_builtins_harness_line_takes_them` and
+  `step19_pins_are_read_for_their_builds_alone` walk every built-in, opencode's included.
+
+**What it changed:**
+
+| Commit | Change | Why |
+|---|---|---|
+| 0057bad02 | The smoke is `{program, args, stdout}`: the env `HOME=/tmp` is gone from pin.json and pin.sh. | Every pin on main gives its smoke in that shape, and claude_tests.rs refuses one with an env. A harness's HOME in its microVM is /tmp (f16). pin.sh's comment keeps why HOME must be writable (f18). |
+| 0057bad02 | `builtin/opencode_tests.rs` is rebuilt on cursor_tests.rs's and codex_tests.rs's pattern, in `anyhow::ensure!`. | Each check reads texts, and each test also hands it changed copies, each of which must fail it: 30 pins, 12 harness files, 4 kinds or files for the launch, and 7 credentials. The command is read from `Kind::launch`, as cursor's test reads it, and the pin's binary is bin/<the kind's program>. |
+| c60b30f93, 89316a105 | kiln main merged twice (3a4b09005, edba77bdb). | Every row and every `mod <x>_tests` line on main is kept, and opencode's goes last. builtin.rs differs from main's only by opencode's row and module. |
+| d523e8438 | Through the one unpacker (main's 6e48ee58b): pin.sh writes `"alone": true`, and pin.json carries it for all four builds. The tests read each unpack through `unpack::Spec`. `context/unpack_tests.rs` gets an opencode-shaped context. | pin.sh already found the archive's one entry (f8), so the unpacker now refuses any other. The context test serves both platforms in each libc from kiln's own HTTP server in the test. It holds bin/opencode (0755) and LICENSE (0644) in opencode-<arch>-<libc>/, and nothing else is left. No other built-in has a member beside a plain file in one build, or a libc variant with an archive. |
+
+**Runs:**
+
+| Where | What | Tree | Result | Log |
+|---|---|---|---|---|
+| this Mac (Python only) | [finish/writer-check.py](finish/writer-check.py): pin.sh's writer alone on the pin's own record, the release's SHA256SUMS and the tag's LICENSE downloaded | d523e8438's pin.sh and pin.json | both digests the pinned ones; writes pin.json again, all but `read.at` | [finish/writer-check.log](finish/writer-check.log) |
+| adacachy (Linux x86_64, ssh, a systemd user unit at 40G) | `cargo test --locked -p kiln --lib agentfiles::` | 0057bad02 | 57 passed, 0 failed; its clippy was stopped for the next tree | [finish/linux-0057bad02.log](finish/linux-0057bad02.log) |
+| adacachy | the same, then `cargo clippy --locked -p kiln --all-targets -- -D warnings` | d523e8438 | 93 passed, 0 failed; clippy exit 0 | [finish/linux-d523e8438.log](finish/linux-d523e8438.log) |
+| adas-mac-studio.local-2 (macOS arm64, kiln run) | the same tests, then clippy | d523e8438 | 93 passed, 0 failed; clippy exit 0 | [finish/macos-d523e8438.log](finish/macos-d523e8438.log) |
+| jupiter (Windows x86_64, kiln run) | clippy | d523e8438 | exit 0 | [finish/windows-d523e8438.log](finish/windows-d523e8438.log) |
+| adacachy | the agentfiles tests again, on main edba77bdb merged in (pi's row) | 89316a105 | 99 passed, 0 failed | [finish/linux-89316a105.log](finish/linux-89316a105.log) |
+| adas-mac-studio.local-2 | the same | 89316a105 | 99 passed, 0 failed | [finish/macos-89316a105.log](finish/macos-89316a105.log) |
+
+Each runner ran [finish/run.sh](finish/run.sh) in a blobless clone of kiln's public repository. It
+fetched a git bundle of the branch, checked out its head (held to the SHA, clean) and used a target
+directory of its own. The script grew a mode argument along the way; the runs above name theirs.
+
+The landed tree is 89316a105's, plus this record (docs only, which no test reads). Clippy on
+Linux, macOS and Windows ran on d523e8438. The merge after it brought in main's own pi row and its
+tests, and nothing of opencode's changed; ROOT owns Windows clippy on the landed revision.
+
+**Owed, ROOT's:** image builds for both platforms in each libc, and the version smoke (`--version`
+alone) in a microVM on each arch.
