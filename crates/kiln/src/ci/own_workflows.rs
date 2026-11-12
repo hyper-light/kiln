@@ -3,7 +3,8 @@
 //! as the server plans a run, and each of its legs routed as the scheduler routes one: to the
 //! `k8s` pool production is to have, else to one of production's runners
 //! (`tests/fixtures/production-runners.json`: `ci.runners.list` on 2026-10-25, their labels and
-//! facts, without v1's pods for one job each, which come and go). Its `runs-on` labels are free
+//! facts, without v1's pods for one job each, which come and go; jupiter under the name production
+//! gives it since, which `windows-recovery.yaml` runs on). Its `runs-on` labels are free
 //! of `KCI6007` against the same. `deploy.yaml` and `environments.yaml` are KilnCD's files.
 
 use std::collections::BTreeMap;
@@ -36,6 +37,7 @@ const WORKFLOWS: &[(&str, &str, &str)] = &[
     ("release.yaml", "push", "main"),
     ("sim.yaml", "workflow_dispatch", "main"),
     ("stress.yaml", "workflow_dispatch", "main"),
+    ("windows-recovery.yaml", "workflow_dispatch", "main"),
     ("wire-lab.yaml", "workflow_dispatch", "main"),
 ];
 
