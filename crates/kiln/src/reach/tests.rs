@@ -157,6 +157,10 @@ async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], 
                             let next = peers.lock().values().max().copied().unwrap_or(0) + 1;
                             peers.lock().insert(name, next);
                             handle_of(name).feed(In::Server(true)).await;
+                            // A node forgets its adoption policy as its server drops (W20, 0ff338877),
+                            // and the next transfer's offer brings it back (agent.rs, `HarnessMailTransfer`'s
+                            // `Offered`): the lab's offer says the lab's own, `Off`, as at its start.
+                            handle_of(name).feed(In::AdoptPolicy(crate::harness::moving::stream::StoragePolicy::Off)).await;
                         }
                         Ok(Ctl::Key(name, fp)) => {
                             if let Some(r) = directory.lock().iter_mut().find(|r| r.name == name) {
