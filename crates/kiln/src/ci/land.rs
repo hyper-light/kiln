@@ -347,13 +347,21 @@ async fn queue_event(hub: &Hub, ids: &[String], action: &str, reason: Option<&st
 /// Takes an entry out of the queue, saying why (`code`: GitHub's reason, for `dequeued`); its
 /// diffs go back to their review state.
 async fn eject(hub: &Arc<Hub>, e: &Entry, reason: &str, code: &str) -> anyhow::Result<()> {
-    let (id, why) = (e.id.clone(), reason.to_owned());
-    hub.store.call(move |c| Ok(c.prepare_cached("UPDATE land_queue SET state = 'ejected', reason = ?2, hold = NULL, updated_at = ?3 WHERE id = ?1")?.execute(params![id, why, crate::util::now_unix()]).map(|_| ())?)).await?;
+    let (id, why, diffs) = (e.id.clone(), reason.to_owned(), e.diffs.clone());
+    // W19-R06's `land.ejected`, recorded with the ejection (crate::events).
+    hub.store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            tx.prepare_cached("UPDATE land_queue SET state = 'ejected', reason = ?2, hold = NULL, updated_at = ?3 WHERE id = ?1")?.execute(params![id, why, crate::util::now_unix()])?;
+            crate::events::record(&tx, "land.ejected", &serde_json::json!({ "diffs": diffs, "reason": why }))?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
     set_diff_state(hub, &e.diffs, State::Accepted).await?;
     hub.store.audit("kiln".into(), "queue.eject".into(), format!("{}: {reason}", e.id)).await;
     tell(hub, e, "ejected", Some(reason)).await;
     queue_event(hub, &e.diffs, "dequeued", Some(code), "kiln").await;
-    crate::rt::spawn(super::notify::land_ejected(Arc::clone(hub), e.diffs.clone(), reason.to_owned()));
     tracing::info!(entry = %e.id, %reason, "ejected from the land queue");
     Ok(())
 }
@@ -457,16 +465,23 @@ async fn hold_entry(hub: &Arc<Hub>, e: &Entry, who: &str, why: &str, code: &str)
 async fn return_to_review(hub: &Arc<Hub>, e: &Entry, files: &[String]) -> anyhow::Result<()> {
     let reason = queue::conflicts_in(files);
     let (id, why, list) = (e.id.clone(), reason.clone(), serde_json::to_string(files)?);
+    // One that was in the queue leaves it: W19-R06's `land.ejected`, recorded with its return
+    // (crate::events).
+    let ejected = matches!(e.state.as_str(), "queued" | "testing").then(|| e.diffs.clone());
     hub.store
         .call(move |c| {
-            c.prepare_cached("UPDATE land_queue SET state = 'returned', hold = NULL, reason = ?2, conflicts = ?3, batch = NULL, base = NULL, candidate = NULL, checks = NULL, commits = NULL, updated_at = ?4 WHERE id = ?1")?.execute(params![id, why, list, crate::util::now_unix()])?;
+            let tx = crate::store::tx(c)?;
+            tx.prepare_cached("UPDATE land_queue SET state = 'returned', hold = NULL, reason = ?2, conflicts = ?3, batch = NULL, base = NULL, candidate = NULL, checks = NULL, commits = NULL, updated_at = ?4 WHERE id = ?1")?.execute(params![id, why, list, crate::util::now_unix()])?;
+            if let Some(diffs) = ejected {
+                crate::events::record(&tx, "land.ejected", &serde_json::json!({ "diffs": diffs, "reason": why }))?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await?;
     if matches!(e.state.as_str(), "queued" | "testing") {
         to_review(hub, &e.diffs).await?;
         queue_event(hub, &e.diffs, "dequeued", Some("INVALID_MERGE_COMMIT"), "kiln").await;
-        crate::rt::spawn(super::notify::land_ejected(Arc::clone(hub), e.diffs.clone(), reason.clone()));
     }
     // Its diffs climb the conflict ladder (W26-R17): once Review's gate clears the resolution a person
     // accepts, the entry joins the queue again.

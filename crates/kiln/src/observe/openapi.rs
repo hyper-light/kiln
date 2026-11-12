@@ -529,7 +529,7 @@ fn schemas() -> Map<String, Value> {
                 ("disk_free", nullable(integer())),
                 ("disk_low", boolean()),
                 ("cache_bytes", describe(integer(), "the bytes the log's cache opened with")),
-                ("cache_next", describe(integer(), "the bytes it opens with next: the server's, the most a learner back from away lacked")),
+                ("cache_next", describe(integer(), "the bytes it opens with next: the same append")),
                 ("file_reads", describe(integer(), "reads of the log's file past its cache")),
                 ("away", describe(integer(), "learners out of step now (the server's)")),
             ],

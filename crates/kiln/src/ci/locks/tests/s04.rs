@@ -97,6 +97,7 @@ fn w29_s04_a_moved_tag_never_reaches_a_job_of_a_locked_github_workflow() -> anyh
     crate::rt::block_on(async {
         let live = Live::for_locks_with(|c| c.ci.notify.push(crate::ci::notify::Rule { on: vec!["tag_moved".into()], cond: None, to: vec!["inbox:lock-observer".into()], throttle: None })).await?;
         let hub = live.hub();
+        super::policy::told(&hub).await?;
         let origin = changed_files(&live).await?;
         let (a, m) = (live.commits.old.clone(), live.commits.new.clone());
         let (partial, full) = (workflow(&format!("{CF}@v45")), workflow(&format!("{CF}@v45.0.7")));
@@ -120,8 +121,18 @@ fn w29_s04_a_moved_tag_never_reaches_a_job_of_a_locked_github_workflow() -> anyh
         assert!(moved.iter().any(flagged), "{moved:?}");
         notify_moves(&hub).await?;
         notify_moves(&hub).await?;
-        let told: i64 = hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM ci_inbox WHERE event = 'tag_moved' AND person = 'user:lock-observer'", [], |r| r.get(0))?)).await?;
-        assert_eq!(told, 1);
+        // Delivered from kiln.events (crate::events): once, however often the moves are told.
+        let inbox = || hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM ci_inbox WHERE event = 'tag_moved' AND person = 'user:lock-observer'", [], |r| r.get::<_, i64>(0))?));
+        let mut told = inbox().await?;
+        for _ in 0..3000 {
+            if told >= 1 {
+                break;
+            }
+            crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+            told = inbox().await?;
+        }
+        crate::rt::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!((told, inbox().await?), (1, 1));
         // A run saved before the move is recovered, and run again, on A.
         let frozen = before.frozen.ok_or_else(|| anyhow::anyhow!("no snapshot"))?;
         let input = serde_json::json!({ "dependency_snapshot": frozen, "trusted": true });

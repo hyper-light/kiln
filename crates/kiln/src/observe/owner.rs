@@ -174,9 +174,8 @@ pub struct View {
     /// are refused until a cut frees room).
     pub disk_free: Option<u64>,
     pub disk_low: bool,
-    /// The log's cache: the bytes it opened with, what it opens with next (the leader's: the most a learner back from
-    /// away lacked, `kiln_obs::catch_up`), and the reads of the log's file its replica made past it (kiln's goal 11
-    /// audit, row B21); the learners away now.
+    /// The log's cache: the bytes it opened with and opens with next, one append (`kiln_obs::group::CACHE_BYTES`), and
+    /// the reads of the log's file its replica made past it (kiln's goal 11 audit, row B21); the learners away now.
     pub cache_bytes: u64,
     pub cache_next: u64,
     pub file_reads: u64,
@@ -834,15 +833,7 @@ struct Rep {
     /// The store's durable point when maintenance was last told: a cut since is new blocks to
     /// merge, however it came (a compaction, a snapshot's persisting).
     told: u64,
-    /// The cache its log opened with ([`group::cache_bytes`]).
-    cache: u64,
-    /// The server's: what its learners lacked back from away, for the log's next open (`kiln_obs::catch_up`).
-    spans: Option<kiln_obs::catch_up::Spans>,
 }
-
-/// Where the server keeps, beside observe's log, the most bytes a learner back from away lacked (`kiln_obs::catch_up`):
-/// what the log's cache holds from its next open on.
-const CATCH_UP: &str = "catch-up";
 
 /// How long applied entries wait for a cut at the most (`kiln_obs::group::CUT_AFTER`);
 /// `KILN_OBSERVE_CUT_AFTER_MS` makes it shorter, for a test of what waits on cuts (log archives).
@@ -1102,21 +1093,13 @@ impl Owner {
             }
         }
         let opened = (|| -> Result<Rep, String> {
-            // The server's log holds what its learners lacked back from away, as a run before learned it; a learner's,
-            // one append (kiln's goal 11 audit, row B21).
-            let learned = (id == SERVER).then(|| kiln_obs::catch_up::kept(&self.dir.join(CATCH_UP)));
-            let cache = learned.map_or(group::cache_bytes(0), group::cache_bytes);
-            let (log, store) = group::open_log_with(&self.dir.join("obs.log"), group::FRAME_BYTES, cache)?;
-            let mut machine = Machine::open(&self.dir.join("store"), Keyed::new(), &group::founding(&[SERVER])).map_err(|e| format!("the store: {e}"))?;
-            if learned.is_some() {
-                machine.count_sizes();
-            }
+            let (log, store) = group::open_log(&self.dir.join("obs.log"))?;
+            let machine = Machine::open(&self.dir.join("store"), Keyed::new(), &group::founding(&[SERVER])).map_err(|e| format!("the store: {e}"))?;
             let depth = store.depth();
             let settings = group::settings(id, depth).map_err(|e| format!("the group's settings: {e:?}"))?;
             let r = Replica::open(&settings, store, machine, Unbounded).map_err(|e| format!("the replica: {e:?}"))?;
             let applied = r.applied().index;
-            let spans = learned.map(kiln_obs::catch_up::Spans::new);
-            Ok(Rep { compacted: applied, cut: applied, waiting: None, told: 0, r, _log: log, out: Output::default(), cache, spans })
+            Ok(Rep { compacted: applied, cut: applied, waiting: None, told: 0, r, _log: log, out: Output::default() })
         })();
         match opened {
             Ok(mut rep) => {
@@ -1793,18 +1776,6 @@ impl Owner {
             self.tried = Some(Instant::now());
             return;
         }
-        // What its learners lacked back from away (the server's; `kiln_obs::catch_up`): the most yet is kept for the
-        // log's next open.
-        let start = rep.r.log().handle().bounds().map_or(0, |(start, _)| start.index);
-        if let (Some(spans), Some(sizes)) = (&mut rep.spans, rep.r.machine().sizes())
-            && let Some(most) = spans.look(&rep.r, sizes, start)
-        {
-            match kiln_obs::catch_up::keep(&self.dir.join(CATCH_UP), most) {
-                Ok(()) => tracing::info!(bytes = most, "a learner back from away lacked more than any before it: observe's log cache holds that from its next start (goal 11's audit, row B21)"),
-                Err(e) => tracing::warn!(error = %e, "the most a learner back from away lacked wasn't kept for observe's log's next start"),
-            }
-        }
-        rep.r.machine_mut().sizes_let_go_through(start);
         let asked = self.compact_asked && rep.r.in_flight() == 0;
         let keep = if asked { 0 } else { group::keep(&rep.r, rep.compacted) };
         if rep.waiting.is_none() && rep.r.applied().index > rep.cut {
@@ -2046,10 +2017,9 @@ impl Owner {
             v.cutoff_ms = store.cutoff();
             v.voters = rep.r.configuration().voters.clone();
             v.learners = rep.r.configuration().learners.clone();
-            v.cache_bytes = rep.cache;
-            v.cache_next = rep.spans.as_ref().map_or(rep.cache, |s| group::cache_bytes(s.most));
+            (v.cache_bytes, v.cache_next) = (group::CACHE_BYTES, group::CACHE_BYTES);
             v.file_reads = rep.r.log().handle().asked();
-            v.away = rep.spans.as_ref().map_or(0, |s| u64::try_from(s.away()).unwrap_or(u64::MAX));
+            v.away = group::away(&rep.r);
             v.digest = store.digest(false).unwrap_or(0);
             v.digest_at = store.applied();
         }

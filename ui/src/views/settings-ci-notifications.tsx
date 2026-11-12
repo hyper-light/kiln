@@ -226,11 +226,15 @@ export function DeliveriesGroup() {
           {d.deliveries.map((x, i) => (
             <li key={`${x.ts}-${i}`}>
               <div className="st-item">
-                <i className="dot" data-status={x.status === "sent" ? "succeeded" : "failed"} aria-hidden="true" />
+                <i className="dot" data-status={x.status === "sent" ? "succeeded" : x.status === "pending" ? "pending" : "failed"} aria-hidden="true" />
                 <span className="st-item-name font-mono text-[12px]">{x.event}</span>
                 <span className="st-item-meta">
                   to {x.channel} · {x.rule} · {relativeTime(x.ts)}
-                  {x.status === "sent" ? "" : ` · didn't go${x.error ? `: ${x.error}` : ""}${x.attempts > 1 ? ` (${x.attempts} tries)` : ""}`}
+                  {x.status === "sent"
+                    ? ""
+                    : x.status === "pending"
+                      ? ` · waiting to go${x.attempts > 0 ? `, tried ${x.attempts} ${x.attempts === 1 ? "time" : "times"}${x.error ? `: ${x.error}` : ""}` : ""}`
+                      : ` · didn't go${x.error ? `: ${x.error}` : ""}${x.attempts > 1 ? ` (${x.attempts} tries)` : ""}`}
                 </span>
               </div>
             </li>

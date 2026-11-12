@@ -1,0 +1,122 @@
+Subject: identities may be made as Ed25519
+Why: Quiver's simulation of its persisted class (kiln's CP-T2.2 step 6, AC-T2.2.5) replays a run from its seed: an ECDSA P-256 certificate verify is a DER document whose length is as random as its nonce, so a handshake's flight was a byte longer or shorter from one run to the next, and a tenth of the seeds ran apart across processes; Ed25519's are 64 bytes every time. The default stays ECDSA P-256
+
+diff --git a/crates/focal-bus/src/pki.rs b/crates/focal-bus/src/pki.rs
+index 2c1a937cb85e7c6213e8f76710e5e2edf5f1c04c..4c7624fb027e5706fe828d8405f866187ba8e658 100644
+--- a/crates/focal-bus/src/pki.rs
++++ b/crates/focal-bus/src/pki.rs
+@@ -36,7 +36,8 @@ const SEALED_FILE: &str = "SEALED";
+ const KEY_MAGIC: &[u8; 8] = b"FCLBUSK1";
+ /// The most bytes a key holds: an ECDSA P-256 key's PKCS #8 document (RFC 5958 around RFC 5915's
+ /// key with its curve and public key), what rcgen's `KeyPair::generate` makes, as every key the
+-/// directory holds was made; a key past it was made by nothing here, and is refused.
++/// directory holds was made unless it was made as Ed25519, whose document is shorter (RFC 8410
++/// §7); a key past it was made by nothing here, and is refused.
+ const KEY_DOCUMENT_BYTES: usize = 138;
+ /// The most bytes a key file's name holds: `client-` and a count's twenty digits, or `node-`'s.
+ const NAME_BYTES: usize = 32;
+@@ -317,6 +318,29 @@ fn read(dir: &Path, name: &str) -> Result<Vec<u8>, BusError> {
+         .map_err(|_| BusError::Configuration("an identity file is missing or unreadable"))
+ }
+ 
++/// What a directory's identities are made with: ECDSA P-256 with SHA-256, what rcgen's
++/// `KeyPair::generate` makes and every directory before this was made with, or Ed25519. An Ed25519
++/// signature is the same 64 bytes whenever a key signs (RFC 8032 §5.1.6 draws no nonce), where an
++/// ECDSA one is a DER document whose length is as random as its nonce, 70 to 72 bytes: each
++/// handshake's certificate verify, and so its flight, may be a byte longer or shorter than the
++/// last. A simulation that replays a run from its seed makes its identities as Ed25519 (Quiver's,
++/// kiln's CP-T2.2 step 6). A directory loads alike whatever its identities were made with.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum KeyKind {
++    #[default]
++    EcdsaP256,
++    Ed25519,
++}
++
++impl KeyKind {
++    fn generate(self) -> Result<rcgen::KeyPair, rcgen::Error> {
++        match self {
++            Self::EcdsaP256 => rcgen::KeyPair::generate(),
++            Self::Ed25519 => rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519),
++        }
++    }
++}
++
+ /// The identities in `dir`, made there first if it holds no authority: `nodes` nodes' and `clients`
+ /// clients'. A node bounds `clients` by what its memory admits (`serve::most_clients`). The
+ /// directory's keys are kept under `key_file` where its owner names one, else under the per-user
+@@ -327,6 +351,17 @@ pub fn load_or_make(
+     key_file: Option<&Path>,
+     nodes: usize,
+     clients: usize,
++) -> Result<Local, BusError> {
++    load_or_make_with(dir, key_file, nodes, clients, KeyKind::default())
++}
++
++/// [`load_or_make`], a directory made here made with `kind`'s keys.
++pub fn load_or_make_with(
++    dir: &Path,
++    key_file: Option<&Path>,
++    nodes: usize,
++    clients: usize,
++    kind: KeyKind,
+ ) -> Result<Local, BusError> {
+     if clients == 0 || nodes == 0 {
+         return Err(BusError::Configuration(
+@@ -348,7 +383,7 @@ pub fn load_or_make(
+         .saturating_add(clients);
+     if !file(dir, "root.der").exists() {
+         sweep(dir, bound)?;
+-        make(dir, &keys, nodes, clients)?;
++        make(dir, &keys, nodes, clients, kind)?;
+     } else if !file(dir, SEALED_FILE).exists() {
+         convert(dir, &keys, bound)?;
+     }
+@@ -379,16 +414,17 @@ fn make(
+     keys: &focal_seal::DataKeys,
+     nodes: usize,
+     clients: usize,
++    kind: KeyKind,
+ ) -> Result<(), BusError> {
+     let failed = |_| BusError::Configuration("an identity could not be made");
+     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).map_err(failed)?;
+     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+-    let key = rcgen::KeyPair::generate().map_err(failed)?;
++    let key = kind.generate().map_err(failed)?;
+     let root = params.self_signed(&key).map_err(failed)?;
+     let issuer = rcgen::Issuer::new(params, key);
+     let issue = |name: &str| -> Result<(Vec<u8>, Vec<u8>), BusError> {
+         let params = rcgen::CertificateParams::new(vec![name.to_owned()]).map_err(failed)?;
+-        let key = rcgen::KeyPair::generate().map_err(failed)?;
++        let key = kind.generate().map_err(failed)?;
+         let certificate = params.signed_by(&key, &issuer).map_err(failed)?;
+         Ok((certificate.der().to_vec(), key.serialize_der()))
+     };
+@@ -498,6 +534,27 @@ mod tests {
+         }
+     }
+ 
++    /// A directory made with Ed25519 keys keeps them sealed and is read back as made by any opener,
++    /// and each of its keys signs in the same 64 bytes whatever it signs, where an ECDSA key's DER
++    /// signature varies (kiln's CP-T2.2 step 6: a simulated handshake's flight is one size in every
++    /// run of a seed).
++    #[test]
++    fn a_directory_made_as_ed25519_signs_in_one_length() {
++        use rcgen::SigningKey as _;
++        let dir = tempfile::tempdir().unwrap();
++        let made = load_or_make_with(dir.path(), None, NODES, CLIENTS, KeyKind::Ed25519).unwrap();
++        assert_sealed(dir.path(), &keys_of(&made));
++        let again = load_or_make(dir.path(), None, NODES, CLIENTS).unwrap();
++        assert_eq!(keys_of(&again), keys_of(&made));
++        for key in keys_of(&made) {
++            let key = rcgen::KeyPair::try_from(key.as_slice()).unwrap();
++            assert_eq!(key.algorithm(), &rcgen::PKCS_ED25519);
++            for message in [&b"a"[..], &[0xff; 200][..]] {
++                assert_eq!(key.sign(message).unwrap().len(), 64);
++            }
++        }
++    }
++
+     /// A directory made now keeps every key sealed and marked so, and is read back as made.
+     #[test]
+     fn a_made_directory_keeps_every_key_sealed() {

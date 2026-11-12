@@ -38,7 +38,8 @@ pub struct Run {
     pub cpu_s: f64,
     /// The publisher's own thread's CPU: its open loop's pacing spins, which isn't the system's work.
     pub publisher_cpu_s: f64,
-    /// The broker's CPU, as its container's cgroup counted it (`--broker-cgroup`).
+    /// The broker's CPU, as its container's cgroup counted it (`--broker-cgroup`), or the kernel its
+    /// process (`--broker-pid`).
     pub broker_cpu_s: Option<f64>,
     pub load_before: Option<f64>,
     pub load_after: Option<f64>,
@@ -249,9 +250,20 @@ fn lead(quiver: Option<u64>, competitor: Option<u64>) -> (String, bool) {
     }
 }
 
+/// `a` over `b`, times: what one tail is of another; `-` where `b`'s didn't come.
+fn times(a: Option<u64>, b: Option<u64>) -> String {
+    match (a, b) {
+        (Some(a), Some(b)) => format!("{:.1}×", a as f64 / b.max(1) as f64),
+        (None, Some(_)) => "∞ (undelivered)".to_owned(),
+        (_, None) => "-".to_owned(),
+    }
+}
+
 /// The comparison of the runs files at `paths`: for each load (rate, subscribers, how their
 /// threads wait), each system's best run (the least p99, CLAUDE.md §7), and Quiver's lead over the
-/// best competitor at p99 and p99.9, an order of magnitude being the bar.
+/// best competitor at p99 and p99.9, an order of magnitude being the bar; then the lead split at
+/// the floor over TCP, where the runs have it: the hop's own part (the deployment, a server over
+/// loopback against Quiver in the process) and the broker's.
 pub fn compare(paths: &[std::path::PathBuf]) -> String {
     let lines: Vec<Line> = paths.iter().flat_map(|p| read(p)).collect();
     let mut loads: BTreeMap<(String, u64, u64), BTreeMap<String, &Line>> = BTreeMap::new();
@@ -267,7 +279,7 @@ pub fn compare(paths: &[std::path::PathBuf]) -> String {
         }
     }
     let mut out = String::from(
-        "| subscribers' threads | rate /s | subscribers | the wake-up's floor, p99 / p99.9 µs | Quiver | NATS | Redis | Kafka | the best competitor | Quiver's lead, p99 / p99.9 | an order of magnitude |\n|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "| subscribers' threads | rate /s | subscribers | the wake-up's floor, p99 / p99.9 µs | the floor over TCP | Quiver | NATS | Redis | Kafka | the best competitor | Quiver's lead, p99 / p99.9 | an order of magnitude |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     let pair = |l: Option<&&Line>| {
         l.map_or_else(
@@ -290,8 +302,9 @@ pub fn compare(paths: &[std::path::PathBuf]) -> String {
             _ => ("-".to_owned(), "-".to_owned(), "-"),
         };
         out.push_str(&format!(
-            "| {busy} | {rate} | {subscribers} | {} | {} | {} | {} | {} | {} | {lead_p99} / {lead_p999} | {verdict} |\n",
+            "| {busy} | {rate} | {subscribers} | {} | {} | {} | {} | {} | {} | {} | {lead_p99} / {lead_p999} | {verdict} |\n",
             pair(systems.get(System::Wake.name())),
+            pair(systems.get(System::Tcp.name())),
             pair(quiver),
             pair(systems.get(System::Nats.name())),
             pair(systems.get(System::Redis.name())),
@@ -299,8 +312,54 @@ pub fn compare(paths: &[std::path::PathBuf]) -> String {
             best.map_or_else(|| "-".to_owned(), |(name, _)| name.to_owned()),
         ));
     }
+    out.push_str(&split(&loads));
     out.push_str(&delivered(&loads));
     out.push_str(&profiles(&loads));
+    out
+}
+
+/// Quiver's lead over the best competitor, split at the floor over TCP, load by load, where the
+/// runs have it: the deployment's part (the hop's floor over Quiver: a server a hop away over
+/// loopback, against Quiver in the process) times the broker's (the competitor over the hop's
+/// floor) is the lead.
+fn split(loads: &BTreeMap<(String, u64, u64), BTreeMap<String, &Line>>) -> String {
+    if !loads.values().any(|s| s.contains_key(System::Tcp.name())) {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n| subscribers' threads | rate /s | subscribers | Quiver, p99 / p99.9 µs | the floor over TCP | the best competitor | the deployment's part: the floor over TCP over Quiver, p99 / p99.9 | the broker's part: the competitor over the floor over TCP, p99 / p99.9 |\n|---|---|---|---|---|---|---|---|\n",
+    );
+    let pair = |l: Option<&Line>| {
+        l.map_or_else(
+            || "-".to_owned(),
+            |l| format!("{} / {}", cell(l.ns("p99_ns")), cell(l.ns("p999_ns"))),
+        )
+    };
+    // Each part where both its systems ran: `-` where one didn't.
+    let part = |a: Option<&Line>, b: Option<&Line>, name: &str| match (a, b) {
+        (Some(a), Some(b)) => times(a.ns(name), b.ns(name)),
+        _ => "-".to_owned(),
+    };
+    for ((busy, rate, subscribers), systems) in loads {
+        let quiver = systems.get(System::Quiver.name()).copied();
+        let tcp = systems.get(System::Tcp.name()).copied();
+        let best = [System::Nats, System::Redis, System::Kafka]
+            .iter()
+            .filter_map(|s| systems.get(s.name()).map(|l| (s.name(), *l)))
+            .min_by_key(|(_, l)| key(l.ns("p99_ns")));
+        let competitor = best.map(|(_, l)| l);
+        out.push_str(&format!(
+            "| {busy} | {rate} | {subscribers} | {} | {} | {} {} | {} / {} | {} / {} |\n",
+            pair(quiver),
+            pair(tcp),
+            best.map_or("-", |(name, _)| name),
+            pair(competitor),
+            part(tcp, quiver, "p99_ns"),
+            part(tcp, quiver, "p999_ns"),
+            part(competitor, tcp, "p99_ns"),
+            part(competitor, tcp, "p999_ns"),
+        ));
+    }
     out
 }
 
@@ -353,6 +412,7 @@ fn profiles(loads: &BTreeMap<(String, u64, u64), BTreeMap<String, &Line>>) -> St
     for ((busy, rate, subscribers), systems) in loads {
         for system in [
             System::Wake,
+            System::Tcp,
             System::Quiver,
             System::Nats,
             System::Redis,
@@ -399,7 +459,7 @@ fn delivered(loads: &BTreeMap<(String, u64, u64), BTreeMap<String, &Line>>) -> S
             .map_or_else(|| "-".to_owned(), |r| format!("{:.2}M", r / 1e6))
     };
     let mut out = String::from(
-        "\n| subscribers' threads | rate /s | subscribers | offered deliveries /s | Quiver | NATS | Redis | Kafka | Quiver's lead |\n|---|---|---|---|---|---|---|---|---|\n",
+        "\n| subscribers' threads | rate /s | subscribers | offered deliveries /s | the floor over TCP | Quiver | NATS | Redis | Kafka | Quiver's lead |\n|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for ((busy, rate, subscribers), systems) in loads {
         let quiver = systems.get(System::Quiver.name());
@@ -415,8 +475,9 @@ fn delivered(loads: &BTreeMap<(String, u64, u64), BTreeMap<String, &Line>>) -> S
             _ => "-".to_owned(),
         };
         out.push_str(&format!(
-            "| {busy} | {rate} | {subscribers} | {:.2}M | {} | {} | {} | {} | {lead} |\n",
+            "| {busy} | {rate} | {subscribers} | {:.2}M | {} | {} | {} | {} | {} | {lead} |\n",
             (*rate as f64) * (*subscribers as f64) / 1e6,
+            cell(systems.get(System::Tcp.name())),
             cell(quiver),
             cell(systems.get(System::Nats.name())),
             cell(systems.get(System::Redis.name())),

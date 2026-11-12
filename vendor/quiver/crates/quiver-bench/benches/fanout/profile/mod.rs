@@ -885,6 +885,19 @@ impl Profile {
                 "- the broker's span: {:.2} s from a quarter second before the window to a quarter second after it, {} messages, {} deliveries\n",
                 b.seconds, b.messages, b.deliveries
             ));
+            // Its dashes, said why (bench/README.md: a figure the machine won't give says so).
+            let uncounted: Vec<&str> = self
+                .rows
+                .iter()
+                .filter(|r| r.broker.is_none())
+                .map(|r| r.label)
+                .collect();
+            if !uncounted.is_empty() {
+                out.push_str(&format!(
+                    "- the broker's {}: not read: the bench reads these for its own process only (its threads by perf_event_open and /proc/self/task, its allocator's counts); for the broker it reads its cgroup and runtime, which keep none of them\n",
+                    uncounted.join(", ")
+                ));
+            }
         }
         if let Some((bytes, held)) = self.node {
             out.push_str(&format!(

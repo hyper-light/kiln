@@ -14,14 +14,17 @@
 //!
 //! Every system runs the same schedule, payloads and fan-out, measured the same way: Quiver in this
 //! process, as kiln runs it (`embedded.rs`), the brokers over loopback through their own clients
-//! (`brokers.rs`), and beside them the kernel's own wake-up with no system around it (`wake.rs`),
-//! the floor under a subscriber that waits.
+//! (`brokers.rs`), and beside them two floors: the kernel's own wake-up with no system around it
+//! (`wake.rs`), the floor under a subscriber that waits, and a relay that only forwards over TCP
+//! (`relay.rs`), the floor under a broker reached over loopback.
 //!
 //! The mode is the first argument:
 //! - `fanout` runs `--system` `--runs` times and reports each run and the best (the least p99,
 //!   CLAUDE.md §7), adding each to `--out`;
 //! - `soak` runs Quiver once for `--seconds` (an hour, for AC-T2.1.4), reporting every minute;
-//! - `report <runs files>` sets each system's best beside Quiver's, load by load.
+//! - `report <runs files>` sets each system's best beside Quiver's, load by load;
+//! - `relay` serves the floor over TCP on `--endpoint` until it's stopped, its topics' subscribers
+//!   over `--threads` writers.
 //!
 //! Every run carries its profile (`profile/`), and with `--budgets` is held to the budgets for its
 //! load (`budget.rs`).
@@ -52,6 +55,8 @@ mod embedded;
 mod follow;
 mod histogram;
 mod profile;
+#[cfg(target_os = "linux")]
+mod relay;
 mod report;
 mod wake;
 
@@ -70,6 +75,8 @@ pub enum System {
     Kafka,
     /// The kernel's own wake-up, no system around it: the floor under a subscriber that waits.
     Wake,
+    /// A relay that only forwards, over loopback TCP: the floor under a broker a hop away.
+    Tcp,
 }
 
 impl System {
@@ -80,6 +87,7 @@ impl System {
             Self::Redis => "redis",
             Self::Kafka => "kafka",
             Self::Wake => "wake",
+            Self::Tcp => "tcp",
         }
     }
 
@@ -90,7 +98,8 @@ impl System {
             "redis" => Self::Redis,
             "kafka" => Self::Kafka,
             "wake" => Self::Wake,
-            other => panic!("unknown system {other:?}: quiver, nats, redis, kafka or wake"),
+            "tcp" => Self::Tcp,
+            other => panic!("unknown system {other:?}: quiver, nats, redis, kafka, wake or tcp"),
         }
     }
 
@@ -102,6 +111,7 @@ impl System {
             Self::Redis => "127.0.0.1:16380",
             Self::Kafka => "127.0.0.1:19092",
             Self::Wake => "the kernel's wake-up alone, in this process",
+            Self::Tcp => "127.0.0.1:14300",
         }
     }
 }
@@ -111,6 +121,7 @@ enum Mode {
     Fanout,
     Soak,
     Report,
+    Relay,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +150,10 @@ pub struct Args {
     pub broker_cgroup: Option<PathBuf>,
     /// The broker's Docker container, whose account and runtime the profile reads.
     pub broker_container: Option<String>,
+    /// The broker's process, whose CPU the run reports where it has no container (the relay).
+    pub broker_pid: Option<u32>,
+    /// The relay's writers (`relay`): by default the CPUs it may use.
+    threads: usize,
     /// Where the broker's saved profiles go.
     pub profiles: Option<PathBuf>,
     /// The budgets each run is held to (`budget.rs`).
@@ -167,6 +182,8 @@ fn args() -> Args {
         out: None,
         broker_cgroup: None,
         broker_container: None,
+        broker_pid: None,
+        threads: cores,
         profiles: None,
         budgets: None,
         files: Vec::new(),
@@ -187,6 +204,7 @@ fn args() -> Args {
             "fanout" => a.mode = Mode::Fanout,
             "soak" => a.mode = Mode::Soak,
             "report" => a.mode = Mode::Report,
+            "relay" => a.mode = Mode::Relay,
             "--system" => a.system = System::parse(&value()),
             "--endpoint" => a.endpoint = value(),
             "--rate" => a.rate = value().parse().unwrap(),
@@ -204,18 +222,24 @@ fn args() -> Args {
             "--out" => a.out = Some(PathBuf::from(value())),
             "--broker-cgroup" => a.broker_cgroup = Some(PathBuf::from(value())),
             "--broker-container" => a.broker_container = Some(value()),
+            "--broker-pid" => a.broker_pid = Some(value().parse().unwrap()),
+            "--threads" => a.threads = value().parse().unwrap(),
             "--profiles" => a.profiles = Some(PathBuf::from(value())),
             "--budgets" => a.budgets = Some(PathBuf::from(value())),
             file if a.mode == Mode::Report && !file.starts_with("--") => {
                 a.files.push(PathBuf::from(file));
             }
             other => panic!(
-                "unknown argument {other:?}: [fanout|soak|report FILE..] --system --endpoint --rate --subscribers --workers --seconds --warmup --payload --retain --runs --seed --max-load --busy --drain --out --broker-cgroup --broker-container --profiles --budgets"
+                "unknown argument {other:?}: [fanout|soak|report FILE..|relay] --system --endpoint --rate --subscribers --workers --seconds --warmup --payload --retain --runs --seed --max-load --busy --drain --out --broker-cgroup --broker-container --broker-pid --threads --profiles --budgets"
             ),
         }
     }
     if a.endpoint.is_empty() {
-        a.system.endpoint().clone_into(&mut a.endpoint);
+        if a.mode == Mode::Relay {
+            System::Tcp.endpoint().clone_into(&mut a.endpoint);
+        } else {
+            a.system.endpoint().clone_into(&mut a.endpoint);
+        }
     }
     assert!(
         a.payload >= 16,
@@ -275,10 +299,24 @@ fn broker(_: &Args, system: System, _: u64, _: usize, _: &Profiler) -> Run {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn relay(a: &Args) {
+    relay::serve(&a.endpoint, a.threads);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn relay(_: &Args) {
+    panic!("the relay serves the comparison, which runs on Linux (bench/compare.sh)")
+}
+
 fn main() -> ExitCode {
     let a = args();
     if a.mode == Mode::Report {
         print!("{}", report::compare(&a.files));
+        return ExitCode::SUCCESS;
+    }
+    if a.mode == Mode::Relay {
+        relay(&a);
         return ExitCode::SUCCESS;
     }
     let load = hyper_measure::usage::load().unwrap_or(0.0);

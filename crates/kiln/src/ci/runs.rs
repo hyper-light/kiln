@@ -70,13 +70,21 @@ pub async fn set_run_name(hub: &Hub, run: &str, name: Option<String>) -> anyhow:
     hub.store.call(move |c| Ok(c.execute("UPDATE runs SET run_name = ?2 WHERE id = ?1", params![run, name]).map(|_| ())?)).await
 }
 
-/// A run's approval (W18-R06): `required`, then `approved` or `rejected` by `by`.
+/// A run's approval (W18-R06): `required`, then `approved` or `rejected` by `by`. A run that comes
+/// to need one waits for its reviewers, which is recorded with it (`approval.waiting`, W19-R06;
+/// `crate::events`).
 pub async fn set_approval(hub: &Hub, run: &str, state: &str, by: Option<&str>) -> anyhow::Result<()> {
     let (run, state, by) = (run.to_owned(), state.to_owned(), by.map(str::to_owned));
     hub.store
         .call(move |c| {
+            let tx = crate::store::tx(c)?;
             let at = by.as_ref().map(|_| crate::util::now_unix());
-            Ok(c.execute("UPDATE runs SET approval = ?2, approved_by = ?3, approved_at = ?4 WHERE id = ?1", params![run, state, by, at]).map(|_| ())?)
+            tx.execute("UPDATE runs SET approval = ?2, approved_by = ?3, approved_at = ?4 WHERE id = ?1", params![run, state, by, at])?;
+            if state == "required" {
+                crate::events::record(&tx, "approval.waiting", &serde_json::json!({ "run": run, "environments": [] }))?;
+            }
+            tx.commit()?;
+            Ok(())
         })
         .await
 }
@@ -346,27 +354,40 @@ pub async fn queued_at(hub: &Hub, leg: &str) -> anyhow::Result<i64> {
 }
 
 /// Why a leg waits now (W05-R13; `null`: no longer for that). A new kind of reason ends the
-/// wait for the last one (W19-R01).
-pub async fn wait_reason(hub: &Hub, leg: &str, reason: &serde_json::Value) -> anyhow::Result<()> {
-    wait_reasons(hub, vec![(leg.to_owned(), reason.clone())]).await
+/// wait for the last one (W19-R01). `waiting`: the run (and the environment) this leg is the first
+/// of to wait for reviewers, which is recorded with the wait (`approval.waiting`, W19-R06;
+/// `crate::events`).
+pub async fn wait_reason(hub: &Hub, leg: &str, reason: &serde_json::Value, waiting: Option<(&str, &str)>) -> anyhow::Result<()> {
+    let waiting = waiting.map(|(run, environment)| serde_json::json!({ "run": run, "environments": [environment] }));
+    write_waits(hub, vec![(leg.to_owned(), reason.clone(), waiting)]).await
 }
 
 /// W05-AC09, W05-R13: independent waits recovered together share one transaction.
-/// Each still closes its previous kind of wait before keeping its new explanation.
+/// Each still closes its previous kind of wait before keeping its new explanation. A recovered
+/// wait records no `approval.waiting`: its first one was recorded as it began.
 pub async fn wait_reasons(hub: &Hub, reasons: Vec<(String, serde_json::Value)>) -> anyhow::Result<()> {
+    write_waits(hub, reasons.into_iter().map(|(leg, reason)| (leg, reason, None)).collect()).await
+}
+
+/// The waits `reasons` say, in one transaction: each leg's reason, with the `approval.waiting` it
+/// records, if any.
+async fn write_waits(hub: &Hub, reasons: Vec<(String, serde_json::Value, Option<serde_json::Value>)>) -> anyhow::Result<()> {
     if reasons.is_empty() {
         return Ok(());
     }
     hub.store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
-            for (leg, reason) in reasons {
+            for (leg, reason, waiting) in reasons {
                 let r = (!reason.is_null()).then(|| reason.to_string());
                 let was: Option<Option<String>> = tx.query_row("SELECT wait_reason FROM jobs WHERE id = ?1", [&leg], |x| x.get(0)).optional()?;
                 if was.as_ref().is_some_and(|w| wait_kind(w.as_deref()) != wait_kind(r.as_deref())) {
                     close_wait(&tx, &leg, crate::util::now_unix())?;
                 }
                 tx.execute("UPDATE jobs SET wait_reason = ?2 WHERE id = ?1", params![leg, r])?;
+                if let Some(fact) = &waiting {
+                    crate::events::record(&tx, "approval.waiting", fact)?;
+                }
             }
             tx.commit()?;
             Ok(())
@@ -374,21 +395,34 @@ pub async fn wait_reasons(hub: &Hub, reasons: Vec<(String, serde_json::Value)>) 
         .await
 }
 
-/// A leg done for good.
-pub async fn finish_leg(hub: &Hub, leg: &str, status: Status, conclusion: &str, outputs: Option<String>, error: Option<String>) -> anyhow::Result<()> {
+/// A deployment a leg's end ended (W15-R04): its run, its environment, and whether it succeeded.
+pub struct Deployed {
+    pub run: String,
+    pub environment: String,
+    pub succeeded: bool,
+}
+
+/// A leg done for good; `deployed`, the deployment it ends, which is recorded with it
+/// (`deploy.succeeded` or `deploy.failed`, W19-R06; `crate::events`).
+pub async fn finish_leg(hub: &Hub, leg: &str, status: Status, conclusion: &str, outputs: Option<String>, error: Option<String>, deployed: Option<Deployed>) -> anyhow::Result<()> {
     let leg_id = leg.to_owned();
     let (leg, conclusion) = (leg.to_owned(), conclusion.to_owned());
     hub.store
         .call(move |c| {
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             // One that never started waited until now; an attempt still open ends with it.
-            close_wait(c, &leg, now)?;
-            c.execute("UPDATE ci_attempts SET status = 'done', conclusion = ?2, finished_at = ?3 WHERE leg_id = ?1 AND status = 'running'", params![leg, conclusion, now])?;
-            c.execute(
+            close_wait(&tx, &leg, now)?;
+            tx.execute("UPDATE ci_attempts SET status = 'done', conclusion = ?2, finished_at = ?3 WHERE leg_id = ?1 AND status = 'running'", params![leg, conclusion, now])?;
+            tx.execute(
                 "UPDATE jobs SET status = ?2, conclusion = ?3, outputs = COALESCE(?4, outputs), error = COALESCE(?5, error), finished_at = ?6 WHERE id = ?1",
                 params![leg, status.as_str(), conclusion, outputs, error, now],
             )?;
-            c.execute("UPDATE steps SET status = 'skipped' WHERE job_id = ?1 AND status IN ('pending', 'running')", [&leg])?;
+            tx.execute("UPDATE steps SET status = 'skipped' WHERE job_id = ?1 AND status IN ('pending', 'running')", [&leg])?;
+            if let Some(d) = &deployed {
+                crate::events::record(&tx, "deployed", &serde_json::json!({ "run": d.run, "leg": leg, "environment": d.environment, "succeeded": d.succeeded }))?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await?;
@@ -476,18 +510,25 @@ pub async fn summary(hub: &Hub, leg: &str, idx: u32, markdown: &str) -> anyhow::
         .await
 }
 
-/// The run's end.
-pub async fn finish_run(hub: &Hub, run: &str, status: Status, conclusion: &str, error: Option<String>) -> anyhow::Result<()> {
+/// The run's end. `told`: whether the notification rules and subscriptions hear of it (W19-R06's
+/// `run.*` and `leg.flaky`: a run the plan finished, not one that never started), recorded with
+/// the end (`crate::events`).
+pub async fn finish_run(hub: &Hub, run: &str, status: Status, conclusion: &str, error: Option<String>, told: bool) -> anyhow::Result<()> {
     let run_id = run.to_owned();
     let (run, conclusion) = (run.to_owned(), conclusion.to_owned());
     hub.store
         .call(move |c| {
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
-            c.execute(
+            tx.execute(
                 "UPDATE runs SET status = ?2, conclusion = ?3, error = COALESCE(?4, error), finished_at = ?5, started_at = COALESCE(started_at, ?5) WHERE id = ?1",
                 params![run, status.as_str(), conclusion, error, now],
             )?;
-            c.execute("UPDATE ci_plans SET done = 1 WHERE run_id = ?1", [&run])?;
+            tx.execute("UPDATE ci_plans SET done = 1 WHERE run_id = ?1", [&run])?;
+            if told {
+                crate::events::record(&tx, "run.finished", &serde_json::json!({ "run": run, "conclusion": conclusion }))?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await?;
