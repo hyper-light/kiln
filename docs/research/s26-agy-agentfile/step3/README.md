@@ -191,6 +191,20 @@ replacing step 25's own (s25-unpack).
   `KILN_HARNESS_SOCK` (kiln-git-sign: "not in a kiln shell"); its signature verifies against kiln's
   agent CA (O=hyper-light), as this step's earlier commits do.
 
+## The step's live test, word for word (kiln main edba77bdb)
+
+kiln built itself, then `kiln agentfiles context antigravity DIR --platform linux/amd64,linux/arm64`
+(scripts/cli-run.sh), at kiln main edba77bdb, whose agy pin, unpack.rs and context.rs are the bytes
+tested above:
+
+| Where | Result |
+|---|---|
+| adacachy, Linux x86_64 (evidence/e_cli_adacachy.txt) | exit 0; DIR holds the Agentfile (the embedded one), antigravity-amd64/ and antigravity-arm64/ alone; each harness.json the embedded one; each bin/agy 0755 with the pin's member SHA-256 and size (2 of 2, sha256sum); `antigravity-amd64/bin/agy --version` printed `1.5.7` (31 2e 35 2e 37 0a), the pin's version |
+| Mac Studio, macOS arm64 (evidence/e_cli_macstudio.txt) | the same, 2 of 2; --version not run (macOS runs no Linux binary) |
+
+The context command took 10 s on adacachy and 105 s on the Mac Studio, single observations of Google's
+storage, not claims.
+
 ## Open
 
 - Owed, platforms without a run: Windows (no run of this branch there), Linux arm64. The step's own
