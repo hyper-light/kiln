@@ -1,0 +1,11 @@
+# Step 2 (plan 01a1cf48e8157494ac9a51f7a564f526): the bytes Claude Code 2.1.311's pinned linux-x64 build prints for --version, run on adacachy2 by kiln run with an empty HOME (docs/research/s19-claude-agentfile/step2-version-bytes.sh)
+HOST adacachy2 2026-11-12T14:32:55Z
+5405c6b4794def30be1bdfff9c6f3793024c85203224dae846238d5321173e8f  step2-version-bytes.sh
+083237093c08bbcf786b7915794533563c02acf1f7226a806609e4c23b05a4ed  pin.json
+BINARY https://downloads.claude.ai/claude-code-releases/2.1.311/linux-x64/claude sha256=86dc1fcc69498159eaf15f446613e847010f9036bfbbdffd4c49350be8489ada (as pinned)
+VERSION_EXIT 0
+VERSION_STDOUT_HEX 32 2e 31 2e 33 31 31 20 28 43 6c 61 75 64 65 20 43 6f 64 65 29 0a
+VERSION_STDOUT_TEXT 2.1.311 (Claude Code)
+VERSION_STDERR_BYTES 0
+HOME_ENTRIES_AFTER 0
+SCRIPT_EXIT 0

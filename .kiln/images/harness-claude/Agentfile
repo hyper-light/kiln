@@ -1,0 +1,39 @@
+# Anthropic's Claude Code as a harness kiln ships (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 19;
+# plan 01a1cf48e8157494ac9a51f7a564f526, research 01a1cf48e8157494b048e1fb2c437f08). Its build installs
+# the binary pin.json pins: kiln writes it at ./claude-<arch>-<libc>/bin/claude, its SHA-256 checked as it
+# downloads, since an http(s) HARNESS source carries no checksum (f26). No RUN fetches it, and no
+# credential is in the image (f48): a person's own sign-in lives in their HOME volume.
+#
+# The base: buildpack-deps:trixie-scm by digest, a Docker Official Image for both arches with git, an ssh
+# client, curl and CA certificates (f46). Another base works: Anthropic's glibc builds need nothing newer
+# than GLIBC_2.17 (f13), and a musl base builds with CLAUDE_LIBC=musl.
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+ARG CLAUDE_LIBC=gnu
+
+FROM ${BASE} AS base-gnu
+
+# Anthropic's musl builds take libgcc, libstdc++ and ripgrep from the system (code.claude.com/docs/en/setup,
+# "Alpine Linux and musl-based distributions"; f14).
+FROM ${BASE} AS base-musl
+RUN apk add --no-cache libgcc libstdc++ ripgrep
+
+# BuildKit builds only the stage the variant names (f28).
+FROM base-${CLAUDE_LIBC}
+ARG TARGETARCH
+ARG CLAUDE_LIBC
+HARNESS claude FROM ./claude-${TARGETARCH}-${CLAUDE_LIBC}
+
+# Its network reach, every part named (default deny): a network for this harness alone, which it joins
+# with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443 out,
+# opened at the network's boundary and at the microVM's. Nothing comes in, and no other port or protocol
+# goes out. Step 9 grants its providers by name instead (f30).
+NETWORK --dns --egress=443/tcp provider FOR claude
+EXPOSE --harnesses=claude 443/tcp AS egress FOR provider
+CONNECT claude WITH claude ON provider
+
+# The project, until step 8 plugs it in at its host path (f25). And the person's own volume, given at run
+# time, as the whole HOME: a harness sees the image read-only, so only a volume makes HOME writable and
+# lasting, and Claude Code keeps everything there, ~/.claude and ~/.claude.json (f22, f33). No volume goes
+# under /tmp, which is each harness's own scratch (f23).
+VOLUME --target-kind=harness /workspace FOR claude
+VOLUME --target-kind=harness /home/claude FOR claude

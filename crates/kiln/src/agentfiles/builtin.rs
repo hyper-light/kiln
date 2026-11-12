@@ -47,6 +47,20 @@ pub const ALL: &[Builtin] = &[Builtin {
     // clap prints Goose's empty display name, then a space and the version: 1.59.0's musl build wrote
     // the bytes 20 31 2e 35 39 2e 30 0a (step 23's research 01a1ce705e3d72af8563e07fa92a7460, f12).
     smoke: Smoke { args: &["--version"], stdout: " {version}\n" },
+}, Builtin {
+    name: "harness-claude",
+    harness: "claude",
+    text: include_str!("../../../../.kiln/images/harness-claude/Agentfile"),
+    pin: include_str!("../../../../.kiln/images/harness-claude/pin.json"),
+    // The musl variant's harness file (CLAUDE_LIBC=musl) also takes the system's ripgrep.
+    files: &[
+        ("harness.json", include_str!("../../../../.kiln/images/harness-claude/harness.json")),
+        ("harness.musl.json", include_str!("../../../../.kiln/images/harness-claude/harness.musl.json")),
+    ],
+    // Claude Code prints its version, then " (Claude Code)": 2.1.311's x86_64 build wrote the bytes
+    // 32 2e 31 2e 33 31 31 20 28 43 6c 61 75 64 65 20 43 6f 64 65 29 0a (step 19's evidence,
+    // docs/research/s19-claude-agentfile/evidence/e_step2_version_bytes.txt).
+    smoke: Smoke { args: &["--version"], stdout: "{version} (Claude Code)\n" },
 }];
 
 /// One as the list shows it.
@@ -394,5 +408,140 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    /// The environment a harness file gives its harness.
+    fn env_of(h: &Value) -> Vec<String> {
+        h.pointer("/run/env").and_then(Value::as_array).map(|e| e.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default()
+    }
+
+    /// How a Claude Code harness file drifts from kiln's own launch. Its command is the kind's program
+    /// and claude::args for a session that asks nothing of its own (a session's own words come at
+    /// launch). Its environment is HOME on its volume, DISABLE_UPDATES (a pinned build never updates
+    /// itself), claude::FIXED_ENV and then `extra`, and nothing else.
+    fn claude_launch_problems(h: &Value, kind: &Kind, home: &str, extra: &[&str]) -> Vec<String> {
+        let mut found = Vec::new();
+        let own = crate::harness::session::Spec { kind: kind.id.to_owned(), allow_bypass: false, ..Default::default() };
+        let want: Vec<String> = std::iter::once(kind.program.to_owned()).chain(crate::harness::claude::args(&own, None)).collect();
+        if command_of(h) != want {
+            found.push(format!("command {:?} isn't kiln's {want:?}", command_of(h)));
+        }
+        let mut env = vec![format!("HOME={home}"), "DISABLE_UPDATES=1".to_owned()];
+        env.extend(crate::harness::claude::FIXED_ENV.iter().map(|(k, v)| format!("{k}={v}")));
+        env.extend(extra.iter().map(|e| (*e).to_owned()));
+        if env_of(h) != env {
+            found.push(format!("env {:?} isn't {env:?}", env_of(h)));
+        }
+        found
+    }
+
+    /// Claude Code runs as kiln's Claude kind starts it: claude and claude::args' fixed arguments, and
+    /// the environment kiln always gives it, with its HOME on the person's volume; musl's file also
+    /// takes the system's ripgrep. Each file is an OSI config of claude at the pin's version. A dropped
+    /// argument, a HOME left on the scratch and a stray variable are each caught.
+    #[test]
+    fn step19_claude_runs_as_kilns_claude_kind_with_its_home_on_its_volume() -> anyhow::Result<()> {
+        let claude = ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude built-in"))?;
+        let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
+        anyhow::ensure!(matches!(kind.protocol, Protocol::ClaudeStreamJson), "kiln's claude kind isn't stream-json");
+        let version = serde_json::from_str::<Value>(claude.pin)?.get("version").and_then(Value::as_str).map(str::to_owned).unwrap_or_default();
+        let volumes = harness_volumes(claude.text, "claude");
+        anyhow::ensure!(volumes == ["/workspace", "/home/claude"], "{volumes:?}");
+        let home = volumes.get(1).copied().unwrap_or_default();
+        let variants: [(&str, &[&str]); 2] = [("harness.json", &[]), ("harness.musl.json", &["USE_BUILTIN_RIPGREP=0"])];
+        for (name, extra) in variants {
+            let text = claude.files.iter().find(|(n, _)| *n == name).map(|(_, t)| *t).ok_or_else(|| anyhow::anyhow!("no {name}"))?;
+            let h: Value = serde_json::from_str(text)?;
+            anyhow::ensure!(h.get("schemaVersion") == Some(&Value::from(1)) && h.get("name").and_then(Value::as_str) == Some("claude"), "{name}: {h}");
+            anyhow::ensure!(h.get("version").and_then(Value::as_str) == Some(version.as_str()), "{name} isn't the pin's {version}");
+            let problems = claude_launch_problems(&h, kind, home, extra);
+            anyhow::ensure!(problems.is_empty(), "{name}: {problems:?}");
+        }
+        let h = harness_file(claude)?;
+        let mut dropped = h.clone();
+        if let Some(c) = dropped.pointer_mut("/run/command").and_then(Value::as_array_mut) {
+            c.retain(|a| a.as_str() != Some("--verbose"));
+        }
+        anyhow::ensure!(!claude_launch_problems(&dropped, kind, home, &[]).is_empty(), "a dropped argument passed");
+        let mut scratch = h.clone();
+        if let Some(e) = scratch.pointer_mut("/run/env/0") {
+            *e = Value::from("HOME=/tmp");
+        }
+        anyhow::ensure!(!claude_launch_problems(&scratch, kind, home, &[]).is_empty(), "HOME on the scratch passed");
+        anyhow::ensure!(!claude_launch_problems(&h, kind, home, &["USE_BUILTIN_RIPGREP=0"]).is_empty(), "a stray variable passed");
+        Ok(())
+    }
+
+    /// Claude Code's Agentfile is the plan's shape: the base by digest, a stage for each libc with a RUN
+    /// only in musl's (Anthropic's packages), Anthropic's own build per platform and libc, exactly the
+    /// bring-up's three grants, exactly its two volumes, and no ENV. Its pin was taken through Anthropic's
+    /// key and has both libcs for both platforms; its smoke line is what Claude Code prints.
+    #[test]
+    fn step19_claude_agentfile_is_the_plans_shape() -> anyhow::Result<()> {
+        let claude = ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude built-in"))?;
+        let lines = instructions(claude.text);
+        let want = [
+            "ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+            "ARG CLAUDE_LIBC=gnu",
+            "FROM ${BASE} AS base-gnu",
+            "FROM ${BASE} AS base-musl",
+            "RUN apk add --no-cache libgcc libstdc++ ripgrep",
+            "FROM base-${CLAUDE_LIBC}",
+            "ARG TARGETARCH",
+            "ARG CLAUDE_LIBC",
+            "HARNESS claude FROM ./claude-${TARGETARCH}-${CLAUDE_LIBC}",
+            "NETWORK --dns --egress=443/tcp provider FOR claude",
+            "EXPOSE --harnesses=claude 443/tcp AS egress FOR provider",
+            "CONNECT claude WITH claude ON provider",
+            "VOLUME --target-kind=harness /workspace FOR claude",
+            "VOLUME --target-kind=harness /home/claude FOR claude",
+        ];
+        anyhow::ensure!(lines == want, "{lines:#?}");
+        let pin: Value = serde_json::from_str(claude.pin)?;
+        let mut builds: Vec<String> = pin
+            .get("builds")
+            .and_then(Value::as_array)
+            .map(|b| b.iter().map(|b| format!("{} {}", b.get("platform").and_then(Value::as_str).unwrap_or_default(), b.get("variant").and_then(Value::as_str).unwrap_or_default())).collect())
+            .unwrap_or_default();
+        builds.sort();
+        anyhow::ensure!(builds == ["linux/amd64 gnu", "linux/amd64 musl", "linux/arm64 gnu", "linux/arm64 musl"], "{builds:?}");
+        anyhow::ensure!(pin.pointer("/verified/signer/fingerprint").and_then(Value::as_str) == Some("31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"), "the pin wasn't taken through Anthropic's key");
+        // The bytes 2.1.311's `claude --version` wrote (step 19's evidence, e_step2_version_bytes.txt).
+        let version = pin.get("version").and_then(Value::as_str).unwrap_or_default();
+        let printed: [u8; 22] = [0x32, 0x2e, 0x31, 0x2e, 0x33, 0x31, 0x31, 0x20, 0x28, 0x43, 0x6c, 0x61, 0x75, 0x64, 0x65, 0x20, 0x43, 0x6f, 0x64, 0x65, 0x29, 0x0a];
+        anyhow::ensure!(version != "2.1.311" || claude.smoke.expected(version).as_bytes() == printed);
+        anyhow::ensure!(claude.smoke.args == ["--version"]);
+        Ok(())
+    }
+
+    /// A harness sees its image read-only, so a HOME its harness file sets is one of its volumes; and no
+    /// built-in puts a volume at or under /tmp, which is each harness's own scratch (step 19's research,
+    /// f22 and f23). A HOME off its volumes and a volume under /tmp are each caught.
+    #[test]
+    fn step19_a_harness_home_is_its_volume_and_none_is_under_tmp() -> anyhow::Result<()> {
+        let problems = |text: &str, h: &Value, harness: &str| -> Vec<String> {
+            let volumes = harness_volumes(text, harness);
+            let mut found: Vec<String> = volumes.iter().filter(|v| **v == "/tmp" || v.starts_with("/tmp/")).map(|v| format!("a volume at {v}")).collect();
+            if let Some(home) = env_of(h).iter().find_map(|e| e.strip_prefix("HOME=").map(str::to_owned))
+                && !volumes.contains(&home.as_str())
+            {
+                found.push(format!("HOME={home} is none of its volumes {volumes:?}"));
+            }
+            found
+        };
+        for b in ALL {
+            let h = harness_file(b)?;
+            let found = problems(b.text, &h, b.harness);
+            anyhow::ensure!(found.is_empty(), "{}: {found:?}", b.name);
+        }
+        let claude = ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude built-in"))?;
+        let h = harness_file(claude)?;
+        anyhow::ensure!(!problems(&claude.text.replace("/home/claude FOR claude", "/tmp/claude FOR claude"), &h, "claude").is_empty(), "a volume under /tmp passed");
+        let mut off = h.clone();
+        if let Some(e) = off.pointer_mut("/run/env/0") {
+            *e = Value::from("HOME=/root");
+        }
+        anyhow::ensure!(!problems(claude.text, &off, "claude").is_empty(), "a HOME off its volumes passed");
+        Ok(())
     }
 }

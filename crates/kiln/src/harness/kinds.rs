@@ -143,8 +143,7 @@ impl Kind {
                 if let Some(dir) = crate::skills::place::session_folder(session) {
                     p.arg("--plugin-dir").arg(dir);
                 }
-                // File snapshots before edits, so a rewind can restore them.
-                p.env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1");
+                p.envs(super::claude::FIXED_ENV.iter().copied());
             }
             // Model, mode and resume go over the protocol (thread/start, turn/start).
             Protocol::CodexAppServer => {
