@@ -197,12 +197,8 @@ impl WriteBuf {
                 }
                 cap => cap.unwrap_or(usize::MAX),
             };
-            // Back from giving the shard up: what coming back to write took of this poll, what putting bytes off costs.
-            if std::mem::take(&mut self.gave_up)
-                && let Some(poll) = hyper_rt::futures::poll_clock()
-            {
-                self.teach(|costs| costs.resumed(poll.held_ns()));
-            }
+            // Writing again: a whole quantum's worth is for the first write after giving the shard up, and no other.
+            self.gave_up = false;
             let began = room.map(|_| Instant::now());
             let n = if self.segs.is_empty() {
                 let rest = self.tail.get(self.sent..).unwrap_or_default();
@@ -418,6 +414,43 @@ mod tests {
         })??;
         assert!(polls > 1, "the flush wrote 1 MiB in the poll that had held its shard 200 µs already");
         assert!(longest_cpu_ns < 1_000_000, "a poll of the flush held its shard {longest_cpu_ns} ns on the CPU");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a flush that gave its shard up and came back to write on holds what it writes after to
+    /// what's left of its poll's quantum, as before it gave it up: none fits a poll with no room left, whatever coming back
+    /// cost. Do: teach a buffer's own costs with writes at 2 ns a byte, then flush 1 MiB in a poll that has held its shard
+    /// 200 µs of the test runtime's 250 µs (it gives its shard up, and comes back to write the rest). Expect: none fits no
+    /// room. Weighed against what coming back cost, a write was let run past its poll's quantum by that much, learned on the
+    /// clock (probe 17, the M3: 256 KiB written with 4 µs of its poll's quantum left, held to 18.7 MB).
+    #[test]
+    fn g9_s3_a_flush_that_came_back_holds_its_writes_to_their_room() -> Result<(), String> {
+        thread_local! {
+            static COSTS: crate::turn::Writes = const { crate::turn::Writes::nothing_yet() };
+        }
+        let (polls, fits) = crate::testing::block_on(async {
+            let mut io = Slow { ns_per_byte: 2, sizes: Vec::new() };
+            let mut buf = WriteBuf::with_costs(&COSTS);
+            for _ in 0..8 {
+                buf.push(Bytes::from(vec![1u8; 32 << 10]));
+                std::future::poll_fn(|cx| buf.poll_flush(&mut io, cx)).await.map_err(|e| e.to_string())?;
+            }
+            buf.push(Bytes::from(vec![2u8; 1 << 20]));
+            let mut polls = 0u32;
+            std::future::poll_fn(|cx| {
+                polls += 1;
+                while polls == 1 && hyper_rt::futures::poll_clock().is_some_and(|p| p.held_ns() < 200_000) {
+                    std::hint::spin_loop();
+                }
+                buf.poll_flush(&mut io, cx)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            // Its costs are its shard's thread's, where it wrote.
+            Ok::<_, String>((polls, COSTS.with(|c| c.fitting(0))))
+        })??;
+        assert!(polls > 1, "the flush didn't give its shard up: {polls} poll");
+        assert_eq!(fits, Some(0), "after coming back, {fits:?} bytes fit a poll with no room left");
         Ok(())
     }
 
