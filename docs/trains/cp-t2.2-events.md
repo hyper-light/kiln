@@ -62,13 +62,29 @@ Ada's word, through Kiln Distro's train.
 
 ## What shows it
 
-On the branch as merged (e0989666f), on fedora (kiln-a094a12d), a debug build:
-- **kiln's full gate** (`ci/gate.sh`): clippy with `-D warnings` for Linux, Windows and macOS;
-  the workspace's tests, 6,312 passed. Of the 6 that failed in the full run, 5 pass alone (load);
-  `p5_chat_slack_one_message_per_release_and_commands_as_their_person` needs `helm`, which fedora
-  lacks.
-- **The kill -9 lab** again: 100 kills over 112 s, 7,635 changes committed, each delivered at
-  least once and in order, 19 twice with the same delivery id.
+On the branch as landed (ba13521227f, main b2dfa3f2cbc merged), the checks of what it changes
+(Ada, 11-01: "we don't need the full gate"), each on a machine kiln picked by its needs:
+- **Clippy** with `-D warnings`, the workspace's every target: Linux (adacachy2) and macOS (a Mac
+  Studio) pass. Windows (`x86_64-pc-windows-gnu` by cargo-zigbuild: no Windows runner takes reach
+  runs) fails on 8 `dead_code` errors in main's W20 legacy custody (`harness/`,
+  `runner/custody.rs`), the same on main's own tree; this branch changes none of those files.
+- **kiln's lib tests** of the modules it changes (`ci`, `events`, `hub`, `bus`, `deploy`, `memory`,
+  `metrics`, `observe`, `store`, `sync`, `api`, `server`), on adacachy under its caps: 1,227 passed,
+  5 failed. Four pass alone (load: `g9_s5`, `w24_ac10`, `g11_s3_b3`, `g11_b21`);
+  `w28_kilns_own_workflows_check_plan_and_route` fails on main too (`.kiln/windows-recovery.yaml`
+  isn't in its list). Step 8's own pass: T-T2.2.1, a rules' channel down 10 minutes, the relay's
+  kill points, the persisted class's three, the group's replay.
+- **kiln-obs and kiln-seams**: 414 passed; `bus_persisted`, `notifications` and `vendored` pass.
+- **`deploy_chat`'s `p5_chat_slack…`** failed on this branch, and not for want of `helm`, as was
+  said of it before: its second release was rejected before its message went out (below, "Risks").
+  It now waits for that message, then rejects it, and passes (adacachy2, which has no `helm`), as
+  it passes on main.
+- **The kill -9 lab**: 100 kills over 184 s, 6,348 changes committed, each delivered at least once
+  and in order, 43 twice with the same delivery id.
+
+Earlier, on fedora (kiln-a094a12d), at e0989666f: the full gate, 6,312 passed, 5 of the 6 that
+failed passing alone (load), and `p5_chat_slack…` (above); the kill -9 lab, 100 kills over 112 s,
+7,635 changes committed, each delivered at least once and in order, 19 twice.
 
 Earlier, on adacachy under its caps:
 - **A persisted topic across kill -9** (`tests/bus_persisted.rs`): 28,000 messages acknowledged in
@@ -132,6 +148,9 @@ On production's `/metrics` and the overview dashboard's "Events" row (docs/bus.m
   went: the same `X-Kiln-Delivery` for webhooks; chat channels show it twice.
 - **A run deleted before its event is read** makes no `run` or `job` delivery (its body is made from
   the run as it is).
+- **A release's first chat message may show a later state:** its messages go out from kiln.events,
+  a move after it changes, so a release that moves on before then (asked for and rejected at once)
+  gets one message, posted as it is by then, and no edit. Before, its first message went out at once.
 - **Throughput:** one relay publishing up to 128 events a message, a flush a message; on adacachy's
   loaded disk it kept up with the lab's writer (100 changes a second) between kills.
 - **Runners on the release before** that hold kiln.db's replica (P2's learners) replay the
@@ -157,6 +176,8 @@ The release before runs on what this one leaves:
 - **hyper-raft main is at fb74b59**: kiln's recorded change 0003 conflicts with its driver fix,
   and the runtime program, whose change it is, refreshes it; kiln and Quiver move there together
   after.
+- **Windows clippy and `w28_kilns_own_workflows` fail on main's own tree** (main's W20 legacy
+  custody: code only Unix calls, and `.kiln/windows-recovery.yaml`); the agent that pushed it is told.
 - **`scripts/locks.py check` fails on main's own code** (async locks and channels in
   `ci/actions.rs`, `ci/dispatch.rs`, `offers/mod.rs`, `reach/told.rs` not listed in
   `scripts/locks/hot.toml`); this branch changes none of them.
