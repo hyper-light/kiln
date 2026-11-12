@@ -1003,6 +1003,13 @@ pub mod input {
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentsStartIsolation {
+        None,
+        Microvm,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     pub struct AgentsStart {
         /// The harness: claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor or pi.
@@ -1028,6 +1035,9 @@ pub mod input {
         /// it goes up for review (agents.change) or a person writes it to disk. Where the machine
         /// has Slates.
         pub workspace: Option<AgentsStartWorkspace>,
+        /// How it's held: `none`, a process on its machine (the default), or `microvm`, a microVM of
+        /// its own, on a machine that starts them. An isolated agent's agents are isolated too.
+        pub isolation: Option<AgentsStartIsolation>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
