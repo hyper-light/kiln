@@ -555,6 +555,19 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// [`Driver::event`] as a poll: an event already queued goes at once; otherwise each turn takes what
     /// arrived, fires the timers due, sends, and hands out the next event, or arms the socket's readiness
     /// and the timer and parks.
+    ///
+    /// **Reads before timers.** A timer fires only at a clock read before a drain that took every
+    /// datagram queued by then: each turn reads the clock, takes the readiness that fired (arming
+    /// none), drains to that reading, and fires what is due at it only where every socket's drain
+    /// was whole ([`Taken::whole`](hyper_rt::udp::Taken)). A driver whose task was held still (its
+    /// process stopped or swapped out, its host paused) so reads what its peers sent during the hold
+    /// before it judges their connections idle: before, its first turn fired their idle timers with
+    /// what fired during the hold not yet taken (found by mantle: a node held 4 s by `SIGSTOP` timed
+    /// out a client whose frames sat in its socket). A drain cut at its bound on calls leaves its
+    /// socket for the next turn, and the timers wait for that turn's clock; at the poll's last turn
+    /// they are judged whatever the drain left, so a peer that outruns every drain delays them at
+    /// most one poll and never starves them. Datagrams taken in the drain are told at their reads,
+    /// after the reading the timers are judged at; the turn sends at a reading after both.
     pub fn poll_event(&mut self, context: &mut Context<'_>) -> Poll<Result<Event<C>, RtError>> {
         self.turns(context, HandOut::AfterSends)
     }
@@ -594,8 +607,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         if let Some(event) = self.endpoint.poll_event() {
             return Poll::Ready(Ok(event));
         }
-        for _ in 0..TURNS {
-            let now = match self.receive() {
+        for turn in 0..TURNS {
+            let now = match self.receive(context, turn.saturating_add(1) == TURNS) {
                 Ok(now) => now,
                 Err(error) => return Poll::Ready(Err(error)),
             };
@@ -631,15 +644,39 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         Poll::Pending
     }
 
-    /// A turn's receive half: the peers' sockets matched to the endpoint's connections, what arrived
-    /// taken, the timers due fired, and the sockets matched again. Now, for the turn's send half.
-    fn receive(&mut self) -> Result<Instant, RtError> {
-        self.reconcile()?;
-        self.drain()?;
-        let now = self.now()?;
-        if self.endpoint.poll_timeout().is_some_and(|due| due <= now) {
-            self.endpoint.handle_timeout(now);
+    /// Takes the sockets' readiness that fired since the driver last looked, arming none: the
+    /// listener's wait if one is armed, and what fired of the peers' group. A turn takes it before
+    /// its drain, so what arrived while the driver was not polled is read before its timers are
+    /// judged ([`Driver::poll_event`]); what is to be armed waits for the park.
+    fn take_ready(&mut self, context: &mut Context<'_>) -> Result<(), RtError> {
+        if !self.listener_ready
+            && let Some(readable) = self.readable.as_mut()
+            && let Poll::Ready(outcome) = Pin::new(readable).poll(context)
+        {
+            self.readable = None;
+            outcome?;
+            self.listener_ready = true;
         }
+        self.take_fired()?;
+        Ok(())
+    }
+
+    /// A turn's receive half: the peers' sockets matched to the endpoint's connections, the clock
+    /// read, the readiness that fired taken (arming none), what arrived by that reading drained, the
+    /// timers due at it fired where every drain was whole or at the poll's `last` turn
+    /// ([`Driver::poll_event`]), and the sockets matched again. Now, for the turn's send half.
+    fn receive(&mut self, context: &mut Context<'_>, last: bool) -> Result<Instant, RtError> {
+        self.reconcile()?;
+        // The readiness is taken after the clock is read, so a socket a datagram reached by then is
+        // drained in this turn.
+        let cutoff = shard_now()?;
+        self.take_ready(context)?;
+        let whole = self.drain(cutoff)?;
+        let cutoff = self.instant(cutoff);
+        if (whole || last) && self.endpoint.poll_timeout().is_some_and(|due| due <= cutoff) {
+            self.endpoint.handle_timeout(cutoff);
+        }
+        let now = self.now()?;
         // A connection established in this turn's receives has its socket, and its path's
         // ceiling, before its first transmission: its first MTU probe is never past the path.
         self.reconcile()?;
@@ -966,15 +1003,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     }
 
     /// Takes, from the listener and each peer socket that may hold datagrams, what was queued
-    /// when the drain began ([`Batched::receive_queued`]), what arrives meanwhile left for the next
-    /// turn: the turn then sends, the peers' credit among what it sends, after the backlog it found
-    /// and not after whatever more its peers kept sending, which a drain to empty had read first.
-    /// A socket left holding datagrams is drained at the next turn without awaiting readiness. At
-    /// most [`TURNS`] receive calls a socket.
-    fn drain(&mut self) -> Result<(), RtError> {
-        let began = shard_now()?;
+    /// when the drain `began` (the shard clock's reading; [`Batched::receive_queued`]), what arrives
+    /// meanwhile left for the next turn: the turn then sends, the peers' credit among what it sends,
+    /// after the backlog it found and not after whatever more its peers kept sending, which a drain
+    /// to empty had read first. A socket left holding datagrams is drained at the next turn without
+    /// awaiting readiness. At most [`TURNS`] receive calls a socket. Whether every socket's drain
+    /// was whole: took all that was queued when it began.
+    fn drain(&mut self, began: u64) -> Result<bool, RtError> {
+        let mut whole = true;
         if self.listener_ready {
-            let ended = Self::drain_measured(
+            let (ended, took) = Self::drain_measured(
                 &mut self.socket,
                 &mut self.ring,
                 &mut self.endpoint,
@@ -983,6 +1021,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                 |endpoint| Some(endpoint.stream_bytes_received_shared()),
             )?;
             self.listener_ready = ended == Queued::More;
+            whole &= took;
             let (room, handshake) = self
                 .measure
                 .rooms(
@@ -1005,7 +1044,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                 continue;
             };
             let id = peer.peer;
-            let ended = Self::drain_measured(
+            let (ended, took) = Self::drain_measured(
                 &mut peer.socket,
                 &mut self.ring,
                 &mut self.endpoint,
@@ -1014,6 +1053,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                 |endpoint| endpoint.stream_bytes_received(id),
             )?;
             peer.ready = ended == Queued::More;
+            whole &= took;
             // Room for each reserved as its socket was made (`reserve_peer`).
             if peer.ready {
                 self.ready_peers.push(key);
@@ -1033,7 +1073,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         draining.clear();
         self.draining = draining;
         self.size_ring();
-        Ok(())
+        Ok(whole)
     }
 
     /// Takes from `socket` what was queued when the drain began, `began` the shard clock's reading
@@ -1043,7 +1083,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// it found with nothing behind it and left empty, the kernel's charge nothing after it, read
     /// that message's charge exactly before it: a sample, with the stream bytes it carried (the
     /// singleton rule; a datagram that came between the two reads shows as a second message, or as
-    /// a charge after). A drop the kernel tells forgets the samples.
+    /// a charge after). A drop the kernel tells forgets the samples. How it ended, and whether it
+    /// was whole ([`Taken::whole`](hyper_rt::udp::Taken)).
     fn drain_measured(
         socket: &mut Batched,
         ring: &mut Ring,
@@ -1051,7 +1092,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         (began, (anchor_ns, anchor)): (u64, (u64, Instant)),
         measure: &mut SocketCharge,
         stream: impl Fn(&Endpoint<C, B, D>) -> Option<u64>,
-    ) -> Result<Queued, RtError> {
+    ) -> Result<(Queued, bool), RtError> {
         // The account is read only where the drain may sample what the measure still needs
         // (`SocketCharge::wants_before`): each read is a system call.
         let before = if measure.wants_before() {
@@ -1089,7 +1130,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         let datagrams = u64::try_from(taken.datagrams).unwrap_or(u64::MAX);
         let bytes = u64::try_from(taken.bytes).unwrap_or(u64::MAX);
         measure.after(before, after, consumed, (datagrams, bytes), emptied);
-        Ok(ended)
+        Ok((ended, taken.whole))
     }
 
     /// Sends what the endpoint transmits, each transmit straight from the driver's buffer on its

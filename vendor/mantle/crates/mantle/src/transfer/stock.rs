@@ -5,11 +5,11 @@
 //! generator as they are written to them and checked against the generator as they are read back,
 //! so neither side holds more than a small object or a part at a time. Their credentials are the
 //! profile `mantle init` wrote; their config names the node's endpoint, which init leaves out for a
-//! founder whose port is chosen as it binds (node.md §1.5), as the stock-client tests write it.
+//! founder whose port is chosen as it binds (node.md §1.5), as the stock-client tests write it, over
+//! TLS with the endpoint's authority as its chain where the listener is not on a loopback address.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -42,19 +42,42 @@ fn io(what: &str) -> impl FnOnce(std::io::Error) -> StockError + '_ {
     move |e| StockError::Io(what.to_owned(), e)
 }
 
-/// The operator's S3 profile for the listener at `endpoint`, written in `dir`: the environment a
-/// stock client runs in, the credentials `mantle init` wrote in `cell` beside a config naming the
-/// endpoint, path-style, and botocore's own transfer client.
+/// The URL of the listener at `endpoint`, `HOST:PORT`: plain HTTP on a loopback address, TLS
+/// elsewhere, as the listener serves it (`mantle_node::listener`; node.md §4.1).
+fn url(endpoint: &str) -> String {
+    let loopback = mantle_node::process::Endpoint::parse(endpoint)
+        .and_then(|at| at.host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|ip| ip.is_loopback());
+    if loopback {
+        format!("http://{endpoint}")
+    } else {
+        format!("https://{endpoint}")
+    }
+}
+
+/// The operator's S3 profile for the listener at `endpoint`, `HOST:PORT`, written in `dir`: the
+/// environment a stock client runs in, the credentials `mantle init` wrote in `cell` beside a
+/// config naming the endpoint, over TLS the endpoint's authority as its chain (`OUT/s3`'s PEM),
+/// path-style, and botocore's own transfer client.
 fn profile(
     dir: &Path,
     cell: &Path,
-    (endpoint, region): (SocketAddr, &str),
+    (endpoint, region): (&str, &str),
 ) -> Result<Vec<(&'static str, OsString)>, StockError> {
     let config = dir.join("aws-config");
+    let url = url(endpoint);
+    let chain = if url.starts_with("https://") {
+        format!(
+            "ca_bundle = {}\n",
+            cell.join("s3").join("authority.pem").display()
+        )
+    } else {
+        String::new()
+    };
     std::fs::write(
         &config,
         format!(
-            "[profile mantle]\nregion = {region}\nendpoint_url = http://{endpoint}\ns3 =\n  \
+            "[profile mantle]\nregion = {region}\nendpoint_url = {url}\n{chain}s3 =\n  \
              addressing_style = path\n  preferred_transfer_client = classic\n"
         ),
     )
@@ -146,7 +169,7 @@ impl Boto {
     pub fn start(
         dir: &Path,
         cell: &Path,
-        (endpoint, region): (SocketAddr, &str),
+        (endpoint, region): (&str, &str),
         bucket: &str,
     ) -> Result<Self, StockError> {
         let script = dir.join("boto.py");
@@ -155,7 +178,7 @@ impl Boto {
         let mut child = Command::new(PYTHON)
             .arg("-I")
             .arg(&script)
-            .arg(format!("http://{endpoint}"))
+            .arg(url(endpoint))
             .arg(region)
             .arg(bucket)
             .envs(env)
@@ -302,7 +325,7 @@ impl Cli {
     pub fn new(
         dir: &Path,
         cell: &Path,
-        (endpoint, region): (SocketAddr, &str),
+        (endpoint, region): (&str, &str),
     ) -> Result<Self, StockError> {
         Ok(Self {
             env: profile(dir, cell, (endpoint, region))?,
@@ -371,6 +394,48 @@ impl Cli {
         }
     }
 
+    /// A successful CLI copy may have skipped the upload: AWS CLI 2.38.5 treats
+    /// PreconditionFailed as a skip and exits 0 without saying it (research/76). A fresh case's
+    /// key must therefore exist at its stated length before it enters the acknowledgment
+    /// oracle. The later exact reads and placement checks still judge all its bytes and blocks.
+    fn uploaded(&self, (bucket, key): (&str, &str), length: u64) -> Result<(), StockError> {
+        let head = self
+            .command(&[
+                "s3api",
+                "head-object",
+                "--bucket",
+                bucket,
+                "--key",
+                key,
+                "--query",
+                "ContentLength",
+                "--output",
+                "text",
+            ])?
+            .stdin(Stdio::null())
+            .output()
+            .map_err(io("the AWS CLI's uploaded-object check"))?;
+        if !head.status.success() {
+            let said = std::fs::read_to_string(&self.errors).map_err(io("the CLI's errors"))?;
+            return Err(StockError::Said(format!(
+                "aws s3 cp exited successfully but its uploaded object {bucket}/{key} failed \
+                 HeadObject ({}): {said}",
+                head.status
+            )));
+        }
+        // The query emits the SDK's integer ContentLength, not an object body or a listing.
+        let held = String::from_utf8(head.stdout)
+            .ok()
+            .and_then(|said| said.trim().parse::<u64>().ok());
+        if held != Some(length) {
+            return Err(StockError::Said(format!(
+                "aws s3 cp exited successfully but its uploaded object {bucket}/{key} has \
+                 length {held:?}, expected {length}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Puts `object`, `length` bytes, at `key` in `bucket` from the CLI's standard input, the
     /// bytes made a piece at a time as they are written to it.
     pub fn put(
@@ -399,6 +464,10 @@ impl Cli {
             // A CLI that refused stopped reading: what it said is the answer.
             (_, refused @ Came::Refused(_)) => Ok(refused),
             (Err(e), _) => Err(e),
+            (Ok(()), Came::Done) => {
+                self.uploaded((bucket, key), length)?;
+                Ok(Came::Done)
+            }
             (Ok(()), came) => Ok(came),
         }
     }
@@ -461,3 +530,7 @@ impl Cli {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "stock/tests.rs"]
+mod tests;

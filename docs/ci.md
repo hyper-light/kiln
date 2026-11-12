@@ -1899,7 +1899,7 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `has <item>`, `matches <glob>`, units on sizes (`50Gi`) and durations, `label <name>` and
   `!label <name>`, combined with `&&`, `||`, `!` and parentheses. Facts are W13's (`os`, `arch`,
   `os.version`, `cpu.cores`, `cpu.model`, `cpu.flags`, `mem.total`, `mem.free`, `disk.free`,
-  `disk.total`, `gpu.count`, `gpu.model`, `gpu.memory`, `virt.kvm`, `virt.hvf`,
+  `disk.total`, `gpu.count`, `gpu.model`, `gpu.memory`, `virt.kvm`, `virt.hvf`, `virt.microvm`,
   `executors`, `tools.<name>.version`, `binfmt` platforms, custom facts). Unknown facts are false,
   never errors at run time; the editor warns.
 - **W05-R23 Preferences** (opt-in: only when a rule or the job declares them): weighted terms over
@@ -4288,6 +4288,7 @@ support (G-11, G-18, G-25, G-27, G-28).
   | `mem.total`, `mem.free`, `disk.total`, `disk.free` (of the work directory's volume) | as today's host samples |
   | `gpu.count`, `gpu.model`, `gpu.memory`, `gpu.driver` | `nvidia-smi`, `rocm-smi`, Metal device names on macOS |
   | `virt.kvm`, `virt.hvf`, `virt.nested` | `/dev/kvm` access, Hypervisor.framework entitlement check |
+  | `virt.microvm` | the runner's own word that it starts microVMs: a usable hypervisor and the runtime kiln carries (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 16 and 32) |
   | `executors` | which of `host`, `docker`, `firecracker`, `shards`, `k8s` work right now (each probed for real: a no-op run), with versions (`docker.version`, `docker.rootless`, `podman.version`, `firecracker.version`, `shards.version`, `shards.features`) |
   | `binfmt` | platforms registered for QEMU user emulation |
   | `tools.<name>.version` | `git`, `node`, `python3`, `cargo`, `go`, `java`, `dotnet`, `docker buildx`, `shards`, … found on the `PATH` a leg's steps have (W13-R03): the runner's, then the folders only its user's login shell has |

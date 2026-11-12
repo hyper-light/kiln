@@ -195,18 +195,17 @@ fn add(a: &AtomicU64, v: u64) {
     a.store(a.load(Relaxed).saturating_add(v), Relaxed);
 }
 
-/// What a connection's writes cost a byte, and what a poll that gave its shard up for them costs as it comes back to write
-/// on: what a write's bytes past its room are weighed against ([`Writes::fitting`]).
+/// What a connection's writes cost a byte: what a write's bytes are held to within what's left of its poll's quantum
+/// ([`Writes::fitting`]).
 #[derive(Debug)]
 pub struct Writes {
     bytes: Costs,
-    resumes: Costs,
 }
 
 impl Writes {
     /// A [`Writes`] with nothing learned.
     pub const fn nothing_yet() -> Self {
-        Self { bytes: Costs::nothing_yet(), resumes: Costs::nothing_yet() }
+        Self { bytes: Costs::nothing_yet() }
     }
 
     /// A write of `len` bytes took `took` nanoseconds.
@@ -214,18 +213,15 @@ impl Writes {
         self.bytes.learn(len, took);
     }
 
-    /// A poll that gave its shard up came back to write `held` nanoseconds into its next poll.
-    pub fn resumed(&self, held: u64) {
-        self.resumes.learn(1, held);
-    }
-
-    /// The most bytes a write may carry in `room` nanoseconds (negative: its poll is past its quantum by that): those whose
-    /// cost past it is expected to be no more than a poll's coming back to write the rest ([`Costs::fit`]), so what a poll
-    /// writes past its quantum in all is. None until a write was timed: the first goes whole, and teaches. Until a poll came
-    /// back, putting the rest off is taken to cost nothing: what fits at the dearest.
+    /// The most bytes a write may carry in `room` nanoseconds, what's left of its poll's quantum (negative: the poll is past
+    /// it by that, and none fits): those whose cost at the dearest its window holds ends within it ([`Costs::fit`], nothing
+    /// put off). None until a write was timed: the first goes whole, and teaches. A write isn't let run past its poll's
+    /// quantum by what coming back to write the rest is expected to cost (goal 9, plan 01a1a87b2cec step 3: that held the
+    /// shard past the quantum by as much, and coming back was learned on the clock, the host's preemption and a core clocked
+    /// down in it: probe 17 on the M3, its clocks kept up, saw 256 KiB written in 99 µs with 4 µs of its poll's quantum left,
+    /// held to 18.7 MB).
     pub fn fitting(&self, room: i64) -> Option<usize> {
-        let defer = self.resumes.mean().map_or(0, |ns| ns as u64);
-        self.bytes.fit(room, defer).map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+        self.bytes.fit(room, 0).map(|n| usize::try_from(n).unwrap_or(usize::MAX))
     }
 }
 
@@ -273,30 +269,14 @@ mod tests {
         assert!(fit.is_some_and(|n| n.saturating_mul(10) <= 250_000), "{fit:?} bytes: past 250 µs at 10 ns a byte");
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 3: once a poll that gave its shard up is known to cost something as it comes back,
-    /// rare dear writes count for their share: a write may run past its room by what's expected to cost no more than coming
-    /// back. Do: as above, then polls that came back 2 µs into their next. Expect: more than fits at the dearest, less than
-    /// at the cheapest.
+    /// Goal 9, plan 01a1a87b2cec step 3: a write is held to what's left of its poll's quantum, its bytes at the dearest they
+    /// cost, and none fits where nothing's left or the poll is past it. Do: writes at 2 ns a byte. Expect: 1,500 bytes fit
+    /// 3 µs; none fits no room, nor 2 µs past it.
     #[test]
-    fn g9_s3_coming_back_weighs_rare_dear_writes_by_their_share() {
-        let w = Writes::nothing_yet();
-        for k in 0..100 {
-            w.learn(64 << 10, if k == 10 || k == 40 { 655_360 } else { 65_536 });
-        }
-        w.resumed(2_000);
-        let fit = w.fitting(250_000);
-        assert!(fit.is_some_and(|n| n > 25_000 && n < 250_000), "{fit:?}");
-    }
-
-    /// Goal 9, plan 01a1a87b2cec step 3: what a poll writes past its quantum in all is what coming back costs, not that
-    /// again with each write: the room is negative once the poll is past it, and what's past counts. Do: writes at 2 ns a
-    /// byte, coming back 3 µs. Expect: 1,500 bytes fit no room left, 500 fit 2 µs past it, none 3 µs past it.
-    #[test]
-    fn g9_s3_a_poll_past_its_quantum_writes_no_more_than_coming_back_costs() {
+    fn g9_s3_a_write_is_held_to_what_is_left_of_its_polls_quantum() {
         let w = Writes::nothing_yet();
         w.learn(64 << 10, 131_072);
-        w.resumed(3_000);
-        assert_eq!((w.fitting(0), w.fitting(-2_000), w.fitting(-3_000), w.fitting(-9_000)), (Some(1_500), Some(500), Some(0), Some(0)));
+        assert_eq!((w.fitting(3_000), w.fitting(0), w.fitting(-2_000)), (Some(1_500), Some(0), Some(0)));
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: no gain is picked; the sketch forgets by halving each window. Do: a window of jobs

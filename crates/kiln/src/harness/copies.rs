@@ -4657,9 +4657,14 @@ struct Turn {
 }
 
 impl Turn {
+    /// A turn from the start of the poll it's begun in, where that's a shard's: what the poll did before it (the wake its wait
+    /// ended in, a chunk read back taken in) is the turn's time too, as the shard counts the poll's (goal 9, plan 01a1a87b2cec
+    /// step 3: probe 17's owners began their turns some microseconds into their polls, which then ended past the quantum by
+    /// as much).
     fn new() -> Self {
         let now = Instant::now();
-        Self { began: now, cpu: hyper_rt::futures::thread_run_ns(), looked: Cell::new(now), longest: Cell::new(Duration::ZERO) }
+        let began = hyper_rt::futures::poll_clock().and_then(|p| now.checked_sub(Duration::from_nanos(p.held_ns()))).unwrap_or(now);
+        Self { began, cpu: hyper_rt::futures::thread_run_ns(), looked: Cell::new(now), longest: Cell::new(Duration::ZERO) }
     }
 
     /// How long it's held its shard so far: on the CPU where its thread says (step 3's bar is a poll's time there, the host's
@@ -4676,12 +4681,15 @@ impl Turn {
         hyper_rt::futures::step_budget_ns().map(Duration::from_nanos)
     }
 
-    /// Whether a piece expected to take `piece` would still end within the quantum.
-    fn fits(&self, piece: Duration) -> bool {
-        self.fits_at(Instant::now(), Self::quantum(), piece)
+    /// Whether a message expected to take `expected` goes in this turn: where it would still end within the quantum; one
+    /// whose kind's cost nothing has taught yet waits for a turn of its own (it's taken first in the next, and teaches it),
+    /// rather than being taken as if it cost nothing. Off a shard every message goes in.
+    fn takes(&self, expected: Option<Duration>) -> bool {
+        let quantum = Self::quantum();
+        quantum.is_none() || expected.is_some_and(|e| self.fits_at(Instant::now(), quantum, e))
     }
 
-    /// [`Turn::fits`] at `now`, against `quantum`.
+    /// Whether a piece expected to take `piece` would still end within `quantum`, at `now` ([`Turn::takes`]).
     fn fits_at(&self, now: Instant, quantum: Option<Duration>, piece: Duration) -> bool {
         quantum.is_none_or(|q| now.saturating_duration_since(self.began).saturating_add(piece) < q)
     }
@@ -4694,28 +4702,31 @@ impl Turn {
     /// After a piece, at `now`: whether the next, expected to take `next` and taken to be as long as the longest yet (the one
     /// just done among them), with `room` after it for what ends its message, would end past `quantum`. So a turn ends within
     /// the quantum where its pieces don't outgrow what's expected of them; one that looked only for its quantum to have
-    /// passed held its shard a piece past it, and what ends the message (an update's commit) past that.
-    fn over_at(&self, now: Instant, quantum: Option<Duration>, next: Duration, room: Duration) -> bool {
+    /// passed held its shard a piece past it, and what ends the message (an update's commit) past that. With nothing learned of
+    /// what ends a message (`room` none) the turn ends at this look, and the take teaches it: taken as nothing, it left no room
+    /// for it, and an owner's first updates of a fresh server ran their tails past the quantum. Off a shard none ends.
+    fn over_at(&self, now: Instant, quantum: Option<Duration>, next: Duration, room: Option<Duration>) -> bool {
         let piece = now.saturating_duration_since(self.looked.get());
         self.looked.set(now);
         let longest = self.longest.get().max(piece);
         self.longest.set(longest);
-        !self.fits_at(now, quantum, longest.max(next).saturating_add(room))
+        quantum.is_some() && room.is_none_or(|room| !self.fits_at(now, quantum, longest.max(next).saturating_add(room)))
     }
 }
 
 /// What a piece of a kind whose pieces cost `costs` is expected to take at the most: the dearest its window holds, what
-/// `kiln_http::turn::Costs::fit` holds a unit to with nothing to put off (goal 9, plan 01a1a87b2cec step 3). None expected
-/// until one was taken.
-fn bound(costs: &kiln_http::turn::Costs) -> Duration {
-    Duration::from_nanos(costs.dearest().map_or(0, |ns| ns as u64))
+/// `kiln_http::turn::Costs::fit` holds a unit to with nothing to put off (goal 9, plan 01a1a87b2cec step 3). None until one
+/// was taken: not nothing.
+fn bound(costs: &kiln_http::turn::Costs) -> Option<Duration> {
+    costs.dearest().map(|ns| Duration::from_nanos(ns as u64))
 }
 
 /// What an owner's messages take, learned as it takes them (goal 9, plan 01a1a87b2cec step 3): each kind's start (a message
-/// whole, or an update's head and first event, up to the first look at its events), and the tail of an update its turn ran
-/// out in (from that look on: its copy's commit, its frame, what it tells the rest of kiln), each a piece a unit
+/// whole, or an update's head and first event, up to the first look at its events), and the tail after an update's last look
+/// at its events, the one its turn ran out at where it did (from that look on: its last events, its copy's commit, its frame,
+/// what it tells the rest of kiln; [`Costs::took`]), each a piece a unit
 /// (`kiln_http::turn::Costs`), and what one is expected to take the dearest its window holds ([`bound`]). A turn takes a
-/// message only where what it's expected to take still ends within the quantum ([`Turn::fits`]), and an update's events
+/// message only where what it's expected to take still ends within the quantum ([`Turn::takes`]), and an update's events
 /// only while the next and that tail do ([`Turn::over_at`]): a turn that took the next message while its last piece did held
 /// its shard past the quantum by as much as that message took past it (a state after an update's events), and by its
 /// commit. It was RFC 6298's mean and four deviations (gains 1/8 and 1/4, K = 4, all picked), which forgot a kind's rare dear
@@ -4740,10 +4751,12 @@ impl Costs {
     }
 
     /// What taking `msg` is expected to take: its kind's start, and for an update's events the tail after them, its first
-    /// event written out ([`write_ns`]) where that's more.
-    fn expected(&self, msg: &Msg) -> Duration {
+    /// event written out ([`write_ns`]) where that's more. None while what it's made of is unlearned: its kind's start, or
+    /// for an update of several events the tail after its last look (one of a single event has no look in it: its start is
+    /// its whole).
+    fn expected(&self, msg: &Msg) -> Option<Duration> {
         let label = label_of(msg);
-        let start = self.kinds.iter().find(|(l, _)| std::ptr::eq(*l, label)).map_or(Duration::ZERO, |(_, c)| bound(c));
+        let start = self.kinds.iter().find(|(l, _)| std::ptr::eq(*l, label)).and_then(|(_, c)| bound(c));
         let u = match msg {
             Msg::Update(i) => &i.u,
             Msg::Runner(r) => &r.update,
@@ -4751,41 +4764,70 @@ impl Costs {
             Msg::Run(_) | Msg::Work(_) | Msg::Each(_) => return start,
         };
         match u {
-            Update::Events { events } => start.max(Duration::from_nanos(events.first().map_or(0, write_ns))).saturating_add(bound(&self.tail)),
+            Update::Events { events } => {
+                let first = start?.max(Duration::from_nanos(events.first().map_or(0, write_ns)));
+                match bound(&self.tail) {
+                    Some(tail) => Some(first.saturating_add(tail)),
+                    None if events.len() <= 1 => Some(first),
+                    None => None,
+                }
+            }
             _ => start,
         }
     }
 
     /// `msg` taken by `shard` in `turn`: what's left of it when the turn ran out in its events, and how long it took, both
-    /// learned (its start, and the tail after the look that ended its turn).
+    /// learned ([`Costs::took`]).
     fn take(&mut self, shard: &mut Shard, msg: Msg, hub: Option<&Arc<Hub>>, turn: &Turn) -> (Option<Msg>, Duration) {
         let label = label_of(&msg);
         let (quantum, room) = (Turn::quantum(), bound(&self.tail));
         let began = Instant::now();
         turn.begin(began);
-        // The first look at its events, and the one that ended its turn.
-        let (first, ran_out) = (Cell::new(None::<Instant>), Cell::new(None::<Instant>));
+        let looks = Looks::default();
         let over = |next_ns: u64| {
             let now = Instant::now();
-            if first.get().is_none() {
-                first.set(Some(now));
-            }
-            let over = turn.over_at(now, quantum, Duration::from_nanos(next_ns), room);
-            if over {
-                ran_out.set(Some(now));
-            }
-            over
+            looks.saw(now);
+            turn.over_at(now, quantum, Duration::from_nanos(next_ns), room)
         };
         let left = shard.take(msg, hub, &over);
         // What was written out off the shard for this take alone: one it didn't take (its update gone meanwhile) isn't kept.
         shard.written = None;
         shard.off_written = None;
         let end = Instant::now();
-        self.learn(label, nanos(first.get().unwrap_or(end).saturating_duration_since(began)));
-        if let Some(at) = ran_out.get() {
+        self.took(label, began, &looks, end);
+        (left, end.saturating_duration_since(began))
+    }
+
+    /// What a take of kind `label`, begun at `began` and ended at `end`, teaches as its `looks` at its events went: its kind's
+    /// start, up to its first look (its whole where it had none), and the tail after its last look (the one that ended its
+    /// turn, where one did: none follows it) to its end, its last events, its commit, its frame and what it tells the rest of
+    /// kiln, which a turn leaves room for at each look ([`Turn::over_at`]). Every take that looked teaches it, not only one its
+    /// turn ran out in (goal 9, plan 01a1a87b2cec step 3): learned from those alone, probe 15's owners on the M3 had learned
+    /// no tail before 13 of their 23 longest takes, left no room for one, and ran 3 to 36 µs past the quantum, three of them
+    /// with a whole update taken.
+    fn took(&mut self, label: &'static hyper_rt::slow::Label, began: Instant, looks: &Looks, end: Instant) {
+        self.learn(label, nanos(looks.first.get().unwrap_or(end).saturating_duration_since(began)));
+        if let Some(at) = looks.last.get() {
             self.tail.learn(1, nanos(end.saturating_duration_since(at)));
         }
-        (left, end.saturating_duration_since(began))
+    }
+}
+
+/// A take's looks at its events ([`Costs::take`]): its first, and its last, the one that ended its turn where one did (no
+/// look follows that one).
+#[derive(Default)]
+struct Looks {
+    first: Cell<Option<Instant>>,
+    last: Cell<Option<Instant>>,
+}
+
+impl Looks {
+    /// A look at `now`.
+    fn saw(&self, now: Instant) {
+        if self.first.get().is_none() {
+            self.first.set(Some(now));
+        }
+        self.last.set(Some(now));
     }
 }
 
@@ -5266,7 +5308,7 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
         // What's waiting already goes in the same turn, where it's expected to end within the quantum.
         let mut next = Some(msg);
         while let Some(msg) = next.take() {
-            if !fresh && !turn.fits(costs.expected(&msg)) {
+            if !fresh && !turn.takes(costs.expected(&msg)) {
                 rest = Some(msg);
                 break;
             }
@@ -7427,7 +7469,7 @@ mod tests {
             let mut at = t0;
             for _ in 0..1000 {
                 at = at.checked_add(piece)?;
-                if turn.over_at(at, Some(quantum), next, room) {
+                if turn.over_at(at, Some(quantum), next, Some(room)) {
                     return Some(at.saturating_duration_since(t0));
                 }
             }
@@ -7442,7 +7484,7 @@ mod tests {
         let turn = turn_at(t0);
         assert!(turn.fits_at(t0 + us(200), Some(quantum), us(60)), "60 µs from 200 µs ends within it");
         assert!(!turn.fits_at(t0 + us(210), Some(quantum), us(60)), "from 210 µs it wouldn't");
-        assert!(turn.fits_at(t0 + Duration::from_secs(1), None, Duration::from_secs(1)) && !turn.over_at(t0 + Duration::from_secs(1), None, Duration::from_secs(1), Duration::from_secs(1)), "off a shard nothing ends a turn");
+        assert!(turn.fits_at(t0 + Duration::from_secs(1), None, Duration::from_secs(1)) && !turn.over_at(t0 + Duration::from_secs(1), None, Duration::from_secs(1), Some(Duration::from_secs(1))), "off a shard nothing ends a turn");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: a kind's rare dear starts keep a turn from taking the next of its kind where it
@@ -7455,13 +7497,13 @@ mod tests {
         let us = Duration::from_micros;
         let job = || Msg::Run(Box::new(|_: &mut Shard| {}));
         let mut costs = Costs::default();
-        assert_eq!(costs.expected(&job()), Duration::ZERO, "nothing expected before one was taken");
+        assert_eq!(costs.expected(&job()), None, "nothing expected before one was taken");
         for k in 1..=130u64 {
             costs.learn(label_of(&job()), if k % 20 == 0 && k <= 120 { 150_000 } else { 10_000 });
         }
         let (t0, quantum) = (Instant::now(), Duration::from_nanos(crate::rt::STEP_BUDGET_NS));
         let turn = turn_at(t0);
-        let expected = costs.expected(&job());
+        let expected = costs.expected(&job()).unwrap_or_default();
         assert!(!turn.fits_at(t0 + quantum.saturating_sub(us(100)), Some(quantum), expected), "a job expected to take {expected:?} went into the turn's last 100 µs");
         assert!(turn.fits_at(t0 + quantum.saturating_sub(us(200)), Some(quantum), expected), "{expected:?} fits 200 µs");
     }
@@ -7478,20 +7520,101 @@ mod tests {
         let first = Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: Body::Assistant { text: "said".into(), streaming: false } };
         let events = || update(Update::Events { events: vec![first.clone()] });
         let mut costs = Costs::default();
-        assert_eq!(costs.expected(&job()), Duration::ZERO, "nothing before one was taken");
+        assert_eq!(costs.expected(&job()), None, "nothing before one was taken");
         costs.learn(label_of(&job()), 120_000);
-        assert_eq!(costs.expected(&job()), us(120), "a job: the dearest of its starts");
+        assert_eq!(costs.expected(&job()), Some(us(120)), "a job: the dearest of its starts");
         costs.learn(label_of(&events()), 20_000);
         costs.tail.learn(1, 30_000);
         // Its first event's writing is learned by every owner as they write (the tests beside this one's too): a few bytes', far
         // under the start learned here.
         let got = costs.expected(&events());
-        assert!(got >= us(20) + us(30) && got < us(20) + us(30) + Duration::from_millis(1), "an update's events: its start, then its tail: {got:?}");
-        assert_eq!(costs.expected(&update(Update::Closed)), Duration::ZERO, "another kind isn't these");
+        assert!(got.is_some_and(|got| got >= us(20) + us(30) && got < us(20) + us(30) + Duration::from_millis(1)), "an update's events: its start, then its tail: {got:?}");
+        assert_eq!(costs.expected(&update(Update::Closed)), None, "another kind isn't these");
         let t0 = Instant::now();
         let (turn, quantum) = (turn_at(t0), Some(Duration::from_nanos(crate::rt::STEP_BUDGET_NS)));
-        assert!(!turn.fits_at(t0 + us(150), quantum, costs.expected(&job())), "a job expected to take 120 µs from 150 µs waits for the next turn");
+        assert!(costs.expected(&job()).is_some_and(|e| !turn.fits_at(t0 + us(150), quantum, e)), "a job expected to take 120 µs from 150 µs waits for the next turn");
         assert!(turn.fits_at(t0 + us(100), quantum, us(150)), "one expected to take 150 µs from 100 µs goes in this one");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: every take that looked at its events teaches the tail after its last look to its end,
+    /// whether its turn ran out there or the update was taken whole; one that looked at none (a job, a single event) teaches its
+    /// kind's start, its whole, and no tail. Taught only by takes its turn ran out in, probe 15's owners on the M3 had learned no
+    /// tail before 13 of their 23 longest takes, left no room for one, and ran 3 to 36 µs past the quantum.
+    #[test]
+    fn g9_s3_every_take_that_looks_at_its_events_teaches_its_tail() {
+        let us = Duration::from_micros;
+        let job = || Msg::Run(Box::new(|_: &mut Shard| {}));
+        let events = || Msg::Update(Box::new(Ingest { from: Location::Local, id: "s".into(), u: Update::Events { events: Vec::new() }, shipped: true, reported: String::new(), came: None }));
+        let looked = |at: &[Duration], t0: Instant| {
+            let looks = Looks::default();
+            for d in at {
+                looks.saw(t0 + *d);
+            }
+            looks
+        };
+        let t0 = Instant::now();
+        let mut costs = Costs::default();
+        costs.took(label_of(&job()), t0, &Looks::default(), t0 + us(30));
+        assert_eq!((costs.expected(&job()), bound(&costs.tail)), (Some(us(30)), None), "a job: its start its whole, no tail");
+        costs.took(label_of(&events()), t0, &looked(&[us(10), us(120), us(200)], t0), t0 + us(245));
+        assert_eq!(bound(&costs.tail), Some(us(45)), "an update taken whole: the tail after its last look");
+        costs.took(label_of(&events()), t0, &looked(&[us(5), us(150)], t0), t0 + us(210));
+        assert_eq!(bound(&costs.tail), Some(us(60)), "one its turn ran out in at 150 µs: the tail after that look, the dearest held");
+        let expected = costs.expected(&events());
+        assert!(expected.is_some_and(|e| e >= us(10) + us(60)), "an update's start (10 µs to its first look) and the tail after its events: {expected:?}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what an owner hasn't learned is taken as unknown, not as costing nothing. A message of a
+    /// kind no take has taught waits for a turn of its own, where it goes first (off a shard every message goes in); an update
+    /// of several events whose tail nothing taught is expected at nothing yet, while one of a single event is its start; and a
+    /// turn that knows nothing of what ends a message ends at its first look, and the take teaches it. Taken as nothing, an
+    /// owner's first updates on a fresh server left no room for their tails, and the lab's fills held their shards past the
+    /// quantum (probe 17, the M3 with its clocks kept up: the owners' the only listed path past it).
+    #[test]
+    fn g9_s3_an_owner_takes_no_cost_it_hasnt_learned_as_nothing() -> anyhow::Result<()> {
+        let us = Duration::from_micros;
+        let events = |n: u64| {
+            use crate::harness::model::{Body, Event};
+            let e = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: "said".into(), streaming: false } };
+            Msg::Update(Box::new(Ingest { from: Location::Local, id: "s".into(), u: Update::Events { events: (1..=n).map(e).collect() }, shipped: true, reported: String::new(), came: None }))
+        };
+        let mut costs = Costs::default();
+        costs.learn(label_of(&events(1)), 20_000);
+        let one = costs.expected(&events(1));
+        assert!(one.is_some_and(|e| e >= us(20)), "an update of one event: its start, though no tail was taught: {one:?}");
+        assert_eq!(costs.expected(&events(3)), None, "an update of several: unknown while its tail is");
+        costs.tail.learn(1, 40_000);
+        let several = costs.expected(&events(3));
+        assert!(several.is_some_and(|e| e >= us(60)), "taught its tail: its start and that: {several:?}");
+        let t0 = Instant::now();
+        assert!(turn_at(t0).over_at(t0 + us(10), Some(us(266)), us(5), None), "nothing taught of what ends it: the turn ends at its first look");
+        assert!(!turn_at(t0).over_at(t0 + us(10), None, us(5), None), "off a shard none ends");
+        assert!(turn_at(t0).takes(None), "off a shard a message of an untaught kind goes in");
+        crate::rt::block_on(async move {
+            let turn = Turn::new();
+            anyhow::ensure!(!turn.takes(None), "on a shard, a message of a kind nothing taught waits for a turn of its own");
+            anyhow::ensure!(turn.takes(Some(us(10))), "one taught to be short goes in");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a turn begun in a poll counts that poll's time before it, as the shard counts the poll.
+    /// Do: on a shard, hold the poll 50 µs, then begin a turn; off a shard, begin one. Expect: the first has held its shard
+    /// 50 µs as it begins; the second began as it was made.
+    #[test]
+    fn g9_s3_a_turn_begins_at_its_polls_start() -> anyhow::Result<()> {
+        let held = Duration::from_micros(50);
+        let began = crate::rt::block_on(async move {
+            while hyper_rt::futures::poll_clock().is_some_and(|p| p.held_ns() < u64::try_from(held.as_nanos()).unwrap_or(u64::MAX)) {
+                std::hint::spin_loop();
+            }
+            anyhow::ensure!(hyper_rt::futures::poll_clock().is_some(), "the test's task polls on a shard");
+            Ok(Turn::new().began.elapsed())
+        })?;
+        anyhow::ensure!(began >= held, "a turn begun {held:?} into its poll had held its shard {began:?}");
+        let off = Turn::new().began.elapsed();
+        anyhow::ensure!(off < held, "off a shard a turn begins as it's made: {off:?}");
+        Ok(())
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: an event under a number its copy has with another id (the timeline went another way)
@@ -8252,8 +8375,8 @@ mod tests {
         let mut costs = Costs::default();
         costs.learn(label_of(&spill()), 200_000);
         costs.learn(label_of(&compact()), 5_000);
-        assert!(costs.expected(&spill()) >= us(200) && costs.expected(&compact()) < us(20), "{:?} {:?}", costs.expected(&spill()), costs.expected(&compact()));
-        assert_eq!(costs.expected(&other()), Duration::ZERO, "a person's command is neither");
+        assert!(costs.expected(&spill()).is_some_and(|e| e >= us(200)) && costs.expected(&compact()).is_some_and(|e| e < us(20)), "{:?} {:?}", costs.expected(&spill()), costs.expected(&compact()));
+        assert_eq!(costs.expected(&other()), None, "a person's command is neither");
     }
 
     /// Says, as it's dropped, whether the thread it's dropped on runs a shard.

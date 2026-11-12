@@ -374,16 +374,19 @@ API, roadmap or trust model is Ada's to decide, marked **[Ada]** here and listed
 - **Changes offered back** as branches are welcome, through Mantle's gates and CI like any change.
 
 As kiln vendored it (2026-11-01, CP-T10.2, on Ada's word: Mantle at the head of its main, kiln's
-one copy of hyper-raft kept, and no step back from kiln's aws-lc-rs):
+one copy of hyper-raft kept, and no step back from kiln's aws-lc-rs), and refreshed (2026-11-12, Ada's
+word: "vendoring a recent copy of Mantle into Kiln as we currently do and using it (Mantle is the
+object store) is wise"):
 
-- **Mantle** at `17eb8032`, its main's head, at `vendor/mantle`, in `vendor/MANIFEST.toml` with
+- **Mantle** at `87ab09e1` (2026-11-08), its main's head as kiln took it (`17eb8032` before), at `vendor/mantle`, in `vendor/MANIFEST.toml` with
   `vendor/mantle/UPSTREAM.md`: its crates, root manifest, `Cargo.lock`, `rust-toolchain.toml`,
   settings and scripts. Left out: its `vendor/`, `docs/`, drawings and CI (`.github/`, `.kiln/`).
-- **hyper-raft:** the one copy is kiln's, `vendor/hyper-raft`, at `0856e05`: hyper-raft's main
-  (`22d5037`) merged with Mantle's line (`0a182ae`). Mantle's crates take it by path, the change kiln
+- **hyper-raft:** the one copy is kiln's, `vendor/hyper-raft`, at `fb74b59`: hyper-raft's main, which
+  holds what Mantle's main snapshots (`5e40eb9`: Mantle's line `0a182ae` and the driver fix main
+  landed as `fb74b59`, a driver reading what its sockets took before it judges its timers). Mantle's crates take it by path, the change kiln
   records to Mantle's manifests (`vendor/patches/mantle/0001-…`), and Mantle's code states the two
-  limits main added as they were before them (`0002-…`). Quiver (`ba41732`) and Focal's bus
-  (`9aded7cd`) build on the same copy.
+  limits main added as they were before them (`0002-…`). Quiver (`966ea139`, which took `fb74b59`
+  for this) and Focal's bus (`9aded7cd`) build on the same copy.
 - **aws-lc-rs:** 1.18.2, kiln's release, at `vendor/aws-lc-rs`, with Mantle's changes, which apply
   unchanged on 1.18.2. kiln's root and Mantle's `[patch.crates-io]` both point at it.
 - **aws-lc-sys** stays crates.io's 0.46.0. Of Mantle's four changes to its 0.45.0, 0.46.0 holds the
@@ -420,18 +423,18 @@ one copy of hyper-raft kept, and no step back from kiln's aws-lc-rs):
   hyper-rt, opted into with `[blobs] store = "mantle"` (docs/blobs.md, "The Mantle store"). It's a
   client of a cell kiln doesn't run: no node starts inside kiln (R1), and production's store stays
   as it is until Ada moves it.
-- **One revision:** Mantle `17eb8032` builds on kiln's hyper-raft `0856e05` and aws-lc-rs 1.18.2
+- **One revision:** Mantle `87ab09e1` builds on kiln's hyper-raft `fb74b59` and aws-lc-rs 1.18.2
   (Vendoring, above), so the client links the hyper-rt, transport and TLS kiln already links.
 - **What it keeps where:** a key's object is a pointer, naming its content's SHA-256, its size and
   its bytes' native ETag, to bytes kept once by their SHA-256; Mantle's preconditions on the
   pointer make the seam's conditional writes, and uploads in parts are kept in the cell until
   they complete.
-- **Through S3** (kiln's `s3` store against Mantle's listener): not yet. At `17eb8032` the listener
+- **Through S3** (kiln's `s3` store against Mantle's listener): not yet. At `87ab09e1`, as at `17eb8032`, the listener
   answers CopyObject and UploadPartCopy `501` and keeps no metadata kiln sets, and kiln's S3 store
   needs both (docs/blobs.md, "The S3 store"). The native store needs neither.
 - **What the client leaves to kiln:** asking again a request whose answer was lost, and telling
   whether it had been applied. mantle-client's docs say an ask again with its identity is answered
-  from what it made; at 17eb8032 that holds for a native upload's Finish, not for a put, which the
+  from what it made; at 87ab09e1, as at 17eb8032, that holds for a native upload's Finish, not for a put, which the
   Name range judges afresh (it knows a write again by the file its gateway wrote), so kiln reads
   the key (docs/blobs.md, "Asked again"). Mantle's to say whether a put's identity should hold.
 - **Custody (W27-R08; the Transfers plan's step 12):** puts and whole reads are signed for as every
@@ -441,7 +444,9 @@ one copy of hyper-raft kept, and no step back from kiln's aws-lc-rs):
   QUIC in 214 s, BLOBS-90's 1001 objects in 58 s; again with each mutation's first answer lost
   (chaos `mantle_lost`), 163 of 163 in 296 s, BLOBS-90 in 104 s, no upload left open; and the
   W27-R08 custody test: a put and its read back walk as hand-on and receipt by SHA-256, and bytes
-  changed in the cell are refused and the break recorded.
+  changed in the cell are refused and the break recorded. Again at `87ab09e1` on hyper-raft `fb74b59`
+  (11-12, on fedora, kiln's part-4 tree `c1d95fff0`): the suite and the custody test pass, 181 s for
+  both.
 - **Not yet:** collecting the bytes no pointer names and the uploads left open; `Full` for a cell
   out of space (it's `Unavailable`, with Mantle's status). Placement, repair, scrub and moving
   production's bytes are T10's, and Ada's to decide.

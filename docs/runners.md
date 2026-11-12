@@ -110,6 +110,7 @@ What a runner reports of itself (W13-R01; `kiln runners facts <name>` shows them
 | `gpu.count`, `gpu.model`, `gpu.vendor`, `gpu.memory` | its GPUs; for `gpus=N`, each requested card must meet the model/vendor/memory predicates |
 | `gpu.memory.total`, `gpu.memory.free`, `gpu.utilization` | measured device memory free (bytes) and utilization (thousandths); unknown when the provider cannot read it |
 | `virt.kvm`, `virt.hvf`, `virt.nested` | the virtualization it offers |
+| `virt.microvm` | it starts microVMs itself (the need `microvm`): a hypervisor it can use and the runtime kiln carries from kiln plan 01a1cd8e862e7169a074db3d5fa33f3d's step 16 |
 | `executors`, `executors.<name>` | executors that work there (`docker`, `firecracker`), and each one's version |
 | `binfmt` | platforms it runs under emulation (`linux/arm64`) |
 | `tools`, `tools.<name>` | tools on its PATH, and each one's version (`tools.cargo >= 1.90`) |
