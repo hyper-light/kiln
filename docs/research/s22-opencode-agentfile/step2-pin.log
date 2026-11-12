@@ -1,0 +1,12 @@
+pin.sh 2026-11-12T08:51:53Z on Darwin arm64, gh 2.98.0
+endpoint https://opencode.ai/update/api/latest/cli/npm: version 2.2.7, commit 5f76acb12572932297cbce81bd0026e59b16e7ac, run 42778325289, refs/heads/dev
+pinning 2.2.7
+tag v2.2.7: commit fedc6f208aa2bd54c1019227214568083f6380ad; SHA256SUMS sha256 72c73a07124c65662239facaa7da2f3fe474078bbd4cbfa68bf90ae8fdca3b8b
+opencode-linux-x64-baseline.tar.gz: 121783361 bytes, sha256 89a6cee227b54bc011179c528a5e63176032462b1a5e21723b616801cddc2ca7; SHA256SUMS, GitHub digest, provenance (https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev, 5f76acb12572932297cbce81bd0026e59b16e7ac, run 42778325289) ok; opencode 258848944 bytes, sha256 589253d36810f21217edd51545cd435b328cdc3cf4f451fbe0cce6f88afcf5e1
+opencode-linux-x64-baseline-musl.tar.gz: 121562329 bytes, sha256 c1801a36bf61e03eafac8d7f4521a200e4d3cd76cf43b36621cb78b460b851ee; SHA256SUMS, GitHub digest, provenance (https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev, 5f76acb12572932297cbce81bd0026e59b16e7ac, run 42778325289) ok; opencode 261027240 bytes, sha256 aeae3102ab6360a0ac3ea56537a643cd02727f766a1da30cb770240f7bf1cf02
+opencode-linux-arm64.tar.gz: 120326654 bytes, sha256 c1682057f0815cb2abdd6e00305f1146ebaf1c167f0335cdb74ddc80008120e7; SHA256SUMS, GitHub digest, provenance (https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev, 5f76acb12572932297cbce81bd0026e59b16e7ac, run 42778325289) ok; opencode 253873144 bytes, sha256 c577783eacf7d1e66661fc7fd904b7646761497b687ff8f8f82ebe4f2f3ea425
+opencode-linux-arm64-musl.tar.gz: 119600531 bytes, sha256 a03405f94ae02db7acb0870cf32030bab86460dc7faf524780e9cae305526b96; SHA256SUMS, GitHub digest, provenance (https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev, 5f76acb12572932297cbce81bd0026e59b16e7ac, run 42778325289) ok; opencode 253697128 bytes, sha256 b4203e9861d0472e711493a34e8d843fb249cf9bf499b69cfdc64416085d87c6
+LICENSE at fedc6f208aa2bd54c1019227214568083f6380ad: MIT, 1065 bytes, sha256 625f0f619133f89bbbb2abe37369613dfa1885eba1e50d02170deb62bb42cb6b
+x64 is baseline: {'gnu': True, 'musl': True}
+wrote /Users/adalundhe/Projects/kiln/.claude/worktrees/s22-opencode-agentfile/.kiln/images/harness-opencode/pin.json
+exit=0

@@ -1,0 +1,27 @@
+M8D run 2026-11-12T08:01:54Z host adacachy2 Linux 7.3.3-1-cachyos x86_64
+ARCHIVE opencode-linux-x64-musl.tar.gz sha256=c1801a36bf61e03eafac8d7f4521a200e4d3cd76cf43b36621cb78b460b851ee
+ROOTFS alpine-minirootfs-3.22.2-x86_64.tar.gz sha256=412454ed98025ad9cd910d13f3d448b184e81502baa83180e89f98d0f13674be match
+--- musl build on Alpine, no libstdc++
+Error loading shared library libstdc++.so.6: No such file or directory (needed by /oc/opencode)
+Error relocating /oc/opencode: _ZSt20__throw_length_errorPKc: symbol not found
+EXIT 127
+--- apk add libstdc++
+(1/2) Installing libgcc (14.2.0-r6)
+(2/2) Installing libstdc++ (14.2.0-r6)
+OK: 10 MiB in 18 packages
+--- musl build on Alpine with libstdc++, /proc and /tmp
+opencode v2.2.7
+EXIT 0
+--- debug paths with the XDG roots on /home/opencode
+home       /tmp
+data       /home/opencode/.local/share/opencode
+cache      /home/opencode/.cache/opencode
+config     /home/opencode/.config/opencode
+state      /home/opencode/.local/state/opencode
+tmp        /tmp/opencode
+bin        /home/opencode/.cache/opencode/bin
+log        /home/opencode/.local/share/opencode/log
+repos      /home/opencode/.local/share/opencode/repos
+db         /home/opencode/.local/share/opencode/opencode.db
+EXIT 0
+kiln_exit=0 tries=2

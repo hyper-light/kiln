@@ -1,0 +1,16 @@
+# kiln run r129 on jupiter (Windows x86_64): run.sh BUNDLE d523e8438c6698074692dc72805926faffddde11 16 clippy, its output as kiln returned it (exit 0)
+START 2026-11-12T22:06:30Z on Jupiter MINGW64_NT-10.0-26200 x86_64, 32 cores, -j 16, mode clippy
+bundle de796fd68d22914eebdb0ef22153b93572731375f918d96bf842eaae85b98f26
+at d523e843 opencode's archives through the one unpacker: its member held alone, read as the unpacker r | dirty 0 | rustc 1.99.0 (b940084d7 2026-09-28)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor\focal-bus\crates\focal-memory\src\budget.rs:235:18
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor\focal-bus\crates\focal-memory\src\budget.rs:467:14
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor\focal-bus\crates\focal-memory\src\budget.rs:1188:10
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor\focal-bus\crates\focal-memory\src\disk.rs:281:18
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor\focal-bus\crates\focal-memory\src\owner.rs:18:10
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+CLIPPY_EXIT=0 22:24:59

@@ -1,0 +1,36 @@
+# @google/gemini-cli 0.68.0 from npm: registry metadata, registry signature, tarball and the GitHub release bundle, 2026-11-12T07:03:43Z, on Adas-MacBook-Pro-2.local
+NAME @google/gemini-cli VERSION 0.68.0
+ENGINES {"node": ">=20"}
+BIN {"gemini": "bundle/gemini.js"}
+OPTIONAL_DEPENDENCIES {"node-pty": "1.0.0", "@github/keytar": "7.10.6", "@lydell/node-pty": "1.1.0", "@lydell/node-pty-linux-x64": "1.1.0", "@lydell/node-pty-win32-x64": "1.1.0", "@lydell/node-pty-darwin-x64": "1.1.0", "@lydell/node-pty-win32-arm64": "1.1.0", "@lydell/node-pty-darwin-arm64": "1.1.0"}
+DEPENDENCIES null
+TARBALL https://registry.npmjs.org/@google/gemini-cli/-/gemini-cli-0.68.0.tgz
+INTEGRITY sha512-eq7AWY+YCijNGKVwyiRjN+GuOdXU/djuOZhX18p+HDmNyUqFdqH7C5V6vDJLl1uffhRPhGijePV+YvY8lymrbQ==
+SHASUM 537f79f90283b963b2850110c404622591a67da7
+UNPACKED_SIZE 99143752 FILE_COUNT 449
+ATTESTATIONS null
+SIGNATURE keyid SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U
+SIGNATURE keyid SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U
+REGISTRY_KEY SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA ecdsa-sha2-nistp256 ecdsa-sha2-nistp256 expires 2025-01-29T00:00:00.000Z
+REGISTRY_KEY SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U ecdsa-sha2-nistp256 ecdsa-sha2-nistp256 expires None
+SIGNED_MESSAGE @google/gemini-cli@0.68.0:sha512-eq7AWY+YCijNGKVwyiRjN+GuOdXU/djuOZhX18p+HDmNyUqFdqH7C5V6vDJLl1uffhRPhGijePV+YvY8lymrbQ==
+REGISTRY_SIGNATURE 0 keyid=SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U openssl: Verified OK
+REGISTRY_SIGNATURE 1 keyid=SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U openssl: Verified OK
+TARBALL_SHA512 sha512-eq7AWY+YCijNGKVwyiRjN+GuOdXU/djuOZhX18p+HDmNyUqFdqH7C5V6vDJLl1uffhRPhGijePV+YvY8lymrbQ==
+TARBALL_SHA1 537f79f90283b963b2850110c404622591a67da7
+TARBALL_SHA256 325099ddcb56937c27d119e7297bfa8a5e29b529bae3c92fdf3b71a36d5fa006 SIZE 20975501
+TGZ_ENTRY_TYPES  449 -
+TGZ_TOP_LEVEL package 
+RELEASE_ASSET gemini-cli-bundle.zip size=21318442 digest=sha256:03b4b9e869de1a08181851cf3fc75031226e319da7e9750e96b942608a2ba33c url=https://github.com/google-gemini/gemini-cli/releases/download/v0.68.0/gemini-cli-bundle.zip
+RELEASE_ZIP_SHA256 03b4b9e869de1a08181851cf3fc75031226e319da7e9750e96b942608a2ba33c
+BUNDLE_COMPARE differ:
+Only in zipx/examples/custom-commands: .gitignore
+Only in zipx/examples/exclude-tools: .gitignore
+Only in zipx/examples/hooks: .gitignore
+Only in zipx/examples/mcp-server: .gitignore
+Only in zipx/examples/skills: .gitignore
+PACKAGE_JSON_VERSION 0.68.0
+BUNDLE_ENTRY_SHEBANG #!/usr/bin/env node
+VENDORED_RIPGREP 0 files
+NATIVE_MODULES 0 files
+UNPACKED_BYTES 99143752
