@@ -120,8 +120,9 @@ bundle, at the commit itself. At its end the tree was clean.
   their tests FAILED.
 - **kiln main 263cad6b4 itself fails** `step30_agentfiles_on_every_surface` (exit 101): the test holds
   the list to `[]`, and Goose's entry is on main. 5e296cac2 (step 20's step-2 subagent's a690a02c5,
-  the same lines as step 25's s25-devin-row) fixes it. ROOT was told; mail was refused (429), so a
-  resend runs until it is accepted.
+  the same lines as step 25's s25-devin-row) fixes it. Mail to ROOT never got through: a resend every
+  minute from 15:46 to 17:44Z was refused 89 times (429 backpressure, then os error 35) and stopped at
+  its two-hour limit. So the person was told in step 20's report instead.
 
 ## What changed from the plan's text, and why
 
