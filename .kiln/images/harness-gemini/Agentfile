@@ -1,0 +1,46 @@
+# Google's Gemini CLI as a kiln harness in a Shards microVM (kiln plan
+# 01a1cd8e862e7169a074db3d5fa33f3d, step 21; plan 01a1ce705e2374dfbac201fe6ba98184, research
+# 01a1ce705e2472df9f3dd81be0531c9f). kiln runs it as its ACP server, `gemini --acp` (Kind "gemini",
+# crates/kiln/src/harness/kinds.rs; f17). It comes in as pin.json pins it, in ./gemini-<arch>/:
+# Google's npm package, its registry signatures and SHA-512 checked by pin.sh, unpacked with its
+# package/ directory stripped; node/bin/node and node/LICENSE from Node.js's own Linux build, whose
+# SHA-256 Node's signed SHASUMS256.txt gives; and kiln's harness.json and system-settings.json.
+# Nothing else installs it, and no credential is in the image.
+
+# Google ships no Linux executable of Gemini CLI: its Linux build is the npm package, run by Node.js 20
+# or later (f5, f6). Node's Linux builds link glibc (2.28 at most), libstdc++ and libgcc_s (f12), and
+# Node publishes no arm64 musl build (f11): the base needs glibc, and bash for Gemini's shell tool
+# (f26), and the image has no libc variant. This default, step 19's, pinned by digest, has them all and
+# runs the harness with no RUN (f13); Alpine can't start it.
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+FROM ${BASE}
+
+# BuildKit sets TARGETARCH in the global scope, so the stage declares it to name each platform's
+# harness directory.
+ARG TARGETARCH
+HARNESS gemini FROM ./gemini-${TARGETARCH}
+
+# Its network reach, every part named (default deny): a network for this harness alone, which it joins
+# with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443 out,
+# opened at the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Every endpoint
+# Gemini CLI reaches by default speaks HTTPS (f27): Code Assist (cloudcode-pa.googleapis.com) for a
+# Google sign-in, the Gemini API (generativelanguage.googleapis.com) for a key, Google's OAuth
+# endpoints, and its usage statistics (play.googleapis.com). The npm registry, which only its update
+# check reaches, is never reached: kiln starts it over ACP, which checks for no update, and its system
+# settings turn the check off in every mode (f23). These are the bring-up's grants (Shards'
+# docs/examples/harness-claude) until step 9 grants providers by name. Nothing comes in; no other
+# port or protocol goes out.
+NETWORK --dns --egress=443/tcp provider FOR gemini
+EXPOSE --harnesses=gemini 443/tcp AS egress FOR provider
+CONNECT gemini WITH gemini ON provider
+
+# The project, which moves to its own host path with step 8, and the person's home. Gemini CLI keeps
+# its settings, its sign-in, its history, its projects and their memory under $HOME/.gemini (f20,
+# f21). A harness sees the image read-only, with its own /tmp scratch and these volumes alone
+# writable, so a home that is writable and kept from run to run must be a volume: the whole home is
+# the person's volume (step 7's shape) and harness.json sets HOME=/home/gemini. What the programs it
+# runs keep in a home lands there too. HOME in run.env needs a shards at or after 997f4e47e (release
+# v0.8.0 and later), where run.env replaces init's HOME=/tmp. Both volumes are the harness's alone,
+# and outside /tmp, which the scratch covers.
+VOLUME --target-kind=harness /workspace FOR gemini
+VOLUME --target-kind=harness /home/gemini FOR gemini

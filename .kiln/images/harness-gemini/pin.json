@@ -1,0 +1,147 @@
+{
+  "harness": "gemini",
+  "version": "0.68.0",
+  "channel": "latest",
+  "read_at": "2026-11-12T21:15:43Z",
+  "verified": {
+    "gemini": {
+      "how": "Every npm registry signature, ECDSA P-256 over <name>@<version>:<integrity>, verifies with the registry key of its keyid, and the tarball's SHA-512 is that integrity. Google publishes no provenance attestation for the package.",
+      "package": "@google/gemini-cli",
+      "integrity": "sha512-eq7AWY+YCijNGKVwyiRjN+GuOdXU/djuOZhX18p+HDmNyUqFdqH7C5V6vDJLl1uffhRPhGijePV+YvY8lymrbQ==",
+      "keys": "https://registry.npmjs.org/-/npm/v1/keys",
+      "keyids": [
+        "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U",
+        "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"
+      ],
+      "files": 449,
+      "entry": "bundle/gemini.js",
+      "engines": ">=20"
+    },
+    "node": {
+      "how": "The newest Node.js major in the node-version matrix of the 'Test (Linux)' job of Gemini CLI's ci.yml at its tag whose end in nodejs/Release's schedule is after the day pinned, at that major's newest release; SHASUMS256.txt.asc verified by gpgv against nodejs/release-keys' gpg-only-active-keys keyring at its commit, and each archive's SHA-256 is the signed one.",
+      "version": "v24.22.3",
+      "tested_majors": [
+        20,
+        22,
+        24
+      ],
+      "major": 24,
+      "end": "2028-04-30",
+      "ci": {
+        "url": "https://raw.githubusercontent.com/google-gemini/gemini-cli/v0.68.0/.github/workflows/ci.yml",
+        "sha256": "2cf6e7110cb88e9f4fdf3a63d320fe171eb6432d3da77da85e649fccb4f32539"
+      },
+      "schedule": {
+        "url": "https://raw.githubusercontent.com/nodejs/Release/main/schedule.json",
+        "sha256": "50fe35a4df02398f741fdffbc666aceca323fcdb7f46d05af93145bf610d0049"
+      },
+      "shasums": {
+        "url": "https://nodejs.org/dist/v24.22.3/SHASUMS256.txt.asc",
+        "sha256": "aaaff9ec5c8c5f0997786c06088134ddb4b21a41f74e872b30ed1acca309e2b5"
+      },
+      "signer": "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
+      "keyring": {
+        "url": "https://raw.githubusercontent.com/nodejs/release-keys/481637f813e912c4aa3622d7964ab426c97b8e8d/gpg-only-active-keys/pubring.kbx",
+        "commit": "481637f813e912c4aa3622d7964ab426c97b8e8d",
+        "sha256": "140f2ad5260fd62773b6243ce8e1d3009645d558f121b8262c55e383dc285932"
+      }
+    }
+  },
+  "base": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+  "smoke": {
+    "program": "node/bin/node",
+    "args": [
+      "/harness/gemini/bundle/gemini.js",
+      "--version"
+    ],
+    "stdout": "0.68.0"
+  },
+  "builds": [
+    {
+      "platform": "linux/amd64",
+      "files": [
+        {
+          "url": "https://registry.npmjs.org/@google/gemini-cli/-/gemini-cli-0.68.0.tgz",
+          "sha256": "325099ddcb56937c27d119e7297bfa8a5e29b529bae3c92fdf3b71a36d5fa006",
+          "size": 20975501,
+          "path": ".",
+          "unpack": {
+            "format": "tar.gz",
+            "strip": 1,
+            "unpacked_bytes": 99143752,
+            "entries": 449
+          }
+        },
+        {
+          "url": "https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-x64.tar.gz",
+          "sha256": "061ec3e3062115705b56b51fa9cc330ab50d34b6969387d4e4b1a50c6809acc2",
+          "size": 58330843,
+          "path": "node/bin/node",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "node-v24.22.3-linux-x64/bin/node",
+            "sha256": "a7ec1b37e6ff9d187e4198c5b6df9a4eb1c74dd31804fb3bac55cc4ceca1ac01",
+            "size": 126891984
+          }
+        },
+        {
+          "url": "https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-x64.tar.gz",
+          "sha256": "061ec3e3062115705b56b51fa9cc330ab50d34b6969387d4e4b1a50c6809acc2",
+          "size": 58330843,
+          "path": "node/LICENSE",
+          "mode": "0644",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "node-v24.22.3-linux-x64/LICENSE",
+            "sha256": "5888dbb9a1d2b18f2c3e6c5f6af1b39de658372b402a0577b002777f14c62ace",
+            "size": 157609
+          }
+        }
+      ]
+    },
+    {
+      "platform": "linux/arm64",
+      "files": [
+        {
+          "url": "https://registry.npmjs.org/@google/gemini-cli/-/gemini-cli-0.68.0.tgz",
+          "sha256": "325099ddcb56937c27d119e7297bfa8a5e29b529bae3c92fdf3b71a36d5fa006",
+          "size": 20975501,
+          "path": ".",
+          "unpack": {
+            "format": "tar.gz",
+            "strip": 1,
+            "unpacked_bytes": 99143752,
+            "entries": 449
+          }
+        },
+        {
+          "url": "https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-arm64.tar.gz",
+          "sha256": "261af2af250dfd7e9f25cf151d1b2713a0adf8f10a9ad116c4947f68627affe8",
+          "size": 58051304,
+          "path": "node/bin/node",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "node-v24.22.3-linux-arm64/bin/node",
+            "sha256": "8f9c2a55879e9705cb285b6cdd649d95df642c6720f052cb30f300d2677da99f",
+            "size": 123446736
+          }
+        },
+        {
+          "url": "https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-arm64.tar.gz",
+          "sha256": "261af2af250dfd7e9f25cf151d1b2713a0adf8f10a9ad116c4947f68627affe8",
+          "size": 58051304,
+          "path": "node/LICENSE",
+          "mode": "0644",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "node-v24.22.3-linux-arm64/LICENSE",
+            "sha256": "5888dbb9a1d2b18f2c3e6c5f6af1b39de658372b402a0577b002777f14c62ace",
+            "size": 157609
+          }
+        }
+      ]
+    }
+  ]
+}

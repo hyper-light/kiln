@@ -62,6 +62,19 @@ pub const ALL: &[Builtin] = &[
         pin: include_str!("../../../../.kiln/images/harness-cursor/pin.json"),
         files: &[("harness.json", include_str!("../../../../.kiln/images/harness-cursor/harness.json"))],
     },
+    // Gemini CLI, Google's npm package on Node.js's own Linux build, as kiln's Gemini kind starts it,
+    // `--acp` (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 21). Its system settings turn its
+    // update check off.
+    Builtin {
+        name: "harness-gemini",
+        harness: "gemini",
+        text: include_str!("../../../../.kiln/images/harness-gemini/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-gemini/pin.json"),
+        files: &[
+            ("harness.json", include_str!("../../../../.kiln/images/harness-gemini/harness.json")),
+            ("system-settings.json", include_str!("../../../../.kiln/images/harness-gemini/system-settings.json")),
+        ],
+    },
 ];
 
 /// One as the list shows it.
@@ -90,6 +103,9 @@ mod antigravity_tests;
 
 #[cfg(test)]
 mod cursor_tests;
+
+#[cfg(test)]
+mod gemini_tests;
 
 #[cfg(test)]
 mod tests {
