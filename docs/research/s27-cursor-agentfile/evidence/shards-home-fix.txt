@@ -1,0 +1,42 @@
+# 2026-11-12T08:48:45Z Shards ROOT's run.env fix and a harness domain's filesystem
+## git log -1 --format='%H %s' 997f4e47e
+997f4e47e8ceebe7de19eb3c1ec6ddbce6cf4672 A harness.json's run.env sets its harness's HOME and PATH: init's defaults give way, the last given winning; SHARDS_DOMAIN stays init's
+## git merge-base --is-ancestor 997f4e47e origin/main (bbd908197)
+997f4e47e is in origin/main
+## git show origin/main:crates/init/src/domains.rs | sed -n 1,20p
+//! Agents and harnesses, each started in its domain (docs/design/architecture.md D59;
+//! AGENTFILE_ARCH.md §9.3, §9.9): the image's normalized Agentfile (`/.agentfile.json`)
+//! says which there are and where each lies, and each one's OSI config (`<dir>.d/osi.json`)
+//! how it runs. One whose config says nothing of how it runs is files alone, for another
+//! to use.
+//!
+//! Each starts with `clone3` into namespaces of its own (mount, PID, IPC, network, UTS,
+//! cgroup) and into a cgroup of its own, `/sys/fs/cgroup/domains/<kind>-<name>`, whose
+//! `pids.max` bounds what it starts. Its first process, PID 1 of its namespace:
+//!
+//! - sees the image's system as built, read-only, `nosuid` and `nodev` (workloads inherit
+//!   the microVM's OS), and nothing the run made of it since: none of its files, mounts or
+//!   sockets, a Unix socket's path being reachable to any process that can see it
+//!   (unix(7)); its own directory and grants with it; every other domain's directory
+//!   and grants hidden under an empty tmpfs no one may read; `/sys` hidden; a `/proc` of
+//!   its PID namespace; a `/dev` of six nodes, the `fd` and stdio links, a `shm` of its
+//!   own and an `mqueue` of its IPC namespace's; and a scratch tmpfs of its own at
+//!   `/tmp`, lost when it ends;
+//! - has only its own loopback, brought up;
+//! - runs as uid and gid `200000 + n`, the n-th domain's, with no supplementary groups and
+## git show 997f4e47e (commit message)
+A harness.json's run.env sets its harness's HOME and PATH: init's defaults give way, the last given winning; SHARDS_DOMAIN stays init's
+
+init gave a supplied domain PATH, HOME=/tmp and SHARDS_DOMAIN, then appended run.env without
+removing duplicates. Go and glibc's getenv read the first, so no harness.json could set HOME or
+PATH; agentfile's startup test already reads run.env HOME=/state, the meaning intended. Found by
+the agy Agentfile's agent (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 26 and master 7):
+agy, which has no config-dir variable of its own, wrote its config under init's HOME.
+
+- init's harness_env merges by name, the last given winning, and looks the program up on the PATH
+  the domain runs with.
+- SHARDS_DOMAIN, a domain's own name, is refused in run.env at build (osi::Config::check, what
+  every reader checks) and at run (init), as D231's staging refuses it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+

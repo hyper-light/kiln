@@ -1,0 +1,23 @@
+# pin.sh's record (kiln plan 01a1ce705e5c7504b88732f443d99288, step 1), 2026-11-12T14:02:52Z, on a Linux runner (Linux 7.3.3-1-cachyos x86_64; CachyOS; curl 8.23.0 libcurl/8.23.0 OpenSSL/3.6.5; Python 3.14.9)
+# run from kiln commit b75ff50fcc232c4b6c34b6de00532a3d41d7be68 (branch s27-cursor-agentfile): .kiln/images/harness-cursor/pin.sh as committed there, its SHA-256 as run: 210673ecca7bfab4db7594c3da4a5938580f4168dbf353648829013280bcf914
+$ bash .kiln/images/harness-cursor/pin.sh
+pin.sh: https://cursor.com/install (SHA-256 e8c7a37d74b27a4beedf2dc5fc3b4c83627b2dc5c05a51d34f95ffec3cc0a247) downloads version 2026.11.11-b912975
+pin.sh: linux/amd64: https://downloads.cursor.com/lab/2026.11.11-b912975/linux/x64/agent-cli-package.tar.gz
+pin.sh:   SHA-256 be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91, as its .sha256 says; 176703341 bytes; 435 entries (353 files, 82 directories), 562236246 bytes unpacked
+pin.sh: linux/arm64: https://downloads.cursor.com/lab/2026.11.11-b912975/linux/arm64/agent-cli-package.tar.gz
+pin.sh:   SHA-256 f068af64ed91b5304605976586f690579679f740a41f388091a6b3a2e776987c, as its .sha256 says; 175384019 bytes; 435 entries (353 files, 82 directories), 552211752 bytes unpacked
+pin.sh: pinned cursor-agent 2026.11.11-b912975 for linux/amd64 and linux/arm64 in /home/adalundhe/.cache/s27-step1.cMgBW9/.kiln/images/harness-cursor/pin.json, SHA-256 4d5f12ae0b03dd7c9117ce92897d4fc5589777c1ab49e65985730e6eafa19a1b
+(exit 0)
+$ each pinned URL and its .sha256 downloaded again, apart from pin.sh: sha256sum, stat and GNU tar against pin.json
+linux/amd64: https://downloads.cursor.com/lab/2026.11.11-b912975/linux/x64/agent-cli-package.tar.gz
+  sha256sum be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91, 176703341 bytes (stat); its .sha256 reads: be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91  agent-cli-package.tar.gz
+  GNU tar: 435 entries (353 regular files, 82 directories), dist-package/ itself 1 of them; 562236246 bytes in its regular files
+  pin.json: sha256 be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91, size 176703341, entries 435, unpacked_bytes 562236246
+  all equal
+linux/arm64: https://downloads.cursor.com/lab/2026.11.11-b912975/linux/arm64/agent-cli-package.tar.gz
+  sha256sum f068af64ed91b5304605976586f690579679f740a41f388091a6b3a2e776987c, 175384019 bytes (stat); its .sha256 reads: f068af64ed91b5304605976586f690579679f740a41f388091a6b3a2e776987c  agent-cli-package.tar.gz
+  GNU tar: 435 entries (353 regular files, 82 directories), dist-package/ itself 1 of them; 552211752 bytes in its regular files
+  pin.json: sha256 f068af64ed91b5304605976586f690579679f740a41f388091a6b3a2e776987c, size 175384019, entries 435, unpacked_bytes 552211752
+  all equal
+pinned builds whose SHA-256 and size equal both the fresh download and Cursor's .sha256 (and whose entries and unpacked_bytes equal GNU tar's count): 2 of 2
+# pin.json as written: 4d5f12ae0b03dd7c9117ce92897d4fc5589777c1ab49e65985730e6eafa19a1b

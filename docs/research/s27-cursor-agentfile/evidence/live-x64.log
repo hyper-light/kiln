@@ -1,0 +1,119 @@
+# kiln MCP run, needs linux/amd64, sync false; runner 00aad8daff2fa3c9daa65d53c425d450, 2026-11-12T07:18Z
+# command: scripts/live_cursor.sh (written to $HOME/.cache/s27-live.sh and run with bash); exit_code 0
+DIR /home/adalundhe/.cache/kiln-step27-live/20261112T071853Z
+Linux 7.3.3-1-cachyos x86_64
+ldd (GNU libc) 2.44
+sha256 be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91 sidecar be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91 pinned be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91
+8096.index.js.LICENSE.txt 873e5f41f22e4a06f74c.js 97f64a4d8eca9a2e35bb.mp4 connect-pool-worker.js connect-pool-worker.js.LICENSE.txt crepectl cursor-agent cursor-agent-sea cursor-agent-worker-sea cursor-askpass cursor-askpass.js cursorsandbox diff-patch-worker.js diff-worker.js file_service.linux-x64-gnu.node index.js index.js.LICENSE.txt mac-webp-runtime.cjs merkle-tree-napi.linux-x64-gnu.node node node_modules node_sqlite3.node package.json pdf-worker.js pty.node rg tree_sitter_bash_binding.node tree_sitter_runtime_binding.node
+unshare -rn: ok
+--- version: cursor-agent --version
+exit 0
+stdout:   0000000   2   0   2   6   .   1   1   .   1   1   -   b   9   1   2   9
+  0000020   7   5  \n
+  0000023
+stdout text: 2026.11.11-b912975
+stderr:
+files written:
+  drwxr-xr-x 26 home
+  drwxr-xr-x 40 home/.cache
+  drwxr-xr-x 46 home/.cache/cursor-compile-cache
+  drwxr-xr-x 128 home/.cache/cursor-compile-cache/v24.22.1-x64-964aae3f-0
+  -rw------- 2052 home/.cache/cursor-compile-cache/v24.22.1-x64-964aae3f-0/067c8059
+  -rw------- 2740 home/.cache/cursor-compile-cache/v24.22.1-x64-964aae3f-0/d56f4f8f
+  -rw------- 4020 home/.cache/cursor-compile-cache/v24.22.1-x64-964aae3f-0/2a365cba
+  -rw------- 1124 home/.cache/cursor-compile-cache/v24.22.1-x64-964aae3f-0/04fcbc59
+  -rw------- 996 home/.cache/cursor-compile-cache/v24.22.1-x64-964aae3f-0/8484daef
+  -rw------- 12756 home/.cache/cursor-compile-cache/v24.22.1-x64-964aae3f-0/0ff87e48
+  -rw------- 3884 home/.cache/cursor-compile-cache/v24.22.1-x64-964aae3f-0/7a05040a
+  -rw------- 837268 home/.cache/cursor-compile-cache/v24.22.1-x64-964aae3f-0/9e409e58
+  drwxr-xr-x 30 home/.cursor
+  -rw-r--r-- 837 home/.cursor/cli-config.json
+  drwxr-xr-x 0 cfg
+--- version-noupdate: cursor-agent --disable-auto-update --version
+exit 0
+stdout:   0000000   2   0   2   6   .   1   1   .   1   1   -   b   9   1   2   9
+  0000020   7   5  \n
+  0000023
+stdout text: 2026.11.11-b912975
+stderr:
+files written:
+  (as the version run: the compile cache under home/.cache and home/.cursor/cli-config.json)
+--- status: cursor-agent status --format json
+exit 0
+stdout text: {
+  "status": "unauthenticated",
+  "isAuthenticated": false,
+  "hasAccessToken": false,
+  "hasRefreshToken": false,
+  "message": "Not logged in"
+}
+stderr:
+files written:
+  drwxr-xr-x 12 home
+  drwxr-xr-x 40 home/.cache
+  drwxr-xr-x 46 home/.cache/cursor-compile-cache
+  (compile cache files under home/.cache/cursor-compile-cache/v24.22.1-x64-964aae3f-0)
+  drwxr-xr-x 12 cfg
+  drwxr-xr-x 30 cfg/cursor
+  -rw-r--r-- 837 cfg/cursor/cli-config.json
+--- acp: cursor-agent --disable-auto-update acp (initialize, then EOF after 15 s)
+exit 124
+stdout: {"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"mcpCapabilities":{"http":true,"sse":true},"promptCapabilities":{"audio":false,"embeddedContext":false,"image":true},"sessionCapabilities":{"list":{}}},"authMethods":[{"id":"cursor_login","name":"Cursor Login","description":"Authenticate using existing Cursor login credentials. Run 'agent login' first if not logged in."}]}}
+stderr:
+files written:
+  drwxr-xr-x 12 home
+  drwxr-xr-x 40 home/.cache
+  drwxr-xr-x 46 home/.cache/cursor-compile-cache
+  (compile cache files under home/.cache/cursor-compile-cache/v24.22.1-x64-964aae3f-0)
+  drwxr-xr-x 12 cfg
+  drwxr-xr-x 46 cfg/cursor
+  -rw-r--r-- 837 cfg/cursor/cli-config.json
+  drwxr-xr-x 20 cfg/cursor/projects
+  drwxr-xr-x 0 cfg/cursor/projects/ho-078895d
+DONE
+# Notes: every run had env -i with PATH=<package>:/usr/bin:/bin and HOME=<empty dir>, inside unshare -rn (no network);
+# status and acp also had XDG_CONFIG_HOME=<cfg> CURSOR_DATA_DIR=<cfg>/cursor NO_OPEN_BROWSER=1. exit 124 is timeout(1) ending acp
+# 25 s after its stdin reached EOF: it did not exit on EOF by itself.
+
+# ---------------------------------------------------------------------------------------------------------
+# kiln MCP run, on 00aad8daff2fa3c9daa65d53c425d450, 2026-11-12T07:2xZ: the default base, no network, uid 65534, HOME=/tmp,
+# the package mounted read-only at /harness/cursor; exit_code 0
+# docker run --rm --network none --user 65534:65534 -e HOME=/tmp -v "$H":/harness/cursor:ro \
+#   buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10 sh -c '...'
+package: /home/adalundhe/.cache/kiln-step27-live/20261112T071853Z/h
+docker.io/library/buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+--- version (no network, uid 65534, HOME=/tmp)
+2026.11.11-b912975
+exit=0
+--- base
+ldd (Debian GLIBC 2.41-12+deb13u4) 2.41
+GNU bash, version 5.2.37(1)-release (x86_64-pc-linux-gnu)
+-rw-r--r-- 1 root root 222073 Nov  5 07:38 /etc/ssl/certs/ca-certificates.crt
+node: unresolved=0
+cursor-agent-sea: unresolved=0
+file_service.linux-x64-gnu.node: unresolved=0
+pty.node: unresolved=0
+node_sqlite3.node: unresolved=0
+merkle-tree-napi.linux-x64-gnu.node: unresolved=0
+tree_sitter_bash_binding.node: unresolved=0
+tree_sitter_runtime_binding.node: unresolved=0
+git: /usr/bin/git
+ssh: /usr/bin/ssh
+curl: /usr/bin/curl
+realpath: /usr/bin/realpath
+exit 0
+
+# ---------------------------------------------------------------------------------------------------------
+# kiln MCP run, on 00aad8daff2fa3c9daa65d53c425d450: the bring-up's Alpine base (musl), same conditions; exit_code 0
+# docker run --rm --network none --user 65534:65534 -e HOME=/tmp -v "$H":/harness/cursor:ro \
+#   alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf sh -c '...'
+package: /home/adalundhe/.cache/kiln-step27-live/20261112T071853Z/h
+alpine already present
+env: can't execute 'bash': No such file or directory
+exit=127
+node exit=127
+sh: /harness/cursor/node: not found
+ls: /lib/ld-linux-x86-64.so.2: No such file or directory
+ls: /lib64/ld-linux-x86-64.so.2: No such file or directory
+bash: MISSING
+exit 0

@@ -70,6 +70,15 @@ pub const ALL: &[Builtin] = &[
         pin: include_str!("../../../../.kiln/images/harness-devin/pin.json"),
         files: &[("harness.json", include_str!("../../../../.kiln/images/harness-devin/harness.json"))],
     },
+    // Cursor's CLI agent, its own Linux package unpacked as its installer does, run as kiln's Cursor
+    // kind starts it, `acp` (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 27).
+    Builtin {
+        name: "harness-cursor",
+        harness: "cursor",
+        text: include_str!("../../../../.kiln/images/harness-cursor/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-cursor/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-cursor/harness.json"))],
+    },
 ];
 
 /// One as the list shows it.
@@ -101,6 +110,9 @@ mod antigravity_tests;
 
 #[cfg(test)]
 mod devin_tests;
+
+#[cfg(test)]
+mod cursor_tests;
 
 #[cfg(test)]
 mod tests {

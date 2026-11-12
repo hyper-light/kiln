@@ -1,0 +1,42 @@
+# Cursor's CLI agent as a kiln harness in a Shards microVM (kiln plan
+# 01a1cd8e862e7169a074db3d5fa33f3d, step 27; plan 01a1ce705e5c7504b88732f443d99288, research
+# 01a1ce705e5c7504bdcac9721fa699e3). kiln runs it as its ACP server, `agent acp` (Kind "cursor",
+# crates/kiln/src/harness/kinds.rs). It comes in as pin.json pins it, in ./cursor-<arch>/: Cursor's
+# own Linux package, whose SHA-256 equals the .sha256 Cursor publishes beside it (Cursor signs
+# nothing; pin.sh), unpacked with its top directory stripped as Cursor's installer does, and
+# harness.json. Nothing else installs it, and no credential is in the image.
+
+# Cursor's package is a bash launcher and a bundled Node whose binaries link glibc (at most
+# GLIBC_2.28 and GLIBCXX_3.4.22, and libz), and Cursor publishes no musl build: the base needs glibc
+# and bash, and the image has no variant. This default, step 19's, pinned by digest, has both and runs
+# the package with no RUN; Alpine can't start it.
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+FROM ${BASE}
+
+# BuildKit sets TARGETARCH in the global scope, so the stage declares it to name each platform's
+# harness directory.
+ARG TARGETARCH
+HARNESS cursor FROM ./cursor-${TARGETARCH}
+
+# Its network reach, every part named (default deny): a network for this harness alone, which it
+# joins with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443
+# out, opened at the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress), for
+# Cursor's backend speaks HTTPS alone (HTTP/2, falling back to HTTP/1.1). These are the bring-up's
+# grants (Shards' docs/examples/harness-claude) until step 9 grants providers by name. Nothing comes
+# in; no other port or protocol goes out.
+NETWORK --dns --egress=443/tcp provider FOR cursor
+EXPOSE --harnesses=cursor 443/tcp AS egress FOR provider
+CONNECT cursor WITH cursor ON provider
+
+# The project, which moves to its own host path with step 8, and the person's home. Cursor keeps its
+# config, sessions, MCP servers, rules, plugins and hooks in $HOME/.cursor, and on Linux its sign-in
+# in $HOME/.config/cursor. A harness sees the image read-only, with its own /tmp scratch and these
+# volumes alone writable, so a home that is writable and kept from run to run must be a volume: the
+# whole home is the person's volume (step 7's shape) and harness.json sets HOME=/home/cursor.
+# Cursor's own layout lands there, and so does what the programs it runs keep in a home (.gitconfig
+# ...). HOME in run.env needs a shards at or after 997f4e47e (release v0.8.0 and later), where
+# run.env replaces init's HOME=/tmp. harness.json also puts caches that follow XDG's rule on the
+# scratch (XDG_CACHE_HOME=/tmp/.cache), out of the person's volume. Both volumes are the harness's
+# alone, and outside /tmp, which the scratch covers.
+VOLUME --target-kind=harness /workspace FOR cursor
+VOLUME --target-kind=harness /home/cursor FOR cursor
