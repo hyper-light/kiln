@@ -1,0 +1,7 @@
+# Step 3 (plan 01a1cf48e8157494ac9a51f7a564f526): kiln run r8 on adacachy2, docs/research/s19-claude-agentfile/step3-recheck.sh, 751a7efb9 plus step3.patch cec58fbd (r7's patch with clippy's cmp_owned fixed in a test): the run's output in the order kiln returned it
+HOST adacachy2 2026-11-12T15:27:08Z
+TREE 751a7efb9f0f5304889db2e9b0d7eb8387eb9d85 plus step3.patch cec58fbd779676efc7d664dbb0cfb7f512687e6f75306e4f422719b3aec35aee
+TEST_EXIT 0
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 4323 filtered out; finished in 0.38s
+CLIPPY_EXIT 0
+SCRIPT_EXIT 0

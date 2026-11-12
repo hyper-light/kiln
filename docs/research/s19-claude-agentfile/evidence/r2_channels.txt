@@ -1,0 +1,2 @@
+# Claude Code release channels, read 2026-11-12T13:52:22Z (curl -fsSL https://downloads.claude.ai/claude-code-releases/{stable,latest})
+CHANNEL stable=2.1.311 latest=2.1.322 read_at=2026-11-12T13:52:22Z

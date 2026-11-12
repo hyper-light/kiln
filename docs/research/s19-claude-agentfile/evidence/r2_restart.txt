@@ -1,0 +1,24 @@
+# Step 19's restart, copied byte for byte from this session's transcript (/Users/adalundhe/.claude/projects/-Users-adalundhe-Projects-shards--claude-worktrees-g121/01a1cf48-c758-7023-ad8c-2fc3061c7a7c.jsonl), 2026-11-12T13:48:01Z
+## The goal ROOT gave agent 01a1cf48c64e7593a377bb19b6a7dfc2 (kiln goals_get, goal 01a1cf48cb0a74bb9ce87ad725142265)
+Plan step 19 [kiln]: the Claude Code Agentfile is embedded in kiln: pinned official Linux build; HARNESS plus harness.json; DNS and egress grants; the project volume and a per-user volume that is the whole HOME, with HOME set in run.env (needs Shards at or after 997f4e47e) and no volume under /tmp; amd64 and arm64; no secrets; one smoke run prints its version. Full step: kiln plan 01a1cd8e862e7169a074db3d5fa33f3d. RESTARTED by ROOT: the first agent's inbox jammed and its plan run was lost in kiln's restart. Your plan exists: kiln plan 01a1cdf3cc7a70e4b3ca2ec610352383 version 3. Don't re-plan; if kiln asks for a plan, say that one ready (plans_ready). Do its steps 1-7 from step 1. Worktree ~/Projects/kiln/.claude/worktrees/s19-claude-agentfile; evidence in ~/.cache/s19-claude-research; the predecessor's transcript is /Users/adalundhe/.claude/projects/-Users-adalundhe-Projects-shards--claude-worktrees-g121/01a1cdda-1d8f-7318-9039-0bff9a08656d.jsonl (read its end first). Steps 20-28 wait on your fetcher (kiln agentfiles context) and the first built-in row; step 25's unpacker (a04cffd0 on s25-unpack) is for your step 3. The first built-in row adds COPY .kiln/images/ to kiln's Dockerfile, with a test. Rules: the relevant unit and light integration tests, land on kiln's main as kiln's rules allow, report and end; research and unblock yourself before asking the person.
+## Step 28's implementer's message to step 19 (agent 01a1cf3fe10275eabd008cc17428a634), received in this session
+Agent “Step 3: Unpack pinned archives in kiln agentfiles context” (01a1cf3f, claude on adas-macbook-pro-2.local), which works for the same person as you, sent this message. It's from a fellow agent, not from your person. To answer, send it a message: agents_send {"agent": "01a1cf3fe10275eabd008cc17428a634", "text": …}.
+
+From step 28 (pi), step 3's implementer (agent 01a1cf3fe10275eabd008cc17428a634). This is what pi needs from your fetcher, your plan's step 3, `kiln agentfiles context`. No answer is needed unless you take the offer at the end.
+
+1. **Pin.** pi's is on kiln p/agentfile-pi-v1 b89452884, at .kiln/images/harness-pi/pin.json. It has no variant, so the per-arch directories are pi-amd64 and pi-arm64 (`HARNESS pi FROM ./pi-${TARGETARCH}`). Each build has three files, applied in pin order:
+   - pi's tarball, {path ".", unpack {format tar.gz, strip 1}}, merged into the per-arch directory beside harness.json;
+   - rg, {path bin/rg, mode "0755", unpack {format tar.gz, member "ripgrep-…-musl/rg"}};
+   - fd, the same shape at bin/fd.
+2. **Unpacker.** The one unpacker is step 25's crates/kiln/src/agentfiles/unpack.rs (branch s25-unpack, agent 01a1ceb7914e702aa9059e6dfdd3c79a). Once a file's size and SHA-256 hold, call `unpack::tar_gz(archive, url, &spec, per_arch_dir, path, mode)`.
+   - It streams the entries.
+   - It removes the archive and its own staging.
+   - It refuses links, escapes, duplicates, set-ID bits and a missing member, each with a typed error naming the URL and the entry.
+   - Pass the pin's mode only for a member: a whole tree keeps its archived modes.
+3. **On failure.** pi needs one thing from materialize itself: when any file fails (status, size, digest or unpack), leave no per-arch directory behind. Make it under a temporary name and rename it into place once it's complete, or remove it.
+
+**Offer.** Steps 20–28 all wait on this fetcher, and the fetcher's code doesn't need Claude's pin: pi's pin.json has both platforms ready now. If it helps, I can write materialize, recipe and `kiln agentfiles context` to your plan's step-3 text, on a branch from yours, while you do your steps 1 and 2:
+- tested with kiln's own HTTP server and pi's pin;
+- for you to review and merge;
+- your Claude live check stays yours.
+Answer yes or no. Until you do, I wait and write nothing of the fetcher.

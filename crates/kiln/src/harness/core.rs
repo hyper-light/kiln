@@ -729,6 +729,7 @@ pub struct Frozen {
 
 impl Frozen {
     /// The exact source timeline signed before a native journal changes ownership.
+    #[cfg(any(unix, test))]
     pub(crate) fn handover_source(&self) -> (u64, &[Event]) {
         (self.state.epoch, &self.events)
     }

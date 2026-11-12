@@ -1,0 +1,327 @@
+# Shards origin/main 8f3cd5b7411dfeea47956a5143eec2c3466b058f excerpts (git -C /Users/adalundhe/Projects/shards/.claude/worktrees/g121 show 8f3cd5b7411dfeea47956a5143eec2c3466b058f:<path> | cat -n), 2026-11-12T13:48:01Z
+## git log -1 997f4e47e
+997f4e47e8ceebe7de19eb3c1ec6ddbce6cf4672 Thu Nov 12 00:05:36 2026 -0800
+A harness.json's run.env sets its harness's HOME and PATH: init's defaults give way, the last given winning; SHARDS_DOMAIN stays init's
+
+init gave a supplied domain PATH, HOME=/tmp and SHARDS_DOMAIN, then appended run.env without
+removing duplicates. Go and glibc's getenv read the first, so no harness.json could set HOME or
+PATH; agentfile's startup test already reads run.env HOME=/state, the meaning intended. Found by
+the agy Agentfile's agent (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 26 and master 7):
+agy, which has no config-dir variable of its own, wrote its config under init's HOME.
+
+- init's harness_env merges by name, the last given winning, and looks the program up on the PATH
+  the domain runs with.
+- SHARDS_DOMAIN, a domain's own name, is refused in run.env at build (osi::Config::check, what
+  every reader checks) and at run (init), as D231's staging refuses it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+997f4e47e IN origin/main 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+tags containing 997f4e47e: []
+c3b7bde8b (startup.rs) NOT in v0.7.0
+1da9132b7 IN origin/main 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+## gh release list -R hyper-light/shards --limit 4
+kernel-6.18.48-17c3ba205400	Pre-release	kernel-6.18.48-17c3ba205400	2026-11-10T00:47:17Z
+kernel-6.18.48-f7cd54dd57a5	Pre-release	kernel-6.18.48-f7cd54dd57a5	2026-11-09T10:38:41Z
+kernel-6.18.48-fa4edcc82303	Pre-release	kernel-6.18.48-fa4edcc82303	2026-11-07T01:40:15Z
+shards 0.7.0	Latest	v0.7.0	2026-11-05T22:48:00Z
+## crates/init/src/domains.rs 1-26
+     1	//! Agents and harnesses, each started in its domain (docs/design/architecture.md D59;
+     2	//! AGENTFILE_ARCH.md §9.3, §9.9): the image's normalized Agentfile (`/.agentfile.json`)
+     3	//! says which there are and where each lies, and each one's OSI config (`<dir>.d/osi.json`)
+     4	//! how it runs. One whose config says nothing of how it runs is files alone, for another
+     5	//! to use.
+     6	//!
+     7	//! Each starts with `clone3` into namespaces of its own (mount, PID, IPC, network, UTS,
+     8	//! cgroup) and into a cgroup of its own, `/sys/fs/cgroup/domains/<kind>-<name>`, whose
+     9	//! `pids.max` bounds what it starts. Its first process, PID 1 of its namespace:
+    10	//!
+    11	//! - sees the image's system as built, read-only, `nosuid` and `nodev` (workloads inherit
+    12	//!   the microVM's OS), and nothing the run made of it since: none of its files, mounts or
+    13	//!   sockets, a Unix socket's path being reachable to any process that can see it
+    14	//!   (unix(7)); its own directory and grants with it; every other domain's directory
+    15	//!   and grants hidden under an empty tmpfs no one may read; `/sys` hidden; a `/proc` of
+    16	//!   its PID namespace; a `/dev` of six nodes, the `fd` and stdio links, a `shm` of its
+    17	//!   own and an `mqueue` of its IPC namespace's; and a scratch tmpfs of its own at
+    18	//!   `/tmp`, lost when it ends;
+    19	//! - has only its own loopback, brought up;
+    20	//! - runs as uid and gid `200000 + n`, the n-th domain's, with no supplementary groups and
+    21	//!   no capability left, bounding set included, and `no_new_privs` set;
+    22	//! - holds no descriptor of init's but its stdio: stdin `/dev/null`, stdout and stderr one
+    23	//!   pipe that init relays a line at a time, each line prefixed with the domain;
+    24	//! - runs the command its config says, a relative program its directory's, a bare name
+    25	//!   found on `PATH` before it starts.
+    26	
+## crates/init/src/domains.rs 519-545
+   519	/// A supplied domain's environment: init's `PATH` (its own directory first), `HOME=/tmp` and
+   520	/// `SHARDS_DOMAIN`, then its config's `run.env`, each name once and the last given winning, so a
+   521	/// harness.json sets its harness's `HOME` or `PATH` (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
+   522	/// master step 7: run.env was appended after init's before, and a program reads the first).
+   523	/// `SHARDS_DOMAIN` is init's alone: a domain's own name, never its image's word.
+   524	fn harness_env(path: &str, label: &str, given: &[String]) -> Result<Vec<String>, String> {
+   525	    let mut env = vec![
+   526	        format!("PATH={path}"),
+   527	        "HOME=/tmp".to_string(),
+   528	        format!("SHARDS_DOMAIN={label}"),
+   529	    ];
+   530	    for e in given {
+   531	        let Some((name, _)) = e.split_once('=').filter(|(name, _)| !name.is_empty()) else {
+   532	            return Err(format!("{label}: run.env entry {e:?} is no NAME=value"));
+   533	        };
+   534	        if name == "SHARDS_DOMAIN" {
+   535	            return Err(format!(
+   536	                "{label}: run.env sets SHARDS_DOMAIN, which is init's: a domain's own name"
+   537	            ));
+   538	        }
+   539	        let at = env
+   540	            .iter()
+   541	            .position(|kept| kept.split_once('=').is_some_and(|(n, _)| n == name));
+   542	        match at.and_then(|i| env.get_mut(i)) {
+   543	            Some(kept) => kept.clone_from(e),
+   544	            None => env.push(e.clone()),
+   545	        }
+## crates/init/src/domains.rs 584-610
+   584	    let workdir = run.get("workdir").and_then(Value::str).unwrap_or(".");
+   585	    // A supplied bare command lives in its own artifact before the system tools.
+   586	    // The inherited PATH also lets an explicit launcher such as nohup find its child.
+   587	    let path = format!("{dir}:{dir}/bin:{PATH}");
+   588	    let given = run.get("env").and_then(Value::strings).unwrap_or_default();
+   589	    let env = harness_env(&path, &label, &given)?;
+   590	    // Its program is found on the PATH it runs with: init's, unless run.env gave its own.
+   591	    let path = env
+   592	        .iter()
+   593	        .find_map(|e| e.strip_prefix("PATH="))
+   594	        .unwrap_or(&path)
+   595	        .to_string();
+   596	    let env = env.iter().map(|e| cstr(e)).collect::<Result<Vec<_>, _>>()?;
+   597	    let first = command.first().map(String::as_str).unwrap_or_default();
+   598	    let program = if first.starts_with('/') {
+   599	        first.to_string()
+   600	    } else if first.contains('/') {
+   601	        // Relative: its directory's.
+   602	        format!("{dir}/{first}")
+   603	    } else {
+   604	        // A bare name, on PATH as execvp(3) would find it, found here: the child may not
+   605	        // allocate.
+   606	        path.split(':')
+   607	            .map(|p| format!("{p}/{first}"))
+   608	            .find(|p| {
+   609	                CString::new(p.as_str()).is_ok_and(|c| {
+   610	                    // SAFETY: access(2) of a NUL-terminated path.
+## crates/init/src/domains.rs 878-883
+   878	/// A domain's scratch, `/tmp` as it sees it, where the image has a `/tmp` (D139): a tmpfs of
+   879	/// its own, attached nowhere, `nosuid` and `nodev`, its root the domain's (uid and gid
+   880	/// `id`) and its group's to read (0750), its server instance being of that group. The
+   881	/// domain attaches it; its instance holds it, beneath which it reads the files the domain
+   882	/// hands across (AGENTFILE_ARCH §9.4).
+   883	fn scratch(lower: std::os::fd::BorrowedFd<'_>, id: u32) -> io::Result<Option<OwnedFd>> {
+## crates/init/src/domains.rs 1818-1826
+  1818	            sockets,
+  1819	            volumes,
+  1820	            scratch: scratch.as_ref().map(AsRawFd::as_raw_fd),
+  1821	            receives,
+  1822	            hide: all
+  1823	                .iter()
+  1824	                .filter(|x| **x != d.dir)
+  1825	                .flat_map(|x| [x.clone(), [x.as_slice(), b".d"].concat()])
+  1826	                .filter_map(|x| CString::new(x).ok())
+## crates/init/src/domains.rs 2331-2366
+  2331	            fail(out, c"making its mounts private");
+  2332	        }
+  2333	        // The image as built, over the system's /proc, then its root; the system's mounts
+  2334	        // under it detached (pivot_root(2), NOTES).
+  2335	        if libc::syscall(
+  2336	            libc::SYS_move_mount,
+  2337	            p.root,
+  2338	            c"".as_ptr(),
+  2339	            libc::AT_FDCWD,
+  2340	            c"/proc".as_ptr(),
+  2341	            mount_api::MOVE_MOUNT_F_EMPTY_PATH,
+  2342	        ) != 0
+  2343	            || libc::chdir(c"/proc".as_ptr()) != 0
+  2344	            || libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) != 0
+  2345	            || libc::umount2(c".".as_ptr(), libc::MNT_DETACH) != 0
+  2346	            || libc::chdir(c"/".as_ptr()) != 0
+  2347	        {
+  2348	            fail(out, c"entering the image as built");
+  2349	        }
+  2350	        // The microVM's system, read-only, nosuid and nodev (struct mount_attr).
+  2351	        let attr: [u64; 4] = [
+  2352	            libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV,
+  2353	            0,
+  2354	            0,
+  2355	            0,
+  2356	        ];
+  2357	        if libc::syscall(
+  2358	            libc::SYS_mount_setattr,
+  2359	            libc::AT_FDCWD,
+  2360	            c"/".as_ptr(),
+  2361	            libc::AT_RECURSIVE,
+  2362	            attr.as_ptr(),
+  2363	            std::mem::size_of_val(&attr),
+  2364	        ) != 0
+  2365	        {
+  2366	            fail(out, c"making the system read-only");
+## crates/init/src/domains.rs 2418-2431
+  2418	        // Its own scratch: /tmp, init's mount of it, which its server instance holds too
+  2419	        // (D139); and /dev/shm.
+  2420	        if let Some(fd) = p.scratch
+  2421	            && libc::syscall(
+  2422	                libc::SYS_move_mount,
+  2423	                fd,
+  2424	                c"".as_ptr(),
+  2425	                libc::AT_FDCWD,
+  2426	                c"/tmp".as_ptr(),
+  2427	                mount_api::MOVE_MOUNT_F_EMPTY_PATH,
+  2428	            ) != 0
+  2429	        {
+  2430	            fail(out, c"making its scratch");
+  2431	        }
+## crates/image/src/osi.rs 76-88
+    76	pub const SCHEMA_VERSION: u32 = 1;
+    77	
+    78	/// How it runs: its first process, relative to its directory.
+    79	#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    80	#[serde(deny_unknown_fields)]
+    81	pub struct Run {
+    82	    pub command: Vec<String>,
+    83	    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    84	    pub env: Vec<String>,
+    85	    #[serde(default, skip_serializing_if = "Option::is_none")]
+    86	    pub workdir: Option<String>,
+    87	}
+    88	
+## crates/image/src/osi.rs 120-133
+   120	    pub variant: Option<String>,
+   121	}
+   122	
+   123	/// An OSI artifact's config.
+   124	#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+   125	#[serde(rename_all = "camelCase", deny_unknown_fields)]
+   126	pub struct Config {
+   127	    pub schema_version: u32,
+   128	    pub name: String,
+   129	    #[serde(default, skip_serializing_if = "String::is_empty")]
+   130	    pub version: String,
+   131	    #[serde(default, skip_serializing_if = "String::is_empty")]
+   132	    pub description: String,
+   133	    #[serde(default, skip_serializing_if = "Option::is_none")]
+## crates/image/src/osi.rs 198-226
+   198	    /// What every reader checks.
+   199	    pub fn check(&self) -> Result<(), Error> {
+   200	        if !valid_name(&self.name) {
+   201	            return bad(format!(
+   202	                "an OSI config's name {:?} is no name an Agentfile can give: lowercase letters, digits, '-', '_' and '.', a letter first",
+   203	                self.name
+   204	            ));
+   205	        }
+   206	        let mut paths: Vec<(&str, &str)> = Vec::new();
+   207	        if let Some(run) = &self.run {
+   208	            if run.command.is_empty() {
+   209	                return bad("an OSI config's run.command is empty");
+   210	            }
+   211	            if let Some(w) = &run.workdir {
+   212	                paths.push(("run.workdir", w));
+   213	            }
+   214	            for e in &run.env {
+   215	                if !e.contains('=') || e.starts_with('=') {
+   216	                    return bad(format!("an OSI config's run.env entry {e:?} is no NAME=value"));
+   217	                }
+   218	                // A domain's name is the runtime's word, never its image's: init sets it (as D231's
+   219	                // staging refuses it).
+   220	                if e.split_once('=').is_some_and(|(name, _)| name == "SHARDS_DOMAIN") {
+   221	                    return bad(
+   222	                        "an OSI config's run.env sets SHARDS_DOMAIN, which the runtime sets: a domain's own name",
+   223	                    );
+   224	                }
+   225	            }
+   226	        }
+## docs/design/architecture.md 17106
+ 17106	### D115. A run's command reaches none of its image's agents and harnesses
+## docs/architecture/AGENTFILE_ARCH.md 276-277
+   276	- A harness is a file artifact. The build unpacks it to `/harness/<name>`, or to
+   277	  `TO <dest_path>` if given.
+## docs/architecture/AGENTFILE_ARCH.md 640-646
+   640	**The run's own command is confined from the domains too** (D115). The workload a run's
+   641	`docker run`-style request starts is not one of the domains, but it shares the microVM with
+   642	them, so it is given no reach into them: a PID namespace of its own, whose PID 1 it is (so
+   643	it sees none of their processes; under `--init` a reaper of shards' is PID 1 there, the
+   644	command its child), and the
+   645	daemon, init and the build refuse whatever the CLI asks that would cross into a domain —
+   646	`--privileged`, the capabilities that reach across the PID namespace (`NET_RAW` and
+## docs/research/measurements/harness-bringup-v1/README.md 224-225
+   224	| A run's environment (`shards run -e`) | Reaches the run's command only. A harness's environment is `PATH` (its directory and `bin` first), `HOME=/tmp`, `SHARDS_DOMAIN`, and its image's OSI `run.env` (`crates/init/src/domains.rs:490-498`) | `a_runs_environment_reaches_no_harness`: `-e CODEX_API_KEY=… -e OPENAI_API_KEY=…` and Codex still sends no key (`401 … Missing bearer or basic authentication in header`) | would be delegation; not available |
+   225	| A host directory given at run time to a volume declared for the harness alone (`VOLUME --target-kind=harness DIR FOR <harness>` in the Agentfile, `shards run -v HOSTDIR:DIR[:ro]`), the harness pointed at it by a path in its image (a `--settings` option, or `run.env` in harness.json's full OSI form) | **Works.** The share is the harness's alone (D109: no other member mounts it; the run's own root does not), its host-made files shown owned by the harness's uid, the host's modes kept (`domains.rs:1472-1489`) | Codex: `CODEX_HOME=/run/codex-home` (full-form `run.env`) over `-v HOSTDIR:/run/codex-home`, its own `auth.json` (`{"auth_mode": "apikey", "OPENAI_API_KEY": …}`, as `codex login --with-api-key` writes it) mode 0600 in a 0700 directory: OpenAI answers `401 Unauthorized: Incorrect API key provided: sk-shard*******************-key … auth error code: invalid_api_key`. Claude Code: `--settings /run/claude-auth/settings.json` (`{"apiKeyHelper": "cat /run/claude-auth/api-key"}`) over `-v HOSTDIR:/run/claude-auth:ro`, both files 0600 in a 0700 directory: `apiKeySource: "apiKeyHelper"`, every request `error_status: 401`, `Invalid API key · Fix external API key`. Probe: the harness is `uid=200000 gid=200000`, the directory `drwx------ 200000 200000`, the file `-rw------- 200000 200000`, read | **native delegation**: the harness, its tools and its children can read the key; Codex writes its token refreshes back there (the share must be writable for a ChatGPT sign-in, and for Codex's own state) |
+## docs/research/measurements/harness-bringup-v1/README.md 276-292
+   276	**H3: no command reads a member's output.** It goes only to the owner endpoint
+   277	(authenticated, per channel, D180); `shards logs` is the command's. A person running a
+   278	harness today sees its process record, not what it says.
+   279	
+   280	**H4: `HOME=/tmp` and Codex.** Every domain's `HOME` is its scratch `/tmp`
+   281	(`domains.rs:493`). Codex then warns `Refusing to create helper binaries under temporary
+   282	dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/.codex"))` and makes none of its helper
+   283	aliases; with `CODEX_HOME` on a volume the warning is gone (`codex-login-volume`).
+   284	
+   285	**H5: input.** A domain's stdin is `/dev/null`; Codex reads it (`Reading additional input
+   286	from stdin...`), finds it empty and goes on. The interactive input and TTY contract (G24)
+   287	remains open.
+   288	
+   289	**H6: the harnesses' own behavior without a credential or a network.** Claude Code refuses
+   290	locally (`Not logged in · Please run /login`, `duration_api_ms: 0`, no request), so its reach
+   291	is shown with a placeholder key. With a key it retries a 401 ten times with backoff
+   292	(2 s rising to about 35 s; 246.5 s in all in the final run, 263 s in an earlier one)
+## docs/examples/harness-claude/Agentfile
+     1	# Anthropic's Claude Code as a harness, started by its own harness.json (architecture.md
+     2	# D54): no RUN or VOLUME installs it, and no credential is in the image.
+     3	#
+     4	# Put Anthropic's musl build for the host's architecture at claude/bin/claude first:
+     5	# docs/research/measurements/harness-bringup-v1/fetch.sh fetches and verifies x86_64's.
+     6	#   shards build image -t harness-claude:1 docs/examples/harness-claude
+     7	#   shards run vm -d --name claude harness-claude:1 sleep 600
+     8	#   shards read processes claude
+     9	FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+    10	
+    11	# The system libraries Claude Code's musl build links (code.claude.com/docs/en/setup,
+    12	# "Alpine Linux and musl-based distributions"): Alpine's own, not the harness.
+    13	RUN apk add --no-cache libgcc libstdc++
+    14	
+    15	HARNESS claude FROM ./claude
+    16	
+    17	# Its network reach, every part named (default deny, AGENTFILE_ARCH.md §4.6, §4.7, §9.7):
+    18	# a network for this harness alone, which it joins with no flow to any member; names past
+    19	# the microVM through the microVM's resolver (--dns); and TCP 443 out, opened both at the
+    20	# network's boundary (--egress) and at the microVM's (EXPOSE ... AS egress). Nothing comes
+    21	# in, and no other port or protocol goes out.
+    22	NETWORK --dns --egress=443/tcp provider FOR claude
+    23	EXPOSE --harnesses=claude 443/tcp AS egress FOR provider
+    24	CONNECT claude WITH claude ON provider
+## docs/examples/harness-claude/claude/harness.json
+     1	{
+     2	  "entrypoint": "claude -p",
+     3	  "options": ["--output-format", "stream-json", "--verbose", "Reply with the single word: ready"]
+     4	}
+## crates/init/src/domains.rs 2524-2537 (its volumes, attached after its scratch at 2418-2431) at 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+  2524	        // Its volumes, at their mount points.
+  2525	        for (copy, at, _) in &p.volumes {
+  2526	            if libc::syscall(
+  2527	                libc::SYS_move_mount,
+  2528	                *copy,
+  2529	                c"".as_ptr(),
+  2530	                libc::AT_FDCWD,
+  2531	                at.as_ptr(),
+  2532	                mount_api::MOVE_MOUNT_F_EMPTY_PATH,
+  2533	            ) != 0
+  2534	            {
+  2535	                fail(out, c"mounting its volumes");
+  2536	            }
+  2537	        }
+## crates/init/src/domains.rs 2685-2686 at 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+  2685	        // Its volumes, written as it pleases where they are not read-only (D109).
+  2686	        for (_, at, ro) in &p.volumes {
+## crates/image/src/osi.rs 126-131 at 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   126	pub struct Config {
+   127	    pub schema_version: u32,
+   128	    pub name: String,
+   129	    #[serde(default, skip_serializing_if = "String::is_empty")]
+   130	    pub version: String,
+   131	    #[serde(default, skip_serializing_if = "String::is_empty")]

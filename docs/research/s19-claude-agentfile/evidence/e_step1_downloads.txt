@@ -1,0 +1,5 @@
+MATCH linux/amd64 gnu sha256=86dc1fcc69498159eaf15f446613e847010f9036bfbbdffd4c49350be8489ada size=293776752 https://downloads.claude.ai/claude-code-releases/2.1.311/linux-x64/claude
+MATCH linux/amd64 musl sha256=cd40dd327145ee47aa0deacd571801c1d782388f709d71242eee6b91de8ed11f size=287442392 https://downloads.claude.ai/claude-code-releases/2.1.311/linux-x64-musl/claude
+MATCH linux/arm64 gnu sha256=2e2496c9a8065df93acb0fca2d341f59a6b8777649b2e025ab8c9bcd5eef61f3 size=293658808 https://downloads.claude.ai/claude-code-releases/2.1.311/linux-arm64/claude
+MATCH linux/arm64 musl sha256=172150e3f9ea07e8e2e2e29862d7d9a25f5c234d8e909e4063df237665bf09b9 size=285822152 https://downloads.claude.ai/claude-code-releases/2.1.311/linux-arm64-musl/claude
+DOWNLOADS_MATCHING 4 of 4

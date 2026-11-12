@@ -1,0 +1,49 @@
+# ELF interpreter, NEEDED and GLIBC versions over HTTP ranges, 2026-11-12T06:27:14Z
+== 2.1.311 linux-x64
+INTERP /lib64/ld-linux-x86-64.so.2
+NEEDED librt.so.1 libc.so.6 ld-linux-x86-64.so.2 libpthread.so.0 libdl.so.2 libm.so.6
+VERNEED librt.so.1 max GLIBC_2.3.3 n 1
+VERNEED libc.so.6 max GLIBC_2.17 n 14
+VERNEED ld-linux-x86-64.so.2 max GLIBC_2.3 n 1
+VERNEED libpthread.so.0 max GLIBC_2.12 n 2
+VERNEED libdl.so.2 max GLIBC_2.2.5 n 1
+VERNEED libm.so.6 max GLIBC_2.2.5 n 1
+== 2.1.311 linux-arm64
+INTERP /lib/ld-linux-aarch64.so.1
+NEEDED librt.so.1 libc.so.6 ld-linux-aarch64.so.1 libpthread.so.0 libdl.so.2 libm.so.6
+VERNEED librt.so.1 max GLIBC_2.17 n 1
+VERNEED libc.so.6 max GLIBC_2.17 n 1
+VERNEED ld-linux-aarch64.so.1 max GLIBC_2.17 n 1
+VERNEED libpthread.so.0 max GLIBC_2.17 n 1
+VERNEED libdl.so.2 max GLIBC_2.17 n 1
+VERNEED libm.so.6 max GLIBC_2.17 n 1
+== 2.1.311 linux-x64-musl
+INTERP /lib/ld-musl-x86_64.so.1
+NEEDED libc.musl-x86_64.so.1
+== 2.1.311 linux-arm64-musl
+INTERP /lib/ld-musl-aarch64.so.1
+NEEDED libc.musl-aarch64.so.1
+== 2.1.322 linux-x64
+INTERP /lib64/ld-linux-x86-64.so.2
+NEEDED librt.so.1 libc.so.6 ld-linux-x86-64.so.2 libpthread.so.0 libdl.so.2 libm.so.6
+VERNEED librt.so.1 max GLIBC_2.3.3 n 1
+VERNEED libc.so.6 max GLIBC_2.17 n 16
+VERNEED ld-linux-x86-64.so.2 max GLIBC_2.3 n 1
+VERNEED libpthread.so.0 max GLIBC_2.12 n 2
+VERNEED libdl.so.2 max GLIBC_2.2.5 n 1
+VERNEED libm.so.6 max GLIBC_2.2.5 n 1
+== 2.1.322 linux-arm64
+INTERP /lib/ld-linux-aarch64.so.1
+NEEDED librt.so.1 libc.so.6 ld-linux-aarch64.so.1 libpthread.so.0 libdl.so.2 libm.so.6
+VERNEED librt.so.1 max GLIBC_2.17 n 1
+VERNEED libc.so.6 max GLIBC_2.17 n 1
+VERNEED ld-linux-aarch64.so.1 max GLIBC_2.17 n 1
+VERNEED libpthread.so.0 max GLIBC_2.17 n 1
+VERNEED libdl.so.2 max GLIBC_2.17 n 1
+VERNEED libm.so.6 max GLIBC_2.17 n 1
+== 2.1.322 linux-x64-musl
+INTERP /lib/ld-musl-x86_64.so.1
+NEEDED libc.musl-x86_64.so.1
+== 2.1.322 linux-arm64-musl
+INTERP /lib/ld-musl-aarch64.so.1
+NEEDED libc.musl-aarch64.so.1

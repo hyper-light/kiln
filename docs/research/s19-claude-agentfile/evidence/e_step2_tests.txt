@@ -1,0 +1,15 @@
+# Step 2 (plan 01a1cf48e8157494ac9a51f7a564f526): kiln run r5 on adacachy2 (Linux x86_64), docs/research/s19-claude-agentfile/step2-test.sh: s19-claude-agentfile d7453f7a5 plus step2.patch in a kiln clone of the runner's own; cargo test -q -p kiln --lib -- agentfiles:: harness::claude:: and cargo clippy -q -p kiln --all-targets -- -D warnings, CARGO_BUILD_JOBS=16 (the run's output, in the order kiln returned it)
+HOST adacachy2 2026-11-12T14:39:09Z cpus 32 free 52G disk 55G
+TREE d7453f7a596dc9477f02e2022997eaaa540e99b4 plus step2.patch 0a72eb011b547b830d1434ba7b9cc85c70a4f0cbc716efa5418942b453986419
+ M crates/kiln/src/agentfiles/builtin.rs
+ M crates/kiln/src/harness/claude.rs
+ M crates/kiln/src/harness/kinds.rs
+?? .kiln/images/harness-claude/Agentfile
+?? .kiln/images/harness-claude/harness.json
+?? .kiln/images/harness-claude/harness.musl.json
+TOOLS cargo 1.98.1 (797e8a9bc 2026-08-05) / rustc 1.98.1 (48a229cea 2026-09-01)
+SHARDS none
+TEST_EXIT 0 after 783 s
+test result: ok. 73 passed; 0 failed; 0 ignored; 0 measured; 4323 filtered out; finished in 0.49s
+CLIPPY_EXIT 0 after 275 s
+SCRIPT_EXIT 0

@@ -1,0 +1,8 @@
+pin.sh: stable is 2.1.311 (read 2026-11-12T14:27:49Z)
+pin.sh: manifest.json 2.1.311: [GNUPG:] VALIDSIG 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE 2026-10-26 1793042338 0 4 0 1 10 00 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
+pin.sh: linux-x64 (linux/amd64 gnu): 293776752 bytes, SHA-256 86dc1fcc69498159eaf15f446613e847010f9036bfbbdffd4c49350be8489ada
+pin.sh: linux-x64-musl (linux/amd64 musl): 287442392 bytes, SHA-256 cd40dd327145ee47aa0deacd571801c1d782388f709d71242eee6b91de8ed11f
+pin.sh: linux-arm64 (linux/arm64 gnu): 293658808 bytes, SHA-256 2e2496c9a8065df93acb0fca2d341f59a6b8777649b2e025ab8c9bcd5eef61f3
+pin.sh: linux-arm64-musl (linux/arm64 musl): 285822152 bytes, SHA-256 172150e3f9ea07e8e2e2e29862d7d9a25f5c234d8e909e4063df237665bf09b9
+pin.sh: base buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+pin.sh: wrote /home/adalundhe/.cache/s19-step1.bRbVvE/pin.json
