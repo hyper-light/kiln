@@ -68,15 +68,41 @@ subagent finished it on branch p/s21-finish-v1. This file is the finish's record
     built-in Gemini's among them passing Shards' static check, as
     [finish/shards-check-v0.7.0.txt](finish/shards-check-v0.7.0.txt) shows for Gemini's alone.
   - `docs_agents_md` (the metrics table this note sits beside): passed.
+- **kiln's clippy gate** (`ci/gate.sh -p kiln clippy`: `cargo clippy --locked -p kiln --all-targets --
+  -D warnings`) on adacachy: at 6e814bff8 it failed on one lint of this branch's
+  (`explicit_auto_deref` in gemini_tests.rs), fixed in 74c0d233c; at d78d882a6, kiln main edba77bdb
+  merged in (pi's row), `GATE: PASS` ([finish/merged-tree-adacachy.txt](finish/merged-tree-adacachy.txt)).
+- **The merged tree d78d882a6**, every row and test module kept: `cargo test --locked -p kiln --lib
+  agentfiles::`, 101 passed, 0 failed, Gemini's 8 and pi's among them.
 - Gemini itself was never run here: smokes are ROOT's.
 
 ## Unverified, and owed
 
 - ROOT's: the image built for both platforms by a real Shards, and its smokes (amd64 under KVM, arm64
   on a Mac Studio); that Gemini honors the system settings there (no `Skipping system settings file`
-  on stderr); Windows hosts; the two node processes' per-VM memory (R14).
+  on stderr); Windows hosts; the two node processes' per-VM memory (R14); the clippy gate on Windows
+  at the landed revision. macOS's clippy gate: see the landing's report (the worktree's sync to the
+  Mac Studio timed out; a carrier run went to adas-mac-studio-2.local).
 - Node's archive's member checks were run on the real archives alone: changing Node's archive breaks
   its signed SHA-256, and no fixture signing key was made for it.
 - kiln writes a built-in's own files (harness.json, system-settings.json) under its umask; a context
   made under umask 002 makes the settings group-writable and Gemini skips them (kiln's runners run at
   022). The fetcher also downloads Node's archive once per member. Both are the fetcher's to change.
+
+## R01-R16
+
+| Rule | This step |
+|---|---|
+| R01 | No production code: a table row of `include_str!`s and tests that return errors, no unwrap or indexing (kiln's denied lints hold, clippy above). pin.sh refuses every malformed input with a message and writes nothing. |
+| R02 | Research 01a1ce705e2472df9f3dd81be0531c9f (f1-f37, npm's, Node's and Gemini's own sources) and the bundle read for the update check's one caller; the one unpacker reused, not another written. |
+| R03 | Node derived from Gemini's CI and Node's schedule; every literal in pin.sh and the tests named with its source (`/harness/gemini`: Shards' HARNESS layout, f28; the members' modes: an executable and a text; the 443 grants: the bring-up's). |
+| R04 | pin.sh: pin.json written whole or a named refusal and none. The tests read texts; no state machine. |
+| R05 | No cache, no wait added; pin.sh's work directory is removed on exit. |
+| R06, R07, R13 | One check per concern; comments give sources and reasons. |
+| R08, R14 | No performance claim. The live context's 12 s and the trees' sizes are single observations. |
+| R09 | The one defect found, the clippy lint, came from kiln's own gate and was fixed there. |
+| R10 | Logs under finish/; every pin-time refusal exercised by a change that alters one thing; each Rust test fails on its altered copies. |
+| R11 | linux/amd64 and linux/arm64 pinned and each one's context made; glibc only, with why; tests and clippy on Linux x86_64; Windows' clippy is ROOT's; Gemini run nowhere. |
+| R12 | The one fetcher and unpacker, the one table; pin.sh in the shape of its siblings'. |
+| R15 | Implementer scope: unit and light integration tests; smokes and real-VM runs are ROOT's. |
+| R16 | Nothing reclaimed; this step's build folders on adacachy are under ~/.cache/s21-finish. |
