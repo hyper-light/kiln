@@ -38,6 +38,10 @@
 //! can: the most other cores can write its records between its decisions. One line per M: ns a
 //! step, and the hints said a second.
 //!
+//! `--profile --mailbox M,..`: the same M threads, each word put in a mailbox instead (each runner's
+//! newest, a map behind a lock held for the insert), which the owner takes whole before each step and
+//! applies itself: its records written by its own thread alone. One line per M, as `--hinters`.
+//!
 //! `cargo bench -p kiln-ci --bench lb -- --json --n N --rho R --d D --runs K [--b B] [--w W]
 //! [--run R] [--batch K]` prints one JSON line a run; without `--json`, a table.
 
@@ -1264,6 +1268,65 @@ fn hinted(im: &Impl<Kiln>, p: &Params, m: usize) -> (f64, f64) {
     (ns, said.load(std::sync::atomic::Ordering::Relaxed) as f64 / secs.max(1e-9))
 }
 
+/// One owner whose words come by mailbox ([`Args::mailbox`]): `m` threads each post that a runner
+/// (drawn at random) has a new word, into a set behind a lock held for the insert, so a runner posted
+/// twice before the owner looks is there once (its newest word is the one that counts); before each
+/// step the owner takes the set whole and applies each runner's word as it stands (the bench's
+/// runners' ledgers are the owner thread's; a real runner sends its own, current, word), so the
+/// owner's records are written by this thread alone. ns a step (the words applied in it), the words
+/// posted a second, and the words applied a step.
+fn mailed(im: &Impl<Kiln>, p: &Params, m: usize) -> (f64, f64, f64) {
+    let mut own = im.clone();
+    let mut rng = Rng(SEED);
+    fill(&mut rng, &mut own, 0, p.f);
+    steps(&mut rng, &mut own, p.f, p.w);
+    let mail = std::sync::Mutex::new(std::collections::HashSet::<u32>::new());
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let put = std::sync::atomic::AtomicU64::new(0);
+    let start = std::sync::Barrier::new(m + 1);
+    let mut applied = 0u64;
+    let (ns, secs) = std::thread::scope(|s| {
+        for i in 0..m {
+            let (mail, done, put, start) = (&mail, &done, &put, &start);
+            s.spawn(move || {
+                let mut rng = Rng(SEED ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let mut n = 0u64;
+                start.wait();
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let r = uniform(rng.next(), p.n);
+                    if let Ok(mut g) = mail.lock() {
+                        g.insert(r);
+                    }
+                    n += 1;
+                }
+                put.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        start.wait();
+        let t = Instant::now();
+        let mut taken = std::collections::HashSet::new();
+        for _ in 0..p.b {
+            if let Ok(mut g) = mail.lock() {
+                std::mem::swap(&mut *g, &mut taken);
+            }
+            let k = &mut own.state;
+            for r in taken.drain() {
+                if let Some(word) = k.runners.get(r as usize).map(Runner::word) {
+                    let _ = k.owner.hear(ToOwner::Hint { runner: RunnerId(r), word }, &mut k.out);
+                    applied += 1;
+                }
+            }
+            k.out.to.clear();
+            k.out.told.clear();
+            steps(&mut rng, &mut own, p.f, 1);
+        }
+        let e = t.elapsed();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        (e.as_nanos() as f64 / p.b as f64, e.as_secs_f64())
+    });
+    (ns, put.load(std::sync::atomic::Ordering::Relaxed) as f64 / secs.max(1e-9), applied as f64 / p.b as f64)
+}
+
 fn null_impl(slots: usize) -> Impl<()> {
     Impl { state: (), release: null_release, pick: null_pick, many_release: null_many_release, many_pick: null_many_pick, sb: vec![-1; slots] }
 }
@@ -1500,12 +1563,14 @@ struct Args {
     owners: Vec<usize>,
     /// `--hinters M,..` (with `--profile`): one owner behind a lock, M threads hinting it.
     hinters: Vec<usize>,
+    /// `--mailbox M,..` (with `--profile`): M threads putting words in the owner's mailbox.
+    mailbox: Vec<usize>,
     /// `--measured`: every runner measured its speed and slowness first; asks stay plain.
     measured: bool,
 }
 
 fn args() -> std::result::Result<Args, String> {
-    let mut a = Args { json: false, cold: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None, profile: false, null: false, terms: None, measured: false, owners: Vec::new(), hinters: Vec::new() };
+    let mut a = Args { json: false, cold: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None, profile: false, null: false, terms: None, measured: false, owners: Vec::new(), hinters: Vec::new(), mailbox: Vec::new() };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if let Some(kinds) = std::env::var("KILN_LB_KINDS").ok().and_then(|v| v.parse().ok()) {
         KINDS.store(kinds, std::sync::atomic::Ordering::Relaxed);
@@ -1558,6 +1623,7 @@ fn args() -> std::result::Result<Args, String> {
             "--kinds" => KINDS.store(v.parse().map_err(|e| format!("--kinds {v}: {e}"))?, std::sync::atomic::Ordering::Relaxed),
             "--owners" => a.owners = list(v)?.into_iter().map(|x| usize::try_from(x).unwrap_or(1).max(1)).collect(),
             "--hinters" => a.hinters = list(v)?.into_iter().map(|x| usize::try_from(x).unwrap_or(0)).collect(),
+            "--mailbox" => a.mailbox = list(v)?.into_iter().map(|x| usize::try_from(x).unwrap_or(0)).collect(),
             "--impl" => match v {
                 "kiln" => a.floor = false,
                 "floor" => a.floor = true,
@@ -1611,7 +1677,7 @@ fn main() -> std::process::ExitCode {
         }
         return std::process::ExitCode::SUCCESS;
     }
-    if a.profile && (!a.owners.is_empty() || !a.hinters.is_empty()) {
+    if a.profile && (!a.owners.is_empty() || !a.hinters.is_empty() || !a.mailbox.is_empty()) {
         for &n in &a.ns {
             for &rho in &a.rhos {
                 let f = inflight(n, rho);
@@ -1629,6 +1695,10 @@ fn main() -> std::process::ExitCode {
                     for &m in &a.hinters {
                         let (ns, hints) = hinted(&im, &p, m);
                         println!("hinters {m} n {n} rho {:.2} d {d}: {ns:.2} ns a step (alone {one:.2}, {:.2}x), {:.2} M hints/s", rho as f64 / 1000.0, ns / one, hints / 1e6);
+                    }
+                    for &m in &a.mailbox {
+                        let (ns, words, applied) = mailed(&im, &p, m);
+                        println!("mailbox {m} n {n} rho {:.2} d {d}: {ns:.2} ns a step (alone {one:.2}, {:.2}x), {:.2} M words/s put, {:.2} applied a step", rho as f64 / 1000.0, ns / one, words / 1e6, applied);
                     }
                 }
             }
