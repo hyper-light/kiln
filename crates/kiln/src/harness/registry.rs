@@ -3857,6 +3857,20 @@ impl Registry {
         self.sessions.view(id).is_some_and(|v| super::history::valid_cursor(cursor, born(), v.reset_at, id))
     }
 
+    /// Whether session `id`'s copy holds every event an older page before number `before` shows
+    /// (`super::history::covers`): then [`Registry::history_overlay`] makes the page from the copy alone, and the
+    /// conversation store, whose reads wait behind its writes, isn't read (plan 01a1cc09, step 1). Looked at off the
+    /// shards, as the overlay is.
+    pub async fn history_kept(&self, id: &str, before: u64, limit: usize) -> bool {
+        let Some(view) = self.sessions.view(id) else { return false };
+        crate::rt::blocking(move || {
+            let floor = view.state.get::<u64>("cleared").unwrap_or(1).max(1);
+            super::history::covers(view.events.metas().filter_map(|m| m.seq()), floor, before, limit)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// Reconcile a durable page against one exact, latest immutable copy after its IO. Work that
     /// reads compact/spilled entries is on the blocking pool; resets are checked again by the API.
     pub async fn history_overlay(&self, id: &str, cursor: &str, before: u64, limit: usize, events: Vec<Value>) -> anyhow::Result<Option<(Vec<Value>, u64, bool, u64)>> {

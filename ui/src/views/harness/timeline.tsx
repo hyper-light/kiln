@@ -85,7 +85,7 @@ import { BodiesContext, Whole } from "./whole";
 import { SessionEvents, useSessionEvent } from "./session-event";
 import { pageInGap, revealRow, rowWindow, survivingPosition, type RowPosition, type WindowPart } from "./row-window";
 import { useRowPins } from "./row-pins";
-import { RestoringPlace } from "./restore-place";
+import { RestoringPlace } from "./restoring-place";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
@@ -1971,7 +1971,8 @@ export const Timeline = React.memo(function Timeline({
     } else if (anchor === null) setAnchor(win.current.turns[win.current.from]?.key ?? null);
   };
   /** To the latest, from a window further back. */
-  const latest = () => {
+  // The same one each render: a restore under way (restore-place.tsx) goes to it when it can't finish.
+  const latest = React.useCallback(() => {
     setRestoring(null);
     setPlaced(null);
     setAnchor(null);
@@ -1979,7 +1980,7 @@ export const Timeline = React.memo(function Timeline({
     reading.current = null;
     readingRow.current = false;
     toEnd();
-  };
+  }, [toEnd]);
   const restored = React.useCallback(
     (position: RowPosition) => {
       const current = turnsOf(store.get().events, parent, false, thread);
@@ -2089,7 +2090,7 @@ export const Timeline = React.memo(function Timeline({
           onPointerDownCapture={keeper.onTouch}
           onKeyDownCapture={keeper.onTouch}
         >
-          <div ref={marks} className="hx-flow">
+          <div ref={marks} className={restoring ? "hx-flow hx-flow-loading" : "hx-flow"}>
             {restoring ? (
               <RestoringPlace store={store} position={restoring} resolved={restored} latest={latest} />
             ) : (
