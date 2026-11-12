@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "name": "antigravity",
+  "version": "1.5.6",
+  "run": {
+    "command": [
+      "sh",
+      "-c",
+      "# The probe's own command (plan step 26, step 4): run by sh as harness antigravity, with its\n# harness.json's env, in the microVM. It writes what it finds into /workspace/probe, the run's\n# project volume, and ends with /workspace/probe/done. Every result is a file; nothing stops it.\no=/workspace/probe\nmkdir -p \"$o\" || exit 1\nagy --version > \"$o/version\" 2> \"$o/version.err\"; echo $? > \"$o/version.rc\"\nid -u > \"$o/uid\"; id -g > \"$o/gid\"\nprintf '%s\\n' \"$HOME\" > \"$o/home\"\ngetent hosts cloudcode-pa.googleapis.com > \"$o/dns\" 2>&1; echo $? > \"$o/dns.rc\"\ntouch \"$HOME/x\" 2> \"$o/touch.err\"; echo $? > \"$o/touch.rc\"\ngit config --global user.name probe 2> \"$o/git.err\"; echo $? > \"$o/git.rc\"\nagy mcp add kiln-probe /bin/true > \"$o/mcp.out\" 2>&1; echo $? > \"$o/mcp.rc\"\nprintf '%s\\n' '{\"event\":\"user\",\"message\":{\"content\":\"Reply with the single word: ready\"}}' | timeout 90 agy --input-format stream-json --output-format stream-json > \"$o/turn.out\" 2> \"$o/turn.err\"; echo $? > \"$o/turn.rc\"\nif command -v curl > /dev/null; then\n  curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 20 https://cloudcode-pa.googleapis.com/ > \"$o/https\" 2> \"$o/https.err\"; echo $? > \"$o/https.rc\"\n  curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 10 http://cloudcode-pa.googleapis.com/ > \"$o/http80\" 2> \"$o/http80.err\"; echo $? > \"$o/http80.rc\"\n  # TCP 443 to the name's IPv4 address as the host resolved it (/workspace/ip4), no lookup asked:\n  # egress itself, apart from DNS. And the same to an IPv6 address of the name, as found then.\n  ip4=$(cat /workspace/ip4 2>/dev/null); ip6=$(cat /workspace/ip6 2>/dev/null)\n  curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 10 --resolve \"cloudcode-pa.googleapis.com:443:$ip4\" https://cloudcode-pa.googleapis.com/ > \"$o/https-ip4\" 2> \"$o/https-ip4.err\"; echo $? > \"$o/https-ip4.rc\"\n  curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 10 --resolve \"cloudcode-pa.googleapis.com:443:[$ip6]\" https://cloudcode-pa.googleapis.com/ > \"$o/https-ip6\" 2> \"$o/https-ip6.err\"; echo $? > \"$o/https-ip6.rc\"\nelse\n  echo \"no curl in this base\" > \"$o/https.err\"\nfi\nls -la /etc/ssl/certs/ca-certificates.crt > \"$o/ca-bundle\" 2>&1\n# agy's own TLS: as it ends, it posts its telemetry over HTTPS; its log names what failed.\ngrep -a -E 'telemetry|x509|certificate' \"$HOME/.gemini/antigravity-cli/cli.log\" > \"$o/agy-tls\" 2>&1\nls -la \"$HOME\" > \"$o/home.ls\" 2>&1\necho done > \"$o/done\"\n"
+    ],
+    "env": [
+      "HOME=/home/antigravity",
+      "AGY_CLI_DISABLE_AUTO_UPDATE=true",
+      "XDG_CACHE_HOME=/tmp/.cache"
+    ]
+  }
+}

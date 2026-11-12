@@ -1,0 +1,2 @@
+WARNING: CAP_NET_RAW withheld from the command: the image's Agentfile runs agents and harnesses beside the command, and CAP_NET_RAW reads and writes the packets of their flows past the microVM, which cross the command's network namespace
+4d1bae186cd703875b4059bb06ab80f87e88acc021ac8d1ac62b8d7e46df14aa
