@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "name": "goose",
+  "version": "1.59.0",
+  "run": {
+    "command": ["goose", "acp"],
+    "env": ["GOOSE_PATH_ROOT=/home/goose/.local/share/goose"]
+  }
+}

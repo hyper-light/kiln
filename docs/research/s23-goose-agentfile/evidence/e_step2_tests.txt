@@ -1,0 +1,167 @@
+# Step 2's record (plan 01a1ce705e3d72af83ef15ae83b62f45): kiln's agentfiles tests, the real-shards checks and clippy at 8756c22bb (s23-goose-agentfile, on origin/main 94639db7b).
+# How: the branch as a git bundle over stdin to kiln-a094a12d (whole-tree syncs of this worktree, 16,431 files and 600 MB, timed out on two runners), fetched into a --shared clone of that runner's own kiln checkout under ~/.cache, then docs/research/s23-goose-agentfile/step2-run.sh:
+#   kiln run --no-sync --needs linux/amd64,cpus=8,mem=20g --on kiln-a094a12d.attlocal.net -i -- "$(cat step2-run.sh)" < s23.bundle
+# shards: v0.7.0's release binary shards-linux-amd64, checked against the release's SHA256SUMS (no Linux runner has shards on its PATH).
+# Earlier at e68a500c6 (on step 30's branch 4a4aa1179): the same tests passed, and clippy -D warnings failed only on step 30's unused Blobs import (tests.rs:11), which main fixed in f075a8375; with that one line removed in the scratch clone, clippy passed (CLIPPY_EXIT=0 at 13:45:56).
+# Not run: kiln's whole test suite and gate (the person's word), a docker build of kiln's image with the new COPY (ROOT's), Windows and macOS clippy.
+# Shards' run.env shadowing (step 26's note, 2026-11-12): harness.json sets no HOME or PATH, so it needs no workaround; GOOSE_PATH_ROOT is no variable shards-init sets.
+# step 2 tests, 2026-11-12T13:50:00Z, host kiln-a094a12d.attlocal.net Linux 6.19.10-300.fc44.x86_64 x86_64, cargo 1.99.1 (5f94df478 2026-08-27), HEAD 8756c22bb (Goose's Agentfile, harness.json and its entry in kiln's buil)
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+    |
+    |
+
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+    |              ^^^^^^^^^^^^
+    |
+    |
+    |
+
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+     |          ^^^^^^^^^^^^
+     |
+     |
+     |
+
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+    |                  ^^^^^^^^^^^^
+    |
+    |
+    |
+
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+   |          ^^^^^^^^^^^^
+   |
+   |
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8m 43s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s23-kiln-target/debug/deps/kiln-721748ad308a6d67)
+
+running 26 tests
+test agentfiles::builtin::tests::step23_a_real_shards_checks_every_builtin ... ok
+test agentfiles::check::tests::step30_a_real_shards_checks_without_resolving_bases ... ok
+test agentfiles::builtin::tests::every_builtin_is_a_valid_agentfile_once ... ok
+test agentfiles::builtin::tests::step23_goose_agentfile_is_the_plans_shape ... ok
+test agentfiles::check::tests::step30_no_result_is_unchecked_saying_shards_last_error ... ok
+test agentfiles::check::tests::step30_a_refusal_without_a_line_in_its_words_names_it ... ok
+test agentfiles::tests::step30_ls_tree_entries ... ok
+test agentfiles::check::tests::step30_the_target_that_stops_shards_says_the_text_passed ... ok
+test agentfiles::check::tests::step30_any_other_error_refuses_it_in_shards_words_at_its_line ... ok
+test agentfiles::builtin::tests::step23_goose_runs_as_kilns_goose_kind_with_its_root_on_its_volume ... ok
+test agentfiles::builtin::tests::step23_every_builtin_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::tests::step23_no_builtin_holds_a_credential ... ok
+test agentfiles::check::tests::step30_warnings_are_diagnostics_that_refuse_nothing ... ok
+test agentfiles::builtin::tests::step23_kilns_dockerfile_copies_what_builtins_embed ... ok
+test agentfiles::tests::step30_names_and_texts ... ok
+test agentfiles::builtin::tests::step23_a_pin_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::tests::step30_a_project_is_listed_for_its_readers_alone ... ok
+test agentfiles::tests::step30_the_migration_makes_its_tables ... ok
+test agentfiles::check::tests::step30_shards_is_asked_for_its_check_in_a_folder_of_its_own ... ok
+test agentfiles::tests::step30_a_text_the_store_cant_keep_writes_no_record ... ok
+test agentfiles::tests::step30_who_reaches_everyones ... ok
+test agentfiles::tests::step30_a_delete_lets_go_of_texts_no_record_names ... ok
+test agentfiles::tests::step30_texts_are_kept_once_in_the_store_of_bytes ... ok
+test agentfiles::tests::step30_a_text_read_back_is_held_to_its_digest ... ok
+test agentfiles::tests::step30_versions_restore_and_delete ... ok
+test agentfiles::tests::step30_a_person_reaches_only_their_own ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 4367 filtered out; finished in 0.60s
+
+TEST_EXIT=0 at 13:58:44
+SHARDS shards version 0.7.0, build 94838b8 sha256 a9c9092ac5f6a7c6b306a47ef5c9d27f48f6541885abe823c0063abc2d549388
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+    |
+    |
+
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+    |              ^^^^^^^^^^^^
+    |
+    |
+    |
+
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+     |          ^^^^^^^^^^^^
+     |
+     |
+     |
+
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+    |                  ^^^^^^^^^^^^
+    |
+    |
+    |
+
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+   |          ^^^^^^^^^^^^
+   |
+   |
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.92s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s23-kiln-target/debug/deps/kiln-721748ad308a6d67)
+
+running 2 tests
+test agentfiles::builtin::tests::step23_a_real_shards_checks_every_builtin ... ok
+test agentfiles::check::tests::step30_a_real_shards_checks_without_resolving_bases ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4391 filtered out; finished in 0.02s
+
+SHARDS_TEST_EXIT=0 at 13:58:45
+    Updating crates.io index
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+    |
+    |
+
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+    |              ^^^^^^^^^^^^
+    |
+    |
+    |
+
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+     |          ^^^^^^^^^^^^
+     |
+     |
+     |
+
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+    |                  ^^^^^^^^^^^^
+    |
+    |
+    |
+
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+   |          ^^^^^^^^^^^^
+   |
+   |
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4m 24s
+CLIPPY_EXIT=0 at 14:03:11
