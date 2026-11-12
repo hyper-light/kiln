@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "kiln-probe": {
+      "command": "/bin/true",
+      "disabled": false
+    }
+  }
+}

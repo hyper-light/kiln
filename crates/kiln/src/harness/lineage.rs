@@ -528,6 +528,28 @@ pub struct Ask {
     /// from what an agent asks (`agents.start` can't hide the agents it starts).
     #[serde(skip)]
     pub helper: Option<String>,
+    /// Told the placer's words once a start waits in its queue for room ([`place_agents`]), so
+    /// the caller answers then rather than past its own wait: never from what's asked.
+    #[serde(skip)]
+    pub queued: Queued,
+}
+
+/// Where a start waiting for room says so, once ([`Ask::queued`]).
+#[derive(Debug, Clone, Default)]
+pub struct Queued(Option<std::sync::Arc<parking_lot::Mutex<Option<futures::channel::oneshot::Sender<String>>>>>);
+
+impl Queued {
+    /// A notice, and what hears it.
+    pub fn new() -> (Self, futures::channel::oneshot::Receiver<String>) {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        (Self(Some(std::sync::Arc::new(parking_lot::Mutex::new(Some(tx))))), rx)
+    }
+
+    fn say(&self, words: String) {
+        if let Some(tx) = self.0.as_ref().and_then(|t| t.lock().take()) {
+            let _ = tx.send(words);
+        }
+    }
 }
 
 /// Who starts agents: the agent that asks (none: a person), whom they act for, how the audit
@@ -691,7 +713,7 @@ fn may_start_on(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) 
 /// lost owner ends the wait at once. The server itself (`local`) isn't a runner and holds no
 /// claim: it's taken when it alone can run it. A fleet with no runner that places sessions yet is
 /// picked from as before ([`pick`]).
-async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize, isolated: bool) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
+async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize, isolated: bool, queued: &Queued) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
     use crate::reach::place::{SessionAsk, SessionWord};
     let default = parent.map(target_of);
     let targets = may_start_on(hub, on, kind, default.as_deref())?;
@@ -736,7 +758,9 @@ async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: 
                 Ok(SessionWord::Answer { answer: a @ kiln_ci::place::Answer::Never { .. } }) => break Err((StatusCode::CONFLICT, a.words(crate::util::now_ms()))),
                 Ok(SessionWord::Fallback { .. }) => break pick(hub, on, kind, default.as_deref()).map(|t| (t, None)),
                 // Queued, its place and why: it waits there, and is told to go when there's room.
-                Ok(SessionWord::Answer { .. }) | Err(_) => {}
+                // Who asked hears so now, not past its own wait (agents.start, 2026-11-11).
+                Ok(SessionWord::Answer { answer }) => queued.say(answer.words(crate::util::now_ms())),
+                Err(_) => {}
             }
         };
         hub.unplace_session(req);
@@ -754,7 +778,7 @@ async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: 
 /// [`place_agents`], for reach's doors tests to drive with their lab's runners (docs/ci.md W05-R03).
 #[cfg(all(test, unix))]
 pub(crate) async fn place_agents_for_tests(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
-    place_agents(hub, parent, on, kind, count, false).await
+    place_agents(hub, parent, on, kind, count, false, &Queued::default()).await
 }
 
 /// The claims of agents placed that won't start (a check refused them): their owners let them go.
@@ -1182,7 +1206,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     // A parent's reach off holds its children to its machine.
     let on = by.parent.as_ref().filter(|p| p.reach.as_deref() == Some("off")).map(target_of).or_else(|| ask.on.clone());
     let isolation = isolation_for(ask.isolation.as_deref(), by.parent.as_ref()).map_err(bad)?;
-    let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, isolation.is_some()).await?;
+    let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, isolation.is_some(), &ask.queued).await?;
     let checked = async {
         let mut targets: Vec<&str> = placed.iter().map(|(t, _)| t.as_str()).collect();
         targets.dedup();

@@ -1,0 +1,57 @@
+[
+    {
+        "Id": "sha256:a6f4470188c7fe127562e9f7802e6256078ecce37a9f855f3412354597b06869",
+        "RepoTags": [
+            "harness-antigravity:s26"
+        ],
+        "RepoDigests": [
+            "harness-antigravity@sha256:a6f4470188c7fe127562e9f7802e6256078ecce37a9f855f3412354597b06869"
+        ],
+        "Comment": "buildkit.dockerfile.v0",
+        "Created": "2026-11-12T16:16:00.994025Z",
+        "Config": {
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ],
+            "Cmd": [
+                "bash"
+            ],
+            "Volumes": {
+                "/home/antigravity": {},
+                "/workspace": {}
+            },
+            "Labels": {
+                "vnd.osi.agentfile.digest": "sha256:b5ccb9d2e9d4bb06b213f5c5af394af80b62cc5823279f35f45525b73415a531",
+                "vnd.osi.agentfile.dns": "1",
+                "vnd.osi.agentfile.egress": "443",
+                "vnd.osi.agentfile.egress-declared": "443/tcp"
+            }
+        },
+        "Architecture": "amd64",
+        "Os": "linux",
+        "Size": 241442052,
+        "RootFS": {
+            "Type": "layers",
+            "Layers": [
+                "sha256:f487d0da9ce0cd3b17ddb89deff39644274b08f2ff71e321a9e0e476ec2d46fe",
+                "sha256:d854713c22704d1fe77bbec5d21c0ac052d26fc4aae53794849d1027e0bfac7a",
+                "sha256:afb0368a2a32f312f7c9f43e3375a54e1a5c3946a76293426362f17120f49c0c",
+                "sha256:2d05e93ba0a9327456d114697aee47d4e111852d44b0da623123e394fa122e27",
+                "sha256:2901f2255390c85d7f2b6932cb143aaace9441c0e09adf8651b5ca17478ede15",
+                "sha256:5aa34ae208363ade7d1248bc5ae2b09b25d4c19e3c35c2feb285d220e5bfafee"
+            ]
+        },
+        "Metadata": {
+            "LastTagTime": "2026-11-12T16:18:44.939676972Z"
+        },
+        "Descriptor": {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": "sha256:0b70741d51323c4eb5215bd78449d2a2796a0dae09abb0db9e25651ab5f68c99",
+            "size": 1617,
+            "platform": {
+                "architecture": "amd64",
+                "os": "linux"
+            }
+        }
+    }
+]

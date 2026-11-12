@@ -82,38 +82,29 @@ fn encode_wire(command: Command, proof: Option<&Value>) -> Result<String, Error>
     String::from_utf8(bytes).map_err(|_| unavailable("communication command was not UTF-8"))
 }
 
-/// Before custody, check both physical storage and the receiver-wide logical working set,
-/// including server-held work. An exact immutable retry is still answered when authority shrinks.
-/// A person's message is queued whatever its recipient's state, its owner's capacity pending or
-/// the agent paused: only the disk's room holds it ([`mail::person`]).
+/// Before custody, check the disk's room for this one original. An exact immutable retry is still
+/// answered when that room shrinks.
+/// Every sender's message is queued whatever its recipient's state, its owner's capacity pending
+/// or the agent paused: only the disk's room holds it.
 pub async fn publish(hub: &Hub, publication: Publish) -> Result<Receipt, Error> {
     if mail::receipt(&hub.store, publication.owner.clone(), publication.sender.clone(), publication.recipient.clone(), publication.id.clone()).await?.is_some() {
         // The ledger checks the complete immutable command, including attachments. Neither a
         // disconnected owner nor shrinking authority can revoke an already committed receipt.
-        return mail::publish(&hub.store, publication, 0, 0).await;
+        return mail::publish(&hub.store, publication, 0).await;
     }
     let command: Command = serde_json::from_value(publication.command.clone()).map_err(|_| Error::Invalid { reason: "publication is not a supported communication command".into() })?;
     let command = hub.harness.attachment_command(hub, &publication.recipient, command).await?;
     // A committed retry keeps its receipt even after closure; a new publication to an unknown
     // recipient has no owner to take custody and must preserve the port's typed absence.
     if hub.harness.location(&publication.recipient).is_none() { return Err(Error::NoSession); }
-    let person = mail::person(&publication.sender);
     let current = match capacity(hub, &publication.recipient) {
         Some(capacity) if super::mail_transfer::dispatch_ready(hub, &publication.recipient, &capacity).await.map_err(|_| unavailable("owner handover state is unavailable"))? => Some(capacity),
         _ => None,
     };
-    // Agents' and kiln's messages are held to the recipient's learned depth, even while it takes
-    // none (paused, its target is none: they wait here till it's back), less what it holds that
-    // the ledger doesn't.
-    let authority = match &current {
-        Some(current) => {
-            let admitted = mail::admitted_count(&hub.store, publication.recipient.clone(), current.epoch).await?;
-            let outside = u64::try_from(current.admitted).map_err(|_| unavailable("source admission count does not fit"))?.saturating_sub(admitted);
-            u64::try_from(current.depth.unwrap_or(current.target)).map_err(|_| unavailable("source admission target does not fit"))?.saturating_sub(outside)
-        }
-        None => 0,
-    };
-    let physical = if current.is_some() || person {
+    // Every sender's message is taken while the disk has room for it, whatever its recipient's
+    // state, depth or owner's capacity: those pace its handing over, never its acceptance (Ada,
+    // 2026-11-12: "Messages cannot and should never be dropped").
+    let physical = {
         let floor = storage_floor(hub)?;
         let data = hub.cfg.server.data_dir.clone();
         let free = crate::rt::blocking(move || crate::os::disk_available(&data)).await.map_err(|_| unavailable("data-volume free space could not be read"))?.ok_or_else(|| unavailable("data-volume free space is unknown"))?;
@@ -121,23 +112,17 @@ pub async fn publish(hub: &Hub, publication: Publish) -> Result<Receipt, Error> 
         // The room on disk for this one original: what's retained already is on disk, so
         // nothing is counted across conversations.
         free.saturating_sub(floor).saturating_sub(reserve)
-    } else { 0 };
-    if current.is_some() || person {
-        let mut population = peers(hub, &publication.recipient).await?;
-        if !population.contains(&publication.sender) { population.push(publication.sender.clone()); }
-        // The longest token is reserved before custody, so a newly accepted body can be sent
-        // under the existing frame cap without clipping or giant JSON reassembly; with no
-        // capacity yet, the longest epoch and generation too.
-        let (epoch, generation) = current.as_ref().map_or((u64::MAX, u64::MAX), |current| (current.epoch, current.feedback_generation.unwrap_or(current.generation)));
-        let envelope = Command::Admit { peer: publication.sender.clone(), token: Token { revision: u64::MAX, generation: u64::MAX }, epoch, generation, peers: population, command: Box::new(command) };
-        let proof = publication.provenance.as_ref().and_then(|p| p.get("relayed"));
-        let _ = encode_wire(envelope, proof)?;
-    }
-    let result = mail::publish(&hub.store, publication, physical, authority).await;
-    match result {
-        Err(Error::Capacity { .. } | Error::Backpressure { .. }) if current.is_none() && !person => Err(unavailable("current owner capacity is pending or unsupported; custody was not accepted")),
-        other => other,
-    }
+    };
+    let mut population = peers(hub, &publication.recipient).await?;
+    if !population.contains(&publication.sender) { population.push(publication.sender.clone()); }
+    // The longest token is reserved before custody, so a newly accepted body can be sent
+    // under the existing frame cap without clipping or giant JSON reassembly; with no
+    // capacity yet, the longest epoch and generation too.
+    let (epoch, generation) = current.as_ref().map_or((u64::MAX, u64::MAX), |current| (current.epoch, current.feedback_generation.unwrap_or(current.generation)));
+    let envelope = Command::Admit { peer: publication.sender.clone(), token: Token { revision: u64::MAX, generation: u64::MAX }, epoch, generation, peers: population, command: Box::new(command) };
+    let proof = publication.provenance.as_ref().and_then(|p| p.get("relayed"));
+    let _ = encode_wire(envelope, proof)?;
+    mail::publish(&hub.store, publication, physical).await
 }
 
 /// One bounded protocol write, with no request waiter/body task. Only source FlowEvent proves
@@ -365,7 +350,7 @@ mod tests {
             assert!(mail::receipt(&hub.store, "fixture".into(), "fixture".into(), "unknown".into(), "one".into()).await?.is_none());
             // A committed original predating closure remains authoritative; absence cannot
             // turn its exact retry into new custody or a different publication.
-            let original = mail::publish(&hub.store, publication.clone(), u64::MAX, 1).await?;
+            let original = mail::publish(&hub.store, publication.clone(), u64::MAX).await?;
             let repeated = publish(&hub, publication).await?;
             assert!(repeated.repeat);
             assert_eq!(repeated.revision, original.revision);

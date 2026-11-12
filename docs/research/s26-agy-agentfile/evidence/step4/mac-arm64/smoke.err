@@ -1,0 +1,3 @@
+Downloading the guest kernel Image-6.18.48-aarch64-17c3ba205400 from https://github.com/hyper-light/shards/releases/download/kernel-6.18.48-17c3ba205400/Image-6.18.48-aarch64
+Guest kernel: sha256:1b178851998d27b4c6c346ae391c26d675f81461fbaa19cbe514500291fe472d
+WARNING: CAP_NET_RAW withheld from the command: the image's Agentfile runs agents and harnesses beside the command, and CAP_NET_RAW reads and writes the packets of their flows past the microVM, which cross the command's network namespace

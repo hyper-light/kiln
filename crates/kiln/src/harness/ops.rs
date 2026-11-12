@@ -131,8 +131,36 @@ async fn start(cx: Cx, v: Value) -> Out {
     }
     let by = starter(&cx)?;
     let parent = by.parent.as_ref().map(|p| p.id.clone());
-    let infos = lineage::start(&cx.hub, &by, ask).await?;
-    Ok(json!({"agents": infos.iter().map(wait::brief).collect::<Vec<_>>(), "parent": parent}))
+    // A start that waits for room on its machine answers when it's queued, with its place and why,
+    // and goes on starting by itself: waiting for room, it outlasted its caller's own wait, which
+    // gave up with no answer and its agents unknown (2026-11-11: "the kiln server didn't answer in
+    // 11 minutes").
+    let (queued, heard) = lineage::Queued::new();
+    let mut ask = ask;
+    ask.queued = queued;
+    let hub = std::sync::Arc::clone(&cx.hub);
+    let started = crate::rt::spawn(async move {
+        let r = lineage::start(&hub, &by, ask).await;
+        if let Err((_, why)) = &r {
+            tracing::warn!(actor = %by.actor, %why, "an agent start ended without starting it");
+        }
+        r
+    });
+    let heard = async { heard.await.ok() };
+    futures::pin_mut!(heard);
+    match futures::future::select(started, heard).await {
+        futures::future::Either::Left((Ok(started), _)) => {
+            let infos = started?;
+            Ok(json!({"agents": infos.iter().map(wait::brief).collect::<Vec<_>>(), "parent": parent}))
+        }
+        futures::future::Either::Left((Err(_), _)) => Err((StatusCode::INTERNAL_SERVER_ERROR, "the start ended before it answered".into())),
+        futures::future::Either::Right((Some(words), _)) => Ok(json!({"agents": [], "parent": parent, "queued": format!("{words}; it starts there as soon as there's room, and agents_list shows it then")})),
+        // The notice went without a word (none was queued): the start's own answer.
+        futures::future::Either::Right((None, started)) => {
+            let infos = started.await.map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "the start ended before it answered".to_owned()))??;
+            Ok(json!({"agents": infos.iter().map(wait::brief).collect::<Vec<_>>(), "parent": parent}))
+        }
+    }
 }
 
 /// The four parts an answer about a piece of code comes in (the UI reads them by these headings).
@@ -1695,7 +1723,8 @@ for line in sys.stdin:
     }
 
     /// CP-T3.2: fellow agents' messages reach a busy harness during its turn, with their sender
-    /// preserved, while explicit queues and a person's default still wait for the turn to end.
+    /// preserved, even sent to queue (Ada, 2026-11-12: agent-to-agent messages steer, not queue),
+    /// while a person's default still waits for the turn to end.
     #[cfg(unix)]
     #[test]
     fn cp_t3_2_agent_messages_steer_a_busy_peer_without_building_a_backlog() -> anyhow::Result<()> {
@@ -1711,7 +1740,7 @@ for line in sys.stdin:
                 ("peer-default", None, false, false),
                 ("peer-steer", Some("steer"), false, false),
                 ("own-default", None, true, false),
-                ("peer-queue", Some("queue"), false, true),
+                ("peer-queue", Some("queue"), false, false),
                 ("person-default", None, false, true),
             ] {
                 let (id, heard) = recording(&hub, &dir.path().join(key), false).await?;
@@ -2012,10 +2041,10 @@ for line in sys.stdin:
     /// at its caller, then prove exact retry and immutable state history after real completion.
     #[test]
     #[cfg(unix)]
-    fn a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication() -> anyhow::Result<()> {
+    fn a_busy_coordinator_takes_custody_of_and_then_delivers_a_waiting_communication() -> anyhow::Result<()> {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         use std::io::Write as _;
-        use crate::harness::{admission::Learning, mail, model::Status};
+        use crate::harness::{admission::Learning, model::Status};
         run(async {
             let hub = hub_with(|config| config.conversations.off = true).await?;
             let dir = tempfile::tempdir()?;
@@ -2055,15 +2084,11 @@ for line in sys.stdin:
             let key = "registry-tests-pass";
             let blocked = json!({"agent": coordinator, "text": "The registry's tests pass on my side.", "mode": "queue", "key": key});
             let blocked_id = crate::harness::queued::from_agent_as(&sender, &super::keyed_id(&peer, "agents.send", &coordinator, key));
-            for _ in 0..3 {
-                let refused = call(peer.clone(), "agents.send", blocked.clone()).await;
-                anyhow::ensure!(matches!(&refused, Err((http::StatusCode::TOO_MANY_REQUESTS, error)) if matches!(serde_json::from_str::<mail::Error>(error), Ok(mail::Error::Backpressure { .. }))), "pre-custody backpressure retains the caller's original: {refused:?}");
-                let current = crate::harness::mail_delivery::capacity(&hub, &coordinator).ok_or_else(|| anyhow::anyhow!("no capacity"))?;
-                anyhow::ensure!(current.admitted <= current.target && current.admitted == capacity.admitted && prompts(&heard) == [initial_id.clone()], "refusal cannot grow source admission or fabricate consumption");
-                let recipient = coordinator.clone();
-                let absent = blocked_id.clone();
-                anyhow::ensure!(hub.store.read(move |connection| Ok(connection.query_row("SELECT COUNT(*) FROM agent_mail WHERE recipient=?1 AND id=?2", rusqlite::params![recipient, absent], |row| row.get::<_, i64>(0))? == 0)).await?, "refused publication silently took custody");
-            }
+            // Ada, 2026-11-12: no message is refused for a busy recipient's depth; it's taken and waits.
+            let accepted = call(peer.clone(), "agents.send", blocked.clone()).await.map_err(|(status, error)| anyhow::anyhow!("{status}: {error}"))?;
+            anyhow::ensure!(accepted.get("id") == Some(&json!(blocked_id)) && accepted.get("repeat") == Some(&json!(false)) && accepted.get("disposition") == Some(&json!("waiting")), "a busy coordinator's peer is taken into custody, not refused: {accepted}");
+            let current = crate::harness::mail_delivery::capacity(&hub, &coordinator).ok_or_else(|| anyhow::anyhow!("no capacity"))?;
+            anyhow::ensure!(current.admitted <= current.target && current.admitted == capacity.admitted && prompts(&heard) == [initial_id.clone()], "custody cannot grow source admission or fabricate consumption");
             // The gate reader was opened before native Started, so this nonblocking writer
             // cannot wait on a missing provider or strand a blocking pool job on cancellation.
             let mut release = std::fs::OpenOptions::new().write(true).custom_flags(nix::libc::O_NONBLOCK).open(&gate)?;
@@ -2071,8 +2096,6 @@ for line in sys.stdin:
             drop(release);
             source_disposition(&hub, &coordinator, &initial_id, true).await?;
             source_disposition(&hub, &coordinator, &goal_id, true).await?;
-            let accepted = call(peer.clone(), "agents.send", blocked.clone()).await.map_err(|(status, error)| anyhow::anyhow!("{status}: {error}"))?;
-            anyhow::ensure!(accepted.get("id") == Some(&json!(blocked_id)) && accepted.get("repeat") == Some(&json!(false)), "the blocked caller reoffers its exact key/body: {accepted}");
             source_disposition(&hub, &coordinator, &blocked_id, true).await?;
             let repeated = call(peer, "agents.send", blocked).await.map_err(|(status, error)| anyhow::anyhow!("{status}: {error}"))?;
             anyhow::ensure!(repeated.get("id") == accepted.get("id") && repeated.get("revision") == accepted.get("revision") && repeated.get("repeat") == Some(&json!(true)), "{accepted} / {repeated}");

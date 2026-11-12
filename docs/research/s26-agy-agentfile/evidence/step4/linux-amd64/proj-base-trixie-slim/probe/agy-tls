@@ -1,0 +1,2 @@
+E1112 16:12:58.021387     330 server.go:4324] Failed to shutdown telemetry client: Post "https://play.googleapis.com/log": tls: failed to verify certificate: x509: certificate signed by unknown authority
+Post "https://play.googleapis.com/log": tls: failed to verify certificate: x509: certificate signed by unknown authority
