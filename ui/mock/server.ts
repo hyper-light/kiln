@@ -280,22 +280,22 @@ const reservedName = (n: string) => n.replace(/\.+$/, "").toLowerCase() === "kil
 const shownAs = (a: Agent) => (a.label ? `${a.label} (${a.name})` : a.name);
 
 /**
- * What a Linux runner with KVM says of itself (`RunnerFacts`), its microVMs as `MICROVM_RUNNERS` has
- * them (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31).
+ * What a Mac with Hypervisor.framework says of itself (`RunnerFacts`), its microVMs as
+ * `MICROVM_RUNNERS` has them (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31).
  */
-function linuxFacts(name: string, cores: number, memGiB: number, diskGiB: number, at: number): NonNullable<Agent["facts"]> {
+function macFacts(name: string, cores: number, memGiB: number, diskGiB: number, at: number): NonNullable<Agent["facts"]> {
   return {
-    os: "linux",
-    os_version: "24.04",
-    os_distro: "ubuntu",
-    kernel: "6.8.0-48-generic",
-    arch: "x86_64",
+    os: "macos",
+    os_version: "26.1",
+    os_distro: null,
+    kernel: "25.1.0",
+    arch: "aarch64",
     arch_variant: null,
-    cpu: { model: "AMD Ryzen 9 7950X 16-Core Processor", cores, threads: cores * 2, flags: ["avx2", "svm"] },
+    cpu: { model: "Apple M4", cores, threads: cores, flags: [] },
     mem: { total: memGiB * 1024 ** 3, free: (memGiB * 1024 ** 3) / 2 },
     disk: { total: diskGiB * 1024 ** 3, free: (diskGiB * 1024 ** 3) / 2 },
     gpus: [],
-    virt: { kvm: true, hvf: false, nested: false, microvm: MICROVM_RUNNERS.has(name) },
+    virt: { kvm: false, hvf: true, nested: false, microvm: MICROVM_RUNNERS.has(name) },
     executors: { host: { version: null, details: {} } },
     binfmt: [],
     tools: { git: "2.43.0" },
@@ -341,7 +341,6 @@ addAgent(
     connected: true,
     last_seen: t,
     enrolled_at: t - 86400 * 38,
-    facts: linuxFacts("metal-ryzen-02", 24, 128, 4000, t),
   },
   newHost(24, 128, 4000),
 );
@@ -376,6 +375,7 @@ addAgent(
     connected: true,
     last_seen: t,
     enrolled_at: t - 86400 * 9,
+    facts: macFacts(MAC_MINI, 10, 32, 1000, t),
   },
   newHost(10, 32, 1000),
 );

@@ -424,7 +424,7 @@ export const MAC_MINI = "9c4e2f7a1b8d43c6a0e5f2b7d1c8a4e3";
  * 01a1cd8e862e7169a074db3d5fa33f3d, step 32): an agent started from an Agentfile goes only to one of
  * these, and is refused anywhere else, as the server refuses it (step 31).
  */
-export const MICROVM_RUNNERS: ReadonlySet<string> = new Set(["metal-ryzen-02"]);
+export const MICROVM_RUNNERS: ReadonlySet<string> = new Set([MAC_MINI]);
 
 /* ---------------------------- discovery (Add machines) ---------------------------- */
 

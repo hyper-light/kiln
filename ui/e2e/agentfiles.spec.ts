@@ -2,7 +2,10 @@
 // place and copied as yours; yours written, edited with Shards' lint, saved, its versions read and one
 // made current again, renamed and deleted; and an agent started from one in Mission control, the
 // choice kept for its harness in its project. Everything in the page's flow, nothing sideways.
-import { expect, test, type Page } from "@playwright/test";
+import { expect as expectNow, test, type Page } from "@playwright/test";
+
+/** Each wait on what the mock answers gives it 15 s, as other specs' waits on the server do: on a busy machine its answers come late. */
+const expect = expectNow.configure({ timeout: 15_000 });
 
 /** How far the page scrolls sideways. */
 const sideways = (page: Page) => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
@@ -56,7 +59,7 @@ test("step31: kiln's are read in place and copied as yours; yours is edited with
   // Its versions: the first read in place and made current again, as a new version, its text in the editor.
   const versions = page.getByRole("region", { name: "Versions" });
   await expect(versions.getByRole("listitem")).toHaveCount(2);
-  const first = versions.getByRole("listitem").filter({ hasText: /^v1\b/ });
+  const first = versions.getByRole("listitem").filter({ has: page.locator(".af-name", { hasText: /^v1$/ }) });
   await first.getByRole("button", { name: "Read" }).click();
   await expect(page.getByLabel("v1's text")).toContainText("HARNESS claude");
   await expect(page.getByLabel("v1's text")).not.toContainText("LABEL org.example.step=31");
@@ -122,11 +125,11 @@ test("step31: an agent starts from the Agentfile chosen in More options, refused
     .click();
   await page
     .getByRole("radiogroup", { name: "Machine" })
-    .getByRole("radio", { name: /metal-ryzen-02/ })
+    .getByRole("radio", { name: /metal-mac-mini/ })
     .click();
   await expect(page.locator(".mc-opts .mc-note")).toHaveCount(0);
   const start = page.locator(".mc-start");
-  await expect(start).toHaveAttribute("aria-label", "Start: Claude Code on metal-ryzen-02, in a microVM from claude-rust");
+  await expect(start).toHaveAttribute("aria-label", "Start: Claude Code on metal-mac-mini (mac-mini), in a microVM from claude-rust");
   expect(await sideways(page)).toBe(0);
   await start.click();
   await expect(page).toHaveURL(/\/agents\/[0-9a-f]{32}$/);
