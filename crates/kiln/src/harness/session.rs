@@ -2954,7 +2954,7 @@ async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)
             crate::rt::blocking(move || match from.protocol {
                 Protocol::ClaudeStreamJson => handoff::read_claude(&env, &id),
                 Protocol::CodexAppServer => handoff::read_codex(&env, &id),
-                Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => None,
+                Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc | Protocol::Terminal => None,
             })
             .await
             .ok()
@@ -2981,7 +2981,7 @@ async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)
         }
         Protocol::CodexAppServer => Record::Codex(handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>")))),
         // Fitted already (fitting it again would count what it left out anew).
-        Protocol::Acp(_) | Protocol::AgyStreamJson => Record::Words(handoff::as_words(conv, &note, usize::MAX)),
+        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc => Record::Words(handoff::as_words(conv, &note, usize::MAX)),
         Protocol::Terminal => Record::Nothing,
     };
     Ok(Carried { record, mode, effort, dropped, empty })

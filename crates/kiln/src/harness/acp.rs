@@ -8,6 +8,10 @@
 //! Steering waits for the turn unless Devin advertises its mid-turn prompt extension.
 //!
 //! Devin CLI (`devin acp`) uses this adapter too, including ACP's session config options.
+//!
+//! So does Cursor's CLI (`agent acp`, cursor.com/docs/cli/acp): its questions
+//! (`cursor/ask_question`) and plans to approve (`cursor/create_plan`), requests of its own that it
+//! waits on, are a person's to answer, and its to-dos (`cursor/update_todos`) are the session's.
 
 use std::collections::HashMap;
 
@@ -16,8 +20,8 @@ use serde_json::{Value, json};
 
 use super::core::{Baseline, Core, Effect};
 use super::model::{
-    AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, Decision, Delivery, ExitInfo, FileDiff, Level, ModeOption, ModelOption, QueueItem, SendMode,
-    Inventory, Known, SlashCommand, Status, StatusItem, Task, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle, sort_catalog,
+    AlwaysOption, Approval, Body, ChoiceAnswer, Command, Control, ControlKind, ControlOption, Decision, Delivery, ExitInfo, FileDiff, Level, ModeOption, ModelOption, Question, QuestionOption,
+    QueueItem, SendMode, Inventory, Known, SlashCommand, Status, StatusItem, Task, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, choices_of, clip_json, clip_middle, sort_catalog,
 };
 
 /// What a session of it can do, said when it starts (and again after an in-place upgrade).
@@ -94,6 +98,8 @@ enum Pending {
     SetMode(String),
     SetModel(String),
     SetConfig(Option<String>, bool),
+    /// Cursor's `authenticate` with the sign-in it has on its machine, after a sign-in in kiln.
+    Authenticate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +107,26 @@ struct Ask {
     rpc: Value,
     /// (option id, kind) as the agent offered them.
     options: Vec<(String, String)>,
+    /// A request of Cursor's own it waits on, rather than one to go ahead.
+    #[serde(default)]
+    cursor: Option<CursorAsk>,
 }
+
+/// Cursor's requests that wait on a person (cursor.com/docs/cli/acp, "Cursor extension methods").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum CursorAsk {
+    /// `cursor/ask_question`: each question's id and words, and its options (id, label).
+    Questions(Vec<(String, String, Vec<(String, String)>)>),
+    /// `cursor/create_plan`.
+    Plan,
+}
+
+/// Cursor's ACP extension methods: its blocking requests and its to-dos.
+const CURSOR_ASK_QUESTION: &str = "cursor/ask_question";
+const CURSOR_CREATE_PLAN: &str = "cursor/create_plan";
+const CURSOR_UPDATE_TODOS: &str = "cursor/update_todos";
+/// The sign-in Cursor's ACP server offers: the one its CLI has on its machine (`agent login`).
+const CURSOR_LOGIN: &str = "cursor_login";
 
 /// Its whole state is plain data, written out when this process re-executes itself (an in-place
 /// upgrade) and read back by the next image, which goes on with the same process.
@@ -201,6 +226,16 @@ pub struct Acp {
     /// unanswered until they resume it (`hold::paused`), then asked again as they came.
     #[serde(default)]
     held_asks: Vec<(Value, Value)>,
+    /// Its harness (`Spec::kind`): Devin's own extensions are Devin's alone. Empty in an older
+    /// image's state, where `account` meant Devin.
+    #[serde(default)]
+    kind: String,
+    /// The sign-ins it offers (`initialize`'s `authMethods`, by id).
+    #[serde(default)]
+    auth: Vec<String>,
+    /// Cursor's to-dos' ids, in `state.todos`' order (`cursor/update_todos` merges by them).
+    #[serde(default)]
+    todo_ids: Vec<String>,
 }
 
 fn ready() -> bool {
@@ -280,12 +315,22 @@ impl Acp {
             compact_prompt: None,
             compaction: None,
             held_asks: Vec::new(),
+            kind: String::new(),
+            auth: Vec::new(),
+            todo_ids: Vec::new(),
         }
+    }
+
+    /// Devin, whose catalog of models and mid-turn prompts are its own.
+    fn devin(&self) -> bool {
+        self.kind == "devin" || (self.kind.is_empty() && self.account)
     }
 
     pub fn from_spec(spec: &super::session::Spec) -> Self {
         let mut a = Self::new(spec.resume.clone()).with_mode(spec.mode.as_deref());
-        a.account = spec.kind == "devin";
+        // Signed in and out through kiln's account card (`crate::accounts`).
+        a.account = matches!(spec.kind.as_str(), "devin" | "cursor");
+        a.kind.clone_from(&spec.kind);
         for (category, value) in [("model", &spec.model), ("thought_level", &spec.effort)] {
             if let Some(v) = value.as_ref().filter(|v| !v.is_empty()) {
                 a.settings.push((category.into(), v.clone()));
@@ -336,7 +381,7 @@ impl Acp {
     }
 
     fn busy(&self, core: &Core) -> bool {
-        self.prompting.is_some() || self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Session | Pending::Refresh | Pending::RefreshNew | Pending::SetMode(_) | Pending::SetModel(_) | Pending::SetConfig(_, _))) || !core.state.approvals.is_empty()
+        self.prompting.is_some() || self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Session | Pending::Refresh | Pending::RefreshNew | Pending::SetMode(_) | Pending::SetModel(_) | Pending::SetConfig(_, _) | Pending::Authenticate)) || !core.state.approvals.is_empty()
     }
 
     fn settle(&self, core: &mut Core) {
@@ -431,7 +476,7 @@ impl Acp {
     }
 
     fn capabilities(&mut self, core: &mut Core, result: &Value) {
-        let steering = self.account && result.pointer("/agentCapabilities/_meta/cognition.ai~1midTurnPrompts").and_then(Value::as_bool) == Some(true);
+        let steering = self.devin() && result.pointer("/agentCapabilities/_meta/cognition.ai~1midTurnPrompts").and_then(Value::as_bool) == Some(true);
         self.steering = Some(steering);
         core.meta.features.retain(|f| f != "steer" && f != "queue_steer");
         if steering {
@@ -444,7 +489,7 @@ impl Acp {
         if self.restore_waiting(core) {
             self.next(core);
         }
-        if self.account && self.steering.is_none() && self.session.is_some() && !self.pending.values().any(|p| matches!(p, Pending::Initialize)) && core.state.status != Status::Exited {
+        if self.devin() && self.steering.is_none() && self.session.is_some() && !self.pending.values().any(|p| matches!(p, Pending::Initialize)) && core.state.status != Status::Exited {
             // Older images did not retain this capability; initialize leaves Devin's session intact.
             self.steering = Some(false);
             self.initialize(core, Pending::Capabilities);
@@ -521,7 +566,7 @@ impl Acp {
                     self.send(core, item, SendMode::Steer);
                 }
             }
-            Command::Approve { id, decision, message, always, .. } => self.answer(core, &id, decision, message, always),
+            Command::Approve { id, decision, message, always, answers, choices } => self.answer(core, &id, decision, message, always, choices_of(answers, choices)),
             Command::Interrupt => self.cancel(core),
             Command::SetMode { mode } => self.change(core, "mode".into(), json!(mode)),
             Command::SetModel { model, .. } => self.change(core, "model".into(), json!(model)),
@@ -603,6 +648,18 @@ impl Acp {
                 return true;
             }
         }
+        // Cursor takes a sign-in made since it started only through `authenticate`, which finds it
+        // on its machine (with none there it opens no browser: `Kind::launch` says so).
+        if self.auth.iter().any(|a| a == CURSOR_LOGIN) {
+            self.request(core, Pending::Authenticate, "authenticate", json!({"methodId": CURSOR_LOGIN}));
+            return true;
+        }
+        self.reopen(core);
+        true
+    }
+
+    /// Its session opened again after a sign-in, as it is now: loaded where it can be, else anew.
+    fn reopen(&mut self, core: &mut Core) {
         if self.ready && self.startup_mode.is_none() && !core.state.mode.is_empty() && core.state.mode != KILN_ASK && core.state.mode != KILN_BYPASS {
             self.startup_mode = Some(core.state.mode.clone());
         }
@@ -614,7 +671,6 @@ impl Acp {
             Some(_) => self.notice(core, Level::Error, "This agent cannot reload its account in an open session."),
             None => self.request(core, Pending::RefreshNew, "session/new", json!({"cwd": cwd, "mcpServers": self.mcp})),
         }
-        true
     }
 
     fn change(&mut self, core: &mut Core, id: String, value: Value) {
@@ -635,7 +691,7 @@ impl Acp {
         if self.changes.is_empty() {
             return false;
         }
-        if self.refresh || self.session.is_none() || (!self.ready && self.failed_setting.is_none()) || self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Session | Pending::Refresh | Pending::RefreshNew | Pending::SetMode(_) | Pending::SetModel(_) | Pending::SetConfig(_, _))) {
+        if self.refresh || self.session.is_none() || (!self.ready && self.failed_setting.is_none()) || self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Session | Pending::Refresh | Pending::RefreshNew | Pending::SetMode(_) | Pending::SetModel(_) | Pending::SetConfig(_, _) | Pending::Authenticate)) {
             return true;
         }
         while !self.changes.is_empty() {
@@ -685,9 +741,10 @@ impl Acp {
         core.touch_state();
         if self.bypass {
             core.effects.push(Effect::AllowBypass);
-            let waiting: Vec<String> = self.asks.keys().cloned().collect();
+            // Requests to go ahead; what Cursor asks a person (a question, a plan) stays theirs.
+            let waiting: Vec<String> = self.asks.iter().filter(|(_, a)| a.cursor.is_none()).map(|(id, _)| id.clone()).collect();
             for id in waiting {
-                self.answer(core, &id, Decision::Allow, None, None);
+                self.answer(core, &id, Decision::Allow, None, None, None);
             }
         }
         true
@@ -702,7 +759,7 @@ impl Acp {
         self.has_config = true;
         self.config = options.to_vec();
         let mut known = std::mem::take(&mut core.meta.models);
-        if self.account {
+        if self.devin() {
             let keep_default = known.iter().any(|m| m.default);
             for mut model in super::kinds::models_of("devin") {
                 if keep_default {
@@ -1094,9 +1151,13 @@ impl Acp {
         self.next(core);
     }
 
-    fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>) {
+    fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, choices: Option<Vec<ChoiceAnswer>>) {
         let Some(approval) = core.take_approval(id) else { return };
         let Some(ask) = self.asks.remove(id) else { return };
+        if let Some(c) = &ask.cursor {
+            self.answer_cursor(core, &approval, &ask.rpc, c, decision, message, choices.as_deref().unwrap_or_default());
+            return;
+        }
         let pick = |kinds: &[&str]| ask.options.iter().find(|(_, k)| kinds.contains(&k.as_str())).map(|(o, _)| o.clone());
         let option = match decision {
             Decision::Allow => pick(&["allow_once"]).or_else(|| pick(&["allow_always"])),
@@ -1140,6 +1201,123 @@ impl Acp {
             }
             self.settle(core);
         }
+    }
+
+    /// A request of Cursor's own that waits on a person: questions to answer (`cursor/ask_question`)
+    /// or a plan to approve (`cursor/create_plan`). Neither is a request to go ahead, so kiln's
+    /// Bypass answers neither.
+    fn cursor_request(&mut self, core: &mut Core, method: &str, rpc: Value, p: &Value) {
+        let id = match &rpc {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let s = |k: &str| p.get(k).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+        let tool_id = s("toolCallId");
+        let (ask, tool, title, detail, questions, plan) = if method == CURSOR_CREATE_PLAN {
+            let plan = s("plan").unwrap_or_default();
+            (CursorAsk::Plan, ToolKind::Plan, s("name").unwrap_or_else(|| "Plan ready for review".to_owned()), s("overview"), Vec::new(), Some(plan))
+        } else {
+            let mut asked = Vec::new();
+            let mut questions = Vec::new();
+            for q in p.get("questions").and_then(Value::as_array).into_iter().flatten() {
+                let Some(qid) = q.get("id").and_then(Value::as_str) else { continue };
+                let words = q.get("prompt").and_then(Value::as_str).unwrap_or("").to_owned();
+                let options: Vec<(String, String)> = q.get("options").and_then(Value::as_array).into_iter().flatten().filter_map(|o| Some((o.get("id")?.as_str()?.to_owned(), o.get("label")?.as_str()?.to_owned()))).collect();
+                questions.push(Question {
+                    id: qid.to_owned(),
+                    question: words.clone(),
+                    multi: q.get("allowMultiple").and_then(Value::as_bool).unwrap_or(false),
+                    options: options.iter().map(|(_, label)| QuestionOption { label: label.clone(), ..QuestionOption::default() }).collect(),
+                    ..Question::default()
+                });
+                asked.push((qid.to_owned(), words, options));
+            }
+            let title = s("title").or_else(|| questions.first().map(|q| q.question.clone())).unwrap_or_else(|| "Question".to_owned());
+            (CursorAsk::Questions(asked), ToolKind::Question, title, None, questions, None)
+        };
+        let approval = Approval {
+            id: id.clone(),
+            tool_id,
+            tool_name: method.to_owned(),
+            tool,
+            title,
+            detail,
+            input: clip_json(p, 64 * 1024),
+            command: None,
+            cwd: core.state.cwd.clone(),
+            diffs: Vec::new(),
+            reason: None,
+            always: Vec::new(),
+            default_to_no: false,
+            questions,
+            plan,
+            agent: None,
+            at: Core::now(),
+        };
+        core.state.doing = Some(if tool == ToolKind::Plan { "Waiting for you to review a plan" } else { "Waiting for your answer" }.to_owned());
+        self.asks.insert(id, Ask { rpc, options: Vec::new(), cursor: Some(ask) });
+        core.add_approval(approval);
+    }
+
+    /// A person's answer to one of Cursor's own requests, in its form: the options chosen (by their
+    /// ids), skipped, or the plan accepted or rejected with their words.
+    #[allow(clippy::too_many_arguments)]
+    fn answer_cursor(&mut self, core: &mut Core, approval: &Approval, rpc: &Value, ask: &CursorAsk, decision: Decision, message: Option<String>, choices: &[ChoiceAnswer]) {
+        let words = message.filter(|m| !m.trim().is_empty());
+        let outcome = match (ask, decision) {
+            (CursorAsk::Plan, Decision::Deny) => json!({"outcome": "rejected", "reason": words.unwrap_or_else(|| "The person rejected the plan.".to_owned())}),
+            (CursorAsk::Plan, _) => json!({"outcome": "accepted"}),
+            (CursorAsk::Questions(_), Decision::Deny) => json!({"outcome": "skipped", "reason": words.unwrap_or_else(|| "The person skipped the questions.".to_owned())}),
+            (CursorAsk::Questions(asked), _) => {
+                let answers: Vec<Value> = asked
+                    .iter()
+                    .filter_map(|(qid, text, options)| {
+                        let c = choices.iter().find(|c| c.id.as_deref() == Some(qid.as_str())).or_else(|| choices.iter().find(|c| c.question == *text))?;
+                        let ids: Vec<&str> = c.selected.iter().filter_map(|label| options.iter().find(|(_, l)| l == label).map(|(oid, _)| oid.as_str())).collect();
+                        (!ids.is_empty()).then(|| json!({"questionId": qid, "selectedOptionIds": ids}))
+                    })
+                    .collect();
+                if answers.is_empty() { json!({"outcome": "skipped", "reason": "The person chose no option."}) } else { json!({"outcome": "answered", "answers": answers}) }
+            }
+        };
+        core.write(&json!({"jsonrpc": "2.0", "id": rpc, "result": {"outcome": outcome}}));
+        if let Some(tid) = approval.tool_id.as_deref()
+            && let Some(e) = core.get_mut(tid)
+            && let Body::Tool(t) = &mut e.body
+        {
+            t.status = if decision == Decision::Deny { ToolStatus::Denied } else { ToolStatus::Running };
+        }
+        self.settle(core);
+    }
+
+    /// Cursor's to-dos (`cursor/update_todos`): the list as it is now, or merged into it by id.
+    fn cursor_todos(&mut self, core: &mut Core, p: &Value) {
+        let todos: Vec<(String, Todo)> = p
+            .get("todos")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|t| Some((t.get("id")?.as_str()?.to_owned(), Todo { text: t.get("content")?.as_str()?.to_owned(), status: t.get("status").and_then(Value::as_str).unwrap_or("pending").to_owned() })))
+            .collect();
+        let merge = p.get("merge").and_then(Value::as_bool).unwrap_or(false) && self.todo_ids.len() == core.state.todos.len();
+        if !merge {
+            core.state.todos.clear();
+            self.todo_ids.clear();
+        }
+        for (id, todo) in todos {
+            match self.todo_ids.iter().position(|t| *t == id) {
+                Some(i) => {
+                    if let Some(slot) = core.state.todos.get_mut(i) {
+                        *slot = todo;
+                    }
+                }
+                None => {
+                    self.todo_ids.push(id);
+                    core.state.todos.push(todo);
+                }
+            }
+        }
+        core.touch_state();
     }
 
     /// One of opencode's subagents (a child session) started, went on or ended
@@ -1271,6 +1449,8 @@ impl Acp {
                     self.update(core, params.get("update").unwrap_or(&Value::Null));
                 } else if m.strip_prefix('_').unwrap_or(&m) == OPENCODE_CHILD_UPDATE {
                     self.child_update(core, &params);
+                } else if m == CURSOR_UPDATE_TODOS {
+                    self.cursor_todos(core, &params);
                 }
             }
             (None, Some(id)) => self.response(core, &id, &v),
@@ -1332,7 +1512,12 @@ impl Acp {
                     self.next(core);
                 }
                 Pending::Session => {
-                    let hint = if msg.to_lowercase().contains("auth") { " (sign in to it in a terminal on this machine first)" } else { "" };
+                    let hint = match msg.to_lowercase().contains("auth") {
+                        // Cursor's sign-in is kiln's account card's; it goes on once signed in.
+                        true if self.kind == "cursor" => " (sign in with /login: it goes on once you're signed in)",
+                        true => " (sign in to it in a terminal on this machine first)",
+                        false => "",
+                    };
                     self.startup_failed(core, Pending::Session, format!("The agent could not open a session: {msg}{hint}"));
                 }
                 Pending::Refresh if self.empty && err.get("code").and_then(Value::as_i64) == Some(-32016) => {
@@ -1348,6 +1533,10 @@ impl Acp {
                     core.set_status(Status::Idle);
                 }
                 Pending::Initialize => self.startup_failed(core, Pending::Initialize, format!("The agent did not start: {msg}")),
+                Pending::Authenticate => {
+                    let why = err.pointer("/data/message").and_then(Value::as_str).unwrap_or(&msg).to_owned();
+                    self.startup_failed(core, Pending::Authenticate, format!("Cursor isn't signed in on this machine ({why}): sign in with /login, and it goes on"));
+                }
                 Pending::Capabilities => {}
                 Pending::SetMode(_) => self.setting_failed(core, id, Some("mode"), &msg),
                 Pending::SetModel(_) => self.setting_failed(core, id, Some("model"), &msg),
@@ -1366,6 +1555,7 @@ impl Acp {
                     core.touch_meta();
                 }
                 core.state.harness_status = status_rows(&result);
+                self.auth = result.get("authMethods").and_then(Value::as_array).into_iter().flatten().filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_owned)).collect();
                 core.touch_state();
                 let cwd = core.state.cwd.clone();
                 match self.resume.clone().filter(|_| self.can_load) {
@@ -1383,6 +1573,8 @@ impl Acp {
                 }
             }
             Pending::Capabilities => self.capabilities(core, &result),
+            // Signed in: its session opens again with it.
+            Pending::Authenticate => self.reopen(core),
             Pending::Session | Pending::Refresh | Pending::RefreshNew => {
                 if new_session { core.skills_provider_ready(); }
                 self.close_streams(core);
@@ -1557,6 +1749,10 @@ impl Acp {
     }
 
     fn agent_request(&mut self, core: &mut Core, method: &str, rpc: Value, p: Value) {
+        if method == CURSOR_ASK_QUESTION || method == CURSOR_CREATE_PLAN {
+            self.cursor_request(core, method, rpc, &p);
+            return;
+        }
         if method != "session/request_permission" {
             // kiln offered no file system or terminal: the agent should not ask for them.
             core.write(&json!({"jsonrpc": "2.0", "id": rpc, "error": {"code": -32601, "message": format!("kiln does not provide {method}")}}));
@@ -1666,7 +1862,7 @@ impl Acp {
             core.upsert(t, task, Body::Tool(Box::new(pending)));
         }
         core.state.doing = Some("Waiting for your approval".to_owned());
-        self.asks.insert(id, Ask { rpc, options });
+        self.asks.insert(id, Ask { rpc, options, cursor: None });
         core.add_approval(approval);
     }
 
@@ -1768,6 +1964,8 @@ impl Acp {
                             .collect()
                     })
                     .unwrap_or_default();
+                // The list is the plan's now: Cursor's ids for the one before no longer name it.
+                self.todo_ids.clear();
                 core.touch_state();
             }
             "available_commands_update" => {
@@ -3034,5 +3232,125 @@ mod tests {
         // One that ended still takes a follow-up (opencode resumes it).
         ad.line(&mut core, &child("c1", "s1", "completed").to_string());
         assert!(core.state.tasks.iter().any(|t| t.id == "c1" && t.takes == [SendMode::Queue]));
+    }
+
+    /// Cursor's ACP server as `agent acp` (2026.11.11) answers: its `initialize` (its one sign-in,
+    /// `cursor_login`) and a session with its modes (Agent, Plan, Ask).
+    fn cursor_session() -> (Acp, Core) {
+        let mut a = Acp::from_spec(&super::super::session::Spec { kind: "cursor".into(), ..Default::default() });
+        let mut core = Core::new();
+        core.state.cwd = "/w".into();
+        a.start(&mut core);
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": cursor_init()})]);
+        let modes = json!({"currentModeId": "agent", "availableModes": [{"id": "agent", "name": "Agent", "description": "Full agent capabilities with tool access"}, {"id": "plan", "name": "Plan", "description": "Read-only mode for planning and designing before implementation"}, {"id": "ask", "name": "Ask", "description": "Q&A mode - no edits or command execution"}]});
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "c1", "modes": modes}})]);
+        let _ = written(&mut core);
+        (a, core)
+    }
+
+    fn cursor_init() -> Value {
+        json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "mcpCapabilities": {"http": true, "sse": true}, "promptCapabilities": {"audio": false, "embeddedContext": false, "image": true}, "sessionCapabilities": {"list": {}}}, "authMethods": [{"id": "cursor_login", "name": "Cursor Login", "description": "Authenticate using existing Cursor login credentials. Run 'agent login' first if not logged in."}]})
+    }
+
+    fn approve(id: &str, decision: Decision, message: Option<&str>, choices: Option<Vec<ChoiceAnswer>>) -> Command {
+        Command::Approve { id: id.into(), decision, message: message.map(str::to_owned), always: None, answers: None, choices }
+    }
+
+    /// Cursor's questions (`cursor/ask_question`, cursor.com/docs/cli/acp) wait on a person, kiln's
+    /// Bypass or not, and their answers go back as the ids of the options chosen; skipped, with the
+    /// person's words.
+    #[test]
+    fn cursors_questions_wait_on_a_person_and_go_back_as_its_option_ids() -> anyhow::Result<()> {
+        let (mut a, mut core) = cursor_session();
+        assert_eq!(core.state.mode, "agent");
+        a.command(&mut core, Command::SetMode { mode: KILN_BYPASS.into() });
+        let _ = written(&mut core);
+        let ask = json!({"toolCallId": "call_123", "title": "Need input", "questions": [
+            {"id": "q1", "prompt": "Which mode should I use?", "options": [{"id": "agent", "label": "Agent"}, {"id": "plan", "label": "Plan"}], "allowMultiple": false},
+            {"id": "q2", "prompt": "Which files?", "options": [{"id": "a", "label": "a.rs"}, {"id": "b", "label": "b.rs"}], "allowMultiple": true},
+        ]});
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 40, "method": "cursor/ask_question", "params": ask})]);
+        assert!(written(&mut core).is_empty(), "nothing but a person answers it");
+        let approval = core.state.approvals.first().cloned().ok_or_else(|| anyhow::anyhow!("no question shown"))?;
+        assert_eq!((approval.tool, approval.title.as_str()), (ToolKind::Question, "Need input"));
+        assert_eq!(approval.questions.iter().map(|q| (q.id.as_str(), q.multi, q.options.len())).collect::<Vec<_>>(), [("q1", false, 2), ("q2", true, 2)]);
+        let choices = vec![
+            ChoiceAnswer { question: "Which mode should I use?".into(), id: Some("q1".into()), selected: vec!["Plan".into()], other: None, note: None },
+            ChoiceAnswer { question: "Which files?".into(), id: None, selected: vec!["a.rs".into(), "b.rs".into()], other: None, note: None },
+        ];
+        a.command(&mut core, approve("40", Decision::Allow, None, Some(choices)));
+        assert_eq!(written(&mut core), [json!({"jsonrpc": "2.0", "id": 40, "result": {"outcome": {"outcome": "answered", "answers": [{"questionId": "q1", "selectedOptionIds": ["plan"]}, {"questionId": "q2", "selectedOptionIds": ["a", "b"]}]}}})]);
+        assert!(core.state.approvals.is_empty());
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 41, "method": "cursor/ask_question", "params": ask})]);
+        a.command(&mut core, approve("41", Decision::Deny, Some("Decide yourself"), None));
+        assert_eq!(written(&mut core), [json!({"jsonrpc": "2.0", "id": 41, "result": {"outcome": {"outcome": "skipped", "reason": "Decide yourself"}}})]);
+        Ok(())
+    }
+
+    /// Cursor's plan to approve (`cursor/create_plan`) waits for a person: accepted, or rejected
+    /// with their words in its answer (not sent again as a prompt); its plan's to-dos are the
+    /// session's.
+    #[test]
+    fn cursors_plans_wait_for_approval_and_a_rejection_carries_the_persons_words() -> anyhow::Result<()> {
+        let (mut a, mut core) = cursor_session();
+        let todos = json!([{"id": "todo-1", "content": "Inspect current tab sizing logic", "status": "completed"}, {"id": "todo-2", "content": "Update layout calculations", "status": "in_progress"}, {"id": "todo-3", "content": "Verify editor behavior", "status": "pending"}]);
+        let plan = json!({"toolCallId": "call_124", "name": "Refactor tabs layout", "overview": "Tighten layout behavior and preserve existing UX.", "plan": "1. Inspect current tab sizing logic.\n2. Update layout calculations.\n3. Verify editor behavior.", "todos": todos, "isProject": false});
+        let entries = json!([{"content": "Inspect current tab sizing logic", "priority": "medium", "status": "completed"}, {"content": "Update layout calculations", "priority": "medium", "status": "in_progress"}, {"content": "Verify editor behavior", "priority": "medium", "status": "pending"}]);
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "c1", "update": {"sessionUpdate": "plan", "entries": entries}}}), json!({"jsonrpc": "2.0", "id": 42, "method": "cursor/create_plan", "params": plan})]);
+        let approval = core.state.approvals.first().cloned().ok_or_else(|| anyhow::anyhow!("no plan shown"))?;
+        assert_eq!((approval.tool, approval.title.as_str(), approval.detail.as_deref()), (ToolKind::Plan, "Refactor tabs layout", Some("Tighten layout behavior and preserve existing UX.")));
+        assert!(approval.plan.as_deref().is_some_and(|p| p.starts_with("1. Inspect current tab sizing logic.")));
+        assert_eq!(core.state.todos.len(), 3);
+        a.command(&mut core, approve("42", Decision::Deny, Some("Keep the old sizing"), None));
+        assert_eq!(written(&mut core), [json!({"jsonrpc": "2.0", "id": 42, "result": {"outcome": {"outcome": "rejected", "reason": "Keep the old sizing"}}})]);
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 43, "method": "cursor/create_plan", "params": plan})]);
+        a.command(&mut core, approve("43", Decision::Allow, None, None));
+        assert_eq!(written(&mut core), [json!({"jsonrpc": "2.0", "id": 43, "result": {"outcome": {"outcome": "accepted"}}})]);
+        Ok(())
+    }
+
+    /// Cursor's to-dos (`cursor/update_todos`): the list given, or merged into the list by id.
+    #[test]
+    fn cursors_to_dos_replace_the_list_or_merge_into_it_by_id() {
+        let (mut a, mut core) = cursor_session();
+        let update = |merge: bool, todos: Value| json!({"jsonrpc": "2.0", "method": "cursor/update_todos", "params": {"toolCallId": "call_125", "todos": todos, "merge": merge}});
+        let now = |core: &Core| core.state.todos.iter().map(|t| (t.text.clone(), t.status.clone())).collect::<Vec<_>>();
+        let pair = |text: &str, status: &str| (text.to_owned(), status.to_owned());
+        feed(&mut a, &mut core, &[update(false, json!([{"id": "1", "content": "Set up project structure", "status": "completed"}, {"id": "2", "content": "Add authentication", "status": "in_progress"}, {"id": "3", "content": "Write unit tests", "status": "pending"}]))]);
+        assert_eq!(now(&core), [pair("Set up project structure", "completed"), pair("Add authentication", "in_progress"), pair("Write unit tests", "pending")]);
+        feed(&mut a, &mut core, &[update(true, json!([{"id": "2", "content": "Add authentication", "status": "completed"}, {"id": "4", "content": "Ship it", "status": "pending"}]))]);
+        assert_eq!(now(&core), [pair("Set up project structure", "completed"), pair("Add authentication", "completed"), pair("Write unit tests", "pending"), pair("Ship it", "pending")]);
+        feed(&mut a, &mut core, &[update(false, json!([{"id": "9", "content": "Only this", "status": "pending"}]))]);
+        assert_eq!(now(&core), [pair("Only this", "pending")]);
+    }
+
+    /// Not signed in, Cursor opens no session and says so; signed in through kiln's account card,
+    /// it takes the sign-in through `authenticate` (it knew only the one it started with) and then
+    /// its session opens.
+    #[test]
+    fn cursor_takes_a_sign_in_made_in_kiln_through_authenticate_then_opens_its_session() -> anyhow::Result<()> {
+        let mut a = Acp::from_spec(&super::super::session::Spec { kind: "cursor".into(), ..Default::default() });
+        let mut core = Core::new();
+        a.start(&mut core);
+        let _ = written(&mut core);
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": cursor_init()})]);
+        let w = written(&mut core);
+        assert!(!w.iter().any(|v| v.get("method") == Some(&json!("authenticate"))), "it's never asked to sign in by itself");
+        let new = w.iter().find(|v| v.get("method") == Some(&json!("session/new"))).cloned().ok_or_else(|| anyhow::anyhow!("no session/new: {w:?}"))?;
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": new.get("id"), "error": {"code": -32000, "message": "Authentication required", "data": {"message": "Authentication required. Please run 'agent login' first, then call authenticate() with methodId 'cursor_login'."}}})]);
+        assert_eq!(core.state.status, Status::Exited);
+        assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text.contains("/login"))));
+        assert!(core.meta.commands.iter().any(|c| c.name == "login"), "its /login is kiln's account card");
+        a.command(&mut core, Command::Control { id: "account".into(), value: None });
+        let auth = request(&mut core, "authenticate")?;
+        assert_eq!(auth.pointer("/params/methodId"), Some(&json!("cursor_login")));
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": auth.get("id"), "result": {}})]);
+        let new = request(&mut core, "session/new")?;
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": new.get("id"), "result": {"sessionId": "c1"}})]);
+        assert_eq!(core.state.harness_session.as_deref(), Some("c1"));
+        assert_eq!(core.state.status, Status::Idle);
+        // Devin's own model catalog and mid-turn prompts aren't Cursor's.
+        assert!(!a.devin() && a.steering == Some(false));
+        Ok(())
     }
 }

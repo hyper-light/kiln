@@ -10,6 +10,7 @@ use super::claude::Claude;
 use super::codex::Codex;
 use super::core::Core;
 use super::model::{Command, Delivery, QueueItem, SendMode};
+use super::pi::Pi;
 use super::session::Spec;
 
 #[cfg(test)]
@@ -40,6 +41,8 @@ pub enum Protocol {
     Acp(&'static [&'static str]),
     /// Antigravity's headless multi-turn stream-json (`agy --input-format stream-json`).
     AgyStreamJson,
+    /// Pi's RPC mode (`pi --mode rpc`): JSON commands on stdin, responses and events on stdout.
+    PiRpc,
     /// No structured mode: it runs as a terminal program, in a kiln terminal.
     Terminal,
 }
@@ -54,6 +57,11 @@ const KINDS: &[Kind] = &[
     // Amp has no ACP mode of its own; its ACP adapter (amp-acp) wraps the signed-in Amp CLI.
     Kind { id: "amp", name: "Amp", program: "amp-acp", verified: false, protocol: Protocol::Acp(&[]), screen: &["amp"], screen_takes_command: false },
     Kind { id: "antigravity", name: "Antigravity CLI", program: "agy", verified: true, protocol: Protocol::AgyStreamJson, screen: &["agy"], screen_takes_command: false },
+    // Cursor's CLI agent: `agent acp`, its ACP server (cursor.com/docs/cli/acp); its installer
+    // puts `agent` (and the older name, `cursor-agent`) in ~/.local/bin.
+    Kind { id: "cursor", name: "Cursor CLI", program: "agent", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["agent"], screen_takes_command: false },
+    // Pi (pi.dev): its RPC mode (`pi --mode rpc`).
+    Kind { id: "pi", name: "Pi", program: "pi", verified: false, protocol: Protocol::PiRpc, screen: &["pi"], screen_takes_command: false },
 ];
 
 impl Kind {
@@ -85,6 +93,7 @@ impl Kind {
             Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)).with_speed(spec.speed.clone()))),
             Protocol::CodexAppServer => Adapter::Codex(Box::new(Codex::from_spec(spec))),
             Protocol::AgyStreamJson => Adapter::Agy(Box::new(Agy::new(spec))),
+            Protocol::PiRpc => Adapter::Pi(Box::new(Pi::new(spec))),
             Protocol::Acp(_) | Protocol::Terminal => Adapter::Acp(Box::new(Acp::from_spec(spec))),
         }
     }
@@ -158,6 +167,11 @@ impl Kind {
             }
             Protocol::Acp(args) => {
                 p.args(args);
+                // Cursor's sign-in (its ACP `authenticate`, `agent login`) opens no browser on the
+                // machine: its link is shown wherever the person is (`crate::accounts`).
+                if self.id == "cursor" {
+                    p.env("NO_OPEN_BROWSER", "1");
+                }
             }
             // Model, effort, mode and the conversation are flags: a change starts it again.
             Protocol::AgyStreamJson => {
@@ -168,6 +182,10 @@ impl Kind {
                 if let Some((_, sock, prefer)) = local_tools(spec) {
                     p.envs(crate::reach::mcp::agy_env(sock, prefer, session));
                 }
+            }
+            // Its session, model, thinking level and mode's tools are flags (`pi::args`).
+            Protocol::PiRpc => {
+                p.args(super::pi::args(spec));
             }
             Protocol::Terminal => {}
         }
@@ -497,6 +515,7 @@ pub enum Adapter {
     Codex(Box<Codex>),
     Acp(Box<Acp>),
     Agy(Box<Agy>),
+    Pi(Box<Pi>),
 }
 
 /// An adapter written out whole, for this process's next image (an in-place upgrade).
@@ -507,13 +526,14 @@ pub enum Frozen {
     Codex(Box<Codex>),
     Acp(Box<Acp>),
     Agy(Box<Agy>),
+    Pi(Box<Pi>),
 }
 
 impl Adapter {
     /// Actual retained provider requests during live-process adoption. Presentation delivery
     /// maps are not evidence of a native flight, and a new provider starts with none.
     pub(crate) fn retained_input_ids(&self) -> Vec<super::admission::LegacyFlight> {
-        match self { Self::Claude(adapter) => adapter.retained_input_ids(), Self::Codex(adapter) => adapter.retained_input_ids(), Self::Acp(adapter) => adapter.retained_input_ids(), Self::Agy(adapter) => adapter.retained_input_ids() }
+        match self { Self::Claude(adapter) => adapter.retained_input_ids(), Self::Codex(adapter) => adapter.retained_input_ids(), Self::Acp(adapter) => adapter.retained_input_ids(), Self::Agy(adapter) => adapter.retained_input_ids(), Self::Pi(adapter) => adapter.retained_input_ids() }
     }
     /// The MCP servers a session it opens gets, for an adapter that gives them over its protocol
     /// (ACP); the others get theirs as they start ([`Kind::launch`]).
@@ -530,6 +550,7 @@ impl Adapter {
             Self::Codex(a) => Frozen::Codex(a),
             Self::Acp(a) => Frozen::Acp(a),
             Self::Agy(a) => Frozen::Agy(a),
+            Self::Pi(a) => Frozen::Pi(a),
         }
     }
 
@@ -539,6 +560,7 @@ impl Adapter {
             Frozen::Codex(a) => Self::Codex(a),
             Frozen::Acp(a) => Self::Acp(a),
             Frozen::Agy(a) => Self::Agy(a),
+            Frozen::Pi(a) => Self::Pi(a),
         }
     }
 
@@ -551,6 +573,7 @@ impl Adapter {
             Self::Codex(a) => a.start(core),
             Self::Acp(a) => a.start(core),
             Self::Agy(a) => a.start(core),
+            Self::Pi(a) => a.start(core),
         }
         self.settle_subagents(core);
     }
@@ -561,6 +584,7 @@ impl Adapter {
             Self::Codex(a) => a.line(core, line),
             Self::Acp(a) => a.line(core, line),
             Self::Agy(a) => a.line(core, line),
+            Self::Pi(a) => a.line(core, line),
         }
         self.settle_subagents(core);
     }
@@ -579,6 +603,7 @@ impl Adapter {
                 Self::Codex(a) => a.command(core, c),
                 Self::Acp(a) => a.command(core, c),
                 Self::Agy(a) => a.command(core, c),
+                Self::Pi(a) => a.command(core, c),
             },
         }
         self.settle_subagents(core);
@@ -606,6 +631,7 @@ impl Adapter {
             Self::Codex(a) => a.send_task(core, &t, m, mode),
             Self::Acp(a) => a.send_task(core, &t, m),
             Self::Agy(a) => a.send_task(core, &t, m, mode),
+            Self::Pi(a) => a.send_task(core, &t, m),
         }
     }
 
@@ -617,6 +643,7 @@ impl Adapter {
             Self::Codex(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
             Self::Acp(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
             Self::Agy(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
+            Self::Pi(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
         }
         // Held at its next tool call: Claude Code asks kiln before each (`claude::HOLD_HOOK`), and so
         // does Codex once it trusts kiln's hook (`codex::hook_args`).
@@ -627,6 +654,8 @@ impl Adapter {
             Self::Acp(_) => true,
             // And Antigravity, once kiln's hook in its hooks.json is heard (`antigravity::hooks_with`).
             Self::Agy(a) => a.holds_calls(),
+            // Pi has no subagents.
+            Self::Pi(_) => false,
         };
         super::subagent::settle_pausable(core, |t| can && t.tool_id.is_some());
         self.note_delivery(core);
@@ -637,7 +666,7 @@ impl Adapter {
         match self {
             Self::Codex(a) => a.held(),
             Self::Acp(a) => a.held(),
-            Self::Claude(_) | Self::Agy(_) => &[],
+            Self::Claude(_) | Self::Agy(_) | Self::Pi(_) => &[],
         }
     }
 
@@ -666,7 +695,7 @@ impl Adapter {
             Self::Claude(a) => a.drain_subagents(core),
             Self::Codex(a) => a.drain_subagents(core),
             Self::Acp(a) => a.drain_subagents(core),
-            Self::Agy(_) => {}
+            Self::Agy(_) | Self::Pi(_) => {}
         }
         self.settle_subagents(core);
     }
@@ -677,6 +706,7 @@ impl Adapter {
             Self::Codex(a) => a.exited(core, code, error),
             Self::Acp(a) => a.exited(core, code, error),
             Self::Agy(a) => a.exited(core, code, error),
+            Self::Pi(a) => a.exited(core, code, error),
         }
         // Whatever the harness and whatever its adapter knew: what it ran ends with its process
         // (a switch, a stop, a restart or a crash), its subagents' and shells' calls with it.
@@ -698,7 +728,7 @@ impl Adapter {
         let held = match self {
             Self::Codex(a) => a.take_held(),
             Self::Acp(a) => a.take_held(),
-            Self::Claude(_) | Self::Agy(_) => Vec::new(),
+            Self::Claude(_) | Self::Agy(_) | Self::Pi(_) => Vec::new(),
         };
         let mut changed = false;
         // CP-T3.2: an older adapter and the durable queue can hold the same input after an
@@ -739,6 +769,7 @@ impl Adapter {
             Self::Codex(a) => a.run_done(core, job, code, output),
             Self::Acp(a) => a.run_done(core, job, code, output),
             Self::Agy(a) => a.run_done(core, job, code, output),
+            Self::Pi(a) => a.run_done(core, job, code, output),
         }
     }
 
@@ -752,6 +783,7 @@ impl Adapter {
             Self::Codex(a) => a.next(core),
             Self::Acp(a) => a.next(core),
             Self::Agy(a) => a.next(core),
+            Self::Pi(a) => a.next(core),
         }
     }
 
@@ -770,6 +802,7 @@ impl Adapter {
             Self::Codex(a) => a.tick(core),
             Self::Agy(a) => a.tick(core),
             Self::Acp(a) => a.tick(core),
+            Self::Pi(a) => a.tick(core),
         }
         self.drain_subagents(core);
     }
@@ -790,6 +823,11 @@ impl Adapter {
                     a.go_on(core, p);
                 }
             }
+            Self::Pi(a) => {
+                if let Some(p) = super::pause::release(core, "The limit's reset time came; going on.") {
+                    a.go_on(core, p);
+                }
+            }
         }
     }
 
@@ -801,6 +839,7 @@ impl Adapter {
             Self::Codex(a) => a.go_on(core, p),
             Self::Acp(a) => a.go_on(core, p),
             Self::Agy(a) => a.go_on(core, p),
+            Self::Pi(a) => a.go_on(core, p),
         }
         // What waited for its subagents meanwhile goes too.
         self.drain_subagents(core);
@@ -814,6 +853,7 @@ impl Adapter {
             Self::Codex(a) => a.room(core),
             Self::Acp(a) => a.room(core),
             Self::Agy(a) => a.room(core),
+            Self::Pi(a) => a.room(core),
         }
         self.drain_subagents(core);
     }
@@ -833,7 +873,7 @@ impl Adapter {
         match self {
             Self::Codex(a) => a.hook(core, input, reply),
             Self::Agy(a) => a.hook(core, input, reply),
-            Self::Claude(_) | Self::Acp(_) => {
+            Self::Claude(_) | Self::Acp(_) | Self::Pi(_) => {
                 let _ = reply.send(serde_json::json!({}));
             }
         }
@@ -847,7 +887,7 @@ impl Adapter {
         let held = match self {
             Self::Codex(a) => a.holds(),
             Self::Acp(a) => a.holds(),
-            Self::Claude(_) | Self::Agy(_) => false,
+            Self::Claude(_) | Self::Agy(_) | Self::Pi(_) => false,
         };
         held || !core.state.queue.is_empty() || core.state.tasks.iter().any(|t| !t.queue.is_empty())
     }
@@ -863,6 +903,7 @@ impl Adapter {
             Self::Codex(a) => a.seed(items),
             Self::Acp(a) => a.offer_context(words()),
             Self::Agy(a) => a.offer_context(words()),
+            Self::Pi(a) => a.offer_context(words()),
             Self::Claude(_) => {}
         }
     }
@@ -874,6 +915,7 @@ impl Adapter {
             Self::Codex(a) => a.seeded(),
             Self::Acp(a) => a.seeded(),
             Self::Agy(a) => a.seeded(),
+            Self::Pi(a) => a.seeded(),
             Self::Claude(_) => true,
         }
     }
@@ -887,6 +929,7 @@ impl Adapter {
             Self::Codex(_) => (super::codex::FEATURES, super::codex::LEARNED),
             Self::Acp(_) => (super::acp::FEATURES, super::acp::LEARNED),
             Self::Agy(_) => (super::antigravity::FEATURES, super::antigravity::LEARNED),
+            Self::Pi(_) => (super::pi::FEATURES, super::pi::LEARNED),
         };
         let now = upgraded_features(features, learned, &core.meta.features);
         if now != core.meta.features {
@@ -959,6 +1002,8 @@ impl Kind {
             }
             Protocol::CodexAppServer => (super::codex::modes(true), "auto"),
             Protocol::AgyStreamJson => (super::antigravity::modes(), super::antigravity::DEFAULT_MODE),
+            Protocol::PiRpc => (super::pi::modes(), super::pi::DEFAULT_MODE),
+            Protocol::Acp(_) if self.id == "cursor" => (cursor_modes(), CURSOR_DEFAULT_MODE),
             Protocol::Acp(_) if self.id == "devin" => (
                 [
                     ("accept-edits", "Code", "Write and edit code", false),
@@ -997,6 +1042,7 @@ impl Kind {
             Protocol::ClaudeStreamJson => super::claude::EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
             Protocol::CodexAppServer => super::codex::default_efforts(),
             Protocol::AgyStreamJson => super::antigravity::EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
+            Protocol::PiRpc => super::pi::EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
             Protocol::Acp(_) if self.id == "devin" => common_efforts(&models_of("devin")),
             Protocol::Acp(_) | Protocol::Terminal => Vec::new(),
         };
@@ -1006,6 +1052,25 @@ impl Kind {
             .collect()
     }
 }
+
+/// Cursor's modes, as its ACP server offers them (`agent acp`'s `session/new`: Agent, Plan, Ask),
+/// and kiln's Bypass, which answers yes to every request to go ahead itself; known before a
+/// session says them.
+pub(super) fn cursor_modes() -> Vec<super::model::ModeOption> {
+    let mut modes: Vec<super::model::ModeOption> = [
+        ("agent", "Agent", "Full agent capabilities with tool access"),
+        ("plan", "Plan", "Read-only mode for planning and designing before implementation"),
+        ("ask", "Ask", "Q&A mode - no edits or command execution"),
+    ]
+    .into_iter()
+    .map(|(id, label, description)| super::model::ModeOption { id: id.into(), label: label.into(), description: description.into(), dangerous: false })
+    .collect();
+    modes.extend(super::acp::kiln_modes().into_iter().filter(|m| m.dangerous));
+    modes
+}
+
+/// A new Cursor session's mode: its own default, Agent.
+pub(super) const CURSOR_DEFAULT_MODE: &str = "agent";
 
 fn common_efforts(models: &[super::model::ModelOption]) -> Vec<String> {
     models.first().map(|first| first.efforts.iter().filter(|e| models.iter().all(|m| m.efforts.contains(e))).cloned().collect()).unwrap_or_default()
@@ -1261,6 +1326,61 @@ mod tests {
         Ok(())
     }
 
+    /// Cursor's CLI runs its ACP server (`agent acp`, cursor.com/docs/cli/acp), told to open no
+    /// browser on the machine; its own terminal interface is `agent`. Its modes are known before it
+    /// says them, each placed in lineage's order, so a child starts in one within its parent's.
+    #[test]
+    fn cursor_runs_its_acp_server_without_a_browser_and_its_modes_are_placed() -> anyhow::Result<()> {
+        use super::super::lineage::{Level, child_mode, level};
+        let kind = Kind::get("cursor").ok_or_else(|| anyhow::anyhow!("no Cursor harness"))?;
+        assert_eq!((kind.program, kind.protocol, kind.screen, kind.screen_takes_command), ("agent", Protocol::Acp(&["acp"]), &["agent"][..], false));
+        let cwd = tempfile::tempdir()?;
+        let spec = Spec { kind: "cursor".into(), program: Some("/path/to/agent".into()), cwd: Some(cwd.path().to_string_lossy().into_owned()), mode: Some("plan".into()), ..Spec::default() };
+        let launch = kind.launch(&spec, "session")?;
+        assert_eq!(launch.get_args().collect::<Vec<_>>(), ["acp"]);
+        let env: std::collections::HashMap<_, _> = launch.get_envs().collect();
+        assert_eq!(env.get(std::ffi::OsStr::new("NO_OPEN_BROWSER")), Some(&Some(std::ffi::OsStr::new("1"))));
+        let (modes, default) = kind.modes();
+        assert_eq!(default, "agent");
+        assert_eq!(modes.iter().map(|m| (m.id.as_str(), m.dangerous)).collect::<Vec<_>>(), [("agent", false), ("plan", false), ("ask", false), (super::super::acp::KILN_BYPASS, true)]);
+        for (mode, l) in [("plan", Level::Plan), ("ask", Level::Plan), ("agent", Level::AcceptEdits), (super::super::acp::KILN_BYPASS, Level::Bypass)] {
+            assert_eq!(level("cursor", mode), Some(l), "{mode}");
+        }
+        assert_eq!(level("cursor", ""), Some(Level::AcceptEdits), "its own default, Agent");
+        // Under a parent that asks, a child doesn't start in Agent (it may edit unasked).
+        assert_eq!(child_mode("cursor", None, Level::Ask, false), Ok(Some("plan".to_owned())));
+        assert_eq!(child_mode("cursor", None, Level::AcceptEdits, false), Ok(Some("agent".to_owned())));
+        assert!(child_mode("cursor", Some("agent"), Level::Ask, false).is_err());
+        Ok(())
+    }
+
+    /// Pi runs in its RPC mode (`pi --mode rpc`) on its session, its mode's tools its flags; its
+    /// own terminal interface is `pi`. It asks before nothing, so its modes are placed by what their
+    /// tools can do: Full access is Bypass.
+    #[test]
+    fn pi_runs_its_rpc_mode_with_its_modes_tools_and_its_modes_are_placed() -> anyhow::Result<()> {
+        use super::super::lineage::{Level, child_mode, level};
+        let kind = Kind::get("pi").ok_or_else(|| anyhow::anyhow!("no Pi harness"))?;
+        assert_eq!((kind.program, kind.protocol, kind.screen, kind.screen_takes_command), ("pi", Protocol::PiRpc, &["pi"][..], false));
+        let cwd = tempfile::tempdir()?;
+        let spec = Spec { kind: "pi".into(), program: Some("/path/to/pi".into()), cwd: Some(cwd.path().to_string_lossy().into_owned()), resume: Some("s1".into()), mode: Some("read-only".into()), ..Spec::default() };
+        let launch = kind.launch(&spec, "session")?;
+        assert_eq!(launch.get_args().collect::<Vec<_>>(), ["--mode", "rpc", "--session-id", "s1", "--tools", "read,grep,find,ls", "--exclude-tools", "mcp__*"]);
+        assert!(matches!(kind.adapter(&spec), Adapter::Pi(_)));
+        let (modes, default) = kind.modes();
+        assert_eq!(default, "edit");
+        assert_eq!(modes.iter().map(|m| (m.id.as_str(), m.dangerous)).collect::<Vec<_>>(), [("read-only", false), ("edit", false), ("full", true)]);
+        assert_eq!(kind.efforts().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["off", "minimal", "low", "medium", "high"]);
+        for (mode, l) in [("read-only", Level::Plan), ("edit", Level::AcceptEdits), ("full", Level::Bypass)] {
+            assert_eq!(level("pi", mode), Some(l), "{mode}");
+        }
+        assert_eq!(child_mode("pi", None, Level::Ask, false), Ok(Some("read-only".to_owned())));
+        assert_eq!(child_mode("pi", None, Level::Bypass, true), Ok(Some("edit".to_owned())), "never Full access unasked");
+        assert!(child_mode("pi", Some("full"), Level::Bypass, false).is_err(), "Full access needs its parent's own permission to skip checks");
+        assert!(!kind.own_record() && kind.switchable());
+        Ok(())
+    }
+
     /// None of kiln's own variables in the environment of the server that starts an agent (its data
     /// folder, config, supervisor's socket and admin token: a test server an agent started opened
     /// production's database through its KILN_DATA_DIR, 2026-11-06), nor in the shell `kiln spawn`
@@ -1375,7 +1495,7 @@ mod tests {
     /// back whole: what an in-place upgrade hands the next image of the runner.
     #[test]
     fn every_adapter_is_written_out_and_read_back_whole() -> anyhow::Result<()> {
-        for id in ["claude", "codex", "gemini", "devin"] {
+        for id in ["claude", "codex", "gemini", "devin", "cursor", "pi"] {
             let kind = Kind::get(id).ok_or_else(|| anyhow::anyhow!("no kind {id}"))?;
             let mut adapter = kind.adapter(&Spec { kind: id.to_owned(), ..Spec::default() });
             let mut core = Core::new();
