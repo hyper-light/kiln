@@ -216,8 +216,10 @@ pub async fn materialize(b: &Builtin, platforms: &[String], variant: Option<&str
                 Ok(()) => std::fs::rename(&staging, &at).map_err(io(&at)),
                 Err(e) => Err(e),
             };
+            // A tree may hold a directory its owner may not search (0644), which `remove_dir_all` can't
+            // empty: the unpacker's discard makes each searchable first.
             if filled.is_err() {
-                let _ = std::fs::remove_dir_all(&staging);
+                unpack::discard(&staging);
             }
             filled?;
             made.push(at);
@@ -227,7 +229,7 @@ pub async fn materialize(b: &Builtin, platforms: &[String], variant: Option<&str
     .await;
     if let Err(e) = result {
         for at in &made {
-            let _ = std::fs::remove_dir_all(at);
+            unpack::discard(at);
         }
         return Err(e);
     }
