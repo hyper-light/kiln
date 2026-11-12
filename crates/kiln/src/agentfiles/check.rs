@@ -29,9 +29,9 @@ use crate::hub::Hub;
 /// The target no stage is named: Shards' plan stops where it looks for it, its static checks done.
 const TARGET: &str = "kiln:static-check";
 
-/// How long a check may take: as long as kiln waits for a tool asked its version (`agent`'s
-/// `binary_runs`, `runner::runtime::memo`), for a check that reads no network and plans no step.
-pub const WITHIN: Duration = Duration::from_secs(30);
+/// How long a check may take: as long as kiln waits for a tool asked its version
+/// ([`crate::proc::VERSION_WITHIN`]), for a check that reads no network and plans no step.
+pub const WITHIN: Duration = crate::proc::VERSION_WITHIN;
 
 /// What Shards said of an Agentfile's text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
