@@ -270,7 +270,7 @@ fn antigravity_pin_names_agy_for_both_platforms() -> anyhow::Result<()> {
         *url = Value::from(other);
         Some(())
     })?;
-    ensure!(other_release != pin.to_string() && check_pin(&other_release).is_err(), "an archive of another release's directory passed");
+    ensure!(serde_json::from_str::<Value>(&other_release)? != pin && check_pin(&other_release).is_err(), "an archive of another release's directory passed");
     let plain_http = edited(b.pin, |p| {
         let url = file_of(p, "linux/arm64")?.get_mut("url")?;
         let other = url.as_str()?.replacen("https://", "http://", 1);
