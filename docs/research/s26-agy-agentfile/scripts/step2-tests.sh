@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Plan step 26, step 2's record: kiln's module tests, Shards' own check of the Agentfile and clippy,
+# Plan step 26, step 2's record: kiln's module tests, its integration test, Shards' own checks of the
+# Agentfiles and clippy,
 # run from the committed tree of s26-agy-agentfile (s26.bundle over kiln as cloned from GitHub),
 # nothing laid over it. Writes the record to $W/e_step2_tests.txt and prints it.
 set -uo pipefail
@@ -33,14 +34,19 @@ say "\$ cargo test --locked -p kiln --lib agentfiles::builtin"
 nice -n 10 cargo test --locked -p kiln --lib agentfiles::builtin > "$W/test3.log" 2>&1; t=$?
 grep -E '^(test |running |test result)|^Error|panicked' "$W/test3.log" | while IFS= read -r l; do say "$l"; done
 say "exit $t"
+say ""
+say "\$ cargo test --locked -p kiln --test agentfiles"
+nice -n 10 cargo test --locked -p kiln --test agentfiles > "$W/test3-it.log" 2>&1; i=$?
+grep -E '^(test |running |test result)|^Error|panicked' "$W/test3-it.log" | while IFS= read -r l; do say "$l"; done
+say "exit $i"
 S="$W/shards-v0.7.0/shards-linux-amd64"
 say ""
 say "Shards v0.7.0's release binary, shards-linux-amd64, against its SHA256SUMS (https://github.com/hyper-light/shards/releases/download/v0.7.0/SHA256SUMS):"
 (cd "$W/shards-v0.7.0" && grep ' shards-linux-amd64$' SHA256SUMS | sha256sum -c -) 2>&1 | while IFS= read -r l; do say "  $l"; done
 home=$(mktemp -d "$W/shards-home.XXXXXX")
 say "  $(SHARDS_HOME="$home" "$S" version 2>&1 | grep -E 'Version|Git commit' | tr -s ' ' | tr '\n' ';')"
-say "\$ KILN_TEST_SHARDS=<that binary> SHARDS_HOME=<an empty directory> cargo test --locked -p kiln --lib -- antigravity_agentfile_passes_shards_own_check step30_a_real_shards_checks_without_resolving_bases"
-KILN_TEST_SHARDS="$S" SHARDS_HOME="$home" nice -n 10 cargo test --locked -p kiln --lib -- antigravity_agentfile_passes_shards_own_check step30_a_real_shards_checks_without_resolving_bases > "$W/test3-shards.log" 2>&1; s=$?
+say "\$ KILN_TEST_SHARDS=<that binary> SHARDS_HOME=<an empty directory> cargo test --locked -p kiln --lib -- antigravity_agentfile_passes_shards_own_check step23_a_real_shards_checks_every_builtin step30_a_real_shards_checks_without_resolving_bases"
+KILN_TEST_SHARDS="$S" SHARDS_HOME="$home" nice -n 10 cargo test --locked -p kiln --lib -- antigravity_agentfile_passes_shards_own_check step23_a_real_shards_checks_every_builtin step30_a_real_shards_checks_without_resolving_bases > "$W/test3-shards.log" 2>&1; s=$?
 grep -E '^(test |running |test result)|^Error|panicked' "$W/test3-shards.log" | while IFS= read -r l; do say "$l"; done
 say "exit $s"
 rm -rf "$home"
@@ -50,5 +56,5 @@ nice -n 10 cargo clippy --locked -p kiln --all-targets -- -D warnings > "$W/clip
 grep -E '^(warning|error)|Finished' "$W/clippy3.log" | while IFS= read -r l; do say "$l"; done
 say "exit $c"
 say ""
-say "verdict: tests exit $t, Shards check exit $s, clippy exit $c"
-[ "$t" = 0 ] && [ "$s" = 0 ] && [ "$c" = 0 ]
+say "verdict: module tests exit $t, integration test exit $i, Shards checks exit $s, clippy exit $c"
+[ "$t" = 0 ] && [ "$i" = 0 ] && [ "$s" = 0 ] && [ "$c" = 0 ]
