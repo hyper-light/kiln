@@ -1028,12 +1028,35 @@ the lock:
 | 4 | 13x | 11x | 49x | 41x |
 | 8 | 41x | 35x | 58x | 41x |
 
-Hints came at 3 to 17 million a second; a fleet's runners say their room when it changes, a dozen
-runners a few times a second each. So the lock costs nothing at today's fleet, and is what fails
-first at a large one: other cores writing the owner's records under it move them between caches on
-every decision. Words to the owner as messages it drains (one writer, the newest word for each
-runner taken) keep them in one core's cache, as the CI engine's kernel already has them (its
-dispatcher's one task).
+Hints came at 3 to 17 million a second, as fast as the threads could; a fleet's runners say
+their room when it changes, a dozen runners a few times a second each. Against a mailbox the
+owner drains itself (`--mailbox M`: each runner's newest word put in a set behind a lock of its
+own, held for the insert, and a flag raised; before each step the owner reads the flag and takes
+the set when it's up, so the owner's records have one writer), run that way the mailbox did
+worse: its owner applied every word its posters made, up to 1,000 a step, where the lock let
+fewer in. At the same words a second (`--rate`, spread over the threads and paced by the clock;
+commit `20318e8b3`), a step's cost over the bare kernel's, for 1 to 8 threads at 10,000 runners,
+rho 0.5 and 0.9, three runs on each machine:
+
+| words a second | x86, lock | x86, mailbox | M3, lock | M3, mailbox |
+|---|---|---|---|---|
+| 10,000 | 1.00-1.42x | 1.02-1.33x | 2.35-5.7x | 1.04-1.30x |
+| 100,000 | 1.03-1.28x | 1.03-1.34x | 2.6-8.8x | 1.06-1.39x |
+| 1,000,000 | 1.29-2.40x | 1.11-1.43x | 2.5-101x | 1.18-21x |
+| 10,000,000 | 1.99-44x | 4.9-47x | 2.5-72x | 17-457x |
+
+With no thread at all the owners cost 1.0x to 1.2x on x86 (a step taken one at a time, the lock's
+with a lock each) and 1.0x to 2.1x on the M3 Ultra. On x86 the two designs cost the same to
+100,000 words a second and the mailbox less at a million. On the M3 Ultra the lock costs 2.4x and
+more from 10,000 a second (why isn't measured here; a contended lock there puts its waiter to sleep
+in the kernel), and its hinters can't get their words in: at a million a second one hinter got 2%
+to 6% of them in. The mailbox there stays within 1.4x to 100,000 words a second; at a million,
+eight posters contending for its own lock cost its owner 2.4x to 21x. At ten million a second (a
+thousand a runner a second, no fleet's) both fail, the lock's hinters shut out and the mailbox's
+owner applying every word that came; unpaced, the M3's mailbox with one poster ran for hours
+without finishing its steps (x86: under a minute). The server's v1 kernel takes its words by mail
+(Adopted, above), its scheduling loop the one writer, and a look takes at most one word a runner
+however many came.
 
 ## What remains
 
