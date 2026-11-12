@@ -52,15 +52,19 @@ impl Speeds {
     }
 
     /// Runner `runner`'s runs just kept (`speeds`: each one's kind and y) folded in, and the fit
-    /// made again.
+    /// made again when one changed a kind that ran on two or more machines (the rest say nothing
+    /// of speed: most kinds, 4,679 of production's 4,701 on 2026-11-12).
     pub async fn observe(&self, store: &crate::store::Store, runner: &str, speeds: &[(String, f64)]) {
         self.loaded(store).await;
         let mut g = self.fleet.lock();
         let Some(f) = g.as_mut() else { return };
+        let mut shared = false;
         for (key, y) in speeds {
-            f.observe(key, runner, *y);
+            shared |= f.observe(key, runner, *y);
         }
-        self.fit.store(Arc::new(f.fit()));
+        if shared {
+            self.fit.store(Arc::new(f.fit()));
+        }
     }
 
     /// The store read as the server starts, so the directory says speeds before a run is kept.
