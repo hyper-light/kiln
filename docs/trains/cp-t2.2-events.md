@@ -5,8 +5,8 @@ persisted class in kiln's bus, and step 8, kiln's CI and deploy events on it (AC
 T-T2.2.1): what it delivers, what deploying it does and how to watch it, its risks and its
 rollback, and what's still open.
 
-**Where it stands (2026-11-09):** on branch `cp/t2.2-land` (step 8's `cp/t2.2-events` merged with
-main 88a68fbeda5), not on main, not deployed. Its gates and labs are below; its landing waits on
+**Where it stands (2026-11-11):** on branch `cp/t2.2-land` (step 8's `cp/t2.2-events` merged with
+main b2dfa3f2cbc), not on main, not deployed; Ada's word to land and deploy given 2026-11-09. Its gates and labs are below; its landing waits on
 Ada's word, through Kiln Distro's train.
 
 ## What rides with it
@@ -30,7 +30,9 @@ Ada's word, through Kiln Distro's train.
 - **The webhook queues' memory owner goes** (`webhook_queues`): the store-backed deliveries
   replaced the queues it counted.
 - **Step 8's two migrations are dated 2026-11-07** (`20261107-1500`, `20261107-1501`), after
-  every migration main has.
+  every migration main had then.
+- **A leg's first wait for reviewers records `approval.waiting` with it**, through the same
+  transaction main's recovered waits share (`ci::runs::write_waits`); a recovered wait records none.
 
 ## What it delivers
 
