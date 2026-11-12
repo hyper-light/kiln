@@ -1,0 +1,43 @@
+# Step 3 (plan 01a1cf48e8157494ac9a51f7a564f526): kiln run r7 on adacachy2 (Linux x86_64), docs/research/s19-claude-agentfile/step3-test.sh, 751a7efb9 plus step3.patch 293eb317 (the fetcher; r8 rechecks after clippy's cmp_owned in a test), the run's output in the order kiln returned it
+HOST adacachy2 2026-11-12T15:16:15Z free 50G
+TREE 751a7efb9f0f5304889db2e9b0d7eb8387eb9d85 plus step3.patch 293eb3174a2439fe436b55e871eb667888024dd0c4141376d5d9eafa9f9a300d
+ M crates/kiln/src/agentfiles/mod.rs
+ M crates/kiln/src/entry.rs
+ M crates/kiln/src/os/unix.rs
+ M crates/kiln/src/os/windows.rs
+?? crates/kiln/src/agentfiles/cli.rs
+?? crates/kiln/src/agentfiles/context.rs
+?? crates/kiln/src/agentfiles/context/
+DISK 34G free; target 27G
+STEP3_TEST_EXIT 0 after 375 s
+skipped: KILN_TEST_SHARDS names no shards binary
+test agentfiles::builtin::tests::step19_claude_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::tests::step19_a_harness_home_is_its_volume_and_none_is_under_tmp ... ok
+test agentfiles::context::tests::step19_a_variants_build_gets_its_own_harness_file ... ok
+test agentfiles::context::tests::step19_modes_are_permissions_and_paths_stay_inside ... ok
+test agentfiles::builtin::tests::step19_claude_runs_as_kilns_claude_kind_with_its_home_on_its_volume ... ok
+test agentfiles::context::tests::step19_a_recipe_changes_exactly_with_what_a_build_takes ... ok
+test agentfiles::context::tests::step19_harness_dirs_are_named_as_each_builtins_harness_line_takes_them ... ok
+test agentfiles::context::tests::step19_pins_are_read_for_their_builds_alone ... ok
+test agentfiles::cli::tests::step19_context_reads_its_words ... ok
+test agentfiles::context::tests::step19_a_context_is_written_whole_or_not_at_all ... ok
+MATCH linux/amd64 gnu 86dc1fcc69498159eaf15f446613e847010f9036bfbbdffd4c49350be8489ada
+MATCH linux/arm64 gnu 2e2496c9a8065df93acb0fca2d341f59a6b8777649b2e025ab8c9bcd5eef61f3
+MATCH linux/amd64 musl cd40dd327145ee47aa0deacd571801c1d782388f709d71242eee6b91de8ed11f
+MATCH linux/arm64 musl 172150e3f9ea07e8e2e2e29862d7d9a25f5c234d8e909e4063df237665bf09b9
+test agentfiles::cli::tests::step19_a_live_claude_context_holds_the_pinned_builds ... ok
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 4323 filtered out; finished in 20.25s
+STEP3_CLIPPY_EXIT 101 after 255 s
+error: this creates an owned instance just for comparison
+  --> crates/kiln/src/agentfiles/cli.rs:73:55
+   |
+73 | ...   anyhow::ensure!(harness == "claude" && dir == PathBuf::from("/x") && platform == ["linux/amd64", "linux/arm64"] && variant.is_...
+   |                                                     ^^^^^^^^^^^^^^^^^^^ help: try: `*"/x"`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cmp_owned
+   = note: `-D clippy::cmp-owned` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::cmp_owned)]`
+
+error: could not compile `kiln` (lib test) due to 1 previous error
+DISK 21G free after; live left 0 entries
+SCRIPT_EXIT 0

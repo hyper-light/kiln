@@ -16,6 +16,8 @@
 
 pub mod builtin;
 pub mod check;
+pub mod cli;
+pub mod context;
 pub mod ops;
 
 use std::collections::HashMap;
