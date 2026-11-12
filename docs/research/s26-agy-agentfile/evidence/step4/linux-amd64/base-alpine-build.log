@@ -15,7 +15,7 @@
 #4 DONE 0.0s
 
 #5 [internal] load build context
-#5 read 2 files, 251MB done
+#5 read 2 files, 252MB done
 #5 DONE 0.0s
 
 #6 [internal] load ./antigravity-amd64
@@ -44,6 +44,6 @@
 
 #14 exporting to image
 #14 exporting layers done
-#14 writing image sha256:5b9a04e90cc5536afa52887b8c5876207066ac6efab514b7217b7b09c68647fa done
+#14 writing image sha256:e578f78abc4f3e3f959409d2bcfd8044ba68b5c15e77c320d62719f7a2068d0d done
 #14 naming to docker.io/library/harness-antigravity-base-alpine:s26 done
-#14 DONE 0.4s
+#14 DONE 0.3s

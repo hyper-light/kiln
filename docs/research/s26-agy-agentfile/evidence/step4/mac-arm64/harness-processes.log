@@ -1,14 +1,14 @@
 TIME                            MEMBER               PID  EVENT  WHAT
-2026-11-12T15:41:30.005467416Z  command              271  exec   sleep 600
-2026-11-12T15:41:30.007002458Z  harness antigravity  276  fork   from 1
-2026-11-12T15:41:30.008859416Z  harness antigravity  276  exec   shards-server "harness antigravity" /proc/self/fd/6 200000 3 4 "" [] 7
-2026-11-12T15:41:30.010565708Z  harness antigravity  278  fork   from 276
-2026-11-12T15:41:30.011235708Z  harness antigravity  278  exec   shards-server sandbox
-2026-11-12T15:41:30.011326000Z  harness antigravity  279  fork   from 1
-2026-11-12T15:41:30.011765958Z  harness antigravity  281  fork   from 279
-2026-11-12T15:41:30.012003416Z  harness antigravity  279  exec   shards-init managed-reaper
-2026-11-12T15:41:30.018703875Z  harness antigravity  281  exec   /harness/antigravity/bin/agy --input-format stream-json --output-format stream-json
-2026-11-12T15:42:30.424892403Z  harness antigravity  281  exit   code 1
-2026-11-12T15:42:30.435101195Z  harness antigravity  279  exit   code 1
-2026-11-12T15:42:30.435181070Z  harness antigravity  278  exit   signal 9 (SIGKILL)
-2026-11-12T15:42:30.435534695Z  harness antigravity  276  exit   signal 9 (SIGKILL)
+2026-11-12T16:19:09.359414542Z  command              271  exec   sleep 600
+2026-11-12T16:19:09.360996500Z  harness antigravity  275  fork   from 1
+2026-11-12T16:19:09.362388917Z  harness antigravity  275  exec   shards-server "harness antigravity" /proc/self/fd/6 200000 3 4 "" [] 7
+2026-11-12T16:19:09.363628459Z  harness antigravity  277  fork   from 275
+2026-11-12T16:19:09.364172125Z  harness antigravity  278  fork   from 1
+2026-11-12T16:19:09.364044959Z  harness antigravity  277  exec   shards-server sandbox
+2026-11-12T16:19:09.364448917Z  harness antigravity  280  fork   from 278
+2026-11-12T16:19:09.364925792Z  harness antigravity  278  exec   shards-init managed-reaper
+2026-11-12T16:19:09.371446959Z  harness antigravity  280  exec   /harness/antigravity/bin/agy --input-format stream-json --output-format stream-json
+2026-11-12T16:20:09.805769821Z  harness antigravity  280  exit   code 1
+2026-11-12T16:20:09.828919196Z  harness antigravity  278  exit   code 1
+2026-11-12T16:20:09.829271696Z  harness antigravity  277  exit   signal 9 (SIGKILL)
+2026-11-12T16:20:09.829802529Z  harness antigravity  275  exit   signal 9 (SIGKILL)

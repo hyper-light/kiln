@@ -193,13 +193,22 @@ fn check_no_signin(name: &str, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The smoke: `agy --version`, answered by the version and a newline, the bytes 1.5.6's build for
-/// linux/amd64 wrote (31 2e 35 2e 36 0a: docs/research/s26-agy-agentfile/evidence/e_smoke_bytes.txt).
-fn check_smoke(smoke: &super::Smoke, version: &str) -> anyhow::Result<()> {
-    ensure!(smoke.args == ["--version"], "the smoke runs agy {:?}, not --version", smoke.args);
-    let expected = smoke.expected(version);
-    ensure!(expected == format!("{version}\n"), "the smoke expects {expected:?}, not the version and a newline");
-    ensure!(version != "1.5.6" || expected.as_bytes() == [0x31, 0x2e, 0x35, 0x2e, 0x36, 0x0a], "the smoke expects {expected:?}, not what 1.5.6 wrote");
+/// The pin's smoke, in the shape every harness's pin gives its own (step 19's layout): `bin/agy
+/// --version`, whose line is the version alone (`stdout`, the line without its newline). agy writes
+/// the version and a newline: 1.5.7's builds wrote 31 2e 35 2e 37 0a in a microVM on both platforms
+/// (docs/research/s26-agy-agentfile/evidence/step4/), as 1.5.6's wrote 31 2e 35 2e 36 0a (3423c8df).
+fn check_smoke(pin: &Value) -> anyhow::Result<()> {
+    let version = pin.get("version").and_then(Value::as_str).unwrap_or_default();
+    let smoke = pin.get("smoke").and_then(Value::as_object).ok_or_else(|| anyhow!("the pin has no smoke"))?;
+    let mut keys: Vec<&str> = smoke.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    ensure!(keys == ["args", "program", "stdout"], "the pin's smoke has {keys:?}, not program, args and stdout");
+    ensure!(smoke.get("program").and_then(Value::as_str) == Some("bin/agy"), "the smoke runs another program than bin/agy");
+    let args: Vec<&str> = smoke.get("args").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    ensure!(args == ["--version"], "the smoke runs agy {args:?}, not --version");
+    let stdout = smoke.get("stdout").and_then(Value::as_str).unwrap_or_default();
+    ensure!(stdout == version, "the smoke expects {stdout:?}, not the version {version} alone");
+    ensure!(version != "1.5.7" || format!("{stdout}\n").as_bytes() == [0x31, 0x2e, 0x35, 0x2e, 0x37, 0x0a], "the smoke expects {stdout:?}, not the line 1.5.7 wrote");
     Ok(())
 }
 
@@ -229,7 +238,7 @@ fn antigravity_is_listed_once_with_its_harness_file() -> anyhow::Result<()> {
 #[test]
 fn antigravity_pin_names_agy_for_both_platforms() -> anyhow::Result<()> {
     let b = agy()?;
-    check_pin(b.pin)?;
+    let pin = check_pin(b.pin)?;
     let short_digest = edited(b.pin, |p| {
         let sha = file_of(p, "linux/amd64")?.get_mut("sha256")?;
         let shorter = sha.as_str()?.get(..63)?.to_owned();
@@ -254,13 +263,14 @@ fn antigravity_pin_names_agy_for_both_platforms() -> anyhow::Result<()> {
         Some(())
     })?;
     ensure!(check_pin(&both_forms).is_err(), "an unpack naming a member and a strip passed");
+    let execution = pin.get("execution_id").and_then(Value::as_str).unwrap_or_default().to_owned();
     let other_release = edited(b.pin, |p| {
         let url = file_of(p, "linux/amd64")?.get_mut("url")?;
-        let other = url.as_str()?.replacen("-6212266538958848/", "-1/", 1);
+        let other = url.as_str()?.replacen(&format!("-{execution}/"), "-1/", 1);
         *url = Value::from(other);
         Some(())
     })?;
-    ensure!(check_pin(&other_release).is_err(), "an archive of another release's directory passed");
+    ensure!(other_release != pin.to_string() && check_pin(&other_release).is_err(), "an archive of another release's directory passed");
     let plain_http = edited(b.pin, |p| {
         let url = file_of(p, "linux/arm64")?.get_mut("url")?;
         let other = url.as_str()?.replacen("https://", "http://", 1);
@@ -360,16 +370,24 @@ fn antigravity_agentfile_grants_its_harness_what_it_lists_alone() -> anyhow::Res
 fn antigravity_smoke_expects_what_agy_prints() -> anyhow::Result<()> {
     let b = agy()?;
     let pin = check_pin(b.pin)?;
-    let version = pin.get("version").and_then(Value::as_str).unwrap_or_default();
-    check_smoke(&b.smoke, version)?;
-    let changes = [
-        super::Smoke { args: &["--version"], stdout: "{version}" },
-        super::Smoke { args: &["--version"], stdout: " {version}\n" },
-        super::Smoke { args: &["version"], stdout: "{version}\n" },
+    check_smoke(&pin)?;
+    let version = pin.get("version").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let changes: [(&str, Value); 5] = [
+        ("/smoke/stdout", Value::from(format!(" {version}"))),
+        ("/smoke/stdout", Value::from(format!("{version}\n"))),
+        ("/smoke/stdout", Value::from("1.5.5")),
+        ("/smoke/args", serde_json::json!(["version"])),
+        ("/smoke/program", Value::from("bin/antigravity")),
     ];
-    for smoke in &changes {
-        ensure!(check_smoke(smoke, version).is_err(), "a smoke of agy {:?} expecting {:?} passed", smoke.args, smoke.stdout);
+    for (at, to) in changes {
+        let changed = edited(b.pin, |p| {
+            *p.pointer_mut(at)? = to.clone();
+            Some(())
+        })?;
+        ensure!(check_smoke(&serde_json::from_str(&changed)?).is_err(), "a smoke with {at} {to} passed");
     }
+    let none = edited(b.pin, |p| p.as_object_mut()?.remove("smoke").map(|_| ()))?;
+    ensure!(check_smoke(&serde_json::from_str(&none)?).is_err(), "a pin without its smoke passed");
     Ok(())
 }
 

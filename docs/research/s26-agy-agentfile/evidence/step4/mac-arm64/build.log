@@ -5,7 +5,7 @@
 #1 DONE 0.0s
 
 #2 [linux/amd64 internal] load metadata for docker.io/library/buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
-#2 DONE 222.7s
+#2 DONE 172.6s
 
 #3 [internal] load .agentignore
 #3 DONE 0.0s
@@ -15,14 +15,14 @@
 #4 DONE 0.5s
 
 #5 [internal] load build context
-#5 read 2 files, 251MB done
+#5 read 2 files, 252MB done
 #5 DONE 0.0s
 
 #6 [internal] load ./antigravity-amd64
-#6 DONE 0.2s
+#6 DONE 0.1s
 
 #7 [linux/amd64 2/2] HARNESS antigravity FROM ./antigravity-amd64
-#7 DONE 0.2s
+#7 DONE 0.1s
 
 #8 [linux/amd64 2/2] LINK HARNESS antigravity FROM ./antigravity-amd64
 #8 DONE 0.1s
@@ -43,14 +43,14 @@
 #13 DONE 0.0s
 
 #14 [linux/arm64 internal] load metadata for docker.io/library/buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
-#14 DONE 136.9s
+#14 DONE 154.8s
 
 #15 [linux/arm64 1/2] FROM docker.io/library/buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
 #15 resolve docker.io/library/buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10 done
 #15 DONE 0.5s
 
 #16 [internal] load build context
-#16 read 2 files, 237.9MB done
+#16 read 2 files, 238.9MB done
 #16 DONE 0.0s
 
 #17 [internal] load ./antigravity-arm64
@@ -79,6 +79,6 @@
 
 #25 exporting to image
 #25 exporting layers done
-#25 exporting manifest list sha256:dfcb1095ec134aaa1c67bc9ec7ee16def7d8f3e4bd6c9af8fe999e1cf8efd1da done
+#25 exporting manifest list sha256:a6f4470188c7fe127562e9f7802e6256078ecce37a9f855f3412354597b06869 done
 #25 naming to docker.io/library/harness-antigravity:s26 done
 #25 DONE 0.0s

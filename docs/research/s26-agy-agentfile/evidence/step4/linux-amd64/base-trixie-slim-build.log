@@ -15,7 +15,7 @@
 #4 DONE 0.3s
 
 #5 [internal] load build context
-#5 read 2 files, 251MB done
+#5 read 2 files, 252MB done
 #5 DONE 0.0s
 
 #6 [internal] load ./antigravity-amd64
@@ -44,6 +44,6 @@
 
 #14 exporting to image
 #14 exporting layers done
-#14 writing image sha256:8c3d0cfc02a76a156f28c3d45edb060747c04cbf755e1a3dc19a05887c011b58 done
+#14 writing image sha256:f6966dad87446bcf038dd83fe8c8fd4530b6f7f44da49d44d6c4a135a21443de done
 #14 naming to docker.io/library/harness-antigravity-base-trixie-slim:s26 done
-#14 DONE 0.3s
+#14 DONE 0.4s

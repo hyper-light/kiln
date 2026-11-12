@@ -5,7 +5,7 @@
 #1 DONE 0.0s
 
 #2 [internal] load metadata for docker.io/library/busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
-#2 DONE 1.5s
+#2 DONE 1.6s
 
 #3 [internal] load .agentignore
 #3 DONE 0.0s
@@ -15,7 +15,7 @@
 #4 DONE 0.0s
 
 #5 [internal] load build context
-#5 read 2 files, 251MB done
+#5 read 2 files, 252MB done
 #5 DONE 0.0s
 
 #6 [internal] load ./antigravity-amd64
@@ -44,6 +44,6 @@
 
 #14 exporting to image
 #14 exporting layers done
-#14 writing image sha256:311d58a4eb29d453ac7271e4538562995a9c8277a2ef02b82dd7e2f8e7d3e586 done
+#14 writing image sha256:25d2f19bc40ea0a35c8c0b0f26bd625b24c291d463d1914049e48014a897abc3 done
 #14 naming to docker.io/library/harness-antigravity-base-busybox:s26 done
 #14 DONE 0.3s
