@@ -1,0 +1,29 @@
+kiln run r12 on d1323898b255a3ed435eb83fa0f7b0cf (adas-mac-studio.local-2: macOS arm64, 32 cores, 9 CPUs and 24 GiB asked),
+2026-11-12, in a clone there of the bundle e5dc43f44..s22-opencode-agentfile (bba4ced87) with this step's
+uncommitted work applied as a patch. kiln's sync of the whole worktree from the laptop timed out ("did not answer
+the sync in 60s", runs r3 and r4), and the Linux runners' queue was hours long (run r2, stopped).
+
+host Adas-Mac-Studio.local Darwin arm64 | rustc 1.99.1 (58cf8f9c3 2026-10-13) | at bba4ced87 Merge p/agentfile-store-v1 (plan 01a1cd8e step 30's table of + wip (10 files) | builtin.rs sha256 7539d94495f8086d
+test agentfiles::builtin::tests::every_builtin_is_a_valid_agentfile_once ... ok
+test agentfiles::builtin::tests::the_server_image_builds_with_the_builtin_agentfiles ... ok
+test agentfiles::builtin::tests::opencodes_agentfile_is_the_layouts ... ok
+test agentfiles::builtin::tests::opencodes_pin_is_opencode_2s_four_builds ... ok
+test agentfiles::builtin::tests::opencodes_harness_json_starts_it_as_kiln_does ... ok
+test agentfiles::builtin::tests::no_builtin_carries_a_credential ... ok
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 4300 filtered out; finished in 0.67s
+TEST_EXIT=0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 41s
+CLIPPY_EXIT=0
+MUTANTS2 2026-11-12T10:33:39Z host Adas-Mac-Studio.local at bba4ced87 Merge p/agentfile-store-v1 (plan 01a1cd8e step 30'
+kinds-acp-args: KILLED (cargo test exit 101) by opencodes_harness_json_starts_it_as_kiln_does; failed: agentfiles::builtin::tests::opencodes_harness_json_starts_it_as_kiln_does
+dockerfile-copy-removed: KILLED (cargo test exit 101) by the_server_image_builds_with_the_builtin_agentfiles; failed: agentfiles::builtin::tests::the_server_image_builds_with_the_builtin_agentfiles
+agentfile-env-added: KILLED (cargo test exit 101) by no_builtin_carries_a_credential; failed: agentfiles::builtin::tests::opencodes_agentfile_is_the_layouts agentfiles::builtin::tests::no_builtin_carries_a_credential
+harness-home-added: KILLED (cargo test exit 101) by opencodes_harness_json_starts_it_as_kiln_does; failed: agentfiles::builtin::tests::opencodes_harness_json_starts_it_as_kiln_does
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4318 filtered out; finished in 0.02s
+RESTORED_EXIT=0
+ M .dockerignore
+ M .kiln/images/harness-opencode/pin.json
+ M .kiln/images/harness-opencode/pin.sh
+ M Dockerfile
+ M crates/kiln/src/agentfiles/builtin.rs
+ M docs/research/s22-opencode-agentfile/README.md

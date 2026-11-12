@@ -1,4 +1,4 @@
-# Build context for the top-level Dockerfile: only Cargo workspace, crates/, ui/, vendor/ and deploy/docker/.
+# Build context for the top-level Dockerfile: only Cargo workspace, crates/, .kiln/images/, ui/, vendor/ and deploy/docker/.
 .git
 .github
 **/target

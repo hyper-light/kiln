@@ -27,6 +27,10 @@ readonly ENDPOINT=https://opencode.ai/update/api/latest/cli/npm
 readonly SIGNER=anomalyco/opencode/.github/workflows/release.yml
 # Steps 19 to 28's default base (step 19's research f29), recorded with the pin for its recipe.
 readonly BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+# The smoke an image's harness must pass, in pin.json for whatever runs it (step 19's image
+# lookup, CI's legs): `opencode --version` prints `opencode v<version>` (f32). It runs with
+# HOME=/tmp because every opencode command first creates its directories (f18).
+readonly SMOKE_PROGRAM=bin/opencode SMOKE_ARGS=--version SMOKE_ENV=HOME=/tmp SMOKE_PREFIX="opencode v"
 # Platform, variant and release asset of each build. amd64 takes the baseline build, made for
 # x86-64 CPUs without AVX2; in 2.2.7 it is the same bytes as x64 (f11).
 readonly BUILDS="linux/amd64 gnu opencode-linux-x64-baseline.tar.gz
@@ -215,7 +219,8 @@ pin() {
     say "LICENSE at $tag_commit: MIT, $(bytes "$WORK/LICENSE") bytes, sha256 $(sha "$WORK/LICENSE")"
 
     python3 -I -c 'import hashlib, json, sys, time
-(work, version, tag_commit, signer, repo, base, license_url, san, commit, ref, run_uri, endpoint) = sys.argv[1:13]
+(work, version, tag_commit, signer, repo, base, license_url, san, commit, ref, run_uri, endpoint,
+ smoke_program, smoke_args, smoke_env, smoke_prefix) = sys.argv[1:17]
 sums = {}
 for line in open(work + "/SHA256SUMS"):
     f = line.split()
@@ -248,11 +253,14 @@ pin = {
                             "musl": same("opencode-linux-x64-musl.tar.gz", "opencode-linux-x64-baseline-musl.tar.gz")},
     },
     "base": base,
+    "smoke": {"program": smoke_program, "args": smoke_args.split(), "env": smoke_env.split(),
+              "stdout": smoke_prefix + version},
     "builds": builds,
 }
 json.dump(pin, open(work + "/pin.json", "w"), indent=2)
 open(work + "/pin.json", "a").write("\n")' \
-        "$WORK" "$version" "$tag_commit" "$SIGNER" "$REPO" "$BASE" "$license" "$san" "$commit" "$ref" "$run_uri" "$ENDPOINT" ||
+        "$WORK" "$version" "$tag_commit" "$SIGNER" "$REPO" "$BASE" "$license" "$san" "$commit" "$ref" "$run_uri" "$ENDPOINT" \
+        "$SMOKE_PROGRAM" "$SMOKE_ARGS" "$SMOKE_ENV" "$SMOKE_PREFIX" ||
         fail write "pin.json"
     say "x64 is baseline: $(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["verified"]["x64_is_baseline"])' "$WORK/pin.json")"
     cp "$WORK/pin.json" "$out.tmp.$$" && mv -f "$out.tmp.$$" "$out" || fail write "$out"

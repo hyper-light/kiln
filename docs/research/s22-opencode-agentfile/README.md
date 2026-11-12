@@ -97,3 +97,56 @@ reruns it.
 **Unrun in step 1:** pin.sh on Linux (gh is not on the Linux runners; the script is bash 3.2 and
 POSIX tools, so nothing in it is macOS's own); a release whose x64 and baseline builds differ
 (none yet: pin.json records whether they do).
+
+## Step 2: the Agentfile, harness.json and the table
+
+[Agentfile](../../../.kiln/images/harness-opencode/Agentfile) and
+[harness.json](../../../.kiln/images/harness-opencode/harness.json) beside the pin, and opencode's
+entry in step 30's table, `crates/kiln/src/agentfiles/builtin.rs` `ALL` (branch
+`p/agentfile-store-v1`, merged into this one at bba4ced87, so this branch lands after it). `Builtin`
+gains the two fields the shared layout agreed: `pin` (pin.json) and `files` (harness.json).
+
+**Choices and their sources:**
+
+| | Value | Why |
+|---|---|---|
+| Base | `ARG BASE` = pin.json's base, by digest | Steps 19–28's default; opencode's glibc builds need glibc 2.17 at most, so no RUN (f12). |
+| Variants | `ARG OPENCODE_LIBC=gnu`; `base-musl` adds `libstdc++ ripgrep` | The musl builds need libstdc++, which brings libgcc (f13, f35); on arm64 the ripgrep opencode fetches is a glibc build (f22). BuildKit builds only the stage asked for. |
+| Harness | `HARNESS opencode FROM ./opencode-${TARGETARCH}-${OPENCODE_LIBC}` | The directories `kiln agentfiles context` writes, every file checked against the pin (f26). |
+| Reach | the bring-up's three lines, for opencode | DNS and TCP 443 out cover its providers, models.dev, npm and GitHub (f21); its ACP server is on the domain's own loopback, which needs no grant (f15, f16). Step 9's by-name grants replace them. |
+| Volumes | `/workspace` and `/home/opencode`, the harness's alone | The project, and the user's opencode (settings, sessions and sign-in in opencode.db, cache) under the four XDG roots (f17, f18, f19). |
+| harness.json | OSI full form: `["opencode", "acp"]`, the four XDG roots under /home/opencode, `OPENCODE_DISABLE_AUTOUPDATE=1` | kiln's program and ACP arguments (f4); opencode reads its XDG roots before HOME (f17); its updater skips its check with the variable set (f20). Only fields Shards' OSI config accepts (it refuses unknown ones). |
+| Smoke | pin.json `smoke`: `bin/opencode --version` with `HOME=/tmp` prints `opencode v<version>` | In the pin, which owns the version, for whatever runs the smoke (step 19's image lookup, CI); step 19's code has no form of its own yet. Every opencode command creates its directories first, hence HOME (f18, f32). |
+| Server image | the Dockerfile's build stage copies `.kiln/images/` | Its build context held only `Cargo.*`, `.cargo/`, `crates/` and `vendor/`: the `include_str!`s of `.kiln/images/` would fail to compile there. Every other build of kiln is from a whole checkout. |
+
+**harness.json and Shards' init (2026-11-12):** Shards' init gives a harness `PATH`, `HOME=/tmp` and
+`SHARDS_DOMAIN` before run.env, and until its fix (branch `p/harness-env-last-wins`) a run.env
+`HOME` or `PATH` would be shadowed. opencode's run.env names neither: only variables init doesn't
+set, which hold today.
+
+**Runs:**
+
+| Run | Command | Result | Log |
+|---|---|---|---|
+| The pin again, with its smoke | `pin.sh latest` (this Mac, 2026-11-12T08:51Z) | the four archives passed every check again; pin.json gains `smoke`: `bin/opencode --version` with `HOME=/tmp`, printing `opencode v2.2.7` | [step2-pin.log](step2-pin.log) |
+| The table's tests | `cargo test --locked -p kiln --lib agentfiles::` on a Mac Studio (macOS arm64, rustc 1.99.1) | 24 passed, 0 failed: step 30's 18 and the table's 6 (`every_builtin_is_a_valid_agentfile_once`, `opencodes_pin_is_opencode_2s_four_builds`, `opencodes_harness_json_starts_it_as_kiln_does`, `opencodes_agentfile_is_the_layouts`, `no_builtin_carries_a_credential`, `the_server_image_builds_with_the_builtin_agentfiles`) | [step2-tests.log](step2-tests.log) |
+| Clippy | `cargo clippy --locked -p kiln --all-targets -- -D warnings`, there | clean once a needless lifetime in a test helper was elided (its first run named it) | [step2-tests.log](step2-tests.log) |
+| Guard-removal mutants (R10) | [scripts/step2-mutants.sh](scripts/step2-mutants.sh), there | each caught by the test that holds its guard: kinds.rs's opencode ACP arguments changed (the harness.json test), the Dockerfile's COPY removed (the server image test), an `ENV OPENAI_API_KEY` added to the Agentfile (the credential test, and the layout test), a `HOME` added to harness.json's env (the harness.json test); restored, the six pass | [step2-tests.log](step2-tests.log) |
+
+The tests also hold each check to what it must refuse, inside the test itself: a 63-character
+digest, linux/arm64 missing, an archive not unpacked and OpenCode 1 in the pin; an ENV and a
+credential-named env in the files.
+
+**How the run reached a machine:** a kiln sync of the whole worktree from this laptop timed out
+("did not answer the sync in 60s"), as other agents found tonight, and the Linux runners' queue was
+hours long. The run went as a git bundle of the branch from a commit a full clone on the Mac Studio
+holds (e5dc43f44; a first try from a shallow clone lacked the bundle's prerequisites), plus a patch
+of the uncommitted work, applied in a clone of its own there.
+
+**Unrun in step 2:** the tests and clippy on Linux and clippy on Windows (the branch's gate, at
+landing); a `docker build` of the server image with `.kiln/images/` copied (CI's image job, after
+landing).
+
+**Told:** step 19 and ROOT could not be reached (their inboxes refused messages, 429). For step 19:
+the Dockerfile's COPY (a production `include_str!` of `.kiln/images/` fails `docker build` without
+it), the two fields, and the smoke's form in pin.json. To send when they take messages.
