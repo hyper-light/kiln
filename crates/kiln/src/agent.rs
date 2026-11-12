@@ -6613,7 +6613,7 @@ pub fn handed_over() -> bool {
 async fn binary_runs(exe: &std::path::Path) -> anyhow::Result<()> {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--version");
-    let out = crate::os::proc::output(cmd, Duration::from_secs(30)).await?;
+    let out = crate::os::proc::output(cmd, crate::proc::VERSION_WITHIN).await?;
     let said = String::from_utf8_lossy(&out.stdout);
     anyhow::ensure!(out.status.success() && said.starts_with("kiln"), "`{} --version` gave {} ({})", exe.display(), out.status, said.trim());
     Ok(())

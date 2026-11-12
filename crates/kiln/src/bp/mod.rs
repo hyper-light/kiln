@@ -345,6 +345,8 @@ impl Feed {
             E::Inbox { person } => self.changed(&format!("person:{person}"), "inbox".into()),
             // One person's Mission control placement changed or a park woke (attention plan 01a199e1b177752e84dad5dc990e6a15).
             E::Attention { principal } => self.changed(&format!("person:{principal}"), "attention".into()),
+            // One person's Agentfiles changed (`crate::agentfiles`): their list read again.
+            E::Agentfile(a) => self.changed(&format!("person:{}", a.owner), "agentfiles".into()),
             E::Program { program } => self.changed("", format!("program/{program}")),
             E::FrontDoor { runner } => self.changed("", format!("front-door/{runner}")),
             E::AgentLimit { runner } => self.changed("", format!("agent-limit/{runner}")),

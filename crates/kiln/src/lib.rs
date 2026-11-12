@@ -10,6 +10,7 @@ pub mod access;
 pub mod accounts;
 pub mod audit;
 pub mod agent;
+pub mod agentfiles;
 pub mod aisessions;
 pub mod api;
 pub mod authz;

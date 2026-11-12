@@ -69,6 +69,8 @@ pub const CAPABILITIES: &[&str] = &[
     // without it a person reaches only the agents that act for them.
     "agents.manage",
     "agents.attach",
+    // Reaching everyone's Agentfiles (`crate::agentfiles`); without it a person reaches only their own.
+    "agentfiles.manage",
     "experiments.run",
     "settings.manage",
     "tokens.manage",
@@ -738,6 +740,10 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/incidents/*", "runs.read", At::Anywhere),
     any("/api/plans", "agents.run", At::Server),
     any("/api/plans/**", "agents.run", At::Server),
+    // Agentfiles (`crate::agentfiles`): the handler keeps a person to their own; the owner and
+    // `agentfiles.manage` reach everyone's.
+    any("/api/agentfiles", "agents.run", At::Server),
+    any("/api/agentfiles/**", "agents.run", At::Server),
     // Multi-stack programs (docs/programs.md): the handler keeps their settings to a person.
     any("/api/programs", "agents.run", At::Server),
     any("/api/programs/**", "agents.run", At::Server),
