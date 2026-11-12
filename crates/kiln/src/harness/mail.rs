@@ -997,7 +997,7 @@ mod tests {
         assert_eq!(publish_on(&mut c, &message("three", Some("build"), "successor"), u64::MAX)?.disposition, Disposition::Waiting);
         transition_on(&mut c, frozen.token, None, Disposition::Waiting, None)?;
         assert_eq!(publish_on(&mut c, &message("four", Some("build"), "must not supersede frozen"), u64::MAX)?.disposition, Disposition::Waiting);
-        let ids: Vec<String> = all(&c)?.items.iter().filter(|r| r.disposition != Disposition::Superseded).map(|r| r.id.clone()).collect();
+        let ids: Vec<String> = all(&c)?.items.iter().filter(|r| r.receipt.disposition != Disposition::Superseded).map(|r| r.receipt.id.clone()).collect();
         assert!(ids.contains(&"two".to_owned()) && ids.contains(&"ordinary".to_owned()) && ids.contains(&"four".to_owned()), "{ids:?}");
         assert_eq!(pending_on(&c, "recipient", 0, 4096)?.items.first().map(|r| r.id.as_str()), Some("two"), "the frozen one still goes first");
         Ok(())
