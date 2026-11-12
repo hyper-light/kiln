@@ -1,0 +1,4 @@
+# 2026-11-12T07:47:24Z git -C ~/Projects/kiln log -1 --format='%H %s' origin/main; merge-base --is-ancestor checks
+efb40ea0f4b28ef1f05f4d7e7f47af28e353e166 Merge main into p/harness-cursor-pi-v1: Cursor's CLI and Pi as harnesses, onto main as it stands
+p/harness-cursor-pi-v1 is in origin/main
+p/agentfile-store-v1 is not in origin/main

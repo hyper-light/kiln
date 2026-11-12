@@ -1,0 +1,16 @@
+HTTP/2 200 
+date: Thu, 12 Nov 2026 07:32:10 GMT
+content-type: text/plain
+content-length: 91
+x-amz-id-2: 2Y03KvqdJ/UKJnMt1uT5YIGN/1ELuUH4f1oAe5BI2mHbilwT1Lh8boD0EgzwZ+Gnpf0cii5y67Jr7ecNGClJkWgK/6+Wk5i5
+x-amz-request-id: E0S6DQBCAEETBYXE
+server: cloudflare
+last-modified: Wed, 11 Nov 2026 19:47:40 GMT
+etag: "287c29ac08d11f105c5563dfceb9b75c"
+x-amz-server-side-encryption: AES256
+x-amz-version-id: NPLKtQt4kGzB_1F4ws1qXSzA9HGMlQA8
+accept-ranges: bytes
+cf-cache-status: DYNAMIC
+set-cookie: __cf_bm=<redacted before commit>; HttpOnly; SameSite=None; Partitioned; Secure; Path=/; Domain=cursor.com; Expires=Thu, 12 Nov 2026 08:02:10 GMT
+cf-ray: a593d75e3ac50a5e-SEA
+
