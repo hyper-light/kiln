@@ -38,12 +38,18 @@ record. Policy readback as in step1.md (rechecked 2026-11-12).
 
 ## The pin again, and what the ELF survey found
 
-pin.sh now writes the smoke, so it ran again on kiln-a094a12d (`scripts/run-step2-pin.sh`, 2026-11-12T14:25:43Z):
+pin.sh now writes the smoke, and each package tree's totals (`unpacked_bytes`, `entries`), which the
+shared unpack holds a tree to under step 27's conversion of step 25's module. Step 3's agent found that
+contract refuses a tree without them. So the pin ran again on kiln-a094a12d
+(`scripts/run-step2-pin.sh OUT rust-v0.167.2`, 2026-11-12T15:18:14Z):
 
-- record: `evidence/e_step2_pin.txt`; pin.sh sha256 04833b32…;
-- the same tag (`rust-v0.167.2`) and the same three archives;
+- record: `evidence/e_step2_pin.txt`, pin.sh sha256 f20720e8…;
+- the same tag and the same three archives;
+- each package 52 entries (44 files and 8 directories): 540223046 bytes unpacked on amd64 and
+  481289300 on arm64, arm64's skipped codex-path/rg counted, as the archive's own totals;
 - MUTATIONS passed=21 failed=0;
-- FRESH archives=3 matching=3 members=1 matching=1.
+- FRESH archives=3 matching=3 members=1 matching=1 trees=2 matching=2. A fresh download's entries and
+  bytes, counted again, are the pin's.
 
 The survey (`scripts/elf-survey.sh`, `evidence/e_step2_elf.txt`, 32 ELF files per package) shows the
 package isn't all static, as research finding f10 had it:

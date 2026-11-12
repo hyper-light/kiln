@@ -178,10 +178,14 @@ else:
     # ripgrep's rg is pinned as one member, with its own SHA-256 and size: read whole.
     programs = [f"{expect}/rg"]
     needs = {programs[0]: None}
-read, seen, files, dirs, voice = {}, set(), 0, 0, {}
+# entries and unpacked_bytes are the archive's own totals, as tar -t and tar -tv list them (tarfile
+# yields no pax or GNU long-name header): the shared unpack holds a tree to them (step 25's module).
+read, seen, files, dirs, voice, entries, unpacked = {}, set(), 0, 0, {}, 0, 0
 try:
     with tarfile.open(path, "r|gz") as t:
         for m in t:
+            entries += 1
+            unpacked += m.size if m.isreg() else 0
             name = m.name[2:] if m.name.startswith("./") else m.name
             parts = name.rstrip("/").split("/")
             if name in ("", "."):
@@ -228,7 +232,7 @@ def need(n):
         fail(f"no regular file {n} in the archive")
     return read[n]
 
-facts = {"files": files, "dirs": dirs}
+facts = {"files": files, "dirs": dirs, "entries": entries, "unpacked_bytes": unpacked}
 if kind == "package":
     try:
         pkg = json.loads(need("codex-package.json"))
@@ -301,10 +305,11 @@ verify() {
             --certificate-oidc-issuer "$ISSUER" "$file" >"$dir/cosign-$target.log" 2>&1 ||
             die "$name: cosign refuses it for $identity: $(tail -1 "$dir/cosign-$target.log")"
         facts=$(inspect package "$file" "$arch" "$version" "$target" 2>"$dir/inspect.err") || die "$name: $(cat "$dir/inspect.err")"
-        say "OK $plat $name sha256 $got, $size bytes, $(jq -r '"\(.files) files and \(.dirs) directories"' <<<"$facts"): GitHub, SHA256SUMS and cosign ($identity)"
+        say "OK $plat $name sha256 $got, $size bytes, $(jq -r '"\(.files) files and \(.dirs) directories, \(.entries) entries, \(.unpacked_bytes) bytes unpacked"' <<<"$facts"): GitHub, SHA256SUMS and cosign ($identity)"
         jq -r --arg p "$plat" '.voice | to_entries[] | "NOTE \($p) \(.key) asks \(.value): voice, built for -gnu, which kiln never starts"' <<<"$facts"
-        files=$(jq -n --arg url "$url" --arg sha256 "$got" --argjson size "$size" \
-            '[{url: $url, sha256: $sha256, size: $size, path: ".", unpack: {format: "tar.gz", strip: 0}}]')
+        files=$(jq -n --arg url "$url" --arg sha256 "$got" --argjson size "$size" --argjson facts "$facts" \
+            '[{url: $url, sha256: $sha256, size: $size, path: ".",
+               unpack: {format: "tar.gz", strip: 0, unpacked_bytes: $facts.unpacked_bytes, entries: $facts.entries}}]')
 
         local interp
         interp=$(jq -r '.rg_interpreter' <<<"$facts")

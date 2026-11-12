@@ -140,7 +140,7 @@ check() {
         [ "$rc" -eq 0 ] && [ "$before" != "$after" ] && [ "$left" -eq 0 ] &&
             jq -e '(.builds | map(.platform)) == ["linux/amd64", "linux/arm64"]
                 and ([.builds[].files | length] == [1, 2])
-                and .builds[0].files[0].unpack == {format: "tar.gz", strip: 0}
+                and (.builds[0].files[0].unpack | .format == "tar.gz" and .strip == 0 and .entries > 0 and .unpacked_bytes > 0)
                 and .builds[1].files[0].unpack.skip == ["codex-path/rg"]
                 and .builds[1].files[1].path == "codex-path/rg"
                 and .smoke == {program: "bin/codex", args: ["--version"], stdout: ("codex-cli " + .version)}' "$out/pin.json" >/dev/null && verdict=PASS

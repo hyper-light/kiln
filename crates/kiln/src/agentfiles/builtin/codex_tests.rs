@@ -80,6 +80,11 @@ fn check_file(platform: &str, file: &Value) -> anyhow::Result<()> {
         }
         None => {
             ensure!(file.get("mode").is_none(), "{at}: a whole tree with a mode, whose entries keep their own");
+            // The shared unpack holds a tree to its strip and the archive's own totals (step 25's module).
+            ensure!(unpack.get("strip").and_then(Value::as_u64).is_some(), "{at}: a tree with no strip");
+            for total in ["entries", "unpacked_bytes"] {
+                ensure!(unpack.get(total).and_then(Value::as_u64).is_some_and(|n| n > 0), "{at}: a tree with no {total}");
+            }
             for skipped in strings(unpack, "/skip") {
                 ensure!(inside(&skipped) && skipped != ".", "{at}: it skips {skipped}, which leaves the tree");
             }
@@ -244,6 +249,8 @@ fn codex_pin_holds_both_platforms_with_arm64s_rg_in_place() -> anyhow::Result<()
         ("a file's path with ..", changed(b.pin, "/builds/1/files/1/path", "../codex-path/rg".into())?),
         ("the package's rg not skipped", changed(b.pin, "/builds/1/files/0/unpack/skip", serde_json::json!([]))?),
         ("a mode of 0777", changed(b.pin, "/builds/1/files/1/mode", "0777".into())?),
+        ("a tree with no entries", changed(b.pin, "/builds/0/files/0/unpack/entries", Value::Null)?),
+        ("a tree with no unpacked bytes", changed(b.pin, "/builds/1/files/0/unpack/unpacked_bytes", serde_json::json!(0))?),
         ("another smoke", changed(b.pin, "/smoke/stdout", "codex-cli 0.0.1".into())?),
         ("another tag's identity", changed(b.pin, "/verified/identity", format!("{WORKFLOW}@refs/tags/rust-v0.0.1").into())?),
     ];

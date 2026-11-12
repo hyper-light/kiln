@@ -2,7 +2,7 @@
   "version": "0.167.2",
   "tag": "rust-v0.167.2",
   "published": "2026-11-11T22:44:46Z",
-  "read_at": "2026-11-12T14:28:23Z",
+  "read_at": "2026-11-12T15:18:32Z",
   "verified": {
     "cosign": {
       "version": "v3.1.4",
@@ -42,7 +42,9 @@
           "path": ".",
           "unpack": {
             "format": "tar.gz",
-            "strip": 0
+            "strip": 0,
+            "unpacked_bytes": 540223046,
+            "entries": 52
           }
         }
       ]
@@ -58,6 +60,8 @@
           "unpack": {
             "format": "tar.gz",
             "strip": 0,
+            "unpacked_bytes": 481289300,
+            "entries": 52,
             "skip": [
               "codex-path/rg"
             ]
