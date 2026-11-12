@@ -103,6 +103,26 @@ record), and runs as .kiln/ci.yaml's rust job does (`CARGO_PROFILE_DEV_DEBUG=lin
   - the Agentfile: a RUN, an ENV, another base, a fourth grant, no CODEX_HOME volume;
   - the secrets scan: `ENV OPENAI_API_KEY=x`, `ARG CODEX_TOKEN`, an `sk-` key, auth.json.
 
+### At the rebased head: ce8ad3845, on kiln main 263cad6b4
+
+`scripts/run-step2-tests-at.sh` (`evidence/e_step2_tests_head.txt`, kiln-a094a12d, 2026-11-12T15:21-15:44Z)
+works in a `--shared` clone of the runner's kiln checkout, the branch fetched from a 233 KB git
+bundle, at the commit itself. At its end the tree was clean.
+
+- clippy -D warnings on `-p kiln --all-targets`: exit 0.
+- `--lib agentfiles`: 30 passed. These include Goose's tests, the four codex_tests, and the table's own
+  (every built-in once; the Dockerfile copies what built-ins embed).
+- `--lib real_shards` with `KILN_TEST_SHARDS`: 2 passed. Every built-in, Codex's among them, passes a
+  real Shards' static check (v0.7.0, sha256 a9c9092a…, as its SHA256SUMS lists it).
+- `--test agentfiles`: 1 passed. `step30_agentfiles_on_every_surface` lists Goose's and Codex's
+  built-ins, through this branch's 5e296cac2.
+- M1 (`codex::args()` given `--strict`) and M2 (`ENV OPENAI_API_KEY=x` in the Agentfile): each exit 101,
+  their tests FAILED.
+- **kiln main 263cad6b4 itself fails** `step30_agentfiles_on_every_surface` (exit 101): the test holds
+  the list to `[]`, and Goose's entry is on main. 5e296cac2 (step 20's step-2 subagent's a690a02c5,
+  the same lines as step 25's s25-devin-row) fixes it. ROOT was told; mail was refused (429), so a
+  resend runs until it is accepted.
+
 ## What changed from the plan's text, and why
 
 - The smoke's expectation lives in pin.json, as steps 21 and 22 keep theirs, since step 19's image()
