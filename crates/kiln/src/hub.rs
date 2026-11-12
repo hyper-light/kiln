@@ -1562,10 +1562,16 @@ impl Hub {
 
     /// Persistent agents from the DB merged with live sessions.
     pub async fn agent_list(&self) -> Vec<AgentLive> {
+        let (rows, labels, machines) = self.agent_rows().await;
+        self.agent_list_of(rows, &labels, &machines, &self.agents.get())
+    }
+
+    /// What [`Hub::agent_list`] reads of the store: its runners' rows, their labels and their machines.
+    pub async fn agent_rows(&self) -> (Vec<crate::store::AgentRow>, HashMap<String, String>, HashMap<String, String>) {
         let rows = self.store.agents().await.unwrap_or_default();
         let labels = self.store.agent_labels().await.unwrap_or_default();
         let machines = self.store.agent_machines().await.unwrap_or_default();
-        self.agent_list_of(rows, &labels, &machines, &self.agents.get())
+        (rows, labels, machines)
     }
 
     /// [`Hub::agent_list`] of the store's rows, labels and machines given (kept in memory for `GET

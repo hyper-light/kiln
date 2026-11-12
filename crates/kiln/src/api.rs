@@ -2263,8 +2263,8 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
         return Err(err(StatusCode::UNAUTHORIZED, "bad cluster token"));
     }
     let dir = hub.cfg.data("cluster").join("copies");
-    let _one = CLUSTER_COPIES.turn().await;
-    // Copies a stop left behind.
+    let one = CLUSTER_COPIES.turn().await;
+    // Copies a stop left behind: none is being made while the turn is here (below).
     if let Ok(old) = std::fs::read_dir(&dir) {
         for e in old.flatten() {
             std::fs::remove_file(e.path()).ok();
@@ -2273,7 +2273,16 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
     std::fs::create_dir_all(&dir).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("making {}: {e}", dir.display())))?;
     let path = dir.join(format!("{}.db", crate::util::new_id()));
     let started = Instant::now();
-    if let Err(e) = hub.store.copy_for_learner(path.clone()).await {
+    // A copy holds the turn for as long as it's being made, whether its runner waits for it or not: one that gave up and
+    // asked again waits for it rather than a second being made beside it, and the turn comes back here with the copy, given
+    // up once the copy is open to be sent (plan 01a1cc09, step 4). A copy is made on the blocking pool, and once started nothing stops
+    // it: on 2026-11-11 four of production's 32 GB kiln.db were being written at once, three of them deleted already by
+    // the asks after, about 100 MiB/s of its disk.
+    let (store, made) = (hub.store.clone(), path.clone());
+    let (copied, _one) = crate::rt::spawn(async move { (store.copy_for_learner(made).await, one) })
+        .await
+        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "the copy of kiln.db stopped before it was made"))?;
+    if let Err(e) = copied {
         std::fs::remove_file(&path).ok();
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")));
     }
@@ -3266,7 +3275,12 @@ async fn agents_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response 
             }
         }
     }
-    srv::json(StatusCode::OK, &crate::doctor::runners_for(hub, caller).await)
+    match crate::doctor::runners_made_for(hub, caller, |runners| crate::reads::encode(&runners)).await {
+        Some(Ok(json)) => pre_encoded(json),
+        Some(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("the runners' list couldn't be encoded: {e:#}")).into_response(),
+        // Where the pool's job is lost (it panicked), here.
+        None => srv::json(StatusCode::OK, &crate::doctor::runners_for(hub, caller).await),
+    }
 }
 
 /// The owner's `GET /api/agents` as `key` says it, made on the compute pool (each runner's record copied, the list
@@ -5942,10 +5956,15 @@ async fn conversation_events_for(hub: &Hub, caller: &crate::authz::Caller, id: &
     let bytes = q.get("bytes").and_then(|v| v.parse::<usize>().ok()).unwrap_or(256 * 1024).clamp(16 * 1024, 1024 * 1024);
     if !hub.harness.history_valid(id, cursor) { return Err(err(StatusCode::CONFLICT, "the conversation restarted; reconnect before loading earlier history")); }
     let mut more = false;
-    let events = if let Some(store) = hub.harness.convo.clone() {
+    // From the session's copy when it holds the page: the conversation store, whose reads wait behind its writes,
+    // only for what the copy doesn't hold, as pages were answered before d7c8bc4ee96b (plan 01a1cc09, step 1).
+    let events = if hub.harness.history_kept(id, before, limit).await {
+        (Vec::new(), false)
+    } else if let Some(store) = hub.harness.convo.clone() {
         let session = id.to_owned();
         crate::rt::blocking(move || {
-            let rows = store.events(&session, Some(before), limit.saturating_add(1))?;
+            // As committed, beside the store's writer: never behind the writes sent before it (plan 01a1cc09, step 2).
+            let rows = store.events_committed(&session, Some(before), limit.saturating_add(1))?;
             let more = rows.len() > limit;
             let values = rows.iter().map(|r| serde_json::from_str::<serde_json::Value>(&r.body)).collect::<Result<Vec<_>, _>>()?;
             anyhow::Ok((values, more))
@@ -8456,6 +8475,47 @@ mod tests {
         })
     }
 
+    /// Plan 01a1cc09, step 1: an older page the session's copy holds comes from the copy, nothing of it read from
+    /// the conversation store (whose reads wait behind its writes), and it's the page the store's events made; a
+    /// conversation that changed is still refused.
+    #[test]
+    fn an_older_page_the_copy_holds_reads_nothing_from_the_store() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "kept".into(), kind: "claude".into(), ..Default::default() };
+            hub.harness.ingest(&there, "kept", Update::Open { info: Box::new(info), since: None }).await;
+            let events = (1..=230).map(|n| Event { id: format!("e{n}"), seq: n, at: i64::try_from(n).unwrap_or_default(), parent: None, by: None, body: Body::Assistant { text: format!("whole text {n}"), streaming: false } }).collect();
+            hub.harness.ingest(&there, "kept", Update::Events { events }).await;
+            hub.harness.ingest(&there, "kept", Update::State { state: Box::new(State::default()) }).await;
+            let held = hub.harness.view_held("kept").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let cursor = crate::harness::history::cursor(crate::harness::registry::born(), held.reset_at, "kept");
+            let mut q = HashMap::from([("cursor".into(), cursor.clone()), ("before".into(), "221".into()), ("limit".into(), "100".into()), ("bytes".into(), "16384".into())]);
+            let reads = || store.report().waits.iter().sum::<u64>();
+            let before = reads();
+            let resp = conversation_events_for(&hub, &crate::authz::Caller::owner(), "kept", &q).await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?;
+            anyhow::ensure!(reads() == before, "the store was read for a page the copy holds");
+            let got: serde_json::Value = serde_json::from_slice(&body_of(resp).await?)?;
+            // The page as the store's events made it before (d7c8bc4ee96b).
+            let rows = {
+                let store = store.clone();
+                crate::rt::blocking(move || store.events("kept", Some(221), 101)).await??
+            };
+            let durable = rows.iter().map(|r| serde_json::from_str::<serde_json::Value>(&r.body)).collect::<Result<Vec<_>, _>>()?;
+            anyhow::ensure!(durable.len() == 101, "the store has the page: {}", durable.len());
+            let (events, revision, held_more, floor) = hub.harness.history_overlay("kept", &cursor, 221, 100, durable).await?.ok_or_else(|| anyhow::anyhow!("no overlay"))?;
+            let more = (rows.len() > 100 || held_more) && events.iter().filter_map(crate::harness::history::seq).min().is_some_and(|n| n > floor);
+            let (page, window) = crate::harness::history::page(events, 221, 100, 16384, cursor.clone(), more);
+            anyhow::ensure!(got == serde_json::json!({"events": page, "history": window, "revision": revision}), "the copy's page differs from the store's: {got}");
+            q.insert("cursor".into(), "another-process".into());
+            anyhow::ensure!(matches!(conversation_events_for(&hub, &crate::authz::Caller::owner(), "kept", &q).await, Err(ApiError(StatusCode::CONFLICT, _))));
+            Ok(())
+        })
+    }
+
     /// W21-R15: a page from the conversation store is cut as the copy's are (whole turns, a page's
     /// bounds), and says there's more when it left some out or the store may have more.
     #[test]
@@ -10192,6 +10252,24 @@ mod tests {
                 anyhow::ensure!(woken.0 >= woken0.0 + FED && woken.1 >= woken0.1 + FED * BEFORE_US, "{}: {FED} frames each {BEFORE_US} µs: {woken0:?} to {woken:?}", taken.name());
                 anyhow::ensure!(write.0 >= write0.0 + FED, "the batch's write, each frame's: {write0:?} to {write:?}");
             }
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: `GET /api/agents` read while no kept list can say it (none made yet, as here, or the
+    /// store's rows moved on from it) has its runners' list made and encoded on the compute pool, none of it on the request's
+    /// shard, and says what the store's path says. Its list was made and encoded where the request was: 0.64 ms of a shard on
+    /// the CPU in the lab's production layout on Linux.
+    #[test]
+    fn g9_s3_a_runners_list_no_kept_one_says_is_made_off_the_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let owner = crate::authz::Caller::owner();
+            let (r, took) = crate::reads::trace::traced(agents_read(&hub, &owner)).await;
+            anyhow::ensure!(r.status() == StatusCode::OK, "{}", r.status());
+            let body = body_of(r).await?;
+            anyhow::ensure!(body == serde_json::to_vec(&crate::doctor::runners_for(&hub, &owner).await)?, "the store's path's bytes");
+            anyhow::ensure!(took.encoded == 0, "encoded {} times on the request's shard", took.encoded);
             Ok(())
         })
     }

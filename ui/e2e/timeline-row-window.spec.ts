@@ -202,7 +202,7 @@ test("W21-R02 a bounded snapshot automatically restores a saved older row throug
   const older = await heldOlderPlace(page);
   try {
     await page.goto("/agents/tree-lead");
-    await expect(page.locator(".hx-restore-place")).toContainText("Restoring your saved place", { timeout: 30_000 });
+    await expect(page.locator(".hx-restore-place")).toContainText("Loading conversation", { timeout: 30_000 });
     await expect.poll(older.requests).toBe(1);
     await expect(page.locator(".hx-flow > .hx-turn")).toHaveCount(0);
     expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem("kiln.agents.places") ?? "{}").state.places["tree-lead"].id)).toBe("window-call-20");
@@ -230,6 +230,38 @@ test("W21-R02 a bounded snapshot automatically restores a saved older row throug
   }
 });
 
+test("W21-R02 a saved place 300 events back restores in one read of the largest page", async ({ page }) => {
+  // Plan 01a1cc09, step 3: the restore asks for the most the server gives at once, not 100 events a read.
+  const cursor = "restore-far-generation";
+  await page.addInitScript(() => {
+    sessionStorage.setItem(
+      "kiln.agents.places",
+      JSON.stringify({ state: { places: { "tree-lead": { id: "window-call-100", seq: 102, row: true, offset: 0, neighbors: [{ id: "window-call-101", row: true }], at: Date.now() } } }, version: 0 }),
+    );
+  });
+  // The snapshot holds the newest 60 events (402 to 461); the saved row is 300 back.
+  await controlled(
+    page,
+    Array.from({ length: 60 }, (_, n) => call(n + 400)),
+    { cursor, before: 402, has_more: true, oversized: false },
+  );
+  const asked: number[] = [];
+  await page.route("**/api/harness/sessions/tree-lead/events?*", async (route) => {
+    const query = new URL(route.request().url()).searchParams;
+    const before = Number(query.get("before"));
+    const limit = Number(query.get("limit"));
+    asked.push(limit);
+    // As the server pages: the newest `limit` events before `before`.
+    const events: HEvent[] = [];
+    for (let seq = Math.max(1, before - limit); seq < before; seq++) events.push(seq === 1 ? prompt : call(seq - 2));
+    const from = events[0]?.seq ?? before;
+    await route.fulfill({ json: { events, history: { cursor, before: from, has_more: from > 1, oversized: false } } });
+  });
+  await page.goto("/agents/tree-lead");
+  await expect(page.locator('[data-window-row="call"][data-ev="window-call-100"]')).toBeVisible({ timeout: 30_000 });
+  expect(asked).toEqual([1000]);
+});
+
 test("W21-R02 Latest cancels the owned restore page and preserves the live bounded snapshot against late history", async ({ page }, info) => {
   const older = await heldOlderPlace(page);
   const cancellation = () => page.evaluate(() => (window as unknown as { __restoreAudit: { signals: number; aborted: number; rejections: string[] } }).__restoreAudit);
@@ -238,7 +270,7 @@ test("W21-R02 Latest cancels the owned restore page and preserves the live bound
     await expect(page.locator(".hx-restore-place")).toBeVisible({ timeout: 30_000 });
     await expect.poll(older.requests).toBe(1);
     await expect.poll(async () => (await cancellation()).signals).toBe(1);
-    await page.getByRole("button", { name: "Latest messages", exact: true }).click();
+    await page.getByRole("button", { name: "Latest", exact: true }).click();
     await expect(page.locator(".hx-restore-place")).toHaveCount(0);
     await expect(page.locator(".hx-flow > .hx-turn")).toBeVisible();
     await expect.poll(async () => (await cancellation()).aborted).toBe(1);

@@ -932,6 +932,15 @@ textarea.hx-input {
 .hx-timeline > .hx-flow {
   min-height: calc(100% + 1px);
 }
+/* Restoring your place (restoring-place.tsx): the conversation's loader where it goes, centred as at
+   its first load (console.css, `.ag-loading`), and the way to the latest at the bottom, as ever. */
+.hx-flow.hx-flow-loading {
+  display: flex;
+  flex-direction: column;
+}
+.hx-flow-loading > .hx-restore-place {
+  margin-block: auto;
+}
 /* Placeholder words that hold a line's height while the page loads. */
 .hx-ghost {
   visibility: hidden;
