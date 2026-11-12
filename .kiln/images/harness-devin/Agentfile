@@ -1,0 +1,43 @@
+# Devin for Terminal as a harness kiln runs in a Shards microVM: kiln plan
+# 01a1ce705e4d7008993f5c7291ef4476, on the layout steps 19 to 28 share; fN are the findings of its
+# research, 01a1ce705e4d70089c04cee721525c8f. kiln runs Devin as `devin acp`, its ACP server over
+# stdio (Kind "devin", crates/kiln/src/harness/kinds.rs), and harness.json starts it so (f9).
+#
+# Cognition's own Linux bundles come in as ./devin-<arch>/: `kiln agentfiles context devin DIR`
+# downloads each as pin.json pins it (its size and SHA-256 from Cognition's versioned manifest;
+# Cognition publishes no signature) and unpacks it there beside harness.json, adding nothing
+# (HARNESS would take an http(s) source with no checksum). It stays on its version with no setting:
+# Devin's updater stayed off without the installer's `distribution` marker, which nothing here
+# writes (f26). No credential is in the image: a person's sign-in lives in their data volume, or
+# arrives through ACP's authenticate (f13).
+#
+#   kiln agentfiles context devin DIR --platform linux/amd64,linux/arm64
+#   shards build --platform linux/amd64,linux/arm64 DIR
+
+# Any base will do, so a project's own toolchain image works: both Linux builds are statically
+# linked, with no program interpreter and no shared library, so they start on a glibc or a musl
+# base alike with nothing added: no RUN, and no libc variant (f5). The default carries git, an ssh
+# client, curl and CA certificates, pinned by digest as step 19 chose it.
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+FROM ${BASE}
+
+# BuildKit sets TARGETARCH in the global scope, so the stage declares it to name each platform's
+# harness directory.
+ARG TARGETARCH
+HARNESS devin FROM ./devin-${TARGETARCH}
+
+# Its reach, every part named (networks are default deny): a network of its own, names through
+# the microVM's resolver, and TCP 443 out, which is all a session was seen to use: every Devin
+# endpoint is an https URL, and its sockets reached port 443 alone (f14). These are the bring-up's
+# three lines, until step 9 grants providers by name.
+NETWORK --dns --egress=443/tcp provider FOR devin
+EXPOSE --harnesses=devin 443/tcp AS egress FOR provider
+CONNECT devin WITH devin ON provider
+
+# The project, and the person's own Devin in its XDG directories under /home/devin, where
+# harness.json's XDG_CONFIG_HOME and XDG_DATA_HOME point: its config (config.json,
+# mcp_config.json) in .config/devin; its sign-in (credentials.toml), sessions and logs in
+# .local/share/devin (f10, f12). Its caches go under HOME, the domain's scratch /tmp, unkept.
+VOLUME --target-kind=harness /workspace FOR devin
+VOLUME --target-kind=harness /home/devin/.config/devin FOR devin
+VOLUME --target-kind=harness /home/devin/.local/share/devin FOR devin

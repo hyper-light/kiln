@@ -1,0 +1,34 @@
+host adacachy2 Linux 7.3.3-1-cachyos x86_64 at 2026-11-12T10:27:20Z
+shards ac87190d3ff78245e9fa9726c81a7392797bce30 2026-11-12T01:11:10-08:00
+ancestry of 1da9132b7 not visible in a depth-1 clone (checked on the Mac: git merge-base --is-ancestor 1da9132b7 ac87190d3ff78245e9fa9726c81a7392797bce30)
+rustc 1.98.1 (48a229cea 2026-09-01)
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+warning: aws-lc-sys@0.45.0: Only dynamic crypto library found in system install; using dynamic linking.
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/adalundhe/.cache/s25-step3/target/debug/build/aws-lc-sys-d7362927ea33fbbf/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/adalundhe/.cache/s25-step3/target/debug/build/aws-lc-sys-d7362927ea33fbbf/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/adalundhe/.cache/s25-step3/target/debug/build/aws-lc-sys-d7362927ea33fbbf/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/adalundhe/.cache/s25-step3/target/debug/build/aws-lc-sys-d7362927ea33fbbf/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+warning: aws-lc-sys@0.45.0: /tmp/cc4rQcsu.s: Assembler messages:
+warning: aws-lc-sys@0.45.0: /home/adalundhe/.cache/s25-step3/shards/vendor/aws-lc-sys/aws-lc/crypto/fipsmodule/ml_dsa/mldsa/native/x86_64/src/mldsa_poly_decompose_32_avx2_asm.S:481: Warning: ignoring incorrect section type for .note.GNU-stack
+warning: aws-lc-sys@0.45.0: /home/adalundhe/.cache/s25-step3/shards/vendor/aws-lc-sys/aws-lc/crypto/fipsmodule/ml_dsa/mldsa/native/x86_64/src/mldsa_poly_decompose_32_avx2_asm.S:481: Warning: ignoring changed section type for .note.GNU-stack
+warning: aws-lc-sys@0.45.0: /tmp/ccC0Gqgk.s: Assembler messages:
+warning: aws-lc-sys@0.45.0: /home/adalundhe/.cache/s25-step3/shards/vendor/aws-lc-sys/aws-lc/crypto/fipsmodule/ml_dsa/mldsa/native/x86_64/src/mldsa_poly_decompose_88_avx2_asm.S:480: Warning: ignoring incorrect section type for .note.GNU-stack
+warning: aws-lc-sys@0.45.0: /home/adalundhe/.cache/s25-step3/shards/vendor/aws-lc-sys/aws-lc/crypto/fipsmodule/ml_dsa/mldsa/native/x86_64/src/mldsa_poly_decompose_88_avx2_asm.S:480: Warning: ignoring changed section type for .note.GNU-stack
+   Compiling rustls-webpki v0.103.16
+   Compiling shards-gitsign v0.1.0 (/home/adalundhe/.cache/s25-step3/shards/crates/gitsign)
+   Compiling rcgen v0.14.10
+   Compiling hyper-tls v0.1.0 (https://github.com/hyper-light/hyper-raft?rev=233b7fcef7a363327c5439b191724a38065062cd#233b7fce)
+   Compiling shards-tuf v0.1.0 (/home/adalundhe/.cache/s25-step3/shards/crates/tuf)
+   Compiling shards-sigstore v0.1.0 (/home/adalundhe/.cache/s25-step3/shards/crates/sigstore)
+   Compiling rustls-platform-verifier v0.7.1
+   Compiling shards-registry v0.1.0 (/home/adalundhe/.cache/s25-step3/shards/crates/registry)
+   Compiling hyper-quic v0.1.0 (https://github.com/hyper-light/hyper-raft?rev=233b7fcef7a363327c5439b191724a38065062cd#233b7fce)
+   Compiling shards-remote v0.1.0 (/home/adalundhe/.cache/s25-step3/shards/crates/remote)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 33.55s
+built in 34 s
+shards version 0.7.0, build unknown-commit
+1bbd2b126e42418b3da9b4fdd6df212ddf14cd2a1e7a11ee07a328ed5acc0662  /home/adalundhe/.cache/s25-step3/target/debug/shards
+exit 0 (try 1)
