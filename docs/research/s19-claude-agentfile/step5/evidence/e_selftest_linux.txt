@@ -1,0 +1,27 @@
+PASS index: one index holding linux/amd64 and linux/arm64
+PASS index mutation caught: linux/amd64 alone
+PASS secrets: a clean image; the pinned program's names are its own
+PASS secrets mutation caught: config Env ANTHROPIC_API_KEY
+PASS secrets mutation caught: a key-shaped value in a file
+PASS secrets mutation caught: a key-shaped value in the pinned program
+PASS secrets mutation caught: an unpinned file naming apiKeyHelper
+PASS secrets mutation caught: the program changed (not the pinned one)
+PASS secrets mutation caught: a sign-in file .credentials.json
+PASS secrets mutation caught: a sign-in file .claude.json
+PASS exec holds: as declared
+PASS exec mutation caught: an argument missing
+PASS exec mutation caught: another program
+PASS exec mutation caught: another member
+PASS homedir: x, .gitconfig and .claude.json as the probe writes them
+PASS homedir mutation caught: no x
+PASS homedir mutation caught: another git name
+PASS homedir mutation caught: no .claude.json
+PASS homedir mutation caught: no kiln-probe server
+PASS interp: /bin/sh names its loader
+PASS interp: not an ELF is refused
+PASS context: the pin's binary, mode and harness.json
+PASS context mutation caught: a byte changed
+PASS context mutation caught: mode 0644
+PASS context mutation caught: the musl harness file
+PASS context mutation caught: another Agentfile
+SELFTEST 26 of 26 passed

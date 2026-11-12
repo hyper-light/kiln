@@ -3,3 +3,8 @@
 # recorded Python traceback's lines into CRLF and failed the test that reads it).
 **/fixtures/** -text
 **/testdata/** -text
+# Docs that tests read as committed, so the same on Windows: docs/runners.md is parsed for its needs
+# and its workflow (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 32), and ci/sim/README.md keeps
+# the sim's reports, compared byte for byte with what it renders (W28-AC33).
+docs/runners.md -text
+ci/sim/README.md -text
