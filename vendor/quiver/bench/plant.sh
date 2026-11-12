@@ -4,9 +4,9 @@
 # every delivery (`--features plant`, in follow.rs's `Seen::take`). Their profiles must differ by one
 # allocation and one free a delivery, all of it on the subscribers' threads: the count sees every
 # thread. Quiver's run and the wake-up floor's, both in this process, their subscribers polling
-# (`--busy`): a waiting subscriber's own allocations go with how often it waits, which a loaded
-# machine moves between two runs, and a polling one's don't. bench/compare.sh runs this before it
-# starts its brokers, so every comparison's profiles stand on it.
+# (`--busy`), as when a waiting subscriber still allocated once a wait (before 88409dd; neither does
+# now), so how often it waits, which a loaded machine moves, stays out of it. bench/compare.sh runs
+# this before it starts its brokers, so every comparison's profiles stand on it.
 #
 #   bench/plant.sh OUT
 #

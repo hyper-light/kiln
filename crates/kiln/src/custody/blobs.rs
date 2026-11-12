@@ -13,8 +13,9 @@
 //! stream of them short. Statements say no time, so reading an object again signs the same records,
 //! which kiln keeps once.
 //!
-//! Objects whose key names their content (`cas/<digest>`, `sync/<hash>`) get no records: every
-//! read checks them by that name already, a whole get here and a stream in `read_stream`. A store's
+//! Objects whose key names their content (`cas/<digest>`, `sync/<hash>`, an Agentfile's text at
+//! `agentfiles/sha256/<digest>`) get no records: every read checks them by that name already, a whole
+//! get here and a stream in `read_stream` (an Agentfile's text in `crate::agentfiles`). A store's
 //! presigned URL that leads to the store itself (an S3's) carries bytes kiln never sees.
 //!
 //! A refusal here is custody's, above the store: `blobs::Metered`, inside this wrapper, counts the
@@ -93,7 +94,7 @@ struct Reader {
 
 /// Whether kiln records custody of the object at `key`: one whose key doesn't name its content.
 fn recorded(key: &str) -> bool {
-    !(key.starts_with("cas/") || key.starts_with("sync/"))
+    !(key.starts_with("cas/") || key.starts_with("sync/") || key.starts_with("agentfiles/sha256/"))
 }
 
 impl Attested {
@@ -511,6 +512,10 @@ mod tests {
             let d = crate::util::sha256_hex(b"an rlib");
             b.put(&format!("cas/{d}"), b"an rlib".to_vec(), Put::default()).await?;
             b.get(&format!("cas/{d}"), None).await?;
+            let text = b"FROM ubuntu:24.04\n";
+            let a = crate::agentfiles::key(&crate::util::sha256_hex(text));
+            b.put(&a, text.to_vec(), Put::default()).await?;
+            b.get(&a, None).await?;
             assert_eq!(k.count("custody").await?, before);
             assert_eq!(k.count("custody_breaks").await?, 0);
             Ok(())

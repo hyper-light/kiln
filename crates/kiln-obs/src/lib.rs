@@ -11,7 +11,6 @@ pub mod apm;
 pub mod batch;
 pub mod bits;
 pub mod block;
-pub mod catch_up;
 pub mod command;
 pub mod crc32c;
 pub mod ddagent;

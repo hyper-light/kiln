@@ -33,6 +33,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use hyper_quic::coding::Codec;
 use hyper_quic::congestion::Congestion;
 use hyper_quic::rustls::pki_types::CertificateDer;
@@ -50,7 +51,9 @@ use crate::credit::{
     K_GRANULARITY, MIN_DATAGRAM, Room, Window, class_reserve, initial_window, stream_window_ceiling,
 };
 use crate::deadlines;
-use crate::exchange::{End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push};
+use crate::exchange::{
+    End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push, push_owned,
+};
 use crate::frame::{PREFIX_BYTES, Prefix};
 use crate::lane::{LaneIn, LaneOut, NotesOut, OPENER_BYTES, Reading, VARINT_MOST, opened};
 use crate::pool::{Pool, PoolStats, Share};
@@ -1582,7 +1585,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// when credit ran out ([`Event::Writable`] says when more can be taken). The last byte
     /// written writes the body's checksum and finishes the message.
     pub fn write_body(&mut self, exchange: ExchangeId, from: &[u8]) -> Result<usize, Refusal> {
-        self.with_exchange(exchange, |core, conn, id| core.write_body(conn, id, from))
+        self.with_exchange(exchange, |core, conn, id| {
+            core.write_body(conn, id, Body::Borrowed(from))
+        })
+    }
+
+    /// [`Endpoint::write_body`] of bytes the owner holds as [`Bytes`], handed to QUIC as they are:
+    /// a borrowed body is copied into a buffer of QUIC's own as it is written, one allocation of its
+    /// bytes a write, where this one is kept by reference until the peer acknowledges it. Returns
+    /// how many were taken; the owner offers the rest (`from.slice(taken..)`) again.
+    pub fn write_body_bytes(
+        &mut self,
+        exchange: ExchangeId,
+        from: &Bytes,
+    ) -> Result<usize, Refusal> {
+        self.with_exchange(exchange, |core, conn, id| {
+            core.write_body(conn, id, Body::Owned(from))
+        })
     }
 
     /// Read the next bytes of the peer's body on `exchange` into `into`, as many as it has room
@@ -3871,8 +3890,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         &mut self,
         conn: &mut Conn<C::Role>,
         id: u64,
-        from: &[u8],
+        body: Body<'_>,
     ) -> Result<usize, Refusal> {
+        let from = body.bytes();
         let allowed = self.allowed(conn, self.rank_of(id));
         let exchange = self.exchanges.get_mut(id).ok_or(Refusal::UnknownExchange)?;
         match exchange.out.state {
@@ -3887,7 +3907,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             return Err(Refusal::Order);
         }
         let stream = exchange.stream.ok_or(Refusal::Order)?;
-        let took = match pushed(push(&mut conn.quic, stream, from, allowed)) {
+        let written = match body {
+            Body::Borrowed(from) => push(&mut conn.quic, stream, from, allowed),
+            Body::Owned(from) => push_owned(&mut conn.quic, stream, from, allowed),
+        };
+        let took = match pushed(written) {
             Ok(took) => took,
             Err(failure) => {
                 self.finish_exchange(conn, id, Some(failure));
@@ -5196,6 +5220,23 @@ fn ended(end: End, short: bool) -> Result<(), (Refusal, bool)> {
         End::Reset(code) => Err((Refusal::from_code(code), true)),
         End::Finished | End::Closed if short => Err((Refusal::Corrupt, false)),
         End::Open | End::Blocked | End::Finished | End::Closed => Ok(()),
+    }
+}
+
+/// A body's next bytes as the owner offers them: borrowed, copied as QUIC takes them, or held as
+/// [`Bytes`], taken by reference.
+#[derive(Clone, Copy)]
+enum Body<'a> {
+    Borrowed(&'a [u8]),
+    Owned(&'a Bytes),
+}
+
+impl Body<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(from) => from,
+            Self::Owned(from) => from,
+        }
     }
 }
 

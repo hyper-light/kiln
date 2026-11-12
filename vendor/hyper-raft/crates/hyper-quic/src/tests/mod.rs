@@ -1863,6 +1863,93 @@ fn data_blocked_retransmit() {
     );
 }
 
+/// A lost packet that carried a stream's STREAM_DATA_BLOCKED, the record of which its space keeps
+/// beside its packets (VENDORED.md §49), sends the frame again.
+#[test]
+fn stream_data_blocked_retransmit() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: TransportConfig {
+            stream_receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        },
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive_client();
+    pair.server.inbound.clear(); // Lose the packet carrying the frame
+    pair.drive();
+
+    assert!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .stream_data_blocked
+            > 1
+    );
+    assert!(
+        pair.server_conn_mut(server_ch)
+            .stats()
+            .frame_rx
+            .stream_data_blocked
+            > 0
+    );
+}
+
+/// A lost packet that carried the receiver's credit, MAX_DATA and a stream's MAX_STREAM_DATA,
+/// recorded inline and by its space (VENDORED.md §49), sends both again, and the sender, held
+/// at the old limits until then, finishes what it writes.
+#[test]
+fn credit_retransmit() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: TransportConfig {
+            stream_receive_window: 10u32.into(),
+            receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        },
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s).write(b"0123456789").unwrap(),
+        10
+    );
+    pair.drive();
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Uni), Some(stream) if stream == s);
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    assert_matches!(chunks.next(usize::MAX), Ok(Some(chunk)) if chunk.bytes.len() == 10);
+    let _ = chunks.finalize();
+    pair.drive_server();
+    pair.client.inbound.clear(); // Lose the packet carrying the credit
+    pair.drive();
+
+    let stats = pair.server_conn_mut(server_ch).stats();
+    assert!(stats.frame_tx.max_data > 1, "{:?}", stats.frame_tx);
+    assert!(stats.frame_tx.max_stream_data > 1, "{:?}", stats.frame_tx);
+    assert_eq!(
+        pair.client_send(client_ch, s).write(b"0123456789").unwrap(),
+        10
+    );
+}
+
 #[test]
 fn key_update_simple() {
     let _guard = subscribe();

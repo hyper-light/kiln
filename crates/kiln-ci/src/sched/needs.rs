@@ -10,6 +10,8 @@
 //!   `32Gi`), as `kiln run --on` takes them; a plain number is bytes.
 //! - `linux/amd64`, `linux`, `arm64`, …: the runner's OS and architecture, by any of their names.
 //! - `+gpu` (or `label=gpu`): the runner carries the label.
+//! - `microvm`: the runner starts microVMs (`virt.microvm`), as an agent in a microVM, and the work
+//!   it starts, are placed (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
 //! - `tool:cargo`, `executor:docker`, `flag:avx2`, `binfmt:linux/arm64`: it has that tool, executor,
 //!   CPU flag or binfmt handler.
 //! - `cpus>=16`, `mem>=32g`: that many CPUs in all, that much memory free, as `kiln run --on` takes
@@ -103,6 +105,10 @@ impl Needs {
         if w.eq_ignore_ascii_case("exclusive") {
             self.exclusive = true;
             return Ok(());
+        }
+        // A runner that starts microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+        if w.eq_ignore_ascii_case("microvm") {
+            return self.require("virt.microvm".into());
         }
         // `cpus>=16` is a fact checked and `cpus=8` a request: comparisons first.
         if let Some((fact, op, value)) = comparison(w) {
@@ -368,6 +374,7 @@ mod tests {
             ("disk.free>=50Gi,os.distro==fedora,custom.rack!=a3", needs(Resources::default(), &["disk.free >= 50Gi", "os.distro == fedora", "custom.rack != a3"], false)),
             ("executor:docker,flag:avx2,binfmt:linux/arm64", needs(Resources::default(), &["executors has docker", "cpu.flags has avx2", "binfmt has linux/arm64"], false)),
             ("label=bench,+bench", needs(Resources::default(), &["label bench"], false)),
+            ("cpus=4,mem=8g,microvm", needs(Resources { cpu: Cpus::whole(4), mem: 8 * GIB, ..Resources::default() }, &["virt.microvm"], false)),
             ("", Needs::default()),
         ];
         for (spelling, want) in cases {
@@ -375,6 +382,21 @@ mod tests {
             // Every constraint is one routing reads.
             want.constraints()?;
         }
+        Ok(())
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32: `microvm` holds only on a runner that says
+    /// it starts microVMs, never on one that only has a hypervisor.
+    #[test]
+    fn step32_microvm_holds_only_where_the_runner_says_it_starts_microvms() -> Result<(), String> {
+        let want = parse("microvm")?.constraints()?;
+        let holds = |virt: crate::facts::Virt| {
+            let f = crate::facts::RunnerFacts { virt, ..crate::facts::RunnerFacts::default() };
+            want.iter().all(|(_, c)| c.eval(&f, &[]))
+        };
+        assert!(holds(crate::facts::Virt { microvm: true, ..crate::facts::Virt::default() }));
+        assert!(!holds(crate::facts::Virt { kvm: true, hvf: true, nested: true, microvm: false }));
+        assert!(!holds(crate::facts::Virt::default()));
         Ok(())
     }
 
