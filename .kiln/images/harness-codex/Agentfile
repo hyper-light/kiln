@@ -1,0 +1,35 @@
+# Codex as a kiln harness in a Shards microVM (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 20).
+# kiln runs Codex's app-server (Kind "codex", crates/kiln/src/harness/kinds.rs), which it speaks
+# JSON-RPC to. pin.json pins OpenAI's whole Codex package for each platform, the archive OpenAI's own
+# Linux installer installs (pin.sh checks it three ways), into ./codex-<arch>/: harness.json,
+# codex-package.json, bin/ (codex, its code-mode host and exec server), codex-resources/ (bwrap) and
+# codex-path/ (rg), the layout Codex finds its helpers through. Nothing else installs it, and no sign-in
+# is in the image: a person's lives in their CODEX_HOME volume until step 33 brings sign-ins from
+# outside the microVM.
+
+# Every program kiln has Codex run is static, so any base runs it with nothing added and there is no
+# libc variant: this default (Debian trixie's buildpack-deps, pinned by digest as step 19 chose it) or a
+# musl base. On linux/arm64 the package's own rg is ripgrep's glibc build, so the pin lays ripgrep's
+# static musl build of the same version in its place. The package's voice resources are glibc builds,
+# but kiln never starts them: its Codex adapter refuses /voice.
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+FROM ${BASE}
+
+# BuildKit sets TARGETARCH in the global scope, so the stage declares it to name each platform's
+# harness directory.
+ARG TARGETARCH
+HARNESS codex FROM ./codex-${TARGETARCH}
+
+# Its network reach, every part named (default deny): a network for this harness alone, which it
+# joins with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443
+# out, opened at the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress), for Codex
+# speaks HTTPS to OpenAI. These are the bring-up's grants (Shards' docs/examples/harness-codex) until
+# step 9 grants providers by name. Nothing comes in; no other port or protocol goes out.
+NETWORK --dns --egress=443/tcp provider FOR codex
+EXPOSE --harnesses=codex 443/tcp AS egress FOR provider
+CONNECT codex WITH codex ON provider
+
+# The project, and the person's Codex home (D109's harness-scoped volumes): harness.json points
+# CODEX_HOME here, where Codex keeps its config.toml and its sign-in. Each is the harness's alone.
+VOLUME --target-kind=harness /workspace FOR codex
+VOLUME --target-kind=harness /home/codex/.codex FOR codex

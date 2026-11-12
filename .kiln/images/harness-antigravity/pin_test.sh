@@ -110,7 +110,7 @@ for b, w in zip(builds, want["builds"]):
         eq(f"{w['platform']} {key}", f.get(key), w[key])
     eq(f"{w['platform']} path", f.get("path"), "bin/agy")
     eq(f"{w['platform']} mode", f.get("mode"), "0755")
-    eq(f"{w['platform']} unpack", f.get("unpack"), {"format": "tar.gz", "member": "antigravity", "sha256": w["member_sha256"], "size": w["member_size"]})
+    eq(f"{w['platform']} unpack", f.get("unpack"), {"format": "tar.gz", "member": "antigravity", "alone": True, "sha256": w["member_sha256"], "size": w["member_size"]})
 if problems:
     sys.exit("; ".join(problems))
 PY

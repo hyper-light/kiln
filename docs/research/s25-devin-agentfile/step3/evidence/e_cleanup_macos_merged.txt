@@ -1,0 +1,13 @@
+[2m[kiln] on d1323898b255a3ed435eb83fa0f7b0cf · macos/aarch64 · 29 of 32 cores idle · 58 GB free[0m
+s25-step3: started on Adas-Mac-Studio.local
+Adas-Mac-Studio.local:  37G at /Users/adalundhe/.cache/s25-step3
+ 56K	/Users/adalundhe/.cache/s25-step3/step3.patch
+100K	/Users/adalundhe/.cache/s25-step3/kind-args.orig
+330M	/Users/adalundhe/.cache/s25-step3/shards
+466M	/Users/adalundhe/.cache/s25-step3/kiln
+2.6G	/Users/adalundhe/.cache/s25-step3/shards-target
+ 34G	/Users/adalundhe/.cache/s25-step3/kiln-target
+removed
+/dev/disk3s5   3.6Ti   1.7Ti   1.9Ti    47%    8.9M   21G    0%   /System/Volumes/Data
+[2m[kiln] used memory not measured over 8 s; OOM kills not seen here[0m
+exit 0 (try 1)

@@ -1,0 +1,22 @@
+# Goose releases on GitHub (gh api), 2026-11-12T07:31:24Z, from Adas-MacBook-Pro-2.local
+== release stable: Linux musl, glibc and goose-acp assets (name, digest, size, updated_at)
+goose-aarch64-unknown-linux-gnu.tar.gz sha256:ba96b78394e3050077482bb285ff35f34613646e90b84a18b5d674b71905166e size=63278800 updated=2026-11-10T17:23:17Z
+goose-aarch64-unknown-linux-musl.tar.gz sha256:63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7 size=48814292 updated=2026-11-10T17:23:13Z
+goose-acp-aarch64-unknown-linux-gnu.tar.gz sha256:98cf9f31b56c58c70bf44e916766936b56540d2d814c927c0d61ba6cd13bdf04 size=10097549 updated=2026-11-10T17:23:08Z
+goose-acp-x86_64-unknown-linux-gnu.tar.gz sha256:bb65c2b2a83c9fcdbe8e089a5ae7dc344d72e0b861d0a9c6a8dc836999d18984 size=10657410 updated=2026-11-10T17:23:06Z
+goose-x86_64-unknown-linux-gnu.tar.gz sha256:a774667de6c20206a60d78d7bece2d9dda8389667e4f5c2fc8aaa758d1e81ef3 size=62450309 updated=2026-11-10T17:22:44Z
+goose-x86_64-unknown-linux-musl.tar.gz sha256:6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31 size=50181341 updated=2026-11-10T17:22:39Z
+== release v1.59.0: Linux musl, glibc and goose-acp assets (name, digest, size, updated_at)
+goose-aarch64-unknown-linux-gnu.tar.gz sha256:ba96b78394e3050077482bb285ff35f34613646e90b84a18b5d674b71905166e size=63278800 updated=2026-11-10T17:18:10Z
+goose-aarch64-unknown-linux-musl.tar.gz sha256:63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7 size=48814292 updated=2026-11-10T17:18:06Z
+goose-acp-aarch64-unknown-linux-gnu.tar.gz sha256:98cf9f31b56c58c70bf44e916766936b56540d2d814c927c0d61ba6cd13bdf04 size=10097549 updated=2026-11-10T17:18:01Z
+goose-acp-x86_64-unknown-linux-gnu.tar.gz sha256:bb65c2b2a83c9fcdbe8e089a5ae7dc344d72e0b861d0a9c6a8dc836999d18984 size=10657410 updated=2026-11-10T17:17:59Z
+goose-x86_64-unknown-linux-gnu.tar.gz sha256:a774667de6c20206a60d78d7bece2d9dda8389667e4f5c2fc8aaa758d1e81ef3 size=62450309 updated=2026-11-10T17:17:32Z
+goose-x86_64-unknown-linux-musl.tar.gz sha256:6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31 size=50181341 updated=2026-11-10T17:17:29Z
+== newest releases
+v1.59.0 2026-11-10T17:17:02Z prerelease=false
+v1.58.1 2026-11-10T04:09:22Z prerelease=false
+v1.58.0 2026-11-09T19:07:20Z prerelease=false
+v1.57.0 2026-10-28T19:26:10Z prerelease=false
+== repository (block/goose redirects)
+full_name=aaif-goose/goose archived=false

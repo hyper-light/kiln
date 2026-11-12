@@ -1,0 +1,37 @@
+# s23 runtime evidence, 2026-11-12T07:45:47Z, host adacachy2 Linux 7.3.3-1-cachyos x86_64, gh 
+ARCHIVE x86_64 sha256=6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31 match=yes
+MEMBER x86_64 sha256=461ea83fc8736fa0ad608661a8e5ef8c704da886d38500441ba2b91f7184d9f5 size=154218008
+ARCHIVE aarch64 sha256=63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7 match=yes
+MEMBER aarch64 sha256=c27e6ea558a39a9af96dcc04368296ca636e40a67c96cdac56a6f644488fb673 size=148726128
+--- goose --version, x86_64 (env -i; HOME and GOOSE_PATH_ROOT empty folders)
+VERSION_EXIT 0
+VERSION_STDOUT_HEX 20 31 2e 35 39 2e 30 0a
+VERSION_STDOUT [ 1.59.0]
+VERSION_STDERR_BYTES 0
+FILES_IN_ROOT_AFTER_VERSION ./state/logs/cli/<date>/<date>.log 
+FILES_IN_HOME_AFTER_VERSION 0
+--- goose --version, x86_64, no network (unshare -rn)
+NONET_VERSION_EXIT 0 NONET_VERSION_STDOUT [ 1.59.0]
+--- goose --version, aarch64 under qemu-user (0 binfmt entries)
+AARCH64_VERSION_EXIT 126 AARCH64_VERSION_STDOUT [/home/adalundhe/.cache/s23-goose-ev2/x-aarch64/goose: /home/adalundhe/.cache/s23-goose-ev2/x-aarch64/goose: cannot execute binary file]
+--- goose update (the portable build has no updater)
+UPDATE_EXIT 2 UPDATE_FIRST_LINE [error: unrecognized subcommand 'update']
+--- goose info -v: where it keeps its files under GOOSE_PATH_ROOT
+Config dir: <GOOSE_PATH_ROOT>/config missing (can create)
+Config yaml: <GOOSE_PATH_ROOT>/config/config.yaml missing (can create)
+Sessions DB (sqlite): <GOOSE_PATH_ROOT>/data/sessions/sessions.db missing (can create)
+Logs dir: <GOOSE_PATH_ROOT>/state/logs 
+--- goose acp: initialize, then session/new, with no network (unshare -rn) and an empty GOOSE_PATH_ROOT
+ACP_INITIALIZE_MS 2
+ACP_INITIALIZE {"id": 0, "jsonrpc": "2.0", "result": {"agentCapabilities": {"_meta": {"goose": {"recipeParameterScopes": {}}}, "auth": {}, "loadSession": true, "mcpCapabilities": {"http": true, "sse": false}, "promptCapabilities": {"audio": false, "embeddedContext": true, "image": true}, "sessionCapabilities": {"close": {}, "delete": {}, "list": {}}}, "agentInfo": {"name": "goose", "version": "1.59.0"}, "authMethods": [{"description": "Run `goose configure` to set up your AI provider and API key", "id": "goose-provider", "name": "Configure Provider"}], "protocolVersion": 1}}
+ACP_SESSION_NEW_MS 40
+ACP_SESSION_NEW {"error": {"code": -32603, "data": "Failed to resolve provider and model: Configuration value not found: GOOSE_PROVIDER", "message": "Internal error"}, "id": 1, "jsonrpc": "2.0"}
+ACP_EXIT_AFTER_STDIN_CLOSED 0
+ACP_STDERR_BYTES 0
+FILES_IN_ROOT_AFTER_ACP ./config ./data ./data/sessions ./data/sessions/sessions.db ./data/sessions/sessions.db-shm ./data/sessions/sessions.db-wal ./state ./state/logs ./state/logs/cli 
+--- TLS roots: goose run with https://example.com as an OpenAI-compatible host and a placeholder key (no credential), system CA bundle vs an empty one
+TLS_system exit=1
+  TLS_system: 405 Method Not Allowed at https://example.com/v1/chat/completion
+TLS_empty exit=1
+END 2026-11-12T07:45:58Z
+[2m2026-11-12T07:46:44.996019Z[0m [31mERROR[0m refused: 00aad8daff2fa3c9daa65d53c425d450 sent no receipt of it
