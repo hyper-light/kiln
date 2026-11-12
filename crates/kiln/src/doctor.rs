@@ -629,6 +629,16 @@ pub async fn runners_for(hub: &Hub, caller: &Caller) -> Vec<crate::hub::AgentLiv
     readable(caller, hub.agent_list().await, |a| &a.name)
 }
 
+/// [`runners_for`], as `make` makes it into what a read answers: the store's rows read off the runtime's threads, then the
+/// list made of them and the runners' live records, each runner's record copied, filtered for `caller` and made on the compute
+/// pool, so no shard copies or encodes them (goal 9, plan 01a1a87b2cec step 3: made on the request's shard, a read of `GET
+/// /api/agents` held it 0.64 ms on the CPU, the lab's production layout on Linux). None where the pool's job was lost.
+pub async fn runners_made_for<T: Send + 'static>(hub: &Arc<Hub>, caller: &Caller, make: impl FnOnce(Vec<crate::hub::AgentLive>) -> T + Send + 'static) -> Option<T> {
+    let (rows, labels, machines) = hub.agent_rows().await;
+    let (h, caller) = (Arc::clone(hub), caller.clone());
+    crate::rt::compute(move || make(readable(&caller, h.agent_list_of(rows, &labels, &machines, &h.agents.get()), |a| &a.name))).await.ok()
+}
+
 /// The runners `caller` may read against the newest kiln, and their latest upgrades: the server's
 /// own only for whoever reads runners server-wide.
 pub async fn updates_for(hub: &Arc<Hub>, caller: &Caller) -> Value {
@@ -649,7 +659,15 @@ pub fn list_ops() -> Vec<Op> {
             destructive: false,
             input: Input::of::<input::RunnersList>(),
             route: |_| Ok((Method::GET, path(&["api", "agents"]))),
-            run: |cx, _| Box::pin(async move { serde_json::to_value(runners_for(&cx.hub, &cx.caller).await).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())) }),
+            run: |cx, _| {
+                Box::pin(async move {
+                    let made = match runners_made_for(&cx.hub, &cx.caller, serde_json::to_value).await {
+                        Some(made) => made,
+                        None => serde_json::to_value(runners_for(&cx.hub, &cx.caller).await),
+                    };
+                    made.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+                })
+            },
         },
         Op {
             name: "runners.diagnose",
