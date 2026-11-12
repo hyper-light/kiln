@@ -2918,7 +2918,6 @@ impl Scheduler {
     /// time lost, not used). None while an exclusive leg holds it whole. Its pace is what it last
     /// said ([`Input::RunnerPace`]). The rank is its free cores (W05-R23): memory is a fit, and
     /// makes no leg finish sooner until it runs short, which its stalls say.
-    #[allow(clippy::float_arithmetic)]
     fn word_of(&self, r: &Runner) -> (lb::Amounts, lb::Word) {
         let c = self.config();
         let size = size(r);
@@ -6042,8 +6041,6 @@ fn uncount(r: &mut Runner, id: &str) {
     }
 }
 
-/// [`Scheduler::headroom`] of a runner. In floats, as [`Headroom`] is.
-#[allow(clippy::float_arithmetic)]
 /// A runner's CPUs, in thousandths, as the load balancer counts them: as it offers them or its
 /// facts say ([`size`]), else as its latest sample says, else one for each of its slots.
 fn cpus_of(r: &Runner) -> u64 {
@@ -6056,6 +6053,8 @@ fn cpus_of(r: &Runner) -> u64 {
     }
 }
 
+/// [`Scheduler::headroom`] of a runner. In floats, as [`Headroom`] is.
+#[allow(clippy::float_arithmetic)]
 fn headroom_of(r: &Runner) -> Option<Headroom> {
     let (s, _) = r.sample.as_ref()?;
     let h = Headroom::of(s);
