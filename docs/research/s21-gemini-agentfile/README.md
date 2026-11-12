@@ -55,6 +55,20 @@ subagent finished it on branch p/s21-finish-v1. This file is the finish's record
     its check (a link, a path outside package/, a path twice, names that fold for a file and for a
     directory, harness.json, system settings and node/ where kiln writes, sticky and set-ID bits, a
     contiguous file, a file the strip leaves no name), with no pin.json written. 22 of 22 in all.
+- **kiln's agentfiles tests** on adacachy at 6e814bff8 (kiln main 3a4b09005 merged in), as a systemd
+  user unit at Nice 10 ([finish/tests-adacachy.txt](finish/tests-adacachy.txt)): `cargo test --locked
+  -p kiln --lib agentfiles::`, 95 passed, 0 failed, Gemini's 8 among them (its live test skipped there),
+  with every other row's, the table's own, the fetcher's and the unpacker's.
+- **Live, real Shards and docs** on adacachy, umask 0022 ([finish/live-context-adacachy.txt](finish/live-context-adacachy.txt)):
+  - `step21_a_live_gemini_context_holds_the_pinned_builds` with `KILN_TEST_LIVE_CONTEXT`: the fetcher
+    and the one unpacker made both platforms' directories from npm and nodejs.org in 12 s; 4 of 4
+    members hash to their pins, each tree is 449 files of 99,143,752 bytes, with no link, every
+    directory 0755 and no file group- or other-writable.
+  - `real_shards` with Shards v0.7.0 (sha256 a9c9092a…, as its SHA256SUMS lists it): 2 passed, every
+    built-in Gemini's among them passing Shards' static check, as
+    [finish/shards-check-v0.7.0.txt](finish/shards-check-v0.7.0.txt) shows for Gemini's alone.
+  - `docs_agents_md` (the metrics table this note sits beside): passed.
+- Gemini itself was never run here: smokes are ROOT's.
 
 ## Unverified, and owed
 

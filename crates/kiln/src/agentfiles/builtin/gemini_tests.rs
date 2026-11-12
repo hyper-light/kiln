@@ -296,7 +296,7 @@ fn launched(kind: &Kind) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let p = kind.launch(&spec, "session")?;
     let args = p.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
     let own = |k: &OsStr| k == OsStr::new("PATH") || k.to_string_lossy().starts_with("KILN_");
-    let env = p.get_envs().filter(|(k, _)| !own(*k)).filter_map(|(k, v)| Some(format!("{}={}", k.to_string_lossy(), v?.to_string_lossy()))).collect();
+    let env = p.get_envs().filter(|(k, _)| !own(k)).filter_map(|(k, v)| Some(format!("{}={}", k.to_string_lossy(), v?.to_string_lossy()))).collect();
     Ok((args, env))
 }
 
