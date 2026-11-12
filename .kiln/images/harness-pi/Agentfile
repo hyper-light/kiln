@@ -1,0 +1,38 @@
+# pi (earendil-works/pi) as a harness in a Shards microVM: the Agentfile kiln ships for it (plan
+# 01a1cd8e862e7169a074db3d5fa33f3d, step 28; plan 01a1ce705e62732b83f16295d74ee263, research
+# 01a1ce705e62732b86d3534d788ae242, f1-f30). kiln drives pi in its RPC mode (Kind `pi`,
+# crates/kiln/src/harness/pi.rs; f13, f14). Its build context is what `kiln agentfiles context pi DIR`
+# writes: this file, and for each platform pi-<arch>/ with harness.json, pi's release tarball unpacked
+# whole at its root less its pi/ (pi reads its package files beside its executable, f11), and bin/rg
+# and bin/fd, each file checked against pin.json. It holds no credential: a person's sign-in stays on
+# their own volume (below).
+
+# pi's Linux builds are Bun executables for glibc: they need glibc's loader and link only libc,
+# libpthread, libdl and libm, at GLIBC_2.17 at most (f9). Any base of glibc 2.17 or later runs them
+# with no RUN; this default, the digest pin.sh read (pin.json's base), is Debian trixie with glibc
+# 2.41. pi publishes no musl build, so there is no libc variant, and a musl base (Alpine) can't start
+# pi (f10).
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+FROM ${BASE}
+
+# pi's own build for the platform being built (TARGETARCH, f21). Its bin/ holds the ripgrep and fd
+# builds pi's grep and find tools would otherwise download, unpinned, at first use: shards-init puts
+# it on pi's PATH, where pi finds them, so pi downloads nothing (f16, f17, f18).
+ARG TARGETARCH
+HARNESS pi FROM ./pi-${TARGETARCH}
+
+# Its providers over HTTPS, as the bring-up proved them (f20): a network for pi alone, names resolved
+# by the microVM (--dns), and TCP 443 out at the network's boundary and the microVM's, where pi's
+# hosted providers, pi.dev and GitHub answer. Nothing in, and no other port or protocol out: an
+# endpoint on another port (a local Ollama, say) waits for step 9's grants by name, which replace
+# these three lines.
+NETWORK --dns --egress=443/tcp provider FOR pi
+EXPOSE --harnesses=pi 443/tcp AS egress FOR provider
+CONNECT pi WITH pi ON provider
+
+# Two volumes of pi's alone (f22): the project, and the person's pi config directory,
+# PI_CODING_AGENT_DIR in harness.json, which holds everything pi keeps for them (its sign-in in
+# auth.json, its settings, models and sessions; f15). No credential is in the image, in a file, an
+# ENV or an ARG (f27).
+VOLUME --target-kind=harness /workspace FOR pi
+VOLUME --target-kind=harness /home/pi/.pi/agent FOR pi
