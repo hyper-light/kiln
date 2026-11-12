@@ -17,6 +17,7 @@ fn fail(e: Error) -> Fail {
         Error::Conflict(m) => (StatusCode::CONFLICT, m),
         Error::Refused(m) => (StatusCode::UNPROCESSABLE_ENTITY, format!("Shards refuses this Agentfile: {m}")),
         Error::Forbidden(m) => (StatusCode::FORBIDDEN, m),
+        Error::Store(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
         Error::Other(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
@@ -43,18 +44,23 @@ fn who(cx: &Cx) -> Result<Who, Fail> {
     Who::of(&cx.caller).map_err(fail)
 }
 
+/// Where the texts are: the server's store of bytes.
+fn blobs(cx: &Cx) -> &dyn kiln_seams::blobs::Blobs {
+    cx.hub.blobs.blobs.as_ref()
+}
+
 async fn list(cx: Cx, v: Value) -> Out {
     let repo = some_text(&v, "repo");
     json_of(&super::listing(&cx.hub, &cx.caller, flag(&v, "all"), repo.as_deref()).await.map_err(fail)?)
 }
 
 async fn get(cx: Cx, v: Value) -> Out {
-    json_of(&super::get(&cx.hub, &who(&cx)?, &id_of(&v)?).await.map_err(fail)?)
+    json_of(&super::get(&cx.hub, blobs(&cx), &who(&cx)?, &id_of(&v)?).await.map_err(fail)?)
 }
 
 async fn create(cx: Cx, v: Value) -> Out {
     let (name, text) = (crate::ops::text(&v, "name")?, v.get("text").and_then(Value::as_str).unwrap_or_default().to_owned());
-    let saved = super::create(&cx.hub, &who(&cx)?, &name, &text, &cx.caller.name).await.map_err(fail)?;
+    let saved = super::create(&cx.hub, blobs(&cx), &who(&cx)?, &name, &text, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentfile.create".into(), format!("{} ({}) v{}", saved.agentfile.name, saved.agentfile.id, saved.agentfile.version)).await;
     json_of(&saved)
 }
@@ -62,13 +68,13 @@ async fn create(cx: Cx, v: Value) -> Out {
 async fn update(cx: Cx, v: Value) -> Out {
     let id = id_of(&v)?;
     let patch = Patch { name: some_text(&v, "name"), text: some_text(&v, "text") };
-    let saved = super::update(&cx.hub, &who(&cx)?, &id, patch, &cx.caller.name).await.map_err(fail)?;
+    let saved = super::update(&cx.hub, blobs(&cx), &who(&cx)?, &id, patch, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentfile.update".into(), format!("{} ({}) v{}", saved.agentfile.name, saved.agentfile.id, saved.agentfile.version)).await;
     json_of(&saved)
 }
 
 async fn versions(cx: Cx, v: Value) -> Out {
-    json_of(&json!({"versions": super::versions(&cx.hub, &who(&cx)?, &id_of(&v)?).await.map_err(fail)?}))
+    json_of(&json!({"versions": super::versions(&cx.hub, blobs(&cx), &who(&cx)?, &id_of(&v)?).await.map_err(fail)?}))
 }
 
 async fn restore(cx: Cx, v: Value) -> Out {
@@ -77,13 +83,13 @@ async fn restore(cx: Cx, v: Value) -> Out {
         .get("version")
         .and_then(|n| n.as_i64().or_else(|| n.as_str().and_then(|s| s.trim().parse().ok())))
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "`version` is the version to make current again".to_owned()))?;
-    let saved = super::restore(&cx.hub, &who(&cx)?, &id, version, &cx.caller.name).await.map_err(fail)?;
+    let saved = super::restore(&cx.hub, blobs(&cx), &who(&cx)?, &id, version, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentfile.restore".into(), format!("{} ({}) v{version} as v{}", saved.agentfile.name, saved.agentfile.id, saved.agentfile.version)).await;
     json_of(&saved)
 }
 
 async fn delete(cx: Cx, v: Value) -> Out {
-    let gone = super::delete(&cx.hub, &who(&cx)?, &id_of(&v)?).await.map_err(fail)?;
+    let gone = super::delete(&cx.hub, blobs(&cx), &who(&cx)?, &id_of(&v)?).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentfile.delete".into(), format!("{} ({}) of {}", gone.name, gone.id, gone.owner)).await;
     Ok(json!({"deleted": true}))
 }

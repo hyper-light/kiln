@@ -160,8 +160,14 @@ target no stage can be named, so that its planning stops before it resolves any 
 its instructions and directives read, its names and grants checked (`CONNECT`, `ATTACH`, `FOR`,
 `EXPOSE … FOR`), its stages linted. No base image is pulled and no registry is asked. A text Shards
 refuses isn't kept: 422, `Shards refuses this Agentfile: <Shards' words>`. Where the server has no
-`shards`, or it answers no check, the text is kept and `check` says why (`checked: false`). Its types
-are generated from the server's (`ui/src/api/wire`):
+`shards`, or it answers no check, the text is kept and `check` says why (`checked: false`).
+
+A text is kept in kiln's store of bytes (docs/blobs.md) at `agentfiles/sha256/<its SHA-256>`, once for
+every Agentfile and version that has it, whoever's; kiln.db keeps the records, each naming its text
+by that digest. The text is kept first and the record after it, so a store that can't keep a text
+leaves nothing that names it: 503, in the store's words, as when it can't give one back or gives back
+bytes that aren't the text its digest names. Deleting an Agentfile lets go of its texts that no other
+Agentfile or version names. Its types are generated from the server's (`ui/src/api/wire`):
 
 ```ts
 interface Agentfile { id; owner /* "owner" | "user:<id>" */; name; text; version; created_at; updated_at }

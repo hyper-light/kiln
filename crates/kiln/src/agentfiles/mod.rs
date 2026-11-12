@@ -8,11 +8,19 @@
 //! project's `.kiln/images/<name>/Agentfile` at its default branch. The same operations serve the
 //! console (`/api/agentfiles`), agents (kiln's MCP server: `agentfiles_*`) and code mode
 //! (`kiln.agentfiles.*`): [`ops`].
+//!
+//! kiln.db keeps the records; a text is bytes, kept in kiln's store of bytes (`crate::blobs`,
+//! docs/blobs.md) under its content's SHA-256 ([`key`]), once for every Agentfile and version that has
+//! it, whoever's. A record names its text by that digest, and is written only once the text is kept; a
+//! text is read back whole and held to its digest. A text no record names any more is let go.
 
 pub mod builtin;
 pub mod check;
 pub mod ops;
 
+use std::collections::HashMap;
+
+use kiln_seams::blobs::{Blobs, Cond, Put, Refusal};
 use rusqlite::{OptionalExtension as _, params};
 use serde::Serialize;
 
@@ -138,6 +146,10 @@ pub enum Error {
     /// No repository the caller may read is named so.
     #[error("no repository {0}")]
     NoRepo(String),
+    /// kiln's store of bytes couldn't keep a text, or give one back as its digest says: nothing was
+    /// kept that names it.
+    #[error("{0}")]
+    Store(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -193,13 +205,35 @@ pub fn text_problem(text: &str) -> Option<String> {
     (text.len() > MOST).then(|| format!("an Agentfile is {} MiB at the most", MOST >> 20))
 }
 
-const COLUMNS: &str = "id, owner, name, text, version, created_at, updated_at";
-
-fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Agentfile> {
-    Ok(Agentfile { id: r.get(0)?, owner: r.get(1)?, name: r.get(2)?, text: r.get(3)?, version: r.get(4)?, created_at: r.get(5)?, updated_at: r.get(6)? })
+/// What kiln.db keeps of an Agentfile: its text named by its SHA-256 ([`key`]).
+#[derive(Debug, Clone)]
+struct Record {
+    id: String,
+    owner: String,
+    name: String,
+    digest: String,
+    version: i64,
+    created_at: i64,
+    updated_at: i64,
 }
 
-fn get_in(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Agentfile>> {
+impl Record {
+    fn with(self, text: String) -> Agentfile {
+        Agentfile { id: self.id, owner: self.owner, name: self.name, text, version: self.version, created_at: self.created_at, updated_at: self.updated_at }
+    }
+
+    fn brief(self) -> Brief {
+        Brief { id: self.id, owner: self.owner, name: self.name, version: self.version, created_at: self.created_at, updated_at: self.updated_at }
+    }
+}
+
+const COLUMNS: &str = "id, owner, name, digest, version, created_at, updated_at";
+
+fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
+    Ok(Record { id: r.get(0)?, owner: r.get(1)?, name: r.get(2)?, digest: r.get(3)?, version: r.get(4)?, created_at: r.get(5)?, updated_at: r.get(6)? })
+}
+
+fn get_in(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Record>> {
     c.query_row(&format!("SELECT {COLUMNS} FROM agentfiles WHERE id = ?1"), params![id], row).optional()
 }
 
@@ -214,8 +248,74 @@ fn taken(name: &str) -> Error {
 
 /// Tells the events sockets an Agentfile changed or went: its owner's, and those of whoever reaches
 /// everyone's (`api`'s `AgentsSeen`).
-fn told(hub: &Hub, a: &Agentfile, deleted: bool) {
+fn told(hub: &Hub, a: &Record, deleted: bool) {
     hub.emit(&ServerEvent::Agentfile(AgentfileChange { owner: a.owner.clone(), id: a.id.clone(), name: a.name.clone(), version: a.version, deleted }));
+}
+
+/// Where an Agentfile's text is kept in kiln's store of bytes: under its content's SHA-256, once for
+/// every Agentfile and version that has it, whoever's (docs/blobs.md, "The keys kiln keeps").
+pub fn key(digest: &str) -> String {
+    format!("agentfiles/sha256/{digest}")
+}
+
+/// Texts are kept (the bytes, then the record that names them) and let go (no record names them, then
+/// the bytes) one at a time, so a text a write finds kept already isn't let go before the write's record
+/// names it. This server is the one that writes them (docs/architecture.md: the store's group of one
+/// voter).
+static TEXTS: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
+
+/// `text` kept in `blobs`, once: put only where nothing is (`If-None-Match`), the store holding the bytes
+/// to their SHA-256 before it keeps them; one kept already is taken by its etag. Its digest.
+async fn keep(blobs: &dyn Blobs, text: &str) -> R<String> {
+    let digest = crate::util::sha256_hex(text.as_bytes());
+    let k = key(&digest);
+    let etag = match blobs.put(&k, text.as_bytes().to_vec(), Put { cond: Cond::IfNoneMatch, sha256: Some(digest.clone()) }).await {
+        Ok(m) => m.etag,
+        Err(Refusal::PreconditionFailed(_)) => blobs.head(&k).await.map_err(|e| unkept(&e))?.etag,
+        Err(e) => return Err(unkept(&e)),
+    };
+    if etag != digest {
+        return Err(Error::Store(format!("kiln's store of bytes holds other bytes at {k}: sha256 {etag}")));
+    }
+    Ok(digest)
+}
+
+fn unkept(e: &Refusal) -> Error {
+    Error::Store(format!("kiln's store of bytes couldn't keep the Agentfile's text: {e}"))
+}
+
+/// The text kept under `digest`, read whole and held to it: the etag the store says, and the bytes it
+/// gives.
+async fn read(blobs: &dyn Blobs, digest: &str) -> R<String> {
+    let k = key(digest);
+    let (meta, bytes) = blobs.get(&k, None).await.map_err(|e| Error::Store(format!("kiln's store of bytes couldn't give back the Agentfile's text: {e}")))?;
+    let got = crate::util::sha256_hex(&bytes);
+    if meta.etag != digest || got != digest {
+        return Err(Error::Store(format!("kiln's store of bytes gave back other bytes than {k}: sha256 {got}")));
+    }
+    String::from_utf8(bytes).map_err(|_| Error::Store(format!("kiln's store of bytes gave back {k} as bytes that aren't text")))
+}
+
+/// Whether a record names text `digest`: an Agentfile, or a version of one.
+fn named(c: &rusqlite::Connection, digest: &str) -> rusqlite::Result<bool> {
+    c.query_row("SELECT EXISTS(SELECT 1 FROM agentfile_versions WHERE digest = ?1) OR EXISTS(SELECT 1 FROM agentfiles WHERE digest = ?1)", params![digest], |r| r.get(0))
+}
+
+/// Of `digests`, the texts no record names any more, let go, with [`TEXTS`] held. One the store
+/// couldn't delete, or whose records couldn't be read, stays where it is, warned of: named by no
+/// record, it's reached by none.
+async fn let_go(hub: &Hub, blobs: &dyn Blobs, digests: Vec<String>) {
+    for d in digests {
+        let asked = d.clone();
+        match hub.store.call(move |c| Ok(named(c, &asked)?)).await {
+            Ok(true) => {}
+            Ok(false) => match blobs.delete(&key(&d)).await {
+                Ok(()) => crate::metrics::blobs().collected.inc(&["agentfiles"]),
+                Err(e) => tracing::warn!(target: "kiln.blobs", event = "collect", key = %key(&d), error = %e, "an Agentfile's text no record names couldn't be deleted"),
+            },
+            Err(e) => tracing::warn!(target: "kiln.blobs", event = "collect", key = %key(&d), error = %format!("{e:#}"), "whether an Agentfile's text is still named couldn't be read: it stays"),
+        }
+    }
 }
 
 /// The caller's own, or with `everyone` everyone's, newest change first.
@@ -236,25 +336,46 @@ pub async fn list(hub: &Hub, who: &Who, everyone: bool) -> R<Vec<Brief>> {
         .await?)
 }
 
-/// One the caller reaches; another's is as none.
-pub async fn get(hub: &Hub, who: &Who, id: &str) -> R<Agentfile> {
+/// The record of one the caller reaches; another's is as none.
+async fn record(hub: &Hub, who: &Who, id: &str) -> R<Record> {
     let id = id.to_owned();
-    let a = hub.store.read(move |c| Ok(get_in(c, &id)?)).await?;
-    a.filter(|a| who.reaches(&a.owner)).ok_or(Error::Missing)
+    let r = hub.store.read(move |c| Ok(get_in(c, &id)?)).await?;
+    r.filter(|r| who.reaches(&r.owner)).ok_or(Error::Missing)
 }
 
-/// Its versions, newest first.
-pub async fn versions(hub: &Hub, who: &Who, id: &str) -> R<Vec<Version>> {
-    get(hub, who, id).await?;
+/// One the caller reaches, its text read back from `blobs`; another's is as none.
+pub async fn get(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str) -> R<Agentfile> {
+    let r = record(hub, who, id).await?;
+    let text = read(blobs, &r.digest).await?;
+    Ok(r.with(text))
+}
+
+/// Its versions, newest first, each text read back once however many versions have it.
+pub async fn versions(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str) -> R<Vec<Version>> {
+    record(hub, who, id).await?;
     let id = id.to_owned();
-    Ok(hub
+    let rows: Vec<(i64, String, i64, String)> = hub
         .store
         .read(move |c| {
-            let mut st = c.prepare("SELECT version, text, at, by FROM agentfile_versions WHERE agentfile_id = ?1 ORDER BY version DESC")?;
-            let rows = st.query_map(params![id], |r| Ok(Version { version: r.get(0)?, text: r.get(1)?, at: r.get(2)?, by: r.get(3)? }))?.collect::<Result<Vec<_>, _>>()?;
+            let mut st = c.prepare("SELECT version, digest, at, by FROM agentfile_versions WHERE agentfile_id = ?1 ORDER BY version DESC")?;
+            let rows = st.query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
-        .await?)
+        .await?;
+    let mut texts: HashMap<String, String> = HashMap::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for (version, digest, at, by) in rows {
+        let text = match texts.get(&digest) {
+            Some(t) => t.clone(),
+            None => {
+                let t = read(blobs, &digest).await?;
+                texts.insert(digest, t.clone());
+                t
+            }
+        };
+        out.push(Version { version, text, at, by });
+    }
+    Ok(out)
 }
 
 /// `text` as Shards checks it: refused, in Shards' words, when Shards says it's no Agentfile.
@@ -269,15 +390,22 @@ async fn checked(hub: &Hub, text: &str) -> R<Check> {
     }
 }
 
-/// A new Agentfile of the caller's, once Shards passes its text: version 1.
-pub async fn create(hub: &Hub, who: &Who, name: &str, text: &str, by: &str) -> R<Saved> {
+/// A new Agentfile of the caller's, once Shards passes its text: version 1, its text kept in `blobs`
+/// before its record is written.
+pub async fn create(hub: &Hub, blobs: &dyn Blobs, who: &Who, name: &str, text: &str, by: &str) -> R<Saved> {
     let name = name.trim().to_owned();
     if let Some(p) = name_problem(&name) {
         return Err(Error::Bad(p));
     }
     let check = checked(hub, text).await?;
-    let (id, now, owner, text, by) = (crate::util::new_id(), crate::util::now_unix(), who.person.clone(), text.to_owned(), by.to_owned());
-    let n = name.clone();
+    let (id, owner) = (crate::util::new_id(), who.person.clone());
+    let (o, n, i) = (owner.clone(), name.clone(), id.clone());
+    if hub.store.read(move |c| Ok(named_in(c, &o, &n, &i)?)).await? {
+        return Err(taken(&name));
+    }
+    let held = TEXTS.lock().await;
+    let digest = keep(blobs, text).await?;
+    let (now, by, n, d) = (crate::util::now_unix(), by.to_owned(), name.clone(), digest.clone());
     let made = hub
         .store
         .call(move |c| {
@@ -285,16 +413,24 @@ pub async fn create(hub: &Hub, who: &Who, name: &str, text: &str, by: &str) -> R
             if named_in(&tx, &owner, &n, &id)? {
                 return Ok(None);
             }
-            tx.execute("INSERT INTO agentfiles (id, owner, name, text, version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)", params![id, owner, n, text, now])?;
-            tx.execute("INSERT INTO agentfile_versions (agentfile_id, version, text, at, by) VALUES (?1, 1, ?2, ?3, ?4)", params![id, text, now, by])?;
+            tx.execute("INSERT INTO agentfiles (id, owner, name, digest, version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)", params![id, owner, n, d, now])?;
+            tx.execute("INSERT INTO agentfile_versions (agentfile_id, version, digest, at, by) VALUES (?1, 1, ?2, ?3, ?4)", params![id, d, now, by])?;
             let a = get_in(&tx, &id)?;
             tx.commit()?;
             Ok(a)
         })
-        .await?;
-    let agentfile = made.ok_or_else(|| taken(&name))?;
-    told(hub, &agentfile, false);
-    Ok(Saved { agentfile, check })
+        .await;
+    let made = match made {
+        Ok(Some(r)) => r,
+        unwritten => {
+            // Kept for a record that wasn't written: let go, unless another names it.
+            let_go(hub, blobs, vec![digest]).await;
+            return Err(unwritten.map_or_else(Error::from, |_| taken(&name)));
+        }
+    };
+    drop(held);
+    told(hub, &made, false);
+    Ok(Saved { agentfile: made.with(text.to_owned()), check })
 }
 
 /// A change: what's given changes. A new text is a new version, once Shards passes it; a new name
@@ -305,55 +441,71 @@ pub struct Patch {
     pub text: Option<String>,
 }
 
-/// Agentfile `id` changed as `patch` says, by `by`.
-pub async fn update(hub: &Hub, who: &Who, id: &str, patch: Patch, by: &str) -> R<Saved> {
-    let old = get(hub, who, id).await?;
+/// Agentfile `id` changed as `patch` says, by `by`: a new text kept in `blobs` before the record that
+/// names it.
+pub async fn update(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str, patch: Patch, by: &str) -> R<Saved> {
+    let old = record(hub, who, id).await?;
     let name = patch.name.map_or_else(|| old.name.clone(), |n| n.trim().to_owned());
     if let Some(p) = name_problem(&name) {
         return Err(Error::Bad(p));
     }
-    let text = patch.text.unwrap_or_else(|| old.text.clone());
-    let check = if text == old.text { check::check(hub, &text).await } else { checked(hub, &text).await? };
-    if name == old.name && text == old.text {
-        return Ok(Saved { agentfile: old, check });
+    let (text, new_version) = match patch.text {
+        Some(t) => {
+            let new = crate::util::sha256_hex(t.as_bytes()) != old.digest;
+            (t, new)
+        }
+        None => (read(blobs, &old.digest).await?, false),
+    };
+    let check = if new_version { checked(hub, &text).await? } else { check::check(hub, &text).await };
+    if name == old.name && !new_version {
+        return Ok(Saved { agentfile: old.with(text), check });
     }
-    let new_version = text != old.text;
-    let (id, now, by, n) = (id.to_owned(), crate::util::now_unix(), by.to_owned(), name.clone());
+    let held = TEXTS.lock().await;
+    let digest = if new_version { keep(blobs, &text).await? } else { old.digest.clone() };
+    let (id, now, by, n, d, was) = (id.to_owned(), crate::util::now_unix(), by.to_owned(), name.clone(), digest.clone(), old.version);
     let written = hub
         .store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
             let Some(now_is) = get_in(&tx, &id)? else { return Ok(Written::Missing) };
             // What it was when this change began: another since is its own change, not overwritten.
-            if now_is.version != old.version {
+            if now_is.version != was {
                 return Ok(Written::Moved);
             }
             if named_in(&tx, &now_is.owner, &n, &id)? {
                 return Ok(Written::Taken);
             }
-            let version = if new_version { old.version.saturating_add(1) } else { old.version };
-            tx.execute("UPDATE agentfiles SET name = ?2, text = ?3, version = ?4, updated_at = ?5 WHERE id = ?1", params![id, n, text, version, now])?;
+            let version = if new_version { was.saturating_add(1) } else { was };
+            tx.execute("UPDATE agentfiles SET name = ?2, digest = ?3, version = ?4, updated_at = ?5 WHERE id = ?1", params![id, n, d, version, now])?;
             if new_version {
-                tx.execute("INSERT INTO agentfile_versions (agentfile_id, version, text, at, by) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, version, text, now, by])?;
+                tx.execute("INSERT INTO agentfile_versions (agentfile_id, version, digest, at, by) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, version, d, now, by])?;
             }
             let a = get_in(&tx, &id)?;
             tx.commit()?;
             Ok(a.map_or(Written::Missing, Written::Done))
         })
-        .await?;
-    let agentfile = match written {
-        Written::Done(a) => a,
-        Written::Missing => return Err(Error::Missing),
-        Written::Taken => return Err(taken(&name)),
-        Written::Moved => return Err(Error::Conflict("it changed since you read it: read it again, then change it".into())),
+        .await;
+    let refused = match written {
+        Ok(Written::Done(a)) => {
+            drop(held);
+            told(hub, &a, false);
+            return Ok(Saved { agentfile: a.with(text), check });
+        }
+        Ok(Written::Missing) => Error::Missing,
+        Ok(Written::Taken) => taken(&name),
+        Ok(Written::Moved) => Error::Conflict("it changed since you read it: read it again, then change it".into()),
+        Err(e) => Error::from(e),
     };
-    told(hub, &agentfile, false);
-    Ok(Saved { agentfile, check })
+    if new_version {
+        // Kept for a version that wasn't written: let go, unless another names it.
+        let_go(hub, blobs, vec![digest]).await;
+    }
+    Err(refused)
 }
 
 /// What a change's write found.
 enum Written {
-    Done(Agentfile),
+    Done(Record),
     Missing,
     Taken,
     /// Another change came first.
@@ -361,36 +513,44 @@ enum Written {
 }
 
 /// Version `version`'s text made current again, as a new version, so nothing is lost.
-pub async fn restore(hub: &Hub, who: &Who, id: &str, version: i64, by: &str) -> R<Saved> {
-    let old = versions(hub, who, id).await?.into_iter().find(|v| v.version == version).ok_or_else(|| Error::Bad(format!("the Agentfile has no version {version}")))?;
-    let a = get(hub, who, id).await?;
-    if a.text == old.text {
+pub async fn restore(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str, version: i64, by: &str) -> R<Saved> {
+    let a = record(hub, who, id).await?;
+    let i = id.to_owned();
+    let digest: Option<String> = hub.store.read(move |c| Ok(c.query_row("SELECT digest FROM agentfile_versions WHERE agentfile_id = ?1 AND version = ?2", params![i, version], |r| r.get(0)).optional()?)).await?;
+    let digest = digest.ok_or_else(|| Error::Bad(format!("the Agentfile has no version {version}")))?;
+    let text = read(blobs, &digest).await?;
+    if digest == a.digest {
         // As it is already: nothing to make again.
-        let check = check::check(hub, &a.text).await;
-        return Ok(Saved { agentfile: a, check });
+        let check = check::check(hub, &text).await;
+        return Ok(Saved { agentfile: a.with(text), check });
     }
-    update(hub, who, id, Patch { name: None, text: Some(old.text) }, by).await
+    update(hub, blobs, who, id, Patch { name: None, text: Some(text) }, by).await
 }
 
-/// Agentfile `id` and its versions, gone: what it was.
-pub async fn delete(hub: &Hub, who: &Who, id: &str) -> R<Agentfile> {
-    let a = get(hub, who, id).await?;
+/// Agentfile `id` and its versions, gone: what it was. Their texts no other record names are let go
+/// from `blobs`.
+pub async fn delete(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str) -> R<Brief> {
+    let a = record(hub, who, id).await?;
     let i = id.to_owned();
-    let gone = hub
+    let gone: Option<Vec<String>> = hub
         .store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
+            let mut st = tx.prepare("SELECT digest FROM agentfile_versions WHERE agentfile_id = ?1 UNION SELECT digest FROM agentfiles WHERE id = ?1")?;
+            let digests = st.query_map(params![i], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            drop(st);
             let n = tx.execute("DELETE FROM agentfiles WHERE id = ?1", params![i])?;
             tx.execute("DELETE FROM agentfile_versions WHERE agentfile_id = ?1", params![i])?;
             tx.commit()?;
-            Ok(n > 0)
+            Ok((n > 0).then_some(digests))
         })
         .await?;
-    if !gone {
-        return Err(Error::Missing);
-    }
+    let Some(digests) = gone else { return Err(Error::Missing) };
+    let held = TEXTS.lock().await;
+    let_go(hub, blobs, digests).await;
+    drop(held);
     told(hub, &a, true);
-    Ok(a)
+    Ok(a.brief())
 }
 
 /// The Agentfiles a list shows, for `caller`: the kept ones it reaches ([`list`]), kiln's own, and with

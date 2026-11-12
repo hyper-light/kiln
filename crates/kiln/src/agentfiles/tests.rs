@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use http::StatusCode;
 use serde_json::{Value, json};
 
+use kiln_seams::blobs::{Blobs as _, Put, Refusal, SimBlobs, SimLimits};
+
 use super::*;
 use crate::authz::gate::{Kind, Rights};
 use crate::authz::{Caller, Grant};
@@ -40,25 +42,44 @@ fn text_of(v: &Value, pointer: &str) -> String {
 const CLAUDE: &str = "FROM ubuntu:24.04\nAGENT main FROM ./agent\nCMD [\"claude\"]\n";
 const CLAUDE_2: &str = "FROM ubuntu:24.04\nAGENT main FROM ./agent\nAGENT helper FROM ./helper\nCMD [\"claude\"]\n";
 
+/// Where `text` is kept.
+fn key_of(text: &str) -> String {
+    key(&crate::util::sha256_hex(text.as_bytes()))
+}
+
+/// A person, as the module's own functions take one.
+fn who(person: &str) -> Who {
+    Who { person: person.into(), all: false }
+}
+
+/// Records only: an Agentfile and each version name their text by its digest, and hold none.
 #[test]
 fn step30_the_migration_makes_its_tables() -> anyhow::Result<()> {
     crate::rt::block_on(async {
         let store = crate::store::Store::in_memory()?;
-        let (tables, unique): (Vec<String>, i64) = store
+        let (tables, unique, columns): (Vec<String>, i64, Vec<Vec<String>>) = store
             .read(|c| {
                 let t = c.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'agentfile%' ORDER BY name")?.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
                 let u = c.query_row("SELECT COUNT(*) FROM pragma_index_list('agentfiles') WHERE \"unique\" = 1 AND origin = 'u'", [], |r| r.get(0))?;
-                Ok((t, u))
+                let mut cols = Vec::new();
+                for table in ["agentfiles", "agentfile_versions"] {
+                    cols.push(c.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?.query_map([table], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?);
+                }
+                Ok((t, u, cols))
             })
             .await?;
         anyhow::ensure!(tables == ["agentfile_versions", "agentfiles"], "{tables:?}");
         anyhow::ensure!(unique == 1, "a name once per owner");
+        anyhow::ensure!(
+            columns == [vec!["id", "owner", "name", "version", "digest", "created_at", "updated_at"], vec!["agentfile_id", "version", "digest", "at", "by"]],
+            "{columns:?}"
+        );
         // A second Agentfile of one name and owner is refused by the table itself.
         let dup = store
             .call(|c| {
-                c.execute("INSERT INTO agentfiles (id, owner, name, text, created_at, updated_at) VALUES ('a', 'user:u1', 'x', 't', 0, 0)", [])?;
-                c.execute("INSERT INTO agentfiles (id, owner, name, text, created_at, updated_at) VALUES ('b', 'user:u2', 'x', 't', 0, 0)", [])?;
-                Ok(c.execute("INSERT INTO agentfiles (id, owner, name, text, created_at, updated_at) VALUES ('c', 'user:u1', 'x', 't', 0, 0)", []).is_err())
+                c.execute("INSERT INTO agentfiles (id, owner, name, digest, created_at, updated_at) VALUES ('a', 'user:u1', 'x', 'd', 0, 0)", [])?;
+                c.execute("INSERT INTO agentfiles (id, owner, name, digest, created_at, updated_at) VALUES ('b', 'user:u2', 'x', 'd', 0, 0)", [])?;
+                Ok(c.execute("INSERT INTO agentfiles (id, owner, name, digest, created_at, updated_at) VALUES ('c', 'user:u1', 'x', 'd', 0, 0)", []).is_err())
             })
             .await?;
         anyhow::ensure!(dup, "the same owner and name went in twice");
@@ -261,4 +282,105 @@ fn step30_ls_tree_entries() {
     assert_eq!(tree_entry("100644 blob 3b18e512dba79e4c8300dd08aeb37f8e728b8dad      12\t.kiln/images/claude/Agentfile"), Some(("3b18e512dba79e4c8300dd08aeb37f8e728b8dad", Some(12), ".kiln/images/claude/Agentfile")));
     assert_eq!(tree_entry("160000 commit 3b18e512dba79e4c8300dd08aeb37f8e728b8dad       -\t.kiln/images/sub"), None);
     assert_eq!(tree_entry(""), None);
+}
+
+/// A text is bytes, kept in kiln's store of bytes under its content's SHA-256: once, however many
+/// Agentfiles and versions have it, whoever's. kiln.db names it by its digest, and each read gives it
+/// back whole. A name taken keeps nothing.
+#[test]
+fn step30_texts_are_kept_once_in_the_store_of_bytes() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let sim = SimBlobs::new(crate::rt::clock(), SimLimits::default());
+        let (ada, bo) = (who("user:u-ada"), who("user:u-bo"));
+        let mine = create(&hub, &sim, &ada, "claude", CLAUDE, "user:u-ada").await?;
+        create(&hub, &sim, &bo, "claude", CLAUDE, "user:u-bo").await?;
+        let id = mine.agentfile.id.clone();
+        update(&hub, &sim, &ada, &id, Patch { name: None, text: Some(CLAUDE_2.into()) }, "user:u-ada").await?;
+        let back = restore(&hub, &sim, &ada, &id, 1, "user:u-ada").await?;
+        anyhow::ensure!(back.agentfile.version == 3 && back.agentfile.text == CLAUDE, "{back:?}");
+        let taken = create(&hub, &sim, &ada, "claude", "FROM scratch\n", "user:u-ada").await;
+        anyhow::ensure!(matches!(&taken, Err(Error::Conflict(_))), "{taken:?}");
+        // Two texts, each once, at its content's name.
+        let mut keys: Vec<String> = sim.list("agentfiles/", None, 100).await?.objects.into_iter().map(|o| o.key).collect();
+        keys.sort();
+        let mut want = vec![key_of(CLAUDE), key_of(CLAUDE_2)];
+        want.sort();
+        anyhow::ensure!(keys == want, "{keys:?}");
+        // kiln.db names them: Ada's three versions and Bo's one.
+        let digests: Vec<String> = hub.store.read(|c| Ok(c.prepare("SELECT digest FROM agentfile_versions")?.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?)).await?;
+        anyhow::ensure!(digests.len() == 4 && digests.iter().all(|d| want.contains(&key(d))), "{digests:?}");
+        // Read back whole: the Agentfile and each of its versions.
+        let got = get(&hub, &sim, &ada, &id).await?;
+        anyhow::ensure!(got.text == CLAUDE && got.version == 3, "{got:?}");
+        let vs: Vec<(i64, String)> = versions(&hub, &sim, &ada, &id).await?.into_iter().map(|v| (v.version, v.text)).collect();
+        anyhow::ensure!(vs == [(3, CLAUDE.to_owned()), (2, CLAUDE_2.to_owned()), (1, CLAUDE.to_owned())], "{vs:?}");
+        Ok(())
+    })
+}
+
+/// A text read back is held to its digest: bytes the store gives other than the name says, or none, are
+/// the store's failure, never shown as the Agentfile's text.
+#[test]
+fn step30_a_text_read_back_is_held_to_its_digest() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let sim = SimBlobs::new(crate::rt::clock(), SimLimits::default());
+        let ada = who("user:u-ada");
+        let id = create(&hub, &sim, &ada, "claude", CLAUDE, "user:u-ada").await?.agentfile.id;
+        sim.put(&key_of(CLAUDE), CLAUDE_2.as_bytes().to_vec(), Put::default()).await?;
+        let r = get(&hub, &sim, &ada, &id).await;
+        anyhow::ensure!(matches!(&r, Err(Error::Store(m)) if m.contains("other bytes")), "{r:?}");
+        let r = versions(&hub, &sim, &ada, &id).await;
+        anyhow::ensure!(matches!(&r, Err(Error::Store(_))), "{r:?}");
+        sim.delete(&key_of(CLAUDE)).await?;
+        let r = get(&hub, &sim, &ada, &id).await;
+        anyhow::ensure!(matches!(&r, Err(Error::Store(m)) if m.contains("couldn't give back")), "{r:?}");
+        Ok(())
+    })
+}
+
+/// The bytes first, then the record: a store that can't keep a text leaves no record naming it, the
+/// caller told why, and an Agentfile it can't keep a new text for stays as it was. A text kept already
+/// needs no room.
+#[test]
+fn step30_a_text_the_store_cant_keep_writes_no_record() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let sim = SimBlobs::new(crate::rt::clock(), SimLimits { objects: 1, ..SimLimits::default() });
+        let ada = who("user:u-ada");
+        let id = create(&hub, &sim, &ada, "claude", CLAUDE, "user:u-ada").await?.agentfile.id;
+        let r = create(&hub, &sim, &ada, "codex", CLAUDE_2, "user:u-ada").await;
+        anyhow::ensure!(matches!(&r, Err(Error::Store(m)) if m.contains("couldn't keep")), "{r:?}");
+        let r = update(&hub, &sim, &ada, &id, Patch { name: None, text: Some(CLAUDE_2.into()) }, "user:u-ada").await;
+        anyhow::ensure!(matches!(&r, Err(Error::Store(_))), "{r:?}");
+        let rows: (i64, i64) = hub.store.read(|c| Ok((c.query_row("SELECT COUNT(*) FROM agentfiles", [], |r| r.get(0))?, c.query_row("SELECT COUNT(*) FROM agentfile_versions", [], |r| r.get(0))?))).await?;
+        anyhow::ensure!(rows == (1, 1), "{rows:?} Agentfiles and versions");
+        let still = get(&hub, &sim, &ada, &id).await?;
+        anyhow::ensure!(still.version == 1 && still.text == CLAUDE, "{still:?}");
+        let again = create(&hub, &sim, &ada, "claude-too", CLAUDE, "user:u-ada").await?;
+        anyhow::ensure!(again.agentfile.version == 1 && again.agentfile.text == CLAUDE, "{again:?}");
+        Ok(())
+    })
+}
+
+/// A delete drops the records and lets go of the texts no record names any more; a text another
+/// person's Agentfile has stays until theirs goes too.
+#[test]
+fn step30_a_delete_lets_go_of_texts_no_record_names() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let sim = SimBlobs::new(crate::rt::clock(), SimLimits::default());
+        let (ada, bo) = (who("user:u-ada"), who("user:u-bo"));
+        let mine = create(&hub, &sim, &ada, "claude", CLAUDE, "user:u-ada").await?.agentfile.id;
+        let theirs = create(&hub, &sim, &bo, "claude", CLAUDE, "user:u-bo").await?.agentfile.id;
+        update(&hub, &sim, &ada, &mine, Patch { name: None, text: Some(CLAUDE_2.into()) }, "user:u-ada").await?;
+        let gone = delete(&hub, &sim, &ada, &mine).await?;
+        anyhow::ensure!(gone.name == "claude" && gone.owner == "user:u-ada" && gone.version == 2, "{gone:?}");
+        anyhow::ensure!(matches!(sim.head(&key_of(CLAUDE_2)).await, Err(Refusal::NotFound(_))), "Ada's second text stayed");
+        anyhow::ensure!(sim.head(&key_of(CLAUDE)).await.is_ok(), "Bo's text went with Ada's");
+        delete(&hub, &sim, &bo, &theirs).await?;
+        anyhow::ensure!(matches!(sim.head(&key_of(CLAUDE)).await, Err(Refusal::NotFound(_))), "the last text named stayed");
+        Ok(())
+    })
 }
