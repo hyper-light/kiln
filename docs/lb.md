@@ -444,7 +444,10 @@ the fleet (64).
   the v1 dispatcher's pick filters by; the job's room is taken from the view until its runner is
   heard of (started, refused, released). What the kernel can't place, the v1 dispatcher's own pick
   does. A run's ordinary jobs waiting together in one look at the queue go to `Legs::pick_batch`
-  first. The CI engine's legs go through a kernel of the engine's own (below).
+  first. Runners' words and the jobs heard of at them come by mail (`legs::Mail`: each runner's
+  newest word, behind a lock held for a map insert), which the scheduling loop takes in as it looks,
+  so the kernel's records are written by that loop alone. The CI engine's legs go through a kernel
+  of the engine's own (below).
 - **Room tokens** (`[reach] tokens`, off until declared; below): a runner that declares them tells
   each owner whose link named `place.tokens` what it holds there, its own word (`tokens` in its
   answers' words, and `FastHint` for what's owed besides), and that owner takes no hint of the
