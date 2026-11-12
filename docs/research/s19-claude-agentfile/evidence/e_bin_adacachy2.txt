@@ -1,0 +1,68 @@
+# Claude Code on Linux x86_64, 2026-11-12T06:11:38Z, host=adacachy2 kernel=7.3.3-1-cachyos glibc=glibc 2.44
+MUSL_LOADER_ON_HOST ls: cannot access '/lib/ld-musl-x86_64.so.1': No such file or directory
+VERIFIED 2.1.311-linux-x64 sha256=86dc1fcc69498159eaf15f446613e847010f9036bfbbdffd4c49350be8489ada
+VERIFIED 2.1.322-linux-x64 sha256=bfb3703ad5380242328459bc62ada4bde8ae7ba57c6e1eeadb9c00e08874c478
+VERIFIED 2.1.311-linux-x64-musl sha256=cd40dd327145ee47aa0deacd571801c1d782388f709d71242eee6b91de8ed11f
+VERSION_OUT 2.1.311: 2.1.311 (Claude Code)
+FLAG 2.1.311 --input-format help=2 binary_quoted=6
+FLAG 2.1.311 --output-format help=5 binary_quoted=7
+FLAG 2.1.311 --verbose help=1 binary_quoted=16
+FLAG 2.1.311 --include-partial-messages help=1 binary_quoted=3
+FLAG 2.1.311 --replay-user-messages help=1 binary_quoted=4
+FLAG 2.1.311 --forward-subagent-text help=1 binary_quoted=2
+FLAG 2.1.311 --permission-prompt-tool help=1 binary_quoted=4
+FLAG 2.1.311 --model help=1 binary_quoted=12
+FLAG 2.1.311 --permission-mode help=1 binary_quoted=16
+FLAG 2.1.311 --allow-dangerously-skip-permissions help=1 binary_quoted=10
+FLAG 2.1.311 --effort help=1 binary_quoted=9
+FLAG 2.1.311 --resume help=5 binary_quoted=15
+FLAG 2.1.311 --resume-session-at help=0 binary_quoted=3
+FLAG 2.1.311 --fork-session help=1 binary_quoted=10
+FLAG 2.1.311 --session-id help=1 binary_quoted=13
+FLAG 2.1.311 --mcp-config help=3 binary_quoted=11
+FLAG 2.1.311 --plugin-dir help=3 binary_quoted=11
+FLAG 2.1.311 --settings help=4 binary_quoted=13
+STRING 2.1.311 DISABLE_UPDATES count=8
+STRING 2.1.311 DISABLE_AUTOUPDATER count=9
+STRING 2.1.311 CLAUDE_CONFIG_DIR count=56
+STRING 2.1.311 USE_BUILTIN_RIPGREP count=5
+VERSION_OUT 2.1.322: 2.1.322 (Claude Code)
+FLAG 2.1.322 --input-format help=2 binary_quoted=6
+FLAG 2.1.322 --output-format help=5 binary_quoted=8
+FLAG 2.1.322 --verbose help=1 binary_quoted=19
+FLAG 2.1.322 --include-partial-messages help=1 binary_quoted=3
+FLAG 2.1.322 --replay-user-messages help=1 binary_quoted=4
+FLAG 2.1.322 --forward-subagent-text help=1 binary_quoted=2
+FLAG 2.1.322 --permission-prompt-tool help=1 binary_quoted=4
+FLAG 2.1.322 --model help=1 binary_quoted=13
+FLAG 2.1.322 --permission-mode help=1 binary_quoted=17
+FLAG 2.1.322 --allow-dangerously-skip-permissions help=1 binary_quoted=10
+FLAG 2.1.322 --effort help=1 binary_quoted=10
+FLAG 2.1.322 --resume help=5 binary_quoted=16
+FLAG 2.1.322 --resume-session-at help=0 binary_quoted=3
+FLAG 2.1.322 --fork-session help=1 binary_quoted=10
+FLAG 2.1.322 --session-id help=1 binary_quoted=13
+FLAG 2.1.322 --mcp-config help=3 binary_quoted=11
+FLAG 2.1.322 --plugin-dir help=3 binary_quoted=11
+FLAG 2.1.322 --settings help=4 binary_quoted=17
+STRING 2.1.322 DISABLE_UPDATES count=9
+STRING 2.1.322 DISABLE_AUTOUPDATER count=9
+STRING 2.1.322 CLAUDE_CONFIG_DIR count=56
+STRING 2.1.322 USE_BUILTIN_RIPGREP count=5
+MUSL_ON_GLIBC: env: ‘./2.1.311-linux-x64-musl’: No such file or directory exit=127
+HOME_DIR /home/adalundhe/.cache/s19-claude-research/bin-20261112T050222Z/home.Taaf
+CONFIG_DIR /home/adalundhe/.cache/s19-claude-research/bin-20261112T050222Z/cfg.3jfs
+PRINT_EXIT 1
+PRINT_FIELDS {"duration_api_ms":0,"is_error":true,"terminal_reason":"api_error"}
+MCP_ADD_EXIT 0
+FILES_IN_HOME_COUNT 0
+FILES_IN_CONFIG_DIR:
+  ./backups
+  ./backups/.claude.json.backup.1794463901205
+  ./.claude.json
+  ./plugins
+  ./plugins/store
+  ./projects
+  ./projects/-home-adalundhe--cache-s19-claude-research-bin-20261112T050222Z
+  ./sessions
+PROBE_IN_CONFIG_DIR_CLAUDE_JSON yes

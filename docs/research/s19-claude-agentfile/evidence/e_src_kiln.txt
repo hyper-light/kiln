@@ -1,0 +1,6 @@
+# kiln origin/main 1a5a5f00d5dc056e70e998eb23ab0b3b315ad1e9 excerpts, 2026-11-12T06:29:10Z
+     8	//! Message shapes were taken from Claude Code 2.1.296 (`system/init`, `command_lifecycle`,
+    84	    ("shards", "shards", &["--version"]),
+   347	    /// Stream the body chunk by chunk (`None` at the end), e.g. for large downloads.
+     6	//!   digest one of its manifests there, the platforms read from that manifest (an index's
+## kiln CI workflows that name shards: 0

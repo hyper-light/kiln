@@ -1,0 +1,124 @@
+# The first research's git-file quotes, found again at today's revisions (regrep.py)
+## s_kiln_agents (f2) AGENTS.md @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+    62	- **The person's word** is needed for every merge to main, every push and every deploy, and to
+## s_bringup (f5) docs/research/measurements/harness-bringup-v1/README.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+    34	| Publisher's check | each binary against its keyless cosign bundle (`.sigstore`): certificate identity `https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2`, issuer `https://token.actions.githubusercontent.com`, verified by cosign v3.1.4 (OpenAI's signing version, `cosign-linux-amd64` sha256 `424e2c97…bbfa` from sigstore's `cosign_checksums.txt`) | GnuPG `VALIDSIG` of `manifest.json.sig` by the documented primary key `31DD DE24 DDFA B679 F42D 7BD2 BAA9 29FF 1A7E CACE`, then the binary's SHA-256 in that manifest ([code.claude.com/docs/en/setup](https://code.claude.com/docs/en/setup), "Binary integrity and code signing") |
+## s_example (f8) docs/examples/harness-claude/Agentfile @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+    13	RUN apk add --no-cache libgcc libstdc++
+## s_claude_rs (f10) crates/kiln/src/harness/claude.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+    57	        "--forward-subagent-text",
+## s_claude_rs (f10) crates/kiln/src/harness/claude.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+    81	                a.extend(["--resume-session-at".to_owned(), at.to_owned()]);
+## s_kinds (f11) crates/kiln/src/harness/kinds.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+    51	    Kind { id: "claude", name: "Claude Code", program: "claude", verified: true, protocol: Protocol::ClaudeStreamJson, screen: &["claude"], screen_takes_command: true },
+## s_kinds (f11) crates/kiln/src/harness/kinds.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+   121	                p.args(super::claude::args(spec, session_id.as_deref()));
+## s_kinds (f11) crates/kiln/src/harness/kinds.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+   147	                p.env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1");
+## s_kinds (f11) crates/kiln/src/harness/kinds.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+    93	            Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)).with_speed(spec.speed.clone()))),
+## s_kinds (f11) crates/kiln/src/harness/kinds.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+   504	        .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+## s_claude_rs (f11) crates/kiln/src/harness/claude.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+    58	        "--permission-prompt-tool",
+## s_bringup (f13) docs/research/measurements/harness-bringup-v1/README.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   290	locally (`Not logged in · Please run /login`, `duration_api_ms: 0`, no request), so its reach
+## s_bringup (f13) docs/research/measurements/harness-bringup-v1/README.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   291	is shown with a placeholder key. With a key it retries a 401 ten times with backoff
+## s_bringup (f14) docs/research/measurements/harness-bringup-v1/README.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   234	2. The simple `harness.json` cannot point a harness at its credential by environment
+## s_bringup (f14) docs/research/measurements/harness-bringup-v1/README.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   235	   (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`); its full OSI form can, and a `--settings`-style
+## s_osi (f14) crates/image/src/osi.rs @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+    84	    pub env: Vec<String>,
+## s_codex_full (f14) docs/research/measurements/harness-bringup-v1/records/codex-login-volume/harness.json @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+     1	{"schemaVersion":1,"name":"codex","run":{"command":["codex","exec","--json","--skip-git-repo-check","--ephemeral","Reply with the single word: ready"],"env":["CODEX_HOME=/run/codex-home"]}}
+## s_af_arch (f15) docs/architecture/AGENTFILE_ARCH.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   182	  - `--target-kind=<agent|harness>` (added 2026-10-01): whether the names after `FOR`
+## s_bringup (f15) docs/research/measurements/harness-bringup-v1/README.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   225	| A host directory given at run time to a volume declared for the harness alone (`VOLUME --target-kind=harness DIR FOR <harness>` in the Agentfile, `shards run -v HOSTDIR:DIR[:ro]`), the harness pointed at it by a path in its image (a `--settings` option, or `run.env` in harness.json's full OSI form) | **Works.** The share is the harness's alone (D109: no other member mounts it; the run's own root does not), its host-made files shown owned by the harness's uid, the host's modes kept (`domains.rs:1472-1489`) | Codex: `CODEX_HOME=/run/codex-home` (full-form `run.env`) over `-v HOSTDIR:/run/codex-home`, its own `auth.json` (`{"auth_mode": "apikey", "OPENAI_API_KEY": …}`, as `codex login --with-api-key` writes it) mode 0600 in a 0700 directory: OpenAI answers `401 Unauthorized: Incorrect API key provided: sk-shard*******************-key … auth error code: invalid_api_key`. Claude Code: `--settings /run/claude-auth/settings.json` (`{"apiKeyHelper": "cat /run/claude-auth/api-key"}`) over `-v HOSTDIR:/run/claude-auth:ro`, both files 0600 in a 0700 directory: `apiKeySource: "apiKeyHelper"`, every request `error_status: 401`, `Invalid API key · Fix external API key`. Probe: the harness is `uid=200000 gid=200000`, the directory `drwx------ 200000 200000`, the file `-rw------- 200000 200000`, read | **native delegation**: the harness, its tools and its children can read the key; Codex writes its token refreshes back there (the share must be writable for a ChatGPT sign-in, and for Codex's own state) |
+## s_t4 (f17) docs/isolation.md @ 0aeb1d5889b5cdcea10d007d76e29ce3669aa648
+    59	- **Its folder** is shared with it writable at its own path, so what the harness says of its files
+## s_af_arch (f18) docs/architecture/AGENTFILE_ARCH.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   273	  | path on the build host | copies it, as `COPY` copies |
+## s_planrs (f18) crates/agentfile/src/plan.rs @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+  4544	                let st = self.graph.source(url, attrs, None, custom_name(shown.clone()));
+## s_planrs (f18) crates/agentfile/src/plan.rs @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+  4549	            crate::agentfile::Source::Path(p) => {
+## s_buildtest (f19) crates/shards/tests/build.rs @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+  9887	    // Expanded where it is laid out too.
+## s_buildtest (f19) crates/shards/tests/build.rs @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+  9867	            "FROM {image} AS with-agent\nARG SRC=./agent\nAGENT main FROM $SRC\n\
+  9890	        format!("FROM {image}\nARG SRC=./agent\nAGENT main FROM $SRC\n"),
+## s_planrs (f19) crates/agentfile/src/plan.rs @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+  1633	        (b"TARGETARCH", target.architecture.clone()),
+## s_arch (f21) docs/design/architecture.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+ 10961	build for both (`--platform linux/amd64,linux/arm64`, D87) runs each platform's RUN steps.
+## s_arch (f21) docs/design/architecture.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+ 10982	  From the host's side, an emulated run costs 4.6 and 5.5 times the cycles of a native one
+## s_example (f22) docs/examples/harness-claude/Agentfile @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+    22	NETWORK --dns --egress=443/tcp provider FOR claude
+## s_example (f22) docs/examples/harness-claude/Agentfile @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+    23	EXPOSE --harnesses=claude 443/tcp AS egress FOR provider
+## s_example (f22) docs/examples/harness-claude/Agentfile @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+    24	CONNECT claude WITH claude ON provider
+## s_af_arch (f22) docs/architecture/AGENTFILE_ARCH.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   236	  (`CONNECT a WITH a ON n`) attaches it to the networks and grants no flow.
+## s_bringup (f22) docs/research/measurements/harness-bringup-v1/README.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   268	**H2: egress names ports, not destinations.** `--egress=443/tcp` with `EXPOSE … AS egress`
+## s_bringup (f24) docs/research/measurements/harness-bringup-v1/README.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   105	| `a_real_claude_code_starts_as_a_harness_and_refuses_without_a_login` (`claude`) | pass | 0.78 s, End | the example as published: Claude Code exec'd as declared, its local refusal |
+## s_bringup (f24) docs/research/measurements/harness-bringup-v1/README.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+     8	no credential enters an image. Implementer record; the coordinator owns suites, lint gates,
+## s_bringup (f24) docs/research/measurements/harness-bringup-v1/README.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   310	| R11 | Verified: Linux x86_64 on KVM only. Unverified: macOS arm64 (HVF), Windows (WHP), Linux arm64, musl hosts; the publishers ship arm64 builds of both (`aarch64-unknown-linux-musl`, `linux-arm64-musl`), which fetch.sh does not fetch yet. |
+## s_runtime (f25) crates/kiln/src/runner/runtime.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+  3938	    /// the builder can), an Agentfile through `shards build` and `shards push` (shards' own, never
+## s_runtime (f25) crates/kiln/src/runner/runtime.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+  3964	        let base = format!("{own}/{}/images/{name}", self.a.repo.to_ascii_lowercase());
+## s_runtime (f25) crates/kiln/src/runner/runtime.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+  3981	            args.extend(["--platform".into(), platforms.join(",")]);
+## s_runtime (f25) crates/kiln/src/runner/runtime.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+  3960	        let found = on_path(&env, prog).ok_or_else(|| anyhow::anyhow!("{file} is built by {prog}, which isn't on this runner{}", if shards { " (an Agentfile is never built with Docker)" } else { "" }))?;
+## s_registry (f25) crates/kiln/src/ci/registry/mod.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+     1	//! kiln's own OCI registry (docs/ci.md W12-R01): the OCI Distribution Specification v1.1 at
+## s_registry (f25) crates/kiln/src/ci/registry/mod.rs @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+    38	const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+## s_image_yaml (f27) .kiln/image.yaml @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+    33	      # One x86_64-unknown-linux-musl build per commit for release and the image (W28-R78): the
+## s_image_yaml (f27) .kiln/image.yaml @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+    37	        run: KILN_COMMIT=$KILN_SHA nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl
+## s_t4_iso (f28) crates/kiln/src/sandbox/isolated.rs @ 0aeb1d5889b5cdcea10d007d76e29ce3669aa648
+    67	        "claude" => Some(include_str!("agentfiles/claude.Agentfile")),
+## s_t4 (f28) docs/isolation.md @ 0aeb1d5889b5cdcea10d007d76e29ce3669aa648
+    46	  and python3. Its tag, `kiln-harness/<harness>:<version>-<recipe>`, carries a digest of the
+## s_t4_af (f28) crates/kiln/src/sandbox/agentfiles/claude.Agentfile @ 0aeb1d5889b5cdcea10d007d76e29ce3669aa648
+     9	FROM node:24-bookworm-slim
+## s_t4_af (f28) crates/kiln/src/sandbox/agentfiles/claude.Agentfile @ 0aeb1d5889b5cdcea10d007d76e29ce3669aa648
+    14	RUN npm install -g "@anthropic-ai/claude-code@${VERSION}" && npm cache clean --force
+## s_t4 (f28) docs/isolation.md @ 0aeb1d5889b5cdcea10d007d76e29ce3669aa648
+   631	- **The images' reproducibility**: kiln's Agentfiles name their base by tag
+## s_cimd (f30) docs/ci.md @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+  4428	  silicon Macs Linux arm64 microVMs; QEMU emulation as a declared fact (W04-R13).
+## s_bringup (f31) docs/research/measurements/harness-bringup-v1/README.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+     8	no credential enters an image. Implementer record; the coordinator owns suites, lint gates,
+## s_kiln_agents (f31) AGENTS.md @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+    61	- **Never print or commit a secret,** kiln's admin token included.
+## s_kiln_agents (f32) AGENTS.md @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+    14	- **hyper-rt, not tokio.** Async code runs on hyper-raft's `hyper-rt`; HTTP is kiln's own
+## s_kiln_agents (f32) AGENTS.md @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+    15	  (`crates/kiln-http`, `docs/http.md`). Don't add tokio, hyper, h2, axum, reqwest, kube-rs or
+## s_kiln_agents (f32) AGENTS.md @ 94639db7b83076143ff48fe5dac6edb9d3a33743
+   103	| Rust | what you touched first (its tests, clippy on its crate), then, when the person asks for the full run, your change's gate (above) |
+## s_bringup (f33) docs/research/measurements/harness-bringup-v1/README.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   276	**H3: no command reads a member's output.** It goes only to the owner endpoint
+## s_policy (f34) docs/development-rules.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   147	Use scoped subagents for parallel implementation and targeted unit/light
+## s_policy (f34) docs/development-rules.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+   156	The main coordinator owns all audits, profiling, benchmarking, cross-lane
+## s_policy (f34) docs/development-rules.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+    42	Use online learned/data-derived values, or exceptionally well-researched invariants
+## s_t4_af (f35) crates/kiln/src/sandbox/agentfiles/claude.Agentfile @ 0aeb1d5889b5cdcea10d007d76e29ce3669aa648
+    14	RUN npm install -g "@anthropic-ai/claude-code@${VERSION}" && npm cache clean --force
+## s_arch (f38) docs/design/architecture.md @ 8f3cd5b7411dfeea47956a5143eec2c3466b058f
+ 10961	build for both (`--platform linux/amd64,linux/arm64`, D87) runs each platform's RUN steps.
