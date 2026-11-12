@@ -128,3 +128,9 @@ systemd-run, and the unit's stderr:
 GATE: PASS
 == gate exit 0
 s21-finish-clippy2.service: Consumed 619ms CPU time over 8min 53.335s wall clock time, 97.3M memory peak, 2M memory swap peak.
+
+# And on 38a9b8aa9 (kiln main ed62a63ef merged in: opencode's row)
+Started [systemd-run] /usr/bin/bash -c "echo \"== \$(hostname) \$(uname -srm) \$(date -u +%FT%TZ) tree \$(git rev-parse HEAD)\"; start=\$(date +%s); cargo test --locked -p kiln --lib agentfiles:: 2>&1; rc=\$?; echo \"== cargo test exit \$rc after \$(( \$(date +%s) - start )) s\"".
+== adacachy Linux 7.2.9-2-cachyos x86_64 2026-11-12T22:38:13Z tree 38a9b8aa949e8fb668268743ae76194c94a0211e
+test result: ok. 107 passed; 0 failed; 0 ignored; 0 measured; 4377 filtered out; finished in 1.36s
+== cargo test exit 0 after 342 s

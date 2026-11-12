@@ -72,8 +72,9 @@ subagent finished it on branch p/s21-finish-v1. This file is the finish's record
   -D warnings`) on adacachy: at 6e814bff8 it failed on one lint of this branch's
   (`explicit_auto_deref` in gemini_tests.rs), fixed in 74c0d233c; at d78d882a6, kiln main edba77bdb
   merged in (pi's row), `GATE: PASS` ([finish/merged-tree-adacachy.txt](finish/merged-tree-adacachy.txt)).
-- **The merged tree d78d882a6**, every row and test module kept: `cargo test --locked -p kiln --lib
-  agentfiles::`, 101 passed, 0 failed, Gemini's 8 and pi's among them.
+- **The merged trees**, every row and test module kept: `cargo test --locked -p kiln --lib
+  agentfiles::` at d78d882a6 (pi's row), 101 passed; at 38a9b8aa9 (kiln main ed62a63ef, opencode's
+  row), 107 passed; 0 failed in each, Gemini's 8 among them.
 - Gemini itself was never run here: smokes are ROOT's.
 
 ## Unverified, and owed
