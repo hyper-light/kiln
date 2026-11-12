@@ -1,0 +1,64 @@
+{
+  "harness": "antigravity",
+  "version": "1.5.6",
+  "execution_id": "6212266538958848",
+  "verified": {
+    "how": "Each archive's SHA-512 equals the one its platform's manifest from Google's updater gives over HTTPS, as Google's install.sh checks it; Google publishes no signature for the CLI.",
+    "read_at": "2026-11-12T08:14:29Z",
+    "releases": {
+      "url": "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/releases",
+      "sha256": "090fa7c9f6bd452c316c9ead04267e991b0967b4ac9c727b15296e4730586078"
+    },
+    "manifests": [
+      {
+        "url": "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64_musl.json",
+        "sha256": "bd5d40bbf028ab239afb49a0deaca9ad8d3e6890cfaf7789652b5dbea36d6e20"
+      },
+      {
+        "url": "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64_musl.json",
+        "sha256": "825a60efdf08fbea3f6737d23696c1fed10762fdb3a07a3e9d0e5b174462e484"
+      }
+    ]
+  },
+  "base": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+  "builds": [
+    {
+      "platform": "linux/amd64",
+      "files": [
+        {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.6-6212266538958848/linux-x64-musl/cli_linux_x64_musl.tar.gz",
+          "sha256": "759402e5bba35938e14710b7d4f1413afd82c5b4edc73c23287784ce47f7e7a4",
+          "sha512": "fddcc0393a24704033b977cef4f500bef3c944eec518b718721ba983a4f3dba35a170651a9d17a447e550a1c9cc50c3946416966ed414aa720b0c5121e5fa970",
+          "size": 96887477,
+          "path": "bin/agy",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "antigravity",
+            "sha256": "e01e1a3af269ce5a3fd8ace31849390128196221346909e90b8d9973776da513",
+            "size": 251006408
+          }
+        }
+      ]
+    },
+    {
+      "platform": "linux/arm64",
+      "files": [
+        {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.6-6212266538958848/linux-arm-musl/cli_linux_arm64_musl.tar.gz",
+          "sha256": "4dae1c738d92826e7cc6184e90e501d566af50e1d02cdb573154171fccc32022",
+          "sha512": "9c4300ff973c0a6697b06a160d98992704e817b1456fe7f7111124e55867a8811dd85d1fb69fa71a9d8aebb467f7c53d7a7b58326d58f81fe6469ef945a5a95f",
+          "size": 90920137,
+          "path": "bin/agy",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "antigravity",
+            "sha256": "982622e3176899affda6d095eec521b7a8f1af88645412b478b6d12b419e0cea",
+            "size": 237939520
+          }
+        }
+      ]
+    }
+  ]
+}
