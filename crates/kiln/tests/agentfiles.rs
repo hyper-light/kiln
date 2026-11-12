@@ -141,7 +141,7 @@ fn step30_agentfiles_on_every_surface() -> anyhow::Result<()> {
     let listed: Vec<Value> = vs.get("versions").and_then(Value::as_array).into_iter().flatten().map(|v| v.get("version").cloned().unwrap_or_default()).collect();
     anyhow::ensure!(listed == [json!(3), json!(2), json!(1)], "{vs}");
     let (failed, said) = mcp(&srv, &ada, "agentfiles_get", json!({ "id": id }))?;
-    anyhow::ensure!(!failed && said.contains("\"version\":3"), "her tool: {said}");
+    anyhow::ensure!(!failed && serde_json::from_str::<Value>(&said).ok().and_then(|v| v.get("version").cloned()) == Some(json!(3)), "her tool: {said}");
     let (failed, said) = mcp(&srv, &ada, "code_run", json!({ "program": "return (await kiln.agentfiles.list({})).agentfiles.map(a => a.name)" }))?;
     anyhow::ensure!(!failed && said.contains("claude"), "her code mode: {said}");
 
