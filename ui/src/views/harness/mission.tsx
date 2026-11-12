@@ -45,6 +45,7 @@ import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
 import { activityAt, missionAgents, missionFoundSessions, missionRows, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
 import { MachinesNote, machinesRes, NewAgent, NewAgentLoading } from "./new-agent";
+import { agentfileChoicesRes } from "@/views/agentfiles/choose";
 import { MISSION_DRAFT } from "./new-agent-draft";
 import { useDrafts } from "./state";
 import { preloadAgents, useAgentList, useAgents } from "./use-agents";
@@ -695,6 +696,7 @@ export default function Mission() {
   // All of it asked for at once: each read would otherwise wait for the one before it.
   preloadAgents();
   ask(machinesRes);
+  ask(agentfileChoicesRes);
   ask(agentsRes);
   ask(pushStateRes);
   ask(thisDeviceRes);

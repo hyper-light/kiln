@@ -1068,6 +1068,28 @@ composer → More options → Workspace → Own volume; `agents.start` with `wor
   loopback on macOS. `GET /api/harness/workspaces` says which machines can, and why each other
   can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
 
+## From an Agentfile, in a microVM of its own
+
+An agent can start in **a microVM of its own, made from an Agentfile** (kiln plan
+01a1cd8e862e7169a074db3d5fa33f3d, step 31): Mission control's composer → More options →
+Agentfile, which offers kiln's for its harness (`harness-claude` …) and each of yours. The choice
+is kept in this browser per harness and per project (the folder it starts in, as typed; its home
+and a shell's folder are none), so the next agent of that harness there starts from the same one;
+None is a process on its machine, as agents start without one. Its start names it as the
+microVM's image (`spec.isolation: {kind: "microvm", image}`, docs/api.md "Agentfiles"). It goes
+only to a runner that says it starts microVMs (its facts' `virt.microvm`), and anywhere else it's
+refused, never run as a process; where the machine picked would refuse it, the composer says so
+under the row. A runner's kiln starts no microVM itself until it carries Shards (the plan's steps
+16 and 17), so until then such a start is refused there, saying so.
+
+**Agentfiles** (Agents → Agentfiles, `/agents/agentfiles`) keeps yours: each opened on its own page
+in the code editor's Agentfile mode, checked by Shards as it's typed (`POST /api/agentfiles/check`,
+what it finds marked on its lines and said under the editor), saved with a new version for each new
+text (one Shards refuses isn't kept, and its words say why), renamed (no new version), each version
+read and any made current again (as a new version), and deleted with its versions after a question
+asked in place. A new one is written in place on the list; kiln's are read there and copied as
+yours, under a name that isn't kiln's, to change.
+
 ## The Changes tab
 
 An agent's Changes tab shows what it changed, its change request above (see "Change requests from

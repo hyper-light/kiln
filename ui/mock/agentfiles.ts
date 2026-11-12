@@ -1,9 +1,10 @@
 /**
  * Agentfiles in the mock (docs/api.md, "Agentfiles"), answered as the server's routes answer: the
- * mock's one person's own (the server's owner), each with its versions; kiln's built-ins (none yet);
- * and, for any repository asked for, one `.kiln/images/claude/Agentfile`. No Shards runs here: a text
- * is kept unchecked (`no_shards`), but one with a `FORM …` line is refused as Shards refuses it, so a
- * page's refusal can be seen.
+ * mock's one person's own (the server's owner), each with its versions; kiln's built-ins, the
+ * repository's own `.kiln/images/harness-<id>/Agentfile` files, which kiln embeds
+ * (`crate::agentfiles::builtin`); and, for any repository asked for, one `.kiln/images/claude/Agentfile`.
+ * No Shards runs here: a text is kept unchecked (`no_shards`), but one with a `FORM …` line is refused
+ * as Shards refuses it, so a page's refusal can be seen.
  *
  *   GET    /api/agentfiles?repo=&all=       the list
  *   POST   /api/agentfiles                  {name, text}: keep one
@@ -16,7 +17,8 @@
  */
 import type http from "node:http";
 import { randomBytes } from "node:crypto";
-import type { Agentfile, AgentfileBrief, AgentfileCheck, AgentfileListing, AgentfileSaved, AgentfileVersion, ServerEvent } from "../src/api/wire/index.ts";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import type { Agentfile, AgentfileBrief, AgentfileBuiltin, AgentfileCheck, AgentfileListing, AgentfileSaved, AgentfileVersion, ServerEvent } from "../src/api/wire/index.ts";
 
 type Ctx = {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
@@ -40,6 +42,19 @@ AGENT main FROM ./agent
 ATTACH main FOR claude
 CMD ["claude"]
 `;
+
+/** Where kiln keeps image definitions (W13-R11), its built-ins' among them. */
+const IMAGES = new URL("../../.kiln/images/", import.meta.url);
+
+/** kiln's built-ins, one per harness: `harness-<id>/Agentfile`, as kiln embeds them. */
+function builtins(): AgentfileBuiltin[] {
+  if (!existsSync(IMAGES)) return [];
+  return readdirSync(IMAGES, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && d.name.startsWith("harness-") && existsSync(new URL(`${d.name}/Agentfile`, IMAGES)))
+    .map((d) => ({ name: d.name, harness: d.name.slice("harness-".length), text: readFileSync(new URL(`${d.name}/Agentfile`, IMAGES), "utf8") }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+let shipped: AgentfileBuiltin[] | null = null;
 
 const kept = new Map<string, Agentfile>();
 const versions = new Map<string, AgentfileVersion[]>();
@@ -116,7 +131,7 @@ export async function handleAgentfiles(req: http.IncomingMessage, res: http.Serv
     const listing: AgentfileListing = {
       agentfiles: [...kept.values()].sort((a, b) => b.updated_at - a.updated_at || a.id.localeCompare(b.id)).map(brief),
       reaches_all: true,
-      builtin: [],
+      builtin: (shipped ??= builtins()),
       ...(repo ? { project: { repo, sha: "4f1c9a7e2b3d5f60718293a4b5c6d7e8f9012345", agentfiles: [{ name: "claude", path: ".kiln/images/claude/Agentfile", text: CLAUDE }] } } : {}),
     };
     return answer(listing);

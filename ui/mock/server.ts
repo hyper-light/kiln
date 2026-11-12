@@ -19,7 +19,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { Agent, AuditEntry, Child, HostSample, Job, JobTools, PlannedJob, Repo, Run, ServerEvent, Status, Step } from "../src/api/types.ts";
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
 import { defaultRunner } from "./defaults.ts";
-import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
+import { AUTHORS, MICROVM_RUNNERS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { demoInfos, handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handleFamily, handleFamilySession, refuseAgent, setFamilyEmit } from "./agents.ts";
 import { handlePlanReview, handleReviewSession, reviewInfos, setReviewEmit } from "./plan-review.ts";
@@ -279,6 +279,38 @@ const reservedName = (n: string) => n.replace(/\.+$/, "").toLowerCase() === "kil
 /** Which runner, as the audit says it: its label and its id, else its name. */
 const shownAs = (a: Agent) => (a.label ? `${a.label} (${a.name})` : a.name);
 
+/**
+ * What a Linux runner with KVM says of itself (`RunnerFacts`), its microVMs as `MICROVM_RUNNERS` has
+ * them (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31).
+ */
+function linuxFacts(name: string, cores: number, memGiB: number, diskGiB: number, at: number): NonNullable<Agent["facts"]> {
+  return {
+    os: "linux",
+    os_version: "24.04",
+    os_distro: "ubuntu",
+    kernel: "6.8.0-48-generic",
+    arch: "x86_64",
+    arch_variant: null,
+    cpu: { model: "AMD Ryzen 9 7950X 16-Core Processor", cores, threads: cores * 2, flags: ["avx2", "svm"] },
+    mem: { total: memGiB * 1024 ** 3, free: (memGiB * 1024 ** 3) / 2 },
+    disk: { total: diskGiB * 1024 ** 3, free: (diskGiB * 1024 ** 3) / 2 },
+    gpus: [],
+    virt: { kvm: true, hvf: false, nested: false, microvm: MICROVM_RUNNERS.has(name) },
+    executors: { host: { version: null, details: {} } },
+    binfmt: [],
+    tools: { git: "2.43.0" },
+    net: { egress: true, proxy: null },
+    custom: {},
+    probed_at: at,
+    kiln: null,
+    workspaces: null,
+    work: null,
+    machine_id: null,
+    storage: null,
+    runs: [],
+  };
+}
+
 const t = now();
 addAgent(
   {
@@ -309,6 +341,7 @@ addAgent(
     connected: true,
     last_seen: t,
     enrolled_at: t - 86400 * 38,
+    facts: linuxFacts("metal-ryzen-02", 24, 128, 4000, t),
   },
   newHost(24, 128, 4000),
 );
