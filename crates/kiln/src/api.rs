@@ -5942,7 +5942,11 @@ async fn conversation_events_for(hub: &Hub, caller: &crate::authz::Caller, id: &
     let bytes = q.get("bytes").and_then(|v| v.parse::<usize>().ok()).unwrap_or(256 * 1024).clamp(16 * 1024, 1024 * 1024);
     if !hub.harness.history_valid(id, cursor) { return Err(err(StatusCode::CONFLICT, "the conversation restarted; reconnect before loading earlier history")); }
     let mut more = false;
-    let events = if let Some(store) = hub.harness.convo.clone() {
+    // From the session's copy when it holds the page: the conversation store, whose reads wait behind its writes,
+    // only for what the copy doesn't hold, as pages were answered before d7c8bc4ee96b (plan 01a1cc09, step 1).
+    let events = if hub.harness.history_kept(id, before, limit).await {
+        (Vec::new(), false)
+    } else if let Some(store) = hub.harness.convo.clone() {
         let session = id.to_owned();
         crate::rt::blocking(move || {
             let rows = store.events(&session, Some(before), limit.saturating_add(1))?;
@@ -8452,6 +8456,47 @@ mod tests {
             assert_eq!(v.pointer("/history/has_more").and_then(serde_json::Value::as_bool), Some(true));
             q.insert("cursor".into(), "another-process".into());
             assert!(matches!(conversation_events_for(&hub, &crate::authz::Caller::owner(), "cursor", &q).await, Err(ApiError(StatusCode::CONFLICT, _))));
+            Ok(())
+        })
+    }
+
+    /// Plan 01a1cc09, step 1: an older page the session's copy holds comes from the copy, nothing of it read from
+    /// the conversation store (whose reads wait behind its writes), and it's the page the store's events made; a
+    /// conversation that changed is still refused.
+    #[test]
+    fn an_older_page_the_copy_holds_reads_nothing_from_the_store() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "kept".into(), kind: "claude".into(), ..Default::default() };
+            hub.harness.ingest(&there, "kept", Update::Open { info: Box::new(info), since: None }).await;
+            let events = (1..=230).map(|n| Event { id: format!("e{n}"), seq: n, at: i64::try_from(n).unwrap_or_default(), parent: None, by: None, body: Body::Assistant { text: format!("whole text {n}"), streaming: false } }).collect();
+            hub.harness.ingest(&there, "kept", Update::Events { events }).await;
+            hub.harness.ingest(&there, "kept", Update::State { state: Box::new(State::default()) }).await;
+            let held = hub.harness.view_held("kept").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let cursor = crate::harness::history::cursor(crate::harness::registry::born(), held.reset_at, "kept");
+            let mut q = HashMap::from([("cursor".into(), cursor.clone()), ("before".into(), "221".into()), ("limit".into(), "100".into()), ("bytes".into(), "16384".into())]);
+            let reads = || store.report().waits.iter().sum::<u64>();
+            let before = reads();
+            let resp = conversation_events_for(&hub, &crate::authz::Caller::owner(), "kept", &q).await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?;
+            anyhow::ensure!(reads() == before, "the store was read for a page the copy holds");
+            let got: serde_json::Value = serde_json::from_slice(&body_of(resp).await?)?;
+            // The page as the store's events made it before (d7c8bc4ee96b).
+            let rows = {
+                let store = store.clone();
+                crate::rt::blocking(move || store.events("kept", Some(221), 101)).await??
+            };
+            let durable = rows.iter().map(|r| serde_json::from_str::<serde_json::Value>(&r.body)).collect::<Result<Vec<_>, _>>()?;
+            anyhow::ensure!(durable.len() == 101, "the store has the page: {}", durable.len());
+            let (events, revision, held_more, floor) = hub.harness.history_overlay("kept", &cursor, 221, 100, durable).await?.ok_or_else(|| anyhow::anyhow!("no overlay"))?;
+            let more = (rows.len() > 100 || held_more) && events.iter().filter_map(crate::harness::history::seq).min().is_some_and(|n| n > floor);
+            let (page, window) = crate::harness::history::page(events, 221, 100, 16384, cursor.clone(), more);
+            anyhow::ensure!(got == serde_json::json!({"events": page, "history": window, "revision": revision}), "the copy's page differs from the store's: {got}");
+            q.insert("cursor".into(), "another-process".into());
+            anyhow::ensure!(matches!(conversation_events_for(&hub, &crate::authz::Caller::owner(), "kept", &q).await, Err(ApiError(StatusCode::CONFLICT, _))));
             Ok(())
         })
     }
