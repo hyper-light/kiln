@@ -26,6 +26,18 @@
 //! runner as a mixed fleet's do (docs/lb.md "Rank"), and asks stay plain: the cost of a decision
 //! on a measured fleet, where narrow asks rank by speed and slowness.
 //!
+//! `--profile --owners K,..`: K owners at once on K threads, each with its own fleet of N runners
+//! and its own requests, as nodes that place their own work are: whether owners on different cores
+//! slow each other. They share no memory; what's left between them is the machine's (a shared
+//! cache's room, memory's bandwidth). One line per K: each owner's ns a step, and every owner's
+//! steps a second together against K times one owner's alone.
+//!
+//! `--profile --hinters M,..`: one owner behind a lock, as the server's v1 kernel is
+//! (`crates/kiln/src/hub/legs.rs`): its steps on this thread, a lock taken for each, while M
+//! threads each say runners' words to it as their connections do, one hint a lock, as fast as they
+//! can: the most other cores can write its records between its decisions. One line per M: ns a
+//! step, and the hints said a second.
+//!
 //! `cargo bench -p kiln-ci --bench lb -- --json --n N --rho R --d D --runs K [--b B] [--w W]
 //! [--run R] [--batch K]` prints one JSON line a run; without `--json`, a table.
 
@@ -1176,6 +1188,82 @@ fn profile<S: Clone>(im: &Impl<S>, p: &Params) -> f64 {
     t.elapsed().as_nanos() as f64 / p.b as f64
 }
 
+/// `k` owners at once ([`Args::owners`]): each a copy of `im` (its own fleet and requests) on a
+/// thread of its own, filled and warmed apart, then its B steps timed while the others run theirs,
+/// all starting together. Each owner's ns a step.
+fn owners_at_once(im: &Impl<Kiln>, p: &Params, k: usize) -> Vec<f64> {
+    let start = std::sync::Barrier::new(k);
+    std::thread::scope(|s| {
+        let threads: Vec<_> = (0..k)
+            .map(|i| {
+                let mut im = im.clone();
+                let start = &start;
+                s.spawn(move || {
+                    // Each owner its own requests: the generator from its own seed.
+                    let mut rng = Rng(SEED ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    fill(&mut rng, &mut im, 0, p.f);
+                    steps(&mut rng, &mut im, p.f, p.w);
+                    start.wait();
+                    let t = Instant::now();
+                    steps(&mut rng, &mut im, p.f, p.b);
+                    t.elapsed().as_nanos() as f64 / p.b as f64
+                })
+            })
+            .collect();
+        threads.into_iter().filter_map(|t| t.join().ok()).collect()
+    })
+}
+
+/// One owner behind a lock, `m` threads hinting it ([`Args::hinters`]): its B steps on this
+/// thread, the lock taken for each, while each hinter takes it for one runner's word at a time
+/// (a runner drawn at random, its word as it stands) until the steps are done. ns a step, and the
+/// hints said a second.
+fn hinted(im: &Impl<Kiln>, p: &Params, m: usize) -> (f64, f64) {
+    let shared = std::sync::Mutex::new(im.clone());
+    let mut rng = Rng(SEED);
+    if let Ok(mut g) = shared.lock() {
+        fill(&mut rng, &mut *g, 0, p.f);
+        steps(&mut rng, &mut *g, p.f, p.w);
+    }
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let said = std::sync::atomic::AtomicU64::new(0);
+    let start = std::sync::Barrier::new(m + 1);
+    let (ns, secs) = std::thread::scope(|s| {
+        for i in 0..m {
+            let (shared, done, said, start) = (&shared, &done, &said, &start);
+            s.spawn(move || {
+                let mut rng = Rng(SEED ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let mut n = 0u64;
+                start.wait();
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let r = uniform(rng.next(), p.n);
+                    if let Ok(mut g) = shared.lock() {
+                        let k = &mut g.state;
+                        if let Some(word) = k.runners.get(r as usize).map(Runner::word) {
+                            let _ = k.owner.hear(ToOwner::Hint { runner: RunnerId(r), word }, &mut k.out);
+                            k.out.to.clear();
+                            k.out.told.clear();
+                        }
+                    }
+                    n += 1;
+                }
+                said.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        start.wait();
+        let t = Instant::now();
+        for _ in 0..p.b {
+            if let Ok(mut g) = shared.lock() {
+                steps(&mut rng, &mut *g, p.f, 1);
+            }
+        }
+        let e = t.elapsed();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        (e.as_nanos() as f64 / p.b as f64, e.as_secs_f64())
+    });
+    (ns, said.load(std::sync::atomic::Ordering::Relaxed) as f64 / secs.max(1e-9))
+}
+
 fn null_impl(slots: usize) -> Impl<()> {
     Impl { state: (), release: null_release, pick: null_pick, many_release: null_many_release, many_pick: null_many_pick, sb: vec![-1; slots] }
 }
@@ -1408,12 +1496,16 @@ struct Args {
     null: bool,
     /// `--terms`: decisions through `ask_with` with these terms.
     terms: Option<TermSet>,
+    /// `--owners K,..` (with `--profile`): K owners at once, one a thread.
+    owners: Vec<usize>,
+    /// `--hinters M,..` (with `--profile`): one owner behind a lock, M threads hinting it.
+    hinters: Vec<usize>,
     /// `--measured`: every runner measured its speed and slowness first; asks stay plain.
     measured: bool,
 }
 
 fn args() -> std::result::Result<Args, String> {
-    let mut a = Args { json: false, cold: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None, profile: false, null: false, terms: None, measured: false };
+    let mut a = Args { json: false, cold: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None, profile: false, null: false, terms: None, measured: false, owners: Vec::new(), hinters: Vec::new() };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if let Some(kinds) = std::env::var("KILN_LB_KINDS").ok().and_then(|v| v.parse().ok()) {
         KINDS.store(kinds, std::sync::atomic::Ordering::Relaxed);
@@ -1464,6 +1556,8 @@ fn args() -> std::result::Result<Args, String> {
             "--batch" => a.batch = v.parse().map_err(|e| format!("--batch {v}: {e}"))?,
             "--terms" => a.terms = Some(TermSet::parse(v)?),
             "--kinds" => KINDS.store(v.parse().map_err(|e| format!("--kinds {v}: {e}"))?, std::sync::atomic::Ordering::Relaxed),
+            "--owners" => a.owners = list(v)?.into_iter().map(|x| usize::try_from(x).unwrap_or(1).max(1)).collect(),
+            "--hinters" => a.hinters = list(v)?.into_iter().map(|x| usize::try_from(x).unwrap_or(0)).collect(),
             "--impl" => match v {
                 "kiln" => a.floor = false,
                 "floor" => a.floor = true,
@@ -1512,6 +1606,30 @@ fn main() -> std::process::ExitCode {
                 match cold_sample(n, d) {
                     Ok((build, first, measured, first_measured, first_byte)) => println!("{{\"commit\":\"{commit}\",\"n\":{n},\"d\":{d},\"build_ns\":{build},\"first_placement_ns\":{first},\"first_cpu_measure_ns\":{measured},\"first_measured_placement_ns\":{first_measured},\"first_byte_placement_ns\":{first_byte},\"runner_bytes\":{},\"owner_inline_bytes\":{},\"harness_slot_bytes\":{},\"scope\":\"fresh process/state; OS page cache uncontrolled\"}}", std::mem::size_of::<Runner>(), std::mem::size_of::<Owner>(), 2 * std::mem::size_of::<u32>() + std::mem::size_of::<Rest>()),
                     Err(why) => { eprintln!("{why}"); return std::process::ExitCode::FAILURE; }
+                }
+            }
+        }
+        return std::process::ExitCode::SUCCESS;
+    }
+    if a.profile && (!a.owners.is_empty() || !a.hinters.is_empty()) {
+        for &n in &a.ns {
+            for &rho in &a.rhos {
+                let f = inflight(n, rho);
+                for &d in &a.ds {
+                    let p = Params { n, f, b: a.b.unwrap_or(1 << 22), w: a.w.unwrap_or(u64::from(n) * 25), m: 1, m_r: 0, batch: 1 };
+                    let im = kiln_impl_on(n, d, f as usize, a.measured);
+                    let alone = owners_at_once(&im, &p, 1);
+                    let one = median(&mut alone.clone());
+                    for &k in &a.owners {
+                        let mut each = if k == 1 { alone.clone() } else { owners_at_once(&im, &p, k) };
+                        let per = median(&mut each);
+                        let together: f64 = each.iter().map(|ns| 1e9 / ns).sum();
+                        println!("owners {k} n {n} rho {:.2} d {d}: {per:.2} ns a step (median owner; one alone {one:.2}), {:.1} M steps/s together, {:.3} of {k} alone", rho as f64 / 1000.0, together / 1e6, together / (k as f64 * 1e9 / one));
+                    }
+                    for &m in &a.hinters {
+                        let (ns, hints) = hinted(&im, &p, m);
+                        println!("hinters {m} n {n} rho {:.2} d {d}: {ns:.2} ns a step (alone {one:.2}, {:.2}x), {:.2} M hints/s", rho as f64 / 1000.0, ns / one, hints / 1e6);
+                    }
                 }
             }
         }
