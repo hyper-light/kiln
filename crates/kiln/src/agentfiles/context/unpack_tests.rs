@@ -351,7 +351,7 @@ fn step26_an_agy_shaped_context_holds_bin_agy_as_pinned() -> anyhow::Result<()> 
 /// Agentfile.
 #[test]
 fn step26_an_agy_archive_failing_a_check_leaves_nothing() -> anyhow::Result<()> {
-    type Is = Box<dyn Fn(&Why) -> bool>;
+    type Is = Box<dyn Fn(&Why) -> bool + Send>;
     let good = agy("arm64");
     let mut flipped = good.clone();
     if let Some(last) = flipped.last_mut() {
@@ -366,13 +366,13 @@ fn step26_an_agy_archive_failing_a_check_leaves_nothing() -> anyhow::Result<()> 
     }
     let (want_digest, got_digest, len) = (sha(&flipped), sha(&good), good.len() as u64);
     let cases: Vec<(&str, Vec<u8>, Vec<u8>, Option<&str>, Is)> = vec![
-        ("a member of another SHA-256", one.clone(), flipped, Some("antigravity"), Box::new(move |w| matches!(w, Why::Digest { expected, got } if *expected == want_digest && *got == got_digest))),
-        ("a member larger than pinned", one.clone(), shorter, Some("antigravity"), Box::new(move |w| matches!(w, Why::Size { expected, got } if *expected == len - 1 && *got == len))),
-        ("no member", targz(&[file("agy", 0o755, &good)])?, good.clone(), Some("antigravity"), Box::new(|w| matches!(w, Why::Missing))),
-        ("an extra entry", targz(&[file("antigravity", 0o755, &good), file("README.md", 0o644, b"# agy\n")])?, good.clone(), Some("README.md"), Box::new(|w| matches!(w, Why::Extra { member } if member == "antigravity"))),
-        ("the member a symlink", targz(&[link("antigravity", EntryType::Symlink, "/bin/sh")])?, good.clone(), Some("antigravity"), Box::new(|w| matches!(w, Why::Link))),
-        ("a ../ path", targz(&[file("antigravity", 0o755, &good), file("../antigravity", 0o755, &good)])?, good.clone(), Some("../antigravity"), Box::new(|w| matches!(w, Why::Escapes))),
-        ("a corrupt gzip stream", corrupt, good.clone(), None, Box::new(|w| matches!(w, Why::Io(_)))),
+        ("a member of another SHA-256", one.clone(), flipped, Some("antigravity"), Box::new(move |w: &Why| matches!(w, Why::Digest { expected, got } if *expected == want_digest && *got == got_digest))),
+        ("a member larger than pinned", one.clone(), shorter, Some("antigravity"), Box::new(move |w: &Why| matches!(w, Why::Size { expected, got } if *expected == len - 1 && *got == len))),
+        ("no member", targz(&[file("agy", 0o755, &good)])?, good.clone(), Some("antigravity"), Box::new(|w: &Why| matches!(w, Why::Missing))),
+        ("an extra entry", targz(&[file("antigravity", 0o755, &good), file("README.md", 0o644, b"# agy\n")])?, good.clone(), Some("README.md"), Box::new(|w: &Why| matches!(w, Why::Extra { member } if member == "antigravity"))),
+        ("the member a symlink", targz(&[link("antigravity", EntryType::Symlink, "/bin/sh")])?, good.clone(), Some("antigravity"), Box::new(|w: &Why| matches!(w, Why::Link))),
+        ("a ../ path", targz(&[file("antigravity", 0o755, &good), file("../antigravity", 0o755, &good)])?, good.clone(), Some("../antigravity"), Box::new(|w: &Why| matches!(w, Why::Escapes))),
+        ("a corrupt gzip stream", corrupt, good.clone(), None, Box::new(|w: &Why| matches!(w, Why::Io(_)))),
     ];
     for (what, gz, member, entry, is) in cases {
         crate::rt::block_on(async move {
