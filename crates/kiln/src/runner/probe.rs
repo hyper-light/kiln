@@ -306,7 +306,9 @@ fn machine(work_dir: &Path) -> RunnerFacts {
         cpu: Cpu { model, cores, threads, flags: cpu_flags() },
         mem: mem(sys.total_memory(), sys.available_memory(), crate::os::cgroup::memory_limit()),
         disk,
-        virt: Virt { kvm, hvf: false, nested },
+        // It starts no microVM itself until kiln carries their runtime (kiln plan
+        // 01a1cd8e862e7169a074db3d5fa33f3d step 16).
+        virt: Virt { kvm, hvf: false, nested, microvm: false },
         binfmt: binfmt(),
         // Its load, for admission (W24-R19).
         work: Some({
