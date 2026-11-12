@@ -128,8 +128,6 @@ mod codex_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     /// Each is what a person's Agentfile must be (a name an image may have, a text Shards may read), and
     /// no two share a name.
     #[test]
@@ -176,22 +174,15 @@ mod tests {
         Ok(())
     }
 
-    /// The real Shards, where a test names it (`KILN_TEST_SHARDS`, a `shards` binary, as
-    /// `check`'s tests take it): each built-in passes its static check with no network asked for.
+    /// Shards' own check, in kiln's process (`check::lint`, kiln plan 01a1cd8e step 16): each built-in
+    /// passes its static check, with no network asked for.
     #[test]
-    fn step23_a_real_shards_checks_every_builtin() -> anyhow::Result<()> {
-        let Some(bin) = std::env::var_os("KILN_TEST_SHARDS") else {
-            eprintln!("skipped: KILN_TEST_SHARDS names no shards binary");
-            return Ok(());
-        };
-        crate::rt::block_on(async move {
-            let root = tempfile::tempdir()?;
-            for b in super::ALL {
-                let c = super::super::check::run(Path::new(&bin), root.path(), b.text).await;
-                anyhow::ensure!(c.checked && c.diagnostics.is_empty(), "{}: {c:?}", b.name);
-            }
-            Ok(())
-        })
+    fn step23_shards_checks_every_builtin() -> anyhow::Result<()> {
+        for b in super::ALL {
+            let c = super::super::check::lint(b.text);
+            anyhow::ensure!(c.checked && c.diagnostics.is_empty(), "{}: {c:?}", b.name);
+        }
+        Ok(())
     }
 
     /// What breaks a harness's HOME in `text` (an Agentfile) and `harness_json`. A harness sees its image
