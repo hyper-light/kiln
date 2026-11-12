@@ -1,0 +1,19 @@
+{
+  "task": "kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 20: the Codex Agentfile embedded in kiln (planning: plan 01a1ce705d7076648c1d9f9ee26214d3, research 01a1ce705d71770686ed0e7e45e6bcdc)",
+  "role": "implementer (Shards ROOT's step 20 agent; planning phase: research, plan, light research checks only)",
+  "read_at": "2026-11-12T07:21:55Z",
+  "shards": {
+    "revision": "08cf6ec5d72a6d48a9c36232f27f801932907140",
+    "AGENTS.md_sha256": "f66d304c033ad4001d3d7347b67faa3bb3137d637860793e8e74f1eb6266db41",
+    "docs/development-rules.md_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+    "docs/development-evidence.md_sha256": "61613a244106d95b2759b38c8b6660ff29a616983e7afd6e9faabdc38368fb63"
+  },
+  "kiln": {
+    "revision": "1a5a5f00d5dc056e70e998eb23ab0b3b315ad1e9",
+    "AGENTS.md_sha256": "16b05ef80db024a7b54b0e703d42c8cf5c1f330a626d6bd85ae4525609447a4c",
+    "CLAUDE.md": "@AGENTS.md",
+    "docs/ci.md_sha256": "29e4b9a9cee874a9d94091b461d047c4738da35713f4f628a2560d2a7771dc33"
+  },
+  "owned_paths": ["~/Projects/kiln/.claude/worktrees/s20-codex-agentfile (branch s20-codex-agentfile from kiln origin/main 1a5a5f00d5dc056e70e998eb23ab0b3b315ad1e9)", "~/.cache/s20-codex-research"],
+  "rules": "Plan step 16's goal: read kiln's AGENTS.md and CLAUDE.md (origin/main) plus Shards' policy; own kiln worktree from origin/main; build only on Linux runners or the Mac Studio runner, never on this Mac; commit with gits, named paths; land on kiln main only as kiln's rules allow (the person's word)."
+}
