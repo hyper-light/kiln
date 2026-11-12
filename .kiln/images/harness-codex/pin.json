@@ -2,7 +2,7 @@
   "version": "0.167.2",
   "tag": "rust-v0.167.2",
   "published": "2026-11-11T22:44:46Z",
-  "read_at": "2026-11-12T13:53:10Z",
+  "read_at": "2026-11-12T14:28:23Z",
   "verified": {
     "cosign": {
       "version": "v3.1.4",
@@ -24,6 +24,13 @@
     }
   },
   "base": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+  "smoke": {
+    "program": "bin/codex",
+    "args": [
+      "--version"
+    ],
+    "stdout": "codex-cli 0.167.2"
+  },
   "builds": [
     {
       "platform": "linux/amd64",

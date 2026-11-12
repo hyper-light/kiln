@@ -16,18 +16,25 @@
 # version OpenAI signs with (its linux-code-sign action at the tag), from sigstore's release, checked
 # against sigstore's checksums.
 #
-# Every member must be a regular file or directory, inside the archive, with no set-ID bit, and every
-# program the harness runs must be static: the Agentfile has no libc variant. The one exception is a
-# package's rg: OpenAI takes ripgrep's glibc build for aarch64, which no musl base can start and which
-# would shadow the base's own rg (Codex puts codex-path first on PATH). For a platform whose packaged
-# rg needs an ELF interpreter, the pin adds ripgrep's own static <arch>-unknown-linux-musl build, of
-# the version OpenAI's package pins (scripts/codex_package/rg at the tag), to replace it.
+# Every member must be a regular file or directory, inside the archive, with no set-ID bit, and no ELF
+# file may ask an interpreter, for the Agentfile has no libc variant. There are two exceptions:
+# - the voice resources, which OpenAI builds for -gnu even in a -musl package and kiln never starts (its
+#   Codex adapter refuses /voice), each named in the output;
+# - a package's rg: OpenAI takes ripgrep's glibc build for aarch64, which no musl base can start and
+#   which would shadow the base's own rg (Codex runs codex-path/rg whenever it is a file). For a
+#   platform whose packaged rg needs an ELF interpreter, the pin adds ripgrep's own static
+#   <arch>-unknown-linux-musl build, of the version OpenAI's package pins (scripts/codex_package/rg at
+#   the tag), to take its place.
 #
 # verify checks digests first, then cosign, and only then reads a package's members, codex-package.json
 # and programs: no package is parsed before its signature holds (ripgrep's archive, once both its
-# digests match). Every check must pass before pin.json is written, renamed into place whole. Its files take the shared shape (kiln plan 01a1cdf3cc7a70e4b3ca2ec610352383's
-# layout, step 25's unpack): each its url, sha256, size and path, and its unpack, the package a tree at
-# the harness's root and ripgrep's rg one member at codex-path/rg, the package's own skipped.
+# digests match). Every check must pass before pin.json is written, renamed into place whole.
+#
+# Its files take the shared shape (kiln plan 01a1cdf3cc7a70e4b3ca2ec610352383's layout, step 25's
+# unpack): each its url, sha256, size and path, and its unpack. The package is a tree at the harness's
+# root; ripgrep's rg is one member at codex-path/rg, the package's own skipped. The pin also names the
+# version smoke a built image is checked by: bin/codex --version prints `codex-cli <version>`, with no
+# credential and no network.
 #
 # Needs bash, curl, jq, python3, sha256sum and GNU coreutils, on Linux amd64 or arm64.
 set -euo pipefail
@@ -130,10 +137,16 @@ inspect() {
     python3 -I - "$@" <<'PY'
 import hashlib, json, struct, sys, tarfile
 
-# Bytes read of each program: an ELF's header, program headers and interpreter path lie at its start
-# (the ELF spec), well within 64 KiB for these; one that puts them further is refused by name, not misread.
+# Bytes read of each file of a package: an ELF's header, program headers and interpreter path lie at its
+# start (the ELF spec), well within 64 KiB for these; one that puts them further is refused by name, not
+# misread.
 HEAD = 1 << 16
 MACHINES = {"x86_64": 62, "aarch64": 183}
+# The one part of a package whose programs may ask an ELF interpreter: OpenAI builds its voice resources
+# for the -gnu target even in a -musl package (.github/scripts/build-codex-package-archive.sh at the tag),
+# and kiln never starts them (its Codex adapter refuses /voice). codex-path/rg, the other, is replaced
+# where it asks one.
+VOICE = "codex-resources/voice/"
 
 def fail(msg):
     print(msg, file=sys.stderr)
@@ -160,12 +173,12 @@ def interpreter(buf, name, arch):
 kind, path, arch, version, expect = sys.argv[1:6]
 if kind == "package":
     programs = ["bin/codex", "bin/codex-code-mode-host", "bin/codex-exec-server", "codex-resources/bwrap", "codex-path/rg"]
-    needs = dict.fromkeys(programs, HEAD) | {"codex-package.json": None}
+    needs = {"codex-package.json": None}
 else:
     # ripgrep's rg is pinned as one member, with its own SHA-256 and size: read whole.
     programs = [f"{expect}/rg"]
     needs = {programs[0]: None}
-read, seen, files, dirs = {}, set(), 0, 0
+read, seen, files, dirs, voice = {}, set(), 0, 0, {}
 try:
     with tarfile.open(path, "r|gz") as t:
         for m in t:
@@ -189,11 +202,24 @@ try:
                     fail(f"member {m.name!r} has a set-ID bit (mode {m.mode:o})")
             files += m.isreg()
             dirs += m.isdir()
-            if key in needs and m.isreg():
-                if key in programs and not m.mode & 0o111:
-                    fail(f"member {m.name!r} is not executable (mode {m.mode:o})")
-                f = t.extractfile(m)
+            if not m.isreg() or not (kind == "package" or key in needs):
+                continue
+            if key in programs and not m.mode & 0o111:
+                fail(f"member {m.name!r} is not executable (mode {m.mode:o})")
+            f = t.extractfile(m)
+            if key in needs:
                 read[key] = f.read() if needs[key] is None else f.read(needs[key])
+                continue
+            # Every other file of a package: none may need an ELF interpreter but voice's and rg.
+            head = f.read(HEAD)
+            if key in programs:
+                read[key] = head
+            if head[:4] == b"\x7fELF":
+                ip = interpreter(head, key, arch)
+                if ip and key != "codex-path/rg":
+                    if not key.startswith(VOICE):
+                        fail(f"{key} needs the ELF interpreter {ip}, and the Agentfile has no libc variant for it")
+                    voice[key] = ip
 except (tarfile.TarError, OSError, EOFError) as e:
     fail(f"not a readable tar.gz: {e}")
 
@@ -213,11 +239,11 @@ if kind == "package":
     for k, v in {"layoutVersion": 1, "version": version, "target": expect, "entrypoint": "bin/codex"}.items():
         if pkg.get(k) != v:
             fail(f"codex-package.json says {k} {pkg.get(k)!r}, not {v!r}")
+    # Each program is an ELF file for the platform, and asks no interpreter (rg may: the pin replaces it).
     for n in programs[:-1]:
-        ip = interpreter(need(n), n, arch)
-        if ip:
-            fail(f"{n} needs the ELF interpreter {ip}, and the Agentfile has no libc variant for it")
+        interpreter(need(n), n, arch)
     facts["rg_interpreter"] = interpreter(need("codex-path/rg"), "codex-path/rg", arch)
+    facts["voice"] = voice
 else:
     rg = need(programs[0])
     ip = interpreter(rg, programs[0], arch)
@@ -276,6 +302,7 @@ verify() {
             die "$name: cosign refuses it for $identity: $(tail -1 "$dir/cosign-$target.log")"
         facts=$(inspect package "$file" "$arch" "$version" "$target" 2>"$dir/inspect.err") || die "$name: $(cat "$dir/inspect.err")"
         say "OK $plat $name sha256 $got, $size bytes, $(jq -r '"\(.files) files and \(.dirs) directories"' <<<"$facts"): GitHub, SHA256SUMS and cosign ($identity)"
+        jq -r --arg p "$plat" '.voice | to_entries[] | "NOTE \($p) \(.key) asks \(.value): voice, built for -gnu, which kiln never starts"' <<<"$facts"
         files=$(jq -n --arg url "$url" --arg sha256 "$got" --argjson size "$size" \
             '[{url: $url, sha256: $sha256, size: $size, path: ".", unpack: {format: "tar.gz", strip: 0}}]')
 
@@ -318,7 +345,9 @@ verify() {
           verified: ({cosign: {version: $cosign, file: $cosign_file, sha256: $cosign_sha256},
                       identity: $identity, issuer: $issuer, sums: {url: $sums_url, sha256: $sums_sha256}}
                      + if $ripgrep == null then {} else {ripgrep: $ripgrep} end),
-          base: $base, builds: $builds}' >"$tmp"; then
+          base: $base,
+          smoke: {program: "bin/codex", args: ["--version"], stdout: ("codex-cli " + $version)},
+          builds: $builds}' >"$tmp"; then
         rm -f "$tmp"
         die "could not write $out"
     fi

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "name": "codex",
+  "version": "0.167.2",
+  "run": {
+    "command": ["codex", "app-server", "-c", "check_for_update_on_startup=false"],
+    "env": ["CODEX_HOME=/home/codex/.codex"]
+  }
+}

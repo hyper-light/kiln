@@ -64,7 +64,7 @@ forge_sums() {
 # ripgrep's kinds, a top directory TARGET without rg, or with a second top directory beside it.
 craft() {
     python3 -I - "$@" <<'PY'
-import io, json, sys, tarfile
+import io, json, struct, sys, tarfile
 out, kind, version, target = sys.argv[1:5]
 pkg = {"layoutVersion": 1, "version": version, "target": target, "entrypoint": "bin/codex"}
 if kind == "version":
@@ -73,6 +73,12 @@ if kind == "target":
     pkg["target"] = "aarch64-unknown-linux-musl"
 if kind == "layout":
     pkg["layoutVersion"] = 2
+
+def elf(interp):
+    """A minimal x86_64 ELF64 whose one program header, PT_INTERP, names INTERP."""
+    ip = interp.encode() + b"\0"
+    ehdr = struct.pack("<4sBBBBB7sHHIQQQIHHHHHH", b"\x7fELF", 2, 1, 1, 0, 0, bytes(7), 2, 62, 1, 0, 64, 0, 0, 64, 56, 1, 0, 0, 0)
+    return ehdr + struct.pack("<IIQQQQQQ", 3, 4, 120, 0, 0, len(ip), len(ip), 1) + ip
 
 def add(t, name, data=b"", mode=0o644, typ=tarfile.REGTYPE, link=""):
     ti = tarfile.TarInfo(name)
@@ -98,6 +104,8 @@ with tarfile.open(out, "w:gz", format=tarfile.PAX_FORMAT) as t:
         add(t, "../codex-pin-test", b"x\n")
     if kind == "set-id":
         add(t, "bin/codex", b"\x7fELF", mode=0o4755)
+    if kind == "dynamic":
+        add(t, "bin/codex-helper", elf("/lib/ld-musl-x86_64.so.1"), mode=0o755)
 PY
 }
 # Put a crafted archive of KIND in the x86_64 slot, its digests forged so only cosign and the archive
@@ -134,7 +142,8 @@ check() {
                 and ([.builds[].files | length] == [1, 2])
                 and .builds[0].files[0].unpack == {format: "tar.gz", strip: 0}
                 and .builds[1].files[0].unpack.skip == ["codex-path/rg"]
-                and .builds[1].files[1].path == "codex-path/rg"' "$out/pin.json" >/dev/null && verdict=PASS
+                and .builds[1].files[1].path == "codex-path/rg"
+                and .smoke == {program: "bin/codex", args: ["--version"], stdout: ("codex-cli " + .version)}' "$out/pin.json" >/dev/null && verdict=PASS
         why=$(tail -1 "$d/verify.out")
     else
         [ "$rc" -ne 0 ] && [ "$before" = "$after" ] && [ "$left" -eq 0 ] && grep -Eq -- "$want" "$d/verify.err" && verdict=PASS
@@ -193,7 +202,8 @@ for c in "symlink|member 'bin/codex' is not a regular file or a directory" \
     "set-id|member 'bin/codex' has a set-ID bit" \
     "version|codex-package\.json says version '0\.0\.1', not '$version'" \
     "target|codex-package\.json says target 'aarch64-unknown-linux-musl', not 'x86_64-unknown-linux-musl'" \
-    "layout|codex-package\.json says layoutVersion 2, not 1"; do
+    "layout|codex-package\.json says layoutVersion 2, not 1" \
+    "dynamic|bin/codex-helper needs the ELF interpreter /lib/ld-musl-x86_64\.so\.1"; do
     kind=${c%%|*}
     d=$(copy "crafted-$kind")
     crafted "$d" "$kind"
