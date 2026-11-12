@@ -90,6 +90,13 @@ pub fn own(id: &str) -> bool {
     id.starts_with(GOAL) || id.starts_with(NEWS)
 }
 
+/// A message from another agent or a harness (a child's news, an agent's own words), by its id:
+/// it steers into the turn under way, never waits for it to end (Ada, 2026-11-12: "agent/harness
+/// to agent/harness communications be steered. Not queued.").
+pub fn steers(id: &str) -> bool {
+    id.starts_with(NEWS) || id.starts_with(FROM_AGENT)
+}
+
 /// A digest of a message's words that every build of kiln makes alike (the first 16 hex digits of
 /// their SHA-256): what a runner says its harness was handed (`State::given`), read by a server that
 /// may be another build.
@@ -372,6 +379,10 @@ mod tests {
         assert_eq!(sender_of("01a16251c49a75fba41b1fae971ba8a9"), None, "a person's");
         assert_eq!(sender_of("kiln-keep-1792650891215"), None, "kiln's own");
         assert_eq!(sender_of("from-agent--x"), None);
+        // Ada, 2026-11-12: another agent's words and a child's news steer; a person's, a goal's and
+        // kiln's own keep-going words keep their mode.
+        assert!(steers(&from_agent("a")) && steers(&made(NEWS)));
+        assert!(!steers("01a16251c49a75fba41b1fae971ba8a9") && !steers(&made(GOAL)) && !steers("kiln-keep-restart-1"));
         assert_eq!(digest("a"), digest("a"));
         assert_ne!(digest("a"), digest("b"));
         assert_eq!(Queued::of("m", "four").len, 4);

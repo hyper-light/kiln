@@ -2012,7 +2012,7 @@ for line in sys.stdin:
     /// at its caller, then prove exact retry and immutable state history after real completion.
     #[test]
     #[cfg(unix)]
-    fn a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication() -> anyhow::Result<()> {
+    fn a_busy_coordinator_takes_custody_of_and_then_delivers_a_waiting_communication() -> anyhow::Result<()> {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         use std::io::Write as _;
         use crate::harness::{admission::Learning, mail, model::Status};
@@ -2055,15 +2055,11 @@ for line in sys.stdin:
             let key = "registry-tests-pass";
             let blocked = json!({"agent": coordinator, "text": "The registry's tests pass on my side.", "mode": "queue", "key": key});
             let blocked_id = crate::harness::queued::from_agent_as(&sender, &super::keyed_id(&peer, "agents.send", &coordinator, key));
-            for _ in 0..3 {
-                let refused = call(peer.clone(), "agents.send", blocked.clone()).await;
-                anyhow::ensure!(matches!(&refused, Err((http::StatusCode::TOO_MANY_REQUESTS, error)) if matches!(serde_json::from_str::<mail::Error>(error), Ok(mail::Error::Backpressure { .. }))), "pre-custody backpressure retains the caller's original: {refused:?}");
-                let current = crate::harness::mail_delivery::capacity(&hub, &coordinator).ok_or_else(|| anyhow::anyhow!("no capacity"))?;
-                anyhow::ensure!(current.admitted <= current.target && current.admitted == capacity.admitted && prompts(&heard) == [initial_id.clone()], "refusal cannot grow source admission or fabricate consumption");
-                let recipient = coordinator.clone();
-                let absent = blocked_id.clone();
-                anyhow::ensure!(hub.store.read(move |connection| Ok(connection.query_row("SELECT COUNT(*) FROM agent_mail WHERE recipient=?1 AND id=?2", rusqlite::params![recipient, absent], |row| row.get::<_, i64>(0))? == 0)).await?, "refused publication silently took custody");
-            }
+            // Ada, 2026-11-12: no message is refused for a busy recipient's depth; it's taken and waits.
+            let accepted = call(peer.clone(), "agents.send", blocked.clone()).await.map_err(|(status, error)| anyhow::anyhow!("{status}: {error}"))?;
+            anyhow::ensure!(accepted.get("id") == Some(&json!(blocked_id)) && accepted.get("repeat") == Some(&json!(false)) && accepted.get("disposition") == Some(&json!("waiting")), "a busy coordinator's peer is taken into custody, not refused: {accepted}");
+            let current = crate::harness::mail_delivery::capacity(&hub, &coordinator).ok_or_else(|| anyhow::anyhow!("no capacity"))?;
+            anyhow::ensure!(current.admitted <= current.target && current.admitted == capacity.admitted && prompts(&heard) == [initial_id.clone()], "custody cannot grow source admission or fabricate consumption");
             // The gate reader was opened before native Started, so this nonblocking writer
             // cannot wait on a missing provider or strand a blocking pool job on cancellation.
             let mut release = std::fs::OpenOptions::new().write(true).custom_flags(nix::libc::O_NONBLOCK).open(&gate)?;
@@ -2071,8 +2067,6 @@ for line in sys.stdin:
             drop(release);
             source_disposition(&hub, &coordinator, &initial_id, true).await?;
             source_disposition(&hub, &coordinator, &goal_id, true).await?;
-            let accepted = call(peer.clone(), "agents.send", blocked.clone()).await.map_err(|(status, error)| anyhow::anyhow!("{status}: {error}"))?;
-            anyhow::ensure!(accepted.get("id") == Some(&json!(blocked_id)) && accepted.get("repeat") == Some(&json!(false)), "the blocked caller reoffers its exact key/body: {accepted}");
             source_disposition(&hub, &coordinator, &blocked_id, true).await?;
             let repeated = call(peer, "agents.send", blocked).await.map_err(|(status, error)| anyhow::anyhow!("{status}: {error}"))?;
             anyhow::ensure!(repeated.get("id") == accepted.get("id") && repeated.get("revision") == accepted.get("revision") && repeated.get("repeat") == Some(&json!(true)), "{accepted} / {repeated}");

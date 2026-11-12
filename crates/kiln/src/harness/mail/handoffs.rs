@@ -194,7 +194,7 @@ mod tests {
     }
 
     fn seeded(c: &mut Connection, id: &str, epoch: u64, state: mail::Disposition) -> anyhow::Result<mail::Delivery> {
-        let receipt=mail::publish_on(c,&publication(id),u64::MAX,u64::MAX)?;
+        let receipt=mail::publish_on(c,&publication(id),u64::MAX)?;
         let delivery=mail::claim_at_on(c,receipt.revision,epoch,1,Some("source-connection"),crate::harness::state_view::FRAME)?.ok_or_else(||anyhow::anyhow!("missing fixture claim"))?;
         match state {
             mail::Disposition::Dispatched=>{},
@@ -215,7 +215,7 @@ mod tests {
         let mut deliveries=Vec::new();
         for (id,state) in [("flight",mail::Disposition::Dispatched),("admitted",mail::Disposition::Admitted),("consumed-awaiting-ack",mail::Disposition::Consumed),("cancelled-awaiting-ack",mail::Disposition::Cancelled)] { deliveries.push(seeded(&mut c,id,1,state)?); }
         let outsider=seeded(&mut c,"other-epoch",99,mail::Disposition::Admitted)?;
-        let waiting=mail::publish_on(&mut c,&publication("server-held"),u64::MAX,u64::MAX)?;
+        let waiting=mail::publish_on(&mut c,&publication("server-held"),u64::MAX)?;
         let before:Vec<Value>=deliveries.iter().map(|d|snapshot(&c,d.token.revision)).collect::<anyhow::Result<_>>()?;
         assert_eq!(affected_on(&c,"session",1).map_err(why)?,2);
         let unrelated=snapshot(&c,outsider.token.revision)?;let server_held=snapshot(&c,waiting.revision)?;

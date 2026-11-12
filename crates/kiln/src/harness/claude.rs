@@ -104,6 +104,9 @@ enum Pending {
     SetMode(String),
     SetModel(String),
     Interrupt,
+    /// The interrupt a person's "now" asked for: its message goes once the CLI has answered it,
+    /// so the turn it stops (a blocking tool call with it) can't take the message down with it.
+    NowAfter(Box<QueueItem>),
     StopTask,
     Suggest(String),
     ContextUsage,
@@ -742,7 +745,12 @@ impl Claude {
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
         self.turn = false;
         self.inflight.clear();
-        self.pending.clear();
+        // A "now" whose interrupt went unanswered goes first when it starts again: never dropped.
+        let held: Vec<QueueItem> = self.pending.drain().filter_map(|(_, p)| if let Pending::NowAfter(item) = p { Some(*item) } else { None }).collect();
+        for item in held.into_iter().rev() {
+            core.state.queue.insert(0, item);
+            core.touch_state();
+        }
         self.held_calls.clear();
         self.asks.clear();
         // Messages it was passing on to its subagents didn't get there.
@@ -1552,6 +1560,18 @@ impl Claude {
     }
 
     fn send(&mut self, core: &mut Core, item: QueueItem, mode: SendMode) {
+        // "Now" stops the turn first, whatever it waits on (a blocking tool call too): the CLI is
+        // asked to interrupt, and the message goes with priority once it has answered
+        // (`Pending::NowAfter`). The CLI's own priority alone left it waiting behind a long call.
+        if mode == SendMode::Now && self.busy(core) {
+            self.request(core, Pending::NowAfter(Box::new(item)), json!({"subtype": "interrupt"}));
+            core.touch_state();
+            return;
+        }
+        self.write_send(core, item, mode);
+    }
+
+    fn write_send(&mut self, core: &mut Core, item: QueueItem, mode: SendMode) {
         let QueueItem { id, text, attachments, overrides, reply_to, .. } = item;
         let text = text.trim_end().to_owned();
         if text.is_empty() && attachments.is_empty() {
@@ -1879,6 +1899,11 @@ impl Claude {
         let Some(resp) = v.get("response") else { return };
         let Some(id) = str_of(resp, "request_id") else { return };
         let Some(kind) = self.pending.remove(id) else { return };
+        // Answered, stopped or not: the person's "now" goes, with priority.
+        if let Pending::NowAfter(item) = kind {
+            self.write_send(core, *item, SendMode::Now);
+            return;
+        }
         let ok = str_of(resp, "subtype") == Some("success");
         let body = resp.get("response").cloned().unwrap_or(Value::Null);
         if !ok {
@@ -2173,7 +2198,7 @@ impl Claude {
                     core.touch_state();
                 }
             }
-            Pending::Interrupt | Pending::StopTask => {}
+            Pending::Interrupt | Pending::StopTask | Pending::NowAfter(_) => {}
         }
     }
 
@@ -4825,10 +4850,17 @@ mod tests {
         c.command(&mut core, Command::Send { id: "m2".into(), text: "also the moon".into(), mode: SendMode::Steer, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = core.take_writes();
         assert!(w.first().is_some_and(|l| l.contains("also the moon") && !l.contains("priority")));
-        // Send now carries priority "now".
+        // Send now stops the turn first (whatever it waits on), then goes with priority "now" once
+        // the CLI has answered the interrupt (Ada, 2026-11-12: "now" must interrupt).
         c.command(&mut core, Command::Send { id: "m3".into(), text: "urgent".into(), mode: SendMode::Now, attachments: vec![], overrides: None, reply_to: None, task: None});
         let w = core.take_writes();
-        assert!(w.first().is_some_and(|l| l.contains("\"priority\":\"now\"")));
+        let ask: Value = serde_json::from_str(w.first().map(String::as_str).unwrap_or("{}"))?;
+        assert_eq!(ask.pointer("/request/subtype").and_then(Value::as_str), Some("interrupt"), "{w:?}");
+        assert!(!w.iter().any(|l| l.contains("urgent")), "held until the interrupt is answered: {w:?}");
+        let req = ask.get("request_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        c.line(&mut core, &format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{req}"}}}}"#));
+        let w = core.take_writes();
+        assert!(w.first().is_some_and(|l| l.contains("\"priority\":\"now\"") && l.contains("urgent")), "{w:?}");
         // A denial with feedback lets the model continue; without feedback it stops the turn.
         c.line(&mut core, r#"{"type":"control_request","request_id":"r9","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/work/a.txt","content":"x\n"},"tool_use_id":"t9"}}"#);
         c.command(&mut core, Command::Approve { id: "r9".into(), decision: Decision::Deny, message: Some("use b.txt".into()), always: None, answers: None, choices: None });
@@ -4847,6 +4879,19 @@ mod tests {
         c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null}"#);
         assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text == "Interrupted")));
         Ok(())
+    }
+
+    #[test]
+    fn a_now_whose_interrupt_goes_unanswered_waits_first_in_line_when_the_cli_ends() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "SLOW story".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        c.line(&mut core, r#"{"type":"command_lifecycle","command_uuid":"m1","state":"started"}"#);
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "later".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None});
+        c.command(&mut core, Command::Send { id: "m3".into(), text: "urgent".into(), mode: SendMode::Now, attachments: vec![], overrides: None, reply_to: None, task: None});
+        c.exited(&mut core, Some(1), None);
+        assert_eq!(core.state.queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), ["m3", "m2"], "never dropped");
     }
 
     #[test]

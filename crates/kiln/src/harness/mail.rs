@@ -25,12 +25,10 @@ pub struct StatusKey {
 
 /// Whether `sender` is a person, whose messages go in a queue of their own: the server's owner
 /// (`admin`) or a signed-in user (`user:<name>`), as `harness::ops::key_scope` names a caller.
-/// A person's messages are held to no other sender's bound and go first; agents', kiln's own
-/// (`server`) and any other caller's are held to the recipient's depth.
+/// A person's messages go first; agents', kiln's own (`server`) and any other caller's are
+/// handed over as the recipient's depth allows. None is refused for it.
 pub fn person(sender: &str) -> bool { sender == "admin" || sender.starts_with("user:") }
 
-/// [`person`]'s complement over `agent_mail.sender`: the senders a recipient's depth holds.
-const BOUNDED: &str = "NOT (sender='admin' OR substr(sender,1,5)='user:')";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -391,13 +389,13 @@ fn receipt_on(c: &Connection, owner: &str, sender: &str, recipient: &str, id: &s
 /// `bytes_authority` is the room this one encoded original may take on disk: the caller's
 /// physical authority, its SQLite/WAL overhead reserved separately. Nothing is summed over every
 /// conversation's mail, so one conversation's backlog takes no other's room; each recipient's
-/// own pending depth is its bound (`pending_authority`), which learning never enlarges. A failed
+/// each recipient's depth paces handing over, never acceptance. A failed
 /// transaction does not transfer custody.
-pub async fn publish(store: &Store, publication: Publish, bytes_authority: u64, pending_authority: u64) -> Result<Receipt, Error> {
-    store.call(move |c| Ok(publish_on(c, &publication, bytes_authority, pending_authority))).await.map_err(store_error)?
+pub async fn publish(store: &Store, publication: Publish, bytes_authority: u64) -> Result<Receipt, Error> {
+    store.call(move |c| Ok(publish_on(c, &publication, bytes_authority))).await.map_err(store_error)?
 }
 
-fn publish_on(c: &mut Connection, publication: &Publish, authority: u64, pending_authority: u64) -> Result<Receipt, Error> {
+fn publish_on(c: &mut Connection, publication: &Publish, authority: u64) -> Result<Receipt, Error> {
     validate(publication)?;
     // SQLite stores this exact accounting in a signed integer; its representable range is a
     // storage invariant, not a learned capacity or a permission to enlarge caller authority.
@@ -422,16 +420,10 @@ fn publish_on(c: &mut Connection, publication: &Publish, authority: u64, pending
     let body = String::from_utf8(body).map_err(|e| Error::Unavailable { reason: e.to_string() })?;
     if bytes > authority { return Err(Error::Capacity { required: bytes, authority }); }
     if handoff_active(&tx, &publication.recipient)? { return Err(Error::Unavailable { reason: "current owner handover retains all accepted communication; new custody is waiting".into() }); }
-    // A person's message goes in the person's own queue: no bound holds it, and it counts
-    // against none. Agents' and kiln's are held to the recipient's depth, counting theirs alone.
-    if !person(&publication.sender) {
-        let unresolved: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM agent_mail WHERE recipient=?1 AND disposition IN ('waiting','dispatched','admitted') AND {BOUNDED}"), [&publication.recipient], |r| r.get(0)).map_err(sql_error)?;
-        let superseded = if let Some(status) = &publication.status {
-            tx.query_row("SELECT COUNT(*) FROM agent_mail WHERE owner=?1 AND sender=?2 AND recipient=?3 AND status_task IS ?4 AND status_key=?5 AND disposition='waiting' AND frozen=0", params![publication.owner, publication.sender, publication.recipient, status.task, status.key], |r| r.get::<_, i64>(0)).map_err(sql_error)?
-        } else { 0 };
-        let pending = unsigned(unresolved)?.checked_sub(unsigned(superseded)?).and_then(|n| n.checked_add(1)).ok_or_else(|| Error::Unavailable { reason: "communication pending accounting overflow".into() })?;
-        if pending > pending_authority { return Err(Error::Backpressure { pending, authority: pending_authority }); }
-    }
+    // Every message is taken into custody and waits here until its recipient admits it: none is
+    // refused for the recipient's depth, which paces their handing over (`super::admission`), never
+    // their acceptance (Ada, 2026-11-12: "Messages cannot and should never be dropped"; a refusal
+    // left the sender to send again, and most never did).
     if let Some(status) = &publication.status {
         tx.execute("UPDATE agent_mail SET disposition='superseded' WHERE owner=?1 AND sender=?2 AND recipient=?3 AND status_task IS ?4 AND status_key=?5 AND disposition='waiting' AND frozen=0",
             params![publication.owner, publication.sender, publication.recipient, status.task, status.key]).map_err(sql_error)?;
@@ -756,7 +748,7 @@ mod tests {
     fn message(id: &str, status: Option<&str>, text: &str) -> Publish {
         Publish { owner: "owner".into(), sender: "sender".into(), recipient: "recipient".into(), id: id.into(), command: json!({"type":"send","id":id,"text":text}), provenance: Some(json!({"original":id})), status: status.map(|key| StatusKey { task: None, key: key.into() }) }
     }
-    fn put(c: &mut Connection, p: &Publish) -> Result<Receipt, Error> { publish_on(c, p, u64::MAX, u64::MAX) }
+    fn put(c: &mut Connection, p: &Publish) -> Result<Receipt, Error> { publish_on(c, p, u64::MAX) }
     fn all(c: &Connection) -> Result<Page<Publication>, Error> { history_on(c, "owner", "sender", "recipient", None, 0, super::super::state_view::FRAME) }
 
     #[test]
@@ -932,11 +924,11 @@ mod tests {
         let mut c = db()?;
         let p = message("one", Some("build"), "first");
         let a = put(&mut c, &p)?;
-        let repeat = publish_on(&mut c, &p, 0, 0)?;
+        let repeat = publish_on(&mut c, &p, 0)?;
         assert_eq!(repeat.revision, a.revision);
         assert!(repeat.repeat);
         assert!(matches!(put(&mut c, &message("one", Some("build"), "changed")), Err(Error::Reused { .. })));
-        assert!(matches!(publish_on(&mut c, &message("two", Some("build"), "replacement"), 0, 0), Err(Error::Capacity { .. })));
+        assert!(matches!(publish_on(&mut c, &message("two", Some("build"), "replacement"), 0), Err(Error::Capacity { .. })));
         let history = all(&c)?;
         assert_eq!(history.items.len(), 1);
         assert_eq!(history.items.first().map(|r| r.receipt.disposition), Some(Disposition::Waiting));
@@ -994,52 +986,53 @@ mod tests {
     }
 
     #[test]
-    fn logical_authority_includes_server_custody_and_refusal_does_not_supersede() -> anyhow::Result<()> {
+    fn every_message_is_taken_and_a_frozen_status_is_never_superseded() -> anyhow::Result<()> {
         let mut c = db()?;
-        let a = publish_on(&mut c, &message("one", Some("build"), "first"), u64::MAX, 1)?;
-        let b = publish_on(&mut c, &message("two", Some("build"), "latest pending"), u64::MAX, 1)?;
+        let a = publish_on(&mut c, &message("one", Some("build"), "first"), u64::MAX)?;
+        let b = publish_on(&mut c, &message("two", Some("build"), "latest pending"), u64::MAX)?;
         assert_ne!(a.revision, b.revision);
-        assert!(matches!(publish_on(&mut c, &message("ordinary", None, "distinct result"), u64::MAX, 1), Err(Error::Backpressure { pending: 2, authority: 1 })));
+        // Ada, 2026-11-12: no message is refused for its recipient's depth; it waits.
+        assert_eq!(publish_on(&mut c, &message("ordinary", None, "distinct result"), u64::MAX)?.disposition, Disposition::Waiting);
         let frozen = claim_on(&mut c, b.revision, 3, 4096)?.ok_or_else(|| anyhow::anyhow!("missing claim"))?;
-        assert!(matches!(publish_on(&mut c, &message("three", Some("build"), "successor"), u64::MAX, 1), Err(Error::Backpressure { .. })));
+        assert_eq!(publish_on(&mut c, &message("three", Some("build"), "successor"), u64::MAX)?.disposition, Disposition::Waiting);
         transition_on(&mut c, frozen.token, None, Disposition::Waiting, None)?;
-        assert!(matches!(publish_on(&mut c, &message("four", Some("build"), "must not supersede frozen"), u64::MAX, 1), Err(Error::Backpressure { .. })));
-        assert_eq!(all(&c)?.items.len(), 2);
-        assert_eq!(pending_on(&c, "recipient", 0, 4096)?.items.first().map(|r| r.id.as_str()), Some("two"));
+        assert_eq!(publish_on(&mut c, &message("four", Some("build"), "must not supersede frozen"), u64::MAX)?.disposition, Disposition::Waiting);
+        let ids: Vec<String> = all(&c)?.items.iter().filter(|r| r.disposition != Disposition::Superseded).map(|r| r.id.clone()).collect();
+        assert!(ids.contains(&"two".to_owned()) && ids.contains(&"ordinary".to_owned()) && ids.contains(&"four".to_owned()), "{ids:?}");
+        assert_eq!(pending_on(&c, "recipient", 0, 4096)?.items.first().map(|r| r.id.as_str()), Some("two"), "the frozen one still goes first");
         Ok(())
     }
 
     /// Each conversation's queue is its own: what one recipient holds takes nothing of another's
     /// room, and no count is kept over every conversation's mail. The room is one original's
-    /// on disk; each recipient's bound is its own pending depth.
+    /// on disk; a backlog holds none back.
     #[test]
     fn one_conversations_backlog_takes_no_other_conversations_room() -> anyhow::Result<()> {
         let mut c = db()?;
         let to = |recipient: &str, id: &str| Publish { recipient: recipient.into(), ..message(id, None, "words of one size") };
         let size = u64::try_from(encoded(&to("a", "a1"), super::super::state_view::FRAME, 0)?.len())?;
-        publish_on(&mut c, &to("a", "a1"), size, 2)?;
-        publish_on(&mut c, &to("a", "a2"), size, 2)?;
-        assert!(matches!(publish_on(&mut c, &to("a", "a3"), size, 2), Err(Error::Backpressure { pending: 3, authority: 2 })), "a's own depth holds its third");
-        publish_on(&mut c, &to("b", "b1"), size, 2)?;
-        publish_on(&mut c, &to("b", "b2"), size, 2)?;
-        assert!(matches!(publish_on(&mut c, &to("b", "b3"), size - 1, 2), Err(Error::Capacity { .. })), "an original the disk has no room for still waits");
+        for id in ["a1", "a2", "a3"] {
+            assert_eq!(publish_on(&mut c, &to("a", id), size)?.disposition, Disposition::Waiting, "a's backlog holds none back");
+        }
+        publish_on(&mut c, &to("b", "b1"), size)?;
+        publish_on(&mut c, &to("b", "b2"), size)?;
+        assert!(matches!(publish_on(&mut c, &to("b", "b3"), size - 1), Err(Error::Capacity { .. })), "an original the disk has no room for still waits");
         Ok(())
     }
 
-    /// A person's messages queue apart: no depth holds them and they count against none, while
-    /// agents', kiln's and any other caller's count against the recipient's depth together.
+    /// No sender's message is refused for the recipient's depth: a person's, an agent's, kiln's
+    /// or any other caller's is taken and waits (Ada, 2026-11-12).
     #[test]
-    fn a_persons_messages_queue_apart_from_the_depth_agents_are_held_to() -> anyhow::Result<()> {
+    fn no_senders_message_is_refused_for_the_recipients_depth() -> anyhow::Result<()> {
         let mut c = db()?;
         let from = |sender: &str, id: &str| Publish { sender: sender.into(), ..message(id, None, "words") };
-        publish_on(&mut c, &from("agent:a", "a1"), u64::MAX, 1)?;
-        assert!(matches!(publish_on(&mut c, &from("agent:b", "b1"), u64::MAX, 1), Err(Error::Backpressure { pending: 2, authority: 1 })), "agents' depth holds a second");
-        assert!(matches!(publish_on(&mut c, &from("server", "k1"), u64::MAX, 1), Err(Error::Backpressure { .. })), "kiln's own counts with agents'");
-        assert!(matches!(publish_on(&mut c, &from("ci-token", "t1"), u64::MAX, 1), Err(Error::Backpressure { .. })), "so does any other caller's");
-        for (sender, id) in [("user:ada", "p1"), ("user:ada", "p2"), ("admin", "p3")] {
-            publish_on(&mut c, &from(sender, id), u64::MAX, 0)?;
+        for (sender, id) in [("agent:a", "a1"), ("agent:b", "b1"), ("server", "k1"), ("ci-token", "t1")] {
+            assert_eq!(publish_on(&mut c, &from(sender, id), u64::MAX)?.disposition, Disposition::Waiting, "{sender}'s is taken");
         }
-        publish_on(&mut c, &from("agent:b", "b2"), u64::MAX, 2)?;
+        for (sender, id) in [("user:ada", "p1"), ("user:ada", "p2"), ("admin", "p3")] {
+            publish_on(&mut c, &from(sender, id), u64::MAX)?;
+        }
+        publish_on(&mut c, &from("agent:b", "b2"), u64::MAX)?;
         Ok(())
     }
 
@@ -1107,7 +1100,7 @@ mod tests {
         let p = message("one", Some("build"), "same command");
         let a = put(&mut c, &p)?;
         let mut retry = p.clone(); retry.provenance = Some(json!({"fresh_transport_proof": true}));
-        let answer = publish_on(&mut c, &retry, 0, 0)?;
+        let answer = publish_on(&mut c, &retry, 0)?;
         assert_eq!(answer.revision, a.revision);
         assert!(answer.repeat);
         assert_eq!(all(&c)?.items.first().map(|r| &r.publication), Some(&p));
