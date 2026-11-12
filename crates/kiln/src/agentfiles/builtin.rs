@@ -88,6 +88,16 @@ pub const ALL: &[Builtin] = &[
         pin: include_str!("../../../../.kiln/images/harness-codex/pin.json"),
         files: &[("harness.json", include_str!("../../../../.kiln/images/harness-codex/harness.json"))],
     },
+    // pi, its own Bun build for glibc unpacked whole as its tarball holds it, with the ripgrep and fd
+    // its tools would otherwise download, in RPC mode as kiln's Pi kind starts it (kiln plan
+    // 01a1cd8e862e7169a074db3d5fa33f3d, step 28).
+    Builtin {
+        name: "harness-pi",
+        harness: "pi",
+        text: include_str!("../../../../.kiln/images/harness-pi/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-pi/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-pi/harness.json"))],
+    },
     // Gemini CLI, Google's npm package on Node.js's own Linux build, as kiln's Gemini kind starts it,
     // `--acp` (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 21). Its system settings turn its
     // update check off.
@@ -138,6 +148,9 @@ mod cursor_tests;
 
 #[cfg(test)]
 mod codex_tests;
+
+#[cfg(test)]
+mod pi_tests;
 
 #[cfg(test)]
 mod gemini_tests;
