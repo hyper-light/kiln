@@ -13,17 +13,18 @@
 //!   pi's and Cursor's, their leading directory stripped). The fetcher unpacks a build's trees first,
 //!   then its members, then writes its harness file, so a tree's target is never there before it.
 //! - a [`Member`]: one regular file, written at the pin file's path and held to its own pinned size
-//!   and SHA-256 (pi's `bin/rg` and `bin/fd`; agy's binary).
+//!   and SHA-256 (pi's `bin/rg` and `bin/fd`; agy's binary). A member the pin says the archive holds
+//!   `alone` (agy's) refuses the archive if any other entry is there.
 //!
 //! Only directories and regular files are taken, as Shards takes them in a harness's domain: each at a
 //! relative path without `..`, with no set-user-ID, set-group-ID or sticky bit, and given 0755 when its
 //! owner may execute it, else 0644. Links, devices, FIFOs and every other kind refuse the archive where
-//! they'd be written; an entry a member's pick passes over isn't checked. Each header is checked before
-//! anything is written, and the entries are written here, never by tar's own `unpack_in`, which drops a
-//! leading `/` rather than refusing it, skips a `..` path, makes links, and writes a device, a FIFO or a
-//! kind it doesn't know as a regular file (tar 0.4.46 entry.rs). Nothing is overwritten, and nothing is
-//! written beside the archive's entries: an installer's `distribution` marker beside Devin's `bin/`
-//! turns its self-update on (f26).
+//! they'd be written; an entry a member's pick passes over isn't checked, unless the member is the
+//! archive's alone. Each header is checked before anything is written, and the entries are written
+//! here, never by tar's own `unpack_in`, which drops a leading `/` rather than refusing it, skips a `..`
+//! path, makes links, and writes a device, a FIFO or a kind it doesn't know as a regular file (tar
+//! 0.4.46 entry.rs). Nothing is overwritten, and nothing is written beside the archive's entries: an
+//! installer's `distribution` marker beside Devin's `bin/` turns its self-update on (f26).
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
@@ -59,6 +60,11 @@ pub struct Member {
     pub sha256: String,
     /// Its own size in bytes.
     pub size: u64,
+    /// The archive holds this member and no other entry, as its pin.sh found when it pinned the archive
+    /// (agy's: kiln plan 01a1ce705e55753182217afdfe607de9, step 3). Every entry is then read, and any
+    /// other refuses the archive. Without it, the entries beside the member are passed over unchecked:
+    /// the archives pi picks rg and fd from hold other files (step 27's contract).
+    pub alone: bool,
 }
 
 /// A whole archive, its first `strip` names dropped, renamed into place at the pin file's path (step
@@ -83,6 +89,7 @@ pub struct Fields {
     pub member: Option<String>,
     pub sha256: Option<String>,
     pub size: Option<u64>,
+    pub alone: Option<bool>,
     pub strip: Option<usize>,
     pub unpacked_bytes: Option<u64>,
     pub entries: Option<u64>,
@@ -95,7 +102,7 @@ impl TryFrom<Fields> for Spec {
         if f.format != "tar.gz" {
             return Err(Why::Format(f.format));
         }
-        let member = f.member.is_some() || f.sha256.is_some() || f.size.is_some();
+        let member = f.member.is_some() || f.sha256.is_some() || f.size.is_some() || f.alone.is_some();
         let tree = f.strip.is_some() || f.unpacked_bytes.is_some() || f.entries.is_some();
         match (member, tree) {
             (true, true) => Err(Why::Both),
@@ -104,6 +111,7 @@ impl TryFrom<Fields> for Spec {
                 member: f.member.ok_or(Why::Lacks("member"))?,
                 sha256: f.sha256.ok_or(Why::Lacks("sha256"))?,
                 size: f.size.ok_or(Why::Lacks("size"))?,
+                alone: f.alone.unwrap_or(false),
             })),
             (false, true) => Ok(Spec::Tree(Tree {
                 strip: f.strip.ok_or(Why::Lacks("strip"))?,
@@ -166,6 +174,9 @@ pub enum Why {
     /// No entry is the member the pin names.
     #[error("the archive holds no such member")]
     Missing,
+    /// An entry beside the member the pin says the archive holds alone.
+    #[error("an entry beside {member}, which the pin says the archive holds alone")]
+    Extra { member: String },
     /// A member whose size isn't the pin's.
     #[error("{got} bytes, where the pin says {expected}")]
     Size { expected: u64, got: u64 },
@@ -183,8 +194,8 @@ pub enum Why {
     /// A `format` other than `tar.gz`.
     #[error("format {0:?}: only tar.gz unpacks")]
     Format(String),
-    /// A member's fields beside a tree's (`member`, `sha256` or `size` with `strip`, `unpacked_bytes`
-    /// or `entries`), which take different things.
+    /// A member's fields beside a tree's (`member`, `sha256`, `size` or `alone` with `strip`,
+    /// `unpacked_bytes` or `entries`), which take different things.
     #[error("a member's fields and a tree's together")]
     Both,
     /// Neither a member's fields nor a tree's.
@@ -218,7 +229,7 @@ fn io_fault(e: io::Error) -> Fault {
 ///   directory renamed into place once the whole archive is in, its totals are the pin's and its modes
 ///   are set. A target there already is refused.
 /// - a member as the file `path`, its parent directories made, with `mode` (the pin's), or else its
-///   own as a tree's entry gets it; no entry after it is read.
+///   own as a tree's entry gets it; no entry after it is read, unless the archive holds it alone.
 ///
 /// Nothing is ever overwritten. The archive is removed either way, and on failure so is what this made.
 pub fn tar_gz(archive: &Path, url: &str, spec: &Spec, root: &Path, path: &Path, mode: Option<u32>) -> Result<(), Unpack> {
@@ -450,25 +461,75 @@ fn discard(staging: &Path) {
 }
 
 /// The regular file at `member.member` in the archive, written as `root/to` with `mode`, or else its
-/// own as [`kept`] gives a tree's entry its mode, and held to its pinned size and SHA-256; every entry
-/// before it passed over unchecked, and none after it read.
+/// own as [`kept`] gives a tree's entry its mode, and held to its pinned size and SHA-256. Every entry
+/// before it is passed over unchecked and none after it read, unless the archive holds it alone: then
+/// every entry is read, and any other refuses the archive (see [`pick`]). On failure nothing written for
+/// it is left: neither its file nor a directory made for it.
 fn one(archive: &Path, member: &Member, mode: Option<u32>, root: &Path, to: &Path) -> Result<(), Fault> {
     let path = Path::new(&member.member);
-    let shown = member.member.clone();
     if escapes(path) || names(path).next().is_none() || to.as_os_str().is_empty() {
-        return Err((Some(shown), Why::Escapes));
+        return Err((Some(member.member.clone()), Why::Escapes));
     }
     if let Some(mode) = mode {
-        special(mode).map_err(|why| (Some(shown.clone()), why))?;
+        special(mode).map_err(|why| (Some(member.member.clone()), why))?;
     }
+    let mut made = Vec::new();
+    let done = pick(archive, member, mode, root, to, &mut made);
+    if done.is_err() {
+        // Best effort, as in `tar_gz`: the file first, then its directories, deepest first.
+        for p in made.iter().rev() {
+            let _ = if p.is_dir() { fs::remove_dir(p) } else { fs::remove_file(p) };
+        }
+    }
+    done
+}
+
+/// Where [`pick`]'s pass over an archive its member is held alone in stands.
+enum Pass {
+    /// Neither the member nor anything beside it yet.
+    Nothing,
+    /// An entry beside the member, the first, and no member yet: an extra once the member comes, else
+    /// the member is missing.
+    Beside(String),
+    /// The member, written.
+    Picked,
+}
+
+/// [`one`]'s pass over the archive, listing in `made` what it writes: the member's directories as they're
+/// made, shallowest first, then its file. In an archive the pin says holds the member alone, an entry
+/// beside it is refused at once as what it is where that's hostile (an escaping path, a link, a device, a
+/// set-ID bit), and otherwise as [`Why::Extra`] once the member is known to be in: as the member comes,
+/// before a byte of it is written, for one before it; at the entry, for one after it. An archive without
+/// the member is [`Why::Missing`], whatever else it holds.
+fn pick(archive: &Path, member: &Member, mode: Option<u32>, root: &Path, to: &Path, made: &mut Vec<PathBuf>) -> Result<(), Fault> {
+    let path = Path::new(&member.member);
+    let at = |why: Why| (Some(member.member.clone()), why);
+    let extra = |name: String| (Some(name), Why::Extra { member: member.member.clone() });
     let mut tar = open(archive)?;
+    let mut pass = Pass::Nothing;
     for entry in tar.entries().map_err(io_fault)? {
         let mut entry = entry.map_err(io_fault)?;
         let kind = kind(&entry);
-        if meta(kind) || !same(&entry.path().map_err(io_fault)?, path) {
+        if meta(kind) {
             continue;
         }
-        let at = |why: Why| (Some(shown.clone()), why);
+        if !same(&entry.path().map_err(io_fault)?, path) {
+            if member.alone {
+                let name = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+                hostile(&entry, kind).map_err(|why| (Some(name.clone()), why))?;
+                match pass {
+                    Pass::Nothing => pass = Pass::Beside(name),
+                    Pass::Beside(_) => {}
+                    Pass::Picked => return Err(extra(name)),
+                }
+            }
+            continue;
+        }
+        match std::mem::replace(&mut pass, Pass::Nothing) {
+            Pass::Nothing => {}
+            Pass::Beside(name) => return Err(extra(name)),
+            Pass::Picked => return Err(at(Why::Duplicate)),
+        }
         if kind.is_dir() {
             return Err(at(Why::Kind(kind.as_byte())));
         }
@@ -481,18 +542,28 @@ fn one(archive: &Path, member: &Member, mode: Option<u32>, root: &Path, to: &Pat
             Some(mode) => mode,
             None => kept(entry.header().mode().map_err(|e| at(Why::Io(e)))?),
         };
+        parents(root, to, made).map_err(|e| at(Why::Io(e)))?;
         let file = root.join(to);
-        let mut made = Vec::new();
-        let wrote = parents(root, to, &mut made).map_err(Why::Io).and_then(|()| copy(&mut entry, &file, to, Some(member.sha256.as_str()), mode));
-        if wrote.is_err() {
-            // Best effort, as in `tar_gz`: no directory made for the member is left.
-            for d in made.iter().rev() {
-                let _ = fs::remove_dir(d);
-            }
+        copy(&mut entry, &file, to, Some(member.sha256.as_str()), mode).map_err(at)?;
+        made.push(file);
+        if !member.alone {
+            return Ok(());
         }
-        return wrote.map_err(at);
+        pass = Pass::Picked;
     }
-    Err((Some(shown), Why::Missing))
+    match pass {
+        Pass::Picked => Ok(()),
+        Pass::Nothing | Pass::Beside(_) => Err(at(Why::Missing)),
+    }
+}
+
+/// Refused if `entry`, beside a member its archive holds alone, is hostile as a tree's entry would be:
+/// an absolute or climbing path, or anything [`writable`] refuses.
+fn hostile<R: io::Read>(entry: &Entry<'_, R>, kind: EntryType) -> Result<(), Why> {
+    if escapes(&entry.path()?) {
+        return Err(Why::Escapes);
+    }
+    writable(entry, kind)
 }
 
 /// `root` and `to`'s parent directories under it, made where they aren't there, with 0755; each one

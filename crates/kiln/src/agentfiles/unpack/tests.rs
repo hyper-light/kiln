@@ -105,7 +105,7 @@ fn tree(strip: usize, t: Totals) -> Spec {
 }
 
 fn member(path: &str, data: &[u8]) -> Spec {
-    Spec::Member(Member { member: path.to_owned(), sha256: hex::encode(Sha256::digest(data)), size: data.len() as u64 })
+    Spec::Member(Member { member: path.to_owned(), sha256: hex::encode(Sha256::digest(data)), size: data.len() as u64, alone: false })
 }
 
 /// A context directory as the fetcher has it when an archive unpacks: the verified archive in it, the
@@ -522,8 +522,8 @@ fn a_member_is_one_regular_file_held_to_its_pin() -> anyhow::Result<()> {
     type Is = fn(&Why) -> bool;
     let rg = b"rg\n";
     let pinned = |path: &str| member(path, rg);
-    let other_size = Spec::Member(Member { member: "top/rg".into(), sha256: hex::encode(Sha256::digest(rg)), size: 4 });
-    let other_digest = Spec::Member(Member { member: "top/rg".into(), sha256: hex::encode(Sha256::digest(b"rh\n")), size: 3 });
+    let other_size = Spec::Member(Member { member: "top/rg".into(), sha256: hex::encode(Sha256::digest(rg)), size: 4, alone: false });
+    let other_digest = Spec::Member(Member { member: "top/rg".into(), sha256: hex::encode(Sha256::digest(b"rh\n")), size: 3, alone: false });
     let cases: [(Spec, Option<u32>, &str, Is); 9] = [
         (pinned("top/missing"), None, "top/missing", |w| matches!(w, Why::Missing)),
         (pinned("top/link"), None, "top/link", |w| matches!(w, Why::Link)),
@@ -565,7 +565,7 @@ fn the_unpack_object_is_one_form_or_refused() -> anyhow::Result<()> {
     let cursor: Spec = serde_json::from_str(r#"{"format": "tar.gz", "strip": 1, "unpacked_bytes": 2048, "entries": 3}"#)?;
     assert_eq!(cursor, Spec::Tree(Tree { strip: 1, unpacked_bytes: 2048, entries: 3 }));
     let agy: Spec = serde_json::from_str(r#"{"format": "tar.gz", "member": "antigravity", "sha256": "00ff", "size": 7}"#)?;
-    assert_eq!(agy, Spec::Member(Member { member: "antigravity".into(), sha256: "00ff".into(), size: 7 }));
+    assert_eq!(agy, Spec::Member(Member { member: "antigravity".into(), sha256: "00ff".into(), size: 7, alone: false }));
 
     type Is = fn(&Why) -> bool;
     let refused: [(&str, Is); 7] = [
@@ -700,5 +700,152 @@ fn a_directory_its_owner_may_not_search_is_kept_and_still_discarded_whole() -> a
     fs::set_permissions(staging.join("closed"), fs::Permissions::from_mode(0o644))?;
     super::discard(&staging);
     assert!(!staging.exists());
+    Ok(())
+}
+
+/// agy's member: the archive's one entry, the binary it's written as bin/agy from (kiln plan
+/// 01a1ce705e55753182217afdfe607de9, step 3).
+const AGY: &[u8] = b"#!/bin/sh\necho 1.5.7\n";
+
+/// A member its pin says the archive holds alone, as agy's pin.sh found it at pin time.
+fn alone(path: &str, data: &[u8]) -> Spec {
+    Spec::Member(Member { member: path.to_owned(), sha256: hex::encode(Sha256::digest(data)), size: data.len() as u64, alone: true })
+}
+
+/// agy's shape (its pin.sh found one entry, the regular file antigravity): a member held alone becomes
+/// bin/agy with the pin's mode, whatever the archive's, and nothing else is written; the archive goes.
+#[test]
+fn a_member_held_alone_unpacks_as_its_file_and_nothing_else() -> anyhow::Result<()> {
+    let c = context()?;
+    archive(&c.gz, |w| w.file("antigravity", 0o644, AGY))?;
+
+    tar_gz(&c.gz, URL, &alone("antigravity", AGY), &c.arch, Path::new("bin/agy"), Some(0o755))?;
+
+    assert_eq!(walk(&c.arch)?, tree_of(&[("bin", true, 0o755), ("bin/agy", false, 0o755)]));
+    assert_eq!(fs::read(c.arch.join("bin/agy"))?, AGY);
+    assert_eq!(names(&c.root)?, set(&["cursor-amd64"]), "the archive is removed");
+    Ok(())
+}
+
+/// Any entry beside a member its archive holds alone refuses the archive, named, wherever it comes:
+/// before the member (refused as the member comes, before a byte of it is written) or after it (its
+/// file and bin/ removed). A hostile one is refused as what it is (a climbing or absolute path, a link,
+/// a device, a set-ID file), the rest as Extra naming the member; the member twice is Duplicate, and an
+/// archive without the member is Missing whatever else it holds. Each refusal names the URL and leaves
+/// nothing: no per-arch directory, no bin/agy in part, no archive.
+#[test]
+fn an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing() -> anyhow::Result<()> {
+    type Is = fn(&Why) -> bool;
+    type Writes = fn(&mut Writer) -> io::Result<()>;
+    fn extra(w: &Why) -> bool {
+        matches!(w, Why::Extra { member } if member == "antigravity")
+    }
+    let cases: [(&str, Writes, &str, Is); 14] = [
+        ("a file after it", |w| { w.file("antigravity", 0o755, AGY)?; w.file("README.md", 0o644, b"# agy\n") }, "README.md", extra),
+        ("a file before it", |w| { w.file("README.md", 0o644, b"# agy\n")?; w.file("antigravity", 0o755, AGY) }, "README.md", extra),
+        ("a directory", |w| { w.dir("./", 0o755)?; w.file("antigravity", 0o755, AGY) }, "./", extra),
+        ("a climbing path after it", |w| { w.file("antigravity", 0o755, AGY)?; w.file("../antigravity", 0o755, AGY) }, "../antigravity", |w| matches!(w, Why::Escapes)),
+        ("only a climbing path", |w| w.file("../antigravity", 0o755, AGY), "../antigravity", |w| matches!(w, Why::Escapes)),
+        ("an absolute path", |w| { w.file("antigravity", 0o755, AGY)?; w.add(b"/etc/agy", EntryType::Regular, 0o644, b"x\n", None) }, "/etc/agy", |w| matches!(w, Why::Escapes)),
+        ("a symlink", |w| { w.file("antigravity", 0o755, AGY)?; w.add(b"agy", EntryType::Symlink, 0o777, b"", Some("antigravity")) }, "agy", |w| matches!(w, Why::Link)),
+        ("a hard link", |w| { w.file("antigravity", 0o755, AGY)?; w.add(b"agy", EntryType::Link, 0o755, b"", Some("antigravity")) }, "agy", |w| matches!(w, Why::Link)),
+        ("a device", |w| { w.file("antigravity", 0o755, AGY)?; w.add(b"null", EntryType::Char, 0o666, b"", None) }, "null", |w| matches!(w, Why::Device)),
+        ("a set-ID file", |w| { w.file("antigravity", 0o755, AGY)?; w.file("helper", 0o4755, b"x\n") }, "helper", |w| matches!(w, Why::SetId)),
+        ("the member twice", |w| { w.file("antigravity", 0o755, AGY)?; w.file("./antigravity", 0o755, AGY) }, "antigravity", |w| matches!(w, Why::Duplicate)),
+        ("the member a symlink", |w| w.add(b"antigravity", EntryType::Symlink, 0o777, b"", Some("/bin/sh")), "antigravity", |w| matches!(w, Why::Link)),
+        ("another file, no member", |w| w.file("agy", 0o755, AGY), "antigravity", |w| matches!(w, Why::Missing)),
+        ("no entry at all", |_| Ok(()), "antigravity", |w| matches!(w, Why::Missing)),
+    ];
+    for (what, writes, shown, is) in cases {
+        let c = context()?;
+        archive(&c.gz, writes)?;
+
+        let Err(Unpack { url, entry, why }) = tar_gz(&c.gz, URL, &alone("antigravity", AGY), &c.arch, Path::new("bin/agy"), Some(0o755)) else {
+            anyhow::bail!("{what}: unpacked, not refused");
+        };
+
+        assert_eq!((url.as_str(), entry.as_deref()), (URL, Some(shown)), "{what}");
+        assert!(is(&why), "{what}: {why:?}");
+        assert_eq!(names(&c.root)?, set(&[]), "{what}: nothing is left");
+    }
+    Ok(())
+}
+
+/// A member held alone is still held to its own pin: another size is refused before a byte is written,
+/// another digest once it's streamed, each naming the member with both values, and nothing is left.
+#[test]
+fn a_member_held_alone_is_held_to_its_size_and_digest() -> anyhow::Result<()> {
+    let (digest, other) = (hex::encode(Sha256::digest(AGY)), hex::encode(Sha256::digest(b"not agy\n")));
+    let size = AGY.len() as u64;
+    let smaller = Spec::Member(Member { member: "antigravity".into(), sha256: digest.clone(), size: size - 1, alone: true });
+    let elsewise = Spec::Member(Member { member: "antigravity".into(), sha256: other.clone(), size, alone: true });
+    for (asked, what) in [(smaller, "larger than pinned"), (elsewise, "another digest")] {
+        let c = context()?;
+        archive(&c.gz, |w| w.file("antigravity", 0o755, AGY))?;
+        let Err(Unpack { entry, why, .. }) = tar_gz(&c.gz, URL, &asked, &c.arch, Path::new("bin/agy"), Some(0o755)) else {
+            anyhow::bail!("{what}: unpacked, not refused");
+        };
+        assert_eq!(entry.as_deref(), Some("antigravity"), "{what}");
+        let fits = match (&why, what) {
+            (Why::Size { expected, got }, "larger than pinned") => (*expected, *got) == (size - 1, size),
+            (Why::Digest { expected, got }, "another digest") => *expected == other && *got == digest,
+            _ => false,
+        };
+        assert!(fits, "{what}: {why:?}");
+        assert_eq!(names(&c.root)?, set(&[]), "{what}: nothing is left");
+    }
+    Ok(())
+}
+
+/// Without `alone` a member's archive may hold anything it never writes (step 27's contract: pi's rg and
+/// fd come from archives holding other files): an archive that refuses agy's member held alone, with a
+/// file, a climbing path, a link and a set-ID file beside it, gives the same member at once.
+#[test]
+fn a_member_not_held_alone_passes_over_what_is_beside_it() -> anyhow::Result<()> {
+    let c = context()?;
+    archive(&c.gz, |w| {
+        w.file("README.md", 0o644, b"# agy\n")?;
+        w.file("../antigravity", 0o755, b"elsewhere\n")?;
+        w.add(b"agy", EntryType::Symlink, 0o777, b"", Some("antigravity"))?;
+        w.file("antigravity", 0o755, AGY)?;
+        w.file("helper", 0o4755, b"x\n")
+    })?;
+    let refused = c.root.join(".alone.part");
+    fs::copy(&c.gz, &refused)?;
+
+    // Held alone, the climbing path refuses it at once, before the member comes.
+    let Err(Unpack { entry, why: Why::Escapes, .. }) = tar_gz(&refused, URL, &alone("antigravity", AGY), &c.arch, Path::new("bin/agy"), Some(0o755)) else {
+        anyhow::bail!("held alone, it wasn't refused at its climbing path");
+    };
+    assert_eq!(entry.as_deref(), Some("../antigravity"));
+    assert_eq!(names(&c.root)?, set(&[".cursor-amd64.part"]));
+    tar_gz(&c.gz, URL, &member("antigravity", AGY), &c.arch, Path::new("bin/agy"), Some(0o755))?;
+
+    assert_eq!(walk(&c.arch)?, tree_of(&[("bin", true, 0o755), ("bin/agy", false, 0o755)]));
+    assert_eq!(fs::read(c.arch.join("bin/agy"))?, AGY);
+    Ok(())
+}
+
+/// `alone` is a member's field: with the member's three it parses (left out, the member isn't held
+/// alone), beside a tree's fields it's Both, given alone it lacks the member's, and it's a bool.
+#[test]
+fn alone_is_a_members_field() -> anyhow::Result<()> {
+    let agy: Spec = serde_json::from_str(r#"{"format": "tar.gz", "member": "antigravity", "alone": true, "sha256": "00ff", "size": 7}"#)?;
+    assert_eq!(agy, Spec::Member(Member { member: "antigravity".into(), sha256: "00ff".into(), size: 7, alone: true }));
+    let pi: Spec = serde_json::from_str(r#"{"format": "tar.gz", "member": "rg", "sha256": "00ff", "size": 7}"#)?;
+    assert_eq!(pi, Spec::Member(Member { member: "rg".into(), sha256: "00ff".into(), size: 7, alone: false }));
+
+    type Is = fn(&Why) -> bool;
+    let refused: [(&str, Is); 2] = [
+        (r#"{"format": "tar.gz", "alone": true, "strip": 1, "unpacked_bytes": 1, "entries": 1}"#, |w| matches!(w, Why::Both)),
+        (r#"{"format": "tar.gz", "alone": true}"#, |w| matches!(w, Why::Lacks("member"))),
+    ];
+    for (json, is) in refused {
+        let Err(why) = Spec::try_from(serde_json::from_str::<Fields>(json)?) else {
+            anyhow::bail!("{json}: taken, not refused");
+        };
+        assert!(is(&why), "{json}: {why:?}");
+    }
+    assert!(serde_json::from_str::<Spec>(r#"{"format": "tar.gz", "member": "antigravity", "alone": "yes", "sha256": "00", "size": 1}"#).is_err());
     Ok(())
 }
