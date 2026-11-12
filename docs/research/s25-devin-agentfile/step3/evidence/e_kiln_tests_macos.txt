@@ -1,0 +1,92 @@
+[2m[kiln] on d1323898b255a3ed435eb83fa0f7b0cf · macos/aarch64 · 28 of 32 cores idle · 59 GB free · room for 12 CPUs, 32 GiB of memory[0m
+host Adas-Mac-Studio.local Darwin 25.4.0 arm64 at 2026-11-12T13:58:32Z, KILN_NEEDS=macos,cpus=12,mem=32g
+.dockerignore: OK
+.kiln/images/harness-devin/Agentfile: OK
+.kiln/images/harness-devin/harness.json: OK
+.kiln/images/harness-devin/pin-tests.sh: OK
+.kiln/images/harness-devin/pin.json: OK
+.kiln/images/harness-devin/pin.sh: OK
+Dockerfile: OK
+crates/kiln/src/agentfiles/builtin.rs: OK
+crates/kiln/tests/agentfiles.rs: OK
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)
+== unit: cargo test -j 12 -p kiln --lib agentfiles::
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+warning: `kiln` (lib test) generated 1 warning
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 4305 filtered out; finished in 0.78s
+unit: exit 0 in 393 s
+test agentfiles::builtin::tests::every_builtin_is_a_valid_agentfile_once ... ok
+test agentfiles::builtin::tests::devins_agentfile_is_the_layouts ... ok
+test agentfiles::builtin::tests::devins_harness_json_starts_it_as_kiln_does ... ok
+test agentfiles::builtin::tests::devins_pin_is_cognitions_two_linux_bundles ... ok
+test agentfiles::builtin::tests::the_server_image_copies_every_path_a_row_includes ... ok
+test agentfiles::builtin::tests::no_builtin_carries_a_credential ... ok
+== integration: cargo test -j 12 -p kiln --test agentfiles
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+warning: `kiln` (bin "kiln") generated 1 warning
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.98s
+integration: exit 0 in 216 s
+test step30_agentfiles_on_every_surface ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.98s
+== clippy: cargo clippy -j 12 -p kiln --all-targets -- -D warnings
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+clippy: exit 0 in 194 s
+53c53
+<     Kind { id: "devin", name: "Devin", program: "devin", verified: true, protocol: Protocol::Acp(&["acp"]), screen: &["devin"], screen_takes_command: false },
+---
+>     Kind { id: "devin", name: "Devin", program: "devin", verified: true, protocol: Protocol::Acp(&["acp", "--stdio"]), screen: &["devin"], screen_takes_command: false },
+test agentfiles::builtin::tests::devins_harness_json_starts_it_as_kiln_does ... FAILED
+thread 'agentfiles::builtin::tests::devins_harness_json_starts_it_as_kiln_does' (28427280) panicked at crates/kiln/src/agentfiles/builtin.rs:213:9:
+assertion `left == right` failed
+  left: ["devin", "acp"]
+ right: ["devin", "acp", "--stdio"]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4328 filtered out; finished in 0.14s
+mutation kind-args: killed, devins_harness_json_starts_it_as_kiln_does FAILED (exit 101)
+48d47
+< COPY .kiln/images/ .kiln/images/
+test agentfiles::builtin::tests::the_server_image_copies_every_path_a_row_includes ... FAILED
+thread 'agentfiles::builtin::tests::the_server_image_copies_every_path_a_row_includes' (28429217) panicked at crates/kiln/src/agentfiles/builtin.rs:367:9:
+assertion `left == right` failed
+  left: ["the Dockerfile's build stage copies no directory holding .kiln/images/harness-devin/Agentfile", "the Dockerfile's build stage copies no directory holding .kiln/images/harness-devin/pin.json", "the Dockerfile's build stage copies no directory holding .kiln/images/harness-devin/harness.json"]
+ right: []
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4328 filtered out; finished in 0.14s
+mutation dockerfile-copy: killed, the_server_image_copies_every_path_a_row_includes FAILED (exit 101)
+40a41
+> ENV WINDSURF_API_KEY=x
+test agentfiles::builtin::tests::no_builtin_carries_a_credential ... FAILED
+thread 'agentfiles::builtin::tests::no_builtin_carries_a_credential' (28430121) panicked at crates/kiln/src/agentfiles/builtin.rs:287:13:
+assertion `left == right` failed: harness-devin
+  left: ["ENV WINDSURF_API_KEY is named like a credential", "WINDSURF_API_KEY in the Agentfile: ENV WINDSURF_API_KEY=x"]
+ right: []
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4328 filtered out; finished in 0.14s
+mutation agentfile-secret: killed, no_builtin_carries_a_credential FAILED (exit 101)
+.dockerignore: OK
+.kiln/images/harness-devin/Agentfile: OK
+.kiln/images/harness-devin/harness.json: OK
+.kiln/images/harness-devin/pin-tests.sh: OK
+.kiln/images/harness-devin/pin.json: OK
+.kiln/images/harness-devin/pin.sh: OK
+Dockerfile: OK
+crates/kiln/src/agentfiles/builtin.rs: OK
+crates/kiln/tests/agentfiles.rs: OK
+all passed, every mutation killed
+[2m[kiln] used memory not measured over 17 min 52 s; OOM kills not seen here[0m
+exit 0 (try 1)

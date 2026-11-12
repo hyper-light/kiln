@@ -1,0 +1,71 @@
+{
+  "policy_read": "POLICY_READ",
+  "read_at": "2026-11-12T10:22:10Z",
+  "agent": {
+    "harness": "claude",
+    "kiln_agent": "01a1cf40527c731c9107df5d9b744455",
+    "session": "01a1cf40-57e6-750d-990d-b82fbb51b1eb",
+    "role": "implementer",
+    "role_rule": "Shards R15: scoped implementation and light tests (unit tests of the agentfiles module, clippy on crates/kiln, shards' own check of the Agentfile); no audits, profiling, benchmarks or heavy E2E",
+    "coordinator": "01a1ce6f55c3749ca87f3ef3393ec8b0 (plan step 25's agent); ROOT 01a148884a4770fdaf0111f3f792a248"
+  },
+  "task": {
+    "plan": "01a1ce705e4d7008993f5c7291ef4476 (version 2)",
+    "research": "01a1ce705e4d70089c04cee721525c8f (basis f3, f5, f9, f10, f11, f12, f13, f14, f17, f18, f21, f25, f26)",
+    "step": "3 of 6: the Agentfile, harness.json and Devin's row in kiln",
+    "shared_layout": "step 19's plan 01a1cdf3cc7a70e4b3ca2ec610352383 (version 3), 'Shared layout for steps 20 to 28'"
+  },
+  "repositories": {
+    "shards": {
+      "read_from": "origin/main",
+      "revision": "ac87190d3ff78245e9fa9726c81a7392797bce30",
+      "policy_last_changed": "cbd39284937d024640c56db6f8d8ef2bd9b0ee24 (2026-11-10)",
+      "why_origin_main": "the session's shards checkout (g121, branch win-passthrough) is not current main; current policy is read from origin/main",
+      "files_sha256": {
+        "AGENTS.md": "f66d304c033ad4001d3d7347b67faa3bb3137d637860793e8e74f1eb6266db41",
+        "docs/development-rules.md": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+        "docs/development-evidence.md": "61613a244106d95b2759b38c8b6660ff29a616983e7afd6e9faabdc38368fb63",
+        "CLAUDE.md": "fd1076b256516e0edab1b3655421d37cd934e93a8232f0125b96abcfb99ece5f"
+      },
+      "rules": "R01-R16 and docs/development-evidence.md bind; equal to the hashes plan 01a1ce705e4d7008993f5c7291ef4476 records"
+    },
+    "kiln": {
+      "read_from": "origin/main",
+      "revision": "c09d232074950062b0a1b2e87ed373c4d02f9840 (step 30's merge, p/agentfile-store-v1)",
+      "files_sha256": {
+        "AGENTS.md": "16b05ef80db024a7b54b0e703d42c8cf5c1f330a626d6bd85ae4525609447a4c",
+        "CLAUDE.md": "336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49",
+        "docs/ci.md": "be867453ea3527c50e5a030c94f931ef9bffb80f8f58a868e98b0cb7b47a4baa"
+      },
+      "notes": "CLAUDE.md is @AGENTS.md; AGENTS.md binds docs/ci.md section 0.3, read in full. docs/ci.md differs from step 1's read (29e4b9a9...) only outside section 0 (W05/W13 virt.microvm, notification deliveries)"
+    }
+  },
+  "worktree": {
+    "path": "~/Projects/kiln/.claude/worktrees/s25-devin-row",
+    "branch": "s25-devin-row",
+    "base": "162f1f757ccaefd46f5b876fa7942f5ae092b15e (s25-devin-agentfile: step 1's pin), with kiln origin/main c09d232074950062b0a1b2e87ed373c4d02f9840 merged in for step 30's table",
+    "why_not_the_shared_worktree": "s25-devin-agentfile holds the coordinator's untracked evidence and is based on 1a5a5f00d, before step 30; this branch keeps step 1's commits, so s25-devin-agentfile can fast-forward to it"
+  },
+  "owned_paths": [
+    ".kiln/images/harness-devin/Agentfile",
+    ".kiln/images/harness-devin/harness.json",
+    "crates/kiln/src/agentfiles/builtin.rs (Devin's row, and Builtin's pin and files, which no harness step has landed yet)",
+    "Dockerfile (the build stage's COPY of .kiln/images/)",
+    "docs/research/s25-devin-agentfile/step3/"
+  ],
+  "read_only_paths": [
+    ".kiln/images/harness-devin/pin.json, pin.sh, pin-tests.sh (step 1's)",
+    "crates/kiln/src/agentfiles/unpack.rs (step 2's, branch s25-unpack)",
+    "docs/research/s25-devin-agentfile/evidence/, POLICY_READ.json, pin/ (the coordinator's and step 1's)"
+  ],
+  "constraints_acknowledged": [
+    "build and test only on Linux runners or a Mac Studio runner through kiln run --needs, never on this Mac",
+    "big files under the runner's ~/.cache; evidence kept in this worktree",
+    "no secret printed or committed; no tree-wide cargo fmt; stop only what I started",
+    "commits signed (this session's git signs through kiln-git-sign: x509, key kiln-agent), on named paths",
+    "typed errors, no panics in production code (tests may assert)",
+    "change only what the step asks; mention other improvements instead",
+    "research and unblock before asking the person",
+    "report the commit SHA and test results to the coordinator"
+  ]
+}

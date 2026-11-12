@@ -1,0 +1,60 @@
+# Goose 1.59.0 Linux archives: digests, attestations, contents and ELF needs, 2026-11-12T07:32:20Z, on Adas-MacBook-Pro-2.local (Darwin arm64); nothing here is run, only read
+# tools: gh version 2.98.0 (2026-08-20); Homebrew LLVM version 23.1.4; file file-5.41
+== x86_64-unknown-linux-musl
+ARCHIVE goose-x86_64-unknown-linux-musl.tar.gz sha256=6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31 size=50181341 release_digest=6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31 match=yes
+ATTEST exit=0
+ATTEST subject_digest_listed=1 predicateType=https://slsa.dev/provenance/v1
+ATTEST buildSignerURI=https://github.com/aaif-goose/goose/.github/workflows/release.yml@refs/tags/v1.59.0
+ATTEST sourceRepositoryRef=refs/tags/v1.59.0 sourceRepositoryDigest=5d03ef6ed07ba59826328f1aff18d9a754ff8ad2
+ATTEST issuer=https://token.actions.githubusercontent.com runnerEnvironment=github-hosted
+ATTEST_WRONG_REF(v1.58.1) exit=1 Error: expected SourceRepositoryRef to be refs/tags/v1.58.1, got refs/tags/v1.59.0
+TAR_LIST:
+  drwxr-xr-x  0 runner runner      0 Nov 10 08:40 ./
+  -rwxr-xr-x  0 runner runner 154218008 Nov 10 08:40 ./goose
+MEMBER goose sha256=461ea83fc8736fa0ad608661a8e5ef8c704da886d38500441ba2b91f7184d9f5 size=154218008
+FILE: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, BuildID[sha1]=25ffb7a165bb28a1367ea5137cd8bb68d280cb16, not stripped
+ELF_TYPE: DYN (Shared object file)
+NEEDED_COUNT: 0
+INTERP: none
+GLIBC_MAX: 
+== aarch64-unknown-linux-musl
+ARCHIVE goose-aarch64-unknown-linux-musl.tar.gz sha256=63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7 size=48814292 release_digest=63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7 match=yes
+ATTEST exit=0
+ATTEST subject_digest_listed=1 predicateType=https://slsa.dev/provenance/v1
+ATTEST buildSignerURI=https://github.com/aaif-goose/goose/.github/workflows/release.yml@refs/tags/v1.59.0
+ATTEST sourceRepositoryRef=refs/tags/v1.59.0 sourceRepositoryDigest=5d03ef6ed07ba59826328f1aff18d9a754ff8ad2
+ATTEST issuer=https://token.actions.githubusercontent.com runnerEnvironment=github-hosted
+ATTEST_WRONG_REF(v1.58.1) exit=1 Error: expected SourceRepositoryRef to be refs/tags/v1.58.1, got refs/tags/v1.59.0
+TAR_LIST:
+  drwxr-xr-x  0 runner runner      0 Nov 10 08:40 ./
+  -rwxr-xr-x  0 runner runner 148726128 Nov 10 08:40 ./goose
+MEMBER goose sha256=c27e6ea558a39a9af96dcc04368296ca636e40a67c96cdac56a6f644488fb673 size=148726128
+FILE: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, BuildID[sha1]=6d6d38f5b22f115c4136770613756d4f5e71d5f9, not stripped
+ELF_TYPE: EXEC (Executable file)
+NEEDED_COUNT: 0
+INTERP: none
+GLIBC_MAX: 
+== x86_64-unknown-linux-gnu
+ARCHIVE goose-x86_64-unknown-linux-gnu.tar.gz sha256=a774667de6c20206a60d78d7bece2d9dda8389667e4f5c2fc8aaa758d1e81ef3 size=62450309 release_digest=a774667de6c20206a60d78d7bece2d9dda8389667e4f5c2fc8aaa758d1e81ef3 match=yes
+ATTEST exit=0
+ATTEST subject_digest_listed=1 predicateType=https://slsa.dev/provenance/v1
+ATTEST buildSignerURI=https://github.com/aaif-goose/goose/.github/workflows/release.yml@refs/tags/v1.59.0
+ATTEST sourceRepositoryRef=refs/tags/v1.59.0 sourceRepositoryDigest=5d03ef6ed07ba59826328f1aff18d9a754ff8ad2
+ATTEST issuer=https://token.actions.githubusercontent.com runnerEnvironment=github-hosted
+ATTEST_WRONG_REF(v1.58.1) exit=1 Error: expected SourceRepositoryRef to be refs/tags/v1.58.1, got refs/tags/v1.59.0
+TAR_LIST:
+  drwxr-xr-x  0 root   root        0 Nov 10 08:59 ./
+  -rwxr-xr-x  0 root   root 208612352 Nov 10 08:59 ./goose
+MEMBER goose sha256=4ee4e39acff02e725e6959a71b5f4d91da9e8c0bd7b95bc2dce4a753abbecede size=208612352
+FILE: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=1d765989a472d93d0b33a6d07961e758c4b8dfc7, not stripped
+ELF_TYPE: DYN (Shared object file)
+NEEDED_COUNT: 7
+NEEDED: [libstdc++.so.6]
+NEEDED: [libgcc_s.so.1]
+NEEDED: [libpthread.so.0]
+NEEDED: [libm.so.6]
+NEEDED: [libdl.so.2]
+NEEDED: [libc.so.6]
+NEEDED: [ld-linux-x86-64.so.2]
+INTERP: interpreter: /lib64/ld-linux-x86-64.so.2
+GLIBC_MAX: GLIBC_2.28

@@ -1,0 +1,66 @@
+[2m[kiln] on 00aad8daff2fa3c9daa65d53c425d450 · linux/x86_64 · 15 of 32 cores idle · 45 GB free · memory pressure 2% · I/O pressure 0%[0m
+6cc832d0430eacd70cab76ec2d48772c18b137df8a47c659f87d5063dae7a9d9  Agentfile
+8529c5afebb4f52b4bdcd7016a70b624959c619c5238ef72a3f6cfa2023978eb  harness.json
+5a378fb22bedd031563fffef2e6c861c03ebe6e4ab1e2950543ef1ea9fb39dc6  pin.json
+shards version 0.7.0, build unknown-commit
+host adacachy2 Linux 7.3.3-1-cachyos x86_64 at 2026-11-12T13:58:38Z
+/home/adalundhe/.cache/s25-step3/dl/devin-3000.12.43-x86_64-unknown-linux.tar.gz: OK
+size 71424183 ok
+devin-amd64: 235 files, 17 dirs, 0 others
+/home/adalundhe/.cache/s25-step3/ctx/devin-amd64:
+total 4
+drwxr-xr-x 1 adalundhe adalundhe  10 Nov  9 11:20 bin
+-rw-r--r-- 1 adalundhe adalundhe 231 Nov 12 05:58 harness.json
+drwxr-xr-x 1 adalundhe adalundhe  16 Nov  9 11:20 share
+
+/home/adalundhe/.cache/s25-step3/ctx/devin-amd64/bin:
+total 204752
+-rwxr-xr-x 1 adalundhe adalundhe 209662952 Nov  9 11:20 devin
+/home/adalundhe/.cache/s25-step3/dl/devin-3000.12.43-aarch64-unknown-linux.tar.gz: OK
+size 67806876 ok
+devin-arm64: 235 files, 17 dirs, 0 others
+/home/adalundhe/.cache/s25-step3/ctx/devin-arm64:
+total 4
+drwxr-xr-x 1 adalundhe adalundhe  10 Nov  9 11:20 bin
+-rw-r--r-- 1 adalundhe adalundhe 231 Nov 12 05:58 harness.json
+drwxr-xr-x 1 adalundhe adalundhe  16 Nov  9 11:20 share
+
+/home/adalundhe/.cache/s25-step3/ctx/devin-arm64/bin:
+total 187468
+-rwxr-xr-x 1 adalundhe adalundhe 191963936 Nov  9 11:20 devin
+== static: shards build --call=check,format=json --progress=quiet --target kiln:static-check -f /home/adalundhe/.cache/s25-step3/ctx/Agentfile /home/adalundhe/.cache/s25-step3/ctx
+exit 1
+{"warnings":null,"sources":[{"filename":"Agentfile","language":"Agentfile"}],"buildError":{"message":"target stage \"kiln:static-check\" could not be found","location":{}}}
+stderr: ERROR: target stage "kiln:static-check" could not be found
+stderr: 
+== whole-amd64: shards build --call=check,format=json --progress=quiet --platform linux/amd64 -f /home/adalundhe/.cache/s25-step3/ctx/Agentfile /home/adalundhe/.cache/s25-step3/ctx
+exit 0
+{"warnings":null,"sources":[{"filename":"Agentfile","language":"Agentfile"}]}
+== whole-arm64: shards build --call=check,format=json --progress=quiet --platform linux/arm64 -f /home/adalundhe/.cache/s25-step3/ctx/Agentfile /home/adalundhe/.cache/s25-step3/ctx
+exit 0
+{"warnings":null,"sources":[{"filename":"Agentfile","language":"Agentfile"}]}
+35c35
+< CONNECT devin WITH devin ON provider
+---
+> CONNECT devin WITH devin ON nowhere
+== mutant-connect: shards build --call=check,format=json --progress=quiet --target kiln:static-check -f /home/adalundhe/.cache/s25-step3/mutants/Agentfile.connect /home/adalundhe/.cache/s25-step3/ctx
+exit 1
+{"warnings":null,"sources":[{"filename":"Agentfile.connect","language":"Agentfile"}],"buildError":{"message":"dockerfile parse error on line 35: CONNECT ... ON names network \"nowhere\", which no NETWORK of this stage's lineage declares","location":{"ranges":[{"start":{"line":35},"end":{"line":35}}]}}}
+stderr:   35 | >>> CONNECT devin WITH devin ON nowhere
+stderr:   36 |     
+stderr:   37 |     # The project, and the person's own Devin in its XDG directories under /home/devin, where
+stderr: --------------------
+stderr: 
+== mutant-secret: shards build --call=check,format=json --progress=quiet --platform linux/amd64 -f /home/adalundhe/.cache/s25-step3/mutants/Agentfile.secret /home/adalundhe/.cache/s25-step3/ctx
+exit 1
+{"warnings":[{"ruleName":"SecretsUsedInArgOrEnv","description":"Sensitive data should not be used in the ARG or ENV commands","url":"https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/","detail":"Do not use ARG or ENV instructions for sensitive data (ENV \"WINDSURF_API_KEY\")","location":{"ranges":[{"start":{"line":44},"end":{"line":44}}]}}],"sources":[{"filename":"Agentfile.secret","language":"Agentfile"}]}
+== mutant-harness-field: shards build --call=check,format=json --progress=quiet --platform linux/amd64 -f /home/adalundhe/.cache/s25-step3/mctx-field/Agentfile /home/adalundhe/.cache/s25-step3/mctx-field
+exit 0
+{"warnings":null,"sources":[{"filename":"Agentfile","language":"Agentfile"}]}
+the real context keeps devin-amd64/
+== mutant-no-dir: shards build --call=check,format=json --progress=quiet --platform linux/amd64 -f /home/adalundhe/.cache/s25-step3/mctx-nodir/Agentfile /home/adalundhe/.cache/s25-step3/mctx-nodir
+exit 0
+{"warnings":null,"sources":[{"filename":"Agentfile","language":"Agentfile"}]}
+context: 386M; store: 653M
+[2m[kiln] used memory not measured, 1 s of CPU (counted by the system, 1.061 CPUs on average) over 1 s; OOM kills not seen here[0m
+exit 0 (try 1)

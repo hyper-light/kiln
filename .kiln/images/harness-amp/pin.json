@@ -1,0 +1,90 @@
+{
+  "harness": "amp",
+  "version": "0.0.1794456033-gb2ff22",
+  "read_at": "2026-11-12T08:18:10Z",
+  "base": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+  "verified": {
+    "amp": {
+      "version": "0.0.1794456033-gb2ff22",
+      "same_origin": "https://static.ampcode.com/cli/0.0.1794456033-gb2ff22/<platform>-amp.sha256",
+      "npm": {
+        "keys": "https://registry.npmjs.org/-/npm/v1/keys",
+        "packages": [
+          {
+            "platform": "linux/amd64",
+            "package": "@ampcode/cli-linux-x64@0.0.1794456033-gb2ff22",
+            "integrity": "sha512-BorO4k3He0fZIuIkkQ27mjHfjQK+sZjHQTI9w8mNMw4628FDg5SL1docPR1G27xnHlle/ppJusTtmlA+TL2e1Q==",
+            "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"
+          },
+          {
+            "platform": "linux/arm64",
+            "package": "@ampcode/cli-linux-arm64@0.0.1794456033-gb2ff22",
+            "integrity": "sha512-FklT9pZfDoW1MFm4H2Z6ly4V3N/jXRWzkmhxyzfR42VEKm5JbjIEhMVUlT765UPd/NhD/X4sMeicRgj18VbncA==",
+            "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"
+          }
+        ]
+      }
+    },
+    "amp-acp": {
+      "version": "0.12.0",
+      "tag": "v0.12.0",
+      "github_release": "https://api.github.com/repos/tao12345666333/amp-acp/releases/tags/v0.12.0",
+      "registry": {
+        "commit": "655c3615c1352f2bebc754ad058478a2cf7b825e",
+        "entry": "https://raw.githubusercontent.com/agentclientprotocol/registry/655c3615c1352f2bebc754ad058478a2cf7b825e/amp-acp/agent.json",
+        "archives": [
+          {
+            "platform": "linux/amd64",
+            "url": "https://github.com/tao12345666333/amp-acp/releases/download/v0.12.0/amp-acp-linux-x86_64.tar.gz",
+            "sha256": "c25e3635159ee12f8a77bd775dd8a8fc21cc4d25a3a23483ffafec73ccb910fe"
+          },
+          {
+            "platform": "linux/arm64",
+            "url": "https://github.com/tao12345666333/amp-acp/releases/download/v0.12.0/amp-acp-linux-aarch64.tar.gz",
+            "sha256": "f75b1f4a2adc1c243601952070eb24bbcfecf328692f799815b59efeb9791528"
+          }
+        ]
+      }
+    }
+  },
+  "builds": [
+    {
+      "platform": "linux/amd64",
+      "files": [
+        {
+          "url": "https://static.ampcode.com/cli/0.0.1794456033-gb2ff22/amp-linux-x64",
+          "sha256": "8e7d7f19cb2321bba7821fe8d1869cbd071be403dffdb47875dfc23dd0487db2",
+          "size": 155723952,
+          "path": "bin/amp",
+          "mode": "0755"
+        },
+        {
+          "url": "https://github.com/tao12345666333/amp-acp/releases/download/v0.12.0/amp-acp-linux-x64",
+          "sha256": "aca36dcdde8de881f5ef203b666194d9e402509da8ca64d1b572bf05a31b5d50",
+          "size": 109684912,
+          "path": "bin/amp-acp",
+          "mode": "0755"
+        }
+      ]
+    },
+    {
+      "platform": "linux/arm64",
+      "files": [
+        {
+          "url": "https://static.ampcode.com/cli/0.0.1794456033-gb2ff22/amp-linux-arm64",
+          "sha256": "f11ba3e81b69089238de215509e0ff770a7188509efb19efe0623099f77c8be9",
+          "size": 155044856,
+          "path": "bin/amp",
+          "mode": "0755"
+        },
+        {
+          "url": "https://github.com/tao12345666333/amp-acp/releases/download/v0.12.0/amp-acp-linux-arm64",
+          "sha256": "ed0e3872e8a53c0a530d9f22fb7d6a0544a013adbd4f736b05398c5bd971909c",
+          "size": 109759480,
+          "path": "bin/amp-acp",
+          "mode": "0755"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+[2m[kiln] on 00aad8daff2fa3c9daa65d53c425d450 · linux/x86_64 · 15 of 32 cores idle · 45 GB free · memory pressure 2% · I/O pressure 0%[0m
+context:
+./.dockerignore
+./.kiln/images/harness-devin/Agentfile
+./.kiln/images/harness-devin/harness.json
+./.kiln/images/harness-devin/pin.json
+./.kiln/images/harness-devin/pin.sh
+./.kiln/images/harness-devin/pin-tests.sh
+./.kiln/images/harness-devin/x.log
+3a5d6a4700e3bcfe1f976cdcfee47114553569cb262a4cf75712c49137c0a411  .dockerignore
+docker 29.9.3
+buildkit: ERROR: BuildKit is enabled but the buildx component is missing or broken.
+buildkit:        Install the buildx component to build images with BuildKit:
+buildkit:        https://docs.docker.com/go/buildx/
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+built as s25-step3-context-check, exported, removed
+landed:
+./dev/console
+./.dockerenv
+./etc/hostname
+./etc/hosts
+./etc/resolv.conf
+./.kiln/images/harness-devin/Agentfile
+./.kiln/images/harness-devin/harness.json
+./.kiln/images/harness-devin/pin.json
+./.kiln/images/harness-devin/pin.sh
+./.kiln/images/harness-devin/pin-tests.sh
+Agentfile: as in the context
+harness.json: as in the context
+pin.json: as in the context
+pin.sh: as in the context
+pin-tests.sh: as in the context
+x.log: dropped by .dockerignore
+images of its name left: 0
+[2m[kiln] used memory not measured, 121 ms of CPU (counted by the system, 0.101 CPUs on average) over 1 s; OOM kills not seen here[0m
+exit 0 (try 1)
