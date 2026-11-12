@@ -97,16 +97,17 @@
 //! it.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_log::{Config as LogConfig, LogStats, Waits};
-use hyper_rt::combine::{Either3, race3};
+use hyper_rt::combine::{Either, Either3, race2, race3};
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::signal::Signal;
@@ -128,7 +129,8 @@ use crate::ask::{CommandOutcome, Wait};
 use crate::derive::{Device, Formatted, Measured, Stated, VolumeFacts};
 use crate::directory::Peer;
 use crate::history;
-use crate::layout::{Layout, LayoutError, Stopped};
+use crate::layout::{Layout, LayoutError, Live, Stopped};
+use crate::names::{Answered, Names};
 use crate::node::{
     GatewaySettings, Hosted, Link, Node, NodeError, NodeSettings, Status, Step, Wall,
 };
@@ -724,23 +726,115 @@ fn peers(lines: &Lines) -> Result<Vec<PeerLine>, ProcessError> {
     Ok(peers)
 }
 
+/// The peers' addresses as the node starts (node.md §1.7 step 5), and the peers its lines name by a
+/// host name, which the node looks up again as it runs (`crate::names`).
+pub struct Resolved {
+    /// Where each peer listens whose line names an address, or a name that resolved now.
+    pub addresses: Vec<(u64, SocketAddr, SocketAddr)>,
+    /// Each peer named by a host name: where its line says it listens and what its name gave now,
+    /// none where it did not resolve.
+    pub named: Vec<crate::names::Start>,
+    /// Why each name that did not resolve now did not, its peer and its endpoint, for the node to say.
+    pub unresolved: Vec<(u64, String, String)>,
+}
+
 /// Where each peer whose line names it listens, resolved now (node.md §1.7 step 5) through the
 /// platform's resolver, as hyper-rt's `dns::resolve` does (std's `ToSocketAddrs`: getaddrinfo on
 /// Unix, GetAddrInfoW on Windows): the first of a name's addresses in the family of the node's own
 /// socket, the only family that socket sends to. It runs before the node's runtime starts, so a
-/// lookup's wait holds no shard.
-pub fn resolve(config: &ProcessConfig) -> Result<Vec<(u64, SocketAddr, SocketAddr)>, ProcessError> {
-    let mut addresses = Vec::with_capacity(config.peers.len());
+/// lookup's wait holds no shard. An address of the other family stops the start, naming the peer;
+/// a name that does not resolve does not, since a name stands for whatever address its holder has
+/// now, and a Kubernetes pod not yet made again has none (research/78): the node looks it up again
+/// as it runs.
+pub fn resolve(config: &ProcessConfig) -> Result<Resolved, ProcessError> {
+    let mut resolved = Resolved {
+        addresses: Vec::with_capacity(config.peers.len()),
+        named: Vec::new(),
+        unresolved: Vec::new(),
+    };
     for peer in &config.peers {
-        if let Some((quic, plane)) = &peer.at {
-            addresses.push((
+        let Some((quic, plane)) = &peer.at else {
+            continue;
+        };
+        let is_address = |at: &Endpoint| at.host.parse::<std::net::IpAddr>().is_ok();
+        if is_address(quic) && is_address(plane) {
+            resolved.addresses.push((
                 peer.id,
                 lookup(peer.id, quic, config.quic)?,
                 lookup(peer.id, plane, config.plane)?,
             ));
+            continue;
+        }
+        let found = lookup(peer.id, quic, config.quic)
+            .and_then(|q| lookup(peer.id, plane, config.plane).map(|p| (q, p)));
+        match found {
+            Ok((q, p)) => {
+                resolved.addresses.push((peer.id, q, p));
+                resolved.named.push(crate::names::Start {
+                    id: peer.id,
+                    at: (quic.clone(), plane.clone()),
+                    known: Some((q, p)),
+                });
+            }
+            Err(e) => {
+                resolved.named.push(crate::names::Start {
+                    id: peer.id,
+                    at: (quic.clone(), plane.clone()),
+                    known: None,
+                });
+                let (at, why) = match e {
+                    ProcessError::Resolve(_, at, why) => (at, why),
+                    other => (quic.to_string(), other.to_string()),
+                };
+                resolved.unresolved.push((peer.id, at, why));
+            }
         }
     }
-    Ok(addresses)
+    Ok(resolved)
+}
+
+/// A named peer's lookup in flight ([`look_up_peer`]): its id and what its name gave.
+type Looking = Pin<Box<dyn Future<Output = (u64, Result<(SocketAddr, SocketAddr), String>)>>>;
+
+/// The first of `at`'s addresses in `own`'s family, asked of hyper-rt's resolver on the blocking
+/// pool, off the node's shards: how a running node looks up a named peer again (`crate::names`).
+async fn look_up(at: &Endpoint, own: SocketAddr) -> Result<SocketAddr, String> {
+    // Every address the platform's resolver gives, as [`lookup`] takes them.
+    let found = hyper_rt::dns::resolve(&at.host, at.port, usize::MAX)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    found
+        .into_iter()
+        .find(|address| address.is_ipv4() == own.is_ipv4())
+        .ok_or_else(|| {
+            let family = if own.is_ipv4() { "IPv4" } else { "IPv6" };
+            format!("no {family} address, the family the node binds")
+        })
+}
+
+/// A named peer's lookup, `wait` nanoseconds from now: its QUIC endpoint's address and its plane's,
+/// one lookup where both name one host.
+async fn look_up_peer(
+    id: u64,
+    (quic, plane): (Endpoint, Endpoint),
+    own: (SocketAddr, SocketAddr),
+    wait: u64,
+) -> (u64, Result<(SocketAddr, SocketAddr), String>) {
+    if wait > 0
+        && let Err(e) = hyper_rt::futures::sleep(wait).await
+    {
+        return (id, Err(format!("{e:?}")));
+    }
+    let q = match look_up(&quic, own.0).await {
+        Ok(q) => q,
+        Err(e) => return (id, Err(e)),
+    };
+    let p = if plane.host == quic.host && own.0.is_ipv4() == own.1.is_ipv4() {
+        Ok(SocketAddr::new(q.ip(), plane.port))
+    } else {
+        look_up(&plane, own.1).await
+    };
+    (id, p.map(|p| (q, p)))
 }
 
 /// The first of `at`'s addresses in `own`'s family.
@@ -1220,7 +1314,16 @@ fn run_node(
         keys,
     } = identity;
     let gateway = config.gateway.take().map(|g| gateway_settings(g, keys));
-    let addresses = resolve(&config).map_err(step(Step::Network))?;
+    let resolved = resolve(&config).map_err(step(Step::Network))?;
+    // A named peer is looked up again as the node runs, on hyper-rt's blocking pool, off its shards:
+    // one lookup at a time (`crate::names`), so one place and no line.
+    if !resolved.named.is_empty() {
+        hyper_rt::blocking::start(hyper_rt::blocking::Config {
+            workers: 1,
+            shares: vec![hyper_rt::blocking::Share::new(hyper_rt::dns::SHARE, 1)],
+        })
+        .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
+    }
     let runtime = runtime(&config, s3.is_some()).map_err(step(Step::Network))?;
     let mut rt = LocalRuntime::new(&runtime)
         .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
@@ -1230,7 +1333,7 @@ fn run_node(
             storage,
             gateway,
             (credentials, peers),
-            (addresses, s3),
+            (resolved, s3),
             (ends_with_input, at_once),
         ))
         .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
@@ -1538,19 +1641,20 @@ pub fn calibration(dir: &Path, budget: Duration) -> Result<Calibration, ProcessE
 }
 
 /// The timers the node's task holds at once, one for each sleep pending: its turn's wait, its
-/// transport driver's QUIC timer, and, once a stop is asked, the stop's bound (no task of the S3
-/// listener sleeps). A sleep that finds every timer taken waits for one to free (hyper-rt's
-/// `Counters::timer_waits`), and the release wakes the task, which ends the turn's wait at once
-/// (`Node::wait`: any wake ends it). Counted two, a stopping node turned without pause until it
-/// ended: 8,834 turns and 8,798 timer waits in a stop of 346 ms on macOS (diag/roll-stop-bound),
-/// a CPU spent for the whole stop.
+/// transport driver's QUIC timer, and, once a stop is asked, the stop's bound. A sleep that finds
+/// every timer taken waits for one to free (hyper-rt's `Counters::timer_waits`), and the release
+/// wakes the task, which ends the turn's wait at once (`Node::wait`: any wake ends it). Counted
+/// two, a stopping node turned without pause until it ended: 8,834 turns and 8,798 timer waits in
+/// a stop of 346 ms on macOS (diag/roll-stop-bound), a CPU spent for the whole stop. Each of the
+/// S3 listener's connection tasks holds one more while it waits on its client
+/// (`listener::TASKS`).
 const TIMERS: usize = 3;
 
 /// One shard, calibrated on this machine (hyper-rt `RuntimeConfig::from_calibration`), sized by
 /// what the node holds: its one task and the timers it holds at once ([`TIMERS`]), and a socket
 /// for its endpoint, each connection and its plane, each read and written; with an S3 listener, a
-/// task for each connection it holds at once, and a socket for the listener and each of those
-/// connections.
+/// task and a timer for each connection it holds at once, served or answered refused
+/// (`listener::TASKS`), and a socket for the listener and each of those connections.
 fn runtime(config: &ProcessConfig, s3: bool) -> Result<RuntimeConfig, ProcessError> {
     let calibration = calibration(&config.dir, config.probe_budget)?;
     let constants = calibration
@@ -1561,7 +1665,7 @@ fn runtime(config: &ProcessConfig, s3: bool) -> Result<RuntimeConfig, ProcessErr
         })
         .map_err(|unmet| ProcessError::Runtime(format!("{unmet:?}")))?;
     let connections = if s3 {
-        usize::try_from(crate::listener::CONNECTIONS)
+        usize::try_from(crate::listener::TASKS)
             .map_err(|_| ProcessError::Runtime("the S3 listener's connections".into()))?
     } else {
         0
@@ -1569,7 +1673,10 @@ fn runtime(config: &ProcessConfig, s3: bool) -> Result<RuntimeConfig, ProcessErr
     let tasks = connections
         .checked_add(1)
         .ok_or_else(|| ProcessError::Runtime("the node's tasks".into()))?;
-    let mut runtime = RuntimeConfig::from_calibration(&calibration, &constants, tasks, TIMERS);
+    let timers = TIMERS
+        .checked_add(connections)
+        .ok_or_else(|| ProcessError::Runtime("the node's timers".into()))?;
+    let mut runtime = RuntimeConfig::from_calibration(&calibration, &constants, tasks, timers);
     runtime.shards = 1;
     runtime.pin = false;
     runtime.cores.clear();
@@ -1625,9 +1732,14 @@ async fn serve(
     storage: Storage,
     gateway: Option<GatewaySettings>,
     (credentials, peers): (Credentials, Vec<Peer>),
-    (addresses, s3): (Vec<(u64, SocketAddr, SocketAddr)>, Option<S3Keys>),
+    (resolved, s3): (Resolved, Option<S3Keys>),
     (ends_with_input, at_once): (bool, SyncSender<Ended>),
 ) -> Result<(), ProcessError> {
+    let Resolved {
+        addresses,
+        named,
+        unresolved,
+    } = resolved;
     // This process's one shard runs the node's replicas, which apply through the engine's
     // synchronous calls (node.md §1.2).
     mantle_engine::store::permit_blocking();
@@ -1710,6 +1822,14 @@ async fn serve(
     let mut output = hyper_rt::stdio::stdout(1, chunk).map_err(|e| talk(format!("{e:?}")))?;
     let (quic, plane) = node.addresses()?;
     say(&mut output, &format!("bound {quic} {plane}\n")).await?;
+    // The peers named by a host name, looked up again as the node runs (`crate::names`): each name
+    // that did not resolve as the node started said, and asked again after a pause.
+    let bound_at = (quic, plane);
+    let mut names = Names::new(config.id, named, hyper_rt::futures::now_ns());
+    for (peer, at, why) in &unresolved {
+        say(&mut output, &format!("unresolved {peer} {at} {why}\n")).await?;
+    }
+    let mut looking: Option<Looking> = None;
     let listener = match s3 {
         Some(keys) => {
             let listener =
@@ -1744,6 +1864,9 @@ async fn serve(
     // laws, not a deadline of the node's, decide when.
     // The node's statements of its history to the root range, once enlisted (node.md §2.4, item 7).
     let mut living = Living::default();
+    // Whether the root range enlisted the node in this run, and the readiness lock a supervisor's
+    // check asks for (`mantle status`), held from then until the process ends.
+    let (mut enlisted, mut live): (bool, Option<Live>) = (false, None);
     let mut enlisting = match &config.enlist {
         Some(e) => {
             let enlist = Command::Root(root::Command::Enlist(Enlist {
@@ -1783,6 +1906,11 @@ async fn serve(
     // as `mantle serve` does under a service manager, whose input is empty.
     let mut input_open = true;
     loop {
+        if looking.is_none()
+            && let Some((peer, at, wait)) = names.next(hyper_rt::futures::now_ns())
+        {
+            looking = Some(Box::pin(look_up_peer(peer, at, bound_at, wait)));
+        }
         let ended = {
             let turn = pin!(node.turn());
             let line = pin!(async {
@@ -1802,7 +1930,18 @@ async fn serve(
                     None => std::future::pending().await,
                 }
             });
-            race3(turn, line, race3(signal, bound, accepting.as_mut())).await
+            let looked = pin!(async {
+                match looking.as_mut() {
+                    Some(lookup) => lookup.await,
+                    None => std::future::pending().await,
+                }
+            });
+            race3(
+                turn,
+                line,
+                race3(signal, bound, race2(accepting.as_mut(), looked)),
+            )
+            .await
         };
         match ended {
             Either3::First(turned) => turned?,
@@ -1847,8 +1986,27 @@ async fn serve(
                     return Err(ProcessError::Stopped(why));
                 }
             }
-            Either3::Third(Either3::Third(ended)) => {
+            Either3::Third(Either3::Third(Either::First(ended))) => {
                 return Err(ProcessError::Listener(ended.to_string()));
+            }
+            Either3::Third(Either3::Third(Either::Second((peer, found)))) => {
+                looking = None;
+                match names.answered(peer, found, hyper_rt::futures::now_ns()) {
+                    Answered::Moved(quic, plane) => {
+                        node.learn(peer, quic, plane)?;
+                        say(&mut output, &format!("resolved {peer} {quic} {plane}\n")).await?;
+                    }
+                    Answered::Same => {}
+                    Answered::Unresolved(why) => {
+                        let at = config
+                            .peers
+                            .iter()
+                            .find(|p| p.id == peer)
+                            .and_then(|p| p.at.as_ref())
+                            .map_or_else(String::new, |(quic, _)| quic.to_string());
+                        say(&mut output, &format!("unresolved {peer} {at} {why}\n")).await?;
+                    }
+                }
             }
         }
         // The node keeps what its ranges answered as they applied for a caller that proposed to
@@ -1862,6 +2020,10 @@ async fn serve(
             enlisting = None;
             match outcome {
                 CommandOutcome::Answered(Answer::Root(root::Outcome::Enlisted)) => {
+                    // Ready before it says so: a check asked once `enlisted` is said finds the
+                    // lock held.
+                    enlisted = true;
+                    live = layout.take_live().map_err(kept)?;
                     say(&mut output, "enlisted\n").await?;
                     if let Some(e) = &config.enlist {
                         living.state(&mut node, e.root, own, started_ns)?;
@@ -1869,6 +2031,11 @@ async fn serve(
                 }
                 other => return Err(ProcessError::Enlist(format!("{other:?}"))),
             }
+        }
+        // A readiness check holds the lock shared for the moment it looks: a take it refused is
+        // asked again at the next turn.
+        if enlisted && live.is_none() {
+            live = layout.take_live().map_err(kept)?;
         }
         if let Some(e) = &config.enlist {
             living.take(&mut node, e.root, own, started_ns)?;
@@ -1884,6 +2051,14 @@ async fn serve(
         for (at, now) in node.links().enumerate() {
             if links.get(at) == Some(&now) {
                 continue;
+            }
+            // A link to a named peer that ended: its name is looked up again (`crate::names`), as
+            // the pod behind it may have come back at another address.
+            let link_ended = links
+                .get(at)
+                .map_or(now.ended > 0, |was| now.ended > was.ended);
+            if link_ended && names.names(now.peer) {
+                names.ended(now.peer, hyper_rt::futures::now_ns());
             }
             let refusal = now
                 .refusal
