@@ -6,6 +6,10 @@
 
 pub use crate::os::proc::{Detached, Duplex, Running, adopt_duplex, interrupt_group, kill_orphan_group, output, spawn_duplex, spawn_duplex_in, spawn_group, stdout_stream, terminate_group, terminate_tree, wait_pid_exit};
 
+/// How long kiln waits for a program asked its version: a runner's tools (`runner::runtime::memo`)
+/// and an upgrade's new kiln (`agent`'s `binary_runs`).
+pub const VERSION_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// [`spawn_duplex_in`] on the blocking pool, never on a shard: joining a group can wait. A group
 /// headroom paces is frozen for part of each period, and so is a process that joins it between
 /// fork and exec, while `spawn` waits for that exec. On a shard the wait stops everything else the

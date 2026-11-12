@@ -36,6 +36,15 @@ focal-platform = { version = "0.1.0", path = "../focal-platform" }
 # The standalone mode's local identities (`pki`).
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "aws_lc_rs"] }
 
+[features]
+# A member's log on hyper-sim's block device (`Member::open_simulated`), for a simulation that
+# decides when each write reaches the device and what a crash leaves of it (Quiver's
+# docs/design/persisted-sim.md).
+sim = ["hyper-block/sim"]
+# A defect planted in a member's replica (`Member::plant`, `hyper_raft::Mutant`), for a test build
+# that shows a simulation catches it; no consumer enables it.
+mutants = ["hyper-durable/mutants", "hyper-raft/mutants"]
+
 [dev-dependencies]
 # A part's image written where each test's own directory is (`group`).
 tempfile.workspace = true

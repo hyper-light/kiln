@@ -331,6 +331,12 @@ fn p5_chat_slack_one_message_per_release_and_commands_as_their_person() -> anyho
     let said = slash("UADA", "ada", "deploy api 2.1.0 to production")?;
     assert!(said.contains("api 2.1.0 → production, waits for approval"), "{said}");
     let second = number_in(&said);
+    // Its message goes out from kiln.events (CP-T2.2 step 8), after the slash command's answer: grace
+    // rejects what #deploys shows her. Rejected first, its one message would be posted as cancelled.
+    until(&s, 30, "the second release's message in #deploys", || {
+        let posts: Vec<String> = seen(&got).into_iter().filter(|(m, p, _)| m == "POST" && p == "/slack/chat.postMessage").map(|(_, _, v)| str_at(&v, "/text").to_owned()).collect();
+        Ok((!posts.iter().any(|t| t.contains("api 2.1.0 → production waits for approval"))).then(|| format!("{posts:?}")))
+    })?;
     let said = slash("UGRACE", "grace", &format!("reject {second} not during the sale"))?;
     assert!(said.starts_with("You rejected it:") && said.contains("cancelled: rejected by user:grace: not during the sale"), "{said}");
     until(&s, 60, "the rejected release's message", || {

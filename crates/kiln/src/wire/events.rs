@@ -179,6 +179,10 @@ pub enum ServerEvent {
     /// 01a199e1b177752e84dad5dc990e6a15). After every tagged frame before it; a page from before it
     /// doesn't apply it.
     Attention { principal: String },
+    /// One of a person's Agentfiles was kept, changed or deleted (`crate::agentfiles`): to its owner's
+    /// sockets, and those of whoever reaches everyone's. After every tagged frame before it; a page from
+    /// before it doesn't apply it.
+    Agentfile(AgentfileChange),
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]
@@ -234,6 +238,22 @@ impl ServerEvent {
     pub fn value(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
     }
+}
+
+/// An Agentfile as it is after a change (`crate::agentfiles`): whose, which, its name and version, and
+/// whether it's gone. A page that shows it loads it again (`GET /api/agentfiles`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct AgentfileChange {
+    /// `owner`, or `user:<id>`: who hears it.
+    pub owner: String,
+    pub id: String,
+    pub name: String,
+    pub version: i64,
+    /// Deleted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+    pub deleted: bool,
 }
 
 /// The two frames tagged `queue`.
