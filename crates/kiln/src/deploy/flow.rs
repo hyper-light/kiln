@@ -109,9 +109,11 @@ fn tell(d: &Deploy, r: &Release, new: bool) {
         State::Cancelled => Some("release.cancelled"),
         _ => None,
     });
+    // Recorded, then taken from kiln.events by the notification rules' reader (crate::events):
+    // a release's messages are brought up to date however often it's told of a move.
     let (hub, id) = (Arc::clone(&d.hub), r.id);
     crate::rt::spawn(async move {
-        crate::ci::notify::release_moved(hub, id, events).await;
+        crate::events::say(&hub, json!({ "type": "release", "id": id, "events": events })).await;
     });
 }
 

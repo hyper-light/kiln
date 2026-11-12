@@ -21,6 +21,11 @@ pub trait TopicsFixture: Send + Sync {
     fn topics(&self) -> &dyn Topics;
     /// Whether the implementation serves topics of `class`.
     fn serves(&self, class: Class) -> bool;
+    /// The class the cases' topics take, one the implementation serves: each class it serves
+    /// passes the suite on its own (QUIVER-18 checks every class).
+    fn class(&self) -> Class {
+        Class::Ephemeral
+    }
 }
 
 /// The fixture for a [`SimTopics`]: it serves every class.
@@ -159,9 +164,9 @@ pub fn refused<T: std::fmt::Debug, E>(what: &str, v: Result<T, E>) -> Result<E, 
 
 const T: &str = "conformance";
 
-fn topic(retain_messages: u64) -> Topic {
+fn topic(class: Class, retain_messages: u64) -> Topic {
     Topic {
-        class: Class::Ephemeral,
+        class,
         retain_messages,
         retain_bytes: 1 << 20,
     }
@@ -249,7 +254,7 @@ impl Wake for Count {
 fn c1<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(100)).await)?;
+        fine("create", t.create(T, topic(f.class(), 100)).await)?;
         same(
             "the offsets given",
             publish_all(t, T, &["a", "b", "c"]).await?,
@@ -262,7 +267,7 @@ fn c1<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c2<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(100)).await)?;
+        fine("create", t.create(T, topic(f.class(), 100)).await)?;
         fine("publish", t.publish(T, Some(b"k1"), b"first").await)?;
         fine("publish", t.publish(T, None, b"second").await)?;
         let all = fine("read", t.read(T, 0, 10).await)?;
@@ -299,7 +304,7 @@ fn c2<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c3<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(100)).await)?;
+        fine("create", t.create(T, topic(f.class(), 100)).await)?;
         publish_all(t, T, &["x", "y"]).await?;
         let one = fine("a first reader", t.read(T, 0, 10).await)?;
         let two = fine("a second reader", t.read(T, 0, 10).await)?;
@@ -327,7 +332,7 @@ fn c3<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c4<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(2)).await)?;
+        fine("create", t.create(T, topic(f.class(), 2)).await)?;
         publish_all(t, T, &["a", "b", "c", "d"]).await?;
         same(
             "the bounds past retention",
@@ -348,7 +353,7 @@ fn c5<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
         let small = Topic {
-            class: Class::Ephemeral,
+            class: f.class(),
             retain_messages: 100,
             retain_bytes: 10,
         };
@@ -391,7 +396,7 @@ fn c5<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c6<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(100)).await)?;
+        fine("create", t.create(T, topic(f.class(), 100)).await)?;
         publish_all(t, T, &["a"]).await?;
         ensure(
             t.wait(T, 0).now_or_never().is_some_and(|r| r.is_ok()),
@@ -448,30 +453,33 @@ fn c7<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c8<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(10)).await)?;
-        fine("the same create again", t.create(T, topic(10)).await)?;
+        fine("create", t.create(T, topic(f.class(), 10)).await)?;
+        fine(
+            "the same create again",
+            t.create(T, topic(f.class(), 10)).await,
+        )?;
         same(
             "a create with other settings",
-            t.create(T, topic(11)).await,
+            t.create(T, topic(f.class(), 11)).await,
             Err(Refusal::Exists(T.into())),
         )?;
         ensure(
             matches!(
-                t.create("Not a name!", topic(10)).await,
+                t.create("Not a name!", topic(f.class(), 10)).await,
                 Err(Refusal::Invalid { .. })
             ),
             || "a bad topic name wasn't refused Invalid".into(),
         )?;
         ensure(
             matches!(
-                t.create("conformance-zero", topic(0)).await,
+                t.create("conformance-zero", topic(f.class(), 0)).await,
                 Err(Refusal::Invalid { .. })
             ),
             || "a retention of 0 messages wasn't refused Invalid".into(),
         )?;
         let no_bytes = Topic {
             retain_bytes: 0,
-            ..topic(10)
+            ..topic(f.class(), 10)
         };
         ensure(
             matches!(
@@ -480,7 +488,7 @@ fn c8<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
             ),
             || "a retention of 0 bytes wasn't refused Invalid".into(),
         )?;
-        let too_many = topic(crate::RETAIN_MESSAGES_MAX.saturating_add(1));
+        let too_many = topic(f.class(), crate::RETAIN_MESSAGES_MAX.saturating_add(1));
         ensure(
             matches!(
                 t.create("conformance-many", too_many).await,
@@ -500,12 +508,12 @@ fn c9<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
         let wide = Topic {
-            class: Class::Ephemeral,
+            class: f.class(),
             retain_messages: 10,
             retain_bytes: crate::RETAIN_BYTES_MAX,
         };
         fine("create", t.create(T, wide).await)?;
-        let big = vec![0; crate::PAYLOAD_MAX.saturating_add(1)];
+        let big = vec![0; f.class().payload_max().saturating_add(1)];
         let e = refused("a payload over the limit", t.publish(T, None, &big).await)?;
         ensure(
             matches!(
@@ -530,7 +538,7 @@ fn c9<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
             fine("bounds", t.bounds(T).await)?,
             (0, 0),
         )?;
-        let largest = vec![7; crate::PAYLOAD_MAX];
+        let largest = vec![7; f.class().payload_max()];
         same(
             "the largest payload",
             fine("publish", t.publish(T, None, &largest).await)?,
@@ -540,7 +548,7 @@ fn c9<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
         same(
             "the largest payload read back",
             read.messages.first().map(|m| m.payload.len()),
-            Some(crate::PAYLOAD_MAX),
+            Some(f.class().payload_max()),
         )
     })
 }
@@ -548,7 +556,7 @@ fn c9<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c10<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(100)).await)?;
+        fine("create", t.create(T, topic(f.class(), 100)).await)?;
         publish_all(t, T, &["a", "b", "c", "d", "e"]).await?;
         let first = fine("read", t.read(T, 0, 2).await)?;
         same(
@@ -590,8 +598,14 @@ fn c10<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c11<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create("conformance-one", topic(10)).await)?;
-        fine("create", t.create("conformance-two", topic(10)).await)?;
+        fine(
+            "create",
+            t.create("conformance-one", topic(f.class(), 10)).await,
+        )?;
+        fine(
+            "create",
+            t.create("conformance-two", topic(f.class(), 10)).await,
+        )?;
         publish_all(t, "conformance-one", &["only in one"]).await?;
         same(
             "the other topic",
@@ -620,7 +634,7 @@ fn c11<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c12<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(100)).await)?;
+        fine("create", t.create(T, topic(f.class(), 100)).await)?;
         publish_all(t, T, &["a", "b"]).await?;
         let mut s = fine("subscribe", t.subscribe(T, Start::Oldest).await)?;
         same(
@@ -646,7 +660,7 @@ fn c12<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c13<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(100)).await)?;
+        fine("create", t.create(T, topic(f.class(), 100)).await)?;
         publish_all(t, T, &["a", "b", "c"]).await?;
         let mut latest = fine(
             "subscribe at the latest",
@@ -669,7 +683,7 @@ fn c13<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c14<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(3)).await)?;
+        fine("create", t.create(T, topic(f.class(), 3)).await)?;
         let mut s = fine("subscribe", t.subscribe(T, Start::Oldest).await)?;
         publish_all(t, T, &["a", "b", "c", "d", "e", "f", "g"]).await?;
         same(
@@ -702,7 +716,7 @@ fn c14<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c15<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(4)).await)?;
+        fine("create", t.create(T, topic(f.class(), 4)).await)?;
         let mut stalled = fine(
             "subscribe the stalled one",
             t.subscribe(T, Start::Oldest).await,
@@ -743,7 +757,7 @@ fn c15<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c16<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(100)).await)?;
+        fine("create", t.create(T, topic(f.class(), 100)).await)?;
         let mut s = fine("subscribe", t.subscribe(T, Start::Latest).await)?;
         let count = Arc::new(Count::default());
         let waker = Waker::from(Arc::clone(&count));
@@ -786,7 +800,7 @@ fn c16<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c17<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(100)).await)?;
+        fine("create", t.create(T, topic(f.class(), 100)).await)?;
         publish_all(t, T, &["a", "b"]).await?;
         let mut s = fine("subscribe", t.subscribe(T, Start::Latest).await)?;
         let mut waiting = t.wait(T, 5);
@@ -814,7 +828,7 @@ fn c17<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
             t.read(T, 0, 1).await.map(|_| ()),
             Err(Refusal::NoTopic(T.into())),
         )?;
-        fine("create it again", t.create(T, topic(100)).await)?;
+        fine("create it again", t.create(T, topic(f.class(), 100)).await)?;
         same(
             "its offsets start again",
             publish_all(t, T, &["first again"]).await?,
@@ -836,7 +850,15 @@ fn c18<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
         })?;
         for class in Class::ALL {
             let name = format!("conformance-{}", class.name());
-            let created = t.create(&name, Topic { class, ..topic(10) }).await;
+            let created = t
+                .create(
+                    &name,
+                    Topic {
+                        class,
+                        ..topic(f.class(), 10)
+                    },
+                )
+                .await;
             if f.serves(class) {
                 fine(&format!("create a {} topic", class.name()), created)?;
                 same(
@@ -864,7 +886,7 @@ fn c18<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c19<F: TopicsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let t = f.topics();
-        fine("create", t.create(T, topic(100)).await)?;
+        fine("create", t.create(T, topic(f.class(), 100)).await)?;
         publish_all(t, T, &["a", "b", "c"]).await?;
         let read = fine("read", t.read(T, 0, 10).await)?;
         let stamps: Vec<u64> = read.messages.iter().map(|m| m.at_us).collect();

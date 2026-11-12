@@ -716,7 +716,7 @@ mod tests {
                     }
                 }
                 let out = self.leader.in_flight() + self.copies.values().map(Replica::in_flight).sum::<usize>();
-                if !moved && out == 0 {
+                if !moved && out == 0 && !self.leader.catching_up() {
                     return Ok(());
                 }
             }

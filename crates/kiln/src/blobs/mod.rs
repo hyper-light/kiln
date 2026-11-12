@@ -523,6 +523,7 @@ pub(crate) mod tests {
             crate::updates::binary_key("<target>"),
             crate::harness::streams::recording_key("session", "recording", "file"),
             crate::harness::archive::key("session", "source", 0, 9),
+            crate::agentfiles::key("<sha256>"),
         ];
         for k in families {
             let family = k.split('/').next().unwrap_or_default();

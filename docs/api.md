@@ -144,6 +144,55 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET | `/metrics` | Prometheus exposition |
 | GET | `/healthz`, `/readyz` | liveness / readiness |
 
+## Agentfiles
+
+An Agentfile is Shards' image of an agent's microVM: a Dockerfile's instructions, and `AGENT`,
+`HARNESS`, `SKILL`, `MCP`, `NETWORK`, `CONNECT`, `ATTACH` and `EXPOSE … FOR`. People keep their own
+in kiln, each with every version of its text (`crate::agentfiles`). The routes need `agents.run`; each
+keeps a person to their own, and answers 404 for another's. The server's owner, and whoever has
+`agentfiles.manage` (an admin), reach everyone's; an agent reaches those of the person it acts for.
+Each route is an operation too (`agentfiles.*`: `POST /api/ops/<name>`, kiln's MCP tools
+`agentfiles_*`, code mode's `kiln.agentfiles.*`), and each change is audited.
+
+Kept, a text is checked by Shards itself: the `shards` on the server's `PATH`, asked for its build
+check (`shards build --call=check,format=json`, BuildKit's lint subrequest as Shards ports it) with a
+target no stage can be named, so that its planning stops before it resolves any base: the text parsed,
+its instructions and directives read, its names and grants checked (`CONNECT`, `ATTACH`, `FOR`,
+`EXPOSE … FOR`), its stages linted. No base image is pulled and no registry is asked. A text Shards
+refuses isn't kept: 422, `Shards refuses this Agentfile: <Shards' words>`. Where the server has no
+`shards`, or it answers no check, the text is kept and `check` says why (`checked: false`).
+
+A text is kept in kiln's store of bytes (docs/blobs.md) at `agentfiles/sha256/<its SHA-256>`, once for
+every Agentfile and version that has it, whoever's; kiln.db keeps the records, each naming its text
+by that digest. The text is kept first and the record after it, so a store that can't keep a text
+leaves nothing that names it: 503, in the store's words, as when it can't give one back or gives back
+bytes that aren't the text its digest names. Deleting an Agentfile lets go of its texts that no other
+Agentfile or version names. Its types are generated from the server's (`ui/src/api/wire`):
+
+```ts
+interface Agentfile { id; owner /* "owner" | "user:<id>" */; name; text; version; created_at; updated_at }
+type AgentfileBrief = Omit<Agentfile, "text">;
+interface AgentfileVersion { version; text; at; by /* as the audit trail names them */ }
+interface AgentfileCheck { checked: boolean;
+  unchecked?: { reason: "no_shards" } | { reason: "timed_out" } | { reason: "failed"; status: number|null; said: string };
+  diagnostics: { code /* the rule, or "shards" for the error */; severity: "error"|"warning"; message; path: "Agentfile";
+    range: { start: { line; col }; end: { line; col } }; url?: string }[] }
+interface AgentfileSaved { agentfile: Agentfile; check: AgentfileCheck }
+interface AgentfileListing { agentfiles: AgentfileBrief[]; reaches_all: boolean /* may ask for `all` */; builtin: { name; harness; text }[];
+  project?: { repo; sha: string|null; agentfiles: { name; path; text: string|null }[] } }
+```
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET | `/api/agentfiles?repo=&all=` | `AgentfileListing`: yours, newest change first, without their texts; beside them, read only, those kiln ships per harness (`builtin`), and with `repo` (`owner/name`, a repository whose runs you read, else 404) its `.kiln/images/<name>/Agentfile` files at its default branch (`text` null past 2 MiB). `all=true`: everyone's (403 without `agentfiles.manage`) |
+| POST | `/api/agentfiles` | `{ name, text }` → `AgentfileSaved`, version 1. `name`: an image's (lowercase letters and digits joined by `.`, `_` or `-`, 255 at most), once among yours (409). `text`: 2 MiB at the most (400); Shards' refusal is 422 |
+| POST | `/api/agentfiles/check` | `{ text }` → `AgentfileCheck`: what keeping it would say, nothing kept (the editor's lint) |
+| GET | `/api/agentfiles/:id` | `Agentfile` |
+| PATCH | `/api/agentfiles/:id` | `{ name?, text? }` → `AgentfileSaved`: a new text is a new version (checked as above); a new name alone is none. 409 when another change came first, or the name is one of yours |
+| GET | `/api/agentfiles/:id/versions` | `{ versions: AgentfileVersion[] }`, newest first |
+| POST | `/api/agentfiles/:id/restore` | `{ version }` → `AgentfileSaved`: that version's text current again, as a new version |
+| DELETE | `/api/agentfiles/:id` | `{ deleted: true }`: it and its versions |
+
 ## WebSockets
 
 * `GET /api/events` — server → client JSON messages:
@@ -152,7 +201,9 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
   `{type:"join_requests"}` (a join request arrived, was confirmed or decided: refetch
   `/api/join-requests`), `{type:"discovery"}` (an instance appeared, changed or left: refetch
   `/api/discovery`), `{type:"front_door", runner}` (a runner's front-door settings or status
-  changed: refetch `/api/runners/:name/front-door`), `{type:"ship", repo, rows: [{ row, yours?,
+  changed: refetch `/api/runners/:name/front-door`), `{type:"agentfile", owner, id, name, version,
+  deleted?}` (one of a person's Agentfiles was kept, changed or deleted: to its owner, and whoever
+  reaches everyone's; refetch `/api/agentfiles`), `{type:"ship", repo, rows: [{ row, yours?,
   whose?, dv?, base?, parts?, items? }], gone?, pace?, whole?}` (ci.md W21-R15: a repository's Ship
   rows that changed in one refresh of Ship's read model, each once, as `GET /api/ship/commits`
   renders them, for everyone and for those whose turn it is; `dv` once someone read that commit's
