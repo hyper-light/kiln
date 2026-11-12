@@ -1744,3 +1744,38 @@ at 3%): the uncoded commit's median 182 to 208 ms where it now is 166 to 172 (16
 each datagram lost on its own, the coded commit's 90th percentile 187 to 193 ms where it now is 173
 to 180 (with §47's spans). Test:
 `congestion::bbr::tests::a_loss_holds_an_app_limited_sender_to_no_less_than_its_latest_round_delivered`.
+
+## 49. A stream's writes and a receiver's credit, recorded without allocating (2026-11-06, found by mantle)
+
+mantle's ledger of its native door (mantle `docs/research/80-the-doors-costs.md`, "The sites")
+counted, per native PUT of 8 MiB on its three servers, 1,745 allocations in `SendBuffer::write`,
+2,608 boxes made by `ThinRetransmits::get_or_create` for packets carrying MAX_DATA, and 2,629
+hash tables grown in `write_max_stream_data`, each made again for every write or packet:
+
+- **The queue of a stream's unacknowledged pieces** (`connection/send_buffer.rs`'s `advance`) is
+  shrunk once it holds under a quarter of its room, as before, but never below four pieces' room
+  (`KEPT_PIECES`, what the standard library's first growth of an empty vector takes): shrunk to
+  nothing whenever a write's data was all acknowledged, it was allocated again by the next write,
+  and shrunk below four it was grown back by the writes after.
+- **What a sent packet carried of the credit frames** is recorded inline (`connection/spaces.rs`'s
+  `Credit`): MAX_DATA, DATA_BLOCKED, MAX_STREAMS and STREAMS_BLOCKED a bit each, in the byte
+  `SentPacket` had spare, so its record stays 128 bytes (upstream's `sent_packet_size`). The stream a
+  packet's MAX_STREAM_DATA or STREAM_DATA_BLOCKED frame named, its first of each, is recorded by its
+  space beside its packets, in packet number order (`PacketSpace::stream_records`), and goes when the
+  packet does: acknowledged or given up (`PacketSpace::take`), lost and queued to send again
+  (`take_lost`), sent again by a probe or copied (`maybe_queue_probe`, `queue_copies`), or discarded
+  with its space (`take_all`). A packet's further streams and every other frame go in the boxed
+  record as upstream's did. A packet built records into `Recording`, split as it is sent.
+
+What is sent again for a loss is what upstream sent: the same frames, queued from the same records
+into the same pending set. Measured (`tests/allocs.rs`, a client writing 1 MiB to a server in
+4 KiB pieces through mantle's 12,000-byte windows, after a transfer to warm up): the server's
+transmissions through the transfer, its acknowledgements and the credit they carry, 175 allocations
+and 24,236 bytes before, 0 after (176 MAX_DATA and 174 MAX_STREAM_DATA frames sent over the
+connection); the client's 262 writes after a stream's first, written owned (`write_chunks`), 87
+allocations and 13,920 bytes before, 0 after, and written borrowed, each its copy alone (262
+allocations of 1,044,480 bytes) where 349 had been made. Tests: `allocs.rs`'s
+`credit_sent_back_allocates_nothing`, `an_owned_write_allocates_nothing` and
+`a_borrowed_write_allocates_its_copy_alone` (each fails before the change), and
+`a_received_datagram_is_handled_without_allocating`; `tests::credit_retransmit` and
+`tests::stream_data_blocked_retransmit`, a lost packet's credit and blocked frames sent again.
