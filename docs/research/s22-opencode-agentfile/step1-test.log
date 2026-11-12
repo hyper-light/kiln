@@ -6,10 +6,12 @@ PASS refuses OpenCode 1.19.5 (pin.sh: FAILED version: 1.19.5: OpenCode 1 has no 
 PASS refuses 2.2 (pin.sh: FAILED version: 2.2: not X.Y.Z)
 PASS a missing asset fails to download (curl: (56) The requested URL returned error: 404)
 PASS GitHub lists no such asset (pin.sh: FAILED github-digest: opencode-linux-riscv64.tar.gz: no asset opencode-linux-riscv64.tar.gz)
-PASS a run missing an archive (pin.sh: FAILED download: opencode-linux-arm64-musl.tar.gz is not in /Users/adalundhe/.cache/kiln-pins/opencode-test.dpoxuD/t/three)
+PASS a run missing an archive (pin.sh: FAILED download: opencode-linux-arm64-musl.tar.gz is not in /Users/adalundhe/.cache/kiln-pins/opencode-test.fSXZ3t/t/three)
 PASS one byte flipped: SHA256SUMS (pin.sh: FAILED sha256sums: opencode-linux-x64-baseline-musl.tar.gz: listed c1801a36bf61e03eafac8d7f4521a200e4d3cd76cf43b36621cb78b460b851ee, got ecc3dd722f6680f)
 PASS one byte flipped: GitHub's digest (pin.sh: FAILED github-digest: opencode-linux-x64-baseline-musl.tar.gz: GitHub has sha256:c1801a36bf61e03eafac8d7f4521a200e4d3cd76cf43b36621cb78b460b851ee, 12156)
 PASS a run with one byte flipped (pin.sh: FAILED sha256sums: opencode-linux-x64-baseline-musl.tar.gz: listed c1801a36bf61e03eafac8d7f4521a200e4d3cd76cf43b36621cb78b460b851ee, got ecc3dd722f6680f)
+PASS one byte of SHA256SUMS changed (pin.sh: FAILED sha256sums: opencode-linux-x64-baseline-musl.tar.gz: listed 01801a36bf61e03eafac8d7f4521a200e4d3cd76cf43b36621cb78b460b851ee, got c1801a36bf61e03)
+PASS SHA256SUMS of another release (2.2.6) (pin.sh: FAILED sha256sums: opencode-linux-x64-baseline-musl.tar.gz: listed 97ce1345a1fdbfb105d9cdf23c57385ac30ed1495ef329dbdbf09c917b479f21, got c1801a36bf61e03)
 PASS another signer workflow (pin.sh: FAILED attestation: opencode-linux-x64-baseline-musl.tar.gz: no provenance signed by anomalyco/opencode/.github/workflows/check.yml in anomalyco/opencod)
 PASS another repository (pin.sh: FAILED attestation: opencode-linux-x64-baseline-musl.tar.gz: no provenance signed by cli/cli/.github/workflows/deployment.yml in cli/cli ( Error: no att)
 PASS another commit (pin.sh: FAILED attestation: opencode-linux-x64-baseline-musl.tar.gz: signed, but not from commit 0000000000000000000000000000000000000000 in run any)
@@ -23,5 +25,5 @@ PASS opencode a symlink (pin.sh: FAILED member: link.tar.gz: opencode is not a r
 PASS opencode a directory (pin.sh: FAILED member: dir.tar.gz: opencode is not a regular file)
 PASS not a tarball (pin.sh: FAILED member: plain.tar.gz: not a gzip tarball: not a gzip file)
 PASS a truncated archive (pin.sh: FAILED member: truncated.tar.gz: not a gzip tarball: Compressed file ended before the end-of-stream marker was reached)
-25 passed, 0 failed
+27 passed, 0 failed
 exit=0

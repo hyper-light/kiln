@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# pin.sh's tests: each check accepts the real archives and refuses what it must, and a run that
-# fails writes no pin.
+# pin.sh's tests (plan 01a1ce70 step 1): each check accepts the real archives and refuses what it
+# must, and a run that fails writes no pin.
 #
 #   pin_test.sh [DIR]
 #
@@ -95,6 +95,17 @@ open(sys.argv[2], "wb").write(d)' "$real" "$T/flipped/opencode-linux-x64-baselin
 refuses "one byte flipped: SHA256SUMS" sha256sums check_sums "$WORK/SHA256SUMS" opencode-linux-x64-baseline-musl.tar.gz "$T/flipped/opencode-linux-x64-baseline-musl.tar.gz"
 refuses "one byte flipped: GitHub's digest" github-digest check_asset "$WORK/release.json" opencode-linux-x64-baseline-musl.tar.gz "$T/flipped/opencode-linux-x64-baseline-musl.tar.gz"
 writes_no_pin "a run with one byte flipped" sha256sums "$VERSION" --from "$T/flipped"
+
+# SHA256SUMS, the release's own list of digests: one byte of it changed, or another release's.
+python3 -I -c 'import sys
+s = open(sys.argv[1]).read().splitlines(True)
+for i, l in enumerate(s):
+    if l.rstrip().endswith(" opencode-linux-x64-baseline-musl.tar.gz"):
+        s[i] = ("0" if l[0] != "0" else "1") + l[1:]
+open(sys.argv[2], "w").write("".join(s))' "$WORK/SHA256SUMS" "$T/SHA256SUMS.changed"
+refuses "one byte of SHA256SUMS changed" sha256sums check_sums "$T/SHA256SUMS.changed" opencode-linux-x64-baseline-musl.tar.gz "$real"
+fetch "https://github.com/$REPO/releases/download/v2.2.6/SHA256SUMS" "$T/SHA256SUMS.2.2.6"
+refuses "SHA256SUMS of another release (2.2.6)" sha256sums check_sums "$T/SHA256SUMS.2.2.6" opencode-linux-x64-baseline-musl.tar.gz "$real"
 
 # Provenance from another signer workflow, another repository, or another commit or run.
 refuses "another signer workflow" attestation check_attestation "$real" "$REPO" anomalyco/opencode/.github/workflows/check.yml "" ""

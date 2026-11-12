@@ -47,7 +47,23 @@ not on the Linux runners, so the pin is made where it is):
 |---|---|---|---|
 | The pin, 2026-11-12T08:20Z | `pin.sh latest --keep` | OpenCode 2.2.7 from the endpoint (commit 5f76acb1, run 42778325289, refs/heads/dev); all four archives passed SHA256SUMS, GitHub's digest, provenance signed by release.yml at that commit and run, and the one-entry check; LICENSE MIT at the tag's commit fedc6f20; x64 = x64-baseline for gnu and musl; pin.json written | [step1-pin.log](step1-pin.log) |
 | Check the pin | `pin.sh --check` (downloads again) | CHECKED 4 of 4 builds: each archive's and member's SHA-256 and size equal the pin's, each provenance at the pinned commit and run | [step1-check.log](step1-check.log) |
-| Tests | `pin_test.sh <the kept archives>` | 25 passed, 0 failed: the checks accept the four real archives and refuse 1.x and non-X.Y.Z versions, a missing asset, a flipped byte, another signer workflow, repository, commit or run, two entries, another name, `./opencode`, `../opencode`, a symlink, a directory, a non-tarball and a truncated archive; whole runs that fail (version, a missing archive, a flipped byte) write no pin | [step1-test.log](step1-test.log) |
+| Tests | `pin_test.sh` (downloading the archives afresh) | 27 passed, 0 failed: the checks accept the four real archives and refuse 1.x and non-X.Y.Z versions, a missing asset, a flipped byte, one byte of SHA256SUMS changed, another release's SHA256SUMS, another signer workflow, repository, commit or run, two entries, another name, `./opencode`, `../opencode`, a symlink, a directory, a non-tarball and a truncated archive; whole runs that fail (version, a missing archive, a flipped byte) write no pin | [step1-test.log](step1-test.log) |
+
+The plan's tests for this step, against what ran:
+
+| The plan's test | Ran as | Outcome |
+|---|---|---|
+| Run pin.sh latest; then download each pinned archive and hash it and its member (4 builds) | `pin.sh latest`, then `pin.sh --check` | CHECKED 4 of 4 builds |
+| One byte flipped in a downloaded archive | "one byte flipped: SHA256SUMS", "one byte flipped: GitHub's digest", "a run with one byte flipped" | refused (sha256sums, github-digest); no pin written |
+| --signer-workflow naming another workflow | "another signer workflow" (and "another repository", "another commit", "another run") | refused (attestation) |
+| Version 1.19.5 | "refuses OpenCode 1.19.5" (and "refuses 2.2") | refused (version); no pin written |
+| An asset name that does not exist | "a missing asset fails to download", "GitHub lists no such asset", "a run missing an archive" | refused (download, github-digest); no pin written |
+| A crafted tar.gz with two members | "a second entry" (and the other crafted archives) | refused (member) |
+
+Step 19's tests flip a byte of its signed manifest and swap its key. opencode's release has no
+signed manifest and no key of its own: SHA256SUMS lists the digests (one byte of it changed, and
+2.2.6's list given as 2.2.7's, are both refused), and the Sigstore certificate stands where a key
+would (another repository's and another workflow's are refused).
 
 A crafted archive with a second entry or another name never reaches the one-entry check in a
 whole run, because its digest fails SHA256SUMS first; that check is held by the crafted-archive
