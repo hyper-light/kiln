@@ -753,6 +753,13 @@ pub fn disk_available(path: &Path) -> Option<u64> {
     disk_space(path).map(|(_, available)| available)
 }
 
+/// A file's change time and its index on its volume, as Windows keeps them: what a stat's ctime
+/// and inode are on Unix (None: unknown).
+#[cfg(windows)]
+pub fn file_change(path: &Path) -> Option<(i64, u64)> {
+    win32::file_change(path).ok()
+}
+
 /// Keep git from ever prompting (terminal, askpass helper, or Git Credential Manager's window):
 /// a missing credential fails fast instead of hanging a job. On Windows there is no
 /// `/bin/true` to answer askpass, and git without one simply fails the credential.

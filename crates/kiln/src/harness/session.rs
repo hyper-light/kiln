@@ -1038,8 +1038,15 @@ fn reach_words(reach: Option<&str>) -> String {
     }
 }
 
-/// A command as the adapter should see it (attachments stored first).
+/// A command as the adapter should see it (attachments stored first; another agent's or a
+/// harness's message steering, [`super::queued::steers`]).
 pub(super) async fn prepare(files: &Files, c: Command) -> Result<Command, PreparationFailure> {
+    let c = match c {
+        Command::Send { id, text, mode: super::model::SendMode::Queue, attachments, overrides, reply_to, task } if super::queued::steers(&id) => {
+            Command::Send { id, text, mode: super::model::SendMode::Steer, attachments, overrides, reply_to, task }
+        }
+        c => c,
+    };
     match c {
         Command::Send { id, text, mode, attachments, overrides, reply_to, task } if !attachments.is_empty() => {
             let files = files.clone();

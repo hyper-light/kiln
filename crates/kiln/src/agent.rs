@@ -1719,7 +1719,11 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, mut
     let native_count = if handed.is_some() { 3 } else { 0 };
     let expected = native_count + usize::from(rec.mail_manifest().is_some());
     if fds.len() != expected { return Err("the native handover did not carry its exact native/journal descriptors; the source retains custody".into()); }
-    let durable_legacy = manifest.is_none() && crate::runner::custody::signs();
+    // A live process's hand-over is promoted on its frozen timeline. A session with none running
+    // (idle, its harness exited) is its record alone, and goes on from it as after a restart: its
+    // refusal for want of a timeline left it with neither process, as the one it came from counts
+    // every refusal as started again here (Amphora, 2026-11-11 21:12: 43 handed, 42 taken).
+    let durable_legacy = manifest.is_none() && handed.is_some() && crate::runner::custody::signs();
     if durable_legacy {
         let frozen = &handed.as_ref().ok_or_else(|| "the legacy native handover has no retained source timeline; its source keeps custody".to_owned())?.core;
         let given = given.as_ref().ok_or_else(|| "the legacy native handover has no source hand-on; its source keeps custody".to_owned())?;
@@ -2439,6 +2443,21 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if let Some(h) = &harness {
         let h = Arc::clone(h);
         crate::runner::custody::set_sessions(move || h.harness_pids());
+    }
+    // W24-R31: the reaper of this machine's projects (the folders its agent sessions work in) and
+    // its ~/.cache, which asks an idle agent of a project to clean what it doesn't recognize.
+    if let Some(h) = harness.as_ref().filter(|_| !o.outpost && !o.ephemeral) {
+        use crate::harness::model::{Command, SendMode, Status};
+        let (list, tell) = (Arc::clone(h), Arc::clone(h));
+        crate::runner::reap_projects::set_sessions(move || {
+            list.list()
+                .into_iter()
+                .filter(|i| !i.subagent)
+                .map(|i| crate::runner::reap_projects::Session { id: i.id, cwd: i.cwd, idle: i.status == Status::Idle, queued: i.queue.into_iter().map(|q| q.id).collect() })
+                .collect()
+        });
+        crate::runner::reap_projects::set_tell(move |session, id, text| tell.command(session, Command::Send { id, text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }));
+        crate::runner::reap_projects::start(name.clone());
     }
     // The harnesses its user's login shell finds are this machine's too
     // (`crate::harness::kinds::search_path`): that shell is asked now, and every ten minutes.
@@ -3203,7 +3222,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                         (Item::Session { .. }, Ack::Taken) => sessions += 1,
                                         (Item::Terminal { .. }, Ack::Taken) => terminals += 1,
                                         // The new build started it again from its record.
-                                        (Item::Session { record, .. }, Ack::Refused(e) | Ack::Lost(e)) => said.push(format!("agent session {} started again from its record there: {e}", record.id())),
+                                        (Item::Session { record, .. }, Ack::Refused(e) | Ack::Lost(e)) => {
+                                            tracing::warn!(session = %record.id(), why = %e, "the new build didn't take an agent session as it was handed over");
+                                            said.push(format!("agent session {} wasn't taken by the new build as handed over: {e}", record.id()));
+                                        }
                                         // Back here: it ends with this runner (which waits for it).
                                         (Item::Terminal { session, state, fd, pid }, ack) => {
                                             moved.remove(&crate::instances::Owned::Terminal(session.clone()));
@@ -6773,6 +6795,32 @@ fn open_mirror(dir: &std::path::Path, up: &crate::memory::queue::Sender<Up>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session with no process running (idle, its harness exited) is handed to the new build as
+    /// its record alone, and the new build takes it from that record: refused for want of a frozen
+    /// timeline, it was left with neither runner process (Amphora, 2026-11-11).
+    #[cfg(unix)]
+    #[test]
+    fn a_blue_green_hand_over_takes_a_session_with_no_process_from_its_record() -> anyhow::Result<()> {
+        use crate::harness::host::{Host, Limits};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()), ..Default::default() };
+            let (tx, _rx) = async_channel::unbounded();
+            let old = Host::new(tx, None, Limits::default());
+            old.open(Some("idle".into()), spec)?;
+            let out = old.move_out_signing(true, None).await.map_err(anyhow::Error::msg)?;
+            let (tx, _rx) = async_channel::unbounded();
+            let new = Host::new(tx, None, Limits::default());
+            for (rec, handed, hand_on) in out {
+                anyhow::ensure!(handed.is_none(), "no process ran");
+                let id = rec.id().to_owned();
+                take_session(Some(&new), &id, rec, handed, hand_on.map(|b| b.to_string()), Vec::new()).await.map_err(anyhow::Error::msg)?;
+            }
+            anyhow::ensure!(new.get("idle").is_some(), "the new build holds it");
+            Ok(())
+        })
+    }
 
     #[test]
     fn an_ordinary_state_keeps_its_exact_existing_wire_representation() -> anyhow::Result<()> {

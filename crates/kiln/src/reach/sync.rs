@@ -280,6 +280,21 @@ pub fn safe_rel(path: &str) -> anyhow::Result<PathBuf> {
     Ok(p.to_path_buf())
 }
 
+/// `path` opened to set its times. Windows' SetFileTime takes a handle with FILE_WRITE_ATTRIBUTES,
+/// which a read-only open hasn't ("Access is denied"); Unix's futimens takes its owner's
+/// descriptor however it was opened.
+fn for_times(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new().access_mode(0x0100).open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
 /// Every folder between `root` and `rel`'s parent exists as a real folder (made if missing);
 /// none is a symlink, so a write can't leave the copy.
 fn real_parents(root: &Path, rel: &Path) -> anyhow::Result<()> {
@@ -301,8 +316,8 @@ fn real_parents(root: &Path, rel: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A file's stat as [`Hashes`] keeps it: its size, its modification time and, on Unix, its change
-/// time and inode, which nothing sets back.
+/// A file's stat as [`Hashes`] keeps it: its size, its modification time, and its change time and
+/// inode (on Windows NTFS's change time and file index), which nothing sets back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stat {
     pub size: u64,
@@ -326,9 +341,16 @@ impl Stat {
         }
     }
 
-    /// `path`'s stat, when it's a file.
+    /// `path`'s stat, when it's a file. On Windows its change time and index are NTFS's, which a
+    /// file's metadata doesn't hold (`crate::os::file_change`).
     pub fn of_path(path: &Path) -> Option<Self> {
-        std::fs::symlink_metadata(path).ok().filter(|m| m.file_type().is_file()).map(|m| Self::of(&m))
+        let stat = std::fs::symlink_metadata(path).ok().filter(|m| m.file_type().is_file()).map(|m| Self::of(&m))?;
+        #[cfg(windows)]
+        let stat = {
+            let (ctime_ns, ino) = crate::os::file_change(path)?;
+            Self { ctime_ns, ino, ..stat }
+        };
+        Some(stat)
     }
 }
 
@@ -506,7 +528,7 @@ impl Mirror {
     pub fn spoil(&mut self) -> anyhow::Result<()> {
         for p in std::mem::take(&mut self.wrote) {
             self.hashes.forget(&p);
-            if let Ok(f) = std::fs::File::open(self.root.join(safe_rel(&p)?)) {
+            if let Ok(f) = for_times(&self.root.join(safe_rel(&p)?)) {
                 f.set_modified(std::time::UNIX_EPOCH)?;
             }
         }
@@ -887,16 +909,13 @@ mod tests {
         let (fixed, m) = sync_digest(s, &d, false)?;
         assert!(fixed == want && m.written >= 1, "sent again, and right");
         // Changed in the copy since, its size and time put back: sent again.
-        #[cfg(unix)]
-        {
-            let f = d.join("src/main.rs");
-            let mtime = std::fs::metadata(&f)?.modified()?;
-            std::fs::write(&f, "fn main() { 2; }\n")?;
-            std::fs::File::open(&f)?.set_modified(mtime)?;
-            let mut m = Mirror::new(d.clone())?;
-            m.plan(scan(s)?.entries)?;
-            assert_eq!(m.needed(), vec!["src/main.rs".to_owned()]);
-        }
+        let f = d.join("src/main.rs");
+        let mtime = std::fs::metadata(&f)?.modified()?;
+        std::fs::write(&f, "fn main() { 2; }\n")?;
+        for_times(&f)?.set_modified(mtime)?;
+        let mut m = Mirror::new(d.clone())?;
+        m.plan(scan(s)?.entries)?;
+        assert_eq!(m.needed(), vec!["src/main.rs".to_owned()]);
         Ok(())
     }
 

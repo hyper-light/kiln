@@ -506,5 +506,7 @@ pub fn effective_text(r: &Resolved, volume: u64) -> serde_json::Value {
     })
 }
 
+pub mod projects;
+
 #[cfg(test)]
 mod tests;

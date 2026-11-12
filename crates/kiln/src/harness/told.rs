@@ -1780,7 +1780,7 @@ mod tests {
         }
 
         async fn publish(&self, told: &mut Told, command: &Command) -> anyhow::Result<Option<Command>> {
-            let receipt=super::super::mail::publish(&self.store,self.publication(command)?,u64::MAX,2).await?;
+            let receipt=super::super::mail::publish(&self.store,self.publication(command)?,u64::MAX).await?;
             Ok(told.mail_progress(&self.parent,&receipt))
         }
 
@@ -2167,7 +2167,7 @@ mod tests {
         })
     }
 
-    /// Preaccept backpressure preserves the producer's exact original until publication commits;
+    /// A preaccept refusal (no room on disk) preserves the producer's exact original until publication commits;
     /// newer desired words cannot silently replace it and planning does not create retries.
     #[test]
     fn news_that_didn_t_reach_its_parent_goes_at_the_next_look() -> anyhow::Result<()> {
@@ -2176,8 +2176,9 @@ mod tests {
             let mut kids=helpers(&p.id,&["w1","w2"]);let now=6_000_000;
             assert!(t.plan(&all(&p,&kids),now,&[],&[]).is_empty());
             let first=one_send(&settle(&mut t,&p,&mut kids,&[(0,"First news.")],now+10_000))?;
-            let refused=super::super::mail::publish(&ledger.store,ledger.publication(&first)?,u64::MAX,0).await;
-            assert!(matches!(refused,Err(super::super::mail::Error::Backpressure { .. })));
+            // No room on disk for it: the one refusal left before custody (none for depth).
+            let refused=super::super::mail::publish(&ledger.store,ledger.publication(&first)?,0).await;
+            assert!(matches!(refused,Err(super::super::mail::Error::Capacity { .. })));
             assert!(ledger.history().await?.is_empty(),"preaccept refusal commits no body or custody");
             t.unsent(&p.id,&first);
             assert!(t.plan(&all(&p,&kids),now+20_000,&[],&[]).is_empty(),"the existing sender, not planning, owns retry");
