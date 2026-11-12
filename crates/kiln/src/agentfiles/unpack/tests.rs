@@ -1014,18 +1014,22 @@ fn a_trees_skip_is_a_trees_field() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Codex's pinned archives are in the shared shape: each `unpack` in its pin.json parses as a [`Spec`],
-/// as the fetcher reads each before it fetches anything. Both packages are trees, with their totals and
-/// arm64's skip, and ripgrep's rg is a member.
+/// Every built-in's pinned archives are in the shared shape: each `unpack` in each built-in's pin.json
+/// parses as a [`Spec`]. Codex's three are among them: both packages as trees, with their totals and
+/// arm64's skip, and ripgrep's rg as a member.
 #[test]
-fn codexs_pinned_unpacks_are_specs() -> anyhow::Result<()> {
-    let b = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "codex").ok_or_else(|| anyhow::anyhow!("no built-in runs codex"))?;
-    let pin: serde_json::Value = serde_json::from_str(b.pin)?;
+fn every_builtins_pinned_unpack_is_a_spec() -> anyhow::Result<()> {
     let mut codex = Vec::new();
-    for build in pin.get("builds").and_then(serde_json::Value::as_array).into_iter().flatten() {
-        for file in build.get("files").and_then(serde_json::Value::as_array).into_iter().flatten() {
-            let Some(unpack) = file.get("unpack") else { continue };
-            codex.push(serde_json::from_value::<Spec>(unpack.clone()).map_err(|e| anyhow::anyhow!("{}: {unpack}: {e}", b.name))?);
+    for b in crate::agentfiles::builtin::ALL {
+        let pin: serde_json::Value = serde_json::from_str(b.pin)?;
+        for build in pin.get("builds").and_then(serde_json::Value::as_array).into_iter().flatten() {
+            for file in build.get("files").and_then(serde_json::Value::as_array).into_iter().flatten() {
+                let Some(unpack) = file.get("unpack") else { continue };
+                let spec: Spec = serde_json::from_value(unpack.clone()).map_err(|e| anyhow::anyhow!("{}: {unpack}: {e}", b.name))?;
+                if b.name == "harness-codex" {
+                    codex.push(spec);
+                }
+            }
         }
     }
     let trees: Vec<&Tree> = codex.iter().filter_map(|s| if let Spec::Tree(t) = s { Some(t) } else { None }).collect();
