@@ -13,8 +13,9 @@ recorded changes, and record new changes (CP-M1; docs/vendoring.md).
   scripts/vendor.py check [<project> ...] [--kind git|bun] [--from PROJECT=PATH]
       Prove each vendored tree is its upstream at the pinned revision plus its recorded changes,
       byte for byte, that its UPSTREAM.md lists every change, and that the pins agree.
-  scripts/vendor.py record <project> <title> --why <why>
-      Record the edits made in a vendored tree as its next change.
+  scripts/vendor.py record <project> <title> --why <why> [--kiln-only <why>]
+      Record the edits made in a vendored tree as its next change; --kiln-only marks one of kiln's
+      layout alone (a crate kiln took as its own), which no product that vendors the project holds.
   scripts/vendor.py list
       The projects, where they come from, their revisions and recorded changes.
 
@@ -474,6 +475,13 @@ class Change:
     def title(self) -> str:
         m = re.search(r"^Subject: (.*)$", self.header, re.M)
         return m.group(1).strip() if m else self.file.stem
+
+    @property
+    def kiln_only(self) -> bool:
+        """A change of kiln's layout alone, its header's `Kiln-only:` line saying why: one that
+        points the project at a crate kiln took as its own (crates/kiln-rt for hyper-raft's
+        hyper-rt), which no product's tree holds, so no product that vendors the project records it."""
+        return re.search(r"^Kiln-only: \S", self.header, re.M) is not None
 
 
 def load_changes(root: Path, project: Project) -> list[Change]:
@@ -1043,9 +1051,10 @@ def takes(spec: dict, path: str) -> bool:
 def pin_problems(manifest: Manifest, project: Project, revision: str, upstream: GitUpstream | BunUpstream) -> list[str]:
     """kiln holds one copy of each project, so a project that vendors others (a hyper-light
     product) must agree with kiln on each of them:
-    - one kiln vendors too it takes at kiln's revision with the same recorded changes, and kiln's
-      copy of the product leaves the product's copy of it out (the product depends on it through
-      `[patch]`, which kiln points at its own copy);
+    - one kiln vendors too it takes at kiln's revision with the same recorded changes (but those
+      of kiln's layout alone, `Kiln-only:`, which no product holds), and kiln's copy of the product
+      leaves the product's copy of it out (the product depends on it through `[patch]`, which kiln
+      points at its own copy);
     - a hyper-light product is always one kiln holds itself, and so is caught by the rule above;
     - anything else (third-party code only that product vendors, as Turso in Amphora) stays inside
       the product's copy, which is kiln's one copy of it."""
@@ -1073,7 +1082,7 @@ def pin_problems(manifest: Manifest, project: Project, revision: str, upstream: 
         if ours.revision != pin:
             out.append(f"{at} takes {name} at {pin}; kiln takes {name} at {ours.revision}: the pins must agree")
         theirs_changes = upstream.files(revision, f"{PATCHES}/{name}")
-        ours_changes = {c.name: c.header.encode("utf-8") + c.diff for c in load_changes(manifest.root, ours)}
+        ours_changes = {c.name: c.header.encode("utf-8") + c.diff for c in load_changes(manifest.root, ours) if not c.kiln_only}
         if theirs_changes != ours_changes:
             differ = sorted(n for n in set(theirs_changes) | set(ours_changes) if theirs_changes.get(n) != ours_changes.get(n))
             out.append(f"{at} records other changes to {name} than kiln does ({', '.join(differ)}): kiln's must be the product's")
@@ -1355,7 +1364,7 @@ def run_gate(manifest: Manifest, project: Project) -> int:
     return 0
 
 
-def record(manifest: Manifest, name: str, title: str, why: str) -> int:
+def record(manifest: Manifest, name: str, title: str, why: str, kiln_only: str = "") -> int:
     root = manifest.root
     project = manifest.projects.get(name)
     if project is None:
@@ -1364,6 +1373,8 @@ def record(manifest: Manifest, name: str, title: str, why: str) -> int:
         raise Refused(f"{name}: its files are upstream's or kiln's own; it takes no recorded changes")
     if not title.strip() or "\n" in title or not why.strip():
         raise Refused("a change needs a one-line title and a why")
+    if "\n" in kiln_only:
+        raise Refused("--kiln-only takes one line: why the change is kiln's layout alone")
     exp = expected_tree(root, project, project.revision, None)
     try:
         here = read_vendored(root, project)
@@ -1384,7 +1395,8 @@ def record(manifest: Manifest, name: str, title: str, why: str) -> int:
             slug = slug[:61].rsplit("-", 1)[0]
         slug = slug or "change"
         f = folder / f"{max(numbers, default=0) + 1:04d}-{slug}.patch"
-        f.write_bytes(f"Subject: {title.strip()}\nWhy: {' '.join(why.split())}\n\n".encode() + diff)
+        only = f"Kiln-only: {' '.join(kiln_only.split())}\n" if kiln_only.strip() else ""
+        f.write_bytes(f"Subject: {title.strip()}\nWhy: {' '.join(why.split())}\n{only}\n".encode() + diff)
         say(f"recorded {f.relative_to(root)}; add its row (file, change, why, {f.name}) to {project.path}/UPSTREAM.md")
         return 0
     finally:
@@ -1410,6 +1422,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--abort", action="store_true", help="drop a re-vendor that stopped at a conflict")
     ap.add_argument("--kind", choices=["git", "bun"], help="check: only the projects of this kind")
     ap.add_argument("--why", default="", help="record: why kiln makes the change")
+    ap.add_argument("--kiln-only", default="", help="record: the change is kiln's layout alone, which no product holds: why")
     ap.add_argument("--root", default=str(Path(__file__).resolve().parent.parent), help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     try:
@@ -1420,7 +1433,7 @@ def main(argv: list[str]) -> int:
         if a.command == "record":
             if len(a.args) != 2:
                 ap.error("record <project> <title> --why <why>")
-            return record(manifest, a.args[0], a.args[1], a.why)
+            return record(manifest, a.args[0], a.args[1], a.why, a.kiln_only)
         if a.command == "list":
             return list_projects(manifest)
         if a.resume or a.abort:

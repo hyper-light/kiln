@@ -4,6 +4,11 @@ use bytes::{Buf, Bytes};
 
 use crate::{VarInt, range_set::RangeSet};
 
+/// Derived: the room a queue of pieces keeps however few it holds, what its first growth takes: the
+/// standard library grows an empty vector of elements of up to 1 KiB to four (`RawVecInner`'s
+/// `min_non_zero_cap`), so a queue shrunk below four is grown back by the writes that follow.
+const KEPT_PIECES: usize = 4;
+
 /// Buffer of outgoing retransmittable stream data
 #[derive(Default, Debug)]
 pub(super) struct SendBuffer {
@@ -101,9 +106,14 @@ impl SendBuffer {
                 self.unacked_segments.pop_front();
                 self.front_trimmed = 0;
 
-                if self.unacked_segments.len().saturating_mul(4) < self.unacked_segments.capacity()
-                {
-                    self.unacked_segments.shrink_to_fit();
+                // Shrunk once it holds under a quarter of its room, so a burst's pieces are not
+                // kept for the stream's life; but never below the room its first growth takes,
+                // which shrinking to nothing as each write's data was all acknowledged gave back
+                // for the next write to allocate again (VENDORED.md §49: one allocation a write,
+                // 1,745 a native PUT of 8 MiB in mantle).
+                let held = self.unacked_segments.len();
+                if held.saturating_mul(4) < self.unacked_segments.capacity() {
+                    self.unacked_segments.shrink_to(held.max(KEPT_PIECES));
                 }
             } else {
                 front.bytes.advance(to_advance);

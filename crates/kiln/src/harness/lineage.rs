@@ -69,6 +69,9 @@ fn default_mode(k: &Kind) -> &'static str {
     if k.id == "devin" {
         return "accept-edits";
     }
+    if k.id == "cursor" {
+        return super::kinds::CURSOR_DEFAULT_MODE;
+    }
     match k.protocol {
         Protocol::Acp(_) => super::acp::KILN_ASK,
         _ => k.modes().1,
@@ -128,6 +131,22 @@ pub fn level(kind: &str, mode: &str) -> Option<Level> {
             super::antigravity::BYPASS => Some(Level::Bypass),
             _ => None,
         },
+        // Its modes are the tools it starts with; it asks before none of them.
+        Protocol::PiRpc => match mode {
+            super::pi::READ_ONLY => Some(Level::Plan),
+            super::pi::EDIT => Some(Level::AcceptEdits),
+            super::pi::FULL => Some(Level::Bypass),
+            _ => None,
+        },
+        // Cursor's Plan and Ask change nothing; its Agent has every tool and asks first for what its
+        // own approval settings don't let go ahead, edits among them or not as those say: placed
+        // with Accept edits, the most it may do unasked. kiln's Bypass answers every request yes.
+        Protocol::Acp(_) if k.id == "cursor" => match mode {
+            "plan" | "ask" => Some(Level::Plan),
+            "agent" => Some(Level::AcceptEdits),
+            super::acp::KILN_BYPASS => Some(Level::Bypass),
+            _ => None,
+        },
         Protocol::Acp(_) if k.id == "devin" => match mode {
             "plan" => Some(Level::Plan),
             "ask" => Some(Level::Ask),
@@ -158,6 +177,8 @@ fn modes_of(k: &Kind) -> Vec<(String, Level)> {
         Protocol::ClaudeStreamJson => super::claude::modes(true).into_iter().map(|m| m.id).collect(),
         Protocol::CodexAppServer => super::codex::modes(true).into_iter().map(|m| m.id).collect(),
         Protocol::AgyStreamJson => super::antigravity::modes().into_iter().map(|m| m.id).collect(),
+        Protocol::PiRpc => super::pi::modes().into_iter().map(|m| m.id).collect(),
+        Protocol::Acp(_) if k.id == "cursor" => super::kinds::cursor_modes().into_iter().map(|m| m.id).collect(),
         Protocol::Acp(_) if k.id == "devin" => ["plan", "ask", "accept-edits", "smart", "bypass"].map(str::to_owned).to_vec(),
         Protocol::Acp(_) => vec![super::acp::KILN_ASK.to_owned(), super::acp::KILN_BYPASS.to_owned()],
         Protocol::Terminal => Vec::new(),
@@ -168,8 +189,9 @@ fn modes_of(k: &Kind) -> Vec<(String, Level)> {
 /// The mode a child in harness `kind` starts in under a parent at `ceiling`: the one `asked` for,
 /// when it's within it; with none asked, its harness's default when that's within it, else the
 /// most its harness offers that is. Always one, so the harness's own settings (Claude Code's
-/// `defaultMode`) can't start it higher. `bypass_ok`: the parent may use bypass itself. Other ACP
-/// agents asked for nothing start in their own default mode (kiln learns their modes as they run).
+/// `defaultMode`) can't start it higher. `bypass_ok`: the parent may use bypass itself. ACP agents
+/// other than Devin and Cursor (whose modes kiln knows before they run) asked for nothing start in
+/// their own default mode (kiln learns their modes as they run).
 pub fn child_mode(kind: &str, asked: Option<&str>, ceiling: Level, bypass_ok: bool) -> Result<Option<String>, String> {
     let k = Kind::get(kind).ok_or_else(|| format!("unknown harness {kind:?}"))?;
     let known = modes_of(k);
@@ -198,7 +220,7 @@ pub fn child_mode(kind: &str, asked: Option<&str>, ceiling: Level, bypass_ok: bo
             }
             Ok(Some(mode.to_owned()))
         }
-        None if matches!(k.protocol, Protocol::Acp(_)) && k.id != "devin" && ceiling >= Level::Ask => Ok(None),
+        None if matches!(k.protocol, Protocol::Acp(_)) && k.id != "devin" && k.id != "cursor" && ceiling >= Level::Ask => Ok(None),
         None => {
             let default = default_mode(k);
             if within.iter().any(|(id, _)| id == default) {
@@ -756,7 +778,7 @@ async fn lacks(hub: &Hub, target: &str, kind: &'static Kind) -> bool {
 }
 
 fn harness(id: &str) -> Result<&'static Kind, Refused> {
-    let kind = Kind::get(id).ok_or_else(|| bad(format!("unknown harness {id:?}: claude, codex, devin, gemini, opencode, goose, amp or antigravity")))?;
+    let kind = Kind::get(id).ok_or_else(|| bad(format!("unknown harness {id:?}: claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor or pi")))?;
     if !kind.structured() {
         return Err(bad(format!("{} has no structured mode", kind.name)));
     }

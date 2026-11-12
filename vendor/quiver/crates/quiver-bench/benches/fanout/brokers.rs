@@ -15,6 +15,10 @@
 //! A thread's end is a fact, bounded: each of its subscribers took every message published, or its
 //! stream ended (the broker disconnected it), or `--drain` seconds passed since the schedule
 //! closed. What a subscriber hadn't taken by then is undelivered.
+//!
+//! The floor over TCP (`--system tcp`) runs here too, as a broker does: its relay a server of its
+//! own (`relay.rs`), reached by the same publisher and subscribers' threads over tokio's own
+//! sockets (Nagle off), a frame its length then its payload.
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
@@ -27,6 +31,7 @@ use futures::StreamExt as _;
 use rdkafka::Message as _;
 use rdkafka::consumer::Consumer as _;
 use rdkafka::producer::Producer as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::follow::{Follow, PRIMING, Schedule, Seen, Taken, Window, stamp};
 use crate::profile::broker::Target;
@@ -154,11 +159,40 @@ async fn subscriber(
                 }
             }
         }
+        System::Tcp => {
+            let stream = relay(endpoint, 'S', topic).await?;
+            shared.subscribed.fetch_add(1, Ordering::AcqRel);
+            let mut stream = tokio::io::BufReader::with_capacity(1 << 16, stream);
+            let mut payload = Vec::new();
+            // Until the relay lets the subscriber go, its connection closed.
+            while let Ok(len) = stream.read_u32_le().await {
+                payload.resize(len as usize, 0);
+                stream
+                    .read_exact(&mut payload)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                take(local, shared, i, &payload);
+            }
+        }
         System::Quiver | System::Wake => {
             return Err("Quiver and the wake-up floor run in this process".to_owned());
         }
     }
     Ok(())
+}
+
+/// A connection to the relay at `endpoint` (`relay.rs`), sending at once (`TCP_NODELAY`), said to be
+/// `kind`'s (`P`, the publisher, or `S`, a subscriber) of `topic`.
+async fn relay(endpoint: &str, kind: char, topic: &str) -> Result<tokio::net::TcpStream, String> {
+    let mut stream = tokio::net::TcpStream::connect(endpoint)
+        .await
+        .map_err(|e| e.to_string())?;
+    stream.set_nodelay(true).map_err(|e| e.to_string())?;
+    stream
+        .write_all(format!("{kind} {topic}\n").as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(stream)
 }
 
 /// A Redis client of `endpoint` whose connections send at once (`TCP_NODELAY`), as a latency-minded
@@ -270,6 +304,8 @@ enum Publisher {
     Nats(async_nats::Client, async_nats::Subject),
     Redis(redis::aio::MultiplexedConnection),
     Kafka(rdkafka::producer::ThreadedProducer<Deliveries>),
+    /// The relay's connection, and the frame each publish writes in one go.
+    Tcp(tokio::net::TcpStream, Vec<u8>),
 }
 
 impl Publisher {
@@ -302,6 +338,7 @@ impl Publisher {
                     .create_with_context(Deliveries::default())
                     .map_err(|e| e.to_string())?,
             )),
+            System::Tcp => Ok(Self::Tcp(relay(endpoint, 'P', topic).await?, Vec::new())),
             System::Quiver | System::Wake => {
                 Err("Quiver and the wake-up floor run in this process".to_owned())
             }
@@ -311,7 +348,7 @@ impl Publisher {
     /// Hands `payload` to the client; Redis's publishes await their replies in `flying`. Returns
     /// the failures it learned of.
     async fn publish(
-        &self,
+        &mut self,
         topic: &str,
         payload: &[u8],
         flying: &mut tokio::task::JoinSet<bool>,
@@ -360,13 +397,19 @@ impl Publisher {
                     }
                 }
             }
+            Self::Tcp(stream, frame) => {
+                frame.clear();
+                frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                frame.extend_from_slice(payload);
+                u64::from(stream.write_all(frame).await.is_err())
+            }
         }
     }
 
     /// Waits until everything handed to the client has gone to the broker: NATS's flush, Redis's
     /// replies, Kafka's acknowledgements (each within its timeout). Returns the failures it
     /// learned of.
-    async fn finish(&self, flying: &mut tokio::task::JoinSet<bool>) -> Result<u64, String> {
+    async fn finish(&mut self, flying: &mut tokio::task::JoinSet<bool>) -> Result<u64, String> {
         match self {
             Self::Nats(client, _) => {
                 client.flush().await.map_err(|e| e.to_string())?;
@@ -384,6 +427,10 @@ impl Publisher {
                     .flush(rdkafka::util::Timeout::After(Duration::from_secs(120)))
                     .map_err(|e| e.to_string())?;
                 Ok(producer.context().failed.swap(0, Ordering::AcqRel))
+            }
+            Self::Tcp(stream, _) => {
+                stream.flush().await.map_err(|e| e.to_string())?;
+                Ok(0)
             }
         }
     }
@@ -407,7 +454,7 @@ async fn publish(
     profiler: &Profiler,
     broker: Option<Target>,
 ) -> Result<Published, String> {
-    let publisher = Publisher::connect(system, &a.endpoint, topic).await?;
+    let mut publisher = Publisher::connect(system, &a.endpoint, topic).await?;
     let mut flying = tokio::task::JoinSet::new();
     let setup = Instant::now() + SETUP;
     let stuck = |what: &str, n: usize| {
@@ -519,8 +566,17 @@ fn create_topic(endpoint: &str, topic: &str) -> Result<(), String> {
     })
 }
 
-/// The broker's CPU so far, seconds, as its container's cgroup counts it.
-fn broker_cpu_s(cgroup: Option<&std::path::Path>) -> Option<f64> {
+/// The broker's CPU so far, seconds: as its container's cgroup counts it, or where it has none (the
+/// relay), as the kernel counts its process (`--broker-pid`).
+fn broker_cpu_s(cgroup: Option<&std::path::Path>, pid: Option<u32>) -> Option<f64> {
+    cgroup_cpu_s(cgroup).or_else(|| {
+        hyper_measure::usage::of(pid?)
+            .ok()
+            .map(|u| u.cpu_ns() as f64 / 1e9)
+    })
+}
+
+fn cgroup_cpu_s(cgroup: Option<&std::path::Path>) -> Option<f64> {
     let text = std::fs::read_to_string(cgroup?.join("cpu.stat")).ok()?;
     let usec: u64 = text
         .lines()
@@ -563,7 +619,7 @@ pub fn run(a: &Args, system: System, seed: u64, index: usize, profiler: &Profile
     let workers = a.workers.min(a.subscribers).max(1);
     let load_before = hyper_measure::usage::load();
     let cpu_before = hyper_measure::usage::this().ok();
-    let broker_before = broker_cpu_s(cgroup.as_deref());
+    let broker_before = broker_cpu_s(cgroup.as_deref(), a.broker_pid);
     let handles: Vec<_> = (0..workers)
         .map(|w| {
             let (per, extra) = (a.subscribers / workers, a.subscribers % workers);
@@ -609,7 +665,7 @@ pub fn run(a: &Args, system: System, seed: u64, index: usize, profiler: &Profile
         (Some(b), Some(a)) => a.since(&b).cpu_ns() as f64 / 1e9,
         _ => f64::NAN,
     };
-    let broker_cpu_s = match (broker_before, broker_cpu_s(cgroup.as_deref())) {
+    let broker_cpu_s = match (broker_before, broker_cpu_s(cgroup.as_deref(), a.broker_pid)) {
         (Some(b), Some(a)) => Some(a - b),
         _ => None,
     };
