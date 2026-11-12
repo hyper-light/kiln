@@ -4,17 +4,14 @@
   "tag": "v1.5.2",
   "commit": "b4afdddf44e059c67ccf5097e5317d913521b470",
   "published_at": "2026-11-10T12:25:43Z",
-  "read_at": "2026-11-12T08:18:17Z",
+  "read_at": "2026-11-12T10:27:33Z",
   "verified": [
     "pi v1.5.2: each Linux tarball's SHA-256 equals its line in the release's SHA256SUMS and the digest GitHub recorded at upload, its size equals GitHub's, and its pi/package.json says 1.5.2",
     "pi v1.5.2: no signature or attestation exists for these builds (GitHub's attestations API has none for either digest) and the release is not immutable, so these checksums are the strongest check its publisher offers",
     "ripgrep 15.2.0: each tarball's SHA-256 equals GitHub's digest and the release's .sha256 file, and the archive holds rg",
     "fd v10.5.2: each tarball's SHA-256 equals GitHub's digest (fd publishes no checksum file), and the archive holds fd"
   ],
-  "base": {
-    "ref": "buildpack-deps:trixie-scm",
-    "digest": "sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10"
-  },
+  "base": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
   "tools": [
     {
       "name": "ripgrep",

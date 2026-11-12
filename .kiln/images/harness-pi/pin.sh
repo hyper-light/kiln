@@ -16,8 +16,8 @@
 # Needs bash, curl, tar, python3 and sha256sum or shasum. Environment:
 #   PIN_GITHUB_API, PIN_GITHUB_DOWNLOAD  where releases are read and downloaded (tests point them
 #                                        at a local server); default api.github.com, github.com
-#   PIN_BASE   the base image the pin is made for, <ref>@sha256:<digest>; default the shared
-#              default of every built-in harness (research f10)
+#   PIN_BASE   the base image the pin is made for, <ref>@sha256:<digest> as the Agentfile's ARG BASE
+#              names it; default the shared default of every built-in harness (research f10)
 #   PIN_OUT    the file written; default pin.json beside this script
 set -euo pipefail
 
@@ -43,7 +43,6 @@ else
     die "needs sha256sum or shasum"
 fi
 [[ $base =~ ^([^@[:space:]]+)@(sha256:[0-9a-f]{64})$ ]] || die "PIN_BASE must be <ref>@sha256:<64 hex digits>, not $base"
-base_ref=${BASH_REMATCH[1]} base_digest=${BASH_REMATCH[2]}
 
 # The JSON half: reading GitHub's records and checksum files, and writing pin.json.
 IFS= read -r -d '' PY <<'EOF' || true
@@ -144,7 +143,7 @@ elif cmd == "write":  # OUT, facts on stdin -> pin.json, written to a temporary 
             f"fd {meta['fd_tag']}: each tarball's SHA-256 equals GitHub's digest (fd publishes no checksum "
             "file), and the archive holds fd",
         ],
-        "base": {"ref": meta["base_ref"], "digest": meta["base_digest"]},
+        "base": meta["base"],
         "tools": [
             {"name": "ripgrep", "repo": meta["rg_repo"], "tag": meta["rg_tag"], "published_at": meta["rg_published"]},
             {"name": "fd", "repo": meta["fd_repo"], "tag": meta["fd_tag"], "published_at": meta["fd_published"]},
@@ -273,8 +272,7 @@ fact meta tag "$pi_tag"
 fact meta commit "$commit"
 fact meta published_at "$pi_published"
 fact meta read_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-fact meta base_ref "$base_ref"
-fact meta base_digest "$base_digest"
+fact meta base "$base"
 fact meta rg_repo "$rg_repo"
 fact meta rg_tag "$rg_tag"
 fact meta rg_published "$rg_published"
