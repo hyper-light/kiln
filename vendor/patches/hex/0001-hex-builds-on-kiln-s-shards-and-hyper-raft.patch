@@ -1,0 +1,767 @@
+Subject: Hex builds on kiln's Shards and hyper-raft
+Why: kiln holds one copy of each project (docs/vendoring.md), and Hex at d84730ee pins older ones: Shards at 482c5d78 and hyper-raft at 0856e05 with changes of its own. Its pins move to kiln's (Shards e55eea10, hyper-raft fb74b595), its records of hyper-raft's changes are kiln's (Hex's suite reading among them, kiln's 0005; its qlog and buffer-growth changes left for Hex and kiln to agree), and its image class takes Shards' API there: a narrowing names its destinations (D236; none kept, as egress and MCP, default deny), a published port names whom it reaches (Bound::to), a spec asks no nesting grant (D234), a boot takes a patience (Duration::MAX, as the boot was before: the box's own wait bounds it), and a plug's refusal (D235) is the call's. Its own tests' model of Shards takes the same (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16).
+
+diff --git a/crates/hex-runtime/src/grants.rs b/crates/hex-runtime/src/grants.rs
+index 23524723a7d22b669ecd85d6a77e15cda7618333..6b60d09839da1594c5ed2d3b63f7e76bac18d255 100644
+--- a/crates/hex-runtime/src/grants.rs
++++ b/crates/hex-runtime/src/grants.rs
+@@ -75,6 +75,7 @@ pub fn program(image: &ShardsImage) -> Result<ImageNetwork, Refusal> {
+         egress: Narrowing {
+             egress: Keep::Only(Vec::new()),
+             mcp: Keep::Only(Vec::new()),
++            destinations: Keep::Only(Vec::new()),
+             dns: false,
+         },
+     })
+diff --git a/crates/hex-runtime/src/grants/tests.rs b/crates/hex-runtime/src/grants/tests.rs
+index ada98540d5d1c0274b0f59af85aa15b9f64839c9..c1d0925c5fc0674018548675c2363b85c5c3d329 100644
+--- a/crates/hex-runtime/src/grants/tests.rs
++++ b/crates/hex-runtime/src/grants/tests.rs
+@@ -12,6 +12,7 @@ fn nothing_kept() -> Narrowing {
+     Narrowing {
+         egress: Keep::Only(Vec::new()),
+         mcp: Keep::Only(Vec::new()),
++        destinations: Keep::Only(Vec::new()),
+         dns: false,
+     }
+ }
+@@ -323,6 +324,7 @@ fn bound_at(guest_port: u16, at: &str) -> shards_api::image::Bound {
+         guest_port,
+         proto: shards_api::image::Proto::Tcp,
+         host: at.parse().unwrap(),
++        to: Vec::new(),
+     }
+ }
+ 
+diff --git a/crates/hex-runtime/src/guest/image.rs b/crates/hex-runtime/src/guest/image.rs
+index 1cdbe2d18508a4299ed0b51fe0dfa3b37b279c01..bedf0bd15fb70754922c8ec2107e180289550f3f 100644
+--- a/crates/hex-runtime/src/guest/image.rs
++++ b/crates/hex-runtime/src/guest/image.rs
+@@ -196,6 +196,10 @@ fn refused(id: &BoxId, op: &'static str, why: ImageRefusal) -> Refusal {
+             op,
+             why: format!("the run host: {why}"),
+         },
++        ImageRefusal::Plug(cause, why) => Refusal::Os {
++            op,
++            why: format!("the plug: {cause:?}: {why}"),
++        },
+         ImageRefusal::Os { what, kind } => Refusal::Os {
+             op: what,
+             why: format!("{kind:?}"),
+@@ -450,6 +454,9 @@ impl GuestRuntime {
+             publish: network.publish,
+             egress: network.egress,
+             shares: Vec::new(),
++            // D234's nesting grant is no harness's: the image class asks none.
++            nesting: false,
++            ready_by: None,
+             binary: Some(self.config.binary.clone()),
+             env,
+         })
+@@ -633,7 +640,9 @@ impl GuestRuntime {
+         let asked = Instant::now();
+         let spawned = std::thread::Builder::new()
+             .name("hex-image-boot".to_owned())
+-            .spawn(move || answer.put(images.boot(&spec)));
++            // Unbounded there, as D231's boot was before it took a patience: the box's own wait bounds the
++            // call (`waits.boot`), and the run host ends with the boot it no longer waits for.
++            .spawn(move || answer.put(images.boot(&spec, Duration::MAX)));
+         if let Err(why) = spawned {
+             // No boot began: the box ends, its intent's record kept with its end.
+             image.insert(&id, Run::Ended(Exit::Unknown))?;
+diff --git a/crates/hex-runtime/src/guest/image_tests.rs b/crates/hex-runtime/src/guest/image_tests.rs
+index f1b232c6f5f95b86a0517a6509d3684a2670fded..73633a687f24bb83c5bf9bec09104cb73da5f94b 100644
+--- a/crates/hex-runtime/src/guest/image_tests.rs
++++ b/crates/hex-runtime/src/guest/image_tests.rs
+@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
+ use super::*;
+ use crate::devices::{Books, Records, Transaction};
+ use hex_api::{Allocation, Bounds, Capacity, CapacityResources, DeviceInfo, Runtime};
+-use shards_api::image::{Bound, Channel, Keep, MemberEnd, MemberInfo, MemberName};
++use shards_api::image::{Bound, Channel, Keep, MemberEnd, MemberInfo, MemberName, Ready};
+ 
+ /// A record owner keeping the node Store's rules (hex-node's `Store::update_lifecycle`): a first record
+ /// is Creating; Creating becomes anything, Ready Ready or Deleting, Deleting Deleting alone; an exit, once
+@@ -208,6 +208,31 @@ impl ImageGuest for ModelGuest {
+     fn wait_member(&self, _: &MemberName, _: Duration) -> Result<Option<MemberEnd>, ImageRefusal> {
+         Ok(None)
+     }
++    fn wait_ready(&self, _: Option<Ready>, _: Duration) -> Result<Option<Ready>, ImageRefusal> {
++        Err(ImageRefusal::Unsupported {
++            what: "the model's readiness",
++            why: "it asks no nesting grant".to_owned(),
++        })
++    }
++    fn plug(
++        &self,
++        _: &MemberName,
++        _: &std::path::Path,
++        _: &str,
++        _: bool,
++        _: Duration,
++    ) -> Result<(), ImageRefusal> {
++        Err(ImageRefusal::Unsupported {
++            what: "the model's plugs",
++            why: "it has none".to_owned(),
++        })
++    }
++    fn unplug(&self, _: &str, _: Duration) -> Result<(), ImageRefusal> {
++        Err(ImageRefusal::Unsupported {
++            what: "the model's plugs",
++            why: "it has none".to_owned(),
++        })
++    }
+     fn stats(&self, _: StatsScope, _: Duration) -> Result<Stats, ImageRefusal> {
+         match self.run.end.lock().unwrap().clone() {
+             Some(end) => Err(ImageRefusal::Ended(end)),
+@@ -258,7 +283,7 @@ impl Images for ModelImages {
+     fn backend(&self) -> Result<shards_api::Backend, ImageRefusal> {
+         Ok(shards_api::Backend::Kvm)
+     }
+-    fn boot(&self, spec: &ImageSpec) -> Result<Box<dyn ImageGuest>, ImageRefusal> {
++    fn boot(&self, spec: &ImageSpec, _: Duration) -> Result<Box<dyn ImageGuest>, ImageRefusal> {
+         self.asked.lock().unwrap().push(spec.clone());
+         let open = self.open.lock().unwrap();
+         drop(self.opened.wait_while(open, |open| !*open).unwrap());
+@@ -281,6 +306,7 @@ impl Images for ModelImages {
+                         publish.host_port
+                     },
+                 ),
++                to: Vec::new(),
+             })
+             .collect();
+         Ok(Box::new(ModelGuest {
+diff --git a/vendor/MANIFEST.toml b/vendor/MANIFEST.toml
+index 24e8c560102dc64b0e0d1d92ad5b53f51780f68f..c7f616e9f6ffe07ed5b6eea203bd9d1e1500b137 100644
+--- a/vendor/MANIFEST.toml
++++ b/vendor/MANIFEST.toml
+@@ -33,7 +33,7 @@ own = ["UPSTREAM.md"]
+ [projects.hyper-raft]
+ kind = "git"
+ repository = "https://github.com/hyper-light/hyper-raft"
+-commit = "0856e05df3d136f0870a98808113294a73399206"
++commit = "fb74b59533908472ade7e526eb08117601cede0e"
+ path = "vendor/hyper-raft"
+ take = [
+     "Cargo.toml",
+@@ -110,7 +110,7 @@ own = ["UPSTREAM.md"]
+ [projects.shards]
+ kind = "git"
+ repository = "https://github.com/hyper-light/shards"
+-commit = "482c5d7856dfea06d167202876ecd430a680eada"
++commit = "e55eea102ff87fa91a5967ce4b24bde5103e82e1"
+ path = "vendor/shards"
+ take = ["LICENSE", "AGENTS.md", "CLAUDE.md", "clippy.toml", "rustfmt.toml", "docs/development-rules.md", "docs/development-evidence.md", "crates/api", "crates/abi", "crates/afunix", "crates/testdir", "docs/research/measurements/managed-borrowed-nowait/focused.rs", "docs/research/measurements/managed-borrowed-nowait/contract.rs", "docs/research/measurements/managed-proc-main/allocation.rs", "docs/research/measurements/managed-proc-main/repro.rs", "docs/research/measurements/managed-proc-main/reader-tests.rs"]
+ own = ["Cargo.toml", "UPSTREAM.md"]
+@@ -125,7 +125,7 @@ own = ["Cargo.toml", "UPSTREAM.md"]
+ [projects.shards-gpu]
+ kind = "git"
+ repository = "https://github.com/hyper-light/shards"
+-commit = "482c5d7856dfea06d167202876ecd430a680eada"
++commit = "e55eea102ff87fa91a5967ce4b24bde5103e82e1"
+ path = "vendor/shards-gpu"
+ take = [
+     "LICENSE",
+diff --git a/vendor/patches/hyper-raft/0001-hyper-transport-takes-hyper-quic-without-its-qlog-traces.patch b/vendor/patches/hyper-raft/0001-hyper-transport-takes-hyper-quic-without-its-qlog-traces.patch
+deleted file mode 100644
+index 57fb3cd112c9cd9e26d817bb8d4ca963b06b8307..0000000000000000000000000000000000000000
+--- a/vendor/patches/hyper-raft/0001-hyper-transport-takes-hyper-quic-without-its-qlog-traces.patch
++++ /dev/null
+@@ -1,19 +0,0 @@
+-Subject: hyper-transport takes hyper-quic without its qlog traces
+-Why: hyper-transport makes no qlog trace, and hyper-quic's default qlog feature turns on serde_json's preserve_order for every crate of the build it joins (hyper-quic VENDORED.md section 20), which would change the key order of every JSON document Hex writes; Hex asks hyper-quic without it by name, as Shards does, and this keeps hyper-transport's own path dependency from turning it back on.
+-
+-diff --git a/crates/hyper-transport/Cargo.toml b/crates/hyper-transport/Cargo.toml
+-index b634d13c453dd8eec50e8e15beb3e208addb183e..a99b849f0477cdce016d8887d04e11330bc49e9f 100644
+---- a/crates/hyper-transport/Cargo.toml
+-+++ b/crates/hyper-transport/Cargo.toml
+-@@ -8,7 +8,10 @@ license.workspace = true
+- repository.workspace = true
+- 
+- [dependencies]
+--hyper-quic = { path = "../hyper-quic" }
+-+# Without hyper-quic's qlog traces, which hyper-transport never makes: the `qlog` crate turns on serde_json's
+-+# `preserve_order` for the whole build it is in (hyper-quic VENDORED.md §20). hyper-quic's own features stay
+-+# what each consumer asks of it by name.
+-+hyper-quic = { path = "../hyper-quic", default-features = false }
+- hyper-timing = { path = "../hyper-timing" }
+- # The key an endpoint keeps across its restarts is expanded by HKDF into its reset key, an HMAC key
+- # (`RestartKey`), the provider hyper-quic's reset tokens are made with.
+diff --git a/vendor/patches/hyper-raft/0001-ramstore-for-tests-alone-the-write-ahead-log-mandatory.patch b/vendor/patches/hyper-raft/0001-ramstore-for-tests-alone-the-write-ahead-log-mandatory.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1c272e19aa8dc358f646391a5ed4a141fc700b5
+--- /dev/null
++++ b/vendor/patches/hyper-raft/0001-ramstore-for-tests-alone-the-write-ahead-log-mandatory.patch
+@@ -0,0 +1,49 @@
++Subject: RamStore for tests alone: the write-ahead log mandatory
++Why: Quiver's plan mandates hyper-durable's GroupStore on a real device and makes RamStore test-only (kiln's CP-T2.1, T-T2.1.2: RamStore outside cfg(test) fails the build). RamStore is compiled only for this crate's own tests or where a dev-dependency asks for the test-store feature, so a production build that names it fails; the crate's own tests ask for it through a dev-dependency on itself.
++
++diff --git a/crates/hyper-durable/Cargo.toml b/crates/hyper-durable/Cargo.toml
++index f66cfbc934ba1ab814a6f960fb34756a45bcb5a2..b830fd642d13d00939d1c2edfbaec6146cf392f4 100644
++--- a/crates/hyper-durable/Cargo.toml
+++++ b/crates/hyper-durable/Cargo.toml
++@@ -11,6 +11,10 @@ repository.workspace = true
++ # A defect planted in the replica's core (`Replica::plant`, `hyper_raft::Mutant`), for a test build
++ # that shows its checks catch it; no consumer enables it.
++ mutants = ["hyper-raft/mutants"]
+++# `RamStore`, a store whose writes complete as they're submitted, for tests alone: a dev-dependency
+++# asks for it (this crate's own tests, below). Quiver's and kiln's copies make it so, as the
+++# write-ahead log is mandatory there (Quiver's docs/design/focal-bus.md, "GroupStore mandated").
+++test-store = []
++ 
++ [dependencies]
++ hyper-block = { path = "../hyper-block" }
++@@ -21,6 +25,7 @@ hyper-timing = { path = "../hyper-timing" }
++ thiserror.workspace = true
++ 
++ [dev-dependencies]
+++hyper-durable = { path = ".", features = ["test-store"] }
++ hyper-block = { path = "../hyper-block", features = ["sim"] }
++ # The oracles the simulated groups are held to, and their crash enumeration by fork (docs/sim.md
++ # S-6, `tests/support/cluster.rs`).
++diff --git a/crates/hyper-durable/src/lib.rs b/crates/hyper-durable/src/lib.rs
++index 84745497b55c3f4ccfc42f75cb5e0bb51648b2a3..4eeba92f61e88afddc3e8cc03d286817c5608d0b 100644
++--- a/crates/hyper-durable/src/lib.rs
+++++ b/crates/hyper-durable/src/lib.rs
++@@ -39,6 +39,10 @@ mod compaction;
++ mod held;
++ mod hyperlog;
++ mod machine;
+++// A store whose writes complete as they're submitted: for tests alone where this copy is built
+++// (Quiver's and kiln's: the write-ahead log is mandatory there), its feature asked for by a
+++// dev-dependency.
+++#[cfg(any(test, feature = "test-store"))]
++ mod memory;
++ mod owner;
++ mod patience;
++@@ -50,6 +54,7 @@ pub use compaction::Compaction;
++ pub use held::Held;
++ pub use hyperlog::{ClaimError, ENTRY_OVERHEAD, GroupStore, LogGroups, decode_entry, encode_entry};
++ pub use machine::{Fatal, StateMachine};
+++#[cfg(any(test, feature = "test-store"))]
++ pub use memory::RamStore;
++ pub use owner::{Full, Handle, Owner};
++ pub use replica::{
+diff --git a/vendor/patches/hyper-raft/0002-hyper-transport-says-which-suite-and-group-a-connection.patch b/vendor/patches/hyper-raft/0002-hyper-transport-says-which-suite-and-group-a-connection.patch
+deleted file mode 100644
+index 0e8390c887eaec5220d0cee3418548aa6ffbe0e9..0000000000000000000000000000000000000000
+--- a/vendor/patches/hyper-raft/0002-hyper-transport-says-which-suite-and-group-a-connection.patch
++++ /dev/null
+@@ -1,37 +0,0 @@
+-Subject: hyper-transport says which suite and group a connection negotiated
+-Why: Every link of the joint kiln, Hex and Shards plan takes TLS13_AES_256_GCM_SHA384 alone, and a test at each end of a connection asserts the suite it negotiated (Ada, 2026-11-11: "all such communications should be AESGCM256 bidirectional encrypted"); hyper-transport holds each connection's TLS session and gave no way to read it. Endpoint::negotiated reads it from hyper-quic's handshake data, as kiln's reach links read theirs from rustls.
+-
+-diff --git a/crates/hyper-transport/src/endpoint.rs b/crates/hyper-transport/src/endpoint.rs
+-index 02865bb3a70485fbf765830109fce73cf016651d..2cab7925d53964cb99f03b8ce63261ecce9e059c 100644
+---- a/crates/hyper-transport/src/endpoint.rs
+-+++ b/crates/hyper-transport/src/endpoint.rs
+-@@ -1768,6 +1768,29 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C,
+-         Ok(conn.epoch)
+-     }
+- 
+-+    /// The TLS 1.3 cipher suite and key exchange group the connection to `peer` negotiated, once
+-+    /// its handshake has chosen them: what an owner whose links take one suite alone reports and
+-+    /// asserts, at each end of a connection. `None` without a connection to `peer`, or before its
+-+    /// handshake has chosen a suite.
+-+    pub fn negotiated(
+-+        &self,
+-+        peer: PeerId,
+-+    ) -> Option<(
+-+        hyper_quic::rustls::CipherSuite,
+-+        Option<hyper_quic::rustls::NamedGroup>,
+-+    )> {
+-+        let key = self.core.connection_of(peer)?;
+-+        let conn = self.conns.get(key)?.as_ref()?;
+-+        let data = conn.quic.crypto_session().handshake_data()?;
+-+        let data = data
+-+            .downcast::<hyper_quic::crypto::rustls::HandshakeData>()
+-+            .ok()?;
+-+        Some((
+-+            data.negotiated_cipher_suite?,
+-+            data.negotiated_key_exchange_group,
+-+        ))
+-+    }
+-+
+-     /// Whether the connection of `epoch` to `peer` is up. A peer may hold several connections at
+-     /// once (its identity's, up to its admission bound), and only its current one's lifecycle is
+-     /// an event ([`Event::Connected`], [`Event::Closed`]): an owner that keeps something for each
+diff --git a/vendor/patches/hyper-raft/0003-driver-poll-received-a-turn-s-events-before-its-sends.patch b/vendor/patches/hyper-raft/0003-driver-poll-received-a-turn-s-events-before-its-sends.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..e79a70b7372b96fa7a96566ba294e371f6153a70
+--- /dev/null
++++ b/vendor/patches/hyper-raft/0003-driver-poll-received-a-turn-s-events-before-its-sends.patch
+@@ -0,0 +1,362 @@
++Subject: Driver::poll_received, a turn's events before its sends
++Why: An owner that passes what comes in onward waited for each turn's sends before the turn's first event: Driver::poll_event takes what arrived, sends, then hands out. poll_received is the same turn split at that seam, an event the receive half made handed out before the send half, which the caller makes with flush in the same turn (its doc says what it owes, and what holding it costs the peer's round trip and congestion window); poll_event is built from the same pieces and does what it did. kiln's net thread hands a turn's frames to its shards before the turn's sends (kiln's goal 10, plan 01a1a87b2dae step 5). Offered upstream; no other caller calls it
++
++diff --git a/crates/hyper-rt-transport/src/driver.rs b/crates/hyper-rt-transport/src/driver.rs
++index 4d8ab462269ed0bd2e965d7b6380fae883020564..4bde16ab64bcf88b369835658e1e6b9ab9690aa4 100644
++--- a/crates/hyper-rt-transport/src/driver.rs
+++++ b/crates/hyper-rt-transport/src/driver.rs
++@@ -106,6 +106,14 @@ struct Held {
++     segment: usize,
++ }
++ 
+++/// Where a turn hands out an event its receives made: after the turn's sends ([`Driver::poll_event`]),
+++/// or before them, the caller to make them ([`Driver::poll_received`]).
+++#[derive(Clone, Copy, PartialEq, Eq)]
+++enum HandOut {
+++    AfterSends,
+++    BeforeSends,
+++}
+++
++ /// The kernel's account of a queue, as hyper-transport takes it.
++ fn account(charge: QueueCharge) -> Account {
++     Account {
++@@ -561,43 +569,53 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
++     /// most one poll and never starves them. Datagrams taken in the drain are told at their reads,
++     /// after the reading the timers are judged at; the turn sends at a reading after both.
++     pub fn poll_event(&mut self, context: &mut Context<'_>) -> Poll<Result<Event<C>, RtError>> {
+++        self.turns(context, HandOut::AfterSends)
+++    }
+++
+++    /// The endpoint's next event, a turn's handed out before that turn's sends, which the caller then
+++    /// owes ([`Driver::poll_received`]). Cancel-safe.
+++    pub async fn received(&mut self) -> Result<Event<C>, RtError> {
+++        poll_fn(|context| self.poll_received(context)).await
+++    }
+++
+++    /// [`Driver::poll_event`] with a turn's events handed out before its sends: each turn takes what
+++    /// arrived and fires the timers due, and an event that made goes at once, the turn's sends not yet
+++    /// made; a turn that made none sends, and hands out an event its sends made or arms and parks, as
+++    /// `poll_event`'s does. For an owner that passes what comes in onward (to another thread) and would
+++    /// not have it wait for the turn's sends.
+++    ///
+++    /// The caller owes those sends: what the turn's receives and timers have the endpoint transmit, the
+++    /// acknowledgements due, retransmissions and probes, data a window or the congestion window let go,
+++    /// a handshake's next flight. It makes them with [`Driver::flush`] once it has taken the turn's
+++    /// events (`endpoint().poll_event()` until none), before it awaits anything else. Until then none
+++    /// of them leaves: each moment held is added to the peer's round-trip samples of the packets they
+++    /// acknowledge (its smoothed round trip and probe timeout grow, and a hold past that timeout has it
+++    /// probe and send again), the peer's congestion window, which these acknowledgements clock, stops
+++    /// growing, and this endpoint's own retransmissions wait. A caller that polls again instead has
+++    /// them sent only at a turn that makes no event: under a steady stream of events, never.
+++    pub fn poll_received(&mut self, context: &mut Context<'_>) -> Poll<Result<Event<C>, RtError>> {
+++        self.turns(context, HandOut::BeforeSends)
+++    }
+++
+++    /// The turns of [`Driver::poll_event`] and [`Driver::poll_received`], which differ only in where a
+++    /// turn hands out an event its receives made (`hand_out`).
+++    fn turns(
+++        &mut self,
+++        context: &mut Context<'_>,
+++        hand_out: HandOut,
+++    ) -> Poll<Result<Event<C>, RtError>> {
++         if let Some(event) = self.endpoint.poll_event() {
++             return Poll::Ready(Ok(event));
++         }
++         for turn in 0..TURNS {
++-            if let Err(error) = self.reconcile() {
++-                return Poll::Ready(Err(error));
++-            }
++-            // The readiness is taken after the clock is read, so a socket a datagram reached by
++-            // then is drained in this turn.
++-            let cutoff = match shard_now() {
++-                Ok(cutoff) => cutoff,
++-                Err(error) => return Poll::Ready(Err(error)),
++-            };
++-            if let Err(error) = self.take_ready(context) {
++-                return Poll::Ready(Err(error));
++-            }
++-            let whole = match self.drain(cutoff) {
++-                Ok(whole) => whole,
++-                Err(error) => return Poll::Ready(Err(error)),
++-            };
++-            let cutoff = self.instant(cutoff);
++-            if (whole || turn.saturating_add(1) == TURNS)
++-                && self
++-                    .endpoint
++-                    .poll_timeout()
++-                    .is_some_and(|due| due <= cutoff)
++-            {
++-                self.endpoint.handle_timeout(cutoff);
++-            }
++-            let now = match self.now() {
+++            let now = match self.receive(context, turn.saturating_add(1) == TURNS) {
++                 Ok(now) => now,
++                 Err(error) => return Poll::Ready(Err(error)),
++             };
++-            // A connection established in this turn's receives has its socket, and its path's
++-            // ceiling, before its first transmission: its first MTU probe is never past the path.
++-            if let Err(error) = self.reconcile() {
++-                return Poll::Ready(Err(error));
+++            if hand_out == HandOut::BeforeSends
+++                && let Some(event) = self.endpoint.poll_event()
+++            {
+++                return Poll::Ready(Ok(event));
++             }
++             let more = self.send(now);
++             if let Some(event) = self.endpoint.poll_event() {
++@@ -643,6 +661,28 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
++         Ok(())
++     }
++ 
+++    /// A turn's receive half: the peers' sockets matched to the endpoint's connections, the clock
+++    /// read, the readiness that fired taken (arming none), what arrived by that reading drained, the
+++    /// timers due at it fired where every drain was whole or at the poll's `last` turn
+++    /// ([`Driver::poll_event`]), and the sockets matched again. Now, for the turn's send half.
+++    fn receive(&mut self, context: &mut Context<'_>, last: bool) -> Result<Instant, RtError> {
+++        self.reconcile()?;
+++        // The readiness is taken after the clock is read, so a socket a datagram reached by then is
+++        // drained in this turn.
+++        let cutoff = shard_now()?;
+++        self.take_ready(context)?;
+++        let whole = self.drain(cutoff)?;
+++        let cutoff = self.instant(cutoff);
+++        if (whole || last) && self.endpoint.poll_timeout().is_some_and(|due| due <= cutoff) {
+++            self.endpoint.handle_timeout(cutoff);
+++        }
+++        let now = self.now()?;
+++        // A connection established in this turn's receives has its socket, and its path's
+++        // ceiling, before its first transmission: its first MTU probe is never past the path.
+++        self.reconcile()?;
+++        Ok(now)
+++    }
+++
++     /// Polls the sockets' readiness waits, arming them as needed; whether one fired. The listener's
++     /// are waits of their own; the peers' are members of the driver's group, which tells what fired
++     /// alone, so a park costs the peers that fired or are to be armed, not every peer held.
++diff --git a/crates/hyper-rt-transport/tests/received.rs b/crates/hyper-rt-transport/tests/received.rs
++new file mode 100644
++index 0000000000000000000000000000000000000000..8109be84978275d4d4ed292b5b383e12ec2ee1f5
++--- /dev/null
+++++ b/crates/hyper-rt-transport/tests/received.rs
++@@ -0,0 +1,221 @@
+++//! `Driver::poll_received` hands out a turn's events before the turn's sends, which its caller then
+++//! makes (`Driver::flush`); `Driver::poll_event` sends first, as before. Do: a client connects to a
+++//! server polled with the one, then with the other, the caller flushing after each event it takes,
+++//! and sends it frames. Expect: the server's turn that ends the handshake hands out its `Connected`
+++//! from `poll_received` with the server's next flight (the handshake's end, its acknowledgement of the
+++//! client's) still to send, which the flush sends; from `poll_event`, with that flight already sent,
+++//! the flush finding nothing. Either way every frame arrives.
+++
+++#![allow(
+++    clippy::unwrap_used,
+++    clippy::expect_used,
+++    clippy::panic,
+++    clippy::indexing_slicing,
+++    clippy::arithmetic_side_effects,
+++    clippy::disallowed_macros,
+++    clippy::disallowed_methods,
+++    clippy::cognitive_complexity,
+++    clippy::too_many_lines,
+++    dead_code,
+++    missing_docs
+++)]
+++
+++#[path = "../../hyper-transport/tests/common/mod.rs"]
+++mod common;
+++
+++use std::future::{Future, poll_fn};
+++use std::net::SocketAddr;
+++use std::pin::pin;
+++use std::task::Poll;
+++use std::time::{Duration, Instant};
+++
+++use common::*;
+++use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
+++use hyper_rt_transport::{Driver, Io};
+++use hyper_transport::{Config, Endpoint, Event, Fixed, Refusal};
+++
+++type Drv = Driver<Mantle, Fixed, Book>;
+++
+++/// Datagrams a system call carries: one QUIC initial window (RFC 9002 §7.2).
+++const IO: Io = Io { batch: 10 };
+++/// The failure guard of a run, far past anything loopback needs.
+++const GUARD: Duration = Duration::from_secs(60);
+++/// The frames the client sends once connected, a thousand bytes each.
+++const FRAMES: u32 = 256;
+++/// The server is node 2 in the client's directory, the client node 1 in the server's.
+++const SERVER: u64 = 2;
+++const CLIENT: u64 = 1;
+++
+++fn config() -> RuntimeConfig {
+++    RuntimeConfig {
+++        shards: 1,
+++        tasks_per_shard: 64,
+++        timers_per_shard: 64,
+++        interests_per_shard: 64,
+++        ring_entries: 64,
+++        step_budget_ns: 1_000_000_000,
+++        timer_tick_ns: 100_000,
+++        batch: 64,
+++        pin: false,
+++        cores: Vec::new(),
+++        page_bytes: 4096,
+++        spin_ns: 0,
+++        wake_tracking: None,
+++        latency_objective_ns: None,
+++    }
+++}
+++
+++fn endpoint(
+++    pki: &Pki,
+++    own: &(Vec<u8>, Vec<u8>),
+++    other: &[u8],
+++    peer: u64,
+++    listen: bool,
+++) -> Endpoint<Mantle, Fixed, Book> {
+++    let mut book = Book::default();
+++    book.add(other, peer, Role::Node);
+++    let config = Config {
+++        tls: hyper_transport::tls::Tls::mutual(&credentials(&pki.root, &own.0, &own.1), listen)
+++            .unwrap(),
+++        role: Role::Node,
+++        limits: limits(),
+++        congestion: Default::default(),
+++    };
+++    Endpoint::new(config, Fixed::new(512 << 20, 64), book, Instant::now()).unwrap()
+++}
+++
+++/// The datagrams `driver` has sent, by its listener and its peers' sockets.
+++fn sent(driver: &Drv) -> u64 {
+++    driver.stats().sent + driver.peer_stats().sent
+++}
+++
+++/// What a run saw: the datagrams the flush after the server's `Connected` sent, which its turn had
+++/// left to send, and the frames that arrived.
+++struct Seen {
+++    owed: u64,
+++    frames: u32,
+++}
+++
+++/// A client connects to a server polled with `poll_received` (`received`) or `poll_event`, the
+++/// server's caller flushing after each event it takes, and sends it [`FRAMES`] frames.
+++fn run(received: bool) -> Seen {
+++    let pki = Pki::new();
+++    let one = pki.issue(&name(1));
+++    let two = pki.issue(&name(2));
+++    let mut rt = LocalRuntime::new(&config()).unwrap();
+++    rt.block_on(async move {
+++        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+++        let mut server: Drv =
+++            Driver::bind(endpoint(&pki, &two, &one.0, CLIENT, true), loopback, IO).unwrap();
+++        let server_addr = server.local_addr().unwrap();
+++        let mut client: Drv =
+++            Driver::bind(endpoint(&pki, &one, &two.0, SERVER, false), loopback, IO).unwrap();
+++        let now = client.clock().unwrap();
+++        client.endpoint().connect(now, SERVER, server_addr).unwrap();
+++        let began = Instant::now();
+++        let frame = [5u8; 1_000];
+++        let (mut connected, mut sent_frames, mut steps) = (false, 0, 0u64);
+++        let mut seen = Seen {
+++            owed: u64::MAX,
+++            frames: 0,
+++        };
+++        while seen.owed == u64::MAX || seen.frames < FRAMES {
+++            assert!(
+++                began.elapsed() < GUARD,
+++                "{} of {FRAMES} frames arrived, connected: {connected}",
+++                seen.frames
+++            );
+++            while connected && sent_frames < FRAMES {
+++                match client
+++                    .endpoint()
+++                    .send_frame(SERVER, 0, Kind::Append, &frame)
+++                {
+++                    Ok(()) => sent_frames += 1,
+++                    Err(Refusal::LaneFull) => break,
+++                    Err(other) => panic!("{other:?}"),
+++                }
+++            }
+++            client.flush().unwrap();
+++            // The driver asked first alternates, so neither side's events starve the other's
+++            // (peer_sockets.rs, `step`).
+++            let mut tick = pin!(hyper_rt::futures::sleep(1_000_000));
+++            let server_first = steps.is_multiple_of(2);
+++            steps += 1;
+++            let next = poll_fn(|context| {
+++                for side in if server_first {
+++                    [SERVER, CLIENT]
+++                } else {
+++                    [CLIENT, SERVER]
+++                } {
+++                    let polled = match (side, received) {
+++                        (SERVER, true) => server.poll_received(context),
+++                        (SERVER, false) => server.poll_event(context),
+++                        _ => client.poll_event(context),
+++                    };
+++                    if let Poll::Ready(event) = polled {
+++                        return Poll::Ready(Some((side, event.unwrap())));
+++                    }
+++                }
+++                if tick.as_mut().poll(context).is_ready() {
+++                    return Poll::Ready(None);
+++                }
+++                Poll::Pending
+++            })
+++            .await;
+++            let Some((side, first)) = next else {
+++                continue;
+++            };
+++            if side == CLIENT {
+++                let mut next = Some(first);
+++                while let Some(event) = next {
+++                    match event {
+++                        Event::Connected { .. } => connected = true,
+++                        Event::Frame { frame, .. } => client.endpoint().release(frame),
+++                        _ => {}
+++                    }
+++                    next = client.endpoint().poll_event();
+++                }
+++                continue;
+++            }
+++            // What the server had sent as its driver handed the turn's first event out, and after the
+++            // flush that makes the turn's sends; its events are taken first, as the method asks.
+++            let before = sent(&server);
+++            let mut ends_handshake = false;
+++            let mut next = Some(first);
+++            while let Some(event) = next {
+++                match event {
+++                    Event::Connected { .. } => ends_handshake = true,
+++                    Event::Frame { frame, .. } => {
+++                        seen.frames += 1;
+++                        server.endpoint().release(frame);
+++                    }
+++                    _ => {}
+++                }
+++                next = server.endpoint().poll_event();
+++            }
+++            server.flush().unwrap();
+++            if ends_handshake {
+++                seen.owed = sent(&server) - before;
+++            }
+++        }
+++        seen
+++    })
+++    .unwrap()
+++}
+++
+++#[test]
+++fn a_turns_event_comes_out_of_poll_received_before_the_turns_sends() {
+++    let received = run(true);
+++    assert!(
+++        received.owed > 0,
+++        "the turn that ended the handshake had sent its next flight when poll_received handed out its event"
+++    );
+++    assert_eq!(received.frames, FRAMES);
+++    let event = run(false);
+++    assert_eq!(
+++        event.owed, 0,
+++        "the turn that ended the handshake left {} datagrams to send when poll_event handed out its event",
+++        event.owed
+++    );
+++    assert_eq!(event.frames, FRAMES);
+++}
+diff --git a/vendor/patches/hyper-raft/0003-hyper-transport-grows-its-spare-buffers-and-receive-chunks-to-their-bounds.patch b/vendor/patches/hyper-raft/0003-hyper-transport-grows-its-spare-buffers-and-receive-chunks-to-their-bounds.patch
+deleted file mode 100644
+index 55933285034e42fbbee0cb8ba8097a3b84a33be2..0000000000000000000000000000000000000000
+--- a/vendor/patches/hyper-raft/0003-hyper-transport-grows-its-spare-buffers-and-receive-chunks-to-their-bounds.patch
++++ /dev/null
+@@ -1,35 +0,0 @@
+-Subject: hyper-transport grows its spare buffers and receive chunks to their bounds
+-Why: Fixed::new laid out room for max_spare buffers and Receive::new for its limit of chunks at the start, so an endpoint's bounds were paid as memory before any peer came: a Hex node's bounds are its own (its connections and programs, docs/design/hex-quic.md Q8), and a client's lanes are its descriptors (2^23 on Windows), which laid out hundreds of megabytes, or more than a process can allocate. Each now grows as buffers and chunks come, to the same bound.
+-
+-diff --git a/crates/hyper-transport/src/budget.rs b/crates/hyper-transport/src/budget.rs
+-index 95516f7c8c16a719d5cf1053a34f4dc54b380133..6ffc1998f1400b843c1bb442521831d0be3ecc4e 100644
+---- a/crates/hyper-transport/src/budget.rs
+-+++ b/crates/hyper-transport/src/budget.rs
+-@@ -133,7 +133,9 @@ impl Fixed {
+-         Self {
+-             capacity,
+-             used: 0,
+--            spare: Vec::with_capacity(max_spare),
+-+            // Grown as buffers come back, to `max_spare` at most: a bound, never laid out ahead, so an
+-+            // owner whose bounds are large pays only for the buffers it holds.
+-+            spare: Vec::new(),
+-             max_spare,
+-             refused: 0,
+-         }
+-diff --git a/crates/hyper-transport/src/receive.rs b/crates/hyper-transport/src/receive.rs
+-index 4390cd6719099dece22956f040bf04e07a619197..50434507b706872444e0430bbf85e7fe90195cf1 100644
+---- a/crates/hyper-transport/src/receive.rs
+-+++ b/crates/hyper-transport/src/receive.rs
+-@@ -47,8 +47,10 @@ impl Receive {
+-     pub(crate) fn new(limit: usize) -> Self {
+-         Self {
+-             active: None,
+--            retired: Vec::with_capacity(limit),
+--            grants: Vec::with_capacity(limit),
+-+            // Grown as chunks are added, to `limit` at most ([`Receive::grow`]): a bound, never laid out
+-+            // ahead, so an endpoint whose limits are large pays only for the chunks it holds.
+-+            retired: Vec::new(),
+-+            grants: Vec::new(),
+-             limit,
+-             copied: 0,
+-         }
+diff --git a/vendor/patches/hyper-raft/0004-hyper-tls-a-connection-s-largest-record-set-as-it-goes.patch b/vendor/patches/hyper-raft/0004-hyper-tls-a-connection-s-largest-record-set-as-it-goes.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..f980f79582b8d5f06fb9e25451b5cea5122ccfb7
+--- /dev/null
++++ b/vendor/patches/hyper-raft/0004-hyper-tls-a-connection-s-largest-record-set-as-it-goes.patch
+@@ -0,0 +1,22 @@
++Subject: hyper-tls: a connection's largest record set as it goes
++Why: kiln's browser protocol socket keeps each TLS record at most its chunk, which follows the path's rate (kiln's goal 3, plan 01a1a832eb2f711f9c6f51d88effe89d step 3): the configuration's max_fragment_size is fixed when the connection is made, before the server knows the connection carries that socket or what its chunk is
++
++diff --git a/crates/hyper-tls/src/conn.rs b/crates/hyper-tls/src/conn.rs
++index 16df6fb9a462199fa346fe7b7c61dd0ff13cc43a..8a8eb4cd3e2cab9d31e362febe23318fb21d9f3a 100644
++--- a/crates/hyper-tls/src/conn.rs
+++++ b/crates/hyper-tls/src/conn.rs
++@@ -483,6 +483,14 @@ impl<Data: SideData> ConnectionCommon<Data> {
++         self.sendable_tls.set_limit(limit);
++     }
++ 
+++    /// Sets the largest TLS record this connection sends from now on, header and all (`None`: TLS's
+++    /// own, 16 KiB), as the configuration's `max_fragment_size` does when the connection is made:
+++    /// for a connection whose records follow its path as it goes (kiln's browser protocol socket,
+++    /// whose records are at most its chunk). Records already made keep their size.
+++    pub fn set_max_fragment_size(&mut self, new: Option<usize>) -> Result<(), Error> {
+++        self.core.common_state.set_max_fragment_size(new)
+++    }
+++
++     /// Sends a TLS1.3 `key_update` message to refresh a connection's keys.
++     ///
++     /// This call refreshes our encryption keys. Once the peer receives the message,
+diff --git a/vendor/patches/hyper-raft/0005-hyper-transport-says-which-suite-and-group-a-connection.patch b/vendor/patches/hyper-raft/0005-hyper-transport-says-which-suite-and-group-a-connection.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6331a20c261acb722209bce34f238428d2d6387
+--- /dev/null
++++ b/vendor/patches/hyper-raft/0005-hyper-transport-says-which-suite-and-group-a-connection.patch
+@@ -0,0 +1,37 @@
++Subject: hyper-transport says which suite and group a connection negotiated
++Why: Every link of the joint kiln, Hex and Shards plan takes TLS13_AES_256_GCM_SHA384 alone, and a test at each end of a connection asserts the suite it negotiated (Ada, 2026-11-11: "all such communications should be AESGCM256 bidirectional encrypted"); hyper-transport holds each connection's TLS session and gave no way to read it. Endpoint::negotiated reads it from hyper-quic's handshake data, as kiln's reach links read theirs from rustls. Hex's own change (its vendor/patches/hyper-raft/0002), which hex-quic calls: kiln holds it so Hex builds on kiln's one hyper-raft.
++
++diff --git a/crates/hyper-transport/src/endpoint.rs b/crates/hyper-transport/src/endpoint.rs
++index 0b3d6d8507b01a352e2fe19f93ff8c46f292a148..9760487f2c1222be65990fa569b66b57a2bd6466 100644
++--- a/crates/hyper-transport/src/endpoint.rs
+++++ b/crates/hyper-transport/src/endpoint.rs
++@@ -1787,6 +1787,29 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C,
++         Ok(conn.epoch)
++     }
++ 
+++    /// The TLS 1.3 cipher suite and key exchange group the connection to `peer` negotiated, once
+++    /// its handshake has chosen them: what an owner whose links take one suite alone reports and
+++    /// asserts, at each end of a connection. `None` without a connection to `peer`, or before its
+++    /// handshake has chosen a suite.
+++    pub fn negotiated(
+++        &self,
+++        peer: PeerId,
+++    ) -> Option<(
+++        hyper_quic::rustls::CipherSuite,
+++        Option<hyper_quic::rustls::NamedGroup>,
+++    )> {
+++        let key = self.core.connection_of(peer)?;
+++        let conn = self.conns.get(key)?.as_ref()?;
+++        let data = conn.quic.crypto_session().handshake_data()?;
+++        let data = data
+++            .downcast::<hyper_quic::crypto::rustls::HandshakeData>()
+++            .ok()?;
+++        Some((
+++            data.negotiated_cipher_suite?,
+++            data.negotiated_key_exchange_group,
+++        ))
+++    }
+++
++     /// Whether the connection of `epoch` to `peer` is up. A peer may hold several connections at
++     /// once (its identity's, up to its admission bound), and only its current one's lifecycle is
++     /// an event ([`Event::Connected`], [`Event::Closed`]): an owner that keeps something for each

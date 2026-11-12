@@ -1,0 +1,2533 @@
+//! A run's admitted, independently credited owner-output channels (D180).
+
+#[cfg(test)]
+mod terminal_order_tests;
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read as _, Seek as _, Write as _};
+use std::mem::size_of;
+use std::path::Path;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
+
+use sha2::{Digest as _, Sha256};
+use shards_abi::run::{
+    self,
+    managed::{Channel, Event, Record, StreamState},
+};
+use shards_ipc::Stream;
+use shards_ipc::fd::AsRawFd as _;
+use shards_remote::{
+    identity::{self, Fingerprint},
+    managed::{Admitted, Control, Endpoint, Producer, Progress, Rejected, RunId, Scope, State},
+};
+
+use super::{Daemon, Disk, Threads, lock, log};
+
+const METADATA: &str = "managed-output";
+const GENERATION: &str = "managed-generation";
+// RFC 8446 §4: Handshake's uint24 length and four-byte type/length head.
+const HANDSHAKE_BYTES: usize = (1 << 24) - 1 + 4;
+
+#[derive(Debug)]
+pub(super) enum Failure {
+    Admission(Admission),
+    Auth(Auth),
+    Protocol(io::Error),
+    Transport(io::Error),
+    Endpoint(shards_remote::managed::Error),
+    Closed,
+}
+
+#[derive(Debug)]
+pub(super) enum Auth {
+    UnknownContext,
+    InvalidKey,
+}
+
+#[derive(Debug)]
+pub(super) enum Admission {
+    UnknownHeadroom,
+    Unavailable,
+    Insufficient { requested: u64, available: u64 },
+    Overflow,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(Admission::Insufficient { requested, available }) => write!(
+                out,
+                "managed output admission: {requested} bytes requested, {available} available (retry after headroom returns)"
+            ),
+            Self::Admission(reason) => write!(out, "managed output admission: {reason:?}"),
+            Self::Auth(reason) => write!(out, "managed output owner: {reason:?}"),
+            Self::Protocol(error) => write!(out, "managed output protocol: {error}"),
+            Self::Transport(error) => write!(out, "managed output transport: {error}"),
+            Self::Endpoint(error) => std::fmt::Display::fmt(error, out),
+            Self::Closed => out.write_str("managed output closed"),
+        }
+    }
+}
+impl std::error::Error for Failure {}
+impl From<Admission> for Failure {
+    fn from(reason: Admission) -> Self {
+        Self::Admission(reason)
+    }
+}
+impl From<io::Error> for Failure {
+    fn from(error: io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::InvalidData => Self::Protocol(error),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionAborted => {
+                Self::Closed
+            }
+            _ => Self::Transport(error),
+        }
+    }
+}
+
+pub(super) struct Outputs {
+    runs: Mutex<HashMap<String, Entry>>,
+    budget: Arc<Mutex<Option<u64>>>,
+}
+
+impl Default for Outputs {
+    fn default() -> Self {
+        Self {
+            runs: Mutex::default(),
+            budget: Arc::new(Mutex::new(Some(0))),
+        }
+    }
+}
+
+enum Entry {
+    Preparing,
+    Serving(Arc<Owner>),
+}
+
+struct Charge {
+    budget: Arc<Mutex<Option<u64>>>,
+    bytes: Mutex<u64>,
+}
+
+impl Charge {
+    fn reserve(budget: &Arc<Mutex<Option<u64>>>, bytes: u64) -> Result<Self, Admission> {
+        let charge = Self {
+            budget: Arc::clone(budget),
+            bytes: Mutex::new(0),
+        };
+        charge.grow(bytes)?;
+        Ok(charge)
+    }
+
+    fn grow(&self, extra: u64) -> Result<(), Admission> {
+        let available = crate::build::host_available().ok_or(Admission::UnknownHeadroom)?;
+        let mut held = lock(&self.bytes);
+        let mut budget = lock(&self.budget);
+        let used = budget.ok_or(Admission::Unavailable)?;
+        let next = used.checked_add(extra).ok_or(Admission::Overflow)?;
+        if next > available {
+            return Err(Admission::Insufficient {
+                requested: extra,
+                available: available.saturating_sub(used),
+            });
+        }
+        *held = held.checked_add(extra).ok_or(Admission::Overflow)?;
+        *budget = Some(next);
+        Ok(())
+    }
+
+    fn release(&self, bytes: u64) -> Result<(), Admission> {
+        let mut held = lock(&self.bytes);
+        let mut budget = lock(&self.budget);
+        let Some((remaining, total)) = held
+            .checked_sub(bytes)
+            .zip(budget.and_then(|used| used.checked_sub(bytes)))
+        else {
+            *budget = None;
+            return Err(Admission::Unavailable);
+        };
+        *held = remaining;
+        *budget = Some(total);
+        Ok(())
+    }
+
+    fn prepare_growth(&self, bytes: u64) -> Result<Growth<'_>, Admission> {
+        self.grow(bytes)?;
+        Ok(Growth {
+            charge: self,
+            state: GrowthState::Prepared(bytes),
+        })
+    }
+}
+
+struct Growth<'a> {
+    charge: &'a Charge,
+    state: GrowthState,
+}
+
+enum GrowthState {
+    Prepared(u64),
+    Committed,
+}
+
+impl Growth<'_> {
+    fn extend(&mut self, bytes: u64) -> Result<(), Admission> {
+        let GrowthState::Prepared(held) = self.state else {
+            return Err(Admission::Unavailable);
+        };
+        let next = held.checked_add(bytes).ok_or(Admission::Overflow)?;
+        if bytes > 0 {
+            self.charge.grow(bytes)?;
+        }
+        self.state = GrowthState::Prepared(next);
+        Ok(())
+    }
+
+    fn commit(mut self, replaced: u64) -> Result<(), Admission> {
+        self.charge.release(replaced)?;
+        self.state = GrowthState::Committed;
+        Ok(())
+    }
+}
+
+impl Drop for Growth<'_> {
+    fn drop(&mut self) {
+        if let GrowthState::Prepared(bytes) = self.state {
+            let _ = self.charge.release(bytes);
+        }
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        let held = *lock(&self.bytes);
+        let mut budget = lock(&self.budget);
+        *budget = budget.and_then(|used| used.checked_sub(held));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Terminal {
+    End,
+    Aborted(i32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Life {
+    Serving,
+    Draining(Terminal),
+    Ended,
+    // None means no canonical terminal was submitted before interruption.
+    Aborted(Option<Terminal>),
+}
+
+#[derive(Clone, Copy)]
+enum Resolve {
+    Complete,
+    Stop,
+}
+
+impl Life {
+    fn drain(&mut self, terminal: Terminal) -> io::Result<()> {
+        if !matches!(self, Self::Serving) {
+            return Err(io::Error::other("capture scope ended"));
+        }
+        *self = Self::Draining(terminal);
+        Ok(())
+    }
+
+    fn resolve(&mut self, state: State, event: Resolve) -> Option<Self> {
+        let next = match (*self, state, event) {
+            (Self::Draining(Terminal::End), State::Finished(_), _) => Self::Ended,
+            (Self::Draining(terminal), State::Finished(_) | State::Aborted(_), _)
+            | (Self::Draining(terminal), _, Resolve::Stop) => Self::Aborted(Some(terminal)),
+            (Self::Serving, State::Aborted(_), _) | (Self::Serving, _, Resolve::Stop) => Self::Aborted(None),
+            _ => return None,
+        };
+        *self = next;
+        Some(next)
+    }
+
+    /// Its terminal record, formatted whole into `buffer` to be appended at once: the
+    /// canonical errno it knows, then its state; nothing while it is not terminal.
+    fn record(self, scope: Scope, at: Progress, buffer: &mut [u8; TERMINAL_MOST]) -> io::Result<&[u8]> {
+        let (state, tail) = match self {
+            Self::Ended => ("ended", "complete"),
+            Self::Aborted(_) => ("aborted", "unknown"),
+            _ => return Ok(&[]),
+        };
+        let mut rest = buffer.as_mut_slice();
+        if let Self::Aborted(Some(Terminal::Aborted(errno))) = self {
+            writeln!(
+                rest,
+                "member {} channel {} canonical aborted errno {errno}",
+                scope.member, scope.channel as u8
+            )?;
+        }
+        writeln!(
+            rest,
+            "member {} channel {} state {state} accepted {} consumed {} tail {tail}",
+            scope.member, scope.channel as u8, at.accepted, at.consumed
+        )?;
+        let used = TERMINAL_MOST.saturating_sub(rest.len());
+        buffer
+            .get(..used)
+            .ok_or_else(|| io::Error::other("managed output terminal record overflow"))
+    }
+}
+
+/// The most bytes one channel's terminal record takes ([`Life::record`]): its canonical
+/// errno line and its state line, their words as written, each number at its type's widest
+/// in decimal (a u32 member, a u8 channel, an i32 errno with its sign, two u64 cursors), and
+/// the longer of each word that varies (`aborted`, `complete`).
+const TERMINAL_MOST: usize = {
+    let member = u32::MAX.ilog10() as usize + 1;
+    let channel = u8::MAX.ilog10() as usize + 1;
+    let errno = i32::MIN.unsigned_abs().ilog10() as usize + 2;
+    let cursor = u64::MAX.ilog10() as usize + 1;
+    "member  channel  canonical aborted errno \n".len()
+        + member
+        + channel
+        + errno
+        + "member  channel  state  accepted  consumed  tail \n".len()
+        + member
+        + channel
+        + "aborted".len()
+        + 2 * cursor
+        + "complete".len()
+};
+
+struct Output {
+    scope: Scope,
+    address: std::net::SocketAddr,
+    control: Control,
+    metadata: Arc<Mutex<Ledger>>,
+    life: Mutex<Life>,
+    credits: std::sync::Weak<Credits>,
+    index: usize,
+    learning: Mutex<Learning>,
+    charge: Arc<Charge>,
+}
+
+struct Sample {
+    began: Instant,
+    end: u64,
+    bytes: u64,
+}
+struct Learning {
+    quantum: shards_registry::Quantum,
+    sample: Option<Sample>,
+    admitted: usize,
+}
+
+impl Output {
+    fn observed(&self) {
+        let at = self.control.progress().consumed;
+        let mut learning = lock(&self.learning);
+        if learning.sample.as_ref().is_some_and(|sample| sample.end <= at)
+            && let Some(sample) = learning.sample.take()
+        {
+            learning
+                .quantum
+                .consumed(sample.began, Instant::now(), sample.bytes);
+        }
+    }
+
+    fn capacity(&self, producer: &Producer) -> io::Result<usize> {
+        let mut learning = lock(&self.learning);
+        let desired = learning.quantum.desired();
+        if desired > learning.admitted {
+            let old = producer.storage_capacity();
+            let extra = desired
+                .checked_sub(learning.admitted)
+                .and_then(|n| n.checked_add(desired))
+                .and_then(|n| u64::try_from(n).ok())
+                .ok_or_else(|| io::Error::other("capture growth overflow"))?;
+            // Keep the old daemon allocation charged while preparing its replacement,
+            // plus the increased VM record allowance. This is logical accounting;
+            // neither it nor owned Vec storage establishes parent/kernel entitlement.
+            if let Ok(mut growth) = self.charge.prepare_growth(extra) {
+                match producer.admit(desired) {
+                    Ok(actual) => {
+                        growth
+                            .extend(u64::try_from(actual.saturating_sub(desired)).map_err(io::Error::other)?)
+                            .map_err(|reason| io::Error::other(Failure::Admission(reason)))?;
+                        growth
+                            .commit(u64::try_from(old).map_err(io::Error::other)?)
+                            .map_err(|reason| io::Error::other(Failure::Admission(reason)))?;
+                        learning.admitted = desired;
+                    }
+                    // A window the endpoint cannot take now (storage it could not allocate,
+                    // or a size or a record in flight it refuses) leaves the channel the
+                    // window it has; the growth's charge goes back as it drops.
+                    Err(
+                        shards_remote::managed::Error::Admission(
+                            shards_remote::managed::AdmissionError::Allocation
+                            | shards_remote::managed::AdmissionError::Capacity,
+                        )
+                        | shards_remote::managed::Error::Closed,
+                    ) => {}
+                    Err(error) => return Err(io::Error::other(error)),
+                }
+            }
+        }
+        Ok(desired.min(learning.admitted))
+    }
+
+    fn resolve(&self, event: Resolve) -> Option<(Life, State)> {
+        let mut life = lock(&self.life);
+        // Stop must observe Finished before retiring Shared, even if the credit
+        // worker has not yet published it. Life arbitrates that single winner.
+        let state = self.control.state();
+        life.resolve(state, event).map(|next| (next, state))
+    }
+
+    fn publish(&self, terminal: Option<(Life, State)>) {
+        let Some((life, state)) = terminal else { return };
+        let mut buffer = [0; TERMINAL_MOST];
+        let result = life
+            .record(self.scope, state.progress(), &mut buffer)
+            .and_then(|record| lock(&self.metadata).append(record));
+        if let Err(error) = result {
+            // Logical consumption is sticky, but a failed append is not publication.
+            // Retire this transport without holding metadata/Life/credit locks.
+            self.stop_transport();
+            log(format!(
+                "managed output metadata member {} channel {}: {error}",
+                self.scope.member, self.scope.channel as u8
+            ));
+        }
+    }
+
+    fn abort(&self) {
+        let terminal = self.resolve(Resolve::Stop);
+        self.stop_transport();
+        self.publish(terminal);
+    }
+
+    fn stop_transport(&self) {
+        if let Some(credits) = self.credits.upgrade() {
+            credits.revoke(self.index);
+        }
+        // Logical terminal does not release ownership of the endpoint's driver.
+        // Stop is unconditional and precedes fallible metadata I/O.
+        self.control.abort();
+    }
+
+    fn finish(&self, terminal: Terminal) -> io::Result<()> {
+        lock(&self.life).drain(terminal)?;
+        // Shared invokes the wake inline; never hold Life across it. A concurrent
+        // stop remains terminal, and remote finish cannot revive an aborted slot.
+        self.control.finish().map_err(io::Error::other)
+    }
+
+    fn complete(&self) {
+        self.observed();
+        let terminal = self.resolve(Resolve::Complete);
+        if matches!(terminal, Some((_, State::Aborted(_)))) {
+            self.stop_transport();
+        }
+        self.publish(terminal);
+    }
+}
+
+impl Drop for Output {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+struct Owner {
+    outputs: Vec<Option<Arc<Output>>>,
+    stream: Stream,
+    credits: Arc<Credits>,
+    _charge: Arc<Charge>,
+}
+
+impl Owner {
+    fn abort(&self) {
+        self.credits.close();
+        shards_ipc::end(&self.stream);
+        for output in self.outputs.iter().flatten() {
+            output.abort();
+        }
+    }
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum After {
+    More,
+    Terminal(Terminal),
+}
+
+enum CreditSlot {
+    Inactive,
+    Waiting,
+    Granted {
+        capacity: usize,
+        began: Instant,
+        bytes: Vec<u8>,
+    },
+    Captured(Vec<u8>, After),
+    Sending,
+    Draining,
+    Ended,
+    Revoked,
+    RevokedGranted {
+        capacity: usize,
+        bytes: Vec<u8>,
+    },
+    Receiving,
+    RevokedReceiving,
+}
+
+enum QueueLife {
+    Open,
+    Closed,
+}
+struct Queue {
+    slots: Vec<CreditSlot>,
+    next: usize,
+    life: QueueLife,
+}
+struct Credits {
+    state: Mutex<Queue>,
+    changed: Condvar,
+}
+enum Action {
+    Grant(usize),
+    Submit(usize, Vec<u8>, After),
+    Complete(usize),
+}
+
+impl Credits {
+    fn revoke(&self, index: usize) {
+        let mut state = lock(&self.state);
+        if let Some(slot) = state.slots.get_mut(index) {
+            *slot = match std::mem::replace(slot, CreditSlot::Revoked) {
+                CreditSlot::Granted { capacity, bytes, .. } => CreditSlot::RevokedGranted { capacity, bytes },
+                CreditSlot::Receiving => CreditSlot::RevokedReceiving,
+                _ => CreditSlot::Revoked,
+            };
+        }
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = lock(&self.state);
+        state.life = QueueLife::Closed;
+        for slot in &mut state.slots {
+            *slot = CreditSlot::Ended;
+        }
+        self.changed.notify_all();
+    }
+
+    fn wake(&self) {
+        // The predicate is read under this same mutex in next. Shared publishers
+        // release Shared before this callback, so credit -> Shared has no reverse edge.
+        let _state = lock(&self.state);
+        self.changed.notify_all();
+    }
+
+    fn begin_record(&self, index: usize, len: usize) -> io::Result<(usize, Instant, Vec<u8>)> {
+        let mut state = lock(&self.state);
+        let slot = state
+            .slots
+            .get_mut(index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown capture route"))?;
+        let receiving = match slot {
+            CreditSlot::Granted { capacity, .. } if len <= *capacity => CreditSlot::Receiving,
+            CreditSlot::RevokedGranted { capacity, .. } if len <= *capacity => CreditSlot::RevokedReceiving,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "capture record exceeds issued channel credit",
+                ));
+            }
+        };
+        match std::mem::replace(slot, receiving) {
+            CreditSlot::Granted {
+                capacity,
+                began,
+                bytes,
+            } => Ok((capacity, began, bytes)),
+            CreditSlot::RevokedGranted { capacity, bytes } => Ok((capacity, Instant::now(), bytes)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "capture buffer ownership",
+            )),
+        }
+    }
+
+    fn captured(&self, index: usize, bytes: Vec<u8>, after: After) -> io::Result<()> {
+        let mut state = lock(&self.state);
+        if let Some(slot @ CreditSlot::RevokedReceiving) = state.slots.get_mut(index) {
+            *slot = CreditSlot::Revoked;
+            return Ok(());
+        }
+        let slot = state
+            .slots
+            .get_mut(index)
+            .filter(|slot| matches!(slot, CreditSlot::Receiving))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "capture record has no channel credit")
+            })?;
+        *slot = CreditSlot::Captured(bytes, after);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn next(&self, observe: impl Fn(usize) -> io::Result<State>) -> io::Result<Option<Action>> {
+        let mut state = lock(&self.state);
+        loop {
+            if matches!(state.life, QueueLife::Closed)
+                || state.slots.iter().all(|s| {
+                    matches!(
+                        s,
+                        CreditSlot::Inactive
+                            | CreditSlot::Ended
+                            | CreditSlot::Revoked
+                            | CreditSlot::RevokedGranted { .. }
+                            | CreditSlot::RevokedReceiving
+                    )
+                })
+            {
+                return Ok(None);
+            }
+            let len = state.slots.len();
+            if len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "capture has no admitted channels",
+                ));
+            }
+            for step in 0..len {
+                let index = state.next.checked_add(step).map(|n| n % len).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "capture scheduler overflow")
+                })?;
+                let Some(slot) = state.slots.get_mut(index) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "capture scheduler index",
+                    ));
+                };
+                if !matches!(
+                    slot,
+                    CreditSlot::Waiting | CreditSlot::Captured(..) | CreditSlot::Draining
+                ) {
+                    continue;
+                }
+                // Observation releases Shared before an action leaves this credit
+                // guard. Life and metadata are touched only by the worker afterward.
+                let remote = observe(index)?;
+                let action = match (std::mem::replace(slot, CreditSlot::Sending), remote) {
+                    (CreditSlot::Waiting, State::Ready(_)) => Some(Action::Grant(index)),
+                    (CreditSlot::Captured(bytes, after), State::Ready(_) | State::Capturing(_)) => {
+                        Some(Action::Submit(index, bytes, after))
+                    }
+                    (CreditSlot::Draining, State::Finished(_))
+                    | (
+                        CreditSlot::Waiting | CreditSlot::Captured(..) | CreditSlot::Draining,
+                        State::Aborted(_),
+                    ) => {
+                        *slot = CreditSlot::Ended;
+                        Some(Action::Complete(index))
+                    }
+                    (old, _) => {
+                        *slot = old;
+                        None
+                    }
+                };
+                if action.is_some() {
+                    state.next = index.checked_add(1).map(|n| n % len).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "capture scheduler overflow")
+                    })?;
+                    return Ok(action);
+                }
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+impl Outputs {
+    pub(super) fn abort_member(&self, id: &str, bytes: &[u8]) -> io::Result<()> {
+        let abort = run::managed::Abort::decode(bytes).map_err(|e| io::Error::other(e.to_string()))?;
+        let owner = match lock(&self.runs).get(id) {
+            Some(Entry::Serving(owner)) => Arc::clone(owner),
+            _ => return Err(io::Error::other("managed run is not registered")),
+        };
+        let first = usize::try_from(abort.member)
+            .ok()
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| io::Error::other("invalid aborted member"))?;
+        let end = first
+            .checked_add(2)
+            .ok_or_else(|| io::Error::other("member overflow"))?;
+        let outputs = owner
+            .outputs
+            .get(first..end)
+            .ok_or_else(|| io::Error::other("unknown aborted member"))?;
+        if outputs.iter().all(Option::is_none) {
+            return Err(io::Error::other("aborted member is inactive"));
+        }
+        for output in outputs.iter().flatten() {
+            output.abort();
+        }
+        Ok(())
+    }
+
+    pub(super) fn published(&self, id: &str) -> Vec<[String; 3]> {
+        match lock(&self.runs).get(id) {
+            Some(Entry::Serving(owner)) => owner
+                .outputs
+                .iter()
+                .flatten()
+                .filter(|output| matches!(*lock(&output.life), Life::Serving | Life::Draining(_)))
+                .map(|output| {
+                    [
+                        format!(
+                            "managed-{}-{}/udp",
+                            output.scope.member, output.scope.channel as u8
+                        ),
+                        output.address.to_string(),
+                        "authenticated owner output".into(),
+                    ]
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn begin(&self, id: &str) -> io::Result<()> {
+        let mut runs = lock(&self.runs);
+        if runs.contains_key(id) {
+            return Err(io::Error::other("managed run already has an output scope"));
+        }
+        runs.try_reserve(1).map_err(io::Error::other)?;
+        runs.insert(id.to_owned(), Entry::Preparing);
+        Ok(())
+    }
+
+    pub(super) fn end(&self, id: &str) {
+        let removed = lock(&self.runs).remove(id);
+        if let Some(Entry::Serving(owner)) = removed {
+            owner.abort();
+        }
+    }
+
+    pub(super) fn close(&self) {
+        let runs = std::mem::take(&mut *lock(&self.runs));
+        for entry in runs.into_values() {
+            if let Entry::Serving(owner) = entry {
+                owner.abort();
+            }
+        }
+    }
+}
+
+impl<D: Disk> Daemon<D> {
+    pub(super) fn managed_capture<'s, 'e>(
+        &'s self,
+        threads: &'s Threads<'s, 'e>,
+        id: &str,
+        client: &str,
+        labels: &[String],
+        active: &[u32],
+        setup: &mut Vec<Vec<u8>>,
+    ) -> Result<Stream, Failure> {
+        self.managed.begin(id)?;
+        let result = self.start_managed_capture(threads, id, client, labels, active, setup);
+        if result.is_err() {
+            self.managed.end(id);
+        }
+        result
+    }
+
+    fn start_managed_capture<'s, 'e>(
+        &'s self,
+        threads: &'s Threads<'s, 'e>,
+        id: &str,
+        client: &str,
+        labels: &[String],
+        active: &[u32],
+        setup: &mut Vec<Vec<u8>>,
+    ) -> Result<Stream, Failure> {
+        let members = u32::try_from(labels.len()).map_err(io::Error::other)?;
+        let count = labels
+            .len()
+            .checked_mul(2)
+            .filter(|n| *n != 0)
+            .ok_or_else(|| io::Error::other("invalid managed channel count"))?;
+        if active.is_empty()
+            || active.windows(2).any(|w| w.first() >= w.get(1))
+            || active.iter().any(|id| *id >= members)
+        {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "invalid trusted active member plan").into(),
+            );
+        }
+        let active_count = active
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| io::Error::other("active channel count overflow"))?;
+        let capacity = record_capacity(labels, active)?;
+        let transport = capacity
+            .checked_add(shards_remote::managed::DATA_HEAD)
+            .ok_or_else(|| io::Error::other("capture window overflow"))?;
+        let per_channel = [
+            capacity,
+            capacity,
+            transport,
+            HANDSHAKE_BYTES,
+            shards_remote::managed::CONTROL_BYTES,
+            shards_remote::managed::DATAGRAM_BYTES,
+            shards_remote::managed::DATAGRAM_BYTES,
+            size_of::<Output>(),
+        ]
+        .into_iter()
+        .try_fold(0u64, |sum, n| sum.checked_add(u64::try_from(n).ok()?))
+        .ok_or_else(|| io::Error::other("capture reservation overflow"))?;
+        let structural = count
+            .checked_mul(
+                size_of::<CreditSlot>()
+                    + size_of::<StreamState>()
+                    + size_of::<Option<Arc<Output>>>()
+                    + size_of::<Option<Arc<Producer>>>(),
+            )
+            .and_then(|n| {
+                labels
+                    .iter()
+                    .try_fold(n, |sum, label| sum.checked_add(label.len() + size_of::<String>()))
+            })
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| io::Error::other("capture structure overflow"))?;
+        let reservation = per_channel
+            .checked_mul(u64::try_from(active_count).map_err(io::Error::other)?)
+            .and_then(|n| n.checked_add(structural))
+            .ok_or_else(|| io::Error::other("capture reservation overflow"))?;
+        let charge = Charge::reserve(&self.managed.budget, reservation)?;
+        let identity = crate::context::identity(&self.home).map_err(io::Error::other)?;
+        let key = owner_key(&self.home, client, identity.fingerprint())?;
+        let dir = lock(&self.containers).dir(id);
+        let generation = generation(&dir)?;
+        let run = RunId(Sha256::digest(id.as_bytes()).into());
+        let admitted = Admitted {
+            record_bytes: capacity,
+            transport_bytes: u64::try_from(transport).map_err(io::Error::other)?,
+            handshake_bytes: HANDSHAKE_BYTES,
+            datagram_bytes: shards_remote::managed::DATAGRAM_BYTES,
+            patience: shards_remote::tls::QUIET,
+        };
+        let mut staged = Vec::new();
+        staged.try_reserve_exact(active_count).map_err(io::Error::other)?;
+        for &member in active {
+            for channel in [Channel::Stdout, Channel::Stderr] {
+                let scope = Scope {
+                    run,
+                    generation,
+                    member,
+                    channel,
+                };
+                let (endpoint, producer, control) =
+                    Endpoint::bind(&identity, key, scope, admitted).map_err(Failure::Endpoint)?;
+                let kernel = endpoint
+                    .kernel_buffer_bytes()
+                    .map_err(io::Error::other)?
+                    .checked_add(control.kernel_buffer_bytes().map_err(Failure::Endpoint)?)
+                    .ok_or_else(|| io::Error::other("capture kernel queue overflow"))?;
+                charge.grow(kernel)?;
+                let excess = u64::try_from(producer.storage_capacity().saturating_sub(capacity))
+                    .map_err(io::Error::other)?;
+                if excess > 0 {
+                    charge.grow(excess)?;
+                }
+                staged.push((scope, endpoint, producer, control));
+            }
+        }
+        #[cfg(unix)]
+        let (stream, peer) = Stream::pair()?;
+        #[cfg(windows)]
+        let (stream, peer) = Stream::plain_pair()?;
+        charge.grow(
+            ipc_buffers(&stream)?
+                .checked_add(ipc_buffers(&peer)?)
+                .ok_or_else(|| io::Error::other("capture IPC queue overflow"))?,
+        )?;
+        let charge = Arc::new(charge);
+        let mut metadata = private_record(&dir.join(METADATA))?;
+        writeln!(
+            metadata,
+            "shards managed output 1\nserver {}\nowner {}\nrun {}\ngeneration {}\ncapacity {}",
+            identity::hex(&identity.fingerprint()),
+            identity::hex(&key),
+            id,
+            generation,
+            capacity
+        )?;
+        for (scope, endpoint, _, _) in &staged {
+            writeln!(
+                metadata,
+                "member {} channel {} address {}",
+                scope.member, scope.channel as u8, endpoint.address
+            )?;
+        }
+        metadata.sync_all()?;
+        let metadata = shared_metadata(metadata)?;
+        let mut outputs = Vec::new();
+        let mut producers = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut slots = Vec::new();
+        let mut states = Vec::new();
+        outputs.try_reserve_exact(count).map_err(io::Error::other)?;
+        producers.try_reserve_exact(count).map_err(io::Error::other)?;
+        endpoints
+            .try_reserve_exact(active_count)
+            .map_err(io::Error::other)?;
+        slots.try_reserve_exact(count).map_err(io::Error::other)?;
+        states.try_reserve_exact(count).map_err(io::Error::other)?;
+        states.resize(count, StreamState::New);
+        slots.resize_with(count, || CreditSlot::Inactive);
+        outputs.resize_with(count, || None);
+        producers.resize_with(count, || None);
+        let credits = Arc::new(Credits {
+            state: Mutex::new(Queue {
+                slots,
+                next: 0,
+                life: QueueLife::Open,
+            }),
+            changed: Condvar::new(),
+        });
+        for (scope, endpoint, producer, control) in staged {
+            let index = route_index(scope.member, scope.channel)?;
+            *lock(&credits.state)
+                .slots
+                .get_mut(index)
+                .ok_or_else(|| io::Error::other("active credit index"))? = CreditSlot::Waiting;
+            let producer = Arc::new(producer);
+            let weak_credits = Arc::downgrade(&credits);
+            let quantum = capture_quantum(capacity)?;
+            let output = Arc::new(Output {
+                scope,
+                address: endpoint.address,
+                control,
+                metadata: Arc::clone(&metadata),
+                life: Mutex::new(Life::Serving),
+                credits: Arc::downgrade(&credits),
+                index,
+                learning: Mutex::new(Learning {
+                    quantum,
+                    sample: None,
+                    admitted: capacity,
+                }),
+                charge: Arc::clone(&charge),
+            });
+            producer.on_credit(move || {
+                if let Some(credits) = weak_credits.upgrade() {
+                    credits.wake();
+                }
+            });
+            *outputs
+                .get_mut(index)
+                .ok_or_else(|| io::Error::other("active output index"))? = Some(Arc::clone(&output));
+            *producers
+                .get_mut(index)
+                .ok_or_else(|| io::Error::other("active producer index"))? = Some(producer);
+            endpoints.push((endpoint, output));
+        }
+        let reading = stream.try_clone()?;
+        let writing = stream.try_clone()?;
+        let owner = Arc::new(Owner {
+            outputs,
+            stream,
+            credits,
+            _charge: charge,
+        });
+        let labels = copy_labels(labels)?;
+        let producers = Arc::new(producers);
+        {
+            let mut runs = lock(&self.managed.runs);
+            let entry = runs
+                .get_mut(id)
+                .filter(|e| matches!(e, Entry::Preparing))
+                .ok_or_else(|| io::Error::other("managed run was cancelled"))?;
+            *entry = Entry::Serving(Arc::clone(&owner));
+        }
+        for (endpoint, output) in endpoints {
+            std::thread::Builder::new()
+                .name("managed-output".into())
+                .spawn_scoped(threads, move || {
+                    if let Err(e) = endpoint.run() {
+                        log(format!("managed output endpoint: {e}"));
+                    }
+                    output.abort();
+                })?;
+        }
+        let writer_owner = Arc::clone(&owner);
+        let writer_producers = Arc::clone(&producers);
+        std::thread::Builder::new()
+            .name("managed-credit".into())
+            .spawn_scoped(threads, move || {
+                if let Err(e) = send_credits(writing, &writer_owner, &writer_producers) {
+                    log(format!("managed output credits: {e}"));
+                    writer_owner.abort();
+                }
+            })?;
+        let reader_owner = Arc::clone(&owner);
+        std::thread::Builder::new()
+            .name("managed-capture".into())
+            .spawn_scoped(threads, move || {
+                if let Err(e) = bridge(reading, &reader_owner, &labels, states) {
+                    log(format!("managed output capture: {e}"));
+                    reader_owner.abort();
+                }
+            })?;
+        setup.try_reserve(3).map_err(io::Error::other)?;
+        setup.push(format!("managed-capacity={}", run::MAX_PAYLOAD).into_bytes());
+        setup.push(format!("managed-members={members}").into_bytes());
+        let mut activation = Vec::new();
+        activation
+            .try_reserve_exact(
+                run::managed::ACTIVE_KEY
+                    .len()
+                    .checked_add(
+                        active
+                            .len()
+                            .checked_mul(size_of::<u32>())
+                            .ok_or_else(|| io::Error::other("active mask overflow"))?,
+                    )
+                    .ok_or_else(|| io::Error::other("active mask overflow"))?,
+            )
+            .map_err(io::Error::other)?;
+        activation.extend_from_slice(run::managed::ACTIVE_KEY);
+        for member in active {
+            activation.extend_from_slice(&member.to_be_bytes());
+        }
+        setup.push(activation);
+        if owner
+            .outputs
+            .iter()
+            .flatten()
+            .any(|output| !matches!(*lock(&output.life), Life::Serving))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed output ended before actor release",
+            )
+            .into());
+        }
+        Ok(peer)
+    }
+}
+
+fn copy_labels(labels: &[String]) -> io::Result<Vec<String>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(labels.len()).map_err(io::Error::other)?;
+    for label in labels {
+        let mut copy = String::new();
+        copy.try_reserve_exact(label.len()).map_err(io::Error::other)?;
+        copy.push_str(label);
+        out.push(copy);
+    }
+    Ok(out)
+}
+
+fn send_credits(
+    mut stream: Stream,
+    owner: &Owner,
+    producers: &[Option<Arc<Producer>>],
+) -> Result<(), Failure> {
+    while let Some(action) = owner.credits.next(|index| {
+        owner
+            .outputs
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(|output| output.control.state())
+            .ok_or_else(|| io::Error::other("unknown output channel"))
+    })? {
+        match action {
+            Action::Grant(index) => {
+                let output = owner
+                    .outputs
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| io::Error::other("unknown output channel"))?;
+                let producer = producers
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| io::Error::other("unknown producer"))?;
+                output.observed();
+                let capacity = output.capacity(producer)?;
+                let Some(bytes) = producer.take_buffer().map_err(Failure::Endpoint)? else {
+                    let mut state = lock(&owner.credits.state);
+                    if let Some(slot @ CreditSlot::Sending) = state.slots.get_mut(index) {
+                        *slot = CreditSlot::Waiting;
+                    }
+                    continue;
+                };
+                {
+                    let mut state = lock(&owner.credits.state);
+                    let Some(slot @ CreditSlot::Sending) = state.slots.get_mut(index) else {
+                        continue;
+                    };
+                    *slot = CreditSlot::Granted {
+                        capacity,
+                        began: Instant::now(),
+                        bytes,
+                    };
+                }
+                let credit = run::managed::Credit {
+                    member: output.scope.member,
+                    channel: output.scope.channel,
+                    capacity: u64::try_from(capacity).map_err(io::Error::other)?,
+                }
+                .encode()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+                stream.write_all(&run::header(run::kind::MANAGED_CREDIT, credit.len() as u32))?;
+                stream.write_all(&credit)?;
+            }
+            Action::Submit(index, bytes, after) => {
+                if let Some(output) = owner.outputs.get(index).and_then(Option::as_ref) {
+                    output.observed();
+                }
+                let producer = producers
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| io::Error::other("unknown capture producer"))?;
+                let result = producer.submit(bytes);
+                let mut state = lock(&owner.credits.state);
+                let slot = state
+                    .slots
+                    .get_mut(index)
+                    .ok_or_else(|| io::Error::other("unknown capture credit"))?;
+                match result {
+                    Ok(()) if matches!(after, After::Terminal(_)) => {
+                        // A concurrent revocation must not reopen this credit slot.
+                        if !matches!(slot, CreditSlot::Sending) {
+                            continue;
+                        }
+                        *slot = CreditSlot::Draining;
+                        drop(state);
+                        if let After::Terminal(terminal) = after
+                            && let Some(output) = owner.outputs.get(index).and_then(Option::as_ref)
+                            && let Err(error) = output.finish(terminal)
+                        {
+                            log(format!("managed output finish: {error}"));
+                            output.abort();
+                        }
+                    }
+                    Ok(()) => {
+                        if matches!(slot, CreditSlot::Sending) {
+                            *slot = CreditSlot::Waiting;
+                        }
+                    }
+                    Err(Rejected::Full(bytes)) => {
+                        if matches!(slot, CreditSlot::Sending) {
+                            *slot = CreditSlot::Captured(bytes, after);
+                        }
+                    }
+                    Err(Rejected::Closed(_) | Rejected::Invalid(_)) => {
+                        *slot = CreditSlot::Ended;
+                        drop(state);
+                        if let Some(output) = owner.outputs.get(index).and_then(Option::as_ref) {
+                            output.abort();
+                        }
+                    }
+                }
+            }
+            Action::Complete(index) => {
+                if let Some(output) = owner.outputs.get(index).and_then(Option::as_ref) {
+                    output.complete();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bridge(
+    stream: Stream,
+    owner: &Owner,
+    labels: &[String],
+    mut states: Vec<StreamState>,
+) -> Result<(), Failure> {
+    loop {
+        let mut head = [0; run::HEADER];
+        read_exact(&stream, &mut head)?;
+        let (_, len) = run::parse_header(head)
+            .filter(|(kind, len)| *kind == run::kind::MANAGED && *len as usize >= run::managed::HEADER)
+            .ok_or_else(|| io::Error::other("invalid capture record header"))?;
+        let mut prefix = [0; run::managed::HEADER];
+        read_exact(&stream, &mut prefix)?;
+        let (member, channel) =
+            run::managed::route_prefix(&prefix).map_err(|e| io::Error::other(e.to_string()))?;
+        let route = route_index(member, channel)?;
+        let (capacity, began, mut bytes) = owner.credits.begin_record(route, len as usize)?;
+        if bytes.capacity() < len as usize {
+            return Err(io::Error::other("capture buffer is smaller than issued credit").into());
+        }
+        bytes.resize(len as usize, 0);
+        bytes
+            .get_mut(..run::managed::HEADER)
+            .ok_or_else(|| io::Error::other("short capture record"))?
+            .copy_from_slice(&prefix);
+        read_exact(
+            &stream,
+            bytes
+                .get_mut(run::managed::HEADER..)
+                .ok_or_else(|| io::Error::other("short capture record"))?,
+        )?;
+        let index = accept(&bytes, labels, &mut states)?;
+        if let Some(output) = owner.outputs.get(index).and_then(Option::as_ref)
+            && let Event::Data(data) = Record::decode(&bytes)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .event
+            && bytes.len() == capacity
+        {
+            let end = output
+                .control
+                .progress()
+                .accepted
+                .checked_add(u64::try_from(bytes.len()).map_err(io::Error::other)?)
+                .ok_or_else(|| io::Error::other("capture sample offset overflow"))?;
+            lock(&output.learning).sample = Some(Sample {
+                began,
+                end,
+                bytes: data.len() as u64,
+            });
+        }
+        let after = match states.get(index) {
+            Some(StreamState::Ended { .. }) => After::Terminal(Terminal::End),
+            Some(StreamState::Aborted { errno, .. }) => After::Terminal(Terminal::Aborted(*errno)),
+            _ => After::More,
+        };
+        owner.credits.captured(index, bytes, after)?;
+        if states
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| owner.outputs.get(*index).is_some_and(Option::is_some))
+            .all(|(_, s)| s.terminal())
+        {
+            return Ok(());
+        }
+    }
+}
+
+fn route_index(member: u32, channel: Channel) -> io::Result<usize> {
+    let channel = match channel {
+        Channel::Stdout => 0,
+        Channel::Stderr => 1,
+    };
+    usize::try_from(member)
+        .ok()
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(channel))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "capture state index overflow"))
+}
+
+fn accept(bytes: &[u8], labels: &[String], states: &mut [StreamState]) -> io::Result<usize> {
+    let record =
+        Record::decode(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let member = usize::try_from(record.member).map_err(io::Error::other)?;
+    let label = labels
+        .get(member)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown capture member"))?;
+    if matches!(record.event, Event::Open(said) if said != label) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "capture label differs from trusted image",
+        ));
+    }
+    let index = route_index(record.member, record.channel)?;
+    states
+        .get_mut(index)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "capture state was not admitted"))?
+        .accept(record)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(index)
+}
+
+fn owner_key(home: &Path, client: &str, local: Fingerprint) -> Result<Fingerprint, Failure> {
+    if client.is_empty() {
+        return Ok(local);
+    }
+    let enrolled = crate::context::clients(home)
+        .into_iter()
+        .find(|c| c.name == client)
+        .ok_or(Failure::Auth(Auth::UnknownContext))?;
+    if !identity::is_ed25519(&enrolled.key) {
+        return Err(Failure::Auth(Auth::InvalidKey));
+    }
+    Ok(identity::fingerprint(&enrolled.key))
+}
+
+fn record_capacity(labels: &[String], active: &[u32]) -> io::Result<usize> {
+    active
+        .iter()
+        .map(|member| {
+            labels
+                .get(*member as usize)
+                .ok_or_else(|| io::Error::other("unknown trusted managed label"))
+        })
+        .map(|label| {
+            let label = label?;
+            Record {
+                member: 0,
+                channel: Channel::Stdout,
+                offset: 0,
+                event: Event::Open(label),
+            }
+            .encoded_len()
+            .map_err(|e| io::Error::other(e.to_string()))
+        })
+        .try_fold(run::managed::HEADER + size_of::<i32>(), |most, n| {
+            n.map(|n| most.max(n))
+        })
+}
+
+/// The run's metadata record, which its channels append their terminal records to: whole
+/// lines only, each a record an owner reads alone. A channel's record is formatted whole
+/// and written at once; one whose write fails part-way is cut back to the last whole line
+/// before another channel appends.
+#[derive(Debug)]
+struct Ledger {
+    file: File,
+    whole: Whole,
+}
+
+/// How far the run's metadata record is whole lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Whole {
+    /// Every byte before this offset, where the next record starts.
+    To(u64),
+    /// A record's write failed part-way and could not be cut back: no line may follow its
+    /// part, so no record is appended.
+    Torn,
+}
+
+impl Ledger {
+    fn new(mut file: File) -> io::Result<Self> {
+        let at = file.stream_position()?;
+        Ok(Self {
+            file,
+            whole: Whole::To(at),
+        })
+    }
+
+    fn append(&mut self, record: &[u8]) -> io::Result<()> {
+        let Whole::To(at) = self.whole else {
+            return Err(io::Error::other("the managed output record ends in a torn line"));
+        };
+        let end = u64::try_from(record.len())
+            .ok()
+            .and_then(|len| at.checked_add(len))
+            .ok_or_else(|| io::Error::other("managed output record length overflow"))?;
+        if let Err(error) = self.file.write_all(record) {
+            let cut = self
+                .file
+                .set_len(at)
+                .and_then(|()| self.file.seek(io::SeekFrom::Start(at)));
+            if cut.is_err() {
+                self.whole = Whole::Torn;
+            }
+            return Err(error);
+        }
+        self.whole = Whole::To(end);
+        Ok(())
+    }
+}
+
+fn shared_metadata(file: File) -> io::Result<Arc<Mutex<Ledger>>> {
+    Ledger::new(file).map(|ledger| Arc::new(Mutex::new(ledger)))
+}
+
+/// The byte quantum a channel's credit climbs in (D226), from the run's first record. A
+/// record crosses two frames, each bounded by its protocol: the run's from the guest
+/// (`run::MAX_PAYLOAD`) and the endpoint's data frame to the owner (`RECORD_MOST`, its
+/// frame less the record's offset). It climbs to the smaller, so that every window it
+/// desires is one the endpoint can admit.
+fn capture_quantum(capacity: usize) -> io::Result<shards_registry::Quantum> {
+    let most = usize::try_from(run::MAX_PAYLOAD)
+        .map_err(io::Error::other)?
+        .min(shards_remote::managed::RECORD_MOST);
+    shards_registry::Quantum::new(capacity, most)
+        .ok_or_else(|| io::Error::other("invalid capture quantum bounds"))
+}
+
+fn private_record(path: &Path) -> io::Result<File> {
+    match shards_ipc::create_private(path) {
+        Ok(file) => Ok(file),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            OpenOptions::new().write(true).truncate(true).open(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn generation(dir: &Path) -> io::Result<u64> {
+    let path = dir.join(GENERATION);
+    let mut file = match shards_ipc::create_private(&path) {
+        Ok(mut file) => {
+            file.write_all(&1u64.to_be_bytes())?;
+            shards_vmm::platform::sync_durable(&file)?;
+            shards_vmm::platform::sync_dir(dir)?;
+            return Ok(1);
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            OpenOptions::new().read(true).write(true).open(path)?
+        }
+        Err(e) => return Err(e),
+    };
+    file.lock()?;
+    let result = (|| {
+        if file.metadata()?.len() != size_of::<u64>() as u64 {
+            return Err(io::Error::other("invalid managed output generation record"));
+        }
+        let mut bytes = [0; size_of::<u64>()];
+        file.read_exact(&mut bytes)?;
+        let next = u64::from_be_bytes(bytes)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("managed output generation exhausted"))?;
+        file.rewind()?;
+        file.write_all(&next.to_be_bytes())?;
+        shards_vmm::platform::sync_durable(&file)?;
+        Ok(next)
+    })();
+    let unlocked = file.unlock();
+    result.and_then(|value| unlocked.map(|()| value))
+}
+
+fn read_exact(stream: &Stream, mut bytes: &mut [u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let count = shards_ipc::read(stream, bytes)?;
+        if count == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        bytes = bytes
+            .get_mut(count..)
+            .ok_or_else(|| io::Error::other("capture read overflow"))?;
+    }
+    Ok(())
+}
+
+fn ipc_buffers(stream: &Stream) -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        [libc::SO_SNDBUF, libc::SO_RCVBUF]
+            .into_iter()
+            .try_fold(0u64, |sum, option| {
+                let mut bytes: libc::c_int = 0;
+                let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: this owned private socket and an integer output of its size.
+                let rc = unsafe {
+                    libc::getsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        option,
+                        (&raw mut bytes).cast(),
+                        &raw mut len,
+                    )
+                };
+                if rc != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if bytes <= 0 || len as usize != size_of::<libc::c_int>() {
+                    return Err(io::Error::other("unknown capture socket queue"));
+                }
+                sum.checked_add(bytes as u64)
+                    .ok_or_else(|| io::Error::other("capture socket queue overflow"))
+            })
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Pipes::GetNamedPipeInfo;
+        let (mut input, mut output) = (0u32, 0u32);
+        // SAFETY: an owned pipe and correctly sized output pointers, no flags requested.
+        let rc = unsafe {
+            GetNamedPipeInfo(
+                stream.as_raw_fd(),
+                std::ptr::null_mut(),
+                &raw mut output,
+                &raw mut input,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if input == 0 || output == 0 {
+            return Err(io::Error::other("capture pipe queues grow without a known bound"));
+        }
+        Ok(u64::from(input) + u64::from(output))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod terminal_tests {
+    use super::*;
+
+    fn at(accepted: u64, consumed: u64) -> Progress {
+        Progress { accepted, consumed }
+    }
+
+    fn scope() -> Scope {
+        Scope {
+            run: RunId([7; 32]),
+            generation: 1,
+            member: 1,
+            channel: Channel::Stdout,
+        }
+    }
+
+    fn queue(slots: Vec<CreditSlot>) -> Credits {
+        Credits {
+            state: Mutex::new(Queue {
+                slots,
+                next: 0,
+                life: QueueLife::Open,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    #[test]
+    fn issued_capture_storage_survives_revocation_until_its_record_is_drained() {
+        let bytes = Vec::with_capacity(16);
+        let pointer = bytes.as_ptr();
+        let credits = queue(vec![
+            CreditSlot::Granted {
+                capacity: 16,
+                began: Instant::now(),
+                bytes,
+            },
+            CreditSlot::Waiting,
+        ]);
+        assert!(credits.begin_record(0, 17).is_err());
+        credits.revoke(0);
+        let (capacity, _, mut bytes) = credits.begin_record(0, 8).unwrap();
+        assert_eq!(capacity, 16);
+        assert_eq!(bytes.as_ptr(), pointer);
+        bytes.resize(8, 0);
+        assert_eq!(bytes.as_ptr(), pointer);
+        credits.captured(0, bytes, After::More).unwrap();
+        assert!(matches!(
+            lock(&credits.state).slots.first(),
+            Some(CreditSlot::Revoked)
+        ));
+        assert!(matches!(
+            credits.next(|_| Ok(State::Ready(at(0, 0)))).unwrap(),
+            Some(Action::Grant(1))
+        ));
+    }
+
+    #[test]
+    fn captured_storage_submits_while_its_endpoint_is_the_explicit_borrower() {
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(b"record");
+        let pointer = bytes.as_ptr();
+        let credits = queue(vec![CreditSlot::Captured(bytes, After::More)]);
+        match credits.next(|_| Ok(State::Capturing(at(0, 0)))).unwrap() {
+            Some(Action::Submit(0, bytes, After::More)) => {
+                assert_eq!(bytes.as_ptr(), pointer);
+                assert_eq!(bytes, b"record");
+            }
+            _ => panic!("the capture loan was not submitted"),
+        }
+        credits.close();
+        assert!(
+            credits
+                .next(|_| panic!("closed owner must not probe"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn prepared_growth_rolls_back_or_commits_the_replacement_charge() {
+        let budget = Arc::new(Mutex::new(Some(80)));
+        let charge = Charge {
+            budget: Arc::clone(&budget),
+            bytes: Mutex::new(80),
+        };
+        {
+            let _pending = charge.prepare_growth(40).unwrap();
+            assert_eq!(*lock(&budget), Some(120));
+        }
+        assert_eq!(*lock(&budget), Some(80));
+        charge.prepare_growth(40).unwrap().commit(30).unwrap();
+        assert_eq!(*lock(&budget), Some(90));
+        assert_eq!(*lock(&charge.bytes), 90);
+        drop(charge);
+        assert_eq!(*lock(&budget), Some(0));
+    }
+
+    #[test]
+    fn known_normal_completion_survives_stop_before_the_worker_publishes() {
+        for wire in [99, 102] {
+            let mut life = Life::Serving;
+            life.drain(Terminal::End).unwrap();
+            let remote = State::Finished(at(wire, wire));
+            // The actual r668 ordering: End/ACK/EOF, delayed publication, then stop.
+            assert_eq!(life.resolve(remote, Resolve::Stop), Some(Life::Ended));
+            let mut buffer = [0; TERMINAL_MOST];
+            assert_eq!(
+                life.record(scope(), remote.progress(), &mut buffer).unwrap(),
+                format!("member 1 channel 1 state ended accepted {wire} consumed {wire} tail complete\n")
+                    .as_bytes()
+            );
+            assert_eq!(life.resolve(State::Aborted(at(wire, wire)), Resolve::Stop), None);
+            assert_eq!(life.resolve(remote, Resolve::Complete), None);
+            assert!(life.drain(Terminal::End).is_err());
+            assert_eq!(life, Life::Ended);
+        }
+    }
+
+    #[test]
+    fn pending_or_aborted_equal_cursors_cannot_publish_normal_completion() {
+        for state in [
+            State::Pending(at(102, 102)),
+            State::Ready(at(102, 102)),
+            State::Aborted(at(102, 102)),
+        ] {
+            let mut life = Life::Draining(Terminal::End);
+            let completed = life.resolve(state, Resolve::Complete);
+            assert_ne!(completed, Some(Life::Ended));
+            life.resolve(state, Resolve::Stop);
+            assert_eq!(life, Life::Aborted(Some(Terminal::End)));
+            assert_eq!(
+                life.resolve(State::Finished(at(102, 102)), Resolve::Complete),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn stop_before_ack_is_sticky_and_retains_the_known_canonical_failure() {
+        for terminal in [Terminal::End, Terminal::Aborted(5), Terminal::Aborted(i32::MAX)] {
+            let mut life = Life::Draining(terminal);
+            assert_eq!(life.resolve(State::Pending(at(102, 86)), Resolve::Complete), None);
+            assert_eq!(
+                life.resolve(State::Pending(at(102, 86)), Resolve::Stop),
+                Some(Life::Aborted(Some(terminal)))
+            );
+            assert_eq!(
+                life.resolve(State::Finished(at(102, 102)), Resolve::Complete),
+                None
+            );
+            assert_eq!(life.resolve(State::Finished(at(102, 102)), Resolve::Stop), None);
+            assert!(life.drain(terminal).is_err());
+        }
+        let mut serving = Life::Serving;
+        assert_eq!(
+            serving.resolve(State::Ready(at(0, 0)), Resolve::Stop),
+            Some(Life::Aborted(None))
+        );
+        assert!(serving.drain(Terminal::End).is_err());
+    }
+
+    #[test]
+    fn fully_consumed_canonical_abort_keeps_errno_and_unknown_tail() {
+        let mut life = Life::Draining(Terminal::Aborted(5));
+        assert_eq!(
+            life.resolve(State::Finished(at(20, 20)), Resolve::Complete),
+            Some(Life::Aborted(Some(Terminal::Aborted(5))))
+        );
+        let mut buffer = [0; TERMINAL_MOST];
+        assert_eq!(
+            life.record(scope(), at(20, 20), &mut buffer).unwrap(),
+            b"member 1 channel 1 canonical aborted errno 5\nmember 1 channel 1 state aborted accepted 20 consumed 20 tail unknown\n"
+        );
+        assert_eq!(life.resolve(State::Finished(at(20, 20)), Resolve::Stop), None);
+    }
+
+    #[test]
+    fn metadata_failure_is_returned_without_changing_the_logical_winner() {
+        let dir = shards_testdir::TempDir::new("managed-refuse").unwrap();
+        File::create(dir.join("metadata")).unwrap();
+        for life in [Life::Ended, Life::Aborted(Some(Terminal::Aborted(5)))] {
+            // A record its file refuses: one opened for reading alone.
+            let mut ledger = Ledger::new(File::open(dir.join("metadata")).unwrap()).unwrap();
+            let mut buffer = [0; TERMINAL_MOST];
+            let record = life.record(scope(), at(20, 20), &mut buffer).unwrap();
+            assert!(ledger.append(record).is_err());
+            let mut sticky = life;
+            assert_eq!(sticky.resolve(State::Aborted(at(20, 20)), Resolve::Stop), None);
+            assert_eq!(sticky, life);
+        }
+    }
+
+    /// A channel's record at its widest, every number at its type's most, fits the record's
+    /// buffer.
+    #[test]
+    fn the_widest_terminal_record_fits_its_buffer() {
+        let scope = Scope {
+            member: u32::MAX,
+            channel: Channel::Stderr,
+            ..scope()
+        };
+        let mut buffer = [0; TERMINAL_MOST];
+        let record = Life::Aborted(Some(Terminal::Aborted(i32::MIN)))
+            .record(scope, at(u64::MAX, u64::MAX), &mut buffer)
+            .unwrap();
+        assert_eq!(
+            record,
+            format!(
+                "member {0} channel 2 canonical aborted errno {1}\n\
+                 member {0} channel 2 state aborted accepted {2} consumed {2} tail unknown\n",
+                u32::MAX,
+                i32::MIN,
+                u64::MAX
+            )
+            .as_bytes()
+        );
+        // The channel's one digit two short of a u8's three, on each of the two lines, and
+        // `unknown` one short of `complete`.
+        assert_eq!(record.len(), TERMINAL_MOST - 5);
+        let mut buffer = [0; TERMINAL_MOST];
+        assert!(
+            Life::Serving
+                .record(scope, at(1, 1), &mut buffer)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A record whose failed write cannot be cut back takes no more lines: none may follow
+    /// the part a failed write may have left.
+    #[test]
+    fn a_record_that_cannot_be_cut_back_takes_no_more_lines() {
+        let dir = shards_testdir::TempDir::new("managed-torn-state").unwrap();
+        File::create(dir.join("metadata")).unwrap();
+        // Opened for reading alone: its writes and its cuts both fail.
+        let mut ledger = Ledger::new(File::open(dir.join("metadata")).unwrap()).unwrap();
+        assert_eq!(ledger.whole, Whole::To(0));
+        assert!(ledger.append(b"member 1 channel 1 state ended\n").is_err());
+        assert_eq!(ledger.whole, Whole::Torn);
+        assert!(ledger.append(b"member 1 channel 2 state ended\n").is_err());
+        let mut whole = Ledger::new(File::create(dir.join("whole")).unwrap()).unwrap();
+        whole.append(b"a\n").unwrap();
+        whole.append(b"bc\n").unwrap();
+        assert_eq!(whole.whole, Whole::To(5));
+        assert_eq!(std::fs::read(dir.join("whole")).unwrap(), b"a\nbc\n");
+    }
+
+    #[test]
+    fn draining_completion_is_actionable_without_capacity_and_only_once() {
+        let credits = queue(vec![CreditSlot::Draining]);
+        let remote = State::Finished(at(102, 102));
+        assert!(matches!(
+            credits.next(|_| Ok(remote)).unwrap(),
+            Some(Action::Complete(0))
+        ));
+        credits.wake();
+        credits.wake();
+        assert!(
+            credits
+                .next(|_| panic!("ended credit must not probe again"))
+                .unwrap()
+                .is_none()
+        );
+        let credits = queue(vec![CreditSlot::Draining]);
+        assert!(matches!(
+            credits.next(|_| Ok(State::Aborted(at(102, 86)))).unwrap(),
+            Some(Action::Complete(0))
+        ));
+    }
+
+    #[test]
+    fn endpoint_loss_in_serving_or_drain_converges_without_waiting_for_capacity() {
+        let remote = State::Aborted(at(102, 86));
+        for initial in [
+            Life::Serving,
+            Life::Draining(Terminal::End),
+            Life::Draining(Terminal::Aborted(5)),
+        ] {
+            let mut life = initial;
+            let expected = match initial {
+                Life::Draining(terminal) => Life::Aborted(Some(terminal)),
+                _ => Life::Aborted(None),
+            };
+            assert_eq!(life.resolve(remote, Resolve::Complete), Some(expected));
+            assert_eq!(life.resolve(remote, Resolve::Stop), None);
+        }
+        for slot in [
+            CreditSlot::Waiting,
+            CreditSlot::Captured(vec![1], After::More),
+            CreditSlot::Draining,
+        ] {
+            let credits = queue(vec![slot]);
+            assert!(matches!(
+                credits.next(|_| Ok(remote)).unwrap(),
+                Some(Action::Complete(0))
+            ));
+            credits.revoke(0);
+            credits.wake();
+            assert!(
+                credits
+                    .next(|_| panic!("lost endpoint credit must be retired"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn drain_wait_rechecks_the_predicate_across_the_atomic_condvar_release() {
+        let credits = queue(vec![CreditSlot::Draining]);
+        let remote = Mutex::new(State::Pending(at(102, 86)));
+        let (inspected, observed) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|threads| {
+            let worker = threads.spawn(|| {
+                credits.next(|_| {
+                    let state = *lock(&remote);
+                    if matches!(state, State::Pending(_)) {
+                        let _ = inspected.try_send(());
+                    }
+                    Ok(state)
+                })
+            });
+            // The worker observed Pending while holding credit. Publication drops
+            // its source lock before wake takes credit, including this wait seam.
+            observed.recv().unwrap();
+            *lock(&remote) = State::Finished(at(102, 102));
+            credits.wake();
+            assert!(matches!(
+                worker.join().unwrap().unwrap(),
+                Some(Action::Complete(0))
+            ));
+        });
+    }
+
+    #[test]
+    fn revocation_and_close_wake_a_drain_without_reopening_it() {
+        for close in [false, true] {
+            let credits = queue(vec![CreditSlot::Draining]);
+            let (inspected, observed) = std::sync::mpsc::sync_channel(1);
+            std::thread::scope(|threads| {
+                let worker = threads.spawn(|| {
+                    credits.next(|_| {
+                        let _ = inspected.try_send(());
+                        Ok(State::Pending(at(102, 86)))
+                    })
+                });
+                observed.recv().unwrap();
+                if close {
+                    credits.close();
+                } else {
+                    credits.revoke(0);
+                }
+                credits.wake();
+                assert!(worker.join().unwrap().unwrap().is_none());
+            });
+        }
+    }
+
+    #[test]
+    fn readiness_is_derived_and_a_spurious_wake_does_not_issue_credit() {
+        let waiting = queue(vec![CreditSlot::Waiting]);
+        let remote = Mutex::new(State::Pending(at(0, 0)));
+        let (inspected, observed) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|threads| {
+            let worker = threads.spawn(|| {
+                waiting.next(|_| {
+                    let state = *lock(&remote);
+                    if matches!(state, State::Pending(_)) {
+                        let _ = inspected.try_send(());
+                    }
+                    Ok(state)
+                })
+            });
+            observed.recv().unwrap();
+            waiting.wake();
+            observed.recv().unwrap();
+            *lock(&remote) = State::Ready(at(0, 0));
+            waiting.wake();
+            assert!(matches!(worker.join().unwrap().unwrap(), Some(Action::Grant(0))));
+        });
+        let credits = queue(vec![
+            CreditSlot::Waiting,
+            CreditSlot::Captured(vec![1], After::More),
+        ]);
+        credits.wake();
+        let remote = State::Ready(at(0, 0));
+        assert!(matches!(
+            credits.next(|_| Ok(remote)).unwrap(),
+            Some(Action::Grant(0))
+        ));
+        assert!(matches!(
+            credits.next(|_| Ok(remote)).unwrap(),
+            Some(Action::Submit(1, _, After::More))
+        ));
+        credits.revoke(0);
+        credits.revoke(1);
+        credits.wake();
+        assert!(
+            credits
+                .next(|_| panic!("revoked credit must not probe"))
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn encoded(member: u32, channel: Channel, offset: u64, event: Event<'_>) -> Vec<u8> {
+        let record = Record {
+            member,
+            channel,
+            offset,
+            event,
+        };
+        let mut out = vec![0; record.encoded_len().unwrap()];
+        record.encode(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn image_identity_and_channel_offsets_are_checked_independently() {
+        let labels = vec!["harness first".into(), "agent second".into()];
+        let mut states = [StreamState::New; 4];
+        assert!(
+            accept(
+                &encoded(2, Channel::Stdout, 0, Event::Open("agent second")),
+                &labels,
+                &mut states
+            )
+            .is_err()
+        );
+        assert!(
+            accept(
+                &encoded(1, Channel::Stdout, 0, Event::Open("harness first")),
+                &labels,
+                &mut states
+            )
+            .is_err()
+        );
+        for channel in [Channel::Stdout, Channel::Stderr] {
+            assert!(
+                accept(
+                    &encoded(1, channel, 0, Event::Open("agent second")),
+                    &labels,
+                    &mut states
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            accept(
+                &encoded(1, Channel::Stdout, 0, Event::Data(b"\0\xff\r\n")),
+                &labels,
+                &mut states
+            )
+            .is_ok()
+        );
+        assert!(
+            accept(
+                &encoded(1, Channel::Stderr, 4, Event::Data(b"bad offset")),
+                &labels,
+                &mut states
+            )
+            .is_err()
+        );
+        assert!(
+            accept(
+                &encoded(1, Channel::Stderr, 0, Event::Data(b"stderr")),
+                &labels,
+                &mut states
+            )
+            .is_ok()
+        );
+        assert!(accept(&encoded(1, Channel::Stdout, 4, Event::End), &labels, &mut states).is_ok());
+        assert!(
+            accept(
+                &encoded(1, Channel::Stdout, 4, Event::Data(b"past end")),
+                &labels,
+                &mut states
+            )
+            .is_err()
+        );
+        assert!(!states.get(3).unwrap().terminal());
+    }
+
+    #[test]
+    fn a_blocked_channel_does_not_take_another_channels_credit() {
+        let at = Progress {
+            accepted: 0,
+            consumed: 0,
+        };
+        let queue = Credits {
+            state: Mutex::new(Queue {
+                slots: vec![
+                    CreditSlot::Captured(vec![1], After::More),
+                    CreditSlot::Waiting,
+                    CreditSlot::Waiting,
+                    CreditSlot::Waiting,
+                ],
+                next: 0,
+                life: QueueLife::Open,
+            }),
+            changed: Condvar::new(),
+        };
+        let observe = |index| {
+            Ok(if index == 1 || index == 3 {
+                State::Ready(at)
+            } else {
+                State::Pending(at)
+            })
+        };
+        assert!(matches!(queue.next(observe).unwrap(), Some(Action::Grant(1))));
+        assert!(matches!(queue.next(observe).unwrap(), Some(Action::Grant(3))));
+        queue.wake();
+        assert!(matches!(
+            queue.next(|_| Ok(State::Ready(at))).unwrap(),
+            Some(Action::Submit(0, _, After::More))
+        ));
+        queue.close();
+        assert!(queue.next(observe).unwrap().is_none());
+    }
+
+    #[test]
+    fn generation_is_persisted_and_never_wraps_or_reuses_a_bad_record() {
+        let dir = shards_testdir::TempDir::new("managed-gen").unwrap();
+        assert_eq!(generation(&dir).unwrap(), 1);
+        assert_eq!(generation(&dir).unwrap(), 2);
+        std::fs::write(dir.join(GENERATION), u64::MAX.to_be_bytes()).unwrap();
+        assert!(generation(&dir).is_err());
+        std::fs::write(dir.join(GENERATION), [0, 1]).unwrap();
+        assert!(generation(&dir).is_err());
+    }
+
+    #[test]
+    fn an_unknown_remote_owner_never_falls_back_to_the_home_key() {
+        let dir = shards_testdir::TempDir::new("managed-key").unwrap();
+        assert_eq!(owner_key(&dir, "", [7; 32]).unwrap(), [7; 32]);
+        assert!(owner_key(&dir, "missing", [7; 32]).is_err());
+    }
+
+    #[test]
+    fn the_initial_record_fits_actual_metadata_and_terminal_errno() {
+        let labels = vec!["agent a".into(), "harness a longer supplied name".into()];
+        let capacity = record_capacity(&labels, &[0, 1]).unwrap();
+        for label in &labels {
+            assert!(encoded(0, Channel::Stdout, 0, Event::Open(label)).len() <= capacity);
+        }
+        assert!(encoded(0, Channel::Stderr, 0, Event::Aborted(5)).len() <= capacity);
+    }
+
+    /// A run's record (its first line) and two of its channels' terminal records: member 0's
+    /// stdout aborted with a canonical errno, then its stderr ended.
+    #[cfg(unix)]
+    const TORN_HEADER: &str = "shards managed output 1\n";
+    #[cfg(unix)]
+    const ABORTED_RECORD: &str = "member 0 channel 1 canonical aborted errno 5\n\
+        member 0 channel 1 state aborted accepted 20 consumed 20 tail unknown\n";
+    #[cfg(unix)]
+    const ENDED_RECORD: &str = "member 0 channel 2 state ended accepted 7 consumed 7 tail complete\n";
+
+    /// A channel's terminal record whose append fails part-way leaves the run's record of
+    /// whole lines: the next channel's record starts a line of its own, and the failed one is
+    /// there whole or not at all (finding 2 of audit-fix-host-v1: its part stayed, and the
+    /// next channel's line was written onto it). Its child lowers its own process's file
+    /// size limit partway through the first record, as a full disk cuts a write short, and
+    /// raises it again before the second, as a disk's room comes back.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_record_that_fails_part_way_leaves_whole_lines() {
+        let dir = shards_testdir::TempDir::new("managed-torn").unwrap();
+        let path = dir.join("metadata");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon::managed::tests::torn_append_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("SHARDS_MANAGED_TORN", &path)
+            .output()
+            .unwrap();
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(child.status.success(), "{said}");
+        assert!(said.contains(" 1 passed"), "the child ran no case: {said}");
+        let record = std::fs::read_to_string(&path).unwrap();
+        let whole = [
+            format!("{TORN_HEADER}{ENDED_RECORD}"),
+            format!("{TORN_HEADER}{ABORTED_RECORD}{ENDED_RECORD}"),
+        ];
+        assert!(
+            whole.contains(&record),
+            "a terminal append that failed part-way left a torn line, the next channel's \
+             written onto it:\n{record}"
+        );
+    }
+
+    /// The child of `a_terminal_record_that_fails_part_way_leaves_whole_lines`, alone in its
+    /// process, whose file size limit it sets.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child of a_terminal_record_that_fails_part_way_leaves_whole_lines: sets its process's RLIMIT_FSIZE"]
+    fn torn_append_child() {
+        let Some(path) = std::env::var_os("SHARDS_MANAGED_TORN") else {
+            return;
+        };
+        let server = identity::Identity::generate().unwrap();
+        let mut file = private_record(Path::new(&path)).unwrap();
+        file.write_all(TORN_HEADER.as_bytes()).unwrap();
+        let metadata = shared_metadata(file).unwrap();
+        let charge = Arc::new(Charge {
+            budget: Arc::new(Mutex::new(Some(0))),
+            bytes: Mutex::new(0),
+        });
+        let capacity = record_capacity(&["agent".into()], &[0]).unwrap();
+        let at = |n| Progress {
+            accepted: n,
+            consumed: n,
+        };
+        let [aborted, ended] = [
+            (
+                Channel::Stdout,
+                Life::Aborted(Some(Terminal::Aborted(5))),
+                State::Aborted(at(20)),
+            ),
+            (Channel::Stderr, Life::Ended, State::Finished(at(7))),
+        ]
+        .map(|(channel, life, state)| {
+            let (scope, endpoint, _producer, control) =
+                bound(&server, server.fingerprint(), channel, capacity);
+            let output = output(
+                scope,
+                &endpoint,
+                control,
+                capture_quantum(capacity).unwrap(),
+                capacity,
+                &metadata,
+                std::sync::Weak::new(),
+                0,
+                &charge,
+            );
+            // Resolved already, as `complete` resolves a channel before it publishes.
+            *lock(&output.life) = life;
+            (output, life, state)
+        });
+        // SAFETY: SIG_IGN for SIGXFSZ, so that a write past the limit fails with EFBIG
+        // rather than ending this child.
+        unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: reads this process's limit into a valid local.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) }, 0);
+        let given = limit;
+        limit.rlim_cur = libc::rlim_t::try_from(TORN_HEADER.len() + ABORTED_RECORD.len() / 2).unwrap();
+        // SAFETY: lowers this process's own soft limit, from a valid local.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) }, 0);
+        aborted.0.publish(Some((aborted.1, aborted.2)));
+        // SAFETY: restores this process's own soft limit, from a valid local.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &given) }, 0);
+        ended.0.publish(Some((ended.1, ended.2)));
+    }
+
+    /// Test patience for the real transport below, as the daemon's own tests wait.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    fn admitted(capacity: usize, patience: std::time::Duration) -> Admitted {
+        Admitted {
+            record_bytes: capacity,
+            transport_bytes: u64::try_from(capacity + shards_remote::managed::DATA_HEAD).unwrap(),
+            handshake_bytes: HANDSHAKE_BYTES,
+            datagram_bytes: shards_remote::managed::DATAGRAM_BYTES,
+            patience,
+        }
+    }
+
+    /// Member 0's `channel` of a run, bound as `start_managed_capture` binds it.
+    fn bound(
+        server: &identity::Identity,
+        owner: Fingerprint,
+        channel: Channel,
+        capacity: usize,
+    ) -> (Scope, Endpoint, Producer, Control) {
+        let scope = Scope {
+            run: RunId([7; 32]),
+            generation: 1,
+            member: 0,
+            channel,
+        };
+        let (endpoint, producer, control) = Endpoint::bind(
+            server,
+            owner,
+            scope,
+            admitted(capacity, shards_remote::tls::QUIET),
+        )
+        .unwrap();
+        (scope, endpoint, producer, control)
+    }
+
+    /// The output of a bound channel, as `start_managed_capture` makes it, learning in
+    /// `quantum`.
+    #[allow(clippy::too_many_arguments)]
+    fn output(
+        scope: Scope,
+        endpoint: &Endpoint,
+        control: Control,
+        quantum: shards_registry::Quantum,
+        capacity: usize,
+        metadata: &Arc<Mutex<Ledger>>,
+        credits: std::sync::Weak<Credits>,
+        index: usize,
+        charge: &Arc<Charge>,
+    ) -> Output {
+        Output {
+            scope,
+            address: endpoint.address,
+            control,
+            metadata: Arc::clone(metadata),
+            life: Mutex::new(Life::Serving),
+            credits,
+            index,
+            learning: Mutex::new(Learning {
+                quantum,
+                sample: None,
+                admitted: capacity,
+            }),
+            charge: Arc::clone(charge),
+        }
+    }
+
+    /// Climbs `quantum` as an owner does that consumes each full record a millisecond after
+    /// it was issued (D226's climb), until its window has not changed for 64 records (a
+    /// doubling takes six: a window it settles in and two it measures, two records each);
+    /// the window it desires then.
+    fn climbed(quantum: &mut shards_registry::Quantum) -> usize {
+        let start = Instant::now();
+        let mut desired = quantum.desired();
+        let mut unchanged = 0;
+        for n in 0..100_000 {
+            let began = start + std::time::Duration::from_millis(n);
+            quantum.consumed(began, began + std::time::Duration::from_millis(1), desired as u64);
+            if quantum.desired() == desired {
+                unchanged += 1;
+                if unchanged == 64 {
+                    return desired;
+                }
+            } else {
+                (desired, unchanged) = (quantum.desired(), 0);
+            }
+        }
+        panic!("the quantum never settled: {desired}");
+    }
+
+    /// A growth its endpoint refuses (`Admission(Capacity)`) leaves the channel the window it
+    /// has: it is credited at that, the charge the growth took is given back, and the channel
+    /// serves on (finding 1 of audit-fix-host-v1: the refusal was an error that ended the
+    /// owner's credit worker and, with it, every channel of the run).
+    #[test]
+    fn growth_the_endpoint_refuses_keeps_the_current_window() {
+        let server = identity::Identity::generate().unwrap();
+        let capacity = record_capacity(&["agent".into()], &[0]).unwrap();
+        let (scope, endpoint, producer, control) =
+            bound(&server, server.fingerprint(), Channel::Stdout, capacity);
+        let storage = producer.storage_capacity();
+        let dir = shards_testdir::TempDir::new("managed-refused").unwrap();
+        let metadata = shared_metadata(File::create(dir.join("metadata")).unwrap()).unwrap();
+        let budget = Arc::new(Mutex::new(Some(0)));
+        let charge = Arc::new(Charge {
+            budget: Arc::clone(&budget),
+            bytes: Mutex::new(0),
+        });
+        // A quantum climbing past what one endpoint record holds: the capture's own, before
+        // its bound.
+        let quantum = shards_registry::Quantum::new(capacity, run::MAX_PAYLOAD as usize).unwrap();
+        let output = output(
+            scope,
+            &endpoint,
+            control,
+            quantum,
+            capacity,
+            &metadata,
+            std::sync::Weak::new(),
+            0,
+            &charge,
+        );
+        let desired = climbed(&mut lock(&output.learning).quantum);
+        assert!(
+            matches!(
+                producer.admit(desired),
+                Err(shards_remote::managed::Error::Admission(
+                    shards_remote::managed::AdmissionError::Capacity
+                ))
+            ),
+            "its endpoint holds a window of {desired}: no refusal to keep"
+        );
+        let granted = output.capacity(&producer);
+        assert!(
+            matches!(granted, Ok(n) if n == capacity),
+            "a growth its endpoint refused cost the channel its credit: {granted:?}"
+        );
+        assert_eq!(lock(&output.learning).admitted, capacity);
+        assert_eq!(producer.storage_capacity(), storage);
+        assert_eq!(
+            *lock(&budget),
+            Some(0),
+            "the refused growth's charge stayed taken"
+        );
+        assert_eq!(*lock(&output.life), Life::Serving);
+        assert!(!matches!(output.control.state(), State::Aborted(_)));
+    }
+
+    /// An owner subscribed to one channel at its start over the real transport, as an
+    /// owner's observer is: what a channel needs of its owner to be credited (`Ready`).
+    struct Subscriber {
+        scope: Scope,
+        config: Option<hyper_quic::ClientConfig>,
+        pending: Vec<u8>,
+        at: Option<(shards_remote::net::ConnKey, hyper_quic::StreamId)>,
+        ended: bool,
+    }
+
+    impl Subscriber {
+        fn flush(&mut self, io: &mut shards_remote::net::Io<'_>) {
+            let Some((conn, stream)) = self.at else { return };
+            while !self.pending.is_empty() {
+                match io.write(conn, stream, &self.pending) {
+                    Ok(0) => return,
+                    Ok(n) => drop(self.pending.drain(..n)),
+                    Err(_) => {
+                        self.ended = true;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    impl shards_remote::net::Handler for Subscriber {
+        type Command = std::net::SocketAddr;
+
+        fn connected(
+            &mut self,
+            io: &mut shards_remote::net::Io<'_>,
+            conn: shards_remote::net::ConnKey,
+            _: &[u8],
+        ) -> Result<(), shards_remote::net::Close> {
+            let stream = io.open(conn).map_err(|_| shards_remote::net::Close {
+                code: 1,
+                why: "the subscription's stream",
+            })?;
+            self.at = Some((conn, stream));
+            self.pending
+                .extend_from_slice(&shards_remote::managed::subscribe(self.scope, 0));
+            self.flush(io);
+            Ok(())
+        }
+        fn opened(&mut self, _: &mut shards_remote::net::Io<'_>, _: u64, _: hyper_quic::StreamId) {}
+        fn readable(&mut self, _: &mut shards_remote::net::Io<'_>, _: u64, _: hyper_quic::StreamId) {}
+        fn writable(&mut self, io: &mut shards_remote::net::Io<'_>, _: u64, _: hyper_quic::StreamId) {
+            self.flush(io);
+        }
+        fn stopped(&mut self, _: &mut shards_remote::net::Io<'_>, _: u64, _: hyper_quic::StreamId) {
+            self.ended = true;
+        }
+        fn lost(&mut self, _: &mut shards_remote::net::Io<'_>, _: u64, _: &str, _: Option<u64>) {
+            self.ended = true;
+        }
+        fn command(&mut self, io: &mut shards_remote::net::Io<'_>, to: std::net::SocketAddr) {
+            match self.config.take().map(|config| io.connect(to, config)) {
+                Some(Ok(_)) => {}
+                _ => self.ended = true,
+            }
+        }
+        fn done(&self) -> bool {
+            self.ended
+        }
+    }
+
+    /// The credit the owner's credit worker sends its capture, read from the capture's end.
+    fn credit(peer: &Stream) -> io::Result<run::managed::Credit> {
+        let mut head = [0; run::HEADER];
+        read_exact(peer, &mut head)?;
+        let (kind, len) = run::parse_header(head).ok_or_else(|| io::Error::other("not a frame"))?;
+        if kind != run::kind::MANAGED_CREDIT {
+            return Err(io::Error::other(format!("a frame of kind {kind}, not a credit")));
+        }
+        let mut payload = vec![0; len as usize];
+        read_exact(peer, &mut payload)?;
+        run::managed::Credit::decode(&payload).map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    /// A capture whose window climbed to its most is credited within one endpoint record,
+    /// and no channel of its run is aborted for it: the owner's credit worker, granting a
+    /// subscribed channel, issues its credit at the window it climbed to, which its
+    /// endpoint holds, and goes on; the run's other channel serves on (finding 1 of
+    /// audit-fix-host-v1: the quantum climbed to `run::MAX_PAYLOAD`, past the endpoint's
+    /// record, whose refusal ended the worker and every channel of the run with it).
+    #[test]
+    fn a_climbed_capture_credit_fits_one_endpoint_record_and_aborts_no_channel() {
+        let server = identity::Identity::generate().unwrap();
+        let owner = identity::Identity::generate().unwrap();
+        let capacity = record_capacity(&["agent".into()], &[0]).unwrap();
+        // The most one endpoint record holds, as its data frame carries it (its offset, then
+        // the record, within one frame): checked against an endpoint of its own.
+        let most = shards_remote::frame::MAX_FRAME - size_of::<u64>();
+        {
+            let (_, _endpoint, producer, _control) =
+                bound(&server, owner.fingerprint(), Channel::Stdout, capacity);
+            assert!(producer.admit(most).is_ok());
+            assert!(producer.admit(most + 1).is_err());
+        }
+        let dir = shards_testdir::TempDir::new("managed-climb").unwrap();
+        let metadata = shared_metadata(File::create(dir.join("metadata")).unwrap()).unwrap();
+        let charge = Arc::new(Charge {
+            budget: Arc::new(Mutex::new(Some(0))),
+            bytes: Mutex::new(0),
+        });
+        let credits = Arc::new(Credits {
+            state: Mutex::new(Queue {
+                slots: vec![CreditSlot::Waiting, CreditSlot::Waiting],
+                next: 0,
+                life: QueueLife::Open,
+            }),
+            changed: Condvar::new(),
+        });
+        let (mut outputs, mut producers, mut endpoints) = (Vec::new(), Vec::new(), Vec::new());
+        for (index, channel) in [Channel::Stdout, Channel::Stderr].into_iter().enumerate() {
+            let (scope, endpoint, producer, control) = bound(&server, owner.fingerprint(), channel, capacity);
+            let output = Arc::new(output(
+                scope,
+                &endpoint,
+                control,
+                capture_quantum(capacity).unwrap(),
+                capacity,
+                &metadata,
+                Arc::downgrade(&credits),
+                index,
+                &charge,
+            ));
+            let weak = Arc::downgrade(&credits);
+            producer.on_credit(move || {
+                if let Some(credits) = weak.upgrade() {
+                    credits.wake();
+                }
+            });
+            outputs.push(Some(output));
+            producers.push(Some(Arc::new(producer)));
+            endpoints.push(endpoint);
+        }
+        let stdout = Arc::clone(outputs.first().unwrap().as_ref().unwrap());
+        let stderr = Arc::clone(outputs.get(1).unwrap().as_ref().unwrap());
+        let desired = climbed(&mut lock(&stdout.learning).quantum);
+        #[cfg(unix)]
+        let (stream, peer) = Stream::pair().unwrap();
+        #[cfg(windows)]
+        let (stream, peer) = Stream::plain_pair().unwrap();
+        peer.set_read_timeout(Some(PATIENCE)).unwrap();
+        let writing = stream.try_clone().unwrap();
+        let owner_side = Owner {
+            outputs,
+            stream,
+            credits,
+            _charge: Arc::clone(&charge),
+        };
+        let (subscriber, sender) = shards_remote::net::Driver::bind_bounded(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Subscriber {
+                scope: stdout.scope,
+                config: Some(
+                    shards_remote::managed::client_config(
+                        &owner,
+                        server.fingerprint(),
+                        admitted(capacity, PATIENCE),
+                    )
+                    .unwrap(),
+                ),
+                pending: Vec::new(),
+                at: None,
+                ended: false,
+            },
+            shards_remote::net::DriverLimits {
+                connections: 1,
+                command_slots: 1,
+                queued_datagram_bytes: shards_remote::managed::DATAGRAM_BYTES,
+                handshake_patience: PATIENCE,
+            },
+        )
+        .unwrap();
+        let (worked, work) = std::sync::mpsc::sync_channel(1);
+        let (granted, ended, sibling) = std::thread::scope(|threads| {
+            for endpoint in endpoints {
+                threads.spawn(move || endpoint.run());
+            }
+            let mut subscriber = subscriber;
+            threads.spawn(move || subscriber.run());
+            sender
+                .send(shards_remote::net::Command::Handler(stdout.address))
+                .unwrap();
+            let (owner_side, producers) = (&owner_side, &producers);
+            threads.spawn(move || {
+                // As the run's own credit worker ends (start_managed_capture): its owner, and
+                // every channel of the run, with it.
+                let result = send_credits(writing, owner_side, producers);
+                if result.is_err() {
+                    owner_side.abort();
+                }
+                let _ = worked.send(result);
+            });
+            let granted = credit(&peer);
+            // A worker that sent a credit goes on; one that did not has ended, or ends.
+            let ended = match granted {
+                Ok(_) => work.try_recv().ok(),
+                Err(_) => work.recv_timeout(PATIENCE).ok(),
+            };
+            let sibling = (*lock(&stderr.life), stderr.control.state());
+            owner_side.abort();
+            sender.request_stop();
+            (granted, ended, sibling)
+        });
+        let record = std::fs::read_to_string(dir.join("metadata")).unwrap();
+        assert!(
+            ended.is_none(),
+            "the credit worker ended at a capture's grant: {ended:?}; its run's record:\n{record}"
+        );
+        assert_eq!(
+            sibling.0,
+            Life::Serving,
+            "the run's other channel ended for its sibling's credit: {sibling:?}"
+        );
+        assert!(!matches!(sibling.1, State::Aborted(_)), "{sibling:?}");
+        let granted = granted.unwrap();
+        assert_eq!((granted.member, granted.channel), (0, Channel::Stdout));
+        assert!(
+            desired <= most,
+            "the capture's window climbed to {desired}, past the {most} one endpoint record holds"
+        );
+        assert!(desired > capacity, "the window never climbed");
+        assert_eq!(
+            granted.capacity, desired as u64,
+            "the channel was credited short of the window it climbed to"
+        );
+        assert_eq!(lock(&stdout.learning).admitted, desired);
+    }
+}

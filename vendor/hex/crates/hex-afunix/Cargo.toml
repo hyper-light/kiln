@@ -1,0 +1,16 @@
+[package]
+name = "hex-afunix"
+description = "Hex's Windows AF_UNIX socket calls: one I/O completion port, overlapped accepts, receives and sends, program-end watches and the peer's user, for the node agent's socket and its client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Windows only: elsewhere the crate is empty (Linux's and macOS's sockets are rustix's).
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[lints]
+workspace = true

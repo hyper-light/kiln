@@ -1720,6 +1720,141 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hex-afunix"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hex-api"
+version = "0.1.0"
+dependencies = [
+ "hex-afunix",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "hex-client"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "hex-afunix",
+ "hex-api",
+ "hex-core",
+ "rustix",
+ "sha2 0.10.9",
+ "shards-api",
+ "tar",
+ "triomphe",
+ "unsize",
+]
+
+[[package]]
+name = "hex-core"
+version = "0.1.0"
+dependencies = [
+ "hex-api",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "triomphe",
+]
+
+[[package]]
+name = "hex-gpu"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hex-health"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "hex-node"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "hex-afunix",
+ "hex-api",
+ "hex-client",
+ "hex-core",
+ "hex-gpu",
+ "hex-health",
+ "hex-quic",
+ "hex-runtime",
+ "hex-sim",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "shards-api",
+ "thiserror 2.0.21",
+ "triomphe",
+]
+
+[[package]]
+name = "hex-quic"
+version = "0.1.0"
+dependencies = [
+ "hex-api",
+ "hex-client",
+ "hex-core",
+ "hyper-quic",
+ "hyper-transport",
+ "pem",
+ "rcgen",
+ "rustix",
+ "rustls-webpki",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "hex-runtime"
+version = "0.1.0"
+dependencies = [
+ "hex-api",
+ "hex-client",
+ "hex-core",
+ "hex-gpu",
+ "libc",
+ "rustix",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "shards-api",
+ "socket2",
+ "thiserror 2.0.21",
+ "triomphe",
+ "windows",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hex-sim"
+version = "0.1.0"
+dependencies = [
+ "hex-api",
+ "hex-health",
+ "hyper-swim",
+ "hyper-timing",
+ "serde",
+ "thiserror 2.0.21",
+ "triomphe",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1906,6 +2041,13 @@ dependencies = [
  "rustix",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hyper-swim"
+version = "0.1.0"
+dependencies = [
+ "hyper-timing",
 ]
 
 [[package]]
@@ -2298,6 +2440,7 @@ dependencies = [
  "futures",
  "glob",
  "hex",
+ "hex-node",
  "hmac 0.13.0",
  "http",
  "http-body",
@@ -2349,6 +2492,8 @@ dependencies = [
  "serde_path_to_error",
  "serde_yaml",
  "sha2 0.11.1",
+ "shards-agentfile",
+ "shards-api",
  "socket2",
  "str0m",
  "sysinfo",
@@ -3660,8 +3805,6 @@ dependencies = [
 [[package]]
 name = "rquickjs-sys"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cee271d0eeba64f0915b846cb7ae02e16faf3dfdffdca91731101d9d30fe3423"
 dependencies = [
  "cc",
 ]
@@ -3823,6 +3966,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3919,6 +4071,13 @@ dependencies = [
  "der",
  "generic-array",
  "zeroize",
+]
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -4116,6 +4275,82 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "shards-abi"
+version = "0.1.0"
+
+[[package]]
+name = "shards-afunix"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "shards-agentfile"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "serde_json",
+ "sha2 0.11.1",
+ "shards-abi",
+ "shards-cmdline",
+ "shards-dns",
+ "shards-image",
+]
+
+[[package]]
+name = "shards-api"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2 0.11.1",
+ "shards-abi",
+ "shards-afunix",
+ "triomphe",
+ "unsize",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "shards-cmdline"
+version = "0.1.0"
+dependencies = [
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "regex",
+ "shards-template",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "shards-dns"
+version = "0.1.0"
+
+[[package]]
+name = "shards-erofs"
+version = "0.1.0"
+
+[[package]]
+name = "shards-image"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "libc",
+ "regex",
+ "ruzstd",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "shards-erofs",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "shards-template"
+version = "0.1.0"
 
 [[package]]
 name = "shared_library"
@@ -4843,6 +5078,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "triomphe"
+version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d15f4f5898bcfc5d8a8e45ed30b2f108d710c1a2e5489dbf80e078f707181bc"
+dependencies = [
+ "unsize",
+]
+
+[[package]]
 name = "ts-rs"
 version = "12.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5068,6 +5312,15 @@ name = "unsafe-libyaml"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+
+[[package]]
+name = "unsize"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fa7a7a734c1a5664a662ddcea0b6c9472a21da8888c957c7f1eaa09dba7a939"
+dependencies = [
+ "autocfg",
+]
 
 [[package]]
 name = "untrusted"

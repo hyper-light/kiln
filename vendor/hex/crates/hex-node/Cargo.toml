@@ -1,0 +1,63 @@
+[package]
+name = "hex-node"
+description = "Hex's node agent (hexlet): drives the runtime classes, keeps a durable record of each box, and takes boxes back or cleans them up after a crash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex-api.workspace = true
+hex-client.workspace = true
+hex-core.workspace = true
+hex-health.workspace = true
+# The node's listener over QUIC (src/quic.rs; docs/design/hex-quic.md Q4).
+hex-quic.workspace = true
+hex-runtime.workspace = true
+shards-api.workspace = true
+# The node's facts are the scheduler's (`src/facts.rs`, `hex_sim::facts`).
+hex-sim.workspace = true
+# The node's GPUs and their load, for its facts (`src/facts.rs`).
+hex-gpu.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+# Identity of a replayed peer envelope, persisted beside its transport sequence.
+sha2.workspace = true
+thiserror.workspace = true
+triomphe.workspace = true
+# Fresh managed NativeScope is filled once by the existing Store before publication.
+getrandom = "=0.4.3"
+
+# Windows' AF_UNIX socket and completion port (CLAUDE.md §12).
+[target.'cfg(windows)'.dependencies]
+hex-afunix.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[features]
+# The builders only hex-cli's tests call (scripts/check-production.sh keeps them out of production builds).
+test-controls = []
+
+[dev-dependencies]
+hex-testkit.workspace = true
+# The relay's end-to-end staging test builds its tarball (src/relay/tests.rs).
+tar.workspace = true
+tempfile.workspace = true
+# Its layer tests name each tarball by its sha256, as an image does (src/relay/tests.rs).
+sha2.workspace = true
+# The guest loop test's stand-in for a Shards guest (tests/guest_loop.rs).
+shards-api.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Actual per-launch isolation ACK in Node's Linux native tests (no production feature edge).
+hex-runtime = { workspace = true, features = ["native-gate-test"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# guest_loop's Firecracker CONNECT fixture; no production stream or handle adapter.
+shards-afunix = { path = "../../vendor/shards/crates/afunix" }
+
+[lints]
+workspace = true
