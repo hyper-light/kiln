@@ -155,12 +155,17 @@ a96c0ecd1edabfb7e9736f25404601dc8002aea5d627dafe5c34e1aff37a442b. Nothing left i
 - R12 Shared: one fetcher (step 19's), one hook (step 28's), one unpacker (step 25's, as step 27 put it);
   this step adds a field to it and writes no second anything.
 - R13 Simple: one optional field, one Why, one state type, one helper.
-- R15 Role: implementer; light tests and the step's live test only. Landed on kiln main by this agent at
-  ROOT's word, under the person's rule that subagents merge their own work to main and end.
+- R15 Role: implementer; light tests and the step's live test only. ROOT's landing batch merged this
+  branch at 51af39c6d into kiln main as 6e48ee58b (2026-11-12T20:05Z), the code and its tests; this
+  record's later commits land by fast-forward.
 - R16 Space: every run made one ~/.cache directory and removed it (each log's END line); the targets
   (17-18 GB on the Mac Studio) went with them.
 
 ## Landing (ROOT's word, 2026-11-12)
+
+On kiln main: 6e48ee58b, ROOT's landing batch's merge of s26-unpack at 51af39c6d (the unpacker's
+`alone`, step 28's hook, agy's pin with `alone`, the tests). The runs below test the branch with main
+ed0c9d3bd merged in, the tree this record's last commits sit on.
 
 ROOT's goal for plan step 26 (on ROOT's stack, agent 01a148884a4770fdaf0111f3f792a248): "put the shared
 unpacker on kiln main (your s26-unpack-core / s26-unpack: agentfiles unpack, the context hook and their
