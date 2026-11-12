@@ -1,7 +1,8 @@
 //! The Agentfiles kiln ships, one per harness it runs in a Shards microVM (kiln plan
 //! 01a1cd8e862e7169a074db3d5fa33f3d, "Every kiln harness in Shards microVMs"): each embedded in kiln's
-//! one binary, listed read-only beside a person's own, and copied to make one theirs. None yet: each
-//! harness's own step adds its Agentfile here (`include_str!`).
+//! one binary, listed read-only beside a person's own, and copied to make one theirs. Each harness's
+//! own step adds its Agentfile here (`include_str!` of `.kiln/images/harness-<id>/`, where kiln keeps
+//! image definitions, W13-R11).
 
 use serde::Serialize;
 
@@ -12,10 +13,24 @@ pub struct Builtin {
     /// The harness it runs (`crate::harness::kinds::Kind`'s id: `claude`, `codex` ...).
     pub harness: &'static str,
     pub text: &'static str,
+    /// Its pin.json: each platform's files of the harness directory, by URL, SHA-256 and size, and
+    /// how its pin.sh checked them.
+    pub pin: &'static str,
+    /// The small files of its build context beside the Agentfile (its harness.json), by name.
+    pub files: &'static [(&'static str, &'static str)],
 }
 
 /// Every one, in the order they're listed.
-pub const ALL: &[Builtin] = &[];
+pub const ALL: &[Builtin] = &[
+    // Amp, through its ACP adapter amp-acp (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 24).
+    Builtin {
+        name: "harness-amp",
+        harness: "amp",
+        text: include_str!("../../../../.kiln/images/harness-amp/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-amp/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-amp/harness.json"))],
+    },
+];
 
 /// One as the list shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -31,6 +46,9 @@ pub struct View {
 pub fn views() -> Vec<View> {
     ALL.iter().map(|b| View { name: b.name.to_owned(), harness: b.harness.to_owned(), text: b.text.to_owned() }).collect()
 }
+
+#[cfg(test)]
+mod amp_tests;
 
 #[cfg(test)]
 mod tests {
