@@ -217,14 +217,23 @@ async fn draft(hub: &Hub, id: &str) -> R<Draft> {
 
 /// Every package installed, oldest first.
 pub async fn all(hub: &Hub) -> R<Vec<Installed>> {
-    let rows: Vec<String> = hub
+    read(&rows(hub).await?)
+}
+
+/// Every package's row as it's kept (its JSON), oldest first: what [`all`] reads, and [`sync`] off the shards.
+async fn rows(hub: &Hub) -> R<Vec<String>> {
+    Ok(hub
         .store
         .call(|c| {
             let mut st = c.prepare("SELECT body FROM skill_packages ORDER BY created_at, id")?;
             let rows = st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
-        .await?;
+        .await?)
+}
+
+/// Packages' rows ([`rows`]), read.
+fn read(rows: &[String]) -> R<Vec<Installed>> {
     rows.iter().map(|r| serde_json::from_str(r).map_err(|e| Error::Other(e.into()))).collect()
 }
 
@@ -445,13 +454,16 @@ pub fn manifests(pkgs: &[Installed], sessions: &[At], machines: &BTreeSet<String
     out
 }
 
-/// Every session kiln knows, as scopes see them.
-async fn sessions(hub: &Hub) -> Vec<At> {
-    let openers: BTreeMap<String, String> = hub.store.kv_prefix("agents/opener/".into()).await.unwrap_or_default().into_iter().filter_map(|(k, v)| k.strip_prefix("agents/opener/").map(|id| (id.to_owned(), v))).collect();
-    hub.harness
-        .list()
-        .into_iter()
-        .map(|i| At { machine: crate::harness::wait::machine(&i.target).to_owned(), root: i.tree.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| i.cwd.clone()), opener: openers.get(&i.id).cloned(), id: i.id })
+/// Who opened each session, by its id, as kiln's store keeps it.
+async fn openers(hub: &Hub) -> BTreeMap<String, String> {
+    hub.store.kv_prefix("agents/opener/".into()).await.unwrap_or_default().into_iter().filter_map(|(k, v)| k.strip_prefix("agents/opener/").map(|id| (id.to_owned(), v))).collect()
+}
+
+/// Every session kiln knows (`infos`, as their owners share them), as scopes see them, with who opened each.
+fn sessions_at(infos: &[Arc<crate::harness::session::Info>], openers: &BTreeMap<String, String>) -> Vec<At> {
+    infos
+        .iter()
+        .map(|i| At { machine: crate::harness::wait::machine(&i.target).to_owned(), root: i.tree.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| i.cwd.clone()), opener: openers.get(&i.id).cloned(), id: i.id.clone() })
         .collect()
 }
 
@@ -479,16 +491,36 @@ pub async fn sync(hub: &Hub) {
     // W20-R01: an older install/session snapshot must never overtake a newer one.
     static SYNC: crate::turn::Gate = crate::turn::Gate::one();
     let _turn = SYNC.turn().await;
-    let pkgs = match all(hub).await {
-        Ok(p) => p,
+    let rows = match rows(hub).await {
+        Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "couldn't read the skills installed");
             return;
         }
     };
-    let at = sessions(hub).await;
+    let (openers, infos) = (openers(hub).await, hub.harness.list_shared());
     let (names, peers) = machines(hub);
-    for (machine, m) in manifests(&pkgs, &at, &names) {
+    // Read, weighed and written out on the compute pool: every package's JSON read, each machine's manifest made from them
+    // and every session, and the runners' written out (goal 9, plan 01a1a87b2cec step 3: on the shard that heard of the
+    // session starting, a sync held it 0.58 to 0.63 ms on the CPU in probes 18 and 20's Linux rounds, the lab's fill
+    // starting 32 sessions).
+    let made = crate::rt::compute(move || -> R<Vec<(String, Manifest, Option<String>)>> {
+        let pkgs = read(&rows)?;
+        let made = manifests(&pkgs, &sessions_at(&infos, &openers), &names);
+        Ok(made.into_iter().map(|(machine, m)| {
+            let json = (machine != "local").then(|| serde_json::to_string(&json!({"manifest": &m})).unwrap_or_default());
+            (machine, m, json)
+        }).collect())
+    })
+    .await;
+    let made = match made.map_err(Error::Other).and_then(|m| m) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't read the skills installed");
+            return;
+        }
+    };
+    for (machine, m, json) in made {
         if machine == "local" {
             place::remember("local", &m);
             let k: Arc<dyn place::Keeper> = Arc::new(Local { host: Arc::clone(&hub.harness.local), store: hub.store.clone() });
@@ -503,8 +535,7 @@ pub async fn sync(hub: &Hub) {
             crate::rt::spawn(place::settle(k));
             continue;
         }
-        if let Some(peer) = peers.get(&machine) {
-            let json = serde_json::to_string(&json!({"manifest": m})).unwrap_or_default();
+        if let (Some(peer), Some(json)) = (peers.get(&machine), json) {
             hub.send_peer(*peer, &crate::proto::ServerMsg::Skills { json }).await;
         }
     }
@@ -824,6 +855,20 @@ mod tests {
         heard_file(99, req, &digest, 0, bytes, true);
         assert!(READS.lock().get(&req).is_some_and(read_complete));
         READS.lock().remove(&req);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what a sync weighs (every package read, each machine's manifest made, the runners'
+    /// written out) goes to the compute pool, not the shard that heard of what changed (a session starting, a runner
+    /// connecting).
+    #[test]
+    fn g9_s3_a_sync_weighs_its_manifests_off_the_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let asked = crate::rt::COMPUTE_ASKED.with(std::cell::Cell::get);
+            sync(&hub).await;
+            anyhow::ensure!(crate::rt::COMPUTE_ASKED.with(std::cell::Cell::get) > asked, "a sync's weighing goes to the compute pool");
+            Ok(())
+        })
     }
 
     #[test]

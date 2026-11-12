@@ -1753,17 +1753,44 @@ pub async fn consume_budget() {
 /// other tasks where they want it ([`maybe_yield`]). So a turn's poll ends within the quantum where its
 /// pieces don't grow (goal 9, plan 01a1a87b2cec step 3: no poll past the quantum); a turn that looked
 /// only for its quantum to have passed held its shard a piece past it.
+///
+/// A turn's time is its poll's, from the poll's start (`hyper_rt::futures::poll_clock`), as the copies' owners count
+/// theirs (`crate::harness::copies`): one made in a poll under way has the poll's time so far against its quantum, and
+/// weighs its first piece too. Goal 9, plan 01a1a87b2cec step 3: counted from its making, a turn begun 0.27 to 0.9 ms into
+/// the hub's loop's poll (a runner's Build, after the frames before it) took its pieces as though the poll were fresh, in
+/// probe 18's and probe 19's Linux rounds, its poll past the quantum by all the turn didn't see.
 pub struct Turns {
+    /// When its poll began (where it was made off a shard, or in a simulation: its making).
     began: Instant,
-    /// When the loop last looked, nanoseconds since `began`, and the longest piece between two looks
+    /// When it was made, nanoseconds since `began`: none for a turn its poll began with (after a wait or a yield), whose
+    /// first piece goes whatever it's expected to take, as no poll would take it sooner.
+    made_ns: u64,
+    /// When the loop last looked, nanoseconds since `began` (none yet: 0), and the longest piece between two looks
     /// this turn: atomics so a `&Turns` goes wherever a reference may (one task's, never contended).
     looked_ns: AtomicU64,
     piece_ns: AtomicU64,
 }
 
 impl Turns {
+    /// A turn made where its task is now: in a poll under way, its time so far counted.
     pub fn new() -> Self {
-        Self { began: Instant::now(), looked_ns: AtomicU64::new(0), piece_ns: AtomicU64::new(0) }
+        let now = Instant::now();
+        let held = hyper_rt::futures::poll_clock().map_or(0, |p| p.held_ns());
+        match now.checked_sub(Duration::from_nanos(held)) {
+            Some(began) => Self { began, made_ns: held, looked_ns: AtomicU64::new(0), piece_ns: AtomicU64::new(0) },
+            None => Self::fresh(),
+        }
+    }
+
+    /// A turn its poll begins with: after its task waited, or gave its shard up.
+    fn fresh() -> Self {
+        Self { began: Instant::now(), made_ns: 0, looked_ns: AtomicU64::new(0), piece_ns: AtomicU64::new(0) }
+    }
+
+    /// Whether no piece has been weighed or done this turn, and its poll began with it: its first piece goes whatever
+    /// it's expected to take.
+    fn first_of_poll(&self) -> bool {
+        self.made_ns == 0 && self.looked_ns.load(Ordering::Relaxed) == 0
     }
 
     /// After a piece of the loop's work: its turn over once its next piece would pass its step's quantum, and its poll
@@ -1776,53 +1803,54 @@ impl Turns {
     pub async fn end(&mut self) {
         if self.over() {
             hyper_rt::futures::yield_now().await;
-            *self = Self::new();
+            *self = Self::fresh();
         }
     }
 
     /// Before a piece of the loop's work expected to take `expected_ns` past what its pieces take on their own (a batch of
     /// frames made where it is: `crate::net::send_made`): where that, after a piece as long as the longest this turn has
     /// done, would take the turn past its step's quantum, the turn ends first, its poll with it ([`Turns::end`]), and the
-    /// piece is the next turn's first. A turn's first piece goes whatever it's expected to take: no turn would take it
+    /// piece is the next turn's first. A poll's first piece goes whatever it's expected to take: no poll would take it
     /// sooner. Goal 9, plan 01a1a87b2cec step 3: a turn of short pieces took one long read last, past the quantum, the
     /// pieces before it having said nothing of it.
     pub async fn before(&mut self, expected_ns: u64) {
         if expected_ns > 0 && hyper_rt::futures::step_budget_ns().is_some_and(|q| self.wont_fit_at(Instant::now(), q, expected_ns)) {
             hyper_rt::futures::yield_now().await;
-            *self = Self::new();
+            *self = Self::fresh();
         }
     }
 
     /// Before a piece of the loop's work, all of it (a runner frame's, its read and its handler), which `fits` says whether
     /// it fits the nanoseconds left of the turn's quantum (negative: the turn is past it by that;
     /// `crate::wire::payload::Piece::fits`): where it doesn't, the turn ends first, its poll with it ([`Turns::end`]), and
-    /// the piece is the next turn's first. A turn's first piece goes whatever it takes: no turn would take it sooner. Goal 9,
+    /// the piece is the next turn's first. A poll's first piece goes whatever it takes: no poll would take it sooner. Goal 9,
     /// plan 01a1a87b2cec step 3: asked only of a frame's read ([`Turns::before`]), with a piece as long as the turn's longest
     /// for the rest, a turn took a piece whose handler or read ran longer than that last, past the quantum (train 16's lab,
     /// g9p16: the hub's net loop's labels to 0.36 ms on the CPU, 0.48 ms custody's).
     pub async fn room_for(&mut self, fits: impl FnOnce(i64) -> bool) {
         if hyper_rt::futures::step_budget_ns().is_some_and(|q| self.no_room_at(Instant::now(), q, fits)) {
             hyper_rt::futures::yield_now().await;
-            *self = Self::new();
+            *self = Self::fresh();
         }
     }
 
-    /// [`Turns::room_for`]'s test at `now`, against a quantum of `quantum_ns`: whether a piece has been done this turn (one has
-    /// been looked at) and the next doesn't fit what's left of it, as `fits` says.
+    /// [`Turns::room_for`]'s test at `now`, against a quantum of `quantum_ns`: whether the poll has done something before this
+    /// piece (a piece of this turn, or what came before the turn was made) and the piece doesn't fit what's left of it, as
+    /// `fits` says.
     fn no_room_at(&self, now: Instant, quantum_ns: u64, fits: impl FnOnce(i64) -> bool) -> bool {
         // One task's: loads alone, nothing changed (the piece is the next look's).
-        if self.looked_ns.load(Ordering::Relaxed) == 0 {
+        if self.first_of_poll() {
             return false;
         }
         let at_ns = u64::try_from(now.saturating_duration_since(self.began).as_nanos()).unwrap_or(u64::MAX);
         !fits(kiln_http::turn::signed(quantum_ns).saturating_sub(kiln_http::turn::signed(at_ns)))
     }
 
-    /// [`Turns::before`]'s test at `now`, against a quantum of `quantum_ns`: whether a piece done this turn (one has been
-    /// looked at), the longest one's time again and `expected_ns` more would take the turn past `quantum_ns`.
+    /// [`Turns::before`]'s test at `now`, against a quantum of `quantum_ns`: whether the poll has done something before this
+    /// piece, and the longest piece this turn's time again and `expected_ns` more would take it past `quantum_ns`.
     fn wont_fit_at(&self, now: Instant, quantum_ns: u64, expected_ns: u64) -> bool {
         // One task's: loads alone, nothing changed (the piece is the next look's).
-        if self.looked_ns.load(Ordering::Relaxed) == 0 {
+        if self.first_of_poll() {
             return false;
         }
         let at_ns = u64::try_from(now.saturating_duration_since(self.began).as_nanos()).unwrap_or(u64::MAX);
@@ -1841,7 +1869,7 @@ impl Turns {
             Err(async_channel::TryRecvError::Closed) => None,
             Err(async_channel::TryRecvError::Empty) => {
                 let item = rx.recv().await.ok()?;
-                *self = Self::new();
+                *self = Self::fresh();
                 Some(item)
             }
         }
@@ -1855,9 +1883,10 @@ impl Turns {
 
     /// [`Turns::over`] at `now`, against a quantum of `quantum_ns`.
     fn over_at(&self, now: Instant, quantum_ns: u64) -> bool {
-        // One task's: a load and a store each, no read-modify-write.
+        // One task's: a load and a store each, no read-modify-write. Its first piece from its making: what its poll did
+        // before is no piece of its own.
         let at_ns = u64::try_from(now.saturating_duration_since(self.began).as_nanos()).unwrap_or(u64::MAX);
-        let piece_ns = at_ns.saturating_sub(self.looked_ns.load(Ordering::Relaxed));
+        let piece_ns = at_ns.saturating_sub(self.looked_ns.load(Ordering::Relaxed).max(self.made_ns));
         self.looked_ns.store(at_ns, Ordering::Relaxed);
         let longest_ns = self.piece_ns.load(Ordering::Relaxed).max(piece_ns);
         self.piece_ns.store(longest_ns, Ordering::Relaxed);
@@ -2999,6 +3028,41 @@ mod tests {
             anyhow::ensure!(futures::poll!(std::pin::pin!(turns.room_for(|_| false))).is_ready(), "the next turn's first piece goes whatever it takes");
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a turn made in a poll under way counts the poll's time so far against its quantum,
+    /// and weighs its first piece by it (one that won't fit waits for the next poll, whose first piece it is then); its own
+    /// first piece is timed from its making. A turn made off a shard is timed from its making, as before.
+    #[test]
+    fn g9_s3_a_turn_made_in_a_poll_under_way_counts_the_polls_time() -> anyhow::Result<()> {
+        let held = Duration::from_micros(50);
+        let held_ns = u64::try_from(held.as_nanos()).unwrap_or(u64::MAX);
+        block_on(async move {
+            while hyper_rt::futures::poll_clock().is_some_and(|p| p.held_ns() < held_ns) {
+                std::hint::spin_loop();
+            }
+            anyhow::ensure!(hyper_rt::futures::poll_clock().is_some(), "the test's task polls on a shard");
+            let t = Turns::new();
+            anyhow::ensure!(t.made_ns >= held_ns && t.began.elapsed() >= held, "a turn made {held:?} into its poll counts {:?} of it", t.began.elapsed());
+            // What's left of the poll's quantum as the turn is made (the spin may have run past 50 µs on a busy host).
+            let (made, left) = (t.began + Duration::from_nanos(t.made_ns), STEP_BUDGET_NS.saturating_sub(t.made_ns));
+            anyhow::ensure!(t.wont_fit_at(made, STEP_BUDGET_NS, left.max(1)), "a first piece that won't fit what's left of the poll's quantum waits");
+            anyhow::ensure!(t.no_room_at(made, STEP_BUDGET_NS, |room| room > kiln_http::turn::signed(left)), "nor is it given room the poll spent");
+            if left > 1_000 {
+                anyhow::ensure!(!t.wont_fit_at(made, STEP_BUDGET_NS, left - 1_000), "one that fits goes");
+            }
+            // Its first piece, 10 µs from its making: the next taken to be as long, not as long as the poll so far.
+            let over = t.made_ns + 20_000 >= STEP_BUDGET_NS;
+            anyhow::ensure!(t.over_at(made + Duration::from_micros(10), STEP_BUDGET_NS) == over, "a 10 µs piece and the next as long, after {} ns of the poll", t.made_ns);
+            anyhow::ensure!(t.piece_ns.load(Ordering::Relaxed) == 10_000, "its first piece is its own: {} ns", t.piece_ns.load(Ordering::Relaxed));
+            // Its poll's first piece goes whatever it's expected to take: a fresh turn's (after a yield or a wait) does.
+            let fresh = Turns::fresh();
+            anyhow::ensure!(!fresh.wont_fit_at(fresh.began, STEP_BUDGET_NS, 10 * STEP_BUDGET_NS), "a fresh turn's first piece goes");
+            Ok(())
+        })?;
+        let off = Turns::new();
+        anyhow::ensure!(off.made_ns == 0 && off.began.elapsed() < held, "off a shard a turn is timed from its making");
+        Ok(())
     }
 
     /// Goal 9 (plan 01a1a87b2cec step 3): a loop that gives its turns up with `end` ends its poll with its
