@@ -1,0 +1,1012 @@
+# step 3's tests, 2026-11-12T16:20:23Z, host kiln-a094a12d.attlocal.net Linux 6.19.10-300.fc44.x86_64 x86_64, rustc 1.99.1 (58cf8f9c3 2026-10-13), cargo 1.99.1 (5f94df478 2026-08-27)
+# unit cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/s27s3-1794500423.service
+# branch 7c0b73b8d3d5c23695325d6f8320e2ad1cb299d7, kiln main ce63fc099977323d8e27cb7a035234515a3c1c74, surface fix a690a02c5fabf1ba9ca90ad2567ce6d28d8aebdd
+# HEAD 7c0b73b8d, tree 316e3c8fb49b4a40b3a591847d2c3d87c2014881: Merge kiln main 263cad6b4 into s27-cursor-agentfile: step 23's built-ins table with its pi
+# merged with main: tree 5562bb3629534d1e6c57420899f7b1049a001b04
+# HEAD a1b10fd09, tree 5562bb3629534d1e6c57420899f7b1049a001b04: Merge commit 'ce63fc099977323d8e27cb7a035234515a3c1c74' into HEAD
+# merged with the surface fix: tree 73b02ad9a2a785a53f7937bfcbe9348d43024d74
+# RED 561f24890798f56111912e372e6516dd0b32015e tree 0acc57c5d7a7f4743563552dbd310ae714ffd487
+# GREEN 3946fcfd5579f3bd8bf1f1420a5eb15a666bc95d tree 4f72567ff6ea12b39cceab70e44bd6b0d5e019a2
+7b57ca552d15c79eed0a10b904e8f303cbaef4e4e436c5257c2ad50bc86cc125  crates/kiln/src/agentfiles/builtin.rs
+b1ab72bab6f890964f638a382d0b91ba4fdadb7c4ca4982c5e1e86b8c7aa981b  crates/kiln/src/agentfiles/builtin/cursor_tests.rs
+ce68f74c4f0255174ebb7e8ccc774bd653fc4dcbf3d8a8e10558d9eb55368f6e  .kiln/images/harness-cursor/Agentfile
+8cdb9f891e92145e58af7a30605db9a9946d8ff00e66962448ea75091482ad61  crates/kiln/tests/agentfiles.rs
+# HEAD 3946fcfd5, tree 4f72567ff6ea12b39cceab70e44bd6b0d5e019a2: s27s3 scratch: step 3's files on the branch merged with s20-surface-fix (GREEN)
+## UNIT: cargo test --locked -p kiln --lib agentfiles:: -j 4 (from 16:20:23)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7m 25s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s27s3/target/debug/deps/kiln-721748ad308a6d67)
+
+running 45 tests
+test agentfiles::builtin::cursor_tests::step27_cursor_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::claude_tests::step19_claude_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::tests::step23_a_real_shards_checks_every_builtin ... ok
+test agentfiles::builtin::goose_tests::step23_goose_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::tests::every_builtin_is_a_valid_agentfile_once ... ok
+test agentfiles::check::tests::step30_a_real_shards_checks_without_resolving_bases ... ok
+test agentfiles::check::tests::step30_a_refusal_without_a_line_in_its_words_names_it ... ok
+test agentfiles::builtin::goose_tests::step23_goose_runs_as_kilns_goose_kind_with_its_root_on_its_volume ... ok
+test agentfiles::check::tests::step30_no_result_is_unchecked_saying_shards_last_error ... ok
+test agentfiles::cli::tests::step19_a_live_claude_context_holds_the_pinned_builds ... ok
+test agentfiles::builtin::tests::step19_a_harness_home_is_its_volume_and_none_is_under_tmp ... ok
+test agentfiles::check::tests::step30_the_target_that_stops_shards_says_the_text_passed ... ok
+test agentfiles::check::tests::step30_any_other_error_refuses_it_in_shards_words_at_its_line ... ok
+test agentfiles::builtin::goose_tests::step23_goose_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::goose_tests::step23_no_goose_file_holds_a_credential ... ok
+test agentfiles::builtin::claude_tests::step19_claude_pin_and_harness_files_hold ... ok
+test agentfiles::builtin::claude_tests::step19_claude_runs_as_kilns_claude_kind_with_its_home_on_its_volume ... ok
+test agentfiles::check::tests::step30_warnings_are_diagnostics_that_refuse_nothing ... ok
+test agentfiles::builtin::tests::step23_kilns_dockerfile_copies_what_builtins_embed ... ok
+test agentfiles::context::tests::step19_a_variants_build_gets_its_own_harness_file ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold ... ok
+test agentfiles::context::tests::step19_modes_are_permissions_and_paths_stay_inside ... ok
+test agentfiles::builtin::claude_tests::step19_no_claude_file_holds_a_credential ... ok
+test agentfiles::context::tests::step19_a_recipe_changes_exactly_with_what_a_build_takes ... ok
+test agentfiles::tests::step30_ls_tree_entries ... ok
+test agentfiles::context::tests::step19_pins_are_read_for_their_builds_alone ... ok
+test agentfiles::context::tests::step19_harness_dirs_are_named_as_each_builtins_harness_line_takes_them ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it ... ok
+test agentfiles::builtin::cursor_tests::step27_no_cursor_file_holds_a_credential ... ok
+test agentfiles::cli::tests::step19_context_reads_its_words ... ok
+test agentfiles::tests::step30_names_and_texts ... ok
+test agentfiles::builtin::goose_tests::step23_a_pin_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::builtin::claude_tests::step19_a_claude_pin_that_would_mislead_is_caught ... ok
+test agentfiles::tests::step30_the_migration_makes_its_tables ... ok
+test agentfiles::tests::step30_texts_are_kept_once_in_the_store_of_bytes ... ok
+test agentfiles::context::tests::step19_a_context_is_written_whole_or_not_at_all ... ok
+test agentfiles::tests::step30_a_text_read_back_is_held_to_its_digest ... ok
+test agentfiles::check::tests::step30_shards_is_asked_for_its_check_in_a_folder_of_its_own ... ok
+test agentfiles::tests::step30_a_project_is_listed_for_its_readers_alone ... ok
+test agentfiles::tests::step30_a_person_reaches_only_their_own ... ok
+test agentfiles::tests::step30_a_text_the_store_cant_keep_writes_no_record ... ok
+test agentfiles::tests::step30_versions_restore_and_delete ... ok
+test agentfiles::tests::step30_a_delete_lets_go_of_texts_no_record_names ... ok
+test agentfiles::tests::step30_who_reaches_everyones ... ok
+
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 4368 filtered out; finished in 0.67s
+
+UNIT_EXIT=0 at 16:27:49
+# SHARDS shards version 0.7.0, build 94838b8, sha256 a9c9092ac5f6a7c6b306a47ef5c9d27f48f6541885abe823c0063abc2d549388, checked against v0.7.0's SHA256SUMS
+## SHARDS: cargo test --locked -p kiln --lib real_shards -j 4 -- --nocapture (from 16:27:49)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.87s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s27s3/target/debug/deps/kiln-721748ad308a6d67)
+
+running 2 tests
+test agentfiles::check::tests::step30_a_real_shards_checks_without_resolving_bases ... ok
+test agentfiles::builtin::tests::step23_a_real_shards_checks_every_builtin ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4411 filtered out; finished in 0.01s
+
+SHARDS_EXIT=0 at 16:27:50
+## INTEG: cargo test --locked -p kiln --test agentfiles -j 4 (from 16:27:50)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 31s
+     Running tests/agentfiles.rs (/home/adalundhe/.cache/s27s3/target/debug/deps/agentfiles-a0d0313353566e30)
+
+running 1 test
+test step30_agentfiles_on_every_surface ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+
+INTEG_EXIT=0 at 16:33:23
+## CLIPPY: cargo clippy --locked -p kiln --all-targets -j 4 -- -D warnings (from 16:33:23)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5m 02s
+CLIPPY_EXIT=0 at 16:38:26
+# HEAD 561f24890, tree 0acc57c5d7a7f4743563552dbd310ae714ffd487: s27s3 scratch: step 3's files on the branch merged with main (RED)
+## INTEG_RED: cargo test --locked -p kiln --test agentfiles step30_agentfiles_on_every_surface -j 4 (from 16:38:26)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 59.35s
+     Running tests/agentfiles.rs (/home/adalundhe/.cache/s27s3/target/debug/deps/agentfiles-a0d0313353566e30)
+
+running 1 test
+test step30_agentfiles_on_every_surface ... FAILED
+
+failures:
+
+---- step30_agentfiles_on_every_surface stdout ----
+Error: {"agentfiles":[{"id":"01a1d0a0e2d7707a9aa6824997d523ca","owner":"user:01a1d0a0e2c476b7b6f7c48e18a972c3","name":"claude","version":1,"created_at":1794501567,"updated_at":1794501567}],"reaches_all":false,"builtin":[{"name":"harness-goose","harness":"goose","text":"# Goose (aaif-goose/goose) as a harness in a Shards microVM: the Agentfile kiln ships for it (plan\n# 01a1cd8e862e7169a074db3d5fa33f3d, step 23; research 01a1ce705e3d72af8563e07fa92a7460, f1-f28).\n# Its build context is what `kiln agentfiles context goose DIR` writes: this file, and for each\n# platform goose-<arch>/ with harness.json and pin.json's goose, checked and unpacked to bin/goose.\n# It holds no credential: a person's provider keys stay on their own volume (below).\n\n# The default base: Debian with git, an ssh client, curl and CA certificates on both arches, the\n# digest pin.sh read (pin.json's base). Any base works, as Goose's build is static (f10), but Goose\n# checks TLS against the base's CA bundle, so a base without one can't reach a provider (f18).\nARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10\nFROM ${BASE}\n\n# Goose's own static build for the platform being built: no RUN, and no libc variant (f10, f23).\nARG TARGETARCH\nHARNESS goose FROM ./goose-${TARGETARCH}\n\n# Its providers over HTTPS, as the bring-up proved them (f21): a network for Goose alone, names\n# resolved by the microVM (--dns), and TCP 443 out at the network's boundary and the microVM's;\n# nothing in, and no other port or protocol out. Step 9's grants by name replace these three lines.\nNETWORK --dns --egress=443/tcp provider FOR goose\nEXPOSE --harnesses=goose 443/tcp AS egress FOR provider\nCONNECT goose WITH goose ON provider\n\n# Two volumes of Goose's alone (D109): the project, and the person's Goose root, GOOSE_PATH_ROOT in\n# harness.json, which holds its config, sessions, logs and the keys its owner saved, and which kiln\n# keeps per person and reads on the host (f14, f15, f5).\nVOLUME --target-kind=harness /workspace FOR goose\nVOLUME --target-kind=harness /home/goose/.local/share/goose FOR goose\n"},{"name":"harness-claude","harness":"claude","text":"# Anthropic's Claude Code as a harness kiln ships (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 19;\n# plan 01a1cf48e8157494ac9a51f7a564f526, research 01a1cf48e8157494b048e1fb2c437f08). Its build installs\n# the binary pin.json pins: kiln writes it at ./claude-<arch>-<libc>/bin/claude, its SHA-256 checked as it\n# downloads, since an http(s) HARNESS source carries no checksum (f26). No RUN fetches it, and no\n# credential is in the image (f48): a person's own sign-in lives in their HOME volume.\n#\n# The base: buildpack-deps:trixie-scm by digest, a Docker Official Image for both arches with git, an ssh\n# client, curl and CA certificates (f46). Another base works: Anthropic's glibc builds need nothing newer\n# than GLIBC_2.17 (f13), and a musl base builds with CLAUDE_LIBC=musl.\nARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10\nARG CLAUDE_LIBC=gnu\n\nFROM ${BASE} AS base-gnu\n\n# Anthropic's musl builds take libgcc, libstdc++ and ripgrep from the system (code.claude.com/docs/en/setup,\n# \"Alpine Linux and musl-based distributions\"; f14).\nFROM ${BASE} AS base-musl\nRUN apk add --no-cache libgcc libstdc++ ripgrep\n\n# BuildKit builds only the stage the variant names (f28).\nFROM base-${CLAUDE_LIBC}\nARG TARGETARCH\nARG CLAUDE_LIBC\nHARNESS claude FROM ./claude-${TARGETARCH}-${CLAUDE_LIBC}\n\n# Its network reach, every part named (default deny): a network for this harness alone, which it joins\n# with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443 out,\n# opened at the network's boundary and at the microVM's. Nothing comes in, and no other port or protocol\n# goes out. Step 9 grants its providers by name instead (f30).\nNETWORK --dns --egress=443/tcp provider FOR claude\nEXPOSE --harnesses=claude 443/tcp AS egress FOR provider\nCONNECT claude WITH claude ON provider\n\n# The project, until step 8 plugs it in at its host path (f25). And the person's own volume, given at run\n# time, as the whole HOME: a harness sees the image read-only, so only a volume makes HOME writable and\n# lasting, and Claude Code keeps everything there, ~/.claude and ~/.claude.json (f22, f33). No volume goes\n# under /tmp, which is each harness's own scratch (f23).\nVOLUME --target-kind=harness /workspace FOR claude\nVOLUME --target-kind=harness /home/claude FOR claude\n"},{"name":"harness-cursor","harness":"cursor","text":"# Cursor's CLI agent as a kiln harness in a Shards microVM (kiln plan\n# 01a1cd8e862e7169a074db3d5fa33f3d, step 27; plan 01a1ce705e5c7504b88732f443d99288, research\n# 01a1ce705e5c7504bdcac9721fa699e3). kiln runs it as its ACP server, `agent acp` (Kind \"cursor\",\n# crates/kiln/src/harness/kinds.rs). It comes in as pin.json pins it, in ./cursor-<arch>/: Cursor's\n# own Linux package, whose SHA-256 equals the .sha256 Cursor publishes beside it (Cursor signs\n# nothing; pin.sh), unpacked with its top directory stripped as Cursor's installer does, and\n# harness.json. Nothing else installs it, and no credential is in the image.\n\n# Cursor's package is a bash launcher and a bundled Node whose binaries link glibc (at most\n# GLIBC_2.28 and GLIBCXX_3.4.22, and libz), and Cursor publishes no musl build: the base needs glibc\n# and bash, and the image has no variant. This default, step 19's, pinned by digest, has both and runs\n# the package with no RUN; Alpine can't start it.\nARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10\nFROM ${BASE}\n\n# BuildKit sets TARGETARCH in the global scope, so the stage declares it to name each platform's\n# harness directory.\nARG TARGETARCH\nHARNESS cursor FROM ./cursor-${TARGETARCH}\n\n# Its network reach, every part named (default deny): a network for this harness alone, which it\n# joins with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443\n# out, opened at the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress), for\n# Cursor's backend speaks HTTPS alone (HTTP/2, falling back to HTTP/1.1). These are the bring-up's\n# grants (Shards' docs/examples/harness-claude) until step 9 grants providers by name. Nothing comes\n# in; no other port or protocol goes out.\nNETWORK --dns --egress=443/tcp provider FOR cursor\nEXPOSE --harnesses=cursor 443/tcp AS egress FOR provider\nCONNECT cursor WITH cursor ON provider\n\n# The project, which moves to its own host path with step 8, and the person's home. Cursor keeps its\n# config, sessions, MCP servers, rules, plugins and hooks in $HOME/.cursor, and on Linux its sign-in\n# in $HOME/.config/cursor. A harness sees the image read-only, with its own /tmp scratch and these\n# volumes alone writable, so a home that is writable and kept from run to run must be a volume: the\n# whole home is the person's volume (step 7's shape) and harness.json sets HOME=/home/cursor.\n# Cursor's own layout lands there, and so does what the programs it runs keep in a home (.gitconfig\n# ...). HOME in run.env needs a shards at or after 997f4e47e (release v0.8.0 and later), where\n# run.env replaces init's HOME=/tmp. harness.json also puts caches that follow XDG's rule on the\n# scratch (XDG_CACHE_HOME=/tmp/.cache), out of the person's volume. Both volumes are the harness's\n# alone, and outside /tmp, which the scratch covers.\nVOLUME --target-kind=harness /workspace FOR cursor\nVOLUME --target-kind=harness /home/cursor FOR cursor\n"}]}
+
+
+failures:
+    step30_agentfiles_on_every_surface
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+
+error: test failed, to rerun pass `-p kiln --test agentfiles`
+INTEG_RED_EXIT=101 at 16:39:27
+# HEAD 3946fcfd5, tree 4f72567ff6ea12b39cceab70e44bd6b0d5e019a2: s27s3 scratch: step 3's files on the branch merged with s20-surface-fix (GREEN)
+# M1 diff: 1	1	crates/kiln/src/harness/kinds.rs
+-    Kind { id: "cursor", name: "Cursor CLI", program: "agent", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["agent"], screen_takes_command: fa
++    Kind { id: "cursor", name: "Cursor CLI", program: "agent", verified: false, protocol: Protocol::Acp(&["acp", "--mutant"]), screen: &["agent"], screen_takes
+## M1: cargo test --locked -p kiln --lib step27_ -j 4 (from 16:39:27)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 17s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s27s3/target/debug/deps/kiln-721748ad308a6d67)
+
+running 5 tests
+test agentfiles::builtin::cursor_tests::step27_cursor_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it ... FAILED
+test agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::cursor_tests::step27_no_cursor_file_holds_a_credential ... ok
+test agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught ... ok
+
+failures:
+
+---- agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it stdout ----
+Error: ["its command [\"cursor-agent\", \"--disable-auto-update\", \"acp\"] isn't [\"cursor-agent\", \"--disable-auto-update\", \"acp\", \"--mutant\"]"]
+
+
+failures:
+    agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 4408 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p kiln --lib`
+M1_EXIT=101 at 16:40:44
+# HEAD 3946fcfd5, tree 4f72567ff6ea12b39cceab70e44bd6b0d5e019a2: s27s3 scratch: step 3's files on the branch merged with s20-surface-fix (GREEN)
+# M2 diff: 1	1	crates/kiln/src/harness/kinds.rs
+-                    p.env("NO_OPEN_BROWSER", "1");
++                    p.env("NO_OPEN_BROWSER", "0");
+## M2: cargo test --locked -p kiln --lib step27_ -j 4 (from 16:40:45)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 11s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s27s3/target/debug/deps/kiln-721748ad308a6d67)
+
+running 5 tests
+test agentfiles::builtin::cursor_tests::step27_cursor_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it ... FAILED
+test agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::cursor_tests::step27_no_cursor_file_holds_a_credential ... ok
+test agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught ... ok
+
+failures:
+
+---- agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it stdout ----
+Error: ["its NO_OPEN_BROWSER Some(\"1\") isn't the kind's Some(\"0\")"]
+
+
+failures:
+    agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 4408 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p kiln --lib`
+M2_EXIT=101 at 16:41:56
+# HEAD 3946fcfd5, tree 4f72567ff6ea12b39cceab70e44bd6b0d5e019a2: s27s3 scratch: step 3's files on the branch merged with s20-surface-fix (GREEN)
+# M3 diff: 1	0	.kiln/images/harness-cursor/Agentfile
++ENV CURSOR_API_KEY=x
+## M3: cargo test --locked -p kiln --lib step27_ -j 4 (from 16:41:56)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 14s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s27s3/target/debug/deps/kiln-721748ad308a6d67)
+
+running 5 tests
+test agentfiles::builtin::cursor_tests::step27_cursor_agentfile_is_the_plans_shape ... FAILED
+test agentfiles::builtin::cursor_tests::step27_no_cursor_file_holds_a_credential ... FAILED
+test agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it ... ok
+test agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught ... ok
+
+failures:
+
+---- agentfiles::builtin::cursor_tests::step27_cursor_agentfile_is_the_plans_shape stdout ----
+Error: [
+    "ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+    "FROM ${BASE}",
+    "ARG TARGETARCH",
+    "HARNESS cursor FROM ./cursor-${TARGETARCH}",
+    "NETWORK --dns --egress=443/tcp provider FOR cursor",
+    "EXPOSE --harnesses=cursor 443/tcp AS egress FOR provider",
+    "CONNECT cursor WITH cursor ON provider",
+    "VOLUME --target-kind=harness /workspace FOR cursor",
+    "VOLUME --target-kind=harness /home/cursor FOR cursor",
+    "ENV CURSOR_API_KEY=x",
+]
+
+---- agentfiles::builtin::cursor_tests::step27_no_cursor_file_holds_a_credential stdout ----
+Error: Agentfile: ["names CURSOR_API_KEY", "`ENV CURSOR_API_KEY=x` names CURSOR_API_KEY", "CURSOR_API_KEY= gives one a value"]
+
+
+failures:
+    agentfiles::builtin::cursor_tests::step27_cursor_agentfile_is_the_plans_shape
+    agentfiles::builtin::cursor_tests::step27_no_cursor_file_holds_a_credential
+
+test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 4408 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p kiln --lib`
+M3_EXIT=101 at 16:43:10
+# HEAD 3946fcfd5, tree 4f72567ff6ea12b39cceab70e44bd6b0d5e019a2: s27s3 scratch: step 3's files on the branch merged with s20-surface-fix (GREEN)
+# M4 diff: 1	1	.kiln/images/harness-cursor/pin.json
+-          "sha256": "be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91",
++          "sha256": "e01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91",
+## M4: cargo test --locked -p kiln --lib step27_ -j 4 (from 16:43:10)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 11s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s27s3/target/debug/deps/kiln-721748ad308a6d67)
+
+running 5 tests
+test agentfiles::builtin::cursor_tests::step27_cursor_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold ... FAILED
+test agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it ... ok
+test agentfiles::builtin::cursor_tests::step27_no_cursor_file_holds_a_credential ... ok
+test agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught ... FAILED
+
+failures:
+
+---- agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold stdout ----
+Error: ["linux/amd64: a file without its SHA-256 and size"]
+
+---- agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught stdout ----
+Error: Condition failed: `pin_problems(cursor.pin).is_empty() &&
+osi_problems(&serde_json::from_str::<Value>(h)?).is_empty()`
+
+
+failures:
+    agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught
+    agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold
+
+test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 4408 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p kiln --lib`
+M4_EXIT=101 at 16:44:22
+# HEAD 3946fcfd5, tree 4f72567ff6ea12b39cceab70e44bd6b0d5e019a2: s27s3 scratch: step 3's files on the branch merged with s20-surface-fix (GREEN)
+# M5 diff: 0	17	.kiln/images/harness-cursor/pin.json
+-    },
+-    {
+-      "platform": "linux/arm64",
+-      "files": [
+-        {
+-          "url": "https://downloads.cursor.com/lab/2026.11.11-b912975/linux/arm64/agent-cli-package.tar.gz",
+-          "sha256": "f068af64ed91b5304605976586f690579679f740a41f388091a6b3a2e776987c",
+-          "size": 175384019,
+-          "path": ".",
+-          "unpack": {
+-            "format": "tar.gz",
+-            "strip": 1,
+-            "unpacked_bytes": 552211752,
+-            "entries": 435
+-          }
+-        }
+-      ]
+## M5: cargo test --locked -p kiln --lib step27_ -j 4 (from 16:44:22)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 11s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s27s3/target/debug/deps/kiln-721748ad308a6d67)
+
+running 5 tests
+test agentfiles::builtin::cursor_tests::step27_cursor_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold ... FAILED
+test agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught ... FAILED
+test agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it ... ok
+test agentfiles::builtin::cursor_tests::step27_no_cursor_file_holds_a_credential ... ok
+
+failures:
+
+---- agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold stdout ----
+Error: ["no build for linux/arm64"]
+
+---- agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught stdout ----
+Error: /builds/1/platform
+
+
+failures:
+    agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught
+    agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold
+
+test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 4408 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p kiln --lib`
+M5_EXIT=101 at 16:45:33
+# HEAD 3946fcfd5, tree 4f72567ff6ea12b39cceab70e44bd6b0d5e019a2: s27s3 scratch: step 3's files on the branch merged with s20-surface-fix (GREEN)
+# M6 diff: 1	1	.kiln/images/harness-cursor/pin.json
+-            "strip": 1,
++            "strip": 0,
+## M6: cargo test --locked -p kiln --lib step27_ -j 4 (from 16:45:33)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 10s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s27s3/target/debug/deps/kiln-721748ad308a6d67)
+
+running 5 tests
+test agentfiles::builtin::cursor_tests::step27_cursor_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold ... FAILED
+test agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it ... ok
+test agentfiles::builtin::cursor_tests::step27_no_cursor_file_holds_a_credential ... ok
+test agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught ... FAILED
+
+failures:
+
+---- agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold stdout ----
+Error: ["linux/amd64: an unpack other than tar.gz with its one top directory stripped"]
+
+---- agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught stdout ----
+Error: Condition failed: `pin_problems(cursor.pin).is_empty() &&
+osi_problems(&serde_json::from_str::<Value>(h)?).is_empty()`
+
+
+failures:
+    agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught
+    agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold
+
+test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 4408 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p kiln --lib`
+M6_EXIT=101 at 16:46:45
+# HEAD 3946fcfd5, tree 4f72567ff6ea12b39cceab70e44bd6b0d5e019a2: s27s3 scratch: step 3's files on the branch merged with s20-surface-fix (GREEN)
+# tree clean at GREEN: 0 changes
+# memory.peak 40355115008 bytes; swap.peak 252588032 bytes
+# target 58G
+# done 2026-11-12T16:46:45Z
