@@ -66,8 +66,8 @@ impl Key {
     }
 }
 
-/// One entry: a key set once, then the polls it held and for how long, those of them the host held, and the time on
-/// the CPU of those whose thread could say it.
+/// One entry: a key set once, then the polls it held and for how long, those of them the host held, the time on the CPU
+/// of those whose thread could say it, and those past the step quantum.
 #[derive(Debug, Default)]
 struct Entry {
     key: OnceLock<Key>,
@@ -80,14 +80,22 @@ struct Entry {
     cpu_held_ns: AtomicU64,
     cpu_ns: AtomicU64,
     longest_cpu_ns: AtomicU64,
+    past_polls: AtomicU64,
+    past_cpu_polls: AtomicU64,
 }
 
 impl Entry {
-    /// Counts one poll of `ns`, `cpu` of it on the CPU where its thread said, the host's when `host` (the writer's
-    /// alone).
-    fn count(&self, ns: u64, cpu: Option<u64>, host: bool) {
+    /// Counts one poll of `ns`, `cpu` of it on the CPU where its thread said, the host's when `host`, against a step
+    /// quantum of `quantum_ns` (none: 0) (the writer's alone).
+    fn count(&self, ns: u64, cpu: Option<u64>, host: bool, quantum_ns: u64) {
         self.total_ns.fetch_add(ns, Ordering::Relaxed);
         self.longest_ns.fetch_max(ns, Ordering::Relaxed);
+        if quantum_ns > 0 && ns > quantum_ns {
+            self.past_polls.fetch_add(1, Ordering::Relaxed);
+        }
+        if quantum_ns > 0 && cpu.is_some_and(|c| c.min(ns) > quantum_ns) {
+            self.past_cpu_polls.fetch_add(1, Ordering::Relaxed);
+        }
         if host {
             self.host_ns.fetch_add(ns, Ordering::Relaxed);
             self.host_polls.fetch_add(1, Ordering::Relaxed);
@@ -117,6 +125,8 @@ impl Entry {
             cpu_held_ns: self.cpu_held_ns.load(Ordering::Relaxed),
             cpu_ns: self.cpu_ns.load(Ordering::Relaxed),
             longest_cpu_ns: self.longest_cpu_ns.load(Ordering::Relaxed),
+            past_polls: self.past_polls.load(Ordering::Relaxed),
+            past_cpu_polls: self.past_cpu_polls.load(Ordering::Relaxed),
         })
     }
 }
@@ -149,11 +159,11 @@ impl SlowTable {
         ns: u64,
         host: bool,
     ) {
-        self.note_with_cpu(site, label, ns, None, host);
+        self.note_with_cpu(site, label, ns, None, host, 0);
     }
 
     /// [`SlowTable::note`], with `cpu` of the poll's hold on the CPU where the shard's thread said (`crate::task_clock`;
-    /// kiln's goal 9, plan 01a1a87b2cec step 3).
+    /// kiln's goal 9, plan 01a1a87b2cec step 3), and the step quantum the shard ran it with (`quantum_ns`; none: 0).
     pub(crate) fn note_with_cpu(
         &self,
         site: Option<&'static Location<'static>>,
@@ -161,6 +171,7 @@ impl SlowTable {
         ns: u64,
         cpu: Option<u64>,
         host: bool,
+        quantum_ns: u64,
     ) {
         let key = Key { site, label };
         let n = self.entries.len();
@@ -172,9 +183,9 @@ impl SlowTable {
             // The shard is the table's only writer: a free entry it finds is still free as it sets the key.
             Some(entry) => {
                 let _ = entry.key.set(key);
-                entry.count(ns, cpu, host);
+                entry.count(ns, cpu, host, quantum_ns);
             }
-            None => self.rest.count(ns, cpu, host),
+            None => self.rest.count(ns, cpu, host, quantum_ns),
         }
     }
 
@@ -280,6 +291,13 @@ pub struct SlowPoll {
     pub cpu_ns: u64,
     /// The longest any of them ran on the CPU, nanoseconds.
     pub longest_cpu_ns: u64,
+    /// Of them, the polls that held their shard past the step quantum it ran them with: what a reader counts between two of
+    /// its reads, where the longest (since the shard started) can't say when a poll passed the quantum (kiln's goal 9,
+    /// plan 01a1a87b2cec step 3: the lab's runners connect before what it measures, and their first messages' polls stood
+    /// for every round of it).
+    pub past_polls: u64,
+    /// Of them, the polls that ran on the CPU past the step quantum, where their thread said its time there.
+    pub past_cpu_polls: u64,
 }
 
 /// The slow polls of the shard `holder` names, as they stand (any thread; nothing of the shard's own is
@@ -353,14 +371,32 @@ mod tests {
     fn g9_s3_a_polls_time_on_the_cpu_is_counted_beside_its_hold() {
         let table = SlowTable::default();
         let here = Location::caller();
-        table.note_with_cpu(Some(here), Some(&ROUTE), 2_000_000, Some(150_000), false);
-        table.note_with_cpu(Some(here), Some(&ROUTE), 300_000, Some(280_000), false);
-        table.note_with_cpu(Some(here), Some(&ROUTE), 400_000, Some(900_000), false);
-        table.note_with_cpu(Some(here), Some(&ROUTE), 500_000, None, false);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 2_000_000, Some(150_000), false, 0);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 300_000, Some(280_000), false, 0);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 400_000, Some(900_000), false, 0);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 500_000, None, false, 0);
         let read = table.read();
         let p = read[0];
         assert_eq!((p.polls, p.total_ns), (4, 3_200_000));
         assert_eq!((p.cpu_polls, p.cpu_held_ns, p.cpu_ns, p.longest_cpu_ns), (3, 2_700_000, 830_000, 400_000));
+        assert_eq!((p.past_polls, p.past_cpu_polls), (0, 0), "no quantum, none past it");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: of an entry's polls, those past the step quantum they ran with are counted, by
+    /// their hold and by their time on the CPU (never more than the hold), so a reader can tell when one passed it.
+    #[test]
+    fn g9_s3_polls_past_the_quantum_are_counted_by_hold_and_on_the_cpu() {
+        let table = SlowTable::default();
+        let here = Location::caller();
+        let q = 266_666;
+        table.note_with_cpu(Some(here), Some(&ROUTE), 2_000_000, Some(150_000), false, q);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 300_000, Some(280_000), false, q);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 260_000, Some(900_000), false, q);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 500_000, None, false, q);
+        table.note_with_cpu(Some(here), Some(&ROUTE), 266_666, Some(266_666), false, q);
+        let p = table.read()[0];
+        assert_eq!(p.past_polls, 3, "held past the quantum: 2 ms, 300 µs and 500 µs");
+        assert_eq!(p.past_cpu_polls, 1, "on the CPU past it: 280 µs (900 µs of a 260 µs hold is 260)");
     }
 
     /// One shard on this thread, its quantum `quantum_ns` (its step budget: it tracks no wake).

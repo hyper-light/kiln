@@ -2483,7 +2483,7 @@ impl Shard {
     fn note_slow(&mut self, slot: u32, elapsed: u64, cpu_from: Option<u64>, quantum_ns: u64, host: bool) {
         let cpu = cpu_from.and_then(|from| Some(self.slow_poll_cpu_now()?.saturating_sub(from)));
         if let Some(entry) = self.desk.entry {
-            entry.slow.note_with_cpu(entry.spawned_at(slot), self.desk.label.get(), elapsed, cpu, host);
+            entry.slow.note_with_cpu(entry.spawned_at(slot), self.desk.label.get(), elapsed, cpu, host, quantum_ns);
         }
         if THREAD_CPU_FOR_SLOW_POLLS && cpu_from.is_none() && elapsed > quantum_ns {
             self.learn_cpu_site(slot);
