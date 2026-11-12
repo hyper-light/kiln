@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use http::StatusCode;
 use serde_json::{Value, json};
 
-use kiln_seams::blobs::{Blobs as _, Put, Refusal, SimBlobs, SimLimits};
+use kiln_seams::blobs::{Put, Refusal, SimBlobs, SimLimits};
 
 use super::*;
 use crate::authz::gate::{Kind, Rights};
