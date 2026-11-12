@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "name": "opencode",
+  "version": "2.2.7",
+  "run": {
+    "command": ["opencode", "acp"],
+    "env": [
+      "XDG_CONFIG_HOME=/home/opencode/.config",
+      "XDG_DATA_HOME=/home/opencode/.local/share",
+      "XDG_STATE_HOME=/home/opencode/.local/state",
+      "XDG_CACHE_HOME=/home/opencode/.cache",
+      "OPENCODE_DISABLE_AUTOUPDATE=1"
+    ]
+  }
+}
