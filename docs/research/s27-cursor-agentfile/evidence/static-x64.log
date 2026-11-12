@@ -1,0 +1,151 @@
+DIR /Users/adalundhe/.cache/kiln-step27-research/pkg-20261112T064650Z
+Thu Nov 12 06:46:50 UTC 2026
+== installer
+e8c7a37d74b27a4beedf2dc5fc3b4c83627b2dc5c05a51d34f95ffec3cc0a247  installer/install.sh
+    6333
+78:TEMP_EXTRACT_DIR="$HOME/.local/share/cursor-agent/versions/.tmp-2026.11.11-b912975-$(date +%s)"
+85:DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.11.11-b912975/${OS}/${ARCH}/agent-cli-package.tar.gz"
+110:FINAL_DIR="$HOME/.local/share/cursor-agent/versions/2026.11.11-b912975"
+130:ln -s ~/.local/share/cursor-agent/versions/2026.11.11-b912975/cursor-agent ~/.local/bin/agent
+131:ln -s ~/.local/share/cursor-agent/versions/2026.11.11-b912975/cursor-agent ~/.local/bin/cursor-agent
+VERSION 2026.11.11-b912975
+== integrity files at the version root
+probe lab/2026.11.11-b912975/manifest.json -> 403
+probe lab/2026.11.11-b912975/checksums.txt -> 403
+probe lab/2026.11.11-b912975/SHA256SUMS -> 403
+probe lab/2026.11.11-b912975/sha256sums.txt -> 403
+probe lab/2026.11.11-b912975/SHA256SUMS.asc -> 403
+probe lab/2026.11.11-b912975/linux/x64/manifest.json -> 403
+== x64 https://downloads.cursor.com/lab/2026.11.11-b912975/linux/x64/agent-cli-package.tar.gz
+HTTP/2 200 
+content-type: application/x-tar
+content-length: 176703341
+x-amz-id-2: xfW/9+aAHSllxmPW9EoTAC/u23KMXroKD80K6jYvqNPe7cdos+sAQzIFAnRmcU/8m6jv84mzQR6Q/thVklphbyNJBdfwBshe
+x-amz-request-id: C5JSJXB90ZMKZ1BN
+server: cloudflare
+last-modified: Wed, 11 Nov 2026 19:47:39 GMT
+etag: "35d19eb0fe5f75fe3cf064219efbf263-22"
+x-amz-server-side-encryption: AES256
+x-amz-version-id: SLlav38Edu2iDVsbivHTLpBl64lTdpUA
+age: 3486
+cache-control: public, max-age=14400
+cf-cache-status: HIT
+be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91  dl-x64/agent-cli-package.tar.gz
+176703341 bytes
+probe .sha256 -> 200
+probe .sha256sum -> 403
+probe .sha512 -> 403
+probe .sig -> 403
+probe .asc -> 403
+probe .sigstore -> 403
+probe .sigstore.json -> 403
+probe .minisig -> 403
+probe .pem -> 403
+-- a second download: be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91  -
+-- entries:      435; top level:
+dist-package/
+dist-package/.npmrc
+dist-package/1212.index.js
+dist-package/1297.index.js
+dist-package/1326.index.js
+dist-package/1538.index.js
+dist-package/2240.index.js
+dist-package/2290.index.js
+dist-package/2422.index.js
+dist-package/2576.index.js
+dist-package/2601.index.js
+dist-package/2652.index.js
+dist-package/272.index.js
+dist-package/2761.index.js
+dist-package/2911.index.js
+dist-package/3144.index.js
+dist-package/3190.index.js
+dist-package/3198.index.js
+dist-package/3244.index.js
+dist-package/3464.index.js
+dist-package/3550.index.js
+dist-package/3575.index.js
+dist-package/3857.index.js
+dist-package/4074.index.js
+dist-package/4114.index.js
+dist-package/4155.index.js
+dist-package/4161.index.js
+dist-package/4343.index.js
+dist-package/4444.index.js
+dist-package/4760.index.js
+dist-package/478.index.js
+dist-package/4945.index.js
+dist-package/4960.index.js
+dist-package/5006.index.js
+dist-package/5092.index.js
+dist-package/5164.index.js
+dist-package/5336.index.js
+dist-package/5380.index.js
+dist-package/5422.index.js
+dist-package/5434.index.js
+-- unpacked: 549944 KiB
+-- executables, native modules and ELF files
+23484136 dist-package/crepectl: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped
+    interp=none needed=[] max=none 
+1096 dist-package/cursor-agent: Bourne-Again shell script text executable, ASCII text
+134876352 dist-package/cursor-agent-sea: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=5f8561a0db5b06f690174a3903e258e2918c2
+    interp=/lib64/ld-linux-x86-64.so.2 needed=[libdl.so.2 libstdc++.so.6 libm.so.6 libgcc_s.so.1 libpthread.so.0 libc.so.6 ld-linux-x86-64.so.2 ] max=GLIBC_2.28 GLIBCXX_3.4.21
+149097664 dist-package/cursor-agent-worker-sea: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=5f8561a0db5b06f690174a3903e258e2918c2
+    interp=/lib64/ld-linux-x86-64.so.2 needed=[libdl.so.2 libstdc++.so.6 libm.so.6 libgcc_s.so.1 libpthread.so.0 libc.so.6 ld-linux-x86-64.so.2 ] max=GLIBC_2.28 GLIBCXX_3.4.21
+175 dist-package/cursor-askpass: POSIX shell script text executable, ASCII text
+4788728 dist-package/cursorsandbox: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped
+    interp=none needed=[] max=none 
+48061656 dist-package/file_service.linux-x64-gnu.node: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, BuildID[sha1]=b9052e15e8b741bb853d41eb22c52d3f36a83f07, not stripped
+    interp=none needed=[libz.so.1 libgcc_s.so.1 libpthread.so.0 libm.so.6 libdl.so.2 libc.so.6 ld-linux-x86-64.so.2 ] max=GLIBC_2.28 
+4302120 dist-package/merkle-tree-napi.linux-x64-gnu.node: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, BuildID[sha1]=b74a8f5571c0dfbf9db65f7af001485c311727ab, not stripped
+    interp=none needed=[libdl.so.2 libgcc_s.so.1 libpthread.so.0 libm.so.6 libc.so.6 ld-linux-x86-64.so.2 ] max=GLIBC_2.28 
+126879696 dist-package/node: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=5f8561a0db5b06f690174a3903e258e2918c2
+    interp=/lib64/ld-linux-x86-64.so.2 needed=[libdl.so.2 libstdc++.so.6 libm.so.6 libgcc_s.so.1 libpthread.so.0 libc.so.6 ld-linux-x86-64.so.2 ] max=GLIBC_2.28 GLIBCXX_3.4.21
+137960 dist-package/node_modules/@jsquash/webp/codec/dec/webp_dec.wasm: WebAssembly (wasm) binary module version 0x1 (MVP)
+281261 dist-package/node_modules/@jsquash/webp/codec/enc/webp_enc.wasm: WebAssembly (wasm) binary module version 0x1 (MVP)
+345584 dist-package/node_modules/@jsquash/webp/codec/enc/webp_enc_simd.wasm: WebAssembly (wasm) binary module version 0x1 (MVP)
+2094 dist-package/node_modules/node-gyp-build/bin.js: a /usr/bin/env node script text executable, ASCII text
+398 dist-package/node_modules/node-gyp-build/build-test.js: a /usr/bin/env node script text executable, ASCII text
+143 dist-package/node_modules/node-gyp-build/optional.js: a /usr/bin/env node script text executable, ASCII text
+1706128 dist-package/node_modules/tree-sitter-bash/build/Release/obj.target/tree_sitter_bash_binding.node: ELF 64-bit LSB shared object, x86-64, version 1 (GNU/Linux), dynamically linked, BuildID[sha1]=4575b687b2d1fdd62120160f234f127b9777cdb7, not stripped
+    interp=none needed=[libm.so.6 libgcc_s.so.1 libpthread.so.0 libc.so.6 ld-linux-x86-64.so.2 ] max=GLIBC_2.25 
+48432 dist-package/node_modules/tree-sitter-bash/build/Release/obj.target/tree_sitter_bash_binding/bindings/node/binding.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+1364560 dist-package/node_modules/tree-sitter-bash/build/Release/obj.target/tree_sitter_bash_binding/src/parser.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+17880 dist-package/node_modules/tree-sitter-bash/build/Release/obj.target/tree_sitter_bash_binding/src/scanner.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+1706128 dist-package/node_modules/tree-sitter-bash/build/Release/tree_sitter_bash_binding.node: ELF 64-bit LSB shared object, x86-64, version 1 (GNU/Linux), dynamically linked, BuildID[sha1]=4575b687b2d1fdd62120160f234f127b9777cdb7, not stripped
+    interp=none needed=[libm.so.6 libgcc_s.so.1 libpthread.so.0 libc.so.6 ld-linux-x86-64.so.2 ] max=GLIBC_2.25 
+1383184 dist-package/node_modules/tree-sitter-bash/prebuilds/linux-x64/tree-sitter-bash.node: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, BuildID[sha1]=56bcfc8693c414b63f02183b9e2984bad6131c42, stripped
+    interp=none needed=[libstdc++.so.6 libgcc_s.so.1 libc.so.6 ] max=GLIBC_2.14 GLIBCXX_3.4.21
+255424 dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter/vendor/tree-sitter/lib/src/lib.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+926656 dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding.node: ELF 64-bit LSB shared object, x86-64, version 1 (GNU/Linux), dynamically linked, BuildID[sha1]=6d18d8e012d4caee87aea47645233e5322e56c8a, not stripped
+    interp=none needed=[libm.so.6 libgcc_s.so.1 libpthread.so.0 libc.so.6 ld-linux-x86-64.so.2 ] max=GLIBC_2.25 
+48056 dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/binding.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+84368 dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/conversions.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+80160 dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/language.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+63824 dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/logger.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+115760 dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/lookaheaditerator.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+168944 dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/node.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+129704 dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/parser.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+148816 dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/query.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+140896 dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/tree.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+121936 dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/tree_cursor.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+    interp=none needed=[] max=none 
+926656 dist-package/node_modules/tree-sitter/build/Release/tree_sitter_runtime_binding.node: ELF 64-bit LSB shared object, x86-64, version 1 (GNU/Linux), dynamically linked, BuildID[sha1]=6d18d8e012d4caee87aea47645233e5322e56c8a, not stripped
+    interp=none needed=[libm.so.6 libgcc_s.so.1 libpthread.so.0 libc.so.6 ld-linux-x86-64.so.2 ] max=GLIBC_2.25 
+1969264 dist-package/node_sqlite3.node: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, BuildID[sha1]=15aacf35cca5f78850f09d3ac5968df7db083b2a, not stripped
+    interp=none needed=[libstdc++.so.6 libm.so.6 libgcc_s.so.1 libpthread.so.0 libc.so.6 ] max=GLIBC_2.28 GLIBCXX_3.4
+72664 dist-package/pty.node: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, BuildID[sha1]=b7a77409db13fccdcf1ad5417557562b532b7414, not stripped
+    interp=none needed=[libutil.so.1 libstdc++.so.6 libgcc_s.so.1 libpthread.so.0 libc.so.6 ] max=GLIBC_2.28 GLIBCXX_3.4.22

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "name": "cursor",
+  "version": "2026.11.11-b912975",
+  "run": {
+    "command": ["cursor-agent", "--disable-auto-update", "acp"],
+    "env": [
+      "HOME=/home/cursor",
+      "XDG_CACHE_HOME=/tmp/.cache",
+      "NO_OPEN_BROWSER=1"
+    ]
+  }
+}

@@ -1,0 +1,25 @@
+# step 27's merge, mode clippy, 2026-11-12T20:34:28Z, host Adas-Mac-Studio.local Darwin 25.4.0 arm64, rustc 1.99.1 (58cf8f9c3 2026-10-13), cargo 1.99.1 (5f94df478 2026-08-27)
+# branch 56fd06d5ce614e7f6b7a484e596f3aa816584aa4, kiln main 378327f4941081ce43355afb9a2519b7f7c9e69e
+Auto-merging crates/kiln/src/agentfiles/builtin.rs
+CONFLICT (content): Merge conflict in crates/kiln/src/agentfiles/builtin.rs
+Automatic merge failed; fix conflicts and then commit the result.
+# merge conflicts in: crates/kiln/src/agentfiles/builtin.rs 
+# merged: a640c00920ba9357044a3b7d8a9d42066fbe7e14, tree f03a163784ae793978c5bd825fdd7c0db5750efa, wanted f03a163784ae793978c5bd825fdd7c0db5750efa
+## CLIPPY_GATE: ci/gate.sh -p kiln --cpus 8 --mem 16g --target-dir /Users/adalundhe/.cache/s27gate/target clippy (from 20:34:30)
+ci/gate.sh: the gate of /Users/adalundhe/.cache/s27gate/kiln at a640c0092, natively on macos/arm64
+asked: 8 CPUs, 16G of memory (from --cpus and --mem)
+caps: MemoryMax=16G CPUWeight=1 Nice=19 IOWeight=1 would apply, but this machine has no systemd user manager: it runs uncapped, at nice 19
+cargo: -j 8, 8 test threads
+memory: each step's peak resident memory of its process tree (ps: shared pages and mapped files count, so it's above what it needs), sampled every 2 s
+guard: none (no systemd here: no cgroups of its own to watch from)
+scope: kiln
+  kiln: asked for (-p)
+steps:
+  1. clippy: cargo clippy --locked -p kiln --all-targets -j 8 -- -D warnings
+build: /Users/adalundhe/.cache/s27gate/target; this run's git config and logs in /Users/adalundhe/.cache/kiln-gate/97a18eee0a72/runs/20261112T203430Z-33143, its TMPDIR in /Users/adalundhe/.cache/kiln-gate/97a18eee0a72/t
+::: clippy: cargo clippy --locked -p kiln --all-targets -j 8 -- -D warnings
+    passed in 81 s, resident memory peak 16.8 GiB
+GATE: PASS
+CLIPPY_GATE_EXIT=0 at 20:35:51
+# tree clean:        0 changes
+# done 2026-11-12T20:35:51Z
