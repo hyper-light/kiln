@@ -44,6 +44,14 @@ pub const ALL: &[Builtin] = &[
             ("harness.musl.json", include_str!("../../../../.kiln/images/harness-claude/harness.musl.json")),
         ],
     },
+    // Amp, through its ACP adapter amp-acp (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 24).
+    Builtin {
+        name: "harness-amp",
+        harness: "amp",
+        text: include_str!("../../../../.kiln/images/harness-amp/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-amp/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-amp/harness.json"))],
+    },
 ];
 
 /// One as the list shows it.
@@ -66,6 +74,9 @@ mod goose_tests;
 
 #[cfg(test)]
 mod claude_tests;
+
+#[cfg(test)]
+mod amp_tests;
 
 #[cfg(test)]
 mod tests {

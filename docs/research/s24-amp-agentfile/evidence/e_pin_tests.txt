@@ -1,0 +1,18 @@
+# pin.sh tests on kiln-a094a12d.attlocal.net (x86_64, 6.19.10-300.fc44.x86_64), 2026-11-12T08:18:10Z; pin.sh sha256 fea7d7901437dc4bfd4fc00834b66f0e44192775256a8ca65685d3844934da80
+PIN_RUN exit=0
+VERIFY linux/amd64 bin/amp https://static.ampcode.com/cli/0.0.1794456033-gb2ff22/amp-linux-x64: match
+VERIFY linux/amd64 bin/amp-acp https://github.com/tao12345666333/amp-acp/releases/download/v0.12.0/amp-acp-linux-x64: match
+VERIFY linux/arm64 bin/amp https://static.ampcode.com/cli/0.0.1794456033-gb2ff22/amp-linux-arm64: match
+VERIFY linux/arm64 bin/amp-acp https://github.com/tao12345666333/amp-acp/releases/download/v0.12.0/amp-acp-linux-arm64: match
+VERIFY_MATCHED 4 of 4
+CASE baseline: PASS (exit 0; the mirror pins what the publishers' endpoints pin)
+CASE amp_byte: PASS (exit 1, no pin written): pin.sh: amp linux-x64: its SHA-256 105579db9c8fc74f24bb5b1ea117782f10cfe6953c6e7061672c1d203b5f9bd4 is not the same-origin checksum (http://127.0.0.1:38561/static/cli/0.0.1794456033-gb2ff22/amp-linux-x64.sha256 beside it)
+CASE npm_key: PASS (exit 1, no pin written): pin.sh: @ampcode/cli-linux-x64@0.0.1794456033-gb2ff22: no registry signature verifies with a current key npm publishes at http://127.0.0.1:38561/npm/-/npm/v1/keys
+CASE npm_tarball: PASS (exit 1, no pin written): pin.sh: @ampcode/cli-linux-x64@0.0.1794456033-gb2ff22: the tarball's SHA-512 is not the packument's dist.integrity
+CASE static_and_checksum: PASS (exit 1, no pin written): pin.sh: amp linux-x64: npm's @ampcode/cli-linux-x64@0.0.1794456033-gb2ff22 holds another binary than http://127.0.0.1:38561/static/cli/0.0.1794456033-gb2ff22/amp-linux-x64
+CASE registry_sha: PASS (exit 1, no pin written): pin.sh: amp-acp linux-x86_64: the archive's SHA-256 is not the ACP registry's (http://127.0.0.1:38561/gh/tao12345666333/amp-acp/releases/download/v0.12.0/amp-acp-linux-x86_64.tar.gz)
+CASE registry_version: PASS (exit 1, no pin written): pin.sh: the ACP registry (commit 655c3615c1352f2bebc754ad058478a2cf7b825e) names amp-acp 0.0.0-mutated, not 0.12.0: the second check of amp-acp needs its entry for the version pinned
+CASE arm64_gone: PASS (exit 1, no pin written): curl: (22) The requested URL returned error: 404
+pin.sh: download failed: http://127.0.0.1:38561/static/cli/0.0.1794456033-gb2ff22/amp-linux-arm64
+CASE asset_and_digest: PASS (exit 1, no pin written): pin.sh: amp-acp linux-x64: the registry's archive holds another binary than amp-acp-linux-x64
+CASES_PASSED 9 of 9

@@ -1,0 +1,32 @@
+# Amp as a kiln harness in a Shards microVM (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 24).
+# kiln runs Amp's ACP adapter, amp-acp (Kind "amp", crates/kiln/src/harness/kinds.rs), which drives
+# Amp's own CLI, amp, found beside it on the harness's PATH. Both come in as pin.json pins them
+# (pin.sh checks each binary two ways) in ./amp-<arch>/: harness.json, bin/amp and bin/amp-acp.
+# Nothing else installs them, and no sign-in is in the image: a person's lives in their /home/amp
+# volume until step 33 brings sign-ins from outside the microVM.
+
+# Both programs are glibc builds needing GLIBC_2.17 at most, and neither publisher ships a musl
+# build: any glibc base runs them with nothing added (this default, Debian trixie's glibc 2.41,
+# pinned by digest as step 19 chose it), and a musl base cannot start them.
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+FROM ${BASE}
+
+# BuildKit sets TARGETARCH in the global scope, so the stage declares it to name each platform's
+# harness directory.
+ARG TARGETARCH
+HARNESS amp FROM ./amp-${TARGETARCH}
+
+# Its network reach, every part named (default deny): a network for this harness alone, which it
+# joins with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443
+# out, opened at the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress), for Amp
+# speaks HTTPS to ampcode.com. These are the bring-up's grants (Shards' docs/examples/harness-claude)
+# until step 9 grants providers by name. Nothing comes in; no other port or protocol goes out.
+NETWORK --dns --egress=443/tcp provider FOR amp
+EXPOSE --harnesses=amp 443/tcp AS egress FOR provider
+CONNECT amp WITH amp ON provider
+
+# The project, and the person's Amp state: one home-shaped volume, since Amp keeps its settings and
+# sign-in under XDG config and data, and amp-acp the session mappings ACP's session/load needs under
+# XDG state. harness.json points the three variables into it. Each is the harness's alone.
+VOLUME --target-kind=harness /workspace FOR amp
+VOLUME --target-kind=harness /home/amp FOR amp
