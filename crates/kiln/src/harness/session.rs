@@ -19,6 +19,29 @@ fn is_zero_epoch(n: &u64) -> bool {
     *n == 0
 }
 
+/// An isolated session's boundary (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 17 and 32), as kiln's T4 isolation
+/// named it: its kind, and the image it boots once one is chosen.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct Isolation {
+    /// `microvm`: a microVM of its own.
+    pub kind: String,
+    /// The image it boots, once chosen (step 31's choice per harness and project).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub image: Option<String>,
+}
+
+impl Isolation {
+    /// The kind every isolated session has today.
+    pub const MICROVM: &'static str = "microvm";
+
+    /// A microVM of its own, its image not yet chosen.
+    pub fn microvm() -> Self {
+        Self { kind: Self::MICROVM.to_owned(), image: None }
+    }
+}
+
 /// What to start.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Spec {
@@ -104,6 +127,11 @@ pub struct Spec {
     /// folder (`crate::workspace`), made on its machine before it starts and kept with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<crate::workspace::Workspace>,
+    /// How it's held when not as a process on its machine: in a microVM of its own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+    /// steps 17 and 32). Set from what was asked, or from its parent's: an isolated agent's agents
+    /// are isolated too. A machine that can't hold it so refuses it, never running it as a process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<Isolation>,
     /// What a person branched it from (`Command::Branch`): a session's id, or `<session>/<task>`
     /// for one of that session's harness's own subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +179,7 @@ impl Default for Spec {
             helper: None,
             subagent: false,
             workspace: None,
+            isolation: None,
             variant_of: None,
         }
     }
@@ -478,6 +507,10 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub workspace: Option<crate::workspace::Workspace>,
+    /// Its isolation, when it's held in a microVM of its own (as `Spec::isolation`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub isolation: Option<Isolation>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -615,7 +648,7 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace } = self;
+        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace, isolation } = self;
         !(*deferred == o.deferred
             && *admission == o.admission
             && *queue_partial == o.queue_partial
@@ -676,7 +709,8 @@ impl Info {
             && *subagent == o.subagent
             && *variant_of == o.variant_of
             && *no_bypass == o.no_bypass
-            && *workspace == o.workspace)
+            && *workspace == o.workspace
+            && *isolation == o.isolation)
     }
 }
 
@@ -1847,6 +1881,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         variant_of: spec.variant_of.clone(),
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
+        isolation: spec.isolation.clone(),
     };
     let (ctl, ctl_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
     let s = Arc::new(Session {
@@ -6614,6 +6649,7 @@ for line in sys.stdin:
             subagent: false,
             no_bypass: false,
             workspace: None,
+            isolation: None,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };

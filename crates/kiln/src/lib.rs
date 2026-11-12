@@ -22,6 +22,7 @@ pub mod bluegreen;
 pub mod browser;
 pub mod cd;
 pub mod deploy;
+pub mod events;
 pub mod ci;
 pub mod h3door;
 pub mod http;

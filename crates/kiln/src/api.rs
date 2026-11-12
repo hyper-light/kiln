@@ -3147,15 +3147,30 @@ async fn overview(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> R {
     }
     // Kept encoded ahead of its asking (goal 10, plan 01a1a87b2dae step 2), made of the last day's
     // figures and the runners' rows kept in memory, the runners' live records and the server's own
-    // figures: nothing is read from the store or encoded while it's answered. The store's, while
-    // what's kept is behind it.
+    // figures: nothing is read from the store or encoded while it's answered. One that finds it behind
+    // what it's made of has it made on the compute pool, as its maker does ([`overview_making`]); the
+    // store's, while what's kept is behind it, is made there too: none of either on the request's shard
+    // (goal 9, plan 01a1a87b2cec step 3: made there, `read /api/overview` held its shard 0.1 to 0.2 ms
+    // on the CPU in the M3's lab).
     hub.harness.views.start(hub);
-    if let Some(made) = overview_key(hub).and_then(|key| hub.harness.views.overview.answer(key, |k| overview_made(hub, k)).ok()) {
-        return Ok(pre_named(made));
+    if let Some(key) = overview_key(hub) {
+        if let Some(made) = hub.harness.views.overview.held(&key) {
+            return Ok(pre_named(made));
+        }
+        match overview_making(hub, key).await {
+            Ok(made) => return Ok(pre_named(made)),
+            Err(e) => tracing::debug!(error = %format!("{e:#}"), "the overview wasn't made off the shard: the store's answers"),
+        }
     }
     let stats = hub.store.stats(None).await?;
-    let agents = hub.agent_list().await;
-    Ok(srv::json(StatusCode::OK, &overview_json(hub, &stats, &agents, &system_now(hub), queue_now())))
+    let (rows, labels, machines) = hub.agent_rows().await;
+    let h = Arc::clone(hub);
+    let json = crate::rt::compute(move || {
+        let agents = h.agent_list_of(rows, &labels, &machines, &h.agents.get());
+        crate::reads::encode(&overview_json(&h, &stats, &agents, &system_now(&h), queue_now()))
+    })
+    .await??;
+    Ok(pre_encoded(json))
 }
 
 /// The jobs queued and running now, as the overview says them.
@@ -3259,11 +3274,11 @@ fn overview_made(hub: &Hub, key: &crate::reads::OverviewKey) -> anyhow::Result<B
 }
 
 /// The maker's turn ([`crate::reads::Views::start`]): each read kept ahead that's been asked for, made
-/// again where what it's made of changed: the runners' list on the compute pool ([`agents_making`]: each
+/// again where what it's made of changed, each on the compute pool: the runners' list ([`agents_making`]: each
 /// runner's record copied and the list encoded, hundreds of microseconds for a long one, more than a shard's
-/// quantum), the overview here (its counts and a few kilobytes encoded). Neither changes by itself: the overview
-/// says when the server started, and the pages count its uptime (goal 9, plan 01a1a87b2cec step 5: it was made
-/// again every second while it was read, for its uptime).
+/// quantum) and the overview ([`overview_making`]). Neither changes by itself: the overview says when the server
+/// started, and the pages count its uptime (goal 9, plan 01a1a87b2cec step 5: it was made again every second while
+/// it was read, for its uptime).
 pub(crate) async fn make_ahead(hub: &Arc<Hub>) {
     let v = &hub.harness.views;
     if v.agents.asked()
@@ -3276,13 +3291,28 @@ pub(crate) async fn make_ahead(hub: &Arc<Hub>) {
     if v.overview.asked()
         && let Some(key) = overview_key(hub)
         && !v.overview.holds(&key)
+        && let Err(e) = overview_making(hub, key).await
     {
-        let was = v.overview.now();
-        match overview_made(hub, &key) {
-            Ok(made) => v.overview.keep(&was, key, crate::reads::Made::of(made)),
-            Err(e) => tracing::debug!(error = %format!("{e:#}"), "the overview wasn't made ahead: a read makes it"),
-        }
+        tracing::debug!(error = %format!("{e:#}"), "the overview wasn't made ahead: a read makes it");
     }
+}
+
+/// `GET /api/overview` as `key` says it, made on the compute pool (its JSON value made, encoded and named:
+/// `crate::reads::Made`) and kept for the reads after it, unless a making begun after this one's was kept meanwhile:
+/// what its maker makes, and a read that finds it behind (goal 9, plan 01a1a87b2cec step 3: made on its maker's shard,
+/// the value's making, its encoding and its letting go held that shard 0.34 ms on the CPU at the middle in the M3's
+/// lab, 0.72 ms at the longest).
+async fn overview_making(hub: &Arc<Hub>, key: crate::reads::OverviewKey) -> anyhow::Result<crate::reads::Made> {
+    let was = hub.harness.views.overview.now();
+    let h = Arc::clone(hub);
+    let (key, made) = crate::rt::compute(move || {
+        let made = overview_made(&h, &key).map(crate::reads::Made::of);
+        (key, made)
+    })
+    .await?;
+    let made = made?;
+    hub.harness.views.overview.keep(&was, key, made.clone());
+    Ok(made)
 }
 
 /// `GET /api/agents`: the runners `caller` may read. The owner's, kept encoded ahead of its asking
@@ -8038,9 +8068,8 @@ fn server_health(hub: &Hub) -> Response {
             "priority": { "realtime": crate::rt::realtime_status(), "nudge": crate::rt::nudge_status(), "work": crate::os::work_said(), "cores": crate::rt::cores_status(), "spin": crate::rt::spin_status() },
             // The cluster group (docs/p2p.md P1, P2): kiln.db's last write, the log's last entry,
             // the runners holding a replica, and kiln.db's size (what a runner's copy takes); the learners
-            // out of step now, and the log's cache: what it opened with, what it opens with next (the most a
-            // learner back from away lacked), and the reads of the log's file it didn't hold (goal 11's
-            // audit, row B21).
+            // out of step now, and the log's cache: what it opened with and opens with next, one append a group,
+            // and the reads of the log's file it didn't hold (goal 11's audit, row B21).
             "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({
                 "group": true,
                 "seq": seq,
@@ -8048,7 +8077,7 @@ fn server_health(hub: &Hub) -> Response {
                 "learners": hub.store.group().map_or(0, |g| g.point().1.learners.len()),
                 "bytes": hub.store.file_bytes(),
                 "away": hub.store.group().map_or(0, crate::store::group::Group::away),
-                "cache": hub.store.group().map(|g| { let (bytes, next) = g.cache(); json!({ "bytes": bytes, "next": next, "file_reads": g.log_reads() }) }),
+                "cache": hub.store.group().map(|g| json!({ "bytes": g.cache(), "next": g.cache(), "file_reads": g.log_reads() })),
             })),
         }),
     )
@@ -10304,6 +10333,67 @@ mod tests {
             let body = body_of(r).await?;
             anyhow::ensure!(body == serde_json::to_vec(&crate::doctor::runners_for(&hub, &owner).await)?, "the store's path's bytes");
             anyhow::ensure!(took.encoded == 0, "encoded {} times on the request's shard", took.encoded);
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: `GET /api/overview` read while what's kept of it is behind what it's made of (none
+    /// made yet, as here, or its runners' live records changed since) has it made and encoded on the compute pool, none of
+    /// it on the request's shard, kept for the reads after it; so does one read while the rows kept are behind the store's,
+    /// whose answer the store's figures and rows make. Made where the request was, the overview's JSON value made, encoded
+    /// and let go of held the shard 0.1 to 0.2 ms on the CPU in the M3's lab.
+    #[test]
+    fn g9_s3_an_overview_none_kept_says_is_made_off_the_shard() -> anyhow::Result<()> {
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        const HANG: Duration = Duration::from_secs(300);
+        /// An overview read as the owner: answered, as the overview, none of it encoded on its shard.
+        async fn read(hub: &Arc<Hub>) -> anyhow::Result<()> {
+            let (r, took) = crate::reads::trace::traced(overview(hub, &crate::authz::Caller::owner())).await;
+            let r = r.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?;
+            anyhow::ensure!(r.status() == StatusCode::OK, "{}", r.status());
+            let said: serde_json::Value = serde_json::from_slice(&body_of(r).await?)?;
+            anyhow::ensure!(said.pointer("/system/started_ms").and_then(serde_json::Value::as_i64) == Some(hub.started_ms), "the overview: {said}");
+            anyhow::ensure!(took.encoded == 0, "encoded {} times on the request's shard", took.encoded);
+            Ok(())
+        }
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            // The figures and rows kept not made yet (their making begun by this read): the store's answer.
+            read(&hub).await?;
+            let deadline = Instant::now() + HANG;
+            while overview_key(&hub).is_none() {
+                anyhow::ensure!(Instant::now() < deadline, "the overview's figures and rows weren't kept");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            // Kept, none of the overview made of them yet.
+            read(&hub).await?;
+            anyhow::ensure!(hub.harness.views.overview.now().is_some(), "kept for the reads after it");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the maker of the reads kept ahead makes the overview, once it's been read, on the
+    /// compute pool, none of it on the maker's shard, and keeps it. Made there, its JSON value's making, its encoding and
+    /// its letting go held the maker's shard 0.34 ms on the CPU at the middle in the M3's lab, 0.72 ms at the longest.
+    #[test]
+    fn g9_s3_the_overview_made_ahead_is_made_off_its_makers_shard() -> anyhow::Result<()> {
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        const HANG: Duration = Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let deadline = Instant::now() + HANG;
+            let key = loop {
+                if let Some(key) = overview_key(&hub) {
+                    break key;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the overview's figures and rows weren't kept");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            };
+            // Read, so its maker keeps it made.
+            anyhow::ensure!(hub.harness.views.overview.held(&key).is_none(), "made before its maker's turn");
+            let ((), took) = crate::reads::trace::traced(make_ahead(&hub)).await;
+            anyhow::ensure!(took.encoded == 0, "encoded {} times on the maker's shard", took.encoded);
+            anyhow::ensure!(hub.harness.views.overview.now().is_some(), "made and kept");
             Ok(())
         })
     }

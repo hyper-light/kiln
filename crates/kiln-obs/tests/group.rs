@@ -369,11 +369,11 @@ impl Cluster {
         self.senders.iter().all(|s| s.acked.len() as u64 == s.total)
     }
 
-    /// Every live member applied all the leader committed, and none has a write out.
+    /// Every live member applied all the leader committed, and none has a write out or a catch-up's read.
     fn settled(&self) -> bool {
         let Some(leader) = self.leader() else { return false };
         let commit = self.nodes[&leader].live.as_ref().unwrap().replica.applied().index;
-        self.nodes.values().filter_map(|n| n.live.as_ref()).all(|l| l.replica.applied().index == commit && l.replica.in_flight() == 0)
+        self.nodes.values().filter_map(|n| n.live.as_ref()).all(|l| l.replica.applied().index == commit && l.replica.in_flight() == 0 && !l.replica.catching_up())
     }
 
     fn store(&self, id: u64) -> kiln_obs::lock::ReadGuard<'_, Store> {

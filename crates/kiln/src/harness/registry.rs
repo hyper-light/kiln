@@ -3968,8 +3968,17 @@ impl Registry {
     /// for get one made here). One that's a session's already, or a start's under way, is refused
     /// ([`IdTaken`]) before anything starts: asked again under the same ids, as its answer was
     /// lost, a start never starts its sessions twice.
-    pub async fn open_as(&self, hub: &Hub, target: &str, spec: Spec, count: usize, ids: &[String]) -> anyhow::Result<Vec<Info>> {
+    pub async fn open_as(&self, hub: &Hub, target: &str, mut spec: Spec, count: usize, ids: &[String]) -> anyhow::Result<Vec<Info>> {
         let count = count.clamp(1, 16);
+        // An isolated agent's agents are isolated too, however they're started; and one is held so
+        // only where its machine starts microVMs: one that can't would run it as a process, unasked
+        // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+        if spec.isolation.is_none() {
+            spec.isolation = spec.parent.as_deref().and_then(|p| self.info(p)).and_then(|i| i.isolation);
+        }
+        if spec.isolation.is_some() {
+            crate::harness::lineage::isolation_on(hub, target).map_err(|why| anyhow::anyhow!("an agent can't run isolated there: {why}"))?;
+        }
         let loc = Location::of_target(target);
         // A machine whose kiln is to be upgraded takes no new agent (`crate::skew`).
         if let Location::Machine(m) = &loc
@@ -4100,6 +4109,7 @@ impl Registry {
                         variant_of: spec.variant_of.clone(),
                         no_bypass: !spec.allow_bypass,
                         workspace: spec.workspace.clone(),
+                        isolation: spec.isolation.clone(),
                     };
                     let mut seed = Mirror::new(info.clone(), loc.clone(), Arc::clone(&self.bus));
                     seed.opened_at = Some(std::time::Instant::now());

@@ -33,6 +33,8 @@ hyper-check = { path = "../hyper-check" }
 hyper-measure = { path = "../hyper-measure" }
 # The world the simulated groups run in: its streams, its network and its write queue.
 hyper-sim = { path = "../hyper-sim" }
+# A log on a file of its own, for a catch-up read from it (`tests/catch_up.rs`).
+tempfile.workspace = true
 
 [[bench]]
 name = "depth"

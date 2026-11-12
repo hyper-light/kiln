@@ -1,0 +1,437 @@
+Subject: a member's log on a simulated device, its cuts and work in flight, a planted defect, the owed redirects in order
+Why: Quiver's persisted class runs in a deterministic simulation (kiln's CP-T2.2 step 6, docs/design/persisted-sim.md). A member opens its log on hyper-sim's block device under hyper-log's Waits::Told (NodeFile, Member::open_simulated; the sim feature). Its host cuts and serves it (Member::cut, serve) at the virtual time the node's disk draws, and reads its work in flight (Member::in_flight). Member::plant reaches the planted defect (the mutants feature). The acknowledgements a member owed are redirected in order when it stops leading, not in a HashMap's. Offered to Focal.
+
+diff --git a/crates/focal-bus/Cargo.toml b/crates/focal-bus/Cargo.toml
+index 47f7c3a18df91ec0abafb4c46c0a962e0a98e977..04d1e07f8317b43ffd7ae63e3638310423f53ccf 100644
+--- a/crates/focal-bus/Cargo.toml
++++ b/crates/focal-bus/Cargo.toml
+@@ -36,6 +36,15 @@ focal-platform = { version = "0.1.0", path = "../focal-platform" }
+ # The standalone mode's local identities (`pki`).
+ rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "aws_lc_rs"] }
+ 
++[features]
++# A member's log on hyper-sim's block device (`Member::open_simulated`), for a simulation that
++# decides when each write reaches the device and what a crash leaves of it (Quiver's
++# docs/design/persisted-sim.md).
++sim = ["hyper-block/sim"]
++# A defect planted in a member's replica (`Member::plant`, `hyper_raft::Mutant`), for a test build
++# that shows a simulation catches it; no consumer enables it.
++mutants = ["hyper-durable/mutants", "hyper-raft/mutants"]
++
+ [dev-dependencies]
+ # A part's image written where each test's own directory is (`group`).
+ tempfile.workspace = true
+diff --git a/crates/focal-bus/src/member.rs b/crates/focal-bus/src/member.rs
+index 2e9f7fc05de234af692742d256af54362640e49a..4dab94e0973974c18f9ea248a8fa8e79bbeb44fa 100644
+--- a/crates/focal-bus/src/member.rs
++++ b/crates/focal-bus/src/member.rs
+@@ -56,6 +56,8 @@ use std::task::Waker;
+ use std::time::{Duration, Instant};
+ 
+ use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
++use hyper_block::DiskError;
++use hyper_block::block::{BlockFile, Durable};
+ use hyper_block::buf::Alignment;
+ use hyper_block::file::{CachingRequest, DeviceFile};
+ use hyper_durable::{
+@@ -463,7 +465,7 @@ impl ReplicaBudget for MemberBudget {
+     }
+ }
+ 
+-type PartReplica = Replica<GroupStore<DeviceFile>, PartMachine, MemberBudget>;
++type PartReplica = Replica<GroupStore<NodeFile>, PartMachine, MemberBudget>;
+ 
+ /// What the liveness stream asked during a call into it.
+ #[derive(Debug, Default)]
+@@ -676,7 +678,7 @@ pub struct Member {
+     /// This node's connection to each of `peers`, in their order.
+     links: Vec<Link>,
+     replica: PartReplica,
+-    log: Log<DeviceFile>,
++    log: Log<NodeFile>,
+     /// Whether the log's file is written in place, as its file system said when it was opened.
+     written_in_place: Option<bool>,
+     liveness: Liveness,
+@@ -866,13 +868,130 @@ fn log_config(align: Alignment, memory_bytes: u64) -> Result<hyper_log::Config,
+     .map_err(|_| BusError::Configuration("the node's log facts give no configuration"))
+ }
+ 
++/// The file a node's log is on: the file in its data directory, or, for a simulation, hyper-sim's
++/// block device (`Member::open_simulated`), whose crash states and power cuts the simulation decides.
++#[derive(Debug)]
++pub enum NodeFile {
++    /// The node's own file (`LOG_FILE` in its data directory).
++    Device(DeviceFile),
++    /// A handle onto a simulated device.
++    #[cfg(feature = "sim")]
++    Sim(hyper_block::sim::SimHandle),
++}
++
++impl BlockFile for NodeFile {
++    fn alignment(&self) -> Alignment {
++        match self {
++            Self::Device(f) => f.alignment(),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => f.alignment(),
++        }
++    }
++
++    fn layout_block(&self) -> Alignment {
++        match self {
++            Self::Device(f) => f.layout_block(),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => f.layout_block(),
++        }
++    }
++
++    fn len(&self) -> Result<u64, DiskError> {
++        match self {
++            Self::Device(f) => BlockFile::len(f),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => BlockFile::len(f),
++        }
++    }
++
++    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
++        match self {
++            Self::Device(f) => f.read_exact_at(buf, offset),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => f.read_exact_at(buf, offset),
++        }
++    }
++
++    fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
++        match self {
++            Self::Device(f) => f.read_resident_at(buf, offset),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => f.read_resident_at(buf, offset),
++        }
++    }
++
++    fn reads_resident(&self) -> bool {
++        match self {
++            Self::Device(f) => f.reads_resident(),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => f.reads_resident(),
++        }
++    }
++
++    fn residency(&self) -> hyper_block::Residency {
++        match self {
++            Self::Device(f) => f.residency(),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => f.residency(),
++        }
++    }
++
++    fn set_residency_shadow(&mut self, on: bool) {
++        match self {
++            Self::Device(f) => f.set_residency_shadow(on),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => f.set_residency_shadow(on),
++        }
++    }
++
++    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
++        match self {
++            Self::Device(f) => f.write_all_at(buf, offset),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => f.write_all_at(buf, offset),
++        }
++    }
++
++    fn sync_data(&self) -> Result<(), DiskError> {
++        match self {
++            Self::Device(f) => f.sync_data(),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => f.sync_data(),
++        }
++    }
++
++    fn fills_new_space(&self) -> bool {
++        match self {
++            Self::Device(f) => f.fills_new_space(),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => f.fills_new_space(),
++        }
++    }
++
++    fn write_durable_at(&self, buf: &[u8], offset: u64) -> Result<Durable, DiskError> {
++        match self {
++            Self::Device(f) => f.write_durable_at(buf, offset),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => f.write_durable_at(buf, offset),
++        }
++    }
++
++    fn try_clone(&self) -> Result<Self, DiskError> {
++        match self {
++            Self::Device(f) => f.try_clone().map(Self::Device),
++            #[cfg(feature = "sim")]
++            Self::Sim(f) => f.try_clone().map(Self::Sim),
++        }
++    }
++}
++
+ /// Opens the node's log in `data`, sealed under the keys `key_file` keeps, or makes it; with
+ /// whether its file is written in place (`DeviceFile::written_in_place`).
+ fn open_log(
+     data: &Path,
+     key_file: &Path,
+     memory_bytes: u64,
+-) -> Result<(Log<DeviceFile>, Option<bool>), BusError> {
++) -> Result<(Log<NodeFile>, Option<bool>), BusError> {
+     let path = data.join(LOG_FILE);
+     let exists = path
+         .try_exists()
+@@ -896,6 +1015,7 @@ fn open_log(
+     let file = DeviceFile::open(&path, false, CachingRequest::PreferDirect, align)
+         .map_err(|_| BusError::Configuration("the node's log could not be opened"))?;
+     let written_in_place = file.written_in_place();
++    let file = NodeFile::Device(file);
+     let ((parent, auth), _keys) = focal_seal::open_or_create(data, key_file)
+         .map_err(|_| BusError::Configuration("the node's keys could not be opened"))?
+         .split();
+@@ -914,6 +1034,90 @@ fn open_log(
+     Ok((log, written_in_place))
+ }
+ 
++/// A member to open on a simulated device ([`Member::open_simulated`]): its settings, and the
++/// handle its log writes through.
++#[cfg(feature = "sim")]
++#[derive(Debug)]
++pub struct Simulated {
++    /// What the member is opened from, as for [`Member::open`]; its log is on `device`, not in
++    /// `data`, where its image, its run and its keys stay.
++    pub settings: MemberSettings,
++    /// The device its log is on.
++    pub device: hyper_block::sim::SimHandle,
++}
++
++/// What a member's log was opened with: the node's run, its directory's keys and whether it was in
++/// the clear, the log, and whether its file is written in place.
++struct Placed {
++    run: u64,
++    /// The directory's keys, and whether it was in the clear before this open ([`prepare`]).
++    keys: focal_seal::DataKeys,
++    clear: bool,
++    log: Log<NodeFile>,
++    written_in_place: Option<bool>,
++}
++
++/// What a member serves its part with beside its log ([`Member::open`]).
++struct Parts {
++    node: Node,
++    members: Vec<u64>,
++    clients: usize,
++    lane_window: usize,
++    budget: MemoryBudget,
++    now: Instant,
++}
++
++/// The node's data directory made, owner-only, each directory durable in its parent, its keys
++/// opened, and its run raised: the run this start is, the keys, and whether the directory was in
++/// the clear before (what [`Member::open`] and `open_simulated` share).
++fn prepare(data: &Path, key_file: &Path) -> Result<(u64, focal_seal::DataKeys, bool), BusError> {
++    focal_platform::fs::create_dir_all_durable(data, focal_platform::fs::create_dir_private)
++        .map_err(|_| BusError::Configuration("the node's data directory could not be made"))?;
++    // The directory's keys before any file of it is read (29 §12.9): made with the root key file
++    // where it has none, as the log's are.
++    let keys = focal_seal::DataKeys::new(data, key_file);
++    keys.ensure()
++        .map_err(|_| BusError::Configuration("the node's keys could not be opened"))?;
++    let clear = !sealed_mark(data)?;
++    let run = raise_run(&data.join(RUN_FILE), &keys, clear)?;
++    Ok((run, keys, clear))
++}
++
++/// Opens the node's log on a simulated device, sealed under the keys `key_file` keeps as
++/// [`open_log`] seals it, under `hyper_log::Waits::Told`: made if the device holds nothing, opened
++/// from what it holds otherwise.
++#[cfg(feature = "sim")]
++fn open_simulated_log(
++    data: &Path,
++    key_file: &Path,
++    memory_bytes: u64,
++    device: hyper_block::sim::SimHandle,
++) -> Result<Log<NodeFile>, BusError> {
++    let empty = device
++        .is_empty()
++        .map_err(|_| BusError::Configuration("the simulated device could not be read"))?;
++    let config = hyper_log::Config {
++        waits: hyper_log::Waits::Told,
++        ..log_config(device.alignment(), memory_bytes)?
++    };
++    let ((parent, auth), _keys) = focal_seal::open_or_create(data, key_file)
++        .map_err(|_| BusError::Configuration("the node's keys could not be opened"))?
++        .split();
++    let with = hyper_log::With {
++        sealing: Some(hyper_log::Sealing { parent, auth }),
++        growth: None,
++    };
++    let file = NodeFile::Sim(device);
++    if empty {
++        hyper_log::Log::create_with(file, config, LOG_ID, with)
++            .map_err(|_| BusError::Configuration("the node's log could not be made"))
++    } else {
++        hyper_log::Log::open_with(file, config, LOG_ID, with)
++            .map(|(log, _)| log)
++            .map_err(|_| BusError::Configuration("the node's log could not be opened"))
++    }
++}
++
+ impl Member {
+     /// The node `settings` names, opened on its log and its part's image, serving the part through
+     /// `node`; `members` are the group's voters, this node among them, its founding configuration.
+@@ -927,21 +1131,81 @@ impl Member {
+         budget: MemoryBudget,
+         now: Instant,
+     ) -> Result<Self, BusError> {
+-        // The data directory, owner-only, each directory made durable in its parent.
+-        focal_platform::fs::create_dir_all_durable(
+-            &settings.data,
+-            focal_platform::fs::create_dir_private,
+-        )
+-        .map_err(|_| BusError::Configuration("the node's data directory could not be made"))?;
+-        // The directory's keys before any file of it is read (29 §12.9): made with the root key file
+-        // where it has none, as the log's are.
+-        let keys = focal_seal::DataKeys::new(&settings.data, &settings.key_file);
+-        keys.ensure()
+-            .map_err(|_| BusError::Configuration("the node's keys could not be opened"))?;
+-        let clear = !sealed_mark(&settings.data)?;
+-        let run = raise_run(&settings.data.join(RUN_FILE), &keys, clear)?;
++        let (run, keys, clear) = prepare(&settings.data, &settings.key_file)?;
+         let (log, written_in_place) =
+             open_log(&settings.data, &settings.key_file, settings.memory_bytes)?;
++        let placed = Placed {
++            run,
++            keys,
++            clear,
++            log,
++            written_in_place,
++        };
++        let parts = Parts {
++            node,
++            members,
++            clients,
++            lane_window,
++            budget,
++            now,
++        };
++        Self::on_log(settings, placed, parts)
++    }
++
++    /// The node `simulated` names, as [`Member::open`] opens it, but with its log on a simulated
++    /// device rather than the file in its data directory: made there if the device holds nothing,
++    /// opened from what it holds otherwise, and run under `hyper_log::Waits::Told`, so it writes
++    /// only when its owner cuts ([`Member::cut`]). For a simulation that decides when each write
++    /// reaches the device and what a crash leaves of it (Quiver's `docs/design/persisted-sim.md`).
++    #[cfg(feature = "sim")]
++    pub fn open_simulated(
++        simulated: Simulated,
++        node: Node,
++        members: Vec<u64>,
++        clients: usize,
++        lane_window: usize,
++        budget: MemoryBudget,
++        now: Instant,
++    ) -> Result<Self, BusError> {
++        let Simulated { settings, device } = simulated;
++        let (run, keys, clear) = prepare(&settings.data, &settings.key_file)?;
++        let log = open_simulated_log(&settings.data, &settings.key_file, settings.memory_bytes, device)?;
++        let placed = Placed {
++            run,
++            keys,
++            clear,
++            log,
++            written_in_place: None,
++        };
++        let parts = Parts {
++            node,
++            members,
++            clients,
++            lane_window,
++            budget,
++            now,
++        };
++        Self::on_log(settings, placed, parts)
++    }
++
++    /// The member opened on its log: its part's group claimed, its image opened, its replica and
++    /// its liveness stream made.
++    fn on_log(settings: MemberSettings, placed: Placed, parts: Parts) -> Result<Self, BusError> {
++        let Placed {
++            run,
++            keys,
++            clear,
++            log,
++            written_in_place,
++        } = placed;
++        let Parts {
++            node,
++            members,
++            clients,
++            lane_window,
++            budget,
++            now,
++        } = parts;
+         let store = GroupStore::claim(&log, PART_GROUP)
+             .map_err(|_| BusError::Configuration("the part's group could not be claimed"))?;
+         let drives = hyper_durable::LogStore::depth(&store).saturating_add(1);
+@@ -1064,6 +1328,44 @@ impl Member {
+         self.fenced
+     }
+ 
++    /// Tells the node's log to write what it holds (`hyper_log::Log::cut`): under
++    /// `hyper_log::Waits::Told` ([`Member::open_simulated`]) the log writes nothing until told,
++    /// and the handle is answered once all it held is; under the other waits, at once.
++    pub fn cut(&self) -> Result<Pending, BusError> {
++        self.log
++            .cut()
++            .map_err(|_| BusError::Configuration("the node's log has closed"))
++    }
++
++    /// Plants `mutant` in the node's replica, or takes the one planted out: a defect a test build
++    /// shows its checks catch (`hyper_raft::Mutant`; the `mutants` feature, which no consumer
++    /// enables). A member opened again holds none.
++    #[cfg(feature = "mutants")]
++    pub fn plant(&mut self, mutant: Option<hyper_raft::Mutant>) {
++        self.replica.plant(mutant);
++    }
++
++    /// Tells the node's log to read the entries its replica asked for and the log holds
++    /// (`hyper_log::Log::serve`): under `hyper_log::Waits::Told` it reads nothing from its device
++    /// until told, and the handle is answered once every such read is; under the other waits, at
++    /// once.
++    pub fn serve(&self) -> Result<Pending, BusError> {
++        self.log
++            .serve()
++            .map_err(|_| BusError::Configuration("the node's log has closed"))
++    }
++
++    /// The node's writes to its log not yet taken back by its replica and its liveness stream,
++    /// and the reads of entries it asked of the log not yet taken back: what a simulation waits
++    /// on before its world moves on, so each answer reaches the node at an instant it chose.
++    pub fn in_flight(&self) -> (usize, usize) {
++        let liveness = usize::from(self.liveness_write.is_some());
++        (
++            self.replica.in_flight().saturating_add(liveness),
++            self.replica.reads_held(),
++        )
++    }
++
+     /// The node's id.
+     pub const fn id(&self) -> u64 {
+         self.id
+@@ -2008,7 +2310,10 @@ impl Member {
+     {
+         let leading = self.replica.is_leader();
+         if self.leading && !leading {
+-            let owed: Vec<(PeerId, Owed)> = self.owed.drain().map(|(owed, _)| owed).collect();
++            let mut owed: Vec<(PeerId, Owed)> =
++                self.owed.drain().map(|(owed, _)| owed).collect();
++            // In order, not the map's: the redirects go out the same way every run.
++            owed.sort_unstable();
+             for (peer, key) in owed {
+                 self.redirect(endpoint, peer, key);
+             }
