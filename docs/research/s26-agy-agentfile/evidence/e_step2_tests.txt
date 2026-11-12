@@ -1,0 +1,43 @@
+# Plan step 26, step 2 (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d): the module's tests, Shards' check and clippy
+# on adacachy2 (x86_64, 7.3.3-1-cachyos), 2026-11-12T14:05:25Z, from the committed tree of f2990f9c3faf44e544768ec3e9ff23a1a1e776ef
+bundle sha256 163c099de636af72eae700a85d07a1cff9138920e7156b7efbd20db0d0fb0b41
+HEAD f2990f9c3faf44e544768ec3e9ff23a1a1e776ef
+working tree: 0 paths differ from HEAD
+files at HEAD:
+  .kiln/images/harness-antigravity/Agentfile blob d5c64fd20d8d0b4237b57296d5c2f6d4daf1ec24 sha256 819f797e99508218f43c335fa5c4ef36fc267e5eb6847c70e5507538d8e55ccf
+  .kiln/images/harness-antigravity/harness.json blob 11b844eb03f5b20cbd9ac9eb5c3c45cd596f43d7 sha256 2a36533bf6d62767f4e84bd2a7436dfe6911c0a7b53d2722c959abd791a48c9b
+  .kiln/images/harness-antigravity/pin.json blob 43b7d3742e9da7205bf6e6a5c1ae3be092486cb1 sha256 9f57726a2de8b75d243764ee6d42145a7c6d1815de2b42d8e773f80b7a36b806
+  .kiln/images/harness-antigravity/pin.log blob fe833c088e8d0a593c18d3b0badd478f973669d4 sha256 0c9061e6b94b5fef7905cd8d8977c580113042414e348ae222bcf97d8abacf71
+  .kiln/images/harness-antigravity/pin.sh blob 602d8dfbda34d0fba47d10cdd59776037b1ae1a0 sha256 3dde6a64ccdd6b992f756469a05b252469f5ca6242555f5c1f31cd4fbc686550
+  .kiln/images/harness-antigravity/pin_test.sh blob ff637211ba35ced045c85df02125fcc6593a4064 sha256 53547cd6e6bf07367037e44c8dd52a8618f151b6291d7d7b737cff7b3b1b8bc1
+  crates/kiln/src/agentfiles/builtin.rs blob c76bd702f5fcd3554f9b466dccd895d0f8246734 sha256 967410b85b84cd2a535848d84ee8327cfe8ed42f316f522c71dcca9a16103ca3
+  crates/kiln/src/agentfiles/builtin/antigravity_tests.rs blob 95560060bb7ca3b44445c8e122f31044a1cff8d0 sha256 7031fef567bcca9b54f74beec9cc7874884cd3a4954e309ce166da0594b7dcf8
+cargo 1.98.1 (797e8a9bc 2026-08-05); rustc 1.98.1 (48a229cea 2026-09-01); clippy 0.1.98 (48a229ceae 2026-09-01)
+
+$ cargo test --locked -p kiln --lib agentfiles::builtin
+running 7 tests
+test agentfiles::builtin::antigravity_tests::antigravity_agentfile_passes_shards_own_check ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_is_listed_once_with_its_harness_file ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_files_carry_no_signin ... ok
+test agentfiles::builtin::tests::every_builtin_is_a_valid_agentfile_once ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_agentfile_grants_its_harness_what_it_lists_alone ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_harness_file_runs_agy_in_ask_mode_with_its_home_in_the_volume ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_pin_names_agy_for_both_platforms ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 4383 filtered out; finished in 0.00s
+exit 0
+
+Shards v0.7.0's release binary, shards-linux-amd64, against its SHA256SUMS (https://github.com/hyper-light/shards/releases/download/v0.7.0/SHA256SUMS):
+  shards-linux-amd64: OK
+   Version: 0.7.0; Git commit: 94838b8; Version: 0.7.0; Git commit: 94838b8; Version: 0.7.0; Version: 6.18.48; Version: 0.7.0;
+$ KILN_TEST_SHARDS=<that binary> SHARDS_HOME=<an empty directory> cargo test --locked -p kiln --lib -- antigravity_agentfile_passes_shards_own_check step30_a_real_shards_checks_without_resolving_bases
+running 2 tests
+test agentfiles::builtin::antigravity_tests::antigravity_agentfile_passes_shards_own_check ... ok
+test agentfiles::check::tests::step30_a_real_shards_checks_without_resolving_bases ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4388 filtered out; finished in 0.01s
+exit 0
+
+$ cargo clippy --locked -p kiln --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 46.13s
+exit 0
+
+verdict: tests exit 0, Shards check exit 0, clippy exit 0
