@@ -103,11 +103,15 @@ Studio's run; shards-build.sh ran under its first form, which sent the script al
    The build's warnings are a dependency's (focal-memory's deprecated `fetch_update`) and macOS's
    linker's (`__eh_frame section too large`), none this change's.
 
-   On Linux amd64: queued when this was committed. kiln
-   held it while every Linux runner was under strain (its headroom guard's cordon, which this step
-   waits out rather than sidesteps with an unsized run); its first placement went away before it
-   started ([e_kiln_tests.lost-placement.txt](evidence/e_kiln_tests.lost-placement.txt)). Its result
-   follows in the next commit, as evidence/e_kiln_tests.txt.
+   On Linux amd64: **not run.** kiln's queue held it behind every Linux runner's strain cordon
+   (the headroom guard's, which kiln's own gate yields to as well). Its first placement went away
+   before it started ([e_kiln_tests.lost-placement.txt](evidence/e_kiln_tests.lost-placement.txt)).
+   Asked again for 12 CPUs and 32 GiB, kiln said "expected within 673 min"
+   ([e_kiln_tests.queued-12cpu.txt](evidence/e_kiln_tests.queued-12cpu.txt)); for 6 CPUs and 24 GiB,
+   "expected within 790 min" ([e_kiln_tests.queued-6cpu.txt](evidence/e_kiln_tests.queued-6cpu.txt)).
+   I stopped it rather than hold a Linux queue's place for 11 to 13 hours or sidestep the cordon with
+   an unsized run. Step 6 runs this module's tests and clippy on a Linux runner at the landed
+   revision. The change has no platform-specific path, and checks 2, 3 and 5 ran on Linux.
 
 5. **The server image's context, by Docker** (`scripts/docker-context.sh`,
    [e_docker_context.txt](evidence/e_docker_context.txt)): on adacachy2 (Docker 29.9.3, whose missing
@@ -120,7 +124,7 @@ Studio's run; shards-build.sh ran under its first form, which sent the script al
 
 | Rule | Proof, or the gap |
 |---|---|
-| R01 | The production change is data: two `&'static` fields and one const row, no fallible step. The tests use `?`, `ok_or_else` and asserts; no unwrap, expect or indexing. Clippy on crates/kiln, all targets, warnings denied (kiln's denied lints included): clean on macOS arm64; Linux amd64 queued (check 4). |
+| R01 | The production change is data: two `&'static` fields and one const row, no fallible step. The tests use `?`, `ok_or_else` and asserts; no unwrap, expect or indexing. Clippy on crates/kiln, all targets, warnings denied (kiln's denied lints included): clean on macOS arm64; not run on Linux amd64 (check 4: kiln's queue; step 6 runs it at the landed revision). |
 | R02 | Every line rests on research 01a1ce705e4d70089c04cee721525c8f (f3, f5, f9, f10, f12, f13, f14, f25, f26) and step 19's shared layout. The row's shape was compared with the s22, s23 and s24 branches' (s23 adds a `smoke` field, s22 puts its smoke in pin.json); harness.json's fields and env order were read in Shards' source at ac87190d3, then held to Shards' own reader. |
 | R03 | No numeric literal in production. The version, URLs and digests are pin.sh's output (step 1); the tests' expected lines are the research's (f12, f14) and the plan's; the mutants' values (`--stdio`, `x`) exist only to differ. |
 | R04 | No state machine and no error path added: data only. |
@@ -130,12 +134,12 @@ Studio's run; shards-build.sh ran under its first form, which sent the script al
 | R08 | Not applicable to a data row. Image sizes and build times are step 4's single observations; comparisons are ROOT's. |
 | R09 | f25's break (a row including from `.kiln/` while the build stage copies no `.kiln/`) is guarded: the test fails with the COPY line removed (mutation dockerfile-copy), and Docker shows the line copies the files with kiln's `.dockerignore` (check 5). kiln's whole server image was not built here (heavy: ROOT's, at merge). |
 | R10 | This directory: each script, its output, and the commands. |
-| R11 | kiln's tests and clippy ran on macOS arm64 (a Mac Studio); Linux amd64's run was queued at this commit (check 4). Windows clippy did not run: kiln's full gate waits for the person's word, and the change has no platform code. Devin's linux/arm64 build was checked by Shards' whole check, run on amd64; arm64 images and smokes are step 4's. |
+| R11 | kiln's tests and clippy ran on macOS arm64 (a Mac Studio); not on Linux amd64 (check 4: kiln's queue, 11 to 13 hours; step 6 runs them there at the landed revision). Windows clippy did not run: kiln's full gate waits for the person's word, and the change has no platform code. Devin's linux/arm64 build was checked by Shards' whole check, run on amd64; arm64 images and smokes are step 4's. |
 | R12 | One table (step 30's), the siblings' field shape, the Dockerfile's lines byte-identical to s22's; no second fetcher (the context here was made by hand, with the same size and digest checks). The OSI test mirrors Shards' field names, since kiln doesn't vendor Shards yet (step 16). |
 | R13 | Data plus the tests the plan names; nothing added for a reader that doesn't exist yet (no smoke field). |
 | R14 | None here: profiling and benchmarks are ROOT's. |
 | R15 | Implementer, light tests only; no push; the SHA and counts go to the coordinator. |
-| R16 | `scripts/cleanup.sh` removes my `~/.cache/s25-step3` once a runner's last run is done: on the Mac Studio, 31 GB (30 GB of it kiln's target; [e_cleanup_macos.txt](evidence/e_cleanup_macos.txt)); adacachy2's after its runs. |
+| R16 | `scripts/cleanup.sh` removes my `~/.cache/s25-step3` once a runner's last run is done: on the Mac Studio, 31 GB (30 GB of it kiln's target; [e_cleanup_macos.txt](evidence/e_cleanup_macos.txt)); on adacachy2, 5.0 GB (3.5 GB of it the check-only shards' target; [e_cleanup_adacachy2.txt](evidence/e_cleanup_adacachy2.txt)). |
 
 ## Not done here
 
@@ -145,5 +149,7 @@ Studio's run; shards-build.sh ran under its first form, which sent the script al
 - Building both platforms, the version and ACP smokes, and the image's secrets scan: step 4. The CI leg
   and image()'s fallback: step 5. kiln's docs: step 6.
 - kiln's server image (`docker build` of the Dockerfile): ROOT's, at merge.
+- The agentfiles module's tests and clippy on Linux amd64 (check 4): step 6 runs them at the landed
+  revision.
 - Devin's bundles carry no publisher signature (step 1's record): the pin's SHA-256s and TLS are all
   that hold them.

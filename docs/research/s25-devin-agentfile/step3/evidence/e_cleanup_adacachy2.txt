@@ -1,0 +1,13 @@
+[2m[kiln] on 00aad8daff2fa3c9daa65d53c425d450 · linux/x86_64 · 23 of 32 cores idle · 51 GB free · memory pressure 2% · I/O pressure 4%[0m
+s25-step3: started on adacachy2
+adacachy2: 5.0G at /home/adalundhe/.cache/s25-step3
+20K	/home/adalundhe/.cache/s25-step3/osi
+133M	/home/adalundhe/.cache/s25-step3/dl
+330M	/home/adalundhe/.cache/s25-step3/shards
+386M	/home/adalundhe/.cache/s25-step3/ctx
+653M	/home/adalundhe/.cache/s25-step3/home
+3.5G	/home/adalundhe/.cache/s25-step3/target
+removed
+/dev/nvme0n1p2  1.9T  1.8T   65G  97% /home
+[2m[kiln] used memory not measured, 331 ms of CPU (counted by the system, 0.415 CPUs on average) over 799 ms; OOM kills not seen here[0m
+exit 0 (try 1)
