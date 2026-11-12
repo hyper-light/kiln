@@ -47,7 +47,7 @@ fn replaying_an_older_committed_handoff_cannot_reassign_the_latest_owner() -> an
             let middle=join(&hub,b,"machine-b","instance-b",2).map_err(refusal)?;
             let destination=join(&hub,c,"machine-c","instance-c",3).map_err(refusal)?;
             let original=mail::Publish { owner:"owner".into(),sender:"sender".into(),recipient:session.into(),id:"immutable-original".into(),command:serde_json::json!({"type":"send","id":"immutable-original","text":"exact retained original 日本語"}),provenance:None,status:None };
-            let publication=mail::publish(&hub.store,original.clone(),u64::MAX,1).await?;
+            let publication=mail::publish(&hub.store,original.clone(),u64::MAX).await?;
             let delivery=mail::claim_at(&hub.store,publication.revision,1,1,"fixture-source".into(),super::super::state_view::FRAME).await?.ok_or_else(||anyhow::anyhow!("fixture original was not claimed"))?;
             let first=commit(&hub,manifest("A-B",session,1)?,source.clone(),middle.clone()).await?;
             let latest=commit(&hub,manifest("B-C",session,2)?,middle.clone(),destination.clone()).await?;
