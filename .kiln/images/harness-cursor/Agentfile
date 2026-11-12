@@ -8,8 +8,8 @@
 
 # Cursor's package is a bash launcher and a bundled Node whose binaries link glibc (at most
 # GLIBC_2.28 and GLIBCXX_3.4.22, and libz), and Cursor publishes no musl build: the base needs glibc
-# and bash. This default, step 19's, pinned by digest, has both and runs the package with no RUN;
-# Alpine can't start it.
+# and bash, and the image has no variant. This default, step 19's, pinned by digest, has both and runs
+# the package with no RUN; Alpine can't start it.
 ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
 FROM ${BASE}
 
@@ -28,14 +28,15 @@ NETWORK --dns --egress=443/tcp provider FOR cursor
 EXPOSE --harnesses=cursor 443/tcp AS egress FOR provider
 CONNECT cursor WITH cursor ON provider
 
-# The project, and the person's home. Cursor keeps its config, sessions, MCP servers, rules, plugins
-# and hooks in $HOME/.cursor, and on Linux its sign-in in $HOME/.config/cursor/auth.json. A harness
-# sees the image read-only, with its own /tmp scratch and these volumes alone writable, so the whole
-# home is the person's volume and harness.json sets HOME=/home/cursor: Cursor's own layout lands
-# there, and so does what the programs it runs keep in a home (.gitconfig ...). HOME in run.env needs
-# a shards at or after 997f4e47e (release v0.8.0 and later), where run.env replaces init's
-# HOME=/tmp. harness.json also puts caches that follow XDG's rule on the scratch
-# (XDG_CACHE_HOME=/tmp/.cache), out of the person's volume. Both volumes are the harness's alone,
-# and outside /tmp, which the scratch covers.
+# The project, which moves to its own host path with step 8, and the person's home. Cursor keeps its
+# config, sessions, MCP servers, rules, plugins and hooks in $HOME/.cursor, and on Linux its sign-in
+# in $HOME/.config/cursor. A harness sees the image read-only, with its own /tmp scratch and these
+# volumes alone writable, so a home that is writable and kept from run to run must be a volume: the
+# whole home is the person's volume (step 7's shape) and harness.json sets HOME=/home/cursor.
+# Cursor's own layout lands there, and so does what the programs it runs keep in a home (.gitconfig
+# ...). HOME in run.env needs a shards at or after 997f4e47e (release v0.8.0 and later), where
+# run.env replaces init's HOME=/tmp. harness.json also puts caches that follow XDG's rule on the
+# scratch (XDG_CACHE_HOME=/tmp/.cache), out of the person's volume. Both volumes are the harness's
+# alone, and outside /tmp, which the scratch covers.
 VOLUME --target-kind=harness /workspace FOR cursor
 VOLUME --target-kind=harness /home/cursor FOR cursor
