@@ -1,0 +1,481 @@
+== shards: shards version 0.7.0, build 7ad28fa, sha256 9b460c47ca38dbc5f8c1bde704a3ef5a72692e3788d93d41ef3f52ecf37d89f7
+== kiln: kiln 0.2.0, built from ce63fc099977323d8e27cb7a035234515a3c1c74, sha256 05fbd978febdc50f84fd183c6647b84cdb521e5f4dad518e9cf2885eb6a3edea
+== host: kiln-a094a12d.attlocal.net Linux 6.19.10-300.fc44.x86_64 x86_64; mode all; pin.json sha256 b98f01ae3d9632c51091c885ff874a36ef3ac8866215ae93041f9eae990bd10c
+== context: kiln agentfiles context claude, linux/amd64 and linux/arm64, the Agentfile's own base, gnu
+context: exit 0 in 11384 ms
+recipe 88ab6c68c16a54c7fbdc8b1991e55616eea0f1dfb7270fc5fba7e5de0a4f2ecc
+Agentfile equals the built-in's: True
+linux/amd64 gnu: claude-amd64-gnu/bin/claude sha256 86dc1fcc69498159eaf15f446613e847010f9036bfbbdffd4c49350be8489ada size 293776752 mode 0755; pinned 86dc1fcc69498159eaf15f446613e847010f9036bfbbdffd4c49350be8489ada 293776752 0755: True
+linux/amd64 gnu: harness.json is the built-in's harness.json: True
+linux/amd64 gnu: files ['bin/claude', 'harness.json']
+linux/arm64 gnu: claude-arm64-gnu/bin/claude sha256 2e2496c9a8065df93acb0fca2d341f59a6b8777649b2e025ab8c9bcd5eef61f3 size 293658808 mode 0755; pinned 2e2496c9a8065df93acb0fca2d341f59a6b8777649b2e025ab8c9bcd5eef61f3 293658808 0755: True
+linux/arm64 gnu: harness.json is the built-in's harness.json: True
+linux/arm64 gnu: files ['bin/claude', 'harness.json']
+context entries: ['Agentfile', 'claude-amd64-gnu', 'claude-arm64-gnu']
+CONTEXT_MATCHES_PIN 2 of 2
+== build: one image for linux/amd64 and linux/arm64
+build-real: exit 0 in 28267 ms
+build-real warns SecretsUsedInArgOrEnv: 0
+images-tree: exit 0 in 27 ms
+IMAGE                                                                                               ID             DISK USAGE   CONTENT SIZE   EXTRA
+buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10   4f34e1d673fd        684MB          293MB        
+├─ linux/amd64                                                                                      712f969c9d81        533MB          143MB        
+├─ linux/arm/v5                                                                                     b6f4d55db57d           0B             0B        
+├─ linux/arm/v7                                                                                     00f00a8dd29a           0B             0B        
+├─ linux/arm64/v8                                                                                   4256ac3dbf04        142MB          142MB        
+├─ linux/386                                                                                        7b4073f252f3           0B             0B        
+├─ linux/ppc64le                                                                                    79e8f9212087           0B             0B        
+├─ linux/riscv64                                                                                    f2781902e83f           0B             0B        
+└─ linux/s390x                                                                                      2585d46a7246           0B             0B        
+
+harness-claude:smoke                                                                                16c4cc7e2507        554MB          554MB        
+├─ linux/amd64                                                                                      5de3d8469973        277MB          277MB        
+└─ linux/arm64                                                                                      14780663e059        277MB          277MB        
+
+inspect linux/amd64: linux/amd64 sha256:16c4cc7e2507009a17e01c633b43999542cf2a1805eebe668be9a254778a53af size 276720771
+inspect linux/arm64: linux/arm64 sha256:16c4cc7e2507009a17e01c633b43999542cf2a1805eebe668be9a254778a53af size 277002567
+== the exported image (shards save): its OCI index
+save-real: exit 0 in 751 ms
+index.json: schemaVersion 2, mediaType application/vnd.oci.image.index.v1+json, 1 entries
+  sha256:16c4cc7e2507009a17e01c633b43999542cf2a1805eebe668be9a254778a53af application/vnd.oci.image.index.v1+json size 1609 {'io.containerd.image.name': 'docker.io/library/harness-claude:smoke', 'org.opencontainers.image.ref.name': 'smoke'}
+    sha256:5de3d84699739cac6c4c153b102ec8edc846e57bfa359a23131f4453f1908b6f application/vnd.oci.image.manifest.v1+json linux/amd64 size 1613 (image)
+    sha256:14780663e05998e7430970c9d0a1bca59859590fb21a811c3ecf2ab9380cee94 application/vnd.oci.image.manifest.v1+json linux/arm64 size 1613 (image)
+    sha256:65d57941ba5f59bfced69aa6014aa53c718e00978a14ce02889cc3730522a3d1 application/vnd.oci.image.manifest.v1+json unknown/unknown size 564 (attestation-manifest)
+    sha256:388084ff731f1a2c3cfaabea563a2acea4d10bb70c7213a061cd5bf5dcf4f32c application/vnd.oci.image.manifest.v1+json unknown/unknown size 564 (attestation-manifest)
+OCI_INDEX sha256:16c4cc7e2507009a17e01c633b43999542cf2a1805eebe668be9a254778a53af IMAGE_MANIFESTS linux/amd64,linux/arm64
+ONE_OCI_INDEX_HOLDS_LINUX_AMD64_AND_ARM64 True
+== the smoke: Claude Code's own --version on linux/amd64, the run's command, its stdout held to pin.json's line
+version: exit 0 in 3253 ms
+version STDOUT 2.1.311 (Claude Code)
+version STDOUT_HEX  32 2e 31 2e 33 31 31 20 28 43 6c 61 75 64 65 20 43 6f 64 65 29 0a 
+version EXACT True
+--- version stderr
+Downloading the guest kernel vmlinux-6.18.48-x86_64-17c3ba205400 from https://github.com/hyper-light/shards/releases/download/kernel-6.18.48-17c3ba205400/vmlinux-6.18.48-x86_64
+Guest kernel: sha256:48a3824b7467dee7d82f36401fed99626e91c5dc5fefc432bc354a69ec616aa7
+WARNING: CAP_NET_RAW withheld from the command: the image's Agentfile runs agents and harnesses beside the command, and CAP_NET_RAW reads and writes the packets of their flows past the microVM, which cross the command's network namespace
+SMOKE_SOURCE run-command
+== the real image: its harness started as harness.json declares, HOME a host folder
+run-real: exit 0 in 91 ms
+TIME                            MEMBER           PID  EVENT  WHAT
+2026-11-12T16:30:12.642826301Z  command          919  exec   sleep 120
+2026-11-12T16:30:12.647292615Z  harness claude   924  fork   from 1
+2026-11-12T16:30:12.650186963Z  harness claude   924  exec   shards-server "harness claude" /proc/self/fd/6 200000 3 4 "" [] 7
+2026-11-12T16:30:12.652304311Z  harness claude   930  fork   from 924
+2026-11-12T16:30:12.653260823Z  harness claude   930  exec   shards-server sandbox
+2026-11-12T16:30:12.654480696Z  harness claude   934  fork   from 1
+2026-11-12T16:30:12.654987586Z  harness claude   936  fork   from 934
+2026-11-12T16:30:12.655263684Z  harness claude   934  exec   shards-init managed-reaper
+2026-11-12T16:30:12.676120902Z  harness claude   936  exec   /harness/claude/bin/claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --replay-user-messages --forward-subagent-text --permission-prompt-tool stdio
+2026-11-12T16:30:12.942159086Z  harness claude  1731  fork   from 936
+2026-11-12T16:30:12.942569937Z  harness claude  1731  exec   git -c core.hooksPath=/dev/null -c core.fsmonitor= -C /harness/claude ls-files --error-unmatch -- :(icase).claude/settings.local.json
+2026-11-12T16:30:12.944369224Z  harness claude  1731  exit   code 128
+2026-11-12T16:30:13.098821460Z  harness claude  1743  fork   from 936
+2026-11-12T16:30:13.099173235Z  harness claude  1743  exec   rg --no-config --files --hidden /harness/claude
+2026-11-12T16:30:13.106576413Z  harness claude  1743  exit   code 0
+2026-11-12T16:30:13.161058820Z  harness claude  1758  fork   from 936
+2026-11-12T16:30:13.161650136Z  harness claude  1758  exec   sh -c "uname -s\nuname -r\nuname -m\nfor c in npm yarn pnpm; do command -v \"$c\" >/dev/null 2>&1 && printf \"%s,\" \"$c\"; done; echo\nfor c in bun deno node; do command -v \"$c\" >/dev/null 2>&1 && printf \"%s,\" \"$c\"; done; echo"
+2026-11-12T16:30:13.163084476Z  harness claude  1759  fork   from 1758
+2026-11-12T16:30:13.163495133Z  harness claude  1759  exec   uname -s
+2026-11-12T16:30:13.164072697Z  harness claude  1759  exit   code 0
+2026-11-12T16:30:13.164125886Z  harness claude  1760  fork   from 1758
+2026-11-12T16:30:13.164751808Z  harness claude  1760  exec   uname -r
+2026-11-12T16:30:13.165495833Z  harness claude  1760  exit   code 0
+2026-11-12T16:30:13.165557945Z  harness claude  1761  fork   from 1758
+2026-11-12T16:30:13.165805013Z  harness claude  1761  exec   uname -m
+2026-11-12T16:30:13.166240079Z  harness claude  1761  exit   code 0
+2026-11-12T16:30:13.166634208Z  harness claude  1758  exit   code 0
+2026-11-12T16:30:13.467809928Z  harness claude   936  exit   code 0
+2026-11-12T16:30:13.474083756Z  harness claude   934  exit   code 0
+2026-11-12T16:30:13.474213611Z  harness claude   924  exit   signal 9 (SIGKILL)
+2026-11-12T16:30:13.474272507Z  harness claude   930  exit   signal 9 (SIGKILL)
+harness.json run.command ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--replay-user-messages", "--forward-subagent-text", "--permission-prompt-tool", "stdio"]
+HARNESS_EXEC_WANTED /harness/claude/bin/claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --replay-user-messages --forward-subagent-text --permission-prompt-tool stdio
+HARNESS_EXEC pid 936 at 2026-11-12T16:30:12.676120902Z; its end: code 0
+HARNESS_EXEC_AS_DECLARED True
+--- what Claude Code wrote into its HOME, the host folder bound at /home/claude
+  dir  0755 uid 1000       44 .claude
+  file 0600 uid 1000      852 .claude.json
+  dir  0755 uid 1000       66 .claude/backups
+  dir  0700 uid 1000       10 .claude/plugins
+  dir  0700 uid 1000        0 .claude/sessions
+  file 0600 uid 1000       84 .claude/backups/.claude.json.backup.1794501012883
+  dir  0700 uid 1000       90 .claude/plugins/store
+  file 0600 uid 1000       92 .claude/plugins/store/cc-plugin-agents-md_builtin-b049b47b3618.json
+== this host's own reach, outside any microVM, for the probe's port 80 to be told against
+host: https://api.anthropic.com/ http_code=404 remote=2607:6bc0::10:443
+host: http://api.anthropic.com/ http_code=400 remote=2607:6bc0::10:80
+== probe: the real Agentfile, a test-only harness.json (sh -c probe.sh, the real run.env)
+probe run.env is the real one: True ['HOME=/home/claude', 'DISABLE_UPDATES=1', 'CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=1']
+build-probe: exit 0 in 11281 ms
+run-probe: exit 0 in 1244 ms
+processes-probe: exit 0 in 19 ms
+2026-11-12T16:30:30.369808138Z  harness claude   937  exec   shards-server "harness claude" /proc/self/fd/6 200000 3 4 "" [] 7
+2026-11-12T16:30:30.372037877Z  harness claude   942  exec   shards-server sandbox
+2026-11-12T16:30:30.372944560Z  harness claude   946  exec   shards-init managed-reaper
+2026-11-12T16:30:30.446825846Z  harness claude   948  exec   /usr/bin/sh -c "# Step 5's probe (plan 01a1cf48e8157494ac9a51f7a564f526): this text is a test-only harness.json's run.command,\n# `sh -c` i
+2026-11-12T16:30:30.499697854Z  harness claude  1723  exec   claude --version
+2026-11-12T16:30:30.530871675Z  harness claude  1723  exit   code 0
+2026-11-12T16:30:30.533260392Z  harness claude  1725  exec   id -u
+2026-11-12T16:30:30.536748222Z  harness claude  1725  exit   code 0
+2026-11-12T16:30:30.537150939Z  harness claude  1726  exec   id
+2026-11-12T16:30:30.538989918Z  harness claude  1726  exit   code 0
+2026-11-12T16:30:30.540010954Z  harness claude  1729  exec   sort
+2026-11-12T16:30:30.540049179Z  harness claude  1728  exec   grep -E ^(HOME|PATH|USER|LOGNAME|DISABLE_UPDATES|CLAUDE_[A-Z_]+|USE_BUILTIN_RIPGREP|SHARDS_DOMAIN)=
+2026-11-12T16:30:30.541446593Z  harness claude  1727  exec   env
+2026-11-12T16:30:30.542197585Z  harness claude  1727  exit   code 0
+2026-11-12T16:30:30.542320904Z  harness claude  1728  exit   code 0
+2026-11-12T16:30:30.542754853Z  harness claude  1729  exit   code 0
+2026-11-12T16:30:30.543243243Z  harness claude  1730  exec   getent ahosts api.anthropic.com
+2026-11-12T16:30:30.550129107Z  harness claude  1730  exit   code 0
+2026-11-12T16:30:30.552072770Z  harness claude  1731  exec   touch /home/claude/x
+2026-11-12T16:30:30.553447133Z  harness claude  1731  exit   code 0
+2026-11-12T16:30:30.557072276Z  harness claude  1732  exec   git config --global user.name kiln-probe
+2026-11-12T16:30:30.561848018Z  harness claude  1732  exit   code 0
+2026-11-12T16:30:30.562385110Z  harness claude  1733  exec   git config --global --get user.name
+2026-11-12T16:30:30.564150582Z  harness claude  1733  exit   code 0
+2026-11-12T16:30:30.564788420Z  harness claude  1734  exec   claude mcp add --scope user kiln-probe -- true
+2026-11-12T16:30:31.170371693Z  harness claude  1734  exit   code 0
+2026-11-12T16:30:31.173914265Z  harness claude  1744  exec   ls -la /home/claude
+2026-11-12T16:30:31.177137746Z  harness claude  1744  exit   code 0
+2026-11-12T16:30:31.177506759Z  harness claude  1745  exec   find /tmp -maxdepth 4 ( -name x -o -name .gitconfig -o -name .claude.json -o -name .claude ) -print
+2026-11-12T16:30:31.178480692Z  harness claude  1745  exit   code 0
+2026-11-12T16:30:31.178989362Z  harness claude  1746  exec   ls -la /tmp
+2026-11-12T16:30:31.180101583Z  harness claude  1746  exit   code 0
+2026-11-12T16:30:31.180499332Z  harness claude  1747  exec   curl -sS -o /dev/null -w "http_code=%{http_code} remote=%{remote_ip}:%{remote_port}\\n" --connect-timeout 15 --max-time 30 https://api.anth
+2026-11-12T16:30:31.241091455Z  harness claude  1747  exit   code 0
+2026-11-12T16:30:31.241710584Z  harness claude  1749  exec   timeout 15 bash -c "exec 3<>/dev/tcp/api.anthropic.com/80"
+2026-11-12T16:30:31.242439523Z  harness claude  1750  exec   bash -c "exec 3<>/dev/tcp/api.anthropic.com/80"
+2026-11-12T16:30:46.242767531Z  harness claude  1750  exit   signal 15 (SIGTERM)
+2026-11-12T16:30:46.243189886Z  harness claude  1749  exit   code 124
+2026-11-12T16:30:46.243834767Z  harness claude  1754  exec   timeout 15 bash -c "exec 3<>/dev/tcp/1.1.1.1/80"
+2026-11-12T16:30:46.244905927Z  harness claude  1755  exec   bash -c "exec 3<>/dev/tcp/1.1.1.1/80"
+2026-11-12T16:31:01.245347291Z  harness claude  1755  exit   signal 15 (SIGTERM)
+2026-11-12T16:31:01.245724658Z  harness claude  1754  exit   code 124
+2026-11-12T16:31:01.246500028Z  harness claude  1759  exec   curl -sS -o /dev/null -w "http_code=%{http_code}\\n" --connect-timeout 15 --max-time 20 http://api.anthropic.com/
+2026-11-12T16:31:16.264446699Z  harness claude  1759  exit   code 28
+2026-11-12T16:31:16.266227417Z  harness claude   948  exit   code 0
+2026-11-12T16:31:16.266456825Z  harness claude   946  exit   code 0
+2026-11-12T16:31:16.266650959Z  harness claude   937  exit   signal 9 (SIGKILL)
+2026-11-12T16:31:16.266699340Z  harness claude   942  exit   signal 9 (SIGKILL)
+== probe: probe.txt, in PROJECT
+== claude --version
+2.1.311 (Claude Code)
+exit 0
+== id -u
+200000
+== id
+uid=200000 gid=200000 groups=200000
+== HOME
+HOME=/home/claude
+== env: the names harness.json's run.env and init give
+CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=1
+DISABLE_UPDATES=1
+HOME=/home/claude
+PATH=/harness/claude:/harness/claude/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+SHARDS_DOMAIN=harness claude
+== name lookup: getent ahosts api.anthropic.com
+160.79.104.10   STREAM api.anthropic.com
+160.79.104.10   DGRAM  
+160.79.104.10   RAW    
+2607:6bc0::10   STREAM 
+2607:6bc0::10   DGRAM  
+2607:6bc0::10   RAW    
+exit 0
+== touch "$HOME/x"
+exit 0
+== git config --global user.name kiln-probe
+exit 0
+== git config --global --get user.name
+kiln-probe
+exit 0
+== claude mcp add --scope user kiln-probe -- true
+Added stdio MCP server kiln-probe with command: true  to user config
+File modified: /home/claude/.claude.json
+exit 0
+== ls -la $HOME
+total 8
+drwxr-xr-x 1 200000 200000  60 Nov 12 16:30 .
+drwxr-xr-x 1 root   root    60 Nov 12 16:30 ..
+drwxr-xr-x 1 200000 200000  14 Nov 12 16:30 .claude
+-rw------- 1 200000 200000 554 Nov 12 16:30 .claude.json
+-rw-r--r-- 1 200000 200000  26 Nov 12 16:30 .gitconfig
+-rw-r--r-- 1 200000 200000   0 Nov 12 16:30 x
+== find /tmp for x, .gitconfig, .claude.json and .claude
+exit 0
+== ls -la /tmp
+total 0
+drwxr-x--- 2 200000 200000  40 Nov 12 16:30 .
+drwxr-xr-x 1 root   root   120 Nov 12 16:30 ..
+== HTTPS by name: curl https://api.anthropic.com/
+http_code=404 remote=160.79.104.10:443
+exit 0
+== TCP port 80 by name: api.anthropic.com:80
+port 80 closed (exit 124)
+== TCP port 80 by address: 1.1.1.1:80
+port 80 closed (exit 124)
+== HTTP on port 80: curl http://api.anthropic.com/
+curl: (28) Connection timed out after 15001 milliseconds
+http_code=000
+exit 28
+== end
+== probe: HOMEDIR, on the host
+  dir  0755 uid 1000       14 .claude
+  file 0600 uid 1000      554 .claude.json
+  file 0644 uid 1000       26 .gitconfig
+  file 0644 uid 1000        0 x
+  dir  0755 uid 1000       66 .claude/backups
+  file 0600 uid 1000       84 .claude/backups/.claude.json.backup.1794501030967
+--- .gitconfig
+[user]
+	name = kiln-probe
+--- .claude.json: its keys ['firstStartTime', 'firstStartVersion', 'hasResetAutoModeOptInForDefaultOffer', 'machineID', 'mcpServers', 'migrationVersion', 'opusProMigrationComplete', 'seenNotifications', 'sonnet1m45MigrationComplete', 'userID']
+--- .claude.json mcpServers.kiln-probe: {"type": "stdio", "command": "true", "args": [], "env": {}}
+HOMEDIR_HOLDS x=True gitconfig_names_kiln_probe=True claude_json_holds_kiln_probe=True
+== control: the probe without the Agentfile's three network lines
+lines taken out: 3
+30,32d29
+< NETWORK --dns --egress=443/tcp provider FOR claude
+< EXPOSE --harnesses=claude 443/tcp AS egress FOR provider
+< CONNECT claude WITH claude ON provider
+build-control: exit 0 in 2456 ms
+run-control: exit 0 in 885 ms
+processes-control: exit 0 in 15 ms
+2026-11-12T16:31:20.034798916Z  harness claude  924  exec   shards-server "harness claude" /proc/self/fd/6 200000 3 4 "" [] 7
+2026-11-12T16:31:20.039089255Z  harness claude  929  exec   shards-server sandbox
+2026-11-12T16:31:20.039858781Z  harness claude  933  exec   shards-init managed-reaper
+2026-11-12T16:31:20.041079599Z  harness claude  934  exec   /usr/bin/sh -c "# Step 5's probe (plan 01a1cf48e8157494ac9a51f7a564f526): this text is a test-only harness.json's run.command,\n# `sh -c` it
+2026-11-12T16:31:20.042980871Z  harness claude  935  exec   claude --version
+2026-11-12T16:31:20.063895496Z  harness claude  935  exit   code 0
+2026-11-12T16:31:20.064662696Z  harness claude  939  exec   id -u
+2026-11-12T16:31:20.066259032Z  harness claude  939  exit   code 0
+2026-11-12T16:31:20.066748276Z  harness claude  940  exec   id
+2026-11-12T16:31:20.067934801Z  harness claude  940  exit   code 0
+2026-11-12T16:31:20.068963677Z  harness claude  943  exec   sort
+2026-11-12T16:31:20.068977561Z  harness claude  941  exec   env
+2026-11-12T16:31:20.069006517Z  harness claude  942  exec   grep -E ^(HOME|PATH|USER|LOGNAME|DISABLE_UPDATES|CLAUDE_[A-Z_]+|USE_BUILTIN_RIPGREP|SHARDS_DOMAIN)=
+2026-11-12T16:31:20.069794356Z  harness claude  941  exit   code 0
+2026-11-12T16:31:20.069866441Z  harness claude  942  exit   code 0
+2026-11-12T16:31:20.070068461Z  harness claude  943  exit   code 0
+2026-11-12T16:31:20.070523868Z  harness claude  944  exec   getent ahosts api.anthropic.com
+2026-11-12T16:31:20.071242928Z  harness claude  944  exit   code 2
+2026-11-12T16:31:20.071867279Z  harness claude  945  exec   touch /home/claude/x
+2026-11-12T16:31:20.073371396Z  harness claude  945  exit   code 0
+2026-11-12T16:31:20.074096797Z  harness claude  946  exec   git config --global user.name kiln-probe
+2026-11-12T16:31:20.078137750Z  harness claude  946  exit   code 0
+2026-11-12T16:31:20.078763788Z  harness claude  947  exec   git config --global --get user.name
+2026-11-12T16:31:20.081429070Z  harness claude  947  exit   code 0
+2026-11-12T16:31:20.081967747Z  harness claude  948  exec   claude mcp add --scope user kiln-probe -- true
+2026-11-12T16:31:20.403284995Z  harness claude  948  exit   code 0
+2026-11-12T16:31:20.408926080Z  harness claude  968  exec   ls -la /home/claude
+2026-11-12T16:31:20.410779353Z  harness claude  968  exit   code 0
+2026-11-12T16:31:20.411024088Z  harness claude  969  exec   find /tmp -maxdepth 4 ( -name x -o -name .gitconfig -o -name .claude.json -o -name .claude ) -print
+2026-11-12T16:31:20.411929567Z  harness claude  969  exit   code 0
+2026-11-12T16:31:20.412339568Z  harness claude  970  exec   ls -la /tmp
+2026-11-12T16:31:20.414053824Z  harness claude  970  exit   code 0
+2026-11-12T16:31:20.414453599Z  harness claude  971  exec   curl -sS -o /dev/null -w "http_code=%{http_code} remote=%{remote_ip}:%{remote_port}\\n" --connect-timeout 15 --max-time 30 https://api.anthr
+2026-11-12T16:31:20.429891446Z  harness claude  971  exit   code 6
+2026-11-12T16:31:20.430480964Z  harness claude  973  exec   timeout 15 bash -c "exec 3<>/dev/tcp/api.anthropic.com/80"
+2026-11-12T16:31:20.431536289Z  harness claude  974  exec   bash -c "exec 3<>/dev/tcp/api.anthropic.com/80"
+2026-11-12T16:31:20.433318137Z  harness claude  974  exit   code 1
+2026-11-12T16:31:20.433520363Z  harness claude  973  exit   code 1
+2026-11-12T16:31:20.433980857Z  harness claude  975  exec   timeout 15 bash -c "exec 3<>/dev/tcp/1.1.1.1/80"
+2026-11-12T16:31:20.435067758Z  harness claude  976  exec   bash -c "exec 3<>/dev/tcp/1.1.1.1/80"
+2026-11-12T16:31:20.437236564Z  harness claude  976  exit   code 1
+2026-11-12T16:31:20.437540877Z  harness claude  975  exit   code 1
+2026-11-12T16:31:20.438029760Z  harness claude  978  exec   curl -sS -o /dev/null -w "http_code=%{http_code}\\n" --connect-timeout 15 --max-time 20 http://api.anthropic.com/
+2026-11-12T16:31:20.453972852Z  harness claude  978  exit   code 6
+2026-11-12T16:31:20.455691912Z  harness claude  934  exit   code 0
+2026-11-12T16:31:20.455876498Z  harness claude  933  exit   code 0
+2026-11-12T16:31:20.455984311Z  harness claude  924  exit   signal 9 (SIGKILL)
+2026-11-12T16:31:20.456093189Z  harness claude  929  exit   signal 9 (SIGKILL)
+== control: probe.txt, in PROJECT
+== claude --version
+2.1.311 (Claude Code)
+exit 0
+== id -u
+200000
+== id
+uid=200000 gid=200000 groups=200000
+== HOME
+HOME=/home/claude
+== env: the names harness.json's run.env and init give
+CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=1
+DISABLE_UPDATES=1
+HOME=/home/claude
+PATH=/harness/claude:/harness/claude/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+SHARDS_DOMAIN=harness claude
+== name lookup: getent ahosts api.anthropic.com
+exit 2
+== touch "$HOME/x"
+exit 0
+== git config --global user.name kiln-probe
+exit 0
+== git config --global --get user.name
+kiln-probe
+exit 0
+== claude mcp add --scope user kiln-probe -- true
+Added stdio MCP server kiln-probe with command: true  to user config
+File modified: /home/claude/.claude.json
+exit 0
+== ls -la $HOME
+total 8
+drwxr-xr-x 1 200000 200000  60 Nov 12 16:31 .
+drwxr-xr-x 1 root   root    60 Nov 12 16:31 ..
+drwxr-xr-x 1 200000 200000  32 Nov 12 16:31 .claude
+-rw------- 1 200000 200000 554 Nov 12 16:31 .claude.json
+-rw-r--r-- 1 200000 200000  26 Nov 12 16:31 .gitconfig
+-rw-r--r-- 1 200000 200000   0 Nov 12 16:31 x
+== find /tmp for x, .gitconfig, .claude.json and .claude
+exit 0
+== ls -la /tmp
+total 0
+drwxr-x--- 2 200000 200000  40 Nov 12 16:31 .
+drwxr-xr-x 1 root   root   120 Nov 12 16:31 ..
+== HTTPS by name: curl https://api.anthropic.com/
+curl: (6) Could not resolve host: api.anthropic.com
+http_code=000 remote=:-1
+exit 6
+== TCP port 80 by name: api.anthropic.com:80
+bash: line 1: api.anthropic.com: Temporary failure in name resolution
+bash: line 1: /dev/tcp/api.anthropic.com/80: Invalid argument
+port 80 closed (exit 1)
+== TCP port 80 by address: 1.1.1.1:80
+bash: connect: Permission denied
+bash: line 1: /dev/tcp/1.1.1.1/80: Permission denied
+port 80 closed (exit 1)
+== HTTP on port 80: curl http://api.anthropic.com/
+curl: (6) Could not resolve host: api.anthropic.com
+http_code=000
+exit 6
+== end
+== control: HOMEDIR, on the host
+  dir  0755 uid 1000       32 .claude
+  file 0600 uid 1000      554 .claude.json
+  file 0644 uid 1000       26 .gitconfig
+  file 0644 uid 1000        0 x
+  dir  0755 uid 1000       66 .claude/backups
+  dir  0755 uid 1000      190 .claude/telemetry
+  file 0600 uid 1000       84 .claude/backups/.claude.json.backup.1794501080322
+  file 0644 uid 1000    10941 .claude/telemetry/1p_failed_events.ac5d02c7-c3b6-4781-8399-80f0c87d107d.810fe93c-01b9-45ae-b197-686f49cb1605.json
+--- .gitconfig
+[user]
+	name = kiln-probe
+--- .claude.json: its keys ['firstStartTime', 'firstStartVersion', 'hasResetAutoModeOptInForDefaultOffer', 'machineID', 'mcpServers', 'migrationVersion', 'opusProMigrationComplete', 'seenNotifications', 'sonnet1m45MigrationComplete', 'userID']
+--- .claude.json mcpServers.kiln-probe: {"type": "stdio", "command": "true", "args": [], "env": {}}
+HOMEDIR_HOLDS x=True gitconfig_names_kiln_probe=True claude_json_holds_kiln_probe=True
+== other bases: Alpine with CLAUDE_LIBC=musl, alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+context-musl: exit 0 in 6152 ms
+recipe 12128ac8210e5bc28986e2e1c2b2e681e7e69fa90c43677cc120674c9080707c
+Agentfile equals the built-in's: True
+linux/amd64 musl: claude-amd64-musl/bin/claude sha256 cd40dd327145ee47aa0deacd571801c1d782388f709d71242eee6b91de8ed11f size 287442392 mode 0755; pinned cd40dd327145ee47aa0deacd571801c1d782388f709d71242eee6b91de8ed11f 287442392 0755: True
+linux/amd64 musl: harness.json is the built-in's harness.musl.json: True
+linux/amd64 musl: files ['bin/claude', 'harness.json']
+context entries: ['Agentfile', 'claude-amd64-musl']
+CONTEXT_MATCHES_PIN 1 of 1
+build-alpine-musl: exit 0 in 14270 ms
+#5 [base-musl 2/2] RUN apk add --no-cache libgcc libstdc++ ripgrep
+#5 2.313 OK: 14.7 MiB in 20 packages
+alpine-musl: exit 0 in 1067 ms
+alpine-musl STDOUT 2.1.311 (Claude Code)
+alpine-musl STDOUT_HEX  32 2e 31 2e 33 31 31 20 28 43 6c 61 75 64 65 20 43 6f 64 65 29 0a 
+alpine-musl EXACT True
+--- alpine-musl stderr
+WARNING: CAP_NET_RAW withheld from the command: the image's Agentfile runs agents and harnesses beside the command, and CAP_NET_RAW reads and writes the packets of their flows past the microVM, which cross the command's network namespace
+== other bases: debian:trixie-slim with gnu, debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+build-slim-gnu: exit 0 in 4221 ms
+slim-gnu: exit 0 in 1027 ms
+slim-gnu STDOUT 2.1.311 (Claude Code)
+slim-gnu STDOUT_HEX  32 2e 31 2e 33 31 31 20 28 43 6c 61 75 64 65 20 43 6f 64 65 29 0a 
+slim-gnu EXACT True
+--- slim-gnu stderr
+WARNING: CAP_NET_RAW withheld from the command: the image's Agentfile runs agents and harnesses beside the command, and CAP_NET_RAW reads and writes the packets of their flows past the microVM, which cross the command's network namespace
+== other bases: Alpine with gnu, which must fail to start: the glibc build's loader isn't there
+build-alpine-gnu: exit 0 in 1342 ms
+alpine-gnu: exit 127 in 1149 ms
+alpine-gnu STDOUT 
+alpine-gnu STDOUT_HEX 
+alpine-gnu EXACT False
+--- alpine-gnu stderr
+WARNING: CAP_NET_RAW withheld from the command: the image's Agentfile runs agents and harnesses beside the command, and CAP_NET_RAW reads and writes the packets of their flows past the microVM, which cross the command's network namespace
+shards: exec /harness/claude/bin/claude: no such file or directory
+Run 'shards run --help' for more information
+the glibc build's loader (its PT_INTERP): /lib64/ld-linux-x86-64.so.2
+alpine-gnu-loader: exit 125 in 104 ms
+WARNING: CAP_NET_RAW withheld from the command: the image's Agentfile runs agents and harnesses beside the command, and CAP_NET_RAW reads and writes the packets of their flows past the microVM, which cross the command's network namespace
+shards: harness claude: its launch: Exec: errno 2
+
+Run 'shards run --help' for more information
+the musl build's loader (its PT_INTERP): /lib/ld-musl-x86_64.so.1
+alpine-musl-loader: exit 0 in 113 ms
+WARNING: CAP_NET_RAW withheld from the command: the image's Agentfile runs agents and harnesses beside the command, and CAP_NET_RAW reads and writes the packets of their flows past the microVM, which cross the command's network namespace
+-rwxr-xr-x    1 root     root        670312 Oct 21 15:50 /lib/ld-musl-x86_64.so.1
+== Alpine with gnu: the harness as harness.json starts it
+run-alpine-gnu: exit 125 in 92 ms
+WARNING: CAP_NET_RAW withheld from the command: the image's Agentfile runs agents and harnesses beside the command, and CAP_NET_RAW reads and writes the packets of their flows past the microVM, which cross the command's network namespace
+9d36c276716a5aac71ab4d718b94fbe50da7dbce50c88564405adc94f0962caf
+shards: harness claude: its launch: Exec: errno 2
+
+Run 'shards run --help' for more information
+processes-alpine-gnu: exit 0 in 12 ms
+TIME  MEMBER  PID  EVENT  WHAT
+== credentials: every file of every layer of the exported image, and each config, held to step 2's patterns
+linux/amd64 (image) manifest sha256:5de3d84699739cac6c4c153b102ec8edc846e57bfa359a23131f4453f1908b6f in sha256:16c4cc7e2507009a17e01c633b43999542cf2a1805eebe668be9a254778a53af
+  config sha256:5ae24184e8a5bbdce48103aa436c6831945c7a8833d4bc99d8af5271ac375825 Env ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin']
+  layer sha256:a6dd1c05fbba4f9028078a11f143cbb625d2408921eb8207bfa1dd1ad301276f application/vnd.oci.image.layer.v1.tar+gzip: 4407 files, 120146899 bytes
+  layer sha256:e8a88afca2bd37d4058d4b33d9d4d29b0557f8b811bb8c106942b5b51e1e4aad application/vnd.oci.image.layer.v1.tar+gzip: 1293 files, 60170781 bytes
+  layer sha256:411d2dc8717dbb4bb0d3cfa27e6e0275fca455c5220029d7a14dc7a75fbe8665 application/vnd.oci.image.layer.v1.tar+gzip: 5794 files, 184972792 bytes
+  layer sha256:96934abf630d9195b840c9e70c56dfce88705b0541babd3577024751010c0777 application/vnd.oci.image.layer.v1.tar+gzip: 2 files, 293777264 bytes
+  layer sha256:95ad7bea98a4521e2a5fb0c6bd5566481d2e818ecc059e3392721de0eba2a6db application/vnd.oci.image.layer.v1.tar+gzip: 1 files, 462 bytes
+  layer sha256:d7731d1263d3e2cf16d422a6ec55c49e52a4b2be2127703e6c27460d19e63e00 application/vnd.oci.image.layer.v1.tar+gzip: 1 files, 973 bytes
+linux/arm64 (image) manifest sha256:14780663e05998e7430970c9d0a1bca59859590fb21a811c3ecf2ab9380cee94 in sha256:16c4cc7e2507009a17e01c633b43999542cf2a1805eebe668be9a254778a53af
+  config sha256:e56949801d0e03a07e89820f440e12b2c865f76f22ed988460779edea140fe90 Env ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin']
+  layer sha256:23b69c48ce5c2a6fb0681d959fa700427ad2a7cf7e6be5d25249170a1853d7ad application/vnd.oci.image.layer.v1.tar+gzip: 4407 files, 141967145 bytes
+  layer sha256:ec7287c5b5ce209cf618681832ded105b3182c871815ac857aeb105737563f59 application/vnd.oci.image.layer.v1.tar+gzip: 1293 files, 58870425 bytes
+  layer sha256:6439840073969a08a9c305e28768838fcea379036919203ccf9f9fc966cc9658 application/vnd.oci.image.layer.v1.tar+gzip: 5801 files, 191043874 bytes
+  layer sha256:89f7854b7055803aeae0ec1a5edc36de0e7a6b062a10691a864df4bfe34a3e02 application/vnd.oci.image.layer.v1.tar+gzip: 2 files, 293659320 bytes
+  layer sha256:3e82c94ecf6dd4f71f5288c78297d74e9e86a131f544848ada85336194a2f4fe application/vnd.oci.image.layer.v1.tar+gzip: 1 files, 973 bytes
+unknown/unknown (attestation-manifest) manifest sha256:65d57941ba5f59bfced69aa6014aa53c718e00978a14ce02889cc3730522a3d1 in sha256:16c4cc7e2507009a17e01c633b43999542cf2a1805eebe668be9a254778a53af
+  config sha256:0c487044cef631a31a038b361f9183188a8a2c36ba26a112bbd8e6dff5b84cbe Env []
+  blob sha256:92873d225d8bf2d6eecbd13a1fe9d87a8ad11be0bee6fcfc08981caeb8312313 application/vnd.in-toto+json 1052 bytes, names [], key-shaped 0
+unknown/unknown (attestation-manifest) manifest sha256:388084ff731f1a2c3cfaabea563a2acea4d10bb70c7213a061cd5bf5dcf4f32c in sha256:16c4cc7e2507009a17e01c633b43999542cf2a1805eebe668be9a254778a53af
+  config sha256:7a5177c83a6703b39831dfee10434c12e4561cabdccb81932ac4b4cfe835f751 Env []
+  blob sha256:37fc7abde68cc2e1262fe3dec849fd0e9b0a33537caaf4e36b82998c8cd14088 application/vnd.in-toto+json 1052 bytes, names [], key-shaped 0
+pinned binary /harness/claude/bin/claude (2e2496c9a806), sha256 equal to pin.json's: names ['.credentials.json', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'apiKeyHelper', 'sk-ant-'], no key-shaped value
+pinned binary /harness/claude/bin/claude (86dc1fcc6949), sha256 equal to pin.json's: names ['.credentials.json', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'apiKeyHelper', 'sk-ant-'], no key-shaped value
+scanned 11 layers, 2 other blobs, 23002 files, 1344613012 bytes
+SCAN clean (0 findings)
+SCAN_RESULT harness-claude:smoke clean
+== the mutation: a copy of the Agentfile given ENV ANTHROPIC_API_KEY
+build-secret: exit 0 in 1727 ms
+build-secret warns SecretsUsedInArgOrEnv: 1
+[0m - SecretsUsedInArgOrEnv: Do not use ARG or ENV instructions for sensitive data (ENV "ANTHROPIC_API_KEY") (line 40)
+save-secret: exit 0 in 592 ms
+linux/amd64 (image) manifest sha256:a539df5626ac416725b47c2b7c19cf4676e81dbf1cf582e66b07f73a54eefe68 in sha256:4e65cddc4adf0213de1152c2e8822ab24d7bbbfb74c7603722349feb4cb4cba1
+  config sha256:bf8b5c87284f64bab1592af67b1e122eaba36ca4085001421c5d12aa0b8e66ac Env ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'ANTHROPIC_API_KEY=<21 characters>']
+  layer sha256:a6dd1c05fbba4f9028078a11f143cbb625d2408921eb8207bfa1dd1ad301276f application/vnd.oci.image.layer.v1.tar+gzip: 4407 files, 120146899 bytes
+  layer sha256:e8a88afca2bd37d4058d4b33d9d4d29b0557f8b811bb8c106942b5b51e1e4aad application/vnd.oci.image.layer.v1.tar+gzip: 1293 files, 60170781 bytes
+  layer sha256:411d2dc8717dbb4bb0d3cfa27e6e0275fca455c5220029d7a14dc7a75fbe8665 application/vnd.oci.image.layer.v1.tar+gzip: 5794 files, 184972792 bytes
+  layer sha256:96934abf630d9195b840c9e70c56dfce88705b0541babd3577024751010c0777 application/vnd.oci.image.layer.v1.tar+gzip: 2 files, 293777264 bytes
+  layer sha256:95ad7bea98a4521e2a5fb0c6bd5566481d2e818ecc059e3392721de0eba2a6db application/vnd.oci.image.layer.v1.tar+gzip: 1 files, 462 bytes
+  layer sha256:d7731d1263d3e2cf16d422a6ec55c49e52a4b2be2127703e6c27460d19e63e00 application/vnd.oci.image.layer.v1.tar+gzip: 1 files, 973 bytes
+unknown/unknown (attestation-manifest) manifest sha256:4c213130f85fadcedbb10a7539a24747213cdf23382dba606b807336818a3e8c in sha256:4e65cddc4adf0213de1152c2e8822ab24d7bbbfb74c7603722349feb4cb4cba1
+  config sha256:6a76e8681cb9efb7af7584bf2bc1421d5d527b5b97d0f6840e75050d1f26f0e0 Env []
+  blob sha256:b7c3c9ce92025bd641dd1828bb674ff8295bdd6afd395e33bb5d85fccc0c5b6f application/vnd.in-toto+json 1053 bytes, names [], key-shaped 0
+pinned binary /harness/claude/bin/claude (86dc1fcc6949), sha256 equal to pin.json's: names ['.credentials.json', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'apiKeyHelper', 'sk-ant-'], no key-shaped value
+scanned 6 layers, 1 other blobs, 11498 files, 659070224 bytes
+FOUND linux/amd64 config Env names ANTHROPIC_API_KEY
+FOUND linux/amd64 config holds ANTHROPIC_API_KEY
+SCAN FOUND (2 findings)
+SCAN_RESULT harness-claude:secret FOUND
+== sizes and times (single observations)
+561M	/home/adalundhe/.cache/s19-step5/run-20261112T162926Z/ctx
+harness-claude:alpine-gnu 24595dd27f41 440MB
+harness-claude:slim-gnu 70d6be168070 544MB
+harness-claude:alpine-musl 8c0f612d0463 441MB
+harness-claude:control 746ce7cbda6c 1.35GB
+harness-claude:probe 079ef8771c14 962MB
+harness-claude:smoke 16c4cc7e2507 1.24GB
+harness-claude:secret 4e65cddc4adf 961MB
+-rw-------. 1 adalundhe adalundhe 553751552 Nov 12 08:30 /home/adalundhe/.cache/s19-step5/run-20261112T162926Z/real.tar
+-rw-------. 1 adalundhe adalundhe 276738560 Nov 12 08:32 /home/adalundhe/.cache/s19-step5/run-20261112T162926Z/secret.tar
+== done /home/adalundhe/.cache/s19-step5/run-20261112T162926Z
