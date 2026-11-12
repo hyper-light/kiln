@@ -1,0 +1,2 @@
+GHSEQ 2026-11-12T08:41:18Z: 16 sequential calls, as pin.sh makes them
+SEQUENTIAL: 0 of 16 failed; seconds per call: 11 9 9 10 9 8 9 8 8 8 6 7 7 7 6 10

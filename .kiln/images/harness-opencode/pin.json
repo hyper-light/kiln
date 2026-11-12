@@ -1,0 +1,159 @@
+{
+  "harness": "opencode",
+  "version": "2.2.7",
+  "read": {
+    "from": "https://opencode.ai/update/api/latest/cli/npm",
+    "at": "2026-11-12T08:24:11Z",
+    "answer": {
+      "channel": "latest",
+      "name": "cli",
+      "distribution": "npm",
+      "version": "2.2.7",
+      "metadata": {
+        "package": "@opencode/cli",
+        "github": {
+          "sha": "5f76acb12572932297cbce81bd0026e59b16e7ac",
+          "run_id": "42778325289",
+          "run_attempt": "1",
+          "actor": "Hona",
+          "ref": "refs/heads/dev"
+        }
+      },
+      "active": true,
+      "minimum": false,
+      "time_created": 1794306910466,
+      "time_updated": 1794306910466
+    }
+  },
+  "tag": {
+    "name": "v2.2.7",
+    "commit": "fedc6f208aa2bd54c1019227214568083f6380ad"
+  },
+  "verified": {
+    "sha256sums": {
+      "url": "https://github.com/anomalyco/opencode/releases/download/v2.2.7/SHA256SUMS",
+      "sha256": "72c73a07124c65662239facaa7da2f3fe474078bbd4cbfa68bf90ae8fdca3b8b"
+    },
+    "github_digest": true,
+    "provenance": {
+      "repo": "anomalyco/opencode",
+      "signer_workflow": "anomalyco/opencode/.github/workflows/release.yml",
+      "san": "https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev",
+      "source_commit": "5f76acb12572932297cbce81bd0026e59b16e7ac",
+      "source_ref": "refs/heads/dev",
+      "run": "https://github.com/anomalyco/opencode/actions/runs/42778325289/attempts/1",
+      "predicate": "https://slsa.dev/provenance/v1"
+    },
+    "x64_is_baseline": {
+      "gnu": true,
+      "musl": true
+    }
+  },
+  "base": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+  "builds": [
+    {
+      "platform": "linux/amd64",
+      "variant": "gnu",
+      "files": [
+        {
+          "url": "https://github.com/anomalyco/opencode/releases/download/v2.2.7/opencode-linux-x64-baseline.tar.gz",
+          "sha256": "89a6cee227b54bc011179c528a5e63176032462b1a5e21723b616801cddc2ca7",
+          "size": 121783361,
+          "path": "bin/opencode",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "opencode",
+            "sha256": "589253d36810f21217edd51545cd435b328cdc3cf4f451fbe0cce6f88afcf5e1",
+            "size": 258848944
+          }
+        },
+        {
+          "url": "https://raw.githubusercontent.com/anomalyco/opencode/fedc6f208aa2bd54c1019227214568083f6380ad/LICENSE",
+          "sha256": "625f0f619133f89bbbb2abe37369613dfa1885eba1e50d02170deb62bb42cb6b",
+          "size": 1065,
+          "path": "LICENSE",
+          "mode": "0644"
+        }
+      ]
+    },
+    {
+      "platform": "linux/amd64",
+      "variant": "musl",
+      "files": [
+        {
+          "url": "https://github.com/anomalyco/opencode/releases/download/v2.2.7/opencode-linux-x64-baseline-musl.tar.gz",
+          "sha256": "c1801a36bf61e03eafac8d7f4521a200e4d3cd76cf43b36621cb78b460b851ee",
+          "size": 121562329,
+          "path": "bin/opencode",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "opencode",
+            "sha256": "aeae3102ab6360a0ac3ea56537a643cd02727f766a1da30cb770240f7bf1cf02",
+            "size": 261027240
+          }
+        },
+        {
+          "url": "https://raw.githubusercontent.com/anomalyco/opencode/fedc6f208aa2bd54c1019227214568083f6380ad/LICENSE",
+          "sha256": "625f0f619133f89bbbb2abe37369613dfa1885eba1e50d02170deb62bb42cb6b",
+          "size": 1065,
+          "path": "LICENSE",
+          "mode": "0644"
+        }
+      ]
+    },
+    {
+      "platform": "linux/arm64",
+      "variant": "gnu",
+      "files": [
+        {
+          "url": "https://github.com/anomalyco/opencode/releases/download/v2.2.7/opencode-linux-arm64.tar.gz",
+          "sha256": "c1682057f0815cb2abdd6e00305f1146ebaf1c167f0335cdb74ddc80008120e7",
+          "size": 120326654,
+          "path": "bin/opencode",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "opencode",
+            "sha256": "c577783eacf7d1e66661fc7fd904b7646761497b687ff8f8f82ebe4f2f3ea425",
+            "size": 253873144
+          }
+        },
+        {
+          "url": "https://raw.githubusercontent.com/anomalyco/opencode/fedc6f208aa2bd54c1019227214568083f6380ad/LICENSE",
+          "sha256": "625f0f619133f89bbbb2abe37369613dfa1885eba1e50d02170deb62bb42cb6b",
+          "size": 1065,
+          "path": "LICENSE",
+          "mode": "0644"
+        }
+      ]
+    },
+    {
+      "platform": "linux/arm64",
+      "variant": "musl",
+      "files": [
+        {
+          "url": "https://github.com/anomalyco/opencode/releases/download/v2.2.7/opencode-linux-arm64-musl.tar.gz",
+          "sha256": "a03405f94ae02db7acb0870cf32030bab86460dc7faf524780e9cae305526b96",
+          "size": 119600531,
+          "path": "bin/opencode",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "opencode",
+            "sha256": "b4203e9861d0472e711493a34e8d843fb249cf9bf499b69cfdc64416085d87c6",
+            "size": 253697128
+          }
+        },
+        {
+          "url": "https://raw.githubusercontent.com/anomalyco/opencode/fedc6f208aa2bd54c1019227214568083f6380ad/LICENSE",
+          "sha256": "625f0f619133f89bbbb2abe37369613dfa1885eba1e50d02170deb62bb42cb6b",
+          "size": 1065,
+          "path": "LICENSE",
+          "mode": "0644"
+        }
+      ]
+    }
+  ]
+}

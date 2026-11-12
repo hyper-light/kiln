@@ -1,0 +1,90 @@
+M4 run 2026-11-12T07:27:37Z host adacachy2 Linux 7.3.3-1-cachyos x86_64 | CachyOS | ldd (GNU libc) 2.44
+ARCHIVE opencode-linux-x64.tar.gz sha256=89a6cee227b54bc011179c528a5e63176032462b1a5e21723b616801cddc2ca7
+BINARY sha256=589253d36810f21217edd51545cd435b328cdc3cf4f451fbe0cce6f88afcf5e1
+--- version, no network (new netns, lo down)
+opencode v2.2.7
+VERSION_EXIT 0
+--- files after --version
+  /home/adalundhe/.cache/s22-opencode-research/vol/.cache
+  /home/adalundhe/.cache/s22-opencode-research/vol/.cache/opencode
+  /home/adalundhe/.cache/s22-opencode-research/vol/.cache/opencode/bin
+  /home/adalundhe/.cache/s22-opencode-research/vol/.config
+  /home/adalundhe/.cache/s22-opencode-research/vol/.config/opencode
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/log
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/log/opencode.log
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/repos
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/state
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/state/opencode
+--- debug paths, no network
+home       /home/adalundhe/.cache/s22-opencode-research/scratch
+data       /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode
+cache      /home/adalundhe/.cache/s22-opencode-research/vol/.cache/opencode
+config     /home/adalundhe/.cache/s22-opencode-research/vol/.config/opencode
+state      /home/adalundhe/.cache/s22-opencode-research/vol/.local/state/opencode
+tmp        /tmp/opencode
+bin        /home/adalundhe/.cache/s22-opencode-research/vol/.cache/opencode/bin
+log        /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/log
+repos      /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/repos
+db         /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/opencode.db
+PATHS_EXIT 0
+--- acp, only loopback up (as a Shards domain: its own loopback, brought up)
+INIT_MS 188
+INIT {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "mcpCapabilities": {"http": true, "sse": false}, "promptCapabilities": {"embeddedContext": true, "image": true}, "sessionCapabilities": {"additionalDirectories": {}, "close": {}, "delete": {}, "fork": {}, "list": {}, "resume": {}}, "_meta": {"opencode/child-session-updates": true}}, "authMethods": [{"description": "Run `opencode auth login` in the terminal", "name": "Login with opencode", "id": "opencode-login"}], "_meta": {"steering": {"supported": true}}, "agentInfo": {"name": "OpenCode", "version": "2.2.7"}}}
+CHILDREN 1573855 /home/adalundhe/.cache/s22-opencode-research/dl/gnu/opencode serve --stdio --port 0
+LISTEN LISTEN 0      512    127.0.0.1:43715 0.0.0.0:* users:(("opencode",pid=1573855,fd=8))
+SESSION_MS 452
+SESSION {"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "ses_e31584951ffeJbuWDoGohPBxFO", "configOptions": [{"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "opencode/big-pickle", "options": [{"value": "opencode/beam-free", "name": "opencode/Beam Free"}, {"value": "opencode/big-pickle", "name": "opencode/Big Pickle"}, {"value": "opencode/deepseek-v4.1-flash-free", "name": "opencode/DeepSeek V4.1 Flash Free"}, {"value": "opencode/flint-40b-free", "name": "opencode/Flint 40B Free"}, {"value": "opencode/glm-5.3-flash-free", "name": "opencode/GLM-5.3-Flash Free"}, {"value": "opencode/iceman-free", "name": "opencode/Iceman Free"}, {"value": "opencode/inkling-2-small-free", "name": "opencode/Inkling 2 Small Free"}, {"value": "opencode/longcat-2.5-free", "name": "opencode/LongCat 2.5 Free"}, {"value": "opencode/mimo-v2.6-flash-free", "name": "opencode/MiMo-V2.
+ESTAB 0      0      127.0.0.1:43715 127.0.0.1:48378 users:(("opencode",pid=1573855,fd=20)) | 0      0      127.0.0.1:48360 127.0.0.1:43715 users:(("opencode",pid=1573750,fd=13)) | 0      0      127.0.0.1:48374 127.0.0.1:43715 users:(("opencode",pid=1573750,fd=14)) | 0      495    127.0.0.1:48378 127.0.0.1:43715 users:(("opencode",pid=1573750,fd=15)) | 0      0      127.0.0.1:48386 127.0.0.1:43715 users:(("opencode",pid=1573750,fd=16)) | 0      0      127.0.0.1:48388 127.0.0.1:43715 users:(("opencode",pid=1573750,fd=17)) | 0      0      127.0.0.1:48400 127.0.0.1:43715 users:(("opencode",pid=1573750,fd=18)) | 0      0      127.0.0.1:43715 127.0.0.1:48360 users:(("opencode",pid=1573855,fd=12)) | 0      894    127.0.0.1:43715 127.0.0.1:48374 users:(("opencode",pid=1573855,fd=13)) | 0      0      127.0.0.1:43715 127.0.0.1:48400 users:(("opencode",pid=1573855,fd=23)) | 0      1291   127.0.0.1:43715 
+EXIT 0
+STDERR 
+--- acp, loopback down
+INIT_MS 183
+INIT {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "mcpCapabilities": {"http": true, "sse": false}, "promptCapabilities": {"embeddedContext": true, "image": true}, "sessionCapabilities": {"additionalDirectories": {}, "close": {}, "delete": {}, "fork": {}, "list": {}, "resume": {}}, "_meta": {"opencode/child-session-updates": true}}, "authMethods": [{"description": "Run `opencode auth login` in the terminal", "name": "Login with opencode", "id": "opencode-login"}], "_meta": {"steering": {"supported": true}}, "agentInfo": {"name": "OpenCode", "version": "2.2.7"}}}
+CHILDREN 1574646 /home/adalundhe/.cache/s22-opencode-research/dl/gnu/opencode serve --stdio --port 0
+LISTEN LISTEN 0      512    127.0.0.1:45307 0.0.0.0:* users:(("opencode",pid=1574646,fd=8))
+SESSION_MS 195
+SESSION {"jsonrpc": "2.0", "id": 2, "error": {"code": -32603, "message": "Internal error: OpenCode server is unavailable", "data": {"errorName": "ServerUnavailable"}}}
+ESTAB 
+EXIT 0
+STDERR 
+--- acp, the host's network
+INIT_MS 177
+INIT {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "mcpCapabilities": {"http": true, "sse": false}, "promptCapabilities": {"embeddedContext": true, "image": true}, "sessionCapabilities": {"additionalDirectories": {}, "close": {}, "delete": {}, "fork": {}, "list": {}, "resume": {}}, "_meta": {"opencode/child-session-updates": true}}, "authMethods": [{"description": "Run `opencode auth login` in the terminal", "name": "Login with opencode", "id": "opencode-login"}], "_meta": {"steering": {"supported": true}}, "agentInfo": {"name": "OpenCode", "version": "2.2.7"}}}
+CHILDREN 1574971 /home/adalundhe/.cache/s22-opencode-research/dl/gnu/opencode serve --stdio --port 0
+LISTEN LISTEN 0      4096      127.0.0.54:53    0.0.0.0:* | LISTEN 0      4096   127.0.0.53%lo:53    0.0.0.0:* | LISTEN 0      128        127.0.0.1:4317  0.0.0.0:* users:(("kiln",pid=1243,fd=29)) | LISTEN 0      128        127.0.0.1:4318  0.0.0.0:* users:(("kiln",pid=1243,fd=28)) | LISTEN 0      4096         0.0.0.0:5355  0.0.0.0:* | LISTEN 0      128        127.0.0.1:8126  0.0.0.0:* users:(("kiln",pid=1243,fd=30)) | LISTEN 0      512        127.0.0.1:46497 0.0.0.0:* users:(("opencode",pid=1574971,fd=8)) | LISTEN 0      4096       127.0.0.1:42261 0.0.0.0:* | LISTEN 0      4096            [::]:5355   
+SESSION_MS 422
+SESSION {"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "ses_e315846b0ffexcYZxc5Rzi7ha4", "configOptions": [{"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "opencode/big-pickle", "options": [{"value": "opencode/beam-free", "name": "opencode/Beam Free"}, {"value": "opencode/big-pickle", "name": "opencode/Big Pickle"}, {"value": "opencode/deepseek-v4.1-flash-free", "name": "opencode/DeepSeek V4.1 Flash Free"}, {"value": "opencode/flint-40b-free", "name": "opencode/Flint 40B Free"}, {"value": "opencode/glm-5.3-flash-free", "name": "opencode/GLM-5.3-Flash Free"}, {"value": "opencode/iceman-free", "name": "opencode/Iceman Free"}, {"value": "opencode/inkling-2-small-free", "name": "opencode/Inkling 2 Small Free"}, {"value": "opencode/longcat-2.5-free", "name": "opencode/LongCat 2.5 Free"}, {"value": "opencode/mimo-v2.6-flash-free", "name": "opencode/MiMo-V2.
+ESTAB 0      0         127.0.0.1:46497    127.0.0.1:55730 users:(("opencode",pid=1574971,fd=12)) | 0      894       127.0.0.1:46497    127.0.0.1:55740 users:(("opencode",pid=1574971,fd=13)) | 0      0      192.168.1.91:51772 104.18.10.66:443   users:(("opencode",pid=1574971,fd=21)) | 0      0         127.0.0.1:46497    127.0.0.1:55782 users:(("opencode",pid=1574971,fd=24)) | 0      0         127.0.0.1:55730    127.0.0.1:46497 users:(("opencode",pid=1574866,fd=13)) | 0      0         127.0.0.1:55740    127.0.0.1:46497 users:(("opencode",pid=1574866,fd=14)) | 0      495       127.0.0.1:55750    127.0.0.1:46497 users:(("opencode",pid=1574866,fd=15)) | 0      0         127.0.0.1:55756    127.0.0.1:46497 users:(("opencode",pid=1574866,fd=16)) | 0      0         127.0.0.1:55766    127.0.0.1:46497 users:(("opencode",pid=1574866,fd=17)) | 0      0         127.0.0.1:55782    127.0.0.1:46497 users:(("op
+EXIT 0
+STDERR 
+--- files after acp
+  /home/adalundhe/.cache/s22-opencode-research/vol/.cache
+  /home/adalundhe/.cache/s22-opencode-research/vol/.cache/opencode
+  /home/adalundhe/.cache/s22-opencode-research/vol/.cache/opencode/bin
+  /home/adalundhe/.cache/s22-opencode-research/vol/.config
+  /home/adalundhe/.cache/s22-opencode-research/vol/.config/opencode
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/log
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/log/opencode.log
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/opencode.db
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/opencode.db-shm
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/opencode.db-wal
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/repos
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/shell
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/share/opencode/shell/a9041095bb6f1827e0042b3280471b8ee29cea07
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/state
+  /home/adalundhe/.cache/s22-opencode-research/vol/.local/state/opencode
+--- sizes
+0	/home/adalundhe/.cache/s22-opencode-research/vol/.config
+676	/home/adalundhe/.cache/s22-opencode-research/vol/.local/share
+0	/home/adalundhe/.cache/s22-opencode-research/vol/.local/state
+0	/home/adalundhe/.cache/s22-opencode-research/vol/.cache
+0	/home/adalundhe/.cache/s22-opencode-research/scratch
+--- log lines naming the network
+[2m2026-11-12T07:28:02.355679Z[0m [31mERROR[0m refused: 00aad8daff2fa3c9daa65d53c425d450 sent no receipt of it
+exit=1
