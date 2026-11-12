@@ -1,7 +1,10 @@
-import type { SessionStore } from "@/api/harness";
+import type { OlderPage, SessionStore } from "@/api/harness";
 import { survivingPosition, type RowPosition } from "./row-window";
 
 type RestoreStore = Pick<SessionStore, "get" | "event" | "loadOlder" | "cancelOlder">;
+/** A place restored reads the most the server gives at once (api.rs `conversation_events_for`), so one far back is a read
+ * or two rather than one per hundred events (plan 01a1cc09, step 3). */
+const RESTORE_PAGE: OlderPage = { limit: 1000, bytes: 1024 * 1024 };
 export type RestoreResult = { type: "found"; position: RowPosition } | { type: "cancelled" } | { type: "error"; message: string };
 
 /** Let the store publish its RAF-batched canonical page before inspecting the next one. */
@@ -36,7 +39,7 @@ export async function restoreCanonicalPlace(store: RestoreStore, position: RowPo
     if (history.before === null) return { type: "error", message: "Earlier history has no usable cursor. Retry restoring your place." };
     const before = history.before;
     const owned = !history.loading;
-    const request = store.loadOlder();
+    const request = store.loadOlder(RESTORE_PAGE);
     const cancel = () => {
       if (owned) store.cancelOlder(request);
     };
