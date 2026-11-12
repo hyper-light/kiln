@@ -4,7 +4,7 @@ use std::net::TcpListener;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::agentfiles::builtin::{ALL, Smoke};
+use crate::agentfiles::builtin::ALL;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -12,7 +12,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// A built-in for a test, of harness `claude`, with `pin` and `files`.
 fn test_builtin(pin: String, files: &'static [(&'static str, &'static str)]) -> Builtin {
-    Builtin { name: "harness-t", harness: "claude", text: "FROM scratch\n", pin: pin.leak(), files, smoke: Smoke { args: &["--version"], stdout: "{version}\n" } }
+    Builtin { name: "harness-t", harness: "claude", text: "FROM scratch\n", pin: pin.leak(), files }
 }
 
 fn pin_of(builds: Value) -> String {

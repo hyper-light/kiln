@@ -1,0 +1,106 @@
+# Step 2's re-pin (plan 01a1ce705e3d72af83ef15ae83b62f45), after 6fa954363 landed Goose's row first with a smoke field on Builtin that no other harness step has: opencode's, amp's and Antigravity's branches give Builtin {name, harness, text, pin, files}, and gemini's and opencode's pins carry their smoke inside pin.json as {program, args, [env], stdout} (step 20, Codex, follows them). Builtin goes back to their fields, and pin.sh now writes Goose's smoke into pin.json in that shape; this is pin.sh's run for stable with that change.
+# How: docs/research/s23-goose-agentfile/step2b-pin-run.sh > step2b-pin.sh (it carries this tree's pin.sh and pin_test.sh and main's pin.json; regenerated afterwards, it matched the script run byte for byte), then
+#   kiln run --no-sync --needs linux/amd64 --on kiln-a094a12d.attlocal.net --timeout 2400 -- "$(cat step2b-pin.sh)"
+# Result: the same release (v1.59.0, which stable still serves), archives, members, attested commit and base as main's pin (REST_AS_MAIN=true); read_at and the smoke are all that changed. The pin.json committed is the one between the markers below (sha256 abcf53e7d94f5dad92ac0083bc60f856e53be55ddba11788e949cc4183caecd1, checked after copying).
+# stdout:
+# step 2 re-pin, 2026-11-12T14:20:22Z, host kiln-a094a12d.attlocal.net Linux 6.19.10-300.fc44.x86_64 x86_64, gh version 2.97.0 (2026-07-31), jq-1.8.1, tar (GNU tar) 1.35, GNU bash, version 5.3.9(1)-release (x86_64-redhat-linux-gnu)
+# scripts as run: pin.sh sha256 b3fd83e48ad28b6952c3f9051c95b5e46acaf8e90a0730d388a1d50949437765, pin_test.sh sha256 1e2a5c3eddc241a2508624a69610f620644e75abcb1a06a6d3b189dfcdd84187; main's pin.json sha256 bd714e640907bdb9518de37f2d0a598a31743f3c7bc7fe2315ce8751796e9b18
+===== pin.sh stable
+PIN_EXIT=0
+===== pin_test.sh
+PASS real archive: size and SHA-256 as GitHub records
+PASS real archive: attested at refs/tags/v1.59.0, commit 5d03ef6ed07ba59826328f1aff18d9a754ff8ad2
+PASS real archive: one regular member, ./goose
+PASS attestation for another tag: pin.sh: refused: goose-x86_64-unknown-linux-musl.tar.gz: its attestation doesn't verify for aaif-goose/goose/.github/workflows/release.yml at refs/tags/v0.0.0
+PASS a byte changed: pin.sh: refused: flipped.tar.gz: SHA-256 fcba0c94b0eb1a2a18a3def7b8701806c5f22fa27e199014ff2824e7352be593, GitHub records 6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31
+PASS a second member: pin.sh: refused: two.tar.gz: expected one regular file, ./goose; found 2 (./extra)
+PASS a symlink named goose: pin.sh: refused: link.tar.gz: ./goose is no regular file or folder (type l)
+PASS a release missing aarch64: pin.sh: refused: the release has no single goose-aarch64-unknown-linux-musl.tar.gz
+PASS a release missing aarch64: no pin written
+PASS a download with a byte changed: pin.sh: refused: goose-x86_64-unknown-linux-musl.tar.gz: SHA-256 ae095ba3d959217dd82167f765c3be4a09e68adbe44953da52c9396f004a6494, GitHub records 6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31
+PASS a download with a byte changed: no pin written
+pin_test: all passed
+PIN_TEST_EXIT=0
+===== independent check: each pinned URL fetched again, archive and extracted goose hashed against pin.json
+CHECK linux/amd64 archive sha256=6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31 size=50181341 member sha256=461ea83fc8736fa0ad608661a8e5ef8c704da886d38500441ba2b91f7184d9f5 size=154218008 matches_pin=true
+CHECK linux/arm64 archive sha256=63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7 size=48814292 member sha256=c27e6ea558a39a9af96dcc04368296ca636e40a67c96cdac56a6f644488fb673 size=148726128 matches_pin=true
+BUILDS_MATCHING_PIN=2
+===== the smoke it wrote, and what differs from main's pin besides it and read_at
+{"program":"bin/goose","args":["--version"],"stdout":" 1.59.0"}
+SMOKE_AS_PLANNED=true
+REST_AS_MAIN=true
+===== pin.json sha256 abcf53e7d94f5dad92ac0083bc60f856e53be55ddba11788e949cc4183caecd1
+=====PIN_JSON_BEGIN
+{
+  "version": "1.59.0",
+  "channel": "stable",
+  "read_at": "2026-11-12T14:20:26Z",
+  "verified": {
+    "method": "github-attestation",
+    "repo": "aaif-goose/goose",
+    "signer_workflow": "aaif-goose/goose/.github/workflows/release.yml",
+    "source_ref": "refs/tags/v1.59.0",
+    "commit": "5d03ef6ed07ba59826328f1aff18d9a754ff8ad2",
+    "predicate": "https://slsa.dev/provenance/v1"
+  },
+  "base": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+  "smoke": {
+    "program": "bin/goose",
+    "args": [
+      "--version"
+    ],
+    "stdout": " 1.59.0"
+  },
+  "builds": [
+    {
+      "platform": "linux/amd64",
+      "files": [
+        {
+          "url": "https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-x86_64-unknown-linux-musl.tar.gz",
+          "sha256": "6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31",
+          "size": 50181341,
+          "path": "bin/goose",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "goose",
+            "sha256": "461ea83fc8736fa0ad608661a8e5ef8c704da886d38500441ba2b91f7184d9f5",
+            "size": 154218008
+          }
+        }
+      ]
+    },
+    {
+      "platform": "linux/arm64",
+      "files": [
+        {
+          "url": "https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-aarch64-unknown-linux-musl.tar.gz",
+          "sha256": "63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7",
+          "size": 48814292,
+          "path": "bin/goose",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "goose",
+            "sha256": "c27e6ea558a39a9af96dcc04368296ca636e40a67c96cdac56a6f644488fb673",
+            "size": 148726128
+          }
+        }
+      ]
+    }
+  ]
+}
+=====PIN_JSON_END
+KILN_RUN_EXIT=0
+# stderr (pin.sh's log, and kiln's lines about the runner):
+[kiln] on 8fadc1ec213332e16cb0d915a3fb913f · linux/x86_64 · 5 of 32 cores idle · 51 GB free · memory pressure 9%
+pin.sh: stable is v1.59.0 (read 2026-11-12T14:20:26Z)
+pin.sh: goose-x86_64-unknown-linux-musl.tar.gz: 50181341 bytes, SHA-256 6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31, as GitHub records
+pin.sh: goose-x86_64-unknown-linux-musl.tar.gz: attested by aaif-goose/goose/.github/workflows/release.yml at refs/tags/v1.59.0, commit 5d03ef6ed07ba59826328f1aff18d9a754ff8ad2
+pin.sh: goose-x86_64-unknown-linux-musl.tar.gz: ./goose is 154218008 bytes, SHA-256 461ea83fc8736fa0ad608661a8e5ef8c704da886d38500441ba2b91f7184d9f5
+pin.sh: goose-aarch64-unknown-linux-musl.tar.gz: 48814292 bytes, SHA-256 63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7, as GitHub records
+pin.sh: goose-aarch64-unknown-linux-musl.tar.gz: attested by aaif-goose/goose/.github/workflows/release.yml at refs/tags/v1.59.0, commit 5d03ef6ed07ba59826328f1aff18d9a754ff8ad2
+pin.sh: goose-aarch64-unknown-linux-musl.tar.gz: ./goose is 148726128 bytes, SHA-256 c27e6ea558a39a9af96dcc04368296ca636e40a67c96cdac56a6f644488fb673
+pin.sh: base buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+pin.sh: wrote /home/adalundhe/.cache/s23-step2b.IyevXA/.kiln/images/harness-goose/pin.json
+[kiln] used memory not measured, 14 s of CPU (counted by the system, 0.242 CPUs on average) over 59 s; OOM kills not seen here

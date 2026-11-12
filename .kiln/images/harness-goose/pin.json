@@ -1,7 +1,7 @@
 {
   "version": "1.59.0",
   "channel": "stable",
-  "read_at": "2026-11-12T08:26:54Z",
+  "read_at": "2026-11-12T14:20:26Z",
   "verified": {
     "method": "github-attestation",
     "repo": "aaif-goose/goose",
@@ -11,6 +11,13 @@
     "predicate": "https://slsa.dev/provenance/v1"
   },
   "base": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+  "smoke": {
+    "program": "bin/goose",
+    "args": [
+      "--version"
+    ],
+    "stdout": " 1.59.0"
+  },
   "builds": [
     {
       "platform": "linux/amd64",
