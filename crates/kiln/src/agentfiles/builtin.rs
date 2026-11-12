@@ -88,6 +88,16 @@ pub const ALL: &[Builtin] = &[
         pin: include_str!("../../../../.kiln/images/harness-codex/pin.json"),
         files: &[("harness.json", include_str!("../../../../.kiln/images/harness-codex/harness.json"))],
     },
+    // pi, its own Bun build for glibc unpacked whole as its tarball holds it, with the ripgrep and fd
+    // its tools would otherwise download, in RPC mode as kiln's Pi kind starts it (kiln plan
+    // 01a1cd8e862e7169a074db3d5fa33f3d, step 28).
+    Builtin {
+        name: "harness-pi",
+        harness: "pi",
+        text: include_str!("../../../../.kiln/images/harness-pi/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-pi/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-pi/harness.json"))],
+    },
     // OpenCode 2, its own Linux build for each platform and libc, over ACP as kiln's opencode kind
     // starts it, `opencode acp` (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 22). Its musl build
     // (OPENCODE_LIBC=musl, on a musl base) also takes the base's libstdc++ and ripgrep.
@@ -135,6 +145,9 @@ mod cursor_tests;
 
 #[cfg(test)]
 mod codex_tests;
+
+#[cfg(test)]
+mod pi_tests;
 
 #[cfg(test)]
 mod opencode_tests;
