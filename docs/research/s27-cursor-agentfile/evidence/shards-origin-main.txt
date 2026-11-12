@@ -1,0 +1,42 @@
+# 2026-11-12T07:47:28Z Shards origin/main 08cf6ec5d72a6d48a9c36232f27f801932907140
+## git show origin/main:crates/init/src/domains.rs | sed -n 489,498p
+    // The inherited PATH also lets an explicit launcher such as nohup find its child.
+    let path = format!("{dir}:{dir}/bin:{PATH}");
+    let mut env = vec![
+        cstr(&format!("PATH={path}"))?,
+        cstr("HOME=/tmp")?,
+        cstr(&format!("SHARDS_DOMAIN={label}"))?,
+    ];
+    for e in run.get("env").and_then(Value::strings).unwrap_or_default() {
+        env.push(cstr(&e)?);
+    }
+## git show origin/main:docs/research/measurements/harness-bringup-v1/README.md | sed -n 224,225p
+| A run's environment (`shards run -e`) | Reaches the run's command only. A harness's environment is `PATH` (its directory and `bin` first), `HOME=/tmp`, `SHARDS_DOMAIN`, and its image's OSI `run.env` (`crates/init/src/domains.rs:490-498`) | `a_runs_environment_reaches_no_harness`: `-e CODEX_API_KEY=… -e OPENAI_API_KEY=…` and Codex still sends no key (`401 … Missing bearer or basic authentication in header`) | would be delegation; not available |
+| A host directory given at run time to a volume declared for the harness alone (`VOLUME --target-kind=harness DIR FOR <harness>` in the Agentfile, `shards run -v HOSTDIR:DIR[:ro]`), the harness pointed at it by a path in its image (a `--settings` option, or `run.env` in harness.json's full OSI form) | **Works.** The share is the harness's alone (D109: no other member mounts it; the run's own root does not), its host-made files shown owned by the harness's uid, the host's modes kept (`domains.rs:1472-1489`) | Codex: `CODEX_HOME=/run/codex-home` (full-form `run.env`) over `-v HOSTDIR:/run/codex-home`, its own `auth.json` (`{"auth_mode": "apikey", "OPENAI_API_KEY": …}`, as `codex login --with-api-key` writes it) mode 0600 in a 0700 directory: OpenAI answers `401 Unauthorized: Incorrect API key provided: sk-shard*******************-key … auth error code: invalid_api_key`. Claude Code: `--settings /run/claude-auth/settings.json` (`{"apiKeyHelper": "cat /run/claude-auth/api-key"}`) over `-v HOSTDIR:/run/claude-auth:ro`, both files 0600 in a 0700 directory: `apiKeySource: "apiKeyHelper"`, every request `error_status: 401`, `Invalid API key · Fix external API key`. Probe: the harness is `uid=200000 gid=200000`, the directory `drwx------ 200000 200000`, the file `-rw------- 200000 200000`, read | **native delegation**: the harness, its tools and its children can read the key; Codex writes its token refreshes back there (the share must be writable for a ChatGPT sign-in, and for Codex's own state) |
+## git show origin/main:docs/examples/harness-claude/Agentfile | grep -E '^(NETWORK|EXPOSE|CONNECT)'
+NETWORK --dns --egress=443/tcp provider FOR claude
+EXPOSE --harnesses=claude 443/tcp AS egress FOR provider
+CONNECT claude WITH claude ON provider
+## git show origin/main:docs/design/architecture.md | sed -n 4482,4503p
+### Supplied agent and harness startup (D54, continued)
+
+A supplied directory or archive may hold its command in the root `agent.json` or
+`harness.json`, with the user-approved fields `entrypoint` (a command string) and
+`options` (an optional array of literal arguments). The same applies after a Git or
+HTTP source is fetched. A nonempty entrypoint is split into quoted/escaped words, with
+no implicit shell or variable, glob or command substitution; options follow as separate
+arguments, including whitespace and empty strings exactly as given. An explicit `nohup`
+is left as an ordinary program. No `ENTRYPOINT` or `CMD` scoping syntax is added to an
+Agentfile, and startup does not install a program through `RUN` or `VOLUME`.
+
+`startup::config` normalizes the simple descriptor to the existing OSI config, using the
+Agentfile's declared name; `shards build agent` and `shards build harness` use the
+explicit `-t` repository's basename instead, never a filesystem name. With no explicit
+name a simple descriptor is refused, while legacy OSI input keeps its own name. The
+full OSI descriptor remains readable with its schema,
+path and platform checks. `DomainConfig` is a graph operation over the unpacked source,
+so native builds and the BuildKit frontend run the same regular-file check and parser
+before copying `osi.json` beside the domain. Symlinks and non-regular descriptors are
+refused. A missing descriptor retains passive layout compatibility. The existing domain
+content checks still refuse escaping links, special files and set-ID bits.
+

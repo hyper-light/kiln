@@ -1,0 +1,21 @@
+{
+  "task": "kiln plan 01a1ce705e5c7504b88732f443d99288 (parent 01a1cd8e862e7169a074db3d5fa33f3d, step 27): planning the Cursor CLI Agentfile embedded in kiln",
+  "role": "coordinator (planning: research and plan records, this untracked evidence; no source edits)",
+  "at": "2026-11-12T07:40Z",
+  "shards": {
+    "revision": "origin/main c4ae59ee094dcdf99e5dcd47ed46952d53e4f1e6",
+    "docs/development-rules.md": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+    "AGENTS.md": "f66d304c033ad4001d3d7347b67faa3bb3137d637860793e8e74f1eb6266db41",
+    "docs/development-evidence.md": "61613a244106d95b2759b38c8b6660ff29a616983e7afd6e9faabdc38368fb63"
+  },
+  "kiln": {
+    "revision": "origin/main efb40ea0f4b28ef1f05f4d7e7f47af28e353e166",
+    "AGENTS.md": "16b05ef80db024a7b54b0e703d42c8cf5c1f330a626d6bd85ae4525609447a4c",
+    "CLAUDE.md": "@AGENTS.md"
+  },
+  "owned_paths": [
+    "~/Projects/kiln/.claude/worktrees/s27-cursor-agentfile (branch s27-cursor-agentfile from kiln origin/main efb40ea0f)",
+    "docs/research/s27-cursor-agentfile/ in it (untracked planning evidence)"
+  ],
+  "continues": "the first step-27 agent's transcript 01a1cdf3-88fa-726c-9e03-404f920f7f87 (stopped by ROOT while fetching Cursor's packages)"
+}
