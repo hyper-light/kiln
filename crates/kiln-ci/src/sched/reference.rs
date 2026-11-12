@@ -452,7 +452,6 @@ fn signature(l: &LegIn) -> String {
     labels.join(",")
 }
 
-/// Whether a runner carries every label a leg asks for.
 /// The load balancer's rank of runner `r` with legs `on` on it (docs/lb.md "The CI engine"): the
 /// whole CPUs free for an ordinary leg there, as the engine tells the kernel them. Slots mode: its
 /// free slots' share of the CPUs no exclusive leg holds (its slots as CPUs where its size isn't
@@ -485,6 +484,7 @@ fn rank_of(cfg: &Config, r: &RunnerIn, on: &[&LegIn]) -> u64 {
     room / 1000
 }
 
+/// Whether a runner carries every label a leg asks for.
 fn carries(r: &RunnerIn, l: &LegIn) -> bool {
     l.route.labels.iter().all(|x| r.view.labels.iter().any(|y| y.eq_ignore_ascii_case(x)))
 }
@@ -1325,8 +1325,8 @@ impl Reference {
     /// Where a whole gang would start now, if it can: each member, in queue order, on a runner
     /// that would take it with room for it beside the members put there before it, as the room
     /// kept there lets it, in the load balancer's rank (the most whole CPUs free, counting those
-    /// members), then by name; where a member has no such runner, the members before it put elsewhere, in that
-    /// order, trying at most 4,096 places in all.
+    /// members), then by name; where a member has no such runner, the members before it put
+    /// elsewhere, in that order, trying at most 4,096 places in all.
     fn gang_plan(&self, g: &str) -> Option<Vec<(String, String)>> {
         self.plan_gang(g, true)
     }

@@ -1658,6 +1658,9 @@ pub struct Scheduler {
     fleet_gen: u64,
     /// The runners whose room changed since the load balancer was last told it.
     dirty: BTreeSet<String>,
+    /// Paces said of runners not yet up ([`Input::RunnerPace`]): each runner's own when it comes
+    /// (one is said again only when it changes).
+    paces: BTreeMap<String, Pace>,
 }
 
 /// Room kept for a class's first item that fits no runner now (W05-R39), or for each member of
@@ -1908,14 +1911,17 @@ impl Scheduler {
                 self.sampled(&runner, sample, now);
                 self.try_runner(&runner, now, &mut out);
             }
-            Input::RunnerPace { runner, pace } => {
-                if let Some(r) = self.runners.get_mut(&runner)
-                    && r.pace != pace
-                {
-                    r.pace = pace;
-                    self.touch(&runner);
+            Input::RunnerPace { runner, pace } => match self.runners.get_mut(&runner) {
+                Some(r) => {
+                    if r.pace != pace {
+                        r.pace = pace;
+                        self.touch(&runner);
+                    }
                 }
-            }
+                None => {
+                    self.paces.insert(runner, pace);
+                }
+            },
         }
         // A reservation whose item left the queue, or whose runner went, keeps nothing (W05-R39);
         // the runners whose kept room ended take what fits them, as new capacity does (W05-R04).
@@ -4112,6 +4118,8 @@ impl Scheduler {
             }
         }
         let (running, used, sample, since, counted, was, pace) = self.runners.get(&id).map(|x| (x.running.clone(), x.used, x.sample, x.since, x.counted.clone(), x.connected, x.pace)).unwrap_or_default();
+        // Its pace as last said, or as said before it was up.
+        let pace = self.paces.remove(&id).unwrap_or(pace);
         // A runner coming back on a new link: what it had in use was measured before it went, and
         // its first sample on this link says what it has now; until then it's placed by its room,
         // as before samples (W05). One already up says what it offers again and keeps its sample.
