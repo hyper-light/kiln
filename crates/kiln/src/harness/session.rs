@@ -648,7 +648,7 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace } = self;
+        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace, isolation } = self;
         !(*deferred == o.deferred
             && *admission == o.admission
             && *queue_partial == o.queue_partial
@@ -709,7 +709,8 @@ impl Info {
             && *subagent == o.subagent
             && *variant_of == o.variant_of
             && *no_bypass == o.no_bypass
-            && *workspace == o.workspace)
+            && *workspace == o.workspace
+            && *isolation == o.isolation)
     }
 }
 
@@ -6648,6 +6649,7 @@ for line in sys.stdin:
             subagent: false,
             no_bypass: false,
             workspace: None,
+            isolation: None,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };
