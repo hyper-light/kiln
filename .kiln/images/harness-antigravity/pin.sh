@@ -12,6 +12,11 @@
 # .tar.gz whose one entry is the regular file `antigravity`, installed as bin/agy, the name
 # Google's installer gives it.
 #
+# The pin also records the smoke an image's agy must pass, in the shape every harness's pin gives
+# its own (kiln plan step 19's layout): `bin/agy --version` prints the version and a newline (1.5.6's
+# musl builds wrote 31 2e 35 2e 36 0a in a microVM on both platforms: step 4's record); `stdout` is
+# that line without its newline.
+#
 #   pin.sh [VERSION]   writes pin.json beside this script, or at $PIN_OUT
 #
 # Needs bash, curl, sha256sum, sha512sum and python3 (its standard library alone, for JSON and
@@ -36,7 +41,7 @@ say() { printf 'pin.sh: %s\n' "$*"; }
 fail() { printf 'pin.sh: %s\n' "$*" >&2; exit 3; }
 
 case "${1:-}" in
-  -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
 esac
 [ $# -le 1 ] || { printf 'usage: pin.sh [VERSION]\n' >&2; exit 64; }
 asked=${1:-}
@@ -159,6 +164,7 @@ pin = {
         "manifests": manifests,
     },
     "base": base,
+    "smoke": {"program": "bin/agy", "args": ["--version"], "stdout": version},
     "builds": builds,
 }
 json.dump(pin, sys.stdout, indent=2)
