@@ -253,6 +253,11 @@ impl Bus for SimBus {
 /// What a `Bus` conformance suite runs against: an empty bus per case.
 pub trait BusFixture: Send + Sync {
     fn bus(&self) -> &dyn Bus;
+    /// The class the cases' topics take, one the bus serves: each class a bus serves passes the
+    /// suite on its own (Quiver's persisted class, CP-T2.2).
+    fn class(&self) -> Class {
+        Class::Ephemeral
+    }
 }
 
 /// The fixture for a [`SimBus`].
@@ -266,8 +271,8 @@ impl BusFixture for SimBusFixture {
 
 const T: &str = "conformance";
 
-fn topic(retain: usize) -> Topic {
-    Topic { class: Class::Ephemeral, retain }
+fn topic(class: Class, retain: usize) -> Topic {
+    Topic { class, retain }
 }
 
 fn payloads(b: &Batch) -> Vec<String> {
@@ -285,7 +290,7 @@ async fn publish_all(bus: &dyn Bus, name: &str, ps: &[&str]) -> Result<Vec<Offse
 fn c1<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let b = f.bus();
-        fine("create", b.create(T, topic(100)).await)?;
+        fine("create", b.create(T, topic(f.class(), 100)).await)?;
         same("the offsets given", publish_all(b, T, &["a", "b", "c"]).await?, vec![0, 1, 2])?;
         same("the bounds", fine("bounds", b.bounds(T).await)?, (0, 3))
     })
@@ -294,7 +299,7 @@ fn c1<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c2<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let b = f.bus();
-        fine("create", b.create(T, topic(100)).await)?;
+        fine("create", b.create(T, topic(f.class(), 100)).await)?;
         fine("publish", b.publish(T, Some(b"k1".to_vec()), b"first".to_vec()).await)?;
         fine("publish", b.publish(T, None, b"second".to_vec()).await)?;
         let all = fine("read", b.read(T, 0, 10).await)?;
@@ -309,7 +314,7 @@ fn c2<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c3<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let b = f.bus();
-        fine("create", b.create(T, topic(100)).await)?;
+        fine("create", b.create(T, topic(f.class(), 100)).await)?;
         publish_all(b, T, &["x", "y"]).await?;
         let one = fine("a first reader", b.read(T, 0, 10).await)?;
         let two = fine("a second reader", b.read(T, 0, 10).await)?;
@@ -321,7 +326,7 @@ fn c3<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c4<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let b = f.bus();
-        fine("create", b.create(T, topic(2)).await)?;
+        fine("create", b.create(T, topic(f.class(), 2)).await)?;
         publish_all(b, T, &["a", "b", "c", "d"]).await?;
         same("the bounds past retention", fine("bounds", b.bounds(T).await)?, (2, 4))?;
         let e = refused("a read from before what's kept", b.read(T, 0, 10).await)?;
@@ -333,7 +338,7 @@ fn c4<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c5<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let b = f.bus();
-        fine("create", b.create(T, topic(100)).await)?;
+        fine("create", b.create(T, topic(f.class(), 100)).await)?;
         publish_all(b, T, &["a"]).await?;
         ensure(futures::FutureExt::now_or_never(b.wait(T, 0)).is_some_and(|r| r.is_ok()), || "a wait for a message already there didn't complete at once".into())?;
         let mut waiting = b.wait(T, 1);
@@ -354,18 +359,18 @@ fn c6<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c7<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let b = f.bus();
-        fine("create", b.create(T, topic(10)).await)?;
-        fine("the same create again", b.create(T, topic(10)).await)?;
-        same("a create with other settings", b.create(T, topic(11)).await, Err(Refusal::Exists(T.into())))?;
-        ensure(matches!(b.create("Not a name!", topic(10)).await, Err(Refusal::Invalid { .. })), || "a bad topic name wasn't refused Invalid".into())?;
-        ensure(matches!(b.create("conformance-zero", topic(0)).await, Err(Refusal::Invalid { .. })), || "a retention of 0 wasn't refused Invalid".into())
+        fine("create", b.create(T, topic(f.class(), 10)).await)?;
+        fine("the same create again", b.create(T, topic(f.class(), 10)).await)?;
+        same("a create with other settings", b.create(T, topic(f.class(), 11)).await, Err(Refusal::Exists(T.into())))?;
+        ensure(matches!(b.create("Not a name!", topic(f.class(), 10)).await, Err(Refusal::Invalid { .. })), || "a bad topic name wasn't refused Invalid".into())?;
+        ensure(matches!(b.create("conformance-zero", topic(f.class(), 0)).await, Err(Refusal::Invalid { .. })), || "a retention of 0 wasn't refused Invalid".into())
     })
 }
 
 fn c8<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let b = f.bus();
-        fine("create", b.create(T, topic(10)).await)?;
+        fine("create", b.create(T, topic(f.class(), 10)).await)?;
         let e = refused("a payload over the limit", b.publish(T, None, vec![0; PAYLOAD_MAX.saturating_add(1)]).await)?;
         ensure(matches!(e, Refusal::TooLarge { .. }), || format!("refused as {e:?}"))?;
         same("the bounds after it", fine("bounds", b.bounds(T).await)?, (0, 0))
@@ -375,7 +380,7 @@ fn c8<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c9<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let b = f.bus();
-        fine("create", b.create(T, topic(100)).await)?;
+        fine("create", b.create(T, topic(f.class(), 100)).await)?;
         publish_all(b, T, &["a", "b", "c", "d", "e"]).await?;
         let first = fine("read", b.read(T, 0, 2).await)?;
         same("a limited read", (payloads(&first), first.next), (vec!["a".to_owned(), "b".to_owned()], 2))?;
@@ -390,8 +395,8 @@ fn c9<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c10<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let b = f.bus();
-        fine("create", b.create("conformance-one", topic(10)).await)?;
-        fine("create", b.create("conformance-two", topic(10)).await)?;
+        fine("create", b.create("conformance-one", topic(f.class(), 10)).await)?;
+        fine("create", b.create("conformance-two", topic(f.class(), 10)).await)?;
         publish_all(b, "conformance-one", &["only in one"]).await?;
         same("the other topic", fine("read", b.read("conformance-two", 0, 10).await)?.messages.len(), 0)?;
         same("the other topic's offsets", publish_all(b, "conformance-two", &["first there"]).await?, vec![0])
@@ -401,7 +406,7 @@ fn c10<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c11<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let b = f.bus();
-        fine("create", b.create(T, topic(10)).await)?;
+        fine("create", b.create(T, topic(f.class(), 10)).await)?;
         publish_all(b, T, &["a", "b"]).await?;
         let mut waiting = b.wait(T, 5);
         ensure(futures::FutureExt::now_or_never(&mut waiting).is_none(), || "a wait for a later message completed".into())?;
@@ -410,7 +415,7 @@ fn c11<F: BusFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
         same("a publish to the deleted topic", b.publish(T, None, b"c".to_vec()).await, Err(Refusal::NoTopic(T.into())))?;
         same("a read of the deleted topic", b.read(T, 0, 1).await, Err(Refusal::NoTopic(T.into())))?;
         same("a delete of no topic", b.delete(T).await, Err(Refusal::NoTopic(T.into())))?;
-        fine("create it again", b.create(T, topic(10)).await)?;
+        fine("create it again", b.create(T, topic(f.class(), 10)).await)?;
         same("its offsets start again", publish_all(b, T, &["first again"]).await?, vec![0])
     })
 }
@@ -448,7 +453,7 @@ mod tests {
     fn messages_are_stamped_by_the_bus_clock() {
         let clock = SimClock::new();
         let bus = SimBus::new(Arc::new(clock.clone()));
-        assert!(futures::executor::block_on(bus.create(T, topic(10))).is_ok());
+        assert!(futures::executor::block_on(bus.create(T, topic(Class::Ephemeral, 10))).is_ok());
         clock.advance(std::time::Duration::from_millis(1500));
         assert!(futures::executor::block_on(bus.publish(T, None, b"x".to_vec())).is_ok());
         let read = futures::executor::block_on(bus.read(T, 0, 1));

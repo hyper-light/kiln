@@ -359,7 +359,7 @@ mod tests {
             runs::create(&hub, &repo, new("run1", "s1")).await?;
             runs::create(&hub, &repo, new("run2", "s2")).await?;
             runs::insert_leg(&hub, "run1", "leg1", &spec, Status::Queued, None).await?;
-            runs::finish_leg(&hub, "leg1", Status::Succeeded, "success", None, None).await?;
+            runs::finish_leg(&hub, "leg1", Status::Succeeded, "success", None, None, None).await?;
             take_over(&hub, "run2", "leg1", "leg2", "h1", None).await?;
             let checks = crate::ci::review::checks_on(&hub, "acme/app", "s2").await?;
             anyhow::ensure!(checks.get("ci/a") == Some(&Some("success".to_owned())), "{checks:?}");

@@ -82,9 +82,10 @@ impl Live {
         Self::for_locks_with(|_| {}).await
     }
 
-    /// As [`Live::for_locks`], with more of the server's configuration (a notification rule).
+    /// As [`Live::for_locks`], with more of the server's configuration (a notification rule), on a
+    /// bus that serves the persisted class: its notices are told through kiln.events (crate::events).
     pub(crate) async fn for_locks_with(more: impl FnOnce(&mut crate::config::Config) + Send + 'static) -> anyhow::Result<Self> {
-        let mut live = Self::with(false, more).await?;
+        let mut live = Self::with(false, true, more).await?;
         if let Some(e) = &mut live.sources.endpoints { e.host = "github.com".into(); }
         Ok(live)
     }
@@ -99,22 +100,23 @@ impl Live {
     }
 
     async fn with_token(credential: bool) -> anyhow::Result<Self> {
-        Self::with(credential, |_| {}).await
+        Self::with(credential, false, |_| {}).await
     }
 
-    async fn with(credential: bool, more: impl FnOnce(&mut crate::config::Config) + Send + 'static) -> anyhow::Result<Self> {
+    async fn with(credential: bool, persisted: bool, more: impl FnOnce(&mut crate::config::Config) + Send + 'static) -> anyhow::Result<Self> {
         let dir = tempfile::tempdir()?;
         let root = dir.path().to_path_buf();
         let pattern = root.join("{repo}.git").to_string_lossy().into_owned();
         let token_file = root.join("source-token");
         let token_copy = token_file.clone();
         if credential { crate::rt::blocking(move || std::fs::write(token_copy, "source-fixture-token")).await??; }
-        let hub = crate::hub::tests::scratch_hub_with(|cfg| {
+        let configure = |cfg: &mut crate::config::Config| {
             cfg.ci.enabled = true;
             cfg.ci.actions.sources.push(crate::config::ci::ActionSource { owners: vec!["acme".into()], url: Some(pattern), native: false });
             cfg.gitops.github_token_file = credential.then_some(token_file);
             more(cfg);
-        }).await?;
+        };
+        let hub = if persisted { crate::hub::tests::persisted_hub_on(crate::rt::clock(), configure).await? } else { crate::hub::tests::scratch_hub_with(configure).await? };
         let work = root.join("work");
         let work_copy = work.clone();
         crate::rt::blocking(move || std::fs::create_dir_all(work_copy)).await??;
