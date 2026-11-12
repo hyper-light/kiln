@@ -1,0 +1,13 @@
+# POLICY_READ, plan 01a1cf48e8157494ac9a51f7a564f526 step 5 (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 19), 2026-11-12T16:20:25Z
+role: implementer of step 5 (kiln agent 01a1d069230c7628b32980623c195cb6), under step 19's agent 01a1cf48c64e7593a377bb19b6a7dfc2, Shards ROOT coordinating
+shards origin/main 87bf86b31dda134b1db6fbe60d69be4a9d46d1fe
+  AGENTS.md sha256 f66d304c033ad4001d3d7347b67faa3bb3137d637860793e8e74f1eb6266db41 (30 lines)
+  docs/development-rules.md sha256 df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3 (200 lines)
+  docs/development-evidence.md sha256 61613a244106d95b2759b38c8b6660ff29a616983e7afd6e9faabdc38368fb63 (47 lines)
+kiln origin/main ce63fc099977323d8e27cb7a035234515a3c1c74
+  AGENTS.md sha256 16b05ef80db024a7b54b0e703d42c8cf5c1f330a626d6bd85ae4525609447a4c (123 lines)
+  CLAUDE.md sha256 336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49 (1 lines)
+  docs/ci.md sha256 be867453ea3527c50e5a030c94f931ef9bffb80f8f58a868e98b0cb7b47a4baa (13679 lines)
+  docs/ci.md section 0.3 (Rules of this repository) read; CLAUDE.md is @AGENTS.md
+owned paths: docs/research/s19-claude-agentfile/step5/** on branch s19-step5 (from kiln main ce63fc099977323d8e27cb7a035234515a3c1c74)
+runners: kiln-a094a12d.attlocal.net (Linux x86_64, KVM), adas-mac-studio.local-2 (M3 Ultra); work under ~/.cache/s19-step5 there
