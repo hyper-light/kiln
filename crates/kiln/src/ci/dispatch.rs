@@ -231,6 +231,9 @@ pub enum Msg {
     /// A runner sent a sample (its CPUs busy, its memory in use): the engine weighs its headroom
     /// by it (the scheduler's headroom, W05).
     RunnerSample { agent: String },
+    /// A runner's measured pace changed, as its kernel's words say it (docs/lb.md "Rank"): the
+    /// engine's load balancer ranks its free cores at that speed (W05-R26).
+    RunnerPace { agent: String, pace: kiln_ci::sched::balance::Pace },
     /// A person paused a leg, or resumed it (docs/ci.md W26-R22): waiting, it's placed nowhere
     /// until it's resumed. The store has it paused already, and its runner froze it if it runs.
     LegPaused { leg: String, paused: bool },
@@ -643,6 +646,10 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         prefer,
         placement: r.placed.get(&spec.key).cloned().unwrap_or_default(),
         gang: gang_of(run, spec),
+        // Its kind of work, as its runner keys its runs of it (`AssignV2`'s repository, job
+        // workflow, job and matrix): where its kind last went well, the load balancer sends it
+        // back (docs/lb.md "Good places").
+        kind: crate::sense::run::leg_key(&r.repo.name, &spec.defined_in.workflow_file_path, &spec.job, &spec.matrix.to_string()),
         // A CI leg runs to its end when its lease is lost (W05-R34); a test build's `stop=<job>`
         // makes that job's legs stop then, as stop items do (W05-R37).
         on_lease_loss: match crate::runner::chaos::get().and_then(|c| c.stop_job.as_deref()) {
@@ -693,6 +700,8 @@ fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config 
         lock_delay,
         // Reservations for big items (W05-R39): off until declared.
         backfill: hub.cfg.sched.backfill,
+        // The load balancer's good places (docs/lb.md): on unless `[reach] good_places = false`.
+        good_places: hub.cfg.reach.good_places,
         ..Config::default()
     }
 }
@@ -1583,6 +1592,11 @@ impl Dispatch {
             }
             Msg::RunnerSample { agent } => {
                 self.runner_sample(&agent).await;
+                Ok(())
+            }
+            Msg::RunnerPace { agent, pace } => {
+                let cmds = self.sched.handle(Input::RunnerPace { runner: agent, pace }, now_ms());
+                self.commands(cmds).await;
                 Ok(())
             }
             Msg::WorkState { agent, state } => {

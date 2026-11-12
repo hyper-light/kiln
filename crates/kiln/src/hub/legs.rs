@@ -29,10 +29,12 @@ pub(crate) type Pick = (String, lb::Handle);
 pub(crate) struct Legs {
     lb: lb::Owner,
     out: lb::Out,
-    /// Runners by name, interned to the kernel's dense ids, and their budgets as last said.
+    /// Runners by name, interned to the kernel's dense ids, and their budgets and paces as last
+    /// said.
     ids: HashMap<String, u32>,
     names: Vec<String>,
     budgets: Vec<Option<lb::Amounts>>,
+    paces: Vec<kiln_ci::sched::balance::Pace>,
     /// Each kind of leg's signature.
     sigs: HashMap<u64, Sig>,
     /// Each leg the kernel sent and not yet heard of (started, refused, ended): its handle.
@@ -51,7 +53,7 @@ struct Sig {
 
 impl Default for Legs {
     fn default() -> Self {
-        Legs { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), ids: HashMap::new(), names: Vec::new(), budgets: Vec::new(), sigs: HashMap::new(), sent: HashMap::new(), auction: false }
+        Legs { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), ids: HashMap::new(), names: Vec::new(), budgets: Vec::new(), paces: Vec::new(), sigs: HashMap::new(), sent: HashMap::new(), auction: false }
     }
 }
 
@@ -64,6 +66,7 @@ impl Legs {
         self.ids.insert(name.to_owned(), r);
         self.names.push(name.to_owned());
         self.budgets.push(None);
+        self.paces.push(kiln_ci::sched::balance::Pace::default());
         r
     }
 
@@ -72,9 +75,16 @@ impl Legs {
     }
 
     /// Runner `runner`'s kernel word, from its hint: it joins the kernel at its first, its budget
-    /// followed, its room what the kernel picks by from now. O(1) but on joining.
-    pub(crate) fn hint(&mut self, runner: &str, w: &FastWord) {
+    /// followed, its room what the kernel picks by from now. O(1) but on joining. Its measured
+    /// pace when that changed with this word, for the CI engine's load balancer (docs/lb.md "The
+    /// CI engine"): the same runner's speed, whichever kernel ranks it.
+    pub(crate) fn hint(&mut self, runner: &str, w: &FastWord) -> Option<kiln_ci::sched::balance::Pace> {
         let r = self.id(runner);
+        let pace = kiln_ci::sched::balance::Pace { speed: w.speed, slowness: w.slowness, measured: w.measured };
+        let changed = self.paces.get_mut(r as usize).filter(|p| **p != pace).map(|p| {
+            *p = pace;
+            pace
+        });
         self.out.clear();
         match self.budgets.get(r as usize).copied().flatten() {
             None => {
@@ -98,6 +108,7 @@ impl Legs {
             }
         }
         self.out.clear();
+        changed
     }
 
     /// The kernel's signature for kind `key`, its members synced with `agents`: each record that

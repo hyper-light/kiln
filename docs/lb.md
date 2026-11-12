@@ -439,11 +439,12 @@ the fleet (64).
 - **The auction** (`[reach] auction`, "The auction" above): `Owner::ask_many` takes asks that
   arrive in one step; `Owner::configure` reads both settings, and the reach `Placer` calls it as
   it's made.
-- **The server** owns CI legs (`crates/kiln/src/hub/legs.rs`): an ordinary leg's runner is the
+- **The server** owns v1 jobs (`crates/kiln/src/hub/legs.rs`): an ordinary job's runner is the
   kernel's pick among the runners that named `place.fast` and hint their words, by the same rules
-  the engine's pick filters by; the leg's room is taken from the view until its runner is heard
-  of (started, refused, released). What the kernel can't place, the engine's own pick does. A
-  run's ordinary legs waiting together in one look at the queue go to `Legs::pick_batch` first.
+  the v1 dispatcher's pick filters by; the job's room is taken from the view until its runner is
+  heard of (started, refused, released). What the kernel can't place, the v1 dispatcher's own pick
+  does. A run's ordinary jobs waiting together in one look at the queue go to `Legs::pick_batch`
+  first. The CI engine's legs go through a kernel of the engine's own (below).
 - **Room tokens** (`[reach] tokens`, off until declared; below): a runner that declares them tells
   each owner whose link named `place.tokens` what it holds there, its own word (`tokens` in its
   answers' words, and `FastHint` for what's owed besides), and that owner takes no hint of the
@@ -451,6 +452,67 @@ the fleet (64).
   name it hear its hints, as before.
 
 Measured (`cargo bench -p kiln-ci --bench place_fast`): see below.
+
+## The CI engine
+
+Every leg of a `.kiln` or GitHub workflow is placed by this kernel (`kiln_ci::sched::balance`;
+docs/ci.md W05-R04, W05-R23): the engine keeps one, as the one owner of its legs, and its own
+pick, the order it kept of its candidates (preference, headroom, then the least loaded and the
+most free slots), is gone. The queue still decides which leg goes next (classes, fair share,
+priorities, W05-R09 to R10, R30, R31); routing, which runners may take it (W05-R19 to R22); the
+engine's rules, whether one takes it now (its room, a slot or its request within capacity ×
+overcommit, W05-R03; its target use by its live sample; room kept for another, W05-R39; a runner a
+retry stays off or is pinned to, W05-R16, R28); and the kernel, which of those it goes to.
+
+- **What the kernel is told.** Each runner joins it at its first word, with its whole budget (its
+  CPUs, memory, disk and GPUs as it offers them or its facts say, else its CPUs as its latest
+  sample says, else one for each slot; CPUs overcommitted in resource mode), and its room for an
+  ordinary leg now, whenever that
+  changes (a leg granted or ended there, an executor started or stopped, a sample, the runner up or
+  changed): the least of what each of the engine's measures leaves, its free slots' share of the
+  CPUs no exclusive leg holds (slot mode) or what its capacity leaves (resource mode), and, by its
+  live sample, what it can still take within its target use, less its CPUs' share of the time its
+  tasks all stalled on memory and on I/O (PSI's `full`: time lost, not used). None while a leg holds
+  it whole. Its pace is what its own kernel's words say (`speed`, `slowness`): the server passes
+  it on when it changes (`Input::RunnerPace`), so its free cores are ranked at its speed. A
+  signature's members are its eligible runners that aren't draining, synced when which runners
+  those are may have changed. The runner leaves the kernel with its link, and joins it again,
+  under its next epoch, when it's back.
+- **The pick.** The kernel proposes the signature's members in its order: the most free by its
+  rank first (free cores at each runner's speed, docs/lb.md "Rank"), and between runners it can't
+  tell apart, the leg's kind's good place, else the next in turn, passing over the runner that
+  last let its kind down when another is as free ("Good places"). The first that takes the leg now
+  by the engine's rules gets it; one that doesn't is set aside for that pick alone. The pick takes
+  its turn; nothing of the kernel's view is left changed by it, since the engine tells the kernel
+  the runner's room once the leg is granted. Memory is a fit, not a rank: it makes no leg finish
+  sooner until it runs short, which its stalls say.
+- **Where it's asked.** A runner with room takes its best legs in queue order (W05-R04), and each
+  goes where the kernel puts it: that runner, or one as free or freer, or its kind's good place
+  among equals. A leg queued is offered to the runners with room for it in the kernel's rank (the
+  most whole cores free first, by id among equals), each taking its best legs, as before. A
+  runner's lost legs, coming back together, each go straight where the kernel puts it.
+- **Preferences and GPUs.** A leg whose job or a rule declares preferences (W05-R23's terms over
+  facts and labels, W24-R18's `warm` and `affinity`), or that asks for GPUs (W05-R22's device fit),
+  goes to the runners those rank first, of those that take it now, and between them where the
+  kernel puts it: where they rank none above another (a cold fleet), exactly as a leg without.
+- **Kinds and ends.** A leg's kind is the key its runner keys its runs of it by
+  (`sense::run::leg_key`: its repository, its job's workflow, its job and its matrix), so the
+  engine and the runner name the same work alike. As an attempt ends on its runner, the kernel is
+  told how it went: success, it went well (its kind's good place from now); lost with its runner,
+  its infrastructure, its image, killed for memory or its disk full, the runner let it down;
+  failed in its steps or timed out, no one knows whose fault it was, which the kernel settles by
+  comparison; cancelled, nothing. `[reach] good_places = false` turns kinds off for CI legs too:
+  equals take turns alone.
+- **Pools and gangs.** A pool's leg (W13-R09) runs in an idle executor of its pool: of the hosts
+  with one, where the kernel puts it, as any leg (its GPUs' fit first when it asks for GPUs). A
+  gang's members (W05-R40) start together or not at all, placed by the engine's all-or-nothing
+  planner, which tries the runners for each member in the kernel's rank as well (the most whole
+  cores free with the members put there before it, then by id).
+
+The reference scheduler (`sched::reference`, docs/needs.md E1.5) holds the engine to this: a leg
+goes to a runner with the most whole cores free of those that take it now, and of runners as free,
+the one the kernel took (its turn and good places are the kernel's own tests'); its replay digest
+(`sched::replay`) moved with it.
 ## Room tokens
 
 Hints cost 2(W - 1) words a run for W owners watching a runner. The least messaging that keeps

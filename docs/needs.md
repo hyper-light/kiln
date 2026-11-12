@@ -281,8 +281,11 @@ saying why it decided as it did:
   program it ran isn't there), or failed with no cause the runner knows. That last is settled by
   comparison: the kind's next run goes elsewhere once; if it goes well there the first runner was
   at fault, if it fails there too the work was, and it keeps its place. A run sent back says "its
-  kind of work last went well there, and no runner was freer". `good_places = false`: among
-  equals runs take turns.
+  kind of work last went well there, and no runner was freer". The CI engine's legs go the same
+  way (docs/lb.md "The CI engine"), their kind their job and matrix, judged by how each attempt
+  ended (succeeded; lost, its infrastructure, image, memory or disk; or failed in its steps or
+  timed out, settled by comparison), and a leg's explanation marks the runner its kind last went
+  well on. `good_places = false`: among equals runs take turns.
 
 **Big items don't starve.** With `[sched] backfill` declared (§21), the first item of each class
 that waits only for room keeps room on the runner where its room frees soonest, from the expected

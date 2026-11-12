@@ -3639,7 +3639,11 @@ impl Hub {
             AgentMsg::Offers { json } => {
                 if let Some(room) = crate::offers::heard(self, &agent, &json) {
                     if let Some(w) = &room.fast {
-                        self.legs.lock().hint(&agent, w);
+                        let pace = self.legs.lock().hint(&agent, w);
+                        // Its pace, when it changed, to the CI engine's load balancer too.
+                        if let Some(pace) = pace {
+                            self.ci.send(crate::ci::dispatch::Msg::RunnerPace { agent: String::from(&*agent), pace });
+                        }
                     }
                     self.pass_room_on(peer, &room).await;
                 }
@@ -7868,10 +7872,11 @@ pub(crate) mod tests {
         assert_eq!(v1_best([V1Candidate { name: "quiet", ..cand(&quiet) }], &asked, 0.85), Some("quiet"));
     }
 
-    /// The scheduler's headroom (W05, step 3): one rule places a CI leg, a v1 job and a command
-    /// alike. On one fleet (a at 80% of its CPUs, b at 30%, c at 10% with its disk under pressure),
-    /// asking 4 CPUs and 2 GiB: a would pass the target use, c's disk counts against it, and the
-    /// engine, the v1 dispatcher and kiln run's ranking all pick b.
+    /// The scheduler's headroom (W05, step 3): a CI leg, a v1 job and a command weigh one runner's
+    /// sample alike (the engine through its load balancer's rank, docs/lb.md "The CI engine"). On
+    /// one fleet (a at 80% of its CPUs, b at 30%, c at 10% with its disk under pressure), asking 4
+    /// CPUs and 2 GiB: a would pass the target use, c's stalls count against it, and the engine,
+    /// the v1 dispatcher and kiln run's ranking all pick b.
     #[test]
     fn one_headroom_rule_places_a_leg_a_v1_job_and_a_command_alike() -> anyhow::Result<()> {
         use kiln_ci::sched::routing::{LegRoute, RunnerView};

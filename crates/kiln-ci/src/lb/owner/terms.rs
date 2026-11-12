@@ -432,6 +432,23 @@ impl Owner {
     /// index, whose keys fold each runner's speed and slowness: its top's next in turn, checked
     /// exactly (CPU alone on the fast path), a walk when that one is short.
     fn ask_most(&mut self, si: u32, need: Amounts, out: &mut Out) -> Result<Asked, Refused> {
+        self.ask_most_of::<false>(si, NIL, need, out)
+    }
+
+    /// [`Owner::ask_kind`] for a wide run (docs/lb.md "Wide and narrow"): one that runs faster
+    /// with every core free past its CPU need, as builds and tests do, so it's ranked by
+    /// core-equivalents under contention (the index's key) on every fleet, measured or not, and
+    /// between runners as free goes back to its kind's good place ("Good places"). The CI
+    /// engine's legs ask so (`crate::sched::balance`): their parallelism isn't learned, and their
+    /// steps run as wide as their runner's cores.
+    pub fn ask_kind_wide(&mut self, sig: SigId, kind: KindId, need: Amounts, out: &mut Out) -> Result<Asked, Refused> {
+        self.ask_most_of::<true>(sig.0, kind.0, need, out)
+    }
+
+    /// [`Owner::ask_most`] for a run of kind `kind` when `K`: its kind's good place among the
+    /// most free, else the turn, past the runner that last let it down, as [`Owner::ask_top`]
+    /// and the index's pick have it.
+    fn ask_most_of<const K: bool>(&mut self, si: u32, kind: u32, need: Amounts, out: &mut Out) -> Result<Asked, Refused> {
         #[cfg(test)]
         let planted = crate::lb::any_planted();
         #[cfg(not(test))]
@@ -439,12 +456,12 @@ impl Owner {
         if !multi(&need)
             && !planted
             && let Ok(cpu) = u32::try_from(need[0])
-            && let Some((r, run, epoch)) = self.ask_top::<false>(si, NIL, cpu)
+            && let Some((r, run, epoch)) = self.ask_top::<K>(si, kind, cpu)
         {
             return Ok(Asked { run, send: Some((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch, need }))) });
         }
         self.flush();
-        let r = self.pick(si, NIL, &need, !multi(&need));
+        let r = self.pick(si, if K { kind } else { NIL }, &need, !multi(&need));
         if r == NIL {
             return self.ask_waits(si, need, out);
         }
