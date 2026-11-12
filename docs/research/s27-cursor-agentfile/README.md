@@ -8,8 +8,9 @@ ROOT's. Unpacking is step 25's alone.
 
 ## What is on kiln main
 
-Landed by fast-forward: the tested merge with kiln main 507069d4b, 5af829a8a (tree
-005013f624a9b2c2672f962cf100e1f19ece3d64), and this record's commit on it, docs alone. In it:
+Landed by fast-forward: the tested merges with kiln main, 5af829a8a (507069d4b) and 67f02926e (378327f49, with
+step 26's Antigravity row beside Cursor's; tree f03a163784ae793978c5bd825fdd7c0db5750efa), and this record's commits on
+them, docs alone. In it:
 
 - `.kiln/images/harness-cursor/`: the Agentfile (glibc-and-bash base by digest, no RUN, the bring-up's three
   grants, `/workspace` and the whole home `/home/cursor` as harness volumes), harness.json (OSI, `cursor-agent
@@ -33,11 +34,12 @@ Landed by fast-forward: the tested merge with kiln main 507069d4b, 5af829a8a (tr
 
 ## Tests of the merged tree
 
-At the tree 005013f624a9b2c2672f962cf100e1f19ece3d64 (`merge/record.md`, each log beside it):
+At the tree f03a163784ae793978c5bd825fdd7c0db5750efa, the one landed (`merge/record.md`, each log beside it; the
+first round, at 005013f6…, before main took Antigravity's row, ran the same and passed the same):
 
 | Platform | Ran | Result |
 |---|---|---|
-| Linux x86_64 (kiln-a094a12d) | the agentfiles tests; the agentfiles integration test; kiln's clippy gate | 45 of 45; 1 of 1; `GATE: PASS` (asked 24g: at 16g systemd-oomd ended it, 22.6 GiB its peak) |
+| Linux x86_64 (kiln-a094a12d) | the agentfiles tests; the agentfiles integration test; kiln's clippy gate | 52 of 52; 1 of 1; `GATE: PASS` (asked 24g: at 16g systemd-oomd ended the first round's, 22.6 GiB its cold peak) |
 | macOS arm64 (adas-mac-studio.local-2) | kiln's clippy gate | `GATE: PASS` |
 | Windows x86_64 (jupiter) | kiln's clippy gate | `GATE: PASS` |
 
