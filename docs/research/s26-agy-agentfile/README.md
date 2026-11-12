@@ -55,7 +55,9 @@ unverified, and how each of Shards' rules R01 to R16 applies.
 - [evidence/e_smoke_bytes.txt](evidence/e_smoke_bytes.txt) holds the bytes of 1.5.6's smoke.
 - [evidence/step4/](evidence/step4/README.md) is step 4 for 1.5.7, on both platforms. 1.5.6's
   records are that directory at 3423c8df.
-- [evidence/e_step6_tests.txt](evidence/e_step6_tests.txt) is the tests at the revision that lands.
+- [evidence/e_step6_tests.txt](evidence/e_step6_tests.txt) is the tests at 24d65d633. Its built-in
+  Agentfiles, their tests and the integration test are the ones that land: what kiln main brought
+  after it changes none of them.
   [evidence/e_step6_tests_red.txt](evidence/e_step6_tests_red.txt) is the first such run, at
   338f78473, where clippy refused one line of the tests (91c13a756 fixes it).
 - [scripts/](scripts/) holds what made each record. Among them is
@@ -127,7 +129,7 @@ Each rule, the proof that applies, and what's left.
 
 - **R01, production never panics.** Production gains data alone: the Agentfile, harness.json and
   pin.json, embedded by `include_str!`, and one `Builtin` entry. No new code path runs in kiln.
-  The tests assert, as tests may. Clippy with `-D warnings` is clean at the revision that lands
+  The tests assert, as tests may. Clippy with `-D warnings` is clean at 24d65d633
   (e_step6_tests.txt). Left: none.
 - **R02, research.** Each decision rests on primary sources and live runs:
   - the pin checks what Google's own installer checks
