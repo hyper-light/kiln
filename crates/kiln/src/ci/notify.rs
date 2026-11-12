@@ -34,7 +34,7 @@ use std::time::Duration;
 use http::StatusCode;
 use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::integrations::{self, Integration};
 use super::{Fail, token};
@@ -81,6 +81,8 @@ pub const AGENT_EVENTS: &[&str] = &["agent.needs_you", "agent.finished", "agent.
 /// The events about a release deployed by API (`crate::deploy`): the server's rules take them, a
 /// repository's can't, and each goes to the app's own channels as well.
 pub const RELEASE_EVENTS: &[&str] = &["release.started", "release.waiting_approval", "release.succeeded", "release.failed", "release.cancelled"];
+/// What a release's move may say of it (`crate::deploy::flow`), as kiln.events carries them.
+const RELEASE_MOVES: &[&str] = &["release.started", "release.waiting_approval", "release.succeeded", "release.failed", "release.cancelled"];
 /// The events about a runner: the server's rules take them, a repository's can't.
 pub const RUNNER_EVENTS: &[&str] = &["runner.offline"];
 /// Events about a deploy of kiln itself (docs/resilience.md, G7): the server's rules take them.
@@ -300,8 +302,9 @@ async fn rules_for(hub: &Hub, repo: &Repo) -> Vec<(String, Rule)> {
     out
 }
 
-/// What an event is about.
-#[derive(Debug, Clone, Default)]
+/// What an event is about: as kiln.events carries a notification's event (`crate::events`).
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
+#[serde(default)]
 pub struct Subject {
     pub repo: String,
     pub run: String,
@@ -326,7 +329,7 @@ pub struct Subject {
 }
 
 impl Subject {
-    fn run_value(&self) -> Value {
+    pub(crate) fn run_value(&self) -> Value {
         serde_json::to_value(self.run_ref()).unwrap_or(Value::Null)
     }
 
@@ -405,13 +408,15 @@ fn message(event: &str, s: &Subject) -> (String, String) {
     (title, format!("{} · {short} {first} · {} · {}", s.repo, kiln_ci::sched::actor::shown(&s.actor), s.url))
 }
 
-/// What a channel is sent: the message, and what some channels need besides.
+/// What a channel is sent: the message, and what some channels need besides. Kept with a delivery
+/// until it's sent (`notify_deliveries.message`).
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 struct Msg {
     title: String,
     line: String,
     url: String,
     /// What the link is to ("the run", "the agent").
-    what: &'static str,
+    what: String,
     /// One incident per thing it's about (PagerDuty, Opsgenie).
     dedup: String,
     /// It ends that incident.
@@ -446,7 +451,7 @@ impl Msg {
             title,
             line,
             url: s.url.clone(),
-            what,
+            what: what.to_owned(),
             dedup,
             resolve: matches!(event, "run.fixed" | "run.succeeded" | "deploy.succeeded"),
             webhook,
@@ -470,7 +475,7 @@ impl Msg {
         };
         let line = format!("{text} · {machine} · {url}");
         let webhook = json!({ "event": event, "title": title, "text": line, "agent": ev.get("agent").cloned().unwrap_or(Value::Null), "url": url });
-        Msg { title, line, url, what: "the agent", dedup: format!("kiln:agent:{id}"), resolve: event == "agent.finished", webhook, people: Vec::new(), refs: Vec::new(), thread: None }
+        Msg { title, line, url, what: "the agent".into(), dedup: format!("kiln:agent:{id}"), resolve: event == "agent.finished", webhook, people: Vec::new(), refs: Vec::new(), thread: None }
     }
 }
 
@@ -525,7 +530,7 @@ impl Msg {
             title,
             line,
             url: url.to_owned(),
-            what: "the release",
+            what: "the release".into(),
             dedup: format!("kiln:release:{app}:{env}"),
             resolve: event == "release.succeeded",
             webhook,
@@ -770,7 +775,26 @@ async fn deliver(hub: &Hub, repo: Option<&Repo>, rule: &str, event: &str, about:
         .await;
 }
 
-/// Sends `event` about `s` through every rule of `repo` that takes it.
+/// The JSON the hub's viewers and an outgoing webhook's subscribers get for a notification's event
+/// on kiln.events (one about a repository's subject), as kiln has always sent it.
+pub fn shown(e: &crate::events::Event) -> Option<Value> {
+    let s: Subject = serde_json::from_value(e.about.get("subject")?.clone()).ok()?;
+    Some(json!({ "type": e.kind, "repo": e.about.get("repo").cloned().unwrap_or(Value::Null), "run": s.run_value(), "environments": s.environments }))
+}
+
+/// What the hub's viewers are told of a notification's event on kiln.events (one about a
+/// repository's subject): its run notice, as [`emit`] tells them of the events it says.
+pub fn notice(e: &crate::events::Event) -> Option<crate::wire::events::ServerEvent> {
+    use crate::wire::events::{NoticeKind, RepoRef, RunNotice, ServerEvent};
+    let kind = NoticeKind::of(&e.kind)?;
+    let s: Subject = serde_json::from_value(e.about.get("subject")?.clone()).ok()?;
+    let text = |key: &str| e.about.get("repo").and_then(|r| r.get(key)).and_then(Value::as_str).unwrap_or_default().to_owned();
+    Some(ServerEvent::RunNotice(Box::new(RunNotice { kind, repo: RepoRef { id: text("id"), name: text("name") }, run: s.run_ref(), environments: s.environments })))
+}
+
+/// Says `event` about `s` (W19-R06, W19-R07): the hub's viewers hear of it now; the rules of `repo`,
+/// each person's own and every subscription that takes it once it's recorded and relayed
+/// (`crate::events`), their deliveries made from kiln.events ([`spawn`]).
 pub async fn emit(hub: &Hub, repo: &Repo, event: &str, s: &Subject) {
     // For outgoing webhooks' subscribers too (W19-R07), and the UI.
     use crate::wire::events::{NoticeKind, RepoRef, RunNotice, ServerEvent};
@@ -779,6 +803,14 @@ pub async fn emit(hub: &Hub, repo: &Repo, event: &str, s: &Subject) {
         // Every name this is called with is a [`NoticeKind`] (`wire::events`' tests).
         None => tracing::warn!(%event, "a notice that isn't one of the events socket's: not sent to it"),
     }
+    let mut said = crate::events::about(repo, s);
+    said.insert("type".into(), json!(event));
+    crate::events::say(hub, Value::Object(said)).await;
+}
+
+/// The deliveries `event` about `s` makes through every rule of `repo` that takes it, and each
+/// person's own rules.
+async fn rules_of_repo(hub: &Hub, repo: &Repo, event: &str, s: &Subject, sink: &mut Sink) {
     let m = Msg::of_run(event, s);
     for (name, rule) in rules_for(hub, repo).await {
         if !takes(&rule, event, s) {
@@ -786,10 +818,10 @@ pub async fn emit(hub: &Hub, repo: &Repo, event: &str, s: &Subject) {
         }
         for spec in &rule.to {
             let key = format!("{name}\u{0}{spec}\u{0}{event}\u{0}{}\u{0}{}", s.workflow, s.branch);
-            if throttled(hub, &key, rule.throttle.as_deref().and_then(seconds)).await {
+            if sink.throttled(hub, &key, rule.throttle.as_deref().and_then(seconds)).await {
                 continue;
             }
-            deliver(hub, Some(repo), &name, event, &s.run, &m, spec).await;
+            sink.push(Some(repo), &name, event, &s.run, &m, spec);
         }
     }
     // Each person's own rules (W19-R06), for repositories they may read.
@@ -815,12 +847,258 @@ pub async fn emit(hub: &Hub, repo: &Repo, event: &str, s: &Subject) {
                     _ => continue,
                 };
                 let key = format!("{name}\u{0}{spec}\u{0}{event}\u{0}{}\u{0}{}", s.workflow, s.branch);
-                if throttled(hub, &key, r.rule.throttle.as_deref().and_then(seconds)).await {
+                if sink.throttled(hub, &key, r.rule.throttle.as_deref().and_then(seconds)).await {
                     continue;
                 }
-                deliver(hub, Some(repo), &name, event, &s.run, &m, &spec).await;
+                sink.push(Some(repo), &name, event, &s.run, &m, &spec);
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------ delivered from kiln.events
+
+/// One rule's delivery an event makes, until it's sent: logged pending in `notify_deliveries`.
+struct Pending {
+    rule: String,
+    event: String,
+    about: String,
+    spec: String,
+    repo: Option<String>,
+    msg: Msg,
+}
+
+/// What one event's rules make (the reader's plan): its deliveries, and the throttles they take,
+/// logged with the reader's position in one transaction, so a kill between finding them and
+/// sending them loses none and throttles none it never logged.
+#[derive(Default)]
+struct Sink {
+    pending: Vec<Pending>,
+    marks: Vec<(String, i64)>,
+}
+
+impl Sink {
+    /// Whether a message for `key` is held back, `throttle` seconds after the last; if not, this
+    /// one is recorded as the last with the rest.
+    async fn throttled(&mut self, hub: &Hub, key: &str, throttle: Option<i64>) -> bool {
+        let Some(t) = throttle.filter(|t| *t > 0) else { return false };
+        let now = hub.clock.unix_s();
+        if self.marks.iter().any(|(k, at)| k == key && now - at < t) {
+            return true;
+        }
+        let k = key.to_owned();
+        let last: Option<i64> = hub.store.call(move |c| Ok(c.query_row("SELECT at FROM notify_sent WHERE key = ?1", [&k], |r| r.get(0)).optional()?)).await.unwrap_or(None);
+        if last.is_some_and(|l| now - l < t) {
+            return true;
+        }
+        self.marks.push((key.to_owned(), now));
+        false
+    }
+
+    fn push(&mut self, repo: Option<&Repo>, rule: &str, event: &str, about: &str, m: &Msg, spec: &str) {
+        self.pending.push(Pending { rule: rule.to_owned(), event: event.to_owned(), about: about.to_owned(), spec: spec.to_owned(), repo: repo.map(|r| r.id.clone()), msg: m.clone() });
+    }
+}
+
+/// The deliveries a secret no repository holds makes, unread in 90 days, through every server rule
+/// that takes it.
+fn rules_of_secret(hub: &Hub, secret: &Value, s: &Subject, sink: &mut Sink) {
+    let m = Msg::of_run("secret.unused", s);
+    for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
+        if rule.check(true).is_err() || !takes_ctx(rule, "secret.unused", "secret", secret) {
+            continue;
+        }
+        for spec in &rule.to {
+            sink.push(None, &format!("server#{}", n + 1), "secret.unused", &s.run, &m, spec);
+        }
+    }
+}
+
+/// Reads kiln.events for the notification rules (W19-R06), and sends what it logs, a sender for
+/// each channel, for as long as the server runs (docs/bus.md, "kiln's events").
+pub fn spawn(hub: &Arc<Hub>) {
+    let reader = Arc::new(Rules { senders: crate::events::Senders::new(Channels) });
+    let (resumed, senders) = (Arc::clone(hub), Arc::clone(&reader.senders));
+    crate::rt::spawn(async move {
+        // What a restart left waiting, first.
+        if let Err(e) = senders.resume(&resumed).await {
+            tracing::warn!(error = %format!("{e:#}"), "the notifications a restart left couldn't be read");
+        }
+    });
+    crate::events::read(hub, reader);
+}
+
+/// The reader of kiln.events for the notification rules.
+struct Rules {
+    senders: Arc<crate::events::Senders<Channels>>,
+}
+
+impl crate::events::Reader for Rules {
+    fn name(&self) -> &'static str {
+        "notify"
+    }
+
+    fn kind(&self) -> &'static str {
+        "notify"
+    }
+
+    fn plan<'a>(&'a self, hub: &'a Arc<Hub>, e: &'a crate::events::Event) -> futures::future::BoxFuture<'a, anyhow::Result<crate::events::Logged>> {
+        Box::pin(async move {
+            let mut sink = Sink::default();
+            let event = e.kind.as_str();
+            let subject: Option<Subject> = e.about.get("subject").and_then(|s| serde_json::from_value(s.clone()).ok());
+            let repo_id = e.about.get("repo").and_then(|r| r.get("id")).and_then(Value::as_str);
+            match (repo_id, subject) {
+                (Some(id), Some(s)) if EVENTS.contains(&event) => {
+                    if let Some(repo) = hub.store.repos().await?.into_iter().find(|r| r.id == id) {
+                        rules_of_repo(hub, &repo, event, &s, &mut sink).await;
+                    }
+                }
+                (None, Some(s)) if event == "secret.unused" => rules_of_secret(hub, e.about.get("secret").unwrap_or(&Value::Null), &s, &mut sink),
+                _ if AGENT_EVENTS.contains(&event) => {
+                    let mut ev = Value::Object(e.about.clone());
+                    if let Some(o) = ev.as_object_mut() {
+                        o.insert("type".into(), json!(event));
+                    }
+                    rules_of_agent(hub, event, &ev, &mut sink).await;
+                }
+                _ if event == "runner.offline" => rules_of_runner(hub, e.about.get("runner").unwrap_or(&Value::Null), &mut sink).await,
+                // A release's move: its messages brought up to date as it is now, on their own
+                // (release_moved sends and keeps what it sent; a kill before it's done leaves the
+                // rest to the release's next move), so a channel that's down holds up no reader.
+                _ if event == "release" => {
+                    if let Some(id) = e.about.get("id").and_then(Value::as_i64) {
+                        let moved: Vec<&'static str> = e.about.get("events").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).filter_map(|n| RELEASE_MOVES.iter().find(|m| **m == n).copied()).collect()).unwrap_or_default();
+                        crate::rt::spawn(release_moved(Arc::clone(hub), id, moved));
+                    }
+                    return Ok(crate::events::Logged::none());
+                }
+                _ => return Ok(crate::events::Logged::none()),
+            }
+            if sink.pending.is_empty() && sink.marks.is_empty() {
+                return Ok(crate::events::Logged::none());
+            }
+            let (now, now_ms) = (hub.clock.unix_s(), hub.clock.unix_ms());
+            let mut targets: Vec<String> = sink.pending.iter().map(|p| p.spec.clone()).collect();
+            targets.sort();
+            targets.dedup();
+            crate::metrics::events().logged.add(&["notify"], u64::try_from(sink.pending.len()).unwrap_or(0));
+            let n = e.n;
+            Ok(crate::events::Logged {
+                write: Box::new(move |c: &rusqlite::Connection| {
+                    for (key, at) in &sink.marks {
+                        c.execute("INSERT INTO notify_sent (key, at) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET at = ?2", params![key, at])?;
+                    }
+                    for p in &sink.pending {
+                        let mut delivery = crate::util::sha256_hex(format!("kiln.events/{n}/{}/{}", p.rule, p.spec).as_bytes());
+                        delivery.truncate(32);
+                        let message = serde_json::to_string(&p.msg).unwrap_or_default();
+                        c.execute(
+                            "INSERT INTO notify_deliveries (ts, rule, event, run_id, channel, status, error, attempts, delivery, repo_id, message, first_at, next_at) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL, 0, ?6, ?7, ?8, ?9, ?9)",
+                            params![now, p.rule, p.event, p.about, p.spec, delivery, p.repo, message, now_ms],
+                        )?;
+                    }
+                    Ok(())
+                }),
+                targets,
+            })
+        })
+    }
+
+    fn wake(&self, hub: &Arc<Hub>, targets: Vec<String>) {
+        for t in targets {
+            self.senders.wake(hub, &t);
+        }
+    }
+}
+
+/// The rules' deliveries, each channel's sent by a sender of its own.
+struct Channels;
+
+impl crate::events::Log for Channels {
+    fn name(&self) -> &'static str {
+        "notify"
+    }
+
+    fn due(&self, c: &rusqlite::Connection, target: &str) -> rusqlite::Result<Option<crate::events::Due>> {
+        c.query_row(
+            "SELECT id, COALESCE(first_at, ts * 1000), COALESCE(next_at, 0), attempts FROM notify_deliveries WHERE status = 'pending' AND channel = ?1 ORDER BY id LIMIT 1",
+            [target],
+            |r| Ok(crate::events::Due { row: r.get(0)?, first_at: r.get(1)?, next_at: r.get(2)?, tries: r.get(3)? }),
+        )
+        .optional()
+    }
+
+    fn send<'a>(&'a self, hub: &'a Arc<Hub>, row: i64) -> futures::future::BoxFuture<'a, crate::events::Tried> {
+        use crate::events::Tried;
+        Box::pin(async move {
+            let found: anyhow::Result<Option<(String, String, Option<String>, Option<String>)>> = hub
+                .store
+                .call(move |c| Ok(c.query_row("SELECT event, channel, repo_id, message FROM notify_deliveries WHERE id = ?1", [row], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?))).optional()?))
+                .await;
+            let (event, spec, repo_id, message) = match found {
+                Ok(Some(found)) => found,
+                Ok(None) => return Tried::Done { status: "failed", code: None, error: Some("the delivery is gone".into()) },
+                Err(e) => return Tried::Failed { code: None, error: format!("{e:#}") },
+            };
+            let Some(m) = message.and_then(|m| serde_json::from_str::<Msg>(&m).ok()) else {
+                return Tried::Done { status: "failed", code: None, error: Some("its message is unreadable".into()) };
+            };
+            let repo = match repo_id {
+                Some(id) => match hub.store.repos().await {
+                    Ok(repos) => repos.into_iter().find(|r| r.id == id),
+                    Err(e) => return Tried::Failed { code: None, error: format!("{e:#}") },
+                },
+                None => None,
+            };
+            send_once(hub, repo.as_ref(), &event, &m, &spec).await
+        })
+    }
+
+    fn tried(&self, c: &rusqlite::Connection, row: i64, a: &crate::events::After<'_>) -> rusqlite::Result<()> {
+        c.execute("UPDATE notify_deliveries SET ts = ?2, status = ?3, attempts = attempts + 1, error = ?4, next_at = ?5 WHERE id = ?1", params![row, a.now, a.status, a.error, a.next_at])?;
+        Ok(())
+    }
+
+    fn pending(&self, c: &rusqlite::Connection) -> rusqlite::Result<Vec<String>> {
+        let mut st = c.prepare("SELECT DISTINCT channel FROM notify_deliveries WHERE status = 'pending'")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    fn waiting(&self, c: &rusqlite::Connection) -> rusqlite::Result<i64> {
+        c.query_row("SELECT COUNT(*) FROM notify_deliveries WHERE status = 'pending'", [], |r| r.get(0))
+    }
+}
+
+/// Sends one delivery through `spec` once: kiln's own inbox, or the channel's integration. A
+/// channel no integration answers to, a tracker's change (which retries itself) and one a channel
+/// had nothing to do with are done however they went; the rest are tried again.
+async fn send_once(hub: &Hub, repo: Option<&Repo>, event: &str, m: &Msg, spec: &str) -> crate::events::Tried {
+    use crate::events::Tried;
+    let inbox = spec == "inbox" || spec.starts_with("inbox:");
+    match channel(hub, repo, spec).await {
+        Err(_) if inbox => {
+            let people: Vec<String> = match spec.strip_prefix("inbox:") {
+                Some(named) => named.split(',').map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned).collect(),
+                None => m.people.clone(),
+            };
+            match super::inbox::put(hub, &people, event, &m.title, &m.line, &m.url, repo.map(|r| r.name.as_str())).await {
+                Ok(0) => Tried::Done { status: "failed", code: None, error: Some("it's about nobody with an inbox".to_owned()) },
+                Ok(_) => Tried::Sent { code: None },
+                Err(e) => Tried::Failed { code: None, error: format!("{e:#}") },
+            }
+        }
+        Err(e) => Tried::Done { status: "failed", code: None, error: Some(e) },
+        Ok((i, target)) => match send(hub, &i, target.as_deref(), event, m).await {
+            Ok(Went::Sent) => Tried::Sent { code: None },
+            Ok(Went::Skipped(why)) => Tried::Done { status: "skipped", code: None, error: Some(why) },
+            Err(e) if super::trackers::KINDS.contains(&i.kind.as_str()) => Tried::Done { status: "failed", code: None, error: Some(e) },
+            Err(e) => {
+                tracing::warn!(channel = spec, event, error = %e, "a notification didn't go out; it's tried again");
+                Tried::Failed { code: None, error: e }
+            }
+        },
     }
 }
 
@@ -841,24 +1119,31 @@ fn takes_agent(rule: &Rule, event: &str, ev: &Value) -> bool {
     kiln_ci::expr::eval_condition(&cond, &cx, &mut kiln_ci::expr::Budget::default()).unwrap_or(false)
 }
 
-/// An agent's event (docs/agentic.md N2, from `crate::push`), through every server rule that takes
-/// it: at most once per channel, event and agent in a rule's `throttle`.
+/// An agent's event (docs/agentic.md N2, from `crate::push`): said, then delivered from kiln.events
+/// through every server rule that takes it ([`rules_of_agent`]).
 pub async fn agent_event(hub: Arc<Hub>, ev: Value) {
-    let Some(event) = ev.get("type").and_then(Value::as_str).filter(|e| AGENT_EVENTS.contains(e)).map(str::to_owned) else { return };
+    if ev.get("type").and_then(Value::as_str).is_some_and(|e| AGENT_EVENTS.contains(&e)) {
+        crate::events::say(&hub, ev).await;
+    }
+}
+
+/// The deliveries an agent's event makes through every server rule that takes it: at most once per
+/// channel, event and agent in a rule's `throttle`.
+async fn rules_of_agent(hub: &Hub, event: &str, ev: &Value, sink: &mut Sink) {
     let id = ev.pointer("/agent/id").and_then(Value::as_str).unwrap_or_default().to_owned();
     let machine = hub.shown(ev.pointer("/agent/machine").and_then(Value::as_str).unwrap_or_default());
-    let m = Msg::of_agent(&event, &ev, &machine);
+    let m = Msg::of_agent(event, ev, &machine);
     for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
-        if rule.check(true).is_err() || !takes_agent(rule, &event, &ev) {
+        if rule.check(true).is_err() || !takes_agent(rule, event, ev) {
             continue;
         }
         let name = format!("server#{}", n + 1);
         for spec in &rule.to {
             let key = format!("{name}\u{0}{spec}\u{0}{event}\u{0}agent:{id}");
-            if throttled(&hub, &key, rule.throttle.as_deref().and_then(seconds)).await {
+            if sink.throttled(hub, &key, rule.throttle.as_deref().and_then(seconds)).await {
                 continue;
             }
-            deliver(&hub, None, &name, &event, &format!("agent:{id}"), &m, spec).await;
+            sink.push(None, &name, event, &format!("agent:{id}"), &m, spec);
         }
     }
 }
@@ -1115,20 +1400,23 @@ async fn subject(hub: &Hub, run: &str) -> anyhow::Result<Option<(Repo, Subject)>
     )))
 }
 
-/// The conclusion of the lane's last run to finish before run `?4`: from `runs_lane_finished`'s
-/// end rather than every run of the lane sorted (the DB query audit, 2026-11-06: 1.6-2.1 ms -> 25-34
-/// us on a lane of 3,400 runs). Of runs that finished in one second the later, by number: `run.fixed`
-/// says whether that one failed, so it must be one.
-const RUN_BEFORE: &str = "SELECT conclusion FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND branch = ?3 AND id != ?4 AND finished_at IS NOT NULL ORDER BY finished_at DESC, number DESC LIMIT 1";
+/// The conclusion of the lane's last run to finish before run `?4`, of those that finished no later
+/// than it did (so a row the relay publishes again makes the same events): from
+/// `runs_lane_finished`'s end rather than every run of the lane sorted (the DB query audit,
+/// 2026-11-06: 1.6-2.1 ms -> 25-34 us on a lane of 3,400 runs). Of runs that finished in one second
+/// the later, by number: `run.fixed` says whether that one failed, so it must be one.
+const RUN_BEFORE: &str = "SELECT conclusion FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND branch = ?3 AND id != ?4 AND finished_at IS NOT NULL AND finished_at <= COALESCE((SELECT finished_at FROM runs WHERE id = ?4), 9223372036854775807) ORDER BY finished_at DESC, number DESC LIMIT 1";
 
-/// A run ended (W19-R06): `run.failed`, `run.cancelled`, or `run.succeeded` and, after failures
-/// on its branch, `run.fixed`.
-pub async fn run_finished(hub: Arc<Hub>, run: String) {
-    let Ok(Some((repo, s))) = subject(&hub, &run).await else { return };
+/// The events a run's end makes (W19-R06), as the relay publishes them (`crate::events`; the end
+/// recorded them, `super::runs::finish_run`): `run.failed`, `run.cancelled`, or `run.succeeded`
+/// and, after failures on its branch, `run.fixed`; and `leg.flaky`. Read as the run ended: a run's
+/// end and the runs before it don't change, so a row published again makes the same events.
+pub async fn finished(hub: &Hub, run: &str) -> anyhow::Result<Vec<(String, Map<String, Value>)>> {
+    let Some((repo, s)) = subject(hub, run).await? else { return Ok(Vec::new()) };
     let events: Vec<&str> = match s.conclusion.as_str() {
         "success" => {
-            let (repo_id, wf, branch, r) = (repo.id.clone(), s.workflow.clone(), s.branch.clone(), run.clone());
-            let before: Option<String> = hub.store.read(move |c| Ok(c.query_row(RUN_BEFORE, params![repo_id, wf, branch, r], |x| x.get(0)).optional()?.flatten())).await.unwrap_or(None);
+            let (repo_id, wf, branch, r) = (repo.id.clone(), s.workflow.clone(), s.branch.clone(), run.to_owned());
+            let before: Option<String> = hub.store.read(move |c| Ok(c.query_row(RUN_BEFORE, params![repo_id, wf, branch, r], |x| x.get(0)).optional()?.flatten())).await?;
             let fixed = before.as_deref().is_some_and(|c| matches!(c, "failure" | "timed_out" | "startup_failure"));
             if fixed { vec!["run.succeeded", "run.fixed"] } else { vec!["run.succeeded"] }
         }
@@ -1136,42 +1424,40 @@ pub async fn run_finished(hub: Arc<Hub>, run: String) {
         "skipped" | "neutral" | "" => Vec::new(),
         _ => vec!["run.failed"],
     };
-    for e in events {
-        emit(&hub, &repo, e, &s).await;
-    }
+    let mut made: Vec<(String, Map<String, Value>)> = events.into_iter().map(|e| (e.to_owned(), crate::events::about(&repo, &s))).collect();
     // W16-R04 in the run itself: tests a retry passed, or that an attempt failed and another
     // passed (`leg.flaky`, the tests named in the message).
-    match super::results::flaky_in_run(&hub, &run).await {
-        Ok(tests) if !tests.is_empty() => {
-            let shown: Vec<&str> = tests.iter().take(10).map(String::as_str).collect();
-            let more = if tests.len() > shown.len() { format!(" and {} more", tests.len() - shown.len()) } else { String::new() };
-            let s = Subject { message: format!("flaky: {}{more}", shown.join(", ")), ..s };
-            emit(&hub, &repo, "leg.flaky", &s).await;
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(run = %run, error = %format!("{e:#}"), "a run's flaky tests couldn't be read"),
+    let tests = super::results::flaky_in_run(hub, run).await?;
+    if !tests.is_empty() {
+        let shown: Vec<&str> = tests.iter().take(10).map(String::as_str).collect();
+        let more = if tests.len() > shown.len() { format!(" and {} more", tests.len() - shown.len()) } else { String::new() };
+        let s = Subject { message: format!("flaky: {}{more}", shown.join(", ")), ..s };
+        made.push(("leg.flaky".to_owned(), crate::events::about(&repo, &s)));
     }
+    Ok(made)
 }
 
-/// A deployment ended (W19-R06): `deploy.succeeded` or `deploy.failed`, about its run and
-/// environment.
-pub async fn deployed(hub: Arc<Hub>, run: String, environment: String, succeeded: bool) {
-    let Ok(Some((repo, mut s))) = subject(&hub, &run).await else { return };
-    s.environments = vec![environment];
-    emit(&hub, &repo, if succeeded { "deploy.succeeded" } else { "deploy.failed" }, &s).await;
+/// The event a deployment's end makes (W19-R06): `deploy.succeeded` or `deploy.failed`, about its
+/// run and environment, as the relay publishes it (the leg's end recorded it,
+/// `super::runs::finish_leg`).
+pub async fn deployment(hub: &Hub, run: &str, environment: &str, succeeded: bool) -> anyhow::Result<Vec<(String, Map<String, Value>)>> {
+    let Some((repo, mut s)) = subject(hub, run).await? else { return Ok(Vec::new()) };
+    s.environments = vec![environment.to_owned()];
+    Ok(vec![((if succeeded { "deploy.succeeded" } else { "deploy.failed" }).to_owned(), crate::events::about(&repo, &s))])
 }
 
-/// A land queue's entry was ejected (W19-R06): `land.ejected`, about its diffs (`D12 title`, the
-/// first's link), with why.
-pub async fn land_ejected(hub: Arc<Hub>, diffs: Vec<String>, reason: String) {
+/// The event a land queue's ejection makes (W19-R06): `land.ejected`, about its diffs (`D12
+/// title`, the first's link), with why, as the relay publishes it (the ejection recorded it,
+/// `super::land`).
+pub async fn ejected(hub: &Hub, diffs: Vec<String>, reason: String) -> anyhow::Result<Vec<(String, Map<String, Value>)>> {
     let mut found = Vec::new();
     for id in &diffs {
-        if let Ok(Some(d)) = super::diffs::find(&hub, id).await {
+        if let Some(d) = super::diffs::find(hub, id).await? {
             found.push(d);
         }
     }
-    let Some(first) = found.first() else { return };
-    let Some(repo) = hub.store.repos().await.ok().and_then(|r| r.into_iter().find(|r| r.name == first.repo)) else { return };
+    let Some(first) = found.first() else { return Ok(Vec::new()) };
+    let Some(repo) = hub.store.repos().await?.into_iter().find(|r| r.name == first.repo) else { return Ok(Vec::new()) };
     let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     let names: Vec<&str> = found.iter().map(|d| d.name.as_str()).collect();
     let s = Subject {
@@ -1185,7 +1471,7 @@ pub async fn land_ejected(hub: Arc<Hub>, diffs: Vec<String>, reason: String) {
         github: json!({ "repository": repo.name, "ref": format!("refs/heads/{}", first.trunk), "ref_name": first.trunk }),
         ..Subject::default()
     };
-    emit(&hub, &repo, "land.ejected", &s).await;
+    Ok(vec![("land.ejected".to_owned(), crate::events::about(&repo, &s))])
 }
 
 /// A diff landed on its trunk at `commit` (W11-R07): `diff.landed`, about it (`D12 title`, its
@@ -1351,6 +1637,14 @@ pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
     let offline = crate::wire::events::OfflineRunner { name: name.clone(), labels: labels.clone(), gone_for };
     let runner = serde_json::to_value(&offline).unwrap_or(Value::Null);
     hub.emit(&crate::wire::events::ServerEvent::RunnerOffline { runner: offline });
+    crate::events::say(&hub, json!({ "type": "runner.offline", "runner": runner })).await;
+}
+
+/// The deliveries a runner gone offline makes through every server rule that takes it.
+async fn rules_of_runner(hub: &Hub, runner: &Value, sink: &mut Sink) {
+    let get = |k: &str| runner.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let (name, gone_for) = (get("name"), runner.get("gone_for").and_then(Value::as_u64).unwrap_or(0));
+    let labels: Vec<String> = runner.get("labels").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
     let url = format!("{}/runners/{name}", hub.cfg.server.public_url.trim_end_matches('/'));
     let title = format!("⚠ runner {} is offline", hub.shown(&name));
     let line = format!("gone {} min · {} · {url}", gone_for / 60, if labels.is_empty() { "no labels".to_owned() } else { labels.join(", ") });
@@ -1358,7 +1652,7 @@ pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
         title: title.clone(),
         line: line.clone(),
         url,
-        what: "the runner",
+        what: "the runner".into(),
         dedup: format!("kiln:runner:{name}"),
         resolve: false,
         webhook: json!({ "event": "runner.offline", "title": title, "text": line, "runner": runner }),
@@ -1367,16 +1661,16 @@ pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
         thread: None,
     };
     for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
-        if rule.check(true).is_err() || !takes_ctx(rule, "runner.offline", "runner", &runner) {
+        if rule.check(true).is_err() || !takes_ctx(rule, "runner.offline", "runner", runner) {
             continue;
         }
         let rule_name = format!("server#{}", n + 1);
         for spec in &rule.to {
             let key = format!("{rule_name}\u{0}{spec}\u{0}runner.offline\u{0}{name}");
-            if throttled(&hub, &key, rule.throttle.as_deref().and_then(seconds)).await {
+            if sink.throttled(hub, &key, rule.throttle.as_deref().and_then(seconds)).await {
                 continue;
             }
-            deliver(&hub, None, &rule_name, "runner.offline", &format!("runner:{name}"), &m, spec).await;
+            sink.push(None, &rule_name, "runner.offline", &format!("runner:{name}"), &m, spec);
         }
     }
 }
@@ -1400,7 +1694,7 @@ pub async fn self_deploy(hub: Arc<Hub>, kind: crate::wire::events::SelfDeployKin
         title: title.clone(),
         line: message.clone(),
         url,
-        what: "the deploy",
+        what: "the deploy".into(),
         dedup: format!("kiln:self-deploy:{app}"),
         resolve: false,
         webhook: json!({ "event": event, "title": title, "text": message, "deploy": deploy }),
@@ -1553,25 +1847,18 @@ async fn secrets_told(hub: &Hub, now: i64, told: Vec<(String, String, String, St
             Some(r) => emit(hub, r, "secret.unused", &s).await,
             None => {
                 let secret = json!({ "name": name, "scope": kind, "last_used_at": last });
-                let m = Msg::of_run("secret.unused", &s);
-                for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
-                    if rule.check(true).is_err() || !takes_ctx(rule, "secret.unused", "secret", &secret) {
-                        continue;
-                    }
-                    for spec in &rule.to {
-                        deliver(hub, None, &format!("server#{}", n + 1), "secret.unused", &s.run, &m, spec).await;
-                    }
-                }
+                crate::events::say(hub, json!({ "type": "secret.unused", "secret": secret, "subject": s })).await;
             }
         }
     }
 }
 
-/// A run waits for a reviewer to deploy to `environments` (W15-R03).
-pub async fn approval_waiting(hub: Arc<Hub>, run: String, environments: Vec<String>) {
-    let Ok(Some((repo, mut s))) = subject(&hub, &run).await else { return };
+/// The event a run waiting for a reviewer to deploy to `environments` makes (W15-R03):
+/// `approval.waiting`, as the relay publishes it (the wait recorded it, `super::runs`).
+pub async fn waiting(hub: &Hub, run: &str, environments: Vec<String>) -> anyhow::Result<Vec<(String, Map<String, Value>)>> {
+    let Some((repo, mut s)) = subject(hub, run).await? else { return Ok(Vec::new()) };
     s.environments = environments;
-    emit(&hub, &repo, "approval.waiting", &s).await;
+    Ok(vec![("approval.waiting".to_owned(), crate::events::about(&repo, &s))])
 }
 
 /// `POST /_kiln/notify` with `{ to: [channels], message }`: a step's own message
@@ -1636,7 +1923,62 @@ pub async fn deliveries(hub: &Hub, q: &std::collections::HashMap<String, String>
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
+    use kiln_seams::clock::SimClock;
+
     use super::*;
+    use crate::ci::webhooks::tests::{endpoint, pass};
+
+    /// CP-T2.2 step 8 (AC-T2.2.1): do send agents' events through a rule to a webhook channel whose
+    /// endpoint is down for 10 minutes, then back; expect every message delivered once it's back,
+    /// in the order the events came, having been tried again and again meanwhile.
+    #[test]
+    fn cp_t2_2_a_rules_channel_down_for_10_minutes_gets_every_message_in_order() -> anyhow::Result<()> {
+        let clock = SimClock::new();
+        crate::rt::block_on(async move {
+            let rule = Rule { on: vec!["agent.finished".into()], cond: None, to: vec!["webhook:hook".into()], throttle: None };
+            let hub = crate::hub::tests::persisted_hub_on(Arc::new(clock.clone()), move |cfg| {
+                cfg.ci.allow_private_targets = vec!["127.0.0.1".into()];
+                cfg.ci.notify = vec![rule];
+            })
+            .await?;
+            let ep = endpoint()?;
+            ep.down.store(true, Ordering::SeqCst);
+            let url = format!("http://127.0.0.1:{}/hook", ep.port);
+            integrations::create(&hub, "webhook", "hook", json!({ "url": url }), integrations::Secrets { secret: Some("s3cret"), signing: None }, None, "test").await.map_err(anyhow::Error::msg)?;
+            crate::events::spawn(&hub);
+            spawn(&hub);
+            for _ in 0..2000 {
+                if hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_positions WHERE reader = 'notify'", [], |r| r.get::<_, i64>(0))?)).await? == 1 {
+                    break;
+                }
+                pass(&clock, Duration::from_secs(1)).await;
+            }
+            let made: Vec<String> = (1..=20).map(|n| format!("a{n:02}")).collect();
+            for id in &made {
+                agent_event(Arc::clone(&hub), json!({ "type": "agent.finished", "agent": { "id": id, "name": format!("agent {id}") }, "text": "done" })).await;
+                pass(&clock, Duration::from_secs(30)).await;
+            }
+            assert!(ep.got.lock().is_empty(), "nothing went while it was down");
+            assert!(ep.refused.load(Ordering::SeqCst) >= 8, "tried again and again over 10 minutes");
+            ep.down.store(false, Ordering::SeqCst);
+            let mut waited = 0;
+            while ep.got.lock().len() < made.len() && waited < 900 {
+                pass(&clock, Duration::from_secs(5)).await;
+                waited += 5;
+            }
+            let got: Vec<String> = ep.got.lock().iter().map(|(_, body)| body.pointer("/agent/id").and_then(Value::as_str).unwrap_or_default().to_owned()).collect();
+            let mut order: Vec<String> = Vec::new();
+            for id in got {
+                if !order.contains(&id) {
+                    order.push(id);
+                }
+            }
+            assert_eq!(order, made, "every message, in order, after {waited} s back");
+            Ok::<(), anyhow::Error>(())
+        })
+    }
 
     fn subject() -> Subject {
         Subject {
@@ -1716,7 +2058,7 @@ mod tests {
         assert_eq!(message("comment.reply", &s).1, "acme/app · Is this right, @rev? · https://kiln.example/diffs/D3");
         assert_eq!(message("mention", &s).0, "@ dev mentioned rev on D3 Parse dates");
         let m = Msg::of_run("mention", &s);
-        assert_eq!((m.people.clone(), m.what), (vec!["user:rev".to_owned()], "the diff"));
+        assert_eq!((m.people.clone(), m.what.as_str()), (vec!["user:rev".to_owned()], "the diff"));
         // A run's is its actor's.
         assert_eq!(Msg::of_run("run.failed", &subject()).people, vec!["ada".to_owned()]);
         let q = Subject { repo: "acme/app".into(), message: "9.2 GiB of 10.0 GiB (92 %)".into(), url: "https://kiln.example/ci/caches?repo=acme/app".into(), ..Subject::default() };

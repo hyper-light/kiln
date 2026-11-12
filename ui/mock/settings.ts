@@ -136,6 +136,24 @@ let integrations: Integration[] = [
   },
 ];
 
+/** What notification rules sent (W19-R06): one sent, one waiting on a channel that's down and tried again, one given up. */
+const deliveries = {
+  deliveries: [
+    { ts: T0 - 40, rule: "acme/app#1", event: "run.failed", run: "r-1042", channel: "webhook:audit", status: "pending", error: "HTTP 503", attempts: 4 },
+    { ts: T0 - 300, rule: "server#1", event: "agent.finished", run: "agent:builder", channel: "slack:#ci", status: "sent", error: null, attempts: 1 },
+    {
+      ts: T0 - 86_400,
+      rule: "acme/app#1",
+      event: "deploy.failed",
+      run: "r-1007",
+      channel: "email:ops@kiln.example.com",
+      status: "failed",
+      error: "connection refused (given up after 288 tries over a day)",
+      attempts: 288,
+    },
+  ],
+};
+
 const oidc: OidcIssuer = {
   issuer: "https://kiln.example.com/oidc",
   discovery: "https://kiln.example.com/oidc/.well-known/openid-configuration",
@@ -198,5 +216,6 @@ export async function handleSettings(req: http.IncomingMessage, res: http.Server
     return true;
   }
   if (p === "/api/ci/oidc" && m === "GET") return (ctx.json(res, 200, oidc), true);
+  if (p === "/api/ci/notify/deliveries" && m === "GET") return (ctx.json(res, 200, deliveries), true);
   return false;
 }

@@ -9,4 +9,11 @@ kvm: boolean,
 /**
  * Hypervisor.framework is usable (macOS).
  */
-hvf: boolean, nested: boolean, };
+hvf: boolean, nested: boolean, 
+/**
+ * It starts microVMs itself: a hypervisor it can use and the runtime that boots them, which kiln
+ * carries from kiln plan 01a1cd8e862e7169a074db3d5fa33f3d's step 16 (Shards, through Hex). Said by
+ * the runner; one that doesn't say so starts none (step 32: where microVM agents and the work
+ * they start are placed).
+ */
+microvm: boolean, };

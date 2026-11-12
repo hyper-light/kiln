@@ -63,7 +63,7 @@ async fn probe(tool: &str, path: &str, wd: &Path) -> Result<String, String> {
         .find(|p| p.is_file());
     let mut c = Command::new(found.as_deref().unwrap_or_else(|| Path::new(tool)));
     c.args(memo::version_args(tool)).current_dir(wd).env("PATH", path);
-    match crate::proc::output(c, Duration::from_secs(30)).await {
+    match crate::proc::output(c, crate::proc::VERSION_WITHIN).await {
         Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
         Ok(o) => Err(format!("`{tool}` didn't say its version: {}", String::from_utf8_lossy(&o.stderr).trim())),
         Err(e) => Err(format!("`{tool}` couldn't be asked its version: {e:#}")),

@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use super::kinds::{Kind, Protocol};
 use super::model::Status;
-use super::session::{Info, Spec};
+use super::session::{Info, Isolation, Spec};
 use crate::hub::Hub;
 
 /// A refusal: an HTTP status and why, in words the caller can act on.
@@ -68,6 +68,9 @@ impl Level {
 fn default_mode(k: &Kind) -> &'static str {
     if k.id == "devin" {
         return "accept-edits";
+    }
+    if k.id == "cursor" {
+        return super::kinds::CURSOR_DEFAULT_MODE;
     }
     match k.protocol {
         Protocol::Acp(_) => super::acp::KILN_ASK,
@@ -128,6 +131,22 @@ pub fn level(kind: &str, mode: &str) -> Option<Level> {
             super::antigravity::BYPASS => Some(Level::Bypass),
             _ => None,
         },
+        // Its modes are the tools it starts with; it asks before none of them.
+        Protocol::PiRpc => match mode {
+            super::pi::READ_ONLY => Some(Level::Plan),
+            super::pi::EDIT => Some(Level::AcceptEdits),
+            super::pi::FULL => Some(Level::Bypass),
+            _ => None,
+        },
+        // Cursor's Plan and Ask change nothing; its Agent has every tool and asks first for what its
+        // own approval settings don't let go ahead, edits among them or not as those say: placed
+        // with Accept edits, the most it may do unasked. kiln's Bypass answers every request yes.
+        Protocol::Acp(_) if k.id == "cursor" => match mode {
+            "plan" | "ask" => Some(Level::Plan),
+            "agent" => Some(Level::AcceptEdits),
+            super::acp::KILN_BYPASS => Some(Level::Bypass),
+            _ => None,
+        },
         Protocol::Acp(_) if k.id == "devin" => match mode {
             "plan" => Some(Level::Plan),
             "ask" => Some(Level::Ask),
@@ -158,6 +177,8 @@ fn modes_of(k: &Kind) -> Vec<(String, Level)> {
         Protocol::ClaudeStreamJson => super::claude::modes(true).into_iter().map(|m| m.id).collect(),
         Protocol::CodexAppServer => super::codex::modes(true).into_iter().map(|m| m.id).collect(),
         Protocol::AgyStreamJson => super::antigravity::modes().into_iter().map(|m| m.id).collect(),
+        Protocol::PiRpc => super::pi::modes().into_iter().map(|m| m.id).collect(),
+        Protocol::Acp(_) if k.id == "cursor" => super::kinds::cursor_modes().into_iter().map(|m| m.id).collect(),
         Protocol::Acp(_) if k.id == "devin" => ["plan", "ask", "accept-edits", "smart", "bypass"].map(str::to_owned).to_vec(),
         Protocol::Acp(_) => vec![super::acp::KILN_ASK.to_owned(), super::acp::KILN_BYPASS.to_owned()],
         Protocol::Terminal => Vec::new(),
@@ -168,8 +189,9 @@ fn modes_of(k: &Kind) -> Vec<(String, Level)> {
 /// The mode a child in harness `kind` starts in under a parent at `ceiling`: the one `asked` for,
 /// when it's within it; with none asked, its harness's default when that's within it, else the
 /// most its harness offers that is. Always one, so the harness's own settings (Claude Code's
-/// `defaultMode`) can't start it higher. `bypass_ok`: the parent may use bypass itself. Other ACP
-/// agents asked for nothing start in their own default mode (kiln learns their modes as they run).
+/// `defaultMode`) can't start it higher. `bypass_ok`: the parent may use bypass itself. ACP agents
+/// other than Devin and Cursor (whose modes kiln knows before they run) asked for nothing start in
+/// their own default mode (kiln learns their modes as they run).
 pub fn child_mode(kind: &str, asked: Option<&str>, ceiling: Level, bypass_ok: bool) -> Result<Option<String>, String> {
     let k = Kind::get(kind).ok_or_else(|| format!("unknown harness {kind:?}"))?;
     let known = modes_of(k);
@@ -198,7 +220,7 @@ pub fn child_mode(kind: &str, asked: Option<&str>, ceiling: Level, bypass_ok: bo
             }
             Ok(Some(mode.to_owned()))
         }
-        None if matches!(k.protocol, Protocol::Acp(_)) && k.id != "devin" && ceiling >= Level::Ask => Ok(None),
+        None if matches!(k.protocol, Protocol::Acp(_)) && k.id != "devin" && k.id != "cursor" && ceiling >= Level::Ask => Ok(None),
         None => {
             let default = default_mode(k);
             if within.iter().any(|(id, _)| id == default) {
@@ -499,6 +521,9 @@ pub struct Ask {
     pub count: Option<usize>,
     /// `folder` (the folder itself, the only one there is until workspaces are built).
     pub workspace: Option<String>,
+    /// `none`, a process on its machine (the default), or `microvm`, a microVM of its own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+    /// steps 17 and 32). An isolated agent's agents are isolated whatever it asks ([`isolation_for`]).
+    pub isolation: Option<String>,
     /// A card's helper (`super::about`), when kiln starts one for a person (`agents.about`): never
     /// from what an agent asks (`agents.start` can't hide the agents it starts).
     #[serde(skip)]
@@ -666,7 +691,7 @@ fn may_start_on(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) 
 /// lost owner ends the wait at once. The server itself (`local`) isn't a runner and holds no
 /// claim: it's taken when it alone can run it. A fleet with no runner that places sessions yet is
 /// picked from as before ([`pick`]).
-async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
+async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize, isolated: bool) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
     use crate::reach::place::{SessionAsk, SessionWord};
     let default = parent.map(target_of);
     let targets = may_start_on(hub, on, kind, default.as_deref())?;
@@ -687,7 +712,11 @@ async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: 
         return Ok(vec![(t, None); count]);
     };
     // What it needs of a machine beyond where it may go, as `on` spells it (`cpus=4`, `+gpu`).
-    let needs = on.filter(|o| named(hub, o).is_none()).and_then(|o| kiln_ci::sched::needs::parse(o).ok()).unwrap_or_default();
+    let mut needs = on.filter(|o| named(hub, o).is_none()).and_then(|o| kiln_ci::sched::needs::parse(o).ok()).unwrap_or_default();
+    // An isolated agent goes only where its runner starts microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+    if isolated {
+        needs.add("microvm").map_err(bad)?;
+    }
     let actor = parent.map_or_else(|| "person".to_owned(), |p| p.id.clone());
     let mut out = Vec::new();
     for _ in 0..count {
@@ -725,7 +754,7 @@ async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: 
 /// [`place_agents`], for reach's doors tests to drive with their lab's runners (docs/ci.md W05-R03).
 #[cfg(all(test, unix))]
 pub(crate) async fn place_agents_for_tests(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
-    place_agents(hub, parent, on, kind, count).await
+    place_agents(hub, parent, on, kind, count, false).await
 }
 
 /// The claims of agents placed that won't start (a check refused them): their owners let them go.
@@ -749,7 +778,7 @@ async fn lacks(hub: &Hub, target: &str, kind: &'static Kind) -> bool {
 }
 
 fn harness(id: &str) -> Result<&'static Kind, Refused> {
-    let kind = Kind::get(id).ok_or_else(|| bad(format!("unknown harness {id:?}: claude, codex, devin, gemini, opencode, goose, amp or antigravity")))?;
+    let kind = Kind::get(id).ok_or_else(|| bad(format!("unknown harness {id:?}: claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor or pi")))?;
     if !kind.structured() {
         return Err(bad(format!("{} has no structured mode", kind.name)));
     }
@@ -777,6 +806,36 @@ fn not_installed(hub: &Hub, target: &str, kind: &Kind) -> Refused {
         format!("{} isn't installed on {machine}: pick a machine that has it with `on`: {}", kind.name, with.join(", "))
     };
     (StatusCode::CONFLICT, why)
+}
+
+/// The isolation an agent starts with (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 17 and 32): what was asked
+/// (`none`, a process on its machine; `microvm`, a microVM of its own), and an isolated parent's,
+/// which its agents keep whatever they ask: one asked as a process under it is refused.
+pub fn isolation_for(asked: Option<&str>, parent: Option<&Info>) -> Result<Option<Isolation>, String> {
+    let inherited = parent.and_then(|p| p.isolation.clone());
+    match asked.map(str::trim) {
+        None | Some("") => Ok(inherited),
+        Some("none") => match inherited {
+            Some(_) => Err("an isolated agent's agents are isolated too: it can't start one as a process on its machine".to_owned()),
+            None => Ok(None),
+        },
+        Some(Isolation::MICROVM) => Ok(Some(inherited.unwrap_or_else(Isolation::microvm))),
+        Some(other) => Err(format!("`isolation` is \"none\" (a process on its machine) or \"microvm\" (a microVM of its own), not {other:?}")),
+    }
+}
+
+/// Whether agents on `target` (`local`, `agent:<machine>`) can be held isolated, in microVMs of
+/// their own: its runner says it starts microVMs (`virt.microvm`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+/// step 32); else why not. The server's own kiln starts none until it carries their runtime (step 16).
+pub fn isolation_on(hub: &Hub, target: &str) -> Result<(), String> {
+    let Some(machine) = target.strip_prefix("agent:") else {
+        return Err("the server's kiln starts no microVM itself until it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16): pick a runner that does with `on` (`microvm`)".to_owned());
+    };
+    match hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().map(|f| f.virt.microvm)) {
+        Some(true) => Ok(()),
+        Some(false) => Err(format!("{} doesn't start microVMs: its kiln starts them once it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16)", hub.shown(machine))),
+        None => Err(format!("{} hasn't said yet whether it starts microVMs: try again in a minute", hub.shown(machine))),
+    }
 }
 
 /// Whether agents on `target` (`local`, `agent:<machine>`) can have workspaces of their own: its
@@ -1122,7 +1181,8 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     let count = ask.count.unwrap_or(1).clamp(1, 16);
     // A parent's reach off holds its children to its machine.
     let on = by.parent.as_ref().filter(|p| p.reach.as_deref() == Some("off")).map(target_of).or_else(|| ask.on.clone());
-    let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count).await?;
+    let isolation = isolation_for(ask.isolation.as_deref(), by.parent.as_ref()).map_err(bad)?;
+    let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, isolation.is_some()).await?;
     let checked = async {
         let mut targets: Vec<&str> = placed.iter().map(|(t, _)| t.as_str()).collect();
         targets.dedup();
@@ -1135,6 +1195,10 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
             }
             if volume {
                 workspaces_on(hub, target).await.map_err(|why| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
+            }
+            // Before anything starts, so its claims are let go: a fallback's pick is checked too.
+            if isolation.is_some() {
+                isolation_on(hub, target).map_err(|why| (StatusCode::CONFLICT, format!("an agent can't run isolated there: {why}")))?;
             }
             if *target == "local" && !hub.cfg.terminal.enabled {
                 return Err(refuse("terminals (and so agents) are off on the server: pick a runner with `on`"));
@@ -1175,6 +1239,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         plan_run: by.plan_run.clone(),
         helper: ask.helper.clone(),
         workspace: volume.then(|| crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() }),
+        isolation,
         ..Spec::default()
     };
     tune(&mut spec);
@@ -1237,6 +1302,46 @@ pub fn children_brief(hub: &Hub, id: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32: an agent is isolated as asked, an isolated agent's agents are
+    /// isolated whatever they ask (its own image with them), and one asked as a process under it is refused.
+    #[test]
+    fn step32_an_isolated_agents_agents_are_isolated() -> Result<(), String> {
+        let host = Info { id: "host-1".into(), ..Info::default() };
+        let imaged = Isolation { image: Some("harness-claude".into()), ..Isolation::microvm() };
+        let vm = Info { id: "vm-1".into(), isolation: Some(imaged.clone()), ..Info::default() };
+        assert_eq!(isolation_for(None, None)?, None);
+        assert_eq!(isolation_for(Some("none"), Some(&host))?, None);
+        assert_eq!(isolation_for(Some("microvm"), None)?, Some(Isolation::microvm()));
+        assert_eq!(isolation_for(None, Some(&vm))?, Some(imaged.clone()));
+        assert_eq!(isolation_for(Some(" microvm "), Some(&vm))?, Some(imaged));
+        assert!(isolation_for(Some("none"), Some(&vm)).is_err(), "a process under an isolated agent is refused");
+        assert!(isolation_for(Some("container"), None).is_err(), "an isolation kiln doesn't know is refused");
+        Ok(())
+    }
+
+    /// Step 32: an isolated agent goes only to a runner that says it starts microVMs; the server's
+    /// kiln, a runner that says it doesn't, one that hasn't said yet and one kiln doesn't know each
+    /// refuse it, saying why.
+    #[test]
+    fn step32_isolated_agents_go_only_where_the_runner_starts_microvms() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let said = |name: &str, microvm: bool| crate::hub::AgentLive {
+                facts: Some(Box::new(kiln_ci::facts::RunnerFacts { virt: kiln_ci::facts::Virt { microvm, ..Default::default() }, ..Default::default() })),
+                ..crate::hub::tests::live_runner(name, "linux", "x86_64")
+            };
+            hub.put_agent(said("vm-box", true));
+            hub.put_agent(said("plain", false));
+            hub.put_agent(crate::hub::tests::live_runner("quiet", "linux", "x86_64"));
+            anyhow::ensure!(isolation_on(&hub, "agent:vm-box").is_ok(), "a runner that starts microVMs holds it");
+            for target in ["local", "agent:plain", "agent:quiet", "agent:nowhere"] {
+                let why = isolation_on(&hub, target).err().unwrap_or_default();
+                anyhow::ensure!(!why.is_empty(), "{target} refuses an isolated agent, saying why");
+            }
+            Ok(())
+        })
+    }
 
     /// How far `caller` reached `id` before goal 10 (plan 01a1a87b2dae step 2) gave the callers who
     /// see every session their answer without asking the store: what `access` must still answer.

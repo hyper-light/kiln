@@ -1,6 +1,7 @@
-//! Signing a machine's harnesses in and out from kiln (Claude Code, Codex, Devin), so `/login` and
-//! `/logout` work from the console: each harness's own CLI (`claude auth …`, `codex login …`, `devin auth …`)
-//! runs in a terminal kiln opens on that machine for the purpose (never listed as anyone's), and
+//! Signing a machine's harnesses in and out from kiln (Claude Code, Codex, Devin, Cursor, Pi), so
+//! `/login` and `/logout` work from the console: each harness's own CLI (`claude auth …`, `codex
+//! login …`, `devin auth …`, Cursor's `agent login`, `pi auth …`) runs in a terminal kiln opens on
+//! that machine for the purpose (never listed as anyone's), and
 //! what a sign-in asks for (a page to open, a code to enter there, a code or an API key to give
 //! back) is read from its output and shown in the console. What is typed in goes to the CLI only:
 //! it is never logged, kept once the sign-in ends, or shown again.
@@ -35,6 +36,9 @@ const CLAUDE_PASTE: &str = "Paste code here";
 const CLAUDE_PROMPT: &str = "Paste code here if prompted >";
 /// Devin's manual sign-in waits for the code its page shows.
 const DEVIN_PASTE: &str = "Paste the code from the sign-in page";
+/// Pi's Claude sign-in without a browser (`pi auth login anthropic --no-browser`, its "Copy code
+/// login") waits for the code Anthropic's page shows.
+const PI_PASTE: &str = "Paste the code Anthropic shows after you sign in";
 
 /// A way to sign in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -57,8 +61,11 @@ struct Cli {
     kind: &'static str,
     name: &'static str,
     program: &'static str,
+    /// What its CLI runs with besides its user's environment (`NAME=value`), else nothing.
+    env: &'static str,
     status: &'static str,
-    logout: &'static str,
+    /// Signing out: each run in turn.
+    logout: &'static [&'static str],
     methods: &'static [Method],
     read: fn(&str) -> Account,
 }
@@ -68,8 +75,9 @@ const CLIS: &[Cli] = &[
         kind: "claude",
         name: "Claude Code",
         program: "claude",
+        env: "",
         status: "auth status --json",
-        logout: "auth logout",
+        logout: &["auth logout"],
         methods: &[
             Method { id: "subscription", label: "Claude subscription", asks: Some("code"), args: "auth login --claudeai" },
             Method { id: "console", label: "Anthropic Console", asks: Some("code"), args: "auth login --console" },
@@ -81,8 +89,9 @@ const CLIS: &[Cli] = &[
         kind: "codex",
         name: "Codex",
         program: "codex",
+        env: "",
         status: "login status",
-        logout: "logout",
+        logout: &["logout"],
         methods: &[
             Method { id: "chatgpt", label: "ChatGPT account", asks: None, args: "login --device-auth" },
             Method { id: "api_key", label: "OpenAI API key", asks: Some("api_key"), args: "login --with-api-key" },
@@ -93,15 +102,52 @@ const CLIS: &[Cli] = &[
         kind: "devin",
         name: "Devin",
         program: "devin",
+        env: "",
         status: "auth status",
-        logout: "auth logout",
+        logout: &["auth logout"],
         methods: &[Method { id: "devin", label: "Devin account", asks: Some("code"), args: "auth login --force-manual-token-flow" }],
         read: read_devin,
+    },
+    // Cursor's CLI signs in on a page opened on any device and finishes by itself; with
+    // NO_OPEN_BROWSER it opens no browser on the machine and prints the page instead
+    // (cursor.com/docs/cli/reference/authentication).
+    Cli {
+        kind: "cursor",
+        name: "Cursor CLI",
+        program: "agent",
+        env: "NO_OPEN_BROWSER=1",
+        status: "status --format json",
+        logout: &["logout"],
+        methods: &[Method { id: "cursor", label: "Cursor account", asks: None, args: "login" }],
+        read: read_cursor,
+    },
+    // Pi signs in to each model provider on its own (`pi auth login <provider>`, its docs/cli.md):
+    // kiln offers the subscriptions it signs in to without a browser on the machine
+    // (`--no-browser`): Claude's copy-code sign-in, which asks for the code Anthropic's page shows,
+    // and ChatGPT's device code, which finishes by itself. Its other providers sign in in its own
+    // screen (`/login` there), or with their API keys in its environment.
+    Cli {
+        kind: "pi",
+        name: "Pi",
+        program: "pi",
+        env: "",
+        status: "--offline --list-models",
+        logout: &["auth logout anthropic", "auth logout openai-codex"],
+        methods: &[
+            Method { id: "anthropic", label: "Claude Pro or Max", asks: Some("code"), args: "auth login anthropic --no-browser" },
+            Method { id: "openai-codex", label: "ChatGPT Plus or Pro", asks: None, args: "auth login openai-codex --no-browser" },
+        ],
+        read: read_pi,
     },
 ];
 
 fn cli(kind: &str) -> anyhow::Result<&'static Cli> {
-    CLIS.iter().find(|c| c.kind == kind).ok_or_else(|| anyhow::anyhow!("kiln can't sign {kind} in or out (it can: claude, codex, devin)"))
+    CLIS.iter().find(|c| c.kind == kind).ok_or_else(|| anyhow::anyhow!("kiln can't sign {kind} in or out (it can: {})", CLIS.iter().map(|c| c.kind).collect::<Vec<_>>().join(", ")))
+}
+
+/// How its CLI is run: the program, with what it runs with first.
+fn invocation(cli: &Cli) -> String {
+    if cli.env.is_empty() { cli.program.to_owned() } else { format!("env {} {}", cli.env, cli.program) }
 }
 
 /// A harness's account on a machine.
@@ -169,6 +215,48 @@ fn read_codex(out: &str) -> Account {
     } else {
         Account { error: Some(if line.is_empty() { "it gave no status".to_owned() } else { line.to_owned() }), ..Account::default() }
     }
+}
+
+/// `agent status --format json` (Cursor's `src/commands/status.ts`): its `status` ("authenticated",
+/// "partially-authenticated", "unauthenticated", or "error" with its `message`) and, signed in, its
+/// `userInfo` (`email`, `teamName`).
+fn read_cursor(out: &str) -> Account {
+    let text = plain(out);
+    let json = text.find('{').zip(text.rfind('}')).and_then(|(a, b)| text.get(a..=b));
+    let Some(v) = json.and_then(|j| serde_json::from_str::<Value>(j).ok()) else {
+        return Account { error: Some(last_words(&text).unwrap_or_else(|| "it gave no status".to_owned())), ..Account::default() };
+    };
+    let s = |p: &str| v.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+    match s("/status").as_deref() {
+        Some("authenticated") => Account { signed_in: Some(true), method: Some("Cursor account".to_owned()), email: s("/userInfo/email"), org: s("/userInfo/teamName"), ..Account::default() },
+        Some("unauthenticated" | "partially-authenticated") => Account { signed_in: Some(false), ..Account::default() },
+        _ => Account { error: Some(s("/message").unwrap_or_else(|| "it gave no status".to_owned())), ..Account::default() },
+    }
+}
+
+/// `pi --offline --list-models` (Pi's `src/cli/list-models.ts`): the models it can use now, those
+/// of the providers it has credentials for, one a line under its header (`provider  model  context
+/// max-out  thinking  images`), or "No models available." with none. Signed in: some provider it
+/// can use; which, its method.
+fn read_pi(out: &str) -> Account {
+    let text = plain(out);
+    if text.lines().any(|l| l.trim_start().starts_with("No models available")) {
+        return Account { signed_in: Some(false), ..Account::default() };
+    }
+    let mut rows = text.lines().map(str::trim).skip_while(|l| !(l.starts_with("provider") && l.contains("model") && l.contains("context")));
+    if rows.next().is_none() {
+        return Account { error: Some(last_words(&text).unwrap_or_else(|| "it gave no status".to_owned())), ..Account::default() };
+    }
+    let mut providers: Vec<&str> = Vec::new();
+    for p in rows.filter_map(|l| l.split_whitespace().next()) {
+        if !providers.contains(&p) {
+            providers.push(p);
+        }
+    }
+    if providers.is_empty() {
+        return Account { signed_in: Some(false), ..Account::default() };
+    }
+    Account { signed_in: Some(true), method: Some(providers.join(", ")), ..Account::default() }
 }
 
 /// `devin auth status`: its sign-in method, then the user and account fields.
@@ -270,7 +358,7 @@ pub async fn status(hub: &Arc<Hub>, target: &str) -> anyhow::Result<Vec<Account>
 /// One harness's account on `target`.
 async fn account(hub: &Arc<Hub>, target: &str, cli: &'static Cli) -> Account {
     let id = crate::util::new_id();
-    let mut a = match run(hub, target, script(&id, cli.program, cli.status, false), QUICK_TIMEOUT).await {
+    let mut a = match run(hub, target, script(&id, &invocation(cli), cli.status, false), QUICK_TIMEOUT).await {
         Ok((Some(127), _)) => Account { error: Some(format!("{} isn't installed there", cli.program)), ..Account::default() },
         Ok((_, out)) => (cli.read)(&out),
         Err(e) => Account { error: Some(format!("{e:#}")), ..Account::default() },
@@ -292,7 +380,7 @@ pub async fn login(hub: &Arc<Hub>, target: &str, kind: &str, method: Option<&str
     reachable(hub, target)?;
     let id = crate::util::new_id();
     let key = m.asks == Some("api_key");
-    let session = open(hub, target, script(&id, cli.program, m.args, key))?;
+    let session = open(hub, target, script(&id, &invocation(cli), m.args, key))?;
     let flow = Flow {
         id: id.clone(),
         target: target.to_owned(),
@@ -522,7 +610,24 @@ pub async fn logout(hub: &Arc<Hub>, target: &str, kind: &str) -> anyhow::Result<
     };
     remember(Entry { flow: flow.clone(), session: None, expects: None, typed: Vec::new() });
     emit(hub, &flow);
-    let ran = run(hub, target, script(&id, cli.program, cli.logout, false), QUICK_TIMEOUT).await;
+    // Each step in turn, its output after the one before; the first that fails says how it went.
+    let mut ran: anyhow::Result<(Option<i32>, String)> = Ok((Some(0), String::new()));
+    for args in cli.logout {
+        match run(hub, target, script(&id, &invocation(cli), args, false), QUICK_TIMEOUT).await {
+            Ok((code, out)) => {
+                if let Ok((was, all)) = &mut ran {
+                    all.push_str(&out);
+                    if *was == Some(0) {
+                        *was = code;
+                    }
+                }
+            }
+            Err(e) => {
+                ran = Err(e);
+                break;
+            }
+        }
+    }
     let account = account(hub, target, cli).await;
     let signed_in = account.signed_in;
     finish(hub, &id, |f| {
@@ -561,7 +666,7 @@ fn reachable(hub: &Hub, target: &str) -> anyhow::Result<()> {
         anyhow::ensure!(a.terminal && !a.ephemeral, "{} has terminals (and so agents) turned off", a.shown());
         a.os == "windows"
     };
-    anyhow::ensure!(!windows, "signing in from kiln isn't available on Windows yet: run `claude auth login`, `codex login` or `devin auth login` on that machine");
+    anyhow::ensure!(!windows, "signing in from kiln isn't available on Windows yet: run `claude auth login`, `codex login`, `devin auth login`, `agent login` or `pi auth login` on that machine");
     Ok(())
 }
 
@@ -644,14 +749,15 @@ fn seen(out: &str, typed: &[String]) -> Seen {
     let mut lines: Vec<String> = Vec::new();
     for l in text.lines().map(str::trim) {
         let l = l.split_once(CLAUDE_PROMPT).map_or(l, |(_, rest)| rest.trim());
-        if l.is_empty() || l.contains(DEVIN_PASTE) || typed.iter().any(|t| l.contains(t.as_str())) || lines.last().is_some_and(|p| p == l) {
+        if l.is_empty() || l.contains(DEVIN_PASTE) || l.contains(PI_PASTE) || typed.iter().any(|t| l.contains(t.as_str())) || lines.last().is_some_and(|p| p == l) {
             continue;
         }
         lines.push(l.to_owned());
     }
-    let code = lines.iter().find_map(|l| device_code(l));
+    // On its own line (Codex), or ending one (Pi's "Open <page> and enter code: <code>").
+    let code = lines.iter().find_map(|l| device_code(l).or_else(|| l.rsplit_once("code: ").and_then(|(_, c)| device_code(c.trim()))));
     let skip = lines.len().saturating_sub(LINES);
-    Seen { url, code, prompts: text.matches(CLAUDE_PASTE).count() + text.matches(DEVIN_PASTE).count(), lines: lines.split_off(skip) }
+    Seen { url, code, prompts: text.matches(CLAUDE_PASTE).count() + text.matches(DEVIN_PASTE).count() + text.matches(PI_PASTE).count(), lines: lines.split_off(skip) }
 }
 
 /// A one-time code as a device sign-in shows it on its own line ("1FYU-ZAUR8").
@@ -809,8 +915,79 @@ mod tests {
         assert_eq!(read_devin("Error: status unavailable\r\n").error.as_deref(), Some("Error: status unavailable"));
         assert_eq!(read_devin("").signed_in, None);
         let c = cli("devin").ok();
-        assert_eq!(c.map(|c| (c.status, c.logout)), Some(("auth status", "auth logout")));
+        assert_eq!(c.map(|c| (c.status, c.logout)), Some(("auth status", &["auth logout"][..])));
         assert_eq!(c.and_then(|c| c.methods.first()).map(|m| (m.asks, m.args)), Some((Some("code"), "auth login --force-manual-token-flow")));
+    }
+
+    /// Cursor's `agent status --format json`, as its `src/commands/status.ts` (CLI 2026.11.11)
+    /// writes it (`JSON.stringify(status, null, 2)`, through a terminal): signed in with the account
+    /// and team the card shows, its ids left out; signed out; or what went wrong.
+    #[test]
+    fn cursor_status_reads_its_json() {
+        let signed = "{\r\n  \"status\": \"authenticated\",\r\n  \"isAuthenticated\": true,\r\n  \"hasAccessToken\": true,\r\n  \"hasRefreshToken\": true,\r\n  \"userInfo\": {\r\n    \"email\": \"agent@example.test\",\r\n    \"userId\": 4242,\r\n    \"firstName\": \"Test\",\r\n    \"lastName\": \"User\",\r\n    \"teamId\": 9,\r\n    \"teamName\": \"Example Team\"\r\n  }\r\n}\r\n";
+        let a = read_cursor(signed);
+        assert_eq!((a.signed_in, a.method.as_deref(), a.email.as_deref(), a.org.as_deref()), (Some(true), Some("Cursor account"), Some("agent@example.test"), Some("Example Team")));
+        assert!(!serde_json::to_string(&a).unwrap_or_default().contains("4242"));
+        assert_eq!(read_cursor("{\n  \"status\": \"unauthenticated\",\n  \"isAuthenticated\": false,\n  \"hasAccessToken\": false,\n  \"hasRefreshToken\": false,\n  \"message\": \"Not logged in\"\n}\n").signed_in, Some(false));
+        assert_eq!(read_cursor("{\"status\": \"partially-authenticated\", \"isAuthenticated\": false, \"hasAccessToken\": true, \"hasRefreshToken\": false, \"message\": \"Partially authenticated (missing refresh token)\"}").signed_in, Some(false));
+        assert_eq!(read_cursor("{\n  \"status\": \"error\",\n  \"message\": \"Status check error: fetch failed\"\n}\n").error.as_deref(), Some("Status check error: fetch failed"));
+        assert_eq!(read_cursor("sh: 1: agent: not found\r\n").error.as_deref(), Some("sh: 1: agent: not found"));
+        assert_eq!(read_cursor("").signed_in, None);
+        let c = cli("cursor").ok();
+        assert_eq!(c.map(|c| (invocation(c), c.status, c.logout)), Some(("env NO_OPEN_BROWSER=1 agent".to_owned(), "status --format json", &["logout"][..])));
+    }
+
+    /// `agent login` with NO_OPEN_BROWSER (its `src/commands/login.ts`): the page to open on any
+    /// device, then it waits for the sign-in there and finishes by itself; nothing to give back. Its
+    /// script opens no browser and reads the same in any shell.
+    #[test]
+    fn a_cursor_sign_in_gives_its_page_and_finishes_by_itself() {
+        let link = "https://cursor.com/loginDeepControl?challenge=synthetic&uuid=00000000-0000-4000-8000-000000000000&mode=login&redirectTarget=cli&supportsSelectedTeamLogin=true";
+        let out = format!("Starting login process...\r\nAuthenticating with Cursor...\r\nWaiting for browser authentication...\r\nOpen a browser and navigate to this link: {link}\r\n\r\nPress q to show a QR code to log in from another device.\r\n");
+        let s = seen(&out, &[]);
+        assert_eq!((s.url.as_deref(), s.code.as_deref(), s.prompts), (Some(link), None, 0));
+        assert!(s.lines.iter().any(|l| l.starts_with("Waiting for browser authentication")));
+        let c = cli("cursor").ok();
+        assert_eq!(c.and_then(|c| c.methods.first()).map(|m| (m.asks, m.args)), Some((None, "login")));
+        let script = c.map(|c| script("01abc", &invocation(c), "login", false)).unwrap_or_default();
+        assert!(crate::termsess::hidden(Some(&script)));
+        assert!(script.ends_with("exec env NO_OPEN_BROWSER=1 agent login'") && !script.trim_start_matches("sh -c '").trim_end_matches('\'').contains(['\'', '\\']), "{script}");
+    }
+
+    /// `pi --offline --list-models` (Pi 1.5.2's `src/cli/list-models.ts`): the providers it has
+    /// credentials for, from its models' rows; none, "No models available."
+    #[test]
+    fn pi_status_says_the_providers_it_can_use() {
+        let out = "provider      model                       context  max-out  thinking  images\r\nanthropic     claude-opus-5-5             1M       128K     yes       yes\r\nanthropic     claude-sonnet-5             1M       64K      yes       yes\r\nopenai-codex  gpt-6.1-sol                 400K     128K     yes       yes\r\n";
+        let a = read_pi(out);
+        assert_eq!((a.signed_in, a.method.as_deref()), (Some(true), Some("anthropic, openai-codex")));
+        // What it says on stderr first doesn't count.
+        let a = read_pi(&format!("Warning: errors loading models.json:\r\nUnexpected token\r\n{out}"));
+        assert_eq!(a.signed_in, Some(true));
+        assert_eq!(read_pi("No models available. Use /login or set an API key environment variable. See https://pi.dev/docs/latest/providers\r\n").signed_in, Some(false));
+        assert_eq!(read_pi("sh: 1: pi: not found\r\n").error.as_deref(), Some("sh: 1: pi: not found"));
+        assert_eq!(read_pi("").signed_in, None);
+        let c = cli("pi").ok();
+        assert_eq!(c.map(|c| (invocation(c), c.status, c.logout)), Some(("pi".to_owned(), "--offline --list-models", &["auth logout anthropic", "auth logout openai-codex"][..])));
+    }
+
+    /// Pi's sign-ins without a browser on the machine (its `src/cli/auth-login.ts` and its
+    /// providers' own words): Claude's copy-code sign-in gives its page and asks for the code
+    /// Anthropic shows; ChatGPT's device code gives its page and code and finishes by itself.
+    #[test]
+    fn pi_sign_ins_give_their_page_and_ask_for_a_code_or_finish_by_themselves() {
+        let link = "https://claude.ai/oauth/authorize?code=true&client_id=synthetic&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=synthetic&code_challenge_method=S256&state=synthetic";
+        let out = format!("Select Anthropic login method: Copy code login (headless)\r\nOpen this URL to sign in:\r\n  {link}\r\nComplete login in your browser, then copy the code Anthropic shows and paste it here.\r\nPaste the code Anthropic shows after you sign in: (code#state): ");
+        let s = seen(&out, &[]);
+        assert_eq!((s.url.as_deref(), s.prompts, s.code), (Some(link), 1, None));
+        assert!(s.lines.iter().all(|l| !l.contains(PI_PASTE)), "its prompt is the console's to show");
+        let s = seen(&format!("{out}synthetic-code#synthetic\r\nExchanging authorization code for tokens...\r\nLogged in to Anthropic. Credentials saved to /home/test/.pi/agent/auth.json\r\n"), &["synthetic-code#synthetic".to_owned()]);
+        assert!(s.lines.iter().all(|l| !l.contains("synthetic-code")) && s.lines.iter().any(|l| l.starts_with("Logged in to Anthropic")));
+        let out = "Select OpenAI Codex login method: Device code login (headless)\r\nOpen https://auth.openai.com/codex/device and enter code: 1FYU-ZAUR8\r\nWaiting for authentication...\r\n";
+        let s = seen(out, &[]);
+        assert_eq!((s.url.as_deref(), s.code.as_deref(), s.prompts), (Some("https://auth.openai.com/codex/device"), Some("1FYU-ZAUR8"), 0));
+        let methods: Vec<_> = cli("pi").map(|c| c.methods.iter().map(|m| (m.id, m.asks, m.args)).collect()).unwrap_or_default();
+        assert_eq!(methods, [("anthropic", Some("code"), "auth login anthropic --no-browser"), ("openai-codex", None, "auth login openai-codex --no-browser")]);
     }
 
     #[test]

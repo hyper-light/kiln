@@ -1,0 +1,194 @@
+Subject: the simulation's diagnosis of a member
+Why: Quiver's simulation of its persisted class (kiln's CP-T2.2 step 6) traces a node that never catches up: the core's state, each member's progress, the outbox, the Raft traffic per peer, the liveness stream's measures
+
+diff --git a/crates/focal-bus/src/member.rs b/crates/focal-bus/src/member.rs
+index 4dab94e0973974c18f9ea248a8fa8e79bbeb44fa..4096b4bad9e38a2102944436bd415ca8822587cf 100644
+--- a/crates/focal-bus/src/member.rs
++++ b/crates/focal-bus/src/member.rs
+@@ -719,6 +719,11 @@ pub struct Member {
+     compact_wanted: bool,
+     /// When the node's last wait ended: its busy period runs from here to its turn's end.
+     woke: Option<Instant>,
++    /// Under a simulation, the Raft messages the node sent, queued or dropped for each peer, and
++    /// took from each, by kind and what the replica said; the heartbeats its stream refused, why;
++    /// its waits as its stream judged them: for its diagnosis (`Member::core_state`).
++    #[cfg(feature = "sim")]
++    traffic: std::collections::BTreeMap<String, u64>,
+     /// Whether the node led at its last turn: a node that stops leading redirects what it owed.
+     leading: bool,
+     /// The drives one turn makes at most: the store's depth and one.
+@@ -1312,6 +1317,8 @@ impl Member {
+             emptied_seen: 0,
+             compact_wanted: false,
+             woke: None,
++            #[cfg(feature = "sim")]
++            traffic: std::collections::BTreeMap::new(),
+             leading: false,
+             drives,
+             due: false,
+@@ -1366,6 +1373,53 @@ impl Member {
+         )
+     }
+ 
++    /// The replica's core as a simulation's diagnosis tells it (`sim` feature): its role, term and
++    /// leader, its log's commit, applied and last index, whether a write of its waits for room,
++    /// the members its detectors suspect, its configuration's members and the peers its stream is
++    /// attached to, and, leading, each member's progress; then its outbox, its traffic, and its
++    /// liveness stream: the flush it measured, its timer's granularity, its wake, each pair.
++    #[cfg(feature = "sim")]
++    #[must_use]
++    pub fn core_state(&self) -> String {
++        use std::fmt::Write as _;
++        let raft = &self.replica.core().raft;
++        let log = raft.log();
++        let mut said = format!(
++            "{:?} in term {}, leader {}, commit {}, applied {}, last {:?}, stalled {}, suspects {:?}, members {:?}, attached {:?}",
++            raft.state(),
++            raft.term(),
++            raft.leader_id(),
++            log.committed(),
++            log.applied(),
++            log.last_index().ok(),
++            self.replica.is_stalled(),
++            raft.suspected(),
++            raft.configuration().members().collect::<Vec<_>>(),
++            self.attached
++        );
++        if raft.state() == hyper_raft::StateRole::Leader {
++            for (member, progress) in raft.tracker().iter() {
++                let _ = write!(said, "; {member}: {progress:?}");
++            }
++        }
++        let _ = write!(
++            said,
++            "\n  liveness flush {:?} granularity {:?} wake {:?} failed {} writing {}",
++            self.liveness.flush_mean(),
++            self.liveness.granularity(),
++            self.liveness.wake(),
++            self.liveness_failed,
++            self.liveness_write.is_some()
++        );
++        for peer in &self.attached {
++            let _ = write!(said, "; {peer}: {:?}", self.liveness.report(*peer));
++        }
++        let waiting: Vec<(PeerId, usize)> =
++            self.outbox.iter().map(|(peer, w)| (*peer, w.len())).collect();
++        let _ = write!(said, "\n  outbox {waiting:?} traffic {:?}", self.traffic);
++        said
++    }
++
+     /// The node's id.
+     pub const fn id(&self) -> u64 {
+         self.id
+@@ -1533,11 +1587,12 @@ impl Member {
+                 ..
+             } => {
+                 let arrival = self.now_ns(now);
+-                if self
+-                    .liveness
+-                    .on_heartbeat(peer, frame.bytes(), arrival, &mut self.asked)
+-                    .is_err()
++                if let Err(_refusal) =
++                    self.liveness
++                        .on_heartbeat(peer, frame.bytes(), arrival, &mut self.asked)
+                 {
++                    #[cfg(feature = "sim")]
++                    self.note(format!("from {peer} heartbeat refused, {_refusal:?}"));
+                     self.stats.refused_heartbeats = self.stats.refused_heartbeats.saturating_add(1);
+                 }
+                 endpoint.release(frame);
+@@ -1612,7 +1667,15 @@ impl Member {
+                 // could not hold is stepped again once the window gave memory back
+                 // ([`Member::relieve_window`]): refused for good, a follower whose window had
+                 // filled its memory took no append again, and fell behind for good.
+-                if let Err(ReplicaError::Budget(_)) = self.replica.step(message)
++                #[cfg(feature = "sim")]
++                let kind = message.msg_type;
++                let stepped = self.replica.step(message);
++                #[cfg(feature = "sim")]
++                self.note(match &stepped {
++                    Ok(()) => format!("from {peer} {kind:?} stepped"),
++                    Err(refused) => format!("from {peer} {kind:?} refused, {refused:?}"),
++                });
++                if let Err(ReplicaError::Budget(_)) = stepped
+                     && self.relieve_window()
+                     && let Ok(again) = Message::decode(bytes)
+                 {
+@@ -1913,10 +1976,16 @@ impl Member {
+         let waiting = self.outbox.get(&to).is_some_and(|w| !w.is_empty());
+         if !waiting {
+             match endpoint.send_frame(to, LANE, Kind::Raft, &self.encoded) {
+-                Ok(()) => return,
++                Ok(()) => {
++                    #[cfg(feature = "sim")]
++                    self.note(format!("to {to} {:?} sent", message.msg_type));
++                    return;
++                }
+                 Err(Refusal::LaneFull) => {}
+                 // No connection yet, or the member is gone.
+-                Err(_) => {
++                Err(_refusal) => {
++                    #[cfg(feature = "sim")]
++                    self.note(format!("to {to} {:?} dropped, {_refusal:?}", message.msg_type));
+                     self.stats.dropped_messages = self.stats.dropped_messages.saturating_add(1);
+                     let _ = self.replica.report_unreachable(to);
+                     return;
+@@ -1926,12 +1995,23 @@ impl Member {
+         let bound = self.outbox_bound;
+         let queue = self.outbox.entry(to).or_default();
+         if queue.len() >= bound {
++            #[cfg(feature = "sim")]
++            self.note(format!("to {to} {:?} dropped, outbox full", message.msg_type));
+             self.stats.dropped_messages = self.stats.dropped_messages.saturating_add(1);
+             let _ = self.replica.report_unreachable(to);
+             return;
+         }
+         queue.push_back(self.encoded.clone());
+         self.stats.outboxed = self.stats.outboxed.saturating_add(1);
++        #[cfg(feature = "sim")]
++        self.note(format!("to {to} {:?} queued", message.msg_type));
++    }
++
++    /// Under a simulation, one more of what the node's traffic counts.
++    #[cfg(feature = "sim")]
++    fn note(&mut self, what: String) {
++        let count = self.traffic.entry(what).or_default();
++        *count = count.saturating_add(1);
+     }
+ 
+     /// Sends what waited in `peer`'s outbox while its lane has room.
+@@ -1948,6 +2028,11 @@ impl Member {
+             match endpoint.send_frame(peer, LANE, Kind::Raft, front) {
+                 Ok(()) => {
+                     queue.pop_front();
++                    #[cfg(feature = "sim")]
++                    {
++                        let count = self.traffic.entry(format!("to {peer} flushed")).or_default();
++                        *count = count.saturating_add(1);
++                    }
+                 }
+                 Err(Refusal::LaneFull) => return,
+                 Err(_) => {
+@@ -2332,9 +2417,22 @@ impl Member {
+     pub fn waited(&mut self, began: Instant, woke: Instant) {
+         self.woke = Some(woke);
+         let Some(at) = self.liveness.wake() else {
++            #[cfg(feature = "sim")]
++            self.note("waited, no wake asked".to_owned());
+             return;
+         };
+         let (began, woke) = (self.now_ns(began), self.now_ns(woke));
++        #[cfg(feature = "sim")]
++        self.note(
++            if began < at && woke >= at {
++                "waited past the wake"
++            } else if woke < at {
++                "waited, woke before the wake"
++            } else {
++                "waited, began past the wake"
++            }
++            .to_owned(),
++        );
+         if began < at && woke >= at {
+             self.liveness.on_wait(at, woke);
+         }

@@ -2,7 +2,7 @@ Subject: RamStore for tests alone: the write-ahead log mandatory
 Why: Quiver's plan mandates hyper-durable's GroupStore on a real device and makes RamStore test-only (kiln's CP-T2.1, T-T2.1.2: RamStore outside cfg(test) fails the build). RamStore is compiled only for this crate's own tests or where a dev-dependency asks for the test-store feature, so a production build that names it fails; the crate's own tests ask for it through a dev-dependency on itself.
 
 diff --git a/crates/hyper-durable/Cargo.toml b/crates/hyper-durable/Cargo.toml
-index fe08357..0121eda 100644
+index f66cfbc934ba1ab814a6f960fb34756a45bcb5a2..b830fd642d13d00939d1c2edfbaec6146cf392f4 100644
 --- a/crates/hyper-durable/Cargo.toml
 +++ b/crates/hyper-durable/Cargo.toml
 @@ -11,6 +11,10 @@ repository.workspace = true
@@ -25,7 +25,7 @@ index fe08357..0121eda 100644
  # The oracles the simulated groups are held to, and their crash enumeration by fork (docs/sim.md
  # S-6, `tests/support/cluster.rs`).
 diff --git a/crates/hyper-durable/src/lib.rs b/crates/hyper-durable/src/lib.rs
-index 8474549..4eeba92 100644
+index 84745497b55c3f4ccfc42f75cb5e0bb51648b2a3..4eeba92f61e88afddc3e8cc03d286817c5608d0b 100644
 --- a/crates/hyper-durable/src/lib.rs
 +++ b/crates/hyper-durable/src/lib.rs
 @@ -39,6 +39,10 @@ mod compaction;

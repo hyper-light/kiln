@@ -4,6 +4,7 @@ import type { ApprovalBrief } from "./ApprovalBrief";
 import type { Capacity } from "./Capacity";
 import type { ExitInfo } from "./ExitInfo";
 import type { HeldGoals } from "./HeldGoals";
+import type { Isolation } from "./Isolation";
 import type { Limit } from "./Limit";
 import type { MovePlan } from "./MovePlan";
 import type { Objective } from "./Objective";
@@ -165,4 +166,8 @@ no_bypass?: boolean,
 /**
  * Its workspace of its own, when it has one (as `Spec::workspace`).
  */
-workspace?: Workspace, };
+workspace?: Workspace, 
+/**
+ * Its isolation, when it's held in a microVM of its own (as `Spec::isolation`).
+ */
+isolation?: Isolation, };

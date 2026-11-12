@@ -1899,7 +1899,7 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `has <item>`, `matches <glob>`, units on sizes (`50Gi`) and durations, `label <name>` and
   `!label <name>`, combined with `&&`, `||`, `!` and parentheses. Facts are W13's (`os`, `arch`,
   `os.version`, `cpu.cores`, `cpu.model`, `cpu.flags`, `mem.total`, `mem.free`, `disk.free`,
-  `disk.total`, `gpu.count`, `gpu.model`, `gpu.memory`, `virt.kvm`, `virt.hvf`,
+  `disk.total`, `gpu.count`, `gpu.model`, `gpu.memory`, `virt.kvm`, `virt.hvf`, `virt.microvm`,
   `executors`, `tools.<name>.version`, `binfmt` platforms, custom facts). Unknown facts are false,
   never errors at run time; the editor warns.
 - **W05-R23 Preferences** (opt-in: only when a rule or the job declares them): weighted terms over
@@ -4293,6 +4293,7 @@ support (G-11, G-18, G-25, G-27, G-28).
   | `mem.total`, `mem.free`, `disk.total`, `disk.free` (of the work directory's volume) | as today's host samples |
   | `gpu.count`, `gpu.model`, `gpu.memory`, `gpu.driver` | `nvidia-smi`, `rocm-smi`, Metal device names on macOS |
   | `virt.kvm`, `virt.hvf`, `virt.nested` | `/dev/kvm` access, Hypervisor.framework entitlement check |
+  | `virt.microvm` | the runner's own word that it starts microVMs: a usable hypervisor and the runtime kiln carries (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 16 and 32) |
   | `executors` | which of `host`, `docker`, `firecracker`, `shards`, `k8s` work right now (each probed for real: a no-op run), with versions (`docker.version`, `docker.rootless`, `podman.version`, `firecracker.version`, `shards.version`, `shards.features`) |
   | `binfmt` | platforms registered for QEMU user emulation |
   | `tools.<name>.version` | `git`, `node`, `python3`, `cargo`, `go`, `java`, `dotnet`, `docker buildx`, `shards`, … found on the `PATH` a leg's steps have (W13-R03): the runner's, then the folders only its user's login shell has |
@@ -6628,8 +6629,23 @@ with W11-AC03's tenants).
     - Slack takes an incoming webhook or a bot token.
     - PagerDuty triggers an incident on a failure, and resolves it on the fix.
     - Webhooks are signed with `X-Kiln-Signature-256` (HMAC-SHA256 of the body).
-  - Deliveries retry after 2 and 15 seconds and are recorded (`GET /api/ci/notify/deliveries`).
-    An integration's Verify sends a test message.
+  - Deliveries are made from kiln.events (CP-T2.2 step 8; docs/bus.md, "kiln's events"), in
+    order for each channel, at least once, and a kill -9 of the server loses none:
+    - a run's end (`run.*`, `leg.flaky`), a deployment's (`deploy.*`), a run waiting for its
+      reviewers (`approval.waiting`) and a land queue's ejection (`land.ejected`) are recorded in
+      the transaction that makes them; the rest as they're said;
+    - each event's deliveries (its rules' channels, after `throttle`) are logged `pending` with
+      their messages in the transaction that moves the rules' reader past it, and the throttles
+      they take with them;
+    - a sender for each channel sends its deliveries one at a time, oldest first; one that fails
+      is tried again after 2 s, 4 s, 8 s… up to 5 minutes between tries, for a day, then logged
+      `failed`. A tracker's change is tried once (it retries its own), and a channel no
+      integration answers to fails at once;
+    - a release's move brings its messages up to date on its own, as before; a kill while it does
+      leaves the rest to the release's next move.
+
+    They're recorded (`GET /api/ci/notify/deliveries`). An integration's Verify sends a test
+    message.
   - `kiln/notify@v1` sends a step's own message (W07-R10).
   - Verified end to end, against a local fake:
     - `run.failed` reached Slack and a webhook whose signature checked;
@@ -6651,19 +6667,33 @@ with W11-AC03's tenants).
     included), an organization's repositories', or one repository's.
   - Each event is POSTed as JSON with `X-Kiln-Event`, `X-Kiln-Delivery` and
     `X-Kiln-Signature-256` (HMAC-SHA256 of the body with the integration's secret).
-  - Delivery is in order for each subscriber, by a worker of its own:
-    - each attempt uses the integration as it is by then;
-    - attempts come after 0, 2, 15 and 60 seconds;
-    - 1,000 events may wait; beyond that they are logged as `dropped`.
-  - Every delivery is logged, with its body, before it is sent (14 days):
-    - a restart resumes the ones still `pending`;
+  - Delivered from kiln.events (CP-T2.2 step 8; docs/bus.md, "kiln's events"): in order for each
+    subscriber, at least once, and a kill -9 of the server loses none:
+    - a run's or a job's change is recorded in the transaction that makes it (triggers on `runs`
+      and `jobs`); `agent`, `queue` and the `cd_*` events as the hub tells kiln's clients of
+      them;
+    - the events are read from the bus's persisted topic from a position kept in kiln.db, each
+      event's deliveries logged `pending`, with their bodies, in the transaction that moves the
+      position past it;
+    - `X-Kiln-Delivery` is the same each time an event goes to a subscriber: one that has it
+      already may drop it (an event comes twice when the server was killed after sending it and
+      before recording that it went);
+    - a sender for each subscriber sends its deliveries one at a time, oldest first, each attempt
+      with the integration as it is by then; one not answered 2xx is tried again after 2 s, 4 s,
+      8 s… up to 5 minutes between tries, for a day, then logged `failed`;
+    - 100,000 may wait for one subscriber; beyond that the next are logged `dropped`.
+  - Every delivery is logged, with its body (14 days once it's sent or given up):
+    - a restart goes on with the ones still `pending`;
     - `GET /api/ci/webhooks/deliveries[/:id]` lists them;
     - `POST …/:id/redeliver` sends one again, with the same delivery id.
   - Verified end to end, against a local fake:
     - run and job events reached a server-wide subscriber, every signature checked;
     - an `org:other` subscriber got nothing;
-    - a subscriber answering 500 was tried four times per event, and logged `failed`;
+    - a subscriber answering 500 was tried four times per event, and logged `failed` (before
+      CP-T2.2 step 8; since, it's tried for a day);
     - a restart mid-retry resumed the 22 pending deliveries;
+    - T-T2.2.1: a subscriber down for 10 minutes while runs were made and moved got every change
+      once it was back, in order (`t_t2_2_1_a_webhook_endpoint_down_for_10_minutes_gets_every_event_in_order`);
     - pointing that subscriber at a working URL sent the rest there;
     - redelivering a failed delivery sent it there with its own delivery id;
     - `run.failed` and `run.succeeded` arrived with their repository.

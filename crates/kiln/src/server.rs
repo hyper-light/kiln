@@ -139,6 +139,11 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     hub.load_topo().await;
     // Where kiln keeps its bytes (docs/blobs.md): what was kept before taken in, what's kept read.
     crate::blobs::start(&hub).await;
+    // kiln's events, from their outbox to the bus's persisted topic, and the notification rules'
+    // deliveries made from it (docs/bus.md, "kiln's events"); the outgoing webhooks' start with
+    // the CI engine.
+    crate::events::start(&hub, if cfg.ci.enabled { &["notify", "webhooks"] } else { &["notify"] });
+    crate::ci::notify::spawn(&hub);
     // The CI engine (docs/ci.md), when turned on.
     crate::ci::dispatch::spawn(hub.clone());
     // What runners can take and what waits: told to the pages as it changes (docs/reach.md §2.2).

@@ -1,7 +1,7 @@
 //! W20-R01: installed Agent Skills reach every structured harness through its prompt transport.
 //! Claude loads its plugins natively; Codex receives native skill input items. ACP (Devin,
-//! OpenCode, Gemini, Goose, Amp) and Antigravity receive the selected instructions with their
-//! asset directory. Ordinary turns advertise metadata only, for progressive discovery.
+//! OpenCode, Gemini, Goose, Amp, Cursor), Antigravity and Pi receive the selected instructions with
+//! their asset directory. Ordinary turns advertise metadata only, for progressive discovery.
 //! No global harness settings or repository files are changed. Disk work runs on the blocking pool.
 
 use std::path::{Path, PathBuf};
@@ -53,6 +53,7 @@ fn input_pointer(protocol: Protocol) -> Option<&'static str> {
         Protocol::CodexAppServer => Some("/params/input"),
         Protocol::Acp(_) => Some("/params/prompt"),
         Protocol::AgyStreamJson => Some("/message/content"),
+        Protocol::PiRpc => Some("/message"),
         Protocol::ClaudeStreamJson | Protocol::Terminal => None,
     }
 }
@@ -62,6 +63,7 @@ fn is_prompt(protocol: Protocol, value: &Value) -> bool {
         Protocol::CodexAppServer => matches!(value.get("method").and_then(Value::as_str), Some("turn/start" | "turn/steer")),
         Protocol::Acp(_) => value.get("method").and_then(Value::as_str) == Some("session/prompt"),
         Protocol::AgyStreamJson => value.get("event").and_then(Value::as_str) == Some("user"),
+        Protocol::PiRpc => matches!(value.get("type").and_then(Value::as_str), Some("prompt" | "steer")),
         Protocol::ClaudeStreamJson | Protocol::Terminal => false,
     }
 }
@@ -73,6 +75,7 @@ pub fn needed(protocol: Protocol, writes: &[String]) -> bool {
         Protocol::CodexAppServer => w.contains("\"method\":\"turn/start\"") || w.contains("\"method\":\"turn/steer\""),
         Protocol::Acp(_) => w.contains("\"method\":\"session/prompt\""),
         Protocol::AgyStreamJson => w.contains("\"event\":\"user\""),
+        Protocol::PiRpc => w.contains("\"type\":\"prompt\"") || w.contains("\"type\":\"steer\""),
         Protocol::ClaudeStreamJson | Protocol::Terminal => false,
     })
 }
@@ -344,6 +347,8 @@ mod tests {
             let value = match protocol {
                 Protocol::CodexAppServer => json!({"id":7,"method":"turn/start","params":{"threadId":"thread","input":input}}),
                 Protocol::Acp(_) => json!({"id":7,"method":"session/prompt","params":{"sessionId":"session","prompt":input}}),
+                // Its pictures go beside its words; the conversation carried over comes before them (`harness::pi`).
+                Protocol::PiRpc => json!({"id":"m7","type":"prompt","message":"/tools:review the diff","images":[{"type":"image","data":"keep-image","mimeType":"image/png"}]}),
                 _ => json!({"event":"user","message":{"content":"/tools:review the diff"}}),
             };
             let sent = deliver(root.path(), protocol, true, vec![value.to_string()]);
@@ -357,7 +362,8 @@ mod tests {
             } else {
                 anyhow::ensure!(wire.contains("Run scripts/check.py on the diff."), "{} didn't receive instructions", kind.id);
             }
-            if protocol != Protocol::AgyStreamJson { anyhow::ensure!(wire.contains("keep-image") && wire.contains("Earlier conversation context."), "attachment or carried context lost"); }
+            if protocol == Protocol::PiRpc { anyhow::ensure!(wire.contains("keep-image") && sent.get("id") == Some(&json!("m7")), "Pi's picture or its message id lost"); }
+            else if protocol != Protocol::AgyStreamJson { anyhow::ensure!(wire.contains("keep-image") && wire.contains("Earlier conversation context."), "attachment or carried context lost"); }
             let other = tempfile::tempdir()?;
             let isolated = deliver(other.path(), protocol, true, vec![value.to_string()]);
             anyhow::ensure!(!isolated.join("").contains("Run scripts/check.py") && !isolated.join("").contains(&skill.to_string_lossy().to_string()));

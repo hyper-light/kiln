@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Quiver's ephemeral class against NATS core, Redis Pub/Sub and Kafka, class for class, on one
-# machine (CLAUDE.md §7; bench/README.md, "The comparison"), beside the kernel's own wake-up (the
-# floor under a subscriber that waits). Every broker up in Docker on CPUs of their own (Quiver and
-# the floor have none: they run in the generator's process); then RUNS rounds of every load, each
+# machine (CLAUDE.md §7; bench/README.md, "The comparison"), beside two floors: the kernel's own
+# wake-up (the floor under a subscriber that waits) and a relay that only forwards over TCP (the
+# floor under a broker a hop away, its part of the lead the deployment's). Every broker up in Docker
+# on CPUs of their own, the relay on the same CPUs as a process of its own (Quiver and the wake-up
+# have none: they run in the generator's process); then RUNS rounds of every load, each
 # load's systems back to back on the generator's CPUs, their order turned each round, so on a
 # machine whose load moves every system's runs of a load come from the same minutes. Every run is
 # added to OUT/runs.tsv and printed to OUT/<system>.md with its profile (what its threads and its
@@ -13,7 +15,7 @@
 #   bench/compare.sh OUT
 #
 # The loads and the placement, from the environment (defaults in brackets):
-#   SYSTEMS [wake quiver nats redis kafka]  RATES [100000]  SUBSCRIBERS [1 100 1000]  WAITS [wait busy]
+#   SYSTEMS [wake tcp quiver nats redis kafka]  RATES [100000]  SUBSCRIBERS [1 100 1000]  WAITS [wait busy]
 #   RUNS [3]  DURATION [30] seconds measured  WARMUP [5] seconds  PAYLOAD [256] bytes
 #   BROKER_CPUS [8-15]: the broker's CPUs (on fedora's i9-14900HX, four P-cores, both threads each)
 #   CLIENT_CPUS [0-7,16-31]: the generator's: its publisher and subscribers, and Quiver's node
@@ -29,7 +31,7 @@ ulimit -n "$(ulimit -Hn)"
 out=${1:?usage: bench/compare.sh OUT}
 # An absolute path: cargo runs a bench from its package's folder.
 mkdir -p "$out" && out=$(cd "$out" && pwd)
-systems=${SYSTEMS:-wake quiver nats redis kafka}
+systems=${SYSTEMS:-wake tcp quiver nats redis kafka}
 rates=${RATES:-100000}
 fanouts=${SUBSCRIBERS:-1 100 1000}
 waits=${WAITS:-wait busy}
@@ -60,13 +62,18 @@ export QUIVER_COMMIT
 cargo bench --locked -q -p quiver-bench --bench fanout --no-run
 taskset -c "$client_cpus" bash bench/plant.sh "$out"
 
-# The brokers' containers, by system.
+# The brokers' containers, by system, and the relay's process.
 declare -A containers=()
+relay_pid=
 stop() {
   for system in "${!containers[@]}"; do
     docker stop -t 10 "${containers[$system]}" >/dev/null 2>&1 || true
   done
   containers=()
+  if [ -n "$relay_pid" ]; then
+    kill "$relay_pid" 2>/dev/null || true
+    relay_pid=
+  fi
 }
 trap stop EXIT
 # Stopped (a watchdog, systemctl stop), it exits, so the brokers it started stop with it.
@@ -115,7 +122,7 @@ ready() {
 # is measured), so the runs interleave: on a machine whose load moves, each load's runs of every
 # system come from the same minutes, not one system's hour against another's.
 for system in $systems; do
-  case $system in quiver | wake) continue ;; esac
+  case $system in quiver | wake | tcp) continue ;; esac
   start "$system"
   n=0
   until ready "$system"; do
@@ -128,6 +135,26 @@ for system in $systems; do
   done
   docker inspect --format '- broker: {{.Config.Image}}, CPUs {{.HostConfig.CpusetCpus}}' "${containers[$system]}" >> "$out/$system.md"
 done
+
+# The floor over TCP's relay: the bench itself as a server (`relay`), on the brokers' CPUs, a
+# writer for each; its runs read its process's CPU (`--broker-pid`: its time, as it polls), and its
+# log says what each run's topic took.
+if [[ " $systems " == *" tcp "* ]]; then
+  exe=$(cargo bench --locked -q -p quiver-bench --bench fanout --no-run --message-format=json \
+    | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1)
+  taskset -c "$broker_cpus" "$exe" relay >> "$out/tcp-relay.log" 2>&1 &
+  relay_pid=$!
+  n=0
+  until grep -q '^relay: on ' "$out/tcp-relay.log" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -ge 100 ] || ! kill -0 "$relay_pid" 2>/dev/null; then
+      cat "$out/tcp-relay.log" >&2 || true
+      exit 1
+    fi
+    sleep 0.1
+  done
+  echo "- relay: pid $relay_pid, CPUs $broker_cpus" >> "$out/tcp.md"
+fi
 
 # Run r of every load, each load's systems back to back, their order turned by one each run (no
 # system always first or last).
@@ -144,6 +171,7 @@ for r in $(seq 1 "$runs"); do
           if [ -n "${containers[$system]:-}" ]; then
             flags+=(--broker-container "${containers[$system]}" --profiles "$out/profiles")
           fi
+          if [ "$system" = tcp ]; then flags+=(--broker-pid "$relay_pid"); fi
           taskset -c "$client_cpus" cargo bench --locked -q -p quiver-bench --bench fanout -- \
             fanout "${flags[@]}" | tee -a "$out/$system.md"
         done

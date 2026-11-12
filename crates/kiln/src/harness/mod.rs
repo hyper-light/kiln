@@ -5,7 +5,9 @@
 //! * [`core`] — a session's state plus what came out of the last step (updates, stdin lines).
 //! * [`claude`] — Claude Code over stream-json and the control protocol.
 //! * [`codex`] — Codex over its app-server (JSON-RPC v2).
-//! * [`acp`] — any Agent Client Protocol agent (Devin, Gemini CLI, opencode, Goose, Amp's adapter).
+//! * [`acp`] — any Agent Client Protocol agent (Devin, Gemini CLI, opencode, Goose, Amp's adapter,
+//!   Cursor's CLI).
+//! * [`pi`] — Pi over its RPC mode (JSON commands and events on stdio).
 //! * [`diff`] — line diffs for edit previews.
 //! * [`handoff`] — a conversation carried from one harness to another (switching models across them).
 //! * [`kinds`] — the registry of harnesses and their adapters.
@@ -68,6 +70,7 @@ pub mod opened;
 pub mod ops;
 pub mod packed;
 pub mod pause;
+pub mod pi;
 pub mod port;
 pub mod queued;
 pub mod registry;
