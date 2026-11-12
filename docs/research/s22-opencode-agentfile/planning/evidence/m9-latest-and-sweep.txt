@@ -1,0 +1,6 @@
+M9 run 2026-11-12T07:45:10Z
+GITHUB_LATEST v1.19.5 published 2026-10-28T06:17:49Z
+RELEASES process-daemon-v0.5.2@2026-11-11 v2.2.7@2026-11-10 v2.2.6@2026-11-06 process-daemon-v0.5.0@2026-11-05 v2.2.5@2026-10-30 v2.2.4@2026-10-30
+NPM_CLI_LATEST 2.2.7 2026-11-10T10:33:01.652Z
+S19_EVIDENCE_DIR ls: /Users/adalundhe/.cache/s19-claude-research: No such file or directory
+S22_FIRST_RUN_EVIDENCE ls: /Users/adalundhe/.cache/s22-opencode-research/evidence: No such file or directory

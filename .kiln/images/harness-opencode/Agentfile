@@ -1,0 +1,49 @@
+# opencode as a harness kiln runs in a Shards microVM: OpenCode 2's own Linux build, pinned in
+# pin.json by pin.sh, started by harness.json as kiln starts it (`opencode acp`). Kiln plan
+# 01a1ce705e2f7773af54b299f1de42f5, on the layout steps 19 to 28 share; fN are its research's
+# findings (research 01a1ce705e307593bd11f26bf9f7b9a9).
+#
+# `kiln agentfiles context opencode DIR --variant gnu` (or musl) writes the opencode-<arch>-<libc>
+# directories HARNESS takes, each file checked against pin.json (HARNESS would take an http(s)
+# source with no checksum), and prints the recipe its image is tagged with. No credential is in
+# the image: a user's sign-in lives in their own volume (f19).
+#
+#   kiln agentfiles context opencode DIR --variant gnu
+#   shards build --platform linux/amd64,linux/arm64 DIR
+#   kiln agentfiles context opencode DIR --variant musl --base <a musl image>
+#   shards build --platform linux/amd64,linux/arm64 --build-arg BASE=<a musl image> \
+#     --build-arg OPENCODE_LIBC=musl DIR
+
+# Any base will do, so a project's own toolchain image works. The default carries git, an ssh
+# client, curl and CA certificates; opencode's glibc builds need only glibc 2.17 or later, so it
+# needs nothing added (f12).
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+# gnu, or musl for a musl base such as Alpine.
+ARG OPENCODE_LIBC=gnu
+
+FROM ${BASE} AS base-gnu
+
+# opencode's musl builds need libstdc++ (which brings libgcc), and on arm64 the distribution's
+# ripgrep: the ripgrep opencode fetches for arm64 Linux is a glibc build (f13, f22, f35).
+FROM ${BASE} AS base-musl
+RUN apk add --no-cache libstdc++ ripgrep
+
+FROM base-${OPENCODE_LIBC}
+ARG TARGETARCH
+ARG OPENCODE_LIBC
+
+HARNESS opencode FROM ./opencode-${TARGETARCH}-${OPENCODE_LIBC}
+
+# Its reach, every part named (networks are default deny): a network of its own, names through
+# the microVM's resolver, and TCP 443 out, for its providers, models.dev, npm and GitHub (f21).
+# These are the bring-up's three lines, until step 9 grants providers by name. The server that
+# `opencode acp` talks to listens on the harness's own loopback, which needs no grant (f15, f16).
+NETWORK --dns --egress=443/tcp provider FOR opencode
+EXPOSE --harnesses=opencode 443/tcp AS egress FOR provider
+CONNECT opencode WITH opencode ON provider
+
+# The project, and the user's own opencode: harness.json puts the four XDG roots under
+# /home/opencode, where opencode keeps its settings, its sessions and sign-in (opencode.db) and its
+# cache (f17, f18, f19). HOME stays the domain's /tmp, a scratch tmpfs lost when it ends (f16).
+VOLUME --target-kind=harness /workspace FOR opencode
+VOLUME --target-kind=harness /home/opencode FOR opencode

@@ -98,6 +98,16 @@ pub const ALL: &[Builtin] = &[
         pin: include_str!("../../../../.kiln/images/harness-pi/pin.json"),
         files: &[("harness.json", include_str!("../../../../.kiln/images/harness-pi/harness.json"))],
     },
+    // OpenCode 2, its own Linux build for each platform and libc, over ACP as kiln's opencode kind
+    // starts it, `opencode acp` (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 22). Its musl build
+    // (OPENCODE_LIBC=musl, on a musl base) also takes the base's libstdc++ and ripgrep.
+    Builtin {
+        name: "harness-opencode",
+        harness: "opencode",
+        text: include_str!("../../../../.kiln/images/harness-opencode/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-opencode/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-opencode/harness.json"))],
+    },
     // Gemini CLI, Google's npm package on Node.js's own Linux build, as kiln's Gemini kind starts it,
     // `--acp` (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 21). Its system settings turn its
     // update check off.
@@ -151,6 +161,9 @@ mod codex_tests;
 
 #[cfg(test)]
 mod pi_tests;
+
+#[cfg(test)]
+mod opencode_tests;
 
 #[cfg(test)]
 mod gemini_tests;
