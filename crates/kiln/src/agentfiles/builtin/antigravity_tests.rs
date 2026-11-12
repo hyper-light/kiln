@@ -193,6 +193,16 @@ fn check_no_signin(name: &str, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The smoke: `agy --version`, answered by the version and a newline, the bytes 1.5.6's build for
+/// linux/amd64 wrote (31 2e 35 2e 36 0a: docs/research/s26-agy-agentfile/evidence/e_smoke_bytes.txt).
+fn check_smoke(smoke: &super::Smoke, version: &str) -> anyhow::Result<()> {
+    ensure!(smoke.args == ["--version"], "the smoke runs agy {:?}, not --version", smoke.args);
+    let expected = smoke.expected(version);
+    ensure!(expected == format!("{version}\n"), "the smoke expects {expected:?}, not the version and a newline");
+    ensure!(version != "1.5.6" || expected.as_bytes() == [0x31, 0x2e, 0x35, 0x2e, 0x36, 0x0a], "the smoke expects {expected:?}, not what 1.5.6 wrote");
+    Ok(())
+}
+
 /// The pin with one edit.
 fn edited(pin: &str, edit: impl FnOnce(&mut Value) -> Option<()>) -> anyhow::Result<String> {
     let mut p: Value = serde_json::from_str(pin)?;
@@ -347,6 +357,23 @@ fn antigravity_agentfile_grants_its_harness_what_it_lists_alone() -> anyhow::Res
 }
 
 #[test]
+fn antigravity_smoke_expects_what_agy_prints() -> anyhow::Result<()> {
+    let b = agy()?;
+    let pin = check_pin(b.pin)?;
+    let version = pin.get("version").and_then(Value::as_str).unwrap_or_default();
+    check_smoke(&b.smoke, version)?;
+    let changes = [
+        super::Smoke { args: &["--version"], stdout: "{version}" },
+        super::Smoke { args: &["--version"], stdout: " {version}\n" },
+        super::Smoke { args: &["version"], stdout: "{version}\n" },
+    ];
+    for smoke in &changes {
+        ensure!(check_smoke(smoke, version).is_err(), "a smoke of agy {:?} expecting {:?} passed", smoke.args, smoke.stdout);
+    }
+    Ok(())
+}
+
+#[test]
 fn antigravity_files_carry_no_signin() -> anyhow::Result<()> {
     let b = agy()?;
     check_no_signin("the Agentfile", b.text)?;
@@ -369,7 +396,10 @@ fn antigravity_files_carry_no_signin() -> anyhow::Result<()> {
 /// refuses it at that line.
 #[test]
 fn antigravity_agentfile_passes_shards_own_check() -> anyhow::Result<()> {
-    let Some(bin) = std::env::var_os("KILN_TEST_SHARDS") else { return Ok(()) };
+    let Some(bin) = std::env::var_os("KILN_TEST_SHARDS") else {
+        eprintln!("skipped: KILN_TEST_SHARDS names no shards binary");
+        return Ok(());
+    };
     let text = agy()?.text;
     crate::rt::block_on(async move {
         let root = tempfile::tempdir()?;
