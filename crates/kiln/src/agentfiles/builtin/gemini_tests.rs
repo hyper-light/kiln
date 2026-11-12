@@ -611,3 +611,101 @@ fn step21_gemini_smoke_runs_its_node_on_its_entry() -> anyhow::Result<()> {
     anyhow::ensure!(says("/smoke", None)?);
     Ok(())
 }
+
+/// Every path under `dir`, relative and `/`-separated, with its metadata (links not followed), sorted.
+fn walk(dir: &std::path::Path) -> anyhow::Result<Vec<(String, std::fs::Metadata)>> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d)? {
+            let path = e?.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            if meta.is_dir() {
+                todo.push(path.clone());
+            }
+            out.push((path.strip_prefix(dir)?.to_string_lossy().replace('\\', "/"), meta));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// A file's SHA-256, in hex, read a MiB at a time.
+fn sha256_of(path: &std::path::Path) -> anyhow::Result<String> {
+    use sha2::Digest as _;
+    let mut hash = sha2::Sha256::new();
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            return Ok(hex::encode(hash.finalize()));
+        }
+        hash.update(buf.get(..n).unwrap_or_default());
+    }
+}
+
+/// Live, where a test names a folder for it (`KILN_TEST_LIVE_CONTEXT`, under `~/.cache` on kiln's Linux
+/// machines): the fetcher makes Gemini's context for linux/amd64 and linux/arm64 from npm's registry and
+/// nodejs.org, through the one unpacker. Each harness directory holds the npm package's files at its
+/// root, as many and as large in all as the pin's tree says; node/bin/node and node/LICENSE alone under
+/// node/, each hashing to its pinned member; and kiln's harness.json and system settings as embedded.
+/// Nothing in it is a link, every directory is 0755 and no file is writable by its group or others, as
+/// Gemini needs of its system settings and the directories above them (f24). Gemini isn't run.
+#[test]
+fn step21_a_live_gemini_context_holds_the_pinned_builds() -> anyhow::Result<()> {
+    let Some(root) = std::env::var_os("KILN_TEST_LIVE_CONTEXT") else {
+        eprintln!("skipped: KILN_TEST_LIVE_CONTEXT names no folder");
+        return Ok(());
+    };
+    let gemini = gemini()?;
+    let pin: Value = serde_json::from_str(gemini.pin)?;
+    crate::rt::block_on(async move {
+        let dir = tempfile::tempdir_in(&root)?;
+        let platforms: Vec<String> = ARCHES.iter().map(|(p, _)| (*p).to_owned()).collect();
+        crate::agentfiles::context::materialize(gemini, &platforms, None, dir.path()).await?;
+        let top: Vec<String> = walk(dir.path())?.into_iter().map(|(p, _)| p).filter(|p| !p.contains('/')).collect();
+        anyhow::ensure!(top == ["Agentfile", "gemini-amd64", "gemini-arm64"], "the context holds {top:?}");
+        let entry = str_at(&pin, "/verified/gemini/entry");
+        let mut matched = 0;
+        for (i, (platform, _)) in ARCHES.iter().enumerate() {
+            let harness = dir.path().join(format!("gemini-{}", platform.trim_start_matches("linux/")));
+            let all = walk(&harness)?;
+            let links: Vec<&String> = all.iter().filter(|(_, m)| m.file_type().is_symlink()).map(|(p, _)| p).collect();
+            anyhow::ensure!(links.is_empty(), "{platform}: links {links:?}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let root = std::fs::metadata(&harness)?.permissions().mode() & 0o7777;
+                anyhow::ensure!(root == 0o755, "{platform}: the harness's directory is {root:o}");
+                let loose: Vec<String> = all
+                    .iter()
+                    .filter(|(_, m)| if m.is_dir() { m.permissions().mode() & 0o7777 != 0o755 } else { m.permissions().mode() & 0o022 != 0 })
+                    .map(|(p, m)| format!("{p} {:o}", m.permissions().mode() & 0o7777))
+                    .collect();
+                anyhow::ensure!(loose.is_empty(), "{platform}: a directory not 0755 or a file others may write: {loose:?}");
+            }
+            let under_node: Vec<&str> = all.iter().map(|(p, _)| p.as_str()).filter(|p| *p == "node" || p.starts_with("node/")).collect();
+            anyhow::ensure!(under_node == ["node", "node/LICENSE", "node/bin", "node/bin/node"], "{platform}: node/ holds {under_node:?}");
+            let kiln_files = ["harness.json", "system-settings.json"];
+            for name in kiln_files {
+                anyhow::ensure!(std::fs::read_to_string(harness.join(name))? == file(gemini, name)?, "{platform}: {name} isn't the embedded one");
+            }
+            let tree: Vec<&(String, std::fs::Metadata)> = all.iter().filter(|(p, m)| m.is_file() && !p.starts_with("node/") && !kiln_files.contains(&p.as_str())).collect();
+            let bytes: u64 = tree.iter().map(|(_, m)| m.len()).sum();
+            let (want_files, want_bytes) = (pin.pointer("/verified/gemini/files").and_then(Value::as_u64), pin.pointer(&format!("/builds/{i}/files/0/unpack/unpacked_bytes")).and_then(Value::as_u64));
+            anyhow::ensure!(u64::try_from(tree.len()).ok() == want_files && Some(bytes) == want_bytes, "{platform}: the package's {} files of {bytes} bytes, pinned {want_files:?} of {want_bytes:?}", tree.len());
+            anyhow::ensure!(tree.iter().any(|(p, _)| p == entry), "{platform}: no {entry}");
+            for (member, path, _) in MEMBERS {
+                let pinned = pin.pointer(&format!("/builds/{i}/files")).and_then(Value::as_array).and_then(|fs| fs.iter().find(|f| str_at(f, "/path") == path)).ok_or_else(|| anyhow::anyhow!("{platform}: no {path} pinned"))?;
+                let got = sha256_of(&harness.join(path))?;
+                anyhow::ensure!(got == str_at(pinned, "/unpack/sha256"), "{platform}: {path} SHA-256 {got}, the pin's {member} {}", str_at(pinned, "/unpack/sha256"));
+                println!("MATCH {platform} {path} {got}");
+                matched += 1;
+            }
+            println!("TREE {platform} {} files {bytes} bytes", tree.len());
+        }
+        anyhow::ensure!(matched == 2 * MEMBERS.len(), "{matched} of {} members match their pins", 2 * MEMBERS.len());
+        Ok(())
+    })
+}
