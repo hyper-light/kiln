@@ -1,0 +1,12 @@
+[2m[kiln] on d1323898b255a3ed435eb83fa0f7b0cf · macos/aarch64 · 28 of 32 cores idle · 59 GB free[0m
+Adas-Mac-Studio.local:  31G at /Users/adalundhe/.cache/s25-step3
+ 20K	/Users/adalundhe/.cache/s25-step3/unit.log
+ 24K	/Users/adalundhe/.cache/s25-step3/clippy.log
+ 64K	/Users/adalundhe/.cache/s25-step3/step3.patch
+100K	/Users/adalundhe/.cache/s25-step3/kind-args.orig
+466M	/Users/adalundhe/.cache/s25-step3/kiln
+ 30G	/Users/adalundhe/.cache/s25-step3/kiln-target
+removed
+/dev/disk3s5   3.6Ti   1.6Ti   2.0Ti    46%    8.8M   21G    0%   /System/Volumes/Data
+[2m[kiln] used memory not measured over 4 s; OOM kills not seen here[0m
+exit 0 (try 1)

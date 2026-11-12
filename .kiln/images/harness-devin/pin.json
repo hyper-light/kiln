@@ -1,0 +1,44 @@
+{
+  "harness": "devin",
+  "version": "3000.12.43",
+  "verified": "sha256 from Cognition's versioned manifest over HTTPS, equal to current/ when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403 or 404)",
+  "manifest": {
+    "url": "https://static.devin.ai/cli/3000.12.43/manifest.json",
+    "sha256": "093e9492b3227bfc7be8a57114448611bf8af6573af7ac3866d3ff85abadb1c1"
+  },
+  "read_at": "2026-11-12T08:48:32Z",
+  "base": {
+    "ref": "buildpack-deps:trixie-scm",
+    "digest": "sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10"
+  },
+  "builds": [
+    {
+      "platform": "linux/amd64",
+      "files": [
+        {
+          "url": "https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-x86_64-unknown-linux.tar.gz",
+          "sha256": "6a19997b5fc2d6ba1a8c341d4e2b12f1b78cad5d415ee9c0ca413a8d52a99562",
+          "size": 71424183,
+          "path": ".",
+          "unpack": {
+            "format": "tar.gz"
+          }
+        }
+      ]
+    },
+    {
+      "platform": "linux/arm64",
+      "files": [
+        {
+          "url": "https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-aarch64-unknown-linux.tar.gz",
+          "sha256": "1eaa07d2181ed26f5789cf6b3617d39a2459c25f1bc5a51cc5cc703db7f95274",
+          "size": 67806876,
+          "path": ".",
+          "unpack": {
+            "format": "tar.gz"
+          }
+        }
+      ]
+    }
+  ]
+}

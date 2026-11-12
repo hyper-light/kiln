@@ -61,6 +61,15 @@ pub const ALL: &[Builtin] = &[
         pin: include_str!("../../../../.kiln/images/harness-antigravity/pin.json"),
         files: &[("harness.json", include_str!("../../../../.kiln/images/harness-antigravity/harness.json"))],
     },
+    // Devin for Terminal, Cognition's own static builds, as kiln's Devin kind starts it (`devin acp`;
+    // kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 25).
+    Builtin {
+        name: "harness-devin",
+        harness: "devin",
+        text: include_str!("../../../../.kiln/images/harness-devin/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-devin/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-devin/harness.json"))],
+    },
 ];
 
 /// One as the list shows it.
@@ -89,6 +98,9 @@ mod amp_tests;
 
 #[cfg(test)]
 mod antigravity_tests;
+
+#[cfg(test)]
+mod devin_tests;
 
 #[cfg(test)]
 mod tests {
