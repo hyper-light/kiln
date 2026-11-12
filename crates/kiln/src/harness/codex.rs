@@ -105,6 +105,8 @@ enum Pending {
     Models,
     Suggest(String),
     Skills,
+    /// W20-R01: session-scoped skill roots, registered before a queued turn is released.
+    InstalledSkillRoots,
     Hooks,
     Mcp,
     /// thread/revert, cutting the timeline from this event.
@@ -321,6 +323,10 @@ pub struct Codex {
     now: Option<String>,
     #[serde(default)]
     interrupt_on_start: bool,
+    /// A stop request is outstanding until the turn actually ends, even after its RPC is
+    /// acknowledged. Unsent input must stay queued meanwhile (CP-T3.2).
+    #[serde(default)]
+    interrupting: bool,
     /// The reasoning effort for turns (None: the model's default).
     effort: Option<String>,
     /// The service tier for the thread and its turns, as kiln set it ("" standard, else a tier's
@@ -460,6 +466,13 @@ pub struct Codex {
 }
 
 impl Codex {
+    pub(crate) fn retained_input_ids(&self) -> Vec<super::admission::LegacyFlight> {
+        self.turn_messages.iter().cloned().chain(self.pending.values().filter_map(|pending| match pending {
+            Pending::Turn(id) | Pending::Steer(id, _) => Some(id.clone()),
+            Pending::ChildTurn { m, .. } | Pending::ChildSteer { m, .. } => Some(m.id.clone()),
+            _ => None,
+        })).chain(self.relays.values().flat_map(|ids| ids.iter().cloned())).collect::<std::collections::BTreeSet<_>>().into_iter().map(|id| super::admission::LegacyFlight { id, protocol: super::admission::FlightProtocol::Codex, request: None }).collect()
+    }
     pub fn from_spec(spec: &super::session::Spec) -> Self {
         let mut c = Self::new(spec.resume.clone(), spec.model.clone(), spec.mode.clone(), spec.allow_bypass);
         c.effort = spec.effort.clone().filter(|e| !e.is_empty());
@@ -484,6 +497,7 @@ impl Codex {
             waiting: Vec::new(),
             now: None,
             interrupt_on_start: false,
+            interrupting: false,
             effort: None,
             speed: None,
             resume,
@@ -1286,11 +1300,19 @@ impl Codex {
         self.injecting || self.turn.is_some() || matches!(self.thread_status, Some(Status::Running | Status::Waiting)) || own_approval || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
     }
 
+    fn installed_skill_roots(&mut self, core: &mut Core) {
+        if !core.session_id.is_empty() {
+            // W20-R01: process-local discovery roots, never the shared Codex home/config.
+            let folder = crate::skills::place::root().join("sessions").join(&core.session_id);
+            self.request(core, Pending::InstalledSkillRoots, "skills/extraRoots/set", json!({"extraRoots": [folder]}));
+        }
+    }
+
     fn accepting(&self, core: &Core) -> bool {
-        self.thread.is_some() && !self.reopen && !self.injecting
+        core.input_ready() && self.thread.is_some() && !self.reopen && !self.injecting
             && core.state.status != Status::Exited
             && !matches!(self.thread_status, Some(Status::Starting | Status::Exited))
-            && !self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Thread | Pending::History | Pending::Inject))
+            && !self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Thread | Pending::History | Pending::Inject | Pending::InstalledSkillRoots))
     }
 
     fn restore_waiting(&mut self, core: &mut Core) -> bool {
@@ -1298,10 +1320,19 @@ impl Codex {
             return false;
         }
         for m in std::mem::take(&mut self.waiting).into_iter().rev() {
+            // CP-T3.2: an old private buffer cannot resurrect input already sent, unsent, or
+            // removed by a rewind. An edited copy in the durable queue takes precedence.
+            if core.state.delivery.get(&m.id).is_some_and(|d| matches!(d, Delivery::Sent | Delivery::Started | Delivery::Completed | Delivery::Cancelled))
+                || (core.state.delivery.get(&m.id) == Some(&Delivery::Queued) && core.get(&m.id).is_none())
+            {
+                core.state.queue.retain(|q| q.id != m.id);
+                continue;
+            }
             let m = match core.state.queue.iter().position(|q| q.id == m.id) {
                 Some(pos) => core.state.queue.remove(pos),
                 None => m,
             };
+            core.state.queue.retain(|q| q.id != m.id);
             core.state.queue.insert(0, m);
         }
         core.touch_state();
@@ -1396,6 +1427,7 @@ impl Codex {
         self.asks.clear();
         self.permissions_changing = false;
         self.interrupt_on_start = false;
+        self.interrupting = false;
         self.turn_permissions = None;
         self.withheld.clear();
         self.stopped.clear();
@@ -1426,6 +1458,9 @@ impl Codex {
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         self.restore_waiting(core);
         match cmd {
+            Command::Admit { token, epoch, .. } | Command::MailAck { token, epoch, .. } => core.refuse_owner_mail(Some(token), epoch),
+            Command::MailPeers { epoch, .. } => core.refuse_owner_mail(None, epoch),
+            Command::MailHandoff { client, .. } => { let epoch = core.state.epoch; core.refuse_owner_mail(None, epoch); core.reply(client, serde_json::json!({"error":{"code":super::state_view::Error::Unreadable}})); },
             Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => {
                 // A checkpoint anchors the prompt's moment: kiln's go-back file restore
                 // (`harness::goback`) reaches back to it (Codex's own rewind has no files side).
@@ -1626,6 +1661,8 @@ impl Codex {
                     self.run(core, Run::McpRemove { name: name.clone(), client }, vec!["mcp".into(), "remove".into(), "--".into(), name]);
                 }
             }
+            Command::StateRead { client, .. } => core.reply(client, json!({"error": {"code": super::state_view::Error::Unreadable}})),
+            Command::AtState { client, .. } => core.reply(client, json!({"error": {"code": super::state_view::Error::Unreadable}})),
             Command::SkillView { name, client } => match core.state.skills.iter().find(|s| s.name == name).and_then(|s| s.path.clone()) {
                 Some(path) => core.effects.push(Effect::Read { client, paths: vec![path] }),
                 None => core.reply(client, json!({"error": format!("This session has no skill named {name}.")})),
@@ -1642,6 +1679,8 @@ impl Codex {
                 self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, mode);
             }
             Command::SkillsReload => {
+                core.skills_changed();
+                self.installed_skill_roots(core);
                 let cwd = core.state.cwd.clone();
                 self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd], "forceReload": true}));
             }
@@ -1932,10 +1971,14 @@ impl Codex {
     }
 
     fn interrupt(&mut self, core: &mut Core) {
+        // A deferred steer must stay queued for the next turn when this one is stopped.
+        self.steer_on_start.clear();
         if let (Some(thread), Some(turn)) = (self.thread.clone(), self.turn.clone()) {
+            self.interrupting = true;
             self.interrupt_on_start = false;
             self.request(core, Pending::Interrupt, "turn/interrupt", json!({"threadId": thread, "turnId": turn}));
         } else if self.pending.values().any(|p| matches!(p, Pending::Turn(_))) {
+            self.interrupting = true;
             self.interrupt_on_start = true;
         }
     }
@@ -1953,8 +1996,15 @@ impl Codex {
             core.state.goal = clip_middle(&m.text, 600).0;
         }
         if !self.accepting(core) {
+            // CP-T3.2: discovery roots may reload during a live turn. Preserve steering intent
+            // until registration answers, so that a brief readiness hold does not queue it for
+            // the rest of a long turn.
+            if mode == SendMode::Steer && self.busy(core) && self.now.is_none() && !self.interrupt_on_start && !self.interrupting {
+                self.steer_on_start.push(m.id.clone());
+            }
             if mode == SendMode::Now {
                 core.state.queue.insert(0, m);
+                self.interrupt(core);
             } else {
                 core.state.queue.push(m);
             }
@@ -1964,7 +2014,7 @@ impl Codex {
         let Some(thread) = self.thread.clone() else { return };
         let busy = self.busy(core);
         match (busy, mode, self.turn.clone()) {
-            (true, SendMode::Steer, Some(turn)) => {
+            (true, SendMode::Steer, Some(turn)) if self.now.is_none() && !self.interrupt_on_start && !self.interrupting => {
                 let items = self.items(&m);
                 self.request(core, Pending::Steer(m.id.clone(), Some(m.clone())), "turn/steer", json!({"threadId": thread, "expectedTurnId": turn, "input": items, "clientUserMessageId": m.id}));
                 self.turn_messages.push(m.id.clone());
@@ -1975,6 +2025,13 @@ impl Codex {
                 core.state.queue.insert(0, m);
                 core.touch_state();
                 self.interrupt(core);
+            }
+            (true, SendMode::Steer, None) if self.now.is_none() && !self.interrupt_on_start && !self.interrupting => {
+                // CP-T3.2: turn/start is in flight. Steer as soon as its turn id arrives,
+                // rather than leaving agent-to-agent input behind a turn that may never end.
+                self.steer_on_start.push(m.id.clone());
+                core.state.queue.push(m);
+                core.touch_state();
             }
             (true, _, _) => {
                 core.state.queue.push(m);
@@ -2008,6 +2065,7 @@ impl Codex {
     }
 
     fn start_turn(&mut self, core: &mut Core, thread: &str, m: QueueItem) {
+        self.interrupting = false;
         if self.now.as_deref() == Some(&m.id) {
             self.now = None;
         }
@@ -2094,9 +2152,10 @@ impl Codex {
         self.next(core);
     }
 
-    /// The turn has its id: the queued messages to steer into it go in.
+    /// The turn has its id and readiness holds have ended: deferred steers go into it. A stop
+    /// keeps them in the durable queue for the next turn.
     fn steer_waiting(&mut self, core: &mut Core) {
-        if self.turn.is_none() {
+        if self.turn.is_none() || !self.accepting(core) || self.now.is_some() || self.interrupt_on_start || self.interrupting {
             return;
         }
         for id in std::mem::take(&mut self.steer_on_start) {
@@ -2456,19 +2515,21 @@ impl Codex {
                 Pending::Turn(id) => {
                     self.permissions_changing = false;
                     self.interrupt_on_start = false;
+                    self.interrupting = false;
                     self.turn_permissions = None;
                     self.turn_messages.retain(|m| m != &id);
                     if self.turn.is_none() {
                         core.state.turn_started = None;
                         core.state.doing = None;
                     }
-                    core.state.delivery.insert(id, Delivery::Cancelled);
-                    self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
+                    if !core.input_retained(&id) { core.state.delivery.insert(id, Delivery::Cancelled); }
+                    self.notice(core, Level::Error, format!("Codex refused the message; accepted work remains retained for retry: {msg}"));
                     core.touch_state();
                 }
                 Pending::Steer(id, _) => {
-                    core.state.delivery.insert(id, Delivery::Cancelled);
-                    self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
+                    self.turn_messages.retain(|message| message != &id);
+                    if !core.input_retained(&id) { core.state.delivery.insert(id, Delivery::Cancelled); }
+                    self.notice(core, Level::Error, format!("Codex refused the message; accepted work remains retained for retry: {msg}"));
                     core.touch_state();
                 }
                 // Codex takes nothing on that subagent's thread from kiln (a multi-agent v2 agent,
@@ -2556,6 +2617,12 @@ impl Codex {
                     core.state.inventory.skills = Known::Ready;
                     core.touch_state();
                 }
+                Pending::InstalledSkillRoots => {
+                    core.installed_skill_roots = false;
+                    self.notice(core, Level::Warn, format!("Codex couldn't register installed skill roots; skill instructions remain available through kiln: {msg}"));
+                    self.steer_waiting(core);
+                    self.next(core);
+                }
                 Pending::Plugins => {
                     core.state.inventory.plugins = Known::Unsupported;
                     core.touch_state();
@@ -2605,6 +2672,7 @@ impl Codex {
         match kind {
             Pending::Initialize => {
                 core.write(&json!({"method": "initialized"}));
+                self.installed_skill_roots(core);
                 let (approval, sandbox, _) = self.policies(core);
                 let cwd = core.state.cwd.clone();
                 let mut params = json!({"cwd": cwd, "approvalPolicy": approval, "sandbox": sandbox});
@@ -2659,6 +2727,7 @@ impl Codex {
                 }
                 let thread = result.get("thread").cloned().unwrap_or(Value::Null);
                 if let Some(id) = thread.get("id").and_then(Value::as_str) {
+                    if self.thread.as_deref() != Some(id) { core.skills_provider_ready(); }
                     self.thread = Some(id.to_owned());
                     core.state.harness_session = Some(id.to_owned());
                 }
@@ -2861,6 +2930,13 @@ impl Codex {
                 core.touch_meta();
                 self.refresh_controls(core);
                 core.touch_state();
+            }
+            Pending::InstalledSkillRoots => {
+                core.installed_skill_roots = true;
+                let cwd = core.state.cwd.clone();
+                self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd], "forceReload": true}));
+                self.steer_waiting(core);
+                self.next(core);
             }
             Pending::Skills => {
                 let mut cmds = Vec::new();
@@ -3576,6 +3652,7 @@ impl Codex {
                 }
                 self.turn = None;
                 self.interrupt_on_start = false;
+                self.interrupting = false;
                 self.turn_permissions = None;
                 if !matches!(self.thread_status, Some(Status::Starting | Status::Exited)) {
                     self.thread_status = Some(Status::Idle);
@@ -3956,15 +4033,25 @@ impl Codex {
                     .and_then(Value::as_array)
                     .map(|c| c.iter().filter_map(|x| x.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"))
                     .unwrap_or_default();
-                let text = text.split("\n\nAttached files:\n").next().unwrap_or(&text).to_owned();
                 // A subagent's own: one kiln sent it for a person (its id, as Codex says it back).
                 let client = item.get("clientId").and_then(Value::as_str).map(str::to_owned).filter(|c| thread.is_none() || core.state.delivery.contains_key(c));
+                let original = client.as_deref().and_then(|client| core.skill_original(client, &text));
+                let text = text.split("\n\nAttached files:\n").next().unwrap_or(&text).to_owned();
                 let key = client.clone().unwrap_or_else(|| id.clone());
                 if let Some(c) = &client
                     && core.state.delivery.contains_key(c)
                 {
+                    // Codex 0.162.1 emits this after native pending input enters model history;
+                    // turn/start and turn/steer RPC replies happen before that boundary.
+                    if core.get(c).is_some_and(|event| matches!(&event.body, Body::User { client_id: Some(original), .. } if original == c)) {
+                        core.input_consumed(c, super::admission::Consumption::ProviderAccepted);
+                    }
                     core.state.delivery.insert(c.clone(), if done { Delivery::Completed } else { Delivery::Started });
                     core.touch_state();
+                }
+                if let Some(original) = original {
+                    core.upsert(&key, parent.clone(), original);
+                    return;
                 }
                 if thread.is_none() && core.state.goal.is_empty() && !text.trim().is_empty() {
                     core.state.goal = clip_middle(text.trim(), 600).0;
@@ -4136,6 +4223,7 @@ impl Codex {
                     "completed" | "failed" => ToolStatus::Error,
                     _ => ToolStatus::Running,
                 };
+                if thread.is_none() && server == "kiln" && tool_name == "agents_wait" && status == ToolStatus::Done && let Some(result) = item.get("result") { core.observe_handoff_result(&id, result); }
                 let output = item
                     .get("error")
                     .and_then(|e| e.get("message"))
@@ -4986,6 +5074,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_user_input_dequeue_returns_credit_but_rpc_ack_and_unidentified_items_do_not() -> anyhow::Result<()> {
+        use crate::harness::admission::{Input, Lease, PhysicalBudget, Stage};
+        let mut c = Codex::new(None, None, None, false);
+        let mut core = Core::new();
+        let inbox = std::sync::Arc::new(crate::harness::inbox::Inbox::new(std::sync::Arc::new(kiln_seams::records::SimRecords::new()), crate::harness::inbox::Limits::default()));
+        let input = Input::new(0, PhysicalBudget::new(1024), inbox);
+        input.controller.lock().restore(Lease { message: "original".into(), peer: "peer".into(), epoch: 0, bytes: 8, stage: Stage::ProviderFlight, token: None, handoff: None }).map_err(|error| anyhow::anyhow!("fixture restore: {error:?}"))?;
+        core.input = Some(input.clone());
+        core.upsert("original", None, Body::User { text: "original".into(), images: 0, client_id: Some("original".into()), origin: Some("agent".into()), attachments: Vec::new(), reply_to: None });
+        c.request(&mut core, Pending::Turn("original".into()), "turn/start", json!({"clientUserMessageId":"original","input":[{"type":"text","text":"original"}]}));
+        let request = written(&mut core).into_iter().next().ok_or_else(|| anyhow::anyhow!("fixture request missing"))?;
+        c.response(&mut core, request.get("id").ok_or_else(|| anyhow::anyhow!("fixture request id missing"))?, &json!({"result":{"turn":{"id":"turn"}}}));
+        assert!(core.input_receipts.is_empty(), "native RPC routing acceptance is earlier than model-history dequeue");
+        c.item(&mut core, &json!({"id":"missing-client","type":"userMessage","content":[{"type":"text","text":"original"}]}), false);
+        assert!(core.input_receipts.is_empty(), "text without exact source identity is not proof");
+        c.item(&mut core, &json!({"id":"unrelated-client","type":"userMessage","clientId":"unrelated","content":[{"type":"text","text":"original"}]}), false);
+        assert!(core.input_receipts.is_empty());
+        let native = json!({"id":"native-original","type":"userMessage","clientId":"original","content":[{"type":"text","text":"original"}]});
+        c.item(&mut core, &native, false);
+        c.item(&mut core, &native, true);
+        assert_eq!(core.input_receipts.len(), 1, "item started/completed are one observed dequeue");
+        assert_eq!(core.input_receipts.first().map(|receipt| receipt.messages.as_slice()), Some(["original".to_owned()].as_slice()));
+        assert!(input.controller.lock().lease("original").is_some(), "durable receipt flush still owns final release");
+        Ok(())
+    }
+
+    #[test]
+    fn w20_r01_only_exact_emitted_skill_echo_projects_the_original_user_message() {
+        let mut c = Codex::new(None, None, None, false);
+        let mut core = Core::new();
+        let original = Body::User { text: "Report material changes.".into(), images: 1, client_id: Some("peer-message".into()), origin: Some("agent".into()), attachments: vec!["diagram.png".into()], reply_to: Some("prior-context".into()) };
+        core.upsert("peer-message", None, original.clone());
+        let effective = "<kiln_installed_skills>\nGenerated catalogue\n</kiln_installed_skills>\nReport material changes.\n\nAttached files:\n- diagram.png";
+        core.skill_projections(vec![crate::skills::bridge::Projection { request_id: Some(json!(42)), client_id: Some("peer-message".into()), effective_digest: crate::skills::bridge::digest(effective) }]);
+        c.item(&mut core, &json!({"id":"native-item","type":"userMessage","clientId":"peer-message","content":[{"type":"text","text":effective}]}), false);
+        assert_eq!(core.get("peer-message").and_then(|e| serde_json::to_value(&e.body).ok()), serde_json::to_value(&original).ok(), "projection before attachment splitting preserves original text, peer origin, files and reply");
+        let mut adopted = Core::thaw(core.freeze());
+        assert!(adopted.skill_original("peer-message", effective).is_some(), "same live-provider adoption retains exact emitted provenance");
+        let literal = "<kiln_installed_skills>\nA real person pasted these literal tags.\n</kiln_installed_skills>";
+        c.item(&mut adopted, &json!({"id":"another-native-item","type":"userMessage","clientId":"new-human-message","content":[{"type":"text","text":literal}]}), false);
+        assert!(matches!(adopted.get("new-human-message").map(|e| &e.body), Some(Body::User { text, .. }) if text == literal), "unregistered literal content is never stripped");
+    }
+
+    #[test]
     fn mc_attention_codex_exit_does_not_end_reach_work() {
         let mut codex = Codex::new(None, None, None, false);
         let mut core = Core::new();
@@ -5005,6 +5137,135 @@ mod tests {
 
     fn written(core: &mut Core) -> Vec<Value> {
         core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect()
+    }
+
+    /// CP-T3.2: a steer received before turn/start answers still reaches that turn. A second
+    /// turn/started notification must not send another copy; explicit Queue keeps waiting.
+    #[test]
+    fn cp_t3_2_steering_during_turn_start_does_not_build_a_backlog() -> anyhow::Result<()> {
+        for notification_first in [false, true] {
+            let mut core = Core::new();
+            let mut c = Codex::new(None, None, None, false);
+            c.start(&mut core);
+            feed(&mut c, &mut core, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"thread": {"id": "th1", "turns": []}}})]);
+            core.take_writes();
+            let send = |id: &str, mode| Command::Send { id: id.into(), text: id.into(), mode, attachments: vec![], overrides: None, reply_to: None, task: None };
+            c.command(&mut core, send("first", SendMode::Queue));
+            let turn = written(&mut core).into_iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("no first turn"))?;
+            c.command(&mut core, send("queued", SendMode::Queue));
+            c.command(&mut core, send("steer-1", SendMode::Steer));
+            c.command(&mut core, send("steer-2", SendMode::Steer));
+            assert!(written(&mut core).is_empty(), "no turn id to steer into yet");
+            let response = json!({"id": turn.get("id"), "result": {"turn": {"id": "t1"}}});
+            let notification = json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}});
+            let replies = if notification_first { [notification, response] } else { [response, notification] };
+            feed(&mut c, &mut core, &replies);
+            let writes = written(&mut core);
+            let steers: Vec<&Value> = writes.iter().filter(|v| v.get("method") == Some(&json!("turn/steer"))).collect();
+            assert_eq!(steers.iter().filter_map(|v| v.pointer("/params/clientUserMessageId").and_then(Value::as_str)).collect::<Vec<_>>(), ["steer-1", "steer-2"]);
+            assert!(steers.iter().all(|v| v.pointer("/params/expectedTurnId") == Some(&json!("t1"))));
+            assert!(!writes.iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+            assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["queued"]);
+            for steer in steers {
+                feed(&mut c, &mut core, &[json!({"id": steer.get("id"), "result": {}})]);
+            }
+            c.room(&mut core);
+            c.tick(&mut core);
+            assert!(written(&mut core).iter().all(|v| !matches!(v.get("method").and_then(Value::as_str), Some("turn/start" | "turn/steer"))));
+            for id in ["steer-1", "steer-2"] {
+                assert_eq!(core.state.delivery.get(id), Some(&Delivery::Started));
+            }
+        }
+        Ok(())
+    }
+
+    /// CP-T3.2: Send Now keeps priority over deferred steers; they must not be injected into
+    /// the turn being stopped and lost when that turn is cancelled.
+    #[test]
+    fn cp_t3_2_a_deferred_steer_survives_send_now_during_turn_start() -> anyhow::Result<()> {
+        for notification_first in [false, true] {
+            for now_first in [false, true] {
+                let mut core = Core::new();
+                let mut c = Codex::new(None, None, None, false);
+                c.start(&mut core);
+                feed(&mut c, &mut core, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"thread": {"id": "th1", "turns": []}}})]);
+                core.take_writes();
+                let send = |id: &str, mode| Command::Send { id: id.into(), text: id.into(), mode, attachments: vec![], overrides: None, reply_to: None, task: None };
+                c.command(&mut core, send("first", SendMode::Queue));
+                let turn = written(&mut core).into_iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("no first turn"))?;
+                let steer = send("steer", SendMode::Steer);
+                let now = send("now", SendMode::Now);
+                for command in if now_first { [now, steer] } else { [steer, now] } {
+                    c.command(&mut core, command);
+                }
+                let response = json!({"id": turn.get("id"), "result": {"turn": {"id": "t1"}}});
+                let notification = json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}});
+                feed(&mut c, &mut core, &if notification_first { [notification, response] } else { [response, notification] });
+                c.command(&mut core, send("later", SendMode::Steer));
+                let writes = written(&mut core);
+                assert!(writes.iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+                assert!(!writes.iter().any(|v| v.get("method") == Some(&json!("turn/steer"))), "steered into a turn being stopped");
+                assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["now", "steer", "later"]);
+                feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+                for (id, turn_id) in [("now", "t2"), ("steer", "t3"), ("later", "t4")] {
+                    let writes = written(&mut core);
+                    let turns: Vec<&Value> = writes.iter().filter(|v| v.get("method") == Some(&json!("turn/start"))).collect();
+                    assert_eq!(turns.len(), 1, "{id}: {writes:?}");
+                    let sent = turns.first().ok_or_else(|| anyhow::anyhow!("no turn for {id}"))?;
+                    assert_eq!(sent.pointer("/params/clientUserMessageId"), Some(&json!(id)));
+                    feed(&mut c, &mut core, &[json!({"id": sent.get("id"), "result": {"turn": {"id": turn_id}}}), json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": turn_id, "status": "completed"}}})]);
+                    assert_eq!(core.state.delivery.get(id), Some(&Delivery::Completed));
+                }
+                assert!(core.state.queue.is_empty());
+                assert!(!written(&mut core).iter().any(|v| matches!(v.get("method").and_then(Value::as_str), Some("turn/start" | "turn/steer"))));
+            }
+        }
+        Ok(())
+    }
+
+    /// CP-T3.2: an acknowledged manual stop still stops the turn. Input arriving before its
+    /// completion stays durable and goes to later turns, never into the one being cancelled.
+    #[test]
+    fn cp_t3_2_a_manual_interrupt_holds_steers_until_the_turn_ends_after_acknowledgement() -> anyhow::Result<()> {
+        for notification_first in [false, true] {
+            let (mut c, mut core, _) = opened();
+            let send = |id: &str, mode| Command::Send { id: id.into(), text: id.into(), mode, attachments: vec![], overrides: None, reply_to: None, task: None };
+            c.command(&mut core, send("first", SendMode::Queue));
+            let turn = written(&mut core).into_iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("no first turn"))?;
+            c.command(&mut core, send("before-stop", SendMode::Steer));
+            c.command(&mut core, Command::Interrupt);
+            let response = json!({"id": turn.get("id"), "result": {"turn": {"id": "t1"}}});
+            let notification = json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1"}}});
+            feed(&mut c, &mut core, &if notification_first { [notification, response] } else { [response, notification] });
+            let writes = written(&mut core);
+            assert!(!writes.iter().any(|v| v.get("method") == Some(&json!("turn/steer"))));
+            let interrupts: Vec<&Value> = writes.iter().filter(|v| v.get("method") == Some(&json!("turn/interrupt"))).collect();
+            assert_eq!(interrupts.len(), 1, "{writes:?}");
+            let interrupt = interrupts.first().ok_or_else(|| anyhow::anyhow!("no interrupt"))?;
+            feed(&mut c, &mut core, &[json!({"id": interrupt.get("id"), "result": {}})]);
+            assert!(!c.pending.values().any(|p| matches!(p, Pending::Interrupt)), "the RPC must already be acknowledged");
+            assert!(c.interrupting, "acknowledgement is not the turn's end");
+            // A hot upgrade during cancellation must retain the hold after the RPC is gone.
+            c = serde_json::from_value(serde_json::to_value(&c)?)?;
+            c.command(&mut core, send("after-ack", SendMode::Steer));
+            c.command(&mut core, send("queued", SendMode::Queue));
+            assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["before-stop", "after-ack", "queued"]);
+            assert!(!written(&mut core).iter().any(|v| matches!(v.get("method").and_then(Value::as_str), Some("turn/start" | "turn/steer"))));
+            feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+            assert_eq!(core.state.delivery.get("first"), Some(&Delivery::Cancelled));
+            for (id, turn_id) in [("before-stop", "t2"), ("after-ack", "t3"), ("queued", "t4")] {
+                let writes = written(&mut core);
+                let turns: Vec<&Value> = writes.iter().filter(|v| v.get("method") == Some(&json!("turn/start"))).collect();
+                assert_eq!(turns.len(), 1, "{id}: {writes:?}");
+                let sent = turns.first().ok_or_else(|| anyhow::anyhow!("no turn for {id}"))?;
+                assert_eq!(sent.pointer("/params/clientUserMessageId"), Some(&json!(id)));
+                feed(&mut c, &mut core, &[json!({"id": sent.get("id"), "result": {"turn": {"id": turn_id}}}), json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": turn_id, "status": "completed"}}})]);
+                assert_eq!(core.state.delivery.get(id), Some(&Delivery::Completed));
+            }
+            assert!(!c.interrupting && core.state.queue.is_empty());
+            assert!(!written(&mut core).iter().any(|v| matches!(v.get("method").and_then(Value::as_str), Some("turn/start" | "turn/steer"))));
+        }
+        Ok(())
     }
 
     #[test]
@@ -5847,6 +6108,137 @@ mod tests {
         assert!(matches!(status(&core), Some((_, s, Some(r))) if s == "unmet" && r.contains("budget")));
         c.notification(&mut core, "thread/goal/cleared", json!({"threadId": "th1"}));
         assert_eq!(status(&core), Some(("ship it".into(), "cleared".into(), None)));
+    }
+
+    #[test]
+    fn w20_r01_installed_roots_are_acknowledged_before_the_first_turn() -> anyhow::Result<()> {
+        for supported in [true, false] {
+            let mut core = Core::new();
+            core.session_id = "installed-skill-session".into();
+            // W20-R01: this protocol test has room even when another test started headroom.
+            let admission = crate::headroom::tests::Admission::held(&core.session_id);
+            admission.grant();
+            core.state.cwd = "/work".into();
+            let mut c = Codex::new(None, None, None, false);
+            c.start(&mut core);
+            let initialize = written(&mut core);
+            respond(&mut c, &mut core, &initialize, "initialize", json!({"userAgent":"codex-test"}));
+            let setup = written(&mut core);
+            let root = setup.iter().find(|v| v.get("method") == Some(&json!("skills/extraRoots/set"))).ok_or_else(|| anyhow::anyhow!("no scoped roots request"))?;
+            anyhow::ensure!(root.pointer("/params/extraRoots").and_then(Value::as_array).is_some_and(|r| r.len() == 1), "roots weren't scoped to this session");
+            c.command(&mut core, Command::SkillRun { name:"tools:audit".into(), args:Some("this diff".into()), id:Some("review".into()), mode:SendMode::Queue });
+            respond(&mut c, &mut core, &setup, "thread/start", json!({"thread":{"id":"th1","turns":[]},"cwd":"/work"}));
+            anyhow::ensure!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start"))), "turn raced discovery registration");
+            if supported {
+                respond(&mut c, &mut core, &setup, "skills/extraRoots/set", json!({}));
+            } else {
+                let id = root.get("id").cloned().unwrap_or_default();
+                feed(&mut c, &mut core, &[json!({"id":id,"error":{"code":-32601,"message":"method not found"}})]);
+            }
+            anyhow::ensure!(core.installed_skill_roots == supported);
+            anyhow::ensure!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start")) && v.pointer("/params/clientUserMessageId") == Some(&json!("review"))), "the queued skill was lost");
+        }
+        Ok(())
+    }
+
+    /// CP-T3.2: registering installed skill roots briefly holds input during an existing turn.
+    /// A steer keeps its mode through that window; Queue and messages after a stop still wait.
+    #[test]
+    fn cp_t3_2_steering_during_skill_roots_reload_reaches_the_active_turn_once() -> anyhow::Result<()> {
+        for supported in [false, true] {
+            for stop in ["none", "interrupt", "now"] {
+                let mut core = Core::new();
+                core.session_id = format!("message-roots-{supported}-{stop}");
+                let admission = crate::headroom::tests::Admission::held(&core.session_id);
+                admission.grant();
+                core.state.cwd = "/work".into();
+                let mut c = Codex::new(None, None, None, false);
+                c.start(&mut core);
+                let initialize = written(&mut core);
+                respond(&mut c, &mut core, &initialize, "initialize", json!({}));
+                let setup = written(&mut core);
+                respond(&mut c, &mut core, &setup, "thread/start", json!({"thread": {"id": "th1", "turns": []}}));
+                respond(&mut c, &mut core, &setup, "skills/extraRoots/set", json!({}));
+                core.take_writes();
+                let send = |id: &str, mode| Command::Send { id: id.into(), text: id.into(), mode, attachments: vec![], overrides: None, reply_to: None, task: None };
+                c.command(&mut core, send("first", SendMode::Queue));
+                let first = written(&mut core);
+                respond(&mut c, &mut core, &first, "turn/start", json!({"turn": {"id": "t1"}}));
+                core.take_writes();
+                c.command(&mut core, Command::SkillsReload);
+                let reload = written(&mut core);
+                let roots = reload.iter().find(|v| v.get("method") == Some(&json!("skills/extraRoots/set"))).ok_or_else(|| anyhow::anyhow!("no roots reload"))?;
+                assert!(!c.accepting(&core), "a bound session must wait for root registration");
+                c.command(&mut core, send("queued", SendMode::Queue));
+                c.command(&mut core, send("steer", SendMode::Steer));
+                assert!(written(&mut core).is_empty(), "input escaped before roots registration");
+                if stop != "none" {
+                    if stop == "now" {
+                        c.command(&mut core, send("now", SendMode::Now));
+                    } else {
+                        c.command(&mut core, Command::Interrupt);
+                    }
+                    let stopping = written(&mut core);
+                    let interrupts: Vec<&Value> = stopping.iter().filter(|v| v.get("method") == Some(&json!("turn/interrupt"))).collect();
+                    assert_eq!(interrupts.len(), 1, "{stop}: {stopping:?}");
+                    let interrupt = interrupts.first().ok_or_else(|| anyhow::anyhow!("no interrupt during roots reload"))?;
+                    feed(&mut c, &mut core, &[json!({"id": interrupt.get("id"), "result": {}})]);
+                    c.command(&mut core, send("after-stop", SendMode::Steer));
+                    assert!(written(&mut core).is_empty(), "steered into a stopping turn");
+                }
+                let registered = if supported {
+                    json!({"id": roots.get("id"), "result": {}})
+                } else {
+                    json!({"id": roots.get("id"), "error": {"code": -32601, "message": "method not found"}})
+                };
+                feed(&mut c, &mut core, std::slice::from_ref(&registered));
+                assert!(c.accepting(&core));
+                let resumed = written(&mut core);
+                assert!(!resumed.iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+                let steers: Vec<&Value> = resumed.iter().filter(|v| v.get("method") == Some(&json!("turn/steer"))).collect();
+                let mut expected = vec!["queued"];
+                if stop == "none" {
+                    assert_eq!(steers.len(), 1, "{resumed:?}");
+                    let steer = steers.first().ok_or_else(|| anyhow::anyhow!("no steer after roots registration"))?;
+                    assert_eq!(steer.pointer("/params/clientUserMessageId"), Some(&json!("steer")));
+                    assert_eq!(steer.pointer("/params/expectedTurnId"), Some(&json!("t1")));
+                    assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), expected);
+                    feed(&mut c, &mut core, &[json!({"id": steer.get("id"), "result": {}})]);
+                    assert_eq!(core.state.delivery.get("steer"), Some(&Delivery::Started));
+                } else {
+                    assert!(steers.is_empty(), "roots acknowledgement steered into a stopping turn");
+                    expected.extend(["steer", "after-stop"]);
+                    if stop == "now" {
+                        expected.insert(0, "now");
+                    }
+                    assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), expected);
+                }
+                // Duplicate acknowledgements and repeated drains never duplicate the held steer.
+                feed(&mut c, &mut core, &[registered]);
+                c.room(&mut core);
+                c.tick(&mut core);
+                assert!(!written(&mut core).iter().any(|v| matches!(v.get("method").and_then(Value::as_str), Some("turn/start" | "turn/steer"))));
+                feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": if stop == "none" { "completed" } else { "interrupted" }}}})]);
+                admission.grant();
+                c.room(&mut core);
+                for (index, id) in expected.iter().enumerate() {
+                    let writes = written(&mut core);
+                    let turns: Vec<&Value> = writes.iter().filter(|v| v.get("method") == Some(&json!("turn/start"))).collect();
+                    assert_eq!(turns.len(), 1, "{id}: {writes:?}");
+                    let turn = turns.first().ok_or_else(|| anyhow::anyhow!("no turn for {id}"))?;
+                    assert_eq!(turn.pointer("/params/clientUserMessageId"), Some(&json!(id)));
+                    let turn_id = format!("later-{index}");
+                    feed(&mut c, &mut core, &[json!({"id": turn.get("id"), "result": {"turn": {"id": turn_id}}}), json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": turn_id, "status": "completed"}}})]);
+                    admission.grant();
+                    c.room(&mut core);
+                    assert_eq!(core.state.delivery.get(*id), Some(&Delivery::Completed));
+                }
+                assert!(core.state.queue.is_empty());
+                assert_eq!(core.state.delivery.get("steer"), Some(&Delivery::Completed));
+                assert!(!written(&mut core).iter().any(|v| matches!(v.get("method").and_then(Value::as_str), Some("turn/start" | "turn/steer"))));
+            }
+        }
+        Ok(())
     }
 
     #[test]

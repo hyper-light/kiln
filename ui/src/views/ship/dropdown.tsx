@@ -6,15 +6,15 @@
 import * as React from "react";
 import type { ShipCommit } from "@/api/ship";
 import { Button, buttonVariants } from "@/components/ui/button";
-import { Loadable, Loading } from "@/components/ui/loading";
+import { Loadable } from "@/components/ui/loading";
 import { Link } from "@/lib/router";
 import { ShipCommits, ShipCommitsSlot, type Narrow } from "./commits";
-import { SectionHead } from "./head";
-import { JobsPane } from "./jobs";
-import { ShipOutput } from "./output";
-import { ReviewFiles, ShipLanes } from "./review";
+import { shipApi } from "@/api/ship";
+import { preload } from "@/lib/resource";
+import { OpenSections } from "./sections-load";
+import { warmReview } from "./review/warm";
 
-export { warmReview } from "./review";
+export { warmReview } from "./review/warm";
 
 /**
  * Brings the dropdown's Files into view and focuses it (the Diff button, Changes plan
@@ -86,6 +86,9 @@ export function RepoDropdown({ head, narrow, reveal }: { head: ShipCommit; narro
 
 /** A commit's sections, in their order: Files (with the Conversation), Jobs (with the picked job's output), Lanes; `commits` before them. */
 function Dropdown({ commit, reveal, commits }: { commit: ShipCommit; reveal: number; commits?: React.ReactNode }) {
+  // The section reads start together, before its rendering code can suspend (W26-R15).
+  warmReview(commit);
+  preload(`ship/commit/${commit.repo}/${commit.sha}`, (signal) => shipApi.commit(commit.repo, commit.sha, signal), { pollMs: 15_000, on: ["run", "job"] });
   // A Diff press (reveal counts them) brings Files into view; opening the row any other way doesn't.
   const root = React.useRef<HTMLDivElement | null>(null);
   const files = React.useCallback(
@@ -103,31 +106,7 @@ function Dropdown({ commit, reveal, commits }: { commit: ShipCommit; reveal: num
           section waits for Files' review, so none is drawn first and then pushed down (2026-10-28).
           A commit picked anew is a new set of sections (W26-R29). */}
       <Loadable key={commit.sha} label="Loading its review">
-        <ReviewFiles item={commit} />
-        {/* Output and Jobs as one pane (docs/ci.md W26-R23): the strip, the jobs by stage, the picked one's output. */}
-        <section aria-label="Jobs" className="ship-sec">
-          <JobsPane
-            commit={commit}
-            output={(picked) => (
-              <Loadable label="Loading the output" className="ship-output-slot">
-                <ShipOutput commit={commit} picked={picked} />
-              </Loadable>
-            )}
-          />
-        </section>
-        <section aria-label="Lanes" className="ship-sec">
-          <Loadable
-            label="Loading the lanes"
-            fallback={
-              <>
-                <SectionHead label="Lanes" />
-                <Loading label="Loading the lanes" block className="ship-lanes-slot" />
-              </>
-            }
-          >
-            <ShipLanes commit={commit} />
-          </Loadable>
-        </section>
+        <OpenSections commit={commit} />
         {/* f-ship's foot (plan 01a1856fe81375b1bd1d1d86f270a45b, step 11): the commit's runs (on its
             page), its Files (here), its page. */}
         <nav className="ship-foot" aria-label={`${commit.short}'s pages`}>

@@ -1,0 +1,11 @@
+{
+  "role": "coordinator",
+  "task": "Shards false-offline from oversize Kiln state; bounded retained queue index and source details",
+  "shards_policy_revision": "0a6d91b3de0f10a8397868aa3794adab1e09afdc",
+  "development_rules_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+  "kiln_base_revision": "812e968e2a182e11075e355a437183f8491530b1",
+  "owned_checkout": "/private/tmp/kiln-offline-fix-20261110",
+  "source_is_uncommitted": false,
+  "note": "Coordinator reread current origin/main AGENTS, full rules/evidence and current ROOT after compaction. Receipt only; deployment and queue admission prevention remain incomplete. Rules SHA unchanged. Original dirty Kiln checkout preserved.",
+  "source_commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f"
+}

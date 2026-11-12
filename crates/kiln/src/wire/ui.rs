@@ -124,6 +124,15 @@ pub enum SessionFrame {
     Reply { client: String, value: Value },
     /// What became of a message sent to the session (CP-T3.2), as its runner said.
     Inbox { said: Box<crate::harness::inbox::Said> },
+    MailFlow {
+        event: Box<crate::harness::admission::FlowEvent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        publication: Option<crate::harness::mail::Receipt>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        mail_scope: Option<String>,
+    },
     /// The timeline starts over (a snapshot follows); `from`, the number of its first event.
     Reset {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +158,10 @@ pub enum SessionFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(test, ts(optional))]
         accepted: Option<crate::harness::inbox::Answer>,
+        /// Durable custody is pending delivery; this is distinct from a source inbox ACK.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        publication: Option<crate::harness::mail::Receipt>,
     },
     /// A command sent under `id` wasn't: its kind (`code`) and why; `again` when it may go again
     /// under its id. `id` null for what couldn't be read far enough to have one.
@@ -162,6 +175,10 @@ pub enum SessionFrame {
         #[cfg_attr(test, ts(optional))]
         refused: Option<crate::harness::inbox::Refusal>,
     },
+    /// W21-R02: optional bounded history, sent only when `recent_turns` was requested. The cursor
+    /// belongs to this session and server incarnation; a reset invalidates it. Whole required
+    /// events can exceed the requested byte budget (`oversized`), never truncated text.
+    History { cursor: String, before: Option<u64>, has_more: bool, oversized: bool },
 }
 
 impl SessionFrame {
@@ -183,6 +200,7 @@ impl SessionFrame {
             Update::Stream { id, text } => SessionFrame::Stream { id: id.clone(), text: text.clone() },
             Update::Reply { client, value } => SessionFrame::Reply { client: client.clone(), value: value.clone() },
             Update::Inbox { said } => SessionFrame::Inbox { said: said.clone() },
+            Update::MailFlow { event } => SessionFrame::MailFlow { event: event.clone(), publication: None, mail_scope: None },
             Update::Reset { from } => SessionFrame::Reset { from: *from },
         }
     }

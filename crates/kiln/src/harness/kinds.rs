@@ -9,8 +9,11 @@ use super::antigravity::Agy;
 use super::claude::Claude;
 use super::codex::Codex;
 use super::core::Core;
-use super::model::{Command, QueueItem, SendMode};
+use super::model::{Command, Delivery, QueueItem, SendMode};
 use super::session::Spec;
+
+#[cfg(test)]
+mod delivery_tests;
 
 pub struct Kind {
     pub id: &'static str,
@@ -124,6 +127,11 @@ impl Kind {
                 }
                 // kiln's skills.
                 if let Some(dir) = crate::mcp::kit().map(|k| k.plugin_dir.as_path()).or_else(crate::mcp::plugin_dir) {
+                    p.arg("--plugin-dir").arg(dir);
+                }
+                // The skills kiln installed for it (docs/agents.md, "Skills kiln installs"): a folder
+                // of plugins its machine fills as they're laid out, loaded again as they change.
+                if let Some(dir) = crate::skills::place::session_folder(session) {
                     p.arg("--plugin-dir").arg(dir);
                 }
                 // File snapshots before edits, so a rewind can restore them.
@@ -502,6 +510,11 @@ pub enum Frozen {
 }
 
 impl Adapter {
+    /// Actual retained provider requests during live-process adoption. Presentation delivery
+    /// maps are not evidence of a native flight, and a new provider starts with none.
+    pub(crate) fn retained_input_ids(&self) -> Vec<super::admission::LegacyFlight> {
+        match self { Self::Claude(adapter) => adapter.retained_input_ids(), Self::Codex(adapter) => adapter.retained_input_ids(), Self::Acp(adapter) => adapter.retained_input_ids(), Self::Agy(adapter) => adapter.retained_input_ids() }
+    }
     /// The MCP servers a session it opens gets, for an adapter that gives them over its protocol
     /// (ACP); the others get theirs as they start ([`Kind::launch`]).
     pub fn offer_mcp(&mut self, servers: Vec<serde_json::Value>) {
@@ -687,9 +700,28 @@ impl Adapter {
             Self::Acp(a) => a.take_held(),
             Self::Claude(_) | Self::Agy(_) => Vec::new(),
         };
-        let held: Vec<QueueItem> = held.into_iter().filter(|m| core.get(&m.id).is_some()).collect();
-        if !held.is_empty() {
-            core.state.queue.splice(0..0, held);
+        let mut changed = false;
+        // CP-T3.2: an older adapter and the durable queue can hold the same input after an
+        // upgrade. Keep its edited durable copy once, never revive a removal or dispatched input,
+        // and keep the rewind's filtering of messages removed from the conversation.
+        for m in held.into_iter().rev() {
+            let durable = core.state.queue.iter().position(|q| q.id == m.id);
+            let removed = core.get(&m.id).is_none() && (core.state.delivery.contains_key(&m.id) || durable.is_none());
+            if removed || core.state.delivery.get(&m.id).is_some_and(|d| matches!(d, Delivery::Sent | Delivery::Started | Delivery::Completed | Delivery::Cancelled)) {
+                let before = core.state.queue.len();
+                core.state.queue.retain(|q| q.id != m.id);
+                changed |= core.state.queue.len() != before;
+                continue;
+            }
+            let m = match durable {
+                Some(pos) => core.state.queue.remove(pos),
+                None => m,
+            };
+            core.state.queue.retain(|q| q.id != m.id);
+            core.state.queue.insert(0, m);
+            changed = true;
+        }
+        if changed {
             core.touch_state();
         }
         core.drop_unfinished(false);
@@ -1519,10 +1551,85 @@ mod tests {
         let mut acp = Adapter::Acp(Box::new(Acp::new(None)));
         acp.start(&mut core);
         acp.command(&mut core, message("m1", "Plans and Research, one tab each"));
-        assert_eq!((core.state.delivery.get("m1"), queue(&core).len()), (Some(&Delivery::Queued), 0));
+        assert_eq!((core.state.delivery.get("m1"), queue(&core).len()), (Some(&Delivery::Queued), 1));
         acp.exited(&mut core, Some(1), Some("not signed in".into()));
         assert_eq!(queue(&core), ["m1"]);
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Queued));
+    }
+
+    /// CP-T3.2: a legacy adapter and the durable queue may overlap across an upgrade. A switch
+    /// carries the edited input once, preserves order, and leaves removed or dispatched input
+    /// behind, including a message a rewind removed from the conversation.
+    #[test]
+    fn cp_t3_2_legacy_held_input_switches_once_with_durable_edits_and_no_resurrection() -> anyhow::Result<()> {
+        use super::super::model::{Attachment, Body, Overrides, Status};
+        for (kind, exited) in [("codex", false), ("codex", true), ("devin", false), ("devin", true)] {
+            let harness = Kind::get(kind).ok_or_else(|| anyhow::anyhow!("no {kind} harness"))?;
+            let adapter = harness.adapter(&Spec { kind: kind.into(), ..Default::default() });
+            let item = |id: &str| QueueItem { id: id.into(), text: id.into(), at: 1, attachments: vec![], overrides: None, reply_to: None };
+            let mut core = Core::new();
+            let states = [("first", Delivery::Queued), ("second", Delivery::Queued), ("removed", Delivery::Cancelled), ("sent", Delivery::Sent), ("started", Delivery::Started), ("completed", Delivery::Completed), ("rewound", Delivery::Queued)];
+            for (id, d) in states {
+                core.state.delivery.insert(id.into(), d);
+                if id != "rewound" {
+                    core.upsert(id, None, Body::User { text: id.into(), images: 0, client_id: Some(id.into()), origin: None, attachments: vec![], reply_to: None });
+                }
+            }
+            let edited = QueueItem {
+                text: "the durable edit".into(),
+                attachments: vec![Attachment { name: "notes.txt".into(), mime: "text/plain".into(), data_base64: String::new(), file_id: None, path: Some("/work/notes.txt".into()) }],
+                overrides: Some(Overrides { model: Some("chosen".into()), effort: Some("high".into()) }),
+                reply_to: Some("earlier".into()),
+                ..item("first")
+            };
+            core.state.queue.push(edited.clone());
+            core.state.queue.push(QueueItem { text: "unshown durable edit".into(), ..item("unshown") });
+            core.state.queue.extend(["removed", "sent", "started", "completed", "rewound", "later", "first"].map(item));
+            let mut frozen = serde_json::to_value(adapter.freeze())?;
+            let state = frozen.get_mut("state").and_then(serde_json::Value::as_object_mut).ok_or_else(|| anyhow::anyhow!("{kind} adapter has no state"))?;
+            // An old image can leave both copies, or more than one buffered copy of an id.
+            let mut legacy = ["first", "second", "unshown", "removed", "sent", "started", "completed", "rewound", "first"].map(item).to_vec();
+            if !exited {
+                legacy.push(item("absent"));
+            }
+            state.insert("waiting".into(), serde_json::to_value(legacy)?);
+            let mut adapter = Adapter::thaw(serde_json::from_value(frozen)?);
+            if exited {
+                adapter.exited(&mut core, Some(1), None);
+            } else {
+                adapter.let_go(&mut core);
+            }
+            assert_eq!(queue(&core), ["first", "second", "unshown", "later"], "{kind}");
+            assert_eq!(core.state.queue.first(), Some(&edited), "{kind}: the durable edit lost metadata");
+            assert_eq!(core.state.queue.iter().find(|m| m.id == "unshown").map(|m| m.text.as_str()), Some("unshown durable edit"), "{kind}: unshown durable input disappeared");
+            for id in ["removed", "sent", "started", "rewound"] {
+                assert_eq!(core.state.delivery.get(id), Some(&Delivery::Cancelled), "{kind}: {id}");
+            }
+            assert_eq!(core.state.delivery.get("completed"), Some(&Delivery::Completed), "{kind}");
+            adapter.let_go(&mut core);
+            assert_eq!(queue(&core), ["first", "second", "unshown", "later"], "{kind}: let_go repeated input");
+
+            core.state.exit = None;
+            core.set_status(Status::Starting);
+            let mut claude = Adapter::Claude(Box::new(Claude::new(false)));
+            claude.start(&mut core);
+            let (_, init) = wrote(&mut core, "initialize");
+            claude.line(&mut core, &serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": init, "response": {}}}).to_string());
+            assert_eq!(wrote(&mut core, "").0, ["first"], "{kind}");
+            for (id, next) in [("first", vec!["second"]), ("second", vec!["unshown"]), ("unshown", vec!["later"]), ("later", Vec::new())] {
+                for line in [
+                    serde_json::json!({"type": "command_lifecycle", "command_uuid": id, "state": "started", "uuid": format!("{id}-started"), "session_id": "s"}),
+                    serde_json::json!({"type": "result", "subtype": "success", "is_error": false, "result": "done", "stop_reason": "end_turn", "session_id": "s"}),
+                    serde_json::json!({"type": "command_lifecycle", "command_uuid": id, "state": "completed", "uuid": format!("{id}-completed"), "session_id": "s"}),
+                ] {
+                    claude.line(&mut core, &line.to_string());
+                }
+                assert_eq!(wrote(&mut core, "").0, next, "{kind}: after {id}");
+                assert_eq!(core.state.delivery.get(id), Some(&Delivery::Completed), "{kind}: {id}");
+            }
+            assert!(core.state.queue.is_empty(), "{kind}");
+        }
+        Ok(())
     }
 
     /// CP-T3.2: its process gone, what its harness was handed and never finished (sent, in its own

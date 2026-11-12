@@ -1,0 +1,25 @@
+{
+  "at": "2026-11-11T09:18:17Z",
+  "kind": "actual-native-Windows-FlushFileBuffers",
+  "source_sha256": "cab5006c3f701b29b143bef90c5c7477b38e9f67e737482b77d7c9570124f2b5",
+  "terminal": "01a1c9e85e6177759f1a8624bcafaa66",
+  "cursor_queries_answered": 1,
+  "native_cases": [
+    {
+      "access": "Read",
+      "flushed": false,
+      "error": 5
+    },
+    {
+      "access": "Write",
+      "flushed": true,
+      "error": 0
+    }
+  ],
+  "fixture_bytes": 20,
+  "exact_owned_content_cleaned": true,
+  "owned_terminal_closed": true,
+  "after": [],
+  "terminal_exit": 0,
+  "limit": "Win32 API seam is reproduced; actual Rust EpochFs regression and Reach-start green remain unrun on Windows"
+}

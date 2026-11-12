@@ -1487,6 +1487,14 @@ impl Objective {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "AgentState"))]
 pub struct State {
+    /// Receiver-owned application credit, updated only by real delivery and lifecycle events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub admission: Option<super::admission::Capacity>,
+    /// Bounded transport projection: missing detail fields are read from their owner at this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub view: Option<super::state_view::Metadata>,
     /// Moved here: where its folder stood in its repo's sync log on the machine it left. It goes
     /// on once the folder here has taken the log that far, after a restart too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2228,6 +2236,17 @@ pub enum Command {
     },
     /// Announce the session again with its whole state (a server that lost track of it).
     Snapshot,
+    /// CP-T3.2: a bounded read of detail omitted from the live control view.
+    StateRead {
+        client: String,
+        read: super::state_view::Read,
+    },
+    /// Apply a queue action only while the exact state its page described is still current.
+    AtState {
+        client: String,
+        revision: String,
+        command: Box<Command>,
+    },
     /// Switch an MCP server on or off.
     McpEnable {
         name: String,
@@ -2404,6 +2423,42 @@ pub enum Command {
     /// Remove does an agent that has: it, and those under it that ended, leave the session's tasks
     /// for good; the call that started it stays in the conversation. One still going stays.
     RemoveTask { task: String },
+    /// Server-authenticated custody envelope. The source host reserves and journals this before
+    /// handing its inner message to the adapter; ordinary callers never choose these grants.
+    Admit {
+        peer: String,
+        token: super::mail::Token,
+        epoch: u64,
+        generation: u64,
+        peers: Vec<String>,
+        command: Box<Command>,
+    },
+    /// The server committed this exact terminal delivery receipt; its source journal can
+    /// release its replay copy. A stale epoch or attempt cannot acknowledge a newer one.
+    MailAck {
+        message: String,
+        token: super::mail::Token,
+        epoch: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disposition: Option<super::admission::Disposition>,
+    },
+    /// Current authenticated demand, pushed when pending peer membership changes.
+    MailPeers {
+        epoch: u64,
+        peers: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        demand: Vec<super::admission::Demand>,
+    },
+    /// Register an exact wait response at the current owner. The original queue and lease
+    /// remain until correlated native tool-result evidence proves the response was observed.
+    MailHandoff {
+        client: String,
+        revision: String,
+        handoff: String,
+        turn: Option<i64>,
+        ids: Vec<String>,
+        response_digest: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

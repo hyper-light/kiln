@@ -210,6 +210,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // `kiln workflow run`'s own server (docs/ci.md W17-R06) runs CI and nothing else: no polling
     // or schedules, terminals, agents, sync, fleet or UI.
     if !cfg.ci.local {
+        // One supervised mail pump reads committed custody; blocked bodies never spawn tasks.
+        child!("agent-mail", h => crate::harness::mail_delivery::run(h));
         // Agents kiln starts on this machine get its MCP server and skills (each agent a token of
         // its own: docs/agents.md, "Agents that run agents").
         let port = cfg.server.http_addr.rsplit_once(':').map(|(_, p)| p.to_owned()).unwrap_or_else(|| "7070".into());

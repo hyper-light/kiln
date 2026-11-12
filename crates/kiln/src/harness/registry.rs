@@ -851,6 +851,14 @@ pub struct Parts {
     /// A window still to be found, where the snapshot is written ([`Parts::resolved`]): its viewer takes a window,
     /// and none was found where the parts were taken (on the socket's shard).
     pub(super) find: Option<Find>,
+    /// Opt-in cursor policy on this exact immutable copy, not another event store.
+    pub(super) history: Option<History>,
+}
+
+pub(super) struct History {
+    limits: super::history::Limits,
+    token: String,
+    durable: bool,
 }
 
 /// A window to find where a snapshot is written, off the shards (goal 9, plan 01a1a87b2cec step 3: no poll past the
@@ -986,6 +994,7 @@ impl Drop for InFlight {
 /// a time (where they are among them).
 enum Part {
     Head,
+    History,
     Meta,
     State,
     Changes,
@@ -1012,6 +1021,7 @@ struct Planned {
     sent: Vec<Option<super::copies::Sent>>,
     since: Option<u64>,
     window: Option<crate::wire::ui::EventsWindow>,
+    history: Option<super::history::Window>,
 }
 
 impl Snapshot {
@@ -1064,14 +1074,28 @@ impl Snapshot {
         // Its window found here, where it's written (goal 9, plan 01a1a87b2cec step 3), each event read for it kept for
         // what follows.
         let mut sending = p.events.sending(p.lean);
-        let (since, window, begins) = p.resolved(&mut sending);
+        let (mut since, mut window, begins) = p.resolved(&mut sending);
+        let mut history = None;
+        let mut selected = None;
+        if let Some(policy) = &p.history {
+            // A resume retains all explicitly loaded pages. If its changes exceed the negotiated
+            // budget it becomes a fresh bounded snapshot, as legacy window resumes already do.
+            if since.is_some_and(|after| p.events.metas().filter(|m| m.at > after).fold(0usize, |n, m| n.saturating_add(m.text_len())) > policy.limits.bytes) { since = None; }
+            if since.is_none() {
+                let rows: Vec<_> = (0..p.events.len()).map(|i| sending.take(i).map_or_else(super::history::Row::default, |s| super::history::Row::read(s.text(p.lean)))).collect();
+                let (indices, h) = super::history::select(&rows, &p.state.to_value(), policy.limits, policy.token.clone(), policy.durable);
+                window = Some(crate::wire::ui::EventsWindow { before: h.before, more: h.has_more });
+                selected = Some(indices); history = Some(h);
+                parts.insert(1, Part::History);
+            }
+        }
         // The session whole, every event as it is: the copy's chunks, each packed once.
         if since.is_none() && window.is_none() && !p.lean {
             parts.extend(p.events.chunks().iter().enumerate().filter(|(_, c)| !c.is_empty()).map(|(i, _)| Part::Chunk(i)));
-            return Plan { parts, of: Planned { brought: Vec::new(), sent: Vec::new(), since, window } };
+            return Plan { parts, of: Planned { brought: Vec::new(), sent: Vec::new(), since, window, history } };
         }
         // A window (W21-R15: from where it begins), what changed since a revision, or events that go lean.
-        let brought: Vec<usize> = p.events.metas().enumerate().skip(begins).filter(|(_, m)| since.is_none_or(|s| m.at > s)).map(|(i, _)| i).collect();
+        let brought: Vec<usize> = selected.unwrap_or_else(|| p.events.metas().enumerate().skip(begins).filter(|(_, m)| since.is_none_or(|s| m.at > s)).map(|(i, _)| i).collect());
         // Each as sent: as finding the window read it, or read now, and kept for its frame's writing. What isn't a window's
         // (all of what changed since a revision, or of a session that goes lean whole) is kept while what's kept is within a
         // window's bytes (`super::window::BYTES`), and the rest read again where it's written, so what a plan holds is
@@ -1100,7 +1124,7 @@ impl Snapshot {
         if from < brought.len() {
             parts.push(Part::Events(from..brought.len(), events_room(size, brought.len() - from)));
         }
-        Plan { parts, of: Planned { brought, sent, since, window } }
+        Plan { parts, of: Planned { brought, sent, since, window, history } }
     }
 
     /// The events of `batch` (where they are among those `of` brings), as sent: each as its plan read it, taken (a batch is
@@ -1124,6 +1148,7 @@ impl Snapshot {
         match part {
             // Its info, written as it's made (a few hundred bytes).
             Part::Head => 0,
+            Part::History => 192 + p.history.as_ref().map_or(0, |h| h.token.len()),
             Part::Meta => write::envelope("meta", Some("meta"), None) + p.meta.json().len(),
             Part::State => p.state_bytes,
             Part::Changes => p.changes.as_ref().map_or(0, |files| write::envelope("changes", Some("files"), None) + write::texts_len(files.iter().map(|f| &**f))),
@@ -1143,6 +1168,15 @@ impl Snapshot {
                 let (info, born) = (serde_json::to_value(&*p.info).unwrap_or(Value::Null), Some(born()));
                 let head = SessionDown { frame: if of.since.is_some() { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born, window: of.window } }, rev: Some(p.rev) }.text();
                 w.write_all(head.as_bytes())
+            }
+            Part::History => {
+                match &of.history {
+                    Some(h) => {
+                        let text = SessionDown::from(SessionFrame::History { cursor: h.cursor.clone(), before: h.before, has_more: h.has_more, oversized: h.oversized }).text();
+                        w.write_all(text.as_bytes())
+                    }
+                    None => Ok(()),
+                }
             }
             Part::Meta => write::meta(w, p.meta.json(), None),
             Part::State => write::state(w, &p.state, None),
@@ -1347,6 +1381,10 @@ pub(crate) fn again_for(r: &inbox::Refusal) -> Option<u64> {
 /// How a command fared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sent {
+    /// The server committed custody; this is not receiver admission or model consumption.
+    Published(super::mail::Receipt),
+    /// Custody was not accepted. The original sender must retain its complete communication.
+    PublicationRefused(super::mail::Error),
     /// On its way to the session's machine, which can't say more: a message whose inbox's answer
     /// didn't come in time, or a command or message to a runner from before the channel (or from
     /// before inboxes). Also what kiln does here itself (a name kept).
@@ -1419,6 +1457,10 @@ impl Sent {
         use crate::wire::channel::Refusal as Code;
         use http::StatusCode;
         match self {
+            Self::Published(_) => None,
+            Self::PublicationRefused(error) => {
+                Some((error.status_code(), serde_json::to_string(error).unwrap_or_else(|_| "communication custody was not accepted".into())))
+            }
             Self::Ok | Self::Accepted(_) | Self::Taken | Self::Parked => None,
             Self::Refused(r) => Some((StatusCode::CONFLICT, r.to_string())),
             Self::Rejected { code: Code::Unknown, why } => Some((StatusCode::NOT_FOUND, format!("its runner doesn't have it: {why}"))),
@@ -1636,22 +1678,32 @@ fn changes_patch(was: &Value, now: &Value) -> Option<String> {
     changes_patch_of(&was, &now).map(|(set, gone)| write::string(256, |b| write::changes_patch(b, &set, &gone, None)))
 }
 
-/// A file uploaded for a message, kept briefly until the message is sent.
-#[derive(Clone)]
+/// Immutable metadata for a durable uploaded file. Non-CAS namespace keys pin both objects
+/// through the existing Blobs store; no registry lifetime/TTL cache owns accepted file bytes.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Upload {
     name: String,
     mime: String,
-    data: bytes::Bytes,
-    at: std::time::Instant,
-    /// When a message first carried it: kept after, so a message sent again (its answer lost, or
-    /// sent once more for the epoch its session is at) carries it too, and reads as the same
-    /// message (CP-T3.2).
-    sent: Option<std::time::Instant>,
+    size: u64,
+    sha256: String,
 }
 
-/// Uploads kept at most this long, and this much in all.
-const UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-const UPLOADS_MAX: usize = 512 << 20;
+impl Upload {
+    fn bytes(id: &str) -> String { format!("attachments/uploads/{id}") }
+    fn metadata(id: &str) -> String { format!("attachments/uploads/{id}.json") }
+}
+
+fn upload_refused(error: kiln_seams::blobs::Refusal) -> super::mail::Error {
+    use kiln_seams::blobs::Refusal;
+    match error {
+        Refusal::Full { .. } => super::mail::Error::StorageFull,
+        Refusal::TooLarge { .. } => super::mail::Error::TooLarge { revision: 0, budget: usize::try_from(super::host::ATTACHMENT_MAX).unwrap_or(usize::MAX) },
+        Refusal::Invalid { .. } | Refusal::PreconditionFailed(_) => super::mail::Error::Invalid { reason: "attachment identity or content is invalid; custody was not accepted".into() },
+        Refusal::NotFound(_) => super::mail::Error::Unavailable { reason: "the original attachment is unavailable; keep its original bytes and upload it again before sending".into() },
+        Refusal::BadChecksum { .. } | Refusal::InvalidRange { .. } | Refusal::NoSuchUpload(_) | Refusal::BadParts(_) | Refusal::Expired | Refusal::Forbidden(_) | Refusal::Unavailable(_) => super::mail::Error::Unavailable { reason: "the original attachment could not be stored or verified; its communication remains held".into() },
+    }
+}
+
 /// Pieces a file is sent to a machine in (lane frames are bounded).
 const FILE_CHUNK: usize = 512 * 1024;
 
@@ -1679,10 +1731,6 @@ pub struct Registry {
     sessions: Copies,
     /// The bus each session's live feed rides (`super::live`).
     bus: Arc<dyn kiln_seams::Bus>,
-    /// Files uploaded for messages, by id. This and the registry's other maps but three are copies
-    /// read without a lock and changed by swapping a new copy in whole (`crate::rcu`; goal 5, plan
-    /// 01a1a59c2aae step 2): a session's updates, on the shard that owns its copy, read them.
-    uploads: Rcu<HashMap<String, Upload>>,
     /// What each machine offers ("local" included).
     kinds: Rcu<HashMap<String, Vec<KindInfo>>>,
     /// The server's own sessions.
@@ -1720,6 +1768,11 @@ pub struct Registry {
     keep_off: Rcu<std::collections::HashSet<String>>,
     /// The UI's commands by the ids their clients made, each taken once (`super::asked`).
     pub asked: super::asked::Asked,
+    /// What sessions' copies lack of states their runners sent bounded, which the server reads from them
+    /// (`super::fill`).
+    pub fills: super::fill::Fills,
+    /// One event pump over committed communication custody, with no blocked-body task list.
+    pub mail_delivery: super::mail_delivery::Relay,
     /// Which of its machine's runner processes holds each session on a machine (its instance:
     /// `main`, a uuid, `legacy`), kept in `holders.json` so it holds across restarts: a process
     /// that says what it holds speaks for its own sessions, never for another's that is away
@@ -1915,7 +1968,6 @@ impl Registry {
         Self {
             sessions,
             bus,
-            uploads: Rcu::default(),
             kinds: Rcu::default(),
             local,
             convo,
@@ -1931,6 +1983,8 @@ impl Registry {
             names: Rcu::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             keep_off: Rcu::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             asked: super::asked::Asked::default(),
+            fills: super::fill::Fills::default(),
+            mail_delivery: super::mail_delivery::Relay::default(),
             holders: Arc::new(Rcu::new(std::fs::read(dir.join("holders.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default())),
             holders_saving: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             holders_writing: Arc::new(Mutex::new(())),
@@ -2415,7 +2469,25 @@ impl Registry {
         let mut turns = crate::rt::Turns::new();
         loop {
             let Ok(said) = rx.recv().await else { return Ok(()) };
+            if let super::session::Local::Said(id, Update::MailFlow { event }) = &said {
+                if hub.harness.location(id) == Some(Location::Local)
+                    && let Err(error) = super::mail_delivery::flow(&hub, id, Location::Local, (**event).clone()).await
+                { tracing::warn!(session = %id, error = %error, "local communication receipt remains unacknowledged"); }
+                turns.end().await;
+                continue;
+            }
+            let lifecycle = match &said {
+                super::session::Local::Said(id, Update::Open { .. } | Update::Closed) | super::session::Local::Gone(id) => Some(id.clone()),
+                _ => None,
+            };
             hub.harness.take_local(said).await;
+            if let Some(id) = lifecycle {
+                // W20-R01: restored, moved or closed local sessions get their current skill scope.
+                hub.harness.applied(&id).await;
+                hub.harness.mail_delivery.changed();
+                let h = Arc::clone(&hub);
+                crate::rt::spawn(async move { crate::api::boxed(|| crate::skills::sync(&h)).await });
+            }
             turns.end().await;
         }
     }
@@ -2729,6 +2801,7 @@ impl Registry {
     fn prepare(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) -> Option<Ingest> {
         // What became of a message: for whoever waits for it, wherever it was taken or refused.
         let u = match u {
+            Update::MailFlow { .. } => return None,
             Update::Inbox { said } => {
                 self.answered(id, *said);
                 return None;
@@ -2741,6 +2814,9 @@ impl Registry {
         let mut reported = String::new();
         let u = match u {
             Update::Open { mut info, since } => {
+                // The wire announcement omits the local queue index. Until state arrives,
+                // absence from it cannot establish that a queued message is gone.
+                info.queue_partial |= info.queue.len() != info.queued;
                 info.target = from.target();
                 own_name(&info.name, &info.kind_name).unwrap_or_default().clone_into(&mut reported);
                 if let Some(n) = self.names.load().get(id) {
@@ -2853,6 +2929,7 @@ impl Registry {
         // Its info changed as its pages see it: the events socket is told, its frame made of the bytes its
         // view encoded the info as (goal 10, plan 01a1a87b2dae step 5: it was encoded again for the socket).
         let mut changed = false;
+        let mut opened_lifecycle = false;
         // What of its info attention reads, before this update (`super::attention::signature`).
         let attention_before = s.get(id).map(|m| super::attention::signature(&m.info));
         // The same meta again (a harness says it at each turn): nothing to keep, encode or send.
@@ -2880,6 +2957,7 @@ impl Registry {
             && !held
         {
             let old = s.get(id);
+            opened_lifecycle = old.is_some_and(|m| m.info.status != info.status);
             // A runner that started again goes on from what this copy has of the same epoch:
             // its events through `since` stay; what's after them comes again.
             let keep = since.filter(|_| old.is_some_and(|m| m.info.epoch == info.epoch));
@@ -2909,6 +2987,12 @@ impl Registry {
             // Its machine announced it: what it reports from now on counts.
             m.opened_at = None;
             m.info = Arc::new(info);
+            // W20-R01: the owner's Open is newer than the disconnected overlay left on its
+            // cached State. Reconcile lifecycle without inventing a State or replacing details.
+            if m.state.is_object() && m.state.get::<Status>("status") != Some(m.info.status) {
+                opened_lifecycle = true;
+                Arc::make_mut(&mut m.state).set("status", &json!(m.info.status));
+            }
             m.reported = reported;
             m.location = Arc::new(from.clone());
             match keep {
@@ -3039,7 +3123,7 @@ impl Registry {
                 }
             }
             // An inbox's answer went to whoever waits for it, before any of this.
-            Update::Reply { .. } | Update::Inbox { .. } => {}
+            Update::Reply { .. } | Update::Inbox { .. } | Update::MailFlow { .. } => {}
             Update::Closed => {
                 gone = true;
                 // Its identities with it (docs/ci.md W27-R01).
@@ -3252,7 +3336,18 @@ impl Registry {
         } else {
             m.commit(|m| match &u {
                 _ if resync => Some(super::copies::payload_of(super::live::RESYNC, 0)),
+                Update::Open { since: Some(_), .. } if m.state.is_object() => m.state_frame(),
+                Update::Open { since: Some(_), .. } if opened_lifecycle => {
+                    // A header can precede the first State. Existing resumed carries it without
+                    // resetting the viewer's retained timeline or manufacturing default details.
+                    let info = serde_json::to_value(&*m.info).unwrap_or(Value::Null);
+                    let text = crate::wire::ui::SessionDown { frame: crate::wire::ui::SessionFrame::Resumed { info, born: Some(born()) }, rev: Some(m.rev) }.text();
+                    Some(super::copies::payload_of(&text, m.rev))
+                }
                 Update::Open { since: Some(_), .. } => None,
+                // A full Open starts the timeline over. Reattach to the coherent copy so an
+                // older viewer cannot retain its disconnected State while new details wait.
+                Update::Open { since: None, .. } if opened_lifecycle && m.state.is_object() => Some(super::copies::payload_of(super::live::RESYNC, 0)),
                 Update::State { .. } => m.state_frame(),
                 Update::Changes { .. } | Update::ChangesPatch { .. } => m.changes_frame(),
                 Update::Meta { .. } if meta_same => None,
@@ -3644,6 +3739,7 @@ impl Registry {
 
     /// The machine went away: its sessions keep running there and come back when it reconnects.
     pub async fn machine_lost(&self, hub: &Hub, machine: &str) {
+        self.mail_delivery.changed();
         self.streams.machine_lost(machine, &hub.shown(machine));
         self.ports.machine_lost(machine);
         let at = Location::Machine(machine.to_owned());
@@ -3658,6 +3754,7 @@ impl Registry {
     /// One runner process of a machine went away while another of the machine stays connected
     /// (see `crate::instances`): the sessions it held keep running there and come back with it.
     pub async fn sessions_lost(&self, hub: &Hub, ids: &[String]) {
+        self.mail_delivery.changed();
         let ids: Arc<std::collections::HashSet<String>> = Arc::new(ids.iter().cloned().collect());
         // A session at a time, as its owner's turns take them (goal 9, plan 01a1a87b2cec step 3: `Copies::on_each_session`).
         let infos: Vec<Info> = self.sessions.on_each_session(move |id, _| ids.contains(id), |s, id| s.get_mut(id).map(disconnected)).await;
@@ -3699,6 +3796,10 @@ impl Registry {
     /// can resume it (the same process, nothing started over since), else all of it (or, to a
     /// viewer that takes a window, its window). None when there is no such session.
     pub fn attach_from(&self, id: &str, after: Option<(u64, u64)>, takes: Patches, view: View) -> Option<Attachment> {
+        self.attach_window(id, after, takes, view, None)
+    }
+
+    pub fn attach_window(&self, id: &str, after: Option<(u64, u64)>, takes: Patches, view: View, limits: Option<super::history::Limits>) -> Option<Attachment> {
         // What's kept is read first: the first time, off disk.
         let files = self.keeper.frame(id);
         let slot = self.sessions.slot(id)?;
@@ -3717,7 +3818,8 @@ impl Registry {
         if copy.closed {
             return None;
         }
-        let parts = copy.parts_after(after.filter(|(b, _)| *b == born()).map(|(_, rev)| rev), view, self.convo.is_some());
+        let mut parts = copy.parts_after(after.filter(|(b, _)| *b == born()).map(|(_, rev)| rev), view, self.convo.is_some());
+        parts.history = limits.map(|limits| History { limits, token: super::history::cursor(born(), copy.reset_at, id), durable: self.convo.is_some() });
         let rev = parts.rev;
         // Written out by the caller off the runtime's threads: no other session's publish waits on
         // this one, nor any socket on its thread, nor its owner.
@@ -3732,6 +3834,10 @@ impl Registry {
     /// session is gone.
     /// Its events go as `view` says (W21-R15).
     pub fn frames_since(&self, id: &str, viewer: &Viewer, rev: u64, view: View) -> Option<(Snapshot, Option<kiln_seams::bus::Offset>, u64, u64)> {
+        self.frames_since_window(id, viewer, rev, view, None)
+    }
+
+    pub fn frames_since_window(&self, id: &str, viewer: &Viewer, rev: u64, view: View, limits: Option<super::history::Limits>) -> Option<(Snapshot, Option<kiln_seams::bus::Offset>, u64, u64)> {
         let files = self.keeper.frame(id);
         let slot = self.sessions.slot(id)?;
         let refusals = viewer.refusals();
@@ -3740,10 +3846,54 @@ impl Registry {
         if copy.closed {
             return None;
         }
-        let parts = copy.parts_after(Some(rev), view, self.convo.is_some());
+        let mut parts = copy.parts_after(Some(rev), view, self.convo.is_some());
+        parts.history = limits.map(|limits| History { limits, token: super::history::cursor(born(), copy.reset_at, id), durable: self.convo.is_some() });
         let now = parts.rev;
         let store = self.convo.clone().map(|s| (s, Arc::from(id)));
         Some((Snapshot { parts, files, store }, at, refusals, now))
+    }
+
+    pub fn history_valid(&self, id: &str, cursor: &str) -> bool {
+        self.sessions.view(id).is_some_and(|v| super::history::valid_cursor(cursor, born(), v.reset_at, id))
+    }
+
+    /// Whether session `id`'s copy holds every event an older page before number `before` shows
+    /// (`super::history::covers`): then [`Registry::history_overlay`] makes the page from the copy alone, and the
+    /// conversation store, whose reads wait behind its writes, isn't read (plan 01a1cc09, step 1). Looked at off the
+    /// shards, as the overlay is.
+    pub async fn history_kept(&self, id: &str, before: u64, limit: usize) -> bool {
+        let Some(view) = self.sessions.view(id) else { return false };
+        crate::rt::blocking(move || {
+            let floor = view.state.get::<u64>("cleared").unwrap_or(1).max(1);
+            super::history::covers(view.events.metas().filter_map(|m| m.seq()), floor, before, limit)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Reconcile a durable page against one exact, latest immutable copy after its IO. Work that
+    /// reads compact/spilled entries is on the blocking pool; resets are checked again by the API.
+    pub async fn history_overlay(&self, id: &str, cursor: &str, before: u64, limit: usize, events: Vec<Value>) -> anyhow::Result<Option<(Vec<Value>, u64, bool, u64)>> {
+        let Some(view) = self.sessions.view(id) else { return Ok(None) };
+        if !super::history::valid_cursor(cursor, born(), view.reset_at, id) { return Ok(None); }
+        crate::rt::blocking(move || {
+            let floor = view.state.get::<u64>("cleared").unwrap_or(1).max(1);
+            let held: std::collections::HashSet<_> = view.events.metas().map(|m| m.id()).collect();
+            let mut by_seq: std::collections::BTreeMap<u64, Value> = events.into_iter()
+                .filter(|e| e.get("id").and_then(Value::as_str).is_none_or(|id| !held.contains(id)))
+                .filter_map(|e| super::history::seq(&e).filter(|n| *n >= floor && *n < before).map(|seq| (seq,e))).collect();
+            // Only a page plus one proof-of-more row is decoded, even when Copies holds a giant
+            // single turn. Metadata still removes a correction's old durable id outside the page.
+            let indices: Vec<_> = (0..view.events.len()).rev().filter(|i| view.events.meta(*i).and_then(|m| m.seq()).is_some_and(|n| n >= floor && n < before)).take(limit.saturating_add(1)).collect();
+            let mut sending = view.events.sending(false);
+            for i in indices {
+                let Some(sent) = sending.take(i) else { continue };
+                let Ok(value) = serde_json::from_str::<Value>(sent.text(false)) else { continue };
+                if let Some(seq) = super::history::seq(&value) { by_seq.insert(seq, value); }
+            }
+            let more = by_seq.len() > limit;
+            Some((by_seq.into_values().collect(), view.rev, more, floor))
+        }).await
     }
 
     /// An older page of session `id`'s events, for a viewer that has them from number `before` on
@@ -3889,6 +4039,8 @@ impl Registry {
                     let kind = super::kinds::Kind::get(&spec.kind);
                     let info = Info {
                         id: id.clone(),
+                        deferred: Default::default(), queue_partial: false, queue_revision: None, queue_next: None,
+                        admission: None,
                         kind: spec.kind.clone(),
                         kind_name: kind.map_or_else(|| spec.kind.clone(), |k| k.name.to_owned()),
                         target: loc.target(),
@@ -3983,147 +4135,153 @@ impl Registry {
         Ok(Claim { held: &self.opening, ids: ids.to_vec() })
     }
 
-    /// Keep an uploaded file for the messages that refer to it (by the returned id): until it
-    /// expires, also after a message carried it (one sent again carries it too). Short of room, the
-    /// files messages carried already go first, the oldest first.
-    pub fn upload(&self, name: String, mime: String, data: bytes::Bytes) -> anyhow::Result<String> {
+    /// Acknowledges an upload only after immutable bytes and their metadata have both committed.
+    /// A partial failure leaves the caller owning its original and never removes stored bytes.
+    pub async fn upload(&self, hub: &Hub, name: String, mime: String, data: bytes::Bytes) -> Result<String, super::mail::Error> {
+        use kiln_seams::blobs::{Cond, Put};
+        let unavailable = || super::mail::Error::Unavailable { reason: "attachment storage authority is unavailable; custody was not accepted".into() };
+        let size = u64::try_from(data.len()).map_err(|_| unavailable())?;
+        if size == 0 { return Err(super::mail::Error::Invalid { reason: "empty attachment".into() }); }
+        if size > super::host::ATTACHMENT_MAX { return Err(super::mail::Error::TooLarge { revision: 0, budget: usize::try_from(super::host::ATTACHMENT_MAX).map_err(|_| unavailable())? }); }
+        let (data, sha256, chunks) = crate::rt::blocking(move || {
+            let sha256 = crate::util::sha256_hex(&data);
+            let chunks = kiln_ci::store::cdc::cuts(&data).len();
+            (data, sha256, chunks)
+        }).await.map_err(|_| unavailable())?;
+        let metadata = Upload { name, mime, size, sha256 };
+        let encoded = super::state_view::encode(&metadata, super::state_view::FRAME).map_err(|_| super::mail::Error::TooLarge { revision: 0, budget: super::state_view::FRAME })?;
+        let metadata_chunks = kiln_ci::store::cdc::cuts(&encoded).len();
+        // LocalBlobs inserts each chunk and one object/key per blob; count both immutable puts.
+        let records = ["bytes-object", "bytes-key", "metadata-object", "metadata-key"];
+        let rows = chunks.checked_add(metadata_chunks).and_then(|n| n.checked_add(records.len())).and_then(|n| u64::try_from(n).ok()).ok_or_else(unavailable)?;
+        let payload = size.checked_add(u64::try_from(encoded.len()).map_err(|_| unavailable())?).ok_or_else(unavailable)?;
+        let reserve = hub.store.storage_reserve_tables(payload, vec!["blob_keys".into(), "cas_objects".into(), "cas_chunks".into()], rows).await.map_err(|_| unavailable())?;
+        let floor = super::mail_delivery::storage_floor(hub)?;
+        let path = hub.cfg.server.data_dir.clone();
+        let free = crate::rt::blocking(move || crate::os::disk_available(&path)).await.map_err(|_| unavailable())?.ok_or_else(unavailable)?;
+        let required = payload.checked_add(reserve).and_then(|n| n.checked_add(floor)).ok_or_else(unavailable)?;
+        if free < required { return Err(super::mail::Error::Capacity { required, authority: free }); }
         let id = crate::util::new_id();
-        let upload = Upload { name, mime, data, at: std::time::Instant::now(), sent: None };
-        let len = upload.data.len();
-        self.uploads.update(|g| {
-            g.retain(|_, u| u.at.elapsed() < UPLOAD_TTL);
-            let mut used: usize = g.values().map(|u| u.data.len()).sum();
-            if used.saturating_add(len) > UPLOADS_MAX {
-                let mut sent: Vec<(std::time::Instant, String)> = g.iter().filter_map(|(id, u)| u.sent.map(|t| (t, id.clone()))).collect();
-                sent.sort();
-                for (_, id) in sent {
-                    if used.saturating_add(len) <= UPLOADS_MAX {
-                        break;
-                    }
-                    if let Some(u) = g.remove(&id) {
-                        used = used.saturating_sub(u.data.len());
-                    }
-                }
-            }
-            if used.saturating_add(len) > UPLOADS_MAX {
-                anyhow::bail!("too many uploads waiting; send them first");
-            }
-            g.insert(id.clone(), upload.clone());
-            Ok(())
-        })?;
+        let kept = hub.blobs.blobs.put(&Upload::bytes(&id), data.to_vec(), Put { cond: Cond::IfNoneMatch, sha256: Some(metadata.sha256.clone()) }).await.map_err(upload_refused)?;
+        if kept.size != size || kept.etag != metadata.sha256 { return Err(unavailable()); }
+        let hash = crate::util::sha256_hex(&encoded);
+        let len = u64::try_from(encoded.len()).map_err(|_| unavailable())?;
+        let kept = hub.blobs.blobs.put(&Upload::metadata(&id), encoded, Put { cond: Cond::IfNoneMatch, sha256: Some(hash.clone()) }).await.map_err(upload_refused)?;
+        if kept.size != len || kept.etag != hash { return Err(unavailable()); }
         Ok(id)
     }
 
-    /// Upload `id`'s name, type and bytes, for a message that carries it: kept (marked sent), so a
-    /// message sent again carries it as well.
-    fn upload_of(&self, id: &str) -> Option<(String, String, bytes::Bytes)> {
-        // Marked sent the first time, a copy swapped in then; read off the copy.
-        if self.uploads.load().get(id)?.sent.is_none() {
-            let now = std::time::Instant::now();
-            self.uploads.update(|g| {
-                if let Some(u) = g.get_mut(id) {
-                    u.sent.get_or_insert(now);
+    async fn upload_of(&self, hub: &Hub, id: &str) -> Result<Upload, super::mail::Error> {
+        if !crate::util::is_id(id) { return Err(super::mail::Error::Invalid { reason: "invalid attachment identity".into() }); }
+        let (kept, encoded) = crate::blobs::io::get_all(hub.blobs.blobs.as_ref(), &Upload::metadata(id), super::state_view::FRAME as u64).await.map_err(upload_refused)?;
+        let invalid = || super::mail::Error::Unavailable { reason: "the original attachment metadata does not match its immutable bytes; communication remains held".into() };
+        if crate::util::sha256_hex(&encoded) != kept.etag { return Err(invalid()); }
+        let upload: Upload = serde_json::from_slice(&encoded).map_err(|_| invalid())?;
+        if upload.size == 0 || upload.size > super::host::ATTACHMENT_MAX { return Err(invalid()); }
+        let bytes = hub.blobs.blobs.head(&Upload::bytes(id)).await.map_err(upload_refused)?;
+        if bytes.size != upload.size || bytes.etag != upload.sha256 { return Err(invalid()); }
+        Ok(upload)
+    }
+
+    /// Preview the exact bounded wire command without transferring bytes or rewriting the
+    /// immutable original. New custody preflight reserves this shape; retries bypass lookup.
+    pub(super) async fn attachment_command(&self, hub: &Hub, recipient: &str, command: Command) -> Result<Command, super::mail::Error> {
+        use base64::Engine as _;
+        super::state_view::encode(&command, super::state_view::FRAME).map_err(|_| super::mail::Error::TooLarge { revision: 0, budget: super::state_view::FRAME })?;
+        let Command::Send { id, text, mode, attachments, overrides, reply_to, task } = command else { return Ok(command) };
+        let mut ready = Vec::new();
+        for (index, mut attachment) in attachments.into_iter().enumerate() {
+            if attachment.path.is_some() { return Err(super::mail::Error::Invalid { reason: "attachments require original bytes or a durable upload identity".into() }); }
+            let sha256 = match &attachment.file_id {
+                Some(file) => {
+                    if !attachment.data_base64.is_empty() { return Err(super::mail::Error::Invalid { reason: "attachment must name one complete original representation".into() }); }
+                    let upload = self.upload_of(hub, file).await?;
+                    if attachment.name.is_empty() { attachment.name = upload.name; }
+                    if attachment.mime.is_empty() { attachment.mime = upload.mime; }
+                    upload.sha256
                 }
-            });
+                None => {
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(attachment.data_base64.as_bytes()).map_err(|_| super::mail::Error::Invalid { reason: "attachment original is not valid base64".into() })?;
+                    if bytes.is_empty() || u64::try_from(bytes.len()).ok().is_none_or(|n| n > super::host::ATTACHMENT_MAX) { return Err(super::mail::Error::Invalid { reason: "attachment original is empty or exceeds its file limit".into() }); }
+                    crate::util::sha256_hex(&bytes)
+                }
+            };
+            attachment.file_id = Some(crate::util::derive_id(&["harness-attachment-v1", recipient, &id, &index.to_string(), &sha256]));
+            attachment.data_base64.clear();
+            ready.push(attachment);
         }
-        self.uploads.load().get(id).map(|u| (u.name.clone(), u.mime.clone(), u.data.clone()))
+        let command = Command::Send { id, text, mode, attachments: ready, overrides, reply_to, task };
+        super::state_view::encode(&command, super::state_view::FRAME).map_err(|_| super::mail::Error::TooLarge { revision: 0, budget: super::state_view::FRAME })?;
+        Ok(command)
     }
 
-    /// Attachments that refer to uploads, with the uploads' bytes in them instead: what one
-    /// message to many agents carries to each. One whose upload is gone (expired, let go for room,
-    /// or the server started again) keeps its name without its bytes, as [`Registry::route_attachments`]
-    /// does: the message is the one it was, so sent again under its key it's answered as its repeat
-    /// where it was taken (CP-T3.2, the twenty-second adversarial check's).
-    pub fn inline_uploads(&self, attachments: Vec<super::model::Attachment>) -> Vec<super::model::Attachment> {
-        use base64::Engine as _;
-        let b64 = base64::engine::general_purpose::STANDARD;
-        attachments
-            .into_iter()
-            .filter_map(|mut a| {
-                a.path = None;
-                let Some(fid) = a.file_id.take() else { return (!a.data_base64.is_empty()).then_some(a) };
-                let Some((name, mime, data)) = self.upload_of(&fid) else {
-                    a.data_base64.clear();
-                    return (!a.name.is_empty()).then_some(a);
-                };
-                if a.name.is_empty() {
-                    a.name = name;
-                }
-                if a.mime.is_empty() {
-                    a.mime = mime;
-                }
-                a.data_base64 = b64.encode(&data);
-                Some(a)
-            })
-            .collect()
+    /// Transfer bounded verified pieces before dispatch; retry identity is derived from immutable
+    /// recipient/message/index/content. Missing or corrupt files never become a name-only send.
+    pub(super) async fn route_attachments(&self, hub: &Hub, id: &str, loc: &Location, c: Command) -> Result<Command, Sent> {
+        self.route_attachments_on(hub, id, loc, c, crate::proto::LANE_CONTROL).await
     }
 
-    /// A message's attachments, made ready for where the session runs: uploads resolved, and
-    /// for a machine, every file sent ahead in pieces (the message then refers to them by id).
-    async fn route_attachments(&self, hub: &Hub, id: &str, loc: &Location, c: Command) -> Result<Command, Sent> {
+    /// [`Registry::route_attachments`], its pieces sent on `lane`: the lane of the command they go
+    /// with, which can't overtake them there (an Admit's, the control lane; a message for a
+    /// runner's inbox, `LANE_TERM`, which drops a file that hasn't come yet).
+    async fn route_attachments_on(&self, hub: &Hub, id: &str, loc: &Location, c: Command, lane: u32) -> Result<Command, Sent> {
         use base64::Engine as _;
+        use sha2::Digest as _;
+        super::state_view::encode(&c, super::state_view::FRAME).map_err(|_| Sent::PublicationRefused(super::mail::Error::TooLarge { revision: 0, budget: super::state_view::FRAME }))?;
         let Command::Send { id: mid, text, mode, attachments, overrides, reply_to, task } = c else { return Ok(c) };
-        if attachments.is_empty() {
-            return Ok(Command::Send { id: mid, text, mode, attachments, overrides, reply_to, task });
-        }
-        let b64 = base64::engine::general_purpose::STANDARD;
+        let waiting = || Sent::PublicationRefused(super::mail::Error::Unavailable { reason: "the complete original attachment is waiting for verified storage at its owner".into() });
         let mut out = Vec::new();
-        for mut a in attachments {
-            a.path = None;
-            // The bytes: inline, or an upload.
-            let data: Option<bytes::Bytes> = match a.file_id.take().and_then(|f| self.upload_of(&f)) {
-                Some((name, mime, data)) => {
-                    if a.name.is_empty() {
-                        a.name = name;
-                    }
-                    if a.mime.is_empty() {
-                        a.mime = mime;
-                    }
-                    Some(data)
+        for (index, mut a) in attachments.into_iter().enumerate() {
+            if a.path.is_some() { return Err(waiting()); }
+            let (size, sha256, key, inline) = match &a.file_id {
+                Some(file) => {
+                    let upload = self.upload_of(hub, file).await.map_err(Sent::PublicationRefused)?;
+                    if a.name.is_empty() { a.name = upload.name; }
+                    if a.mime.is_empty() { a.mime = upload.mime; }
+                    (upload.size, upload.sha256, Some(Upload::bytes(file)), Vec::new())
                 }
-                None => b64.decode(a.data_base64.as_bytes()).ok().map(bytes::Bytes::from),
+                None => {
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(a.data_base64.as_bytes()).map_err(|_| waiting())?;
+                    let size = u64::try_from(bytes.len()).map_err(|_| waiting())?;
+                    let sha256 = crate::util::sha256_hex(&bytes);
+                    (size, sha256, None, bytes)
+                }
             };
-            let Some(data) = data.filter(|d| !d.is_empty()) else {
-                // Its upload is gone (the server started again, or let it go for room or age): its
-                // name still goes, so the message is the one it was (CP-T3.2, the twenty-second
-                // adversarial check's). Sent again after its first try was taken, it's answered as
-                // its repeat, never refused as another message under its id (whose Retry would be a
-                // second prompt). New, it goes without the file, which its runner leaves out, said.
-                a.data_base64.clear();
-                out.push(a);
-                continue;
-            };
-            match loc {
-                Location::Local => {
-                    let fid = crate::util::new_id();
-                    let (host, sid, f) = (Arc::clone(&self.local), id.to_owned(), fid.clone());
-                    let stored = crate::rt::blocking(move || host.receive(&sid, &f, 0, &data, true)).await;
-                    if !matches!(stored, Ok(Ok(()))) {
-                        continue;
+            if size == 0 || size > super::host::ATTACHMENT_MAX { return Err(waiting()); }
+            let fid = crate::util::derive_id(&["harness-attachment-v1", id, &mid, &index.to_string(), &sha256]);
+            let mut hash = sha2::Sha256::new();
+            let mut offset = 0u64;
+            while offset < size {
+                let end = offset.checked_add(FILE_CHUNK as u64).ok_or_else(waiting)?.min(size);
+                let data = match &key {
+                    Some(key) => {
+                        let (meta, bytes) = hub.blobs.blobs.get(key, Some(kiln_seams::blobs::Range { start: offset, end: end.checked_sub(1) })).await.map_err(|e| Sent::PublicationRefused(upload_refused(e)))?;
+                        if meta.etag != sha256 || meta.size != size { return Err(waiting()); }
+                        bytes
                     }
-                    a.data_base64.clear();
-                    a.file_id = Some(fid);
-                }
-                Location::Machine(machine) => {
-                    let fid = crate::util::new_id();
-                    let total = data.len();
-                    let mut offset = 0usize;
-                    while offset < total || total == 0 {
-                        let end = (offset + FILE_CHUNK).min(total);
-                        let piece = data.get(offset..end).map(<[u8]>::to_vec).unwrap_or_default();
-                        let msg = ServerMsg::HarnessFile { session: id.to_owned(), file: fid.clone(), offset: offset as u64, data: piece, done: end >= total };
-                        if !hub.send_to_agent(machine, LANE_TERM, &msg).await {
-                            return Err(Sent::Unreachable);
-                        }
-                        offset = end;
-                        if end >= total {
-                            break;
-                        }
+                    None => inline.get(usize::try_from(offset).map_err(|_| waiting())?..usize::try_from(end).map_err(|_| waiting())?).ok_or_else(waiting)?.to_vec(),
+                };
+                if u64::try_from(data.len()).ok() != end.checked_sub(offset) { return Err(waiting()); }
+                hash.update(&data);
+                let done = end == size;
+                if done && hex::encode(hash.clone().finalize()) != sha256 { return Err(waiting()); }
+                match loc {
+                    Location::Local => {
+                        let (host, sid, file) = (Arc::clone(&self.local), id.to_owned(), fid.clone());
+                        if !matches!(crate::rt::blocking(move || host.receive(&sid, &file, offset, &data, done)).await, Ok(Ok(()))) { return Err(waiting()); }
                     }
-                    a.data_base64.clear();
-                    a.file_id = Some(fid);
+                    Location::Machine(machine) => {
+                        let msg = ServerMsg::HarnessFile { session: id.to_owned(), file: fid.clone(), offset, data, done };
+                        // File pieces and the command after them share a lane; QUIC lane
+                        // ordering prevents the command from overtaking its originals.
+                        if !hub.send_to_agent(machine, lane, &msg).await { return Err(Sent::Unreachable); }
+                    }
                 }
+                offset = end;
             }
+            a.path = None;
+            a.data_base64.clear();
+            a.file_id = Some(fid);
             out.push(a);
         }
         Ok(Command::Send { id: mid, text, mode, attachments: out, overrides, reply_to, task })
@@ -4146,6 +4304,22 @@ impl Registry {
     pub fn epoch_of(&self, id: &str) -> u64 {
         let seen = self.sessions.with(id, |v| v.info.epoch).unwrap_or(0);
         self.epochs.load().get(id).copied().unwrap_or(0).max(seen)
+    }
+
+    /// A real server incarnation and authenticated owner connection, stable across bookkeeping
+    /// writes and capacity updates. It changes only when restart/reconnect requires reconciliation.
+    pub fn mail_connection(&self, hub: &Hub, id: &str) -> Option<String> {
+        match self.location(id)? {
+            Location::Local => Some(format!("{}:{}:local", born(), hub.generation)),
+            Location::Machine(machine) => {
+                let instances = hub.instances.load();
+                let peer = instances.owner(&crate::instances::Owned::Agent(id.to_owned()))?;
+                let owner = instances.get(peer)?;
+                if owner.name != machine || !instances.current_connection(peer) { return None; }
+                let connection = hub.tunnels.connection_id(peer)?;
+                Some(format!("{}:{}:{peer}:{connection}", born(), hub.generation))
+            }
+        }
     }
 
     /// Waits for the answer to message `message` sent to session `id`: none when too many wait
@@ -4195,6 +4369,67 @@ impl Registry {
         self.resolve(hub, id, c, pending).await
     }
 
+    /// The shared publication path for authenticated producers. Receipt means durable server
+    /// custody only; actual source admission and consumption are separate owner events.
+    #[allow(clippy::too_many_arguments, reason = "authenticated custody binds the existing recipient, command, proof, principal, sender and explicit status together")]
+    pub async fn command_published(&self, hub: &Arc<Hub>, id: &str, command: Command, provenance: Option<Value>, owner: String, sender: String, status: Option<super::mail::StatusKey>) -> Result<super::mail::Receipt, super::mail::Error> {
+        self.publish_command(hub, id, command, provenance, owner, sender, status).await
+    }
+
+    pub async fn command_status(&self, hub: &Hub, id: &str, command: Command, status: super::mail::StatusKey) -> Sent {
+        match self.publish_command(hub, id, command, None, "server".into(), "server".into(), Some(status)).await {
+            Ok(receipt) => Sent::Published(receipt),
+            Err(error) => Sent::PublicationRefused(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "authenticated custody binds the existing recipient, command, proof, principal, sender and explicit status together")]
+    async fn publish_command(&self, hub: &Hub, id: &str, command: Command, provenance: Option<Value>, owner: String, sender: String, status: Option<super::mail::StatusKey>) -> Result<super::mail::Receipt, super::mail::Error> {
+        let message = message_id(&command).ok_or_else(|| super::mail::Error::Invalid { reason: "durable communications require an immutable nonempty message id".into() })?;
+        if !super::session::is_message(&command) { return Err(super::mail::Error::Invalid { reason: "only a communication can transfer durable mail custody".into() }); }
+        let command = serde_json::to_value(command).map_err(|_| super::mail::Error::Invalid { reason: "communication cannot be encoded".into() })?;
+        super::mail_delivery::publish(hub, super::mail::Publish { owner, sender, recipient: id.to_owned(), id: message, command, provenance, status }).await
+    }
+
+    /// Publish a current source event on its existing session feed and control projection.
+    /// Source epoch/location are checked again on the owner shard, after the ledger commit.
+    pub async fn mail_event(&self, hub: &Arc<Hub>, id: &str, source: Location, event: super::admission::FlowEvent, projection: Option<super::mail::Projection>) -> bool {
+        let (id, h) = (id.to_owned(), Arc::clone(hub));
+        self.sessions.on(&id.clone(), move |s| {
+            let capacity = super::mail_delivery::event_capacity(&event);
+            let Some(m) = s.get_mut(&id) else { return false };
+            if *m.location != source || m.info.epoch != capacity.epoch { return false; }
+            let fault = matches!(&event, super::admission::FlowEvent::Fault { .. });
+            let newer = fault || m.info.admission.as_ref().is_none_or(|was| was.epoch != capacity.epoch || was.generation <= capacity.generation);
+            let changed = newer && if fault { m.info.admission.is_some() } else { m.info.admission.as_ref() != Some(capacity) };
+            if newer {
+                Arc::make_mut(&mut m.info).admission = (!fault).then(|| capacity.clone());
+                if m.state.is_object() { Arc::make_mut(&mut m.state).set("admission", &if fault { Value::Null } else { json!(capacity) }); }
+            }
+            m.rev = m.rev.saturating_add(1);
+            m.commit(|m| {
+                let (publication, mail_scope) = projection.map(|p| (Some(p.publication), Some(p.mail_scope))).unwrap_or_default();
+                let text = crate::wire::ui::SessionDown { frame: crate::wire::ui::SessionFrame::MailFlow { event: Box::new(event), publication, mail_scope }, rev: Some(m.rev) }.text();
+                let mut payload = super::live::Payload::new(m.rev, text.len());
+                payload.text().extend_from_slice(text.as_bytes());
+                payload.done();
+                Some(payload)
+            });
+            let lent = h.emit_harness(&id, m.info_encoded());
+            m.harness_at = lent.seq();
+            m.harness = Some(lent);
+            if changed {
+                h.harness.mail_delivery.changed();
+                super::told::wake(&h, &id);
+            }
+            true
+        }).await.unwrap_or(false)
+    }
+
+    pub fn mail_receipt(&self, id: &str, receipt: super::mail::Receipt) {
+        self.asked.published(id, receipt);
+    }
+
     /// What command `c` to session `id` is, for what its answers mean (`super::asked`): a message,
     /// and whether it goes under its id to an inbox that takes it once.
     pub fn kind_of(&self, hub: &Hub, id: &str, c: &Command) -> super::asked::Kind {
@@ -4213,6 +4448,17 @@ impl Registry {
     /// hear them: one parked at once, then its runner's once it's back.
     pub async fn send_asked(&self, hub: &Arc<Hub>, id: &str, scope: &str, cmd: &str, c: Command) {
         use std::time::Instant;
+        // A message goes into custody (W20), a person's in a queue of its own, unless it's a
+        // person's and its session's runner predates mail-flow: then it goes to that runner's
+        // inbox, as before, through `dispatch` below ([`super::mail_delivery::legacy_owner`]).
+        if super::session::is_message(&c) && (!super::mail::person(scope) || !super::mail_delivery::legacy_owner(hub, id)) {
+            let sent = match self.publish_command(hub, id, c, None, scope.to_owned(), scope.to_owned(), None).await {
+                Ok(receipt) => Sent::Published(receipt),
+                Err(error) => Sent::PublicationRefused(error),
+            };
+            self.asked.answered(id, scope, cmd, &sent, Instant::now());
+            return;
+        }
         let pending = self.dispatch(hub, id, c.clone()).await;
         let (h, session, scope, cmd) = (Arc::clone(hub), id.to_owned(), scope.to_owned(), cmd.to_owned());
         crate::rt::spawn(async move {
@@ -4321,6 +4567,19 @@ impl Registry {
     /// [`Registry::dispatch_one`], with what kiln and the relays before it record of passing it on
     /// (`relayed`, [`Registry::command_relayed`]) beside it in what goes to the runner.
     async fn dispatch_relayed(&self, hub: &Hub, id: &str, c: Command, relayed: Option<&Value>) -> Pending {
+        if matches!(&c, Command::Admit { .. } | Command::MailAck { .. } | Command::MailPeers { .. } | Command::MailHandoff { .. }) {
+            return Pending::Now(Sent::PublicationRefused(super::mail::Error::Invalid { reason: "mail grants and receipts belong to the authenticated server relay".into() }));
+        }
+        // A person's message, or kiln's own, to a runner that predates mail-flow goes to its
+        // inbox below, as before W20: that runner never pushes the capacity custody waits for.
+        // An agent's relayed words stay in custody, bounded, until it's upgraded.
+        if super::session::is_message(&c) && (relayed.is_some() || !super::mail_delivery::legacy_owner(hub, id)) {
+            let provenance = relayed.map(|proof| json!({"relayed": proof}));
+            return Pending::Now(match self.publish_command(hub, id, c, provenance, "server".into(), "server".into(), None).await {
+                Ok(receipt) => Sent::Published(receipt),
+                Err(error) => Sent::PublicationRefused(error),
+            });
+        }
         let Some(loc) = self.location(id) else { return Pending::Now(Sent::NoSession) };
         // Kiln's own (`goals::keep`), kept here: its harness has nothing to do with it.
         if let Command::Control { id: control, value } = &c
@@ -4337,7 +4596,7 @@ impl Registry {
         {
             self.rename(hub, id, value.as_ref()).await;
         }
-        let c = match self.route_attachments(hub, id, &loc, c).await {
+        let c = match self.route_attachments_on(hub, id, &loc, c, LANE_TERM).await {
             Ok(c) => c,
             Err(e) => return Pending::Now(e),
         };
@@ -6126,6 +6385,50 @@ mod tests {
         })
     }
 
+    /// W20-R01: an owner's Open restores lifecycle while its full State is still on the way.
+    #[test]
+    fn an_owner_open_updates_lifecycle_for_current_and_later_viewers() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let open = |status, since| Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), status, epoch: 3, ..Info::default() }), since };
+            hub.harness.ingest(&there, "s", open(Status::Idle, None)).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(State { status: Status::Idle, epoch: 3, summary: "details retained".into(), ..State::default() }) }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: vec![Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: Body::Assistant { text: "existing event".into(), streaming: false } }] }).await;
+            let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
+            for status in [Status::Starting, Status::Idle, Status::Exited, Status::Waiting, Status::Running] {
+                hub.harness.machine_lost(&hub, "box").await;
+                let _ = sent(&hub, &topic, &mut at);
+                hub.harness.ingest(&there, "s", open(status, Some(1))).await;
+                anyhow::ensure!(hub.harness.info("s").is_some_and(|i| i.status == status), "the owner's actual lifecycle");
+                anyhow::ensure!(hub.harness.state("s").is_some_and(|s| s.status == status && s.summary == "details retained"), "stale offline status is reconciled without replacing details");
+                let heard = sent(&hub, &topic, &mut at);
+                anyhow::ensure!(heard.iter().filter_map(|f| serde_json::from_str::<Value>(f).ok()).any(|v| v.get("t").and_then(Value::as_str) == Some("state") && v.pointer("/state/status") == Some(&json!(status))), "the existing viewer receives the control change: {heard:?}");
+                anyhow::ensure!(!heard.iter().any(|f| f == super::super::live::RESYNC || f.contains(r#""t":"open""#)), "the resumed timeline is not reset: {heard:?}");
+                let next = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no later copy"))?;
+                let frames = next.frames().iter().map(|f| serde_json::from_str::<Value>(f)).collect::<Result<Vec<_>, _>>()?;
+                anyhow::ensure!(frames.iter().any(|v| v.pointer("/info/status") == Some(&json!(status))) && frames.iter().any(|v| v.pointer("/state/status") == Some(&json!(status))), "later attach sees coherent Info and State");
+                anyhow::ensure!(copy_of(&hub, "s") == ["e1"], "event history is retained");
+            }
+            hub.harness.machine_lost(&hub, "box").await;
+            let _ = sent(&hub, &topic, &mut at);
+            hub.harness.ingest(&there, "s", open(Status::Idle, None)).await;
+            anyhow::ensure!(sent(&hub, &topic, &mut at).iter().any(|f| f == super::super::live::RESYNC), "a full Open refreshes older viewers from the coherent copy");
+            anyhow::ensure!(hub.harness.state("s").is_some_and(|s| s.status == Status::Idle), "the replacement snapshot has fresh lifecycle");
+            // An owner can announce lifecycle before it has supplied any State at all.
+            hub.harness.ingest(&there, "header", Update::Open { info: Box::new(Info { id: "header".into(), kind: "claude".into(), status: Status::Exited, ..Info::default() }), since: None }).await;
+            let header = hub.harness.attach("header").ok_or_else(|| anyhow::anyhow!("no header copy"))?;
+            let (_watching, topic, mut at) = (header.viewer, header.topic, header.at.unwrap_or_default());
+            hub.harness.ingest(&there, "header", Update::Open { info: Box::new(Info { id: "header".into(), kind: "claude".into(), status: Status::Starting, ..Info::default() }), since: Some(0) }).await;
+            anyhow::ensure!(hub.harness.state("header").is_none(), "a header does not fabricate a State");
+            let heard = sent(&hub, &topic, &mut at);
+            anyhow::ensure!(heard.iter().filter_map(|f| serde_json::from_str::<Value>(f).ok()).any(|v| v.get("t").and_then(Value::as_str) == Some("resumed") && v.pointer("/info/status") == Some(&json!("starting"))), "the header-only viewer receives lifecycle: {heard:?}");
+            Ok(())
+        })
+    }
+
     /// Session `id`'s events as its copy has them: each one's id and words, in order.
     fn said_in(hub: &Hub, id: &str) -> Vec<(String, String)> {
         hub.harness
@@ -6331,7 +6634,7 @@ mod tests {
             for id in ids.clone() {
                 let (hub, sent) = (Arc::clone(&hub), sent_tx.clone());
                 crate::rt::spawn_spread(async move {
-                    let runner = |update: Update| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None, taken: None };
+                    let runner = |update: Update| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None, taken: None, fill: false };
                     let mut n = 0u64;
                     while n < per {
                         let run = if n.is_multiple_of(4) { 8.min(per - n) } else { 1 };
@@ -6363,6 +6666,53 @@ mod tests {
                 let summary = hub.harness.sessions.with(id, |v| v.info.summary.clone());
                 anyhow::ensure!(summary.as_deref() == Some(format!("through {per}").as_str()), "{id}'s last state: {summary:?}");
             }
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: a runner's state too large for its frame comes as a view, its queue left out. The copy keeps the
+    /// queue it had (no page sees a field left out, nor the view) and takes the view's own fields; the queue the server
+    /// read from the runner comes in at the revision the view said, and one read at another revision doesn't.
+    #[test]
+    fn cp_t3_2_a_bounded_view_keeps_the_copys_fields_until_read() -> anyhow::Result<()> {
+        use crate::harness::model::{QueueItem, State, Status};
+        use crate::harness::state_view::{FRAME, Metadata, view};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let id = "big".to_owned();
+            hub.harness.ingest(&there, &id, Update::Open { info: Box::new(Info { id: id.clone(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            let runner = |update: Update, fill: bool| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None, taken: None, fill };
+            let item = |i: usize| QueueItem { id: format!("q{i}"), text: "peer report ".repeat(200), at: 1, attachments: Vec::new(), overrides: None, reply_to: None };
+            let copy = || hub.harness.sessions.with(&id, |v| (v.state.to_value(), v.info.queued)).ok_or_else(|| anyhow::anyhow!("no copy"));
+            let first = State { status: Status::Running, queue: (0..400).map(item).collect(), ..State::default() };
+            hub.harness.from_runner(runner(Update::State { state: Box::new(first.clone()) }, false)).await;
+            hub.harness.settled().await;
+            let mut now = first.clone();
+            now.queue.push(item(400));
+            now.status = Status::Waiting;
+            let bounded: State = serde_json::from_value(view(&now, FRAME - 4096)?.into_state()?)?;
+            anyhow::ensure!(bounded.queue.is_empty(), "the view leaves the queue out");
+            hub.harness.from_runner(runner(Update::State { state: Box::new(bounded.clone()) }, false)).await;
+            hub.harness.settled().await;
+            let (doc, queued) = copy()?;
+            anyhow::ensure!(doc.get("view").is_none(), "a page never sees the view");
+            anyhow::ensure!(doc.get("status") == Some(&serde_json::json!("waiting")), "the view's own fields count");
+            anyhow::ensure!(doc.get("queue").and_then(Value::as_array).map(Vec::len) == Some(400), "the queue left out keeps the copy's");
+            anyhow::ensure!(queued == 401, "its count is the runner's: {queued}");
+            let revision = bounded.view.as_ref().and_then(|v| v.revisions.get("queue").cloned()).unwrap_or_default();
+            let read = |revision: String| {
+                let view = Metadata { revision: String::new(), revisions: std::collections::BTreeMap::from([("queue".to_owned(), revision)]), deferred: std::collections::BTreeMap::new(), counts: Default::default(), queue_index: None };
+                Update::State { state: Box::new(State { queue: now.queue.clone(), view: Some(view), ..State::default() }) }
+            };
+            hub.harness.from_runner(runner(read("another".into()), true)).await;
+            hub.harness.settled().await;
+            anyhow::ensure!(copy()?.0.get("queue").and_then(Value::as_array).map(Vec::len) == Some(400), "a read at another revision isn't taken");
+            hub.harness.from_runner(runner(read(revision), true)).await;
+            hub.harness.settled().await;
+            let (doc, queued) = copy()?;
+            anyhow::ensure!(doc.get("queue").and_then(Value::as_array).map(Vec::len) == Some(401) && queued == 401, "the queue read comes in");
+            anyhow::ensure!(doc.get("status") == Some(&serde_json::json!("waiting")) && doc.get("view").is_none(), "{:?}", doc.get("status"));
             Ok(())
         })
     }
@@ -6987,7 +7337,7 @@ mod tests {
 
     /// An update of session `session` as its runner sends it, for its owner to judge and take (`Registry::from_runner`).
     fn from_box(session: &str, update: Update) -> super::super::copies::RunnerUpdate {
-        super::super::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: session.to_owned(), update, shipped: false, arrived: None, handed: None, taken: None }
+        super::super::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: session.to_owned(), update, shipped: false, arrived: None, handed: None, taken: None, fill: false }
     }
 
     /// Event `q` of session `id` (named `{id}-e{q}`), saying `text`.
@@ -7503,6 +7853,68 @@ mod tests {
     const WINDOWED: View = View { window: true, lean: false };
     const LEAN: View = View { window: true, lean: true };
 
+    fn bounded_parts(m: &Mirror, after: Option<u64>, lean: bool) -> Parts {
+        let mut p = m.view().parts_after(after, View { window: true, lean }, true);
+        p.history = Some(History { limits: super::super::history::Limits::new(2, 16 * 1024), token: super::super::history::cursor(born(), m.reset_at, "s"), durable: true });
+        p
+    }
+
+    #[test]
+    fn w21_r02_bounded_copies_keep_lean_hydration_resume_and_incremental_gzip() -> anyhow::Result<()> {
+        use std::io::Read as _;
+        let all = long_session(480);
+        let mut m = mirror_of(&all);
+        let legacy = Snapshot { parts: m.view().parts_for(View::default(), false), files: None, store: None }.frames();
+        assert_eq!(ids(&legacy).len(), all.len());
+        assert!(!legacy.iter().any(|f| f.contains("\"t\":\"history\"")));
+        let make = || Snapshot { parts: bounded_parts(&m, None, true), files: None, store: None };
+        let frames = make().frames();
+        let (events, window) = sent_events(&frames);
+        assert!(events.len() < all.len());
+        assert!(events.iter().any(|e| e.get("held").is_some()), "main's lazy tool bodies are retained");
+        let h: Value = frames.iter().filter_map(|f| serde_json::from_str::<Value>(f).ok()).find(|f| f.get("t").and_then(Value::as_str) == Some("history")).ok_or_else(|| anyhow::anyhow!("no history"))?;
+        assert_eq!(h.get("before"), window.as_ref().and_then(|w| w.get("before")));
+        assert_eq!(h.get("has_more"), Some(&json!(true)));
+        let mut packing = make().packing("{\"t\":\"synced\"}");
+        let mut packed = Vec::new();
+        while let Some(piece) = packing.next_piece(73)? { packed.extend(piece); }
+        let mut decoded = String::new();
+        flate2::read::GzDecoder::new(packed.as_slice()).read_to_string(&mut decoded)?;
+        assert_eq!(decoded, frames.join("\n") + "\n{\"t\":\"synced\"}");
+        let old_cursor = h.get("cursor").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let streamed = all.iter().rev().find(|e| e.get("kind").and_then(Value::as_str) == Some("assistant")).and_then(|e| e.get("id")).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let had = m.rev;
+        took(&mut m, |m| m.append(&streamed, " streamed"));
+        let resumed = Snapshot { parts: bounded_parts(&m, Some(had), true), files: None, store: None }.frames();
+        assert_eq!(ids(&resumed), vec![streamed]);
+        assert!(!resumed.iter().any(|f| f.contains("\"t\":\"history\"")));
+        took(&mut m, |m| m.started_over());
+        assert!(!super::super::history::valid_cursor(&old_cursor, born(), m.reset_at, "s"));
+        Ok(())
+    }
+
+    #[test]
+    fn w21_r02_cursor_pages_overlay_canonical_corrections_and_reject_reset() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let mut m = mirror_of(&[]);
+            took(&mut m, |m| m.upsert(Arc::new(Entry::new(json!({"id":"replacement","seq":2,"kind":"assistant","text":"corrected"})))));
+            took(&mut m, |m| m.upsert(Arc::new(Entry::new(json!({"id":"moved","seq":9,"kind":"assistant","text":"past this page"})))));
+            let token = super::super::history::cursor(born(), m.reset_at, "s");
+            hub.harness.sessions.on("s", move |s| s.insert("s".into(), m)).await;
+            assert!(hub.harness.history_valid("s", &token));
+            assert!(!hub.harness.history_valid("other", &token));
+            let durable = vec![json!({"id":"deleted","seq":2,"text":"old"}),json!({"id":"earlier","seq":1}),json!({"id":"moved","seq":3,"text":"stale"})];
+            let (page, revision, more, floor) = hub.harness.history_overlay("s", &token, 5, 100, durable).await?.ok_or_else(|| anyhow::anyhow!("no page"))?;
+            assert_eq!(revision, 2); assert!(!more); assert_eq!(floor, 1);
+            assert_eq!(page.iter().filter_map(|e| e.get("id").and_then(Value::as_str)).collect::<Vec<_>>(), vec!["earlier", "replacement"]);
+            hub.harness.sessions.on("s", |s| { if let Some(m) = s.get_mut("s") { took(m, |m| m.started_over()); m.publish(); } }).await;
+            assert!(!hub.harness.history_valid("s", &token));
+            assert!(hub.harness.history_overlay("s", &token, 5, 100, Vec::new()).await?.is_none());
+            Ok(())
+        })
+    }
+
     /// W21-R15 (an agent's page opens at once): a viewer that asks for a window is sent the newest
     /// ten turns whole, and told where they begin and that there's more before; one from before
     /// windows is sent every event, its `open` as it was.
@@ -7786,5 +8198,62 @@ mod tests {
         assert!(lean.2 < before.2 / 10, "a window costs a tenth of today's at most: {lean:?} against {before:?}");
         assert!(lean.2 <= super::super::window::BYTES + 64 * 1024, "about a window's bytes: {lean:?}");
         Ok(())
+    }
+
+    /// A person's message to an agent whose runner predates mail-flow goes to that runner's inbox,
+    /// as it did before W20, and is answered there: the runner never pushes the capacity custody
+    /// waits for, so custody refused it ("waiting for capacity") for as long as the runner was old.
+    /// An agent's message to it stays in custody's hands (W20's bound). Once the runner speaks
+    /// mail-flow, a person's is queued in custody, in a queue of its own, before the agent's
+    /// capacity has come; an agent's and kiln's own wait for that capacity.
+    #[test]
+    fn w20_a_persons_message_reaches_a_runner_from_before_mail_flow_through_its_inbox() -> anyhow::Result<()> {
+        use super::super::asked::Taken;
+        use super::super::model::SendMode;
+        use crate::proto::{AgentMsg, CAP_INBOX, CAP_UNREAD, CAP_WIRE};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::hub_with_runner(crate::rt::clock(), "old-mac", CAP_UNREAD | CAP_WIRE | CAP_INBOX).await?;
+            let open = Update::Open { info: Box::new(Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
+            crate::hub::tests::hear_item(&hub, 1, "s:s1#a1", 1, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&open)? }).await?;
+            anyhow::ensure!(hub.harness.located_on("s1", "old-mac"), "s1 opened on old-mac");
+            anyhow::ensure!(super::super::mail_delivery::legacy_owner(&hub, "s1"), "a runner that names no mail-flow is from before it");
+            let send = |id: &str| Command::Send { id: id.into(), text: "what is this section?".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+            let asked = |scope: &str, cmd: &str, id: &str| {
+                let kind = hub.harness.kind_of(&hub, "s1", &send(id));
+                match hub.harness.asked.take("s1", scope, cmd, kind, std::time::Instant::now()) {
+                    (_, Taken::New(rx)) => Ok(rx),
+                    (_, other) => Err(anyhow::anyhow!("{cmd} came before: {other:?}")),
+                }
+            };
+            // A person's, from the page's socket: on to its inbox, which answers it.
+            let person = asked("user:ada", "c1", "m1")?;
+            hub.harness.send_asked(&hub, "s1", "user:ada", "c1", send("m1")).await;
+            anyhow::ensure!(super::super::mail::receipt(&hub.store, "user:ada".into(), "user:ada".into(), "s1".into(), "m1".into()).await?.is_none(), "not held in custody");
+            let took = Update::Inbox { said: Box::new(Said { message: "m1".into(), answer: Ok(Answer { session: "s1".into(), message: "m1".into(), epoch: 0, at: 1, seq: 1, repeat: false }) }) };
+            crate::hub::tests::hear_item(&hub, 1, "s:s1#a1", 2, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&took)? }).await?;
+            let sent = person.await?;
+            anyhow::ensure!(matches!(sent, Sent::Accepted(ref a) if a.message == "m1"), "its inbox took it: {sent:?}");
+            // Kiln's own and a person's through the API go there too.
+            anyhow::ensure!(matches!(hub.harness.dispatch(&hub, "s1", send("m2")).await, Pending::Answer { ref message, .. } if message == "m2"), "to its inbox");
+            // An agent's stays with custody, which takes nothing for a runner that pushes no capacity.
+            let agent = asked("agent:a1", "c3", "m3")?;
+            hub.harness.send_asked(&hub, "s1", "agent:a1", "c3", send("m3")).await;
+            let sent = agent.await?;
+            anyhow::ensure!(matches!(sent, Sent::PublicationRefused(super::super::mail::Error::Unavailable { .. })), "an agent's is held to custody: {sent:?}");
+            // Its runner upgraded, speaking mail-flow, its capacity not come yet: a person's is
+            // queued in custody, in the person's own queue; an agent's and kiln's wait for it.
+            hub.instances.update(|i| i.set_features(1, vec![crate::proto::feature::MAIL_FLOW.to_owned()]));
+            anyhow::ensure!(!super::super::mail_delivery::legacy_owner(&hub, "s1"), "a runner naming mail-flow isn't from before it");
+            let person = asked("user:ada", "c4", "m4")?;
+            hub.harness.send_asked(&hub, "s1", "user:ada", "c4", send("m4")).await;
+            let sent = person.await?;
+            anyhow::ensure!(matches!(sent, Sent::Published(ref r) if r.disposition == super::super::mail::Disposition::Waiting), "queued for the agent: {sent:?}");
+            let agent = asked("agent:a1", "c5", "m5")?;
+            hub.harness.send_asked(&hub, "s1", "agent:a1", "c5", send("m5")).await;
+            let sent = agent.await?;
+            anyhow::ensure!(matches!(sent, Sent::PublicationRefused(super::super::mail::Error::Unavailable { .. })), "an agent's waits for its capacity: {sent:?}");
+            anyhow::ensure!(matches!(hub.harness.dispatch(&hub, "s1", send("m6")).await, Pending::Now(Sent::PublicationRefused(_))), "and kiln's own");
+            Ok(())
+        })
     }
 }

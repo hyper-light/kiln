@@ -22,7 +22,7 @@ use super::queue::Room;
 
 /// The owners of runners' bytes on their way to the copies, in the buffers the room is for: left out of what the server
 /// holds beside them.
-const IN_FLIGHT: [&Owner; 3] = [&super::owners::NET_EVENTS, &super::owners::SESSION_INBOXES, &super::owners::SESSION_PACKING];
+const IN_FLIGHT: [&Owner; 4] = [&super::owners::NET_EVENTS, &super::owners::SESSION_INBOXES, &super::owners::SESSION_PACKING, &super::owners::HARNESS_INPUT];
 
 /// The server's buffers of runners' bytes, which fill together while its copies are behind, each a share: the net
 /// thread's own (what it holds before it holds the runners' lanes), the hub loops' queues (`net_events`), each of
@@ -55,12 +55,27 @@ fn resident() -> u64 {
     hyper_rt::machine::facts::Facts::resident_now().unwrap_or(0)
 }
 
+/// Existing transport buffers and source input owners resize on the same resource events.
+pub trait ShareFollower: Send + Sync {
+    fn resize(&self, bytes: usize);
+}
+
+impl ShareFollower for Room {
+    fn resize(&self, bytes: usize) { Room::resize(self, bytes); }
+}
+
+#[derive(Clone)]
+struct Follower {
+    target: Weak<dyn ShareFollower>,
+    input_pool: bool,
+}
+
 /// The share and what it's measured from, and the queues it sizes.
 pub struct Shares {
     runners: AtomicUsize,
     /// The share last measured; none until first asked.
     share: OnceLock<AtomicUsize>,
-    followers: OnceLock<crate::rcu::Rcu<Vec<Weak<Room>>>>,
+    followers: OnceLock<crate::rcu::Rcu<Vec<Follower>>>,
 }
 
 impl Shares {
@@ -85,9 +100,23 @@ impl Shares {
     /// `room` sized by the share from now on: now, and each time it's measured again. One that goes is let go of.
     pub fn follow(&self, room: &Arc<Room>) {
         room.resize(self.share());
+        let target: Arc<dyn ShareFollower> = room.clone();
+        self.register(&target, false);
+    }
+
+    /// A source host's input takes one cut of the physical resource split, and each of its
+    /// sessions is held to that share on its own (`harness::admission::SessionBudgets`): one
+    /// session's backlog takes no other's room.
+    pub fn follow_input<T: ShareFollower + 'static>(&self, input: &Arc<T>) {
+        let target: Arc<dyn ShareFollower> = input.clone();
+        self.register(&target, true);
+        self.measure();
+    }
+
+    fn register(&self, target: &Arc<dyn ShareFollower>, input_pool: bool) {
         self.followers().update(|f| {
-            f.retain(|w| w.strong_count() > 0);
-            f.push(Arc::downgrade(room));
+            f.retain(|w| w.target.strong_count() > 0);
+            f.push(Follower { target: Arc::downgrade(target), input_pool });
         });
     }
 
@@ -101,15 +130,18 @@ impl Shares {
     /// [`Shares::measure`] of `limit` bytes the server may hold, `resident` held now, `in_flight` of it in the buffers.
     fn measure_with(&self, limit: u64, resident: u64, in_flight: u64) -> usize {
         let room = limit.saturating_sub(resident.saturating_sub(in_flight));
-        let share = usize::try_from(share_of(room, self.runners.load(Ordering::Relaxed), crate::wire::fan::shards())).unwrap_or(usize::MAX);
+        let followers = self.followers().load();
+        let inputs = followers.iter().filter(|f| f.input_pool && f.target.strong_count() > 0).count();
+        let cuts = self.runners.load(Ordering::Relaxed).max(1).saturating_add(buffers(crate::wire::fan::shards())).saturating_add(inputs);
+        let share = usize::try_from(room.checked_div(u64::try_from(cuts).unwrap_or(u64::MAX)).unwrap_or(0)).unwrap_or(usize::MAX);
         self.share.get_or_init(|| AtomicUsize::new(share)).store(share, Ordering::Relaxed);
-        for room in self.followers().load().iter().filter_map(Weak::upgrade) {
+        for room in followers.iter().filter_map(|f| f.target.upgrade()) {
             room.resize(share);
         }
         share
     }
 
-    fn followers(&self) -> &crate::rcu::Rcu<Vec<Weak<Room>>> {
+    fn followers(&self) -> &crate::rcu::Rcu<Vec<Follower>> {
         self.followers.get_or_init(crate::rcu::Rcu::default)
     }
 }
@@ -138,6 +170,10 @@ pub fn follow(room: &Arc<Room>) {
     SHARES.follow(room);
 }
 
+pub fn follow_input<T: ShareFollower + 'static>(input: &Arc<T>) {
+    SHARES.follow_input(input);
+}
+
 /// The server's share measured again ([`Shares::measure`]): the kernel said memory is short.
 pub fn measure() -> usize {
     SHARES.measure()
@@ -146,6 +182,31 @@ pub fn measure() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_input_pools_share_authority_instead_of_multiplying_it() {
+        struct Input(AtomicUsize);
+        impl ShareFollower for Input {
+            fn resize(&self, bytes: usize) { self.0.store(bytes, Ordering::Relaxed); }
+        }
+        let shares = Shares::new();
+        let memory = 256 * MIB;
+        let resident = 96 * MIB;
+        let before = shares.measure_with(memory, resident, 0);
+        let first: Arc<dyn ShareFollower> = Arc::new(Input(AtomicUsize::new(0)));
+        shares.register(&first, true);
+        let one = shares.measure_with(memory, resident, 0);
+        let second: Arc<dyn ShareFollower> = Arc::new(Input(AtomicUsize::new(0)));
+        shares.register(&second, true);
+        let two = shares.measure_with(memory, resident, 0);
+        assert!(before > one && one > two);
+        let cuts = 1 + buffers(crate::wire::fan::shards()) + 2;
+        assert!(u64::try_from(two.saturating_mul(cuts)).unwrap_or(u64::MAX) <= memory - resident);
+        drop(second);
+        assert_eq!(shares.measure_with(memory, resident, 0), one);
+        drop(first);
+        assert_eq!(shares.measure_with(memory, resident, 0), before);
+    }
 
     const MIB: u64 = 1 << 20;
 

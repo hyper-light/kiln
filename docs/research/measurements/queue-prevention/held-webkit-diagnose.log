@@ -1,0 +1,18 @@
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: [{"place":"abort","name":"UnknownError","message":"Error preparing Blob/File data to be stored in object store"}]
+
+false !== true
+
+    at file:///private/tmp/kiln-queue-prevention-20261111/docs/research/measurements/queue-prevention/held-webkit-diagnose.mjs:50:10 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: false,
+  expected: true,
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v24.14.1

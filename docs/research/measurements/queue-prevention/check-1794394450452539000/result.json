@@ -1,0 +1,20 @@
+{
+  "exit_code": 0,
+  "source_unchanged": true,
+  "errors": [],
+  "free_before": 162387292160,
+  "free_after": 160691523584,
+  "command": [
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "test",
+    "--no-run",
+    "--locked",
+    "-p",
+    "kiln",
+    "--lib",
+    "--message-format=json"
+  ]
+}

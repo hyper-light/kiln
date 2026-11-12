@@ -107,6 +107,9 @@ pub struct Query {
     pub until: Option<i64>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// W21-R02: exclusive durable sequence cutoff within one conversation.
+    #[serde(default)]
+    pub before_seq: Option<u64>,
 }
 
 /// Most results one search returns.
@@ -279,9 +282,57 @@ pub trait Engine: Send + 'static {
     fn release(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+    /// A reader of its file beside the writer ([`Read`]): a connection of its own. None: reads go to the writer.
+    fn reader(&self) -> Option<Box<dyn Read + Send>> {
+        None
+    }
+}
+
+/// What reads what's committed (plan 01a1cc09, step 2): a reader beside the writer ([`Engine::reader`], on the
+/// store's reader thread), never behind the writes sent before it; or the writer itself ([`OnWriter`]). For reads of
+/// what was committed a while ago (an older page); one that must see what was just sent goes to the writer.
+pub trait Read {
+    /// As [`Engine::events`].
+    fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>>;
+}
+
+/// The writer's engine as a [`Read`]: a store whose engine has no reader (or whose reader stopped) reads on its writer,
+/// after what was sent before.
+struct OnWriter<'a>(&'a mut dyn Engine);
+
+impl Read for OnWriter<'_> {
+    fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        self.0.events(session, before, limit)
+    }
 }
 
 type Job = Box<dyn FnOnce(&mut dyn Engine) + Send>;
+type ReadJob = Box<dyn FnOnce(&mut dyn Read) + Send>;
+
+/// What the reader thread is asked ([`Store::read`]).
+enum ReadMsg {
+    /// Run on the reader, at the last commit.
+    Run(ReadJob),
+    /// Read with this one from now on: its engine's file is new (a compaction's copy took the old one's place).
+    Use(Box<dyn Read + Send>),
+    /// Let go of the file and stop: the writer lets go of it next ([`Store::close`]).
+    Stop(mpsc::Sender<()>),
+}
+
+/// The reader thread: what's asked of the reader beside the writer, in turn.
+fn read_on(mut reader: Box<dyn Read + Send>, rx: &mpsc::Receiver<ReadMsg>) {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            ReadMsg::Run(job) => job(&mut *reader),
+            ReadMsg::Use(next) => reader = next,
+            ReadMsg::Stop(done) => {
+                drop(reader);
+                let _ = done.send(());
+                return;
+            }
+        }
+    }
+}
 
 enum Msg {
     /// Rows, and the bytes [`Queue`] counts them at.
@@ -405,6 +456,8 @@ pub struct Store {
     watchers: Watchers,
     /// Sessions that ended at or after this (unix ms) keep their records ([`Store::hold_prune`]).
     hold: Arc<AtomicI64>,
+    /// The reader thread beside the writer, where the engine has a reader ([`Store::read`]).
+    reads: Option<mpsc::Sender<ReadMsg>>,
 }
 
 impl Store {
@@ -416,9 +469,17 @@ impl Store {
         let meter: Arc<Meter> = Arc::default();
         let hold = Arc::new(AtomicI64::new(i64::MAX));
         let queue: Arc<Queue> = Arc::default();
-        let (w, m, h, q) = (watchers.clone(), meter.clone(), Arc::clone(&hold), Arc::clone(&queue));
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m, &h, &q))?;
-        Ok(Self { tx, queue, id, meter, watchers, hold })
+        let reads = match engine.reader() {
+            Some(reader) => {
+                let (rtx, rrx) = mpsc::channel::<ReadMsg>();
+                std::thread::Builder::new().name("kiln-convo-read".into()).spawn(move || read_on(reader, &rrx))?;
+                Some(rtx)
+            }
+            None => None,
+        };
+        let (w, m, h, q, r) = (watchers.clone(), meter.clone(), Arc::clone(&hold), Arc::clone(&queue), reads.clone());
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m, &h, &q, r.as_ref()))?;
+        Ok(Self { tx, queue, id, meter, watchers, hold, reads })
     }
 
     /// Keeps the records of sessions that ended at or after `ended_ms` (unix ms), however long
@@ -572,6 +633,43 @@ impl Store {
         }
     }
 
+    /// Run `f` on the reader beside the writer, at the last commit ([`Read`]): never behind what was sent before it,
+    /// for what asks for what's committed (an older page; plan 01a1cc09, step 2). A store with no reader
+    /// (or whose reader stopped) runs it on the writer, after what was sent. Blocking, for `READ_WAIT` at most.
+    fn read<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Read) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
+        let (rtx, rrx) = mpsc::channel();
+        let asked = Instant::now();
+        let job: ReadJob = Box::new(move |r| {
+            let _ = rtx.send(f(r));
+        });
+        let back = match &self.reads {
+            Some(reads) => reads.send(ReadMsg::Run(job)).err().map(|mpsc::SendError(msg)| msg),
+            None => Some(ReadMsg::Run(job)),
+        };
+        if let Some(ReadMsg::Run(job)) = back {
+            self.tx
+                .send(Msg::Run(Box::new(move |e| job(&mut OnWriter(e)))))
+                .map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
+        }
+        match rrx.recv_timeout(READ_WAIT) {
+            Ok(answer) => {
+                self.meter.waited(asked.elapsed());
+                answer
+            }
+            Err(_) => {
+                self.meter.timed_out();
+                Err(anyhow::anyhow!("the conversation store didn't answer in time"))
+            }
+        }
+    }
+
+    /// A session's events before event number `before`, as committed: read beside the writer ([`Store::read`]), never
+    /// behind the writes sent before it, for an older page of a conversation. Blocking.
+    pub fn events_committed(&self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        let s = session.to_owned();
+        self.read(move |r| r.events(&s, before, limit))
+    }
+
     /// What is kept of `session`, with at most its last `last` events. Blocking.
     pub fn kept(&self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
         let s = session.to_owned();
@@ -594,6 +692,8 @@ impl Store {
         let (mut found, mut from, mut rows) = (Vec::new(), None, SEARCH_SLICE_FIRST);
         while found.len() < limit {
             let (q, want) = (q.clone(), limit - found.len());
+            // On the writer, after what was sent before it: a search finds what was just said (a reader beside the writer
+            // reads only what's committed; plan 01a1cc09, step 2).
             let (more, next, took) = self.run(move |e| {
                 let began = Instant::now();
                 let (more, next) = e.search_some(&q, from, rows, want)?;
@@ -739,7 +839,8 @@ impl Store {
 /// last commit, so its batches grow with its load and its disk's pace. A job commits what waits first, so it sees
 /// everything sent before it. Rows waited up to `COMMIT_MS` (50 ms) for others to share their commit, or for
 /// `COMMIT_ROWS` (2048) of them.
-fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64, queue: &Queue) {
+#[allow(clippy::too_many_arguments)]
+fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64, queue: &Queue, reads: Option<&mpsc::Sender<ReadMsg>>) {
     let keep_closed = upkeep.keep_closed;
     // The hold on letting records go as it last looked: one moved later lets more go, so it looks
     // again.
@@ -807,7 +908,14 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                         }
                         Msg::Close(reply) => {
                             commit(&mut engine, &mut pending, &mut pending_bytes);
-                            // Its files closed before it says so: whoever moves them next finds them let go of.
+                            // Its files closed before it says so, its reader's first: whoever moves them next finds them
+                            // let go of.
+                            if let Some(reads) = reads {
+                                let (done, stopped) = mpsc::channel();
+                                if reads.send(ReadMsg::Stop(done)).is_ok() {
+                                    let _ = stopped.recv_timeout(READ_WAIT);
+                                }
+                            }
                             let released = engine.release();
                             drop(engine);
                             let _ = reply.send(released);
@@ -834,6 +942,10 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                         Ok((e, Compacting::Going)) => e,
                         Ok((e, done)) => {
                             if let Compacting::Done { before, after } = done {
+                                // The file is the compact copy now: its reader reads that one.
+                                if let (Some(reads), Some(reader)) = (reads, e.reader()) {
+                                    let _ = reads.send(ReadMsg::Use(reader));
+                                }
                                 tracing::info!(before, after, "conversation store: its file was made compact");
                                 let ms = u64::try_from(compact_began.elapsed().as_millis()).unwrap_or(u64::MAX);
                                 meter.saw(|f| f.compacted = Some(Compacted { at: crate::util::now_ms(), before, after, ms }));
@@ -1012,7 +1124,7 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
 #[cfg(test)]
 pub fn stopped() -> Store {
     let (tx, _) = mpsc::channel();
-    Store { tx, queue: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)) }
+    Store { tx, queue: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)), reads: None }
 }
 
 /// An engine that takes `hold` longer than `inner` to let go of its file ([`Engine::release`]), its
@@ -1104,6 +1216,39 @@ mod tests {
 
     fn said(id: &str, seq: u64, text: &str) -> Update {
         Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] }
+    }
+
+    /// Plan 01a1cc09, step 2: a store's read of what's committed goes beside its writer: one asked while the writer is
+    /// held (as a commit to a disk that stalls holds it) answers before the writer is let go.
+    #[test]
+    fn a_committed_read_answers_while_the_writer_is_held() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join("conversations.db"))?), Upkeep::default())?);
+        for i in 1..=40u64 {
+            store.send("a1", &said(&format!("m{i}"), i, "words"));
+        }
+        store.sync()?;
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let holder = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.run(move |_| {
+                    let _ = held_tx.send(());
+                    let _ = go_rx.recv_timeout(Duration::from_secs(8));
+                    Ok(())
+                })
+            })
+        };
+        held_rx.recv_timeout(Duration::from_secs(5))?;
+        let began = Instant::now();
+        let page = store.events_committed("a1", Some(31), 10);
+        let took = began.elapsed();
+        let _ = go_tx.send(());
+        holder.join().map_err(|_| anyhow::anyhow!("the holder's thread panicked"))??;
+        assert_eq!(page?.iter().map(|e| e.seq).collect::<Vec<_>>(), (21..=30).collect::<Vec<_>>());
+        assert!(took < Duration::from_secs(2), "the read waited for the writer: {took:?}");
+        Ok(())
     }
 
     /// consts-audit B3 (goal 9, plan 01a1a87b2cec step 5): the docs say the store's commit as its writer makes it.

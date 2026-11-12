@@ -1,0 +1,30 @@
+
+running 4 tests
+test harness::told::tests::a_parent_in_a_long_turn_has_one_message_of_news_waiting_each_child_s_latest_line_once ... FAILED
+test harness::told::tests::news_taken_then_a_child_read_before_the_next_look_is_told_once ... FAILED
+test harness::told::tests::news_taken_then_a_child_read_while_its_handing_is_awaited_is_told_once ... FAILED
+test harness::told::tests::what_an_edit_too_late_said_goes_again_in_the_next_message ... FAILED
+
+failures:
+
+---- harness::told::tests::a_parent_in_a_long_turn_has_one_message_of_news_waiting_each_child_s_latest_line_once stdout ----
+Error: the waiting one edited, nothing more queued: []
+
+---- harness::told::tests::news_taken_then_a_child_read_before_the_next_look_is_told_once stdout ----
+Error: []
+
+---- harness::told::tests::news_taken_then_a_child_read_while_its_handing_is_awaited_is_told_once stdout ----
+Error: []
+
+---- harness::told::tests::what_an_edit_too_late_said_goes_again_in_the_next_message stdout ----
+Error: []
+
+
+failures:
+    harness::told::tests::a_parent_in_a_long_turn_has_one_message_of_news_waiting_each_child_s_latest_line_once
+    harness::told::tests::news_taken_then_a_child_read_before_the_next_look_is_told_once
+    harness::told::tests::news_taken_then_a_child_read_while_its_handing_is_awaited_is_told_once
+    harness::told::tests::what_an_edit_too_late_said_goes_again_in_the_next_message
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 4182 filtered out; finished in 0.07s
+

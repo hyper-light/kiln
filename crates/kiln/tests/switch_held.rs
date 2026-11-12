@@ -1,5 +1,5 @@
 //! CP-T3.2, as the "Tabs UI" agent met it (2026-10-31): a message sent to a Codex agent as Codex
-//! started waits in its adapter for the thread, shown queued by the agent, and a switch to Claude
+//! started waits for the thread, and a switch to Claude
 //! Code (at once: nothing is under way) ended Codex's process with that message still in it: never
 //! sent, it said queued for good, and Claude Code never heard it. Through a server and a runner,
 //! with a Codex that never opens a thread and Claude Code's stand-in (`tests/fixtures/fake-claude`):
@@ -33,21 +33,34 @@ fn heard(file: &Path) -> Vec<String> {
 
 #[test]
 fn a_message_held_for_codex_goes_to_claude_code_when_the_agent_switches() -> anyhow::Result<()> {
+    switch_held("codex", "codex")
+}
+
+/// CP-T3.2: every ACP harness and Antigravity keeps accepted startup input through a switch.
+#[test]
+fn cp_t3_2_startup_messages_follow_every_other_supported_harness_switch() -> anyhow::Result<()> {
+    for kind in kiln::harness::kinds::Kind::all().iter().filter(|k| k.structured() && !matches!(k.id, "codex" | "claude")) {
+        switch_held(kind.id, kind.program).map_err(|error| anyhow::anyhow!("{}: {error:#}", kind.id))?;
+    }
+    Ok(())
+}
+
+fn switch_held(kind: &str, program: &str) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let s = start(dir.path(), &Options::default())?;
-    // A Codex that never opens a thread (it never answers), found first on the runner's PATH, as
-    // Claude Code's stand-in is.
+    // A harness that never opens its thread/session (it never answers), found first on the
+    // runner's PATH, as Claude Code's stand-in is.
     let bin = dir.path().join("bin");
     std::fs::create_dir_all(&bin)?;
-    std::fs::write(bin.join("codex"), "#!/bin/sh\nexec cat >/dev/null\n")?;
-    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o755))?;
+    std::fs::write(bin.join(program), "#!/bin/sh\nexec cat >/dev/null\n")?;
+    std::fs::set_permissions(bin.join(program), std::fs::Permissions::from_mode(0o755))?;
     let (_runner, log) = agents::runner(dir.path(), s.port, "box", None, Talk { lines: 3, every_ms: 20 })?;
     agents::connected(s.port, &s.admin, "box", &log, Duration::from_secs(120))?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
     let said = work.join(".fake-claude-messages");
     std::fs::write(&said, "")?;
-    let open = json!({"target": format!("agent:{}", common::machine("box")), "spec": {"kind": "codex", "cwd": work.display().to_string()}});
+    let open = json!({"target": format!("agent:{}", common::machine("box")), "spec": {"kind": kind, "cwd": work.display().to_string()}});
     let (code, body) = http(s.port, "POST", "/api/harness/sessions", &s.admin, Some(&open))?;
     anyhow::ensure!(code == 200, "couldn't open it: {code} {body}");
     let id = serde_json::from_str::<Value>(&body)?.pointer("/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -73,10 +86,8 @@ fn a_message_held_for_codex_goes_to_claude_code_when_the_agent_switches() -> any
     let first = "01a19347-2437-7490-b35b-000000000001";
     let words = "Plans and Research, one tab each";
     send(first, words)?;
-    // Held for Codex's thread, which never opens: whole, in the session's queue. Codex's adapter
-    // no longer holds it, shown queued by the agent: since 893c9a6a05 what's sent before its thread
-    // is ready waits in kiln's queue.
-    until("the message held for Codex's thread", Duration::from_secs(60), &|st| {
+    // CP-T3.2: startup input stays whole in the durable queue until its harness can take it.
+    until("the message held in the durable queue", Duration::from_secs(60), &|st| {
         st.get("queue").and_then(Value::as_array).is_some_and(|q| q.iter().any(|m| m.get("id").and_then(Value::as_str) == Some(first) && m.get("text").and_then(Value::as_str) == Some(words)))
     })?;
     let (code, body) = http(s.port, "POST", &command, &s.admin, Some(&json!({"type": "set_model", "model": "", "kind": "claude"})))?;

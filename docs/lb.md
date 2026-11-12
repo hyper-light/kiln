@@ -1,6 +1,6 @@
 # The placement kernel
 
-`kiln_ci::lb` decides where a run goes: in O(1), at the node that asks for it (its owner), and
+`kiln_ci::lb` decides where a run goes: in O(1) for plain CPU asks, at the node that asks for it (its owner), and
 admitted by the runner whose room it takes, never past that runner's budget. The place core's
 owner picks through it and its runner keeps its ledger in it; the shell (`crates/kiln`,
 `reach/place.rs` on lb/wire) carries the messages. It serves docs/ci.md W05-R03 (capacity, never
@@ -11,7 +11,7 @@ then most free; a run's expected finish), W05-R26 (speed) and W24-R18 (warm stat
 move, in the expected finish).
 
 Like the rest of kiln-ci it is pure: no clock, disk, network or randomness; integer amounts;
-nothing hashed, and nothing allocated on a decision once its tables have grown to the fleet.
+nothing hashed on a plain CPU decision, and no allocation there once its tables have grown to the fleet. GPU requests use the bounded device-aware walk described below.
 
 ## What it decides
 
@@ -49,6 +49,18 @@ owner is told it).
   every other dimension exactly; when that member is short of what's asked, a walk member by
   member down to the bucket whose range holds the need, so an exact fit there is found (counted:
   `Counts::walked`).
+- **A run that ends, and the pick after it.** The rise of the runner a run just ended on is put
+  off until something reads the buckets. When it is then alone as the most free, the pick goes
+  back to it and neither move is made. When it only ties the most free (the top bucket holds
+  others: the usual pick on a fleet with room to spare), the pick is what the top bucket gives
+  with it counted in: the good place of the kind asked when that is there ("Good places",
+  below), else the bucket's next in turn. That is the runner itself, and again nothing moves
+  (when it is its kind's good place, with nothing looked up either: the move put off carries
+  the kind); or another, which the run leaves where the first was, and the two change places in
+  one write (`Index::swap`), each bucket's count and the bitmap of non-empty buckets untouched.
+  Anything else (a run of another size, a runner in several indexes, orders kept) makes the two
+  moves one after the other. A twin test holds the put-off form to every move made as it comes,
+  pick by pick (W05-R04, W05-R26).
 - **The rank key** is `(view * scale) >> 40`. At the reference speed `scale` is ceil(2^40 / 1000),
   and the key is whole free CPUs, exactly, for every view below 2^32: a multiply and a shift, no
   divide. A runner's measured speed and slowness are folded into its `scale` when its word says
@@ -61,8 +73,12 @@ owner is told it).
   without run times). Every word it sends carries its room and its epoch.
 - **Records:** the owner's record of a runner is 32 bytes, aligned (view, in flight, epoch, ends
   heard, key multiplier, first index, flags, measure count): four to a 128-byte line, none straddling
-  two. A runner's hot fields are its first 128 bytes. An admitted run is 24 bytes (its memory,
-  disk and GPU needs in a side slab when it has any). A run at the owner is 32 bytes.
+  two. A runner's fast fields and eight inline 16-byte admitted records occupy its first 160
+  bytes; overflow records are 24 bytes. Memory, disk and GPU needs use a side slab when needed.
+  An owner's whole run slot is 24 bytes, including its full generation. CPU and signature share
+  one word with the runner handle: CPU/signature remain live through waiting and Go refusal;
+  only Started replaces them with the admitted handle. Wider CPU demand stays exact in Slow
+  until admission. A freed slot reuses its runner field for the free-list link (W05-R23).
 - **Messages** are `Copy` values. A start or an end of CPU alone, for a runner's one owner, takes
   a short path on each side; anything else (memory, disk or GPUs asked, several owners, a line,
   another epoch) takes the general one.
@@ -103,10 +119,12 @@ owner is told it).
   held only when what's left covers it. `Runner::set_budget` and `Owner::set_budget` follow a budget
   that changes: what's free is worked out again from what's held, and runs past a smaller budget run
   on, nothing new admitted until they fit.
-- **Batches.** `ask_many` decides `n` runs of one need in the order one at a time would. For whole
-  CPUs alone on runners whose keys are whole free CPUs, a member of bucket b goes to b - c, so the
-  index alone decides the batch and the members' records are then updated in a pass of
-  independent steps.
+- **Batches.** `ask_many` decides `n` runs of one need and one kind in the order one at a time
+  would. For whole CPUs alone on runners whose keys are whole free CPUs, a member of bucket b
+  goes to b - c, so the index alone decides the batch and the members' records are then updated
+  in a pass of independent steps. After a batch of ends (`ended_batch`), its runs go first, among
+  equals, to the runners that kind's work just went well on, in the order their ends came; every
+  other rise is made first and takes its turn.
 
 ## Rank: expected finish
 
@@ -149,9 +167,15 @@ decides as before. The buckets cover the most core-equivalents any runner's whol
 
 ## Orders
 
-Beside its index each signature keeps, once something is measured, an order by each rate a run's
-finish divides by: the key multiplier, per-core speed over slowness (narrow asks), disk, this
-owner's link, the runner's network (`lb::Order`). A member's class is its rate's place on a log scale: the octave (its top bit) and
+Beside its index each signature can keep an order by each rate a run's finish divides by: the key
+multiplier, per-core speed over slowness (narrow asks), disk, this owner's link, the runner's
+network (`lb::Order`). The first non-reference CPU measurement activates the CPU order once.
+Each byte-rate order is populated from current membership and facts when an ask first needs it;
+that first ask pays its construction cost. Subsequent facts, joins, departures and room changes
+maintain active orders. An unused order has no heap storage, and CPU-only updates do not load the
+separate byte-rate facts. No TTL, eviction threshold or guessed capacity controls these indexes
+(W05-R26). Cold construction and first-use timings are reported separately from warmed throughput
+by the benchmark's `--cold` mode. A member's class is its rate's place on a log scale: the octave (its top bit) and
 the six bits below it, 64 classes an octave, rates in one class within 1/64 of each other; 64
 octaves of a u64 times 64 is BUCKETS, so the highest class is two leading-zeros counts away, as
 the index's top bucket is. Members of a class take turns in a ring through their neighbours:
@@ -245,7 +269,82 @@ A machine that throttles (heat, a battery's power limit) measures a lower speed,
 hear it through `Runner::measure`: no rule of its own. On battery the shell may lower the runner's
 budget (`Runner::set_budget`) or cordon it (`Runner::cordon`): it takes no new run, its words say
 no room so owners pick elsewhere, its runs run on, runs waiting in its line stay (each waits at
-another runner too) and are held when it opens again.
+another runner too) and are held when it opens again. The place core cordons its kernel while its
+runner takes no work: draining (an upgrade pending, or `[runner] on_battery`) or under strain.
+Under room tokens a cordon leaves no room to hold, so every token is cut to none and each owner
+that held some is told; the room that comes back is no owner's run's, so the first watcher's.
+
+## Good places
+
+An assignment succeeds when the work lands on the node that lets it complete as quickly, as
+efficiently, as completely and as correctly as it can. What the kernel holds down is the time
+and work of deciding. One rule serves both: **work goes back to where its kind last went well,
+when the rank can't tell that node from the best.** What that kind left there is warm and the
+node has shown it can do the work; and when it is the runner a run just ended on, going back is
+also the decision that takes least: nothing looked up, nothing moved. It is on by default, the
+user's exception to opt-in automation (2026-11-11, docs/ci.md §0.3): `[reach] good_places =
+false` turns it off, and a run it sends back says so.
+
+- **Kinds.** The shell numbers kinds of work (`KindId`: work whose runs leave a node equipped
+  for the next of them: the same job, the same tree), as it numbers signatures. `Owner::ask_kind`
+  names one. `Owner::ask` names none and is decided as before, through entries compiled apart
+  that carry none of a kind's checks: it takes what it took before there were kinds.
+- **The shell judges, as a run ends and never while deciding.** It has what the four tests
+  need (how long the run took against its history, what it used, whether it ran to its end, a
+  cause it knows when it didn't); the kernel knows nothing of how runs end. Of an end it says one
+  of three things, or nothing:
+  - `Owner::won`: a successful assignment (`Owner::ended_won` hears the end and says it in one).
+    A run that failed for its own sake, a test that fails anywhere, was assigned well.
+  - `Owner::failed`: the node let the work down, by a cause the shell knows (lost, killed for
+    memory, out of room, a tool missing).
+  - `Owner::unsure`: it failed and no cause is known.
+- **What the owner keeps** of a kind is twelve bytes: the runner its work last went well on (its
+  good place), the runner that last let it down, and whether a doubt is open.
+- **The pick** of a kind's run: its good place, when that runner is among the best by rank (in
+  the top bucket, with the room; on measured runners, in the narrow order's highest class with a
+  core free), and no turn moves for it; else the next in turn, passing over the runner that let
+  it down when another is as free. The rank decides first. A good place that is less free isn't
+  gone back to, nor one whose cores have measured slower since (heat, a power limit: its word
+  says a lower speed, above), though its last run went well.
+- **A failure no one can explain is settled by comparison,** with no rate, count or timer. The
+  kind's next run goes elsewhere once. If it goes well there, the first runner was at fault and
+  stays passed over. If it fails there too, the work was: nothing is held against either runner,
+  the kind stays where it now is, and its further failures are its own until a run of it goes
+  well. So work that fails for its own sake moves once and then keeps its place (and its warm
+  state), and a node that fails work that passes elsewhere loses it at its first failure.
+- **It moves no load.** The pick goes to one of the most free either way; only which of equals
+  differs. With every run said to have gone well and with nothing said, a fleet is as full step
+  by step (as many runners hold each number of runs). What differs is where: 64 runners of eight
+  cores, one kind, a run ending and another asked at each step (`cargo test -p kiln-ci
+  lb::tests::w05_r04_a_good_place_moves_no_load -- --nocapture`):
+
+  | Runs in flight | Runners given runs, taking turns | Going back to where it went well |
+  |---|---|---|
+  | 1 | 64 | 1 |
+  | 4 | 64 | 4 |
+  | 16 | 64 | 16 |
+  | 32 | 64 | 32 |
+  | 64 and more | 64 | 64 |
+
+  A kind's work stays on as many runners as it has runs in flight; taking turns takes it round
+  every runner, each cold for it.
+- **A runner that lets a kind down doesn't keep it.** One that went well and then goes bad
+  loses the kind at its first let-down and isn't given it again while another is as free. One
+  that never went well gets the kind's work only while the kind is looking for a place: once,
+  when the shell can tell a node's fault from the work's own. When it can't, and says of a share
+  q of the other runners' runs that they were let down, the kind stays 1 / q runs on each of them
+  (the mean of a geometric count) and the failing runner gets one run a round: q / (q + n - 1) of
+  the runs on n runners, against 1 / n taking turns. That is staying on a winner (Robbins, "Some
+  aspects of the sequential design of experiments", Bull. AMS 58(5), 1952) as Zelen's play the
+  winner rule counts it ("Play the winner rule and the controlled clinical trial", JASA 64(325),
+  1969: for two, q_B / (q_A + q_B)); a test holds the share to it within 5% over 200,000 runs,
+  for 2, 3, 10 and 64 runners. The comparison above is why the shell seldom has to say it of a
+  healthy runner.
+
+What the rule doesn't reach: an ask with terms (`ask_with`) ranks by its own finish, where the
+shell's warm list already says what a runner saves; a shared owner's draw (`set_spread`) spreads
+first; and a node that is the best by rank and fails every run is still picked when no other is
+as free or as fast, since the rank knows speed and room, not failure.
 
 ## Several owners
 
@@ -320,20 +419,36 @@ the fleet (64).
   in the admission from its start: its room, its tenant's charge, its predicted and hard ends (kept
   room and expected starts count it), its record. The kernel's ledger is the admission's index:
   its budget the admission's cap, its room for a new run what's free for an ordinary run while
-  nothing waits in the line, the runner takes work and no run holds it whole, else none
-  (`sync_fast`, at the close of every input; everything else is its `outside`). So a run takes
-  its room once in each whichever path admitted it, and nothing passes a line: while runs wait,
-  owners' kernels see no room there and probe. Runs probing admits don't enter the kernel's
+  nothing waits in the line and no run holds it whole, else none (`sync_fast`, at the close of
+  every input; everything else is its `outside`), and it's cordoned while the runner takes no
+  work (draining, on battery, under strain). So a run takes its room once in each whichever path
+  admitted it, and nothing passes a line: while runs wait, owners' kernels see no room there and
+  probe. Runs probing admits don't enter the kernel's
   ledger (they are `outside`), so its end counts are the kernel's runs' alone.
 - **Words**: `FastStarted` once the process has started (the asker hears it started then),
   `FastDeclined` with the room there (a decline not about room says none, so it isn't picked
   again before the runner's next word), `FastEnded`, then the owner's `Ack` drops the record. Each
   carries the kernel's word as the input left it (`FastWord`: epoch, room, budget, speed,
-  slowness); hints carry it too (`offers`' `fast`), and the server passes them on.
+  slowness); hints carry it too (`offers`' `fast`), and the server passes them on. The speed and
+  slowness are the runner's pace as the shell's sense measured it (`Admission::paced`, and a
+  sample's pace), said through its kernel's `Runner::measure`: owners' kernels fold them into its
+  key multiplier (W05-R26).
+- **Learned weights** (`[reach] learned_weights`, "Learned wait weights" above): a ticket probed
+  afresh (`probe_new`) has its two runners drawn in proportion to the weights of the runners its
+  kind of ask suits, and its run, when history knows its time, is Algorithm 1's job over them.
+- **The auction** (`[reach] auction`, "The auction" above): `Owner::ask_many` takes asks that
+  arrive in one step; `Owner::configure` reads both settings, and the reach `Placer` calls it as
+  it's made.
 - **The server** owns CI legs (`crates/kiln/src/hub/legs.rs`): an ordinary leg's runner is the
   kernel's pick among the runners that named `place.fast` and hint their words, by the same rules
   the engine's pick filters by; the leg's room is taken from the view until its runner is heard
-  of (started, refused, released). What the kernel can't place, the engine's own pick does.
+  of (started, refused, released). What the kernel can't place, the engine's own pick does. A
+  run's ordinary legs waiting together in one look at the queue go to `Legs::pick_batch` first.
+- **Room tokens** (`[reach] tokens`, off until declared; below): a runner that declares them tells
+  each owner whose link named `place.tokens` what it holds there, its own word (`tokens` in its
+  answers' words, and `FastHint` for what's owed besides), and that owner takes no hint of the
+  runner's kernel epoch while it does. The server, the runner's own node and owners that didn't
+  name it hear its hints, as before.
 
 Measured (`cargo bench -p kiln-ci --bench place_fast`): see below.
 ## Room tokens
@@ -373,44 +488,125 @@ room:
 - **Waits are drawn.** A view under tokens is what an owner holds, not what a runner has, so a run
   no token fits waits at the members whose view covers part of it, then at members drawn uniformly
   from its signature (PULL's random server; two of them, late-bound, as before).
+- **A cordon holds nothing** (`Runner::cordon`): it leaves no room, so every token is cut to none
+  and each owner that held some is owed its word; the room that comes back is no owner's run's, so
+  the first watcher's.
+- **A mixed fleet keeps hints with the owners that hear them** (`Runner::hints_for`): an owner whose
+  link can't carry words of its own is told the whole room, as under hints, holds no token, never
+  hears that another wants, and the room its runs free is no one's. The first watcher is the first
+  owner the runner talks to that hears tokens, so that room reaches them; were it the hints owner's
+  token, no owner would ever see it (it sees all the room anyway).
 
-The model checks every property with tokens on everywhere, and adds two: each owner's view of a
-runner is what that runner says it holds there, at quiescence; what the owners hold is at most the
-room, at every step. Which design kiln uses where, hints or tokens, is for comparisons at scale
-that aren't in this kernel's tests.
+The model checks every property with tokens on everywhere (and again with one owner of three
+hearing hints at every runner, a mixed fleet), runners cordoned and opened among its events, and
+adds two: each owner's view of a runner is what that runner says it holds there, at quiescence;
+what the owners hold is at most the room, at every step. Which design kiln uses where, hints or
+tokens, is for comparisons at scale that aren't in this kernel's tests.
+
+**Through the place core** (docs/reach.md §2.3; `place::runner::Settings::tokens`, `[reach] tokens`
+of the runner's own config, off until declared). The runner's admission keeps them in its kernel
+ledger:
+
+- **Who hears tokens:** an owner whose link named `place.tokens` (the shell reads it off the link
+  each of the owner's words comes on, `Admission::tokens_with`), its name's current process, its
+  link up and it in the directory. Any other hears hints and holds nothing: an owner from before,
+  the server's CI engine, the runner's own node (in its process, every word is free), an owner away,
+  one that gave way to a new process, one gone from the directory. What one of those held is no
+  one's, so the first watcher's.
+- **What it hears:** its answers (`FastStarted`, `FastDeclined`, `FastEnded`) carry its own word,
+  saying `tokens`; what it's owed besides (another took room under its token, a token forwarded to
+  it, room come back to the first watcher, another's run waiting) goes at the close of each input
+  as `FastHint`, one however many changes the input made, on placement's channel. Its owner hears
+  that as it hears a hint, and takes no hint of that runner's kernel epoch from then (one of a
+  newer epoch, the runner started again, it takes until the new process says it its own; with its
+  link down it takes them again).
+- **Wanting:** a run that waits in the runner's line for room (probing's: the kernel's runs never
+  wait here) makes its owner the one that wants there. An owner whose word says another wants,
+  with none of its own waiting in its kernel, gives back what it holds there (`FastRelease`), and
+  the runner forwards it to that owner, once.
+- **The kernel's room is the line's:** none while runs wait in the runner's line (they're probing's,
+  its line's order, fair share and kept room deciding), so tokens carry the uncontended path, where
+  the kernel decides, and the line keeps the contended one, as under hints.
+
+A token owner hears, besides the answers about its own runs it hears anyway, a word only when what
+it holds there changed without its asking; under hints every owner watching a runner hears each
+change of its room, through the server. `place::tokens_tests` pins each rule through the place
+core, each with its mistake caught: what an owner hears (OneWord, TakesHints), who hears tokens
+(TokensToAll, AwayHolds, RetiredHolds, TokensUndeclared), wanting and forwarding (NoWaited,
+KeepsTokens, and the kernel's NeverWants and ForwardAgain), a mixed fleet (the kernel's HintsHold
+and FirstHearsHints) and a runner that takes no work (CordonQuiet).
 
 ## Learned wait weights
 
 Lattanzi, Lavastida, Moseley and Vassilvitskii, "Online Scheduling via Learned Weights", SODA 2020:
-restricted assignment (a run may go only to its signature's members), one weight per machine,
-each job split over its eligible machines in proportion to their weights. Predicted weights within
-a factor η of good ones give an O(min{log η, log m})-competitive fractional makespan with their
-Algorithm 1. `Owner::set_weights` turns them on (off until set; `src/lb/weights.rs`):
+restricted assignment (a run may go only to its kind's members: a signature's, a suit's live
+runners), one weight per machine, each job split over its eligible machines in proportion to their
+weights (their (3.1)). Predicted weights within a factor η of good ones give an O(min{log η, log
+m})-competitive fractional makespan with their Algorithm 1 (Theorem 3.1). `src/lb/weights.rs`
+follows it step for step. The kernel turns it on with `Owner::set_weights`, the place core with
+`[reach] learned_weights` (docs/needs.md §21): off until declared, as before them otherwise.
 
-- A runner's weight starts at its CPU budget (in proportion to capacity: what predicts with no
-  history) or at what the shell predicts (`Owner::set_weight`).
-- A run that finds no room waits at members drawn in proportion to their weights: the fractional
-  assignment rounded by sampling, by rejection against the signature's largest weight.
-- The fractional loads are kept lazily: a signature's waits add need / Σ weights to its
-  accumulator; a runner's phase load is its weight times what its signatures' accumulators gained,
-  over its CPU. T is the balanced load, each wait's need over the owner's whole CPU.
-- A drawn runner whose phase load passed 2T has its weight halved and starts a phase (Algorithm 1;
-  each halving closes a factor two of the error). One whose load since the weights were set passed
-  2⌈log2 m⌉T means the predictions aren't helping: the owner draws uniformly again and says which
-  runner and loads (`Owner::fell_back`), the switch of their Theorem 3.1.
+- **Weights.** A runner's weight starts at its CPU budget (in proportion to capacity: what
+  predicts with no history) or at what the shell predicts (`Owner::set_weight`). A runner of C
+  CPUs is C unit machines weighted alike, Algorithm 1's identical machines: its load counts per
+  CPU, its units pass a threshold together, and halving the runner's weight halves theirs.
+- **The draw.** A run that finds no room waits (the kernel) or is probed (the place core,
+  `probe_new`) at places drawn in proportion to the weights of its kind's members, two without
+  replacement: the fractional assignment rounded by sampling, late-bound as before (the first
+  place with room starts it), as Algorithm 1's weights bias where runs wait.
+- **Algorithm 1's step.** A run's first wait (the kernel) or first probes (the place core) is a
+  job. Its size p_j (the kernel's: its CPU need; the place core's: its CPUs times its median from
+  history, no job when history knows no time) adds p_j x_ij(ŵ) to the phase load of every member
+  i, and each member whose phase load passed 2T has its weight halved and starts a new phase: if
+  1/2 ≤ ŵ_i/w_i ≤ 1 for every i then x_ij(ŵ) ≤ 2 x_ij(w), so each halving closes a factor two of
+  the error. Every member, as the algorithm's loop does: O(members) a job.
+- **T.** Algorithm 1 is given the optimal fractional makespan. Their §2 and Lemma D.1 remove that
+  by a standard online doubling argument, the one of Aspnes, Azar, Fiat, Plotkin and Waarts
+  ("On-line routing of virtual circuits with applications to load balancing and machine
+  scheduling", J. ACM 44(3), 1997, §2.1 and §3.2): T starts at what the first job shows of the
+  optimum; an epoch (their phase) runs the algorithm on its own jobs, ignoring those before it;
+  once its jobs show the optimum is past T, T doubles and a new epoch begins with the job that
+  showed it, every load at 0, nothing fallen back, the weights as learned (Theorem 3.1 holds for
+  any predictions, η theirs). Each doubling is shown needed, so T stays below twice the optimum,
+  and the epochs together cost at most four times what the algorithm guarantees given the
+  optimum. What jobs show of the optimum: each kind's sizes over its members' CPUs (every job of a
+  kind runs on its members, so one of them carries at least that) and the fleet's over its CPUs.
+- **The switch.** Once a job makes a member's load in the epoch, all its phases, pass 2⌈log2 m⌉T,
+  the predictions aren't helping (their switch to a robust algorithm, after Theorem 3.1): the owner
+  draws as it did before the weights until T next doubles, and says which runner and loads
+  (`fell_back`). The kernel's draw is then the two members nearest to fitting (drawn uniformly
+  under tokens), the place core's two at random, and its answers say "not probed (two drawn at
+  random: the learned weights weren't helping)". m counts runners, the machines the draw chooses
+  among.
 
-Makespan isn't kiln's objective, and learning online with many owners is unproven (the research
-says so); comparing these draws with two choices is the lead's, at scale.
+What it does: a runner's weight halves once its load in its phase passes 2T, and an epoch begins
+every phase afresh. An epoch's work of a kind is at most T times its members' CPUs (more would show
+the optimum past T), so a runner halves when it takes more than twice its share of that capacity,
+and each epoch holds about twice the work of the one before. It bounds the makespan; it doesn't
+balance below that, and it learns from runs' sizes and where they may run, not from how long they
+waited (the paper's model).
 
-## Batches and gangs
+Where kiln departs, each for a reason: the rounding is two places drawn and late-bound, not their
+§5 rounding to one machine a job, since a run here waits at two places and starts at the first
+with room (above); what learns, the fractional algorithm, is theirs exactly. The robust draw is the
+one each core made before the weights, not their [3, 4]'s O(log m)-competitive algorithms; with
+tokens off the kernel's, the members nearest to fitting, is greedy's least-loaded choice (Azar, Naor
+and Rom, J. Algorithms 18(2), 1995, their [4]). What the jobs show is a lower bound on the optimum,
+so an epoch whose T is below the optimum without its jobs showing it can switch early: back to the
+draw before the weights, the safe side.
 
-`Owner::ask_batch` places runs together, each with its own cost at each member (its expected
-finish: `auction::expected_finish_ms`, the run time at the runner's measured speed and its inputs'
-transfer there from the topology's `Link::transfer_us`), over the slots members' views hold now.
-`Owner::set_auction` decides them by an integer auction (off: one at a time, each to its cheapest
-member, the rule it is measured against). Bertsekas, "Auction Algorithms for Network Flow
-Problems: A Tutorial Introduction", Computational Optimization and Applications 1:7-66, 1992
-(`src/lb/auction.rs`):
+The rule before this one held T to the fleet's balanced load and each phase to the T gained in it.
+A runner that alone runs a kind carries that kind's whole work, which no assignment avoids; under
+that T it looked overloaded, its weight collapsed and the owner fell back though nothing did better
+(`KindBlind` plants it, and the test of that case catches it).
+
+## The auction
+
+`Owner::ask_batch` places runs that arrive in one step together, each with its own cost at each
+member (its expected finish) over the slots members' views hold now. `Owner::set_auction` decides
+them by an integer auction (off: one at a time, each to its cheapest member, the rule it is
+measured against). Bertsekas, "Auction Algorithms for Network Flow Problems: A Tutorial
+Introduction", Computational Optimization and Applications 1:7-66, 1992 (`src/lb/auction.rs`):
 
 - The forward auction, prices from zero (§9: more slots than runs).
 - Costs scaled by min(n, m) + 1 and ε = 1, so ε < 1/n (Prop. 1 and 2) and ε < 1/m for m runners
@@ -419,9 +615,41 @@ Problems: A Tutorial Introduction", Computational Optimization and Applications 
   runner, so runs don't bid identical slots up one ε at a time.
 - Feasibility first, by augmenting paths, so the auction ends.
 
-`Owner::place_jointly` is the same decision all or none: a gang's members go where it says or
-nowhere (None when the views can't hold them all). Holding every member's room and starting them
-together is the caller's; the kernel has no gang protocol of its own.
+**Costs.** A run's expected finish at a runner (`auction::finish_at`): its time at the reference
+core over the runner's key multiplier as the kernel keeps it (`Owner::multiplier`: its measured
+per-core speed over its slowness under contention, folded in as its word says them), at the
+kernel's resolution, the least rate of the multiplier's class (rates within 1/64 are one class,
+and the orders don't rank within one), plus its inputs' transfer where it's given. Runners'
+measures reach owners' kernels in their own words: the place core's admission says its pace
+(`Admission::paced`, what the shell's sense measured, W05-R26) in its kernel's word, so on a
+measured fleet the multipliers differ and the auction has something to decide by.
+
+**When it decides.** Where the runs' times and the members' rates (their classes) both differ.
+Otherwise every assignment of them costs the same, and the kernel's own pick, one at a time, is as
+cheap and spreads them by room (W05-R23), where the auction's slots, alike within a runner, would
+stack them on one. What the views don't hold goes one at a time: probed in the place core, the
+engine's pick at the server.
+
+**Where batches arrive.**
+
+- The place core (`place::Owner::ask_many`, `[reach] auction`): the asks a tenant's budget lets
+  through together (the reach `Placer`'s budget releases). The ordinary asks of a kind the kernel
+  starts go together; every other ask goes as one at a time would. A run it placed says so ("the
+  auction put it there with 2 others asked with it, where their expected finishes total least").
+- The server's kernel for CI legs (`hub/legs.rs`, `Legs::pick_batch`, the same setting): a run's
+  ordinary legs of one kind and need that wait in one look at the queue; a pick the job can't take
+  (refused there, no slot by the engine's rule) goes back, and the engine's pick decides. v1 legs
+  carry no time from history (none is kept by job), so their costs can't tell them apart and they
+  are picked one at a time, as before; the auction acts there once a leg's median is passed.
+
+**Batches, not gangs.** A gang (`together:`) starts whole or not at all. The place core has
+answered every gang never since it was built, as reach's directory pick refused one before it
+("commands can't start together yet": commands can't be one of a gang until the engine places
+them, W05-R40, docs/needs.md E4 and E5), and CI's gangs are the engine's, granted whole in one
+input (docs/needs.md E4). So the auction's integration point is the batch: runs that arrive in one
+step, each started on its own. `Owner::place_jointly` decides a gang's places all or none for a
+gang protocol to come; holding every member's room and starting them together is that
+protocol's.
 
 ## Complexity
 
@@ -438,6 +666,8 @@ together is the caller's; the kernel has no gang protocol of its own.
 | A key to or from 0, once something is measured | the narrow order: O(signatures it is in); the others: a flag, applied by the next `ask_with` |
 | A pick by an order | O(members passed), counted |
 | `ask_with` | O(listed + members the threshold reads): O(orders + listed) when one member leads every order it reads; a multiply a term each, one divide for the CPU time |
+| A wait with learned weights on (the kernel's first wait; the place core's first probes) | the draw O(members); Algorithm 1's step O(members), as its loop tests every eligible machine; the fleet's CPUs O(runners) in the kernel; a doubling O(runners) |
+| A batch by the auction (n runs, m members with room) | feasibility O(n × edges) by augmenting paths, then the auction's bids |
 
 ## Where each number comes from
 
@@ -458,8 +688,11 @@ together is the caller's; the kernel has no gang protocol of its own.
 | SPREAD = 2,654,435,769 | floor(2^32 / φ), Knuth §6.4 |
 | Tokens' two places, drawn uniformly | PULL's random server (Stolyar 2015, 2017); two, as PLACES |
 | Weights' 2T and halving | Lattanzi et al. 2020, Algorithm 1 (x(ŵ) ≤ 2x(w) when 1/2 ≤ ŵ/w ≤ 1) |
-| Weights' 2⌈log2 m⌉T | Lattanzi et al. 2020, the switch to a robust algorithm (Theorem 3.1) |
+| Weights' 2⌈log2 m⌉T | Lattanzi et al. 2020, the switch to a robust algorithm (after Theorem 3.1) |
+| T's first value, and doubling it | Aspnes et al. 1997 §2.1 and §3.2, the doubling Lattanzi et al.'s Lemma D.1 takes: the first job's bound on the optimum, doubled when an epoch's jobs show the optimum past it |
+| A weight's start, its CPU budget | allocation in proportion to capacity, what predicts with no history (good weights are scale-invariant: Remark 3.1) |
 | The auction's ε = 1 on costs × (min(n, m) + 1) | Bertsekas 1992, Prop. 1 and 2, §5.1 |
+| The auction's rate, its class's least | the orders' resolution (64 classes an octave): the kernel doesn't rank within a class |
 | Record sizes (32, 24 bytes) | Apple silicon's 128-byte line (`sysctl hw.cachelinesize`) |
 | Views to 4,294,967 thousandths | u32; a bigger runner admits exactly, its owner sees less of it |
 
@@ -483,7 +716,17 @@ DropDeclined, NoFence, NoGeneration, NoHint and Unordered; unit tests catch NoDe
 starts herding), NoKeep (the first in line starves), NoTurn (equals don't take turns) and
 MostLoaded. The model also drives askers giving up and room taken outside the ledger, and in half
 its seeds runners that measure their speed, slowness, disk and network and owners that measure
-their links.
+their links; its asks are of three kinds of work and of none, and of each end an owner hears its
+shell says that it went well, that its runner let it down, that no one can say, or nothing.
+
+Good places (`lb::tests`, each with its planted bug): a kind's work goes back to where it went
+well, another kind's and work of no kind don't take that place (NoStay, NoTurn); a runner that
+lets a kind down doesn't keep it, and a failure no one can explain is settled by comparison
+(StaysOnALoser: what the shell says against a runner is dropped); a good place holds only among
+cores as fast; it moves no load. The twin test runs two owners over twin fleets through the same
+ends, the same words of their shell and the same picks, of three kinds and of none, one putting
+moves off and one making every move as it comes, and holds them to the same pick, the same
+picks to come and the same views at each of 32,000 steps on fleets of 2 to 257 runners.
 
 The plain path on measured runners (`w05_r26_plain_asks_on_measured_runners_take_the_fast_path`):
 4,000 random fleets of 2 to 8 runners, speed and slowness measured, then measured again (every key
@@ -496,11 +739,37 @@ while a member has one free is decided by the fast entry with nothing walked: of
 stale rates (StaleKey), a narrow order that doesn't follow a key to or from 0 (NoGate).
 
 With tokens on (`lb::model`, its tokens run), the model also catches NoHint (a shrunk token not
-told) and TokensOverlap (owners holding more than the room). `lb::scale_tests` pins each rule of
-tokens, weights and the auction on a small case, each with its planted mistake caught:
-FreedToFirst, NeverWants and ForwardAgain, NearestPlaces; NoLearn, Unweighted, NoFallback;
-EpsilonTooLarge (against the optimum found by trying every assignment, 400 cases) and
+told), TokensOverlap (owners holding more than the room) and CordonQuiet (a cordon that cuts no
+token and tells no one). `lb::scale_tests` pins each rule of tokens, the weights' draw and the
+auction on a small case, each with its planted mistake caught: FreedToFirst, NeverWants and
+ForwardAgain, HintsHold and FirstHearsHints (a mixed fleet), CordonQuiet, NearestPlaces; Unweighted
+(places in proportion to the weights); EpsilonTooLarge (against the optimum found by trying every
+assignment, 400 cases) and
 SecondInClass (a price war).
+
+Learned weights (`src/lb/weights_tests.rs`): Algorithm 1 written as the paper states it, with
+Aspnes et al.'s doubling for T and the switch, in floats, beside the kernel's integers on 400
+random instances (two to nine runners of a quarter to 16 CPUs, one to four kinds of random
+members, predictions up to 4,096 times a runner's CPUs, up to 80 jobs of one to 16 CPUs): every
+weight, the switch and T's doublings agree after every job. One instance stopped where a
+comparison came within 10^-5 of its threshold; of the rest, 271 halved a weight, 392 doubled T
+and 85 fell back. Each rule's planted mistake is caught there: NoLearn, NoFallback, DrawnOnly
+(only the places drawn tested), KindBlind (T blind to kinds: the earlier rule), NoDoubling and
+NoRestart (T doubled without beginning an epoch). Cases small enough to follow: a runner that
+alone runs a kind keeps its weight and the predictions (KindBlind); a weight predicted four times
+its CPU halves once and holds (NoLearn); predictions 2^20 off fall back with the first job and
+say why (NoFallback); once fallen back, the places are the nearest to fitting again.
+
+In the place core (`place::weights_tests`, `place::auction_tests`), through its owner and, where
+words matter, its runners' admissions paced as the shell paces them: probes in proportion to the
+weights, a runner of 3 CPUs among three of 2 one of the two 13/21 of the time (UnweightedProbes);
+the runs probed are Algorithm 1's jobs, the owner's weights and T equal to the kernel's learner
+fed the same jobs by hand (NoProbeLearn, SizeByCpu); predictions that don't help fall back to
+random probes and say so (KeepWeights); the auction off until declared; asks in one step where
+it puts them (AuctionOneByOne); its costs read slowness (SpeedAloneCost) and a runner's measured
+pace through its own kernel's word (UnpacedKernel); where costs tie, the kernel's own pick
+(AuctionTies); what it can't start probed (DropUnplaced); gangs answered never; and, with either
+on or off, every run started once.
 Expected finish (`src/lb/finish_tests.rs`): 20,000 random fleets of 2 to 6 runners, each order's
 classes and keys their own, and 20,000 of 2 to 12 whose classes and buckets hold several runners,
 measured or not term by term, one ask each with every term drawn on or off and a list of up to
@@ -616,3 +885,103 @@ without admission oversubscribe (static-rr 372 picks onto full backends in this 
   pass 1/64 of its finish reads on until its ordered terms' bound passes the best (counted).
 - A decided run placed again (declined) is placed by its order alone: the owner doesn't keep an
   ask's terms.
+- Learned weights and the auction are off until declared, and whether either beats what's there
+  (two choices; one at a time) is for comparisons at scale, not these tests. Learning with many
+  owners at once is unproven: each owner learns from its own runs alone.
+- The server's auction has no times to read for v1 legs (no history of v1 jobs is kept by job), so
+  their batches are picked one at a time; a leg's median passed to `Legs::pick_batch` lets it act.
+- What the jobs show of the optimum is each kind's bound and the fleet's, not the optimum: kinds
+  nested in one another (a kind's members inside another's) can leave it below, and an epoch
+  switch early. The optimum itself is a max-flow over kinds and runners.
+- Room tokens through the place core change what owners hear, not yet how many words: the server
+  still passes each runner's word on to every owner (owners that hear hints, and its own kernel,
+  need it), and an owner that hears tokens drops it. Cutting that fan-out needs the server to know
+  which owners hear tokens from which runners.
+
+## GPU fit and load (W05-R03, W05-R22, W05-R23, W13-R01)
+
+GPU asks use Hex's per-device fit and dominant-load rule, ported from the fixed source
+`37021c35e64b2a8bab1d35f20f92a0042d874a44`: `hex-sim/src/model.rs`'s `matches`/`bind`
+and `hex-sim/src/index.rs`'s `gpu_busy`/`gpu_idle`. The kiln adaptation is
+`sched/gpu.rs`, used by CI's scheduler, the place owner's kernel start and offer comparison,
+and the receiving runner's admission, plus directory ranking and the pre-placement fallback. The same facts serve commands, MCP runs and sessions.
+
+For `gpus=2,gpu.model==A100,gpu.memory.free>=16Gi`, two cards must each meet both predicates.
+A model on one card and enough memory on a different card do not suffice. Boolean constraints
+retain their meaning and host facts (OS, labels, GPU count) retain their host scope. `gpu.memory` and `gpu.memory.free` constrain each card's free memory for GPU reservations,
+as Hex does; `gpu.memory.total` constrains its hardware total. Without `gpus=N`, the existing
+`gpu.memory` fact still describes the largest hardware total. GPU model
+names also accept Hex's whitespace-joined spelling, e.g. `NVIDIA-A100`.
+
+Hex's `bind` first chooses compatible cards by utilization, then used memory, then inventory
+position. It then scores those selected cards by the sum of their idle dominant shares: the
+greater of utilization and used-memory share, in millionths (DRF, Ghodsi et al., NSDI 2011).
+Sorting the cards directly by dominant pressure would be a different policy. GPU rank precedes
+CPU headroom; explicit CI preferences still apply first. Counters stay independently optional
+in the facts. Hex's later quality fix (`b5b67b383e3cb2746efa330687fdd911275b5d6c`) is retained:
+a card with a missing memory or compute reading, or an invalid utilization, cannot satisfy a
+fresh GPU reservation and earns no idle credit. Known zero remains idle; unread free memory
+is not fabricated. A later valid observation can make a queued ask fit, and CPU-only work still
+proceeds. Count-only peers without a device inventory retain their declared-count compatibility, but earn
+no measured idle credit and cannot satisfy per-card predicates or supply concrete binding IDs.
+There is no separate kiln GPU prior. All four reservation dimensions
+are still checked and deducted by the existing ledger. Equal GPU ranks first compare measured per-core speed under contention, then retain CPU room
+and the bucket cursor. Only GPU asks pay for the full bounded candidate walk. GPU bids in an
+optional auction take this same individual path.
+
+Reservations remain node-level GPU counts. In a mixed-device node, availability is conservative:
+already-held count is removed from the compatible pool, since no physical assignment is known.
+This may wait despite spare cards. Kiln does not set CUDA visibility, create CDI attachments,
+pass through VFIO devices or recover per-device runtime assignments. Hex's generic live Runtime
+path still refused device-bearing asks at the source pin; its ongoing device recovery/attachment
+work is not imported here.
+
+For a local executor pool, declare its GPU count in the pool's resources. Each warm executor
+reserves that count when it starts, in slot mode as well as resource mode. A GPU leg must fit
+the selected executor's reservation; its original GPU request and per-card predicates are
+retained for that check. The grant credits its own executor's reservation once, leaving the
+other warm executors' GPUs held. Ordinary gang siblings share the remaining host capacity.
+A hosted pool's pod instead needs its own runner to report enough GPU capacity before a grant.
+These admission checks do not establish physical attachment or device isolation.
+
+`crates/kiln-gpu` is Hex's retained provider, updated at fixed source
+`c2da38cc363e7d53f6df8fb82ab7bbda5e2f1efe`; `ORIGIN.md` and `HEX-SOURCE.json` retain provenance.
+It opens NVIDIA NVML, Linux AMD amdgpu counters and Windows AMD ADL once, then samples through
+retained handles, file descriptors and contexts. Apple Silicon uses native Metal identity and
+working-set budgets, exact-entry IOKit mapped allocations and IOReport GPU residency. The full
+Metal registry ID survives in the optional facts ID; it is scoped to the host boot. Apple's memory
+budget is not dedicated VRAM or host RAM, and observed allocations may exceed it. Missing or
+ambiguous counters remain unknown. Sampling starts no subprocess or periodic worker. Linux/Windows
+samples retain their allocation-free contract; Apple's native snapshots may allocate.
+No installed driver is redistributed or replaced.
+
+The same vendored libraries and recorded changes are built from kiln's tree:
+
+- NVIDIA `cuda-rust` `a0a4dc78a20e06ec90827f597e950bdc49f723e2`: adapted runtime loader.
+- `all-smi` `fe479ae675e39475a2eab1cfbb3f5432f705e12b`: adapted amdgpu counter reader and AMD ADL types/sensors.
+
+Their licenses, `UPSTREAM.md` files and patches travel with them. `scripts/vendor.py check
+cuda-rust all-smi` verifies both. Native FFI remains in the retained NVML/ADL `sys.rs` modules and the ported
+Apple `sys.rs`; scheduling contains none. Hex's original rationale and primary sources are retained in
+[gpu-telemetry-origin.md](gpu-telemetry-origin.md).
+
+One retained facts value and one coalescing publisher handle full inventory probes and GPU-only
+refreshes. GPU hosts refresh on workload start/end through the existing recorder, without a
+periodic timer. Local placement receives facts directly; remote owners receive the existing
+optional JSON facts fields through the directory. Host CPU/memory samples do not erase GPU
+inventory. A full probe requested during GPU I/O is retained for the same publisher's next read.
+On known GPU hosts, external load changes are observed at the next facts/workload event; a newly installed GPU or driver is discovered by the next full inventory probe.
+
+Two other Hex fixes are ported: interleaved bucket offsets and the cursor's rounded fleet width
+use widened arithmetic; reservation-size parsing uses checked integer bytes, refusing overflow
+and fractional bytes instead of rounding through `f64`. Sources are Hex's `lb/index.rs` and
+`needs.rs` at the pin above. Packing and box-runtime recovery changes are specific to Hex's
+long-lived boxes; kiln retains its expected-finish placement and existing session recovery.
+
+The follow-up is explicitly gated on Hex's completed **durable GPU bindings, actual runtime
+attachment and validation of that combined path** (Ada, 2026-11-10). Bring over the accepted
+pinned changes and their recovery/attachment evidence together, including the load-swap/reboot
+case, exact selected-identity persistence before launch, lost/duplicate attachment controls and
+native platform validation. The current port carries neither an independent attachment design
+nor a claim that this unfinished path is proven. Hex has been asked to provide the ready SHA and
+combined validation; until then the existing count ledger remains authoritative and conservative.

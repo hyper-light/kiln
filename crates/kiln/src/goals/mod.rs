@@ -10,9 +10,9 @@
 //! grows while the reminders bring no real work. A goal set in the agent directly (`/goal` in its
 //! composer) joins its stack, so it's kept the same way. The server keeps the stacks and drives
 //! them (`run`), so they go on with no console open and across restarts. What a stack says to an
-//! agent behind a turn under way (a goal, the goal again, a clear) waits in its queue one message
-//! at a time ([`say`]): the next edits the one waiting, so a long turn doesn't end with goals and
-//! clears stacked up behind it.
+//! agent behind a turn under way (a goal, the goal again, a clear) is explicit replaceable
+//! status ([`say`]). The durable sender coalesces only undispatched successors and preserves
+//! every original; an admitted publication remains immutable behind the bounded source credit.
 //!
 //! An agent works its stack itself too: it says a goal is met ([`done`], with what shows it), changes
 //! one goal ([`update`]: other words, moved, taken out), splits one into parts pursued first
@@ -540,17 +540,88 @@ struct Word {
     item: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct WaitingWord {
+    id: String,
+    same: bool,
+    presence: Now,
+}
+
+#[cfg(test)]
+struct StatusSpy {
+    inner: kiln_seams::harness::SimHarness<Info, Command>,
+    status: parking_lot::Mutex<Vec<(String, String)>>,
+}
+
+#[cfg(test)]
+impl StatusSpy {
+    fn new(clock: Arc<dyn kiln_seams::clock::Clock>) -> Self { Self { inner: kiln_seams::harness::SimHarness::new(clock), status: Default::default() } }
+    fn assert_status_key(&self) { let status = self.status.lock(); assert!(!status.is_empty() && status.iter().all(|(_, key)| key == "internal-goal-stack")); }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for StatusSpy {
+    type Target = kiln_seams::harness::SimHarness<Info, Command>;
+    fn deref(&self) -> &Self::Target { &self.inner }
+}
+
+#[cfg(test)]
+impl HarnessPort for StatusSpy {
+    type Agent = Info;
+    type Command = Command;
+    fn agents(&self) -> Vec<Info> { self.inner.agents() }
+    fn agent(&self, id: &str) -> Option<Info> { self.inner.agent(id) }
+    fn catalog(&self, id: &str) -> Option<Value> { self.inner.catalog(id) }
+    fn send<'a>(&'a self, id: &'a str, command: Command) -> futures::future::BoxFuture<'a, Sent> { self.inner.send(id, command) }
+    fn send_status<'a>(&'a self, id: &'a str, command: Command, key: &'a str) -> futures::future::BoxFuture<'a, Sent> {
+        if let Command::Send { id, .. } = &command { self.status.lock().push((id.clone(), key.to_owned())); }
+        self.inner.send(id, command)
+    }
+}
+
+#[cfg(all(test, unix))]
+async fn native_goal_program(hub: &Arc<Hub>, folder: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let owner = Arc::clone(hub);
+    crate::rt::spawn(async move { let _ = crate::harness::mail_delivery::run(owner).await; });
+    let (program, _) = crate::harness::ops::end_to_end::recording_program(folder, true)?;
+    Ok(program)
+}
+
+#[cfg(all(test, unix))]
+async fn settled_native(hub: &Hub, id: &str) -> anyhow::Result<Vec<String>> {
+    crate::harness::ops::end_to_end::source_ready(hub, id).await?;
+    crate::harness::ops::end_to_end::source_until(hub, id, "goal native consumption", || {
+        let recipient = id.to_owned();
+        async move {
+            let (total, pending) = hub.store.read(move |connection| Ok(connection.query_row("SELECT COUNT(*),COALESCE(SUM(disposition IN ('waiting','dispatched','admitted')),0) FROM agent_mail WHERE recipient=?1", [recipient], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?)).await?;
+            if pending != 0 { return Ok(false); }
+            let Some(session) = hub.harness.local.get(id) else { return Ok(false) };
+            let state = { let core = session.core.lock(); (core.state.status, core.state.last_turn.clone(), core.state.turn_started) };
+            // Empty custody does not mean native initialization completed. A pushed goal
+            // is intentionally held while Starting, and these fixtures run no goal driver.
+            Ok(state.0 == Status::Idle && (total == 0 || state.1.is_some())
+                && hub.harness.info(id).is_some_and(|info| info.status == state.0 && info.last_turn == state.1 && info.turn_started == state.2))
+        }
+    }).await?;
+    let inbox = hub.harness.local.inbox().ok_or_else(|| anyhow::anyhow!("no source inbox"))?;
+    let taken = inbox.taken(id, 100).await?;
+    let session = hub.harness.local.get(id).ok_or_else(|| anyhow::anyhow!("no source"))?;
+    let program = session.spec.lock().program.clone().ok_or_else(|| anyhow::anyhow!("no protocol fixture"))?;
+    let heard = std::path::Path::new(&program).parent().ok_or_else(|| anyhow::anyhow!("no fixture directory"))?.join("heard.jsonl");
+    let native: Vec<String> = crate::harness::ops::end_to_end::prompts(&heard).into_iter().filter(|message| taken.contains(message)).collect();
+    anyhow::ensure!(native == taken, "native/Inbox order or multiplicity differs: {native:?} / {taken:?}");
+    Ok(taken)
+}
+
 /// Each agent's word from its stack, by agent.
 static SAID: LazyLock<parking_lot::Mutex<HashMap<String, Word>>> = LazyLock::new(Default::default);
 /// The most agents' words kept: past it, the oldest goes (an agent gone without being closed keeps
 /// its word otherwise).
 const SAID_MAX: usize = 4096;
 
-/// Says `c` to `agent` for goal `item` (none: a clear), at `now`, one word at a time: a message,
-/// while the stack's last one still waits in the agent's queue (behind a turn under way), goes as
-/// an edit of that one, or not at all when it says the same, so goals, reminders and clears never
-/// stack up there; anything else goes as it is. A word a server before this one left waiting
-/// (`queued::from_before`) is the one waiting. How it went, and the message that takes it.
+/// Says the stack's explicitly replaceable desired state. Identical waiting work keeps its
+/// identity; changed intent publishes a new immutable status. Receiver-admitted originals stay
+/// frozen, and only the durable sender may coalesce an undispatched successor.
 async fn say<P>(port: &P, agent: &str, item: Option<&str>, c: Command, now: i64) -> (Sent, Option<String>)
 where
     P: HarnessPort<Agent = Info, Command = Command>,
@@ -564,9 +635,12 @@ where
 /// The stack's word waiting in `agent`'s queue (as `info` has it) at `now`, through which `say`
 /// says `text`: its id, and whether it says `text` already; none when none waits. A word a server
 /// before this one left waiting (`queued::from_before`) is the one waiting.
-fn waiting_word(info: Option<&Info>, agent: &str, text: &str, now: i64) -> Option<(String, bool)> {
+fn waiting_word(info: Option<&Info>, agent: &str, text: &str, now: i64) -> Option<WaitingWord> {
     let mut said = SAID.lock();
-    let w = said.get_mut(agent).and_then(|w| (w.msg.look(info, now) == Now::Waiting).then(|| (w.msg.id.clone(), w.msg.text == text)));
+    let w = said.get_mut(agent).and_then(|w| match w.msg.look(info, now) {
+        presence @ (Now::Waiting | Now::Unknown) => Some(WaitingWord { id: w.msg.id.clone(), same: w.msg.text == text, presence }),
+        Now::Gone => None,
+    });
     if w.is_none() {
         said.remove(agent);
     }
@@ -575,12 +649,12 @@ fn waiting_word(info: Option<&Info>, agent: &str, text: &str, now: i64) -> Optio
         let q = info?.queue.iter().find(|q| crate::harness::queued::from_before(&q.id, GOAL))?;
         let same = q.digest == crate::harness::queued::digest(text);
         said.insert(agent.to_owned(), Word { msg: Kept::found(q.id.clone(), if same { text.to_owned() } else { String::new() }, now), item: None });
-        Some((q.id.clone(), same))
+        Some(WaitingWord { id: q.id.clone(), same, presence: Now::Waiting })
     })
 }
 
 /// [`say`], the word waiting found already ([`waiting_word`], by `info`).
-async fn say_with<P>(port: &P, agent: &str, item: Option<&str>, c: Command, info: Option<&Info>, waiting: Option<(String, bool)>, now: i64) -> (Sent, Option<String>)
+async fn say_with<P>(port: &P, agent: &str, item: Option<&str>, c: Command, info: Option<&Info>, waiting: Option<WaitingWord>, now: i64) -> (Sent, Option<String>)
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
@@ -588,25 +662,19 @@ where
     let (id, text) = (id.clone(), text.clone());
     let item = item.map(str::to_owned);
     match waiting {
-        Some((waits, true)) => {
-            if let Some(w) = SAID.lock().get_mut(agent) {
-                w.item = item;
+        Some(waiting) if waiting.same => {
+            let mut sent = if waiting.presence == Now::Unknown { Sent::Retained } else { Sent::Delivered };
+            if let Some(word) = SAID.lock().get_mut(agent) {
+                word.item = item;
+                if word.msg.at_sender() { sent = Sent::Retained; }
             }
-            (Sent::Delivered, Some(waits))
+            (sent, Some(waiting.id))
         }
-        Some((waits, false)) => {
-            let sent = port.send(agent, Command::QueueEdit { id: waits.clone(), text: text.clone(), attachments: None }).await;
-            if sent == Sent::Delivered
-                && let Some(w) = SAID.lock().get_mut(agent)
-            {
-                w.msg.text = text;
-                w.item = item;
-            }
-            (sent, Some(waits))
-        }
-        None => {
-            let sent = port.send(agent, c).await;
-            if sent == Sent::Delivered
+        Some(_) | None => {
+            // A changed goal-stack state is a new immutable publication. Only its explicitly
+            // replaceable pending successor is coalesced; an accepted revision stays frozen.
+            let sent = port.send_status(agent, c, "internal-goal-stack").await;
+            if sent.has_custody()
                 && let Some(to) = info
             {
                 let mut said = SAID.lock();
@@ -616,7 +684,9 @@ where
                 {
                     said.remove(&oldest);
                 }
-                said.insert(agent.to_owned(), Word { msg: Kept::sent(id.clone(), text, to, now), item });
+                let mut msg = Kept::sent(id.clone(), text, to, now);
+                if sent == Sent::Retained { msg.awaiting_source(); }
+                said.insert(agent.to_owned(), Word { msg, item });
             }
             (sent, Some(id))
         }
@@ -652,11 +722,28 @@ where
             info.map(|i| (a, i))
         })
         .collect();
+    let mut observed = Vec::new();
+    if let Some(hub) = hub {
+        for (agent, info) in &infos {
+            let message = SAID.lock().get(agent).map(|w| w.msg.id.clone());
+            if let Some(message) = message.filter(|id| info.queue_partial && !info.queue.iter().any(|q| &q.id == id) && !info.said.iter().any(|q| &q.id == id))
+                && let Ok(found) = crate::harness::state_reads::lookup(hub, agent, info, &message).await
+            {
+                observed.push((agent.clone(), message, found));
+            }
+        }
+    }
     let lost: Vec<(String, Word)> = {
         let mut said = SAID.lock();
         let mut lost = Vec::new();
         for (agent, info) in &infos {
-            if said.get_mut(agent).is_some_and(|w| w.msg.look_heard(Some(&**info), now) == Now::Gone)
+            if said.get_mut(agent).is_some_and(|w| {
+                let known = observed.iter().find(|(a, message, _)| a == agent && message == &w.msg.id);
+                match known {
+                    Some((_, _, found)) => w.msg.look_heard_known(info, found.as_ref(), now) == Now::Gone,
+                    None => w.msg.look_heard(Some(&**info), now) == Now::Gone,
+                }
+            })
                 && let Some(w) = said.remove(agent)
                 && w.msg.lost()
             {
@@ -669,7 +756,7 @@ where
         let c = send(w.msg.text.clone());
         let (sent, _) = say(port, &agent, w.item.as_deref(), c, now).await;
         // Not delivered: kept as it was, to say again at the next look (unless something was said since).
-        if sent != Sent::Delivered {
+        if !sent.has_custody() {
             tracing::info!(%agent, "a goal stack's word, said again, didn't reach its agent");
             SAID.lock().entry(agent).or_insert(w);
         }
@@ -2065,31 +2152,51 @@ async fn send_id(store: &crate::store::Store, item: &str) -> anyhow::Result<Stri
         .await
 }
 
-/// The id of the goal message going to item `item`'s agent through the stack's word `word` waiting
-/// in its queue (an edit of it: `say`): that word's, kept as the goal's before the edit goes, so a
-/// driver that restarts before it learns how it went says it again under that id, the inbox's
-/// repeat (or the word, edited still), never another message (CP-T3.2, the thirteenth adversarial
-/// check's).
+/// Bind an identical existing word to this goal; changed text must use its own persisted
+/// attempt, whose identity canonical goal edits clear before publishing the new intent.
 async fn send_id_through(store: &crate::store::Store, item: &str, word: &str) -> anyhow::Result<String> {
     let (item, word) = (item.to_owned(), word.to_owned());
     store.call(move |c| Ok(c.execute("UPDATE goal_items SET send_id = ?2 WHERE id = ?1", params![item, word]).map(|_| word)?)).await
 }
 
-/// The id a goal's message `c` goes under to `agent`, and the stack's word waiting it goes through
-/// (`say_with`): through a word waiting, that word's id ([`send_id_through`]); else the goal's own
-/// ([`send_id`]).
-async fn goal_message<P>(store: &crate::store::Store, port: &P, agent: &str, item: &str, c: &Command, now: i64) -> anyhow::Result<(String, Option<Info>, Option<(String, bool)>)>
+/// An identical waiting word keeps its ID. A new desired state uses the goal's persisted
+/// attempt ID, so an uncertain retry remains exact without mutating the preceding publication.
+async fn goal_message<P>(store: &crate::store::Store, port: &P, hub: Option<&Hub>, agent: &str, item: &str, c: &Command, now: i64) -> anyhow::Result<(String, Option<Info>, Option<WaitingWord>)>
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
     let info = port.agent(agent);
+    if let (Command::Send { text, .. }, Some(info)) = (c, info.as_ref())
+        && info.queue_partial
+    {
+        let tracked = SAID.lock().get(agent).map(|w| w.msg.id.clone());
+        if let Some(message) = tracked.filter(|id| !info.queue.iter().any(|q| &q.id == id))
+            && let Some(hub) = hub
+            && let Ok(found) = crate::harness::state_reads::lookup(hub, agent, info, &message).await
+        {
+            let mut said = SAID.lock();
+            if let Some(word) = said.get_mut(agent).filter(|w| w.msg.id == message)
+                && word.msg.look_known(info, found.as_ref(), now) == Now::Gone
+            {
+                said.remove(agent);
+            }
+        }
+        if !SAID.lock().contains_key(agent) {
+            let hub = hub.ok_or_else(|| anyhow::anyhow!("the partial queue's owner is unavailable to establish its prior goal words"))?;
+            let found = crate::harness::state_reads::first(hub, agent, info, |q| crate::harness::queued::from_before(&q.id, GOAL)).await.map_err(|e| anyhow::anyhow!("the queue's owner could not establish prior goal words: {e:?}"))?;
+            if let Some(q) = found {
+                let holds = if q.digest == crate::harness::queued::digest(text) { text.clone() } else { String::new() };
+                SAID.lock().insert(agent.to_owned(), Word { msg: Kept::found(q.id, holds, now), item: None });
+            }
+        }
+    }
     let waiting = match c {
         Command::Send { text, .. } => waiting_word(info.as_ref(), agent, text, now),
         _ => None,
     };
     let message = match &waiting {
-        Some((word, _)) => send_id_through(store, item, word).await?,
-        None => send_id(store, item).await?,
+        Some(waiting) if waiting.same => send_id_through(store, item, &waiting.id).await?,
+        _ => send_id(store, item).await?,
     };
     Ok((message, info, waiting))
 }
@@ -3283,10 +3390,10 @@ where
             let how = how(port, agent);
             let stopped = info.as_ref().is_some_and(|i| i.status == Status::Exited);
             let c = first_command(how, &text, stopped);
-            let (message, found, waiting) = goal_message(store, port, agent, &id, &c, now).await?;
+            let (message, found, waiting) = goal_message(store, port, d.planner, agent, &id, &c, now).await?;
             let (went, sent) = say_with(port, agent, Some(id.as_str()), with_id(c, &message), found.as_ref(), waiting, now).await;
             match went {
-                Sent::Delivered => {
+                Sent::Delivered | Sent::Retained => {
                     d.metrics.goal_sent(false);
                     store
                         .call(move |c| {
@@ -3302,15 +3409,15 @@ where
                 // its way elsewhere): the goal goes when it's back, under the same id. A try that got
                 // there before a restart and is refused now (its session moving) is answered as the
                 // repeat it is once it's settled, never sent again as another message (CP-T3.2).
-                Sent::NoSession | Sent::Unreachable | Sent::Full => {}
+                Sent::NoSession | Sent::Unreachable | Sent::Full | Sent::Cancelled => {}
             }
         }
         Next::Remind { id, text, how, worked, stopped, fresh } => {
             let c = if fresh { first_command(&how, &text, stopped) } else { reminder_command(&how, &text, stopped) };
-            let (message, found, waiting) = goal_message(store, port, agent, &id, &c, now).await?;
+            let (message, found, waiting) = goal_message(store, port, d.planner, agent, &id, &c, now).await?;
             let (went, sent) = say_with(port, agent, Some(id.as_str()), with_id(c, &message), found.as_ref(), waiting, now).await;
             match went {
-                Sent::Delivered => {
+                Sent::Delivered | Sent::Retained => {
                     // Afresh (resumed, or reworded) it goes as a goal goes first: a start.
                     d.metrics.goal_sent(!fresh);
                     tracing::info!(%agent, worked, stopped, fresh, "goal sent again");
@@ -3327,7 +3434,7 @@ where
                 // Not known right now, or its machine is away (or its inbox full, or the session on
                 // its way elsewhere): tried again after a pause, as a reminder that brought no work,
                 // under the same id until it gets there (CP-T3.2).
-                Sent::NoSession | Sent::Unreachable | Sent::Full => {
+                Sent::NoSession | Sent::Unreachable | Sent::Full | Sent::Cancelled => {
                     store.call(move |c| Ok(c.execute("UPDATE goal_items SET reminded_at = ?2, reminders = reminders + 1 WHERE id = ?1", params![id, now]).map(|_| ())?)).await?;
                 }
             }
@@ -3988,15 +4095,6 @@ mod tests {
     /// as the repeat it is, and the agent is sent the goal's first message once.
     #[test]
     fn a_goal_message_refused_on_its_retry_keeps_its_id() -> anyhow::Result<()> {
-        async fn exited(hub: &Hub, id: &str) -> bool {
-            for _ in 0..500 {
-                if hub.harness.info(id).is_some_and(|i| i.status == Status::Exited) {
-                    return true;
-                }
-                crate::rt::sleep(Duration::from_millis(20)).await;
-            }
-            false
-        }
         async fn item(hub: &Hub) -> anyhow::Result<(String, Option<String>)> {
             hub.store.call(|c| Ok(c.query_row("SELECT status, send_id FROM goal_items WHERE id = 'kept-g1'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?)).await
         }
@@ -4007,15 +4105,16 @@ mod tests {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
             });
             let dir = tempfile::tempdir()?;
+            let program = native_goal_program(&hub, dir.path()).await?;
             let spec = crate::harness::session::Spec {
                 kind: "claude".into(),
                 cwd: Some(dir.path().to_string_lossy().into_owned()),
-                program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
+                program: Some(program.to_string_lossy().into_owned()),
                 ..Default::default()
             };
             let opened = hub.harness.open(&hub, "local", spec, 1).await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
             let id = opened.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
-            anyhow::ensure!(exited(&hub, &id).await, "it never stood stopped");
+            settled_native(&hub, &id).await?;
             let (a, now) = (id.clone(), hub.clock.unix_ms());
             hub.store
                 .call(move |c| {
@@ -4024,16 +4123,15 @@ mod tests {
                     Ok(())
                 })
                 .await?;
-            let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("the server's sessions have no inboxes"))?;
             let metrics = crate::metrics::AgentMetrics::default();
             let d = Driver { store: &hub.store, clock: hub.clock.as_ref(), shutdown: &hub.shutdown, port: hub.as_ref(), hub: None, metrics: &metrics, planner: None };
             // The goal's first message goes, and its agent's inbox takes it.
             step(&d, &id, true).await?;
-            let first = inbox.taken(&id, 100).await?;
+            let first = settled_native(&hub, &id).await?;
             anyhow::ensure!(first.len() == 1 && item(&hub).await?.0 == "active", "the goal went: {first:?} {:?}", item(&hub).await?);
             let g1 = first.first().cloned().unwrap_or_default();
             // It left the agent's queue for its harness.
-            let _ = hub.harness.command(&hub, &id, Command::QueueRemove { id: g1.clone() }).await;
+            crate::harness::ops::end_to_end::source_disposition(&hub, &id, &g1, true).await?;
             // The server restarted after that send and before it recorded how it went: the goal is
             // pending still, the id the driver kept for it is there (as `send_id` keeps it), and the
             // driver's memory of what it said is gone.
@@ -4045,25 +4143,13 @@ mod tests {
             // As the driver sends it again under that id, its host takes no messages (refused
             // `moved`): tried again and again, the goal keeps the id.
             hub.harness.local.hold(true);
-            for _ in 0..5 {
-                exited(&hub, &id).await;
-                step(&d, &id, true).await?;
-                crate::rt::sleep(Duration::from_millis(50)).await;
-            }
+            step(&d, &id, true).await?;
             let held = item(&hub).await?;
             hub.harness.local.hold(false);
-            anyhow::ensure!(held == ("pending".to_owned(), Some(g1.clone())), "refused, the goal keeps its message's id: {held:?}");
-            // Its next steps, until the goal goes: its message answered as the repeat it is.
-            for _ in 0..20 {
-                exited(&hub, &id).await;
-                step(&d, &id, true).await?;
-                if item(&hub).await?.0 == "active" {
-                    break;
-                }
-                crate::rt::sleep(Duration::from_millis(100)).await;
-            }
-            anyhow::ensure!(item(&hub).await?.0 == "active", "the goal went once its session took messages again: {:?}", item(&hub).await?);
-            let taken = inbox.taken(&id, 100).await?;
+            // Custody was committed before the hold. Its exact retry keeps the saved receipt,
+            // without a new source admission or publication ID.
+            anyhow::ensure!(held == ("active".to_owned(), None), "committed retry lost its receipt: {held:?}");
+            let taken = settled_native(&hub, &id).await?;
             anyhow::ensure!(taken.len() == 1, "the goal's first message reached its agent {} times, under {taken:?} (first under {g1})", taken.len());
             Ok(())
         })
@@ -4076,15 +4162,6 @@ mod tests {
     /// stack, and used to write that one without its id.
     #[test]
     fn a_goal_sent_before_a_restart_keeps_its_message_s_id_when_cleared_goals_are_brought_back() -> anyhow::Result<()> {
-        async fn exited(hub: &Hub, id: &str) -> bool {
-            for _ in 0..500 {
-                if hub.harness.info(id).is_some_and(|i| i.status == Status::Exited) {
-                    return true;
-                }
-                crate::rt::sleep(Duration::from_millis(20)).await;
-            }
-            false
-        }
         async fn item(hub: &Hub) -> anyhow::Result<(String, Option<String>)> {
             hub.store.call(|c| Ok(c.query_row("SELECT status, send_id FROM goal_items WHERE id = 'kept-g1'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?)).await
         }
@@ -4095,15 +4172,16 @@ mod tests {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
             });
             let dir = tempfile::tempdir()?;
+            let program = native_goal_program(&hub, dir.path()).await?;
             let spec = crate::harness::session::Spec {
                 kind: "claude".into(),
                 cwd: Some(dir.path().to_string_lossy().into_owned()),
-                program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
+                program: Some(program.to_string_lossy().into_owned()),
                 ..Default::default()
             };
             let opened = hub.harness.open(&hub, "local", spec, 1).await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
             let id = opened.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
-            anyhow::ensure!(exited(&hub, &id).await, "it never stood stopped");
+            settled_native(&hub, &id).await?;
             // A goal met earlier, cleared: something to bring back.
             let (a, now) = (id.clone(), hub.clock.unix_ms());
             hub.store
@@ -4123,16 +4201,15 @@ mod tests {
                     Ok(())
                 })
                 .await?;
-            let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("the server's sessions have no inboxes"))?;
             let metrics = crate::metrics::AgentMetrics::default();
             let d = Driver { store: &hub.store, clock: hub.clock.as_ref(), shutdown: &hub.shutdown, port: hub.as_ref(), hub: None, metrics: &metrics, planner: None };
             // The goal's first message goes, its agent's inbox takes it, and it leaves the agent's
             // queue for its harness.
             step(&d, &id, true).await?;
-            let first = inbox.taken(&id, 100).await?;
+            let first = settled_native(&hub, &id).await?;
             anyhow::ensure!(first.len() == 1 && item(&hub).await?.0 == "active", "the goal went: {first:?} {:?}", item(&hub).await?);
             let g1 = first.first().cloned().unwrap_or_default();
-            let _ = hub.harness.command(&hub, &id, Command::QueueRemove { id: g1.clone() }).await;
+            crate::harness::ops::end_to_end::source_disposition(&hub, &id, &g1, true).await?;
             // The server restarted after that send and before it recorded how it went: the goal is
             // pending still, the id the driver kept for it is there, and the driver's memory of
             // what it said is gone.
@@ -4144,17 +4221,9 @@ mod tests {
             // You bring back what you cleared before the driver sends the goal again: the goal
             // keeps the id, and goes under it (bringing goals back sends what's next at once).
             control_asked(&hub, &id, Action::Restore, &By::You, Pausing::default(), None, None).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-            for _ in 0..20 {
-                exited(&hub, &id).await;
-                step(&d, &id, true).await?;
-                if item(&hub).await?.0 == "active" {
-                    break;
-                }
-                crate::rt::sleep(Duration::from_millis(100)).await;
-            }
-            anyhow::ensure!(item(&hub).await?.0 == "active", "the goal went once its goals were back: {:?}", item(&hub).await?);
-            crate::rt::sleep(Duration::from_millis(300)).await;
-            let taken = inbox.taken(&id, 100).await?;
+            step(&d, &id, true).await?;
+            anyhow::ensure!(item(&hub).await?.0 == "active", "restored exact attempt did not become active");
+            let taken = settled_native(&hub, &id).await?;
             anyhow::ensure!(taken.len() == 1, "the goal's first message reached its agent {} times, under {taken:?} (first under {g1})", taken.len());
             Ok(())
         })
@@ -4167,15 +4236,6 @@ mod tests {
     /// in the harness a goal it doesn't know went; its stack used to keep the goal without the id.
     #[test]
     fn a_goal_sent_before_a_restart_then_cleared_and_brought_back_reaches_its_agent_once() -> anyhow::Result<()> {
-        async fn exited(hub: &Hub, id: &str) -> bool {
-            for _ in 0..500 {
-                if hub.harness.info(id).is_some_and(|i| i.status == Status::Exited) {
-                    return true;
-                }
-                crate::rt::sleep(Duration::from_millis(20)).await;
-            }
-            false
-        }
         async fn item(hub: &Hub) -> anyhow::Result<Option<(String, Option<String>)>> {
             hub.store
                 .call(|c| Ok(rusqlite::OptionalExtension::optional(c.query_row("SELECT status, send_id FROM goal_items WHERE id = 'kept-g1'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))))?))
@@ -4188,15 +4248,16 @@ mod tests {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
             });
             let dir = tempfile::tempdir()?;
+            let program = native_goal_program(&hub, dir.path()).await?;
             let spec = crate::harness::session::Spec {
                 kind: "claude".into(),
                 cwd: Some(dir.path().to_string_lossy().into_owned()),
-                program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
+                program: Some(program.to_string_lossy().into_owned()),
                 ..Default::default()
             };
             let opened = hub.harness.open(&hub, "local", spec, 1).await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
             let id = opened.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
-            anyhow::ensure!(exited(&hub, &id).await, "it never stood stopped");
+            settled_native(&hub, &id).await?;
             let (a, now) = (id.clone(), hub.clock.unix_ms());
             hub.store
                 .call(move |c| {
@@ -4205,16 +4266,15 @@ mod tests {
                     Ok(())
                 })
                 .await?;
-            let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("the server's sessions have no inboxes"))?;
             let metrics = crate::metrics::AgentMetrics::default();
             let d = Driver { store: &hub.store, clock: hub.clock.as_ref(), shutdown: &hub.shutdown, port: hub.as_ref(), hub: None, metrics: &metrics, planner: None };
             // The goal's first message goes, its agent's inbox takes it, and it leaves the agent's
             // queue for its harness.
             step(&d, &id, true).await?;
-            let first = inbox.taken(&id, 100).await?;
+            let first = settled_native(&hub, &id).await?;
             anyhow::ensure!(first.len() == 1 && item(&hub).await?.is_some_and(|(s, _)| s == "active"), "the goal went: {first:?} {:?}", item(&hub).await?);
             let g1 = first.first().cloned().unwrap_or_default();
-            let _ = hub.harness.command(&hub, &id, Command::QueueRemove { id: g1.clone() }).await;
+            crate::harness::ops::end_to_end::source_disposition(&hub, &id, &g1, true).await?;
             // The server restarted after that send and before it recorded how it went: the goal is
             // pending still, the id the driver kept for it is there, and the driver's memory of
             // what it said is gone.
@@ -4226,17 +4286,9 @@ mod tests {
             // Before the driver sends it again, you clear the stack and bring it back.
             control_asked(&hub, &id, Action::Clear, &By::You, Pausing::default(), None, None).await.map_err(|e| anyhow::anyhow!("{e}"))?;
             control_asked(&hub, &id, Action::Restore, &By::You, Pausing::default(), None, None).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-            for _ in 0..20 {
-                exited(&hub, &id).await;
-                step(&d, &id, true).await?;
-                if item(&hub).await?.is_some_and(|(s, _)| s == "active") {
-                    break;
-                }
-                crate::rt::sleep(Duration::from_millis(100)).await;
-            }
-            anyhow::ensure!(item(&hub).await?.is_some_and(|(s, _)| s == "active"), "the goal went once its goals were back: {:?}", item(&hub).await?);
-            crate::rt::sleep(Duration::from_millis(300)).await;
-            let taken = inbox.taken(&id, 100).await?;
+            step(&d, &id, true).await?;
+            anyhow::ensure!(item(&hub).await?.is_some_and(|(status, _)| status == "active"), "restored exact attempt did not become active");
+            let taken = settled_native(&hub, &id).await?;
             anyhow::ensure!(taken.len() == 1, "the goal's first message reached its agent {} times, under {taken:?} (first under {g1})", taken.len());
             Ok(())
         })
@@ -4312,6 +4364,68 @@ mod tests {
         q
     }
 
+    #[test]
+    fn a_canonical_reword_rotates_the_attempt_once_and_an_uncertain_retry_keeps_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let id = format!("reword-{}", crate::util::new_id());
+            let agent = id.clone();
+            hub.store.call(move |connection| {
+                touch(connection, &agent, Some("running"), None, 0)?;
+                connection.execute("INSERT INTO goal_items (id,agent,pos,text,status,send_id) VALUES ('reword-item',?1,0,'before','active','goal-original-attempt')", [agent])?;
+                Ok(())
+            }).await?;
+            let port = StatusSpy::new(Arc::new(kiln_seams::clock::SimClock::new()));
+            let info = Info { id: id.clone(), status: Status::Running, ..Info::default() };
+            assert!(port.open(&id, info.clone()));
+            let before = send("Your goal: before".into());
+            let (original, _, _) = goal_message(&hub.store, &port, None, &id, "reword-item", &before, 1).await?;
+            assert_eq!(original, "goal-original-attempt");
+            set_unsent(&hub, &info, &id, vec![(Some("reword-item".into()), "after".into())], Vec::new()).await?;
+            let after = send("Your goal: after".into());
+            let (successor, found, waiting) = goal_message(&hub.store, &port, None, &id, "reword-item", &after, 2).await?;
+            assert_ne!(successor, original, "changed canonical text cannot reuse its old immutable body ID");
+            assert!(port.away(&id, true));
+            let (refused, _) = say_with(&port, &id, Some("reword-item"), with_id(after.clone(), &successor), found.as_ref(), waiting, 2).await;
+            assert!(!refused.has_custody());
+            SAID.lock().remove(&id);
+            let (retry, found, waiting) = goal_message(&hub.store, &port, None, &id, "reword-item", &after, 3).await?;
+            assert_eq!(retry, successor, "memory loss and an unanswered attempt must retain the persisted successor");
+            assert!(port.away(&id, false));
+            let (sent, _) = say_with(&port, &id, Some("reword-item"), with_id(after, &retry), found.as_ref(), waiting, 3).await;
+            assert!(sent.has_custody());
+            let attempts = port.status.lock();
+            assert_eq!(attempts.len(), 2);
+            assert!(attempts.iter().all(|(id, key)| id == &successor && key == "internal-goal-stack"));
+            let history = port.heard(&id);
+            assert!(matches!(history.as_slice(), [delivery] if matches!(&delivery.command, Command::Send { id, text, .. } if id == &successor && text == "Your goal: after")));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn an_unseen_tracked_word_in_a_partial_index_is_not_replaced() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let id = format!("partial-goal-{}", crate::util::new_id());
+            let port = StatusSpy::new(Arc::new(kiln_seams::clock::SimClock::new()));
+            assert!(port.open(&id, Info { id: id.clone(), status: Status::Running, queued: 100, queue_partial: true, ..Info::default() }));
+            let original = Kept::found("same-goal-word".into(), "before".into(), 0);
+            SAID.lock().insert(id.clone(), Word { msg: original.clone(), item: None });
+            let now = crate::harness::queued::SHOW_MS * 2;
+            let (same, same_id) = say(&port, &id, Some("same"), send("before".into()), now).await;
+            anyhow::ensure!(same == Sent::Retained && same_id.as_deref() == Some("same-goal-word") && port.heard(&id).is_empty(), "unknown identical work must retain its exact ID without another publication");
+            let (changed, successor) = say(&port, &id, Some("next"), send("after".into()), now).await;
+            let successor = successor.ok_or_else(|| anyhow::anyhow!("no successor"))?;
+            anyhow::ensure!(changed == Sent::Delivered && successor != original.id, "changed intent needs a new immutable identity");
+            let heard = port.heard(&id);
+            anyhow::ensure!(matches!(heard.as_slice(), [delivery] if matches!(&delivery.command, Command::Send { id, text, .. } if id == &successor && text == "after")), "{heard:?}");
+            anyhow::ensure!(original.id == "same-goal-word" && original.text == "before", "uncertain predecessor was not proven gone or edited");
+            port.assert_status_key();
+            SAID.lock().remove(&id);
+            Ok(())
+        })
+    }
+
     /// The incident's goals: an agent in one long turn, its stack resumed again and again, a goal
     /// said met and the next sent, then that one met before the agent took it, its own goal cleared
     /// each time. One message of the stack's waits in its queue at a time, edited, never a second
@@ -4320,78 +4434,49 @@ mod tests {
     #[test]
     fn a_goal_stack_s_word_waits_in_its_agent_s_queue_one_message_at_a_time() -> anyhow::Result<()> {
         use kiln_seams::Clock as _;
-        use kiln_seams::clock::SimClock;
-        use kiln_seams::harness::SimHarness;
         crate::rt::block_on(async {
-            let clock = SimClock::new();
+            let clock = kiln_seams::clock::SimClock::new();
             let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
             let shutdown = crate::rt::Shutdown::new();
-            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let port = StatusSpy::new(Arc::new(clock.clone()));
             let id = "goals-one-word";
-            // At work on one long turn, its harness's own goal the stack's first, met there already.
-            let lint = Objective { text: "lint passes".into(), status: "active".into(), reason: None, at: clock.unix_ms() };
-            assert!(port.open(id, Info { id: id.into(), status: Status::Running, objective: Some(lint), ..Info::default() }));
+            assert!(port.open(id, Info { id: id.into(), status: Status::Running, ..Info::default() }));
             port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]}));
             let metrics = crate::metrics::AgentMetrics::default();
-            let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
-            let a = id.to_owned();
-            store
-                .call(move |c| {
-                    touch(c, &a, Some("running"), None, 0)?;
-                    c.execute("INSERT INTO goal_items (id, agent, pos, text, status, how, reminded_at) VALUES ('g0', ?1, 0, 'lint passes', 'active', 'goal', 1)", params![a])?;
-                    c.execute("INSERT INTO goal_items (id, agent, pos, text, status) VALUES ('g1', ?1, 1, 'tests pass', 'pending'), ('g2', ?1, 2, 'docs build', 'pending')", params![a])?;
-                    Ok(())
-                })
-                .await?;
-            let st = &store;
-            let items = || async move { anyhow::Ok(stack_of(st, id).await?.items) };
-            let info = || port.agent(id).unwrap_or_default();
-            let met = |goal: &'static str| async move {
-                st.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'met' WHERE id = ?1", params![goal]).map(|_| ())?)).await?;
-                renumber_in(st, id).await
-            };
-            // g0 is met (as `done` does it): its goal cleared in the agent, behind its turn; then the next goes.
-            clear_in_agent(&port, &info(), &items().await?, clock.unix_ms()).await;
-            withdraw(&port, id, &items().await?, |i| i.id == "g0").await;
-            met("g0").await?;
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
+            store.call(|connection| {
+                touch(connection, "goals-one-word", Some("running"), None, 0)?;
+                connection.execute("INSERT INTO goal_items (id,agent,pos,text) VALUES ('g1','goals-one-word',0,'tests pass'),('g2','goals-one-word',1,'docs build')", [])?;
+                Ok(())
+            }).await?;
+            let (_, clear) = say(&port, id, None, send("/goal clear".into()), clock.unix_ms()).await;
+            let clear = clear.ok_or_else(|| anyhow::anyhow!("no clear"))?;
             queue_of(&port, id, &[]);
-            step(&d, id, true).await?;
-            let q = queue_of(&port, id, &[]);
-            anyhow::ensure!(matches!(q.as_slice(), [(_, t)] if t == "/goal tests pass"), "the clear waiting became the next goal: {q:?}");
-            // Resumed again and again: the goal waiting already says it, so nothing more goes.
+            step(&driver, id, true).await?;
+            let first = queue_of(&port, id, &[]);
+            anyhow::ensure!(first.len() == 2 && first.first() == Some(&(clear.clone(), "/goal clear".into())) && first.last().is_some_and(|(word, text)| word != &clear && text == "/goal tests pass"), "ordinary fallback preserves both immutable originals: {first:?}");
+            let before = port.heard(id).len();
             for _ in 0..3 {
-                store.call(|c| Ok(c.execute("UPDATE goal_items SET reminded_at = 0 WHERE status = 'active'", []).map(|_| ())?)).await?;
+                store.call(|connection| Ok(connection.execute("UPDATE goal_items SET reminded_at=0 WHERE status='active'", []).map(|_| ())?)).await?;
                 clock.advance(Duration::from_secs(60));
-                step(&d, id, true).await?;
+                step(&driver, id, true).await?;
             }
-            let heard: Vec<Command> = port.heard(id).into_iter().map(|d| d.command).collect();
-            anyhow::ensure!(matches!(heard.as_slice(), [Command::Send { .. }, Command::QueueEdit { .. }]), "one message, edited once: {heard:?}");
-            // g1 met before the agent took it: the agent's own goal is cleared, the next goes, and
-            // each is the one message, edited.
-            clear_in_agent(&port, &info(), &items().await?, clock.unix_ms()).await;
-            withdraw(&port, id, &items().await?, |i| i.id == "g1").await;
-            met("g1").await?;
-            step(&d, id, true).await?;
-            let q = queue_of(&port, id, &[]);
-            anyhow::ensure!(matches!(q.as_slice(), [(_, t)] if t == "/goal docs build"), "{q:?}");
-            let sends = port.heard(id).iter().filter(|d| matches!(d.command, Command::Send { .. })).count();
-            anyhow::ensure!(sends == 1, "a single message queued all along: {:?}", port.heard(id));
-            let waiting = q.first().map(|(m, _)| m.clone()).unwrap_or_default();
-            // Its goal reworded, and the edit comes too late: the turn ended, the agent took the
-            // message as it was. What the edit said goes again, in a message of its own.
-            let _ = say(&port, id, Some("g2"), send("/goal docs build on every platform".into()), clock.unix_ms()).await;
-            queue_of(&port, id, std::slice::from_ref(&waiting));
-            handed(&port, id, &waiting, "/goal docs build");
-            resay(&port, clock.unix_ms()).await;
-            let q = queue_of(&port, id, std::slice::from_ref(&waiting));
-            anyhow::ensure!(matches!(q.as_slice(), [(m, t)] if *m != waiting && t == "/goal docs build on every platform"), "{q:?}");
-            // Once that's seen waiting and then taken, nothing more is said.
-            resay(&port, clock.unix_ms()).await;
-            let taken: Vec<String> = q.iter().map(|(m, _)| m.clone()).chain(std::iter::once(waiting)).collect();
+            anyhow::ensure!(port.heard(id).len() == before, "unchanged desired state was published again");
+            store.call(|connection| Ok(connection.execute("UPDATE goal_items SET status='met' WHERE id='g1'", []).map(|_| ())?)).await?;
+            step(&driver, id, true).await?;
+            let all = queue_of(&port, id, &[]);
+            anyhow::ensure!(all.len() == 3 && all.last().is_some_and(|(_, text)| text == "/goal docs build"), "changed intent is an immutable successor: {all:?}");
+            let items = stack_of(&store, id).await?.items;
+            anyhow::ensure!(items.iter().any(|item| item.id == "g1" && item.status == "met") && items.iter().any(|item| item.id == "g2" && item.status == "active"), "goal lifecycle changed");
+            let (successor, text) = all.last().cloned().ok_or_else(|| anyhow::anyhow!("no latest word"))?;
+            let taken: Vec<String> = all.iter().map(|(id, _)| id.clone()).collect();
             queue_of(&port, id, &taken);
+            handed(&port, id, &successor, &text);
             let before = port.heard(id).len();
             resay(&port, clock.unix_ms()).await;
-            anyhow::ensure!(port.heard(id).len() == before, "{:?}", port.heard(id));
+            anyhow::ensure!(port.heard(id).len() == before, "a correlated handoff must not create another successor");
+            port.assert_status_key();
+            anyhow::ensure!(all.iter().map(|(id, _)| id).collect::<std::collections::HashSet<_>>().len() == all.len(), "changed bodies reused an immutable ID");
             Ok(())
         })
     }
@@ -4409,38 +4494,24 @@ mod tests {
     #[test]
     fn an_edit_applied_and_taken_between_two_looks_is_said_once() -> anyhow::Result<()> {
         use kiln_seams::Clock as _;
-        use kiln_seams::clock::SimClock;
-        use kiln_seams::harness::SimHarness;
         crate::rt::block_on(async {
-            let clock = SimClock::new();
-            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let clock = kiln_seams::clock::SimClock::new();
+            let port = StatusSpy::new(Arc::new(clock.clone()));
             let id = "goals-edit-applied";
             assert!(port.open(id, Info { id: id.into(), status: Status::Running, ..Info::default() }));
-            let (went, _) = say(&port, id, Some("g1"), send("/goal tests pass".into()), clock.unix_ms()).await;
-            anyhow::ensure!(went == Sent::Delivered);
-            let q = queue_of(&port, id, &[]);
-            let word = q.first().map(|(m, _)| m.clone()).unwrap_or_default();
-            // The driver looks, and sees it waiting.
-            resay(&port, clock.unix_ms()).await;
-            // The goal reworded: an edit of the word waiting.
-            let _ = say(&port, id, Some("g1"), send("/goal tests pass on every platform".into()), clock.unix_ms()).await;
-            // Applied: the agent's queue holds the edited words ...
-            let held = queue_of(&port, id, &[]);
-            anyhow::ensure!(matches!(held.as_slice(), [(m, t)] if *m == word && t == "/goal tests pass on every platform"), "{held:?}");
-            // ... and its turn ends: it takes the word, edited, before the driver looks again.
-            queue_of(&port, id, std::slice::from_ref(&word));
-            handed(&port, id, &word, "/goal tests pass on every platform");
+            let (_, first) = say(&port, id, Some("g1"), send("/goal tests pass".into()), clock.unix_ms()).await;
+            let first = first.ok_or_else(|| anyhow::anyhow!("no original"))?;
+            queue_of(&port, id, &[]);
+            let (_, successor) = say(&port, id, Some("g1"), send("/goal tests pass on every platform".into()), clock.unix_ms()).await;
+            let successor = successor.ok_or_else(|| anyhow::anyhow!("no successor"))?;
+            let history = queue_of(&port, id, &[]);
+            anyhow::ensure!(successor != first && history == [(first.clone(), "/goal tests pass".into()), (successor.clone(), "/goal tests pass on every platform".into())], "original body/history mutated: {history:?}");
+            queue_of(&port, id, &[first, successor.clone()]);
+            handed(&port, id, &successor, "/goal tests pass on every platform");
             clock.advance(Duration::from_millis(1500));
             resay(&port, clock.unix_ms()).await;
-            let again: Vec<String> = port
-                .heard(id)
-                .into_iter()
-                .filter_map(|h| match h.command {
-                    Command::Send { id: m, text, .. } if m != word => Some(text),
-                    _ => None,
-                })
-                .collect();
-            anyhow::ensure!(again.is_empty(), "the agent took the word as edited, and it was said again: {again:?}");
+            anyhow::ensure!(port.heard(id).len() == 2, "exact successor handoff was published again");
+            port.assert_status_key();
             Ok(())
         })
     }
@@ -4455,12 +4526,11 @@ mod tests {
     fn a_goal_sent_as_an_edit_and_sent_again_after_a_restart_reaches_the_agent_once() -> anyhow::Result<()> {
         use kiln_seams::Clock as _;
         use kiln_seams::clock::SimClock;
-        use kiln_seams::harness::SimHarness;
         crate::rt::block_on(async {
             let clock = SimClock::new();
             let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
             let shutdown = crate::rt::Shutdown::new();
-            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let port = StatusSpy::new(Arc::new(clock.clone()));
             let id = "goals-goal-as-an-edit";
             assert!(port.open(id, Info { id: id.into(), status: Status::Running, ..Info::default() }));
             assert!(port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]})));
@@ -4484,14 +4554,15 @@ mod tests {
             // goes, is the word's id.
             assert!(port.away(id, true));
             step(&d, id, true).await?;
-            anyhow::ensure!(kept().await?.as_deref() == Some(word.as_str()), "kept for the goal as it went as an edit: {:?}, the word {word}", kept().await?);
+            anyhow::ensure!(kept().await?.as_deref() == Some("goal-kept-earlier"), "kept for the goal as it went as an edit: {:?}, the word {word}", kept().await?);
             assert!(port.away(id, false));
             // Back: the next goal goes, as an edit of that word, still waiting.
             step(&d, id, true).await?;
             let heard: Vec<Command> = port.heard(id).into_iter().map(|h| h.command).collect();
-            anyhow::ensure!(matches!(heard.as_slice(), [Command::Send { .. }, Command::QueueEdit { id: e, text, .. }] if *e == word && text == "/goal tests pass"), "{heard:?}");
+            anyhow::ensure!(matches!(heard.as_slice(), [Command::Send { id: original, text: old, .. }, Command::Send { id: successor, text, .. }] if *original == word && old == "/goal clear" && successor == "goal-kept-earlier" && successor != original && text == "/goal tests pass"), "{heard:?}");
             // The server restarted before it noted that the goal went (the store as it kept it as
             // the edit went), and meanwhile the agent's turn ended: it took the word, edited.
+            let word = "goal-kept-earlier".to_owned();
             let w = word.clone();
             store
                 .call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'pending', how = NULL, started_at = NULL, reminded_at = 0, sent_id = NULL, send_id = ?1 WHERE id = 'g1'", params![w]).map(|_| ())?))
@@ -4510,7 +4581,8 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            anyhow::ensure!(again.is_empty(), "the agent took the goal as the edited word {word}, and was sent it again after the restart: {again:?}");
+            anyhow::ensure!(again.is_empty(), "the agent took the immutable successor {word}, and was sent another after the restart: {again:?}");
+            port.assert_status_key();
             Ok(())
         })
     }
@@ -4522,42 +4594,32 @@ mod tests {
     #[test]
     fn a_word_a_server_before_left_waiting_is_the_one_waiting_and_one_said_again_is_kept_till_it_goes() -> anyhow::Result<()> {
         use kiln_seams::Clock as _;
-        use kiln_seams::clock::SimClock;
-        use kiln_seams::harness::SimHarness;
         crate::rt::block_on(async {
-            let clock = SimClock::new();
-            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let clock = kiln_seams::clock::SimClock::new();
+            let port = StatusSpy::new(Arc::new(clock.clone()));
             let id = "goals-word-from-before";
             let old = "goal-01a16251c49a75fba41b1fae971ba8a9";
             let waiting = vec![crate::harness::queued::Queued::of(old, "/goal tests pass")];
-            assert!(port.open(id, Info { id: id.into(), status: Status::Running, queue: waiting, queued: 1, ..Info::default() }));
-            let (went, by) = say(&port, id, Some("g1"), send("/goal tests pass".into()), clock.unix_ms()).await;
-            anyhow::ensure!(went == Sent::Delivered && by.as_deref() == Some(old) && port.heard(id).is_empty(), "the same word, left as it is: {:?}", port.heard(id));
+            assert!(port.open(id, Info { id: id.into(), status: Status::Running, queue: waiting.clone(), queued: 1, ..Info::default() }));
+            let (same, by) = say(&port, id, Some("g1"), send("/goal tests pass".into()), clock.unix_ms()).await;
+            anyhow::ensure!(same == Sent::Delivered && by.as_deref() == Some(old) && port.heard(id).is_empty(), "known identical predecessor is retained");
             let (_, by) = say(&port, id, Some("g2"), send("/goal docs build".into()), clock.unix_ms()).await;
+            let successor = by.ok_or_else(|| anyhow::anyhow!("no successor"))?;
             let heard = port.heard(id);
-            anyhow::ensure!(by.as_deref() == Some(old) && matches!(heard.as_slice(), [d] if matches!(&d.command, Command::QueueEdit { id: e, text, .. } if e == old && text == "/goal docs build")), "{heard:?}");
-            // The agent took it before the edit came (as its runner says it), and its machine is away
-            // when it's said again.
-            port.update(id, |i| {
-                i.queue.clear();
-                i.queued = 0;
-            });
-            handed(&port, id, old, "/goal tests pass");
+            anyhow::ensure!(successor != old && matches!(heard.as_slice(), [delivery] if matches!(&delivery.command, Command::Send { id, text, .. } if id == &successor && text == "/goal docs build")), "{heard:?}");
+            anyhow::ensure!(port.agent(id).is_some_and(|info| info.queue == waiting), "publication cannot mutate the prior source original");
+            port.update(id, |info| { info.queue = vec![crate::harness::queued::Queued::of(&successor, "/goal docs build")]; info.queued = 1; });
+            resay(&port, clock.unix_ms()).await;
+            port.update(id, |info| { info.queue.clear(); info.queued = 0; });
+            handed(&port, id, &successor, "/goal docs build");
             assert!(port.away(id, true));
             resay(&port, clock.unix_ms()).await;
-            anyhow::ensure!(port.heard(id).len() == 1, "nothing reached it: {:?}", port.heard(id));
             assert!(port.away(id, false));
             resay(&port, clock.unix_ms()).await;
-            let heard = port.heard(id);
-            anyhow::ensure!(heard.len() == 2 && matches!(heard.last().map(|d| &d.command), Some(Command::Send { id, text, .. }) if id.starts_with(GOAL) && text == "/goal docs build"), "said once it's back: {heard:?}");
+            anyhow::ensure!(port.heard(id).len() == 1, "immutable successor was published again after exact handoff");
+            port.assert_status_key();
             Ok(())
         })
-    }
-
-    /// Puts the goals done first, as `done` leaves them.
-    async fn renumber_in(store: &crate::store::Store, agent: &str) -> anyhow::Result<()> {
-        let a = agent.to_owned();
-        store.call(move |c| renumber(c, &a)).await
     }
 
     /// A stack paused for a while resumes by itself when its time is up, by the driver's clock: not
@@ -4940,8 +5002,9 @@ mod stack_tests {
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
             });
-            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
             let folder = tempfile::tempdir()?;
+            let program = native_goal_program(&hub, folder.path()).await?;
+            hub.harness.set_test_program(&program.to_string_lossy());
             let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask {
                 kind: "claude".into(),
@@ -4954,7 +5017,7 @@ mod stack_tests {
             };
             let a = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent started"))?;
             let id = a.id.as_str();
-            settled(&hub, id).await;
+            settled_native(&hub, id).await?;
 
             // Lined up, not started.
             let s = add(&hub, id, vec!["tests pass".into(), "docs build".into(), "ship it".into()], false).await?;
@@ -4966,7 +5029,7 @@ mod stack_tests {
             let given = |order: &[(usize, &str)]| order.iter().map(|(k, t)| Given { id: ids.get(*k).cloned(), text: (*t).to_owned() }).collect::<Vec<_>>();
 
             // Another put before the goal under way: that one goes now, and it waits next.
-            settled(&hub, id).await;
+            settled_native(&hub, id).await?;
             let s = set(&hub, id, given(&[(2, "ship it"), (0, "tests pass"), (1, "docs build")])).await?;
             assert_eq!(words(&s), strs(&["active:ship it", "pending:tests pass", "pending:docs build"]));
             assert_eq!(under_way(&s), Some(("ship it".into(), true)));
@@ -4974,7 +5037,7 @@ mod stack_tests {
             let s = set(&hub, id, given(&[(1, "docs build"), (0, "tests pass")])).await?;
             assert_eq!(words(&s), strs(&["active:ship it", "pending:docs build", "pending:tests pass"]));
             // The goal under way with other words: sent again as they say.
-            settled(&hub, id).await;
+            settled_native(&hub, id).await?;
             let s = set(&hub, id, given(&[(2, "ship it today"), (1, "docs build"), (0, "tests pass")])).await?;
             assert_eq!(under_way(&s), Some(("ship it today".into(), true)));
             assert_eq!(s.items.len(), 3, "nothing repeated: {s:?}");
@@ -4982,11 +5045,11 @@ mod stack_tests {
             // Paused, then resumed: the goal under way goes again at once.
             let s = control(&hub, id, Action::Pause).await?;
             assert_eq!(s.state, "paused");
-            settled(&hub, id).await;
+            settled_native(&hub, id).await?;
             let s = control(&hub, id, Action::Start).await?;
             assert_eq!((s.state.as_str(), under_way(&s)), ("running", Some(("ship it today".into(), true))));
             // Skipped: the next goes at once.
-            settled(&hub, id).await;
+            settled_native(&hub, id).await?;
             let s = control(&hub, id, Action::Skip).await?;
             assert_eq!(words(&s), strs(&["skipped:ship it today", "active:docs build", "pending:tests pass"]));
             assert_eq!(under_way(&s), Some(("docs build".into(), true)));
@@ -4996,7 +5059,7 @@ mod stack_tests {
             assert_eq!((s.state.as_str(), s.items.len(), s.cleared), ("paused", 0, 3));
             let s = add(&hub, id, vec!["hotfix".into()], false).await?;
             assert_eq!((words(&s), s.cleared), (strs(&["pending:hotfix"]), 3));
-            settled(&hub, id).await;
+            settled_native(&hub, id).await?;
             let s = control(&hub, id, Action::Restore).await?;
             assert_eq!(words(&s), strs(&["skipped:ship it today", "active:docs build", "pending:tests pass", "pending:hotfix"]));
             assert_eq!((s.state.as_str(), s.cleared, under_way(&s)), ("running", 0, Some(("docs build".into(), true))));
@@ -5010,7 +5073,7 @@ mod stack_tests {
             let s = add(&hub, id, vec!["one more".into()], false).await?;
             assert_eq!((s.state.as_str(), words(&s).last().cloned()), ("paused", Some("pending:one more".into())));
             // A goal added with the words of the goal under way is a new one: that one stays under way.
-            settled(&hub, id).await;
+            settled_native(&hub, id).await?;
             let s = control(&hub, id, Action::Start).await?;
             assert_eq!(under_way(&s), Some(("one more".into(), true)));
             let s = add(&hub, id, vec!["one  more".into()], false).await?;
@@ -5458,6 +5521,10 @@ mod stack_tests {
 
     /// A hub and an agent on it (no harness runs) with a goal stack: `goals`, started.
     async fn agent_with_goals(goals: &[&str]) -> anyhow::Result<(Arc<Hub>, String, tempfile::TempDir)> {
+        agent_with_goals_fixture(goals, false).await
+    }
+
+    async fn agent_with_goals_fixture(goals: &[&str], native: bool) -> anyhow::Result<(Arc<Hub>, String, tempfile::TempDir)> {
         let hub = crate::hub::tests::scratch_hub_with(|c| {
             c.terminal.enabled = true;
             c.conversations.off = true;
@@ -5467,8 +5534,11 @@ mod stack_tests {
         crate::rt::spawn(async move {
             let _ = crate::harness::registry::Registry::run_local(h).await;
         });
-        hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
         let folder = tempfile::tempdir()?;
+        if native {
+            let program = native_goal_program(&hub, folder.path()).await?;
+            hub.harness.set_test_program(&program.to_string_lossy());
+        } else { hub.harness.set_test_program("/nonexistent/kiln-test-no-harness"); }
         let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
         let ask = Ask {
             kind: "claude".into(),
@@ -5480,7 +5550,7 @@ mod stack_tests {
             ..Ask::default()
         };
         let a = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent started"))?;
-        settled(&hub, &a.id).await;
+        if native { settled_native(&hub, &a.id).await?; } else { settled(&hub, &a.id).await; }
         add(&hub, &a.id, strs(goals), true).await?;
         Ok((hub, a.id, folder))
     }
@@ -5839,7 +5909,7 @@ mod stack_tests {
     #[test]
     fn running_a_plan_held_for_review_approves_it() -> anyhow::Result<()> {
         within(async {
-            let (hub, id, _folder) = agent_with_goals(&["one"]).await?;
+            let (hub, id, _folder) = agent_with_goals_fixture(&["one"], true).await?;
             let id = id.as_str();
             let person = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let mut me = crate::authz::Caller::owner();
@@ -5870,9 +5940,14 @@ mod stack_tests {
             assert_eq!(again.get("approved"), Some(&serde_json::json!(true)), "{again}");
             assert_eq!((crate::plans::get(&hub, &one).await?.runs, steps(&get(&hub, id).await?)), (runs, 2));
 
+            settled_native(&hub, id).await?;
             // Under a key of its own, now that nothing waits on its review: it runs as asked.
             let ran = call_ok(crate::ops::call(person.clone(), "plans.run", serde_json::json!({"id": one, "session": id, "mode": "message", "key": "r2"})).await)?;
-            assert_eq!((ran.get("approved"), ran.get("sent")), (None, Some(&serde_json::json!(1))), "{ran}");
+            assert!(ran.get("approved").is_none(), "{ran}");
+            let sent = ran.get("sent").and_then(Value::as_u64).unwrap_or(0);
+            let retained = ran.get("retained").and_then(Value::as_u64).unwrap_or(0);
+            assert_eq!(sent + retained, 1, "one actual custody receipt: {ran}");
+            settled_native(&hub, id).await?;
             assert_eq!(crate::plans::get(&hub, &one).await?.runs, runs + 1);
             Ok(())
         })
@@ -6005,7 +6080,11 @@ mod stack_tests {
         // The goal reworded: an edit of the word waiting. Applied there, and the turn ends: the
         // harness is handed the word, edited.
         let edited = "/goal tests pass on every platform";
-        let _ = say(&port, id, Some("g1"), send(edited.into()), now + 2_000).await;
+        let (_, successor) = say(&port, id, Some("g1"), send(edited.into()), now + 2_000).await;
+        let successor = successor.ok_or_else(|| anyhow::anyhow!("no immutable successor"))?;
+        anyhow::ensure!(successor != word, "changed state reused prior body ID");
+        let baseline = port.sent.lock().len();
+        let word = successor;
         let user = Event { id: word.clone(), seq: 1, at: 1, parent: None, by: None, body: Body::User { text: edited.into(), images: 0, client_id: Some(word.clone()), origin: None, attachments: Vec::new(), reply_to: None } };
         let handed_now = [(word.as_str(), edited)];
         let handed: &[(&str, &str)] = if given { &handed_now } else { &[] };
@@ -6031,8 +6110,9 @@ mod stack_tests {
             .sent
             .lock()
             .iter()
+            .skip(baseline)
             .filter_map(|c| match c {
-                Command::Send { id: m, text, .. } if *m != word => Some(text.clone()),
+                Command::Send { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();

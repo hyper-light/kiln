@@ -1,0 +1,13 @@
+{
+  "kind": "derived from exact existing reserve_rows formula and live readonly layout; source not executed",
+  "page_size": 4096,
+  "page_count": 7158475,
+  "trees_fixture": 5,
+  "columns_fixture": 15,
+  "publication": 524288,
+  "rows": 3,
+  "required": 442753176600,
+  "live_free": 268829614080,
+  "would_refuse": true,
+  "database_bytes": 29321113600
+}

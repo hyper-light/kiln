@@ -63,7 +63,12 @@ fn w13_ac04_docker_pool_burst() -> anyhow::Result<()> {
         "[[ci.pools]]\nname = \"burst\"\nexecutor = \"docker\"\nhosts = \"executors contains docker\"\nimage = \"kiln/runner-ubuntu-24.04\"\nlabels = [\"burst\"]\nmin_idle = 2\nmax = 32\nper_host_max = 32\nidle_timeout = \"20s\"\n\n[[repos]]\nname = \"acme/burst\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n",
         repo.display()
     );
-    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
+    // W13-AC04 tests the executor lifecycle, with trusted echo jobs and no service ports.
+    // Native Linux's host network keeps the required 32 executors independent of Docker's
+    // finite default subnet pool and other tests' networks (as common::DockerNet does).
+    let network = [("KILN_CONTAINER_NETWORK", "host")];
+    let env = if cfg!(target_os = "linux") && !common::DockerNet::get().desktop { network.as_slice() } else { &[] };
+    let s = common::start_env(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra }, false, env)?;
     let (port, admin) = (s.port, s.admin.clone());
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let result = (|| -> anyhow::Result<()> {
@@ -126,7 +131,20 @@ fn w13_ac04_docker_pool_burst() -> anyhow::Result<()> {
         let legs = d.get("legs").and_then(Value::as_array).cloned().unwrap_or_default();
         anyhow::ensure!(legs.len() == 200, "200 legs, not {}", legs.len());
         let failed: Vec<&Value> = legs.iter().filter(|l| l.get("conclusion").and_then(Value::as_str) != Some("success")).collect();
-        anyhow::ensure!(failed.is_empty(), "every leg succeeds: {:?}", failed.first());
+        if !failed.is_empty() {
+            // W13-AC04: fail-fast cancels siblings of the initiating failure. The first matrix
+            // leg that isn't successful needn't be that cause; keep every outcome and the causes'
+            // failure excerpts while this test's server still has their logs.
+            let mut excerpts = Vec::new();
+            for leg in failed.iter().filter(|l| l.get("conclusion").and_then(Value::as_str) != Some("cancelled")).take(4) {
+                let id = leg.get("id").and_then(Value::as_str).unwrap_or_default();
+                match common::http(port, "GET", &format!("/api/ci/legs/{id}/logs/failure?lines=80"), &admin, None) {
+                    Ok((status, body)) => excerpts.push(format!("{id}: {status} {body}")),
+                    Err(e) => excerpts.push(format!("{id}: couldn't read its failure: {e:#}")),
+                }
+            }
+            anyhow::bail!("every leg succeeds; all non-successes: {failed:?}\nfailure excerpts:\n{}\nserver:\n{}", excerpts.join("\n"), s.log());
+        }
         anyhow::ensure!(run.get("conclusion").and_then(Value::as_str) == Some("success"), "{run}");
         anyhow::ensure!(peak == 32, "the executors scale to max: peak {peak}");
         // Each leg ran in a pool executor of its own.

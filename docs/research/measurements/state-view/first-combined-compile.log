@@ -1,0 +1,369 @@
+   Compiling tree-sitter v0.26.10 (/private/tmp/kiln-offline-fix-20261110/vendor/vorpal/vendor/tree-sitter)
+   Compiling turso_ext v0.9.0-pre.1 (/private/tmp/kiln-offline-fix-20261110/vendor/turso/extensions/core)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+   Compiling kiln-cd v0.2.0 (/private/tmp/kiln-offline-fix-20261110/crates/kiln-cd)
+   Compiling vorpal-core v0.10.2 (/private/tmp/kiln-offline-fix-20261110/vendor/vorpal/crates/core)
+   Compiling turso_core v0.9.0-pre.1 (/private/tmp/kiln-offline-fix-20261110/vendor/turso/core)
+   Compiling vorpal-config v0.10.2 (/private/tmp/kiln-offline-fix-20261110/vendor/vorpal/crates/config)
+   Compiling vorpal-outline v0.10.2 (/private/tmp/kiln-offline-fix-20261110/vendor/vorpal/crates/outline)
+   Compiling vorpal-language v0.10.2 (/private/tmp/kiln-offline-fix-20261110/vendor/vorpal/crates/language)
+   Compiling vorpal-kg v0.10.2 (/private/tmp/kiln-offline-fix-20261110/vendor/vorpal/crates/kg)
+   Compiling kiln-search v0.2.0 (/private/tmp/kiln-offline-fix-20261110/crates/kiln-search)
+   Compiling kiln-ci v0.2.0 (/private/tmp/kiln-offline-fix-20261110/crates/kiln-ci)
+   Compiling kiln v0.2.0 (/private/tmp/kiln-offline-fix-20261110/crates/kiln)
+error[E0063]: missing fields `deferred`, `queue_next`, `queue_partial` and 1 other field in initializer of `harness::session::Info`
+    --> crates/kiln/src/harness/registry.rs:3976:32
+     |
+3976 |                     let info = Info {
+     |                                ^^^^ missing `deferred`, `queue_next`, `queue_partial` and 1 other field
+
+error[E0063]: missing fields `deferred`, `queue_next`, `queue_partial` and 1 other field in initializer of `harness::session::Info`
+    --> crates/kiln/src/harness/host.rs:2893:16
+     |
+2893 |     let info = Info {
+     |                ^^^^ missing `deferred`, `queue_next`, `queue_partial` and 1 other field
+
+error[E0277]: `#[ts(optional)]` can only be used on fields of type `Option`
+   --> crates/kiln/src/harness/session.rs:287:19
+    |
+287 |     pub deferred: std::collections::BTreeMap<String, super::state_view::Descriptor>,
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `#[ts(optional)]` is not allowed on field of type std::collections::BTreeMap<std::string::String, state_view::Descriptor>
+    |
+    = help: the trait `ts_rs::IsOption` is not implemented for `std::collections::BTreeMap<std::string::String, state_view::Descriptor>`
+    = note: `#[ts(optional)]` was used on a field of type std::collections::BTreeMap<std::string::String, state_view::Descriptor>, which is not permitted
+help: the trait `ts_rs::IsOption` is implemented for `std::option::Option<T>`
+   --> /Users/adalundhe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ts-rs-12.0.1/src/lib.rs:721:1
+    |
+721 | impl<T> IsOption for Option<T> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+    --> crates/kiln/src/harness/session.rs:1320:16
+     |
+1320 |     core.reply(&client, value);
+     |          ----- ^^^^^^^ expected `String`, found `&String`
+     |          |
+     |          arguments to this method are incorrect
+     |
+note: method defined here
+    --> crates/kiln/src/harness/core.rs:1300:12
+     |
+1300 |     pub fn reply(&mut self, client: String, value: serde_json::Value) {
+     |            ^^^^^            --------------
+help: consider removing the borrow
+     |
+1320 -     core.reply(&client, value);
+1320 +     core.reply(client, value);
+     |
+
+error[E0308]: mismatched types
+    --> crates/kiln/src/harness/session.rs:1339:24
+     |
+1339 |             core.reply(&client, serde_json::json!({"result":{"type":"applied", "revision":revision}}));
+     |                  ----- ^^^^^^^ expected `String`, found `&String`
+     |                  |
+     |                  arguments to this method are incorrect
+     |
+note: method defined here
+    --> crates/kiln/src/harness/core.rs:1300:12
+     |
+1300 |     pub fn reply(&mut self, client: String, value: serde_json::Value) {
+     |            ^^^^^            --------------
+help: consider removing the borrow
+     |
+1339 -             core.reply(&client, serde_json::json!({"result":{"type":"applied", "revision":revision}}));
+1339 +             core.reply(client, serde_json::json!({"result":{"type":"applied", "revision":revision}}));
+     |
+
+error[E0308]: mismatched types
+    --> crates/kiln/src/harness/session.rs:1341:33
+     |
+1341 |         Err(code) => core.reply(&client, serde_json::json!({"error":{"code":code}})),
+     |                           ----- ^^^^^^^ expected `String`, found `&String`
+     |                           |
+     |                           arguments to this method are incorrect
+     |
+note: method defined here
+    --> crates/kiln/src/harness/core.rs:1300:12
+     |
+1300 |     pub fn reply(&mut self, client: String, value: serde_json::Value) {
+     |            ^^^^^            --------------
+help: consider removing the borrow
+     |
+1341 -         Err(code) => core.reply(&client, serde_json::json!({"error":{"code":code}})),
+1341 +         Err(code) => core.reply(client, serde_json::json!({"error":{"code":code}})),
+     |
+
+error[E0063]: missing fields `deferred`, `queue_next`, `queue_partial` and 1 other field in initializer of `harness::session::Info`
+    --> crates/kiln/src/harness/session.rs:5703:21
+     |
+5703 |         let mut i = Info {
+     |                     ^^^^ missing `deferred`, `queue_next`, `queue_partial` and 1 other field
+
+error[E0004]: non-exhaustive patterns: `harness::model::Command::StateRead { .. }` and `harness::model::Command::AtState { .. }` not covered
+    --> crates/kiln/src/harness/acp.rs:478:15
+     |
+ 478 |         match cmd {
+     |               ^^^ patterns `harness::model::Command::StateRead { .. }` and `harness::model::Command::AtState { .. }` not covered
+     |
+note: `harness::model::Command` defined here
+    --> crates/kiln/src/harness/model.rs:2073:10
+     |
+2073 | pub enum Command {
+     |          ^^^^^^^
+...
+2236 |     StateRead {
+     |     --------- not covered
+...
+2241 |     AtState {
+     |     ------- not covered
+     = note: the matched value is of type `harness::model::Command`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+ 575 ~             Command::McpRefresh | Command::SkillsReload => {},
+ 576 +             harness::model::Command::StateRead { .. } | harness::model::Command::AtState { .. } => todo!()
+     |
+
+error[E0004]: non-exhaustive patterns: `harness::model::Command::StateRead { .. }` and `harness::model::Command::AtState { .. }` not covered
+    --> crates/kiln/src/harness/antigravity.rs:246:15
+     |
+ 246 |         match cmd {
+     |               ^^^ patterns `harness::model::Command::StateRead { .. }` and `harness::model::Command::AtState { .. }` not covered
+     |
+note: `harness::model::Command` defined here
+    --> crates/kiln/src/harness/model.rs:2073:10
+     |
+2073 | pub enum Command {
+     |          ^^^^^^^
+...
+2236 |     StateRead {
+     |     --------- not covered
+...
+2241 |     AtState {
+     |     ------- not covered
+     = note: the matched value is of type `harness::model::Command`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+ 354 ~             Command::McpRefresh | Command::SkillsReload => {},
+ 355 +             harness::model::Command::StateRead { .. } | harness::model::Command::AtState { .. } => todo!()
+     |
+
+error[E0004]: non-exhaustive patterns: `&harness::model::Command::StateRead { .. }` and `&harness::model::Command::AtState { .. }` not covered
+    --> crates/kiln/src/harness/attention_hooks.rs:14:11
+     |
+  14 |     match command {
+     |           ^^^^^^^ patterns `&harness::model::Command::StateRead { .. }` and `&harness::model::Command::AtState { .. }` not covered
+     |
+note: `harness::model::Command` defined here
+    --> crates/kiln/src/harness/model.rs:2073:10
+     |
+2073 | pub enum Command {
+     |          ^^^^^^^
+...
+2236 |     StateRead {
+     |     --------- not covered
+...
+2241 |     AtState {
+     |     ------- not covered
+     = note: the matched value is of type `&harness::model::Command`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+  28 ~         Command::Moving { .. } | Command::HandedOver { .. } | Command::LimitHold { .. } => None,
+  29 ~         &harness::model::Command::StateRead { .. } | &harness::model::Command::AtState { .. } => todo!(),
+     |
+
+error[E0004]: non-exhaustive patterns: `harness::model::Command::StateRead { .. }` and `harness::model::Command::AtState { .. }` not covered
+    --> crates/kiln/src/harness/claude.rs:764:15
+     |
+ 764 |         match cmd {
+     |               ^^^ patterns `harness::model::Command::StateRead { .. }` and `harness::model::Command::AtState { .. }` not covered
+     |
+note: `harness::model::Command` defined here
+    --> crates/kiln/src/harness/model.rs:2073:10
+     |
+2073 | pub enum Command {
+     |          ^^^^^^^
+...
+2236 |     StateRead {
+     |     --------- not covered
+...
+2241 |     AtState {
+     |     ------- not covered
+     = note: the matched value is of type `harness::model::Command`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+ 915 ~             Command::SkillsReload => self.request(core, Pending::ReloadSkills, json!({"subtype": "reload_skills"})),
+ 916 ~             harness::model::Command::StateRead { .. } | harness::model::Command::AtState { .. } => todo!(),
+     |
+
+error[E0004]: non-exhaustive patterns: `harness::model::Command::StateRead { .. }` and `harness::model::Command::AtState { .. }` not covered
+    --> crates/kiln/src/harness/codex.rs:1453:15
+     |
+1453 |         match cmd {
+     |               ^^^ patterns `harness::model::Command::StateRead { .. }` and `harness::model::Command::AtState { .. }` not covered
+     |
+note: `harness::model::Command` defined here
+    --> crates/kiln/src/harness/model.rs:2073:10
+     |
+2073 | pub enum Command {
+     |          ^^^^^^^
+...
+2236 |     StateRead {
+     |     --------- not covered
+...
+2241 |     AtState {
+     |     ------- not covered
+     = note: the matched value is of type `harness::model::Command`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+1673 ~             },
+1674 +             harness::model::Command::StateRead { .. } | harness::model::Command::AtState { .. } => todo!()
+     |
+
+error[E0004]: non-exhaustive patterns: `&harness::model::Command::StateRead { .. }` and `&harness::model::Command::AtState { .. }` not covered
+    --> crates/kiln/src/wire/mod.rs:141:19
+     |
+ 141 |               match m {
+     |                     ^ patterns `&harness::model::Command::StateRead { .. }` and `&harness::model::Command::AtState { .. }` not covered
+...
+ 330 | / classes! {
+ 331 | |     /// A person's (or kiln's own) commands to an agent session: the UI's socket, the API, kiln's
+ 332 | |     /// MCP operations, carried to its machine in [`ServerMsg::HarnessCmd`]. Whether one waits for a
+ 333 | |     /// machine that's away is its own to say, not `HarnessCmd`'s.
+...    |
+ 378 | | }
+     | |_- in this macro invocation
+     |
+note: `harness::model::Command` defined here
+    --> crates/kiln/src/harness/model.rs:2073:10
+     |
+2073 | pub enum Command {
+     |          ^^^^^^^
+...
+2236 |     StateRead {
+     |     --------- not covered
+...
+2241 |     AtState {
+     |     ------- not covered
+     = note: the matched value is of type `&harness::model::Command`
+     = note: this error originates in the macro `classes` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+ 142 |                 $($p => $c, &harness::model::Command::StateRead { .. } | &harness::model::Command::AtState { .. } => todo!(),)+
+     |                           ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0004]: non-exhaustive patterns: `&harness::model::Command::StateRead { .. }` and `&harness::model::Command::AtState { .. }` not covered
+    --> crates/kiln/src/wire/mod.rs:149:19
+     |
+ 149 |               match m {
+     |                     ^ patterns `&harness::model::Command::StateRead { .. }` and `&harness::model::Command::AtState { .. }` not covered
+...
+ 330 | / classes! {
+ 331 | |     /// A person's (or kiln's own) commands to an agent session: the UI's socket, the API, kiln's
+ 332 | |     /// MCP operations, carried to its machine in [`ServerMsg::HarnessCmd`]. Whether one waits for a
+ 333 | |     /// machine that's away is its own to say, not `HarnessCmd`'s.
+...    |
+ 378 | | }
+     | |_- in this macro invocation
+     |
+note: `harness::model::Command` defined here
+    --> crates/kiln/src/harness/model.rs:2073:10
+     |
+2073 | pub enum Command {
+     |          ^^^^^^^
+...
+2236 |     StateRead {
+     |     --------- not covered
+...
+2241 |     AtState {
+     |     ------- not covered
+     = note: the matched value is of type `&harness::model::Command`
+     = note: this error originates in the macro `classes` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+ 150 |                 $($p => variant(stringify!($p)), &harness::model::Command::StateRead { .. } | &harness::model::Command::AtState { .. } => todo!(),)+
+     |                                                ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Some errors have detailed explanations: E0004, E0063, E0277, E0308.
+For more information about an error, try `rustc --explain E0004`.
+error: could not compile `kiln` (lib test) due to 16 previous errors
+      170.71 real       187.38 user        10.38 sys
+         14217101312  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             2289802  page reclaims
+               33401  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                 497  messages sent
+                 240  messages received
+                  12  signals received
+               18302  voluntary context switches
+              273102  involuntary context switches
+          4485578396  instructions retired
+          2072293804  cycles elapsed
+           108855992  peak memory footprint
+

@@ -1,0 +1,21 @@
+{
+  "capture": "/private/tmp/kiln-queue-prevention-20261111/docs/research/measurements/queue-prevention/check-1794404028984981000",
+  "binary": "/Users/adalundhe/.cache/kiln-queue-prevention-tests-20261111/check-1794404028984981000/kiln-tests",
+  "binary_sha256": "1fb3206d0230bc9fce4574b3607030cbcc1efccad17e37e8be014df365ca974a",
+  "selected": [
+    "agent::native_handover_tests::a_native_journal_registers_its_one_epoch_receipt_before_the_first_open_ask",
+    "agent::native_handover_tests::a_wrong_key_or_uninstalled_identity_cannot_complete_a_legacy_promotion",
+    "harness::admission::tests::legacy_epoch_promotion_preserves_debt_and_retry_authority_until_real_completion",
+    "harness::admission::tests::legacy_epoch_promotion_refuses_tokens_and_does_not_clear_unavailable",
+    "harness::host::tests::legacy_reconciliation_retries_before_epoch_activation_after_original_only_budget",
+    "harness::inbox::promotion::tests::applied_then_error_and_cancelled_head_read_keep_the_promotion_wake",
+    "harness::inbox::promotion::tests::legacy_epoch_rebind_refuses_token_or_stale_rows_without_mutation",
+    "harness::inbox::promotion::tests::partial_legacy_epoch_rebind_reopens_without_changing_originals_or_debt",
+    "harness::session::tests::early_legacy_effect_waits_for_its_original_without_poisoning_readiness",
+    "harness::session::tests::legacy_promotion_does_not_advance_past_uncommitted_input_effects",
+    "harness::session::tests::partial_legacy_rebinding_retains_completion_until_epochs_match_and_retires_its_flight",
+    "runner::identity::tests::g9_s3_a_certificate_is_written_with_no_lock_held",
+    "runner::identity::tests::w27_r02_a_key_stays_here_signs_and_goes",
+    "runner::identity::tests::w27_r05_a_key_is_awaited_from_its_ask_until_kiln_answers_it"
+  ]
+}

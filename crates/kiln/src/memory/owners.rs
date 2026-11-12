@@ -31,6 +31,10 @@ pub static SESSION_INBOXES: Owner = Owner::new("session_inboxes");
 /// control: nothing is dropped.
 pub static SESSION_PACKING: Owner = Owner::new("session_packing");
 
+/// Source inputs reserved through provider acceptance. Every host shares one strict pool among
+/// its sessions, sized on resource events by `memory::room`; pending custody is never evicted.
+pub static HARNESS_INPUT: Owner = Owner::new("harness_input");
+
 /// The server's own sessions' updates waiting for the loop that hands them to their owners
 /// (`crate::harness::registry`'s `local_rx`): at most [`crate::net::EVENTS_BYTES`], as much as the owner's
 /// inbox they go to next. At the bound a session waits to send.
@@ -226,7 +230,7 @@ pub static CHANNELS: Owner = Owner::new("channels");
 /// and said as the thread next writes: a shard that logs never waits for the log's reader.
 pub static LOG_LINES: Owner = Owner::new("log_lines");
 
-pub(super) const ALL: [&Owner; 28] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &SESSION_PACKING, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &CUSTODY_RECORDS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
+pub(super) const ALL: [&Owner; 29] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &SESSION_PACKING, &HARNESS_INPUT, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &CUSTODY_RECORDS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
 
 #[cfg(test)]
 mod tests {

@@ -387,14 +387,15 @@ pub async fn may_steer(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Re
 pub enum Reach {
     /// A person, the agent itself, or an agent it started (and theirs): in any mode, as its own.
     Own,
-    /// Another agent that works for the same person: queued, its receiver told who sent it.
+    /// Another agent that works for the same person: steered or queued, its receiver told who sent it.
     Peer,
 }
 
 /// Whether `caller` may send agent `id` a message (docs/agents.md, "Messages between agents"): a
 /// person the agents they act on ([`access`]); an agent itself and the agents it started in any
-/// mode, as [`may_steer`] has it, and any other agent that works for the same person, as a queued
-/// message from it. Agents that work for someone else, or for someone kiln can't name, aren't sent to.
+/// mode, as [`may_steer`] has it, and any other agent that works for the same person, as a steered
+/// or queued message from it. Agents that work for someone else, or for someone kiln can't name,
+/// aren't sent to.
 pub async fn may_message(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<Reach, Refused> {
     let Some(me) = caller.agent.as_deref() else {
         return if access(hub, caller, id).await == Access::Act { Ok(Reach::Own) } else { Err(unseen()) };
@@ -1214,6 +1215,8 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
             super::wait::sent(&i.id, None);
         }
     }
+    // Whose they are says which installed skills they have (docs/agents.md, "Skills kiln installs").
+    crate::api::boxed(|| crate::skills::sync(hub)).await;
     let parent = by.parent.as_ref().map_or_else(String::new, |p| format!(" for {} ({})", p.name, short(&p.id)));
     hub.store.audit(by.actor.clone(), "agent.open".into(), format!("{} {what} on {target}{parent}", infos.len())).await;
     Ok(infos)

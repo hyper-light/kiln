@@ -62,14 +62,26 @@ impl std::fmt::Display for NotHanded {
 /// The server's word on a hand-over.
 type Word = Result<(), NotHanded>;
 
+#[derive(Clone, Hash, PartialEq, Eq)]
+enum Waiting { Session(String), Mail(String) }
+
+enum Answer { Word(Word), Mail(super::mail::TransferDown) }
+
+struct MailWait(String);
+impl Drop for MailWait { fn drop(&mut self) { transfer_done(&self.0); } }
+
 /// This runner's link to the server, and the hand-overs under way, each waiting for its word: on
 /// lock-free queues (`crate::memory::queue`; goal 5, plan 01a1a59c2aae), whose waits take no lock.
 struct Relay {
     up: Mutex<Option<crate::memory::queue::Sender<Up>>>,
-    waiting: Mutex<HashMap<String, (crate::memory::queue::Sender<Word>, crate::memory::queue::Receiver<Word>)>>,
+    waiting: Mutex<HashMap<Waiting, (crate::memory::queue::Sender<Answer>, crate::memory::queue::Receiver<Answer>)>>,
+    mail: std::sync::atomic::AtomicBool,
 }
 
-static RELAY: LazyLock<Relay> = LazyLock::new(|| Relay { up: Mutex::new(None), waiting: Mutex::new(HashMap::new()) });
+static RELAY: LazyLock<Relay> = LazyLock::new(|| Relay { up: Mutex::new(None), waiting: Mutex::new(HashMap::new()), mail: std::sync::atomic::AtomicBool::new(false) });
+
+pub fn mail_supported(on: bool) { RELAY.mail.store(on, std::sync::atomic::Ordering::Release); }
+pub fn takes_mail() -> bool { RELAY.mail.load(std::sync::atomic::Ordering::Acquire) }
 
 /// This runner's link to the server, set as it starts.
 pub fn install(up: crate::memory::queue::Sender<Up>) {
@@ -88,8 +100,8 @@ pub fn install(up: crate::memory::queue::Sender<Up>) {
 #[allow(clippy::disallowed_methods)] // (e) a hand-over's answer waited for ANSWER_WITHIN: an operation's deadline
 pub async fn send(id: &str, bytes: &[u8]) -> Word {
     let Some(up) = RELAY.up.lock().clone() else { return Err(NotHanded::NotPassed("this runner has no link to the server".to_owned())) };
-    let rx = RELAY.waiting.lock().entry(id.to_owned()).or_insert_with(|| crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS)).1.clone();
-    if let Ok(word) = rx.try_recv() {
+    let rx = RELAY.waiting.lock().entry(Waiting::Session(id.to_owned())).or_insert_with(|| crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS)).1.clone();
+    if let Ok(Answer::Word(word)) = rx.try_recv() {
         return word;
     }
     let pieces: Vec<&[u8]> = bytes.chunks(PIECE).collect();
@@ -103,7 +115,7 @@ pub async fn send(id: &str, bytes: &[u8]) -> Word {
         offset += piece.len() as u64;
     }
     futures::select! {
-        w = rx.recv().fuse() => w.unwrap_or_else(|_| Err(NotHanded::Unknown("its hand-over was ended here".into()))),
+        w = rx.recv().fuse() => match w { Ok(Answer::Word(word)) => word, _ => Err(NotHanded::Unknown("its hand-over was ended here".into())) },
         () = crate::rt::sleep(ANSWER_WITHIN).fuse() => Err(NotHanded::Unknown(format!("the server said nothing of it in {} minutes", ANSWER_WITHIN.as_secs() / 60))),
     }
 }
@@ -111,31 +123,81 @@ pub async fn send(id: &str, bytes: &[u8]) -> Word {
 /// Session `id`'s hand-over is over (its word known, or the session gone): nothing waits for its
 /// word any more.
 pub fn done(id: &str) {
-    RELAY.waiting.lock().remove(id);
+    RELAY.waiting.lock().remove(&Waiting::Session(id.to_owned()));
 }
 
 /// The server's word on session `id`'s hand-over (`Command::HandedOver`: `error`, and whether the
 /// newer process said it, `by_newest`, or the server can't say, `unsure`): whether a hand-over was
 /// waiting for it.
 pub fn answered(id: &str, error: Option<String>, unsure: bool, by_newest: bool) -> bool {
-    let Some(tx) = RELAY.waiting.lock().get(id).map(|(tx, _)| tx.clone()) else { return false };
+    let Some(tx) = RELAY.waiting.lock().get(&Waiting::Session(id.to_owned())).map(|(tx, _)| tx.clone()) else { return false };
     let word = match error {
         None => Ok(()),
         Some(why) if by_newest => Err(NotHanded::Refused(why)),
         Some(why) if unsure => Err(NotHanded::Unknown(why)),
         Some(why) => Err(NotHanded::NotPassed(why)),
     };
-    tx.try_send(word).is_ok()
+    tx.try_send(Answer::Word(word)).is_ok()
 }
 
 /// The link to the server dropped: no word comes now for what was on its way. Each waits on (the
 /// server's word, parked, comes once the link is back) and is asked again.
 pub fn link_lost() {
-    let waiting: Vec<_> = RELAY.waiting.lock().values().map(|(tx, _)| tx.clone()).collect();
+    let waiting: Vec<_> = RELAY.waiting.lock().iter().filter(|(key, _)| matches!(key, Waiting::Session(_))).map(|(_, (tx, _))| tx.clone()).collect();
     for tx in waiting {
-        let _ = tx.try_send(Err(NotHanded::Unknown("this runner's link to the server dropped".into())));
+        let _ = tx.try_send(Answer::Word(Err(NotHanded::Unknown("this runner's link to the server dropped".into()))));
     }
 }
+
+/// The same handover owner carries the feature-gated mail ownership phases on Control. The
+/// durable Inbox metadata is written before this call; reconnect replays that metadata, not a
+/// timer query. A missing/closed link cannot mean an authoritative abort.
+pub async fn post_transfer(event: &super::mail::TransferUp) -> Result<(), String> {
+    if !takes_mail() { return Err("the server has not negotiated durable mail transfer; the original owner retains custody".into()); }
+    let up = RELAY.up.lock().clone().ok_or_else(|| "the mail transfer has no server link; ownership remains pending".to_owned())?;
+    if super::inbox::transfer::encoded_len(event).map_err(|_| "mail transfer control metadata could not be counted".to_owned())? > super::state_view::FRAME as u64 {
+        return Err("mail transfer control metadata exceeds the existing frame bound".into());
+    }
+    let json = serde_json::to_string(event).map_err(|_| "mail transfer control metadata could not be encoded".to_owned())?;
+    up.send(Up::Msg(AgentMsg::HarnessMailTransfer { json })).await.map_err(|_| "the mail transfer server link closed; ownership remains pending".to_owned())
+}
+
+pub async fn transfer(event: &super::mail::TransferUp) -> Result<super::mail::TransferDown, String> {
+    use super::mail::{TransferDown, TransferUp};
+    let manifest = match event { TransferUp::Offer { manifest, .. } | TransferUp::Ready { manifest } | TransferUp::Adopt { manifest } | TransferUp::Abort { manifest } => manifest };
+    let rx = {
+        let mut waiting = RELAY.waiting.lock();
+        let key = Waiting::Mail(manifest.attempt.clone());
+        if waiting.contains_key(&key) { return Err("this mail transfer already has a phase operation waiting".into()); }
+        let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        waiting.insert(key, (tx, rx.clone()));
+        rx
+    };
+    let _wait = MailWait(manifest.attempt.clone());
+    post_transfer(event).await?;
+    loop {
+        let answer = rx.recv().await.map_err(|_| "the mail transfer operation ended without authoritative ownership".to_owned())?;
+        let Answer::Mail(answer) = answer else { return Err("the mail transfer received an unrelated handover answer".into()) };
+        let agrees = match &answer {
+            TransferDown::Offered { manifest: actual, .. } | TransferDown::Committed { manifest: actual } | TransferDown::Aborted { manifest: actual } => actual == manifest,
+            TransferDown::Refused { attempt, .. } => attempt == &manifest.attempt,
+        };
+        if !agrees { return Err("the mail transfer answer names a different immutable manifest".into()); }
+        if matches!(event, TransferUp::Offer { .. }) || !matches!(answer, TransferDown::Offered { .. }) { return Ok(answer); }
+    }
+}
+
+pub fn transfer_answer(answer: super::mail::TransferDown) -> bool {
+    use super::mail::TransferDown;
+    let attempt = match &answer {
+        TransferDown::Offered { manifest, .. } | TransferDown::Committed { manifest } | TransferDown::Aborted { manifest } => &manifest.attempt,
+        TransferDown::Refused { attempt, .. } => attempt,
+    };
+    let Some(tx) = RELAY.waiting.lock().get(&Waiting::Mail(attempt.clone())).map(|(tx, _)| tx.clone()) else { return false };
+    tx.try_send(Answer::Mail(answer)).is_ok()
+}
+
+pub fn transfer_done(attempt: &str) { RELAY.waiting.lock().remove(&Waiting::Mail(attempt.to_owned())); }
 
 /// This runner's link to the server dropped (`crate::agent::run`): [`link_lost`], but for a runner a
 /// test starts in this process while another test holds the link, which is that test's alone.
@@ -234,7 +296,7 @@ mod tests {
             // once the link is back (between two tries, here) answers its next try at once.
             let dropped = crate::rt::spawn(async move { send("s4", &[1]).await });
             let _ = rx.recv().await?;
-            while !RELAY.waiting.lock().contains_key("s4") {
+            while !RELAY.waiting.lock().contains_key(&Waiting::Session("s4".into())) {
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
             link_lost();

@@ -3468,6 +3468,7 @@ impl Dispatch {
         let wf = &spec.workflow;
         let job = spec.def();
         let id_tokens = spec.permissions.level("id-token") == kiln_ci::plan::perms::Level::Write && (r.trusted || self.hub.cfg.ci.oidc.untrusted);
+        let gpu_request = request_of(job, &self.hub.cfg.ci);
         let num = |k: &str| spec.strategy.get(k).and_then(serde_json::Value::as_f64).map_or(0, |v| v as u32);
         let mut env_from = spec.env_from.clone();
         env_from.extend(spec.run_env.iter().map(|(k, v)| (format!("KILN_RUN_{k}"), v.clone())));
@@ -3479,7 +3480,7 @@ impl Dispatch {
             sha: r.event.sha.clone(),
             git_ref: r.event.git_ref.clone(),
             dialect: if wf.dialect == Some(kiln_ci::expr::Dialect::Kiln) { "kiln".into() } else { "gha".into() },
-            leg: wire::LegInfo { job_id: spec.job.clone(), name: spec.name.clone(), matrix: spec.matrix.clone(), index: num("job-index"), total: num("job-total") },
+            leg: wire::LegInfo { job_id: spec.job.clone(), name: spec.name.clone(), matrix: spec.matrix.clone(), index: num("job-index"), total: num("job-total"), requires: if gpu_request.gpu > 0 { spec.requires.clone() } else { Vec::new() } },
             // The image for container and microVM executors (W13-R04, R05).
             executor: wire::ExecutorSpec {
                 image: if matches!(executor.as_deref(), Some("docker" | "firecracker")) { image } else { None },
@@ -3574,6 +3575,7 @@ impl Dispatch {
             // Exclusive, it has its runner to itself: the share it asked for, or the whole runner.
             exclusive: job.is_some_and(|j| j.kiln.exclusive),
             holds: job.filter(|j| j.kiln.exclusive).and_then(|j| asked_of(Some(j))).filter(|q| !q.cpu.is_zero()),
+            request: (gpu_request.gpu > 0).then_some(gpu_request),
             // Its grant, as its assignment gives it (W05-R34).
             fence: None,
             lease_ms: None,
@@ -3934,6 +3936,22 @@ impl Dispatch {
 
     /// Rebuilds unfinished runs by replaying their plans' logs (W05-R25); legs that were running
     /// wait for their runner to say it still has them.
+    /// W05-AC09: publish recovered explanations together before any following action
+    /// can assign, settle or otherwise change those legs.
+    async fn restore_waits(&self, waits: &mut Vec<(String, serde_json::Value)>) {
+        let batch = std::mem::take(waits);
+        if batch.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
+        if let Err(e) = runs::wait_reasons(&self.hub, batch).await {
+            tracing::warn!(legs = ids.len(), error = %format!("{e:#}"), "recovered wait reasons could not be kept");
+        }
+        for id in ids {
+            self.hub.emit_job(&id).await;
+        }
+    }
+
     async fn restore(&mut self) -> anyhow::Result<()> {
         let rows: Vec<(String, String, String)> = self.hub.store.call(|c| {
             let mut st = c.prepare("SELECT p.run_id, p.workflow, p.input FROM ci_plans p WHERE p.done = 0")?;
@@ -4017,15 +4035,15 @@ impl Dispatch {
         }
         // The legs as the store has them.
         let run_owned = run.to_owned();
-        type Row = (String, String, String, Option<String>, u32, Option<String>, Option<String>, Option<String>, Fence);
+        type Row = (String, String, String, Option<String>, u32, Option<String>, Option<String>, Option<String>, Fence, Option<String>, Option<String>);
         let rows: Vec<Row> = self.hub.store.call(move |c| {
-            let mut st = c.prepare("SELECT id, key, status, agent, attempt, leg, conclusion, outputs, grant_epoch, grant_n FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1)")?;
+            let mut st = c.prepare("SELECT id, key, status, agent, attempt, leg, conclusion, outputs, grant_epoch, grant_n, input_hash, wait_reason FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1)")?;
             // Its grant's fence (W05-R34), none from an older build's claim.
             let fence = |e: Option<i64>, n: Option<i64>| match (e.and_then(|e| u64::try_from(e).ok()), n.and_then(|n| u64::try_from(n).ok())) {
                 (Some(epoch), Some(n)) => Fence { epoch, n },
                 _ => Fence::default(),
             };
-            Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, fence(r.get(8)?, r.get(9)?))))?.collect::<Result<Vec<_>, _>>()?)
+            Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, fence(r.get(8)?, r.get(9)?), r.get(10)?, r.get(11)?)))?.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
         // Legs that ended before their report reached the log (the server stopped in between):
@@ -4039,7 +4057,8 @@ impl Dispatch {
                 (r.1.clone(), LegReport { conclusion: Some(conclusion_of(r.6.as_deref())), outputs, ..LegReport::default() })
             })
             .collect();
-        let legs: Vec<(String, String, String, Option<String>, u32, Option<String>, Fence)> = rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5, r.8)).collect();
+        let mut previous_waits: HashMap<String, serde_json::Value> = rows.iter().filter_map(|r| r.10.as_deref().and_then(|v| serde_json::from_str(v).ok()).map(|v| (r.0.clone(), v))).collect();
+        let legs: Vec<(String, String, String, Option<String>, u32, Option<String>, Fence, Option<String>)> = rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5, r.8, r.9)).collect();
         // Those a person paused (W26-R22): they come back paused, and their tokens live the while
         // they were paused longer.
         let run_owned = run.to_owned();
@@ -4090,7 +4109,8 @@ impl Dispatch {
         let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, dependencies, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), culprit, placed };
         st.who = who_of(&self.hub, &st).await;
         let mut queued = Vec::new();
-        for (id, key, status, agent, attempt, leg, fence) in legs {
+        let mut owned = Vec::with_capacity(legs.len());
+        for (id, key, status, agent, attempt, leg, fence, input_hash) in legs {
             st.keys.insert(key.clone(), id.clone());
             let s = Status::parse(&status);
             if s.is_terminal() {
@@ -4105,7 +4125,12 @@ impl Dispatch {
                     rebuild_spec(&wf, &v)
                 }
             };
-            self.hub.ci.own_legs([id.as_str()]);
+            // W05-AC09: publishing one id copies the ownership set. Keep running grants
+            // visible before taking them back, and publish the queued ids together below.
+            if s == Status::Running && agent.is_some() {
+                self.hub.ci.own_legs([id.as_str()]);
+            }
+            owned.push(id.clone());
             self.legs.insert(
                 id.clone(),
                 LegSt {
@@ -4126,8 +4151,9 @@ impl Dispatch {
             let mut li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
             crate::offers::ci_leg(&self.hub, &li);
             li.paused = paused.contains(&id);
-            // Its work again, from the input hash it was queued with (W28-R46, W05-R25).
-            li.work = work_of(&st, &spec, super::reuse::hash_of(&self.hub, &id).await.ok().flatten());
+            // W05-AC09, W28-R46: restore its queued input hash with its row, avoiding one
+            // database round trip per leg while keeping the same adoption key.
+            li.work = work_of(&st, &spec, input_hash);
             li.finish_within = st.sup.as_ref().map(|s| s.finish_within);
             // Queued again at the attempt the store has (W05-R25): one that ended isn't granted again.
             li.attempt = attempt.max(1);
@@ -4151,6 +4177,7 @@ impl Dispatch {
                 _ => queued.push(li),
             }
         }
+        self.hub.ci.own_legs(owned.iter().map(String::as_str));
         self.hub.ci.own_run(run);
         let waits = st.awaiting.is_some();
         self.runs.insert(run.to_owned(), st);
@@ -4162,9 +4189,11 @@ impl Dispatch {
         // started already.
         let cmds: Vec<Command> = self.run_queued(run, None, Arrival::Restore).into_iter().filter(|c| !matches!(c, Command::StartRun { .. })).collect();
         Box::pin(self.commands(cmds)).await;
+        let mut waits = Vec::new();
         for li in queued {
             // Held for its environment before the restart: held again, its wait counted from then.
             if let Some(env) = self.legs.get(&li.id).and_then(|l| l.spec.environment.as_ref()).map(|e| e.name.clone()).filter(|n| !n.is_empty()) {
+                self.restore_waits(&mut waits).await;
                 let id = li.id.clone();
                 let ready_at = runs::queued_at(&self.hub, &id).await.unwrap_or_else(|_| crate::util::now_unix());
                 // Announced before the server stopped, or not: once more at worst.
@@ -4174,9 +4203,37 @@ impl Dispatch {
                 }
                 continue;
             }
+            let id = li.id.clone();
+            let previous = previous_waits.remove(&id);
             let cmds = self.sched.handle(Input::LegQueued(Box::new(li)), now_ms());
-            Box::pin(self.commands(cmds)).await;
+            // W05-AC09, W05-R13: only independent waits and timers commute here. Keep
+            // identical waits as they are; batch changed ones. All other actions first flush
+            // those waits, and capability waits retain the locked-job message path.
+            if cmds.iter().filter(|c| matches!(c, Command::Wait { .. })).count() == 1
+                && cmds.iter().all(|c| matches!(c, Command::Timer { .. }) || matches!(c, Command::Wait { leg, reason } if leg == &id && !matches!(reason, kiln_ci::sched::WaitReason::Capability { .. })))
+            {
+                for c in cmds {
+                    crate::offers::ci(&self.hub, &c);
+                    match c {
+                        Command::Wait { leg, reason } => {
+                            let value = serde_json::to_value(reason).unwrap_or_default();
+                            if previous.as_ref() != Some(&value) {
+                                waits.push((leg, value));
+                            }
+                        }
+                        Command::Timer { at } => { self.timers.insert(at); }
+                        other => {
+                            self.restore_waits(&mut waits).await;
+                            Box::pin(self.commands(vec![other])).await;
+                        }
+                    }
+                }
+            } else {
+                self.restore_waits(&mut waits).await;
+                Box::pin(self.commands(cmds)).await;
+            }
         }
+        self.restore_waits(&mut waits).await;
         for (key, reason) in cancelled {
             let Some(id) = self.runs.get(run).and_then(|r| r.keys.get(&key).cloned()).filter(|id| self.legs.contains_key(id)) else { continue };
             if self.held.remove(&id).is_some() {

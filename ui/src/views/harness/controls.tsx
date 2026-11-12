@@ -16,6 +16,7 @@ import { Loadable } from "@/components/ui/loading";
 import { ReapPolicy } from "../reap";
 import { cn } from "@/lib/utils";
 import { AtLimit } from "./elsewhere";
+import type { OriginalFile } from "@/api/held";
 
 /** Its copies on other runners and its rules for them (docs/reach.md §5.1), loaded with the sheet's group. */
 const AgentKeep = React.lazy(() => import("../keep/agent").then((m) => ({ default: m.AgentKeep })));
@@ -365,6 +366,7 @@ export interface Attached {
   data_base64?: string;
   /** A local preview of an image (object URL). */
   preview?: string;
+  original?: OriginalFile;
 }
 
 const toBase64 = (b: Blob) =>
@@ -416,9 +418,10 @@ interface Box {
   going: Set<Promise<unknown>>;
   names: string[];
   lost: string[];
+  originals: OriginalFile[];
 }
 
-const emptyBox = (): Box => ({ files: [], going: new Set(), names: [], lost: [] });
+const emptyBox = (): Box => ({ files: [], going: new Set(), names: [], lost: [], originals: [] });
 
 /** A message's files, taken from its box as it's sent (`take`). */
 export interface Taken {
@@ -426,10 +429,14 @@ export interface Taken {
   files: Attachment[];
   /** The names of those still on their way. */
   uploading: string[];
-  /** Every one that made it, once none is on its way (one that didn't is said in a toast: the message goes without it). */
+  /** Completed uploads; missing originals remain pending in Held until retried or removed. */
   up: Promise<Attachment[]>;
   /** Puts them back in the box once they're up (what carried them didn't go), unless something's been attached since. */
   back: () => void;
+  /** Clears the taken box only after the original has committed to Held. */
+  commit?: () => void;
+  /** Structured-cloned by Held before the composer gives up ownership, including pending files. */
+  originals?: OriginalFile[];
 }
 
 /** Files and screenshots to send with a message: pasted, dropped anywhere on the page, or picked (Photos, Camera or Files on a phone). */
@@ -458,6 +465,8 @@ export function useAttachments(accepts: "any" | "images" | "none") {
       // Each file uploads as soon as it is attached, so sending is instant.
       const batch = Promise.all(
         picked.map(async (f) => {
+          const original = { name: f.name, mime: f.type, blob: f };
+          mine.originals.push(original);
           try {
             const blob = f.type.startsWith("image/") ? await prepareImage(f) : f;
             if (blob.size > FILE_MAX_BYTES) {
@@ -468,6 +477,7 @@ export function useAttachments(accepts: "any" | "images" | "none") {
             const unnamed = !f.name || f.name === "image.png" || f.name === "image";
             const name = unnamed ? `screenshot-${stamp()}.${ext}` : blob !== f && blob.type !== f.type ? f.name.replace(/\.[^.]+$/, `.${ext}`) : f.name;
             const mime = blob.type || "application/octet-stream";
+            Object.assign(original, { name, mime, blob });
             const preview = mime.startsWith("image/") ? URL.createObjectURL(blob) : undefined;
             let att: Attached;
             try {
@@ -478,6 +488,7 @@ export function useAttachments(accepts: "any" | "images" | "none") {
               att = { name, mime, size: blob.size, preview, data_base64: await toBase64(blob) };
             }
             if (att.preview && att.file_id) previews.set(att.file_id, att.preview);
+            att.original = original;
             added.push(att);
             mine.files.push(att);
             if (here()) setFiles([...mine.files]);
@@ -502,6 +513,7 @@ export function useAttachments(accepts: "any" | "images" | "none") {
     const f = box.current.files[i];
     if (f?.preview) URL.revokeObjectURL(f.preview);
     box.current.files = box.current.files.filter((_, j) => j !== i);
+    box.current.originals = box.current.originals.filter((original) => original !== f?.original);
     setFiles([...box.current.files]);
   };
   const clear = React.useCallback(() => {
@@ -519,22 +531,42 @@ export function useAttachments(accepts: "any" | "images" | "none") {
   const take = (): Taken => {
     const was = box.current;
     box.current = emptyBox();
-    setFiles([]);
-    setPending(0);
-    setFailed(null);
+    const publish = () => {
+      setFiles([...box.current.files]);
+      setPending(box.current.names.length);
+      setFailed(box.current.lost.at(-1) ?? null);
+    };
+    const commit = () => publish();
     const seen = was.lost.length;
     const up = Promise.all([...was.going]).then(() => {
-      for (const why of was.lost.slice(seen)) toast.error("A file didn't upload: the message goes without it", why);
+      for (const why of was.lost.slice(seen)) toast.error("A file is still waiting; retry its upload or remove it explicitly", why);
       return was.files.map(asAttachment);
     });
-    const back = () =>
-      void up.then(() => {
-        const now = box.current;
-        if (now.files.length || now.going.size || !was.files.length) return;
-        now.files = [...was.files];
-        setFiles([...now.files]);
-      });
-    return { files: was.files.map(asAttachment), uploading: [...was.names], up, back };
+    let restored = false;
+    const restore = () => {
+      const now = box.current;
+      if (now === was) {
+        publish();
+        return;
+      }
+      if (!now.files.length && !now.going.size && !now.originals.length) box.current = was;
+      else {
+        now.files = [...was.files.filter((file) => !now.files.includes(file)), ...now.files];
+        now.originals = [...was.originals.filter((file) => !now.originals.includes(file)), ...now.originals];
+        now.going = new Set([...was.going, ...now.going]);
+        if (!restored) {
+          now.names = [...was.names, ...now.names];
+          now.lost = [...was.lost, ...now.lost];
+        }
+      }
+      restored = true;
+      publish();
+    };
+    const back = () => {
+      restore();
+      void up.then(restore);
+    };
+    return { files: was.files.map(asAttachment), uploading: [...was.names], originals: [...was.originals], up, back, commit };
   };
   // An attached image, full size, before it's sent (as a phone shows it): its name and size, Remove/Keep.
   const [viewing, setViewing] = React.useState<Attached | null>(null);

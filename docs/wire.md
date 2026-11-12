@@ -170,10 +170,37 @@ An agent session's commands ride these streams too: `HarnessOpen`, `HarnessCmd`,
   ends it. Its sender sends it again under its id, wherever its session runs then; parked, it
   would go to the copy there with no epoch even after its session went on elsewhere (CP-T3.2,
   until CP-T3.3 parks it under its epoch).
-- **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `McpAuth`,
+- **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `StateRead`, `McpAuth`,
   `SkillView` and `OwnEdits`.
 - **Live**, refused at once while its runner is away: every other command (an interrupt, a model,
   effort or mode to change to, a move, a restart, the MCP servers' and skills' commands ...).
+
+`state-pages` keeps session control messages within the existing 512 KiB cap, including their
+stamp and wire envelope. A fitting state keeps its original representation. An oversized state
+keeps status and counts, preserves fields that fit, and explicitly describes deferred fields.
+`Info.queue` remains a bounded local ID/digest/length index; an incomplete index cannot prove
+that a message is gone. Complete message bodies remain in the owning session and its durable
+record. `StateRead` reads one bounded detail page or text range; its revision is the field's
+content plus the session epoch, so unrelated status changes do not invalidate queue pages.
+`AtState` applies a queue action only at the revision read, on its owner, and is never parked
+while that owner is away. These messages are enabled only after named-feature negotiation;
+the runner refreshes its resumable session streams when that negotiation completes.
+
+The server fills an oversized state in itself (`harness::fill`): its copy keeps the values it had
+for the fields the view left out and takes the view's own, reads the runner's with `StateRead`
+(their replies go to the server alone, not to the session's viewers), and takes each field in once
+read at the revision the view named; one read at another revision waits for the next view's. Pages
+get the whole state and never `view`. The copy's state keeps `view` naming the fields still being
+read, for the store and the server's own readers (an incomplete queue index still proves nothing).
+
+`mail-flow` adds receiver-owned application credit, independent of transport connection.
+Accepted publications first transfer durable server custody (`Published`, HTTP202 with a receipt).
+Receiver admission and correlated provider handoff are subsequent owner events; neither a socket
+write nor a durable inbox ACK is model consumption. Only explicitly keyed replaceable status
+revisions coalesce before dispatch; every original remains in history. Actual consumption/refill
+and peer lifecycle events change learned logical credit. The host-wide physical authority remains
+separate. A new publication refused before custody stays the sender's responsibility; a previously
+committed retry returns its same receipt even if the owner is offline or capacity has shrunk.
 
 The parked and live ones' callers get the runner's answer:
 
@@ -596,8 +623,29 @@ run out, and two lines can't take the same one by accident as they could a bit.
   `{"epoch", "budget"}` (a need in `Ask::Place`, a give in `Say::Place`; docs/needs.md §9.1, LB08); a
   runner that didn't name it is in no budget's split and is asked for none. `told`: news of queued and
   started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes
-  from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 15). A name keeps its
-  meaning for good; a change in meaning is a new name. A name a side doesn't know, it ignores.
+  from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 15). `place.tokens`:
+  room tokens on placement's channel (docs/lb.md "Room tokens", LB08), two ops of their own in
+  placement's JSON, appended after the kernel's: a runner takes an owner's give-back, what it holds
+  there and can't use (`{"op": "fast_release", "epoch", "amount"}`: forwarded once to the owner
+  whose run last waited there for room), and an owner hears a runner's word to it alone, what it
+  holds there (`{"op": "fast_hint", "word"}`, about no run), taking no hint of that runner's while
+  it does. A kernel word that's its owner's own says `tokens` (optional, false unsaid). Each is said
+  only on a link where the other side named `place.tokens`: a runner tells an owner its own word
+  only where its person declared `[reach] tokens`, and an owner gives back only what such a word
+  asked of it; to an owner that didn't name it, a runner says its room in hints, as before. A name
+  keeps its meaning for good; a change in meaning is a new name. A name a side doesn't know, it
+  ignores.
+  `skills`: skills
+  kiln installs for agents (docs/agents.md, "Skills kiln installs"): the server sends what's installed
+  and which session has which (`ServerMsg::Skills`) and the files a runner asks for
+  (`ServerMsg::SkillFile`); the runner says its packages' states, the files it wants and a folder's
+  files it was asked to read (`AgentMsg::Skills`, `AgentMsg::SkillFile`).
+  `state-pages`: bounded session state views retain status and counts when details exceed the
+  existing frame cap; deferred fields and queue indexes are read at their owner's field revision
+  using `StateRead`, by the server, which fills the state in before its pages see it.
+  `AtState` applies queue actions only while that revision is current.
+  `mail-flow`: receiver-owned admission and exact durable custody receipts.
+  `mail-transfer`: event-driven Offered, Prepared, Committed or Aborted journal handover, with authenticated exact manifests and unchanged attempt tokens.
 
 ## Registry
 
@@ -639,17 +687,25 @@ code: each bit once, each appended variant at its index, in this order.
 | `AgentMsg` | 67 | `Features` | | this line |
 | `AgentMsg` | 68 | `Offers` | | this line: the admission hint, JSON, to a server that named `offers` |
 | `AgentMsg` | 69 | `Placed` | | this line: an owner's word on an agent session's start the server asked it to place, JSON |
+| `AgentMsg` | 70 | `Skills` | | this line: installed skills on a runner (files it wants, its packages' states, a folder's files), JSON, to a server that named `skills` |
+| `AgentMsg` | 71 | `SkillFile` | | this line: a piece of a folder's file for skills, to a server that named `skills` |
+| `AgentMsg` | 72 | `HarnessMailTransfer` | | this line: exact journal transfer phase, to a server that named `mail-transfer` |
 | `AgentMsg` | 58–62 | `Amphora`, `JobFinishedV2`, `RunnerProcess`, `JobLogChunkV1`, `JobLogEndV1` | | in flight (fb1bf362), on a main older than 861bbe60: each collides, and goes after main's last when it lands |
 | `AgentMsg` | 58 | `SampleWithPressure` | | in flight (`placement/pressure`), on an older main: goes after the last when it lands |
 | `ServerMsg` | 0–66 | `Welcome` … `Custody` | | main |
 | `ServerMsg` | 67 | `Later` | | main (docs/resilience.md R5) |
 | `ServerMsg` | 68 | `Back` | | main (docs/resilience.md C3) |
-| `ServerMsg` | 69 | `Renewed` | | this line (needs-engine; it had 67 before main's `Later` and `Back`: never released there) |
-| `ServerMsg` | 70 | `Stop` | | this line (needs-engine) |
-| `ServerMsg` | 71 | `Features` | | this line |
-| `ServerMsg` | 72 | `Offers` | | this line: another runner's room as its admission said it, JSON, for owners choosing where to probe; to a runner that named `offers` |
-| `ServerMsg` | 73 | `Place` | | this line: own an agent session's start, JSON, to a runner that named `place.sessions` |
-| `ServerMsg` | 74 | `Copies` | | this line: a runner's rules for the copies it keeps and its ask to let go now, JSON, to a runner that named `reach.keep` |
+| `ServerMsg` | 69 | `HarnessArchive` | | main (attention plan 01a199e1b177752e84dad5dc990e6a15) |
+| `ServerMsg` | 70 | `HarnessRestoreCopy` | | main (attention plan 01a199e1b177752e84dad5dc990e6a15) |
+| `ServerMsg` | 71 | `Renewed` | | this line (needs-engine; it had 67 before main's `Later` and `Back`, and 69 before main's `HarnessArchive` and `HarnessRestoreCopy`: never released there) |
+| `ServerMsg` | 72 | `Stop` | | this line (needs-engine) |
+| `ServerMsg` | 73 | `Features` | | this line |
+| `ServerMsg` | 74 | `Offers` | | this line: another runner's room as its admission said it, JSON, for owners choosing where to probe; to a runner that named `offers` |
+| `ServerMsg` | 75 | `Place` | | this line: own an agent session's start, JSON, to a runner that named `place.sessions` |
+| `ServerMsg` | 76 | `Copies` | | this line: a runner's rules for the copies it keeps and its ask to let go now, JSON, to a runner that named `reach.keep` |
+| `ServerMsg` | 77 | `Skills` | | this line: installed skills (what a machine lays out, which session has which) or a folder to read, JSON, to a runner that named `skills` |
+| `ServerMsg` | 78 | `SkillFile` | | this line: a piece of an installed package's file a runner asked for, to a runner that named `skills` |
+| `ServerMsg` | 79 | `HarnessMailTransfer` | | this line: durable journal transfer phase, to a runner that named `mail-transfer` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -818,6 +874,9 @@ Four edges are left, and the lab steers clear of each:
 | `Features` | handshake | The features the runner speaks, by name (docs/wire.md, "Named features"): every name it says, superseding the last list. | New: to a server announcing `CAP_FEATURES`, once its `Caps` said so, and again when they change. |
 | `Offers` | state | What the runner's admission holds, as a hint for the offers view (docs/needs.md E5): budget, room, its line by class, quotes, its own runs waiting. Sent when a decision-relevant value changes, never per sample. | New: to a server that named `offers`. |
 | `Placed` | answer | An owner's word on an agent session's start the server asked it to place (`ServerMsg::Place` `req`): its answer as it changes, `go` with its runner and claim, or `fallback`. | New: from runners that named `place.sessions`. |
+| `Skills` | state | Installed skills on the runner (`crate::skills::heard`, JSON): the files it lacks (`want`), each package's state there (`states`: fetching, setting up, ready, needs a tool, failed), or a folder's files it was asked to read (`read`). The newest states win; a want is asked again as each manifest comes. | New: to a server that named `skills`. |
+| `SkillFile` | answer | A piece of a file of a folder the server asked the runner to read for skills, by its SHA-256, at its offset; the last says so. | New: to a server that named `skills`. |
+| `HarnessMailTransfer` | command, refused while away | Offer, readiness, adoption or abort for one exact fenced journal manifest. | Current authenticated custodian and expected destination only; durable phase acknowledges it. |
 
 ## Server to runner: `ServerMsg`
 
@@ -900,6 +959,9 @@ Four edges are left, and the lab steers clear of each:
 | `Offers` | state | Another runner's room as its admission last said it (`{runner, epoch, seq, room}`, JSON), for this runner's owner to choose where to probe by (docs/needs.md E5). A hint, never a claim: the newest of each runner's wins. | New: to runners that named `offers`, when a runner's hint changed something decided by. |
 | `Place` | ask | Own an agent session's start (docs/needs.md E5): place it among the machines that can run its harness, as this runner's owner places its runs, or let it go. Answered by `Placed` until it's told to go; the server waits on no deadline, and a lost link ends the wait at once. | New: to runners that named `place.sessions`. |
 | `Copies` | state | This runner's rules for the copies of other runners' trees it keeps and the last ask to let go now, as its keeper's report's answer carries them (`reach::keep::Answer`, JSON; docs/reach.md §5.1): its keeper looks at once. The newest wins. | New: to runners that named `reach.keep`, when rules are set or an ask is made. |
+| `Skills` | state | Installed skills (`crate::skills::place::Manifest`, JSON): every package the machine lays out and which of its sessions has which; or a folder to read for skills, answered by `AgentMsg::Skills` and `AgentMsg::SkillFile`. The newest wins. | New: to runners that named `skills`, as installs and sessions change and on every connect. |
+| `SkillFile` | answer | A piece of an installed package's file the runner asked for (`AgentMsg::Skills` `want`), by its SHA-256, at its offset; the last says so. | New: to runners that named `skills`, in pieces of 512 KiB. |
+| `HarnessMailTransfer` | command, refused while away | Apply the authoritative durable transfer phase for one exact manifest. | Persisted destination readiness precedes source permission to send; Committed precedes activation. |
 
 ## Commands to a session: `Command`
 
@@ -929,6 +991,12 @@ travels in `HarnessCmd`.
 | `Restart` | command, refused while away | Starts the harness again now. | Fire-and-forget. |
 | `Suggest` | ask | Answered by a `Reply` to its client. | As its class says. |
 | `Snapshot` | ask | The whole session, for a server that lost track of it. A resume by revision replaces it. | Asked for by a server that restarted. |
+| `StateRead` | ask | A bounded page or range of deferred session detail, at its field revision. | Reply to the requesting client; stale reads are refused. |
+| `AtState` | command, refused while away | A queue action conditional on the owner's current queue revision. | Live owner only; stale actions are refused. |
+| `Admit` | command, refused while away | An authenticated relay offers one immutable publication under current receiver credit. | Owner-only; the source commits body and lease before Accepted. |
+| `MailAck` | command, refused while away | The relay committed this exact source receipt. | Owner-only; source keeps terminal journal until acknowledged. |
+| `MailPeers` | command, refused while away | Authenticated peers with unresolved custody divide current receiver authority. | Owner-only; no peer creates extra byte authority. |
+| `MailHandoff` | command, refused while away | Register an exact bounded wait response while preserving its original queue and lease. | Owner-only; native tool-result evidence establishes handoff. |
 | `McpEnable` | command, refused while away | Switches an MCP server now. | Fire-and-forget. |
 | `McpReconnect` | command, refused while away | As `McpEnable`. | Fire-and-forget. |
 | `McpRefresh` | command, refused while away | As `McpEnable`. | Fire-and-forget. |
@@ -966,6 +1034,7 @@ From wherever a session runs to the server, inside `Harness`, and on to its view
 | `Stream` | stream | Text appended to a streaming event. | As `Harness`. |
 | `Reply` | answer | Answers one client's ask. | As its class says. |
 | `Inbox` | answer | What a session's inbox made of a message (`HarnessSend`): taken, a repeat with the first time's answer, or refused and why (CP-T3.2). | T3: rides the session's stream. Sent again after a server restart, it finds no waiter, or a retry's own waiter (CP-T3.3 gives each send a nonce). |
+| `MailFlow` | answer | Current owner capacity and correlated admission, consumption, waiting or terminal receipt. | Named mail-flow peers; each event is fenced by publication token and source epoch. |
 | `Reset` | stream | The timeline starts over (a snapshot follows). | As `Harness`. |
 | `ChangesPatch` | stream | What changed in its changeset since the last one the server's copy took: the files set (each in place of the one with its key, or after the rest) and those gone. Only to a server that says `CAP_CHANGES_PATCH`, so a file an agent touches doesn't send every file's diff again; a snapshot has the whole changeset, its first frame whole and the rest as patches when it doesn't fit one. | As `Harness`. The server stores the whole changeset it makes. |
 
@@ -1052,6 +1121,7 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | down | `synced` | stream | Follows a snapshot. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `closed` | stream | The session is gone. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `error` | answer | A command's refusal. | Says a bare command's refusals, to clients from before ids. |
+| `/api/harness/sessions/:id/ws` | down | `mail_flow` | answer | A committed owner capacity or publication progress event. | Optional exact publication receipt and opaque sender scope bind progress before its initial ACK. |
 | `/api/events` | up | `unread` | ack | As the session socket's. | Noted (`events_down`). |
 | `/api/events` | up | `topics` | state | The event types the page wants from now on, and where it was when it asked for more. | The newest wins; of the types new to it, what came since is sent too. |
 | `/api/events` | down | `event` | stream | Kiln's events for the UI, each its own frame. | To a page that didn't ask for batches: not resumed after a reconnect. |
@@ -1091,9 +1161,16 @@ and noted on the wires `bp_up` and `bp_down` ("What can't be read").
 
 `/api/events` carries `crate::wire::events::ServerEvent`s, every frame `Hub::emit` sends, to every
 tab, narrowed to what its caller may see (W10's repositories, "Whose agents"). A page that asks
-for nothing more is sent each frame as it comes, as before. The UI asks for three things
-(`crate::wire::events::feed`, `ui/src/api/events.ts`), each opt-in, so an older page or server
-goes on as it did:
+for nothing more is sent each frame as it comes, as before.
+
+Runner measurements reach placement, metrics and the full history as they arrive. Their UI
+`sample` events publish the first reading immediately, then each runner's newest pending reading
+on the server sampler's existing `[telemetry] sample_seconds` deadline (W21-R15). This publishes
+the final reading even when the runner goes quiet, and keeps job and OS events from multiplying
+a page's sampling cadence. Every sample event that is published goes through the feed normally.
+
+The UI asks for three things (`crate::wire::events::feed`, `ui/src/api/events.ts`), each opt-in,
+so an older page or server goes on as it did:
 
 - **Batches** (`?batch=1`, or `?after=`): the socket's first frame, and every one after it but
   `refused`, is a `batch` (`EventsDown`): `{"t": "batch", "at": "<epoch>.<seq>", "events": [...]}`.

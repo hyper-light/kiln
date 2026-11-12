@@ -9,12 +9,20 @@
 //! signature, its members the runners it may run on as the agents' records stand: synced as those
 //! records change, by their address (a record is replaced whole on every change), so a pick reads
 //! no record that didn't change since the last.
+//!
+//! A run's ordinary legs of one kind and need that are waiting in one look at the queue arrive in
+//! one step: with `[reach] auction` declared they go together where the kernel's integer auction
+//! puts them (docs/lb.md "The auction"; LB08, W05-R26), at the least total expected finish, when
+//! their times and the members' rates tell them apart ([`Legs::pick_batch`]); else one at a time.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use kiln_ci::lb;
 use kiln_ci::place::msg::FastWord;
+
+/// A pick: the runner's name, and the kernel's run its room is taken under.
+pub(crate) type Pick = (String, lb::Handle);
 
 /// The server's kernel and what it follows.
 #[derive(Debug)]
@@ -29,6 +37,9 @@ pub(crate) struct Legs {
     sigs: HashMap<u64, Sig>,
     /// Each leg the kernel sent and not yet heard of (started, refused, ended): its handle.
     sent: HashMap<String, lb::Handle>,
+    /// A run's legs that arrive together go where the integer auction puts them (`[reach]
+    /// auction`): off until declared.
+    auction: bool,
 }
 
 #[derive(Debug)]
@@ -40,7 +51,7 @@ struct Sig {
 
 impl Default for Legs {
     fn default() -> Self {
-        Legs { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), ids: HashMap::new(), names: Vec::new(), budgets: Vec::new(), sigs: HashMap::new(), sent: HashMap::new() }
+        Legs { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), ids: HashMap::new(), names: Vec::new(), budgets: Vec::new(), sigs: HashMap::new(), sent: HashMap::new(), auction: false }
     }
 }
 
@@ -168,6 +179,75 @@ impl Legs {
         }
     }
 
+    /// A run's legs that arrive together are placed by the integer auction (`[reach] auction`,
+    /// docs/lb.md "The auction"), or one at a time (off, the default).
+    pub(crate) fn set_auction(&mut self, on: bool) {
+        self.auction = on;
+        self.lb.set_auction(on);
+    }
+
+    /// The kernel's picks for `times.len()` legs of kind `key` needing `need` that arrived
+    /// together (a run's ordinary legs in one look at the queue), each with its expected run time
+    /// at the reference core where history knows one (ms). With the auction declared, and their
+    /// times and the members' rates telling them apart (otherwise every assignment costs the same,
+    /// and one at a time spreads them by room, W05-R23), as many as the members' views hold go
+    /// where Bertsekas's auction puts them, at the least total expected finish
+    /// (`lb::auction::finish_at`: a leg's time over a member's key multiplier, its measured speed
+    /// over its slowness as the kernel keeps it), one each, in the legs' order; the rest `None`,
+    /// for the engine's own pick. Each pick's room is taken from the kernel's view at once (`sent`
+    /// once sent, `unsent` if not). `None` in all: not decided together, each is picked as before.
+    pub(crate) fn pick_batch<A>(&mut self, key: u64, need: lb::Amounts, times: &[Option<u64>], agents: &HashMap<String, Arc<A>>, name: impl Fn(&A) -> &str, member: impl Fn(&A) -> bool) -> Option<Vec<Option<Pick>>> {
+        let n = times.len();
+        if !self.auction || n < 2 || self.ids.is_empty() || !self.budgets.iter().any(Option::is_some) {
+            return None;
+        }
+        let sig = self.sync(key, agents, name, member);
+        if !self.tells_apart(key, need, times) {
+            return None;
+        }
+        let rates: Vec<u32> = (0..u32::try_from(self.names.len()).unwrap_or(u32::MAX)).map(|r| self.lb.multiplier(lb::RunnerId(r))).collect();
+        let cost = |i: usize, r: lb::RunnerId| Some(lb::auction::finish_at(times.get(i).copied().flatten().unwrap_or(0), rates.get(r.0 as usize).copied().unwrap_or(lb::SCALE), 0));
+        let (mut starts, mut waits) = (Vec::new(), Vec::new());
+        self.out.clear();
+        // Refused (the kernel's runs full): what it started before is placed, the rest picked by the engine.
+        let _ = self.lb.ask_batch(sig, need, n, cost, &mut starts, &mut waits, &mut self.out);
+        self.out.clear();
+        // Waiting is the engine's (its queue), never the kernel's.
+        for h in waits {
+            let _ = self.lb.cancel(h, &mut self.out);
+        }
+        self.out.clear();
+        // Its starts are the legs' first, in their order.
+        let mut picks: Vec<Option<Pick>> = Vec::with_capacity(n);
+        for (r, st) in starts {
+            match self.names.get(r.0 as usize) {
+                Some(nm) => picks.push(Some((nm.clone(), st.run))),
+                None => {
+                    let _ = self.lb.unsent(st.run);
+                    picks.push(None);
+                }
+            }
+        }
+        picks.resize(n, None);
+        Some(picks)
+    }
+
+    /// Whether the auction's costs tell legs of kind `key` needing `need` apart: their `times`
+    /// differ (none known is a time of its own), and so do the rates, at the kernel's resolution
+    /// (each multiplier's class), of the kind's members whose view holds `need` now.
+    fn tells_apart(&self, key: u64, need: lb::Amounts, times: &[Option<u64>]) -> bool {
+        let mut t = times.iter();
+        let first = t.next();
+        if !t.any(|x| Some(x) != first) {
+            return false;
+        }
+        let Some(s) = self.sigs.get(&key) else { return false };
+        let fits = |r: u32| self.lb.view(lb::RunnerId(r)).is_some_and(|v| v.iter().zip(&need).all(|(v, n)| n <= v));
+        let mut rates = s.seen.iter().filter(|(r, (_, m))| *m && fits(**r)).map(|(r, _)| lb::class_of(u64::from(self.lb.multiplier(lb::RunnerId(*r)))));
+        let one = rates.next();
+        rates.any(|x| Some(x) != one)
+    }
+
     /// Leg `job` went to the runner the kernel picked for it under `run`.
     pub(crate) fn sent(&mut self, job: &str, run: lb::Handle) {
         if let Some(old) = self.sent.insert(job.to_owned(), run) {
@@ -237,6 +317,35 @@ mod tests {
         legs.hint("b", &word(2));
         let (next, _) = legs.pick(key, [2000, 0, 0, 0], &agents, |r| &r.name, |r| r.ok).ok_or_else(|| anyhow::anyhow!("no pick"))?;
         anyhow::ensure!(next == "a" || next == "b", "picked {next}");
+        Ok(())
+    }
+
+    /// LB08, W05-R26: a run's legs that arrive together go where the auction puts them once it's
+    /// declared: of two runners of 2 CPUs, one measured twice as fast, the long legs take the fast
+    /// one. Off, or with no times to tell the legs apart, they're not decided together.
+    #[test]
+    fn lb08_w05_r26_a_runs_legs_go_where_the_auction_puts_them() -> anyhow::Result<()> {
+        let agents = fleet(&[("fast", true), ("slow", true)]);
+        let key = Legs::kind(&[], &[], "");
+        let need = [1000, 0, 0, 0];
+        let times = [Some(10_000), Some(100_000), Some(10_000), Some(100_000)];
+        let words = |legs: &mut Legs| {
+            legs.hint("fast", &FastWord { speed: 2048, measured: 1, ..word(2) });
+            legs.hint("slow", &FastWord { speed: 1024, measured: 1, ..word(2) });
+        };
+        let mut off = Legs::default();
+        words(&mut off);
+        anyhow::ensure!(off.pick_batch(key, need, &times, &agents, |r| &r.name, |r| r.ok).is_none(), "decided together though the auction is off");
+        let mut on = Legs::default();
+        on.set_auction(true);
+        words(&mut on);
+        anyhow::ensure!(on.pick_batch(key, need, &[None; 4], &agents, |r| &r.name, |r| r.ok).is_none(), "decided together with no times to tell the legs apart");
+        let picks = on.pick_batch(key, need, &times, &agents, |r| &r.name, |r| r.ok).ok_or_else(|| anyhow::anyhow!("not decided together"))?;
+        let at: Vec<Option<&str>> = picks.iter().map(|p| p.as_ref().map(|(n, _)| n.as_str())).collect();
+        anyhow::ensure!(at == [Some("slow"), Some("fast"), Some("slow"), Some("fast")], "the legs went to {at:?}");
+        for (_, run) in picks.into_iter().flatten() {
+            on.unsent(run);
+        }
         Ok(())
     }
 

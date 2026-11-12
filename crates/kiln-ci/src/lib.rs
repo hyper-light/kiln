@@ -96,3 +96,6 @@ pub mod verdict;
 pub mod wf;
 pub mod wire;
 pub mod work;
+
+/// W20-R01: skill package detection and selection, from supplied files alone.
+pub mod skills;

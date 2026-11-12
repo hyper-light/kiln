@@ -157,6 +157,12 @@ impl Owner {
             }
             return self.ask_most(sig.0, need, out);
         }
+        // W05-R26: create only the rate indexes this ask reads; a CPU measurement need not
+        // prepay disk/link/network construction. Their first use pays the explicit build.
+        // Link quality also contributes latency/stability and a listed candidate's own
+        // missing bytes. Those dependencies remain even when the default transfer is zero.
+        let link = terms.bytes != 0 || terms.interactive || terms.warm.iter().any(|w| w.missing != 0);
+        self.keep_orders([false, terms.io_bytes != 0, link, terms.net_bytes != 0]);
         self.flush();
         self.clean();
         let si = sig.0;
@@ -175,7 +181,7 @@ impl Owner {
         // The terms compared: those every member with a core free (none in its order's class 0,
         // a rate below 2 bytes a second) and every listed candidate has measured.
         let on = {
-            let order = |o: usize| self.orders_on && self.sigs.get(si as usize).and_then(|s| s.orders.get(o)).is_some_and(|x| !x.has(0));
+            let order = |o: usize| self.orders_kept & (1 << o) != 0 && self.sigs.get(si as usize).and_then(|s| s.orders.get(o)).is_some_and(|x| !x.has(0));
             let mut on = On { disk: order(DISK), net: order(NET), link: order(LINK) };
             for (r, _) in listed.iter().filter_map(|w| listed_at(self, w)) {
                 let c = self.cold.get(r as usize).copied().unwrap_or_default();
@@ -244,7 +250,7 @@ impl Owner {
             self.seen = seen;
             // No member with a core free has room (nor a listed one): a need below a core may
             // still fit one with less.
-            let r = self.pick_cpu(si, &need, !multi(&need));
+            let r = self.pick_cpu(si, NIL, &need, !multi(&need));
             return if r == NIL { self.ask_waits(si, need, out) } else { self.start_at(si, need, r) };
         }
         // A shared owner draws among the seen within the bound of the soonest: each is within
@@ -371,12 +377,16 @@ impl Owner {
                 }
                 NARROW => cap = cap.min(u128::from(p) * u128::from(class_hi(c.at).min(u64::from(u32::MAX)))),
                 o => {
-                    let v = match o {
-                        DISK => t.io_bytes,
-                        LINK => t.bytes,
-                        _ => t.net_bytes,
+                    let (v, prior) = match o {
+                        DISK => (t.io_bytes, self.prior.disk),
+                        LINK => (t.bytes, self.prior.link),
+                        _ => (t.net_bytes, self.prior.net),
                     };
-                    tau = tau.saturating_add(mul_q32(u128::from(v), per_byte_q32(class_hi(c.at))));
+                    // W24-R18: one observed multiplier is also every unknown's exact prior.
+                    // Its bound avoids a whole class walk when rounding the class alone loses
+                    // enough of a tiny term to miss the 1/64 stopping rule.
+                    let q = per_byte_q32(class_hi(c.at)).max(prior.lower_q32());
+                    tau = tau.saturating_add(mul_q32(u128::from(v), q));
                 }
             }
         }
@@ -429,12 +439,12 @@ impl Owner {
         if !multi(&need)
             && !planted
             && let Ok(cpu) = u32::try_from(need[0])
-            && let Some((r, run, epoch)) = self.ask_top(si, cpu)
+            && let Some((r, run, epoch)) = self.ask_top::<false>(si, NIL, cpu)
         {
             return Ok(Asked { run, send: Some((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch, need }))) });
         }
         self.flush();
-        let r = self.pick(si, &need, !multi(&need));
+        let r = self.pick(si, NIL, &need, !multi(&need));
         if r == NIL {
             return self.ask_waits(si, need, out);
         }
@@ -445,8 +455,8 @@ impl Owner {
     /// path does once it has picked.
     fn start_at(&mut self, si: u32, need: Amounts, r: u32) -> Result<Asked, Refused> {
         let cpu_only = !multi(&need);
-        let slow = if cpu_only { NIL } else { self.slow_for(&need)? };
-        let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: si, runner: r, state: STARTING, slow }) else {
+        let slow = if Run::needs_slow(&need) { self.slow_for(&need)? } else { NIL };
+        let Some(run) = self.runs.insert(Run::new(need[0], si, r, STARTING, slow)) else {
             self.free_slow(slow);
             return Err(Refused::Full);
         };
@@ -466,7 +476,7 @@ impl Owner {
         }
         sl.places = places;
         let slow = self.slow.insert(sl).ok_or(Refused::Full)?.slot;
-        let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: si, runner: NIL, state: WAITING, slow }) else {
+        let Some(run) = self.runs.insert(Run::new(need[0], si, NIL, WAITING, slow)) else {
             self.free_slow(slow);
             return Err(Refused::Full);
         };
@@ -543,6 +553,13 @@ impl Mean {
     /// The mean multiplier (0: none measured).
     pub(crate) fn q32(self) -> u64 {
         self.sum.checked_div(u128::from(self.n)).map_or(0, |m| u64::try_from(m).unwrap_or(u64::MAX))
+    }
+
+    /// A lower bound on every effective multiplier, including unknowns taking the prior.
+    /// With one observation they all equal it. With several, the mean does not bound the
+    /// fastest observation from below, so only zero follows from this aggregate (W24-R18).
+    pub(crate) fn lower_q32(self) -> u64 {
+        if self.n == 1 { u64::try_from(self.sum).unwrap_or(u64::MAX) } else { 0 }
     }
 
     /// `rate` if it was measured, else the rate the mean multiplier is, bytes a second (0: none).

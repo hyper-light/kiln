@@ -1,0 +1,16 @@
+{
+  "owned_inactive_only": "/Users/adalundhe/.cache/kiln-offline-state-fix-20261110/red-target/debug/incremental",
+  "files": [
+    {
+      "path": "kiln-3c5nefglqdyot/s-ho1ywedi5e-10m01cs.lock",
+      "bytes": 0
+    },
+    {
+      "path": "kiln-3c5nefglqdyot/s-ho1ywedi5e-10m01cs-working/dep-graph.part.bin",
+      "bytes": 1132320076
+    }
+  ],
+  "logical_bytes": 1132320076,
+  "free_before": 37288685568,
+  "free_after": 38419537920
+}

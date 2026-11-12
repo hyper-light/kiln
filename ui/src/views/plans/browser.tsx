@@ -7,15 +7,16 @@
  */
 import * as React from "react";
 import { ChevronRight } from "lucide-react";
-import { ApiError } from "@/api/client";
 import { clientId } from "@/api/harness";
 import { planHref, plansApi, type Plan, type PlanItem, type PlanMode, type PlanRan } from "@/api/plans";
+import { planRes } from "@/api/plan-resources";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { FilterBar, SelectField } from "@/components/ui/misc";
 import { useAction } from "@/lib/action";
+import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Link } from "@/lib/router";
@@ -41,11 +42,6 @@ const MODES: { value: HereMode; label: string }[] = [
 /** Rows shown before "Show more", and how many more each time. */
 const PAGE = 6;
 const MORE = 20;
-
-const unlessGone = (e: unknown): "gone" => {
-  if (e instanceof ApiError && (e.status === 404 || e.status === 400)) return "gone";
-  throw e;
-};
 
 /** The Plans section: `active`, the plan under way (its own words and graph), then every plan kept (with an agent `session`). */
 export function PlansSection({ session, active }: { session?: string; active: React.ReactNode }) {
@@ -177,7 +173,7 @@ function Found({
  * its page. One its agent's goals wait on your review of is approved instead (approve.tsx).
  */
 function Recall({ id, session, draft, onDraft, onSaved }: { id: string; session: string; draft: Draft | null; onDraft: (d: Draft | null) => void; onSaved: (p: Plan) => void }) {
-  const p = useSuspenseResource(`plans/${id}`, (s) => plansApi.get(id, s).catch(unlessGone)).data;
+  const p = useRes(planRes(id)).data;
   const waits = useWaitsOn(id);
   const [approved, setApproved] = React.useState<Approved | null>(null);
   const [mode, setMode] = React.useState<HereMode>("message");
@@ -245,7 +241,9 @@ function Recall({ id, session, draft, onDraft, onSaved }: { id: string; session:
             ? `Approved instead (its goals waited on your review of it): its ${ran.sent} step${ran.sent === 1 ? "" : "s"} go to it as its goal's parts.`
             : mode === "goals" && n
               ? `${ran.sent} goals lined up in its goal stack, below.`
-              : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}.`}
+              : ran.retained
+                ? `${ran.retained} message${ran.retained === 1 ? "" : "s"} retained, waiting for receiver admission${ran.sent ? ` · ${ran.sent} sent` : ""}`
+                : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}.`}
         </p>
       )}
       {error && <p className="plan-error">{error}</p>}

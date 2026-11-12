@@ -6,12 +6,10 @@
 //! parent that would rather wait; what it saw that way (or through `agents_result`) isn't told
 //! again. Children that settle together are told of in one message.
 //!
-//! The news waits for the parent in that one message (`super::queued`): a child that settles
-//! again while it waits changes its line in it, one that settles anew joins it, and what the parent
-//! sees itself comes out of it (the message too, once nothing is left). So a parent that spends
-//! hours in one turn, its children settling again and again, finds each child's latest line when
-//! the turn ends, once, rather than every settle since. A server that started since finds the news
-//! a server before it left waiting (its id says what it is) and adds to that one.
+//! News is explicitly replaceable status. Each changed snapshot has a fresh immutable message
+//! id and uses the internal-news ledger stream; every accepted original stays in history. Only
+//! the latest never-dispatched successor is coalesced. An already dispatched snapshot is frozen
+//! until its exact source receipt, and a parent seeing a line does not erase that original.
 //!
 //! An agent's runs on kiln's machines are told of the same way, in the same message (docs/reach.md
 //! §7; agents are told, not polled): a run it left in the background (`run` with `background`, or
@@ -229,7 +227,7 @@ pub fn clip_tail(output: &str, max: usize) -> String {
 }
 
 /// One run kiln was told of ([`ran`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct Ran {
     /// The latest news of it.
     news: RunNews,
@@ -318,7 +316,62 @@ struct News {
     /// says what its harness was handed (`Info::said`), those lines reached the parent, whatever
     /// kiln had it say since (an edit too late, or one its own read of a child made: `saw`).
     given: Vec<(String, Vec<(String, String)>)>,
+    custody: NewsCustody,
+    said_more: (usize, usize),
+    previous: Option<super::mail::Receipt>,
 }
+
+#[derive(Debug, Default)]
+enum NewsCustody { #[default] Legacy, Pending, Retained(super::mail::Receipt) }
+
+const PRODUCER_PREFIX: &str = "told/news/";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct Desired {
+    before: Option<String>,
+    lines: Vec<(String, String)>,
+    more: usize,
+    more_runs: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum Owned {
+    Quiet,
+    Pending { original: Command },
+    Retained { original: Command, receipt: super::mail::Receipt },
+}
+
+impl Owned {
+    fn original(&self) -> Option<&Command> { match self { Self::Quiet => None, Self::Pending { original } | Self::Retained { original, .. } => Some(original) } }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ProducerContent {
+    owned: Owned,
+    desired: Desired,
+    said: Vec<(String, String)>,
+    said_more: (usize, usize),
+    previous: Option<super::mail::Receipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProducerRecord {
+    version: i64,
+    content: ProducerContent,
+    captured_runs: Vec<(String, i64)>,
+}
+
+struct ProducerWrite { parent: String, record: ProducerRecord, json: String }
+struct Persist { runs: Vec<Row>, producers: Vec<ProducerWrite> }
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum Refusal { Rejected { reason: String }, Persistence { error: super::mail::Error } }
+impl std::fmt::Display for Refusal { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{self:?}") } }
+impl std::error::Error for Refusal {}
+impl From<super::mail::Error> for Refusal { fn from(error: super::mail::Error) -> Self { Self::Persistence { error } } }
+impl Refusal { fn status(&self) -> u16 { match self { Self::Rejected { .. } => http::StatusCode::FORBIDDEN.as_u16(), Self::Persistence { error } => error.status_code().as_u16() } } }
 
 /// The most of a news message's words kept to tell which its harness was handed.
 const GIVEN_MAX: usize = 16;
@@ -357,6 +410,11 @@ struct Told {
     loaded: bool,
     /// Runs changed or gone since they were last written, by agent and key ([`flush`]).
     dirty: BTreeSet<(String, String)>,
+    news_dirty: BTreeSet<String>,
+    captured_runs: HashMap<(String, String), i64>,
+    captured_news: HashMap<String, i64>,
+    removed: HashMap<String, Option<super::mail::Receipt>>,
+    producers_loaded: HashSet<String>,
 }
 
 static TOLD: LazyLock<Mutex<Told>> = LazyLock::new(Default::default);
@@ -366,32 +424,90 @@ static TOLD: LazyLock<Mutex<Told>> = LazyLock::new(Default::default);
 /// unsent. Two edits of one message can't cross on their way, and nothing that decides waits on a
 /// parent's machine: a command waits up to 30 s for an answer, and one lock held across every
 /// parent's sends in turn once held `agents_wait` and `agents_result` waiting on it.
-static TO_SEND: LazyLock<Mutex<HashMap<String, VecDeque<Command>>>> = LazyLock::new(Default::default);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SenderState { Sending, Blocked }
+struct Outbound { commands: VecDeque<Command>, state: SenderState }
+static TO_SEND: LazyLock<Mutex<HashMap<String, Outbound>>> = LazyLock::new(Default::default);
 
 /// Queues `c` for `parent` (its sender starts when nothing waited for it): true when it starts one,
 /// which [`send_queued`] then is. Taken under `TOLD`'s lock alone (never the other way around).
 fn queue_for(parent: &str, c: Command) -> bool {
     let mut g = TO_SEND.lock();
-    let q = g.entry(parent.to_owned()).or_default();
-    q.push_back(c);
-    q.len() == 1
+    let q = g.entry(parent.to_owned()).or_insert_with(|| Outbound { commands: VecDeque::new(), state: SenderState::Blocked });
+    q.commands.push_back(c);
+    let start = q.state == SenderState::Blocked;
+    q.state = SenderState::Sending;
+    start
+}
+
+/// A real source capacity/connection event may retry a producer-owned, unaccepted original.
+/// One sender per parent is retained; ledger changes never create a waiter per message.
+pub fn wake(hub: &Arc<crate::hub::Hub>, parent: &str) {
+    let dirty = TOLD.lock().news_dirty.contains(parent);
+    let mut sends = TO_SEND.lock();
+    if dirty { sends.entry(parent.to_owned()).or_insert_with(|| Outbound { commands: VecDeque::new(), state: SenderState::Blocked }); }
+    let start = sends.get_mut(parent).is_some_and(|q| {
+        if q.state != SenderState::Blocked || (q.commands.is_empty() && !dirty) { return false; }
+        q.state = SenderState::Sending; true
+    });
+    drop(sends);
+    if start { start_senders(hub, vec![parent.to_owned()]); }
+}
+
+/// Only committed receipt metadata from the authenticated internal producer reaches this hook.
+pub fn mail_progress(hub: &Arc<crate::hub::Hub>, parent: &str, receipt: &super::mail::Receipt, mail_scope: &str) {
+    if mail_scope != super::mail::scope("server") { return; }
+    let start = {
+        let mut told = TOLD.lock();
+        told.mail_progress(parent, receipt).is_some_and(|c| queue_for(parent, c))
+    };
+    if start { start_senders(hub, vec![parent.to_owned()]); }
+    wake(hub, parent);
 }
 
 /// `parent`'s sender: what's queued for it, in order, each once the one before it went (or is said
 /// unsent, its words to go at the next look). It ends once nothing's left.
 async fn send_queued(hub: Arc<crate::hub::Hub>, parent: String) {
     loop {
+        if let Err(error) = flush(&hub).await {
+            if let Some(q) = TO_SEND.lock().get_mut(&parent) { q.state = SenderState::Blocked; }
+            tracing::warn!(agent=%parent, error=?error, "internal news original was not persisted; custody remains with its producer");
+            return;
+        }
         // The front stays queued while it goes: what's queued meanwhile waits behind it.
-        let Some(c) = TO_SEND.lock().get(&parent).and_then(|q| q.front().cloned()) else { return };
-        // It went: queued, or taken by its session's inbox (CP-T3.2).
-        if !hub.harness.command(&hub, &parent, c.clone()).await.went() {
-            tracing::info!(agent = %parent, "news of the agents it started didn't reach it");
-            TOLD.lock().unsent(&parent, &c);
+        let next = {
+            let mut sends = TO_SEND.lock();
+            let next = sends.get(&parent).and_then(|q| q.commands.front().cloned());
+            if next.is_none() { sends.remove(&parent); }
+            next
+        };
+        let Some(c) = next else { return };
+        let sent = if matches!(c, Command::Send { .. }) {
+            hub.harness.command_status(&hub, &parent, c.clone(), super::mail::StatusKey { task: None, key: "internal-news".into() }).await
+        } else { hub.harness.command(&hub, &parent, c.clone()).await };
+        match sent {
+            super::registry::Sent::Published(receipt) => mail_progress(&hub, &parent, &receipt, &super::mail::scope("server")),
+            sent if sent.went() => {}
+            _ => {
+                if let Command::Send { id, .. } = &c
+                    && let Ok(Some(receipt)) = super::mail::receipt(&hub.store, "server".into(), "server".into(), parent.clone(), id.clone()).await
+                {
+                    // One completion-event reconciliation handles a commit whose response was
+                    // lost. This is not a capacity probe or a periodic publisher retry.
+                    mail_progress(&hub, &parent, &receipt, &super::mail::scope("server"));
+                } else {
+                // No custody transfer: retain this exact original at the existing sender. Desired
+                // lines may change, but no new revision is generated until this one is accepted.
+                if let Some(q) = TO_SEND.lock().get_mut(&parent) { q.state = SenderState::Blocked; }
+                tracing::info!(agent = %parent, "internal news retains its original until a source event permits publication");
+                return;
+                }
+            }
         }
         let mut g = TO_SEND.lock();
         let done = g.get_mut(&parent).is_none_or(|q| {
-            q.pop_front();
-            q.is_empty()
+            q.commands.pop_front();
+            q.commands.is_empty()
         });
         if done {
             g.remove(&parent);
@@ -415,11 +531,14 @@ fn key_of(info: &Info) -> String {
 /// again, and its line comes out of the parent's news waiting in its queue (the message with it,
 /// once no line is left).
 pub async fn saw(hub: &Arc<crate::hub::Hub>, child: &Info) {
+    if let Err(error) = load(hub).await { tracing::warn!(error=?error,"internal news canonical state unavailable"); return; }
+    if let Some(parent) = child.parent.as_deref() && let Err(error) = load_parent(hub,parent).await { tracing::warn!(error=?error,"internal news producer state unavailable"); return; }
     // Decided and queued as one: an edit decided later can't go before it.
     let start = {
         let mut told = TOLD.lock();
         told.saw(child).and_then(|(parent, c)| queue_for(&parent, c).then_some(parent))
     };
+    if let Err(error) = flush(hub).await { if let Some(parent) = &start && let Some(q) = TO_SEND.lock().get_mut(parent) { q.state = SenderState::Blocked; } tracing::warn!(error=?error,"internal news seen-state not persisted"); return; }
     start_senders(hub, start.into_iter().collect());
 }
 
@@ -430,20 +549,21 @@ pub async fn saw(hub: &Arc<crate::hub::Hub>, child: &Info) {
 /// (E8: no runner tells an agent of runs it doesn't follow). Kept (and written, E1), and told in
 /// the agent's news at the next look ([`tick`]); a run its agent saw end itself comes out of the
 /// news waiting, as a child it saw does ([`saw`]).
-pub async fn ran(hub: &Arc<crate::hub::Hub>, runner: &str, session: &str, news: RunNews) -> Result<(), String> {
-    load(hub).await;
-    let Some(info) = hub.harness.info(session) else { return Err(format!("kiln knows no agent session {session:?}")) };
+pub async fn ran(hub: &Arc<crate::hub::Hub>, runner: &str, session: &str, news: RunNews) -> Result<(), Refusal> {
+    load(hub).await?;
+    let Some(info) = hub.harness.info(session) else { return Err(Refusal::Rejected { reason: format!("kiln knows no agent session {session:?}") }) };
     if info.status == Status::Exited {
-        return Err(format!("agent session {session} has ended"));
+        return Err(Refusal::Rejected { reason: format!("agent session {session} has ended") });
     }
+    load_parent(hub, session).await?;
     let located = hub.harness.located_on(session, runner);
     let start = {
         let mut told = TOLD.lock();
-        let c = told.ran(runner, located, session, news.clipped(), crate::util::now_ms())?;
+        let c = told.ran(runner, located, session, news.clipped(), crate::util::now_ms()).map_err(|reason| Refusal::Rejected { reason })?;
         c.and_then(|c| queue_for(session, c).then(|| session.to_owned()))
     };
+    if let Err(error) = flush(hub).await { if let Some(parent) = &start && let Some(q) = TO_SEND.lock().get_mut(parent) { q.state = SenderState::Blocked; } return Err(error.into()); }
     start_senders(hub, start.into_iter().collect());
-    flush(hub).await;
     Ok(())
 }
 
@@ -451,7 +571,7 @@ pub async fn ran(hub: &Arc<crate::hub::Hub>, runner: &str, session: &str, news: 
 pub async fn heard(hub: &Arc<crate::hub::Hub>, runner: &str, session: &str, news: &RunNews) -> serde_json::Value {
     match ran(hub, runner, session, news.clone()).await {
         Ok(()) => serde_json::json!({"ok": {}}),
-        Err(e) => serde_json::json!({"error": e, "status": 403}),
+        Err(e) => serde_json::json!({"error": e.to_string(), "refusal": e, "status": e.status()}),
     }
 }
 
@@ -461,7 +581,8 @@ pub async fn heard(hub: &Arc<crate::hub::Hub>, runner: &str, session: &str, news
 /// T8); never wakes the agent, as an end does. Later news of the run (its end, from what follows
 /// it) takes its line's place.
 pub async fn answer(hub: &Arc<crate::hub::Hub>, session: &str, news: AnswerNews) {
-    load(hub).await;
+    if let Err(error) = load(hub).await { tracing::warn!(error=?error, "internal news canonical state unavailable"); return; }
+    if let Err(error) = load_parent(hub, session).await { tracing::warn!(error=?error, "internal news producer state unavailable"); return; }
     let run = news.into_run();
     let start = {
         let mut told = TOLD.lock();
@@ -474,8 +595,8 @@ pub async fn answer(hub: &Arc<crate::hub::Hub>, session: &str, news: AnswerNews)
             }
         }
     };
+    if let Err(error) = flush(hub).await { if let Some(parent) = &start && let Some(q) = TO_SEND.lock().get_mut(parent) { q.state = SenderState::Blocked; } tracing::warn!(error=?error, "internal news original not persisted"); return; }
     start_senders(hub, start.into_iter().collect());
-    flush(hub).await;
 }
 
 /// Where placement's answer for a queued run stands ([`answer`]).
@@ -548,23 +669,36 @@ pub fn runs_awaited(agent: &Info) -> bool {
 }
 
 /// The runs kept (`told_runs`) read in, once: what a server before this one heard (E1).
-async fn load(hub: &Arc<crate::hub::Hub>) {
-    if TOLD.lock().loaded {
-        return;
-    }
-    let rows = read_rows(&hub.store).await.unwrap_or_else(|e| {
-        tracing::warn!(error = %format!("{e:#}"), "the runs agents are told of couldn't be read");
-        Vec::new()
-    });
+async fn load(hub: &Arc<crate::hub::Hub>) -> Result<(), super::mail::Error> {
+    if TOLD.lock().loaded { return Ok(()); }
+    let rows = read_rows(&hub.store).await.map_err(persistence_error)?;
     TOLD.lock().adopt(rows);
+    Ok(())
 }
 
-/// Every run changed or gone since it was last written, written as it stands now (E1).
-async fn flush(hub: &Arc<crate::hub::Hub>) {
-    let rows = TOLD.lock().dirty_rows();
-    if let Err(e) = write_rows(&hub.store, rows).await {
-        tracing::warn!(error = %format!("{e:#}"), "the runs agents are told of couldn't be kept");
+/// Dirty keys stay owned until the outer Store::call has committed. A failure never restores
+/// old values over newer events and never acknowledges a producer original that was not kept.
+async fn flush(hub: &Arc<crate::hub::Hub>) -> Result<(), super::mail::Error> {
+    let batch = TOLD.lock().capture()?;
+    if batch.runs.is_empty() && batch.producers.is_empty() { return Ok(()); }
+    let mut bytes = Bytes(0);
+    serde_json::to_writer(&mut bytes, &batch.runs).map_err(|e| super::mail::Error::Unavailable { reason: e.to_string() })?;
+    let mut confirmed = HashSet::new();
+    for producer in &batch.producers {
+        use std::io::Write as _;
+        bytes.write_all(format!("{PRODUCER_PREFIX}{}", producer.parent).as_bytes()).map_err(|e| super::mail::Error::Unavailable { reason: e.to_string() })?;
+        bytes.write_all(producer.json.as_bytes()).map_err(|e| super::mail::Error::Unavailable { reason: e.to_string() })?;
+        if let Some(previous) = &producer.record.content.previous {
+            let receipt = super::mail::receipt(&hub.store, "server".into(), "server".into(), producer.parent.clone(), previous.id.clone()).await?;
+            if receipt.as_ref().is_none_or(|r| r.revision != previous.revision) { return Err(super::mail::Error::Unavailable { reason: "previous news original has no authoritative archive receipt".into() }); }
+            confirmed.insert((producer.parent.clone(), previous.id.clone()));
+        }
     }
+    let rows = batch.runs.len().checked_add(batch.producers.len()).and_then(|n| u64::try_from(n).ok()).ok_or_else(|| super::mail::Error::Unavailable { reason: "producer row count overflow".into() })?;
+    storage_room(hub, bytes.0, rows).await?;
+    let batch = hub.store.call(move |c| write_persist(c, batch, &confirmed)).await.map_err(persistence_error)?;
+    TOLD.lock().acknowledge(&batch);
+    Ok(())
 }
 
 /// A run as `told_runs` keeps it, by agent and key (none: gone), and the version it's written at:
@@ -574,35 +708,155 @@ type Row = (String, String, Option<Ran>, i64);
 /// The version the next row is written at: past every one kept ([`read_rows`] raises it).
 static VERSION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
 
+fn next_version() -> Result<i64, super::mail::Error> {
+    VERSION.try_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |v| v.checked_add(1))
+        .map_err(|_| super::mail::Error::Unavailable { reason: "internal news version exhausted".into() })
+}
+
+fn persistence_error(error: anyhow::Error) -> super::mail::Error {
+    if let Some(error) = error.downcast_ref::<super::mail::Error>() { return error.clone(); }
+    if matches!(error.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::DiskFull) { return super::mail::Error::StorageFull; }
+    super::mail::Error::Unavailable { reason: error.to_string() }
+}
+
+fn original_id(command: &Command) -> Option<&str> { match command { Command::Send { id, .. } if !id.is_empty() => Some(id), _ => None } }
+
+fn content(news: Option<&News>, previous: Option<super::mail::Receipt>) -> ProducerContent {
+    let Some(n) = news else { return ProducerContent { owned: Owned::Quiet, desired: Desired::default(), said: Vec::new(), said_more: (0, 0), previous } };
+    let original = n.msg.as_ref().map(|m| Command::Send { id: m.id.clone(), text: m.text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None });
+    let owned = match (&n.custody, original) {
+        (NewsCustody::Pending, Some(original)) => Owned::Pending { original },
+        (NewsCustody::Retained(receipt), Some(original)) => {
+            let mut receipt = receipt.clone(); receipt.repeat = false;
+            Owned::Retained { original, receipt }
+        }
+        _ => Owned::Quiet,
+    };
+    ProducerContent { owned, desired: Desired { before: n.before.clone(), lines: n.lines.clone(), more: n.more, more_runs: n.more_runs }, said: n.said.clone(), said_more: n.said_more, previous: n.previous.clone() }
+}
+
+fn restore_news(record: &ProducerRecord) -> Result<News, super::mail::Error> {
+    let d = &record.content.desired;
+    let mut n = News { before: d.before.clone(), lines: d.lines.clone(), more: d.more, more_runs: d.more_runs, said: record.content.said.clone(), said_more: record.content.said_more, previous: record.content.previous.clone(), ..News::default() };
+    if let Some(original) = record.content.owned.original() {
+        let Command::Send { id, text, .. } = original else { return Err(super::mail::Error::Invalid { reason: "saved internal news is not a send".into() }); };
+        if id.is_empty() { return Err(super::mail::Error::Invalid { reason: "saved internal news has no id".into() }); }
+        // The saved body is known, but this record proves producer custody only. Reset the
+        // legacy constructor's source observation before it is visible to the planner.
+        let mut message = Kept::found(id.clone(), text.clone(), 0); message.awaiting_source();
+        n.msg = Some(message);
+        n.custody = match &record.content.owned { Owned::Retained { receipt, .. } => NewsCustody::Retained(receipt.clone()), _ => NewsCustody::Pending };
+    }
+    Ok(n)
+}
+
+fn read_producer(c: &rusqlite::Connection, parent: &str) -> anyhow::Result<Option<ProducerRecord>> {
+    use rusqlite::OptionalExtension as _;
+    let budget = i64::try_from(super::state_view::FRAME)?;
+    let saved: Option<(i64, Option<String>)> = c.query_row("SELECT length(CAST(v AS BLOB)),CASE WHEN length(CAST(v AS BLOB))<=?2 THEN v END FROM kv WHERE k=?1", rusqlite::params![format!("{PRODUCER_PREFIX}{parent}"), budget], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let json = match saved { None => return Ok(None), Some((_, Some(json))) => json, Some((_, None)) => return Err(super::mail::Error::TooLarge { revision: 0, budget: super::state_view::FRAME }.into()) };
+    let record: ProducerRecord = serde_json::from_str(&json)?;
+    anyhow::ensure!(record.version > 0, "invalid internal news version");
+    let next = record.version.checked_add(1).ok_or_else(|| anyhow::anyhow!("internal news version exhausted"))?;
+    VERSION.fetch_max(next, std::sync::atomic::Ordering::Relaxed);
+    Ok(Some(record))
+}
+
+async fn load_parent(hub: &Arc<crate::hub::Hub>, parent: &str) -> Result<(), super::mail::Error> {
+    if TOLD.lock().producers_loaded.contains(parent) { return Ok(()); }
+    let id = parent.to_owned();
+    let record = hub.store.read(move |c| read_producer(c, &id)).await.map_err(persistence_error)?;
+    let reconciled = if let Some(original) = record.as_ref().and_then(|r| r.content.owned.original()) {
+        let id = original_id(original).ok_or_else(|| super::mail::Error::Invalid { reason: "saved producer original has no id".into() })?;
+        super::mail::receipt(&hub.store, "server".into(), "server".into(), parent.to_owned(), id.to_owned()).await?
+    } else { None };
+    let start = {
+        let mut told = TOLD.lock();
+        if told.producers_loaded.contains(parent) { return Ok(()); }
+        if let Some(record) = &record {
+            if matches!(record.content.owned, Owned::Retained { .. }) && reconciled.is_none() { return Err(super::mail::Error::Unavailable { reason: "saved retained news has no authoritative ledger receipt".into() }); }
+            let news = restore_news(record)?;
+            told.news.insert(parent.to_owned(), news);
+        }
+        told.producers_loaded.insert(parent.to_owned());
+        let next = if let Some(receipt) = &reconciled { told.mail_progress(parent, receipt) }
+            else { record.as_ref().and_then(|r| r.content.owned.original()).cloned() };
+        next.is_some_and(|command| queue_for(parent, command))
+    };
+    if start { start_senders(hub, vec![parent.to_owned()]); }
+    Ok(())
+}
+
+async fn storage_room(hub: &crate::hub::Hub, bytes: u64, rows: u64) -> Result<(), super::mail::Error> {
+    let floor = super::mail_delivery::storage_floor(hub)?;
+    let data = hub.cfg.server.data_dir.clone();
+    let free = crate::rt::blocking(move || crate::os::disk_available(&data)).await.map_err(|e| super::mail::Error::Unavailable { reason: e.to_string() })?.ok_or_else(|| super::mail::Error::Unavailable { reason: "producer volume free space is unknown".into() })?;
+    // A shrinking snapshot may replace a larger previously bounded producer/run row.
+    let old_bound = u64::try_from(super::state_view::FRAME).map_err(|error| persistence_error(error.into()))?.checked_mul(rows).ok_or_else(|| super::mail::Error::Unavailable { reason: "producer prior payload bound overflow".into() })?;
+    let scratch = hub.store.storage_reserve_tables(bytes.max(old_bound), vec!["kv".into(), "told_runs".into()], rows).await.map_err(persistence_error)?;
+    let required = floor.checked_add(scratch).ok_or_else(|| super::mail::Error::Unavailable { reason: "producer storage scratch overflow".into() })?;
+    if free < required { return Err(super::mail::Error::Capacity { required, authority: free }); }
+    Ok(())
+}
+
+struct Bytes(u64);
+impl std::io::Write for Bytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let n = u64::try_from(bytes.len()).map_err(std::io::Error::other)?;
+        self.0 = self.0.checked_add(n).ok_or_else(|| std::io::Error::other("producer payload size overflow"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
 /// `rows` written to `told_runs`: an older state never overwrites (nor deletes) a newer one,
 /// whichever write reaches the store first.
+#[cfg(test)]
 async fn write_rows(store: &crate::store::Store, rows: Vec<Row>) -> anyhow::Result<()> {
-    if rows.is_empty() {
-        return Ok(());
+    if rows.is_empty() { return Ok(()); }
+    store.call(move |c| { let tx = c.savepoint()?; write_rows_on(&tx, &rows)?; tx.commit()?; Ok(()) }).await
+}
+
+fn write_rows_on(c: &rusqlite::Connection, rows: &[Row]) -> anyhow::Result<()> {
+    for (session, key, ran, version) in rows {
+        match ran {
+            Some(r) => {
+                let news = serde_json::to_string(&r.news)?;
+                c.execute("INSERT INTO told_runs (session,key,runner,news,handed_at,heard_at,told,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(session,key) DO UPDATE SET runner=excluded.runner,news=excluded.news,handed_at=excluded.handed_at,heard_at=excluded.heard_at,told=excluded.told,version=excluded.version WHERE excluded.version>told_runs.version",
+                    rusqlite::params![session,key,r.runner,news,r.handed_at,i64::try_from(r.heard_at).unwrap_or(i64::MAX),r.told,version])?;
+            }
+            None => { c.execute("DELETE FROM told_runs WHERE session=?1 AND key=?2 AND version<?3", rusqlite::params![session,key,version])?; }
+        }
     }
-    store
-        .call(move |c| {
-            let tx = c.savepoint()?;
-            for (session, key, ran, version) in rows {
-                match ran {
-                    Some(r) => {
-                        let news = serde_json::to_string(&r.news)?;
-                        tx.execute(
-                            "INSERT INTO told_runs (session, key, runner, news, handed_at, heard_at, told, version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                             ON CONFLICT (session, key) DO UPDATE SET runner = excluded.runner, news = excluded.news, handed_at = excluded.handed_at, heard_at = excluded.heard_at, told = excluded.told, version = excluded.version
-                             WHERE excluded.version > told_runs.version",
-                            rusqlite::params![session, key, r.runner, news, r.handed_at, i64::try_from(r.heard_at).unwrap_or(i64::MAX), r.told, version],
-                        )?;
-                    }
-                    None => {
-                        tx.execute("DELETE FROM told_runs WHERE session = ?1 AND key = ?2 AND version < ?3", rusqlite::params![session, key, version])?;
-                    }
+    Ok(())
+}
+
+fn write_persist(c: &mut rusqlite::Connection, mut batch: Persist, confirmed: &HashSet<(String, String)>) -> anyhow::Result<Persist> {
+    let tx = c.savepoint()?;
+    let mut stale = HashSet::new();
+    for producer in &batch.producers {
+        if let Some(previous) = read_producer(&tx, &producer.parent)? {
+            if previous.version >= producer.record.version {
+                if previous.version == producer.record.version { anyhow::ensure!(serde_json::to_string(&previous)? == producer.json, "one producer version names different state"); }
+                stale.insert(producer.parent.clone()); continue;
+            }
+            if let Some(original) = previous.content.owned.original() {
+                let old_id = original_id(original).ok_or_else(|| anyhow::anyhow!("saved producer original is invalid"))?;
+                if producer.record.content.owned.original() != Some(original) {
+                    if producer.record.content.owned.original().and_then(original_id) == Some(old_id) { return Err(super::mail::Error::Reused { id: old_id.to_owned() }.into()); }
+                    anyhow::ensure!(confirmed.contains(&(producer.parent.clone(), old_id.to_owned())), "an unarchived producer original cannot be replaced");
                 }
             }
-            tx.commit()?;
-            Ok(())
-        })
-        .await
+        }
+        tx.execute("INSERT INTO kv(k,v) VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v", rusqlite::params![format!("{PRODUCER_PREFIX}{}", producer.parent), producer.json])?;
+    }
+    for row in &batch.runs {
+        if !stale.contains(row.0.as_str()) { write_rows_on(&tx, std::slice::from_ref(row))?; }
+    }
+    tx.commit()?;
+    batch.runs.retain(|row| !stale.contains(row.0.as_str()));
+    batch.producers.retain(|producer| !stale.contains(producer.parent.as_str()));
+    Ok(batch)
 }
 
 /// What `told_runs` keeps, by agent, the oldest written first.
@@ -616,8 +870,8 @@ async fn read_rows(store: &crate::store::Store) -> anyhow::Result<Vec<(String, R
             let mut out = Vec::new();
             for row in rows {
                 let (session, runner, news, handed_at, heard_at, told) = row?;
-                let Ok(news) = serde_json::from_str::<RunNews>(&news) else { continue };
-                out.push((session, Ran { news, handed_at, runner, heard_at: u64::try_from(heard_at).unwrap_or(0), told, held: true }));
+                let news = serde_json::from_str::<RunNews>(&news)?;
+                out.push((session, Ran { news, handed_at, runner, heard_at: u64::try_from(heard_at)?, told, held: true }));
             }
             Ok(out)
         })
@@ -629,14 +883,18 @@ async fn read_rows(store: &crate::store::Store) -> anyhow::Result<Vec<(String, R
 /// stack drives now; `quiet`: those paused for usage (docs/programs.md), which get no new message,
 /// since one would start their turn: their news waits, and goes once they go on.
 pub async fn tick(hub: &Arc<crate::hub::Hub>, all: &[Info], now: i64, driven: &[String], quiet: &[String]) {
-    load(hub).await;
+    if let Err(error) = load(hub).await { tracing::warn!(error=?error, "internal news canonical state unavailable"); return; }
+    for parent in all { if let Err(error) = load_parent(hub, &parent.id).await { tracing::warn!(agent=%parent.id,error=?error,"internal news producer state unavailable"); return; } }
     // News a server before this one queued, waiting still: this one adds to it.
-    for p in all.iter().filter(|p| !matches!(p.status, Status::Exited | Status::Disconnected) && p.queue.iter().any(|q| super::queued::from_before(&q.id, NEWS))) {
+    for p in all.iter().filter(|p| !matches!(p.status, Status::Exited | Status::Disconnected) && (p.queue_partial || p.queue.iter().any(|q| super::queued::from_before(&q.id, NEWS)))) {
         if TOLD.lock().news.contains_key(&p.id) {
             continue;
         }
-        if let Some(q) = hub.harness.queue(&p.id).into_iter().find(|q| super::queued::from_before(&q.id, NEWS)) {
-            TOLD.lock().found(&p.id, q.id, q.text, now);
+        let found = super::state_reads::first(hub, &p.id, p, |q| super::queued::from_before(&q.id, NEWS)).await;
+        if let Ok(Some(found)) = found
+            && let Ok(Some(q)) = super::state_reads::item(hub, &p.id, p, &found.id).await
+        {
+            TOLD.lock().found(&p.id, q.value.id, q.value.text, now);
         }
     }
     // The runners up now: a run whose runner is away has no one to say how it ends until it's back
@@ -662,8 +920,8 @@ pub async fn tick(hub: &Arc<crate::hub::Hub>, all: &[Info], now: i64, driven: &[
         }
         start
     };
+    if let Err(error) = flush(hub).await { for parent in &start { if let Some(q) = TO_SEND.lock().get_mut(parent) { q.state = SenderState::Blocked; } } tracing::warn!(error=?error, "internal news original not persisted"); return; }
     start_senders(hub, start);
-    flush(hub).await;
 }
 
 /// Each of `all` by its id, the first of any id given twice (as a scan for it finds).
@@ -676,6 +934,90 @@ fn by_id(all: &[Info]) -> HashMap<&str, &Info> {
 }
 
 impl Told {
+    fn mark_news(&mut self, parent: &str) { self.news_dirty.insert(parent.to_owned()); }
+
+    fn remove_news(&mut self, parent: &str) {
+        if let Some(news) = self.news.remove(parent) { self.removed.insert(parent.to_owned(), news.previous); }
+        self.mark_news(parent);
+    }
+
+    fn capture(&mut self) -> Result<Persist, super::mail::Error> {
+        let runs = self.dirty_rows()?;
+        let mut producers = Vec::new();
+        for parent in &self.news_dirty {
+            let content = content(self.news.get(parent), self.removed.get(parent).cloned().flatten());
+            let captured_runs = runs.iter().filter(|(session, _, row, _)| session == parent && row.as_ref().is_some_and(|r| r.told)).map(|(_, key, _, version)| (key.clone(), *version)).collect();
+            let record = ProducerRecord { version: next_version()?, content, captured_runs };
+            let bytes = super::state_view::encode(&record, super::state_view::FRAME).map_err(|_| super::mail::Error::TooLarge { revision: 0, budget: super::state_view::FRAME })?;
+            let json = String::from_utf8(bytes).map_err(|e| super::mail::Error::Unavailable { reason: e.to_string() })?;
+            producers.push(ProducerWrite { parent: parent.clone(), record, json });
+        }
+        // A later in-flight capture may commit after this one. Equality alone cannot fence
+        // X→Y→X changes: only the newest capture may acknowledge its still-current values.
+        for (parent, key, _, version) in &runs { self.captured_runs.insert((parent.clone(), key.clone()), *version); }
+        for producer in &producers { self.captured_news.insert(producer.parent.clone(), producer.record.version); }
+        Ok(Persist { runs, producers })
+    }
+
+    fn acknowledge(&mut self, batch: &Persist) {
+        for (parent, key, saved, version) in &batch.runs {
+            let current = self.runs.get(parent).and_then(|rs| rs.iter().find(|r| r.news.key == *key));
+            let identity = (parent.clone(), key.clone());
+            if self.captured_runs.get(&identity) == Some(version) && current == saved.as_ref() { self.dirty.remove(&identity); self.captured_runs.remove(&identity); }
+        }
+        for producer in &batch.producers {
+            if self.captured_news.get(&producer.parent) == Some(&producer.record.version) && content(self.news.get(&producer.parent), self.removed.get(&producer.parent).cloned().flatten()) == producer.record.content {
+                self.news_dirty.remove(&producer.parent); self.removed.remove(&producer.parent);
+                self.captured_news.remove(&producer.parent);
+            }
+        }
+    }
+
+    /// A changed explicit news snapshot is another immutable publication, never a source edit.
+    fn revision(n: &mut News, text: String) -> Option<Command> {
+        let mut message = n.msg.as_ref()?.clone();
+        let id = super::queued::made(NEWS);
+        message.id = id.clone(); message.text = text.clone(); message.held.clear(); message.awaiting_source();
+        n.msg = Some(message); n.custody = NewsCustody::Pending;
+        n.said.clone_from(&n.lines); n.said_more = (n.more, n.more_runs);
+        n.given.clear(); gave(&mut n.given, &text, &n.lines);
+        Some(Command::Send { id, text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None })
+    }
+
+    fn mail_progress(&mut self, parent: &str, receipt: &super::mail::Receipt) -> Option<Command> {
+        let mut changed = false;
+        let result = self.progress(parent, receipt, &mut changed);
+        if changed { self.mark_news(parent); }
+        result
+    }
+
+    fn progress(&mut self, parent: &str, receipt: &super::mail::Receipt, changed: &mut bool) -> Option<Command> {
+        use super::mail::Disposition;
+        let n = self.news.get_mut(parent)?;
+        let message = n.msg.as_mut()?;
+        if message.id != receipt.id { return None; }
+        if let NewsCustody::Retained(previous) = &n.custody {
+            if previous.revision != receipt.revision || previous.generation > receipt.generation { return None; }
+            if previous.generation == receipt.generation && previous.disposition == receipt.disposition { return None; }
+        }
+        *changed = true;
+        let mut previous = receipt.clone(); previous.repeat = false; n.previous = Some(previous);
+        message.awaiting_source();
+        n.custody = NewsCustody::Retained(receipt.clone());
+        if matches!(receipt.disposition, Disposition::Consumed | Disposition::Cancelled | Disposition::Superseded) {
+            n.lines.retain(|line| !n.said.contains(line));
+            n.more = n.more.saturating_sub(n.said_more.0); n.more_runs = n.more_runs.saturating_sub(n.said_more.1);
+            n.msg = None; n.before = None; n.said.clear(); n.held.clear(); n.given.clear(); n.said_more = (0, 0);
+            n.custody = NewsCustody::Legacy;
+            return None;
+        }
+        // Publication ACK can race a newer desired snapshot. The original stays immutable;
+        // make the latest successor only now, after its predecessor has committed custody.
+        let desired = n.text();
+        if !desired.is_empty() && n.msg.as_ref().is_some_and(|m| m.text != desired) { return Self::revision(n, desired); }
+        None
+    }
+
     /// Runs a server before this one kept (`told_runs`), taken in under what this one heard since
     /// (newer); each runner's count of news as high as any of its runs says, so the window a repeat
     /// can come in goes on from there.
@@ -698,13 +1040,12 @@ impl Told {
     }
 
     /// The runs changed or gone since they were last written, as they stand now.
-    fn dirty_rows(&mut self) -> Vec<Row> {
-        let dirty = std::mem::take(&mut self.dirty);
-        dirty
-            .into_iter()
+    fn dirty_rows(&self) -> Result<Vec<Row>, super::mail::Error> {
+        self.dirty
+            .iter()
             .map(|(session, key)| {
-                let ran = self.runs.get(&session).and_then(|rs| rs.iter().find(|r| r.news.key == key)).cloned();
-                (session, key, ran, VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                let ran = self.runs.get(session).and_then(|rs| rs.iter().find(|r| r.news.key == *key)).cloned();
+                Ok((session.clone(), key.clone(), ran, next_version()?))
             })
             .collect()
     }
@@ -734,19 +1075,21 @@ impl Told {
         if n.lines.len() == had {
             return None;
         }
+        self.news_dirty.insert(parent.to_owned());
         let (empty, text) = (n.lines.is_empty() && n.before.is_none(), n.text());
+        if !matches!(n.custody, NewsCustody::Legacy) {
+            if !empty && matches!(n.custody, NewsCustody::Retained(_)) { return Self::revision(n, text); }
+            // The caller saw a line; that is not permission to remove an accepted original
+            // from its ledger or mutate a frozen source prompt. It retires by exact receipt.
+            return None;
+        }
         let c = match n.msg.as_mut() {
             Some(m) if empty => Some(Command::QueueRemove { id: m.id.clone() }),
-            Some(m) => {
-                m.text = text;
-                n.said.clone_from(&n.lines);
-                gave(&mut n.given, &m.text, &n.lines);
-                Some(Command::QueueEdit { id: m.id.clone(), text: m.text.clone(), attachments: None })
-            }
+            Some(_) => Self::revision(n, text),
             None => None,
         };
         if empty {
-            self.news.remove(parent);
+            self.remove_news(parent);
         }
         c
     }
@@ -808,6 +1151,7 @@ impl Told {
             None => runs.push(Ran::new(news, now, runner, heard)),
         }
         self.dirty.insert((session.to_owned(), key.clone()));
+        self.mark_news(session);
         Ok(if event == RunEvent::Seen { self.take_line(session, &format!("{RUN}{key}")) } else { None })
     }
 
@@ -835,12 +1179,13 @@ impl Told {
     /// (it had their answer, and says them no more: the window a repeat can come in, T13); one
     /// going whose runner is away (`up` says which are here) holds its agent back no more.
     fn due_runs(&mut self, all: &[Info], now: i64, up: &dyn Fn(&str) -> bool) -> HashMap<String, Vec<(String, String)>> {
-        let Told { runs, heard, dirty, .. } = self;
+        let Told { runs, heard, dirty, news_dirty, .. } = self;
         let live: HashSet<&str> = all.iter().filter(|i| i.status != Status::Exited).map(|i| i.id.as_str()).collect();
         runs.retain(|s, rs| {
             let keep = live.contains(s.as_str());
             if !keep {
                 dirty.extend(rs.iter().map(|r| (s.clone(), r.news.key.clone())));
+                news_dirty.insert(s.clone());
             }
             keep
         });
@@ -855,6 +1200,7 @@ impl Told {
                 }
                 r.told = true;
                 dirty.insert((agent.clone(), r.news.key.clone()));
+                news_dirty.insert(agent.clone());
                 if !matches!(r.news.event, RunEvent::Going | RunEvent::Seen) {
                     by_agent.entry(agent.clone()).or_default().push((format!("{RUN}{}", r.news.key), run_line(&r.news, now)));
                 }
@@ -863,6 +1209,7 @@ impl Told {
                 let keep = !(r.finished() && heard.get(&r.runner).is_some_and(|h| *h > r.heard_at));
                 if !keep {
                     dirty.insert((agent.clone(), r.news.key.clone()));
+                    news_dirty.insert(agent.clone());
                 }
                 keep
             });
@@ -951,14 +1298,15 @@ impl Told {
         // of each of those, for each parent, under `TOLD`'s lock, on the goal driver's shard (goal 9, plan 01a1a87b2cec
         // step 3).
         let (by_id, quiet) = (by_id(all), quiet.iter().map(String::as_str).collect::<HashSet<&str>>());
-        self.news.retain(|p, _| by_id.contains_key(p.as_str()));
+        let removed: Vec<String> = self.news.iter().filter(|(p, n)| !by_id.contains_key(p.as_str()) && (n.msg.is_none() || matches!(n.custody, NewsCustody::Legacy))).map(|(p, _)| p.clone()).collect();
+        for parent in removed { self.remove_news(&parent); }
         let parents: BTreeSet<String> = self.news.keys().chain(due.keys()).cloned().collect();
         let mut out = Vec::new();
         for parent in parents {
             let Some(info) = by_id.get(parent.as_str()).copied() else { continue };
             let n = self.news.entry(parent.clone()).or_default();
             let mut unheard = false;
-            if let Some(m) = n.msg.as_mut() {
+            if let Some(m) = n.msg.as_mut() && matches!(n.custody, NewsCustody::Legacy) {
                 let at = m.look(Some(info), now);
                 // What it says reaches the parent, unless an edit of it didn't go (its words not
                 // known since: what it held before stands).
@@ -987,7 +1335,9 @@ impl Told {
                     n.more_runs = 0;
                 }
             }
-            for (child, l) in due.remove(&parent).unwrap_or_default() {
+            let additions = due.remove(&parent).unwrap_or_default();
+            if !additions.is_empty() { self.news_dirty.insert(parent.clone()); }
+            for (child, l) in additions {
                 n.lines.retain(|(c, _)| *c != child);
                 n.lines.push((child, l));
             }
@@ -998,29 +1348,29 @@ impl Told {
                 n.more = n.more.saturating_add(over.saturating_sub(runs));
                 n.more_runs = n.more_runs.saturating_add(runs);
             }
-            if (n.lines.is_empty() && n.before.is_none()) || info.status == Status::Exited {
-                self.news.remove(&parent);
+            if ((n.lines.is_empty() && n.before.is_none()) || info.status == Status::Exited) && (n.msg.is_none() || matches!(n.custody, NewsCustody::Legacy)) {
+                self.remove_news(&parent);
                 continue;
             }
-            if info.status == Status::Disconnected || unheard {
+            if matches!(info.status, Status::Disconnected | Status::Exited) || unheard {
                 continue;
             }
             let text = n.text();
             match n.msg.as_mut() {
                 Some(m) if m.text == text => {}
-                Some(m) => {
-                    out.push((parent, Command::QueueEdit { id: m.id.clone(), text: text.clone(), attachments: None }));
-                    gave(&mut n.given, &text, &n.lines);
-                    m.text = text;
-                    n.said.clone_from(&n.lines);
-                }
+                Some(_) if matches!(n.custody, NewsCustody::Pending) => {}
+                Some(_) => { if !text.is_empty() && let Some(c) = Self::revision(n, text) { self.news_dirty.insert(parent.clone()); out.push((parent, c)); } }
                 None if quiet.contains(parent.as_str()) => {}
                 None if n.lines.iter().all(|(k, _)| calm.contains(k)) => {}
                 None => {
                     let id = super::queued::made(NEWS);
+                    self.news_dirty.insert(parent.clone());
                     out.push((parent, Command::Send { id: id.clone(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }));
                     n.given = vec![(super::queued::stable(&text), n.lines.clone())];
                     n.msg = Some(Kept::sent(id, text, info, now));
+                    if let Some(message) = n.msg.as_mut() { message.awaiting_source(); }
+                    n.custody = NewsCustody::Pending;
+                    n.said_more = (n.more, n.more_runs);
                     n.said.clone_from(&n.lines);
                     n.held.clone_from(&n.lines);
                 }
@@ -1031,8 +1381,10 @@ impl Told {
 
     /// Command `c` from `plan` didn't reach `parent`: what it said goes at the next look (an edit
     /// that didn't go says nothing the message holds, so the lines it carried aren't taken as held).
+    #[cfg(test)]
     fn unsent(&mut self, parent: &str, c: &Command) {
         let Some(n) = self.news.get_mut(parent) else { return };
+        if !matches!(n.custody, NewsCustody::Legacy) { return; }
         match (c, n.msg.as_mut()) {
             (Command::Send { id, .. }, Some(m)) if m.id == *id => {
                 n.msg = None;
@@ -1415,6 +1767,65 @@ mod tests {
         p.queued = 0;
     }
 
+    /// Real immutable ledger custody, kept separate from apply/take's source observations.
+    /// The two unresolved slots represent one frozen original and its latest desired successor.
+    struct NewsLedger { store: crate::store::Store, parent: String }
+
+    impl NewsLedger {
+        fn new(parent: &str) -> anyhow::Result<Self> { Ok(Self { store: crate::store::Store::in_memory()?, parent: parent.into() }) }
+
+        fn publication(&self, command: &Command) -> anyhow::Result<super::super::mail::Publish> {
+            let id=original_id(command).ok_or_else(||anyhow::anyhow!("news is not an immutable send"))?;
+            Ok(super::super::mail::Publish { owner:"server".into(),sender:"server".into(),recipient:self.parent.clone(),id:id.into(),command:serde_json::to_value(command)?,provenance:None,status:Some(super::super::mail::StatusKey { task:None,key:"internal-news".into() }) })
+        }
+
+        async fn publish(&self, told: &mut Told, command: &Command) -> anyhow::Result<Option<Command>> {
+            let receipt=super::super::mail::publish(&self.store,self.publication(command)?,u64::MAX,2).await?;
+            Ok(told.mail_progress(&self.parent,&receipt))
+        }
+
+        async fn admit(&self, told: &mut Told, parent: &mut Info, command: &Command) -> anyhow::Result<super::super::mail::Delivery> {
+            let id=original_id(command).ok_or_else(||anyhow::anyhow!("not a send"))?;
+            let receipt=super::super::mail::receipt(&self.store,"server".into(),"server".into(),self.parent.clone(),id.into()).await?.ok_or_else(||anyhow::anyhow!("original was not committed"))?;
+            let delivery=super::super::mail::claim_at(&self.store,receipt.revision,1,1,"fixture-owner".into(),super::super::state_view::FRAME).await?.ok_or_else(||anyhow::anyhow!("original is not eligible"))?;
+            assert_eq!(delivery.publication.command,serde_json::to_value(command)?,"source receives the immutable stored command");
+            let admitted=super::super::mail::mark_admitted(&self.store,delivery.token,delivery.epoch).await?;
+            assert!(told.mail_progress(&self.parent,&admitted).is_none());
+            apply(parent,command);
+            Ok(delivery)
+        }
+
+        async fn consume(&self, told: &mut Told, delivery: &super::super::mail::Delivery) -> anyhow::Result<()> {
+            let consumed=super::super::mail::mark_consumed(&self.store,delivery.token,delivery.epoch).await?;
+            assert!(told.mail_progress(&self.parent,&consumed).is_none());
+            Ok(())
+        }
+
+        async fn history(&self) -> anyhow::Result<Vec<super::super::mail::Publication>> {
+            let page=super::super::mail::history(&self.store,"server".into(),"server".into(),self.parent.clone(),None,0,super::super::state_view::FRAME).await?;
+            anyhow::ensure!(page.next.is_none(),"fixture history must fit its bounded page");
+            Ok(page.items)
+        }
+
+        async fn originals(&self, commands: &[Command]) -> anyhow::Result<()> {
+            let history=self.history().await?;
+            assert_eq!(history.len(),commands.len());
+            for command in commands {
+                let id=original_id(command).ok_or_else(||anyhow::anyhow!("not a send"))?;
+                assert_eq!(history.iter().find(|row|row.receipt.id==id).map(|row|&row.publication.command),Some(&serde_json::to_value(command)?),"all accepted words stay immutable: {id}");
+            }
+            Ok(())
+        }
+    }
+
+    fn one_send(commands: &[Command]) -> anyhow::Result<Command> {
+        match commands { [command @ Command::Send { .. }] => Ok(command.clone()),_ => anyhow::bail!("expected one immutable send: {commands:?}") }
+    }
+
+    fn words(command: &Command) -> anyhow::Result<(&str,&str)> {
+        match command { Command::Send { id,text,.. } => Ok((id,text)),_ => anyhow::bail!("expected an immutable send") }
+    }
+
     /// Children `which` (by index, with their last words) go to work, then end a turn and stand
     /// settled a while, from `now`: what goes to their parent `p` meanwhile.
     fn settle(t: &mut Told, p: &Info, kids: &mut [Info], which: &[(usize, &str)], now: i64) -> Vec<Command> {
@@ -1441,318 +1852,433 @@ mod tests {
         t.news.get(parent).and_then(|n| n.msg.as_ref()).map(|m| m.text.clone()).unwrap_or_default()
     }
 
-    /// The incident: a coordinator in one turn for hours, its children settling again and again.
-    /// What waits for it is one message, each child's latest line in it once; when its turn ends
-    /// and it takes that, what settles next is news again, in a message of its own.
+    #[test]
+    fn durable_news_keeps_unaccepted_original_and_revises_only_after_custody() -> anyhow::Result<()> {
+        let mut t = Told::default(); let p = coordinator("parent");
+        let original = "original status".to_owned(); let id = "news-original".to_owned();
+        let mut message = Kept::sent(id.clone(), original.clone(), &p, 0); message.awaiting_source();
+        t.news.insert(p.id.clone(), News { msg: Some(message), lines: vec![("child".into(), "latest desired status".into())], said: vec![("child".into(), original.clone())], custody: NewsCustody::Pending, ..News::default() });
+        let failed = Command::Send { id: id.clone(), text: original.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+        t.unsent(&p.id, &failed);
+        assert_eq!(news_of(&t, &p.id), original);
+        assert!(t.plan(std::slice::from_ref(&p), 1_000_000, &[], &[]).is_empty(), "unaccepted original must not generate fresh ids or mutate on timeout/queue absence");
+        let accepted = super::super::mail::Receipt { id: id.clone(), revision: 7, generation: 0, disposition: super::super::mail::Disposition::Waiting, repeat: false };
+        let successor = t.mail_progress(&p.id, &accepted).ok_or_else(|| anyhow::anyhow!("latest desired snapshot was not published"))?;
+        let Command::Send { id: next, text, .. } = successor else { anyhow::bail!("news revised by a mutable source edit") };
+        assert_ne!(next, id); assert_eq!(text, "latest desired status");
+        assert!(t.plan(std::slice::from_ref(&p), 2_000_000, &[], &[]).is_empty());
+        let old_consumed = super::super::mail::Receipt { disposition: super::super::mail::Disposition::Consumed, generation: 1, ..accepted };
+        assert!(t.mail_progress(&p.id, &old_consumed).is_none());
+        assert_eq!(t.news.get(&p.id).and_then(|n| n.msg.as_ref()).map(|m| m.id.as_str()), Some(next.as_str()), "old receipt cannot retire the successor");
+        Ok(())
+    }
+
+    #[test]
+    fn only_exact_committed_consumption_retires_durable_news() -> anyhow::Result<()> {
+        let mut t = Told::default(); let p = coordinator("parent"); let id = "news-exact".to_owned();
+        let mut message = Kept::sent(id.clone(), "status".into(), &p, 0); message.awaiting_source();
+        t.news.insert(p.id.clone(), News { msg: Some(message), lines: vec![("child".into(), "status".into())], said: vec![("child".into(), "status".into())], custody: NewsCustody::Pending, ..News::default() });
+        let admitted = super::super::mail::Receipt { id: id.clone(), revision: 9, generation: 2, disposition: super::super::mail::Disposition::Admitted, repeat: false };
+        assert!(t.mail_progress(&p.id, &admitted).is_none());
+        let mut observed = p.clone(); observed.said.push(super::super::model::Given { id: id.clone(), digest: super::super::queued::stable("status") });
+        assert!(t.plan(std::slice::from_ref(&observed), 5_000_000, &[], &[]).is_empty());
+        assert!(t.news.get(&p.id).is_some_and(|n| n.msg.is_some()), "an index/old note_sent echo is not consumption");
+        let stale = super::super::mail::Receipt { generation: 1, disposition: super::super::mail::Disposition::Consumed, ..admitted.clone() };
+        t.mail_progress(&p.id, &stale); assert!(t.news.get(&p.id).is_some_and(|n| n.msg.is_some()));
+        let consumed = super::super::mail::Receipt { disposition: super::super::mail::Disposition::Consumed, ..admitted };
+        t.mail_progress(&p.id, &consumed);
+        assert!(t.news.get(&p.id).is_some_and(|n| n.msg.is_none() && n.lines.is_empty()));
+        Ok(())
+    }
+
+    fn producer_db() -> anyhow::Result<rusqlite::Connection> {
+        let c = rusqlite::Connection::open_in_memory()?;
+        c.execute_batch("CREATE TABLE kv(k TEXT PRIMARY KEY,v TEXT NOT NULL);")?;
+        c.execute_batch(include_str!("../store/migrations/20261107-0600_told_runs.sql"))?;
+        Ok(c)
+    }
+
+    fn producer_write(version: i64, id: &str, original: &str, desired: &str) -> anyhow::Result<ProducerWrite> {
+        let command = Command::Send { id: id.into(), text: original.into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+        let content = ProducerContent { owned: Owned::Pending { original: command }, desired: Desired { lines: vec![("run:r1".into(), desired.into())], ..Desired::default() }, said: vec![("run:r1".into(), original.into())], said_more: (0,0), previous: None };
+        let record = ProducerRecord { version, content, captured_runs: vec![("r1".into(),version)] };
+        let json = serde_json::to_string(&record)?;
+        Ok(ProducerWrite { parent: "parent".into(), record, json })
+    }
+
+    #[test]
+    fn producer_original_and_run_ack_commit_together_and_restore_exact_bytes() -> anyhow::Result<()> {
+        let directory=tempfile::tempdir()?;let path=directory.path().join("producer.sqlite");
+        let mut c=rusqlite::Connection::open(&path)?;
+        c.execute_batch("CREATE TABLE kv(k TEXT PRIMARY KEY,v TEXT NOT NULL);")?;
+        c.execute_batch(include_str!("../store/migrations/20261107-0600_told_runs.sql"))?;
+        let mut ran = Ran::new(run_ended("r1"), 0, "runner", 1); ran.told = true;
+        let producer = producer_write(20,"news-stable","original 日本語 \\\"","latest desired is separate")?;
+        let expected = producer.record.content.clone();
+        write_persist(&mut c, Persist { runs: vec![("parent".into(),"r1".into(),Some(ran),20)], producers: vec![producer] }, &HashSet::new())?;
+        drop(c);let c=rusqlite::Connection::open(&path)?;
+        let saved = read_producer(&c,"parent")?.ok_or_else(|| anyhow::anyhow!("producer was not committed"))?;
+        assert_eq!(saved.content,expected);
+        assert!(c.query_row("SELECT told FROM told_runs WHERE session='parent' AND key='r1'",[],|r|r.get::<_,bool>(0))?);
+        let restored = restore_news(&saved)?;
+        assert_eq!(restored.msg.as_ref().map(|m| m.id.as_str()),Some("news-stable"));
+        assert_eq!(restored.msg.as_ref().map(|m| m.text.as_str()),Some("original 日本語 \\\""));
+        assert_eq!(restored.lines.first().map(|l|l.1.as_str()),Some("latest desired is separate"));
+        Ok(())
+    }
+
+    #[test]
+    fn unarchived_original_cannot_be_replaced_or_acknowledge_a_run() -> anyhow::Result<()> {
+        let mut c=producer_db()?;
+        write_persist(&mut c,Persist { runs:Vec::new(),producers:vec![producer_write(30,"news-old","exact original","desired-a")?] },&HashSet::new())?;
+        let mut ran=Ran::new(run_ended("r1"),0,"runner",1);ran.told=true;
+        let failed=write_persist(&mut c,Persist { runs:vec![("parent".into(),"r1".into(),Some(ran),31)],producers:vec![producer_write(31,"news-new","new body","desired-b")?] },&HashSet::new());
+        assert!(failed.is_err());
+        let original=read_producer(&c,"parent")?.ok_or_else(||anyhow::anyhow!("original disappeared"))?;
+        assert_eq!(original.content.owned.original().and_then(original_id),Some("news-old"));
+        assert_eq!(c.query_row("SELECT count(*) FROM told_runs",[],|r|r.get::<_,i64>(0))?,0);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_producer_capture_cannot_resurrect_a_deleted_newer_run_row() -> anyhow::Result<()> {
+        let mut c=producer_db()?;
+        write_persist(&mut c,Persist { runs:vec![("parent".into(),"r1".into(),None,50)],producers:vec![producer_write(50,"news-one","original","newer desired")?] },&HashSet::new())?;
+        let mut ran=Ran::new(run_ended("r1"),0,"runner",1);ran.told=true;
+        write_persist(&mut c,Persist { runs:vec![("parent".into(),"r1".into(),Some(ran),40)],producers:vec![producer_write(40,"news-one","original","older desired")?] },&HashSet::new())?;
+        assert_eq!(c.query_row("SELECT count(*) FROM told_runs",[],|r|r.get::<_,i64>(0))?,0);
+        assert_eq!(read_producer(&c,"parent")?.ok_or_else(||anyhow::anyhow!("no producer"))?.version,50);
+        Ok(())
+    }
+
+    #[test]
+    fn persistence_failure_keeps_dirty_keys_and_does_not_mutate_owned_original() -> anyhow::Result<()> {
+        let mut c=producer_db()?;
+        c.execute_batch("CREATE TRIGGER refuse_producer BEFORE INSERT ON kv BEGIN SELECT RAISE(ABORT,'injected producer failure'); END;")?;
+        let mut t=Told::default();
+        t.ran("runner",true,"parent",run_ended("r1"),1).map_err(anyhow::Error::msg)?;
+        let saved=producer_write(60,"news-stable","original","desired")?;
+        let news=restore_news(&saved.record)?;t.news.insert("parent".into(),news);t.mark_news("parent");
+        let rows=t.dirty_rows()?;
+        assert!(write_persist(&mut c,Persist { runs:rows,producers:vec![saved] },&HashSet::new()).is_err());
+        assert!(t.dirty.contains(&("parent".into(),"r1".into())));
+        assert!(t.news_dirty.contains("parent"));
+        assert_eq!(t.news.get("parent").and_then(|n|n.msg.as_ref()).map(|m|m.id.as_str()),Some("news-stable"));
+        assert_eq!(c.query_row("SELECT count(*) FROM told_runs",[],|r|r.get::<_,i64>(0))?,0);
+        let refusal=Refusal::Persistence { error:super::super::mail::Error::StorageFull };
+        assert_eq!(refusal.status(),http::StatusCode::INSUFFICIENT_STORAGE.as_u16());
+        Ok(())
+    }
+
+    #[test]
+    fn in_flight_newer_capture_fences_equal_older_acknowledgement() -> anyhow::Result<()> {
+        let mut c=producer_db()?;
+        let mut t=Told::default();
+        t.ran("runner",true,"parent",run_ended("r1"),1).map_err(anyhow::Error::msg)?;
+        t.news.insert("parent".into(),restore_news(&producer_write(1,"news-owned","original","desired-x")?.record)?);
+        let older=t.capture()?;
+        if let Some(n)=t.news.get_mut("parent") { n.lines=vec![("run:r1".into(),"desired-y".into())]; }
+        t.mark_news("parent"); let newer=t.capture()?;
+        if let Some(n)=t.news.get_mut("parent") { n.lines=vec![("run:r1".into(),"desired-x".into())]; }
+        t.mark_news("parent");
+        let committed=write_persist(&mut c,older,&HashSet::new())?;t.acknowledge(&committed);
+        assert!(t.news_dirty.contains("parent"),"an equal X snapshot must not clear a newer in-flight Y capture");
+        assert!(t.dirty.contains(&("parent".into(),"r1".into())));
+        let committed=write_persist(&mut c,newer,&HashSet::new())?;t.acknowledge(&committed);
+        assert!(t.news_dirty.contains("parent"));
+        let latest=t.capture()?;let committed=write_persist(&mut c,latest,&HashSet::new())?;t.acknowledge(&committed);
+        assert!(!t.news_dirty.contains("parent"));
+        assert!(t.dirty.is_empty());
+        assert_eq!(read_producer(&c,"parent")?.ok_or_else(||anyhow::anyhow!("no producer"))?.content.desired.lines.first().map(|l|l.1.as_str()),Some("desired-x"));
+        Ok(())
+    }
+
+    #[test]
+    fn archived_original_can_advance_but_stale_write_is_not_acknowledged() -> anyhow::Result<()> {
+        let mut c=producer_db()?;
+        write_persist(&mut c,Persist { runs:Vec::new(),producers:vec![producer_write(70,"old","original","desired")?] },&HashSet::new())?;
+        let proof=HashSet::from([("parent".into(),"old".into())]);
+        write_persist(&mut c,Persist { runs:Vec::new(),producers:vec![producer_write(80,"new","new original","new desired")?] },&proof)?;
+        let stale=write_persist(&mut c,Persist { runs:Vec::new(),producers:vec![producer_write(75,"old","original","desired")?] },&HashSet::new())?;
+        assert!(stale.producers.is_empty(),"a skipped write cannot clear an owned dirty key");
+        assert_eq!(read_producer(&c,"parent")?.ok_or_else(||anyhow::anyhow!("no producer"))?.content.owned.original().and_then(original_id),Some("new"));
+        Ok(())
+    }
+
+    /// One admitted original stays frozen through a long turn; the ledger keeps one latest
+    /// never-dispatched successor and every prior immutable status body.
     #[test]
     fn a_parent_in_a_long_turn_has_one_message_of_news_waiting_each_child_s_latest_line_once() -> anyhow::Result<()> {
-        let mut t = Told::default();
-        let mut p = coordinator("q1");
-        let mut kids = helpers("q1", &["k1", "k2", "k3"]);
-        let mut now = 2_000_000;
-        assert!(t.plan(&all(&p, &kids), now, &[], &[]).is_empty(), "seen at work first");
-        // Two settle: one message, behind the parent's turn.
-        now += 10_000;
-        let first = settle(&mut t, &p, &mut kids, &[(0, "The lexer is done."), (1, "Docs updated.")], now);
-        let Some(Command::Send { id, text, mode: SendMode::Queue, .. }) = first.first() else { anyhow::bail!("no news: {first:?}") };
-        anyhow::ensure!(first.len() == 1 && text.contains("Agents you started") && text.contains("The lexer is done.") && text.contains("Docs updated."), "{first:?}");
-        let id = id.clone();
-        first.iter().for_each(|c| apply(&mut p, c));
-        // While it waits, one settles again and another for the first time; then one again and
-        // again: each time the one message is edited, never another queued.
-        let rounds: [&[(usize, &str)]; 4] = [&[(0, "The parser is done."), (2, "The bench is recorded.")], &[(1, "Docs: round 1.")], &[(1, "Docs: round 2.")], &[(1, "Docs: round 3.")]];
-        for which in rounds {
-            now += 10_000;
-            let sent = settle(&mut t, &p, &mut kids, which, now);
-            anyhow::ensure!(!sent.is_empty() && sent.iter().all(|c| matches!(c, Command::QueueEdit { id: e, .. } if *e == id)), "the waiting one edited, nothing more queued: {sent:?}");
-            sent.iter().for_each(|c| apply(&mut p, c));
-        }
-        // A look later: nothing more to say, and its queue is seen holding the last edit.
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty());
-        let latest = news_of(&t, "q1");
-        anyhow::ensure!(p.queue == [Queued::of(&id, &latest)], "its queue holds the one message, as kiln last had it: {:?}", p.queue);
-        for old in ["The lexer is done.", "Docs updated.", "Docs: round 1.", "Docs: round 2."] {
-            anyhow::ensure!(!latest.contains(old), "{old:?} isn't news any more: {latest}");
-        }
-        for now_news in ["The parser is done.", "The bench is recorded.", "Docs: round 3."] {
-            anyhow::ensure!(latest.contains(now_news), "{now_news:?} missing: {latest}");
-        }
-        anyhow::ensure!(latest.matches("which you started").count() == 3, "each child once: {latest}");
-        // Its turn ends and it takes the news; what settles next is news again, on its own.
-        take(&mut p, &[(&id, &latest)]);
-        now += 10_000;
-        let next = settle(&mut t, &p, &mut kids, &[(2, "The bench is green.")], now);
-        let Some(Command::Send { id: again, text, .. }) = next.first() else { anyhow::bail!("no news after the parent took the last: {next:?}") };
-        anyhow::ensure!(next.len() == 1 && *again != id && text.contains("The bench is green.") && !text.contains("Docs: round 3.") && !text.contains("Agents you started"), "{next:?}");
-        Ok(())
+        crate::rt::block_on(async {
+            let mut t=Told::default();let mut p=coordinator("q1");let ledger=NewsLedger::new(&p.id)?;
+            let mut kids=helpers(&p.id,&["k1","k2","k3"]);let mut now=2_000_000;
+            assert!(t.plan(&all(&p,&kids),now,&[],&[]).is_empty());
+            now+=10_000;
+            let first=one_send(&settle(&mut t,&p,&mut kids,&[(0,"The lexer is done."),(1,"Docs updated.")],now))?;
+            assert!(words(&first)?.1.contains("Agents you started"));
+            assert!(ledger.publish(&mut t,&first).await?.is_none());
+            let frozen=ledger.admit(&mut t,&mut p,&first).await?;
+            let mut originals=vec![first.clone()];let mut latest=first.clone();
+            let rounds:[&[(usize,&str)];4]=[&[(0,"The parser is done."),(2,"The bench is recorded.")],&[(1,"Docs: round 1.")],&[(1,"Docs: round 2.")],&[(1,"Docs: round 3.")]];
+            for changes in rounds {
+                now+=10_000;latest=one_send(&settle(&mut t,&p,&mut kids,changes,now))?;
+                assert_ne!(words(&latest)?.0,words(originals.last().ok_or_else(||anyhow::anyhow!("no original"))?)?.0);
+                assert!(ledger.publish(&mut t,&latest).await?.is_none());originals.push(latest.clone());
+                assert_eq!(p.queue,[Queued::of(words(&first)?.0,words(&first)?.1)],"source-owned original never changes");
+            }
+            let text=words(&latest)?.1;
+            for old in ["The lexer is done.","Docs updated.","Docs: round 1.","Docs: round 2."] { assert!(!text.contains(old),"{old}: {text}"); }
+            for expected in ["The parser is done.","The bench is recorded.","Docs: round 3."] { assert!(text.contains(expected),"{text}"); }
+            assert_eq!(text.matches("which you started").count(),3);
+            let history=ledger.history().await?;
+            assert_eq!(history.iter().filter(|r|r.receipt.disposition==super::super::mail::Disposition::Waiting).count(),1,"only the latest never-dispatched status waits");
+            assert_eq!(history.iter().filter(|r|r.receipt.disposition==super::super::mail::Disposition::Superseded).count(),3);
+            take(&mut p,&[(words(&first)?.0,words(&first)?.1)]);
+            assert!(t.plan(&all(&p,&kids),now+100_000,&[],&[]).is_empty(),"queue absence grants no consumption authority");
+            assert_eq!(news_of(&t,&p.id),text);
+            ledger.consume(&mut t,&frozen).await?;
+            assert_eq!(news_of(&t,&p.id),text,"old receipt cannot retire a newer original");
+            let delivered=ledger.admit(&mut t,&mut p,&latest).await?;
+            take(&mut p,&[(words(&latest)?.0,words(&latest)?.1)]);ledger.consume(&mut t,&delivered).await?;
+            now+=200_000;
+            let fresh=one_send(&settle(&mut t,&p,&mut kids,&[(2,"The bench is green.")],now))?;
+            assert!(words(&fresh)?.1.contains("The bench is green.")&&!words(&fresh)?.1.contains("Docs: round 3.")&&!words(&fresh)?.1.contains("Agents you started"));
+            assert!(ledger.publish(&mut t,&fresh).await?.is_none());originals.push(fresh);
+            ledger.originals(&originals).await?;
+            Ok(())
+        })
     }
 
-    /// An edit that reaches the parent's machine just after its turn ended, the news gone with
-    /// what it said before, does nothing there: what the edit said goes again, in the next message.
+    /// A successor racing older delivery is a distinct original. Old observations and receipts
+    /// cannot remove its words; the actual source admits it after the frozen predecessor ends.
     #[test]
     fn what_an_edit_too_late_said_goes_again_in_the_next_message() -> anyhow::Result<()> {
-        let mut t = Told::default();
-        let mut p = coordinator("q2");
-        let mut kids = helpers("q2", &["j1", "j2"]);
-        let mut now = 3_000_000;
-        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
-        now += 10_000;
-        let first = settle(&mut t, &p, &mut kids, &[(0, "First news.")], now);
-        first.iter().for_each(|c| apply(&mut p, c));
-        let [Command::Send { id, text, .. }] = first.as_slice() else { anyhow::bail!("{first:?}") };
-        now += 10_000;
-        let edit = settle(&mut t, &p, &mut kids, &[(1, "Second news.")], now);
-        anyhow::ensure!(matches!(edit.as_slice(), [Command::QueueEdit { .. }]), "{edit:?}");
-        // Before the edit came, the turn ended and the message went as it was.
-        take(&mut p, &[(id, text)]);
-        let resent = t.plan(&all(&p, &kids), now + 10_000, &[], &[]);
-        let Some((to, Command::Send { text, .. })) = resent.first() else { anyhow::bail!("the edit's words were lost: {resent:?}") };
-        anyhow::ensure!(resent.len() == 1 && to == "q2" && text.contains("Second news.") && !text.contains("First news."), "only what didn't reach it: {resent:?}");
-        Ok(())
+        crate::rt::block_on(async {
+            let mut t=Told::default();let mut p=coordinator("q2");let ledger=NewsLedger::new(&p.id)?;
+            let mut kids=helpers(&p.id,&["j1","j2"]);let now=3_000_000;
+            assert!(t.plan(&all(&p,&kids),now,&[],&[]).is_empty());
+            let first=one_send(&settle(&mut t,&p,&mut kids,&[(0,"First news.")],now+10_000))?;
+            assert!(ledger.publish(&mut t,&first).await?.is_none());let frozen=ledger.admit(&mut t,&mut p,&first).await?;
+            let successor=one_send(&settle(&mut t,&p,&mut kids,&[(1,"Second news.")],now+20_000))?;
+            assert_ne!(words(&successor)?.0,words(&first)?.0);
+            assert!(words(&successor)?.1.contains("First news.")&&words(&successor)?.1.contains("Second news."));
+            assert!(ledger.publish(&mut t,&successor).await?.is_none());
+            take(&mut p,&[(words(&first)?.0,words(&first)?.1)]);
+            assert!(t.plan(&all(&p,&kids),now+100_000,&[],&[]).is_empty());
+            assert_eq!(news_of(&t,&p.id),words(&successor)?.1,"the late successor cannot disappear with the older queue observation");
+            ledger.consume(&mut t,&frozen).await?;
+            assert_eq!(news_of(&t,&p.id),words(&successor)?.1);
+            let delivered=ledger.admit(&mut t,&mut p,&successor).await?;
+            take(&mut p,&[(words(&successor)?.0,words(&successor)?.1)]);ledger.consume(&mut t,&delivered).await?;
+            assert!(t.plan(&all(&p,&kids),now+200_000,&[],&[]).is_empty(),"exact consumed original is not republished");
+            ledger.originals(&[first,successor]).await?;
+            Ok(())
+        })
     }
 
-    /// CP-T3.2 (the sixteenth adversarial check's): a runner from before this release says what its
-    /// harness was handed only in its events, and coming back it says its state first. News edited
-    /// and taken between two looks, its handing not heard of yet, waits for it (`queued::HEARD_MS`)
-    /// rather than tell again the lines the edit gave it; heard of, they aren't news any more. Not
-    /// heard of in that time, it's taken for lost, and what it may not have said goes again.
+    /// CP-T3.2: queue absence, Info.said and the old grace interval grant no receipt authority.
+    /// Exact source consumption, including for a later successor, retires each original once.
     #[test]
     fn news_edited_and_taken_between_two_looks_waits_to_hear_it_was_handed() -> anyhow::Result<()> {
-        let mut t = Told::default();
-        let mut p = coordinator("q9");
-        let mut kids = helpers("q9", &["t1", "t2"]);
-        let mut now = 9_000_000;
-        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
-        now += 10_000;
-        let first = settle(&mut t, &p, &mut kids, &[(0, "First news.")], now);
-        first.iter().for_each(|c| apply(&mut p, c));
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty(), "seen waiting");
-        now += 10_000;
-        let edit = settle(&mut t, &p, &mut kids, &[(1, "Second news.")], now);
-        let [Command::QueueEdit { id, text, .. }] = edit.as_slice() else { anyhow::bail!("{edit:?}") };
-        let (id, text) = (id.clone(), text.clone());
-        // The edit applies and the parent takes the news before the next look; its runner comes
-        // back saying its queue (empty) before its events.
-        edit.iter().for_each(|c| apply(&mut p, c));
-        p.queue.clear();
-        p.queued = 0;
-        for wait in [10_000, 12_000] {
-            let sent = t.plan(&all(&p, &kids), now + wait, &[], &[]);
-            anyhow::ensure!(sent.is_empty(), "nothing goes while its handing isn't heard of: {sent:?}");
-        }
-        // Its events say it was handed the news as edited: nothing to tell again.
-        p.said.push(crate::harness::model::Given { id: id.clone(), digest: crate::harness::queued::stable(&text) });
-        let sent = t.plan(&all(&p, &kids), now + 13_000, &[], &[]);
-        anyhow::ensure!(sent.is_empty(), "the edit's lines reached it: {sent:?}");
-        // What settles next is news again, on its own; edited and taken the same way, and its
-        // handing never heard of, what the edit said goes again once the wait is over.
-        now += 20_000;
-        let next = settle(&mut t, &p, &mut kids, &[(0, "Third news.")], now);
-        anyhow::ensure!(matches!(next.as_slice(), [Command::Send { text, .. }] if text.contains("Third news.") && !text.contains("Second news.")), "{next:?}");
-        next.iter().for_each(|c| apply(&mut p, c));
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty(), "seen waiting");
-        now += 10_000;
-        let edit = settle(&mut t, &p, &mut kids, &[(1, "Fourth news.")], now);
-        anyhow::ensure!(matches!(edit.as_slice(), [Command::QueueEdit { .. }]), "{edit:?}");
-        edit.iter().for_each(|c| apply(&mut p, c));
-        p.queue.clear();
-        p.queued = 0;
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 10_000, &[], &[]).is_empty(), "waiting to hear of it");
-        let lost = t.plan(&all(&p, &kids), now + 10_000 + crate::harness::queued::HEARD_MS, &[], &[]);
-        anyhow::ensure!(matches!(lost.as_slice(), [(_, Command::Send { text, .. })] if text.contains("Fourth news.") && !text.contains("Third news.")), "{lost:?}");
-        Ok(())
+        crate::rt::block_on(async {
+            let mut t=Told::default();let mut p=coordinator("q9");let ledger=NewsLedger::new(&p.id)?;
+            let mut kids=helpers(&p.id,&["t1","t2"]);let now=9_000_000;
+            assert!(t.plan(&all(&p,&kids),now,&[],&[]).is_empty());
+            let first=one_send(&settle(&mut t,&p,&mut kids,&[(0,"First news.")],now+10_000))?;
+            assert!(ledger.publish(&mut t,&first).await?.is_none());
+            let second=one_send(&settle(&mut t,&p,&mut kids,&[(1,"Second news.")],now+20_000))?;
+            assert!(ledger.publish(&mut t,&second).await?.is_none());
+            let delivered=ledger.admit(&mut t,&mut p,&second).await?;
+            p.queue.clear();p.queued=0;
+            for elapsed in [10_000,12_000,100_000+super::super::queued::HEARD_MS] {
+                assert!(t.plan(&all(&p,&kids),now+20_000+elapsed,&[],&[]).is_empty());
+                assert_eq!(news_of(&t,&p.id),words(&second)?.1,"a grace timeout cannot consume or regenerate an original");
+            }
+            p.said.push(super::super::model::Given { id:words(&second)?.0.into(),digest:super::super::queued::stable(words(&second)?.1) });
+            assert!(t.plan(&all(&p,&kids),now+200_000,&[],&[]).is_empty());
+            assert!(!news_of(&t,&p.id).is_empty(),"old note_sent/Info.said is not native acceptance");
+            ledger.consume(&mut t,&delivered).await?;
+            let third=one_send(&settle(&mut t,&p,&mut kids,&[(0,"Third news.")],now+300_000))?;
+            assert!(words(&third)?.1.contains("Third news.")&&!words(&third)?.1.contains("Second news."));
+            assert!(ledger.publish(&mut t,&third).await?.is_none());let third_delivery=ledger.admit(&mut t,&mut p,&third).await?;
+            let fourth=one_send(&settle(&mut t,&p,&mut kids,&[(1,"Fourth news.")],now+400_000))?;
+            assert!(ledger.publish(&mut t,&fourth).await?.is_none());p.queue.clear();p.queued=0;
+            assert!(t.plan(&all(&p,&kids),now+500_000+super::super::queued::HEARD_MS,&[],&[]).is_empty());
+            assert_eq!(news_of(&t,&p.id),words(&fourth)?.1);
+            ledger.consume(&mut t,&third_delivery).await?;let last=ledger.admit(&mut t,&mut p,&fourth).await?;
+            ledger.consume(&mut t,&last).await?;ledger.originals(&[first,second,third,fourth]).await?;
+            Ok(())
+        })
     }
 
-    /// CP-T3.2, AC-T3.2.1 (the seventeenth adversarial check's): news edited and taken between two looks,
-    /// this release's runner saying what its harness was handed beside its queue, and the parent,
-    /// reading it, asks for one child's result (agents_result, as the news tells it to) before the
-    /// server's next look. That child's line comes out of the news kiln keeps, so the words it
-    /// keeps no longer match the words handed. The parent was handed every line: none is told again.
+    /// CP-T3.2, AC-T3.2.1: consumption can commit between planner looks. Reading a child after
+    /// that exact receipt does not create another status for lines already delivered.
     #[test]
     fn news_taken_then_a_child_read_before_the_next_look_is_told_once() -> anyhow::Result<()> {
-        let mut t = Told::default();
-        let mut p = coordinator("q10");
-        let mut kids = helpers("q10", &["s1", "s2"]);
-        let mut now = 10_000_000;
-        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
-        now += 10_000;
-        let first = settle(&mut t, &p, &mut kids, &[(0, "First news.")], now);
-        first.iter().for_each(|c| apply(&mut p, c));
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty(), "seen waiting");
-        now += 10_000;
-        let edit = settle(&mut t, &p, &mut kids, &[(1, "Second news.")], now);
-        let [Command::QueueEdit { id, text, .. }] = edit.as_slice() else { anyhow::bail!("{edit:?}") };
-        let (id, text) = (id.clone(), text.clone());
-        anyhow::ensure!(text.contains("First news.") && text.contains("Second news."), "{text}");
-        // The edit applies and the parent takes the news, both lines, before the next look; its
-        // runner says so beside its queue.
-        edit.iter().for_each(|c| apply(&mut p, c));
-        take(&mut p, &[(&id, &text)]);
-        // Reading it, the parent asks for the first child's result before the server looks again.
-        let s1 = kids.first().cloned().ok_or_else(|| anyhow::anyhow!("no child"))?;
-        anyhow::ensure!(t.saw(&s1).is_some(), "its line was in the news");
-        let sent = t.plan(&all(&p, &kids), now + 10_000, &[], &[]);
-        anyhow::ensure!(sent.is_empty(), "news the parent was handed is told again: {sent:?}");
-        Ok(())
+        crate::rt::block_on(async {
+            let mut t=Told::default();let mut p=coordinator("q10");let ledger=NewsLedger::new(&p.id)?;
+            let mut kids=helpers(&p.id,&["s1","s2"]);let now=10_000_000;
+            assert!(t.plan(&all(&p,&kids),now,&[],&[]).is_empty());
+            let first=one_send(&settle(&mut t,&p,&mut kids,&[(0,"First news.")],now+10_000))?;
+            assert!(ledger.publish(&mut t,&first).await?.is_none());
+            let second=one_send(&settle(&mut t,&p,&mut kids,&[(1,"Second news.")],now+20_000))?;
+            assert!(words(&second)?.1.contains("First news.")&&words(&second)?.1.contains("Second news."));
+            assert!(ledger.publish(&mut t,&second).await?.is_none());let delivery=ledger.admit(&mut t,&mut p,&second).await?;
+            take(&mut p,&[(words(&second)?.0,words(&second)?.1)]);
+            assert_eq!(news_of(&t,&p.id),words(&second)?.1,"source observation alone does not retire it");
+            // The exact committed receipt arrives before the parent reads a result, without a planner look.
+            ledger.consume(&mut t,&delivery).await?;
+            let child=kids.first().ok_or_else(||anyhow::anyhow!("no child"))?;
+            assert!(t.saw(child).is_none(),"already delivered lines need no successor");
+            assert!(t.plan(&all(&p,&kids),now+100_000,&[],&[]).is_empty(),"nothing is told again after the exact receipt");
+            ledger.originals(&[first,second]).await?;
+            Ok(())
+        })
     }
 
-    /// The same, its runner from before this release (its events say what was handed, after its
-    /// state): the parent reads the first child's result while the server waits to hear of the
-    /// handing (`queued::HEARD_MS`); then heard of, it was handed every line: none is told again.
+    /// A read before proven consumption creates a fresh reduced desired status, never a mutable
+    /// source edit. The older receipt cannot retire that separately accepted successor.
     #[test]
     fn news_taken_then_a_child_read_while_its_handing_is_awaited_is_told_once() -> anyhow::Result<()> {
-        let mut t = Told::default();
-        let mut p = coordinator("q11");
-        let mut kids = helpers("q11", &["r1", "r2"]);
-        let mut now = 11_000_000;
-        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
-        now += 10_000;
-        let first = settle(&mut t, &p, &mut kids, &[(0, "First news.")], now);
-        first.iter().for_each(|c| apply(&mut p, c));
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty(), "seen waiting");
-        now += 10_000;
-        let edit = settle(&mut t, &p, &mut kids, &[(1, "Second news.")], now);
-        let [Command::QueueEdit { id, text, .. }] = edit.as_slice() else { anyhow::bail!("{edit:?}") };
-        let (id, text) = (id.clone(), text.clone());
-        edit.iter().for_each(|c| apply(&mut p, c));
-        p.queue.clear();
-        p.queued = 0;
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 10_000, &[], &[]).is_empty(), "waiting to hear of its handing");
-        let r1 = kids.first().cloned().ok_or_else(|| anyhow::anyhow!("no child"))?;
-        anyhow::ensure!(t.saw(&r1).is_some(), "its line was in the news");
-        // Its events: it was handed the news as edited, both lines.
-        p.said.push(crate::harness::model::Given { id: id.clone(), digest: crate::harness::queued::stable(&text) });
-        let sent = t.plan(&all(&p, &kids), now + 12_000, &[], &[]);
-        anyhow::ensure!(sent.is_empty(), "news the parent was handed is told again: {sent:?}");
-        Ok(())
+        crate::rt::block_on(async {
+            let mut t=Told::default();let mut p=coordinator("q11");let ledger=NewsLedger::new(&p.id)?;
+            let mut kids=helpers(&p.id,&["r1","r2"]);let now=11_000_000;
+            assert!(t.plan(&all(&p,&kids),now,&[],&[]).is_empty());
+            let first=one_send(&settle(&mut t,&p,&mut kids,&[(0,"First news.")],now+10_000))?;
+            assert!(ledger.publish(&mut t,&first).await?.is_none());
+            let second=one_send(&settle(&mut t,&p,&mut kids,&[(1,"Second news.")],now+20_000))?;
+            assert!(ledger.publish(&mut t,&second).await?.is_none());let delivery=ledger.admit(&mut t,&mut p,&second).await?;
+            p.queue.clear();p.queued=0;
+            assert!(t.plan(&all(&p,&kids),now+30_000,&[],&[]).is_empty());
+            let child=kids.first().ok_or_else(||anyhow::anyhow!("no child"))?;
+            let (parent,third)=t.saw(child).ok_or_else(||anyhow::anyhow!("desired status was not revised"))?;
+            assert_eq!(parent,p.id);assert_ne!(words(&third)?.0,words(&second)?.0);
+            assert!(words(&third)?.1.contains("Second news.")&&!words(&third)?.1.contains("First news."));
+            assert!(ledger.publish(&mut t,&third).await?.is_none());
+            p.said.push(super::super::model::Given { id:words(&second)?.0.into(),digest:super::super::queued::stable(words(&second)?.1) });
+            assert!(t.plan(&all(&p,&kids),now+100_000,&[],&[]).is_empty());
+            ledger.consume(&mut t,&delivery).await?;
+            assert_eq!(news_of(&t,&p.id),words(&third)?.1,"the old receipt cannot retire the immutable successor");
+            let last=ledger.admit(&mut t,&mut p,&third).await?;take(&mut p,&[(words(&third)?.0,words(&third)?.1)]);
+            ledger.consume(&mut t,&last).await?;
+            assert!(t.plan(&all(&p,&kids),now+200_000,&[],&[]).is_empty());
+            ledger.originals(&[first,second,third]).await?;
+            Ok(())
+        })
     }
 
-    /// News that didn't reach the parent (its machine away a moment) goes at the next look: a
-    /// message again, an edit again; and should the message go meanwhile, what the edit said goes
-    /// in the next.
+    /// Preaccept backpressure preserves the producer's exact original until publication commits;
+    /// newer desired words cannot silently replace it and planning does not create retries.
     #[test]
     fn news_that_didn_t_reach_its_parent_goes_at_the_next_look() -> anyhow::Result<()> {
-        let mut t = Told::default();
-        let mut p = coordinator("q6");
-        let mut kids = helpers("q6", &["w1", "w2"]);
-        let mut now = 6_000_000;
-        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
-        now += 10_000;
-        let first = settle(&mut t, &p, &mut kids, &[(0, "First news.")], now);
-        let Some(send) = first.first() else { anyhow::bail!("no news") };
-        t.unsent("q6", send);
-        let again = t.plan(&all(&p, &kids), now + 10_000, &[], &[]);
-        let [(_, Command::Send { id: sent, text: said, .. })] = again.as_slice() else { anyhow::bail!("{again:?}") };
-        anyhow::ensure!(said.contains("First news."), "{again:?}");
-        let (sent, said) = (sent.clone(), said.clone());
-        again.iter().for_each(|(_, c)| apply(&mut p, c));
-        now += 20_000;
-        let edit = settle(&mut t, &p, &mut kids, &[(1, "Second news.")], now);
-        let Some(c) = edit.first() else { anyhow::bail!("no edit") };
-        t.unsent("q6", c);
-        let again = t.plan(&all(&p, &kids), now + 10_000, &[], &[]);
-        anyhow::ensure!(again.len() == 1 && again.first().map(|(_, c)| c) == Some(c), "the same edit again: {again:?}");
-        // It didn't go either, and the parent took the message as it was.
-        t.unsent("q6", c);
-        take(&mut p, &[(&sent, &said)]);
-        let next = t.plan(&all(&p, &kids), now + 20_000, &[], &[]);
-        anyhow::ensure!(matches!(next.as_slice(), [(_, Command::Send { text, .. })] if text.contains("Second news.") && !text.contains("First news.")), "{next:?}");
-        Ok(())
+        crate::rt::block_on(async {
+            let mut t=Told::default();let mut p=coordinator("q6");let ledger=NewsLedger::new(&p.id)?;
+            let mut kids=helpers(&p.id,&["w1","w2"]);let now=6_000_000;
+            assert!(t.plan(&all(&p,&kids),now,&[],&[]).is_empty());
+            let first=one_send(&settle(&mut t,&p,&mut kids,&[(0,"First news.")],now+10_000))?;
+            let refused=super::super::mail::publish(&ledger.store,ledger.publication(&first)?,u64::MAX,0).await;
+            assert!(matches!(refused,Err(super::super::mail::Error::Backpressure { .. })));
+            assert!(ledger.history().await?.is_empty(),"preaccept refusal commits no body or custody");
+            t.unsent(&p.id,&first);
+            assert!(t.plan(&all(&p,&kids),now+20_000,&[],&[]).is_empty(),"the existing sender, not planning, owns retry");
+            assert!(settle(&mut t,&p,&mut kids,&[(1,"Second news.")],now+30_000).is_empty());
+            assert_eq!(news_of(&t,&p.id),words(&first)?.1,"new desired lines cannot overwrite the unaccepted original");
+            let successor=ledger.publish(&mut t,&first).await?.ok_or_else(||anyhow::anyhow!("latest desired revision was not produced after custody"))?;
+            assert_ne!(words(&successor)?.0,words(&first)?.0);assert!(words(&successor)?.1.contains("Second news."));
+            assert!(ledger.publish(&mut t,&successor).await?.is_none());
+            let delivery=ledger.admit(&mut t,&mut p,&successor).await?;
+            take(&mut p,&[(words(&successor)?.0,words(&successor)?.1)]);ledger.consume(&mut t,&delivery).await?;
+            assert!(t.plan(&all(&p,&kids),now+200_000,&[],&[]).is_empty());
+            let history=ledger.history().await?;assert_eq!(history.first().map(|r|r.receipt.disposition),Some(super::super::mail::Disposition::Superseded));
+            ledger.originals(&[first,successor]).await?;
+            Ok(())
+        })
     }
 
-    /// While the parent's machine is away, kiln's view of its queue stands still: news that comes
-    /// meanwhile waits, and isn't taken for what the message waiting said. Its turn ended during the
-    /// outage and it took that message as it was; once back, it's told what came meanwhile.
+    /// New desired words wait through disconnection. Reconnection and a stale empty queue do
+    /// not release the frozen stream; its exact receipt permits admission of the successor.
     #[test]
     fn news_that_came_while_its_parent_s_machine_was_away_goes_once_it_s_back() -> anyhow::Result<()> {
-        let mut t = Told::default();
-        let mut p = coordinator("q7");
-        let mut kids = helpers("q7", &["v1", "v2"]);
-        let mut now = 7_000_000;
-        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
-        now += 10_000;
-        let first = settle(&mut t, &p, &mut kids, &[(0, "v1 is done.")], now);
-        first.iter().for_each(|c| apply(&mut p, c));
-        let [Command::Send { id, text, .. }] = first.as_slice() else { anyhow::bail!("{first:?}") };
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty(), "seen waiting");
-        p.status = Status::Disconnected;
-        now += 10_000;
-        anyhow::ensure!(settle(&mut t, &p, &mut kids, &[(1, "v2 is done.")], now).is_empty(), "nothing goes while it's away");
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 10_000, &[], &[]).is_empty());
-        p.status = Status::Running;
-        take(&mut p, &[(id, text)]);
-        let back = t.plan(&all(&p, &kids), now + 20_000, &[], &[]);
-        anyhow::ensure!(matches!(back.as_slice(), [(_, Command::Send { text, .. })] if text.contains("v2 is done.") && !text.contains("v1 is done.")), "{back:?}");
-        Ok(())
+        crate::rt::block_on(async {
+            let mut t=Told::default();let mut p=coordinator("q7");let ledger=NewsLedger::new(&p.id)?;
+            let mut kids=helpers(&p.id,&["v1","v2"]);let now=7_000_000;
+            assert!(t.plan(&all(&p,&kids),now,&[],&[]).is_empty());
+            let first=one_send(&settle(&mut t,&p,&mut kids,&[(0,"v1 is done.")],now+10_000))?;
+            assert!(ledger.publish(&mut t,&first).await?.is_none());let frozen=ledger.admit(&mut t,&mut p,&first).await?;
+            p.status=Status::Disconnected;
+            assert!(settle(&mut t,&p,&mut kids,&[(1,"v2 is done.")],now+20_000).is_empty());
+            assert_eq!(news_of(&t,&p.id),words(&first)?.1);
+            p.status=Status::Running;take(&mut p,&[(words(&first)?.0,words(&first)?.1)]);
+            let back:Vec<Command>=t.plan(&all(&p,&kids),now+40_000,&[],&[]).into_iter().map(|(_,c)|c).collect();
+            let successor=one_send(&back)?;assert_ne!(words(&successor)?.0,words(&first)?.0);
+            assert!(words(&successor)?.1.contains("v2 is done."));assert!(ledger.publish(&mut t,&successor).await?.is_none());
+            assert!(super::super::mail::pending(&ledger.store,p.id.clone(),0,super::super::state_view::FRAME).await?.items.is_empty(),"reconnect and absent queue cannot release the frozen stream");
+            ledger.consume(&mut t,&frozen).await?;
+            let latest=ledger.admit(&mut t,&mut p,&successor).await?;ledger.consume(&mut t,&latest).await?;
+            assert!(t.plan(&all(&p,&kids),now+100_000,&[],&[]).is_empty());ledger.originals(&[first,successor]).await?;
+            Ok(())
+        })
     }
 
-    /// A server that started since finds the news a server before it left waiting for a parent (its
-    /// id says what it is): it adds to that message, what it said first, rather than queue another.
+    /// A legacy source original stays untouched. New desired words enter the durable stream
+    /// under a fresh managed identity, and its exact receipt clears inherited old context.
     #[test]
     fn news_a_server_before_left_waiting_is_added_to_not_queued_again() -> anyhow::Result<()> {
-        let mut t = Told::default();
-        let old = "news-01a16251c49a75fba41b1fae971ba8a9";
-        let before = "Agent “Helper 0” (h0), which you started, ended its turn: from before the restart.";
-        let mut p = Info { queue: vec![Queued::of(old, before)], queued: 1, ..coordinator("q8") };
-        let mut kids = helpers("q8", &["u1"]);
-        let mut now = 8_000_000;
-        t.found("q8", old.into(), before.into(), now);
-        anyhow::ensure!(t.plan(&all(&p, &kids), now, &[], &[]).is_empty(), "nothing new to say");
-        now += 10_000;
-        let sent = settle(&mut t, &p, &mut kids, &[(0, "u1 is done.")], now);
-        let [Command::QueueEdit { id, text, .. }] = sent.as_slice() else { anyhow::bail!("{sent:?}") };
-        anyhow::ensure!(id == old && text.starts_with(before) && text.contains("u1 is done."), "{text}");
-        sent.iter().for_each(|c| apply(&mut p, c));
-        // Once the parent takes it, what came before goes with it.
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 10_000, &[], &[]).is_empty());
-        take(&mut p, &[(id, text)]);
-        now += 20_000;
-        let next = settle(&mut t, &p, &mut kids, &[(0, "u1 again.")], now);
-        anyhow::ensure!(matches!(next.as_slice(), [Command::Send { id, text, .. }] if id.starts_with(NEWS) && !text.contains("before the restart")), "{next:?}");
-        Ok(())
+        crate::rt::block_on(async {
+            let mut t=Told::default();let old="news-01a16251c49a75fba41b1fae971ba8a9";
+            let before="Agent “Helper 0” (h0), which you started, ended its turn: from before the restart.";
+            let mut p=Info { queue:vec![Queued::of(old,before)],queued:1,..coordinator("q8") };let ledger=NewsLedger::new(&p.id)?;
+            let mut kids=helpers(&p.id,&["u1"]);let now=8_000_000;t.found(&p.id,old.into(),before.into(),now);
+            assert!(t.plan(&all(&p,&kids),now,&[],&[]).is_empty());
+            let managed=one_send(&settle(&mut t,&p,&mut kids,&[(0,"u1 is done.")],now+10_000))?;
+            assert_ne!(words(&managed)?.0,old,"legacy source identity is never edited or reused");
+            assert!(words(&managed)?.1.starts_with(before)&&words(&managed)?.1.contains("u1 is done."));
+            assert_eq!(p.queue,[Queued::of(old,before)],"legacy original remains exactly as found");
+            assert!(ledger.publish(&mut t,&managed).await?.is_none());let delivered=ledger.admit(&mut t,&mut p,&managed).await?;
+            assert_eq!(p.queue.first(),Some(&Queued::of(old,before)));
+            take(&mut p,&[(old,before),(words(&managed)?.0,words(&managed)?.1)]);
+            assert!(t.plan(&all(&p,&kids),now+50_000,&[],&[]).is_empty());
+            assert!(!news_of(&t,&p.id).is_empty(),"legacy queue observations cannot consume the managed successor");
+            ledger.consume(&mut t,&delivered).await?;
+            let next=one_send(&settle(&mut t,&p,&mut kids,&[(0,"u1 again.")],now+100_000))?;
+            assert!(words(&next)?.1.contains("u1 again.")&&!words(&next)?.1.contains("before the restart"));
+            assert!(ledger.publish(&mut t,&next).await?.is_none());ledger.originals(&[managed,next]).await?;
+            Ok(())
+        })
     }
 
-    /// What the parent sees itself (agents_wait, agents_result) comes out of its news still waiting;
-    /// the last line out takes the message out of its queue.
+    /// Reading results changes desired lines and coalesces pending successors. It cannot remove
+    /// the frozen source original or erase an accepted body when the last desired line is read.
     #[test]
     fn what_a_parent_sees_itself_comes_out_of_its_news_and_the_message_with_the_last_line() -> anyhow::Result<()> {
-        let mut t = Told::default();
-        let mut p = coordinator("q3");
-        let mut kids = helpers("q3", &["x1", "x2", "x3"]);
-        let mut now = 4_000_000;
-        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
-        now += 10_000;
-        let first = settle(&mut t, &p, &mut kids, &[(0, "x1 is done."), (1, "x2 is done."), (2, "x3 is done.")], now);
-        first.iter().for_each(|c| apply(&mut p, c));
-        let Some(Command::Send { id, .. }) = first.first() else { anyhow::bail!("{first:?}") };
-        let id = id.clone();
-        let (x1, x2, x3) = match kids.as_slice() {
-            [a, b, c] => (a.clone(), b.clone(), c.clone()),
-            _ => anyhow::bail!("three helpers"),
-        };
-        // It waited for x1: x1's line comes out, the rest stay, in the same message.
-        let Some((to, c)) = t.saw(&x1) else { anyhow::bail!("x1's line stayed in the news") };
-        let Command::QueueEdit { id: edited, text, .. } = &c else { anyhow::bail!("{c:?}") };
-        anyhow::ensure!(to == "q3" && *edited == id && !text.contains("x1 is done.") && text.contains("x2 is done.") && text.contains("x3 is done."), "{text}");
-        apply(&mut p, &c);
-        // It read x2's result: one line left, said on its own.
-        let Some((_, c)) = t.saw(&x2) else { anyhow::bail!("x2's line stayed in the news") };
-        anyhow::ensure!(matches!(&c, Command::QueueEdit { text, .. } if text.contains("x3 is done.") && !text.contains("x2 is done.") && !text.contains("Agents you started")), "{c:?}");
-        apply(&mut p, &c);
-        // And x3's: nothing left, so the message goes.
-        let Some((_, c)) = t.saw(&x3) else { anyhow::bail!("x3's line stayed in the news") };
-        anyhow::ensure!(c == Command::QueueRemove { id: id.clone() }, "{c:?}");
-        apply(&mut p, &c);
-        anyhow::ensure!(p.queue.is_empty(), "{:?}", p.queue);
-        anyhow::ensure!(t.saw(&x1).is_none(), "nothing of it waits");
-        // Nothing comes back for what it saw.
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 20_000, &[], &[]).is_empty());
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 20_000 + SETTLE_MS, &[], &[]).is_empty());
-        // x1 settles again: news again.
-        now += 30_000;
-        let again = settle(&mut t, &p, &mut kids, &[(0, "x1 is done again.")], now);
-        anyhow::ensure!(matches!(again.as_slice(), [Command::Send { text, .. }] if text.contains("x1 is done again.")), "{again:?}");
-        Ok(())
+        crate::rt::block_on(async {
+            let mut t=Told::default();let mut p=coordinator("q3");let ledger=NewsLedger::new(&p.id)?;
+            let mut kids=helpers(&p.id,&["x1","x2","x3"]);let now=4_000_000;
+            assert!(t.plan(&all(&p,&kids),now,&[],&[]).is_empty());
+            let first=one_send(&settle(&mut t,&p,&mut kids,&[(0,"x1 is done."),(1,"x2 is done."),(2,"x3 is done.")],now+10_000))?;
+            assert!(ledger.publish(&mut t,&first).await?.is_none());let frozen=ledger.admit(&mut t,&mut p,&first).await?;
+            let (x1,x2,x3)=match kids.as_slice() { [a,b,c]=>(a.clone(),b.clone(),c.clone()),_=>anyhow::bail!("three helpers") };
+            let (parent,second)=t.saw(&x1).ok_or_else(||anyhow::anyhow!("first desired line did not change"))?;
+            assert_eq!(parent,p.id);assert_ne!(words(&second)?.0,words(&first)?.0);
+            assert!(!words(&second)?.1.contains("x1 is done.")&&words(&second)?.1.contains("x2 is done.")&&words(&second)?.1.contains("x3 is done."));
+            assert!(ledger.publish(&mut t,&second).await?.is_none());
+            let (_,third)=t.saw(&x2).ok_or_else(||anyhow::anyhow!("second desired line did not change"))?;
+            assert!(words(&third)?.1.contains("x3 is done.")&&!words(&third)?.1.contains("x2 is done.")&&!words(&third)?.1.contains("Agents you started"));
+            assert!(ledger.publish(&mut t,&third).await?.is_none());
+            assert!(t.saw(&x3).is_none(),"an empty desired snapshot is not permission to remove accepted originals");
+            assert!(t.news.get(&p.id).is_some_and(|n|n.lines.is_empty()&&n.msg.is_some()));
+            assert_eq!(p.queue,[Queued::of(words(&first)?.0,words(&first)?.1)]);
+            assert!(t.saw(&x1).is_none());assert!(t.plan(&all(&p,&kids),now+50_000,&[],&[]).is_empty());
+            ledger.consume(&mut t,&frozen).await?;
+            assert_eq!(news_of(&t,&p.id),words(&third)?.1);
+            take(&mut p,&[(words(&first)?.0,words(&first)?.1)]);
+            let last=ledger.admit(&mut t,&mut p,&third).await?;ledger.consume(&mut t,&last).await?;
+            assert!(t.plan(&all(&p,&kids),now+100_000,&[],&[]).is_empty());
+            let again=one_send(&settle(&mut t,&p,&mut kids,&[(0,"x1 is done again.")],now+200_000))?;
+            assert!(words(&again)?.1.contains("x1 is done again.")&&!words(&again)?.1.contains("x2 is done."));
+            assert!(ledger.publish(&mut t,&again).await?.is_none());ledger.originals(&[first,second,third,again]).await?;
+            Ok(())
+        })
     }
 
     /// An ended parent isn't sent its children's news; one whose machine is away is, once it's
@@ -1844,29 +2370,31 @@ mod tests {
         Ok(())
     }
 
-    /// T8: a run's start is state, not a wake: alone it sends nothing (it cost the agent a turn);
-    /// a message that goes anyway (a child settled) says it; and its end, which wakes, takes its
-    /// line's place in that message while it waits.
+    /// T8: a start alone does not wake. A later end supersedes the never-dispatched status,
+    /// while both immutable originals remain in history and only the latest is admitted.
     #[test]
     fn t08_a_run_s_start_is_state_its_end_wakes() -> anyhow::Result<()> {
-        let mut t = Told::default();
-        let mut p = coordinator("a2");
-        let mut kids = helpers("a2", &["c2"]);
-        let now = 2_000_000;
-        anyhow::ensure!(t.plan(&all(&p, &kids), now, &[], &[]).is_empty(), "seen at work first");
-        let _ = heard(&mut t, "a2", run_news("r2", RunEvent::Going), now);
-        let _ = heard(&mut t, "a2", run_news("r2", RunEvent::Started), now + 500);
-        anyhow::ensure!(going(&t, "a2"), "started is still going");
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 600, &[], &[]).is_empty(), "a start alone wakes no one");
-        let sent = settle(&mut t, &p, &mut kids, &[(0, "The parser is done.")], now + 700);
-        let [c @ Command::Send { id, text, .. }] = sent.as_slice() else { anyhow::bail!("one message: {sent:?}") };
-        anyhow::ensure!(text.contains("The parser is done.") && text.contains("Run r2 (`cargo test -p kiln`), which you started in the background, started on kiln-a094a12d: kiln tells you when it ends."), "{text}");
-        let id = id.clone();
-        apply(&mut p, c);
-        let _ = heard(&mut t, "a2", run_ended("r2"), now + 60_000);
-        let edit = t.plan(&all(&p, &kids), now + 60_000, &[], &[]);
-        anyhow::ensure!(matches!(edit.as_slice(), [(_, Command::QueueEdit { id: e, text, .. })] if *e == id && text.contains("ended on kiln-a094a12d") && !text.contains("started on")), "the waiting message edited, its line now the end: {edit:?}");
-        Ok(())
+        crate::rt::block_on(async {
+            let mut t=Told::default();let mut p=coordinator("a2");let ledger=NewsLedger::new(&p.id)?;
+            let mut kids=helpers(&p.id,&["c2"]);let now=2_000_000;
+            assert!(t.plan(&all(&p,&kids),now,&[],&[]).is_empty());
+            let _=heard(&mut t,&p.id,run_news("r2",RunEvent::Going),now);
+            let _=heard(&mut t,&p.id,run_news("r2",RunEvent::Started),now+500);
+            assert!(going(&t,&p.id));assert!(t.plan(&all(&p,&kids),now+600,&[],&[]).is_empty(),"start alone wakes no one");
+            let started=one_send(&settle(&mut t,&p,&mut kids,&[(0,"The parser is done.")],now+700))?;
+            assert!(words(&started)?.1.contains("The parser is done.")&&words(&started)?.1.contains("started on kiln-a094a12d"));
+            assert!(ledger.publish(&mut t,&started).await?.is_none());
+            let _=heard(&mut t,&p.id,run_ended("r2"),now+60_000);
+            let changes:Vec<Command>=t.plan(&all(&p,&kids),now+60_000,&[],&[]).into_iter().map(|(_,c)|c).collect();
+            let ended=one_send(&changes)?;assert_ne!(words(&ended)?.0,words(&started)?.0);
+            assert!(words(&ended)?.1.contains("ended on kiln-a094a12d")&&!words(&ended)?.1.contains("started on"));
+            assert!(ledger.publish(&mut t,&ended).await?.is_none());
+            let history=ledger.history().await?;assert_eq!(history.first().map(|r|r.receipt.disposition),Some(super::super::mail::Disposition::Superseded));
+            let delivery=ledger.admit(&mut t,&mut p,&ended).await?;
+            assert_eq!(p.queue,[Queued::of(words(&ended)?.0,words(&ended)?.1)],"only the latest never-dispatched status reaches source admission");
+            ledger.consume(&mut t,&delivery).await?;ledger.originals(&[started,ended]).await?;
+            Ok(())
+        })
     }
 
     /// T9: news said twice is one: a start said again isn't told again, nor an end.
@@ -2037,11 +2565,11 @@ mod tests {
             let _ = heard(&mut before, "a10", run_news("g1", RunEvent::Going), 1_000);
             let _ = heard(&mut before, "a10", run_ended("t1"), 1_000);
             anyhow::ensure!(before.plan(std::slice::from_ref(&p), 1_000, &[], &[]).len() == 1, "t1 told by the first server");
-            let first = before.dirty_rows();
+            let first = before.dirty_rows()?;
             let _ = heard(&mut before, "a10", RunNews { handed: 2, ..run_news("g1", RunEvent::Going) }, 1_200);
             let _ = heard(&mut before, "a10", run_ended("u1"), 1_300);
             // The later state reaches the store first: the earlier one, after, changes nothing.
-            write_rows(&store, before.dirty_rows()).await?;
+            write_rows(&store, before.dirty_rows()?).await?;
             write_rows(&store, first).await?;
             let mut after = Told::default();
             after.adopt(read_rows(&store).await?);
@@ -2055,26 +2583,29 @@ mod tests {
         })
     }
 
-    /// What the agent saw of a run itself (`output` or `stop` showing its end) comes out of its news
-    /// waiting, as a child's line it read does: the message goes with its last line; and a run seen
-    /// before its end was told of isn't told at all.
+    /// Seeing a run changes desired news without cancelling the accepted original. Only an
+    /// exact source receipt retires it; seen-before-publication news still creates no message.
     #[test]
     fn what_an_agent_saw_of_its_run_comes_out_of_its_news() -> anyhow::Result<()> {
-        let mut t = Told::default();
-        let mut p = coordinator("a3");
-        let now = 3_000_000;
-        let _ = heard(&mut t, "a3", run_ended("r3"), now);
-        let sent = t.plan(std::slice::from_ref(&p), now, &[], &[]);
-        let [(_, c @ Command::Send { id, .. })] = sent.as_slice() else { anyhow::bail!("{sent:?}") };
-        let id = id.clone();
-        apply(&mut p, c);
-        let seen = heard(&mut t, "a3", run_news("r3", RunEvent::Seen), now + 100);
-        anyhow::ensure!(seen == Some(Command::QueueRemove { id }), "its one line out, the message with it: {seen:?}");
-        // Seen ended before its news was looked at: nothing told.
-        let _ = heard(&mut t, "a3", run_ended("r4"), now + 20_000);
-        anyhow::ensure!(heard(&mut t, "a3", run_news("r4", RunEvent::Seen), now + 20_001).is_none());
-        anyhow::ensure!(t.plan(std::slice::from_ref(&p), now + 20_002, &[], &[]).is_empty(), "the agent saw it");
-        Ok(())
+        crate::rt::block_on(async {
+            let mut t=Told::default();let mut p=coordinator("a3");let ledger=NewsLedger::new(&p.id)?;let now=3_000_000;
+            let _=heard(&mut t,&p.id,run_ended("r3"),now);
+            let commands:Vec<Command>=t.plan(std::slice::from_ref(&p),now,&[],&[]).into_iter().map(|(_,c)|c).collect();
+            let original=one_send(&commands)?;assert!(ledger.publish(&mut t,&original).await?.is_none());
+            let delivered=ledger.admit(&mut t,&mut p,&original).await?;
+            let seen=heard(&mut t,&p.id,run_news("r3",RunEvent::Seen),now+100);
+            assert!(seen.is_none(),"reading a run cannot issue QueueRemove against a frozen accepted original");
+            assert!(t.news.get(&p.id).is_some_and(|n|n.lines.is_empty()&&n.msg.is_some()));
+            assert_eq!(p.queue,[Queued::of(words(&original)?.0,words(&original)?.1)]);
+            take(&mut p,&[(words(&original)?.0,words(&original)?.1)]);
+            assert_eq!(news_of(&t,&p.id),words(&original)?.1,"queue absence is not delivery");
+            ledger.consume(&mut t,&delivered).await?;
+            let _=heard(&mut t,&p.id,run_ended("r4"),now+20_000);
+            assert!(heard(&mut t,&p.id,run_news("r4",RunEvent::Seen),now+20_001).is_none());
+            assert!(t.plan(std::slice::from_ref(&p),now+20_002,&[],&[]).is_empty(),"seen-before-publication news is not published");
+            ledger.originals(&[original]).await?;
+            Ok(())
+        })
     }
 
     /// News of a run that came after later news of it (two that came the other way round) changes
@@ -2090,24 +2621,38 @@ mod tests {
         Ok(())
     }
 
-    /// A run and a child that come due together are told in one message, each under its heading;
-    /// an agent that ended is told nothing of its runs, and they're forgotten.
+    /// A child settling while a run's original awaits custody becomes one combined successor.
+    /// The earlier run-only body stays immutable; an ended agent gets no new run news.
     #[test]
     fn a_run_s_news_and_a_child_s_are_one_message() -> anyhow::Result<()> {
-        let mut t = Told::default();
-        let p = coordinator("a11");
-        let mut kids = helpers("a11", &["c11"]);
-        let now = 5_000_000;
-        anyhow::ensure!(t.plan(&all(&p, &kids), now, &[], &[]).is_empty(), "seen at work first");
-        let _ = heard(&mut t, "a11", run_ended("r6"), now);
-        let _ = settle(&mut t, &p, &mut kids, &[(0, "The parser is done.")], now);
-        let text = news_of(&t, "a11");
-        anyhow::ensure!(text.starts_with("Agents you started:\n- Agent") && text.contains("The parser is done.") && text.contains("\n\nRuns you started:\n- Run r6 (`cargo test -p kiln`)"), "{text}");
-        anyhow::ensure!(text.contains("\n  Its output ended with:\n  ```\n  running 412 tests"), "the end of its output stays in its item: {text}");
-        let _ = heard(&mut t, "a11", run_ended("r7"), now + 200);
-        let ended = Info { status: Status::Exited, ..p };
-        anyhow::ensure!(t.plan(&[ended], now + 201, &[], &[]).is_empty() && !t.runs.contains_key("a11"));
-        Ok(())
+        crate::rt::block_on(async {
+            let mut t = Told::default();
+            let p = coordinator("a11");
+            let ledger = NewsLedger::new(&p.id)?;
+            let mut kids = helpers("a11", &["c11"]);
+            let now = 5_000_000;
+            anyhow::ensure!(t.plan(&all(&p, &kids), now, &[], &[]).is_empty(), "seen at work first");
+            let _ = heard(&mut t, "a11", run_ended("r6"), now);
+            let original = one_send(&settle(&mut t, &p, &mut kids, &[(0, "The parser is done.")], now))?;
+            assert!(words(&original)?.1.starts_with("Run r6") && !words(&original)?.1.contains("The parser is done."));
+            assert_eq!(news_of(&t, "a11"), words(&original)?.1, "pre-custody original cannot be overwritten");
+            let combined = ledger.publish(&mut t, &original).await?.ok_or_else(|| anyhow::anyhow!("settled child missing from successor"))?;
+            assert_ne!(words(&combined)?.0, words(&original)?.0);
+            let text = words(&combined)?.1;
+            anyhow::ensure!(text.starts_with("Agents you started:\n- Agent") && text.contains("The parser is done.") && text.contains("\n\nRuns you started:\n- Run r6 (`cargo test -p kiln`)"), "{text}");
+            anyhow::ensure!(text.contains("\n  Its output ended with:\n  ```\n  running 412 tests"), "the end of its output stays in its item: {text}");
+            assert!(ledger.publish(&mut t, &combined).await?.is_none());
+            assert_eq!(news_of(&t, "a11"), text);
+            ledger.originals(&[original.clone(), combined.clone()]).await?;
+            let history = ledger.history().await?;
+            let original_id = words(&original)?.0;
+            assert_eq!(history.iter().find(|r| r.receipt.id == original_id).map(|r| &r.receipt.disposition), Some(&super::super::mail::Disposition::Superseded));
+            let _ = heard(&mut t, "a11", run_ended("r7"), now + 200);
+            let ended = Info { status: Status::Exited, ..p };
+            anyhow::ensure!(t.plan(&[ended], now + 201, &[], &[]).is_empty() && !t.runs.contains_key("a11"));
+            ledger.originals(&[original, combined]).await?;
+            Ok(())
+        })
     }
 
     /// Placement's answer folds into the one message (docs/needs.md E5): a place in line is state

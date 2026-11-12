@@ -19,6 +19,13 @@ use super::{Amounts, NIL};
 /// bucket is two leading-zeros counts away. A member whose key is past that is in the last bucket.
 pub const BUCKETS: u32 = 64 * 64;
 
+/// W05-R04: Hex's widened interleaved address; u32 multiplication overflowed on large fleets.
+#[inline(always)]
+fn cell(word: u32, buckets: u32, bucket: u32) -> usize {
+    usize::try_from(u64::from(word) * u64::from(buckets) + u64::from(bucket)).unwrap_or(usize::MAX)
+}
+
+
 /// A bucket's own state.
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
@@ -80,16 +87,16 @@ impl Index {
             return;
         }
         let ns = nw.div_ceil(64);
-        let mut bits = vec![0u64; (nw * nb) as usize];
-        let mut sum = vec![0u64; (ns * nb) as usize];
+        let mut bits = vec![0u64; cell(nw, nb, 0)];
+        let mut sum = vec![0u64; cell(ns, nb, 0)];
         for w in 0..self.nw {
             for b in 0..self.nb {
-                let x = self.bits.get((w * self.nb + b) as usize).copied().unwrap_or(0);
-                if let Some(d) = bits.get_mut((w * nb + b) as usize) {
+                let x = self.bits.get(cell(w, self.nb, b)).copied().unwrap_or(0);
+                if let Some(d) = bits.get_mut(cell(w, nb, b)) {
                     *d = x;
                 }
                 if x != 0
-                    && let Some(s) = sum.get_mut(((w / 64) * nb + b) as usize)
+                    && let Some(s) = sum.get_mut(cell(w / 64, nb, b))
                 {
                     *s |= 1u64 << (w % 64);
                 }
@@ -98,7 +105,7 @@ impl Index {
         self.bits = bits;
         self.sum = sum;
         // A cursor starts at the owner's spread over the fleet it has now.
-        let at = ((u64::from(self.start) * u64::from(nw * 64)) >> 32) as u32;
+        let at = ((u64::from(self.start) * (u64::from(nw) * 64)) >> 32) as u32;
         self.slots.resize(nb as usize, Bucket { count: 0, cursor: at, last: NIL });
         self.member.resize(nw as usize, 0);
         self.nb = nb;
@@ -213,11 +220,11 @@ impl Index {
     #[inline(always)]
     pub fn push(&mut self, r: u32, b: u32) {
         let (w, nb) = (r / 64, self.nb);
-        let Some(x) = self.bits.get_mut((w * nb + b) as usize) else { return };
+        let Some(x) = self.bits.get_mut(cell(w, nb, b)) else { return };
         let was = *x;
         *x = was | (1u64 << (r % 64));
         if was == 0
-            && let Some(s) = self.sum.get_mut(((w / 64) * nb + b) as usize)
+            && let Some(s) = self.sum.get_mut(cell(w / 64, nb, b))
         {
             *s |= 1u64 << (w % 64);
         }
@@ -234,11 +241,11 @@ impl Index {
     #[inline(always)]
     pub fn unlink(&mut self, r: u32, b: u32) {
         let (w, nb) = (r / 64, self.nb);
-        let Some(x) = self.bits.get_mut((w * nb + b) as usize) else { return };
+        let Some(x) = self.bits.get_mut(cell(w, nb, b)) else { return };
         let left = *x & !(1u64 << (r % 64));
         *x = left;
         if left == 0
-            && let Some(s) = self.sum.get_mut(((w / 64) * nb + b) as usize)
+            && let Some(s) = self.sum.get_mut(cell(w / 64, nb, b))
         {
             *s &= !(1u64 << (w % 64));
         }
@@ -276,14 +283,18 @@ impl Index {
         Some(w * 64 + 63u32.checked_sub(bits.leading_zeros())?)
     }
 
-    /// Whether bucket `b` and every one above it are empty.
+    /// What holds a member from bucket `b` up: 0 when `b` and every bucket above it are empty, 1
+    /// when `b` alone holds any, more when a bucket above it does.
     #[inline(always)]
-    pub fn none_from(&self, b: u32) -> bool {
-        if b < 64 {
-            let low = self.words.first().copied().unwrap_or(0);
-            return self.summary <= 1 && low >> b == 0;
+    pub fn upward(&self, b: u32) -> u64 {
+        if b < 64 && self.summary <= 1 {
+            return self.words.first().copied().unwrap_or(0) >> b;
         }
-        self.top().is_none_or(|t| b > t)
+        match self.top() {
+            Some(t) if t > b => 2,
+            Some(t) if t == b => 1,
+            _ => 0,
+        }
     }
 
     /// The highest bucket below `b` that holds a member.
@@ -303,12 +314,12 @@ impl Index {
     }
 
     /// Bucket `b`'s member at or after runner `from`, wrapping (NIL: the bucket is empty).
-    #[inline]
+    #[inline(always)]
     fn first_from(&self, b: u32, from: u32) -> u32 {
         let (nb, nw) = (self.nb, self.nw);
         let (w0, from) = if from / 64 < nw { (from / 64, from) } else { (0, 0) };
         // The cursor's own word, at and above the cursor.
-        let x = self.bits.get((w0 * nb + b) as usize).copied().unwrap_or(0) & (u64::MAX << (from % 64));
+        let x = self.bits.get(cell(w0, nb, b)).copied().unwrap_or(0) & (u64::MAX << (from % 64));
         if x != 0 {
             return w0 * 64 + x.trailing_zeros();
         }
@@ -317,22 +328,25 @@ impl Index {
 
     /// Bucket `b`'s first member in a word after `w0`, wrapping round to the words before it and
     /// `w0`'s own (by the summary: a word per 4,096 runners).
-    #[inline]
+    // W05-R23: the current membership word is the small common lookup. Keep the
+    // summary walk and wraparound out of that inlined path; its exact order is unchanged.
+    #[cold]
+    #[inline(never)]
     fn first_after(&self, b: u32, w0: u32) -> u32 {
         let nb = self.nb;
         let ns = self.nw.div_ceil(64);
         let s0 = w0 / 64;
         let found = |s: u32, m: u64| -> u32 {
             let w = s * 64 + m.trailing_zeros();
-            w * 64 + self.bits.get((w * nb + b) as usize).copied().unwrap_or(0).trailing_zeros()
+            w * 64 + self.bits.get(cell(w, nb, b)).copied().unwrap_or(0).trailing_zeros()
         };
-        let m = self.sum.get((s0 * nb + b) as usize).copied().unwrap_or(0);
+        let m = self.sum.get(cell(s0, nb, b)).copied().unwrap_or(0);
         let above = m & u64::MAX.checked_shl(w0 % 64 + 1).unwrap_or(0);
         if above != 0 {
             return found(s0, above);
         }
         for s in (s0 + 1..ns).chain(0..s0) {
-            let m = self.sum.get((s * nb + b) as usize).copied().unwrap_or(0);
+            let m = self.sum.get(cell(s, nb, b)).copied().unwrap_or(0);
             if m != 0 {
                 return found(s, m);
             }
@@ -378,7 +392,7 @@ impl Index {
         let c = if k.cursor / 64 < nw { k.cursor } else { 0 };
         let w0 = c / 64;
         let high = u64::MAX << (c % 64);
-        let word = |w: u32| self.bits.get((w * nb + b) as usize).copied().unwrap_or(0);
+        let word = |w: u32| self.bits.get(cell(w, nb, b)).copied().unwrap_or(0);
         let mut left = n;
         let mut scan = |w: u32, mut x: u64| -> Option<u32> {
             let ones = x.count_ones();
@@ -418,6 +432,80 @@ impl Index {
     pub fn took(&mut self, b: u32, r: u32) {
         if let Some(k) = self.slots.get_mut(b as usize) {
             k.cursor = r.wrapping_add(1);
+        }
+    }
+
+    /// Whether runner `a` would come before runner `b` in bucket `k`'s turn, were both in it: by
+    /// id from the bucket's cursor, wrapping, as [`Index::first_from`] finds its members (a
+    /// cursor past the fleet starts at 0). True when there is no `b` (NIL).
+    #[inline(always)]
+    pub fn before(&self, k: u32, a: u32, b: u32) -> bool {
+        if b == NIL {
+            return true;
+        }
+        let c = self.slots.get(k as usize).map_or(0, |s| s.cursor);
+        let c = if c / 64 < self.nw { c } else { 0 };
+        a.wrapping_sub(c) < b.wrapping_sub(c)
+    }
+
+    /// Sets `mask` in bucket `b`'s membership word `w`, and the word's bit in the bucket's summary
+    /// when it held no member.
+    #[inline(always)]
+    fn add_bit(&mut self, w: u32, b: u32, mask: u64) {
+        let nb = self.nb;
+        let Some(x) = self.bits.get_mut(cell(w, nb, b)) else { return };
+        let was = *x;
+        *x = was | mask;
+        if was == 0
+            && let Some(s) = self.sum.get_mut(cell(w / 64, nb, b))
+        {
+            *s |= 1u64 << (w % 64);
+        }
+    }
+
+    /// Clears `mask` in bucket `b`'s membership word `w`, and the word's bit in the bucket's
+    /// summary when that leaves it no member.
+    #[inline(always)]
+    fn drop_bit(&mut self, w: u32, b: u32, mask: u64) {
+        let nb = self.nb;
+        let Some(x) = self.bits.get_mut(cell(w, nb, b)) else { return };
+        let left = *x & !mask;
+        *x = left;
+        if left == 0
+            && let Some(s) = self.sum.get_mut(cell(w / 64, nb, b))
+        {
+            *s &= !(1u64 << (w % 64));
+        }
+    }
+
+    /// Member `a` goes from bucket `lo` to bucket `hi` as member `b` goes from `hi` to `lo`: what
+    /// `relink(a, lo, hi)` then `relink(b, hi, lo)` leave, written once. Each bucket holds as many
+    /// as it did, so neither its count nor the buckets that hold any change; each bucket's last
+    /// put in is the one it gained. `a` is in `lo` and `b` in `hi` by the index's invariant.
+    #[inline(always)]
+    pub fn swap(&mut self, a: u32, b: u32, lo: u32, hi: u32) {
+        let nb = self.nb;
+        let (wa, wb) = (a / 64, b / 64);
+        let (ma, mb) = (1u64 << (a % 64), 1u64 << (b % 64));
+        if wa == wb {
+            // One word of each bucket, and each keeps one of the two: neither empties.
+            if let Some(x) = self.bits.get_mut(cell(wa, nb, lo)) {
+                *x = (*x & !ma) | mb;
+            }
+            if let Some(x) = self.bits.get_mut(cell(wa, nb, hi)) {
+                *x = (*x & !mb) | ma;
+            }
+        } else {
+            self.drop_bit(wa, lo, ma);
+            self.add_bit(wb, lo, mb);
+            self.add_bit(wa, hi, ma);
+            self.drop_bit(wb, hi, mb);
+        }
+        if let Some(k) = self.slots.get_mut(lo as usize) {
+            k.last = b;
+        }
+        if let Some(k) = self.slots.get_mut(hi as usize) {
+            k.last = a;
         }
     }
 
@@ -469,6 +557,74 @@ impl Index {
     /// Whether bucket `b` holds runner `r`.
     #[inline(always)]
     pub fn holds(&self, b: u32, r: u32) -> bool {
-        self.bits.get(((r / 64) * self.nb + b) as usize).is_some_and(|x| x & (1u64 << (r % 64)) != 0)
+        self.bits.get(cell(r / 64, self.nb, b)).is_some_and(|x| x & (1u64 << (r % 64)) != 0)
+    }
+}
+
+#[cfg(test)]
+mod hex_address_tests {
+    #[test]
+    fn w05_r04_interleaved_addresses_do_not_wrap_at_u32() {
+        // Previously this legal address wrapped to 4095 (and panicked in debug builds).
+        assert_eq!(super::cell(1 << 20, super::BUCKETS, 4095), usize::try_from((1u64 << 32) + 4095).unwrap_or(usize::MAX));
+    }
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use super::Index;
+    use crate::lb::model::Rng;
+
+    /// W05-R04, W05-R26: one swap leaves the index exactly as the two moves it stands for
+    /// (members, summaries, counts, cursors, each bucket's last put in), within one membership
+    /// word and across words and summary words; and a runner comes before a bucket's next in turn
+    /// exactly when, put in that bucket, it is the next.
+    #[test]
+    fn w05_r26_a_swap_leaves_what_its_two_moves_leave() -> Result<(), String> {
+        let mut rng = Rng(7);
+        let mut swapped = 0u32;
+        for case in 0..6000u32 {
+            let runners = [2u32, 3, 63, 64, 65, 130, 4097, 9000].get((case % 8) as usize).copied().unwrap_or(2);
+            let buckets = 2 + rng.below(8) as u32;
+            let mut ix = Index::new(rng.below(u64::from(u32::MAX)) as u32);
+            ix.grow(buckets, runners);
+            // Few members in the big fleets, so words and summary words empty and fill.
+            let members = runners.min(2 + rng.below(40) as u32);
+            let mut at: Vec<(u32, u32)> = Vec::new();
+            while (at.len() as u32) < members {
+                let r = rng.below(u64::from(runners)) as u32;
+                if at.iter().any(|x| x.0 == r) {
+                    continue;
+                }
+                let b = rng.below(u64::from(buckets)) as u32;
+                ix.join(r, &[8000, 0, 0, 0]);
+                ix.push(r, b);
+                at.push((r, b));
+            }
+            // A cursor anywhere, past the fleet too.
+            for b in 0..buckets {
+                ix.took(b, rng.below(u64::from(runners) + 70) as u32);
+            }
+            let Some(&(a, lo)) = at.get(rng.below(at.len() as u64) as usize) else { continue };
+            let Some(&(b, hi)) = at.iter().find(|x| x.1 != lo) else { continue };
+            let next = ix.next_in(hi);
+            let mut with = ix.clone();
+            with.push(a, hi);
+            if ix.before(hi, a, next) != (with.next_in(hi) == a) {
+                return Err(format!("case {case}: {a} before {next} in bucket {hi}: {}\n{ix:?}", ix.before(hi, a, next)));
+            }
+            let (mut one, mut two) = (ix.clone(), ix);
+            one.swap(a, b, lo, hi);
+            two.relink(a, lo, hi);
+            two.relink(b, hi, lo);
+            if format!("{one:?}") != format!("{two:?}") {
+                return Err(format!("case {case}: {runners} runners, {a} from {lo} to {hi} as {b} comes back:\n{one:?}\n{two:?}"));
+            }
+            swapped += 1;
+        }
+        if swapped < 5000 {
+            return Err(format!("only {swapped} cases had two buckets to swap between"));
+        }
+        Ok(())
     }
 }

@@ -5,6 +5,7 @@
 import * as React from "react";
 import { harnessApi, useSession, type AgentInfo, type Command, type FileChange as ServerChange, type HEvent, type SessionStore, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
+import { useRes } from "@/lib/data";
 import { agentLabel, changesetOf, editsOf, runsOf, useSameList } from "./derive";
 import { isBackground } from "./background";
 import { workingNow } from "./tasks";
@@ -21,13 +22,19 @@ import type { CompareSource } from "./compare";
 const NO_EVENTS: HEvent[] = [];
 const NO_AGENTS: readonly AgentInfo[] = [];
 
-/** The Plan and Tools tabs' code, asked for as a tab is pointed at or opened (goal 8 step 6: not in the first view). */
-const loadTabs = () => import("./inspector-tabs");
-const PlanTab = React.lazy(() => loadTabs().then((m) => ({ default: m.PlanTab })));
-const ToolsTab = React.lazy(() => loadTabs().then((m) => ({ default: m.ToolsTab })));
+export { prepareInspectorTab, type InspectorTab } from "./inspector-code";
+import { inspectorTabsRes, prepareInspectorTab, type InspectorTab } from "./inspector-code";
+type Tabs = typeof import("./inspector-tabs");
 
-/** Three places beside the conversation: what it changed, its plan (and goals, and saved plans to run), and its tools (what it has running, subagents, commands it ran, MCP, skills, usage). */
-export type InspectorTab = "changes" | "plan" | "tools";
+function PlanTab(props: React.ComponentProps<Tabs["PlanTab"]>) {
+  const { PlanTab: Content } = useRes(inspectorTabsRes).data;
+  return <Content {...props} />;
+}
+
+function ToolsTab(props: React.ComponentProps<Tabs["ToolsTab"]>) {
+  const { ToolsTab: Content } = useRes(inspectorTabsRes).data;
+  return <Content {...props} />;
+}
 
 /** Its harness's subagents (their runs' ids, what each was asked, its kind), the same list while they stay the same: what the Changes tab's By names. */
 function useSubs(tasks: readonly Task[] | undefined): readonly Sub[] {
@@ -184,8 +191,8 @@ export function Inspector({
                 aria-selected={tab === t.id}
                 className="hx-tab"
                 onClick={() => onTab(t.id)}
-                onPointerEnter={t.id === "changes" ? undefined : loadTabs}
-                onFocus={t.id === "changes" ? undefined : loadTabs}
+                onPointerEnter={() => prepareInspectorTab(t.id)}
+                onFocus={() => prepareInspectorTab(t.id)}
               >
                 {t.label}
                 {t.count && <span className="hx-tab-count">{t.count}</span>}

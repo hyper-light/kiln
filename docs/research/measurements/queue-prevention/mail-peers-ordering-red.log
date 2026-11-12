@@ -1,0 +1,15 @@
+
+running 1 test
+test harness::ops::end_to_end::mail_peers_capacity_survives_an_ordinary_owner_state ... FAILED
+
+failures:
+
+---- harness::ops::end_to_end::mail_peers_capacity_survives_an_ordinary_owner_state stdout ----
+Error: MailPeers did not update the authoritative State: Capacity { epoch: 0, generation: 4, retry_generation: Some(1), learning: Bootstrap, target: 2, admitted: 0, bytes: 0, peers: 1, eligible_peer: Some("server"), feedback_generation: Some(4) }
+
+
+failures:
+    harness::ops::end_to_end::mail_peers_capacity_survives_an_ordinary_owner_state
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4233 filtered out; finished in 0.47s
+

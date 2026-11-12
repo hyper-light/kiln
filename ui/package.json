@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -p tsconfig.app.json --noEmit && vite build && node scripts/stable-names.mjs && node scripts/server-pages.mjs && node scripts/pack-ui-server.mjs",
+    "build": "tsc -p tsconfig.app.json --noEmit && vite build && node scripts/stable-names.mjs && node scripts/server-pages.mjs && node scripts/compress-assets.mjs && node scripts/pack-ui-server.mjs",
     "pack-ui-server": "node scripts/pack-ui-server.mjs",
     "serve": "bun server/main.ts",
     "preview": "vite preview",
@@ -62,6 +62,7 @@
     "@vitejs/plugin-rsc": "0.5.38",
     "eslint": "^10.12.0",
     "eslint-plugin-react-hooks": "^7.1.1",
+    "fake-indexeddb": "6.2.7",
     "globals": "^17.13.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.23.15",

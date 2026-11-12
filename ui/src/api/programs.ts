@@ -88,9 +88,10 @@ export interface ProgramNotice {
   text: string;
   at: number;
   delivered: boolean;
+  publication?: import("./wire/MailReceipt").MailReceipt;
   /** The message's id, once delivered. */
   message?: string;
-  /** Why it isn't yet (kiln tries again every 15 s). */
+  /** Why it is waiting; delivery advances on owner events. */
   why?: string;
 }
 

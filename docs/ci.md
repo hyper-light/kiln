@@ -140,6 +140,10 @@ These hold for every line written under this spec.
   "routed to X because…", "retried because…", "skipped because…". One exception, decided by the
   user (2026-10-27): headroom (docs/headroom.md) is on by default, since its decisions keep a
   machine from harming what runs on it; each of them says why, and Runners → Headroom turns it off.
+  A second, decided by the user (2026-11-11): good places (docs/lb.md) are on by default, since
+  they choose only between runners the rank can't tell apart (a run goes back to where its kind of
+  work last went well, its caches warm, and that pick is the cheapest to make); each such pick
+  says why, and `[reach] good_places = false` turns them off.
 - **Tests and checks before handing over:** the tests relevant to the change must pass before it's
   pushed. Decided by the user (2026-11-04): full runs (`cargo clippy --workspace --all-targets --
   -D warnings`, `cargo test --workspace`, a workstream's scenario suites (W22), the gate and the

@@ -297,6 +297,10 @@ impl Records for StoreRecords {
     }
 
     fn commit<'a>(&'a self, tx: Tx) -> BoxFuture<'a, Result<Rev, Refusal>> {
+        self.commit_owned(tx, Box::new(()))
+    }
+
+    fn commit_owned<'a>(&'a self, tx: Tx, owner: Box<dyn Send + Sync>) -> BoxFuture<'a, Result<Rev, Refusal>> {
         Box::pin(async move {
             // What doesn't fit is refused before anything is read or written.
             if tx.conds.len() > TX_MAX {
@@ -323,6 +327,11 @@ impl Records for StoreRecords {
             let out = self
                 .store
                 .call(move |c| {
+                    // Fields drop in declaration order: payload before its authority, including
+                    // early errors and cancellation of the caller after this closure is queued.
+                    struct Owned { tx: Tx, _owner: Box<dyn Send + Sync> }
+                    let owned = Owned { tx, _owner: owner };
+                    let tx = &owned.tx;
                     let t = crate::store::tx(c)?;
                     for cond in &tx.conds {
                         let (Cond::Absent { family, key } | Cond::At { family, key, .. }) = cond;

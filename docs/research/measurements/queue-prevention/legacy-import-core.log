@@ -1,0 +1,54 @@
+
+running 49 tests
+test harness::mail_delivery::tests::unknown_recipient_refuses_new_custody_but_keeps_an_existing_exact_receipt ... ok
+test harness::ops::end_to_end::a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication ... ok
+test harness::ops::end_to_end::a_child_asked_for_more_than_its_parent_has_is_refused_and_one_within_it_starts ... ok
+test harness::ops::end_to_end::a_fellow_agents_message_is_its_words_whatever_kiln_says_of_its_sender ... ok
+test harness::ops::end_to_end::a_key_given_to_a_plan_run_in_one_mode_is_refused_in_another ... ok
+test harness::ops::end_to_end::a_key_given_to_another_plan_run_is_refused ... ok
+test harness::ops::end_to_end::a_keyed_plan_run_retried_after_its_agent_moved_is_the_same_run ... ok
+test harness::ops::end_to_end::a_keyed_send_retried_after_its_sender_moved_is_the_same_message ... ok
+test harness::ops::end_to_end::a_message_from_a_fellow_agent_says_who_sent_it_and_how_to_answer ... ok
+test harness::ops::end_to_end::a_stale_inbox_epoch_preserves_custody_without_changing_the_current_owner ... ok
+test harness::ops::end_to_end::agents_send_twice_with_one_key_is_one_prompt_and_both_get_its_answer ... ok
+test harness::ops::end_to_end::an_agent_held_to_fewer_subagents_starts_no_more_through_kiln ... ok
+test harness::ops::end_to_end::bypass_needs_the_parent_s_own_and_chains_and_children_are_bounded ... ok
+test harness::ops::end_to_end::cp_t3_2_agent_messages_steer_a_busy_peer_without_building_a_backlog ... ok
+test harness::ops::end_to_end::cp_t3_2_an_agent_steers_peers_but_stops_only_its_own ... ok
+test harness::ops::end_to_end::g10_a2c_agents_get_and_result_read_nothing_back_on_the_requests_shard ... ok
+test harness::ops::end_to_end::g9_s3_agents_list_lists_what_it_listed_for_agents_and_people ... ok
+test harness::ops::end_to_end::g9_s5_a_list_for_whoever_sees_every_session_is_the_copied_lists ... ok
+test harness::ops::end_to_end::mail_peers_capacity_survives_an_ordinary_owner_state ... ok
+test harness::ops::end_to_end::wait_handoff_budget_includes_the_complete_wait_response ... ok
+test harness::ops::end_to_end::wait_response_stages_exact_ids_and_can_withdraw_unregistered_mail ... ok
+test harness::ops::tests::a_key_is_whose_it_is_wherever_they_call_from ... ok
+test harness::ops::tests::a_publication_keeps_send_aliases_without_inventing_receiver_acceptance ... ok
+test harness::ops::tests::a_wait_is_a_change_and_a_result_a_read ... ok
+test harness::ops::tests::about_asks_what_was_tapped_in_the_four_parts_the_card_reads ... ok
+test harness::ops::tests::g10_s5_agents_list_makes_its_briefs_off_the_shard ... ok
+test harness::ops::tests::no_operation_answers_for_a_person ... ok
+test harness::ops::tests::status_is_only_explicit_and_does_not_reuse_the_publication_key ... ok
+test harness::ops::tests::waits_say_whom_they_wait_for ... ok
+test harness::port::tests::kiln_s_registry_holds_every_harness_port_clause ... ok
+test harness::session::tests::accepted_queue_edit_reserves_growth_and_journals_before_adapter_mutation ... ok
+test harness::session::tests::accepted_queue_shrink_grants_retry_credit_only_after_cas_and_actual_owner_apply ... ok
+test harness::wait::tests::a_later_index_page_can_wake_a_wait_without_claiming_mail ... ok
+test harness::wait::tests::a_message_on_its_way_keeps_an_idle_agent_working_until_its_turn_ends ... ok
+test harness::wait::tests::a_partial_mail_probe_is_consumed_only_by_its_queue_revision ... ok
+test harness::wait::tests::a_quiet_wait_has_only_its_initial_and_final_snapshot ... ok
+test harness::wait::tests::a_source_read_cannot_outlive_the_wait_deadline ... ok
+test harness::wait::tests::a_wait_ends_when_a_message_from_another_agent_waits_in_the_waiter_s_queue ... ok
+test harness::wait::tests::a_wait_hands_over_others_messages_to_its_own_turn_each_once_as_many_as_fit ... ok
+test harness::wait::tests::a_wait_returns_when_its_agents_settle_or_its_time_is_up ... ok
+test harness::wait::tests::concurrent_handoff_claims_are_recipient_scoped_and_end_with_request ... ok
+test harness::wait::tests::deferred_approvals_still_need_a_person ... ok
+test harness::wait::tests::handoff_digest_binds_exact_response_and_normalizes_object_order ... ok
+test harness::wait::tests::malformed_or_oversized_handoff_payload_is_not_a_digest ... ok
+test harness::wait::tests::mc_attention_wait_a_persons_pause_wins_over_live_work_until_resumed ... ok
+test harness::wait::tests::mc_attention_wait_pause_flags_preserve_exit_offline_and_usage_semantics ... ok
+test harness::wait::tests::mc_attention_wait_queued_input_and_room_wait_stay_working_until_cleared ... ok
+test harness::wait::tests::mc_attention_wait_requests_and_held_goals_win_over_pause_and_pending_work ... ok
+test harness::wait::tests::where_an_agent_stands_in_a_word ... ok
+
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 4195 filtered out; finished in 28.78s
+

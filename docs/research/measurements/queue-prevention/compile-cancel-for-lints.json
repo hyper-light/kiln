@@ -1,0 +1,14 @@
+{
+  "reason": "Stop own final test compile before correcting the reported clippy errors; no other processes signalled",
+  "expected": {
+    "31653": [
+      31648,
+      "cargo"
+    ],
+    "54125": [
+      31653,
+      "rustc"
+    ]
+  },
+  "signalled": []
+}

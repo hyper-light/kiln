@@ -28,11 +28,13 @@ use super::kinds::Protocol;
 use super::model::{Event, State};
 use super::session::Spec;
 
+pub mod stream;
+
 /// The package's format, newest: one of a version this runner doesn't know is refused, never
 /// guessed at. 2 added [`Carry::Words`]; 3, what the harness keeps in its home
-/// ([`Package::home`]). A package without them stays 1, so older runners still take it; one with
+/// ([`Package::home`]); 4 adds a mail manifest followed by its exact journal row stream. A package without them stays 1, so older runners still take it; one with
 /// them, an older runner refuses whole rather than take it without them.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// The format a package with `carry` is.
 fn version_of(carry: &Carry) -> u32 {
@@ -132,6 +134,10 @@ pub struct Package {
     /// holding no identity: it goes unsigned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hand_on: Option<serde_json::Value>,
+    /// v4 only: exact journal rows follow this JSON header as a value stream. Keeping the rows
+    /// outside the header prevents serde Vec/Value/Frame encoders assembling all accepted bodies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail: Option<super::mail::TransferManifest>,
 }
 
 impl Package {
@@ -257,6 +263,7 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
         handover: false,
         attempt: None,
         hand_on: None,
+        mail: None,
     }
 }
 

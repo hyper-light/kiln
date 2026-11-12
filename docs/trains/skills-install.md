@@ -1,0 +1,92 @@
+# Train notes: installed skills across harnesses
+
+This train serves W20-R01. The person authorized merging, pushing and deploying it on
+2026-11-09. It imports packages from GitHub links, local folders, uploaded archives or Markdown,
+previews their contents, and installs selected skills for an agent, the person's agents, or a
+repository folder. Setup is explicit, reports its commands and logs, and can be retried.
+
+Claude Code uses its native plugin format. Codex registers installed skill roots before sending
+queued turns, and uses native skill input after acknowledgement. Older Codex versions and the ACP
+and headless harnesses receive scoped instructions and asset paths through Kiln's prompt writer.
+This covers Devin, OpenCode, Gemini, Goose, Amp and Antigravity. Optional hooks, agent definitions
+and package MCP configuration retain their harness-specific formats; the UI identifies them.
+
+The additive migration `20261109-1200_skills_install` creates package and draft tables, with
+content-addressed files under `skills/files`. It does not raise the schema epoch. An older server
+ignores these tables. New postcard variants are appended, and runners advertise the named
+`skills` feature. Older runners continue their existing sessions; placing packages and delivering
+their instructions requires an upgraded runner. Runner upgrades remain the person's action.
+
+The feature's native skills, prompt delivery, protocol and adapter checks are recorded in the
+shipping evidence. Linux, macOS and Windows clippy passed; the expanded Windows Codex suite had
+two failures in unchanged Unix-path fixtures. These are not claimed as passing. The main-based
+candidate preserves main's Ship syntax worker change and reruns the combined UI checks.
+The full Linux gate and deployment have their own recorded outcomes; this note makes no claim
+that either has completed.
+
+The gate repairs also serve W05-R25: a completed run retains its request until acknowledgment,
+including the agent it owes news to. The existing optional request in its persisted run record is
+restored even after completion. An adopter registers the run before telling members it owns it,
+so a local member's synchronous completion cannot arrive before its follower exists. The regression
+checks both request retention across restore and one start followed by one successful completion
+when the adopter is also the runner. No new wire variant or schema change is needed for this fix.
+
+The merged main binds the deployment issuer to its own server rather than another hub in the
+process (W10-R11); account reload and permission retry grant their sessions headroom, so authentication
+and permission refusal are the holds under test (W20-R01). The adapter measurement fixture counts completed waits independently of the
+engine draining its samples. Conflict-agent fixtures wait until their runner advertises its harness
+(W26-R17), and resume-from-copy waits for that session's committed native transcript instead of a
+future telemetry timestamp (W27-R08). These preserve the behavior each test is meant to check.
+The cached-page fixture waits for both sealed chunks to finish compaction before warming them
+(G10-S5); one chunk becoming compact does not mean the second has finished.
+All ACP configuration and protocol fixtures own a distinct admitted core, renewing its grant for the next
+protocol interaction and releasing their waits afterward. Anonymous protocol cores do not join
+runner admission: session startup sets a real session ID before starting its harness, and turn
+completion already ignores anonymous cores. This keeps unrelated protocol fixtures from sharing
+an empty admission key when another test starts the process-wide controller. The attention usage
+poll fixture waits for all six messages to complete before measuring, because an idle snapshot
+can precede the next message's start even after the stand-in has read its prompt. The cleanup-timer fixture waits for
+the persisted decision as well as the removed directory before checking its trigger (G9).
+
+The restart budget checks found one database round trip per restored leg to read its input hash,
+even when its workflow did not adopt work. Restore now reads that existing column with the leg
+rows and keeps the same adoption keys (W05-AC09, W28-R46). The timing limits remain unchanged.
+
+Production uses the dedicated bare-metal server, as documented in the conversation performance
+and Mission Control trains. The retained Kubernetes app is not the serving process. Build the
+exact landing commit with the production release profile and its carried Linux UI. Check the
+candidate and saved previous executable against a private online SQLite backup in a network
+namespace, with the real home masked and agents, discovery, CI/CD and updates disabled. Verify
+the migration, readiness, commit and served assets before server-only atomic promotion. Preserve
+the rollback executable and observe ten minutes of readiness, restart/OOM counters and runner
+reconnections. Never replace a runner executable or restart a runner service for this release.
+
+The landing also merges published main `e7dedd3256d38cc5c0d4c17246bbbbeb03465679`. Its room-token,
+learned-weight, timer and packed-stream fixes are preserved. Main's durable transcript cursor check
+replaces the earlier test snapshot workaround. The skills postcard variants remain after every
+published main variant, and both named feature sets are advertised.
+
+The lease-loss fixture also serves W05-AC16: it waits for the paused runner's child to finish
+writing its late output before resuming the runner. Attempt 2 and the refused old tokens already
+prove that the old grant expired. A fixed additional 17-second pause also expired QUIC's 10-second
+idle connection, so a log chunk could disappear with that connection before its refusal was
+counted. The fixture keeps all three refusal counters, old-token refusals, attempt ownership,
+output isolation and the final artifact checks.
+
+The real-process restart check also exposed repeated copies of the shared ownership set.
+Restore publishes queued-leg ownership together (W05-AC09), while running grants are made
+visible before they are recovered. Plan spec lookup now uses the existing unique-key index
+instead of scanning all earlier matrix cells, including for completed cells retained for replay.
+The restart timing limit remains two seconds, and every recovered leg and grant is still checked.
+
+Restore reads the existing wait reason with each leg too. When the scheduler's only action
+for that leg is the identical wait (and timers), it restores the offers view and keeps the
+already durable explanation, avoiding a write transaction and a job reread per queued leg.
+Changed waits, capability messages, assignments and all other actions still take their normal
+path. The retry-after-restart regression seeds a stale capacity explanation and verifies that
+restore replaces it with the current unroutable reason before the second attempt is assigned.
+
+Changed independent wait explanations recovered together share one transaction. Each still
+closes the previous kind of wait and is published; the batch is flushed before an assignment,
+protected-environment check or any other action that can change a leg. This keeps recovery from
+paying for one commit per queued leg, including when its last wait was not saved before shutdown.

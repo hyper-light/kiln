@@ -1194,6 +1194,36 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             }
             boxed(|| own_op(&hub, &caller, "research.add", body)).await
         }
+        // Skills kiln installs (docs/agents.md, "Skills kiln installs"): each operation is its
+        // route; an upload is its file's bytes, named in its query.
+        (&Method::GET, ["api", "skills"]) => boxed(|| own_op(&hub, &caller, "skills.list", query_value(&q))).await,
+        (&Method::POST, ["api", "skills", "look"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "skills.look", body)).await
+        }
+        (&Method::POST, ["api", "skills", "upload"]) => {
+            let (agent, name) = (q.get("agent").cloned().unwrap_or_default(), q.get("name").cloned().unwrap_or_default());
+            let limit = usize::try_from(crate::skills::detect::MAX_TOTAL).unwrap_or(usize::MAX);
+            let bytes = boxed(|| srv::body_bytes(req.into_body(), limit)).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
+            let cx = crate::skills::ops::cx(&hub, &caller);
+            let plugin = q.get("plugin").cloned();
+            boxed(|| crate::skills::ops::upload(cx, &agent, &name, plugin.as_deref(), bytes)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+        }
+        (&Method::POST, ["api", "skills"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "skills.install", body)).await
+        }
+        (&Method::PATCH, ["api", "skills", id]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "skills.set", body)).await
+        }
+        (&Method::DELETE, ["api", "skills", id]) => boxed(|| own_op(&hub, &caller, "skills.remove", json!({ "id": id }))).await,
+        (&Method::POST, ["api", "skills", id, "update"]) => boxed(|| own_op(&hub, &caller, "skills.update", json!({ "id": id }))).await,
+        (&Method::GET, ["api", "skills", id, "skills", skill]) => boxed(|| own_op(&hub, &caller, "skills.read", json!({ "id": id, "skill": skill }))).await,
         (&Method::GET, ["api", "harness", "conversations", "search"]) => boxed(|| own_op(&hub, &caller, "conversations.search", query_value(&q))).await,
         (&Method::GET, ["api", "plans", "runs"]) => boxed(|| own_op(&hub, &caller, "plans.runs.list", query_value(&q))).await,
         (&Method::GET, ["api", "plans", "runs", run]) => boxed(|| own_op(&hub, &caller, "plans.runs.get", json!({ "run": run }))).await,
@@ -1252,6 +1282,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::GET, ["api", "plans", id]) => boxed(|| crate::plans::get(&hub, id)).await.map(|p| srv::json(StatusCode::OK, &p)).map_err(plan_err),
         (&Method::PATCH, ["api", "plans", id]) => boxed(|| plans_update(&hub, id, req)).await,
         (&Method::DELETE, ["api", "plans", id]) => boxed(|| plans_delete(&hub, id)).await,
+        // W21-R02: related review records from one read revision; no approval or other mutation.
+        (&Method::GET, ["api", "plans", id, "review-context"]) => boxed(|| crate::plans::review::context(&hub, id)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
         (&Method::GET, ["api", "plans", id, "versions"]) => boxed(|| crate::plans::versions(&hub, id)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
         (&Method::GET, ["api", "plans", id, "runs"]) => boxed(|| crate::plans::runs(&hub, id)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
         (&Method::POST, ["api", "plans", id, "restore"]) => boxed(|| plans_restore(&hub, id, req)).await,
@@ -1330,9 +1362,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         // would be read).
         (&Method::GET, ["api", "harness", "agents", "wait"]) => Err(err(StatusCode::METHOD_NOT_ALLOWED, "agents.wait takes delivery of your messages, so it's a POST: send its input as a JSON body")),
         (&Method::GET, ["api", "harness", "agents", id]) => boxed(|| own_op(&hub, &caller, "agents.get", json!({ "agent": id }))).await,
-        (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children")]) => {
-            let op = format!("agents.{what}");
-            boxed(|| own_op(&hub, &caller, &op, json!({ "agent": id }))).await
+        (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children" | "messages" | "message-body")]) => {
+            let op = format!("agents.{}", what.replace('-', "_"));
+            let mut input = query_value(&q);
+            if let Some(input) = input.as_object_mut() { input.insert("agent".into(), json!(id)); }
+            boxed(|| own_op(&hub, &caller, &op, input)).await
         }
         (&Method::GET, ["api", "harness", "changes"]) => boxed(|| own_op(&hub, &caller, "agents.changes", query_value(&q))).await,
         (&Method::GET, ["api", "harness", "agents", id, "workspace"]) => boxed(|| own_op(&hub, &caller, "agents.workspace", json!({ "agent": id }))).await,
@@ -1493,7 +1527,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             boxed(|| harness_terminal(&hub, &id, req)).await
         }
         (&Method::GET, ["api", "harness", "history"]) => boxed(|| harness_history(&hub, &caller, &q)).await,
-        (&Method::GET, ["api", "harness", "sessions", id, "events"]) => boxed(|| conversation_events(&hub, id, &q)).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "events"]) => boxed(|| conversation_events_for(&hub, &caller, id, &q)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "events", event]) => boxed(|| harness_event(&hub, id, event, &q)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "timeline"]) => boxed(|| harness_timeline(&hub, id, &q)).await,
         (&Method::GET, ["api", "conversations", "search"]) => boxed(|| conversation_search(&hub, &q)).await,
@@ -1513,8 +1547,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         // Recordings of its streams (`crate::browser::record`): theirs a person's own profile's.
         (&Method::GET, ["api", "harness", "sessions", id, "recordings"]) => Ok(srv::json(StatusCode::OK, &hub.harness.streams.recordings(id, person(&req).as_deref()))),
         (&Method::GET, ["api", "harness", "sessions", id, "recordings", rid, what]) => boxed(|| recording_file(&hub, id, rid, what, &req)).await,
-        // Its record once it closed, as kiln's store of bytes keeps it (`crate::harness::archive`).
-        (&Method::GET, ["api", "harness", "sessions", id, "transcripts"]) => Ok(srv::json(StatusCode::OK, &json!({ "pieces": boxed(|| crate::harness::archive::archived(&hub, id)).await? }))),
+        // W27-R08: its durable record positions, and its archived pieces once it closed.
+        (&Method::GET, ["api", "harness", "sessions", id, "transcripts"]) => boxed(|| transcripts(&hub, id, q.get("records").is_some_and(|v| v == "1"))).await,
         (&Method::GET, ["api", "harness", "sessions", id, "transcripts", source]) => boxed(|| archived_transcript(&hub, id, source)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
@@ -1871,6 +1905,25 @@ async fn recording_file(hub: &Arc<Hub>, id: &str, rid: &str, what: &str, req: &R
     Ok(r)
 }
 
+/// W27-R08: what the server has received of each native transcript, independently of whether a
+/// runner has sent another telemetry report. Positions are read by the conversation store's own
+/// writer: another process can't open its Turso database while it runs.
+async fn transcripts(hub: &Hub, id: &str, include_records: bool) -> R {
+    let pieces = crate::harness::archive::archived(hub, id).await?;
+    // Existing archive readers need no native-record read or inflation on the store's writer.
+    if !include_records {
+        return Ok(srv::json(StatusCode::OK, &json!({ "pieces": pieces })));
+    }
+    let records = if let Some(store) = hub.harness.convo.clone() {
+        let session = id.to_owned();
+        let marks = crate::rt::blocking(move || store.marks(&session)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        marks.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?.into_iter().map(|m| json!({ "source": m.source, "lines": m.n.saturating_add(1), "end": m.end })).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    Ok(srv::json(StatusCode::OK, &json!({ "pieces": pieces, "records": records })))
+}
+
 /// `GET /api/harness/sessions/:id/transcripts/:source`: a closed conversation's record from
 /// `source`, every line archived, in order (JSON lines, read back from its pieces).
 async fn archived_transcript(hub: &Arc<Hub>, id: &str, source: &str) -> R {
@@ -2061,6 +2114,8 @@ async fn opened_by(hub: &Hub, caller: &crate::authz::Caller, infos: &[crate::har
             let _ = hub.store.kv_set(crate::mcp::opened_by_key(&i.id), p.clone()).await;
         }
     }
+    // Whose they are says which installed skills they have (docs/agents.md, "Skills kiln installs").
+    boxed(|| crate::skills::sync(hub)).await;
 }
 
 /// Where a session found on `machine` continues as an agent: on that machine's runner, except the
@@ -2208,8 +2263,8 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
         return Err(err(StatusCode::UNAUTHORIZED, "bad cluster token"));
     }
     let dir = hub.cfg.data("cluster").join("copies");
-    let _one = CLUSTER_COPIES.turn().await;
-    // Copies a stop left behind.
+    let one = CLUSTER_COPIES.turn().await;
+    // Copies a stop left behind: none is being made while the turn is here (below).
     if let Ok(old) = std::fs::read_dir(&dir) {
         for e in old.flatten() {
             std::fs::remove_file(e.path()).ok();
@@ -2218,7 +2273,16 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
     std::fs::create_dir_all(&dir).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("making {}: {e}", dir.display())))?;
     let path = dir.join(format!("{}.db", crate::util::new_id()));
     let started = Instant::now();
-    if let Err(e) = hub.store.copy_for_learner(path.clone()).await {
+    // A copy holds the turn for as long as it's being made, whether its runner waits for it or not: one that gave up and
+    // asked again waits for it rather than a second being made beside it, and the turn comes back here with the copy, given
+    // up once the copy is open to be sent (plan 01a1cc09, step 4). A copy is made on the blocking pool, and once started nothing stops
+    // it: on 2026-11-11 four of production's 32 GB kiln.db were being written at once, three of them deleted already by
+    // the asks after, about 100 MiB/s of its disk.
+    let (store, made) = (hub.store.clone(), path.clone());
+    let (copied, _one) = crate::rt::spawn(async move { (store.copy_for_learner(made).await, one) })
+        .await
+        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "the copy of kiln.db stopped before it was made"))?;
+    if let Err(e) = copied {
         std::fs::remove_file(&path).ok();
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")));
     }
@@ -3009,6 +3073,7 @@ fn me_json(hub: &Hub, caller: Option<&crate::authz::Caller>, groups: Vec<String>
         // Who (W10-R01): `admin` for the owner, `user:<name>`, a token, a job; and what they
         // hold, when that isn't everything.
         "principal": caller.map(|c| c.name.clone()),
+        "mail_scope": caller.map(|c| crate::util::sha256_hex(format!("mail-scope-v1:{}", crate::harness::ops::key_scope(c)).as_bytes())),
         "kind": caller.map(|c| c.kind),
         "grants": caller.and_then(crate::authz::Caller::grants),
         "groups": groups,
@@ -5877,6 +5942,47 @@ async fn harness_sessions(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Resp
     srv::json(StatusCode::OK, &crate::harness::lineage::seen(hub, caller, hub.harness.list()).await)
 }
 
+/// A cursor reader asks for a bounded canonical page; legacy callers retain their pre-encoded
+/// read-model path below. The cursor and lineage are checked on both sides of durable IO.
+async fn conversation_events_for(hub: &Hub, caller: &crate::authz::Caller, id: &str, q: &HashMap<String, String>) -> R {
+    let Some(cursor) = q.get("cursor") else { return conversation_events(hub, id, q).await };
+    let before = q.get("before").and_then(|v| v.parse::<u64>().ok()).ok_or_else(|| err(StatusCode::BAD_REQUEST, "history needs a numeric before cursor"))?;
+    let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(100).clamp(1, 1000);
+    let bytes = q.get("bytes").and_then(|v| v.parse::<usize>().ok()).unwrap_or(256 * 1024).clamp(16 * 1024, 1024 * 1024);
+    if !hub.harness.history_valid(id, cursor) { return Err(err(StatusCode::CONFLICT, "the conversation restarted; reconnect before loading earlier history")); }
+    let mut more = false;
+    // From the session's copy when it holds the page: the conversation store, whose reads wait behind its writes,
+    // only for what the copy doesn't hold, as pages were answered before d7c8bc4ee96b (plan 01a1cc09, step 1).
+    let events = if hub.harness.history_kept(id, before, limit).await {
+        (Vec::new(), false)
+    } else if let Some(store) = hub.harness.convo.clone() {
+        let session = id.to_owned();
+        crate::rt::blocking(move || {
+            // As committed, beside the store's writer: never behind the writes sent before it (plan 01a1cc09, step 2).
+            let rows = store.events_committed(&session, Some(before), limit.saturating_add(1))?;
+            let more = rows.len() > limit;
+            let values = rows.iter().map(|r| serde_json::from_str::<serde_json::Value>(&r.body)).collect::<Result<Vec<_>, _>>()?;
+            anyhow::Ok((values, more))
+        }).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+            .map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?
+    } else { (Vec::new(), false) };
+    more |= events.1;
+    crate::harness::lineage::may_see(hub, caller, id).await.map_err(|(c, m)| err(c, m))?;
+    let (events, revision, held_more, floor) = hub.harness.history_overlay(id, cursor, before, limit, events.0).await
+        .map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?
+        .ok_or_else(|| err(StatusCode::CONFLICT, "the conversation changed while history was loading; reconnect and retry"))?;
+    if !hub.harness.history_valid(id, cursor) { return Err(err(StatusCode::CONFLICT, "the conversation changed while history was loading; reconnect and retry")); }
+    let more = (more || held_more) && events.iter().filter_map(crate::harness::history::seq).min().is_some_and(|n| n > floor);
+    let token = cursor.clone();
+    let json = crate::rt::blocking(move || {
+        let (events, history) = crate::harness::history::page(events, before, limit, bytes, token, more);
+        crate::reads::encode(&json!({"events":events,"history":history,"revision":revision}))
+    }).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e:#}")))?;
+    let response = pre_encoded(json);
+    Ok(srv::with_header(srv::with_header(response, header::CACHE_CONTROL, "private, no-store"), header::VARY, "Cookie, Authorization"))
+}
+
 async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
     let before = q.get("before").and_then(|b| b.parse::<u64>().ok());
@@ -5992,22 +6098,28 @@ async fn conversation_restore(hub: &Arc<Hub>, req: Request) -> R {
     Ok(srv::json(StatusCode::ACCEPTED, &hub.harness.restore_view()))
 }
 
-/// `GET /api/conversations/search?q=&agent=&kind=&tool=&status=&since=&until=&limit=`: events across
+/// `GET /api/conversations/search?q=&agent=&kind=&tool=&status=&since=&until=&limit=&before_seq=`: events across
 /// every agent's conversation, newest first, from the server's store: `{hits: [{agent, name, machine,
 /// event}]}`.
 async fn conversation_search(hub: &Hub, q: &HashMap<String, String>) -> R {
     let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
     let text = |k: &str| q.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
     let num = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok());
+    let before_seq = q.get("before_seq").map(|v| v.parse::<u64>()).transpose().map_err(|_| err(StatusCode::BAD_REQUEST, "before_seq must be an unsigned integer"))?;
+    let session = text("agent");
+    if before_seq.is_some() && session.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "before_seq requires an agent"));
+    }
     let query = crate::convo::store::Query {
         q: text("q").unwrap_or_default(),
-        session: text("agent"),
+        session,
         kind: text("kind"),
         tool: text("tool"),
         status: text("status"),
         since: num("since"),
         until: num("until"),
         limit: q.get("limit").and_then(|v| v.parse::<usize>().ok()),
+        before_seq,
     };
     let rows = crate::rt::blocking(move || store.search(query)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
@@ -6413,6 +6525,10 @@ async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
 /// The API's answer to a command: what became of it, as an HTTP status.
 fn answer_command(sent: crate::harness::registry::Sent, message: Option<String>) -> R {
     match sent {
+        crate::harness::registry::Sent::Published(publication) => Ok(srv::json(StatusCode::ACCEPTED, &json!({"retained": true, "publication": publication, "message": message}))),
+        crate::harness::registry::Sent::PublicationRefused(error) => {
+            Ok(srv::json(error.status_code(), &json!({"retained": false, "error": error, "message": message})))
+        }
         crate::harness::registry::Sent::Ok | crate::harness::registry::Sent::Taken => Ok(srv::status(StatusCode::NO_CONTENT)),
         // Waits for its runner, which is away: it goes once the runner is back.
         crate::harness::registry::Sent::Parked => Ok(srv::json(StatusCode::ACCEPTED, &json!({"parked": true}))),
@@ -6430,8 +6546,7 @@ fn answer_command(sent: crate::harness::registry::Sent, message: Option<String>)
     }
 }
 
-/// A file for a message (larger than fits inline): kept briefly, sent with the message that
-/// names its `file_id`. `?name=&mime=`; the body is the file.
+/// A file for a message: immutable bytes and metadata commit before returning its upload id.
 async fn harness_upload(hub: &Hub, q: &HashMap<String, String>, req: Request) -> R {
     let limit = usize::try_from(crate::harness::host::ATTACHMENT_MAX).unwrap_or(usize::MAX);
     let data = srv::body_bytes(req.into_body(), limit).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
@@ -6441,7 +6556,7 @@ async fn harness_upload(hub: &Hub, q: &HashMap<String, String>, req: Request) ->
     let name = q.get("name").cloned().unwrap_or_else(|| "file".to_owned());
     let mime = q.get("mime").cloned().unwrap_or_else(|| "application/octet-stream".to_owned());
     let size = data.len();
-    let id = hub.harness.upload(name, mime, data).map_err(|e| err(StatusCode::INSUFFICIENT_STORAGE, format!("{e:#}")))?;
+    let id = hub.harness.upload(hub, name, mime, data).await.map_err(|e| err(e.status_code(), serde_json::to_string(&e).unwrap_or_else(|_| "attachment custody was not accepted".into())))?;
     Ok(srv::json(StatusCode::OK, &json!({"file_id": id, "size": size})))
 }
 
@@ -6802,6 +6917,8 @@ struct Takes {
     /// `window=1`: its first load the newest events alone, as many as a window holds; `lean=1`:
     /// settled tool calls without their bodies (docs/wire.md, "Windows").
     view: crate::harness::registry::View,
+    /// `recent_turns`: cursor history negotiated in addition to legacy window/body hydration.
+    history: Option<crate::harness::history::Limits>,
     /// `timing=1`: each live frame followed by the server's times with it ([`timing_frame`]), as an API read that asks
     /// is told its own (`Kiln-Timing`): goal 10, plan 01a1a87b2dae step 5, the lab's frames split frame by frame.
     timing: bool,
@@ -6819,6 +6936,10 @@ impl Takes {
             patches: crate::harness::registry::Patches { state: has("patch=state"), changes: has("patch=changes") },
             after,
             view: crate::harness::registry::View { window: has("window=1"), lean: has("lean=1") },
+            history: query.and_then(|q| {
+                let value = |key: &str| q.split('&').find_map(|x| x.strip_prefix(key)).and_then(|v| v.parse::<usize>().ok());
+                value("recent_turns=").map(|turns| crate::harness::history::Limits::new(turns, value("event_bytes=").unwrap_or(256 * 1024)))
+            }),
             timing: has("timing=1"),
         }
     }
@@ -7139,6 +7260,8 @@ fn refusal_frame(sent: crate::harness::registry::Sent) -> Option<String> {
     use crate::harness::registry::Sent;
     match sent {
         Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => None,
+        Sent::Published(publication) => Some(session_error(format!("communication {} is retained, awaiting receiver capacity", publication.id))),
+        Sent::PublicationRefused(error) => Some(session_error(format!("communication not accepted: {error}"))),
         Sent::Refused(r) => Some(SessionDown::from(SessionFrame::Error { error: r.to_string(), refused: Some(r) }).text()),
         s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => s.failure().map(|(_, why)| session_error(why)),
         Sent::NoSession => Some(session_error("this session is gone".into())),
@@ -7426,7 +7549,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     hyper_rt::futures::label(&VIEWER_ATTACH);
     crate::harness::kept::warm(&hub, &id).await;
     hyper_rt::futures::label(&VIEWER_ATTACH);
-    let Some(att) = hub.harness.attach_from(&id, takes.after, takes.patches, takes.view) else {
+    let Some(att) = hub.harness.attach_window(&id, takes.after, takes.patches, takes.view, takes.history) else {
         tx.send(ws::text(SessionDown::from(SessionFrame::Closed).text())).await?;
         return Ok(());
     };
@@ -7639,7 +7762,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             hyper_rt::futures::label(&VIEWER_CATCH_UP);
             crate::harness::kept::warm(&hub, &id).await;
             hyper_rt::futures::label(&VIEWER_CATCH_UP);
-            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, &viewer, have, takes.view) else {
+            let Some((snapshot, from, now, rev)) = hub.harness.frames_since_window(&id, &viewer, have, takes.view, takes.history) else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
@@ -8313,6 +8436,78 @@ mod tests {
         assert_eq!(Takes::of(Some("z=gzip&window=1&lean=1")).view, View { window: true, lean: true });
         assert_eq!(Takes::of(Some("window=1")).view, View { window: true, lean: false });
         assert_eq!(Takes::of(Some("patch=state&window=2&leanest=1")).view, View::default());
+        assert_eq!(Takes::of(None).history, None);
+        assert_eq!(Takes::of(Some("window=1&lean=1&recent_turns=8&event_bytes=262144")).history, Some(crate::harness::history::Limits::new(8, 262144)));
+    }
+
+    #[test]
+    fn w21_r02_cursor_http_pages_are_bounded_private_and_reject_another_generation() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "cursor".into(), kind: "claude".into(), ..Default::default() };
+            hub.harness.ingest(&there, "cursor", Update::Open { info: Box::new(info), since: None }).await;
+            let events = (1..=230).map(|n| Event { id: format!("e{n}"), seq: n, at: i64::try_from(n).unwrap_or_default(), parent: None, by: None, body: Body::Assistant { text: "whole text".into(), streaming: false } }).collect();
+            hub.harness.ingest(&there, "cursor", Update::Events { events }).await;
+            hub.harness.ingest(&there, "cursor", Update::State { state: Box::new(State::default()) }).await;
+            let held = hub.harness.view_held("cursor").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let cursor = crate::harness::history::cursor(crate::harness::registry::born(), held.reset_at, "cursor");
+            let mut q = HashMap::from([("cursor".into(), cursor.clone()), ("before".into(), "221".into()), ("limit".into(), "100".into()), ("bytes".into(), "16384".into())]);
+            let resp = conversation_events_for(&hub, &crate::authz::Caller::owner(), "cursor", &q).await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?;
+            assert_eq!(resp.headers().get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()), Some("private, no-store"));
+            let v: serde_json::Value = serde_json::from_slice(&body_of(resp).await?)?;
+            let page = v.get("events").and_then(serde_json::Value::as_array).ok_or_else(|| anyhow::anyhow!("no events"))?;
+            assert_eq!(page.len(), 100);
+            assert_eq!(page.first().and_then(|e| e.get("seq")).and_then(serde_json::Value::as_u64), Some(121));
+            assert_eq!(v.pointer("/history/cursor").and_then(serde_json::Value::as_str), Some(cursor.as_str()));
+            assert_eq!(v.pointer("/history/has_more").and_then(serde_json::Value::as_bool), Some(true));
+            q.insert("cursor".into(), "another-process".into());
+            assert!(matches!(conversation_events_for(&hub, &crate::authz::Caller::owner(), "cursor", &q).await, Err(ApiError(StatusCode::CONFLICT, _))));
+            Ok(())
+        })
+    }
+
+    /// Plan 01a1cc09, step 1: an older page the session's copy holds comes from the copy, nothing of it read from
+    /// the conversation store (whose reads wait behind its writes), and it's the page the store's events made; a
+    /// conversation that changed is still refused.
+    #[test]
+    fn an_older_page_the_copy_holds_reads_nothing_from_the_store() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "kept".into(), kind: "claude".into(), ..Default::default() };
+            hub.harness.ingest(&there, "kept", Update::Open { info: Box::new(info), since: None }).await;
+            let events = (1..=230).map(|n| Event { id: format!("e{n}"), seq: n, at: i64::try_from(n).unwrap_or_default(), parent: None, by: None, body: Body::Assistant { text: format!("whole text {n}"), streaming: false } }).collect();
+            hub.harness.ingest(&there, "kept", Update::Events { events }).await;
+            hub.harness.ingest(&there, "kept", Update::State { state: Box::new(State::default()) }).await;
+            let held = hub.harness.view_held("kept").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let cursor = crate::harness::history::cursor(crate::harness::registry::born(), held.reset_at, "kept");
+            let mut q = HashMap::from([("cursor".into(), cursor.clone()), ("before".into(), "221".into()), ("limit".into(), "100".into()), ("bytes".into(), "16384".into())]);
+            let reads = || store.report().waits.iter().sum::<u64>();
+            let before = reads();
+            let resp = conversation_events_for(&hub, &crate::authz::Caller::owner(), "kept", &q).await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?;
+            anyhow::ensure!(reads() == before, "the store was read for a page the copy holds");
+            let got: serde_json::Value = serde_json::from_slice(&body_of(resp).await?)?;
+            // The page as the store's events made it before (d7c8bc4ee96b).
+            let rows = {
+                let store = store.clone();
+                crate::rt::blocking(move || store.events("kept", Some(221), 101)).await??
+            };
+            let durable = rows.iter().map(|r| serde_json::from_str::<serde_json::Value>(&r.body)).collect::<Result<Vec<_>, _>>()?;
+            anyhow::ensure!(durable.len() == 101, "the store has the page: {}", durable.len());
+            let (events, revision, held_more, floor) = hub.harness.history_overlay("kept", &cursor, 221, 100, durable).await?.ok_or_else(|| anyhow::anyhow!("no overlay"))?;
+            let more = (rows.len() > 100 || held_more) && events.iter().filter_map(crate::harness::history::seq).min().is_some_and(|n| n > floor);
+            let (page, window) = crate::harness::history::page(events, 221, 100, 16384, cursor.clone(), more);
+            anyhow::ensure!(got == serde_json::json!({"events": page, "history": window, "revision": revision}), "the copy's page differs from the store's: {got}");
+            q.insert("cursor".into(), "another-process".into());
+            anyhow::ensure!(matches!(conversation_events_for(&hub, &crate::authz::Caller::owner(), "kept", &q).await, Err(ApiError(StatusCode::CONFLICT, _))));
+            Ok(())
+        })
     }
 
     /// W21-R15: a page from the conversation store is cut as the copy's are (whole turns, a page's
@@ -8455,6 +8650,30 @@ mod tests {
     async fn body_of(r: Response) -> anyhow::Result<Vec<u8>> {
         use http_body_util::BodyExt as _;
         Ok(r.into_body().collect().await?.to_bytes().to_vec())
+    }
+
+    /// W27-R08: readiness names only this session's durably received native lines; another
+    /// session's record and an initial empty store cannot make it ready to resume.
+    #[test]
+    fn w27_r08_transcript_positions_follow_the_servers_durable_copy() -> anyhow::Result<()> {
+        use crate::convo::rows::{RecordRow, Row};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let read = || async {
+                let response = transcripts(&hub, "session", true).await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?;
+                anyhow::Ok(serde_json::from_slice::<serde_json::Value>(&body_of(response).await?)?)
+            };
+            assert_eq!(read().await?, json!({ "pieces": [], "records": [] }));
+            let archived = transcripts(&hub, "session", false).await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?;
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body_of(archived).await?)?, json!({ "pieces": [] }));
+            let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            let rows = [("other", "native", 0, 90), ("session", "native", 0, 10), ("session", "native", 1, 20)].into_iter().map(|(session, source, n, end)| Row::Record(Box::new(RecordRow {
+                session: session.into(), source: source.into(), n, end, line: "{}".into(), kept: None,
+            }))).collect();
+            anyhow::ensure!(crate::rt::blocking(move || store.put_wait(rows)).await?, "the record wasn't kept");
+            assert_eq!(read().await?, json!({ "pieces": [], "records": [{ "source": "native", "lines": 2, "end": 20 }] }));
+            Ok(())
+        })
     }
 
     /// `fut`, and the segments its polls read back from spill files on the thread that polled them (a request's shard),
@@ -9213,12 +9432,15 @@ mod tests {
             let n = u64::try_from(2 * chunk + open)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
             hub.harness.ingest(&there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
-            // Till its chunks are compact, the page is read from the events themselves.
+            // Goal 10 step 5: both sealed chunks must be compact before the first read. Unkept
+            // alone can mean just one finished; publishing the other after the read changes the
+            // page being measured and legitimately asks the blocking pool to make its texts.
             let deadline = Instant::now() + Duration::from_secs(30);
-            while hub.harness.events_page_kept("a", None, EVENTS_PAGE) != Err(Unread::Unkept) {
+            while !hub.harness.view_held("a").is_some_and(|v| v.events.chunks().iter().filter(|c| c.is_compact()).count() == 2) {
                 anyhow::ensure!(Instant::now() < deadline, "the copy's sealed chunks weren't kept compact");
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
+            anyhow::ensure!(hub.harness.events_page_kept("a", None, EVENTS_PAGE) == Err(Unread::Unkept), "the first read must make the compact chunks' texts");
             let api = Arc::new(Api { hub: Arc::clone(&hub) });
             let read = || {
                 let api = Arc::clone(&api);

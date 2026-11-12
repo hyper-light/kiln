@@ -1557,7 +1557,11 @@ mod tests{
             loop{
                 let heard=std::fs::read_to_string(&heard).unwrap_or_default();
                 let all_in=["from another agent","from the composer","from Mission Control","from the CLI","from MCP"].iter().all(|text|heard.contains(text));
-                if all_in && hub.harness.info(&target).is_some_and(|i|i.status==Status::Idle && i.queued==0 && i.turn_started.is_none()){break;}
+                // W20-R01: Idle can be the previous turn's state after the fake read the next
+                // prompt but before it reported starting it. Wait for all six actual deliveries:
+                // the goal, the other agent's message and the person's four messages.
+                let completed=hub.harness.state(&target).is_some_and(|state|state.status==Status::Idle && state.queue.is_empty() && state.turn_started.is_none() && state.delivery.len()==6 && state.delivery.values().all(|delivery|matches!(delivery,super::super::model::Delivery::Completed)));
+                if all_in && completed{break;}
                 anyhow::ensure!(std::time::Instant::now()<deadline,"its messages' turns never ended");
                 crate::rt::sleep(std::time::Duration::from_millis(20)).await;
             }

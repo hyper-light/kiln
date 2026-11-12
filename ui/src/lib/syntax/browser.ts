@@ -8,40 +8,9 @@
  * On the server, and while the page hydrates, everything reads plain.
  */
 import * as React from "react";
-import { Highlighter, type Assets, type Tok } from "./engine";
+import { Highlighter, type Tok } from "./engine";
+import { assets } from "./assets";
 import { languageById, languageOfFence, languageOfFile, type Language } from "./languages";
-
-/**
- * The grammars' and queries' files as the bundler makes them: each grammar an asset of its own,
- * each query a chunk of its own. Read only once something is highlighted (never outside a page:
- * the tests import views that hold code, and Node has no import.meta.glob).
- */
-let files: { grammars: Record<string, string>; queries: Record<string, () => Promise<string>> } | null = null;
-const filesOf = () =>
-  (files ??= {
-    grammars: import.meta.glob<string>("./grammars/*.wasm.gz", { query: "?url&no-inline", import: "default", eager: true }),
-    queries: import.meta.glob<string>(["./grammars/queries/**/*.scm", "./queries/*.scm"], { query: "?raw", import: "default" }),
-  });
-
-const assets: Assets = {
-  runtime: async () => {
-    const [rt, wasm] = await Promise.all([import("web-tree-sitter"), import("web-tree-sitter/web-tree-sitter.wasm?url")]);
-    await rt.Parser.init({ locateFile: () => wasm.default });
-    return rt;
-  },
-  grammar: async (id) => {
-    const url = filesOf().grammars[`./grammars/${id}.wasm.gz`];
-    if (!url) throw new Error(`no grammar ${id}`);
-    const res = await fetch(url);
-    if (!res.ok || !res.body) throw new Error(`${url}: HTTP ${res.status}`);
-    if (!url.endsWith(".gz")) return new Uint8Array(await res.arrayBuffer());
-    return new Uint8Array(await new Response(res.body.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer());
-  },
-  query: (path) => {
-    const load = filesOf().queries[`./${path}`];
-    return load ? load() : Promise.reject(new Error(`no query ${path}`));
-  },
-};
 
 const highlighter = new Highlighter(assets);
 

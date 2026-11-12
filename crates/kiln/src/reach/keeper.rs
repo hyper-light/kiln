@@ -771,10 +771,12 @@ mod tests {
             accept: false,
             mirrors: base.to_path_buf(),
             adopt: None,
+            adopt_policy: crate::harness::moving::stream::StoragePolicy::Off,
             using: Arc::clone(using),
             objects: None,
             sense: false,
             on_battery: kiln_ci::pace::power::OnBattery::default(),
+            place: kiln_ci::place::runner::Settings::default(),
             version: super::super::wire::VERSION,
             root: Vec::new(),
         })?;
@@ -897,11 +899,17 @@ mod tests {
                 crate::rt::sleep(Duration::from_millis(20)).await;
             }
             anyhow::ensure!(base.join("mac/held-0123456789").exists() || crate::util::now_unix() >= used + keep::GRACE_S, "held at first");
-            while base.join("mac/held-0123456789").exists() {
-                anyhow::ensure!(Instant::now() < until, "its grace's end never woke it");
+            // Goal 9: deletion precedes the keeper's asynchronous report and durable save.
+            // Wait for the recorded decision too; a missing row's default says Schedule.
+            let gone = loop {
+                if !base.join("mac/held-0123456789").exists()
+                    && let Some(gone) = saved(&base)?.gone.first().cloned()
+                {
+                    break gone;
+                }
+                anyhow::ensure!(Instant::now() < until, "its grace's end never woke it or recorded its decision");
                 crate::rt::sleep(Duration::from_millis(50)).await;
-            }
-            let gone = saved(&base)?.gone.first().cloned().unwrap_or_default();
+            };
             anyhow::ensure!(gone.trigger == keep::Trigger::Room && using.looks() == 2, "{:?} after {} looks", gone.trigger, using.looks());
             Ok(())
         })

@@ -4,8 +4,8 @@
  * options, Other, Decline and Submit. The question whole comes from the asking session's own state
  * (the row has only its title); answered (answered.ts), the row moves on at once.
  */
-import * as React from "react";
 import { sessionStore, useSession, useSessionReady, type AgentInfo, type ApprovalBrief } from "@/api/harness";
+import { Loadable } from "@/components/ui/loading";
 import { Skeleton } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
@@ -13,10 +13,12 @@ import { answer } from "./answered";
 import { Questions } from "./approval";
 
 export function AnswerHere({ who, ap }: { who: AgentInfo; ap: ApprovalBrief }) {
+  // W21-R02: the waiting row remains subscribed while its first-snapshot reader suspends.
+  useSession(sessionStore(who.id), (s) => s.ready);
   return (
-    <React.Suspense fallback={<Skeleton className="ms-answer-wait" />}>
+    <Loadable key={who.id} fallback={<Skeleton className="ms-answer-wait" />}>
       <Asked who={who} ap={ap} />
-    </React.Suspense>
+    </Loadable>
   );
 }
 

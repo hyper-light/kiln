@@ -267,7 +267,8 @@ fn lb03_a_runner_says_what_it_holds_of_a_run() {
     let mut a = Admission::new(Init { me: "linux".into(), epoch: 2, sample: Sample { size, ..Sample::default() }, ..Init::default() }, 0);
     let mac = Peer { name: "mac", epoch: 1 };
     let mut out = Vec::new();
-    a.probe(mac, Ask { run: "r1".into(), ..Ask::default() }, None, 0, &mut out);
+    let ask = Ask { run: "r1".into(), ..Ask::default() };
+    a.probe(mac, ask.clone(), None, 0, &mut out);
     assert!(matches!(a.holding(mac, "r1"), Some(Held::Waiting { ask }) if ask.run == "r1"), "{out:?}");
     assert_eq!(a.holding(mac, "r2"), None);
     assert_eq!(a.runs_of("mac").len(), 1);
@@ -280,7 +281,20 @@ fn lb03_a_runner_says_what_it_holds_of_a_run() {
     assert_eq!(a.start(mac, "r1", fence, 1, &mut out), Some(Start::New));
     assert!(matches!(a.holding(mac, "r1"), Some(Held::Running { fence: f, .. }) if f == fence));
     a.ended(mac, "r1", true, 2, &mut out);
-    assert!(matches!(a.holding(mac, "r1"), Some(Held::Ended { ok: true, .. })));
+    // Ended, its probe gone: still held with its ask (and so its asker), for its adopter to tell.
+    assert!(matches!(a.holding(mac, "r1"), Some(Held::Ended { ok: true, ask: Some(ask), .. }) if ask.run == "r1"), "{:?}", a.holding(mac, "r1"));
+    // W05-R25: the durable request survives restart until its completion is acknowledged.
+    let changes = a.record_changes();
+    let kept = changes.iter().find(|(owner, epoch, run, _, _)| owner == "mac" && *epoch == 1 && run == "r1").and_then(|(_, _, _, _, ask)| ask.clone());
+    assert_eq!(kept.as_deref(), Some(&ask));
+    let mut restored = Admission::new(Init { me: "linux".into(), epoch: 3, records: a.records().clone(), ..Init::default() }, 3);
+    if let Some(kept) = kept {
+        restored.restore_record_asks([(("mac".into(), 1, "r1".into()), (*kept).clone())]);
+    }
+    assert!(matches!(restored.holding(mac, "r1"), Some(Held::Ended { ok: true, ask: Some(kept), .. }) if kept == ask));
+    restored.ack(mac, "r1");
+    assert_eq!(restored.holding(mac, "r1"), None);
+    assert!(restored.record_changes().iter().all(|(_, _, _, record, ask)| record.is_none() && ask.is_none()));
     assert_eq!(a.runs_of("mac").len(), 1, "its record");
     a.ack(mac, "r1");
     assert_eq!(a.holding(mac, "r1"), None, "heard: nothing of it here (why a claim reads nothing as may-have-run)");

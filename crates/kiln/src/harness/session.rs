@@ -13,7 +13,7 @@ use tracing::Instrument as _;
 
 use super::core::{Core, Update};
 use super::kinds::{Kind, Protocol};
-use super::model::{Command, ExitInfo, Level, State, Status, Task, ToolKind};
+use super::model::{Body, Command, ExitInfo, Level, State, Status, Task, ToolKind};
 
 fn is_zero_epoch(n: &u64) -> bool {
     *n == 0
@@ -281,6 +281,10 @@ pub struct Held {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "AgentInfo"))]
 pub struct Info {
+    /// Omitted detail fields in the owner's bounded control projection.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<std::collections::BTreeMap<String, crate::harness::state_view::Descriptor>>", optional))]
+    pub deferred: std::collections::BTreeMap<String, super::state_view::Descriptor>,
     pub id: String,
     pub kind: String,
     pub kind_name: String,
@@ -312,11 +316,22 @@ pub struct Info {
     pub approvals: Vec<ApprovalBrief>,
     #[serde(default)]
     pub queued: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub admission: Option<super::admission::Capacity>,
     /// What waits in its queue, each message by its id and a digest of its words (as
     /// `State::queue`): the server's, for the messages kiln keeps there itself
     /// (`super::queued`). Lists don't show it.
     #[serde(skip)]
     pub queue: Vec<super::queued::Queued>,
+    /// The bounded index does not cover the whole queue: absence is not proof of removal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queue_partial: bool,
+    /// The owner's queue revision, for targeted reads when the bounded index is incomplete.
+    #[serde(skip)]
+    pub queue_revision: Option<String>,
+    #[serde(skip)]
+    pub queue_next: Option<usize>,
     /// kiln's own messages its harness was handed lately (a goal stack's words, a parent's news),
     /// each by its id and a digest of the words it had then, as its timeline shows them: the
     /// server's (`super::queued::Kept::look`). Lists don't show it.
@@ -488,6 +503,8 @@ impl Info {
 
     /// Refresh the live fields from the session's state.
     pub fn apply(&mut self, s: &State) {
+        self.admission.clone_from(&s.admission);
+        self.deferred = s.view.as_ref().map(|v| v.deferred.clone()).unwrap_or_default();
         if !s.name.is_empty() {
             self.name.clone_from(&s.name);
         }
@@ -506,8 +523,44 @@ impl Info {
             .iter()
             .map(|a| ApprovalBrief { id: a.id.clone(), tool: a.tool, tool_name: a.tool_name.clone(), title: a.title.clone(), at: a.at, agent: a.agent.clone() })
             .collect();
-        self.queued = s.queue.len();
-        self.queue = s.queue.iter().map(|q| super::queued::Queued::of(&q.id, &q.text)).collect();
+        self.queued = s.view.as_ref().map_or(s.queue.len(), |v| v.counts.queue);
+        let deferred = s.view.as_ref().filter(|v| v.deferred.contains_key("queue"));
+        let made = if deferred.is_none() { super::state_view::queue_index(&s.queue, 0, super::state_view::FRAME).ok() } else { None };
+        let index = match deferred {
+            Some(view) => view.queue_index.as_ref(),
+            None => made.as_ref(),
+        };
+        self.queue = Vec::new();
+        self.queue_partial = true;
+        self.queue_next = None;
+        if let Some(index) = index {
+            self.queue_partial = !(index.complete && index.entries.len() == self.queued && index.next.is_none());
+            self.queue_next = index.next;
+            if self.queue.try_reserve(index.entries.len()).is_err() {
+                self.queue_partial = true;
+                self.queue_next = Some(0);
+            } else {
+                for entry in &index.entries {
+                    match u64::from_str_radix(&entry.digest, 16) {
+                        Ok(digest) => {
+                            let mut id = String::new();
+                            if id.try_reserve(entry.id.len()).is_err() {
+                                self.queue_partial = true;
+                                self.queue_next = Some(0);
+                                break;
+                            }
+                            id.push_str(&entry.id);
+                            self.queue.push(super::queued::Queued { id, digest, len: entry.len });
+                        }
+                        Err(_) => self.queue_partial = true,
+                    }
+                }
+            }
+        }
+        self.queue_revision = s.view.as_ref().and_then(|v| v.revisions.get("queue")).cloned();
+        if self.queue_partial && self.queue_revision.is_none() && s.view.is_none() {
+            self.queue_revision = super::state_view::field_revision(s, "queue").ok();
+        }
         // Attention plan 01a199e1b177752e84dad5dc990e6a15: pending/paused tasks
         // still hold work; Finished must never hide them.
         self.tasks_running = s.tasks.iter().filter(|t| t.live()).count();
@@ -522,6 +575,12 @@ impl Info {
         let total = u32::try_from(s.todos.len()).unwrap_or(u32::MAX);
         self.todos_total = total;
         self.todos_done = u32::try_from(s.todos.iter().filter(|t| t.status == "completed").count()).unwrap_or(total);
+        if let Some(view) = &s.view {
+            self.queued = view.counts.queue;
+            self.tasks_running = view.counts.tasks_running;
+            self.todos_total = u32::try_from(view.counts.todos).unwrap_or(u32::MAX);
+            self.todos_done = u32::try_from(view.counts.todos_done).unwrap_or(u32::MAX);
+        }
         self.files_changed = s.files_changed;
         self.lines_added = s.lines_added;
         self.lines_removed = s.lines_removed;
@@ -556,8 +615,12 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace } = self;
-        !(*id == o.id
+        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace } = self;
+        !(*deferred == o.deferred
+            && *admission == o.admission
+            && *queue_partial == o.queue_partial
+            && (!*queue_partial || *queue_revision == o.queue_revision)
+            && *id == o.id
             && *kind == o.kind
             && *kind_name == o.kind_name
             && *target == o.target
@@ -768,6 +831,7 @@ pub type SettleFor = Arc<dyn Fn(String, String, bool) -> futures::future::BoxFut
 
 #[derive(Clone)]
 pub struct Files {
+    pub host: Option<std::sync::Weak<super::host::Host>>,
     pub dir: std::path::PathBuf,
     pub take: Arc<dyn Fn(&str) -> Option<std::path::PathBuf> + Send + Sync>,
     pub spawn: Arc<dyn Fn(Spec) + Send + Sync>,
@@ -814,45 +878,85 @@ pub struct Seed {
     pub local: bool,
 }
 
-/// Put a message's attachments on disk, so the harness can read them: each gets a `path`;
-/// images keep (or get) their bytes inline for harnesses that take them that way. Blocking.
-fn store_attachments(files: &Files, msg: &str, list: Vec<super::model::Attachment>) -> Vec<super::model::Attachment> {
+/// A preparation failure never converts a communication into a text-only prompt.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PreparationCode { AttachmentUnavailable, WorkerUnavailable }
+
+pub(super) struct PreparationFailure { pub message: Option<String>, pub code: PreparationCode }
+
+fn attachment_digest(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use sha2::Digest as _;
+    struct DigestWriter(sha2::Sha256);
+    impl std::io::Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.update(bytes); Ok(bytes.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.len() > super::host::ATTACHMENT_MAX { return Err(std::io::Error::other("attachment is not a bounded regular file")); }
+    let mut digest = DigestWriter(sha2::Sha256::new());
+    std::io::copy(&mut std::fs::File::open(path)?, &mut digest)?;
+    Ok(digest.0.finalize().to_vec())
+}
+
+/// Completed source and destination files are immutable. Only a newly created destination is
+/// removed on failure; an earlier completed materialization is verified and never overwritten.
+fn immutable_attachment(path: &std::path::Path, source: Option<&std::path::Path>, bytes: &[u8]) -> std::io::Result<()> {
+    use sha2::Digest as _;
+    use std::io::Write as _;
+    let expected = match source { Some(source) => attachment_digest(source)?, None => sha2::Sha256::digest(bytes).to_vec() };
+    let opened = std::fs::OpenOptions::new().write(true).create_new(true).open(path);
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if attachment_digest(path)? == expected { return Ok(()); }
+            return Err(std::io::Error::other("completed attachment materialization differs"));
+        }
+        Err(error) => return Err(error),
+    };
+    let written = (|| {
+        match source {
+            Some(source) => { std::io::copy(&mut std::fs::File::open(source)?, &mut file)?; }
+            None => file.write_all(bytes)?,
+        }
+        file.sync_all()?;
+        if attachment_digest(path)? != expected { return Err(std::io::Error::other("attachment materialization changed its bytes")); }
+        Ok(())
+    })();
+    if written.is_err() { drop(file); let _ = std::fs::remove_file(path); }
+    written
+}
+
+/// All attachments or an explicit failure. Original upload ids/inline bytes remain in metadata
+/// so a later replay verifies the same immutable input rather than trusting a supplied path.
+fn store_attachments(files: &Files, msg: &str, list: Vec<super::model::Attachment>) -> std::io::Result<Vec<super::model::Attachment>> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
-    let mut out = Vec::new();
-    if std::fs::create_dir_all(&files.dir).is_err() {
-        return out;
-    }
-    let tag: String = msg.chars().filter(char::is_ascii_alphanumeric).take(12).collect();
+    std::fs::create_dir_all(&files.dir)?;
+    let mut out = Vec::with_capacity(list.len());
     for (i, mut a) in list.into_iter().enumerate() {
+        let index = i.to_string();
+        let tag = crate::util::derive_id(&["harness-materialized-v1", msg, &index, &a.name, a.file_id.as_deref().unwrap_or(&a.data_base64)]);
         let name: String = a.name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).take(80).collect();
         let name = if name.trim_matches('.').is_empty() { format!("file-{i}") } else { name };
-        let path = files.dir.join(format!("{tag}-{i}-{name}"));
-        let wrote = match a.file_id.as_deref().and_then(|f| (files.take)(f)) {
-            Some(src) => std::fs::rename(&src, &path).or_else(|_| std::fs::copy(&src, &path).map(|_| ())).is_ok(),
-            None => match b64.decode(a.data_base64.as_bytes()) {
-                Ok(bytes) if !bytes.is_empty() && bytes.len() as u64 <= super::host::ATTACHMENT_MAX => std::fs::write(&path, &bytes).is_ok(),
-                _ => false,
-            },
+        let path = files.dir.join(format!("{tag}-{name}"));
+        let source = match a.file_id.as_deref() {
+            Some(file) => Some((files.take)(file).ok_or_else(|| std::io::Error::other("completed attachment input is unavailable"))?),
+            None => None,
         };
-        if !wrote {
-            tracing::warn!(attachment = %a.name, "could not store an attachment; it is left out");
-            continue;
-        }
-        if a.is_image() {
-            if a.data_base64.is_empty()
-                && let Ok(bytes) = std::fs::read(&path)
-            {
-                a.data_base64 = b64.encode(bytes);
+        let bytes = match &source {
+            Some(_) => Vec::new(),
+            None => {
+                let bytes = b64.decode(a.data_base64.as_bytes()).map_err(|_| std::io::Error::other("attachment bytes are invalid"))?;
+                if bytes.is_empty() || u64::try_from(bytes.len()).map_or(true, |length| length > super::host::ATTACHMENT_MAX) { return Err(std::io::Error::other("attachment bytes are absent or exceed their bound")); }
+                bytes
             }
-        } else {
-            a.data_base64.clear();
-        }
-        a.file_id = None;
+        };
+        immutable_attachment(&path, source.as_deref(), &bytes)?;
+        if a.is_image() && a.data_base64.is_empty() { a.data_base64 = b64.encode(std::fs::read(&path)?); }
         a.path = Some(path.to_string_lossy().into_owned());
         out.push(a);
     }
-    out
+    Ok(out)
 }
 
 /// The longest name a session takes.
@@ -901,28 +1005,58 @@ fn reach_words(reach: Option<&str>) -> String {
 }
 
 /// A command as the adapter should see it (attachments stored first).
-async fn prepare(files: &Files, c: Command) -> Command {
+pub(super) async fn prepare(files: &Files, c: Command) -> Result<Command, PreparationFailure> {
     match c {
         Command::Send { id, text, mode, attachments, overrides, reply_to, task } if !attachments.is_empty() => {
             let files = files.clone();
             let msg = id.clone();
-            let stored = crate::rt::blocking(move || store_attachments(&files, &msg, attachments)).await.unwrap_or_default();
-            Command::Send { id, text, mode, attachments: stored, overrides, reply_to, task }
+            let stored = crate::rt::blocking(move || store_attachments(&files, &msg, attachments)).await
+                .map_err(|_| PreparationFailure { message: Some(id.clone()), code: PreparationCode::WorkerUnavailable })?
+                .map_err(|_| PreparationFailure { message: Some(id.clone()), code: PreparationCode::AttachmentUnavailable })?;
+            Ok(Command::Send { id, text, mode, attachments: stored, overrides, reply_to, task })
         }
-        other => other,
+        other => Ok(other),
     }
+}
+
+async fn preparation_failed(s: &Session, failure: PreparationFailure) {
+    let input = s.core.lock().input.clone();
+    if let Some(input) = input && let Some(message) = &failure.message {
+        let epoch = input.controller.lock().lease(message).map(|lease| lease.epoch);
+        if let Some(epoch) = epoch {
+            // Still replayable; no provider-flight intent was persisted and no partial
+            // prompt was emitted. Connection/owner recovery may retry the original.
+            let _ = input.inbox.stage_pending(&s.id, message, epoch, super::admission::Stage::Carried).await;
+            let mut controller = input.controller.lock();
+            let _ = controller.stage(message, super::admission::Stage::Carried);
+            let _ = controller.unavailable();
+            let token = controller.lease(message).and_then(|lease| lease.token);
+            let capacity = controller.capacity();
+            drop(controller);
+            let mut core = s.core.lock();
+            core.state.admission = Some(capacity.clone());
+            if let Some(token) = token { core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Waiting { token, epoch, cause: super::admission::WaitCause::SourceUnavailable, capacity }) }); }
+        }
+    }
+    let mut core = s.core.lock();
+    core.upsert("attachment-preparation-unavailable", None, super::model::Body::Notice { level: Level::Error, text: format!("Communication retained: attachment preparation is unavailable ({:?}). No partial prompt was sent.", failure.code) });
+    core.touch_state();
+    drop(core);
+    s.input_changed();
 }
 
 enum Ctl {
     Cmd(Box<Command>),
     /// Owned Reach state changed; publish through this driver, never a stale parallel snapshot.
     OwnedChanged,
+    /// A persisted legacy promotion changed; its body work stays on this owner.
+    Promotion,
     /// Automatic archive inspects after previously accepted commands reach this actor.
     ArchiveQuiet(futures::channel::oneshot::Sender<bool>),
     Close,
     /// This image of the process ends next (an in-place upgrade): the harness process, still
     /// running, goes to the next one.
-    HandOver(futures::channel::oneshot::Sender<Option<Box<Handed>>>),
+    HandOver(futures::channel::oneshot::Sender<Result<Option<Box<Handed>>, String>>),
     /// It went on on another machine: it stops here, and isn't closed.
     LetGo,
     /// There may be room on its machine for it to go to work: what waited for that goes, if it
@@ -994,6 +1128,19 @@ pub struct Session {
 }
 
 impl Session {
+    pub(crate) async fn promotion_changed(&self) -> Result<(), String> { self.ctl.send(Ctl::Promotion).await.map_err(|_| "the legacy session owner stopped before its persisted transition could progress".to_owned()) }
+    pub(super) fn input_changed(&self) { let _ = self.ctl.try_send(Ctl::OwnedChanged); }
+    /// Host receipts and ordinary State frames share the session owner's ordered output.
+    pub(super) fn mail_flow(&self, event: super::admission::FlowEvent) {
+        {
+            let mut core = self.core.lock();
+            let capacity = core.input.as_ref().map(|input| input.controller.lock().capacity()).unwrap_or_else(|| event.capacity().clone());
+            core.state.admission = Some(capacity);
+            core.out.push(Update::MailFlow { event: Box::new(event) });
+            core.touch_state();
+        }
+        self.input_changed();
+    }
     pub fn info(&self) -> Info {
         let mut i = self.info.lock().clone();
         let mut core = self.core.lock();
@@ -1018,6 +1165,10 @@ impl Session {
         *self.moving.lock() = true;
     }
 
+    /// The transfer owner calls this only before an offer or after authoritative abort. An
+    /// uncertain/committed transfer must retain its existing acceptance fence.
+    pub(super) fn resume_taking(&self) { *self.moving.lock() = false; }
+
     /// Hands `c` to the session. False when it can't take it: it has ended, or `c` is a message
     /// and the session is on its way to another machine.
     pub fn command(&self, c: Command) -> bool {
@@ -1033,6 +1184,7 @@ impl Session {
         let _ = self.ctl.try_send(Ctl::Close);
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) async fn publish_owned_change(&self)->Result<(),String>{
         self.ctl.send(Ctl::OwnedChanged).await.map_err(|_|"the owning session stopped publishing state".to_owned())
     }
@@ -1101,10 +1253,10 @@ impl Session {
     /// Hand its harness process to this process's next image (an in-place upgrade, next):
     /// `None` when none runs, or it couldn't be handed over (it was stopped then, and starts again
     /// in the next image, continuing its conversation).
-    pub async fn hand_over(&self) -> Option<Box<Handed>> {
+    pub async fn hand_over(&self) -> Result<Option<Box<Handed>>, String> {
         let (tx, rx) = futures::channel::oneshot::channel();
-        self.ctl.send(Ctl::HandOver(tx)).await.ok()?;
-        rx.await.ok().flatten()
+        self.ctl.send(Ctl::HandOver(tx)).await.map_err(|_| "the source owner cannot prepare its live provider handover".to_owned())?;
+        rx.await.map_err(|_| "the source provider handover did not complete".to_owned())?
     }
 
     /// It went on on another machine since: its harness here stops and this machine lets go of
@@ -1247,6 +1399,222 @@ fn read_unread_children(s: &Arc<Session>) {
     });
 }
 
+fn read_state(core: &mut Core, client: String, read: super::state_view::Read) {
+    let empty = serde_json::json!({"t":"reply", "client":client, "value":{"result":null}});
+    let envelope = serde_json::to_vec(&empty).map_or(super::state_view::FRAME, |v| v.len());
+    let stamp = format!(",\"taken_us\":{}", u64::MAX).len();
+    let room = crate::proto::harness_json_room(&core.session_id, super::state_view::FRAME);
+    let budget = room.saturating_sub(envelope).saturating_sub(stamp);
+    let value = match super::state_view::read(&core.state, &read, budget) {
+        Ok(result) => serde_json::json!({"result":result}),
+        Err(code) => serde_json::json!({"error":{"code":code}}),
+    };
+    core.reply(client, value);
+}
+
+fn at_state(core: &mut Core, client: String, revision: &str, command: Command, apply: impl FnOnce(&mut Core, Command)) -> bool {
+    use super::state_view::Error;
+    let id = match &command {
+        Command::QueueEdit { id, .. } | Command::QueueRemove { id } | Command::QueueMove { id, .. }
+        | Command::QueueSteer { id } | Command::QueueSendNow { id } => Some(id),
+        _ => None,
+    };
+    let check = super::state_view::field_revision(&core.state, "queue").and_then(|current| {
+        if current != revision { return Err(Error::Stale) }
+        if !id.is_some_and(|id| core.state.queue.iter().any(|q| &q.id == id)) { return Err(Error::InvalidPath) }
+        Ok(())
+    });
+    match check {
+        Ok(()) => {
+            apply(core, command);
+            let revision = super::state_view::field_revision(&core.state, "queue").ok();
+            core.reply(client, serde_json::json!({"result":{"type":"applied", "revision":revision}}));
+            true
+        }
+        Err(code) => { core.reply(client, serde_json::json!({"error":{"code":code}})); false },
+    }
+}
+
+/// The actor is the only queue writer while this awaits its journal CAS. AtState is validated
+/// before persistence and again by its normal application seam; admission/status changes do not
+/// alter that queue revision. No accepted original is changed by an edit.
+async fn journal_edit(s: &Session, files: &Files, command: Command, apply_edit: impl FnOnce(&mut Core, Command)) -> Option<Command> {
+    let (mut command, at) = match command {
+        Command::AtState { client, revision, command } => (*command, Some((client, revision))),
+        command => (command, None),
+    };
+    let result = async {
+        if matches!(command, Command::QueueEdit { .. } | Command::QueueRemove { .. } | Command::QueueMove { .. } | Command::QueueSteer { .. } | Command::QueueSendNow { .. }) && !s.core.lock().input_ready() { return Err(super::state_view::Error::Unreadable); }
+        let Command::QueueEdit { id, text, attachments } = &command else { return Ok(None) };
+        let (input, queued) = {
+            let core = s.core.lock();
+            if let Some((_, revision)) = &at
+                && super::state_view::field_revision(&core.state, "queue").map_err(|_| super::state_view::Error::Unreadable)? != *revision { return Err(super::state_view::Error::Stale); }
+            (core.input.clone(), core.state.queue.iter().chain(core.state.tasks.iter().flat_map(|task| &task.queue)).find(|queued| &queued.id == id).cloned())
+        };
+        let Some(input) = input else { return Ok(None) };
+        let Some(old_lease) = input.controller.lock().lease(id).cloned() else { return Ok(None) };
+        // A registered response may already be in this turn's native tool input. Rewriting its
+        // body would let proof of the old text consume a newer edit under the same immutable id.
+        if old_lease.handoff.is_some() { return Err(super::state_view::Error::Stale); }
+        let queued = queued.ok_or(super::state_view::Error::InvalidPath)?;
+        let pending = input.inbox.pending(&s.id, id).await.map_err(|_| super::state_view::Error::Unreadable)?.ok_or(super::state_view::Error::Unreadable)?;
+        let old_bytes = pending.body_bytes.ok_or(super::state_view::Error::Budget)?;
+        let mut current = pending.current_command().ok_or(super::state_view::Error::Unreadable)?.clone();
+        let Command::Send { text: words, attachments: current_attachments, .. } = &mut current else { return Err(super::state_view::Error::InvalidPath) };
+        *words = text.clone();
+        *current_attachments = attachments.clone().unwrap_or(queued.attachments);
+        let current = prepare(files, current).await.map_err(|_| super::state_view::Error::Unreadable)?;
+        let new_bytes = super::admission::command_bytes(&current).map_err(|_| super::state_view::Error::Budget)?;
+        let target = old_lease.bytes.checked_sub(old_bytes).and_then(|base| base.checked_add(new_bytes)).ok_or(super::state_view::Error::Budget)?;
+        let lease = {
+            let mut controller = input.controller.lock();
+            if target > old_lease.bytes && !controller.resize(id, target).map_err(|_| super::state_view::Error::Budget)? { return Err(super::state_view::Error::Budget); }
+            let mut lease = controller.lease(id).cloned().ok_or(super::state_view::Error::Unreadable)?;
+            // The journal records its planned current size, but shrink cannot release the old
+            // queue body's authority until the owner has actually replaced that body.
+            lease.bytes = target;
+            lease
+        };
+        let materialized = match &current { Command::Send { attachments, .. } => attachments.clone(), _ => return Err(super::state_view::Error::InvalidPath) };
+        if input.inbox.edit_pending(&s.id, id, lease, current).await.is_err() {
+            if target > old_lease.bytes { let _ = input.controller.lock().resize(id, old_lease.bytes); }
+            return Err(super::state_view::Error::Unreadable);
+        }
+        if let Command::QueueEdit { attachments, .. } = &mut command { *attachments = Some(materialized); }
+        Ok(Some((input, old_lease.message, old_lease.bytes, target)))
+    }.await;
+    match result {
+        Ok(None) => Some(match at { Some((client, revision)) => Command::AtState { client, revision, command: Box::new(command) }, None => command }),
+        Ok(Some((input, id, before, after))) => {
+            let mut core = s.core.lock();
+            let applied = match at {
+                Some((client, revision)) => at_state(&mut core, client, &revision, command, apply_edit),
+                None if core.state.queue.iter().chain(core.state.tasks.iter().flat_map(|task| &task.queue)).any(|item| item.id == id) => { apply_edit(&mut core, command); true }
+                None => false,
+            };
+            if applied {
+                let capacity = {
+                    let mut controller = input.controller.lock();
+                    match controller.applied_edit(&id, before, after) {
+                        Ok(true) => { controller.advertised_ready(input.now_ns()); Some(controller.capacity()) }
+                        Ok(false) => None,
+                        Err(_) => { let _ = controller.unavailable(); Some(controller.capacity()) }
+                    }
+                };
+                if let Some(capacity) = capacity { core.state.admission = Some(capacity.clone()); core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) }); core.touch_state(); }
+            }
+            None
+        }
+        Err(code) => {
+            let mut core = s.core.lock();
+            if let Some((client, _)) = at { core.reply(client, serde_json::json!({"error":{"code":code}})); }
+            else { core.upsert("queue-edit-retained", None, super::model::Body::Notice { level: Level::Error, text: format!("Queue edit was not applied ({code:?}); the previous communication remains retained.") }); }
+            core.touch_state();
+            drop(core);
+            s.input_changed();
+            None
+        }
+    }
+}
+
+async fn register_handoff(s: &Session, client: String, revision: String, handoff: String, turn: Option<i64>, ids: Vec<String>, response_digest: String) {
+    use super::state_view::Error;
+    let result = async {
+        if !crate::util::is_id(&handoff) || response_digest.len() != 64 || !response_digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) || turn.is_none() || ids.is_empty() { return Err(Error::InvalidPath); }
+        let input = {
+            let core = s.core.lock();
+            if core.state.turn_started != turn || super::state_view::field_revision(&core.state, "queue")? != revision { return Err(Error::Stale); }
+            let mut distinct = std::collections::BTreeSet::new();
+            for id in &ids {
+                if !distinct.insert(id) || !core.state.queue.iter().any(|queued| &queued.id == id && queued.attachments.is_empty()) { return Err(Error::InvalidPath); }
+            }
+            core.input.clone().ok_or(Error::Unreadable)?
+        };
+        let metadata = super::admission::Handoff { id: handoff, turn, digest: response_digest };
+        let (leases, newly_registered) = {
+            let mut controller = input.controller.lock();
+            let newly_registered: Vec<_> = ids.iter().filter(|id| controller.lease(id).is_some_and(|lease| lease.handoff.is_none())).cloned().collect();
+            if !controller.register_handoff(&ids, &metadata).map_err(|_| Error::InvalidPath)? { return Err(Error::Budget); }
+            let leases: Vec<_> = ids.iter().filter_map(|id| controller.lease(id).cloned()).collect();
+            (leases, newly_registered)
+        };
+        if input.inbox.register_handoff(&s.id, &leases).await.is_err() {
+            input.controller.lock().withdraw_handoff(&newly_registered, &metadata);
+            return Err(Error::Unreadable);
+        }
+        input.observe_physical();
+        let capacity = { let mut controller = input.controller.lock(); controller.advertised_ready(input.now_ns()); controller.capacity() };
+        { let mut core = s.core.lock(); core.state.admission = Some(capacity.clone()); core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) }); core.touch_state(); }
+        Ok(super::state_view::field_revision(&s.core.lock().state, "queue").ok())
+    }.await;
+    let value = match result {
+        Ok(revision) => serde_json::json!({"result":{"type":"registered","revision":revision}}),
+        Err(code) => serde_json::json!({"error":{"code":code}}),
+    };
+    s.core.lock().reply(client, value);
+}
+
+#[cfg(test)]
+mod state_command_tests {
+    use super::*;
+
+    fn queued() -> Core {
+        let mut core = Core::new();
+        core.session_id = "state-command".into();
+        core.state.queue.push(super::super::model::QueueItem {
+            id: "message".into(), text: "original".into(), at: 0,
+            attachments: Vec::new(), overrides: None, reply_to: None,
+        });
+        core
+    }
+
+    #[test]
+    fn a_paged_edit_is_checked_by_the_owner_before_the_real_adapter_changes_it() -> anyhow::Result<()> {
+        let mut core = queued();
+        let mut adapter = super::super::codex::Codex::new(None, None, None, false);
+        let revision = super::super::state_view::field_revision(&core.state, "queue")?;
+        core.state.queue.first_mut().ok_or_else(|| anyhow::anyhow!("no queue"))?.text = "changed elsewhere".into();
+        at_state(&mut core, "stale-edit".into(), &revision,
+            Command::QueueEdit { id: "message".into(), text: "stale replacement".into(), attachments: None },
+            |core, command| adapter.command(core, command));
+        assert_eq!(core.state.queue.first().map(|q| q.text.as_str()), Some("changed elsewhere"));
+        assert!(core.take_out().iter().any(|u| matches!(u, Update::Reply { client, value }
+            if client == "stale-edit" && value.pointer("/error/code").and_then(serde_json::Value::as_str) == Some("stale"))));
+
+        let revision = super::super::state_view::field_revision(&core.state, "queue")?;
+        core.state.status = Status::Running;
+        at_state(&mut core, "current-edit".into(), &revision,
+            Command::QueueEdit { id: "message".into(), text: "current replacement".into(), attachments: None },
+            |core, command| adapter.command(core, command));
+        assert_eq!(core.state.queue.first().map(|q| q.text.as_str()), Some("current replacement"));
+        let current = super::super::state_view::field_revision(&core.state, "queue")?;
+        assert!(core.take_out().iter().any(|u| matches!(u, Update::Reply { client, value }
+            if client == "current-edit" && value.pointer("/result/revision").and_then(serde_json::Value::as_str) == Some(current.as_str()))));
+        Ok(())
+    }
+
+    #[test]
+    fn a_detail_reply_fits_the_cap_with_its_stamp_and_wire_envelope() -> anyhow::Result<()> {
+        let mut core = queued();
+        core.state.queue.first_mut().ok_or_else(|| anyhow::anyhow!("no queue"))?.text = "é\\\"\n".repeat(super::super::state_view::FRAME);
+        let read = super::super::state_view::Read {
+            revision: super::super::state_view::field_revision(&core.state, "queue")?,
+            field: "queue".into(),
+            path: vec![super::super::state_view::Step::Id { id: "message".into() }, super::super::state_view::Step::Key { key: "text".into() }],
+            offset: 0,
+        };
+        read_state(&mut core, "viewer".into(), read);
+        let reply = core.take_out().into_iter().find(|u| matches!(u, Update::Reply { client, .. } if client == "viewer"))
+            .ok_or_else(|| anyhow::anyhow!("no page reply"))?;
+        let mut json = serde_json::to_string(&reply)?;
+        crate::wire::stamp::put(&mut json, Duration::MAX);
+        let bytes = crate::proto::encode(&crate::proto::AgentMsg::Harness { session: core.session_id, json })?;
+        assert!(bytes.len() <= super::super::state_view::FRAME);
+        Ok(())
+    }
+}
+
 /// The agent ended: what its harness ran ended with it, and so did what kiln took back over for it
 /// (stopped with the rest). Its last state, what an ended agent shows, says so.
 fn end_tasks(core: &mut Core) {
@@ -1291,16 +1659,30 @@ pub fn start(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn F
 /// Go on with a session this process's previous image handed over ([`Session::hand_over`]): its
 /// timeline and state as they were, and its harness process, still running.
 pub fn start_handed(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, h: Box<Handed>) -> anyhow::Result<Arc<Session>> {
+    start_handed_input(id, spec, sink, on_change, files, h, None)
+}
+
+pub(super) fn start_handed_input(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, h: Box<Handed>, input: Option<super::admission::Input>) -> anyhow::Result<Arc<Session>> {
     use base64::Engine as _;
     let kind = Kind::get(&h.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", h.kind))?;
     let h = *h;
-    let core = Core::thaw(h.core);
-    let adopt = Adopt { process: h.process, adapter: super::kinds::Adapter::thaw(h.adapter), partial: base64::engine::general_purpose::STANDARD.decode(h.partial).unwrap_or_default() };
+    let mut core = Core::thaw(h.core);
+    if let Some(input) = input {
+        let _ = input.controller.lock().initial_epoch(core.state.epoch);
+        core.input = Some(input);
+    }
+    let adapter = super::kinds::Adapter::thaw(h.adapter);
+    core.input_legacy_flights = adapter.retained_input_ids();
+    let adopt = Adopt { process: h.process, adapter, partial: base64::engine::general_purpose::STANDARD.decode(h.partial).unwrap_or_default() };
     begin(id, spec, kind, core, sink.into(), on_change, files, None, Some(adopt))
 }
 
 /// Start a session, seeded with what it had on another machine when it moved here.
 pub fn start_seeded(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>) -> anyhow::Result<Arc<Session>> {
+    start_seeded_input(id, spec, sink, on_change, files, seed, None)
+}
+
+pub(super) fn start_seeded_input(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>, input: Option<super::admission::Input>) -> anyhow::Result<Arc<Session>> {
     let kind = Kind::get(&spec.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", spec.kind))?;
     let cwd = resolve_cwd(spec.cwd.as_deref());
     let mut core = Core::new();
@@ -1351,6 +1733,10 @@ pub fn start_seeded(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Ar
         core.state.arriving = sd.synced;
     }
     core.state.reach.clone_from(&spec.reach);
+    if let Some(input) = input {
+        let _ = input.controller.lock().initial_epoch(core.state.epoch);
+        core.input = Some(input);
+    }
     named_ahead(&mut core.meta, kind, spec.model.as_deref());
     begin(id, spec, kind, core, sink.into(), on_change, files, items, None)
 }
@@ -1396,6 +1782,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
     core.room = Some(Arc::clone(&files.room));
     let cwd = core.state.cwd.clone();
     let info = Info {
+        deferred: Default::default(),
         id: id.clone(),
         kind: kind.id.to_owned(),
         kind_name: kind.name.to_owned(),
@@ -1412,7 +1799,11 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         harness_session: spec.resume.clone(),
         approvals: Vec::new(),
         queued: 0,
+        admission: core.state.admission.clone(),
         queue: Vec::new(),
+        queue_partial: false,
+        queue_revision: None,
+        queue_next: None,
         said: Vec::new(),
         tasks_running: 0,
         subagents: Vec::new(),
@@ -1564,11 +1955,40 @@ fn queued(c: Command) -> Option<super::model::QueueItem> {
 }
 
 /// The session goes on at `epoch` (epochs only rise): its state says so, sent with its next flush.
-fn raise_epoch(core: &mut Core, epoch: u64) {
-    if core.state.epoch < epoch {
-        core.state.epoch = epoch;
+async fn progress_promotion(s: &Session, files: &Files) {
+    let Some(host) = files.host.as_ref().and_then(std::sync::Weak::upgrade) else { return };
+    // Prepare retained originals, or finish partial row/epoch alignment, before
+    // flushing callbacks. Ownership stays fenced until their journal effects commit.
+    if let Err(error) = host.reconcile_legacy_owner(s).await {
+        let mut core = s.core.lock();
+        if matches!(error, super::inbox::PromotionError::Invalid { .. } | super::inbox::PromotionError::Stale) && let Some(input) = &core.input { let _ = input.controller.lock().unavailable(); }
+        core.upsert("legacy-promotion-held", None, Body::Notice { level: Level::Warn, text: format!("Legacy ownership remains held: {error}") });
+        core.touch_state();
+        return;
+    }
+    // A callback already parsed before the owner event commits under its original lease epoch.
+    let _ = flush_input(s).await;
+    {
+        let mut core = s.core.lock();
+        if !core.input_stages.is_empty() || !core.input_retained.is_empty() || !core.input_receipts.is_empty() {
+            core.upsert("legacy-promotion-held", None, Body::Notice { level: Level::Warn, text: "Legacy ownership remains held until its existing input effects commit. The original work is retained.".into() });
+            core.touch_state();
+            return;
+        }
+    }
+    if let Err(error) = host.progress_legacy_promotion(s).await {
+        let mut core = s.core.lock();
+        if matches!(error, super::inbox::PromotionError::Invalid { .. } | super::inbox::PromotionError::Stale) && let Some(input) = &core.input { let _ = input.controller.lock().unavailable(); }
+        core.upsert("legacy-promotion-held", None, Body::Notice { level: Level::Warn, text: format!("Legacy ownership remains held: {error}") });
         core.touch_state();
     }
+}
+
+async fn raise_epoch(s: &Session, files: &Files, epoch: u64) {
+    if s.epoch() >= epoch { return; }
+    let Some(input) = s.core.lock().input.clone() else { return };
+    if input.inbox.promotion(&s.id).await.ok().flatten().is_some_and(|p| p.to_epoch == epoch) { progress_promotion(s, files).await; }
+    else { let mut core = s.core.lock(); let _ = input.controller.lock().unavailable(); core.upsert("legacy-promotion-held", None, Body::Notice { level: Level::Warn, text: "The certified epoch has no matching durable promotion intent; existing work remains retained.".into() }); core.touch_state(); }
 }
 
 /// Background work a step asked for.
@@ -1577,14 +1997,204 @@ struct Jobs {
     changes: Vec<super::core::ChangeJob>,
 }
 
+fn legacy_effect_waiting_for_original(s: &Session, input: &super::admission::Input, message: &str) -> bool {
+    let core = s.core.lock();
+    let controller = input.controller.lock();
+    let Some((from, _)) = controller.promoting_epochs() else { return false };
+    core.state.epoch == from && controller.capacity().epoch == from && controller.lease(message).is_none_or(|lease| lease.epoch == from && lease.token.is_none())
+        && (core.input_legacy_flights.iter().any(|flight| flight.id == message)
+            || core.state.queue.iter().chain(core.state.tasks.iter().flat_map(|task| &task.queue)).any(|item| item.id == message))
+}
+
+async fn legacy_effects_waiting_for_epoch(s: &Session, input: &super::admission::Input, messages: &[String], refusal: &super::inbox::Refusal) -> bool {
+    let super::inbox::Refusal::StaleEpoch { session, sent, current } = refusal else { return false };
+    if session != &s.id || !messages.iter().all(|message| legacy_effect_waiting_for_original(s, input, message)) || input.controller.lock().promoting_epochs() != Some((*sent, *current)) { return false; }
+    matches!(input.inbox.promotion(&s.id).await, Ok(Some(promotion)) if promotion.phase == super::inbox::PromotionPhase::Rebinding && (promotion.from_epoch, promotion.to_epoch) == (*sent, *current))
+}
+
 /// Hand out what the core produced: updates to the sink, lines to the process.
+async fn flush_input(s: &Session) -> bool {
+    let (input, stages, retained, replay, receipts) = {
+        let mut core = s.core.lock();
+        (core.input.clone(), std::mem::take(&mut core.input_stages), std::mem::take(&mut core.input_retained), std::mem::take(&mut core.input_replay), std::mem::take(&mut core.input_receipts))
+    };
+    let Some(input) = input else {
+        let mut core = s.core.lock();
+        core.input_stages.extend(stages);
+        core.input_retained.extend(retained);
+        core.input_receipts.extend(receipts);
+        core.input_replay = replay;
+        return core.input_legacy_flights.is_empty();
+    };
+    if matches!(replay, super::admission::Replay::ProviderReady) {
+        let capacity = {
+            let mut controller = input.controller.lock();
+            if controller.provider_ready().is_err() { let _ = controller.unavailable(); }
+            controller.advertised_ready(input.now_ns());
+            controller.capacity()
+        };
+        let mut core = s.core.lock();
+        core.state.admission = Some(capacity.clone());
+        core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) });
+        core.touch_state();
+    }
+    let mut write_ready = input.controller.lock().writes_ready();
+    for message in stages {
+        let epoch = input.controller.lock().lease(&message).map(|l| l.epoch);
+        let Some(epoch) = epoch else {
+            if legacy_effect_waiting_for_original(s, &input, &message) { s.core.lock().input_stages.push(message); write_ready = false; }
+            continue;
+        };
+        let staged = input.inbox.stage_pending(&s.id, &message, epoch, super::admission::Stage::ProviderFlight).await;
+        if !matches!(&staged, Ok(true)) {
+            let deferred = match &staged {
+                Ok(false) => legacy_effect_waiting_for_original(s, &input, &message),
+                Err(error) => legacy_effects_waiting_for_epoch(s, &input, std::slice::from_ref(&message), error).await,
+                _ => false,
+            };
+            s.core.lock().input_stages.push(message);
+            if !deferred { let _ = input.controller.lock().unavailable(); }
+            write_ready = false;
+        }
+    }
+    for message in retained {
+        let lease = input.controller.lock().lease(&message).cloned();
+        let Some(lease) = lease else { s.core.lock().input_retained.push(message); continue };
+        let staged = input.inbox.stage_pending(&s.id, &message, lease.epoch, super::admission::Stage::Carried).await;
+        if !matches!(&staged, Ok(true)) {
+            let deferred = match &staged {
+                Ok(false) => legacy_effect_waiting_for_original(s, &input, &message),
+                Err(error) => legacy_effects_waiting_for_epoch(s, &input, std::slice::from_ref(&message), error).await,
+                _ => false,
+            };
+            s.core.lock().input_retained.push(message);
+            if !deferred { let _ = input.controller.lock().unavailable(); }
+            write_ready = false;
+            continue;
+        }
+        let capacity = { let mut controller = input.controller.lock(); let _ = controller.stage(&message, super::admission::Stage::Carried); controller.capacity() };
+        if let Some(token) = lease.token { s.core.lock().out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Waiting { token, epoch: lease.epoch, cause: super::admission::WaitCause::ConsumptionUnknown, capacity }) }); }
+    }
+    if matches!(replay, super::admission::Replay::ProviderReady) && write_ready {
+        let mut after = None;
+        loop {
+            let next = input.inbox.pending_next(&s.id, after).await;
+            let Ok(Some((key, pending))) = next else { break };
+            after = Some(key);
+            if pending.disposition.is_some() || pending.lease.stage != super::admission::Stage::Carried || !input.controller.lock().lease(&pending.lease.message).is_some_and(|lease| lease.stage == super::admission::Stage::Carried) { continue; }
+            let queued = { let core = s.core.lock(); core.state.queue.iter().chain(core.state.tasks.iter().flat_map(|task| &task.queue)).any(|item| item.id == pending.lease.message) };
+            if let Some(command) = pending.current_command() && !queued && s.command(command.clone()) { let _ = input.controller.lock().stage(&pending.lease.message, super::admission::Stage::InCtl); }
+        }
+    }
+    for receipt in receipts {
+        let deferred = {
+            let core = s.core.lock();
+            let controller = input.controller.lock();
+            receipt.messages.iter().filter(|message| controller.lease(message).is_none() && core.input_legacy_flights.iter().any(|flight| &flight.id == *message)).cloned().collect::<Vec<_>>()
+        };
+        let (messages, epoch) = {
+            let c = input.controller.lock();
+            let messages: Vec<_> = receipt.messages.iter().filter(|message| c.lease(message).is_some()).cloned().collect();
+            let epoch = messages.first().and_then(|message| c.lease(message)).map(|lease| lease.epoch);
+            (messages, epoch)
+        };
+        let Some(epoch) = epoch else {
+            if !deferred.is_empty() { s.core.lock().input_receipts.push(receipt); write_ready = false; }
+            continue;
+        };
+        let pending = input.inbox.dispose_pending_batch(&s.id, &messages, epoch, &receipt.disposition).await;
+        match pending {
+            Ok(pending) => {
+                if !deferred.is_empty() {
+                    s.core.lock().input_receipts.push(super::admission::Receipt { messages: deferred, ..receipt.clone() });
+                    write_ready = false;
+                }
+                let capacity = {
+                    let mut c = input.controller.lock();
+                    if pending.iter().all(|p| p.disposition == receipt.disposition) {
+                        let ids: Vec<_> = pending.iter().map(|p| p.lease.message.as_str()).collect();
+                        if c.finish_batch(&ids, receipt.disposition.clone(), receipt.at_ns, receipt.continuously_available).is_err() { let _ = c.unavailable(); }
+                    } else {
+                        for p in &pending {
+                            if c.finish(&p.lease.message, p.disposition.clone(), receipt.at_ns, false).is_err() { let _ = c.unavailable(); }
+                        }
+                    }
+                    c.advertised_ready(input.now_ns());
+                    c.capacity()
+                };
+                input.observe_physical();
+                let mut core = s.core.lock();
+                core.state.admission = Some(capacity.clone());
+                // The durable terminal row is the witness now; retaining this fallback ID
+                // would turn a repeated native callback into an unresolvable missing lease.
+                core.input_legacy_flights.retain(|flight| !pending.iter().any(|entry| entry.lease.message == flight.id));
+                for pending in pending {
+                    let Some(token) = pending.lease.token else { continue };
+                    let event = match pending.disposition {
+                        super::admission::Disposition::Consumed { boundary } => super::admission::FlowEvent::Consumed { token, epoch, boundary, capacity: capacity.clone() },
+                        disposition => super::admission::FlowEvent::Disposed { token, epoch, disposition, capacity: capacity.clone() },
+                    };
+                    core.out.push(Update::MailFlow { event: Box::new(event) });
+                }
+                core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) });
+                core.touch_state();
+            }
+            Err(super::inbox::CompletionError::MissingOriginal { message }) if legacy_effect_waiting_for_original(s, &input, &message) => {
+                write_ready = false;
+                s.core.lock().input_receipts.push(receipt);
+            }
+            Err(super::inbox::CompletionError::Refused(error)) if legacy_effects_waiting_for_epoch(s, &input, &receipt.messages, &error).await => {
+                write_ready = false;
+                s.core.lock().input_receipts.push(receipt);
+            }
+            Err(_) => {
+                write_ready = false;
+                let (tokens, capacity) = { let mut c = input.controller.lock(); let _ = c.unavailable(); (messages.iter().filter_map(|message| c.lease(message).and_then(|l| l.token)).collect::<Vec<_>>(), c.capacity()) };
+                let mut core = s.core.lock();
+                core.state.admission = Some(capacity.clone());
+                core.touch_state();
+                core.input_receipts.push(receipt);
+                for token in tokens {
+                    core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Waiting { token, epoch, cause: super::admission::WaitCause::SourceUnavailable, capacity: capacity.clone() }) });
+                }
+            }
+        }
+    }
+    write_ready
+}
+
 async fn flush(s: &Session, sink: &Sink, stdin: Option<&crate::memory::queue::Sender<Vec<u8>>>) -> Jobs {
+    let write_ready = flush_input(s).await;
     let (updates, writes, previews, changes) = {
         let mut core = s.core.lock();
         let u = core.take_out();
-        (u, core.take_writes(), std::mem::take(&mut core.previews), core.take_change_jobs())
+        let writes = core.take_writes();
+        let writes = if write_ready { writes } else {
+            let (held, control): (Vec<_>, Vec<_>) = writes.into_iter().partition(|wire| super::admission::native_input(wire));
+            core.writes = held;
+            control
+        };
+        (u, writes, std::mem::take(&mut core.previews), core.take_change_jobs())
     };
     if let Some(stdin) = stdin {
+        // W20-R01: bridge the current scoped skills at actual delivery, after queueing/holds.
+        // The blocking pool reads files; adapters and the runtime shard do no filesystem work.
+        let protocol = Kind::get(&s.info.lock().kind).map(|kind| kind.protocol);
+        let writes = if let Some(protocol) = protocol.filter(|p| crate::skills::bridge::needed(*p, &writes)) {
+            let folder = crate::skills::place::root().join("sessions").join(&s.id);
+            let pending = writes.clone();
+            let (native, bridge, refresh) = { let mut core = s.core.lock(); (core.installed_skill_roots, Arc::clone(&core.skill_bridge), std::mem::take(&mut core.skill_refresh)) };
+            match crate::rt::blocking(move || {
+                let mut bridge = bridge.lock();
+                refresh.apply(&mut bridge);
+                let delivered = bridge.deliver(&folder, protocol, native, pending);
+                let advertised = bridge.advertised();
+                (delivered, advertised)
+            }).await {
+                Ok((delivered, advertised)) => { s.core.lock().skills_delivered(delivered.projections, advertised); delivered.writes }
+                Err(_) => { let mut core = s.core.lock(); core.skill_refresh = core.skill_refresh.merge(refresh); writes }
+            }
+        } else { writes };
         for w in writes {
             let mut line = w.into_bytes();
             line.push(b'\n');
@@ -1614,6 +2224,8 @@ async fn pipe(rx: &crate::memory::queue::Receiver<Vec<u8>>, open: bool) -> Optio
 }
 
 enum Ev {
+    InputBudget,
+    PromotionJournal,
     Change((String, super::diff::Found)),
     Out(Option<Vec<u8>>),
     Err(Option<Vec<u8>>),
@@ -1624,6 +2236,35 @@ enum Ev {
     Tick,
     /// Headroom has room for work it held (docs/headroom.md).
     Room,
+}
+
+async fn input_budget(s: &Session) {
+    let input = s.core.lock().input.clone();
+    match input {
+        Some(input) => input.physical_changed().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn promotion_pending(s: &Session) -> bool {
+    let input = s.core.lock().input.clone();
+    input.is_some_and(|input| { let controller = input.controller.lock(); controller.promoting() })
+}
+
+async fn promotion_journal(s: &Session) {
+    let input = s.core.lock().input.clone();
+    match input { Some(input) => input.promotion_journal_changed(&s.id).await, None => std::future::pending().await }
+}
+
+fn publish_input_budget(s: &Session) -> bool {
+    let mut core = s.core.lock();
+    let Some(input) = core.input.clone() else { return false };
+    let Some(improved) = input.take_budget_change() else { return false };
+    let capacity = { let mut c = input.controller.lock(); if c.budget_changed(improved).is_err() { let _ = c.unavailable(); } c.advertised_ready(input.now_ns()); c.capacity() };
+    core.state.admission = Some(capacity.clone());
+    core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) });
+    core.touch_state();
+    improved
 }
 
 /// What of a session's pause is kept on disk (`host::Saved`): a change is written there.
@@ -2348,13 +2989,23 @@ async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)
 
 /// The conversation as kiln's timeline keeps it, with the plan as it stands: what is carried out
 /// of a harness whose own record kiln doesn't read (`carried`). None for one whose record it does.
-fn timeline_of<'a>(from: &Kind, events: impl IntoIterator<Item = &'a super::model::Event>, todos: &[super::model::Todo]) -> Option<super::handoff::Conversation> {
+fn timeline_of<'a>(from: &Kind, events: impl IntoIterator<Item = &'a super::model::Event>, todos: &[super::model::Todo], queue: &[super::model::QueueItem]) -> Option<super::handoff::Conversation> {
     if from.own_record() {
         return None;
     }
-    let mut c = super::handoff::from_events(events);
+    let mut c = super::handoff::from_events(handed_events(events, queue));
     c.todos = todos.to_vec();
     Some(c)
+}
+
+/// CP-T3.2: shown queued input still travels in the durable queue, and must not also become
+/// past conversation in the next harness. The displayed timeline itself stays whole.
+fn handed_events<'a>(events: impl IntoIterator<Item = &'a super::model::Event>, queue: &[super::model::QueueItem]) -> Vec<&'a super::model::Event> {
+    let queued: std::collections::HashSet<&str> = queue.iter().map(|q| q.id.as_str()).collect();
+    events.into_iter().filter(|e| match &e.body {
+        super::model::Body::User { client_id, .. } => !queued.contains(e.id.as_str()) && !client_id.as_deref().is_some_and(|id| queued.contains(id)),
+        _ => true,
+    }).collect()
 }
 
 /// The permission mode and effort a session goes on with in harness `to`, carried from `from`: the
@@ -2445,7 +3096,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
     let (cwd, session, old_model, mode, effort, timeline) = {
         let core = s.core.lock();
         let st = &core.state;
-        (st.cwd.clone(), st.harness_session.clone(), st.model.clone(), st.mode.clone(), st.effort.clone(), timeline_of(from, core.events(), &st.todos))
+        (st.cwd.clone(), st.harness_session.clone(), st.model.clone(), st.mode.clone(), st.effort.clone(), timeline_of(from, core.events(), &st.todos, &st.queue))
     };
     let fail = |s: &Arc<Session>, text: String| {
         let mut core = s.core.lock();
@@ -2918,23 +3569,26 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
         let msg = ctl_rx.recv().fuse();
         futures::pin_mut!(tick, msg);
         futures::select_biased! {
+            () = input_budget(s).fuse() => { if publish_input_budget(s) && promotion_pending(s) { progress_promotion(s, files).await; } flush(s,sink,None).await; },
+            () = promotion_journal(s).fuse() => { progress_promotion(s, files).await; flush(s,sink,None).await; },
             m = msg => match m {
                 Ok(Ctl::Cmd(c)) => match *c {
                     Command::Moving { text } => moving_note(s, &text),
-                    c @ (Command::Send { .. } | Command::SkillRun { .. }) => carry.push(prepare(files, c).await),
+                    c @ (Command::Send { .. } | Command::SkillRun { .. }) => match prepare(files, c).await { Ok(command) => carry.push(command), Err(error) => preparation_failed(s, error).await },
                     c => carry.push(c),
                 },
                 // No process to hand over: the next image starts it from its record.
                 Ok(Ctl::HandOver(reply)) => {
-                    let _ = reply.send(None);
+                    let _ = reply.send(Ok(None));
                 }
                 Ok(Ctl::LetGo) => return Arrived::End { let_go: true },
                 Ok(Ctl::Close) | Err(_) => return Arrived::End { let_go: false },
                 // What it carries goes once it's on, asking for room then.
                 Ok(Ctl::Room) => {}
                 Ok(Ctl::OwnedChanged) => {flush(s,sink,None).await;}
+                Ok(Ctl::Promotion) => { progress_promotion(s, files).await; flush(s,sink,None).await; }
                 Ok(Ctl::ArchiveQuiet(reply)) => {let _=reply.send(false);}
-                Ok(Ctl::Epoch(e)) => raise_epoch(&mut s.core.lock(), e),
+                Ok(Ctl::Epoch(e)) => raise_epoch(s, files, e).await,
                 // No harness of its runs here to hold a call.
                 Ok(Ctl::Hook(_, reply)) => {
                     let _ = reply.send(serde_json::json!({}));
@@ -3013,7 +3667,8 @@ where
     };
     let carry = match kind.protocol {
         super::kinds::Protocol::Acp(_) | super::kinds::Protocol::AgyStreamJson => {
-            super::moving::words(&events, "This conversation went on in this machine's newer kiln runner, which took the older one's place.")
+            let history: Vec<_> = handed_events(&events, &state.queue).into_iter().cloned().collect();
+            super::moving::words(&history, "This conversation went on in this machine's newer kiln runner, which took the older one's place.")
         }
         _ => Carry::Nothing,
     };
@@ -3129,7 +3784,7 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
         // Its record, and what its harness keeps for it in its home besides (`homes`).
         None => {
             let env = spec.env.clone();
-            let timeline = events.clone();
+            let timeline: Vec<_> = handed_events(&events, &state.queue).into_iter().cloned().collect();
             let (cwd, objective) = (from_cwd.clone(), state.objective.clone());
             crate::rt::blocking(move || {
                 let carry = super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)?;
@@ -3143,7 +3798,7 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
         // writes one (`carried`).
         Some(to) => {
             let model = mv.model.clone().unwrap_or_default();
-            let timeline = timeline_of(kind, &events, &state.todos);
+            let timeline = timeline_of(kind, &events, &state.todos, &state.queue);
             let c = carried(kind, to, &spec.env, session, timeline, &mv.cwd, &state.model, &state.mode, &state.effort, spec.allow_bypass, &model, Some(&note)).await?;
             let (carry, there) = match c.record {
                 Record::Claude { session, records } => (Carry::ClaudeLines { session: session.clone(), lines: records.iter().map(serde_json::Value::to_string).collect() }, Some(session)),
@@ -3651,6 +4306,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     let ev = futures::select_biased! {
                         c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
+                        () = input_budget(&s).fuse() => Ev::InputBudget,
+                        () = promotion_journal(&s).fuse() => Ev::PromotionJournal,
                         c = changes.select_next_some() => Ev::Change(c),
                         o = pipe(&p.stdout, out_open).fuse() => Ev::Out(o),
                         e = pipe(&p.stderr, err_open).fuse() => Ev::Err(e),
@@ -3697,7 +4354,16 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 break;
                             }
                         }
-                        Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
+                        Ev::Ctl(Some(Ctl::Cmd(c))) => {
+                            let prepared = journal_edit(&s, &files, *c, |core, command| adapter.command(core, command)).await;
+                            match prepared {
+                            None => {},
+                            Some(command) => match command {
+                            Command::StateRead { client, read } => read_state(&mut s.core.lock(), client, read),
+                            Command::MailHandoff { client, revision, handoff, turn, ids, response_digest } => register_handoff(&s, client, revision, handoff, turn, ids, response_digest).await,
+                            Command::AtState { client, revision, command } => {
+                                at_state(&mut s.core.lock(), client, &revision, *command, |core, command| adapter.command(core, command));
+                            }
                             Command::Restart => {
                                 if s.core.lock().state.status == Status::Exited {
                                     rewind_to = Some(None);
@@ -3852,7 +4518,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                         e.body = super::model::Body::Notice { level: Level::Info, text: "Switch cancelled".to_owned() };
                                     }
                                 }
-                                let c = prepare(&files, c).await;
+                                let c = match prepare(&files, c).await { Ok(command) => command, Err(error) => { preparation_failed(&s, error).await; continue; } };
                                 let mut core = s.core.lock();
                                 // No room on its machine for it to go to work: a skill run waits
                                 // for room (`super::limit`).
@@ -3865,6 +4531,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                     adapter.command(&mut core, c);
                                 }
                             }
+                        }
+                        }
                         },
                         // There may be room on its machine now: the skill runs that waited for it
                         // go, then its queue, if it may go to work now.
@@ -3878,8 +4546,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             adapter.room(&mut core);
                         }
                         Ev::Ctl(Some(Ctl::OwnedChanged)) => {},
+                        Ev::Ctl(Some(Ctl::Promotion)) => progress_promotion(&s, &files).await,
+                        Ev::InputBudget => { if publish_input_budget(&s) && promotion_pending(&s) { progress_promotion(&s, &files).await; } },
+                        Ev::PromotionJournal => progress_promotion(&s, &files).await,
                         Ev::Ctl(Some(Ctl::ArchiveQuiet(reply))) => {let _=reply.send(s.archive_quiet_now(!carry.is_empty() || !for_room.is_empty() || moving.is_some() || switching.is_some() || reloading));},
-                        Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
+                        Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&s, &files, e).await,
                         // Its harness's hook asks before a tool call: the adapter answers, at once or
                         // once a person lets the call go.
                         Ev::Ctl(Some(Ctl::Hook(input, reply))) => adapter.hook(&mut s.core.lock(), input, reply),
@@ -3888,6 +4559,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             // one goes on with this very process. What it has said so far is taken
                             // in here, and nothing more is read, so nothing it says is lost.
                             let _ = flush(&s, &sink, Some(&p.stdin)).await;
+                            let unresolved = { let core = s.core.lock(); !core.input_stages.is_empty() || !core.input_retained.is_empty() || !core.input_receipts.is_empty() };
+                            if unresolved {
+                                let _ = reply.send(Err("source input journal effects are not committed; the current owner is retained".into()));
+                                continue;
+                            }
                             // A switch, move or setting waiting for the turn to end is this image's
                             // alone: such a session starts again in the next one instead.
                             let waiting = switching.is_some() || moving.is_some() || reloading;
@@ -3900,27 +4576,43 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 *s.pid.lock() = None;
                                 // What its adapter held goes with its record, in its queue.
                                 adapter.let_go(&mut s.core.lock());
-                                let _ = reply.send(None);
+                                let _ = reply.send(Ok(None));
                                 return;
                             };
                             while let Ok(Some(chunk)) = crate::rt::timeout(Duration::from_secs(1), p.stdout.recv()).await.map(Result::ok) {
                                 buf.extend_from_slice(&chunk);
                             }
-                            let (updates, core) = {
+                            {
                                 let mut core = s.core.lock();
                                 while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
                                     let line: Vec<u8> = buf.drain(..=nl).collect();
                                     adapter.line(&mut core, &String::from_utf8_lossy(&line));
                                 }
-                                (core.take_out(), core.freeze())
-                            };
+                            }
+                            let _ = flush_input(&s).await;
+                            let unresolved = { let core = s.core.lock(); !core.input_stages.is_empty() || !core.input_retained.is_empty() || !core.input_receipts.is_empty() };
+                            if unresolved {
+                                let _ = reply.send(Err("trailing native input effects could not commit; the current owner is retained".into()));
+                                match crate::proc::adopt_duplex(process) {
+                                    Ok(resumed) => { p = resumed; out_open = true; err_open = true; continue; }
+                                    Err(error) => {
+                                        crate::proc::terminate_tree(i32::try_from(process.pid).unwrap_or(0), Duration::from_secs(2)).await;
+                                        let mut core = s.core.lock();
+                                        adapter.let_go(&mut core);
+                                        core.upsert("input-handover-retained", None, super::model::Body::Notice { level: Level::Error, text: format!("Source handover was refused; accepted communications remain retained. The provider must restart: {error:#}") });
+                                        ending = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            let (updates, core) = { let mut core = s.core.lock(); (core.take_out(), core.freeze()) };
                             for u in updates {
                                 let _ = sink.send((s.id.clone(), u)).await;
                             }
                             *s.pid.lock() = None;
                             use base64::Engine as _;
                             let partial = base64::engine::general_purpose::STANDARD.encode(&buf);
-                            let _ = reply.send(Some(Box::new(Handed { kind: kind.id.to_owned(), process, core, adapter: adapter.freeze(), partial })));
+                            let _ = reply.send(Ok(Some(Box::new(Handed { kind: kind.id.to_owned(), process, core, adapter: adapter.freeze(), partial }))));
                             return;
                         }
                         Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
@@ -4213,6 +4905,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             };
             let ev = futures::select_biased! {
                 c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
+                () = input_budget(&s).fuse() => Ev::InputBudget,
+                        () = promotion_journal(&s).fuse() => Ev::PromotionJournal,
                 f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
                 () = wake.fuse() => {
                     again_at = None;
@@ -4220,7 +4914,16 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 }
             };
             match ev {
-                Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
+                Ev::Ctl(Some(Ctl::Cmd(c))) => {
+                            let prepared = journal_edit(&s, &files, *c, |core, command| adapter.command(core, command)).await;
+                            match prepared {
+                    None => {},
+                    Some(command) => match command {
+                    Command::StateRead { client, read } => read_state(&mut s.core.lock(), client, read),
+                            Command::MailHandoff { client, revision, handoff, turn, ids, response_digest } => register_handoff(&s, client, revision, handoff, turn, ids, response_digest).await,
+                    Command::AtState { client, revision, command } => {
+                        at_state(&mut s.core.lock(), client, &revision, *command, |core, command| adapter.command(core, command));
+                    }
                     Command::Restart => {
                         if s.core.lock().has_room() {
                             break;
@@ -4269,7 +4972,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         on_change();
                     }
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {
-                        let c = prepare(&files, c).await;
+                        let c = match prepare(&files, c).await { Ok(command) => command, Err(error) => { preparation_failed(&s, error).await; continue; } };
                         let mut core = s.core.lock();
                         // What waits in its queue goes first (held for its harness when that
                         // ended, CP-T3.2): one to go in turn waits behind it, and the harness,
@@ -4348,9 +5051,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     c => adapter.command(&mut s.core.lock(), c),
                 },
+                }
+                },
                 // No process to hand over: the next image starts it from its record.
                 Ev::Ctl(Some(Ctl::HandOver(reply))) => {
-                    let _ = reply.send(None);
+                    let _ = reply.send(Ok(None));
                 }
                 // No harness of its runs now to hold a call.
                 Ev::Ctl(Some(Ctl::Hook(_, reply))) => {
@@ -4371,8 +5076,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                 }
                 Ev::Ctl(Some(Ctl::OwnedChanged)) => {},
+                Ev::Ctl(Some(Ctl::Promotion)) => progress_promotion(&s, &files).await,
+                Ev::InputBudget => { if publish_input_budget(&s) && promotion_pending(&s) { progress_promotion(&s, &files).await; } },
+                        Ev::PromotionJournal => progress_promotion(&s, &files).await,
                 Ev::Ctl(Some(Ctl::ArchiveQuiet(reply))) => {let _=reply.send(s.archive_quiet_now(restart_wanted || !carry.is_empty() || !for_room.is_empty() || moving.is_some() || switching.is_some() || reloading));},
-                Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
+                Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&s, &files, e).await,
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
                     s.stop_owned_reach(None);
                     // Ending the agent ends what it left running that kiln took back over, and the
@@ -4414,6 +5122,59 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
 
 #[cfg(test)]
 mod tests {
+    use crate::util::Must as _;
+    #[test]
+    fn deferred_bodies_retain_the_complete_compact_queue_index() -> anyhow::Result<()> {
+        let state = State {
+            status: Status::Running,
+            queue: (0..600).map(|i| super::super::model::QueueItem {
+                id: format!("queued-{i}"), text: "payload".repeat(400), at: i,
+                attachments: Vec::new(), overrides: None, reply_to: None,
+            }).collect(),
+            ..State::default()
+        };
+        let view = super::super::state_view::view(&state, super::super::state_view::FRAME)?;
+        let projected: State = serde_json::from_value(view.into_state()?)?;
+        assert!(projected.queue.is_empty());
+        let mut info = Info::default();
+        info.apply(&projected);
+        assert_eq!(info.queued, state.queue.len());
+        assert_eq!(info.queue.len(), state.queue.len());
+        assert!(!info.queue_partial);
+        for (actual, original) in info.queue.iter().zip(&state.queue) {
+            assert_eq!(actual, &super::super::queued::Queued::of(&original.id, &original.text));
+        }
+        assert!(serde_json::to_value(&info)?.get("queue").is_none(), "the compact local index is not a wire body");
+        Ok(())
+    }
+
+    #[test]
+    fn the_local_queue_index_is_bounded_and_marks_its_unseen_suffix() -> anyhow::Result<()> {
+        let state = State { queue: (0..128).map(|i| super::super::model::QueueItem {
+            id: format!("{i}-{}", "x".repeat(8192)), text: "small".into(), at: i,
+            attachments: Vec::new(), overrides: None, reply_to: None,
+        }).collect(), ..State::default() };
+        let expected = super::super::state_view::queue_index(&state.queue, 0, super::super::state_view::FRAME)?;
+        assert!(serde_json::to_vec(&expected)?.len() <= super::super::state_view::FRAME);
+        let mut info = Info::default();
+        info.apply(&state);
+        assert!(info.queue_partial);
+        assert_eq!(info.queue.len(), expected.entries.len());
+        assert!(info.queue.len() < state.queue.len());
+        assert_eq!(info.queue_next, expected.next);
+        Ok(())
+    }
+
+    #[test]
+    fn a_partial_index_revision_wakes_waiters_even_when_its_count_is_unchanged() {
+        let before = Info { queued: 10, queue_partial: true, queue_revision: Some("first".into()), ..Info::default() };
+        let after = Info { queue_revision: Some("second".into()), ..before.clone() };
+        assert!(after.differs(&before));
+        let before = Info { queue_partial: false, ..before };
+        let after = Info { queue_partial: false, ..after };
+        assert!(!after.differs(&before), "ordinary complete-index notification rules are unchanged");
+    }
+
     /// A session that runs nothing, and the receiving end of its channel (what its task would read).
     fn idle(id: &str) -> (Session, crate::memory::queue::Receiver<Ctl>) {
         let (ctl, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
@@ -4436,6 +5197,337 @@ mod tests {
             owned_reach: Mutex::new(std::collections::HashMap::new()),
         };
         (s, rx)
+    }
+
+    fn attachment_files(dir: std::path::PathBuf) -> Files {
+        Files { host: None, dir, take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}), carried: Arc::new(|_| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_, _| Box::pin(async { Ok(()) })), settle: Arc::new(|_, _, _| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}) }
+    }
+
+    #[test]
+    fn partial_legacy_rebinding_retains_completion_until_epochs_match_and_retires_its_flight() -> anyhow::Result<()> {
+        use super::super::{admission::{Consumption, FlightProtocol, Input, Lease, LegacyFlight, PhysicalBudget, Stage}, inbox::{Inbox, Limits as InboxLimits, Pending, PromotionPhase, promotion::RebindStep}};
+        crate::rt::block_on(async {
+            for prior_unavailable in [false, true] {
+                let directory = tempfile::tempdir()?;
+                let records = crate::records::open(&directory.path().join("records.db"))?;
+                let inbox = Arc::new(Inbox::new(records, InboxLimits::default()));
+                let (session, _control) = idle("partial-legacy-effect");
+                inbox.open(&session.id, 0).await?;
+                let pool = PhysicalBudget::new(super::super::state_view::FRAME);
+                let input = Input::new(0, pool.clone(), inbox.clone());
+                let ids = ["0123456789abcdef0123456789abcde0a", "0123456789abcdef0123456789abcde0b"];
+                let [first, second] = ids;
+                let bytes = size_of::<LegacyFlight>() + first.len();
+                for id in ids {
+                    let lease = Lease { message: id.into(), peer: String::new(), epoch: 0, bytes, stage: Stage::ProviderFlight, token: None, handoff: None };
+                    input.controller.lock().restore(lease.clone()).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    inbox.adopt_pending(&session.id, Pending::opaque(lease, Vec::new()), 1).await?;
+                }
+                input.controller.lock().begin_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                if prior_unavailable { input.controller.lock().unavailable().map_err(|error| anyhow::anyhow!("{error:?}"))?; }
+                {
+                    let mut core = session.core.lock();
+                    core.input = Some(input.clone());
+                    core.input_legacy_flights = ids.iter().map(|id| LegacyFlight { id: (*id).into(), protocol: FlightProtocol::Claude, request: None }).collect();
+                }
+                let frozen = session.core.lock().freeze();
+                let (_, events) = frozen.handover_source();
+                let proof = crate::runner::custody::LegacyProof::of(&session.id, 0, events, None).map_err(anyhow::Error::msg)?;
+                inbox.prepare_promotion(&session.id, 0, 1, proof, &pool, Some(&input)).await?;
+                inbox.advance_promotion(&session.id, 1, PromotionPhase::AwaitingCertificate, &pool, Some(&input)).await?;
+                inbox.advance_promotion(&session.id, 1, PromotionPhase::Rebinding, &pool, Some(&input)).await?;
+                assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, RebindStep::Row);
+                pool.resize(pool.counts().0);
+                assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await, Err(super::super::inbox::PromotionError::ResourceHeld));
+                assert_eq!(inbox.pending(&session.id, first).await?.must()?.lease.epoch, 1);
+                assert_eq!(input.controller.lock().capacity().epoch, 0);
+                // An exact native callback arrived between the real partial commit and its
+                // external budget wake. It is a component input, not a model-work claim.
+                session.core.lock().input_consumed(first, Consumption::ProviderCompleted);
+                assert!(!flush_input(&session).await);
+                assert_eq!(session.core.lock().input_receipts.len(), 1);
+                assert!(inbox.pending(&session.id, first).await?.must()?.disposition.is_none(), "the epoch guard must not be weakened");
+                assert_eq!(pool.counts().0, bytes * 2);
+                pool.resize(super::super::state_view::FRAME);
+                assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, RebindStep::Row);
+                assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, RebindStep::Complete);
+                {
+                    let mut core = session.core.lock();
+                    input.controller.lock().rebind_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    core.state.epoch = 1;
+                }
+                assert!(!flush_input(&session).await, "the owner must stay Promoting until the receipt commits");
+                assert!(session.core.lock().input_receipts.is_empty());
+                assert!(inbox.pending(&session.id, first).await?.must()?.disposition.is_some());
+                assert_eq!(inbox.promotion(&session.id).await?.must()?.phase, PromotionPhase::Rebinding);
+                assert!(input.controller.lock().lease(second).is_some());
+                assert_eq!(pool.counts().0, bytes);
+                inbox.advance_promotion(&session.id, 1, PromotionPhase::Active, &pool, Some(&input)).await?;
+                inbox.retire_promotion(&session.id, 1, &pool, Some(&input)).await?;
+                {
+                    let mut controller = input.controller.lock();
+                    controller.complete_legacy_reconciliation().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    controller.activate_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    if prior_unavailable { assert_eq!(controller.capacity().target, 0, "genuine Unavailable remains held"); }
+                    else { assert!(controller.capacity().target > 0, "a callback during partial rebinding poisoned readiness"); }
+                }
+                session.core.lock().input_consumed(first, Consumption::ProviderCompleted);
+                let _ = flush_input(&session).await;
+                assert!(session.core.lock().input_receipts.is_empty(), "a committed legacy callback must not defer forever after its lease is gone");
+                assert!(session.core.lock().input_legacy_flights.iter().any(|flight| flight.id == second));
+                assert_eq!(input.controller.lock().capacity().admitted, 1, "a duplicate callback cannot release the other original");
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn early_legacy_effect_waits_for_its_original_without_poisoning_readiness() -> anyhow::Result<()> {
+        use super::super::{admission::{Consumption, FlightProtocol, Input, Lease, LegacyFlight, PhysicalBudget, Stage}, inbox::{Inbox, Limits as InboxLimits, Pending, PromotionPhase}};
+        crate::rt::block_on(async {
+            for effect in ["stage", "retained", "receipt"] {
+                for prior_unavailable in [false, true] {
+                    let directory = tempfile::tempdir()?;
+                    let records = crate::records::open(&directory.path().join("records.db"))?;
+                    let inbox = Arc::new(Inbox::new(records, InboxLimits::default()));
+                    let (session, _control) = idle("early-legacy-effect");
+                    inbox.open(&session.id, 0).await?;
+                    let pool = PhysicalBudget::new(super::super::state_view::FRAME);
+                    let input = Input::new(0, pool.clone(), inbox.clone());
+                    let id = "0123456789abcdef0123456789abcdef";
+                    let lease = Lease { message: id.into(), peer: String::new(), epoch: 0, bytes: size_of::<LegacyFlight>() + id.len(), stage: Stage::ProviderFlight, token: None, handoff: None };
+                    input.controller.lock().restore(lease.clone()).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    input.controller.lock().begin_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    if prior_unavailable { input.controller.lock().unavailable().map_err(|error| anyhow::anyhow!("{error:?}"))?; }
+                    {
+                        let mut core = session.core.lock();
+                        core.input = Some(input.clone());
+                        core.input_legacy_flights.push(LegacyFlight { id: id.into(), protocol: FlightProtocol::Claude, request: None });
+                        match effect {
+                            "stage" => core.input_stages.push(id.into()),
+                            "retained" => core.input_retained.push(id.into()),
+                            _ => core.input_consumed(id, Consumption::ProviderCompleted),
+                        }
+                    }
+                    let frozen = session.core.lock().freeze();
+                    let (_, events) = frozen.handover_source();
+                    let proof = crate::runner::custody::LegacyProof::of(&session.id, 0, events, None).map_err(anyhow::Error::msg)?;
+                    inbox.prepare_promotion(&session.id, 0, 1, proof, &pool, Some(&input)).await?;
+                    inbox.advance_promotion(&session.id, 1, PromotionPhase::AwaitingCertificate, &pool, Some(&input)).await?;
+                    assert!(!flush_input(&session).await);
+                    assert!(inbox.pending(&session.id, id).await?.is_none());
+                    {
+                        let core = session.core.lock();
+                        let deferred = match effect { "stage" => core.input_stages.len(), "retained" => core.input_retained.len(), _ => core.input_receipts.len() };
+                        assert_eq!(deferred, 1, "the exact early {effect} must remain retryable");
+                    }
+                    assert_eq!((input.controller.lock().capacity().epoch, pool.counts().0), (0, lease.bytes));
+                    // This is the component's exact source-journal boundary, not a fabricated
+                    // provider response or certificate. The native upgrade fixture proves those.
+                    inbox.adopt_pending(&session.id, Pending::opaque(lease.clone(), Vec::new()), 1).await?;
+                    assert!(!flush_input(&session).await, "Promoting still withholds new prompt writes");
+                    {
+                        let core = session.core.lock();
+                        assert!(core.input_stages.is_empty() && core.input_retained.is_empty() && core.input_receipts.is_empty());
+                    }
+                    let row = inbox.pending(&session.id, id).await?.must()?;
+                    assert_eq!((row.lease.message.as_str(), row.lease.epoch, row.lease.token), (id, 0, None));
+                    assert_eq!(row.disposition.is_some(), effect == "receipt");
+                    {
+                        let mut controller = input.controller.lock();
+                        controller.rebind_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                        controller.complete_legacy_reconciliation().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                        controller.activate_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                        let capacity = controller.capacity();
+                        assert_eq!(capacity.admitted, usize::from(effect != "receipt"));
+                        assert_eq!(capacity.bytes, if effect == "receipt" { 0 } else { lease.bytes });
+                        if prior_unavailable { assert_eq!(capacity.target, 0, "genuine prior Unavailable must not be cleared"); }
+                        else { assert!(capacity.target > 0, "early {effect} missing its legacy row poisoned later successful reconciliation"); }
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn legacy_promotion_does_not_advance_past_uncommitted_input_effects() -> anyhow::Result<()> {
+        use super::super::{admission::{command_bytes, Input, Lease, PhysicalBudget, Stage}, host::{Host, Limits as HostLimits}, inbox::{Inbox, Limits as InboxLimits}};
+        use kiln_seams::{clock::SimClock, records::{Consistency, Records as _, SimRecords}};
+        crate::rt::block_on(async {
+            for pending_effect in [true, false] {
+                let directory = tempfile::tempdir()?;
+                let (session, _control) = idle(if pending_effect { "legacy-effect-held" } else { "legacy-effect-clear" });
+                let records = Arc::new(SimRecords::new());
+                let inbox = Arc::new(Inbox::new(records.clone(), InboxLimits::default()));
+                let (sink, _updates) = async_channel::unbounded();
+                let host = Host::with_records(sink, Some(directory.path().join("sessions.json")), HostLimits::default(), Arc::new(SimClock::new()), Some(records.clone()));
+                host.set_input_budget(super::super::state_view::FRAME);
+                inbox.open(&session.id, 0).await?;
+                let frozen = session.core.lock().freeze();
+                let (source_epoch, events) = frozen.handover_source();
+                let proof = crate::runner::custody::LegacyProof::of(&session.id, source_epoch, events, None).map_err(anyhow::Error::msg)?;
+                host.prepare_legacy_promotion(&session.id, 0, 1, proof).await?;
+                let before = records.get("inbox-heads", session.id.as_bytes(), Consistency::Linearizable).await?.ok_or_else(|| anyhow::anyhow!("promotion head missing"))?;
+                let pool = PhysicalBudget::new(super::super::state_view::FRAME);
+                let input = Input::new(0, pool, Arc::clone(&inbox));
+                let original = message("uncommitted-native-input", "retained original");
+                let bytes = command_bytes(&original).map_err(|error| anyhow::anyhow!("fixture input weight: {error:?}"))?;
+                if pending_effect {
+                    input.controller.lock().restore(Lease { message: "uncommitted-native-input".into(), peer: "legacy-peer".into(), epoch: 0, bytes, stage: Stage::InCtl, token: None, handoff: None }).map_err(|error| anyhow::anyhow!("fixture lease: {error:?}"))?;
+                    let mut core = session.core.lock();
+                    core.input = Some(input.clone());
+                    core.input_stages.push("uncommitted-native-input".into());
+                } else {
+                    input.controller.lock().begin_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("fixture promotion: {error:?}"))?;
+                    session.core.lock().input = Some(input.clone());
+                }
+                let mut files = attachment_files(directory.path().join("files"));
+                files.host = Some(Arc::downgrade(&host));
+                assert!(!flush_input(&session).await, "both an uncommitted effect and a deliberately gated Promoting owner withhold writes");
+                if pending_effect {
+                    assert!(inbox.pending(&session.id, "uncommitted-native-input").await?.is_none(), "the real journal cannot commit this stage callback without its pending row");
+                    assert_eq!(session.core.lock().input_stages, ["uncommitted-native-input"]);
+                }
+                progress_promotion(&session, &files).await;
+                {
+                    let controller = input.controller.lock();
+                    assert_eq!(controller.capacity().epoch, 0);
+                    assert_eq!(session.epoch(), 0);
+                    if pending_effect {
+                        assert!(!controller.promoting(), "ownership cannot enter Promoting ahead of an earlier uncommitted native effect");
+                        assert!(controller.lease("uncommitted-native-input").is_some_and(|lease| lease.epoch == 0 && lease.bytes == bytes && lease.stage == Stage::InCtl));
+                        let core = session.core.lock();
+                        assert_eq!(core.input_stages, ["uncommitted-native-input"], "the original callback remains retryable");
+                        assert!(core.events().any(|event| event.id == "legacy-promotion-held" && matches!(&event.body, Body::Notice { level: Level::Warn, .. })), "the person can see why ownership is held");
+                    } else {
+                        assert!(controller.promoting());
+                        let core = session.core.lock();
+                        assert!(core.input_stages.is_empty() && core.input_retained.is_empty() && core.input_receipts.is_empty());
+                        assert!(core.out.iter().any(|update| matches!(update, Update::MailFlow { event } if matches!(event.as_ref(), super::super::admission::FlowEvent::Capacity { .. }))), "no unresolved effects: the deliberately gated owner must still execute its promotion step");
+                        assert!(!core.events().any(|event| event.id == "legacy-promotion-held"));
+                    }
+                }
+                let after = records.get("inbox-heads", session.id.as_bytes(), Consistency::Linearizable).await?.ok_or_else(|| anyhow::anyhow!("promotion head disappeared"))?;
+                assert_eq!((after.rev, after.value), (before.rev, before.value), "neither case has authority to advance the persisted head epoch yet");
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn attachment_materialization_is_all_or_error_and_never_clobbers_completed_input() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("incoming-original");
+        let destination = dir.path().join("materialized");
+        std::fs::write(&source, b"original attachment")?;
+        immutable_attachment(&destination, Some(&source), &[])?;
+        immutable_attachment(&destination, Some(&source), &[])?;
+        anyhow::ensure!(std::fs::read(&source)? == b"original attachment", "materialization cannot spend/move durable incoming bytes");
+        anyhow::ensure!(immutable_attachment(&destination, None, b"different retry").is_err());
+        anyhow::ensure!(std::fs::read(&destination)? == b"original attachment");
+        let good = super::super::model::Attachment { name: "first.txt".into(), mime: "text/plain".into(), data_base64: "Zmlyc3Q=".into(), file_id: None, path: None };
+        let missing = super::super::model::Attachment { name: "missing.txt".into(), mime: "text/plain".into(), data_base64: String::new(), file_id: Some("missing-upload".into()), path: None };
+        anyhow::ensure!(store_attachments(&attachment_files(dir.path().join("files")), "message", vec![good, missing]).is_err(), "a missing attachment cannot become a partial prompt");
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_queue_edit_reserves_growth_and_journals_before_adapter_mutation() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use super::super::{admission::{command_bytes, Input, Lease, PhysicalBudget, Stage}, inbox::{Inbox, Limits, Pending}, mail::Token};
+            let dir = tempfile::tempdir()?;
+            let files = attachment_files(dir.path().join("files"));
+            let (s, _rx) = idle("edit-owner");
+            let original = message("edit-message", "old");
+            let bytes = command_bytes(&original).map_err(|error| anyhow::anyhow!("fixture weight: {error:?}"))?;
+            let pool = PhysicalBudget::new(bytes);
+            let inbox = Arc::new(Inbox::new(Arc::new(kiln_seams::records::SimRecords::new()), Limits::default()));
+            let input = Input::new(0, Arc::clone(&pool), Arc::clone(&inbox));
+            let lease = Lease { message: "edit-message".into(), peer: "peer".into(), epoch: 0, bytes, stage: Stage::Queued, token: Some(Token { revision: 1, generation: 1 }), handoff: None };
+            input.controller.lock().restore(lease.clone()).map_err(|error| anyhow::anyhow!("fixture lease: {error:?}"))?;
+            inbox.accept_pending(&s.id, "edit-message", &super::super::inbox::digest("old", &[]), Some(0), 1, &Pending::new(lease, original)).await?;
+            { let mut core = s.core.lock(); core.input = Some(input); core.state.queue.push(super::super::model::QueueItem { id: "edit-message".into(), text: "old".into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None }); }
+            let edit = || Command::QueueEdit { id: "edit-message".into(), text: "larger replacement".into(), attachments: None };
+            anyhow::ensure!(journal_edit(&s, &files, edit(), |_, _| {}).await.is_none(), "growth beyond shared physical authority must retain the old body");
+            anyhow::ensure!(inbox.pending(&s.id, "edit-message").await?.is_some_and(|pending| pending.current.is_none()));
+            pool.resize(bytes.checked_add(1024).ok_or_else(|| anyhow::anyhow!("fixture bound overflow"))?);
+            let mut adapter = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("fixture kind missing"))?.adapter(&Spec::default());
+            anyhow::ensure!(journal_edit(&s, &files, edit(), |core, command| {
+                assert!(core.state.queue.first().is_some_and(|queued| queued.text == "old"), "persistence must precede owner application");
+                adapter.command(core, command);
+            }).await.is_none());
+            let saved = inbox.pending(&s.id, "edit-message").await?.ok_or_else(|| anyhow::anyhow!("fixture journal missing"))?;
+            anyhow::ensure!(matches!(saved.current_command(), Some(Command::Send { text, .. }) if text == "larger replacement"));
+            anyhow::ensure!(s.core.lock().state.queue.first().is_some_and(|queued| queued.text == "larger replacement"), "the owner applies the durable edit once");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn accepted_queue_shrink_grants_retry_credit_only_after_cas_and_actual_owner_apply() -> anyhow::Result<()> {
+        use kiln_seams::records::{self, Records};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Conflicting { inner: records::SimRecords, conflict: AtomicBool, pool: Arc<super::super::admission::PhysicalBudget>, before: usize }
+        impl Records for Conflicting {
+            fn get<'a>(&'a self, family: &'a str, key: &'a [u8], at: records::Consistency) -> futures::future::BoxFuture<'a, Result<Option<records::Row>, records::Refusal>> { self.inner.get(family, key, at) }
+            fn scan<'a>(&'a self, family: &'a str, scan: records::Scan) -> futures::future::BoxFuture<'a, Result<records::Page, records::Refusal>> { self.inner.scan(family, scan) }
+            fn commit<'a>(&'a self, tx: records::Tx) -> futures::future::BoxFuture<'a, Result<records::Rev, records::Refusal>> {
+                if self.conflict.swap(false, Ordering::SeqCst) {
+                    assert_eq!(self.pool.counts().0, self.before, "a proposed shrink cannot release authority before its journal CAS");
+                    return Box::pin(async { Err(records::Refusal::Conflict { family: "inbox-pending".into(), key: b"edit-owner/edit-message".to_vec(), at: Some(2) }) });
+                }
+                self.inner.commit(tx)
+            }
+            fn changes<'a>(&'a self, family: &'a str, after: records::Rev, limit: usize) -> futures::future::BoxFuture<'a, Result<records::Changes, records::Refusal>> { self.inner.changes(family, after, limit) }
+            fn wait<'a>(&'a self, family: &'a str, after: records::Rev) -> futures::future::BoxFuture<'a, Result<records::Rev, records::Refusal>> { self.inner.wait(family, after) }
+            fn head(&self) -> futures::future::BoxFuture<'_, Result<records::Rev, records::Refusal>> { self.inner.head() }
+        }
+        crate::rt::block_on(async {
+            use super::super::{admission::{command_bytes, Input, Lease, PhysicalBudget, Stage}, inbox::{Inbox, Limits, Pending}};
+            let dir = tempfile::tempdir()?;
+            let files = attachment_files(dir.path().join("files"));
+            let (s, _rx) = idle("edit-owner");
+            let words = "original accepted communication with retained history".repeat(8);
+            let original = message("edit-message", &words);
+            let bytes = command_bytes(&original).map_err(|error| anyhow::anyhow!("fixture size: {error:?}"))?;
+            let pool = PhysicalBudget::new(bytes);
+            let records = Arc::new(Conflicting { inner: records::SimRecords::new(), conflict: AtomicBool::new(false), pool: Arc::clone(&pool), before: bytes });
+            let inbox = Arc::new(Inbox::new(records.clone(), Limits::default()));
+            let input = Input::new(0, Arc::clone(&pool), Arc::clone(&inbox));
+            let lease = Lease { message: "edit-message".into(), peer: "peer".into(), epoch: 0, bytes, stage: Stage::Queued, token: None, handoff: None };
+            input.controller.lock().restore(lease.clone()).map_err(|error| anyhow::anyhow!("fixture restore: {error:?}"))?;
+            inbox.accept_pending(&s.id, "edit-message", &super::super::inbox::digest(&words, &[]), Some(0), 1, &Pending::new(lease, original)).await?;
+            { let mut core = s.core.lock(); core.input = Some(input.clone()); core.state.queue.push(super::super::model::QueueItem { id: "edit-message".into(), text: words.clone(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None }); }
+            let before = input.controller.lock().capacity().retry_permission();
+            let edit = || Command::QueueEdit { id: "edit-message".into(), text: "short".into(), attachments: None };
+            let mut adapter = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("fixture kind missing"))?.adapter(&Spec::default());
+            records.conflict.store(true, Ordering::SeqCst);
+            let mut applied = false;
+            assert!(journal_edit(&s, &files, edit(), |core, command| { applied = true; adapter.command(core, command); }).await.is_none());
+            assert!(!applied, "a failed journal CAS cannot apply the edit");
+            assert_eq!(input.controller.lock().capacity().retry_permission(), before);
+            assert_eq!(input.controller.lock().lease("edit-message").map(|lease| lease.bytes), Some(bytes));
+            assert_eq!(pool.counts().0, bytes, "failed CAS rollback returns the exact resident authority");
+            assert!(inbox.pending(&s.id, "edit-message").await?.is_some_and(|pending| pending.current.is_none()));
+            assert!(s.core.lock().state.queue.first().is_some_and(|queued| queued.text == words));
+            assert!(journal_edit(&s, &files, edit(), |core, command| {
+                assert_eq!(input.controller.lock().capacity().retry_permission(), before, "CAS alone has not freed the old queue body");
+                assert_eq!(pool.counts().0, bytes, "the old body remains charged until the owner replaces it");
+                assert!(core.state.queue.first().is_some_and(|queued| queued.text == words));
+                assert!(futures::executor::block_on(inbox.pending(&s.id, "edit-message")).is_ok_and(|pending| pending.is_some_and(|pending| pending.current.is_some())), "the current body is durable before owner application");
+                adapter.command(core, command);
+            }).await.is_none());
+            assert!(s.core.lock().state.queue.first().is_some_and(|queued| queued.text == "short"));
+            let after = input.controller.lock().capacity().retry_permission();
+            assert_eq!(after, before.checked_add(1).ok_or_else(|| anyhow::anyhow!("fixture retry overflow"))?);
+            assert!(pool.counts().0 < bytes);
+            let saved = inbox.pending(&s.id, "edit-message").await?.ok_or_else(|| anyhow::anyhow!("fixture original missing"))?;
+            assert!(matches!(&saved.command, Some(Command::Send { text, .. }) if text == &words));
+            assert!(journal_edit(&s, &files, edit(), |core, command| adapter.command(core, command)).await.is_none());
+            assert_eq!(input.controller.lock().capacity().retry_permission(), after, "an equal-sized repeated edit is not another release");
+            Ok(())
+        })
     }
 
     /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: what a session is told goes on a lock-free
@@ -4507,6 +5599,36 @@ mod tests {
 
     fn message(id: &str, text: &str) -> Command {
         Command::Send { id: id.into(), text: text.into(), mode: super::super::model::SendMode::Now, attachments: Vec::new(), overrides: None, reply_to: None, task: None }
+    }
+
+    #[test]
+    fn w20_r01_driver_delivers_installed_skills_and_revokes_them() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let sessions = crate::skills::place::root().join("sessions");
+            std::fs::create_dir_all(&sessions)?;
+            let folder = tempfile::tempdir_in(&sessions)?;
+            let id = folder.path().file_name().ok_or_else(|| anyhow::anyhow!("no session folder"))?.to_string_lossy().into_owned();
+            let skill = folder.path().join("tools/skills/audit");
+            std::fs::create_dir_all(&skill)?;
+            std::fs::write(skill.join("SKILL.md"), "---\nname: audit\ndescription: Audit a diff.\n---\nCheck the invariants.")?;
+            let (s, _) = idle(&id);
+            s.info.lock().kind = "devin".into();
+            let (sink, _) = async_channel::unbounded();
+            let sink: Sink = sink.into();
+            let (stdin, delivered) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+            let prompt = serde_json::json!({"id": 9, "method":"session/prompt", "params":{"sessionId":"native", "prompt":[{"type":"text", "text":"/tools:audit the diff"}]}});
+            s.core.lock().write(&prompt);
+            flush(&s, &sink, Some(&stdin)).await;
+            let line: serde_json::Value = serde_json::from_slice(&delivered.recv().await?)?;
+            anyhow::ensure!(line.get("id") == Some(&serde_json::json!(9)));
+            anyhow::ensure!(line.to_string().contains("Check the invariants."), "the actual driver omitted the selected instructions");
+            std::fs::remove_dir_all(folder.path().join("tools"))?;
+            s.core.lock().write(&prompt);
+            flush(&s, &sink, Some(&stdin)).await;
+            let line: serde_json::Value = serde_json::from_slice(&delivered.recv().await?)?;
+            anyhow::ensure!(!line.to_string().contains("Check the invariants."), "removal left old instructions in a later delivery");
+            Ok(())
+        })
     }
 
     #[test]
@@ -4591,6 +5713,7 @@ for line in sys.stdin:
                 std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
                 let (sink, updates) = async_channel::unbounded();
                 let files = Files {
+                    host: None,
                     dir: dir.path().to_owned(), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}),
                     carried: Arc::new(|_| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_, _| Box::pin(async { Ok(()) })),
                     settle: Arc::new(|_, _, _| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}),
@@ -5008,7 +6131,7 @@ for line in sys.stdin:
         let nothing: Vec<Event> = Vec::new();
         crate::rt::block_on(async move {
             // Out of Devin into Claude Code: a transcript it resumes, the command its own Bash call.
-            let c = carried(devin, claude, &[], None, timeline_of(devin, &events, &todos), "/w", "", "smart", "high", true, "opus", None).await.map_err(anyhow::Error::msg)?;
+            let c = carried(devin, claude, &[], None, timeline_of(devin, &events, &todos, &[]), "/w", "", "smart", "high", true, "opus", None).await.map_err(anyhow::Error::msg)?;
             let Record::Claude { session, records } = &c.record else { anyhow::bail!("not a transcript") };
             let lines: Vec<String> = records.iter().map(serde_json::Value::to_string).collect();
             anyhow::ensure!(!session.is_empty() && lines.iter().any(|l| l.contains("what time is it?")) && lines.iter().any(|l| l.contains("\"Bash\"") && l.contains("date -u")), "{lines:?}");
@@ -5016,13 +6139,13 @@ for line in sys.stdin:
             assert_eq!((c.mode.as_deref(), c.effort.as_deref(), c.dropped, c.empty), (Some("auto"), Some("high"), 0, false));
             // Into Codex: its new thread's history (from kiln's timeline, its own session's id
             // notwithstanding).
-            let c = carried(devin, codex, &[], Some("devin-session".into()), timeline_of(devin, &events, &todos), "/w", "", "ask", "", true, "gpt-6.1-sol", None).await.map_err(anyhow::Error::msg)?;
+            let c = carried(devin, codex, &[], Some("devin-session".into()), timeline_of(devin, &events, &todos, &[]), "/w", "", "ask", "", true, "gpt-6.1-sol", None).await.map_err(anyhow::Error::msg)?;
             let Record::Codex(items) = &c.record else { anyhow::bail!("not a thread's history") };
             let all = serde_json::to_string(items)?;
             anyhow::ensure!(all.contains("<kiln_handoff>") && all.contains("began in Devin and now continues here in Codex") && all.contains("what time is it?") && all.contains("exec_command") && all.contains("date -u") && all.contains("noon"), "{all}");
             assert_eq!(c.mode.as_deref(), Some("untrusted"));
             // Out of Gemini CLI (an ACP agent's own mode, placed by its words) into Claude Code.
-            let c = carried(gemini, claude, &[], None, timeline_of(gemini, &events, &todos), "/w", "gemini-3-pro", "autoEdit", "", true, "opus", None).await.map_err(anyhow::Error::msg)?;
+            let c = carried(gemini, claude, &[], None, timeline_of(gemini, &events, &todos, &[]), "/w", "gemini-3-pro", "autoEdit", "", true, "opus", None).await.map_err(anyhow::Error::msg)?;
             let Record::Claude { records, .. } = &c.record else { anyhow::bail!("not a transcript") };
             let all = serde_json::to_string(records)?;
             anyhow::ensure!(all.contains("began in Gemini CLI (model gemini-3-pro)") && all.contains("It's noon, UTC."), "{all}");
@@ -5032,7 +6155,7 @@ for line in sys.stdin:
             let env = vec![("CLAUDE_CONFIG_DIR".to_owned(), dir.path().to_string_lossy().into_owned())];
             let recs = handoff::to_claude(&handoff::from_events(&events), None, "S1", "/w", "claude-opus-5-5");
             handoff::write_claude(&env, "/w", "S1", &recs)?;
-            anyhow::ensure!(timeline_of(claude, &events, &todos).is_none() && timeline_of(codex, &events, &todos).is_none(), "Claude Code's and Codex's own records are read, not kiln's timeline");
+            anyhow::ensure!(timeline_of(claude, &events, &todos, &[]).is_none() && timeline_of(codex, &events, &todos, &[]).is_none(), "Claude Code's and Codex's own records are read, not kiln's timeline");
             let c = carried(claude, devin, &env, Some("S1".into()), None, "/w", "claude-opus-5-5", "acceptEdits", "max", true, "", None).await.map_err(anyhow::Error::msg)?;
             let Record::Words(text) = &c.record else { anyhow::bail!("not in words") };
             anyhow::ensure!(text.starts_with("<kiln_handoff>\nThis conversation began in Claude Code (model claude-opus-5-5) and now continues here in Devin") && text.contains("each described in words"), "{text}");
@@ -5042,17 +6165,17 @@ for line in sys.stdin:
             let e = carried(claude, devin, &env, Some("missing".into()), None, "/w", "", "", "", true, "", None).await.err().unwrap_or_default();
             anyhow::ensure!(e.contains("could not read Claude Code's record"), "{e}");
             // Out of Devin into Antigravity: in words too, a move's note after the switch's.
-            let c = carried(devin, agy, &[], None, timeline_of(devin, &events, &todos), "/w", "", "plan", "", true, "", Some("It moved to mac.")).await.map_err(anyhow::Error::msg)?;
+            let c = carried(devin, agy, &[], None, timeline_of(devin, &events, &todos, &[]), "/w", "", "plan", "", true, "", Some("It moved to mac.")).await.map_err(anyhow::Error::msg)?;
             let Record::Words(text) = &c.record else { anyhow::bail!("not in words") };
             anyhow::ensure!(text.contains("continues here in Antigravity CLI") && text.contains("It moved to mac.") && text.contains("- [~] read the clock once"), "{text}");
             assert_eq!(c.mode.as_deref(), Some("plan"));
             // Nothing said yet: nothing to carry.
-            let c = carried(gemini, devin, &[], None, timeline_of(gemini, &nothing, &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
+            let c = carried(gemini, devin, &[], None, timeline_of(gemini, &nothing, &[], &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(c.empty && matches!(c.record, Record::Nothing));
             // A long one goes in words in less room than a harness's own record takes.
             let mut long = vec![ev("u0", said("the goal"))];
             long.extend((0..400).map(|i| ev(&format!("a{i}"), Body::Assistant { text: format!("{i} {}", "x".repeat(1000)), streaming: false })));
-            let c = carried(gemini, devin, &[], None, timeline_of(gemini, &long, &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
+            let c = carried(gemini, devin, &[], None, timeline_of(gemini, &long, &[], &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
             let Record::Words(text) = &c.record else { anyhow::bail!("not in words") };
             anyhow::ensure!(
                 c.dropped > 0 && text.len() < handoff::WORDS_BUDGET + 16 * 1024 && text.contains("the goal") && text.contains(&format!("{} older messages were left out", c.dropped)) && text.contains(&format!("[{} earlier message(s)", c.dropped)),
@@ -5060,8 +6183,70 @@ for line in sys.stdin:
                 text.len(),
                 c.dropped
             );
-            let c = carried(gemini, claude, &[], None, timeline_of(gemini, &long, &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
+            let c = carried(gemini, claude, &[], None, timeline_of(gemini, &long, &[], &[]), "/w", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(c.dropped == 0, "{} left out of Claude Code's", c.dropped);
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: ACP shows startup input before handing it over. A switch or move carries the
+    /// genuine conversation as history and the unsent input only in its durable queue.
+    #[test]
+    fn cp_t3_2_shown_queued_input_is_not_carried_as_conversation_and_sent_again() -> anyhow::Result<()> {
+        use super::super::handoff::Entry;
+        use super::super::model::{Body, Delivery};
+        crate::rt::block_on(async {
+            let source = Kind::get("devin").ok_or_else(|| anyhow::anyhow!("no source harness"))?;
+            let mut core = Core::new();
+            core.state.cwd = "/work".into();
+            core.upsert("past", None, Body::User { text: "past-request".into(), images: 0, client_id: Some("past".into()), origin: None, attachments: Vec::new(), reply_to: None });
+            core.upsert("answer", None, Body::Assistant { text: "past-answer".into(), streaming: false });
+            // A harness's own queued label doesn't make already handed input kiln's queued input.
+            core.state.delivery.insert("past".into(), Delivery::Queued);
+            let mut before = source.adapter(&Spec { kind: source.id.into(), ..Spec::default() });
+            before.start(&mut core);
+            before.command(&mut core, Command::Send { id: "pending".into(), text: "pending-only".into(), mode: super::super::model::SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None });
+            assert!(core.get("pending").is_some());
+            assert_eq!(core.state.delivery.get("pending"), Some(&Delivery::Queued));
+            let timeline = timeline_of(source, core.events(), &core.state.todos, &core.state.queue).ok_or_else(|| anyhow::anyhow!("no carried timeline"))?;
+            assert_eq!(timeline.entries, [Entry::User { text: "past-request".into(), images: Vec::new() }, Entry::Assistant("past-answer".into())]);
+            for destination in ["claude", "codex", "antigravity"] {
+                let to = Kind::get(destination).ok_or_else(|| anyhow::anyhow!("no {destination}"))?;
+                let carried = carried(source, to, &[], None, Some(timeline.clone()), "/work", "", "", "", true, "", None).await.map_err(anyhow::Error::msg)?;
+                let history = match carried.record {
+                    Record::Claude { records, .. } => serde_json::to_string(&records)?,
+                    Record::Codex(items) => serde_json::to_string(&items)?,
+                    Record::Words(text) => text,
+                    Record::Nothing => anyhow::bail!("{destination} lost the sent conversation"),
+                };
+                anyhow::ensure!(history.contains("past-request") && history.contains("past-answer") && !history.contains("pending-only"), "{destination} carried queued input as history: {history}");
+            }
+            let history: Vec<_> = handed_events(core.events(), &core.state.queue).into_iter().cloned().collect();
+            for carry in [super::super::moving::words(&history, "handover"), super::super::moving::record(&source.protocol, &[], None, &history, "move").map_err(anyhow::Error::msg)?] {
+                let super::super::moving::Carry::Words { text } = carry else { anyhow::bail!("moving lost the sent conversation") };
+                anyhow::ensure!(text.contains("past-request") && text.contains("past-answer") && !text.contains("pending-only"), "moving carried queued input as history: {text}");
+            }
+            assert_eq!(core.state.queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), ["pending"]);
+            assert!(core.get("pending").is_some(), "carrying changed the displayed timeline");
+            before.exited(&mut core, None, None);
+            core.take_writes();
+            core.state.exit = None;
+            core.set_status(Status::Starting);
+            let destination = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no destination harness"))?;
+            let mut after = destination.adapter(&Spec { kind: destination.id.into(), ..Spec::default() });
+            after.start(&mut core);
+            let writes = core.take_writes().iter().map(|line| serde_json::from_str::<serde_json::Value>(line)).collect::<Result<Vec<_>, _>>()?;
+            let initialize = writes.iter().find(|v| v.pointer("/request/subtype").and_then(serde_json::Value::as_str) == Some("initialize")).ok_or_else(|| anyhow::anyhow!("no Claude initialization"))?;
+            after.line(&mut core, &serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": initialize.get("request_id"), "response": {}}}).to_string());
+            let writes = core.take_writes().iter().map(|line| serde_json::from_str::<serde_json::Value>(line)).collect::<Result<Vec<_>, _>>()?;
+            let prompts: Vec<_> = writes.iter().filter(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("user")).collect();
+            assert_eq!(prompts.len(), 1);
+            assert_eq!(prompts.first().and_then(|v| v.get("uuid")), Some(&serde_json::json!("pending")));
+            assert_eq!(prompts.first().and_then(|v| v.pointer("/message/content")), Some(&serde_json::json!("pending-only")));
+            assert!(core.state.queue.is_empty());
+            after.drain(&mut core);
+            after.tick(&mut core);
+            assert!(!core.take_writes().iter().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).any(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("user")), "queued input was sent twice");
             Ok(())
         })
     }
@@ -5368,6 +6553,7 @@ for line in sys.stdin:
     fn info_follows_state() {
         let mut i = Info {
             id: "a".into(),
+            deferred: Default::default(), queue_partial: false, queue_revision: None, queue_next: None,
             kind: "claude".into(),
             kind_name: "Claude Code".into(),
             target: "local".into(),
@@ -5383,6 +6569,7 @@ for line in sys.stdin:
             harness_session: None,
             approvals: vec![],
             queued: 0,
+            admission: None,
             queue: Vec::new(),
             said: Vec::new(),
             tasks_running: 0,

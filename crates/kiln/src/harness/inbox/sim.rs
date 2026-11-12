@@ -202,6 +202,14 @@ impl Records for Faults {
         }
         self.inner.commit(tx)
     }
+    fn commit_owned<'a>(&'a self, tx: Tx, owner: Box<dyn Send + Sync>) -> BoxFuture<'a, Result<Rev, Failed>> {
+        let n = self.fail_commits.load(std::sync::atomic::Ordering::SeqCst);
+        let failing = n > 0 && self.fail_commits.compare_exchange(n, n - 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok();
+        if failing {
+            return Box::pin(async { Err(Failed::Unavailable("a write failed".into())) });
+        }
+        self.inner.commit_owned(tx, owner)
+    }
     fn changes<'a>(&'a self, family: &'a str, after: Rev, limit: usize) -> BoxFuture<'a, Result<Changes, Failed>> {
         self.inner.changes(family, after, limit)
     }

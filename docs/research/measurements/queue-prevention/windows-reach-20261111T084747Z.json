@@ -1,0 +1,233 @@
+{
+  "windows_features_diag": {
+    "captured_at": "2026-11-11T08:42:32.339887+00:00",
+    "runners": [
+      {
+        "name": "451397fcc585f7f7cb9aaf00e42064bb",
+        "hostname": "adacachy",
+        "os": "linux",
+        "arch": "x86_64",
+        "connected": true,
+        "reach": true,
+        "fingerprint": "c6759033caba9f52ec8a4dc4a08135d9178d480786833e0c5bde6e8651c6a974",
+        "features": [
+          "place",
+          "link-features",
+          "offers",
+          "told",
+          "reach.sizes",
+          "place.sessions",
+          "place.health",
+          "place.sync",
+          "place.fast",
+          "reach.keep",
+          "place.budget",
+          "place.handoff",
+          "place.tokens",
+          "skills",
+          "state-pages"
+        ],
+        "reach_version": 2,
+        "via": "",
+        "busy": 0,
+        "draining": false
+      },
+      {
+        "name": "e30189ea29182644fe5a4b2e06c7dac2",
+        "hostname": "Adas-MacBook-Pro-2.local",
+        "os": "macos",
+        "arch": "aarch64",
+        "connected": true,
+        "reach": true,
+        "fingerprint": "e9d203179d06a808c9a9c8cff11857446f7c2423c60969853d5e4c2f2c1f8825",
+        "features": [
+          "place",
+          "link-features",
+          "offers",
+          "told",
+          "reach.sizes",
+          "place.sessions",
+          "place.health",
+          "place.sync",
+          "place.fast",
+          "reach.keep",
+          "place.budget",
+          "place.handoff",
+          "place.tokens",
+          "skills",
+          "state-pages"
+        ],
+        "reach_version": 2,
+        "via": "",
+        "busy": 0,
+        "draining": false
+      },
+      {
+        "name": "f766f09294f2e17e3b8a631ffd4e6a4b",
+        "hostname": "Jupiter",
+        "os": "windows",
+        "arch": "x86_64",
+        "connected": true,
+        "reach": true,
+        "fingerprint": "e0b0edc1af73a33a04e1154468ffeb5bf1761132eb8470d39517ff024e075e3b",
+        "reach_version": 2,
+        "via": "",
+        "busy": 0,
+        "draining": false
+      }
+    ]
+  },
+  "windows_reported_facts": {
+    "captured_at": "2026-11-11T08:45:53.380688+00:00",
+    "runners": [
+      {
+        "name": "451397fcc585f7f7cb9aaf00e42064bb",
+        "reported_kiln": {
+          "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+          "build": "87107f09976e",
+          "version": "0.2.0",
+          "target": "x86_64-unknown-linux-musl",
+          "checkout": "/home/adalundhe/Projects/kiln"
+        },
+        "features": [
+          "place",
+          "link-features",
+          "offers",
+          "told",
+          "reach.sizes",
+          "place.sessions",
+          "place.health",
+          "place.sync",
+          "place.fast",
+          "reach.keep",
+          "place.budget",
+          "place.handoff",
+          "place.tokens",
+          "skills",
+          "state-pages"
+        ],
+        "reach": true,
+        "fingerprint": "c6759033caba9f52ec8a4dc4a08135d9178d480786833e0c5bde6e8651c6a974",
+        "sampled_at": 1794386751944
+      },
+      {
+        "name": "f766f09294f2e17e3b8a631ffd4e6a4b",
+        "reported_kiln": {
+          "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+          "build": "14ad7179f912",
+          "version": "0.2.0",
+          "target": "x86_64-pc-windows-msvc",
+          "checkout": "C:\\Users\\corph\\Projects/kiln"
+        },
+        "features": null,
+        "reach": true,
+        "fingerprint": "e0b0edc1af73a33a04e1154468ffeb5bf1761132eb8470d39517ff024e075e3b",
+        "sampled_at": 1794380406592
+      }
+    ]
+  },
+  "windows_control_dir_diag": {
+    "captured_at": "2026-11-11T08:47:47.008511+00:00",
+    "control_dir_request": {
+      "path": "C:\\Users\\corph\\.kiln\\reach\\e30189ea29182644fe5a4b2e06c7dac2\\kiln-offline-fix-20261110-8a5ae447ef",
+      "http": 200,
+      "result": {
+        "path": "~\\.kiln\\reach\\e30189ea29182644fe5a4b2e06c7dac2\\kiln-offline-fix-20261110-8a5ae447ef",
+        "abs": "C:\\Users\\corph\\.kiln\\reach\\e30189ea29182644fe5a4b2e06c7dac2\\kiln-offline-fix-20261110-8a5ae447ef",
+        "parent": "~\\.kiln\\reach\\e30189ea29182644fe5a4b2e06c7dac2",
+        "exists": true,
+        "dirs": [
+          {
+            "name": "dist",
+            "modified": 1794375058
+          },
+          {
+            "name": "ui",
+            "modified": 1794371219
+          },
+          {
+            "name": "vendor",
+            "modified": 1794370993
+          },
+          {
+            "name": "docs",
+            "modified": 1794370989
+          },
+          {
+            "name": "scripts",
+            "modified": 1794370989
+          },
+          {
+            "name": "deploy",
+            "modified": 1794370988
+          },
+          {
+            "name": "ci",
+            "modified": 1794370975
+          },
+          {
+            "name": "crates",
+            "modified": 1794370881
+          },
+          {
+            "name": "bench",
+            "modified": 1794370873
+          }
+        ],
+        "truncated": false
+      }
+    },
+    "primary_initiator_journal": {
+      "exit": 0,
+      "events": [
+        {
+          "time_us": "1794386769554053",
+          "message": "2026-11-11T08:46:09.521489Z  INFO a runner process found a break in what a relay passed on machine=f766f09294f2e17e3b8a631ffd4e6a4b instance=main relay=kiln://hyper-light/server detail=kiln://hyper-light/server changed frames 2 to 2 of reach link 01a1c9c8acc970c38ae28022f865ee58 from 451397fcc585f7f7cb9aaf00e42064bb on the way: its kiln-frames-v1 was 3197474fd5ec603945f0c0ed90f2a7f7a52dc531f13f51c64cdfc731c37c5d92 as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived"
+        },
+        {
+          "time_us": "1794386769554053",
+          "message": "2026-11-11T08:46:09.518292Z  INFO refused reach link 01a1c9c8acc970c38ae28022f865ee58: its frames as they came (0 of the 1 kiln's record names), which its end couldn't read digest=sha256:f6f16620f4b890f5fea5f00c6e895fd117e718e6b23d4d95ab307c4acee0556e signer=kiln://hyper-light/server why=kiln://hyper-light/server changed frames 2 to 2 of reach link 01a1c9c8acc970c38ae28022f865ee58 from 451397fcc585f7f7cb9aaf00e42064bb on the way: its kiln-frames-v1 was 3197474fd5ec603945f0c0ed90f2a7f7a52dc531f13f51c64cdfc731c37c5d92 as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived (as runner f766f09294f2e17e3b8a631ffd4e6a4b (instance main) found it)"
+        },
+        {
+          "time_us": "1794386769554053",
+          "message": "2026-11-11T08:46:09.421842Z  WARN a chain of custody doesn't hold record=sha256:f6f16620f4b890f5fea5f00c6e895fd117e718e6b23d4d95ab307c4acee0556e detail=kiln://hyper-light/server changed frames 2 to 2 of reach link 01a1c9c8acc970c38ae28022f865ee58 from 451397fcc585f7f7cb9aaf00e42064bb on the way: its kiln-frames-v1 was 3197474fd5ec603945f0c0ed90f2a7f7a52dc531f13f51c64cdfc731c37c5d92 as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived (as runner f766f09294f2e17e3b8a631ffd4e6a4b (instance main) found it)"
+        },
+        {
+          "time_us": "1794386769554053",
+          "message": "2026-11-11T08:46:09.421478Z  INFO took a custody record machine=f766f09294f2e17e3b8a631ffd4e6a4b instance=main digest=sha256:c93ddcbca621339230073889dd68718da51eec51396eb9a4fe0d0c6d40ed30ee again=false broke=\"frames 2 to 2 of reach link 01a1c9c8acc970c38ae28022f865ee58 from 451397fcc585f7f7cb9aaf00e42064bb changed between sha256:f6f16620f4b890f5fea5f00c6e895fd117e718e6b23d4d95ab307c4acee0556e and sha256:c93ddcbca621339230073889dd68718da51eec51396eb9a4fe0d0c6d40ed30ee: its kiln-frames-v1 was 3197474fd5ec603945f0c0ed90f2a7f7a52dc531f13f51c64cdfc731c37c5d92, and is 0000000000000000000000000000000000000000000000000000000000000000\""
+        },
+        {
+          "time_us": "1794386768717970",
+          "message": "2026-11-11T08:46:08.711482Z  INFO a runner process found a break in what a relay passed on machine=f766f09294f2e17e3b8a631ffd4e6a4b instance=main relay=kiln://hyper-light/server detail=kiln://hyper-light/server changed frames 1 to 1 of reach link 01a1c9c8acc970c38ae28022f865ee58 from 451397fcc585f7f7cb9aaf00e42064bb on the way: its kiln-frames-v1 was e1beedd5a9191bc03e4749cc6b77fd2980dbd0ae631330a632bdbdfb19aa6ae6 as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived"
+        },
+        {
+          "time_us": "1794386768711289",
+          "message": "2026-11-11T08:46:08.710769Z  INFO refused reach link 01a1c9c8acc970c38ae28022f865ee58: its frames as they came (0 of the 1 kiln's record names), which its end couldn't read digest=sha256:ba37c975c6428bf847016eab149a29e696e959c90ca5b57a09b50833413b0ee0 signer=kiln://hyper-light/server why=kiln://hyper-light/server changed frames 1 to 1 of reach link 01a1c9c8acc970c38ae28022f865ee58 from 451397fcc585f7f7cb9aaf00e42064bb on the way: its kiln-frames-v1 was e1beedd5a9191bc03e4749cc6b77fd2980dbd0ae631330a632bdbdfb19aa6ae6 as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived (as runner f766f09294f2e17e3b8a631ffd4e6a4b (instance main) found it)"
+        },
+        {
+          "time_us": "1794386768711289",
+          "message": "2026-11-11T08:46:08.707908Z  WARN a chain of custody doesn't hold record=sha256:ba37c975c6428bf847016eab149a29e696e959c90ca5b57a09b50833413b0ee0 detail=kiln://hyper-light/server changed frames 1 to 1 of reach link 01a1c9c8acc970c38ae28022f865ee58 from 451397fcc585f7f7cb9aaf00e42064bb on the way: its kiln-frames-v1 was e1beedd5a9191bc03e4749cc6b77fd2980dbd0ae631330a632bdbdfb19aa6ae6 as kiln://hyper-light/server passed it on, and is 0000000000000000000000000000000000000000000000000000000000000000 as it arrived (as runner f766f09294f2e17e3b8a631ffd4e6a4b (instance main) found it)"
+        },
+        {
+          "time_us": "1794386768711289",
+          "message": "2026-11-11T08:46:08.707710Z  INFO took a custody record machine=f766f09294f2e17e3b8a631ffd4e6a4b instance=main digest=sha256:c1d89cf9fcb0a960b086941b5027fd5ae0957ec39c32e192d302aa51281367f0 again=false broke=\"frames 1 to 1 of reach link 01a1c9c8acc970c38ae28022f865ee58 from 451397fcc585f7f7cb9aaf00e42064bb changed between sha256:ba37c975c6428bf847016eab149a29e696e959c90ca5b57a09b50833413b0ee0 and sha256:c1d89cf9fcb0a960b086941b5027fd5ae0957ec39c32e192d302aa51281367f0: its kiln-frames-v1 was e1beedd5a9191bc03e4749cc6b77fd2980dbd0ae631330a632bdbdfb19aa6ae6, and is 0000000000000000000000000000000000000000000000000000000000000000\""
+        }
+      ]
+    }
+  },
+  "policy": {
+    "revision": "3830327b6c8d7ac22452a5e32ffa32799263132c",
+    "rules_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+    "role": "implementer",
+    "scope": "read-only Windows Reach diagnosis"
+  },
+  "primary_initiated_request": {
+    "started_at": "2026-11-11T08:45:49Z",
+    "initiator": "451397fcc585f7f7cb9aaf00e42064bb",
+    "recipient": "f766f09294f2e17e3b8a631ffd4e6a4b",
+    "elapsed_seconds": 15.104,
+    "exit": 1,
+    "parsed_result": null,
+    "limit": "Unparsed command stdout not retained; exact server journal is authoritative for refusal."
+  }
+}

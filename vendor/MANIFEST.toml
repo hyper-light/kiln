@@ -197,3 +197,38 @@ commit = "17eb8032710b8803d328a6c846a9dc1769660b98"
 path = "vendor/mantle"
 exclude = [".github", ".kiln", "vendor", "docs", "loomdoc.html", "mantle-strata.svg", "mantle-strata-dark.svg", "mantle-strata-light.svg"]
 own = ["UPSTREAM.md"]
+
+# cuda-rust (NVIDIA): hex-gpu loads NVML at run time by its CUDA driver loader's policy (library names
+# per OS, WSL's own path, the library kept for the process, a library missing told from a symbol
+# missing), adapted from cuda-bindings' dyn_load.rs and compiled from this copy by path
+# (crates/hex-gpu/src/nvml.rs; docs/design/gpu-telemetry.md G1). cuda-rust binds no NVML: the eight
+# NVML calls hex-gpu makes are declared in crates/hex-gpu/src/nvml/sys.rs from NVIDIA's NVML reference.
+# Apache-2.0, as is its LICENSE taken beside it; no NOTICE file upstream.
+[projects.cuda-rust]
+kind = "git"
+repository = "https://github.com/NVIDIA/cuda-rust"
+commit = "a0a4dc78a20e06ec90827f597e950bdc49f723e2"
+path = "vendor/cuda-rust"
+take = ["LICENSE", "cuda-bindings/src/dyn_load.rs"]
+own = ["UPSTREAM.md"]
+
+# all-smi (Lablup): hex-gpu reads AMD GPUs through amdgpu's sysfs counters on Linux, from all-smi's AMD
+# reader's gpu_busy_percent read (its fallback beside libamdgpu_top's ioctls), adapted to read each
+# counter with one pread of a file kept open (crates/hex-gpu/src/amd.rs; docs/design/gpu-telemetry.md
+# G2); and through ADL on Windows, from all-smi's transcription of AMD's ADL SDK headers (its ADL types
+# and entry points) and its PMLog sensor read, cut to what hex-gpu calls (crates/hex-gpu/src/adl.rs;
+# G3). Each is compiled from this copy by path. Apache-2.0, as is its LICENSE taken beside it; no
+# NOTICE file upstream. AMD's ADL SDK headers it transcribes are MIT (GPUOpen-LibrariesAndSDKs/
+# display-library at 84c881cb), cited, not taken.
+[projects.all-smi]
+kind = "git"
+repository = "https://github.com/lablup/all-smi"
+commit = "fe479ae675e39475a2eab1cfbb3f5432f705e12b"
+path = "vendor/all-smi"
+take = [
+    "LICENSE",
+    "crates/all-smi-amd-plugin/src/reader.rs",
+    "src/device/readers/amd_adl/ffi.rs",
+    "src/device/readers/amd_adl/sensors.rs",
+]
+own = ["UPSTREAM.md"]

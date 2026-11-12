@@ -1,0 +1,274 @@
+error[E0004]: non-exhaustive patterns: `harness::registry::Sent::Published(_)` and `harness::registry::Sent::PublicationRefused(_)` not covered
+    --> crates/kiln/src/api.rs:7251:11
+     |
+7251 |     match sent {
+     |           ^^^^ patterns `harness::registry::Sent::Published(_)` and `harness::registry::Sent::PublicationRefused(_)` not covered
+     |
+note: `harness::registry::Sent` defined here
+    --> crates/kiln/src/harness/registry.rs:1383:10
+     |
+1383 | pub enum Sent {
+     |          ^^^^
+1384 |     /// The server committed custody; this is not receiver admission or model consumption.
+1385 |     Published(super::mail::Receipt),
+     |     --------- not covered
+1386 |     /// Custody was not accepted. The original sender must retain its complete communication.
+1387 |     PublicationRefused(super::mail::Error),
+     |     ------------------ not covered
+     = note: the matched value is of type `harness::registry::Sent`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+7256 ~         Sent::Unreachable => Some(session_error("the session's machine is not connected".into())),
+7257 ~         harness::registry::Sent::Published(_) | harness::registry::Sent::PublicationRefused(_) => todo!(),
+     |
+
+error[E0004]: non-exhaustive patterns: `&SessionFrame::MailFlow { .. }` not covered
+   --> crates/kiln/src/bp/session.rs:65:15
+    |
+ 65 |         match f {
+    |               ^ pattern `&SessionFrame::MailFlow { .. }` not covered
+    |
+note: `SessionFrame` defined here
+   --> crates/kiln/src/wire/ui.rs:60:10
+    |
+ 60 | pub enum SessionFrame {
+    |          ^^^^^^^^^^^^
+...
+127 |     MailFlow { event: Box<crate::harness::admission::FlowEvent> },
+    |     -------- not covered
+    = note: the matched value is of type `&SessionFrame`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+    |
+154 ~             SessionFrame::History { .. } | SessionFrame::Synced | SessionFrame::Reply { .. } | SessionFrame::Inbox { .. } | SessionFrame::Error { .. } | SessionFrame::Ack { .. } | SessionFrame::Nack { .. } => {},
+155 +             &SessionFrame::MailFlow { .. } => todo!()
+    |
+
+error[E0004]: non-exhaustive patterns: `harness::model::Command::Admit { .. }`, `harness::model::Command::MailAck { .. }` and `harness::model::Command::MailPeers { .. }` not covered
+    --> crates/kiln/src/harness/acp.rs:478:15
+     |
+ 478 |         match cmd {
+     |               ^^^ patterns `harness::model::Command::Admit { .. }`, `harness::model::Command::MailAck { .. }` and `harness::model::Command::MailPeers { .. }` not covered
+     |
+note: `harness::model::Command` defined here
+    --> crates/kiln/src/harness/model.rs:2077:10
+     |
+2077 | pub enum Command {
+     |          ^^^^^^^
+...
+2428 |     Admit {
+     |     ----- not covered
+...
+2438 |     MailAck {
+     |     ------- not covered
+...
+2444 |     MailPeers { epoch: u64, peers: Vec<String> },
+     |     --------- not covered
+     = note: the matched value is of type `harness::model::Command`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+ 577 ~             Command::McpRefresh | Command::SkillsReload => {},
+ 578 +             harness::model::Command::Admit { .. } | harness::model::Command::MailAck { .. } | harness::model::Command::MailPeers { .. } => todo!()
+     |
+
+error[E0004]: non-exhaustive patterns: `harness::model::Command::Admit { .. }`, `harness::model::Command::MailAck { .. }` and `harness::model::Command::MailPeers { .. }` not covered
+    --> crates/kiln/src/harness/antigravity.rs:246:15
+     |
+ 246 |         match cmd {
+     |               ^^^ patterns `harness::model::Command::Admit { .. }`, `harness::model::Command::MailAck { .. }` and `harness::model::Command::MailPeers { .. }` not covered
+     |
+note: `harness::model::Command` defined here
+    --> crates/kiln/src/harness/model.rs:2077:10
+     |
+2077 | pub enum Command {
+     |          ^^^^^^^
+...
+2428 |     Admit {
+     |     ----- not covered
+...
+2438 |     MailAck {
+     |     ------- not covered
+...
+2444 |     MailPeers { epoch: u64, peers: Vec<String> },
+     |     --------- not covered
+     = note: the matched value is of type `harness::model::Command`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+ 356 ~             Command::McpRefresh | Command::SkillsReload => {},
+ 357 +             harness::model::Command::Admit { .. } | harness::model::Command::MailAck { .. } | harness::model::Command::MailPeers { .. } => todo!()
+     |
+
+error[E0004]: non-exhaustive patterns: `&harness::model::Command::Admit { .. }`, `&harness::model::Command::MailAck { .. }` and `&harness::model::Command::MailPeers { .. }` not covered
+    --> crates/kiln/src/harness/attention_hooks.rs:14:11
+     |
+  14 |     match command {
+     |           ^^^^^^^ patterns `&harness::model::Command::Admit { .. }`, `&harness::model::Command::MailAck { .. }` and `&harness::model::Command::MailPeers { .. }` not covered
+     |
+note: `harness::model::Command` defined here
+    --> crates/kiln/src/harness/model.rs:2077:10
+     |
+2077 | pub enum Command {
+     |          ^^^^^^^
+...
+2428 |     Admit {
+     |     ----- not covered
+...
+2438 |     MailAck {
+     |     ------- not covered
+...
+2444 |     MailPeers { epoch: u64, peers: Vec<String> },
+     |     --------- not covered
+     = note: the matched value is of type `&harness::model::Command`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+  30 ~         Command::Moving { .. } | Command::HandedOver { .. } | Command::LimitHold { .. } => None,
+  31 ~         &harness::model::Command::Admit { .. } | &harness::model::Command::MailAck { .. } | &harness::model::Command::MailPeers { .. } => todo!(),
+     |
+
+warning: unused variable: `client`
+   --> crates/kiln/src/harness/broadcast.rs:214:13
+    |
+214 |         let client = message_for(&id, &info.id);
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_client`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+error[E0004]: non-exhaustive patterns: `harness::model::Command::Admit { .. }`, `harness::model::Command::MailAck { .. }` and `harness::model::Command::MailPeers { .. }` not covered
+    --> crates/kiln/src/harness/claude.rs:764:15
+     |
+ 764 |         match cmd {
+     |               ^^^ patterns `harness::model::Command::Admit { .. }`, `harness::model::Command::MailAck { .. }` and `harness::model::Command::MailPeers { .. }` not covered
+     |
+note: `harness::model::Command` defined here
+    --> crates/kiln/src/harness/model.rs:2077:10
+     |
+2077 | pub enum Command {
+     |          ^^^^^^^
+...
+2428 |     Admit {
+     |     ----- not covered
+...
+2438 |     MailAck {
+     |     ------- not covered
+...
+2444 |     MailPeers { epoch: u64, peers: Vec<String> },
+     |     --------- not covered
+     = note: the matched value is of type `harness::model::Command`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+ 917 ~             Command::SkillsReload => self.request(core, Pending::ReloadSkills, json!({"subtype": "reload_skills"})),
+ 918 ~             harness::model::Command::Admit { .. } | harness::model::Command::MailAck { .. } | harness::model::Command::MailPeers { .. } => todo!(),
+     |
+
+error[E0004]: non-exhaustive patterns: `harness::model::Command::Admit { .. }`, `harness::model::Command::MailAck { .. }` and `harness::model::Command::MailPeers { .. }` not covered
+    --> crates/kiln/src/harness/codex.rs:1453:15
+     |
+1453 |         match cmd {
+     |               ^^^ patterns `harness::model::Command::Admit { .. }`, `harness::model::Command::MailAck { .. }` and `harness::model::Command::MailPeers { .. }` not covered
+     |
+note: `harness::model::Command` defined here
+    --> crates/kiln/src/harness/model.rs:2077:10
+     |
+2077 | pub enum Command {
+     |          ^^^^^^^
+...
+2428 |     Admit {
+     |     ----- not covered
+...
+2438 |     MailAck {
+     |     ------- not covered
+...
+2444 |     MailPeers { epoch: u64, peers: Vec<String> },
+     |     --------- not covered
+     = note: the matched value is of type `harness::model::Command`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+1675 ~             },
+1676 +             harness::model::Command::Admit { .. } | harness::model::Command::MailAck { .. } | harness::model::Command::MailPeers { .. } => todo!()
+     |
+
+error: future cannot be sent between threads safely
+    --> crates/kiln/src/harness/host.rs:1652:9
+     |
+1652 | /         crate::rt::spawn_owner(owner_shard(&id), async move {
+1653 | |             if let Some(before) = before {
+1654 | |                 let _ = before.recv().await;
+...    |
+1667 | |         });
+     | |__________^ future created by async block is not `Send`
+     |
+     = help: within `{async block@crates/kiln/src/harness/host.rs:1652:50: 1652:60}`, the trait `std::marker::Send` is not implemented for `*mut ()`
+note: future is not `Send` as this value is used across an await
+    --> crates/kiln/src/harness/host.rs:1869:142
+     |
+1865 | ...et mut core = s.core.lock();
+     |       -------- has type `parking_lot::lock_api::MutexGuard<'_, parking_lot::RawMutex, harness::core::Core>` which is not `Send`
+...
+1869 | ...et _ = self.sink.send((s.id.clone(), Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) })).await;
+     |                                                                                                                                    ^^^^^ await occurs here, with `mut core` maybe used later
+note: required by a bound in `spawn_owner`
+    --> crates/kiln/src/rt.rs:1397:45
+     |
+1397 | pub fn spawn_owner<F: Future<Output = ()> + Send + 'static>(shard: usize, fut: F) {
+     |                                             ^^^^ required by this bound in `spawn_owner`
+
+error[E0004]: non-exhaustive patterns: `harness::registry::Sent::Published(_)` and `harness::registry::Sent::PublicationRefused(_)` not covered
+    --> crates/kiln/src/harness/port.rs:37:19
+     |
+  37 |             match self.harness.command(self, id, command).await {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ patterns `harness::registry::Sent::Published(_)` and `harness::registry::Sent::PublicationRefused(_)` not covered
+     |
+note: `harness::registry::Sent` defined here
+    --> crates/kiln/src/harness/registry.rs:1383:10
+     |
+1383 | pub enum Sent {
+     |          ^^^^
+1384 |     /// The server committed custody; this is not receiver admission or model consumption.
+1385 |     Published(super::mail::Receipt),
+     |     --------- not covered
+1386 |     /// Custody was not accepted. The original sender must retain its complete communication.
+1387 |     PublicationRefused(super::mail::Error),
+     |     ------------------ not covered
+     = note: the matched value is of type `harness::registry::Sent`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+  46 ~                 registry::Sent::Refused(_) | registry::Sent::Unreachable => Sent::Unreachable,
+  47 ~                 harness::registry::Sent::Published(_) | harness::registry::Sent::PublicationRefused(_) => todo!(),
+     |
+
+warning: unused variable: `id`
+  --> crates/kiln/src/harness/port.rs:35:27
+   |
+35 |     fn send<'a>(&'a self, id: &'a str, command: Command) -> BoxFuture<'a, Sent> {
+   |                           ^^ help: if this is intentional, prefix it with an underscore: `_id`
+
+warning: unused variable: `command`
+  --> crates/kiln/src/harness/port.rs:35:40
+   |
+35 |     fn send<'a>(&'a self, id: &'a str, command: Command) -> BoxFuture<'a, Sent> {
+   |                                        ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command`
+
+error[E0004]: non-exhaustive patterns: `&harness::core::Update::MailFlow { .. }` not covered
+   --> crates/kiln/src/harness/weigh.rs:76:50
+    |
+ 76 |         size_of::<Update>().saturating_add(match self {
+    |                                                  ^^^^ pattern `&harness::core::Update::MailFlow { .. }` not covered
+    |
+note: `harness::core::Update` defined here
+   --> crates/kiln/src/harness/core.rs:140:10
+    |
+140 | pub enum Update {
+    |          ^^^^^^
+...
+185 |     MailFlow { event: Box<super::admission::FlowEvent> },
+    |     -------- not covered
+    = note: the matched value is of type `&harness::core::Update`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+    |
+ 86 ~             Update::Closed | Update::Reset { .. } => 0,
+ 87 ~             &harness::core::Update::MailFlow { .. } => todo!(),
+    |
+
+Some errors have detailed explanations: E0004, E0063, E0277, E0428, E0616.
+For more information about an error, try `rustc --explain E0004`.
+warning: `kiln` (lib) generated 3 warnings
+error: could not compile `kiln` (lib) due to 25 previous errors; 3 warnings emitted

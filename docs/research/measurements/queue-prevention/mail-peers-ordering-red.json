@@ -1,0 +1,13 @@
+{
+  "command": [
+    "nice",
+    "-n",
+    "10",
+    "/Users/adalundhe/.cache/kiln-offline-state-fix-20261110/red-target/debug/deps/kiln-a2cd230deb814ff5",
+    "--exact",
+    "harness::ops::end_to_end::mail_peers_capacity_survives_an_ordinary_owner_state",
+    "--test-threads=1"
+  ],
+  "exit_code": 101,
+  "expected_guard_failure": true
+}

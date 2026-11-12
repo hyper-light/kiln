@@ -277,6 +277,9 @@ impl Loop {
             Carried::Read(FromServer::Preview { req, session, ask }) => preview(shared, req, session, ask),
             Carried::Read(FromServer::Workspace { req, session, ask }) => workspace(shared, req, session, ask),
             Carried::Nothing(ServerMsg::HarnessTaskOutput { req, session, task, since }) => task_output(shared, req, session, task, since),
+            Carried::Nothing(ServerMsg::HarnessFile { session, file: f, offset, data, done }) => {
+                if let Some((code, why)) = file(shared, &session, &f, offset, &data, done) { tracing::warn!(%session, ?code, %why, "an untracked attachment piece was refused"); }
+            }
             // The fan hands a session loop no other (`crate::wire::fan::peek_server`).
             _ => tracing::warn!("a frame the server sent came to an agent session's loop that isn't one of a session's"),
         }
@@ -372,8 +375,7 @@ impl Loop {
                 (refused, Some(session))
             }
             Carried::Nothing(ServerMsg::HarnessFile { session, file: f, offset, data, done }) => {
-                file(shared, &session, &f, offset, &data, done);
-                (None, None)
+                (file(shared, &session, &f, offset, &data, done), None)
             }
             Carried::Nothing(ServerMsg::HarnessRelease { session }) => {
                 release(shared, &session);
@@ -471,11 +473,11 @@ pub(super) fn close(shared: &Shared, session: String) -> Refused {
 }
 
 /// A piece of a file a message to agent session `session` carries, kept.
-pub(super) fn file(shared: &Shared, session: &str, file: &str, offset: u64, data: &[u8], done: bool) {
-    if let Some(h) = &shared.harness
-        && let Err(e) = h.receive(session, file, offset, data, done)
-    {
-        tracing::warn!(%session, error = %format!("{e:#}"), "could not store an attachment");
+pub(super) fn file(shared: &Shared, session: &str, file: &str, offset: u64, data: &[u8], done: bool) -> Refused {
+    let Some(host) = &shared.harness else { return Some((crate::wire::channel::Refusal::Unknown, "attachment storage is unavailable on this runner".into())) };
+    match host.receive(session, file, offset, data, done) {
+        Ok(()) => None,
+        Err(_) => Some((crate::wire::channel::Refusal::Refused, "attachment storage refused the piece; the original communication remains retained".into())),
     }
 }
 

@@ -1,0 +1,160 @@
+
+running 48 tests
+test harness::mail_delivery::tests::unknown_recipient_refuses_new_custody_but_keeps_an_existing_exact_receipt ... ok
+test harness::ops::end_to_end::a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication ... FAILED
+test harness::ops::end_to_end::a_child_asked_for_more_than_its_parent_has_is_refused_and_one_within_it_starts ... ok
+test harness::ops::end_to_end::a_fellow_agents_message_is_its_words_whatever_kiln_says_of_its_sender ... ok
+test harness::ops::end_to_end::a_key_given_to_a_plan_run_in_one_mode_is_refused_in_another ... ok
+test harness::ops::end_to_end::a_key_given_to_another_plan_run_is_refused ... ok
+test harness::ops::end_to_end::a_keyed_plan_run_retried_after_its_agent_moved_is_the_same_run ... ok
+test harness::ops::end_to_end::a_keyed_send_retried_after_its_sender_moved_is_the_same_message ... ok
+test harness::ops::end_to_end::a_message_from_a_fellow_agent_says_who_sent_it_and_how_to_answer ... ok
+test harness::ops::end_to_end::a_stale_inbox_epoch_preserves_custody_without_changing_the_current_owner ... ok
+test harness::ops::end_to_end::agents_send_twice_with_one_key_is_one_prompt_and_both_get_its_answer ... ok
+test harness::ops::end_to_end::an_agent_held_to_fewer_subagents_starts_no_more_through_kiln ... ok
+test harness::ops::end_to_end::bypass_needs_the_parent_s_own_and_chains_and_children_are_bounded ... ok
+test harness::ops::end_to_end::cp_t3_2_agent_messages_steer_a_busy_peer_without_building_a_backlog ... ok
+test harness::ops::end_to_end::cp_t3_2_an_agent_steers_peers_but_stops_only_its_own ... ok
+test harness::ops::end_to_end::g10_a2c_agents_get_and_result_read_nothing_back_on_the_requests_shard ... ok
+test harness::ops::end_to_end::g9_s3_agents_list_lists_what_it_listed_for_agents_and_people ... ok
+test harness::ops::end_to_end::g9_s5_a_list_for_whoever_sees_every_session_is_the_copied_lists ... ok
+test harness::ops::end_to_end::wait_handoff_budget_includes_the_complete_wait_response ... ok
+test harness::ops::end_to_end::wait_response_stages_exact_ids_and_can_withdraw_unregistered_mail ... ok
+test harness::ops::tests::a_key_is_whose_it_is_wherever_they_call_from ... ok
+test harness::ops::tests::a_publication_keeps_send_aliases_without_inventing_receiver_acceptance ... ok
+test harness::ops::tests::a_wait_is_a_change_and_a_result_a_read ... ok
+test harness::ops::tests::about_asks_what_was_tapped_in_the_four_parts_the_card_reads ... ok
+test harness::ops::tests::g10_s5_agents_list_makes_its_briefs_off_the_shard ... ok
+test harness::ops::tests::no_operation_answers_for_a_person ... ok
+test harness::ops::tests::status_is_only_explicit_and_does_not_reuse_the_publication_key ... ok
+test harness::ops::tests::waits_say_whom_they_wait_for ... ok
+test harness::port::tests::kiln_s_registry_holds_every_harness_port_clause ... ok
+test harness::session::tests::accepted_queue_edit_reserves_growth_and_journals_before_adapter_mutation ... ok
+test harness::session::tests::accepted_queue_shrink_grants_retry_credit_only_after_cas_and_actual_owner_apply ... ok
+test harness::wait::tests::a_later_index_page_can_wake_a_wait_without_claiming_mail ... ok
+test harness::wait::tests::a_message_on_its_way_keeps_an_idle_agent_working_until_its_turn_ends ... ok
+test harness::wait::tests::a_partial_mail_probe_is_consumed_only_by_its_queue_revision ... ok
+test harness::wait::tests::a_quiet_wait_has_only_its_initial_and_final_snapshot ... ok
+test harness::wait::tests::a_source_read_cannot_outlive_the_wait_deadline ... ok
+test harness::wait::tests::a_wait_ends_when_a_message_from_another_agent_waits_in_the_waiter_s_queue ... ok
+test harness::wait::tests::a_wait_hands_over_others_messages_to_its_own_turn_each_once_as_many_as_fit ... ok
+test harness::wait::tests::a_wait_returns_when_its_agents_settle_or_its_time_is_up ... ok
+test harness::wait::tests::concurrent_handoff_claims_are_recipient_scoped_and_end_with_request ... ok
+test harness::wait::tests::deferred_approvals_still_need_a_person ... ok
+test harness::wait::tests::handoff_digest_binds_exact_response_and_normalizes_object_order ... ok
+test harness::wait::tests::malformed_or_oversized_handoff_payload_is_not_a_digest ... ok
+test harness::wait::tests::mc_attention_wait_a_persons_pause_wins_over_live_work_until_resumed ... ok
+test harness::wait::tests::mc_attention_wait_pause_flags_preserve_exit_offline_and_usage_semantics ... ok
+test harness::wait::tests::mc_attention_wait_queued_input_and_room_wait_stay_working_until_cleared ... ok
+test harness::wait::tests::mc_attention_wait_requests_and_held_goals_win_over_pause_and_pending_work ... ok
+test harness::wait::tests::where_an_agent_stands_in_a_word ... ok
+
+failures:
+
+---- harness::ops::end_to_end::a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication stdout ----
+Error: correlated durable source receipt: source protocol deadline; expected_consumed=true; [busy-diagnostic] {"phase":"next-goal-consumed","message":"goal-01a1ca40e64f7301bfe16151b4b7efca","recipient":"01a1ca40e426728a9244ba59ef9f0184","fixture":"/var/folders/1s/ldpdh04d7d7219qts5t19d7h0000gn/T/.tmpGHXg3j","process":3198,"runtime_shard":0,"projected":{"status":"idle","epoch":0,"queued":0,"queue_ids":[],"partial":false,"said_ids":["goal-01a1ca40e5fa7624a600ef7eb246217f"],"pause":false,"frozen":null,"room_wait":null,"approvals":0,"objective":false,"turn_started":null,"last_turn":{"at":1794394613321,"how":"done"},"capacity":{"epoch":0,"generation":30,"retry_generation":5,"learning":"bootstrap","target":2,"admitted":0,"bytes":0,"peers":1}},"local":{"status":"idle","epoch":0,"queue_ids":[],"delivery":null,"turn_started":null,"last_turn":{"at":1794394613321,"how":"done"},"pause":false,"frozen":null,"room_wait":null,"approvals":0,"objective":false,"writes":0,"input_receipts":0,"input_stages":[],"input_retained":[],"legacy_flights":0},"input":{"writes_ready":true,"capacity":{"epoch":0,"generation":32,"retry_generation":5,"learning":"bootstrap","target":2,"admitted":0,"bytes":0,"peers":1,"eligible_peer":"server","feedback_generation":32},"lease":null},"ledger":{"mail":[{"id":"4a9fd7c8c96e8abda018c7211dd8f475","revision":1,"generation":1,"disposition":"consumed","epoch":0,"frozen":true,"retry_generation":1,"connection":true},{"id":"goal-01a1ca40e5fa7624a600ef7eb246217f","revision":2,"generation":1,"disposition":"consumed","epoch":0,"frozen":true,"retry_generation":1,"connection":true},{"id":"from-agent-01a1ca40e6027009ae4c1caba9f9eafd-c94554225258811cbdae22f53b36cf3b","revision":3,"generation":1,"disposition":"consumed","epoch":0,"frozen":true,"retry_generation":3,"connection":true},{"id":"a1bcbba5394b88ed98835b68acefe681","revision":4,"generation":0,"disposition":"superseded","epoch":null,"frozen":false,"retry_generation":null,"connection":false},{"id":"c65d0c740451864fb2d463f61e68bbd7","revision":5,"generation":1,"disposition":"consumed","epoch":0,"frozen":true,"retry_generation":4,"connection":true},{"id":"goal-01a1ca40e64f7301bfe16151b4b7efca","revision":6,"generation":0,"disposition":"waiting","epoch":null,"frozen":false,"retry_generation":null,"connection":false}],"goals":[{"id":"01a1ca40e5f8702091b6b9498cbc8e70","status":"met","how_present":true,"sent_id":"goal-01a1ca40e5fa7624a600ef7eb246217f","send_id":null},{"id":"01a1ca40e5f87020941dd83b56b47032","status":"active","how_present":true,"sent_id":"goal-01a1ca40e64f7301bfe16151b4b7efca","send_id":null}]},"native_ids":["4a9fd7c8c96e8abda018c7211dd8f475","goal-01a1ca40e5fa7624a600ef7eb246217f","from-agent-01a1ca40e6027009ae4c1caba9f9eafd-c94554225258811cbdae22f53b36cf3b","c65d0c740451864fb2d463f61e68bbd7"],"headroom_held":false,"process_input_bytes":0,"process_input_bound":19619268900,"mail_store_revision":47}
+
+Stack backtrace:
+   0: std::backtrace_rs::backtrace::libunwind::trace
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1: std::backtrace_rs::backtrace::trace_unsynchronized::<<std::backtrace::Backtrace>::create::{closure#0}>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2: <std::backtrace::Backtrace>::create
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/backtrace.rs:331:13
+   3: <std::backtrace::Backtrace>::capture
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/backtrace.rs:296:9
+   4: msg<alloc::string::String>
+             at /Users/adalundhe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.104/src/backtrace.rs:10:14
+   5: {async_fn#0}
+             at ./crates/kiln/src/harness/ops.rs:2075:31
+   6: {async_block#1}
+             at ./crates/kiln/src/harness/ops.rs:2186:93
+   7: {async_block#0}
+             at ./crates/kiln/src/harness/ops.rs:2189:15
+   8: poll<kiln::harness::ops::end_to_end::a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication::{async_block_env#0}>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panic/unwind_safe.rs:300:9
+   9: {closure#0}<core::panic::unwind_safe::AssertUnwindSafe<kiln::harness::ops::end_to_end::a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication::{async_block_env#0}>>
+             at /Users/adalundhe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.34/src/future/future/catch_unwind.rs:37:44
+  10: call_once<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, futures_util::future::future::catch_unwind::{impl#1}::poll::{closure_env#0}<core::panic::unwind_safe::AssertUnwindSafe<kiln::harness::ops::end_to_end::a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication::{async_block_env#0}>>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panic/unwind_safe.rs:275:9
+  11: do_call<core::panic::unwind_safe::AssertUnwindSafe<futures_util::future::future::catch_unwind::{impl#1}::poll::{closure_env#0}<core::panic::unwind_safe::AssertUnwindSafe<kiln::harness::ops::end_to_end::a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication::{async_block_env#0}>>>, core::task::poll::Poll<core::result::Result<(), anyhow::Error>>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:576:43
+  12: ___rust_try
+  13: catch_unwind<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, core::panic::unwind_safe::AssertUnwindSafe<futures_util::future::future::catch_unwind::{impl#1}::poll::{closure_env#0}<core::panic::unwind_safe::AssertUnwindSafe<kiln::harness::ops::end_to_end::a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication::{async_block_env#0}>>>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:544:19
+  14: catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<futures_util::future::future::catch_unwind::{impl#1}::poll::{closure_env#0}<core::panic::unwind_safe::AssertUnwindSafe<kiln::harness::ops::end_to_end::a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication::{async_block_env#0}>>>, core::task::poll::Poll<core::result::Result<(), anyhow::Error>>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panic.rs:359:14
+  15: poll<core::panic::unwind_safe::AssertUnwindSafe<kiln::harness::ops::end_to_end::a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication::{async_block_env#0}>>
+             at /Users/adalundhe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.34/src/future/future/catch_unwind.rs:37:9
+  16: {async_block#1}<(), kiln::harness::ops::end_to_end::a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication::{async_block_env#0}>
+             at ./crates/kiln/src/rt.rs:1457:74
+  17: poll<alloc::boxed::Box<(dyn core::future::future::Future<Output=()> + core::marker::Send), alloc::alloc::Global>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/future/future.rs:133:9
+  18: {async_block#0}
+             at ./crates/kiln/src/rt.rs:1194:17
+  19: poll
+             at ./crates/kiln-rt/src/task.rs:39:58
+  20: {closure#0}
+             at ./crates/kiln-rt/src/shard_loop.rs:2372:55
+  21: call_once<core::task::poll::Poll<()>, hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panic/unwind_safe.rs:275:9
+  22: do_call<core::panic::unwind_safe::AssertUnwindSafe<hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>, core::task::poll::Poll<()>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:576:43
+  23: ___rust_try
+  24: catch_unwind<core::task::poll::Poll<()>, core::panic::unwind_safe::AssertUnwindSafe<hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:544:19
+  25: catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>, core::task::poll::Poll<()>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panic.rs:359:14
+  26: contained<core::task::poll::Poll<()>, hyper_rt::shard_loop::{impl#4}::poll_slot::{closure_env#0}>
+             at ./crates/kiln-rt/src/unwind.rs:12:11
+  27: poll_slot
+             at ./crates/kiln-rt/src/shard_loop.rs:2372:20
+  28: poll_batch_in
+             at ./crates/kiln-rt/src/shard_loop.rs:1505:30
+  29: {closure#0}
+             at ./crates/kiln-rt/src/shard_loop.rs:1474:66
+  30: {closure#0}<hyper_rt::shard_loop::Shard, (bool, core::option::Option<u64>), hyper_rt::shard_loop::{impl#4}::poll_batch::{closure_env#0}>
+             at ./crates/kiln-rt/src/registry.rs:926:35
+  31: try_with<core::cell::Cell<*const hyper_rt::shard::ShardContext>, hyper_rt::registry::with_current_cell::{closure_env#0}<hyper_rt::shard_loop::Shard, (bool, core::option::Option<u64>), hyper_rt::shard_loop::{impl#4}::poll_batch::{closure_env#0}>, (bool, core::option::Option<u64>)>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/thread/local.rs:463:12
+  32: with_current_cell<hyper_rt::shard_loop::Shard, (bool, core::option::Option<u64>), hyper_rt::shard_loop::{impl#4}::poll_batch::{closure_env#0}>
+             at ./crates/kiln-rt/src/registry.rs:926:19
+  33: poll_batch
+             at ./crates/kiln-rt/src/shard_loop.rs:1474:9
+  34: step_after
+             at ./crates/kiln-rt/src/shard_loop.rs:1438:35
+  35: run
+             at ./crates/kiln-rt/src/shard_loop.rs:1030:40
+  36: run_worker
+             at ./crates/kiln-rt/src/runtime.rs:464:11
+  37: {closure#1}
+             at ./crates/kiln-rt/src/runtime.rs:595:32
+  38: __rust_begin_short_backtrace<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/sys/backtrace.rs:166:18
+  39: {closure#0}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/thread/lifecycle.rs:70:13
+  40: call_once<core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>, std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panic/unwind_safe.rs:275:9
+  41: do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>>, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:576:43
+  42: ___rust_try
+  43: catch_unwind<core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>, core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:544:19
+  44: catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>>, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panic.rs:359:14
+  45: {closure#1}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/thread/lifecycle.rs:68:26
+  46: call_once<std::thread::lifecycle::spawn_unchecked::{closure_env#1}<hyper_rt::runtime::{impl#3}::start_with::{closure_env#1}, core::result::Result<hyper_rt::shard_loop::Counters, hyper_rt::error::RtError>>, ()>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ops/function.rs:250:5
+  47: <alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/boxed.rs:2320:9
+  48: <std::sys::thread::unix::Thread>::new::thread_start
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/sys/thread/unix.rs:123:17
+  49: __pthread_cond_wait
+
+
+failures:
+    harness::ops::end_to_end::a_busy_coordinator_bounds_custody_and_retries_the_exact_blocked_communication
+
+test result: FAILED. 47 passed; 1 failed; 0 ignored; 0 measured; 4185 filtered out; finished in 35.40s
+

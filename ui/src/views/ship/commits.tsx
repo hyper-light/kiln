@@ -12,11 +12,11 @@ import * as React from "react";
 import { whoSaid } from "@/api/review";
 import type { ShipCommit, ShipQuery } from "@/api/ship";
 import { Loading } from "@/components/ui/loading";
+import { Pager, PerPicker, type PerPage } from "@/components/ui/pager";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { STATES, type GlyphState } from "@/components/ui/status-glyph-spec";
 import { formatDuration, spanSeconds } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
-import { sendingProps } from "@/lib/action";
 import { useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "../shared";
 import { SectionHead } from "./head";
@@ -25,9 +25,7 @@ import { pageOpts, shipCommits } from "./live";
 /** The facets the server narrows a repository's commits by: the list's own (host, kind). */
 export type Narrow = Pick<ShipQuery, "host" | "kind">;
 
-/** A page's sizes, as the strip offers them. */
-export const PER_PAGE = [5, 10, 25, 50, 100] as const;
-export type PerPage = (typeof PER_PAGE)[number];
+export { PER_PAGE, type PerPage } from "@/components/ui/pager";
 
 /** What turns the page: Newer, Older, or a page's size. */
 type Turn = "newer" | "older" | PerPage;
@@ -173,17 +171,7 @@ function Frame({
   return (
     <section aria-label="Commits" className="ship-sec ship-commits">
       <SectionHead label="Commits">
-        <span className="sc-per" role="group" aria-label="Commits a page">
-          <span>per page</span>
-          {PER_PAGE.map((n, i) => (
-            <React.Fragment key={n}>
-              {i > 0 && <span aria-hidden="true">·</span>}
-              <button type="button" aria-pressed={per === n} aria-label={`${n} a page`} disabled={onPer === null} {...sendingProps(turning === n)} onClick={() => onPer?.(n)}>
-                {n}
-              </button>
-            </React.Fragment>
-          ))}
-        </span>
+        <PerPicker className="sc-per" per={per} onPer={onPer} label="Commits a page" turning={typeof turning === "number" ? turning : null} />
       </SectionHead>
       <div className="sc-body">
         <div className="sc-h" aria-hidden="true">
@@ -198,15 +186,7 @@ function Frame({
         <ol className="sc-list" aria-label={`${repo}'s commits`} style={{ "--sc-per": per } as React.CSSProperties}>
           {children}
         </ol>
-        <div className="sc-pager">
-          <button type="button" disabled={newer === null} {...sendingProps(turning === "newer")} onClick={() => newer?.()}>
-            Newer
-          </button>
-          <span>{range}</span>
-          <button type="button" disabled={older === null} {...sendingProps(turning === "older")} onClick={() => older?.()}>
-            Older
-          </button>
-        </div>
+        <Pager className="sc-pager" back={newer} range={range} on={older} words={["Newer", "Older"]} turning={turning === "newer" ? "back" : turning === "older" ? "on" : null} />
       </div>
     </section>
   );

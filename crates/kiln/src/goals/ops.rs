@@ -237,10 +237,11 @@ async fn dispatch(hub: &crate::hub::Hub, agent: &str, p: &super::Planned) -> Res
     let id = format!("{}plan-{}", crate::harness::pause::KILN_ID, crate::util::derive_id(&["goals.plan.dispatch", &p.plan, &asked.map(|a| a.to_string()).unwrap_or_default()]));
     let send = crate::harness::model::Command::Send { id, text: dispatch_words(p), mode: crate::harness::model::SendMode::Steer, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
     match hub.harness.command(hub, agent, send).await {
-        crate::harness::registry::Sent::Ok | crate::harness::registry::Sent::Accepted(_) | crate::harness::registry::Sent::Taken | crate::harness::registry::Sent::Parked => {
+        crate::harness::registry::Sent::Ok | crate::harness::registry::Sent::Accepted(_) | crate::harness::registry::Sent::Taken | crate::harness::registry::Sent::Parked | crate::harness::registry::Sent::Published(_) => {
             let _ = hub.store.kv_set(key, now.to_string()).await;
             Ok(())
         }
+        crate::harness::registry::Sent::PublicationRefused(error) => Err(error.to_string()),
         crate::harness::registry::Sent::Refused(why) => Err(format!("its agent's inbox refused it ({why}), so it's planned when the stack gets to it")),
         s @ (crate::harness::registry::Sent::Rejected { .. } | crate::harness::registry::Sent::Unanswered(_)) => {
             Err(format!("{}, so it's planned when the stack gets to it", s.failure().map_or_else(|| "its agent's runner refused it".to_owned(), |(_, why)| why)))
@@ -693,12 +694,16 @@ mod tests {
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
             });
-            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move { let _ = crate::harness::mail_delivery::run(h).await; });
             let folder = tempfile::tempdir()?;
+            let (program, _) = crate::harness::ops::end_to_end::recording_program(folder.path(), true)?;
+            hub.harness.set_test_program(&program.to_string_lossy());
             let cwd = folder.path().to_string_lossy().into_owned();
             let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd.clone()), name: Some("A".into()), count: Some(1), ..Ask::default() };
             let a = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?;
+            stopped(&hub, &a.id).await?;
             let p = crate::plans::create(&hub, crate::plans::New { title: "Tidy".into(), body: "- one\n- two\n".into(), ..Default::default() }, "admin").await?;
             let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let run = |input: Value| {
@@ -709,18 +714,34 @@ mod tests {
             let first = run(json!({"id": p.id, "session": a.id, "mode": "steps", "key": "tidy-1"})).await?;
             let again = run(json!({"id": p.id, "session": a.id, "mode": "steps", "key": "tidy-1"})).await?;
             assert_eq!(first, again, "answered as it was");
-            assert_eq!(first.get("sent"), Some(&json!(2)));
-            let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
-            assert_eq!(inbox.taken(&a.id, 100).await?.len(), 2, "its two messages, once each");
+            assert_eq!(first.get("sent").and_then(Value::as_u64).unwrap_or(0) + first.get("retained").and_then(Value::as_u64).unwrap_or(0), 2, "exactly two custody receipts: {first}");
+            assert_eq!(taken_by(&hub, &a.id, 2).await?.len(), 2, "its two messages, once each");
             // Without a key, another run.
             let other = run(json!({"id": p.id, "session": a.id, "mode": "steps"})).await?;
             assert_ne!(other.get("run"), first.get("run"));
-            // On a new agent: one agent, once.
+            assert_eq!(taken_by(&hub, &a.id, 4).await?.len(), 4, "each distinct run's two native inputs, in order once");
+            // A new recipient uses the same immutable index-zero publication as an existing
+            // recipient. Wait for actual native completion, then retry the key without another agent.
             let agents = hub.harness.list().len();
             let made = run(json!({"id": p.id, "new": {"target": "local", "kind": "claude", "cwd": cwd}, "mode": "message", "key": "tidy-2"})).await?;
+            let created = made.get("session").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no new recipient: {made}"))?.to_owned();
+            let created_run = made.get("run").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no new run: {made}"))?.to_owned();
+            let first_id = crate::util::derive_id(&["plan-run", &created_run, "0"]);
+            crate::harness::ops::end_to_end::source_disposition(&hub, &created, &first_id, true).await?;
+            let original = crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), created.clone(), first_id.clone()).await?.ok_or_else(|| anyhow::anyhow!("new-agent first input has no durable receipt"))?;
+            assert_eq!(original.disposition, crate::harness::mail::Disposition::Consumed);
             let made_again = run(json!({"id": p.id, "new": {"target": "local", "kind": "claude", "cwd": cwd}, "mode": "message", "key": "tidy-2"})).await?;
-            assert_eq!(made, made_again);
+            assert_eq!((made.get("run"), made.get("session")), (made_again.get("run"), made_again.get("session")), "immutable run/recipient identity");
+            for answer in [&made, &made_again] {
+                assert_eq!(answer.get("sent").and_then(Value::as_u64).unwrap_or(0) + answer.get("retained").and_then(Value::as_u64).unwrap_or(0), 1, "one actual custody receipt: {answer}");
+            }
+            let repeated = crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), created.clone(), first_id.clone()).await?.ok_or_else(|| anyhow::anyhow!("new-agent receipt disappeared"))?;
+            assert_eq!((original.id, original.revision), (repeated.id, repeated.revision));
             assert_eq!(hub.harness.list().len(), agents + 1, "one agent started");
+            let created_inbox = hub.harness.local.inbox().ok_or_else(|| anyhow::anyhow!("no source inbox"))?.taken(&created, 100).await?;
+            assert_eq!(created_inbox, std::slice::from_ref(&first_id), "one native publication under the run's canonical identity");
+            let native = crate::harness::ops::end_to_end::prompts(&folder.path().join("heard.jsonl"));
+            assert_eq!(native.iter().filter(|id| *id == &first_id).count(), 1, "new-target key retry repeated native input");
             // As goals: added once.
             let goals = run(json!({"id": p.id, "session": a.id, "mode": "goals", "key": "tidy-3"})).await?;
             let goals_again = run(json!({"id": p.id, "session": a.id, "mode": "goals", "key": "tidy-3"})).await?;
@@ -743,6 +764,47 @@ mod tests {
                 let again = run(input).await.map_err(|e| e.to_string());
                 anyhow::ensure!(first.is_err() && again == first, "{first:?}, then {again:?}");
             }
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: two parallel steps form one immutable round communication. A keyed replay
+    /// counts that communication, rather than inventing a missing second receipt from step count.
+    #[test]
+    fn a_keyed_parallel_plan_round_replays_its_one_immutable_publication() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, folder) = stopped_agent().await?;
+            let plan = crate::plans::create(&hub, crate::plans::New {
+                title: "Parallel round".into(),
+                items: vec![
+                    crate::plans::Item { title: "Build the engine".into(), ..Default::default() },
+                    crate::plans::Item { title: "Build the view".into(), ..Default::default() },
+                    crate::plans::Item { title: "Integrate both".into(), needs: vec![1, 2], ..Default::default() },
+                ],
+                ..Default::default()
+            }, "admin").await?;
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let input = json!({"id": plan.id, "session": id, "mode": "steps", "only": [1, 2], "key": "parallel-round"});
+            let first = call(person.clone(), "plans.run", input.clone()).await.map_err(|(status, error)| anyhow::anyhow!("first round: {status}: {error}"))?;
+            let run = first.get("run").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no run: {first}"))?.to_owned();
+            let message = crate::util::derive_id(&["plan-run", &run, "0"]);
+            crate::harness::ops::end_to_end::source_disposition(&hub, &id, &message, true).await?;
+            let original = crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), id.clone(), message.clone()).await?.ok_or_else(|| anyhow::anyhow!("no round receipt"))?;
+            assert_eq!(original.disposition, crate::harness::mail::Disposition::Consumed);
+            // This was the real bug: claim used selected step count=2 and looked for an
+            // index-one receipt, even though the native provider consumed the one round.
+            let again = call(person, "plans.run", input).await.map_err(|(status, error)| anyhow::anyhow!("keyed round replay: {status}: {error}"))?;
+            assert_eq!((first.get("run"), first.get("session")), (again.get("run"), again.get("session")));
+            for answer in [&first, &again] {
+                assert_eq!(answer.get("sent").and_then(Value::as_u64).unwrap_or(0) + answer.get("retained").and_then(Value::as_u64).unwrap_or(0), 1, "one round publication: {answer}");
+            }
+            let repeated = crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), id.clone(), message.clone()).await?.ok_or_else(|| anyhow::anyhow!("round receipt disappeared"))?;
+            assert_eq!((original.id, original.revision), (repeated.id, repeated.revision));
+            let missing = crate::util::derive_id(&["plan-run", &run, "1"]);
+            assert!(crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), id.clone(), missing).await?.is_none(), "there is no second communication in this round");
+            let taken = hub.harness.local.inbox().ok_or_else(|| anyhow::anyhow!("no source inbox"))?.taken(&id, 100).await?;
+            assert_eq!(taken, std::slice::from_ref(&message));
+            assert_eq!(crate::harness::ops::end_to_end::prompts(&folder.path().join("heard.jsonl")), [message], "the native round is delivered once");
             Ok(())
         })
     }
@@ -795,8 +857,8 @@ mod tests {
         })
     }
 
-    /// A hub whose agent's harness is a program that isn't there (it stands stopped, and a message
-    /// waits in its queue), as the tests above have it.
+    /// A hub with an initialized protocol provider that completes actual correlated inputs.
+    /// Goal lifecycle remains controlled solely by each test's operations.
     async fn stopped_agent() -> anyhow::Result<(Arc<crate::hub::Hub>, String, tempfile::TempDir)> {
         let hub = crate::hub::tests::scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |c| {
             c.terminal.enabled = true;
@@ -807,8 +869,11 @@ mod tests {
         crate::rt::spawn(async move {
             let _ = crate::harness::registry::Registry::run_local(h).await;
         });
-        hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+        let h = Arc::clone(&hub);
+        crate::rt::spawn(async move { let _ = crate::harness::mail_delivery::run(h).await; });
         let folder = tempfile::tempdir()?;
+        let (program, _) = crate::harness::ops::end_to_end::recording_program(folder.path(), true)?;
+        hub.harness.set_test_program(&program.to_string_lossy());
         let cwd = folder.path().to_string_lossy().into_owned();
         let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
         let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };
@@ -817,51 +882,57 @@ mod tests {
         Ok((hub, a.id, folder))
     }
 
-    /// Waits (30 s at the most) until agent `id` is listed and stopped, as these tests start from.
-    /// A stack started before then has no agent to send its goal to, and on the tests' clock, which
-    /// only a test moves, the driver doesn't come round to send it later: the goals stay pending.
+    /// A real initialized provider and its current same-epoch source capacity.
     async fn stopped(hub: &Arc<crate::hub::Hub>, id: &str) -> anyhow::Result<()> {
-        let until = std::time::Instant::now() + Duration::from_secs(30);
-        while !hub.harness.info(id).is_some_and(|i| i.status == crate::harness::model::Status::Exited) {
-            anyhow::ensure!(std::time::Instant::now() < until, "agent {id} never stopped: {:?}", hub.harness.info(id).map(|i| i.status));
-            crate::rt::sleep(Duration::from_millis(20)).await;
-        }
-        Ok(())
+        crate::harness::ops::end_to_end::source_ready(hub, id).await?;
+        // Bootstrap credit is advertised before native initialize completes. Goal pushes
+        // deliberately wait while Starting; this fixture has no background goal driver.
+        crate::harness::ops::end_to_end::source_until(hub, id, "initialized goal provider", || async {
+            Ok(hub.harness.info(id).is_some_and(|info| info.status == crate::harness::model::Status::Idle)
+                && hub.harness.local.get(id).is_some_and(|session| session.core.lock().state.status == crate::harness::model::Status::Idle))
+        }).await
     }
 
-    /// What agent `id`'s inbox took once it took `n`, given 10 s (a loaded machine takes a while
-    /// to prompt it; a test with several still ends within its 90 s), each message then taken out
-    /// of its queue as its harness would take it, and the agent stopped again.
     async fn taken_by(hub: &Arc<crate::hub::Hub>, id: &str, n: usize) -> anyhow::Result<Vec<String>> {
-        taken_within(hub, id, n, Duration::from_secs(10)).await
+        taken_settled(hub, id, n).await
     }
 
-    /// What agent `id`'s inbox took, given 2 s for an `n`th that mustn't come: a request asked again
-    /// that would prompt it a second time.
-    async fn taken_no_more(hub: &Arc<crate::hub::Hub>, id: &str, n: usize) -> anyhow::Result<Vec<String>> {
-        taken_within(hub, id, n, Duration::from_secs(2)).await
+    /// The awaited operation has committed its publications. Settle all of them, including
+    /// an unexpected extra, before asserting that a retry added no native input.
+    async fn taken_no_more(hub: &Arc<crate::hub::Hub>, id: &str, forbidden: usize) -> anyhow::Result<Vec<String>> {
+        taken_settled(hub, id, forbidden.checked_sub(1).ok_or_else(|| anyhow::anyhow!("a negative count has no expected predecessor"))?).await
     }
 
-    async fn taken_within(hub: &Arc<crate::hub::Hub>, id: &str, n: usize, within: Duration) -> anyhow::Result<Vec<String>> {
+    async fn taken_settled(hub: &Arc<crate::hub::Hub>, id: &str, expected: usize) -> anyhow::Result<Vec<String>> {
         let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
-        let until = std::time::Instant::now() + within;
-        let mut taken;
-        loop {
-            taken = inbox.taken(id, 100).await?;
-            if taken.len() >= n || std::time::Instant::now() >= until {
-                break;
+        crate::harness::ops::end_to_end::source_until(hub, id, "all goal publications consumed", || {
+            let recipient = id.to_owned();
+            async move {
+                let consumed = hub.store.read(move |connection| {
+                    let (total, pending) = connection.query_row("SELECT COUNT(*),COALESCE(SUM(disposition IN ('waiting','dispatched','admitted')),0) FROM agent_mail WHERE recipient=?1", [recipient], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+                    Ok(usize::try_from(total).is_ok_and(|total| total >= expected) && pending == 0)
+                }).await?;
+                if !consumed { return Ok(false); }
+                // The receipt commit can precede the owner's Idle state in the same batch.
+                // Settle that projection before the existing clock-skew fixture injects a turn.
+                let Some(session) = hub.harness.local.get(id) else { return Ok(false) };
+                let current = { let core = session.core.lock(); (core.state.status, core.state.last_turn.clone(), core.state.turn_started, core.state.summary.clone()) };
+                Ok(current.0 == crate::harness::model::Status::Idle && current.1.is_some()
+                    && hub.harness.info(id).is_some_and(|info| info.status == current.0 && info.last_turn == current.1 && info.turn_started == current.2 && info.summary == current.3))
             }
-            crate::rt::sleep(Duration::from_millis(20)).await;
-        }
-        for m in &taken {
-            let _ = hub.harness.command(hub, id, crate::harness::model::Command::QueueRemove { id: m.clone() }).await;
-        }
-        for _ in 0..200 {
-            if hub.harness.info(id).is_some_and(|i| i.status == crate::harness::model::Status::Exited && i.queue.is_empty()) {
-                break;
-            }
-            crate::rt::sleep(Duration::from_millis(20)).await;
-        }
+        }).await.map_err(|error| anyhow::anyhow!("{error}; goal source={:?}, local={:?}", hub.harness.info(id).map(|info| (info.status, info.queued, info.last_turn)), hub.harness.local.get(id).map(|session| { let core = session.core.lock(); (core.state.status, core.state.queue.len(), core.state.last_turn.clone()) })))?;
+        let recipient = id.to_owned();
+        let history: Vec<(String, String)> = hub.store.read(move |connection| {
+            let mut statement = connection.prepare("SELECT id,disposition FROM agent_mail WHERE recipient=?1 ORDER BY revision")?;
+            Ok(statement.query_map([recipient], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
+        }).await?;
+        let taken = inbox.taken(id, 100).await?;
+        let session = hub.harness.local.get(id).ok_or_else(|| anyhow::anyhow!("no source"))?;
+        let program = session.spec.lock().program.clone().ok_or_else(|| anyhow::anyhow!("no protocol fixture"))?;
+        let heard = std::path::Path::new(&program).parent().ok_or_else(|| anyhow::anyhow!("no fixture directory"))?.join("heard.jsonl");
+        let native: Vec<String> = crate::harness::ops::end_to_end::prompts(&heard).into_iter().filter(|message| taken.contains(message)).collect();
+        anyhow::ensure!(taken.len() == expected && native == taken, "expected {expected} native goal inputs, Inbox {taken:?}, native {native:?}, terminal history {history:?}");
+        anyhow::ensure!(session.core.lock().state.queue.is_empty(), "consumed goal input remains queued");
         Ok(taken)
     }
 
@@ -979,8 +1050,11 @@ mod tests {
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
             });
-            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move { let _ = crate::harness::mail_delivery::run(h).await; });
             let folder = tempfile::tempdir()?;
+            let (program, _) = crate::harness::ops::end_to_end::recording_program(folder.path(), true)?;
+            hub.harness.set_test_program(&program.to_string_lossy());
             let cwd = folder.path().to_string_lossy().into_owned();
             let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };
@@ -1107,8 +1181,11 @@ mod tests {
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
             });
-            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move { let _ = crate::harness::mail_delivery::run(h).await; });
             let folder = tempfile::tempdir()?;
+            let (program, _) = crate::harness::ops::end_to_end::recording_program(folder.path(), true)?;
+            hub.harness.set_test_program(&program.to_string_lossy());
             let cwd = folder.path().to_string_lossy().into_owned();
             let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };

@@ -382,6 +382,8 @@ impl Mode {
 pub struct Ran {
     pub session: String,
     pub sent: usize,
+    /// Durable server custody, pending receiver admission.
+    pub retained: usize,
     pub run: String,
     /// As goals, split into its acceptance criteria and tests: how many steps were.
     #[serde(skip_serializing_if = "is_zero")]
@@ -1128,6 +1130,35 @@ async fn start_for(hub: &Hub, by: &crate::harness::lineage::Starter, target: Str
     infos.into_iter().next().map(|i| i.id).ok_or_else(|| Error::Bad("the agent did not start".into()))
 }
 
+/// A new agent publishes bootstrap credit asynchronously. Listen before checking the
+/// current owner, so the plan uses the normal durable publication path for its first input.
+async fn new_recipient_ready(hub: &Hub, session: &str) -> R<()> {
+    use futures::future::{Either, select};
+    use kiln_seams::Bus as _;
+    let unavailable = |why: &str| Error::Refused(http::StatusCode::SERVICE_UNAVAILABLE, why.to_owned());
+    let crate::harness::registry::Attachment { snapshot, topic, at, viewer, refusals, .. } = hub.harness.attach(session).ok_or_else(|| unavailable("the new run recipient has no live source feed; its run and agent remain recorded"))?;
+    drop(snapshot);
+    let mut at = at.ok_or_else(|| unavailable("the new run recipient's source feed is unavailable; its run and agent remain recorded"))?;
+    let operation = async {
+        loop {
+            if crate::harness::mail_delivery::capacity(hub, session).is_some_and(|capacity| capacity.target > 0) { return Ok(()); }
+            if viewer.refusals() != refusals { return Err(unavailable("the new run recipient's source feed was lost; its run and agent remain recorded")); }
+            let batch = hub.bus.read(&topic, at, 1).await.map_err(|_| unavailable("the new run recipient's source feed could not be read; its run and agent remain recorded"))?;
+            at = batch.next;
+            if batch.messages.is_empty() {
+                hub.bus.wait(&topic, at).await.map_err(|_| unavailable("the new run recipient's source feed was lost; its run and agent remain recorded"))?;
+            }
+        }
+    };
+    let clock = crate::rt::clock();
+    let deadline = clock.sleep(crate::harness::registry::ANSWER_WAIT);
+    futures::pin_mut!(operation, deadline);
+    match select(operation, deadline).await {
+        Either::Left((result, _)) => result,
+        Either::Right(_) => Err(unavailable("the new run recipient has not advertised source capacity; its run and agent remain recorded")),
+    }
+}
+
 /// Runs a plan on an agent: an existing one, or a new one started with it (as `by` starts agents).
 ///
 /// With `key` (an idempotency key, CP-T3.2) the run's id is made from it, the plan and who runs it,
@@ -1206,25 +1237,42 @@ async fn run_claimed(hub: &Hub, p: &Plan, target: Target, mode: Mode, pick: &Pic
     };
     // The run's id is made first, and each of its messages' ids from it and its place among them:
     // whatever sends one again sends the same message, which its agent gets once (CP-T3.2).
-    let (session, rest) = match target {
-        Target::Session(session) => (session, messages.as_slice()),
+    let session = match target {
+        Target::Session(session) => session,
         Target::New { target, kind, cwd } => {
-            let (first, rest) = messages.split_first().ok_or_else(|| Error::Bad("nothing to send".into()))?;
-            let started = start_for(hub, by, target, kind, cwd, Some(first.clone()), p.title.clone()).await?;
+            if messages.is_empty() { return Err(Error::Bad("nothing to send".into())); }
+            let started = start_for(hub, by, target, kind, cwd, None, p.title.clone()).await?;
             *acted = true;
-            (started, rest)
+            // Bind the created recipient before waiting or publishing. Cancellation/failure
+            // must never let a keyed retry create a second agent or invent a custody receipt.
+            let (bound_run, plan, version, recipient, mode, at, actor) = (run.clone(), p.id.clone(), p.version, started.clone(), mode.as_str(), crate::util::now_unix(), by.actor.clone());
+            let bound = hub.store.call(move |connection| Ok(connection.execute(
+                "INSERT INTO plan_runs (id,plan_id,version,session,mode,at,by) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET session=excluded.session,at=excluded.at WHERE plan_runs.session='' OR plan_runs.session=excluded.session",
+                params![bound_run, plan, version, recipient, mode, at, actor],
+            )?)).await?;
+            if bound != 1 { return Err(Error::Refused(http::StatusCode::CONFLICT, "this plan run already belongs to another recipient".into())); }
+            new_recipient_ready(hub, &started).await?;
+            started
         }
     };
-    let first = messages.len().saturating_sub(rest.len());
-    let mut sent = first;
-    for (n, text) in rest.iter().enumerate() {
-        let step = n.saturating_add(first).to_string();
+    let (mut sent, mut retained) = (0usize, 0usize);
+    for (n, text) in messages.iter().enumerate() {
+        let step = n.to_string();
         let c = Command::Send { id: crate::util::derive_id(&["plan-run", &run, &step]), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
         match hub.harness.command(hub, &session, c).await {
             Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => {
-                sent += 1;
+                sent = sent.saturating_add(1);
                 *acted = true;
             }
+            Sent::Published(receipt) => {
+                match receipt.disposition {
+                    crate::harness::mail::Disposition::Admitted | crate::harness::mail::Disposition::Consumed => sent = sent.saturating_add(1),
+                    crate::harness::mail::Disposition::Waiting | crate::harness::mail::Disposition::Dispatched | crate::harness::mail::Disposition::Transferred | crate::harness::mail::Disposition::Superseded => retained = retained.saturating_add(1),
+                    crate::harness::mail::Disposition::Cancelled => return Err(Error::Bad("the communication was cancelled; its original remains in history".into())),
+                }
+                *acted = true;
+            }
+            Sent::PublicationRefused(error) => return Err(Error::Bad(error.to_string())),
             Sent::Refused(r) => return Err(Error::Bad(r.to_string())),
             s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => return Err(Error::Bad(s.failure().map_or_else(|| "its runner refused it".to_owned(), |(_, why)| why))),
             Sent::NoSession => return Err(Error::Bad("no such agent".into())),
@@ -1243,7 +1291,7 @@ async fn run_claimed(hub: &Hub, p: &Plan, target: Target, mode: Mode, pick: &Pic
             Ok(())
         })
         .await?;
-    Ok(Ran { session, sent, run, split: 0 })
+    Ok(Ran { session, sent, retained, run, split: 0 })
 }
 
 /// Notes plan `p` run on agent `session` in `mode` (`goals`: its steps on that agent's stack),
@@ -1423,7 +1471,7 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate:
             Ok(())
         })
         .await?;
-    Ok(Ran { session, sent, run, split })
+    Ok(Ran { session, sent, retained: 0, run, split })
 }
 
 /// A run under an idempotency key, before it's done: the run it was, if it was done (its answer,
@@ -1458,12 +1506,30 @@ async fn claim(hub: &Hub, p: &Plan, run: &str, mode: Mode, pick: &Pick, by: &cra
         None => Ok(None),
         Some(session) if !session.is_empty() => {
             let sent = match mode {
-                Mode::Steps => pick.of(p.steps.len().min(STEPS)).len(),
+                Mode::Steps => {
+                    let n = p.steps.len().min(STEPS);
+                    picked_rounds(&p.items, n, &pick.of(n)).len()
+                },
                 Mode::Goals => pick.of(if p.items.is_empty() { p.steps.len().min(STEPS) } else { p.items.len().min(STEPS) }).len(),
                 Mode::Message | Mode::Agents => 1,
             };
             let split = if mode == Mode::Goals && pick.split { split_of(hub, &session, run).await } else { 0 };
-            Ok(Some(Ran { session, sent, run: run.to_owned(), split }))
+            let (mut confirmed, mut retained) = (sent, 0usize);
+            if mode != Mode::Goals {
+                confirmed = 0;
+                for n in 0..sent {
+                    let message = crate::util::derive_id(&["plan-run", run, &n.to_string()]);
+                    let receipt = crate::harness::mail::receipt(&hub.store, "server".into(), "server".into(), session.clone(), message).await
+                        .map_err(|e| Error::Bad(e.to_string()))?
+                        .ok_or_else(|| Error::Refused(http::StatusCode::SERVICE_UNAVAILABLE, "this run exists, but its legacy delivery has no custody receipt; see the existing run rather than starting another".into()))?;
+                    match receipt.disposition {
+                        crate::harness::mail::Disposition::Admitted | crate::harness::mail::Disposition::Consumed => confirmed = confirmed.saturating_add(1),
+                        crate::harness::mail::Disposition::Waiting | crate::harness::mail::Disposition::Dispatched | crate::harness::mail::Disposition::Transferred | crate::harness::mail::Disposition::Superseded => retained = retained.saturating_add(1),
+                        crate::harness::mail::Disposition::Cancelled => return Err(Error::Bad("an existing run communication was cancelled; its original remains in history".into())),
+                    }
+                }
+            }
+            Ok(Some(Ran { session, sent: confirmed, retained, run: run.to_owned(), split }))
         }
         Some(_) if again_safe => Ok(None),
         Some(_) => Err(Error::Refused(http::StatusCode::CONFLICT, "a run under this key is under way, or stopped part-way: see plans.runs.list for where it is".into())),

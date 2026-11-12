@@ -45,6 +45,7 @@ import {
   taskOfCall,
   tokens,
   turnsFrom,
+  turnsOf,
   type Item,
   type Step,
   type ToolEvent,
@@ -81,12 +82,19 @@ import { parentWrote, type ThreadFrom } from "./subagent-tree";
 import { KeepButton } from "./subagent-branch";
 import { Highlighted } from "@/components/code/highlighted";
 import { BodiesContext, Whole } from "./whole";
+import { SessionEvents, useSessionEvent } from "./session-event";
+import { pageInGap, revealRow, rowWindow, survivingPosition, type RowPosition, type WindowPart } from "./row-window";
+import { useRowPins } from "./row-pins";
+import { RestoringPlace } from "./restoring-place";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
 
 /** The calls that last touched each piece of research in the conversation: their steps open on it, as the agent reports it. */
 const Researched = React.createContext<ReadonlySet<string>>(new Set());
+
+/** The concrete row being read, including a call inside one very long grouped step. */
+const Reading = React.createContext<string | null>(null);
 
 /** The notice saying the harness isn't signed in (the latest, unless it has worked since), and where to sign it in. */
 const SignIn = React.createContext<{ notice: string; target: string; kind: string } | null>(null);
@@ -97,6 +105,7 @@ const NO_TASKS: Task[] = [];
 const Tasks = React.createContext<Task[]>(NO_TASKS);
 
 function Contexts({
+  store,
   asking,
   researched,
   signIn,
@@ -105,6 +114,7 @@ function Contexts({
   files,
   children,
 }: {
+  store: SessionStore;
   asking: ReadonlySet<string>;
   researched: ReadonlySet<string>;
   signIn: React.ContextType<typeof SignIn>;
@@ -115,17 +125,19 @@ function Contexts({
   children: React.ReactNode;
 }) {
   return (
-    <Asking.Provider value={asking}>
-      <Researched.Provider value={researched}>
-        <SignIn.Provider value={signIn}>
-          <Tasks.Provider value={tasks}>
-            <FilesContext.Provider value={files}>
-              <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
-            </FilesContext.Provider>
-          </Tasks.Provider>
-        </SignIn.Provider>
-      </Researched.Provider>
-    </Asking.Provider>
+    <SessionEvents.Provider value={store}>
+      <Asking.Provider value={asking}>
+        <Researched.Provider value={researched}>
+          <SignIn.Provider value={signIn}>
+            <Tasks.Provider value={tasks}>
+              <FilesContext.Provider value={files}>
+                <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
+              </FilesContext.Provider>
+            </Tasks.Provider>
+          </SignIn.Provider>
+        </Researched.Provider>
+      </Asking.Provider>
+    </SessionEvents.Provider>
   );
 }
 
@@ -178,8 +190,8 @@ function ExploreBody({ calls, cwd }: { calls: ToolEvent[]; cwd: string }) {
   );
 }
 
-function EditBody({ calls, cwd }: { calls: ToolEvent[]; cwd: string }) {
-  const many = calls.reduce((n, c) => n + (c.diffs?.length ?? 0), 0) > 3;
+function EditBody({ calls, cwd, many: grouped }: { calls: ToolEvent[]; cwd: string; many?: boolean }) {
+  const many = grouped ?? calls.reduce((n, c) => n + (c.diffs?.length ?? 0), 0) > 3;
   const now = React.useContext(FindNowContext);
   return (
     <div className="hx-stack">
@@ -264,11 +276,11 @@ function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
   );
 }
 
-function ShellBody({ calls }: { calls: ToolEvent[] }) {
+function ShellBody({ calls, single = calls.length === 1 }: { calls: ToolEvent[]; single?: boolean }) {
   return (
     <div className="hx-stack">
       {calls.map((c) => (
-        <CommandRow key={c.id} c={c} open={calls.length === 1 || c.status === "error" || (c.exit_code ?? 0) !== 0} />
+        <CommandRow key={c.id} c={c} open={single || c.status === "error" || (c.exit_code ?? 0) !== 0} />
       ))}
     </div>
   );
@@ -333,7 +345,7 @@ function AskBody({ calls }: { calls: ToolEvent[] }) {
   );
 }
 
-function ToolBody({ calls }: { calls: ToolEvent[] }) {
+function ToolBody({ calls, lastResearch }: { calls: ToolEvent[]; lastResearch?: ReadonlySet<string> }) {
   // Research the agent records or reads shows as the research, as it stands, once in the step: where it last touched it.
   const research = calls.map((c) => (c.status === "error" ? null : researchCall(c)));
   const lastOf = new Map(research.flatMap((r, i) => (r?.id ? [[r.id, i] as const] : [])));
@@ -359,7 +371,7 @@ function ToolBody({ calls }: { calls: ToolEvent[] }) {
               <span className="hx-dim hx-trunc">{c.title}</span>
             </div>
             {r?.id ? (
-              lastOf.get(r.id) === i && <ResearchCard id={r.id} />
+              (lastResearch ? lastResearch.has(c.id) : lastOf.get(r.id) === i) && <ResearchCard id={r.id} />
             ) : (
               <>
                 {input && (c.server || c.tool === "other" || c.tool === "mcp") && (
@@ -421,6 +433,81 @@ const OPEN_AFTER_MS = 500;
 /** A call that had been running this long when the page saw it first (by this device's clock, with room for another's) opens at once. */
 const RUNNING_BEFORE_MS = 2000;
 
+/** These are row pages, not estimated-height scroll spacers (W21-R02). */
+const CALL_ROWS = 60;
+
+function RowGap({ keys, gap, size, from, noun, onPage }: { keys: string[]; gap: WindowPart; size: number; from: number; noun: string; onPage: (key: string | null) => void }) {
+  const n = gap.to - gap.from;
+  return (
+    <button type="button" className="hx-earlier-steps" onClick={() => onPage(pageInGap(keys, gap, size, from))}>
+      {n} {gap.to <= from ? "earlier" : "later"} {noun}
+      {n === 1 ? "" : "s"}
+    </button>
+  );
+}
+
+/** A grouped step can itself contain thousands of calls: bound the actual rendered call rows. */
+function WindowedStepBody({ step, cwd, tasks, onOpenTask }: { step: Step; cwd: string; tasks: Task[]; onOpenTask?: (t: string) => void }) {
+  const { pins, ref } = useRowPins();
+  const [anchor, setAnchor] = React.useState<string | null>(null);
+  const keys = React.useMemo(() => step.calls.map((c) => c.id), [step.calls]);
+  const now = React.useContext(FindNowContext);
+  useRevealed(
+    (id) => keys.includes(id),
+    () => now && setAnchor(revealRow(keys, now.id)),
+  );
+  const asking = React.useContext(Asking);
+  const researched = React.useContext(Researched);
+  const reading = React.useContext(Reading);
+  const kept = React.useMemo(
+    () => new Set([...pins, ...(reading ? [reading] : []), ...step.calls.filter((c) => c.status === "pending" || asking.has(c.tool_id) || researched.has(c.id)).map((c) => c.id)]),
+    [pins, step.calls, asking, researched, reading],
+  );
+  const window = rowWindow(keys, CALL_ROWS, anchor, kept);
+  const manyEdits = React.useMemo(() => step.calls.reduce((n, c) => n + (c.diffs?.length ?? 0), 0) > 3, [step.calls]);
+  const lastResearch = React.useMemo(() => {
+    const last = new Map<string, string>();
+    for (const c of step.calls) {
+      const r = c.status === "error" ? null : researchCall(c);
+      if (r?.id) last.set(r.id, c.id);
+    }
+    return new Set(last.values());
+  }, [step.calls]);
+  const body = (calls: ToolEvent[]) => (
+    <>
+      {step.group === "explore" && <ExploreBody calls={calls} cwd={cwd} />}
+      {step.group === "edit" && <EditBody calls={calls} cwd={cwd} many={manyEdits} />}
+      {step.group === "shell" && <ShellBody calls={calls} single={step.calls.length === 1} />}
+      {step.group === "web" && <ExploreBody calls={calls} cwd={cwd} />}
+      {step.group === "agent" && <AgentBody calls={calls} tasks={tasks} onOpenTask={onOpenTask} />}
+      {step.group === "plan" && <PlanBody calls={calls} />}
+      {step.group === "ask" && <AskBody calls={calls} />}
+      {step.group === "tool" && <ToolBody calls={calls} lastResearch={lastResearch} />}
+    </>
+  );
+  // PlanBody deliberately shows the last plan, not one row per call. Preserve that contract.
+  const bounded = step.calls.length > CALL_ROWS && step.group !== "plan";
+  return (
+    <div ref={ref} className="hx-step-body" data-row-window={bounded || undefined}>
+      {step.group !== "plan" ? (
+        <div className={step.group === "explore" || step.group === "web" ? "hx-list" : "hx-stack"}>
+          {window.parts.flatMap((part) =>
+            part.type === "gap"
+              ? [<RowGap key={`gap-${part.from}-${part.to}`} keys={keys} gap={part} size={CALL_ROWS} from={window.from} noun="call" onPage={setAnchor} />]
+              : step.calls.slice(part.from, part.to).map((call) => (
+                  <div key={`call:${call.id}`} data-window-row="call" data-ev={call.id}>
+                    {body([call])}
+                  </div>
+                )),
+          )}
+        </div>
+      ) : (
+        body(step.calls)
+      )}
+    </div>
+  );
+}
+
 const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { step: Step; cwd: string; tasks: Task[]; onOpenTask?: (t: string) => void }) {
   useLabels();
   const status = stepStatus(step.calls);
@@ -428,6 +515,7 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
   const asking = React.useContext(Asking);
   const asked = step.calls.some((c) => asking.has(c.tool_id));
   const researched = React.useContext(Researched);
+  const reading = React.useContext(Reading);
   // Open by default: what needs attention, and what is happening right now (once it has gone on a moment).
   const [open, setOpen] = React.useState<boolean | null>(null);
   // A match found in it opens it.
@@ -444,6 +532,7 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
   const isOpen =
     open ??
     (opened.yes ||
+      (reading !== null && step.calls.some((c) => c.id === reading)) ||
       failures > 0 ||
       step.group === "agent" ||
       step.group === "ask" ||
@@ -489,18 +578,7 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
           <ChevronRight size={13} className={cn("hx-chev", isOpen && "rotate-90")} />
         </span>
       </button>
-      {isOpen && (
-        <div className="hx-step-body">
-          {step.group === "explore" && <ExploreBody calls={step.calls} cwd={cwd} />}
-          {step.group === "edit" && <EditBody calls={step.calls} cwd={cwd} />}
-          {step.group === "shell" && <ShellBody calls={step.calls} />}
-          {step.group === "web" && <ExploreBody calls={step.calls} cwd={cwd} />}
-          {step.group === "agent" && <AgentBody calls={step.calls} tasks={tasks} onOpenTask={onOpenTask} />}
-          {step.group === "plan" && <PlanBody calls={step.calls} />}
-          {step.group === "ask" && <AskBody calls={step.calls} />}
-          {step.group === "tool" && <ToolBody calls={step.calls} />}
-        </div>
-      )}
+      {isOpen && <WindowedStepBody step={step} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />}
     </div>
   );
 });
@@ -510,22 +588,37 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
 function Thought({ item, live, since }: { item: ThoughtItem; live: boolean; since: number }) {
   const { event: e, more = [] } = item;
   const [open, setOpen] = React.useState(false);
+  const [anchor, setAnchor] = React.useState<string | null>(null);
+  const { pins, ref } = useRowPins();
+  const now = React.useContext(FindNowContext);
+  const reading = React.useContext(Reading);
+  const all = [e, ...more].filter((x) => !x.redacted);
+  const keys = all.map((x) => x.id);
   useRevealed(
     (id) => id === e.id || more.some((m) => m.id === id),
-    () => setOpen(true),
+    () => {
+      setOpen(true);
+      if (now) setAnchor(revealRow(keys, now.id));
+    },
   );
   // Nothing to show yet (or ever): no row, so none comes and goes; the live tail says it thinks.
   if (e.redacted || !thoughtShown(item)) return null;
-  const all = [e, ...more].filter((x) => !x.redacted);
+  const window = rowWindow(keys, CALL_ROWS, anchor, reading ? new Set([...pins, reading]) : pins);
   return (
-    <div className="hx-thought" data-ev={all.map((x) => x.id).join(" ")}>
+    <div ref={ref} className="hx-thought" data-ev={all.map((x) => x.id).join(" ")}>
       <ThinkingHead live={live} since={since} open={open} onToggle={() => setOpen(!open)} />
       {all.length > 1 && !open && <span className="hx-thought-n">{all.length} thoughts</span>}
       {open && (
         <ThinkingBody live={live}>
-          {all.map((x) => (
-            <Prose key={x.id} text={x.text} className="hx-thought-text" ev={x.id} streaming={x.streaming} />
-          ))}
+          {window.parts.flatMap((part) =>
+            part.type === "gap"
+              ? [<RowGap key={`gap-${part.from}-${part.to}`} keys={keys} gap={part} size={CALL_ROWS} from={window.from} noun="thought" onPage={setAnchor} />]
+              : all.slice(part.from, part.to).map((x) => (
+                  <div key={`thought:${x.id}`} data-window-row="thought" data-ev={x.id}>
+                    <Prose text={x.text} className="hx-thought-text" ev={x.id} streaming={x.streaming} />
+                  </div>
+                )),
+          )}
         </ThinkingBody>
       )}
     </div>
@@ -637,9 +730,9 @@ function downloadNamed(ctx: { session: string; cwd: string; files: { path: strin
 }
 
 /** The message a reply quotes: a clamped line or two of it; the whole of it a tap away. */
-function Quote({ id, who, lookup }: { id: string; who?: string; lookup: (id: string) => HEvent | undefined }) {
+function Quote({ id, who }: { id: string; who?: string }) {
   const [full, setFull] = React.useState(false);
-  const src = lookup(id);
+  const src = useSessionEvent(id);
   if (!src) return null;
   const text = (src.kind === "user" || src.kind === "assistant" || src.kind === "thinking" ? src.text : "").trim();
   if (!text) return null;
@@ -808,7 +901,6 @@ const Prompt = React.memo(function Prompt({
   queueItem,
   onCommand,
   onReply,
-  lookup,
   spawn,
   kindName,
   by,
@@ -825,7 +917,6 @@ const Prompt = React.memo(function Prompt({
   queueItem?: QueueItem;
   onCommand?: (c: Command) => void;
   onReply?: (t: ReplyTarget) => void;
-  lookup?: (id: string) => HEvent | undefined;
   /** What a "new agent" starts with (its target, folder, harness). */
   spawn?: { target?: string; cwd?: string; kind?: string };
   kindName?: string;
@@ -970,7 +1061,7 @@ const Prompt = React.memo(function Prompt({
           ) : null}
           <MsgMenu groups={groups} label={system ? "Actions on this message" : "Actions on your message"} className="hx-prompt-menu" />
         </div>
-        {e.reply_to && lookup && <Quote id={e.reply_to} lookup={lookup} />}
+        {e.reply_to && <Quote id={e.reply_to} />}
         {editing ? (
           <textarea
             className="hx-prompt-edit"
@@ -1005,14 +1096,12 @@ const Prompt = React.memo(function Prompt({
 const Sending = React.memo(function Sending({
   m,
   live,
-  lookup,
   onResend,
   onDiscard,
 }: {
   m: Outgoing;
   /** Connected: it can go again now. */
   live: boolean;
-  lookup?: (id: string) => HEvent | undefined;
   onResend: (id: string) => void;
   onDiscard: (id: string) => void;
 }) {
@@ -1028,7 +1117,7 @@ const Sending = React.memo(function Sending({
             <span className="hx-dim">
               ·{" "}
               <span className="hx-delivery" data-delivery={m.state}>
-                {failed ? "failed to send" : m.state === "sent" ? "sent" : "sending…"}
+                {failed ? "failed to send" : m.state === "sent" ? "sent" : m.state === "retained" ? "queued" : m.state === "waiting" ? "waiting" : "sending…"}
               </span>
             </span>
             {m.attachments.length > 0 && (
@@ -1038,8 +1127,13 @@ const Sending = React.memo(function Sending({
               </span>
             )}
           </div>
-          {m.reply_to && lookup && <Quote id={m.reply_to} lookup={lookup} />}
+          {m.reply_to && <Quote id={m.reply_to} />}
           <div className="hx-prompt-text">{m.text}</div>
+          {(m.state === "waiting" || m.state === "retained") && m.why && (
+            <div className="hx-dim" role="status">
+              {m.why}
+            </div>
+          )}
           {failed && (
             <div className="hx-send-failed" role="alert">
               <span>{why}</span>
@@ -1103,19 +1197,7 @@ function AgentStep({ step, cwd, onOpenTask }: { step: Step; cwd: string; onOpenT
 }
 
 /** Something the agent said along the way (a note): hold it to copy it as Markdown; its ⋯ is always there. */
-function Said({
-  item,
-  who,
-  onReply,
-  lookup,
-  spawn,
-}: {
-  item: Extract<Item, { type: "note" }>;
-  who?: string;
-  onReply?: (t: ReplyTarget) => void;
-  lookup?: (id: string) => HEvent | undefined;
-  spawn?: { target?: string; cwd?: string; kind?: string };
-}) {
+function Said({ item, who, onReply, spawn }: { item: Extract<Item, { type: "note" }>; who?: string; onReply?: (t: ReplyTarget) => void; spawn?: { target?: string; cwd?: string; kind?: string } }) {
   const navigate = useNavigate();
   const hold = useHoldCopy(() => item.event.text);
   const replyTo = (item.event as { reply_to?: string }).reply_to;
@@ -1129,7 +1211,7 @@ function Said({
           className="hx-said-menu"
         />
       )}
-      {replyTo && lookup && <Quote id={replyTo} lookup={lookup} />}
+      {replyTo && <Quote id={replyTo} />}
       <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} streaming={item.event.streaming} />
     </div>
   );
@@ -1144,7 +1226,6 @@ const ItemView = React.memo(function ItemView({
   since,
   who,
   onReply,
-  lookup,
   spawn,
 }: {
   item: Item;
@@ -1154,14 +1235,13 @@ const ItemView = React.memo(function ItemView({
   since: number;
   who?: string;
   onReply?: (t: ReplyTarget) => void;
-  lookup?: (id: string) => HEvent | undefined;
   spawn?: { target?: string; cwd?: string; kind?: string };
 }) {
   switch (item.type) {
     case "step":
       return item.group === "agent" ? <AgentStep step={item} cwd={cwd} onOpenTask={onOpenTask} /> : <StepRow step={item} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />;
     case "note":
-      return <Said item={item} who={who} onReply={onReply} lookup={lookup} spawn={spawn} />;
+      return <Said item={item} who={who} onReply={onReply} spawn={spawn} />;
     case "thought":
       return <Thought item={item} live={active && Boolean(latestThought(item).streaming)} since={since} />;
     case "notice":
@@ -1274,13 +1354,11 @@ function OutcomeBody({
   outcome,
   who,
   onReply,
-  lookup,
   spawn,
 }: {
   outcome: { id: string; seq: number; text: string; reply_to?: string };
   who?: string;
   onReply?: (t: ReplyTarget) => void;
-  lookup?: (id: string) => HEvent | undefined;
   spawn?: { target?: string; cwd?: string; kind?: string };
 }) {
   const navigate = useNavigate();
@@ -1295,7 +1373,7 @@ function OutcomeBody({
           className="hx-outcome-menu"
         />
       )}
-      {outcome.reply_to && lookup && <Quote id={outcome.reply_to} lookup={lookup} />}
+      {outcome.reply_to && <Quote id={outcome.reply_to} />}
       <Prose text={outcome.text} seq={outcome.seq} />
     </div>
   );
@@ -1314,9 +1392,9 @@ const TurnView = React.memo(function TurnView({
   onCommand,
   agentLabel,
   reading,
+  readingRow = false,
   queueItem,
   onReply,
-  lookup,
   spawn,
   kindName,
   from,
@@ -1342,24 +1420,45 @@ const TurnView = React.memo(function TurnView({
   onCommand?: (c: Command) => void;
   /** The part being read stays in the window while the turn grows. */
   reading: string | null;
+  readingRow?: boolean;
   queueItem?: QueueItem;
   onReply?: (t: ReplyTarget) => void;
-  lookup?: (id: string) => HEvent | undefined;
   spawn?: { target?: string; cwd?: string; kind?: string };
   kindName?: string;
 }) {
   const edits = React.useMemo(() => (turn.outcome ? changesetOf(turn.items.flatMap((i) => (i.type === "step" ? i.calls : []))) : []), [turn]);
   const add = edits.reduce((n, f) => n + f.add, 0);
   const del = edits.reduce((n, f) => n + f.del, 0);
-  // A turn of hundreds of steps shows its latest; the rest are a tap away (and there for a match
-  // you find in them).
+  // A long turn remains a bounded page of rows, including when an earlier match is revealed.
+  // Its selected/focused/expanded rows are kept; the page never replaces their live DOM.
   const findNow = React.useContext(FindNowContext);
-  const [allSteps, setAllSteps] = React.useState(false);
-  const at = reading ? turn.items.findIndex((it) => itemHolds(it, reading)) : -1;
-  const hidden = allSteps ? 0 : Math.max(0, Math.min(turn.items.length - STEPS_WINDOW, at < 0 ? Infinity : at));
-  const end = allSteps ? turn.items.length : hidden + STEPS_WINDOW;
-  const sought = findNow !== null && turn.items.some((it, i) => (i < hidden || i >= end) && itemHolds(it, findNow.id));
-  const items = sought ? turn.items : turn.items.slice(hidden, end);
+  const { pins, ref: rowsRef } = useRowPins();
+  const [anchor, setAnchor] = React.useState<string | null>(null);
+  const keys = React.useMemo(() => turn.items.map((it) => it.key), [turn.items]);
+  useRevealed(
+    (id) => turn.items.some((it) => itemHolds(it, id)),
+    () => {
+      const item = turn.items.find((it) => findNow && itemHolds(it, findNow.id));
+      if (item) setAnchor(revealRow(keys, item.key));
+    },
+  );
+  const asking = React.useContext(Asking);
+  const kept = React.useMemo(
+    () =>
+      new Set(
+        turn.items
+          .filter(
+            (it) =>
+              (reading !== null && itemHolds(it, reading)) ||
+              (it.type === "step"
+                ? it.calls.some((c) => pins.has(c.id) || c.status === "pending" || asking.has(c.tool_id))
+                : pins.has(it.event.id) || (it.event.kind === "tool" && it.event.status === "pending")),
+          )
+          .map((it) => it.key),
+      ),
+    [turn.items, pins, asking, reading],
+  );
+  const window = rowWindow(keys, STEPS_WINDOW, anchor, kept);
   const currentItem = turn.items.findLast((item) => item.type !== "notice" && item.type !== "compaction");
   const since = thinkingStarted(turn, turnStarted);
   // At work with nothing moving at its end: said once the end has held still a moment (from the
@@ -1385,39 +1484,40 @@ const TurnView = React.memo(function TurnView({
           queueItem={queueItem}
           onCommand={onCommand}
           onReply={onReply}
-          lookup={lookup}
           spawn={spawn}
           kindName={kindName}
           by={from && parentWrote(from, turn.prompt, first ?? false) ? from : undefined}
           via={from?.via ? from.name : undefined}
         />
       )}
-      <div className="hx-work">
-        {label && (turn.items.length > 0 || turn.outcome || live) && <div className="hx-agent-label">{label}</div>}
-        {hidden > 0 && !sought && (
-          <button type="button" className="hx-earlier-steps" onClick={() => setAllSteps(true)}>
-            {hidden} earlier step{hidden === 1 ? "" : "s"}
-          </button>
-        )}
-        {items.map((it) => (
-          <ItemView
-            key={it.key}
-            since={since}
-            item={it}
-            cwd={cwd}
-            onOpenTask={onOpenTask}
-            active={live && it === currentItem && (it.type !== "thought" || thoughtIsLive(it, true, turnStarted))}
-            who={label ?? agentLabel}
-            onReply={onReply}
-            lookup={lookup}
-            spawn={spawn}
-          />
-        ))}
-        {compacting ? <CompactingRow c={compacting} /> : live && !turn.outcome && !movedLately && <LiveTail doing={doing} since={since} />}
-      </div>
+      <Reading.Provider value={readingRow ? reading : null}>
+        <div ref={rowsRef} className="hx-work">
+          {label && (turn.items.length > 0 || turn.outcome || live) && <div className="hx-agent-label">{label}</div>}
+          {window.parts.flatMap((part) =>
+            part.type === "gap"
+              ? [<RowGap key={`gap-${part.from}-${part.to}`} keys={keys} gap={part} size={STEPS_WINDOW} from={window.from} noun="step" onPage={setAnchor} />]
+              : turn.items
+                  .slice(part.from, part.to)
+                  .map((it) => (
+                    <ItemView
+                      key={`item:${it.key}`}
+                      since={since}
+                      item={it}
+                      cwd={cwd}
+                      onOpenTask={onOpenTask}
+                      active={live && it === currentItem && (it.type !== "thought" || thoughtIsLive(it, true, turnStarted))}
+                      who={label ?? agentLabel}
+                      onReply={onReply}
+                      spawn={spawn}
+                    />
+                  )),
+          )}
+          {compacting ? <CompactingRow c={compacting} /> : live && !turn.outcome && !movedLately && <LiveTail doing={doing} since={since} />}
+        </div>
+      </Reading.Provider>
       {turn.outcome && (
         <div className="hx-outcome" data-ev={turn.outcome.id}>
-          <OutcomeBody outcome={turn.outcome} who={label ?? agentLabel} onReply={onReply} lookup={lookup} spawn={spawn} />
+          <OutcomeBody outcome={turn.outcome} who={label ?? agentLabel} onReply={onReply} spawn={spawn} />
           <div className="hx-outcome-foot">
             {edits.length > 0 && (
               <span>
@@ -1435,7 +1535,7 @@ const TurnView = React.memo(function TurnView({
 /* ------------------------------------------------------------------ where you are in it */
 
 /** The parts a place in the conversation is kept by: what you asked, each thing it did or said, its answer. */
-const PARTS = ".hx-turn > [data-ev], .hx-work > [data-ev]";
+const PARTS = ".hx-turn > [data-ev], .hx-work > [data-ev], [data-window-row][data-ev]";
 /** This close to the end counts as at the end: it follows what comes. */
 const END_PX = 40;
 /** A part you tapped (or keyed) that changes size this soon after (a step opening) stays where it was. */
@@ -1443,15 +1543,18 @@ const TOUCH_MS = 1000;
 
 const partId = (el: Element) => (el.getAttribute("data-ev") ?? "").split(" ")[0] ?? "";
 
-function partOf(root: HTMLElement, id: string): HTMLElement | null {
+function partOf(root: HTMLElement, id: string, row?: true): HTMLElement | null {
   const ev = `[data-ev~="${CSS.escape(id)}"]`;
-  return root.querySelector<HTMLElement>(`.hx-turn > ${ev}, .hx-work > ${ev}`);
+  return row ? root.querySelector<HTMLElement>(`[data-window-row]${ev}`) : root.querySelector<HTMLElement>(`.hx-turn > ${ev}, .hx-work > ${ev}`);
 }
 
 /** The first part in view, and how far below the view's top it starts (negative: above it). */
-function firstInView(root: HTMLElement): { id: string; offset: number } | null {
+function firstInView(root: HTMLElement): RowPosition | null {
   const top = root.getBoundingClientRect().top;
-  const all = root.querySelectorAll<HTMLElement>(PARTS);
+  // A grouped step's actual call rows replace its enclosing rectangle in the ordered list:
+  // nested overlapping rectangles would invalidate the binary search and save its first call
+  // as the anchor even while a later call is being read.
+  const all = [...root.querySelectorAll<HTMLElement>(PARTS)].filter((el) => !el.querySelector("[data-window-row]"));
   let lo = 0;
   let hi = all.length - 1;
   let found: HTMLElement | null = null;
@@ -1465,12 +1568,15 @@ function firstInView(root: HTMLElement): { id: string; offset: number } | null {
     } else lo = mid + 1;
   }
   const id = found ? partId(found) : "";
-  return found && id ? { id, offset: found.getBoundingClientRect().top - top } : null;
+  const index = found ? all.indexOf(found) : -1;
+  const neighbors = [all[index + 1], all[index - 1]].flatMap((el) => (el && partId(el) ? [{ id: partId(el), ...(el.hasAttribute("data-window-row") ? { row: true as const } : {}) }] : []));
+  return found && id ? { id, offset: found.getBoundingClientRect().top - top, ...(found.hasAttribute("data-window-row") ? { row: true as const } : {}), neighbors } : null;
 }
 
 /** Scrolls so that part `at.id` starts `at.offset` below the view's top; false when it isn't there. */
-function goTo(root: HTMLElement, at: { id: string; offset: number }): boolean {
-  const el = partOf(root, at.id);
+function goTo(root: HTMLElement, at: RowPosition): boolean {
+  const target = survivingPosition(at, (id, row) => partOf(root, id, row) !== null);
+  const el = target ? partOf(root, target.id, target.row) : null;
   if (!el) return false;
   const by = el.getBoundingClientRect().top - root.getBoundingClientRect().top - at.offset;
   if (Math.abs(by) >= 1) root.scrollTop += by;
@@ -1484,10 +1590,11 @@ interface Keep {
   /** The page holds the conversation's end (not a window further back): only then is its bottom the end. */
   tail: boolean;
   /** Otherwise: what's being read, and where. */
-  at: { id: string; offset: number } | null;
+  at: RowPosition | null;
   /** The part last tapped or keyed in: its height and place then, and when. */
   touched: { el: HTMLElement; h: number; offset: number; t: number } | null;
   saving: number;
+  pending: RowPosition | null;
 }
 
 /**
@@ -1495,26 +1602,41 @@ interface Keep {
  * what comes; scrolled up, what you're reading stays exactly where it is; a step you open opens
  * under your finger. Your place is kept under `key` for the next visit (and a reload).
  */
-function useKeeper(key: string) {
-  const k = React.useRef<Keep>({ root: null, end: true, tail: true, at: null, touched: null, saving: 0 });
+function useKeeper(key: string, store: SessionStore, pending: RowPosition | null) {
+  const k = React.useRef<Keep>({ root: null, end: true, tail: true, at: null, touched: null, saving: 0, pending });
   /** Where the view is now. */
   const read = React.useCallback(() => {
     const s = k.current;
     if (!s.root) return;
+    if (s.pending) return;
     s.end = s.tail && s.root.scrollHeight - s.root.scrollTop - s.root.clientHeight < END_PX;
     s.at = s.end ? null : firstInView(s.root);
   }, []);
   const restore = React.useCallback(() => {
     const s = k.current;
-    if (s.root && s.at) goTo(s.root, s.at);
+    const root = s.root;
+    if (root && s.pending) {
+      const position = survivingPosition(s.pending, (id, row) => partOf(root, id, row) !== null);
+      if (position && goTo(root, position)) {
+        s.at = position;
+        s.end = false;
+        s.pending = null;
+      }
+      return;
+    }
+    if (!root || !s.at) return;
+    const next = survivingPosition(s.at, (id, row) => partOf(root, id, row) !== null);
+    s.at = next ?? firstInView(root);
+    if (next) goTo(root, next);
   }, []);
   const save = React.useCallback(() => {
     const s = k.current;
     window.clearTimeout(s.saving);
     s.saving = 0;
+    if (s.pending) return;
     const place: Place = s.end || !s.at ? { end: true } : s.at;
-    usePlaces.getState().setPlace(key, place);
-  }, [key]);
+    usePlaces.getState().setPlace(key, "id" in place ? { ...place, seq: store.event(place.id)?.seq ?? place.seq } : place);
+  }, [key, store]);
   const ref = React.useCallback(
     (root: HTMLDivElement | null) => {
       if (!root) return;
@@ -1522,9 +1644,13 @@ function useKeeper(key: string) {
       s.root = root;
       // Where you were; the end the first time.
       const was = usePlaces.getState().places[key];
-      if (was && "id" in was && goTo(root, was)) {
+      if (s.pending) {
+        root.scrollTop = 0;
         s.end = false;
-        s.at = { id: was.id, offset: was.offset };
+        s.at = null;
+      } else if (was && "id" in was && goTo(root, was)) {
+        s.end = false;
+        s.at = survivingPosition(was, (id, row) => partOf(root, id, row) !== null);
       } else {
         root.scrollTop = root.scrollHeight;
         s.end = true;
@@ -1548,11 +1674,11 @@ function useKeeper(key: string) {
         const t = s.touched;
         if (t && performance.now() - t.t < TOUCH_MS && t.el.isConnected && t.el.offsetHeight !== t.h) {
           // What you just opened (or closed) opens in place; where that leaves you is where you are.
-          goTo(root, { id: partId(t.el), offset: t.offset });
+          goTo(root, { id: partId(t.el), offset: t.offset, ...(t.el.hasAttribute("data-window-row") ? { row: true } : {}) });
           s.touched = null;
           read();
         } else if (s.end) root.scrollTop = root.scrollHeight;
-        else if (s.at) goTo(root, s.at);
+        else if (s.at) restore();
       };
       const watch = new ResizeObserver(hold);
       watch.observe(root);
@@ -1565,7 +1691,7 @@ function useKeeper(key: string) {
         s.root = null;
       };
     },
-    [key, read, save],
+    [key, read, save, restore],
   );
   const onScroll = () => {
     read();
@@ -1573,7 +1699,7 @@ function useKeeper(key: string) {
     s.touched = null;
     window.clearTimeout(s.saving);
     s.saving = window.setTimeout(save, 250);
-    return s.at?.id ?? null;
+    return s.at;
   };
   /** At the end, following what comes. */
   const atEnd = React.useCallback(() => k.current.end, []);
@@ -1593,7 +1719,12 @@ function useKeeper(key: string) {
     s.tail = true;
     s.end = true;
     s.at = null;
+    s.pending = null;
     if (s.root) s.root.scrollTop = s.root.scrollHeight;
+  }, []);
+  const adopt = React.useCallback((position: RowPosition) => {
+    k.current.pending = position;
+    k.current.end = false;
   }, []);
   /** A tap or a key on a part: if it changes size because of it, it does so in place. */
   const onTouch = (e: React.SyntheticEvent) => {
@@ -1601,7 +1732,7 @@ function useKeeper(key: string) {
     const el = e.target instanceof Element ? e.target.closest<HTMLElement>(PARTS) : null;
     k.current.touched = el && root ? { el, h: el.offsetHeight, offset: el.getBoundingClientRect().top - root.getBoundingClientRect().top, t: performance.now() } : null;
   };
-  return { ref, onScroll, onTouch, read, restore, atEnd, atBottom, setTail, toEnd };
+  return { ref, onScroll, onTouch, read, restore, atEnd, atBottom, setTail, toEnd, adopt };
 }
 
 /**
@@ -1683,13 +1814,11 @@ export const Timeline = React.memo(function Timeline({
   footer?: React.ReactNode;
 }) {
   const events = useSession(store, (s) => s.events);
+  const history = useSession(store, (s) => s.history);
   const state = useSession(store, (s) => s.state);
   const meta = useSession(store, (s) => s.meta);
   const done = useAnswered();
   const threadFrom = React.useContext(ThreadFromContext);
-  // What a reply quotes, by the event it answers.
-  const byId = React.useMemo(() => new Map(events.map((e) => [e.id, e] as const)), [events]);
-  const lookup = React.useCallback((id: string) => byId.get(id), [byId]);
   const spawn = React.useMemo(() => ({ target, cwd, kind }), [target, cwd, kind]);
   // The files its messages mention, as the server kept them: shown where they're mentioned.
   const keptFiles = useSession(store, (s) => s.files);
@@ -1709,7 +1838,9 @@ export const Timeline = React.memo(function Timeline({
   const mine = React.useMemo(() => outgoing.filter((m) => (thread ? m.task === thread : !m.task)), [outgoing, thread]);
   const resend = React.useCallback(
     (id: string) => {
-      if (!store.resend(id)) toast.error("Not connected", "The page is reconnecting to the agent; try again in a moment.");
+      void store.resend(id).then((accepted) => {
+        if (!accepted) toast.error("Message stayed here", "The original remains saved; check the connection and browser storage.");
+      });
     },
     [store],
   );
@@ -1724,10 +1855,18 @@ export const Timeline = React.memo(function Timeline({
     memo.last = { ...next, turns: shared };
     return shared;
   }, [kept, memo, events, parent, going, thread]);
-  const keeper = useKeeper(placeKey(agent, parent));
-  const { read, restore, atEnd, setTail, toEnd } = keeper;
+  const [initialPlace] = React.useState(() => {
+    const place = usePlaces.getState().places[placeKey(agent, parent)];
+    if (!place || !("id" in place) || turnOf(turns, place.id) >= 0) return place;
+    const covered = !history?.hasMore || (place.seq !== undefined && history.before !== null && history.before <= place.seq);
+    return covered ? (survivingPosition(place, (id) => turnOf(turns, id) >= 0) ?? place) : place;
+  });
+  const [restoring, setRestoring] = React.useState<RowPosition | null>(() => (initialPlace && "id" in initialPlace && turnOf(turns, initialPlace.id) < 0 ? initialPlace : null));
+  const keeper = useKeeper(placeKey(agent, parent), store, restoring);
+  const { read, restore, atEnd, setTail, toEnd, adopt } = keeper;
   // Scrolling records the place for the next content update without rendering the conversation.
-  const reading = React.useRef<string | null>(null);
+  const reading = React.useRef<string | null>(initialPlace && "id" in initialPlace ? initialPlace.id : null);
+  const readingRow = React.useRef(Boolean(initialPlace && "id" in initialPlace && initialPlace.row));
   // The turns in the page (`WINDOW` at a time, `MOST` at most): from the one `anchor` names (null:
   // the latest), through the one `till` names (null: the end). Read back, the window stays put as
   // more comes; gone far back (your place from last time, a match you find), it's a window there,
@@ -1746,18 +1885,26 @@ export const Timeline = React.memo(function Timeline({
   };
   // Your place from last time, once its turns are in: the page opens on it.
   const [placed, setPlaced] = React.useState<string | null>(() => {
-    const p = usePlaces.getState().places[placeKey(agent, parent)];
+    const p = initialPlace;
     return p && "id" in p ? p.id : null;
   });
   if (placed && turns.length > 0) {
-    setPlaced(null);
-    around(turnOf(turns, placed));
+    const at = turnOf(turns, placed);
+    if (at >= 0) {
+      setPlaced(null);
+      around(at);
+    }
   }
   // A match you find, each time one is shown.
   const shownMatch = find?.now ? `${find.now.id}:${find.now.n}` : null;
   const [revealed, setRevealed] = React.useState<string | null>(null);
   if (shownMatch && shownMatch !== revealed) {
     setRevealed(shownMatch);
+    if (restoring) {
+      setRestoring(null);
+      setPlaced(null);
+      toEnd();
+    }
     around(turnOf(turns, find?.now?.id));
   }
   // Only a page that holds the end follows what comes at its bottom.
@@ -1815,19 +1962,39 @@ export const Timeline = React.memo(function Timeline({
     return () => io.disconnect();
   }, []);
   const onScroll = () => {
-    reading.current = keeper.onScroll();
+    const position = keeper.onScroll();
+    reading.current = position?.id ?? null;
+    readingRow.current = position?.row === true;
     // Back at the end: the page holds the latest turns again, and follows them. Read back, it stays put.
     if (atEnd()) {
       if (anchor !== null) setAnchor(null);
     } else if (anchor === null) setAnchor(win.current.turns[win.current.from]?.key ?? null);
   };
   /** To the latest, from a window further back. */
-  const latest = () => {
+  // The same one each render: a restore under way (restore-place.tsx) goes to it when it can't finish.
+  const latest = React.useCallback(() => {
+    setRestoring(null);
+    setPlaced(null);
     setAnchor(null);
     setTill(null);
     reading.current = null;
+    readingRow.current = false;
     toEnd();
-  };
+  }, [toEnd]);
+  const restored = React.useCallback(
+    (position: RowPosition) => {
+      const current = turnsOf(store.get().events, parent, false, thread);
+      const visible = survivingPosition(position, (id) => turnOf(current, id) >= 0);
+      if (!visible) return false;
+      adopt(visible);
+      reading.current = visible.id;
+      readingRow.current = visible.row === true;
+      setPlaced(visible.id);
+      setRestoring(null);
+      return true;
+    },
+    [store, parent, thread, adopt],
+  );
   // Find: every match marked in place (again as the conversation grows), and the one shown brought
   // into view when it's chosen (not again after: you may scroll away).
   const findQ = find?.q ?? "";
@@ -1845,6 +2012,7 @@ export const Timeline = React.memo(function Timeline({
       void holds;
       void from;
       void to;
+      void restoring;
       restore();
       const at = findNow ? elementOf(flow, findNow.id) : null;
       const first = mark(flow, findQ, at);
@@ -1858,7 +2026,7 @@ export const Timeline = React.memo(function Timeline({
       }
       return () => void mark(flow, "", null);
     },
-    [findQ, findNow, grows, holds, from, to, read, restore],
+    [findQ, findNow, grows, holds, from, to, read, restore, restoring],
   );
   const running = parent ? task?.status === "running" : state?.status === "running";
   // A compaction of this thread's conversation under way, while its harness can still be heard.
@@ -1912,7 +2080,7 @@ export const Timeline = React.memo(function Timeline({
   const signIn = React.useMemo(() => (signedOut && target && kind ? { notice: signedOut, target, kind } : null), [signedOut, target, kind]);
   return (
     <BodiesContext.Provider value={store}>
-      <Contexts asking={asking} researched={researched} signIn={signIn} findNow={findNow} tasks={tasks} files={conversationFiles}>
+      <Contexts store={store} asking={asking} researched={researched} signIn={signIn} findNow={findNow} tasks={tasks} files={conversationFiles}>
         {/* Named for the router's scroll memory, so another page's never lands here or this one's there. */}
         <div
           ref={keeper.ref}
@@ -1922,104 +2090,126 @@ export const Timeline = React.memo(function Timeline({
           onPointerDownCapture={keeper.onTouch}
           onKeyDownCapture={keeper.onTouch}
         >
-          <div ref={marks} className="hx-flow">
-            {/* Keyed by where the page starts: each time more joins, a new watch says at once whether more should. */}
-            {from > 0 && <div key={`from-${from}`} ref={earlier} className="hx-earlier" aria-hidden="true" />}
-            {/* At the top of what's held, with more before it: the page before joins as you read up to it (keyed by where it begins, so each page watches anew). */}
-            {from === 0 && more && <div key={`older-${events[0]?.seq ?? 0}`} ref={older} className="hx-earlier" aria-hidden="true" />}
-            {from === 0 && !more && state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
-            {turns.length === 0 &&
-              (parent ? (
-                <div className="hx-sub-empty">
-                  <p className="hx-sub-what">{task?.description || "Subagent"}</p>
-                  {task?.prompt && <Prose text={task.prompt} className="hx-sub-prompt" />}
-                  {task && (
-                    <div className="hx-sub-meta">
-                      <i className="dot" data-status={taskDot(task)} aria-hidden="true" />
-                      <PrismLabel live={going}>{task.status}</PrismLabel>
-                      <TaskElapsed task={task} />
-                      {going && task.last_tool && <span className="hx-trunc">{task.last_tool}</span>}
-                    </div>
-                  )}
-                  {task?.summary ? <Prose text={task.summary} className="hx-sub-result" /> : <p className="hx-dim text-[12px]">No work has been reported in this thread yet.</p>}
-                </div>
-              ) : (
-                mine.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
-              ))}
-            {/* A turn that only passed a person's message on to a subagent (`Turn.relay`) is drawn as nothing: the message is in that subagent's thread. */}
-            {turns
-              .slice(from, to)
-              .map((t, j) =>
-                t.relay ? null : (
-                  <TurnView
-                    key={t.key}
-                    turn={t}
-                    cwd={cwd}
-                    delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
-                    live={running && from + j === turns.length - 1}
-                    doing={running && from + j === turns.length - 1 ? state?.doing : undefined}
-                    compacting={from + j === turns.length - 1 ? compacting : undefined}
-                    turnStarted={running && from + j === turns.length - 1 ? (parent ? task?.started : (state?.turn_started ?? undefined)) : undefined}
-                    onOpenTask={onOpenTask}
-                    meta={meta}
-                    onCommand={onCommand}
-                    agentLabel={agentLabel}
-                    reading={reading.current}
-                    queueItem={t.prompt?.client_id ? state?.queue.find((q) => q.id === t.prompt?.client_id) : undefined}
-                    onReply={onReply}
-                    lookup={lookup}
-                    spawn={spawn}
-                    kindName={agentLabel ?? kind}
-                    from={threadFrom}
-                    first={from + j === 0 && !state?.dropped && !more}
-                  />
-                ),
-              )}
-            {/* A finished subagent's thread ends with how and when, and the way back to its parent's. */}
-            {tail && threadFrom?.end && (
-              <div className="hx-thread-end" data-stand={threadFrom.end.stand}>
-                <span className="hx-thread-word">
-                  <i aria-hidden="true" />
-                  {threadFrom.end.word}
-                </span>
-                {threadFrom.end.at != null && <span className="hx-dim">{SAID_AT.format(threadFrom.end.at)}</span>}
-                <Link to={threadFrom.href} className="hx-thread-back">
-                  <ArrowUpLeft size={13} />
-                  {threadFrom.name}
-                </Link>
-                {threadFrom.keep && <KeepButton keep={threadFrom.keep} />}
-              </div>
-            )}
-            {/* A window further back: what came after joins as you scroll down to it. */}
-            {!tail && <div key={`to-${to}`} ref={later} className="hx-earlier" aria-hidden="true" />}
-            {tail && mine.map((m) => <Sending key={m.id} m={m} live={live} lookup={lookup} onResend={resend} onDiscard={store.discard} />)}
-            {tail && hasAsks && onDecide && (
-              <div ref={asksRef} className="hx-asks">
-                {pending.map((a) => (
-                  <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} onReviewPlan={parent ? undefined : onReviewPlan} />
-                ))}
-              </div>
-            )}
-            {tail && footer}
-            <div ref={endRef} aria-hidden="true" />
-            <div className="hx-waiting-anchor">
-              {!tail || (!hasAsks && !endSeen) ? (
-                <button type="button" className="hx-waiting" onClick={latest}>
-                  {hasAsks && <i aria-hidden="true" />}
-                  {hasAsks ? (pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`) : "Latest"}
-                  <ArrowDown size={12} aria-hidden="true" />
-                </button>
-              ) : (
-                hasAsks &&
-                !asksSeen && (
-                  <button type="button" className="hx-waiting" onClick={() => asksEl.current?.scrollIntoView({ block: "start", behavior: "smooth" })}>
-                    <i aria-hidden="true" />
-                    {pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`}
-                    <ArrowDown size={12} aria-hidden="true" />
+          <div ref={marks} className={restoring ? "hx-flow hx-flow-loading" : "hx-flow"}>
+            {restoring ? (
+              <RestoringPlace store={store} position={restoring} resolved={restored} latest={latest} />
+            ) : (
+              <>
+                {/* Keyed by where the page starts: each time more joins, a new watch says at once whether more should. */}
+                {from > 0 && <div key={`from-${from}`} ref={earlier} className="hx-earlier" aria-hidden="true" />}
+                {from === 0 && !history && more && <div key={`older-${events[0]?.seq ?? 0}`} ref={older} className="hx-earlier" aria-hidden="true" />}
+                {from === 0 && history?.hasMore && (
+                  <button
+                    type="button"
+                    className="hx-earlier-steps"
+                    disabled={history.loading}
+                    onClick={() => {
+                      read();
+                      void store.loadOlder();
+                    }}
+                  >
+                    {history.loading ? "Loading earlier messages…" : "Earlier messages"}
                   </button>
-                )
-              )}
-            </div>
+                )}
+                {from === 0 && history?.error && (
+                  <div role="alert" className="hx-bad text-[11px]">
+                    Couldn't load earlier messages. {history.error}
+                  </div>
+                )}
+                {from === 0 && !history && !more && state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
+                {turns.length === 0 &&
+                  (parent ? (
+                    <div className="hx-sub-empty">
+                      <p className="hx-sub-what">{task?.description || "Subagent"}</p>
+                      {task?.prompt && <Prose text={task.prompt} className="hx-sub-prompt" />}
+                      {task && (
+                        <div className="hx-sub-meta">
+                          <i className="dot" data-status={taskDot(task)} aria-hidden="true" />
+                          <PrismLabel live={going}>{task.status}</PrismLabel>
+                          <TaskElapsed task={task} />
+                          {going && task.last_tool && <span className="hx-trunc">{task.last_tool}</span>}
+                        </div>
+                      )}
+                      {task?.summary ? <Prose text={task.summary} className="hx-sub-result" /> : <p className="hx-dim text-[12px]">No work has been reported in this thread yet.</p>}
+                    </div>
+                  ) : (
+                    mine.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
+                  ))}
+                {turns
+                  .slice(from, to)
+                  .map((t, j) =>
+                    t.relay ? null : (
+                      <TurnView
+                        key={t.key}
+                        turn={t}
+                        cwd={cwd}
+                        delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
+                        live={running && from + j === turns.length - 1}
+                        doing={running && from + j === turns.length - 1 ? state?.doing : undefined}
+                        compacting={from + j === turns.length - 1 ? compacting : undefined}
+                        turnStarted={running && from + j === turns.length - 1 ? (parent ? task?.started : (state?.turn_started ?? undefined)) : undefined}
+                        onOpenTask={onOpenTask}
+                        meta={meta}
+                        onCommand={onCommand}
+                        agentLabel={agentLabel}
+                        reading={reading.current}
+                        readingRow={readingRow.current}
+                        queueItem={t.prompt?.client_id ? state?.queue.find((q) => q.id === t.prompt?.client_id) : undefined}
+                        onReply={onReply}
+                        spawn={spawn}
+                        kindName={agentLabel ?? kind}
+                        from={threadFrom}
+                        first={from + j === 0 && (history ? !history.hasMore : !state?.dropped && !more)}
+                      />
+                    ),
+                  )}
+                {/* A finished subagent's thread ends with how and when, and the way back to its parent's. */}
+                {tail && threadFrom?.end && (
+                  <div className="hx-thread-end" data-stand={threadFrom.end.stand}>
+                    <span className="hx-thread-word">
+                      <i aria-hidden="true" />
+                      {threadFrom.end.word}
+                    </span>
+                    {threadFrom.end.at != null && <span className="hx-dim">{SAID_AT.format(threadFrom.end.at)}</span>}
+                    <Link to={threadFrom.href} className="hx-thread-back">
+                      <ArrowUpLeft size={13} />
+                      {threadFrom.name}
+                    </Link>
+                    {threadFrom.keep && <KeepButton keep={threadFrom.keep} />}
+                  </div>
+                )}
+                {/* A window further back: what came after joins as you scroll down to it. */}
+                {!tail && <div key={`to-${to}`} ref={later} className="hx-earlier" aria-hidden="true" />}
+                {tail && mine.map((m) => <Sending key={m.id} m={m} live={live} onResend={resend} onDiscard={store.discard} />)}
+                {tail && hasAsks && onDecide && (
+                  <div ref={asksRef} className="hx-asks">
+                    {pending.map((a) => (
+                      <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} onReviewPlan={parent ? undefined : onReviewPlan} />
+                    ))}
+                  </div>
+                )}
+                {tail && footer}
+                <div ref={endRef} aria-hidden="true" />
+                <div className="hx-waiting-anchor">
+                  {!tail || (!hasAsks && !endSeen) ? (
+                    <button type="button" className="hx-waiting" onClick={latest}>
+                      {hasAsks && <i aria-hidden="true" />}
+                      {hasAsks ? (pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`) : "Latest"}
+                      <ArrowDown size={12} aria-hidden="true" />
+                    </button>
+                  ) : (
+                    hasAsks &&
+                    !asksSeen && (
+                      <button type="button" className="hx-waiting" onClick={() => asksEl.current?.scrollIntoView({ block: "start", behavior: "smooth" })}>
+                        <i aria-hidden="true" />
+                        {pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`}
+                        <ArrowDown size={12} aria-hidden="true" />
+                      </button>
+                    )
+                  )}
+                </div>
+              </>
+            )}
           </div>
         </div>
       </Contexts>

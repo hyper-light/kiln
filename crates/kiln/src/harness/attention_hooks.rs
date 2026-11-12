@@ -12,6 +12,9 @@ use crate::hub::Hub;
 /// own words to an agent aren't deliberate uses. Every command is named, so a new one is decided here, not missed.
 pub fn command_kind(command: &Command) -> Option<&'static str> {
     match command {
+        Command::StateRead { .. } => None,
+        Command::AtState { command, .. } => command_kind(command),
+        Command::Admit { .. } | Command::MailAck { .. } | Command::MailPeers { .. } | Command::MailHandoff { .. } => None,
         Command::Send { .. } | Command::SkillRun { .. } => Some("message"),
         Command::Approve { .. } | Command::Resume => Some("answer"),
         Command::Interrupt | Command::ForceStop | Command::Restart | Command::StopTask { .. } | Command::StopTasks

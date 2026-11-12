@@ -13,11 +13,13 @@
 //! - [`msg`]: what they say to each other, small `Copy` messages.
 //! - [`slab`]: generational handles, so a word about a run that is gone finds nothing.
 //! - [`tokens`]: room tokens, what each of several owners is told of a runner's room: what its
-//!   own runs freed, so a runner's words grow with its runs, not with its watchers.
+//!   own runs freed, so a runner's words grow with its runs, not with its watchers; an owner that
+//!   can't hear words of its own hears hints beside them.
 //! - [`weights`]: learned wait weights, one per runner, the distribution a run that finds no room
-//!   draws its waiting places from (Lattanzi et al., SODA 2020).
-//! - [`auction`]: an integer auction (Bertsekas 1992) for runs placed together, batches and gangs,
-//!   at the least total expected finish.
+//!   draws its waiting places from (Lattanzi et al., SODA 2020, Algorithm 1, T by Aspnes et al.'s
+//!   doubling).
+//! - [`auction`]: an integer auction (Bertsekas 1992) for runs placed together, batches that arrive
+//!   in one step, at the least total expected finish.
 //!
 //! Pure like the rest of kiln-ci: no clock, disk, network or randomness; integer amounts; nothing
 //! hashed, and nothing allocated on a decision once the tables have grown to the fleet. Runners,
@@ -40,13 +42,15 @@ mod model;
 #[cfg(test)]
 mod scale_tests;
 #[cfg(test)]
+mod weights_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod finish_tests;
 
 pub use index::{BUCKETS, Index};
 pub use msg::{Brief, Of, Start, ToOwner, ToRunner, Why, Word};
-pub use order::{Order, class_of};
+pub use order::{Order, class_lo, class_of};
 pub use owner::{Asked, Counts, Link, Out, Owner, PLACES, Refused, SCALE, SPEED_ONE, State, Terms, Told, Warm};
 pub use runner::{Runner, RunnerOut};
 pub use slab::{Handle, Slab};
@@ -79,6 +83,18 @@ pub struct OwnerId(pub u32);
 /// the set is first seen (Borg's equivalence classes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SigId(pub u32);
+
+/// A kind of work at one owner: work whose runs leave a node equipped for the next of them (the
+/// same job, the same tree), numbered by the shell as signatures are: dense, from 0. The owner
+/// keeps where each kind's work last went well, and sends its next run back there when that node
+/// is among the best by rank (docs/lb.md "Good places").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KindId(pub u32);
+
+impl KindId {
+    /// No kind: an ask that names none is decided by rank and turn alone.
+    pub const NONE: KindId = KindId(NIL);
+}
 
 /// A u64 amount as a view (saturating: views top out at 4,294,967 thousandths, 4,294 CPUs; a
 /// bigger runner admits exactly, its owner just sees less of it).
@@ -179,6 +195,15 @@ pub enum Mutant {
     /// Room tokens: a runner never says another owner waited for room there, so a token its owner
     /// can't use is never forwarded.
     NeverWants,
+    /// Room tokens in a mixed fleet: room a run of an owner that hears hints freed is that owner's
+    /// token, which it never reads (it sees all the room): the owners that hear tokens don't see it.
+    HintsHold,
+    /// Room tokens in a mixed fleet: the first watcher is the first owner the runner talks to even
+    /// when it hears hints, so room no one holds is told only to an owner that sees all of it anyway.
+    FirstHearsHints,
+    /// Room tokens: a cordon fits no token to the room it leaves and owes no word, so owners go on
+    /// holding room a runner that takes nothing has, and aren't told the room it has again.
+    CordonQuiet,
     /// Learned weights: a runner whose phase load passes 2T keeps its weight (Algorithm 1 never
     /// halves).
     NoLearn,
@@ -186,6 +211,16 @@ pub enum Mutant {
     Unweighted,
     /// Learned weights: predictions that aren't helping are kept (no switch to the robust draw).
     NoFallback,
+    /// Learned weights: Algorithm 1 adds to and tests the first two members alone (the places
+    /// drawn), not every one the job could run on.
+    DrawnOnly,
+    /// Learned weights: what the jobs show of the optimum is the fleet's balanced load alone, not
+    /// each kind's over its members: a runner that alone runs a kind looks overloaded.
+    KindBlind,
+    /// Learned weights: T stays at what the first job showed, never doubled.
+    NoDoubling,
+    /// Learned weights: T doubles but the phases' loads carry on, not begun again with the epoch.
+    NoRestart,
     /// The auction: ε of 1 on unscaled costs, not below 1/n: an assignment within n of optimal,
     /// not optimal.
     EpsilonTooLarge,
@@ -197,6 +232,11 @@ pub enum Mutant {
     StaleKey,
     /// A key that goes to or from 0 doesn't move its runner into or out of the narrow order.
     NoGate,
+    /// A kind's good place is kept after its shell says the node let its work down: it goes on
+    /// getting that kind's work for as long as it is as free as any (docs/lb.md "Good places").
+    StaysOnALoser,
+    /// Where a kind's work went well isn't kept: its next run goes on to another of its equals.
+    NoStay,
 }
 
 #[cfg(test)]

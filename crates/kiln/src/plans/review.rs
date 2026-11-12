@@ -13,6 +13,38 @@ use crate::hub::Hub;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+/// W21-R02: one read revision of the plan and the research its review presents.
+#[derive(Debug, Serialize)]
+pub struct Context {
+    pub plan: Plan,
+    pub research: Option<crate::research::View>,
+    pub cohort: Cohort,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Cohort {
+    pub plan_version: i64,
+    pub research_id: Option<String>,
+    pub research_updated_at: Option<i64>,
+}
+
+fn context_in(c: &rusqlite::Connection, id: &str) -> anyhow::Result<Option<(Plan, Option<crate::research::Research>)>> {
+    let tx = crate::store::tx(c)?;
+    let Some(mut plan) = super::get_in(c, id)? else { return Ok(None) };
+    plan.reviewed = last_in(c, id)?;
+    let research = plan.research.as_deref().map(|id| crate::research::load(c, id)).transpose()?.flatten();
+    tx.commit()?;
+    Ok(Some((plan, research)))
+}
+
+/// Read-only: approval still checks the current held goal stack and expected plan version.
+pub async fn context(hub: &Hub, id: &str) -> R<Context> {
+    let id = id.to_owned();
+    let (plan, research) = hub.store.call(move |c| context_in(c, &id)).await?.ok_or(Error::Missing)?;
+    let cohort = Cohort { plan_version: plan.version, research_id: plan.research.clone(), research_updated_at: research.as_ref().map(|r| r.updated_at) };
+    Ok(Context { plan, research: research.as_ref().map(|r| crate::research::view(r, false)), cohort })
+}
+
 /// What a person answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -187,4 +219,30 @@ async fn tell(hub: &Hub, agent: &str, p: &Plan, id: Option<&str>) {
     let id = id.map_or_else(crate::util::new_id, |i| format!("{i}-told"));
     let c = crate::harness::model::Command::Send { id, text, mode: crate::harness::model::SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
     let _sent = hub.harness.command(hub, agent, c).await;
+}
+
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn w21_r02_review_context_keeps_plan_version_last_answer_and_latest_linked_research() -> anyhow::Result<()> {
+        let store = crate::store::Store::in_memory_inline()?;
+        store.now(|c| {
+        c.execute("INSERT INTO plans (id, title, body, tags, source, version, created_at, updated_at, items, phase) VALUES ('p', 'A plan', '- a', '[]', NULL, 3, 1, 2, '[]', 'ready')", [])?;
+        assert!(context_in(c, "missing")?.is_none());
+        let Some((without, research)) = context_in(c, "p")? else { anyhow::bail!("plan missing") };
+        assert_eq!(without.version, 3);
+        assert!(research.is_none());
+        c.execute("INSERT INTO research (id, question, agent, by, plan_id, sources, findings, skipped, created_at, updated_at) VALUES ('r-old', 'Older', NULL, 'admin', 'p', '[]', '[]', '{}', 1, 1), ('r-new', 'Current', NULL, 'admin', 'p', '[]', '[]', '{}', 2, 4)", [])?;
+        c.execute("INSERT INTO plan_reviews (plan_id, version, answer, words, goal, by, at, key) VALUES ('p', 2, 'revise', 'Tighten it', 'g', 'admin', 3, 'k')", [])?;
+        let Some((plan, research)) = context_in(c, "p")? else { anyhow::bail!("plan missing") };
+        assert_eq!(plan.version, 3);
+        assert_eq!(plan.research.as_deref(), Some("r-new"));
+        assert_eq!(plan.reviewed.as_ref().map(|reviewed| reviewed.version), Some(2));
+        assert_eq!(research.as_ref().map(|r| (r.id.as_str(), r.plan.as_deref(), r.updated_at)), Some(("r-new", Some("p"), 4)));
+        Ok(())
+        })
+    }
 }

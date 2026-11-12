@@ -1,0 +1,288 @@
+{
+  "policy": {
+    "revision": "3830327b6c8d7ac22452a5e32ffa32799263132c",
+    "rules_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+    "role": "implementer"
+  },
+  "scope": "Exact named Windows cache DirList and filtered server runtime config/headroom/facts only; no enqueue/build/terminal/config/service mutation",
+  "captures": {
+    "windows_prebuild_metadata": {
+      "runner": "451397fcc585f7f7cb9aaf00e42064bb",
+      "exit_code": 0,
+      "data": {
+        "captured_at": "2026-11-11T09:12:05.281012+00:00",
+        "runner": "f766f09294f2e17e3b8a631ffd4e6a4b",
+        "cache_candidates": [
+          {
+            "requested": "C:\\Users\\corph\\.cache\\kiln-offline-release-20261111",
+            "http": 200,
+            "path": "~\\.cache\\kiln-offline-release-20261111",
+            "abs": "C:\\Users\\corph\\.cache\\kiln-offline-release-20261111",
+            "exists": true,
+            "truncated": false,
+            "dirs": [
+              {
+                "name": "windows-native-target",
+                "modified": 1794371388
+              }
+            ],
+            "reported_count": 1
+          },
+          {
+            "requested": "C:\\Users\\corph\\.cache\\kiln-offline-state-fix-20261110",
+            "http": 200,
+            "path": "~\\.cache\\kiln-offline-state-fix-20261110",
+            "abs": "C:\\Users\\corph\\.cache\\kiln-offline-state-fix-20261110",
+            "exists": false,
+            "truncated": false,
+            "dirs": [],
+            "reported_count": 0
+          }
+        ],
+        "ci_config": {
+          "http": 200,
+          "enabled": false,
+          "scheduler": {
+            "headroom": true,
+            "admission": null
+          }
+        },
+        "headroom": {
+          "http": 200,
+          "connected": true,
+          "supported": true,
+          "applied": true,
+          "customized": false,
+          "status_at": 1794388325,
+          "settings_enabled": true,
+          "status": {
+            "settings": "e028f70ad2dd7cbd",
+            "enabled": true,
+            "pacing": "threads"
+          }
+        },
+        "agent": {
+          "name": "f766f09294f2e17e3b8a631ffd4e6a4b",
+          "connected": true,
+          "slots": 8,
+          "busy": 0,
+          "running": [],
+          "sample": {
+            "ts_ms": 1794380406476,
+            "cpu_pct": 28.355387,
+            "cpus": 32,
+            "load1": 0,
+            "mem_total": 132766306304,
+            "mem_used": 18094735360,
+            "disk_total": 992549867520,
+            "disk_used": 828162285568,
+            "net_rx": 39353352960,
+            "net_tx": 1792486674,
+            "procs": 178
+          },
+          "last_seen": 1794388325,
+          "facts": {
+            "os": "windows",
+            "arch": "x86_64",
+            "disk": {
+              "total": 992549867520,
+              "free": 161841254400
+            },
+            "kiln": {
+              "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+              "build": "14ad7179f912",
+              "version": "0.2.0",
+              "target": "x86_64-pc-windows-msvc",
+              "checkout": "C:\\Users\\corph\\Projects/kiln"
+            },
+            "executors": [
+              "host"
+            ]
+          },
+          "fact_keys": [
+            "os",
+            "os_version",
+            "os_distro",
+            "kernel",
+            "arch",
+            "arch_variant",
+            "cpu",
+            "mem",
+            "disk",
+            "gpus",
+            "virt",
+            "executors",
+            "binfmt",
+            "tools",
+            "net",
+            "custom",
+            "probed_at",
+            "kiln",
+            "workspaces",
+            "work",
+            "machine_id",
+            "storage"
+          ]
+        },
+        "ci_route": {
+          "error": "HTTPError",
+          "status": 404
+        },
+        "elapsed_seconds": 0.126
+      }
+    },
+    "windows_cache_children": {
+      "runner": "451397fcc585f7f7cb9aaf00e42064bb",
+      "exit_code": 0,
+      "data": {
+        "captured_at": "2026-11-11T09:12:48.294538+00:00",
+        "directories": [
+          {
+            "requested": "C:\\Users\\corph\\.cache\\kiln-offline-release-20261111\\windows-native-target",
+            "http": 200,
+            "path": "~\\.cache\\kiln-offline-release-20261111\\windows-native-target",
+            "abs": "C:\\Users\\corph\\.cache\\kiln-offline-release-20261111\\windows-native-target",
+            "exists": true,
+            "truncated": false,
+            "dirs": [
+              {
+                "name": "release",
+                "modified": 1794371388
+              },
+              {
+                "name": "x86_64-pc-windows-msvc",
+                "modified": 1794371388
+              }
+            ],
+            "reported_count": 2
+          },
+          {
+            "requested": "C:\\Users\\corph\\.cache\\kiln-offline-release-20261111\\windows-native-target\\x86_64-pc-windows-msvc\\release",
+            "http": 200,
+            "path": "~\\.cache\\kiln-offline-release-20261111\\windows-native-target\\x86_64-pc-windows-msvc\\release",
+            "abs": "C:\\Users\\corph\\.cache\\kiln-offline-release-20261111\\windows-native-target\\x86_64-pc-windows-msvc\\release",
+            "exists": true,
+            "truncated": false,
+            "dirs": [
+              {
+                "name": "deps",
+                "modified": 1794375047
+              },
+              {
+                "name": "build",
+                "modified": 1794371389
+              },
+              {
+                "name": "examples",
+                "modified": 1794371388
+              },
+              {
+                "name": "incremental",
+                "modified": 1794371388
+              }
+            ],
+            "reported_count": 4
+          },
+          {
+            "requested": "C:\\Users\\corph\\.cache\\kiln-offline-release-20261111\\windows-native-target\\release",
+            "http": 200,
+            "path": "~\\.cache\\kiln-offline-release-20261111\\windows-native-target\\release",
+            "abs": "C:\\Users\\corph\\.cache\\kiln-offline-release-20261111\\windows-native-target\\release",
+            "exists": true,
+            "truncated": false,
+            "dirs": [
+              {
+                "name": "deps",
+                "modified": 1794371718
+              },
+              {
+                "name": "build",
+                "modified": 1794371389
+              },
+              {
+                "name": "examples",
+                "modified": 1794371388
+              },
+              {
+                "name": "incremental",
+                "modified": 1794371388
+              }
+            ],
+            "reported_count": 4
+          }
+        ]
+      }
+    },
+    "windows_scheduler_flags": {
+      "runner": "451397fcc585f7f7cb9aaf00e42064bb",
+      "exit_code": 0,
+      "data": {
+        "captured_at": "2026-11-11T09:14:01.471122+00:00",
+        "ci": {
+          "enabled": false,
+          "kiln_workflows": false
+        },
+        "scheduler": {
+          "mode": "slots",
+          "overcommit": {
+            "cpu": 1.5,
+            "memory": 1,
+            "disk": 1
+          },
+          "headroom": true,
+          "admission": null,
+          "target_use": null
+        },
+        "windows": {
+          "facts_probed_at": 1794388333,
+          "cpu": {
+            "model": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+            "cores": 16,
+            "threads": 32,
+            "flags": [
+              "sse4.2",
+              "popcnt",
+              "aes",
+              "pclmulqdq",
+              "avx",
+              "avx2",
+              "fma",
+              "bmi1",
+              "bmi2",
+              "f16c",
+              "sha",
+              "avx512f",
+              "avx512bw",
+              "avx512vl",
+              "avx512vnni",
+              "vaes",
+              "vpclmulqdq"
+            ]
+          },
+          "mem": {
+            "total": 132766306304,
+            "free": 113576214528
+          },
+          "disk": {
+            "total": 992549867520,
+            "free": 161837694976
+          },
+          "tool_names": [
+            "cargo",
+            "docker",
+            "docker buildx",
+            "git",
+            "go",
+            "kubectl",
+            "node"
+          ],
+          "selected_tools": {
+            "cargo": "1.99.0",
+            "node": "24.21.0",
+            "git": "2.56.0"
+          }
+        }
+      }
+    }
+  }
+}

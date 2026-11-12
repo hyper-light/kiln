@@ -1,0 +1,120 @@
+   Compiling libc v0.2.190
+   Compiling syn v3.0.9
+   Compiling jobserver v0.1.35
+   Compiling cc v1.8.0
+   Compiling syn v2.0.119
+   Compiling time-macros v0.2.32
+   Compiling cmake v0.1.58
+   Compiling deranged v0.5.9
+   Compiling time v0.3.55
+   Compiling synstructure v0.13.2
+   Compiling aws-lc-sys v0.46.0
+   Compiling thiserror-impl v2.0.21
+   Compiling thiserror v2.0.21
+   Compiling asn1-rs-derive v0.6.0
+   Compiling asn1-rs-impl v0.2.0
+   Compiling displaydoc v0.2.7
+   Compiling asn1-rs v0.7.2
+   Compiling futures-core v0.3.34
+   Compiling aws-lc-rs v1.18.2 (/private/tmp/kiln-queue-prevention-20261111/vendor/aws-lc-rs/aws-lc-rs)
+   Compiling serde_core v1.0.229
+   Compiling futures-channel v0.3.34
+   Compiling futures-macro v0.3.34
+   Compiling slab v0.4.12
+   Compiling futures-io v0.3.34
+   Compiling futures-util v0.3.34
+   Compiling der-parser v10.0.0
+   Compiling oid-registry v0.8.1
+   Compiling aho-corasick v1.1.5
+   Compiling smallvec v1.15.2
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.154
+   Compiling regex-automata v0.4.18
+   Compiling lock_api v0.4.14
+   Compiling parking_lot_core v0.9.12
+   Compiling digest v0.11.3
+   Compiling futures-executor v0.3.34
+   Compiling rustls-pki-types v1.15.1
+   Compiling yasna v0.6.0
+   Compiling serde_derive v1.0.229
+   Compiling cpufeatures v0.3.1
+   Compiling sha2 v0.11.1
+   Compiling futures v0.3.34
+   Compiling parking_lot v0.12.5
+   Compiling regex v1.13.1
+   Compiling x509-parser v0.18.1
+   Compiling rcgen v0.14.10
+   Compiling kiln-seams v0.2.0 (/private/tmp/kiln-queue-prevention-20261111/crates/kiln-seams)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 28.77s
+     Running unittests src/lib.rs (/Users/adalundhe/.cache/kiln-offline-state-fix-20261110/red-target/debug/deps/kiln_seams-2a63cf83ff455011)
+
+running 47 tests
+test conformance::tests::a_case_that_never_ends_fails_at_its_deadline_and_the_suite_goes_on ... ok
+test artifacts::tests::the_grammars_are_the_distribution_specification_s ... ok
+test blobs::tests::keys_ranges_and_lifetimes_are_checked_alike ... ok
+test forge::sim::tests::w26_r20_bitbucket_refuses_stacks_and_a_queue_naming_what_kiln_does ... ok
+test bus::tests::messages_are_stamped_by_the_bus_clock ... ok
+test clock::tests::time_moves_only_when_moved_and_sleepers_wake_in_deadline_order ... ok
+test clock::tests::a_dropped_sleep_is_forgotten ... ok
+test clock::tests::a_test_waits_for_the_code_under_test_to_come_round_to_its_next_sleep ... ok
+test blobs::tests::its_bytes_and_objects_are_bounded ... ok
+test dependencies::contract::tests::w29_r25_whole_code_comparison_includes_binary_modes_and_refuses_overflow ... ok
+test forge::sim::tests::w26_r20_github_refuses_a_stack_that_isnt_linear_until_it_is_updated ... ok
+test bus::tests::the_simulated_bus_passes_the_bus_suite ... ok
+test clock::tests::the_simulated_clock_passes_the_clock_suite ... ok
+test records::tests::a_wait_from_before_what_the_feed_keeps_is_refused_not_left_waiting ... ok
+test records::tests::deleted_keys_past_what_s_kept_go_and_snapshots_before_them_are_refused ... ok
+test records::tests::its_history_and_rows_are_bounded_and_say_so ... ok
+test placement::tests::it_places_on_the_node_with_the_most_memory_free_and_says_why_it_cant ... ok
+test harness::tests::deliveries_are_stamped_by_the_clock_and_refusals_are_typed ... ok
+test records::tests::a_snapshot_between_a_version_dropped_and_the_next_kept_is_refused_not_answered_wrong ... ok
+test forge::sim::tests::w26_r20_github_merges_a_stack_bottom_up_only_in_a_linear_history ... ok
+test harness::tests::the_simulated_harness_passes_the_harness_port_suite ... ok
+test search::tests::w26_r07_the_simulator_reads_definitions_and_patterns ... ok
+test sandbox::tests::the_simulated_sandbox_passes_the_sandbox_suite ... ok
+test secrets::tests::only_a_value_s_length_shows ... ok
+test records::tests::the_simulated_store_passes_the_records_suite ... ok
+test forge::sim::tests::w27_r03_a_change_reads_its_first_250_commits_and_keeps_them_once_merged ... ok
+test forge::sim::tests::w26_r20_gitlab_refuses_a_21st_stacked_merge_request_and_another_author_s ... ok
+test spawn::tests::a_full_executor_refuses_and_a_stopped_one_too ... ok
+test search::tests::w26_r07_a_text_query_is_words_or_a_regex ... ok
+test spawn::tests::tasks_run_only_when_the_test_says_in_the_order_they_were_woken ... ok
+test dependencies::contract::tests::w29_r23_simulated_sources_pass_the_source_contract ... ok
+test secrets::tests::the_simulated_store_passes_the_secrets_suite ... ok
+test sandbox::tests::a_microvm_is_refused_as_unsupported_and_runs_are_bounded ... ok
+test forge::suite::tests::w26_ac09_the_bitbucket_simulator_passes_the_forge_suite ... ok
+test artifacts::tests::the_simulated_registry_passes_the_artifacts_suite ... ok
+test forge::sim::tests::w26_r20_not_modified_reads_are_free_and_the_limit_holds ... ok
+test forge::suite::tests::w26_ac09_the_github_simulator_passes_the_forge_suite ... ok
+test dependencies::contract::tests::w29_r23_source_tables_refuse_overflow_without_replacing_existing_data ... ok
+test spawn::tests::a_task_that_wakes_itself_forever_ends_the_run_at_its_budget ... ok
+test forge::suite::tests::w26_ac09_the_gitlab_simulator_passes_the_forge_suite ... ok
+test spawn::tests::the_simulated_executor_passes_the_spawn_suite ... ok
+test sigstore::tests::its_log_is_bounded_its_tree_rfc_6962s_and_its_keys_its_seeds ... ok
+test sigstore::tests::the_simulated_sigstore_passes_the_sigstore_suite ... ok
+test search::tests::w26_r07_the_simulated_search_passes_the_search_suite ... ok
+test placement::tests::the_simulated_placement_passes_the_placement_suite ... ok
+test blobs::tests::the_simulated_store_passes_the_blobs_suite ... ok
+test harness::tests::it_keeps_nothing_for_agents_it_doesn_t_know_and_what_closed_ones_heard_is_bounded ... ok
+
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/doc_truth.rs (/Users/adalundhe/.cache/kiln-offline-state-fix-20261110/red-target/debug/deps/doc_truth-5e0acad53491633a)
+
+running 3 tests
+test a_bound_said_wrong_or_a_handed_out_trait_s_method_left_out_is_caught ... ok
+test a_reworded_clause_or_a_missing_method_is_caught ... ok
+test docs_seams_md_states_each_contract_as_the_code_has_it ... FAILED
+
+failures:
+
+---- docs_seams_md_states_each_contract_as_the_code_has_it stdout ----
+Error: "docs/seams.md and the code part:\nRecords: the doc says the methods are {\"changes\", \"commit\", \"get\", \"head\", \"scan\", \"wait\"}, the trait has {\"changes\", \"commit\", \"commit_owned\", \"get\", \"head\", \"scan\", \"wait\"}\nHarnessPort: the doc says the methods are {\"agent\", \"agents\", \"catalog\", \"send\"}, the trait has {\"agent\", \"agents\", \"catalog\", \"send\", \"send_status\"}"
+
+
+failures:
+    docs_seams_md_states_each_contract_as_the_code_has_it
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p kiln-seams --test doc_truth`

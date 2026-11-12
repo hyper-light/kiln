@@ -91,7 +91,9 @@ fn now_us() -> u64 {
 /// yes where no runner started headroom.
 pub fn admit(session: &str, class: Class) -> bool {
     let s = &*SHARED;
-    if !s.running.load(Ordering::Acquire) || !s.enabled.load(Ordering::Acquire) || class == Class::Person {
+    // W05-R03: an unbound core has no session whose turn can be granted or released, just as
+    // `turn_ended` and the message meter ignore it. It must not enter another runner's ledger.
+    if session.is_empty() || !s.running.load(Ordering::Acquire) || !s.enabled.load(Ordering::Acquire) || class == Class::Person {
         return true;
     }
     let now = now_us();
@@ -652,6 +654,12 @@ fn run(ctx: Ctx, mut settings: Settings) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn w20_r01_an_anonymous_protocol_core_never_joins_runner_admission() {
+        assert!(admit("", Class::Agent));
+        assert!(!held(""), "an anonymous core has no runner session to wait for");
+    }
 
     pub(crate) struct Admission {
         session: String,

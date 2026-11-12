@@ -307,7 +307,7 @@ impl Fleet {
                     Down::Start { fence, elsewhere } => self.start(o, r, &run, fence, elsewhere, &mut out),
                     Down::Ack => a.ack(peer, &run),
                     // Its runners don't name `place.fast` and its owners don't restart: neither is said.
-                    Down::Fast { .. } | Down::Sync => {}
+                    Down::Fast { .. } | Down::Sync | Down::FastRelease { .. } => {}
                 }
                 self.replies(r, out);
             }

@@ -1,0 +1,49 @@
+{
+  "exit_code": 101,
+  "source_unchanged": false,
+  "errors": [
+    {
+      "message": "cannot find type `Arc` in this scope",
+      "rendered": "error[E0433]: cannot find type `Arc` in this scope\n    --> crates/kiln/src/harness/core.rs:1845:27\n     |\n1845 |             let records = Arc::new(kiln_seams::records::SimRecords::new());\n     |                           ^^^ use of undeclared type `Arc`\n     |\n     = note: struct `crate::workspace::follow::tests::Arc` exists but is inaccessible\nhelp: consider importing this struct\n     |\n1819 +     use std::sync::Arc;\n     |\n\n"
+    },
+    {
+      "message": "cannot find type `Arc` in this scope",
+      "rendered": "error[E0433]: cannot find type `Arc` in this scope\n    --> crates/kiln/src/harness/core.rs:1846:25\n     |\n1846 |             let inbox = Arc::new(crate::harness::inbox::Inbox::new(records, crate::harness::inbox::Limits::default()));\n     |                         ^^^ use of undeclared type `Arc`\n     |\n     = note: struct `crate::workspace::follow::tests::Arc` exists but is inaccessible\nhelp: consider importing this struct\n     |\n1819 +     use std::sync::Arc;\n     |\n\n"
+    },
+    {
+      "message": "cannot find module or crate `wait` in this scope",
+      "rendered": "error[E0433]: cannot find module or crate `wait` in this scope\n    --> crates/kiln/src/harness/ops.rs:1996:22\n     |\n1996 |         let expected=wait::handoff_digest(\"handoff\",Some(1),std::slice::from_ref(&message)).map_err(|e|anyhow::anyhow!(\"{e:?}\"))?;\n     |                      ^^^^ use of unresolved module or unlinked crate `wait`\n     |\nhelp: to make use of source file crates/kiln/src/harness/wait.rs, use `mod wait` in this file to declare the module\n    -->  crates/kiln/src/lib.rs:7:1\n     |\n   7 + mod wait;\n     |\nhelp: consider importing this module\n     |\n1365 +     use crate::harness::wait;\n     |\n\n"
+    },
+    {
+      "message": "cannot find function `stage_handoff` in this scope",
+      "rendered": "error[E0425]: cannot find function `stage_handoff` in this scope\n    --> crates/kiln/src/harness/ops.rs:1997:20\n     |\n1997 |         assert_eq!(stage_handoff(&mut response,\"handoff\",Some(1),vec![message.clone()]),Ok(expected));\n     |                    ^^^^^^^^^^^^^ not found in this scope\n     |\nhelp: consider importing this function\n     |\n1365 +     use crate::harness::ops::stage_handoff;\n     |\n\n"
+    },
+    {
+      "message": "cannot find function `clear_handoff` in this scope",
+      "rendered": "error[E0425]: cannot find function `clear_handoff` in this scope\n    --> crates/kiln/src/harness/ops.rs:2001:9\n     |\n2001 |         clear_handoff(&mut response);\n     |         ^^^^^^^^^^^^^ not found in this scope\n     |\nhelp: consider importing this function\n     |\n1365 +     use crate::harness::ops::clear_handoff;\n     |\n\n"
+    },
+    {
+      "message": "cannot find function `stage_handoff` in this scope",
+      "rendered": "error[E0425]: cannot find function `stage_handoff` in this scope\n    --> crates/kiln/src/harness/ops.rs:2016:20\n     |\n2016 | ...   assert_eq!(stage_handoff(&mut response,\"handoff\",Some(1),vec![message]),Err(Failure::Source(super::super::state_view::Error:...\n     |                  ^^^^^^^^^^^^^ not found in this scope\n     |\nhelp: consider importing this function\n     |\n1365 +     use crate::harness::ops::stage_handoff;\n     |\n\n"
+    },
+    {
+      "message": "cannot find function `stage_handoff` in this scope",
+      "rendered": "error[E0425]: cannot find function `stage_handoff` in this scope\n    --> crates/kiln/src/harness/ops.rs:2020:20\n     |\n2020 | ...   assert_eq!(stage_handoff(&mut reserved,\"handoff\",Some(1),vec![json!({\"id\":\"original\",\"from\":\"peer\",\"name\":null,\"text\":\"body\"...\n     |                  ^^^^^^^^^^^^^ not found in this scope\n     |\nhelp: consider importing this function\n     |\n1365 +     use crate::harness::ops::stage_handoff;\n     |\n\n"
+    }
+  ],
+  "free_before": 40344027136,
+  "free_after": 37134884864,
+  "command": [
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "test",
+    "--no-run",
+    "--locked",
+    "-p",
+    "kiln",
+    "--lib",
+    "--message-format=json"
+  ]
+}

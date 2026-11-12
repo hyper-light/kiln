@@ -1,0 +1,860 @@
+{
+  "policy": {
+    "revision": "7d7e0855a5073ed5163b4fe7ed3355c9ed7c2506",
+    "rules_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+    "role": "implementer",
+    "scope": "read-only rollout/agent metadata and evidence; no source/service/API mutation"
+  },
+  "observer": {
+    "primary": "451397fcc585f7f7cb9aaf00e42064bb",
+    "needs": "cpus=1,mem=1g,disk=1g",
+    "sync": false,
+    "helper": "kiln-offline-publish-20261111.py::credential",
+    "credential_path": "/home/adalundhe/.config/kiln/server.env",
+    "endpoints": [
+      "GET /healthz/server",
+      "GET /api/updates",
+      "GET /api/agents",
+      "/api/jobs/01a1c90a52ef71d0a53bc8bafd35b1fa"
+    ],
+    "agent_tool": "agents.get",
+    "note": "Authentication value never emitted; URLs removed from native progress. No transcript or message body retained."
+  },
+  "summary": {
+    "captured_at": "2026-11-11T07:14:34.553420+00:00",
+    "server_commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+    "server_build": "87107f09976e",
+    "connected": 9,
+    "connected_current": 8,
+    "connected_pending": 1,
+    "offline": 3,
+    "pending_runner_ids": [
+      "b24c5c951260dcdfd0972f2aeaf3cf51"
+    ],
+    "offline_runner_ids": [
+      "75694786916abd6207b67832b9b1e85e",
+      "f3f618f29b31df31a1f52482b39578c2",
+      "fedora.attlocal.net"
+    ],
+    "current_ci_job": "01a1c90a52ef71d0a53bc8bafd35b1fa",
+    "current_ci_job_runner": "cec37f60f22c5a60d27f08f4d2e5daa8",
+    "current_ci_job_prevents_latest_switch": false,
+    "pending_mac_running_jobs": [
+      {
+        "runner": "b24c5c951260dcdfd0972f2aeaf3cf51",
+        "busy": 0,
+        "running": []
+      }
+    ],
+    "pending_mac_reason": "API reports native upgrade still running/reached=false; no running-job blocker shown. No causal inference from absence of job."
+  },
+  "fleet": {
+    "captured_at": "2026-11-11T07:14:34.553420+00:00",
+    "errors": {},
+    "health": {
+      "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+      "version": "0.2.0"
+    },
+    "newest": {
+      "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+      "from": "server",
+      "since": 1794380327
+    },
+    "primary": "451397fcc585f7f7cb9aaf00e42064bb",
+    "read_only": true,
+    "runner_work": [
+      {
+        "arch": "x86_64",
+        "busy": 0,
+        "connected": true,
+        "draining": false,
+        "hostname": "adacachy2",
+        "name": "00aad8daff2fa3c9daa65d53c425d450",
+        "os": "linux",
+        "running": []
+      },
+      {
+        "arch": "aarch64",
+        "busy": 0,
+        "connected": true,
+        "draining": false,
+        "hostname": "Mac",
+        "name": "2768d0d5d2974f1e21d348edadff9d1b",
+        "os": "macos",
+        "running": []
+      },
+      {
+        "arch": "x86_64",
+        "busy": 0,
+        "connected": true,
+        "draining": false,
+        "hostname": "adacachy",
+        "name": "451397fcc585f7f7cb9aaf00e42064bb",
+        "os": "linux",
+        "running": []
+      },
+      {
+        "arch": "x86_64",
+        "busy": 0,
+        "connected": true,
+        "draining": false,
+        "hostname": "kiln-a094a12d.attlocal.net",
+        "name": "8fadc1ec213332e16cb0d915a3fb913f",
+        "os": "linux",
+        "running": []
+      },
+      {
+        "arch": "aarch64",
+        "busy": 0,
+        "connected": true,
+        "draining": false,
+        "hostname": "Mac",
+        "name": "b24c5c951260dcdfd0972f2aeaf3cf51",
+        "os": "macos",
+        "running": []
+      },
+      {
+        "arch": "aarch64",
+        "busy": 1,
+        "connected": true,
+        "draining": false,
+        "hostname": "Adas-Mac-Studio-3.local",
+        "name": "cec37f60f22c5a60d27f08f4d2e5daa8",
+        "os": "macos",
+        "running": [
+          "01a1c90a52ef71d0a53bc8bafd35b1fa"
+        ]
+      },
+      {
+        "arch": "aarch64",
+        "busy": 0,
+        "connected": true,
+        "draining": false,
+        "hostname": "Adas-Mac-Studio.local",
+        "name": "d1323898b255a3ed435eb83fa0f7b0cf",
+        "os": "macos",
+        "running": []
+      },
+      {
+        "arch": "aarch64",
+        "busy": 0,
+        "connected": true,
+        "draining": false,
+        "hostname": "Adas-MacBook-Pro-2.local",
+        "name": "e30189ea29182644fe5a4b2e06c7dac2",
+        "os": "macos",
+        "running": []
+      },
+      {
+        "arch": "x86_64",
+        "busy": 0,
+        "connected": true,
+        "draining": false,
+        "hostname": "Jupiter",
+        "name": "f766f09294f2e17e3b8a631ffd4e6a4b",
+        "os": "windows",
+        "running": []
+      },
+      {
+        "arch": "aarch64",
+        "busy": 0,
+        "connected": false,
+        "draining": false,
+        "hostname": "adalundhe-MacBook-Pro",
+        "name": "75694786916abd6207b67832b9b1e85e",
+        "os": "macos",
+        "running": []
+      },
+      {
+        "arch": "aarch64",
+        "busy": 0,
+        "connected": false,
+        "draining": false,
+        "hostname": "Adas-MacBook-Pro-3.local",
+        "name": "f3f618f29b31df31a1f52482b39578c2",
+        "os": "macos",
+        "running": []
+      },
+      {
+        "arch": "x86_64",
+        "busy": 0,
+        "connected": false,
+        "draining": false,
+        "hostname": "kiln-a094a12d.attlocal.net",
+        "name": "fedora.attlocal.net",
+        "os": "linux",
+        "running": []
+      }
+    ],
+    "runners": [
+      {
+        "arch": "x86_64",
+        "build": "87107f09976e",
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "connected": true,
+        "hostname": "adacachy2",
+        "how": null,
+        "instances": [
+          {
+            "agents": 0,
+            "build": "87107f09976e",
+            "id": "01a1c967f75b71dc9bf12f761ace8456",
+            "jobs": 0,
+            "newest": true,
+            "terminals": 0,
+            "version": "0.2.0"
+          }
+        ],
+        "locked": false,
+        "method": "native",
+        "name": "00aad8daff2fa3c9daa65d53c425d450",
+        "next": null,
+        "os": "linux",
+        "policy": "notify",
+        "standing": "current",
+        "target": "x86_64-unknown-linux-musl",
+        "target_build": "87107f09976e",
+        "up_to_date": true,
+        "version": "0.2.0"
+      },
+      {
+        "arch": "aarch64",
+        "build": "be797cf09ec9",
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "connected": true,
+        "hostname": "Mac",
+        "how": null,
+        "instances": [
+          {
+            "agents": 0,
+            "build": "be797cf09ec9",
+            "id": "main",
+            "jobs": 0,
+            "newest": true,
+            "terminals": 0,
+            "version": "0.2.0"
+          }
+        ],
+        "locked": false,
+        "method": "native",
+        "name": "2768d0d5d2974f1e21d348edadff9d1b",
+        "next": null,
+        "os": "macos",
+        "policy": "notify",
+        "standing": "current",
+        "target": "aarch64-apple-darwin",
+        "target_build": "be797cf09ec9",
+        "up_to_date": true,
+        "version": "0.2.0"
+      },
+      {
+        "arch": "x86_64",
+        "build": "87107f09976e",
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "connected": true,
+        "hostname": "adacachy",
+        "how": null,
+        "instances": [
+          {
+            "agents": 46,
+            "build": "87107f09976e",
+            "id": "01a1c967ed607739b5d0bcbf865f36c0",
+            "jobs": 0,
+            "newest": true,
+            "terminals": 0,
+            "version": "0.2.0"
+          },
+          {
+            "agents": 4,
+            "build": "5241ae82702e",
+            "id": "01a1b969939774669c25507cfecef037",
+            "jobs": 0,
+            "newest": false,
+            "terminals": 0,
+            "version": "0.2.0"
+          }
+        ],
+        "locked": false,
+        "method": "native",
+        "name": "451397fcc585f7f7cb9aaf00e42064bb",
+        "next": null,
+        "os": "linux",
+        "policy": "notify",
+        "standing": "current",
+        "target": "x86_64-unknown-linux-musl",
+        "target_build": "87107f09976e",
+        "up_to_date": true,
+        "version": "0.2.0"
+      },
+      {
+        "arch": "x86_64",
+        "build": "87107f09976e",
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "connected": true,
+        "hostname": "kiln-a094a12d.attlocal.net",
+        "how": null,
+        "instances": [
+          {
+            "agents": 3,
+            "build": "87107f09976e",
+            "id": "01a1b969-ca7d-7677-8bcf-29c1065a3a1e",
+            "jobs": 0,
+            "newest": true,
+            "terminals": 0,
+            "version": "0.2.0"
+          }
+        ],
+        "locked": false,
+        "method": "native",
+        "name": "8fadc1ec213332e16cb0d915a3fb913f",
+        "next": null,
+        "os": "linux",
+        "policy": "notify",
+        "standing": "current",
+        "target": "x86_64-unknown-linux-musl",
+        "target_build": "87107f09976e",
+        "up_to_date": true,
+        "version": "0.2.0"
+      },
+      {
+        "arch": "aarch64",
+        "build": "4dfd3bb19754",
+        "commit": "32f174b2c46a634ae0b072f3dc73764919523327",
+        "connected": true,
+        "hostname": "Mac",
+        "how": "upgrading",
+        "instances": [
+          {
+            "agents": 1,
+            "build": "4dfd3bb19754",
+            "id": "01a1b1a064b576a5aa2d24275bba91f9",
+            "jobs": 0,
+            "newest": true,
+            "terminals": 0,
+            "version": "0.2.0"
+          }
+        ],
+        "locked": false,
+        "method": "native",
+        "name": "b24c5c951260dcdfd0972f2aeaf3cf51",
+        "next": "is upgrading to f555736bd887",
+        "os": "macos",
+        "policy": "notify",
+        "standing": "behind",
+        "target": "aarch64-apple-darwin",
+        "target_build": "be797cf09ec9",
+        "up_to_date": false,
+        "version": "0.2.0"
+      },
+      {
+        "arch": "aarch64",
+        "build": "be797cf09ec9",
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "connected": true,
+        "hostname": "Adas-Mac-Studio-3.local",
+        "how": null,
+        "instances": [
+          {
+            "agents": 0,
+            "build": "be797cf09ec9",
+            "id": "01a1c971f84f721ba6af2219e6c5960e",
+            "jobs": 0,
+            "newest": true,
+            "terminals": 0,
+            "version": "0.2.0"
+          },
+          {
+            "agents": 0,
+            "build": "f6246da174bd",
+            "id": "01a1c7fc969b7439bc215a7a4a2cfe25",
+            "jobs": 1,
+            "newest": false,
+            "terminals": 0,
+            "version": "0.2.0"
+          }
+        ],
+        "locked": false,
+        "method": "native",
+        "name": "cec37f60f22c5a60d27f08f4d2e5daa8",
+        "next": null,
+        "os": "macos",
+        "policy": "notify",
+        "standing": "current",
+        "target": "aarch64-apple-darwin",
+        "target_build": "be797cf09ec9",
+        "up_to_date": true,
+        "version": "0.2.0"
+      },
+      {
+        "arch": "aarch64",
+        "build": "be797cf09ec9",
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "connected": true,
+        "hostname": "Adas-Mac-Studio.local",
+        "how": null,
+        "instances": [
+          {
+            "agents": 0,
+            "build": "be797cf09ec9",
+            "id": "01a1c9745b84721288e52200e2393a3d",
+            "jobs": 0,
+            "newest": true,
+            "terminals": 0,
+            "version": "0.2.0"
+          }
+        ],
+        "locked": false,
+        "method": "native",
+        "name": "d1323898b255a3ed435eb83fa0f7b0cf",
+        "next": null,
+        "os": "macos",
+        "policy": "notify",
+        "standing": "current",
+        "target": "aarch64-apple-darwin",
+        "target_build": "be797cf09ec9",
+        "up_to_date": true,
+        "version": "0.2.0"
+      },
+      {
+        "arch": "aarch64",
+        "build": "be797cf09ec9",
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "connected": true,
+        "hostname": "Adas-MacBook-Pro-2.local",
+        "how": null,
+        "instances": [
+          {
+            "agents": 67,
+            "build": "be797cf09ec9",
+            "id": "main",
+            "jobs": 0,
+            "newest": true,
+            "terminals": 0,
+            "version": "0.2.0"
+          }
+        ],
+        "locked": false,
+        "method": "native",
+        "name": "e30189ea29182644fe5a4b2e06c7dac2",
+        "next": null,
+        "os": "macos",
+        "policy": "notify",
+        "standing": "current",
+        "target": "aarch64-apple-darwin",
+        "target_build": "be797cf09ec9",
+        "up_to_date": true,
+        "version": "0.2.0"
+      },
+      {
+        "arch": "x86_64",
+        "build": "14ad7179f912",
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "connected": true,
+        "hostname": "Jupiter",
+        "how": null,
+        "instances": [
+          {
+            "agents": 4,
+            "build": "14ad7179f912",
+            "id": "main",
+            "jobs": 0,
+            "newest": true,
+            "terminals": 0,
+            "version": "0.2.0"
+          }
+        ],
+        "locked": false,
+        "method": "native",
+        "name": "f766f09294f2e17e3b8a631ffd4e6a4b",
+        "next": null,
+        "os": "windows",
+        "policy": "notify",
+        "standing": "current",
+        "target": "x86_64-pc-windows-msvc",
+        "target_build": "14ad7179f912",
+        "up_to_date": true,
+        "version": "0.2.0"
+      },
+      {
+        "arch": "aarch64",
+        "build": null,
+        "commit": null,
+        "connected": false,
+        "hostname": "adalundhe-MacBook-Pro",
+        "how": null,
+        "instances": [],
+        "locked": false,
+        "method": "terminal",
+        "name": "75694786916abd6207b67832b9b1e85e",
+        "next": null,
+        "os": "macos",
+        "policy": "notify",
+        "standing": "unknown",
+        "target": "aarch64-apple-darwin",
+        "target_build": "be797cf09ec9",
+        "up_to_date": false,
+        "version": "0.2.0"
+      },
+      {
+        "arch": "aarch64",
+        "build": null,
+        "commit": null,
+        "connected": false,
+        "hostname": "Adas-MacBook-Pro-3.local",
+        "how": null,
+        "instances": [],
+        "locked": false,
+        "method": "terminal",
+        "name": "f3f618f29b31df31a1f52482b39578c2",
+        "next": null,
+        "os": "macos",
+        "policy": "notify",
+        "standing": "unknown",
+        "target": "aarch64-apple-darwin",
+        "target_build": "be797cf09ec9",
+        "up_to_date": false,
+        "version": "0.2.0"
+      },
+      {
+        "arch": "x86_64",
+        "build": null,
+        "commit": null,
+        "connected": false,
+        "hostname": "kiln-a094a12d.attlocal.net",
+        "how": null,
+        "instances": [],
+        "locked": false,
+        "method": "terminal",
+        "name": "fedora.attlocal.net",
+        "next": null,
+        "os": "linux",
+        "policy": "notify",
+        "standing": "unknown",
+        "target": "x86_64-unknown-linux-musl",
+        "target_build": "87107f09976e",
+        "up_to_date": false,
+        "version": "0.2.0"
+      }
+    ],
+    "server": {
+      "action": null,
+      "build": "87107f09976e",
+      "checking": true,
+      "mode": "service",
+      "newer": false,
+      "target": "x86_64-unknown-linux-musl",
+      "version": "0.2.0"
+    },
+    "upgrade_jobs": [
+      {
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "ended_at": 1794380863,
+        "error": null,
+        "from_build": "5241ae82702e",
+        "id": "01a1c96ef11d740eb6b5761ac328bb65",
+        "kind": "runner",
+        "method": "native",
+        "native_progress": [
+          "downloading <url>",
+          "asked the runner to upgrade itself",
+          "verified build 87107f09976e (353177136 bytes)",
+          "kiln install --agent --upgrade --service kiln-agent-01a14c4f-01a1576c-01a19962",
+          "Upgrading the kiln agent beside the running one"
+        ],
+        "reached": true,
+        "started_at": 1794380853,
+        "state": "done",
+        "target": "8fadc1ec213332e16cb0d915a3fb913f",
+        "to_build": "87107f09976e"
+      },
+      {
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "ended_at": 1794380862,
+        "error": null,
+        "from_build": "5241ae82702e",
+        "id": "01a1c96dadb174fd94347678d44a5bbb",
+        "kind": "runner",
+        "method": "native",
+        "native_progress": [
+          "upgrading kiln-a094a12d.attlocal.net to build 87107f09976e (x86_64-unknown-linux-musl); nothing it runs is stopped",
+          "asked the runner to upgrade itself",
+          "downloading <url>",
+          "failed: create /home/adalundhe/.local/share/kiln/agent/instances/01a1b969-ca7d-7677-8bcf-29c1065a3a1e/kiln-upgrade: Read-only file system (os error 30)",
+          "upgraded after all: it got there after kiln had stopped waiting (create /home/adalundhe/.local/share/kiln/agent/instances/01a1b969-ca7d-7677-8bcf-29c1065a3a1e/kiln-upgrade: Read-only file system (os error 30))"
+        ],
+        "reached": true,
+        "started_at": 1794380770,
+        "state": "done",
+        "target": "8fadc1ec213332e16cb0d915a3fb913f",
+        "to_build": "87107f09976e"
+      },
+      {
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "ended_at": 1794380862,
+        "error": null,
+        "from_build": "5241ae82702e",
+        "id": "01a1c96d74e37584a2ae637a14892b80",
+        "kind": "runner",
+        "method": "native",
+        "native_progress": [
+          "upgrading kiln-a094a12d.attlocal.net to build 87107f09976e (x86_64-unknown-linux-musl); nothing it runs is stopped",
+          "asked the runner to upgrade itself",
+          "downloading <url>",
+          "failed: create /home/adalundhe/.local/share/kiln/agent/instances/01a1b969-ca7d-7677-8bcf-29c1065a3a1e/kiln-upgrade: Read-only file system (os error 30)",
+          "upgraded after all: it got there after kiln had stopped waiting (create /home/adalundhe/.local/share/kiln/agent/instances/01a1b969-ca7d-7677-8bcf-29c1065a3a1e/kiln-upgrade: Read-only file system (os error 30))"
+        ],
+        "reached": true,
+        "started_at": 1794380756,
+        "state": "done",
+        "target": "8fadc1ec213332e16cb0d915a3fb913f",
+        "to_build": "87107f09976e"
+      },
+      {
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "ended_at": 1794380406,
+        "error": null,
+        "from_build": "0d1adebaf2a7",
+        "id": "01a1c967d7b6764c8cd517fc641b5f01",
+        "kind": "runner",
+        "method": "native",
+        "native_progress": [
+          "asked the runner to upgrade itself",
+          "downloading <url>",
+          "verified build 14ad7179f912 (414221824 bytes)",
+          "kiln install --agent --upgrade --service kiln-agent",
+          "Upgrading the kiln agent beside the running one"
+        ],
+        "reached": true,
+        "started_at": 1794380388,
+        "state": "done",
+        "target": "f766f09294f2e17e3b8a631ffd4e6a4b",
+        "to_build": "14ad7179f912"
+      },
+      {
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "ended_at": 1794381185,
+        "error": null,
+        "from_build": "f6246da174bd",
+        "id": "01a1c967d7b577df995686b53773f581",
+        "kind": "runner",
+        "method": "native",
+        "native_progress": [
+          "asked the runner to upgrade itself",
+          "downloading <url>",
+          "verified build be797cf09ec9 (310278944 bytes)",
+          "kiln install --agent --upgrade --service kiln-agent",
+          "Upgrading the kiln agent beside the running one"
+        ],
+        "reached": true,
+        "started_at": 1794380388,
+        "state": "done",
+        "target": "e30189ea29182644fe5a4b2e06c7dac2",
+        "to_build": "be797cf09ec9"
+      },
+      {
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "ended_at": 1794381249,
+        "error": null,
+        "from_build": "48d63ecf843f",
+        "id": "01a1c967d7b577df941b3c31a688582f",
+        "kind": "runner",
+        "method": "native",
+        "native_progress": [
+          "upgrading adas-mac-studio.local-2 to build be797cf09ec9 (aarch64-apple-darwin); nothing it runs is stopped",
+          "asked the runner to upgrade itself: the new build starts beside it and takes over",
+          "downloading <url>",
+          "verified build be797cf09ec9 (310278944 bytes)"
+        ],
+        "reached": true,
+        "started_at": 1794380388,
+        "state": "done",
+        "target": "d1323898b255a3ed435eb83fa0f7b0cf",
+        "to_build": "be797cf09ec9"
+      },
+      {
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "ended_at": 1794381092,
+        "error": null,
+        "from_build": "f6246da174bd",
+        "id": "01a1c967d7b472988f35812da476fd90",
+        "kind": "runner",
+        "method": "native",
+        "native_progress": [
+          "asked the runner to upgrade itself: the new build starts beside it and takes over",
+          "downloading <url>",
+          "adas-mac-studio.local waits for its running job before it switches",
+          "adas-mac-studio.local waits for its running job before it switches",
+          "verified build be797cf09ec9 (310278944 bytes)"
+        ],
+        "reached": true,
+        "started_at": 1794380388,
+        "state": "done",
+        "target": "cec37f60f22c5a60d27f08f4d2e5daa8",
+        "to_build": "be797cf09ec9"
+      },
+      {
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "ended_at": null,
+        "error": null,
+        "from_build": "4dfd3bb19754",
+        "id": "01a1c967d7b374a8a45d42685c8a174d",
+        "kind": "runner",
+        "method": "native",
+        "native_progress": [
+          "asked the runner to upgrade itself",
+          "downloading <url>",
+          "verified build be797cf09ec9 (310278944 bytes)",
+          "kiln install --agent --upgrade --service kiln-agent",
+          "Upgrading the kiln agent beside the running one"
+        ],
+        "reached": false,
+        "started_at": 1794380388,
+        "state": "running",
+        "target": "b24c5c951260dcdfd0972f2aeaf3cf51",
+        "to_build": "be797cf09ec9"
+      },
+      {
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "ended_at": 1794380862,
+        "error": null,
+        "from_build": "5241ae82702e",
+        "id": "01a1c967d7b277b1b91e2d7459f1f1c5",
+        "kind": "runner",
+        "method": "native",
+        "native_progress": [
+          "upgrading kiln-a094a12d.attlocal.net to build 87107f09976e (x86_64-unknown-linux-musl); nothing it runs is stopped",
+          "asked the runner to upgrade itself",
+          "downloading <url>",
+          "failed: create /home/adalundhe/.local/share/kiln/agent/instances/01a1b969-ca7d-7677-8bcf-29c1065a3a1e/kiln-upgrade: Read-only file system (os error 30)",
+          "upgraded after all: it got there after kiln had stopped waiting (create /home/adalundhe/.local/share/kiln/agent/instances/01a1b969-ca7d-7677-8bcf-29c1065a3a1e/kiln-upgrade: Read-only file system (os error 30))"
+        ],
+        "reached": true,
+        "started_at": 1794380388,
+        "state": "done",
+        "target": "8fadc1ec213332e16cb0d915a3fb913f",
+        "to_build": "87107f09976e"
+      },
+      {
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "ended_at": 1794380414,
+        "error": null,
+        "from_build": "ed396ecc6495",
+        "id": "01a1c967d7b071fea4f2b40b42dfbdd4",
+        "kind": "runner",
+        "method": "native",
+        "native_progress": [
+          "upgrading adacachy to build 87107f09976e (x86_64-unknown-linux-musl); nothing it runs is stopped",
+          "asked the runner to upgrade itself: the new build starts beside it and takes over",
+          "downloading <url>",
+          "verified build 87107f09976e (353177136 bytes)"
+        ],
+        "reached": true,
+        "started_at": 1794380388,
+        "state": "done",
+        "target": "451397fcc585f7f7cb9aaf00e42064bb",
+        "to_build": "87107f09976e"
+      },
+      {
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "ended_at": 1794381178,
+        "error": null,
+        "from_build": "48d63ecf843f",
+        "id": "01a1c967d7b071fea1c35a3e9893d98b",
+        "kind": "runner",
+        "method": "native",
+        "native_progress": [
+          "upgrading adas-mac-studio-3.local to build be797cf09ec9 (aarch64-apple-darwin); nothing it runs is stopped",
+          "asked the runner to upgrade itself",
+          "downloading <url>"
+        ],
+        "reached": true,
+        "started_at": 1794380388,
+        "state": "done",
+        "target": "2768d0d5d2974f1e21d348edadff9d1b",
+        "to_build": "be797cf09ec9"
+      },
+      {
+        "commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+        "ended_at": 1794380423,
+        "error": null,
+        "from_build": "5241ae82702e",
+        "id": "01a1c967d7af70d8b89d3955c69256ad",
+        "kind": "runner",
+        "method": "native",
+        "native_progress": [
+          "upgrading adacachy2 to build 87107f09976e (x86_64-unknown-linux-musl); nothing it runs is stopped",
+          "asked the runner to upgrade itself: the new build starts beside it and takes over",
+          "downloading <url>",
+          "adacachy2 waits for its 5 running jobs before it switches",
+          "verified build 87107f09976e (353177136 bytes)"
+        ],
+        "reached": true,
+        "started_at": 1794380388,
+        "state": "done",
+        "target": "00aad8daff2fa3c9daa65d53c425d450",
+        "to_build": "87107f09976e"
+      }
+    ]
+  },
+  "ci_job": {
+    "captured_at": "2026-11-11T07:14:57.777561+00:00",
+    "job": {
+      "agent": "cec37f60f22c5a60d27f08f4d2e5daa8",
+      "attempt": 0,
+      "exit_code": null,
+      "finished_at": null,
+      "id": "01a1c90a52ef71d0a53bc8bafd35b1fa",
+      "run_id": "01a1c90a52ef71d09d13063b97f7ed63",
+      "started_at": 1794380344,
+      "status": "running",
+      "steps": [
+        {
+          "exit_code": 0,
+          "finished_at": 1794380363,
+          "name": "ui",
+          "started_at": 1794380347,
+          "status": "succeeded"
+        },
+        {
+          "exit_code": 0,
+          "finished_at": 1794381034,
+          "name": "build",
+          "started_at": 1794380363,
+          "status": "succeeded"
+        }
+      ]
+    },
+    "path": "/api/jobs/01a1c90a52ef71d0a53bc8bafd35b1fa"
+  },
+  "shards": {
+    "captured_at": "2026-11-11T07:14:53.685Z",
+    "id": "01a148884a4770fdaf0111f3f792a248",
+    "status": "running",
+    "stand": "working",
+    "target": "agent:e30189ea29182644fe5a4b2e06c7dac2",
+    "queued": 7,
+    "queue_index_count": null,
+    "state_queue_count": 7,
+    "owner_build": "be797cf09ec9",
+    "owner_commit": "f555736bd887a4196c8841564cb9b4d6c1ede95f",
+    "owner_instances": [
+      {
+        "agents": 67,
+        "build": "be797cf09ec9",
+        "id": "main",
+        "jobs": 0,
+        "newest": true,
+        "terminals": 0,
+        "version": "0.2.0"
+      }
+    ],
+    "owner_evidence": "agent target matched exact runner ID from the fleet snapshot; that runner reports a single main instance"
+  },
+  "limits": [
+    "Point-in-time metadata, not a full end-to-end delivery/no-loss validation.",
+    "Eight connected current runners include older retained instances; old instance jobs/agents are not assumed migrated or retired.",
+    "The prior read-only-filesystem runner now reports target build; no claim is made here that filesystem health is repaired.",
+    "Broad queue-prevention changes in the working checkout are not included in this f555 deployment.",
+    "No install/restart/remount/kill or API mutation performed by this verification."
+  ]
+}

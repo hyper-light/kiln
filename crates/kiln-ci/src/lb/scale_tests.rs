@@ -1,6 +1,6 @@
-//! Room tokens, learned wait weights and the integer auction (docs/lb.md "Room tokens", "Learned
-//! wait weights", "Batches and gangs"; LB08): each rule pinned down on a case small enough to read,
-//! each with the mistake planted against it caught. The model (model.rs) checks tokens' safety
+//! Room tokens, learned wait weights' draw and the integer auction (docs/lb.md "Room tokens",
+//! "Learned wait weights", "The auction"; LB08): each rule pinned down on a case small enough to
+//! read, each with the mistake planted against it caught (Algorithm 1 itself: weights_tests.rs). The model (model.rs) checks tokens' safety
 //! under random interleavings; comparisons at scale are not here.
 
 use std::collections::VecDeque;
@@ -23,15 +23,24 @@ impl Net {
     /// `owners` owners and a runner of each budget, every runner a member of each owner's one
     /// signature; tokens on or off everywhere. Owner 0 is every runner's first watcher.
     fn new(owners: u32, budgets: &[Amounts], tokens: bool) -> Net {
+        Net::mixed(owners, budgets, tokens, &[])
+    }
+
+    /// [`Net::new`], with the owners in `hints` hearing hints at every runner, beside the others'
+    /// tokens (a mixed fleet).
+    fn mixed(owners: u32, budgets: &[Amounts], tokens: bool, hints: &[u32]) -> Net {
         let mut rs: Vec<Runner> = budgets.iter().zip(0u32..).map(|(b, i)| Runner::new(RunnerId(i), *b, 1)).collect();
         for r in rs.iter_mut() {
             r.set_tokens(tokens);
+            for h in hints {
+                r.hints_for(OwnerId(*h), true);
+            }
         }
         let mut os = Vec::new();
         let mut sigs = Vec::new();
         for o in 0..owners {
             let mut ow = Owner::new(OwnerId(o));
-            ow.set_tokens(tokens, u64::from(o) + 1);
+            ow.set_tokens(tokens && !hints.contains(&o), u64::from(o) + 1);
             let mut out = Out::default();
             for r in rs.iter_mut() {
                 r.watch(OwnerId(o));
@@ -110,6 +119,15 @@ impl Net {
 
     fn view(&self, o: u32, r: u32) -> u64 {
         self.os.get(o as usize).and_then(|ow| ow.view(RunnerId(r))).map_or(0, |v| v[0])
+    }
+
+    /// Runner `r` takes no new run (`on`: a laptop on battery, a machine drained), or takes them
+    /// again; what it says is carried.
+    fn cordon(&mut self, r: u32, on: bool) -> Result<(), String> {
+        let mut rout = RunnerOut::new();
+        self.rs.get_mut(r as usize).ok_or("runner")?.cordon(on, &mut rout);
+        self.up.extend(rout.into_iter().map(|(w, m)| (r, w, m)));
+        self.settle()
     }
 }
 
@@ -219,6 +237,118 @@ fn lb08_a_token_its_owner_cant_use_is_forwarded_once() -> Result<(), String> {
     caught(Mutant::ForwardAgain, forwarded_once)
 }
 
+/// A mixed fleet: owner 0 is the first the runner talks to and hears hints; owner 1 is the first
+/// that hears tokens, so room no one holds is its; owner 2 holds what its own runs free. Owner 0
+/// sees all of the room, holds none of it, is never told another wants, and what its runs free is
+/// the first watcher's.
+fn mixed_fleet() -> Result<(), String> {
+    let mut n = Net::mixed(3, &[[4 * CPU, 0, 0, 0]], true, &[0]);
+    let views = |n: &Net| (n.view(0, 0), n.view(1, 0), n.view(2, 0));
+    if views(&n) != (4 * CPU, 4 * CPU, 0) {
+        return Err(format!("as they join, owner 0 sees all of it, owner 1 holds what no one does, owner 2 nothing: {:?}", views(&n)));
+    }
+    n.ask(0, ONE_CPU)?;
+    n.settle()?;
+    if views(&n) != (3 * CPU, 3 * CPU, 0) {
+        return Err(format!("owner 0's run takes a CPU, and both are told: {:?}", views(&n)));
+    }
+    n.end(0, 0)?;
+    if views(&n) != (4 * CPU, 4 * CPU, 0) {
+        return Err(format!("what owner 0's run freed is no one's, and so owner 1's: {:?}", views(&n)));
+    }
+    // Owner 2's run frees its own token, as ever, and owner 1's word is what's left.
+    n.ask(2, ONE_CPU)?;
+    n.settle()?;
+    n.end(2, 0)?;
+    if views(&n) != (4 * CPU, 3 * CPU, CPU) {
+        return Err(format!("owner 2 holds what its run freed: {:?}", views(&n)));
+    }
+    // Filled to the brim by owner 0 (it sees all of the room), owner 1's run waits there for room:
+    // owner 2 hears that another wants; owner 0, which holds nothing to give, doesn't.
+    n.ask(0, [4 * CPU, 0, 0, 0])?;
+    n.settle()?;
+    n.ask(1, ONE_CPU)?;
+    n.settle()?;
+    let r = n.rs.first().ok_or("runner")?;
+    if r.waiting().len() != 1 || r.word_for(OwnerId(0)).wants || !r.word_for(OwnerId(2)).wants {
+        return Err(format!("a run waits ({:?}), owner 2 hears it and owner 0 doesn't: {} {}", r.waiting(), r.word_for(OwnerId(0)).wants, r.word_for(OwnerId(2)).wants));
+    }
+    Ok(())
+}
+
+/// LB08: a mixed fleet keeps hints with the owners whose links can't carry words of their own, and
+/// tokens with the others.
+#[test]
+fn lb08_a_mixed_fleet_keeps_hints_with_the_owners_that_hear_them() -> Result<(), String> {
+    caught(Mutant::HintsHold, mixed_fleet)?;
+    caught(Mutant::FirstHearsHints, mixed_fleet)
+}
+
+/// LB08: a runner's shell can word its own answers, and what it says is what's written down: a
+/// Hint is owed only once that changes ([`Runner::say_to`]); and an owner that goes over to hints
+/// takes nothing with it, what it held the first watcher's.
+#[test]
+fn lb08_a_word_said_by_the_shell_is_written_down_and_hints_take_nothing() -> Result<(), String> {
+    let mut r = Runner::new(RunnerId(0), [4 * CPU, 0, 0, 0], 1);
+    r.set_tokens(true);
+    r.watch(OwnerId(0));
+    r.watch(OwnerId(1));
+    let mut out = RunnerOut::new();
+    let start = |run: u32| ToRunner::Start(Start { owner: OwnerId(1), run: Handle { slot: run, generation: 1 }, epoch: 1, need: ONE_CPU });
+    let Some(ToOwner::Started { at, .. }) = r.hear(start(0), &mut out) else { return Err("owner 1's run didn't start".into()) };
+    let _ = r.end(at, &mut out);
+    out.clear();
+    r.drain(&mut out);
+    out.clear();
+    if r.say_to(OwnerId(1)).cpu != CPU || r.say_to(OwnerId(0)).cpu != 3 * CPU {
+        return Err(format!("owner 1 holds what its run freed, owner 0 the rest: {:?} {:?}", r.word_for(OwnerId(1)), r.word_for(OwnerId(0))));
+    }
+    r.drain(&mut out);
+    if !out.is_empty() {
+        return Err(format!("nothing has changed since each was told, and it owes {out:?}"));
+    }
+    // Owner 1 goes over to hints: what it held is no one's, so owner 0's; each is owed its word.
+    r.hints_for(OwnerId(1), true);
+    r.drain(&mut out);
+    let said: Vec<(u32, u64)> = out.iter().map(|(o, m)| (o.0, m.word().cpu)).collect();
+    if said != [(0, 4 * CPU), (1, 4 * CPU)] {
+        return Err(format!("owner 0 holds all of it now, owner 1 sees all of it: {said:?}"));
+    }
+    Ok(())
+}
+
+/// A cordon under tokens: as the runner takes no run its room is none, so every token is cut to
+/// none and each owner that held some is told so (none goes on holding room a runner that takes
+/// nothing has); once it takes runs again, the room is no owner's run's, so the first watcher's,
+/// and it alone is told.
+fn cordoned() -> Result<(), String> {
+    let mut n = Net::new(3, &[[4 * CPU, 0, 0, 0]], true);
+    n.ask(2, ONE_CPU)?;
+    n.settle()?;
+    n.end(2, 0)?;
+    let views = |n: &Net| (n.view(0, 0), n.view(1, 0), n.view(2, 0));
+    if views(&n) != (3 * CPU, 0, CPU) {
+        return Err(format!("owner 2 holds what its run freed, owner 0 the rest: {:?}", views(&n)));
+    }
+    n.cordon(0, true)?;
+    let held = n.rs.first().map(Runner::held_tokens).unwrap_or_default();
+    if views(&n) != (0, 0, 0) || held.iter().any(|(_, t)| *t != [0; 4]) {
+        return Err(format!("cordoned, no owner holds any of its room or thinks it does: views {:?}, tokens {held:?}", views(&n)));
+    }
+    n.cordon(0, false)?;
+    if views(&n) != (4 * CPU, 0, 0) {
+        return Err(format!("taking runs again, the room is the first watcher's: {:?}", views(&n)));
+    }
+    Ok(())
+}
+
+/// LB08: a cordon under tokens fits every token to the room it leaves, and owes each owner whose
+/// holding changed its word, going and coming back.
+#[test]
+fn lb08_a_cordon_under_tokens_takes_every_token_and_tells_each_owner() -> Result<(), String> {
+    caught(Mutant::CordonQuiet, cordoned)
+}
+
 /// Under tokens an owner's views are what it holds, so its waits are drawn from the signature's
 /// members, not put on the same "nearest" two.
 fn waits_spread() -> Result<(), String> {
@@ -280,27 +410,6 @@ fn full(runners: u32, weights: &[(u32, u64)]) -> (Owner, SigId) {
     (o, s)
 }
 
-/// Algorithm 1 (Lattanzi et al.): a weight predicted 48 times too high halves while its runner's
-/// fractional load passes 2T, and stops at the first halving within it: 48 → 3 against two of 1
-/// (x = 3/5 of a wait's need, under 2/3).
-fn learns() -> Result<(), String> {
-    let (mut o, s) = full(3, &[(0, 48 * CPU)]);
-    let mut out = Out::default();
-    for _ in 0..40 {
-        o.ask(s, ONE_CPU, &mut out).map_err(|e| format!("{e:?}"))?;
-    }
-    let w = o.weight(RunnerId(0));
-    if w != 3 * CPU {
-        return Err(format!("runner 0's weight is {w}, Algorithm 1 ends at {}", 3 * CPU));
-    }
-    Ok(())
-}
-
-#[test]
-fn lb08_algorithm_1_halves_an_overpredicted_weight_until_within_2t() -> Result<(), String> {
-    caught(Mutant::NoLearn, learns)
-}
-
 /// Places are drawn in proportion to the weights: of four runners weighted 2, 2, 2 and 3, the
 /// heaviest is the first place a third of the time (a quarter if drawn uniformly).
 fn proportional() -> Result<(), String> {
@@ -324,25 +433,6 @@ fn proportional() -> Result<(), String> {
 #[test]
 fn lb08_places_are_drawn_in_proportion_to_weights() -> Result<(), String> {
     caught(Mutant::Unweighted, proportional)
-}
-
-/// Predictions that aren't helping (one runner of 16 weighted 2^20 times the rest) put more than
-/// 2⌈log2 m⌉T on it: the owner draws uniformly again and says which runner and why.
-fn falls_back() -> Result<(), String> {
-    let (mut o, s) = full(16, &[(0, CPU << 20)]);
-    let mut out = Out::default();
-    for _ in 0..10 {
-        o.ask(s, ONE_CPU, &mut out).map_err(|e| format!("{e:?}"))?;
-    }
-    match o.fell_back() {
-        Some(f) if f.runner == RunnerId(0) && f.load > f.bound => Ok(()),
-        other => Err(format!("the owner kept predictions that weren't helping: {other:?}")),
-    }
-}
-
-#[test]
-fn lb08_predictions_that_dont_help_fall_back_and_say_why() -> Result<(), String> {
-    caught(Mutant::NoFallback, falls_back)
 }
 
 /// The least total cost by trying every assignment (None: none puts everyone in a slot).

@@ -6,7 +6,7 @@
  */
 import * as React from "react";
 import { ArrowUpRight, GitFork } from "lucide-react";
-import { clientId, harnessApi } from "@/api/harness";
+import { clientId, harnessApi, sessionStore } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
@@ -58,17 +58,25 @@ export function KeepButton({ keep }: { keep: { to: string; text: string } }) {
   const [state, setState] = React.useState<"keep" | "sending" | "kept">("keep");
   const go = () => {
     setState("sending");
-    harnessApi.command(keep.to, { type: "send", id: clientId(), text: keep.text, mode: "queue" }).then(
-      () => setState("kept"),
-      (e: unknown) => {
-        setState("keep");
-        toast.error("Couldn't tell its parent", errorMessage(e));
-      },
-    );
+    sessionStore(keep.to)
+      .sendMail({ type: "send", id: clientId(), text: keep.text, mode: "queue" })
+      .then(
+        (saved) => {
+          if (saved) setState("kept");
+          else {
+            setState("keep");
+            toast.error("Couldn't save its original", "The result stays here. Try again after browser storage is available.");
+          }
+        },
+        (e: unknown) => {
+          setState("keep");
+          toast.error("Couldn't tell its parent", errorMessage(e));
+        },
+      );
   };
   return (
     <Button size="xs" variant="secondary" className="ml-auto" disabled={state !== "keep"} onClick={go}>
-      {state === "kept" ? "Kept" : "Keep"}
+      {state === "kept" ? "Queued" : "Keep"}
     </Button>
   );
 }

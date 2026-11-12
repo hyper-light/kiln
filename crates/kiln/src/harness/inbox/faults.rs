@@ -46,6 +46,13 @@ impl Records for Flaky {
         }
         self.inner.commit(tx)
     }
+    fn commit_owned<'a>(&'a self, tx: Tx, owner: Box<dyn Send + Sync>) -> BoxFuture<'a, Result<Rev, Failed>> {
+        let n = self.commits.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == self.fail_commit {
+            return Box::pin(async { Err(Failed::Unavailable("a write failed (injected)".into())) });
+        }
+        self.inner.commit_owned(tx, owner)
+    }
     fn changes<'a>(&'a self, family: &'a str, after: Rev, limit: usize) -> BoxFuture<'a, Result<Changes, Failed>> {
         self.inner.changes(family, after, limit)
     }
@@ -244,7 +251,7 @@ fn a_runner_restarted_after_a_handover_that_never_completed_takes_its_sessions_m
             blue.stop_all();
             assert!(blue.command("bg", message("m0")));
             anyhow::ensure!(next_said(&rx).await?.answer.is_ok(), "m0 taken");
-            let moved = blue.move_out().await;
+            let moved = blue.move_out().await.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(moved.len() == 1, "one session handed over");
             let inbox = blue.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
             let mut fenced = false;
@@ -293,7 +300,7 @@ fn a_runner_restarted_before_its_session_took_in_the_ids_it_brought_takes_a_retr
         {
             let (tx, _rx) = async_channel::unbounded();
             let before = Host::with_records(tx, Some(file.clone()), HostLimits::default(), Arc::new(SimClock::new()), Some(records.clone() as Arc<dyn Records>));
-            before.move_in(rec, None)?;
+            before.move_in(rec, None).await?;
             let inbox = before.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
             let mut opened = false;
             for _ in 0..500 {
@@ -331,114 +338,118 @@ fn a_runner_restarted_before_its_session_took_in_the_ids_it_brought_takes_a_retr
     })
 }
 
-/// A hub running its own sessions, and one session on it whose harness isn't there (its inbox takes
-/// messages to it all the same).
-async fn hub_and_session() -> anyhow::Result<(Arc<crate::hub::Hub>, String, tempfile::TempDir)> {
-    let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
-    let h = Arc::clone(&hub);
-    crate::rt::spawn(async move {
-        let _ = crate::harness::registry::Registry::run_local(h).await;
-    });
-    let dir = tempfile::tempdir()?;
-    let spec = crate::harness::session::Spec {
-        kind: "claude".into(),
-        cwd: Some(dir.path().to_string_lossy().into_owned()),
-        program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
-        ..Default::default()
-    };
-    let id = hub.harness.open(&hub, "local", spec, 1).await.map_err(|e| anyhow::anyhow!("{e:#}"))?.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
-    Ok((hub, id, dir))
-}
-
-/// Message m1 with an uploaded file, as the composer, Mission Control and the API send one.
+/// The complete original command retains its durable server upload identity.
 fn with_file(file: String) -> Command {
     let shot = crate::harness::model::Attachment { name: "shot.png".into(), mime: "image/png".into(), data_base64: String::new(), file_id: Some(file), path: None };
     Command::Send { id: "m1".into(), text: "look at this".into(), mode: SendMode::Queue, attachments: vec![shot], overrides: None, reply_to: None, task: None }
 }
 
-/// A retry of a message carrying an uploaded file (the same id, words and file; its first answer
-/// lost) is answered as its repeat: the upload is kept after the first try carried it, so the
-/// retry carries it too and reads as the same message.
 #[test]
-fn a_retry_of_a_message_with_an_uploaded_file_is_answered_as_its_repeat() -> anyhow::Result<()> {
-    use crate::harness::registry::Sent;
+fn w20_a_durable_upload_routes_to_the_same_wire_command_after_registry_reopen() -> anyhow::Result<()> {
     crate::rt::block_on(async {
-        let (hub, id, _dir) = hub_and_session().await?;
-        let file = hub.harness.upload("shot.png".into(), "image/png".into(), bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"))?;
-        let first = hub.harness.command(&hub, &id, with_file(file.clone())).await;
-        anyhow::ensure!(matches!(&first, Sent::Accepted(a) if !a.repeat), "{first:?}");
-        let again = hub.harness.command(&hub, &id, with_file(file)).await;
-        anyhow::ensure!(matches!(&again, Sent::Accepted(a) if a.repeat), "the same message sent again was answered {again:?}");
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let data = bytes::Bytes::from_static(b"complete original file");
+        let file = hub.harness.upload(&hub, "shot.png".into(), "image/png".into(), data.clone()).await?;
+        let original = with_file(file.clone());
+        let preview = hub.harness.attachment_command(&hub, "fixture-agent", original.clone()).await?;
+        let routed = hub.harness.route_attachments(&hub, "fixture-agent", &crate::harness::registry::Location::Local, original.clone()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(serde_json::to_value(&preview)?, serde_json::to_value(&routed)?);
+        let dir = tempfile::tempdir()?;
+        let reopened = crate::harness::registry::Registry::new(dir.path().to_owned());
+        let again = reopened.route_attachments(&hub, "fixture-agent", &crate::harness::registry::Location::Local, original.clone()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(serde_json::to_value(&routed)?, serde_json::to_value(&again)?, "registry lifetime cannot change strict proof retry identity");
+        let (kept, bytes) = hub.blobs.blobs.get(&format!("attachments/uploads/{file}"), None).await?;
+        assert_eq!(bytes.as_slice(), data.as_ref());
+        assert_eq!(kept.etag, crate::util::sha256_hex(&bytes));
+        let replaced = hub.blobs.blobs.put(&format!("attachments/uploads/{file}"), b"different".to_vec(), kiln_seams::blobs::Put { cond: kiln_seams::blobs::Cond::IfNoneMatch, sha256: None }).await;
+        assert!(matches!(replaced, Err(kiln_seams::blobs::Refusal::PreconditionFailed(_))));
+        assert_eq!(hub.blobs.blobs.head(&format!("attachments/uploads/{file}")).await?.etag, kept.etag, "an immutable write refusal leaves the complete original intact");
+        assert!(matches!(original, Command::Send { attachments, .. } if attachments.first().and_then(|a| a.file_id.as_deref()) == Some(file.as_str())), "routing cannot rewrite the saved original");
         Ok(())
     })
 }
 
-/// CP-T3.2 (the twenty-second adversarial check's): a retry of a message carrying an uploaded file
-/// whose upload left the server since its first try (short of room, as here; its 30 minutes up; or
-/// the server started again: uploads are kept in memory) still carries the file's name, so it reads
-/// as the same message and is answered as its repeat. Without its name it read as another message
-/// under its id, refused `reused` for good, and the conversation's Retry sent it as a new message: a
-/// second prompt.
 #[test]
-fn a_retry_of_a_message_whose_upload_left_the_server_is_answered_as_its_repeat() -> anyhow::Result<()> {
-    use crate::harness::registry::Sent;
+fn w20_missing_upload_refuses_new_custody_but_an_exact_committed_original_keeps_its_receipt() -> anyhow::Result<()> {
     crate::rt::block_on(async {
-        let (hub, id, _dir) = hub_and_session().await?;
-        let file = hub.harness.upload("shot.png".into(), "image/png".into(), bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"))?;
-        let first = hub.harness.command(&hub, &id, with_file(file.clone())).await;
-        anyhow::ensure!(matches!(&first, Sent::Accepted(a) if !a.repeat), "{first:?}");
-        // Short of room (512 MiB in all), the files messages carried already go first.
-        hub.harness.upload("big.bin".into(), "application/octet-stream".into(), bytes::Bytes::from(vec![0u8; (512 << 20) - 4]))?;
-        let again = hub.harness.command(&hub, &id, with_file(file)).await;
-        anyhow::ensure!(matches!(&again, Sent::Accepted(a) if a.repeat), "the same message sent again, its upload gone, was answered {again:?}");
+        use crate::harness::{mail, mail_delivery};
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let missing = crate::util::new_id();
+        let command = with_file(missing.clone());
+        let fresh = mail::Publish { owner: "user:fixture".into(), sender: "user:fixture".into(), recipient: "fixture-agent".into(), id: "m1".into(), command: serde_json::to_value(command.clone())?, provenance: None, status: None };
+        assert!(matches!(mail_delivery::publish(&hub, fresh.clone()).await, Err(mail::Error::Unavailable { .. })));
+        assert!(mail::receipt(&hub.store, fresh.owner.clone(), fresh.sender.clone(), fresh.recipient.clone(), fresh.id.clone()).await?.is_none(), "no new ledger custody for a missing original");
+        // A pre-migration accepted communication may refer to a now-missing old ephemeral id.
+        // Reconciliation answers that immutable receipt before store/owner lookup, without
+        // claiming delivery or deleting its original history.
+        let accepted = mail::publish(&hub.store, fresh.clone(), u64::MAX, 1).await?;
+        let repeated = mail_delivery::publish(&hub, fresh.clone()).await?;
+        assert!(repeated.repeat && repeated.revision == accepted.revision);
+        let mut changed = fresh;
+        changed.command = serde_json::to_value(Command::Send { id: "m1".into(), text: "different words".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None })?;
+        assert!(matches!(mail_delivery::publish(&hub, changed).await, Err(mail::Error::Reused { .. })));
+        assert!(matches!(hub.blobs.blobs.head(&format!("attachments/uploads/{missing}")).await, Err(kiln_seams::blobs::Refusal::NotFound(_))), "a missing reference never becomes fabricated bytes");
         Ok(())
     })
 }
 
-/// CP-T3.2 (the twenty-second adversarial check's): Mission Control's message box sent again under
-/// its key (its answer lost, as when the server starts again) once its upload left the server: the
-/// agent that took the first try is told it was sent, as its repeat, never refused as another message
-/// under its id (a report of `failed`, whose resend under a new key would be a second prompt).
 #[test]
-fn a_broadcast_sent_again_after_its_upload_left_the_server_is_sent_once() -> anyhow::Result<()> {
+fn w20_attachment_content_and_recipient_fence_stable_receiver_ids() -> anyhow::Result<()> {
     crate::rt::block_on(async {
-        let (hub, id, _dir) = hub_and_session().await?;
-        let file = hub.harness.upload("shot.png".into(), "image/png".into(), bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"))?;
-        let b: crate::harness::broadcast::Broadcast = serde_json::from_value(serde_json::json!({
-            "to": {"ids": [id.clone()]}, "text": "look at this", "key": "bk-1",
-            "attachments": [{"name": "shot.png", "mime": "image/png", "file_id": file}],
-        }))?;
-        let among = hub.harness.list();
-        let first = crate::harness::broadcast::run(&hub, &b, "user:dev1", &among).await?;
-        anyhow::ensure!(first.sent == 1, "{first:?}");
-        // Short of room (512 MiB in all), the files messages carried already go first.
-        hub.harness.upload("big.bin".into(), "application/octet-stream".into(), bytes::Bytes::from(vec![0u8; (512 << 20) - 4]))?;
-        // What it carries to each agent keeps the file's name, its bytes gone.
-        let carried = hub.harness.inline_uploads(b.attachments.clone());
-        anyhow::ensure!(carried.iter().map(|a| (a.name.as_str(), a.data_base64.is_empty())).eq([("shot.png", true)]), "{carried:?}");
-        let again = crate::harness::broadcast::run(&hub, &b, "user:dev1", &among).await?;
-        anyhow::ensure!(again.sent == 1 && again.failed == 0, "sent again under its key, its upload gone: {again:?}");
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let mut wires = Vec::new();
+        for data in [b"original".as_slice(), b"original".as_slice(), b"different".as_slice()] {
+            let file = hub.harness.upload(&hub, "same-name".into(), "text/plain".into(), bytes::Bytes::copy_from_slice(data)).await?;
+            wires.push(hub.harness.attachment_command(&hub, "recipient-a", with_file(file)).await?);
+        }
+        assert_eq!(serde_json::to_value(wires.first())?, serde_json::to_value(wires.get(1))?, "content identity is stable across equivalent durable uploads");
+        assert_ne!(serde_json::to_value(wires.first())?, serde_json::to_value(wires.get(2))?, "different content cannot reuse the receiver file id");
+        let file = hub.harness.upload(&hub, "same-name".into(), "text/plain".into(), bytes::Bytes::from_static(b"original")).await?;
+        let elsewhere = hub.harness.attachment_command(&hub, "recipient-b", with_file(file)).await?;
+        assert_ne!(serde_json::to_value(wires.first())?, serde_json::to_value(Some(&elsewhere))?, "receiver identity is part of the binding");
         Ok(())
     })
 }
 
-/// The server's one send again for the epoch a `stale_epoch` refusal names (`again_for`) carries
-/// the message's uploaded files: the session takes it with them.
 #[test]
-fn a_message_sent_again_for_the_epoch_named_keeps_its_files() -> anyhow::Result<()> {
-    use crate::harness::registry::Sent;
+fn w20_an_oversized_inline_original_is_refused_before_custody_and_a_partial_upload_has_no_metadata() -> anyhow::Result<()> {
     crate::rt::block_on(async {
-        let (hub, id, _dir) = hub_and_session().await?;
-        let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
-        // Its inbox has gone on to epoch 3 (as a session that moved back here would have it); the
-        // server last heard 0.
-        inbox.open(&id, 3).await?;
-        let file = hub.harness.upload("shot.png".into(), "image/png".into(), bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"))?;
-        let sent = hub.harness.command(&hub, &id, with_file(file)).await;
-        anyhow::ensure!(matches!(&sent, Sent::Accepted(a) if a.epoch == 3), "{sent:?}");
-        let kept = inbox.carried(&id, 10).await?;
-        let whole = super::digest("look at this", &["shot.png"]);
-        anyhow::ensure!(kept == [("m1".to_owned(), whole.clone())], "the session took m1 as {kept:?}: with its file it would be {whole}, without it it's {}", super::digest("look at this", &[]));
+        use kiln_seams::blobs::{Cond, Put};
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let mut command = with_file(crate::util::new_id());
+        if let Command::Send { attachments, .. } = &mut command
+            && let Some(file) = attachments.first_mut()
+        {
+            file.file_id = None;
+            file.data_base64 = "a".repeat(crate::harness::state_view::FRAME);
+        }
+        assert!(matches!(hub.harness.attachment_command(&hub, "recipient", command).await, Err(crate::harness::mail::Error::TooLarge { .. })));
+        let id = crate::util::new_id();
+        let key = format!("attachments/uploads/{id}");
+        let bytes = b"original bytes committed before metadata".to_vec();
+        let sha = crate::util::sha256_hex(&bytes);
+        hub.blobs.blobs.put(&key, bytes, Put { cond: Cond::IfNoneMatch, sha256: Some(sha.clone()) }).await?;
+        assert!(matches!(hub.harness.attachment_command(&hub, "recipient", with_file(id)).await, Err(crate::harness::mail::Error::Unavailable { .. })));
+        assert_eq!(hub.blobs.blobs.head(&key).await?.etag, sha, "failure before metadata never deletes bytes or fabricates an upload ACK");
+        Ok(())
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn w20_upload_bytes_and_metadata_survive_the_actual_store_reopening() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kiln.db");
+        let data_dir = dir.path().join("data");
+        let first = crate::hub::tests::scratch_hub_persistent(path.clone(), |c| { c.server.data_dir = data_dir.clone(); }).await?;
+        let file = first.harness.upload(&first, "proof.txt".into(), "text/plain".into(), bytes::Bytes::from_static(b"retained through reopening")).await?;
+        let before = first.harness.attachment_command(&first, "recipient", with_file(file.clone())).await?;
+        drop(first);
+        let second = crate::hub::tests::scratch_hub_persistent(path, |c| { c.server.data_dir = data_dir; }).await?;
+        let after = second.harness.attachment_command(&second, "recipient", with_file(file.clone())).await?;
+        assert_eq!(serde_json::to_value(before)?, serde_json::to_value(after)?);
+        assert_eq!(second.blobs.blobs.get(&format!("attachments/uploads/{file}"), None).await?.1, b"retained through reopening".to_vec());
         Ok(())
     })
 }
@@ -642,7 +653,7 @@ fn an_in_place_upgrade_keeps_the_ids_a_session_brought_and_has_not_taken_in() ->
         {
             let (tx, _rx) = async_channel::unbounded();
             let before = Host::with_records(tx, Some(file.clone()), HostLimits::default(), Arc::new(SimClock::new()), Some(records.clone() as Arc<dyn Records>));
-            before.move_in(rec, None)?;
+            before.move_in(rec, None).await?;
             let inbox = before.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
             until("its inbox opened", || futures::executor::block_on(inbox.epoch("s1")).ok().flatten().is_some()).await?;
             anyhow::ensure!(inbox.waiting("s1") == [("m1".to_owned(), String::new())], "m1 isn't waiting: {:?}", inbox.waiting("s1"));
@@ -729,8 +740,8 @@ fn a_hand_over_sent_again_after_a_blue_green_upgrade_is_answered_as_taken() -> a
         // box-b upgrades blue/green: its sessions go to the new build.
         let (tx2, _rx2) = async_channel::unbounded();
         let green = Host::with_records(tx2, Some(green_dir.join("harness.json")), HostLimits::default(), Arc::new(SimClock::new()), Some(Arc::new(SimRecords::new())));
-        for (rec, handed) in blue.move_out().await {
-            green.move_in(rec, handed)?;
+        for (rec, handed) in blue.move_out().await.map_err(anyhow::Error::msg)? {
+            green.move_in(rec, handed).await?;
         }
         anyhow::ensure!(green.get("s1").is_some(), "s1 didn't go to the new build");
         anyhow::ensure!(green.close("s1"), "no session to end");
@@ -814,19 +825,23 @@ fn a_blue_green_handover_with_an_unreadable_inbox_keeps_the_ids_its_session_brou
         }))?;
         let (tx, _rx) = async_channel::unbounded();
         let blue = Host::with_records(tx, Some(blue_dir.join("harness.json")), HostLimits::default(), Arc::new(SimClock::new()), Some(records.clone() as Arc<dyn Records>));
-        blue.move_in(rec, None)?;
+        blue.move_in(rec, None).await?;
         let inbox = blue.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
         until("its inbox opened", || futures::executor::block_on(inbox.epoch("s1")).ok().flatten().is_some()).await?;
         anyhow::ensure!(inbox.waiting("s1") == [("m1".to_owned(), String::new())], "m1 isn't waiting: {:?}", inbox.waiting("s1"));
         // Blue/green: blue's inbox can't be read as it hands s1 over.
         records.scans_fail.store(true, Ordering::SeqCst);
-        let moved = blue.move_out().await;
+        let refused = blue.move_out().await;
+        anyhow::ensure!(refused.is_err(), "an unreadable source journal must refuse before native custody is released");
+        anyhow::ensure!(blue.get("s1").is_some(), "refusal removed the authoritative source session");
+        anyhow::ensure!(inbox.waiting("s1") == [("m1".to_owned(), String::new())], "refusal lost the original brought message identity");
         records.scans_fail.store(false, Ordering::SeqCst);
+        let moved = blue.move_out().await.map_err(anyhow::Error::msg)?;
         let carried: Vec<Vec<String>> = moved.iter().map(|(r, _)| serde_json::to_value(r).ok().and_then(|v| v.get("inbox").cloned()).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default()).collect();
         let (tx2, rx2) = async_channel::unbounded();
         let green = Host::with_records(tx2, Some(green_dir.join("harness.json")), HostLimits::default(), Arc::new(SimClock::new()), Some(Arc::new(SimRecords::new())));
         for (rec, handed) in moved {
-            green.move_in(rec, handed)?;
+            green.move_in(rec, handed).await?;
         }
         anyhow::ensure!(green.command("s1", message("m1")), "the new build took nothing");
         let said = crate::rt::timeout(Duration::from_secs(30), async {

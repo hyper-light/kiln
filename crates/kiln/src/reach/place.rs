@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use kiln_ci::facts::RunnerFacts;
 use kiln_ci::place::answer::Answer;
 use kiln_ci::place::ask::{Ask, Peer, Sample};
-use kiln_ci::place::msg::{ToOwner, ToRunner};
+use kiln_ci::place::msg::{How, ToOwner, ToRunner};
 use kiln_ci::place::owner::{Act, Kept, Machine, Owner, Size};
 use kiln_ci::place::runner::{Admission, Init, Record, Records, Settings, Start};
 use kiln_seams::records::{Scan, TX_MAX, Tx, Write};
@@ -84,6 +84,14 @@ pub fn for_older_owner(json: String) -> String {
         _ => return json,
     }
     serde_json::to_string(&e).unwrap_or(json)
+}
+
+/// Whether placement word `json` is one of room tokens' own (docs/lb.md "Room tokens"; LB08): a
+/// runner's word to an owner alone (`fast_hint`) or an owner's give-back (`fast_release`), said only
+/// to a peer whose link named `place.tokens`. Read off the op's tag, which serde writes first and
+/// which no string inside the word can spell unescaped.
+pub fn tokens_word(json: &str) -> bool {
+    json.contains(r#""op":"fast_hint""#) || json.contains(r#""op":"fast_release""#)
 }
 
 /// A waiting reason's kind as `kiln_ci::place::msg::Reason` names it (the hint's quotes).
@@ -538,7 +546,7 @@ impl EpochDisk for EpochFs<'_> {
     }
 
     fn sync_new(&self) -> std::io::Result<()> {
-        std::fs::File::open(self.new_path())?.sync_all()
+        std::fs::OpenOptions::new().write(true).open(self.new_path())?.sync_all()
     }
 
     fn rename_new(&self) -> std::io::Result<()> {
@@ -600,6 +608,28 @@ pub fn sample_of_measure(m: &crate::sense::Measure, last: Option<&crate::sense::
 /// every run works in the work volume, so a full one, or its device's errors rising, bars all
 /// work; a run of its kind killed for memory here, or missing a tool here, bars it whatever it
 /// asks; memory and tools as asked bar the rest.
+/// How a run that exited here ended, as this runner judges it when it ends (docs/lb.md "Good
+/// places"), from its exit alone (`code`; `error`: it couldn't start, or `timed_out`, its own
+/// limit ran out). It went well when it exited 0. The node let it down when it couldn't start
+/// here, or exited as a shell does of a program that isn't here (`sense::health::classify`'s
+/// missing tool). Any other failure has no cause this runner knows from its exit: the node's
+/// fault or the work's own, which its owner settles by where its kind's next run goes and what
+/// becomes of it. A run a signal ended (its asker stopped it, as far as an exit says) is judged
+/// by no one.
+pub fn how(code: Option<i32>, error: Option<&str>, timed_out: bool) -> How {
+    use crate::sense::health::{Ending, Failure, classify};
+    match (code, error) {
+        (_, Some(_)) if timed_out => How::Unsure,
+        (_, Some(_)) => How::LetDown,
+        (Some(0), None) => How::Well,
+        (Some(c), None) => match classify(&Ending { exit_code: Some(c), ..Ending::default() }) {
+            Some(Failure::MissingTool { .. }) => How::LetDown,
+            _ => How::Unsure,
+        },
+        (None, None) => How::Unsaid,
+    }
+}
+
 fn barred(ask: &Ask, key: Option<String>, m: &crate::sense::Measure) -> Option<crate::sense::health::Refusal> {
     let tools = ask.needs.requires.iter().filter_map(|r| r.strip_prefix("tools has ")).map(|t| t.trim_matches(|c| c == '\'' || c == '"').to_owned()).collect();
     let a = crate::sense::health::Ask { key, disk: ask.needs.request.disk.max(1), mem: ask.needs.request.mem, tools };
@@ -623,7 +653,7 @@ pub fn sample_of(s: &crate::metrics::HostSample) -> Sample {
 /// and whether it places.
 pub fn machine_of(r: &RunnerInfo) -> Machine {
     let facts = r.facts.as_deref().cloned().unwrap_or_else(|| RunnerFacts { os: r.os.clone(), arch: r.arch.clone(), ..RunnerFacts::default() });
-    let size = Size { cpu: (r.cpus > 0).then(|| Cpus::whole(u64::from(r.cpus))), mem: (r.mem_total > 0).then_some(r.mem_total), disk: None, gpu: None };
+    let size = Size { cpu: (r.cpus > 0).then(|| Cpus::whole(u64::from(r.cpus))), mem: (r.mem_total > 0).then_some(r.mem_total), disk: None, gpu: r.facts.as_ref().map(|f| u32::try_from(f.gpus.len()).unwrap_or(u32::MAX)) };
     Machine { name: r.name.clone(), facts, labels: r.labels.clone(), size, epoch: 0, connected: r.connected && r.reach, places: feature::speaks(&r.features, feature::PLACE), idle: None, syncs: feature::speaks(&r.features, feature::PLACE_SYNC), fast: feature::speaks(&r.features, feature::FAST) }
 }
 
@@ -660,6 +690,7 @@ impl Placer {
             records.entry(owner.clone()).or_default().entry(*epoch).or_default().insert(run.clone(), row.record);
         }
         self.admission.restore_records(records, since, forgot);
+        self.admission.restore_record_asks(ran.iter().filter_map(|((owner, epoch, run), row)| Some(((owner.clone(), *epoch, run.clone()), row.ask.clone()?))));
         for ((owner, epoch, run), row) in ran {
             if row.record.ended.is_some() {
                 continue;
@@ -709,11 +740,16 @@ impl Placer {
         self.budget_outs(b, now)
     }
 
-    /// What budgets said, as the node's: the asks they released placed here now, their changes
-    /// noted to be kept before any of it is published.
+    /// What budgets said, as the node's: the asks they released placed here now, together (they
+    /// arrive in one step: the owner's auction, once declared, places them jointly; LB08), their
+    /// changes noted to be kept before any of it is published.
     fn budget_outs(&mut self, (asks, mut out): (Vec<Ask>, Vec<Out>), now: i64) -> Vec<Out> {
-        for a in asks {
-            out.extend(self.ask_now(a, now));
+        if asks.len() > 1 {
+            out.extend(self.ask_many_now(asks, now));
+        } else {
+            for a in asks {
+                out.extend(self.ask_now(a, now));
+            }
         }
         self.note_changes();
         out
@@ -814,9 +850,13 @@ impl Placer {
     }
 
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
-    pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
+    pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, mut sample: Sample, settings: Settings, now: i64) -> Placer {
+        sample.size.gpu = u32::try_from(facts.gpus.len()).unwrap_or(u32::MAX);
+        // Its owner decides by its node's settings too (`[reach] learned_weights`, `auction`; LB08).
+        let mut owner = Owner::seeded(me, epoch, rand::random());
+        owner.configure(&settings);
         let init = Init { me: me.to_owned(), epoch, since: None, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default() }
+        Placer { me: me.to_owned(), epoch, owner, admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default() }
     }
 
     /// It measures its machine itself on events, with `sensor` (AUDIT L1, L2; W05-R26).
@@ -840,6 +880,7 @@ impl Placer {
         let window = sensor.strain().cloned();
         let mut sample = sample_of_measure(&m, self.last.as_ref());
         sample.pace = self.pace;
+        sample.size.gpu = u32::try_from(self.facts.gpus.len()).unwrap_or(u32::MAX);
         // What each placed run here uses, from its own group, in the same moment.
         sample.runs = self.groups.iter_mut().map(|((owner, epoch, run), h)| kiln_ci::place::ask::RunUse { owner: owner.clone(), epoch: *epoch, run: run.clone(), used: group_use(h) }).collect();
         self.admission.measured(sample, now, said);
@@ -982,7 +1023,8 @@ impl Placer {
             && let Some(m) = &self.last
             && barred(&ask, key, m).is_some()
         {
-            let word = kiln_ci::place::msg::FastWord { room: [0; 4], whole: false, ..self.admission.fast_word() };
+            // None here for it, in the word its owner hears (what it holds, under room tokens).
+            let word = self.admission.fast_word_none_to(Peer { name: peer, epoch });
             said.push((peer.to_owned(), ToOwner::FastDeclined { run: ask.run.clone(), kernel: kiln_ci::place::msg::FastHandle::of(kernel), why: kiln_ci::place::msg::FastWhy::Never, word }));
             return None;
         }
@@ -1040,10 +1082,25 @@ impl Placer {
 
     /// A run owned here now: probed where it could run.
     fn ask_now(&mut self, ask: Ask, now: i64) -> Vec<Out> {
-        let wait = crate::offers::hint::Wait { run: ask.run.clone(), need: ask.needs.describe(), ask: kiln_ci::place::ask::amounts(&ask.needs.request), class: ask.class, since: now, reason: String::new() };
-        self.waits.insert(ask.run.clone(), wait);
+        self.waiting(&ask, now);
         let acts = self.owner.ask(ask, now);
         self.acts(acts, now)
+    }
+
+    /// Runs owned here now that arrived in one step (a budget let them through together): placed
+    /// together, as the owner's settings say (`[reach] auction`: jointly; else one at a time).
+    fn ask_many_now(&mut self, asks: Vec<Ask>, now: i64) -> Vec<Out> {
+        for ask in &asks {
+            self.waiting(ask, now);
+        }
+        let acts = self.owner.ask_many(asks, now);
+        self.acts(acts, now)
+    }
+
+    /// A run of this node's own waits, as its hint will say until it starts.
+    fn waiting(&mut self, ask: &Ask, now: i64) {
+        let wait = crate::offers::hint::Wait { run: ask.run.clone(), need: ask.needs.describe(), ask: kiln_ci::place::ask::amounts(&ask.needs.request), class: ask.class, since: now, reason: String::new() };
+        self.waits.insert(ask.run.clone(), wait);
     }
 
     /// Its asker doesn't want it any more.
@@ -1210,9 +1267,19 @@ impl Placer {
                 }
             }
             ToRunner::Sync => self.admission.sync(from, now, &mut said),
+            // What it holds here and can't use, given back under room tokens (docs/lb.md "Room
+            // tokens"; LB08): forwarded to the owner whose run last waited here.
+            ToRunner::FastRelease { epoch, amount } => self.admission.fast_release(from, epoch, amount, now, &mut said),
         }
         out.extend(self.said(said, now));
         out
+    }
+
+    /// Whether owner `peer`'s link named `place.tokens` (docs/lb.md "Room tokens"; LB08), as the
+    /// node reads it off the link each of its words came on: only then, and only where `[reach]
+    /// tokens` is declared, is it told what it holds here, on placement's channel.
+    pub fn tokens_with(&mut self, peer: &str, on: bool) {
+        self.admission.tokens_with(peer, on);
     }
 
     /// A spec came from runner `peer` (`Ask::Run`): what to do with it.
@@ -1245,15 +1312,38 @@ impl Placer {
 
     /// A run started here for `peer` (spec `id`) ended.
     pub fn ended(&mut self, peer: &str, id: u64, ok: bool, now: i64) -> Vec<Out> {
+        self.ended_as(peer, id, ok, How::Unsaid, now)
+    }
+
+    /// [`Self::ended`], with this runner's judgment of how the run ended ([`how`]): what its
+    /// owner's kernel is told of the assignment (docs/lb.md "Good places").
+    pub fn ended_as(&mut self, peer: &str, id: u64, ok: bool, how: How, now: i64) -> Vec<Out> {
         let Some((epoch, run)) = self.started.remove(&(peer.to_owned(), id)) else { return Vec::new() };
         self.ungrouped(peer, epoch, &run);
         let mut said = Vec::new();
-        self.admission.ended(Peer { name: peer, epoch }, &run, ok, now, &mut said);
+        self.admission.ended_as(Peer { name: peer, epoch }, &run, ok, how, now, &mut said);
         let mut out = self.said(said, now);
         // Its end to its claimant, or handed off if its owner can't be reached; the room it freed
         // may be what a waiting run of such an owner needs (LB03).
         out.extend(self.hand_ended(peer, epoch, &run, now));
         out.extend(self.hand_room(now));
+        out
+    }
+
+    /// W13-R01: local facts go straight to admission, preserving the room ledger.
+    pub fn refreshed(&mut self, facts: RunnerFacts, now: i64) -> Vec<Out> {
+        if facts == self.facts { return Vec::new(); }
+        self.facts = facts;
+        let mut said = Vec::new();
+        self.admission.refreshed(self.facts.clone(), self.labels.clone(), now, &mut said);
+        let mut out = self.said(said, now);
+        if let Some(me) = self.machines.iter_mut().find(|m| m.name == self.me) {
+            me.facts = self.facts.clone();
+            me.size.gpu = Some(u32::try_from(self.admission.cap()[3]).unwrap_or(u32::MAX));
+        }
+        let mut acts = self.owner.machines(self.machines.clone());
+        acts.extend(self.owner.reask(now));
+        out.extend(self.acts(acts, now));
         out
     }
 
@@ -1280,7 +1370,8 @@ impl Placer {
 
     /// A reading of this machine: the room it admits against; where it measures itself, a measure
     /// due once this input is done (the reading's figures aren't taken).
-    pub fn measured(&mut self, sample: Sample, now: i64) -> Vec<Out> {
+    pub fn measured(&mut self, mut sample: Sample, now: i64) -> Vec<Out> {
+        sample.size.gpu = u32::try_from(self.facts.gpus.len()).unwrap_or(u32::MAX);
         let mut said = Vec::new();
         if self.sensor.is_some() {
             self.machine_changed();
@@ -1726,6 +1817,9 @@ impl Placer {
                             let _ = self.fast(&name, e, ask, kernel.handle(), epoch, now, &mut said);
                         }
                         ToRunner::Sync => self.admission.sync(me, now, &mut said),
+                        // This node's owner hears its own runner's hints, never its tokens: it is
+                        // never told another wants, so it gives nothing back here.
+                        ToRunner::FastRelease { epoch, amount } => self.admission.fast_release(me, epoch, amount, now, &mut said),
                     }
                     for (to, msg) in said {
                         if to == self.me {
@@ -1779,6 +1873,26 @@ impl Placer {
 }
 
 #[cfg(test)]
+mod how_tests {
+    use super::{How, how};
+
+    /// W05-R04 (docs/lb.md "Good places"): a run that exited here is judged by its exit. It went
+    /// well when it exited 0; the node let it down when it couldn't start here or a program it
+    /// ran isn't here; any other failure has no cause the runner knows; a run a signal ended (its
+    /// asker stopped it, as far as an exit says) is judged by no one.
+    #[test]
+    fn w05_r04_a_run_is_judged_by_its_exit() {
+        assert_eq!(how(Some(0), None, false), How::Well, "it exited 0");
+        assert_eq!(how(Some(1), None, false), How::Unsure, "a failure with no cause known here: the node's or the work's");
+        assert_eq!(how(Some(127), None, false), How::LetDown, "a shell's \"command not found\": a program it ran isn't here");
+        assert_eq!(how(Some(9009), None, false), How::LetDown, "cmd's \"is not recognized\"");
+        assert_eq!(how(None, Some("cannot keep the shell's state"), false), How::LetDown, "it couldn't start here");
+        assert_eq!(how(None, Some("timed out"), true), How::Unsure, "its own limit ran out: the node's slowness or the work's");
+        assert_eq!(how(None, None, false), How::Unsaid, "a signal ended it: stopped by its asker as far as its exit says");
+    }
+}
+
+#[cfg(test)]
 mod key_tests {
     use super::*;
 
@@ -1796,6 +1910,23 @@ mod key_tests {
         let line = say(Reason::Line)?;
         anyhow::ensure!(for_older_owner(line.clone()) == line, "a reason it reads goes as it is");
         anyhow::ensure!(crate::proto::feature::speaks(&crate::proto::feature::all(), crate::proto::feature::PLACE_HEALTH), "this build reads them");
+        Ok(())
+    }
+
+    /// LB08: room tokens' own words (a runner's word to an owner alone, an owner's give-back) are
+    /// told apart from every other placement word by their op, which the node holds to the peers
+    /// whose links named `place.tokens`; a run whose key spells the op in a string is no such word.
+    #[test]
+    fn lb08_room_tokens_words_are_known_by_their_op() -> anyhow::Result<()> {
+        use kiln_ci::place::msg::FastWord;
+        let env = |msg: ToOwner| serde_json::to_string(&Envelope { epoch: 3, spec: None, ballot: None, members: Vec::new(), msg });
+        let hint = env(ToOwner::FastHint { word: FastWord { tokens: true, ..FastWord::default() } })?;
+        let release = serde_json::to_string(&Envelope { epoch: 3, spec: None, ballot: None, members: Vec::new(), msg: ToRunner::FastRelease { epoch: 1, amount: [1000, 0, 0, 0] } })?;
+        anyhow::ensure!(tokens_word(&hint) && tokens_word(&release), "{hint} {release}");
+        let ask = Ask { run: "r1".into(), key: Some(r#"cmd:echo "op":"fast_release""#.into()), ..Ask::default() };
+        let probe = serde_json::to_string(&Envelope { epoch: 3, spec: None, ballot: None, members: Vec::new(), msg: ToRunner::Probe { ask: std::sync::Arc::new(ask), elsewhere: 0 } })?;
+        anyhow::ensure!(!tokens_word(&probe) && !tokens_word(&env(ToOwner::Ran { run: "r1".into() })?), "{probe}");
+        anyhow::ensure!(crate::proto::feature::speaks(&crate::proto::feature::all(), crate::proto::feature::PLACE_TOKENS), "this build speaks them");
         Ok(())
     }
 
@@ -1838,7 +1969,7 @@ mod key_tests {
         let size = Resources { cpu: Cpus::whole(4), mem: 8 << 30, ..Resources::default() };
         let mut p = Placer::new("doer", 1, RunnerFacts::default(), Vec::new(), Sample { size, ..Sample::default() }, Settings::default(), 0);
         let offered = |out: &[Out], run: &str| out.iter().any(|o| matches!(o, Out::Say { peer, json } if peer == "owner-a" && json.contains(r#""op":"offer""#) && json.contains(&format!(r#""run":"{run}""#))));
-        let older = r#"{"epoch":1,"msg":{"op":"probe","ask":{"run":"r1","needs":{"request":{"cpu":1000,"mem":0,"disk":0,"gpu":0}},"class":"batch","repo":"acme","actor":"a"}}}"#;
+        let older = r#"{"epoch":1,"msg":{"op":"probe","ask":{"run":"r1","needs":{"request":{"cpu":1,"mem":0,"disk":0,"gpu":0}},"class":"batch","repo":"acme","actor":"a"}}}"#;
         let out = p.told("owner-a", older, 0);
         anyhow::ensure!(offered(&out, "r1"), "an older owner's probe is offered as before: {out:?}");
         let ask = Ask { run: "r2".into(), needs: kiln_ci::sched::needs::Needs { request: Resources { cpu: Cpus::whole(1), ..Resources::default() }, ..Default::default() }, repo: "acme".into(), actor: "a".into(), ..Ask::default() };
@@ -2217,6 +2348,16 @@ mod durable_tests {
         assert!(planted.is_err(), "planted: an unsynced epoch is taken up again after a crash: {planted:?}");
     }
 
+    #[test]
+    fn lb03_real_epoch_file_advances_and_leaves_only_the_committed_epoch() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert_eq!(next_epoch(dir.path())?, 1);
+        assert_eq!(next_epoch(dir.path())?, 2);
+        assert_eq!(std::fs::read_to_string(dir.path().join("place-epoch"))?, "2");
+        assert!(!dir.path().join("place-epoch.new").exists());
+        Ok(())
+    }
+
     /// LB03: an owner gone from the directory is forgotten at its runner, its ended records let go
     /// in the runner's records too.
     #[test]
@@ -2307,5 +2448,20 @@ mod topo_tests {
         let hint: crate::offers::hint::Hint = serde_json::from_str(&json)?;
         anyhow::ensure!(hint.topo == Some(word(900_000)), "{:?}", hint.topo);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hex_gpu_port_tests {
+    use super::*;
+    #[test]
+    fn w13_r01_gpu_inventory_survives_host_samples_and_changes_on_local_facts() {
+        let facts = RunnerFacts { gpus: vec![kiln_ci::facts::Gpu { model: "A100".into(), memory: 80 << 30, ..Default::default() }; 2], ..RunnerFacts::default() };
+        let mut p = Placer::new("gpu-node", 1, facts, Vec::new(), Sample::default(), Settings::default(), 0);
+        assert_eq!(p.admission.cap()[3], 2);
+        p.measured(Sample::default(), 1);
+        assert_eq!(p.admission.cap()[3], 2);
+        p.refreshed(RunnerFacts::default(), 2);
+        assert_eq!(p.admission.cap()[3], 0);
     }
 }

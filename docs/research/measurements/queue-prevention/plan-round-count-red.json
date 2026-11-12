@@ -1,0 +1,6 @@
+{
+  "exit_code": 101,
+  "expected_group_count_failure": true,
+  "source_capture": "check-1794392067933345000",
+  "log": "/private/tmp/kiln-queue-prevention-20261111/docs/research/measurements/queue-prevention/plan-round-count-red.log"
+}

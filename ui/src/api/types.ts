@@ -38,6 +38,8 @@ export type RunEvent = "push" | "pull_request" | "tag" | "manual" | "schedule";
 
 export interface Me {
   authenticated: boolean;
+  /** Opaque stable authenticated scope for browser message custody; never an API token. */
+  mail_scope?: string;
   version: string;
   hostname: string;
   /** Who is signed in: the owner, a person, or a token's or agent's principal. */

@@ -85,14 +85,19 @@ fn probe_facts(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::ru
 /// run's tool not found alone (W13-R01). One at a time: what asks while one runs gives one more
 /// after it.
 fn probe_facts_as(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::runner::probe::Declared, probing: &Arc<crate::runner::probe::Probing>, looked: bool) {
-    if !probing.take(looked) {
-        return;
-    }
+    start_facts_probe(uplink, work_dir, declared, probing, looked, false);
+}
+
+fn start_facts_probe(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::runner::probe::Declared, probing: &Arc<crate::runner::probe::Probing>, looked: bool, gpu_only: bool) {
+    if !(if gpu_only { probing.take_gpu() } else { probing.take(looked) }) { return; }
     let (up, dir, declared, busy) = (uplink.clone(), work_dir.to_path_buf(), declared.clone(), Arc::clone(probing));
     crate::rt::spawn(async move {
         let mut look = busy.looks();
         loop {
-            let facts = crate::runner::probe::gather(&dir, &declared, look).await;
+            let facts = busy.read(&dir, &declared, look).await;
+            if let Some(node) = crate::reach::node::global() {
+                node.feed(crate::reach::node::In::LocalFacts(Box::new(facts.clone()))).await;
+            }
             if let Ok(json) = serde_json::to_string(&facts) {
                 up.msg(AgentMsg::Facts { json }).await;
             }
@@ -492,6 +497,10 @@ enum Ev {
     Harness(String, crate::harness::core::Update, Instant),
     /// A retained archive/restore finished while the loop kept delivering Reach exits.
     HarnessApplied(HarnessApplied),
+    /// The one event-triggered source-journal replay completed, after its bounded sink drained.
+    MailReplayed(bool),
+    /// Actual shared input-pool availability changed while a header copy was held.
+    MailBudget,
     /// The front door's status changed.
     FrontDoor,
     /// What headroom decides changed (docs/headroom.md).
@@ -538,11 +547,246 @@ fn in_kind(ev: &Ev) -> crate::route_latency::InKind {
     }
 }
 
-type HarnessApplied=(Option<(String,u64)>,Result<(),(crate::wire::channel::Refusal,String)>);
+enum HarnessApplied {
+    Command { reply: Option<(String, u64)>, result: Result<(), (crate::wire::channel::Refusal, String)> },
+    Native(NativePrepared),
+    #[cfg(unix)]
+    LegacyPromotion(Result<(), crate::harness::inbox::PromotionError>),
+}
 type HarnessOperations=futures::stream::FuturesUnordered<futures::future::BoxFuture<'static,HarnessApplied>>;
 
 async fn next_harness_operation(operations:&mut HarnessOperations)->HarnessApplied{
     match operations.next().await{Some(answer)=>answer,None=>futures::future::pending().await}
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum LegacyCause { Observe, Promoted }
+
+#[cfg(unix)]
+impl LegacyCause {
+    fn joined(self, other: Self) -> Self { if matches!(self, Self::Promoted) || matches!(other, Self::Promoted) { Self::Promoted } else { Self::Observe } }
+}
+
+/// One metadata operation in the existing owner. A failed promotion keeps its actual event
+/// until another real connection/identity event retries it; bookkeeping never self-retries.
+#[cfg(unix)]
+#[derive(Default)]
+enum LegacyProgress {
+    #[default]
+    Idle,
+    Reading { cause: LegacyCause, again: Option<LegacyCause> },
+    Held(LegacyCause),
+}
+
+#[cfg(unix)]
+impl LegacyProgress {
+    fn request(&mut self, host: Option<&Arc<crate::harness::host::Host>>, operations: &mut HarnessOperations, tx: &crate::memory::queue::Sender<Bg>, cause: LegacyCause) {
+        let cause = match self {
+            Self::Reading { again, .. } => { *again = Some(again.map_or(cause, |before| before.joined(cause))); return; }
+            Self::Held(before) => before.joined(cause),
+            Self::Idle => cause,
+        };
+        let Some(host) = host else { return };
+        let (host, tx) = (Arc::clone(host), tx.clone());
+        *self = Self::Reading { cause, again: None };
+        operations.push(async move { HarnessApplied::LegacyPromotion(legacy_promotion_progress(&host, cause, &tx).await) }.boxed());
+    }
+
+    fn finish(&mut self, result: &Result<(), crate::harness::inbox::PromotionError>, host: Option<&Arc<crate::harness::host::Host>>, operations: &mut HarnessOperations, tx: &crate::memory::queue::Sender<Bg>) {
+        let Self::Reading { cause, again } = std::mem::take(self) else { return };
+        if result.is_err() { *self = Self::Held(cause); }
+        if let Some(again) = again { self.request(host, operations, tx, again); }
+    }
+}
+
+#[cfg(unix)]
+async fn legacy_promotion_progress(host: &Arc<crate::harness::host::Host>, cause: LegacyCause, tx: &crate::memory::queue::Sender<Bg>) -> Result<(), crate::harness::inbox::PromotionError> {
+    let mut after = None;
+    let mut first_error = None;
+    while let Some((session, promotion)) = host.legacy_promotion_next(after).await? {
+        after = Some(session.clone());
+        if let Err(error) = legacy_session_progress(host, &session, promotion, cause, tx).await && first_error.is_none() { first_error = Some(error); }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(unix)]
+async fn legacy_session_progress(host: &Arc<crate::harness::host::Host>, session: &str, mut promotion: crate::harness::inbox::Promotion, cause: LegacyCause, tx: &crate::memory::queue::Sender<Bg>) -> Result<(), crate::harness::inbox::PromotionError> {
+    use crate::harness::inbox::{PromotionError, PromotionPhase};
+    if promotion.phase == PromotionPhase::Active && !host.legacy_recovery_pending(session, promotion.from_epoch, promotion.to_epoch).await? { return Ok(()); }
+    crate::runner::custody::legacy_waiting(session, &promotion).map_err(|why| PromotionError::Invalid { why })?;
+    if matches!(cause, LegacyCause::Promoted) && promotion.phase == PromotionPhase::AwaitingPromotion {
+        host.promote_legacy(session, promotion.to_epoch).await?;
+        promotion = host.legacy_promotion(session).await?.ok_or(PromotionError::Stale)?;
+        crate::runner::custody::legacy_waiting(session, &promotion).map_err(|why| PromotionError::Invalid { why })?;
+    }
+    if matches!(promotion.phase, PromotionPhase::AwaitingCertificate | PromotionPhase::Rebinding | PromotionPhase::Active) {
+        if crate::runner::custody::legacy_certificate_ready(session, promotion.to_epoch, &promotion.proof).is_ok() {
+            host.certify_legacy(session, promotion.to_epoch).await?;
+        } else {
+            tx.send(Bg::LegacyIdentity { session: session.to_owned(), epoch: promotion.to_epoch }).await.map_err(|_| PromotionError::Storage { why: "the existing runner control owner is closed; promotion remains retained".into() })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+type PreparedSessions = Vec<(crate::harness::host::Saved, Option<Box<crate::harness::session::Handed>>, Option<serde_json::Value>)>;
+
+#[cfg(unix)]
+struct BlueGreenReady { job: String, conn: Arc<crate::bluegreen::Conn>, instance: String, custody: bool, role: Option<String>, relays: bool, stores: bool, mail: bool }
+
+enum NativePreparation {
+    #[cfg(unix)]
+    BlueGreen { ready: BlueGreenReady, machine: String },
+    InPlace { exe: PathBuf, mtime: Option<std::time::SystemTime> },
+    #[cfg(unix)]
+    Rollback { job: String, why: String, acks: Vec<Ack>, records: Vec<crate::harness::host::Saved> },
+}
+
+enum NativePrepared {
+    #[cfg(unix)]
+    BlueGreen { ready: BlueGreenReady, sessions: Result<PreparedSessions, String> },
+    InPlace { exe: PathBuf, mtime: Option<std::time::SystemTime>, result: Result<usize, String> },
+    #[cfg(unix)]
+    Rollback { job: String, why: String, acks: Vec<Ack>, allowed: Result<bool, String> },
+}
+
+#[derive(PartialEq, Eq)]
+enum NativeKind { #[cfg(unix)] BlueGreen(String), InPlace, #[cfg(unix)] Rollback(String) }
+
+/// One native preparation in the existing operation set. Cancellation records intent; it does
+/// not drop the future that may already own detached native descriptors. Its completion hands
+/// those descriptors to the existing rollback owner before cancellation is acted on.
+#[derive(Default)]
+enum NativeHandover {
+    #[default]
+    Idle,
+    Preparing { kind: NativeKind, cancel: Option<String>, wake: crate::rt::Shutdown },
+}
+
+impl NativeHandover {
+    fn idle(&self) -> bool { matches!(self, Self::Idle) }
+    fn cancel(&mut self, job: Option<&str>, why: String) -> bool {
+        let Self::Preparing { kind, cancel, wake } = self else { return false };
+        let same = match (job, &*kind) {
+            (None, _) => true,
+            #[cfg(unix)]
+            (Some(job), NativeKind::BlueGreen(active) | NativeKind::Rollback(active)) => active == job,
+            (Some(_), _) => false,
+        };
+        if !same { return false; }
+        if cancel.is_none() { *cancel = Some(why); }
+        wake.cancel();
+        true
+    }
+    fn finish(&mut self) -> Option<String> {
+        match std::mem::take(self) { Self::Preparing { cancel, .. } => cancel, Self::Idle => None }
+    }
+    fn prepare(&mut self, operations: &mut HarnessOperations, host: Option<Arc<crate::harness::host::Host>>, operation: NativePreparation) -> bool {
+        if !self.idle() { return false; }
+        let kind = match &operation {
+            #[cfg(unix)]
+            NativePreparation::BlueGreen { ready, .. } => NativeKind::BlueGreen(ready.job.clone()),
+            NativePreparation::InPlace { .. } => NativeKind::InPlace,
+            #[cfg(unix)]
+            NativePreparation::Rollback { job, .. } => NativeKind::Rollback(job.clone()),
+        };
+        let wake = crate::rt::Shutdown::new();
+        *self = Self::Preparing { kind, cancel: None, wake: wake.clone() };
+        operations.push(async move {
+            HarnessApplied::Native(match operation {
+                #[cfg(unix)]
+                NativePreparation::BlueGreen { ready, machine } => {
+                    let destination = crate::harness::host::transfer::NativeDestination { machine, instance: ready.instance.clone(), mail: ready.mail, cancel: wake };
+                    let sessions = match host { Some(host) => host.move_out_signing(ready.custody, Some(destination)).await, None => Ok(Vec::new()) };
+                    NativePrepared::BlueGreen { ready, sessions }
+                }
+                NativePreparation::InPlace { exe, mtime } => {
+                    let result = match host { Some(host) => host.hand_over_all().await, None => Ok(0) };
+                    NativePrepared::InPlace { exe, mtime, result }
+                }
+                #[cfg(unix)]
+                NativePreparation::Rollback { job, why, acks, records } => {
+                    let allowed = match host { Some(host) => host.abort_native_records(&records).await, None if records.is_empty() => Ok(true), None => Err("the rollback source journal is unavailable; native owners remain retained".into()) };
+                    NativePrepared::Rollback { job, why, acks, allowed }
+                }
+            })
+        }.boxed());
+        true
+    }
+}
+
+/// One operation on the existing Host, polled beside the sink this loop drains. A second
+/// connection/stream-reset event coalesces into one further read; no receipt/body queue lives here.
+#[derive(Clone, Copy)]
+// Counts are (used, bound). Unfavourable changes update only the observed cursor, so a
+// reserve/release pulse back to the failure baseline cannot manufacture new availability.
+struct ReplayBudget { before: (usize, usize), observed: (usize, usize) }
+impl ReplayBudget {
+    fn new(counts: (usize, usize)) -> Self { Self { before: counts, observed: counts } }
+    fn improved(&mut self, now: (usize, usize)) -> bool {
+        self.observed = now;
+        now.1 > self.before.1 || now.0 < self.before.0
+    }
+}
+
+enum MailReplay {
+    Idle { budget: Option<ReplayBudget> },
+    Reading { read: futures::future::BoxFuture<'static, bool>, before: (usize, usize) },
+    Again { read: futures::future::BoxFuture<'static, bool>, before: (usize, usize) },
+}
+impl Default for MailReplay { fn default() -> Self { Self::Idle { budget: None } } }
+
+impl MailReplay {
+    fn request(&mut self, host: Option<&Arc<crate::harness::host::Host>>) {
+        *self = match std::mem::take(self) {
+            Self::Idle { .. } => match host.cloned() {
+                Some(host) => {
+                    let before = host.native_budget_counts();
+                    Self::Reading { read: Box::pin(async move { let held = host.replay_mail_transfers().await; host.replay_mail().await; held }), before }
+                }
+                None => Self::default(),
+            },
+            Self::Reading { read, before } | Self::Again { read, before } => Self::Again { read, before },
+        };
+    }
+
+    async fn completed(&mut self) -> bool {
+        match self {
+            Self::Reading { read, .. } | Self::Again { read, .. } => read.await,
+            Self::Idle { .. } => futures::future::pending().await,
+        }
+    }
+
+    fn budget_observed(&self) -> Option<(usize, usize)> {
+        match self { Self::Idle { budget: Some(budget) } => Some(budget.observed), _ => None }
+    }
+
+    async fn budget_changed(host: Option<&Arc<crate::harness::host::Host>>, observed: Option<(usize, usize)>) {
+        match (host, observed) {
+            (Some(host), Some(observed)) => host.native_budget_changed(observed).await,
+            _ => futures::future::pending().await,
+        }
+    }
+
+    fn budget_event(&mut self, host: Option<&Arc<crate::harness::host::Host>>) {
+        if let (Self::Idle { budget: Some(budget) }, Some(host)) = (&mut *self, host)
+            && budget.improved(host.native_budget_counts()) { self.request(Some(host)); }
+    }
+
+    fn finish(&mut self, host: Option<&Arc<crate::harness::host::Host>>, held: bool) {
+        let (again, before) = match std::mem::take(self) {
+            Self::Reading { before, .. } => (false, before),
+            Self::Again { before, .. } => (true, before),
+            Self::Idle { .. } => return,
+        };
+        let Some(host) = host else { return };
+        let after = host.native_budget_counts();
+        if again || (held && ReplayBudget::new(before).improved(after)) { self.request(Some(host)); }
+        else if held { *self = Self::Idle { budget: Some(ReplayBudget::new(after)) }; }
+    }
 }
 
 /// Blue/green upgrade steps (`crate::bluegreen`) done off the event loop, back to it (none on
@@ -557,7 +801,10 @@ enum Bg {
     /// when it takes the machine's runner role signed for too; `relays`: it checks this runner's
     /// records of the frames it forwards (docs/ci.md W27-R08's relays); `stores`: it takes blue's
     /// conversation stores over too.
-    Ready { job: String, conn: Arc<crate::bluegreen::Conn>, custody: bool, role: Option<String>, relays: bool, stores: bool },
+    Ready(BlueGreenReady),
+    /// Source native preparation completed while the control loop kept draining its sink.
+    #[cfg(unix)]
+    Prepared { ready: BlueGreenReady, sessions: Result<PreparedSessions, String> },
     /// Everything was sent: what the new build said of each, in order (`broke`: the connection
     /// failed part-way), and where it set aside each conversation store that wouldn't open there
     /// (`aside`, as [`Given::aside`]).
@@ -566,6 +813,9 @@ enum Bg {
     /// The new build didn't come up: this runner goes on.
     #[cfg(unix)]
     Failed { job: String, why: String },
+    /// Exact source manifest Abort is durable; only this event may stop green and resume blue.
+    #[cfg(unix)]
+    RollbackAuthorized { job: String, why: String, acks: Vec<Ack> },
     /// (The new build's runner.) A terminal handed over: take it, and say how it went.
     #[cfg(unix)]
     TakeTerminal { session: String, command: Option<String>, cols: u16, rows: u16, replay: Vec<u8>, fd: std::os::fd::OwnedFd, pid: u32, done: futures::channel::oneshot::Sender<Result<(), String>> },
@@ -584,6 +834,9 @@ enum Bg {
     /// (The new build's runner.) It is the runner now: the server hears it's the newest.
     #[cfg(unix)]
     Promoted,
+    /// A durable promotion asks only its exact destination epoch, outside the metadata worker.
+    #[cfg(unix)]
+    LegacyIdentity { session: String, epoch: u64 },
     /// A server frame for [`Ev::Forwarded`].
     #[cfg(unix)]
     Forwarded(Vec<u8>),
@@ -976,9 +1229,9 @@ mod replica_tests {
 /// placement ledger beside the runs owners placed here (docs/needs.md E5, AUDIT M4: one ledger
 /// for CI legs, commands and sessions, so together they never pass its budget, G1): `Err(why)`
 /// when it leaves no room. Without reach, as before.
-async fn leg_room(reach: Option<&crate::reach::node::Handle>, id: &str, key: String, exclusive: bool, request: kiln_ci::sched::state::Resources) -> Result<(), String> {
+async fn leg_room(reach: Option<&crate::reach::node::Handle>, id: &str, key: String, exclusive: bool, request: kiln_ci::sched::state::Resources, requires: &[String]) -> Result<(), String> {
     let Some(r) = reach else { return Ok(()) };
-    let needs = kiln_ci::sched::needs::Needs { request, exclusive, ..kiln_ci::sched::needs::Needs::default() };
+    let needs = kiln_ci::sched::needs::Needs { request, exclusive, requires: if request.gpu > 0 { requires.to_vec() } else { Vec::new() }, ..kiln_ci::sched::needs::Needs::default() };
     // Its kind as its run here is keyed (`sense::run::leg_key`, as the executor keys it): a cause
     // its own runs met here bars it (AUDIT L2).
     let ask = kiln_ci::place::Ask { run: id.to_owned(), needs, class: kiln_ci::sched::state::Class::Batch, key: Some(key), ..kiln_ci::place::Ask::default() };
@@ -1067,7 +1320,7 @@ async fn roll_back(
                     hd.process.foreign = true;
                     Some(Box::new(hd))
                 });
-                if let Err(e) = h.move_in(*record, handed) {
+                if let Err(e) = h.move_in(*record, handed).await {
                     problems.push(format!("agent session {id}: {e:#}"));
                 }
             }
@@ -1223,6 +1476,47 @@ async fn gone_within(pid: u32, patience: Duration) -> bool {
     true
 }
 
+/// A Welcome does not settle named features: that reply follows independently on the
+/// same connection. Only an actual Caps-negative or Features reply releases native Ready.
+#[cfg(unix)]
+#[derive(Default, Debug, PartialEq, Eq)]
+enum FeatureNegotiation {
+    #[default]
+    AwaitingCaps,
+    AwaitingNames,
+    Legacy,
+    Named,
+}
+
+#[cfg(unix)]
+impl FeatureNegotiation {
+    fn caps(&mut self, caps: u64) {
+        if caps & proto::CAP_FEATURES == 0 {
+            *self = Self::Legacy;
+        } else if *self != Self::Named {
+            *self = Self::AwaitingNames;
+        }
+    }
+
+    fn names(&mut self) { *self = Self::Named; }
+
+    fn take_over(&self, welcomed: bool, pending: &mut Option<PathBuf>) -> Option<PathBuf> {
+        if welcomed && matches!(self, Self::Legacy | Self::Named) { pending.take() } else { None }
+    }
+}
+
+/// Uses the existing one-shot takeover owner after this connection's handshake is settled.
+#[cfg(unix)]
+fn start_take_over(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: crate::memory::queue::Sender<Bg>, me: Me, takes: bool) {
+    crate::rt::spawn(async move {
+        if let Err(e) = take_over_from(path, harness, tx.clone(), me, takes).await {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");
+        }
+        crate::reach::told::predecessor_ended();
+        let _ = tx.send(Bg::TakeOverEnded).await;
+    });
+}
+
 /// (The new build's runner, blue/green.) Take over from the runner being upgraded, at `path`: say
 /// it's ready, take each agent session and terminal it hands over (saying how each went), then the
 /// server's frames about them that reached it meanwhile, until that runner ends. Terminals are
@@ -1235,7 +1529,8 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
     let conn = Arc::new(crate::rt::blocking(move || crate::bluegreen::connect(&path)).await??);
     let c = Arc::clone(&conn);
     let (custody, instance) = (crate::runner::custody::signs(), me.instance.clone());
-    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance, custody, role: custody, relays: custody, stores: takes_stores }, &[])).await??;
+    let mail_transfer = harness.as_ref().is_some_and(|host| host.inbox().is_some()) && crate::harness::handing::takes_mail();
+    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance, custody, role: custody, relays: custody, stores: takes_stores, mail_transfer }, &[])).await??;
     tracing::info!(upgrade = %std::env::var("KILN_UPGRADE_ID").unwrap_or_default(), "connected to the runner being upgraded: taking over");
     // Read on a thread of its own: once everything is in, the connection stays open (idle) until
     // the old runner ends.
@@ -1409,17 +1704,48 @@ fn gone_here(session: &str, moved: &std::collections::HashSet<crate::instances::
 /// came as `fds` (stdin, stdout, stderr); else started again from its record. When its process
 /// can't go on here it is stopped and the session starts again from its record (an error, saying so).
 #[cfg(unix)]
-async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, rec: crate::harness::host::Saved, handed: Option<Box<crate::harness::session::Handed>>, hand_on: Option<String>, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
+async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, mut rec: crate::harness::host::Saved, handed: Option<Box<crate::harness::session::Handed>>, hand_on: Option<String>, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
     use std::os::fd::IntoRawFd as _;
     let Some(h) = h else { return Err("this runner runs no agent sessions".to_owned()) };
     if h.get(id).is_some() {
         return Ok(());
     }
+    let manifest = rec.mail_manifest().cloned();
+    let given = hand_on.as_deref().and_then(crate::runner::custody::bundle_of);
+    if let Some(manifest) = &manifest {
+        if manifest.session != id { return Err("the native journal names a different session".into()); }
+        native_journal_hand_on(manifest, handed.as_deref().map(|h| &h.core), given.as_ref())?;
+    }
+    let native_count = if handed.is_some() { 3 } else { 0 };
+    let expected = native_count + usize::from(rec.mail_manifest().is_some());
+    if fds.len() != expected { return Err("the native handover did not carry its exact native/journal descriptors; the source retains custody".into()); }
+    let durable_legacy = manifest.is_none() && crate::runner::custody::signs();
+    if durable_legacy {
+        let frozen = &handed.as_ref().ok_or_else(|| "the legacy native handover has no retained source timeline; its source keeps custody".to_owned())?.core;
+        let given = given.as_ref().ok_or_else(|| "the legacy native handover has no source hand-on; its source keeps custody".to_owned())?;
+        let (from, events) = frozen.handover_source();
+        let to = from.checked_add(1).ok_or_else(|| "the legacy ownership epoch cannot advance".to_owned())?;
+        let mut proof = crate::runner::custody::LegacyProof::of(id, from, events, Some(given))?;
+        proof.hand_on = hand_on;
+        h.prepare_legacy_promotion(id, from, to, proof).await.map_err(|error| error.to_string())?;
+    }
+    let mut fds = fds;
+    if rec.mail_manifest().is_some() {
+        let journal = fds.pop().ok_or_else(|| "the native journal descriptor is missing".to_owned())?;
+        rec.attach_journal(std::fs::File::from(journal));
+    }
+    // This await occurs on the handover receiver, never the control loop draining its source
+    // sink. Native descriptors are still owned and no process is stopped on precommit refusal.
+    let mut prepared = h.prepare_native_import(rec, handed).await?;
+    if let Some(manifest) = &manifest {
+        // The journal commit already advanced ownership. Register its one receipt before Open
+        // can request the destination certificate; legacy promotion would advance it again.
+        native_journal_receipt(manifest, prepared.handed.as_deref().map(|h| &h.core), given.as_ref())?;
+    }
     // Signed for by the runner it came from, or by none (one from before): it goes on at its epoch
     // until this runner is promoted, its receipt waiting till then (docs/ci.md W27-R08).
-    let given = hand_on.as_deref().and_then(crate::runner::custody::bundle_of);
     let taken = |r: Result<(), String>| {
-        if r.is_ok()
+        if manifest.is_none() && !durable_legacy && r.is_ok()
             && let Some(s) = h.get(id)
         {
             let (epoch, events) = {
@@ -1430,33 +1756,50 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, rec
         }
         r
     };
-    let Some(mut hd) = handed else {
-        return taken(h.move_in(rec, None).map_err(|e| format!("{e:#}")));
-    };
-    let pid = hd.process.pid;
-    let mut fds = fds.into_iter();
-    let (Some(i), Some(o), Some(e)) = (fds.next(), fds.next(), fds.next()) else {
-        let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
-        let again = taken(h.move_in(rec, None).map_err(|e| format!("{e:#}")));
-        return Err(format!("its pipes didn't come with it, so its process was stopped{}", again.err().map_or_else(|| ": it started again from its record".to_owned(), |e| format!(", and it couldn't start again: {e}"))));
-    };
-    hd.process.stdin = i.into_raw_fd();
-    hd.process.stdout = o.into_raw_fd();
-    hd.process.stderr = e.into_raw_fd();
-    hd.process.foreign = true;
-    let raw = [hd.process.stdin, hd.process.stdout, hd.process.stderr];
-    match h.move_in(rec.clone(), Some(hd)) {
-        Ok(()) => taken(Ok(())),
-        // Refused before its pipes were taken: they close, its process is stopped.
-        Err(e) => {
-            for r in raw {
-                drop(crate::os::reclaim_fd(r));
-            }
-            let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
-            let again = taken(h.move_in(rec, None).map_err(|e| format!("{e:#}")));
-            Err(format!("{e:#}; its process was stopped{}", again.err().map_or_else(|| ", and it started again from its record".to_owned(), |e| format!(", and it couldn't start again: {e}"))))
-        }
+    if let Some(handed) = &mut prepared.handed {
+            let mut fds = fds.into_iter();
+            let (Some(stdin), Some(stdout), Some(stderr)) = (fds.next(), fds.next(), fds.next()) else { return Err("native process descriptors are incomplete".into()) };
+            handed.process.stdin = stdin.into_raw_fd();
+            handed.process.stdout = stdout.into_raw_fd();
+            handed.process.stderr = stderr.into_raw_fd();
+            handed.process.foreign = true;
     }
+    taken(h.move_in_prepared(prepared).await.map_err(|e| format!("{e:#}")))
+}
+
+/// W27-R08: bind the untrusted hand-on to this retained timeline before building its receipt.
+/// The server alone validates its signer, root and complete revocations before certification.
+#[cfg(unix)]
+fn native_journal_hand_on(manifest: &crate::harness::mail::TransferManifest, frozen: Option<&crate::harness::core::Frozen>, hand_on: Option<&serde_json::Value>) -> Result<(), String> {
+    use kiln_ci::identity::{chain::{Actor, Identity}, custody, statement};
+    if !crate::runner::custody::signs() { return Ok(()); }
+    let frozen = frozen.ok_or_else(|| "the signed native journal has no retained source timeline; custody stays held".to_owned())?;
+    let (source_epoch, events) = frozen.handover_source();
+    if source_epoch != manifest.source_epoch || source_epoch.checked_add(1) != Some(manifest.destination_epoch) {
+        return Err("the signed native timeline does not match the journal ownership epochs".into());
+    }
+    let hand_on = hand_on.ok_or_else(|| "the signed native journal has no source hand-on; custody stays held".to_owned())?;
+    let given = crate::runner::custody::statement_of(hand_on).ok_or_else(|| "the native source hand-on has no readable statement".to_owned())?;
+    let body: custody::Body = crate::wire::payload(crate::wire::unread::Wire::RunnerPayload, "NativeHandOn", &given.body.to_string()).map_err(|error| format!("the native source hand-on has no readable custody body: {error}"))?;
+    let source = Identity::parse(&body.by).ok().is_some_and(|identity| matches!(identity.actor, Actor::Agent { agent, epoch, .. } if agent == manifest.session && epoch == source_epoch));
+    if !source || hand_on.pointer("/dsseEnvelope/payloadType").and_then(serde_json::Value::as_str) != Some(statement::PAYLOAD_CUSTODY)
+        || given.v != statement::VERSION || body.v != custody::VERSION || body.kind != custody::Kind::HandedOn || body.epoch != Some(manifest.destination_epoch)
+        || body.to != crate::custody::at_epoch(&body.by, manifest.destination_epoch)
+        || given.subject.as_slice() != [crate::custody::timeline(&manifest.session, source_epoch, events)]
+    {
+        return Err("the native source hand-on does not name this exact session timeline and destination epoch".into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn native_journal_receipt(manifest: &crate::harness::mail::TransferManifest, frozen: Option<&crate::harness::core::Frozen>, hand_on: Option<&serde_json::Value>) -> Result<(), String> {
+    native_journal_hand_on(manifest, frozen, hand_on)?;
+    if let (Some(frozen), Some(hand_on)) = (frozen, hand_on) {
+        let (_, events) = frozen.handover_source();
+        crate::runner::custody::took(&manifest.session, manifest.destination_epoch, events, hand_on)?;
+    }
+    Ok(())
 }
 
 /// Completes when the front door (if this runner has one) reports something new.
@@ -1760,9 +2103,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // session host, once there is one (below).
     let (adopt_tx, adopt_rx) = crate::memory::queue::places::<crate::reach::node::Adoption>(&crate::memory::owners::CHANNELS, 4);
     let reach = o.reach.filter(|_| !o.ephemeral).map(|accept| {
-        // `[runner] on_battery` of its own kiln config, the default without one (W05-R26).
-        let on_battery = o.config.as_deref().and_then(|p| crate::config::Config::load(p).ok()).map(|c| c.runner.on_battery).unwrap_or_default();
-        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), on_battery, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
+        // `[runner] on_battery` and `[reach]`'s placement settings of its own kiln config, kiln's
+        // own without one (W05-R26; W05-R09, W05-R39, LB08).
+        let own = o.config.as_deref().and_then(|p| crate::config::Config::load(p).ok());
+        let on_battery = own.as_ref().map(|c| c.runner.on_battery).unwrap_or_default();
+        let place = own.as_ref().map_or_else(kiln_ci::place::runner::Settings::default, |c| {
+            c.reach.place().unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "placement here decides by kiln's own settings");
+                kiln_ci::place::runner::Settings::default()
+            })
+        });
+        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), on_battery, place, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
         (Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start(cfg))
     });
     let reach = reach.and_then(|(using, mirrors, started)| match started {
@@ -1829,6 +2180,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 futures::select_biased! {
                     () = stop.cancelled().fuse() => return,
                     looked = asks.next().fuse() => probe_facts_as(&up, &dir, &declared, &busy, looked),
+                    () = crate::runner::probe::gpu_change().fuse() => start_facts_probe(&up, &dir, &declared, &busy, false, true),
                 }
             }
         });
@@ -1954,6 +2306,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut told = crate::wire::unread::Told::default();
     // The channel's updates go (a server that keeps it welcomed this runner since it started).
     let mut updates_on = false;
+    let mut mail_replay = MailReplay::default();
     // The server's commands on the channel (`crate::wire::commands`): what this runner has of
     // each stream; and the one being applied, answered at the top of the next turn of the loop
     // (however its arm ended), taken unless its arm refused it.
@@ -1962,6 +2315,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut wire_current = crate::wire::commands::Current::new();
     let mut answer_after: Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)> = None;
     let mut harness_operations=HarnessOperations::new();
+    #[cfg(unix)]
+    let mut legacy_progress = LegacyProgress::default();
+    let mut native_handover = NativeHandover::default();
     // When it says what it has of them again soon after a link came up, and how many more times.
     let mut have_soon: Option<(Instant, u32)> = None;
     // What the server's copy of each session here has, said in digests on this connection: a
@@ -2027,6 +2383,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The features the server speaks by name (docs/wire.md, "Named features"), said on this
     // connection after its caps say `CAP_FEATURES`: none from a server before them.
     let mut server_features: Vec<String> = Vec::new();
+    #[cfg(unix)]
+    let mut feature_negotiation = FeatureNegotiation::default();
     let mut grants: HashMap<String, proto::Grant> = HashMap::new();
     let mut renew_seq = 0u64;
     // Where each grant's lease ends by this machine's clock, which counts sleep, and which grants
@@ -2074,6 +2432,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }}
     }
     if let Some(h)=&harness{h.restore_from(convo.as_ref());}
+    #[cfg(unix)]
+    legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Observe);
     // Which of the machine's processes are its agent sessions' own: a run they ask for elsewhere
     // is their act (docs/ci.md W27-R08).
     if let Some(h) = &harness {
@@ -2117,7 +2477,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Some(h) => {
                         let h = Arc::clone(h);
                         // Stopped part-way (it panicked): it may have been taken over, so not "not taken".
-                        crate::rt::blocking(move || h.adopt(&from, &data)).await.unwrap_or_else(|_| Err(crate::reach::node::DROPPED.to_owned()))
+                        h.adopt_spool(&from, data).await
                     }
                     None => Err(format!("{}this runner runs no agent sessions", crate::reach::node::NOT_TAKEN)),
                 };
@@ -2293,6 +2653,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         if let Some(until) = lingering
             && ((crate::observe::collect::get().is_none_or(|c| c.stopped()) && crate::observe::last_written()) || Instant::now() >= until)
+            && native_handover.idle()
         {
             return Ok(());
         }
@@ -2366,6 +2727,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         // job's end that does waits behind what its job sent (`Ev::Done`).
         let in_turn = taken.is_empty();
         let retirement_due=retire_at.filter(|_|retiring && jobs.is_empty() && terms.is_empty() && harness_operations.is_empty());
+        let mail_budget = mail_replay.budget_observed();
         let ev = futures::select_biased! {
             () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
             // Taken ahead of their turn, in order: a frame put back behind what the session loops handed this loop before
@@ -2373,6 +2735,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             e = next_taken(&mut taken).fuse() => e,
             // A retained archive or restore that finished (attention plan 01a199e1b177752e84dad5dc990e6a15).
             answer = next_harness_operation(&mut harness_operations).fuse() => Ev::HarnessApplied(answer),
+            held = mail_replay.completed().fuse() => Ev::MailReplayed(held),
+            () = MailReplay::budget_changed(harness.as_ref(), mail_budget).fuse() => Ev::MailBudget,
             r = events.recv().fuse() => match r { Ok(r) => Ev::Routed(r), Err(_) => Ev::Net(None) },
             d = deferred_rx.recv().fuse() => match d { Ok((k, n, data)) => Ev::Deferred(k, n, data), Err(_) => Ev::Watchdog },
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
@@ -2465,13 +2829,58 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         // What this loop holds from now (runner-fan), by what it is.
         holding = Some((Instant::now(), kind));
         match ev {
-            Ev::HarnessApplied((reply,result))=>{
+            #[cfg(unix)]
+            Ev::HarnessApplied(HarnessApplied::LegacyPromotion(result)) => {
+                if let Err(error) = &result { tracing::warn!(%error, "legacy ownership promotion remains durably held"); }
+                legacy_progress.finish(&result, harness.as_ref(), &mut harness_operations, &bg_tx);
+            }
+            Ev::MailReplayed(held) => mail_replay.finish(harness.as_ref(), held),
+            Ev::MailBudget => mail_replay.budget_event(harness.as_ref()),
+            Ev::HarnessApplied(HarnessApplied::Command { reply, result })=>{
                 if let Some((stream,seq))=reply{
                     let answer=match result{Ok(())=>wire_in.took(&stream,seq),Err((code,why))=>wire_in.refused(&stream,seq,code,why)};
                     // On this loop's own channel, never the uplink it alone drains (W22-AC04), counted as an answer.
                     answers_at.push_back((Instant::now(), crate::route_latency::InKind::Command));
                     own.0.send(Up::Term(AgentMsg::Wire(answer))).await.ok();
                 }else if let Err((code,why))=result{tracing::warn!(?code,%why,"an untracked archive or restore was refused");}
+            }
+            Ev::HarnessApplied(HarnessApplied::Native(NativePrepared::InPlace { exe, mtime, result })) => {
+                let cancellation = native_handover.finish();
+                match result {
+                    Ok(sessions) if cancellation.is_none() => {
+                        tracing::info!(sessions, "agent sessions handed to the new image, their processes still running");
+                        let error = upgrade_in_place(&o, &exe, &terms);
+                        tracing::error!(%error, "in-place upgrade failed; continuing on the running binary");
+                        if let Some(host) = &harness { host.take_back(); }
+                    }
+                    Ok(_) => {
+                        // Preparation succeeded, but no exec took place: restore the retained
+                        // native handover record before shutdown/cancellation can end this turn.
+                        if let Some(host) = &harness { host.take_back(); }
+                        tracing::warn!(why = cancellation.as_deref().unwrap_or("handover cancelled"), "native handover cancelled; the running owner is retained");
+                    }
+                    Err(why) => tracing::warn!(%why, "the source handover was refused; the running owner is retained"),
+                }
+                upgrade_pending = false;
+                exe_mtime = mtime;
+            }
+            #[cfg(unix)]
+            Ev::HarnessApplied(HarnessApplied::Native(NativePrepared::BlueGreen { ready, sessions })) => {
+                taken.push_front(Ev::Bg(Bg::Prepared { ready, sessions }));
+            }
+            #[cfg(unix)]
+            Ev::HarnessApplied(HarnessApplied::Native(NativePrepared::Rollback { job, why, acks, allowed })) => {
+                native_handover.finish();
+                match allowed {
+                    Ok(true) => taken.push_front(Ev::Bg(Bg::RollbackAuthorized { job, why, acks })),
+                    Ok(false) => {
+                        // A verified green owns the journal now. Keep both control/FD records
+                        // fenced; neither a lost socket nor failed supervisor promotion can
+                        // authorize killing that owner or resuming blue's old snapshot.
+                        own.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some("the native destination committed custody; the failed promotion needs reconciliation and the source remains fenced".into()) }).await;
+                    }
+                    Err(error) => own.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(format!("native ownership is uncertain; both retained owners stay fenced: {error}")) }).await,
+                }
             }
             Ev::Shutdown => {
                 if lingering.is_some() {
@@ -2491,7 +2900,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     _ => false,
                 };
-                if !collecting && crate::observe::last_written() {
+                native_handover.cancel(None, "the runner is shutting down".into());
+                if !collecting && crate::observe::last_written()
+                    && native_handover.idle()
+                {
                     return Ok(());
                 }
                 lingering = Some(Instant::now() + Duration::from_secs(3));
@@ -2536,6 +2948,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let empty = tracing::field::Empty;
                 match b {
                     Bg::Fetched { job, exe, build } => {
+                        if moving.is_some() || !native_handover.idle() {
+                            own.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some("a native handover already owns this runner's preparation; the existing owner is retained".into()) }).await;
+                            continue;
+                        }
                         // Known since this runner said its build; this loop never waits for it either way.
                         let from = crate::updates::own_binary_now().and_then(Result::ok).map_or_else(|| "unknown".to_owned(), |o| o.build);
                         let root = tracing::info_span!(target: "kiln::upgrade", "upgrade", runner = %name, from = %from, to = %build, upgrade_id = %job, result = empty, error = empty);
@@ -2567,7 +2983,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let (tx, j) = (bg_tx.clone(), job.clone());
                                 let waited = std::thread::Builder::new().name("kiln-upgrade".into()).spawn(move || {
                                     let _ = match listener.ready(green.pid, Instant::now() + crate::bluegreen::READY_WITHIN) {
-                                        Ok((conn, instance, custody, role, relays, stores)) => tx.send_blocking(Bg::Ready { job: j, conn: Arc::new(conn), custody, role: role.then_some(instance), relays, stores }),
+                                        Ok((conn, instance, custody, role, relays, stores, mail)) => tx.send_blocking(Bg::Ready(BlueGreenReady { job: j, conn: Arc::new(conn), instance: instance.clone(), custody, role: role.then_some(instance), relays, stores, mail })),
                                         Err(e) => tx.send_blocking(Bg::Failed { job: j, why: format!("{e:#}") }),
                                     };
                                 });
@@ -2588,14 +3004,64 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Bg::Ready { job, conn, custody, role, relays, stores } => {
-                        let Some(mv) = moving.as_mut() else { continue };
+                    Bg::Ready(ready) => {
+                        if moving.is_some() { native_handover.prepare(&mut harness_operations, harness.clone(), NativePreparation::BlueGreen { ready, machine: name.clone() }); }
+                    }
+                    Bg::Prepared { ready: BlueGreenReady { job, conn, custody: _, role, relays, stores, .. }, sessions } => {
+                        let cancellation = native_handover.finish();
+                        let sessions = match sessions {
+                            Ok(sessions) => sessions,
+                            Err(why) => { taken.push_back(Ev::Bg(Bg::Failed { job, why })); continue; }
+                        };
+                        let Some(mv) = moving.as_mut() else {
+                            // A stale completion cannot silently discard detached Saved/native
+                            // handles. No destination was sent them from this operation yet.
+                            if let Some(host) = &harness {
+                                for (record, handed, _) in sessions {
+                                    if let Err(error) = host.move_in(record, handed).await { tracing::error!(%error, "a stale native preparation could not resume; its source journal remains retained"); }
+                                }
+                            }
+                            continue;
+                        };
                         if let Some(h) = mv.healthy.take() {
                             h.record("result", "ok");
                         }
                         mv.handing = true;
                         mv.relays = relays;
                         let mut frames: Vec<(Frame, Vec<std::os::fd::RawFd>)> = Vec::new();
+                        {
+                            for (rec, handed, hand_on) in sessions {
+                                let id = rec.id().to_owned();
+                                let mut handed = handed;
+                                let kept = match handed.as_ref() {
+                                    Some(hd) => match keep_pipes(&hd.process) {
+                                        Some(pipes) => serde_json::to_vec(hd).ok().map(|json| (json, pipes)),
+                                        None => None,
+                                    },
+                                    None => None,
+                                };
+                                // Not handed over running after all: stopped, it starts again from its record there.
+                                if kept.is_none()
+                                    && let Some(hd) = handed.take()
+                                {
+                                    let pid = hd.process.pid;
+                                    let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
+                                }
+                                let mut fds: Vec<_> = kept.as_ref().map(|(_, p)| p.iter().map(|f| f.as_raw_fd()).collect()).unwrap_or_default();
+                                if let Some(journal) = rec.journal() { fds.push(journal.as_raw_fd()); }
+                                // Signed for as it goes, to a new build that takes it so (docs/ci.md W27-R08).
+                                let hand_on = hand_on.map(|b| b.to_string());
+                                frames.push((Frame::Session { id: id.clone(), record: Box::new(rec.clone()), handed, hand_on }, fds));
+                                moved.insert(crate::instances::Owned::Agent(id));
+                                mv.items.push(Item::Session { record: Box::new(rec), kept });
+                            }
+                        }
+                        if let Some(why) = cancellation {
+                            // Every prepared native process now belongs to Moving's existing
+                            // rollback records/pipes. Cancellation must never drop that result.
+                            taken.push_front(Ev::Bg(Bg::Failed { job, why }));
+                            continue;
+                        }
                         let ids: Vec<String> = terms.keys().cloned().collect();
                         for id in ids {
                             let Some((pty, state)) = terms.remove(&id) else { continue };
@@ -2615,32 +3081,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     tracing::warn!(session = %id, "a terminal couldn't be handed to the new build; it stays with this runner");
                                     terms.insert(id, (pty, state));
                                 }
-                            }
-                        }
-                        if let Some(h) = &harness {
-                            for (rec, handed, hand_on) in h.move_out_signing(custody).await {
-                                let id = rec.id().to_owned();
-                                let mut handed = handed;
-                                let kept = match handed.as_ref() {
-                                    Some(hd) => match keep_pipes(&hd.process) {
-                                        Some(pipes) => serde_json::to_vec(hd).ok().map(|json| (json, pipes)),
-                                        None => None,
-                                    },
-                                    None => None,
-                                };
-                                // Not handed over running after all: stopped, it starts again from its record there.
-                                if kept.is_none()
-                                    && let Some(hd) = handed.take()
-                                {
-                                    let pid = hd.process.pid;
-                                    let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
-                                }
-                                let fds = kept.as_ref().map(|(_, p)| p.iter().map(|f| f.as_raw_fd()).collect()).unwrap_or_default();
-                                // Signed for as it goes, to a new build that takes it so (docs/ci.md W27-R08).
-                                let hand_on = hand_on.map(|b| b.to_string());
-                                frames.push((Frame::Session { id: id.clone(), record: Box::new(rec.clone()), handed, hand_on }, fds));
-                                moved.insert(crate::instances::Owned::Agent(id));
-                                mv.items.push(Item::Session { record: Box::new(rec), kept });
                             }
                         }
                         // The machine's runner role, last, signed for as it goes to a new build that
@@ -2849,39 +3289,25 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 retire_job = Some(job);
                             }
                             Err(why) => {
-                                let mut held_back = std::mem::take(&mut mv.held);
-                                let (problems, back) = roll_back(mv, &acks, &why, harness.as_ref(), &mut terms, &term_tx, &o.state_dir).await;
-                                if let Some(st) = back {
-                                    let ship = start_feed(&st, harness.as_ref(), &uplink.0);
-                                    if connected {
-                                        ship.link(crate::convo::feed::Link::Up);
-                                    }
-                                    (convo, shipper) = (Some(st), Some(ship));
-                                }
-                                moved.clear();
-                                draining = false;
-                                serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir);
-                                announce(term_list(&terms), harness.as_ref(), &own).await;
-                                for d in held_back.drain(..) {
-                                    let _ = bg_tx.try_send(Bg::Forwarded(d));
-                                }
-                                let mut error = format!("the new build didn't take over ({why}): it was stopped, and this runner goes on with everything");
-                                if !problems.is_empty() {
-                                    error.push_str(&format!("; but these couldn't come back: {}", problems.join("; ")));
-                                }
-                                tracing::warn!(%job, %error, "blue/green upgrade rolled back");
-                                own.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(error) }).await;
+                                let records = mv.items.iter().filter_map(|item| match item { Item::Session { record, .. } => Some((**record).clone()), Item::Terminal { .. } => None }).collect();
+                                moving = Some(mv);
+                                native_handover.prepare(&mut harness_operations, harness.clone(), NativePreparation::Rollback { job, why, acks, records });
                             }
                         }
                     }
                     Bg::Failed { job, why } => {
+                        if native_handover.cancel(Some(&job), why.clone()) { continue; }
+                        let records = moving.as_ref().map(|moving| moving.items.iter().filter_map(|item| match item { Item::Session { record, .. } => Some((**record).clone()), Item::Terminal { .. } => None }).collect()).unwrap_or_default();
+                        native_handover.prepare(&mut harness_operations, harness.clone(), NativePreparation::Rollback { job, why, acks: Vec::new(), records });
+                    }
+                    Bg::RollbackAuthorized { job, why, acks } => {
                         if let Some(mut mv) = moving.take() {
                             if let Some(h) = mv.healthy.take() {
                                 h.record("result", "failed");
                                 h.record("error", why.as_str());
                             }
                             let held_back = std::mem::take(&mut mv.held);
-                            let (_, back) = roll_back(mv, &[], &why, harness.as_ref(), &mut terms, &term_tx, &o.state_dir).await;
+                            let (_, back) = roll_back(mv, &acks, &why, harness.as_ref(), &mut terms, &term_tx, &o.state_dir).await;
                             if let Some(st) = back {
                                 let ship = start_feed(&st, harness.as_ref(), &uplink.0);
                                 if connected {
@@ -3017,14 +3443,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(h) = &harness {
                             h.hold(false);
                         }
-                        if server_identity && connected {
-                            for (session, epoch) in crate::runner::custody::promoted() {
-                                ask_agent_identity(&own, &mut identity_asked, &session, epoch).await;
-                            }
-                        }
+                        legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Promoted);
                         instance_hello.created_at = real_created_at;
                         draining = false;
                         own.msg(AgentMsg::Instance(instance_hello.clone())).await;
+                    }
+                    Bg::LegacyIdentity { session, epoch } => {
+                        if server_identity && connected && crate::runner::custody::legacy_identity_pending(&session, epoch) {
+                            // The current waiter authorizes starting this request. A request already
+                            // in flight can finish later; completion prevents queued events starting one.
+                            ask_agent_identity(&own, &mut identity_asked, &session, epoch).await;
+                        }
                     }
                     // Turned into Ev::Forwarded as they're received.
                     Bg::Forwarded(_) | Bg::Again(..) => {}
@@ -3066,7 +3495,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         harness_wait.get_or_insert_with(Instant::now);
                     }
                     let ready = busy == 0 || harness_wait.is_some_and(|t| t.elapsed() >= HARNESS_GRACE);
-                    if upgrade_pending && !relaunch_wanted && jobs.is_empty() && ready && let Some(exe) = exe.as_deref() {
+                    if upgrade_pending && !relaunch_wanted && jobs.is_empty() && ready && native_handover.idle() && let Some(exe) = exe.as_deref() {
                         if let Err(e) = binary_runs(exe).await {
                             // Never switch to a binary that cannot start: keep this one until
                             // the binary on disk changes again.
@@ -3074,19 +3503,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             upgrade_pending = false;
                             exe_mtime = now;
                         } else if !successor {
-                            if let Some(h) = &harness {
-                                let n = h.hand_over_all().await;
-                                tracing::info!(sessions = n, "agent sessions handed to the new image, their processes still running");
-                            }
-                            let err = upgrade_in_place(&o, exe, &terms);
-                            // Only reached when the exec failed: carry on with this binary, and
-                            // with the agent sessions just handed over.
-                            tracing::error!(error = %err, "in-place upgrade failed; continuing on the running binary");
-                            if let Some(h) = &harness {
-                                h.take_back();
-                            }
-                            upgrade_pending = false;
-                            exe_mtime = now;
+                            native_handover.prepare(&mut harness_operations, harness.clone(), NativePreparation::InPlace { exe: exe.to_path_buf(), mtime: now });
                         } else if channel {
                             match write_handover(&o, &terms) {
                                 Ok(masters) => {
@@ -3183,6 +3600,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Net(None) => anyhow::bail!("transport stopped"),
             Ev::Net(Some(NetEvent::Connected { binding, .. })) => {
+                #[cfg(unix)]
+                { feature_negotiation = FeatureNegotiation::default(); }
+                crate::harness::handing::mail_supported(false);
                 tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
                 chaos_drop = chaos.and_then(|c| c.drop_every).map(|d| Instant::now() + d);
                 // How long saying what it is takes (its build's probes, its facts), told below: the
@@ -3357,6 +3777,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 connected = false;
                 welcomed = false;
+                mail_replay = MailReplay::default();
+                crate::harness::handing::mail_supported(false);
+                #[cfg(unix)]
+                { feature_negotiation = FeatureNegotiation::default(); }
                 leases.away();
                 // The channel's items in flight go again once the server says what it has, and
                 // the server's from what this side says it has: the session loops' too (runner-fan).
@@ -3379,6 +3803,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 limit_said = None;
                 server_leases = false;
                 server_features.clear();
+                sent_changes.state_pages = false;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -3603,12 +4028,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // A certificate for a key this process holds (docs/ci.md W27-R01).
                     Carried::Read(FromServer::Identity(given)) => {
                         let label = o.instance.clone().unwrap_or_else(|| crate::upgrade::MAIN.to_owned());
-                        let taken_over = (given.kind == "agent" && given.cert_pem.is_some()).then(|| (given.of.clone(), given.epoch));
                         // Its certificate's file written on the blocking pool, waited for here so what follows finds it
                         // kept (goal 9, plan 01a1a87b2cec step 3: written and synced on this loop's shard).
-                        if let Err(e) = crate::runner::identity::given_off(given, o.state_dir.clone(), label).await {
-                            tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept");
-                        }
+                        let taken_over = match installed_identity(given, o.state_dir.clone(), label).await {
+                            Ok(installed) => installed,
+                            Err(e) => { tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept"); None }
+                        };
                         // The runner role handed to this process, signed for once its own
                         // identity is (W27-R08), what relays passed on to it, and the work its sessions
                         // took up before they held theirs: an identity given is what each waits on
@@ -3621,12 +4046,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // A session's identity at an epoch it was taken over at: its receipt went
                         // with the ask, and kiln recorded it. Taken over blue/green, it goes on at
                         // that epoch now.
-                        if let Some((Some(session), Some(epoch))) = taken_over
-                            && crate::runner::custody::certified(&session, epoch)
-                            && let Some(s) = harness.as_ref().and_then(|h| h.get(&session))
+                        if let Some((session, epoch)) = taken_over
                         {
-                            s.go_on_at(epoch);
+                            // Durable legacy waiters survive this notification. The session owner
+                            // commits Head/leases/Controller/Saved before retiring their witness.
+                                match crate::runner::custody::certified(&session, epoch) {
+                                    crate::runner::custody::Certification::BlueGreen => {
+                                        if let Some(session) = harness.as_ref().and_then(|host| host.get(&session)) { session.go_on_at(epoch); }
+                                    }
+                                    crate::runner::custody::Certification::DurablePromotion | crate::runner::custody::Certification::Receipt | crate::runner::custody::Certification::Untracked => {}
+                                }
                         }
+                        #[cfg(unix)]
+                        legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Observe);
                         if server_custody {
                             for json in crate::runner::custody::drain() {
                                 own.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
@@ -3802,7 +4234,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // A pool's leg runs in its executor, beside this runner's own slots.
                         let pooled = a.executor.slot.is_some();
                         let holds = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
-                        let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
+                        let room = admits(o.slots, probing.sized(size), jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
                         // A test build's `refuse=<job>`: refused as one with no room would refuse it.
                         let room = room.and_then(|()| if crate::runner::chaos::refuses(&a.leg.job_id) { Err("no free slot") } else { Ok(()) });
                         if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
@@ -3819,7 +4251,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // refused, saying why, when they leave it no room. A pool's leg runs in its
                         // executor, not on this machine's room.
                         if !pooled
-                            && let Err(why) = leg_room(reach.as_ref(), &id, crate::sense::run::leg_key(&a.repo, a.job_workflow.as_ref().map_or("", |w| w.workflow_file_path.as_str()), &a.leg.job_id, &a.leg.matrix.to_string()), a.exclusive, a.holds.unwrap_or_default()).await
+                            && let Err(why) = leg_room(reach.as_ref(), &id, crate::sense::run::leg_key(&a.repo, a.job_workflow.as_ref().map_or("", |w| w.workflow_file_path.as_str()), &a.leg.job_id, &a.leg.matrix.to_string()), a.exclusive, a.request.or(a.holds).unwrap_or_default(), &a.leg.requires).await
                         {
                             let refusal = match a.fence {
                                 Some(fence) if server_leases => AgentMsg::Refused { grant: proto::Grant::of(&id, a.attempt, fence), reason: why },
@@ -3973,6 +4405,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_kept.extend(sessions.into_iter().map(|k| (k.session.clone(), k)));
                     }
                     ServerMsg::Caps { caps } => {
+                        #[cfg(unix)]
+                        feature_negotiation.caps(caps);
                         // An identity of this process's own, for a key it made and keeps, certified
                         // on each connection (docs/ci.md W27-R01); an ephemeral runner's too (a `k8s`
                         // pool's pod, a v1 job's), enrolled by kiln, so its leg signs as the leg.
@@ -4064,6 +4498,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             own.0.send(Up::Term(AgentMsg::Wire(loops::have_of(wire_in.have(), &shared)))).await.ok();
                             have_soon = Some((Instant::now() + HAVE_SOON, HAVES_SOON));
                         }
+                        #[cfg(unix)]
+                        legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Observe);
+                        #[cfg(unix)]
+                        if let Some(path) = feature_negotiation.take_over(welcomed, &mut take_over) {
+                            start_take_over(path, harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
+                        }
                     }
                     // The relay refused a frame of this runner's reach links: as a close, its code
                     // said in the log.
@@ -4084,22 +4524,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // lacks goes; a stream it lost starts over, its snapshot first.
                     ServerMsg::Wire(frame) => {
                         updates.on_frame(frame);
-                        for key in updates.take_stale() {
-                            if let Some(id) = key.strip_prefix("s:") {
-                                if let Some(s) = harness.as_ref().and_then(|h| h.get(id)) {
-                                    start_stream(&mut updates, id, &s, server_kept.get(id), &mut sent_changes);
-                                }
-                            } else if let Some(id) = key.strip_prefix("t:")
-                                && let Some((_, state)) = terms.get(id)
-                            {
-                                // A terminal's stream starts over with its picture now.
-                                let a = state.attach();
-                                state.detach();
-                                updates.start(&key);
-                                if let Ok(b) = proto::encode(&AgentMsg::TermReplay { session: id.to_owned(), data: a.replay }) {
-                                    updates.picture(&key, b);
-                                }
-                            }
+                        if restart_updates(&mut updates, harness.as_ref(), &terms, &server_kept, &mut sent_changes)
+                            && proto::feature::speaks(&server_features, proto::feature::MAIL_FLOW)
+                        {
+                            mail_replay.request(harness.as_ref());
                         }
                         flush_updates(&mut updates, &own).await;
                     }
@@ -4181,6 +4609,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 // whose stream starts now are in its snapshot.
                                 while let Ok(crate::harness::session::Taken { session, update: u, at }) = harness_rx.try_recv() {
                                     note_announced(&mut announced, &session, &u);
+                                    if matches!(u, crate::harness::core::Update::MailFlow { .. }) && !proto::feature::speaks(&server_features, proto::feature::MAIL_FLOW) { continue; }
                                     if updates.started(&crate::wire::uplink::session_key(&session)) {
                                         push_update(&mut updates, &session, &u, false, &mut sent_changes, Some(at));
                                     }
@@ -4203,25 +4632,21 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     continue;
                                 }
                                 for u in s.snapshot() {
-                                    for json in harness_frames(&info.id, &u) {
-                                        own.0.send(Up::Term(AgentMsg::Harness { session: info.id.clone(), json })).await.ok();
-                                    }
+                                    raw_harness_update(&own, &info.id, &u).await;
                                 }
                             }
                             flush_updates(&mut updates, &own).await;
                         }
-                        // A new build started to take over from the runner being upgraded (blue/green):
-                        // connected and welcomed, it says it's ready, and takes everything.
+                        if proto::feature::speaks(&server_features, proto::feature::MAIL_FLOW) {
+                            request_mail_replay(&mut mail_replay, harness.as_ref(), &own, !updates_on).await;
+                        }
+                        // Keep the existing takeover pending until this connection's feature
+                        // answer is known; Welcome alone cannot advertise journal support.
                         #[cfg(unix)]
-                        if let Some(path) = take_over.take() {
-                            let (h, tx, me, takes) = (harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
-                            crate::rt::spawn(async move {
-                                if let Err(e) = take_over_from(path, h, tx.clone(), me, takes).await {
-                                    tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");
-                                }
-                                crate::reach::told::predecessor_ended();
-                                let _ = tx.send(Bg::TakeOverEnded).await;
-                            });
+                        legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Observe);
+                        #[cfg(unix)]
+                        if let Some(path) = feature_negotiation.take_over(welcomed, &mut take_over) {
+                            start_take_over(path, harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
                         }
                         // The server knows this runner now: reach may relay (its links resume).
                         if let Some(r) = &reach {
@@ -4275,14 +4700,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         a.server_url = o.server_url.clone();
                         let id = a.job_id.clone();
                         let holds = crate::hub::v1_incoming(a.spec.exclusive, &a.spec.resources);
-                        let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), false, holds);
+                        let room = admits(o.slots, probing.sized(size), jobs.values().map(|j| (j.pooled, j.holds)), false, holds);
                         if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
                             let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { REFUSED_DRAINING } else if upgrade_pending { REFUSED_UPGRADING } else { room.err().unwrap_or("no free slot") };
                             own.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
                         // Admitted against the same ledger as the runs placed here (AUDIT M4, G1).
-                        if let Err(why) = leg_room(reach.as_ref(), &id, crate::sense::run::leg_key(&a.repo, "", &a.spec.key, ""), a.spec.exclusive, crate::hub::v1_asked(&a.spec.resources)).await {
+                        if let Err(why) = leg_room(reach.as_ref(), &id, crate::sense::run::leg_key(&a.repo, "", &a.spec.key, ""), a.spec.exclusive, crate::hub::v1_asked(&a.spec.resources), &a.spec.requires).await {
                             own.msg(AgentMsg::Reject { job: id, reason: why }).await;
                             continue;
                         }
@@ -4365,6 +4790,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     },
                     // The features the server speaks by name (docs/wire.md): each says them all.
                     ServerMsg::Features { names } => {
+                        let pages = proto::feature::speaks(&names, proto::feature::STATE_PAGES);
+                        let refresh = pages && !sent_changes.state_pages && welcomed;
+                        let mail = proto::feature::speaks(&names, proto::feature::MAIL_FLOW);
+                        let replay = welcomed && mail && (refresh || !proto::feature::speaks(&server_features, proto::feature::MAIL_FLOW));
+                        let transfers = proto::feature::speaks(&names, proto::feature::MAIL_TRANSFER);
+                        let transfer_replay = welcomed && transfers && !proto::feature::speaks(&server_features, proto::feature::MAIL_TRANSFER);
+                        crate::harness::handing::mail_supported(transfers);
+                        #[cfg(unix)]
+                        feature_negotiation.names();
+                        sent_changes.state_pages = pages;
                         tracing::debug!(?names, "the server speaks these features");
                         crate::reach::told::server_features(&names);
                         // Its admission's hints go to a server that takes them (AUDIT O1).
@@ -4372,10 +4807,52 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             r.feed(crate::reach::node::In::Offers(proto::feature::speaks(&names, proto::feature::OFFERS))).await;
                         }
                         server_features = names;
+                        // Welcome precedes the named feature reply. Re-send through the existing
+                        // resumable stream so a quiet session's first oversized state is recovered too.
+                        if refresh {
+                            if let Some(h) = &harness {
+                                for info in h.list() {
+                                    if let Some(s) = h.get(&info.id) {
+                                        start_stream(&mut updates, &info.id, &s, server_kept.get(&info.id), &mut sent_changes);
+                                    }
+                                }
+                            }
+                            flush_updates(&mut updates, &own).await;
+                        }
+                        if replay || transfer_replay { request_mail_replay(&mut mail_replay, harness.as_ref(), &own, !updates_on).await; }
+                        if !mail && !transfers { mail_replay = MailReplay::default(); }
+                        #[cfg(unix)]
+                        legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Observe);
+                        #[cfg(unix)]
+                        if let Some(path) = feature_negotiation.take_over(welcomed, &mut take_over) {
+                            start_take_over(path, harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
+                        }
+                    }
+                    ServerMsg::HarnessMailTransfer { json } => {
+                        if !proto::feature::speaks(&server_features, proto::feature::MAIL_TRANSFER) {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unsupported, "durable mail transfer was not negotiated");
+                        } else if let (Some(host), Ok(answer)) = (harness.as_ref(), crate::wire::payload::<crate::harness::mail::TransferDown>(crate::wire::unread::Wire::ServerPayload, "HarnessMailTransfer", &json)) {
+                            match host.mail_transfer_event(answer).await {
+                                Ok(crate::harness::host::transfer::Effect::Offered { manifest, policy, role }) => {
+                                    if let Some(reach) = &reach { reach.feed(crate::reach::node::In::AdoptPolicy(policy)).await; }
+                                    if role == crate::harness::inbox::transfer::Role::Destination && crate::harness::handing::post_transfer(&crate::harness::mail::TransferUp::Ready { manifest }).await.is_err() {
+                                        refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, "durable mail transfer readiness could not be sent; ownership remains pending");
+                                    }
+                                }
+                                Ok(crate::harness::host::transfer::Effect::Progress { recover }) => { if recover { mail_replay.request(harness.as_ref()); } },
+                                Err(_) => refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, "durable mail transfer phase could not be persisted; ownership remains pending"),
+                            }
+                        } else {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unsupported, "durable mail transfer metadata or source storage is unavailable");
+                        }
                     }
                     // Its rules for the copies of other runners' trees here, and an ask to let go
                     // now, as they change: its keeper looks at once (docs/reach.md §5.1, goal 9).
                     ServerMsg::Copies { json } => crate::reach::keeper::told(&json),
+                    // Installed skills (docs/agents.md, "Skills kiln installs"): what this machine
+                    // lays out and which session has which, a folder to read, and the files it asked for.
+                    ServerMsg::Skills { json } => crate::skills::runner::told(&json, own.clone(), harness.clone()),
+                    ServerMsg::SkillFile { sha256, offset, data, done } => crate::skills::runner::file(sha256, offset, data, done, own.clone(), harness.clone()).await,
                     // Another runner's room, for this runner's owner to choose where to probe by
                     // (docs/needs.md E5, AUDIT O1).
                     ServerMsg::Offers { json } => {
@@ -4545,13 +5022,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             own.0.send(Up::Term(AgentMsg::AiView { req, json: None })).await.ok();
                         }
                     },
-                    ServerMsg::HarnessFile { session, file, offset, data, done } => loops::file(&shared, &session, &file, offset, &data, done),
+                    ServerMsg::HarnessFile { session, file, offset, data, done } => {
+                        if let Some((code, why)) = loops::file(&shared, &session, &file, offset, &data, done) { refuse(&mut answer_after, code, &why); }
+                    }
                     ServerMsg::HarnessRestoreCopy { session } => {
                         let Some(host)=harness.clone() else{refuse(&mut answer_after,crate::wire::channel::Refusal::Unknown,"this runner has no agent host");continue;};
                         let reply=answer_after.take().map(|(stream,seq,_)|(stream,seq));
                         harness_operations.push(async move{
                             let result=host.restore_archive_copy(&session).await.map_err(|why|(crate::wire::channel::Refusal::Unknown,why));
-                            (reply,result)
+                            HarnessApplied::Command { reply, result }
                         }.boxed());
                     }
                     ServerMsg::HarnessArchive { session, restore, only_if_quiet } => {
@@ -4569,7 +5048,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 }
                             }else{host.archive(&session).await.map_err(|why|(Refusal::Unknown,why))};
                             if result.is_ok() && !restore{crate::browser::apps::stop(&session);crate::browser::stream::streams().close_session(&dir,&session).await;}
-                            (reply,result)
+                            HarnessApplied::Command { reply, result }
                         }.boxed());
                     }
                     ServerMsg::HarnessClose { session } => {
@@ -5022,6 +5501,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Harness(session, u, taken_at) => {
+                // Admission/terminal receipts stay in the source journal until acknowledged.
+                // A peer not yet welcomed/negotiated cannot own these events; its next real
+                // connection/feature event replays the journal and current capacity.
+                if matches!(u, crate::harness::core::Update::MailFlow { .. }) && (!connected || !welcomed || !proto::feature::speaks(&server_features, proto::feature::MAIL_FLOW)) { continue; }
                 note_announced(&mut announced, &session, &u);
                 // A session's turn ending is what an upgrade waiting on its sessions waits on.
                 if upgrade_pending && jobs.is_empty() && harness.as_ref().is_some_and(|h| h.busy() == 0) {
@@ -5089,6 +5572,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if matches!(u, crate::harness::core::Update::Closed) {
                         updates.closing(&key);
                     }
+                    // Overflow can discard an earlier receipt even when this update is ordinary
+                    // history. Do not wait for another server frame when the discarded stream was
+                    // the only unanswered one. The existing picture gate still bounds resets;
+                    // while disconnected no new snapshot/journal read is made.
+                    if connected && welcomed
+                        && restart_updates(&mut updates, harness.as_ref(), &terms, &server_kept, &mut sent_changes)
+                        && proto::feature::speaks(&server_features, proto::feature::MAIL_FLOW)
+                    {
+                        mail_replay.request(harness.as_ref());
+                    }
                     // Straight to the link from this turn, unless what this loop said or took before waits to go
                     // (`flush_updates_now`; goal 10, plan 01a1a87b2dae step 5).
                     if connected {
@@ -5099,9 +5592,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // A server from before the channel: not kept across a disconnect, the
                     // reconnect sends every session whole (and before its Welcome, nothing: the
                     // Welcome brings the server all of each, over the channel or not).
-                    for json in harness_frames(&session, &u) {
-                        own.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
-                    }
+                    raw_harness_update(&own, &session, &u).await;
                 }
             }
             Ev::Done(mut r) => {
@@ -5405,6 +5896,7 @@ pub async fn enroll_only(o: &Opts) -> anyhow::Result<()> {
 /// again (a long session's changeset ran to 690 KB, sent whole for every edit).
 #[derive(Default)]
 struct SentChanges {
+    state_pages: bool,
     /// The server takes changesets as patches.
     patches: bool,
     sessions: HashMap<String, HashMap<crate::harness::model::FileKey, u64>>,
@@ -5539,6 +6031,7 @@ fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &cr
     use crate::harness::core::Update;
     let key = crate::wire::uplink::session_key(session);
     let frames = match u {
+        Update::State { .. } | Update::Open { .. } if !sent.state_pages => legacy_harness_frames(session, u),
         Update::Changes { files } => sent.frames(session, files, picture),
         // Its server's copy starts its changeset over (an Open), or lets the session go.
         Update::Open { .. } | Update::Closed => {
@@ -5672,6 +6165,15 @@ fn note_announced(announced: &mut std::collections::HashSet<String>, session: &s
 const AGENT_IDENTITY_AGAIN: Duration = Duration::from_secs(5);
 const AGENT_IDENTITY_MOST: Duration = Duration::from_secs(600);
 
+/// A certificate notification counts only after the current key and exact subject were installed.
+async fn installed_identity(given: crate::proto::IdentityGiven, state_dir: PathBuf, label: String) -> anyhow::Result<Option<(String, u64)>> {
+    let expected = (given.kind == "agent").then(|| (given.of.clone(), given.epoch, given.uri.clone()));
+    crate::runner::identity::given_off(given, state_dir, label).await?;
+    let Some((Some(session), Some(epoch), uri)) = expected else { return Ok(None) };
+    let slot = crate::runner::identity::slot("agent", Some(&session), Some(epoch));
+    Ok((crate::runner::identity::cert(&slot).is_some() && crate::runner::identity::uri(&slot).as_deref() == Some(uri.as_str())).then_some((session, epoch)))
+}
+
 /// Asks for agent session `session`'s identity at `epoch` (docs/ci.md W27-R01), unless this
 /// process holds one or asked lately ([`AGENT_IDENTITY_AGAIN`], doubling each time). A session kiln
 /// hasn't heard of yet is refused (the ask can come before its Open, which rides the channel), and
@@ -5699,6 +6201,57 @@ async fn flush_updates(updates: &mut crate::wire::uplink::Updates, uplink: &Upli
     for f in updates.poll(Instant::now()) {
         uplink.0.send(Up::Term(AgentMsg::Wire(f))).await.ok();
     }
+}
+
+/// Resume actual stale streams from their pictures. A session picture does not contain the
+/// durable source mail journal, so the caller also schedules one journal replay when any session
+/// restarted. `take_stale` retains streams whose preceding picture still waits for its ACK.
+fn restart_updates(
+    updates: &mut crate::wire::uplink::Updates,
+    host: Option<&Arc<crate::harness::host::Host>>,
+    terms: &HashMap<String, (PtySession, Arc<crate::termsess::Session>)>,
+    kept: &HashMap<String, proto::KeptSession>,
+    sent: &mut SentChanges,
+) -> bool {
+    let mut session_reset = false;
+    for key in updates.take_stale() {
+        if let Some(id) = key.strip_prefix("s:") {
+            if let Some(s) = host.and_then(|host| host.get(id)) {
+                start_stream(updates, id, &s, kept.get(id), sent);
+                session_reset = true;
+            }
+        } else if let Some(id) = key.strip_prefix("t:")
+            && let Some((_, state)) = terms.get(id)
+        {
+            let a = state.attach();
+            state.detach();
+            updates.start(&key);
+            if let Ok(b) = proto::encode(&AgentMsg::TermReplay { session: id.to_owned(), data: a.replay }) {
+                updates.picture(&key, b);
+            }
+        }
+    }
+    session_reset
+}
+
+async fn raw_harness_update(own: &Uplink, session: &str, update: &crate::harness::core::Update) {
+    let critical = matches!(update, crate::harness::core::Update::Open { .. } | crate::harness::core::Update::MailFlow { .. });
+    for json in harness_frames(session, update) {
+        let message = AgentMsg::Harness { session: session.to_owned(), json };
+        own.0.send(if critical { Up::Msg(message) } else { Up::Term(message) }).await.ok();
+    }
+}
+
+async fn request_mail_replay(replay: &mut MailReplay, host: Option<&Arc<crate::harness::host::Host>>, own: &Uplink, raw: bool) {
+    if raw && let Some(host) = host {
+        // Legacy transport has no ordered session stream. The current owner header must use
+        // the same reliable control lane and precede its critical receipts, not race a TERM Open.
+        for info in host.list() {
+            let session = info.id.clone();
+            raw_harness_update(own, &session, &crate::harness::core::Update::Open { info: Box::new(info), since: None }).await;
+        }
+    }
+    replay.request(host);
 }
 
 /// [`flush_updates`] from the turn of the runner's loop that made them (goal 10, plan 01a1a87b2dae step 5): each frame
@@ -5738,7 +6291,7 @@ async fn send_term(net: &net::NetHandle, delay: Option<&crate::runner::chaos::De
 
 /// Most of one agent-session update a frame carries. They go on the interactive lane, which
 /// refuses frames past 1 MiB ([`net::Kiln`]); a resumed session's history can be several.
-const HARNESS_FRAME: usize = 512 * 1024;
+const HARNESS_FRAME: usize = crate::harness::state_view::FRAME;
 
 /// What a runner sends the server of a message of the server's whose payload it couldn't read
 /// (`crate::wire::payload`): word of it when `told` says (`Unread`, with the session it was about
@@ -5801,6 +6354,35 @@ fn refuse(answer_after: &mut Option<(String, u64, Option<(crate::wire::channel::
 /// their counts kept (`fit_changes`), and a changeset's patch goes in parts. Only what still doesn't
 /// fit is dropped, and logged.
 fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
+    let room = proto::harness_json_room(session, HARNESS_FRAME);
+    let stamp = format!(",\"taken_us\":{}", u64::MAX).len();
+    if matches!(u, crate::harness::core::Update::State { .. })
+        && let Ok(bytes) = crate::harness::state_view::encode(u, room.saturating_sub(stamp)) {
+        return String::from_utf8(bytes).ok().into_iter().collect();
+    }
+    if let crate::harness::core::Update::Open { info, since } = u {
+        let envelope = serde_json::to_vec(&serde_json::json!({"t":"open","info":null,"since":since})).map_or(HARNESS_FRAME, |v| v.len());
+        return crate::harness::state_view::info_view(info, room.saturating_sub(envelope).saturating_sub(stamp)).ok()
+            .and_then(|info| serde_json::to_string(&serde_json::json!({"t":"open","info":info,"since":since})).ok())
+            .filter(|json| json.len().saturating_add(stamp) <= HARNESS_FRAME).into_iter().collect();
+    }
+    let crate::harness::core::Update::State { state } = u else { return legacy_harness_frames(session, u) };
+    // The maximum stamp, rather than a guessed allowance: it is appended after encoding.
+    let envelope = r#"{"t":"state","state":null}"#.len();
+    let budget = room.saturating_sub(stamp).saturating_sub(envelope);
+    let view = match crate::harness::state_view::view(state, budget) {
+        Ok(view) => view,
+        Err(error) => {
+            tracing::warn!(session, ?error, "a bounded session view could not be encoded");
+            return Vec::new();
+        }
+    };
+    let Ok(projected) = view.into_state() else { return Vec::new() };
+    serde_json::to_string(&serde_json::json!({"t":"state", "state":projected})).ok()
+        .filter(|json| json.len().saturating_add(stamp) <= HARNESS_FRAME).into_iter().collect()
+}
+
+fn legacy_harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
     use crate::harness::core::Update;
     let Ok(json) = serde_json::to_string(u) else { return Vec::new() };
     if json.len() <= HARNESS_FRAME {
@@ -6191,6 +6773,43 @@ fn open_mirror(dir: &std::path::Path, up: &crate::memory::queue::Sender<Up>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ordinary_state_keeps_its_exact_existing_wire_representation() -> anyhow::Result<()> {
+        let update = crate::harness::core::Update::State { state: Box::default() };
+        assert_eq!(harness_frames("ordinary-state", &update), vec![serde_json::to_string(&update)?]);
+        Ok(())
+    }
+
+    /// CP-T3.2: Shards' queued messages must not prevent its owner from publishing its status.
+    #[test]
+    fn state_delivery_survives_a_queue_larger_than_a_frame() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{QueueItem, State, Status};
+        let state = State {
+            status: Status::Running,
+            queue: (0..600).map(|i| QueueItem {
+                id: format!("queued-{i}"), text: "same authoritative message ".repeat(100), at: i,
+                attachments: Vec::new(), overrides: None, reply_to: None,
+            }).collect(),
+            ..State::default()
+        };
+        let update = Update::State { state: Box::new(state.clone()) };
+        let frames = harness_frames("offline-regression", &update);
+        anyhow::ensure!(!frames.is_empty(), "an online session's state was dropped because its queue exceeded the frame cap");
+        anyhow::ensure!(frames.iter().all(|f| f.len() <= HARNESS_FRAME), "the frame cap must remain enforced");
+        let first: serde_json::Value = serde_json::from_str(frames.first().ok_or_else(|| anyhow::anyhow!("no state frame"))?)?;
+        anyhow::ensure!(first.pointer("/state/status").and_then(serde_json::Value::as_str) == Some("running"));
+        anyhow::ensure!(first.pointer("/state/view/deferred/queue").is_some(), "a deferred queue must never look empty or contain clipped messages");
+        anyhow::ensure!(matches!(&update, Update::State { state: original } if **original == state), "publishing a view must preserve the owner's queue");
+        let recorded = crate::convo::rows::of("offline-regression", &update, 0);
+        let stored = recorded.iter().find_map(|row| match row {
+            crate::convo::rows::Row::Session { state: Some(state), .. } => Some(state), _ => None,
+        }).ok_or_else(|| anyhow::anyhow!("no durable state row"))?;
+        let restored: State = serde_json::from_str(stored)?;
+        anyhow::ensure!(restored.queue == state.queue, "the durable source state must retain every complete message");
+        Ok(())
+    }
 
     /// Goal 9: an idle runner, connected, wakes for nothing. A server runs here with its own runner
     /// (the local agent, this process's `run`); once it's connected and settled, the timers armed in
@@ -6944,17 +7563,264 @@ mod attention_archive_ack_tests{
                 let mut operations=HarnessOperations::new();
                 operations.push(async move{
                     let result=heard.await.unwrap_or_else(|_|Err((Refusal::Unknown,"the runner stopped delivering exits".into())));
-                    (Some(("archive".into(),1)),result)
+                    HarnessApplied::Command { reply: Some(("archive".into(),1)), result }
                 }.boxed());
                 assert!(next_harness_operation(&mut operations).now_or_never().is_none());
                 assert_eq!(wire.on_item("archive",1,0,now),Arrival::Answered(None),"a retry remains pending and does not run twice");
                 exit.send(outcome.clone()).map_err(|_|anyhow::anyhow!("the deferred operation was abandoned"))?;
-                let(reply,result)=next_harness_operation(&mut operations).await;
+                let HarnessApplied::Command { reply, result } = next_harness_operation(&mut operations).await else { anyhow::bail!("not the pending archive operation") };
                 let(stream,seq)=reply.ok_or_else(||anyhow::anyhow!("lost the command identity"))?;
                 assert_eq!(result,outcome);
                 let answer=match result{Ok(())=>wire.took(&stream,seq),Err((code,why))=>wire.refused(&stream,seq,code,why)};
                 assert_eq!(wire.on_item("archive",1,0,now),Arrival::Answered(Some(answer)));
             }Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod native_handover_tests {
+    use super::*;
+
+    /// W27-R08: Open's first identity ask carries the committed 0→1 receipt. Promotion must
+    /// never schedule epoch 2 for a native journal that already changed ownership to epoch 1.
+    #[test]
+    #[cfg(unix)]
+    fn a_native_journal_registers_its_one_epoch_receipt_before_the_first_open_ask() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        use kiln_ci::identity::{chain::{Actor, Holder, Identity}, custody::{Body, Kind}, statement::{self, PAYLOAD_CUSTODY, Statement}};
+        use rcgen::SigningKey as _;
+        let directory = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(&directory.path().join("pki"))?;
+        let session = format!("native-epoch-{}", crate::util::new_id());
+        let manifest = crate::harness::mail::TransferManifest { attempt: crate::util::new_id(), session: session.clone(), source_epoch: 0, destination_epoch: 1, count: 1, sha256: "a".repeat(64) };
+        let frozen = crate::harness::core::Core::new().freeze();
+        let (epoch, events) = frozen.handover_source();
+        let identity = Identity::new(pki.organization(), Actor::Agent { person: "ada".into(), agent: session.clone(), epoch, held_by: Some(Holder { machine: "native-box".into(), instance: "old".into() }) });
+        let by = identity.uri()?;
+        let key = crate::pki::new_key_pem()?;
+        let cert = pki.issue_identity(&crate::pki::make_csr_with_key("kiln-identity", &key)?, &identity, &[], time::Duration::hours(1))?;
+        let signing = rcgen::KeyPair::from_pem(&key)?;
+        let subject = crate::custody::timeline(&session, epoch, events);
+        let sign = |epoch: u64| -> anyhow::Result<serde_json::Value> {
+            let body = Body { to: crate::custody::at_epoch(&by, epoch), epoch: Some(epoch), ..Body::new(Kind::HandedOn, &by) };
+            let payload = statement::payload(&Statement { subject: vec![subject.clone()], ..Statement::new(serde_json::to_value(body)?) })?;
+            Ok(statement::bundle(PAYLOAD_CUSTODY, &payload, &signing.sign(&statement::to_sign(PAYLOAD_CUSTODY, &payload))?, &crate::pki::der_of(&cert)?))
+        };
+        let hand_on = sign(1)?;
+        assert!(native_journal_hand_on(&manifest, None, Some(&hand_on)).is_err(), "no invented empty timeline when native state is missing");
+        assert!(native_journal_hand_on(&manifest, Some(&frozen), None).is_err(), "signed custody cannot silently become unsigned");
+        assert!(native_journal_hand_on(&manifest, Some(&frozen), Some(&sign(2)?)).is_err(), "an epoch-2 statement cannot form the epoch-1 receipt");
+        native_journal_receipt(&manifest, Some(&frozen), Some(&hand_on)).map_err(anyhow::Error::msg)?;
+        let open_epoch = crate::runner::custody::to_ask(&session, manifest.destination_epoch);
+        assert_eq!(open_epoch, Some(1), "the receipt is installed before the first Open asks for its identity");
+        let ask = crate::runner::identity::request("agent", Some(&session), open_epoch)?;
+        let ask = crate::runner::custody::carrying(&session, 1, ask);
+        assert_eq!(ask.epoch, Some(1));
+        assert_eq!(ask.hand_on.as_deref(), Some(hand_on.to_string().as_str()));
+        let receipt = ask.receipt.ok_or_else(|| anyhow::anyhow!("Open would ask without its source custody receipt"))?;
+        let payload = base64::engine::general_purpose::STANDARD.decode(&receipt.payload)?;
+        let receipt: Statement = serde_json::from_slice(&payload)?;
+        let body: Body = serde_json::from_value(receipt.body)?;
+        assert_eq!(body.epoch, Some(1));
+        assert_eq!(receipt.subject, vec![subject]);
+        assert_eq!(crate::runner::custody::certified(&session, 2), crate::runner::custody::Certification::Untracked, "no second-epoch identity transition exists");
+        assert_eq!(crate::runner::custody::certified(&session, 1), crate::runner::custody::Certification::Receipt, "the committed journal epoch needs no blue-green go_on_at increment");
+        let proof = crate::runner::custody::LegacyProof::of(&session, 0, events, Some(&hand_on)).map_err(anyhow::Error::msg)?;
+        let proof: crate::runner::custody::LegacyProof = serde_json::from_slice(&serde_json::to_vec(&proof)?)?;
+        proof.validate(&session, 0, 1).map_err(anyhow::Error::msg)?;
+        assert!(proof.validate("another-session", 0, 1).is_err());
+        assert!(proof.validate(&session, 1, 2).is_err());
+        let mut promotion = crate::harness::inbox::Promotion { from_epoch: 0, to_epoch: 1, phase: crate::harness::inbox::PromotionPhase::AwaitingPromotion, proof, after: None };
+        crate::runner::custody::legacy_waiting(&session, &promotion).map_err(anyhow::Error::msg)?;
+        assert_eq!(crate::runner::custody::to_ask(&session, 0), None, "persisted proof alone cannot authorize promotion");
+        promotion.phase = crate::harness::inbox::PromotionPhase::AwaitingCertificate;
+        crate::runner::custody::legacy_waiting(&session, &promotion).map_err(anyhow::Error::msg)?;
+        assert_eq!(crate::runner::custody::to_ask(&session, 0), Some(1));
+        assert_eq!(crate::runner::custody::certified(&session, 1), crate::runner::custody::Certification::DurablePromotion);
+        assert_eq!(crate::runner::custody::certified(&session, 1), crate::runner::custody::Certification::DurablePromotion, "certificate notifications cannot retire the durable transition");
+        let ask = crate::runner::custody::carrying(&session, 1, crate::runner::identity::request("agent", Some(&session), Some(1))?);
+        assert!(ask.receipt.is_some() && ask.hand_on.is_some(), "persisted compact proof recreates the exact receipt without event reassembly");
+        crate::runner::identity::forget_prefix(&format!("agent/{session}/"));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_wrong_key_or_uninstalled_identity_cannot_complete_a_legacy_promotion() -> anyhow::Result<()> {
+        use kiln_ci::identity::chain::{Actor, Holder, Identity};
+        crate::rt::block_on(async {
+            let directory = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open_scratch(&directory.path().join("pki"))?;
+            let session = format!("legacy-key-{}", crate::util::new_id());
+            let frozen = crate::harness::core::Core::new().freeze();
+            let (_, events) = frozen.handover_source();
+            let proof = crate::runner::custody::LegacyProof::of(&session, 0, events, None).map_err(anyhow::Error::msg)?;
+            let promotion = crate::harness::inbox::Promotion { from_epoch: 0, to_epoch: 1, phase: crate::harness::inbox::PromotionPhase::AwaitingCertificate, proof, after: None };
+            crate::runner::custody::legacy_waiting(&session, &promotion).map_err(anyhow::Error::msg)?;
+            let _requested = crate::runner::identity::request("agent", Some(&session), Some(1))?;
+            let identity = Identity::new(pki.organization(), Actor::Agent { person: "ada".into(), agent: session.clone(), epoch: 1, held_by: Some(Holder { machine: "box".into(), instance: "green".into() }) });
+            let wrong_key = crate::pki::new_key_pem()?;
+            let wrong_cert = pki.issue_identity(&crate::pki::make_csr_with_key("kiln-identity", &wrong_key)?, &identity, &[], time::Duration::hours(1))?;
+            let given = crate::proto::IdentityGiven { kind: "agent".into(), of: Some(session.clone()), epoch: Some(1), uri: identity.uri()?, cert_pem: Some(wrong_cert), ..Default::default() };
+            assert!(installed_identity(given.clone(), directory.path().to_path_buf(), "green".into()).await.is_err(), "a valid certificate for a different private key is not installed");
+            let slot = crate::runner::identity::slot("agent", Some(&session), Some(1));
+            assert!(crate::runner::identity::cert(&slot).is_none());
+            assert_eq!(crate::runner::custody::certified(&session, 1), crate::runner::custody::Certification::DurablePromotion);
+            crate::runner::identity::forget(&slot);
+            assert_eq!(installed_identity(given, directory.path().to_path_buf(), "green".into()).await?, None, "given_off Ok for a vanished key is no installed certificate notification");
+            assert_eq!(crate::runner::custody::to_ask(&session, 0), Some(1), "no certificate failure may retire the epoch witness or ask for epoch0");
+            assert!(crate::runner::custody::legacy_certificate_ready(&session, 1, &promotion.proof).is_err());
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_ready_waits_for_actual_features_on_the_current_connection() {
+        let pending = || Some(PathBuf::from("old-runner"));
+        let mut path = pending();
+        let mut features = FeatureNegotiation::default();
+        assert_eq!(features.take_over(true, &mut path), None, "Welcome before Caps is not a negative capability");
+        features.caps(proto::CAP_FEATURES);
+        assert_eq!(features.take_over(true, &mut path), None, "named features still pending");
+        features.names();
+        assert_eq!(features.take_over(true, &mut path), pending());
+        features.names();
+        features.caps(proto::CAP_FEATURES);
+        assert_eq!(features.take_over(true, &mut path), None, "duplicate handshake events cannot start a second owner");
+
+        let mut path = pending();
+        let mut features = FeatureNegotiation::default();
+        features.names();
+        assert_eq!(features.take_over(false, &mut path), None, "Features before Welcome does not start takeover");
+        assert_eq!(features.take_over(true, &mut path), pending());
+
+        let mut path = pending();
+        let mut features = FeatureNegotiation::default();
+        features.caps(0);
+        assert_eq!(features, FeatureNegotiation::Legacy);
+        assert_eq!(features.take_over(false, &mut path), None);
+        assert_eq!(features.take_over(true, &mut path), pending(), "an actual legacy Caps reply settles the handshake without inventing mail support");
+
+        let mut path = pending();
+        let mut features = FeatureNegotiation::default();
+        features.caps(proto::CAP_FEATURES);
+        features.names();
+        features = FeatureNegotiation::default();
+        assert_eq!(features.take_over(false, &mut path), None, "disconnect retains the pending operation");
+        assert_eq!(features.take_over(true, &mut path), None, "a reconnect Welcome cannot reuse previous named features");
+        features.caps(proto::CAP_FEATURES);
+        assert_eq!(features.take_over(true, &mut path), None);
+        features.names();
+        assert_eq!(features.take_over(true, &mut path), pending());
+    }
+
+    use crate::harness::core::Update;
+    use crate::harness::host::{Host, Limits};
+    use crate::harness::model::{State, Status};
+    use crate::harness::session::Spec;
+    use kiln_seams::clock::SimClock;
+
+    /// W20: a held mail replay waits for room of its own, the share each session's budget is.
+    /// Another session's copy, held or let go of, changes nothing of it (no pool spans every
+    /// session), its own pulse schedules nothing, and the share measured larger lets it go once.
+    #[test]
+    fn a_held_mail_replay_retries_once_its_share_grows_never_for_another_sessions_release() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (sink, _updates) = async_channel::unbounded();
+            let host = Host::with_records(sink, None, Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())));
+            host.set_input_budget(100);
+            let other = host.reserve_input_buffer(90).map_err(|_| anyhow::anyhow!("another session's reserve failed"))?.ok_or_else(|| anyhow::anyhow!("another session's reserve refused"))?;
+            let before = host.native_budget_counts();
+            let own = Arc::clone(&host);
+            let mut replay = MailReplay::Reading { before, read: Box::pin(async move {
+                // Its own room is whole, whatever another session holds.
+                let charge = own.reserve_input_buffer(20).ok().flatten();
+                assert!(charge.is_some());
+                drop(charge);
+                true
+            }) };
+            assert!(replay.budget_observed().is_none(), "budget watches are disabled for the one in-flight replay");
+            let held = replay.completed().await;
+            replay.finish(Some(&host), held);
+            assert!(matches!(replay, MailReplay::Idle { budget: Some(_) }), "own temporary drop cannot schedule another attempt");
+            assert!(MailReplay::budget_changed(Some(&host), replay.budget_observed()).now_or_never().is_none(), "own net-unchanged pulse cannot wake idle recovery");
+            drop(other);
+            assert!(MailReplay::budget_changed(Some(&host), replay.budget_observed()).now_or_never().is_none(), "another session's release is no room of its own");
+            host.set_input_budget(200);
+            assert_eq!(MailReplay::budget_changed(Some(&host), replay.budget_observed()).now_or_never(), Some(()));
+            replay.budget_event(Some(&host));
+            assert!(matches!(replay, MailReplay::Reading { .. }), "a larger share permits one existing-owner attempt");
+            replay.budget_event(Some(&host));
+            assert!(matches!(replay, MailReplay::Reading { .. }), "an in-flight budget event cannot enqueue a second attempt");
+            let held = replay.completed().await;
+            replay.finish(Some(&host), held);
+            assert!(matches!(replay, MailReplay::Idle { budget: None }));
+
+            // A share measured larger during the replay cannot be lost while its budget waiter is disabled.
+            let before = host.native_budget_counts();
+            let grows = Arc::clone(&host);
+            let mut replay = MailReplay::Reading { before, read: Box::pin(async move { grows.set_input_budget(300); true }) };
+            let held = replay.completed().await;
+            replay.finish(Some(&host), held);
+            assert!(matches!(replay, MailReplay::Reading { .. }), "post-operation comparison catches a larger share during replay");
+            let held = replay.completed().await;
+            replay.finish(Some(&host), held);
+            assert!(matches!(replay, MailReplay::Idle { budget: None }));
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2: the real Host cannot handle its native handover control until its initial
+    /// snapshot gets through this full sink. The runner must keep taking that snapshot while
+    /// its operation waits. Cancellation retains the operation through its actual completion.
+    #[test]
+    fn a_native_handover_drains_the_full_source_sink_and_keeps_cancellation_until_completion() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            for cancelled in [false, true] {
+                let directory = tempfile::tempdir()?;
+                let (tx, rx) = async_channel::bounded(1);
+                tx.send(("stale".to_owned(), Update::State { state: Box::new(State { status: Status::Running, ..State::default() }) })).await?;
+                let host = Host::with_records(tx, None, Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())));
+                host.open(Some("native-prepare".into()), Spec {
+                    kind: "claude".into(), cwd: Some(directory.path().to_string_lossy().into_owned()),
+                    program: Some(directory.path().join("no-provider").to_string_lossy().into_owned()),
+                    ..Spec::default()
+                })?;
+                let mut operations = HarnessOperations::new();
+                let mut native = NativeHandover::default();
+                assert!(native.prepare(&mut operations, Some(Arc::clone(&host)), NativePreparation::InPlace { exe: directory.path().join("next"), mtime: None }));
+                assert!(!native.prepare(&mut operations, Some(Arc::clone(&host)), NativePreparation::InPlace { exe: directory.path().join("duplicate"), mtime: None }));
+                assert_eq!(operations.len(), 1, "one existing operation owner, not a new handover queue");
+                assert!(next_harness_operation(&mut operations).now_or_never().is_none(), "the native owner still waits behind its full sink");
+                assert!(!native.idle());
+                if cancelled { assert!(native.cancel(None, "cancel before native completion".into())); }
+                let mut stale = false;
+                let mut announced = false;
+                let result = crate::rt::timeout(Duration::from_secs(5), async {
+                    loop {
+                        futures::select! {
+                            done = next_harness_operation(&mut operations).fuse() => break Ok::<_, anyhow::Error>(done),
+                            update = rx.recv().fuse() => {
+                                let (session, update) = update?;
+                                stale |= session == "stale" && matches!(&update, Update::State { state } if state.status == Status::Running);
+                                announced |= session == "native-prepare" && matches!(&update, Update::Open { .. });
+                            }
+                        }
+                    }
+                }).await.map_err(|_| anyhow::anyhow!("native preparation blocked the loop that must drain its source sink"))??;
+                let HarnessApplied::Native(NativePrepared::InPlace { result, .. }) = result else { anyhow::bail!("the wrong operation completed") };
+                assert!(result.is_ok(), "a missing provider has no native process to detach: {result:?}");
+                assert!(stale && announced, "both an earlier state and the actual source owner snapshot must drain");
+                assert!(host.get("native-prepare").is_some(), "no session disappeared while preparation waited");
+                assert_eq!(native.finish().as_deref(), cancelled.then_some("cancel before native completion"));
+                assert!(native.idle());
+                assert!(operations.is_empty());
+                drop(rx);
+                let _ = host.end("native-prepare");
+            }
+            Ok(())
         })
     }
 }

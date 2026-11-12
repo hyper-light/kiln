@@ -1,0 +1,53 @@
+{
+  "source_commit": "ef473cf5fa400ed567e189f86e1a8cf3a41084cd",
+  "source_tree": "a1c5df2a052cd3ce5a9963324038cfa05f80758a",
+  "parent": "1d5c3821ad1f2e7b6b5cccff0543d89d953dedb7",
+  "bundle_sha256": "cb43e6d8344e39ddfb7083f39aea7a47572586e77a8978d01b0afceb85dd63e2",
+  "target": "aarch64-apple-darwin",
+  "kind": "private-checkpoint-build",
+  "crypto_verdict_pending": true,
+  "declared_reach": {
+    "cpus": 4,
+    "memory_gib": 32,
+    "disk_gib": 16
+  },
+  "warm_target": "/Users/adalundhe/.cache/kiln-offline-release-20261111/mac-arm64-target",
+  "warm_rustc_info_sha256": "310c8eed37c1f6182a608b09dd0c8ec79a992a10e600aabf3c81610d6a04cf1a",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: aarch64-apple-darwin\nrelease: 1.99.1\nLLVM version: 23.1.1",
+  "tools": {
+    "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
+    "node": "v24.14.1",
+    "npm": "11.11.0"
+  },
+  "baseline_sha256": "7e59ada60d03deba823685c87f3034d6e066b4e192009ff8d8b894f8ca7e8246",
+  "baseline_bytes": 308639008,
+  "steps": [
+    {
+      "name": "ui",
+      "exit_code": 0
+    },
+    {
+      "name": "release",
+      "exit_code": 0
+    }
+  ],
+  "started": 1794395454.580811,
+  "untracked_evidence_before": {
+    "count": 40,
+    "sha256": "57f7ae87a4e141d7a0372583a2977473080c0918111f7fc1c6254fd937d8108d"
+  },
+  "artifact": "/Users/adalundhe/.cache/kiln-queue-prevention-release-20261111/ef473cf5fa400ed567e189f86e1a8cf3a41084cd/mac/dist/kiln-aarch64-apple-darwin",
+  "sha256": "9f997ec839747abf3768300a1ff10b480b4fef00ead158671aa03ecca96737fa",
+  "bytes": 309120976,
+  "native_smoke_exit": 0,
+  "native_smoke": "kiln 0.2.0",
+  "file": "/Users/adalundhe/.cache/kiln-queue-prevention-release-20261111/ef473cf5fa400ed567e189f86e1a8cf3a41084cd/mac/dist/kiln-aarch64-apple-darwin: Mach-O 64-bit executable arm64",
+  "source_unchanged": true,
+  "exit_code": 0,
+  "elapsed_seconds": 790.5974898338318,
+  "free_after": 154745303040,
+  "untracked_evidence_after": {
+    "count": 44,
+    "sha256": "720568f9c48a826a0db89669d84b1e7d3a521f7fbe9e3a5fa0e40ea8882318e6"
+  }
+}

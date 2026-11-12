@@ -7,8 +7,10 @@ import type { Event } from "./Event";
 import type { EventsWindow } from "./EventsWindow";
 import type { FileChange } from "./FileChange";
 import type { FileKey } from "./FileKey";
+import type { FlowEvent } from "./FlowEvent";
 import type { InboxAnswer } from "./InboxAnswer";
 import type { KeptFile } from "./KeptFile";
+import type { MailReceipt } from "./MailReceipt";
 import type { Meta } from "./Meta";
 import type { Refusal } from "./Refusal";
 import type { Said } from "./Said";
@@ -20,12 +22,16 @@ import type { JsonValue } from "./serde_json/JsonValue";
  * (docs/wire.md, "Revisions"). Every frame the socket sends is one, and so is every frame of the
  * session's feed on the bus: the registry and its viewers share it.
  */
-export type SessionDown = { rev?: number, } & ({ "t": "open", info: AgentInfo, born?: number, window?: EventsWindow, } | { "t": "resumed", info: AgentInfo, born?: number, } | { "t": "meta", meta: Meta, } | { "t": "state", state: AgentState, } | { "t": "state_patch", set: Partial<AgentState>, gone?: Array<string>, } | { "t": "changes", files: Array<FileChange>, } | { "t": "changes_patch", set?: Array<FileChange>, gone?: Array<FileKey>, } | { "t": "files", files: Array<KeptFile>, } | { "t": "events", events: Array<Event>, } | { "t": "stream", id: string, text: string, } | { "t": "reply", client: string, value: JsonValue, } | { "t": "inbox", said: Said, } | { "t": "reset", from?: number, } | { "t": "closed" } | { "t": "synced" } | { "t": "error", error: string, refused?: Refusal, } | { "t": "ack", id: string, outcome: AckOutcome, 
+export type SessionDown = { rev?: number, } & ({ "t": "open", info: AgentInfo, born?: number, window?: EventsWindow, } | { "t": "resumed", info: AgentInfo, born?: number, } | { "t": "meta", meta: Meta, } | { "t": "state", state: AgentState, } | { "t": "state_patch", set: Partial<AgentState>, gone?: Array<string>, } | { "t": "changes", files: Array<FileChange>, } | { "t": "changes_patch", set?: Array<FileChange>, gone?: Array<FileKey>, } | { "t": "files", files: Array<KeptFile>, } | { "t": "events", events: Array<Event>, } | { "t": "stream", id: string, text: string, } | { "t": "reply", client: string, value: JsonValue, } | { "t": "inbox", said: Said, } | { "t": "mail_flow", event: FlowEvent, publication?: MailReceipt, mail_scope?: string, } | { "t": "reset", from?: number, } | { "t": "closed" } | { "t": "synced" } | { "t": "error", error: string, refused?: Refusal, } | { "t": "ack", id: string, outcome: AckOutcome, 
 /**
  * What its inbox said, when it took a message (`accepted`).
  */
-accepted?: InboxAnswer, } | { "t": "nack", id: string | null, code: string, why: string, again: boolean, 
+accepted?: InboxAnswer, 
+/**
+ * Durable custody is pending delivery; this is distinct from a source inbox ACK.
+ */
+publication?: MailReceipt, } | { "t": "nack", id: string | null, code: string, why: string, again: boolean, 
 /**
  * Its inbox's refusal, when that's what it was.
  */
-refused?: Refusal, });
+refused?: Refusal, } | { "t": "history", cursor: string, before: number | null, has_more: boolean, oversized: boolean, });

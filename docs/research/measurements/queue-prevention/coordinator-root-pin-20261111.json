@@ -1,0 +1,19 @@
+{
+  "captured_at": "2026-11-11T09:51:36.113153+00:00",
+  "policy_revision": "06ae067c0beda71c98a8c6f9633df9feb71fc11b",
+  "rules_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+  "role": "implementer",
+  "source": {
+    "path": "/Users/adalundhe/.local/share/kiln/agent/ca.pem",
+    "modified_utc": "2026-10-21T05:57:47.236291+00:00",
+    "bytes": 607,
+    "certificate_count": 1,
+    "der_sha256": "c815d046a45d7f59ec224962255ab6b5872524acf915482dc392fd5f99fe4749",
+    "public_subject": "O=hyper-light,CN=kiln CA"
+  },
+  "method": "existing prior-enrollment publicCA file; ssl PEM-to-DER SHA256; openssl x509 publicsubject",
+  "private_key_read": false,
+  "certificate_bytes_printed": false,
+  "fresh_server_response_used_as_pin": false,
+  "checkpoint_crypto_verifier_executed": false
+}

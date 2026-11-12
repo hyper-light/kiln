@@ -63,12 +63,27 @@ type AuthListener = (authed: boolean) => void;
 export const SIGNED_OUT = "kiln.signedOut";
 const authListeners = new Set<AuthListener>();
 let authed: boolean | null = null;
+let custodyScope: string | null = null;
+const custodyListeners = new Set<() => void>();
+
+export const mailScope = () => custodyScope;
+export function onMailScopeChange(listener: () => void): () => void {
+  custodyListeners.add(listener);
+  return () => custodyListeners.delete(listener);
+}
+export function setMailScope(scope: string | null | undefined) {
+  const next = typeof scope === "string" && scope.length > 0 && !/\p{Cc}/u.test(scope) ? scope : null;
+  if (next === custodyScope) return;
+  custodyScope = next;
+  custodyListeners.forEach((listener) => listener());
+}
 
 export function onAuthChange(fn: AuthListener): () => void {
   authListeners.add(fn);
   return () => authListeners.delete(fn);
 }
 export function setAuthed(value: boolean) {
+  if (!value) setMailScope(null);
   if (authed === value) return;
   authed = value;
   // For the document's first reads (lib/early-script.ts): signed out last time, it asks only who this is.
@@ -85,7 +100,12 @@ export function isAuthed() {
 
 /* ---------------------------- core fetch ---------------------------- */
 
-export async function request<T>(method: string, path: string, body?: unknown, opts: { raw?: boolean; signal?: AbortSignal; file?: Blob; type?: string; keepalive?: boolean } = {}): Promise<T> {
+export async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  opts: { raw?: boolean; signal?: AbortSignal; file?: Blob; type?: string; keepalive?: boolean; cache?: RequestCache } = {},
+): Promise<T> {
   const init: RequestInit = {
     method,
     credentials: "same-origin",
@@ -93,6 +113,7 @@ export async function request<T>(method: string, path: string, body?: unknown, o
     body: opts.file ?? (body !== undefined ? JSON.stringify(body) : undefined),
     signal: opts.signal,
     keepalive: opts.keepalive,
+    cache: opts.cache,
   };
   const res = await fetch(path, init);
   if (res.status === 401) {
@@ -240,6 +261,7 @@ export const api = {
   },
   me: async (signal?: AbortSignal) => {
     const me = await get<Me>("/api/me", signal);
+    setMailScope(me.authenticated ? me.mail_scope : null);
     setAuthed(Boolean(me.authenticated));
     return me;
   },

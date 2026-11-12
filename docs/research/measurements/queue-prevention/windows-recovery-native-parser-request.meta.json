@@ -1,0 +1,13 @@
+{
+  "workflow": ".kiln/windows-recovery.yaml",
+  "workflow_sha256": "46610bbd138a560d15977934a1cf3bdeb26a399e835bc5c826110d7273fba3a4",
+  "step_sha256": "340dbc0cff489c55a52a9c3298358255ad599bedc89cfa6972a994467b674d76",
+  "step_bytes": 6893,
+  "gzip_bytes": 2728,
+  "command_characters": 20478,
+  "request_sha256": "16c05ddc51aeadf9e2d2e3bc06593b48f232cdc83e7726089c3226fd20e0da6c",
+  "parser_execution": "unrun",
+  "readonly_git_preflight": "unrun; exact source HEAD/status first20/two named config keys/target existence only",
+  "step_execution": "never by this payload",
+  "writes_on_windows": "none explicit"
+}

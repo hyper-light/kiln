@@ -27,6 +27,7 @@ import { ahead, note, runnerRefused } from "./refused.ts";
 import { handleGoals } from "./goals.ts";
 import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
+import { handleSkills } from "./skills.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handleKeep } from "./keep.ts";
@@ -35,6 +36,7 @@ import { handleReap } from "./reap.ts";
 import { handleExperiments } from "./experiments.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleLongTimeline, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { handleMockHistory } from "./history.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
 import { fleetInfos, handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
@@ -1729,6 +1731,7 @@ const server = http.createServer(async (req, res) => {
       const refused = refuseAgent(url.searchParams.get("agent") ?? "", what);
       return refused ? json(res, 200, refused) : err(res, 404, "no such runner or agent");
     }
+    if (handleMockHistory(req, res, url)) return;
     // ---- files the long session's messages mention ----
     if (handleLongFiles(p, url, req, res)) return;
     if (handleLongTimeline(p, url, res)) return;
@@ -1934,7 +1937,9 @@ const server = http.createServer(async (req, res) => {
     // ---- agents ----
     if (p === "/api/conversations/search" && m === "GET") {
       const q = url.searchParams;
-      return json(res, 200, { hits: searchSaid(q.get("q") ?? "", q.get("agent"), q.has("until") ? Number(q.get("until")) : null, Number(q.get("limit") ?? 100)) });
+      return json(res, 200, {
+        hits: searchSaid(q.get("q") ?? "", q.get("agent"), q.has("until") ? Number(q.get("until")) : null, Number(q.get("limit") ?? 100), q.has("before_seq") ? Number(q.get("before_seq")) : null),
+      });
     }
     if (p === "/api/agents" && m === "GET") return json(res, 200, [...agents.values()]);
     if (p === "/api/agents/join" && m === "GET") {
@@ -2149,6 +2154,7 @@ const server = http.createServer(async (req, res) => {
       return;
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
     if (await handleSettings(req, res, url, { json, err, body })) return;
+    if (await handleSkills(req, res, url, { json, err, body })) return;
     if (
       await handlePages(req, res, url, {
         agents: () => [...agents.values()],
@@ -2207,13 +2213,10 @@ server.on("upgrade", (req, socket, head) => {
     if (
       hm &&
       (handleDemoSession(ws, decodeURIComponent(hm[1]!)) ||
-        handleReviewSession(ws, decodeURIComponent(hm[1]!)) ||
+        handleReviewSession(ws, decodeURIComponent(hm[1]!), url.searchParams) ||
         handleFamilySession(ws, decodeURIComponent(hm[1]!)) ||
-        handleFastSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("patch") === "state") ||
-        handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state", {
-          window: url.searchParams.get("window") === "1",
-          lean: url.searchParams.get("lean") === "1",
-        }))
+        handleFastSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("patch") === "state", url.searchParams) ||
+        handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state", url.searchParams))
     )
       return;
     ws.close(1008, "no such socket");

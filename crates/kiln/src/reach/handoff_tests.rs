@@ -22,13 +22,20 @@ const NAMES: [&str; 3] = ["mac", "linux", "studio"];
 struct Lab3 {
     nodes: HashMap<&'static str, Handle>,
     /// Kill a node: its connection to the "server" ends for good.
-    kill: async_channel::Sender<&'static str>,
+    kill: async_channel::Sender<(&'static str, futures::channel::oneshot::Sender<()>)>,
     _dirs: Vec<tempfile::TempDir>,
 }
 
 impl Lab3 {
     fn node(&self, name: &str) -> anyhow::Result<Handle> {
         self.nodes.get(name).cloned().ok_or_else(|| anyhow::anyhow!("no node {name}"))
+    }
+
+    async fn kill(&self, name: &'static str) -> anyhow::Result<()> {
+        let (ack, done) = futures::channel::oneshot::channel();
+        self.kill.send((name, ack)).await.map_err(|_| anyhow::anyhow!("the relay stopped before killing {name}"))?;
+        crate::rt::timeout(HANG, done).await.map_err(|_| anyhow::anyhow!("the relay did not acknowledge killing {name}"))??;
+        Ok(())
     }
 }
 
@@ -80,10 +87,12 @@ async fn lab3() -> anyhow::Result<Lab3> {
             accept: true,
             mirrors: mirrors.clone(),
             adopt: None,
+            adopt_policy: crate::harness::moving::stream::StoragePolicy::Off,
             using: Arc::default(),
             objects: None,
             sense: false,
             on_battery: kiln_ci::pace::power::OnBattery::default(),
+            place: kiln_ci::place::runner::Settings::default(),
             version: super::wire::VERSION,
             root: Vec::new(),
         };
@@ -93,7 +102,7 @@ async fn lab3() -> anyhow::Result<Lab3> {
     }
     let directory: Vec<RunnerInfo> = NAMES.iter().filter_map(|n| nodes.get(n).map(|h| info(n, h.fingerprint()))).collect();
     let peers: Arc<Mutex<HashMap<&'static str, u64>>> = Arc::new(Mutex::new(NAMES.iter().enumerate().map(|(i, n)| (*n, 10 * (u64::try_from(i).unwrap_or(0) + 1))).collect()));
-    let (kill_tx, kill_rx) = async_channel::unbounded::<&'static str>();
+    let (kill_tx, kill_rx) = async_channel::unbounded::<(&'static str, futures::channel::oneshot::Sender<()>)>();
     let (said_tx, said_rx) = async_channel::unbounded::<(&'static str, AgentMsg)>();
     for (name, out) in outs {
         let tx = said_tx.clone();
@@ -117,7 +126,7 @@ async fn lab3() -> anyhow::Result<Lab3> {
             use futures::FutureExt as _;
             let (from, msg) = futures::select_biased! {
                 k = kill_rx.recv().fuse() => {
-                    let Ok(name) = k else { return };
+                    let Ok((name, ack)) = k else { return };
                     let peer = peers.lock().get(name).copied().unwrap_or(0);
                     for (to, sm) in relay.lost(peer, "disconnected from the kiln server") {
                         deliver(&peers, &relay_nodes, to, sm).await;
@@ -126,6 +135,7 @@ async fn lab3() -> anyhow::Result<Lab3> {
                     if let Some(h) = relay_nodes.get(name) {
                         h.feed(In::Server(false)).await;
                     }
+                    let _ = ack.send(());
                     continue;
                 }
                 m = said_rx.recv().fuse() => match m {
@@ -143,10 +153,19 @@ async fn lab3() -> anyhow::Result<Lab3> {
                     }
                 }
                 AgentMsg::ReachAsk { req, json: _ } => {
-                    // Every question here is the directory's: the dead node shown gone.
-                    let live: Vec<RunnerInfo> = directory.iter().filter(|r| peers.lock().contains_key(r.name.as_str())).cloned().collect();
+                    // LB03: Hub::reach_directory retains disconnected non-ephemeral runners
+                    // (hub.rs), with connected/reach false. Omitting one means permanently
+                    // forgetting its ended runs to Placer::directory, not losing its connection.
+                    let listed: Vec<RunnerInfo> = {
+                        let peers = peers.lock();
+                        directory.iter().cloned().map(|mut r| {
+                            r.connected = peers.contains_key(r.name.as_str());
+                            r.reach &= r.connected;
+                            r
+                        }).collect()
+                    };
                     if let Some(h) = relay_nodes.get(from) {
-                        h.feed(In::Answer { req, answer: serde_json::json!({ "runners": live }) }).await;
+                        h.feed(In::Answer { req, answer: serde_json::json!({ "runners": listed }) }).await;
                     }
                 }
                 _ => {}
@@ -217,11 +236,27 @@ fn lb03_w05_r25_an_owner_killed_mid_run_has_its_run_adopted_and_its_agent_told()
             }
         }
         // mac is killed mid-run, for good; then the run ends.
-        lab.kill.send("mac").await?;
+        anyhow::ensure!(evs.iter().any(|e| matches!(e, Ev::Placed { .. })), "the run bypassed placement: {evs:?}");
+        lab.kill("mac").await?;
+        // The relay has queued every loss frame. These ordered node requests observe those
+        // inputs before the process may end: a killed owner mid-run, not a race with the kill.
+        for h in [&mac, &linux, &studio] {
+            let _ = crate::rt::timeout(HANG, h.place_view()).await.map_err(|_| anyhow::anyhow!("{} did not observe the owner's disconnection", h.name()))??;
+        }
         std::fs::write(&go, b"")?;
         let told = eventually(|| crate::reach::told::heard_of(&session).iter().any(|n| matches!(n.event, crate::reach::told::RunEvent::Ended) && n.error.is_none())).await;
         let news = crate::reach::told::heard_of(&session);
-        anyhow::ensure!(told, "its agent was told how it ended: {news:?}");
+        if !told {
+            let mut views = Vec::new();
+            for h in [&mac, &linux, &studio] {
+                let view = crate::rt::timeout(HANG, h.place_view()).await.map_err(|_| anyhow::anyhow!("{} did not answer the handoff diagnostic", h.name()))??;
+                views.push((h.name().to_owned(), view));
+            }
+            while let Ok(e) = ev_rx.try_recv() {
+                evs.push(e);
+            }
+            anyhow::bail!("its agent was told how it ended: {news:?}; placement: {views:?}; events: {evs:?}");
+        }
         anyhow::ensure!(news.iter().any(|n| matches!(n.event, crate::reach::told::RunEvent::Started) && n.on.contains("linux")), "and that it runs on at linux under its adopter: {news:?}");
         let v = linux.place_view().await?;
         anyhow::ensure!(v.get("held").cloned() == Some(serde_json::json!([0, 0, 0, 0])), "its room is free on linux: {v}");

@@ -342,6 +342,19 @@ pub enum AgentMsg {
     /// answer (queued, never), `go` (its runner and claim), or `fallback`. Appended last, after
     /// `Offers`: postcard encodes variants by index.
     Placed { req: u64, json: String },
+    /// Installed skills on this machine (JSON, `crate::skills::heard`): the files it wants
+    /// (`want`, by SHA-256), each package's state here (`states`), or the files of a folder it was
+    /// asked to read (`read`, its `req`; their bytes as [`AgentMsg::SkillFile`]). Only to a server
+    /// that named [`feature::SKILLS`]. Appended last, after `Placed`: postcard encodes variants by
+    /// index.
+    Skills { json: String },
+    /// A piece of a file of a folder this runner was asked to read for skills, at `offset`, by its
+    /// SHA-256; `done` on the last. Only to a server that named [`feature::SKILLS`]. Appended
+    /// last, after `Skills`: postcard encodes variants by index.
+    SkillFile { req: u64, sha256: String, offset: u64, #[serde(with = "wire_bytes")] data: Vec<u8>, done: bool },
+    /// Exact source offer or destination receipt for journal custody. Only when both peers
+    /// name mail-transfer; appended to preserve postcard variant indices. Control lane only.
+    HarnessMailTransfer { json: String },
 }
 
 /// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
@@ -748,7 +761,26 @@ pub mod feature {
     /// placement's channel (`{"epoch", "budget"}`, docs/needs.md §9.1, LB08); a runner that didn't
     /// name it is in no budget's split and is asked for no rights.
     pub const PLACE_BUDGET: &str = "place.budget";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF];
+    /// Room tokens on placement's channel (docs/lb.md "Room tokens"; LB08, W05-R03): a runner that
+    /// names it takes what an owner gives back of what it holds there
+    /// (`kiln_ci::place::msg::ToRunner::FastRelease`, forwarded to the owner whose run waited); an
+    /// owner that names it hears a runner's word to it alone, what it holds there
+    /// (`ToOwner::FastHint`), and takes no hint of that runner's while it does. Only a runner whose
+    /// person declared `[reach] tokens` tells it so; to an owner that didn't name it, a runner says
+    /// its room in hints, as before.
+    pub const PLACE_TOKENS: &str = "place.tokens";
+    /// Skills kiln installs for agents (docs/agents.md, "Skills kiln installs"): a runner that
+    /// names it takes [`super::ServerMsg::Skills`] (what's installed, which session has which, or a
+    /// folder to read) and the files it asks for ([`super::ServerMsg::SkillFile`]), and says its
+    /// packages' states, the files it wants and a folder's files ([`super::AgentMsg::Skills`],
+    /// [`super::AgentMsg::SkillFile`]); a server that names it sends them.
+    pub const SKILLS: &str = "skills";
+    /// Bounded session control projections and revisioned, on-demand detail reads.
+    pub const STATE_PAGES: &str = "state-pages";
+    /// Durable communications with consumption-driven receiver credit.
+    pub const MAIL_FLOW: &str = "mail-flow";
+    pub const MAIL_TRANSFER: &str = "mail-transfer";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1125,6 +1157,19 @@ pub enum ServerMsg {
     /// change: its keeper looks at once (docs/reach.md §5.1; goal 9). Only to runners that named
     /// [`feature::KEEP`]. Appended last, after `Place`: postcard encodes variants by index.
     Copies { json: String },
+    /// Installed skills (JSON, `crate::skills::place::Manifest` as `manifest`): every package
+    /// this machine lays out and which of its sessions has which, sent as they change and on
+    /// every connect; or a folder to read for skills (`read`: `req`, `path`), answered by
+    /// [`AgentMsg::Skills`] and [`AgentMsg::SkillFile`]. Only to runners that named
+    /// [`feature::SKILLS`]. Appended last, after `Copies`: postcard encodes variants by index.
+    Skills { json: String },
+    /// A piece of a file of an installed package this runner asked for ([`AgentMsg::Skills`]
+    /// `want`), at `offset`, by its SHA-256; `done` on the last. Only to runners that named
+    /// [`feature::SKILLS`]. Appended last, after `Skills`: postcard encodes variants by index.
+    SkillFile { sha256: String, offset: u64, #[serde(with = "wire_bytes")] data: Vec<u8>, done: bool },
+    /// Authoritative durable transfer phase for the exact manifest, on Control. A receiver
+    /// keeps its imported journal fenced until Committed. Only with mail-transfer.
+    HarnessMailTransfer { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1263,6 +1308,15 @@ pub(crate) mod shared_str {
 pub fn encode<T: Serialize>(v: &T) -> anyhow::Result<Vec<u8>> {
     let size = postcard::experimental::serialized_size(v).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
     postcard::serialize_with_flavor::<T, Exact, Vec<u8>>(v, Exact(Vec::with_capacity(size))).map_err(|e| anyhow::anyhow!("encode: {e}"))
+}
+
+/// JSON room inside a Harness message, including the maximum postcard length prefix.
+pub(crate) fn harness_json_room(session: &str, cap: usize) -> usize {
+    if session.len() > cap { return 0 }
+    let empty = AgentMsg::Harness { session: session.to_owned(), json: String::new() };
+    let overhead = postcard::experimental::serialized_size(&empty).unwrap_or(cap);
+    let length = postcard::experimental::serialized_size(&cap).unwrap_or(cap);
+    cap.saturating_sub(overhead).saturating_sub(length)
 }
 
 /// postcard's output as one buffer made the size it will come to ([`encode`]).
@@ -1965,7 +2019,8 @@ mod tests {
         // needs-engine its leases (`Renew`, `Refused`, `Fenced` 64 to 66; `Renewed`, `Stop` 71 and 72); named
         // features their own (67 and 73; docs/wire.md's registry); the offers hint 68, and its room passed on to
         // owners 74; an owner's word on a session's start 69, and the ask for it 75; the keeper's rules and ask 76.
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (70, 77), "each table has every variant once");
+        // W20-R01 appended Skills and SkillFile in each direction (70/71 and 77/78).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (72, 79), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -2119,8 +2174,8 @@ mod tests {
             assert!(decode::<AgentMsg>(b.get(..b.len() - 1).unwrap_or_default()).is_err(), "a cut-off frame is an error");
         }
         let server = [
-            (ServerMsg::Renewed { seq: 9, lease_ms: 60_000, epoch: 7, lost: vec![grant.clone()] }, 69u8),
-            (ServerMsg::Stop { grant: grant.clone(), reason: "its grant was lost".into() }, 70),
+            (ServerMsg::Renewed { seq: 9, lease_ms: 60_000, epoch: 7, lost: vec![grant.clone()] }, 71u8),
+            (ServerMsg::Stop { grant: grant.clone(), reason: "its grant was lost".into() }, 72),
         ];
         for (m, idx) in server {
             let b = encode(&m)?;
@@ -2169,6 +2224,8 @@ mod tests {
             ("Features", AgentMsg::Features { names: names.clone() }),
             ("Offers", AgentMsg::Offers { json: "{}".into() }),
             ("Placed", AgentMsg::Placed { req: 1, json: "{}".into() }),
+            ("Skills", AgentMsg::Skills { json: "{}".into() }),
+            ("SkillFile", AgentMsg::SkillFile { req: 1, sha256: "00".into(), offset: 0, data: vec![1], done: true }),
         ];
         let mut last = 63u8;
         for (name, m) in agent {
@@ -2185,8 +2242,11 @@ mod tests {
             ("Offers", ServerMsg::Offers { json: "{}".into() }),
             ("Place", ServerMsg::Place { req: 1, json: "{}".into() }),
             ("Copies", ServerMsg::Copies { json: "{}".into() }),
+            ("Skills", ServerMsg::Skills { json: "{}".into() }),
+            ("SkillFile", ServerMsg::SkillFile { sha256: "00".into(), offset: 0, data: vec![1], done: true }),
         ];
-        let mut last = 68u8;
+        // After main's `HarnessArchive` (69) and `HarnessRestoreCopy` (70).
+        let mut last = 70u8;
         for (name, m) in server {
             let idx = *encode(&m)?.first().unwrap_or(&0);
             assert_eq!(idx, last + 1, "ServerMsg::{name} follows the variant before it");
@@ -2220,7 +2280,7 @@ mod tests {
         for name in feature::ALL {
             assert!(named.contains(&format!("`{name}`:")), "docs/wire.md's list of names doesn't say what `{name}` means");
         }
-        for name in [feature::OFFERS, feature::TOLD, feature::SIZES, feature::SESSIONS, feature::KEEP] {
+        for name in [feature::OFFERS, feature::TOLD, feature::SIZES, feature::SESSIONS, feature::KEEP, feature::PLACE_TOKENS] {
             assert!(feature::speaks(&names, name), "this build speaks {name}");
         }
         assert!(feature::speaks(&names, feature::LINK_FEATURES) && !feature::speaks(&[], feature::LINK_FEATURES));

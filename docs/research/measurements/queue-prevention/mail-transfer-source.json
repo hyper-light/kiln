@@ -1,0 +1,94 @@
+{
+  "policy": "7d7e0855a5073ed5163b4fe7ed3355c9ed7c2506",
+  "rules_sha256": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+  "role": "implementer",
+  "paths": [
+    {
+      "path": "crates/kiln/src/agent.rs",
+      "sha256": "00a938317f9461a28ae3b728d3800f0aeae15f22f7f648628672d2453755a81d",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/agent/loops.rs",
+      "sha256": "b6832100c2973213732281109dec1622701fe867d8c1473a5bcabe203f162a01",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/handing.rs",
+      "sha256": "4948488ea0872984ffc841a02fffc32e4e8ce47ef144fdda43f5c5546c7029c4",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/host.rs",
+      "sha256": "02de5af879eb53348c511a7570a39452f371ce636c3d669c46716a4e180d783c",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/host/transfer.rs",
+      "sha256": "4b32549398f76816fcc065afbf0ff2c039f20d1d7fa41e9b99a26a107ff3629c",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/inbox/mod.rs",
+      "sha256": "7f685475ce5734bfab5e06f915c5ca90d36faf09bf2bfd52ecec07065f8f895d",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/inbox/transfer.rs",
+      "sha256": "efacdf78dee978e75bbd9db9490319919aab13c42906f654fa236739c5d73a86",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/inbox/faults.rs",
+      "sha256": "756d978b3f6240750cd9c23f7f1c7dffc7a765ebd4dab050df4996748b04f6f9",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/moving.rs",
+      "sha256": "9ea25d32e1ec3bdae4ade566eca8e1b729dba316a7d4175fc1f67cb1781e5075",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/harness/moving/stream.rs",
+      "sha256": "ad242863cf9a91249d2168eefdc426dddce0f066f14028f7439367bca457927b",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/reach/node.rs",
+      "sha256": "0f5428ef715a1c5a3811cd3839c82e1de6d58ca7552c23a64b8946655f70780e",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/reach/tests.rs",
+      "sha256": "6af1e14237d600e6c69e32bdd06163c1b8e8fedd350f5df5261abea5d5f435bd",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/reach/handoff_tests.rs",
+      "sha256": "b6bc93413b9334603b34f4f2422db1a2dc1fc5751c784aec43e3b4fa6827c3a3",
+      "parser_exit": 0,
+      "stderr": ""
+    },
+    {
+      "path": "crates/kiln/src/reach/keeper.rs",
+      "sha256": "c67c23651fe40d8fb2574f375589acdbcb1e77985f2f5956e2bda7b0c57b9f45",
+      "parser_exit": 0,
+      "stderr": ""
+    }
+  ],
+  "diff_check_exit": 0,
+  "diff_check_output": "",
+  "rust_tests_executed": false
+}

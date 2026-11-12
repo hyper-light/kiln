@@ -628,7 +628,7 @@ it acts for (`crate::mcp::whose`). A child is its parent's person's.
 |---|---|
 | The owner, or a person with `agents.manage` (the `maintainer` role has it) | every session: lists, reads, watches, commands and closes it |
 | Any other person | their own sessions, their children included, as fully; no other |
-| An agent | itself and the agents it started (and theirs), to steer, interrupt and end; it sees (lists, reads, watches) the other agents that work for its person, and may send them queued messages ("Messages between agents") |
+| An agent | itself and the agents it started (and theirs), to control, interrupt and end; it sees (lists, reads, watches) the other agents that work for its person, and may send them steered or queued messages ("Messages between agents") |
 | A job, a peer | no session |
 
 A session a caller doesn't reach is one kiln doesn't run, as far as they can tell. It isn't in their
@@ -735,7 +735,9 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state}` (its state without the catalogs) |
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
 | `agents.about` | `POST /api/harness/agents/:id/about` | `{path, code, line?, end_line?, selection?, change?, question?, now?}` → `{agents: [Agent], itself}`: a child of the agent, reading only, answers what a person tapped in its conversation (a name, a line, a change) in four parts (what it is, what it does here, where else it's used, what's worth knowing); when the agent runs no subagents (`max_subagents` 0) it answers itself (`itself: true`, `sent` as `agents.send` answers), after its turn or with `now` between its steps. The child is a helper (`helper: "about"` on it): no row of Mission Control, its parent not told of it, ended once no card has read it (`agents.result`) for 90 seconds |
-| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?}` (or the `Idempotency-Key` header) → `{sent, message, accepted?}`: `accepted` is the agent's inbox's answer, `repeat` on every one after the first ("Sending again", below) |
+| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?, status?: {key, task?}}` (or the `Idempotency-Key` header) → durable receipt `{sent: true, retained: true, message, id, revision, generation, disposition, repeat}`: retained custody is separate from actual model consumption; mode defaults to `steer` for agents, `queue` for people ("Sending again" and "Replaceable progress", below) |
+| `agents.messages` | `GET /api/harness/agents/:id/messages` | `{from?, status_key?, task?, after?, bytes?}` → byte-bounded `{items, next}` of accepted originals, including superseded statuses; another sender's incoming history requires permission to see the recipient conversation |
+| `agents.message_body` | `GET /api/harness/agents/:id/message-body` | `{revision, from?, path?, offset?, bytes?}` → bounded original-value inspection: JSON-pointer object keys, array length, scalar or UTF-8 string range; `/$transfers` inspects custody-transfer receipts |
 | `agents.wait` | `POST /api/harness/agents/wait` | `{agent?` or `agents?` (a list, or `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?}` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
@@ -809,23 +811,49 @@ agent that can't start there.
 A message's id is made once, by whoever sends it, and every retry carries it: the agent's inbox
 takes each id once (docs/sends.md). Give `agents.send` a `key` of yours (1 to 256 bytes; over HTTP
 the `Idempotency-Key` header does too) and a call with the same key is the same message: the agent
-gets it once, and every call is answered as the first was, `accepted.repeat` on the ones after.
+gets it once, and every call names the same committed publication, `repeat` on the ones after.
 A key is its caller's: an agent's is the same on whichever machine it runs, so its retry after it
 moves is the same message. Without a key, each call is a message of its own. A key given to other
 words is refused (409). From a kiln shell: `kiln agents send <id> --key <key> <text>`.
+Use `--queue`, `--steer` or `--now` to choose the mode explicitly.
 
 ### Messages between agents
 
 Agents that work for the same person can talk to each other, whoever started them: any of them may
-send any other a queued message (`agents.send`, `queue`). Agents a person started apart (one on
-kiln, one on Mantle, one on Focal) work things out between them, without the person carrying notes.
-The message reaches its receiver after its turn, as one from a fellow agent, never as its person's:
+send any other a message (`agents.send`), steered into its turn by default (`steer`), or after
+its turn when explicitly queued (`queue`). A person's default remains `queue`.
+Agents a person started apart (one on kiln, one on Mantle, one on Focal) work things out between
+them, without the person carrying notes.
+The message reaches its receiver as one from a fellow agent, never as its person's:
 "Agent “Mantle” (01a14887, claude on adas-macbook-pro-2.local), which works for the same person as
 you, sent this message. It's from a fellow agent, not from your person. To answer, send it a
-message: agents_send {"agent": "…", "text": …}." A receiver in a long turn, waiting for its
-children (`agents_wait`), gets it at once, with the wait ("Waiting", below). Control stays with
-the agents an agent started: steering into a turn, sending now, interrupting, ending, and their
+message: agents_send {"agent": "…", "text": …}." Steering uses the harness's support for input
+during a turn; a harness without that support queues it. A receiver waiting for its children
+(`agents_wait`) gets queued messages with the wait ("Waiting", below). Control stays with
+the agents an agent started: sending now, interrupting, ending, and their
 goals and plan runs are theirs alone. Agents that work for different people aren't sent to.
+
+### Replaceable progress
+
+Use `status: {task, key}` only for progress whose latest pending value may replace an earlier
+value of the same purpose. The stream belongs to the authenticated sender and recipient;
+`task` is your workflow label, not source task routing or extra permission. For example:
+
+```json
+{"agent":"receiver-id","text":"The focused check is running.","key":"check-publication-1","status":{"task":"parser-fix","key":"validation"}}
+```
+
+A later changed progress report uses a new publication `key` and the same `status`. Retrying
+the same publication uses its original `key` and exact content. Every accepted original stays
+in `agents.messages`; only never-dispatched status presentation is replaced. A dispatched
+revision is frozen, and its latest successor waits for actual consumption. A retained receipt
+does not say that the model has read the message. Typed backpressure/storage failure means
+no custody was accepted, so keep the original and wait for the actual readiness event.
+
+Publish progress when it changes what the recipient can do. Send required policy readbacks once
+per task/policy revision; unchanged “still waiting” or build checkpoints do not need repeated
+messages. Instructions, requests for decisions and final results use ordinary distinct sends.
+Kiln never infers replaceability from those words or silently merges them.
 
 ### No more than its parent
 
@@ -836,8 +864,8 @@ goals and plan runs are theirs alone. Agents that work for different people aren
 | Its reach | a parent whose commands run only on its own machine (`reach` off) has children that run there too, with reach off |
 | Depth | at most `[agents] max_depth` (3) agents deep below the one a person started |
 | Children | as many subagents at work at once as its own settings say (Subagents → At once), one pool whatever each does: the agents it started that work, wait on a person or are held to a goal still to go on a stack that runs, and its harness's own still going; one idle with its work done, or ended, holds no place. None set: no limit, unless kiln's config sets `[agents] max_children` for every agent |
-| Messages | an agent may send a queued message to any agent that works for the same person, whoever started it (`agents.send`, `queue`): its receiver is told who sent it, that it isn't from its person, and how to answer ("Messages between agents") |
-| Steering | an agent steers into a turn, sends now, interrupts and ends only itself and the agents it started (and theirs); the same holds for their goals (`goals.add`, `goals.set`, `goals.control`, and the console's goal routes when an agent calls them) and for running a plan on an agent that runs (`plans.run` with `session`); it stops and retries only the plan runs it ran, or that the agents it started ran (`plans.runs.stop`, `plans.runs.retry`) |
+| Messages | an agent may send a steered (the default) or queued message to any agent that works for the same person, whoever started it (`agents.send`, `steer` or `queue`): its receiver is told who sent it, that it isn't from its person, and how to answer ("Messages between agents") |
+| Control | an agent sends now, interrupts and ends only itself and the agents it started (and theirs); the same holds for their goals (`goals.add`, `goals.set`, `goals.control`, and the console's goal routes when an agent calls them) and for running a plan on an agent that runs (`plans.run` with `session`); it stops and retries only the plan runs it ran, or that the agents it started ran (`plans.runs.stop`, `plans.runs.retry`) |
 | Plans | a plan run on a new agent (`plans.run` with `new`, any mode) starts it as `agents.start` would: the caller's child, under every rule above |
 
 The modes, harness by harness: Claude Code `plan` (plan), `default` and `dontAsk` (ask),
@@ -1814,6 +1842,108 @@ kiln's tests hold each to this with a stand-in ACP agent (`harness::acp`):
 `acp_bypass_still_held_to_limits`, `acp_session_perms_hold_own_requests`,
 `acp_opencode_children_are_subagents_in_the_tree`, `acp_nested_child_under_its_parent` and
 `acp_opencode_message_goes_by_its_parent`; the UI's in `ui/e2e/subagent-acp.spec.ts`.
+
+## Skills kiln installs
+
+An agent's Tools tab lists its skills: the packages kiln installed for it, and those its harness
+found on its own (its plugins too). **Add** takes skills from:
+
+- **a link**: a GitHub repository (`github.com/owner/repo`), a folder or file in one
+  (`…/tree/<branch>/<folder>`, `…/blob/<branch>/<file>`), or any git URL. kiln fetches it at one
+  commit with the server's git credentials (`[gitops]`), so private repositories it can reach work;
+- **a folder** on the agent's machine (`~` is that machine's home);
+- **an upload**: a `.zip`, a `.tar.gz` or one `.md`;
+- **words written in the page**: a name, when to use it, and its steps.
+
+kiln looks before it installs anything (`kiln_ci::skills`, pure). In order, the first that
+matches: a marketplace (`.claude-plugin/marketplace.json`, else `.cursor-plugin/`'s): its plugin
+by the name the link ends in, else its only one, else a choice; a plugin's manifest
+(`.claude-plugin/plugin.json`, `.cursor-plugin/`, `.codex-plugin/`, or agent-plugins.org's
+`plugin.json`): its `skills` (a folder or a list) and `agents`; every `SKILL.md` a few folders
+down, but under `deprecated`, `misc`, dot-folders and `node_modules`; or one Markdown file, a skill
+by its frontmatter. `cursor/plugins`' pstack is read from the copy its marketplace names for Claude
+Code; `mattpocock/skills` from its manifest's list; `t3dotgg/tstack` from its skill folders, with
+the tools its README's Requirements name.
+
+What it found shows before it installs: the package's name, version, commit and license; its
+skills and agents; its hooks and MCP servers, which run code on their own and are off until turned
+on; the setup each skill asks for on a machine (`uv sync` for a `pyproject.toml`, a venv and `pip`
+for a `requirements.txt`, `go build -o bin/ ./...` for a `go.mod`, `npm ci --ignore-scripts` for a
+`package.json`, `cargo build --release` for a `Cargo.toml`); and the tools it needs (setup's, a
+script's interpreter, a Requirements list). A package is installed **for this agent**, **for all my
+agents** (every agent that acts for the person who installed it, on every machine), or **for this
+repo** (every agent working in this agent's repository folder, on its machine). The same package
+installed again for the same scope replaces it. An agent installs nothing: every operation refuses
+an agent calling, and none is an agent's tool.
+
+A package is pinned to its commit (an upload's, folder's or written skill's: its content's digest),
+its files kept once each in kiln's store of bytes by their SHA-256 (`skills/files/<sha256>`). A
+link's branch is looked at again for a newer commit as the panel shows it, at most once each
+`[gitops] poll_seconds`; **Update** fetches it, keeping what was picked and whom it's for. A package
+turned off stays installed and no agent has it; **Remove** uninstalls it, and its files go once
+nothing holds them.
+
+Each machine with agents that have a package lays it out (`crate::skills::place`): the server says
+what's installed and which session has which (`ServerMsg::Skills`, to runners that name `skills`,
+docs/wire.md), the runner asks for the files it lacks (`AgentMsg::Skills` `want`,
+`ServerMsg::SkillFile`), keeps each once by its digest, lays each package out per installation and selection as a
+Claude Code plugin (`<agents>/skills/pkgs/<id>-<fingerprint>/`: `.claude-plugin/plugin.json`,
+`skills/<name>/`, `agents/<name>.md`, and `hooks/` and `.mcp.json` only when turned on), runs its
+setup there at a lower priority, a package's commands in turn, and checks for the tools it needs.
+Each says its state back: fetching, setting up, ready, needs a tool (what's missing, by machine:
+its skills are there anyway), or failed (why, and the last of its output). **Retry setup** repeats the
+installation of that commit after a failure or after its missing tool was installed. The server's own
+sessions are laid out by the server itself, beside its runner's, each letting go only of what
+neither holds.
+
+A Claude Code session loads a folder of plugins of its own (`<agents>/skills/sessions/<session>`,
+`--plugin-dir`, beside kiln's own skills), a link to each package it has. As installs change, its
+machine relinks it and tells it to load its plugins again (`reload_plugins`), so a running agent has
+a new package's skills at once, as `/<package>:<skill>`. A session gets them as it starts, once
+whose it is is known.
+
+Installed skills work in every structured harness. W20-R01's delivery bridge (`skills::bridge`)
+reads that session's package links on the blocking pool at actual prompt delivery, after holds and
+queueing. Normal turns receive the current skills' names, descriptions, and absolute SKILL.md paths
+for progressive discovery; a selected skill also carries its asset directory and user arguments.
+Codex registers that session's directory with process-local `skills/extraRoots/set` and holds
+queued turns until the registration is answered, then refreshes native discovery. A selected skill
+gets a native `skill` input item. The selected instructions also travel as text, so older Codex
+versions that lack root registration keep working through the portable path without native items.
+ACP agents
+(Devin, OpenCode, Gemini CLI, Goose, and Amp) and Antigravity get the selected instructions in their
+prompt transport. Images, resource links, message ids and queue semantics are retained. Skills
+remain readable while setup runs or needs repair. Disabling or removing a package updates the
+next delivered turn's catalogue, including a turn that was already queued. Nothing writes to the
+repository or a shared harness home, so agent/person/repository scopes stay isolated.
+
+| Harness | Installed skill delivery |
+|---|---|
+| Claude Code | Native plugin discovery and reload |
+| Codex | Process-local native discovery, native skill input items, portable fallback |
+| Devin, OpenCode, Gemini CLI, Goose, Amp | Scoped catalogue; instructions and asset directory over ACP |
+| Antigravity | Scoped catalogue; instructions and asset directory over headless stream-json |
+
+Python/Go/Node/Rust setup is independent of the harness. Agent definitions, hooks and package MCP
+configuration currently activate as Claude Code components; the UI says so for other harnesses,
+and never claims that these optional components have been translated. Future ACP harnesses inherit
+the portable delivery path. Codex's integration follows its [app-server protocol](https://learn.chatgpt.com/docs/app-server).
+A runner whose kiln is older says: "Upgrade kiln on <machine> to
+install skills".
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/skills?agent=` | `{packages, machine, installs, loads, native_components}`: the packages the agent has, each with its source, commit, skills, agents, hooks, MCP servers, setup, needs, scope, `on`, `update` (a newer commit) and its state on each machine it went to (`machines`) |
+| POST | `/api/skills/look` | `{agent, from: link\|folder\|write, link?, path?, plugin?, name?, description?, body?}`: what it holds, as a `draft` to install; a marketplace of several plugins answers `{choose}` |
+| POST | `/api/skills/upload?agent=&name=&plugin=` | the file's bytes (`.zip`, `.tar.gz`, `.md`): as `look` |
+| POST | `/api/skills` | `{agent, draft, scope: agent\|mine\|repo, picks: {skills, agents, hooks, mcp, setup}}`: installed |
+| PATCH | `/api/skills/:id` | `{on}` |
+| POST | `/api/skills/:id/update` | fetched again at its branch's commit now |
+| DELETE | `/api/skills/:id` | uninstalled |
+| GET | `/api/skills/:id/skills/:skill` | `{content}`: a skill's SKILL.md |
+
+Code mode has them as `kiln.skills.*` (`skills.list`, `skills.look`, `skills.install`, `skills.set`,
+`skills.update`, `skills.remove`, `skills.read`).
 
 ## Files in messages
 

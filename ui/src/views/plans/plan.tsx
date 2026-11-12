@@ -11,9 +11,9 @@
  */
 import * as React from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
-import { ApiError } from "@/api/client";
 import { clientId, harnessApi, type KindInfo } from "@/api/harness";
 import { plansApi, runHref, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan, type PlanStarted } from "@/api/plans";
+import { planRes } from "@/api/plan-resources";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -46,13 +46,8 @@ const tagList = (s: string) =>
 const kindsRes: Res<Record<string, KindInfo[]>> = { key: "harness/kinds", fetch: () => harnessApi.kindsAll(), opts: { pollMs: 60_000 } };
 
 /** "gone" for a plan that isn't there: trying again won't bring it. */
-const unlessGone = (e: unknown): "gone" => {
-  if (e instanceof ApiError && e.status === 404) return "gone";
-  throw e;
-};
 
 /** A plan; "gone" for one that isn't there (deleted, or a wrong link). */
-const planRes = (id: string): Res<Plan | "gone"> => ({ key: `plans/${id}`, fetch: (s) => plansApi.get(id, s).catch(unlessGone) });
 
 export default function PlanPage() {
   const { id = "" } = useParams();
@@ -506,7 +501,9 @@ function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; 
               ? `Approved instead (its goals waited on your review of it): its ${ran.sent} step${ran.sent === 1 ? "" : "s"} go to it as its goal's parts`
               : mode === "goals"
                 ? `${ran.sent} goal${ran.sent === 1 ? "" : "s"} lined up${ran.split ? `, ${ran.split} as goal stacks of their criteria and tests` : ""}`
-                : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`}{" "}
+                : ran.retained
+                  ? `${ran.retained} message${ran.retained === 1 ? "" : "s"} retained, waiting for receiver admission${ran.sent ? ` · ${ran.sent} sent` : ""}`
+                  : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`}{" "}
             · <Link to={`/agents/${encodeURIComponent(ran.session)}`}>open the agent</Link>
           </span>
         )}

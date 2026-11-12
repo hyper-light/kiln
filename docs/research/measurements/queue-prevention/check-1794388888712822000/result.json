@@ -1,0 +1,37 @@
+{
+  "exit_code": 101,
+  "source_unchanged": true,
+  "errors": [
+    {
+      "message": "cannot find type `Command` in this scope",
+      "rendered": "error[E0433]: cannot find type `Command` in this scope\n    --> crates/kiln/src/harness/ops.rs:1960:30\n     |\n1960 | ...   let command = || Command::Send { id: \"m1\".into(), text: \"hello\".into(), mode: Default::default(), attachments: Vec::new(), o...\n     |                        ^^^^^^^ use of undeclared type `Command`\n     |\nnote: these items exist but are inaccessible:\n      crate::workspace::slates::tests::Command\n    --> crates/kiln/src/discovery/bonjour.rs:344:1\n     |\n 344 | enum Command {\n     | ^^^^^^^^^^^^ `crate::discovery::bonjour::Command`: not accessible\n     |\n    ::: crates/kiln/src/frontdoor/runner.rs:69:1\n     |\n  69 | enum Command {\n     | ^^^^^^^^^^^^ `crate::frontdoor::runner::Command`: not accessible\n     |\n    ::: crates/kiln/src/setup/plan.rs:214:1\n     |\n 214 | pub struct Command {\n     | ^^^^^^^^^^^^^^^^^^ `crate::setup::plan::Command`: not accessible\nhelp: consider importing one of these items\n     |\n1387 +     use crate::ci::chat::Command;\n     |\n1387 +     use crate::harness::ops::Command;\n     |\n1387 +     use crate::reach::mcp::input::Command;\n     |\n1387 +     use std::process::Command;\n     |\n\n"
+    },
+    {
+      "message": "cannot find module or crate `libc` in this scope",
+      "rendered": "error[E0433]: cannot find module or crate `libc` in this scope\n    --> crates/kiln/src/harness/ops.rs:2059:84\n     |\n2059 |             let mut release = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&gate)?;\n     |                                                                                    ^^^^ use of unresolved module or unlinked crate `libc`\n     |\n     = help: if you wanted to use a crate named `libc`, use `cargo add libc` to add it to your `Cargo.toml`\n\n"
+    },
+    {
+      "message": "cannot move out of `port` because it is borrowed",
+      "rendered": "error[E0505]: cannot move out of `port` because it is borrowed\n    --> crates/kiln/src/goals/mod.rs:4539:23\n     |\n4531 | ...   let port = StatusSpy::new(Arc::new(clock.clone()));\n     |           ---- binding `port` declared here\n...\n4536 | ...   let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };\n     |                                                                                 ----- borrow of `port` occurs here\n...\n4539 | ...       .call(move |c| {\n     |                 ^^^^^^^^ move out of `port` occurs here\n...\n4543 | ...           port.assert_status_key();\n     |               ---- move occurs due to use in closure\n...\n4555 | ...   step(&d, id, true).await?;\n     |            -- borrow later used here\n     |\nnote: if `goals::StatusSpy` implemented `Clone`, you could clone the value\n    --> crates/kiln/src/goals/mod.rs:551:1\n     |\n 551 | struct StatusSpy {\n     | ^^^^^^^^^^^^^^^^ consider implementing `Clone` for this type\n...\n4536 |             let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner...\n     |                                                                                        ---- you could clone this value\n\n"
+    },
+    {
+      "message": "borrow of moved value: `port`",
+      "rendered": "error[E0382]: borrow of moved value: `port`\n    --> crates/kiln/src/goals/mod.rs:4548:33\n     |\n4531 |             let port = StatusSpy::new(Arc::new(clock.clone()));\n     |                 ---- move occurs because `port` has type `goals::StatusSpy`, which does not implement the `Copy` trait\n...\n4539 |                 .call(move |c| {\n     |                       -------- value moved into closure here\n...\n4543 |                     port.assert_status_key();\n     |                     ---- variable moved due to use in closure\n...\n4548 |             let (went, _) = say(&port, id, None, send(\"/goal clear\".into()), now).await;\n     |                                 ^^^^^ value borrowed here after move\n     |\nnote: if `goals::StatusSpy` implemented `Clone`, you could clone the value\n    --> crates/kiln/src/goals/mod.rs:551:1\n     |\n 551 | struct StatusSpy {\n     | ^^^^^^^^^^^^^^^^ consider implementing `Clone` for this type\n...\n4543 |                     port.assert_status_key();\n     |                     ---- you could clone this value\n\n"
+    }
+  ],
+  "free_before": 183540563968,
+  "free_after": 184937930752,
+  "command": [
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "test",
+    "--no-run",
+    "--locked",
+    "-p",
+    "kiln",
+    "--lib",
+    "--message-format=json"
+  ]
+}

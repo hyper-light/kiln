@@ -57,7 +57,7 @@ use super::ask::{self, Amounts, Ask, Peer, Sample};
 use super::keys::{FxMap, Interner};
 use super::line::{Item, Key, Line, Query};
 use super::link::Rtt;
-use super::msg::{Estimate, Place, Reason, ToOwner, Up, shortfall};
+use super::msg::{Estimate, How, Place, Reason, ToOwner, Up, shortfall};
 use crate::lb;
 use crate::facts::RunnerFacts;
 use crate::sched::routing::Constraint;
@@ -108,6 +108,33 @@ pub struct Settings {
     /// ((1 + 2η/n)-competitive in total completion time, η the predictions' total error: their
     /// bound for SPJF). Between tenants only standing counts.
     pub predicted_order: Option<PerMille>,
+    /// The node's owner draws a run's probes by learned weights (`[reach] learned_weights`; docs/lb.md
+    /// "Learned wait weights"; LB08, W05-R23): in proportion to one weight a runner, its CPUs until
+    /// learned, halved where the runs probed loaded it past twice the optimum's makespan in its
+    /// phase (Lattanzi, Lavastida, Moseley and Vassilvitskii, SODA 2020, Algorithm 1, that level
+    /// doubled as the runs show it's past it: Aspnes et al., J. ACM 1997), and at random again once
+    /// they aren't helping, saying so. Off: drawn at random, as before. Its owner's, read by
+    /// [`super::Owner::configure`]; the runner's admission doesn't read it.
+    pub learned_weights: bool,
+    /// The node's owner places ordinary asks that come in one step by the integer auction
+    /// (`[reach] auction`; docs/lb.md "The auction"; LB08, W05-R26): those of a kind the kernel can
+    /// start now go where their expected finishes total least (Bertsekas 1992), where their times
+    /// and the runners' measured speeds tell them apart; the rest as before. Off: one at a time.
+    /// Its owner's, read by [`super::Owner::configure`]; the runner's admission doesn't read it.
+    pub auction: bool,
+    /// Room tokens (`[reach] tokens`, docs/lb.md "Room tokens"; LB08, W05-R03): owners whose links
+    /// named `place.tokens` are told what they hold here, on placement's channel, each its own,
+    /// the room each run freed going back to the owner whose run it was; others keep hearing this
+    /// runner's hints. Off until declared.
+    pub tokens: bool,
+    /// The node's owner sends a run the kernel places back to where its kind of work (its ask's
+    /// key) last went well, when that runner is among the best by rank, and past the runner that
+    /// last let that kind down (`[reach] good_places`; docs/lb.md "Good places"; W05-R04,
+    /// W05-R23); a run's answer says when that was why. On by default, the user's exception to
+    /// opt-in automation (2026-11-11, docs/ci.md §0.3); off, runs take turns among equals, as
+    /// before. Its owner's, read by [`super::Owner::configure`]; the runner's admission doesn't
+    /// read it (it says how each kernel run ended either way).
+    pub good_places: bool,
 }
 
 impl Default for Settings {
@@ -124,6 +151,10 @@ impl Default for Settings {
             slots: 0,
             default_cost: None,
             predicted_order: None,
+            learned_weights: false,
+            auction: false,
+            tokens: false,
+            good_places: true,
         }
     }
 }
@@ -436,6 +467,10 @@ pub struct Admission {
     ends_at: Line,
     hard_ends: BTreeSet<(i64, u32)>,
     records: Records,
+    /// Each recorded run's ask, kept while its record is (LB03: a runner holding a run that ended
+    /// passes its ask, and with it its asker, to the node that adopts it, and keeps it on its disk
+    /// beside the record; the run's probe goes as it ends).
+    record_asks: BTreeMap<(String, u64, String), Arc<Ask>>,
     /// The first epoch whose records are kept on disk ([`Init::since`]), and the records changed
     /// since the shell last took them ([`Admission::record_changes`]).
     since: Option<u64>,
@@ -478,6 +513,9 @@ pub struct Admission {
     /// waits here ([`Self::sync_fast`]), so a run is counted once whichever path admits it.
     fast: lb::Runner,
     fast_out: lb::RunnerOut,
+    /// Under room tokens ([`Settings::tokens`]): the owners, by name, whose links named
+    /// `place.tokens` as the shell last said ([`Self::tokens_with`]).
+    token_links: BTreeSet<String>,
 }
 
 fn ix(s: u32) -> usize {
@@ -564,6 +602,7 @@ impl Admission {
             ends_at: Line::default(),
             hard_ends: BTreeSet::new(),
             records,
+            record_asks: BTreeMap::new(),
             kept: None,
             stale: false,
             promotions: BTreeMap::new(),
@@ -578,10 +617,14 @@ impl Admission {
             // The low half of its epoch: one per process as its epoch is (docs/lb.md, "Fences").
             fast: lb::Runner::new(lb::RunnerId(0), [0; ask::DIMS], epoch as u32),
             fast_out: Vec::new(),
+            token_links: BTreeSet::new(),
         };
+        let tokens = a.tokens_on();
+        a.fast.set_tokens(tokens);
         a.nodes.intern("");
         a.remeasure();
         a.sync_fast();
+        a.pace_kernel();
         let _ = now;
         a
     }
@@ -700,15 +743,22 @@ impl Admission {
             self.forgotten.remove(from.name);
         }
         let current = self.owner_ix.get(from.name).and_then(|v| v.last()).copied();
-        match current {
+        let retired = match current {
             Some((e, o)) if e == from.epoch => return Some(o),
             Some((e, _)) if e > from.epoch => return None,
-            Some((_, old)) => self.retire(old, from.name, from.epoch),
-            None => {}
-        }
+            Some((_, old)) => {
+                self.retire(old, from.name, from.epoch);
+                Some(old)
+            }
+            None => None,
+        };
         let o = u32::try_from(self.owners.len()).unwrap_or(u32::MAX);
         self.owners.push(OwnerAt { name: from.name.to_owned(), epoch: from.epoch, away: false, synced: false, runs: FxMap::default(), rtt: None });
         self.owner_ix.entry(from.name.to_owned()).or_default().push((from.epoch, o));
+        // A process its owner retired holds nothing of the room tokens' any more.
+        if let Some(old) = retired {
+            self.sync_owner(old);
+        }
         Some(o)
     }
 
@@ -716,10 +766,73 @@ impl Admission {
     /// every waiting run is told where it stands now.
     fn speaker(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Reply>) -> Option<u32> {
         let o = self.owner_for(from);
+        if let Some(o) = o {
+            self.sync_owner(o);
+        }
         if self.stale {
             self.boundaries(now, out);
         }
         o
+    }
+
+    /// The shell says whether owner `name`'s link names `place.tokens` (docs/lb.md "Room tokens";
+    /// LB08): only such an owner is told what it holds here, and hears this runner's words on
+    /// placement's channel. Read off its link on each of its words, so a new process of it is
+    /// asked again.
+    pub fn tokens_with(&mut self, name: &str, on: bool) {
+        if !self.tokens_on() || self.token_links.contains(name) == on {
+            return;
+        }
+        if on {
+            self.token_links.insert(name.to_owned());
+        } else {
+            self.token_links.remove(name);
+        }
+        if let Some(o) = self.current(name) {
+            self.sync_owner(o);
+        }
+    }
+
+    /// Whether owner `o` hears its words from this runner under room tokens (docs/lb.md "Room
+    /// tokens"; LB08): tokens are declared here, its link named them, it's its name's current
+    /// process and not gone from the directory, and its link is up. Any other owner hears hints.
+    fn hears_tokens(&self, o: u32) -> bool {
+        #[cfg(test)]
+        let (all, away, retired) = (super::mutant() == Some(super::Mutant::TokensToAll), super::mutant() == Some(super::Mutant::AwayHolds), super::mutant() == Some(super::Mutant::RetiredHolds));
+        #[cfg(not(test))]
+        let (all, away, retired) = (false, false, false);
+        self.tokens_on() && self.owner(o).is_some_and(|w| (!w.away || away) && (all || self.token_links.contains(&w.name)) && (retired || self.current(&w.name) == Some(o)) && !self.forgotten.contains(&w.name))
+    }
+
+    /// Whether room tokens are declared here (`[reach] tokens`, docs/lb.md "Room tokens"; LB08):
+    /// off until they are.
+    fn tokens_on(&self) -> bool {
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::TokensUndeclared) {
+            return true;
+        }
+        self.settings.tokens
+    }
+
+    /// Owner `o` in the kernel's ledger, as it stands (room tokens; docs/lb.md "Room tokens", LB08):
+    /// one that hears tokens is watched, and so told what it holds here; any other hears hints,
+    /// holding nothing, and a process retired or gone from the directory isn't watched at all (its
+    /// runs that go on end as any do, and the room they free is no one's). Nothing while tokens
+    /// aren't declared.
+    fn sync_owner(&mut self, o: u32) {
+        if !self.tokens_on() {
+            return;
+        }
+        let Some(w) = self.owner(o) else { return };
+        let gone = self.current(&w.name) != Some(o) || self.forgotten.contains(&w.name);
+        let tokens = self.hears_tokens(o);
+        let k = lb::OwnerId(o);
+        self.fast.hints_for(k, !tokens);
+        if tokens {
+            self.fast.watch(k);
+        } else if gone {
+            self.fast.unwatch(k);
+        }
     }
 
     /// The owner process of `name` in `epoch`, current or not.
@@ -1243,6 +1356,7 @@ impl Admission {
         self.admit(now, out);
         self.boundaries(now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     fn carried_in(&mut self, from: Peer<'_>, run: &str, ask: Option<&Ask>, elsewhere: i64) {
@@ -1548,44 +1662,99 @@ impl Admission {
         self.sync_fast();
     }
 
-    /// Whether the kernel may admit here now (docs/lb.md, "One ledger"): nothing waits in its line
-    /// (what comes then goes to probing, where the line's order, fair share and kept room decide),
-    /// it takes work (not draining, not under strain) and no run holds it whole.
-    fn takes_fast(&self) -> bool {
-        self.line.is_empty() && self.kept.is_none() && !self.draining && self.strained.is_none() && self.whole_claims == 0
+    /// Whether the kernel's room for a new run is this ledger's (docs/lb.md, "One ledger"):
+    /// nothing waits in its line (what comes then goes to probing, where the line's order, fair
+    /// share and kept room decide), no room is kept here, and no run holds it whole.
+    fn open_fast(&self) -> bool {
+        self.line.is_empty() && self.kept.is_none() && self.whole_claims == 0
+    }
+
+    /// Whether it takes no new work: draining (an upgrade pending, or its battery) or under strain.
+    /// Its kernel is cordoned so (docs/lb.md "Thermals and battery"): it admits nothing, its words
+    /// say no room, and under room tokens each owner's word says it holds none here.
+    fn cordoned(&self) -> bool {
+        self.draining || self.strained.is_some()
     }
 
     /// Keeps the kernel's ledger saying what this one has room for (docs/lb.md, "One ledger";
     /// W05-R03): its budget this runner's cap, its room for a new run what's free here for an
-    /// ordinary one while it [`Self::takes_fast`], else none. What this ledger holds that the
-    /// kernel didn't admit (claims offered, taken or running by probing, room kept, use measured
-    /// outside every claim) is the kernel's `outside`; what the kernel admitted is a claim here
-    /// too. So a run takes its room once in each, whichever path admitted it.
+    /// ordinary one while it's [`Self::open_fast`], else none, and cordoned while it takes no work
+    /// ([`Self::cordoned`]). What this ledger holds that the kernel didn't admit (claims offered,
+    /// taken or running by probing, room kept, use measured outside every claim) is the kernel's
+    /// `outside`; what the kernel admitted is a claim here too. So a run takes its room once in
+    /// each, whichever path admitted it.
     fn sync_fast(&mut self) {
         let cap = self.cap();
         if cap != self.fast.budget() {
             self.fast.set_budget(cap, &mut self.fast_out);
         }
-        let target = if self.takes_fast() { self.free_now() } else { [0; ask::DIMS] };
+        let target = if self.open_fast() { self.free_now() } else { [0; ask::DIMS] };
         let mut outside = [0u64; ask::DIMS];
         for ((o, f), t) in outside.iter_mut().zip(self.fast.free()).zip(target) {
             *o = f.saturating_sub(t);
         }
         self.fast.outside(outside, &mut self.fast_out);
+        let cordoned = self.cordoned();
+        self.fast.cordon(cordoned, &mut self.fast_out);
         // Its own line is never used (waiting is this ledger's): nothing it says here is news.
         self.fast_out.clear();
     }
 
     /// The kernel's word of its room, with its budget: what an owner's kernel picks by
-    /// (`place::msg::FastWord`).
+    /// (`place::msg::FastWord`), as every owner hears it (its hints carry this one).
     pub fn fast_word(&self) -> super::msg::FastWord {
         super::msg::FastWord::of(&self.fast.word(), self.fast.budget())
     }
 
-    /// The kernel's word as a decline not about room says it: none here for it, so its owner's
-    /// kernel doesn't pick it again before it next hears this runner's room.
-    fn fast_word_none(&self) -> super::msg::FastWord {
-        super::msg::FastWord { room: [0; ask::DIMS], whole: false, ..self.fast_word() }
+    /// The kernel's word to owner `o` (docs/lb.md "Room tokens"; LB08): one that hears tokens is
+    /// told what it holds here, written down as told (so it's owed a word once that changes);
+    /// any other, what every owner hears.
+    fn fast_word_for(&mut self, o: u32) -> super::msg::FastWord {
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::OneWord) {
+            return self.fast_word();
+        }
+        if !self.tokens_on() {
+            return self.fast_word();
+        }
+        let word = self.fast.say_to(lb::OwnerId(o));
+        super::msg::FastWord { tokens: self.hears_tokens(o), ..super::msg::FastWord::of(&word, self.fast.budget()) }
+    }
+
+    /// The kernel's word to owner `o` as a decline not about room says it: none here for it, so its
+    /// kernel doesn't pick this runner again before it next hears this runner's room.
+    fn fast_word_none_for(&mut self, o: u32) -> super::msg::FastWord {
+        super::msg::FastWord { room: [0; ask::DIMS], whole: false, ..self.fast_word_for(o) }
+    }
+
+    /// [`Self::fast_word_none_for`] for owner process `from`, as the shell's own declines say it
+    /// (a run its health bars here); one not heard from yet hears what every owner hears.
+    pub fn fast_word_none_to(&mut self, from: Peer<'_>) -> super::msg::FastWord {
+        match self.incarnation(from.name, from.epoch) {
+            Some(o) => self.fast_word_none_for(o),
+            None => super::msg::FastWord { room: [0; ask::DIMS], whole: false, ..self.fast_word() },
+        }
+    }
+
+    /// The words the kernel owes its owners under room tokens (docs/lb.md "Room tokens"; LB08):
+    /// to each owner that hears tokens and whose holding here changed without its hearing, what it
+    /// holds now, one word however many changes an input made. Owners that hear hints hear them
+    /// from this runner's hints, as ever.
+    fn tokens_out(&mut self, out: &mut Vec<Reply>) {
+        if !self.tokens_on() {
+            return;
+        }
+        let mut owed = std::mem::take(&mut self.fast_out);
+        owed.clear();
+        self.fast.drain(&mut owed);
+        for (o, m) in owed.drain(..) {
+            let lb::ToOwner::Hint { word, .. } = m else { continue };
+            if self.hears_tokens(o.0) {
+                let word = super::msg::FastWord { tokens: true, ..super::msg::FastWord::of(&word, self.fast.budget()) };
+                out.push(Reply { owner: o.0, token: 0, run: Arc::from(""), msg: Up::FastHint { word } });
+            }
+        }
+        self.fast_out = owed;
     }
 }
 
@@ -1596,6 +1765,9 @@ impl Admission {
     /// leg); a share fits in what's not held, never overcommitted; any other fits beside.
     fn can_start(&self, s: u32) -> bool {
         let Some(p) = self.get(s) else { return false };
+        if p.ask.needs.request.gpu > 0 && crate::sched::gpu::rank(&p.ask.needs, &self.facts, &self.labels, self.free_now()[3]).is_none() {
+            return false;
+        }
         if self.whole_claims > 0 {
             return false;
         }
@@ -1903,7 +2075,10 @@ impl Admission {
             State::Offered { .. } => self.say_offer(s, None, out),
             State::Taken { fence } => out.push(reply(Up::Held { fence })),
             State::Running { .. } => match self.get(s).and_then(|p| p.fast) {
-                Some((kernel, at)) => out.push(reply(Up::FastStarted { kernel, at, word: self.fast_word() })),
+                Some((kernel, at)) => {
+                    let word = self.fast_word_for(owner);
+                    out.push(reply(Up::FastStarted { kernel, at, word }));
+                }
                 None => out.push(reply(Up::Ran)),
             },
             State::Aside => out.push(reply(Up::Waiting { reason: Reason::Away, place: Place::default(), start: Estimate::default(), predicted, free: ask::resources(&self.free_now()), pace: self.sample.pace })),
@@ -1972,6 +2147,11 @@ impl Admission {
         started
     }
 
+    /// [`Self::fast_release_r`], its words as the wire has them.
+    pub fn fast_release(&mut self, from: Peer<'_>, epoch: u32, amount: lb::Amounts, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.fast_release_r(from, epoch, amount, now, r));
+    }
+
     pub fn spawned(&mut self, from: Peer<'_>, run: &str, out: &mut Vec<Said>) {
         self.wire(out, |a, r| a.spawned_r(from, run, r));
     }
@@ -1980,14 +2160,31 @@ impl Admission {
         self.wire(out, |a, r| a.ended_r(from, run, ok, now, r));
     }
 
+    /// [`Self::ended`] with its shell's judgment of how the run ended (docs/lb.md "Good places").
+    pub fn ended_as(&mut self, from: Peer<'_>, run: &str, ok: bool, how: How, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.ended_as_r(from, run, ok, how, now, r));
+    }
+
     pub fn measured(&mut self, sample: Sample, now: i64, out: &mut Vec<Said>) {
         self.wire(out, |a, r| a.measured_r(sample, now, r));
     }
 
-    /// Its pace as the shell measured it last (W05-R26): the words it says from now on carry it;
-    /// nothing it admits changes.
+    /// Its pace as the shell measured it last (W05-R26): the words it says from now on carry it,
+    /// its kernel's among them (its speed and slowness, what owners' kernels fold into its key
+    /// multiplier: docs/lb.md "Rank"); nothing it admits changes.
     pub fn paced(&mut self, pace: crate::pace::Pace) {
         self.sample.pace = pace;
+        self.pace_kernel();
+    }
+
+    /// Its kernel's word says its pace as measured (`lb::Runner::measure`): per-core speed and
+    /// slowness under contention, each in 1/1024, 0 not measured.
+    fn pace_kernel(&mut self) {
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::UnpacedKernel) {
+            return;
+        }
+        self.fast.measure(self.sample.pace.speed, self.sample.pace.slowness);
     }
 
     pub fn drain(&mut self, draining: bool, now: i64, out: &mut Vec<Said>) {
@@ -2039,7 +2236,11 @@ impl Admission {
     /// don't meet, more than kiln may place here even idle, or a gang (commands start together with
     /// docs/needs.md E5's gangs, not yet). A disk whose size isn't measured is no reason.
     fn never(&self, ask: &Ask) -> Option<String> {
+        if ask.needs.request.gpu > 0 && !crate::sched::gpu::could_match(&ask.needs, &self.facts, &self.labels) {
+            return Some("too few GPUs matching the model, vendor and memory requirements".into());
+        }
         for src in &ask.needs.requires {
+            if ask.needs.request.gpu > 0 { break; } // Checked jointly on each GPU above.
             match Constraint::parse(src) {
                 Ok(c) if c.eval(&self.facts, &self.labels) => {}
                 Ok(c) => {
@@ -2139,6 +2340,7 @@ impl Admission {
         self.begin(now, out);
         self.probe_in(from, ask.into(), token, predicted, now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     /// A probe of `ask` from owner `o` in a slot of its own, out of every line and holding nothing
@@ -2226,6 +2428,17 @@ impl Admission {
         if self.get(s).is_some_and(|p| p.state == State::Waiting && p.told.is_none()) {
             self.tell_if_changed(s, now, out);
         }
+        // An ordinary run that waits here for room is a run its owner's kernel had no room for:
+        // what the kernel's own Wait, queued here, would say (room tokens: a token another owner
+        // can't use is forwarded to this one; docs/lb.md "Room tokens", LB08). This line, not the
+        // kernel's, keeps it: the kernel only hears who waited.
+        #[cfg(test)]
+        let noted = super::mutant() != Some(super::Mutant::NoWaited);
+        #[cfg(not(test))]
+        let noted = true;
+        if noted && self.get(s).is_some_and(|p| p.state == State::Waiting && kind_of(&p.ask) == Kind::Ordinary) && self.hears_tokens(o) {
+            self.fast.waited(lb::OwnerId(o));
+        }
     }
 
     /// The placement kernel's start of `ask` (docs/lb.md; W05-R03, W05-R23): admitted by the
@@ -2242,17 +2455,19 @@ impl Admission {
         let started = self.fast_in(from, ask, token, kernel, epoch, predicted, now, out);
         self.close(now);
         self.fresh_words(out.get_mut(mark..).unwrap_or_default());
+        self.tokens_out(out);
         started
     }
 
     /// The kernel's words said in an input carry its room as the input left it: what was offered,
-    /// held or freed after they were made is in it.
-    fn fresh_words(&self, said: &mut [Reply]) {
-        let now = self.fast_word();
+    /// held or freed after they were made is in it (each owner's, under room tokens, its own).
+    fn fresh_words(&mut self, said: &mut [Reply]) {
         for r in said {
-            match &mut r.msg {
-                Up::FastStarted { word, .. } | Up::FastEnded { word, .. } | Up::FastDeclined { why: lb::Why::Room | lb::Why::Epoch, word, .. } => *word = now,
-                _ => {}
+            if matches!(r.msg, Up::FastStarted { .. } | Up::FastEnded { .. } | Up::FastDeclined { why: lb::Why::Room | lb::Why::Epoch, .. }) {
+                let now = self.fast_word_for(r.owner);
+                if let Up::FastStarted { word, .. } | Up::FastEnded { word, .. } | Up::FastDeclined { word, .. } = &mut r.msg {
+                    *word = now;
+                }
             }
         }
     }
@@ -2266,16 +2481,19 @@ impl Admission {
         // Said again (its link came back, or its owner's start was): what it is here, said again.
         if let Some(s) = self.owner(o).and_then(|w| w.runs.get(ask.run.as_str())).copied() {
             if let Some(Probe { fast: Some((_, at)), state: State::Running { .. }, .. }) = self.get(s) {
-                let word = self.fast_word();
-                out.push(Reply { owner: o, token, run, msg: Up::FastStarted { kernel, at: *at, word } });
+                let at = *at;
+                let word = self.fast_word_for(o);
+                out.push(Reply { owner: o, token, run, msg: Up::FastStarted { kernel, at, word } });
                 return Some(Start::Already);
             }
-            out.push(Reply { owner: o, token, run, msg: Up::FastDeclined { kernel, why: lb::Why::Gone, word: self.fast_word_none() } });
+            let word = self.fast_word_none_for(o);
+            out.push(Reply { owner: o, token, run, msg: Up::FastDeclined { kernel, why: lb::Why::Gone, word } });
             return None;
         }
         if let Some(r) = self.record(from.name, from.epoch, &ask.run) {
             let msg = match r.ended {
-                Some(ok) => Up::FastEnded { kernel, ok, word: self.fast_word() },
+                // Said again as its link came back: its shell's judgment isn't kept with its record.
+                Some(ok) => Up::FastEnded { kernel, ok, word: self.fast_word_for(o), how: How::Unsaid },
                 None => Up::Ran,
             };
             out.push(Reply { owner: o, token, run, msg });
@@ -2283,14 +2501,22 @@ impl Admission {
         }
         // Not this ledger's kind of ordinary run, or one this runner never takes: none here for it.
         if kind_of(&ask) != Kind::Ordinary || self.never(&ask).is_some() {
-            out.push(Reply { owner: o, token, run, msg: Up::FastDeclined { kernel, why: lb::Why::Never, word: self.fast_word_none() } });
+            let word = self.fast_word_none_for(o);
+            out.push(Reply { owner: o, token, run, msg: Up::FastDeclined { kernel, why: lb::Why::Never, word } });
             return None;
         }
         let need = ask::amounts(&ask.needs.request);
-        let at = match self.fast.start(lb::Start { owner: lb::OwnerId(o), run: kernel, epoch, need }) {
-            lb::ToOwner::Started { at, .. } => at,
-            lb::ToOwner::Declined { why, word, .. } => {
-                let word = super::msg::FastWord::of(&word, self.fast.budget());
+        if need[3] > 0 && crate::sched::gpu::rank(&ask.needs, &self.facts, &self.labels, self.free_now()[3]).is_none() {
+            let word = self.fast_word_for(o);
+            out.push(Reply { owner: o, token, run, msg: Up::FastDeclined { kernel, why: lb::Why::Room, word } });
+            return None;
+        }
+        // Through its word, so a start under room tokens comes out of its owner's token first.
+        let answer = self.fast.hear(lb::ToRunner::Start(lb::Start { owner: lb::OwnerId(o), run: kernel, epoch, need }), &mut self.fast_out);
+        let at = match answer {
+            Some(lb::ToOwner::Started { at, .. }) => at,
+            Some(lb::ToOwner::Declined { why, .. }) => {
+                let word = self.fast_word_for(o);
                 out.push(Reply { owner: o, token, run, msg: Up::FastDeclined { kernel, why, word } });
                 return None;
             }
@@ -2304,9 +2530,30 @@ impl Admission {
         }
         self.claim(s, now);
         self.charge(s, now);
+        // W05-R25: kernel starts must reach the shell's commit-before-spawn journal too.
+        self.changed.insert((from.name.to_owned(), from.epoch, run.to_string()));
         let record = Record { fence, ended: None };
         self.records.entry(from.name.to_owned()).or_default().entry(from.epoch).or_default().insert(run.to_string(), record);
+        if let Some(p) = self.get(s) {
+            self.record_asks.insert((from.name.to_owned(), from.epoch, run.to_string()), Arc::clone(&p.ask));
+        }
         Some(Start::New)
+    }
+
+    /// Owner `from` gives back `amount` of what it holds here under room tokens, as a word of this
+    /// runner's said another owner's run waits here and none of its own does (docs/lb.md "Room
+    /// tokens"; LB08): forwarded once to the owner whose run last waited here, each of the two then
+    /// told what it holds. Under this runner's epoch `epoch` only, and from an owner that hears
+    /// tokens here.
+    pub fn fast_release_r(&mut self, from: Peer<'_>, epoch: u32, amount: lb::Amounts, now: i64, out: &mut Vec<Reply>) {
+        self.begin(now, out);
+        if let Some(o) = self.speaker(from, now, out)
+            && self.hears_tokens(o)
+        {
+            let _ = self.fast.hear(lb::ToRunner::Release { owner: lb::OwnerId(o), epoch, amount }, &mut self.fast_out);
+        }
+        self.close(now);
+        self.tokens_out(out);
     }
 
     /// A run the kernel admitted here leaves its ledger (ended, or dropped with its owner): the
@@ -2325,6 +2572,7 @@ impl Admission {
         self.begin(now, out);
         self.withdraw_in(from, run, now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     fn withdraw_in(&mut self, from: Peer<'_>, run: &str, now: i64, out: &mut Vec<Reply>) {
@@ -2348,6 +2596,7 @@ impl Admission {
         self.admit(now, out);
         self.boundaries(now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     fn take_in(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Reply>) {
@@ -2379,6 +2628,7 @@ impl Admission {
         self.begin(now, out);
         self.decline_in(from, run, fence, now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     fn decline_in(&mut self, from: Peer<'_>, run: &str, fence: Fence, now: i64, out: &mut Vec<Reply>) {
@@ -2405,6 +2655,7 @@ impl Admission {
         self.admit(now, out);
         self.boundaries(now, out);
         self.close(now);
+        self.tokens_out(out);
         started
     }
 
@@ -2448,6 +2699,9 @@ impl Admission {
         }
         let record = Record { fence, ended: None };
         self.changed.insert((from.name.to_owned(), from.epoch, run.to_owned()));
+        if let Some(p) = self.get(s) {
+            self.record_asks.insert((from.name.to_owned(), from.epoch, run.to_owned()), Arc::clone(&p.ask));
+        }
         match self.records.get_mut(from.name) {
             Some(by_epoch) => {
                 by_epoch.entry(from.epoch).or_default().insert(run.to_owned(), record);
@@ -2466,7 +2720,7 @@ impl Admission {
         let fast = self.get(s).and_then(|p| p.fast);
         if let Some((owner, token, run)) = self.told_owner(s) {
             let msg = match fast {
-                Some((kernel, at)) => Up::FastStarted { kernel, at, word: self.fast_word() },
+                Some((kernel, at)) => Up::FastStarted { kernel, at, word: self.fast_word_for(owner) },
                 None => Up::Started { fence },
             };
             out.push(Reply { owner, token, run, msg });
@@ -2502,14 +2756,21 @@ impl Admission {
     /// A run it started ended (`ok`: its process exited; not: it couldn't start, or was lost): its
     /// room is free in the same input, its tenant charged what it ran, and its owner told.
     pub fn ended_r(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Reply>) {
-        let mark = out.len();
-        self.begin(now, out);
-        self.ended_in(from, run, ok, now, out);
-        self.close(now);
-        self.fresh_words(out.get_mut(mark..).unwrap_or_default());
+        self.ended_as_r(from, run, ok, How::Unsaid, now, out);
     }
 
-    fn ended_in(&mut self, from: Peer<'_>, run: &str, ok: bool, now: i64, out: &mut Vec<Reply>) {
+    /// [`Self::ended_r`] with its shell's judgment of how the run ended: said to its owner with
+    /// a kernel run's end, and of no other (a claim's end is answered as before).
+    pub fn ended_as_r(&mut self, from: Peer<'_>, run: &str, ok: bool, how: How, now: i64, out: &mut Vec<Reply>) {
+        let mark = out.len();
+        self.begin(now, out);
+        self.ended_in(from, run, ok, how, now, out);
+        self.close(now);
+        self.fresh_words(out.get_mut(mark..).unwrap_or_default());
+        self.tokens_out(out);
+    }
+
+    fn ended_in(&mut self, from: Peer<'_>, run: &str, ok: bool, how: How, now: i64, out: &mut Vec<Reply>) {
         let Some(s) = self.find(from, run) else { return };
         let Some(State::Running { fence, .. }) = self.state(s) else { return };
         // From its dispatch, as the engine settles a grant.
@@ -2527,8 +2788,8 @@ impl Admission {
         self.drop_probe(s);
         if let Some((owner, token, run)) = to {
             let msg = match (kernel, ended) {
-                (Some(kernel), Some(word)) => Up::FastEnded { kernel, ok, word: super::msg::FastWord::of(&word, self.fast.budget()) },
-                (Some(kernel), None) => Up::FastEnded { kernel, ok, word: self.fast_word() },
+                (Some(kernel), Some(word)) => Up::FastEnded { kernel, ok, word: super::msg::FastWord::of(&word, self.fast.budget()), how },
+                (Some(kernel), None) => Up::FastEnded { kernel, ok, word: self.fast_word(), how },
                 _ => Up::Ended { fence, ok },
             };
             out.push(Reply { owner, token, run, msg });
@@ -2551,6 +2812,7 @@ impl Admission {
         for e in epochs {
             if let Some(runs) = by_epoch.get_mut(&e) {
                 runs.remove(run);
+                self.record_asks.remove(&(from.name.to_owned(), e, run.to_owned()));
                 self.changed.insert((from.name.to_owned(), e, run.to_owned()));
                 if runs.is_empty() {
                     by_epoch.remove(&e);
@@ -2600,6 +2862,7 @@ impl Admission {
             self.boundaries(now, out);
         }
         self.close(now);
+        self.tokens_out(out);
     }
 
     /// A run this runner's process before this one started, whose process goes on under this one
@@ -2652,6 +2915,14 @@ impl Admission {
         self.forgot = forgot;
     }
 
+    /// The asks its disk kept beside the records it restored (LB03), each by its owner, the owner's
+    /// epoch and its run.
+    pub fn restore_record_asks(&mut self, asks: impl IntoIterator<Item = ((String, u64, String), Ask)>) {
+        for (key, ask) in asks {
+            self.record_asks.insert(key, Arc::new(ask));
+        }
+    }
+
     /// The owners forgotten with records since this was last asked, and this runner's epoch then,
     /// for the shell to keep.
     pub fn forgot_changes(&mut self) -> Vec<(String, u64)> {
@@ -2677,16 +2948,30 @@ impl Admission {
             .into_iter()
             .map(|(owner, epoch, run)| {
                 let rec = self.record(&owner, epoch, &run);
-                let ask = self.find(Peer { name: &owner, epoch }, &run).and_then(|s| self.get(s)).map(|p| Arc::clone(&p.ask));
+                let key = (owner.clone(), epoch, run.clone());
+                let ask = self.find(Peer { name: &owner, epoch }, &run).and_then(|s| self.get(s)).map(|p| Arc::clone(&p.ask)).or_else(|| self.record_asks.get(&key).cloned());
+                if rec.is_none() {
+                    self.record_asks.remove(&key);
+                }
                 (owner, epoch, run, rec, ask)
             })
             .collect()
+    }
+
+    /// W13-R01: refreshed inventory, preserving every live reservation.
+    pub fn refreshed(&mut self, facts: RunnerFacts, labels: Vec<String>, now: i64, out: &mut Vec<Said>) {
+        self.facts = facts;
+        self.labels = labels;
+        let mut sample = self.sample.clone();
+        sample.size.gpu = u32::try_from(self.facts.gpus.len()).unwrap_or(u32::MAX);
+        self.measured(sample, now, out);
     }
 
     /// A new sample: the room is worked out again, and what now fits is offered.
     pub fn measured_r(&mut self, sample: Sample, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         self.sample = sample;
+        self.pace_kernel();
         let mut own = [0; ask::DIMS];
         for u in &self.sample.runs {
             if let Some(s) = self.find(Peer { name: &u.owner, epoch: u.epoch }, &u.run)
@@ -2701,6 +2986,7 @@ impl Admission {
         self.admit(now, out);
         self.boundaries(now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     /// Its machine under strain (`why`), or not (AUDIT L1, as the shell measured it at decision
@@ -2720,6 +3006,7 @@ impl Admission {
         self.admit(now, out);
         self.tell_all(now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     /// Draining (an upgrade pending) or not: draining, it offers nothing new.
@@ -2729,6 +3016,7 @@ impl Admission {
         self.admit(now, out);
         self.tell_all(now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     /// An owner's link went down: its probes leave the line, offered nothing, an offer it hadn't
@@ -2738,6 +3026,7 @@ impl Admission {
         self.begin(now, out);
         self.away_in(name, now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     fn away_in(&mut self, name: &str, now: i64, out: &mut Vec<Reply>) {
@@ -2749,6 +3038,8 @@ impl Admission {
             }
             None => return,
         };
+        // Its words can't reach it: what it held is no one's while it's away (room tokens).
+        self.sync_owner(o);
         for s in slots {
             match self.state(s) {
                 Some(State::Waiting) => {
@@ -2775,6 +3066,7 @@ impl Admission {
         self.begin(now, out);
         self.back_in(from, now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     fn back_in(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Reply>) {
@@ -2786,6 +3078,8 @@ impl Admission {
             }
             None => return,
         };
+        // It hears its own words again (room tokens): told what it holds here, if that's changed.
+        self.sync_owner(o);
         for s in &slots {
             if self.state(*s) == Some(State::Aside) {
                 self.enter(*s);
@@ -2814,6 +3108,7 @@ impl Admission {
         if let Some(runs) = by_epoch.get_mut(&epoch)
             && runs.remove(run).is_some()
         {
+            self.record_asks.remove(&(owner.to_owned(), epoch, run.to_owned()));
             self.changed.insert((owner.to_owned(), epoch, run.to_owned()));
             if runs.is_empty() {
                 by_epoch.remove(&epoch);
@@ -2841,6 +3136,8 @@ impl Admission {
         self.forgotten.insert(name.to_owned());
         let incarnations: Vec<u32> = self.owner_ix.get(name).map(|v| v.iter().map(|(_, o)| *o).collect()).unwrap_or_default();
         for o in incarnations {
+            // Nothing of its holds any room tokens from now.
+            self.sync_owner(o);
             let slots: Vec<u32> = self.owner(o).map(|w| w.runs.values().copied().collect()).unwrap_or_default();
             for s in slots {
                 if !matches!(self.state(s), Some(State::Running { .. })) {
@@ -2852,6 +3149,7 @@ impl Admission {
         self.admit(now, out);
         self.boundaries(now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     /// The link to an owner measured again (its round trip, RFC 6298): what its offers are held by.
@@ -2869,6 +3167,7 @@ impl Admission {
         self.begin(now, out);
         self.predict_in(from, run, predicted, now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     fn predict_in(&mut self, from: Peer<'_>, run: &str, predicted: Option<Ms>, now: i64, out: &mut Vec<Reply>) {
@@ -2919,6 +3218,7 @@ impl Admission {
         self.admit(now, out);
         self.boundaries(now, out);
         self.close(now);
+        self.tokens_out(out);
     }
 
     /// When it's to be told the time again ([`Self::tick`]): the soonest offer to lapse or
@@ -2938,7 +3238,8 @@ impl Admission {
     pub fn holding(&self, from: Peer<'_>, run: &str) -> Option<super::handoff::Held> {
         use super::handoff::Held;
         let probe = self.find(from, run).and_then(|s| self.get(s));
-        let ask = probe.map(|p| (*p.ask).clone());
+        // Its probe's, while it has one; its record's once it ended (its probe gone with it).
+        let ask = probe.map(|p| (*p.ask).clone()).or_else(|| self.record_asks.get(&(from.name.to_owned(), from.epoch, run.to_owned())).map(|a| (**a).clone()));
         if let Some(r) = self.record(from.name, from.epoch, run) {
             return Some(match r.ended {
                 None => Held::Running { fence: r.fence, ask },

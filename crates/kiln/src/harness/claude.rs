@@ -302,6 +302,9 @@ pub struct Claude {
 }
 
 impl Claude {
+    pub(crate) fn retained_input_ids(&self) -> Vec<super::admission::LegacyFlight> {
+        self.inflight.iter().cloned().chain(self.relays.values().flat_map(|ids| ids.iter().cloned())).chain(self.relay_calls.values().map(|(_, id)| id.clone())).collect::<std::collections::BTreeSet<_>>().into_iter().map(|id| super::admission::LegacyFlight { id, protocol: super::admission::FlightProtocol::Claude, request: None }).collect()
+    }
     pub fn new(allow_bypass: bool) -> Self {
         Self {
             next_req: 0,
@@ -762,6 +765,9 @@ impl Claude {
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         match cmd {
+            Command::Admit { token, epoch, .. } | Command::MailAck { token, epoch, .. } => core.refuse_owner_mail(Some(token), epoch),
+            Command::MailPeers { epoch, .. } => core.refuse_owner_mail(None, epoch),
+            Command::MailHandoff { client, .. } => { let epoch = core.state.epoch; core.refuse_owner_mail(None, epoch); core.reply(client, serde_json::json!({"error":{"code":super::state_view::Error::Unreadable}})); },
             Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to }, mode),
             Command::QueueEdit { id, text, attachments } => {
                 if let Some(q) = core.state.queue.iter_mut().find(|q| q.id == id) {
@@ -901,6 +907,8 @@ impl Claude {
                 self.run(core, Run::McpRemove { name, client }, a);
             }
             Command::SkillView { name, client } => self.skill_view(core, &name, client),
+            Command::StateRead { client, .. } => core.reply(client, json!({"error": {"code": super::state_view::Error::Unreadable}})),
+            Command::AtState { client, .. } => core.reply(client, json!({"error": {"code": super::state_view::Error::Unreadable}})),
             Command::SkillRun { name, args, id, mode } => {
                 let name = name.trim().trim_start_matches('/').to_owned();
                 if name.is_empty() {
@@ -912,7 +920,7 @@ impl Claude {
                 };
                 self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, mode);
             }
-            Command::SkillsReload => self.request(core, Pending::ReloadSkills, json!({"subtype": "reload_skills"})),
+            Command::SkillsReload => { core.skills_changed(); self.request(core, Pending::ReloadSkills, json!({"subtype": "reload_skills"})); }
         }
     }
 
@@ -2901,6 +2909,10 @@ impl Claude {
         let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         let mut text = content_text(block.get("content"));
         let (name, input) = self.tools.get(tid).cloned().unwrap_or_default();
+        if !is_error && name == "mcp__kiln__agents_wait" && core.get(tid).is_some_and(|event| event.parent.is_none()) {
+            core.observe_handoff_result(tid, structured);
+            if text.len() <= super::state_view::FRAME && let Ok(result) = serde_json::from_str::<Value>(&text) { core.observe_handoff_result(tid, &result); }
+        }
         // A command now running in the background: its task's output file.
         if let Some((task, file)) = background_of(&text, structured) {
             match core.state.tasks.iter_mut().find(|t| t.id == task || t.tool_id.as_deref() == Some(tid)) {
@@ -3122,6 +3134,18 @@ impl Claude {
             ("success", Some(s)) => ("cut", Some(s)),
             (s, _) => ("cut", Some(s)),
         };
+        // Lifecycle Started precedes the input builder and can be followed by a dead turn.
+        // Use the native successful real-work result's explicit original IDs as one batch.
+        if how == "done" && str_of(v, "terminal_reason") == Some("completed") && v.get("is_error").and_then(Value::as_bool) == Some(false)
+            && v.get("num_turns").and_then(Value::as_u64).is_some_and(|turns| turns > 0)
+            && v.get("duration_api_ms").and_then(Value::as_u64).is_some_and(|elapsed| elapsed > 0)
+        {
+            let ids: Vec<&str> = match v.get("user_message_uuids").and_then(Value::as_array) {
+                Some(ids) => ids.iter().filter_map(Value::as_str).collect(),
+                None => str_of(v, "user_message_uuid").into_iter().collect(),
+            };
+            core.inputs_consumed(&ids, super::admission::Consumption::ProviderCompleted);
+        }
         core.end_turn(started, how, why);
         // A goal it pursued: how it came out is in the transcript.
         if core.state.objective.as_ref().is_some_and(|o| o.status == "active")
@@ -3187,7 +3211,8 @@ impl Claude {
         if state == Delivery::Started {
             self.begin(core);
         }
-        if core.state.delivery.contains_key(id) {
+        let retained = state == Delivery::Cancelled && core.input_retained(id);
+        if !retained && core.state.delivery.contains_key(id) {
             core.state.delivery.insert(id.to_owned(), state);
             core.touch_state();
         }

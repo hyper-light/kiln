@@ -76,20 +76,34 @@ fn first_epoch(port: u16, admin: &str, id: &str) -> anyhow::Result<u64> {
     })
 }
 
-/// Once kiln keeps runner `name`'s copy of the stand-in harness's own record of a session
+/// Once kiln keeps the stand-in harness's own record of a session
 /// (Claude Code's, under `<dir>/home/.claude`), which a resume from kiln's copy carries: the record
-/// written, then the runner's store said to be in step with the server's after its follower can
-/// have found the record (`convo::record` looks for one every 15 s) and the runner said so (every
-/// 5 s).
-fn record_kept(dir: &Path, port: u16, admin: &str, name: &str) -> anyhow::Result<()> {
+/// written, then its complete lines received in the server's store. W27-R08: reports are sent on
+/// commits, so waiting for a report with a future timestamp doesn't prove that the record arrived.
+fn record_kept(dir: &Path, port: u16, admin: &str, id: &str) -> anyhow::Result<()> {
     record_written(dir)?;
-    let after = kiln::util::now_ms() + 25_000;
+    let own = until(Duration::from_secs(60), || {
+        let (st, body) = http(port, "GET", &format!("/api/harness/sessions/{id}"), admin, None)?;
+        anyhow::ensure!(st == 200, "{st} {body}");
+        let info: Value = serde_json::from_str(&body)?;
+        Ok(info.get("harness_session").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned))
+    })?;
+    let projects = dir.join("home/.claude/projects");
+    let end = until(Duration::from_secs(60), || {
+        for entry in std::fs::read_dir(&projects)?.flatten() {
+            if let Ok(bytes) = std::fs::read(entry.path().join(format!("{own}.jsonl")))
+                && let Some(end) = bytes.iter().rposition(|b| *b == b'\n')
+            {
+                return Ok(Some(u64::try_from(end + 1)?));
+            }
+        }
+        Ok(None)
+    })?;
     until(Duration::from_secs(120), || {
-        let (st, body) = http(port, "GET", "/api/conversations/status", admin, None)?;
+        let (st, body) = http(port, "GET", &format!("/api/harness/sessions/{id}/transcripts?records=1"), admin, None)?;
         anyhow::ensure!(st == 200, "{st} {body}");
         let v: Value = serde_json::from_str(&body)?;
-        let stores = v.get("stores").and_then(Value::as_array).cloned().unwrap_or_default();
-        Ok(stores.iter().any(|s| field(s, "machine") == machine(name) && field(s, "role") == "runner" && field(s, "state") == "in_sync" && s.get("heard").and_then(Value::as_i64).is_some_and(|h| h >= after)).then_some(()))
+        Ok(v.get("records").and_then(Value::as_array).is_some_and(|records| records.iter().any(|r| field(r, "source") == own && r.get("end").and_then(Value::as_u64).is_some_and(|kept| kept >= end))).then_some(()))
     })
 }
 
@@ -253,7 +267,7 @@ fn w27_r08_a_session_resumed_from_kilns_copy_is_kilns_take() -> anyhow::Result<(
     std::fs::create_dir_all(&cwd)?;
     let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
     let e0 = first_epoch(port, admin, &id)?;
-    record_kept(dir.path(), port, admin, "box-a")?;
+    record_kept(dir.path(), port, admin, &id)?;
     // box-a goes away: the session goes on on box-b, from kiln's copy.
     drop(a);
     until(Duration::from_secs(60), || Ok((!connected(port, admin, "box-a")?).then_some(())))?;
@@ -501,7 +515,7 @@ fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
     let z1 = instance_with(dir.path(), port, "box-b", "z1", None, &env)?;
     chain_through(3, "taken over")?;
     // box-b away: it goes on on box-a, from kiln's copy.
-    record_kept(dir.path(), port, admin, "box-b").map_err(|e| anyhow::anyhow!("box-b's copy of the record: {e}: {}", said_of(dir.path(), port, admin, &id)))?;
+    record_kept(dir.path(), port, admin, &id).map_err(|e| anyhow::anyhow!("box-b's copy of the record: {e}: {}", said_of(dir.path(), port, admin, &id)))?;
     drop((z1, box_b));
     until(Duration::from_secs(120), || Ok((!connected(port, admin, "box-b")?).then_some(()))).map_err(|e| {
         let (_, agents) = http(port, "GET", "/api/agents", admin, None).unwrap_or_default();
@@ -728,7 +742,7 @@ fn w27_ac05_the_twin_played_again() -> anyhow::Result<()> {
     op(port, admin, "goals.add", &json!({"agent": id, "goals": [{"text": text}]}))?;
     let stack = op(port, admin, "goals.get", &json!({"agent": id}))?;
     let goal_id = stack.get("items").and_then(Value::as_array).and_then(|l| l.iter().find(|g| field(g, "text") == text)).map(|g| field(g, "id").to_owned()).ok_or_else(|| anyhow::anyhow!("no goal added: {stack}"))?;
-    record_kept(dir.path(), port, admin, "box-a")?;
+    record_kept(dir.path(), port, admin, &id)?;
     let copy: i64 = {
         let said = std::fs::read_to_string(cwd.join(".fake-claude-messages"))?;
         said.lines().find_map(|l| serde_json::from_str::<Value>(l).ok()?.get("pid")?.as_i64()).ok_or_else(|| anyhow::anyhow!("the copy's harness said no pid"))?
@@ -1606,8 +1620,8 @@ fn ask_as(dir: &Path, runner: &str, id: &str, name: &str, input: Value) -> anyho
 }
 
 /// A runner `name` connected to the server at `port`, its own identity certified, with a session
-/// open on it whose acts are signed (its identity at its first epoch certified): the runner and
-/// the session.
+/// open on it whose acts are signed (its identity at its first epoch certified, and its
+/// certificate kept by the runner process: [`kept`]): the runner and the session.
 fn signing_session(dir: &Path, port: u16, admin: &str, name: &str, chaos: Option<&str>) -> anyhow::Result<(agents::Runner, String)> {
     let (r, log) = agents::runner_with(dir, port, name, chaos, TALK, &[])?;
     agents::connected(port, admin, name, &log, Duration::from_secs(120))?;
@@ -1620,8 +1634,25 @@ fn signing_session(dir: &Path, port: u16, admin: &str, name: &str, chaos: Option
         Ok(v.get("identities").and_then(Value::as_array).is_some_and(|l| l.iter().any(|i| field(i, "subject").contains(&mark) && !field(i, "verified").is_empty())).then_some(()))
     })?;
     let id = agents::open_session(port, admin, name, &dir.join("work-here"), Duration::from_secs(60))?;
-    first_epoch(port, admin, &id)?;
+    let epoch = first_epoch(port, admin, &id)?;
+    kept(&log, &id, epoch)?;
     Ok((r, id))
+}
+
+/// Until the runner process whose log is `log` keeps session `id`'s certificate at `epoch` (it
+/// logs `identity certified`): only from then does it sign the session's acts. kiln lists the
+/// identity as soon as it certifies it, while its certificate is still on its way to that process
+/// (written and waited for on its disk first), and an act the process sends in between goes
+/// unsigned and is refused (W27-R08): what [`first_epoch`] alone let a loaded machine's test meet.
+fn kept(log: &Path, id: &str, epoch: u64) -> anyhow::Result<()> {
+    let mark = format!("/agent/{id}/epoch/{epoch}");
+    until(Duration::from_secs(60), || {
+        let said = std::fs::read_to_string(log)?;
+        // Its epoch whole: `…/epoch/1` isn't `…/epoch/10`.
+        let certified = |l: &str| l.contains("identity certified") && l.split_once(mark.as_str()).is_some_and(|(_, rest)| !rest.starts_with(|c: char| c.is_ascii_digit()));
+        Ok(said.lines().any(certified).then_some(()))
+    })
+    .map_err(|e| anyhow::anyhow!("session {id}'s certificate at epoch {epoch} wasn't kept by its runner process: {e}"))
 }
 
 /// W27-R08's relays (the Transfers plan's step 13): a runner relays its agent's calls to kiln. Each

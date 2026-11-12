@@ -121,6 +121,15 @@ pub trait Records: Send + Sync + 'static {
     /// Commits `tx`: every write at one new revision, or none (a condition failed). A transaction
     /// with no writes commits nothing and returns the head.
     fn commit<'a>(&'a self, tx: Tx) -> BoxFuture<'a, Result<Rev, Refusal>>;
+    /// Keeps the allocation owner with the queued transaction until its worker has dropped the
+    /// transaction and transient bindings, even when the requesting future is cancelled. An
+    /// implementation without that lifetime guarantee must refuse before enqueueing anything.
+    fn commit_owned<'a>(&'a self, tx: Tx, owner: Box<dyn Send + Sync>) -> BoxFuture<'a, Result<Rev, Refusal>> {
+        Box::pin(async move {
+            drop((tx, owner));
+            Err(Refusal::Unavailable("the records implementation cannot retain an owned commit".into()))
+        })
+    }
     /// Changes to `family` committed after `after`, oldest first, at most `limit`.
     fn changes<'a>(&'a self, family: &'a str, after: Rev, limit: usize) -> BoxFuture<'a, Result<Changes, Refusal>>;
     /// Completes with the newest revision of a change to `family` once there's one after `after`
@@ -444,6 +453,12 @@ impl Records for SimRecords {
             self.inner.changed.notify(usize::MAX);
         }
         Box::pin(async move { out })
+    }
+
+    fn commit_owned<'a>(&'a self, tx: Tx, owner: Box<dyn Send + Sync>) -> BoxFuture<'a, Result<Rev, Refusal>> {
+        // This simulator applies synchronously before returning its ready result future.
+        let committed = self.commit(tx);
+        Box::pin(async move { let result = committed.await; drop(owner); result })
     }
 
     fn changes<'a>(&'a self, family: &'a str, after: Rev, limit: usize) -> BoxFuture<'a, Result<Changes, Refusal>> {

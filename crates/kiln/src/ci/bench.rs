@@ -436,8 +436,16 @@ async fn restart(dir: &Path, legs: usize, running: bool) -> Result<Vec<Measure>>
     // Each running leg is back as the grant it ran under, made in the epoch before, and none is
     // granted again: one live grant each, through the restart (G10).
     let (grants, after) = (second.ci.live_grants(), epoch_of(&second.store).await);
+    let waits = if before.is_none() {
+        Some(second.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM jobs WHERE job_id IS NOT NULL AND status = 'queued' AND wait_reason IS NOT NULL", [], |r| r.get::<_, i64>(0))?)).await)
+    } else {
+        None
+    };
     second.shutdown.cancel();
     anyhow::ensure!(restored.legs >= want, "{} of {want} legs rebuilt", restored.legs);
+    if let Some(waits) = waits {
+        anyhow::ensure!(usize::try_from(waits?)? == want, "every recovered queued leg has a durable wait reason");
+    }
     let ms = vec![restored.took.as_secs_f64() * 1000.0];
     let Some(before) = before else { return Ok(vec![Measure::new("restart.rebuild_ms", "ms", Better::Lower, 2_000.0, ms)]) };
     let after = after?;
@@ -913,6 +921,19 @@ mod tests {
         })
     }
 
+    /// W05-AC09, W05-R13: a thousand queued legs return with every wait durable, within
+    /// the same two-second budget as running grants.
+    #[test]
+    fn w05_ac09_a_queued_restart_keeps_every_wait_within_budget() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().to_path_buf();
+        crate::rt::block_on(async move {
+            let m = restart(&dir, 1_000, false).await?;
+            assert!(m.iter().any(|x| x.name == "ci.bench.restart.rebuild_ms" && x.value < 2_000.0), "{m:?}");
+            anyhow::Ok(())
+        })
+    }
+
     /// W05-R25, docs/sim.md's bug 11: a leg the store has queued at its second attempt (its first
     /// lost with its runner) through a restart. The next server rebuilds it at that attempt: given
     /// to a runner, the claim writes its second attempt, and its first's record stays as it ended.
@@ -939,7 +960,7 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(60);
                 let id = loop {
                     let r = run.clone();
-                    let id: Option<String> = first.store.call(move |c| Ok(c.query_row("SELECT id FROM jobs WHERE run_id = ?1 AND status = 'queued'", [r], |x| x.get(0)).ok())).await?;
+                    let id: Option<String> = first.store.call(move |c| Ok(c.query_row("SELECT id FROM jobs WHERE run_id = ?1 AND status = 'queued' AND wait_reason IS NOT NULL", [r], |x| x.get(0)).ok())).await?;
                     if let Some(id) = id {
                         break id;
                     }
@@ -953,7 +974,8 @@ mod tests {
                     .store
                     .call(move |c| {
                         let now = crate::util::now_unix();
-                        c.execute("UPDATE jobs SET attempt = 2 WHERE id = ?1", [&l])?;
+                        // W05-AC09: restore must recompute a changed wait, not retain the old explanation.
+                        c.execute("UPDATE jobs SET attempt = 2, wait_reason = ?2 WHERE id = ?1", rusqlite::params![l, r#"{"reason":"capacity","eligible":1,"busy":1,"draining":0}"#])?;
                         c.execute(
                             "INSERT INTO ci_attempts (id, leg_id, number, status, conclusion, failure_class, runner, executor, queued_at, started_at, finished_at) VALUES (lower(hex(randomblob(16))), ?1, 1, 'done', 'failure', 'runner-lost', 'gone', 'host', ?2, ?2, ?2)",
                             rusqlite::params![l, now],
@@ -973,6 +995,10 @@ mod tests {
                     anyhow::ensure!(Instant::now() < deadline, "the second hub didn't rebuild its runs within two minutes");
                     crate::rt::sleep(Duration::from_millis(5)).await;
                 }
+                let id = leg.clone();
+                let wait: Option<String> = second.store.call(move |c| Ok(c.query_row("SELECT wait_reason FROM jobs WHERE id = ?1", [id], |r| r.get(0))?)).await?;
+                let wait: serde_json::Value = serde_json::from_str(wait.as_deref().unwrap_or("null"))?;
+                assert_eq!(wait.get("reason").and_then(serde_json::Value::as_str), Some("unroutable"), "the current wait replaces the saved one: {wait}");
                 // A runner for it comes, one that runs CI legs (its process says `CAP_CI2`).
                 second.put_agent(crate::hub::AgentLive { labels: vec!["elsewhere".into()], slots: 1, ..crate::hub::tests::live_runner("r", "linux", "x86_64") });
                 let hello = crate::proto::Hello { protocol: 0, name: "r".into(), labels: vec!["elsewhere".into()], slots: 1, hostname: "r".into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: false, dedicated_job: None, running: Vec::new(), terminal: false };

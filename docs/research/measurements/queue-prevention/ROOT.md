@@ -1,0 +1,237 @@
+# Kiln reliable adaptive inbox flow (in progress)
+
+POLICY_READ coordinator: Shards origin/main 7a897def2ac3bb041da584d1d6854fa066ad7fc2;
+rules SHA256 df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3.
+Read AGENTS, full rules/evidence, task ROOT, Kiln AGENTS/ci section0. Source base f555736bd887a4196c8841564cb9b4d6c1ede95f.
+Own clone /private/tmp/kiln-queue-prevention-20261111. Do not edit the completed release checkout.
+
+User explicitly requests all further fixes, one subagent per fix, externally researched learned queue
+depth from consumption rate and interacting peers, cold start, status coalescing; no dropped communications.
+No arbitrary fixed queue depths. Work accepted at any stage must be retained, including at backpressure,
+restart/move/restore/cancel/error. Coalescing changes delivery presentation of explicitly replaceable
+status, and must retain original communications in durable history. Instructions/results are never
+silently coalesced. No unbounded spill queue disguised as a fix. No periodic polling/cache added casually.
+
+Live backlog:761 distinct messages,760peer+1news,17agent senders, three busiest96/86/83.
+143 policy readbacks;631 check/build/run keyword hits;251 held/waiting;478 evidence/checkpoint.
+Exact private backup and recovery receipt stay in /private/tmp/shards-queue-recovery-z7s82owz.
+Status is Running after clearing at explicit user approval; do not replay or purge live messages.
+
+Lanes: queue_index_consumers owns adaptive admission/control & typed source backpressure;
+kiln_status_trace owns durable explicit status coalescing/API and producer descriptions;
+reach_deployment_plan owns availability/status delivery resilience and small fixtures.
+Root owns research decision review, integration, all heavy tests/audits/profiling and deployment.
+Implementers first return policy receipt plus a researched design/seam proposal; production edits
+wait for root's cross-lane design approval. No children or service actions. Parser/light pure checks
+only until root assigns normal headroom. Named scoped signed commits only after root review.
+
+Research underway: Netflix concurrency-limits, Envoy gradient controller, Reactive Streams1.0.4,
+RabbitMQ4.4 overflow/nack, Akka2.10.24 mailboxes. Upstream tuning constants are alternatives to assess,
+not a license to copy defaults. Queue consumption means authoritative handoff to model, not inbox ACK.
+Physical byte authority remains separate from learned logical depth. Shrink stops new admission;
+it must not evict prior accepted messages. Every state transition must preserve provenance/order/idempotency.
+
+Completed prior release: Mac ARM64 f555 artifact be797cf09ec95a61f0cb95dcb3d0714bbc6be258182a2a2f09f5f90ef1685a84,
+MachO arm64, --version passes. Not deployed. Linuxr34 queued; Windowsr38 retry active. No fullgate
+per user, but focused source/regression validation still required. Mac free space must remain>=30GiB.
+
+
+## First combined compile checkpoint (not readiness)
+
+All three implementation lanes froze their finite Rust chunks. Exact30 modified/new Rust/SQL
+source hashes in first-check-source.json. Root Reach **r40** requests native Mac2CPU/24GiB/4GiB,
+1200s, same private red-target, `KILN_UI_SERVER=off cargo check --locked -p kiln --lib`.
+Runner not assigned in initial response: queued, do not call it running. Source frozen until result.
+An empty ignored ui/dist/client folder satisfies rust-embed's path for this type check only;
+no new UI production artifact claimed. ui/node_modules is an owned temporary symlink to prior
+release checkout's install; do not mutate linked dependencies.
+
+Root explicit shared changes: Command::Admit, MailAck, MailPeers; State/Info optional admission;
+Core Update::MailFlow custom serialization; SessionFrame::MailFlow/Ack.publication; named mail-flow
+feature; convo rows omit source-only flow; wire classifications explicit. Root-owned parser checks
+pass, source tests still unrun. API published response202 exact custody receipt and preaccept typed
+refusal structured body added; broad new Sent consumer semantics remain to integrate.
+
+Physical input authority uses actual room mechanism, with weak ShareFollower interface for two real
+consumers (existing Room, Host input pool). Each live Host adds one pool to actual share cuts;
+all its sessions share that strict pool, peers never multiply bytes. HARNESS_INPUT metrics included
+in IN_FLIGHT. Resource/connect/OS-pressure events resize; source existing Session select watches
+shared-budget release directly, no polling/watcher strong Host. Tests written, not executed.
+Complete provider clone/encoded byte accounting remains owed: strict counter alone is not complete proof.
+
+Store::storage_reserve reads actual SQLite page count/page size/schema Btrees for a conservative
+WAL+growth scratch reservation before publishing. Constants derive from official SQLite fileformat
+https://www.sqlite.org/fileformat.html and WAL index format https://www.sqlite.org/walformat.html:
+page512..65536, min usable480, overflow pointer4, varint max9, WAL header32/frame24,
+WAL-index32768 bytes/first4062 entries. One transaction inserts original and may replace prior
+pending status disposition; count actual ledger Btrees and reserve old-page split paths plus new
+payload overflow/local/root pages, database growth + WAL frames + WAL index. This is intentionally
+conservative and has no measured optimality claim. It cannot reserve against unrelated writers;
+commit failure transfers no custody. Operator's configured existing disk_free floor remains separate.
+Unit fixture source written, unrun. Do not silently replace unknown storage layout with guessed space.
+
+R16: held own inactive Cargo lock and deleted only9445 task-private incremental .o files (logical
+4,722,570,128B; allocated blocks4,741,296,128B). No source/log/evidence/test/release binary removed.
+Immediate df did NOT show corresponding physical free growth (APFS/snapshot/shared extents may retain
+blocks; not diagnosed), so only claim file removal, not measured physical bytes reclaimed. Latest df
+~35.8GiB free; r40 precheck requires30GiB floor+4GiB declared scratch. No headroom bypass.
+
+Original Shards session latest API Running with32queued; no new queue purge or replay performed.
+Original release r33 completed MacARM64 f555; r38 Windows native compilingdependencies; r34 Linux
+still queued, now estimatedplace8–15. No artifact deployed. Native Windows Git preflight corrected
+platformmode semantics only, content verified. Exploring spareMac Zig cross build as an alternative
+to long Linux queue, not changing I/O pressure/admission rules.
+
+Remaining source obligations before readiness: complete clone charge; journaled queueedit current
+revision+growth; journal transfer and destination debt beforemove/bluegreen activation; dedicated
+agents.wait durable response/handoff receipt; explicit batch-consumption observation; actor/peer/epoch
+fences and signed replay. Server/UI producer persistence/event waiting not implemented at freeze;
+existing outgoing retry timers/inline-attachment loss must be fixed, not called no-loss already.
+Provider acceptance excludes local write/Sent/note_sent. Claimed uncertain delivery reuses EXACT
+Token across reconnect; never mint newgeneration on uncertain retry. No event bookkeeping retryloop.
+
+
+Cross-platform continuation: **r41 STARTED** on spare Mac d1323898b255a3ed435eb83fa0f7b0cf,
+normal2CPU/32GiB/16GiB admission. Builds the unchanged signed f555 source as Linuxamd64musl
+using the release script's same pinned ziglang0.17.0/cargo-zigbuild0.23.4 + jemalloc flags,
+real Linux Bun pack, new private cache. This follows primary cargo-zigbuild support for macOS
+hosts and musl targets (https://github.com/rust-cross/cargo-zigbuild), rather than changing
+normal Linux headroom or pretending a queued build is running. It cannot execute the Linux
+artifact on Mac; ELF architecture/static link and native Linux --version smoke still owed.
+No artifact yet. Source sync/preflight/nativecompiler may still be underway. Data floor precheck
+requires30+16GiB free. r34 remains queued as fallback; not stopped/guard bypassed.
+
+At firstcompilefreeze relay/source/ledger report remaining errors/obligations honestly. PlainRegistry
+Sent::Published/PublicationRefused need all callsites to preserve custody vs source delivery.
+Root added HTTP202 {retained,publication,message}, typedpreaccept HTTP body {retained:false,error}.
+Do not map merely Published to Delivered without changing semantics. HarnessPort currently has no
+Retained variant; goal/news bookkeeping needs retained identity without claimingmodelconsumption.
+Other broad Sent consumer matches remain compiler-guided rootwork. Existing consumers' fallbacks
+must not trigger fresh IDs/reports while same communication is merely serverretained.
+
+Relay nextfix aftercompile: produceroriginal persistence/event-wait in existing Held store; full
+inline attachment preservation+visiblequota failure, no composer ownershipclear before durablewrite.
+No syntheticprobe/retrytimer. New outputPending ACK includespublication andmustcancel timer resend.
+Status source Pending no-busyloop attempted(epoch,capacitygeneration,connection) persisted; uncertain
+Dispatched reconnect retries SAME token, notclaimnewattempt. Ledger lookup ofexactalreadycommitted
+retry mustprecede newcapacity/disk preflight so changingpressure cannoterase custody receipt semantics.
+Sourceproof replay mustrespect journalaware idempotence ratherthanbypass signer replay checks.
+
+Coordinator resume: reread current origin/main full AGENTS/rules/evidence/CLAUDE and ROOT. Rules SHA256 unchanged df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3. Own cross-lane integration, focused validation and deployment. Source and ledger/UI agents remain scoped implementers, parser/light checks only. Nine preexisting peer queue entries steered by exact IDs, owner API accepted all9 without QueueRemove/body changes; model consumption not yet proven.
+
+Transport source f555736bd887a4196c8841564cb9b4d6c1ede95f was fast-forward pushed through signed gits to canonical hyper-light/kiln main (remote812 matched), push exit0. Existing source commit unchanged. This publishes source, not a deployment claim. Primary Reach r44 copied verified Mac310278944B artifact via nonrepository sync and read-only blob metadata, empty terminal inventory. CAS existingMac48d63ecf843f... at1794357386346, no legacy pair; preparing known legacy importer stage for next controlled server replacement. No DB writes or provenance fabrication.
+
+## Executed integration checkpoint
+
+Root R46 cargo check --locked -p kiln --lib exit0; source hashes changed while the finite Told
+chunk completed, so this is a development compile only. R47 test-binary compilation --no-run
+exit0 with before/after source_unchanged=true; exact captures in check-1794374846237407000.
+Focused cached-binary execution then ran40 tests, all40 passed in1.05s; first-focused-tests.log
+includes admission/mail/source custody, original offline regression, skills/Codex echo identity,
+owner Open lifecycle, shared physical pool, SQLite scratch and actual wire generation/contracts.
+This checkpoint precedes subsequent batched observation/gate/producer persistence/attachment changes;
+it is not final combined readiness or a full gate. Generated types came from the Rust binary.
+
+Native Chromium isolated-origin held-browser.mjs exit0, held-chromium-native.log: two actual tabs
+retain both writers, complete Blob survives reload, explicit abort/quota refuses custody, account
+isolation, legacy raw bytes preserved. This is the actual Held module bundled alone, no production
+origin/credentials and not an end-to-end app or browser appearance claim. Official simulated
+fake-indexeddb6.2.7 is pinned test-only after primary source/package/WPT review; its Node tests do
+not prove browser crash durability. Existing deps were APFS-cloned into owned node_modules before
+installation; prior linked dependency tree unchanged. W3C IndexedDB3.0 transaction serialization
+supports the choice; Web Locks-only was rejected because its SecureContext excludes this actual
+HTTP LAN origin. One authoritative Held IndexedDB store replaces localStorage writes, no secondoutbox.
+
+R38 Windows native f555 release succeeded0 after63m05s. Artifact414221824B SHA256
+14ad7179f912bf132fefd738d159ace4b3ae8bea1283bc9c2b80a613723f9c2d, native --version0.
+Raw Reach CLI output is byte preserving: 1MiB all-byte-values fixture matched expected SHA;
+then entire Windows artifact transferred to local private bundle and matched known build hash.
+No temporary network listener or service was used for artifact transfer. Primary r53 copied/staged
+Windows legacy binary+metadata with accurate f555 source, next controlled server startup imports it.
+Mac stage r45 succeeded, Windows stage r53 succeeded; stages are NOT deployment/promotions.
+Linux cross build r41 still executing; r34 remains fallback queued, no new binary is live yet.
+
+R16 root held exclusive nonblocking Cargo profile lock and removed ONLY own inactive incremental
+cache.8753 files/19,890,598,833 logical bytes removed; measured free-space increase16,962,121,728B,
+afterfree51,352,657,920B. Detailed manifest incremental-reclaim-1794375379335168000.json.
+Source, evidence, test binary, rlibs, release cache/artifacts, private recovery backup preserved.
+
+Coordinator POLICY_READ after resume: current Shards origin/main749c3ca0602c43dac74976e8db713102f5b15874, rules SHA256df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3; full AGENTS/rules/evidence/CLAUDE+ROOT reread. Kiln origin is a different repository and has no Shards policy; do not confuse its dc19 origin/main with the Shards receipt.
+Native WebKit red diagnosed actual IDB UnknownError preparing Blob/File data; primary WebKitbug188438 and W3C IndexedDB ArrayBuffer support inform persistence of exact ArrayBuffer data with Blob reconstructed only in memory. Both Chromium and WebKit now pass7checks in held-*-arraybuffer.log, including changed-file sameID refusal. No app/crash/perfclaim.
+Linuxcross r61 reuses unchanged f555 source+allocator. Actual libjemalloc{,_pic}.a were96-byte empty Mac archives while ELFobjects existed. Rebuilt through pinned Zig ar via existing make install_lib_static (now7345622/7345812bytes), normal2CPU32GiB8GiB Reach; final link retry underway. No allocator disabling.
+
+Current root checkpoints r62: focused37Node tests pass0fail, TypeScriptfull0; r63 actualChrome guard-removal mutation fails at changed-file acceptance (true!=false) asintended, lint0. Added indexedDB-availability BCguard to avoidallocating an unused channel wherepersistenceunsupported; commandfixturemigration+newunsupported-storage2pass recordedUI-REQUEST-TESTS. r54 full UI run interrupted after first obsolete fixturefailure/hang, remaining cancellationreports arenotexecutedfailures; do notclaimfullsuitepassed.
+R64devcheck101/source_unchanged=false:4missingDemand duringtypeimplementation,2registrycutsVec.count correctedlen,2sourcejournal_editnestedmatch errors assignedsource,2ToldSQLusize/movedparent assignedstatus/fixed. Freshfrozencompileowed.
+Root MailAck race identified: delayedAccepted ACKcoulddeletealaterConsumedjournal. RelaynowACKsonlyterminalevents, CommandMailAck includesexactterminalDisposition; sourceagent implementingexactcomparison+regression. Demandisnowrevision-scoped, mailwaitingquery returnsDemand{peer,MINrevision}; sourceagent retainscompletedbusyservice butresetsidleanchors andcorrelatesonlyexactrefillrevision/generation. Notyetvalidated.
+RootMailHandoff command+wireclassificationregistered, owneronlyexternalreject. Waitingresponseproposalretainsoriginalsourcequeue+lease untilnativeexacttool-resultproof; no newserverbodyarchive. Statusagentownsops/wait/state_reads registration+canonicalsubtree, sourceagentHost/Inbox/provider. Transferagentownsagenttransport+disjointSaved/Package/Hostmoveout/in afterfinitefreeze; sourceordinaryHost/sessionremainseparate. No sourcecomplete/deploymentclaim.
+
+R66 Linux retry normal2CPU32GiB8GiB on same spareMac/cache waitsCargo profilelock before checking only known jemallocarchives. R61 rebuilt dependency due changed Zig command environment and recreated96-byte archives; this retry deliberately preserves R61env and repairsafteritsCargo ownership, then relinks. Source/allocator unchanged. Artifactnotyetpresent/deployed.
+
+Coordinator currentpolicy resume7d7e0855a5073ed5163b4fe7ed3355c9ed7c2506/rulesdf2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3 fullAGENTS/rules/evidence/CLAUDE+ROOT reread. ExactnewSQL/storage/wait/Toldtests sourceon disk; no latercompiledproofyet. Developmentcheck currentturnR1started2CPU24GiB4GiB, IDs mayresetafterinterruption sooldR1nameisnotcurrentjob.
+R73 cargoLinuxrelease actuallysucceeded16m11; onlycopyfailedmissingdist. Rootmadefolderandcopiedexactartifact353177136B SHA87107f09976eb189264a7d1e5ee7fc7435797507a819be51ff89b4234044c8ff, staticELFx86-64stripped. Removaltwoownedregenerablejemallocsysrlib/rmeta forcedrebundleofrepairedELFarchive; noallocatordisable/sourcechange. Allf555releaseartifactsnowbuilt; NOTyetdeployed. Source→primaryrawstdinReachpipeincompletezero-bytepart, untouched; rootdirectsource→localReachstdout session12005 transferring353MB at~0.5MB/s thennormalbundleSync. NoHTTPserver/credentialexposure.
+LastShardsliveRunning queue1 afterearlier14, nofurtherclearing. Rootmail_transfer newserverowner handler integratesOffer→destinationReady→Prepared→Adopt→Committed exactmetadata+sameTokenrebind. Raw/genericOpen/Inventory/adopt gatesregistered. Newhandler/transfer/sourcechunksUNVERIFIED, broadno-losschangesnotready. TargetedreadOnlyagentfoundoldCommittedA→B replayafterB→Ccouldreassignoldowner; rootadded latest-recordequalityfence beforeinmemoryownershipmutation. Noexecutedregressionyet.
+
+Live deployment update: server normalPOSTupdates/server replace job01a1c965fe5c726ea13cc4ee4dc368c8 accepted, publichealth verifiedcompiledcommitf555736bd887a4196c8841564cb9b4d6c1ede95f. ItsstoredMac/Windowsaccuratelegacyf555metadata importedproperly. NativeLinuxartifacthash87107f... passes--version0. Fleet targetnowf555fromserver, normalPOSTupdates/runners started9nativejobs/errors[]. Threepositivedone: Linux00aad8...,primary451397...(47nativeprocesssessions+0terminalshandedunchanged),Windowsf766...(14ad...). FiveMacstillupgrading/waitingjobs; Linux8fadc... failedreadonly filesystemcreateatknowninstancepath, scopedread-onlydiagnosisdelegatedstatusagent. Threeoffline remainpending. DoNOTclaimallmachinesdone/preventiondeployed. ShardslatestRunningqueue1 beforeupgrade, verifyafter.
+Resource floor: testcompile8GiBrequestheldbecauseactualAPFSfree<38GiB, nofloorbypass. Removed833MB then1.13GBowninactiveincrementalunderprofilelock; then1.129GBonlyoldkiln-2d1a...failed-codegen `.rcgu.o` underprofilelock, preservingbinary/rlibs/evidence/source/artifacts/recoverydata. Manifestrecordsactualfreechanges. Freshtestcompilerequests6GiB(normalReach2CPU32GiB), matchesknownfocusedrebuildbudget;stillrequires30+6GiBactualfree. R7testcompilefailed7missingtestimports, repairedscopedbyagents; noproductionerrorsatthatcheckpointbutfullnewsourceunvalidated.
+
+CurrentturnR18testcompile startednormal2CPU32GiB6GiB afterR7test-importrepairs. AllRustlanesfrozen; no sourceproofclaimeduntilbefore/afterhashesreturn. UI fullsuitecorrectcwd ran704:699passed,5StartingfixturefailuresactualasyncReadyfailure scheduledrenderdespitefalse. RootcorrectedSessionStoreconstructor `.then(ready=> ifready&&!disposed...)`; focused43passed inclall5Starting/unsupportedstorage/Held/sessioncustody. Fullrerunowedafterfinaltypes. Earlierui-suite-after-fixes.log wasincorrectworkingdir/tsxconfig harnessfailure, notsourcefailproof. Newfiles ui-suite-correct-cwd.log red +ui-storage-ready-start.log green.
+Read-onlyLinux8fadcdeploymentdiag: nativeuser-systemdservice, root/homeBtrfs/dev/nvme0n1p3superblockROalsoPID1namespace, directory755uid1000, serviceprotectsettingsalloff. Neithercontainerconfigurationnorchmodfixesit. ActualcauseROunknown(kernelcurrentlogsprivileged), counterszerodonotprovehealth. No mount/process/filesystemmutationauthorized/executed. Holdthatpromotionpendinghoststoragefix; existingnativeupgradeproperrouteafterrecovery.
+
+Coordinator resumed7d7e/df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3 policy full read. R18 compiled0 source_unchanged=true capture check-1794380497363412000. UI full704pass0fail ui-suite-final-ready.log. Two automatic runner restarts interrupted tools, not source operations; agents resumed scoped finite chunks. Mac actual free fell below30GiB (19.64GB) from outside this compile snapshot, builds held, only owned inactive incremental reclaim under exclusive lock underway. No prevention deployment claim.
+
+R18 root focused executable run executed531tests:524pass7fail88.57s (r18-focused-tests.log), source identity check-1794380497363412000. Newattachments all5pass, realSQLite3.53.2 scratch/WAL3fixturespass, auth transfer handler2pass. Failures: staleDerivedMailFlow unknownvariants test, missingMailTransferfanbarrier, missingMailFlowcosttag (rootfixed source); twogenuine directnativejournalhandover gaps (assignedtransfer); Toldcombinedrun/childbody andone transfercursorbudget (assignedstatus). Currentbinary predatesnewfinitepreaccept/deadlockchunks. Not readiness. NativeReachlocal --cwd ignored workingdir; absolutePython script+os.chdir fixture fixesruninvocation only.
+
+Resource continuation: own incremental6.423GBlogical + inactiveintermediatecodegen13.110GBlogical removedunderexclusiveprofilelocks, preservingtestbinary/rlibs. R16 also reclaimedONLY previousinactivekiln-skills-check/target/debug/deps/*.rcgu.o underexclusiveNONBLOCKprofilelock (noactiveCargowriter); source/proofs/experiments/artifacts untouched. Manifest inactive-prior-codegen-reclaim-1794381798509566000.json:53.623GBlogical, measuredfree159.951GB→197.054GB (separateunattributedotherreclamationoccurredbeforethiscleanup; donotattributeallfreegrowthtous). MacUI npmrunbuildexit0 withrealapp+nativeBunpack; LinuxUIproduction1794381766185424485 install/types/lint/build all0 sourceunchangedtrue, rawlogsretainedlocal. FirstUIrunner lackednpm; capabilityinventoryempty requiredverifiedprimaryselection. Nohiddenbypass.
+
+Developmentcompile check-1794382051632580000 completed0/errors0, sourcechanged whiledirectSCMfinishedso NOTfinalproof. Directtransferagentclosure nowpersistsSaved/FrozenpreAdopt andexplicitAbortingreplay beforefreeze; currenthashlist direct-native-source.json ispriorclosureonly. Sourceagentpreaccept-copychunkfrozen (Recordscommit_owned actuallifetime), statusfixture/wrappersfrozen. RootwirefanMailTransferbarrier +MailFlowcosttags +Derivedroundtripfixedsource. Rootidentifiedownreservation-failurecapacitygeneration canretriggerrelayclaim; sourceconfirmedtrace, butredfixtureexecutionstillowed. AgentwritesboundedactualHost+SQLite two-claim regressionfirst, noproductionfixyet. This mustbeclosedbeforepreventionship; nofullno-loss/performanceclaim.
+LastconnectedMacb24 stagingpublicbinary stream timedoutafter300s with219152384Bpart; nodefaultpathreplacement/processrestartdone. APIupgradepreviouslyverifiedartifact+installerfinishedbutoldversionedexeunchanged. PreserveliveClaude; oldsource32fwatchdogfallbackcallsstop_all, so donotblindlytouchwatchedfileortriggeritwhilethinkingFDspreserve. Other8connectedcurrentf555,3offlinepending. Localstaginghelper /private/tmp/kiln-b24-uptake-20261111 no artifactpromotion.
+
+RootproductionUIsemanticE2E4/4pass actualChrome+WebKit desktop+phone: ui/e2e/session-availability.spec.ts againstownmock127.0.0.1:17084 andproductionclient. ExactmockInfoRunning+detailStateDisconnected, composer/draftremainusable,nosideways. FirstWebKitphonescreenshotcapturedbeforepaintdespiteDOMchecks; strengthenedtovisibility+twoRAFpaintboundary, rerun4pass availability-browser-painted.log. RootvisuallyinspectedChromiumphone/desktop+WebKitphone/desktopimages; validcomposeronall. Thisdoesnotprovecrossmachinecommunicationdurability.
+Redtestcompile1794382625226993000 unchangedbut101soleinvalidSpec.manual_resumefixturefieldagent.rs7341; rootremovedtest-onlynonexistentfield. Newunchangedtestcompileexecsession51800running,allRustheld. Preacceptretryproductionnotyetmodified.
+
+UNAMBIGUOUS executedretryred: check-1794383179335510000 testcompile0/unchangedtrue; retry-red.py ranexact1test, binaryexit101 withexpectedassertion ownfailedreservationrelease mustnotreauthorizesamepublication (retry-red.log/result). RealHostjournalphysicalreservationfailedtyped/noACK/noPending andSQLiteoriginalunchanged beforeassertion. Rootreleasedsourceagent forretry_generationseparatecreditcounter+sameexistingInputownershipaccounting; transferagentforONErestart/cancelclosure. AllotherRustfrozen. Rootadded3externalCapacityliteralsretryfield(corefallbackNone;testSome). Compiledbinaryotherfocusedtestsnowrunningexec26327, intentionallyexcludesknownredtestandnotnewsourceproof.
+LiveShards07:52Running47queued→fresh07:54Running51queued;rootQueueSteer exact50peerIDs bodyaggregate57098B underexisting512KiBcap, all204, sameIDs/bodySHArecorded, afterqueue1Running. NoQueueRemove/newSend orpurge. SafeAPIreceipt shards-existing-steer-20261111-0754.json. Thisisqueuehandoff, notclaimedmodelconsumption.
+
+Frozencompiledfocused546(excludingknownretryred) completed544pass2fail97.44s. AllTold/cursor/attachment/storage/mailhandler/ownedRecords/buffer/native-fullsinkfixturesPASS. RemainingoldSourcebluegreenrepeatfixturefailsLegacyRetainedemptyreceipt/bodydigest import (transferagentfixingexplicitnontokenlegacycaseonly). OtherfailureDerivednewMailFlowwasinwrongtestenumorder; rootcorrectedtesttoactualUpdate/UpdateKindappendorderandalignedwiretable+costtagsnewvariantlast. No pubwireordinalchange. Capture1794383179335510000 immutablebinarywitness; notnewproductionretry/restartchecks.
+
+Seams requiredcargo test-pkiln-seams:47behavioraltestsPASS; doctestcontract2pass1fail onlymethodsLists lackednewRecords.commit_owned/HarnessPort.send_status. Rootupdateddocs/seams.md withactualowner/cancellation/statushistorycontracts; directdoc_truth binaryrerun3/3PASS seams-doc-truth-after.log. No seamRusteditsaftercompiled47. Source retrycounter/restartclosuresongoingonlyapprovedfinitepaths. B24nativeinstaller sourceconfirmedlaunchd fastpathonlycopycanonicalbin; avoidtouchingversionedwatchdogwhicholdsourcewouldstopClaude. Manualpartialdownload219152384B untouched, noreplacement.
+
+AllRustfrozenagainforfreshcombinedtestcompileafterretryanddirectrestartclosures. Nativeupdatedhashreceipt direct-native-source.json(agent03b224e...,transferb20bae35..., native9441645e...), Sourcefinaladmissioncda64937..., sessionfae2ceb9... inADMISSION.md. QueueEditshrinknowretainsoldchargeuntilCAS+actualownerapplythencreditonce, failed/equaleditnocredit. NativepoolretryeligibleonlytypedResourceHeldbeforeactorretention; oneexistingMailReplaywaitgatedinflight, no ownpulsecredit. SourcefullsnapshotafteractualOfferedpolicy, markeronlypreOffer, sourcepreheadercrashmanual-heldexplicit. Quietbackendrepairwithoutphase/connnotificationsstillunsupported/no probes. No fullresident-process-memoryclaim; payload/encodedguards do notproveall decoder/provider allocations. FreshcompileandnewfixturesUNRUNwhenwritten.
+
+Coordinator POLICY_READ resume3830327b6c8d7ac22452a5e32ffa32799263132c/rulesdf2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3 fullAGENTS/rules/evidence/CLAUDE+ROOT+KilnAGENTS/ci§0 read. Latestfrozencompilecheck1794384968309236000 unchanged0 and552focusedPASS84s, retryredactualHost+SQLite101/retrygreen0. Additionalcallers11 ran8pass3fail: bothQueueEditgrowth/shrinkPASS; oldopsfixture/publicreceipts fail. Rootrestoringappend-onlysent/messagealiaseswithretained:true andallReceiptfields, neverfabricatedreceiveraccepted. Agentownsopsend_to_endfixtureonly. B24newalongside15429e44 startedroot; connectionnotyetverified. Preventionnotcommitted/built/deployed.
+
+Resume09UTC closure: restoredpublicsendaliasesretainedtruthfully +typedMailErrorNoSessionafterexactreceiptlookup; libraryclippyfirst45errorsfixed,secondonlyleftremovedRECHECKdoccomment(nowremoved). Finaltestcompile1794386567668125000 failed2missingBusimports; fixed. Developmentcompile1794387307432199000 passed0 butsourcechanged(goals/mod,wait),notfinalproof. ActualisolatedpublickeyedsendNativeCompletePASS0.49s. Consumers171=153PASS18FAIL consumer-check.log; realgoalchangedbodyoldIDReuse +UnknownfalseDelivered/duplicatefound; scopedagentfinitefixfrozen6a05df57... +fixturemigrationsunrun. Rootremoved5secwaitsampling, added6squietlookregression(unrun). WindowsReachservercustody0of1observedfromMacANDLinux;controlDirListworks. Boundedterminalown01a1c9d497f170dbb952d33dc03c0ded50stimeout/noWindowsoutput/closedtrue/after[]; noflushredclaimed. PrimaryWin32FlushFileBuffersGENERIC_WRITEcontractfixEpochFssync_newwritablehandle +realFSunitwritten68be8d51... nativeWindowsunverified. B24alongsideNoRoute65beforecertissuance;oldClaudeuntouched. No preventioncommit/build/deployyet. Currenttestexec64814caller48blocked90sgoalsfixturedeadlineSimClock(oldbinary); exec80864core32blockedoldcoordinatorfixture. Bothsafeownedlighttestprocesses,rootcontrols. Teamfrozenexcepttransfer2consumerfixtures.
+
+Coordinator POLICY_READ resume06ae067c0beda71c98a8c6f9633df9feb71fc11b/rulesdf2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3 fullAGENTS/rules/evidence/CLAUDE+ROOT+KilnAGENTS/ci§0. Signedprivatecheckpoint0ff33887757bc0584e7a69abfa0d2759ec7d850d exactCMS verified using shipped87107 hook, priorenrollmentc815root and completecurrentrevocations; receiptSHA6d28df55e3484d474e06d7daa7529f5623088600bb986233d4772ed3f27d42b3. Latestcompiledcore48/focused544pass, consumer172=158pass14fail; sourcebackedfixtureStarting readiness/cwd/mirrorauthority fixes preparedprivatelywhileMacreleaseholds. Requiredseams47+doc_truth3pass. Live09:54existing37peerIDs steered204exact47,347B, queue38→4Running; noRemove/newSend, notclaimedconsumption. Mac60478andLinux58199privatebuildsactive;Linuxexacttwoevidencedocsbackedup+namedpathstashbeforecheckout, nofileloss. Preventionstillnotpushed/deployed.
+
+10:10UTC closure: Mac0ff release309,408,544B/33d5689e23f156fa0bbf0c40e6460cabc3e87906519a28d667d724e807a69d50 built0/sourceunchanged/nativeversion0; Linux0ff352,035,792B/30c989770c5ac7e83b5e96a06a3652fd1ff6e9bcb643b2ef073a21a88eb80e4d built0/sourceunchanged/nativeLinuxsmokeowed. BothPRIVATE, notdeployablefinal: actualisolatednativehandoverfoundnegotiationrace. FirstproofownedtempSocketSUN_LENfixturefailure; correctedshortTMPDIRnative-live-short-0ff338 nowactual23.309sred beforejournalhandover, sourceheldoriginalmail1/g1/e0Admitted andproviderPID10804. No userproductionactor touched; cleanupownedgroupsexitedtrue. AgentReadyFeatureNegotiation fixa330dcea...frozen, rootreviewedUnknown/Caps-negative/Named/disconnectevents, no absence-as-negative/probe/timer/unconditionaltrue. Its newtest/livegreenowed.
+Fixturechangesfinaltestcompile1794391410322496000 passed0/sourceunchanged; currentconsumer172ran171PASS1FAIL43.96s. RemainingplannewrecipientinitialSpec.promptbypassescanonicaldurableplanrunID; sourceagentapprovedfinitefixno-promptstart+durablerecipientbinding+canonicalindex0mail+eventreadywait, keepingmissingreceipt typedrefusal/no secondspool. AllotherRustfrozen. Preceding1794391267316049000 wascargoCHECK0, nottest: CLI didnotforwardKILN_CHECK_MODE; correctedexplicitwrapperproduced141032testbinary. Neverclaimoldcheckasexecutedtests.
+NativeWindowsrecipeparser14871actualPASS0 withexact46610bbdworkflow/340dbc0cstep: binding4args/parsererrors[], terminalclosed/after[]. NativeGitsourcepreflight showed228changes; scopedcontentstatusignoringonlyNTFSexecutebits showedexact4:2ownedevidencedocs+2missingtrackedHelmassetlinks. Checkoutpreparationscriptbeingpreparedto preserveallbeforeplatformGitnormalization+namedpathstash; no buildstartedormutationdone. RootactualboundedstartupLog12,179,142B/last32KiBmatchedzeroReachstartupstrings, causeunconfirmed; nativeFlushFileBuffersred5/green0remainsactualproofofAPIcorrectness. ManualCIflags/headroomuntouched.
+
+10:44UTC source freeze1d5c3821ad1f2e7b6b5cccff0543d89d953dedb7 signed72paths; exactCMSprimaryhookpositive receiptSHA4e4e1c43b37e21aa82bf0f52cc5c7db4f03712773fc7c48700293f0764cde8af. Finalclippy0 andtestcompilecheck1794392747213249000 unchanged0. Consumer173PASS60.77s/focused545PASS109.50s. Wholecore48 has47pass1coordinatorprotocoldeadline; isolatedcoordinator andtwo-testprefixPASS1–1.6s. Fullcorecaptured/uncapturedandnormalpriorityallstillfail; isolatednice10/capturebothpass, so neitheroutputcapture norpriorityis establishedcause. Backtracesecondfullcorepinpointsinitialactualnativeinputgatebeforegoals/peer. Queueagentprivateinstrumentationpreparednotapplied, no assertions/deadlinerelaxed. DoNOTclaimalltests0. Mac4CPU32GiB16GiB13m13 release0/sourceunchanged/nativeversion0 artifact308639008B/7e59ada60d03deba823685c87f3034d6e066b4e192009ff8d8b894f8ca7e8246; LinuxsameSHA4CPU32GiB16GiB10m48 release0/sourceunchanged artifact352548048B/b0bf06ce2ff66615155ef3c41c0c28ebfdfee05f6bcb29b0eafcbcd9c105ab5f onspareMac, nativeLinuxsmokeowed.
+Actualnative12305 old0ff→1d5 privateSCM27.37s passed13mail/PIDwitnesses: nonemptyjournalcount1, sourcee0→dest1, samegeneration/revision/body, sameproviderPID85003, durableheaders, exactone nativeprompt/retry, postgateConsumed, ownedcleanuptrue. BUTforbiddenobserverlog10:40:51.934974 refusedextraagentidentityepoch2 (server's verifiedhand-onis0→1). ThisisPARTIALgreen, NOTpromotionproof; Rootcaughtmissingactor-authcoverage. Rootreleasedtransferagentforfinitefix: journalmove_in_preparedalreadyadoptsSaved/Coreepoch1, laterlegacytook_blue_greenalwaysqueuesepoch+1=2. Exactjournalbranchmustregisterexistingcustody::tookatmanifestdestepochBEFOREOpen, notlegacyafteractivation; legacy-nomanifestunchanged, missinghanded/proofmustnotinventhistory. Newliveactor-authwitnessrequired. PolicycurrentShardsorigin/main0d261aa931ae2e33e1f4a528b33f7e26b5ee7c90 rulesunchangeddf2acf... readbackfromtransferagent; rootearlierfullread06ae067samecontents.
+Windowsactualstashproof16251PASS0: HEADf555clean, namedstash00b2f5ee6cf95957e38c1fd1aaab33010e7903cb exactparent/fourpaths; rawdiff14242B SHA98030f40fdc7f3e9247dddbc2d67c3f87327fc7fd18f5bdc470b8a3cb07e341e matchspreservedpatch; bothdocumentbytehashesunchanged. Original68093wrapperexit1retainedasred; independentinspection45345andproof16251verifyactualoperationcompleted; NOv3retryperformed. Windowsbuildnotstarted/sourcehasno1d5artifact. IMPORTANTnormalWindowsf555updaterisRestart→stop_child, notUnixSCM; DrainonlyblocksCIjobs, noexposednative/durablequiescenceACKfound. HOLDpromotionwith4activeagents; donotforcekill/pause/restart. Build/stagecanproceedafterrootgates/sourcepush; protocolguard/permanentWindowsfixnotinventedfromsourceobservationalone.
+AllnewartifactsPRIVATE; canonicalmainstillf555, preventionnotpushed/staged/deployed. RootdeploymentPREP /private/tmp/kiln-final-deploy-prep-20261111 hasdirectprimary→sourceReachfetch,publisher/stagehelpers,manifestplaceholder; noexecutionyet. PrimarycredentialONLYknownserver.envhelperinmemory; no/procenviron/secretprint. Fleet8/9connectedalreadyf555, B24old32f/newalongsideNoRoute65heldoldClaude,3offline. LastliveShards9:54Runningqueue38→4byexact37existingIDs/47347BQueueSteer204; noRemove/newSend/consumptionclaim. Privatequarantine761originalsuntouched.
+
+Coordinator POLICY_READ resumed: current Shards origin/main 0d261aa931ae2e33e1f4a528b33f7e26b5ee7c90; rules SHA256 df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3. Full AGENTS/rules/evidence/CLAUDE reread from current origin/main because working branch lacks AGENTS. Role coordinator; owned private Kiln clone integration/evidence/build/deploy, current source parent1d5. Corrected epoch patch removes duplicate local crypto validation, retains existing server trust authority, structurally binds exact hand-on before receipt/pre-Open. Four-file parser/diff0 only; compilation/runtime owed. Test-only busy diagnostics now applied with original assertions/deadline unchanged; grouped failure not waived. Next normal Reach 2CPU32GiB8GiB compile.
+
+11:07UTC finite checkpoint3 source frozen: deterministic actual MailPeers+ordinaryState regression compiled unchanged1794394901327881000 then failed101 at authoritativeState mismatch, exactexpectedguard=true. Confirmed rootcause projectedgen30/noeligibility versuscontroller32/servereligibility. Ownerpattern correction now routes Host Flow through existingSession/Core.out/currentControllerState+wake, including refusal/replay; no Infomerge/timer/extraqueue. Big forensic wrapper removed, originalbusyfixture byte-for-byte1d5 retained +newdeterministicregression. TypedwireBodyreadguard corrected, epochreceipt registeredpreOpen; nativeactualold1d5 strongeractorred27s catchesepoch2, ownedcleanuptrue. Correctedobserver attributesrefusalonlyrequestedidentity field (epoch1referenceinsideerrorisnotrefusal1). Privatecheckpoint signing/build preparation may proceed withchecksPENDING; push/deploy remainhelduntilfreshfocused+actualnativeauth+CMS. RootrouteprimarycurrentserviceCLI→sourceverifiedsmallreceipt; olderprimary.local/bin lacksneeds, noadmissionbypass. Alltrackedsource/evidencefrozenwhilebuildsrun; newtestlogsallowedonlyuntrackedmeasurementprefix.
+
+11:29UTC closure: ef473cf/treea1c5df2a exactCMSpositive295cacaaab2f33c87277a55cf833386c8849673c05d82bc76996d341f8b05483. Macrelease309120976B/9f997ec839747abf3768300a1ff10b480b4fef00ead158671aa03ecca96737fa nativeversion0/sourceunchanged13m11. Linuxrelease351314768B/fd25cf58ddb22cb1f8070365002cb4363c4bb6d4eea6d9acd63b3d286677bd10 sourceunchanged11m11; directprimarytransfer/hash/nativeversion0; Macdirecttransfer/hash0. Actual1d5→ef isolatednativeactorproof27.43s all18PASS/ownedcleanuptrue; onlyepochs0,1/no identityrefusals, realproviderchildenvmarksremovedcommand0, samePID45080/original/token/body. efcompile1794395240081526000 unchanged0/pinnedexe3fd860680063299cf1603755fa44b02d5d93ce20807d3cbceac9ada22e2dd226: coordinator49PASS/consumers173PASS/clippy0/focused545PASS+onefixtureorderingfailure. Test-onlyfollowupcollectorcompiledunchanged1794396280990290000 thenexactrealpreaccept/retryfixturePASS0; ALL17assertsunchanged/no productioncodechange. Actualreleasedartifactsource stays ef473cf honestly; no rebuild for excluded cfgtestblock. FleetselectsnewestRUNNINGcommitonreleasebranch, notunrunmainhead; followuptestcommitcanbeonmainwhileexactef artifactsrollout. Windowsmanualbuildtargetexactef afterpush/CMSreceiptdelivery; promotionheld4active/unsupportedWindowsagentCLI. Olderprimaryinstancebuild5241 has4agents/sourceunknown; newestupgradealonecannotproveoldownersupgraded. NextstageMacaccuratelegacy+LinuxAPIupload/normalserverreplace/eligiblePOSIXupdates. No prevention deployed YET.
+
+Coordinator POLICY_READ resumed 2026-11-11T12:04Z: current Shards origin/main 0d261aa931ae2e33e1f4a528b33f7e26b5ee7c90; AGENTS/rules/evidence/CLAUDE full read; rules SHA256 df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3. Coordinator owns integration, actual builds/live proofs, signing/push/deploy; source lane owns Inbox/Controller/Session/Host and exact legacy fence only; receipt lane owns agent/custody/identity; status lane private fixtures/preparation only, all implementer acknowledgments current, no children.
+Actual f555→ef legacy migration red (normal Reach run69186): cert epoch1 while tokenless LegacyOpaque ProviderFlight pending lease remains epoch0. Owned cleanup true; result retained under native fixture legacy-native-reach-1-ef473cf. This is a real production compatibility gap, not a missing assertion. Prevention server replacement remains held. New finite promotion Head phase machine + exact row-CAS migration + installed certificate authority is being implemented; modern verified manifest path stays separate. No dropping/clearing.
+Actual Windows native run2377 compile failed E0599 session.rs1129 because input_changed references unix/test-only Ctl::OwnedChanged. Assigned existing session owner the all-platform mail wake correction. No Windows binary produced or promotion attempted. Existing4activeWindows agents retained.
+Read-only normal Reach primary observation 2026-11-11T12:04Z: Shards 01a148884a4770fdaf0111f3f792a248 Running, state Running, exact18queued, thread01a1c87d-b08c-77e3-b8cf-20f37437a7c5, zero terminals, no running update jobs. Server stillf555 build87107f09976e. ef artifact fd25 is merely uploaded/ready, not installed. No new queue command or user-agent message sent. First sandbox attempt could not open existing runner socket (EPERM), exact authorized read succeeded under escalation; no automatic review rejection.
+
+12:28UTC finite legacy checkpoint production frozen. Diagnostic CHECK1794399617885550000 failed4integrationerrors (harness before declaration, missingBody import2, accidentallyremovedHost::new); correctedwithoutconcurrentownededits. Diagnostic CHECK1794399856207026000 compiled0/errors0 butsourcechanged whiletests werefinished, so NOTfinalproof. All8sourceownerpaths frozen; finaltestcompile normalReach2CPU32GiB8GiB exec61604 active. NewrealRecords restart/partialCAS/applied-then-Err/cancelled-read/stale/token tests and preflushguard positivecontrol written, notexecutedyet. Newlegacyharnessbc9d1d3590be9c1fcd37662915d59e5e2e9844ada84c2a31e74cc171f4ebb763 retainedunder docs/research/measurements/queue-prevention/direct-native-legacy-live.py. Receiptorder normalization capturesoriginalrow.rev whenaccepted_seqwasNone; preservesexistingsome. Terminalpromotionretirement precedesopeningControllergate, exactwaiterretired, stalequeuedIdentityasks gated. Records notificationcursor advancesafterownHeadread tosurvivefuturecancellation; no timer/cacheofbody/projection.
+RootactualWindows recipeparserexit0/workflowd34aa8f26f6a7b4bbf23179acfbbe172db58714ff7ac6fa83668039edf69c9fa. Read-onlypreflight verifiedactualEfHEAD/14addist414221824/original00b2stash+backup butFAILED5DproofPNGs. Exactnativepreview observedunsetlongpaths and277/263/273/269/265paths+pinHEADblobs. Rootreviewed/ranexact5namedrepair7c0de1fcd4ddc105037ff79e215eb55d2ae3bd39b7f0727f2650ed3d13d4d6aa: exit0/cleantrue/localcore.longpaths=true;5blobhashesmatch/HEADef+stash00b2unchanged; allownedterminalsclosed/after[]. No globalconfig/reset/cleanglob/newstash/service/agentrestart. Deletioncauseunconfirmed; officialGitWindowsFAQsupportsscopedlongpathsetting. Nativepowershellsource retainedwindows-owned-evidence-repair.ps1 SHA447d23bd0bae4b5b03aa8928ee9a34ba487f993bb621749b88fdec8643d0b172.
+CurrentcanonicalGitHubmain verified5b7814c09bf9eb538b371fc312fa18ec4de8f34f. Nextsignedsnapshotisprivatebuildinputonlywhilefinaltests/livepending. C4sourceadditionalnarrowcrashintervalscope explainedinLEGACY-PROMOTION.md; no fullcrash/nativePIDcontinuityclaim. Serverstillf555; EfLinuxonlyuploadednotreplaced; Shardslast12:04Running18queued. No additionalcommunicationscleared.
+
+Coordinator POLICY_READ resume: Shards origin/main28ba5083bd65a9a3bff4896921821cbbd4f1fee7, rules SHA256 df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3; full AGENTS/rules/evidence/CLAUDE and Kiln AGENTS/ci§0 reread. Coordinator owns integration, builds/live tests, evidence and deployment; three scoped implementers acknowledged same current policy, no children. Source c6751a28ef95060b3f0205ea56503da4b06d0ed6.
+
+c675 final unchanged test compile check1794401390110489000 passed; pinned test executable738c0247d1f3012dd84e98eb9a034eac811c17d5396b22d142048ff2fc3c552e: targeted11/core49/consumers173/focused546 PASS; library clippy -D warnings PASS. Mac artifact309605872B/fe0cb0837891f76ce3606f2cf1347e814887a7bc530d84895a7176a43cb80432 and Linux352156240B/aed8e7ea834b6df9de79e93e6c4049a98f5b6e721e29b2cd157d5c7f68aaed09 built unchanged. Linux direct Reach transfer/hash/native version smoke PASS. Windows native run2378 exact c675 still running at last observation. Development branch fix/adaptive-inbox-flow pushed nonforce to c675 with positive shipped CMS verification; main remains5b, deployment held.
+
+Actual isolated modern ef→c675 native proof passed18 checks, owned groups exited. Actual f555→c675 legacy proof legacy-native-green-c6751a2 failed after181.607s: nine checks passed including epoch1, retained original, same provider PID94182 and real provider-child authorization with both identity marks removed; native completion did not release admitted1/80B (target0). Cleanup owned_groups_exited=true. Read-only stopped-fixture SQLite inspection of all three runner records databases found zero inbox-pending versions, with destination Head revisions AwaitingPromotion→AwaitingCertificate→Rebinding→Active→retired. This is a new real compatibility failure, not a passing upgrade. Source review identifies a charged in-memory lease installed before durable legacy adoption can fail, while promotion can still scan an empty journal and activate; exact failing adoption cause is not yet distinguished. Legacy import and activation ordering is under scoped repair; no blanket clearing of Unavailable, no deletion or invented completion. Failed fixture and logs retained. Ef ready Linux candidate was withdrawn through the normal DELETE endpoint before any server replacement; server remains deployed f555. Shards last oneoff12:40 steered18 existing peer messages with exact IDs/body hashes, queue19→2/Running, no new Send/Remove and no consumption claim.
+
+13:40UTC closure: exact three pre-fix regressions red .22/.15/.23s under captures1794403035078639000/1794403383195866000/1794403787664581000. Three-file owner amendment1e0d6f464f627b1e481139d38361773891e1f53bf0e69836e47119d96c3a6641 applied/frozen Host76625be9/Sessionea2ac1bf/Inbox6e439051. Final compile1794404028984981000 unchanged0; pinned1fb3206d0230bc9fce4574b3607030cbcc1efccad17e37e8be014df365ca974a passes14targeted, libraryclippy0, coordinator49pass. Consumers/focused42777running. Linuxlegacyfixture now exactLinux87107 baseline, Macbe797guard preserved; allassertions retained. Private nextsign/build package /private/tmp/kiln-legacy-durable-import-release-20261111 parentc675 prepared; native signer01a1c9f5886e72e48d3a2554f9406e3e remainsauthorized. Canonicalmain5b/developmentbranchc675 verified13:35, no newpushyet. Windowsrun2378 c675 stillrunning; productionserver/8runnersf555, unsafeefLinuxreadywithdrawn. 13:38ShardsRunning10queue/State0 and currente301cert0 matching; historicaloldhostnamecert alsoexists, no epoch1 source mismatch. No messagepurge. Relevantdetails LEGACY-DURABLE-IMPORT.md, compactredreplaypatch89626fc...+instructions retained.

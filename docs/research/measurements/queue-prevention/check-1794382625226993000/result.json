@@ -1,0 +1,25 @@
+{
+  "exit_code": 101,
+  "source_unchanged": true,
+  "errors": [
+    {
+      "message": "struct `harness::session::Spec` has no field named `manual_resume`",
+      "rendered": "error[E0560]: struct `harness::session::Spec` has no field named `manual_resume`\n    --> crates/kiln/src/agent.rs:7341:21\n     |\n7341 |                     manual_resume: true, ..Spec::default()\n     |                     ^^^^^^^^^^^^^ `harness::session::Spec` does not have this field\n     |\n     = note: available fields are: `model`, `mode`, `resume`, `prompt`, `name` ... and 18 others\n\n"
+    }
+  ],
+  "free_before": 191768514560,
+  "free_after": 184380207104,
+  "command": [
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "test",
+    "--no-run",
+    "--locked",
+    "-p",
+    "kiln",
+    "--lib",
+    "--message-format=json"
+  ]
+}

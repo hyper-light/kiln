@@ -28,12 +28,17 @@ use super::kinds::{Kind, KindInfo};
 use super::model::{Body, Command, QueueItem, Status};
 use super::session::{self, Info, Session, Sink, Spec};
 
+pub(crate) mod transfer;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     /// Agent sessions at work on this machine at once ([`Info::at_work`]): finished, paused and
     /// ended ones don't count.
     pub per_machine: usize,
 }
+
+#[derive(Clone, Copy)]
+enum LegacyReconciliation { Debt { from: u64, to: u64 }, Journal }
 
 impl Default for Limits {
     fn default() -> Self {
@@ -98,6 +103,8 @@ pub struct Inventory {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Saved {
     id: String,
+    #[serde(default)]
+    epoch: u64,
     spec: Spec,
     #[serde(default)]
     queue: Vec<QueueItem>,
@@ -142,12 +149,27 @@ pub struct Saved {
     carried: Option<Vec<serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     owned_reach: Vec<super::model::Task>,
+    /// The journal is sent on one extra local SCM descriptor, never expanded in Saved/Frame JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mail: Option<super::mail::TransferManifest>,
+    #[serde(skip)]
+    journal: Option<Arc<std::fs::File>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    mail_bound: bool,
+    #[serde(skip)]
+    local_mail: Option<transfer::NativeReceipt>,
+    #[serde(skip)]
+    native_guard: Option<Arc<futures::lock::OwnedMutexGuard<()>>>,
 }
 
 impl Saved {
     pub fn id(&self) -> &str {
         &self.id
     }
+
+    pub(crate) fn mail_manifest(&self) -> Option<&super::mail::TransferManifest> { self.mail.as_ref() }
+    pub(crate) fn journal(&self) -> Option<&Arc<std::fs::File>> { self.journal.as_ref() }
+    pub(crate) fn attach_journal(&mut self, file: std::fs::File) { self.journal = Some(Arc::new(file)); }
 }
 
 /// What became of an End ([`Host::end`]).
@@ -362,6 +384,7 @@ fn record(s: &Session) -> Saved {
     let st = &core.state;
     Saved {
         id: s.id.clone(),
+        epoch: st.epoch,
         spec,
         queue: st.queue.clone(),
         pause: st.pause.clone(),
@@ -377,6 +400,11 @@ fn record(s: &Session) -> Saved {
         restore_revision: None,
         carried: s.carried.lock().clone(),
         owned_reach: st.tasks.iter().filter(|t|t.id.starts_with(crate::reach::owned::PREFIX) && t.live()).cloned().collect(),
+        mail: None,
+        journal: None,
+        mail_bound: false,
+        local_mail: None,
+        native_guard: None,
     }
 }
 
@@ -617,6 +645,8 @@ const HOST_GONE: &str = "this runner's host of its sessions is gone, so it stays
 const CUT_BY_RESTART: &str = "kiln restarted on this machine part-way through your last turn, which stopped it. Pick up where you left off.";
 
 pub struct Host {
+    /// Its sessions' byte authorities, one each (W20): none takes another's room.
+    input_budgets: super::admission::SessionBudgets,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     sink: Sink,
     /// What its sessions are held to, who's at work and who waits for room ([`Room`]): its most
@@ -638,6 +668,7 @@ pub struct Host {
     files_dir: PathBuf,
     /// Files received (whole), by file id.
     received: Mutex<HashMap<String, PathBuf>>,
+    received_changed: crate::rt::Changed,
     clock: Arc<dyn Clock>,
     /// Looks the watch has taken, and records written: told to `changed`'s listeners.
     looks: AtomicU64,
@@ -669,6 +700,10 @@ pub struct Host {
 
 /// Most of what waits in one session's lane: past it, what's sent is refused (a message, `Full`).
 pub const LANE: usize = 1024;
+
+impl crate::memory::room::ShareFollower for Host {
+    fn resize(&self, bytes: usize) { self.set_input_budget(bytes); }
+}
 
 /// The runtime's shard that owns agent session `id` (`super::copies::owner_of` of the shards a fan has session loops for):
 /// where its tasks run (its harness's drive, its lane) and where its frames are taken (a runner's session loop,
@@ -713,6 +748,177 @@ impl Host {
         Self::with_clock(sink, file, limits, crate::rt::clock())
     }
 
+    pub(crate) async fn legacy_recovery_pending(&self, id: &str, from: u64, to: u64) -> Result<bool, inbox::PromotionError> {
+        if let Some(session) = self.get(id) { return Ok(session.core.lock().input.as_ref().is_some_and(|input| input.controller.lock().promoting_epoch(from, to))); }
+        let host = self.me.upgrade().ok_or_else(|| inbox::PromotionError::Storage { why: HOST_GONE.into() })?;
+        let id = id.to_owned();
+        crate::rt::blocking(move || host.legacy_fence_epochs(&id)).await.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?.map(|epochs| epochs == Some((from, to))).map_err(|why| inbox::PromotionError::Storage { why })
+    }
+    pub(crate) async fn legacy_promotion(&self, id: &str) -> Result<Option<inbox::Promotion>, inbox::PromotionError> {
+        self.inbox.as_ref().ok_or_else(|| inbox::PromotionError::Storage { why: "source journal is unavailable".into() })?.promotion(id).await
+    }
+
+    pub(crate) async fn legacy_promotion_next(&self, after: Option<String>) -> Result<Option<(String, inbox::Promotion)>, inbox::PromotionError> {
+        self.inbox.as_ref().ok_or_else(|| inbox::PromotionError::Storage { why: "source journal is unavailable".into() })?.promotion_next(after).await
+    }
+
+    pub(crate) async fn prepare_legacy_promotion(&self, id: &str, from: u64, to: u64, proof: crate::runner::custody::LegacyProof) -> Result<(), inbox::PromotionError> {
+        proof.validate(id, from, to).map_err(|why| inbox::PromotionError::Invalid { why })?;
+        let host = self.me.upgrade().ok_or_else(|| inbox::PromotionError::Storage { why: HOST_GONE.into() })?;
+        let session = id.to_owned();
+        crate::rt::blocking(move || host.persist_legacy_fence(&session, from, to)).await.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?.map_err(|why| inbox::PromotionError::Storage { why })?;
+        let input = self.get(id).and_then(|session| session.core.lock().input.clone());
+        self.inbox.as_ref().ok_or_else(|| inbox::PromotionError::Storage { why: "source journal is unavailable".into() })?.prepare_promotion(id, from, to, proof, &self.input_budgets.budget(), input.as_ref()).await?;
+        self.wake_legacy_promotion(id).await
+    }
+
+    pub(crate) async fn promote_legacy(&self, id: &str, to: u64) -> Result<(), inbox::PromotionError> {
+        let promotion = self.legacy_promotion(id).await?.ok_or(inbox::PromotionError::Stale)?;
+        if promotion.to_epoch != to { return Err(inbox::PromotionError::Stale); }
+        if promotion.phase == inbox::PromotionPhase::AwaitingPromotion {
+            let input = self.get(id).and_then(|session| session.core.lock().input.clone());
+            self.inbox.as_ref().ok_or(inbox::PromotionError::Stale)?.advance_promotion(id, to, inbox::PromotionPhase::AwaitingCertificate, &self.input_budgets.budget(), input.as_ref()).await?;
+        }
+        self.wake_legacy_promotion(id).await
+    }
+
+    pub(crate) async fn certify_legacy(&self, id: &str, to: u64) -> Result<(), inbox::PromotionError> {
+        let promotion = self.legacy_promotion(id).await?.ok_or(inbox::PromotionError::Stale)?;
+        if promotion.to_epoch != to { return Err(inbox::PromotionError::Stale); }
+        crate::runner::custody::legacy_certificate_ready(id, to, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
+        if promotion.phase == inbox::PromotionPhase::AwaitingPromotion { return Err(inbox::PromotionError::WaitingForCertificate { why: "the destination has not been promoted".into() }); }
+        if self.get(id).is_none() {
+            let host = self.me.upgrade().ok_or_else(|| inbox::PromotionError::Storage { why: HOST_GONE.into() })?;
+            let session = id.to_owned();
+            crate::rt::blocking(move || host.recover_legacy_owner(&session, &promotion)).await.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })??;
+        }
+        self.wake_legacy_promotion(id).await
+    }
+
+    async fn wake_legacy_promotion(&self, id: &str) -> Result<(), inbox::PromotionError> {
+        let promotion = self.legacy_promotion(id).await?.ok_or(inbox::PromotionError::Stale)?;
+        crate::runner::custody::legacy_waiting(id, &promotion).map_err(|why| inbox::PromotionError::Invalid { why })?;
+        if let Some(session) = self.get(id) { session.promotion_changed().await.map_err(|why| inbox::PromotionError::Storage { why })?; }
+        Ok(())
+    }
+
+    fn recover_legacy_owner(&self, id: &str, promotion: &inbox::Promotion) -> Result<(), inbox::PromotionError> {
+        if self.get(id).is_some() { return Ok(()); }
+        let mut saved = self.native_active_record(id).map_err(|why| inbox::PromotionError::Storage { why })?;
+        if (promotion.phase == inbox::PromotionPhase::Active && saved.epoch != promotion.to_epoch) || (saved.epoch != promotion.from_epoch && saved.epoch != promotion.to_epoch) { return Err(inbox::PromotionError::Stale); }
+        crate::runner::custody::legacy_certificate_ready(id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
+        if let Some(harness) = &saved.harness {
+            let actual = super::survivors::alive(std::slice::from_ref(harness));
+            super::survivors::stop(&actual.iter().map(|run| run.pid).collect::<Vec<_>>());
+        }
+        saved.manual_resume = true; saved.cut = false; saved.spec.prompt = None;
+        self.open_record(saved, None, Vec::new(), u64::try_from(self.clock.unix_ms().max(0)).unwrap_or(0) / 1000, false).map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?;
+        if let Some(session) = self.get(id) { session.core.lock().upsert("legacy-native-uncertain", None, super::model::Body::Notice { level: super::model::Level::Warn, text: "The runner restarted during legacy ownership promotion. Existing originals and provider-flight debt are retained. The native result is uncertain; review it before resuming.".into() }); }
+        Ok(())
+    }
+
+    async fn finish_legacy_promotion(&self, session: &Session, input: &super::admission::Input, from: u64, to: u64) -> Result<(), inbox::PromotionError> {
+        let host = self.me.upgrade().ok_or_else(|| inbox::PromotionError::Storage { why: HOST_GONE.into() })?;
+        let id = session.id.clone();
+        crate::rt::blocking(move || { host.save_checked().map_err(|error| error.to_string())?; host.clear_legacy_fence(&id, from, to) }).await.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?.map_err(|why| inbox::PromotionError::Storage { why })?;
+        input.inbox.retire_promotion(&session.id, to, &self.input_budgets.budget(), Some(input)).await?;
+        // No await between durable retirement and opening this exact controller's gate.
+        crate::runner::custody::legacy_completed(&session.id, to);
+        {
+            let mut controller = input.controller.lock();
+            controller.complete_legacy_reconciliation().map_err(|error| inbox::PromotionError::Invalid { why: format!("{error:?}") })?;
+            controller.activate_legacy_epoch(from, to).map_err(|error| inbox::PromotionError::Invalid { why: format!("{error:?}") })?;
+        }
+        let capacity = input.controller.lock().capacity(); session.mail_flow(super::admission::FlowEvent::Capacity { capacity });
+        Ok(())
+    }
+
+    pub(super) async fn reconcile_legacy_owner(&self, session: &Session) -> Result<(), inbox::PromotionError> {
+        let Some(input) = session.core.lock().input.clone() else { return Ok(()) };
+        let Some(promotion) = input.inbox.promotion(&session.id).await? else { return Ok(()) };
+        if promotion.phase == inbox::PromotionPhase::Active || !input.controller.lock().promoting_epoch(promotion.from_epoch, promotion.to_epoch) { return Ok(()) }
+        self.settled(&session.id).await;
+        input.observe_physical();
+        if promotion.phase == inbox::PromotionPhase::Rebinding {
+            crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
+            return self.rebind_legacy_owner(session, &input, &promotion).await;
+        }
+        if session.epoch() != promotion.from_epoch || input.controller.lock().capacity().epoch != promotion.from_epoch { return Err(inbox::PromotionError::Stale); }
+        self.reconcile_legacy_mail(session, &input, LegacyReconciliation::Debt { from: promotion.from_epoch, to: promotion.to_epoch }).await?;
+        if promotion.phase == inbox::PromotionPhase::AwaitingPromotion { return Ok(()) }
+        crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
+        self.reconcile_legacy_mail(session, &input, LegacyReconciliation::Journal).await
+    }
+
+    async fn rebind_legacy_owner(&self, session: &Session, input: &super::admission::Input, promotion: &inbox::Promotion) -> Result<(), inbox::PromotionError> {
+        let mut after = None;
+        while let Some((cursor, pending)) = input.inbox.pending_next(&session.id, after).await? {
+            if !matches!(pending.origin, inbox::Origin::LegacyRetained | inbox::Origin::LegacyOpaque) || pending.lease.token.is_some() { return Err(inbox::PromotionError::Invalid { why: "legacy journal custody changed".into() }); }
+            if pending.lease.epoch != promotion.from_epoch && pending.lease.epoch != promotion.to_epoch { return Err(inbox::PromotionError::Stale); }
+            if pending.disposition.is_none() { input.controller.lock().restore_legacy_debt(pending.lease, promotion.from_epoch, promotion.to_epoch).map_err(|error| inbox::PromotionError::Invalid { why: format!("{error:?}") })?; }
+            after = Some(cursor);
+        }
+        input.observe_physical();
+        let mut conflict = None;
+        loop {
+            match input.inbox.rebind_promotion_step(&session.id, input).await {
+                Ok(inbox::promotion::RebindStep::Row) => conflict = None,
+                Ok(inbox::promotion::RebindStep::Complete) => break,
+                Err(inbox::PromotionError::Conflict { revision }) if conflict.is_none_or(|prior| revision > prior) => conflict = Some(revision),
+                Err(error) => return Err(error),
+            }
+        }
+        {
+            let mut core = session.core.lock();
+            input.controller.lock().rebind_legacy_epoch(promotion.from_epoch, promotion.to_epoch).map_err(|error| inbox::PromotionError::Invalid { why: format!("{error:?}") })?;
+            core.state.epoch = promotion.to_epoch;
+            core.touch_state();
+        }
+        let mut after = None;
+        while let Some((cursor, pending)) = input.inbox.pending_next(&session.id, after).await? {
+            if pending.lease.epoch != promotion.to_epoch || pending.lease.token.is_some() || !matches!(pending.origin, inbox::Origin::LegacyRetained | inbox::Origin::LegacyOpaque) { return Err(inbox::PromotionError::Invalid { why: "legacy journal custody changed".into() }); }
+            if pending.disposition.is_none() { input.controller.lock().restore(pending.lease).map_err(|error| inbox::PromotionError::Invalid { why: format!("{error:?}") })?; }
+            after = Some(cursor);
+        }
+        Ok(())
+    }
+
+    pub(super) async fn progress_legacy_promotion(&self, session: &Session) -> Result<(), inbox::PromotionError> {
+        let input = session.core.lock().input.clone().ok_or_else(|| inbox::PromotionError::Storage { why: "legacy owner input is not initialized".into() })?;
+        let (revision, promotion) = input.inbox.promotion_snapshot(&session.id).await?;
+        input.promotion_cursor.fetch_max(revision, Ordering::AcqRel);
+        input.promotion_head.store(revision, Ordering::Release);
+        let Some(promotion) = promotion else {
+            let epochs = input.controller.lock().promoting_epochs();
+            if let Some((from, to)) = epochs {
+                if session.epoch() != to || input.inbox.epoch(&session.id).await? != Some((to, false)) { return Err(inbox::PromotionError::Stale); }
+                return self.finish_legacy_promotion(session, &input, from, to).await;
+            }
+            return Ok(());
+        };
+        if promotion.phase == inbox::PromotionPhase::Active {
+            if session.epoch() != promotion.to_epoch || input.controller.lock().capacity().epoch != promotion.to_epoch { return Err(inbox::PromotionError::Stale); }
+            crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
+            return self.finish_legacy_promotion(session, &input, promotion.from_epoch, promotion.to_epoch).await;
+        }
+        input.controller.lock().begin_legacy_epoch(promotion.from_epoch, promotion.to_epoch).map_err(|error| inbox::PromotionError::Invalid { why: format!("{error:?}") })?;
+        if promotion.phase == inbox::PromotionPhase::AwaitingPromotion {
+            let capacity = input.controller.lock().capacity(); session.mail_flow(super::admission::FlowEvent::Capacity { capacity }); return Ok(());
+        }
+        crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
+        self.settled(&session.id).await;
+        if promotion.phase == inbox::PromotionPhase::AwaitingCertificate {
+            input.inbox.advance_promotion(&session.id, promotion.to_epoch, inbox::PromotionPhase::Rebinding, &self.input_budgets.budget(), Some(&input)).await?;
+        }
+        self.rebind_legacy_owner(session, &input, &promotion).await?;
+        let host = self.me.upgrade().ok_or_else(|| inbox::PromotionError::Storage { why: HOST_GONE.into() })?;
+        crate::rt::blocking(move || host.save_checked()).await.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?.map_err(|error| inbox::PromotionError::Storage { why: error.to_string() })?;
+        crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
+        input.inbox.advance_promotion(&session.id, promotion.to_epoch, inbox::PromotionPhase::Active, &self.input_budgets.budget(), Some(&input)).await?;
+        crate::runner::custody::legacy_certificate_ready(&session.id, promotion.to_epoch, &promotion.proof).map_err(|why| inbox::PromotionError::WaitingForCertificate { why })?;
+        self.finish_legacy_promotion(session, &input, promotion.from_epoch, promotion.to_epoch).await
+    }
+
     /// A host whose time is `clock`'s, its sessions' inboxes keeping their records beside its own
     /// record of them.
     pub fn with_clock(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>) -> Arc<Self> {
@@ -744,7 +950,8 @@ impl Host {
             |d| d.join("attachments"),
         );
         let handovers = file.as_ref().and_then(|f| f.parent()).map(Handovers::of);
-        Arc::new_cyclic(|me| Self {
+        let host = Arc::new_cyclic(|me| Self {
+            input_budgets: super::admission::SessionBudgets::default(),
             sessions: Mutex::new(HashMap::new()),
             sink,
             room: Mutex::new(Room { limits, ..Room::default() }),
@@ -757,6 +964,7 @@ impl Host {
             me: me.clone(),
             files_dir,
             received: Mutex::new(HashMap::new()),
+            received_changed: crate::rt::Changed::new(),
             clock,
             looks: AtomicU64::new(0),
             saves: AtomicU64::new(0),
@@ -767,7 +975,9 @@ impl Host {
             ending: Mutex::new(HashMap::new()),
             held: AtomicBool::new(false),
             handovers,
-        })
+        });
+        crate::memory::room::follow_input(&host);
+        host
     }
 
     /// Takes no messages (`on`), or takes them again: a new build that takes its sessions over from
@@ -890,7 +1100,7 @@ impl Host {
 
     /// A piece of a file attached to a message for `session` (blocking; small writes).
     pub fn receive(&self, session: &str, file: &str, offset: u64, data: &[u8], done: bool) -> anyhow::Result<()> {
-        use std::io::{Seek as _, Write as _};
+        use std::io::{Read as _, Seek as _, Write as _};
         let safe = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') && !s.is_empty() && s.len() <= 64;
         if !safe(session) || !safe(file) {
             anyhow::bail!("bad file or session id");
@@ -901,11 +1111,30 @@ impl Host {
         let dir = self.files_dir.join(session).join("incoming");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(file);
-        let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(offset == 0).open(&path)?;
+        // A completed deterministic fid is immutable. Reconnect replay verifies the same range;
+        // it must not truncate bytes already materialized or used by an accepted communication.
+        if path.try_exists()? {
+            let mut f = std::fs::File::open(&path)?;
+            let size = f.metadata()?.len();
+            let end = offset.checked_add(u64::try_from(data.len())?).ok_or_else(|| anyhow::anyhow!("attachment range overflow"))?;
+            anyhow::ensure!(end <= size && (!done || end == size), "completed attachment retry changed its size");
+            f.seek(std::io::SeekFrom::Start(offset))?;
+            let mut expected = vec![0; data.len()];
+            f.read_exact(&mut expected)?;
+            anyhow::ensure!(expected == data, "completed attachment retry changed its bytes");
+            return Ok(());
+        }
+        let partial = dir.join(format!("{file}.partial"));
+        let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(offset == 0).open(&partial)?;
+        anyhow::ensure!(offset <= f.metadata()?.len(), "attachment range has a gap");
         f.seek(std::io::SeekFrom::Start(offset))?;
         f.write_all(data)?;
         if done {
-            self.received.lock().insert(file.to_owned(), path);
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&partial, &path)?;
+            self.received.lock().insert(format!("{session}/{file}"), path);
+            self.received_changed.notify();
         }
         Ok(())
     }
@@ -1031,9 +1260,43 @@ impl Host {
         s.is_some()
     }
 
-    /// A received file, once (its id is spent).
-    fn take_file(&self, file: &str) -> Option<PathBuf> {
-        self.received.lock().remove(file)
+    /// Completed input remains immutable on disk until its communication's custody ends. The
+    /// deterministic path also resolves it after restart, without a parallel receipt cache.
+    fn take_file(&self, session: &str, file: &str) -> Option<PathBuf> {
+        if file.is_empty() || file.len() > 64 || !file.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') { return None; }
+        let path = self.received.lock().remove(&format!("{session}/{file}")).unwrap_or_else(|| self.files_dir.join(session).join("incoming").join(file));
+        std::fs::symlink_metadata(&path).ok().filter(|metadata| metadata.is_file()).map(|_| path)
+    }
+
+    /// Transfer preparation waits on an actual completed immutable file, never on a name-only
+    /// descriptor. The caller's existing operation deadline/cancellation bounds this future.
+    pub async fn attachment_ready(&self, session: &str, file: &str, sha256: &str, size: u64) -> Result<PathBuf, String> {
+        if session.is_empty() || session.len() > 64 || !session.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || file.is_empty() || file.len() > 64 || !file.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || sha256.len() != 64 || !sha256.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) || size > ATTACHMENT_MAX
+        { return Err("invalid attachment transfer descriptor".into()); }
+        let path = self.files_dir.join(session).join("incoming").join(file);
+        loop {
+            let completed = self.received_changed.listen();
+            let probe = path.clone();
+            let expected = sha256.to_owned();
+            let verified = crate::rt::blocking(move || {
+                use sha2::Digest as _;
+                struct Hash(sha2::Sha256);
+                impl std::io::Write for Hash {
+                    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.update(bytes); Ok(bytes.len()) }
+                    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+                }
+                let metadata = match std::fs::symlink_metadata(&probe) { Ok(metadata) => metadata, Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false), Err(error) => return Err(error) };
+                if !metadata.is_file() || metadata.len() != size { return Err(std::io::Error::other("completed attachment size differs")); }
+                let mut hash = Hash(sha2::Sha256::new());
+                let copied = std::io::copy(&mut std::fs::File::open(&probe)?, &mut hash)?;
+                if copied != size || hex::encode(hash.0.finalize()) != expected { return Err(std::io::Error::other("completed attachment digest differs")); }
+                Ok(true)
+            }).await.map_err(|_| "attachment verification worker is unavailable".to_owned())?.map_err(|_| "completed attachment could not be verified".to_owned())?;
+            if verified { return Ok(path); }
+            completed.await;
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
@@ -1041,6 +1304,7 @@ impl Host {
     }
 
     /// Register under the same admission fence Archive holds, and sync ownership before launch.
+    #[cfg(any(unix, test))]
     pub(crate) async fn begin_owned_reach(&self,agent:&str,req:&crate::reach::local::RunReq)->Result<(Arc<crate::reach::owned::Run>,crate::rt::Shutdown),String>{
         let operation=self.archive_lock(agent);let _admission=operation.lock().await;
         if self.archive_path(agent).is_ok_and(|path|path.exists()){return Err("the agent has an archive transition in progress; no new owned commands may start".into());}
@@ -1058,6 +1322,7 @@ impl Host {
         Ok((run,stop))
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) async fn publish_owned(&self,session:&Session)->Result<(),String>{
         self.persist_archive_transition().await?;
         // The session's driver is the single state publisher. Sending a snapshot taken
@@ -1187,6 +1452,10 @@ impl Host {
             Err(_) if leaving => return Err(Refused::NotTaken(LEAVING.into())),
             Err(e) => return Err(Refused::NotTaken(format!("the session from {from} is unreadable: {e}"))),
         };
+        self.take_over_package(from, pkg, leaving)
+    }
+
+    fn take_over_package(&self, from: &str, pkg: super::moving::Package, leaving: bool) -> Result<(), Refused> {
         // It goes on here an epoch up (`session::start_seeded`).
         let epoch = pkg.state.epoch.saturating_add(1);
         // One take at a time on the machine (CP-T3.2, the nineteenth adversarial check's): two of its
@@ -1298,7 +1567,7 @@ impl Host {
         // Its giver's signed hand-on goes on to the server, and this process's receipt waits for
         // its identity at the epoch it goes on at (docs/ci.md W27-R08).
         if let Some(h) = &pkg.hand_on {
-            crate::runner::custody::took(&pkg.id, epoch, &pkg.events, h);
+            crate::runner::custody::took(&pkg.id, epoch, &pkg.events, h).map_err(Refused::NotTaken)?;
         }
         let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced, local: pkg.handover };
         // Taken over, written so before anything of it runs here: no other process of the machine
@@ -1355,14 +1624,16 @@ impl Host {
     /// nor read how a try at handing it over was decided, so it never goes on as if it was refused.
     fn files_for(&self, id: &str) -> session::Files {
         let me = self.me.clone();
+        let session_id = id.to_owned();
         let me2 = self.me.clone();
         let me3 = self.me.clone();
         let me4 = self.me.clone();
         let me5 = self.me.clone();
         let me6 = self.me.clone();
         session::Files {
+            host: Some(self.me.clone()),
             dir: self.files_dir.join(id),
-            take: Arc::new(move |f: &str| me.upgrade().and_then(|h| h.take_file(f))),
+            take: Arc::new(move |f: &str| me.upgrade().and_then(|h| h.take_file(&session_id, f))),
             // A branch: another session on this machine.
             spawn: Arc::new(move |spec: Spec| {
                 if let Some(h) = me2.upgrade()
@@ -1426,6 +1697,11 @@ impl Host {
     /// another of its runner processes) never is, whatever its limits say now (`super::limit`).
     #[allow(clippy::too_many_arguments, reason = "each says how the session comes to be here")]
     fn open_seeded(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>, handed: Option<Box<session::Handed>>, brought: Vec<(String, String)>, back: bool, new: bool) -> anyhow::Result<Arc<Session>> {
+        self.open_seeded_with_input(id, spec, seed, handed, brought, back, new, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_seeded_with_input(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>, handed: Option<Box<session::Handed>>, brought: Vec<(String, String)>, back: bool, new: bool, prepared_input: Option<super::admission::Input>) -> anyhow::Result<Arc<Session>> {
         if Kind::get(&spec.kind).is_none() {
             anyhow::bail!("unknown harness {:?}", spec.kind);
         }
@@ -1474,9 +1750,14 @@ impl Host {
         if let Some(s) = self.sessions.lock().get(&id) {
             return Ok(Arc::clone(s));
         }
+        let input = prepared_input.or_else(|| self.inbox.clone().map(|inbox| {
+            let input = super::admission::Input::new(0, self.input_budgets.budget(), inbox);
+            let _ = input.controller.lock().restoring();
+            input
+        }));
         let started = match handed {
-            Some(h) => session::start_handed(id.clone(), spec, self.sink.clone(), on_change, files, h),
-            None => session::start_seeded(id.clone(), spec, self.sink.clone(), on_change, files, seed),
+            Some(h) => session::start_handed_input(id.clone(), spec, self.sink.clone(), on_change, files, h, input),
+            None => session::start_seeded_input(id.clone(), spec, self.sink.clone(), on_change, files, seed, input),
         };
         let s = match started {
             Ok(s) => s,
@@ -1542,9 +1823,11 @@ impl Host {
         let operation = self.archive_lock(id);
         let Some(_guard) = operation.try_lock() else { return false };
         let Some(lane) = self.lanes.lock().get(id).map(|(lane, _)| lane.clone()) else { return false };
+        if !self.prepare_admit(id, &c) { return true; }
         match lane.try_send(Lane::Cmd { c: Box::new(c), epoch, at: std::time::Instant::now() }) {
             Ok(()) => true,
             Err(async_channel::TrySendError::Full(Lane::Cmd { c, .. })) => {
+                self.release_unaccepted(id, &c);
                 if let Some((message, _)) = message_of(&c) {
                     let said = Said { message, answer: Err(inbox::Refusal::Full { session: id.to_owned(), limit: LANE }) };
                     let (sink, id) = (self.sink.clone(), id.to_owned());
@@ -1554,13 +1837,87 @@ impl Host {
                 }
                 false
             }
+            Err(async_channel::TrySendError::Closed(Lane::Cmd { c, .. })) => { self.release_unaccepted(id, &c); false }
             Err(_) => false,
+        }
+    }
+
+    /// Each session's input is held to a resource-derived strict budget of its own, through all
+    /// its stages: `bytes`, the share Root's resource events measure, is each one's bound. One
+    /// session's backlog never takes another's room. No timer is introduced.
+    pub fn set_input_budget(&self, bytes: usize) {
+        self.input_budgets.resize(bytes);
+    }
+    /// A transient copy's own budget, at the share: as any one session's, it takes no other's room.
+    pub(crate) fn reserve_input_buffer(&self, bytes: usize) -> Result<Option<super::admission::BufferCharge>, super::admission::Error> { self.input_budgets.budget().reserve_buffer(bytes) }
+
+    fn prepare_admit(&self, id: &str, c: &Command) -> bool {
+        let Command::Admit { peer, token, epoch, generation, peers, command } = c else { return true };
+        let Some(s) = self.get(id) else { return true };
+        let Some((message, _)) = message_of(command) else { return true };
+        let mut core = s.core.lock();
+        let current_epoch = core.state.epoch;
+        let Some(inbox) = self.inbox.clone() else {
+            let mut controller = super::admission::Controller::new(current_epoch, self.input_budgets.budget());
+            let _ = controller.unavailable();
+            let capacity = controller.capacity();
+            core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Waiting { token: *token, epoch: *epoch, cause: super::admission::WaitCause::SourceUnavailable, capacity }) });
+            drop(core);
+            s.input_changed();
+            return false;
+        };
+        let input = core.input.get_or_insert_with(|| super::admission::Input::new(current_epoch, self.input_budgets.budget(), inbox)).clone();
+        let bytes = match super::admission::command_bytes(command) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                let capacity = input.controller.lock().capacity();
+                core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Waiting { token: *token, epoch: *epoch, cause: super::admission::WaitCause::SourceUnavailable, capacity }) });
+                drop(core); s.input_changed(); return false;
+            }
+        };
+        let (decision, capacity) = {
+            let mut controller = input.controller.lock();
+            let _ = controller.peers(peers);
+            let decision = controller.offer_publication(&message, peer, *epoch, bytes, Some(*generation), token.revision, input.now_ns());
+            if matches!(decision, Ok(super::admission::Admission::Reserved(_))) { let _ = controller.bind(&message, *token); }
+            (decision, controller.capacity())
+        };
+        input.observe_physical();
+        core.state.admission = Some(capacity.clone());
+        core.touch_state();
+        let cause = match decision {
+            Ok(super::admission::Admission::Reserved(_) | super::admission::Admission::Existing(_)) => return true,
+            Ok(super::admission::Admission::Waiting { cause, .. }) => cause,
+            Err(super::admission::Error::StaleEpoch) => super::admission::WaitCause::Fenced,
+            Err(_) => super::admission::WaitCause::SourceUnavailable,
+        };
+        core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Waiting { token: *token, epoch: *epoch, cause, capacity }) });
+        drop(core);
+        s.input_changed();
+        false
+    }
+
+    fn release_unaccepted(&self, id: &str, c: &Command) {
+        let Command::Admit { command, .. } = c else { return };
+        let Some((message, _)) = message_of(command) else { return };
+        let Some(s) = self.get(id) else { return };
+        let input = s.core.lock().input.clone();
+        if let Some(input) = input {
+            let mut c = input.controller.lock();
+            if c.lease(&message).is_some_and(|l| l.stage == super::admission::Stage::Reserved) {
+                let _ = c.finish(&message, super::admission::Disposition::Cancelled { reason: super::admission::CancelReason::BeforeAcceptance }, input.now_ns(), false);
+            }
         }
     }
 
     /// Opens session `id`'s lane (with `lanes` held), its first word that the session is here at
     /// `epoch` (`back`: taken back). It goes once its last lane is done.
     fn open_lane(&self, lanes: &mut HashMap<String, (crate::memory::queue::Sender<Lane>, crate::memory::queue::Receiver<()>)>, id: &str, epoch: u64, back: bool) {
+        if let (Some(s), Some(inbox)) = (self.get(id), self.inbox.clone()) {
+            let mut core = s.core.lock();
+            let input = core.input.get_or_insert_with(|| super::admission::Input::new(epoch, self.input_budgets.budget(), inbox));
+            let _ = input.controller.lock().restoring();
+        }
         // At most `LANE` waiting, whatever each carries, as the channel it was held.
         let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, LANE);
         let _ = tx.try_send(Lane::Open { epoch, back });
@@ -1613,7 +1970,25 @@ impl Host {
     pub async fn moving_fence(&self, id: &str, on: bool) -> Result<(), inbox::Refusal> {
         let (Some(inbox), Some(s)) = (&self.inbox, self.get(id)) else { return Ok(()) };
         let epoch = s.epoch();
-        if on { inbox.fence(id, epoch).await } else { inbox.take_back(id, epoch).await.map(|_| ()) }
+        let input = s.core.lock().input.clone();
+        if on && let Some(input) = &input { input.controller.lock().fence(true).map_err(|_| inbox::Refusal::Unavailable { session: id.to_owned(), why: "its source admission fence could not advance".into() })?; }
+        let result = if on { inbox.fence(id, epoch).await } else { inbox.take_back(id, epoch).await.map(|_| ()) };
+        if let Some(input) = input {
+            let capacity = {
+                let mut controller = input.controller.lock();
+                if result.is_ok() && !on { let _ = controller.fence(false); }
+                if matches!(&result, Err(inbox::Refusal::Unavailable { .. })) { let _ = controller.unavailable(); }
+                controller.capacity()
+            };
+            {
+                let mut core = s.core.lock();
+                core.state.admission = Some(capacity.clone());
+                core.out.push(Update::MailFlow { event: Box::new(super::admission::FlowEvent::Capacity { capacity }) });
+                core.touch_state();
+            }
+            s.input_changed();
+        }
+        result
     }
 
     /// The ids of the messages session `id` took that go with it when it moves: its inbox's newest,
@@ -1649,6 +2024,7 @@ impl Host {
                     // What it brought may have taken it past its bound.
                     let _ = inbox.tidy(id).await;
                 }
+                if let Some(s) = self.get(id) { self.replay_session_mail(&s).await; }
             }
             // Only for a session not here (again) by now.
             Lane::Fence { epoch, handover } => {
@@ -1676,6 +2052,35 @@ impl Host {
     /// Command `c` for session `id`, in its turn: a message through its inbox, and on to the
     /// session if it's new there; anything else straight on.
     async fn take(&self, id: &str, c: Command, epoch: Option<u64>) {
+        let c = match c {
+            Command::Admit { peer: _, token, epoch, generation: _, peers: _, command } => {
+                self.take_admitted(id, *command, token, epoch).await;
+                return;
+            }
+            Command::MailAck { message, token, epoch, disposition } => {
+                if let Some(inbox) = &self.inbox { let _ = inbox.acknowledge_pending(id, &message, epoch, &token, disposition.as_ref()).await; }
+                return;
+            }
+            Command::MailPeers { epoch, peers, demand } => {
+                if let Some(s) = self.get(id) {
+                    let input = s.core.lock().input.clone();
+                    if let Some(input) = input {
+                        let capacity = {
+                            let mut c = input.controller.lock();
+                            if c.capacity().epoch != epoch { return; }
+                            let peers_changed = c.peers(&peers).unwrap_or(false);
+                            let demand_changed = c.demand(&demand).unwrap_or(false);
+                            if !peers_changed && !demand_changed { return; }
+                            c.advertised_ready(input.now_ns());
+                            c.capacity()
+                        };
+                        s.mail_flow(super::admission::FlowEvent::Capacity { capacity });
+                    }
+                }
+                return;
+            }
+            other => other,
+        };
         let s = self.get(id);
         // Held (a new build not promoted yet): a message is refused before anything takes it.
         if self.is_held()
@@ -1686,6 +2091,13 @@ impl Host {
             return;
         }
         let at = self.clock.unix_ms();
+        let c = match session::prepare(&self.files_for(id), c).await {
+            Ok(command) => command,
+            Err(failure) => {
+                if let Some(message) = failure.message { self.say(id, Said { message, answer: Err(inbox::Refusal::Unavailable { session: id.to_owned(), why: "attachment materialization is unavailable; no partial communication was accepted".into() }) }).await; }
+                return;
+            }
+        };
         if let Some(said) = take_message(self.inbox.as_deref(), id, s.as_deref(), c, epoch, at).await {
             self.say(id, said).await;
             // Its answer gone: an inbox past its bound lets its oldest ids go now, off the answer's way.
@@ -1693,6 +2105,252 @@ impl Host {
                 let _ = inbox.tidy(id).await;
             }
         }
+    }
+
+    async fn take_admitted(&self, id: &str, c: Command, token: super::mail::Token, epoch: u64) {
+        use super::admission::{Disposition, FlowEvent, Stage, WaitCause};
+        let Some(s) = self.get(id) else { return };
+        let Some((message, digest)) = message_of(&c) else { return };
+        let Some(input) = s.core.lock().input.clone() else { return };
+        let lease = input.controller.lock().lease(&message).cloned();
+        let Some(mut lease) = lease else { return };
+        if self.is_held() || s.is_moving() {
+            self.release_unaccepted(id, &Command::Admit { peer: lease.peer.clone(), token, epoch, generation: 0, peers: Vec::new(), command: Box::new(c) });
+            let capacity = input.controller.lock().capacity();
+            s.mail_flow(FlowEvent::Waiting { token, epoch, cause: WaitCause::Fenced, capacity });
+            return;
+        }
+        lease.stage = Stage::InboxAccepted;
+        let existing = input.inbox.pending(id, &message).await;
+        let original = if matches!(&existing, Ok(None)) && matches!(&c, Command::Send { attachments, .. } if !attachments.is_empty()) {
+            match input.clone_command(&c) {
+                Ok(Some(original)) => Some(original),
+                _ => {
+                    let capacity = { let mut controller = input.controller.lock(); let _ = controller.finish(&message, Disposition::Cancelled { reason: super::admission::CancelReason::BeforeAcceptance }, input.now_ns(), false); controller.capacity() };
+                    s.mail_flow(FlowEvent::Waiting { token, epoch, cause: WaitCause::PhysicalBytes, capacity });
+                    return;
+                }
+            }
+        } else { None };
+        let prepared = match existing {
+            Ok(Some(_)) => Ok(c),
+            Ok(None) => session::prepare(&self.files_for(id), c).await,
+            Err(_) => Err(session::PreparationFailure { message: Some(message.clone()), code: session::PreparationCode::WorkerUnavailable }),
+        };
+        let c = match prepared {
+            Ok(command) => command,
+            Err(_) => {
+                let capacity = {
+                    let mut controller = input.controller.lock();
+                    if controller.lease(&message).is_some_and(|lease| lease.stage == Stage::Reserved) { let _ = controller.finish(&message, Disposition::Cancelled { reason: super::admission::CancelReason::BeforeAcceptance }, input.now_ns(), false); }
+                    controller.capacity()
+                };
+                s.mail_flow(FlowEvent::Waiting { token, epoch, cause: WaitCause::SourceUnavailable, capacity });
+                self.say(id, Said { message, answer: Err(inbox::Refusal::Unavailable { session: id.to_owned(), why: "attachment materialization or source custody is unavailable; original communication remains retained".into() }) }).await;
+                return;
+            }
+        };
+        if matches!(existing, Ok(None)) {
+            let materialized = super::admission::command_bytes(&c);
+            let reserved = match materialized { Ok(bytes) => input.controller.lock().resize(&message, bytes), Err(error) => Err(error) };
+            if !matches!(reserved, Ok(true)) {
+                let capacity = {
+                    let mut controller = input.controller.lock();
+                    if controller.lease(&message).is_some_and(|lease| lease.stage == Stage::Reserved) { let _ = controller.finish(&message, Disposition::Cancelled { reason: super::admission::CancelReason::BeforeAcceptance }, input.now_ns(), false); }
+                    controller.capacity()
+                };
+                s.mail_flow(FlowEvent::Waiting { token, epoch, cause: WaitCause::PhysicalBytes, capacity });
+                return;
+            }
+            if let Some(current) = input.controller.lock().lease(&message) { lease.bytes = current.bytes; }
+        }
+        let original_command = original.as_ref().map_or(&c, |(original, _charge)| original);
+        let answer = input.inbox.accept_input(id, &message, &digest, epoch, self.clock.unix_ms(), &lease, original_command, lease.bytes, &input).await;
+        drop(original);
+        match answer {
+            Ok(answer) => {
+                if !answer.repeat {
+                    let _ = input.controller.lock().stage(&message, Stage::InboxAccepted);
+                    // The durable original remains even if the session stops between the inbox
+                    // commit and its ctl handoff. No rollback may erase accepted custody.
+                    if s.command(c) { let _ = input.controller.lock().stage(&message, Stage::InCtl); }
+                }
+                if let Ok(Some(original)) = input.inbox.pending(id, &message).await {
+                    self.publish_pending(id, &input, original);
+                }
+                self.say(id, Said { message, answer: Ok(answer) }).await;
+            }
+            Err(refusal) => {
+                let _ = input.controller.lock().finish(&message, Disposition::Cancelled { reason: super::admission::CancelReason::BeforeAcceptance }, input.now_ns(), false);
+                let capacity = input.controller.lock().capacity();
+                s.mail_flow(FlowEvent::Waiting { token, epoch, cause: WaitCause::SourceUnavailable, capacity });
+                self.say(id, Said { message, answer: Err(refusal) }).await;
+            }
+        }
+    }
+
+    fn publish_pending(&self, id: &str, input: &super::admission::Input, pending: inbox::Pending) {
+        use super::admission::{Disposition, FlowEvent};
+        let Some(token) = pending.lease.token else { return };
+        let capacity = { let mut c = input.controller.lock(); c.advertised_ready(input.now_ns()); c.capacity() };
+        let event = match pending.disposition {
+            Some(Disposition::Consumed { boundary }) => FlowEvent::Consumed { token, epoch: pending.lease.epoch, boundary, capacity },
+            Some(disposition) => FlowEvent::Disposed { token, epoch: pending.lease.epoch, disposition, capacity },
+            None => FlowEvent::Accepted { token, epoch: pending.lease.epoch, capacity },
+        };
+        if let Some(s) = self.get(id) { s.mail_flow(event); }
+    }
+
+    /// A connection/open event replays durable custody receipts through the ordinary harness
+    /// feed. One row is read and emitted at a time; there is no timer or assembled journal.
+    pub async fn replay_mail(&self) {
+        let sessions: Vec<_> = self.sessions.lock().values().cloned().collect();
+        for s in sessions { self.replay_session_mail(&s).await; }
+    }
+
+    async fn replay_session_mail(&self, s: &Arc<Session>) {
+        let Some(inbox) = self.inbox.clone() else {
+            let capacity = { let mut c = super::admission::Controller::new(s.epoch(), self.input_budgets.budget()); let _ = c.unavailable(); c.capacity() };
+            s.mail_flow(super::admission::FlowEvent::Capacity { capacity });
+            return;
+        };
+        let input = {
+            let mut core = s.core.lock();
+            let epoch = core.state.epoch;
+            core.input.get_or_insert_with(|| super::admission::Input::new(epoch, self.input_budgets.budget(), inbox)).clone()
+        };
+        match input.inbox.promotion(&s.id).await {
+            Ok(Some(promotion)) if promotion.phase != inbox::PromotionPhase::Active => {
+                {
+                    let core = s.core.lock();
+                    let mut controller = input.controller.lock();
+                    // A Head read can finish after this actor completed the transition. It
+                    // cannot re-enter old promotion or restore a completed legacy flight.
+                    if core.state.epoch >= promotion.to_epoch && controller.capacity().epoch == core.state.epoch && !controller.promoting_epoch(promotion.from_epoch, promotion.to_epoch) { return; }
+                    if controller.begin_legacy_epoch(promotion.from_epoch, promotion.to_epoch).is_err() { let _ = controller.unavailable(); return; }
+                }
+                let capacity = input.controller.lock().capacity(); s.mail_flow(super::admission::FlowEvent::Capacity { capacity });
+                let _ = s.promotion_changed().await;
+                return;
+            }
+            Ok(Some(promotion)) if s.epoch() != promotion.to_epoch => { let _ = input.controller.lock().unavailable(); return; }
+            Err(_) => { let _ = input.controller.lock().unavailable(); return; }
+            _ => {}
+        }
+        let mut after = None;
+        let _ = input.controller.lock().restoring();
+        let reconciled = self.reconcile_legacy_mail(s, &input, LegacyReconciliation::Journal).await.is_ok();
+        if !reconciled { let _ = input.controller.lock().unavailable(); }
+        loop {
+            if !reconciled { break; }
+            let next = input.inbox.pending_next(&s.id, after).await;
+            let (key, pending) = match next {
+                Ok(Some(next)) => next,
+                Ok(None) => { let _ = input.controller.lock().restore_complete(); break; }
+                Err(_) => { let _ = input.controller.lock().unavailable(); break; }
+            };
+            after = Some(key);
+            let newly_restored = input.controller.lock().lease(&pending.lease.message).is_none_or(|lease| lease.stage == super::admission::Stage::Carried);
+            if pending.disposition.is_none() && input.controller.lock().restore(pending.lease.clone()).is_err() {
+                let _ = input.controller.lock().unavailable();
+                break;
+            }
+            if newly_restored && pending.disposition.is_none() && pending.lease.stage != super::admission::Stage::ProviderFlight {
+                let already_queued = { let core = s.core.lock(); core.state.queue.iter().chain(core.state.tasks.iter().flat_map(|t| &t.queue)).any(|q| q.id == pending.lease.message) || core.input_stages.contains(&pending.lease.message) };
+                if let Some(command) = pending.current_command() && !already_queued && s.command(command.clone()) { let _ = input.controller.lock().stage(&pending.lease.message, super::admission::Stage::InCtl); }
+            }
+            self.publish_pending(&s.id, &input, pending);
+        }
+        let capacity = { let mut c = input.controller.lock(); c.advertised_ready(input.now_ns()); c.capacity() };
+        s.mail_flow(super::admission::FlowEvent::Capacity { capacity });
+        if input.inbox.promotion(&s.id).await.ok().flatten().is_some() { let _ = s.promotion_changed().await; }
+    }
+
+    /// An old live provider has no new journal yet. Its complete queue bodies and actual native
+    /// flight identities become existing charged debt before an empty journal can grant room.
+    /// At most one extra communication representation is held while its row is committed.
+    async fn reconcile_legacy_mail(&self, s: &Session, input: &super::admission::Input, mode: LegacyReconciliation) -> Result<(), inbox::PromotionError> {
+        use super::admission::{Lease, Stage};
+        let invalid = |error| inbox::PromotionError::Invalid { why: format!("{error:?}") };
+        let mut after: Option<String> = None;
+        loop {
+            let next = {
+                let core = s.core.lock();
+                core.state.queue.iter().chain(core.state.tasks.iter().flat_map(|task| &task.queue))
+                    .filter(|item| after.as_deref().is_none_or(|after| item.id.as_str() > after))
+                    .min_by(|left, right| left.id.cmp(&right.id)).map(|item| item.id.clone())
+            };
+            let Some(message) = next else { break };
+            after = Some(message.clone());
+            match input.inbox.pending(&s.id, &message).await {
+                Ok(Some(pending)) => {
+                    if pending.disposition.is_none() { input.controller.lock().restore(pending.lease).map_err(invalid)?; }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let recovered = {
+                let core = s.core.lock();
+                let item = core.state.queue.iter().map(|item| (None, item)).chain(core.state.tasks.iter().flat_map(|task| task.queue.iter().map(move |item| (Some(task.id.as_str()), item)))).find(|(_, item)| item.id == message);
+                let Some((task, item)) = item else { continue };
+                let bytes = super::admission::queued_command_bytes(item, task).map_err(invalid)?;
+                let lease = Lease { message: message.clone(), peer: String::new(), epoch: core.state.epoch, bytes, stage: Stage::Queued, token: None, handoff: None };
+                {
+                    let mut controller = input.controller.lock();
+                    if let LegacyReconciliation::Debt { from, to } = mode {
+                        if core.state.epoch != from || controller.capacity().epoch != from || !controller.promoting_epoch(from, to) { return Ok(()); }
+                        controller.restore(lease).map_err(invalid)?;
+                        continue;
+                    }
+                    controller.restore(lease.clone()).map_err(invalid)?;
+                }
+                let charge = input.reserve_buffer(bytes).map_err(invalid)?.ok_or(inbox::PromotionError::ResourceHeld)?;
+                let command = Command::Send { id: item.id.clone(), text: item.text.clone(), mode: super::model::SendMode::Queue, attachments: item.attachments.clone(), overrides: item.overrides.clone(), reply_to: item.reply_to.clone(), task: task.map(str::to_owned) };
+                (inbox::Pending::legacy(lease, command), charge)
+            };
+            let (pending, _charge) = recovered;
+            input.inbox.adopt_pending(&s.id, pending, self.clock.unix_ms()).await?;
+        }
+        let mut after: Option<String> = None;
+        loop {
+            let next = {
+                let core = s.core.lock();
+                core.input_legacy_flights.iter().filter(|flight| after.as_deref().is_none_or(|after| flight.id.as_str() > after)).min_by(|left, right| left.id.cmp(&right.id)).map(|flight| flight.id.clone())
+            };
+            let Some(message) = next else { break };
+            after = Some(message.clone());
+            match input.inbox.pending(&s.id, &message).await {
+                Ok(Some(pending)) => {
+                    if pending.disposition.is_none() { input.controller.lock().restore(pending.lease).map_err(invalid)?; }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let recovered = {
+                let core = s.core.lock();
+                let Some(flight) = core.input_legacy_flights.iter().find(|flight| flight.id == message) else { continue };
+                let bytes = core.writes.iter().filter(|wire| flight.matches(wire)).fold(std::mem::size_of::<super::admission::LegacyFlight>().checked_add(flight.id.capacity()), |bytes, wire| bytes.and_then(|bytes| bytes.checked_add(std::mem::size_of::<String>())).and_then(|bytes| bytes.checked_add(wire.capacity())));
+                let bytes = bytes.ok_or_else(|| inbox::PromotionError::Invalid { why: "legacy retained byte count overflowed".into() })?;
+                let lease = Lease { message: message.clone(), peer: String::new(), epoch: core.state.epoch, bytes, stage: Stage::ProviderFlight, token: None, handoff: None };
+                {
+                    let mut controller = input.controller.lock();
+                    if let LegacyReconciliation::Debt { from, to } = mode {
+                        if core.state.epoch != from || controller.capacity().epoch != from || !controller.promoting_epoch(from, to) { return Ok(()); }
+                        controller.restore(lease).map_err(invalid)?;
+                        continue;
+                    }
+                    controller.restore(lease.clone()).map_err(invalid)?;
+                }
+                let charge = input.reserve_buffer(bytes).map_err(invalid)?.ok_or(inbox::PromotionError::ResourceHeld)?;
+                let writes = core.writes.iter().filter(|wire| flight.matches(wire)).cloned().collect();
+                (inbox::Pending::opaque(lease, writes), charge)
+            };
+            let (pending, _charge) = recovered;
+            input.inbox.adopt_pending(&s.id, pending, self.clock.unix_ms()).await?;
+        }
+        Ok(())
     }
 
     /// A message for session `id` this machine couldn't read, as its inbox answers it
@@ -1996,9 +2654,22 @@ impl Host {
     /// re-executes itself next: an in-place upgrade), where each goes on as it was, mid-turn
     /// included ([`Host::restore`]). One that can't be handed over is stopped, and starts again
     /// there from its record (its conversation goes on). Returns how many were handed over.
-    pub async fn hand_over_all(&self) -> usize {
+    pub async fn hand_over_all(&self) -> Result<usize, String> {
         let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
-        let handed = futures::future::join_all(sessions.iter().map(|s| async move { (Arc::clone(s), crate::rt::timeout(Duration::from_secs(15), s.hand_over()).await.ok().flatten()) })).await;
+        self.save_checked().map_err(|_| "the active sessions could not be durably recorded before handover".to_owned())?;
+        let prepared = futures::future::join_all(sessions.iter().map(|s| async move { (Arc::clone(s), s.hand_over().await) })).await;
+        let mut handed = Vec::new();
+        let mut failure = None;
+        for (session, result) in prepared {
+            match result {
+                Ok(h) => handed.push((session, h)),
+                Err(why) => { failure.get_or_insert(why); },
+            }
+        }
+        if let Some(why) = failure {
+            self.resume_prepared(handed).await?;
+            return Err(why);
+        }
         let mut out: HashMap<String, Box<session::Handed>> = HashMap::new();
         for (s, h) in handed {
             match h {
@@ -2026,7 +2697,7 @@ impl Host {
                     #[cfg(unix)]
                     let _ = crate::os::try_reap(h.process.pid);
                 }
-                return 0;
+                return Err("the next image's native handover record could not be durably written".into());
             }
             // Their pipes kept open across the exec that comes next, only now: a process started
             // while they were handed over would hold them for good.
@@ -2036,31 +2707,79 @@ impl Host {
                 }
             }
         }
-        n
+        Ok(n)
     }
 
     /// Every session, handed to another runner process of this machine (a blue/green upgrade,
     /// `crate::bluegreen`): each with its spec and, still running, its harness process (`None`:
     /// it couldn't be handed over, was stopped, and starts again there from its spec). They are no
     /// longer this runner's.
-    pub async fn move_out(&self) -> Vec<(Saved, Option<Box<session::Handed>>)> {
-        self.move_out_signing(false).await.into_iter().map(|(rec, handed, _)| (rec, handed)).collect()
+    pub async fn move_out(&self) -> Result<Vec<(Saved, Option<Box<session::Handed>>)>, String> {
+        Ok(self.move_out_signing(false, None).await?.into_iter().map(|(rec, handed, _)| (rec, handed)).collect())
     }
 
     /// [`Host::move_out`], each session signed for as it goes when `sign` (the new build takes
     /// sessions so, docs/ci.md W27-R08): its hand-on, at the epoch it has, of its timeline as it's
     /// handed over, if this process holds its key at that epoch.
-    #[allow(clippy::disallowed_methods)] // (b) retry backoff, picked
-    pub async fn move_out_signing(&self, sign: bool) -> Vec<(Saved, Option<Box<session::Handed>>, Option<serde_json::Value>)> {
+    pub(crate) async fn move_out_signing(&self, sign: bool, destination: Option<transfer::NativeDestination>) -> Result<Vec<(Saved, Option<Box<session::Handed>>, Option<serde_json::Value>)>, String> {
         let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+        // An older green cannot silently ignore the journal descriptor. Refuse before any
+        // native detach, and never substitute in-memory IDs for an unreadable source journal.
         // They take no messages as they're handed over: sent again, those go where they went.
         for s in &sessions {
             s.stop_taking();
         }
-        let handed = futures::future::join_all(sessions.iter().map(|s| async move { (Arc::clone(s), crate::rt::timeout(Duration::from_secs(15), s.hand_over()).await.ok().flatten()) })).await;
         // What their lanes hold is done first, all at once and for a while at most.
         if crate::rt::timeout(SETTLE_WAIT, futures::future::join_all(sessions.iter().map(|s| self.settled(&s.id)))).await.is_err() {
-            tracing::warn!(target: "kiln.sends", event = "settle_timed_out", "the sessions' lanes didn't settle in time as they were handed over: the ids their inboxes took go as they stand");
+            for session in &sessions { session.resume_taking(); }
+            return Err("source lanes did not settle; the current owner is retained".into());
+        }
+        let mut carried = HashMap::new();
+        if let Some(inbox) = &self.inbox {
+            for session in &sessions {
+                let kept = match inbox.pending_next(&session.id, None).await {
+                    Ok(Some(_)) if destination.as_ref().is_some_and(|destination| !destination.mail || !super::handing::takes_mail()) => Err("the new runner/server has not negotiated journal handover; the source is retained".into()),
+                    Ok(_) => carry(inbox, &session.id).await.map_err(|_| "source inbox identities could not be read before handover".to_owned()),
+                    Err(_) => Err("source mail journal could not be read before handover".to_owned()),
+                };
+                match kept {
+                    Ok(kept) => { carried.insert(session.id.clone(), kept); },
+                    Err(why) => { for session in &sessions { session.resume_taking(); } return Err(why); },
+                }
+            }
+        }
+        let prepared = futures::future::join_all(sessions.iter().map(|s| async move { (Arc::clone(s), s.hand_over().await) })).await;
+        let mut handed = Vec::new();
+        let mut failure = None;
+        for (session, result) in prepared {
+            match result {
+                Ok(h) => handed.push((session, h)),
+                Err(why) => { session.resume_taking(); failure.get_or_insert(why); },
+            }
+        }
+        if let Some(why) = failure { self.resume_prepared(handed).await?; return Err(why); }
+        // Every native actor has now acknowledged its reversible pause and final journal
+        // flush. Export only after that acknowledgment, never against an earlier live picture.
+        let mut exports = HashMap::new();
+        let mut guards = HashMap::new();
+        let mut failure = None;
+        for (session, native) in &handed {
+            guards.insert(session.id.clone(), Arc::new(self.archive_lock(&session.id).lock_owned().await));
+            match self.export_native_journal(session, native.as_deref(), destination.as_ref()).await {
+                Ok(export) => { exports.insert(session.id.clone(), export); },
+                Err(why) => { failure = Some(why); break; },
+            }
+        }
+        if let Some(why) = failure {
+            // export_native_journal does not return an error after an uncertain Offer. It
+            // reconciles that exact phase; only a known abort may reach this rollback.
+            let successful: Vec<_> = exports.values().filter_map(|export| export.as_ref().map(|(manifest, journal, bound)| {
+                let session = handed.iter().find(|(session, _)| session.id == manifest.session).map(|(session, _)| Arc::clone(session));
+                session.map(|session| { let mut saved = record(&session); saved.mail = Some(manifest.clone()); saved.journal = Some(Arc::clone(journal)); saved.mail_bound = *bound; saved.local_mail = (!bound).then(|| self.inbox.as_ref().map(|inbox| transfer::NativeReceipt::new(Arc::clone(inbox)))).flatten(); saved })
+            })).flatten().collect();
+            if !self.abort_native_records(&successful).await? { return futures::future::pending().await; }
+            self.resume_prepared(handed).await?;
+            return Err(why);
         }
         let mut out = Vec::new();
         for (s, h) in handed {
@@ -2072,26 +2791,14 @@ impl Host {
                 let _ = crate::os::try_reap(pid);
             }
             let mut rec = record(&s);
-            // What its inbox took goes with it (its newest ids), and this one takes nothing more for
-            // it. Its harness is handed over already, so it goes either way: its inbox unreadable
-            // (tried a few times), it takes the ids it holds itself, said.
-            if let Some(inbox) = &self.inbox {
-                let mut kept = Err(inbox::Refusal::Unavailable { session: s.id.clone(), why: "not read yet".into() });
-                for wait in [0u64, 50, 250] {
-                    crate::rt::sleep(Duration::from_millis(wait)).await;
-                    kept = carry(inbox, &s.id).await;
-                    if kept.is_ok() {
-                        break;
-                    }
-                }
-                let kept = kept.unwrap_or_else(|_| {
-                    tracing::warn!(target: "kiln.sends", event = "carry_own_ids", session = %s.id, "a session handed to the next runner process goes with the ids it holds itself (its queue, its timeline, those it brought and hasn't taken in): its inbox couldn't be read");
-                    // Those it brought last: it took nothing since (it refuses messages until
-                    // they're in), so they're its newest.
-                    let mut ids = own_ids(&s);
-                    ids.extend(inbox.waiting(&s.id));
-                    ids
-                });
+            rec.native_guard = guards.remove(&s.id);
+            if let Some(Some((manifest, journal, bound))) = exports.remove(&s.id) {
+                rec.mail = Some(manifest);
+                rec.journal = Some(journal);
+                rec.mail_bound = bound;
+                rec.local_mail = (!bound).then(|| self.inbox.as_ref().map(|inbox| transfer::NativeReceipt::new(Arc::clone(inbox)))).flatten();
+            }
+            if let Some(kept) = carried.remove(&s.id) {
                 (rec.inbox, rec.inbox_digests) = split_kept(kept);
             }
             self.sessions.lock().remove(&s.id);
@@ -2107,17 +2814,42 @@ impl Host {
             out.push((rec, h, hand_on));
         }
         self.mark_dirty();
-        out
+        Ok(out)
+    }
+
+    /// Only used for a known pre-offer preparation failure. No uncertain/committed destination
+    /// is rolled back here. Retained native handles are reattached through the existing path.
+    async fn resume_prepared(&self, prepared: Vec<(Arc<Session>, Option<Box<session::Handed>>)>) -> Result<(), String> {
+        let mut failure = None;
+        for (session, handed) in prepared {
+            if let Some(inbox) = &self.inbox { inbox.take_back(&session.id, session.epoch()).await.map_err(|e| e.to_string())?; }
+            if handed.is_some() {
+                let rec = record(&session);
+                self.sessions.lock().remove(&session.id);
+                if self.move_in_plain(rec, handed, None).is_err() { failure.get_or_insert("a prepared native process could not resume; its accepted journal remains retained".to_owned()); }
+            } else { session.resume_taking(); }
+        }
+        match failure { Some(why) => Err(why), None => Ok(()) }
     }
 
     /// Take over a session another runner process of this machine handed over (blue/green): with
     /// its process (its descriptors are this process's now), or started again from its record (a
     /// turn its stop cut short is picked up first).
-    pub fn move_in(&self, rec: Saved, handed: Option<Box<session::Handed>>) -> anyhow::Result<()> {
+    pub async fn move_in(&self, rec: Saved, handed: Option<Box<session::Handed>>) -> anyhow::Result<()> {
+        if let (Some(inbox), Some(manifest)) = (&self.inbox, &rec.mail)
+            && inbox.transfer(&rec.id).await?.is_some_and(|state| state.manifest == *manifest && state.role == inbox::transfer::Role::Source)
+        {
+            return self.restore_native_source(rec, handed).await;
+        }
+        let prepared = self.prepare_native_import(rec, handed).await.map_err(anyhow::Error::msg)?;
+        self.move_in_prepared(prepared).await
+    }
+
+    fn move_in_plain(&self, rec: Saved, handed: Option<Box<session::Handed>>, input: Option<super::admission::Input>) -> anyhow::Result<()> {
         match handed {
             Some(h) => {
                 let (harness, ran) = (rec.harness.clone(), rec.ran.clone());
-                let session = self.open_seeded(Some(rec.id), rec.spec, None, Some(h), kept_pairs(rec.inbox, rec.inbox_digests), true, false)?;
+                let session = self.open_seeded_with_input(Some(rec.id), rec.spec, None, Some(h), kept_pairs(rec.inbox, rec.inbox_digests), true, false, input)?;
                 // What its harness runs stays under it; the watch finds the rest again.
                 *session.ran.lock() = (harness, ran);
                 *session.carried.lock() = rec.carried;
@@ -2132,7 +2864,8 @@ impl Host {
                 let found = super::survivors::scan(&[(rec.id.clone(), None)]);
                 let apart = found.get(&rec.id).map(|f| f.apart.clone()).unwrap_or_default();
                 let now_s = u64::try_from(self.clock.unix_s()).unwrap_or(0);
-                self.open_record(rec, None, apart, now_s, true).map(|_| ())
+                let seed = (rec.epoch > 0).then(|| session::Seed { events: Vec::new(), state: super::model::State { epoch: rec.epoch, ..Default::default() }, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: true });
+                self.open_record_with_input(rec, seed, apart, now_s, true, input).map(|_| ())
             }
         }
     }
@@ -2188,7 +2921,14 @@ impl Host {
     /// otherwise as before (a Claude Code session's history from its transcript).
     pub fn restore_from(&self, store: Option<&crate::convo::store::Store>) {
         tracing::info!(how = %crate::os::contain::how(), "agents' processes are held together by");
+        let fenced = match self.native_restore_fences() {
+            Ok(fenced) => fenced,
+            Err(why) => { tracing::warn!(%why, "native ownership markers could not be read; automatic restore remains fenced"); return; }
+        };
         let mut handed = self.take_handover();
+        // A marker only withholds action. Exact durable ownership is reconciled asynchronously
+        // before this process may stop a shared survivor or start a replacement writer.
+        handed.retain(|id, _| !fenced.contains(id));
         let mut saved: Vec<Saved> = match self.file.as_ref().map(|f| (f, std::fs::read(f))) {
             Some((file, Ok(raw))) => serde_json::from_slice(&raw).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, file = %file.display(), "unreadable agent session record; starting without it");
@@ -2196,17 +2936,19 @@ impl Host {
             }),
             _ => Vec::new(),
         };
+        saved.retain(|saved| !fenced.contains(&saved.id));
         // Restoring intent can precede the active-record write. Recover that snapshot only
         // when no newer active record exists. Corrupt markers remain safely archived.
         let mut recovering = HashMap::new();
         let mut snapshot_restore = HashSet::new();
-        let mut foreign_or_busy = HashSet::new();
+        let mut foreign_or_busy = fenced.clone();
         let mut archive_file_guards = Vec::new();
         let directory = self.archive_dir();
         if let Some(entries) = directory.and_then(|p| std::fs::read_dir(p).ok()) {
             for entry in entries.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")) {
                 let path = entry.path();
                 let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_owned();
+                if fenced.contains(&id) { continue; }
                 let lock = crate::os::with_mode(std::fs::OpenOptions::new().create(true).truncate(false).write(true), 0o600).open(path.with_extension("lock"));
                 let lock = match lock {
                     Ok(lock) if lock.try_lock().is_ok() => lock,
@@ -2341,6 +3083,10 @@ impl Host {
     /// left running. How many such were found. `back`: this host takes it back (blue/green that
     /// never happened).
     fn open_record(&self, s: Saved, seed: Option<session::Seed>, apart: Vec<super::survivors::Ran>, now_s: u64, back: bool) -> anyhow::Result<usize> {
+        self.open_record_with_input(s, seed, apart, now_s, back, None)
+    }
+
+    fn open_record_with_input(&self, s: Saved, seed: Option<session::Seed>, apart: Vec<super::survivors::Ran>, now_s: u64, back: bool, input: Option<super::admission::Input>) -> anyhow::Result<usize> {
         let seed = match s.carried.clone() {
             Some(items) => {
                 let mut seed = seed.unwrap_or_else(|| session::Seed { events: Vec::new(), state: super::model::State { cwd: session::resolve_cwd(s.spec.cwd.as_deref()), ..Default::default() }, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: false });
@@ -2361,7 +3107,7 @@ impl Host {
             alive.retain(|r| r.pid != h.pid);
         }
         let trees = super::survivors::trees(&alive);
-        let session = self.open_seeded(Some(s.id), s.spec, seed, None, kept_pairs(s.inbox, s.inbox_digests), back, false)?;
+        let session = self.open_seeded_with_input(Some(s.id), s.spec, seed, None, kept_pairs(s.inbox, s.inbox_digests), back, false, input)?;
         restore_owned_reach(&session, s.owned_reach);
         let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume || s.move_on_limit;
         if !trees.is_empty() {
@@ -2705,19 +3451,6 @@ pub(crate) async fn carry(inbox: &Inbox, id: &str) -> Result<Vec<(String, String
     })
 }
 
-/// The ids of the messages session `s` holds itself (each without a digest): those in its queue,
-/// and those its timeline shows it was sent. What its inbox handed it: what goes with it when its
-/// inbox can't be read and it must go (handed to this machine's next runner process).
-fn own_ids(s: &Session) -> Vec<(String, String)> {
-    let core = s.core.lock();
-    let mut ids: Vec<String> = core.events().filter_map(|e| match &e.body {
-        Body::User { client_id: Some(c), .. } if !c.is_empty() => Some(c.clone()),
-        _ => None,
-    }).collect();
-    ids.extend(core.state.queue.iter().map(|q| q.id.clone()).filter(|q| !q.is_empty()));
-    ids.into_iter().map(|id| (id, String::new())).collect()
-}
-
 pub(crate) fn message_of(c: &Command) -> Option<(String, String)> {
     match c {
         Command::Send { id, text, attachments, .. } if !id.is_empty() => {
@@ -2890,6 +3623,7 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
     let exit = super::model::ExitInfo::now(None, Some(error.to_owned()));
     let info = Info {
         id: id.to_owned(),
+        deferred: Default::default(), queue_partial: false, queue_revision: None, queue_next: None,
         kind: spec.kind.clone(),
         kind_name: kind.map_or_else(|| spec.kind.clone(), |k| k.name.to_owned()),
         target: String::new(),
@@ -2905,6 +3639,7 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         harness_session: None,
         approvals: Vec::new(),
         queued: 0,
+        admission: None,
         queue: Vec::new(),
         said: Vec::new(),
         tasks_running: 0,
@@ -2980,6 +3715,77 @@ fn free_claim(c: Option<crate::reach::place::Claim>) {
 mod tests {
     use super::*;
     use kiln_seams::clock::SimClock;
+    use crate::util::Must as _;
+
+    /// The journal failure is the real Host adoption path, not a synthetic consumption event.
+    /// Certificate verification is covered by the isolated native upgrade proof; this fixture
+    /// drives the owner/journal ordering beneath that boundary on real file-backed Records.
+    #[test]
+    fn legacy_reconciliation_retries_before_epoch_activation_after_original_only_budget() -> anyhow::Result<()> {
+        use super::super::admission::{FlightProtocol, Input, LegacyFlight, Stage};
+        use kiln_seams::records::Consistency;
+        crate::rt::block_on(async {
+            for prior_unavailable in [false, true] {
+                let directory = tempfile::tempdir()?;
+                let records = crate::records::open(&directory.path().join("records.db"))?;
+                let (sink, _updates) = async_channel::unbounded();
+                let host = Host::with_records(sink, None, Limits::default(), Arc::new(SimClock::new()), Some(records.clone()));
+                let session = host.open(Some("legacy-original-before-rebind".into()), no_harness(directory.path()))?;
+                host.settled(&session.id).await;
+                crate::rt::timeout(super::super::registry::ANSWER_WAIT, session.close_wait()).await.map_err(|_| anyhow::anyhow!("fixture owner did not stop"))?;
+                let inbox = host.inbox().cloned().ok_or_else(|| anyhow::anyhow!("fixture journal missing"))?;
+                let input = Input::new(0, host.input_budgets.budget(), Arc::clone(&inbox));
+                let flight = LegacyFlight { id: "0123456789abcdef0123456789abcdef".into(), protocol: FlightProtocol::Claude, request: None };
+                let bytes = size_of::<LegacyFlight>() + flight.id.capacity();
+                {
+                    let mut core = session.core.lock();
+                    core.input = Some(input.clone());
+                    core.state.epoch = 0;
+                    core.state.status = Status::Running;
+                    core.state.manual_resume = false;
+                    core.input_legacy_flights = vec![flight.clone()];
+                    core.writes.clear();
+                }
+                if prior_unavailable { input.controller.lock().unavailable().map_err(|error| anyhow::anyhow!("{error:?}"))?; }
+                let frozen = session.core.lock().freeze();
+                let (_, events) = frozen.handover_source();
+                let proof = crate::runner::custody::LegacyProof::of(&session.id, 0, events, None).map_err(anyhow::Error::msg)?;
+                host.set_input_budget(super::super::state_view::FRAME);
+                inbox.prepare_promotion(&session.id, 0, 1, proof, &host.input_budgets.budget(), Some(&input)).await?;
+                inbox.advance_promotion(&session.id, 1, inbox::PromotionPhase::AwaitingCertificate, &host.input_budgets.budget(), Some(&input)).await?;
+                // Existing retained bytes fit; the temporary representation required by adoption
+                // does not. No original is removed to make a journal copy fit.
+                host.set_input_budget(bytes);
+                host.replay_session_mail(&session).await;
+                assert_eq!(input.controller.lock().capacity().epoch, 0);
+                assert!(inbox.pending(&session.id, &flight.id).await?.is_none());
+                assert_eq!(records.scan("inbox-pending", kiln_seams::records::Scan { prefix: Vec::new(), after: None, limit: 1, at: Consistency::Linearizable }).await?.rows.len(), 0);
+                // A real external budget improvement permits the existing owner to reconcile.
+                host.set_input_budget(super::super::state_view::FRAME);
+                assert!(host.reconcile_legacy_mail(&session, &input, LegacyReconciliation::Journal).await.is_ok(), "the complete retained original must become replayable before row rebinding");
+                let original = inbox.pending(&session.id, &flight.id).await?.ok_or_else(|| anyhow::anyhow!("original has no durable row before rebind"))?;
+                assert_eq!(original.origin, inbox::Origin::LegacyOpaque);
+                assert!(original.command.is_none() && original.lease.token.is_none() && original.disposition.is_none());
+                assert_eq!((original.lease.message.as_str(), original.lease.epoch, original.lease.bytes, original.lease.stage), (flight.id.as_str(), 0, bytes, Stage::ProviderFlight));
+                assert_eq!(input.controller.lock().capacity().epoch, 0, "durability must precede controller epoch change");
+                inbox.advance_promotion(&session.id, 1, inbox::PromotionPhase::Rebinding, &host.input_budgets.budget(), Some(&input)).await?;
+                assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, inbox::promotion::RebindStep::Row);
+                assert_eq!(inbox.rebind_promotion_step(&session.id, &input).await?, inbox::promotion::RebindStep::Complete);
+                assert_eq!(inbox.pending(&session.id, &flight.id).await?.must()?.lease.epoch, 1);
+                {
+                    let mut controller = input.controller.lock();
+                    controller.rebind_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    controller.complete_legacy_reconciliation().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    controller.activate_legacy_epoch(0, 1).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    let capacity = controller.capacity();
+                    assert_eq!((capacity.epoch, capacity.admitted, capacity.bytes), (1, 1, bytes));
+                    if prior_unavailable { assert_eq!(capacity.target, 0, "a genuine prior unavailable state must remain held"); }
+                    else { assert!(capacity.target > capacity.admitted, "successful owner reconciliation left promotion unavailable after a temporary copy refusal"); }
+                }
+            }
+            Ok(())
+        })
+    }
 
     /// A host on a simulated clock of its own, never moved: its watch never looks and its record
     /// is written only when a test says (`save_now`).
@@ -4388,6 +5194,19 @@ while True:
                 self.inner.commit(tx).await
             })
         }
+        fn commit_owned<'a>(&'a self, tx: kiln_seams::records::Tx, owner: Box<dyn Send + Sync>) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Rev, kiln_seams::records::Refusal>> {
+            use std::sync::atomic::Ordering;
+            struct Owned { tx: kiln_seams::records::Tx, owner: Box<dyn Send + Sync> }
+            let owned = Owned { tx, owner };
+            Box::pin(async move {
+                if self.stalled.load(Ordering::SeqCst) {
+                    self.waiting.fetch_add(1, Ordering::SeqCst);
+                    while self.stalled.load(Ordering::SeqCst) { crate::rt::sleep(Duration::from_millis(5)).await; }
+                    self.waiting.fetch_sub(1, Ordering::SeqCst);
+                }
+                self.inner.commit_owned(owned.tx, owned.owner).await
+            })
+        }
         fn changes<'a>(&'a self, family: &'a str, after: kiln_seams::records::Rev, limit: usize) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Changes, kiln_seams::records::Refusal>> {
             self.inner.changes(family, after, limit)
         }
@@ -4527,12 +5346,12 @@ while True:
                 inbox.accept("bg", &format!("m{n}"), &d, None, 1).await?;
             }
             let newest = format!("m{}", most.saturating_sub(1));
-            let moved = blue.move_out().await;
+            let moved = blue.move_out().await.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(moved.len() == 1, "one session handed over");
             let (tx2, rx2) = async_channel::unbounded();
             let green = with_inbox(tx2);
             for (rec, handed) in moved {
-                green.move_in(rec, handed)?;
+                green.move_in(rec, handed).await?;
             }
             assert!(green.command("bg", message(&newest, "x")));
             let said = answers(&rx2, 1).await?;
@@ -4553,7 +5372,7 @@ while True:
             blue.open(Some("rb".into()), no_harness(dir.path()))?;
             assert!(blue.command("rb", message("m0", "before")));
             anyhow::ensure!(matches!(answers(&rx, 1).await?.first().map(|s| &s.answer), Some(Ok(_))), "taken before");
-            let moved = blue.move_out().await;
+            let moved = blue.move_out().await.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(moved.len() == 1, "one session handed over");
             // Its inbox here fenced, as it is by the time a rollback comes.
             let inbox = blue.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
@@ -4567,7 +5386,7 @@ while True:
             }
             anyhow::ensure!(fenced, "the session's old lane never fenced its inbox");
             for (rec, handed) in moved {
-                blue.move_in(rec, handed)?;
+                blue.move_in(rec, handed).await?;
             }
             assert!(blue.command("rb", message("m1", "after the rollback")));
             assert!(blue.command("rb", message("m0", "before")));
@@ -4686,7 +5505,7 @@ while True:
             crate::rt::sleep(Duration::from_secs(1)).await;
             let out = crate::rt::timeout(Duration::from_secs(45), host.move_out()).await;
             drop(rx);
-            anyhow::ensure!(out.is_ok_and(|m| m.len() == 1), "the handover hung on a full sink");
+            anyhow::ensure!(out.is_ok_and(|m| m.is_ok_and(|m| m.len() == 1)), "the handover hung on a full sink");
             Ok(())
         })
     }

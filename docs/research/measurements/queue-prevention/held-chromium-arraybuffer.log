@@ -1,0 +1,1 @@
+{"engine":"chromium","result":"pass","checks":["two native tab writers","reload with original bytes","changed original file identity refused","abort","quota refusal","account isolation","legacy bytes preserved"]}

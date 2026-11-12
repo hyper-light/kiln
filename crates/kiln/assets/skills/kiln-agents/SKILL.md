@@ -129,6 +129,9 @@ page in kiln, or Mission Control), then wait for it again or go on with somethin
 
 ## Steering and ending
 
-`agents_send` (`queue` after its turn, `steer` into it, `now` stopping it) and `agents_interrupt`
-work on your own children (and theirs) only. `agents_stop` ends one; `children: true` ends what
-it started too. End children you no longer need: each holds a harness process on its machine.
+`agents_send` defaults to `steer`, into the turn under way; use `queue` to wait until after its
+turn. You may send either to any agent that works for the same person, whoever started it; a
+fellow agent is told the message is from you and how to answer. `now` stops a turn and works on
+your own children (and theirs) only, as does `agents_interrupt`. `agents_stop` ends one;
+`children: true` ends what it started too. End children you no longer need: each holds a harness
+process on its machine.

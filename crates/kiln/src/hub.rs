@@ -696,6 +696,9 @@ pub struct Hub {
     /// Each machine's recent samples (the server's too): read by the overview, written a sample at a
     /// time, each machine's own copy swapped in with it (`crate::rcu`).
     pub history: crate::rcu::Rcu<HashMap<String, Arc<VecDeque<HostSample>>>>,
+    /// W21-R15: the newest event-driven reading of each runner, for its next UI sample.
+    /// Flushed on the server sampler's declared deadline; raw history and placement stay immediate.
+    sample_events: crate::rcu::Rcu<HashMap<String, HostSample>>,
     pub wake: Notify,
     pub launching: crate::rcu::Rcu<HashMap<String, Launch>>,
     pub started: Instant,
@@ -902,6 +905,10 @@ impl Hub {
         let records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::StoreRecords::open(store.clone())?);
         let live = crate::live::Live::new(&cfg.server);
         let runners = Arc::new(crate::rt::Changed::new());
+        // The CI legs' kernel places a run's legs that arrive together by the auction once
+        // declared (`[reach] auction`; docs/lb.md "The auction"; LB08).
+        let mut fast_legs = legs::Legs::default();
+        fast_legs.set_auction(cfg.reach.auction);
         let hub = Arc::new(Self {
             cfg,
             store,
@@ -942,6 +949,7 @@ impl Hub {
             ai_seq: AtomicU64::new(1),
             file_requests: Default::default(),
             history: Default::default(),
+            sample_events: Default::default(),
             wake: Notify::new(),
             launching: Default::default(),
             started: Instant::now(),
@@ -991,7 +999,7 @@ impl Hub {
             offers: crate::offers::Offers::default(),
             topo: parking_lot::Mutex::default(),
             session_places: parking_lot::Mutex::default(),
-            legs: parking_lot::Mutex::default(),
+            legs: parking_lot::Mutex::new(fast_legs),
             session_place_req: AtomicU64::new(1),
             places,
             tasks,
@@ -1535,12 +1543,14 @@ impl Hub {
     }
 
     pub fn record_sample(&self, agent: &str, s: HostSample) {
-        self.history.update(|h| {
+        let first = self.history.update(|h| {
             let q = Arc::make_mut(h.entry(agent.to_owned()).or_default());
+            let first = q.is_empty();
             if q.len() >= HISTORY {
                 q.pop_front();
             }
             q.push_back(s.clone());
+            first
         });
         // The overview says the server's newest (goal 10, plan 01a1a87b2dae step 2).
         if agent == "server" {
@@ -1554,7 +1564,25 @@ impl Hub {
                 crate::observe::hub::host_sample(agent, &s);
             }
         }
-        self.emit(&ServerEvent::Sample { agent: agent.to_owned(), sample: Box::new(s) });
+        if agent == "server" || first {
+            self.emit(&ServerEvent::Sample { agent: agent.to_owned(), sample: Box::new(s) });
+            if agent == "server" {
+                self.flush_sample_events();
+            }
+        } else {
+            // A run's starts/ends and OS pressure can produce readings far more often than
+            // the page's configured cadence. Keep only its newest UI reading between deadlines.
+            self.sample_events.update(|pending| pending.insert(agent.to_owned(), s.clone()));
+        }
+    }
+
+    fn flush_sample_events(&self) {
+        // Take the pending readings atomically: a reading arriving during publication stays
+        // for the next declared deadline. The last reading is sent even if the runner goes quiet.
+        let pending = self.sample_events.update(std::mem::take);
+        for (agent, sample) in pending {
+            self.emit(&ServerEvent::Sample { agent, sample: Box::new(sample) });
+        }
     }
 
     // ------------------------------------------------------------ agent view
@@ -1997,7 +2025,11 @@ impl Hub {
     /// toward that runner go on a live link (shed, or a test build's chaos: `metrics::net().drops`),
     /// where it was said every 5 s. Nothing wakes it while nothing is due.
     pub async fn commands_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let net = crate::metrics::net();
+        self.commands_loop_with(crate::metrics::net()).await
+    }
+
+    /// W13-R01 / goal 9: a fixture owns its drop notifications; production uses the process's.
+    async fn commands_loop_with(self: Arc<Self>, net: &crate::metrics::NetMetrics) -> anyhow::Result<()> {
         let mut seen = lost_toward(&net.toward_all());
         let (mut at, mut look) = (None, true);
         loop {
@@ -3606,7 +3638,19 @@ impl Hub {
                 }
             }
             // The features it speaks by name: each says them all, superseding the last.
-            AgentMsg::Features { names } => self.instances.update(|i| i.set_features(peer, names.clone())),
+            AgentMsg::Features { names } => {
+                let skills = proto::feature::speaks(&names, crate::skills::FEATURE);
+                self.instances.update(|i| i.set_features(peer, names.clone()));
+                self.harness.mail_delivery.changed();
+                // One that installs skills is told what it lays out (docs/agents.md, "Skills kiln installs").
+                if skills {
+                    let hub = Arc::clone(self);
+                    crate::rt::spawn(async move { crate::skills::sync(&hub).await });
+                }
+            }
+            // Installed skills on its machine: the files it wants, its packages' states, a folder's files.
+            AgentMsg::Skills { json } => crate::api::boxed(|| crate::skills::heard(self, &agent, peer, &json)).await,
+            AgentMsg::SkillFile { req, sha256, offset, data, done } => crate::skills::heard_file(peer, req, &sha256, offset, &data, done),
             // A runner's admission hint (docs/needs.md E5, AUDIT O1): the offers view takes it, and
             // its room goes on to the other runners' owners.
             // An owner's word on an agent session's start it was asked to place (AUDIT M4): to
@@ -3645,6 +3689,7 @@ impl Hub {
                 self.change_agent(&agent, |a| a.dropped.clone_from(&dropped));
             }
             // Hand-overs between a machine's runner processes (`crate::handovers`).
+            AgentMsg::HarnessMailTransfer { json } => crate::api::boxed(|| crate::harness::mail_transfer::heard(self, peer, json)).await,
             AgentMsg::HarnessHandOver { session, offset, data, done } => crate::api::boxed(|| self.handover_piece(&agent, peer, session, offset, data, done)).await,
             AgentMsg::HarnessAdopted { session, error } => crate::api::boxed(|| self.handover_adopted(&agent, peer, session, error)).await,
             // A frame of the server's this runner couldn't read: noted against it, and on the page
@@ -3759,7 +3804,7 @@ impl Hub {
     /// back, for the owner to take first at its next turn.
     pub(crate) fn runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, r: crate::harness::copies::RunnerUpdate, over: &dyn Fn(u64) -> bool) -> Option<crate::harness::copies::Ingest> {
         let began = Instant::now();
-        let crate::harness::copies::RunnerUpdate { peer, agent, session, update, shipped, arrived, handed, taken } = r;
+        let crate::harness::copies::RunnerUpdate { peer, agent, session, update, shipped, arrived, handed, taken, fill } = r;
         // Its third leg: from the hub's loop handing it over to its owner taking it (goal 10, plan 01a1a87b2dae
         // step 4).
         if let Some(h) = handed {
@@ -3768,6 +3813,16 @@ impl Hub {
         // The frames it makes carry where it came from, for the viewers who ask (goal 10, plan 01a1a87b2dae step 5).
         let runner_us = taken.map(|t| u64::try_from(t.as_micros()).unwrap_or(u64::MAX));
         let _came = crate::harness::live::carrying(Some(crate::harness::live::Came { arrived_us: arrived.map(crate::harness::live::us_at), took_us: crate::harness::live::us_at(began), runner_us }));
+        // A state its runner sent bounded keeps the copy's values for what it left out, which the server reads from the
+        // runner itself; what's read comes in where the copy still lacks it (CP-T3.2's views filled in: `crate::harness::fill`).
+        let update = match update {
+            u @ (crate::harness::core::Update::State { .. } | crate::harness::core::Update::Closed) => {
+                let last = if matches!(u, crate::harness::core::Update::State { .. }) { s.get(&session).and_then(crate::harness::copies::Mirror::last_state) } else { None };
+                let source = crate::harness::fill::Source { peer, agent: Arc::clone(&agent), shipped };
+                crate::harness::fill::taken(self, last, &session, u, fill, source)?
+            }
+            u => u,
+        };
         let rest = self.judge_runner_update(s, peer, &agent, &session, update, shipped, over);
         let done = Instant::now();
         crate::route_latency::observe(crate::route_latency::Class::Runner, arrived.map(|at| began.saturating_duration_since(at)), done.saturating_duration_since(began));
@@ -3880,7 +3935,19 @@ impl Hub {
     /// Runner process `peer`'s update to its agent session `session` (`FromRunner::Harness`), on a frame of its own or a
     /// channel item ([`Hub::on_wire`]), its runner `runner` heard. `arrived`: as [`Hub::on_net_at`]'s.
     async fn on_session_update(self: &Arc<Self>, peer: PeerId, runner: &Arc<str>, session: String, update: Box<crate::harness::core::Update>, taken: Option<Duration>, arrived: &mut Option<Arrived>) {
+        if let crate::harness::core::Update::Open { info, .. } = &*update && !crate::harness::mail_transfer::allows_claim(self, peer, &session, Some(info.epoch)).await { return; }
+        // The answer to a read the server made of the session's state itself (`crate::harness::fill`): its, not its viewers'.
+        let Some(update) = self.harness.fills.answered(update) else { return };
         match *update {
+            crate::harness::core::Update::MailFlow { event } => {
+                let owner = self.instances.load().owner(&crate::instances::Owned::Agent(session.clone()));
+                if owner == Some(peer) && self.peers.load().contains_key(&peer) && self.harness.runs_on(&session, runner) {
+                    let from = crate::harness::registry::Location::Machine(runner.to_string());
+                    if let Err(error) = crate::harness::mail_delivery::flow(self, &session, from, *event).await {
+                        tracing::warn!(session = %session, error = %error, "source communication receipt remains unacknowledged");
+                    }
+                }
+            }
             // An inbox's answer counts wherever it came from (it's for the message sent there),
             // and says nothing of where the session runs: whoever waits for it is told, and
             // the session's messages still go where it runs.
@@ -3909,10 +3976,15 @@ impl Hub {
                 // session's id for that: the rest hand theirs on, not a copy (goal 9, plan
                 // 01a1a87b2cec step 5).
                 let applied = lifecycle.then(|| session.clone());
-                let r = crate::harness::copies::RunnerUpdate { peer, agent: Arc::clone(runner), session, update: u, shipped, arrived: arrival.map(|a| a.at), handed: Some(handed), taken };
+                let r = crate::harness::copies::RunnerUpdate { peer, agent: Arc::clone(runner), session, update: u, shipped, arrived: arrival.map(|a| a.at), handed: Some(handed), taken, fill: false };
                 self.harness.from_runner(r).await;
                 if let Some(id) = applied {
                     self.harness.applied(&id).await;
+                    self.harness.mail_delivery.changed();
+                    // W20-R01: an Open supplies the actual cwd and machine (including a move).
+                    // Only lifecycle updates rescope installed skills, never conversation chunks.
+                    let hub = Arc::clone(self);
+                    crate::rt::spawn(async move { crate::api::boxed(|| crate::skills::sync(&hub)).await });
                 }
             }
         }
@@ -4208,6 +4280,11 @@ impl Hub {
             FromRunner::Harness { session, update, taken } => self.on_session_update(peer, runner, session, update, taken, arrived).await,
             FromRunner::HarnessInventory(inv) => {
                 let mut inv = *inv;
+                let mut allowed = Vec::new();
+                for id in std::mem::take(&mut inv.sessions) {
+                    if crate::harness::mail_transfer::allows_claim(self, peer, &id, None).await { allowed.push(id); }
+                }
+                inv.sessions = allowed;
                 // A copy it kept of a session that went on elsewhere since isn't its own: it's
                 // told to let go of it now, at its runner's first word since, not once the copy
                 // announces it again (W27-R08: the twin of 2026-10-25 ran on for ten minutes).
@@ -5090,6 +5167,9 @@ impl Hub {
         // pick at a time now, its poll ended once its turn would pass the quantum (goal 9, plan 01a1a87b2cec step 3: no
         // poll past the quantum, `rt::Turns::end`).
         let mut turns = crate::rt::Turns::new();
+        // A run's ordinary legs that wait together in this look are placed together, as the auction puts them once
+        // it's declared (docs/lb.md "The auction"; LB08, W05-R26). Picks not used by the end of the walk are let go.
+        let mut joint = Joint { legs: &self.legs, picks: self.joint_picks(&queued) };
         for job in queued {
             turns.end().await;
             let Some(spec) = job.spec.clone() else { continue };
@@ -5109,7 +5189,11 @@ impl Hub {
                     continue;
                 }
             }
-            let chosen = self.pick_agent(&job);
+            let chosen = match joint.picks.remove(&job.id) {
+                // Its runner as the auction put it, if that's still this job's to take; else as before.
+                Some((name, run)) => self.fast_chosen(&job, name, run).or_else(|| self.pick_agent(&job)),
+                None => self.pick_agent(&job),
+            };
             match chosen {
                 Some(agent) => {
                     let ephemeral = self.agents.load().get(&agent).is_some_and(|a| a.ephemeral);
@@ -5317,30 +5401,33 @@ impl Hub {
     /// (no member has room, or its pick fails what's this job's alone), and the engine's own pick
     /// decides as before.
     fn pick_fast(&self, job: &Job) -> Option<String> {
-        let spec = job.spec.as_ref()?;
-        if !matches!(v1_incoming(spec.exclusive, &spec.resources), kiln_ci::sched::state::Incoming::Ordinary) {
-            return None;
-        }
-        let asked = v1_asked(&spec.resources);
-        let need = [asked.cpu.get(), asked.mem, asked.disk, u64::from(asked.gpu)];
-        let placement = job.placement.as_ref().map(|p| format!("{p:?}")).unwrap_or_default();
-        let key = legs::Legs::kind(&job.labels, &spec.requires, &placement);
+        let (key, need) = fast_kind(job)?;
         let g = self.agents.load();
-        let member = |a: &AgentLive| {
-            a.connected
-                && !a.draining
-                && !a.exclusive
-                && a.skew.takes_work()
-                && a.dedicated_job.is_none()
-                && (a.ephemeral || self.runner_built(&a.name))
-                && job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l))
-                && meets(job, a)
-                && job.placement.as_ref().is_none_or(|p| p.allows(&a.name))
-        };
         let agents: &HashMap<String, Arc<AgentLive>> = &g;
-        let (name, run) = self.legs.lock().pick(key, need, agents, |a: &AgentLive| a.name.as_str(), member)?;
-        // What's this job's alone: not where it runs already, not where it was just refused, and
-        // room for one more there by the engine's own rule.
+        let (name, run) = self.legs.lock().pick(key, need, agents, |a: &AgentLive| a.name.as_str(), |a: &AgentLive| self.fast_member(job, a))?;
+        self.fast_chosen(job, name, run)
+    }
+
+    /// Whether runner `a` is one a leg of `job`'s kind may run on, by [`Self::pick_agent`]'s rules
+    /// (what's the kind's, not this job's alone): the kernel's members for it.
+    fn fast_member(&self, job: &Job, a: &AgentLive) -> bool {
+        a.connected
+            && !a.draining
+            && !a.exclusive
+            && a.skew.takes_work()
+            && a.dedicated_job.is_none()
+            && (a.ephemeral || self.runner_built(&a.name))
+            && job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l))
+            && meets(job, a)
+            && job.placement.as_ref().is_none_or(|p| p.allows(&a.name))
+    }
+
+    /// The kernel picked runner `name` for `job` under `run`: its runner if that passes what's this
+    /// job's alone (not where it runs already, not where it was just refused, room for one more
+    /// there by the engine's own rule), its pick then sent; else `None`, its room back in the
+    /// kernel's view.
+    fn fast_chosen(&self, job: &Job, name: String, run: kiln_ci::lb::Handle) -> Option<String> {
+        let g = self.agents.load();
         let declined = self.declined.load();
         let fits = g.get(&name).is_some_and(|a| {
             !a.running.contains(&job.id)
@@ -5355,6 +5442,45 @@ impl Hub {
             legs.unsent(run);
             None
         }
+    }
+
+    /// The kernel's picks for the queue's ordinary legs that arrived together: each run's legs of
+    /// one kind and need, placed together by [`legs::Legs::pick_batch`] (the auction, once
+    /// declared, where their times and the members' rates tell them apart), by job. Empty when
+    /// the auction isn't declared, or nothing was decided together.
+    fn joint_picks(&self, queued: &[Job]) -> HashMap<String, legs::Pick> {
+        let mut picks = HashMap::new();
+        if !self.cfg.reach.auction {
+            return picks;
+        }
+        // Each run's ordinary legs by kind and need, in the queue's order.
+        let mut groups: Vec<((String, u64, kiln_ci::lb::Amounts), Vec<&Job>)> = Vec::new();
+        for job in queued {
+            let Some((key, need)) = fast_kind(job) else { continue };
+            let k = (job.run_id.clone(), key, need);
+            match groups.iter_mut().find(|(g, _)| *g == k) {
+                Some((_, v)) => v.push(job),
+                None => groups.push((k, vec![job])),
+            }
+        }
+        let g = self.agents.load();
+        let agents: &HashMap<String, Arc<AgentLive>> = &g;
+        for ((_, key, need), jobs) in groups {
+            let Some(first) = jobs.first().copied() else { continue };
+            if jobs.len() < 2 {
+                continue;
+            }
+            // A v1 leg's expected time: none known yet (no history of v1 jobs is kept by job), so
+            // the costs can't tell such legs apart and they're picked one at a time, as before.
+            let times: Vec<Option<u64>> = jobs.iter().map(|_| None).collect();
+            let got = self.legs.lock().pick_batch(key, need, &times, agents, |a: &AgentLive| a.name.as_str(), |a: &AgentLive| self.fast_member(first, a));
+            for (job, pick) in jobs.iter().zip(got.unwrap_or_default()) {
+                if let Some(p) = pick {
+                    picks.insert(job.id.clone(), p);
+                }
+            }
+        }
+        picks
     }
 
     async fn check_timeouts(&self) -> anyhow::Result<()> {
@@ -5505,7 +5631,10 @@ impl Hub {
                     sampler = Some(back);
                     self.record_sample("server", sample);
                 }
-                Err(e) => tracing::warn!(error = %format!("{e:#}"), "the server's host sample wasn't taken"),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "the server's host sample wasn't taken");
+                    self.flush_sample_events();
+                }
             }
         }
     }
@@ -5595,6 +5724,39 @@ impl Hub {
 /// What a v1 job holds of the runner it runs on (docs/ci.md W05-R03): an exclusive one asking for
 /// CPUs (`resources: { cpu, memory }`) holds them and that memory; asking for none, the whole
 /// runner. A `resources:` that isn't a quantity asks for none.
+/// An ordinary leg's kind for the server's kernel (its labels, constraints and where a retry asked
+/// it to run) and its need (CPUs in thousandths, memory, disk, GPUs). `None`: not an ordinary leg
+/// (no spec, `exclusive`, or a whole runner), which the engine's own pick places.
+fn fast_kind(job: &Job) -> Option<(u64, kiln_ci::lb::Amounts)> {
+    let spec = job.spec.as_ref()?;
+    if !matches!(v1_incoming(spec.exclusive, &spec.resources), kiln_ci::sched::state::Incoming::Ordinary) {
+        return None;
+    }
+    let asked = v1_asked(&spec.resources);
+    let placement = job.placement.as_ref().map(|p| format!("{p:?}")).unwrap_or_default();
+    Some((legs::Legs::kind(&job.labels, &spec.requires, &placement), [asked.cpu.get(), asked.mem, asked.disk, u64::from(asked.gpu)]))
+}
+
+/// The kernel's picks made for a look at the queue ([`Hub::joint_picks`]): those not used by the
+/// time the look ends (a job skipped, a claim not made, an error) have their room put back in the
+/// kernel's view.
+struct Joint<'a> {
+    legs: &'a parking_lot::Mutex<legs::Legs>,
+    picks: HashMap<String, legs::Pick>,
+}
+
+impl Drop for Joint<'_> {
+    fn drop(&mut self) {
+        if self.picks.is_empty() {
+            return;
+        }
+        let mut legs = self.legs.lock();
+        for (_, (_, run)) in self.picks.drain() {
+            legs.unsent(run);
+        }
+    }
+}
+
 pub(crate) fn v1_incoming(exclusive: bool, resources: &crate::pipeline::Resources) -> kiln_ci::sched::state::Incoming {
     kiln_ci::sched::state::Incoming::of(exclusive, &v1_asked(resources))
 }
@@ -5669,6 +5831,54 @@ fn drains_on_its_own(reason: &str) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// W21-R15: event-driven placement readings reach history and metrics at once, while
+    /// a page gets each runner's newest reading on the server's configured sample cadence.
+    #[test]
+    fn w21_r15_ui_samples_keep_the_last_event_reading_without_delaying_history() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let mut events = hub.subscribe_events()?;
+            let runner = format!("sample-{}", crate::util::new_id());
+            let other = format!("sample-{}", crate::util::new_id());
+            let sample = |ts_ms| HostSample { ts_ms, ..Default::default() };
+            let mut samples = || -> anyhow::Result<Vec<(String, i64)>> {
+                let mut got = Vec::new();
+                while let Ok(text) = events.try_recv() {
+                    let v: serde_json::Value = serde_json::from_str(&text)?;
+                    if v.get("type").and_then(serde_json::Value::as_str) == Some("sample") {
+                        let agent = v.get("agent").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("sample without its runner"))?;
+                        let at = v.pointer("/sample/ts_ms").and_then(serde_json::Value::as_i64).ok_or_else(|| anyhow::anyhow!("sample without its timestamp"))?;
+                        got.push((agent.to_owned(), at));
+                    }
+                }
+                Ok(got)
+            };
+            hub.record_sample(&runner, sample(1));
+            anyhow::ensure!(samples()? == [(runner.clone(), 1)], "the first reading is immediate");
+            hub.record_sample(&runner, sample(2));
+            hub.record_sample(&runner, sample(3));
+            anyhow::ensure!(samples()?.is_empty(), "placement events must not flood the UI between its sample deadlines");
+            let history = hub.history.get();
+            anyhow::ensure!(history.get(&runner).is_some_and(|q| q.len() == 3 && q.back().is_some_and(|s| s.ts_ms == 3)), "every raw reading stays available immediately");
+            anyhow::ensure!(metrics::agent_samples().load().get(&runner).is_some_and(|s| s.ts_ms == 3), "metrics see the latest raw reading immediately");
+            hub.record_sample(&other, sample(4));
+            anyhow::ensure!(samples()? == [(other.clone(), 4)], "a different runner's first reading is immediate too");
+            hub.record_sample(&other, sample(5));
+            anyhow::ensure!(samples()?.is_empty(), "pending readings wait for the existing telemetry deadline");
+            // The sampler takes the server's sample on that configured deadline. No further
+            // runner event is needed to publish its final reading.
+            hub.record_sample("server", sample(6));
+            let mut got = samples()?;
+            got.sort();
+            let mut want = vec![(runner, 3), (other, 5), ("server".into(), 6)];
+            want.sort();
+            anyhow::ensure!(got == want, "each runner's latest reading is published: {got:?}");
+            hub.record_sample("server", sample(7));
+            anyhow::ensure!(samples()? == [("server".into(), 7)], "a published runner sample is not sent again");
+            Ok(())
+        })
+    }
 
     fn unread(wire: crate::wire::unread::Wire, from: crate::wire::unread::Sender) -> crate::wire::unread::Unread {
         crate::wire::unread::Unread { wire, from, what: "variant 51".into(), code: crate::wire::unread::Code::Unknown, why: "AgentMsg has 51 variants".into() }
@@ -6409,7 +6619,9 @@ pub(crate) mod tests {
                 })
                 .await;
             let polls = Arc::new(AtomicU64::new(0));
-            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Arc::clone(&hub).commands_loop())));
+            let net = Arc::new(crate::metrics::NetMetrics::default());
+            let (h, metrics) = (Arc::clone(&hub), Arc::clone(&net));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), async move { h.commands_loop_with(&metrics).await })));
             crate::rt::settled(&polls, until).await?;
             let sent = |item: bool| {
                 hub.sent.lock().iter().filter(|(p, m)| *p == PEER && matches!((m, item), (ServerMsg::Wire(Frame::Item { .. }), true) | (ServerMsg::Wire(Frame::Have(_)), false))).count()
@@ -6418,13 +6630,19 @@ pub(crate) mod tests {
             let _answer = hub.cmds.ask(move |c| c.push(PEER, crate::wire::commands::Kind::Live, None, b"keys".to_vec(), now)).await;
             hub.commands_due.notify();
             until_held("the command sent at once", until, || sent(true) == 1).await?;
-            let went = Instant::now();
+            // W13-R01 / goal 9: read the sender's deadline before delaying its observer.
+            // Time spent scheduling this test must not restart the command's patience.
+            let retry_due = hub.cmds.ask(|c| c.due(Instant::now())).await.flatten().ok_or_else(|| anyhow::anyhow!("the sent command has no retry deadline"))?;
+            anyhow::ensure!(retry_due >= now + crate::wire::commands::PATIENCE, "retry due before the queued command's patience");
+            // Goal 9 regression control: the observer may be delayed independently of the
+            // sender. A retry's patience still starts when the command core sends it.
+            crate::rt::sleep(crate::wire::commands::PATIENCE / 2).await;
             until_held("sent again at its patience", until, || sent(true) == 2).await?;
-            anyhow::ensure!(went.elapsed() + Duration::from_millis(50) >= crate::wire::commands::PATIENCE, "sent again before its patience: {:?}", went.elapsed());
+            anyhow::ensure!(Instant::now() >= retry_due, "sent again before its patience deadline");
             let haves = sent(false);
-            crate::metrics::net().dropped(PEER, proto::LANE_FILES, "shed", 1);
+            net.dropped(PEER, proto::LANE_FILES, "shed", 1);
             until_held("its Have said again for a frame shed", until, || sent(false) == haves + 1).await?;
-            crate::metrics::net().dropped(PEER, proto::LANE_FILES, "refused", 1);
+            net.dropped(PEER, proto::LANE_FILES, "refused", 1);
             crate::rt::sleep(Duration::from_millis(300)).await;
             anyhow::ensure!(sent(false) == haves + 1, "said again for a frame refused");
             hub.shutdown.cancel();
@@ -6500,10 +6718,9 @@ pub(crate) mod tests {
         })
     }
 
-    /// Goal 9: an idle server's commands, terminals, retention and fleet loops wake for nothing. Do: a scratch hub with
-    /// nothing queued, running, listed or due; each loop started and counted by its polls, settled; three seconds in
-    /// which no frame anywhere was let go (a test beside it that drops one wakes the commands loop, as it should: the span
-    /// is taken again). Expect: no poll of any (they woke every second, 30 s, hour and minute).
+    /// Goal 9: the scratch server's idle loops never poll without an input or due item. Its
+    /// command loop uses its own transport metrics, so another fixture cannot wake it between
+    /// the settled snapshot and the quiet window (W13-R01).
     #[test]
     fn g9_an_idle_servers_commands_terminals_retention_and_fleet_loops_wake_for_nothing() -> anyhow::Result<()> {
         let until = Instant::now() + Duration::from_secs(300);
@@ -6511,26 +6728,20 @@ pub(crate) mod tests {
             let hub = scratch_hub().await?;
             let loops = [("commands", Arc::new(AtomicU64::new(0))), ("terminals", Arc::new(AtomicU64::new(0))), ("retention", Arc::new(AtomicU64::new(0))), ("fleet", Arc::new(AtomicU64::new(0)))];
             let [(_, commands), (_, terminals), (_, retention), (_, fleet)] = &loops;
-            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(commands), Arc::clone(&hub).commands_loop())));
+            let net = Arc::new(crate::metrics::NetMetrics::default());
+            let h = Arc::clone(&hub);
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(commands), async move { h.commands_loop_with(&net).await })));
             drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(terminals), Arc::clone(&hub).terminal_loop())));
             drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(retention), Arc::clone(&hub).retention_loop())));
             drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(fleet), crate::fleet::follow_loop(Arc::clone(&hub)))));
-            loop {
-                for (_, polls) in &loops {
-                    crate::rt::settled(polls, until).await?;
-                }
-                let seen: Vec<u64> = loops.iter().map(|(_, polls)| polls.load(Ordering::Relaxed)).collect();
-                let drops = crate::metrics::net().toward_all();
-                crate::rt::sleep(Duration::from_secs(3)).await;
-                if !Arc::ptr_eq(&drops, &crate::metrics::net().toward_all()) {
-                    anyhow::ensure!(Instant::now() < until, "never a quiet span: frames let go all along");
-                    continue;
-                }
-                for ((name, polls), was) in loops.iter().zip(&seen) {
-                    let polled = polls.load(Ordering::Relaxed).saturating_sub(*was);
-                    anyhow::ensure!(polled == 0, "{name}: {polled} polls in 3 s, idle");
-                }
-                break;
+            for (_, polls) in &loops {
+                crate::rt::settled(polls, until).await?;
+            }
+            let seen: Vec<u64> = loops.iter().map(|(_, polls)| polls.load(Ordering::Relaxed)).collect();
+            crate::rt::sleep(Duration::from_secs(3)).await;
+            for ((name, polls), was) in loops.iter().zip(&seen) {
+                let polled = polls.load(Ordering::Relaxed).saturating_sub(*was);
+                anyhow::ensure!(polled == 0, "{name}: {polled} polls in 3 s, idle");
             }
             hub.shutdown.cancel();
             Ok(())

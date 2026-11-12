@@ -680,7 +680,7 @@ fn kind_of(data: &[u8]) -> usize {
 
 /// Format: the kinds of agent session update whose reads are expected apart ([`UPDATE_COSTS`]), by the tag each is
 /// written with (`crate::harness::core::Update`'s `t`, in its order; a test holds them to what it writes).
-const UPDATE_TAGS: [&str; 11] = ["open", "closed", "state", "meta", "events", "changes", "stream", "reply", "inbox", "reset", "changes_patch"];
+const UPDATE_TAGS: [&str; 12] = ["open", "closed", "state", "meta", "events", "changes", "stream", "reply", "inbox", "reset", "changes_patch", "mail_flow"];
 
 /// What reading an agent session's update of each kind is expected to take, a byte a unit: one for each of [`UPDATE_TAGS`]
 /// (goal 9, plan 01a1a87b2cec step 3), as [`KIND_COSTS`] keeps one for each kind of message. Their JSON costs a byte
@@ -1081,7 +1081,11 @@ impl Carries for AgentMsg {
             | AgentMsg::Features { .. }
             // The offers hint's JSON is read by its view (lb/offers-ui), which keeps what it can.
             | AgentMsg::Offers { .. }
-            | AgentMsg::Placed { .. }) => return Ok(Carried::Nothing(m)),
+            | AgentMsg::Placed { .. }
+            // Installed skills' JSON is read by `crate::skills`, which keeps what it can.
+            | AgentMsg::Skills { .. }
+            | AgentMsg::SkillFile { .. }
+            | AgentMsg::HarnessMailTransfer { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }
@@ -1235,6 +1239,9 @@ impl Carries for ServerMsg {
             | ServerMsg::Offers { .. }
             | ServerMsg::Place { .. }
             | ServerMsg::Copies { .. }
+            | ServerMsg::Skills { .. }
+            | ServerMsg::SkillFile { .. }
+            | ServerMsg::HarnessMailTransfer { .. }
             | ServerMsg::Later { .. }
             | ServerMsg::Back { .. }) => return Ok(Carried::Nothing(m)),
         };
@@ -2132,7 +2139,7 @@ mod tests {
     /// own (a file, a socket of its own, what it's about to send), each named here.
     #[test]
     fn no_handler_reads_a_payload_of_its_own() {
-        const OWN: [(&str, &str); 8] = [
+        const OWN: [(&str, &str); 10] = [
             ("serde_json::from_slice(&json).ok()?", "a session handed back by this machine's newer build, on a socket of its own"),
             ("serde_json::from_value(cut_value(v, budget))", "its own event, cut to fit a frame before it's sent"),
             ("let handed: Vec<HandedTerm> = match serde_json::from_slice(&raw)", "terminals the runner before it handed over, in a file"),
@@ -2141,6 +2148,8 @@ mod tests {
             ("serde_json::from_slice(&raw).unwrap_or_else(|e| {", "the sessions it handed itself, and its record of its sessions, in its files"),
             ("let state: super::model::State = kept.state.as_deref().and_then(|s| serde_json::from_str(s).ok())?;", "what its conversation store kept"),
             ("let mut events: Vec<super::model::Event> = kept.events.iter().filter_map(|e| serde_json::from_str(&e.body).ok()).collect();", "what its conversation store kept"),
+            ("Some((k.strip_prefix(\"topo/link/\")?.to_owned(), serde_json::from_str(&v).ok()?))", "the fleet's link history its store kept (LB08)"),
+            ("self.store.kv_get(\"topo/codrops\".to_owned()).await.ok().flatten().and_then(|v| serde_json::from_str(&v).ok())", "the fleet's co-drops its store kept (LB08)"),
         ];
         const READS: [&str; 7] = ["serde_json::from_str", "serde_json::from_slice", "serde_json::from_value", "serde_json::from_reader", "feed::decode(", "learner::decode(", "wire::decode("];
         let sources = [("hub.rs", include_str!("../hub.rs")), ("agent.rs", include_str!("../agent.rs")), ("harness/host.rs", include_str!("../harness/host.rs"))];

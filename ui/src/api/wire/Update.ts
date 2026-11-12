@@ -5,6 +5,7 @@ import type { AgentState } from "./AgentState";
 import type { Event } from "./Event";
 import type { FileChange } from "./FileChange";
 import type { FileKey } from "./FileKey";
+import type { FlowEvent } from "./FlowEvent";
 import type { Meta } from "./Meta";
 import type { Said } from "./Said";
 import type { JsonValue } from "./serde_json/JsonValue";
@@ -12,4 +13,4 @@ import type { JsonValue } from "./serde_json/JsonValue";
 /**
  * A change for the UI (and for the server's mirror of a machine's session).
  */
-export type Update = { "t": "open", info: AgentInfo, since?: number, } | { "t": "closed" } | { "t": "state", state: AgentState, } | { "t": "meta", meta: Meta, } | { "t": "events", events: Array<Event>, } | { "t": "changes", files: Array<FileChange>, } | { "t": "stream", id: string, text: string, } | { "t": "reply", client: string, value: JsonValue, } | { "t": "inbox", said: Said, } | { "t": "reset", from?: number, } | { "t": "changes_patch", set?: Array<FileChange>, gone?: Array<FileKey>, };
+export type Update = { "t": "open", info: AgentInfo, since?: number, } | { "t": "closed" } | { "t": "state", state: AgentState, } | { "t": "meta", meta: Meta, } | { "t": "events", events: Array<Event>, } | { "t": "changes", files: Array<FileChange>, } | { "t": "stream", id: string, text: string, } | { "t": "reply", client: string, value: JsonValue, } | { "t": "inbox", said: Said, } | { "t": "reset", from?: number, } | { "t": "changes_patch", set?: Array<FileChange>, gone?: Array<FileKey>, } | { "t": "mail_flow", event: FlowEvent, };

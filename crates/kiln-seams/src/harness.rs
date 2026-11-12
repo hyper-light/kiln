@@ -17,6 +17,10 @@ use crate::conformance::{Case, Failure, ensure, same};
 /// How a command went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sent {
+    /// Durable sender custody is committed; receiver admission is still pending.
+    Retained,
+    /// Delivery was explicitly cancelled; its original remains in communication history.
+    Cancelled,
     /// The agent's runner has it.
     Delivered,
     /// No agent by that id is known.
@@ -25,6 +29,10 @@ pub enum Sent {
     Unreachable,
     /// The agent's inbox holds its most: nothing was delivered.
     Full,
+}
+
+impl Sent {
+    pub fn has_custody(self) -> bool { matches!(self, Self::Delivered | Self::Retained) }
 }
 
 /// kiln's agents, to the code that drives them.
@@ -41,6 +49,11 @@ pub trait HarnessPort: Send + Sync + 'static {
     fn catalog(&self, id: &str) -> Option<Value>;
     /// Hands `command` to agent `id`.
     fn send<'a>(&'a self, id: &'a str, command: Self::Command) -> BoxFuture<'a, Sent>;
+    /// An explicit replaceable state publication. Implementations without durable status
+    /// replacement deliver each original normally; they must never silently discard one.
+    fn send_status<'a>(&'a self, id: &'a str, command: Self::Command, _key: &'a str) -> BoxFuture<'a, Sent> {
+        self.send(id, command)
+    }
 }
 
 // ---------------------------------------------------------------------------------- simulator
@@ -313,7 +326,8 @@ fn c3<F: HarnessFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         f.open("conformance-a").await?;
         for t in ["one", "two", "three"] {
-            same(&format!("sending {t:?}"), f.port().send("conformance-a", f.say(t)).await, Sent::Delivered)?;
+            let sent = f.port().send("conformance-a", f.say(t)).await;
+            ensure(sent.has_custody(), || format!("sending {t:?}: {sent:?} transferred no custody"))?;
         }
         let heard = heard(f, "conformance-a").await?;
         same("what the agent was told", heard.iter().map(String::as_str).filter(|h| ["one", "two", "three"].contains(h)).collect::<Vec<_>>(), vec!["one", "two", "three"])
@@ -333,7 +347,8 @@ fn c5<F: HarnessFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         f.open("conformance-a").await?;
         f.open("conformance-b").await?;
-        same("sending to a", f.port().send("conformance-a", f.say("for a only")).await, Sent::Delivered)?;
+        let sent = f.port().send("conformance-a", f.say("for a only")).await;
+        ensure(sent.has_custody(), || format!("sending to a: {sent:?} transferred no custody"))?;
         ensure(heard(f, "conformance-a").await?.iter().any(|h| h == "for a only"), || "what was sent to a didn't reach it".into())?;
         ensure(!heard(f, "conformance-b").await?.iter().any(|h| h == "for a only"), || "what was sent to one agent reached another".into())
     })

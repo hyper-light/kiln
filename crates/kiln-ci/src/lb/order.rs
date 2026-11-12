@@ -24,6 +24,15 @@ pub fn class_of(rate: u64) -> u32 {
     e * 64 + m as u32
 }
 
+/// The least rate in class `c`: (64 + m) << (e - 6) for class (e, m), e >= 6; below 64 (a rate
+/// of no real machine), the octave's foot. Members of a class aren't ordered within it, so what
+/// reads rates at the kernel's resolution reads this.
+#[inline]
+pub fn class_lo(c: u32) -> u64 {
+    let (e, m) = (c / 64, u64::from(c % 64));
+    if e >= 6 { (64 + m) << (e - 6) } else { 1u64 << e }
+}
+
 /// The most a rate in class `c` or any below it can be: a bound for the members an order's walk
 /// hasn't reached. Class (e, m), e >= 6, holds [(64 + m) << (e - 6), (65 + m) << (e - 6)); below
 /// 64 (a rate of no real machine) the octave's top bounds it.
@@ -60,7 +69,7 @@ impl Default for Order {
 
 impl Order {
     pub fn new() -> Order {
-        Order { head: vec![NIL; BUCKETS as usize], class: Vec::new(), next: Vec::new(), prev: Vec::new(), words: [0; 64], summary: 0 }
+        Order { head: Vec::new(), class: Vec::new(), next: Vec::new(), prev: Vec::new(), words: [0; 64], summary: 0 }
     }
 
     /// Runner `r`'s class (NIL: not in the order).
@@ -85,6 +94,9 @@ impl Order {
     }
 
     fn link(&mut self, r: u32, c: u32) {
+        // W05-R26: an unused order has no heap storage. Its first valid member activates
+        // the fixed class domain; the bound comes from the rate encoding, not a cache limit.
+        if self.head.is_empty() { self.head.resize(BUCKETS as usize, NIL); }
         let n = r as usize + 1;
         if self.class.len() < n {
             self.class.resize(n, NIL);

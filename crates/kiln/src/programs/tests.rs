@@ -167,8 +167,15 @@ async fn until(what: &str, holds: impl Fn() -> bool) -> anyhow::Result<()> {
 
 /// Session `id`'s state changed as its machine would report it (its usage, a pause).
 async fn report(hub: &Hub, id: &str, f: impl FnOnce(&mut crate::harness::model::State)) -> anyhow::Result<()> {
-    let mut st = hub.harness.state(id).ok_or_else(|| anyhow::anyhow!("no session {id}"))?;
-    f(&mut st);
+    let session = hub.harness.local.get(id).ok_or_else(|| anyhow::anyhow!("no source session {id}"))?;
+    // The test's provider report is authoritative on its owner too; later real source
+    // events must not restore the usage that preceded this report.
+    let st = {
+        let mut core = session.core.lock();
+        f(&mut core.state);
+        core.touch_state();
+        core.state.clone()
+    };
     hub.harness.ingest(&crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(st) }).await;
     Ok(())
 }
@@ -200,6 +207,7 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         crate::rt::spawn(async move {
             let _ = crate::harness::registry::Registry::run_local(h).await;
         });
+        // No relay runs until the first notice's retained state has been observed below.
         let dir = tempfile::tempdir()?;
         let spec = |name: &str, parent: Option<&str>| Spec {
             kind: "claude".into(),
@@ -218,6 +226,7 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
                 // Settled: its harness (there's none) didn't start, so what it says next is what
                 // the test reports for it.
                 until("the session settled", || hub.harness.info(&id).is_some_and(|i| i.status != Status::Starting)).await?;
+                crate::harness::ops::end_to_end::source_ready(&hub, &id).await?;
                 anyhow::Ok(id)
             }
         };
@@ -349,19 +358,41 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         assert_eq!((kept.slots, kept.weights.get("T3").copied(), kept.weights.get("T7").copied(), kept.seeded, kept.by.as_str()), (Some(1), Some(2), Some(4), true, "admin"));
         let notice = kept.notice.clone().ok_or_else(|| anyhow::anyhow!("no notice"))?;
         assert!(notice.text.contains("slots 6 → 1") && notice.text.contains("T3's weight 5 → 2") && notice.text.contains("programs.get"), "{}", notice.text);
-        assert!(notice.delivered && notice.message.is_some() && notice.why.is_none(), "taken by the coordinator's session: {notice:?}");
+        let retained = notice.publication.as_ref().ok_or_else(|| anyhow::anyhow!("notice was not durably retained"))?;
+        assert!(!notice.delivered && notice.message.as_deref() == Some(retained.id.as_str()) && notice.why.is_some(), "custody cannot invent coordinator admission: {notice:?}");
+        assert_eq!(retained.disposition, crate::harness::mail::Disposition::Waiting);
+        let h = Arc::clone(&hub);
+        crate::rt::spawn(async move { let _ = crate::harness::mail_delivery::run(h).await; });
+        crate::harness::ops::end_to_end::source_disposition(&hub, &coordinator, &retained.id, false).await?;
+        crate::harness::ops::end_to_end::source_until(&hub, &coordinator, "the committed notice advances settings", || async {
+            Ok(settings(&hub, "m1").await?.notice.as_ref().is_some_and(|notice| notice.delivered && notice.publication.as_ref().is_some_and(|receipt| receipt.id == retained.id && receipt.revision == retained.revision && matches!(receipt.disposition, crate::harness::mail::Disposition::Admitted | crate::harness::mail::Disposition::Consumed))))
+        }).await?;
+        let admitted = settings(&hub, "m1").await?.notice.ok_or_else(|| anyhow::anyhow!("the admitted notice disappeared"))?;
+        assert!(admitted.delivered && admitted.why.is_none(), "actual coordinator admission: {admitted:?}");
+        let receipt = admitted.publication.as_ref().ok_or_else(|| anyhow::anyhow!("admission lost its publication identity"))?;
+        let (recipient, text) = (coordinator.clone(), notice.text.clone());
+        let original = hub.store.read(move |connection| {
+            Ok(connection.query_row("SELECT body FROM agent_mail WHERE recipient=?1 AND json_extract(body,'$.command.text')=?2", rusqlite::params![recipient, text], |row| row.get::<_, String>(0))?)
+        }).await?;
         enforce(&hub).await;
         until("T3's worker held to 80", || pause_at(&sends) == Some(80)).await?;
         let sent: BTreeMap<String, u8> = kv_json(&hub.store, thresholds_key("m1")).await?;
         assert_eq!((pause_at(&hex), sent.get(&hex).copied(), sent.get(&sends).copied()), (Some(90), Some(80), Some(80)), "the person's still, nothing sent to it");
-        // A notice that didn't reach the coordinator is sent again (every 15 s, by the driver), and
-        // kept as delivered once its session takes it.
+        // A legacy unsent marker recovers on the existing event owner. Its deterministic ID
+        // finds the real receipt above, so neither a new original nor a new attempt is made.
         let mut s = settings(&hub, "m1").await?;
-        s.notice = Some(Notice { delivered: false, message: None, why: Some("the coordinator's machine isn't connected right now".into()), ..notice.clone() });
+        s.notice = Some(Notice { delivered: false, publication: None, message: None, why: Some("the coordinator's machine isn't connected right now".into()), ..notice.clone() });
         save_settings(&hub, "m1", &s).await?;
-        enforce(&hub).await;
+        resume_notices(&hub).await?;
         let again = settings(&hub, "m1").await?.notice.ok_or_else(|| anyhow::anyhow!("no notice"))?;
-        assert!(again.delivered && again.message.is_some() && again.why.is_none() && again.text == notice.text, "{again:?}");
+        assert!(again.delivered && again.message == admitted.message && again.why.is_none() && again.text == notice.text, "{again:?}");
+        let retried = again.publication.as_ref().ok_or_else(|| anyhow::anyhow!("legacy recovery lost its real receipt"))?;
+        assert_eq!((&retried.id, retried.revision, retried.generation, retried.disposition), (&receipt.id, receipt.revision, receipt.generation, receipt.disposition), "legacy recovery preserves the exact committed attempt");
+        let (recipient, text) = (coordinator.clone(), notice.text.clone());
+        let (count, body) = hub.store.read(move |connection| {
+            Ok(connection.query_row("SELECT COUNT(*),MIN(body) FROM agent_mail WHERE recipient=?1 AND json_extract(body,'$.command.text')=?2", rusqlite::params![recipient, text], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)))?)
+        }).await?;
+        assert_eq!((count, body.as_deref()), (1, Some(original.as_str())), "the complete original is retained exactly once");
         let kept = settings(&hub, "m1").await?;
         // Out of bounds, or a track it hasn't: refused, nothing kept.
         for bad in [json!({"program": "m1", "slots": 0}), json!({"program": "m1", "slots": 33}), json!({"program": "m1", "weights": {"T3": 0}}), json!({"program": "m1", "weights": {"T9": 2}})] {

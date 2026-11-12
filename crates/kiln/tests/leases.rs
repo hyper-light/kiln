@@ -599,7 +599,7 @@ fn w05_ac16_a_runner_cut_off_past_its_lease_writes_nothing_after_the_next_attemp
     );
     let second = "for i in $(seq 21 40); do echo \"attempt $KILN_ATTEMPT line $i\"; done";
     let third = format!(
-        "if [ \"$KILN_ATTEMPT\" = 1 ]; then\n  touch \"{o}/third\"\n  while [ ! -e \"{o}/go\" ]; do sleep 0.2; done\n  for i in $(seq 1 10); do echo \"attempt 1 late line $i\"; done\n  exit 3\nfi\nwhile [ ! -e \"{o}/done\" ]; do sleep 0.2; done\necho \"attempt 2 ran\""
+        "if [ \"$KILN_ATTEMPT\" = 1 ]; then\n  touch \"{o}/third\"\n  while [ ! -e \"{o}/go\" ]; do sleep 0.2; done\n  for i in $(seq 1 10); do echo \"attempt 1 late line $i\"; done\n  touch \"{o}/late-written\"\n  exit 3\nfi\nwhile [ ! -e \"{o}/done\" ]; do sleep 0.2; done\necho \"attempt 2 ran\""
     );
     let workflow = format!("on: push\njobs:\n  cut:\n    runs-on: cut\n    permissions:\n      contents: read\n      id-token: write\n    steps:\n{}{}{}", step(&first), step(second), step(&third));
     let s = bare(dir.path(), &[])?;
@@ -642,7 +642,10 @@ fn w05_ac16_a_runner_cut_off_past_its_lease_writes_nothing_after_the_next_attemp
     assert_eq!(finish(&s, &two, "dist", &url2, dist)?, [201, 200], "attempt 2's dist, its grant live\n{}", s.log());
     // Attempt 1's step, running on while A is paused, prints its late lines and fails.
     std::fs::write(out.join("go"), "")?;
-    std::thread::sleep(Duration::from_secs(17).saturating_sub(paused.elapsed()));
+    // W05-AC16: attempt 2 proves the old grant expired. Wait for the late output itself,
+    // not another 17 s: that also expires QUIC's idle connection and can discard its log
+    // chunk before the server can refuse it, while events/results replay on reconnect.
+    wait("attempt 1 never wrote its late output", 120, &|| Ok(out.join("late-written").exists()))?;
     a.signal("CONT")?;
     // What A held and ran on goes to the server under attempt 1's grant: refused, each kind.
     let kinds = || ["log", "event", "result"].map(|k| (k, refused_writes(&s, k).unwrap_or(0.0)));

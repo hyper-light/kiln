@@ -354,22 +354,40 @@ pub async fn queued_at(hub: &Hub, leg: &str) -> anyhow::Result<i64> {
 }
 
 /// Why a leg waits now (W05-R13; `null`: no longer for that). A new kind of reason ends the
-/// wait for the last one (W19-R01).
-/// `waiting`: the run (and the environment) this leg is the first of to wait for reviewers, which
-/// is recorded with the wait (`approval.waiting`, W19-R06; `crate::events`).
+/// wait for the last one (W19-R01). `waiting`: the run (and the environment) this leg is the first
+/// of to wait for reviewers, which is recorded with the wait (`approval.waiting`, W19-R06;
+/// `crate::events`).
 pub async fn wait_reason(hub: &Hub, leg: &str, reason: &serde_json::Value, waiting: Option<(&str, &str)>) -> anyhow::Result<()> {
-    let (leg, r) = (leg.to_owned(), (!reason.is_null()).then(|| reason.to_string()));
     let waiting = waiting.map(|(run, environment)| serde_json::json!({ "run": run, "environments": [environment] }));
+    write_waits(hub, vec![(leg.to_owned(), reason.clone(), waiting)]).await
+}
+
+/// W05-AC09, W05-R13: independent waits recovered together share one transaction.
+/// Each still closes its previous kind of wait before keeping its new explanation. A recovered
+/// wait records no `approval.waiting`: its first one was recorded as it began.
+pub async fn wait_reasons(hub: &Hub, reasons: Vec<(String, serde_json::Value)>) -> anyhow::Result<()> {
+    write_waits(hub, reasons.into_iter().map(|(leg, reason)| (leg, reason, None)).collect()).await
+}
+
+/// The waits `reasons` say, in one transaction: each leg's reason, with the `approval.waiting` it
+/// records, if any.
+async fn write_waits(hub: &Hub, reasons: Vec<(String, serde_json::Value, Option<serde_json::Value>)>) -> anyhow::Result<()> {
+    if reasons.is_empty() {
+        return Ok(());
+    }
     hub.store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
-            let was: Option<Option<String>> = tx.query_row("SELECT wait_reason FROM jobs WHERE id = ?1", [&leg], |x| x.get(0)).optional()?;
-            if was.as_ref().is_some_and(|w| wait_kind(w.as_deref()) != wait_kind(r.as_deref())) {
-                close_wait(&tx, &leg, crate::util::now_unix())?;
-            }
-            tx.execute("UPDATE jobs SET wait_reason = ?2 WHERE id = ?1", params![leg, r])?;
-            if let Some(fact) = &waiting {
-                crate::events::record(&tx, "approval.waiting", fact)?;
+            for (leg, reason, waiting) in reasons {
+                let r = (!reason.is_null()).then(|| reason.to_string());
+                let was: Option<Option<String>> = tx.query_row("SELECT wait_reason FROM jobs WHERE id = ?1", [&leg], |x| x.get(0)).optional()?;
+                if was.as_ref().is_some_and(|w| wait_kind(w.as_deref()) != wait_kind(r.as_deref())) {
+                    close_wait(&tx, &leg, crate::util::now_unix())?;
+                }
+                tx.execute("UPDATE jobs SET wait_reason = ?2 WHERE id = ?1", params![leg, r])?;
+                if let Some(fact) = &waiting {
+                    crate::events::record(&tx, "approval.waiting", fact)?;
+                }
             }
             tx.commit()?;
             Ok(())

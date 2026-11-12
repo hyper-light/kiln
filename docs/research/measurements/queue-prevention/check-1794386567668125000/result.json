@@ -1,0 +1,29 @@
+{
+  "exit_code": 101,
+  "source_unchanged": false,
+  "errors": [
+    {
+      "message": "no method named `read` found for struct `bus::QuiverBus` in the current scope",
+      "rendered": "error[E0599]: no method named `read` found for struct `bus::QuiverBus` in the current scope\n    --> crates/kiln/src/harness/ops.rs:1625:37\n     |\n1625 |                 let batch = hub.bus.read(&attached.topic, at, 1).await.map_err(|e| anyhow::anyhow!(\"{what}: {e:?}\"))?;\n     |                                     ^^^^ method not found in `bus::QuiverBus`\n     |\n    ::: crates/kiln-seams/src/bus.rs:86:8\n     |\n  86 |     fn read<'a>(&'a self, name: &'a str, from: Offset, limit: usize) -> BoxFuture<'a, Result<Batch, Refusal>>;\n     |        ---- the method is available for `bus::QuiverBus` here\n     |\n    ::: crates/kiln/src/bus.rs:63:1\n     |\n  63 | pub struct QuiverBus {\n     | -------------------- method `read` not found for this struct\n     |\n     = help: items from traits can only be used if the trait is in scope\nhelp: trait `Bus` which provides `read` is implemented but not in scope; perhaps you want to import it\n     |\n1392 +     use kiln_seams::Bus;\n     |\n\n"
+    },
+    {
+      "message": "no method named `wait` found for struct `bus::QuiverBus` in the current scope",
+      "rendered": "error[E0599]: no method named `wait` found for struct `bus::QuiverBus` in the current scope\n    --> crates/kiln/src/harness/ops.rs:1629:38\n     |\n1629 |                     result = hub.bus.wait(&attached.topic, at).fuse() => result.map_err(|e| anyhow::anyhow!(\"{what}: {e:?}\"))?,\n     |                                      ^^^^ method not found in `bus::QuiverBus`\n     |\n    ::: crates/kiln-seams/src/bus.rs:88:8\n     |\n  88 |     fn wait<'a>(&'a self, name: &'a str, from: Offset) -> BoxFuture<'a, Result<(), Refusal>>;\n     |        ---- the method is available for `bus::QuiverBus` here\n     |\n    ::: crates/kiln/src/bus.rs:63:1\n     |\n  63 | pub struct QuiverBus {\n     | -------------------- method `wait` not found for this struct\n     |\n     = help: items from traits can only be used if the trait is in scope\nhelp: trait `Bus` which provides `wait` is implemented but not in scope; perhaps you want to import it\n     |\n1392 +     use kiln_seams::Bus;\n     |\n\n"
+    }
+  ],
+  "free_before": 187961671680,
+  "free_after": 190624444416,
+  "command": [
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "test",
+    "--no-run",
+    "--locked",
+    "-p",
+    "kiln",
+    "--lib",
+    "--message-format=json"
+  ]
+}

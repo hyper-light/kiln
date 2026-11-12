@@ -138,11 +138,10 @@ export function EarlyComposer({ id, start }: { id: string; start?: Start }) {
     },
     [draft],
   );
-  const keep = () => {
+  const keep = async () => {
     const text = draft.trim();
     if (!text || failed) return;
-    useHeld.getState().hold(id, { id: clientId(), text, at: Date.now(), mode: "queue" });
-    setDraft(id, "");
+    if (await useHeld.getState().hold(id, { id: clientId(), text, at: Date.now(), mode: "queue" })) setDraft(id, "");
   };
   return (
     <div className="hx-composer cp">

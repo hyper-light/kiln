@@ -18,6 +18,7 @@ use std::sync::LazyLock;
 use kiln_ci::identity::custody::{Body, Kind, to_value};
 use kiln_ci::identity::statement::{self, PAYLOAD_CUSTODY, Statement, Subject};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::custody::{at_epoch, timeline};
@@ -36,8 +37,11 @@ struct Waiting {
     /// Taken over blue/green: it goes on at the epoch it had until this process is promoted, its
     /// ask held till then, and it goes on at the next once that's certified ([`certified`]).
     held: bool,
-    blue_green: bool,
+    transition: EpochTransition,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EpochTransition { Taken, BlueGreen, DurablePromotion }
 
 /// A receipt to sign, of the hand-on it follows.
 struct Receipt {
@@ -49,6 +53,90 @@ struct Receipt {
     /// The session at the epoch it was taken at, without the process: its signer, as it says
     /// before kiln has certified the process's key.
     by: String,
+}
+
+/// The original hand-on and compact timeline retained before a legacy native session opens.
+/// It is request material, not locally verified ownership; the server checks its full trust chain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LegacyProof {
+    pub hand_on: Option<String>,
+    pub subject: Subject,
+}
+
+impl LegacyProof {
+    pub(crate) fn of(session: &str, from: u64, events: &[Event], hand_on: Option<&Value>) -> Result<Self, String> {
+        let to = from.checked_add(1).ok_or_else(|| "the legacy handover epoch cannot advance".to_owned())?;
+        let proof = Self { hand_on: hand_on.map(Value::to_string), subject: timeline(session, from, events) };
+        proof.validate(session, from, to)?;
+        Ok(proof)
+    }
+
+    pub(crate) fn validate(&self, session: &str, from: u64, to: u64) -> Result<(), String> {
+        use kiln_ci::identity::chain::{Actor, Identity};
+        if from.checked_add(1) != Some(to) || self.subject.name != format!("session {session} at epoch {from}")
+            || self.subject.annotations.get("epoch").and_then(Value::as_u64) != Some(from)
+            || self.subject.annotations.get("events").and_then(Value::as_u64).is_none()
+            || self.subject.digest.len() != 1 || self.subject.digest.get(crate::custody::TIMELINE).is_none_or(|hex| hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        { return Err("legacy custody proof does not name its exact source session and next epoch".into()); }
+        let Some(hand_on) = &self.hand_on else { return Ok(()) };
+        let bundle: Value = crate::wire::payload(crate::wire::unread::Wire::RunnerPayload, "LegacyHandOn", hand_on).map_err(|error| error.to_string())?;
+        let statement = statement_of(&bundle).ok_or_else(|| "legacy source hand-on has no readable statement".to_owned())?;
+        let body: Body = crate::wire::payload(crate::wire::unread::Wire::RunnerPayload, "LegacyHandOnBody", &statement.body.to_string()).map_err(|error| error.to_string())?;
+        let source = Identity::parse(&body.by).ok().is_some_and(|identity| matches!(identity.actor, Actor::Agent { agent, epoch, .. } if agent == session && epoch == from));
+        if !source || bundle.pointer("/dsseEnvelope/payloadType").and_then(Value::as_str) != Some(PAYLOAD_CUSTODY)
+            || statement.v != statement::VERSION || body.v != kiln_ci::identity::custody::VERSION
+            || body.kind != Kind::HandedOn || body.epoch != Some(to) || body.to != at_epoch(&body.by, to)
+            || statement.subject.as_slice() != std::slice::from_ref(&self.subject)
+        { return Err("legacy source hand-on differs from its retained timeline or destination epoch".into()); }
+        Ok(())
+    }
+
+    fn receipt(&self, epoch: u64) -> Option<Receipt> {
+        let hand_on = self.hand_on.as_ref()?;
+        let bundle: Value = crate::wire::payload(crate::wire::unread::Wire::RunnerPayload, "LegacyHandOn", hand_on).ok()?;
+        let from = giver_of(&bundle)?;
+        Some(Receipt { subject: self.subject.clone(), hand_on: hand_on.clone(), follows: digest_of(&bundle), by: at_epoch(&from, epoch)?, from })
+    }
+}
+
+/// Restores only the existing receipt waiter from its authoritative durable Head phase.
+pub(crate) fn legacy_waiting(session: &str, promotion: &crate::harness::inbox::Promotion) -> Result<(), String> {
+    use crate::harness::inbox::PromotionPhase;
+    promotion.proof.validate(session, promotion.from_epoch, promotion.to_epoch)?;
+    let key = (session.to_owned(), promotion.to_epoch);
+    let active = promotion.phase == PromotionPhase::Active && legacy_certificate_ready(session, promotion.to_epoch, &promotion.proof).is_ok();
+    let mut state = STATE.lock();
+    if active { state.waiting.remove(&key); return Ok(()); }
+    let signed = promotion.proof.receipt(promotion.to_epoch);
+    if promotion.proof.hand_on.is_some() && signed.is_none() { return Err("legacy source proof cannot form its exact custody receipt".into()); }
+    state.waiting.insert(key, Waiting { signed, held: promotion.phase == PromotionPhase::AwaitingPromotion, transition: EpochTransition::DurablePromotion });
+    Ok(())
+}
+
+pub(crate) fn legacy_certificate_ready(session: &str, to: u64, proof: &LegacyProof) -> Result<(), String> {
+    let from = to.checked_sub(1).ok_or_else(|| "a legacy promotion has no preceding epoch".to_owned())?;
+    proof.validate(session, from, to)?;
+    let source = match &proof.hand_on {
+        Some(hand_on) => {
+            let bundle: Value = crate::wire::payload(crate::wire::unread::Wire::RunnerPayload, "LegacyHandOn", hand_on).map_err(|error| error.to_string())?;
+            Some(kiln_ci::identity::chain::Identity::parse(&giver_of(&bundle).ok_or_else(|| "legacy source proof names no giver".to_owned())?).map_err(|error| error.to_string())?)
+        }
+        None if !signs() => None,
+        None => return Err("the retained legacy source has no signed identity proof".into()),
+    };
+    identity::agent_certificate_ready(session, to, source.as_ref())
+}
+
+/// Called only after the owner durably retires its completed Head transition.
+pub(crate) fn legacy_completed(session: &str, to: u64) {
+    let mut state = STATE.lock();
+    let key = (session.to_owned(), to);
+    if state.waiting.get(&key).is_some_and(|waiting| waiting.transition == EpochTransition::DurablePromotion) { state.waiting.remove(&key); }
+}
+
+/// A queued request may start only while this exact transition still awaits its certificate.
+pub(crate) fn legacy_identity_pending(session: &str, to: u64) -> bool {
+    STATE.lock().waiting.get(&(session.to_owned(), to)).is_some_and(|waiting| !waiting.held && waiting.transition == EpochTransition::DurablePromotion)
 }
 
 impl Receipt {
@@ -528,12 +616,13 @@ pub fn hand_on(session: &str, epoch: u64, events: &[Event], why: &str) -> Option
 /// Session `session` taken over here at `epoch` (an epoch up from the one it left), its package
 /// carrying `events` and the giver's `hand_on`: this process's receipt waits to go with the ask
 /// for its identity at `epoch` ([`carrying`]).
-pub fn took(session: &str, epoch: u64, events: &[Event], hand_on: &Value) {
+pub fn took(session: &str, epoch: u64, events: &[Event], hand_on: &Value) -> Result<(), String> {
     if !signs() {
-        return;
+        return Ok(());
     }
-    let Some(signed) = Receipt::of(session, epoch, events, hand_on) else { return };
-    STATE.lock().waiting.insert((session.to_owned(), epoch), Waiting { signed: Some(signed), held: false, blue_green: false });
+    let signed = Receipt::of(session, epoch, events, hand_on).ok_or_else(|| "the source hand-on cannot form this session's custody receipt".to_owned())?;
+    STATE.lock().waiting.insert((session.to_owned(), epoch), Waiting { signed: Some(signed), held: false, transition: EpochTransition::Taken });
+    Ok(())
 }
 
 /// Session `session` taken over blue/green from this machine's runner process being upgraded, at
@@ -547,7 +636,7 @@ pub fn took_blue_green(session: &str, epoch: u64, events: &[Event], hand_on: Opt
     }
     let next = epoch.saturating_add(1);
     let signed = hand_on.and_then(|h| Receipt::of(session, next, events, h));
-    STATE.lock().waiting.insert((session.to_owned(), next), Waiting { signed, held: true, blue_green: true });
+    STATE.lock().waiting.insert((session.to_owned(), next), Waiting { signed, held: true, transition: EpochTransition::BlueGreen });
 }
 
 /// This process was promoted (blue/green): the sessions it took over, each at the epoch it goes
@@ -602,8 +691,18 @@ fn sign_uncertified(slot: &str, s: &Statement) -> anyhow::Result<(Vec<u8>, Vec<u
 /// This process's identity at `epoch` of session `session` was certified: its receipt went with
 /// the ask, and kiln recorded it. Whether the session goes on at `epoch` now (a blue/green
 /// take-over's: it went on at the one before until then).
-pub fn certified(session: &str, epoch: u64) -> bool {
-    STATE.lock().waiting.remove(&(session.to_owned(), epoch)).is_some_and(|w| w.blue_green)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Certification { Untracked, Receipt, BlueGreen, DurablePromotion }
+
+pub(crate) fn certified(session: &str, epoch: u64) -> Certification {
+    let mut state = STATE.lock();
+    let key = (session.to_owned(), epoch);
+    if state.waiting.get(&key).is_some_and(|waiting| waiting.transition == EpochTransition::DurablePromotion) { return Certification::DurablePromotion; }
+    match state.waiting.remove(&key).map(|waiting| waiting.transition) {
+        Some(EpochTransition::BlueGreen) => Certification::BlueGreen,
+        Some(EpochTransition::Taken) => Certification::Receipt,
+        Some(EpochTransition::DurablePromotion) | None => Certification::Untracked,
+    }
 }
 
 /// A bundle (a signed statement, as JSON) as it came: a hand-on passed from the runner before this
@@ -887,6 +986,14 @@ static STARTED: LazyLock<i64> = LazyLock::new(crate::util::now_ms);
 /// The most records of relayed words a process remembers seeing, to refuse one sent again.
 const SEEN_MAX: usize = 1024;
 
+#[derive(Clone, PartialEq, Eq)]
+struct MailProof([u8; 32]);
+
+struct SeenWords {
+    digest: String,
+    mail: Option<MailProof>,
+}
+
 /// What this process relays, and is relayed (docs/ci.md W27-R08's relays).
 #[derive(Default)]
 struct Relaying {
@@ -902,8 +1009,9 @@ struct Relaying {
     /// The runner process this one took over from recorded what it forwarded: each frame since
     /// comes with its record.
     forwards_recorded: bool,
-    /// Records of relayed words seen here, by digest, newest last: one again is refused.
-    seen: VecDeque<String>,
+    /// Proofs remain bounded by SEEN_MAX. Only an exact durable publication may repeat; an
+    /// unbound legacy/naked command still has the original anti-replay behavior.
+    seen: VecDeque<SeenWords>,
     /// Records of the runner process this one took over from of passing an agent's words on to
     /// this one (blue/green), by the act's digest: the last relay's of those words.
     forwarded_words: BTreeMap<String, Value>,
@@ -1048,16 +1156,44 @@ pub fn relay_due() {
 /// session; each relay's record in turn, the first following the act, each the one before it, of
 /// the act by its digest, from the relay before it, to the next; the last to this process (or to
 /// the one this process took over from, whose forwarder passed it on: its record of that, last); and
-/// none seen here before. Then this process's receipt, following the last relay's record, goes to
+/// none seen here before, except an exact durable publication retry. Every retry rechecks the
+/// complete signature chain before journal/inbox deduplication. This process's receipt goes to
 /// kiln. Why not: kiln is told (a break naming the relay), and the session isn't given them. A
 /// message with nothing relayed beside it (a person's, a server's from before) goes as before.
 pub fn relayed_words(session: &str, json: &str, root: &[u8], machine: &str, instance: &str) -> Result<(), String> {
     use kiln_ci::identity::custody::names;
     use kiln_ci::identity::relay::{Unrelayed, relayed};
     let Ok(v) = serde_json::from_str::<Value>(json) else { return Ok(()) };
+    // One server-owned admission wrapper carries the original words; the unchanged proof
+    // remains at the outer wire level and is checked by the same path below.
+    let words_command = if v.get("type").and_then(Value::as_str) == Some("admit") {
+        let inner = v.get("command").filter(|c| c.is_object()).ok_or_else(|| "malformed mail admission command".to_owned())?;
+        if !matches!(inner.get("type").and_then(Value::as_str), Some("send" | "skill_run")) {
+            return Err("nested or non-communication mail admission command".to_owned());
+        }
+        inner
+    } else { &v };
     let Some(r) = v.get("relayed") else { return Ok(()) };
+    let mail = if v.get("type").and_then(Value::as_str) == Some("admit") {
+        use sha2::Digest as _;
+        let revision = v.pointer("/token/revision").and_then(Value::as_u64).filter(|n| *n > 0).ok_or_else(|| "mail admission has no publication revision".to_owned())?;
+        let message = words_command.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| "mail admission has no original message identity".to_owned())?;
+        let command = crate::harness::state_view::encode(words_command, crate::harness::state_view::FRAME).map_err(|_| "mail admission command cannot be bound within its frame budget".to_owned())?;
+        let mut binding = sha2::Sha256::new();
+        binding.update(b"kiln-mail-proof-v1");
+        binding.update(revision.to_le_bytes());
+        // Variable fields are length-framed; the revision and SHA-256 command digest have
+        // fixed widths. Retain one digest rather than frame-sized attacker-controlled IDs.
+        for part in [session.as_bytes(), message.as_bytes()] {
+            let len = u64::try_from(part.len()).map_err(|_| "mail proof identity length does not fit".to_owned())?;
+            binding.update(len.to_le_bytes());
+            binding.update(part);
+        }
+        binding.update(sha2::Sha256::digest(&command));
+        Some(MailProof(binding.finalize().into()))
+    } else { None };
     let at = crate::util::now_unix();
-    let message = v.get("id").and_then(Value::as_str).unwrap_or_default();
+    let message = words_command.get("id").and_then(Value::as_str).unwrap_or_default();
     let refused = format!("message {message} to session {session}");
     let bundle = |x: Option<&Value>| x.and_then(Value::as_str).and_then(|s| serde_json::from_str::<Value>(s).ok());
     let mut records: Vec<Value> = r.get("passed_on").and_then(Value::as_array).into_iter().flatten().filter_map(|x| bundle(Some(x))).collect();
@@ -1090,7 +1226,7 @@ pub fn relayed_words(session: &str, json: &str, root: &[u8], machine: &str, inst
     let covers = signed.statement.subject.iter().any(|t| t.digest.get("sha256").is_some_and(|d| d.eq_ignore_ascii_case(&ask_digest)));
     let asked: Value = serde_json::from_str(ask).unwrap_or_default();
     let said = |p: &str| asked.pointer(p).and_then(Value::as_str).unwrap_or_default().to_owned();
-    let words = v.get("text").and_then(Value::as_str).map(crate::harness::ops::body_of).unwrap_or_default();
+    let words = words_command.get("text").and_then(Value::as_str).map(crate::harness::ops::body_of).unwrap_or_default();
     // For this session: as its sender named it (its id, or the start of it), or, named otherwise (by
     // its name), as kiln's record of passing them on says it found it.
     let to = said("/input/agent");
@@ -1125,17 +1261,20 @@ pub fn relayed_words(session: &str, json: &str, root: &[u8], machine: &str, inst
     }
     let Some(nearest) = checked.last() else { return fail(unreadable("no relay's record came with it".into())) };
     let before = (nearest.digest.clone(), nearest.custodian.clone());
-    // Sent again: refused.
+    // A retry changes transport/attempt metadata, never the signed original publication.
+    // Matching the proof alone would let a second publication impersonate this one.
     let again = {
         let mut st = RELAYING.lock();
-        let again = st.seen.contains(&before.0);
-        if !again {
-            st.seen.push_back(before.0.clone());
-            while st.seen.len() > SEEN_MAX {
-                st.seen.pop_front();
+        match st.seen.iter().find(|seen| seen.digest == before.0) {
+            Some(seen) => mail.is_none() || seen.mail.as_ref() != mail.as_ref(),
+            None => {
+                st.seen.push_back(SeenWords { digest: before.0.clone(), mail });
+                while st.seen.len() > SEEN_MAX {
+                    st.seen.pop_front();
+                }
+                false
             }
         }
-        again
     };
     if again {
         let last = checked.last();
@@ -1649,6 +1788,28 @@ mod tests {
         // For another process: refused.
         let elsewhere = relayed_words(a, &message(words, &relayed_of(&kilns(5, &act_b)?, &act_b)), &pki.ca_der, machine, "green");
         assert!(elsewhere.as_ref().is_err_and(|e| e.contains("not to runner relay-box (instance green)")), "{elsewhere:?}");
+        // An uncertain durable attempt retries the SAME publication and original inner command.
+        // Attempt generation is not a new grant to replay a signed act under another identity.
+        let proof = relayed_of(&kilns(6, &act_b)?, &act_b);
+        let admitted = |revision: u64, generation: u64, id: &str, mode: &str, proof: &Value| serde_json::json!({
+            "type": "admit", "peer": b, "token": { "revision": revision, "generation": generation },
+            "epoch": 0, "generation": generation, "peers": [b],
+            "command": { "type": "send", "id": id, "text": words, "mode": mode }, "relayed": proof,
+        }).to_string();
+        for generation in [1, 1, 2] {
+            relayed_words(a, &admitted(17, generation, "durable-m1", "queue", &proof), &pki.ca_der, machine, "blue").map_err(|e| anyhow::anyhow!(e))?;
+        }
+        for changed in [admitted(18, 2, "durable-m1", "queue", &proof), admitted(17, 2, "another-id", "queue", &proof), admitted(17, 2, "durable-m1", "now", &proof)] {
+            assert!(relayed_words(a, &changed, &pki.ca_der, machine, "blue").is_err(), "changed publication reused a proof");
+        }
+        assert!(relayed_words(&format!("{a}-other"), &admitted(17, 2, "durable-m1", "queue", &proof), &pki.ca_der, machine, "blue").is_err(), "recipient is part of the binding");
+        assert!(relayed_words(a, &message(words, &proof), &pki.ca_der, machine, "blue").is_err(), "durable retry cannot authorize a naked replay");
+        assert!(relayed_words(a, &admitted(17, 2, "durable-m1", "queue", &relayed_of(&p2, &act_b)), &pki.ca_der, machine, "blue").is_err(), "an old unbound seen record cannot be adopted");
+        let mut forged = proof.clone();
+        if let Some(object) = forged.as_object_mut() { object.insert("ask".into(), Value::String("{}".into())); }
+        assert!(relayed_words(a, &admitted(17, 2, "durable-m1", "queue", &forged), &pki.ca_der, machine, "blue").is_err(), "an exact retry still verifies its full signature");
+        let nested = serde_json::json!({ "type": "admit", "token": { "revision": 17, "generation": 2 }, "command": { "type": "admit" }, "relayed": proof }).to_string();
+        assert!(relayed_words(a, &nested, &pki.ca_der, machine, "blue").is_err(), "nested wrappers never skip proof verification");
         drain_all(&mut drained);
         let breaks: Vec<Value> = drained.iter().filter_map(|v| v.get("relay_break").cloned()).collect();
         let codes: Vec<(&str, &str)> = breaks.iter().map(|b| (b.get("code").and_then(Value::as_str).unwrap_or_default(), b.get("relay").and_then(Value::as_str).unwrap_or_default())).collect();
@@ -1859,9 +2020,9 @@ mod tests {
         assert_eq!(to_ask("bg-unsigned", 3), Some(4), "then its next epoch's");
         let ask = carrying("bg-unsigned", 4, IdentityAsk::default());
         assert!(ask.hand_on.is_none() && ask.receipt.is_none(), "nothing signed to carry: kiln records it unsigned");
-        assert!(certified("bg-unsigned", 4), "certified, it goes on at epoch 4");
+        assert_eq!(certified("bg-unsigned", 4), Certification::BlueGreen, "certified, it goes on at epoch 4");
         assert_eq!(to_ask("bg-unsigned", 4), Some(4));
-        assert!(!certified("bg-unsigned", 4), "once");
+        assert_eq!(certified("bg-unsigned", 4), Certification::Untracked, "once");
     }
 }
 

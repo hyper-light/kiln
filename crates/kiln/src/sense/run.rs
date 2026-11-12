@@ -187,6 +187,7 @@ impl Recorder {
     /// cgroup's is nothing; a reused one's is what came before). `p`: the probability its
     /// placement chose this runner with, where the placer said.
     pub fn start(key: String, kind: &'static str, label: Option<String>, dir: &Path, usage: Usage, p: Option<f64>) -> Recorder {
+        crate::runner::probe::gpu_changed();
         let (m, device) = read_shared(dir);
         Recorder { key, kind, label, dir: dir.to_path_buf(), started: Instant::now(), started_ms: crate::util::now_ms(), idle_cpus: m.idle_cpus(), device, peak_bps: m.device_peak_bps, usage_at_start: usage, own_oom_kills: own_oom_kills(), p, work_key: None, signals: super::pace::at_start() }
     }
@@ -202,6 +203,7 @@ impl Recorder {
     /// looked over by `scan` where it was: its observation, with what of the machine's ended it
     /// (S6), which the runner's health takes in at once.
     pub fn finish(self, exit_code: Option<i32>, usage: Usage, scan: Option<&super::health::Scan>) -> Observation {
+        crate::runner::probe::gpu_changed();
         let wall = self.started.elapsed();
         let wall_us = u64::try_from(wall.as_micros()).unwrap_or(u64::MAX);
         let (end, device_end) = read_shared(&self.dir);

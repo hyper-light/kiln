@@ -1,0 +1,11 @@
+
+running 6 tests
+test wire::ts::a_field_added_in_rust_without_its_binding_names_the_file ... ok
+test wire::ts::bindings_are_current ... ok
+test wire::ts::every_update_goes_down_as_a_session_frame ... ok
+test wire::ts::hand_written_finds_definitions_not_re_exports ... ok
+test wire::ts::no_generated_type_is_written_by_hand ... ok
+test wire::ts::tags_are_serdes_and_what_kiln_leaves_out_is_optional ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4124 filtered out; finished in 0.28s
+

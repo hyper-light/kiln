@@ -475,8 +475,14 @@ function Bar({
           ? `Stop ${who} and say…`
           : `Message ${who}${roomy ? `: a prompt, / for a command${onPick ? ", @ to pick agents" : ""}` : "…"}`;
   const outcome = report
-    ? [report.sent ? `Sent to ${report.sent}` : "", report.skipped ? `${report.skipped} skipped` : "", report.failed ? `${report.failed} failed` : ""].filter(Boolean).join(" · ") ||
-      "No agent to send to"
+    ? [
+        report.sent ? `Sent to ${report.sent}` : "",
+        report.retained ? `${report.retained} retained, waiting for receiver` : "",
+        report.skipped ? `${report.skipped} skipped` : "",
+        report.failed ? `${report.failed} failed` : "",
+      ]
+        .filter(Boolean)
+        .join(" · ") || "No agent to send to"
     : "";
 
   const picked = reach === "selected" ? agents : [];

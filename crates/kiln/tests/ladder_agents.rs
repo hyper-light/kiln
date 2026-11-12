@@ -166,6 +166,14 @@ fn world_with(dir: &Path, more: &str) -> anyhow::Result<World> {
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let (runner, log) = agents::runner_with(dir, s.port, "r1", None, Talk { lines: 1, every_ms: 1 }, &env)?;
     agents::connected(s.port, &s.admin, "r1", &log, Duration::from_secs(120))?;
+    // W26-R17: connection precedes its harness inventory. A replay starts only once the
+    // directory can place its agent; otherwise its one attempt records "no claude installed".
+    until(60, "r1 offered the stand-in harness", || {
+        let kinds = ok(&s, &s.admin, "GET", &format!("/api/harness/kinds?target=agent:{}", common::machine("r1")), None)?;
+        let offered = kinds.as_array().into_iter().flatten().any(|k| text(k, "id") == "claude" && k.get("available") == Some(&json!(true)));
+        Ok((!offered).then(|| kinds.to_string()))
+    })?;
+    agents::headroom_off(s.port, &s.admin, "r1", Duration::from_secs(60))?;
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "native repository: {st} {body}");
     let bare = std::path::PathBuf::from(text(&serde_json::from_str(&body)?, "clone_url").trim_start_matches("file://"));

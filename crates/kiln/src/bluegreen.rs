@@ -53,6 +53,8 @@ pub enum Frame {
         relays: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         stores: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        mail_transfer: bool,
     },
     /// blue → green: an agent session, its harness process still running (descriptors: its stdin,
     /// stdout and stderr), or (`handed` none) to start again from its record. `hand_on`: blue's
@@ -235,7 +237,7 @@ mod unix {
         /// instance it runs as, whether it takes sessions signed for, whether it takes the
         /// machine's runner role so, whether it checks the records of what's forwarded to it, and
         /// whether it takes this runner's conversation stores over ([`Frame::Ready`]).
-        pub fn ready(&self, pid: u32, deadline: Instant) -> Result<(Conn, String, bool, bool, bool, bool)> {
+        pub fn ready(&self, pid: u32, deadline: Instant) -> Result<(Conn, String, bool, bool, bool, bool, bool)> {
             loop {
                 match self.listener.accept() {
                     Ok((stream, _)) => {
@@ -243,7 +245,7 @@ mod unix {
                         stream.set_read_timeout(Some(Duration::from_secs(60)))?;
                         let conn = Conn { stream };
                         match conn.recv() {
-                            Ok((Frame::Ready { pid: said, instance, custody, role, relays, stores }, _)) if said == pid => return Ok((conn, instance, custody, role, relays, stores)),
+                            Ok((Frame::Ready { pid: said, instance, custody, role, relays, stores, mail_transfer }, _)) if said == pid => return Ok((conn, instance, custody, role, relays, stores, mail_transfer)),
                             // Not the process started for this: not listened to.
                             Ok((Frame::Ready { pid: said, .. }, _)) => tracing::warn!(said, expected = pid, "a runner that isn't the new build tried to take over; ignored"),
                             Ok(_) => tracing::warn!("a connection to the handover socket didn't open by saying it's ready; ignored"),
@@ -352,8 +354,8 @@ mod unix {
         fn a_ready_from_a_build_from_before_takes_no_stores_and_stores_read_back() -> anyhow::Result<()> {
             let before: Frame = serde_json::from_str(r#"{"ready":{"pid":7,"instance":"g"}}"#)?;
             assert!(matches!(before, Frame::Ready { pid: 7, stores: false, .. }));
-            assert_eq!(serde_json::to_string(&Frame::Ready { pid: 7, instance: "g".into(), custody: false, role: false, relays: false, stores: false })?, r#"{"ready":{"pid":7,"instance":"g"}}"#);
-            assert_eq!(serde_json::to_string(&Frame::Ready { pid: 7, instance: "g".into(), custody: false, role: false, relays: false, stores: true })?, r#"{"ready":{"pid":7,"instance":"g","stores":true}}"#);
+            assert_eq!(serde_json::to_string(&Frame::Ready { pid: 7, instance: "g".into(), custody: false, role: false, relays: false, stores: false, mail_transfer: false })?, r#"{"ready":{"pid":7,"instance":"g"}}"#);
+            assert_eq!(serde_json::to_string(&Frame::Ready { pid: 7, instance: "g".into(), custody: false, role: false, relays: false, stores: true, mail_transfer: false })?, r#"{"ready":{"pid":7,"instance":"g","stores":true}}"#);
             let said = serde_json::to_string(&Frame::Stores { own: Some("/s/instances/g/conversations.db".into()), mirror: None })?;
             assert!(matches!(serde_json::from_str::<Frame>(&said)?, Frame::Stores { own: Some(o), mirror: None } if o.ends_with("/g/conversations.db")));
             // Its answer: where green set aside what wouldn't open, said only when it did.

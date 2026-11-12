@@ -1,0 +1,6 @@
+{
+  "exit_code": 0,
+  "executed_one": true,
+  "expected_guard_failure": false,
+  "log": "/private/tmp/kiln-queue-prevention-20261111/docs/research/measurements/queue-prevention/retry-green.log"
+}

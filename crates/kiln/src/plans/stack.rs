@@ -654,9 +654,9 @@ pub async fn amend(hub: &Arc<Hub>, actor: &str, info: &Info, want: &Want, run: &
 /// three steps runs as three agents in order, each starting once the step before is met, and ends
 /// as a stack of three diffs, each by its own step's agent. What review says to a step's agent
 /// waits while the run goes on; once it ends, a step's agent makes a new version of its diff and
-/// the steps above stay as they were. No harness runs (each step's is a program that isn't
-/// there): each agent's changeset is set as its machine would report it, and each goal is marked
-/// met in the store as its goal stack would.
+/// the steps above stay as they were. A protocol stand-in records each input and emits a correlated
+/// completion; each agent's changeset is then set as its machine would report it, and each goal is
+/// marked met in the store as its goal stack would.
 #[cfg(all(test, unix))]
 mod end_to_end {
     use std::path::Path;
@@ -733,7 +733,20 @@ mod end_to_end {
             crate::rt::spawn(async move {
                 let _ = crate::workspace::follow::follow_loop(h).await;
             });
-            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let fixture = tempfile::tempdir()?;
+            let (program, _heard) = crate::harness::ops::end_to_end::recording_program(fixture.path(), true)?;
+            hub.harness.set_test_program(&program.to_string_lossy());
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move { let _ = crate::harness::mail_delivery::run(h).await; });
+            // The real goals owner retries sender-held initial words when the new source
+            // publishes capacity. Complete reports native input consumption, never goal met.
+            let h = Arc::clone(&hub);
+            crate::rt::spawn(async move { let _ = crate::goals::run(h).await; });
+            struct Fixture(Arc<crate::hub::Hub>);
+            impl Drop for Fixture {
+                fn drop(&mut self) { self.0.harness.local.stop_all(); self.0.shutdown.cancel(); }
+            }
+            let _owned = Fixture(Arc::clone(&hub));
             // A repository kiln hosts, its trunk pushed by its owner from a person's folder.
             let path = crate::ci::hosting::create(&hub, "acme/app", "main", None).await?;
             let repo = Repo { id: crate::util::new_id(), name: "acme/app".into(), clone_url: crate::ci::hosting::clone_url(&path), branches: Vec::new(), poll_seconds: 3600, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "native".into(), default_branch: Some("main".into()), mirror: None };
@@ -760,11 +773,28 @@ mod end_to_end {
                 let stands: Vec<&str> = v.steps.iter().map(|s| s.stand.as_str()).collect();
                 anyhow::ensure!(stands.get(i) == Some(&"working") && stands.iter().skip(i + 1).all(|s| *s == "waiting"), "step {} starts once the one before is met: {stands:?}", i + 1);
                 let agent = v.steps.get(i).and_then(|s| s.agent_id.clone()).ok_or_else(|| anyhow::anyhow!("no agent for step {}", i + 1))?;
+                crate::harness::ops::end_to_end::source_ready(&hub, &agent).await?;
+                crate::harness::ops::end_to_end::source_until(&hub, &agent, "the step's exact goal input completes before reported file work", || {
+                    let recipient = agent.clone();
+                    let source = agent.clone();
+                    let hub = Arc::clone(&hub);
+                    async move {
+                        let consumed = hub.store.read(move |connection| {
+                            Ok(connection.query_row("SELECT COUNT(*) FROM (SELECT disposition FROM agent_mail WHERE recipient=?1 AND owner='server' AND sender='server' AND status_key='internal-goal-stack' ORDER BY revision DESC LIMIT 1) WHERE disposition='consumed'", [recipient], |row| row.get::<_, i64>(0))? == 1)
+                        }).await?;
+                        let idle = hub.harness.local.get(&source).is_some_and(|session| session.core.lock().state.status == crate::harness::model::Status::Idle)
+                            && hub.harness.info(&source).is_some_and(|info| info.status == crate::harness::model::Status::Idle);
+                        Ok(consumed && idle)
+                    }
+                }).await?;
+                let reported = hub.harness.info(&agent).ok_or_else(|| anyhow::anyhow!("the completed step lost its source"))?;
+                anyhow::ensure!(std::fs::canonicalize(&reported.cwd)? == std::fs::canonicalize(work.path())?, "the provider reported {} instead of its fixture repository {cwd}", reported.cwd);
                 // Before its step is met, its work isn't a change of its own.
                 let early = crate::ops::call(cx.clone(), "agents.change", json!({"agent": agent})).await.err().map(|(_, m)| m).unwrap_or_default();
                 anyhow::ensure!(early.contains("still going"), "{early}");
                 std::fs::write(work.path().join(file), text)?;
                 anyhow::ensure!(hub.harness.set_changes(&agent, json!([{"path": format!("{cwd}/{file}"), "added": 1, "removed": 0}])).await, "no agent to set the changes of");
+                anyhow::ensure!(crate::workspace::change::paths_of(&hub, &agent).contains(&format!("{cwd}/{file}")), "the actual agent report did not retain {file}");
                 let a = agent.clone();
                 hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'met' WHERE agent = ?1", rusqlite::params![a])?)).await?;
                 agents::advance(&hub, &run).await?;

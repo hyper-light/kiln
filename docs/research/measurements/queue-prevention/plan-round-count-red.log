@@ -1,0 +1,17 @@
+
+running 3 tests
+test agent::native_handover_tests::native_ready_waits_for_actual_features_on_the_current_connection ... ok
+test goals::ops::tests::a_keyed_parallel_plan_round_replays_its_one_immutable_publication ... FAILED
+test goals::ops::tests::a_plan_run_again_under_its_key_is_the_same_run ... ok
+
+failures:
+
+---- goals::ops::tests::a_keyed_parallel_plan_round_replays_its_one_immutable_publication stdout ----
+Error: keyed round replay: 503 Service Unavailable: this run exists, but its legacy delivery has no custody receipt; see the existing run rather than starting another
+
+
+failures:
+    goals::ops::tests::a_keyed_parallel_plan_round_replays_its_one_immutable_publication
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 4229 filtered out; finished in 1.09s
+
