@@ -221,16 +221,23 @@ fn step28_an_archive_the_unpacker_refuses_leaves_nothing() -> anyhow::Result<()>
         t.insert(2, extra);
         t
     };
-    let cases: Vec<(&str, Vec<E>, Option<(u64, u64)>, &str, Option<&str>, Is)> = vec![
-        ("a symlink", with(link("pi/link", EntryType::Symlink, "pi")), None, "rg", Some("pi/link"), |w| matches!(w, Why::Link)),
-        ("a hard link", with(link("pi/hard", EntryType::Link, "pi/pi")), None, "rg", Some("pi/hard"), |w| matches!(w, Why::Link)),
-        ("an absolute path", with(file("/pi/abs", 0o644, b"x\n")), None, "rg", Some("/pi/abs"), |w| matches!(w, Why::Escapes)),
-        ("a .. path", with(file("pi/../../x", 0o644, b"x\n")), None, "rg", Some("pi/../../x"), |w| matches!(w, Why::Escapes)),
-        ("a duplicate", with(file("pi/package.json", 0o644, b"{}\n")), None, "rg", Some("pi/package.json"), |w| matches!(w, Why::Duplicate)),
-        ("a missing member", pi_tree("arm64"), None, "rg-not-it", Some("rg-1.0.0-arm64-unknown-linux-musl/rg"), |w| matches!(w, Why::Missing)),
-        ("a wrong count", pi_tree("arm64"), Some((9, 0)), "rg", None, |w| matches!(w, Why::Entries { expected: 9, got: 8 })),
+    let rg_missing = Some("rg-1.0.0-arm64-unknown-linux-musl/rg");
+    // A directory its owner may not search (0644), which `remove_dir_all` can't empty once the tree is in.
+    let mut locked = pi_tree("arm64");
+    locked.extend([E { name: b"pi/locked/".to_vec(), kind: EntryType::Directory, mode: 0o644, data: Vec::new(), link: None }, file("pi/locked/f", 0o644, b"f\n")]);
+    // Each case: what it is, arm64's tree, its pinned totals where they aren't the tree's, what ripgrep's
+    // archive holds its binary as, the archive refused, the entry it names, and why.
+    let cases: Vec<(&str, Vec<E>, Option<(u64, u64)>, &str, &str, Option<&str>, Is)> = vec![
+        ("a symlink", with(link("pi/link", EntryType::Symlink, "pi")), None, "rg", "pi", Some("pi/link"), |w| matches!(w, Why::Link)),
+        ("a hard link", with(link("pi/hard", EntryType::Link, "pi/pi")), None, "rg", "pi", Some("pi/hard"), |w| matches!(w, Why::Link)),
+        ("an absolute path", with(file("/pi/abs", 0o644, b"x\n")), None, "rg", "pi", Some("/pi/abs"), |w| matches!(w, Why::Escapes)),
+        ("a .. path", with(file("pi/../../x", 0o644, b"x\n")), None, "rg", "pi", Some("pi/../../x"), |w| matches!(w, Why::Escapes)),
+        ("a duplicate", with(file("pi/package.json", 0o644, b"{}\n")), None, "rg", "pi", Some("pi/package.json"), |w| matches!(w, Why::Duplicate)),
+        ("a missing member", pi_tree("arm64"), None, "rg-not-it", "rg", rg_missing, |w| matches!(w, Why::Missing)),
+        ("a wrong count", pi_tree("arm64"), Some((9, 0)), "rg", "pi", None, |w| matches!(w, Why::Entries { expected: 9, got: 8 })),
+        ("a missing member after a locked directory", locked, None, "rg-not-it", "rg", rg_missing, |w| matches!(w, Why::Missing)),
     ];
-    for (what, tree, wrong, rg, entry, is) in cases {
+    for (what, tree, wrong, rg, fails, entry, is) in cases {
         crate::rt::block_on(async move {
             let mut builds = Vec::new();
             let origin = serve(|o| {
@@ -244,7 +251,7 @@ fn step28_an_archive_the_unpacker_refuses_leaves_nothing() -> anyhow::Result<()>
             })
             .await?;
             let b = pi(builds);
-            let url = if what == "a missing member" { format!("{origin}/arm64/rg.tar.gz") } else { format!("{origin}/arm64/pi.tar.gz") };
+            let url = format!("{origin}/arm64/{fails}.tar.gz");
             let tmp = tempfile::tempdir()?;
             let (absent, empty) = (tmp.path().join("absent"), tmp.path().join("empty"));
             std::fs::create_dir(&empty)?;

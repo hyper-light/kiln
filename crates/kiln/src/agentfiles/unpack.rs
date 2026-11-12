@@ -447,7 +447,7 @@ fn modes(staging: &Path, under: &Path, dirs: &Dirs) -> Result<(), Fault> {
 /// What a failed tree staged, removed (best effort: the fault returned is the first one). Each directory
 /// is made its owner's to search and change first: one whose mode lacks its owner's execute bit (0644)
 /// would keep `remove_dir_all` from what it holds.
-fn discard(staging: &Path) {
+pub(super) fn discard(staging: &Path) {
     let mut todo = vec![staging.to_path_buf()];
     while let Some(dir) = todo.pop() {
         if set_dir_mode(&dir, 0o700).is_err() {
