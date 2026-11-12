@@ -1,0 +1,7 @@
+# Plan step 20 [kiln] step 2's source mutations on kiln-a094a12d.attlocal.net, 2026-11-12T15:01:29Z
+MUTANT codex-args exit=101 PASS :: test agentfiles::builtin::codex_tests::codex_harness_json_runs_kilns_command_with_codex_home_in_its_volume ... FAILED     agentfiles::builtin::codex_tests::codex_harness_json_runs_kilns_command_with_codex_home_in_its_volume test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4387 filtere
+MUTANT agentfile-env-key exit=101 PASS :: test agentfiles::builtin::codex_tests::codex_embedded_files_hold_no_credential ... FAILED test agentfiles::builtin::codex_tests::codex_agentfile_is_exactly_its_base_harness_grants_and_volumes ... FAILED     agentfiles::builtin::codex_tests::codex_agentfile_is_exactly_its_base_harness_grants_and_volu
+## the untouched tree again
+UNTOUCHED exit=0 :: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 4384 filtered out; finished in 0.00s
+MUTANTS passed=2 failed=0
+# done 2026-11-12T15:06:33Z

@@ -79,6 +79,15 @@ pub const ALL: &[Builtin] = &[
         pin: include_str!("../../../../.kiln/images/harness-cursor/pin.json"),
         files: &[("harness.json", include_str!("../../../../.kiln/images/harness-cursor/harness.json"))],
     },
+    // Codex, through its app-server, from OpenAI's whole package (kiln plan
+    // 01a1cd8e862e7169a074db3d5fa33f3d, step 20).
+    Builtin {
+        name: "harness-codex",
+        harness: "codex",
+        text: include_str!("../../../../.kiln/images/harness-codex/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-codex/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-codex/harness.json"))],
+    },
 ];
 
 /// One as the list shows it.
@@ -113,6 +122,9 @@ mod devin_tests;
 
 #[cfg(test)]
 mod cursor_tests;
+
+#[cfg(test)]
+mod codex_tests;
 
 #[cfg(test)]
 mod tests {
