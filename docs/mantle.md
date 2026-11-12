@@ -444,7 +444,9 @@ object store) is wise"):
   QUIC in 214 s, BLOBS-90's 1001 objects in 58 s; again with each mutation's first answer lost
   (chaos `mantle_lost`), 163 of 163 in 296 s, BLOBS-90 in 104 s, no upload left open; and the
   W27-R08 custody test: a put and its read back walk as hand-on and receipt by SHA-256, and bytes
-  changed in the cell are refused and the break recorded.
+  changed in the cell are refused and the break recorded. Again at `87ab09e1` on hyper-raft `fb74b59`
+  (11-12, on fedora, kiln's part-4 tree `c1d95fff0`): the suite and the custody test pass, 181 s for
+  both.
 - **Not yet:** collecting the bytes no pointer names and the uploads left open; `Full` for a cell
   out of space (it's `Unavailable`, with Mantle's status). Placement, repair, scrub and moving
   production's bytes are T10's, and Ada's to decide.
