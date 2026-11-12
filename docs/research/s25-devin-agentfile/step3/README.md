@@ -8,7 +8,9 @@ ROOT 01a148884a4770fdaf0111f3f792a248. The policy read before any edit is
 R01-R16), kiln main c09d23207 (AGENTS.md 16b05ef8…, docs/ci.md §0.3).
 
 Branch `s25-devin-row`: step 1's pin (162f1f757), kiln main c09d23207 (step 30's table) merged in
-(19b4ee5c0), then this step's commit.
+(19b4ee5c0), this step's commits (365af3037, 4cefe7ada), then kiln main 172176b23 merged in
+(f3a10164b). That main has step 23's Goose row, the table's first, so the branch takes its layout
+(below, "After main moved").
 
 ## What it adds
 
@@ -16,9 +18,10 @@ Branch `s25-devin-row`: step 1's pin (162f1f757), kiln main c09d23207 (step 30's
 |---|---|
 | `.kiln/images/harness-devin/Agentfile` | `ARG BASE` (pin.json's base by digest), `FROM ${BASE}`, `ARG TARGETARCH`, `HARNESS devin FROM ./devin-${TARGETARCH}`, the bring-up's three provider grants, three harness-scoped volumes (/workspace, /home/devin/.config/devin, /home/devin/.local/share/devin); no RUN, no ENV. Comments cite why: static builds (f5), the grants until step 9 (f14), Devin's XDG directories (f10, f12), no credential (f13), no self-update (f26). |
 | `.kiln/images/harness-devin/harness.json` | Shards' full OSI form: schemaVersion 1, name devin, version 3000.12.43 (the pin's), run.command `["devin", "acp"]` (the devin Kind's program and ACP arguments, f9), run.env the two XDG roots (f12). No update setting (f26). |
-| `crates/kiln/src/agentfiles/builtin.rs` | `Builtin` gains `pin` and `files`; `ALL` holds one row, harness-devin, by `include_str!` of the three files; six tests (below). |
+| `crates/kiln/src/agentfiles/builtin.rs` | Devin's row in `ALL`, after Goose's, by `include_str!` of the three files, and `mod devin_tests`. (Before the merge: `Builtin` gaining `pin` and `files`, and six tests in `mod tests`.) |
+| `crates/kiln/src/agentfiles/builtin/devin_tests.rs` | Devin's four tests: step25_devins_pin_is_cognitions_two_linux_bundles, step25_devins_harness_json_starts_it_as_kiln_does, step25_devins_agentfile_is_the_layouts, step25_devins_files_carry_no_credential. |
 | `crates/kiln/tests/agentfiles.rs` | The listing's `builtin` is held to `kiln::agentfiles::builtin::views()`, not `[]`, so each harness's row passes it unchanged. |
-| `Dockerfile` | The build stage copies `.kiln/images/` before cargo builds kiln (f25). |
+| `Dockerfile` | The build stage copies `.kiln/images/` before cargo builds kiln (f25). Since the merge, main's own line, which Goose landed. |
 | `.dockerignore` | Its header names `.kiln/images/` among the context it keeps (a comment). |
 
 ## Decisions
@@ -26,7 +29,8 @@ Branch `s25-devin-row`: step 1's pin (162f1f757), kiln main c09d23207 (step 30's
 - **The row's shape.** `pin: &'static str` and `files: &'static [(&'static str, &'static str)]`, the
   shape the opencode (s22), goose (s23) and amp (s24) branches add, so whichever harness lands first
   defines it and the others merge (step 19's shared layout, item 2: never a second table). The
-  Dockerfile's three lines are byte-identical to s22's, so the two merge cleanly.
+  Dockerfile's three lines were byte-identical to s22's. Goose landed first, with this shape and a
+  COPY line of its own, which the merge takes.
 - **No smoke data on the row.** Step 19 has landed no row carrying any, and nothing in kiln reads one
   yet. Step 5 gives step 19's `image()` fallback Devin's smoke where its reader is: program
   `--version`, expected prefix `devin <pin version> (` (f8). The coordinator's word: "if the row needs
@@ -120,6 +124,50 @@ Studio's run; shards-build.sh ran under its first form, which sent the script al
    own line, `COPY .kiln/images/ .kiln/images/`, then exported and removed. All five files landed byte
    for byte; the decoy was dropped by `**/*.log`; no image of its name was left.
 
+## After main moved: Goose landed first
+
+While this step waited on Linux, kiln main reached 172176b23: step 23 landed the table's first row,
+harness-goose. It brought `Builtin {name, harness, text, pin, files}`, the shape this branch had,
+and the Dockerfile's `COPY .kiln/images/ .kiln/images/` under its own comment. It also brought
+`step23_kilns_dockerfile_copies_what_builtins_embed` (the test this branch had added),
+`step23_a_real_shards_checks_every_builtin`, and Goose's tests in their own file,
+`builtin/goose_tests.rs`, named `step23_…`. kiln's AGENTS.md asks that test names cite the ID they
+serve, which this branch's names hadn't.
+
+The merge (f3a10164b) takes main's side and adds Devin. `builtin.rs` is main's, with Devin's row after
+Goose's and `mod devin_tests`. Devin's four tests move, unchanged in substance, to
+`builtin/devin_tests.rs` as `step25_…`, the credential scan held to Devin's row alone. This branch's
+`every_builtin_is_a_valid_agentfile_once` was main's word for word, and its Dockerfile test repeated
+main's step23 one, so both go; the .dockerignore half of the latter goes with it, and check 5 keeps its
+evidence. The Dockerfile is main's. tests/agentfiles.rs keeps this branch's comparison to
+`builtin::views()`.
+
+Smoke: Goose's pin carries one (`"smoke": {program, args, stdout}`), checked by Goose's own tests;
+no shared test asks a pin for one. Devin's is step 5's, in pin.json through pin.sh, which writes that
+file.
+
+After the merge, on the same Mac Studio, `scripts/kiln-tests.sh` ran with BASE 172176b23 and
+SHARDS_REV ac87190d3 ([e_kiln_tests_merged_macos.txt](evidence/e_kiln_tests_merged_macos.txt)). That
+built a check-only shards first, as shards-build.sh does, and named it by `KILN_TEST_SHARDS`, with its
+own SHARDS_HOME and an empty DOCKER_CONFIG.
+
+| Step | Result |
+|---|---|
+| `cargo test -p kiln --lib agentfiles::` | 30 passed, 0 failed: Devin's four step25 tests, Goose's five, the table's three, and the module's others |
+| `step23_a_real_shards_checks_every_builtin`, `--nocapture` | passed, and ran: kiln's own `check::run` with the real shards had nothing to say of Goose's Agentfile or Devin's |
+| `cargo test -p kiln --test agentfiles` | 1 passed (both rows listed) |
+| `cargo clippy -p kiln --all-targets -- -D warnings` | exit 0 |
+| mutation: Devin's Kind `Acp(&["acp", "--stdio"])` | killed: step25_devins_harness_json_starts_it_as_kiln_does FAILED |
+| mutation: the Dockerfile's COPY of .kiln/images/ removed | killed: main's step23_kilns_dockerfile_copies_what_builtins_embed FAILED |
+| mutation: `ENV WINDSURF_API_KEY=x` in the Agentfile | killed: step25_devins_files_carry_no_credential FAILED |
+
+**Main's own integration test fails as main stands (R09).** `scripts/main-repro.sh` ran
+[e_main_repro_macos.txt](evidence/e_main_repro_macos.txt) on main 172176b23's tree exactly (`git status`
+empty) with the same target. `step30_agentfiles_on_every_surface` FAILED, exit 101: line 111 asserts
+`listed.get("builtin") == Some(&json!([]))`, and the listing's `builtin` holds
+`{"name":"harness-goose", …}`. The merged branch passes it with tests/agentfiles.rs comparing to
+`builtin::views()` instead, so main is red there until this branch, or that line alone, lands.
+
 ## R01-R16
 
 | Rule | Proof, or the gap |
@@ -132,14 +180,14 @@ Studio's run; shards-build.sh ran under its first form, which sent the script al
 | R06 | Each test helper does one check; the longest, the pin's, is a list of independent conditions. |
 | R07 | The Agentfile's comments give reasons with their findings; the code's cite Shards' source and the research. |
 | R08 | Not applicable to a data row. Image sizes and build times are step 4's single observations; comparisons are ROOT's. |
-| R09 | f25's break (a row including from `.kiln/` while the build stage copies no `.kiln/`) is guarded: the test fails with the COPY line removed (mutation dockerfile-copy), and Docker shows the line copies the files with kiln's `.dockerignore` (check 5). kiln's whole server image was not built here (heavy: ROOT's, at merge). |
+| R09 | f25's break (a row including from `.kiln/` while the build stage copies no `.kiln/`) is guarded: the test fails with the COPY line removed (mutation dockerfile-copy), and Docker shows the line copies the files with kiln's `.dockerignore` (check 5). kiln's whole server image was not built here (heavy: ROOT's, at merge). Main's integration-test failure was reproduced live on main's own tree before this branch's fix counts for it (red on main 172176b23, green on f3a10164b). |
 | R10 | This directory: each script, its output, and the commands. |
 | R11 | kiln's tests and clippy ran on macOS arm64 (a Mac Studio); not on Linux amd64 (check 4: kiln's queue, 11 to 13 hours; step 6 runs them there at the landed revision). Windows clippy did not run: kiln's full gate waits for the person's word, and the change has no platform code. Devin's linux/arm64 build was checked by Shards' whole check, run on amd64; arm64 images and smokes are step 4's. |
-| R12 | One table (step 30's), the siblings' field shape, the Dockerfile's lines byte-identical to s22's; no second fetcher (the context here was made by hand, with the same size and digest checks). The OSI test mirrors Shards' field names, since kiln doesn't vendor Shards yet (step 16). |
+| R12 | One table (step 30's), with Goose's row before Devin's: the shape Goose landed, main's Dockerfile line, main's table tests (the Dockerfile and the real Shards), and Devin's own tests in their own file as Goose's are; no second fetcher (the context here was made by hand, with the same size and digest checks). The OSI test mirrors Shards' field names, since kiln doesn't vendor Shards yet (step 16). |
 | R13 | Data plus the tests the plan names; nothing added for a reader that doesn't exist yet (no smoke field). |
 | R14 | None here: profiling and benchmarks are ROOT's. |
 | R15 | Implementer, light tests only; no push; the SHA and counts go to the coordinator. |
-| R16 | `scripts/cleanup.sh` removes my `~/.cache/s25-step3` once a runner's last run is done: on the Mac Studio, 31 GB (30 GB of it kiln's target; [e_cleanup_macos.txt](evidence/e_cleanup_macos.txt)); on adacachy2, 5.0 GB (3.5 GB of it the check-only shards' target; [e_cleanup_adacachy2.txt](evidence/e_cleanup_adacachy2.txt)). |
+| R16 | `scripts/cleanup.sh` removes my `~/.cache/s25-step3` once a runner's last run is done: on the Mac Studio, 31 GB (30 GB of it kiln's target; [e_cleanup_macos.txt](evidence/e_cleanup_macos.txt)); on adacachy2, 5.0 GB (3.5 GB of it the check-only shards' target; [e_cleanup_adacachy2.txt](evidence/e_cleanup_adacachy2.txt)); on the Mac Studio after the merge's run, 37 GB ([e_cleanup_macos_merged.txt](evidence/e_cleanup_macos_merged.txt)). |
 
 ## Not done here
 

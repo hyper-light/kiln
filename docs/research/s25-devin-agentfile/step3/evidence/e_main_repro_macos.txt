@@ -1,0 +1,13 @@
+[2m[kiln] on d1323898b255a3ed435eb83fa0f7b0cf · macos/aarch64 · 28 of 32 cores idle · 58 GB free · room for 12 CPUs, 32 GiB of memory[0m
+s25-step3: started on Adas-Mac-Studio.local
+kiln 172176b23e2bec820a05a430f2482bfbdbb806c8
+tree as main's: yes
+111:    anyhow::ensure!(names == ["claude"] && listed.get("builtin") == Some(&json!([])) && listed.get("reaches_all") == Some(&json!(false)), "{listed}");
+test step30_agentfiles_on_every_surface ... FAILED
+failures:
+failures:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.86s
+"builtin":[{"name":"harness-goose","harness":"goose","text":"# Goose (aaif-goose/
+main's tests/agentfiles.rs: exit 101
+[2m[kiln] used memory not measured over 1 min 5 s; OOM kills not seen here[0m
+exit 0 (try 1)
