@@ -4,7 +4,7 @@
   "execution_id": "6212266538958848",
   "verified": {
     "how": "Each archive's SHA-512 equals the one its platform's manifest from Google's updater gives over HTTPS, as Google's install.sh checks it; Google publishes no signature for the CLI.",
-    "read_at": "2026-11-12T08:14:29Z",
+    "read_at": "2026-11-12T08:39:19Z",
     "releases": {
       "url": "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/releases",
       "sha256": "090fa7c9f6bd452c316c9ead04267e991b0967b4ac9c727b15296e4730586078"
