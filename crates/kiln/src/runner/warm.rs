@@ -849,6 +849,15 @@ pub fn take_reaped() -> Vec<reap::Eviction> {
     REAPED.lock().drain(..).collect()
 }
 
+/// An eviction of the reaper's, kept for the server with the rest (the newest 200).
+pub fn keep_reaped(e: reap::Eviction) {
+    let mut kept = REAPED.lock();
+    kept.push_back(e);
+    while kept.len() > 200 {
+        kept.pop_front();
+    }
+}
+
 /// W24-R31's reaper over this runner's warm workspaces. The policy is `layers` (the server's
 /// system and runner scopes) over [`env_policy`]; the volume `disk` (`(size, free)`, measured with
 /// statvfs when `None`). When free space is under the floor, the workspaces past their ceiling, or
@@ -916,6 +925,11 @@ static SERVER_POLICIES: LazyLock<parking_lot::Mutex<Vec<(reap::Scope, reap::Poli
 /// The server's reaper policies for this runner, as it last said (W24-R31).
 pub fn set_server_policies(layers: Vec<(reap::Scope, reap::Policy)>) {
     *SERVER_POLICIES.lock() = layers;
+}
+
+/// The server's reaper policies for this runner (its system and runner scopes), as it last said.
+pub fn server_policies() -> Vec<(reap::Scope, reap::Policy)> {
+    SERVER_POLICIES.lock().clone()
 }
 
 /// W24-R31: the reaper's clock on this runner. Every minute it checks whether free space, the

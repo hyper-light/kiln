@@ -2440,6 +2440,21 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         let h = Arc::clone(h);
         crate::runner::custody::set_sessions(move || h.harness_pids());
     }
+    // W24-R31: the reaper of this machine's projects (the folders its agent sessions work in) and
+    // its ~/.cache, which asks an idle agent of a project to clean what it doesn't recognize.
+    if let Some(h) = harness.as_ref().filter(|_| !o.outpost && !o.ephemeral) {
+        use crate::harness::model::{Command, SendMode, Status};
+        let (list, tell) = (Arc::clone(h), Arc::clone(h));
+        crate::runner::reap_projects::set_sessions(move || {
+            list.list()
+                .into_iter()
+                .filter(|i| !i.subagent)
+                .map(|i| crate::runner::reap_projects::Session { id: i.id, cwd: i.cwd, idle: i.status == Status::Idle, queued: i.queue.into_iter().map(|q| q.id).collect() })
+                .collect()
+        });
+        crate::runner::reap_projects::set_tell(move |session, id, text| tell.command(session, Command::Send { id, text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }));
+        crate::runner::reap_projects::start(name.clone());
+    }
     // The harnesses its user's login shell finds are this machine's too
     // (`crate::harness::kinds::search_path`): that shell is asked now, and every ten minutes.
     if harness.is_some() {
