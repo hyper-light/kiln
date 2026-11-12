@@ -59,6 +59,14 @@ export interface Turn {
 const RELAY_ID = "kiln-relay-";
 const isRelay = (e: HEvent): e is Extract<HEvent, { kind: "user" }> => e.kind === "user" && !!e.client_id?.startsWith(RELAY_ID);
 
+/**
+ * What agents say to each other, and kiln's news to an agent of the agents and runs it started:
+ * `from-agent-` and `news-` ids (harness/queued.rs `FROM_AGENT`, `NEWS`). Internal: the
+ * conversation shows what the agent did with them, not the messages.
+ */
+const INTERNAL_IDS = ["from-agent-", "news-"];
+export const isInternal = (id: string | undefined): boolean => !!id && INTERNAL_IDS.some((p) => id.startsWith(p));
+
 /** The subagent a relay is for, as kiln names it to the agent ("… (agent id a575), …": `subagent::relay_words`). */
 const relayFor = (e: Extract<HEvent, { kind: "user" }>): string | null => /\(agent id ([^)\s]+)\)/.exec(e.text)?.[1] ?? null;
 
@@ -260,6 +268,19 @@ function readTurns(events: HEvent[], at: number, parent: string | undefined, thr
         }
         t.hidden = [...(t.hidden ?? []), e.id];
         relayTo.set(t, [...(relayTo.get(t) ?? []), relayFor(e)]);
+        continue;
+      }
+      // Another agent's message, or kiln's news: steered into the agent's work, part of that turn;
+      // after the agent answered, a turn of the agent's with no prompt shown.
+      if (isInternal(e.client_id)) {
+        const steered = cur !== null && !(before?.kind === "assistant" && !before.streaming);
+        let t: Turn;
+        if (steered) t = cur as unknown as Turn;
+        else {
+          if (cur) (cur as Turn).ended = e.at;
+          t = open(null, e.at, e.id);
+        }
+        t.hidden = [...(t.hidden ?? []), e.id];
         continue;
       }
       if (cur) (cur as Turn).ended = e.at;
