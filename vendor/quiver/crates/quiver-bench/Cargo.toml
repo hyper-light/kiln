@@ -33,13 +33,13 @@ libc = "0.2.191"
 
 # The competitors' own clients, as Focal's comparison takes them (bench/README.md, "The
 # comparison"): async-nats, redis-rs and librdkafka (built from its vendored source, without TLS,
-# SASL or compression), each on a tokio runtime of its own. On Linux, where the comparison runs, its
-# brokers in Docker.
+# SASL or compression), each on a tokio runtime of its own, and the floor over TCP's, on tokio's own
+# sockets. On Linux, where the comparison runs, its brokers in Docker.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 async-nats = { version = "0.50", default-features = false, features = ["aws-lc-rs"] }
 rdkafka = { version = "0.39", default-features = false, features = ["tokio"] }
 redis = { version = "1.7", default-features = false, features = ["tokio-comp"] }
-tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "time"] }
 # Kafka's Flight Recorder events, as `jfr print --json` gives them.
 serde_json = "1.0.154"
 

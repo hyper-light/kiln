@@ -67,6 +67,34 @@ fn notification(config: &mut crate::config::Config) {
     config.ci.notify.push(crate::ci::notify::Rule { on: vec!["tag_moved".into()], cond: None, to: vec!["inbox:lock-observer".into()], throttle: None });
 }
 
+/// Starts the relay of kiln's events and the notification rules' reader, and waits until the reader
+/// stands on kiln.events: a moved tag's notice is delivered from there (crate::events), to what
+/// happens after the reader stands.
+pub(super) async fn told(hub: &Arc<Hub>) -> anyhow::Result<()> {
+    crate::events::spawn(hub);
+    crate::ci::notify::spawn(hub);
+    for _ in 0..3000 {
+        if hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_positions WHERE reader = 'notify'", [], |r| r.get::<_, i64>(0))?)).await? == 1 {
+            return Ok(());
+        }
+        crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    anyhow::bail!("the notification rules' reader never stood on kiln.events")
+}
+
+/// [`counts`] once the notices told by then are delivered: as `want` within 30 s, else as they are.
+async fn counts_settled(hub: &Hub, want: (&str, &str, &str, i64, i64)) -> anyhow::Result<(String, String, String, i64, i64)> {
+    let mut now = counts(hub).await?;
+    for _ in 0..3000 {
+        if (now.0.as_str(), now.1.as_str(), now.2.as_str(), now.3, now.4) == want {
+            break;
+        }
+        crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+        now = counts(hub).await?;
+    }
+    Ok(now)
+}
+
 async fn counts(hub: &Hub) -> anyhow::Result<(String, String, String, i64, i64)> {
     hub.store.call(|c| {
         let (first, accepted, last) = c.query_row("SELECT first_commit, accepted_commit, last_commit FROM ci_lock_refs WHERE git_ref = 'refs/tags/v1.2.3'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
@@ -82,6 +110,7 @@ fn w29_r26_moved_tags_are_not_blessed_or_notified_again_after_reopening_the_stor
         let root = tempfile::tempdir()?;
         let database = root.path().join("history.db");
         let hub = crate::hub::tests::scratch_hub_persistent(database.clone(), notification).await?;
+        told(&hub).await?;
         let text = WORKFLOW.replace("@v1", "@v1.2.3");
         let caller = caller(&hub, root.path(), &text, None).await?;
         let (source, repository) = simulated()?;
@@ -93,7 +122,7 @@ fn w29_r26_moved_tags_are_not_blessed_or_notified_again_after_reopening_the_stor
             assert!(next.warnings.iter().any(|w| w.contains("KCI4056")));
             assert_eq!(next.root_actions().map_err(anyhow::Error::msg)?.get("acme/tools@v1.2.3").map(|a| a.sha.as_str()), Some(M));
         }
-        assert_eq!(counts(&hub).await?, (A.into(), A.into(), M.into(), 1, 1));
+        assert_eq!(counts_settled(&hub, (A, A, M, 1, 1)).await?, (A.into(), A.into(), M.into(), 1, 1));
         let moved = moved_tags(&hub, "acme/tools", false).await?;
         assert_eq!(moved.len(), 1);
         assert!(moved_tags(&hub, "acme/tools", true).await?.is_empty(), "a native repository with the same name has its own history");
@@ -101,6 +130,7 @@ fn w29_r26_moved_tags_are_not_blessed_or_notified_again_after_reopening_the_stor
         assert_eq!(moved.first().and_then(|m| m.get("now")).and_then(serde_json::Value::as_str), Some(M));
         drop(hub);
         let hub = crate::hub::tests::scratch_hub_persistent(database, |config| { notification(config); config.ci.locks.moved_tags = verify::MovedTags::Refuse; }).await?;
+        told(&hub).await?;
         crate::gitops::sync_mirror(&hub, &caller.repo).await?;
         notify_moves(&hub).await?;
         notify_moves(&hub).await?;
@@ -109,7 +139,7 @@ fn w29_r26_moved_tags_are_not_blessed_or_notified_again_after_reopening_the_stor
         let refused = prepare_with(&hub, &traced, &caller.repo, &caller.commit, PATH, Arc::clone(&caller.model)).await;
         assert!(refused.is_err_and(|e| e.contains("KCI4056")));
         assert!(reads.lock().is_empty());
-        assert_eq!(counts(&hub).await?, (A.into(), A.into(), M.into(), 1, 1));
+        assert_eq!(counts_settled(&hub, (A, A, M, 1, 1)).await?, (A.into(), A.into(), M.into(), 1, 1));
         source.replace_identity(&repository, Identity::Github { hostname: "github.com".into(), owner_id: 99, repo_id: 100 })?;
         assert!(prepare_with(&hub, &traced, &caller.repo, &caller.commit, PATH, Arc::clone(&caller.model)).await.is_err_and(|e| e.contains("KCI4052")));
         assert!(reads.lock().is_empty());
@@ -129,7 +159,8 @@ fn w29_r26_moved_tags_are_not_blessed_or_notified_again_after_reopening_the_stor
 fn w29_r26_a_preview_neither_accepts_a_first_resolution_nor_records_a_move() -> anyhow::Result<()> {
     crate::rt::block_on(async {
         let root = tempfile::tempdir()?;
-        let hub = crate::hub::tests::scratch_hub_with(notification).await?;
+        let hub = crate::hub::tests::persisted_hub_on(crate::rt::clock(), notification).await?;
+        told(&hub).await?;
         let text = WORKFLOW.replace("@v1", "@v1.2.3");
         let caller = caller(&hub, root.path(), &text, None).await?;
         let (source, repository) = simulated()?;
@@ -145,7 +176,7 @@ fn w29_r26_a_preview_neither_accepts_a_first_resolution_nor_records_a_move() -> 
         assert!(moved_tags(&hub, "acme/tools", false).await?.is_empty());
         // A real start records the same observation and reaches only declared channels.
         prepare_with(&hub, &source, &caller.repo, &caller.commit, PATH, caller.model).await.map_err(anyhow::Error::msg)?;
-        assert_eq!(counts(&hub).await?, (A.into(), A.into(), M.into(), 1, 1));
+        assert_eq!(counts_settled(&hub, (A, A, M, 1, 1)).await?, (A.into(), A.into(), M.into(), 1, 1));
         Ok(())
     })
 }

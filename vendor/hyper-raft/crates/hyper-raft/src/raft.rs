@@ -543,6 +543,17 @@ pub struct FastStats {
     pub recovered: u64,
 }
 
+/// The entries a member committed as leader since it opened, by the quorum that committed each
+/// first (core step R-8, `docs/raft.md` §3.7): its owner's count of what held quorums answered
+/// sooner than disks. The fast track's are [`FastStats::committed`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitStats {
+    /// Committed by a classic quorum, its members' disks.
+    pub classic: u64,
+    /// Committed by a held quorum before the classic one held them.
+    pub held: u64,
+}
+
 /// What decides a member's next campaign when it elects by suspicion ([`Raft::campaign_state`]),
 /// for its owner to report: a campaign that does not come is one of these.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -712,6 +723,8 @@ pub struct Raft<S> {
     pub(crate) voted_to: (u64, NodeId),
     /// What the fast track did here since the member opened.
     pub(crate) fast_stats: FastStats,
+    /// What this member committed as leader since it opened, by quorum.
+    commit_stats: CommitStats,
     pub(crate) holders: Vec<NodeId>,
     /// In a fast group that this member leads: the voters of the
     /// configuration it counted by when it was elected, by which a member
@@ -1389,6 +1402,7 @@ impl<S: Storage> Raft<S> {
             takes_through: None,
             voted_to: (0, 0),
             fast_stats: FastStats::default(),
+            commit_stats: CommitStats::default(),
             holders: Vec::new(),
             term_voters: Vec::new(),
             term_next: Vec::new(),
@@ -1732,6 +1746,11 @@ impl<S: Storage> Raft<S> {
     pub fn has_pending_conf(&self) -> bool {
         self.pending_conf_index > self.log.applied()
     }
+    /// What this member committed as leader since it opened, by the quorum that committed each
+    /// entry first.
+    pub fn commit_stats(&self) -> CommitStats {
+        self.commit_stats
+    }
     /// Whether this leader committed the blank entry it began its term with: it serves reads only
     /// once it has, as then it knows every entry committed before its term (the thesis's §6.4: a
     /// leader "commit[s] a blank no-op entry into the log at the start of its term"). An entry of
@@ -2053,8 +2072,21 @@ impl<S: Storage> Raft<S> {
             self.term
         };
         // The first of the classic quorum and a held one commits (R-8, `docs/raft.md` §3.7).
+        let before = self.log.committed();
         let held = self.held_quorum_index()?;
         let classic = self.log.maybe_commit(index.max(held), term)?;
+        if classic {
+            // What the commit moved through the classic quorum's index it holds; past it, only
+            // the held quorum did.
+            let after = self.log.committed();
+            let stats = &mut self.commit_stats;
+            stats.classic = stats
+                .classic
+                .saturating_add(after.min(index).saturating_sub(before));
+            stats.held = stats
+                .held
+                .saturating_add(after.saturating_sub(before.max(index)));
+        }
         // The quorum holds this leader's entry at `index`, so every later leader's log holds it
         // and every entry before it: what this member holds by itself through it is held no more.
         // A fast quorum may have committed it first. The members learn it with the next append or
