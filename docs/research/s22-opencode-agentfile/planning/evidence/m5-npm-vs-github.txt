@@ -1,0 +1,9 @@
+M5 run 2026-11-12T07:19:54Z
+NPM @opencode/cli-linux-x64@2.2.7 tarball=https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-2.2.7.tgz integrity=match
+NPM_MEMBERS cli-linux-x64 package/package.json package/bin/opencode 
+NPM_BINARY cli-linux-x64 npmx-cli-linux-x64/package/bin/opencode sha256=589253d36810f21217edd51545cd435b328cdc3cf4f451fbe0cce6f88afcf5e1
+NPM @opencode/cli-linux-arm64-musl@2.2.7 tarball=https://registry.npmjs.org/@opencode/cli-linux-arm64-musl/-/cli-linux-arm64-musl-2.2.7.tgz integrity=match
+NPM_MEMBERS cli-linux-arm64-musl package/package.json package/bin/opencode 
+NPM_BINARY cli-linux-arm64-musl npmx-cli-linux-arm64-musl/package/bin/opencode sha256=b4203e9861d0472e711493a34e8d843fb249cf9bf499b69cfdc64416085d87c6
+GITHUB_BINARY x64 sha256=589253d36810f21217edd51545cd435b328cdc3cf4f451fbe0cce6f88afcf5e1
+GITHUB_BINARY arm64-musl sha256=b4203e9861d0472e711493a34e8d843fb249cf9bf499b69cfdc64416085d87c6

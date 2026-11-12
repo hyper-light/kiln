@@ -1,0 +1,3 @@
+# pi's pinned tarballs: entries whose names collide with case ignored, as on APFS and NTFS (host adacachy, 2026-11-12T22:36:36Z)
+pi-linux-x64.tar.gz: sha256 and size as pinned; 234 entries; names that collide with case ignored: none
+pi-linux-arm64.tar.gz: sha256 and size as pinned; 234 entries; names that collide with case ignored: none

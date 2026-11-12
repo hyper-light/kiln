@@ -1,0 +1,8 @@
+M8B run 2026-11-12T07:45:47Z host adacachy2
+TMP_BEFORE drwxr-xr-x 1 adalundhe adalundhe 68 Nov 11 23:31 /home/adalundhe/.cache/s22-opencode-research/alpine/tmp
+Error: ENOENT: no such file or directory, realpath '/tmp/opencode'
+EXIT 1
+Error: ENOENT: no such file or directory, realpath '/tmp/opencode'
+EXIT 0
+[2m2026-11-12T07:46:45.086919Z[0m [31mERROR[0m refused: 00aad8daff2fa3c9daa65d53c425d450 sent no receipt of it
+kiln_exit=1 tries=1

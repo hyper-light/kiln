@@ -1,0 +1,7 @@
+M8C run 2026-11-12T07:52:58Z host adacachy
+PROC_BEFORE ls: cannot access '/home/adalundhe/.cache/s22-opencode-research/alpine/proc': No such file or directory 
+unshare: mount /home/adalundhe/.cache/s22-opencode-research/alpine/proc failed: No such file or directory
+EXIT 1
+unshare: mount /home/adalundhe/.cache/s22-opencode-research/alpine/proc failed: No such file or directory
+EXIT 1
+kiln_exit=0 tries=2

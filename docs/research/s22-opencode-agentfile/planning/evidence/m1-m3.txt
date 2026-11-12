@@ -1,0 +1,110 @@
+M1 run 2026-11-12T07:11:23Z host Darwin arm64 gh 2.98.0
+SHA256SUMS sha256 72c73a07124c65662239facaa7da2f3fe474078bbd4cbfa68bf90ae8fdca3b8b
+ARCHIVE opencode-linux-x64.tar.gz size=121783361 sha256=89a6cee227b54bc011179c528a5e63176032462b1a5e21723b616801cddc2ca7 sums=match api=match
+ARCHIVE opencode-linux-arm64.tar.gz size=120326654 sha256=c1682057f0815cb2abdd6e00305f1146ebaf1c167f0335cdb74ddc80008120e7 sums=match api=match
+ARCHIVE opencode-linux-x64-musl.tar.gz size=121562329 sha256=c1801a36bf61e03eafac8d7f4521a200e4d3cd76cf43b36621cb78b460b851ee sums=match api=match
+ARCHIVE opencode-linux-arm64-musl.tar.gz size=119600531 sha256=a03405f94ae02db7acb0870cf32030bab86460dc7faf524780e9cae305526b96 sums=match api=match
+ARCHIVE opencode-linux-x64-baseline.tar.gz size=121783361 sha256=89a6cee227b54bc011179c528a5e63176032462b1a5e21723b616801cddc2ca7 sums=match api=match
+ARCHIVE opencode-linux-x64-baseline-musl.tar.gz size=121562329 sha256=c1801a36bf61e03eafac8d7f4521a200e4d3cd76cf43b36621cb78b460b851ee sums=match api=match
+M2 run 2026-11-12T07:14:57Z gh 2.98.0
+VERIFY opencode-linux-x64.tar.gz exit=0
+  predicateType https://slsa.dev/provenance/v1
+  subject [('opencode-ai-2.2.7.tgz', 'd046f0c69b1c8993526f4ddc03eab504c46e8b3e4e45fa777ef5d450faadf6c8'), ('opencode-cli-2.2.7.tgz', '5e8bcb9d2e536f33e9d22a55e2ffac8663f031d7e9003dc91830cf4e5034c83f'), ('opencode-cli-darwin-arm64-2.2.7.tgz', '0a4c803b7c44906a046e2f4297882b87e2395314d30c11d6e86b45b846f853f9')] of 33
+  cert.subjectAlternativeName https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev
+  cert.buildSignerURI https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev
+  cert.sourceRepositoryURI https://github.com/anomalyco/opencode
+  cert.sourceRepositoryRef refs/heads/dev
+  cert.sourceRepositoryDigest 5f76acb12572932297cbce81bd0026e59b16e7ac
+  cert.runInvocationURI https://github.com/anomalyco/opencode/actions/runs/42778325289/attempts/1
+  cert.issuer https://token.actions.githubusercontent.com
+  cert.githubWorkflowTrigger workflow_dispatch
+  predicateType https://slsa.dev/provenance/v1
+  subject [('opencode-ai-2.2.7.tgz', 'd046f0c69b1c8993526f4ddc03eab504c46e8b3e4e45fa777ef5d450faadf6c8'), ('opencode-cli-2.2.7.tgz', '5e8bcb9d2e536f33e9d22a55e2ffac8663f031d7e9003dc91830cf4e5034c83f'), ('opencode-cli-darwin-arm64-2.2.7.tgz', '0a4c803b7c44906a046e2f4297882b87e2395314d30c11d6e86b45b846f853f9')] of 33
+  cert.subjectAlternativeName https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev
+  cert.buildSignerURI https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev
+  cert.sourceRepositoryURI https://github.com/anomalyco/opencode
+  cert.sourceRepositoryRef refs/heads/dev
+  cert.sourceRepositoryDigest 5f76acb12572932297cbce81bd0026e59b16e7ac
+  cert.runInvocationURI https://github.com/anomalyco/opencode/actions/runs/42778325289/attempts/1
+  cert.issuer https://token.actions.githubusercontent.com
+  cert.githubWorkflowTrigger workflow_dispatch
+VERIFY opencode-linux-arm64.tar.gz exit=0
+  predicateType https://slsa.dev/provenance/v1
+  subject [('opencode-ai-2.2.7.tgz', 'd046f0c69b1c8993526f4ddc03eab504c46e8b3e4e45fa777ef5d450faadf6c8'), ('opencode-cli-2.2.7.tgz', '5e8bcb9d2e536f33e9d22a55e2ffac8663f031d7e9003dc91830cf4e5034c83f'), ('opencode-cli-darwin-arm64-2.2.7.tgz', '0a4c803b7c44906a046e2f4297882b87e2395314d30c11d6e86b45b846f853f9')] of 33
+  cert.subjectAlternativeName https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev
+  cert.buildSignerURI https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev
+  cert.sourceRepositoryURI https://github.com/anomalyco/opencode
+  cert.sourceRepositoryRef refs/heads/dev
+  cert.sourceRepositoryDigest 5f76acb12572932297cbce81bd0026e59b16e7ac
+  cert.runInvocationURI https://github.com/anomalyco/opencode/actions/runs/42778325289/attempts/1
+  cert.issuer https://token.actions.githubusercontent.com
+  cert.githubWorkflowTrigger workflow_dispatch
+VERIFY opencode-linux-x64-musl.tar.gz exit=0
+  predicateType https://slsa.dev/provenance/v1
+  subject [('opencode-ai-2.2.7.tgz', 'd046f0c69b1c8993526f4ddc03eab504c46e8b3e4e45fa777ef5d450faadf6c8'), ('opencode-cli-2.2.7.tgz', '5e8bcb9d2e536f33e9d22a55e2ffac8663f031d7e9003dc91830cf4e5034c83f'), ('opencode-cli-darwin-arm64-2.2.7.tgz', '0a4c803b7c44906a046e2f4297882b87e2395314d30c11d6e86b45b846f853f9')] of 33
+  cert.subjectAlternativeName https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev
+  cert.buildSignerURI https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev
+  cert.sourceRepositoryURI https://github.com/anomalyco/opencode
+  cert.sourceRepositoryRef refs/heads/dev
+  cert.sourceRepositoryDigest 5f76acb12572932297cbce81bd0026e59b16e7ac
+  cert.runInvocationURI https://github.com/anomalyco/opencode/actions/runs/42778325289/attempts/1
+  cert.issuer https://token.actions.githubusercontent.com
+  cert.githubWorkflowTrigger workflow_dispatch
+  predicateType https://slsa.dev/provenance/v1
+  subject [('opencode-ai-2.2.7.tgz', 'd046f0c69b1c8993526f4ddc03eab504c46e8b3e4e45fa777ef5d450faadf6c8'), ('opencode-cli-2.2.7.tgz', '5e8bcb9d2e536f33e9d22a55e2ffac8663f031d7e9003dc91830cf4e5034c83f'), ('opencode-cli-darwin-arm64-2.2.7.tgz', '0a4c803b7c44906a046e2f4297882b87e2395314d30c11d6e86b45b846f853f9')] of 33
+  cert.subjectAlternativeName https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev
+  cert.buildSignerURI https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev
+  cert.sourceRepositoryURI https://github.com/anomalyco/opencode
+  cert.sourceRepositoryRef refs/heads/dev
+  cert.sourceRepositoryDigest 5f76acb12572932297cbce81bd0026e59b16e7ac
+  cert.runInvocationURI https://github.com/anomalyco/opencode/actions/runs/42778325289/attempts/1
+  cert.issuer https://token.actions.githubusercontent.com
+  cert.githubWorkflowTrigger workflow_dispatch
+VERIFY opencode-linux-arm64-musl.tar.gz exit=0
+  predicateType https://slsa.dev/provenance/v1
+  subject [('opencode-ai-2.2.7.tgz', 'd046f0c69b1c8993526f4ddc03eab504c46e8b3e4e45fa777ef5d450faadf6c8'), ('opencode-cli-2.2.7.tgz', '5e8bcb9d2e536f33e9d22a55e2ffac8663f031d7e9003dc91830cf4e5034c83f'), ('opencode-cli-darwin-arm64-2.2.7.tgz', '0a4c803b7c44906a046e2f4297882b87e2395314d30c11d6e86b45b846f853f9')] of 33
+  cert.subjectAlternativeName https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev
+  cert.buildSignerURI https://github.com/anomalyco/opencode/.github/workflows/release.yml@refs/heads/dev
+  cert.sourceRepositoryURI https://github.com/anomalyco/opencode
+  cert.sourceRepositoryRef refs/heads/dev
+  cert.sourceRepositoryDigest 5f76acb12572932297cbce81bd0026e59b16e7ac
+  cert.runInvocationURI https://github.com/anomalyco/opencode/actions/runs/42778325289/attempts/1
+  cert.issuer https://token.actions.githubusercontent.com
+  cert.githubWorkflowTrigger workflow_dispatch
+M3 run 2026-11-12T07:16:01Z Homebrew LLVM version 23.1.4
+== opencode-linux-x64.tar.gz members: opencode 
+BINARY x64 sha256=589253d36810f21217edd51545cd435b328cdc3cf4f451fbe0cce6f88afcf5e1 size=258848944 mode=755
+MACHINE x64 Advanced Micro Devices X86-64
+INTERP x64 /lib64/ld-linux-x86-64.so.2
+NEEDED x64 libc.so.6 ld-linux-x86-64.so.2 libpthread.so.0 libdl.so.2 libm.so.6 
+MAX_GLIBC x64 GLIBC_2.17
+MAX_GLIBCXX x64 
+MAX_CXXABI x64 
+MAX_GCC x64 
+== opencode-linux-arm64.tar.gz members: opencode 
+BINARY arm64 sha256=c577783eacf7d1e66661fc7fd904b7646761497b687ff8f8f82ebe4f2f3ea425 size=253873144 mode=755
+MACHINE arm64 AArch64
+INTERP arm64 /lib/ld-linux-aarch64.so.1
+NEEDED arm64 libc.so.6 ld-linux-aarch64.so.1 libpthread.so.0 libdl.so.2 libm.so.6 
+MAX_GLIBC arm64 GLIBC_2.17
+MAX_GLIBCXX arm64 
+MAX_CXXABI arm64 
+MAX_GCC arm64 
+== opencode-linux-x64-musl.tar.gz members: opencode 
+BINARY x64-musl sha256=aeae3102ab6360a0ac3ea56537a643cd02727f766a1da30cb770240f7bf1cf02 size=261027240 mode=755
+MACHINE x64-musl Advanced Micro Devices X86-64
+INTERP x64-musl /lib/ld-musl-x86_64.so.1
+NEEDED x64-musl libstdc++.so.6 libc.musl-x86_64.so.1 
+MAX_GLIBC x64-musl 
+MAX_GLIBCXX x64-musl 
+MAX_CXXABI x64-musl 
+MAX_GCC x64-musl 
+== opencode-linux-arm64-musl.tar.gz members: opencode 
+BINARY arm64-musl sha256=b4203e9861d0472e711493a34e8d843fb249cf9bf499b69cfdc64416085d87c6 size=253697128 mode=755
+MACHINE arm64-musl AArch64
+INTERP arm64-musl /lib/ld-musl-aarch64.so.1
+NEEDED arm64-musl libstdc++.so.6 libc.musl-aarch64.so.1 
+MAX_GLIBC arm64-musl 
+MAX_GLIBCXX arm64-musl 
+MAX_CXXABI arm64-musl 
+MAX_GCC arm64-musl 

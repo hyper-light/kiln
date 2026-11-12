@@ -1,0 +1,245 @@
+# kiln origin/main 1a5a5f00d5dc056e70e998eb23ab0b3b315ad1e9 excerpts (git show <rev>:<path> | cat -n), 2026-11-12T07:22:24Z; AGENTS.md sha256 16b05ef80db024a7b54b0e703d42c8cf5c1f330a626d6bd85ae4525609447a4c; step 30 branch p/agentfile-store-v1 at 28e6af35d6f6fe73d1d9ba7ac43ec729a55005fd
+## origin/main:crates/kiln/src/harness/kinds.rs lines 47,57
+    47	const KINDS: &[Kind] = &[
+    48	    Kind { id: "claude", name: "Claude Code", program: "claude", verified: true, protocol: Protocol::ClaudeStreamJson, screen: &["claude"], screen_takes_command: true },
+    49	    Kind { id: "codex", name: "Codex", program: "codex", verified: true, protocol: Protocol::CodexAppServer, screen: &["codex"], screen_takes_command: false },
+    50	    Kind { id: "devin", name: "Devin", program: "devin", verified: true, protocol: Protocol::Acp(&["acp"]), screen: &["devin"], screen_takes_command: false },
+    51	    Kind { id: "gemini", name: "Gemini CLI", program: "gemini", verified: false, protocol: Protocol::Acp(&["--acp"]), screen: &["gemini"], screen_takes_command: false },
+    52	    Kind { id: "opencode", name: "opencode", program: "opencode", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["opencode"], screen_takes_command: false },
+    53	    Kind { id: "goose", name: "Goose", program: "goose", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["goose", "session"], screen_takes_command: false },
+    54	    // Amp has no ACP mode of its own; its ACP adapter (amp-acp) wraps the signed-in Amp CLI.
+    55	    Kind { id: "amp", name: "Amp", program: "amp-acp", verified: false, protocol: Protocol::Acp(&[]), screen: &["amp"], screen_takes_command: false },
+    56	    Kind { id: "antigravity", name: "Antigravity CLI", program: "agy", verified: true, protocol: Protocol::AgyStreamJson, screen: &["agy"], screen_takes_command: false },
+    57	];
+## origin/main:crates/kiln/src/harness/kinds.rs lines 159,161
+   159	            Protocol::Acp(args) => {
+   160	                p.args(args);
+   161	            }
+## origin/main:crates/kiln/src/harness/homes.rs lines 20,25
+    20	//!   Codex records there in a rollout of its own; a copy of the old one would be a second thread of
+    21	//!   the same conversation there, in a folder that isn't, and the old one stays where it was.
+    22	//! - Gemini CLI (`GEMINI_CLI_HOME`, else home: `.gemini/`): its memory of the project
+    23	//!   (`tmp/<project>/memory/`), merged into the project's there: under the name Gemini CLI knows
+    24	//!   the folder by there, else the one it would give it, marked so that it finds it.
+    25	//! - Antigravity (`~/.gemini/antigravity-cli`): its knowledge (`knowledge/`), merged.
+## origin/main:crates/kiln/src/harness/homes.rs lines 238,242
+   238	    }
+   239	
+   240	    fn gemini(&self) -> PathBuf {
+   241	        self.var("GEMINI_CLI_HOME").unwrap_or_else(|| self.home.clone()).join(".gemini")
+   242	    }
+## origin/main:crates/kiln/src/harness/acp.rs lines 1,10
+     1	//! Harnesses that speak the Agent Client Protocol (ACP: JSON-RPC 2.0 over stdio, as Zed and
+     2	//! other editors drive agents): Gemini CLI (`gemini --acp`), opencode (`opencode acp`), Goose
+     3	//! (`goose acp`), Amp through its ACP adapter, and any other ACP agent. kiln is the client: it
+     4	//! opens (or loads) a session, sends prompts, streams the agent's messages, thoughts, tool calls
+     5	//! (with diffs) and plan, answers its permission requests, switches modes and cancels turns.
+     6	//!
+     7	//! kiln advertises no file-system or terminal capabilities, so agents use their own tools.
+     8	//! Steering waits for the turn unless Devin advertises its mid-turn prompt extension.
+     9	//!
+    10	//! Devin CLI (`devin acp`) uses this adapter too, including ACP's session config options.
+## origin/main:crates/kiln/src/harness/acp.rs lines 422,428
+   422	            core,
+   423	            kind,
+   424	            "initialize",
+   425	            json!({
+   426	                "protocolVersion": 1,
+   427	                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "session": {"configOptions": {"boolean": {}}, "compaction": {}}, "_meta": {OPENCODE_CHILDREN: true}},
+   428	                "clientInfo": {"name": "kiln", "version": env!("CARGO_PKG_VERSION")},
+## origin/main:crates/kiln/src/runner/runtime.rs lines 3936,3983
+  3936	    /// A built-in kiln action (W07-R10), run here.
+  3937	    /// `kiln/build-image@v1` (W13-R11): a Dockerfile through `docker buildx` (multi-platform where
+  3938	    /// the builder can), an Agentfile through `shards build` and `shards push` (shards' own, never
+  3939	    /// Docker), into kiln's registry under the repository's `images/<name>`, signed in with the
+  3940	    /// job's token by kiln's credential helper; the image reported over the runner's channel, so
+  3941	    /// the server registers what its registry holds.
+  3942	    async fn build_image(&self, st: &mut State, idx: u32, with: &BTreeMap<String, String>, wd: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+  3943	        let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+  3944	        let name = get("name").unwrap_or_default();
+  3945	        anyhow::ensure!(!name.contains('/') && crate::ci::registry::valid_name(&name), "`{name}` isn't an image name (lowercase letters, digits, `.`, `_`, `-`)");
+  3946	        let context = get("context").unwrap_or_else(|| format!(".kiln/images/{name}"));
+  3947	        let agentfile = Path::new(&context).join("Agentfile");
+  3948	        // An Agentfile is shards' (it reads one before a Dockerfile, as here).
+  3949	        let (file, shards) = match get("file") {
+  3950	            Some(f) => {
+  3951	                let shards = Path::new(&f).file_name().is_some_and(|n| n == "Agentfile");
+  3952	                (f, shards)
+  3953	            }
+  3954	            None if wd.join(&agentfile).exists() => (agentfile.to_string_lossy().into_owned(), true),
+  3955	            None => (Path::new(&context).join("Dockerfile").to_string_lossy().into_owned(), false),
+  3956	        };
+  3957	        let prog = if shards { "shards" } else { "docker" };
+  3958	        // Found as the leg's steps find it: on the leg's `PATH`, kiln's credential helper too.
+  3959	        let env = self.tool_env(st);
+  3960	        let found = on_path(&env, prog).ok_or_else(|| anyhow::anyhow!("{file} is built by {prog}, which isn't on this runner{}", if shards { " (an Agentfile is never built with Docker)" } else { "" }))?;
+  3961	        let own = crate::githost::host_of(if self.a.runtime.registry_url.is_empty() { &self.a.runtime.facade_url } else { &self.a.runtime.registry_url });
+  3962	        let sha = self.a.contexts.github.get("sha").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+  3963	        let tag = get("tag").unwrap_or_else(|| sha.get(..12).unwrap_or("latest").to_owned());
+  3964	        let base = format!("{own}/{}/images/{name}", self.a.repo.to_ascii_lowercase());
+  3965	        let tags = if tag == "latest" { vec![format!("{base}:latest")] } else { vec![format!("{base}:{tag}"), format!("{base}:latest")] };
+  3966	        let platforms: Vec<String> = get("platforms").map(|p| p.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+  3967	        let meta = st.layout.temp.join(format!("_kiln_build_{idx}.json"));
+  3968	        // `push: false`: built only, as a check (the image builder's Build, W21-R08): nothing pushed
+  3969	        // or registered.
+  3970	        let push = get("push").is_none_or(|p| !p.eq_ignore_ascii_case("false"));
+  3971	        let mut args: Vec<String> = match (shards, push) {
+  3972	            (true, _) => vec!["build".into()],
+  3973	            (false, true) => vec!["buildx".into(), "build".into(), "--push".into(), "--metadata-file".into(), meta.to_string_lossy().into_owned()],
+  3974	            (false, false) => vec!["buildx".into(), "build".into(), "--output".into(), "type=cacheonly".into()],
+  3975	        };
+  3976	        args.extend(["-f".into(), file.clone()]);
+  3977	        for t in &tags {
+  3978	            args.extend(["-t".into(), t.clone()]);
+  3979	        }
+  3980	        if !platforms.is_empty() {
+  3981	            args.extend(["--platform".into(), platforms.join(",")]);
+  3982	        }
+  3983	        args.push(context.clone());
+## p/agentfile-store-v1:crates/kiln/src/agentfiles/builtin.rs lines 1,20
+     1	//! The Agentfiles kiln ships, one per harness it runs in a Shards microVM (kiln plan
+     2	//! 01a1cd8e862e7169a074db3d5fa33f3d, "Every kiln harness in Shards microVMs"): each embedded in kiln's
+     3	//! one binary, listed read-only beside a person's own, and copied to make one theirs. None yet: each
+     4	//! harness's own step adds its Agentfile here (`include_str!`).
+     5	
+     6	use serde::Serialize;
+     7	
+     8	/// An Agentfile kiln ships.
+     9	pub struct Builtin {
+    10	    /// Its name, an image's (as a person's Agentfile's is: [`super::name_problem`]).
+    11	    pub name: &'static str,
+    12	    /// The harness it runs (`crate::harness::kinds::Kind`'s id: `claude`, `codex` ...).
+    13	    pub harness: &'static str,
+    14	    pub text: &'static str,
+    15	}
+    16	
+    17	/// Every one, in the order they're listed.
+    18	pub const ALL: &[Builtin] = &[];
+    19	
+    20	/// One as the list shows it.
+## AGENTS.md section heads: 7:## The rules 44:## Hazards 96:## Checks before handing over 
+## origin/main:AGENTS.md lines 1,40
+     1	# kiln, for coding agents
+     2	
+     3	kiln is one Rust binary: a CI/CD server, a deployer (Argo CD's model), a fleet of runners, and
+     4	the front end for coding agents (Claude Code, Codex, ACP agents, Antigravity, Devin), with its
+     5	web UI embedded. Read this before you change it, then the documents it points to.
+     6	
+     7	## The rules
+     8	
+     9	`docs/ci.md` §0 holds the rules for every line written here; §0.3 binds. In short:
+    10	
+    11	- **No panics.** The workspace denies `unwrap`, `expect`, `panic!`, `todo!`, `unimplemented!`,
+    12	  `unreachable!`, unchecked indexing and `exit` (`Cargo.toml`). Bad input becomes an error value
+    13	  shown to the person, never a crash.
+    14	- **hyper-rt, not tokio.** Async code runs on hyper-raft's `hyper-rt`; HTTP is kiln's own
+    15	  (`crates/kiln-http`, `docs/http.md`). Don't add tokio, hyper, h2, axum, reqwest, kube-rs or
+    16	  tokio-rustls. If hyper-rt lacks something, say so and ask.
+    17	- **Deterministic cores.** Logic that decides lives in `crates/kiln-ci` and `crates/kiln-cd` as
+    18	  pure code: no clock, disk, network or randomness except what's passed in.
+    19	- **SQLite is CI's system of record**, changed only by numbered migrations
+    20	  (`crates/kiln/src/store/migrations`).
+    21	- **The protocol only grows.** `crates/kiln/src/proto.rs` is postcard by variant index: new
+    22	  variants go after every existing one, and new capabilities are new bits.
+    23	- **General hardware.** Pick machines by what they can do, never by name.
+    24	- **The UI** (`ui/`): the hyperlight-site style; one primary surface per page; no popups
+    25	  (modals, sheets, floating panels); no effects (`useEffect` is a lint error; data comes through
+    26	  Suspense); static by default; a press never waits on the server to show it was taken (W21-R15:
+    27	  `ui/src/lib/action.ts`); checked in Chromium and WebKit at desktop and phone widths.
+    28	- **Opt-in automation.** What kiln decides on its own is off until declared, and says why it did
+    29	  what it did.
+    30	- **Seams.** kiln reaches other products only through `crates/kiln-seams` (`docs/seams.md`):
+    31	  each seam is a trait, a simulator and a conformance suite.
+    32	- **Change only what the task asks for.** Mention any other improvement instead of making it.
+    33	
+    34	## IDs
+    35	
+    36	- `Wnn-Rmm` and `Wnn-ACmm` are `docs/ci.md`'s requirements and acceptance criteria.
+    37	- `CP-T3.2`, `AC-T1.4.2`, `T-T2.1.1` and the like come from kiln's critical-path program. Its
+    38	  master plan is a kiln plan, not a file: `01a157fddb8276a2996246ea931c4808`. Read it with the
+    39	  kiln MCP tool `plans_get`; its §7 lists each track's plan (T1 Amphora to T10 Mantle).
+    40	- Cite the ID your change serves in code comments, commits and test names
+## origin/main:AGENTS.md lines 41,123
+    41	  (`fn w05_r07_cancel_in_progress_cancels_running()`).
+    42	- Track branches are `cp/tN-*`. Don't edit another track's work: ask its agent (`agents_send`).
+    43	
+    44	## Hazards
+    45	
+    46	- **Never restart, swap, upgrade or reinstall a runner** (`kiln install`, `kiln join`, replacing
+    47	  `~/.local/bin/kiln`, its LaunchAgent or its service). Agents run through runners, likely you
+    48	  among them, and a restart ends their sessions. Say what the upgrade is; the person does it.
+    49	- **Production runs on adacachy, beside other work.** Heavy builds and tests go where kiln puts
+    50	  them, never to a machine by name: ask for what they need (`kiln run --needs`, or MCP `run` with
+    51	  `needs`). Your change's gate (below) holds each of its runs to what it asked and yields to
+    52	  production. Anything else heavy: `nice -n 10` and your own `CARGO_TARGET_DIR`.
+    53	- **Big files go under `~/.cache`, never `/tmp`.** On the Linux machines `/tmp` is a RAM disk
+    54	  every session shares.
+    55	- **Stop only what you started,** by the PID you recorded as you started it. Never `pkill -f` or
+    56	  `pgrep -f`: other sessions run the same commands.
+    57	- **No tree-wide `cargo fmt`.** kiln's long lines aren't rustfmt's; clippy is the check. For UI
+    58	  files, run `npx prettier --print-width 200 --write` on the files you changed, and only those.
+    59	- **Wire formats change append-only:** postcard variants, capability bits, new JSON fields
+    60	  optional.
+    61	- **Never print or commit a secret,** kiln's admin token included.
+    62	- **The person's word** is needed for every merge to main, every push and every deploy, and to
+    63	  create a repository. Deploys go through KilnCD, in merge trains (`docs/trains`).
+    64	- **Git:** never a bare `git stash`; rebase and squash only onto a fixed SHA; every push waits on
+    65	  the exit codes of the tests relevant to its change.
+    66	
+    67	## Your change's gate
+    68	
+    69	You compose it, not kiln. `ci/gate.sh` runs one step alone (`clippy`, or `test`; both when neither
+    70	is named), natively where it runs, on the crates you name, held to what its run asked for.
+    71	
+    72	- **Scope:** `--since origin/main` takes the crates your change touches (committed or not), those
+    73	  whose code reads a file it changed by path (a test reading a doc or `.kiln/`: string literals,
+    74	  not comments) or builds a changed crate by path, and every crate depending on them. A changed
+    75	  file in no crate that none reads puts the whole workspace in scope.
+    76	  `ci/gate.sh --since origin/main --dry-run` says which and why; `-p <crate>` adds one.
+    77	- **Platforms:** clippy on Linux, macOS and Windows, each natively; tests on Linux, and on macOS or
+    78	  Windows too where your change has code for them.
+    79	- **Side by side:** `ci/gates.sh` starts a run per platform at once, each through `kiln run --needs`
+    80	  with the CPUs (`<N>`) and memory (`<M>`) its steps need, waits for each and keeps its output:
+    81	  ```sh
+    82	  ci/gates.sh --needs linux/amd64,cpus=<N>,mem=<M> --since origin/main \
+    83	              --needs macos,cpus=<N>,mem=<M> clippy --since origin/main \
+    84	              --needs windows,cpus=<N>,mem=<M> clippy --since origin/main
+    85	  ```
+    86	  Never detach a gate's run or leave it to a bare `wait`: either exits 0 whatever the run said.
+    87	- **Sized** by measurement, never a picked number: a step runs a rustc per CPU asked, is capped at
+    88	  the memory asked, and runs nothing without both. Each step says its peak memory (on Linux its
+    89	  anonymous memory, page cache left out; on macOS its processes' resident memory; on Windows
+    90	  none): ask that next time. Measured so far: kiln's own crate takes 7 GiB and more to build, and
+    91	  the libraries' tests peaked at 16.7 GiB at `-j 4` (`.kiln/ci.yaml`).
+    92	- **One verdict:** each run ends `GATE: PASS`; `GATE: FAIL` and why; or `GATE: YIELDED` (exit 75:
+    93	  it stopped for a strained machine; run it later or elsewhere). `ci/gates.sh` passes only when
+    94	  every run exited 0 and said `GATE: PASS`.
+    95	
+    96	## Checks before handing over
+    97	
+    98	The tests relevant to a change must pass before it's pushed. Full CI/CD runs (the gate, the whole
+    99	workspace's tests, the pipelines started by hand) wait for the person's explicit word.
+   100	
+   101	| You changed | Run |
+   102	|---|---|
+   103	| Rust | what you touched first (its tests, clippy on its crate), then, when the person asks for the full run, your change's gate (above) |
+   104	| The UI | in `ui/`: `npm run typecheck`, `npm run lint`, `npm test` and `npm run build` |
+   105	| A seam or `docs/seams.md` | `cargo test -p kiln-seams` (its `doc_truth` test holds the doc to the code) |
+   106	| Vendored code | `python3 scripts/vendor.py check` |
+   107	| This file | `cargo test -p kiln --test agents_md` |
+   108	
+   109	## Where things are
+   110	
+   111	| Path | What |
+   112	|---|---|
+   113	| `crates/kiln` | the binary: server, runner, supervisor, installer, CLI and MCP server |
+   114	| `crates/kiln/src/harness` | coding agents as structured sessions (`docs/agents.md`) |
+   115	| `crates/kiln-ci` | CI's deterministic core: expressions, plans, scheduling (`docs/ci.md`) |
+   116	| `crates/kiln-cd` | the deployments' engine (`docs/cd.md`) |
+   117	| `crates/kiln-seams` | the seams to other products, with simulators and conformance suites |
+   118	| `crates/kiln-http` | HTTP/1.1 and HTTP/2 on hyper-rt (`docs/http.md`) |
+   119	| `crates/kiln-search` | the search across a change: kiln-seams' `Search` on vorpal (`vendor/vorpal`) |
+   120	| `ui/` | the web UI (TanStack Start), embedded in the binary |
+   121	| `docs/` | how each part works: start with `docs/architecture.md` |
+   122	| `vendor/` | vendored projects (`vendor/MANIFEST.toml`, `docs/vendoring.md`) |
+   123	| `.kiln/` | kiln's own CI and deployments |

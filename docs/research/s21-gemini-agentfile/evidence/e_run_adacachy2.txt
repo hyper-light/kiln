@@ -1,0 +1,39 @@
+# Gemini CLI 0.68.0 on Node v24.22.3 (nodejs.org linux-x64), laid out as the harness directory, 2026-11-12T07:29:04Z
+HOST adacachy2 kernel=7.3.3-1-cachyos glibc=glibc 2.44 arch=x86_64
+VERIFIED node.tar.xz sha256=4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb
+VERIFIED gemini.tgz sha256=325099ddcb56937c27d119e7297bfa8a5e29b529bae3c92fdf3b71a36d5fa006
+NODE_TARBALL_UNPACKED_BYTES 201778667
+HARNESS_DIR_BYTES 226193421 files=452 links=0
+LDD_NODE:
+  	linux-vdso.so.1
+  	libdl.so.2 => /usr/lib/libdl.so.2
+  	libstdc++.so.6 => /usr/lib/libstdc++.so.6
+  	libm.so.6 => /usr/lib/libm.so.6
+  	libgcc_s.so.1 => /usr/lib/libgcc_s.so.1
+  	libpthread.so.0 => /usr/lib/libpthread.so.0
+  	libc.so.6 => /usr/lib/libc.so.6
+  	/lib64/ld-linux-x86-64.so.2 => /usr/lib64/ld-linux-x86-64.so.2
+OFFLINE via unshare -rn (a network namespace with no interface but lo, down)
+VERSION_OUT [0.68.0] exit=0 stderr_bytes=301
+FILES_IN_HOME 0
+FILES_IN_GEMINI_CLI_HOME:
+  ./.gemini
+  ./.gemini/projects.json.04bf0ecf-1a64-4f75-9abe-24bf2981732d.tmp
+  ./.gemini/projects.json.3c1581b9-9ec3-4e83-8d75-228ef9425f93.tmp
+STRACE absent
+ACP_INITIALIZE_MS 693
+ACP_INITIALIZE {"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": 1, "authMethods": [{"id": "oauth-personal", "name": "Log in with Google", "description": "Log in with your Google account"}, {"id": "gemini-api-key", "name": "Gemini API key", "description": "Use an API key with Gemini Developer API", "_meta": {"api-key": {"provider": "google"}}}, {"id": "vertex-ai", "name": "Vertex AI", "description": "Use an API key with Vertex AI GenAI API"}, {"id": "gateway", "name": "AI API Gateway", "description": "Use a custom AI API Gateway", "_meta": {"gateway": {"protocol": "google", "restartRequired": "false"}}}], "agentInfo": {"name": "gemini-cli", "title": "Gemini CLI", "version": "0.68.0"}, "agentCapabilities": {"loadSession": true, "promptCapabilities": {"image": true, "audio": true, "embeddedContext": true}, "mcpCapabilities": {"http": true, "sse": true}}}}
+ACP_SESSION_NEW {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "Gemini API key is missing or not configured."}}
+ACP_EXIT 0
+ACP_STDERR_TAIL nt directory '/home' is insecure: Directory '/home' is not owned by root (uid 0). Current uid: 65534. To fix this, run: sudo chown root:root "/home" | Skipping project agents due to untrusted folder. To enable, ensure that the project root is trusted. | Project hooks disabled because the folder is not trusted. | Error handling request { |   jsonrpc: '2.0', |   id: 1, |   method: 'session/new', |   params: { |     cwd: '/home/adalundhe/s21-gemini-research/run-20261112T072904Z/t.Vh1A/proj', |     mcpServers: [] |   } | } { |   code: -32000, |   message: 'Gemini API key is missing or not configured.', |   data: undefined | } | 
+FILES_IN_GEMINI_CLI_HOME_AFTER_ACP:
+  ./.gemini
+  ./.gemini/history
+  ./.gemini/history/proj
+  ./.gemini/installation_id
+  ./.gemini/projects.json
+  ./.gemini/projects.json.04bf0ecf-1a64-4f75-9abe-24bf2981732d.tmp
+  ./.gemini/projects.json.3c1581b9-9ec3-4e83-8d75-228ef9425f93.tmp
+  ./.gemini/tmp
+  ./.gemini/tmp/proj
+FILES_IN_HOME_AFTER_ACP 12

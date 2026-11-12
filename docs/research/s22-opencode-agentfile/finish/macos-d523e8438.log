@@ -1,0 +1,15 @@
+# kiln run r128 on adas-mac-studio.local-2 (macOS arm64): run.sh BUNDLE d523e8438c6698074692dc72805926faffddde11 16 all (exit 0).
+# An excerpt of its output as kiln returned it: its first lines, the tests naming opencode, and every result line.
+START 2026-11-12T22:06:14Z on Adas-Mac-Studio.local Darwin arm64, 32 cores, -j 16, mode all
+bundle de796fd68d22914eebdb0ef22153b93572731375f918d96bf842eaae85b98f26
+at d523e843 opencode's archives through the one unpacker: its member held alone, read as the unpacker r | dirty 0 | rustc 1.99.1 (58cf8f9c3 2026-10-13)
+test agentfiles::builtin::opencode_tests::step22_opencode_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::opencode_tests::step22_opencode_runs_as_kilns_opencode_kind_launches_it ... ok
+test agentfiles::builtin::opencode_tests::step22_opencode_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::opencode_tests::step22_an_opencode_pin_or_harness_file_that_would_mislead_is_caught ... ok
+test agentfiles::builtin::opencode_tests::step22_no_opencode_file_holds_a_credential ... ok
+test agentfiles::context::unpack_tests::step22_an_opencode_shaped_context_holds_bin_opencode_and_its_license_as_pinned ... ok
+test result: ok. 93 passed; 0 failed; 0 ignored; 0 measured; 4317 filtered out; finished in 7.51s
+TEST_EXIT=0 22:23:01
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+CLIPPY_EXIT=0 22:26:35

@@ -1,0 +1,39 @@
+# bundle on adacachy2: /home/adalundhe/.cache/s21-pin-tests.1s0s4b
+# arrived: pin.sh 4845cb8b2a3173a54242111f5cf11cfbcc3a6abd86770a63091ca1f3654ce072 (sent 4845cb8b2a3173a54242111f5cf11cfbcc3a6abd86770a63091ca1f3654ce072), pin-tests.sh 54949615ab97a0af17d2693ac5b44c538fc3d95d37af34b2c86f67b010404081 (sent 54949615ab97a0af17d2693ac5b44c538fc3d95d37af34b2c86f67b010404081)
+# pin.sh tests on adacachy2 (Linux 7.3.3-1-cachyos x86_64), 2026-11-12T10:27:08Z
+# pin.sh sha256 4845cb8b2a3173a54242111f5cf11cfbcc3a6abd86770a63091ca1f3654ce072; curl 8.23.0, gpgv 2.4.9, OpenSSL 3.6.5, python 3.14.9
+
+## A. pin from npm, GitHub and nodejs.org
+pinned Gemini CLI 0.68.0 (latest) on Node.js v24.22.3 (tested [20, 22, 24], 24 ends 2028-04-30, signed by 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356) into /home/adalundhe/.cache/s21-pin-tests.1s0s4b/w/pin.json
+pinned 0.68.0 channel latest node v24.22.3 tested [20, 22, 24] major 24 ends 2028-04-30 signer 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356
+build linux/amd64 gnu [('node/bin/node', {'format': 'tar.gz', 'member': 'node-v24.22.3-linux-x64/bin/node'}), ('node/LICENSE', {'format': 'tar.gz', 'member': 'node-v24.22.3-linux-x64/LICENSE'}), ('.', {'format': 'tar.gz', 'strip': 1})]
+build linux/arm64 gnu [('node/bin/node', {'format': 'tar.gz', 'member': 'node-v24.22.3-linux-arm64/bin/node'}), ('node/LICENSE', {'format': 'tar.gz', 'member': 'node-v24.22.3-linux-arm64/LICENSE'}), ('.', {'format': 'tar.gz', 'strip': 1})]
+build linux/amd64 musl [('.', {'format': 'tar.gz', 'strip': 1})]
+build linux/arm64 musl [('.', {'format': 'tar.gz', 'strip': 1})]
+
+## A. every pinned file downloaded again and checked against pin.json
+match: https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-x64.tar.gz sha256 061ec3e3062115705b56b51fa9cc330ab50d34b6969387d4e4b1a50c6809acc2 size 58330843
+match: https://registry.npmjs.org/@google/gemini-cli/-/gemini-cli-0.68.0.tgz sha256 325099ddcb56937c27d119e7297bfa8a5e29b529bae3c92fdf3b71a36d5fa006 size 20975501
+match: https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-arm64.tar.gz sha256 261af2af250dfd7e9f25cf151d1b2713a0adf8f10a9ad116c4947f68627affe8 size 58051304
+distinct pinned files whose SHA-256 and size match pin.json: 3 of 3
+
+## B. fixture: the same records and files, served from 127.0.0.1
+fixture: Gemini CLI 0.68.0, Node.js v24.22.3, release-keys 481637f813e912c4aa3622d7964ab426c97b8e8d; other version for signatures: 0.67.0-nightly.20261104.g89e9d25d6
+server: pid 2050015 on 127.0.0.1:56137
+
+## B. the control and one change at a time
+PASS control: exit 0, pin.json written, the same builds, files and signer as A's
+PASS integrity-flipped: exit 1, no pin.json, said: pin.sh: registry signature 0 by SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U does not verify over @google/gemini-cli@0.68.0:sha512-eq7AWY+YCijNGAVwyiRjN+GuOdXU/djuOZhX18p+HDmNyUqFdqH7C5V6vDJLl1uffhRPhGijePV+YvY8lymrbQ== 
+PASS other-signatures: exit 1, no pin.json, said: pin.sh: registry signature 0 by SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U does not verify over @google/gemini-cli@0.68.0:sha512-eq7AWY+YCijNGKVwyiRjN+GuOdXU/djuOZhX18p+HDmNyUqFdqH7C5V6vDJLl1uffhRPhGijePV+YvY8lymrbQ== 
+PASS tarball-flipped: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:56137/tarball-flipped/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: SHA-512 sha512-Jjo7x6beuu+fpDvZpMZ9AVfjBS+wdQz587tZ8ZvrGmOaDcBcbY4MPoN1xfvZwbb47/A8Oryv0yHbffbPpGXiqQ== is not the signed integrity sha512-eq7AWY+YCijNGKVwyiRjN+GuOdXU/djuOZhX18p+HDmNyUqFdqH7C5V6vDJLl1uffhRPhGijePV+YvY8lymrbQ== 
+PASS shasums-edited: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:56137/shasums-edited/dist/v24.22.3/SHASUMS256.txt.asc is not signed by a key of nodejs/release-keys' active keyring at 481637f813e912c4aa3622d7964ab426c97b8e8d: gpgv: Signature made Wed 11 Nov 2026 08:40:02 AM PST gpgv:                using EDDSA key 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 gpgv: BAD signature from "Antoine du Hamel <antoine.duhamel@platformatic.dev>" 
+PASS empty-keyring: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:56137/empty-keyring/dist/v24.22.3/SHASUMS256.txt.asc is not signed by a key of nodejs/release-keys' active keyring at 481637f813e912c4aa3622d7964ab426c97b8e8d: gpgv: Signature made Wed 11 Nov 2026 08:40:02 AM PST gpgv:                using EDDSA key 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 gpgv: Can't check signature: No public key 
+PASS node-flipped: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:56137/node-flipped/dist/v24.22.3/node-v24.22.3-linux-arm64.tar.gz: SHA-256 e25421454bd633914d9420f5499dbaadf7c795c6e47b2111d7047a5118a81ee6 is not the signed 261af2af250dfd7e9f25cf151d1b2713a0adf8f10a9ad116c4947f68627affe8 
+PASS no-arm64: exit 1, no pin.json, said: pin.sh: Node.js v24.22.3 has no linux-arm64 build for linux/arm64 
+PASS majors-ended: exit 1, no pin.json, said: pin.sh: no Node.js major that Gemini CLI 0.68.0 tests on Linux (16, 18, 20) is still supported on 2026-11-12 
+
+cases passing: 9 of 9 (1 control, 8 changes)
+pin.sh work directories left in /home/adalundhe/.cache: 0
+A's pin.json sha256 7cf3b6bfcad46f5a998aafce9b4ccfa0d8728bd2bcedd5b634cb946909d4a813
+# pin-tests.sh exit 0
+# work kept at /home/adalundhe/.cache/s21-pin-tests.1s0s4b
