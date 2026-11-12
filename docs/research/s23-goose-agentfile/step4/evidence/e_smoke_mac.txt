@@ -1,0 +1,72 @@
+# step 4 run, 2026-11-12T14:52:49Z, host Adas-Mac-Studio.local Darwin 25.4.0 arm64, mode arch
+c97682e05da9864b4678107d340521ce971f511ed908ba5f1c7cfd8b51401e04  smoke.sh
+abcf53e7d94f5dad92ac0083bc60f856e53be55ddba11788e949cc4183caecd1  pin.json
+509626e26acd81697fe9237d91bdc1941808369f86296e414229225873578c48  Agentfile
+50df9c4a15c946dedb2fd4df967ef36ca97ac5ec42414cec3284ca8b2d688321  harness.json
+# shards shards version 0.7.0, build 8f3cd5b, sha256 66a45b4ba6353102c3b9643945077613baa2d92324123eca4a11c508fe9f1f92
+== shards shards version 0.7.0, build 8f3cd5b; host Darwin 25.4.0 arm64; mode arch
+== context
+curl: (6) Could not resolve host: release-assets.githubusercontent.com
+linux/amd64: https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-x86_64-unknown-linux-musl.tar.gz sha256 6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31 size 50181341; member goose to goose-amd64/bin/goose, sha256 461ea83fc8736fa0ad608661a8e5ef8c704da886d38500441ba2b91f7184d9f5 size 154218008 mode 0755
+linux/arm64: https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-aarch64-unknown-linux-musl.tar.gz sha256 63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7 size 48814292; member goose to goose-arm64/bin/goose, sha256 c27e6ea558a39a9af96dcc04368296ca636e40a67c96cdac56a6f644488fb673 size 148726128 mode 0755
+== build: one image for linux/amd64 and linux/arm64
+build-real: exit 0 in 273257 ms
+images-tree: exit 0 in 80 ms
+IMAGE                                                                                               ID             DISK USAGE   CONTENT SIZE   EXTRA
+buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10   4f34e1d673fd        710MB          293MB        
+├─ linux/amd64                                                                                      712f969c9d81        143MB          143MB        
+├─ linux/arm/v5                                                                                     b6f4d55db57d           0B             0B        
+├─ linux/arm/v7                                                                                     00f00a8dd29a           0B             0B        
+├─ linux/arm64/v8                                                                                   4256ac3dbf04        560MB          142MB        
+├─ linux/386                                                                                        7b4073f252f3           0B             0B        
+├─ linux/ppc64le                                                                                    79e8f9212087           0B             0B        
+├─ linux/riscv64                                                                                    f2781902e83f           0B             0B        
+└─ linux/s390x                                                                                      2585d46a7246           0B             0B        
+
+harness-goose:smoke                                                                                 d0d4bfd16cdb        387MB          387MB        
+├─ linux/amd64                                                                                      23dd5f85790d        194MB          194MB        
+└─ linux/arm64                                                                                      ac449b15b5e2        193MB          193MB        
+
+inspect linux/amd64: linux/amd64 sha256:d0d4bfd16cdb7a7b39996e6e9a284a183c1def854d672e8dcf9408280d70a3b1 size 194009972
+inspect linux/arm64: linux/arm64 sha256:d0d4bfd16cdb7a7b39996e6e9a284a183c1def854d672e8dcf9408280d70a3b1 size 192909281
+== the smoke: Goose's own --version on linux/arm64, stdout held to the pin's line
+run-version: exit 0 in 16060 ms
+SMOKE_STDOUT_HEX  20 31 2e 35 39 2e 30 0a 
+SMOKE_EXACT True
+Downloading the guest kernel Image-6.18.48-aarch64-17c3ba205400 from https://github.com/hyper-light/shards/releases/download/kernel-6.18.48-17c3ba205400/Image-6.18.48-aarch64
+Guest kernel: sha256:1b178851998d27b4c6c346ae391c26d675f81461fbaa19cbe514500291fe472d
+WARNING: CAP_NET_RAW withheld from the command: the image's Agentfile runs agents and harnesses beside the command, and CAP_NET_RAW reads and writes the packets of their flows past the microVM, which cross the command's network namespace
+== the real image: its harness as harness.json declares, Goose's root a host folder
+run-real: exit 0 in 105 ms
+processes-real: exit 0 in 43 ms
+TIME                            MEMBER         PID  EVENT  WHAT
+2026-11-12T15:03:06.595161374Z  command        269  exec   sleep 120
+2026-11-12T15:03:06.596639666Z  harness goose  274  fork   from 1
+2026-11-12T15:03:06.597999499Z  harness goose  274  exec   shards-server "harness goose" /proc/self/fd/6 200000 3 4 "" [] 7
+2026-11-12T15:03:06.599398583Z  harness goose  277  fork   from 274
+2026-11-12T15:03:06.600045499Z  harness goose  277  exec   shards-server sandbox
+2026-11-12T15:03:06.600100708Z  harness goose  278  fork   from 1
+2026-11-12T15:03:06.600663958Z  harness goose  280  fork   from 278
+2026-11-12T15:03:06.600898374Z  harness goose  278  exec   shards-init managed-reaper
+2026-11-12T15:03:06.609612791Z  harness goose  280  exec   /harness/goose/bin/goose acp
+2026-11-12T15:03:06.619401374Z  harness goose  280  exit   code 0
+2026-11-12T15:03:06.620040874Z  harness goose  278  exit   code 0
+2026-11-12T15:03:06.620108916Z  harness goose  277  exit   signal 9 (SIGKILL)
+2026-11-12T15:03:06.620234124Z  harness goose  274  exit   signal 9 (SIGKILL)
+--- what goose acp wrote under GOOSE_PATH_ROOT (the host folder)
+.
+./config
+./data
+./data/sessions
+./data/sessions/sessions.db
+./state
+./state/logs
+./state/logs/cli
+== sizes and times (single observations)
+289M	/Users/adalundhe/.cache/s23-step4/run-20261112T145249Z/ctx
+147M	/Users/adalundhe/.cache/s23-step4/run-20261112T145249Z/ctx/goose-amd64
+142M	/Users/adalundhe/.cache/s23-step4/run-20261112T145249Z/ctx/goose-arm64
+harness-goose:smoke 953MB
+== done /Users/adalundhe/.cache/s23-step4/run-20261112T145249Z
+SMOKE_EXIT=0
+SMOKE_RUN_EXIT=0
