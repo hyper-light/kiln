@@ -59,6 +59,39 @@ pub fn keep_watching() {
     imp::keep_watching();
 }
 
+/// Who signs the executables kiln carries on this machine (`sign_carried`): on a Mac, kiln's identity
+/// where `kiln signing setup` made one, else ad hoc, as their own builds sign them; elsewhere nobody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Signer {
+    /// kiln's identity, by its SHA-1.
+    Kiln(String),
+    AdHoc,
+    NotNeeded,
+}
+
+impl Signer {
+    /// What tells one signer's copies from another's in a folder's name: none where nothing is signed.
+    pub fn tag(&self) -> String {
+        match self {
+            Self::Kiln(id) => format!("-k{}", id.get(..8).unwrap_or(id).to_ascii_lowercase()),
+            Self::AdHoc => "-a".to_owned(),
+            Self::NotNeeded => String::new(),
+        }
+    }
+}
+
+pub fn signer() -> Signer {
+    imp::signer()
+}
+
+/// Sign `path`, an executable kiln carries (Shards' binary and its VM and network processes,
+/// `crate::shards`), in place, as `signer` signs: with `entitlements` (a property list's path) under the
+/// Hardened Runtime where it has some, as Shards' own build signs its VM and network processes (its
+/// `crates/shards/build.rs` `sign`); its identifier the one its Info.plist names, else its file's name.
+pub fn sign_carried(path: &Path, entitlements: Option<&Path>, signer: &Signer) -> anyhow::Result<()> {
+    imp::sign_carried(path, entitlements, signer)
+}
+
 /// Sign the kiln binary at `path`, in place by a copy renamed over it (a process running it keeps
 /// the old one), as the build it is. `Ok(false)`: no identity.
 pub fn resign(path: &Path) -> anyhow::Result<bool> {
@@ -140,10 +173,18 @@ fn remember(dest: &Path, signed: &Path, build: &str) -> anyhow::Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    use super::{Path, PathBuf, State};
+    use super::{Path, PathBuf, Signer, State};
 
     pub fn state() -> State {
         State::NotNeeded
+    }
+
+    pub fn signer() -> Signer {
+        Signer::NotNeeded
+    }
+
+    pub fn sign_carried(_path: &Path, _entitlements: Option<&Path>, _signer: &Signer) -> anyhow::Result<()> {
+        Ok(())
     }
 
     pub fn sign_as(_tmp: &Path, _dest: &Path, _build: &str) -> anyhow::Result<bool> {
@@ -163,7 +204,7 @@ mod imp {
 
     use anyhow::Context as _;
 
-    use super::{IDENTIFIER, Path, PathBuf, State};
+    use super::{IDENTIFIER, Path, PathBuf, Signer, State};
 
     const NAME: &str = "kiln code signing";
 
@@ -222,6 +263,30 @@ mod imp {
             Some(id) => State::Ready(id),
             None => State::Missing("kiln's signing identity here isn't trusted for code signing: run `kiln signing setup` again".to_owned()),
         }
+    }
+
+    pub fn signer() -> Signer {
+        identity().map_or(Signer::AdHoc, Signer::Kiln)
+    }
+
+    pub fn sign_carried(path: &Path, entitlements: Option<&Path>, signer: &Signer) -> anyhow::Result<()> {
+        let mut c = Command::new("/usr/bin/codesign");
+        c.arg("--force");
+        match signer {
+            Signer::Kiln(id) => {
+                c.arg("--sign").arg(id).arg("--keychain").arg(keychain());
+            }
+            Signer::AdHoc => {
+                c.args(["--sign", "-"]);
+            }
+            Signer::NotNeeded => return Ok(()),
+        }
+        if let Some(e) = entitlements {
+            c.arg("--entitlements").arg(e).args(["-o", "runtime"]);
+        }
+        let out = c.arg("--timestamp=none").arg(path).stdin(Stdio::null()).output().context("run /usr/bin/codesign")?;
+        anyhow::ensure!(out.status.success(), "codesign {}: {}", path.display(), String::from_utf8_lossy(&out.stderr).trim());
+        Ok(())
     }
 
     pub fn sign_as(tmp: &Path, dest: &Path, build: &str) -> anyhow::Result<bool> {
