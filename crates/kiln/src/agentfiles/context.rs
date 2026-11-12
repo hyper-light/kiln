@@ -14,6 +14,7 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 use super::builtin::Builtin;
+use super::unpack::{self, Fields, Spec};
 
 /// What the fetcher reads of a pin: its builds. The rest is its pin.sh's record of how its publisher's
 /// build was checked, for people; steps 19 to 28's pins differ there (f7).
@@ -60,8 +61,9 @@ pub enum Error {
     Size { url: String, expected: u64, observed: u64 },
     /// Its body wasn't the pinned file.
     Digest { url: String, expected: String, observed: String },
-    /// An archive: unpacking one is step 25's unpacker's, not in this build of kiln yet.
-    Unpack { url: String },
+    /// An archive the one unpacker refused, or an `unpack` it doesn't take: the URL, the entry at fault
+    /// and why ([`unpack::Unpack`]).
+    Unpack(unpack::Unpack),
     /// The disk.
     Io { path: PathBuf, why: String },
 }
@@ -75,7 +77,7 @@ impl std::fmt::Display for Error {
             Self::Status { url, status } => write!(f, "{url} answered {status}"),
             Self::Size { url, expected, observed } => write!(f, "{url}: {observed} bytes, pinned {expected}"),
             Self::Digest { url, expected, observed } => write!(f, "{url}: SHA-256 {observed}, pinned {expected}"),
-            Self::Unpack { url } => write!(f, "{url} is an archive to unpack, which this build of kiln can't do yet"),
+            Self::Unpack(e) => write!(f, "{e}"),
             Self::Io { path, why } => write!(f, "{}: {why}", path.display()),
         }
     }
@@ -197,6 +199,10 @@ pub async fn materialize(b: &Builtin, platforms: &[String], variant: Option<&str
     let mut chosen = Vec::new();
     for platform in platforms {
         let build = pin.build(platform, variant)?;
+        // Every archive's `unpack` is one the unpacker takes, before anything is fetched.
+        for f in &build.files {
+            spec(f)?;
+        }
         chosen.push((harness_dir(b.harness, platform, build.variant.as_deref())?, build));
     }
     std::fs::create_dir_all(dir).map_err(io(dir))?;
@@ -206,7 +212,7 @@ pub async fn materialize(b: &Builtin, platforms: &[String], variant: Option<&str
         for (name, build) in &chosen {
             let at = dir.join(name);
             let staging = dir.join(format!(".{name}.{}", crate::util::new_id()));
-            let filled = match fill(&client, b, build, &staging).await {
+            let filled = match fill(&client, b, build, dir, &staging).await {
                 Ok(()) => std::fs::rename(&staging, &at).map_err(io(&at)),
                 Err(e) => Err(e),
             };
@@ -228,14 +234,28 @@ pub async fn materialize(b: &Builtin, platforms: &[String], variant: Option<&str
     Ok(made)
 }
 
-/// One harness's directory, made at `staging`: each pinned file, then the built-in's own files.
-async fn fill(client: &crate::http::client::Client, b: &Builtin, build: &Build, staging: &Path) -> Result<(), Error> {
-    std::fs::create_dir(staging).map_err(io(staging))?;
-    for f in &build.files {
-        // An archive's path may be the directory itself (`.`: a tree merged into it), the unpacker's to place.
-        if f.unpack.is_some() {
-            return Err(Error::Unpack { url: f.url.clone() });
+/// One harness's directory, made at `staging`: its archives' trees, then its members and plain files, each
+/// in pin order, then the built-in's own files. The unpacker renames a tree into place whole, so nothing
+/// may be at its target before it: a tree at `.` makes the directory itself. An archive is fetched into
+/// `dir`, beside the directory, and removed by the unpacker either way.
+async fn fill(client: &crate::http::client::Client, b: &Builtin, build: &Build, dir: &Path, staging: &Path) -> Result<(), Error> {
+    let mut files = build.files.iter().map(|f| spec(f).map(|s| (f, s))).collect::<Result<Vec<_>, _>>()?;
+    // A stable sort: trees first, each class in pin order.
+    files.sort_by_key(|(_, s)| !matches!(s, Some(Spec::Tree(_))));
+    for (f, spec) in files {
+        let mode = f.mode.as_deref().map(octal).transpose()?;
+        if let Some(spec) = spec {
+            if matches!(spec, Spec::Member(_)) {
+                made(staging)?;
+            }
+            let arrived = fetch(client, f, dir).await?;
+            let (archive, url, root, path) = (arrived.path.clone(), f.url.clone(), staging.to_path_buf(), PathBuf::from(&f.path));
+            // 130 MB of pi's tree is written by it: off the runtime's threads.
+            let unpacked = crate::rt::blocking(move || unpack::tar_gz(&archive, &url, &spec, &root, &path, mode)).await;
+            unpacked.map_err(|e| Error::Io { path: arrived.path.clone(), why: format!("{e:#}") })?.map_err(Error::Unpack)?;
+            continue;
         }
+        made(staging)?;
         let rel = inside(&f.path)?;
         let mode = f.mode.as_deref().map(octal).transpose()?;
         let arrived = fetch(client, f, staging).await?;
@@ -251,10 +271,30 @@ async fn fill(client: &crate::http::client::Client, b: &Builtin, build: &Build, 
             crate::os::set_mode(&to, m).map_err(io(&to))?;
         }
     }
+    made(staging)?;
     for (name, text) in files_for(b, build.variant.as_deref()) {
         write_new(&staging.join(inside(name)?), text)?;
     }
     Ok(())
+}
+
+/// `staging` made, unless a tree at `.` made it.
+fn made(staging: &Path) -> Result<(), Error> {
+    match std::fs::create_dir(staging) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(io(staging)(e)),
+        _ => Ok(()),
+    }
+}
+
+/// What the one unpacker takes of a pinned file, none for a plain file: its `unpack` read as the unpacker
+/// reads pin.json's. A form the unpacker refuses (another format, a member's fields and a tree's, neither,
+/// one lacking) is its typed refusal, naming the URL; a field it doesn't know is the pin's fault.
+fn spec(f: &PinnedFile) -> Result<Option<Spec>, Error> {
+    let Some(v) = &f.unpack else {
+        return Ok(None);
+    };
+    let fields: Fields = serde_json::from_value(v.clone()).map_err(|e| Error::Pin(format!("{}'s unpack: {e}", f.path)))?;
+    Spec::try_from(fields).map(Some).map_err(|why| Error::Unpack(unpack::Unpack { url: f.url.clone(), entry: None, why }))
 }
 
 /// `f` downloaded into `dir`, its size and SHA-256 held to the pin's as it streams.
@@ -293,3 +333,6 @@ fn write_new(path: &Path, text: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod unpack_tests;
