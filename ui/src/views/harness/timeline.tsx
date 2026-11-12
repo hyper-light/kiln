@@ -651,7 +651,9 @@ function Notice({ e, repeats }: { e: Extract<HEvent, { kind: "notice" }>; repeat
 
 const DELIVERY: Record<Delivery, string> = {
   sent: "sent",
-  queued: "queued by the agent",
+  // The harness has it and takes it at its next step (a steer folded into the turn): delivered,
+  // not queued. Queued is only what kiln still holds (Ada, 2026-11-12).
+  queued: "sent",
   started: "being worked on",
   completed: "done",
   cancelled: "dropped",
