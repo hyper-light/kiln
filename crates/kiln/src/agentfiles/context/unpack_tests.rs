@@ -1,7 +1,9 @@
 //! Archives through the one unpacker (kiln plan 01a1ce705e62732b83f16295d74ee263, step 3). Contexts of
 //! pi's shape are fetched from kiln's own HTTP server in the test: pi's tree with `pi/` stripped at the
-//! harness directory's root, then ripgrep's and fd's members at bin/. Each archive the unpacker refuses
-//! comes back as its typed error, naming its URL and its entry, and leaves nothing behind.
+//! harness directory's root, then ripgrep's and fd's members at bin/. So are agy's (plan
+//! 01a1ce705e55753182217afdfe607de9, step 3): each archive's one entry, the member antigravity held
+//! alone, at bin/agy. Each archive the unpacker refuses comes back as its typed error, naming its URL and
+//! its entry, and leaves nothing behind.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -257,6 +259,143 @@ fn step28_an_archive_the_unpacker_refuses_leaves_nothing() -> anyhow::Result<()>
                 assert!(left.is_empty(), "{what}: left {left:?}");
             }
             assert!(!absent.exists() || names(&absent)?.is_empty(), "{what}: the directory it made");
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// agy's harness file and Agentfile for a test: its HARNESS line takes `./antigravity-${TARGETARCH}`.
+const AGY_AGENTFILE: &str = "FROM scratch\nARG TARGETARCH\nHARNESS antigravity FROM ./antigravity-${TARGETARCH}\n";
+const AGY_HARNESS_JSON: &str = "{\"schemaVersion\":1,\"name\":\"antigravity\"}\n";
+
+/// agy's binary for `arch`, as Google's archive holds it, in small.
+fn agy(arch: &str) -> Vec<u8> {
+    format!("#!/bin/sh\necho 1.5.7 {arch}\n").into_bytes()
+}
+
+/// The URL path of agy's archive for `arch` on the test's server.
+fn agy_path(arch: &str) -> String {
+    format!("/{arch}/cli_linux_{arch}_musl.tar.gz")
+}
+
+/// One platform of agy's shape (kiln plan 01a1ce705e55753182217afdfe607de9, step 3), as the test's server
+/// serves it and as agy's pin.sh pins Google's archive: `gz` by its own SHA-256 and size, unpacked from
+/// its one entry, the member antigravity held alone, of `member`'s SHA-256 and size, to bin/agy at 0755.
+fn agy_build(origin: &str, arch: &str, gz: Vec<u8>, member: &[u8]) -> (Vec<(String, Vec<u8>)>, Value) {
+    let file = json!({ "url": format!("{origin}{}", agy_path(arch)), "sha256": sha(&gz), "size": gz.len(), "path": "bin/agy", "mode": "0755",
+        "unpack": { "format": "tar.gz", "member": "antigravity", "alone": true, "sha256": sha(member), "size": member.len() } });
+    (vec![(agy_path(arch), gz)], json!({ "platform": format!("linux/{arch}"), "files": [file] }))
+}
+
+/// agy's built-in for a test: the pin of `builds`.
+fn antigravity(builds: Vec<Value>) -> Builtin {
+    let pin = json!({ "version": "1.5.7", "verified": "by the test", "builds": builds }).to_string();
+    Builtin { name: "harness-antigravity", harness: "antigravity", text: AGY_AGENTFILE, pin: pin.leak(), files: &[("harness.json", AGY_HARNESS_JSON)] }
+}
+
+fn both() -> [String; 2] {
+    ["linux/amd64".to_owned(), "linux/arm64".to_owned()]
+}
+
+/// A context of agy's shape for linux/amd64 and linux/arm64 holds the Agentfile and antigravity-amd64/
+/// and antigravity-arm64/, and nothing else: no staging directory, no archive, no temporary file. Each
+/// holds harness.json and bin/agy, its own arch's bytes at the pin's 0755 (the archive's entry is 0644).
+#[test]
+fn step26_an_agy_shaped_context_holds_bin_agy_as_pinned() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let mut builds = Vec::new();
+        let origin = serve(|o| {
+            let mut routes = Vec::new();
+            for arch in ["amd64", "arm64"] {
+                let (r, b) = agy_build(o, arch, targz(&[file("antigravity", 0o644, &agy(arch))])?, &agy(arch));
+                routes.extend(r);
+                builds.push(b);
+            }
+            Ok(routes)
+        })
+        .await?;
+        let tmp = tempfile::tempdir()?;
+        let ctx = tmp.path().join("ctx");
+
+        let made = materialize(&antigravity(builds), &both(), None, &ctx).await?;
+
+        assert_eq!(made, [ctx.join("antigravity-amd64"), ctx.join("antigravity-arm64")], "from {origin}");
+        assert_eq!(names(&ctx)?, set(["Agentfile", "antigravity-amd64", "antigravity-arm64"]));
+        assert_eq!(std::fs::read_to_string(ctx.join("Agentfile"))?, AGY_AGENTFILE);
+        for arch in ["amd64", "arm64"] {
+            let d = ctx.join(format!("antigravity-{arch}"));
+            assert_eq!(names(&d)?, set(["bin", "harness.json"]), "{arch}");
+            assert_eq!(names(&d.join("bin"))?, set(["agy"]), "{arch}");
+            assert_eq!(std::fs::read(d.join("bin/agy"))?, agy(arch), "{arch}");
+            assert_eq!(std::fs::read_to_string(d.join("harness.json"))?, AGY_HARNESS_JSON, "{arch}");
+            #[cfg(unix)]
+            assert_eq!((mode(&d.join("bin/agy"))?, mode(&d.join("bin"))?), (0o755, 0o755), "{arch}");
+        }
+        Ok(())
+    })
+}
+
+/// Each agy archive failing a check comes back as the unpacker's typed error naming the pinned URL, the
+/// entry at fault and, where there are two, the values pinned and found: its member of another SHA-256,
+/// or larger than pinned; no member; an entry beside the member; the member a symlink; a `../` path; a
+/// corrupt gzip stream. Each is arm64's, after amd64's directory was made, and leaves nothing in the
+/// context's directory: no harness directory, no bin/agy, no staging directory, no archive, no
+/// Agentfile.
+#[test]
+fn step26_an_agy_archive_failing_a_check_leaves_nothing() -> anyhow::Result<()> {
+    type Is = Box<dyn Fn(&Why) -> bool>;
+    let good = agy("arm64");
+    let mut flipped = good.clone();
+    if let Some(last) = flipped.last_mut() {
+        *last ^= 1;
+    }
+    let shorter = good.get(..good.len().saturating_sub(1)).unwrap_or_default().to_vec();
+    let one = targz(&[file("antigravity", 0o755, &good)])?;
+    // A gzip header, then a deflate block of the reserved type (BTYPE 11): no gzip reader gets past it.
+    let mut corrupt = one.clone();
+    for b in corrupt.iter_mut().skip(10).take(16) {
+        *b = 0xff;
+    }
+    let (want_digest, got_digest, len) = (sha(&flipped), sha(&good), good.len() as u64);
+    let cases: Vec<(&str, Vec<u8>, Vec<u8>, Option<&str>, Is)> = vec![
+        ("a member of another SHA-256", one.clone(), flipped, Some("antigravity"), Box::new(move |w| matches!(w, Why::Digest { expected, got } if *expected == want_digest && *got == got_digest))),
+        ("a member larger than pinned", one.clone(), shorter, Some("antigravity"), Box::new(move |w| matches!(w, Why::Size { expected, got } if *expected == len - 1 && *got == len))),
+        ("no member", targz(&[file("agy", 0o755, &good)])?, good.clone(), Some("antigravity"), Box::new(|w| matches!(w, Why::Missing))),
+        ("an extra entry", targz(&[file("antigravity", 0o755, &good), file("README.md", 0o644, b"# agy\n")])?, good.clone(), Some("README.md"), Box::new(|w| matches!(w, Why::Extra { member } if member == "antigravity"))),
+        ("the member a symlink", targz(&[link("antigravity", EntryType::Symlink, "/bin/sh")])?, good.clone(), Some("antigravity"), Box::new(|w| matches!(w, Why::Link))),
+        ("a ../ path", targz(&[file("antigravity", 0o755, &good), file("../antigravity", 0o755, &good)])?, good.clone(), Some("../antigravity"), Box::new(|w| matches!(w, Why::Escapes))),
+        ("a corrupt gzip stream", corrupt, good.clone(), None, Box::new(|w| matches!(w, Why::Io(_)))),
+    ];
+    for (what, gz, member, entry, is) in cases {
+        crate::rt::block_on(async move {
+            let mut builds = Vec::new();
+            let origin = serve(|o| {
+                let (mut routes, b) = agy_build(o, "amd64", targz(&[file("antigravity", 0o755, &agy("amd64"))])?, &agy("amd64"));
+                builds.push(b);
+                let (r, b) = agy_build(o, "arm64", gz, &member);
+                routes.extend(r);
+                builds.push(b);
+                Ok(routes)
+            })
+            .await?;
+            let b = antigravity(builds);
+            let url = format!("{origin}{}", agy_path("arm64"));
+            let tmp = tempfile::tempdir()?;
+            let (absent, empty) = (tmp.path().join("absent"), tmp.path().join("empty"));
+            std::fs::create_dir(&empty)?;
+            for ctx in [&absent, &empty] {
+                let refused = materialize(&b, &both(), None, ctx).await;
+                let Err(Error::Unpack(u)) = refused else {
+                    anyhow::bail!("{what}: {:?}, not the unpacker's refusal", refused.map(|m| m.len()));
+                };
+                assert_eq!((u.url.as_str(), u.entry.as_deref()), (url.as_str(), entry), "{what}: {u}");
+                assert!(is(&u.why), "{what}: {:?}", u.why);
+                let shown = u.to_string();
+                assert!(shown.starts_with(&url) && entry.is_none_or(|e| shown.contains(e)), "{what}: {shown}");
+                let left = if ctx.exists() { names(ctx)? } else { BTreeSet::new() };
+                assert!(left.is_empty(), "{what}: left {left:?}");
+            }
             Ok(())
         })?;
     }
