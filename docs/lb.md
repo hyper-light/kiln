@@ -839,7 +839,8 @@ Where the step goes, measured apart at N = 100, rho = 0.5: the owner's side 17 n
 7.8), the runners' side 11 ns, the bench's carrying of messages the rest. Each part is a short chain
 of dependent loads through a different structure (the owner's record of the runner, its run slab,
 the index, the runner's ledger, its run slab): it is latency, not instructions, at every N, and at
-N = 10,000 those structures (about 10 MB) are in L2.
+N = 10,000 those structures (about 10 MB) are in the M3 Ultra's L2 (16 MB for each cluster of six
+cores); on a core with 1 MB of L2 they're in L3 already (below, "At scale").
 
 The competitors on the same machine, one run each of the bench's drivers at rho = 0.5 (the
 interleaved rounds of `ci/bench/run.py` are the comparison that decides):
@@ -862,6 +863,77 @@ Against the load-aware algorithms it would take 4.4 ns at N = 100 (HAProxy least
 10,000; kiln's step, at 33 and 99, is the five chains above one after the other. The competitors
 without admission oversubscribe (static-rr 372 picks onto full backends in this run, Maglev
 5,471, nginx random 5,000); kiln never does.
+
+## At scale
+
+Where a step leaves each level of cache, whether owners on several cores slow each other, and what
+a lock other cores write through costs (Ada's questions, 2026-11-12). `--profile` runs (one
+stretch of 2^23 steps after the fill and 25 N warm-up steps), ns a step with the harness's own
+bookkeeping in it (null); `--impl owner` is the owner's side alone, what a node that places holds
+(the whole bench also keeps every runner's ledger, which lives on the runner). Commit `1a5a8da8b`
+(main `efb40ea0f` and the bench's two modes below); `~/.cache/kiln-lb/sync-scale` runs it.
+
+**One owner, 10,000 to 1,000,000 runners.** adacachy2 (AMD Ryzen 9 9950X3D2: 48 KB L1d and 1 MB L2
+a core, 96 MB L3 for eight; load 4 to 7) and adas-mac-studio.local-2 (Apple M3 Ultra: 16 MB L2 for
+each cluster of six performance cores, no L3 but the system cache; load about 8, a CI job beside):
+
+| N | rho | x86 owner | x86 whole | M3 owner | M3 whole |
+|---|---|---|---|---|---|
+| 10,000 | 0.5 | 19.2 | 25.3 | 14.8 | 27.1 |
+| 30,000 | 0.5 | 22.7 | 29.6 | 19.8 | 49.8 |
+| 100,000 | 0.5 | 23.8 | 33.6 | 46.3 | 74.6 |
+| 300,000 | 0.5 | 31.7 | 105.3 | 84.0 | 125.2 |
+| 1,000,000 | 0.5 | 112.9 | 171.0 | 125.0 | 156.3 |
+| 10,000 | 0.9 | 25.4 | 32.6 | 22.2 | 33.7 |
+| 100,000 | 0.9 | 29.3 | 47.2 | 64.7 | 113.5 |
+| 300,000 | 0.9 | 88.4 | 145.4 | 113.0 | 156.3 |
+| 1,000,000 | 0.9 | 132.5 | 210.2 | 134.5 | 172.3 |
+
+On a core with 1 MB of L2 a step left it below 10,000 runners (the 10k audit: 15 of its 25 ns
+wait on L3); the 96 MB L3 then holds the owner's side nearly flat to 300,000 runners at half load
+(to 100,000 at 90%), the whole bench to 100,000; past that each miss is memory's, and the owner's
+step costs four to five times what it did on the plateau. On the M3 Ultra the owner's side leaves the 16 MB L2 between 30,000 and 100,000 runners,
+the whole bench between 10,000 and 30,000. At a million runners a decision takes 113 to 135 ns of
+the owner's on either machine.
+
+**Owners on several cores** (`--owners K`): K owners at once, one a thread, each with its own
+fleet and requests; every owner's steps a second together, over K times one owner's alone:
+
+| N | rho | K = 2 | 4 | 8 | 16 | machine |
+|---|---|---|---|---|---|---|
+| 10,000 | 0.5 | 0.98 | 0.98 | 0.94 | 0.87 | x86 |
+| 10,000 | 0.9 | 1.00 | 0.96 | 0.93 | 0.90 | x86 |
+| 100,000 | 0.5 | 0.64 | 0.29 | 0.26 | 0.14 | x86 |
+| 100,000 | 0.9 | 0.43 | 0.31 | 0.22 | 0.15 | x86 |
+| 10,000 | 0.5 | 1.01 | 0.92 | 0.82 | 0.75 | M3 |
+| 100,000 | 0.5 | 0.80 | 0.73 | 0.61 | 0.51 | M3 |
+
+Owners share no memory, and two owners on two cores lose nothing at 10,000 runners: no line goes
+back and forth between them. What they share is the machine's: at 100,000 runners each owner of the
+whole bench holds about 100 MB (ten times the 10 MB at 10,000 above), so two of them no longer fit the 96 MB L3 they share, and from four
+on they're held to memory's bandwidth (x86: 35 to 66 million steps a second together). The
+M3 Ultra's memory carries several times more, and its owners keep half their
+pace at 16. Most of the whole bench's footprint is the runners' ledgers (640 bytes each, the 10k
+audit's sizes), which a node that places doesn't hold.
+
+**One owner behind a lock** (`--hinters M`, the server's v1 kernel's shape, `crates/kiln/src/hub/legs.rs`):
+its steps a lock each while M threads hint it as fast as they can, against the same owner without
+the lock:
+
+| M | x86, rho 0.5 | x86, rho 0.9 | M3, rho 0.5 | M3, rho 0.9 |
+|---|---|---|---|---|
+| 0 (the lock alone) | 1.09x | 1.08x | 1.38x | 1.43x |
+| 1 | 2.7x | 2.2x | 5.2x | 5.1x |
+| 2 | 4.5x | 3.6x | 25x | 27x |
+| 4 | 13x | 11x | 49x | 41x |
+| 8 | 41x | 35x | 58x | 41x |
+
+Hints came at 3 to 17 million a second; a fleet's runners say their room when it changes, a dozen
+runners a few times a second each. So the lock costs nothing at today's fleet, and is what fails
+first at a large one: other cores writing the owner's records under it move them between caches on
+every decision. Words to the owner as messages it drains (one writer, the newest word for each
+runner taken) keep them in one core's cache, as the CI engine's kernel already has them (its
+dispatcher's one task).
 
 ## What remains
 
