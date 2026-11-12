@@ -1,11 +1,13 @@
 //! The store's engine: Turso, embedded (`docs/conversations.md`, "The store"), vendored in
-//! `vendor/turso`. One connection, owned by the store's writer thread; every statement is driven
-//! to its end on that thread (`PlatformIO` does its I/O inline, so `step` waits on nothing).
+//! `vendor/turso`. One connection writes, owned by the store's writer thread; another reads beside it
+//! on the store's reader thread ([`TursoRead`]; plan 01a1cc09, step 2). Every statement is driven to
+//! its end on its connection's thread (`PlatformIO` does its I/O inline, so `step` waits on nothing).
 
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::time::{Duration, Instant};
 
 use turso_core::{CheckpointMode, Connection, ConnectOpts, Database, DatabaseOpts, IO, OpenOptions, PlatformIO, Row as TRow, SqliteDialect, Statement, StepResult, Value};
 
@@ -13,7 +15,7 @@ use std::collections::HashMap;
 
 use super::rows::{EventRow, RecordRow, Row};
 use super::sql;
-use super::store::{Change, Changes, Compacting, Engine, Kept, Look, Mark, Query, SearchFrom, Took, Unended};
+use super::store::{Change, Changes, Compacting, Engine, Kept, Look, Mark, Query, Read, SearchFrom, Took, Unended};
 use super::telemetry::CompactView;
 
 /// Rows of each kind a feed reads at once.
@@ -480,48 +482,23 @@ impl Turso {
         Ok(())
     }
 
+    /// Its writer's connection ([`Link`]).
+    fn link(&self) -> Link<'_> {
+        Link { io: &self.io, conn: &self.conn, busy: None }
+    }
+
     fn prepare(&self, sql: &str) -> anyhow::Result<Statement> {
-        self.conn.prepare(sql).map_err(fail)
+        self.link().prepare(sql)
     }
 
     /// Run `stmt` with `params`, handing each row to `each`.
-    fn run(&self, stmt: &mut Statement, params: &[Value], mut each: impl FnMut(&TRow) -> anyhow::Result<()>) -> anyhow::Result<()> {
-        self.run_while(stmt, params, |r| each(r).map(|()| true))
+    fn run(&self, stmt: &mut Statement, params: &[Value], each: impl FnMut(&TRow) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        self.link().run(stmt, params, each)
     }
 
     /// [`Turso::run`], stopping once `each` says no more (false).
-    fn run_while(&self, stmt: &mut Statement, params: &[Value], mut each: impl FnMut(&TRow) -> anyhow::Result<bool>) -> anyhow::Result<()> {
-        stmt.reset().map_err(fail)?;
-        for (i, p) in params.iter().enumerate() {
-            stmt.bind_at(at(i + 1)?, p.clone()).map_err(fail)?;
-        }
-        loop {
-            match stmt.step().map_err(fail)? {
-                StepResult::Row => {
-                    if let Some(row) = stmt.row()
-                        && !each(row)?
-                    {
-                        return stmt.reset().map_err(fail);
-                    }
-                }
-                StepResult::Done => return Ok(()),
-                StepResult::IO | StepResult::Yield => self.io.step().map_err(fail)?,
-                // Never here: Turso says busy only where a lock this statement needs is held by another
-                // connection to the database (its WAL's read and write locks, VACUUM's), or where another
-                // statement of the connection holds its statement journal, and asks for a wait (`Sleep`)
-                // only where a busy handler says to try again. A store has one connection, its writer's:
-                // its file is opened once in a process (a second open would share its database, Turso
-                // keeping one a file) and by no other process while it's open (`Turso::open` is refused
-                // the file's lock); it runs a statement at a time, each to its end or reset; it never
-                // vacuums, and sets no busy handler. So either is a fault, said with the statement it
-                // stopped, never waited out (it was tried 50 times, 10 ms apart).
-                StepResult::Busy | StepResult::Sleep { .. } => anyhow::bail!(
-                    "the conversation store's database said busy for `{}`: a lock it needs is held by another connection to it, or its statement journal by another of its statements, and a store opens one connection and runs one statement at a time",
-                    stmt.get_sql().lines().next().unwrap_or_default()
-                ),
-                StepResult::Interrupt => anyhow::bail!("a statement on the conversation store was interrupted"),
-            }
-        }
+    fn run_while(&self, stmt: &mut Statement, params: &[Value], each: impl FnMut(&TRow) -> anyhow::Result<bool>) -> anyhow::Result<()> {
+        self.link().run_while(stmt, params, each)
     }
 
     fn migrate(&mut self, schema: usize) -> anyhow::Result<()> {
@@ -550,6 +527,83 @@ impl Turso {
     }
 
     fn event_rows(&self, sql: &str, params: &[Value]) -> anyhow::Result<Vec<EventRow>> {
+        self.link().event_rows(sql, params)
+    }
+}
+
+/// How long a reader beside the writer waits out a lock the writer holds for a moment (a checkpoint's) before its read
+/// fails ([`Link::run_while`]); the store's wait for its answer bounds it too (`super::store::READ_WAIT`).
+const READ_BUSY: Duration = Duration::from_secs(5);
+/// How long a reader waits before trying a statement Turso said busy for again.
+const BUSY_AGAIN: Duration = Duration::from_millis(2);
+
+/// A connection to the store's file and the I/O it steps on: the writer's ([`Turso`]), or a reader's beside it
+/// ([`TursoRead`]; plan 01a1cc09, step 2), which waits out a lock the writer holds (`busy`: until when).
+struct Link<'a> {
+    io: &'a Arc<dyn IO>,
+    conn: &'a Arc<Connection>,
+    busy: Option<Instant>,
+}
+
+impl Link<'_> {
+    fn prepare(&self, sql: &str) -> anyhow::Result<Statement> {
+        self.conn.prepare(sql).map_err(fail)
+    }
+
+    /// Run `stmt` with `params`, handing each row to `each`.
+    fn run(&self, stmt: &mut Statement, params: &[Value], mut each: impl FnMut(&TRow) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        self.run_while(stmt, params, |r| each(r).map(|()| true))
+    }
+
+    /// [`Link::run`], stopping once `each` says no more (false).
+    fn run_while(&self, stmt: &mut Statement, params: &[Value], mut each: impl FnMut(&TRow) -> anyhow::Result<bool>) -> anyhow::Result<()> {
+        let bind = |stmt: &mut Statement| -> anyhow::Result<()> {
+            stmt.reset().map_err(fail)?;
+            for (i, p) in params.iter().enumerate() {
+                stmt.bind_at(at(i + 1)?, p.clone()).map_err(fail)?;
+            }
+            Ok(())
+        };
+        bind(stmt)?;
+        let mut rows = false;
+        loop {
+            match stmt.step().map_err(fail)? {
+                StepResult::Row => {
+                    rows = true;
+                    if let Some(row) = stmt.row()
+                        && !each(row)?
+                    {
+                        return stmt.reset().map_err(fail);
+                    }
+                }
+                StepResult::Done => return Ok(()),
+                StepResult::IO | StepResult::Yield => self.io.step().map_err(fail)?,
+                // A reader's, before any row: the writer holds a lock it needs for a moment (a checkpoint's). From the
+                // start again a little later, until its wait is out.
+                StepResult::Busy | StepResult::Sleep { .. } if !rows && self.busy.is_some_and(|until| Instant::now() < until) => {
+                    std::thread::sleep(BUSY_AGAIN);
+                    bind(stmt)?;
+                }
+                // Never the writer's: Turso says busy only where a lock this statement needs is held by another
+                // connection to the database (its WAL's read and write locks, VACUUM's), or where another
+                // statement of the connection holds its statement journal, and asks for a wait (`Sleep`)
+                // only where a busy handler says to try again. A store writes on one connection, its writer's (its
+                // reader only reads, never taking the write lock): its file is opened once in a process (a second
+                // open would share its database, Turso keeping one a file) and by no other process while it's open
+                // (`Turso::open` is refused the file's lock); it runs a statement at a time, each to its end or
+                // reset; it never vacuums, and sets no busy handler. So the writer's is a fault, said with the
+                // statement it stopped, never waited out (it was tried 50 times, 10 ms apart); a reader's is past
+                // its wait.
+                StepResult::Busy | StepResult::Sleep { .. } => anyhow::bail!(
+                    "the conversation store's database said busy for `{}`: a lock it needs is held by another connection to it, or its statement journal by another of its statements",
+                    stmt.get_sql().lines().next().unwrap_or_default()
+                ),
+                StepResult::Interrupt => anyhow::bail!("a statement on the conversation store was interrupted"),
+            }
+        }
+    }
+
+    fn event_rows(&self, sql: &str, params: &[Value]) -> anyhow::Result<Vec<EventRow>> {
         let mut stmt = self.prepare(sql)?;
         let mut out = Vec::new();
         self.run(&mut stmt, params, |r| {
@@ -557,6 +611,89 @@ impl Turso {
             Ok(())
         })?;
         Ok(out)
+    }
+
+    /// [`Engine::events`], on this connection.
+    fn events(&self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        let limit = int(i64::try_from(limit).unwrap_or(i64::MAX));
+        let mut rows = match before {
+            Some(b) => self.event_rows(sql::EVENTS_BEFORE, &[Value::from_text(session.to_owned()), seq(b), limit])?,
+            None => self.event_rows(sql::EVENTS_LAST, &[Value::from_text(session.to_owned()), limit])?,
+        };
+        rows.reverse();
+        Ok(rows)
+    }
+
+    /// [`Engine::search_some`], on this connection.
+    fn search_some(&self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> {
+        // Newest first by an index, so nothing is sorted and it stops once it has `want`; the words
+        // matched here, as LIKE would (any case of an ASCII letter; `%` and `_` as they are).
+        let words: Vec<String> = q.q.split_whitespace().map(str::to_ascii_lowercase).collect();
+        let (sql, params) = match &q.session {
+            Some(s) => {
+                let before = q.before_seq.and_then(|n| i64::try_from(n).ok()).map_or(i64::MAX, |n| n.saturating_sub(1));
+                let search = if q.before_seq.is_some() { sql::SEARCH_CANONICAL_SESSION } else { sql::SEARCH_SESSION };
+                (search, vec![txt(s), int(from.map_or(before, |f| f.key))])
+            }
+            None => (sql::SEARCH_ALL, vec![int(from.map_or_else(|| q.until.map_or(i64::MAX, |u| u.saturating_sub(1)), |f| f.key))]),
+        };
+        let mut stmt = self.prepare(sql)?;
+        let (mut hits, mut looked, mut last, mut more) = (Vec::new(), 0usize, None, false);
+        self.run_while(&mut stmt, &params, |r| {
+            let (rowid, key) = (r.get::<i64>(0).map_err(fail)?, r.get::<i64>(1).map_err(fail)?);
+            // Looked at already (the same key as where it goes on from, a rowid not before it).
+            if from.is_some_and(|f| key == f.key && rowid >= f.rowid) {
+                return Ok(true);
+            }
+            let at = r.get::<i64>(2).unwrap_or(0);
+            // Across agents it goes back in time: older than it looks back to, nothing more fits.
+            if q.session.is_none() && q.since.is_some_and(|s| at < s) {
+                return Ok(false);
+            }
+            looked += 1;
+            last = Some(SearchFrom { key, rowid });
+            let column = |i: usize| r.get::<String>(i).ok();
+            let fits = q.since.is_none_or(|s| at >= s)
+                && q.until.is_none_or(|u| at < u)
+                && [(&q.kind, 3), (&q.tool, 4), (&q.status, 5)].into_iter().all(|(w, i)| w.as_deref().is_none_or(|w| column(i).as_deref() == Some(w)))
+                && (words.is_empty() || {
+                    let text = column(6).unwrap_or_default().to_ascii_lowercase();
+                    words.iter().all(|w| text.contains(w.as_str()))
+                });
+            if fits {
+                hits.push(rowid);
+            }
+            more = hits.len() >= want || looked >= rows;
+            Ok(!more)
+        })?;
+        let mut whole = self.prepare(sql::EVENT_BY_ROWID)?;
+        let mut found = Vec::with_capacity(hits.len());
+        for rowid in hits {
+            self.run(&mut whole, &[int(rowid)], |r| {
+                found.push(event_of(r)?);
+                Ok(())
+            })?;
+        }
+        Ok((found, if more { last } else { None }))
+    }
+}
+
+/// A reader of a Turso store's file beside its writer ([`Read`]; plan 01a1cc09, step 2): a connection of its own to the
+/// same database, reading what's committed, on the store's reader thread.
+pub struct TursoRead {
+    io: Arc<dyn IO>,
+    conn: Arc<Connection>,
+}
+
+impl TursoRead {
+    fn link(&self) -> Link<'_> {
+        Link { io: &self.io, conn: &self.conn, busy: Some(Instant::now() + READ_BUSY) }
+    }
+}
+
+impl Read for TursoRead {
+    fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        self.link().events(session, before, limit)
     }
 }
 
@@ -1420,65 +1557,25 @@ impl Engine for Turso {
     }
 
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
-        let limit = int(i64::try_from(limit).unwrap_or(i64::MAX));
-        let mut rows = match before {
-            Some(b) => self.event_rows(sql::EVENTS_BEFORE, &[Value::from_text(session.to_owned()), seq(b), limit])?,
-            None => self.event_rows(sql::EVENTS_LAST, &[Value::from_text(session.to_owned()), limit])?,
-        };
-        rows.reverse();
-        Ok(rows)
+        self.link().events(session, before, limit)
     }
 
     fn search_some(&mut self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> {
-        // Newest first by an index, so nothing is sorted and it stops once it has `want`; the words
-        // matched here, as LIKE would (any case of an ASCII letter; `%` and `_` as they are).
-        let words: Vec<String> = q.q.split_whitespace().map(str::to_ascii_lowercase).collect();
-        let (sql, params) = match &q.session {
-            Some(s) => {
-                let before = q.before_seq.and_then(|n| i64::try_from(n).ok()).map_or(i64::MAX, |n| n.saturating_sub(1));
-                let search = if q.before_seq.is_some() { sql::SEARCH_CANONICAL_SESSION } else { sql::SEARCH_SESSION };
-                (search, vec![txt(s), int(from.map_or(before, |f| f.key))])
-            }
-            None => (sql::SEARCH_ALL, vec![int(from.map_or_else(|| q.until.map_or(i64::MAX, |u| u.saturating_sub(1)), |f| f.key))]),
-        };
-        let mut stmt = self.prepare(sql)?;
-        let (mut hits, mut looked, mut last, mut more) = (Vec::new(), 0usize, None, false);
-        self.run_while(&mut stmt, &params, |r| {
-            let (rowid, key) = (r.get::<i64>(0).map_err(fail)?, r.get::<i64>(1).map_err(fail)?);
-            // Looked at already (the same key as where it goes on from, a rowid not before it).
-            if from.is_some_and(|f| key == f.key && rowid >= f.rowid) {
-                return Ok(true);
-            }
-            let at = r.get::<i64>(2).unwrap_or(0);
-            // Across agents it goes back in time: older than it looks back to, nothing more fits.
-            if q.session.is_none() && q.since.is_some_and(|s| at < s) {
-                return Ok(false);
-            }
-            looked += 1;
-            last = Some(SearchFrom { key, rowid });
-            let column = |i: usize| r.get::<String>(i).ok();
-            let fits = q.since.is_none_or(|s| at >= s)
-                && q.until.is_none_or(|u| at < u)
-                && [(&q.kind, 3), (&q.tool, 4), (&q.status, 5)].into_iter().all(|(w, i)| w.as_deref().is_none_or(|w| column(i).as_deref() == Some(w)))
-                && (words.is_empty() || {
-                    let text = column(6).unwrap_or_default().to_ascii_lowercase();
-                    words.iter().all(|w| text.contains(w.as_str()))
-                });
-            if fits {
-                hits.push(rowid);
-            }
-            more = hits.len() >= want || looked >= rows;
-            Ok(!more)
-        })?;
-        let mut whole = self.prepare(sql::EVENT_BY_ROWID)?;
-        let mut found = Vec::with_capacity(hits.len());
-        for rowid in hits {
-            self.run(&mut whole, &[int(rowid)], |r| {
-                found.push(event_of(r)?);
-                Ok(())
-            })?;
+        self.link().search_some(q, from, rows, want)
+    }
+
+    fn reader(&self) -> Option<Box<dyn Read + Send>> {
+        // Windows renames no file over one that's open: a compaction's swap would fail while a reader held it.
+        if cfg!(windows) {
+            return None;
         }
-        Ok((found, if more { last } else { None }))
+        match self._db.connect(ConnectOpts::new()) {
+            Ok(conn) => Some(Box::new(TursoRead { io: Arc::clone(&self.io), conn })),
+            Err(e) => {
+                tracing::warn!(error = %e, "conversation store: no reader beside its writer, so its reads wait for it");
+                None
+            }
+        }
     }
 }
 
@@ -1494,6 +1591,37 @@ mod tests {
 
     fn said(id: &str, seq: u64, text: &str) -> Update {
         Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] }
+    }
+
+    /// Plan 01a1cc09, step 2: a reader beside the writer reads what's committed while the writer holds a write it hasn't
+    /// committed, on a thread of its own, without waiting for it; once it's committed, that too.
+    #[test]
+    fn a_reader_reads_the_last_commit_beside_a_write_held_open() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("conversations.db"))?;
+        let rows = |from: u64, to: u64| (from..=to).flat_map(|i| super::super::rows::of("a1", &said(&format!("m{i}"), i, "words"), 0)).collect::<Vec<_>>();
+        t.apply(&rows(1, 50))?;
+        let mut reader = t.reader().ok_or_else(|| anyhow::anyhow!("no reader"))?;
+        // A write held open on the writer's connection.
+        t.exec("BEGIN")?;
+        let mut w = t.writes()?;
+        for row in rows(51, 60) {
+            t.rev += 1;
+            t.write(&mut w, &row, t.rev)?;
+        }
+        let (tx, rx) = mpsc::channel();
+        let read = std::thread::spawn(move || {
+            let page = reader.events("a1", None, 100);
+            let _ = tx.send(());
+            (reader, page)
+        });
+        rx.recv_timeout(Duration::from_secs(5)).map_err(|_| anyhow::anyhow!("the reader waited for the write held open"))?;
+        let (mut reader, page) = read.join().map_err(|_| anyhow::anyhow!("the reader's thread panicked"))?;
+        assert_eq!(page?.iter().map(|e| e.seq).max(), Some(50), "the reader reads the last commit, not the write held open");
+        drop(w);
+        t.exec("COMMIT")?;
+        assert_eq!(reader.events("a1", None, 100)?.iter().map(|e| e.seq).max(), Some(60), "then what was committed");
+        Ok(())
     }
 
     #[test]

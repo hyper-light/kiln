@@ -5949,7 +5949,8 @@ async fn conversation_events_for(hub: &Hub, caller: &crate::authz::Caller, id: &
     } else if let Some(store) = hub.harness.convo.clone() {
         let session = id.to_owned();
         crate::rt::blocking(move || {
-            let rows = store.events(&session, Some(before), limit.saturating_add(1))?;
+            // As committed, beside the store's writer: never behind the writes sent before it (plan 01a1cc09, step 2).
+            let rows = store.events_committed(&session, Some(before), limit.saturating_add(1))?;
             let more = rows.len() > limit;
             let values = rows.iter().map(|r| serde_json::from_str::<serde_json::Value>(&r.body)).collect::<Result<Vec<_>, _>>()?;
             anyhow::Ok((values, more))
