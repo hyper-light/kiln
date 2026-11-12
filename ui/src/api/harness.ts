@@ -704,6 +704,10 @@ interface HistoryRead {
   seqs: Set<number>;
   promise: Promise<void>;
 }
+/** An older page's size (W21-R02; the server clamps it, api.rs `conversation_events_for`): `limit` events at most, about `bytes` of them. */
+export type OlderPage = { limit: number; bytes: number };
+/** What "Earlier messages" asks for at a time. */
+const OLDER_PAGE: OlderPage = { limit: 100, bytes: 256 * 1024 };
 
 export interface Snapshot {
   conn: Conn;
@@ -1339,7 +1343,7 @@ export class SessionStore {
 
   /** W21-R02: one explicit older page, merged into this canonical live store. A response never
    * overwrites an event already held or one corrected/deleted while its request was in flight. */
-  loadOlder = (): Promise<void> => {
+  loadOlder = (size: OlderPage = OLDER_PAGE): Promise<void> => {
     if (this.historyRead) return this.historyRead.promise;
     const history = this.snap.history;
     if (this.disposed || this.incoming || !history?.hasMore || history.before === null) return READY;
@@ -1347,7 +1351,7 @@ export class SessionStore {
     const read: HistoryRead = { controller, ids: new Set(), seqs: new Set(), promise: READY };
     this.historyRead = read;
     this.patch({ history: { ...history, loading: true, error: null } });
-    const qs = new URLSearchParams({ before: String(history.before), cursor: history.cursor, limit: "100", bytes: "262144" });
+    const qs = new URLSearchParams({ before: String(history.before), cursor: history.cursor, limit: String(size.limit), bytes: String(size.bytes) });
     read.promise = request<{ events: HEvent[]; history: HistoryWire; revision?: number }>("GET", apiPath(`/api/harness/sessions/${encodeURIComponent(this.id)}/events?${qs}`), undefined, {
       signal: controller.signal,
       // W21-R02: this visible action owns its network request. The page's shared plain-GET

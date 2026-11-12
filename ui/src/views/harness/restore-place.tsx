@@ -1,8 +1,10 @@
-import * as React from "react";
-import { useSession, type SessionStore } from "@/api/harness";
+import type { OlderPage, SessionStore } from "@/api/harness";
 import { survivingPosition, type RowPosition } from "./row-window";
 
 type RestoreStore = Pick<SessionStore, "get" | "event" | "loadOlder" | "cancelOlder">;
+/** A place restored reads the most the server gives at once (api.rs `conversation_events_for`), so one far back is a read
+ * or two rather than one per hundred events (plan 01a1cc09, step 3). */
+const RESTORE_PAGE: OlderPage = { limit: 1000, bytes: 1024 * 1024 };
 export type RestoreResult = { type: "found"; position: RowPosition } | { type: "cancelled" } | { type: "error"; message: string };
 
 /** Let the store publish its RAF-batched canonical page before inspecting the next one. */
@@ -37,7 +39,7 @@ export async function restoreCanonicalPlace(store: RestoreStore, position: RowPo
     if (history.before === null) return { type: "error", message: "Earlier history has no usable cursor. Retry restoring your place." };
     const before = history.before;
     const owned = !history.loading;
-    const request = store.loadOlder();
+    const request = store.loadOlder(RESTORE_PAGE);
     const cancel = () => {
       if (owned) store.cancelOlder(request);
     };
@@ -57,44 +59,4 @@ export async function restoreCanonicalPlace(store: RestoreStore, position: RowPo
     await yieldFrame(signal);
   }
   return { type: "cancelled" };
-}
-
-/** Callback-ref ownership cancels navigation/Latest without a hidden controller or an effect. */
-export function RestoringPlace({ store, position, resolved, latest }: { store: SessionStore; position: RowPosition; resolved: (position: RowPosition) => boolean; latest: () => void }) {
-  const ready = useSession(store, (snapshot) => snapshot.ready);
-  const [attempt, retry] = React.useState(0);
-  const [status, setStatus] = React.useState<{ pages: number; error: string | null }>({ pages: 0, error: null });
-  const ref = React.useCallback(
-    (el: HTMLDivElement | null) => {
-      // A deliberate Retry creates a new ref owner and aborts the previous attempt.
-      void attempt;
-      if (!el || !ready) return;
-      const controller = new AbortController();
-      setStatus({ pages: 0, error: null });
-      void restoreCanonicalPlace(store, position, controller.signal, (pages) => setStatus({ pages, error: null }))
-        .then((result) => {
-          if (controller.signal.aborted || result.type === "cancelled") return;
-          if (result.type === "error") setStatus((status) => ({ ...status, error: result.message }));
-          else if (!resolved(result.position)) setStatus((status) => ({ ...status, error: "Your saved row is no longer shown. Retry or go to the latest messages." }));
-        })
-        .catch(() => {
-          if (!controller.signal.aborted) setStatus((status) => ({ ...status, error: "Earlier history could not be loaded. Retry restoring your place." }));
-        });
-      return () => controller.abort();
-    },
-    [store, position, resolved, attempt, ready],
-  );
-  return (
-    <div ref={ref} className="hx-restore-place" role="status">
-      <p>{status.error ?? `Restoring your saved place${status.pages ? ` · ${status.pages} earlier page${status.pages === 1 ? "" : "s"} loaded` : "…"}`}</p>
-      {status.error && (
-        <button type="button" className="hx-earlier-steps" onClick={() => retry((n) => n + 1)}>
-          Retry restoring place
-        </button>
-      )}
-      <button type="button" className="hx-earlier-steps" onClick={latest}>
-        Latest messages
-      </button>
-    </div>
-  );
 }

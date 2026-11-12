@@ -29,6 +29,19 @@ fn main_user(e: &Value) -> bool { e.get("kind").and_then(Value::as_str) == Some(
 pub fn cursor(born: u64, generation: u64, session: &str) -> String { format!("{born}.{generation}.{session}") }
 pub fn valid_cursor(value: &str, born: u64, generation: u64, session: &str) -> bool { value == cursor(born, generation, session) }
 
+/// Whether a copy holding the events numbered `seqs` (a run of them, in order) holds all an older page before
+/// `before` shows ([`page`]: `limit` events, one more saying there are more): it has that many from `floor` on,
+/// or it starts at `floor` (or before), so nothing older is anywhere else. Then the conversation store has
+/// nothing for the page the copy doesn't (plan 01a1cc09, step 1).
+pub fn covers(seqs: impl IntoIterator<Item = u64>, floor: u64, before: u64, limit: usize) -> bool {
+    let (mut first, mut below) = (None::<u64>, 0usize);
+    for n in seqs {
+        first = Some(first.map_or(n, |f| f.min(n)));
+        if n >= floor && n < before { below = below.saturating_add(1); }
+    }
+    first.is_some_and(|f| f <= floor) || below > limit
+}
+
 /// A contiguous suffix, capped by turns and bytes, plus only the events needed to understand
 /// current interactions. `before` follows the suffix, not sparse older dependency events.
 pub fn recent(events: &[Arc<Value>], state: &Value, limits: Limits, token: String, durable: bool) -> (Vec<Arc<Value>>, Window) {
@@ -195,6 +208,25 @@ mod tests {
                 assert_eq!(serde_json::to_value(old).ok(), serde_json::to_value(new).ok());
             }
         }
+    }
+
+    /// Plan 01a1cc09, step 1: a copy covers a page when it holds the page and one more past it, or holds from
+    /// the floor; one that starts later with fewer leaves the rest to the store.
+    #[test]
+    fn a_copy_covers_a_page_it_holds_whole() {
+        // From the first event: every page.
+        assert!(covers(1..=230, 1, 221, 100));
+        assert!(covers(1..=230, 1, 50, 100));
+        // From the cleared floor on: nothing older shows.
+        assert!(covers(18..=230, 18, 60, 100));
+        // A later start with the page and one more: the page.
+        assert!(covers(101..=230, 1, 221, 100));
+        // A later start with only the page, not one more: whether there are more is the store's to say.
+        assert!(!covers(121..=230, 1, 221, 100));
+        // A later start with fewer: the store has the rest.
+        assert!(!covers(150..=230, 1, 221, 100));
+        // No copy events at all.
+        assert!(!covers(std::iter::empty(), 1, 221, 100));
     }
 
     #[test]
