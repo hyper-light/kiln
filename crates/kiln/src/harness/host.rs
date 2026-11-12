@@ -1387,6 +1387,11 @@ impl Host {
     /// Start a session (`id` keeps a known one's identity, e.g. one the server named). A subagent
     /// opens as its parent runs here ([`Host::like_its_parent`]).
     pub fn open(&self, id: Option<String>, spec: Spec) -> anyhow::Result<Arc<Session>> {
+        // Held in a microVM of its own or not at all: this kiln starts no microVM yet (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+        // steps 16 and 17), so an isolated agent is refused here, never run as a process (step 32).
+        if spec.isolation.is_some() {
+            anyhow::bail!("this machine's kiln starts no microVM yet, so it can't hold an isolated agent (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 16 and 17)");
+        }
         let spec = self.like_its_parent(spec);
         let claim = spec.claim.clone();
         let s = self.open_seeded(id, spec, None, None, Vec::new(), false, true)?;
@@ -3684,6 +3689,7 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         variant_of: spec.variant_of.clone(),
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
+        isolation: spec.isolation.clone(),
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info), since: None }, super::core::Update::State { state: Box::new(state) }]

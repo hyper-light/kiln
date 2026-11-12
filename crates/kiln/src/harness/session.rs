@@ -19,6 +19,29 @@ fn is_zero_epoch(n: &u64) -> bool {
     *n == 0
 }
 
+/// An isolated session's boundary (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 17 and 32), as kiln's T4 isolation
+/// named it: its kind, and the image it boots once one is chosen.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct Isolation {
+    /// `microvm`: a microVM of its own.
+    pub kind: String,
+    /// The image it boots, once chosen (step 31's choice per harness and project).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub image: Option<String>,
+}
+
+impl Isolation {
+    /// The kind every isolated session has today.
+    pub const MICROVM: &'static str = "microvm";
+
+    /// A microVM of its own, its image not yet chosen.
+    pub fn microvm() -> Self {
+        Self { kind: Self::MICROVM.to_owned(), image: None }
+    }
+}
+
 /// What to start.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Spec {
@@ -104,6 +127,11 @@ pub struct Spec {
     /// folder (`crate::workspace`), made on its machine before it starts and kept with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<crate::workspace::Workspace>,
+    /// How it's held when not as a process on its machine: in a microVM of its own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+    /// steps 17 and 32). Set from what was asked, or from its parent's: an isolated agent's agents
+    /// are isolated too. A machine that can't hold it so refuses it, never running it as a process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<Isolation>,
     /// What a person branched it from (`Command::Branch`): a session's id, or `<session>/<task>`
     /// for one of that session's harness's own subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +179,7 @@ impl Default for Spec {
             helper: None,
             subagent: false,
             workspace: None,
+            isolation: None,
             variant_of: None,
         }
     }
@@ -478,6 +507,10 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub workspace: Option<crate::workspace::Workspace>,
+    /// Its isolation, when it's held in a microVM of its own (as `Spec::isolation`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub isolation: Option<Isolation>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -1847,6 +1880,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         variant_of: spec.variant_of.clone(),
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
+        isolation: spec.isolation.clone(),
     };
     let (ctl, ctl_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
     let s = Arc::new(Session {
