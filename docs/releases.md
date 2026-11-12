@@ -153,9 +153,11 @@ whether a machine is set up. A signed binary keeps the build id it was handed ou
 too, and each runner brings the watcher up to date with its own kiln as it starts. An upgrade is
 done once the runner reports the commit it was upgraded to, even on a binary signed again since.
 
-Some runners still upgrade as before: those not under a supervisor (`kiln agent` run by hand), and
-Windows runners. On Unix they upgrade in place: the process re-executes itself, keeping its
-terminals and agent sessions. Otherwise they upgrade through `kiln install --agent --upgrade`.
+A runner not under a supervisor (`kiln agent` run by hand) still upgrades as before, through
+`kiln install --agent --upgrade`. A supervised runner keeps its agent sessions across an upgrade on
+every platform: on Linux it re-executes itself in place (keeping its terminals too); on macOS and
+Windows it hands its sessions to its supervisor, which starts the new binary as a fresh process
+(macOS keeps its terminals; Windows' restart, as ConPTY handover is a separate step).
 
 ## Version skew
 
@@ -380,9 +382,22 @@ one that doesn't is never switched to.
 - **macOS:** nothing re-executes itself. macOS's local network privacy stops recognising a
   process that replaced its own image, so after an in-place upgrade the runner's connections to
   the server failed with "No route to host" until kiln was started afresh. Instead, the runner
-  hands its terminals to its supervisor (`kiln supervise`) and exits, and the supervisor starts the
-  new binary as a fresh process that takes them over.
-- **Windows:** the supervisor restarts the runner (and its terminals).
+  hands its terminals **and its agent sessions' harness processes** to its supervisor
+  (`kiln supervise`) and exits, and the supervisor starts the new binary as a fresh process that
+  takes them over: the pipes and PTYs are passed across, not reopened, so a session's reply that
+  was streaming goes on and its shells keep running. A session whose process can't be handed over
+  stops and resumes from its record, as after a restart. (The supervisor from before this carried
+  terminals only; its runner's sessions resume from their records until the supervisor itself is
+  started afresh.)
+- **Windows:** nothing re-executes itself (Windows has no exec). As on macOS, the runner hands its
+  agent sessions' harness processes to its supervisor and exits, and the supervisor starts the new
+  binary as a fresh process that goes on with them. Windows has no `SCM_RIGHTS`: the runner writes
+  its harness handle values over a pipe the fresh runner inherits, and the supervisor duplicates
+  each into itself (so it holds the job, kill-on-close, across the gap and the harness isn't taken)
+  before it answers, so the runner exits knowing they are held. Its **terminals** (ConPTY) are not
+  handed over yet; they restart, as they always did. (The supervisor from before this restarted the
+  runner and its terminals; its runner's sessions resume from their records until the supervisor
+  itself is started afresh.)
 
 On macOS the launchd job (`~/Library/LaunchAgents/io.github.hyper-light.kiln-agent.plist`) runs a
 launcher, `~/.local/share/kiln/launcher/kiln-agent`: a copy of kiln that upgrades never replace,
