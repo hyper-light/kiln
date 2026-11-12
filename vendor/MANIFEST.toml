@@ -76,7 +76,7 @@ files = { "ld-musl-aarch64.so.1" = "/lib/ld-musl-aarch64.so.1", "libstdc++.so.6"
 [projects.quiver]
 kind = "git"
 repository = "https://github.com/hyper-light/quiver"
-commit = "1e8363be255ea2c748953fb560e49acb47587a4a"
+commit = "966ea139a18d590afd64cc3e30ba3807302d42b1"
 path = "vendor/quiver"
 exclude = ["vendor", "bench/records"]
 
@@ -104,7 +104,7 @@ own = ["UPSTREAM.md"]
 [projects.hyper-raft]
 kind = "git"
 repository = "https://github.com/hyper-light/hyper-raft"
-commit = "f45fc563e05736dae734452c8eb0f6fc12d7704a"
+commit = "fb74b59533908472ade7e526eb08117601cede0e"
 path = "vendor/hyper-raft"
 take = [
   "Cargo.toml",
@@ -193,7 +193,7 @@ own = ["UPSTREAM.md"]
 [projects.mantle]
 kind = "git"
 repository = "https://github.com/hyper-light/mantle"
-commit = "17eb8032710b8803d328a6c846a9dc1769660b98"
+commit = "87ab09e1c94149c7b669cb0de5975e228125c867"
 path = "vendor/mantle"
 exclude = [".github", ".kiln", "vendor", "docs", "loomdoc.html", "mantle-strata.svg", "mantle-strata-dark.svg", "mantle-strata-light.svg"]
 own = ["UPSTREAM.md"]

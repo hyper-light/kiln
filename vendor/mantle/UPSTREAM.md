@@ -4,19 +4,20 @@ kiln's store of bytes (docs/mantle.md; kiln's CP-T10.2): Mantle's crates, built 
 hyper-raft and of aws-lc-rs (CP-M1's one revision).
 
 - **Upstream:** https://github.com/hyper-light/mantle, branch `main`, commit
-  `17eb8032710b8803d328a6c846a9dc1769660b98` (2026-11-01), MIT (`LICENSE`): the head of Mantle's
-  main as kiln took it.
+  `87ab09e1c94149c7b669cb0de5975e228125c867` (2026-11-08), MIT (`LICENSE`): the head of Mantle's
+  main as kiln took it (2026-11-12; `17eb8032` before, 2026-11-01).
 - **What is here:** upstream's tree, at upstream's paths: its crates (`crates/*`), its root
   manifest and `Cargo.lock`, its toolchain, lint and format settings, its scripts, `README.md`,
   `CLAUDE.md` and `LICENSE`. Left out (`vendor/MANIFEST.toml`): its `vendor/`, its copies of
-  hyper-raft's crates (at `0a182ae`) and of aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0 with its changes
+  hyper-raft's crates (at `5e40eb9`) and of aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0 with its changes
   (upstream's `vendor/UPSTREAM.md`); its `docs/`, `loomdoc.html` and drawings; and its CI
   (`.github/`, `.kiln/`), which runs in Mantle's repository.
 - **What it builds on:**
-  - hyper-raft's shared crates at `0856e05`, vendored apart at `vendor/hyper-raft`: hyper-raft's
-    `main` (`22d5037`) merged with Mantle's line (`0a182ae`, the commit Mantle's `vendor/` takes),
-    so kiln, Quiver, Focal's bus and Mantle link one revision; hyper-rt from kiln's own copy of it,
-    `crates/kiln-rt`, taken from that revision (the third change below);
+  - hyper-raft's shared crates at `fb74b59`, vendored apart at `vendor/hyper-raft`: hyper-raft's
+    `main`, which holds what Mantle's `vendor/` takes (`5e40eb9`: Mantle's line `0a182ae` and the driver
+    fix `main` landed as `fb74b59`), so kiln, Quiver, Focal's bus and Mantle link one revision; hyper-rt
+    from kiln's own copy of it, `crates/kiln-rt`, with that revision's hyper-rt changes kiln takes (its
+    `ORIGIN.md`; the third change below);
   - aws-lc-rs 1.18.2 with Mantle's changes, vendored apart at `vendor/aws-lc-rs`, and aws-lc-sys
     0.46.0 from crates.io, which lacks three of Mantle's changes to it
     (`vendor/aws-lc-rs/UPSTREAM.md` says which).
@@ -24,7 +25,7 @@ hyper-raft and of aws-lc-rs (CP-M1's one revision).
   (below). kiln's workspace excludes `vendor/mantle`, so kiln's lints don't apply here and Mantle's
   do. Run in this folder, cargo takes Mantle's toolchain (`rust-toolchain.toml`, 1.98.1); kiln builds
   on stable (1.99.1). With `RUSTUP_TOOLCHAIN=stable`, `cargo clippy --workspace --all-targets
-  --all-features -- -D warnings` passes here at this commit (2026-11-01). Its only warnings are two
+  --all-features -- -D warnings` passes here at this commit (2026-11-12). Its only warnings are
   deprecations in hyper-rt, which is kiln's copy and outside this workspace.
 
 ## Changes from upstream
