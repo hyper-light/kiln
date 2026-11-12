@@ -1,0 +1,29 @@
+# step 27's merge, mode clippy, 2026-11-12T19:59:51Z, host kiln-a094a12d.attlocal.net Linux 6.19.10-300.fc44.x86_64 x86_64, rustc 1.99.1 (58cf8f9c3 2026-10-13), cargo 1.99.1 (5f94df478 2026-08-27)
+# branch b85b17c1640907cb38f67b6595a68ffc2a270cdb, kiln main 507069d4bea883c616d644f82e414990ad969d62
+# merged: e0cf2c44bbee92b86f9c94c8ca6447f445417717, tree 005013f624a9b2c2672f962cf100e1f19ece3d64, wanted 005013f624a9b2c2672f962cf100e1f19ece3d64
+## CLIPPY_GATE: ci/gate.sh -p kiln --cpus 4 --mem 24g --target-dir /home/adalundhe/.cache/s27s3/target clippy (from 19:59:51)
+ci/gate.sh: the gate of /home/adalundhe/.cache/s27s3/kiln at e0cf2c44b, natively on linux/x86_64
+asked: 4 CPUs, 24G of memory (from --cpus and --mem)
+caps: MemoryMax=24G CPUWeight=1 Nice=19 IOWeight=1 (systemd user unit kiln-gate-42200673d265-20261112T195951Z-2185845)
+cargo: -j 4, 4 test threads
+io weight: /dev/nvme1n1: not enforced, its scheduler is none and io.cost is off (root's, once: BFQ, or io.cost.qos enable=1)
+memory: each step's peak anonymous memory in its unit (memory.stat's anon: page cache left out), sampled every 2 s
+guard: the I/O pressure (full avg10) of kiln's services here (kiln-agent-01a14c4f-01a1576c-01a1b969.service, kiln.service) over 30, 3 checks running (10 s apart), yields (GATE: YIELDED, exit 75); its numbers are still to derive (ci/gate.sh says from what)
+scope: kiln
+  kiln: asked for (-p)
+steps:
+  1. clippy: cargo clippy --locked -p kiln --all-targets -j 4 -- -D warnings
+build: /home/adalundhe/.cache/s27s3/target; this run's git config and logs in /home/adalundhe/.cache/kiln-gate/42200673d265/runs/20261112T195951Z-2185845, its TMPDIR in /home/adalundhe/.cache/kiln-gate/42200673d265/t
+::: clippy: cargo clippy --locked -p kiln --all-targets -j 4 -- -D warnings
+    passed in 712 s, anonymous memory peak 22.6 GiB
+systemd-run, and the unit's stderr:
+  Running as unit: kiln-gate-42200673d265-20261112T195951Z-2185845.service; invocation ID: d2d35e3956fd41579df4db7d1a589882
+            Finished with result: success
+  Main processes terminated with: code=exited, status=0/SUCCESS
+                 Service runtime: 11min 51.789s
+               CPU time consumed: 20min 43.595s
+                     Memory peak: 24G (swap: 2.2G)
+GATE: PASS
+CLIPPY_GATE_EXIT=0 at 20:11:45
+# tree clean: 0 changes
+# done 2026-11-12T20:11:45Z

@@ -1,0 +1,28 @@
+# step 27's merge, mode clippy, 2026-11-12T20:33:21Z, host Jupiter MINGW64_NT-10.0-26200 3.6.10-5a1665c8.x86_64 x86_64, rustc 1.99.0 (b940084d7 2026-09-28), cargo 1.99.0 (5f94df478 2026-08-27)
+# branch 56fd06d5ce614e7f6b7a484e596f3aa816584aa4, kiln main 378327f4941081ce43355afb9a2519b7f7c9e69e
+Auto-merging crates/kiln/src/agentfiles/builtin.rs
+CONFLICT (content): Merge conflict in crates/kiln/src/agentfiles/builtin.rs
+Automatic merge failed; fix conflicts and then commit the result.
+# merge conflicts in: crates/kiln/src/agentfiles/builtin.rs 
+warning: in the working copy of 'crates/kiln/src/agentfiles/builtin.rs', LF will be replaced by CRLF the next time Git touches it
+# merged: 535aea33b7c48f84cb16e1b63c322dec815dde2a, tree f03a163784ae793978c5bd825fdd7c0db5750efa, wanted f03a163784ae793978c5bd825fdd7c0db5750efa
+## CLIPPY_GATE: ci/gate.sh -p kiln --cpus 8 --mem 16g --target-dir /c/Users/corph/.cache/s27gate/target clippy (from 20:33:26)
+ci/gate.sh: the gate of /c/Users/corph/.cache/s27gate/kiln at 535aea33b, natively on windows/x86_64
+asked: 8 CPUs, 16G of memory (from --cpus and --mem)
+caps: MemoryMax=16G CPUWeight=1 Nice=19 IOWeight=1 would apply, but this machine has no systemd user manager: it runs uncapped, at nice 19 (Idle priority)
+cargo: -j 8, 8 test threads
+env: AWS_LC_SYS_PREBUILT_NASM=1
+memory: none measured: from Git Bash, cargo's own children (rustc, the tests) and their memory aren't visible
+guard: none (no systemd here: no cgroups of its own to watch from)
+scope: kiln
+  kiln: asked for (-p)
+steps:
+  1. clippy: cargo clippy --locked -p kiln --all-targets -j 8 -- -D warnings
+build: /c/Users/corph/.cache/s27gate/target; this run's git config and logs in /c/Users/corph/.cache/kiln-gate/6d817bcc6395/runs/20261112T203327Z-26181, its TMPDIR in /c/Users/corph/.cache/kiln-gate/6d817bcc6395/t
+nice: cannot set niceness: Permission denied
+::: clippy: cargo clippy --locked -p kiln --all-targets -j 8 -- -D warnings
+    passed in 389 s
+GATE: PASS
+CLIPPY_GATE_EXIT=0 at 20:39:58
+# tree clean: 0 changes
+# done 2026-11-12T20:39:58Z

@@ -110,10 +110,15 @@ The probe's image on other bases, linux/amd64, on Linux:
 
 - **A signed-in turn.** No sign-in reaches any microVM here, so every turn ended "authentication
   failed or timed out". Step 33 brings the sign-in.
+- **agy's embedded ripgrep.** For searches, agy extracts a ripgrep it carries and runs it, unless
+  `ANTIGRAVITY_DISABLE_EMBEDDED_RIPGREP` is true (research f29). Where it extracts it, and whether it
+  runs from the harness's home volume, stayed unverified: a search needs a signed-in session.
 - **The fetcher on Google's own archives.** Step 3's live test covers it, on step 3's branch.
   Here, step4.sh laid the contexts out from the same pin, holding each bin/agy to the pin's member
   SHA-256.
-- **Step 5:** CI's prebuild, the registered digest, image() and its fallback.
+- **Step 5:** CI's prebuild, the registered digest, image() and its fallback. Step 19's own steps 6
+  (image()) and 7 (the CI workflow), which it plugs into, aren't on kiln main.
+- **ROOT's end-to-end runs (master step 34).** They're ROOT's, and none ran here.
 - **Reproducible images.** The Linux and Mac builds of one context differ: indexes cbab89ce… and
   a6f44701…, whose manifests differ by a few bytes each.
 - **IPv6.** Connects over IPv6 fail on Shards 8f3cd5b7, with the grants or without.

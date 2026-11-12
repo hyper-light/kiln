@@ -1,0 +1,21 @@
+# step 27's merge, mode clippy, 2026-11-12T19:43:26Z, host Adas-Mac-Studio.local Darwin 25.4.0 arm64, rustc 1.99.1 (58cf8f9c3 2026-10-13), cargo 1.99.1 (5f94df478 2026-08-27)
+# branch b85b17c1640907cb38f67b6595a68ffc2a270cdb, kiln main 507069d4bea883c616d644f82e414990ad969d62
+# merged: 4b27ed0f3f0abaca3c7a6bb4a905d126fff1625b, tree 005013f624a9b2c2672f962cf100e1f19ece3d64, wanted 005013f624a9b2c2672f962cf100e1f19ece3d64
+## CLIPPY_GATE: ci/gate.sh -p kiln --cpus 8 --mem 16g --target-dir /Users/adalundhe/.cache/s27gate/target clippy (from 19:45:37)
+ci/gate.sh: the gate of /Users/adalundhe/.cache/s27gate/kiln at 4b27ed0f3, natively on macos/arm64
+asked: 8 CPUs, 16G of memory (from --cpus and --mem)
+caps: MemoryMax=16G CPUWeight=1 Nice=19 IOWeight=1 would apply, but this machine has no systemd user manager: it runs uncapped, at nice 19
+cargo: -j 8, 8 test threads
+memory: each step's peak resident memory of its process tree (ps: shared pages and mapped files count, so it's above what it needs), sampled every 2 s
+guard: none (no systemd here: no cgroups of its own to watch from)
+scope: kiln
+  kiln: asked for (-p)
+steps:
+  1. clippy: cargo clippy --locked -p kiln --all-targets -j 8 -- -D warnings
+build: /Users/adalundhe/.cache/s27gate/target; this run's git config and logs in /Users/adalundhe/.cache/kiln-gate/97a18eee0a72/runs/20261112T194537Z-65040, its TMPDIR in /Users/adalundhe/.cache/kiln-gate/97a18eee0a72/t
+::: clippy: cargo clippy --locked -p kiln --all-targets -j 8 -- -D warnings
+    passed in 210 s, resident memory peak 21.7 GiB
+GATE: PASS
+CLIPPY_GATE_EXIT=0 at 19:49:07
+# tree clean:        0 changes
+# done 2026-11-12T19:49:07Z
