@@ -55,9 +55,6 @@
     "args": [
       "--version"
     ],
-    "env": [
-      "HOME=/tmp"
-    ],
     "stdout": "opencode v2.2.7"
   },
   "builds": [
