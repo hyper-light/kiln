@@ -2,8 +2,10 @@
 //! pi's shape are fetched from kiln's own HTTP server in the test: pi's tree with `pi/` stripped at the
 //! harness directory's root, then ripgrep's and fd's members at bin/. So are agy's (plan
 //! 01a1ce705e55753182217afdfe607de9, step 3): each archive's one entry, the member antigravity held
-//! alone, at bin/agy. Each archive the unpacker refuses comes back as its typed error, naming its URL and
-//! its entry, and leaves nothing behind.
+//! alone, at bin/agy. So are Devin's (plan 01a1ce705e4d7008993f5c7291ef4476, step 2), through kiln's own
+//! Agentfile and harness.json for it: each bundle a tree at the harness directory's root, stripped of
+//! nothing. Each archive the unpacker refuses comes back as its typed error, naming its URL and its entry,
+//! and leaves nothing behind; one of another digest or size is never opened.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -400,6 +402,236 @@ fn step26_an_agy_archive_failing_a_check_leaves_nothing() -> anyhow::Result<()> 
                 assert!(is(&u.why), "{what}: {:?}", u.why);
                 let shown = u.to_string();
                 assert!(shown.starts_with(&url) && entry.is_none_or(|e| shown.contains(e)), "{what}: {shown}");
+                let left = if ctx.exists() { names(ctx)? } else { BTreeSet::new() };
+                assert!(left.is_empty(), "{what}: left {left:?}");
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Devin's built-in (kiln plan 01a1ce705e4d7008993f5c7291ef4476, step 2) for a test: kiln's own Agentfile
+/// and harness.json for it, with a pin of `builds`.
+fn devin(builds: Vec<Value>) -> anyhow::Result<Builtin> {
+    let real = super::super::builtin::ALL.iter().find(|b| b.name == "harness-devin").ok_or_else(|| anyhow::anyhow!("kiln ships no harness-devin"))?;
+    let pin = json!({ "version": "3000.12.43", "verified": "by the test", "builds": builds }).to_string();
+    Ok(Builtin { name: real.name, harness: real.harness, text: real.text, pin: pin.leak(), files: real.files })
+}
+
+/// Devin's executable for `arch`, in small.
+fn devin_bin(arch: &str) -> Vec<u8> {
+    format!("#!/bin/sh\necho 'devin 3000.12.43 {arch}'\n").into_bytes()
+}
+
+/// Devin's bundle for `arch`, in small, as Cognition's 3000.12.43 bundles begin (step 2's raw headers:
+/// directories and regular files alone, no `./` and no leading directory): bin/devin at 0755 and its
+/// documents at 0644 under share/, each directory listed before what it holds.
+fn devin_tree(arch: &str) -> Vec<E> {
+    vec![
+        dir("bin/"),
+        file("bin/devin", 0o755, &devin_bin(arch)),
+        dir("share/"),
+        dir("share/devin/"),
+        dir("share/devin/docs/"),
+        file("share/devin/docs/adaptive.mdx", 0o644, b"# Adaptive\n"),
+    ]
+}
+
+/// The URL path of Devin's bundle for `arch` on the test's server.
+fn devin_path(arch: &str) -> String {
+    format!("/cli/3000.12.43/devin-{arch}.tar.gz")
+}
+
+/// One platform of Devin's shape as its pin.sh pins it: the bundle at `.`, by `sha256` and `size`, a tree
+/// stripped of nothing, of `totals`; the test's server serves `gz` for it.
+fn devin_build(origin: &str, arch: &str, gz: Vec<u8>, sha256: &str, size: usize, totals: (u64, u64)) -> (Vec<(String, Vec<u8>)>, Value) {
+    let file = json!({ "url": format!("{origin}{}", devin_path(arch)), "sha256": sha256, "size": size, "path": ".",
+        "unpack": { "format": "tar.gz", "strip": 0, "unpacked_bytes": totals.1, "entries": totals.0 } });
+    (vec![(devin_path(arch), gz)], json!({ "platform": format!("linux/{arch}"), "files": [file] }))
+}
+
+/// `arch`'s Devin bundle served and pinned as it is.
+fn devin_as_pinned(origin: &str, arch: &str) -> anyhow::Result<(Vec<(String, Vec<u8>)>, Value)> {
+    let tree = devin_tree(arch);
+    let gz = targz(&tree)?;
+    let (sha256, size) = (sha(&gz), gz.len());
+    Ok(devin_build(origin, arch, gz, &sha256, size, totals(&tree)))
+}
+
+/// Every path under `root`, relative to it with `/` between names, directories included.
+fn walk(root: &Path) -> anyhow::Result<BTreeSet<String>> {
+    let (mut found, mut todo) = (BTreeSet::new(), vec![root.to_path_buf()]);
+    while let Some(dir) = todo.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let rel = entry.path().strip_prefix(root)?.iter().map(|n| n.to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
+            if entry.file_type()?.is_dir() {
+                todo.push(entry.path());
+            }
+            found.insert(rel);
+        }
+    }
+    Ok(found)
+}
+
+/// A context of Devin's shape for linux/amd64 and linux/arm64, made through kiln's own Agentfile for it,
+/// holds the Agentfile, devin-amd64/ and devin-arm64/, and nothing else. Each holds bin/devin, its own
+/// arch's bytes (size and SHA-256 as the bundle holds them) at 0755, share/ as the bundle holds it, and
+/// kiln's harness.json, and nothing else: no archive, no distribution marker, no staging directory, no
+/// temporary file.
+#[test]
+fn step25_a_devin_shaped_context_holds_bin_devin_share_and_harness_json_alone() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let mut builds = Vec::new();
+        let origin = serve(|o| {
+            let mut routes = Vec::new();
+            for arch in ["amd64", "arm64"] {
+                let (r, b) = devin_as_pinned(o, arch)?;
+                routes.extend(r);
+                builds.push(b);
+            }
+            Ok(routes)
+        })
+        .await?;
+        let b = devin(builds)?;
+        let harness = b.files.iter().find(|(name, _)| *name == "harness.json").map(|(_, text)| *text).ok_or_else(|| anyhow::anyhow!("no harness.json"))?;
+        let tmp = tempfile::tempdir()?;
+        let ctx = tmp.path().join("ctx");
+
+        let made = materialize(&b, &both(), None, &ctx).await?;
+
+        assert_eq!(made, [ctx.join("devin-amd64"), ctx.join("devin-arm64")], "from {origin}");
+        assert_eq!(names(&ctx)?, set(["Agentfile", "devin-amd64", "devin-arm64"]));
+        assert_eq!(std::fs::read_to_string(ctx.join("Agentfile"))?, b.text);
+        for arch in ["amd64", "arm64"] {
+            let d = ctx.join(format!("devin-{arch}"));
+            assert_eq!(walk(&d)?, set(["bin", "bin/devin", "harness.json", "share", "share/devin", "share/devin/docs", "share/devin/docs/adaptive.mdx"]), "{arch}");
+            let devin = std::fs::read(d.join("bin/devin"))?;
+            assert_eq!((devin.len(), sha(&devin)), (devin_bin(arch).len(), sha(&devin_bin(arch))), "{arch}");
+            assert_eq!(std::fs::read_to_string(d.join("harness.json"))?, harness, "{arch}");
+            #[cfg(unix)]
+            {
+                for (path, bits) in [("bin", 0o755), ("bin/devin", 0o755), ("share", 0o755), ("share/devin/docs", 0o755), ("share/devin/docs/adaptive.mdx", 0o644)] {
+                    assert_eq!(mode(&d.join(path))?, bits, "{arch}: {path}");
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A Devin bundle whose SHA-256 or size isn't its pin's is refused as it arrives and never opened.
+/// arm64's URL serves a bundle whose first entry is a symlink: pinned as it is (the control), the
+/// unpacker opens it and refuses that entry; pinned with another SHA-256, or a size larger or smaller,
+/// the fetcher names the URL and the digest or size pinned and found instead. Each comes after amd64's
+/// directory was made, and leaves nothing in the context's directory.
+#[test]
+fn step25_a_devin_bundle_of_another_digest_or_size_is_never_opened() -> anyhow::Result<()> {
+    type Is = Box<dyn Fn(&Error) -> bool + Send>;
+    let served = targz(&[link("bin/devin", EntryType::Symlink, "/bin/sh"), dir("share/")])?;
+    let (len, digest) = (served.len(), sha(&served));
+    let (n, other) = (len as u64, sha(&targz(&devin_tree("arm64"))?));
+    let (pinned, found) = (other.clone(), digest.clone());
+    let cases: Vec<(&str, String, usize, Is)> = vec![
+        ("as pinned (the control)", digest.clone(), len, Box::new(|e: &Error| matches!(e, Error::Unpack(u) if u.entry.as_deref() == Some("bin/devin") && matches!(u.why, Why::Link)))),
+        ("another SHA-256", other, len, Box::new(move |e: &Error| matches!(e, Error::Digest { expected, observed, .. } if *expected == pinned && *observed == found))),
+        ("a size larger than served", digest.clone(), len + 1, Box::new(move |e: &Error| matches!(e, Error::Size { expected, observed, .. } if *expected == n + 1 && *observed == n))),
+        ("a size smaller than served", digest.clone(), len.saturating_sub(1), Box::new(move |e: &Error| matches!(e, Error::Size { expected, observed, .. } if *expected == n - 1 && *observed > *expected))),
+    ];
+    for (what, sha256, size, is) in cases {
+        let served = served.clone();
+        crate::rt::block_on(async move {
+            let mut builds = Vec::new();
+            let origin = serve(|o| {
+                let (mut routes, b) = devin_as_pinned(o, "amd64")?;
+                builds.push(b);
+                let (r, b) = devin_build(o, "arm64", served, &sha256, size, totals(&devin_tree("arm64")));
+                routes.extend(r);
+                builds.push(b);
+                Ok(routes)
+            })
+            .await?;
+            let b = devin(builds)?;
+            let url = format!("{origin}{}", devin_path("arm64"));
+            let tmp = tempfile::tempdir()?;
+            let (absent, empty) = (tmp.path().join("absent"), tmp.path().join("empty"));
+            std::fs::create_dir(&empty)?;
+            for ctx in [&absent, &empty] {
+                let refused = materialize(&b, &both(), None, ctx).await;
+                let Err(e) = refused else {
+                    anyhow::bail!("{what}: {:?}, not refused", refused.map(|m| m.len()));
+                };
+                let named = match &e {
+                    Error::Unpack(u) => u.url.as_str(),
+                    Error::Digest { url, .. } | Error::Size { url, .. } => url.as_str(),
+                    _ => "",
+                };
+                assert_eq!(named, url, "{what}: {e}");
+                assert!(is(&e), "{what}: {e:?}");
+                let left = if ctx.exists() { names(ctx)? } else { BTreeSet::new() };
+                assert!(left.is_empty(), "{what}: left {left:?}");
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Each Devin bundle the unpacker refuses comes back as its typed error, naming the pinned URL and the
+/// entry at fault, at Devin's strip 0: a symlink, a hard link, a character or a block device, a FIFO, an
+/// absolute path, a `..` path, harness.json at its root (where kiln writes the harness's own), and an entry
+/// or a byte fewer than pinned. Each is arm64's, after amd64's directory was made, and leaves nothing in
+/// the context's directory.
+#[test]
+fn step25_a_devin_bundle_the_unpacker_refuses_leaves_nothing() -> anyhow::Result<()> {
+    type Is = Box<dyn Fn(&Why) -> bool + Send>;
+    let with = |extra: E| {
+        let mut t = devin_tree("arm64");
+        t.insert(2, extra);
+        t
+    };
+    let node = |name: &str, kind: EntryType| E { name: name.into(), kind, mode: 0o644, data: Vec::new(), link: None };
+    let (n, bytes) = totals(&devin_tree("arm64"));
+    let cases: Vec<(&str, Vec<E>, Option<(u64, u64)>, Option<&str>, Is)> = vec![
+        ("a symlink", with(link("bin/devin-link", EntryType::Symlink, "devin")), None, Some("bin/devin-link"), Box::new(|w: &Why| matches!(w, Why::Link))),
+        ("a hard link", with(link("bin/devin-hard", EntryType::Link, "bin/devin")), None, Some("bin/devin-hard"), Box::new(|w: &Why| matches!(w, Why::Link))),
+        ("a character device", with(node("share/null", EntryType::Char)), None, Some("share/null"), Box::new(|w: &Why| matches!(w, Why::Device))),
+        ("a block device", with(node("share/disk", EntryType::Block)), None, Some("share/disk"), Box::new(|w: &Why| matches!(w, Why::Device))),
+        ("a FIFO", with(node("share/fifo", EntryType::Fifo)), None, Some("share/fifo"), Box::new(|w: &Why| matches!(w, Why::Device))),
+        ("an absolute path", with(file("/etc/devin", 0o755, b"x\n")), None, Some("/etc/devin"), Box::new(|w: &Why| matches!(w, Why::Escapes))),
+        ("a .. path", with(file("../devin", 0o755, b"x\n")), None, Some("../devin"), Box::new(|w: &Why| matches!(w, Why::Escapes))),
+        ("a .. path under share/", with(file("share/../../devin", 0o755, b"x\n")), None, Some("share/../../devin"), Box::new(|w: &Why| matches!(w, Why::Escapes))),
+        ("harness.json at its root", with(file("harness.json", 0o644, b"{}\n")), None, Some("harness.json"), Box::new(|w: &Why| matches!(w, Why::HarnessFile))),
+        ("an entry fewer than pinned", devin_tree("arm64"), Some((n + 1, bytes)), None, Box::new(move |w: &Why| matches!(w, Why::Entries { expected, got } if *expected == n + 1 && *got == n))),
+        ("a byte fewer than pinned", devin_tree("arm64"), Some((n, bytes + 1)), None, Box::new(move |w: &Why| matches!(w, Why::Bytes { expected, got } if *expected == bytes + 1 && *got == bytes))),
+    ];
+    for (what, tree, pinned, entry, is) in cases {
+        crate::rt::block_on(async move {
+            let mut builds = Vec::new();
+            let origin = serve(|o| {
+                let (mut routes, b) = devin_as_pinned(o, "amd64")?;
+                builds.push(b);
+                let gz = targz(&tree)?;
+                let (sha256, size) = (sha(&gz), gz.len());
+                let (r, b) = devin_build(o, "arm64", gz, &sha256, size, pinned.unwrap_or_else(|| totals(&tree)));
+                routes.extend(r);
+                builds.push(b);
+                Ok(routes)
+            })
+            .await?;
+            let b = devin(builds)?;
+            let url = format!("{origin}{}", devin_path("arm64"));
+            let tmp = tempfile::tempdir()?;
+            let (absent, empty) = (tmp.path().join("absent"), tmp.path().join("empty"));
+            std::fs::create_dir(&empty)?;
+            for ctx in [&absent, &empty] {
+                let refused = materialize(&b, &both(), None, ctx).await;
+                let Err(Error::Unpack(u)) = refused else {
+                    anyhow::bail!("{what}: {:?}, not the unpacker's refusal", refused.map(|m| m.len()));
+                };
+                assert_eq!((u.url.as_str(), u.entry.as_deref()), (url.as_str(), entry), "{what}: {u}");
+                assert!(is(&u.why), "{what}: {:?}", u.why);
                 let left = if ctx.exists() { names(ctx)? } else { BTreeSet::new() };
                 assert!(left.is_empty(), "{what}: left {left:?}");
             }

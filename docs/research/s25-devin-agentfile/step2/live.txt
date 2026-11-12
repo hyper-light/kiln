@@ -1,0 +1,34 @@
+# kiln agentfiles context devin, live: Cognition's pinned bundles fetched and unpacked by kiln's one unpacker,
+# each per-arch directory then held to its bundle as the bundle itself lists and holds it (live.sh)
+#
+# Kiln plan 01a1ce705e4d7008993f5c7291ef4476 (step 25 of 01a1cd8e862e7169a074db3d5fa33f3d), step 2. Ran on
+# adacachy (Linux 7.2.9-2-cachyos x86_64, 32 cores) over ssh, as systemd --user units, in a scratch clone of
+# kiln main 3a4b09005 with this step's change applied (~/.cache/s25-devin-tree-pin, removed after). pin.sh sha256
+# 4cc09f930a07b5198f900f82a94298c438bdb90e050929d67ca4c1eb17b70d6c and pin-tests.sh sha256
+# 21faaad2239a84fd3e0d138d6dbafff217a4ac5450bd84bbd2632877ccf059c3, as committed. job.sh and live.sh beside this
+# file ran them; `===` lines are job.sh's.
+# The line after the `agentfiles context` command is the recipe it printed. Compiler lines and the vendored
+# focal-memory's deprecation warnings are left out.
+
+== kiln 3a4b090054c59dc50eee8e196d78a52cbf749234 with the change applied; Linux 7.2.9-2-cachyos x86_64; tar (GNU tar) 1.35
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7m 27s
+== /home/adalundhe/.cache/s25-devin-tree-pin/target/debug/kiln agentfiles context devin /home/adalundhe/.cache/s25-devin-tree-pin/ctx-20261112T223723Z --platform linux/amd64,linux/arm64
+8211452fae0492a7e0ba9c173c1ad1a5bfd1e4b7950759dff97e7351d9cd4dcb
+== /home/adalundhe/.cache/s25-devin-tree-pin/ctx-20261112T223723Z holds: Agentfile devin-amd64 devin-arm64 
+Agentfile is kiln's
+-- amd64: https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-x86_64-unknown-linux.tar.gz downloaded again, sha256 6a19997b5fc2d6ba1a8c341d4e2b12f1b78cad5d415ee9c0ca413a8d52a99562, 71424183 bytes, as pinned
+-- /home/adalundhe/.cache/s25-devin-tree-pin/ctx-20261112T223723Z/devin-amd64 holds: bin harness.json share ; bin/ holds: devin 
+-- amd64: 251 paths, exactly the bundle's 250 entries and harness.json
+-- amd64: bin/devin mode 755, 209662952 bytes, sha256 1e5e27535f2e7ee19d4bfbec95096361e539aeec5f2a5a9cbacdfb89bf050ad9; the bundle's: 209662952 bytes, sha256 1e5e27535f2e7ee19d4bfbec95096361e539aeec5f2a5a9cbacdfb89bf050ad9
+-- amd64: every file's bytes are the bundle's
+-- amd64: harness.json is kiln's
+-- amd64: set-ID or sticky: 0; kinds and modes:  16 d755; 234 f644; 1 f755;
+-- arm64: https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-aarch64-unknown-linux.tar.gz downloaded again, sha256 1eaa07d2181ed26f5789cf6b3617d39a2459c25f1bc5a51cc5cc703db7f95274, 67806876 bytes, as pinned
+-- /home/adalundhe/.cache/s25-devin-tree-pin/ctx-20261112T223723Z/devin-arm64 holds: bin harness.json share ; bin/ holds: devin 
+-- arm64: 251 paths, exactly the bundle's 250 entries and harness.json
+-- arm64: bin/devin mode 755, 191963936 bytes, sha256 b6028024158c34b16e694f13b568850ca6d62ae752bfd2feb5042719aaf8712f; the bundle's: 191963936 bytes, sha256 b6028024158c34b16e694f13b568850ca6d62ae752bfd2feb5042719aaf8712f
+-- arm64: every file's bytes are the bundle's
+-- arm64: harness.json is kiln's
+-- arm64: set-ID or sticky: 0; kinds and modes:  16 d755; 234 f644; 1 f755;
+== live check PASSED

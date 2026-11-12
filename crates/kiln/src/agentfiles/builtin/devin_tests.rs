@@ -7,6 +7,7 @@
 use serde_json::Value;
 
 use super::{ALL, Builtin};
+use crate::agentfiles::unpack::{Fields, Spec, Tree};
 use crate::harness::kinds::{Kind, Protocol};
 
 fn devin() -> anyhow::Result<&'static Builtin> {
@@ -38,8 +39,9 @@ fn is_sha256(s: &str) -> bool {
 /// What's wrong with Devin's pin (kiln plan 01a1ce705e4d7008993f5c7291ef4476, step 1): its version
 /// X.Y.Z, read from Cognition's manifest of that version (its SHA-256 kept); the base by digest; and
 /// exactly one build for each of linux/amd64 and linux/arm64, each that version's bundle for its
-/// architecture, with its size and SHA-256, unpacked as a tar.gz at its harness's directory (research
-/// f4, f6).
+/// architecture, with its size and SHA-256, unpacked at its harness's directory as kiln's one unpacker
+/// takes a tree: read as the fetcher reads it, stripped of nothing (its bin/ and share/ are the
+/// directory's), its entries and bytes pinned (research f4, f6).
 fn devin_pin_problems(pin: &Value) -> Vec<String> {
     let mut problems = Vec::new();
     let version = text(pin, "/version");
@@ -77,20 +79,26 @@ fn devin_pin_problems(pin: &Value) -> Vec<String> {
         if file.get("size").and_then(Value::as_u64).unwrap_or(0) == 0 {
             problems.push(format!("{file}: no size"));
         }
-        if text(file, "/path") != "." || text(file, "/unpack/format") != "tar.gz" {
-            problems.push(format!("{file}: not unpacked as a tar.gz at the harness's directory"));
+        if text(file, "/path") != "." {
+            problems.push(format!("{file}: not at the harness's directory"));
+        }
+        let unpack = file.get("unpack").cloned().map(serde_json::from_value::<Fields>).and_then(Result::ok).map(Spec::try_from);
+        if !matches!(unpack, Some(Ok(Spec::Tree(Tree { strip: 0, unpacked_bytes: 1.., entries: 1.. })))) {
+            problems.push(format!("{file}: not a tar.gz tree the one unpacker takes, stripped of nothing"));
         }
     }
     problems
 }
 
-/// Devin's pin names Cognition's two Linux bundles of one version, each unpacked; a pin with a short
-/// digest, a platform missing or a bundle not unpacked is refused (plan step 3's test).
+/// Devin's pin names Cognition's two Linux bundles of one version, each a tree the one unpacker takes;
+/// a pin with a short digest, a platform missing, a bundle not unpacked, an unpack the unpacker
+/// refuses or a bundle stripped of a name is refused (plan step 3's test; step 2's, once the one
+/// unpacker landed).
 #[test]
 fn step25_devins_pin_is_cognitions_two_linux_bundles() -> anyhow::Result<()> {
     let pin: Value = serde_json::from_str(devin()?.pin)?;
     assert_eq!(devin_pin_problems(&pin), Vec::<String>::new());
-    let mutants: [(&str, fn(&mut Value)); 3] = [
+    let mutants: [(&str, fn(&mut Value)); 5] = [
         ("a 63-character digest", |p| {
             if let Some(s) = p.pointer_mut("/builds/0/files/0/sha256") {
                 *s = Value::from("0".repeat(63));
@@ -104,6 +112,16 @@ fn step25_devins_pin_is_cognitions_two_linux_bundles() -> anyhow::Result<()> {
         ("a bundle not unpacked", |p| {
             if let Some(file) = p.pointer_mut("/builds/1/files/0").and_then(Value::as_object_mut) {
                 file.remove("unpack");
+            }
+        }),
+        ("an unpack the one unpacker refuses (no entries)", |p| {
+            if let Some(unpack) = p.pointer_mut("/builds/0/files/0/unpack").and_then(Value::as_object_mut) {
+                unpack.remove("entries");
+            }
+        }),
+        ("a bundle stripped of a name", |p| {
+            if let Some(strip) = p.pointer_mut("/builds/1/files/0/unpack/strip") {
+                *strip = Value::from(1);
             }
         }),
     ];

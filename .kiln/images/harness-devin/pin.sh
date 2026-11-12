@@ -12,6 +12,12 @@
 # written only once every check has passed. Should a signature file appear, or whether one exists
 # be unknown, pin.sh refuses, so that checking it gets added rather than skipped.
 #
+# Each bundle is pinned as kiln's one unpacker takes a tree (crates/kiln/src/agentfiles/unpack.rs,
+# the form steps 26 and 27 agreed): `strip` 0, since the bundle's bin/ and share/ sit at the
+# harness directory's root; `entries`, its directories and regular files as tar --list lists them;
+# and `unpacked_bytes`, its regular files' sizes as tar --list --verbose gives them. The unpacker
+# counts both again as it unpacks and refuses a bundle whose totals differ.
+#
 # Needs Linux: bash, curl, sha256sum and GNU tar. DEVIN_PIN_BASE replaces
 # https://static.devin.ai/cli for pin-tests.sh alone, which serves its fixtures over HTTPS from
 # 127.0.0.1, its certificate trusted through CURL_CA_BUNDLE.
@@ -146,7 +152,7 @@ for u in "${probes[@]}"; do
 done
 say "no signature: each of ${#probes[@]} URLs answers 403 or 404 ($n403 answered 403, $n404 answered 404): $base/$v/SHA256SUMS, and .sig, .asc, .sha256 and .sigstore.json beside the manifest and both bundles"
 
-sizes=()
+sizes=() entries=() unpacked=()
 for i in "${!targets[@]}"; do
     t=${targets[i]} url=${urls[i]} sha=${shas[i]}
     f=$work/devin-$v-$t.tar.gz
@@ -159,11 +165,16 @@ for i in "${!targets[@]}"; do
     tar --list --gzip --absolute-names --quoting-style=escape --file="$f" >"$work/names" 2>"$work/err" || die "list: tar could not list $url: $(<"$work/err")"
     tar --list --verbose --numeric-owner --gzip --absolute-names --quoting-style=escape --file="$f" >"$work/long" 2>"$work/err" || die "list: tar could not list $url: $(<"$work/err")"
     (($(wc -l <"$work/names") == $(wc -l <"$work/long"))) || die "list: tar's two listings of $url disagree"
-    files=0 dirs=0 devin=
+    files=0 dirs=0 bytes=0 devin=
     while IFS= read -r path <&3 && IFS= read -r line <&4; do
         mode=${line%% *}
         case ${mode:0:1} in
-        -) files=$((files + 1)) ;;
+        -)
+            files=$((files + 1))
+            read -r _ _ length _ <<<"$line"
+            [[ $length =~ ^[0-9]+$ ]] || die "list: tar lists $path in $url with the size $length"
+            bytes=$((bytes + length))
+            ;;
         d) dirs=$((dirs + 1)) ;;
         *) die "entry-type: $url holds $path, which is neither a directory nor a regular file ($mode)" ;;
         esac
@@ -176,7 +187,8 @@ for i in "${!targets[@]}"; do
         fi
     done 3<"$work/names" 4<"$work/long"
     [[ -n $devin ]] || die "bin-devin: $url holds no bin/devin"
-    say "${platforms[i]} ($t): $url, sha256 $got as the manifest gives it, $size bytes; $files regular files and $dirs directories, bin/devin $devin"
+    entries+=("$((files + dirs))") unpacked+=("$bytes")
+    say "${platforms[i]} ($t): $url, sha256 $got as the manifest gives it, $size bytes; $files regular files and $dirs directories ($((files + dirs)) entries) of $bytes bytes, bin/devin $devin"
 done
 
 json() {
@@ -191,7 +203,7 @@ json() {
         ((i + 1 < ${#targets[@]})) || sep=
         printf '    {\n      "platform": "%s",\n      "files": [\n        {\n' "${platforms[i]}"
         printf '          "url": "%s",\n          "sha256": "%s",\n          "size": %s,\n' "${urls[i]}" "${shas[i]}" "${sizes[i]}"
-        printf '          "path": ".",\n          "unpack": {\n            "format": "tar.gz"\n          }\n        }\n      ]\n    }%s\n' "$sep"
+        printf '          "path": ".",\n          "unpack": {\n            "format": "tar.gz",\n            "strip": 0,\n            "unpacked_bytes": %s,\n            "entries": %s\n          }\n        }\n      ]\n    }%s\n' "${unpacked[i]}" "${entries[i]}" "$sep"
     done
     printf '  ]\n}\n'
 }
