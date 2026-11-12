@@ -2671,6 +2671,25 @@ impl Host {
     /// included ([`Host::restore`]). One that can't be handed over is stopped, and starts again
     /// there from its record (its conversation goes on). Returns how many were handed over.
     pub async fn hand_over_all(&self) -> Result<usize, String> {
+        Ok(self.hand_over_all_inner(true).await?.len())
+    }
+
+    /// Like [`Host::hand_over_all`], but for a successor upgrade (macOS and Windows take a new binary
+    /// up as a fresh process, not a re-exec): the sessions are handed over and their detached
+    /// descriptors returned, ordered by session id, for the supervisor to carry to the fresh runner,
+    /// which re-maps them in the same order ([`Host::restore`], [`os::supervise::to_supervisor`]).
+    /// A session that can't be handed over stops and resumes from its record, as in place.
+    pub async fn hand_over_all_for_successor(&self) -> Result<Vec<crate::proc::Detached>, String> {
+        Ok(self.hand_over_all_inner(false).await?.into_values().map(|h| h.process).collect())
+    }
+
+    /// The shared work of [`Host::hand_over_all`] and [`Host::hand_over_all_for_successor`]: hand
+    /// each session's harness process over, write the handover record, and return the handed
+    /// sessions ordered by id (so a successor hands their descriptors over in that order).
+    /// `keep_across_exec` clears close-on-exec on the pipes for an in-place re-exec; a successor
+    /// carries them a different way (the supervisor's duplicated/inherited descriptors) and keeps
+    /// nothing across an exec.
+    async fn hand_over_all_inner(&self, keep_across_exec: bool) -> Result<std::collections::BTreeMap<String, Box<session::Handed>>, String> {
         let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
         self.save_checked().map_err(|_| "the active sessions could not be durably recorded before handover".to_owned())?;
         let prepared = futures::future::join_all(sessions.iter().map(|s| async move { (Arc::clone(s), s.hand_over().await) })).await;
@@ -2686,7 +2705,8 @@ impl Host {
             self.resume_prepared(handed).await?;
             return Err(why);
         }
-        let mut out: HashMap<String, Box<session::Handed>> = HashMap::new();
+        // Ordered by id, so a successor's descriptors and the fresh runner's re-mapping agree.
+        let mut out: std::collections::BTreeMap<String, Box<session::Handed>> = std::collections::BTreeMap::new();
         for (s, h) in handed {
             match h {
                 Some(h) => {
@@ -2702,7 +2722,6 @@ impl Host {
             }
         }
         self.save_now();
-        let n = out.len();
         if let Some(path) = self.handover_path() {
             let wrote = serde_json::to_vec(&out).map_err(std::io::Error::other).and_then(|json| crate::util::write_secret(&path, &json, 0o600));
             if let Err(e) = wrote {
@@ -2717,13 +2736,15 @@ impl Host {
             }
             // Their pipes kept open across the exec that comes next, only now: a process started
             // while they were handed over would hold them for good.
-            for (id, h) in &out {
-                if let Err(e) = h.process.keep_across_exec() {
-                    tracing::warn!(session = %id, error = %e, "an agent session's pipes can't be kept across the upgrade: it starts again after it");
+            if keep_across_exec {
+                for (id, h) in &out {
+                    if let Err(e) = h.process.keep_across_exec() {
+                        tracing::warn!(session = %id, error = %e, "an agent session's pipes can't be kept across the upgrade: it starts again after it");
+                    }
                 }
             }
         }
-        Ok(n)
+        Ok(out)
     }
 
     /// Every session, handed to another runner process of this machine (a blue/green upgrade,
@@ -2919,10 +2940,20 @@ impl Host {
         let Some(path) = self.handover_path() else { return HashMap::new() };
         let Ok(raw) = std::fs::read(&path) else { return HashMap::new() };
         let _ = std::fs::remove_file(&path);
-        serde_json::from_slice(&raw).unwrap_or_else(|e| {
+        let mut map: HashMap<String, Box<session::Handed>> = serde_json::from_slice(&raw).unwrap_or_else(|e| {
             tracing::warn!(error = %e, file = %path.display(), "unreadable agent session handover: they start again");
             HashMap::new()
-        })
+        });
+        // A successor upgrade (macOS, Windows): the descriptors in the record are the previous
+        // runner's, not this process's. The supervisor carried the real ones to this process and
+        // named them in the environment, three per session on Unix (five on Windows: the process
+        // and job handles too), in the order the sessions were handed (sorted by id), which this
+        // re-maps the same way. An in-place re-exec (Linux) carries the descriptors at their own
+        // numbers, so nothing is named and nothing is re-mapped.
+        if let Some(carried) = crate::os::supervise::handed_sessions() {
+            remap_handed(&mut map, &carried);
+        }
+        map
     }
 
     /// Continue the sessions recorded before a restart (`restore_from`, without the conversation
@@ -3581,6 +3612,48 @@ fn kept_seed(store: &crate::convo::store::Store, id: &str) -> Option<session::Se
     Some(session::Seed { events, state, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: false })
 }
 
+/// Re-map the handed sessions' descriptors from what the supervisor carried to this process across
+/// a successor upgrade (Unix: three pipes per session; the record's are the previous runner's).
+/// The sessions are taken in id order, the order they were handed over, so each gets its own.
+#[cfg(unix)]
+fn remap_handed(map: &mut HashMap<String, Box<session::Handed>>, carried: &[i64]) {
+    let mut ids: Vec<String> = map.keys().cloned().collect();
+    ids.sort();
+    for (i, id) in ids.iter().enumerate() {
+        let Some(h) = map.get_mut(id) else { continue };
+        if let Some(&[stdin, stdout, stderr]) = carried.get(i * 3..i * 3 + 3) {
+            h.process.stdin = stdin as i32;
+            h.process.stdout = stdout as i32;
+            h.process.stderr = stderr as i32;
+            // The harness is this process's to serve but not its child: watched, not reaped.
+            h.process.foreign = true;
+        } else {
+            tracing::warn!(session = %id, "an agent session's pipes did not come across the upgrade; it starts again from its record");
+        }
+    }
+}
+
+/// Re-map the handed sessions' descriptors from what the supervisor carried to this process across
+/// a successor upgrade (Windows: five handles per session — three pipes, the process and the job).
+#[cfg(windows)]
+fn remap_handed(map: &mut HashMap<String, Box<session::Handed>>, carried: &[i64]) {
+    let mut ids: Vec<String> = map.keys().cloned().collect();
+    ids.sort();
+    for (i, id) in ids.iter().enumerate() {
+        let Some(h) = map.get_mut(id) else { continue };
+        if let Some(&[stdin, stdout, stderr, process, job]) = carried.get(i * 5..i * 5 + 5) {
+            h.process.stdin = stdin;
+            h.process.stdout = stdout;
+            h.process.stderr = stderr;
+            h.process.process = process;
+            h.process.job = job;
+            h.process.foreign = true;
+        } else {
+            tracing::warn!(session = %id, "an agent session's handles did not come across the upgrade; it starts again from its record");
+        }
+    }
+}
+
 /// SIGTERM a harness's process group, then SIGKILL it if it is still there after 3 s.
 #[cfg(unix)]
 pub(crate) fn stop_process(pid: u32) {
@@ -3733,6 +3806,35 @@ mod tests {
     use super::*;
     use kiln_seams::clock::SimClock;
     use crate::util::Must as _;
+
+    /// A1 (step 30's follow-up): across a successor upgrade, the fresh runner gives each handed
+    /// session the descriptors the supervisor carried, in session-id order (the order the runner
+    /// before it handed them in, `Host::hand_over_all_for_successor`), each marked foreign (the
+    /// fresh runner isn't the harness's parent); a session the carried list has none for keeps what
+    /// its record says, and starts again from it.
+    #[cfg(unix)]
+    #[test]
+    fn a1_carried_descriptors_go_to_their_sessions_in_id_order() {
+        let handed = |stdin: i32| {
+            Box::new(session::Handed {
+                kind: "claude".into(),
+                process: crate::proc::Detached { pid: 1, stdin, stdout: stdin + 1, stderr: stdin + 2, foreign: false },
+                core: crate::harness::core::Core::new().freeze(),
+                adapter: crate::harness::kinds::Frozen::Claude(Box::new(crate::harness::claude::Claude::new(false))),
+                partial: String::new(),
+            })
+        };
+        let mut map: HashMap<String, Box<session::Handed>> = HashMap::new();
+        map.insert("b".into(), handed(100));
+        map.insert("a".into(), handed(200));
+        map.insert("c".into(), handed(300));
+        // Carried for the first two sessions in id order only (a, then b): c had none.
+        remap_handed(&mut map, &[10, 11, 12, 20, 21, 22]);
+        let pipes = |id: &str| map.get(id).map(|h| (h.process.stdin, h.process.stdout, h.process.stderr, h.process.foreign));
+        assert_eq!(pipes("a"), Some((10, 11, 12, true)));
+        assert_eq!(pipes("b"), Some((20, 21, 22, true)));
+        assert_eq!(pipes("c"), Some((300, 301, 302, false)), "no carried descriptors: its record's, unchanged");
+    }
 
     /// The journal failure is the real Host adoption path, not a synthetic consumption event.
     /// Certificate verification is covered by the isolated native upgrade proof; this fixture

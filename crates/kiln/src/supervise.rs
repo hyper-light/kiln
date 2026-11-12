@@ -301,7 +301,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
             match ChildControl::spawn(&mut cmd) {
                 Ok((child, control)) => {
                     if let Some(h) = &mut handover {
-                        h.started();
+                        h.started(control.pid().and_then(|p| u32::try_from(p).ok()).unwrap_or(0));
                     }
                     // The child holds them now: close this process's copies.
                     if let Some(t) = handed.take()

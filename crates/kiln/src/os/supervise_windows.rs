@@ -147,7 +147,7 @@ impl Handover {
         None
     }
 
-    pub fn started(&mut self) {}
+    pub fn started(&mut self, _pid: u32) {}
 
     pub async fn finish(self) -> Option<Terminals> {
         None
@@ -174,10 +174,20 @@ pub fn has_supervisor_channel() -> bool {
     false
 }
 
+/// A runner never hands sessions to its supervisor here yet (landed in a later piece).
+pub fn supervisor_takes_sessions() -> bool {
+    false
+}
+
 pub fn handed_terminals() -> Option<Vec<i32>> {
     None
 }
 
-pub fn to_supervisor(_masters: &[i32]) -> std::io::Result<()> {
-    Err(std::io::Error::other("terminals are not handed over on Windows"))
+/// No sessions come across a successor upgrade on Windows yet (landed in a later piece).
+pub fn handed_sessions() -> Option<Vec<i64>> {
+    None
+}
+
+pub fn to_supervisor(_masters: &[i32], _sessions: &[crate::proc::Detached]) -> std::io::Result<()> {
+    Err(std::io::Error::other("the handover channel is not set up on Windows yet"))
 }

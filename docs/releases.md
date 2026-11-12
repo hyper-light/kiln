@@ -380,8 +380,13 @@ one that doesn't is never switched to.
 - **macOS:** nothing re-executes itself. macOS's local network privacy stops recognising a
   process that replaced its own image, so after an in-place upgrade the runner's connections to
   the server failed with "No route to host" until kiln was started afresh. Instead, the runner
-  hands its terminals to its supervisor (`kiln supervise`) and exits, and the supervisor starts the
-  new binary as a fresh process that takes them over.
+  hands its terminals **and its agent sessions' harness processes** to its supervisor
+  (`kiln supervise`) and exits, and the supervisor starts the new binary as a fresh process that
+  takes them over: the pipes and PTYs are passed across, not reopened, so a session's reply that
+  was streaming goes on and its shells keep running. A session whose process can't be handed over
+  stops and resumes from its record, as after a restart. (The supervisor from before this carried
+  terminals only; its runner's sessions resume from their records until the supervisor itself is
+  started afresh.)
 - **Windows:** the supervisor restarts the runner (and its terminals).
 
 On macOS the launchd job (`~/Library/LaunchAgents/io.github.hyper-light.kiln-agent.plist`) runs a
