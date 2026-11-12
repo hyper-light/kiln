@@ -1192,6 +1192,17 @@ fn profile<S: Clone>(im: &Impl<S>, p: &Params) -> f64 {
     t.elapsed().as_nanos() as f64 / p.b as f64
 }
 
+/// Thread `i` of `m` saying `rate` words a second between them (`None`: as fast as it can): waits
+/// for the time its next word is due, spinning, so the rate holds without the OS's timers.
+fn paced(start: Instant, i: usize, m: usize, rate: Option<u64>, n: u64) {
+    let Some(rate) = rate.filter(|r| *r > 0) else { return };
+    // Its n-th word is the (n * m + i)-th of all of them.
+    let due = (n.saturating_mul(m as u64).saturating_add(i as u64)) as f64 / rate as f64;
+    while start.elapsed().as_secs_f64() < due {
+        std::hint::spin_loop();
+    }
+}
+
 /// `k` owners at once ([`Args::owners`]): each a copy of `im` (its own fleet and requests) on a
 /// thread of its own, filled and warmed apart, then its B steps timed while the others run theirs,
 /// all starting together. Each owner's ns a step.
@@ -1222,7 +1233,7 @@ fn owners_at_once(im: &Impl<Kiln>, p: &Params, k: usize) -> Vec<f64> {
 /// thread, the lock taken for each, while each hinter takes it for one runner's word at a time
 /// (a runner drawn at random, its word as it stands) until the steps are done. ns a step, and the
 /// hints said a second.
-fn hinted(im: &Impl<Kiln>, p: &Params, m: usize) -> (f64, f64) {
+fn hinted(im: &Impl<Kiln>, p: &Params, m: usize, rate: Option<u64>) -> (f64, f64) {
     let shared = std::sync::Mutex::new(im.clone());
     let mut rng = Rng(SEED);
     if let Ok(mut g) = shared.lock() {
@@ -1239,7 +1250,9 @@ fn hinted(im: &Impl<Kiln>, p: &Params, m: usize) -> (f64, f64) {
                 let mut rng = Rng(SEED ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
                 let mut n = 0u64;
                 start.wait();
+                let t0 = Instant::now();
                 while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    paced(t0, i, m, rate, n);
                     let r = uniform(rng.next(), p.n);
                     if let Ok(mut g) = shared.lock() {
                         let k = &mut g.state;
@@ -1270,32 +1283,42 @@ fn hinted(im: &Impl<Kiln>, p: &Params, m: usize) -> (f64, f64) {
 
 /// One owner whose words come by mailbox ([`Args::mailbox`]): `m` threads each post that a runner
 /// (drawn at random) has a new word, into a set behind a lock held for the insert, so a runner posted
-/// twice before the owner looks is there once (its newest word is the one that counts); before each
-/// step the owner takes the set whole and applies each runner's word as it stands (the bench's
-/// runners' ledgers are the owner thread's; a real runner sends its own, current, word), so the
-/// owner's records are written by this thread alone. ns a step (the words applied in it), the words
+/// twice before the owner looks is there once (its newest word is the one that counts), then raise a
+/// flag; before each step the owner reads the flag and, when it's up, lowers it, takes the set whole
+/// and applies each runner's word as it stands (the bench's runners' ledgers are the owner thread's;
+/// a real runner sends its own, current, word), so the owner's records are written by this thread
+/// alone and it takes no lock while nothing came. ns a step (the words applied in it), the words
 /// posted a second, and the words applied a step.
-fn mailed(im: &Impl<Kiln>, p: &Params, m: usize) -> (f64, f64, f64) {
+fn mailed(im: &Impl<Kiln>, p: &Params, m: usize, rate: Option<u64>) -> (f64, f64, f64) {
     let mut own = im.clone();
     let mut rng = Rng(SEED);
     fill(&mut rng, &mut own, 0, p.f);
     steps(&mut rng, &mut own, p.f, p.w);
     let mail = std::sync::Mutex::new(std::collections::HashSet::<u32>::new());
+    // Raised after an insert, lowered by the owner before it takes the set: a post after the take
+    // finds it lowered (the lock orders the two) and raises it again, so none waits unseen.
+    let waiting = std::sync::atomic::AtomicBool::new(false);
     let done = std::sync::atomic::AtomicBool::new(false);
     let put = std::sync::atomic::AtomicU64::new(0);
     let start = std::sync::Barrier::new(m + 1);
     let mut applied = 0u64;
     let (ns, secs) = std::thread::scope(|s| {
         for i in 0..m {
-            let (mail, done, put, start) = (&mail, &done, &put, &start);
+            let (mail, waiting, done, put, start) = (&mail, &waiting, &done, &put, &start);
             s.spawn(move || {
                 let mut rng = Rng(SEED ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
                 let mut n = 0u64;
                 start.wait();
+                let t0 = Instant::now();
                 while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    paced(t0, i, m, rate, n);
                     let r = uniform(rng.next(), p.n);
                     if let Ok(mut g) = mail.lock() {
                         g.insert(r);
+                    }
+                    // Written only when down, so a flag already up isn't pulled from the owner's cache.
+                    if !waiting.load(std::sync::atomic::Ordering::Relaxed) {
+                        waiting.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     n += 1;
                 }
@@ -1306,18 +1329,21 @@ fn mailed(im: &Impl<Kiln>, p: &Params, m: usize) -> (f64, f64, f64) {
         let t = Instant::now();
         let mut taken = std::collections::HashSet::new();
         for _ in 0..p.b {
-            if let Ok(mut g) = mail.lock() {
-                std::mem::swap(&mut *g, &mut taken);
-            }
-            let k = &mut own.state;
-            for r in taken.drain() {
-                if let Some(word) = k.runners.get(r as usize).map(Runner::word) {
-                    let _ = k.owner.hear(ToOwner::Hint { runner: RunnerId(r), word }, &mut k.out);
-                    applied += 1;
+            if waiting.load(std::sync::atomic::Ordering::Relaxed) {
+                waiting.store(false, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut g) = mail.lock() {
+                    std::mem::swap(&mut *g, &mut taken);
                 }
+                let k = &mut own.state;
+                for r in taken.drain() {
+                    if let Some(word) = k.runners.get(r as usize).map(Runner::word) {
+                        let _ = k.owner.hear(ToOwner::Hint { runner: RunnerId(r), word }, &mut k.out);
+                        applied += 1;
+                    }
+                }
+                k.out.to.clear();
+                k.out.told.clear();
             }
-            k.out.to.clear();
-            k.out.told.clear();
             steps(&mut rng, &mut own, p.f, 1);
         }
         let e = t.elapsed();
@@ -1565,12 +1591,15 @@ struct Args {
     hinters: Vec<usize>,
     /// `--mailbox M,..` (with `--profile`): M threads putting words in the owner's mailbox.
     mailbox: Vec<usize>,
+    /// `--rate R,..` (with `--hinters` or `--mailbox`): the words those threads say a second, all of
+    /// them together, paced; none (the default): as fast as they can.
+    rates: Vec<u64>,
     /// `--measured`: every runner measured its speed and slowness first; asks stay plain.
     measured: bool,
 }
 
 fn args() -> std::result::Result<Args, String> {
-    let mut a = Args { json: false, cold: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None, profile: false, null: false, terms: None, measured: false, owners: Vec::new(), hinters: Vec::new(), mailbox: Vec::new() };
+    let mut a = Args { json: false, cold: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None, profile: false, null: false, terms: None, measured: false, owners: Vec::new(), hinters: Vec::new(), mailbox: Vec::new(), rates: Vec::new() };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if let Some(kinds) = std::env::var("KILN_LB_KINDS").ok().and_then(|v| v.parse().ok()) {
         KINDS.store(kinds, std::sync::atomic::Ordering::Relaxed);
@@ -1624,6 +1653,7 @@ fn args() -> std::result::Result<Args, String> {
             "--owners" => a.owners = list(v)?.into_iter().map(|x| usize::try_from(x).unwrap_or(1).max(1)).collect(),
             "--hinters" => a.hinters = list(v)?.into_iter().map(|x| usize::try_from(x).unwrap_or(0)).collect(),
             "--mailbox" => a.mailbox = list(v)?.into_iter().map(|x| usize::try_from(x).unwrap_or(0)).collect(),
+            "--rate" => a.rates = list(v)?,
             "--impl" => match v {
                 "kiln" => a.floor = false,
                 "floor" => a.floor = true,
@@ -1692,13 +1722,17 @@ fn main() -> std::process::ExitCode {
                         let together: f64 = each.iter().map(|ns| 1e9 / ns).sum();
                         println!("owners {k} n {n} rho {:.2} d {d}: {per:.2} ns a step (median owner; one alone {one:.2}), {:.1} M steps/s together, {:.3} of {k} alone", rho as f64 / 1000.0, together / 1e6, together / (k as f64 * 1e9 / one));
                     }
-                    for &m in &a.hinters {
-                        let (ns, hints) = hinted(&im, &p, m);
-                        println!("hinters {m} n {n} rho {:.2} d {d}: {ns:.2} ns a step (alone {one:.2}, {:.2}x), {:.2} M hints/s", rho as f64 / 1000.0, ns / one, hints / 1e6);
-                    }
-                    for &m in &a.mailbox {
-                        let (ns, words, applied) = mailed(&im, &p, m);
-                        println!("mailbox {m} n {n} rho {:.2} d {d}: {ns:.2} ns a step (alone {one:.2}, {:.2}x), {:.2} M words/s put, {:.2} applied a step", rho as f64 / 1000.0, ns / one, words / 1e6, applied);
+                    let rates: Vec<Option<u64>> = if a.rates.is_empty() { vec![None] } else { a.rates.iter().map(|r| Some(*r)).collect() };
+                    for rate in &rates {
+                        let at = rate.map_or_else(|| "as fast as they can".to_owned(), |r| format!("{:.2} M words/s asked", r as f64 / 1e6));
+                        for &m in &a.hinters {
+                            let (ns, hints) = hinted(&im, &p, m, *rate);
+                            println!("hinters {m} n {n} rho {:.2} d {d} ({at}): {ns:.2} ns a step (alone {one:.2}, {:.2}x), {:.2} M hints/s", rho as f64 / 1000.0, ns / one, hints / 1e6);
+                        }
+                        for &m in &a.mailbox {
+                            let (ns, words, applied) = mailed(&im, &p, m, *rate);
+                            println!("mailbox {m} n {n} rho {:.2} d {d} ({at}): {ns:.2} ns a step (alone {one:.2}, {:.2}x), {:.2} M words/s put, {:.2} applied a step", rho as f64 / 1000.0, ns / one, words / 1e6, applied);
+                        }
                     }
                 }
             }
