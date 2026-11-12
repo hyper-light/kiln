@@ -2126,6 +2126,49 @@ mock-up, a small tool) as a page: see docs/previews.md.
   - **Records.** pin.sh's record is `pin.log`, beside it. docs/research/s26-agy-agentfile/ holds
     the rest: the tests' runs, the microVM build, smokes and probe on both platforms
     (`evidence/step4/`), and what stayed unverified (its README).
+- **Gemini CLI in a Shards microVM**: kiln's built-in Agentfile `harness-gemini`
+  (`.kiln/images/harness-gemini/`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 21).
+  - **Its pin.** Google ships no Linux executable of Gemini CLI: its Linux build is the npm package
+    `@google/gemini-cli`, run by Node.js. pin.sh checks the package as npm documents it: each
+    registry signature over its name, version and integrity, then the tarball's SHA-512 (Google
+    publishes no provenance for it). The Node.js is derived, not chosen: the newest major that
+    Gemini's own Linux CI tests and Node still supports, at its newest release, from nodejs.org's
+    archives, whose SHA-256 Node's signed SHASUMS256.txt gives. pin.json takes the package whole at
+    the harness's root and Node's `bin/node` and `LICENSE` alone, at `node/`, and kiln's unpacker
+    holds each to its pinned totals or digest. Its smoke runs that node on the package's
+    `bundle/gemini.js` with `--version`, which prints the bare version.
+  - **Its base.** Node's Linux builds link glibc, libstdc++ and libgcc_s, and Node publishes no arm64
+    musl build, so the image has no musl variant and Alpine can't start it. The default base,
+    buildpack-deps:trixie-scm by digest, has them, and bash for Gemini's shell tool.
+  - **Node off PATH.** harness.json starts `/harness/gemini/node/bin/node
+    /harness/gemini/bundle/gemini.js --acp`. A harness's own directory and its `bin/` lead the PATH
+    its commands inherit, so the harness's node, elsewhere, leaves the project's own node to the
+    model's commands. No `npm` or `npx` is in the harness, and no `gemini` is on its PATH: a project
+    whose MCP servers need npm brings it in its image.
+  - **No update check.** Gemini checks npm for a newer version, and installs it, only from its
+    interactive screen. harness.json points `GEMINI_CLI_SYSTEM_SETTINGS_PATH` at kiln's
+    `system-settings.json`, which turns both off in every mode. Gemini reads a system settings file
+    only when it and every directory above it belong to root and no group or other may write them:
+    in the image they belong to root, and kiln's unpacker gives the harness's directories 0755. kiln
+    writes `harness.json` and `system-settings.json` themselves under its umask, so a context made
+    under a umask that leaves group write (002) has Gemini skip its settings, with a warning.
+  - **Its HOME.** Gemini keeps its settings, its sign-in (`oauth_creds.json`, or its file keychain
+    `gemini-credentials.json`, whose key is salted with the hostname and the user), its history and
+    its projects under `$HOME/.gemini`. harness.json sets `HOME=/home/gemini`, and that whole home is
+    a harness volume, the person's. Folder trust is on out of the box: whether a project is trusted
+    is the session's to say.
+  - **Two processes.** Every start is two node processes: a light parent that starts node again with
+    a heap limit of half the machine's memory.
+  - **Volumes and grants.** `/workspace` and `/home/gemini`. The network grants are the bring-up's:
+    names through the microVM's resolver and TCP 443 out, nothing in. Every endpoint Gemini reaches
+    by default speaks HTTPS: Code Assist for a Google sign-in, the Gemini API for a key, Google's
+    OAuth endpoints and its usage statistics (play.googleapis.com).
+  - **What later steps change.** As agy's: steps 7, 8 and 9 (HOME, the project at its host path,
+    providers by name), 17 and 18 (the start through Hex, its config on a volume kiln reads, and its
+    sign-in on the terminal lane, which starts the same node and script), and 33 (its sign-in filled
+    in at the microVM's egress).
+  - **Records.** docs/research/s21-gemini-agentfile/: its research's evidence, the pin's runs and its
+    tests, and what stayed unverified (its README).
 - **ACP agents** report no MCP servers, skills or plan limits; their slash commands run with
   `skill_run`.
 - **Cursor CLI** offers subagents as sessions of their own only to a client that takes ACP's
