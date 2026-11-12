@@ -1578,8 +1578,8 @@ impl Claude {
             return;
         }
         let busy = self.busy(core);
-        // Past the machine's headroom, new work waits in kiln's queue (a person's "now" never does).
-        if mode == SendMode::Queue && (busy || !crate::headroom::admit(&core.session_id, crate::headroom::Class::Agent)) {
+        // Past the machine's headroom, new work waits in kiln's queue (a person's never does).
+        if mode == SendMode::Queue && (busy || !crate::headroom::admit(&core.session_id, super::pause::class_of(&id))) {
             core.state.queue.push(QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to });
             core.touch_state();
             return;

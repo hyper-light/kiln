@@ -97,6 +97,12 @@ pub fn steers(id: &str) -> bool {
     id.starts_with(NEWS) || id.starts_with(FROM_AGENT)
 }
 
+/// A person's message, by its id: none of kiln's own (`kiln-`), a goal's, a child's news or
+/// another agent's.
+pub fn persons(id: &str) -> bool {
+    !id.starts_with(super::core::KEEP_ID) && !own(id) && !steers(id)
+}
+
 /// A digest of a message's words that every build of kiln makes alike (the first 16 hex digits of
 /// their SHA-256): what a runner says its harness was handed (`State::given`), read by a server that
 /// may be another build.
@@ -383,6 +389,8 @@ mod tests {
         // kiln's own keep-going words keep their mode.
         assert!(steers(&from_agent("a")) && steers(&made(NEWS)));
         assert!(!steers("01a16251c49a75fba41b1fae971ba8a9") && !steers(&made(GOAL)) && !steers("kiln-keep-restart-1"));
+        assert!(persons("01a16251c49a75fba41b1fae971ba8a9"));
+        assert!(!persons(&from_agent("a")) && !persons(&made(NEWS)) && !persons(&made(GOAL)) && !persons("kiln-keep-restart-1"));
         assert_eq!(digest("a"), digest("a"));
         assert_ne!(digest("a"), digest("b"));
         assert_eq!(Queued::of("m", "four").len, 4);
