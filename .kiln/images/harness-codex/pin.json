@@ -1,0 +1,86 @@
+{
+  "version": "0.167.2",
+  "tag": "rust-v0.167.2",
+  "published": "2026-11-11T22:44:46Z",
+  "read_at": "2026-11-12T15:18:32Z",
+  "verified": {
+    "cosign": {
+      "version": "v3.1.4",
+      "file": "cosign-linux-amd64",
+      "sha256": "424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa"
+    },
+    "identity": "https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.167.2",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "sums": {
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.167.2/codex-package_SHA256SUMS",
+      "sha256": "4f19652c992601851ce08ffe522412e22a17c242e580358d1150a9c98f3e1986"
+    },
+    "ripgrep": {
+      "version": "15.2.0",
+      "pinned_by": {
+        "url": "https://raw.githubusercontent.com/openai/codex/rust-v0.167.2/scripts/codex_package/rg",
+        "sha256": "41a10ca63365560d899a82b6f825fd7b420a18b34f660a98bffeece77eeae1f1"
+      }
+    }
+  },
+  "base": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+  "smoke": {
+    "program": "bin/codex",
+    "args": [
+      "--version"
+    ],
+    "stdout": "codex-cli 0.167.2"
+  },
+  "builds": [
+    {
+      "platform": "linux/amd64",
+      "files": [
+        {
+          "url": "https://github.com/openai/codex/releases/download/rust-v0.167.2/codex-package-x86_64-unknown-linux-musl.tar.gz",
+          "sha256": "3d77be1748d35a4bb0e7f8752cde3b11890c63338e8c599f01eafa4a59e17b3d",
+          "size": 200235673,
+          "path": ".",
+          "unpack": {
+            "format": "tar.gz",
+            "strip": 0,
+            "unpacked_bytes": 540223046,
+            "entries": 52
+          }
+        }
+      ]
+    },
+    {
+      "platform": "linux/arm64",
+      "files": [
+        {
+          "url": "https://github.com/openai/codex/releases/download/rust-v0.167.2/codex-package-aarch64-unknown-linux-musl.tar.gz",
+          "sha256": "56b08c1214e062a5b61684bacb5033c4372a01062a47c87c49a32be83af70695",
+          "size": 187980188,
+          "path": ".",
+          "unpack": {
+            "format": "tar.gz",
+            "strip": 0,
+            "unpacked_bytes": 481289300,
+            "entries": 52,
+            "skip": [
+              "codex-path/rg"
+            ]
+          }
+        },
+        {
+          "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz",
+          "sha256": "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915",
+          "size": 1982561,
+          "path": "codex-path/rg",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "ripgrep-15.2.0-aarch64-unknown-linux-musl/rg",
+            "sha256": "c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a",
+            "size": 4466000
+          }
+        }
+      ]
+    }
+  ]
+}

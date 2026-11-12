@@ -1,0 +1,29 @@
+# Shards origin/main 08cf6ec5d72a6d48a9c36232f27f801932907140: lines step 23 rests on (git show origin/main:<path> | grep -n -F), 2026-11-12T07:35:56Z
+# policy: docs/development-rules.md sha256 df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3; AGENTS.md f66d304c033ad4001d3d7347b67faa3bb3137d637860793e8e74f1eb6266db41; docs/development-evidence.md 61613a244106d95b2759b38c8b6660ff29a616983e7afd6e9faabdc38368fb63
+crates/init/src/domains.rs:40:const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+crates/init/src/domains.rs:490:    let path = format!("{dir}:{dir}/bin:{PATH}");
+crates/init/src/domains.rs:493:        cstr("HOME=/tmp")?,
+crates/init/src/domains.rs:496:    for e in run.get("env").and_then(Value::strings).unwrap_or_default() {
+crates/image/src/osi.rs:76:pub const SCHEMA_VERSION: u32 = 1;
+crates/image/src/osi.rs:84:    pub env: Vec<String>,
+crates/agentfile/src/startup.rs:2://! `harness.json` may say only `entrypoint` and optional `options`; the runtime receives
+crates/agentfile/src/plan.rs:1633:        (b"TARGETARCH", target.architecture.clone()),
+docs/examples/harness-codex/Agentfile:20:NETWORK --dns --egress=443/tcp provider FOR codex
+docs/examples/harness-codex/Agentfile:21:EXPOSE --harnesses=codex 443/tcp AS egress FOR provider
+docs/examples/harness-codex/Agentfile:22:CONNECT codex WITH codex ON provider
+docs/research/measurements/harness-bringup-v1/records/codex-login-volume/Agentfile:23:VOLUME --target-kind=harness /run/codex-home FOR codex
+docs/research/measurements/harness-bringup-v1/records/codex-login-volume/harness.json:1:{"schemaVersion":1,"name":"codex","run":{"command":["codex","exec","--json","--skip-git-repo-check","--ephemeral","Reply with the single word: ready"],"env":["CODEX_HOME=/run/codex-home"]}}
+docs/research/measurements/harness-bringup-v1/README.md:31:| Artifact | `codex-x86_64-unknown-linux-musl.tar.gz` (static-pie musl) and `codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz`, from `github.com/openai/codex/releases/download/rust-v0.167.2/` | `linux-x64-musl/claude` from `downloads.claude.ai/claude-code-releases/2.1.322/` (what `claude.ai/install.sh` picks on Alpine) |
+docs/architecture/AGENTFILE_ARCH.md:182:  - `--target-kind=<agent|harness>` (added 2026-10-01): whether the names after `FOR`
+docs/architecture/AGENTFILE_ARCH.md:236:  (`CONNECT a WITH a ON n`) attaches it to the networks and grants no flow.
+docs/architecture/AGENTFILE_ARCH.md:273:  | path on the build host | copies it, as `COPY` copies |
+docs/architecture/AGENTFILE_ARCH.md:602:**The run's own command is confined from the domains too** (D115). The workload a run's
+docs/design/architecture.md:10982:  From the host's side, an emulated run costs 4.6 and 5.5 times the cycles of a native one
+docs/development-rules.md:42:Use online learned/data-derived values, or exceptionally well-researched invariants
+docs/development-rules.md:147:Use scoped subagents for parallel implementation and targeted unit/light
+docs/development-rules.md:156:The main coordinator owns all audits, profiling, benchmarking, cross-lane
+CLAUDE.md:65:- No arm64 Linux host here has KVM (CI's arm64 runners have no `/dev/kvm`): boot.rs's `snapshot_tests_pass_on_a_kvm_host_of_this_architecture` builds E2E test binaries for arm64 Linux (`common::linux_tests`, into `target/l1`) and runs them in a guest with EL2 on an M3 or later Mac (the test guest's `e2e` mode; guests prebuilt through `SHARDS_TEST_GUESTS`), one test at a time (PM M346). A Mac without EL2 skips it. `SHARDS_L1_TESTS` picks binaries and filters, `SHARDS_L1_CONSOLE` keeps its console; time it through `launchd-run.sh`, as the session's QoS clamp starves the nested guests.
+== harness.json startup: the commit that added startup.rs, and whether 1da9132b7 is in main
+c3b7bde8b 2026-11-09 Start supplied agents and harnesses from their root startup descriptors
+1da9132b7 is an ancestor of origin/main 08cf6ec5d72a6d48a9c36232f27f801932907140
+tags containing c3b7bde8b: 0

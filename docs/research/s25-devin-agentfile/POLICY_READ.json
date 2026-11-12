@@ -1,0 +1,69 @@
+{
+  "policy_read": "POLICY_READ",
+  "read_at": "2026-11-12T07:51:00Z",
+  "agent": {
+    "harness": "claude",
+    "session": "01a1ceb7-257b-7032-9959-af2097c0f615",
+    "role": "implementer",
+    "role_rule": "Shards R15: scoped implementation and light tests; no audits, profiling, benchmarks, pushes or merges",
+    "coordinator": "01a1ce6f55c3749ca87f3ef3393ec8b0 (plan step 25's agent)",
+    "readback_sent_to_coordinator": "2026-11-12T07:51Z, kiln agents send, before this file was written"
+  },
+  "task": {
+    "plan": "01a1ce705e4d7008993f5c7291ef4476",
+    "research": "01a1ce705e4d70089c04cee721525c8f (findings f4, f6, f7 for the pin)",
+    "step": "1 of 6: policy readback, .kiln/images/harness-devin/pin.sh and pin.json",
+    "schema": "step 19's pin.json (plan 01a1cdf3cc7a70e4b3ca2ec610352383, item 3)",
+    "base_digest_to_record": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10"
+  },
+  "repositories": {
+    "shards": {
+      "read_from": "origin/main",
+      "revision": "fbb407d33df33e0fcf06296136966f886a7a611f",
+      "brief_revision": "c4ae59ee094dcdf99e5dcd47ed46952d53e4f1e6 (an ancestor of fbb407d33; every policy file byte-identical at both)",
+      "policy_last_changed": "cbd39284937d024640c56db6f8d8ef2bd9b0ee24 (2026-11-10)",
+      "why_origin_main": "the session's shards checkout (g121, branch win-passthrough) has no AGENTS.md or docs/development-rules.md",
+      "files_sha256": {
+        "AGENTS.md": "f66d304c033ad4001d3d7347b67faa3bb3137d637860793e8e74f1eb6266db41",
+        "docs/development-rules.md": "df2acf47cf92996e9435f9a4988f10e9e7aaa21ca952a00069c044c7ed4f13d3",
+        "docs/development-evidence.md": "61613a244106d95b2759b38c8b6660ff29a616983e7afd6e9faabdc38368fb63",
+        "CLAUDE.md": "fd1076b256516e0edab1b3655421d37cd934e93a8232f0125b96abcfb99ece5f"
+      },
+      "rules": "R01-R16 bind"
+    },
+    "kiln": {
+      "read_at": "1a5a5f00d5dc056e70e998eb23ab0b3b315ad1e9 (the worktree's HEAD)",
+      "origin_main": "efb40ea0f4b28ef1f05f4d7e7f47af28e353e166 (policy files unchanged there)",
+      "files_sha256": {
+        "AGENTS.md": "16b05ef80db024a7b54b0e703d42c8cf5c1f330a626d6bd85ae4525609447a4c",
+        "CLAUDE.md": "336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49",
+        "docs/ci.md": "29e4b9a9cee874a9d94091b461d047c4738da35713f4f628a2560d2a7771dc33"
+      },
+      "notes": "CLAUDE.md is @AGENTS.md; AGENTS.md binds docs/ci.md section 0.3, read in full (section 0)"
+    }
+  },
+  "worktree": {
+    "path": "~/Projects/kiln/.claude/worktrees/s25-devin-agentfile",
+    "branch": "s25-devin-agentfile",
+    "base": "1a5a5f00d5dc056e70e998eb23ab0b3b315ad1e9",
+    "shared_with": "step 2's subagent 01a1ceb7914e702aa9059e6dfdd3c79a: stage and commit named paths only"
+  },
+  "owned_paths": [
+    ".kiln/images/harness-devin/pin.sh",
+    ".kiln/images/harness-devin/pin.json",
+    ".kiln/images/harness-devin/pin-tests.sh",
+    "docs/research/s25-devin-agentfile/POLICY_READ.json",
+    "docs/research/s25-devin-agentfile/pin/"
+  ],
+  "read_only_paths": [
+    "docs/research/s25-devin-agentfile/evidence/"
+  ],
+  "constraints_acknowledged": [
+    "pin.sh and its mutation tests run only on a Linux runner through kiln run --needs linux/amd64, retried when the server is slow",
+    "nothing built or tested on this Mac; big files under the runner's ~/.cache",
+    "no secret printed or committed",
+    "commits signed: this session's git signs every commit through kiln-git-sign (x509, key kiln-agent; no separate gits binary exists in this session); named paths only; no push (step 6 lands)",
+    "research and unblock before asking the person",
+    "report the commit SHA and test results to the coordinator"
+  ]
+}

@@ -1,6 +1,6 @@
 /** W21-R02: request-local hints for public modules; never prefetch data or run route loaders. */
 export function agentEntry(pathname: string): boolean {
-  return /^\/agents\/(?!(?:plans|research|sessions)(?:\/|$))[^/]+\/?$/.test(pathname);
+  return /^\/agents\/(?!(?:plans|research|sessions|agentfiles)(?:\/|$))[^/]+\/?$/.test(pathname);
 }
 
 export function preloadLinks(manifest: unknown): string {

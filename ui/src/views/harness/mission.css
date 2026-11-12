@@ -1504,6 +1504,22 @@ html[data-motion="paused"] .ms-pick::before {
 .mc-none {
   color: #6d7078;
 }
+/* The Agentfile row (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31): the pick, then the way to the Agentfiles. */
+.mc-opt-agentfile .mc-opt-val {
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0 14px;
+}
+.mc-opt-agentfile .mc-pick {
+  min-width: 0;
+  max-width: 100%;
+}
+.mc-opt-agentfile .mc-pick > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 button.mc-pick {
   min-width: 0;
   max-width: 100%;

@@ -1,0 +1,10 @@
+shards ac87190d3ff78245e9fa9726c81a7392797bce30
+8529c5afebb4f52b4bdcd7016a70b624959c619c5238ef72a3f6cfa2023978eb  /home/adalundhe/.cache/s25-step3/in/harness.json
+/home/adalundhe/.cache/s25-step3/osi/harness.json: accepted: name "devin", version "3000.12.43", run Some(Run { command: ["devin", "acp"], env: ["XDG_CONFIG_HOME=/home/devin/.config", "XDG_DATA_HOME=/home/devin/.local/share"], workdir: None })
+/home/adalundhe/.cache/s25-step3/osi/mutant-unknown-field.json: refused: an OSI config: unknown field `update`, expected one of `schemaVersion`, `name`, `version`, `description`, `platform`, `run`, `skills`, `mcp`, `asks`
+/home/adalundhe/.cache/s25-step3/osi/mutant-shards-domain.json: refused: an OSI config's run.env sets SHARDS_DOMAIN, which the runtime sets: a domain's own name
+/home/adalundhe/.cache/s25-step3/osi/mutant-schema-2.json: refused: an OSI config of schema version 2, which shards does not read (it reads 1)
+/home/adalundhe/.cache/s25-step3/osi/mutant-empty-command.json: refused: an OSI config's run.command is empty
+refused 4
+shards checkout clean: yes
+exit 0 (try 1)

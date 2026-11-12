@@ -44,6 +44,14 @@ pub const ALL: &[Builtin] = &[
             ("harness.musl.json", include_str!("../../../../.kiln/images/harness-claude/harness.musl.json")),
         ],
     },
+    // Amp, through its ACP adapter amp-acp (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 24).
+    Builtin {
+        name: "harness-amp",
+        harness: "amp",
+        text: include_str!("../../../../.kiln/images/harness-amp/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-amp/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-amp/harness.json"))],
+    },
     // Antigravity's CLI, agy, Google's static musl build, in its headless stream-json mode as kiln's
     // Antigravity kind starts it (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 26).
     Builtin {
@@ -53,6 +61,15 @@ pub const ALL: &[Builtin] = &[
         pin: include_str!("../../../../.kiln/images/harness-antigravity/pin.json"),
         files: &[("harness.json", include_str!("../../../../.kiln/images/harness-antigravity/harness.json"))],
     },
+    // Devin for Terminal, Cognition's own static builds, as kiln's Devin kind starts it (`devin acp`;
+    // kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 25).
+    Builtin {
+        name: "harness-devin",
+        harness: "devin",
+        text: include_str!("../../../../.kiln/images/harness-devin/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-devin/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-devin/harness.json"))],
+    },
     // Cursor's CLI agent, its own Linux package unpacked as its installer does, run as kiln's Cursor
     // kind starts it, `acp` (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 27).
     Builtin {
@@ -61,6 +78,15 @@ pub const ALL: &[Builtin] = &[
         text: include_str!("../../../../.kiln/images/harness-cursor/Agentfile"),
         pin: include_str!("../../../../.kiln/images/harness-cursor/pin.json"),
         files: &[("harness.json", include_str!("../../../../.kiln/images/harness-cursor/harness.json"))],
+    },
+    // Codex, through its app-server, from OpenAI's whole package (kiln plan
+    // 01a1cd8e862e7169a074db3d5fa33f3d, step 20).
+    Builtin {
+        name: "harness-codex",
+        harness: "codex",
+        text: include_str!("../../../../.kiln/images/harness-codex/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-codex/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-codex/harness.json"))],
     },
     // Gemini CLI, Google's npm package on Node.js's own Linux build, as kiln's Gemini kind starts it,
     // `--acp` (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 21). Its system settings turn its
@@ -99,10 +125,19 @@ mod goose_tests;
 mod claude_tests;
 
 #[cfg(test)]
+mod amp_tests;
+
+#[cfg(test)]
 mod antigravity_tests;
 
 #[cfg(test)]
+mod devin_tests;
+
+#[cfg(test)]
 mod cursor_tests;
+
+#[cfg(test)]
+mod codex_tests;
 
 #[cfg(test)]
 mod gemini_tests;

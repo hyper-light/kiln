@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "name": "devin",
+  "version": "3000.12.43",
+  "run": {
+    "command": ["devin", "acp"],
+    "env": [
+      "XDG_CONFIG_HOME=/home/devin/.config",
+      "XDG_DATA_HOME=/home/devin/.local/share"
+    ]
+  }
+}

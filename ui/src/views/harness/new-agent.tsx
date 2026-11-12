@@ -2,8 +2,9 @@
  * Mission control's composer with nothing selected: it starts an agent, written like a message to
  * it. Above the box, the agent page's own line (permissions · model · effort, and the bolt where
  * the model goes faster); in the box's top slot, the agent, its machine, its folder and how many,
- * each opened in place; under the box, More options (name, workspace, where its commands run, a
- * shell to run in) and the machine's past sessions, each a dropdown that opens in place. Start
+ * each opened in place; under the box, More options (name, workspace, the Agentfile its microVM is
+ * made from, where its commands run, a shell to run in) and the machine's past sessions, each a
+ * dropdown that opens in place. Start
  * starts it and opens it; several stay here, and the line under the box says so. There is no
  * dialog: every way in that had one fills this in (new-agent-draft.ts).
  *
@@ -26,7 +27,8 @@ import { readLocal, useLocalStorage, useNow } from "@/lib/hooks";
 import { sendingProps } from "@/lib/action";
 import { useSuspenseResource } from "@/lib/resource";
 import { useRouter } from "@tanstack/react-router";
-import { useNavigate, useSearchParams } from "@/lib/router";
+import { Link, useNavigate, useSearchParams } from "@/lib/router";
+import { agentfileChoicesRes, choicesFor, chosenFor, projectOf, whyNoMicrovm, withChoice, type AgentfileChoice } from "@/views/agentfiles/choose";
 import { atOf, doingOf, findAgents } from "./broadcast";
 import { ComposeField } from "./compose-field";
 import { useAttachments } from "./controls";
@@ -122,6 +124,8 @@ function useChoices() {
   const [speedByKind, setSpeedByKind] = useLocalStorage<Record<string, string>>("kiln.agents.speeds", {});
   /** `volume`: a Slates volume of its own over the folder, where the machine can make one. */
   const [workspace, setWorkspace] = useLocalStorage<"folder" | "volume">("kiln.agents.workspace", "folder");
+  /** The Agentfile each harness's microVM is made from, per project (views/agentfiles/choose.ts); none kept: a process on its machine. */
+  const [agentfiles, setAgentfiles] = useLocalStorage<Record<string, string>>("kiln.agents.agentfiles", {});
   const [dirs, setDirs] = useLocalStorage<Record<string, string[]>>("kiln.agents.recentDirs", {});
   const [picked, setPicked] = React.useState<string | null>(null);
   /** The folder typed or browsed to, on the machine it was for. */
@@ -174,6 +178,8 @@ function useChoices() {
     setSpeedByKind,
     workspace,
     setWorkspace,
+    agentfiles,
+    setAgentfiles,
     dirs,
     setDirs,
     picked,
@@ -268,6 +274,18 @@ function useSetup(c: Choices): Setup {
   return resolve(c, useRes(machinesRes).data);
 }
 
+/**
+ * The Agentfile its microVM is made from, as chosen for its harness in its project (none: a process
+ * on its machine), what there is to choose, and why its machine would refuse it, where it would
+ * (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31).
+ */
+function useAgentfile(c: Choices, s: Setup) {
+  const choices = choicesFor(useRes(agentfileChoicesRes).data, s.kind);
+  const project = projectOf(s.cwd, c.shell);
+  const chosen = chosenFor(c.agentfiles, choices, s.kind, project);
+  return { choices, project, chosen, why: chosen && s.target ? whyNoMicrovm(s.target, s.machines, s.machine) : null };
+}
+
 /** Above the box: the agent page's own line, for the agent to be. */
 function HowLine({ c }: { c: Choices }) {
   const s = useSetup(c);
@@ -316,8 +334,9 @@ function HowLine({ c }: { c: Choices }) {
 }
 
 /** Start. `sending`: several are starting from here: it says so, and a press waits (a second would start more). */
-function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (s: Setup) => void }) {
+function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (s: Setup, agentfile: AgentfileChoice | null) => void }) {
   const s = useSetup(c);
+  const { chosen } = useAgentfile(c, s);
   const label = c.count > 1 ? `Start ${c.count}` : "Start";
   return (
     <button
@@ -327,9 +346,9 @@ function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (
       disabled={!s.target || s.noHarness}
       {...sendingProps(sending)}
       onClick={() => {
-        if (!sending) run(s);
+        if (!sending) run(s, chosen);
       }}
-      aria-label={`${label}: ${s.kindName} on ${s.machine}`}
+      aria-label={`${label}: ${s.kindName} on ${s.machine}${chosen ? `, in a microVM from ${chosen.name}` : ""}`}
     >
       <ArrowUp size={15} />
       <span>{label}</span>
@@ -337,20 +356,61 @@ function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (
   );
 }
 
-/** A choice of a few, as a word with a chevron over the system's own picker. */
-function Pick({ label, value, onChange, options }: { label: string; value: string; onChange: (v: string) => void; options: { value: string; label: string }[] }) {
+/** A choice of a few, as a word with a chevron over the system's own picker; those with a `group` under its name, as the picker lists them. */
+function Pick({ label, value, onChange, options }: { label: string; value: string; onChange: (v: string) => void; options: { value: string; label: string; group?: string }[] }) {
+  const option = (o: { value: string; label: string }) => (
+    <option key={o.value} value={o.value}>
+      {o.label}
+    </option>
+  );
+  const groups = [...new Set(options.map((o) => o.group))];
   return (
     <label className="mc-pick">
       <span>{options.find((o) => o.value === value)?.label ?? options[0]?.label}</span>
       <ChevronDown size={12} className="mc-chev" aria-hidden="true" />
       <select aria-label={label} value={value} onChange={(e) => onChange(e.target.value)}>
-        {options.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label}
-          </option>
-        ))}
+        {groups.map((g) =>
+          g === undefined ? (
+            <React.Fragment key="">{options.filter((o) => o.group === undefined).map(option)}</React.Fragment>
+          ) : (
+            <optgroup key={g} label={g}>
+              {options.filter((o) => o.group === g).map(option)}
+            </optgroup>
+          ),
+        )}
       </select>
     </label>
+  );
+}
+
+/**
+ * The Agentfile its microVM is made from, kept for this harness in this project (kiln plan
+ * 01a1cd8e862e7169a074db3d5fa33f3d, step 31): kiln's for the harness, or one of yours; none, a
+ * process on its machine. Where its machine would refuse it, it says so under the row.
+ */
+function AgentfileRow({ c, s }: { c: Choices; s: Setup }) {
+  const af = useAgentfile(c, s);
+  return (
+    <>
+      <div className="mc-opt mc-opt-agentfile">
+        <span className="mc-opt-key">Agentfile</span>
+        <div className="mc-opt-val">
+          <Pick
+            label={`The Agentfile ${s.kindName}'s microVM is made from`}
+            value={af.chosen?.image ?? ""}
+            onChange={(v) => c.setAgentfiles(withChoice(c.agentfiles, s.kind, af.project, v || null))}
+            options={[
+              { value: "", label: "None: a process on its machine" },
+              ...af.choices.map((x) => ({ value: x.image, label: x.whose === "kiln" ? `${x.name} (kiln's)` : x.name, group: x.whose === "kiln" ? "kiln's" : "Yours" })),
+            ]}
+          />
+          <Link to="/agents/agentfiles" className="ms-link">
+            Agentfiles
+          </Link>
+        </div>
+      </div>
+      {af.why && <p className="mc-note mc-opt-panel">{af.why}. An agent from an Agentfile starts only on a machine that starts microVMs.</p>}
+    </>
   );
 }
 
@@ -457,6 +517,7 @@ function Options({ c, s, past, setPast, onResume }: { c: Choices; s: Setup; past
           </div>
         </div>
       </div>
+      <AgentfileRow c={c} s={s} />
       <div className="mc-opt">
         <span className="mc-opt-key">Commands</span>
         <div className="mc-opt-val">
@@ -546,8 +607,16 @@ function Under({
   onResume: (s: Setup, p: PastSession) => void;
 }) {
   const s = useSetup(c);
+  const { chosen } = useAgentfile(c, s);
   // What More options holds that isn't as it starts out, said while it's closed.
-  const summary = [c.name.trim() && `“${c.name.trim()}”`, s.volume && "Own volume", c.reach && (c.reach === "off" ? "Only its machine" : `Prefers ${labelOf(c.reach)}`)].filter(Boolean).join(" · ");
+  const summary = [
+    c.name.trim() && `“${c.name.trim()}”`,
+    s.volume && "Own volume",
+    chosen && `microVM: ${chosen.name}`,
+    c.reach && (c.reach === "off" ? "Only its machine" : `Prefers ${labelOf(c.reach)}`),
+  ]
+    .filter(Boolean)
+    .join(" · ");
   return (
     <>
       <div className="mc-under">
@@ -739,7 +808,7 @@ export function NewAgent({
 
   // Start doesn't wait for the server (starting.ts): the agents are listed starting at once, under
   // ids made here, and one opens at once.
-  const run = async (s: Setup) => {
+  const run = async (s: Setup, agentfile: AgentfileChoice | null) => {
     if (!s.target) return;
     const body = text.trim();
     // Files go with the first message (those still uploading too: Start doesn't wait for them), so
@@ -758,6 +827,7 @@ export function NewAgent({
       prompt: sending ? "" : body,
       reach: c.reach,
       volume: s.volume,
+      agentfile: agentfile?.image,
     });
     const ids = Array.from({ length: c.count }, () => clientId());
     // One agent: its files are kept for it, and its page sends them once it can take them (and
