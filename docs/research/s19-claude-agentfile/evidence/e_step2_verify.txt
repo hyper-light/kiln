@@ -1,0 +1,111 @@
+# Steps 2 and 3 (plan 01a1cf48e8157494ac9a51f7a564f526): kiln run r6 on adacachy2 (Linux x86_64), docs/research/s19-claude-agentfile/step23-verify.sh, the run's output in the order kiln returned it. Its checkout of 751a7efb9 was refused by r5's uncommitted copy of the same step-2 patch (sha256 0a72eb01..., the content 751a7efb9 commits), so parts 1 to 3 ran on d7453f7a5 plus that patch.
+HOST adacachy2 2026-11-12T15:03:35Z free 40G disk 7.8G
+error: Your local changes to the following files would be overwritten by checkout:
+	crates/kiln/src/agentfiles/builtin.rs
+	crates/kiln/src/harness/claude.rs
+	crates/kiln/src/harness/kinds.rs
+Please commit your changes or stash them before you switch branches.
+error: The following untracked working tree files would be overwritten by checkout:
+	.kiln/images/harness-claude/Agentfile
+	.kiln/images/harness-claude/harness.json
+	.kiln/images/harness-claude/harness.musl.json
+Please move or remove them before you switch branches.
+Aborting
+TREE d7453f7a596dc9477f02e2022997eaaa540e99b4
+ M crates/kiln/src/agentfiles/builtin.rs
+ M crates/kiln/src/harness/claude.rs
+ M crates/kiln/src/harness/kinds.rs
+?? .kiln/images/harness-claude/Agentfile
+?? .kiln/images/harness-claude/harness.json
+?? .kiln/images/harness-claude/harness.musl.json
+== 1. tests by name
+NAMES_EXIT 0
+test result: ok. 73 passed; 0 failed; 0 ignored; 0 measured; 4323 filtered out; finished in 0.52s
+test agentfiles::builtin::tests::step23_a_real_shards_checks_every_builtin ... ok
+test agentfiles::builtin::tests::every_builtin_is_a_valid_agentfile_once ... ok
+test agentfiles::builtin::tests::step23_every_builtin_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::tests::step19_a_harness_home_is_its_volume_and_none_is_under_tmp ... ok
+test agentfiles::builtin::tests::step23_goose_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::tests::step23_kilns_dockerfile_copies_what_builtins_embed ... ok
+test agentfiles::builtin::tests::step23_goose_runs_as_kilns_goose_kind_with_its_root_on_its_volume ... ok
+test agentfiles::builtin::tests::step19_claude_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::tests::step23_a_pin_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::builtin::tests::step23_no_builtin_holds_a_credential ... ok
+test agentfiles::builtin::tests::step19_claude_runs_as_kilns_claude_kind_with_its_home_on_its_volume ... ok
+== 2. the real Shards
+/home/adalundhe/.cache/s19-shards/shards.part: OK
+a9c9092ac5f6a7c6b306a47ef5c9d27f48f6541885abe823c0063abc2d549388  /home/adalundhe/.cache/s19-shards/shards
+shards version 0.7.0, build 94838b8
+SHARDS_CHECK_EXIT 0
+test agentfiles::builtin::tests::step23_a_real_shards_checks_every_builtin ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4395 filtered out; finished in 0.01s
+== 3. mutations
+ crates/kiln/src/harness/claude.rs     |   7 ++
+ crates/kiln/src/harness/kinds.rs      |   3 +-
+ 4 files changed, 158 insertions(+), 3 deletions(-)
+MUTANTS_A_EXIT 101
+test agentfiles::builtin::tests::step19_claude_runs_as_kilns_claude_kind_with_its_home_on_its_volume ... FAILED
+test agentfiles::builtin::tests::step23_every_builtin_pin_and_harness_file_hold ... FAILED
+test result: FAILED. 71 passed; 2 failed; 0 ignored; 0 measured; 4323 filtered out; finished in 0.41s
+Error: harness.json: ["env [\"HOME=/home/claude\", \"DISABLE_UPDATES=1\", \"CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=1\"] isn't [\"HOME=/home/claude\", \"DISABLE_UPDATES=1\", \"CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=0\"]"]
+Error: harness-claude: the Agentfile's BASE isn't its pin's Some("buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da11")
+ crates/kiln/src/harness/claude.rs     |   7 ++
+ crates/kiln/src/harness/kinds.rs      |   3 +-
+ 3 files changed, 157 insertions(+), 2 deletions(-)
+MUTANTS_B_EXIT 101
+test agentfiles::builtin::tests::step19_claude_agentfile_is_the_plans_shape ... FAILED
+test agentfiles::builtin::tests::step19_claude_runs_as_kilns_claude_kind_with_its_home_on_its_volume ... FAILED
+test agentfiles::builtin::tests::step19_a_harness_home_is_its_volume_and_none_is_under_tmp ... FAILED
+test result: FAILED. 70 passed; 3 failed; 0 ignored; 0 measured; 4323 filtered out; finished in 0.40s
+    "VOLUME --target-kind=harness /tmp/claude FOR claude",
+Error: ["/workspace", "/tmp/claude"]
+Error: harness-claude: ["a volume at /tmp/claude", "HOME=/home/claude is none of its volumes [\"/workspace\", \"/tmp/claude\"]"]
+RESTORED 6 changes
+RESTORED_EXIT 0
+test result: ok. 73 passed; 0 failed; 0 ignored; 0 measured; 4323 filtered out; finished in 0.36s
+== 4. step 3
+STEP3 patch f763cdb220d1f17d5eee388255161f870675029efc96e74bf2c46cd962f8fbc7
+ M crates/kiln/src/agentfiles/builtin.rs
+ M crates/kiln/src/agentfiles/mod.rs
+ M crates/kiln/src/entry.rs
+ M crates/kiln/src/harness/claude.rs
+ M crates/kiln/src/harness/kinds.rs
+ M crates/kiln/src/os/unix.rs
+ M crates/kiln/src/os/windows.rs
+?? .kiln/images/harness-claude/Agentfile
+?? .kiln/images/harness-claude/harness.json
+?? .kiln/images/harness-claude/harness.musl.json
+?? crates/kiln/src/agentfiles/cli.rs
+?? crates/kiln/src/agentfiles/context.rs
+?? crates/kiln/src/agentfiles/context/
+STEP3_TEST_EXIT 101
+error[E0373]: closure may outlive the current function, but it borrows `base`, which is owned by the current function
+error: could not compile `kiln` (lib test) due to 1 previous error
+STEP3_CLIPPY_EXIT 101
+error[E0373]: closure may outlive the current function, but it borrows `base`, which is owned by the current function
+   --> crates/kiln/src/agentfiles/context/tests.rs:199:14
+    |
+199 |     let at = |p: &str| format!("{base}{p}");
+    |              ^^^^^^^^^           ---- `base` is borrowed here
+    |              |
+    |              may outlive borrowed value `base`
+    |
+note: function requires argument type to outlive `'static`
+   --> crates/kiln/src/agentfiles/context/tests.rs:205:5
+    |
+205 | /     crate::rt::block_on(async move {
+206 | |         let files: &'static [(&'static str, &'static str)] = &[("harness.json", "{\"schemaVersion\":1}")];
+207 | |         let dir = tempfile::tempdir()?;
+208 | |         let b = test_builtin(pin_of(good.clone()), files);
+...   |
+254 | |         Ok(())
+255 | |     })
+    | |______^
+help: to force the closure to take ownership of `base` (and any other referenced variables), use the `move` keyword
+    |
+199 |     let at = move |p: &str| format!("{base}{p}");
+    |              ++++
+
+For more information about this error, try `rustc --explain E0373`.
+error: could not compile `kiln` (lib test) due to 1 previous error
+SCRIPT_EXIT 0

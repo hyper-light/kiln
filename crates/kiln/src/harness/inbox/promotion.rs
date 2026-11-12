@@ -93,6 +93,7 @@ impl Inbox {
         self.committed(session, cached, Some(head), result).map(|_| ()).map_err(|error| match error { Retry::No(error) => error.into(), _ => storage("promotion head changed concurrently") })
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) async fn prepare_promotion(&self, session: &str, from: u64, to: u64, proof: crate::runner::custody::LegacyProof, pool: &Arc<PhysicalBudget>, input: Option<&Input>) -> Result<(), PromotionError> {
         check_session(session)?;
         proof.validate(session, from, to).map_err(|why| PromotionError::Invalid { why })?;

@@ -122,6 +122,11 @@ pub fn make_executable(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Nothing to do: Windows keeps no Unix permission bits.
+pub fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
 /// Open `path` to read it, sharing it for reading only: until the file is closed nobody can
 /// write, rename or delete it.
 pub fn open_unchangeable(path: &Path) -> io::Result<File> {

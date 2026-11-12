@@ -1,0 +1,130 @@
+# The sibling steps' kiln branches and worktrees, read 2026-11-12T13:48:01Z (kiln origin/main 94639db7b83076143ff48fe5dac6edb9d3a33743)
+BRANCH p/agentfile-pi-v1 7267759f3 2026-11-12T02:30:12-08:00
+BRANCH s20-codex-agentfile c09d23207 2026-11-12T01:59:37-08:00
+BRANCH s21-gemini-agentfile d8a8614b5 2026-11-12T02:28:52-08:00
+BRANCH s22-opencode-agentfile 3d71b1939 2026-11-12T05:47:15-08:00
+BRANCH s23-goose-agentfile 27dc025d9 2026-11-12T05:46:16-08:00
+BRANCH s24-amp-agentfile c8c38109a 2026-11-12T02:24:02-08:00
+BRANCH s25-devin-row 19b4ee5c0 2026-11-12T02:22:54-08:00
+BRANCH s25-unpack a04cffd0c 2026-11-12T01:35:11-08:00
+BRANCH s26-agy-agentfile 4b9bd3440 2026-11-12T02:20:10-08:00
+BRANCH s27-cursor-agentfile e47d2e1d4 2026-11-12T02:28:33-08:00
+BRANCH s27-unpack 94639db7b 2026-11-12T05:42:44-08:00
+## Agentfile instructions (comment and blank lines left out)
+### s23-goose-agentfile .kiln/images/harness-goose/Agentfile
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+FROM ${BASE}
+ARG TARGETARCH
+HARNESS goose FROM ./goose-${TARGETARCH}
+NETWORK --dns --egress=443/tcp provider FOR goose
+EXPOSE --harnesses=goose 443/tcp AS egress FOR provider
+CONNECT goose WITH goose ON provider
+VOLUME --target-kind=harness /workspace FOR goose
+VOLUME --target-kind=harness /home/goose/.local/share/goose FOR goose
+### s23-goose-agentfile .kiln/images/harness-goose/harness.json
+{"schemaVersion":1,"name":"goose","version":"1.59.0","run":{"command":["goose","acp"],"env":["GOOSE_PATH_ROOT=/home/goose/.local/share/goose"]}}
+### s24-amp-agentfile .kiln/images/harness-amp/Agentfile
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+FROM ${BASE}
+ARG TARGETARCH
+HARNESS amp FROM ./amp-${TARGETARCH}
+NETWORK --dns --egress=443/tcp provider FOR amp
+EXPOSE --harnesses=amp 443/tcp AS egress FOR provider
+CONNECT amp WITH amp ON provider
+VOLUME --target-kind=harness /workspace FOR amp
+VOLUME --target-kind=harness /home/amp FOR amp
+### s24-amp-agentfile .kiln/images/harness-amp/harness.json
+{"schemaVersion":1,"name":"amp","version":"0.0.1794456033-gb2ff22","description":"Amp 0.0.1794456033-gb2ff22 over ACP through amp-acp 0.12.0","run":{"command":["amp-acp"],"env":["XDG_CONFIG_HOME=/home/amp/.config","XDG_DATA_HOME=/home/amp/.local/share","XDG_STATE_HOME=/home/amp/.local/state","AMP_SKIP_UPDATE_CHECK=1"]}}
+### s27-cursor-agentfile .kiln/images/harness-cursor/Agentfile
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+FROM ${BASE}
+ARG TARGETARCH
+HARNESS cursor FROM ./cursor-${TARGETARCH}
+NETWORK --dns --egress=443/tcp provider FOR cursor
+EXPOSE --harnesses=cursor 443/tcp AS egress FOR provider
+CONNECT cursor WITH cursor ON provider
+VOLUME --target-kind=harness /workspace FOR cursor
+VOLUME --target-kind=harness /home/cursor FOR cursor
+### s27-cursor-agentfile .kiln/images/harness-cursor/harness.json
+{"schemaVersion":1,"name":"cursor","version":"2026.11.11-b912975","run":{"command":["cursor-agent","--disable-auto-update","acp"],"env":["HOME=/home/cursor","XDG_CACHE_HOME=/tmp/.cache","NO_OPEN_BROWSER=1"]}}
+## pin.json: top-level keys, and each build's platform, variant and file fields
+### b89452884 .kiln/images/harness-pi/pin.json
+{"keys":["base","builds","commit","harness","published_at","read_at","tag","tools","verified","version"],"base_type":"object","verified_type":"array"}
+{"platform":"linux/amd64","variant":null,"files":[{"keys":"path,sha256,size,unpack,url","path":".","mode":null,"unpack":{"format":"tar.gz","strip":1}},{"keys":"mode,path,sha256,size,unpack,url","path":"bin/rg","mode":"0755","unpack":{"format":"tar.gz","member":"ripgrep-15.2.0-x86_64-unknown-linux-musl/rg"}},{"keys":"mode,path,sha256,size,unpack,url","path":"bin/fd","mode":"0755","unpack":{"format":"tar.gz","member":"fd-v10.5.2-x86_64-unknown-linux-musl/fd"}}]}
+{"platform":"linux/arm64","variant":null,"files":[{"keys":"path,sha256,size,unpack,url","path":".","mode":null,"unpack":{"format":"tar.gz","strip":1}},{"keys":"mode,path,sha256,size,unpack,url","path":"bin/rg","mode":"0755","unpack":{"format":"tar.gz","member":"ripgrep-15.2.0-aarch64-unknown-linux-musl/rg"}},{"keys":"mode,path,sha256,size,unpack,url","path":"bin/fd","mode":"0755","unpack":{"format":"tar.gz","member":"fd-v10.5.2-aarch64-unknown-linux-musl/fd"}}]}
+### s25-devin-row .kiln/images/harness-devin/pin.json
+{"keys":["base","builds","harness","manifest","read_at","verified","version"],"base_type":"object","verified_type":"string"}
+{"platform":"linux/amd64","variant":null,"files":[{"keys":"path,sha256,size,unpack,url","path":".","mode":null,"unpack":{"format":"tar.gz"}}]}
+{"platform":"linux/arm64","variant":null,"files":[{"keys":"path,sha256,size,unpack,url","path":".","mode":null,"unpack":{"format":"tar.gz"}}]}
+### s23-goose-agentfile .kiln/images/harness-goose/pin.json
+{"keys":["base","builds","channel","read_at","verified","version"],"base_type":"string","verified_type":"object"}
+{"platform":"linux/amd64","variant":null,"files":[{"keys":"mode,path,sha256,size,unpack,url","path":"bin/goose","mode":"0755","unpack":{"format":"tar.gz","member":"goose","sha256":"461ea83fc8736fa0ad608661a8e5ef8c704da886d38500441ba2b91f7184d9f5","size":154218008}}]}
+{"platform":"linux/arm64","variant":null,"files":[{"keys":"mode,path,sha256,size,unpack,url","path":"bin/goose","mode":"0755","unpack":{"format":"tar.gz","member":"goose","sha256":"c27e6ea558a39a9af96dcc04368296ca636e40a67c96cdac56a6f644488fb673","size":148726128}}]}
+### s24-amp-agentfile .kiln/images/harness-amp/pin.json
+{"keys":["base","builds","harness","read_at","verified","version"],"base_type":"string","verified_type":"object"}
+{"platform":"linux/amd64","variant":null,"files":[{"keys":"mode,path,sha256,size,url","path":"bin/amp","mode":"0755","unpack":null},{"keys":"mode,path,sha256,size,url","path":"bin/amp-acp","mode":"0755","unpack":null}]}
+{"platform":"linux/arm64","variant":null,"files":[{"keys":"mode,path,sha256,size,url","path":"bin/amp","mode":"0755","unpack":null},{"keys":"mode,path,sha256,size,url","path":"bin/amp-acp","mode":"0755","unpack":null}]}
+### s22-opencode-agentfile .kiln/images/harness-opencode/pin.json
+{"keys":["base","builds","harness","read","smoke","tag","verified","version"],"base_type":"string","verified_type":"object"}
+{"platform":"linux/amd64","variant":"gnu","files":[{"keys":"mode,path,sha256,size,unpack,url","path":"bin/opencode","mode":"0755","unpack":{"format":"tar.gz","member":"opencode","sha256":"589253d36810f21217edd51545cd435b328cdc3cf4f451fbe0cce6f88afcf5e1","size":258848944}},{"keys":"mode,path,sha256,size,url","path":"LICENSE","mode":"0644","unpack":null}]}
+{"platform":"linux/amd64","variant":"musl","files":[{"keys":"mode,path,sha256,size,unpack,url","path":"bin/opencode","mode":"0755","unpack":{"format":"tar.gz","member":"opencode","sha256":"aeae3102ab6360a0ac3ea56537a643cd02727f766a1da30cb770240f7bf1cf02","size":261027240}},{"keys":"mode,path,sha256,size,url","path":"LICENSE","mode":"0644","unpack":null}]}
+{"platform":"linux/arm64","variant":"gnu","files":[{"keys":"mode,path,sha256,size,unpack,url","path":"bin/opencode","mode":"0755","unpack":{"format":"tar.gz","member":"opencode","sha256":"c577783eacf7d1e66661fc7fd904b7646761497b687ff8f8f82ebe4f2f3ea425","size":253873144}},{"keys":"mode,path,sha256,size,url","path":"LICENSE","mode":"0644","unpack":null}]}
+{"platform":"linux/arm64","variant":"musl","files":[{"keys":"mode,path,sha256,size,unpack,url","path":"bin/opencode","mode":"0755","unpack":{"format":"tar.gz","member":"opencode","sha256":"b4203e9861d0472e711493a34e8d843fb249cf9bf499b69cfdc64416085d87c6","size":253697128}},{"keys":"mode,path,sha256,size,url","path":"LICENSE","mode":"0644","unpack":null}]}
+### s21-gemini-agentfile .kiln/images/harness-gemini/pin.json
+{"keys":["base","builds","channel","harness","read_at","smoke","verified","version"],"base_type":"object","verified_type":"object"}
+{"platform":"linux/amd64","variant":"gnu","files":[{"keys":"mode,path,sha256,size,unpack,url","path":"node/bin/node","mode":"0755","unpack":{"format":"tar.gz","member":"node-v24.22.3-linux-x64/bin/node"}},{"keys":"mode,path,sha256,size,unpack,url","path":"node/LICENSE","mode":"0644","unpack":{"format":"tar.gz","member":"node-v24.22.3-linux-x64/LICENSE"}},{"keys":"path,sha256,size,unpack,url","path":".","mode":null,"unpack":{"format":"tar.gz","strip":1}}]}
+{"platform":"linux/arm64","variant":"gnu","files":[{"keys":"mode,path,sha256,size,unpack,url","path":"node/bin/node","mode":"0755","unpack":{"format":"tar.gz","member":"node-v24.22.3-linux-arm64/bin/node"}},{"keys":"mode,path,sha256,size,unpack,url","path":"node/LICENSE","mode":"0644","unpack":{"format":"tar.gz","member":"node-v24.22.3-linux-arm64/LICENSE"}},{"keys":"path,sha256,size,unpack,url","path":".","mode":null,"unpack":{"format":"tar.gz","strip":1}}]}
+{"platform":"linux/amd64","variant":"musl","files":[{"keys":"path,sha256,size,unpack,url","path":".","mode":null,"unpack":{"format":"tar.gz","strip":1}}]}
+{"platform":"linux/arm64","variant":"musl","files":[{"keys":"path,sha256,size,unpack,url","path":".","mode":null,"unpack":{"format":"tar.gz","strip":1}}]}
+### s26-agy-agentfile .kiln/images/harness-antigravity/pin.json
+{"keys":["base","builds","execution_id","harness","verified","version"],"base_type":"string","verified_type":"object"}
+{"platform":"linux/amd64","variant":null,"files":[{"keys":"mode,path,sha256,sha512,size,unpack,url","path":"bin/agy","mode":"0755","unpack":{"format":"tar.gz","member":"antigravity","sha256":"e01e1a3af269ce5a3fd8ace31849390128196221346909e90b8d9973776da513","size":251006408}}]}
+{"platform":"linux/arm64","variant":null,"files":[{"keys":"mode,path,sha256,sha512,size,unpack,url","path":"bin/agy","mode":"0755","unpack":{"format":"tar.gz","member":"antigravity","sha256":"982622e3176899affda6d095eec521b7a8f1af88645412b478b6d12b419e0cea","size":237939520}}]}
+## Uncommitted Builtin fields in sibling worktrees (git diff of crates/kiln/src/agentfiles/builtin.rs)
+### agentfile-pi-v1
++    pub pin: &'static str,
++    pub files: &'static [(&'static str, &'static str)],
++        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-pi/harness.json"))],
+### s25-devin-row
++    pub pin: &'static str,
++    pub files: &'static [(&'static str, &'static str)],
++        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-devin/harness.json"))],
+### s26-agy-agentfile
++    pub pin: &'static str,
++    pub files: &'static [(&'static str, &'static str)],
++        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-antigravity/harness.json"))],
+## Step 25's unpacker: git log -1 a04cffd0
+a04cffd0cd0ffb72c8807437ad49181dfe826c5f 2026-11-12T01:35:11-08:00
+tar.gz unpacking for the Agentfiles' context fetcher (kiln plan 01a1ce705e4d7008993f5c7291ef4476, step 2)
+
+agentfiles::unpack::tar_gz unpacks a gzip tar whose size and SHA-256 have matched its pin into a
+harness's per-arch directory: every entry into a fresh directory inside it, each header checked
+before tar writes anything; then the top-level entries renamed into place, never over a name already
+there; then the directories given their modes in place, deepest first; then the archive removed.
+Only directories and regular files are taken, at relative paths without `..` and without set-ID bits.
+Links, devices, FIFOs and every other kind refuse the archive, naming the entry:
+Unpack { url, entry, why: Link | Device | Escapes | SetId | Kind | Io }. tar 0.4.46's own unpack_in
+strips a leading `/`, skips `..`, makes links and writes devices and unknown kinds as regular files,
+so each check is kiln's. Directories stay writable until they're placed, since Linux moves a
+read-only directory to another parent for no one but root (rename(2), EACCES). On failure nothing
+it made is left, nor the archive. No marker is written beside the entries (f26).
+
+Decided by step 25's coordinator, overriding the step's text, which said set-ID and sticky bits are
+cleared: set-ID bits refuse the archive (SetId), as pin.sh and Shards' check of an artifact refuse
+them, and modes are kept as pinned. The sticky bit is never applied (mode & 0o777). FIFOs are
+Device; Kind(typeflag) names any other kind; pax and GNU metadata headers are passed over by name.
+
+Step 19's fetcher isn't committed yet, so its hook, the HTTP light-integration test and the live
+context wait for it. Devin's two pinned bundles (3000.12.43) hold 234 regular files and 16
+directories each, and nothing else (their raw headers: docs/research/s25-devin-agentfile/evidence/).
+macOS arm64 (Mac Studio, kiln run r10): the module's 5 tests pass. clippy -D warnings on
+-p kiln --all-targets reports one error, step 30's (an unused import in agentfiles/tests.rs), none
+of this change's. Linux and the mutations are owed: docs/research/s25-devin-agentfile/unpack.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### its tar_gz at a04cffd0
+77:pub fn tar_gz(archive: &Path, url: &str, into: &Path) -> Result<(), Unpack> {
+### the s25-unpack worktree, uncommitted
+ M crates/kiln/src/agentfiles/unpack.rs
+186:pub fn tar_gz(archive: &Path, url: &str, spec: &Spec, root: &Path, path: &Path, mode: Option<u32>) -> Result<(), Unpack> {
