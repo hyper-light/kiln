@@ -12,6 +12,8 @@
 //!   its entries and its files' bytes are the pin's, and its modes are set (Devin's bundle at strip 0;
 //!   pi's and Cursor's, their leading directory stripped). The fetcher unpacks a build's trees first,
 //!   then its members, then writes its harness file, so a tree's target is never there before it.
+//!   Files its `skip` names are checked and counted as every entry is, but not written, so a member
+//!   can take their place (Codex's arm64 `codex-path/rg`, which ripgrep's static build replaces).
 //! - a [`Member`]: one regular file, written at the pin file's path and held to its own pinned size
 //!   and SHA-256 (pi's `bin/rg` and `bin/fd`; agy's binary). A member the pin says the archive holds
 //!   `alone` (agy's) refuses the archive if any other entry is there.
@@ -70,7 +72,7 @@ pub struct Member {
 /// A whole archive, its first `strip` names dropped, renamed into place at the pin file's path (step
 /// 27's form). Its totals are measured from the archive at pin time, so the bound comes from the pinned
 /// data (R03).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tree {
     /// How many leading names each entry's path loses, `.` not counted.
     pub strip: usize,
@@ -79,6 +81,12 @@ pub struct Tree {
     /// Its directories and regular files in all, as `tar -t` lists them: the leading directories the
     /// strip drops included, tar's own metadata (pax and GNU long-name headers) not.
     pub entries: u64,
+    /// Regular files of it, by their paths once the strip has dropped its names, that are checked and
+    /// counted as every entry is but not written, so a member the pin lists after the tree can be that
+    /// file: nothing is ever overwritten. Codex's arm64 package carries a glibc `codex-path/rg`, which
+    /// Codex runs whenever it's a file, so ripgrep's static build has to sit at that path (kiln plan
+    /// 01a1ce705d7076648c1d9f9ee26214d3, f11 and f23). Each must be one the archive holds.
+    pub skip: Vec<String>,
 }
 
 /// pin.json's `unpack` object as written, before it's one [`Spec`]: no field beside these.
@@ -93,6 +101,7 @@ pub struct Fields {
     pub strip: Option<usize>,
     pub unpacked_bytes: Option<u64>,
     pub entries: Option<u64>,
+    pub skip: Option<Vec<String>>,
 }
 
 impl TryFrom<Fields> for Spec {
@@ -103,7 +112,7 @@ impl TryFrom<Fields> for Spec {
             return Err(Why::Format(f.format));
         }
         let member = f.member.is_some() || f.sha256.is_some() || f.size.is_some() || f.alone.is_some();
-        let tree = f.strip.is_some() || f.unpacked_bytes.is_some() || f.entries.is_some();
+        let tree = f.strip.is_some() || f.unpacked_bytes.is_some() || f.entries.is_some() || f.skip.is_some();
         match (member, tree) {
             (true, true) => Err(Why::Both),
             (false, false) => Err(Why::Neither),
@@ -117,6 +126,7 @@ impl TryFrom<Fields> for Spec {
                 strip: f.strip.ok_or(Why::Lacks("strip"))?,
                 unpacked_bytes: f.unpacked_bytes.ok_or(Why::Lacks("unpacked_bytes"))?,
                 entries: f.entries.ok_or(Why::Lacks("entries"))?,
+                skip: f.skip.unwrap_or_default(),
             })),
         }
     }
@@ -142,7 +152,7 @@ pub enum Why {
     #[error("a device or a FIFO, which a harness may not hold")]
     Device,
     /// A kind this doesn't take there, by its typeflag: neither a directory nor a regular file (tar has
-    /// no kind for a socket), or a member that isn't a regular file.
+    /// no kind for a socket), or a member or a tree's skipped path that isn't a regular file.
     #[error("an entry of type '{}', which this doesn't take", typeflag(.0))]
     Kind(u8),
     /// A path, an entry's or the pin's, that's absolute, climbs out with `..`, or names nothing.
@@ -155,7 +165,8 @@ pub enum Why {
     /// A file the strip leaves no name, which would be dropped unseen.
     #[error("a file the strip leaves no name")]
     Nameless,
-    /// The same path as an entry before it, a directory's too, which one would take the other's place.
+    /// The same path as an entry before it, a directory's too, which one would take the other's place;
+    /// or a path a tree's `skip` names twice.
     #[error("the same path as an entry before it")]
     Duplicate,
     /// `harness.json` (ASCII case aside) at the root of a tree unpacked at the per-arch directory's,
@@ -171,7 +182,7 @@ pub enum Why {
     /// A path that's there already: a tree's target, or a member's file (under the per-arch directory).
     #[error("{} is there already, and nothing is overwritten", .0.display())]
     Exists(PathBuf),
-    /// No entry is the member the pin names.
+    /// No entry is the member the pin names, or a file its tree's `skip` names.
     #[error("the archive holds no such member")]
     Missing,
     /// An entry beside the member the pin says the archive holds alone.
@@ -251,13 +262,14 @@ pub fn tar_gz(archive: &Path, url: &str, spec: &Spec, root: &Path, path: &Path, 
 /// The tree into staging, then staging renamed to the first directory on the way to `root/at` that
 /// isn't there: so nothing of the tree shows until all of it is in. On failure staging is discarded.
 fn unpack_tree(archive: &Path, tree: &Tree, root: &Path, at: &Path) -> Result<(), Fault> {
+    let skip = Skip::of(&tree.skip)?;
     let (unit, under) = first_missing(root, at)?;
     let staging = staging_for(&unit)?;
     fs::create_dir(&staging).map_err(io_fault)?;
     let inner = staging.join(&under);
     let done = fs::create_dir_all(&inner)
         .map_err(io_fault)
-        .and_then(|()| fill(archive, tree, &inner, at))
+        .and_then(|()| fill(archive, tree, skip, &inner, at))
         .and_then(|dirs| modes(&staging, &under, &dirs))
         .and_then(|()| fs::rename(&staging, &unit).map_err(io_fault));
     if done.is_err() {
@@ -299,10 +311,52 @@ struct Dirs {
     root: Option<u32>,
 }
 
+/// A tree's `skip`: each path as the strip leaves an entry's, with the pin's words for it and whether the
+/// archive has held it yet.
+struct Skip<'a>(BTreeMap<PathBuf, (&'a str, bool)>);
+
+impl<'a> Skip<'a> {
+    /// The pin's list, before the archive is read: each refused if it's outside the tree or names
+    /// nothing, or if it's named twice.
+    fn of(paths: &'a [String]) -> Result<Self, Fault> {
+        let mut skip = BTreeMap::new();
+        for shown in paths {
+            let path = Path::new(shown);
+            if escapes(path) || names(path).next().is_none() {
+                return Err((Some(shown.clone()), Why::Escapes));
+            }
+            if skip.insert(clean(path), (shown.as_str(), false)).is_some() {
+                return Err((Some(shown.clone()), Why::Duplicate));
+            }
+        }
+        Ok(Skip(skip))
+    }
+
+    fn lists(&self, rel: &Path) -> bool {
+        self.0.contains_key(rel)
+    }
+
+    /// Whether the file at `rel` is one to skip, noting that the archive holds it.
+    fn take(&mut self, rel: &Path) -> bool {
+        match self.0.get_mut(rel) {
+            Some((_, held)) => {
+                *held = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The first the archive didn't hold, in the pin's words.
+    fn missing(&self) -> Option<&'a str> {
+        self.0.values().find(|(_, held)| !held).map(|(shown, _)| *shown)
+    }
+}
+
 /// Every entry of the tree into `inner` (`at`: where that is under the per-arch directory), each checked
 /// before it's written, and its totals held to the pin's: as they come, so nothing past the pin's bound
-/// is written, and at the end.
-fn fill(archive: &Path, tree: &Tree, inner: &Path, at: &Path) -> Result<Dirs, Fault> {
+/// is written, and at the end. A skipped file is checked and counted, never written.
+fn fill(archive: &Path, tree: &Tree, mut skip: Skip<'_>, inner: &Path, at: &Path) -> Result<Dirs, Fault> {
     let mut tar = open(archive)?;
     let mut seen = Seen::default();
     let mut dirs = Dirs::default();
@@ -327,12 +381,18 @@ fn fill(archive: &Path, tree: &Tree, inner: &Path, at: &Path) -> Result<Dirs, Fa
                     return Err(at_fault(Why::Bytes { expected: tree.unpacked_bytes, got: bytes }));
                 }
                 harness(at, &rel).map_err(at_fault)?;
+                if skip.take(&rel) {
+                    continue;
+                }
                 if let Some(parent) = rel.parent() {
                     make(inner, parent, &mut dirs.under).map_err(at_fault)?;
                 }
                 copy(&mut entry, &inner.join(&rel), &at.join(&rel), None, kept(mode)).map_err(at_fault)?;
             }
             Goes::Dir { rel, mode } => {
+                if skip.lists(&rel) {
+                    return Err(at_fault(Why::Kind(EntryType::Directory.as_byte())));
+                }
                 harness(at, &rel).map_err(at_fault)?;
                 make(inner, &rel, &mut dirs.under).map_err(at_fault)?;
                 dirs.under.insert(rel, kept(mode));
@@ -344,6 +404,9 @@ fn fill(archive: &Path, tree: &Tree, inner: &Path, at: &Path) -> Result<Dirs, Fa
     }
     if bytes != tree.unpacked_bytes {
         return Err((None, Why::Bytes { expected: tree.unpacked_bytes, got: bytes }));
+    }
+    if let Some(shown) = skip.missing() {
+        return Err((Some(shown.to_owned()), Why::Missing));
     }
     Ok(dirs)
 }
