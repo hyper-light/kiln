@@ -1,0 +1,39 @@
+[2m[kiln] on 00aad8daff2fa3c9daa65d53c425d450 · linux/x86_64 · 19 of 32 cores idle · 38 GB free · room for 4 CPUs, 12 GiB of memory · memory pressure 5% · I/O pressure 4%[0m
+== host: Linux 7.3.3-1-cachyos x86_64 adacachy2 2026-11-12T15:04:01Z
+rustc 1.98.1 (48a229cea 2026-09-01)
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+clippy 0.1.98 (48a229ceae 2026-09-01)
+== tree: 94639db7b83076143ff48fe5dac6edb9d3a33743
+ M crates/kiln/src/agentfiles/mod.rs
+?? .s25-base/
+?? crates/kiln/src/agentfiles/unpack.rs
+?? crates/kiln/src/agentfiles/unpack/
+?? docs/research/s27-cursor-agentfile/
+== crates/kiln/src/agentfiles/unpack.rs c839318f8d148e5b23106aaf1af5b8050606df9a8987ca15b8a77da5ddfe2838
+== crates/kiln/src/agentfiles/unpack/tests.rs c0f93809d48f83aeb047afb15e1e457ed43e4a0e7b3611c665bf75b7513cf1cb
+== crates/kiln/src/agentfiles/mod.rs c882e23c7355c0167d74e36f818dc5dc77e2f4526b57d50fa4366e6142bab1f2
+ci/gate.sh: the gate of /home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/s27-unpack-1c5a800bdd at 94639db7b, natively on linux/x86_64
+asked: 4 CPUs, 12G of memory (from --cpus and --mem)
+caps: MemoryMax=12G CPUWeight=1 Nice=19 IOWeight=1 (systemd user unit kiln-gate-5c35ff4eddf3-20261112T150401Z-2777875)
+cargo: -j 4, 4 test threads
+io weight: /dev/nvme0n1: not enforced, its scheduler is kyber and io.cost is off (root's, once: BFQ, or io.cost.qos enable=1)
+memory: each step's peak anonymous memory in its unit (memory.stat's anon: page cache left out), sampled every 2 s
+guard: the I/O pressure (full avg10) of kiln's services here (kiln-agent-01a1b969.service) over 30, 3 checks running (10 s apart), yields (GATE: YIELDED, exit 75); its numbers are still to derive (ci/gate.sh says from what)
+scope: kiln
+  kiln: asked for (-p)
+steps:
+  1. clippy: cargo clippy --locked -p kiln --all-targets -j 4 -- -D warnings
+build: /home/adalundhe/.cache/s27-unpack/target; this run's git config and logs in /home/adalundhe/.cache/kiln-gate/5c35ff4eddf3/runs/20261112T150401Z-2777875, its TMPDIR in /home/adalundhe/.cache/kiln-gate/5c35ff4eddf3/t
+::: clippy: cargo clippy --locked -p kiln --all-targets -j 4 -- -D warnings
+    passed in 290 s, anonymous memory peak 11.7 GiB
+systemd-run, and the unit's stderr:
+  Running as unit: kiln-gate-5c35ff4eddf3-20261112T150401Z-2777875.service
+            Finished with result: success
+  Main processes terminated with: code=exited, status=0/SUCCESS
+                 Service runtime: 4min 49.504s
+               CPU time consumed: 10min 12.810s
+                     Memory peak: 12G (swap: 11.4G)
+GATE: PASS
+== gate exit: 0
+[2m[kiln] used memory not measured, 322 ms of CPU (counted by the system, 0.001 CPUs on average) over 4 min 49 s; OOM kills not seen here[0m
+kiln run exit 0

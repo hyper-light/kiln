@@ -1,0 +1,7 @@
+[2m[kiln] on d1323898b255a3ed435eb83fa0f7b0cf · macos/aarch64 · 31 of 32 cores idle · 59 GB free · room for 4 CPUs, 12 GiB of memory[0m
+[2m[kiln] syncing 17162 files (647.7 MB)…[0m
+[2m[kiln] syncing 17162 files (647.7 MB)…[0m
+[2m[kiln] syncing 17162 files (647.6 MB)…[0m
+[2m[kiln] syncing 17162 files (647.7 MB)…[0m
+[2m2026-11-12T14:50:00.350342Z[0m [31mERROR[0m d1323898b255a3ed435eb83fa0f7b0cf did not answer the sync in 60s
+kiln run exit 1
