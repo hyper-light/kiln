@@ -125,6 +125,15 @@ Both started 2026-11-12T14:44:59Z.
 `cargo test -p kiln --lib agentfiles::` passed 49 of 49, among them the coordinator's codex_tests on the
 re-pinned pin and the new every_builtins_pinned_unpack_is_a_spec. Clippy exited 0.
 
+### macOS and Windows (scratch crate)
+
+The committed unpack.rs (674161d0…) and its tests, the built-in test aside (it needs the kiln crate),
+through `scripts/step3-run-scratch-portable.sh`:
+- `evidence/e_step3_scratch_macos.txt`: adas-mac-studio.local-2, Darwin 25.4.0 arm64, rustc 1.99.1. 18
+  passed; clippy --all-targets -D warnings exit 0.
+- `evidence/e_step3_scratch_windows.txt`: jupiter, MINGW64 on Windows 10.0.26200 x86_64, rustc 1.99.0.
+  16 passed, step 27's two `cfg(unix)` tests compiled out; clippy exit 0.
+
 ### The final run, on what is committed
 
 `evidence/e_step3_kiln_final.txt` (`scripts/step3-start-kiln-final.sh`), on adacachy2 at
@@ -173,7 +182,7 @@ coordinator's.
 | R08 measured results | Not applicable: a correctness rule, with no performance claim made. |
 | R09 reproduce first | Both defects are reproduced by tests: without skip, ripgrep's member is Exists (`without_its_skip…`); a tree without totals doesn't parse (M8). |
 | R10 durable evidence | Logs in `evidence/e_step3_*`. Eight mutants (M1-M7 in the scratch crate, M8 in the kiln crate), each failing for its reason. |
-| R11 platforms | Linux x86_64 (adacachy2) only so far. macOS arm64 and Windows are unrun for this change: the module's mode code is step 27's `cfg(unix)`, and this change adds none. Listed as unverified. |
+| R11 platforms | The module and its tests: Linux x86_64 (adacachy2, the kiln crate and the scratch crate), macOS arm64 (adas-mac-studio.local-2, Darwin 25.4.0, rustc 1.99.1: 18 of 18) and Windows x86_64 (jupiter, MINGW64 on Windows 10.0.26200, rustc 1.99.0: 16 of 16, step 27's two `cfg(unix)` tests compiled out), with clippy -D warnings clean on each. Unverified: the kiln crate's own build on macOS and Windows, and Linux arm64. |
 | R12 share implementations | Extends the one shared unpacker. No second unpacker and no second fetcher. Duplicate pin edits were dropped for the coordinator's. |
 | R13 simple | The smallest change that lets the arm64 rg member be written: one tree field. |
 | R14 profiling | Not done: ROOT's. No speed or allocation claim. |
