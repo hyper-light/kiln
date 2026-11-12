@@ -69,6 +69,7 @@ bytes) stops the server at start, saying which.
 | `binaries/kiln-<target>`, `binaries/kiln-<target>.json` | runner upgrade binaries for other platforms, and what kiln knows of each | `updates` | when it's removed (Settings → Updates) or replaced |
 | `recordings/<session>/<recording>/<file>` | live pages' recordings (video, log, test), copied from their machine when they end | `harness::streams` | when the conversation closes |
 | `transcripts/<session>/<source>/<first>-<last>.jsonl.br` | a piece of a closed conversation's own record (Claude Code's transcript, Codex's rollouts): lines `first` to `last`, brotli, written once and never replaced | `harness::archive` | `[conversations] keep_archived_days` (365) after its last close; the conversation store lets no record go before it's archived, or given up 30 days past its own keeping |
+| `agentfiles/sha256/<sha256>` | an Agentfile's text (docs/api.md, "Agentfiles"), once for every Agentfile and version that has it, whoever's; kiln.db's `agentfiles` and `agentfile_versions` name it by its SHA-256 | `agentfiles` | as soon as no Agentfile or version names it: when the last that does is deleted, or when the record it was kept for wasn't written. A text is kept, and its record written, and a text no record names is let go, one at a time on the server, so a write finding its text kept already never loses it to a delete |
 
 Keys are 1 to 960 bytes of UTF-8, in `/`-separated segments of 1 to 254 bytes, with no `.` or
 `..` segment, no segment ending in a space, no control characters and no backslash: the same keys
@@ -278,7 +279,7 @@ kept as files.
 - `kiln_blobs_request_seconds{store, op}`: how long each took.
 - `kiln_blobs_bytes_total{store, direction}`: bytes `written` and `read`.
 - `kiln_blobs_collected_total{kind}`: objects let go that nothing refers to any more, by what kept
-  them: `cas`, `sync`, `recordings`, `transcripts`.
+  them: `cas`, `sync`, `recordings`, `transcripts`, `agentfiles`.
 - `kiln_blobs_archives_given_up_total`: closed conversations whose record couldn't be archived in
   the 30 days held past the conversation store's keeping, given up and let go by the store; each is
   an event `given_up` naming the session and the sources of its record.

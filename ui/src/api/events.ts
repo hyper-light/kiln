@@ -105,6 +105,7 @@ const EVENT_FRAMES = {
   refused: true,
   ship: true,
   pipelines: true,
+  agentfile: true,
   "run.succeeded": true,
   "run.fixed": true,
   "run.cancelled": true,
