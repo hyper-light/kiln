@@ -10,7 +10,8 @@
 #
 # The archives are Google's static musl builds (no loader or libc from the base image), each a
 # .tar.gz whose one entry is the regular file `antigravity`, installed as bin/agy, the name
-# Google's installer gives it.
+# Google's installer gives it. The pin says the archive holds it alone (`"alone": true`, checked
+# here), so kiln's unpacker refuses an archive with any other entry (plan step 3).
 #
 # The pin also records the smoke an image's agy must pass, in the shape every harness's pin gives
 # its own (kiln plan step 19's layout): `bin/agy --version` prints the version and a newline (1.5.6's
@@ -151,7 +152,7 @@ rest = a[8:]
 builds, manifests = [], []
 for i in range(0, len(rest), 9):
     platform, url, sha256, sha512, size, m256, msize, murl, msha = rest[i:i + 9]
-    builds.append({"platform": platform, "files": [{"url": url, "sha256": sha256, "sha512": sha512, "size": int(size), "path": "bin/agy", "mode": "0755", "unpack": {"format": "tar.gz", "member": "antigravity", "sha256": m256, "size": int(msize)}}]})
+    builds.append({"platform": platform, "files": [{"url": url, "sha256": sha256, "sha512": sha512, "size": int(size), "path": "bin/agy", "mode": "0755", "unpack": {"format": "tar.gz", "member": "antigravity", "alone": True, "sha256": m256, "size": int(msize)}}]})
     manifests.append({"url": murl, "sha256": msha})
 pin = {
     "harness": harness,

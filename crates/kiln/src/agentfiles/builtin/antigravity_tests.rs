@@ -42,7 +42,8 @@ fn lowercase_hex(s: &str, digits: usize) -> bool {
 /// The pin: agy's version and its release's execution id, the base by digest, the two manifests
 /// read, and linux/amd64 and linux/arm64 once each, each one .tar.gz from that release's directory
 /// by HTTPS URL, SHA-256, SHA-512 and size, whose one member, antigravity, becomes bin/agy (0755)
-/// by its own SHA-256 and size: the shared unpack's member form alone, never its tree's.
+/// by its own SHA-256 and size: the shared unpack's member form alone, never its tree's, held
+/// alone, as pin.sh found it the archive's only entry (plan step 3).
 fn check_pin(pin: &str) -> anyhow::Result<Value> {
     let p: Value = serde_json::from_str(pin).context("pin.json doesn't parse")?;
     ensure!(p.get("harness").and_then(Value::as_str) == Some("antigravity"), "the pin isn't antigravity's");
@@ -75,7 +76,8 @@ fn check_pin(pin: &str) -> anyhow::Result<Value> {
         let unpack = file.get("unpack").and_then(Value::as_object).ok_or_else(|| anyhow!("{platform}: the archive isn't unpacked"))?;
         let mut keys: Vec<&str> = unpack.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        ensure!(keys == ["format", "member", "sha256", "size"], "{platform}: unpack has {keys:?}, not the member form's format, member, sha256 and size");
+        ensure!(keys == ["alone", "format", "member", "sha256", "size"], "{platform}: unpack has {keys:?}, not the member form's format, member, alone, sha256 and size");
+        ensure!(unpack.get("alone").and_then(Value::as_bool) == Some(true), "{platform}: the member isn't held alone");
         ensure!(unpack.get("format").and_then(Value::as_str) == Some("tar.gz"), "{platform}: unpack isn't of a tar.gz");
         ensure!(unpack.get("member").and_then(Value::as_str) == Some("antigravity"), "{platform}: unpack's member isn't antigravity");
         let member = unpack.get("sha256").and_then(Value::as_str).unwrap_or_default();
@@ -249,6 +251,11 @@ fn antigravity_pin_names_agy_for_both_platforms() -> anyhow::Result<()> {
         Some(())
     })?;
     ensure!(check_pin(&other_member).is_err(), "a member other than antigravity passed");
+    let not_alone = edited(b.pin, |p| {
+        *file_of(p, "linux/arm64")?.pointer_mut("/unpack/alone")? = Value::from(false);
+        Some(())
+    })?;
+    ensure!(check_pin(&not_alone).is_err(), "a member not held alone passed");
     let both_forms = edited(b.pin, |p| {
         file_of(p, "linux/amd64")?.get_mut("unpack")?.as_object_mut()?.insert("strip".into(), Value::from(1));
         Some(())
