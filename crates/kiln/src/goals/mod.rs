@@ -4093,6 +4093,7 @@ mod tests {
     /// session on its way elsewhere, or its runner's new build not promoted yet: refused before its
     /// inbox looks at the id), keeps that id: once its session takes messages again it's answered
     /// as the repeat it is, and the agent is sent the goal's first message once.
+    #[cfg(unix)]
     #[test]
     fn a_goal_message_refused_on_its_retry_keeps_its_id() -> anyhow::Result<()> {
         async fn item(hub: &Hub) -> anyhow::Result<(String, Option<String>)> {
@@ -4160,6 +4161,7 @@ mod tests {
     /// brought back before it's sent again: sent again, it's answered as the repeat it is, and the
     /// agent is sent the goal's first message once. Bringing goals back rewrites every goal of the
     /// stack, and used to write that one without its id.
+    #[cfg(unix)]
     #[test]
     fn a_goal_sent_before_a_restart_keeps_its_message_s_id_when_cleared_goals_are_brought_back() -> anyhow::Result<()> {
         async fn item(hub: &Hub) -> anyhow::Result<(String, Option<String>)> {
@@ -4234,6 +4236,7 @@ mod tests {
     /// under the id the driver kept for it: answered as the repeat it is, the agent is sent the
     /// goal's first message once. The clear can't withdraw a send it never heard answered, nor clear
     /// in the harness a goal it doesn't know went; its stack used to keep the goal without the id.
+    #[cfg(unix)]
     #[test]
     fn a_goal_sent_before_a_restart_then_cleared_and_brought_back_reaches_its_agent_once() -> anyhow::Result<()> {
         async fn item(hub: &Hub) -> anyhow::Result<Option<(String, Option<String>)>> {

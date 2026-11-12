@@ -236,6 +236,33 @@ machine holds as many agents at work as it may, it starts again once there's roo
 A runner that starts again (an upgrade, a crash, the system stopping it) starts each of its agents
 again the same way, from its record (above).
 
+**Not on Windows yet** (owed, Windows parity: kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, 2026-11-12).
+W20's native hand-over moves a native session between kiln processes with its descriptors passed
+over Unix sockets (`SCM_RIGHTS`), so these exist on Linux and macOS alone, their callers Unix's
+(`#[cfg(unix)]`), and a Windows runner has none of them:
+
+- **The session's mail journal, handed over with it:** its transfer manifest and journal file go to
+  the process that takes it (`harness::host::Saved::mail_manifest`, `journal`, `attach_journal`),
+  and the source timeline is signed before the journal changes owner
+  (`harness::core::Frozen::handover_source`).
+- **Promoting a session an older kiln opened** to the hand-over's epoch, blue/green:
+  - its proof (`runner::custody::LegacyProof::of`, and the receipt that settles it, `receipt`);
+  - its durable promotion record (`harness::inbox::Inbox::prepare_promotion`, `Host::prepare_legacy_promotion`);
+  - the step to the new epoch, and its certificate from the server (`Host::promote_legacy`,
+    `certify_legacy`);
+  - the waits on that certificate (`runner::custody::legacy_waiting`, `legacy_identity_pending`);
+  - finding a promotion under way, or one cut short, after a restart (`Host::legacy_promotion`,
+    `legacy_promotion_next`, `legacy_recovery_pending`, `wake_legacy_promotion`,
+    `recover_legacy_owner`);
+  - the native transfer's fence of the two epochs (`legacy_fence_epochs`, `persist_legacy_fence`).
+- **Their tests on Unix alone:** three of goal messages across a restart, which run a native fake
+  agent (`goals::native_goal_program`, `settled_native`): a message refused on its retry keeps its
+  id, and one sent before a restart keeps its id, and reaches its agent once, when cleared goals are
+  brought back; and one of the host's promotion, through the native fence and wake
+  (`harness::session`'s `legacy_promotion_does_not_advance_past_uncommitted_input_effects`). The
+  promotion's proof, its source timeline and the inbox's promotion record are kept in Windows'
+  test builds, so the rest of their tests run there too.
+
 ## How many agents a machine runs
 
 A machine has at most so many agent sessions at work at once (`crate::harness::limit`). Only
