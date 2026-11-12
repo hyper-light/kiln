@@ -4185,8 +4185,9 @@ fn w05_r26_cores_at_their_measured_speed() {
     assert_eq!(ran_on(&sim, &["l1"]), ["c"]);
 }
 
-/// One leg at a time on two runners as free, each of kind `kind` but those named `x…` (another
-/// kind), the ones in `fails` failing as said: where each ran, with good places on or off.
+/// One leg at a time on two runners as free, each of kind `build` but those named `x…` (each a
+/// kind of its own, never seen before: they take the turn), the ones in `fails` failing as said:
+/// where each ran, with good places on or off.
 fn one_at_a_time(legs: &[&str], fails: &[(&str, FailureClass)], good_places: bool) -> Vec<String> {
     let mut sim = Sim::new(Config { good_places, ..Config::default() });
     sim.runner(0, of_cpus("a", 8, 2));
@@ -4195,7 +4196,7 @@ fn one_at_a_time(legs: &[&str], fails: &[(&str, FailureClass)], good_places: boo
         sim.fail(leg, &[*class]);
     }
     for (i, l) in (0i64..).zip(legs) {
-        let kind = if l.starts_with('x') { "lint" } else { "build" };
+        let kind = if l.starts_with('x') { l } else { "build" };
         sim.leg(1 + i * 2 * MIN, kinded(l, kind), MIN);
     }
     sim.run(100 * MIN);
