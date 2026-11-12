@@ -1,0 +1,40 @@
+# Antigravity's CLI, agy, as a kiln harness in a Shards microVM (kiln plan
+# 01a1cd8e862e7169a074db3d5fa33f3d, step 26). kiln runs agy in its headless stream-json mode (Kind
+# "antigravity", crates/kiln/src/harness/kinds.rs). It comes in as pin.json pins it (pin.sh checks
+# each archive's SHA-512 against Google's updater, as Google's installer does) in
+# ./antigravity-<arch>/: harness.json and bin/agy. Nothing else installs it, and no sign-in is in
+# the image: agy keeps its own in the system's keyring, which a microVM has none of, and step 33
+# brings sign-ins from outside the microVM.
+
+# Google's static musl build of agy needs no loader or libc from the base. It checks TLS against the
+# system's CA bundle and carries no roots of its own, so any base with CA certificates runs it: this
+# default is step 19's, pinned by digest.
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+FROM ${BASE}
+
+# BuildKit sets TARGETARCH in the global scope, so the stage declares it to name each platform's
+# harness directory.
+ARG TARGETARCH
+HARNESS antigravity FROM ./antigravity-${TARGETARCH}
+
+# Its network reach, every part named (default deny): a network for this harness alone, which it
+# joins with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443
+# out, opened at the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress), for agy
+# speaks HTTPS alone. These are the bring-up's grants (Shards' docs/examples/harness-claude) until
+# step 9 grants providers by name. Nothing comes in; no other port or protocol goes out.
+NETWORK --dns --egress=443/tcp provider FOR antigravity
+EXPOSE --harnesses=antigravity 443/tcp AS egress FOR provider
+CONNECT antigravity WITH antigravity ON provider
+
+# The project, and the person's home. agy keeps its settings, MCP servers and conversations under
+# $HOME/.gemini, and no variable of its own moves them. A harness sees the image read-only, with its
+# own /tmp scratch and these volumes alone writable, so the whole home is the person's volume, and
+# harness.json sets HOME=/home/antigravity: .gemini lands there, and so does what the programs agy
+# runs keep in a home (.gitconfig ...), until step 7 gives every harness its home. HOME in run.env
+# needs a shards at or after 997f4e47e on Shards' main (v0.8.0 is the first release with it), where
+# run.env replaces init's HOME=/tmp; before it, init's came first and agy took it. harness.json also
+# turns off agy's self-updater (AGY_CLI_DISABLE_AUTO_UPDATE=true: the pin is the version that runs)
+# and puts caches that follow XDG's rule on the scratch (XDG_CACHE_HOME=/tmp/.cache), out of the
+# person's volume. Both volumes are the harness's alone, and outside /tmp, which the scratch covers.
+VOLUME --target-kind=harness /workspace FOR antigravity
+VOLUME --target-kind=harness /home/antigravity FOR antigravity

@@ -1,0 +1,53 @@
+[
+    {
+        "Id": "sha256:1042e2ef99a2a6ec90dde329118c8c3a8e4fb7384c78e692de50df18e82ea03b",
+        "RepoTags": [
+            "harness-antigravity:s26"
+        ],
+        "RepoDigests": [
+            "harness-antigravity@sha256:1042e2ef99a2a6ec90dde329118c8c3a8e4fb7384c78e692de50df18e82ea03b"
+        ],
+        "Comment": "buildkit.dockerfile.v0",
+        "Created": "2026-11-12T15:17:57.793093581Z",
+        "Config": {
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ],
+            "Cmd": [
+                "bash"
+            ],
+            "Volumes": {
+                "/home/antigravity": {},
+                "/workspace": {}
+            },
+            "Labels": {
+                "vnd.osi.agentfile.digest": "sha256:b5ccb9d2e9d4bb06b213f5c5af394af80b62cc5823279f35f45525b73415a531",
+                "vnd.osi.agentfile.dns": "1",
+                "vnd.osi.agentfile.egress": "443",
+                "vnd.osi.agentfile.egress-declared": "443/tcp"
+            }
+        },
+        "Architecture": "amd64",
+        "Os": "linux",
+        "Size": 241146852,
+        "RootFS": {
+            "Type": "layers",
+            "Layers": [
+                "sha256:f487d0da9ce0cd3b17ddb89deff39644274b08f2ff71e321a9e0e476ec2d46fe",
+                "sha256:d854713c22704d1fe77bbec5d21c0ac052d26fc4aae53794849d1027e0bfac7a",
+                "sha256:afb0368a2a32f312f7c9f43e3375a54e1a5c3946a76293426362f17120f49c0c",
+                "sha256:5bfb740eb95fcf670669d7bdd8307f34916f82a499f98f3bab0b7609fd347521",
+                "sha256:04d882e10331967733ac9c3294f20b33acee3c53e7dfcdb68cfce6fb133b29fc",
+                "sha256:bdf3e0b54344fd3372d0ffa8e8729bbf8566bd394fde329dc71381d7d7e4ea0a"
+            ]
+        },
+        "Metadata": {
+            "LastTagTime": "2026-11-12T15:18:13.923264755Z"
+        },
+        "Descriptor": {
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "digest": "sha256:1042e2ef99a2a6ec90dde329118c8c3a8e4fb7384c78e692de50df18e82ea03b",
+            "size": 1609
+        }
+    }
+]

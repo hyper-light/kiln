@@ -1,0 +1,14 @@
+TIME                            MEMBER               PID  EVENT  WHAT
+2026-11-12T15:18:17.933117802Z  command              917  exec   sleep 600
+2026-11-12T15:18:17.936737400Z  harness antigravity  924  fork   from 1
+2026-11-12T15:18:17.941036371Z  harness antigravity  924  exec   shards-server "harness antigravity" /proc/self/fd/6 200000 3 4 "" [] 7
+2026-11-12T15:18:17.945597026Z  harness antigravity  929  fork   from 924
+2026-11-12T15:18:17.946533625Z  harness antigravity  929  exec   shards-server sandbox
+2026-11-12T15:18:17.947566207Z  harness antigravity  933  fork   from 1
+2026-11-12T15:18:17.949356989Z  harness antigravity  938  fork   from 933
+2026-11-12T15:18:17.950282934Z  harness antigravity  933  exec   shards-init managed-reaper
+2026-11-12T15:18:17.969106123Z  harness antigravity  938  exec   /harness/antigravity/bin/agy --input-format stream-json --output-format stream-json
+2026-11-12T15:19:18.665077286Z  harness antigravity  938  exit   code 1
+2026-11-12T15:19:18.665475071Z  harness antigravity  933  exit   code 1
+2026-11-12T15:19:18.665720191Z  harness antigravity  929  exit   signal 9 (SIGKILL)
+2026-11-12T15:19:18.665971825Z  harness antigravity  924  exit   signal 9 (SIGKILL)

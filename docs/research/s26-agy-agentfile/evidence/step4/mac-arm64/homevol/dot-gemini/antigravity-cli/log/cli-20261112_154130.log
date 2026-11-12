@@ -1,0 +1,104 @@
+I1112 15:41:30.089236      82 server.go:2353] Starting language server process with pid 2
+I1112 15:41:30.090227      82 workflow_python.go:21] run_workflow Python: interpreter "", embedded true
+I1112 15:41:30.091905      82 server.go:2412] Language server version: 1.5.6
+I1112 15:41:30.092060      82 server.go:1103] Language server will attempt to listen on host localhost
+I1112 15:41:30.092801      82 server.go:1118] Language server listening on random port at 40381 for HTTPS (gRPC)
+I1112 15:41:30.092999      82 server.go:1126] Language server listening on random port at 43809 for HTTP
+I1112 15:41:30.093920      90 model_configs.go:201] Auth mode is unspecified, skipping fetchAvailableModels and returning empty response
+W1112 15:41:30.094252      31 cache.go:157] Cache(loadCodeAssistResponse): Singleflight refresh failed: error getting token source: You are not logged into Antigravity.
+W1112 15:41:30.094615      31 cache.go:157] Cache(userInfo): Singleflight refresh failed: failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+E1112 15:41:30.095010      90 errorreport.go:273] Failed to poll ListExperiments: error getting token source: You are not logged into Antigravity.
+I1112 15:41:30.131139      98 store_client.go:714] summary store: starting background reconciliation (trigger=empty_on_open)
+I1112 15:41:30.131520      98 store_client.go:743] summary store: reconcile func returned 0 records, skipping
+I1112 15:41:30.134838      82 server.go:2836] Generated and saved persistent installation UUID: aaaffac0-8b7e-4bab-8258-81fe3d1cab41
+I1112 15:41:30.135895      82 auth_store.go:199] Using file-based secret storage at /home/antigravity/.config/antigravity/plugin-secrets.json
+I1112 15:41:30.136017      82 auth_store.go:199] Using file-based secret storage at /home/antigravity/.config/antigravity/plugin-secrets.json
+W1112 15:41:30.136028     130 cache.go:157] Cache(peopleInfo): Singleflight refresh failed: error getting token source: You are not logged into Antigravity.
+E1112 15:41:30.136367     130 errorreport.go:273] error getting token source: You are not logged into Antigravity.
+W1112 15:41:30.136895      82 defaults.go:725] failed to get cs path: cs path /usr/bin/cs invalid
+I1112 15:41:30.137117      82 manager.go:140] Creating trajectory store manager with proto store and SQLite store
+I1112 15:41:30.137237     107 migrate.go:49] Migration marker /home/antigravity/.gemini/config/.migrated does not exist. Attempting migration from AppDataDir /home/antigravity/.gemini/antigravity-cli.
+I1112 15:41:30.139155     107 migrate.go:157] Migration complete, marked with /home/antigravity/.gemini/config/.migrated
+I1112 15:41:30.185224     168 manager.go:98] Migration [MIGRATION_ID_SANITY_CHECK_PROJECT_URIS] is enabled
+I1112 15:41:30.185848     168 manager.go:113] Migration [MIGRATION_ID_SANITY_CHECK_PROJECT_URIS] starting
+I1112 15:41:30.187441     168 project_uris_migration.go:42] Starting ProjectUrisMigration
+I1112 15:41:30.188137     168 manager.go:133] Migration [MIGRATION_ID_SANITY_CHECK_PROJECT_URIS] completed successfully in 695.708µs
+I1112 15:41:30.189697     168 manager.go:98] Migration [MIGRATION_ID_PLUGIN_ENABLEMENT] is enabled
+I1112 15:41:30.190482     168 manager.go:113] Migration [MIGRATION_ID_PLUGIN_ENABLEMENT] starting
+I1112 15:41:30.196879     168 plugin_enablement_migration.go:64] Seeded plugin enablement for 1 plugin(s) into config.json
+I1112 15:41:30.197162     168 manager.go:133] Migration [MIGRATION_ID_PLUGIN_ENABLEMENT] completed successfully in 5.165875ms
+I1112 15:41:30.199157     168 manager.go:98] Migration [MIGRATION_ID_BUILTIN_SIDECARS_TO_PLUGINS] is enabled
+I1112 15:41:30.200468     168 manager.go:113] Migration [MIGRATION_ID_BUILTIN_SIDECARS_TO_PLUGINS] starting
+I1112 15:41:30.203231     168 manager.go:133] Migration [MIGRATION_ID_BUILTIN_SIDECARS_TO_PLUGINS] completed successfully in 1.394208ms
+I1112 15:41:30.204897     168 manager.go:95] Migration [MIGRATION_ID_LIN_BUILTIN_TO_MARKETPLACE] is disabled, skipping entirely
+I1112 15:41:30.205149     168 manager.go:95] Migration [MIGRATION_ID_ADOPT_BWG_INSTALLS] is disabled, skipping entirely
+I1112 15:41:30.205604     168 manager.go:95] Migration [MIGRATION_ID_GDRIVE_BUILTIN_PLUGIN] is disabled, skipping entirely
+I1112 15:41:30.205907     168 manager.go:95] Migration [MIGRATION_ID_SPLIT_SCIENCE_PLUGIN] is disabled, skipping entirely
+I1112 15:41:30.207933      82 server.go:3698] initialized server successfully in 118.385791ms
+I1112 15:41:30.208036      69 server.go:4405] Auth succeeded, refreshing features and managers
+I1112 15:41:30.208252       1 auto_updater.go:247] Auto-update disabled via environment variable AGY_CLI_DISABLE_AUTO_UPDATE
+I1112 15:41:30.208594       1 common.go:191] Launching CLI mode
+E1112 15:41:30.208755       1 launchsteps.go:95] Failed to resolve GeminiDir ".gemini": .gemini must be an absolute path: path is not absolute, falling back to default
+I1112 15:41:30.208908       1 common.go:212] CLI app data directory: /home/antigravity/.gemini/antigravity-cli
+I1112 15:41:30.209045       1 server.go:313] Creating CLI server backend: product=antigravity workspaceDirs=[/harness/antigravity] appDataDir=/home/antigravity/.gemini/antigravity-cli languageServer=true codeAssist=true
+W1112 15:41:30.208515     209 cache.go:157] Cache(loadCodeAssistResponse): Singleflight refresh failed: error getting token source: You are not logged into Antigravity.
+E1112 15:41:30.209466     209 errorreport.go:273] error getting token source: You are not logged into Antigravity.
+E1112 15:41:30.209683      69 errorreport.go:273] Failed to poll ListExperiments: error getting token source: You are not logged into Antigravity.
+I1112 15:41:30.209869      69 server.go:4424] State refresh took 1ms
+I1112 15:41:30.210005      69 server.go:4439] [RemoteControl] Subscription callback triggered.
+W1112 15:41:30.208514     208 cache.go:157] Cache(peopleInfo): Singleflight refresh failed: error getting token source: You are not logged into Antigravity.
+E1112 15:41:30.210410     208 errorreport.go:273] error getting token source: You are not logged into Antigravity.
+I1112 15:41:30.209309       1 composite_token_storage.go:125] Using file-based token storage because no D-Bus session bus detected
+I1112 15:41:30.210854       1 auth_provider.go:984] [AuthProvider] SetEnableBusinessLogin called with enable: true
+I1112 15:41:30.211021      69 server.go:4442] [RemoteControl] RemoteControlEnabled value: false
+I1112 15:41:30.211144      69 server.go:5551] [RemoteControl] Session toggle is off, staying disconnected
+I1112 15:41:30.211264      69 server.go:5237] [RemoteControl] Resolved proxyServerURL: ""
+I1112 15:41:30.211576      69 profiler.go:231] Continuous pprof profiling is disabled.
+W1112 15:41:30.210607     208 rpcs_plugin_auth.go:109] Not reloading plugin MCP servers: cannot get the signed-in user: error getting token source: You are not logged into Antigravity.
+I1112 15:41:30.211610     283 manager.go:98] Migration [MIGRATION_ID_SANITY_CHECK_PROJECT_URIS] is enabled
+I1112 15:41:30.212487     279 reconcile_summaries.go:94] [Summaries] reconcile checked 0 conversations, restored 0, cached 0, skipped 0, dropped 0, cancelled false in 0ms (resident: 0 -> 0)
+I1112 15:41:30.213360     283 manager.go:107] Migration [MIGRATION_ID_SANITY_CHECK_PROJECT_URIS] already has status MIGRATION_STATUS_COMPLETED, skipping
+I1112 15:41:30.213527     283 manager.go:98] Migration [MIGRATION_ID_PLUGIN_ENABLEMENT] is enabled
+I1112 15:41:30.213461     264 store_client.go:714] summary store: starting background reconciliation (trigger=empty_on_open)
+I1112 15:41:30.214596     283 manager.go:107] Migration [MIGRATION_ID_PLUGIN_ENABLEMENT] already has status MIGRATION_STATUS_COMPLETED, skipping
+I1112 15:41:30.214703     283 manager.go:98] Migration [MIGRATION_ID_BUILTIN_SIDECARS_TO_PLUGINS] is enabled
+E1112 15:41:30.214871     264 server.go:3211] Failed to read conversations directory /home/antigravity/.gemini/antigravity/conversations: open /home/antigravity/.gemini/antigravity/conversations: no such file or directory
+I1112 15:41:30.215122     264 server.go:3113] ListConversations returning 0 summaries
+I1112 15:41:30.215364     264 store_client.go:743] summary store: reconcile func returned 0 records, skipping
+I1112 15:41:30.215581       1 project.go:78] project: created project "CLI Project" (id=default-cli-project) at /home/antigravity/.gemini/config/projects/default-cli-project.json
+I1112 15:41:30.215698       1 server.go:2258] Backend project ID updated dynamically to: default-cli-project
+I1112 15:41:30.215801       1 analytics.go:249] CLI startup completed (took 129.211667ms, phases [main_entered=0ms ls_start=2ms ls_ready=121ms launch_cli=122ms backend_created=126ms project_resolved=129ms])
+I1112 15:41:30.215735     283 manager.go:107] Migration [MIGRATION_ID_BUILTIN_SIDECARS_TO_PLUGINS] already has status MIGRATION_STATUS_COMPLETED, skipping
+I1112 15:41:30.215990     283 manager.go:95] Migration [MIGRATION_ID_LIN_BUILTIN_TO_MARKETPLACE] is disabled, skipping entirely
+I1112 15:41:30.216076     283 manager.go:95] Migration [MIGRATION_ID_ADOPT_BWG_INSTALLS] is disabled, skipping entirely
+I1112 15:41:30.215904       1 printmode.go:208] Print mode: starting (promptLength=0, model="", conversationID="")
+I1112 15:41:30.216236     283 manager.go:95] Migration [MIGRATION_ID_GDRIVE_BUILTIN_PLUGIN] is disabled, skipping entirely
+I1112 15:41:30.216388     283 manager.go:95] Migration [MIGRATION_ID_SPLIT_SCIENCE_PLUGIN] is disabled, skipping entirely
+I1112 15:41:30.216288       1 manager.go:553] Initializing CLI store manager for workspace /harness/antigravity
+W1112 15:41:30.216826       1 cli_setting_manager.go:451] cli settings not available, using defaults: failed to read cli settings: open /home/antigravity/.gemini/antigravity-cli/settings.json: no such file or directory
+I1112 15:41:30.217199       1 cli_setting_manager.go:97] CLI settings initialized: permissions=<nil>, toolPermission=request-review
+I1112 15:41:30.218318       1 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I1112 15:41:30.218429       1 manager.go:727] CLI store manager initialized successfully
+I1112 15:41:30.220324     145 manager.go:1702] Reloading system slash commands and skills
+I1112 15:41:30.220431     145 manager.go:1658] Reloading system slash commands
+I1112 15:41:30.220574     145 manager.go:1667] Slash commands unchanged, skipping update
+I1112 15:41:30.221069       1 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I1112 15:41:30.221238       1 printmode.go:409] Print mode: not authenticated, trying silent auth
+I1112 15:41:30.221483       1 printmode.go:415] Print mode: silent auth failed
+I1112 15:41:30.221570       1 printmode.go:432] Print mode: triggering interactive OAuth
+I1112 15:41:30.221701       1 auth_manager.go:208] Starting OAuth authentication flow
+I1112 15:41:30.221834       1 browser.go:56] consumerOAuth: starting OAuth flow
+W1112 15:41:30.222067     273 browser.go:320] Failed to open browser: exec: "xdg-open": executable file not found in $PATH
+W1112 15:42:30.094555     487 cache.go:157] Cache(loadCodeAssistResponse): Singleflight refresh failed: error getting token source: You are not logged into Antigravity.
+E1112 15:42:30.094959     487 errorreport.go:273] error getting token source: You are not logged into Antigravity.
+E1112 15:42:30.095371      90 errorreport.go:273] Failed to poll ListExperiments: error getting token source: You are not logged into Antigravity.
+E1112 15:42:30.222864       1 printmode.go:482] Print mode: auth timed out
+I1112 15:42:30.223335       1 manager.go:965] CLI store manager shutting down
+I1112 15:42:30.223647     492 server.go:4112] Language server shutting down
+I1112 15:42:30.223853     492 server.go:4134] Waiting for migrations to complete to prevent partial migration state...
+W1112 15:42:30.224141     492 cache.go:157] Cache(loadCodeAssistResponse): Singleflight refresh failed: error getting token source: You are not logged into Antigravity.
+W1112 15:42:30.224294     492 cache.go:157] Cache(userInfo): Singleflight refresh failed: failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+E1112 15:42:30.224679      33 file_watcher.go:194] skipping empty or temp file: 
+E1112 15:42:30.224836      33 file_watcher.go:194] skipping empty or temp file: 
+E1112 15:42:30.224981      33 file_watcher.go:194] skipping empty or temp file: 
+E1112 15:42:30.225114      33 file_watcher.go:194] skipping empty or temp file: 

@@ -1,0 +1,78 @@
+TIME                            MEMBER               PID  EVENT  WHAT
+2026-11-12T15:42:38.206323750Z  command              272  exec   sleep 600
+2026-11-12T15:42:38.207936417Z  harness antigravity  276  fork   from 1
+2026-11-12T15:42:38.209710917Z  harness antigravity  276  exec   shards-server "harness antigravity" /proc/self/fd/6 200000 3 4 "" [] 7
+2026-11-12T15:42:38.211160459Z  harness antigravity  278  fork   from 276
+2026-11-12T15:42:38.211559042Z  harness antigravity  278  exec   shards-server sandbox
+2026-11-12T15:42:38.212051292Z  harness antigravity  279  fork   from 1
+2026-11-12T15:42:38.212349334Z  harness antigravity  281  fork   from 279
+2026-11-12T15:42:38.212528417Z  harness antigravity  279  exec   shards-init managed-reaper
+2026-11-12T15:42:38.218848625Z  harness antigravity  281  exec   /usr/bin/sh -c "# The probe's own command (plan step 26, step 4): run by sh as harness antigravity, with its\n# harness.json's env, in the microVM. It writes what it finds into /workspace/probe, the run's\n# project volume, and ends with /workspace/probe/done. Every result is a file; nothing stops it.\no=/workspace/probe\nmkdir -p \"$o\" || exit 1\nagy --version > \"$o/version\" 2> \"$o/version.err\"; echo $? > \"$o/version.rc\"\nid -u > \"$o/uid\"; id -g > \"$o/gid\"\nprintf '%s\\n' \"$HOME\" > \"$o/home\"\ngetent hosts cloudcode-pa.googleapis.com > \"$o/dns\" 2>&1; echo $? > \"$o/dns.rc\"\ntouch \"$HOME/x\" 2> \"$o/touch.err\"; echo $? > \"$o/touch.rc\"\ngit config --global user.name probe 2> \"$o/git.err\"; echo $? > \"$o/git.rc\"\nagy mcp add kiln-probe /bin/true > \"$o/mcp.out\" 2>&1; echo $? > \"$o/mcp.rc\"\nprintf '%s\\n' '{\"event\":\"user\",\"message\":{\"content\":\"Reply with the single word: ready\"}}' | timeout 90 agy --input-format stream-json --output-format stream-json > \"$o/turn.out\" 2> \"$o/turn.err\"; echo $? > \"$o/turn.rc\"\nif command -v curl > /dev/null; then\n  curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 20 https://cloudcode-pa.googleapis.com/ > \"$o/https\" 2> \"$o/https.err\"; echo $? > \"$o/https.rc\"\n  curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 10 http://cloudcode-pa.googleapis.com/ > \"$o/http80\" 2> \"$o/http80.err\"; echo $? > \"$o/http80.rc\"\n  # TCP 443 to the name's IPv4 address as the host resolved it (/workspace/ip4), no lookup asked:\n  # egress itself, apart from DNS. And the same to an IPv6 address of the name, as found then.\n  ip4=$(cat /workspace/ip4 2>/dev/null); ip6=$(cat /workspace/ip6 2>/dev/null)\n  curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 10 --resolve \"cloudcode-pa.googleapis.com:443:$ip4\" https://cloudcode-pa.googleapis.com/ > \"$o/https-ip4\" 2> \"$o/https-ip4.err\"; echo $? > \"$o/https-ip4.rc\"\n  curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 10 --resolve \"cloudcode-pa.googleapis.com:443:[$ip6]\" https://cloudcode-pa.googleapis.com/ > \"$o/https-ip6\" 2> \"$o/https-ip6.err\"; echo $? > \"$o/https-ip6.rc\"\nelse\n  echo \"no curl in this base\" > \"$o/https.err\"\nfi\nls -la /etc/ssl/certs/ca-certificates.crt > \"$o/ca-bundle\" 2>&1\n# agy's own TLS: as it ends, it posts its telemetry over HTTPS; its log names what failed.\ngrep -a -E 'telemetry|x509|certificate' \"$HOME/.gemini/antigravity-cli/cli.log\" > \"$o/agy-tls\" 2>&1\nls -la \"$HOME\" > \"$o/home.ls\" 2>&1\necho done > \"$o/done\"\n"
+2026-11-12T15:42:38.222877292Z  harness antigravity  291  fork   from 281
+2026-11-12T15:42:38.223454334Z  harness antigravity  291  exec   mkdir -p /workspace/probe
+2026-11-12T15:42:38.225859375Z  harness antigravity  291  exit   code 0
+2026-11-12T15:42:38.226444000Z  harness antigravity  292  fork   from 281
+2026-11-12T15:42:38.226675750Z  harness antigravity  292  exec   agy --version
+2026-11-12T15:42:38.317723959Z  harness antigravity  292  exit   code 0
+2026-11-12T15:42:38.319181667Z  harness antigravity  315  fork   from 281
+2026-11-12T15:42:38.319593917Z  harness antigravity  315  exec   id -u
+2026-11-12T15:42:38.320322584Z  harness antigravity  315  exit   code 0
+2026-11-12T15:42:38.320652667Z  harness antigravity  316  fork   from 281
+2026-11-12T15:42:38.320752625Z  harness antigravity  316  exec   id -g
+2026-11-12T15:42:38.321362792Z  harness antigravity  316  exit   code 0
+2026-11-12T15:42:38.322259500Z  harness antigravity  317  fork   from 281
+2026-11-12T15:42:38.322637042Z  harness antigravity  317  exec   getent hosts cloudcode-pa.googleapis.com
+2026-11-12T15:42:38.342506542Z  harness antigravity  317  exit   code 0
+2026-11-12T15:42:38.343746042Z  harness antigravity  320  fork   from 281
+2026-11-12T15:42:38.344270792Z  harness antigravity  320  exec   touch /home/antigravity/x
+2026-11-12T15:42:38.345327792Z  harness antigravity  320  exit   code 0
+2026-11-12T15:42:38.350273834Z  harness antigravity  321  fork   from 281
+2026-11-12T15:42:38.350522500Z  harness antigravity  321  exec   git config --global user.name probe
+2026-11-12T15:42:38.355211042Z  harness antigravity  321  exit   code 0
+2026-11-12T15:42:38.355886167Z  harness antigravity  322  fork   from 281
+2026-11-12T15:42:38.355967417Z  harness antigravity  322  exec   agy mcp add kiln-probe /bin/true
+2026-11-12T15:42:38.411644000Z  harness antigravity  322  exit   code 0
+2026-11-12T15:42:38.412803417Z  harness antigravity  342  fork   from 281
+2026-11-12T15:42:38.412887334Z  harness antigravity  343  fork   from 281
+2026-11-12T15:42:38.413102917Z  harness antigravity  342  exit   code 0
+2026-11-12T15:42:38.414050125Z  harness antigravity  343  exec   timeout 90 agy --input-format stream-json --output-format stream-json
+2026-11-12T15:42:38.414355459Z  harness antigravity  344  fork   from 343
+2026-11-12T15:42:38.414470792Z  harness antigravity  344  exec   agy --input-format stream-json --output-format stream-json
+2026-11-12T15:42:38.522818917Z  harness antigravity  369  fork   from 344
+2026-11-12T15:42:38.524044334Z  harness antigravity  369  exit   code 0
+2026-11-12T15:42:38.524077917Z  harness antigravity  370  fork   from 344
+2026-11-12T15:42:38.525369917Z  harness antigravity  370  exec   /bin/true
+2026-11-12T15:42:38.525670167Z  harness antigravity  370  exit   code 0
+2026-11-12T15:42:39.007507001Z  harness antigravity  344  exit   code 1
+2026-11-12T15:42:39.029349417Z  harness antigravity  343  exit   code 1
+2026-11-12T15:42:39.030787876Z  harness antigravity  392  fork   from 281
+2026-11-12T15:42:39.031231001Z  harness antigravity  392  exec   curl -sS -o /dev/null -w "%{http_code}\\n" --max-time 20 https://cloudcode-pa.googleapis.com/
+2026-11-12T15:42:39.236044917Z  harness antigravity  392  exit   code 0
+2026-11-12T15:42:39.237224876Z  harness antigravity  394  fork   from 281
+2026-11-12T15:42:39.237335209Z  harness antigravity  394  exec   curl -sS -o /dev/null -w "%{http_code}\\n" --max-time 10 http://cloudcode-pa.googleapis.com/
+2026-11-12T15:42:49.250728422Z  harness antigravity  394  exit   code 28
+2026-11-12T15:42:49.251768922Z  harness antigravity  403  fork   from 281
+2026-11-12T15:42:49.252593630Z  harness antigravity  403  exec   cat /workspace/ip4
+2026-11-12T15:42:49.253259797Z  harness antigravity  403  exit   code 0
+2026-11-12T15:42:49.253310547Z  harness antigravity  404  fork   from 281
+2026-11-12T15:42:49.253460672Z  harness antigravity  404  exec   cat /workspace/ip6
+2026-11-12T15:42:49.254035714Z  harness antigravity  404  exit   code 0
+2026-11-12T15:42:49.254664880Z  harness antigravity  405  fork   from 281
+2026-11-12T15:42:49.254750172Z  harness antigravity  405  exec   curl -sS -o /dev/null -w "%{http_code}\\n" --max-time 10 --resolve cloudcode-pa.googleapis.com:443:172.217.112.4 https://cloudcode-pa.googleapis.com/
+2026-11-12T15:42:49.444139214Z  harness antigravity  405  exit   code 0
+2026-11-12T15:42:49.445810714Z  harness antigravity  406  fork   from 281
+2026-11-12T15:42:49.445917381Z  harness antigravity  406  exec   curl -sS -o /dev/null -w "%{http_code}\\n" --max-time 10 --resolve cloudcode-pa.googleapis.com:443:[2001:4860:4845:400::] https://cloudcode-pa.googleapis.com/
+2026-11-12T15:42:49.462904172Z  harness antigravity  406  exit   code 7
+2026-11-12T15:42:49.464238631Z  harness antigravity  407  fork   from 281
+2026-11-12T15:42:49.464799297Z  harness antigravity  407  exec   ls -la /etc/ssl/certs/ca-certificates.crt
+2026-11-12T15:42:49.466152672Z  harness antigravity  407  exit   code 0
+2026-11-12T15:42:49.466543922Z  harness antigravity  408  fork   from 281
+2026-11-12T15:42:49.466960881Z  harness antigravity  408  exec   grep -a -E telemetry|x509|certificate /home/antigravity/.gemini/antigravity-cli/cli.log
+2026-11-12T15:42:49.468469047Z  harness antigravity  408  exit   code 1
+2026-11-12T15:42:49.468846422Z  harness antigravity  409  fork   from 281
+2026-11-12T15:42:49.468914089Z  harness antigravity  409  exec   ls -la /home/antigravity
+2026-11-12T15:42:49.470055256Z  harness antigravity  409  exit   code 0
+2026-11-12T15:42:49.470998214Z  harness antigravity  281  exit   code 0
+2026-11-12T15:42:49.471258339Z  harness antigravity  279  exit   code 0
+2026-11-12T15:42:49.471337922Z  harness antigravity  276  exit   signal 9 (SIGKILL)
+2026-11-12T15:42:49.471340964Z  harness antigravity  278  exit   signal 9 (SIGKILL)
