@@ -1,0 +1,52 @@
+{
+  "version": "1.59.0",
+  "channel": "stable",
+  "read_at": "2026-11-12T08:26:54Z",
+  "verified": {
+    "method": "github-attestation",
+    "repo": "aaif-goose/goose",
+    "signer_workflow": "aaif-goose/goose/.github/workflows/release.yml",
+    "source_ref": "refs/tags/v1.59.0",
+    "commit": "5d03ef6ed07ba59826328f1aff18d9a754ff8ad2",
+    "predicate": "https://slsa.dev/provenance/v1"
+  },
+  "base": "buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+  "builds": [
+    {
+      "platform": "linux/amd64",
+      "files": [
+        {
+          "url": "https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-x86_64-unknown-linux-musl.tar.gz",
+          "sha256": "6da57ce8775f712ab146bcf244b69e2b15f85368836bff2ba3306fdefdac8f31",
+          "size": 50181341,
+          "path": "bin/goose",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "goose",
+            "sha256": "461ea83fc8736fa0ad608661a8e5ef8c704da886d38500441ba2b91f7184d9f5",
+            "size": 154218008
+          }
+        }
+      ]
+    },
+    {
+      "platform": "linux/arm64",
+      "files": [
+        {
+          "url": "https://github.com/aaif-goose/goose/releases/download/v1.59.0/goose-aarch64-unknown-linux-musl.tar.gz",
+          "sha256": "63124ef1fdc2f3c6b38155aaab3a3a5ad73b053e2ff327c224c888816d85f5d7",
+          "size": 48814292,
+          "path": "bin/goose",
+          "mode": "0755",
+          "unpack": {
+            "format": "tar.gz",
+            "member": "goose",
+            "sha256": "c27e6ea558a39a9af96dcc04368296ca636e40a67c96cdac56a6f644488fb673",
+            "size": 148726128
+          }
+        }
+      ]
+    }
+  ]
+}

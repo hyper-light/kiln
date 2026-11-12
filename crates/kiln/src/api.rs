@@ -7480,7 +7480,7 @@ where
         // Its flush with what's fed past what's left of the poll's quantum: what's fed goes, and the turn ends first.
         if unflushed > 0 && kiln_http::turn::room().and_then(|room| costs.try_with(|c| c.fitting(room)).ok().flatten()).is_some_and(|fit| unflushed.saturating_add(said.len()) > fit) {
             flush_timed(tx, costs, std::mem::take(&mut unflushed)).await?;
-            give_turn_up(costs).await;
+            hyper_rt::futures::yield_now().await;
             *turns = crate::rt::Turns::new();
         }
         if let Some(at) = published {
@@ -7499,7 +7499,7 @@ where
         fed = fed.saturating_add(1);
         if turns.over() {
             flush_timed(tx, costs, std::mem::take(&mut unflushed)).await?;
-            give_turn_up(costs).await;
+            hyper_rt::futures::yield_now().await;
             *turns = crate::rt::Turns::new();
         }
     }
@@ -7542,19 +7542,10 @@ fn timing_frame(epoch: u64, published: u64, came: Option<crate::harness::live::C
 thread_local! {
     /// What flushing a viewer's socket is learned to cost a byte on a shard (`kiln_http::turn::Writes`): each shard's own, a
     /// shard being a thread, so a flush stores only to cache lines its own core holds, and a fresh shard learns from nothing
-    /// (goal 9, plan 01a1a87b2cec step 3). Its viewers' flushes teach it ([`flush_timed`]), and their turns given up what
-    /// coming back costs ([`give_turn_up`]); each of their batches is weighed by it ([`write_live_batch`]). Made in place
+    /// (goal 9, plan 01a1a87b2cec step 3). Its viewers' flushes teach it ([`flush_timed`]); each of their batches is weighed
+    /// by it ([`write_live_batch`]). Made in place
     /// with the thread, nothing to drop: there, and allocating nothing, for the thread's whole life.
     static FLUSHES: kiln_http::turn::Writes = const { kiln_http::turn::Writes::nothing_yet() };
-}
-
-/// A viewer's turn given up, and what coming back to write took of its next poll taught to `costs`: what putting a frame's
-/// flush off costs (`kiln_http::turn::Writes::fitting`; goal 9, plan 01a1a87b2cec step 3).
-async fn give_turn_up(costs: &'static std::thread::LocalKey<kiln_http::turn::Writes>) {
-    hyper_rt::futures::yield_now().await;
-    if let Some(poll) = hyper_rt::futures::poll_clock() {
-        costs.try_with(|c| c.resumed(poll.held_ns())).unwrap_or_default();
-    }
 }
 
 /// `tx` flushed, its `bytes` fed since its last flush, and what that took taught to `costs` where it didn't wait for its
