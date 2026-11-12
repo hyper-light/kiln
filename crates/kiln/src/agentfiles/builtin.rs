@@ -38,16 +38,28 @@ impl Smoke {
 }
 
 /// Every one, in the order they're listed.
-pub const ALL: &[Builtin] = &[Builtin {
-    name: "harness-goose",
-    harness: "goose",
-    text: include_str!("../../../../.kiln/images/harness-goose/Agentfile"),
-    pin: include_str!("../../../../.kiln/images/harness-goose/pin.json"),
-    files: &[("harness.json", include_str!("../../../../.kiln/images/harness-goose/harness.json"))],
-    // clap prints Goose's empty display name, then a space and the version: 1.59.0's musl build wrote
-    // the bytes 20 31 2e 35 39 2e 30 0a (step 23's research 01a1ce705e3d72af8563e07fa92a7460, f12).
-    smoke: Smoke { args: &["--version"], stdout: " {version}\n" },
-}];
+pub const ALL: &[Builtin] = &[
+    Builtin {
+        name: "harness-goose",
+        harness: "goose",
+        text: include_str!("../../../../.kiln/images/harness-goose/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-goose/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-goose/harness.json"))],
+        // clap prints Goose's empty display name, then a space and the version: 1.59.0's musl build wrote
+        // the bytes 20 31 2e 35 39 2e 30 0a (step 23's research 01a1ce705e3d72af8563e07fa92a7460, f12).
+        smoke: Smoke { args: &["--version"], stdout: " {version}\n" },
+    },
+    Builtin {
+        name: "harness-pi",
+        harness: "pi",
+        text: include_str!("../../../../.kiln/images/harness-pi/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-pi/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-pi/harness.json"))],
+        // pi prints its bare version: 1.5.2's x64 build wrote the bytes 31 2e 35 2e 32 0a to its standard
+        // output, and nothing to its standard error (step 28's record, docs/research/s28-pi-agentfile/step2/).
+        smoke: Smoke { args: &["--version"], stdout: "{version}\n" },
+    },
+];
 
 /// One as the list shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -134,7 +146,10 @@ mod tests {
     /// What in a pin would mislead a build, as the shared layout writes pins (step 19's plan): a
     /// version not x.y.z, a base not pinned by digest, a platform missing or twice, and per file an
     /// https URL, a SHA-256, a size, a path inside its folder and octal permissions, an archive's
-    /// `unpack` naming its one member with that member's own SHA-256 and size.
+    /// `unpack` naming its one member with that member's own SHA-256 and size. An archive unpacked
+    /// whole (step 25's unpacker's tree: no `member`, pi's tarball) goes into its folder (`.`) or one
+    /// inside it with no mode, as its entries keep their own, and gives the totals the unpacker holds
+    /// it to, as a member gives its own digest; an unpack is never both.
     fn pin_problems(text: &str) -> Vec<String> {
         let pin: Value = match serde_json::from_str(text) {
             Ok(v) => v,
@@ -167,16 +182,21 @@ mod tests {
             }
             for f in &files {
                 let s = |k: &str| f.get(k).and_then(Value::as_str);
+                let tree = f.get("unpack").is_some_and(|u| u.get("member").is_none());
                 if !s("url").is_some_and(|u| u.starts_with("https://")) {
                     found.push(format!("{at}: no https URL"));
                 }
                 if !s("sha256").is_some_and(is_sha256) || f.get("size").and_then(Value::as_u64).is_none() {
                     found.push(format!("{at}: a file without its SHA-256 and size"));
                 }
-                if !s("path").is_some_and(is_inside) {
+                if !s("path").is_some_and(|p| is_inside(p) || (tree && p == ".")) {
                     found.push(format!("{at}: a path outside its folder"));
                 }
-                if !s("mode").is_some_and(|m| (3..=4).contains(&m.len()) && m.bytes().all(|b| (b'0'..=b'7').contains(&b))) {
+                if tree {
+                    if f.get("mode").is_some() {
+                        found.push(format!("{at}: a mode for a whole tree, whose entries keep their own"));
+                    }
+                } else if !s("mode").is_some_and(|m| (3..=4).contains(&m.len()) && m.bytes().all(|b| (b'0'..=b'7').contains(&b))) {
                     found.push(format!("{at}: a mode that isn't octal permissions"));
                 }
                 if let Some(u) = f.get("unpack") {
@@ -184,11 +204,23 @@ mod tests {
                     if us("format") != Some("tar.gz") {
                         found.push(format!("{at}: an unpack that isn't tar.gz"));
                     }
-                    if !us("member").map(|m| m.strip_prefix("./").unwrap_or(m)).is_some_and(is_inside) {
-                        found.push(format!("{at}: a member outside the folder"));
-                    }
-                    if !us("sha256").is_some_and(is_sha256) || u.get("size").and_then(Value::as_u64).is_none() {
-                        found.push(format!("{at}: a member without its own SHA-256 and size"));
+                    if tree {
+                        if ["unpacked_bytes", "entries"].iter().any(|k| u.get(k).and_then(Value::as_u64).is_none()) {
+                            found.push(format!("{at}: a tree without its totals"));
+                        }
+                        if ["sha256", "size"].iter().any(|k| u.get(k).is_some()) {
+                            found.push(format!("{at}: an unpack that's both a tree and a member"));
+                        }
+                    } else {
+                        if !us("member").map(|m| m.strip_prefix("./").unwrap_or(m)).is_some_and(is_inside) {
+                            found.push(format!("{at}: a member outside the folder"));
+                        }
+                        if !us("sha256").is_some_and(is_sha256) || u.get("size").and_then(Value::as_u64).is_none() {
+                            found.push(format!("{at}: a member without its own SHA-256 and size"));
+                        }
+                        if ["strip", "unpacked_bytes", "entries"].iter().any(|k| u.get(k).is_some()) {
+                            found.push(format!("{at}: an unpack that's both a tree and a member"));
+                        }
                     }
                 }
             }
@@ -249,9 +281,9 @@ mod tests {
         paths.iter().copied().filter(|p| !sources.iter().any(|s| if s.ends_with('/') { p.starts_with(s.as_str()) } else { p == s })).collect()
     }
 
-    /// Each pin holds (both platforms, every digest a SHA-256, an archive's member with its own), each
-    /// harness file is an OSI config of its harness at the pin's version, and each Agentfile builds on
-    /// the base its pin was checked with by default.
+    /// Each pin holds (both platforms, every digest a SHA-256, an archive's member with its own and a
+    /// tree with its totals), each harness file is an OSI config of its harness at the pin's version,
+    /// and each Agentfile builds on the base its pin was checked with by default.
     #[test]
     fn step23_every_builtin_pin_and_harness_file_hold() -> anyhow::Result<()> {
         for b in ALL {
@@ -270,30 +302,54 @@ mod tests {
         Ok(())
     }
 
+    /// `pin` with the value at `path` (a JSON pointer) set to `to`, or taken out without one.
+    fn edited(pin: &Value, path: &str, to: Option<Value>) -> anyhow::Result<String> {
+        let mut v = pin.clone();
+        let (parent, key) = path.rsplit_once('/').ok_or_else(|| anyhow::anyhow!("{path}"))?;
+        let at = v.pointer_mut(parent).and_then(Value::as_object_mut).ok_or_else(|| anyhow::anyhow!("{path}"))?;
+        match to {
+            Some(to) => at.insert(key.to_owned(), to),
+            None => at.remove(key),
+        };
+        Ok(v.to_string())
+    }
+
+    /// Whether one of the problems found in a pin's `text` says `what`.
+    fn says(text: &str, what: &str) -> bool {
+        pin_problems(text).iter().any(|p| p.contains(what))
+    }
+
     /// A pin no build could trust is caught: a digest one digit short, a platform missing, an
     /// archive's member without its own digest, a member path that climbs out.
     #[test]
     fn step23_a_pin_that_would_mislead_a_build_is_caught() -> anyhow::Result<()> {
         let goose = ALL.iter().find(|b| b.harness == "goose").ok_or_else(|| anyhow::anyhow!("no goose built-in"))?;
         let real: Value = serde_json::from_str(goose.pin)?;
-        let edited = |path: &str, to: Option<Value>| -> anyhow::Result<String> {
-            let mut v = real.clone();
-            let (parent, key) = path.rsplit_once('/').ok_or_else(|| anyhow::anyhow!("{path}"))?;
-            let at = v.pointer_mut(parent).and_then(Value::as_object_mut).ok_or_else(|| anyhow::anyhow!("{path}"))?;
-            match to {
-                Some(to) => at.insert(key.to_owned(), to),
-                None => at.remove(key),
-            };
-            Ok(v.to_string())
-        };
         let short = real.pointer("/builds/0/files/0/sha256").and_then(Value::as_str).and_then(|d| d.get(1..)).map(Value::from);
-        let says = |text: String, what: &str| pin_problems(&text).iter().any(|p| p.contains(what));
-        anyhow::ensure!(says(edited("/builds/0/files/0/sha256", short)?, "without its SHA-256"));
-        anyhow::ensure!(says(edited("/builds/1/platform", Some(Value::from("linux/amd64")))?, "no build for linux/arm64"));
-        anyhow::ensure!(says(edited("/builds/0/files/0/unpack/sha256", None)?, "member without its own SHA-256"));
-        anyhow::ensure!(says(edited("/builds/0/files/0/unpack/member", Some(Value::from("../goose")))?, "member outside"));
-        anyhow::ensure!(says(edited("/base", Some(Value::from("buildpack-deps:trixie-scm")))?, "pinned by digest"));
+        anyhow::ensure!(says(&edited(&real, "/builds/0/files/0/sha256", short)?, "without its SHA-256"));
+        anyhow::ensure!(says(&edited(&real, "/builds/1/platform", Some(Value::from("linux/amd64")))?, "no build for linux/arm64"));
+        anyhow::ensure!(says(&edited(&real, "/builds/0/files/0/unpack/sha256", None)?, "member without its own SHA-256"));
+        anyhow::ensure!(says(&edited(&real, "/builds/0/files/0/unpack/member", Some(Value::from("../goose")))?, "member outside"));
+        anyhow::ensure!(says(&edited(&real, "/base", Some(Value::from("buildpack-deps:trixie-scm")))?, "pinned by digest"));
         anyhow::ensure!(pin_problems(goose.pin).is_empty());
+        Ok(())
+    }
+
+    /// A tree no build could trust is caught, as a member is: pi's tarball given a mode, a member's
+    /// digest beside its totals, a total left out, or a path that climbs out; and rg's member given a
+    /// tree's strip, or the folder itself as its path.
+    #[test]
+    fn step28_a_tree_that_would_mislead_a_build_is_caught() -> anyhow::Result<()> {
+        let pi = ALL.iter().find(|b| b.harness == "pi").ok_or_else(|| anyhow::anyhow!("no pi built-in"))?;
+        let real: Value = serde_json::from_str(pi.pin)?;
+        anyhow::ensure!(pin_problems(pi.pin).is_empty(), "{:?}", pin_problems(pi.pin));
+        // files/0 is pi's tarball, unpacked whole; files/1 is rg, one member of its own.
+        anyhow::ensure!(says(&edited(&real, "/builds/0/files/0/mode", Some(Value::from("0755")))?, "a mode for a whole tree"));
+        anyhow::ensure!(says(&edited(&real, "/builds/0/files/0/unpack/sha256", Some(Value::from("0".repeat(64))))?, "both a tree and a member"));
+        anyhow::ensure!(says(&edited(&real, "/builds/0/files/0/unpack/entries", None)?, "a tree without its totals"));
+        anyhow::ensure!(says(&edited(&real, "/builds/0/files/0/path", Some(Value::from("../pi")))?, "a path outside"));
+        anyhow::ensure!(says(&edited(&real, "/builds/0/files/1/unpack/strip", Some(Value::from(1)))?, "both a tree and a member"));
+        anyhow::ensure!(says(&edited(&real, "/builds/0/files/1/path", Some(Value::from(".")))?, "a path outside"));
         Ok(())
     }
 
@@ -359,6 +415,87 @@ mod tests {
         let version = serde_json::from_str::<Value>(goose.pin)?.get("version").and_then(Value::as_str).map(str::to_owned).unwrap_or_default();
         anyhow::ensure!(version != "1.59.0" || goose.smoke.expected(&version).as_bytes() == [0x20, 0x31, 0x2e, 0x35, 0x39, 0x2e, 0x30, 0x0a]);
         anyhow::ensure!(goose.smoke.args == ["--version"]);
+        Ok(())
+    }
+
+    /// pi runs as kiln's Pi kind starts it: harness.json's command is the kind's program and what
+    /// `pi::args` gives every session before its own flags (`--mode rpc`, f14). Its env is exactly its
+    /// config directory, on the volume the Agentfile gives it, and the version check off (f15, f19),
+    /// so it sets nothing shards-init sets first (PATH, HOME, SHARDS_DOMAIN; f16); and the one file
+    /// beside the Agentfile is harness.json, with no sign-in, as pi's auth.json lives on that volume
+    /// (f27). A kind, an env, a volume or a file that drifts from them is caught.
+    #[test]
+    fn step28_pi_runs_as_kilns_pi_kind_with_its_config_on_its_volume() -> anyhow::Result<()> {
+        let pi = ALL.iter().find(|b| b.harness == "pi").ok_or_else(|| anyhow::anyhow!("no pi built-in"))?;
+        let kind = Kind::get("pi").ok_or_else(|| anyhow::anyhow!("no pi kind"))?;
+        let started = |kind: &Kind| -> Vec<String> {
+            let args = crate::harness::pi::args(&crate::harness::session::Spec { kind: kind.id.to_owned(), ..Default::default() });
+            std::iter::once(kind.program.to_owned()).chain(args.into_iter().take_while(|a| a != "--session-id")).collect()
+        };
+        let h = harness_file(pi)?;
+        anyhow::ensure!(command_of(&h) == started(kind), "{h} isn't {:?}", started(kind));
+        anyhow::ensure!(command_of(&h) != started(&Kind { program: "pi-rpc", ..*kind }));
+
+        let env: Vec<&str> = h.pointer("/run/env").and_then(Value::as_array).map(|e| e.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        let config = env.iter().find_map(|e| e.strip_prefix("PI_CODING_AGENT_DIR=")).ok_or_else(|| anyhow::anyhow!("no PI_CODING_AGENT_DIR in {env:?}"))?;
+        let want = [format!("PI_CODING_AGENT_DIR={config}"), "PI_SKIP_VERSION_CHECK=1".to_owned()];
+        anyhow::ensure!(env == want, "{env:?}");
+        anyhow::ensure!([env.as_slice(), &["HOME=/home/pi"]].concat() != want);
+        let volumes = harness_volumes(pi.text, "pi");
+        anyhow::ensure!(volumes == ["/workspace", config], "{volumes:?}");
+        let moved = pi.text.replace("/home/pi/.pi/agent FOR pi", "/home/pi/.pi FOR pi");
+        anyhow::ensure!(harness_volumes(&moved, "pi").get(1) != Some(&config));
+
+        let names = |files: &[(&str, &str)]| files.iter().map(|(n, _)| n.to_string()).collect::<Vec<_>>();
+        anyhow::ensure!(names(pi.files) == ["harness.json"], "{:?}", names(pi.files));
+        anyhow::ensure!(names([pi.files, &[("auth.json", "{}")]].concat().as_slice()) != ["harness.json"]);
+        Ok(())
+    }
+
+    /// pi's Agentfile is the plan's shape: a base by digest, pi's own build per platform with no RUN,
+    /// exactly the bring-up's three grants, exactly its two volumes, and no ENV. Its pin lays each
+    /// platform's directory out as pi needs it: its tarball whole at the root less its pi/ (f11), and
+    /// ripgrep's and fd's builds at bin/rg and bin/fd, 0755, so that pi downloads neither (f17, f18); a
+    /// platform without rg is caught. Its smoke line is what pi prints.
+    #[test]
+    fn step28_pi_agentfile_and_pin_are_the_plans_shape() -> anyhow::Result<()> {
+        let pi = ALL.iter().find(|b| b.harness == "pi").ok_or_else(|| anyhow::anyhow!("no pi built-in"))?;
+        let lines = instructions(pi.text);
+        let want = [
+            "ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+            "FROM ${BASE}",
+            "ARG TARGETARCH",
+            "HARNESS pi FROM ./pi-${TARGETARCH}",
+            "NETWORK --dns --egress=443/tcp provider FOR pi",
+            "EXPOSE --harnesses=pi 443/tcp AS egress FOR provider",
+            "CONNECT pi WITH pi ON provider",
+            "VOLUME --target-kind=harness /workspace FOR pi",
+            "VOLUME --target-kind=harness /home/pi/.pi/agent FOR pi",
+        ];
+        anyhow::ensure!(lines == want, "{lines:#?}");
+
+        let pin: Value = serde_json::from_str(pi.pin)?;
+        // Each platform's files, each as `path mode what`: a tree's strip, or its member's file name.
+        let layout = |pin: &Value| -> Vec<String> {
+            let file = |f: &Value| {
+                let s = |p: &str| f.pointer(p).and_then(Value::as_str).unwrap_or("-");
+                let member = || s("/unpack/member").rsplit('/').next().unwrap_or_default().to_owned();
+                let what = f.pointer("/unpack/strip").and_then(Value::as_u64).map_or_else(member, |n| format!("strip {n}"));
+                format!("{} {} {what}", s("/path"), s("/mode"))
+            };
+            let builds = pin.get("builds").and_then(Value::as_array).cloned().unwrap_or_default();
+            builds.iter().map(|b| b.get("files").and_then(Value::as_array).map(|f| f.iter().map(&file).collect::<Vec<_>>().join(", ")).unwrap_or_default()).collect()
+        };
+        let each = ". - strip 1, bin/rg 0755 rg, bin/fd 0755 fd";
+        anyhow::ensure!(layout(&pin) == [each, each], "{:?}", layout(&pin));
+        let mut no_rg = pin.clone();
+        no_rg.pointer_mut("/builds/1/files").and_then(Value::as_array_mut).ok_or_else(|| anyhow::anyhow!("no arm64 files"))?.retain(|f| f.get("path") != Some(&Value::from("bin/rg")));
+        anyhow::ensure!(layout(&no_rg) != [each, each]);
+
+        // The bytes 1.5.2's x64 `pi --version` wrote (step 28's record).
+        let version = pin.get("version").and_then(Value::as_str).unwrap_or_default();
+        anyhow::ensure!(version != "1.5.2" || pi.smoke.expected(version).as_bytes() == [0x31, 0x2e, 0x35, 0x2e, 0x32, 0x0a]);
+        anyhow::ensure!(pi.smoke.args == ["--version"]);
         Ok(())
     }
 
