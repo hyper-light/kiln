@@ -1,0 +1,312 @@
+# Shards origin/main 08cf6ec5d72a6d48a9c36232f27f801932907140 excerpts (git show origin/main:<path> | cat -n), 2026-11-12T07:21:29Z
+## crates/init/src/domains.rs lines 487,522
+   487	    let workdir = run.get("workdir").and_then(Value::str).unwrap_or(".");
+   488	    // A supplied bare command lives in its own artifact before the system tools.
+   489	    // The inherited PATH also lets an explicit launcher such as nohup find its child.
+   490	    let path = format!("{dir}:{dir}/bin:{PATH}");
+   491	    let mut env = vec![
+   492	        cstr(&format!("PATH={path}"))?,
+   493	        cstr("HOME=/tmp")?,
+   494	        cstr(&format!("SHARDS_DOMAIN={label}"))?,
+   495	    ];
+   496	    for e in run.get("env").and_then(Value::strings).unwrap_or_default() {
+   497	        env.push(cstr(&e)?);
+   498	    }
+   499	    let first = command.first().map(String::as_str).unwrap_or_default();
+   500	    let program = if first.starts_with('/') {
+   501	        first.to_string()
+   502	    } else if first.contains('/') {
+   503	        // Relative: its directory's.
+   504	        format!("{dir}/{first}")
+   505	    } else {
+   506	        // A bare name, on PATH as execvp(3) would find it, found here: the child may not
+   507	        // allocate.
+   508	        path.split(':')
+   509	            .map(|p| format!("{p}/{first}"))
+   510	            .find(|p| {
+   511	                CString::new(p.as_str()).is_ok_and(|c| {
+   512	                    // SAFETY: access(2) of a NUL-terminated path.
+   513	                    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
+   514	                })
+   515	            })
+   516	            .ok_or_else(|| format!("{label}: {first:?} is on no directory of PATH"))?
+   517	    };
+   518	    let mut argv = vec![cstr(&program)?];
+   519	    for a in command.iter().skip(1) {
+   520	        argv.push(cstr(a)?);
+   521	    }
+   522	    let workdir = cstr(&format!("{dir}/{workdir}"))?;
+## docs/architecture/AGENTFILE_ARCH.md lines 821,824
+   821	1. **Directories carry names, never tags (Q3, Q4, Q18).** An agent unpacks to
+   822	   `/agents/<name>`, a harness to `/harness/<name>`, an unscoped MCP server to
+   823	   `/mcp/<name>`, and what `SKILL … FOR` and `MCP … FOR` grant an agent under
+   824	   `/agents/<name>.d/{skills,mcp}/`. A tag may itself hold `_`, `.` and `-` (OCI
+## docs/architecture/AGENTFILE_ARCH.md lines 897,902
+   897	    - **Content**: one or more layers, `application/vnd.osi.agent.content.v1.tar` with
+   898	      `+zstd` or `+gzip` (or none), applied in order onto an empty directory, the
+   899	      domain's (`/agents/<name>`). They hold files and directories alone: no whiteouts,
+   900	      device nodes, FIFOs, sockets, set-ID bits or links leaving the directory, which the
+   901	      build refuses as §9.2 refuses them anywhere in a domain.
+   902	    - **Config** (JSON, every path relative to the domain's directory, none may leave it):
+## crates/image/src/osi.rs lines 78,90
+    78	/// How it runs: its first process, relative to its directory.
+    79	#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    80	#[serde(deny_unknown_fields)]
+    81	pub struct Run {
+    82	    pub command: Vec<String>,
+    83	    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    84	    pub env: Vec<String>,
+    85	    #[serde(default, skip_serializing_if = "Option::is_none")]
+    86	    pub workdir: Option<String>,
+    87	}
+    88	
+    89	/// An MCP server it brings, spoken to over stdio.
+    90	#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+## crates/image/src/osi.rs lines 123,143
+   123	/// An OSI artifact's config.
+   124	#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+   125	#[serde(rename_all = "camelCase", deny_unknown_fields)]
+   126	pub struct Config {
+   127	    pub schema_version: u32,
+   128	    pub name: String,
+   129	    #[serde(default, skip_serializing_if = "String::is_empty")]
+   130	    pub version: String,
+   131	    #[serde(default, skip_serializing_if = "String::is_empty")]
+   132	    pub description: String,
+   133	    #[serde(default, skip_serializing_if = "Option::is_none")]
+   134	    pub platform: Option<Platform>,
+   135	    #[serde(default, skip_serializing_if = "Option::is_none")]
+   136	    pub run: Option<Run>,
+   137	    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+   138	    pub skills: Vec<String>,
+   139	    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+   140	    pub mcp: Vec<Mcp>,
+   141	    #[serde(default, skip_serializing_if = "is_default")]
+   142	    pub asks: Asks,
+   143	}
+## docs/architecture/AGENTFILE_ARCH.md lines 171,190
+   171	### 4.5 `VOLUME`, with options and `FOR`
+   172	
+   173	```
+   174	VOLUME [OPTIONS...] <path> [<dest>] [FOR <agent_name>]
+   175	```
+   176	
+   177	- Without `FOR`, the volume, mount point or path is available to every workspace and agent.
+   178	- With `FOR <agent_name>`, it is available to that agent's workload/workspace alone.
+   179	- Options:
+   180	  - `--chown=<agent_name>/<user_id>/...`;
+   181	  - `--chmod=<permissions>`;
+   182	  - `--target-kind=<agent|harness>` (added 2026-10-01): whether the names after `FOR`
+   183	    are agents or harnesses (§4.10). A `VOLUME` without `FOR` is Docker's own.
+   184	
+   185	### 4.6 `NETWORK`
+   186	
+   187	```
+   188	NETWORK [OPTIONS...] <name> [FOR <agent_name_a> <agent_name_b> ...]
+   189	```
+   190	
+## docs/architecture/AGENTFILE_ARCH.md lines 219,245
+   219	### 4.7 `CONNECT`
+   220	
+   221	```
+   222	CONNECT [OPTIONS...] <agent> [<agent> ...]
+   223	    (WITH <agent> [<agent> ...] | TO <agent> [<agent> ...])
+   224	    ON <network> [<network> ...]
+   225	```
+   226	
+   227	**Networks are default deny** (decided 2026-10-06): every agent is airgapped unless the
+   228	Agentfile configures otherwise, and a flow no directive names does not exist. Joining a
+   229	network grants nothing; `CONNECT` names each flow, who to whom on which ports.
+   230	
+   231	- `--port=<port>[/tcp|/udp]` (repeatable; a range such as `8000-8010`; TCP where no
+   232	  protocol is said) names what the receiving side accepts, and `--port=unix:<name>` a Unix
+   233	  socket: the agents after `TO` (and with `WITH`, every agent named) may make sockets in
+   234	  `/run/networks/<network>/<name>/`, and the agents after `CONNECT` connect to them. A `CONNECT` between agents
+   235	  with no `--port` is a build error, not a grant. A `CONNECT` naming one agent alone
+   236	  (`CONNECT a WITH a ON n`) attaches it to the networks and grants no flow.
+   237	- Each `--port` must lie within what each of its networks lets in to its members
+   238	  (`NETWORK --ingress` or `--expose`): the network is a second boundary, inside the
+   239	  microVM as at its edge, and a port outside it is a build error naming both.
+   240	- An agent resolves its own name and those of the peers it is granted a flow to, and no
+   241	  other.
+   242	- Exactly one of `WITH` and `TO` is required.
+   243	- `--target-kind=<agent|harness>` (added 2026-10-01) says whether the names are agents
+   244	  or harnesses (§4.10).
+   245	- Several agents may follow `CONNECT`, `WITH` and `TO`, and several networks may follow
+## docs/architecture/AGENTFILE_ARCH.md lines 256,280
+   256	### 4.8 `HARNESS`
+   257	
+   258	Added 2026-10-01, and revised the same day: a harness has no agents until `ATTACH` grants
+   259	them.
+   260	
+   261	```
+   262	HARNESS <name> FROM <source>[:<tag>] [TO <dest_path>]
+   263	```
+   264	
+   265	- `<name>` is required, and names the harness.
+   266	- `FROM <source>[:<tag>]` names where the harness comes from, with an optional tag, as
+   267	  `AGENT` does. The build detects the kind of source and fetches the harness that way:
+   268	
+   269	  | Source | The build |
+   270	  |---|---|
+   271	  | git URL | clones it |
+   272	  | http(s) URL | downloads it, respecting HTTPS |
+   273	  | path on the build host | copies it, as `COPY` copies |
+   274	  | OCI reference | pulls it from its registry |
+   275	
+   276	- A harness is a file artifact. The build unpacks it to `/harness/<name>`, or to
+   277	  `TO <dest_path>` if given.
+   278	- **Starting supplied files.** A path, archive, Git tree or HTTP archive may carry a
+   279	  root `harness.json` (`agent.json` for `AGENT`) containing:
+   280	
+## docs/architecture/AGENTFILE_ARCH.md lines 598,608
+   598	io_uring ring opens and connects sockets without the system calls a seccomp filter sees.
+   599	The pinned guest kernel has no Yama (`resources/kernel/`), so ptrace is closed by the PID
+   600	namespace and the separate IDs alone.
+   601	
+   602	**The run's own command is confined from the domains too** (D115). The workload a run's
+   603	`docker run`-style request starts is not one of the domains, but it shares the microVM with
+   604	them, so it is given no reach into them: a PID namespace of its own, whose PID 1 it is (so
+   605	it sees none of their processes; under `--init` a reaper of shards' is PID 1 there, the
+   606	command its child), and the
+   607	daemon, init and the build refuse whatever the CLI asks that would cross into a domain —
+   608	`--privileged`, the capabilities that reach across the PID namespace (`NET_RAW` and
+## docs/design/architecture.md lines 4482,4510
+  4482	### Supplied agent and harness startup (D54, continued)
+  4483	
+  4484	A supplied directory or archive may hold its command in the root `agent.json` or
+  4485	`harness.json`, with the user-approved fields `entrypoint` (a command string) and
+  4486	`options` (an optional array of literal arguments). The same applies after a Git or
+  4487	HTTP source is fetched. A nonempty entrypoint is split into quoted/escaped words, with
+  4488	no implicit shell or variable, glob or command substitution; options follow as separate
+  4489	arguments, including whitespace and empty strings exactly as given. An explicit `nohup`
+  4490	is left as an ordinary program. No `ENTRYPOINT` or `CMD` scoping syntax is added to an
+  4491	Agentfile, and startup does not install a program through `RUN` or `VOLUME`.
+  4492	
+  4493	`startup::config` normalizes the simple descriptor to the existing OSI config, using the
+  4494	Agentfile's declared name; `shards build agent` and `shards build harness` use the
+  4495	explicit `-t` repository's basename instead, never a filesystem name. With no explicit
+  4496	name a simple descriptor is refused, while legacy OSI input keeps its own name. The
+  4497	full OSI descriptor remains readable with its schema,
+  4498	path and platform checks. `DomainConfig` is a graph operation over the unpacked source,
+  4499	so native builds and the BuildKit frontend run the same regular-file check and parser
+  4500	before copying `osi.json` beside the domain. Symlinks and non-regular descriptors are
+  4501	refused. A missing descriptor retains passive layout compatibility. The existing domain
+  4502	content checks still refuse escaping links, special files and set-ID bits.
+  4503	
+  4504	At runtime the domain's own root and `bin` precede the system directories on `PATH`,
+  4505	which is inherited by children too. This makes a supplied bare `codex` or `claude` work,
+  4506	and makes `nohup codex ...` find the same artifact's executable. This changes neither
+  4507	its cgroup nor its filesystem, process or network grants. Output routing is a separate
+  4508	contract; this startup decision makes no output grants.
+  4509	
+  4510	| Literal or field | Source |
+## docs/research/measurements/harness-bringup-v1/README.md lines 1,12
+     1	# Harness bring-up v1: a real Codex CLI and a real Claude Code as Shards harnesses
+     2	
+     3	The managed-runtime plan's G24 and P10, through the startup contract of
+     4	[D54](../../../design/architecture.md) ("Supplied agent and harness startup"): each
+     5	publisher's own Linux binary, supplied as a directory whose root `harness.json` holds
+     6	`entrypoint` and literal `options`, declared by `HARNESS <name> FROM <path>`, built with
+     7	`shards build image` and run with `shards run`. No `RUN` or `VOLUME` installs a harness and
+     8	no credential enters an image. Implementer record; the coordinator owns suites, lint gates,
+     9	multi-platform validation and review.
+    10	
+    11	## Identity
+    12	
+## docs/research/measurements/harness-bringup-v1/README.md lines 229,240
+   229	What is missing, for the person's choice:
+   230	
+   231	1. A run-time secret primitive for members: per-member, tmpfs-backed, never in the image,
+   232	   the store or a host directory the run shares; today's working way is a host directory
+   233	   shared over virtio-fs for the run's life.
+   234	2. The simple `harness.json` cannot point a harness at its credential by environment
+   235	   (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`); its full OSI form can, and a `--settings`-style
+   236	   option can where the harness has one.
+   237	3. A volume shared by more than one domain is root's (`domains.rs:1476`), so a credential
+   238	   share must name one harness.
+   239	4. No refresh, rotation or revocation contract (G18): a ChatGPT or Claude sign-in writes its
+   240	   refreshed tokens wherever the harness keeps them.
+## docs/research/measurements/harness-bringup-v1/README.md lines 266,300
+   266	bound on the managed transport is the likely fix, not tried here.
+   267	
+   268	**H2: egress names ports, not destinations.** `--egress=443/tcp` with `EXPOSE … AS egress`
+   269	lets the harness open TCP 443 to any address past the microVM, and `--dns` lets it resolve
+   270	any name (`crates/init/src/netplan.rs:87-98`). Codex used two provider hosts,
+   271	`api.openai.com` and `chatgpt.com` (its model list); no Agentfile form grants "TCP 443 to
+   272	those hosts alone". Only a remote `MCP` server's grant is host-scoped (its resolved
+   273	addresses, its one name). The person decides whether provider egress needs a destination
+   274	form.
+   275	
+   276	**H3: no command reads a member's output.** It goes only to the owner endpoint
+   277	(authenticated, per channel, D180); `shards logs` is the command's. A person running a
+   278	harness today sees its process record, not what it says.
+   279	
+   280	**H4: `HOME=/tmp` and Codex.** Every domain's `HOME` is its scratch `/tmp`
+   281	(`domains.rs:493`). Codex then warns `Refusing to create helper binaries under temporary
+   282	dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/.codex"))` and makes none of its helper
+   283	aliases; with `CODEX_HOME` on a volume the warning is gone (`codex-login-volume`).
+   284	
+   285	**H5: input.** A domain's stdin is `/dev/null`; Codex reads it (`Reading additional input
+   286	from stdin...`), finds it empty and goes on. The interactive input and TTY contract (G24)
+   287	remains open.
+   288	
+   289	**H6: the harnesses' own behavior without a credential or a network.** Claude Code refuses
+   290	locally (`Not logged in · Please run /login`, `duration_api_ms: 0`, no request), so its reach
+   291	is shown with a placeholder key. With a key it retries a 401 ten times with backoff
+   292	(2 s rising to about 35 s; 246.5 s in all in the final run, 263 s in an earlier one)
+   293	before giving up. Codex without a network waits for
+   294	one as long as it runs (`Reconnecting... waiting for network`, more than 9 minutes in an
+   295	earlier run); the owner's `shards rm -f` ends it.
+   296	
+   297	## R01–R16
+   298	
+   299	| Rule | This change |
+   300	|---|---|
+## docs/examples/harness-claude/Agentfile lines 1,24
+     1	# Anthropic's Claude Code as a harness, started by its own harness.json (architecture.md
+     2	# D54): no RUN or VOLUME installs it, and no credential is in the image.
+     3	#
+     4	# Put Anthropic's musl build for the host's architecture at claude/bin/claude first:
+     5	# docs/research/measurements/harness-bringup-v1/fetch.sh fetches and verifies x86_64's.
+     6	#   shards build image -t harness-claude:1 docs/examples/harness-claude
+     7	#   shards run vm -d --name claude harness-claude:1 sleep 600
+     8	#   shards read processes claude
+     9	FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+    10	
+    11	# The system libraries Claude Code's musl build links (code.claude.com/docs/en/setup,
+    12	# "Alpine Linux and musl-based distributions"): Alpine's own, not the harness.
+    13	RUN apk add --no-cache libgcc libstdc++
+    14	
+    15	HARNESS claude FROM ./claude
+    16	
+    17	# Its network reach, every part named (default deny, AGENTFILE_ARCH.md §4.6, §4.7, §9.7):
+    18	# a network for this harness alone, which it joins with no flow to any member; names past
+    19	# the microVM through the microVM's resolver (--dns); and TCP 443 out, opened both at the
+    20	# network's boundary (--egress) and at the microVM's (EXPOSE ... AS egress). Nothing comes
+    21	# in, and no other port or protocol goes out.
+    22	NETWORK --dns --egress=443/tcp provider FOR claude
+    23	EXPOSE --harnesses=claude 443/tcp AS egress FOR provider
+    24	CONNECT claude WITH claude ON provider
+## crates/init/src/domains.rs lines 1,16
+     1	//! Agents and harnesses, each started in its domain (docs/design/architecture.md D59;
+     2	//! AGENTFILE_ARCH.md §9.3, §9.9): the image's normalized Agentfile (`/.agentfile.json`)
+     3	//! says which there are and where each lies, and each one's OSI config (`<dir>.d/osi.json`)
+     4	//! how it runs. One whose config says nothing of how it runs is files alone, for another
+     5	//! to use.
+     6	//!
+     7	//! Each starts with `clone3` into namespaces of its own (mount, PID, IPC, network, UTS,
+     8	//! cgroup) and into a cgroup of its own, `/sys/fs/cgroup/domains/<kind>-<name>`, whose
+     9	//! `pids.max` bounds what it starts. Its first process, PID 1 of its namespace:
+    10	//!
+    11	//! - sees the image's system as built, read-only, `nosuid` and `nodev` (workloads inherit
+    12	//!   the microVM's OS), and nothing the run made of it since: none of its files, mounts or
+    13	//!   sockets, a Unix socket's path being reachable to any process that can see it
+    14	//!   (unix(7)); its own directory and grants with it; every other domain's directory
+    15	//!   and grants hidden under an empty tmpfs no one may read; `/sys` hidden; a `/proc` of
+    16	//!   its PID namespace; a `/dev` of six nodes, the `fd` and stdio links, a `shm` of its
+## harness.json startup against shards v0.7.0
+startup.rs added: c3b7bde8b 2026-11-09 Start supplied agents and harnesses from their root startup descriptors
+startup.rs NOT in v0.7.0
+1da9132b7 IN origin/main
+latest release: v0.7.0 2026-11-05T22:48:00Z

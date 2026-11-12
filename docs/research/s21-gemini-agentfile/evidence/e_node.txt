@@ -1,0 +1,46 @@
+# Node.js v24.22.3: signed checksums, Linux builds and ELF needs, 2026-11-12T06:54:54Z, on Adas-MacBook-Pro-2.local
+RELEASE_KEYS_COMMIT nodejs/release-keys@481637f813e912c4aa3622d7964ab426c97b8e8d
+SHASUMS256 sha256=06d17307d84ec057dd2783863f12cb228c9273f9424b330532e4e3699f5d47c9
+KEYS_LISTED 29
+curl: (35) Recv failure: Operation timed out
+DETACHED [GNUPG:] GOODSIG 20B1A390B168D356 Antoine du Hamel <antoine.duhamel@platformatic.dev>
+DETACHED [GNUPG:] VALIDSIG 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 2026-11-11 1794415202 0 4 0 22 8 00 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356
+CLEARSIGNED [GNUPG:] GOODSIG 20B1A390B168D356 Antoine du Hamel <antoine.duhamel@platformatic.dev>
+CLEARSIGNED [GNUPG:] VALIDSIG 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 2026-11-11 1794415202 0 4 0 22 8 01 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356
+LISTED 6e51a2ada00f0011cc266f65d98922b403d7ad88f809ca2aa615a5fe1ce6e86c  node-v24.22.3-linux-arm64.tar.xz
+LISTED 601b3e1930a593f3d44af2d0dca978dad4bd8b4594c4f8268b67a33553b04c30  node-v24.22.3-linux-x64-musl.tar.xz
+LISTED 4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb  node-v24.22.3-linux-x64.tar.xz
+VERIFIED node-v24.22.3-linux-x64.tar.xz sha256=4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb size=32064292
+ENTRY_TYPES linux-x64 4797 - 1088 d  3 l 
+LINK linux-x64 node-v24.22.3-linux-x64/bin/corepack -> ../lib/node_modules/corepack/dist/corepack.js
+LINK linux-x64 node-v24.22.3-linux-x64/bin/npx -> ../lib/node_modules/npm/bin/npx-cli.js
+LINK linux-x64 node-v24.22.3-linux-x64/bin/npm -> ../lib/node_modules/npm/bin/npm-cli.js
+UNPACKED_TOTAL linux-x64 0 bytes; bin/node 126891984 bytes
+INTERP linux-x64 Requesting program interpreter: /lib64/ld-linux-x86-64.so.2
+NEEDED linux-x64 [libdl.so.2]
+NEEDED linux-x64 [libstdc++.so.6]
+NEEDED linux-x64 [libm.so.6]
+NEEDED linux-x64 [libgcc_s.so.1]
+NEEDED linux-x64 [libpthread.so.0]
+NEEDED linux-x64 [libc.so.6]
+NEEDED linux-x64 [ld-linux-x86-64.so.2]
+MAX_GLIBC linux-x64 GLIBC_2.28
+MAX_GLIBCXX linux-x64 GLIBCXX_3.4.21
+MAX_CXXABI linux-x64 CXXABI_1.3.9
+VERIFIED node-v24.22.3-linux-arm64.tar.xz sha256=6e51a2ada00f0011cc266f65d98922b403d7ad88f809ca2aa615a5fe1ce6e86c size=30991864
+ENTRY_TYPES linux-arm64 4797 - 1088 d  3 l 
+LINK linux-arm64 node-v24.22.3-linux-arm64/bin/npm -> ../lib/node_modules/npm/bin/npm-cli.js
+LINK linux-arm64 node-v24.22.3-linux-arm64/bin/npx -> ../lib/node_modules/npm/bin/npx-cli.js
+LINK linux-arm64 node-v24.22.3-linux-arm64/bin/corepack -> ../lib/node_modules/corepack/dist/corepack.js
+UNPACKED_TOTAL linux-arm64 0 bytes; bin/node 123446736 bytes
+INTERP linux-arm64 Requesting program interpreter: /lib/ld-linux-aarch64.so.1
+NEEDED linux-arm64 [libdl.so.2]
+NEEDED linux-arm64 [libstdc++.so.6]
+NEEDED linux-arm64 [libm.so.6]
+NEEDED linux-arm64 [libgcc_s.so.1]
+NEEDED linux-arm64 [libpthread.so.0]
+NEEDED linux-arm64 [libc.so.6]
+NEEDED linux-arm64 [ld-linux-aarch64.so.1]
+MAX_GLIBC linux-arm64 GLIBC_2.28
+MAX_GLIBCXX linux-arm64 GLIBCXX_3.4.21
+MAX_CXXABI linux-arm64 CXXABI_1.3.9
