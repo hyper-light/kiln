@@ -7,8 +7,9 @@
 use serde_json::Value;
 
 use super::{ALL, Builtin};
+use crate::agentfiles::unpack::{Member, Spec};
 use crate::harness::kinds::{Kind, Protocol};
-use crate::harness::session::Spec;
+use crate::harness::session::Spec as Session;
 
 /// The repository whose release workflow builds opencode's archives and signs their provenance (pin.sh's
 /// REPO and SIGNER, f9), and the provenance's predicate.
@@ -78,8 +79,9 @@ fn is_opencode_2(version: &str) -> bool {
 ///   digests, and SLSA provenance signed by opencode's release workflow at a commit;
 /// - builds other than linux/amd64 and linux/arm64, each in gnu and musl;
 /// - per build, other than two files: the release's archive for it (amd64's the baseline build, f11) with
-///   its SHA-256 and size, unpacked from its one entry `opencode` (that entry's own SHA-256 and size) to
-///   bin/opencode, 0755 (f8); then the tag's LICENSE at LICENSE, 0644, with nothing to unpack (f29);
+///   its SHA-256 and size, which the one unpacker reads as its one entry `opencode` held alone (that
+///   entry's own SHA-256 and size) and writes at bin/opencode, 0755 (f8); then the tag's LICENSE at
+///   LICENSE, 0644, with nothing to unpack (f29);
 /// - a smoke that isn't `bin/opencode --version` printing `opencode v<version>` (f32), in the shape every
 ///   pin gives its own: its program, args and stdout alone.
 fn pin_problems(text: &str, agentfile: &str) -> Vec<String> {
@@ -142,12 +144,14 @@ fn pin_problems(text: &str, agentfile: &str) -> Vec<String> {
         if of(archive, "path") != "bin/opencode" || of(archive, "mode") != "0755" {
             found.push(format!("{at}: its archive doesn't go to bin/opencode, 0755"));
         }
-        let u = |k: &str| archive.get("unpack").and_then(|u| u.get(k));
-        let member = u("format").and_then(Value::as_str) == Some("tar.gz") && u("member").and_then(Value::as_str) == Some("opencode");
-        let own = u("sha256").and_then(Value::as_str).is_some_and(is_sha256) && u("size").and_then(Value::as_u64).is_some_and(|n| n > 0);
-        let tree = ["strip", "entries", "unpacked_bytes"].into_iter().any(|k| u(k).is_some());
-        if !member || !own || tree {
-            found.push(format!("{at}: its archive isn't unpacked from its one entry opencode, with that entry's SHA-256 and size"));
+        // As the one unpacker reads it (`unpack::Spec`): the member opencode, held alone, as pin.sh found it
+        // the archive's only entry (f8), with that entry's own SHA-256 and size.
+        let unpack = archive.get("unpack");
+        let (sha256, size) = (unpack.and_then(|u| u.get("sha256")).and_then(Value::as_str).unwrap_or_default(), unpack.and_then(|u| u.get("size")).and_then(Value::as_u64).unwrap_or_default());
+        let held = Spec::Member(Member { member: "opencode".to_owned(), sha256: sha256.to_owned(), size, alone: true });
+        let read = unpack.cloned().map(serde_json::from_value::<Spec>);
+        if !is_sha256(sha256) || size == 0 || !matches!(read, Some(Ok(ref spec)) if *spec == held) {
+            found.push(format!("{at}: its archive isn't unpacked from its one entry opencode, held alone, with that entry's SHA-256 and size"));
         }
         if of(notice, "url") != license || of(notice, "path") != "LICENSE" || of(notice, "mode") != "0644" || notice.get("unpack").is_some() {
             found.push(format!("{at}: its second file isn't the tag's LICENSE at LICENSE, 0644"));
@@ -226,7 +230,7 @@ fn env_problems(h: &Value, home: &str) -> Vec<String> {
 /// arguments, after the program.
 fn launched(kind: &Kind) -> anyhow::Result<Vec<String>> {
     let cwd = tempfile::tempdir()?;
-    let spec = Spec { kind: kind.id.to_owned(), program: Some(format!("/nowhere/{}", kind.program)), cwd: Some(cwd.path().to_string_lossy().into_owned()), ..Spec::default() };
+    let spec = Session { kind: kind.id.to_owned(), program: Some(format!("/nowhere/{}", kind.program)), cwd: Some(cwd.path().to_string_lossy().into_owned()), ..Session::default() };
     let p = kind.launch(&spec, "session")?;
     Ok(p.get_args().map(|a| a.to_string_lossy().into_owned()).collect())
 }
@@ -318,10 +322,10 @@ fn edited(text: &str, path: &str, to: Option<Value>) -> anyhow::Result<String> {
     Ok(v.to_string())
 }
 
-/// opencode's pin holds (OpenCode 2's four builds, each its release archive's one entry to bin/opencode
-/// with its LICENSE, checked as pin.sh checks them, the base its Agentfile builds on, its smoke); its
-/// harness file is an OSI config of opencode at the pin's version whose env is exactly [`ENV`], each XDG
-/// root on the person's volume; and it has no other context file.
+/// opencode's pin holds (OpenCode 2's four builds, each its release archive's one entry, held alone, to
+/// bin/opencode with its LICENSE, checked as pin.sh checks them, the base its Agentfile builds on, its
+/// smoke); its harness file is an OSI config of opencode at the pin's version whose env is exactly
+/// [`ENV`], each XDG root on the person's volume; and it has no other context file.
 #[test]
 fn step22_opencode_pin_and_harness_file_hold() -> anyhow::Result<()> {
     let b = opencode()?;
@@ -345,10 +349,11 @@ fn step22_opencode_pin_and_harness_file_hold() -> anyhow::Result<()> {
 /// a variant or a platform missing, OpenCode 1, a tag elsewhere, a base by tag or not the Agentfile's,
 /// another workflow's provenance, an archive of another release or over plain HTTP, the x64 build where
 /// amd64 takes the baseline one, an archive not unpacked or unpacked as a tree, its entry without its
-/// digest, a binary elsewhere, the LICENSE missing or at another commit, and a smoke that runs another
-/// program, asks something else, expects another line or carries an env; in the harness file, a schema
-/// it isn't, a field Shards refuses, a name no Agentfile gives, no command, an env entry with no value or
-/// the runtime's own, an XDG root off the person's volume, a HOME, the update check on, and a workdir.
+/// digest, not held alone or in a form the unpacker refuses, a binary elsewhere, the LICENSE missing or
+/// at another commit, and a smoke that runs another program, asks something else, expects another line
+/// or carries an env; in the harness file, a schema it isn't, a field Shards refuses, a name no
+/// Agentfile gives, no command, an env entry with no value or the runtime's own, an XDG root off the
+/// person's volume, a HOME, the update check on, and a workdir.
 #[test]
 fn step22_an_opencode_pin_or_harness_file_that_would_mislead_is_caught() -> anyhow::Result<()> {
     let b = opencode()?;
@@ -374,6 +379,10 @@ fn step22_an_opencode_pin_or_harness_file_that_would_mislead_is_caught() -> anyh
     anyhow::ensure!(says("/builds/0/files/0/unpack/member", Some(Value::from("./opencode")), "one entry opencode")?);
     anyhow::ensure!(says("/builds/0/files/0/unpack/sha256", None, "one entry opencode")?);
     anyhow::ensure!(says("/builds/0/files/0/unpack/strip", Some(Value::from(0)), "one entry opencode")?);
+    anyhow::ensure!(says("/builds/0/files/0/unpack/alone", Some(Value::Bool(false)), "held alone")?);
+    anyhow::ensure!(says("/builds/2/files/0/unpack/alone", None, "held alone")?);
+    anyhow::ensure!(says("/builds/1/files/0/unpack/format", Some(Value::from("zip")), "held alone")?);
+    anyhow::ensure!(says("/builds/3/files/0/unpack/skip", Some(serde_json::json!(["opencode"])), "held alone")?);
     anyhow::ensure!(says("/builds/0/files/0/path", Some(Value::from("opencode")), "bin/opencode, 0755")?);
     anyhow::ensure!(says("/builds/0/files/0/mode", Some(Value::from("0644")), "bin/opencode, 0755")?);
     anyhow::ensure!(says("/builds/0/files/1", None, "not its archive and its LICENSE")?);

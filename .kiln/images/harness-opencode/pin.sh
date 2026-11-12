@@ -13,7 +13,8 @@
 #   opencode/child-session-updates, which only OpenCode 2 has (f6).
 # - each archive: its SHA256SUMS line; GitHub's digest and size for the asset; its Sigstore build
 #   provenance, signed by the release workflow below at the commit and run the endpoint names
-#   (gh attestation verify, f9); and one entry only, a regular file named opencode (f8).
+#   (gh attestation verify, f9); and one entry only, a regular file named opencode (f8). The pin
+#   says so (`"alone": true`), so kiln's one unpacker refuses an archive holding anything beside it.
 # - LICENSE at the tag's commit: opencode is MIT, and its archives don't carry the notice (f29).
 # --from DIR takes the archives from DIR instead of downloading them; every check still runs.
 # --check downloads what a pin names and checks each file, member and attestation against it.
@@ -237,7 +238,7 @@ for row in open(work + "/builds.tsv"):
     platform, variant, url, sha, size, m_sha, m_size = row.rstrip("\n").split("\t")
     builds.append({"platform": platform, "variant": variant, "files": [
         {"url": url, "sha256": sha, "size": int(size), "path": "bin/opencode", "mode": "0755",
-         "unpack": {"format": "tar.gz", "member": "opencode", "sha256": m_sha, "size": int(m_size)}},
+         "unpack": {"format": "tar.gz", "member": "opencode", "alone": True, "sha256": m_sha, "size": int(m_size)}},
         dict(lic)]})
 pin = {
     "harness": "opencode",

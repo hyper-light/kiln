@@ -71,6 +71,7 @@
           "unpack": {
             "format": "tar.gz",
             "member": "opencode",
+            "alone": true,
             "sha256": "589253d36810f21217edd51545cd435b328cdc3cf4f451fbe0cce6f88afcf5e1",
             "size": 258848944
           }
@@ -97,6 +98,7 @@
           "unpack": {
             "format": "tar.gz",
             "member": "opencode",
+            "alone": true,
             "sha256": "aeae3102ab6360a0ac3ea56537a643cd02727f766a1da30cb770240f7bf1cf02",
             "size": 261027240
           }
@@ -123,6 +125,7 @@
           "unpack": {
             "format": "tar.gz",
             "member": "opencode",
+            "alone": true,
             "sha256": "c577783eacf7d1e66661fc7fd904b7646761497b687ff8f8f82ebe4f2f3ea425",
             "size": 253873144
           }
@@ -149,6 +152,7 @@
           "unpack": {
             "format": "tar.gz",
             "member": "opencode",
+            "alone": true,
             "sha256": "b4203e9861d0472e711493a34e8d843fb249cf9bf499b69cfdc64416085d87c6",
             "size": 253697128
           }
