@@ -23,7 +23,8 @@ import { fleetCommand, fleetInfos } from "./push.ts";
 import { familyInfos } from "./agents.ts";
 import { reviewInfos } from "./plan-review.ts";
 import { fastInfos } from "./fast.ts";
-import { MAC_MINI } from "./data.ts";
+import { MAC_MINI, MICROVM_RUNNERS } from "./data.ts";
+import type { Isolation } from "../src/api/wire/index.ts";
 
 const now = () => Math.floor(Date.now() / 1000);
 const EMAIL = "ada@lundhe.audio";
@@ -469,7 +470,7 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
   if (p === "/api/harness/sessions" && m === "POST") {
     // Under the ids its page made (W21-R15), as the server starts them: after a moment, a runner's
     // answer (MOCK_START_MS); refused as there already when one is. Asked with none, the Claude demo.
-    const b = await body<{ target?: string; spec?: { kind?: string; prompt?: string; name?: string; model?: string }; ids?: string[] }>(req);
+    const b = await body<{ target?: string; spec?: { kind?: string; prompt?: string; name?: string; model?: string; isolation?: Isolation }; ids?: string[] }>(req);
     const ids = b.ids ?? [];
     if (ids.length === 0) {
       json(res, 200, [demos.get("demo-claude")!.info]);
@@ -480,12 +481,21 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
       json(res, 409, { error: `an agent ${taken} is there already, or starting` });
       return true;
     }
+    // One in a microVM of its own (made from an Agentfile, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+    // step 31) goes only where the runner starts them, as the server's `isolation_on` holds it.
+    const machine = (b.target ?? "local").replace(/^agent:/, "");
+    const isolation = b.spec?.isolation;
+    if (isolation && !MICROVM_RUNNERS.has(machine)) {
+      const why = b.target?.startsWith("agent:") ? `${machine} doesn't start microVMs` : "the server's kiln starts no microVM itself: pick a runner that does with `on` (`microvm`)";
+      json(res, 400, { error: `an agent can't run isolated there: ${why}` });
+      return true;
+    }
     await new Promise((r) => setTimeout(r, Number(process.env.MOCK_START_MS ?? 600)));
     const kind = b.spec?.kind ?? "claude";
     const made = ids.map((id, i) => {
       const d = demo(id, kind, b.target ?? "local", "", b.spec?.model || (kind === "claude" ? "claude-opus-5-5" : "gpt-5.5-codex"), b.spec?.prompt ?? "", "Invalid API key · Please run /login");
       const name = b.spec?.name?.trim() || d.info.name;
-      d.info = { ...d.info, name: ids.length > 1 ? `${name} ${i + 1}` : name, created_at: Date.now(), last_activity: Date.now() };
+      d.info = { ...d.info, name: ids.length > 1 ? `${name} ${i + 1}` : name, created_at: Date.now(), last_activity: Date.now(), ...(isolation ? { isolation } : {}) };
       if (!b.spec?.prompt) d.events = [];
       demos.set(id, d);
       emitEvent({ type: "harness", info: d.info });

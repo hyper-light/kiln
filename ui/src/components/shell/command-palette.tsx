@@ -151,6 +151,7 @@ function Palette() {
       },
       { id: "p-runners", group: "Pages", label: "Runners", icon: <Server size={15} />, run: () => go("/runners") },
       { id: "p-agents", group: "Pages", label: "Agents", hint: "AI sessions", icon: <Bot size={15} />, run: () => go("/agents") },
+      { id: "p-agentfiles", group: "Pages", label: "Agentfiles", hint: "in Agents: what their microVMs are made from", icon: <Bot size={15} />, run: () => go("/agents/agentfiles") },
       { id: "p-term", group: "Pages", label: "Terminal", icon: <SquareTerminal size={15} />, run: () => go("/terminal") },
       { id: "p-observe", group: "Pages", label: "Observe", hint: "monitors, events, the store", icon: <Cpu size={15} />, run: () => go("/observe") },
       { id: "p-dashboards", group: "Pages", label: "Dashboards", hint: "in Observe: hosts, CI, CD and yours", icon: <Cpu size={15} />, run: () => go("/observe/dashboards") },
