@@ -2,7 +2,7 @@ Subject: Driver::poll_received, a turn's events before its sends
 Why: An owner that passes what comes in onward waited for each turn's sends before the turn's first event: Driver::poll_event takes what arrived, sends, then hands out. poll_received is the same turn split at that seam, an event the receive half made handed out before the send half, which the caller makes with flush in the same turn (its doc says what it owes, and what holding it costs the peer's round trip and congestion window); poll_event is built from the same pieces and does what it did. kiln's net thread hands a turn's frames to its shards before the turn's sends (kiln's goal 10, plan 01a1a87b2dae step 5). Offered upstream; no other caller calls it
 
 diff --git a/crates/hyper-rt-transport/src/driver.rs b/crates/hyper-rt-transport/src/driver.rs
-index e93362f20d214627af84c099a7ba592b88cbca78..ebbf14ba42bcf2a7f66935ab40257e32c5591f9d 100644
+index 4d8ab462269ed0bd2e965d7b6380fae883020564..4bde16ab64bcf88b369835658e1e6b9ab9690aa4 100644
 --- a/crates/hyper-rt-transport/src/driver.rs
 +++ b/crates/hyper-rt-transport/src/driver.rs
 @@ -106,6 +106,14 @@ struct Held {
@@ -20,9 +20,9 @@ index e93362f20d214627af84c099a7ba592b88cbca78..ebbf14ba42bcf2a7f66935ab40257e32
  /// The kernel's account of a queue, as hyper-transport takes it.
  fn account(charge: QueueCharge) -> Account {
      Account {
-@@ -548,27 +556,53 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
-     /// arrived, fires the timers due, sends, and hands out the next event, or arms the socket's readiness
-     /// and the timer and parks.
+@@ -561,43 +569,53 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
+     /// most one poll and never starves them. Datagrams taken in the drain are told at their reads,
+     /// after the reading the timers are judged at; the turn sends at a reading after both.
      pub fn poll_event(&mut self, context: &mut Context<'_>) -> Poll<Result<Event<C>, RtError>> {
 +        self.turns(context, HandOut::AfterSends)
 +    }
@@ -62,21 +62,37 @@ index e93362f20d214627af84c099a7ba592b88cbca78..ebbf14ba42bcf2a7f66935ab40257e32
          if let Some(event) = self.endpoint.poll_event() {
              return Poll::Ready(Ok(event));
          }
-         for _ in 0..TURNS {
+         for turn in 0..TURNS {
 -            if let Err(error) = self.reconcile() {
 -                return Poll::Ready(Err(error));
 -            }
--            if let Err(error) = self.drain() {
+-            // The readiness is taken after the clock is read, so a socket a datagram reached by
+-            // then is drained in this turn.
+-            let cutoff = match shard_now() {
+-                Ok(cutoff) => cutoff,
+-                Err(error) => return Poll::Ready(Err(error)),
+-            };
+-            if let Err(error) = self.take_ready(context) {
 -                return Poll::Ready(Err(error));
 -            }
+-            let whole = match self.drain(cutoff) {
+-                Ok(whole) => whole,
+-                Err(error) => return Poll::Ready(Err(error)),
+-            };
+-            let cutoff = self.instant(cutoff);
+-            if (whole || turn.saturating_add(1) == TURNS)
+-                && self
+-                    .endpoint
+-                    .poll_timeout()
+-                    .is_some_and(|due| due <= cutoff)
+-            {
+-                self.endpoint.handle_timeout(cutoff);
+-            }
 -            let now = match self.now() {
-+            let now = match self.receive() {
++            let now = match self.receive(context, turn.saturating_add(1) == TURNS) {
                  Ok(now) => now,
                  Err(error) => return Poll::Ready(Err(error)),
              };
--            if self.endpoint.poll_timeout().is_some_and(|due| due <= now) {
--                self.endpoint.handle_timeout(now);
--            }
 -            // A connection established in this turn's receives has its socket, and its path's
 -            // ceiling, before its first transmission: its first MTU probe is never past the path.
 -            if let Err(error) = self.reconcile() {
@@ -88,19 +104,26 @@ index e93362f20d214627af84c099a7ba592b88cbca78..ebbf14ba42bcf2a7f66935ab40257e32
              }
              let more = self.send(now);
              if let Some(event) = self.endpoint.poll_event() {
-@@ -597,6 +631,21 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
-         Poll::Pending
+@@ -643,6 +661,28 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
+         Ok(())
      }
  
-+    /// A turn's receive half: the peers' sockets matched to the endpoint's connections, what arrived
-+    /// taken, the timers due fired, and the sockets matched again. Now, for the turn's send half.
-+    fn receive(&mut self) -> Result<Instant, RtError> {
++    /// A turn's receive half: the peers' sockets matched to the endpoint's connections, the clock
++    /// read, the readiness that fired taken (arming none), what arrived by that reading drained, the
++    /// timers due at it fired where every drain was whole or at the poll's `last` turn
++    /// ([`Driver::poll_event`]), and the sockets matched again. Now, for the turn's send half.
++    fn receive(&mut self, context: &mut Context<'_>, last: bool) -> Result<Instant, RtError> {
 +        self.reconcile()?;
-+        self.drain()?;
-+        let now = self.now()?;
-+        if self.endpoint.poll_timeout().is_some_and(|due| due <= now) {
-+            self.endpoint.handle_timeout(now);
++        // The readiness is taken after the clock is read, so a socket a datagram reached by then is
++        // drained in this turn.
++        let cutoff = shard_now()?;
++        self.take_ready(context)?;
++        let whole = self.drain(cutoff)?;
++        let cutoff = self.instant(cutoff);
++        if (whole || last) && self.endpoint.poll_timeout().is_some_and(|due| due <= cutoff) {
++            self.endpoint.handle_timeout(cutoff);
 +        }
++        let now = self.now()?;
 +        // A connection established in this turn's receives has its socket, and its path's
 +        // ceiling, before its first transmission: its first MTU probe is never past the path.
 +        self.reconcile()?;

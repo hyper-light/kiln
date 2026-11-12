@@ -171,7 +171,7 @@ authority issued it (`mantle init client`) and takes only nodes that authority c
   the bytes' native ETag is the pointer's, else only once the whole object hashes to it. Bytes
   that don't are refused `BadChecksum`.
 - **Asked again:** mantle-client asks again only what no node can have taken, and what's slowed
-  a few times; the rest is the caller's. Mantle judges a put asked again afresh (at 17eb8032 it
+  a few times; the rest is the caller's. Mantle judges a put asked again afresh (at 87ab09e1, as at 17eb8032, it
   knows a write again by the file its gateway wrote, not by the client's identity), so a put whose
   answer was lost on the way is checked against its key before it's sent again: a document (a
   pointer, an upload's record) carries its write's own id, bytes their SHA-256, and a write the
@@ -195,7 +195,7 @@ authority issued it (`mantle init client`) and takes only nodes that authority c
   one through each client (a caller waits for each answer before it asks again, so they're
   concurrent ones); a completion, one writing as the next reads its parts, and a listing, its keys'
   pointers read through all of them (Mantle's listing says each pointer's own size, not its
-  object's), go alone. A node at 17eb8032 admits two native clients at once and runs two
+  object's), go alone. A node at 87ab09e1, as at 17eb8032, admits two native clients at once and runs two
   operations at once, so one a node takes half of each.
   64 requests more wait at most, and one past them is refused `Full`. Each is answered within
   `timeout_s`, every exchange it needs included. A cell that doesn't answer is `Unavailable`, with

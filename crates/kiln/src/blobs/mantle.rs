@@ -40,7 +40,7 @@ const PAUSE_MOST: Duration = Duration::from_secs(8);
 /// The clients kiln holds: one a node of the cell, each first asking a node of its own, at least
 /// two (one writes, one reads a completion's parts as it goes) and at most four. Requests that come
 /// together go through them at once, one each, and a listing reads its keys' pointers through all
-/// of them. A node (17eb8032) admits two native clients at once and runs two operations at once
+/// of them. A node (87ab09e1, as 17eb8032) admits two native clients at once and runs two operations at once
 /// (`gateway.clients`, `gateway.objects`, fixed), so one a node takes half of what each admits and
 /// leaves the rest to its other clients.
 const CLIENTS_MOST: usize = 4;
@@ -143,7 +143,9 @@ impl Loaded {
             let first = n % nodes.len();
             nodes.rotate_left(first);
         }
-        Ok(Settings { id: self.id, bind: if self.nodes.first().is_some_and(|(_, at)| at.is_ipv6()) { "[::]:0" } else { "0.0.0.0:0" }.parse().map_err(unavailable)?, credentials: mantle_client::Credentials { chain: vec![mantle_client::CertificateDer::from(self.certificate.clone())], key: mantle_client::PrivateKeyDer::Pkcs8(mantle_client::PrivatePkcs8KeyDer::from(self.key.clone())), roots: vec![mantle_client::CertificateDer::from(self.authority.clone())] }, nodes, transport_bytes: mantle_client::least_transport(self.nodes.len()).map_err(unavailable)? })
+        // The nodes by address alone, as kiln's client config names them: none by a host name, so the
+        // client never looks one up again (mantle's research/78, for when kiln names its nodes so).
+        Ok(Settings { id: self.id, bind: if self.nodes.first().is_some_and(|(_, at)| at.is_ipv6()) { "[::]:0" } else { "0.0.0.0:0" }.parse().map_err(unavailable)?, credentials: mantle_client::Credentials { chain: vec![mantle_client::CertificateDer::from(self.certificate.clone())], key: mantle_client::PrivateKeyDer::Pkcs8(mantle_client::PrivatePkcs8KeyDer::from(self.key.clone())), roots: vec![mantle_client::CertificateDer::from(self.authority.clone())] }, nodes, names: Vec::new(), transport_bytes: mantle_client::least_transport(self.nodes.len()).map_err(unavailable)? })
     }
 }
 
@@ -542,7 +544,7 @@ struct Written<'a, T> {
 }
 
 /// Writes `value` as JSON at `key` under `headers`' preconditions. Mantle judges a put asked again
-/// afresh (at 17eb8032 a write is known again by the file the gateway wrote for it, which an ask
+/// afresh (at 87ab09e1, as at 17eb8032, a write is known again by the file the gateway wrote for it, which an ask
 /// again doesn't carry), so one whose answer was lost and that was applied comes back refused for
 /// its condition. The write's own id in the document says which: a refused write that the key
 /// holds now was done.
