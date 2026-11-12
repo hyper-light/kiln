@@ -310,13 +310,19 @@ impl Fleet {
         let (within, repeats) = self.keys.values().filter(|c| c.len() >= 2 && c.keys().all(|m| local.contains_key(m))).flat_map(|c| c.values()).fold((0.0, 0u64), |(w, r), c| (w + c.within(), r + c.n.saturating_sub(1)));
         let s_e = if repeats > 0 { within / repeats as f64 } else { 0.0 };
         let var_of = |g: f64| -> Vec<Vec<f64>> { kinds.iter().map(|cells| cells.iter().map(|o| g + s_e / o.n).collect()).collect() };
-        // g, the typical kind's work-differs: the cells' median standardised residual at it is the normal's.
+        // g, the typical kind's work-differs: the cells' median standardised residual at it is the
+        // normal's. Its search starts at the cell means' variance about their kinds' means.
+        let (dev, cells_less_kinds) = kinds.iter().fold((0.0, 0usize), |(d, c), cells| {
+            let mean = cells.iter().map(|o| o.mean).sum::<f64>() / cells.len().max(1) as f64;
+            (d + cells.iter().map(|o| (o.mean - mean).powi(2)).sum::<f64>(), c + cells.len().saturating_sub(1))
+        });
+        let scale = if cells_less_kinds > 0 { dev / cells_less_kinds as f64 } else { 0.0 };
         let g = least_root(|g| {
             let var = var_of(g);
             let w = weighted(&kinds, &var, mm)?;
             let z: Vec<f64> = w.resid.iter().zip(&var).flat_map(|(rs, vs)| rs.iter().zip(vs)).filter(|((_, h), _)| 1.0 - h > f64::EPSILON).map(|((r, h), v)| r.abs() / (v * (1.0 - h)).sqrt()).collect();
             Some(median(z).map_or(-NORMAL_MEDIAN_ABS, |m| m - NORMAL_MEDIAN_ABS))
-        }, s_e > 0.0)
+        }, s_e > 0.0, scale)
         .unwrap_or(0.0);
         // One step: each kind at least as noisy as its own cells say about that fit.
         let var0 = var_of(g);
@@ -453,13 +459,14 @@ fn median(mut xs: Vec<f64>) -> Option<f64> {
 
 /// The least x ≥ 0 at which `f`, decreasing in x, is at most 0 (0 when it is there already; f(0)
 /// asked only when `at_zero`, as a zero variance may not be): bisection to f64's own precision,
-/// its upper end doubled from one f says is past it. None when f has no answer or no end is found.
-fn least_root(f: impl Fn(f64) -> Option<f64>, at_zero: bool) -> Option<f64> {
+/// its upper end `scale` (the data's own, so a few dozen asks find it), doubled until f says it's
+/// past. None when f has no answer or no end is found.
+fn least_root(f: impl Fn(f64) -> Option<f64>, at_zero: bool, scale: f64) -> Option<f64> {
     if at_zero && f(0.0)? <= 0.0 {
         return Some(0.0);
     }
-    // An upper end: from the smallest normal f64 up, doubling (at most f64's exponent range).
-    let mut hi = f64::MIN_POSITIVE;
+    // An upper end: the scale, else the smallest normal f64, doubled (at most f64's exponent range).
+    let mut hi = if scale.is_finite() && scale > 0.0 { scale } else { f64::MIN_POSITIVE };
     while f(hi)? > 0.0 {
         hi *= 2.0;
         if !hi.is_finite() {
@@ -507,12 +514,15 @@ fn centre_and_spread(theta: &[f64], var: &[f64]) -> (f64, f64) {
             return (centre, tau2);
         }
         seen.push(centre.to_bits());
+        // At τ² = (the largest |θ̂ − μ| / Φ⁻¹(3/4))² every machine's |z| is at most Φ⁻¹(3/4): an end.
+        let far = theta.iter().map(|t| (t - centre).abs()).fold(0.0, f64::max) / NORMAL_MEDIAN_ABS;
         let spread = least_root(
             |t2| {
                 let z: Vec<f64> = theta.iter().zip(var).map(|(t, v)| if v + t2 > 0.0 { (t - centre).abs() / (v + t2).sqrt() } else if *t == centre { 0.0 } else { f64::MAX }).collect();
                 Some(median(z)? - NORMAL_MEDIAN_ABS)
             },
             true,
+            far * far,
         );
         tau2 = spread.unwrap_or(0.0);
     }
