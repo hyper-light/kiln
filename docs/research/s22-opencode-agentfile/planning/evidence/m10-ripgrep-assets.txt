@@ -1,0 +1,9 @@
+M10 run 2026-11-12T07:53:12Z
+RIPGREP 15.1.0 published 2025-10-22T13:00:26Z
+ASSET ripgrep-15.1.0-aarch64-unknown-linux-gnu.tar.gz sha256:2b661c6ef508e902f388e9098d9c4c5aca72c87b55922d94abdba830b4dc885e
+ASSET ripgrep-15.1.0-armv7-unknown-linux-gnueabihf.tar.gz sha256:1349e515287c06317c1f7adc894a6590ab8bea8cbe997c61060bf6395f42733c
+ASSET ripgrep-15.1.0-armv7-unknown-linux-musleabi.tar.gz sha256:59f117dc44a08db816eb55d530ea2aa2f9239ab6939ea4b0dc5f7d355f42165c
+ASSET ripgrep-15.1.0-armv7-unknown-linux-musleabihf.tar.gz sha256:89c0230b8ad3c280460e0391f2ecb92f4a7c498b10f4a912540fc0f916336b08
+ASSET ripgrep-15.1.0-i686-unknown-linux-gnu.tar.gz sha256:0300c58864b1de49da08f714d56ce10328dcbf6de37a404486fe2696e95692f1
+ASSET ripgrep-15.1.0-s390x-unknown-linux-gnu.tar.gz sha256:a7b9bae0009abc2df000877a2f6e64f03bbf8fdd0c912167427e69ab45dd2fef
+ASSET ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz sha256:1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599

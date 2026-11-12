@@ -1,0 +1,13 @@
+# Shards ROOT's goal stack (agent 01a148884a4770fdaf0111f3f792a248), kiln goals_get as saved 2026-11-12T04:15Z by step 21's first agent (/Users/adalundhe/.claude/projects/-Users-adalundhe-Projects-shards--claude-worktrees-g121/01a1cdf2-6459-76ce-8527-5d16ba025adf/tool-results/mcp-kiln-goals_get-1794456921659.txt)
+6d9264239fcb8c48b20c5da1685cd36e pending
+Plan step 16 [kiln]: kiln vendors Hex and Shards at one Shards revision and carries Shards' VM and network processes, signed with Shards' entitlements on macOS; build time and size measured; decision recorded. Rules: read kiln's AGENTS.md and CLAUDE.md (origin/main) plus Shards' policy, and record the readback. Work in your own kiln worktree from origin/main under ~/Projects/kiln/.claude/worktrees/. Build only on Linux runners or the Mac Studio runner, never on this Mac. Commit with gits; no push. Full step: kiln plan 01a1cd8e862e7169a074db3d5fa33f3d.
+
+d4d312f663f88b09b218463a81241214 active
+Plan step 19 [kiln]: the Claude Code Agentfile is embedded in kiln: - pinned official Linux build; - HARNESS plus harness.json; - DNS and egress grants; - the project volume and a per-user config volume; - amd64 and arm64; - no secrets; - one smoke run prints its version. Rules as plan step 16's goal. Full step: kiln plan 01a1cd8e862e7169a074db3d5fa33f3d.
+
+306e318bf3d68d8ab9526b6946ecafa9 active
+Plan step 20 [kiln]: the Codex Agentfile is embedded in kiln, as step 19's goal says. Rules as plan step 16's goal.
+
+fe0b5a6ec03387349948d8dae8bbb674 active
+Plan step 21 [kiln]: the Gemini CLI Agentfile is embedded in kiln, as step 19's goal says. Rules as plan step 16's goal.
+

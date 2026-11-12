@@ -1,0 +1,17 @@
+# Node v24.22.3 Linux .tar.gz against .tar.xz (same files?), 2026-11-12T07:45:33Z, on Adas-MacBook-Pro-2.local
+VERIFIED node-v24.22.3-linux-x64.tar.gz sha256=061ec3e3062115705b56b51fa9cc330ab50d34b6969387d4e4b1a50c6809acc2 size=58330843
+VERIFIED node-v24.22.3-linux-x64.tar.xz sha256=4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb size=32064292
+SAME linux-x64 bin/node sha256=a7ec1b37e6ff9d187e4198c5b6df9a4eb1c74dd31804fb3bac55cc4ceca1ac01
+SAME linux-x64 LICENSE sha256=5888dbb9a1d2b18f2c3e6c5f6af1b39de658372b402a0577b002777f14c62ace
+GZ_ENTRY_TYPES linux-x64 4797 - 1088 d  3 l 
+GZ_SYMLINKS linux-x64: node-v24.22.3-linux-x64/bin/corepack -> ../lib/node_modules/corepack/dist/corepack.js; node-v24.22.3-linux-x64/bin/npx -> ../lib/node_modules/npm/bin/npx-cli.js; node-v24.22.3-linux-x64/bin/npm -> ../lib/node_modules/npm/bin/npm-cli.js; 
+GZ_FILE_BYTES linux-x64 201778667
+GZ_TOP_LEVEL linux-x64 node-v24.22.3-linux-x64 
+VERIFIED node-v24.22.3-linux-arm64.tar.gz sha256=261af2af250dfd7e9f25cf151d1b2713a0adf8f10a9ad116c4947f68627affe8 size=58051304
+VERIFIED node-v24.22.3-linux-arm64.tar.xz sha256=6e51a2ada00f0011cc266f65d98922b403d7ad88f809ca2aa615a5fe1ce6e86c size=30991864
+SAME linux-arm64 bin/node sha256=8f9c2a55879e9705cb285b6cdd649d95df642c6720f052cb30f300d2677da99f
+SAME linux-arm64 LICENSE sha256=5888dbb9a1d2b18f2c3e6c5f6af1b39de658372b402a0577b002777f14c62ace
+GZ_ENTRY_TYPES linux-arm64 4797 - 1088 d  3 l 
+GZ_SYMLINKS linux-arm64: node-v24.22.3-linux-arm64/bin/npm -> ../lib/node_modules/npm/bin/npm-cli.js; node-v24.22.3-linux-arm64/bin/npx -> ../lib/node_modules/npm/bin/npx-cli.js; node-v24.22.3-linux-arm64/bin/corepack -> ../lib/node_modules/corepack/dist/corepack.js; 
+GZ_FILE_BYTES linux-arm64 198333367
+GZ_TOP_LEVEL linux-arm64 node-v24.22.3-linux-arm64 

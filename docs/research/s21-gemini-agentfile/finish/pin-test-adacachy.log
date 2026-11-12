@@ -1,0 +1,56 @@
+# pin.sh tests on adacachy (Linux 7.2.9-2-cachyos x86_64), 2026-11-12T21:58:42Z
+# pin.sh sha256 6d5e8387fc4fa5b1f91808e6ddcc0700b334c30c43ae981c63d20fe1d6ed39d5; curl 8.22.0, gpgv 2.4.9, OpenSSL 3.6.5, tar (GNU tar) 1.35, python 3.14.8
+
+## A. pin from npm, GitHub and nodejs.org
+pinned Gemini CLI 0.68.0 (latest) on Node.js v24.22.3 (tested [20, 22, 24], 24 ends 2028-04-30, signed by 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356) into /home/adalundhe/.cache/s21-finish/pintest/pin.json
+pinned 0.68.0 channel latest node v24.22.3 tested [20, 22, 24] major 24 ends 2028-04-30 signer 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356
+smoke {'program': 'node/bin/node', 'args': ['/harness/gemini/bundle/gemini.js', '--version'], 'stdout': '0.68.0'}
+build linux/amd64 [('.', None, {'format': 'tar.gz', 'strip': 1, 'unpacked_bytes': 99143752, 'entries': 449}), ('node/bin/node', '0755', {'format': 'tar.gz', 'member': 'node-v24.22.3-linux-x64/bin/node', 'sha256': 'a7ec1b37e6ff9d187e4198c5b6df9a4eb1c74dd31804fb3bac55cc4ceca1ac01', 'size': 126891984}), ('node/LICENSE', '0644', {'format': 'tar.gz', 'member': 'node-v24.22.3-linux-x64/LICENSE', 'sha256': '5888dbb9a1d2b18f2c3e6c5f6af1b39de658372b402a0577b002777f14c62ace', 'size': 157609})]
+build linux/arm64 [('.', None, {'format': 'tar.gz', 'strip': 1, 'unpacked_bytes': 99143752, 'entries': 449}), ('node/bin/node', '0755', {'format': 'tar.gz', 'member': 'node-v24.22.3-linux-arm64/bin/node', 'sha256': '8f9c2a55879e9705cb285b6cdd649d95df642c6720f052cb30f300d2677da99f', 'size': 123446736}), ('node/LICENSE', '0644', {'format': 'tar.gz', 'member': 'node-v24.22.3-linux-arm64/LICENSE', 'sha256': '5888dbb9a1d2b18f2c3e6c5f6af1b39de658372b402a0577b002777f14c62ace', 'size': 157609})]
+
+## A. every pinned file downloaded again, and what GNU tar finds in it, against pin.json
+match: https://registry.npmjs.org/@google/gemini-cli/-/gemini-cli-0.68.0.tgz sha256 325099ddcb56937c27d119e7297bfa8a5e29b529bae3c92fdf3b71a36d5fa006 size 20975501
+tree: gemini-cli-0.68.0.tgz 449 entries, 99143752 bytes in its files, as pinned
+match: https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-x64.tar.gz sha256 061ec3e3062115705b56b51fa9cc330ab50d34b6969387d4e4b1a50c6809acc2 size 58330843
+member: node-v24.22.3-linux-x64/bin/node sha256 a7ec1b37e6ff9d187e4198c5b6df9a4eb1c74dd31804fb3bac55cc4ceca1ac01 size 126891984, as pinned
+member: node-v24.22.3-linux-x64/LICENSE sha256 5888dbb9a1d2b18f2c3e6c5f6af1b39de658372b402a0577b002777f14c62ace size 157609, as pinned
+tree: gemini-cli-0.68.0.tgz 449 entries, 99143752 bytes in its files, as pinned
+match: https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-arm64.tar.gz sha256 261af2af250dfd7e9f25cf151d1b2713a0adf8f10a9ad116c4947f68627affe8 size 58051304
+member: node-v24.22.3-linux-arm64/bin/node sha256 8f9c2a55879e9705cb285b6cdd649d95df642c6720f052cb30f300d2677da99f size 123446736, as pinned
+member: node-v24.22.3-linux-arm64/LICENSE sha256 5888dbb9a1d2b18f2c3e6c5f6af1b39de658372b402a0577b002777f14c62ace size 157609, as pinned
+distinct pinned files whose SHA-256 and size match pin.json: 3 of 3
+pinned members and trees GNU tar finds as pinned: 6 of 6
+
+## B. fixture: the same records and files, served from 127.0.0.1
+fixture: Gemini CLI 0.68.0, Node.js v24.22.3, release-keys 481637f813e912c4aa3622d7964ab426c97b8e8d; other version for signatures: 0.67.0-nightly.20261104.g89e9d25d6
+server: pid 3504872 on 127.0.0.1:35325
+
+## B. the control and one change at a time
+PASS control: exit 0, pin.json written, the same builds, files, smoke and signer as A's
+PASS integrity-flipped: exit 1, no pin.json, said: pin.sh: registry signature 0 by SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U does not verify over @google/gemini-cli@0.68.0:sha512-eq7AWY+YCijNGAVwyiRjN+GuOdXU/djuOZhX18p+HDmNyUqFdqH7C5V6vDJLl1uffhRPhGijePV+YvY8lymrbQ== 
+PASS other-signatures: exit 1, no pin.json, said: pin.sh: registry signature 0 by SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U does not verify over @google/gemini-cli@0.68.0:sha512-eq7AWY+YCijNGKVwyiRjN+GuOdXU/djuOZhX18p+HDmNyUqFdqH7C5V6vDJLl1uffhRPhGijePV+YvY8lymrbQ== 
+PASS tarball-flipped: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/tarball-flipped/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: SHA-512 sha512-Jjo7x6beuu+fpDvZpMZ9AVfjBS+wdQz587tZ8ZvrGmOaDcBcbY4MPoN1xfvZwbb47/A8Oryv0yHbffbPpGXiqQ== is not the signed integrity sha512-eq7AWY+YCijNGKVwyiRjN+GuOdXU/djuOZhX18p+HDmNyUqFdqH7C5V6vDJLl1uffhRPhGijePV+YvY8lymrbQ== 
+PASS shasums-edited: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/shasums-edited/dist/v24.22.3/SHASUMS256.txt.asc is not signed by a key of nodejs/release-keys' active keyring at 481637f813e912c4aa3622d7964ab426c97b8e8d: gpgv: Signature made Wed 11 Nov 2026 08:40:02 AM PST gpgv:                using EDDSA key 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 gpgv: BAD signature from "Antoine du Hamel <antoine.duhamel@platformatic.dev>" 
+PASS empty-keyring: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/empty-keyring/dist/v24.22.3/SHASUMS256.txt.asc is not signed by a key of nodejs/release-keys' active keyring at 481637f813e912c4aa3622d7964ab426c97b8e8d: gpgv: Signature made Wed 11 Nov 2026 08:40:02 AM PST gpgv:                using EDDSA key 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 gpgv: Can't check signature: No public key 
+PASS node-flipped: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/node-flipped/dist/v24.22.3/node-v24.22.3-linux-arm64.tar.gz: SHA-256 e25421454bd633914d9420f5499dbaadf7c795c6e47b2111d7047a5118a81ee6 is not the signed 261af2af250dfd7e9f25cf151d1b2713a0adf8f10a9ad116c4947f68627affe8 
+PASS no-arm64: exit 1, no pin.json, said: pin.sh: Node.js v24.22.3 has no linux-arm64 build for linux/arm64 
+PASS majors-ended: exit 1, no pin.json, said: pin.sh: no Node.js major that Gemini CLI 0.68.0 tests on Linux (16, 18, 20) is still supported on 2026-11-12 
+
+## C. npm's record signed by the fixture's own key, the tarball changed one entry at a time
+PASS resigned-control: exit 0, pin.json written, the same builds, files, smoke and signer as A's
+PASS symlink: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/symlink/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: package/bundle/link.js is a link 
+PASS outside: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/outside/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: other/x.js lies outside package/, the directory the strip drops 
+PASS twice: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/twice/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: package/README.md is there twice 
+PASS folds: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/folds/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: readme.md and README.md are one path where names fold 
+PASS folds-dir: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/folds-dir/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: Bundle and bundle are one path where names fold 
+PASS harness-json: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/harness-json/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: package/harness.json lands where kiln writes the built-in's own files or Node's members 
+PASS settings: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/settings/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: package/System-Settings.json lands where kiln writes the built-in's own files or Node's members 
+PASS node-dir: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/node-dir/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: package/node/bin/node lands where kiln writes the built-in's own files or Node's members 
+PASS sticky: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/sticky/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: package/bundle/s.js has the sticky bit 
+PASS set-id: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/set-id/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: package/bundle/s.js has a set-ID bit 
+PASS contiguous: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/contiguous/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: package/bundle/c.js is neither a regular file nor a directory (tar type b'7') 
+PASS nameless: exit 1, no pin.json, said: pin.sh: http://127.0.0.1:35325/nameless/npm/@google/gemini-cli/-/gemini-cli-0.68.0.tgz: package is a file the strip leaves no name 
+
+cases passing: 22 of 22 (2 controls, 20 changes)
+pin.sh work directories left in /home/adalundhe/.cache: 0
+A's pin.json sha256 66556eea229b55280c5d218a7a8d5f9059e7cfd2944e870a9ad3fb77790cc27d

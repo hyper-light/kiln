@@ -1,0 +1,88 @@
+kiln origin/main efb40ea0f4b28ef1f05f4d7e7f47af28e353e166 (2026-11-11 22:24:41 -0800); step 30 branch p/agentfile-store-v1 at d8b829869
+crates/kiln/src/harness/kinds.rs:55:     Kind { id: "opencode", name: "opencode", program: "opencode", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["opencode"], screen_takes_command: false },
+crates/kiln/src/harness/kinds.rs:101:     /// The process to start for session `session` of `spec` (cwd, environment and arguments).
+crates/kiln/src/harness/kinds.rs:102:     #[cfg_attr(not(unix), allow(unused_variables))]
+crates/kiln/src/harness/kinds.rs:103:     pub fn launch(&self, spec: &Spec, session: &str) -> anyhow::Result<Process> {
+crates/kiln/src/harness/kinds.rs:104:         if self.protocol == Protocol::Terminal {
+crates/kiln/src/harness/kinds.rs:105:             anyhow::bail!("{} has no structured mode; run it in a terminal ({})", self.name, self.program);
+crates/kiln/src/harness/kinds.rs:106:         }
+crates/kiln/src/harness/kinds.rs:107:         let program = match &spec.program {
+crates/kiln/src/harness/kinds.rs:108:             Some(p) => std::path::PathBuf::from(p),
+crates/kiln/src/harness/kinds.rs:109:             None => self.find().ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?,
+crates/kiln/src/harness/kinds.rs:110:         };
+crates/kiln/src/harness/kinds.rs:111:         let mut p = Process::new(program);
+crates/kiln/src/harness/kinds.rs:112:         let cwd = super::session::resolve_cwd(spec.cwd.as_deref());
+crates/kiln/src/harness/kinds.rs:166:                 }
+crates/kiln/src/harness/kinds.rs:167:             }
+crates/kiln/src/harness/kinds.rs:168:             Protocol::Acp(args) => {
+crates/kiln/src/harness/kinds.rs:169:                 p.args(args);
+crates/kiln/src/harness/kinds.rs:170:                 // Cursor's sign-in (its ACP `authenticate`, `agent login`) opens no browser on the
+crates/kiln/src/harness/kinds.rs:171:                 // machine: its link is shown wherever the person is (`crate::accounts`).
+crates/kiln/src/harness/acp.rs:249: /// opencode reports its subagents (child sessions) to a client that asks for them in its
+crates/kiln/src/harness/acp.rs:250: /// capabilities' `_meta`, each by this notification (an ACP extension's, so `_` first).
+crates/kiln/src/harness/acp.rs:251: const OPENCODE_CHILDREN: &str = "opencode/child-session-updates";
+crates/kiln/src/harness/acp.rs:252: const OPENCODE_CHILD_UPDATE: &str = "opencode/session/child_update";
+crates/kiln/src/harness/acp.rs:466:         self.request(
+crates/kiln/src/harness/acp.rs:467:             core,
+crates/kiln/src/harness/acp.rs:468:             kind,
+crates/kiln/src/harness/acp.rs:469:             "initialize",
+crates/kiln/src/harness/acp.rs:470:             json!({
+crates/kiln/src/harness/acp.rs:471:                 "protocolVersion": 1,
+crates/kiln/src/harness/acp.rs:472:                 "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "session": {"configOptions": {"boolean": {}}, "compaction": {}}, "_meta": {OPENCODE_CHILDREN: true}},
+crates/kiln/src/harness/acp.rs:473:                 "clientInfo": {"name": "kiln", "version": env!("CARGO_PKG_VERSION")},
+crates/kiln/src/harness/acp.rs:474:             }),
+crates/kiln/src/harness/acp.rs:475:         );
+crates/kiln/src/harness/acp.rs:476:     }
+crates/kiln/Cargo.toml:36: [dependencies]
+crates/kiln/Cargo.toml:113: tar = "0.4.46"
+crates/kiln/Cargo.toml:133: flate2 = "1.1.10"
+crates/kiln/src/cd/targets/aws_static.rs:134:     } else if bytes.starts_with(&[0x1f, 0x8b]) {
+crates/kiln/src/cd/targets/aws_static.rs:135:         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+crates/kiln/src/cd/targets/aws_static.rs:136:         for entry in tar.entries()? {
+docs/ci.md:4413: - **W13-R11 Runner images** (G-11): image definitions live in repositories
+docs/ci.md:4414:   (`.kiln/images/<name>/Dockerfile` or `.kiln/images/<name>/Agentfile`) or are made in the UI
+crates/kiln/src/runner/runtime.rs:3767:             tar::Archive::new(flate2::read::GzDecoder::new(bytes.as_slice())).unpack(&d)?;
+crates/kiln/src/runner/runtime.rs:3946:         let context = get("context").unwrap_or_else(|| format!(".kiln/images/{name}"));
+AGENTS.md:44: ## Hazards
+AGENTS.md:45: 
+AGENTS.md:46: - **Never restart, swap, upgrade or reinstall a runner** (`kiln install`, `kiln join`, replacing
+AGENTS.md:47:   `~/.local/bin/kiln`, its LaunchAgent or its service). Agents run through runners, likely you
+AGENTS.md:48:   among them, and a restart ends their sessions. Say what the upgrade is; the person does it.
+AGENTS.md:49: - **Production runs on adacachy, beside other work.** Heavy builds and tests go where kiln puts
+AGENTS.md:50:   them, never to a machine by name: ask for what they need (`kiln run --needs`, or MCP `run` with
+AGENTS.md:51:   `needs`). Your change's gate (below) holds each of its runs to what it asked and yields to
+AGENTS.md:52:   production. Anything else heavy: `nice -n 10` and your own `CARGO_TARGET_DIR`.
+AGENTS.md:53: - **Big files go under `~/.cache`, never `/tmp`.** On the Linux machines `/tmp` is a RAM disk
+AGENTS.md:54:   every session shares.
+AGENTS.md:55: - **Stop only what you started,** by the PID you recorded as you started it. Never `pkill -f` or
+AGENTS.md:56:   `pgrep -f`: other sessions run the same commands.
+AGENTS.md:57: - **No tree-wide `cargo fmt`.** kiln's long lines aren't rustfmt's; clippy is the check. For UI
+AGENTS.md:58:   files, run `npx prettier --print-width 200 --write` on the files you changed, and only those.
+AGENTS.md:59: - **Wire formats change append-only:** postcard variants, capability bits, new JSON fields
+AGENTS.md:60:   optional.
+AGENTS.md:61: - **Never print or commit a secret,** kiln's admin token included.
+AGENTS.md:62: - **The person's word** is needed for every merge to main, every push and every deploy, and to
+AGENTS.md:63:   create a repository. Deploys go through KilnCD, in merge trains (`docs/trains`).
+AGENTS.md:64: - **Git:** never a bare `git stash`; rebase and squash only onto a fixed SHA; every push waits on
+AGENTS.md:65:   the exit codes of the tests relevant to its change.
+AGENTS.md:66: 
+AGENTS.md:67: ## Your change's gate
+AGENTS.md:68: 
+AGENTS.md:69: You compose it, not kiln. `ci/gate.sh` runs one step alone (`clippy`, or `test`; both when neither
+AGENTS.md:70: is named), natively where it runs, on the crates you name, held to what its run asked for.
+AGENTS.md:71: 
+crates/kiln/src/agentfiles/builtin.rs:1: //! The Agentfiles kiln ships, one per harness it runs in a Shards microVM (kiln plan
+crates/kiln/src/agentfiles/builtin.rs:2: //! 01a1cd8e862e7169a074db3d5fa33f3d, "Every kiln harness in Shards microVMs"): each embedded in kiln's
+crates/kiln/src/agentfiles/builtin.rs:3: //! one binary, listed read-only beside a person's own, and copied to make one theirs. None yet: each
+crates/kiln/src/agentfiles/builtin.rs:4: //! harness's own step adds its Agentfile here (`include_str!`).
+crates/kiln/src/agentfiles/builtin.rs:8: /// An Agentfile kiln ships.
+crates/kiln/src/agentfiles/builtin.rs:9: pub struct Builtin {
+crates/kiln/src/agentfiles/builtin.rs:10:     /// Its name, an image's (as a person's Agentfile's is: [`super::name_problem`]).
+crates/kiln/src/agentfiles/builtin.rs:11:     pub name: &'static str,
+crates/kiln/src/agentfiles/builtin.rs:12:     /// The harness it runs (`crate::harness::kinds::Kind`'s id: `claude`, `codex` ...).
+crates/kiln/src/agentfiles/builtin.rs:13:     pub harness: &'static str,
+crates/kiln/src/agentfiles/builtin.rs:14:     pub text: &'static str,
+crates/kiln/src/agentfiles/builtin.rs:15: }
+crates/kiln/src/agentfiles/builtin.rs:16: 
+crates/kiln/src/agentfiles/builtin.rs:17: /// Every one, in the order they're listed.
+crates/kiln/src/agentfiles/builtin.rs:18: pub const ALL: &[Builtin] = &[];

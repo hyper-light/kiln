@@ -1,0 +1,4 @@
+M6 run 2026-11-12T07:23:42Z
+SITE opencode.ai/files/bin/2.2.7/opencode-linux-x64.tar.gz sha256=89a6cee227b54bc011179c528a5e63176032462b1a5e21723b616801cddc2ca7
+GITHUB opencode-linux-x64.tar.gz sha256=89a6cee227b54bc011179c528a5e63176032462b1a5e21723b616801cddc2ca7
+UPDATE_API {"channel":"latest","name":"cli","distribution":"npm","version":"2.2.7","metadata":{"package":"@opencode/cli","github":{"sha":"5f76acb12572932297cbce81bd0026e59b16e7ac","run_id":"42778325289","run_attempt":"1","actor":"Hona","ref":"refs/heads/dev"}},"active":true,"minimum":false,"time_created":1794306910466,"time_updated":1794306910466}

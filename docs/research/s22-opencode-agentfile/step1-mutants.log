@@ -1,0 +1,12 @@
+MUTANTS 2026-11-12T08:31:27Z of efb40ea0f (pin.sh sha256 63ba92a5204cd2c5), archives /Users/adalundhe/.cache/kiln-pins/opencode.HaRFJl
+no-sha256sums-compare: pin_test.sh exit 1; 22 passed, 3 failed; KILLED by: FAIL one byte flipped: SHA256SUMS: it passed
+    FAIL a run missing an archive: exit 1 without FAILED download: pin.sh: FAILED attestation: opencode-linux-x64-baseline.tar.gz: no provenance signed by anomalyco/opencode/.github/workflows/release.yml in anomalyco/opencod
+    FAIL one byte flipped: SHA256SUMS: it passed
+    FAIL a run with one byte flipped: exit 1 without FAILED sha256sums: pin.sh: FAILED github-digest: opencode-linux-x64-baseline-musl.tar.gz: GitHub has sha256:c1801a36bf61e03eafac8d7f4521a200e4d3cd76cf43b36621cb78b460b851e
+no-1x-refusal: pin_test.sh exit 1; 24 passed, 1 failed; KILLED by: FAIL refuses OpenCode 1.19.5: exit 1 without FAILED version: curl: (56) The requested URL returned error: 404
+    FAIL refuses OpenCode 1.19.5: exit 1 without FAILED version: curl: (56) The requested URL returned error: 404
+no-one-entry-check: pin_test.sh exit 1; 24 passed, 1 failed; KILLED by: FAIL a second entry: it passed
+    FAIL a second entry: it passed
+no-provenance-commit: pin_test.sh exit 1; 24 passed, 1 failed; KILLED by: FAIL another commit: it passed
+    FAIL another commit: it passed
+exit=0
