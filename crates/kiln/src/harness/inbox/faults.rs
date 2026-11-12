@@ -382,7 +382,7 @@ fn w20_missing_upload_refuses_new_custody_but_an_exact_committed_original_keeps_
         // A pre-migration accepted communication may refer to a now-missing old ephemeral id.
         // Reconciliation answers that immutable receipt before store/owner lookup, without
         // claiming delivery or deleting its original history.
-        let accepted = mail::publish(&hub.store, fresh.clone(), u64::MAX, 1).await?;
+        let accepted = mail::publish(&hub.store, fresh.clone(), u64::MAX).await?;
         let repeated = mail_delivery::publish(&hub, fresh.clone()).await?;
         assert!(repeated.repeat && repeated.revision == accepted.revision);
         let mut changed = fresh;

@@ -3,7 +3,9 @@
 //! broadcast that tells the desktop it changed (`WM_SETTINGCHANGE`), and running a program as an
 //! administrator (`ShellExecuteExW` with the `runas` verb: Windows asks the person at the desktop).
 //! And one every kiln makes: how big a volume is and how much of it this user may still write
-//! (`GetDiskFreeSpaceExW`), what `statvfs` tells elsewhere. And a runner's: keeping its memory
+//! (`GetDiskFreeSpaceExW`), what `statvfs` tells elsewhere; and a file's change time and index
+//! (`GetFileInformationByHandleEx`, `GetFileInformationByHandle`), a stat's ctime and inode
+//! elsewhere. And a runner's: keeping its memory
 //! from its user's other processes (its own DACL, `SetKernelObjectSecurity`). And `kiln setup`'s:
 //! VT escapes on in its console (`SetConsoleMode`).
 //!
@@ -51,6 +53,41 @@ const SDDL_REVISION_1: u32 = 1;
 const PRIVATE_DACL: &str = "D:P(A;;0x1fffff;;;SY)(A;;0x101001;;;OW)";
 /// What `ShellExecuteExW` fails with when the person says no to the elevation prompt.
 pub const ERROR_CANCELLED: i32 = 1223;
+const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+/// `FILE_INFO_BY_HANDLE_CLASS::FileBasicInfo`.
+const FILE_BASIC_INFO_CLASS: u32 = 0;
+
+/// `FILE_BASIC_INFO`: its times are LARGE_INTEGERs.
+#[repr(C)]
+struct FileBasicInfo {
+    creation: i64,
+    access: i64,
+    write: i64,
+    change: i64,
+    attributes: u32,
+}
+
+/// `BY_HANDLE_FILE_INFORMATION`, its three FILETIMEs as six DWORDs.
+#[repr(C)]
+struct ByHandleFileInformation {
+    attributes: u32,
+    times: [u32; 6],
+    volume: u32,
+    size_high: u32,
+    size_low: u32,
+    links: u32,
+    index_high: u32,
+    index_low: u32,
+}
+
+// The layout of the Windows SDK headers, on every Windows (neither holds a pointer).
+const _: () = {
+    use std::mem::offset_of;
+    assert!(size_of::<FileBasicInfo>() == 40);
+    assert!(offset_of!(FileBasicInfo, change) == 24);
+    assert!(size_of::<ByHandleFileInformation>() == 52);
+    assert!(offset_of!(ByHandleFileInformation, index_high) == 44);
+};
 
 /// `TOKEN_ELEVATION`.
 #[repr(C)]
@@ -103,6 +140,8 @@ unsafe extern "system" {
     fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
     fn GetDiskFreeSpaceExW(directory: *const u16, available: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+    fn GetFileInformationByHandleEx(file: *mut c_void, class: u32, info: *mut c_void, size: u32) -> i32;
+    fn GetFileInformationByHandle(file: *mut c_void, info: *mut ByHandleFileInformation) -> i32;
     fn GetStdHandle(which: u32) -> *mut c_void;
     fn GetConsoleMode(console: *mut c_void, mode: *mut u32) -> i32;
     fn SetConsoleMode(console: *mut c_void, mode: u32) -> i32;
@@ -324,6 +363,28 @@ pub fn disk_space(dir: &Path) -> io::Result<(u64, u64)> {
         return Err(io::Error::last_os_error());
     }
     Ok((total, available))
+}
+
+/// A file's change time (NTFS's, in 100 ns since 1601: set by every write and attribute change,
+/// never by `SetFileTime`) and its index on its volume: what a stat's ctime and inode are on Unix.
+pub fn file_change(path: &Path) -> io::Result<(i64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    let file = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).open(path)?;
+    let mut basic = FileBasicInfo { creation: 0, access: 0, write: 0, change: 0, attributes: 0 };
+    let mut info = ByHandleFileInformation { attributes: 0, times: [0; 6], volume: 0, size_high: 0, size_low: 0, links: 0, index_high: 0, index_low: 0 };
+    // SAFETY: an open file's handle, alive while `file` is, and places of the sizes the calls
+    // write (FILE_BASIC_INFO's, as its size says; BY_HANDLE_FILE_INFORMATION's).
+    let (got_basic, got_info) = unsafe {
+        (
+            GetFileInformationByHandleEx(file.as_raw_handle(), FILE_BASIC_INFO_CLASS, std::ptr::from_mut(&mut basic).cast(), size_of::<FileBasicInfo>() as u32),
+            GetFileInformationByHandle(file.as_raw_handle(), &mut info),
+        )
+    };
+    if got_basic == 0 || got_info == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((basic.change, (u64::from(info.index_high) << 32) | u64::from(info.index_low)))
 }
 
 /// This process's DACL from before [`private_memory`] narrowed it (a self-relative security

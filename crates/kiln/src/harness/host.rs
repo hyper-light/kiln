@@ -3111,6 +3111,18 @@ impl Host {
             }
             None => seed,
         };
+        // The epoch its record keeps is the least it goes on at: the conversation store's copy of
+        // its state can be from before a hand-over raised it, and a session the store kept nothing
+        // of has no state at all. Started below it, the server takes it for a copy left behind and
+        // has this machine let it go, and no machine runs it (Hex, 2026-11-11: at 0, the server at 3).
+        let seed = match seed {
+            Some(mut seed) => {
+                seed.state.epoch = seed.state.epoch.max(s.epoch);
+                Some(seed)
+            }
+            None if s.epoch > 0 => Some(session::Seed { events: Vec::new(), state: super::model::State { epoch: s.epoch, cwd: session::resolve_cwd(s.spec.cwd.as_deref()), ..Default::default() }, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: true }),
+            None => None,
+        };
         let cut = s.cut;
         // What it started that still runs, taken back over (its stopped harness not among it).
         let mut alive = apart;
@@ -4513,6 +4525,47 @@ mod tests {
                 _ => false,
             };
             assert!(!said.iter().any(again_said), "{said:?}");
+            Ok(())
+        })
+    }
+
+    /// A restart in place keeps the epoch its record says, whether the conversation store kept an
+    /// older copy of its state or nothing of it (Hex, 2026-11-11: back at 0 while the server had it
+    /// at 3, so the server let it go and no machine ran it).
+    #[test]
+    fn a_restarted_session_goes_on_at_its_records_epoch() -> anyhow::Result<()> {
+        use super::super::core::Update;
+        use super::super::model::{Body, Event, State};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let spec = |id: &str| Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()), name: Some(id.into()), ..Spec::default() };
+            {
+                let (tx, _rx) = async_channel::unbounded();
+                let host = sim(tx, Some(file.clone()), Limits::default());
+                host.open(Some("kept".into()), spec("kept"))?;
+                host.open(Some("bare".into()), spec("bare"))?;
+                host.save_now();
+            }
+            // Its record says epoch 3 (hand-overs raised it); the store's copy of one is from before.
+            let mut saved: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&file)?)?;
+            for s in &mut saved {
+                if let Some(o) = s.as_object_mut() {
+                    o.insert("epoch".into(), serde_json::json!(3));
+                }
+            }
+            std::fs::write(&file, serde_json::to_vec(&saved)?)?;
+            let (_dir, store) = crate::convo::store::scratch()?;
+            store.send("kept", &Update::State { state: Box::new(State { title: "older".into(), ..State::default() }) });
+            store.send("kept", &Update::Events { events: vec![Event { id: "m1".into(), seq: 1, at: 1_001, parent: None, by: None, body: Body::Assistant { text: "first".into(), streaming: false } }] });
+            store.sync()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let again = sim(tx, Some(file.clone()), Limits::default());
+            again.restore_from(Some(&store));
+            for id in ["kept", "bare"] {
+                let s = again.sessions.lock().get(id).cloned().ok_or_else(|| anyhow::anyhow!("{id} not restored"))?;
+                assert_eq!(s.epoch(), 3, "{id}");
+            }
             Ok(())
         })
     }

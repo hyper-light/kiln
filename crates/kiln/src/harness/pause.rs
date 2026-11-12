@@ -515,7 +515,15 @@ pub fn let_through(core: &mut Core, c: Command) -> Option<Command> {
 /// the stop point (which starts a pause), and room on its machine for it to go to work
 /// (`Core::has_room`: at work already, it has).
 pub fn open(core: &mut Core) -> bool {
-    open_for(core, crate::headroom::Class::Agent)
+    let class = core.state.queue.first().map_or(crate::headroom::Class::Agent, |q| class_of(&q.id));
+    open_for(core, class)
+}
+
+/// A message's class at its machine's headroom, by its id: a person's is never held there (they
+/// waited in an idle agent's queue while the machine was loaded, 2026-11-11); another agent's,
+/// kiln's own and a goal's are held for room.
+pub fn class_of(id: &str) -> crate::headroom::Class {
+    if super::queued::persons(id) { crate::headroom::Class::Person } else { crate::headroom::Class::Agent }
 }
 
 pub(super) fn open_for(core: &mut Core, class: crate::headroom::Class) -> bool {
