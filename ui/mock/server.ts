@@ -28,6 +28,7 @@ import { handleGoals } from "./goals.ts";
 import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
 import { handleSkills } from "./skills.ts";
+import { handleAgentfiles } from "./agentfiles.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handleKeep } from "./keep.ts";
@@ -2155,6 +2156,7 @@ const server = http.createServer(async (req, res) => {
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
     if (await handleSettings(req, res, url, { json, err, body })) return;
     if (await handleSkills(req, res, url, { json, err, body })) return;
+    if (await handleAgentfiles(req, res, url, { json, err, body, emit })) return;
     if (
       await handlePages(req, res, url, {
         agents: () => [...agents.values()],

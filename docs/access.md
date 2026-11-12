@@ -35,7 +35,7 @@ on a repository covers its pipelines and environments.
 | Code | `diffs.read`, `diffs.submit`, `diffs.review`, `diffs.land`, `queue.manage` |
 | Pipelines | `pipelines.edit` (always as a reviewed diff), `environments.deploy` |
 | Machines | `machines.read`, `machines.manage`, `machines.terminal`, `binaries.publish` |
-| Agents | `agents.run`, `agents.manage`, `agents.attach`, `agents.stop`, `experiments.run` |
+| Agents | `agents.run`, `agents.manage`, `agents.attach`, `agents.stop`, `experiments.run`, `agentfiles.manage` (everyone's Agentfiles; without it a person reaches only their own: docs/api.md, "Agentfiles") |
 | Secrets | `secrets.use:<name>`, `secrets.manage` |
 | Observe | `observe.read` (queries, searches, live tails, dashboards, monitors, integrations listed without their secrets), `observe.write` (dashboards, monitors, series, logs and events posted), `observe.manage` (integrations and clouds, which hold secrets; the store's compaction and checks) |
 | Server | `settings.manage`, `tokens.manage`, `users.manage`, `audit.read` |

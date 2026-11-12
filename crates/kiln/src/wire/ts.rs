@@ -98,6 +98,12 @@ fn roots(c: &mut Collect<'_>) {
     // Compare (`agents.refs`, `agents.compare`).
     c.visit::<crate::workspace::git::Refs>();
     c.visit::<crate::workspace::git::Compared>();
+    // Agentfiles (`agentfiles.*`): the list, one, its versions, what a change kept, and Shards' check.
+    c.visit::<crate::agentfiles::Listing>();
+    c.visit::<crate::agentfiles::Agentfile>();
+    c.visit::<crate::agentfiles::Version>();
+    c.visit::<crate::agentfiles::Saved>();
+    c.visit::<crate::agentfiles::check::Check>();
 }
 
 /// Every file as it should be, by its name in [`dir`], the index among them.

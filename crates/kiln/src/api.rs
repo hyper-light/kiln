@@ -1322,6 +1322,35 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             }
             boxed(|| own_op(&hub, &caller, "plans.ready", body)).await
         }
+        // Agentfiles (`crate::agentfiles`): each operation is its route, each keeping its caller to their own.
+        (&Method::GET, ["api", "agentfiles"]) => boxed(|| own_op(&hub, &caller, "agentfiles.list", query_value(&q))).await,
+        (&Method::POST, ["api", "agentfiles"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentfiles.create", body)).await
+        }
+        (&Method::POST, ["api", "agentfiles", "check"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentfiles.check", body)).await
+        }
+        (&Method::GET, ["api", "agentfiles", id]) => boxed(|| own_op(&hub, &caller, "agentfiles.get", json!({ "id": id }))).await,
+        (&Method::PATCH, ["api", "agentfiles", id]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "agentfiles.update", body)).await
+        }
+        (&Method::DELETE, ["api", "agentfiles", id]) => boxed(|| own_op(&hub, &caller, "agentfiles.delete", json!({ "id": id }))).await,
+        (&Method::GET, ["api", "agentfiles", id, "versions"]) => boxed(|| own_op(&hub, &caller, "agentfiles.versions", json!({ "id": id }))).await,
+        (&Method::POST, ["api", "agentfiles", id, "restore"]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "agentfiles.restore", body)).await
+        }
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
         }
@@ -5298,6 +5327,10 @@ impl AgentsSeen {
         if m.kind == "attention" {
             return crate::harness::attention::person(&self.caller).is_some_and(|who| m.person.as_deref() == Some(who.as_str()));
         }
+        // An Agentfile's change, to its owner and whoever reaches everyone's (`crate::agentfiles`).
+        if m.kind == "agentfile" {
+            return m.person.as_deref().is_some_and(|owner| crate::agentfiles::hears(&self.caller, owner));
+        }
         if self.all {
             return true;
         }
@@ -5325,8 +5358,9 @@ impl Narrow {
         }
         match m.kind.as_str() {
             "resync" => return true,
-            // AgentsSeen has already checked the attention event's person (attention plan 01a199e1b177752e84dad5dc990e6a15).
-            "attention" => return true,
+            // AgentsSeen has already checked the attention event's person (attention plan 01a199e1b177752e84dad5dc990e6a15),
+            // and an Agentfile's owner.
+            "attention" | "agentfile" => return true,
             "inbox" => return m.person.as_deref() == Some(self.person.as_str()),
             _ => {}
         }
