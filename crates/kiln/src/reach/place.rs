@@ -428,59 +428,132 @@ pub struct Placer {
     hand: handoff::Hand,
 }
 
-/// Where a placed run's processes are counted, and its CPU time as last read with when.
-/// Read through its cgroup, on Linux alone: elsewhere it's kept and never read.
+/// Where a placed run's processes are counted, and its CPU time as last read with when. Read
+/// through its cgroup on Linux, and through the group Shards keeps for it (`Group::Shards`) on
+/// every platform: elsewhere it's kept and never read.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct Held {
     at: Group,
     cpu: Option<(u64, std::time::Instant)>,
 }
 
-/// A placed run's group: a folder (a command's, found by its process; a CI leg's job group), or
-/// an agent session's, found by its id as it reads (its group comes once its harness starts).
+/// A placed run's group: a folder (a command's, found by its process; a CI leg's job group), an
+/// agent session's, found by its id as it reads (its group comes once its harness starts), or a
+/// group Shards keeps (D183, slice 3: on macOS and Windows), its folder `groups/<name>` of
+/// Shards' home, where an isolated session's microVM is made and charged ([`vm_group`], kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 32).
 #[derive(Debug, Clone)]
 pub enum Group {
     Dir(std::path::PathBuf),
     Session(String),
+    Shards(std::path::PathBuf),
 }
 
-/// What a placed run uses now, read from its group (Linux; elsewhere nothing is read, and the run
-/// counts as the machine's load as before): CPUs, its `cpu.stat` time over the time since its last
-/// read, the same interval the machine's own idle share covers (both read in one measure);
-/// memory, its anonymous memory (cgroup v2 `memory.stat` `anon`, what `MemAvailable` doesn't
-/// count free; page cache is reclaimable and counted free there too), or, where its group has no
-/// memory controller, the anonymous resident memory of its processes (`/proc/<pid>/status`
-/// `RssAnon`).
+/// Where an isolated agent session's microVM is charged from (kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 32), as its launch makes it: on Linux the session's own
+/// cgroup, which its launch makes the microVM in (Shards' `--cgroup-parent` naming that cgroup, a
+/// cgroup delegated to the user: D183's slice 2), so its `cpu.stat` and `memory.stat` count the
+/// microVM's VM and network processes; on macOS and Windows, which have no group of processes a
+/// user's own tools make and cap, the group Shards keeps for it in `shards_home` (D183's slice 3),
+/// named [`shards_group`].
+pub fn vm_group(session: &str, shards_home: &std::path::Path) -> Group {
+    if cfg!(target_os = "linux") {
+        Group::Session(session.to_owned())
+    } else {
+        Group::Shards(shards_home.join("groups").join(shards_group(session)))
+    }
+}
+
+/// The group Shards keeps for an isolated agent session's microVM (D183's slice 3), by the name its
+/// launch gives `--cgroup-parent`: `kiln-<session>`, of the letters, digits, `.`, `-` and `_` a
+/// group's name takes alone.
+pub fn shards_group(session: &str) -> String {
+    let id: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')).collect();
+    format!("kiln-{id}")
+}
+
+/// What a group Shards keeps (D183, slice 3) says of its microVMs, as its daemon writes them in the
+/// group's folder every pressure window while it has any: `memory.current`, the bytes its
+/// microVMs hold (their VM processes' footprints, summed), and `cgroup.procs`, its processes, a line
+/// each (on macOS its microVMs' VM processes; on Windows every process of the group's job, its
+/// microVMs' VM and network processes, its warm ones' too).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShardsGroup {
+    pub memory: u64,
+    pub procs: Vec<u32>,
+}
+
+/// [`ShardsGroup`] from its files' text, as Shards writes them; a file not written yet (no microVM
+/// of it has begun) is empty, and says nothing is held. Anything else is refused: a group whose
+/// files say what kiln can't read is charged nothing, and its microVM counts as the machine's load.
+pub fn shards_group_of(memory_current: &str, procs: &str) -> Result<ShardsGroup, String> {
+    let memory = match memory_current.trim() {
+        "" => 0,
+        m => m.parse().map_err(|_| format!("memory.current says {m:?}, no number of bytes"))?,
+    };
+    let procs = procs.lines().map(str::trim).filter(|l| !l.is_empty()).map(|l| l.parse().map_err(|_| format!("cgroup.procs says {l:?}, no process"))).collect::<Result<_, String>>()?;
+    Ok(ShardsGroup { memory, procs })
+}
+
+/// What a placed run uses now, read from its group (on Linux its cgroup; on every platform a group
+/// Shards keeps; elsewhere nothing is read, and the run counts as the machine's load as before):
+/// CPUs, its CPU time over the time since its last read, the same interval the machine's own idle
+/// share covers (both read in one measure); memory as its group says it ([`cgroup_now`],
+/// [`shards_now`]).
 fn group_use(h: &mut Held) -> Resources {
-    #[cfg(target_os = "linux")]
-    {
-        let dir = match &h.at {
-            Group::Dir(d) => d.clone(),
-            Group::Session(id) => match crate::os::contain::Group::existing(id) {
-                Some(g) => g.dir().to_path_buf(),
-                None => return Resources::default(),
-            },
-        };
-        let read = |n: &str| std::fs::read_to_string(dir.join(n)).ok();
-        let now = std::time::Instant::now();
-        let cpu_us = read("cpu.stat").and_then(|t| crate::sense::parse::keyed(&t, "usage_usec"));
-        let milli = match (cpu_us, h.cpu) {
-            (Some(c), Some((c0, t0))) => {
-                let span = u64::try_from(now.duration_since(t0).as_micros()).unwrap_or(u64::MAX);
-                u64::try_from(u128::from(c.saturating_sub(c0)).saturating_mul(1000) / u128::from(span.max(1))).unwrap_or(u64::MAX)
+    let now = std::time::Instant::now();
+    let (cpu_us, mem) = match h.at.clone() {
+        Group::Shards(dir) => match shards_now(&dir) {
+            Some(read) => read,
+            None => {
+                h.cpu = None;
+                return Resources::default();
             }
-            _ => 0,
-        };
-        h.cpu = cpu_us.map(|c| (c, now));
-        let mem = read("memory.stat").and_then(|t| crate::sense::parse::keyed(&t, "anon")).unwrap_or_else(|| procs_in(&dir).into_iter().filter_map(rss_anon).sum());
-        Resources { cpu: Cpus::milli(milli), mem, disk: 0, gpu: 0 }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = h;
-        Resources::default()
-    }
+        },
+        #[cfg(target_os = "linux")]
+        Group::Dir(dir) => cgroup_now(&dir),
+        #[cfg(target_os = "linux")]
+        Group::Session(id) => match crate::os::contain::Group::existing(&id) {
+            Some(g) => cgroup_now(g.dir()),
+            None => return Resources::default(),
+        },
+        #[cfg(not(target_os = "linux"))]
+        Group::Dir(_) | Group::Session(_) => return Resources::default(),
+    };
+    let milli = match (cpu_us, h.cpu) {
+        (Some(c), Some((c0, t0))) => per_mille(c.saturating_sub(c0), u64::try_from(now.duration_since(t0).as_micros()).unwrap_or(u64::MAX)),
+        _ => 0,
+    };
+    h.cpu = cpu_us.map(|c| (c, now));
+    Resources { cpu: Cpus::milli(milli), mem, disk: 0, gpu: 0 }
+}
+
+/// CPUs, in thousandths: `used_us` of CPU time over `span_us` of the time it was used in.
+fn per_mille(used_us: u64, span_us: u64) -> u64 {
+    u64::try_from(u128::from(used_us).saturating_mul(1000) / u128::from(span_us.max(1))).unwrap_or(u64::MAX)
+}
+
+/// A cgroup's CPU time so far, µs (`cpu.stat`'s `usage_usec`), and its memory now: its anonymous
+/// memory (cgroup v2 `memory.stat` `anon`, what `MemAvailable` doesn't count free; page cache is
+/// reclaimable and counted free there too), or, where its group has no memory controller, the
+/// anonymous resident memory of its processes (`/proc/<pid>/status` `RssAnon`).
+#[cfg(target_os = "linux")]
+fn cgroup_now(dir: &std::path::Path) -> (Option<u64>, u64) {
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).ok();
+    let cpu_us = read("cpu.stat").and_then(|t| crate::sense::parse::keyed(&t, "usage_usec"));
+    let mem = read("memory.stat").and_then(|t| crate::sense::parse::keyed(&t, "anon")).unwrap_or_else(|| procs_in(dir).into_iter().filter_map(rss_anon).sum());
+    (cpu_us, mem)
+}
+
+/// A group Shards keeps (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32): the CPU time its
+/// processes have used so far, µs, as the OS counts each, and the memory its daemon last said its
+/// microVMs hold ([`ShardsGroup`]). None when it lists no process that runs (it holds nothing now,
+/// whatever its files said last), or its files aren't as Shards writes them.
+fn shards_now(dir: &std::path::Path) -> Option<(Option<u64>, u64)> {
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap_or_default();
+    let group = shards_group_of(&read("memory.current"), &read("cgroup.procs")).ok()?;
+    let cpu_us = crate::os::metrics::cpu_us_of(&group.procs)?;
+    Some((Some(cpu_us), group.memory))
 }
 
 /// Every process in group `dir` and the groups under it.
@@ -882,7 +955,7 @@ impl Placer {
         sample.pace = self.pace;
         sample.size.gpu = u32::try_from(self.facts.gpus.len()).unwrap_or(u32::MAX);
         // What each placed run here uses, from its own group, in the same moment.
-        sample.runs = self.groups.iter_mut().map(|((owner, epoch, run), h)| kiln_ci::place::ask::RunUse { owner: owner.clone(), epoch: *epoch, run: run.clone(), used: group_use(h) }).collect();
+        sample.runs = self.runs_used();
         self.admission.measured(sample, now, said);
         let target = kiln_ci::sched::state::knee(m.cpus);
         // Over the window the decision is about (sense::window): since the load here last changed.
@@ -925,6 +998,15 @@ impl Placer {
         if let Some((epoch, run)) = self.started.get(&(peer.to_owned(), id)).cloned() {
             self.ran_as(peer, epoch, &run, here);
         }
+    }
+
+    /// What each placed run here uses now, read from its own group (docs/needs.md E5): what the
+    /// admission is measured with beside its machine, so a run's room is held once, by its claim,
+    /// and what it uses past that counts as the machine's load. An isolated session's is its
+    /// microVM's, as its group says it ([`vm_group`]): what it's measured using, never what it
+    /// asked (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+    fn runs_used(&mut self) -> Vec<kiln_ci::place::ask::RunUse> {
+        self.groups.iter_mut().map(|((owner, epoch, run), h)| kiln_ci::place::ask::RunUse { owner: owner.clone(), epoch: *epoch, run: run.clone(), used: group_use(h) }).collect()
     }
 
     /// Placed run `run` of owner `owner` (`epoch`) runs in group `at`: what it uses is read from
@@ -1567,12 +1649,13 @@ impl Placer {
     }
 
     /// An agent session placed here under claim `c` started (AUDIT M4): its room is held from now
-    /// until [`Self::session_ended`], as a run's is. Its owner's word that it may (`Start`) is the
-    /// claim the server gave the session; this runner's word that it started goes to that owner.
-    /// A claim that isn't live here any more starts nothing (`false`).
-    pub fn session_start(&mut self, c: &Claim, session: Option<&str>, now: i64) -> (bool, Vec<Out>) {
-        if let Some(id) = session {
-            self.grouped(&c.owner, c.epoch, &c.run, Group::Session(id.to_owned()));
+    /// until [`Self::session_ended`], as a run's is, what it uses read from group `at` (its own, or
+    /// its microVM's: [`vm_group`]). Its owner's word that it may (`Start`) is the claim the server
+    /// gave the session; this runner's word that it started goes to that owner. A claim that isn't
+    /// live here any more starts nothing (`false`).
+    pub fn session_start(&mut self, c: &Claim, at: Option<Group>, now: i64) -> (bool, Vec<Out>) {
+        if let Some(at) = at {
+            self.grouped(&c.owner, c.epoch, &c.run, at);
         }
         self.load_changed();
         let mut said = Vec::new();
@@ -2044,6 +2127,123 @@ mod tests {
         std::fs::remove_file(dir.path().join("memory.stat"))?;
         anyhow::ensure!(group_use(&mut h).mem == 0);
         Ok(())
+    }
+}
+
+/// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32: an isolated agent session's microVM charged
+/// what it's measured using, from the group Shards keeps for it on macOS and Windows (D183's slice
+/// 3), read as recordings of real runs left its files (`fixtures/shards-groups.json`).
+#[cfg(test)]
+mod step32_tests {
+    use super::*;
+
+    /// No process runs as this (past every system's highest pid, odd as no Windows pid is).
+    const NONE_RUNS: u32 = 4_000_000_001;
+
+    fn recorded() -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::from_str(include_str!("fixtures/shards-groups.json"))?)
+    }
+
+    /// A group's folder of `files` (name, text), as Shards' daemon writes it.
+    fn group(files: &[(&str, &str)]) -> anyhow::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        for (name, text) in files {
+            std::fs::write(dir.path().join(name), text)?;
+        }
+        Ok(dir)
+    }
+
+    /// The groups' files read as real runs on macOS and Windows left them: the bytes their microVMs
+    /// hold and the processes they list. Between two reads, what kiln charges a microVM is what the
+    /// OS counted its processes using: a busy vCPU's 0.9 of a CPU on the Mac, 1.014 on Windows (its
+    /// VM process's, and its warm one's beside it in its job), never what it asked. What kiln can't
+    /// read as Shards writes it is refused, and charges nothing.
+    #[test]
+    fn step32_a_shards_groups_files_are_read_as_real_runs_left_them() -> anyhow::Result<()> {
+        let fixture = recorded()?;
+        let want = [("macos", 139_758_208, vec![33820], 900), ("windows", 214_929_408, vec![136_764, 70392, 72700, 71936], 1014)];
+        for (os, memory, procs, cpus) in want {
+            let reads = fixture.pointer(&format!("/{os}/reads")).and_then(serde_json::Value::as_array).ok_or_else(|| anyhow::anyhow!("{os}'s reads"))?;
+            let mut charged = Vec::new();
+            for r in reads {
+                let file = |n: &str| r.pointer(&format!("/files/{n}")).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+                let g = shards_group_of(&file("memory.current"), &file("cgroup.procs")).map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(g == ShardsGroup { memory, procs: procs.clone() }, "{os}: {g:?}");
+                let cpu_ms: u64 = r.get("processes").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|p| p.get("cpu_ms").and_then(serde_json::Value::as_u64)).sum();
+                charged.push((r.get("at_ms").and_then(serde_json::Value::as_u64).unwrap_or(0), cpu_ms));
+            }
+            let [(t0, c0), (t1, c1)] = charged.as_slice() else { anyhow::bail!("{os}: two reads, not {charged:?}") };
+            let milli = per_mille(c1.saturating_sub(*c0).saturating_mul(1000), t1.saturating_sub(*t0).saturating_mul(1000));
+            anyhow::ensure!(milli == cpus, "{os}: charged {milli} thousandths of a CPU");
+        }
+        anyhow::ensure!(shards_group_of("", "") == Ok(ShardsGroup::default()), "files not written yet: nothing held");
+        for (memory, procs) in [("139758208 bytes\n", "33820\n"), ("max\n", ""), ("139758208\n", "33820\nshards-vm\n")] {
+            anyhow::ensure!(shards_group_of(memory, procs).is_err(), "{memory:?} {procs:?}");
+        }
+        Ok(())
+    }
+
+    /// A microVM's use is what its group says while a process it lists runs: the memory its daemon
+    /// last summed, and the CPU time its processes used since the last read over the time since
+    /// (none at a first read: no interval yet). Listing only processes that don't run, it holds
+    /// nothing now, whatever its file said last; nor does a group whose files aren't written yet.
+    #[test]
+    fn step32_a_microvms_use_is_what_its_shards_group_says_while_its_processes_run() -> anyhow::Result<()> {
+        let me = std::process::id().to_string();
+        let dir = group(&[("memory.current", "139758208\n"), ("cgroup.procs", format!("{NONE_RUNS}\n{me}\n").as_str())])?;
+        let mut h = Held { at: Group::Shards(dir.path().to_path_buf()), cpu: None };
+        let first = group_use(&mut h);
+        anyhow::ensure!(first.cpu.is_zero() && first.mem == 139_758_208, "{first:?}");
+        // This process busy for a while (its CPU time, as its OS counts it, goes up by at least that).
+        let busy = std::time::Instant::now();
+        let mut spun = 0u64;
+        while busy.elapsed() < std::time::Duration::from_millis(300) {
+            spun = std::hint::black_box(spun.wrapping_mul(31).wrapping_add(7));
+        }
+        std::hint::black_box(spun);
+        let second = group_use(&mut h);
+        anyhow::ensure!(!second.cpu.is_zero() && second.mem == 139_758_208, "{second:?}");
+        std::fs::write(dir.path().join("cgroup.procs"), format!("{NONE_RUNS}\n"))?;
+        anyhow::ensure!(group_use(&mut h) == Resources::default(), "none of its processes runs: it holds nothing now");
+        let unwritten = tempfile::tempdir()?;
+        anyhow::ensure!(group_use(&mut Held { at: Group::Shards(unwritten.path().to_path_buf()), cpu: None }) == Resources::default());
+        Ok(())
+    }
+
+    /// The balancer learns a microVM's measured use, not what it asked: a session's claim (here 4
+    /// CPUs and 8 GiB) grouped at its microVM's Shards group, what the admission is measured with
+    /// for it is what the group says it holds (the Mac's recorded 133 MiB), and nothing once it's
+    /// let go.
+    #[test]
+    fn step32_charging_follows_a_microvms_measured_use_not_its_ask() -> anyhow::Result<()> {
+        let mut p = Placer::new("linux", 1, RunnerFacts::default(), Vec::new(), Sample::default(), Settings::default(), 0);
+        let me = std::process::id().to_string();
+        let dir = group(&[("memory.current", "139758208\n"), ("cgroup.procs", format!("{me}\n").as_str())])?;
+        let claim = Claim { owner: "mac".into(), epoch: 3, run: "session-1".into(), fence: Fence::default() };
+        let asked = kiln_ci::sched::needs::parse("cpus=4,mem=8g").map_err(anyhow::Error::msg)?.request;
+        p.grouped(&claim.owner, claim.epoch, &claim.run, Group::Shards(dir.path().to_path_buf()));
+        let used = p.runs_used();
+        let [u] = used.as_slice() else { anyhow::bail!("its run alone: {used:?}") };
+        anyhow::ensure!((u.owner.as_str(), u.epoch, u.run.as_str()) == ("mac", 3, "session-1"), "{u:?}");
+        anyhow::ensure!(u.used.mem == 139_758_208 && u.used.mem != asked.mem && u.used.cpu != asked.cpu, "{u:?}");
+        p.ungrouped(&claim.owner, claim.epoch, &claim.run);
+        anyhow::ensure!(p.runs_used().is_empty());
+        Ok(())
+    }
+
+    /// Where an isolated session's microVM is charged from: on Linux its session's own cgroup,
+    /// elsewhere the group Shards keeps for it, by a name Shards takes.
+    #[test]
+    fn step32_a_microvms_group_is_its_sessions_cgroup_on_linux_and_its_shards_group_elsewhere() {
+        let home = std::path::Path::new("/kiln/shards");
+        let id = "0123456789abcdef0123456789abcdef";
+        let g = vm_group(id, home);
+        if cfg!(target_os = "linux") {
+            assert!(matches!(&g, Group::Session(s) if s == id), "{g:?}");
+        } else {
+            assert!(matches!(&g, Group::Shards(d) if *d == home.join("groups").join(format!("kiln-{id}"))), "{g:?}");
+        }
+        assert_eq!(shards_group("a/../b c"), "kiln-a..bc");
     }
 }
 

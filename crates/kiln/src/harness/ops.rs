@@ -1064,7 +1064,10 @@ pub mod input {
         /// has Slates.
         pub workspace: Option<AgentsStartWorkspace>,
         /// How it's held: `none`, a process on its machine (the default), or `microvm`, a microVM of
-        /// its own, on a machine that starts them. An isolated agent's agents are isolated too.
+        /// its own, on a machine that starts them. An isolated agent's agents are isolated too. An
+        /// isolated agent's `on` sizes its microVM (`cpus=2,mem=4g`: its vCPUs and memory, else its
+        /// parent's), which kiln's balancer asks and holds for it from its start to its end; its
+        /// commands are refused, never run on a bare host.
         pub isolation: Option<AgentsStartIsolation>,
     }
 

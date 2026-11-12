@@ -116,6 +116,20 @@ pub fn process_self() -> ProcStats {
     ProcStats { rss_bytes: n(21) * page_size(), cpu_seconds, open_fds, threads: n(17) }
 }
 
+/// The CPU time, µs, those of `pids` that run have used so far, all told (`/proc/<pid>/stat`'s
+/// `utime` and `stime`): none when none of them runs. What a group Shards keeps lists of its
+/// microVMs' processes is charged so (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+pub fn cpu_us_of(pids: &[u32]) -> Option<u64> {
+    let tck = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK).ok().flatten().and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0).unwrap_or(100);
+    let mut ticks: Option<u64> = None;
+    for pid in pids {
+        let Some(f) = stat_fields(&pid.to_string()) else { continue };
+        let n = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        ticks = Some(ticks.unwrap_or(0).saturating_add(n(11)).saturating_add(n(12)));
+    }
+    ticks.map(|t| u64::try_from(u128::from(t).saturating_mul(1_000_000) / u128::from(tck)).unwrap_or(u64::MAX))
+}
+
 /// Aggregate CPU time and RSS of every process in a process group: the footprint of one job.
 pub fn process_group(pgid: i32) -> ProcStats {
     let mut acc = ProcStats::default();

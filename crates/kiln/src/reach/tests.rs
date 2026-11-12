@@ -34,6 +34,9 @@ enum Ctl {
     Features(&'static str, Vec<String>),
     /// Change what the directory says a runner has in all, and free, of memory.
     Mem(&'static str, u64),
+    /// Change whether the directory says a runner starts microVMs (`virt.microvm`, kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+    Microvm(&'static str, bool),
 }
 
 struct Lab {
@@ -175,6 +178,13 @@ async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], 
                         Ok(Ctl::Mem(name, total)) => {
                             if let Some(r) = directory.lock().iter_mut().find(|r| r.name == name) {
                                 (r.mem_total, r.mem_used) = (total, 0);
+                            }
+                        }
+                        Ok(Ctl::Microvm(name, microvm)) => {
+                            if let Some(r) = directory.lock().iter_mut().find(|r| r.name == name) {
+                                let mut facts = r.facts.take().map_or_else(|| kiln_ci::facts::RunnerFacts { os: r.os.clone(), arch: r.arch.clone(), ..kiln_ci::facts::RunnerFacts::default() }, |f| *f);
+                                facts.virt.microvm = microvm;
+                                r.facts = Some(Box::new(facts));
                             }
                         }
                         Err(_) => return,

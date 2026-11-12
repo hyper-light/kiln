@@ -298,7 +298,7 @@ pub enum Local {
     /// CI leg `run` ended here.
     LegEnded { run: String, ok: bool },
     /// An agent session placed here under `claim` started (`true` answered: its claim was live).
-    SessionStarted { claim: super::place::Claim, session: Option<String>, reply: oneshot::Sender<bool> },
+    SessionStarted { claim: super::place::Claim, at: Option<super::place::Group>, reply: oneshot::Sender<bool> },
     /// An agent session placed here under `claim` ended.
     SessionEnded { claim: super::place::Claim },
     /// What this runner's admission holds, for a view (JSON).
@@ -397,9 +397,10 @@ impl Handle {
     }
 
     /// An agent session placed here under `claim` started: whether its claim was live (its room
-    /// held from now, AUDIT M4).
-    pub async fn session_started(&self, claim: super::place::Claim, session: Option<String>) -> anyhow::Result<bool> {
-        self.ask(|reply| Local::SessionStarted { claim, session, reply }).await
+    /// held from now, AUDIT M4), what it uses read from group `at` (its own, or its microVM's:
+    /// `super::place::vm_group`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+    pub async fn session_started(&self, claim: super::place::Claim, at: Option<super::place::Group>) -> anyhow::Result<bool> {
+        self.ask(|reply| Local::SessionStarted { claim, at, reply }).await
     }
 
     /// An agent session placed here under `claim` ended: its room is free.
@@ -2912,8 +2913,8 @@ impl Node {
                 let outs = self.place.leg_ended(&run, ok, crate::util::now_ms());
                 self.place_do(outs).await;
             }
-            Local::SessionStarted { claim, session, reply } => {
-                let (ok, outs) = self.place.session_start(&claim, session.as_deref(), crate::util::now_ms());
+            Local::SessionStarted { claim, at, reply } => {
+                let (ok, outs) = self.place.session_start(&claim, at, crate::util::now_ms());
                 let _ = reply.send(ok);
                 self.place_do(outs).await;
             }
