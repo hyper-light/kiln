@@ -739,10 +739,12 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
         Some((u64::from(s.blocks()).saturating_mul(frag), u64::from(s.blocks_available()).saturating_mul(frag)))
     }
     // Asked of the volume itself: `sysinfo`'s mount points (`C:\`) don't prefix the `\\?\` path
-    // `canonicalize` gives.
+    // `canonicalize` gives. GetDiskFreeSpaceExW takes "a directory on the disk" (Microsoft's
+    // reference) and refuses a file, which statvfs answers of: a file is asked of its folder.
     #[cfg(windows)]
     {
-        win32::disk_space(path).ok()
+        let dir = if path.is_file() { path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")) } else { path };
+        win32::disk_space(dir).ok()
     }
 }
 
