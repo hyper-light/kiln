@@ -539,7 +539,8 @@ impl place::Keeper for Local {
     }
 }
 
-/// Refresh native inventories where supported; the portable bridge reads current skills per turn.
+/// Refresh native inventories where supported, and the portable bridge's catalogue, which it keeps
+/// until told so (`Core::skills_changed`).
 pub fn reload(host: &crate::harness::host::Host, session: &str) {
     use crate::harness::model::Command;
     if let Some(s) = host.get(session) {

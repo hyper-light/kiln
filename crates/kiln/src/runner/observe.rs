@@ -51,7 +51,7 @@ mod linux {
     /// The calls traced: each one's number, name, the argument holding its path, and the one
     /// holding the folder that path is relative to (an `*at` call's).
     fn calls() -> Vec<(i64, &'static str, usize, Option<usize>)> {
-        let mut out = vec![
+        [
             (libc::SYS_openat, "openat", 1, Some(0)),
             (libc::SYS_openat2, "openat2", 1, Some(0)),
             (libc::SYS_newfstatat, "newfstatat", 1, Some(0)),
@@ -64,17 +64,24 @@ mod linux {
             (libc::SYS_chdir, "chdir", 0, None),
             (libc::SYS_getdents64, "getdents64", 0, None),
             (libc::SYS_connect, "connect", 0, None),
-        ];
-        #[cfg(target_arch = "x86_64")]
-        out.extend([
-            (libc::SYS_open, "open", 0, None),
-            (libc::SYS_stat, "stat", 0, None),
-            (libc::SYS_lstat, "lstat", 0, None),
-            (libc::SYS_access, "access", 0, None),
-            (libc::SYS_readlink, "readlink", 0, None),
-        ]);
-        out
+        ]
+        .into_iter()
+        .chain(BEFORE_AT)
+        .collect()
     }
+
+    /// The calls their `*at` forms replaced, which x86-64 keeps and arm64 never had: Linux's
+    /// generic table, which arm64 takes, starts at the `*at` calls.
+    #[cfg(target_arch = "x86_64")]
+    const BEFORE_AT: [(i64, &str, usize, Option<usize>); 5] = [
+        (libc::SYS_open, "open", 0, None),
+        (libc::SYS_stat, "stat", 0, None),
+        (libc::SYS_lstat, "lstat", 0, None),
+        (libc::SYS_access, "access", 0, None),
+        (libc::SYS_readlink, "readlink", 0, None),
+    ];
+    #[cfg(target_arch = "aarch64")]
+    const BEFORE_AT: [(i64, &str, usize, Option<usize>); 0] = [];
 
     fn stmt(code: u16, k: u32) -> libc::sock_filter {
         libc::sock_filter { code, jt: 0, jf: 0, k }

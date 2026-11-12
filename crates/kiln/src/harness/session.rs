@@ -5385,6 +5385,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     fn legacy_promotion_does_not_advance_past_uncommitted_input_effects() -> anyhow::Result<()> {
         use super::super::{admission::{command_bytes, Input, Lease, PhysicalBudget, Stage}, host::{Host, Limits as HostLimits}, inbox::{Inbox, Limits as InboxLimits}};
@@ -5658,6 +5659,9 @@ mod tests {
             anyhow::ensure!(line.get("id") == Some(&serde_json::json!(9)));
             anyhow::ensure!(line.to_string().contains("Check the invariants."), "the actual driver omitted the selected instructions");
             std::fs::remove_dir_all(folder.path().join("tools"))?;
+            // Removed as kiln removes a skill: its sessions told (skills::reload's SkillsReload), as
+            // the bridge keeps the catalogue it read until then.
+            s.core.lock().skills_changed();
             s.core.lock().write(&prompt);
             flush(&s, &sink, Some(&stdin)).await;
             let line: serde_json::Value = serde_json::from_slice(&delivered.recv().await?)?;
@@ -6836,7 +6840,9 @@ for line in sys.stdin:
     #[test]
     fn task_output_files_and_their_tails() -> anyhow::Result<()> {
         let env = vec![("CLAUDE_CODE_TMPDIR".to_owned(), "/tmp/cc".to_owned())];
-        assert_eq!(claude_task_file(&env, "/home/u/my app", Some("s1"), "b7").as_deref(), Some("/tmp/cc/-home-u-my-app/s1/tasks/b7.output"));
+        // A path of this machine's, its separators this platform's.
+        let file = std::path::Path::new("/tmp/cc").join("-home-u-my-app").join("s1").join("tasks").join("b7.output");
+        assert_eq!(claude_task_file(&env, "/home/u/my app", Some("s1"), "b7").as_deref(), file.to_str());
         assert!(claude_task_file(&env, "/w", Some("s1"), "../x").is_none());
         assert!(claude_task_file(&env, "/w", None, "b7").is_none());
         let dir = std::env::temp_dir().join(format!("kiln-tail-{}", crate::util::new_id())).join("tasks");

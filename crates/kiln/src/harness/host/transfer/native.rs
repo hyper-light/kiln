@@ -78,12 +78,14 @@ impl Host {
         Ok(fence)
     }
 
+    #[cfg(unix)]
     pub(in crate::harness::host) fn legacy_fence_epochs(&self, session: &str) -> Result<Option<(u64, u64)>, String> {
         let path = self.legacy_fence_path(session);
         if !path.try_exists().map_err(|_| "legacy promotion fence cannot be inspected".to_owned())? { return Ok(None); }
         self.read_legacy_fence(&path).map(|fence| Some((fence.from, fence.to)))
     }
 
+    #[cfg(unix)]
     pub(in crate::harness::host) fn persist_legacy_fence(&self, session: &str, from: u64, to: u64) -> Result<(), String> {
         if from.checked_add(1) != Some(to) { return Err("legacy promotion requires the next epoch".into()); }
         let path = self.legacy_fence_path(session);

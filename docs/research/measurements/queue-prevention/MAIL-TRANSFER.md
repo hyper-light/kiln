@@ -133,3 +133,9 @@ token consumes after source disconnect and verified move; ProviderFlight remains
 partial import/retry/accounted debt before actor writes; old receiver refusal; allocation/peak
 memory of every serialization path; source/destination disk failure and cleanup; supported
 platforms. Parser or simulated pure rows will not establish these live properties.
+
+## Windows (2026-11-12)
+
+The journal's transfer, legacy promotion and their custody are Unix's alone (their callers
+`#[cfg(unix)]`; the journal goes on an `SCM_RIGHTS` descriptor): a Windows runner builds none of
+them, and they are owed there. docs/agents.md, "Not on Windows yet", lists each item.

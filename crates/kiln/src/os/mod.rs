@@ -988,6 +988,18 @@ mod tests {
         Ok(())
     }
 
+    /// The volume holding a file is its folder's, on every platform: a transfer's spool asks of
+    /// its file, which Windows' GetDiskFreeSpaceExW refuses.
+    #[test]
+    fn disk_space_answers_of_a_file_as_of_its_folder() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("spool");
+        std::fs::write(&file, b"x")?;
+        let (total, _) = disk_space(&file).ok_or_else(|| anyhow::anyhow!("no answer of a file"))?;
+        assert_eq!(Some(total), disk_space(dir.path()).map(|(total, _)| total));
+        Ok(())
+    }
+
     /// Goal 8 (plan 01a1a59c2b29 step 6): `[server] cores` reads as Linux writes a CPU list, and
     /// says what's wrong with one that isn't.
     #[test]
