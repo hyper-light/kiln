@@ -2545,7 +2545,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // upgrades read again as it changes, a new kiln on disk taken up as it lands. They were read
     // every 10 s and every 5 s.
     let config_watch = o.config.as_deref().and_then(watch_file);
-    let exe_watch = if !o.ephemeral && standalone && crate::os::IN_PLACE_UPGRADE { exe.as_deref().and_then(watch_file) } else { None };
+    let exe_watch = if !o.ephemeral && standalone && (crate::os::IN_PLACE_UPGRADE || crate::os::UPGRADE_BY_SUCCESSOR) { exe.as_deref().and_then(watch_file) } else { None };
     // An older server (no `CAP_LEASES`) renews a leg's grant only from a heartbeat naming it, on a
     // lease it doesn't say: to it alone, while legs run, a heartbeat goes at that server's own
     // cadence (`OLD_BEAT`), and as what it says changes.
@@ -3501,7 +3501,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             },
             Ev::Watchdog => {
                 legs_gone_seen = crate::runner::kept::gones();
-                if !o.ephemeral && standalone && crate::os::IN_PLACE_UPGRADE && started.elapsed() >= WATCHDOG_SETTLE {
+                if !o.ephemeral && standalone && (crate::os::IN_PLACE_UPGRADE || crate::os::UPGRADE_BY_SUCCESSOR) && started.elapsed() >= WATCHDOG_SETTLE {
                     let now = exe.as_deref().and_then(binary_mtime);
                     if !upgrade_pending && now.is_some() && now != exe_mtime {
                         upgrade_pending = true;
@@ -3527,27 +3527,61 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         } else if !successor {
                             native_handover.prepare(&mut harness_operations, harness.clone(), NativePreparation::InPlace { exe: exe.to_path_buf(), mtime: now });
                         } else if channel {
+                            // Hand the agent sessions over too, where the supervisor carries them
+                            // (append-only: a supervisor that takes terminals alone is never sent a
+                            // session mark). Each session's harness keeps running across the upgrade,
+                            // as it does in place on Linux; one that can't be handed over, and every
+                            // session when the supervisor doesn't carry them, stops and resumes from
+                            // its record, as before. Terminals on Windows (ConPTY) are not handed
+                            // over yet (`write_handover` keeps them where it runs); that is separate.
+                            let sessions = if crate::os::supervise::supervisor_takes_sessions() {
+                                match &harness {
+                                    Some(h) => match h.hand_over_all_for_successor().await {
+                                        Ok(list) => Some(list),
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "could not hand the agent sessions over; they resume from their records");
+                                            None
+                                        }
+                                    },
+                                    None => Some(Vec::new()),
+                                }
+                            } else {
+                                None
+                            };
                             match write_handover(&o, &terms) {
                                 Ok(masters) => {
-                                    if let Some(h) = &harness {
+                                    // Sessions not carried over stop only now, once the terminals'
+                                    // handover is written: a handover that fails before this keeps them.
+                                    if sessions.is_none() && let Some(h) = &harness {
                                         h.stop_all();
                                     }
-                                    match crate::os::supervise::to_supervisor(&masters) {
+                                    match crate::os::supervise::to_supervisor(&masters, sessions.as_deref().unwrap_or(&[])) {
                                         Ok(()) => {
-                                            tracing::info!(terminals = masters.len(), "handed over to the supervisor, which starts the new binary as a fresh process");
+                                            tracing::info!(terminals = masters.len(), sessions = sessions.as_ref().map_or(0, Vec::len), "handed over to the supervisor, which starts the new binary as a fresh process");
                                             HANDED_OVER.store(true, std::sync::atomic::Ordering::SeqCst);
-                                            // The supervisor holds the terminals now: ending
-                                            // their sessions here would hang their shells up.
+                                            // The supervisor holds the terminals and sessions now:
+                                            // ending them here would hang their shells up or stop
+                                            // their harnesses.
                                             std::mem::forget(std::mem::take(&mut terms));
                                             return Ok(());
                                         }
                                         Err(e) => {
                                             let _ = std::fs::remove_file(handover_path(&o));
+                                            // The sessions were detached but not taken over: go on
+                                            // with them and their processes, still running.
+                                            if sessions.is_some() && let Some(h) = &harness {
+                                                h.take_back();
+                                            }
                                             tracing::error!(error = %e, "could not hand over to the supervisor; continuing on the running binary");
                                         }
                                     }
                                 }
-                                Err(e) => tracing::error!(error = %format!("{e:#}"), "could not write the terminal handover; continuing on the running binary"),
+                                Err(e) => {
+                                    if sessions.is_some() && let Some(h) = &harness {
+                                        h.take_back();
+                                    }
+                                    tracing::error!(error = %format!("{e:#}"), "could not write the terminal handover; continuing on the running binary");
+                                }
                             }
                             upgrade_pending = false;
                             exe_mtime = now;

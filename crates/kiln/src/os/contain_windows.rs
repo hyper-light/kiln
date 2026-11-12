@@ -339,6 +339,13 @@ impl Group {
         pids_in(&self.job)
     }
 
+    /// The job's handle, for a harness handover to duplicate across a successor upgrade
+    /// (`crate::os::proc::Duplex::detach`): the carried copy keeps the job (kill-on-close) alive
+    /// while no runner process holds it.
+    pub(crate) fn job_handle(&self) -> Handle {
+        self.job.0
+    }
+
     /// Whether `pid` is in it.
     fn holds(&self, process: &Owned) -> bool {
         let mut inside = 0i32;

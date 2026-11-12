@@ -301,7 +301,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
             match ChildControl::spawn(&mut cmd) {
                 Ok((child, control)) => {
                     if let Some(h) = &mut handover {
-                        h.started();
+                        h.started(control.pid().and_then(|p| u32::try_from(p).ok()).unwrap_or(0));
                     }
                     // The child holds them now: close this process's copies.
                     if let Some(t) = handed.take()
@@ -819,15 +819,10 @@ mod tests {
     fn how_children_take_up_a_new_binary() {
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(takes_upgrade(&args(&["server"])), Takes::Restart);
-        // A runner keeps its terminals: in place on Linux, as a fresh process on macOS (where a
-        // process that re-executed itself loses the local network), restarted on Windows.
-        let runner = if cfg!(target_os = "macos") {
-            Takes::Successor
-        } else if cfg!(unix) {
-            Takes::InPlace
-        } else {
-            Takes::Restart
-        };
+        // A runner takes up a new binary in place on Linux, and as a fresh process its supervisor
+        // starts on macOS (where a process that re-executed itself loses the local network) and on
+        // Windows (which has no exec), its agent sessions handed to the supervisor first (A1).
+        let runner = if cfg!(any(target_os = "macos", windows)) { Takes::Successor } else { Takes::InPlace };
         assert_eq!(takes_upgrade(&args(&["--config=/c.toml", "agent", "--name", "x"])), runner);
     }
 }
