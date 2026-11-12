@@ -1,6 +1,6 @@
 # Agent sessions
 
-kiln runs coding agents (Claude Code, Codex, ACP agents, the Antigravity CLI) as structured sessions and is their
+kiln runs coding agents (Claude Code, Codex, ACP agents, the Antigravity CLI, Pi) as structured sessions and is their
 front end: it starts the harness in its structured mode, turns everything the harness says into
 one normalized model (timeline events, state, meta) and turns the console's commands into the
 harness's own protocol. A session runs on any machine (the server, or a runner) and outlives the
@@ -10,8 +10,9 @@ browsers watching it.
 |---|---|---|
 | Claude Code | `claude -p` stream-json + control protocol | `harness/claude.rs` |
 | Codex | `codex app-server` (JSON-RPC v2) | `harness/codex.rs` |
-| Devin, Gemini CLI, opencode, Goose, Amp | Agent Client Protocol | `harness/acp.rs` |
+| Devin, Gemini CLI, opencode, Goose, Amp, Cursor CLI | Agent Client Protocol | `harness/acp.rs` |
 | Antigravity CLI | `agy` headless stream-json, one turn per message on stdin (agy 1.4 or newer) | `harness/antigravity.rs` |
+| Pi | `pi --mode rpc`: JSON commands on stdin, responses and its session's events on stdout | `harness/pi.rs` |
 
 Devin runs as `devin acp`, with its modes, models and effort announced by the harness. Its modes
 include Code (`accept-edits`, its own default), Ask, Plan, Smart and Bypass; a child starts in Ask or Plan
@@ -63,6 +64,19 @@ is under way (`state.compacting`) until it says how it ended (`completed`, `fail
 compactions out of ACP, so a `/compact` sent to an agent whose catalog has one is a compaction for
 its turn, its answer saying how it went.
 
+Cursor's CLI runs as `agent acp`, its ACP server (cursor.com/docs/cli/acp), its program `agent`
+(its installer puts that and the older name, `cursor-agent`, in `~/.local/bin`). Its modes are its
+own: Agent (its default: every tool, asking first for what its approval settings don't let go ahead,
+which kiln places with Accept edits), Plan and Ask (neither changes anything), with kiln's Bypass
+beside them; a child starts in Plan or Ask when its parent's permissions require it. Its questions (`cursor/ask_question`) and its plans to
+approve (`cursor/create_plan`), requests it waits on, are yours to answer, whatever the mode: a
+question's answer goes back as the ids of the options chosen, and a plan you reject carries your
+words. Its to-dos (`cursor/update_todos`) are the session's. kiln never asks it to sign in by itself
+(its `authenticate` would open a browser on the machine, and kiln starts it with `NO_OPEN_BROWSER`):
+a session that couldn't open for want of a sign-in says so, and opens once you sign it in with
+`/login`. Its own terminal interface is `agent`. Written from its docs and its CLI's own source
+(2026.11.11); not yet run end to end.
+
 The Antigravity CLI runs as `agy --input-format stream-json --output-format stream-json`: kiln
 writes `{"event":"user","message":{"content":…}}` for each turn and reads `init` (its conversation,
 which a restart resumes with `--conversation`), `step_update`s (the reply as it streams, each tool
@@ -75,6 +89,23 @@ stopped mid-turn either: a stop ends its process, which keeps the turn so far, a
 again on the same conversation. A new model, effort or mode is a flag, so it starts again with it
 between turns. Files you attach go to it as their paths on its machine; its models come from
 `agy models`.
+
+Pi runs as `pi --mode rpc` (pi.dev/docs/latest/rpc): kiln writes one command a line (`prompt`, `steer`,
+`abort`, `set_model`, `set_thinking_level`, `compact`, ...), each under an id its `response` names,
+and reads its session's events (`message_update` as the reply streams, `tool_execution_*` for each
+tool call, `agent_settled` once it won't go on by itself). A message's own id is its prompt's. It
+asks before no tool call (its docs: "it does not ask for approval before every tool call"), so its
+modes are the tools it starts with: Read only (`read`, `grep`, `find`, `ls`), Edit files (those,
+`edit` and `write`: a new agent's) and Full access (every tool it has, commands included, each run
+unasked: a choice that skips every check), the narrower two without MCP tools; a new mode starts it
+again on the same session (`--session-id`, which a restart resumes too). Its model and thinking
+level change over RPC, its models (`provider/model`) and each one's levels from Pi itself. A message
+for a turn under way goes in as its steering, after the turn's tool calls and before its next model
+call; a stop takes back what it hadn't taken yet (`clear_queue`), then aborts the turn. An
+extension's dialogs (select, confirm, input, editor) are yours to answer; its notices are the
+timeline's. Pictures go to it inline, other files as their paths on its machine. Its own terminal
+interface is `pi`. Written from its docs and its RPC mode's source (Pi 1.5.2); not yet run end to
+end.
 
 Its subagents (`invoke_subagent`, each a conversation of agy's own) are tasks of the session: the
 stream names each one its agent starts (a `subagent` step's `subagent_info`: its conversation, role,
@@ -578,6 +609,19 @@ and shows what a sign-in asks for:
   the link in kiln works from another device. After sign-in, existing ACP sessions reload their
   conversation before queued messages continue, refreshing credentials and model choices while
   retaining their permission mode.
+- Cursor CLI (`agent login`, with `NO_OPEN_BROWSER` so it opens no browser on the machine): a page
+  to open on any device; it finishes by itself once you've signed in there. Its account card reads
+  `agent status --format json`; signing out runs `agent logout`. After sign-in, its sessions take it
+  through ACP's `authenticate` (`cursor_login`, the sign-in its CLI has on the machine) and reload
+  their conversation, or open the one they couldn't for want of it.
+- Pi signs in to each model provider on its own (`pi auth login <provider>`). kiln offers the
+  subscriptions it signs in to with no browser on the machine (`--no-browser`): Claude Pro or Max
+  (a page to open on any device, then the code Anthropic shows, pasted back) and ChatGPT Plus or Pro
+  (a page and a one-time code to enter there; it finishes by itself). Its account card reads
+  `pi --offline --list-models`: signed in when some provider has credentials, those providers its
+  method. Signing out runs `pi auth logout` for each of the two. Its other providers sign in in its
+  own screen (`/screen`, then its `/login`), or by their API keys in its environment. A session
+  starts again on its conversation once idle, to take the sign-in.
 
 Not on Windows machines yet. What is typed in goes to the CLI only: never logged, kept once the
 sign-in ends, or shown in its output.
@@ -1999,6 +2043,13 @@ mock-up, a small tool) as a page: see docs/previews.md.
   machine). Removing an http server signs it out first. Effort and model are set per turn.
 - **ACP agents** report no MCP servers, skills or plan limits; their slash commands run with
   `skill_run`.
+- **Cursor CLI** offers subagents as sessions of their own only to a client that takes ACP's
+  `subagents` capability, which kiln doesn't yet: its `cursor/task` notices aren't read, so its
+  subagents aren't tasks of the session.
+- **Pi** runs no command from kiln's catalog but its own (`get_commands`: its extensions' commands,
+  prompt templates and skills, each sent as `/name`) and kiln's (`/compact` is Pi's `compact`, run
+  once a turn under way ends). Its built-in terminal commands (`/settings`, `/login`, `/model` ...)
+  are its own screen's.
 - kiln never lets a harness CLI it runs open a browser on the machine; sign-in pages are shown in
   the console, wherever the person is.
 
@@ -2022,58 +2073,60 @@ Checked end to end against the real CLIs with scripted model APIs and isolated c
 homes, on the server and through a runner: Claude Code 2.1.296 and Codex 0.162.1; ACP through
 Zed's Claude agent adapter (claude-agent-acp). Devin has separate installed-CLI smoke tests for
 settings, steering, interruption, queueing, resumption, native history and terminal ownership.
+Cursor's CLI and Pi were written from their docs and their own source (Cursor CLI 2026.11.11, Pi
+1.5.2) and are covered by their adapters' tests; neither has been run end to end yet.
 
 ✓ verified end to end · unit: covered by the adapter's tests (fed the harness's real message
 shapes), not end to end · — the protocol has no way · ? not run against a real install.
 
-| | Claude Code | Codex | ACP (claude-agent-acp) | Gemini / opencode / Goose / Amp |
-|---|---|---|---|---|
-| start | ✓ | ✓ | ✓ | ? |
-| resume, with the history | ✓ | ✓ (latest 100 turns, paged) | unit (when the agent loads sessions) | ? |
-| survives server and runner restarts | ✓ | ? | ? | ? |
-| a runner upgrade keeps its process (mid-turn, background commands) | ✓ | unit | unit | ? |
-| send, queue | ✓ | ✓ | ✓ | ? |
-| steer into a running turn | ✓ | ✓ | — (waits for the turn) | — |
-| a queued message steered in (`queue_steer`) | ✓ | ✓ | — | — |
-| send now | ✓ | ✓ | unit | ? |
-| interrupt | ✓ | ✓ | ✓ | ? |
-| approvals, always-allow, deny with feedback | ✓ | ✓ | ✓ (allow) | ? |
-| questions: previews, free text, notes, labels with commas | ✓ | unit (Codex asks only in its Plan mode, which kiln does not run) | — | — |
-| plans to approve | unit | — | — | — |
-| permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (interrupts and continues an active turn) | ✓ (the agent's modes) | ? |
-| `set_model` mid-session | ✓ | ✓ (from the next turn) | ? (sent as session/set_model) | ? |
-| effort from the start (`meta.efforts`), `set_effort` | ✓ | ✓ (from the next turn) | — | — |
-| speed where the model goes faster (`meta.speeds`), `set_speed` | unit (fast mode, a setting of the session's alone; what keeps it off and its cooldown from each turn) | unit (each model's service tiers, with every turn) | unit (an agent's `speed` option, as Devin offers it) | ? |
-| one message's own model and effort | unit | ✓ | — | — |
-| attachments: images inline, files by path | ✓ | ✓ | ? (images when offered) | ? |
-| diffs, approval previews, cumulative changeset | ✓ | ✓ | ✓ | ? |
-| calls waiting behind a prompt read as pending | ✓ | — (Codex reports each call's own state) | — | — |
-| subagents: tasks, nested messages, stop | ✓ | unit (read-only task and thread tracking; no direct stop) | — | — |
-| a person's message to a subagent: queue, steer, now | unit (by way of its agent's SendMessage; no now) | unit (v1 on its own thread; v2 by way of its agent) | — | — |
-| rewind, branch, compact, rename | ✓ | ✓ | — | — |
-| a compaction shown as it goes on, then marked where it ran (`compacting`) | unit | unit | unit (`compaction_update`; Devin: its own `/compact`) | — (their ACP says nothing of one) |
-| restore files on rewind | ✓ | — | — | — |
-| thinking display / budget, output style | ✓ | ✓ (reasoning summaries) | — | — |
-| plan limits (`limits`) | ✓ none for an API key; unit for subscriber windows | ✓ (pushed during turns); unit for ChatGPT reads | — | — |
-| harness status (`harness_status`) | ✓ | ✓ | unit | ? |
-| MCP servers: list with tools, enable/disable, reconnect | ✓ | ✓ | — | — |
-| MCP sign-in (OAuth, finished from another device) | ✓ | ✓ | — | — |
-| MCP add / remove | ✓ (`claude mcp`) | ✓ (`codex mcp`, http via config) | — | — |
-| skills: list with source, view, run, reload | ✓ | ✓ | run only | ? |
-| plugins | ✓ | ✓ | — | — |
-| MCP server and skill named on tool calls | ✓ | unit (MCP) | — | — |
-| inventories known vs loading (`inventory`) | ✓ | ✓ | unit (unsupported) | ? |
-| shells it leaves running as tasks (command, folder, left behind) | ✓ | ✓ (terminals) | — | — |
-| task output, read on its machine, followed from an offset | ✓ | ✓ | — | — |
-| stop a task / all tasks | ✓ (`stop_task`) | ✓ (kiln stops the process) | — | — |
-| ending the agent stops what it left running | ✓ | ✓ | — | — |
-| monitors: events counted, the latest kept | unit (not offered to API-key sessions) | — | — | — |
-| pause / resume a task | — | — | — | — |
-| take over a session found running in a kiln terminal | ✓ | ✓ | — | — |
-| past sessions listed (`/api/harness/history`), continued with their history and model | ✓ | ✓ | — | — |
-| command catalog: every command with its route, aliases | ✓ | ✓ | ✓ | ? |
-| catalog commands kiln runs, answered to the asking console | ✓ (/btw /cost /export /plan /permissions /memory /git-diff) | ✓ (/goal /export /rollout /pwd) | ✓ (/export) | — |
-| /branch, /fork, /undo from the catalog | ✓ (/branch) | ✓ (/fork, /undo) | — | — |
-| refuse one running outside kiln | ✓ | ✓ | — | — |
-| usage limit: pause once, queue and goals held, checkpoint | unit | unit | unit (limit words) | ? |
-| resume at the reset after a usage check | unit (`get_usage`) | unit (`account/rateLimits/read`) | — (retries on a schedule) | ? |
+| | Claude Code | Codex | ACP (claude-agent-acp) | Gemini / opencode / Goose / Amp | Cursor CLI | Pi |
+|---|---|---|---|---|---|---|
+| start | ✓ | ✓ | ✓ | ? | unit | unit |
+| resume, with the history | ✓ | ✓ (latest 100 turns, paged) | unit (when the agent loads sessions) | ? | unit (`session/load`, as ACP loads sessions) | unit (`--session-id`) |
+| survives server and runner restarts | ✓ | ? | ? | ? | ? | ? |
+| a runner upgrade keeps its process (mid-turn, background commands) | ✓ | unit | unit | ? | unit | unit |
+| send, queue | ✓ | ✓ | ✓ | ? | unit | unit |
+| steer into a running turn | ✓ | ✓ | — (waits for the turn) | — | — (waits for the turn) | unit (its `steer`) |
+| a queued message steered in (`queue_steer`) | ✓ | ✓ | — | — | — | unit |
+| send now | ✓ | ✓ | unit | ? | unit | unit |
+| interrupt | ✓ | ✓ | ✓ | ? | unit | unit (`clear_queue`, then `abort`) |
+| approvals, always-allow, deny with feedback | ✓ | ✓ | ✓ (allow) | ? | unit (ACP's) | — (it asks before nothing) |
+| questions: previews, free text, notes, labels with commas | ✓ | unit (Codex asks only in its Plan mode, which kiln does not run) | — | — | unit (`cursor/ask_question`: options by id, several at once; no free text) | unit (an extension's dialogs: a choice, yes or no, free text) |
+| plans to approve | unit | — | — | — | unit (`cursor/create_plan`) | — |
+| permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (interrupts and continues an active turn) | ✓ (the agent's modes) | ? | unit (its modes) | unit (tool sets; a new one starts it again) |
+| `set_model` mid-session | ✓ | ✓ (from the next turn) | ? (sent as session/set_model) | ? | ? | unit (`set_model`) |
+| effort from the start (`meta.efforts`), `set_effort` | ✓ | ✓ (from the next turn) | — | — | ? | unit (its model's thinking levels) |
+| speed where the model goes faster (`meta.speeds`), `set_speed` | unit (fast mode, a setting of the session's alone; what keeps it off and its cooldown from each turn) | unit (each model's service tiers, with every turn) | unit (an agent's `speed` option, as Devin offers it) | ? | ? | — |
+| one message's own model and effort | unit | ✓ | — | — | — | — |
+| attachments: images inline, files by path | ✓ | ✓ | ? (images when offered) | ? | ? (images when offered) | unit |
+| diffs, approval previews, cumulative changeset | ✓ | ✓ | ✓ | ? | ? | unit (an edit's replacements) |
+| calls waiting behind a prompt read as pending | ✓ | — (Codex reports each call's own state) | — | — | — | — |
+| subagents: tasks, nested messages, stop | ✓ | unit (read-only task and thread tracking; no direct stop) | — | — | — (its `cursor/task` notices aren't read) | — (it has none) |
+| a person's message to a subagent: queue, steer, now | unit (by way of its agent's SendMessage; no now) | unit (v1 on its own thread; v2 by way of its agent) | — | — | — | — |
+| rewind, branch, compact, rename | ✓ | ✓ | — | — | — | unit (compact) |
+| a compaction shown as it goes on, then marked where it ran (`compacting`) | unit | unit | unit (`compaction_update`; Devin: its own `/compact`) | — (their ACP says nothing of one) | ? | unit (`compaction_start`, `compaction_end`) |
+| restore files on rewind | ✓ | — | — | — | — | — |
+| thinking display / budget, output style | ✓ | ✓ (reasoning summaries) | — | — | ? | unit (its thinking, its levels) |
+| plan limits (`limits`) | ✓ none for an API key; unit for subscriber windows | ✓ (pushed during turns); unit for ChatGPT reads | — | — | — | — |
+| harness status (`harness_status`) | ✓ | ✓ | unit | ? | unit | unit |
+| MCP servers: list with tools, enable/disable, reconnect | ✓ | ✓ | — | — | — | — |
+| MCP sign-in (OAuth, finished from another device) | ✓ | ✓ | — | — | — | — |
+| MCP add / remove | ✓ (`claude mcp`) | ✓ (`codex mcp`, http via config) | — | — | — | — |
+| skills: list with source, view, run, reload | ✓ | ✓ | run only | ? | run only | run only (`get_commands`) |
+| plugins | ✓ | ✓ | — | — | — | — |
+| MCP server and skill named on tool calls | ✓ | unit (MCP) | — | — | — | — |
+| inventories known vs loading (`inventory`) | ✓ | ✓ | unit (unsupported) | ? | unit (unsupported) | unit (unsupported) |
+| shells it leaves running as tasks (command, folder, left behind) | ✓ | ✓ (terminals) | — | — | — | — |
+| task output, read on its machine, followed from an offset | ✓ | ✓ | — | — | — | — |
+| stop a task / all tasks | ✓ (`stop_task`) | ✓ (kiln stops the process) | — | — | — | — |
+| ending the agent stops what it left running | ✓ | ✓ | — | — | — | — |
+| monitors: events counted, the latest kept | unit (not offered to API-key sessions) | — | — | — | — | — |
+| pause / resume a task | — | — | — | — | — | — |
+| take over a session found running in a kiln terminal | ✓ | ✓ | — | — | — | — |
+| past sessions listed (`/api/harness/history`), continued with their history and model | ✓ | ✓ | — | — | — | — |
+| command catalog: every command with its route, aliases | ✓ | ✓ | ✓ | ? | unit | unit |
+| catalog commands kiln runs, answered to the asking console | ✓ (/btw /cost /export /plan /permissions /memory /git-diff) | ✓ (/goal /export /rollout /pwd) | ✓ (/export) | — | unit (/export) | unit (/export, /compact) |
+| /branch, /fork, /undo from the catalog | ✓ (/branch) | ✓ (/fork, /undo) | — | — | — | — |
+| refuse one running outside kiln | ✓ | ✓ | — | — | — | — |
+| usage limit: pause once, queue and goals held, checkpoint | unit | unit | unit (limit words) | ? | unit (limit words) | unit (limit words) |
+| resume at the reset after a usage check | unit (`get_usage`) | unit (`account/rateLimits/read`) | — (retries on a schedule) | ? | — (retries on a schedule) | — (retries on a schedule) |

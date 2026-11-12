@@ -207,7 +207,7 @@ pub fn words(events: &[Event], note: &str) -> Carry {
 /// The harness's record of `session` on this machine, for `protocol` (blocking: reads files);
 /// `events`, kiln's timeline, for a harness whose own record kiln doesn't keep.
 pub fn record(protocol: &Protocol, env: &[(String, String)], session: Option<&str>, events: &[Event], note: &str) -> Result<Carry, String> {
-    if matches!(protocol, Protocol::Acp(_) | Protocol::AgyStreamJson) {
+    if matches!(protocol, Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc) {
         return Ok(words(events, note));
     }
     let Some(session) = session.filter(|s| !s.is_empty()) else { return Ok(Carry::Nothing) };
@@ -221,7 +221,7 @@ pub fn record(protocol: &Protocol, env: &[(String, String)], session: Option<&st
             let conv = super::handoff::read_codex(env, session).ok_or_else(|| format!("Codex's record of thread {session} is not on this machine"))?;
             Ok(Carry::Seed { items: super::handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>"))) })
         }
-        Protocol::Acp(_) | Protocol::AgyStreamJson => Ok(words(events, note)),
+        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc => Ok(words(events, note)),
         Protocol::Terminal => Err("this harness's sessions can't move between machines yet".into()),
     }
 }

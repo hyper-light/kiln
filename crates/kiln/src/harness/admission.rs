@@ -101,12 +101,12 @@ pub struct Handoff { pub id: String, pub turn: Option<i64>, pub digest: String }
 pub struct HandoffProof { pub handoff: Handoff, pub messages: Vec<String>, pub native_id: String }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum FlightProtocol { Claude, Codex, Acp, Agy }
+pub enum FlightProtocol { Claude, Codex, Acp, Agy, Pi }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LegacyFlight { pub id: String, pub protocol: FlightProtocol, pub request: Option<u64> }
 
-/// The four supported adapters' prompt envelopes. Recovery/control requests and native tool
+/// The supported adapters' prompt envelopes (Pi's: `prompt`, `steer`, `follow_up`). Recovery/control requests and native tool
 /// replies stay live while admission is restoring; only new model input is held at that barrier.
 pub fn native_input(wire: &str) -> bool {
     use std::borrow::Cow;
@@ -117,7 +117,7 @@ pub fn native_input(wire: &str) -> bool {
         #[serde(default, borrow)] event: Option<Cow<'a, str>>,
     }
     let Ok(envelope) = serde_json::from_str::<Envelope<'_>>(wire) else { return true };
-    envelope.kind.as_deref() == Some("user") || envelope.event.as_deref() == Some("user") || matches!(envelope.method.as_deref(), Some("turn/start" | "turn/steer" | "session/prompt"))
+    matches!(envelope.kind.as_deref(), Some("user" | "prompt" | "steer" | "follow_up")) || envelope.event.as_deref() == Some("user") || matches!(envelope.method.as_deref(), Some("turn/start" | "turn/steer" | "session/prompt"))
 }
 
 impl LegacyFlight {
@@ -129,7 +129,8 @@ impl LegacyFlight {
         struct Params<'a> { #[serde(default, borrow, rename = "clientUserMessageId")] client: Option<Cow<'a, str>> }
         #[derive(Deserialize)]
         struct Envelope<'a> {
-            #[serde(default)] id: Option<u64>,
+            // A number (JSON-RPC's, kiln's ACP requests) or a string (Pi's commands).
+            #[serde(default)] id: Option<serde_json::Value>,
             #[serde(default, borrow)] uuid: Option<Cow<'a, str>>,
             #[serde(default, borrow)] event: Option<Cow<'a, str>>,
             #[serde(default, borrow)] method: Option<Cow<'a, str>>,
@@ -140,8 +141,10 @@ impl LegacyFlight {
         match self.protocol {
             FlightProtocol::Claude => envelope.kind.as_deref() == Some("user") && envelope.uuid.as_deref() == Some(self.id.as_str()),
             FlightProtocol::Codex => matches!(envelope.method.as_deref(), Some("turn/start" | "turn/steer")) && envelope.params.as_ref().and_then(|params| params.client.as_deref()) == Some(self.id.as_str()),
-            FlightProtocol::Acp => envelope.method.as_deref() == Some("session/prompt") && self.request.is_some() && envelope.id == self.request,
+            FlightProtocol::Acp => envelope.method.as_deref() == Some("session/prompt") && self.request.is_some() && envelope.id.as_ref().and_then(serde_json::Value::as_u64) == self.request,
             FlightProtocol::Agy => envelope.event.as_deref() == Some("user"), // exactly one active turn, as this adapter owns it
+            // Pi's prompt and steering go under the message's own id.
+            FlightProtocol::Pi => matches!(envelope.kind.as_deref(), Some("prompt" | "steer")) && envelope.id.as_ref().and_then(serde_json::Value::as_str) == Some(self.id.as_str()),
         }
     }
 }
@@ -985,6 +988,18 @@ mod tests {
         assert!(flight.matches(r#"{"method":"turn/steer","params":{"clientUserMessageId":"original"}}"#));
         assert!(!flight.matches(r#"{"method":"turn/steer","params":{"clientUserMessageId":"other","text":"original"}}"#));
         assert!(!flight.matches(r#"{"method":"thread/read","params":{"clientUserMessageId":"original"}}"#));
+        // ACP's numeric request ids still match as numbers.
+        let acp = LegacyFlight { id: "m".into(), protocol: FlightProtocol::Acp, request: Some(7) };
+        assert!(acp.matches(r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{}}"#));
+        assert!(!acp.matches(r#"{"jsonrpc":"2.0","id":8,"method":"session/prompt","params":{}}"#));
+        // Pi's prompt and steering go under the message's own id, a string.
+        let pi = LegacyFlight { id: "original".into(), protocol: FlightProtocol::Pi, request: None };
+        assert!(pi.matches(r#"{"id":"original","type":"prompt","message":"hi"}"#));
+        assert!(pi.matches(r#"{"id":"original","type":"steer","message":"hi"}"#));
+        assert!(!pi.matches(r#"{"id":"other","type":"prompt","message":"original"}"#));
+        assert!(!pi.matches(r#"{"id":"original","type":"get_state"}"#));
+        for prompt in [r#"{"id":"m","type":"prompt","message":"hi"}"#, r#"{"id":"m","type":"steer","message":"hi"}"#, r#"{"type":"follow_up","message":"hi"}"#] { assert!(native_input(prompt)); }
+        for control in [r#"{"id":"kiln-1","type":"get_state"}"#, r#"{"id":"kiln-2","type":"abort"}"#, r#"{"type":"extension_ui_response","id":"u","value":"x"}"#] { assert!(!native_input(control)); }
     }
 
     #[test]
