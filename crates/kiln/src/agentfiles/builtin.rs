@@ -52,6 +52,15 @@ pub const ALL: &[Builtin] = &[
         pin: include_str!("../../../../.kiln/images/harness-amp/pin.json"),
         files: &[("harness.json", include_str!("../../../../.kiln/images/harness-amp/harness.json"))],
     },
+    // Antigravity's CLI, agy, Google's static musl build, in its headless stream-json mode as kiln's
+    // Antigravity kind starts it (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 26).
+    Builtin {
+        name: "harness-antigravity",
+        harness: "antigravity",
+        text: include_str!("../../../../.kiln/images/harness-antigravity/Agentfile"),
+        pin: include_str!("../../../../.kiln/images/harness-antigravity/pin.json"),
+        files: &[("harness.json", include_str!("../../../../.kiln/images/harness-antigravity/harness.json"))],
+    },
 ];
 
 /// One as the list shows it.
@@ -77,6 +86,9 @@ mod claude_tests;
 
 #[cfg(test)]
 mod amp_tests;
+
+#[cfg(test)]
+mod antigravity_tests;
 
 #[cfg(test)]
 mod tests {

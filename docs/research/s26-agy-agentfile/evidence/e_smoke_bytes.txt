@@ -1,0 +1,8 @@
+# on adacachy2 (x86_64, 7.3.3-1-cachyos), 2026-11-12T14:27:48Z; pin.json sha256 9f57726a2de8b75d243764ee6d42145a7c6d1815de2b42d8e773f80b7a36b806
+qemu-user for arm64: none
+linux/amd64: archive and member match the pin (759402e5bba35938e14710b7d4f1413afd82c5b4edc73c23287784ce47f7e7a4, member e01e1a3af269ce5a3fd8ace31849390128196221346909e90b8d9973776da513)
+linux/amd64: --version stdout bytes: 31 2e 35 2e 36 0a  (exit 0; stderr 0 bytes)
+linux/amd64: with no network (unshare -rn): 31 2e 35 2e 36 0a 
+linux/amd64: files it left under HOME: 0
+linux/arm64: archive and member match the pin (4dae1c738d92826e7cc6184e90e501d566af50e1d02cdb573154171fccc32022, member 982622e3176899affda6d095eec521b7a8f1af88645412b478b6d12b419e0cea)
+linux/arm64: not run (no arm64 here, no qemu-user)

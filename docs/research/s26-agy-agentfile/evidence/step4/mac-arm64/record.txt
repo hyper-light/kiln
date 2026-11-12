@@ -1,0 +1,98 @@
+# step 4 on Adas-Mac-Studio.local (Darwin 25.4.0 arm64) at 2026-11-12T16:10:29Z; shards c4a2b97aab9eb72141335705c1004d1ab58fcefd63a5c766e4bc01f9b43bafdb
+# shards:  Version: 0.7.0  Git commit: 8f3cd5b 
+# carrier: Agentfile 819f797e99508218f43c335fa5c4ef36fc267e5eb6847c70e5507538d8e55ccf, harness.json 06c38aa2545e23cbc882ecad4521d1f5721e1c5bc6300668fa0431caf9644fb4, pin.json 6102386d7aa9233f065dfc47c8a54ac19fedcc5defb0677a069b894a268c98ce
+ctx: /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/ctx/antigravity-amd64: bin/agy bd643ae267d521b8febe5cd9fbce6533a1c7c0831aa0b28325401cb3e3b2035d mode 0755, harness.json 06c38aa2545e23cbc882ecad4521d1f5721e1c5bc6300668fa0431caf9644fb4
+ctx: /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/ctx/antigravity-arm64: bin/agy a96c0ecd1edabfb7e9736f25404601dc8002aea5d627dafe5c34e1aff37a442b mode 0755, harness.json 06c38aa2545e23cbc882ecad4521d1f5721e1c5bc6300668fa0431caf9644fb4
+build.log: exit 0 in 337761 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards build image --progress=plain --platform linux/amd64,linux/arm64 -t harness-antigravity:s26 /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/ctx
+inspect.log: exit 0 in 659 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards inspect image harness-antigravity:s26
+images.log: exit 0 in 34 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards list image
+inspect-amd64.log: exit 0 in 34 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards inspect image --platform linux/amd64 harness-antigravity:s26
+index linux/amd64: application/vnd.oci.image.manifest.v1+json sha256:0b70741d51323c4eb5215bd78449d2a2796a0dae09abb0db9e25651ab5f68c99 linux/amd64 241442052 bytes, 6 layers
+inspect-arm64.log: exit 0 in 34 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards inspect image --platform linux/arm64 harness-antigravity:s26
+index linux/arm64: application/vnd.oci.image.manifest.v1+json sha256:e43371d6d66b9c2a45f2c0a3d9b4605c0921737134f3daf9f8fe2bbbe0f2e9f9 linux/arm64 235427325 bytes, 6 layers
+index document a6f4470188c7fe127562e9f7802e6256078ecce37a9f855f3412354597b06869: {   "schemaVersion": 2,   "mediaType": "application/vnd.oci.image.index.v1+json",   "manifests": [     {       "mediaType": "application/vnd.oci.image.manifest.v1+json",       "digest": "sha256:0b70741d51323c4eb5215bd78449d2a2796a0dae09abb0db9e25651ab5f68c99",       "size": 1617,       "platform": {         "architecture": "amd64",         "os": "linux"       }     },     {       "mediaType": "application/vnd.oci.image.manifest.v1+json",       "digest": "sha256:e43371d6d66b9c2a45f2c0a3d9b4605c0921737134f3daf9f8fe2bbbe0f2e9f9",       "size": 1617,       "platform": {         "architecture": "arm64",         "os": "linux"       }     },     {       "mediaType": "application/vnd.oci.image.manifest.v1+json",       "digest": "sha256:aecc064209263681a637337c29f40dae08e82b9aff53fc3f6fd74092adbac927",       "size": 564,       "annotations": {         "vnd.docker.reference.digest": "sha256:0b70741d51323c4eb5215bd78449d2a2796a0dae09abb0db9e25651ab5f68c99",         "vnd.docker.reference.type": "attestation-manifest"       },       "platform": {         "architecture": "unknown",         "os": "unknown"       }     },     {       "mediaType": "application/vnd.oci.image.manifest.v1+json",       "digest": "sha256:a8a3f0c272499ffe91b234542dfc29ab759ccbd8b6ea76fd630598460521c7fd",       "size": 564,       "annotations": {         "vnd.docker.reference.digest": "sha256:e43371d6d66b9c2a45f2c0a3d9b4605c0921737134f3daf9f8fe2bbbe0f2e9f9",         "vnd.docker.reference.type": "attestation-manifest"       },       "platform": {         "architecture": "unknown",         "os": "unknown"       }     }   ] }
+smoke: exit 0 in 23180 ms: shards run vm --rm --platform linux/arm64 harness-antigravity:s26 /harness/antigravity/bin/agy --version
+smoke stdout bytes:  31 2e 35 2e 37 0a 
+smoke stderr: Downloading the guest kernel Image-6.18.48-aarch64-17c3ba205400 from https://github.com/hyper-light/shards/releases/download/kernel-6.18.48-17c3ba205400/Image-6.18.48-aarch64 Guest kernel: sha256:1b178851998d27b4c6c346ae391c26d675f81461fbaa19cbe514500291fe472d WARNING: CAP_NET_RAW withheld from the command: the image's Agentfile runs agents and harnesses beside the command, and CAP_NET_RAW reads and writes the packets of their flows past the microVM, which cross the command's network namespace 
+harness-run.log: exit 0 in 88 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards run vm -d --platform linux/arm64 --name agy-s26 -v /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/proj:/workspace -v /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/homevol:/home/antigravity harness-antigravity:s26 sleep 600
+harness: its execs: harness antigravity  280  exec   /harness/antigravity/bin/agy --input-format stream-json --output-format stream-json;
+harness: the home volume after: . ./.gemini ./.gemini/antigravity-cli ./.gemini/antigravity-cli/brain ./.gemini/antigravity-cli/builtin ./.gemini/antigravity-cli/cache ./.gemini/antigravity-cli/cli.log ./.gemini/antigravity-cli/conversation_summaries.db ./.gemini/antigravity-cli/conversations ./.gemini/antigravity-cli/crashes ./.gemini/antigravity-cli/implicit ./.gemini/antigravity-cli/installation_id ./.gemini/antigravity-cli/jetski_state.pbtxt ./.gemini/antigravity-cli/log ./.gemini/config ./.gemini/config/.migrated ./.gemini/config/config.json ./.gemini/config/mcp_config.json ./.gemini/config/projects 
+harness-rm.log: exit 0 in 59 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards rm -f agy-s26
+ctx: /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/ctx-probe/antigravity-amd64: bin/agy bd643ae267d521b8febe5cd9fbce6533a1c7c0831aa0b28325401cb3e3b2035d mode 0755, harness.json 97ea1e5a9bdf42814c70f4bb20423d83a21e2c0ddf426db460f770a38b30dda7
+ctx: /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/ctx-probe/antigravity-arm64: bin/agy a96c0ecd1edabfb7e9736f25404601dc8002aea5d627dafe5c34e1aff37a442b mode 0755, harness.json 97ea1e5a9bdf42814c70f4bb20423d83a21e2c0ddf426db460f770a38b30dda7
+probe-build.log: exit 0 in 4431 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards build image --progress=plain --platform linux/arm64 -t harness-antigravity-probe:s26 /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/ctx-probe
+probe: the host resolves cloudcode-pa.googleapis.com to 172.217.118.4 and 2001:4860:4846:400::
+probe-run.log: exit 0 in 430 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards run vm -d --platform linux/arm64 --name agy-probe -v /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/proj-probe:/workspace -v /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/homevol-probe:/home/antigravity harness-antigravity-probe:s26 sleep 600
+probe version: 1.5.7 
+probe version.rc: 0 
+probe uid: 200000 
+probe gid: 200000 
+probe home: /home/antigravity 
+probe dns: 2001:4860:4842:400:: cloudcode-pa.googleapis.com 2001:4860:4840:400:: cloudcode-pa.googleapis.com 2001:4860:4843:400:: cloudcode-pa.googleapis.com 2001:4860:4846:400:: cloudcode-pa.googleapis.com 2001:4860:4845:400:: cloudcode-pa.googleapis.com 2001:4860:4841:400:: cloudcode-pa.googleapis.com 2001:4860:4844:400:: cloudcode-pa.googleapis.com 2001:4860:4847:400:: cloudcode-pa.googleapis.com 
+probe dns.rc: 0 
+probe touch.rc: 0 
+probe touch.err: 
+probe git.rc: 0 
+probe git.err: 
+probe mcp.rc: 0 
+probe mcp.out: Added MCP server "kiln-probe" (stdio) 
+probe turn.rc: 1 
+probe https: 404 
+probe https.rc: 0 
+probe https.err: 
+probe http80: 000 
+probe http80.rc: 28 
+probe http80.err: curl: (28) Connection timed out after 10000 milliseconds 
+probe https-ip4: 404 
+probe https-ip4.rc: 0 
+probe https-ip4.err: 
+probe https-ip6: 000 
+probe https-ip6.rc: 7 
+probe https-ip6.err: curl: (7) Failed to connect to cloudcode-pa.googleapis.com port 443 after 0 ms: Could not connect to server 
+probe ca-bundle: -rw-r--r-- 1 root root 222073 Nov  5 07:42 /etc/ssl/certs/ca-certificates.crt 
+probe agy-tls: 
+probe done: done 
+probe turn.out: {"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"authentication failed or timed out","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"finished_reason":"error"}} 
+probe home volume: . ./.gemini ./.gemini/antigravity-cli ./.gemini/antigravity-cli/brain ./.gemini/antigravity-cli/builtin ./.gemini/antigravity-cli/builtin/.checksum ./.gemini/antigravity-cli/builtin/.manifest ./.gemini/antigravity-cli/builtin/keep.txt ./.gemini/antigravity-cli/builtin/plugins ./.gemini/antigravity-cli/builtin/skills ./.gemini/antigravity-cli/cache ./.gemini/antigravity-cli/cache/default_project_id.txt ./.gemini/antigravity-cli/cli.log ./.gemini/antigravity-cli/conversation_summaries.db ./.gemini/antigravity-cli/conversations ./.gemini/antigravity-cli/crashes ./.gemini/antigravity-cli/crashes/crash_53_c3acb2b1-06ab-4e23-9440-fb721c26ba59.log ./.gemini/antigravity-cli/implicit ./.gemini/antigravity-cli/implicit/77c17376-12a5-49ce-9f74-6ee7e4a73edc.pb ./.gemini/antigravity-cli/installation_id ./.gemini/antigravity-cli/jetski_state.pbtxt ./.gemini/antigravity-cli/log ./.gemini/antigravity-cli/log/cli-20261112_162017.log ./.gemini/config ./.gemini/config/.migrated ./.gemini/config/config.json ./.gemini/config/mcp_config.json ./.gemini/config/projects ./.gemini/config/projects/default-cli-project.json ./.gitconfig 
+probe .gitconfig: [user] 	name = probe 
+probe mcp_config.json: {  "mcpServers": {    "kiln-probe": {      "command": "/bin/true",      "disabled": false    }  }}
+probe-rm.log: exit 0 in 57 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards rm -f agy-probe
+ctx: /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/ctx-control/antigravity-amd64: bin/agy bd643ae267d521b8febe5cd9fbce6533a1c7c0831aa0b28325401cb3e3b2035d mode 0755, harness.json 97ea1e5a9bdf42814c70f4bb20423d83a21e2c0ddf426db460f770a38b30dda7
+ctx: /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/ctx-control/antigravity-arm64: bin/agy a96c0ecd1edabfb7e9736f25404601dc8002aea5d627dafe5c34e1aff37a442b mode 0755, harness.json 97ea1e5a9bdf42814c70f4bb20423d83a21e2c0ddf426db460f770a38b30dda7
+control-build.log: exit 0 in 1220 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards build image --progress=plain --platform linux/arm64 -t harness-antigravity-control:s26 /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/ctx-control
+control: the host resolves cloudcode-pa.googleapis.com to 172.217.114.4 and 2001:4860:4846:400::
+control-run.log: exit 0 in 402 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards run vm -d --platform linux/arm64 --name agy-control -v /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/proj-control:/workspace -v /Users/adalundhe/.cache/s26-agy-step4/run-1.5.7/homevol-control:/home/antigravity harness-antigravity-control:s26 sleep 600
+control version: 1.5.7 
+control version.rc: 0 
+control uid: 200000 
+control gid: 200000 
+control home: /home/antigravity 
+control dns: 
+control dns.rc: 2 
+control touch.rc: 0 
+control touch.err: 
+control git.rc: 0 
+control git.err: 
+control mcp.rc: 0 
+control mcp.out: Added MCP server "kiln-probe" (stdio) 
+control turn.rc: 1 
+control https: 000 
+control https.rc: 6 
+control https.err: curl: (6) Could not resolve host: cloudcode-pa.googleapis.com 
+control http80: 000 
+control http80.rc: 6 
+control http80.err: curl: (6) Could not resolve host: cloudcode-pa.googleapis.com 
+control https-ip4: 000 
+control https-ip4.rc: 7 
+control https-ip4.err: curl: (7) Failed to connect to cloudcode-pa.googleapis.com port 443 after 0 ms: Could not connect to server 
+control https-ip6: 000 
+control https-ip6.rc: 7 
+control https-ip6.err: curl: (7) Failed to connect to cloudcode-pa.googleapis.com port 443 after 0 ms: Could not connect to server 
+control ca-bundle: -rw-r--r-- 1 root root 222073 Nov  5 07:42 /etc/ssl/certs/ca-certificates.crt 
+control agy-tls: E1112 16:20:33.611594     388 server.go:4324] Failed to shutdown telemetry client: Post "https://play.googleapis.com/log": dial tcp: lookup play.googleapis.com on 1.0.0.1:53: dial udp 1.0.0.1:53: connect: network is unreachable 
+control done: done 
+control turn.out: {"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"authentication failed or timed out","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"finished_reason":"error"}} 
+control home volume: . ./.gemini ./.gemini/antigravity-cli ./.gemini/antigravity-cli/brain ./.gemini/antigravity-cli/builtin ./.gemini/antigravity-cli/builtin/.checksum ./.gemini/antigravity-cli/builtin/.manifest ./.gemini/antigravity-cli/builtin/keep.txt ./.gemini/antigravity-cli/builtin/plugins ./.gemini/antigravity-cli/builtin/skills ./.gemini/antigravity-cli/cache ./.gemini/antigravity-cli/cache/default_project_id.txt ./.gemini/antigravity-cli/cli.log ./.gemini/antigravity-cli/conversation_summaries.db ./.gemini/antigravity-cli/conversations ./.gemini/antigravity-cli/crashes ./.gemini/antigravity-cli/implicit ./.gemini/antigravity-cli/implicit/3d05396a-4a1d-4e56-8902-3d42579458d5.pb ./.gemini/antigravity-cli/installation_id ./.gemini/antigravity-cli/jetski_state.pbtxt ./.gemini/antigravity-cli/log ./.gemini/antigravity-cli/log/cli-20261112_162033.log ./.gemini/config ./.gemini/config/.migrated ./.gemini/config/config.json ./.gemini/config/mcp_config.json ./.gemini/config/projects ./.gemini/config/projects/default-cli-project.json ./.gitconfig ./x 
+control .gitconfig: [user] 	name = probe 
+control mcp_config.json: {  "mcpServers": {    "kiln-probe": {      "command": "/bin/true",      "disabled": false    }  }}
+control-rm.log: exit 0 in 61 ms: /Users/adalundhe/.cache/s26-agy-step4/shards-target/test-release/shards rm -f agy-control
