@@ -76,7 +76,7 @@ pub struct Meta {
     pub repo: Option<String>,
     /// For a leg's frame: its run.
     pub job_run: Option<String>,
-    /// For an inbox's frame, or an attention change's: whose.
+    /// For an inbox's frame, an attention change's, or an Agentfile's: whose.
     pub person: Option<String>,
     pub agent: Agent,
     /// Its text read as JSON.
@@ -109,6 +109,8 @@ impl Meta {
         let person = match kind.as_str() {
             "inbox" => v.get("person"),
             "attention" => v.get("principal"),
+            // An Agentfile's owner (`crate::agentfiles`).
+            "agentfile" => v.get("owner"),
             _ => None,
         }
         .and_then(Value::as_str)
