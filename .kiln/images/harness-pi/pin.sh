@@ -105,6 +105,39 @@ elif cmd == "version":  # package.json on stdin -> its version
 elif cmd == "ref":  # FILE -> a git ref's (or tag object's) object type and sha
     o = load(args[0], "a git ref").get("object") or {}
     print(o.get("type") or "-", o.get("sha") or "-")
+elif cmd == "tree":  # ARCHIVE PREFIX -> entries and unpacked bytes of a tree unpacked with PREFIX/ stripped
+    # Measured here, at pin time, so the unpacker can hold the archive to its own counts (R03).
+    import tarfile
+    path, prefix = args
+    entries = unpacked = 0
+    try:
+        with tarfile.open(path, "r:gz") as t:
+            for m in t:
+                name = m.name.rstrip("/")
+                if name != prefix and not name.startswith(prefix + "/"):
+                    fail(f"{os.path.basename(path)} holds {m.name}, outside {prefix}/")
+                if not (m.isfile() or m.isdir()):
+                    fail(f"{os.path.basename(path)} holds {m.name}, neither a regular file nor a directory")
+                entries += 1
+                unpacked += m.size if m.isfile() else 0
+    except (OSError, tarfile.TarError) as e:
+        fail(f"{os.path.basename(path)} is not a readable tar.gz: {e}")
+    print(entries, unpacked)
+elif cmd == "member":  # ARCHIVE MEMBER -> the member's SHA-256 and size; it must be a regular file
+    import hashlib, tarfile
+    path, member = args
+    try:
+        with tarfile.open(path, "r:gz") as t:
+            try:
+                m = t.getmember(member)
+            except KeyError:
+                fail(f"{os.path.basename(path)} holds no {member}")
+            if not m.isfile():
+                fail(f"{os.path.basename(path)}: {member} is not a regular file")
+            digest = hashlib.sha256(t.extractfile(m).read()).hexdigest()  # a tool binary: a few MB
+    except (OSError, tarfile.TarError) as e:
+        fail(f"{os.path.basename(path)} is not a readable tar.gz: {e}")
+    print(digest, m.size)
 elif cmd == "write":  # OUT, facts on stdin -> pin.json, written to a temporary file and renamed
     out = args[0]
     meta, builds = {}, {}
@@ -113,16 +146,11 @@ elif cmd == "write":  # OUT, facts on stdin -> pin.json, written to a temporary 
         if kind == "meta":
             meta[f[0]] = f[1]
         elif kind == "file":
-            platform, url, sha, size, path, mode, fmt, strip, member = f
+            platform, url, sha, size, path, mode, unpack = f
             entry = {"url": url, "sha256": sha, "size": int(size), "path": path}
             if mode:
                 entry["mode"] = mode
-            unpack = {"format": fmt}
-            if strip:
-                unpack["strip"] = int(strip)
-            if member:
-                unpack["member"] = member
-            entry["unpack"] = unpack
+            entry["unpack"] = json.loads(unpack)
             builds.setdefault(platform, []).append(entry)
     pin = {
         "harness": "pi",
@@ -134,14 +162,15 @@ elif cmd == "write":  # OUT, facts on stdin -> pin.json, written to a temporary 
         "verified": [
             f"pi {meta['tag']}: each Linux tarball's SHA-256 equals its line in the release's SHA256SUMS "
             "and the digest GitHub recorded at upload, its size equals GitHub's, and its pi/package.json "
-            f"says {meta['version']}",
+            f"says {meta['version']}; it holds only regular files and directories under pi/, whose count "
+            "and bytes are pinned for the unpacker",
             f"pi {meta['tag']}: no signature or attestation exists for these builds (GitHub's attestations "
             "API has none for either digest) and the release is not immutable, so these checksums are the "
             "strongest check its publisher offers",
             f"ripgrep {meta['rg_tag']}: each tarball's SHA-256 equals GitHub's digest and the release's "
-            ".sha256 file, and the archive holds rg",
+            ".sha256 file, and the archive holds rg, a regular file whose SHA-256 and size are pinned",
             f"fd {meta['fd_tag']}: each tarball's SHA-256 equals GitHub's digest (fd publishes no checksum "
-            "file), and the archive holds fd",
+            "file), and the archive holds fd, a regular file whose SHA-256 and size are pinned",
         ],
         "base": meta["base"],
         "tools": [
@@ -231,14 +260,14 @@ for a in x64:amd64 arm64:arm64; do
     200) die "$pi_repo $pi_tag: GitHub holds an attestation for $name: verify it (gh attestation verify) and teach pin.sh to check it" ;;
     *) die "$pi_repo $pi_tag: GitHub's attestations API answered $code for $name, so whether it is attested is unknown" ;;
     esac
+    t=$(py tree "$work/$name" pi)
+    read -r entries unpacked <<<"$t"
     members "$work/$name"
-    if grep -qv '^pi/' "$work/members"; then
-        die "$pi_repo $pi_tag: $name has members outside pi/, so stripping its first directory would lose them"
-    fi
     grep -qxF pi/pi "$work/members" || die "$pi_repo $pi_tag: $name holds no pi/pi"
     v=$(tar -xzOf "$work/$name" pi/package.json | py version) || die "$pi_repo $pi_tag: could not read $name's pi/package.json"
     [[ $v == "$pi_version" ]] || die "$pi_repo $pi_tag: $name's pi/package.json says $v"
-    fact file "linux/${a#*:}" "$dl/$pi_repo/releases/download/$pi_tag/$name" "$sha" "$bytes" . "" tar.gz 1 ""
+    fact file "linux/${a#*:}" "$dl/$pi_repo/releases/download/$pi_tag/$name" "$sha" "$bytes" . "" \
+        "{\"format\":\"tar.gz\",\"strip\":1,\"unpacked_bytes\":$unpacked,\"entries\":$entries}"
 done
 
 # ripgrep and fd: the <arch>-unknown-linux-musl builds pi's tools-manager downloads (research f17)
@@ -254,17 +283,19 @@ for a in x86_64:amd64 aarch64:arm64; do
     fetch "$rg_repo" "$rg_tag" "$work/rg.json" "$name.sha256"
     listed=$(py sum "$work/$name.sha256" "$name")
     [[ $rg_sha == "$listed" ]] || die "$rg_repo $rg_tag: $name has SHA-256 $rg_sha; its .sha256 file says $listed"
-    members "$work/$name"
     member=ripgrep-$rg_tag-$target/rg
-    grep -qxF "$member" "$work/members" || die "$rg_repo $rg_tag: $name holds no $member"
-    fact file "linux/${a#*:}" "$dl/$rg_repo/releases/download/$rg_tag/$name" "$rg_sha" "$rg_bytes" bin/rg 0755 tar.gz "" "$member"
+    m=$(py member "$work/$name" "$member")
+    read -r msha msize <<<"$m"
+    fact file "linux/${a#*:}" "$dl/$rg_repo/releases/download/$rg_tag/$name" "$rg_sha" "$rg_bytes" bin/rg 0755 \
+        "{\"format\":\"tar.gz\",\"member\":\"$member\",\"sha256\":\"$msha\",\"size\":$msize}"
 
     name=fd-v${fd_tag#v}-$target.tar.gz
     fetch "$fd_repo" "$fd_tag" "$work/fd.json" "$name"
-    members "$work/$name"
     member=fd-v${fd_tag#v}-$target/fd
-    grep -qxF "$member" "$work/members" || die "$fd_repo $fd_tag: $name holds no $member"
-    fact file "linux/${a#*:}" "$dl/$fd_repo/releases/download/$fd_tag/$name" "$sha" "$bytes" bin/fd 0755 tar.gz "" "$member"
+    m=$(py member "$work/$name" "$member")
+    read -r msha msize <<<"$m"
+    fact file "linux/${a#*:}" "$dl/$fd_repo/releases/download/$fd_tag/$name" "$sha" "$bytes" bin/fd 0755 \
+        "{\"format\":\"tar.gz\",\"member\":\"$member\",\"sha256\":\"$msha\",\"size\":$msize}"
 done
 
 fact meta version "$pi_version"

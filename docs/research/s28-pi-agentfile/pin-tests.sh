@@ -171,6 +171,34 @@ elif op == "dropmember":  # TARBALL MEMBER SHAFILE JSON: a member taken out, its
     restate(a[3], a[0])
     resum(a[2], os.path.basename(a[0]), hashlib.sha256(get(a[0])).hexdigest())
     restate(a[3], a[2])
+elif op == "addlink":  # TARBALL NAME TARGET SUMS JSON: a symlink entry added, its checksums with it
+    src = tarfile.open(fileobj=io.BytesIO(get(a[0])), mode="r:gz")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as dst:
+        for m in src.getmembers():
+            dst.addfile(m, src.extractfile(m) if m.isfile() else None)
+        link = tarfile.TarInfo(a[1])
+        link.type, link.linkname = tarfile.SYMTYPE, a[2]
+        dst.addfile(link)
+    put(a[0], buf.getvalue())
+    restate(a[4], a[0])
+    resum(a[3], os.path.basename(a[0]), hashlib.sha256(get(a[0])).hexdigest())
+    restate(a[4], a[3])
+elif op == "linkmember":  # TARBALL MEMBER SHAFILE JSON: the member made a symlink, its checksums with it
+    src = tarfile.open(fileobj=io.BytesIO(get(a[0])), mode="r:gz")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as dst:
+        for m in src.getmembers():
+            if m.name == a[1]:
+                link = tarfile.TarInfo(m.name)
+                link.type, link.linkname = tarfile.SYMTYPE, "/usr/bin/true"
+                dst.addfile(link)
+            else:
+                dst.addfile(m, src.extractfile(m) if m.isfile() else None)
+    put(a[0], buf.getvalue())
+    restate(a[3], a[0])
+    resum(a[2], os.path.basename(a[0]), hashlib.sha256(get(a[0])).hexdigest())
+    restate(a[3], a[2])
 elif op == "attest":  # SHA: GitHub's attestations API answers for this digest
     p = os.path.join(run, "api/repos/earendil-works/pi/attestations")
     os.makedirs(p, exist_ok=True)
@@ -258,6 +286,12 @@ case_ norg "holds no $rg_x64/rg" "$pi_tag" "$rg_tag" "$fd_tag"
 
 mkrun rgsha; edit "$W/runs/rgsha" sumline "$RG_DL/$rg_a64.tar.gz.sha256" "$rg_a64.tar.gz" "$x64_sha" "$RG_REL"
 case_ rgsha "$rg_a64.tar.gz has SHA-256 [0-9a-f]+; its .sha256 file says $x64_sha" "$pi_tag" "$rg_tag" "$fd_tag"
+
+mkrun pilink; edit "$W/runs/pilink" addlink "$PI_DL/pi-linux-x64.tar.gz" pi/link pi "$PI_DL/SHA256SUMS" "$PI_REL"
+case_ pilink "pi-linux-x64.tar.gz holds pi/link, neither a regular file nor a directory" "$pi_tag" "$rg_tag" "$fd_tag"
+
+mkrun rglink; edit "$W/runs/rglink" linkmember "$RG_DL/$rg_x64.tar.gz" "$rg_x64/rg" "$RG_DL/$rg_x64.tar.gz.sha256" "$RG_REL"
+case_ rglink "$rg_x64/rg is not a regular file" "$pi_tag" "$rg_tag" "$fd_tag"
 
 mkrun attested; edit "$W/runs/attested" attest "$x64_sha"
 case_ attested "GitHub holds an attestation for pi-linux-x64.tar.gz" "$pi_tag" "$rg_tag" "$fd_tag"
