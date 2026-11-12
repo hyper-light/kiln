@@ -31,7 +31,7 @@ test("W21-R02 entry hints support Windows component facades without matching oth
 
 test("W21-R02 entry hints apply only to an agent document and accept bounded local JavaScript paths", () => {
   for (const path of ["/agents/a", "/agents/a/", "/agents/plan-123"]) assert.equal(agentEntry(path), true, path);
-  for (const path of ["/agents", "/ship", "/agents/plans", "/agents/plans/a", "/agents/research", "/agents/sessions", "/.kiln-peer/a/agents/b", "/shared/agents/a"])
+  for (const path of ["/agents", "/ship", "/agents/plans", "/agents/plans/a", "/agents/research", "/agents/sessions", "/agents/agentfiles", "/.kiln-peer/a/agents/b", "/shared/agents/a"])
     assert.equal(agentEntry(path), false, path);
   assert.equal(preloadLinks({ version: 1, agent: ["/assets/agent-123.js", "/assets/agent-123.js"] }), '<link rel="modulepreload" crossorigin="anonymous" href="/assets/agent-123.js">');
   assert.equal(

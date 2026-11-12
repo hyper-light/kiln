@@ -92,6 +92,7 @@ test("W21-R02: anonymous, public and peered pages make no bootstrap API requests
   assert.equal(needsSessions("/agents/plans/one"), false);
   assert.equal(needsSessions("/agents/research/one"), false);
   assert.equal(needsSessions("/agents/sessions"), false);
+  assert.equal(needsSessions("/agents/agentfiles"), false);
   assert.equal(needsSessions("/agents/one"), true);
 });
 

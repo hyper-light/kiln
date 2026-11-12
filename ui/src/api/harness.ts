@@ -25,6 +25,7 @@ import type {
   FileChange,
   Event as HEvent,
   HeldBack,
+  Isolation,
   KeptFile,
   Meta,
   ModelOption,
@@ -369,6 +370,8 @@ export interface Spec {
   reach?: string;
   /** Where it works: its folder itself (none), or a Slates volume of its own laid over the folder (`volume`). */
   workspace?: { kind: "volume" };
+  /** How it's held when not as a process on its machine: a microVM of its own (`microvm`), made from the Agentfile `image` names (api/agentfiles.ts; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31). */
+  isolation?: Isolation;
 }
 
 /** Where agents can have workspaces of their own, by target (`local`, `agent:<name>`). */

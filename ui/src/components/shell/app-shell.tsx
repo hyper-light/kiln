@@ -78,8 +78,8 @@ export function AppShell({ me }: { me: Me | null }) {
   const location = useLocation();
   const onTerminal = location.pathname.startsWith("/terminal");
   // An agent's workspace fills the window like the terminal does (no footer, no page scroll);
-  // plans, research and the rest under /agents are ordinary pages and keep the window's scroll.
-  const fullHeight = onTerminal || /^\/agents\/(?!(?:sessions|plans|research)(?:\/|$))[^/]+\/?$/.test(location.pathname);
+  // plans, research, Agentfiles and the rest under /agents are ordinary pages and keep the window's scroll.
+  const fullHeight = onTerminal || /^\/agents\/(?!(?:sessions|plans|research|agentfiles)(?:\/|$))[^/]+\/?$/.test(location.pathname);
   // The terminal stays mounted once opened, so its sessions live on while you're elsewhere.
   const [termMounted, setTermMounted] = React.useState(onTerminal);
   if (onTerminal && !termMounted) setTermMounted(true);
