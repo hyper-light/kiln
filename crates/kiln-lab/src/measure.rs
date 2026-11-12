@@ -356,6 +356,16 @@ pub struct Held {
     pub cpu_ms: f64,
     #[serde(default)]
     pub longest_cpu_ms: f64,
+    /// Of those polls, the ones past the step quantum their shard ran them with, by their hold
+    /// (`kiln_shard_held_past_quantum_polls_total`) and on the CPU (`kiln_shard_held_cpu_past_quantum_polls_total`), between
+    /// the two scrapes, and whether the build counts them (goal 9, plan 01a1a87b2cec step 3): what says a poll passed the
+    /// quantum between them, where the longest is since the server started. None from a build from before it counted.
+    #[serde(default)]
+    pub past_polls: f64,
+    #[serde(default)]
+    pub past_cpu_polls: f64,
+    #[serde(default)]
+    pub counts_past: bool,
 }
 
 /// What held the shards between `before` and `after`, `secs` apart, the most time first.
@@ -377,6 +387,14 @@ pub fn held(before: &Scrape, after: &Scrape, secs: f64) -> Vec<Held> {
             "kiln_shard_held_cpu_held_seconds_total" => row.cpu_held_ms += added * 1000.0,
             "kiln_shard_held_cpu_seconds_total" => row.cpu_ms += added * 1000.0,
             "kiln_shard_held_longest_cpu_seconds" => row.longest_cpu_ms = row.longest_cpu_ms.max(value * 1000.0),
+            "kiln_shard_held_past_quantum_polls_total" => {
+                row.past_polls += added;
+                row.counts_past = true;
+            }
+            "kiln_shard_held_cpu_past_quantum_polls_total" => {
+                row.past_cpu_polls += added;
+                row.counts_past = true;
+            }
             _ => {}
         }
     }

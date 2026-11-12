@@ -1,0 +1,9 @@
+M7 run 2026-11-12T07:51:47Z
+OPENCODE1 v1.19.5 810c0eba1a7348036f8bdf61e6632d0c36c6876c files naming child-session-updates: 0
+OPENCODE2 v2.2.7 fedc6f208aa2bd54c1019227214568083f6380ad files naming child-session-updates under packages/cli/src: packages/cli/src/acp/capabilities.ts 
+OPENCODE1 acp command: packages/opencode/src/cli/cmd/acp.ts:10:  command: "acp",
+INSTALL_V2 sha256 bbc4584fd6a888bcd14623b8a63afa0f1b4075a2e84a2c3518cd509b446b3135 (fetched 2026-11-12T04:28Z from https://opencode.ai/v2/install)
+INSTALL_V2 137:        if ! grep -qwi avx2 /proc/cpuinfo 2>/dev/null; then
+INSTALL_V2 143:        avx2=$(sysctl -n hw.optional.avx2_0 2>/dev/null || echo 0)
+INSTALL_V2 144:        if [ "$avx2" != "1" ]; then
+INSTALL_V2 179:        metadata=$(curl -fsSL https://opencode.ai/update/api/latest/cli/npm || true)

@@ -1,0 +1,9 @@
+# kiln branches for steps 19 and 30, 2026-11-12T08:04:15Z; kiln origin/main efb40ea0f4b28ef1f05f4d7e7f47af28e353e166
+p/agentfile-store-v1: 4a4aa1179 Merge origin/main into p/agentfile-store-v1 (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 30)
+p/agentfile-store-v1 is NOT on origin/main
+no crates/kiln/src/agentfiles/builtin.rs on origin/main
+s19-claude-agentfile: 1a5a5f00d Merge fix/agent-limit-headroom (CI failure 12 of 14): agent_limit.rs's runner turns its headroom off (Ada's word: push it alone, the relevant checks only)
+s19-claude-agentfile commits not on origin/main: 0
+s19 worktree status:
+  ?? docs/research/s19-claude-agentfile/
+.kiln/images on origin/main: 0 files

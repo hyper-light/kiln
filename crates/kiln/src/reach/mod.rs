@@ -88,10 +88,12 @@ pub enum Question {
         rest: serde_json::Map<String, serde_json::Value>,
     },
     /// What the runner holds of other runners' trees and let go (docs/reach.md §5.1), answered
-    /// with the rules it weighs them with (`crate::reach::copies`).
+    /// with the rules it weighs them with (`crate::reach::copies`). Read with the question, where
+    /// its frame is (goal 9, plan 01a1a87b2cec step 3: kept as a JSON tree, it was read again from
+    /// that on the hub's shard).
     Keep {
         #[serde(default)]
-        report: Option<serde_json::Value>,
+        report: Option<keep::Report>,
     },
     /// That the runner holds an object of the runners' caches (docs/ci.md W24-R27).
     Holds {

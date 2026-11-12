@@ -1,0 +1,1 @@
+Security Warning: Skipping system settings file '/home/adalundhe/s21-gemini-research/run-20261112T072904Z/harness-gemini/etc/system-settings.json': Parent directory '/home' is insecure: Directory '/home' is not owned by root (uid 0). Current uid: 65534. To fix this, run: sudo chown root:root "/home"

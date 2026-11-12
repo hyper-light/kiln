@@ -1,0 +1,343 @@
+opencode v2.2.7 = fedc6f208aa2bd54c1019227214568083f6380ad (https://github.com/anomalyco/opencode/tree/v2.2.7)
+packages/cli/src/acp/capabilities.ts:1: import type { ClientCapabilities } from "@agentclientprotocol/sdk"
+packages/cli/src/acp/capabilities.ts:2: 
+packages/cli/src/acp/capabilities.ts:3: export const ChildSessionUpdates = "opencode/child-session-updates"
+packages/cli/src/acp/capabilities.ts:4: 
+packages/cli/src/acp/capabilities.ts:5: export type Capabilities = ReturnType<typeof parse>
+packages/cli/src/acp/capabilities.ts:6: 
+packages/cli/src/acp/capabilities.ts:7: export function parse(client: ClientCapabilities | undefined) {
+packages/cli/src/acp/capabilities.ts:8:   const elicitation = client?.elicitation
+packages/cli/src/acp/capabilities.ts:9:   const compaction = client?.session?.compaction
+packages/cli/src/acp/capabilities.ts:10:   return {
+packages/cli/src/acp/capabilities.ts:11:     childSessionUpdates: client?._meta?.[ChildSessionUpdates] === true,
+packages/cli/src/acp/capabilities.ts:12:     formElicitation: elicitation?.form !== undefined && elicitation.form !== null,
+packages/cli/src/acp/capabilities.ts:13:     compaction: compaction !== undefined && compaction !== null,
+packages/cli/src/acp/capabilities.ts:14:   }
+packages/cli/src/acp/capabilities.ts:15: }
+packages/cli/src/commands/handlers/acp.ts:24:     process.env.OPENCODE_CLIENT = "acp"
+packages/cli/src/commands/handlers/acp.ts:25:     const endpoint = yield* Standalone.start()
+packages/cli/src/commands/handlers/acp.ts:26:     const client = yield* OpenCode.make({ baseUrl: endpoint.url }).pipe(
+packages/cli/src/commands/handlers/acp.ts:27:       Effect.provideServiceEffect(
+packages/cli/src/commands/handlers/acp.ts:28:         HttpClient.HttpClient,
+packages/cli/src/commands/handlers/acp.ts:29:         HttpClient.HttpClient.pipe(
+packages/cli/src/commands/handlers/acp.ts:30:           Effect.map(HttpClient.mapRequest(HttpClientRequest.setHeaders(Service.headers(endpoint) ?? {}))),
+packages/cli/src/commands/handlers/acp.ts:31:         ),
+packages/cli/src/commands/handlers/acp.ts:32:       ),
+packages/cli/src/commands/handlers/acp.ts:33:       Effect.provide(FetchHttpClient.layer),
+packages/cli/src/commands/handlers/acp.ts:34:     )
+packages/cli/src/commands/handlers/acp.ts:35:     const connection = yield* ACP.connect(client, ndJsonStream(Writable.toWeb(process.stdout), Bun.stdin.stream()))
+packages/cli/src/services/standalone.ts:17: function command(password: string, options: Options) {
+packages/cli/src/services/standalone.ts:18:   const [executable, ...args] = options.command ?? [...selfCommand(), "serve"]
+packages/cli/src/services/standalone.ts:19:   if (!executable) throw new Error("Failed to resolve standalone server command")
+packages/cli/src/services/standalone.ts:20:   return ChildProcess.make(executable, [...args, "--stdio", "--port", "0"], {
+packages/cli/src/services/standalone.ts:21:     cwd: startupDirectory,
+packages/cli/src/services/standalone.ts:22:     // Explicit entry wins over anything inherited, so a user-exported
+packages/cli/src/services/standalone.ts:23:     // OPENCODE_PASSWORD cannot shadow the child's lease credential.
+packages/cli/src/services/standalone.ts:24:     env: { OPENCODE_PASSWORD: password },
+packages/cli/src/services/standalone.ts:25:     extendEnv: true,
+packages/cli/src/services/standalone.ts:26:     // The server treats EOF on this pipe as the end of its ownership lease.
+packages/cli/src/services/standalone.ts:27:     // The OS closes it even when the TUI is killed before Effect finalizers run.
+packages/cli/src/services/standalone.ts:28:     stdin: "pipe",
+packages/cli/src/services/standalone.ts:29:     stderr: process.env.OPENCODE_PRINT_LOGS === "1" ? "inherit" : "ignore",
+packages/cli/src/services/standalone.ts:30:     killSignal: "SIGTERM",
+packages/cli/src/services/standalone.ts:31:     forceKillAfter: "3 seconds",
+packages/cli/src/services/standalone.ts:32:   })
+packages/cli/src/services/standalone.ts:33: }
+packages/cli/src/server-process.ts:72:       const hostname = options.hostname ?? config.hostname ?? "127.0.0.1"
+packages/cli/src/server-process.ts:73:       const port = options.port ?? config.port ?? (options.mode === "service" ? ServiceConfig.defaultPort() : undefined)
+packages/cli/src/server-process.ts:117:           models: {
+packages/cli/src/server-process.ts:118:             url: process.env.OPENCODE_MODELS_URL,
+packages/cli/src/server-process.ts:119:             file: process.env.OPENCODE_MODELS_PATH,
+packages/cli/src/server-process.ts:120:             fetch: !truthy(process.env.OPENCODE_DISABLE_MODELS_FETCH),
+packages/cli/src/server-process.ts:121:           },
+packages/cli/src/services/updater.ts:534:   const inspect = Effect.fnUntraced(function* () {
+packages/cli/src/services/updater.ts:535:     if (OPENCODE_LOCAL || ["1", "true"].includes(process.env.OPENCODE_DISABLE_AUTOUPDATE?.toLowerCase() ?? "")) {
+packages/cli/src/services/updater.ts:536:       yield* Effect.logInfo("update check skipped", {
+packages/cli/src/services/updater.ts:537:         reason: OPENCODE_LOCAL ? "local-install" : "disabled",
+packages/cli/src/services/updater.ts:538:         version: OPENCODE_VERSION,
+packages/cli/src/services/updater.ts:539:         channel: OPENCODE_CHANNEL,
+packages/cli/src/services/updater.ts:540:       })
+packages/cli/src/services/updater.ts:541:       return undefined
+packages/cli/src/services/updater.ts:542:     }
+packages/cli/src/commands/handlers/default.ts:62:     const updater = yield* Updater.Service
+packages/cli/src/commands/handlers/default.ts:63:     let installing: string | undefined
+packages/cli/src/commands/handlers/default.ts:64:     let latest: Updater.RunResult | undefined
+packages/cli/src/commands/handlers/default.ts:65:     const installListeners = new Set<(version: string) => void>()
+packages/cli/src/commands/handlers/default.ts:66:     const resultListeners = new Set<(result: Updater.RunResult) => void>()
+packages/cli/src/commands/handlers/default.ts:67:     // Background checks, `/update` lookups, and manual installs take turns so two installs never overlap.
+packages/cli/src/commands/handlers/default.ts:68:     const checking = yield* Semaphore.make(1)
+packages/cli/src/commands/handlers/default.ts:69:     yield* updater
+packages/cli/src/commands/handlers/default.ts:70:       .run((version) => {
+packages/cli/src/commands/handlers/default.ts:71:         installing = version
+packages/cli/src/database-path.ts:4: export function databasePath(data: string) {
+packages/cli/src/database-path.ts:5:   const filename =
+packages/cli/src/database-path.ts:6:     process.env.OPENCODE_DB ??
+packages/cli/src/database-path.ts:7:     (["latest", "dev", "beta", "next", "prod"].includes(OPENCODE_CHANNEL) ||
+packages/cli/src/database-path.ts:8:     process.env.OPENCODE_DISABLE_CHANNEL_DB === "1" ||
+packages/cli/src/database-path.ts:9:     process.env.OPENCODE_DISABLE_CHANNEL_DB === "true"
+packages/cli/src/database-path.ts:10:       ? "opencode.db"
+packages/cli/src/database-path.ts:11:       : `opencode-${OPENCODE_CHANNEL.replace(/[^a-zA-Z0-9._-]/g, "-")}.db`)
+packages/cli/src/database-path.ts:12:   return filename === ":memory:" ? filename : path.resolve(data, filename)
+packages/cli/src/database-path.ts:13: }
+packages/cli/src/index.ts:148:     }),
+packages/cli/src/index.ts:149:   ),
+packages/cli/src/index.ts:150:   Effect.provide(
+packages/cli/src/index.ts:151:     Observability.layer({
+packages/cli/src/index.ts:152:       endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+packages/cli/src/index.ts:153:       headers: process.env.OTEL_EXPORTER_OTLP_HEADERS,
+packages/cli/src/index.ts:154:       client: process.env.OPENCODE_CLIENT ?? OPENCODE_ARTIFACT,
+packages/cli/src/index.ts:155:       version: OPENCODE_VERSION,
+packages/cli/src/index.ts:156:       channel: OPENCODE_CHANNEL,
+packages/util/src/global-roots.ts:4: const home = os.homedir()
+packages/util/src/global-roots.ts:5: const data = process.env.XDG_DATA_HOME || (home ? path.join(home, ".local", "share") : undefined)
+packages/util/src/global-roots.ts:6: const cache = process.env.XDG_CACHE_HOME || (home ? path.join(home, ".cache") : undefined)
+packages/util/src/global-roots.ts:7: const config = process.env.XDG_CONFIG_HOME || (home ? path.join(home, ".config") : undefined)
+packages/util/src/global-roots.ts:8: const state = process.env.XDG_STATE_HOME || (home ? path.join(home, ".local", "state") : undefined)
+packages/util/src/global-roots.ts:9: 
+packages/util/src/global-roots.ts:10: /** The XDG base directories that root opencode's global paths. */
+packages/util/src/global-roots.ts:11: export function roots(app: string) {
+packages/util/src/global-roots.ts:12:   return {
+packages/util/src/global-roots.ts:13:     data: path.join(data!, app),
+packages/util/src/global-roots.ts:14:     cache: path.join(cache!, app),
+packages/util/src/global-roots.ts:15:     config: path.join(config!, app),
+packages/util/src/global-roots.ts:16:     state: path.join(state!, app),
+packages/util/src/global-roots.ts:17:     tmp: path.join(os.tmpdir(), app),
+packages/util/src/global-roots.ts:18:   }
+packages/util/src/global-roots.ts:19: }
+packages/util/src/global.ts:12: const app = "opencode"
+packages/util/src/global.ts:13: const { data, cache, config, state, tmp } = roots(app)
+packages/util/src/global.ts:14: 
+packages/util/src/global.ts:15: const paths = {
+packages/util/src/global.ts:16:   get home() {
+packages/util/src/global.ts:17:     return process.env.OPENCODE_TEST_HOME ?? os.homedir()
+packages/util/src/global.ts:18:   },
+packages/util/src/global.ts:19:   data,
+packages/util/src/global.ts:20:   bin: path.join(cache, "bin"),
+packages/util/src/global.ts:21:   log: path.join(data, "log"),
+packages/util/src/global.ts:22:   repos: path.join(data, "repos"),
+packages/util/src/global.ts:23:   cache,
+packages/util/src/global.ts:24:   config,
+packages/util/src/global.ts:25:   state,
+packages/util/src/global.ts:26:   tmp,
+packages/util/src/global.ts:27: }
+packages/util/src/global.ts:63: const acquire = (input: Partial<Interface>) =>
+packages/util/src/global.ts:64:   Effect.gen(function* () {
+packages/util/src/global.ts:65:     const service = Service.of(make(input))
+packages/util/src/global.ts:66:     yield* Effect.promise(() =>
+packages/util/src/global.ts:67:       Promise.all(
+packages/util/src/global.ts:68:         [service.data, service.config, service.state, service.log, service.bin, service.repos, service.tmp].map(
+packages/util/src/global.ts:69:           (directory) => fs.promises.mkdir(directory, { recursive: true }),
+packages/util/src/global.ts:70:         ),
+packages/util/src/global.ts:71:       ),
+packages/util/src/global.ts:72:     )
+packages/util/src/global.ts:73:     const canonicalTmp = yield* Effect.promise(() => fs.promises.realpath(service.tmp))
+packages/util/src/global.ts:74:     return Service.of({ ...service, tmp: input.tmp ?? canonicalTmp })
+packages/util/src/global.ts:75:   })
+packages/util/src/global.ts:76: 
+packages/util/src/global.ts:77: const layer = Layer.effect(
+packages/util/src/global.ts:78:   Service,
+packages/util/src/global.ts:79:   Effect.suspend(() => acquire({ config: process.env.OPENCODE_CONFIG_DIR ?? Path.config })),
+packages/util/src/global.ts:80: )
+packages/core/src/ripgrep/binary.ts:14: export namespace RipgrepBinary {
+packages/core/src/ripgrep/binary.ts:15:   const VERSION = "15.1.0"
+packages/core/src/ripgrep/binary.ts:16:   // SHA-256 of each release asset, from the `<asset>.sha256` files published with ripgrep 15.1.0. Release assets
+packages/core/src/ripgrep/binary.ts:17:   // can be replaced after publication, so a download is only written and run when it matches the pinned hash.
+packages/core/src/ripgrep/binary.ts:18:   const PLATFORM = {
+packages/core/src/ripgrep/binary.ts:19:     "arm64-darwin": {
+packages/core/src/ripgrep/binary.ts:20:       platform: "aarch64-apple-darwin",
+packages/core/src/ripgrep/binary.ts:21:       extension: "tar.gz",
+packages/core/src/ripgrep/binary.ts:22:       sha256: "378e973289176ca0c6054054ee7f631a065874a352bf43f0fa60ef079b6ba715",
+packages/core/src/ripgrep/binary.ts:23:     },
+packages/core/src/ripgrep/binary.ts:24:     "arm64-linux": {
+packages/core/src/ripgrep/binary.ts:25:       platform: "aarch64-unknown-linux-gnu",
+packages/core/src/ripgrep/binary.ts:26:       extension: "tar.gz",
+packages/core/src/ripgrep/binary.ts:27:       sha256: "2b661c6ef508e902f388e9098d9c4c5aca72c87b55922d94abdba830b4dc885e",
+packages/core/src/ripgrep/binary.ts:28:     },
+packages/core/src/ripgrep/binary.ts:29:     "x64-darwin": {
+packages/core/src/ripgrep/binary.ts:30:       platform: "x86_64-apple-darwin",
+packages/core/src/ripgrep/binary.ts:31:       extension: "tar.gz",
+packages/core/src/ripgrep/binary.ts:32:       sha256: "64811cb24e77cac3057d6c40b63ac9becf9082eedd54ca411b475b755d334882",
+packages/core/src/ripgrep/binary.ts:33:     },
+packages/core/src/ripgrep/binary.ts:34:     "x64-linux": {
+packages/core/src/ripgrep/binary.ts:35:       platform: "x86_64-unknown-linux-musl",
+packages/core/src/ripgrep/binary.ts:36:       extension: "tar.gz",
+packages/core/src/ripgrep/binary.ts:37:       sha256: "1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599",
+packages/core/src/ripgrep/binary.ts:38:     },
+packages/core/src/ripgrep/binary.ts:120:           Effect.gen(function* () {
+packages/core/src/ripgrep/binary.ts:121:             const system = yield* Effect.sync(() => findExecutable(process.platform === "win32" ? "rg.exe" : "rg"))
+packages/core/src/ripgrep/binary.ts:122:             if (system && (yield* fs.isFile(system).pipe(Effect.orDie))) return system
+packages/core/src/ripgrep/binary.ts:123: 
+packages/core/src/ripgrep/binary.ts:124:             const target = path.join(global.bin, `rg${process.platform === "win32" ? ".exe" : ""}`)
+packages/core/src/ripgrep/binary.ts:125:             if (yield* fs.isFile(target).pipe(Effect.orDie)) return target
+packages/core/src/ripgrep/binary.ts:126: 
+packages/core/src/ripgrep/binary.ts:127:             const platformKey = `${process.arch}-${process.platform}` as keyof typeof PLATFORM
+packages/core/src/ripgrep/binary.ts:128:             const config = PLATFORM[platformKey]
+packages/core/src/ripgrep/binary.ts:129:             if (!config) throw new Error(`unsupported platform for ripgrep: ${platformKey}`)
+packages/core/src/ripgrep/binary.ts:130: 
+packages/core/src/ripgrep/binary.ts:131:             const filename = `ripgrep-${VERSION}-${config.platform}.${config.extension}`
+packages/core/src/ripgrep/binary.ts:132:             const url = `https://github.com/BurntSushi/ripgrep/releases/download/${VERSION}/${filename}`
+packages/core/src/ripgrep/binary.ts:133:             const archive = path.join(global.bin, filename)
+packages/core/src/ripgrep/binary.ts:134: 
+packages/core/src/ripgrep/binary.ts:135:             yield* Effect.logInfo("downloading ripgrep", { url })
+packages/core/src/ripgrep/binary.ts:136:             yield* fs.ensureDir(global.bin).pipe(Effect.orDie)
+packages/core/src/ripgrep/binary.ts:137:             const bytes = yield* HttpClientRequest.get(url).pipe(
+packages/core/src/ripgrep/binary.ts:138:               http.execute,
+packages/core/src/ripgrep/binary.ts:139:               Effect.flatMap((response) => response.arrayBuffer),
+packages/core/src/filesystem/search.ts:225:     Effect.gen(function* () {
+packages/core/src/filesystem/search.ts:226:       const location = yield* Location.Service
+packages/core/src/filesystem/search.ts:227:       // Workspace-backed Locations resolve in a remote sandbox; fff would index the local server directory
+packages/core/src/filesystem/search.ts:228:       // in-process and serve wrong results. Ripgrep routes through the Location environment spawner.
+packages/core/src/filesystem/search.ts:229:       if (location.workspaceID) return ripgrepLayer
+packages/core/src/filesystem/search.ts:230:       if (options?.fff === false || (options?.fff === undefined && process.platform === "win32") || !Fff.available())
+packages/core/src/filesystem/search.ts:231:         return ripgrepLayer
+packages/core/src/filesystem/search.ts:232:       // Non-VCS locations can contain many repositories, so avoid eagerly content-indexing the entire aggregate tree.
+packages/core/src/filesystem/search.ts:233:       return location.vcs && !Protected.isHome(location.directory) ? fffLayer : ripgrepLayer
+packages/core/src/filesystem/search.ts:234:     }),
+packages/core/src/plugin/provider/sdk-factory.ts:5: export const loadSDKFactory = Effect.fnUntraced(function* (npm: Npm.Interface, packageName: string) {
+packages/core/src/plugin/provider/sdk-factory.ts:6:   const installedPath = packageName.startsWith("file://")
+packages/core/src/plugin/provider/sdk-factory.ts:7:     ? packageName
+packages/core/src/plugin/provider/sdk-factory.ts:8:     : yield* npm.add(installSpec(packageName)).pipe(
+packages/core/src/plugin/provider/sdk-factory.ts:9:         Effect.orDie,
+packages/core/src/plugin/provider/sdk-factory.ts:10:         Effect.map((installed) => resolveModule(installed.name, installed.directory)),
+packages/core/src/plugin/provider/sdk-factory.ts:11:       )
+packages/core/src/provider.ts:204: export const loadPackage = Effect.fn("Provider.loadPackage")(function* (input: string, npm?: Npm.Interface) {
+packages/core/src/provider.ts:205:   const specifier = packageName(input)
+packages/core/src/provider.ts:206:   const builtin = builtins.get(specifier)
+packages/core/src/provider.ts:207:   if (builtin) return yield* importPackage(specifier, specifier, builtin)
+packages/core/src/provider.ts:208:   const resolved = yield* Effect.sync(() => {
+packages/core/src/provider.ts:209:     if (specifier.startsWith("file://") || specifier.startsWith("@opencode/ai/")) return specifier
+packages/core/src/provider.ts:210:     try {
+packages/core/src/provider.ts:211:       return import.meta.resolve(specifier)
+packages/core/src/provider.ts:212:     } catch {
+packages/core/src/provider.ts:213:       return undefined
+packages/core/src/provider.ts:214:     }
+packages/core/src/provider.ts:215:   })
+packages/core/src/provider.ts:216:   if (resolved) return yield* importPackage(specifier, resolved)
+packages/core/src/provider.ts:217:   if (!npm) {
+packages/core/src/provider.ts:218:     return yield* new LoadError({
+packages/core/src/provider.ts:219:       package: specifier,
+packages/core/src/provider.ts:220:       cause: new Error(`Provider package ${specifier} is not installed`),
+packages/core/src/provider.ts:221:     })
+packages/core/src/provider.ts:222:   }
+packages/core/src/provider.ts:223:   const parts = specifier.split("/")
+packages/core/src/provider.ts:224:   const root = specifier.startsWith("@") ? parts.slice(0, 2).join("/") : (parts[0] ?? specifier)
+packages/core/src/provider.ts:225:   const installed = yield* npm.add(root).pipe(Effect.mapError((cause) => new LoadError({ package: specifier, cause })))
+packages/core/src/provider.ts:226:   const entrypoint = yield* Effect.try({
+packages/core/src/persistent-pty/binary.bun.ts:8: export async function resolveBinary(bin: string) {
+packages/core/src/persistent-pty/binary.bun.ts:9:   if (process.env.OPENCODE_PTY_BIN) return process.env.OPENCODE_PTY_BIN
+packages/core/src/persistent-pty/binary.bun.ts:10:   if (!asset) return "opencode-pty"
+packages/core/src/persistent-pty/binary.bun.ts:11:   if (typeof asset === "string") return asset
+packages/core/src/persistent-pty/binary.bun.ts:12:   return install(bin, asset)
+packages/core/src/persistent-pty/binary.bun.ts:13: }
+packages/core/src/persistent-pty/binary.bun.ts:15: async function install(
+packages/core/src/persistent-pty/binary.bun.ts:16:   bin: string,
+packages/core/src/persistent-pty/binary.bun.ts:17:   input: { readonly path: string; readonly version: string; readonly sha256: string },
+packages/core/src/persistent-pty/binary.bun.ts:18: ) {
+packages/core/src/persistent-pty/binary.bun.ts:19:   const root = path.join(bin, "opencode-pty")
+packages/core/src/persistent-pty/binary.bun.ts:20:   await privateDirectory(root)
+packages/core/src/persistent-pty/binary.bun.ts:21:   const directory = path.join(root, `${input.version}-${input.sha256.slice(0, 16)}`)
+packages/core/src/persistent-pty/binary.bun.ts:22:   await privateDirectory(directory)
+packages/core/src/persistent-pty/binary.bun.ts:23:   // Windows only launches executables with their extension.
+packages/core/src/persistent-pty/binary.bun.ts:24:   const destination = path.join(directory, process.platform === "win32" ? "opencode-pty.exe" : "opencode-pty")
+packages/core/src/persistent-pty/binary.bun.ts:25:   if (await validateIfPresent(destination, input.sha256)) return destination
+packages/core/src/persistent-pty/binary.bun.ts:26: 
+packages/core/src/persistent-pty/binary.bun.ts:27:   const bytes = new Uint8Array(await Bun.file(input.path).arrayBuffer())
+packages/core/src/persistent-pty/binary.bun.ts:28:   if (sha256(bytes) !== input.sha256) throw new Error("Embedded opencode-pty checksum mismatch")
+packages/cli/script/build.ts:40: const allTargets: {
+packages/cli/script/build.ts:41:   os: string
+packages/cli/script/build.ts:42:   arch: "arm64" | "x64"
+packages/cli/script/build.ts:43:   abi?: "musl"
+packages/cli/script/build.ts:44:   avx2?: false
+packages/cli/script/build.ts:45: }[] = [
+packages/cli/script/build.ts:46:   { os: "linux", arch: "arm64" },
+packages/cli/script/build.ts:47:   { os: "linux", arch: "x64" },
+packages/cli/script/build.ts:48:   { os: "linux", arch: "x64", avx2: false },
+packages/cli/script/build.ts:49:   { os: "linux", arch: "arm64", abi: "musl" },
+packages/cli/script/build.ts:50:   { os: "linux", arch: "x64", abi: "musl" },
+packages/cli/script/build.ts:51:   { os: "linux", arch: "x64", abi: "musl", avx2: false },
+packages/cli/script/build.ts:52:   { os: "darwin", arch: "arm64" },
+packages/cli/script/build.ts:53:   { os: "darwin", arch: "x64" },
+packages/cli/script/build.ts:54:   { os: "darwin", arch: "x64", avx2: false },
+packages/cli/script/build.ts:55:   { os: "win32", arch: "arm64" },
+packages/cli/script/build.ts:56:   { os: "win32", arch: "x64" },
+packages/cli/script/build.ts:57:   { os: "win32", arch: "x64", avx2: false },
+packages/cli/script/build.ts:58: ]
+.github/workflows/release.yml:584:   # Build provenance for the npm tarballs and Linux archives. No secrets; id-token only for Sigstore.
+.github/workflows/release.yml:585:   publish-attestations:
+.github/workflows/release.yml:586:     needs: [plan, build-npm]
+.github/workflows/release.yml:587:     if: ${{ !cancelled() && !failure() && needs.plan.outputs.cli == 'true' && needs.plan.outputs.dry_run != 'true' }}
+.github/workflows/release.yml:588:     runs-on: ubuntu-24.04
+.github/workflows/release.yml:589:     permissions:
+.github/workflows/release.yml:590:       contents: read
+.github/workflows/release.yml:591:       id-token: write
+.github/workflows/release.yml:592:       attestations: write
+.github/workflows/release.yml:593:     steps:
+.github/workflows/release.yml:594:       - *checkout-release
+.github/workflows/release.yml:595:       - name: Download
+.github/workflows/release.yml:596:         uses: ./.github/release/download
+.github/workflows/release.yml:597:         with:
+.github/workflows/release.yml:598:           pattern: "{build-npm,build-archives}"
+.github/workflows/release.yml:599:       - name: Sign
+.github/workflows/release.yml:600:         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+.github/workflows/release.yml:601:         with:
+.github/workflows/release.yml:602:           subject-path: |
+.github/workflows/release.yml:603:             ${{ runner.temp }}/in/build-npm/*.tgz
+.github/workflows/release.yml:604:             ${{ runner.temp }}/in/build-archives/opencode*
+services/site/src/docs/content/index.mdx:33: Download a standalone CLI binary for your platform.
+services/site/src/docs/content/index.mdx:34: 
+services/site/src/docs/content/index.mdx:35: - **macOS:** [Apple silicon](https://opencode.ai/update/api/latest/cli/opencode/opencode-darwin-arm64.zip) · [Intel](https://opencode.ai/update/api/latest/cli/opencode/opencode-darwin-x64.zip) · [Intel (baseline)](https://opencode.ai/update/api/latest/cli/opencode/opencode-darwin-x64-baseline.zip)
+services/site/src/docs/content/index.mdx:36: - **Windows:** [ARM64](https://opencode.ai/update/api/latest/cli/opencode/opencode-windows-arm64.zip) · [x64](https://opencode.ai/update/api/latest/cli/opencode/opencode-windows-x64.zip) · [x64 (baseline)](https://opencode.ai/update/api/latest/cli/opencode/opencode-windows-x64-baseline.zip)
+services/site/src/docs/content/index.mdx:37: - **Linux (glibc):** [ARM64](https://opencode.ai/update/api/latest/cli/opencode/opencode-linux-arm64.tar.gz) · [x64](https://opencode.ai/update/api/latest/cli/opencode/opencode-linux-x64.tar.gz) · [x64 (baseline)](https://opencode.ai/update/api/latest/cli/opencode/opencode-linux-x64-baseline.tar.gz)
+services/site/src/docs/content/index.mdx:38: - **Linux (musl):** [ARM64](https://opencode.ai/update/api/latest/cli/opencode/opencode-linux-arm64-musl.tar.gz) · [x64](https://opencode.ai/update/api/latest/cli/opencode/opencode-linux-x64-musl.tar.gz) · [x64 (baseline)](https://opencode.ai/update/api/latest/cli/opencode/opencode-linux-x64-baseline-musl.tar.gz)
+services/site/src/docs/content/cli/providers.mdx:128: ## Storage
+services/site/src/docs/content/cli/providers.mdx:129: 
+services/site/src/docs/content/cli/providers.mdx:130: Saved API keys and OAuth tokens live in the server's SQLite database. For the local server, print its database path with:
+services/site/src/docs/content/cli/providers.mdx:131: 
+services/site/src/docs/content/cli/providers.mdx:132: ```bash
+services/site/src/docs/content/cli/providers.mdx:133: opencode debug paths db
+services/site/src/docs/content/cli/providers.mdx:134: ```
+services/site/src/docs/content/cli/providers.mdx:135: 
+services/site/src/docs/content/cli/providers.mdx:136: The usual release path is `~/.local/share/opencode/opencode.db`; `XDG_DATA_HOME`, the release channel, and `OPENCODE_DB`
+services/site/src/docs/content/cli/providers.mdx:137: can change it. Do not edit the database to manage credentials; use `/connect` or the `auth` commands.
+services/site/src/docs/content/cli/providers.mdx:138: 
+services/site/src/docs/content/cli/providers.mdx:139: V2 imports supported credentials from the legacy `auth.json` in the OpenCode data directory during its database
+services/site/src/docs/content/cli/providers.mdx:140: migration. New and updated credentials are stored in SQLite rather than written back to that file.
+services/site/src/docs/content/cli/acp.mdx:6: `opencode acp` runs OpenCode as an [Agent Client Protocol](https://agentclientprotocol.com) agent, so you can use it
+services/site/src/docs/content/cli/acp.mdx:7: from an ACP client such as Zed. This example adds OpenCode to Zed:
+services/site/src/docs/content/cli/acp.mdx:8: 
+services/site/src/docs/content/cli/acp.mdx:9: ```json title="~/.config/zed/settings.json"
+services/site/src/docs/content/cli/acp.mdx:10: {
+services/site/src/docs/content/cli/acp.mdx:11:   "agent_servers": {
+services/site/src/docs/content/cli/acp.mdx:12:     "OpenCode": {
+services/site/src/docs/content/cli/acp.mdx:13:       "command": "opencode",
+services/site/src/docs/content/cli/acp.mdx:14:       "args": ["acp"]
+services/site/src/docs/content/cli/acp.mdx:15:     }
+services/site/src/docs/content/cli/acp.mdx:16:   }
+services/site/src/docs/content/cli/acp.mdx:17: }
+services/site/src/docs/content/cli/acp.mdx:18: ```
+services/site/src/docs/content/cli/acp.mdx:19: 
+services/site/src/docs/content/cli/acp.mdx:20: Other ACP clients use the same command and `acp` argument, but their configuration file and field names may differ. If
+services/site/src/docs/content/cli/index.mdx:72: 
+services/site/src/docs/content/cli/index.mdx:73: Print a specific local path for use with other tools:
+services/site/src/docs/content/cli/index.mdx:74: 
+services/site/src/docs/content/cli/index.mdx:75: ```bash
+services/site/src/docs/content/cli/index.mdx:76: opencode debug paths db
+services/site/src/docs/content/cli/index.mdx:77: sqlite3 "$(opencode debug paths db)"
+services/site/src/docs/content/cli/index.mdx:78: ```
+services/site/src/docs/content/cli/index.mdx:79: 
+services/site/src/docs/content/cli/index.mdx:80: The optional selector accepts `db`, `home`, `data`, `config`, `cache`, `state`, `tmp`, `bin`, `log`, or `repos` and prints
+services/site/src/docs/content/cli/index.mdx:81: only the path and a newline. The database path respects the release channel and `OPENCODE_DB`; relative database overrides
+services/site/src/docs/content/cli/index.mdx:82: resolve under the data directory, and `:memory:` is printed as-is. This command does not start a server or open the database.
+services/site/src/docs/content/cli/index.mdx:83: 
+packages/web/src/content/docs/index.mdx:10: :::note
+packages/web/src/content/docs/index.mdx:11: OpenCode 1 and OpenCode 2 both use the `opencode` command and cannot be installed side by side under their default command.
+packages/web/src/content/docs/index.mdx:12: See the [OpenCode 2 docs](https://opencode.ai/docs/) to migrate to V2.
+packages/web/src/content/docs/index.mdx:13: :::
+packages/web/src/content/docs/cli.mdx:756: | `OPENCODE_CONFIG_DIR`                 | string  | Path to config directory                                                     |
+packages/web/src/content/docs/cli.mdx:757: | `OPENCODE_CONFIG_CONTENT`             | string  | Inline json config content                                                   |
+packages/web/src/content/docs/cli.mdx:758: | `OPENCODE_DISABLE_AUTOUPDATE`         | boolean | Disable automatic update checks                                              |
+LICENSE:1: MIT License
+LICENSE:2: 
+LICENSE:3: Copyright (c) 2025 opencode
+LICENSE:4: 
+LICENSE:5: Permission is hereby granted, free of charge, to any person obtaining a copy

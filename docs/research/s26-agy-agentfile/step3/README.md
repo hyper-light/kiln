@@ -149,23 +149,68 @@ a96c0ecd1edabfb7e9736f25404601dc8002aea5d627dafe5c34e1aff37a442b. Nothing left i
 - R09 Reproduce: the gap is a contract's, not a defect: the agreed member passes over every other entry
   by design (a_member_not_held_alone_passes_over_what_is_beside_it shows it, and pi needs it).
 - R10 Evidence: this record, its harnesses, the logs; mutants each killed (mutate.py).
-- R11 Platforms: Linux x86_64 (r9, r12) and macOS arm64 (r11, r15, r17, r19) run; Linux arm64 and
-  Windows unrun, so unverified (the code has no platform branch beside the module's existing Unix-only
-  modes).
+- R11 Platforms: Linux x86_64 (r9, r12, adacachy at the landed tree) and macOS arm64 (r11, r15, r17,
+  r19, r1 at the landed tree) run; Linux arm64 and Windows unrun, so unverified (the code has no platform
+  branch beside the module's existing Unix-only modes).
 - R12 Shared: one fetcher (step 19's), one hook (step 28's), one unpacker (step 25's, as step 27 put it);
   this step adds a field to it and writes no second anything.
 - R13 Simple: one optional field, one Why, one state type, one helper.
-- R15 Role: implementer; light tests and the step's live test only. Landing is the plan's step 6, the
-  coordinator's, with the person's word.
+- R15 Role: implementer; light tests and the step's live test only. ROOT's landing batch merged this
+  branch at 51af39c6d into kiln main as 6e48ee58b (2026-11-12T20:05Z), the code and its tests; this
+  record's later commits land by fast-forward.
 - R16 Space: every run made one ~/.cache directory and removed it (each log's END line); the targets
   (17-18 GB on the Mac Studio) went with them.
 
+## Landing (ROOT's word, 2026-11-12)
+
+On kiln main: 6e48ee58b, ROOT's landing batch's merge of s26-unpack at 51af39c6d (the unpacker's
+`alone`, step 28's hook, agy's pin with `alone`, the tests). The runs below test the branch with main
+ed0c9d3bd merged in, the tree this record's last commits sit on.
+
+ROOT's goal for plan step 26 (on ROOT's stack, agent 01a148884a4770fdaf0111f3f792a248): "put the shared
+unpacker on kiln main (your s26-unpack-core / s26-unpack: agentfiles unpack, the context hook and their
+tests). It's THE one unpacker, and steps 20, 22, 23, 25, 27 and 28 wait on it." With its rules: test this
+change only, merge origin/main in, push to kiln main (never force), report the SHA, what ran and what's
+owed, and end; a platform without room is owed. Step 25's goal names this branch the one unpacker,
+replacing step 25's own (s25-unpack).
+
+- 95fada35b merges kiln main ed0c9d3bd (step 27's Cursor row beside Antigravity's) into s26-unpack:
+  `git merge-tree` gave tree 1ba53cf7688dee9ed59c8777c3e34d17ed71ad13 and the merge has it. Cursor's pin
+  unpacks as a tree ({format, strip, unpacked_bytes, entries}), the agreed form.
+- r1 after kiln's restart, at 95fada35b, on the Mac Studio (macOS arm64): kiln's agentfiles tests 75 of
+  75 (Cursor's five among them, with the unpacker present); clippy -D warnings on kiln --all-targets exit
+  0 (evidence/e_land_macstudio.txt).
+- adacachy (Linux x86_64, rustc 1.99.1) over ssh, as ROOT's rules allow when kiln's runners are busy, at
+  95fada35b: kiln's agentfiles tests 75 of 75; the live context of Google's two archives through the
+  CLI's own `run` in the test binary, MATCH 2 of 2 (each bin/agy the pin's member at 0755, harness.json
+  the embedded one, nothing left) and `antigravity-amd64/bin/agy --version` printing `1.5.7`, the pin's
+  version, as its first line; clippy -D warnings on kiln --all-targets exit 0
+  (evidence/e_land_adacachy.txt, copied while kiln itself was still being built for the literal CLI
+  run, which is extra to the step's tests).
+- The merge commit was signed through the runner's harness socket: the restarted session had lost
+  `KILN_HARNESS_SOCK` (kiln-git-sign: "not in a kiln shell"); its signature verifies against kiln's
+  agent CA (O=hyper-light), as this step's earlier commits do.
+
+## The step's live test, word for word (kiln main edba77bdb)
+
+kiln built itself, then `kiln agentfiles context antigravity DIR --platform linux/amd64,linux/arm64`
+(scripts/cli-run.sh), at kiln main edba77bdb, whose agy pin, unpack.rs and context.rs are the bytes
+tested above:
+
+| Where | Result |
+|---|---|
+| adacachy, Linux x86_64 (evidence/e_cli_adacachy.txt) | exit 0; DIR holds the Agentfile (the embedded one), antigravity-amd64/ and antigravity-arm64/ alone; each harness.json the embedded one; each bin/agy 0755 with the pin's member SHA-256 and size (2 of 2, sha256sum); `antigravity-amd64/bin/agy --version` printed `1.5.7` (31 2e 35 2e 37 0a), the pin's version |
+| Mac Studio, macOS arm64 (evidence/e_cli_macstudio.txt) | the same, 2 of 2; --version not run (macOS runs no Linux binary) |
+
+The context command took 10 s on adacachy and 105 s on the Mac Studio, single observations of Google's
+storage, not claims.
+
 ## Open
 
-- The Linux run at the final revision (r18: kiln's agentfiles tests, the live context in the test binary,
-  clippy, and `kiln agentfiles context antigravity DIR --platform linux/amd64,linux/arm64` by kiln itself
-  with `antigravity-amd64/bin/agy --version`) waits for a Linux runner with room.
-- Landing: s26-unpack holds step 28's hook (held by step 28, refs/s28-hold/unpack-hook-on-s27, its step 8
-  lands it) and the coordinator's s26-agy-agentfile. It lands after them, by the coordinator's step 6.
-- Step 20's s20-unpack 40af1af26 is a second hook, on the withdrawn s19-fetcher; step 28's record says
-  one should land. Not this step's to settle.
+- Owed, platforms without a run: Windows (no run of this branch there), Linux arm64. The step's own
+  tests passed on Linux x86_64 and macOS arm64 at the landed tree.
+- ROOT's, by the rules: image builds, smokes and real-VM runs of harness-antigravity.
+- Step 28's hook (73fc55df9, 8e571d7d8) lands with this branch, as ROOT asked; step 28's record commit
+  (a753c91f7, refs/s28-hold/unpack-hook-on-s27) is step 28's to land.
+- Step 20's s20-unpack 40af1af26 is a second hook, on the withdrawn s19-fetcher: it conflicts with main's
+  fetcher, and is step 20's to drop now that this one is on main.

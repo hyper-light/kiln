@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "name": "pi",
+  "version": "1.5.2",
+  "run": {
+    "command": ["pi", "--mode", "rpc"],
+    "env": ["PI_CODING_AGENT_DIR=/home/pi/.pi/agent", "PI_SKIP_VERSION_CHECK=1"]
+  }
+}

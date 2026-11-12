@@ -1048,8 +1048,8 @@ fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
         return;
     }
     // Each shard's entries by what the exposition names them (two labels of one name are one series): polls,
-    // their time, the longest, those of them the host held with their time, and those whose thread said its time on
-    // the CPU with their holds, that time and the longest of it.
+    // their time, the longest, those of them the host held with their time, those whose thread said its time on
+    // the CPU with their holds, that time and the longest of it, and those past the step quantum.
     #[derive(Default)]
     struct Row {
         polls: u64,
@@ -1061,6 +1061,8 @@ fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
         cpu_held_ns: u64,
         cpu_ns: u64,
         longest_cpu: u64,
+        past_polls: u64,
+        past_cpu_polls: u64,
     }
     let mut rows: std::collections::BTreeMap<(usize, String, &'static str), Row> = std::collections::BTreeMap::new();
     for (i, holder) in crate::rt::shard_holders().into_iter().take(shards().len()).enumerate() {
@@ -1076,6 +1078,8 @@ fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
             row.cpu_held_ns = row.cpu_held_ns.saturating_add(p.cpu_held_ns);
             row.cpu_ns = row.cpu_ns.saturating_add(p.cpu_ns);
             row.longest_cpu = row.longest_cpu.max(p.longest_cpu_ns);
+            row.past_polls = row.past_polls.saturating_add(p.past_polls);
+            row.past_cpu_polls = row.past_cpu_polls.saturating_add(p.past_cpu_polls);
         }
     }
     let series = |o: &mut String, name: &str, value: &dyn Fn(&Row) -> String| {
@@ -1104,6 +1108,12 @@ fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
     series(o, "kiln_shard_held_cpu_seconds_total", &|r| secs(Duration::from_nanos(r.cpu_ns)).to_string());
     help(o, "kiln_shard_held_longest_cpu_seconds", "gauge", "The longest any of them ran on the CPU.");
     series(o, "kiln_shard_held_longest_cpu_seconds", &|r| secs(Duration::from_nanos(r.longest_cpu)).to_string());
+    // Goal 9, plan 01a1a87b2cec step 3: what passed the step quantum, counted, so a reader of two scrapes can say whether
+    // a poll passed it between them (the longest above is since the shard started).
+    help(o, "kiln_shard_held_past_quantum_polls_total", "counter", "Of those polls, the ones that held their shard past the step quantum it ran them with.");
+    series(o, "kiln_shard_held_past_quantum_polls_total", &|r| r.past_polls.to_string());
+    help(o, "kiln_shard_held_cpu_past_quantum_polls_total", "counter", "Of those polls, the ones that ran on the CPU past the step quantum (Linux).");
+    series(o, "kiln_shard_held_cpu_past_quantum_polls_total", &|r| r.past_cpu_polls.to_string());
 }
 
 /// A label's value as the exposition writes it: its backslashes, quotes and line ends escaped.

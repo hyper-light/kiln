@@ -2,7 +2,9 @@
 //! pi's shape are fetched from kiln's own HTTP server in the test: pi's tree with `pi/` stripped at the
 //! harness directory's root, then ripgrep's and fd's members at bin/. So are agy's (plan
 //! 01a1ce705e55753182217afdfe607de9, step 3): each archive's one entry, the member antigravity held
-//! alone, at bin/agy. So are Devin's (plan 01a1ce705e4d7008993f5c7291ef4476, step 2), through kiln's own
+//! alone, at bin/agy. So are opencode's (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 22): for each
+//! libc, each archive's one entry, the member opencode held alone, at bin/opencode, and LICENSE beside it,
+//! a plain file. So are Devin's (plan 01a1ce705e4d7008993f5c7291ef4476, step 2), through kiln's own
 //! Agentfile and harness.json for it: each bundle a tree at the harness directory's root, stripped of
 //! nothing. Each archive the unpacker refuses comes back as its typed error, naming its URL and its entry,
 //! and leaves nothing behind; one of another digest or size is never opened.
@@ -409,6 +411,78 @@ fn step26_an_agy_archive_failing_a_check_leaves_nothing() -> anyhow::Result<()> 
         })?;
     }
     Ok(())
+}
+
+const OPENCODE_AGENTFILE: &str = "FROM scratch\nARG TARGETARCH\nARG OPENCODE_LIBC=gnu\nHARNESS opencode FROM ./opencode-${TARGETARCH}-${OPENCODE_LIBC}\n";
+const OPENCODE_HARNESS_JSON: &str = "{\"schemaVersion\":1,\"name\":\"opencode\"}\n";
+const OPENCODE_LICENSE: &[u8] = b"MIT License\n";
+
+/// opencode's binary for `arch` and `libc`, as its release archive holds it, in small.
+fn opencode(arch: &str, libc: &str) -> Vec<u8> {
+    format!("#!/bin/sh\necho opencode v2.2.7 {arch} {libc}\n").into_bytes()
+}
+
+/// One build of opencode's shape (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 22), as the test's server
+/// serves it and as opencode's pin.sh pins the release: its archive by its own SHA-256 and size, unpacked
+/// from its one entry, the member opencode held alone, to bin/opencode at 0755; then LICENSE beside it, a
+/// plain file at 0644, for each platform and libc.
+fn opencode_build(origin: &str, arch: &str, libc: &str) -> anyhow::Result<(Vec<(String, Vec<u8>)>, Value)> {
+    let bin = opencode(arch, libc);
+    let gz = targz(&[file("opencode", 0o755, &bin)])?;
+    let path = format!("/v2.2.7/opencode-linux-{arch}-{libc}.tar.gz");
+    let archive = json!({ "url": format!("{origin}{path}"), "sha256": sha(&gz), "size": gz.len(), "path": "bin/opencode", "mode": "0755",
+        "unpack": { "format": "tar.gz", "member": "opencode", "alone": true, "sha256": sha(&bin), "size": bin.len() } });
+    let license = json!({ "url": format!("{origin}/LICENSE"), "sha256": sha(OPENCODE_LICENSE), "size": OPENCODE_LICENSE.len(), "path": "LICENSE", "mode": "0644" });
+    Ok((vec![(path, gz)], json!({ "platform": format!("linux/{arch}"), "variant": libc, "files": [archive, license] })))
+}
+
+/// A context of opencode's shape, for linux/amd64 and linux/arm64 in the libc asked, holds the Agentfile
+/// and opencode-<arch>-<libc>/ for that libc alone, and nothing else: no staging directory, no archive.
+/// Each holds harness.json, bin/opencode (its archive's one entry, its own arch's and libc's bytes, at
+/// 0755) and LICENSE (0644), the plain file pinned beside the archive.
+#[test]
+fn step22_an_opencode_shaped_context_holds_bin_opencode_and_its_license_as_pinned() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let mut builds = Vec::new();
+        let origin = serve(|o| {
+            let mut routes = vec![("/LICENSE".to_owned(), OPENCODE_LICENSE.to_vec())];
+            for arch in ["amd64", "arm64"] {
+                for libc in ["gnu", "musl"] {
+                    let (r, b) = opencode_build(o, arch, libc)?;
+                    routes.extend(r);
+                    builds.push(b);
+                }
+            }
+            Ok(routes)
+        })
+        .await?;
+        let pin = json!({ "version": "2.2.7", "verified": "by the test", "builds": builds }).to_string();
+        let b = Builtin { name: "harness-opencode", harness: "opencode", text: OPENCODE_AGENTFILE, pin: pin.leak(), files: &[("harness.json", OPENCODE_HARNESS_JSON)] };
+        for libc in ["gnu", "musl"] {
+            let tmp = tempfile::tempdir()?;
+            let ctx = tmp.path().join("ctx");
+
+            let made = materialize(&b, &both(), Some(libc), &ctx).await?;
+
+            let dirs = [format!("opencode-amd64-{libc}"), format!("opencode-arm64-{libc}")];
+            assert_eq!(made, dirs.iter().map(|d| ctx.join(d)).collect::<Vec<_>>(), "{libc} from {origin}");
+            let mut want = set(["Agentfile"]);
+            want.extend(dirs.iter().cloned());
+            assert_eq!(names(&ctx)?, want, "{libc}");
+            assert_eq!(std::fs::read_to_string(ctx.join("Agentfile"))?, OPENCODE_AGENTFILE);
+            for arch in ["amd64", "arm64"] {
+                let d = ctx.join(format!("opencode-{arch}-{libc}"));
+                assert_eq!(names(&d)?, set(["LICENSE", "bin", "harness.json"]), "{arch} {libc}");
+                assert_eq!(names(&d.join("bin"))?, set(["opencode"]), "{arch} {libc}");
+                assert_eq!(std::fs::read(d.join("bin/opencode"))?, opencode(arch, libc), "{arch} {libc}");
+                assert_eq!(std::fs::read(d.join("LICENSE"))?, OPENCODE_LICENSE, "{arch} {libc}");
+                assert_eq!(std::fs::read_to_string(d.join("harness.json"))?, OPENCODE_HARNESS_JSON, "{arch} {libc}");
+                #[cfg(unix)]
+                assert_eq!((mode(&d.join("bin/opencode"))?, mode(&d.join("LICENSE"))?), (0o755, 0o644), "{arch} {libc}");
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Devin's built-in (kiln plan 01a1ce705e4d7008993f5c7291ef4476, step 2) for a test: kiln's own Agentfile

@@ -402,6 +402,11 @@ const UNLISTED_ROWS: usize = 5;
 /// poll as long), its polls past 100 µs a second in the window and the share of their time the host was found to hold
 /// (preempted: step 4's, not the code's); then what else passed the quantum. The quantum is the least the rounds say
 /// their shards ran with (`Round::quantum_us`, or `kiln-lab report --quantum-us`).
+///
+/// A round passed the quantum where a poll did in its fill or its window, as the server counted them
+/// (`Held::past_polls`, `Held::past_cpu_polls`); with a build from before it counted, where the longest since the server
+/// started did, which takes in what the server did before the fill (its runners connecting: their first messages' polls
+/// stood for every round, goal 9's step 3).
 fn listed_markdown(rounds: &[&Round]) -> String {
     /// A path's longest poll, its site and label, the rounds past the quantum, its window's polls past 100 µs a
     /// second (all rounds' added), and their time and the host's.
@@ -438,17 +443,27 @@ fn listed_markdown(rounds: &[&Round]) -> String {
     let mut probe_most_ms = 0.0_f64;
     for r in rounds {
         let mut longest_here = vec![0.0_f64; LISTED.len()];
-        let mut longest_cpu_here = vec![0.0_f64; LISTED.len()];
+        let (mut past_here, mut past_cpu_here) = (vec![false; LISTED.len()], vec![false; LISTED.len()]);
         let probe_ms = r.held.iter().chain(r.fill_held.iter()).filter(|h| is_probe(&h.site)).map(|h| h.longest_ms).fold(0.0_f64, f64::max);
         probe_most_ms = probe_most_ms.max(probe_ms);
         for (in_window, h) in r.held.iter().map(|h| (true, h)).chain(r.fill_held.iter().map(|h| (false, h))) {
+            // Whether a poll passed the quantum in this phase, by its hold and on the CPU.
+            let (past, past_cpu) = match quantum_ms {
+                Some(_) if h.counts_past => (h.past_polls > 0.0, h.past_cpu_polls > 0.0),
+                Some(q) => (h.longest_ms > q, h.cpu_polls > 0.0 && h.longest_cpu_ms > q),
+                None => (false, false),
+            };
             let Some(i) = listed(&h.site, &h.label, &net, &http) else {
-                if quantum_ms.is_some_and(|q| h.longest_ms > q) {
+                if past {
                     let most = unlisted.entry((h.site.clone(), h.label.clone())).or_default();
                     *most = most.max(h.longest_ms);
                 }
                 continue;
             };
+            if let (Some(p), Some(c)) = (past_here.get_mut(i), past_cpu_here.get_mut(i)) {
+                *p |= past;
+                *c |= past_cpu;
+            }
             let Some(p) = paths.get_mut(i) else { continue };
             p.seen = true;
             if h.longest_ms > p.longest_ms {
@@ -466,22 +481,17 @@ fn listed_markdown(rounds: &[&Round]) -> String {
             if h.cpu_polls > 0.0 {
                 p.cpu_seen = true;
                 p.longest_cpu_ms = p.longest_cpu_ms.max(h.longest_cpu_ms);
-                if let Some(most) = longest_cpu_here.get_mut(i) {
-                    *most = most.max(h.longest_cpu_ms);
-                }
             }
         }
-        if let Some(q) = quantum_ms {
-            for ((p, most), cpu) in paths.iter_mut().zip(&longest_here).zip(&longest_cpu_here) {
-                if *most > q {
-                    p.past += 1;
-                    if *most > probe_ms {
-                        p.past_probe += 1;
-                    }
+        for (((p, most), past), past_cpu) in paths.iter_mut().zip(&longest_here).zip(&past_here).zip(&past_cpu_here) {
+            if *past {
+                p.past += 1;
+                if *most > probe_ms {
+                    p.past_probe += 1;
                 }
-                if *cpu > q {
-                    p.past_cpu += 1;
-                }
+            }
+            if *past_cpu {
+                p.past_cpu += 1;
             }
         }
     }
@@ -701,5 +711,26 @@ mod tests {
         let held_md = held_markdown([&r].into_iter(), "the window", |r| &r.held);
         assert!(held_md.contains("Of those holds, 25% on the CPU (kiln's code ran) and 75% off it"), "{held_md}");
         assert!(held_md.contains("| 25% | 0.200 |"), "{held_md}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: where the server counts its polls past the quantum, a round passed it where one did
+    /// in its fill or its window, by its hold and on the CPU; a longest since the server started (its runners connecting,
+    /// before the fill) is no round's, though it's still the path's longest.
+    #[test]
+    fn g9_s3_a_round_passed_the_quantum_where_a_poll_did_in_it() {
+        let net = "crates/kiln/src/server.rs:170:9";
+        let counted = |site: &str, label: &str, longest_ms: f64, past_polls: f64, past_cpu_polls: f64| Held { cpu_polls: 10.0, cpu_held_ms: 2.0, cpu_ms: 0.5, longest_cpu_ms: longest_ms, past_polls, past_cpu_polls, counts_past: true, ..held(site, label, longest_ms) };
+        // The net loop's longest, 0.9 ms, from before the fill: none past the quantum in the round. The owners passed it
+        // in the fill, on the CPU too.
+        let r = round(vec![counted(net, "runner AgentMsg::Offers { .. }", 0.9, 0.0, 0.0)], vec![counted("crates/kiln/src/harness/copies.rs:1480:13", "owner Update::Events { .. }", 0.4, 2.0, 1.0)], Some(266.666));
+        let md = listed_markdown(&[&r]);
+        assert!(md.contains("listed: **not met**, 1 of 11 past it."), "{md}");
+        assert!(md.contains("On the CPU, by the shards' own clocks (kiln's code alone, the host's time left out): **not met**, 1 of 11 ran past it."), "{md}");
+        let row = |name: &str| md.lines().find(|l| l.starts_with(&format!("| {name} |"))).unwrap_or_default().to_owned();
+        assert!(row("the hub's net loop (its labels `runner …`)").contains("| 0.900 | `crates/kiln/src/server.rs:170:9` runner AgentMsg::Offers { .. } | 0 of 1 (0) |"), "{md}");
+        assert!(row("the hub's net loop (its labels `runner …`)").ends_with("| 0.900 | 0 of 1 |"), "{md}");
+        assert!(row("sessions' owners (`harness/copies.rs`)").ends_with("| 0.400 | 1 of 1 |"), "{md}");
+        let calm = round(vec![counted(net, "runner AgentMsg::Offers { .. }", 0.9, 0.0, 0.0)], vec![], Some(266.666));
+        assert!(listed_markdown(&[&calm]).contains("from the paths step 2 listed: **met**."), "none past it in the round");
     }
 }

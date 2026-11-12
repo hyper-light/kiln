@@ -4200,8 +4200,8 @@ impl Hub {
                 crate::reach::Question::Keep { report } => {
                     let (hub, runner) = (Arc::clone(self), agent.to_owned());
                     crate::rt::spawn(async move {
-                        let answer = hub.copies.heard(&hub, &runner, report.as_ref()).await;
-                        hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                        let json = hub.copies.heard(&hub, &runner, report).await;
+                        hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json }).await;
                     });
                 }
                 // Which runner holds which object of the runners' caches (docs/ci.md W24-R27).

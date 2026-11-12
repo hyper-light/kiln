@@ -1,0 +1,44 @@
+# adacachy (Linux x86_64, rustc 1.99.1) over ssh, as ROOT's rules allow when kiln's runners are busy: cli-run.sh 006ac4493cb6d29b56cda19e35cfce87c1a882a446014982940da94e9ee1d72f (the portable copy committed beside it, e0446b6c, differs only in using shasum where sha256sum is missing, listing with python rather than GNU find, and skipping --version off Linux) at kiln main edba77bdb, started 2026-11-12T22:18:59Z under nohup. kiln built itself, then ran `kiln agentfiles context antigravity DIR --platform linux/amd64,linux/arm64` (exit 0): DIR held the Agentfile (the embedded one) and antigravity-amd64/ and antigravity-arm64/ alone, each with harness.json (the embedded one) and bin/agy, 0755, hashing to the pin's member SHA-256 and size, 2 of 2; antigravity-amd64/bin/agy --version printed 1.5.7, the pin's version, as its first line. Log sha256 on adacachy 8dd1f07b26780bcdf2fca915ec0dd0cd580c2a7bf3036d6b14109ff824dd9279, checked here.
+START host adacachy Linux 7.2.9-2-cachyos x86_64 at 2026-11-12T22:18:59Z rev edba77bdbf35d313769b492470160ae3938080db load 129.68
+HEAD edba77bdbf35d313769b492470160ae3938080db dirty 0
+dafc262048e643acc6274c307800482fccdc9a9c48d847c4de966fa66ffed138  .kiln/images/harness-antigravity/pin.json
+06c38aa2545e23cbc882ecad4521d1f5721e1c5bc6300668fa0431caf9644fb4  .kiln/images/harness-antigravity/harness.json
+819f797e99508218f43c335fa5c4ef36fc267e5eb6847c70e5507538d8e55ccf  .kiln/images/harness-antigravity/Agentfile
+344b17f786d4c2bc38b20a4edb6d032b11bc50b5be25f2a02b35603bafd01ad6  crates/kiln/src/agentfiles/unpack.rs
+97b9ea3f743bd8313056abf8863b29485ccbe2738d4224c936b4f818882e69a9  crates/kiln/src/agentfiles/context.rs
+cargo 1.99.1 (5f94df478 2026-08-27)
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11m 59s
+BUILD EXIT 0 after 720 s
+== /home/adalundhe/.cache/s26-cli.Rzonwh/target/debug/kiln agentfiles context antigravity /home/adalundhe/.cache/s26-cli.Rzonwh/ctx --platform linux/amd64,linux/arm64
+2d23c12923eecda8b4df8629ad96294dd38ad28617cf94d7b62532cbbf370a73
+CONTEXT EXIT 0 after 10 s (one observation)
+context top level: Agentfile antigravity-amd64 antigravity-arm64 
+TOP LEVEL OK
+Agentfile: the embedded one
+== antigravity-amd64: bin harness.json ; bin: agy 
+drwxr-xr-x 755 6 bin
+-rwxr-xr-x 755 252013896 bin/agy
+-rw-r--r-- 644 307 harness.json
+harness.json: the embedded one
+bd643ae267d521b8febe5cd9fbce6533a1c7c0831aa0b28325401cb3e3b2035d  /home/adalundhe/.cache/s26-cli.Rzonwh/ctx/antigravity-amd64/bin/agy
+/home/adalundhe/.cache/s26-cli.Rzonwh/ctx/antigravity-amd64/bin/agy: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, for GNU/Linux 3.2.0
+== antigravity-arm64: bin harness.json ; bin: agy 
+drwxr-xr-x 755 6 bin
+-rwxr-xr-x 755 238891264 bin/agy
+-rw-r--r-- 644 307 harness.json
+harness.json: the embedded one
+a96c0ecd1edabfb7e9736f25404601dc8002aea5d627dafe5c34e1aff37a442b  /home/adalundhe/.cache/s26-cli.Rzonwh/ctx/antigravity-arm64/bin/agy
+/home/adalundhe/.cache/s26-cli.Rzonwh/ctx/antigravity-arm64/bin/agy: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, for GNU/Linux 
+MATCH linux/amd64 sha256 bd643ae267d521b8febe5cd9fbce6533a1c7c0831aa0b28325401cb3e3b2035d (pin bd643ae267d521b8febe5cd9fbce6533a1c7c0831aa0b28325401cb3e3b2035d) size 252013896 (pin 252013896) mode 755
+MATCH linux/arm64 sha256 a96c0ecd1edabfb7e9736f25404601dc8002aea5d627dafe5c34e1aff37a442b (pin a96c0ecd1edabfb7e9736f25404601dc8002aea5d627dafe5c34e1aff37a442b) size 238891264 (pin 238891264) mode 755
+binaries matching the pin's member SHA-256, size and mode 0755: 2 of 2
+PIN CHECK EXIT 0
+antigravity-amd64/bin/agy --version: exit 0, first line '1.5.7', bytes  31 2e 35 2e 37 0a
+VERSION MATCH 1.5.7
+DISK /dev/nvme1n1p2  7.3T  4.6T  2.8T  63% /home; target 13G
+END 2026-11-12T22:32:26Z, removed /home/adalundhe/.cache/s26-cli.Rzonwh

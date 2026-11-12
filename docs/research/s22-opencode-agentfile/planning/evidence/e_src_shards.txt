@@ -1,0 +1,129 @@
+shards origin/main 08cf6ec5d72a6d48a9c36232f27f801932907140 (2026-11-11 23:20:59 -0800)
+crates/init/src/domains.rs:1: //! Agents and harnesses, each started in its domain (docs/design/architecture.md D59;
+crates/init/src/domains.rs:2: //! AGENTFILE_ARCH.md §9.3, §9.9): the image's normalized Agentfile (`/.agentfile.json`)
+crates/init/src/domains.rs:3: //! says which there are and where each lies, and each one's OSI config (`<dir>.d/osi.json`)
+crates/init/src/domains.rs:4: //! how it runs. One whose config says nothing of how it runs is files alone, for another
+crates/init/src/domains.rs:5: //! to use.
+crates/init/src/domains.rs:6: //!
+crates/init/src/domains.rs:7: //! Each starts with `clone3` into namespaces of its own (mount, PID, IPC, network, UTS,
+crates/init/src/domains.rs:8: //! cgroup) and into a cgroup of its own, `/sys/fs/cgroup/domains/<kind>-<name>`, whose
+crates/init/src/domains.rs:9: //! `pids.max` bounds what it starts. Its first process, PID 1 of its namespace:
+crates/init/src/domains.rs:10: //!
+crates/init/src/domains.rs:11: //! - sees the image's system as built, read-only, `nosuid` and `nodev` (workloads inherit
+crates/init/src/domains.rs:12: //!   the microVM's OS), and nothing the run made of it since: none of its files, mounts or
+crates/init/src/domains.rs:13: //!   sockets, a Unix socket's path being reachable to any process that can see it
+crates/init/src/domains.rs:14: //!   (unix(7)); its own directory and grants with it; every other domain's directory
+crates/init/src/domains.rs:15: //!   and grants hidden under an empty tmpfs no one may read; `/sys` hidden; a `/proc` of
+crates/init/src/domains.rs:16: //!   its PID namespace; a `/dev` of six nodes, the `fd` and stdio links, a `shm` of its
+crates/init/src/domains.rs:17: //!   own and an `mqueue` of its IPC namespace's; and a scratch tmpfs of its own at
+crates/init/src/domains.rs:18: //!   `/tmp`, lost when it ends;
+crates/init/src/domains.rs:19: //! - has only its own loopback, brought up;
+crates/init/src/domains.rs:20: //! - runs as uid and gid `200000 + n`, the n-th domain's, with no supplementary groups and
+crates/init/src/domains.rs:21: //!   no capability left, bounding set included, and `no_new_privs` set;
+crates/init/src/domains.rs:22: //! - holds no descriptor of init's but its stdio: stdin `/dev/null`, stdout and stderr one
+crates/init/src/domains.rs:23: //!   pipe that init relays a line at a time, each line prefixed with the domain;
+crates/init/src/domains.rs:24: //! - runs the command its config says, a relative program its directory's, a bare name
+crates/init/src/domains.rs:25: //!   found on `PATH` before it starts.
+crates/init/src/domains.rs:40: const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+crates/init/src/domains.rs:41: /// The nodes a domain's `/dev` holds, as Docker's containers' (moby oci/defaults.go,
+crates/init/src/domains.rs:42: /// `DefaultLinuxDevices` less `/dev/console`): name, major, minor.
+crates/init/src/domains.rs:486:     };
+crates/init/src/domains.rs:487:     let workdir = run.get("workdir").and_then(Value::str).unwrap_or(".");
+crates/init/src/domains.rs:488:     // A supplied bare command lives in its own artifact before the system tools.
+crates/init/src/domains.rs:489:     // The inherited PATH also lets an explicit launcher such as nohup find its child.
+crates/init/src/domains.rs:490:     let path = format!("{dir}:{dir}/bin:{PATH}");
+crates/init/src/domains.rs:491:     let mut env = vec![
+crates/init/src/domains.rs:492:         cstr(&format!("PATH={path}"))?,
+crates/init/src/domains.rs:493:         cstr("HOME=/tmp")?,
+crates/init/src/domains.rs:494:         cstr(&format!("SHARDS_DOMAIN={label}"))?,
+crates/init/src/domains.rs:495:     ];
+crates/init/src/domains.rs:496:     for e in run.get("env").and_then(Value::strings).unwrap_or_default() {
+crates/init/src/domains.rs:497:         env.push(cstr(&e)?);
+crates/init/src/domains.rs:2447:         // Its own name, and loopback.
+crates/init/src/domains.rs:2448:         if libc::sethostname(p.hostname.as_ptr(), p.hostname.as_bytes().len()) != 0 {
+crates/init/src/domains.rs:2449:             fail(out, c"naming its host");
+crates/init/src/domains.rs:2450:         }
+crates/init/src/domains.rs:2451:         if !crate::run::loopback_up_raw() {
+crates/init/src/domains.rs:2452:             fail(out, c"bringing its loopback up");
+crates/init/src/domains.rs:2453:         }
+docs/architecture/AGENTFILE_ARCH.md:171: ### 4.5 `VOLUME`, with options and `FOR`
+docs/architecture/AGENTFILE_ARCH.md:172: 
+docs/architecture/AGENTFILE_ARCH.md:173: ```
+docs/architecture/AGENTFILE_ARCH.md:174: VOLUME [OPTIONS...] <path> [<dest>] [FOR <agent_name>]
+docs/architecture/AGENTFILE_ARCH.md:175: ```
+docs/architecture/AGENTFILE_ARCH.md:176: 
+docs/architecture/AGENTFILE_ARCH.md:177: - Without `FOR`, the volume, mount point or path is available to every workspace and agent.
+docs/architecture/AGENTFILE_ARCH.md:178: - With `FOR <agent_name>`, it is available to that agent's workload/workspace alone.
+docs/architecture/AGENTFILE_ARCH.md:179: - Options:
+docs/architecture/AGENTFILE_ARCH.md:180:   - `--chown=<agent_name>/<user_id>/...`;
+docs/architecture/AGENTFILE_ARCH.md:181:   - `--chmod=<permissions>`;
+docs/architecture/AGENTFILE_ARCH.md:182:   - `--target-kind=<agent|harness>` (added 2026-10-01): whether the names after `FOR`
+docs/architecture/AGENTFILE_ARCH.md:183:     are agents or harnesses (§4.10). A `VOLUME` without `FOR` is Docker's own.
+docs/architecture/AGENTFILE_ARCH.md:184: 
+docs/architecture/AGENTFILE_ARCH.md:256: ### 4.8 `HARNESS`
+docs/architecture/AGENTFILE_ARCH.md:257: 
+docs/architecture/AGENTFILE_ARCH.md:258: Added 2026-10-01, and revised the same day: a harness has no agents until `ATTACH` grants
+docs/architecture/AGENTFILE_ARCH.md:259: them.
+docs/architecture/AGENTFILE_ARCH.md:260: 
+docs/architecture/AGENTFILE_ARCH.md:261: ```
+docs/architecture/AGENTFILE_ARCH.md:262: HARNESS <name> FROM <source>[:<tag>] [TO <dest_path>]
+docs/architecture/AGENTFILE_ARCH.md:263: ```
+docs/architecture/AGENTFILE_ARCH.md:264: 
+docs/architecture/AGENTFILE_ARCH.md:265: - `<name>` is required, and names the harness.
+docs/architecture/AGENTFILE_ARCH.md:266: - `FROM <source>[:<tag>]` names where the harness comes from, with an optional tag, as
+docs/architecture/AGENTFILE_ARCH.md:267:   `AGENT` does. The build detects the kind of source and fetches the harness that way:
+docs/architecture/AGENTFILE_ARCH.md:268: 
+docs/architecture/AGENTFILE_ARCH.md:269:   | Source | The build |
+docs/architecture/AGENTFILE_ARCH.md:270:   |---|---|
+docs/architecture/AGENTFILE_ARCH.md:271:   | git URL | clones it |
+docs/architecture/AGENTFILE_ARCH.md:272:   | http(s) URL | downloads it, respecting HTTPS |
+docs/architecture/AGENTFILE_ARCH.md:273:   | path on the build host | copies it, as `COPY` copies |
+docs/architecture/AGENTFILE_ARCH.md:274:   | OCI reference | pulls it from its registry |
+docs/architecture/AGENTFILE_ARCH.md:275: 
+docs/architecture/AGENTFILE_ARCH.md:276: - A harness is a file artifact. The build unpacks it to `/harness/<name>`, or to
+docs/examples/harness-claude/Agentfile:9: FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+docs/examples/harness-claude/Agentfile:10: 
+docs/examples/harness-claude/Agentfile:11: # The system libraries Claude Code's musl build links (code.claude.com/docs/en/setup,
+docs/examples/harness-claude/Agentfile:12: # "Alpine Linux and musl-based distributions"): Alpine's own, not the harness.
+docs/examples/harness-claude/Agentfile:13: RUN apk add --no-cache libgcc libstdc++
+docs/examples/harness-claude/Agentfile:14: 
+docs/examples/harness-claude/Agentfile:15: HARNESS claude FROM ./claude
+docs/examples/harness-claude/Agentfile:16: 
+docs/examples/harness-claude/Agentfile:17: # Its network reach, every part named (default deny, AGENTFILE_ARCH.md §4.6, §4.7, §9.7):
+docs/examples/harness-claude/Agentfile:18: # a network for this harness alone, which it joins with no flow to any member; names past
+docs/examples/harness-claude/Agentfile:19: # the microVM through the microVM's resolver (--dns); and TCP 443 out, opened both at the
+docs/examples/harness-claude/Agentfile:20: # network's boundary (--egress) and at the microVM's (EXPOSE ... AS egress). Nothing comes
+docs/examples/harness-claude/Agentfile:21: # in, and no other port or protocol goes out.
+docs/examples/harness-claude/Agentfile:22: NETWORK --dns --egress=443/tcp provider FOR claude
+docs/examples/harness-claude/Agentfile:23: EXPOSE --harnesses=claude 443/tcp AS egress FOR provider
+docs/examples/harness-claude/Agentfile:24: CONNECT claude WITH claude ON provider
+docs/research/measurements/harness-bringup-v1/records/codex-login-volume/harness.json:1: {"schemaVersion":1,"name":"codex","run":{"command":["codex","exec","--json","--skip-git-repo-check","--ephemeral","Reply with the single word: ready"],"env":["CODEX_HOME=/run/codex-home"]}}
+docs/development-rules.md:41: 
+docs/development-rules.md:42: Use online learned/data-derived values, or exceptionally well-researched invariants
+docs/development-rules.md:43: and justified protocol/physical/algorithmic bounds. Document each production
+docs/development-rules.md:44: literal's source or derivation in its D-entry, including cold-start, uncertainty,
+docs/development-rules.md:45: overflow and adversarial-input behavior where relevant. An upstream default or a
+docs/development-rules.md:46: number from one benchmark alone is insufficient. Measurements validate methods;
+docs/development-rules.md:110: measurement record. Use [the evidence checklist](development-evidence.md).
+docs/development-rules.md:111: 
+docs/development-rules.md:112: ## R11 — Supported platforms and architectures
+docs/development-rules.md:113: 
+docs/development-rules.md:114: Support Windows and Linux on amd64 and arm64; Linux includes glibc and musl and
+docs/development-rules.md:115: coverage of major distribution/kernel environments. Support macOS on arm64.
+docs/development-rules.md:116: **Intel Mac is unsupported.** `resources/supported-targets.txt` is the current
+docs/development-rules.md:117: seven-target build/lint/release set. Real-VM validation covers supported KVM,
+docs/development-rules.md:118: Hypervisor.framework and WHP combinations; unavailable hardware and skipped tests
+docs/development-rules.md:119: are unverified, never passed. Preserve explicit host/VM pause instructions.
+docs/development-rules.md:120: 
+docs/development-rules.md:121: ## R12 — Share implementations
+docs/development-rules.md:122: 
+docs/development-rules.md:123: Use the existing `hv`, `arch` and `platform` seams. Do not create hacks or duplicate
+docs/development-rules.md:133: required behavior, evidence or error path in the name of brevity.
+docs/development-rules.md:134: 
+docs/development-rules.md:135: ## R14 — Profile allocations and faults
+docs/development-rules.md:136: 
+docs/development-rules.md:137: The main coordinator performs all profiling and benchmarking, and reviews
+docs/development-rules.md:138: optimization of
+c3b7bde8b: c3b7bde8b 2026-11-09 Start supplied agents and harnesses from their root startup descriptors
+startup.rs (c3b7bde8b) NOT in v0.7.0
+1da9132b7 IN origin/main 08cf6ec5d72a6d48a9c36232f27f801932907140

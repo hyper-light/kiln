@@ -1,0 +1,100 @@
+# Step 28's port on macOS arm64: kiln runs r78 (run.sh: unit live api shards) and r165 (clippy) on the
+# Mac Studio adas-mac-studio.local-2, from the bundle of p/s28-port-v1 at da5e752be. Excerpted from the
+# runs' output: each step's header, pi's tests, test results, verdicts and the end of clippy; the other
+# tests' lines and cargo's warnings in vendored crates (focal-memory's fetch_update) are left out.
+# SHARDS for the shards step: ~/.cache/s28-shards-ac87190d3/shards, ROOT's recorded Shards main build.
+
+# step 28 port, 2026-11-12T22:05:51Z, host Adas-Mac-Studio.local Darwin 25.4.0 arm64, cargo 1.99.1 (5f94df478 2026-08-27), clippy 0.1.99 (58cf8f9c35 2026-10-13)
+# run.sh sha256 ac15e1ed5464d688781f71d303401ae98173efbed441c18cd01965b356e8631f
+# HEAD da5e752beaf15a86445a533675d10bac31a026a4 on kiln main 3a4b090054c59dc50eee8e196d78a52cbf749234; main contained: yes
+#   .kiln/images/harness-pi/Agentfile sha256 72ae6af81092be52bd6905bfd83f397c79933998941245b919fe725dba974963
+#   .kiln/images/harness-pi/harness.json sha256 e5ce333c3217b3d71b5b547442e2268ec78024a2c0da92f5e89876ea7b383187
+#   .kiln/images/harness-pi/pin.json sha256 cede20c250de87c078fa1e8bec1f8ce253a641aaa049f69a4b58358ffa1efde4
+#   .kiln/images/harness-pi/pin.sh sha256 869dd1d95ff5125697181a5ca78ae96f95b3311adcfba4bc4578480c70128f70
+#   crates/kiln/src/agentfiles/builtin.rs sha256 4c362d539d4554e9c53057c5ae271e5769e4db33d634bf8af842aa73e9d5dc91
+#   crates/kiln/src/agentfiles/builtin/pi_tests.rs sha256 e3b205d050856fa74bf14c8d644cf66f5ca4a52c65dd88fdc8e47857d79558d2
+
+## unit: cargo test --locked -p kiln --lib agentfiles::
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6m 44s
+     Running unittests src/lib.rs (/Users/adalundhe/.cache/s28-port/target/debug/deps/kiln-169af09cfe45a705)
+
+running 93 tests
+test agentfiles::builtin::pi_tests::step28_a_live_pi_context_holds_the_pinned_builds ... ok
+test agentfiles::builtin::tests::step23_a_real_shards_checks_every_builtin ... ok
+test agentfiles::builtin::pi_tests::step28_no_pi_file_holds_a_credential ... ok
+test agentfiles::builtin::tests::every_builtin_is_a_valid_agentfile_once ... ok
+test agentfiles::builtin::pi_tests::step28_pi_agentfile_and_pin_are_the_plans_shape ... ok
+test agentfiles::builtin::tests::step19_a_harness_home_is_its_volume_and_none_is_under_tmp ... ok
+test agentfiles::builtin::tests::step23_kilns_dockerfile_copies_what_builtins_embed ... ok
+test agentfiles::builtin::pi_tests::step28_pi_runs_as_kilns_pi_kind_with_its_config_on_its_volume ... ok
+test agentfiles::context::tests::step19_harness_dirs_are_named_as_each_builtins_harness_line_takes_them ... ok
+test agentfiles::builtin::pi_tests::step28_pi_pin_and_harness_file_hold ... ok
+test agentfiles::context::tests::step19_pins_are_read_for_their_builds_alone ... ok
+test agentfiles::builtin::pi_tests::step28_a_pin_that_would_mislead_a_build_is_caught ... ok
+
+test result: ok. 93 passed; 0 failed; 0 ignored; 0 measured; 4317 filtered out; finished in 1.44s
+
+STEP unit EXIT 0 at 22:12:44
+(Without KILN_TEST_LIVE_CONTEXT and KILN_TEST_SHARDS, the live and real-Shards tests return early here; the live and shards steps run them.)
+
+## clippy (r165): CARGO_TARGET_DIR=~/.cache/s28-port/target-clippy cargo clippy --locked -p kiln --all-targets -j 10 -- -D warnings
+# clippy at da5e752beaf15a86445a533675d10bac31a026a4, Adas-Mac-Studio.local Darwin 25.4.0 arm64, clippy 0.1.99 (58cf8f9c35 2026-10-13), 2026-11-12T22:11:01Z
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4m 33s
+CLIPPY_EXIT=0 at 22:15:35
+
+## live, first try (r78): stopped
+In r78 the live step's first download, pi-linux-x64.tar.gz from GitHub, stopped at about 53 MB of
+its 58.9 MB and sat there for 16 minutes at 0% CPU (ps, and the .arriving-… file's size). kiln's
+fetcher has no idle timeout on a download's body, so it would have waited forever. r78 was stopped
+there, before its api and shards steps. Linux's live step had passed in 14.78 s. r289 ran the live,
+api and shards steps again from the same checkout. It teed its output on the Mac to
+~/.cache/s28-port/macos-run2.log, which is excerpted here.
+
+## live (r289): KILN_TEST_LIVE_CONTEXT=/Users/adalundhe/.cache/s28-port/live cargo test --locked -p kiln --lib step28_a_live_pi_context_holds_the_pinned_builds -- --nocapture
+# step 28 port, 2026-11-12T22:33:59Z, host Adas-Mac-Studio.local Darwin 25.4.0 arm64, cargo 1.99.1 (5f94df478 2026-08-27), clippy 0.1.99 (58cf8f9c35 2026-10-13)
+# run.sh sha256 ac15e1ed5464d688781f71d303401ae98173efbed441c18cd01965b356e8631f
+# HEAD da5e752beaf15a86445a533675d10bac31a026a4 on kiln main edba77bdbf35d313769b492470160ae3938080db; main contained: yes
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.36s
+     Running unittests src/lib.rs (/Users/adalundhe/.cache/s28-port/target/debug/deps/kiln-169af09cfe45a705)
+
+running 1 test
+test agentfiles::builtin::pi_tests::step28_a_live_pi_context_holds_the_pinned_builds has been running for over 60 seconds
+MATCH linux/amd64 bin/rg e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849
+MATCH linux/amd64 bin/fd bd664fa3c5c4919234adf2b489c4b7ec47282e8e926c012e3f67112cf9f8c182
+MATCH linux/arm64 bin/rg c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a
+MATCH linux/arm64 bin/fd 3f27a82f32ccbaef516abca257bc026ea5011ff4f25e2c20a31318be5e0f0dd7
+test agentfiles::builtin::pi_tests::step28_a_live_pi_context_holds_the_pinned_builds ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4409 filtered out; finished in 218.65s
+
+left in /Users/adalundhe/.cache/s28-port/live: 0 entries
+STEP live EXIT 0 at 22:38:10
+(On macOS the live test makes both platforms' contexts on APFS and runs no pi: pi's builds are Linux's.)
+
+## api (r289): cargo test --locked -p kiln --test agentfiles
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6m 46s
+     Running tests/agentfiles.rs (/Users/adalundhe/.cache/s28-port/target/debug/deps/agentfiles-ada639a35831ac3d)
+
+running 1 test
+test step30_agentfiles_on_every_surface ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.62s
+
+STEP api EXIT 0 at 22:45:13
+
+## shards (r289): the real Shards' static check of every built-in
+shards /Users/adalundhe/.cache/s28-shards-ac87190d3/shards, sha256 02db1caf534185f3af4ed27a06f886be9387af674d6ffc81adc6f37712725543
+shards version 0.7.0, build unknown-commit
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.26s
+     Running unittests src/lib.rs (/Users/adalundhe/.cache/s28-port/target/debug/deps/kiln-169af09cfe45a705)
+
+running 1 test
+test agentfiles::builtin::tests::step23_a_real_shards_checks_every_builtin ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4409 filtered out; finished in 0.51s
+
+STEP shards EXIT 0 at 22:45:16
+
+STEPS_FAILED=0
+RUN_EXIT=0
