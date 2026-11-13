@@ -1179,9 +1179,17 @@ kiln ships an Agentfile for each harness it drives, `harness-<id>`. Read one on 
   the link kiln drives the harness by, never the network, so no Agentfile grants anything for it.
   A harness that takes any provider (Goose, opencode, Pi) is granted every provider its own build
   reaches at a fixed public host, with their sign-ins. Antigravity is granted every sign-in it
-  documents: your Google account, a Gemini API key, Gemini Enterprise and ADC. A run is to keep only
-  its own provider's or sign-in's hosts, dropped as kiln starts it. Not yet: until the launch does
-  that, a run of these four is granted every host its image names. A cloud platform's model service
+  documents: your Google account, a Gemini API key, Gemini Enterprise and ADC. A run of one of these
+  four keeps only the hosts of the provider or sign-in it uses, and kiln drops the rest as it starts
+  it. kiln tells which one as the harness itself does: from the run's environment, the model the
+  agent is started with, and the harness's own settings in your volume or your project (Goose's
+  `GOOSE_PROVIDER`, opencode's `model`, Pi's `defaultProvider`, Antigravity's sign-in). Whatever it
+  uses, opencode keeps its model catalog and the GitHub hosts it fetches ripgrep from, and Pi keeps
+  `pi.dev`; Goose keeps TypeSafe's host where its auto effort is on. Where kiln can't tell what a run
+  uses (kiln keeps no volume of yours on that machine, a settings file can't be read, the provider or
+  sign-in named is one the image names no hosts for, or nothing says), the run keeps every host its
+  image names, each by name, and the agent says so and why, in its conversation and in its state
+  (`runs.reach`). No run is given a host its image doesn't grant. A cloud platform's model service
   (Bedrock, Vertex AI, Azure), a self-hosted or local server, and a provider whose address you give
   it are none of those: copy kiln's Agentfile into one of yours and add your provider's
   `--egress=HOST:PORT`. Each Agentfile's comments say what each host is for. Each harness's record
@@ -1219,7 +1227,9 @@ kiln's user alone), and reads your sessions there to show and resume them. They 
 kiln's upgrades: a runner started as a new instance keeps them in the same place, and moves there
 any that an older kiln's instance kept in its own folder (`<kiln's state>/instances/<id>/homes/`) as
 it starts, leaving one where it is, and logging why, where kiln already keeps yours for that harness
-or the move fails.
+or the move fails. Beside each harness's volume, never in it, kiln keeps which Agentfile and image
+each of your conversations ran in, and the machine's past sessions name that Agentfile with the
+conversation (`GET /api/harness/history`'s `isolation.image`), for a start that continues it.
 
 Its base is `buildpack-deps:trixie-scm`, pinned by digest: git, an ssh client, curl and CA
 certificates, for both platforms. For your project's own toolchain, copy kiln's Agentfile into one of
@@ -1293,7 +1303,7 @@ What this page describes, once an isolated agent's start goes through:
 | Driving it: sending, steering, interrupting, stopping, models, modes, commands, questions, state, usage limits | Works: kiln speaks the same harness protocol over the microVM's stdio. |
 | Said at once when it can't sign in or reach its provider (State's `trouble`) | Works, as for every agent. |
 | The Changes tab, Commits, Compare, whose a file is, a subagent's edits, change requests | Works: the project is at its own path inside, so kiln reads its diffs, HEAD and checkpoints where it always does. |
-| Continuing a past session | Works: kiln reads its transcript from your volume on the machine. |
+| Continuing a past session | Works: kiln reads its transcript from your volume on the machine, and the machine's past sessions name the Agentfile it ran in. |
 | Its harness's settings, sign-in and memories | Kept in your volume, yours alone; no credential leaves it. |
 | Agents that run agents, and kiln's other tools | Not yet: through kiln's MCP, which comes over the link kiln drives the harness by (its own MCP lane, through the bridge `/run/shards/mcp` each harness names), never the network, on every OS, answered by the runner in its own process; what it starts is isolated too. The launch handing the lane's connections to the runner is still to come. Pi takes no MCP server from kiln. |
 | Skills kiln installs, and kiln's own | Its plugin folders are plugged in read-only at their own paths as it starts. |
