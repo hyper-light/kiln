@@ -356,7 +356,9 @@ of it is the copy's to clear.
 - **Passed by:** the simulator and kiln's store, every clause; Veil, when CP-T8.1 lands it.
 - **Bounds:** names 1 to 512 of `A-Z a-z 0-9 / _ + = . @ -` and values to 64 KiB (Secrets
   Manager's); 100 names a listing; 100 versions kept a secret (the oldest without a stage go
-  first); deletes 7 to 30 days out (Secrets Manager's); leases up to a day.
+  first); deletes 7 to 30 days out (Secrets Manager's); leases up to a day (kiln-seams' own bound, which no
+  provider gave: a run's credential lease ends at its value's own end or its run's, the broker taking
+  a store's lease anew as it needs one).
 
 Methods: `create`, `put`, `get`, `promote`, `describe`, `list`, `delete`, `restore`, `lease`, `read_leased`, `renew`, `revoke`.
 

@@ -361,6 +361,7 @@ pub(crate) mod tests {
     pub(crate) struct Fixture {
         pub(crate) secrets: KilnSecrets,
         pub(crate) clock: SimClock,
+        pub(crate) hub: Arc<Hub>,
     }
 
     impl Fixture {
@@ -371,7 +372,7 @@ pub(crate) mod tests {
 
         fn on(hub: Arc<Hub>) -> Fixture {
             let clock = SimClock::new();
-            Fixture { secrets: KilnSecrets::new(hub, Arc::new(clock.clone())), clock }
+            Fixture { secrets: KilnSecrets::new(Arc::clone(&hub), Arc::new(clock.clone())), clock, hub }
         }
     }
 

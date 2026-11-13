@@ -140,7 +140,8 @@ fn t03_e2_detached_follows_outlive_a_runner_restart() -> anyhow::Result<()> {
 #[test]
 fn t12_news_comes_only_from_an_agent_session_s_own_processes() -> anyhow::Result<()> {
     let json = serde_json::to_string(&news("x", RunEvent::Going))?;
-    let (refused, probe) = crate::rt::block_on(async move { anyhow::Ok((heard(&json, Some(std::process::id())).await, heard("{}", None).await)) })?;
+    let (me, nobody) = (crate::reach::local::Peer::Process(Some(std::process::id())), crate::reach::local::Peer::Process(None));
+    let (refused, probe) = crate::rt::block_on(async move { anyhow::Ok((heard(&json, &me).await, heard("{}", &nobody).await)) })?;
     anyhow::ensure!(matches!(refused, Ev::Error(ref e) if e.contains("agent session's own processes")), "{refused:?}");
     anyhow::ensure!(matches!(probe, Ev::Answer(_)), "news of no run asks whether news goes: {probe:?}");
     Ok(())

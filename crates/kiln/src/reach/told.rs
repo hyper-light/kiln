@@ -34,7 +34,6 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(unix)]
 use serde_json::json;
 
 pub use crate::harness::told::{DETACHED, LINE_SHARE, RunEvent, RunNews, Rto, clip_tail};
@@ -443,22 +442,30 @@ pub fn gone(client: Option<u32>) {
     }
 }
 
-/// News said over this runner's socket (`Req::Told`, JSON) by process `pid`: for the agent session
-/// that process belongs to by the process alone (T12), into the outbox; what to answer. News with
-/// no run (`key`) asks whether news goes from here.
-#[cfg(unix)]
-pub async fn heard(json: &str, pid: Option<u32>) -> Ev {
+/// News said to this runner (`Req::Told`, JSON) by `peer`: over its socket by a process, for the
+/// agent session that process belongs to by the process alone (T12); over an isolated session's lane,
+/// for that session (D254). Into the outbox; what to answer. News with no run (`key`) asks whether
+/// news goes from here.
+pub async fn heard(json: &str, peer: &super::local::Peer) -> Ev {
     let news = match serde_json::from_str::<RunNews>(json) {
         Ok(n) => n,
         Err(e) => return Ev::Error(format!("that isn't news of a run: {e}")),
     };
     if !news.key.is_empty() {
-        let session = match pid {
-            Some(p) => crate::rt::blocking(move || crate::runner::custody::session_by_pid(p)).await.ok().flatten(),
-            None => None,
+        let (session, by) = match peer {
+            #[cfg(unix)]
+            super::local::Peer::Process(pid) => {
+                let pid = *pid;
+                let session = match pid {
+                    Some(p) => crate::rt::blocking(move || crate::runner::custody::session_by_pid(p)).await.ok().flatten(),
+                    None => None,
+                };
+                (session, pid)
+            }
+            super::local::Peer::Session(session) => (Some(session.clone()), None),
         };
         let Some(session) = session else { return Ev::Error("news of a run comes from an agent session's own processes".into()) };
-        say(&session, news, pid);
+        say(&session, news, by);
     }
     Ev::Answer(json!({ "told": will_tell() }).to_string())
 }
@@ -751,13 +758,19 @@ impl Detached {
 /// Says news of an agent's runs to its runner (`Req::Told`), in the order it came, on a thread of
 /// its own: nothing waits on it (T6), and what didn't go goes again after the socket's RTO,
 /// measured from the news it answered (RFC 6298), each attempt bounded by it. Of each run only its
-/// latest news waits. One per runner socket ([`teller`]).
-#[cfg(unix)]
+/// latest news waits. One per runner socket ([`teller`]). In the runner's own process (an isolated
+/// session's lane, D254) its news goes into the outbox as it's said, for its session.
 #[derive(Clone)]
-pub struct Teller {
-    tx: std::sync::mpsc::Sender<RunNews>,
-    /// The runner said news goes from it, as it last said.
-    takes: Arc<AtomicBool>,
+pub enum Teller {
+    /// The runner at a reach socket.
+    #[cfg(unix)]
+    Socket {
+        tx: std::sync::mpsc::Sender<RunNews>,
+        /// The runner said news goes from it, as it last said.
+        takes: Arc<AtomicBool>,
+    },
+    /// This runner itself, for the agent session it names.
+    Here(String),
 }
 
 /// The teller for the runner at `sock`, started the first time it's asked for.
@@ -774,20 +787,29 @@ pub fn teller(sock: &Path) -> Teller {
             let _ = std::thread::Builder::new().name("kiln-told".into()).spawn(move || tell_all(&sock, &rx, &t));
             // Asks first whether news goes from the runner (news of no run), for the first answers.
             let _ = tx.send(RunNews::default());
-            Teller { tx, takes }
+            Teller::Socket { tx, takes }
         })
         .clone()
 }
 
-#[cfg(unix)]
 impl Teller {
     pub fn tell(&self, news: RunNews) {
-        let _ = self.tx.send(news.clipped());
+        match self {
+            #[cfg(unix)]
+            Teller::Socket { tx, .. } => {
+                let _ = tx.send(news.clipped());
+            }
+            Teller::Here(session) => say(session, news, None),
+        }
     }
 
     /// Whether news goes from the runner, as it last said (no waiting for it).
     pub fn takes(&self) -> bool {
-        self.takes.load(Ordering::Relaxed)
+        match self {
+            #[cfg(unix)]
+            Teller::Socket { takes, .. } => takes.load(Ordering::Relaxed),
+            Teller::Here(_) => will_tell(),
+        }
     }
 }
 
@@ -869,7 +891,6 @@ fn tell_runner(sock: &Path, news: &RunNews, timeout: Duration) -> anyhow::Result
 /// turn (T2); its start, when what handed it over didn't say it had, is state; its end, with no
 /// call waiting on it, is news; an answer that shows its end after says it seen. Each said through
 /// the one [`Teller`] while the run's lock is held, so in the order decided (T10).
-#[cfg(unix)]
 #[derive(Default)]
 pub struct Telling {
     teller: Option<Teller>,
@@ -887,14 +908,13 @@ pub struct Telling {
     queued: bool,
 }
 
-#[cfg(unix)]
 impl Telling {
-    /// Run `id` of this MCP server, `args` the tool's input, told to the runner at `sock`.
-    pub fn begin(sock: &Path, id: &str, args: &Value) -> Self {
+    /// Run `id` of this MCP server, `args` the tool's input, told through `teller`.
+    pub fn begin(teller: Teller, id: &str, args: &Value) -> Self {
         static ME: LazyLock<String> = LazyLock::new(crate::util::new_id);
         let command = args.get("command").and_then(Value::as_str).unwrap_or_default().to_owned();
         let news = RunNews { key: format!("{}-{id}", *ME), id: id.to_owned(), command, how: "run".to_owned(), ..RunNews::default() };
-        Self { teller: Some(teller(sock)), news, ..Self::default() }
+        Self { teller: Some(teller), news, ..Self::default() }
     }
 
     /// What its runner is told it's called for its agent's news ([`KEY_ENV`], [`ID_ENV`]), so
@@ -993,7 +1013,6 @@ impl Telling {
 
 /// What an answer about a run its agent was handed says while it goes, when news goes from the
 /// runner (`Telling::answered`).
-#[cfg(unix)]
 const TOLD: &str = "kiln tells you when it ends (where, how long, its exit code and the end of its output): end your turn rather than wait on `output` for it.";
 
 /// What this runner said of its sessions' runs, for tests: by session, in order.

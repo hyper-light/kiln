@@ -29,7 +29,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::local::{Client, Ev, Req, RunReq};
+#[cfg(unix)]
+use super::local::Client;
+use super::local::{Ev, Req, RunReq};
 use super::wire::Signal;
 use super::{CODE_WALL_MAX, codex_tool_timeout_sec};
 use crate::mcp::code;
@@ -95,12 +97,12 @@ you show live with show_live: it streams to them as they look, and use_live lets
 
 /// This kiln's machines, as the instructions name them ("adacachy (linux/x86_64, this machine),
 /// …"): asked of the runner's reach socket, briefly (empty when it doesn't answer in time).
-fn machines(sock: &std::path::Path) -> String {
-    let sock = sock.to_path_buf();
+fn machines(link: &Link) -> String {
+    let link = link.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let ask = || -> anyhow::Result<Value> {
-            let mut c = Client::connect(&sock)?;
+            let mut c = link.connect()?;
             c.send(&Req::Runners { want: None })?;
             match c.event()? {
                 Some(Ev::Runners(j)) => Ok(serde_json::from_str(&j)?),
@@ -329,7 +331,7 @@ struct Run {
     read: usize,
     exit: Option<Value>,
     error: Option<String>,
-    signal: Option<std::os::unix::net::UnixStream>,
+    signal: Option<Signals>,
     /// Placement's latest answer (docs/needs.md E5): queued, its place and expected start, and why.
     placed: Option<Value>,
     /// What kiln is told of it for its agent (docs/reach.md §7).
@@ -350,7 +352,7 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 /// Follow a run's events into `cell` until it ends (on a thread of its own).
-fn follow(mut client: Client, cell: Cell) {
+fn follow(mut client: Conn, cell: Cell) {
     std::thread::spawn(move || {
         loop {
             let ev = client.event();
@@ -479,8 +481,97 @@ fn running(v: &Value) -> bool {
 /// registry, why there is none, which are agents' tools when it says).
 type Registry = (Instant, Vec<Value>, Option<String>, Option<Vec<String>>);
 
+/// How a server asks its runner: over the runner's reach socket (`kiln reach mcp`, a process of the
+/// machine), or in the runner's own process (an isolated session's MCP over its lane, Shards D254),
+/// which every platform has.
+#[derive(Clone)]
+pub enum Link {
+    #[cfg(unix)]
+    Socket(std::path::PathBuf),
+    Here(super::local::Here),
+}
+
+/// One request of a server's to its runner, over its [`Link`].
+enum Conn {
+    #[cfg(unix)]
+    Socket(Client),
+    Here(Box<super::local::Asked>),
+}
+
+/// A run's way to its runner after its request: its input and signals.
+pub(super) enum Signals {
+    #[cfg(unix)]
+    Socket(std::os::unix::net::UnixStream),
+    Here(crate::memory::queue::Sender<Req>),
+}
+
+impl Link {
+    fn connect(&self) -> anyhow::Result<Conn> {
+        match self {
+            #[cfg(unix)]
+            Link::Socket(sock) => Ok(Conn::Socket(Client::connect(sock)?)),
+            Link::Here(here) => Ok(Conn::Here(Box::new(here.ask()))),
+        }
+    }
+
+    /// Whether it's an isolated session's lane, in the runner's own process.
+    fn is_lane(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            Link::Socket(_) => false,
+            Link::Here(_) => true,
+        }
+    }
+
+    /// What tells its runner of its runs (docs/reach.md §7).
+    fn teller(&self) -> super::told::Teller {
+        match self {
+            #[cfg(unix)]
+            Link::Socket(sock) => super::told::teller(sock),
+            Link::Here(here) => super::told::Teller::Here(here.session.clone()),
+        }
+    }
+}
+
+impl Conn {
+    fn send(&mut self, r: &Req) -> anyhow::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Conn::Socket(c) => c.send(r),
+            Conn::Here(a) => a.send(r),
+        }
+    }
+
+    /// The next event; None once the runner is done answering.
+    fn event(&mut self) -> anyhow::Result<Option<Ev>> {
+        match self {
+            #[cfg(unix)]
+            Conn::Socket(c) => c.event(),
+            Conn::Here(a) => a.event(),
+        }
+    }
+
+    fn signals(&self) -> anyhow::Result<Signals> {
+        match self {
+            #[cfg(unix)]
+            Conn::Socket(c) => Ok(Signals::Socket(c.sender()?)),
+            Conn::Here(a) => Ok(Signals::Here(a.sender())),
+        }
+    }
+}
+
+impl Signals {
+    fn send(&mut self, r: &Req) -> anyhow::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Signals::Socket(stream) => super::local::send_on(stream, r),
+            Signals::Here(tx) => tx.send_blocking(r.clone()).map_err(|_| anyhow::anyhow!("the run has ended")),
+        }
+    }
+}
+
 struct Server {
-    sock: std::path::PathBuf,
+    link: Link,
     prefer: Option<String>,
     cwd: String,
     /// This agent session: whom kiln's operations are asked for.
@@ -499,7 +590,7 @@ struct Server {
 
 impl Server {
     fn runners(&self, want: Option<String>) -> anyhow::Result<Value> {
-        let mut c = Client::connect(&self.sock)?;
+        let mut c = self.link.connect()?;
         c.send(&Req::Runners { want })?;
         match c.event()? {
             Some(Ev::Runners(j)) => Ok(serde_json::from_str(&j)?),
@@ -529,7 +620,7 @@ impl Server {
         };
         // Its runner tells this agent placement's answers for it under the line this server
         // follows it by (AUDIT O5): what it's called goes with it, for the runner alone.
-        let telling = super::told::Telling::begin(&self.sock, &id, args);
+        let telling = super::told::Telling::begin(self.link.teller(), &id, args);
         env.extend(telling.names());
         let req = RunReq {
             target: run_target(args, self.prefer.as_deref())?,
@@ -545,10 +636,10 @@ impl Server {
             asker: None,
             client: None,
         };
-        let mut client = Client::connect(&self.sock).map_err(|e| format!("{e:#}"))?;
+        let mut client = self.link.connect().map_err(|e| format!("{e:#}"))?;
         let reuse = args.get("reuse").and_then(Value::as_bool).unwrap_or(false);
         client.send(&if reuse { Req::RunReuse(Box::new(req)) } else { Req::Run(Box::new(req)) }).map_err(|e| format!("{e:#}"))?;
-        let signal = client.sender().ok();
+        let signal = client.signals().ok();
         let cell: Cell = Arc::new((Mutex::new(Run { signal, telling, ..Run::default() }), std::sync::Condvar::new()));
         if let Ok(mut runs) = self.runs.lock() {
             runs.insert(id.clone(), Arc::clone(&cell));
@@ -572,13 +663,26 @@ impl Server {
         self.runs.lock().ok().and_then(|r| r.get(id).cloned())
     }
 
+    /// Its runs, stopped as a client going away stops its own on the reach socket: its stream (an
+    /// isolated session's lane connection) ended.
+    fn let_go(&self) {
+        let Ok(runs) = self.runs.lock() else { return };
+        for cell in runs.values() {
+            if let Ok(mut r) = cell.0.lock()
+                && let Some(w) = r.signal.as_mut()
+            {
+                let _ = w.send(&Req::Signal(Signal::Terminate));
+            }
+        }
+    }
+
     /// Stop run `id`: Ctrl-C, then terminate if it still runs 5 s later.
     fn stop(&self, id: &str, max: usize) -> (Value, bool) {
         let Some(cell) = self.cell(id) else { return (json!({"error": format!("no run {id}")}), true) };
         if let Ok(mut r) = cell.0.lock()
             && let Some(w) = r.signal.as_mut()
         {
-            let _ = super::local::send_on(w, &Req::Signal(Signal::Interrupt));
+            let _ = w.send(&Req::Signal(Signal::Interrupt));
         }
         if let Ok(mut r) = cell.0.lock() { r.telling.stopped(); }
         let (v, failed) = report(id, &cell, 5, true, max);
@@ -586,7 +690,7 @@ impl Server {
             && let Ok(mut r) = cell.0.lock()
             && let Some(w) = r.signal.as_mut()
         {
-            let _ = super::local::send_on(w, &Req::Signal(Signal::Terminate));
+            let _ = w.send(&Req::Signal(Signal::Terminate));
         }
         if let Ok(mut runs) = self.runs.lock() {
             runs.remove(id);
@@ -600,7 +704,7 @@ impl Server {
         if let Some(o) = q.as_object_mut() {
             o.insert("session".into(), json!(self.session));
         }
-        let mut c = Client::connect(&self.sock)?;
+        let mut c = self.link.connect()?;
         c.send(&Req::Ask { json: q.to_string() })?;
         match c.event()? {
             Some(Ev::Answer(j)) => Ok(serde_json::from_str(&j)?),
@@ -646,7 +750,7 @@ impl Server {
 
     /// Ask the machine's preview browser, through the runner (`crate::browser::ask`).
     fn browser(&self, q: &Value) -> anyhow::Result<Value> {
-        let mut c = Client::connect(&self.sock)?;
+        let mut c = self.link.connect()?;
         c.send(&Req::Browser { json: q.to_string() })?;
         match c.event()? {
             Some(Ev::Answer(j)) => Ok(serde_json::from_str(&j)?),
@@ -1002,34 +1106,68 @@ fn rpc_ok(id: Value, result: Value) -> Value {
 /// The tools of a server of its own on `sock`, for agent session `session`, as its agent calls
 /// them (`tools/call`, blocking): reach's doors tests drive `run` and `output` by it into a lab's
 /// placement (docs/ci.md W05-R03).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn tools_on(sock: &std::path::Path, session: &str) -> impl Fn(&str, &Value) -> Value + Send + Sync + 'static {
-    let server = Arc::new(Server { sock: sock.to_path_buf(), prefer: None, cwd: String::new(), session: session.to_owned(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
+    let server = Arc::new(Server { link: Link::Socket(sock.to_path_buf()), prefer: None, cwd: String::new(), session: session.to_owned(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
     move |name: &str, args: &Value| server.call(name, args)
 }
 
-/// `kiln reach mcp`: serve MCP on stdin/stdout until stdin closes. Tool calls run side by side.
+/// Where a server's answers go: the harness's end of its stream.
+type Out = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
+
+/// `v` said on `out`, a line of its own.
+fn say(out: &Out, v: &Value) {
+    if let Ok(mut o) = out.lock() {
+        let _ = writeln!(o, "{v}");
+        let _ = o.flush();
+    }
+}
+
+/// `kiln reach mcp`: serve MCP on stdin/stdout until stdin closes, over the runner's reach socket.
+#[cfg(unix)]
 pub fn serve() -> anyhow::Result<()> {
     let sock = super::local::find_socket()?;
     let prefer = std::env::var("KILN_REACH_ON").ok().filter(|s| !s.trim().is_empty());
     let session = std::env::var("KILN_SESSION").unwrap_or_default();
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    let machines = machines(&sock);
-    let server = Arc::new(Server { sock, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
-    let out = Arc::new(Mutex::new(std::io::stdout()));
-    let say = |out: &Arc<Mutex<std::io::Stdout>>, v: &Value| {
-        if let Ok(mut o) = out.lock() {
-            let _ = writeln!(o, "{v}");
-            let _ = o.flush();
-        }
-    };
+    serve_over(Link::Socket(sock), prefer, cwd, session, &mut std::io::stdin().lock(), Box::new(std::io::stdout()))
+}
+
+/// Without Unix sockets no runner of the machine answers `kiln reach mcp`: here a harness reaches
+/// kiln's MCP from a microVM of its own, over its lane ([`serve_lane`]).
+#[cfg(not(unix))]
+pub fn serve() -> anyhow::Result<()> {
+    anyhow::bail!("`kiln reach mcp` reaches its runner over a Unix socket, which no runner here serves: a harness on this machine reaches kiln's MCP from a microVM of its own, over its lane")
+}
+
+/// kiln's MCP for isolated session `here.session`, over one connection of its lane (kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 18, Shards D254: each connection its harness makes to its
+/// microVM's bridge is one byte stream each way): what `input` carries, answered on `output`, until it
+/// ends, in this runner's own process, on every platform. `cwd` is its harness's folder, the
+/// project at its host path (D235). Each call it takes is said on `kiln.mcp.lane` with its session.
+pub fn serve_lane(here: super::local::Here, cwd: String, input: &mut impl BufRead, output: Box<dyn std::io::Write + Send>) -> anyhow::Result<()> {
+    let session = here.session.clone();
+    serve_over(Link::Here(here), None, cwd, session, input, output)
+}
+
+/// Serve MCP read from `input` and answered on `output`, its calls asked of the runner over
+/// `link`, until `input` ends. Tool calls run side by side.
+fn serve_over(link: Link, prefer: Option<String>, cwd: String, session: String, input: &mut impl BufRead, output: Box<dyn std::io::Write + Send>) -> anyhow::Result<()> {
+    let lane = link.is_lane();
+    let machines = machines(&link);
+    let server = Arc::new(Server { link, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
+    let out: Out = Arc::new(Mutex::new(output));
     // The tools the server offers change (a deploy): the agent is told to ask for them again,
-    // once it has asked for them at all.
+    // once it has asked for them at all, until its stream ends.
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
-        let (server, out) = (Arc::clone(&server), Arc::clone(&out));
+        let (server, out, ended) = (Arc::clone(&server), Arc::clone(&out), Arc::clone(&ended));
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(REGISTRY_TTL);
+                if ended.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 let Some(before) = server.listed.lock().ok().and_then(|g| *g) else { continue };
                 let now = fingerprint(&server.tools());
                 if now != before {
@@ -1041,8 +1179,7 @@ pub fn serve() -> anyhow::Result<()> {
             }
         });
     }
-    let mut stdin = std::io::stdin().lock();
-    while let Ok(Some(line)) = next_line(&mut stdin) {
+    while let Ok(Some(line)) = next_line(input) {
         // A line past what a message may be is refused unread, and noted.
         let Ok(line) = line else {
             let r = Box::new(crate::mcp::rpc::too_large());
@@ -1058,10 +1195,21 @@ pub fn serve() -> anyhow::Result<()> {
         // answered as it's done, a tool's call on a thread of its own.
         let body = crate::mcp::rpc::body(&line);
         let lone = (!body.batch).then_some(&out);
+        if lane {
+            for m in body.messages.iter().flatten().filter(|m| m.method == "tools/call") {
+                let tool = m.params.get("name").and_then(Value::as_str).unwrap_or_default();
+                tracing::info!(target: "kiln.mcp.lane", session = %server.session, tool, "a call of kiln's MCP over its agent-control lane (D254)");
+            }
+        }
         let answers: Vec<Value> = body.messages.into_iter().filter_map(|m| answer(&server, &machines, m, lone)).collect();
         if let Some(a) = crate::mcp::rpc::reply(body.batch, answers) {
             say(&out, &a);
         }
+    }
+    ended.store(true, std::sync::atomic::Ordering::Relaxed);
+    // A lane's stream ended: its runs stop, as a socket client's do when it goes (`local::serve`).
+    if lane {
+        server.let_go();
     }
     Ok(())
 }
@@ -1096,7 +1244,7 @@ fn next_line(input: &mut impl BufRead) -> std::io::Result<Option<Result<Vec<u8>,
 
 /// One message's answer: none for a notification, nor for a tool's call when `out` is given (its
 /// answer goes there once it's done).
-fn answer(server: &Arc<Server>, machines: &str, m: Result<crate::mcp::rpc::Request, Box<crate::mcp::rpc::Refused>>, out: Option<&Arc<Mutex<std::io::Stdout>>>) -> Option<Value> {
+fn answer(server: &Arc<Server>, machines: &str, m: Result<crate::mcp::rpc::Request, Box<crate::mcp::rpc::Refused>>, out: Option<&Out>) -> Option<Value> {
     use crate::mcp::rpc;
     let refused = |r: Box<rpc::Refused>| {
         server.note(&r);
@@ -1510,7 +1658,8 @@ pub mod input {
     }
 }
 
-#[cfg(test)]
+// Its tests drive it over the runner's reach socket: Unix.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -1561,7 +1710,7 @@ mod tests {
     /// notification isn't answered.
     #[test]
     fn what_the_agent_sends_is_read_as_json_rpc_says() {
-        let server = Arc::new(Server { sock: "/nonexistent/kiln-reach.sock".into(), prefer: None, cwd: String::new(), session: String::new(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
+        let server = Arc::new(Server { link: Link::Socket("/nonexistent/kiln-reach.sock".into()), prefer: None, cwd: String::new(), session: String::new(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
         let ask = |line: &str| {
             let body = crate::mcp::rpc::body(line.as_bytes());
             let answers = body.messages.into_iter().filter_map(|m| answer(&server, "", m, None)).collect();
@@ -1713,7 +1862,7 @@ mod tests {
     /// A server of its own on `sock`, for session `session` (none: it tells the kiln server
     /// nothing).
     fn server_on(sock: &str, session: &str) -> Arc<Server> {
-        Arc::new(Server { sock: sock.into(), prefer: None, cwd: String::new(), session: session.into(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() })
+        Arc::new(Server { link: Link::Socket(sock.into()), prefer: None, cwd: String::new(), session: session.into(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() })
     }
 
     /// Each of its own tools and of `kiln.machines.*`, with the schema it publishes: the tool's
@@ -1958,5 +2107,111 @@ mod tests {
             anyhow::ensure!(principal == "agent:s1", "{principal}");
             Ok(())
         })
+    }
+}
+
+// kiln's MCP over an isolated session's lane, served in this runner's own process (kiln plan
+// 01a1cd8e862e7169a074db3d5fa33f3d step 18, Shards D254): every platform, Windows' included.
+#[cfg(test)]
+mod lane_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{Value, json};
+
+    /// What the harness's end of a lane connection is told, as the runner writes it.
+    #[derive(Clone, Default)]
+    struct Heard(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Heard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().map_err(|_| std::io::Error::other("poisoned"))?.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Heard {
+        /// The answer to request `id`, once it's said, waiting up to `within` for it (a tool's call
+        /// is answered on a thread of its own).
+        fn answer(&self, id: i64, within: Duration) -> anyhow::Result<Value> {
+            let until = Instant::now() + within;
+            loop {
+                let said = self.0.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.clone();
+                let found = said.split(|b| *b == b'\n').filter_map(|l| serde_json::from_slice::<Value>(l).ok()).find(|v| v.get("id") == Some(&json!(id)));
+                if let Some(v) = found {
+                    return Ok(v);
+                }
+                anyhow::ensure!(Instant::now() < until, "no answer to {id} in {within:?}: {}", String::from_utf8_lossy(&said));
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// A runner's reach node of its own, alone: no server, no peers, a runner's usual settings but
+    /// its copies, which stay in `dir`. What it would send its server is kept, unread, as long as
+    /// the test holds it.
+    fn node(dir: &std::path::Path) -> anyhow::Result<(crate::reach::node::Handle, crate::memory::queue::Receiver<crate::proto::AgentMsg>)> {
+        let config = crate::reach::node::Config {
+            mirrors: dir.join("mirrors"),
+            adopt_policy: crate::harness::moving::stream::StoragePolicy::Off,
+            sense: false,
+            ..crate::reach::node::Config::for_runner("here", dir, true)
+        };
+        crate::reach::node::start(config)
+    }
+
+    /// One connection of an isolated session's lane, served in this process with no socket: its
+    /// `initialize` is answered as `kiln reach mcp` answers it, naming the session, its `tools/list`
+    /// gives `kiln reach mcp`'s tools, and a tool's call crosses into this runner in-process and
+    /// comes back in its node's own words (`runners`: a lone node, with no server, says it isn't
+    /// connected to one, where a request that never reached it would end with no answer at all).
+    /// Nothing of it is Unix's.
+    #[test]
+    fn step18_kilns_mcp_over_a_lane_is_answered_in_this_runners_process() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (handle, _to_server) = node(dir.path())?;
+        let here = crate::reach::local::Here { handle, me: "here".into(), host: None, session: "lane-s1".into() };
+        let asked = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "lane", "version": "1"}}}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "runners", "arguments": {}}}),
+        ];
+        let input: String = asked.iter().map(|v| format!("{v}\n")).collect();
+        let heard = Heard::default();
+        super::serve_lane(here, String::new(), &mut input.as_bytes(), Box::new(heard.clone()))?;
+        let init = heard.answer(1, Duration::from_secs(30))?;
+        anyhow::ensure!(init.pointer("/result/protocolVersion").is_some() && init.pointer("/result/serverInfo").is_some(), "{init}");
+        anyhow::ensure!(init.pointer("/result/instructions").and_then(Value::as_str).is_some_and(|i| i.contains("lane-s1")), "{init}");
+        let list = heard.answer(2, Duration::from_secs(30))?;
+        let names: Vec<&str> = list.pointer("/result/tools").and_then(Value::as_array).into_iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str)).collect();
+        anyhow::ensure!(names.get(..6) == Some(&["code_run", "code_search", "runners", "run", "output", "stop"][..]), "not kiln reach mcp's tools: {list}");
+        let runners = heard.answer(3, Duration::from_secs(30))?;
+        let listed = runners.pointer("/result/structuredContent/runners").is_some_and(Value::is_array);
+        let nodes_own = runners.pointer("/result/structuredContent/error").and_then(Value::as_str) == Some("not connected to the kiln server");
+        anyhow::ensure!(listed || nodes_own, "not the runner's own answer: {runners}");
+        Ok(())
+    }
+
+    /// A request of the runner in its own process is answered as its socket answers it: the first
+    /// is the request, its events come back and then its end, and a lane's news is its session's.
+    #[test]
+    fn step18_a_request_in_this_process_is_answered_as_the_socket_answers_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (handle, _to_server) = node(dir.path())?;
+        let here = crate::reach::local::Here { handle, me: "here".into(), host: None, session: "lane-s2".into() };
+        let mut asked = here.ask();
+        asked.send(&crate::reach::local::Req::Status)?;
+        let status = asked.event()?;
+        anyhow::ensure!(matches!(status, Some(crate::reach::local::Ev::Status(ref s)) if serde_json::from_str::<Value>(s).is_ok()), "{status:?}");
+        anyhow::ensure!(asked.event()?.is_none(), "the answer goes on past its end");
+        let mut told = here.ask();
+        told.send(&crate::reach::local::Req::Told(serde_json::to_string(&crate::reach::told::RunNews::default())?))?;
+        anyhow::ensure!(matches!(told.event()?, Some(crate::reach::local::Ev::Answer(_))), "news of no run isn't answered");
+        Ok(())
     }
 }

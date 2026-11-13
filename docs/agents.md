@@ -1264,8 +1264,12 @@ to `s28-pi-agentfile`).
   "kiln's MCP rides the agent-control lane (D254)"). That covers a destination or a remote MCP
   server that is the machine its runner is (`host.docker.internal`; a loopback, link-local or
   unspecified address; a network's own gateway) or kiln's server (the hosts its configuration
-  names). Other remote MCP servers, a GitHub MCP for one, stay yours to grant by name. The runner's
-  end of the lane is still to come.
+  names). Other remote MCP servers, a GitHub MCP for one, stay yours to grant by name. The runner
+  answers each lane connection itself, in its own process, with no socket of the machine, on every
+  OS kiln runs on, Windows included: the same tools `kiln reach mcp` gives a harness on its machine.
+  A run on another machine still needs the runner's own launches, which only a Unix runner holds
+  today. Each call over the lane is logged on the runner (`kiln.mcp.lane`), naming its session and
+  tool. What's still to come is the launch handing each connection to it.
 - **Use a tool its image doesn't have.** The project's toolchain comes from the image: build your
   own Agentfile on your project's image (above).
 - **Move to another machine, or switch to another harness.** Not yet: it stays where it started, in
@@ -1287,7 +1291,7 @@ What this page describes, once an isolated agent's start goes through:
 | The Changes tab, Commits, Compare, whose a file is, a subagent's edits, change requests | Works: the project is at its own path inside, so kiln reads its diffs, HEAD and checkpoints where it always does. |
 | Continuing a past session | Works: kiln reads its transcript from your volume on the machine. |
 | Its harness's settings, sign-in and memories | Kept in your volume, yours alone; no credential leaves it. |
-| Agents that run agents, and kiln's other tools | Not yet: through kiln's MCP, which comes over the link kiln drives the harness by (its own MCP lane, through the bridge `/run/shards/mcp` each harness names), never the network, on every OS; what it starts is isolated too. The runner's end of the lane is still to come. Pi takes no MCP server from kiln. |
+| Agents that run agents, and kiln's other tools | Not yet: through kiln's MCP, which comes over the link kiln drives the harness by (its own MCP lane, through the bridge `/run/shards/mcp` each harness names), never the network, on every OS, answered by the runner in its own process; what it starts is isolated too. The launch handing the lane's connections to the runner is still to come. Pi takes no MCP server from kiln. |
 | Skills kiln installs, and kiln's own | Its plugin folders are plugged in read-only at their own paths as it starts. |
 | Files in messages | A file in your project or in its home shows; one on the microVM's scratch (`/tmp`) can't, as it's nowhere on the machine. |
 | What it leaves running | Inside its microVM, and ends with it. |
