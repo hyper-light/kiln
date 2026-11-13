@@ -90,6 +90,7 @@ hyper-transport = { path = "vendor/hyper-raft/crates/hyper-transport" }
 hex-api = { path = "vendor/hex/crates/hex-api" }
 hex-core = { path = "vendor/hex/crates/hex-core" }
 hex-node = { path = "vendor/hex/crates/hex-node" }
+hex-quic = { path = "vendor/hex/crates/hex-quic" }
 rquickjs-sys = { path = "vendor/shards/vendor/rquickjs-sys" }
 seccompiler = { path = "vendor/hex/vendor/seccompiler" }
 shards-agentfile = { path = "vendor/shards/crates/agentfile" }
