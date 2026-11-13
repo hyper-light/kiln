@@ -673,6 +673,11 @@ pub enum Status {
     Exited,
     /// Its machine is not connected right now (the agent keeps running there).
     Disconnected,
+    /// Its harness's process is gone while its machine is connected: no runner of it holds the
+    /// session (the runner process that held it ended, and the one there now didn't take it).
+    /// Offline is only ever a machine that is: this one is resumed in place, under its id
+    /// (`POST /api/harness/sessions/{id}/resume`, `agents.resume`). Why: its `exit`.
+    Crashed,
 }
 
 /// A decision the agent is waiting for: a tool call to approve, questions to answer, a plan.

@@ -141,6 +141,21 @@ impl Updates {
         self.in_flight.remove(key);
     }
 
+    /// One item of `key` that's kept elsewhere until the server has it (a session's mail flow: its
+    /// journal, which a replay sends again), so a stream that has no room for it goes on without
+    /// it rather than start over. False when it wasn't taken: not started, starting over, or no
+    /// room (its stream's or all of them together). 2026-11-12: a replay of a session's journal
+    /// larger than its stream's room filled it before any of it went, the stream started over,
+    /// its start asked for the replay again, and so on without end: its snapshot made again and
+    /// sent about once a second, for hours.
+    pub fn push_kept(&mut self, key: &str, body: Vec<u8>) -> bool {
+        if !self.started(key) || self.stale.contains(key) || self.tx.backlog().saturating_add(body.len()) > self.total {
+            return false;
+        }
+        let stream = self.stream(key);
+        self.tx.push(&stream, body).is_ok()
+    }
+
     /// One item of `key` (its bytes: an encoded `AgentMsg`). False when its stream isn't taking
     /// items: not started, starting over, or full (then it starts over later, its picture first,
     /// and this item is in that picture).
@@ -463,6 +478,37 @@ mod tests {
         assert_eq!(u.unanswered(), 0, "what it kept went with it");
         start(&mut u, "s:x", 1);
         assert!(u.push("s:x", vec![0; 16]));
+    }
+
+    /// 2026-11-12: a session's mail journal replayed into a stream without room for it made the
+    /// stream start over, and its start asked for the replay again, without end. What's kept
+    /// elsewhere (`push_kept`) is refused when there's no room, its stream going on: it takes no
+    /// more until answers make room, never starts over for it, and takes its other items as before.
+    #[test]
+    fn kept_items_past_the_room_leave_the_stream_going() {
+        let base = Instant::now();
+        let mut u = Updates::with("boot1", 64, PATIENCE);
+        let mut s = Server::new();
+        start(&mut u, "s:x", 1);
+        u.on_frame(s.rx.have());
+        for a in s.take(u.poll(base)) {
+            u.on_frame(a);
+        }
+        let stream = u.stream("s:x");
+        let mut kept = 0;
+        while u.push_kept("s:x", vec![0; 16]) {
+            kept += 1;
+            assert!(kept < 10, "the room bounds what's kept");
+        }
+        assert!(kept > 0);
+        assert!(u.take_stale().is_empty(), "no room for a kept item starts nothing over");
+        assert_eq!(u.stream("s:x"), stream, "the same stream goes on");
+        // Answered, there's room again.
+        for a in s.take(u.poll(base)) {
+            u.on_frame(a);
+        }
+        assert!(u.push_kept("s:x", vec![0; 16]));
+        assert!(u.take_stale().is_empty());
     }
 
     /// A session whose snapshot is larger than a stream's room (a long Codex session's was 10 to
