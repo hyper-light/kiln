@@ -1,0 +1,9 @@
+ROOT's call for goal 61 part 4 on Goose's, opencode's and pi's providers, 2026-11-13, verbatim, as ROOT sent it to
+part 4's implementer in answer to its question (the plan's "each provider their docs list" against the person's bar
+of zero breaks against today):
+
+Goal 61 part 4: my call is your recommendation, the same shape as agy. Each built-in names every provider its pinned build reaches at a fixed public host. Each host is cited to that provider's own API docs and to the harness's source. A host neither backs is dropped and recorded. Each run is narrowed at launch to its configured provider (goal 60's launch, the same rule as agy's sign-ins). Hosts the person gives (Azure, Bedrock, Vertex, local servers, *_HOST overrides) stay out, as now. Zero breaks beats the plan's literal "docs list", so record it as ROOT's call, 2026-11-13, citing the person's bar. Send goal 60's agent the per-harness provider-selection rules together with agy's.
+
+Part 4 then told ROOT that opencode 2.2.7 reads its provider catalog from models.opencode.ai, not models.dev, and drives
+every catalog provider its packages ship (about 220 fixed hosts, not about 32), and that it proceeds with the rule as
+decided unless ROOT caps opencode at its own provider modules. No cap came.
