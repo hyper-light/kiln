@@ -195,7 +195,9 @@ pub fn message_for(id: &str, agent: &str) -> String {
 
 /// Send `b` to the agents it asks for among `among`, the agents its caller acts on
 /// (`lineage::reached`): every picked agent at once. `by`: whose it is (the agent and person it comes
-/// from): a key is its caller's, so another caller's same key is another broadcast.
+/// from, as `ops::key_scope` names a caller): a key is its caller's, so another caller's same key is
+/// another broadcast, and each message goes into custody as its sender's (kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 35: a person's held to no depth), never as kiln's own.
 pub async fn run(hub: &Arc<Hub>, b: &Broadcast, by: &str, among: &[Info]) -> anyhow::Result<Report> {
     let prompt = b.text.as_deref().is_some_and(|t| !t.trim().is_empty()) || !b.attachments.is_empty();
     let given = [prompt, b.command.is_some(), b.approvals.is_some()].into_iter().filter(|x| *x).count();
@@ -343,5 +345,32 @@ mod tests {
         // A send's id is made the same way.
         let send = Broadcast { command: Some(json!({"type": "send", "id": "theirs", "text": "go"})), ..b };
         assert!(matches!(plan(&send, &info, None, &[], &client).as_deref(), Ok([Command::Send { id, .. }]) if *id == client));
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: Mission Control's broadcast (`POST
+    /// /api/harness/broadcast`) and a command for several agents send each message as whoever sent
+    /// it (`by`), never as kiln's own (`server`): a person's waits in the persons' part, held to no
+    /// depth, an agent's is held to the recipient's.
+    #[test]
+    fn s35_a_broadcast_goes_into_custody_as_its_senders_never_kilns_own() -> anyhow::Result<()> {
+        use crate::proto::{AgentMsg, CAP_INBOX, CAP_UNREAD, CAP_WIRE};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::hub_with_runner(crate::rt::clock(), "mac", CAP_UNREAD | CAP_WIRE | CAP_INBOX).await?;
+            hub.instances.update(|i| i.set_features(1, vec![crate::proto::feature::MAIL_FLOW.to_owned()]));
+            let info = Info { id: "s1".into(), kind: "claude".into(), ..Default::default() };
+            let open = super::super::core::Update::Open { info: Box::new(info.clone()), since: None };
+            crate::hub::tests::hear_item(&hub, 1, "s:s1#a1", 1, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&open)? }).await?;
+            anyhow::ensure!(!super::super::mail_delivery::legacy_owner(&hub, "s1"), "its runner speaks mail-flow");
+            for by in ["admin", "user:ada", "agent:a1"] {
+                let b = Broadcast { to: To { ids: vec!["s1".into()], ..To::default() }, text: Some("how far along is it?".into()), attachments: Vec::new(), mode: None, command: None, approvals: None, key: None };
+                let report = run(&hub, &b, by, std::slice::from_ref(&info)).await?;
+                anyhow::ensure!(report.retained == 1, "{by}'s is taken into custody and waits: {report:?}");
+            }
+            let demand = super::super::mail::waiting_peers(&hub.store, "s1".into(), 0, super::super::state_view::FRAME).await?;
+            let mut senders: Vec<String> = demand.items.iter().map(|head| head.peer.clone()).collect();
+            senders.sort();
+            anyhow::ensure!(senders == ["admin", "agent:a1", "user:ada"], "each waits as its sender's, none as kiln's own: {senders:?}");
+            Ok(())
+        })
     }
 }
