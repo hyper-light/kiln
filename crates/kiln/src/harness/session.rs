@@ -1287,8 +1287,8 @@ async fn preparation_failed(s: &Session, failure: PreparationFailure) {
 enum Ctl {
     Cmd(Box<Command>),
     /// Owned Reach state or its input's admission changed; publish through this driver, never a
-    /// stale parallel snapshot. A running harness takes it as [`Ctl::Room`] too: what its input
-    /// held may go now.
+    /// stale parallel snapshot. A session takes it as [`Ctl::Room`] too: what its input held may go
+    /// now, and a start asked while its harness was down may happen.
     OwnedChanged,
     /// A persisted legacy promotion changed; its body work stays on this owner.
     Promotion,
@@ -4406,9 +4406,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
     // What its machine was last told of how it stands for its agent limit, and whether anything
     // waits to go to its harness.
     let mut stood: Option<(Work, bool)> = None;
-    // Down, it starts again once there's room on its machine (a person restarted it, or it came
-    // back by itself after a crash).
-    let mut restart_wanted = false;
+    // Down, it was asked to start and `Core::has_room` held it: a person restarted it or sent it
+    // work, or its wait after its process ended was over. It starts once there's room (`Ctl::Room`,
+    // `Ctl::OwnedChanged`). What only waits in its queue (the pick-up of a turn its end cut short)
+    // asks nothing, so its wait is never cut short.
+    let mut start_asked = false;
     // Moved here: on once its folder's last changes are (after a restart too: its state says so).
     let arriving = s.core.lock().state.arriving.clone();
     if let Some(mark) = arriving {
@@ -5270,13 +5272,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 let mut core = s.core.lock();
                 let queued = !core.state.queue.is_empty() && core.state.pause.is_none() && !core.hold;
                 // Nothing waits to start it again: it waits for room no longer.
-                let unwaited = !(restart_wanted || !carry.is_empty() || queued) && core.state.room_wait.take().is_some();
+                let unwaited = !(start_asked || !carry.is_empty() || queued) && core.state.room_wait.take().is_some();
                 if unwaited {
                     core.touch_state();
                 }
                 (queued, unwaited)
             };
-            let stands = (Work::No, restart_wanted || !carry.is_empty() || queued);
+            let stands = (Work::No, start_asked || !carry.is_empty() || queued);
             if stood != Some(stands) || unwaited {
                 stood = Some(stands);
                 (files.work)(stands.0, stands.1);
@@ -5317,7 +5319,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         if s.core.lock().has_room() {
                             break;
                         }
-                        restart_wanted = true;
+                        start_asked = true;
                     }
                     Command::Snapshot => {
                         for u in s.snapshot() {
@@ -5379,6 +5381,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             if room {
                                 break;
                             }
+                            start_asked = true;
                         } else if core.has_room() {
                             drop(core);
                             carry.push(c);
@@ -5394,6 +5397,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 c => carry.push(c),
                             }
                             drop(core);
+                            start_asked = true;
                             on_change();
                         }
                     }
@@ -5452,12 +5456,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 Ev::Ctl(Some(Ctl::Hook(_, reply))) => {
                     let _ = reply.send(serde_json::json!({}));
                 }
-                // There may be room on its machine now: it starts again if anything waits for that,
-                // the first message in its queue first.
-                Ev::Ctl(Some(Ctl::Room)) => {
+                // There may be room on its machine now, or its input may take writes again
+                // (`Session::input_changed`), each of which `Core::has_room` holds a start for: it
+                // starts again if it was asked to, the first message in its queue first (kiln plan
+                // 01a1cd8e862e7169a074db3d5fa33f3d step 35: a restart asked while its input
+                // restored stayed held). Nobody asked, its wait (`again_at`) starts it, never this.
+                Ev::Ctl(Some(Ctl::Room | Ctl::OwnedChanged)) => {
                     let mut core = s.core.lock();
-                    let queued = !core.state.queue.is_empty() && core.state.pause.is_none() && !core.hold;
-                    if (restart_wanted || !carry.is_empty() || queued) && core.has_room() {
+                    if start_asked && core.has_room() {
+                        let queued = !core.state.queue.is_empty() && core.state.pause.is_none() && !core.hold;
                         if carry.is_empty() && queued {
                             let q = core.state.queue.remove(0);
                             core.touch_state();
@@ -5466,11 +5473,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         break;
                     }
                 }
-                Ev::Ctl(Some(Ctl::OwnedChanged)) => {},
                 Ev::Ctl(Some(Ctl::Promotion)) => progress_promotion(&s, &files).await,
                 Ev::InputBudget => { if publish_input_budget(&s) && promotion_pending(&s) { progress_promotion(&s, &files).await; } },
                         Ev::PromotionJournal => progress_promotion(&s, &files).await,
-                Ev::Ctl(Some(Ctl::ArchiveQuiet(reply))) => {let _=reply.send(s.archive_quiet_now(restart_wanted || !carry.is_empty() || !for_room.is_empty() || moving.is_some() || switching.is_some() || reloading));},
+                Ev::Ctl(Some(Ctl::ArchiveQuiet(reply))) => {let _=reply.send(s.archive_quiet_now(start_asked || !carry.is_empty() || !for_room.is_empty() || moving.is_some() || switching.is_some() || reloading));},
                 Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&s, &files, e).await,
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
                     s.stop_owned_reach(None);
@@ -5507,7 +5513,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 break;
             }
         }
-        restart_wanted = false;
+        start_asked = false;
     }
 }
 
