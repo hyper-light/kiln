@@ -32,13 +32,18 @@ pub mod stream;
 
 /// The package's format, newest: one of a version this runner doesn't know is refused, never
 /// guessed at. 2 added [`Carry::Words`]; 3, what the harness keeps in its home
-/// ([`Package::home`]); 4 adds a mail manifest followed by its exact journal row stream. A package without them stays 1, so older runners still take it; one with
+/// ([`Package::home`]); 4 adds a mail manifest followed by its exact journal row stream; 5,
+/// [`Carry::Native`]. A package without them stays 1, so older runners still take it; one with
 /// them, an older runner refuses whole rather than take it without them.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// The format a package with `carry` is.
 fn version_of(carry: &Carry) -> u32 {
-    if matches!(carry, Carry::Words { .. }) { 2 } else { 1 }
+    match carry {
+        Carry::Words { .. } => 2,
+        Carry::Native { .. } => 5,
+        _ => 1,
+    }
 }
 
 /// Whether a runner taking packages up to [`VERSION`] reads one of `version`.
@@ -70,6 +75,16 @@ pub enum Carry {
     /// The conversation in words, from kiln's timeline, for a harness whose own record kiln
     /// doesn't keep: it's given them with the first message it gets.
     Words { text: String },
+    /// Resumed in place (a crashed session on its own machine): the harness's own record of its
+    /// conversation is there, so it goes on natively by its own id (`spec.resume`: Claude Code's
+    /// session, Codex's thread, an ACP agent's session for `session/load`, Antigravity's, Pi's).
+    /// `words`: the conversation in words, for an ACP agent that turns out not to load sessions
+    /// (it's given them with its first message, and says so); dropped where it loads.
+    Native {
+        session: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        words: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,7 +254,7 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
     spec.resume_at = None;
     spec.fork = false;
     match &carry {
-        Carry::ClaudeLines { session, .. } => spec.resume = Some(session.clone()),
+        Carry::ClaudeLines { session, .. } | Carry::Native { session, .. } => spec.resume = Some(session.clone()),
         Carry::Seed { .. } | Carry::Words { .. } | Carry::Nothing => spec.resume = None,
     }
     Package {
@@ -271,7 +286,7 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
 pub fn transcript_of(carry: &Carry) -> &[String] {
     match carry {
         Carry::ClaudeLines { lines, .. } => lines,
-        Carry::Seed { .. } | Carry::Nothing | Carry::Words { .. } => &[],
+        Carry::Seed { .. } | Carry::Nothing | Carry::Words { .. } | Carry::Native { .. } => &[],
     }
 }
 
@@ -291,19 +306,25 @@ pub fn install(pkg: &Package, cwd: &str) -> Result<Option<Vec<Value>>, String> {
             let config = super::transcript::config_dir(&pkg.spec.env);
             // A record of the session here already is the one it left moving away (it comes back):
             // the one coming holds all of it and what came since, and takes its place. One with
-            // turns of its own (resumed here meanwhile) is never written over.
+            // turns of its own (resumed here meanwhile, or a crashed one resumed in place after it
+            // went on here: Amphora, 2026-11-13) is never written over: holding all the one coming
+            // holds, it's what the session goes on from; turns of each the other lacks, refused.
             let left = super::transcript::find(&config, session);
+            let mut body = lines.join("\n");
             if let Some(old) = &left {
                 let had = std::fs::read_to_string(old).map_err(|e| format!("read {}: {e}", old.display()))?;
                 if !holds_all_of(lines, &had) {
-                    return Err(format!("Claude Code here has turns of session {session} that the one coming doesn't, and they are never written over"));
+                    let here: Vec<String> = had.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect();
+                    if !holds_all_of(&here, &body) {
+                        return Err(format!("Claude Code here has turns of session {session} that the one coming doesn't, and it has turns this one doesn't: neither is written over"));
+                    }
+                    body = here.join("\n");
                 }
             }
             let dir = super::handoff::claude_project_dir(&config, cwd);
             std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
             let path = dir.join(format!("{session}.jsonl"));
             let part = dir.join(format!(".{session}.jsonl.part"));
-            let mut body = lines.join("\n");
             body.push('\n');
             if let Err(e) = std::fs::write(&part, body).and_then(|()| std::fs::rename(&part, &path)) {
                 let _ = std::fs::remove_file(&part);
@@ -325,6 +346,8 @@ pub fn install(pkg: &Package, cwd: &str) -> Result<Option<Vec<Value>>, String> {
         }
         // Given to the harness with the first message it gets (`Adapter::seed`).
         Carry::Words { text } => Ok(Some(vec![serde_json::json!({"type": CONTEXT, "text": text})])),
+        // Its own record is here: nothing to write; the words only for an agent that can't load it.
+        Carry::Native { words, .. } => Ok(words.as_ref().map(|text| vec![serde_json::json!({"type": CONTEXT, "text": text})])),
         Carry::Nothing => Ok(None),
     }
 }
@@ -342,7 +365,7 @@ pub fn install_home(pkg: &Package, cwd: &str, folder: bool) -> Vec<String> {
 fn install_home_in(pkg: &Package, dirs: &super::homes::Dirs, cwd: &str, folder: bool) -> Vec<String> {
     let Some(home) = &pkg.home else { return Vec::new() };
     let session = match &pkg.carry {
-        Carry::ClaudeLines { session, .. } => Some(session.as_str()),
+        Carry::ClaudeLines { session, .. } | Carry::Native { session, .. } => Some(session.as_str()),
         Carry::Seed { .. } | Carry::Nothing | Carry::Words { .. } => pkg.spec.resume.as_deref(),
     };
     super::homes::install(home, &pkg.spec.kind, dirs, session, cwd, &pkg.from, folder)
@@ -372,7 +395,7 @@ mod tests {
         let pkg = pack("s1", spec, "/home/b/w", "a", "/home/a/w", carry, vec![], State::default());
         // A new conversation there, given the words; a package an older runner can tell it can't take.
         assert_eq!((pkg.spec.resume.as_deref(), pkg.version), (None, 2));
-        assert!(takes(pkg.version) && takes(1) && takes(3) && !takes(4));
+        assert!(takes(pkg.version) && takes(1) && takes(VERSION) && !takes(VERSION + 1));
         let items = install(&pkg, "/home/b/w").map_err(anyhow::Error::msg)?.unwrap_or_default();
         assert_eq!(items.first().and_then(|i| i.get("type")).and_then(Value::as_str), Some(CONTEXT));
         // Claude Code's and Codex's packages stay as older runners read them.
@@ -412,6 +435,53 @@ mod tests {
         Ok(())
     }
 
+    /// Ada, 2026-11-13: a crashed session resumed in place starts every harness kiln supports
+    /// natively on its own stored id: Claude Code `--resume`, Antigravity `--conversation`, Pi
+    /// `--session-id`, Codex `thread/resume` with its `threadId`, an ACP agent `session/load` with
+    /// its `sessionId` (where it advertises `loadSession`); the words only for an ACP agent.
+    #[test]
+    fn resume_in_place_every_harness_starts_natively_on_its_own_id() -> anyhow::Result<()> {
+        use super::super::kinds::{Kind, Protocol};
+        let has = |a: &[String], f: &str| a.windows(2).any(|w| matches!(w, [flag, v] if flag == f && v == "own-1"));
+        let asked = |core: &mut super::super::core::Core, method: &str| -> Option<Value> {
+            core.take_writes().iter().filter_map(|w| serde_json::from_str::<Value>(w).ok()).find(|v| v.get("method").and_then(Value::as_str) == Some(method))
+        };
+        for k in Kind::all() {
+            let words = matches!(k.protocol, Protocol::Acp(_)).then(|| "earlier".to_owned());
+            let pkg = pack("s1", Spec { kind: k.id.into(), ..Spec::default() }, "/w", "box", "/w", Carry::Native { session: "own-1".into(), words }, Vec::new(), State::default());
+            assert_eq!((pkg.spec.resume.as_deref(), pkg.version), (Some("own-1"), 5), "{}", k.id);
+            let seeded = install(&pkg, "/w").map_err(anyhow::Error::msg)?;
+            assert_eq!(seeded.is_some(), matches!(k.protocol, Protocol::Acp(_)), "{}: words only for ACP", k.id);
+            match k.protocol {
+                Protocol::ClaudeStreamJson => assert!(has(&super::super::claude::args(&pkg.spec, None), "--resume"), "{}", k.id),
+                Protocol::AgyStreamJson => assert!(has(&super::super::antigravity::args(&pkg.spec), "--conversation"), "{}", k.id),
+                Protocol::PiRpc => assert!(has(&super::super::pi::args(&pkg.spec), "--session-id"), "{}", k.id),
+                Protocol::CodexAppServer => {
+                    let mut core = super::super::core::Core::new();
+                    core.state.cwd = "/w".into();
+                    let mut c = super::super::codex::Codex::from_spec(&pkg.spec);
+                    c.start(&mut core);
+                    let _ = core.take_writes();
+                    c.line(&mut core, &serde_json::json!({"id": 1, "result": {}}).to_string());
+                    let r = asked(&mut core, "thread/resume").unwrap_or_default();
+                    assert_eq!(r.pointer("/params/threadId").and_then(Value::as_str), Some("own-1"), "{}", k.id);
+                }
+                Protocol::Acp(_) => {
+                    let mut core = super::super::core::Core::new();
+                    core.state.cwd = "/w".into();
+                    let mut a = super::super::acp::Acp::from_spec(&pkg.spec);
+                    a.start(&mut core);
+                    let _ = core.take_writes();
+                    a.line(&mut core, &serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}}).to_string());
+                    let r = asked(&mut core, "session/load").unwrap_or_default();
+                    assert_eq!(r.pointer("/params/sessionId").and_then(Value::as_str), Some("own-1"), "{}", k.id);
+                }
+                Protocol::Terminal => {}
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn a_claude_transcript_lands_where_claude_code_looks_for_the_new_folder() -> anyhow::Result<()> {
         let config = tempfile::tempdir()?;
@@ -444,9 +514,13 @@ mod tests {
         assert!(found.starts_with(super::super::handoff::claude_project_dir(config.path(), &now)));
         assert_eq!(std::fs::read_to_string(&found)?.lines().count(), 4);
         assert!(!super::super::handoff::claude_project_dir(config.path(), &then).join("abc.jsonl").exists(), "one record of a session, not two");
-        // A record here with a turn the one coming doesn't have stays as it is.
-        let err = put(&now, vec![msg("u1"), msg("u2")]).err().unwrap_or_default();
-        assert!(err.contains("never written over"), "{err}");
+        // A record here with a turn the one coming doesn't have stays as it is, and the session goes
+        // on from it (Amphora, 2026-11-13: resumed in place after it went on here).
+        put(&now, vec![msg("u1"), msg("u2")]).map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(std::fs::read_to_string(&found)?.lines().count(), 4, "the record here, as it was");
+        // Turns of each the other lacks: neither is written over.
+        let err = put(&now, vec![msg("u1"), msg("u9")]).err().unwrap_or_default();
+        assert!(err.contains("neither is written over"), "{err}");
         assert_eq!(std::fs::read_to_string(&found)?.lines().count(), 4);
         Ok(())
     }

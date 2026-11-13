@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { ownAgentAction } from "@/lib/own-agent-action";
-import { ApiError, mailScope, onAuthChange, onMailScopeChange, request, wsUrl } from "@/api/client";
+import { ApiError, identifiedMailScope, mailScope, onAuthChange, onMailScopeChange, request, wsUrl } from "@/api/client";
 import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import { readFrame, unread } from "./frames";
@@ -590,6 +590,8 @@ export const harnessApi = {
   /** Move an agent to runner `to`: once its turn is over, or `now` (the turn stops here and goes on there). */
   move: (id: string, to: string, now = false, kind?: string, model?: string) =>
     call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to, now, ...(kind ? { kind } : {}), ...(model ? { model } : {}) }),
+  /** Resume a crashed agent in place: a fresh harness under its id, its conversation, plans, goals and subagents its own. */
+  resume: (id: string) => call<{ resumed: unknown; subagents: string[] }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/resume`),
   /** Every agent of `machine`, which is gone, goes on elsewhere from the server's copy of its conversation: each on the machine that suits it, or all on `to`. */
   recover: (machine: string, to?: string) =>
     call<{ moved: { id: string; name: string; to?: string; error?: string }[] }>("POST", `/api/harness/machines/${encodeURIComponent(machine)}/recover`, to ? { to } : {}),
@@ -1175,7 +1177,8 @@ export class SessionStore {
 
   private async retryMail(connection = false) {
     const owner = mailScope();
-    if (!(await useHeld.getState().ready()) || owner !== mailScope()) return;
+    await useHeld.getState().ready();
+    if (owner !== mailScope()) return;
     if (this.disposed || this.speculation || this.ws?.readyState !== WebSocket.OPEN || !this.opened) return;
     this.restoreMail();
     const wake = this.mailWake();
@@ -1209,12 +1212,13 @@ export class SessionStore {
   private mailWaiting(id: string, code: string) {
     const original = this.originals().find((message) => message.id === id);
     const going = this.out.get(id);
-    if (!original || !going) return;
-    const retained = going.publication ?? original.publication;
+    if (!going) return;
+    const retained = going.publication ?? original?.publication;
     const why = retained ? "Queued in Kiln; it goes to the agent as soon as it takes messages" : `${waitingFor(code)}; the original message and files are saved here`;
-    this.saveMail(
-      useHeld.getState().hold(this.id, { ...original, custody: retained ? "retained" : "waiting", publication: retained, wait: this.mailWake() ?? `connection:${this.mailConnection}`, why }),
-    );
+    // Refused before the server took it: the sender's to keep (this browser's copy stays and is
+    // offered again on the next wake). With a receipt the server has it, and the copy goes.
+    if (retained) this.saveMail(useHeld.getState().settled(this.id, id));
+    else if (original) this.saveMail(useHeld.getState().hold(this.id, { ...original, custody: "waiting", wait: this.mailWake() ?? `connection:${this.mailConnection}`, why }));
     const asked = this.asked.get(id);
     if (asked) this.asked.set(id, { ...asked, mail: true, waiting: true, why });
     this.out.set(id, { ...going, o: { ...going.o, state: retained ? "retained" : "waiting", why } });
@@ -1229,8 +1233,8 @@ export class SessionStore {
     }
     const original = this.originals().find((message) => message.id === id);
     const going = this.out.get(id);
-    if (!original || !going || receipt.id !== id) return;
-    const known = going.publication ?? original.publication;
+    if (!going || receipt.id !== id) return;
+    const known = going.publication ?? original?.publication;
     if (known && (known.revision !== receipt.revision || known.generation > receipt.generation)) return;
     this.out.set(id, { ...going, publication: receipt });
     if (receipt.disposition === "admitted" || receipt.disposition === "consumed") {
@@ -1245,7 +1249,8 @@ export class SessionStore {
       : receipt.disposition === "transferred"
         ? "Queued in Kiln while the agent moves to another machine"
         : "Queued in Kiln; it goes to the agent as soon as it takes messages";
-    this.saveMail(useHeld.getState().hold(this.id, { ...original, custody: terminal ? "failed" : "retained", publication: receipt, why }));
+    // The server's receipt: it holds the message now, so this browser's copy goes (W20 custody).
+    this.saveMail(useHeld.getState().settled(this.id, id));
     this.out.set(id, { ...going, publication: receipt, o: { ...going.o, state: terminal ? "failed" : "retained", why, fresh: terminal } });
     const asked = this.asked.get(id);
     if (terminal) this.asked.delete(id);
@@ -1521,34 +1526,43 @@ export class SessionStore {
     return true;
   };
 
-  /** Only transaction completion transfers the caller's original into browser custody. */
+  /**
+   * Sends `c` to the server now: the server's durable waiting is its record (W20, docs/wire.md
+   * "mail-flow"). This browser keeps a copy only until the server takes it, a backup and never a
+   * gate (2026-11-13: saving it here first, every send, failed them all when it failed): the copy
+   * goes into memory in the same moment the message goes out, and to IndexedDB after, unawaited.
+   * A sign-in not identified yet is asked for first; one identity bound to other saved words or
+   * files is refused, as the server would.
+   */
   sendMail = async (c: Extract<Command, { type: "send" }>, originals?: Held["originals"]): Promise<boolean> => {
-    const owner = mailScope();
     this.promote();
-    if (this.disposed || !owner) return false;
-    if (!(await useHeld.getState().ready())) {
-      this.patch({ error: useHeld.getState().error });
-      return false;
-    }
-    if (this.disposed || owner !== mailScope()) return false;
-    const previous = this.originals().find((message) => message.id === c.id);
+    if (this.disposed) return false;
+    const owner = mailScope() ?? (await identifiedMailScope());
+    if (this.disposed) return false;
+    const previous = owner ? this.originals().find((message) => message.id === c.id) : undefined;
     if (previous?.custody && JSON.stringify(heldCommand(previous)) !== JSON.stringify(c)) {
       this.patch({ error: "That message identity already belongs to different saved words or files. Keep the original and send the edit as a new message." });
       return false;
     }
     const at = previous?.at ?? Date.now();
-    if (!(await useHeld.getState().hold(this.id, heldFrom(c, at, { custody: "offered", wait: this.mailWake() ?? undefined, publication: previous?.publication, originals })))) {
-      this.patch({ error: useHeld.getState().error });
-      return false;
-    }
-    if (owner !== mailScope() || this.disposed) return true;
+    // Memory has the copy before the frame goes (its receipt finds it); the write isn't awaited.
+    if (owner) this.saveMail(useHeld.getState().hold(this.id, heldFrom(c, at, { custody: "offered", wait: this.mailWake() ?? undefined, publication: previous?.publication, originals })));
     this.track(c);
-    if (this.ws?.readyState === WebSocket.OPEN) this.offerMail(c, at);
-    else {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.offerMail(c, at);
+      return true;
+    }
+    // No socket: the server takes it now by its command, and holds it.
+    try {
+      await harnessApi.command(this.id, c, c.id);
+      if (owner) this.saveMail(useHeld.getState().settled(this.id, c.id));
+      return true;
+    } catch {
+      // Not taken: the copy here (if this browser could keep one) goes when the socket's back.
       this.want();
       this.restoreMail();
+      return !!owner;
     }
-    return true;
   };
 
   /**
@@ -2412,7 +2426,9 @@ export class SessionStore {
       const m = this.out.get(id);
       if (!m || m.o.state === "sent") continue;
       const original = this.originals().find((message) => message.id === id);
-      if (original) this.saveMail(useHeld.getState().hold(this.id, { ...original, custody: m.publication && !fresh ? "retained" : "failed", publication: m.publication, why }));
+      // The server holds what it gave a receipt for (its history keeps every original): this
+      // browser's copy goes. One it never took stays here, the sender's to send again.
+      if (original) this.saveMail(m.publication ? useHeld.getState().settled(this.id, id) : useHeld.getState().hold(this.id, { ...original, custody: "failed", why }));
       if (m.publication && !fresh) {
         this.out.set(id, { ...m, o: { ...m.o, state: "retained", why: "Queued in Kiln; it goes once the agent's machine is back" } });
         changed = true;

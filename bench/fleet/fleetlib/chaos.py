@@ -37,12 +37,13 @@ def kill_in_scope(pid: int, start: str, scope_pids: Dict[int, str]) -> str:
     return procs.kill(pid, start)
 
 
-def parse(spec: str) -> List[str]:
-    """`--chaos vm,daemon,client` into its actions, each known; `none` is no chaos."""
+def parse(spec: str, known: Sequence[str] = ACTIONS) -> List[str]:
+    """`--chaos vm,daemon,client` into its actions, each one the driver takes (`known`: the direct
+    driver's by default; Hex's are vm, node and scheduler); `none` is no chaos."""
     if spec.strip() in ("", "none"):
         return []
     out = [a.strip() for a in spec.split(",") if a.strip()]
-    unknown = [a for a in out if a not in ACTIONS]
+    unknown = [a for a in out if a not in known]
     if unknown:
-        raise ValueError(f"unknown chaos actions {unknown}: the actions are {', '.join(ACTIONS)}")
+        raise ValueError(f"unknown chaos actions {unknown}: the actions are {', '.join(known)}")
     return out

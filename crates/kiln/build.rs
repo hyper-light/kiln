@@ -65,6 +65,39 @@ fn main() {
 
     ui_server();
     ui_packed();
+    shards_carried();
+}
+
+/// The Shards this kiln carries (`crate::shards`, docs/shards.md): its binary and its VM and network
+/// processes for the platform it's built for, from `target/shards-carried/<target>/` (or
+/// `KILN_SHARDS_DIR`), where ci/shards/pack.sh builds them from vendor/shards, embedded under
+/// `cfg(kiln_shards)` with their paths in `KILN_SHARDS_BIN`, `KILN_SHARDS_VM` and `KILN_SHARDS_NET`.
+/// Without all three, kiln builds without Shards, and a release build says so.
+fn shards_carried() {
+    println!("cargo:rustc-check-cfg=cfg(kiln_shards)");
+    println!("cargo:rerun-if-env-changed=KILN_SHARDS_DIR");
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
+    let dir = std::env::var_os("KILN_SHARDS_DIR").map_or_else(|| manifest.join("../../target/shards-carried").join(&target), PathBuf::from);
+    let exe = if std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows") { ".exe" } else { "" };
+    // Watched only where it is, as the UI server's packs are.
+    let watch = if dir.is_dir() { Some(dir.clone()) } else { dir.parent().filter(|p| p.is_dir()).map(PathBuf::from) };
+    if let Some(w) = watch {
+        println!("cargo:rerun-if-changed={}", w.display());
+    }
+    let files: Vec<(&str, PathBuf)> = [("KILN_SHARDS_BIN", "shards"), ("KILN_SHARDS_VM", "shards-vm"), ("KILN_SHARDS_NET", "shards-net")]
+        .into_iter()
+        .map(|(var, name)| (var, dir.join(format!("{name}{exe}"))))
+        .collect();
+    if files.iter().all(|(_, f)| f.is_file()) {
+        for (var, f) in &files {
+            println!("cargo:rerun-if-changed={}", f.display());
+            println!("cargo:rustc-env={var}={}", f.display());
+        }
+        println!("cargo:rustc-cfg=kiln_shards");
+    } else if std::env::var("PROFILE").is_ok_and(|p| p == "release") {
+        println!("cargo:warning=kiln is built without Shards: its binary and VM and network processes aren't in {} (ci/shards/pack.sh builds them)", dir.display());
+    }
 }
 
 /// The UI's files worth packing (`ui/dist/client`, which rust-embed embeds), packed here with brotli and with gzip

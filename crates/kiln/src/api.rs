@@ -1447,6 +1447,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::POST, ["api", "harness", "broadcast"]) => boxed(|| harness_broadcast(&hub, req)).await,
         (&Method::POST, ["api", "harness", "broadcast", "preview"]) => boxed(|| harness_broadcast_preview(&hub, req)).await,
         (&Method::POST, ["api", "harness", "machines", machine, "recover"]) => boxed(|| harness_recover(&hub, machine, req)).await,
+        // A crashed agent resumed in place, under its id (`relocate::resume`).
+        (&Method::POST, ["api", "harness", "sessions", id, "resume"]) => match boxed(|| crate::harness::relocate::resume(&hub, id)).await {
+            Ok(v) => Ok(srv::json(StatusCode::ACCEPTED, &v)),
+            Err(e) => Err(err(StatusCode::CONFLICT, e)),
+        },
         (&Method::POST, ["api", "harness", "sessions", id, "move"]) => {
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             let to = body.get("to").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();

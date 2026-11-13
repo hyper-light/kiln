@@ -729,6 +729,12 @@ async fn interrupt(cx: Cx, v: Value) -> Out {
     }
 }
 
+async fn resume(cx: Cx, v: Value) -> Out {
+    let info = known(&cx, &agent_of(&v)?)?;
+    may_steer(&cx, &info.id).await?;
+    super::relocate::resume(&cx.hub, &info.id).await.map_err(|e| (StatusCode::CONFLICT, e))
+}
+
 /// Ends agent `id` for good, its goal stack with it (and is audited by `actor`).
 pub async fn end(hub: &crate::hub::Hub, id: &str, actor: &str) -> bool {
     if !hub.harness.close(hub, id).await {
@@ -891,6 +897,15 @@ pub fn list_ops() -> Vec<Op> {
             input: Input::of::<input::AgentsInterrupt>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "interrupt"]))),
             run: |cx, v| Box::pin(interrupt(cx, v)),
+        },
+        Op {
+            name: "agents.resume",
+            summary: "Resume a crashed agent in place (its stand `crashed`: its harness gone while its machine is up): a fresh harness process on its machine, under its id, continuing its conversation, its plans, goal stack and subagents still its own (the subagents that crashed with it resumed too).",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsInterrupt>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "resume"]))),
+            run: |cx, v| Box::pin(resume(cx, v)),
         },
         Op {
             name: "agents.change",

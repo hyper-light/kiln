@@ -7,7 +7,7 @@
 //!   bounded uplink buffer and are delivered after reconnecting.
 //! * Serves PTY terminals so the UI can drive this machine.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -732,24 +732,57 @@ impl ReplayBudget {
     }
 }
 
+/// Whose mail journals a replay reads: every session's, or these alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReplayOf {
+    All,
+    Sessions(BTreeSet<String>),
+}
+
+impl ReplayOf {
+    /// What two asks for a replay read together.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Sessions(mut a), Self::Sessions(b)) => {
+                a.extend(b);
+                Self::Sessions(a)
+            }
+            _ => Self::All,
+        }
+    }
+}
+
 enum MailReplay {
     Idle { budget: Option<ReplayBudget> },
     Reading { read: futures::future::BoxFuture<'static, bool>, before: (usize, usize) },
-    Again { read: futures::future::BoxFuture<'static, bool>, before: (usize, usize) },
+    /// Asked for again while reading: `next` is what the next read reads.
+    Again { read: futures::future::BoxFuture<'static, bool>, before: (usize, usize), next: ReplayOf },
 }
 impl Default for MailReplay { fn default() -> Self { Self::Idle { budget: None } } }
 
 impl MailReplay {
+    /// A replay of every session's journal.
     fn request(&mut self, host: Option<&Arc<crate::harness::host::Host>>) {
+        self.request_of(host, ReplayOf::All);
+    }
+
+    /// A replay of `of`'s journals (2026-11-12: a stream that started over had every session's
+    /// journal replayed, each session's mail flow sent again for one session's start).
+    fn request_of(&mut self, host: Option<&Arc<crate::harness::host::Host>>, of: ReplayOf) {
         *self = match std::mem::take(self) {
             Self::Idle { .. } => match host.cloned() {
                 Some(host) => {
                     let before = host.native_budget_counts();
-                    Self::Reading { read: Box::pin(async move { let held = host.replay_mail_transfers().await; host.replay_mail().await; held }), before }
+                    let read: futures::future::BoxFuture<'static, bool> = match of {
+                        ReplayOf::All => Box::pin(async move { let held = host.replay_mail_transfers().await; host.replay_mail().await; held }),
+                        ReplayOf::Sessions(ids) => Box::pin(async move { let held = host.replay_mail_transfers().await; host.replay_mail_of(&ids).await; held }),
+                    };
+                    Self::Reading { read, before }
                 }
                 None => Self::default(),
             },
-            Self::Reading { read, before } | Self::Again { read, before } => Self::Again { read, before },
+            Self::Reading { read, before } => Self::Again { read, before, next: of },
+            Self::Again { read, before, next } => Self::Again { read, before, next: next.and(of) },
         };
     }
 
@@ -778,14 +811,19 @@ impl MailReplay {
 
     fn finish(&mut self, host: Option<&Arc<crate::harness::host::Host>>, held: bool) {
         let (again, before) = match std::mem::take(self) {
-            Self::Reading { before, .. } => (false, before),
-            Self::Again { before, .. } => (true, before),
+            Self::Reading { before, .. } => (None, before),
+            Self::Again { before, next, .. } => (Some(next), before),
             Self::Idle { .. } => return,
         };
         let Some(host) = host else { return };
         let after = host.native_budget_counts();
-        if again || (held && ReplayBudget::new(before).improved(after)) { self.request(Some(host)); }
-        else if held { *self = Self::Idle { budget: Some(ReplayBudget::new(after)) }; }
+        // Room grew while it read: every session's journal again, as before.
+        let next = if held && ReplayBudget::new(before).improved(after) { Some(ReplayOf::All) } else { again };
+        match next {
+            Some(of) => self.request_of(Some(host), of),
+            None if held => *self = Self::Idle { budget: Some(ReplayBudget::new(after)) },
+            None => {}
+        }
     }
 }
 
@@ -2689,7 +2727,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         if draining && jobs.is_empty() && o.ephemeral {
             return Ok(());
         }
-        if retiring && jobs.is_empty() && terms.is_empty() && harness_operations.is_empty() && retire_at.is_some_and(|t| Instant::now() >= t) {
+        if retiring && jobs.is_empty() && terms.is_empty() && harness_operations.is_empty() && harness.as_ref().is_none_or(|h| h.holds_none()) && retire_at.is_some_and(|t| Instant::now() >= t) {
             tracing::info!("handed everything to the new build, and its own jobs are done: this runner retires");
             // What its tracers' spans counted, written before it goes, as a stop's is.
             crate::observe::ddtrace::finish(Duration::from_secs(3)).await;
@@ -2745,7 +2783,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         // Whether this turn's event comes off its own channel (none was taken ahead of its turn): a
         // job's end that does waits behind what its job sent (`Ev::Done`).
         let in_turn = taken.is_empty();
-        let retirement_due=retire_at.filter(|_|retiring && jobs.is_empty() && terms.is_empty() && harness_operations.is_empty());
+        let retirement_due=retire_at.filter(|_|retiring && jobs.is_empty() && terms.is_empty() && harness_operations.is_empty() && harness.as_ref().is_none_or(|h| h.holds_none()));
         let mail_budget = mail_replay.budget_observed();
         let ev = futures::select_biased! {
             () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
@@ -3167,7 +3205,37 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 }
                                 match conn.send(f, fds).and_then(|()| conn.recv()) {
                                     Ok((Frame::Ack { ok: true, .. }, _)) => acks.push(Ack::Taken),
-                                    Ok((Frame::Ack { error, .. }, _)) => acks.push(Ack::Refused(error.unwrap_or_else(|| "refused".to_owned()))),
+                                    // Refused with its process running: this runner has already let go of it
+                                    // (`Host::move_out_signing`) and the new build didn't take it, so it had no
+                                    // owner, and its process died on its first write once this runner ended
+                                    // (Amphora, 2026-11-12 21:12:49Z: absent from the new build's records).
+                                    // Its process is stopped and it goes again as its record alone, which the
+                                    // new build starts again from, its conversation resumed.
+                                    Ok((Frame::Ack { error, .. }, _)) => acks.push(match f {
+                                        Frame::Session { id, record, handed: Some(hd), hand_on } => {
+                                            let first = error.unwrap_or_else(|| "refused".to_owned());
+                                            crate::harness::host::stop_process(hd.process.pid);
+                                            let again = Frame::Session { id: id.clone(), record: record.clone(), handed: None, hand_on: hand_on.clone() };
+                                            let journal: Vec<std::os::fd::RawFd> = record.journal().map(|j| j.as_raw_fd()).into_iter().collect();
+                                            match conn.send(&again, &journal).and_then(|()| conn.recv()) {
+                                                Ok((Frame::Ack { ok: true, .. }, _)) => {
+                                                    tracing::warn!(session = %id, why = %first, "the new build didn't take an agent session with its process running: it starts again there from its record");
+                                                    Ack::Taken
+                                                }
+                                                Ok((Frame::Ack { error, .. }, _)) => Ack::Refused(format!("{first}; as its record alone: {}", error.unwrap_or_else(|| "refused".to_owned()))),
+                                                Ok(_) => {
+                                                    broke = Some("the new build answered out of turn".to_owned());
+                                                    Ack::Lost("an answer out of turn".to_owned())
+                                                }
+                                                Err(e) => {
+                                                    let e = format!("{e:#}");
+                                                    broke = Some(e.clone());
+                                                    Ack::Lost(e)
+                                                }
+                                            }
+                                        }
+                                        _ => Ack::Refused(error.unwrap_or_else(|| "refused".to_owned())),
+                                    }),
                                     Ok(_) => {
                                         broke = Some("the new build answered out of turn".to_owned());
                                         acks.push(Ack::Lost("an answer out of turn".to_owned()));
@@ -3221,10 +3289,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     match (item, ack) {
                                         (Item::Session { .. }, Ack::Taken) => sessions += 1,
                                         (Item::Terminal { .. }, Ack::Taken) => terminals += 1,
-                                        // The new build started it again from its record.
+                                        // Refused even as its record alone: nobody else holds it, so it's back here,
+                                        // started again from its record, and this runner ends with it (as a terminal
+                                        // that couldn't go), never left to no one (Amphora, 2026-11-12 21:12:49Z).
                                         (Item::Session { record, .. }, Ack::Refused(e) | Ack::Lost(e)) => {
-                                            tracing::warn!(session = %record.id(), why = %e, "the new build didn't take an agent session as it was handed over");
-                                            said.push(format!("agent session {} wasn't taken by the new build as handed over: {e}", record.id()));
+                                            let id = record.id().to_owned();
+                                            tracing::warn!(session = %id, why = %e, "the new build didn't take an agent session: it stays with this runner");
+                                            moved.remove(&crate::instances::Owned::Agent(id.clone()));
+                                            let back = match &harness {
+                                                Some(host) => host.move_in(*record, None).await.map_err(|e| format!("{e:#}")),
+                                                None => Err("this runner runs no agent sessions".to_owned()),
+                                            };
+                                            match back {
+                                                Ok(()) => said.push(format!("agent session {id} stays with this runner (the new build didn't take it: {e}); this runner ends with it")),
+                                                Err(why) => {
+                                                    tracing::error!(session = %id, why = %why, "an agent session the new build didn't take couldn't start again here");
+                                                    said.push(format!("agent session {id} wasn't taken by the new build ({e}) and couldn't start again here: {why}"));
+                                                }
+                                            }
                                         }
                                         // Back here: it ends with this runner (which waits for it).
                                         (Item::Terminal { session, state, fd, pid }, ack) => {
@@ -4580,10 +4662,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // lacks goes; a stream it lost starts over, its snapshot first.
                     ServerMsg::Wire(frame) => {
                         updates.on_frame(frame);
-                        if restart_updates(&mut updates, harness.as_ref(), &terms, &server_kept, &mut sent_changes)
+                        if let Some(of) = restart_updates(&mut updates, harness.as_ref(), &terms, &server_kept, &mut sent_changes)
                             && proto::feature::speaks(&server_features, proto::feature::MAIL_FLOW)
                         {
-                            mail_replay.request(harness.as_ref());
+                            mail_replay.request_of(harness.as_ref(), of);
                         }
                         flush_updates(&mut updates, &own).await;
                     }
@@ -5633,10 +5715,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // the only unanswered one. The existing picture gate still bounds resets;
                     // while disconnected no new snapshot/journal read is made.
                     if connected && welcomed
-                        && restart_updates(&mut updates, harness.as_ref(), &terms, &server_kept, &mut sent_changes)
+                        && let Some(of) = restart_updates(&mut updates, harness.as_ref(), &terms, &server_kept, &mut sent_changes)
                         && proto::feature::speaks(&server_features, proto::feature::MAIL_FLOW)
                     {
-                        mail_replay.request(harness.as_ref());
+                        mail_replay.request_of(harness.as_ref(), of);
                     }
                     // Straight to the link from this turn, unless what this loop said or took before waits to go
                     // (`flush_updates_now`; goal 10, plan 01a1a87b2dae step 5).
@@ -5956,6 +6038,9 @@ struct SentChanges {
     /// The server takes changesets as patches.
     patches: bool,
     sessions: HashMap<String, HashMap<crate::harness::model::FileKey, u64>>,
+    /// Sessions whose mail flow didn't all go, their streams without room for it
+    /// (`Updates::push_kept`): their journals are replayed at the next replay of any session's.
+    mail_behind: BTreeSet<String>,
 }
 
 impl SentChanges {
@@ -6087,7 +6172,14 @@ fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &cr
     use crate::harness::core::Update;
     let key = crate::wire::uplink::session_key(session);
     let frames = match u {
-        Update::State { .. } | Update::Open { .. } if !sent.state_pages => legacy_harness_frames(session, u),
+        // To a server without bounded views (CP-T3.2): as before, and an Open still starts its
+        // changeset over, as the arm below does for one that takes views.
+        Update::State { .. } | Update::Open { .. } if !sent.state_pages => {
+            if matches!(u, Update::Open { .. }) {
+                sent.forget(session);
+            }
+            legacy_harness_frames(session, u)
+        }
         Update::Changes { files } => sent.frames(session, files, picture),
         // Its server's copy starts its changeset over (an Open), or lets the session go.
         Update::Open { .. } | Update::Closed => {
@@ -6120,6 +6212,15 @@ fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &cr
         // What ends or starts its timeline over: no state of before it comes after it.
         for b in bodies {
             updates.push_after_state(&key, b);
+        }
+    } else if matches!(u, Update::MailFlow { .. }) {
+        // Its mail's flow is kept in its journal, which a replay sends again: one with no room goes
+        // without it (`Updates::push_kept`), and the session's next replay sends it.
+        for b in bodies {
+            if !updates.push_kept(&key, b) {
+                sent.mail_behind.insert(session.to_owned());
+                break;
+            }
         }
     } else {
         for b in bodies {
@@ -6260,21 +6361,23 @@ async fn flush_updates(updates: &mut crate::wire::uplink::Updates, uplink: &Upli
 }
 
 /// Resume actual stale streams from their pictures. A session picture does not contain the
-/// durable source mail journal, so the caller also schedules one journal replay when any session
-/// restarted. `take_stale` retains streams whose preceding picture still waits for its ACK.
+/// durable source mail journal, so the caller also schedules a replay of the journals of the
+/// sessions that restarted, and of those whose mail flow didn't all go (`SentChanges::mail_behind`),
+/// these alone: the sessions returned, none when no session restarted. `take_stale` retains streams
+/// whose preceding picture still waits for its ACK.
 fn restart_updates(
     updates: &mut crate::wire::uplink::Updates,
     host: Option<&Arc<crate::harness::host::Host>>,
     terms: &HashMap<String, (PtySession, Arc<crate::termsess::Session>)>,
     kept: &HashMap<String, proto::KeptSession>,
     sent: &mut SentChanges,
-) -> bool {
-    let mut session_reset = false;
+) -> Option<ReplayOf> {
+    let mut restarted = BTreeSet::new();
     for key in updates.take_stale() {
         if let Some(id) = key.strip_prefix("s:") {
             if let Some(s) = host.and_then(|host| host.get(id)) {
                 start_stream(updates, id, &s, kept.get(id), sent);
-                session_reset = true;
+                restarted.insert(id.to_owned());
             }
         } else if let Some(id) = key.strip_prefix("t:")
             && let Some((_, state)) = terms.get(id)
@@ -6287,7 +6390,11 @@ fn restart_updates(
             }
         }
     }
-    session_reset
+    if restarted.is_empty() {
+        return None;
+    }
+    restarted.append(&mut sent.mail_behind);
+    Some(ReplayOf::Sessions(restarted))
 }
 
 async fn raw_harness_update(own: &Uplink, session: &str, update: &crate::harness::core::Update) {
@@ -7275,7 +7382,7 @@ mod tests {
         let send = Command::Send { id: "m1".into(), text: "go on".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None };
         let moved: std::collections::HashSet<Owned> = [Owned::Agent("s1".into())].into_iter().collect();
         let me = Me { machine: "box".into(), instance: "01a17502".into(), root: Vec::new() };
-        let mut words = vec![("a local MoveTo".to_owned(), cmd(&Command::MoveTo { to: "box".into(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true })?)];
+        let mut words = vec![("a local MoveTo".to_owned(), cmd(&Command::MoveTo { to: "box".into(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native: false })?)];
         for w in [Word::Taken, Word::Refused("no room".into()), Word::NotPassed("x".into()), Word::Unsure("x".into()), Word::NoneNewer("x".into())] {
             words.push((format!("HandedOver ({w:?})"), cmd(&w.command())?));
         }
@@ -7283,7 +7390,7 @@ mod tests {
             ("a person's message", cmd(&send)?),
             ("a message for its epoch", ServerMsg::HarnessSend { session: "s1".into(), epoch: 2, json: serde_json::to_string(&send)? }),
             ("an interrupt", cmd(&Command::Interrupt)?),
-            ("a move to another machine", cmd(&Command::MoveTo { to: "other".into(), cwd: "~/w".into(), note: None, now: false, kind: None, model: None, local: false })?),
+            ("a move to another machine", cmd(&Command::MoveTo { to: "other".into(), cwd: "~/w".into(), note: None, now: false, kind: None, model: None, local: false, native: false })?),
             ("a close", ServerMsg::HarnessClose { session: "s1".into() }),
         ];
         let b64 = |m: &ServerMsg| -> anyhow::Result<String> { Ok(base64::engine::general_purpose::STANDARD.encode(proto::encode(m)?)) };
@@ -7566,7 +7673,14 @@ mod tests {
         use crate::harness::model::{State, Status};
         // Dropped, its page would go on showing a turn under way that no longer is.
         let state = State { status: Status::Idle, summary: format!("begin {}", "x".repeat(900_000)), ..State::default() };
-        let frames = harness_frames("s", &Update::State { state: Box::new(state) });
+        // To a server that takes bounded views (CP-T3.2), the state goes as one, its status whole.
+        let views = harness_frames("s", &Update::State { state: Box::new(state.clone()) });
+        assert_eq!(views.len(), 1);
+        assert!(views.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let view: serde_json::Value = serde_json::from_str(views.first().map_or("", String::as_str)).unwrap_or_default();
+        assert_eq!(view.pointer("/state/status").and_then(serde_json::Value::as_str), Some("idle"), "{view:.200}");
+        // To one that doesn't, it's cut to fit, as before.
+        let frames = legacy_harness_frames("s", &Update::State { state: Box::new(state) });
         assert_eq!(frames.len(), 1);
         assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
         let state = match serde_json::from_str::<Update>(frames.first().map_or("", String::as_str)) {
@@ -7589,7 +7703,14 @@ mod tests {
         let mut tasks: Vec<Task> = (0..3000).map(ended).collect();
         tasks.insert(1, Task { id: "server".into(), status: "running".into(), class: Some("shell".into()), ..Task::default() });
         let state = State { status: Status::Running, tasks, ..State::default() };
-        let frames = harness_frames("s", &Update::State { state: Box::new(state) });
+        // To a server that takes bounded views (CP-T3.2), the state goes as one, its status whole.
+        let views = harness_frames("s", &Update::State { state: Box::new(state.clone()) });
+        assert_eq!(views.len(), 1);
+        assert!(views.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let view: serde_json::Value = serde_json::from_str(views.first().map_or("", String::as_str)).unwrap_or_default();
+        assert_eq!(view.pointer("/state/status").and_then(serde_json::Value::as_str), Some("running"), "{view:.200}");
+        // To one that doesn't, the oldest finished tasks are shed, as before.
+        let frames = legacy_harness_frames("s", &Update::State { state: Box::new(state) });
         assert_eq!(frames.len(), 1);
         assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
         let state = match serde_json::from_str::<Update>(frames.first().map_or("", String::as_str)) {
@@ -7803,6 +7924,29 @@ mod native_handover_tests {
     use crate::harness::model::{State, Status};
     use crate::harness::session::Spec;
     use kiln_seams::clock::SimClock;
+
+    /// 2026-11-12: a stream that started over had every session's mail journal replayed. A
+    /// replay asked for while one reads reads, next, the sessions asked for (theirs together),
+    /// and every session's only when that's what one asked for; then it reads that.
+    #[test]
+    fn a_replay_asked_for_while_reading_reads_the_sessions_asked_for() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (sink, _updates) = async_channel::unbounded();
+            let host = Host::with_records(sink, None, Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())));
+            let of = |ids: &[&str]| ReplayOf::Sessions(ids.iter().map(|s| (*s).to_owned()).collect());
+            let mut replay = MailReplay::Reading { before: host.native_budget_counts(), read: Box::pin(async { false }) };
+            replay.request_of(Some(&host), of(&["a"]));
+            replay.request_of(Some(&host), of(&["b"]));
+            assert!(matches!(&replay, MailReplay::Again { next, .. } if *next == of(&["a", "b"])), "the sessions asked for, together");
+            replay.finish(Some(&host), false);
+            assert!(matches!(replay, MailReplay::Reading { .. }), "then it reads them");
+            replay.request(Some(&host));
+            replay.request_of(Some(&host), of(&["c"]));
+            assert!(matches!(&replay, MailReplay::Again { next: ReplayOf::All, .. }), "every session's once one asked for that");
+            assert_eq!(of(&["a"]).and(ReplayOf::All), ReplayOf::All);
+            Ok(())
+        })
+    }
 
     /// W20: a held mail replay waits for room of its own, the share each session's budget is.
     /// Another session's copy, held or let go of, changes nothing of it (no pool spans every

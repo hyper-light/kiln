@@ -1,0 +1,15 @@
+[package]
+name = "hex-health"
+description = "Hex's failure detection and isolation core: graded node suspicion, disk-stall probes, antagonists, agent faults, dangerous workloads and the penalties that bound them, sans-IO"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

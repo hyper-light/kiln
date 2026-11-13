@@ -1,0 +1,36 @@
+[package]
+name = "hex-gpu"
+description = "Hex's GPU telemetry: a node's NVIDIA (NVML) and AMD (amdgpu sysfs) GPUs, their identity once and their load per sample, for the scheduler to balance on beside CPU load"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+# NVML loaded at run time (dlopen), and the OS's error numbers amdgpu's counters answer with.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+# NVML loaded at run time (LoadLibraryExW and GetProcAddress).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys.workspace = true
+
+# Apple's native IOKit/Metal/IOReport adapter; uname names its bundled OS driver release.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+# The hardware check's counting allocator (tests/hardware.rs): a sample allocates nothing, counted by
+# every byte asked for (`stats`), not only those still held.
+cap = { version = "0.1.2", features = ["stats"] }
+tempfile.workspace = true
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { workspace = true, features = ["Wdk_Graphics_Direct3D", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Security", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[lints]
+workspace = true

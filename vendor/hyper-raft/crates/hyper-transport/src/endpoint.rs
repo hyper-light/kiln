@@ -1787,6 +1787,29 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         Ok(conn.epoch)
     }
 
+    /// The TLS 1.3 cipher suite and key exchange group the connection to `peer` negotiated, once
+    /// its handshake has chosen them: what an owner whose links take one suite alone reports and
+    /// asserts, at each end of a connection. `None` without a connection to `peer`, or before its
+    /// handshake has chosen a suite.
+    pub fn negotiated(
+        &self,
+        peer: PeerId,
+    ) -> Option<(
+        hyper_quic::rustls::CipherSuite,
+        Option<hyper_quic::rustls::NamedGroup>,
+    )> {
+        let key = self.core.connection_of(peer)?;
+        let conn = self.conns.get(key)?.as_ref()?;
+        let data = conn.quic.crypto_session().handshake_data()?;
+        let data = data
+            .downcast::<hyper_quic::crypto::rustls::HandshakeData>()
+            .ok()?;
+        Some((
+            data.negotiated_cipher_suite?,
+            data.negotiated_key_exchange_group,
+        ))
+    }
+
     /// Whether the connection of `epoch` to `peer` is up. A peer may hold several connections at
     /// once (its identity's, up to its admission bound), and only its current one's lifecycle is
     /// an event ([`Event::Connected`], [`Event::Closed`]): an owner that keeps something for each

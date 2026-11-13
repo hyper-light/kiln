@@ -187,3 +187,37 @@ fn unfinished_handover_of_a_superseded_source_settles() -> anyhow::Result<()> {
         result
     })
 }
+
+/// 2026-11-12, after the successor claim deployed: adacachy's old process had signed each session's
+/// hand-on to its next epoch, and the new process held them on at the binding's own epoch (1, 7 and
+/// 5), so the claim past the epoch never came and their mail stayed refused. At the binding's epoch
+/// its successor claims the session once the bound process signed that hand-on, and not before.
+#[test]
+fn a_successor_claims_at_the_binding_epoch_once_the_bound_process_handed_the_session_on() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub=crate::hub::tests::scratch_hub().await?;
+        let result: anyhow::Result<()>=async {
+            let session="transfer-handed-on";let (a,b)=(0x3a_u64,0x3b_u64);
+            let source=join(&hub,a,"machine-src","src-instance",1).map_err(refusal)?;
+            let bound=join(&hub,b,"machine-held","held-old",2).map_err(refusal)?;
+            commit(&hub,manifest("handed-on-binding",session,4)?,source,bound).await?;
+            hub.instances.update(|instances|{instances.lost(b);});
+            join(&hub,b,"machine-held","held-new",3).map_err(refusal)?;
+            hub.instances.update(|instances|instances.own(Owned::Agent(session.into()),b));
+            assert!(!allows_claim(&hub,b,session,Some(5)).await,"at the binding's epoch, with no word from the bound process, the fence stands");
+            assert!(!dispatch_ready(&hub,session,&capacity(5)).await.map_err(refusal)?);
+            let signer=format!("kiln://hyper-light/person/ada/agent/{session}/epoch/5/machine/machine-held/instance/held-old");
+            let taker=format!("kiln://hyper-light/person/ada/agent/{session}/epoch/6");
+            hub.store.call(move |c| {
+                c.execute("INSERT INTO custody (digest, payload_type, kind, custodian, counterpart, envelope, taken_at) VALUES ('sha256:handed-on', 'p', 'handed-on', ?1, ?2, '{}', 10)", rusqlite::params![signer, taker])?;
+                Ok(())
+            }).await?;
+            assert!(allows_claim(&hub,b,session,Some(5)).await,"the bound process handed it on: its successor claims it at the binding's epoch");
+            assert!(dispatch_ready(&hub,session,&capacity(5)).await.map_err(refusal)?,"and its mail goes to it");
+            assert!(!allows_claim(&hub,b,session,Some(4)).await,"never below the binding's epoch");
+            Ok(())
+        }.await;
+        hub.shutdown.cancel();
+        result
+    })
+}

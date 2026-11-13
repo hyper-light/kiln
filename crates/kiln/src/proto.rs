@@ -780,7 +780,12 @@ pub mod feature {
     /// Durable communications with consumption-driven receiver credit.
     pub const MAIL_FLOW: &str = "mail-flow";
     pub const MAIL_TRANSFER: &str = "mail-transfer";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER];
+    /// This runner reads a session's package that goes on natively from its harness's own record
+    /// on this machine (`harness::moving::Carry::Native`, package version 5): handed one by an
+    /// older runner process of its machine, an ACP agent or Antigravity continues its own
+    /// conversation rather than taking it in words (Ada, 2026-11-13).
+    pub const NATIVE_RESUME: &str = "native-resume";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {

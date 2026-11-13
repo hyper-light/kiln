@@ -47,6 +47,7 @@ const STATUS: Record<Status, { label: string; dot: string }> = {
   waiting: { label: "Needs you", dot: "timed_out" },
   exited: { label: "Stopped", dot: "cancelled" },
   disconnected: { label: "Offline", dot: "skipped" },
+  crashed: { label: "Crashed", dot: "failed" },
 };
 
 export function statusLabel(s: Status) {
@@ -73,8 +74,18 @@ export const machineShown = (target: string, labels?: Labels) => labelOf(machine
  *  A conversation that already exists is resuming, not starting, while its harness comes up. */
 export function StateWord({ a }: { a: { status: Status; approvals: readonly unknown[]; pause?: unknown; harness_session?: string } }) {
   // Paused for a usage limit: once a turn under way ends, it waits for the reset.
-  const s = a.approvals.length > 0 ? "waiting" : a.pause && a.status !== "running" && a.status !== "exited" && a.status !== "disconnected" ? "paused" : a.status;
-  const word = { waiting: "Needs you", running: "Working", starting: a.harness_session ? "Resuming" : "Starting", idle: "Ready", exited: "Ended", disconnected: "Offline", paused: "Paused" }[s];
+  const gone = a.status === "exited" || a.status === "disconnected" || a.status === "crashed";
+  const s = a.approvals.length > 0 ? "waiting" : a.pause && a.status !== "running" && !gone ? "paused" : a.status;
+  const word = {
+    waiting: "Needs you",
+    running: "Working",
+    starting: a.harness_session ? "Resuming" : "Starting",
+    idle: "Ready",
+    exited: "Ended",
+    disconnected: "Offline",
+    crashed: "Crashed",
+    paused: "Paused",
+  }[s];
   return (
     <span className="st-word" data-state={s}>
       <i aria-hidden="true" />

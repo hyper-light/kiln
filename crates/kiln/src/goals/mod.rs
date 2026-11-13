@@ -3017,7 +3017,7 @@ fn decide_on(stack: &Stack, plans: &subagents::Graph, info: Option<&Info>, now: 
     // Yours goes now: behind a turn under way (its harness queues it), but not to an agent still
     // starting, whose goal command isn't known yet (`how`), nor to one whose machine is away (it
     // goes when it's back).
-    let pushed = push && !matches!(info.status, Status::Starting | Status::Disconnected);
+    let pushed = push && !matches!(info.status, Status::Starting | Status::Disconnected | Status::Crashed);
     // Nothing waiting on you or in its queue; stopped counts (a message starts it again).
     let idle = matches!(info.status, Status::Idle | Status::Exited) && info.approvals.is_empty() && info.queued == 0;
     // Not while agents it started are at work: it ended its turn to let them, and is told when each
