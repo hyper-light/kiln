@@ -46,14 +46,14 @@ fn key_aad(id: &str) -> Vec<u8> {
     format!("kiln secret key\0{id}").into_bytes()
 }
 
-fn seal(k: &[u8; 32], plain: &[u8], aad: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+pub(super) fn seal(k: &[u8; 32], plain: &[u8], aad: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let nonce: [u8; NONCE_LEN] = random()?;
     let mut buf = plain.to_vec();
     aead(k)?.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut buf).map_err(|_| anyhow::anyhow!("sealing failed"))?;
     Ok((buf, nonce.to_vec()))
 }
 
-fn open(k: &[u8; 32], sealed: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result<Value> {
+pub(super) fn open(k: &[u8; 32], sealed: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result<Value> {
     let n: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| anyhow::anyhow!("a bad nonce"))?;
     let mut buf = sealed.to_vec();
     let len = aead(k)?.open_in_place(Nonce::assume_unique_for_key(n), Aad::from(aad), &mut buf).map_err(|_| anyhow::anyhow!("a secret doesn't decrypt: the master key or the store changed"))?.len();
@@ -62,7 +62,7 @@ fn open(k: &[u8; 32], sealed: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result
 }
 
 /// Every data key, unwrapped, by id.
-fn keys(hub: &Hub, c: &Connection) -> anyhow::Result<HashMap<String, [u8; 32]>> {
+pub(super) fn keys(hub: &Hub, c: &Connection) -> anyhow::Result<HashMap<String, [u8; 32]>> {
     let mut q = c.prepare("SELECT id, wrapped, nonce FROM secret_keys")?;
     let rows = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?)))?.collect::<Result<Vec<_>, _>>()?;
     let mut out = HashMap::new();
@@ -83,7 +83,7 @@ fn new_key(hub: &Hub, c: &Connection) -> anyhow::Result<(String, [u8; 32])> {
 }
 
 /// The data key new values are sealed under: the newest not retired, made at first use.
-fn current_key(hub: &Hub, c: &Connection) -> anyhow::Result<(String, [u8; 32])> {
+pub(super) fn current_key(hub: &Hub, c: &Connection) -> anyhow::Result<(String, [u8; 32])> {
     let row: Option<(String, Vec<u8>, Vec<u8>)> =
         c.query_row("SELECT id, wrapped, nonce FROM secret_keys WHERE retired_at IS NULL ORDER BY created_at DESC, id DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
     match row {
