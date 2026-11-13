@@ -2,7 +2,7 @@
 
 On a machine where kiln's server runs beside its own work, the server comes first: it runs at the
 most CPU weight, and CI legs and agents below it, each in a group of its own at the least weight
-(Linux), below normal (macOS: nice 10 past the runner's, on every core; Windows); headroom slows them when the
+(Linux), below normal (macOS: nice `PRIO_MAX`, the lowest priority there is, on every core; Windows); headroom slows them when the
 server's own delay rises; and the server can be given cores of its own. This is plan 01a1a59c2b29
 (goal 8) and the CPU-priority part of plan 01a19617's step 10. It
 joins `docs/baremetal.md` (the bare-metal design, on its own branch until it lands) as that lands:
@@ -92,11 +92,14 @@ settings of its own under cgroup v2 (f22). A microVM deployment's VMM runs as th
 
 The server's launchd job (a LaunchDaemon installed system-wide, else a LaunchAgent) runs with
 `ProcessType` `Interactive`: no limits for its purpose, as an app has none. Left unset, launchd
-throttles a job's CPU and I/O (f25). Each agent's harness and each CI step starts below normal,
-nice 10 past the runner's own (`setpriority(PRIO_PROCESS, 0, …)` between fork and exec; 10 under a
-runner at normal, at most 20, `PRIO_MAX`), inherited by everything it starts: below what the runner
-starts plainly, a person's run, even where the runner itself was started under `nice`. A step on a
-pty is put there as it starts.
+throttles a job's CPU and I/O (f25). Each agent's harness and each CI step starts below normal, at
+nice 20, `PRIO_MAX` in `<sys/resource.h>`, the lowest priority the scale has
+(`setpriority(PRIO_PROCESS, 0, PRIO_MAX)` between fork and exec), inherited by everything it starts:
+below everything the runner starts plainly, a person's run included, whatever the runner's own nice.
+Raising a nice value needs no privilege, so this holds under a runner started under `nice` too. The
+value is the scale's own bound, not a step of kiln's choosing: a runner already at `PRIO_MAX` leaves
+its agents level with what it starts plainly, as nothing runs lower. A step on a pty is put there as
+it starts.
 
 Not under Darwin background policy (`PRIO_DARWIN_BG`, `taskpolicy -b`, f26), as they did until
 2026-11-05: Apple silicon runs background work on its efficiency cores alone and throttles its disk
@@ -395,7 +398,7 @@ winner is the bare-metal default where it needs no more than the installer can g
   and its load's to say, and cores held for it sit idle whenever it does. Declared on a system install, they're
   a partition.
 - **macOS and Windows keep what they have:** the server's launchd job at `ProcessType` `Interactive`, its legs and
-  agents under background policy; on Windows the server above normal, legs and agents below normal in jobs of
+  agents below normal (nice `PRIO_MAX`); on Windows the server above normal, legs and agents below normal in jobs of
   their own. Neither has cores of the server's own or the real-time class, and `kiln install` says so.
 
 Its basis:
@@ -851,8 +854,9 @@ kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this 
   its weights and cores, `ProcessType` `Interactive` for the server's launchd job, and
   `systemd-analyze verify` finding nothing against them.
 - `os::contain::tests::g8_s3_an_agents_processes_run_under_background_policy` (macOS): an agent's
-  harness and what it starts run below normal, their scheduling priority (`ps`) below a plain
-  process's; a person's run doesn't; a step on a pty is put there as it runs.
+  harness and what it starts run at nice `PRIO_MAX` (`ps`), strictly below a plain process's under a
+  runner below `PRIO_MAX` and level with it under one at it; a person's run doesn't; a step on a pty
+  is put there as it runs.
 - `os::contain::tests::what_an_agent_starts_through_launchd_is_followed_as_its` (macOS): a launchd
   job an agent's script bootstraps from a relative property list is followed as the agent's, below
   normal, and ending the agent boots it out.
