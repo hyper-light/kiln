@@ -366,6 +366,25 @@ pub struct Held {
     pub past_cpu_polls: f64,
     #[serde(default)]
     pub counts_past: bool,
+    /// Of those polls, the ones whose shard's thread said its own time too (`kiln_shard_held_own_*`, goal 9, plan
+    /// 01a1a87b2cec step 3: Linux, a site's polls after its first past the quantum), their time on the CPU and their own
+    /// (the rest was the interrupts and softirqs their CPU served, the host's), and the longest own (since the server
+    /// started); and between the two scrapes, the polls past the quantum by their own time and those past it on the CPU
+    /// with their own within it, and whether the build counts them. None from a build from before it said.
+    #[serde(default)]
+    pub own_polls: f64,
+    #[serde(default)]
+    pub own_cpu_ms: f64,
+    #[serde(default)]
+    pub own_ms: f64,
+    #[serde(default)]
+    pub longest_own_ms: f64,
+    #[serde(default)]
+    pub past_own_polls: f64,
+    #[serde(default)]
+    pub past_cpu_interrupts_polls: f64,
+    #[serde(default)]
+    pub counts_own: bool,
 }
 
 /// What held the shards between `before` and `after`, `secs` apart, the most time first.
@@ -395,6 +414,15 @@ pub fn held(before: &Scrape, after: &Scrape, secs: f64) -> Vec<Held> {
                 row.past_cpu_polls += added;
                 row.counts_past = true;
             }
+            "kiln_shard_held_own_polls_total" => {
+                row.own_polls += added;
+                row.counts_own = true;
+            }
+            "kiln_shard_held_own_cpu_seconds_total" => row.own_cpu_ms += added * 1000.0,
+            "kiln_shard_held_own_seconds_total" => row.own_ms += added * 1000.0,
+            "kiln_shard_held_longest_own_seconds" => row.longest_own_ms = row.longest_own_ms.max(value * 1000.0),
+            "kiln_shard_held_own_past_quantum_polls_total" => row.past_own_polls += added,
+            "kiln_shard_held_cpu_past_quantum_interrupts_polls_total" => row.past_cpu_interrupts_polls += added,
             _ => {}
         }
     }
@@ -585,6 +613,26 @@ mod tests {
         let h = held(&before, &after, 1.0);
         let a = h.first().cloned().unwrap_or_default();
         assert!((a.cpu_polls - 4.0).abs() < 1e-9 && (a.cpu_held_ms - 10.0).abs() < 1e-9 && (a.cpu_ms - 2.0).abs() < 1e-9 && (a.longest_cpu_ms - 2.5).abs() < 1e-9, "{a:?}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: of what held the shards in a window, the polls whose thread said its own time, their
+    /// time on the CPU and their own, those past the quantum by their own time and those past it on the CPU with their own
+    /// within it are the window's own; the longest own is since the server started; and the build counts own time.
+    #[test]
+    fn g9_s3_a_polls_own_time_is_the_window_s_own() {
+        let series = |polls: u32, cpu: f64, own: f64, longest: f64, past: u32, interrupts: u32| {
+            let at = "{shard=\"0\",site=\"a.rs:1:1\",label=\"\"}";
+            format!(
+                "kiln_shard_held_polls_total{at} {polls}\nkiln_shard_held_own_polls_total{at} {polls}\nkiln_shard_held_own_cpu_seconds_total{at} {cpu}\nkiln_shard_held_own_seconds_total{at} {own}\nkiln_shard_held_longest_own_seconds{at} {longest}\nkiln_shard_held_own_past_quantum_polls_total{at} {past}\nkiln_shard_held_cpu_past_quantum_interrupts_polls_total{at} {interrupts}\n"
+            )
+        };
+        let (before, after) = (Scrape::parse(&series(10, 0.004, 0.001, 0.0003, 1, 2)), Scrape::parse(&series(14, 0.006, 0.0015, 0.0004, 2, 5)));
+        let a = held(&before, &after, 1.0).first().cloned().unwrap_or_default();
+        assert!(a.counts_own, "{a:?}");
+        assert!((a.own_polls - 4.0).abs() < 1e-9 && (a.own_cpu_ms - 2.0).abs() < 1e-9 && (a.own_ms - 0.5).abs() < 1e-9 && (a.longest_own_ms - 0.4).abs() < 1e-9, "{a:?}");
+        assert!((a.past_own_polls - 1.0).abs() < 1e-9 && (a.past_cpu_interrupts_polls - 3.0).abs() < 1e-9, "{a:?}");
+        let older = held(&Scrape::parse("kiln_shard_held_polls_total{shard=\"0\",site=\"a.rs:1:1\",label=\"\"} 1\n"), &Scrape::parse("kiln_shard_held_polls_total{shard=\"0\",site=\"a.rs:1:1\",label=\"\"} 2\n"), 1.0);
+        assert!(older.first().is_some_and(|h| !h.counts_own), "a build from before it said: {older:?}");
     }
 
     /// Goal 9, plan 01a1a87b2cec steps 3 and 4: of what held the shards in a window, the polls the host held and

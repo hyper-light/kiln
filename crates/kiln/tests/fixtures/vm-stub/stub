@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""A stand-in harness for kiln's microVM E2E (crates/kiln/tests/vm_harnesses.rs; kiln plan
+01a1cd8e862e7169a074db3d5fa33f3d, steps 34 and 35). It calls no model and reads no account.
+
+It speaks each machine interface kiln drives, as kiln's adapters read them (crates/kiln/src/harness):
+Claude Code's stream-json and control requests, Codex's app-server, the Agent Client Protocol,
+Antigravity's headless stream-json and Pi's RPC mode. Its dialect is `VM_STUB_PROTOCOL`, else the
+name it was started as:
+
+    claude -> claude    codex -> codex    agy -> agy    pi -> pi
+    agent, gemini, opencode, goose, amp-acp, devin -> acp
+
+Each turn it says, a line each: `CWD <its folder>`, `WHERE <kernel name> <boot id>` (the kernel it
+runs on: a microVM's guest has its own), `HEARD <its prompt>`, the lines its prompt asks for, then
+`line 00000`... (VM_STUB_LINES of them, 2 unless set) and `STUB_DONE` once the turn wasn't stopped. Its
+prompt asks with words:
+
+    WRITE=<name>    the file <name> written in its folder, its name as its words, as a harness at work
+                    in its project writes one: `WROTE <name>`, or `WRITE_FAIL <why>`
+    MCP_PING        a round trip to kiln's MCP server, the one its dialect was given (stdio or HTTP):
+                    initialize, then tools/list: `MCP_OK <tools> <first tool>`, or `MCP_FAIL <why>`
+    SPAWN=<kind>    an agent of that harness started through kiln's MCP server (`agents_start`), from
+                    where this one runs: `SPAWN_OK <its id>`, or `SPAWN_FAIL <why>`
+    SLOW=<ms>       that long between its lines, so a turn lasts long enough to steer and stop
+
+A message steered into a running turn is said as `STEERED <its words>`. A stopped turn ends where it
+was, as its harness ends one (Claude Code's interrupt, Codex's turn/interrupt, ACP's session/cancel,
+Pi's abort; Antigravity's process is ended by kiln).
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import uuid
+
+PROTO = os.environ.get("VM_STUB_PROTOCOL") or os.path.basename(sys.argv[0] or "")
+LINES = int(os.environ.get("VM_STUB_LINES", "2"))
+VERSION = os.environ.get("VM_STUB_VERSION", "9.9.9-stub")
+ACP_PROGRAMS = {"acp", "agent", "cursor-agent", "gemini", "opencode", "goose", "amp-acp", "devin"}
+
+_OUT = threading.Lock()
+
+
+def dialect():
+    if PROTO in ("claude", "codex", "agy", "pi"):
+        return PROTO
+    if PROTO in ACP_PROGRAMS:
+        return "acp"
+    sys.stderr.write("vm-stub: no dialect for %r: set VM_STUB_PROTOCOL\n" % PROTO)
+    sys.exit(2)
+
+
+def emit(obj):
+    with _OUT:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+
+def flag(name):
+    """The value after `name` among its arguments, if it has one."""
+    args = sys.argv[1:]
+    if name in args:
+        i = args.index(name)
+        if i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+def where():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            boot = f.read().strip()
+    except OSError:
+        boot = "-"
+    return "WHERE %s %s" % (os.uname().sysname, boot)
+
+
+def write(name):
+    """`name` written in its folder (a bare file name: no path of another folder), its words its name."""
+    if name in (".", "..") or os.sep in name:
+        return "WRITE_FAIL %r is no bare file name" % name
+    try:
+        with open(name, "w") as f:
+            f.write(name + "\n")
+        return "WROTE " + name
+    except OSError as e:
+        return "WRITE_FAIL %s" % e
+
+
+# --- kiln's MCP server, as its dialect was given it -----------------------------------------------
+
+
+def _servers_in(config):
+    """The `kiln` entry of an `mcpServers` map, as one of `_servers`' entries."""
+    s = (config.get("mcpServers") or {}).get("kiln")
+    if not isinstance(s, dict):
+        return []
+    if s.get("url"):
+        return [{"url": s["url"], "headers": dict(s.get("headers") or {})}]
+    if s.get("command"):
+        return [{"command": [s["command"]] + list(s.get("args") or []), "env": {k: str(v) for k, v in (s.get("env") or {}).items()}}]
+    return []
+
+
+def _claude_servers():
+    # `--mcp-config` takes JSON, or a file of it (kiln gives a runner's agent the first, the server's
+    # agents the second: crates/kiln/src/harness/kinds.rs).
+    out = []
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a != "--mcp-config" or i + 1 >= len(args):
+            continue
+        value = args[i + 1]
+        try:
+            config = json.loads(value)
+        except ValueError:
+            try:
+                with open(value) as f:
+                    config = json.load(f)
+            except (OSError, ValueError):
+                continue
+        out += _servers_in(config)
+    return out
+
+
+_TOML_PAIR = re.compile(r'([A-Za-z0-9_.-]+)\s*=\s*("(?:[^"\\]|\\.)*")')
+
+
+def _codex_servers():
+    # `-c mcp_servers.kiln.<key>=<TOML value>` (reach/mcp.rs codex_config): command and args are
+    # JSON-compatible TOML, env an inline table of quoted strings.
+    keys = {}
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == "-c" and i + 1 < len(args):
+            k, _, v = args[i + 1].partition("=")
+            if k.startswith("mcp_servers.kiln."):
+                keys[k[len("mcp_servers.kiln."):]] = v.strip()
+    # A streamable-HTTP server's token comes from the variable `bearer_token_env_var` names, as Codex
+    # reads it (codex-rs config/src/mcp_types.rs; kiln plan step 18's harness/isolated/mcp.rs).
+    try:
+        if "url" in keys:
+            headers = {k: json.loads(v) for k, v in _TOML_PAIR.findall(keys.get("http_headers", ""))}
+            if "bearer_token_env_var" in keys:
+                token = os.environ.get(json.loads(keys["bearer_token_env_var"]))
+                if token:
+                    headers["Authorization"] = "Bearer " + token
+            return [{"url": json.loads(keys["url"]), "headers": headers}]
+        if "command" in keys:
+            env = {k: json.loads(v) for k, v in _TOML_PAIR.findall(keys.get("env", ""))}
+            return [{"command": [json.loads(keys["command"])] + json.loads(keys.get("args", "[]")), "env": env}]
+    except ValueError:
+        pass
+    return []
+
+
+def _acp_servers(servers):
+    out = []
+    for s in servers or []:
+        if s.get("name") != "kiln":
+            continue
+        if s.get("url"):
+            out.append({"url": s["url"], "headers": {h.get("name", ""): h.get("value", "") for h in s.get("headers") or []}})
+        elif s.get("command"):
+            out.append({"command": [s["command"]] + list(s.get("args") or []), "env": {e.get("name", ""): e.get("value", "") for e in s.get("env") or []}})
+    return out
+
+
+AGY_CONFIG = os.path.join(os.path.expanduser("~"), ".gemini", "config", "mcp_config.json")
+
+
+def _agy_servers():
+    # Antigravity reads MCP servers from its own config alone; kiln puts its own there with
+    # `agy mcp add kiln <kiln> reach mcp` (kinds.rs `prepare`) and whom it serves in agy's
+    # environment, which agy hands on to the servers it starts.
+    try:
+        with open(AGY_CONFIG) as f:
+            return _servers_in(json.load(f))
+    except (OSError, ValueError):
+        return []
+
+
+class Mcp:
+    """One MCP client: stdio (a process, a JSON-RPC message a line) or HTTP (a POST each)."""
+
+    def __init__(self, server):
+        self.server = server
+        self.proc = None
+        self.next_id = 0
+        self.session = None
+        if "command" in server:
+            env = dict(os.environ)
+            env.update(server.get("env") or {})
+            self.proc = subprocess.Popen(server["command"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, text=True)
+
+    def call(self, method, params):
+        self.next_id += 1
+        msg = {"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params}
+        reply = self._stdio(msg) if self.proc else self._http(msg)
+        if reply is None:
+            raise OSError("no answer to %s" % method)
+        if "error" in reply:
+            raise OSError("%s refused: %s" % (method, (reply.get("error") or {}).get("message")))
+        return reply.get("result") or {}
+
+    def notify(self, method):
+        msg = {"jsonrpc": "2.0", "method": method}
+        if self.proc:
+            self.proc.stdin.write(json.dumps(msg) + "\n")
+            self.proc.stdin.flush()
+        else:
+            self._http(msg)
+
+    def _stdio(self, msg):
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+        for line in self.proc.stdout:
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if m.get("id") == msg["id"]:
+                return m
+        return None
+
+    def _http(self, msg):
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        headers.update(self.server.get("headers") or {})
+        if self.session:
+            headers["Mcp-Session-Id"] = self.session
+        req = urllib.request.Request(self.server["url"], data=json.dumps(msg).encode(), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            self.session = r.headers.get("Mcp-Session-Id") or self.session
+            body = r.read().decode()
+        if "id" not in msg or not body.strip():
+            return None
+        if (r.headers.get("Content-Type") or "").startswith("text/event-stream"):
+            for line in body.splitlines():
+                if line.startswith("data:"):
+                    m = json.loads(line[5:])
+                    if m.get("id") == msg["id"]:
+                        return m
+            return None
+        return json.loads(body)
+
+    def close(self):
+        if self.proc:
+            try:
+                self.proc.stdin.close()
+                self.proc.terminate()
+                self.proc.wait(10)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
+def _connect(servers):
+    if not servers:
+        raise OSError("no kiln MCP server was given to this harness")
+    c = Mcp(servers[0])
+    c.call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "vm-stub", "version": VERSION}})
+    c.notify("notifications/initialized")
+    return c
+
+
+def mcp_ping(servers):
+    c = None
+    try:
+        c = _connect(servers)
+        tools = c.call("tools/list", {}).get("tools") or []
+        if not tools:
+            return "MCP_FAIL kiln's MCP server listed no tools"
+        return "MCP_OK %d %s" % (len(tools), tools[0].get("name", "?"))
+    except (OSError, ValueError) as e:
+        return "MCP_FAIL %s" % e
+    finally:
+        if c:
+            c.close()
+
+
+def spawn(servers, kind):
+    c = None
+    try:
+        c = _connect(servers)
+        res = c.call("tools/call", {"name": "agents_start", "arguments": {"kind": kind, "prompt": "CHILD do the task"}})
+        text = "".join(b.get("text", "") for b in res.get("content") or [] if isinstance(b, dict))
+        if res.get("isError"):
+            return "SPAWN_FAIL %s" % (text or "agents_start was refused")
+        # agents_start's reply: {"agents": [<each started, its id>], "parent": <the asker's id>}; one
+        # queued for room starts none yet.
+        reply = json.loads(text) if text.startswith("{") else {}
+        started = [a.get("id") for a in reply.get("agents") or [] if isinstance(a, dict) and a.get("id")]
+        return "SPAWN_OK %s" % (started[0] if started else "?")
+    except (OSError, ValueError) as e:
+        return "SPAWN_FAIL %s" % e
+    finally:
+        if c:
+            c.close()
+
+
+# --- a turn -----------------------------------------------------------------------------------------
+
+
+class Turn:
+    """One turn's lines, said through `say`, stopped by `stop`; words steered in are said next."""
+
+    def __init__(self, prompt, servers, say):
+        self.prompt = prompt or ""
+        self.servers = servers
+        self.say = say
+        self.stopped = threading.Event()
+        self.steered = []
+        self.lock = threading.Lock()
+
+    def steer(self, text):
+        with self.lock:
+            self.steered.append(text)
+
+    def stop(self):
+        self.stopped.set()
+
+    def _steered(self):
+        with self.lock:
+            out, self.steered = self.steered, []
+        for t in out:
+            self.say("STEERED " + " ".join(t.split()))
+
+    def run(self):
+        """Says its lines; whether it ran to its end."""
+        slow = re.search(r"\bSLOW=(\d+)\b", self.prompt)
+        every = int(slow.group(1)) / 1000.0 if slow else 0.0
+        self.say("CWD " + os.getcwd())
+        self.say(where())
+        self.say("HEARD " + " ".join(self.prompt.split())[:200])
+        name = re.search(r"\bWRITE=([A-Za-z0-9._-]+)", self.prompt)
+        if name:
+            self.say(write(name.group(1)))
+        if "MCP_PING" in self.prompt:
+            self.say(mcp_ping(self.servers))
+        kind = re.search(r"\bSPAWN=([a-z]+)\b", self.prompt)
+        if kind:
+            self.say(spawn(self.servers, kind.group(1)))
+        for n in range(LINES):
+            if self.stopped.wait(every):
+                return False
+            self._steered()
+            self.say("line %05d" % n)
+        if self.stopped.is_set():
+            return False
+        self._steered()
+        self.say("STUB_DONE")
+        return True
+
+
+class Worker:
+    """A turn in a thread of its own, so its harness reads its stdin as it runs (a steer, a stop).
+    At its stdin's end, the turn under way is stopped and waited for, as a harness ends."""
+
+    def __init__(self):
+        self.thread = None
+        self.turn = None
+
+    def start(self, target, *args):
+        self.thread = threading.Thread(target=target, args=args)
+        self.thread.start()
+
+    def end(self):
+        if self.turn:
+            self.turn.stop()
+        if self.thread:
+            self.thread.join()
+
+
+def version():
+    if "--version" in sys.argv[1:]:
+        print({"claude": "%s (Claude Code)", "codex": "codex-cli %s"}.get(dialect(), "%s") % VERSION)
+        return True
+    return False
+
+
+# --- Claude Code: stream-json and control requests ------------------------------------------------
+
+
+def run_claude():
+    import queue
+
+    session = flag("--resume") or flag("--session-id") or str(uuid.uuid4())
+    servers = _claude_servers()
+    work = queue.Queue()
+    current = [None]
+
+    def read():
+        for line in sys.stdin:
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if m.get("type") == "control_request":
+                req = m.get("request") or {}
+                resp = {}
+                if req.get("subtype") == "initialize":
+                    resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": VERSION}
+                elif req.get("subtype") == "interrupt" and current[0]:
+                    current[0].stop()
+                emit({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
+            elif m.get("type") == "user":
+                # A message written while a turn runs is queued, as Claude Code 2.1 says it (kiln's
+                # harness/claude.rs tests hold its adapter to that).
+                if current[0] is not None and m.get("uuid") is not None:
+                    emit({"type": "command_lifecycle", "command_uuid": m.get("uuid"), "state": "queued", "uuid": str(uuid.uuid4()), "session_id": session})
+                work.put(m)
+        work.put(None)
+
+    def words(m):
+        content = (m.get("message") or {}).get("content")
+        return content if isinstance(content, str) else " ".join(b.get("text", "") for b in content or [] if isinstance(b, dict))
+
+    threading.Thread(target=read, daemon=True).start()
+    replay = "--replay-user-messages" in sys.argv[1:]
+    turn = 0
+    while True:
+        m = work.get()
+        if m is None:
+            return
+        # What queued behind a turn starts together, as one prompt, its words joined, under the last
+        # message's id (Claude Code 2.1, as kiln's harness/claude.rs tests have it).
+        taken = [m]
+        while True:
+            try:
+                more = work.get_nowait()
+            except queue.Empty:
+                break
+            if more is None:
+                work.put(None)
+                break
+            taken.append(more)
+        turn += 1
+        commands = [x.get("uuid") for x in taken if x.get("uuid") is not None]
+        prompt = "\n".join(words(x) for x in taken)
+        for command in commands:
+            emit({"type": "command_lifecycle", "command_uuid": command, "state": "started", "uuid": str(uuid.uuid4()), "session_id": session})
+        # `--replay-user-messages`: the prompt it took, said back under its last message's id.
+        if replay and commands:
+            emit({"type": "user", "message": {"role": "user", "content": prompt}, "session_id": session, "parent_tool_use_id": None, "uuid": commands[-1], "isReplay": True})
+        emit({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "stub", "permissionMode": "default", "claude_code_version": VERSION})
+        said = [0]
+
+        def say(text, turn=turn):
+            said[0] += 1
+            emit({"type": "assistant", "message": {"id": "msg_%d_%d_%d" % (os.getpid(), turn, said[0]), "type": "message", "role": "assistant", "model": "stub", "content": [{"type": "text", "text": text}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}}, "parent_tool_use_id": None, "session_id": session})
+
+        t = Turn(prompt, servers, say)
+        current[0] = t
+        whole = t.run()
+        current[0] = None
+        if whole:
+            emit({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+        else:
+            emit({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}, "parent_tool_use_id": None, "session_id": session})
+            emit({"type": "result", "subtype": "error_during_execution", "terminal_reason": "aborted_streaming", "is_error": False, "duration_ms": 1, "num_turns": 1, "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+        for command in commands:
+            emit({"type": "command_lifecycle", "command_uuid": command, "state": "completed", "uuid": str(uuid.uuid4()), "session_id": session})
+
+
+# --- Codex: the app-server's JSON-RPC ---------------------------------------------------------------
+
+
+def run_codex():
+    servers = _codex_servers()
+    thread = ["thread-" + uuid.uuid4().hex[:12]]
+    current = [None]
+    lock = threading.Lock()
+    worker = Worker()
+
+    def result(mid, res):
+        emit({"id": mid, "result": res})
+
+    def note(method, params):
+        emit({"method": method, "params": dict(params, threadId=thread[0])})
+
+    def text_of(items):
+        return " ".join(i.get("text", "") for i in items or [] if isinstance(i, dict))
+
+    def go(turn_id, prompt):
+        n = [0]
+
+        def say(text):
+            n[0] += 1
+            item = "item-%s-%d" % (turn_id, n[0])
+            note("item/agentMessage/delta", {"turnId": turn_id, "itemId": item, "delta": text})
+            note("item/completed", {"turnId": turn_id, "item": {"type": "agentMessage", "id": item, "text": text}})
+
+        t = Turn(prompt, servers, say)
+        worker.turn = t
+        with lock:
+            current[0] = (turn_id, t)
+        note("turn/started", {"turn": {"id": turn_id}})
+        whole = t.run()
+        with lock:
+            current[0] = None
+        note("turn/completed", {"turn": {"id": turn_id, "status": "completed" if whole else "interrupted"}})
+        note("thread/status/changed", {"status": {"type": "idle"}})
+
+    for line in sys.stdin:
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        method, mid, params = m.get("method"), m.get("id"), m.get("params") or {}
+        if method == "initialize":
+            result(mid, {"userAgent": "codex/%s" % VERSION})
+        elif method in ("thread/start", "thread/resume", "thread/fork"):
+            if method == "thread/resume" and params.get("threadId"):
+                thread[0] = params["threadId"]
+            result(mid, {"thread": {"id": thread[0], "status": {"type": "idle"}, "cliVersion": VERSION, "turns": []}, "model": "stub", "cwd": os.getcwd()})
+        elif method == "thread/turns/list":
+            result(mid, {"data": [], "nextCursor": None})
+        elif method == "model/list":
+            result(mid, {"data": [{"id": "stub", "model": "stub", "displayName": "stub", "isDefault": True, "supportedReasoningEfforts": []}]})
+        elif method == "turn/start":
+            turn_id = "turn-" + uuid.uuid4().hex[:12]
+            result(mid, {"turn": {"id": turn_id}})
+            note("item/completed", {"turnId": turn_id, "item": {"type": "userMessage", "id": "user-" + turn_id, "clientId": params.get("clientUserMessageId"), "content": params.get("input") or []}})
+            worker.start(go, turn_id, text_of(params.get("input")))
+        elif method == "turn/steer":
+            with lock:
+                running = current[0]
+            if running is None or running[0] != params.get("expectedTurnId"):
+                emit({"id": mid, "error": {"code": -32600, "message": "no turn is running"}})
+                continue
+            result(mid, {"turnId": running[0]})
+            note("item/completed", {"turnId": running[0], "item": {"type": "userMessage", "id": "user-" + uuid.uuid4().hex[:12], "clientId": params.get("clientUserMessageId"), "content": params.get("input") or []}})
+            running[1].steer(text_of(params.get("input")))
+        elif method == "turn/interrupt":
+            with lock:
+                running = current[0]
+            if running is not None:
+                running[1].stop()
+            result(mid, {})
+        elif mid is not None:
+            result(mid, {})
+    worker.end()
+
+
+# --- the Agent Client Protocol ------------------------------------------------------------------------
+
+
+def run_acp():
+    session = ["sess-" + uuid.uuid4().hex[:12]]
+    servers = [[]]
+    current = [None]
+    worker = Worker()
+
+    def result(mid, res):
+        emit({"jsonrpc": "2.0", "id": mid, "result": res})
+
+    def update(u):
+        emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session[0], "update": u}})
+
+    def go(mid, prompt):
+        t = Turn(prompt, servers[0], lambda text: update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text + "\n"}}))
+        worker.turn = t
+        current[0] = t
+        whole = t.run()
+        current[0] = None
+        result(mid, {"stopReason": "end_turn" if whole else "cancelled"})
+
+    for line in sys.stdin:
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        method, mid, params = m.get("method"), m.get("id"), m.get("params") or {}
+        if method == "initialize":
+            result(mid, {"protocolVersion": 1, "agentCapabilities": {"loadSession": True, "promptCapabilities": {"image": True}}, "agentInfo": {"name": "vm-stub", "version": VERSION}, "authMethods": []})
+        elif method in ("session/new", "session/load"):
+            servers[0] = _acp_servers(params.get("mcpServers"))
+            if method == "session/load" and params.get("sessionId"):
+                session[0] = params["sessionId"]
+            modes = {"currentModeId": "default", "availableModes": [{"id": "default", "name": "Agent"}]}
+            models = {"currentModelId": "stub", "availableModels": [{"modelId": "stub", "name": "stub"}]}
+            result(mid, {"sessionId": session[0], "modes": modes, "models": models} if method == "session/new" else {"modes": modes, "models": models})
+        elif method == "session/prompt":
+            prompt = " ".join(b.get("text", "") for b in params.get("prompt") or [] if isinstance(b, dict))
+            worker.start(go, mid, prompt)
+        elif method == "session/cancel":
+            if current[0]:
+                current[0].stop()
+            if mid is not None:
+                result(mid, None)
+        elif mid is not None:
+            result(mid, {})
+    worker.end()
+
+
+# --- Antigravity's CLI: headless stream-json ---------------------------------------------------------
+
+
+def run_agy():
+    args = sys.argv[1:]
+    if args[:2] == ["mcp", "add"] and len(args) >= 4:
+        # `agy mcp add <name> <command> <args>...`, as agy keeps it.
+        try:
+            with open(AGY_CONFIG) as f:
+                config = json.load(f)
+        except (OSError, ValueError):
+            config = {}
+        config.setdefault("mcpServers", {})[args[2]] = {"command": args[3], "args": args[4:]}
+        os.makedirs(os.path.dirname(AGY_CONFIG), exist_ok=True)
+        with open(AGY_CONFIG, "w") as f:
+            json.dump(config, f)
+        return
+    if args[:1] == ["mcp"]:
+        return
+    cid = flag("--conversation") or str(uuid.uuid4())
+    emit({"event": "init", "conversation_id": cid, "init": {"model": "stub", "cwd": os.getcwd(), "tools": [], "permission_mode": "accept-edits"}})
+    step = [0]
+
+    def say(text):
+        emit({"event": "step_update", "step_update": {"conversation_id": cid, "step_index": step[0], "state": "DONE", "step_type": "agent_response", "text_delta": text + "\n", "usage": {"input_tokens": 1, "output_tokens": 1}}})
+        step[0] += 1
+
+    for line in sys.stdin:
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if m.get("event") != "user":
+            continue
+        content = (m.get("message") or {}).get("content")
+        emit({"event": "step_update", "step_update": {"conversation_id": cid, "step_index": step[0], "state": "DONE", "step_type": "user_input"}})
+        step[0] += 1
+        Turn(content if isinstance(content, str) else "", _agy_servers(), say).run()
+        emit({"event": "result", "result": {"conversation_id": cid, "status": "SUCCESS", "response": "", "num_turns": 1}})
+
+
+# --- Pi: its RPC mode ---------------------------------------------------------------------------------
+
+
+def run_pi():
+    session = flag("--session-id") or str(uuid.uuid4())
+    current = [None]
+    told = [0]
+    worker = Worker()
+
+    def response(mid, command, data):
+        emit({"type": "response", "id": mid, "command": command, "success": True, "data": data})
+
+    def go(prompt):
+        index = [0]
+
+        def say(text):
+            emit({"type": "message_update", "assistantMessageEvent": {"type": "text_end", "contentIndex": index[0], "content": text}})
+            index[0] += 1
+
+        # kiln gives Pi no MCP server (its RPC mode has none to give: crates/kiln/src/harness/pi.rs).
+        t = Turn(prompt, [], say)
+        worker.turn = t
+        current[0] = t
+        emit({"type": "agent_start"})
+        emit({"type": "message_start", "message": {"role": "assistant"}})
+        whole = t.run()
+        emit({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop" if whole else "aborted"}})
+        current[0] = None
+        told[0] += 1
+        emit({"type": "agent_settled", "aborted": not whole})
+
+    for line in sys.stdin:
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        kind, mid = m.get("type"), m.get("id")
+        if kind == "get_state":
+            response(mid, kind, {"sessionId": session, "model": {"provider": "stub", "id": "stub", "input": ["text"]}, "thinkingLevel": "medium", "messageCount": told[0]})
+        elif kind == "get_available_models":
+            response(mid, kind, {"models": [{"provider": "stub", "id": "stub", "name": "stub", "input": ["text"]}]})
+        elif kind == "get_commands":
+            response(mid, kind, {"commands": []})
+        elif kind == "get_available_thinking_levels":
+            response(mid, kind, {"levels": ["medium"]})
+        elif kind == "prompt":
+            response(mid, kind, {})
+            worker.start(go, m.get("message") or "")
+        elif kind == "steer":
+            if current[0]:
+                current[0].steer(m.get("message") or "")
+                response(mid, kind, {})
+            else:
+                emit({"type": "response", "id": mid, "command": kind, "success": False, "error": "no run is under way"})
+        elif kind == "abort":
+            if current[0]:
+                current[0].stop()
+            response(mid, kind, {})
+        elif mid is not None:
+            response(mid, kind, {})
+    worker.end()
+
+
+def main():
+    if version():
+        return
+    try:
+        {"claude": run_claude, "codex": run_codex, "acp": run_acp, "agy": run_agy, "pi": run_pi}[dialect()]()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+
+
+if __name__ == "__main__":
+    main()

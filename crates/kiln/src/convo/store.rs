@@ -245,6 +245,8 @@ pub trait Engine: Send + 'static {
     fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>>;
     /// The sessions not ended, heard of since `since` (unix ms), oldest first.
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>>;
+    /// As [`Read::restorable`], on the writer.
+    fn restorable(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>>;
     /// The sessions that ended after `after` (`(closed_at, id)` together), oldest first, `limit` at
     /// most: `(id, closed_at)`.
     fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>>;
@@ -301,6 +303,10 @@ pub trait Read {
     fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>>;
     /// As [`Engine::ended`].
     fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>>;
+    /// What lists a session again: its row (by its id, the table's key) and its newest `last` events by number
+    /// (`sql::EVENTS_NEWEST`, an index's order, no sort of the session's events), oldest first. Cheap whatever the
+    /// session's or the store's size.
+    fn restorable(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>>;
 }
 
 /// The writer's engine as a [`Read`]: a store whose engine has no reader (or whose reader stopped) reads on its writer,
@@ -322,6 +328,10 @@ impl Read for OnWriter<'_> {
 
     fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
         self.0.ended(after, limit)
+    }
+
+    fn restorable(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        self.0.restorable(session, last)
     }
 }
 
@@ -701,6 +711,13 @@ impl Store {
         let (at, id) = after.unwrap_or((i64::MIN, String::new()));
         let limit = limit.min(ENDED_MAX);
         self.read(move |r| r.ended((at, &id), limit))
+    }
+
+    /// [`Read::restorable`], beside the writer at the last commit: what `Registry::restore_held` lists a session
+    /// with. Blocking, for `READ_WAIT` at most.
+    pub fn restorable_committed(&self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        let s = session.to_owned();
+        self.read(move |r| r.restorable(&s, last))
     }
 
     /// [`Store::kept`], read beside the writer at the last commit. Blocking, for `READ_WAIT` at most.
@@ -1179,6 +1196,9 @@ pub(crate) struct SlowToLetGo {
 impl Engine for SlowToLetGo {
     fn id(&self) -> String {
         self.inner.id()
+    }
+    fn restorable(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        self.inner.restorable(session, last)
     }
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<()> {
         self.inner.apply(rows)
