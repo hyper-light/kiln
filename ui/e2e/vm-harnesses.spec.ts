@@ -35,7 +35,7 @@ const HARNESSES = [
   ["pi", "Pi"],
 ] as const;
 
-/** The mock's one machine that starts microVMs (ui/mock/data.ts MICROVM_RUNNERS). */
+/** The mock's one machine that starts microVMs (ui/mock/data.ts MICROVM_RUNNERS), running Claude Code and Codex (ui/mock/machines.ts). */
 const MOCK_VM = "metal-mac-mini";
 
 const sideways = (page: Page) => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
@@ -46,8 +46,15 @@ async function isolationOf(page: Page, id: string) {
   return list.find((a) => a.id === id)?.isolation;
 }
 
-/** Picks harness `name` in Mission control's composer by a model of its, as a harness switch does. */
+/**
+ * Picks harness `name` in Mission control's composer by a model of its, as a harness switch does. The
+ * composer keeps the harness last picked (`kiln.agents.kind`), and its model picker lists the other
+ * harnesses alone: where it's `name` already, there's nothing to pick.
+ */
 async function toHarness(page: Page, name: string) {
+  const start = page.locator(".mc-start");
+  await expect(start).toHaveAttribute("aria-label", /^Start: /);
+  if ((await start.getAttribute("aria-label"))?.startsWith(`Start: ${name} on `)) return;
   const model = page.locator(".mc-how").locator('.rs-v[data-kind="model"]');
   if ((await model.getAttribute("aria-expanded")) !== "true") await model.click();
   await page
@@ -58,16 +65,21 @@ async function toHarness(page: Page, name: string) {
     .click();
 }
 
-/** In More options: the Agentfile its microVM is made from (by its image), then machine `machine`. */
-async function chooseAgentfileAndMachine(page: Page, name: string, image: string, machine: RegExp) {
-  await page.getByRole("button", { name: /^More options/ }).click();
-  await page.getByLabel(`The Agentfile ${name}'s microVM is made from`).selectOption(image);
+/** In More options, open: machine `machine`. The composer keeps the one last picked (`kiln.agents.target`). */
+async function toMachine(page: Page, machine: RegExp) {
   await page
     .locator(".mc-opt")
     .filter({ has: page.locator(".mc-opt-key", { hasText: /^Machine$/ }) })
     .locator("button.mc-pick")
     .click();
   await page.getByRole("radiogroup", { name: "Machine" }).getByRole("radio", { name: machine }).click();
+}
+
+/** In More options: the Agentfile its microVM is made from (by its image), then machine `machine`. */
+async function chooseAgentfileAndMachine(page: Page, name: string, image: string, machine: RegExp) {
+  await page.getByRole("button", { name: /^More options/ }).click();
+  await page.getByLabel(`The Agentfile ${name}'s microVM is made from`).selectOption(image);
+  await toMachine(page, machine);
 }
 
 /** Starts it from the composer: its id, from the page it opens. */
@@ -99,20 +111,13 @@ test.describe("against the mock", () => {
       ["codex", "Codex"],
     ] as const) {
       await page.goto("/agents");
-      if (kind !== "claude") await toHarness(page, name);
+      await toHarness(page, name);
       await page.getByRole("button", { name: /^More options/ }).click();
-      await page.getByLabel(`The Agentfile ${name}'s microVM is made from`).selectOption(`harness-${kind}`);
       // The server's own kiln starts none: said under the row, and nothing starts there.
+      await toMachine(page, /kiln server/);
+      await page.getByLabel(`The Agentfile ${name}'s microVM is made from`).selectOption(`harness-${kind}`);
       await expect(page.locator(".mc-opts .mc-note")).toContainText("kiln's server starts no microVMs itself");
-      await page
-        .locator(".mc-opt")
-        .filter({ has: page.locator(".mc-opt-key", { hasText: /^Machine$/ }) })
-        .locator("button.mc-pick")
-        .click();
-      await page
-        .getByRole("radiogroup", { name: "Machine" })
-        .getByRole("radio", { name: new RegExp(MOCK_VM) })
-        .click();
+      await toMachine(page, new RegExp(MOCK_VM));
       await expect(page.locator(".mc-opts .mc-note")).toHaveCount(0);
       await expect(page.locator(".mc-start")).toHaveAttribute("aria-label", new RegExp(`^Start: ${name} on ${MOCK_VM} .*in a microVM from harness-${kind}$`));
       expect(await sideways(page)).toBe(0);
