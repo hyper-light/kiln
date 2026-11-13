@@ -102,10 +102,12 @@ fn resumed_how(kind: &str) -> String {
     use super::kinds::{Kind, Protocol};
     let named = Kind::get(kind).map_or(kind, |k| k.name);
     match Kind::get(kind).map(|k| k.protocol) {
-        Some(Protocol::ClaudeStreamJson) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own conversation."),
-        Some(Protocol::CodexAppServer) => format!("It crashed and is resumed in place: a fresh {named} process going on in a thread made of its conversation."),
+        Some(Protocol::ClaudeStreamJson) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own conversation (--resume)."),
+        Some(Protocol::CodexAppServer) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own thread (thread/resume)."),
+        Some(Protocol::AgyStreamJson) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own conversation."),
+        Some(Protocol::PiRpc) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own session (--session-id)."),
+        Some(Protocol::Acp(_)) => format!("It crashed and is resumed in place: a fresh {named} process loading its own session (session/load), or, if it can't load sessions, given the conversation in words, as it says."),
         Some(Protocol::Terminal) | None => format!("It crashed and can't be resumed in its own conversation: {named} keeps none kiln can continue."),
-        Some(_) => format!("It crashed and is resumed in place: {named} keeps no conversation kiln can continue, so a fresh process is given it in words."),
     }
 }
 
@@ -248,7 +250,7 @@ async fn say(hub: &Arc<Hub>, id: &str, text: &str) {
 #[allow(clippy::too_many_arguments)]
 async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, now: bool, kind: Option<String>, model: Option<String>) -> Result<(), String> {
     let (there, note) = folder(hub, id, from, to, cwd, false).await?;
-    match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note, now, kind, model, local: false }).await {
+    match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note, now, kind, model, local: false, native: false }).await {
         Sent::Ok | Sent::Taken => Ok(()),
         Sent::Unreachable => Err(format!("{} is not connected", hub.shown(from))),
         s => Err(s.failure().map_or_else(|| format!("{} didn't take it", hub.shown(from)), |(_, why)| why)),
@@ -351,10 +353,12 @@ mod tests {
             let said = resumed_how(k.id);
             assert!(said.contains(k.name), "{}: {said}", k.id);
             match k.protocol {
-                Protocol::ClaudeStreamJson => assert!(said.contains("its own conversation"), "{said}"),
-                Protocol::CodexAppServer => assert!(said.contains("a thread made of its conversation"), "{said}"),
+                Protocol::ClaudeStreamJson => assert!(said.contains("--resume"), "{said}"),
+                Protocol::CodexAppServer => assert!(said.contains("thread/resume"), "{said}"),
+                Protocol::PiRpc => assert!(said.contains("--session-id"), "{said}"),
+                Protocol::AgyStreamJson => assert!(said.contains("its own conversation"), "{said}"),
+                Protocol::Acp(_) => assert!(said.contains("session/load") && said.contains("in words"), "{said}"),
                 Protocol::Terminal => assert!(said.contains("can't be resumed"), "{said}"),
-                _ => assert!(said.contains("in words"), "{}: {said}", k.id),
             }
         }
         assert!(resumed_how("no-such-harness").contains("can't be resumed"));

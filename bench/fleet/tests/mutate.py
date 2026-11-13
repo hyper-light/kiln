@@ -2,8 +2,8 @@
 """Guard-removal mutations (Shards R10): each guard the harness keeps is removed in a copy of
 fleetlib, and the light tests are run against the copy; every mutation must fail them.
 
-Run: python3 bench/fleet/tests/mutate.py   (prints each mutation and whether the tests caught it;
-exits 1 if any survived)
+Run: python3 bench/fleet/tests/mutate.py [WORDS...]   (prints each mutation and whether the tests
+caught it; exits 1 if any survived; WORDS: only the mutations whose guard's description holds one)
 """
 
 import os
@@ -22,14 +22,24 @@ MUTATIONS = [
     ("witness.py", "if len(set(pids)) > 1:", "if False:", "doubled within a token"),
     ("witness.py", "if pid in owner and owner[pid] != token:", "if False:", "doubled across tokens"),
     ("witness.py", "if not quiescent:\n        return out", "if False:\n        return out", "quiescence gating"),
-    ("witness.py", "if ask.state in HOLDS_VM and not any(pid in vm_pids for pid in view.get(token, [])):", "if False:", "lost"),
+    ("witness.py", "if ask.state in HOLDS_VM and token not in unnamed and not any(pid in vm_pids for pid in named.get(token, [])):", "if False:", "lost"),
     ("witness.py", "if ask is None or ask.state not in HOLDS_VM:\n            out.append(violation(\"leaked\"", "if False:\n            out.append(violation(\"leaked\"", "leaked"),
     ("witness.py", "if p.get(\"role\") == \"net\" and p.get(\"vm\") is not None and int(p[\"vm\"]) not in vm_pids:", "if False:", "orphan"),
     ("witness.py", "if token in seen and seen[token] != host:", "if False:", "doubled across hosts"),
     ("witness.py", "if to not in MOVES.get(self.state, set()):", "if False:", "the ask's state machine"),
     ("chaos.py", "if scope_pids.get(pid) != start:", "if False:", "chaos scope"),
     ("procs.py", "if start and now.start != start:", "if False:", "pid reuse"),
-    ("lane.py", "if chunk != op.out[op.got : op.got + len(chunk)]:", "if False:", "lane corruption"),
+    ("lane.py", "\n        if chunk != op.out[op.got : op.got + len(chunk)]:", "\n        if False:", "lane corruption"),
+    ("lane.py", "elif chunk != op.out[op.got : op.got + len(chunk)]:", "elif False:", "a thread lane's corruption"),
+    ("lane.py", "if self.streams.get(s.name) is not s:\n            return", "if False:\n            return", "a dropped thread lane's late word reaches no one"),
+    ("lane.py", "            for fd in mine:\n                os.close(fd)\n", "", "a lane refused a thread leaves no descriptor"),
+    ("procs.py", 'return name[:-4] if name.lower().endswith(".exe") else name', "return name", "a Windows image is named without its .exe"),
+    ("procs.py", "if now is None or now.zombie:", "if now is None:", "an exited process is gone, never killed"),
+    ("agent.py", "        except OSError as e:\n            # No descriptor or thread for its lane", "        except ValueError as e:\n            # No descriptor or thread for its lane", "a lane the host can't serve is typed"),
+    ("witness.py", "if len(loose) > len(held_unnamed):", "if False:", "unnamed asks leaked, by count"),
+    ("witness.py", "elif len(loose) < len(held_unnamed):", "elif False:", "unnamed asks lost, by count"),
+    ("hex.py", "        if reply.get(\"refusals\"):\n            return f\"refused: {refusals(reply)}\"\n        if reply.get(\"key\") is None:", "        if reply.get(\"key\") is None:", "a Hex refusal is typed in its words"),
+    ("agent.py", "        ended = [t for t in live_before if t in self.driver.ended]", "        ended = []", "a placer's kill ends the asks it says ended"),
     ("derive.py", "self._slowest = max(self._slowest, max(1, took_ns) / units)", "self._slowest = max(1, took_ns) / units", "waits only rise"),
     ("derive.py", "self._slowest = max(self._slowest, max(1, took_ns) / units)", "self._slowest = max(self._slowest, max(1, took_ns))", "a wait is kept per unit"),
     ("derive.py", "limits.append(max(0, have // per))", "limits.append(max(0, have // per) + 1)", "density limit"),
@@ -47,7 +57,8 @@ MUTATIONS = [
 
 def main() -> int:
     survived = 0
-    for name, guard, removed, what in MUTATIONS:
+    chosen = [m for m in MUTATIONS if not sys.argv[1:] or any(w in m[3] for w in sys.argv[1:])]
+    for name, guard, removed, what in chosen:
         with tempfile.TemporaryDirectory() as d:
             shutil.copytree(os.path.join(ROOT, "fleetlib"), os.path.join(d, "fleetlib"))
             shutil.copytree(HERE, os.path.join(d, "tests"))
@@ -64,7 +75,7 @@ def main() -> int:
             caught = r.returncode != 0
             print(f"{'caught ' if caught else 'SURVIVED'} {what} ({name})")
             survived += 0 if caught else 1
-    print(f"{len(MUTATIONS) - survived} of {len(MUTATIONS)} mutations caught")
+    print(f"{len(chosen) - survived} of {len(chosen)} mutations caught")
     return 1 if survived else 0
 
 

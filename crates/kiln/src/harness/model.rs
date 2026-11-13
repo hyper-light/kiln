@@ -2198,6 +2198,11 @@ pub enum Command {
         /// its folder or its harness's record travels, and it goes by way of the server.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         local: bool,
+        /// With `local`: the newer process reads a package that goes on natively from the harness's
+        /// own record here (`proto::feature::NATIVE_RESUME`), so an ACP agent or Antigravity goes on
+        /// in its own conversation; else (an older build, a rollback) its conversation goes in words.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        native: bool,
     },
     /// How a move is getting on before it starts (its repository being copied over): shown.
     Moving {

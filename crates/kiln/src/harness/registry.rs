@@ -4792,7 +4792,8 @@ impl Registry {
         let (from_shown, to_shown) = (hub.shown(&from_name), hub.shown(to));
         // The package, and its timeline for kiln's take of it (every event's digest), made on the blocking pool (goal 9,
         // plan 01a1a87b2cec step 3).
-        let (mut pkg, timeline) = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown)).map(|p| {
+        let in_place = from_name == to;
+        let (mut pkg, timeline) = crate::rt::blocking(move || crate::convo::resume::package_for(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown), in_place).map(|p| {
             let t = crate::custody::timeline(&i, p.state.epoch, &p.events);
             (p, t)
         }))

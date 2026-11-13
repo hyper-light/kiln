@@ -520,6 +520,30 @@ mod tests {
         InstanceHello { id: id.into(), created_at, pid: 1 }
     }
 
+    /// Ada, 2026-11-13: a same-machine hand-over carries an ACP agent's or Antigravity's
+    /// conversation natively only to a newest process that says it reads a native package
+    /// (`feature::NATIVE_RESUME`): new→new natively; to an older build (a rollback), or one that
+    /// says no features, in words.
+    #[test]
+    fn native_handover_goes_natively_only_to_a_newest_process_that_reads_it() {
+        let mut m = Instances::default();
+        m.announce(10, ih("0199-old", 50));
+        m.join(10, "box", hello("old"), 1);
+        m.announce(20, ih("0199-new", 100));
+        m.join(20, "box", hello("new"), 2);
+        assert!(!crate::handovers::native_to(&m, "box"), "says no features: words");
+        m.set_features(20, vec![crate::proto::feature::PLACE.into()]);
+        assert!(!crate::handovers::native_to(&m, "box"), "an older build's features: words");
+        m.set_features(20, crate::proto::feature::all());
+        assert!(crate::handovers::native_to(&m, "box"), "this build's: natively");
+        // A rollback: an older build is the newest now; the newer one, older in its place, isn't asked.
+        m.announce(30, ih("0199-rollback", 200));
+        m.join(30, "box", hello("rolled-back"), 3);
+        m.set_features(30, vec![crate::proto::feature::PLACE.into()]);
+        assert!(!crate::handovers::native_to(&m, "box"), "to the rolled-back build: words");
+        assert!(!crate::handovers::native_to(&m, "nobody"), "no such machine");
+    }
+
     #[test]
     fn a_new_runner_beside_a_legacy_one_takes_new_work_and_the_old_keeps_its_own() -> anyhow::Result<()> {
         let mut m = Instances::default();

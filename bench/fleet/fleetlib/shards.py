@@ -30,10 +30,20 @@ NAME_PREFIX = "fleet-"
 
 
 class Shards:
+    """The direct driver: each VM a client's run, its stdio the lane."""
+
+    name = "shards"
+    lanes = True
+    actions = ("vm", "daemon", "client")
+    # Asks whose run the placer says ended: the direct driver learns that from each lane's end.
+    ended: frozenset = frozenset()
+
     def __init__(self, binary: str, scope: str) -> None:
         self.binary = binary
         self.scope = scope
         self.home = os.path.join(scope, "h")
+        # What a process of the run's names in its arguments (teardown's last scan).
+        self.mark = self.home
         self.env = dict(os.environ)
         for drop in ("DOCKER_AUTH_CONFIG", "SHARDS_DEFAULT_PLATFORM", "DOCKER_DEFAULT_PLATFORM", "DOCKER_HOST", "SHARDS_HOST"):
             self.env.pop(drop, None)
@@ -52,7 +62,7 @@ class Shards:
         _, out, _ = self.command("version")
         return " ".join(line.strip() for line in out.splitlines()[:5])
 
-    def identity(self) -> str:
+    def identity(self) -> Dict[str, str]:
         """The binary's SHA-256: what was measured, exactly (its version is asked of the daemon
         once it serves, since a client with no daemon would start one)."""
         import hashlib
@@ -61,9 +71,16 @@ class Shards:
         with open(self.binary, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
-        return h.hexdigest()
+        return {"shards": h.hexdigest()}
 
-    def start_daemon(self, log_path: str, deadline_ns: Optional[int]) -> Tuple[bool, str]:
+    def roots(self) -> List[int]:
+        d = self.daemon
+        return [d.pid] if d is not None and d.poll() is None else []
+
+    def placer(self) -> Dict[str, object]:
+        return {"pid": self.daemon.pid if self.daemon else None, "start": self.daemon_start}
+
+    def start(self, log_path: str, deadline_ns: Optional[int]) -> Tuple[bool, str]:
         """Starts the home's daemon as this process's child and waits for it to serve: its pid file
         naming it and its request slots made (D185), then a client answered by it."""
         os.makedirs(self.config, exist_ok=True)
@@ -95,7 +112,7 @@ class Shards:
             return False, f"the daemon answered no list: {err.strip()[:300]}"
         return True, ""
 
-    def stop_daemon(self) -> Optional[int]:
+    def stop(self) -> Optional[int]:
         if self.daemon is None:
             return None
         if self.daemon.poll() is None:
@@ -110,10 +127,14 @@ class Shards:
         code, out, err = self.command("pull", image)
         return code == 0, (out + err).strip()[-500:]
 
-    def run_once(self, image: str) -> Tuple[bool, str]:
+    def run_once(self, image: str, deadline_ns: Optional[int]) -> Tuple[bool, str]:
         """One run to its end: the guest kernel fetched and the image's template made, the
-        first-run costs no fleet start pays again."""
-        code, out, err = self.command("run", "vm", "--rm", image, "true")
+        first-run costs no fleet start pays again; bounded by the run's deadline alone."""
+        left = None if deadline_ns is None else max(0.0, (deadline_ns - time.monotonic_ns()) / 1e9)
+        try:
+            code, out, err = self.command("run", "vm", "--rm", image, "true", timeout_s=left)
+        except subprocess.TimeoutExpired:
+            return False, "the first run didn't end within the run's deadline"
         return code == 0, (out + err).strip()[-500:]
 
     def start_vm(self, token: str, image: str, ballast: int, stderr_path: str) -> subprocess.Popen:
