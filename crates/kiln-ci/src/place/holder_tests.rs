@@ -14,7 +14,7 @@ use hex_api::capacity::sim::SimView;
 use hex_api::capacity::{self as hex, Budget, CapacityView, Held, Host, ReservationId, ToHolder, ToKeeper};
 
 use super::ask::{Ask, Peer, Sample};
-use super::holder::{Event, Holding, Link, Out};
+use super::holder::{BoxName, Event, Holding, Link, Out, Paired};
 use super::keeper::{Keeper, NotGranted, Unsynced, View, WaitEnded};
 use super::msg::{Reason, ToOwner};
 use super::runner::{Admission, Init, Records, Said, Settings, Start};
@@ -406,6 +406,29 @@ fn holder_refusals_are_typed_and_a_run_asking_nothing_reserves_nothing() -> Resu
     let events = talk(&mut keeper, 1, &mut h, said(vec![word]), 7)?;
     assert_eq!(not_granted(&events, gpu), Some(NotGranted::Devices), "{events:?}");
     assert!(books(&keeper, "runner-1")?.is_empty());
+    Ok(())
+}
+
+/// The boxes kiln runs on its machine are named so its keeper pairs each with what kiln holds there
+/// (agreed with Hex's lead): a reservation's box `kiln-r<epoch>-<seq>`, the box of a run that asks
+/// nothing `kiln-z<epoch>-<n>`, numbered from 0 in its runner process, each number decimal. Each is
+/// a name Hex's boxes take and pairs back with itself; an id that isn't one written so (a leading
+/// zero, a sign, a part more or fewer, a number past a `u64`, another prefix) pairs with nothing.
+#[test]
+fn holder_boxes_are_named_by_what_they_hold_and_pair_byte_for_byte() -> Result<(), String> {
+    let mut h = holding("runner-1", 7, &[])?;
+    let reserved = BoxName::Reserved(ReservationId { epoch: 7, seq: 12 });
+    assert_eq!(reserved.to_string(), "kiln-r7-12");
+    assert_eq!(h.unreserved(), BoxName::Unreserved { epoch: 7, n: 0 });
+    assert_eq!(h.unreserved().to_string(), "kiln-z7-1");
+    let widest = BoxName::Reserved(ReservationId { epoch: u64::MAX, seq: u64::MAX });
+    for name in [reserved, BoxName::Unreserved { epoch: 7, n: 1 }, widest] {
+        assert_eq!(name.id().map_err(debug)?.as_str(), name.to_string(), "a name Hex's boxes take");
+        assert_eq!(BoxName::pair(&name.to_string()), Paired::Kiln(name));
+    }
+    for id in ["kiln-r07-12", "kiln-r+7-12", "kiln-r7-012", "kiln-r7-12-1", "kiln-r7", "kiln-r7-", "kiln-r-12", "kiln-z7-01", "kiln-x7-12", "Kiln-r7-12", "kiln-r18446744073709551616-0", "box-1", ""] {
+        assert_eq!(BoxName::pair(id), Paired::Unpaired, "{id:?}");
+    }
     Ok(())
 }
 

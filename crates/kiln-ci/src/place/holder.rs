@@ -99,6 +99,71 @@ pub struct Holding {
     most: u64,
     /// Where it stood when it last said so.
     stood: Option<Keeper>,
+    /// The starts that asked nothing, so reserved nothing, in this process: each one's box numbered
+    /// ([`BoxName::Unreserved`]).
+    unreserved: u64,
+}
+
+/// What a box kiln runs on its machine is named, so that its machine's keeper pairs the box with
+/// what kiln holds there (agreed with Hex's lead): the box of a run that reserved by its
+/// reservation, `kiln-r<epoch>-<seq>`; that of a run that asks nothing, which reserves nothing, by
+/// its runner process's epoch and its count of such runs in that process, `kiln-z<epoch>-<n>`. Each
+/// number is decimal, as a `u64` is written: no sign, no leading zero. At most 47 characters of
+/// `a-z 0-9 -`, a name Hex's `BoxId` takes ([`Self::id`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BoxName {
+    /// A run that reserved its room: its reservation.
+    Reserved(ReservationId),
+    /// The `n`th run (from 0) that asked nothing in the runner process of `epoch`.
+    Unreserved { epoch: u64, n: u64 },
+}
+
+/// What a box's id pairs with ([`BoxName::pair`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Paired {
+    /// A box of kiln's, as its name says.
+    Kiln(BoxName),
+    /// An id in neither of kiln's namespaces: a box that pairs with nothing of kiln's.
+    Unpaired,
+}
+
+impl std::fmt::Display for BoxName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BoxName::Reserved(id) => write!(f, "kiln-r{}-{}", id.epoch, id.seq),
+            BoxName::Unreserved { epoch, n } => write!(f, "kiln-z{epoch}-{n}"),
+        }
+    }
+}
+
+impl BoxName {
+    /// Its id as Hex's boxes take it.
+    pub fn id(self) -> Result<hex_api::BoxId, hex_api::Refusal> {
+        hex_api::BoxId::new(&self.to_string())
+    }
+
+    /// What box id `id` pairs with: the name it reads as, where that name written gives `id` back
+    /// byte for byte (so `kiln-r01-2`, `kiln-r+1-2` and `kiln-r1-2-3` pair with nothing); else
+    /// unpaired.
+    pub fn pair(id: &str) -> Paired {
+        let read = if let Some(rest) = id.strip_prefix("kiln-r") {
+            two(rest).map(|(epoch, seq)| BoxName::Reserved(ReservationId { epoch, seq }))
+        } else if let Some(rest) = id.strip_prefix("kiln-z") {
+            two(rest).map(|(epoch, n)| BoxName::Unreserved { epoch, n })
+        } else {
+            None
+        };
+        match read {
+            Some(name) if name.to_string() == id => Paired::Kiln(name),
+            _ => Paired::Unpaired,
+        }
+    }
+}
+
+/// Two numbers parted by a `-`.
+fn two(text: &str) -> Option<(u64, u64)> {
+    let (a, b) = text.split_once('-')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
 }
 
 impl Holding {
@@ -120,12 +185,26 @@ impl Holding {
             stalled: false,
             most: u64::try_from(most).unwrap_or(u64::MAX),
             stood: None,
+            unreserved: 0,
         })
     }
 
     /// Where its core's link stands.
     pub fn link(&self) -> Link {
         self.link
+    }
+
+    /// The epoch its process started under.
+    pub fn epoch(&self) -> u64 {
+        self.core.epoch()
+    }
+
+    /// The box of a start that asks nothing ([`Self::reserve`]'s none), which starts without a
+    /// reservation: the next of this process's ([`BoxName::Unreserved`]).
+    pub fn unreserved(&mut self) -> BoxName {
+        let n = self.unreserved;
+        self.unreserved = n.saturating_add(1);
+        BoxName::Unreserved { epoch: self.core.epoch(), n }
     }
 
     /// The reservations whose work may run, its starts' granted and its survivors': what its
