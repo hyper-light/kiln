@@ -4707,7 +4707,10 @@ impl Registry {
             Location::Local => return Err("it runs on the server itself, which is up: move it instead".into()),
             Location::Machine(m) => m.clone(),
         };
-        if hub.agents.load().get(&from_name).is_some_and(|a| a.connected) {
+        // Online and still holding it: it moves from there instead. Online without it (its runner
+        // let go of it, and no runner holds it): it goes on from the server's copy, even there.
+        let held = self.list().into_iter().find(|i| i.id == id).is_some_and(|i| i.status != super::model::Status::Disconnected);
+        if held && hub.agents.load().get(&from_name).is_some_and(|a| a.connected) {
             return Err(format!("{} is online: move the session from there instead", hub.shown(&from_name)));
         }
         if !hub.agents.load().get(to).is_some_and(|a| a.connected) {

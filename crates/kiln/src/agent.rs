@@ -2689,7 +2689,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         if draining && jobs.is_empty() && o.ephemeral {
             return Ok(());
         }
-        if retiring && jobs.is_empty() && terms.is_empty() && harness_operations.is_empty() && retire_at.is_some_and(|t| Instant::now() >= t) {
+        if retiring && jobs.is_empty() && terms.is_empty() && harness_operations.is_empty() && harness.as_ref().is_none_or(|h| h.holds_none()) && retire_at.is_some_and(|t| Instant::now() >= t) {
             tracing::info!("handed everything to the new build, and its own jobs are done: this runner retires");
             // What its tracers' spans counted, written before it goes, as a stop's is.
             crate::observe::ddtrace::finish(Duration::from_secs(3)).await;
@@ -2745,7 +2745,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         // Whether this turn's event comes off its own channel (none was taken ahead of its turn): a
         // job's end that does waits behind what its job sent (`Ev::Done`).
         let in_turn = taken.is_empty();
-        let retirement_due=retire_at.filter(|_|retiring && jobs.is_empty() && terms.is_empty() && harness_operations.is_empty());
+        let retirement_due=retire_at.filter(|_|retiring && jobs.is_empty() && terms.is_empty() && harness_operations.is_empty() && harness.as_ref().is_none_or(|h| h.holds_none()));
         let mail_budget = mail_replay.budget_observed();
         let ev = futures::select_biased! {
             () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
@@ -3167,7 +3167,37 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 }
                                 match conn.send(f, fds).and_then(|()| conn.recv()) {
                                     Ok((Frame::Ack { ok: true, .. }, _)) => acks.push(Ack::Taken),
-                                    Ok((Frame::Ack { error, .. }, _)) => acks.push(Ack::Refused(error.unwrap_or_else(|| "refused".to_owned()))),
+                                    // Refused with its process running: this runner has already let go of it
+                                    // (`Host::move_out_signing`) and the new build didn't take it, so it had no
+                                    // owner, and its process died on its first write once this runner ended
+                                    // (Amphora, 2026-11-12 21:12:49Z: absent from the new build's records).
+                                    // Its process is stopped and it goes again as its record alone, which the
+                                    // new build starts again from, its conversation resumed.
+                                    Ok((Frame::Ack { error, .. }, _)) => acks.push(match f {
+                                        Frame::Session { id, record, handed: Some(hd), hand_on } => {
+                                            let first = error.unwrap_or_else(|| "refused".to_owned());
+                                            crate::harness::host::stop_process(hd.process.pid);
+                                            let again = Frame::Session { id: id.clone(), record: record.clone(), handed: None, hand_on: hand_on.clone() };
+                                            let journal: Vec<std::os::fd::RawFd> = record.journal().map(|j| j.as_raw_fd()).into_iter().collect();
+                                            match conn.send(&again, &journal).and_then(|()| conn.recv()) {
+                                                Ok((Frame::Ack { ok: true, .. }, _)) => {
+                                                    tracing::warn!(session = %id, why = %first, "the new build didn't take an agent session with its process running: it starts again there from its record");
+                                                    Ack::Taken
+                                                }
+                                                Ok((Frame::Ack { error, .. }, _)) => Ack::Refused(format!("{first}; as its record alone: {}", error.unwrap_or_else(|| "refused".to_owned()))),
+                                                Ok(_) => {
+                                                    broke = Some("the new build answered out of turn".to_owned());
+                                                    Ack::Lost("an answer out of turn".to_owned())
+                                                }
+                                                Err(e) => {
+                                                    let e = format!("{e:#}");
+                                                    broke = Some(e.clone());
+                                                    Ack::Lost(e)
+                                                }
+                                            }
+                                        }
+                                        _ => Ack::Refused(error.unwrap_or_else(|| "refused".to_owned())),
+                                    }),
                                     Ok(_) => {
                                         broke = Some("the new build answered out of turn".to_owned());
                                         acks.push(Ack::Lost("an answer out of turn".to_owned()));
@@ -3221,10 +3251,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     match (item, ack) {
                                         (Item::Session { .. }, Ack::Taken) => sessions += 1,
                                         (Item::Terminal { .. }, Ack::Taken) => terminals += 1,
-                                        // The new build started it again from its record.
+                                        // Refused even as its record alone: nobody else holds it, so it's back here,
+                                        // started again from its record, and this runner ends with it (as a terminal
+                                        // that couldn't go), never left to no one (Amphora, 2026-11-12 21:12:49Z).
                                         (Item::Session { record, .. }, Ack::Refused(e) | Ack::Lost(e)) => {
-                                            tracing::warn!(session = %record.id(), why = %e, "the new build didn't take an agent session as it was handed over");
-                                            said.push(format!("agent session {} wasn't taken by the new build as handed over: {e}", record.id()));
+                                            let id = record.id().to_owned();
+                                            tracing::warn!(session = %id, why = %e, "the new build didn't take an agent session: it stays with this runner");
+                                            moved.remove(&crate::instances::Owned::Agent(id.clone()));
+                                            let back = match &harness {
+                                                Some(host) => host.move_in(*record, None).await.map_err(|e| format!("{e:#}")),
+                                                None => Err("this runner runs no agent sessions".to_owned()),
+                                            };
+                                            match back {
+                                                Ok(()) => said.push(format!("agent session {id} stays with this runner (the new build didn't take it: {e}); this runner ends with it")),
+                                                Err(why) => {
+                                                    tracing::error!(session = %id, why = %why, "an agent session the new build didn't take couldn't start again here");
+                                                    said.push(format!("agent session {id} wasn't taken by the new build ({e}) and couldn't start again here: {why}"));
+                                                }
+                                            }
                                         }
                                         // Back here: it ends with this runner (which waits for it).
                                         (Item::Terminal { session, state, fd, pid }, ack) => {

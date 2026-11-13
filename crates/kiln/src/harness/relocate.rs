@@ -61,7 +61,10 @@ pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     let to = to.strip_prefix("agent:").unwrap_or(to);
     let to = &hub.machine_named(to).unwrap_or_else(|| to.to_owned());
     let moved = start_one(hub, id, to, now, kind, model).await?;
-    for c in all.iter().filter(|c| c.subagent && c.parent.as_deref() == Some(id) && c.status != super::model::Status::Exited && hub.harness.location(&c.id) == leaves) {
+    // Gone on where it was (a stranded session taken up again by its own runner): its subagents are
+    // there already.
+    let stays = leaves.as_ref().is_some_and(|l| *l == Location::Machine(to.clone()));
+    for c in all.iter().filter(|c| !stays && c.subagent && c.parent.as_deref() == Some(id) && c.status != super::model::Status::Exited && hub.harness.location(&c.id) == leaves) {
         if let Err(e) = start_one(hub, &c.id, to, now, None, None).await {
             say(hub, &c.id, &format!("Couldn't go along with its agent to {}: {e}", hub.shown(to))).await;
         }
@@ -80,6 +83,14 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
         Some(Location::Local) if hub.harness.never_started(id) => "the kiln server".to_owned(),
         _ => return Err("the kiln server keeps the agents it runs once they've started: only one whose harness never started there moves".into()),
     };
+    // Left by its own runner, which is up (a hand-over to a new build that didn't take it: Amphora,
+    // 2026-11-12 21:12:49Z): it goes on there again, under its own id, from the server's copy of
+    // its conversation, as one whose machine is away does on another.
+    let stranded = info.status == super::model::Status::Disconnected && hub.agents.load().get(&from).is_some_and(|a| a.connected);
+    if from == to && stranded && kind.is_none() {
+        hub.harness.resume_on(hub, id, &to, Some(info.cwd.clone())).await?;
+        return Ok(serde_json::json!({ "moving": to, "from_store": true }));
+    }
     if from == to {
         return Err(format!("it runs on {} already", hub.shown(&to)));
     }
