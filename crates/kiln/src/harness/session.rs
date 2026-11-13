@@ -6583,7 +6583,7 @@ for line in sys.stdin:
     }
 
     /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: a harness that ended part-way through a
-    /// turn starts again when its wait is over (`AGAIN_FIRST`), the turn's pick-up first. Its host
+    /// turn starts again when its wait is over (`again`), the turn's pick-up first. Its host
     /// saying its input takes writes before then (`Session::input_changed`) starts nothing early:
     /// nobody asked it to start, and the pick-up waiting in its queue isn't an ask.
     #[cfg(unix)]
