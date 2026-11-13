@@ -27,7 +27,7 @@ impl KilnBackend {
     }
 }
 
-fn random<const N: usize>() -> anyhow::Result<[u8; N]> {
+pub(super) fn random<const N: usize>() -> anyhow::Result<[u8; N]> {
     let mut b = [0u8; N];
     SystemRandom::new().fill(&mut b).map_err(|_| anyhow::anyhow!("the system's random source failed"))?;
     Ok(b)
