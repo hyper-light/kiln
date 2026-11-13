@@ -4,8 +4,7 @@
 //! decision it holds (`docs/design/capacity-view.md`), and [`view`] returns the cases that failed and why.
 
 use super::{
-    Amounts, Close, Fence, Held, Host, ReservationId, Scope, ScopeRefused, ToHolder, ToKeeper,
-    View, Why,
+    Amounts, Close, Fence, Held, Host, ReservationId, Scope, ToHolder, ToKeeper, View, Why,
 };
 use crate::Refusal;
 
@@ -74,16 +73,11 @@ pub const CASES: &[Case] = &[
     },
     Case {
         id: "HEX-CV-9",
-        says: "CV12: a synced holder whose hello names its work's scope is credited what that work used in the host's sample, up to what it holds, and nothing once its link drops",
-        run: credits,
+        says: "CV12, withdrawn: a hello naming its work's scope is served as one naming none, and the room is the measured room alone: a holder's use is never credited",
+        run: scope_earns_nothing,
     },
     Case {
         id: "HEX-CV-10",
-        says: "CV12: a sample that refuses a holder's scope credits nothing and closes its session, typed",
-        run: refused_scope,
-    },
-    Case {
-        id: "HEX-CV-11",
         says: "CV4: a link speaks for its own session alone: a fence of another link's session is closed as no session, and changes nothing",
         run: own_session,
     },
@@ -534,69 +528,35 @@ fn scoped(host: &mut dyn Host, link: u64, scope: Scope) -> Result<Fence, String>
     Ok(fence)
 }
 
-/// HEX-CV-9: a holder naming its cgroup reserves 4 GiB while its work uses 3, the host's sample reading the room 3
-/// GiB short; expect its scope among those the host reads, a reserve of all that is left counting it once (granted),
-/// and after its link drops a new session's welcome saying the measured room alone.
-fn credits(host: &mut dyn Host) -> Result<(), String> {
-    let scope = Scope::Cgroup("conformance/a".to_owned());
-    let fence = scoped(host, 1, scope.clone())?;
+/// HEX-CV-9: a holder whose hello names a cgroup reserves 4 GiB, and the host measures the room 3 GiB short (its work's use,
+/// missing from free memory); expect the hello welcomed, a reserve of all the measured room leaves granted, and a GiB more
+/// refused for room in the measured room: its use counted twice, never credited (CV12, withdrawn).
+fn scope_earns_nothing(host: &mut dyn Host) -> Result<(), String> {
+    let fence = scoped(host, 1, Scope::Cgroup("conformance/a".to_owned()))?;
     ensure(granted(&reserve(host, 1, fence, id(1, 0), gib(4))?), || {
         "4 GiB refused".to_owned()
     })?;
-    let scopes = host.scopes().map_err(|e| format!("scopes: {e}"))?;
-    ensure(scopes == vec![(1, scope)], || format!("scopes {scopes:?}"))?;
     let measured = ROOM.less(gib(3));
-    host.sample(measured, &[(1, Ok(gib(3)))])
-        .map_err(|e| format!("sample: {e}"))?;
+    host.set_room(measured)
+        .map_err(|e| format!("set_room: {e}"))?;
     let rest = Amounts {
-        mem_bytes: ROOM.mem_bytes.saturating_sub(4 << 30),
+        mem_bytes: measured.mem_bytes.saturating_sub(4 << 30),
         ..Amounts::ZERO
     };
-    let all = reserve(host, 1, fence, id(1, 1), rest)?;
-    ensure(granted(&all), || {
-        format!("the rest of the room refused, the holder's use counted twice: {all:?}")
+    ensure(granted(&reserve(host, 1, fence, id(1, 1), rest)?), || {
+        "all the measured room leaves refused".to_owned()
     })?;
-    host.link_down(1).map_err(|e| format!("link down: {e}"))?;
-    let hello = ToKeeper::Hello {
-        holder: "conformance-a".to_owned(),
-        epoch: 1,
-        scope: None,
-    };
-    match hear(host, 2, hello)? {
-        ToHolder::Welcome { view, .. } if view.room == measured => Ok(()),
-        other => Err(format!("after its link dropped: {other:?}")),
-    }
-}
-
-/// HEX-CV-10: a holder naming a process group reserves 2 GiB, then the host's sample refuses the group as not its
-/// user's; expect the hints to close its session with Close::Scope(NotOwned), and a reserve on that fence closed as
-/// no session.
-fn refused_scope(host: &mut dyn Host) -> Result<(), String> {
-    let fence = scoped(host, 1, Scope::Group(4242))?;
-    ensure(granted(&reserve(host, 1, fence, id(1, 0), gib(2))?), || {
-        "2 GiB refused".to_owned()
-    })?;
-    let measured = ROOM.less(gib(1));
-    host.sample(measured, &[(1, Err(ScopeRefused::NotOwned))])
-        .map_err(|e| format!("sample: {e}"))?;
-    let hints = host.hints().map_err(|e| format!("hints: {e}"))?;
-    ensure(
-        matches!(
-            hints.as_slice(),
-            [(1, ToHolder::Closed { rejected: Some(f), why: Close::Scope(ScopeRefused::NotOwned) })] if *f == fence
-        ),
-        || format!("hints {hints:?}"),
-    )?;
-    match reserve(host, 1, fence, id(1, 1), gib(1))? {
-        ToHolder::Closed {
-            why: Close::Session,
+    match reserve(host, 1, fence, id(1, 2), gib(1))? {
+        ToHolder::Refused {
+            why: Why::Room,
+            view,
             ..
-        } => Ok(()),
-        other => Err(format!("a reserve on the closed session: {other:?}")),
+        } if view.room == measured => Ok(()),
+        other => Err(format!("a GiB past the measured room: {other:?}")),
     }
 }
 
-/// HEX-CV-11: two holders joined on links 1 and 2; link 2 reserves under link 1's fence, then link 1 reserves the whole
+/// HEX-CV-10: two holders joined on links 1 and 2; link 2 reserves under link 1's fence, then link 1 reserves the whole
 /// room; expect link 2's word closed as no session (naming the fence it said) and link 1's reserve granted.
 fn own_session(host: &mut dyn Host) -> Result<(), String> {
     let first = joined(host, 1, "conformance-a", 1)?;

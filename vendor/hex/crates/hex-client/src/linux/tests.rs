@@ -1252,6 +1252,7 @@ fn container_box(id: &str, class: Class) -> hex_api::BoxSpec {
         devices: Vec::new(),
         allocation: None,
         route: None,
+        band: 0,
     }
 }
 

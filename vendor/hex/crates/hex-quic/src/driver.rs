@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,10 +15,10 @@ use hyper_quic::rustls::{CipherSuite, NamedGroup};
 use hyper_transport::tls::CertificateDer;
 use hyper_transport::{Authenticated, Directory, Event, PeerId};
 
-use crate::Refused;
 use crate::classes::{Hex, Role};
 use crate::conn::{Conn, Shared};
 use crate::limits::Derived;
+use crate::{Admits, Refused};
 
 /// The endpoint the driver owns.
 type Endpoint = hyper_transport::Endpoint<Hex, hyper_transport::Fixed, Names>;
@@ -28,7 +28,7 @@ pub(crate) enum Command {
     Dial {
         name: String,
         address: SocketAddr,
-        reply: SyncSender<Result<PeerId, Refused>>,
+        reply: hex_wait::mpsc::SyncSender<Result<PeerId, Refused>>,
     },
     Open {
         peer: PeerId,
@@ -153,10 +153,12 @@ impl Queue {
 }
 
 /// Which peer a connection's handshake names: the DNS name its certificate carries, which kiln's CA binds at
-/// enrollment (docs/design/hex-quic.md Q5), as its id ([`peer_id`]).
+/// enrollment (docs/design/hex-quic.md Q5), as its id ([`peer_id`]); a connection the peer opened, only where the
+/// endpoint admits that name (Q10).
 pub(crate) struct Names {
     /// The names this side dials, by id: the name a server's certificate is checked against.
     dialing: BTreeMap<PeerId, String>,
+    admits: Admits,
 }
 
 /// A peer's id: the first eight bytes of the SHA-256 of its name, so a dialer knows the id of the peer it dials
@@ -186,10 +188,15 @@ impl Directory for Names {
         }
         let name = certificate_name(authenticated.certificate?)?;
         let peer = peer_id(&name);
-        if authenticated.dialed.is_some_and(|dialed| dialed != peer) {
-            return None;
+        let admitted = match authenticated.dialed {
+            Some(dialed) => dialed == peer,
+            None => self.admits.admits(&name),
+        };
+        if admitted {
+            Some((peer, Role::Member))
+        } else {
+            None
         }
-        Some((peer, Role::Member))
     }
 
     fn server_name(&self, peer: PeerId) -> Option<&str> {
@@ -218,8 +225,8 @@ const WAITING: usize = 6;
 /// Connections accepted for a port and not yet taken by its owner.
 #[derive(Default)]
 pub(crate) struct Accepts {
-    queues: Mutex<AcceptQueues>,
-    came: Condvar,
+    queues: hex_wait::Mutex<AcceptQueues>,
+    came: hex_wait::Condvar,
 }
 
 #[derive(Default)]
@@ -227,6 +234,18 @@ struct AcceptQueues {
     by_port: BTreeMap<u32, VecDeque<(PeerId, Arc<Shared>)>>,
     /// The driver has ended: no connection comes.
     closed: bool,
+}
+
+/// An accept's wait that couldn't wait: the queues' lock poisoned, the driver gone with it, or the OS refused it
+/// (macOS's kqueue).
+fn wait_refused(why: hex_wait::Failed) -> Refused {
+    match why {
+        hex_wait::Failed::Poisoned => Refused::Ended,
+        hex_wait::Failed::Os(why) => Refused::Os {
+            op: "waiting for an accepted connection",
+            why: why.to_string(),
+        },
+    }
 }
 
 impl Accepts {
@@ -244,7 +263,7 @@ impl Accepts {
                 return Err(Refused::Ended);
             }
             queues = match deadline {
-                None => self.came.wait(queues).map_err(|_| Refused::Ended)?,
+                None => self.came.wait(queues).map_err(wait_refused)?,
                 Some(at) => {
                     let left = at.saturating_duration_since(Instant::now());
                     if left.is_zero() {
@@ -254,7 +273,7 @@ impl Accepts {
                     }
                     self.came
                         .wait_timeout(queues, left)
-                        .map_err(|_| Refused::Ended)?
+                        .map_err(wait_refused)?
                         .0
                 }
             };
@@ -296,7 +315,7 @@ pub(crate) struct Driver {
     derived: Derived,
     serves: Vec<u32>,
     peers: BTreeMap<PeerId, PeerState>,
-    dials: BTreeMap<PeerId, Vec<SyncSender<Result<PeerId, Refused>>>>,
+    dials: BTreeMap<PeerId, Vec<hex_wait::mpsc::SyncSender<Result<PeerId, Refused>>>>,
     out: Vec<u8>,
     buf: Vec<u8>,
 }
@@ -310,12 +329,25 @@ pub(crate) struct Started {
 }
 
 impl Driver {
+    /// A driver admitting every peer kiln's CA enrolled: the tests' endpoints of another TLS (`tests.rs`, `under`).
+    #[cfg(test)]
     pub(crate) fn start(
         ep_config: hyper_transport::Config<Role>,
         budget: hyper_transport::Fixed,
         bind: SocketAddr,
         derived: Derived,
         serves: Vec<u32>,
+    ) -> Result<Started, Refused> {
+        Self::start_admitting(ep_config, budget, bind, derived, serves, Admits::Enrolled)
+    }
+
+    pub(crate) fn start_admitting(
+        ep_config: hyper_transport::Config<Role>,
+        budget: hyper_transport::Fixed,
+        bind: SocketAddr,
+        derived: Derived,
+        serves: Vec<u32>,
+        admits: Admits,
     ) -> Result<Started, Refused> {
         let os = |op: &'static str| {
             move |e: std::io::Error| Refused::Os {
@@ -331,6 +363,7 @@ impl Driver {
             .map_err(os("reading the endpoint's address"))?;
         let names = Names {
             dialing: BTreeMap::new(),
+            admits,
         };
         let ep = Endpoint::new(ep_config, budget, names, Instant::now())
             .map_err(|refusal| Refused::Transport { refusal })?;
@@ -832,17 +865,22 @@ impl Driver {
 
 /// Waits for a dial's answer until `deadline` (none: until the driver tells it, or ends).
 pub(crate) fn wait_dial(
-    answer: &Receiver<Result<PeerId, Refused>>,
+    answer: &hex_wait::mpsc::Receiver<Result<PeerId, Refused>>,
     deadline: Option<Instant>,
 ) -> Result<PeerId, Refused> {
+    use hex_wait::mpsc::RecvTimeoutError;
     let answered = match deadline {
         Some(deadline) => answer.recv_timeout(deadline.saturating_duration_since(Instant::now())),
-        None => answer.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        None => answer.recv().map_err(RecvTimeoutError::from),
     };
     match answered {
         Ok(result) => result,
         Err(RecvTimeoutError::Timeout) => Err(Refused::Deadline { what: "a dial" }),
         Err(RecvTimeoutError::Disconnected) => Err(Refused::Ended),
+        Err(RecvTimeoutError::Failed(why)) => Err(Refused::Os {
+            op: "waiting for a dial's answer",
+            why: why.to_string(),
+        }),
     }
 }
 
@@ -850,3 +888,6 @@ pub(crate) fn wait_dial(
 pub(crate) fn conn(shared: Arc<Shared>) -> Conn {
     Conn { shared }
 }
+
+#[cfg(test)]
+mod tests;

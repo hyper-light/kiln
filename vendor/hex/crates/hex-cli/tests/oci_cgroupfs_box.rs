@@ -137,6 +137,7 @@ fn exercise(own: &Path, cache: &Path, exe: &str) {
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(bundle_dir),
         owner: None,
+        band: 0,
     });
     let _attacker_cleanup = Deleting(&node, attacker.clone());
     let why = match made {
@@ -169,6 +170,7 @@ fn exercise(own: &Path, cache: &Path, exe: &str) {
             hosts: Vec::new(),
         })),
         owner: None,
+        band: 0,
     })
     .expect("create the plain box");
     let _plain_cleanup = Deleting(&node, plain.clone());
@@ -268,6 +270,7 @@ fn exercise(own: &Path, cache: &Path, exe: &str) {
             hosts: Vec::new(),
         })),
         owner: None,
+        band: 0,
     })
     .expect("create the victim box");
     let _victim_cleanup = Deleting(&node, victim.clone());
@@ -290,6 +293,7 @@ fn exercise(own: &Path, cache: &Path, exe: &str) {
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(prober_dir),
         owner: None,
+        band: 0,
     })
     .expect("a box holding CAP_SYS_ADMIN with a network namespace of its own is made");
     let _prober_cleanup = Deleting(&node, prober.clone());

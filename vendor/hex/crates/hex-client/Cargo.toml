@@ -21,12 +21,14 @@ rustix.workspace = true
 sha2.workspace = true
 triomphe = { workspace = true, features = ["unsize"] }
 unsize.workspace = true
+# Condition variables whose timed waits end at their deadlines on macOS too (docs/design/deadline-waits.md).
+hex-wait.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 hex-afunix.workspace = true
 
 [dev-dependencies]
-# The budget tests wait on their own facts' patiences (src/calls/budget_tests.rs).
+# The tests wait on their own facts' patiences (src/calls/budget_tests.rs, src/copy/tests.rs).
 hex-testkit.workspace = true
 tempfile.workspace = true
 # tests/shards_borrowed_contract.rs, Hex's campaign over shards-api's borrowed connector: its directories,

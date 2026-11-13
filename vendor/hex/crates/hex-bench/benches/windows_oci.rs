@@ -82,6 +82,7 @@ fn main() {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(bundle(i)),
             owner: None,
+            band: 0,
         };
         let t = Instant::now();
         rt.create(spec).expect("create");

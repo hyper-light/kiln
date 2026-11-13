@@ -746,7 +746,8 @@ impl GuestRuntime {
             if current.native_commitment()? != record.native_commitment()? {
                 return Err(refused(key, LifecycleCause::Uncertain));
             }
-            let Some(receipt) = pool::read(self.pool_path()?)? else {
+            let path = self.pool_path()?;
+            let Some(mut receipt) = pool::read(path)? else {
                 return Ok(false);
             };
             receipt.matches(&current)?;
@@ -771,13 +772,29 @@ impl GuestRuntime {
             let terminal = native
                 .terminal()
                 .map_err(|why| refusal("observing shared backing during recovery", &why))?;
-            let Some(terminal) =
-                terminal.filter(|end| end.scope == shards_api::TerminalScope::Released)
-            else {
-                return Ok(false);
+            // AC-T7.4.1: its controller, the VM, ended while no node ran, so there is no guest to take back or
+            // dial. A member of its scope that outlived it is ended now, as the pool's release ends one and
+            // within the same learned bound, so the end recorded is the whole scope's, the witness inner
+            // recovery takes (gpu_pool's recover_gpu_terminal ends one so too).
+            let end = match terminal {
+                None => return Ok(false),
+                Some(end) if end.scope == shards_api::TerminalScope::Released => end,
+                Some(_) => {
+                    let identity = identity.map(copy_identity).transpose()?;
+                    if let Some(identity) = &identity {
+                        receipt.phase = Phase::Stopping(copy_identity(identity)?);
+                        pool::write(path, &receipt)?;
+                    }
+                    managed::stop_scope(
+                        transaction,
+                        identity.as_ref(),
+                        self.first_dial_bound()?,
+                        refused(key, LifecycleCause::Uncertain),
+                    )?
+                }
             };
             current.phase = BackingPhase::Draining;
-            current.exit = Some(exit_of(terminal.status));
+            current.exit = Some(exit_of(end.status));
             transaction.put_pool(&current)?;
             *record = current;
             Ok(true)

@@ -595,6 +595,7 @@ mod tests {
             devices,
             allocation: None,
             route: None,
+            band: 0,
         }
     }
 

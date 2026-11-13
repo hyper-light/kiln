@@ -9,7 +9,7 @@
 //! socket in tests. The control connection is read as every client's is (`crate::calls`), by whoever waits on it, or
 //! in the event form by the node's loop ([`Pump`]), never by a thread of its own.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -24,7 +24,7 @@ use crate::calls::{
     BOX_KINDS, CLASSES, Core, KINDS, Lent, ReplyDeadline, Sent, Shared, SharedOwner, Take,
     Transport, by_class, class_waits, poisoned, protocol_ready,
 };
-use crate::copy::{DuplexIo, copy, copy_in};
+use crate::copy::{Cut, Cuts, DuplexIo, Waiting, copy, copy_in};
 
 /// The OS handle under a guest connection, which an event loop waits on: a file descriptor on Unix, a
 /// Winsock socket on Windows.
@@ -56,6 +56,11 @@ pub trait Duplex: Read + Write + Send + Sync + 'static {
     fn handle(&self) -> Handle<'_>;
     /// With `on`, a read or a write that would wait fails `WouldBlock` at once; shared by its clones.
     fn set_nonblocking(&self, on: bool) -> io::Result<()>;
+    /// What cuts it short where its reads alone can't tell its caller (a QUIC connection bridged to a socket pair,
+    /// `hex_quic::bridge`): none where its socket reports a reset itself.
+    fn cut(&self) -> Option<Cut> {
+        None
+    }
 }
 
 impl Duplex for TcpStream {
@@ -140,6 +145,13 @@ pub trait Link: Send + Sync + 'static {
             });
         }
         self.dial(port)
+    }
+    /// Whether this link's transport carries a half-close: this side's end of sending reaches the peer as its end of
+    /// input, the other way still open, as Shards' vsock does (D12) and QUIC's lanes do. Firecracker's vsock doesn't: it
+    /// makes a host's half-close a full shutdown and drops what the guest sends after it (`vsock/csm/connection.rs`
+    /// 228-239 and 307 at upstream 500efc6; docs/design/shards-guest.md).
+    fn carries_half_close(&self) -> bool {
+        false
     }
     /// An identity safe to lend to a caller that opens its own guest streams, without owning the VM.
     fn identity(&self) -> Result<shards_api::Identity, Refusal> {
@@ -324,6 +336,9 @@ pub struct Stream<W = Guest> {
     read: Mutex<Option<DuplexOwner>>,
     /// In the event form, what waits to be written ([`Backlog`]); else nothing.
     backlog: Mutex<Option<Backlog>>,
+    /// Each exec's streams being set up whose cut is told, by name, until its start takes them
+    /// ([`Transport::cuts`]): at most the calls in flight hold one.
+    cuts: Mutex<BTreeMap<u64, Cuts>>,
 }
 
 /// What the turn's holder reads with and into, and what of a frame has come.
@@ -427,6 +442,16 @@ impl<W: Waits> Stream<W> {
                 .write_all(&stream::name(named))
                 .map_err(os("naming a stdio connection"))?,
         }
+        // An output stream carries nothing this way once named: where the link carries a half-close, its own half
+        // ends, so its peer's End closes the connection whole, which no reader sleeps through (Shards M236), and the
+        // peer's side ends both halves with nothing left open to reset (AC-T7.4.1; joint plan step 4, ROOT's decision
+        // of 2026-11-12).
+        if self.link.carries_half_close()
+            && matches!(named.stream, stream::Stdio::Out | stream::Stdio::Err)
+        {
+            conn.shutdown(Shutdown::Write)
+                .map_err(os("ending an output stream's own half"))?;
+        }
         Ok(conn)
     }
 }
@@ -470,6 +495,9 @@ impl<W: Waits> Stream<W> {
                 return Ok(None);
             }
             let conn = self.dial_named_before(Named { exec, stream }, deadline)?;
+            if let (Some(name), Some(cut)) = (output(stream), conn.cut()) {
+                self.watch(exec.id, name, cut)?;
+            }
             caller_end(&*conn).map(Some)
         };
         Ok(hex_api::Given {
@@ -477,6 +505,40 @@ impl<W: Waits> Stream<W> {
             stdout: dial(ask.stdout, stream::Stdio::Out)?,
             stderr: dial(ask.stderr, stream::Stdio::Err)?,
         })
+    }
+
+    /// Copies output stream `name`'s connection `conn` into the caller's own pipe `to`, its cut told to its program.
+    fn carry(
+        &self,
+        exec: u64,
+        name: &'static str,
+        conn: DuplexOwner,
+        to: std::io::PipeWriter,
+    ) -> Result<(), Refusal> {
+        let cut = Cut::default();
+        copy(DuplexIo(conn), to, cut.clone(), drop)?;
+        self.watch(exec, name, cut)
+    }
+
+    /// Keeps exec `exec`'s stream `name`'s cut until its start takes it ([`Transport::cuts`]).
+    fn watch(&self, exec: u64, name: &'static str, cut: Cut) -> Result<(), Refusal> {
+        self.cuts
+            .lock()
+            .map_err(poisoned)?
+            .entry(exec)
+            .or_default()
+            .push((name, cut));
+        Ok(())
+    }
+}
+
+/// An output stream's name: whether its cut is its program's to tell. A stdin connection's reset is its program
+/// letting its stdin go (HEX-GUEST-41), the stream's end.
+fn output(stream: stream::Stdio) -> Option<&'static str> {
+    match stream {
+        stream::Stdio::In => None,
+        stream::Stdio::Out => Some("stdout"),
+        stream::Stdio::Err => Some("stderr"),
     }
 }
 
@@ -638,17 +700,19 @@ impl<W: Waits> Transport for Stream<W> {
             copy_in(r, DuplexIo(self.dial_named(named(stream::Stdio::In))?))?;
         }
         if let Some(w) = stdio.stdout {
-            copy(
-                DuplexIo(self.dial_named(named(stream::Stdio::Out))?),
+            self.carry(
+                exec.id,
+                "stdout",
+                self.dial_named(named(stream::Stdio::Out))?,
                 w,
-                drop,
             )?;
         }
         if let Some(w) = stdio.stderr {
-            copy(
-                DuplexIo(self.dial_named(named(stream::Stdio::Err))?),
+            self.carry(
+                exec.id,
+                "stderr",
+                self.dial_named(named(stream::Stdio::Err))?,
                 w,
-                drop,
             )?;
         }
         Ok(())
@@ -686,12 +750,21 @@ impl<W: Waits> Transport for Stream<W> {
             copy_in(r, DuplexIo(conn))?;
         }
         if let (Some(w), Some(conn)) = (stdio.stdout, output) {
-            copy(DuplexIo(conn), w, drop)?;
+            self.carry(exec.id, "stdout", conn, w)?;
         }
         if let (Some(w), Some(conn)) = (stdio.stderr, error) {
-            copy(DuplexIo(conn), w, drop)?;
+            self.carry(exec.id, "stderr", conn, w)?;
         }
         Ok(())
+    }
+
+    fn cuts(&self, exec: u64) -> Result<Cuts, Refusal> {
+        Ok(self
+            .cuts
+            .lock()
+            .map_err(poisoned)?
+            .remove(&exec)
+            .unwrap_or_default())
     }
 
     /// What one read takes, each whole message in it handed on; a frame cut across reads stays in the deframer.
@@ -1058,7 +1131,8 @@ impl<W: Waits> Stream<W> {
                     "reading the relay's token for the connection",
                 )?;
             }
-            None => conn
+            // As long as the link's transport takes, in poll(2) first on macOS (AC-T7.4.1, joint plan step 4, 2(a)).
+            None => Waiting(&mut *conn)
                 .read_exact(&mut token)
                 .map_err(os("reading the relay's token for the connection"))?,
         }
@@ -1080,6 +1154,7 @@ impl<W: Waits> Stream<W> {
             end,
             read: Mutex::new(Some(read)),
             backlog: Mutex::new(None),
+            cuts: Mutex::new(BTreeMap::new()),
         })
     }
 }

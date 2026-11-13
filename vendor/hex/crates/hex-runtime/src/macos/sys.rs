@@ -168,13 +168,6 @@ pub fn run_state(pid: i32) -> io::Result<Option<Run>> {
     }))
 }
 
-/// The user process `pid` runs as, its effective uid (`pbi_uid`, XNU's `kauth_cred_getuid` of its credential,
-/// `bsd/kern/proc_info.c`), or `None` when no process has that pid (`ESRCH`): what proves a capacity holder's
-/// process group its own (joint plan step 13, CV12).
-pub fn user_of(pid: i32) -> io::Result<Option<u32>> {
-    Ok(bsdinfo(pid)?.map(|info| info.pbi_uid))
-}
-
 /// `proc_pidinfo(PROC_PIDTBSDINFO)` of `pid`, or `None` when no process has that pid (`ESRCH`).
 fn bsdinfo(pid: i32) -> io::Result<Option<libc::proc_bsdinfo>> {
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
@@ -245,6 +238,104 @@ pub(crate) fn descriptors(pid: i32) -> io::Result<Vec<i32>> {
     }
     list.truncate(usize::try_from(wrote).map_err(io::Error::other)? / each);
     Ok(list.iter().map(|info| info.proc_fd).collect())
+}
+
+/// `PROC_FP_CLEXEC` (`bsd/sys/proc_info.h`): a descriptor's `proc_fileinfo.fi_status` bit for close-on-exec.
+#[cfg(test)]
+const PROC_FP_CLEXEC: u32 = 2;
+
+/// The `proc_pidfdinfo` flavor that reads a descriptor of `kind` (`proc_fdinfo.proc_fdtype`), each answer
+/// beginning with the descriptor's `proc_fileinfo` (`bsd/sys/proc_info.h`: `PROC_PIDFDVNODEINFO` 1,
+/// `PROC_PIDFDSOCKETINFO` 3, `PROC_PIDFDPSEMINFO` 4, `PROC_PIDFDPSHMINFO` 5, `PROC_PIDFDPIPEINFO` 6,
+/// `PROC_PIDFDKQUEUEINFO` 7, `PROC_PIDFDCHANNELINFO` 10), or none for a kind with no such flavor.
+#[cfg(test)]
+fn fd_flavor(kind: u32) -> Option<c_int> {
+    let kind = c_int::try_from(kind).ok()?;
+    Some(match kind {
+        libc::PROX_FDTYPE_VNODE => 1,
+        libc::PROX_FDTYPE_SOCKET => 3,
+        libc::PROX_FDTYPE_PSEM => 4,
+        libc::PROX_FDTYPE_PSHM => 5,
+        libc::PROX_FDTYPE_PIPE => 6,
+        libc::PROX_FDTYPE_KQUEUE => 7,
+        libc::PROX_FDTYPE_CHANNEL => 10,
+        _ => return None,
+    })
+}
+
+/// The descriptors past stdio that process `pid` holds without close-on-exec, each with its kind
+/// (`proc_fdinfo.proc_fdtype`): what a spawn that inherits would hand on. Each is read by its kind's
+/// `proc_pidfdinfo` flavor, whose answer begins with its `proc_fileinfo` (`fi_openflags`, then `fi_status`,
+/// whose `PROC_FP_CLEXEC` bit says close-on-exec). One of a kind with no flavor is listed: it can't be read
+/// close-on-exec. One closed between the list and its read is passed over.
+#[cfg(test)]
+pub(crate) fn inheritable_descriptors(pid: i32) -> io::Result<Vec<(i32, u32)>> {
+    // SAFETY: with a null buffer and a size of 0, proc_pidinfo writes nothing and returns the bytes it needs.
+    let needed =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let each = size_of::<libc::proc_fdinfo>();
+    let slots = usize::try_from(needed).map_err(io::Error::other)? / each;
+    let mut list = vec![
+        libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0,
+        };
+        slots
+    ];
+    let size = c_int::try_from(slots * each).map_err(io::Error::other)?;
+    // SAFETY: proc_pidinfo writes at most `size` bytes, whole proc_fdinfo entries, into `list`, which
+    // holds `slots` of them and outlives the call.
+    let wrote = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            list.as_mut_ptr().cast::<c_void>(),
+            size,
+        )
+    };
+    if wrote <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    list.truncate(usize::try_from(wrote).map_err(io::Error::other)? / each);
+    let mut open = Vec::new();
+    for entry in list.iter().filter(|entry| entry.proc_fd > 2) {
+        let Some(flavor) = fd_flavor(entry.proc_fdtype) else {
+            open.push((entry.proc_fd, entry.proc_fdtype));
+            continue;
+        };
+        // Room for every flavor's answer (a socket's is the largest, under a page), aligned as each is.
+        let mut answer = [0u64; 512];
+        let room = c_int::try_from(size_of_val(&answer)).map_err(io::Error::other)?;
+        // SAFETY: proc_pidfdinfo writes at most `room` bytes, one answer of `flavor`, into `answer`, which is
+        // that many bytes, aligned for any of them, and alive for the call.
+        let got = unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                entry.proc_fd,
+                flavor,
+                answer.as_mut_ptr().cast::<c_void>(),
+                room,
+            )
+        };
+        if got <= 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EBADF) {
+                continue;
+            }
+            return Err(e);
+        }
+        // fi_openflags, then fi_status: the first word's two halves, in this host's byte order.
+        let first = answer[0].to_ne_bytes();
+        let status = u32::from_ne_bytes([first[4], first[5], first[6], first[7]]);
+        if status & PROC_FP_CLEXEC == 0 {
+            open.push((entry.proc_fd, entry.proc_fdtype));
+        }
+    }
+    Ok(open)
 }
 
 /// What a process's threads are doing, as `proc_pidinfo(PROC_PIDTASKINFO)` reads them: XNU counts each

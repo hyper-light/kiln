@@ -20,8 +20,7 @@
 //! request, never sent from inside a read, so the reader never waits on itself, and never lost ([`Owed`]).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
@@ -33,9 +32,10 @@ use hex_core::netns;
 use hex_core::patience::Patience;
 use hex_core::schedule::waits::WaitKind;
 use hex_core::wire::{self, Answer, Call, Header, Limits, Received, Request, Streams};
+use hex_wait::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 
 use crate::MAX_LIST;
-use crate::copy::{copy, copy_in};
+use crate::copy::{Cut, Cuts, copy, copy_in};
 
 /// What takes a call's answer in the event form ([`Core::begin`]), with its request's id (an exec's names
 /// its program): run once, on the thread that reads the connection, after the client's lock is let go.
@@ -731,6 +731,13 @@ pub trait Transport: Send + Sync + 'static {
         let _ = (exec, ask, deadline);
         Err(unbounded_setup("asked streams"))
     }
+
+    /// The streams of exec `exec` it made or carries whose cut its program tells, by name, taken: only where
+    /// [`Transport::MAKES_ASKED`] (docs/design/hex-quic.md Q11).
+    fn cuts(&self, exec: u64) -> Result<Cuts, Refusal> {
+        let _ = exec;
+        Ok(Vec::new())
+    }
 }
 
 fn unbounded_setup(what: &'static str) -> Refusal {
@@ -742,6 +749,19 @@ fn unbounded_setup(what: &'static str) -> Refusal {
 
 pub(crate) fn poisoned<T>(_: std::sync::PoisonError<T>) -> Refusal {
     Refusal::Broken("a lock of the node agent's client was poisoned".to_owned())
+}
+
+/// A wait on one of the client's locks that couldn't wait: the lock poisoned, or the OS refused it (macOS's kqueue).
+fn wait_refused(why: hex_wait::Failed) -> Refusal {
+    match why {
+        hex_wait::Failed::Poisoned => {
+            Refusal::Broken("a lock of the node agent's client was poisoned".to_owned())
+        }
+        hex_wait::Failed::Os(why) => Refusal::Os {
+            op: "waiting on a lock of the node agent's client",
+            why: why.to_string(),
+        },
+    }
 }
 
 /// The longest one wait on a connection can be: `i32::MAX` milliseconds, the most poll(2) takes where it has no
@@ -784,8 +804,8 @@ pub(crate) type SharedOwner<T> = triomphe::Arc<Shared<T>>;
 /// wait on the current sender's release with its own deadline instead of blocking inside Mutex::lock.
 #[derive(Default)]
 struct SendLock {
-    busy: Mutex<bool>,
-    released: Condvar,
+    busy: hex_wait::Mutex<bool>,
+    released: hex_wait::Condvar,
 }
 
 struct Whole<'a>(&'a SendLock);
@@ -800,9 +820,12 @@ impl SendLock {
                     if left.is_zero() {
                         return Ok(None);
                     }
-                    self.released.wait_timeout(busy, left).map_err(poisoned)?.0
+                    self.released
+                        .wait_timeout(busy, left)
+                        .map_err(wait_refused)?
+                        .0
                 }
-                None => self.released.wait(busy).map_err(poisoned)?,
+                None => self.released.wait(busy).map_err(wait_refused)?,
             };
         }
         *busy = true;
@@ -942,8 +965,8 @@ impl Taker {
 /// A program's end, once it has come, and its `Proc`'s waking: by its end, or by the reader's turn handed to its wait.
 #[derive(Default)]
 struct Ending {
-    state: Mutex<EndState>,
-    came: Condvar,
+    state: hex_wait::Mutex<EndState>,
+    came: hex_wait::Condvar,
 }
 
 #[derive(Default)]
@@ -1333,7 +1356,7 @@ impl<'a, T: Transport> Caller<'a, T> {
     /// before the exec goes, so the end can't come first.
     fn new(shared: &'a Shared<T>, program: Option<Arc<Ending>>) -> Result<Self, Refusal> {
         // An answer, and the reader's turn handed to it before that: never more at once.
-        let (tx, mail) = sync_channel(2);
+        let (tx, mail) = sync_channel(2).map_err(wait_refused)?;
         let mut state = shared.state()?;
         if let Some(why) = &state.closed {
             return Err(why.clone());
@@ -1584,6 +1607,7 @@ impl<'a, T: Transport> Caller<'a, T> {
                             "the node agent's answer was lost".to_owned(),
                         )));
                     }
+                    Err(RecvTimeoutError::Failed(why)) => return Some(Err(wait_refused(why))),
                 }
             }
         }
@@ -2465,6 +2489,8 @@ impl<T: Transport> Core<T> {
             }
             None => None,
         };
+        // The streams whose cut the program's end tells (docs/design/hex-quic.md Q11).
+        let mut cuts = Vec::new();
         let (exec, answer, kept) = if T::MAKES_ASKED {
             let request =
                 Request::Call(launch.call(program, union(carried, asked), Streams::default()));
@@ -2488,14 +2514,16 @@ impl<T: Transport> Core<T> {
                 self.limits.message_bytes,
                 &request,
                 |exec, deadline| {
-                    make(shared, exec, asked, deadline)?;
-                    if let Some(deadline) = deadline {
-                        deadline.remaining("opening carried streams")?;
-                        shared.transport.carries_before(exec, pipes, deadline)?;
-                    } else {
-                        shared.transport.carries(exec, pipes)?;
-                    }
-                    Ok(NONE)
+                    let made = make(shared, exec, asked, deadline).and_then(|()| match deadline {
+                        Some(deadline) => {
+                            deadline.remaining("opening carried streams")?;
+                            shared.transport.carries_before(exec, pipes, deadline)
+                        }
+                        None => shared.transport.carries(exec, pipes),
+                    });
+                    // Taken however the setup went, so none outlives it.
+                    cuts = shared.transport.cuts(exec)?;
+                    made.map(|()| NONE)
                 },
                 Some(Arc::clone(&ending)),
                 cap,
@@ -2534,11 +2562,13 @@ impl<T: Transport> Core<T> {
                     release_before: caller,
                     exit: None,
                     given: None,
+                    cuts,
                     kill_asked: false,
                 };
                 match settle(kept, ends) {
-                    Ok(given) => {
+                    Ok((given, settled)) => {
                         proc.given = Some(given);
+                        proc.cuts.extend(settled);
                         Ok(Box::new(proc))
                     }
                     Err(why) => {
@@ -2736,10 +2766,11 @@ fn lend(stdio: &Stdio) -> Vec<Lent<'_>> {
 }
 
 /// The ends an exec's start gave, each settled: a stream the caller carried as a pipe of its own is copied between
-/// that pipe and its end, here in the caller's client (the one copy left, native plan step 8); a stream it asked
-/// for is the caller's to take ([`Proc::streams`]). A carried pipe whose program took it has no end, and is let go
-/// here. An end of a stream the exec neither carried nor asked for is the agent's fault, refused.
-fn settle(stdio: Stdio, ends: hex_api::Given) -> Result<hex_api::Given, Refusal> {
+/// that pipe and its end, here in the caller's client (the one copy left, native plan step 8), its cut told to its
+/// program; a stream it asked for is the caller's to take ([`Proc::streams`]). A carried pipe whose program took it
+/// has no end, and is let go here. An end of a stream the exec neither carried nor asked for is the agent's fault,
+/// refused.
+fn settle(stdio: Stdio, ends: hex_api::Given) -> Result<(hex_api::Given, Cuts), Refusal> {
     let Stdio {
         stdin,
         stdout,
@@ -2752,6 +2783,7 @@ fn settle(stdio: Stdio, ends: hex_api::Given) -> Result<hex_api::Given, Refusal>
         ))
     };
     let mut given = hex_api::Given::default();
+    let mut cuts = Vec::new();
     match (stdin, ends.stdin) {
         (Some(pipe), Some(end)) => copy_in(pipe, hex_api::OwnedStream::from(end))?,
         (None, Some(end)) if ask.stdin => given.stdin = Some(end),
@@ -2763,13 +2795,17 @@ fn settle(stdio: Stdio, ends: hex_api::Given) -> Result<hex_api::Given, Refusal>
         (stderr, ends.stderr, ask.stderr, "stderr", &mut given.stderr),
     ] {
         match (pipe, end) {
-            (Some(pipe), Some(end)) => copy(hex_api::OwnedStream::from(end), pipe, drop)?,
+            (Some(pipe), Some(end)) => {
+                let cut = Cut::default();
+                copy(hex_api::OwnedStream::from(end), pipe, cut.clone(), drop)?;
+                cuts.push((name, cut));
+            }
             (None, Some(end)) if asked => *to = Some(end),
             (None, Some(_)) => return Err(unasked(name)),
             (_, None) => {}
         }
     }
-    Ok(given)
+    Ok((given, cuts))
 }
 
 impl<T: Transport> Runtime for Core<T> {
@@ -2884,6 +2920,18 @@ impl<T: Transport> Runtime for Core<T> {
         self.info(Call::Inspect(id.clone()), "inspect")
     }
 
+    /// A member's streams are taken in the process that holds its image box's run (joint plan step 17): the node's
+    /// wire carries no member call yet, so a caller over it is refused, typed, rather than told the box has none.
+    fn member(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
+        Err(Refusal::Invalid {
+            what: "member",
+            why: format!(
+                "{member} of box {id}: the node's wire carries no member call yet; a member's streams are taken \
+                 in the node's own process"
+            ),
+        })
+    }
+
     fn usage(&self, id: &BoxId) -> Result<Usage, Refusal> {
         match self.plain(Call::Usage(id.clone()))? {
             Answer::Usage(usage) => Ok(usage),
@@ -2918,6 +2966,8 @@ struct RemoteProc<T: Transport> {
     exit: Option<Exit>,
     /// The caller's ends of the streams its exec asked for, until taken.
     given: Option<hex_api::Given>,
+    /// Its output streams whose cut its end tells (docs/design/hex-quic.md Q11).
+    cuts: Cuts,
     /// Asked to end because its setup failed: never released, which tells the agent to let it run on.
     kill_asked: bool,
 }
@@ -2928,6 +2978,22 @@ impl<T: Transport> RemoteProc<T> {
     /// handed to it by the thread that reads; the turn handed on as it goes.
     fn wait(&mut self, timeout: Option<Duration>) -> Result<Option<Exit>, Refusal> {
         self.wait_before(timeout, None)
+    }
+
+    /// Its end `ended` as its caller is told it: refused Broken, naming the stream, where one of its output streams was
+    /// cut short, so what its caller read of it isn't taken for all of it (docs/design/hex-quic.md Q11).
+    fn whole(&self, ended: Option<Exit>) -> Result<Option<Exit>, Refusal> {
+        if ended.is_some()
+            && let Some((name, cut)) = self
+                .cuts
+                .iter()
+                .find_map(|(name, cut)| cut.error().map(|cut| (name, cut)))
+        {
+            return Err(Refusal::Broken(format!(
+                "the program's {name} was cut short before its end: {cut}"
+            )));
+        }
+        Ok(ended)
     }
 
     fn wait_before(
@@ -3016,7 +3082,7 @@ impl<T: Transport> RemoteProc<T> {
                     && !ended.turn
                     && let Err(e) = self.ending.came.wait_timeout(ended, left)
                 {
-                    break Err(poisoned(e));
+                    break Err(wait_refused(e));
                 }
             }
         };
@@ -3067,11 +3133,13 @@ impl<T: Transport> Proc for RemoteProc<T> {
     }
 
     fn try_wait(&mut self) -> Result<Option<Exit>, Refusal> {
-        self.wait(None)
+        let ended = self.wait(None)?;
+        self.whole(ended)
     }
 
     fn wait_for(&mut self, timeout: Duration) -> Result<Option<Exit>, Refusal> {
-        self.wait(Some(timeout))
+        let ended = self.wait(Some(timeout))?;
+        self.whole(ended)
     }
 
     /// A kill request naming its exec, answered once the agent has sent KILL; its end then comes as any

@@ -34,6 +34,7 @@ fn physical_claims_reach_the_configured_backend_route_for_create_and_run() {
             kind: hex_api::DeviceKind::Gpu,
             key: 256,
         }],
+        band: 0,
     };
     spec.check().unwrap();
     let created = node.create(spec.clone());

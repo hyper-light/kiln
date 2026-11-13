@@ -1934,6 +1934,7 @@ fn creating_capture_record(id: &str) -> BoxRecord {
             devices: Vec::new(),
             allocation: None,
             route: None,
+            band: 0,
         },
         Phase::Creating,
         Vec::new(),

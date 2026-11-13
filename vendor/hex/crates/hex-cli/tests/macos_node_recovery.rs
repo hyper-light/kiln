@@ -91,6 +91,7 @@ fn spec(id: &BoxId) -> BoxSpec {
         bounds: Bounds::default(),
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     }
 }
 

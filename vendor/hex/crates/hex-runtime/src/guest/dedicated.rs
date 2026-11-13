@@ -836,8 +836,9 @@ mod tests {
             .with_gpu_catalog(triomphe::Arc::try_new(catalog).unwrap())
             .with_gpu_observer(input)
             .unwrap();
+            // A tarball root, which every host stages; Windows refuses a directory as a Linux root.
             let mut spec = super::super::tests::oci(
-                hex_api::Rootfs::Dir(dir.path().to_path_buf()),
+                hex_api::Rootfs::Dir(dir.path().join("rootfs.tar")),
                 Vec::new(),
             );
             let ClassSpec::Oci(payload) = spec.class else {

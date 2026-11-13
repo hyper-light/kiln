@@ -5,10 +5,11 @@
 //! the end finds the box gone. It does so whether or not the caller still holds the run: a caller that lets
 //! the run go leaves no box behind.
 
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use hex_api::{BoxId, Exit, Given, Proc, Refusal};
+use hex_wait::{Condvar, Mutex};
 
 /// What ends a run's program: its box's KILL, which a run's box, made for that program alone, holds.
 pub(crate) type Kill = Box<dyn FnMut() -> Result<(), Refusal> + Send>;
@@ -24,6 +25,17 @@ struct Ended {
 
 fn poisoned<T>(_: PoisonError<T>) -> Refusal {
     Refusal::Broken("a run's end lock was poisoned".to_owned())
+}
+
+/// A wait for a run's end that couldn't wait: its lock poisoned, or the OS refused it (macOS's kqueue).
+fn wait_refused(why: hex_wait::Failed) -> Refusal {
+    match why {
+        hex_wait::Failed::Poisoned => Refusal::Broken("a run's end lock was poisoned".to_owned()),
+        hex_wait::Failed::Os(why) => Refusal::Os {
+            op: "waiting for a run's end",
+            why: why.to_string(),
+        },
+    }
 }
 
 /// A run's program as its caller holds it ([`hex_api::Runtime::run`]): its end comes from the run's thread.
@@ -123,7 +135,12 @@ impl Proc for Run {
             if left.is_zero() {
                 return Ok(None);
             }
-            end = self.ended.came.wait_timeout(end, left).map_err(poisoned)?.0;
+            end = self
+                .ended
+                .came
+                .wait_timeout(end, left)
+                .map_err(wait_refused)?
+                .0;
         }
     }
 
