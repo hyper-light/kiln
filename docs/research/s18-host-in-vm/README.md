@@ -437,9 +437,13 @@ store migration and docs/seams.md), none of whose files are part 3b's, and wasn'
 Windows' build, clippy and tests of these (`reach::mcp` is built there now) are CI's on main.
 
 Owed:
-- Each `Execs::mcp(member)` connection handed to `serve_lane` on a thread of its own, at step 17's
-  launch (`sandbox::microvm()`), on top of goal 60's part 7 and goal 75's listen half (ROOT,
-  2026-11-13).
+- Goal 60's, in its part 7 (agreed with its agent, 2026-11-13, on ROOT's word): each
+  `Execs::mcp(member)` connection handed to `serve_lane` on a thread of its own at step 17's launch
+  (`sandbox::microvm()`), `Here` built as agent.rs hands reach::local::serve its node, name and
+  host, `cwd` the project at its host path (D235), its `end` dropped once `serve_lane` returns. It
+  waits on goal 60's re-vendor (below), goal 75's listen half and goal 58's host pairing, which holds
+  each member connection the VM process accepts until an `Execs::mcp(member)` ask takes it, the
+  member asked for it by the daemon's annotation, the orchestrator's `MemberSpec` field.
 - Kiln's vendor/shards at or after Shards e1995061f, with shards-remote linked (its owner's). Step 17's
   re-vendor (kiln ba75aa819) pins Shards 1389dc0b6, from before it: its shards-remote has no `Execs::mcp`.
   Goal 60's next re-vendor, at the Hex lead's next SHA, pins Shards main at or after 237f3ebe7, which
