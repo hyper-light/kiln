@@ -5105,7 +5105,10 @@ while True:
             let vms = Arc::new(crate::sandbox::fake::FakeVms::with(&pinned, "claude", &program).linked(link.clone()));
             host.hold_isolated_in(crate::sandbox::Microvms { sandbox: Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images });
             let cwd = dir.path().to_string_lossy().into_owned();
-            let spec = Spec { kind: "claude".into(), cwd: Some(cwd.clone()), isolation: Some(session::Isolation::microvm()), claim: Some(balancers_claim()), ..Spec::default() };
+            // Its person's volumes kept on the machine (goal 65's finding: where its conversation ran is kept beside them).
+            host.keep_homes(dir.path().join("homes"));
+            let isolation = session::Isolation { person: Some("owner".into()), ..session::Isolation::microvm() };
+            let spec = Spec { kind: "claude".into(), cwd: Some(cwd.clone()), isolation: Some(isolation), claim: Some(balancers_claim()), ..Spec::default() };
             let s = host.open(Some("isolated".into()), spec)?;
             let heard_lines = || std::fs::read_to_string(&heard).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).collect::<Vec<_>>();
             let idle = || s.core.lock().state.status == Status::Idle && !s.core.lock().meta.features.is_empty();
@@ -5146,6 +5149,12 @@ while True:
             let conversation_id = conversation.clone().unwrap_or_default();
             assert!(resumed.args.windows(2).any(|w| w == ["--resume", conversation_id.as_str()]), "resumed through its launch's arguments: {:?}", resumed.args);
             until_it("it back", 60, idle).await?;
+            // Where its conversation ran, kept beside its person's volume once its first run ended: kiln's
+            // Agentfile for Claude Code, at this kiln's text, and its image pinned.
+            let ran_in = crate::harness::isolated::home::ran_in_dir(&dir.path().join("homes"), "owner", "claude")?;
+            let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
+            let kept = crate::harness::isolated::home::RanIn { conversation: conversation_id.clone(), agentfile: "harness-claude".into(), digest: crate::util::sha256_hex(claude.text.as_bytes()), image: pinned.clone() };
+            until_it("where its conversation ran, kept", 60, || crate::harness::isolated::home::ran_in(&ran_in, &conversation_id).as_ref() == Some(&kept)).await?;
             // kiln's record: two starts, each in a microVM of its own, none on the host, the first ended.
             let starts = s.info().starts;
             assert_eq!(starts.len(), 2, "{starts:?}");
