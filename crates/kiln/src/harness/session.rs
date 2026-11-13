@@ -6348,6 +6348,181 @@ for line in sys.stdin:
         })
     }
 
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: a session whose harness isn't running,
+    /// restarted by a person while its input restores (`Core::has_room` holds the start), starts
+    /// once its host says its input takes writes (`Session::mail_flow`), though nothing else comes
+    /// to it. Its harness never launched, so no wait of its own would start it.
+    #[cfg(unix)]
+    #[test]
+    fn s35_a_restart_held_while_its_input_restores_starts_once_its_input_takes_writes() -> anyhow::Result<()> {
+        use super::super::{admission::{FlowEvent, Input, PhysicalBudget}, inbox::{Inbox, Limits as InboxLimits}};
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            // Not there yet: its first launch fails.
+            let program = dir.path().join("acp.py");
+            let records = crate::records::open(&dir.path().join("records.db"))?;
+            let input = Input::new(0, PhysicalBudget::new(super::super::state_view::FRAME), Arc::new(Inbox::new(records, InboxLimits::default())));
+            input.controller.lock().restoring().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let (sink, updates) = async_channel::unbounded();
+            let files = Files {
+                host: None,
+                dir: dir.path().to_owned(), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}),
+                carried: Arc::new(|_| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                settle: Arc::new(|_, _, _| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}),
+            };
+            let s = start_seeded_input(crate::util::new_id(), Spec {
+                kind: "gemini".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()),
+                reach: Some("off".into()),
+                ..Spec::default()
+            }, sink, Arc::new(|| {}), files, None, Some(input.clone()))?;
+            let result = async {
+                loop {
+                    if let (_, Update::State { state }) = updates.recv().await? && state.status == Status::Exited {
+                        anyhow::ensure!(state.exit.as_ref().is_some_and(|x| x.again_at.is_none()), "a harness that never launched waits for a person, not a wait of its own: {:?}", state.exit);
+                        break;
+                    }
+                }
+                // An ACP agent there now, which loads its sessions.
+                std::fs::write(&program, r##"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
+    elif method == "session/new":
+        result = {"sessionId": "s1"}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"##)?;
+                std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+                // A person restarts it while its input restores: held.
+                anyhow::ensure!(s.command(Command::Restart) && s.command(Command::Snapshot), "the session took no command");
+                loop {
+                    if let (_, Update::Open { info, .. }) = updates.recv().await? {
+                        anyhow::ensure!(info.status == Status::Exited, "it started while its input restored: {:?}", info.status);
+                        break;
+                    }
+                }
+                // Its journal read: its input takes writes, and its host says so.
+                let capacity = {
+                    let mut controller = input.controller.lock();
+                    controller.restore_complete().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    controller.capacity()
+                };
+                s.mail_flow(FlowEvent::Capacity { capacity });
+                anyhow::ensure!(s.command(Command::Snapshot), "the session took no command");
+                loop {
+                    if let (_, Update::Open { info, .. }) = updates.recv().await? {
+                        anyhow::ensure!(info.status != Status::Exited, "its input takes writes, yet the restart a person asked for stayed held");
+                        break;
+                    }
+                }
+                // Its agent came up.
+                loop {
+                    if let (_, Update::State { state }) = updates.recv().await? && state.status == Status::Idle {
+                        break;
+                    }
+                }
+                anyhow::Ok(())
+            }.await;
+            s.close();
+            while !matches!(updates.recv().await?, (_, Update::Closed)) {}
+            result
+        })
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: a harness that ended part-way through a
+    /// turn starts again when its wait is over (`AGAIN_FIRST`), the turn's pick-up first. Its host
+    /// saying its input takes writes before then (`Session::input_changed`) starts nothing early:
+    /// nobody asked it to start, and the pick-up waiting in its queue isn't an ask.
+    #[cfg(unix)]
+    #[test]
+    fn s35_a_crash_wait_holds_its_restart_when_its_input_takes_writes_first() -> anyhow::Result<()> {
+        use serde_json::Value;
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let program = dir.path().join("acp.py");
+            let prompts = dir.path().join("prompts.jsonl");
+            // An ACP agent whose process ends at its first prompt, and answers each after that.
+            std::fs::write(&program, r##"#!/usr/bin/env python3
+import json, os, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
+    elif method == "session/new":
+        result = {"sessionId": "s1"}
+    elif method == "session/prompt":
+        if not os.path.exists(os.environ["ACP_ENDED"]):
+            open(os.environ["ACP_ENDED"], "w").close()
+            sys.exit(1)
+        with open(os.environ["ACP_PROMPTS"], "a") as log:
+            log.write(json.dumps(request["params"]) + "\n")
+        result = {"stopReason": "end_turn"}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"##)?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+            let (sink, updates) = async_channel::unbounded();
+            let files = Files {
+                host: None,
+                dir: dir.path().to_owned(), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}),
+                carried: Arc::new(|_| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                settle: Arc::new(|_, _, _| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}),
+            };
+            let s = start(crate::util::new_id(), Spec {
+                kind: "gemini".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()),
+                prompt: Some("first task".into()), reach: Some("off".into()),
+                env: vec![("ACP_ENDED".into(), dir.path().join("ended").to_string_lossy().into_owned()), ("ACP_PROMPTS".into(), prompts.to_string_lossy().into_owned())],
+                ..Spec::default()
+            }, sink, Arc::new(|| {}), files)?;
+            let result = async {
+                // Ended part-way through its turn: it waits, the pick-up first in its queue.
+                let again_at = loop {
+                    if let (_, Update::State { state }) = updates.recv().await? && state.status == Status::Exited
+                        && let Some(again_at) = state.exit.as_ref().and_then(|x| x.again_at) {
+                        anyhow::ensure!(state.queue.first().is_some_and(|q| q.text == PICK_UP), "no pick-up queued: {:?}", state.queue);
+                        break again_at;
+                    }
+                };
+                // Its input takes writes (there's room for it all along): its wait still holds.
+                s.input_changed();
+                anyhow::ensure!(s.command(Command::Snapshot), "the session took no command");
+                loop {
+                    if let (_, Update::Open { info, .. }) = updates.recv().await? {
+                        let now = Core::now();
+                        anyhow::ensure!(info.status == Status::Exited || now >= again_at, "it started {} ms before its wait was over", again_at.saturating_sub(now));
+                        break;
+                    }
+                }
+                // Its wait over, it starts again and picks up its turn.
+                loop {
+                    if let (_, Update::State { state }) = updates.recv().await? && state.status == Status::Idle && std::fs::read_to_string(&prompts).is_ok_and(|p| !p.is_empty()) {
+                        break;
+                    }
+                }
+                anyhow::Ok(())
+            }.await;
+            s.close();
+            while !matches!(updates.recv().await?, (_, Update::Closed)) {}
+            result?;
+            let given: Vec<Value> = std::fs::read_to_string(&prompts)?.lines().map(serde_json::from_str).collect::<Result<_, _>>()?;
+            let words: Vec<&str> = given.iter().filter_map(|p| p.pointer("/prompt/0/text").and_then(Value::as_str)).collect();
+            anyhow::ensure!(words.first() == Some(&PICK_UP), "its agent was given {given:?}");
+            anyhow::Ok(())
+        })
+    }
+
     /// CP-T3.2: a move gathers what a session was sent and hasn't taken (carried while its harness
     /// was down, then still in its channel) into its queue, in the order it came, to go with it; it
     /// holds back everything else; and from then on the session takes no message (its inbox takes
