@@ -1,4 +1,8 @@
 {
-  "entrypoint": "python3 /opt/vm-stub/stub",
-  "options": []
+  "schemaVersion": 1,
+  "name": "stub",
+  "run": {
+    "command": ["python3", "/opt/vm-stub/stub"],
+    "env": ["HOME=/home/stub"]
+  }
 }
