@@ -5041,12 +5041,13 @@ impl Registry {
     }
 }
 
-/// Whether runner process `holder` is one `me` came after: both kiln ids (UUIDv7, ordered by when
-/// they were made, `crate::util::new_id`), the holder's older. A name that isn't one (`main`, an
-/// old runner's) says nothing of order: never superseded by it.
+/// Whether runner process `holder` is one `me` came after: `me` a kiln id (UUIDv7, ordered by when
+/// it was made, `crate::util::new_id`), and the holder an older id, or a name from before runner
+/// processes had ids (`main`, `legacy`: e30189ea…'s sessions, held by `main`, 2026-11-13). Asked
+/// only of a holder that isn't connected. `me` a name says nothing of order.
 fn superseded(holder: &str, me: &str) -> bool {
     let id = |s: &str| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit());
-    id(holder) && id(me) && holder < me
+    id(me) && (!id(holder) || holder < me)
 }
 
 /// A copy whose harness is gone while its machine is up: said crashed, with why, to its viewers too.
@@ -6435,8 +6436,8 @@ mod tests {
 
     /// Ada, 2026-11-12 (Amphora): a session whose runner process ended while its machine is up reads
     /// crashed, never offline, with why, for every harness kiln supports: held by a process the one
-    /// reporting superseded (an older kiln id, gone) that the reporting one doesn't hold. One whose
-    /// holder may still be up (a name, not an id of an older process) stays away, as before.
+    /// reporting superseded (an older kiln id, or a name from before ids, gone) that the reporting
+    /// one doesn't hold.
     #[test]
     fn crashed_state_a_session_whose_runner_process_ended_reads_crashed_never_offline_for_every_harness() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -6451,8 +6452,8 @@ mod tests {
                 hub.harness.ingest(&there, &info.id.clone(), Update::Open { info: Box::new(info.clone()), since: None }).await;
                 hub.harness.held_by(&info.id, &old);
             }
-            hub.harness.ingest(&there, "away", Update::Open { info: Box::new(Info { id: "away".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
-            hub.harness.held_by("away", "main");
+            hub.harness.ingest(&there, "legacy", Update::Open { info: Box::new(Info { id: "legacy".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            hub.harness.held_by("legacy", "main");
             hub.harness.inventory(&hub, "box", Some(&me), std::slice::from_ref(&me), crate::harness::host::Inventory::default()).await;
             for k in kinds {
                 let id = format!("c-{}", k.id);
@@ -6461,7 +6462,7 @@ mod tests {
                 anyhow::ensure!(super::super::wait::stand(&i) == "crashed", "{}: {}", k.id, super::super::wait::stand(&i));
                 anyhow::ensure!(i.exit.as_ref().and_then(|e| e.error.as_deref()).is_some_and(|w| w.contains(&old)), "{}: why {:?}", k.id, i.exit);
             }
-            anyhow::ensure!(hub.harness.info("away").map(|i| i.status) == Some(Status::Disconnected), "a holder that may be up: away");
+            anyhow::ensure!(hub.harness.info("legacy").map(|i| i.status) == Some(Status::Crashed), "held by a name from before ids, gone: crashed");
             Ok(())
         })
     }
