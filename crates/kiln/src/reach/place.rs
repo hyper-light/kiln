@@ -477,12 +477,14 @@ struct Held {
 /// agent session's, found by its id as it reads (its group comes once its harness starts), or a
 /// group Shards keeps (D183, slice 3: on macOS and Windows), its folder `groups/<name>` of
 /// Shards' home, where an isolated session's microVM is made and charged ([`vm_group`], kiln plan
-/// 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 32); or a microVM Hex runs, read through its meter
+/// (`crate::sandbox::hexvm::Meter`: Hex's `host_use`, on every platform; #73 part 7 slice 3).
 #[derive(Debug, Clone)]
 pub enum Group {
     Dir(std::path::PathBuf),
     Session(String),
     Shards(std::path::PathBuf),
+    Hex(crate::sandbox::hexvm::Meter),
 }
 
 /// Where an isolated agent session's microVM is charged from (kiln plan
@@ -532,13 +534,20 @@ pub fn shards_group_of(memory_current: &str, procs: &str) -> Result<ShardsGroup,
 }
 
 /// What a placed run uses now, read from its group (on Linux its cgroup; on every platform a group
-/// Shards keeps; elsewhere nothing is read, and the run counts as the machine's load as before):
+/// Shards keeps, or a microVM Hex runs; elsewhere nothing is read, and the run counts as the machine's load as before):
 /// CPUs, its CPU time over the time since its last read, the same interval the machine's own idle
 /// share covers (both read in one measure); memory as its group says it ([`cgroup_now`],
 /// [`shards_now`]).
 fn group_use(h: &mut Held) -> Resources {
     let now = std::time::Instant::now();
     let (cpu_us, mem) = match h.at.clone() {
+        // Its CPUs over the window Hex's run host read since its last read: counters of its own, no clock here.
+        Group::Hex(meter) => {
+            return match meter.read() {
+                Ok(u) => Resources { cpu: Cpus::milli(u.cpu_milli), mem: u.footprint_bytes, disk: 0, gpu: 0 },
+                Err(_) => Resources::default(),
+            };
+        }
         Group::Shards(dir) => match shards_now(&dir) {
             Some(read) => read,
             None => {
