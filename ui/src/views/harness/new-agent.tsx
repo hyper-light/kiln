@@ -28,7 +28,7 @@ import { sendingProps } from "@/lib/action";
 import { useSuspenseResource } from "@/lib/resource";
 import { useRouter } from "@tanstack/react-router";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
-import { agentfileChoicesRes, choicesFor, chosenFor, projectOf, whyNoMicrovm, withChoice, type AgentfileChoice } from "@/views/agentfiles/choose";
+import { agentfileChoicesRes, choicesFor, chosenFor, projectOf, resumedImage, whyNoMicrovm, withChoice, type AgentfileChoice } from "@/views/agentfiles/choose";
 import { atOf, doingOf, findAgents } from "./broadcast";
 import { ComposeField } from "./compose-field";
 import { useAttachments } from "./controls";
@@ -52,6 +52,7 @@ import {
   onMachine,
   oneOf,
   reachChoices,
+  resumeSpecOf,
   specOf,
   speedsFor,
   targetOf,
@@ -429,7 +430,7 @@ function Opens({ c, part, text, title }: { c: Choices; part: Exclude<Part, null>
  * (the machine, the folder, how many), then the rest. The agent is picked as the agent page switches
  * one: by a model of its in the model select above the box.
  */
-function Options({ c, s, past, setPast, onResume }: { c: Choices; s: Setup; past: boolean; setPast: (o: boolean) => void; onResume: (s: Setup, p: PastSession) => void }) {
+function Options({ c, s, past, setPast, onResume }: { c: Choices; s: Setup; past: boolean; setPast: (o: boolean) => void; onResume: (s: Setup, p: PastSession, image?: string) => void }) {
   const shell = c.shell ? s.shells.find((x) => x.id === c.shell) : undefined;
   return (
     <div className="mc-opts">
@@ -554,7 +555,7 @@ function Options({ c, s, past, setPast, onResume }: { c: Choices; s: Setup; past
       {past && s.target && (
         <div className="ps-body mc-past mc-opt-panel">
           <Loadable label="Loading past sessions" fallback={<p className="ps-none">Looking…</p>}>
-            <PastList target={s.target} kind={s.kind} kindName={s.kindName} onPick={(p) => onResume(s, p)} />
+            <PastList target={s.target} kind={s.kind} kindName={s.kindName} kept={c.agentfiles} onPick={(p, image) => onResume(s, p, image)} />
           </Loadable>
         </div>
       )}
@@ -562,9 +563,26 @@ function Options({ c, s, past, setPast, onResume }: { c: Choices; s: Setup; past
   );
 }
 
-/** The machine's past sessions with this harness, once it has said (or said why it can't). */
-function PastList({ target, kind, kindName, onPick }: { target: string; kind: string; kindName: string; onPick: (p: PastSession) => void }) {
+/**
+ * The machine's past sessions with this harness, once it has said (or said why it can't). One that ran in a microVM of yours says
+ * so, and is picked up in one, made from the Agentfile kept for its harness in its folder, else kiln's (kiln plan
+ * 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
+ */
+function PastList({
+  target,
+  kind,
+  kindName,
+  kept,
+  onPick,
+}: {
+  target: string;
+  kind: string;
+  kindName: string;
+  kept: Readonly<Record<string, string>>;
+  onPick: (p: PastSession, image?: string) => void;
+}) {
   const now = useNow();
+  const agentfiles = useRes(agentfileChoicesRes).data;
   const { list, error } = useSuspenseResource(`harness/history/${target}/${kind}`, () =>
     harnessApi.history(target, kind).then(
       (list) => ({ list, error: null }),
@@ -576,12 +594,13 @@ function PastList({ target, kind, kindName, onPick }: { target: string; kind: st
   return (
     <ul className="ps-list">
       {list.map((p) => (
-        <li key={p.id}>
-          <button type="button" className="ps-row" onClick={() => onPick(p)}>
+        <li key={`${p.isolation ? "microvm" : "machine"}:${p.id}`}>
+          <button type="button" className="ps-row" onClick={() => onPick(p, p.isolation ? resumedImage(agentfiles, kept, p.kind, p.cwd) : undefined)}>
             <span className="ps-title">{p.title || p.last_prompt || p.id}</span>
             <span className="ps-meta">
               {tildify(p.cwd)}
               {p.branch ? ` · ${p.branch}` : ""} · {relativeTime(p.last_activity, now)}
+              {p.isolation ? " · in a microVM" : ""}
             </span>
           </button>
         </li>
@@ -604,7 +623,7 @@ function Under({
   setMore: (o: boolean) => void;
   past: boolean;
   setPast: (o: boolean) => void;
-  onResume: (s: Setup, p: PastSession) => void;
+  onResume: (s: Setup, p: PastSession, image?: string) => void;
 }) {
   const s = useSetup(c);
   const { chosen } = useAgentfile(c, s);
@@ -882,14 +901,17 @@ export function NewAgent({
     setMany(ids[0] ?? null);
   };
 
-  /** Pick up a past conversation where it ended: same harness, folder and history, its page open at once. */
-  const resume = (s: Setup, p: PastSession) => {
+  /**
+   * Pick up a past conversation where it ended: same harness, folder and history, its page open at once. One that ran in a microVM
+   * goes on in one, made from `image`, never as a process on its machine (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
+   */
+  const resume = (s: Setup, p: PastSession, image?: string) => {
     const id = clientId();
     const dirs = withDir(c.dirs, s.target, p.cwd);
     startAgents({
       ids: [id],
       target: s.target,
-      spec: { kind: p.kind, cwd: p.cwd || undefined, resume: p.id, mode: s.mode || undefined, effort: resumeEffort(s.info, p.model, s.effort), name: (p.title || "").slice(0, 80) || undefined },
+      spec: resumeSpecOf(p, { mode: s.mode, effort: resumeEffort(s.info, p.model, s.effort), image }),
       kindName: s.kindName,
       machine: s.machine,
       text: "",

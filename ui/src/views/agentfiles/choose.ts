@@ -10,6 +10,7 @@ import { request } from "@/api/client";
 import type { Agent } from "@/api/types";
 import type { AgentfileBuiltin, AgentfileListing } from "@/api/wire";
 import type { Res } from "@/lib/data";
+import { tildify } from "@/views/harness/derive";
 
 /** What a start chooses from: yours and kiln's. */
 type Listed = Pick<AgentfileListing, "agentfiles" | "builtin">;
@@ -67,6 +68,17 @@ const keyOf = (kind: string, project: string) => `${kind}\n${project}`;
 export function chosenFor(kept: Readonly<Record<string, string>>, choices: AgentfileChoice[], kind: string, project: string): AgentfileChoice | null {
   const image = kept[keyOf(kind, project)];
   return choices.find((c) => c.image === image) ?? null;
+}
+
+/**
+ * The Agentfile a past conversation that ran in a microVM goes on in, picked up again in its own folder `cwd` (kiln plan
+ * 01a1d2c16eb074f19cf7ae7f1025c0be step 5): the one kept for its harness there (as typed, or under `~`), else kiln's for its
+ * harness. Never none, which would be a process; none known (a server from before Agentfiles), and the server takes kiln's.
+ */
+export function resumedImage(listing: Listed, kept: Readonly<Record<string, string>>, kind: string, cwd: string): string | undefined {
+  const choices = choicesFor(listing, kind);
+  const keptThere = [cwd, tildify(cwd)].map((folder) => chosenFor(kept, choices, kind, projectOf(folder, ""))).find((c): c is AgentfileChoice => c !== null);
+  return (keptThere ?? choices.find((c) => c.whose === "kiln"))?.image;
 }
 
 /** The choices kept, with `image` (none: a process) now harness `kind`'s in `project`. */

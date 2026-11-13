@@ -6046,6 +6046,25 @@ mod tests {
         assert_eq!(s.resume_spec().prompt, None);
     }
 
+    /// Kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5: an ended agent that ran in a microVM is
+    /// restarted (`Command::Restart`, its harness started again from `resume_spec`) in a microVM again,
+    /// as it ran: from its image, for its person, at its size, its Agentfile's text with it, on its own
+    /// conversation; never as a process on its machine. Mutation: `s.isolation = None` in
+    /// `resume_spec` fails it.
+    #[test]
+    fn s35_an_ended_isolated_agents_restart_keeps_its_isolation() {
+        let (s, _rx) = idle("isolated-ended");
+        let isolation = Isolation { image: Some("agentfile:0123456789abcdef0123456789abcdef".into()), person: Some("user:u1".into()), memory: Some(4 << 30), ..Isolation::microvm() };
+        *s.spec.lock() = Spec { kind: "codex".into(), isolation: Some(isolation.clone()), agentfile: Some("FROM scratch\n".into()), ..Spec::default() };
+        {
+            let mut core = s.core.lock();
+            core.state.harness_session = Some("thread-1".into());
+            core.state.status = Status::Exited;
+        }
+        let again = s.resume_spec();
+        assert_eq!((again.isolation, again.agentfile.as_deref(), again.resume.as_deref()), (Some(isolation), Some("FROM scratch\n"), Some("thread-1")));
+    }
+
     #[cfg(unix)]
     #[test]
     fn cp_t3_2_a_restart_recovers_a_codex_startup_refusal_while_its_process_lives() -> anyhow::Result<()> {

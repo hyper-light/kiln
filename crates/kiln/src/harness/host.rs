@@ -969,7 +969,7 @@ impl Host {
             |d| d.join("attachments"),
         );
         let handovers = file.as_ref().and_then(|f| f.parent()).map(Handovers::of);
-        let homes = file.as_ref().and_then(|f| f.parent()).map(|d| d.join("homes"));
+        let homes = file.as_ref().and_then(|f| f.parent()).map(super::isolated::home::root);
         let host = Arc::new_cyclic(|me| Self {
             input_budgets: super::admission::SessionBudgets::default(),
             sessions: Mutex::new(HashMap::new()),

@@ -58,11 +58,11 @@ fn installed_devin_native_history_and_repl_ownership() -> anyhow::Result<()> {
         scanner.codex = dir.path().join("codex");
         scanner.devin = data.join("devin/cli");
         assert!(!scanner.scan(&HashMap::new()).iter().any(|r| r.id == own));
-        assert!(!scanner.history(Some("devin"), 10, &HashSet::new()).iter().any(|r| r.id == own));
+        assert!(!scanner.history(Some("devin"), 10, &HashSet::new(), None).iter().any(|r| r.id == own));
         s.close();
         until(|| s.core.lock().state.status == Status::Exited).await?;
-        until(|| scanner.history(Some("devin"), 10, &HashSet::new()).iter().any(|r| r.id == own)).await?;
-        let past = scanner.history(Some("devin"), 10, &HashSet::new());
+        until(|| scanner.history(Some("devin"), 10, &HashSet::new(), None).iter().any(|r| r.id == own)).await?;
+        let past = scanner.history(Some("devin"), 10, &HashSet::new(), None);
         assert_eq!(past.len(), 1);
         let past = past.first().ok_or_else(|| anyhow::anyhow!("no native history"))?;
         assert_eq!((past.id.as_str(), past.kind.as_str(), past.last_prompt.as_str(), past.model.as_str()), (own.as_str(), "devin", prompt, model.as_str()));
@@ -83,7 +83,7 @@ fn installed_devin_native_history_and_repl_ownership() -> anyhow::Result<()> {
         });
         until(|| scanner.scan(&HashMap::new()).iter().any(|r| r.pid == pid && r.id == own && r.last_reply == "KILN_DEVIN_NATIVE_OK")).await?;
         assert!(scanner.transcript(pid).is_some_and(|e| e.iter().any(|e| e.role == "assistant" && e.text == "KILN_DEVIN_NATIVE_OK")));
-        assert!(scanner.history(Some("devin"), 10, &HashSet::new()).is_empty());
+        assert!(scanner.history(Some("devin"), 10, &HashSet::new(), None).is_empty());
         pty.write(vec![4]);
         crate::rt::timeout(Duration::from_secs(10), ended).await??;
         Ok(())

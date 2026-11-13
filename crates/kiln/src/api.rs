@@ -5945,7 +5945,11 @@ async fn harness_history(hub: &Hub, caller: &crate::authz::Caller, q: &HashMap<S
         return Err(err(StatusCode::BAD_REQUEST, "kind is \"claude\", \"codex\" or \"devin\""));
     }
     let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(50);
-    match hub.harness.history(hub, target, kind, limit).await {
+    // With the conversations kept in the asker's own microVM volumes there, each saying so (kiln plan
+    // 01a1d2c16eb074f19cf7ae7f1025c0be step 5): whose is whoever asks, as an isolated start's person
+    // is (`as_asked`), never what's asked.
+    let person = crate::harness::lineage::person_of(caller);
+    match hub.harness.history(hub, target, kind, limit, person).await {
         Ok(Some(v)) => Ok(srv::json(StatusCode::OK, &v)),
         Ok(None) => Err(err(StatusCode::NOT_FOUND, "that machine keeps no sessions (an ephemeral runner)")),
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),

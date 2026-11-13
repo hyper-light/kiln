@@ -132,6 +132,12 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     if from == to {
         return Err(format!("it runs on {} already", hub.shown(&to)));
     }
+    // An isolated agent's microVM and its person's volume are its machine's: it goes on there alone
+    // (resumed in place, above), never on another machine, nor as a process anywhere (kiln plan
+    // 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
+    if info.isolation.is_some() {
+        return Err(crate::sandbox::isolated::NO_MOVE.to_owned());
+    }
     // Its workspace is a volume in its machine's memory: it doesn't follow yet (docs/agentic.md W7).
     if info.workspace.as_ref().is_some_and(|w| w.made.is_some()) {
         return Err(format!("it works in a workspace of its own on {}, which can't move with it yet: open a change request from its work (or write it to disk), then start an agent on {}", hub.shown(&from), hub.shown(&to)));
@@ -362,5 +368,25 @@ mod tests {
             }
         }
         assert!(resumed_how("no-such-harness").contains("can't be resumed"));
+    }
+
+    /// Kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5: an isolated agent goes on on its own machine
+    /// alone, where its microVM and its person's volume are: a move to another machine is refused,
+    /// saying why (`NO_MOVE`), never made as a process there. Without the guard the move goes on, to
+    /// be refused for what `elsewhere` lacks.
+    #[test]
+    fn s35_an_isolated_agent_never_moves_to_another_machine() -> anyhow::Result<()> {
+        use super::super::core::Update;
+        use super::super::model::Status;
+        use super::super::session::{Info, Isolation};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            hub.put_agent(crate::hub::tests::live_runner("elsewhere", "linux", "x86_64"));
+            let held = Info { id: "vm".into(), kind: "codex".into(), status: Status::Idle, isolation: Some(Isolation::microvm()), ..Info::default() };
+            hub.harness.ingest(&Location::Machine("box".into()), "vm", Update::Open { info: Box::new(held), since: None }).await;
+            let moved = start(&hub, "vm", "elsewhere", false, None, None).await;
+            anyhow::ensure!(moved.as_ref().is_err_and(|e| e == crate::sandbox::isolated::NO_MOVE), "{moved:?}");
+            Ok(())
+        })
     }
 }

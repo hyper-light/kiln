@@ -2481,6 +2481,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         h
     });
+    // Its history reads its people's microVM volumes where its harness host's isolated launches keep
+    // them (`Host::homes`; kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
+    if let (Some(ai), Some(homes)) = (&ai, harness.as_ref().and_then(|h| h.homes())) {
+        ai.read_homes(homes.to_path_buf());
+    }
     // Bind the local Reach endpoint to the actual Host before restoring adapters that
     // can immediately ask it to run work (attention plan 01a199e1b177752e84dad5dc990e6a15).
     if let Some(handle)=&reach{
@@ -4367,6 +4372,21 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         loops::workspace(&shared, req, session, ask);
                         continue;
                     }
+                    // This machine's past sessions asked for a person: with the conversations kept in their
+                    // microVM volumes here (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
+                    Carried::Read(FromServer::HarnessHistoryFor { req, asked }) => {
+                        match &ai {
+                            Some(ai) => {
+                                // Kiln's own sessions here are running, not past.
+                                let running = harness.as_ref().map(|h| h.list().into_iter().filter_map(|i| i.harness_session).collect()).unwrap_or_default();
+                                ai.history(req, asked.kind, usize::try_from(asked.limit).unwrap_or(usize::MAX), running, asked.person, uplink.0.clone());
+                            }
+                            None => {
+                                own.0.send(Up::Term(AgentMsg::HarnessHistory { req, json: None })).await.ok();
+                            }
+                        }
+                        continue;
+                    }
                     Carried::Read(FromServer::FrontDoor(push)) => {
                         // Settings (and certificates) are never logged: an upload carries a key.
                         if let Some(fd) = &front_door {
@@ -5344,7 +5364,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         Some(ai) => {
                             // Kiln's own sessions here are running, not past.
                             let running = harness.as_ref().map(|h| h.list().into_iter().filter_map(|i| i.harness_session).collect()).unwrap_or_default();
-                            ai.history(req, kind, usize::try_from(limit).unwrap_or(usize::MAX), running, uplink.0.clone());
+                            ai.history(req, kind, usize::try_from(limit).unwrap_or(usize::MAX), running, None, uplink.0.clone());
                         }
                         None => {
                             own.0.send(Up::Term(AgentMsg::HarnessHistory { req, json: None })).await.ok();
@@ -5539,7 +5559,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     | ServerMsg::Executor { .. }
                     | ServerMsg::Undeploy { .. }
                     | ServerMsg::Cluster { .. }
-                    | ServerMsg::AgentLimit { .. } => {}
+                    | ServerMsg::AgentLimit { .. }
+                    | ServerMsg::HarnessHistoryFor { .. } => {}
                 }
             }
             Ev::Headroom => {

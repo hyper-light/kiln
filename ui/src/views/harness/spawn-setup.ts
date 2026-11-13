@@ -3,7 +3,7 @@
  * folder, its permissions, model, effort and speed, and the spec that starts it. Pure, so Mission
  * control's composer (new-agent.tsx) and its tests share one reading.
  */
-import type { ControlOption, KindInfo, ModeOption, Spec } from "@/api/harness";
+import type { ControlOption, KindInfo, ModeOption, PastSession, Spec } from "@/api/harness";
 import type { Agent, ReachRunner } from "@/api/types";
 import { labelOf, shownName } from "@/lib/data";
 
@@ -224,6 +224,23 @@ export function specOf(c: Choices): Spec {
     workspace: c.volume && !c.shell ? { kind: "volume" } : undefined,
     // A microVM of its own, made from its Agentfile (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31).
     ...(c.agentfile ? { isolation: { kind: "microvm", image: c.agentfile } } : {}),
+  };
+}
+
+/**
+ * The spec that picks up past conversation `p` where it ended: its harness, its folder and its conversation, named by its title.
+ * One that ran in a microVM (`p.isolation`) goes on in one, made from `image` (none known: kiln's for its harness, as the server
+ * takes it), never as a process on its machine (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
+ */
+export function resumeSpecOf(p: PastSession, c: { mode: string; effort?: string; image?: string }): Spec {
+  return {
+    kind: p.kind,
+    cwd: p.cwd || undefined,
+    resume: p.id,
+    mode: c.mode || undefined,
+    effort: c.effort,
+    name: (p.title || "").slice(0, 80) || undefined,
+    ...(p.isolation ? { isolation: { kind: p.isolation.kind, ...(c.image ? { image: c.image } : {}) } } : {}),
   };
 }
 
