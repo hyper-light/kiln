@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use super::common;
 
 /// The one TLS 1.3 suite every control link negotiates (kiln plan step 3; the plan's "every link uses
-/// TLS13_AES_256_GCM_SHA384 only"), as rustls names it (`reach::e2e`'s `Negotiated::suite`). QUIC's
+/// TLS13_AES_256_GCM_SHA384 only"), as rustls names it (`kiln_ci::facts::Negotiated::suite`). QUIC's
 /// Initial packets stay AES-128-GCM under keys derived from the connection id (RFC 9001 §5): they carry
 /// no application data and are no link's negotiated suite.
 pub const REQUIRED_SUITE: &str = "TLS13_AES_256_GCM_SHA384";
@@ -178,6 +178,22 @@ pub fn picked<'b>(body: &'b Value, pick: Option<&(String, String)>) -> Option<&'
 /// The lanes' names a body lists at `pointer`.
 pub fn lanes_at(body: &Value, pointer: &str) -> Option<Vec<String>> {
     body.pointer(pointer)?.as_array()?.iter().map(|l| l.as_str().map(str::to_owned)).collect()
+}
+
+/// What kiln's runner logs for each call of its MCP it takes over a session's agent-control lane
+/// (`reach::mcp::serve_over`: target `kiln.mcp.lane`, which its log leaves out, and fields `session`
+/// and `tool`), its words as kiln writes them.
+pub const MCP_LANE_SAID: &str = "a call of kiln's MCP over its agent-control lane (D254)";
+
+/// The calls of kiln's MCP that a runner's log says it took over `session`'s lane: its lines of
+/// [`MCP_LANE_SAID`] naming that session, as kiln writes them (`session=<id>`) or as JSON
+/// (`kiln --json`: the event's `fields`).
+pub fn mcp_calls_over_lane(log: &str, session: &str) -> usize {
+    let said = |l: &str| match serde_json::from_str::<Value>(l) {
+        Ok(v) => v.pointer("/fields/message").and_then(Value::as_str) == Some(MCP_LANE_SAID) && v.pointer("/fields/session").and_then(Value::as_str) == Some(session),
+        Err(_) => l.contains(MCP_LANE_SAID) && l.split_whitespace().any(|w| w.strip_prefix("session=") == Some(session)),
+    };
+    log.lines().filter(|l| said(l)).count()
 }
 
 /// Ok when the link that carries kiln's MCP from inside reported its lane ([`MCP_LANE`]).
@@ -700,6 +716,12 @@ impl Fixture {
 
     pub fn runner_log(&self) -> String {
         self.log.as_ref().map(|l| common::tail(l, 60)).unwrap_or_default()
+    }
+
+    /// Its runner's whole log: its own runner's, or ROOT's runner's (`VM_E2E_RUNNER_LOG`).
+    pub fn runner_log_whole(&self) -> anyhow::Result<String> {
+        let path = self.log.clone().or_else(|| std::env::var_os("VM_E2E_RUNNER_LOG").map(PathBuf::from)).ok_or_else(|| anyhow::anyhow!("name ROOT's runner's log in VM_E2E_RUNNER_LOG (tests/vm_e2e/README.md)"))?;
+        std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("the runner's log {}: {e}", path.display()))
     }
 }
 
@@ -1304,6 +1326,7 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
     if mcp {
         mcp_round_trip(&d.events, &d.first).map_err(fail)?;
         check_mcp_lane(&d.links).map_err(fail)?;
+        anyhow::ensure!(mcp_calls_over_lane(&f.runner_log_whole()?, &d.id) > 0, "{what}: its runner's log says no call of kiln's MCP over the session's lane ({MCP_LANE_SAID:?}, session={})", d.id);
     }
     if let Some(c) = &d.child {
         check_child(c, &d.id, &vm_runners(&f.get("/api/reach/runners")?)).map_err(fail)?;
@@ -1386,6 +1409,9 @@ pub fn on_host(kind: &str, mcp: bool) -> anyhow::Result<()> {
     let said_where = where_said(&d.first);
     anyhow::ensure!(check_in_guest(said_where.as_ref(), std::env::consts::OS, host_boot_id().as_deref()).is_err(), "{kind}: the kernel check took the host's for a guest's: {said_where:?}");
     anyhow::ensure!(check_all_links(&d.links).is_err(), "{kind}: links read where there are none");
+    if mcp {
+        anyhow::ensure!(mcp_calls_over_lane(&f.runner_log_whole()?, &d.id) == 0, "{kind}: the runner's log says a session on the host called kiln's MCP over an agent-control lane");
+    }
     anyhow::ensure!(check_no_host_pid(&d.last).is_err() && check_starts(&d.last).is_err(), "{kind}: kiln says a session on the host ran in a microVM: {}", d.last.get("runs").unwrap_or(&Value::Null));
     Ok(())
 }

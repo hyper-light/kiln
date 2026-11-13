@@ -789,11 +789,11 @@ pub(crate) mod tests {
     fn step32_the_guard_reads_a_macs_free_memory_as_the_balancer_does() {
         use kiln_ci::facts::VmPages;
         let page = 16_384;
-        let swapping = VmPages { free: 3_805, active: 769_543, inactive: 750_125, compressor: 2_309_113 };
-        let crowded = VmPages { free: 3_971 + 31_637, active: 442_304, inactive: 408_933, compressor: 1_287_005 };
-        let after = VmPages { free: 539_938 + 696_358, active: 1_266_849, inactive: 782_394, compressor: 564_488 };
-        let desktop = VmPages { free: 337_310 + 472_318, active: 2_731_319, inactive: 2_259_298, compressor: 2_028_728 };
-        let idle = VmPages { free: 563_065 + 132_218, active: 719_425, inactive: 628_564, compressor: 95_903 };
+        let swapping = VmPages { free: 3_805, active: 769_543, inactive: 750_125, compressor: 2_309_113, ..VmPages::default() };
+        let crowded = VmPages { free: 3_971 + 31_637, active: 442_304, inactive: 408_933, compressor: 1_287_005, ..VmPages::default() };
+        let after = VmPages { free: 539_938 + 696_358, active: 1_266_849, inactive: 782_394, compressor: 564_488, ..VmPages::default() };
+        let desktop = VmPages { free: 337_310 + 472_318, active: 2_731_319, inactive: 2_259_298, compressor: 2_028_728, ..VmPages::default() };
+        let idle = VmPages { free: 563_065 + 132_218, active: 719_425, inactive: 628_564, compressor: 95_903, ..VmPages::default() };
         let read = [swapping, crowded, after, desktop, idle].map(|mac| mac_free(&mac, page));
         assert_eq!(read, [3_805, 35_608, 1_454_202, 1_040_198, 1_227_944].map(|pages: u64| (pages * page) as f64));
         assert_eq!(read, [swapping, crowded, after, desktop, idle].map(|mac| mac.room(page) as f64), "the room the runner's sample and facts read");

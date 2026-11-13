@@ -95,29 +95,18 @@ pub enum Runs {
 #[cfg_attr(test, ts(rename = "AgentLink"))]
 pub struct Link {
     /// The controller's, on the machine.
-    pub controller: Negotiated,
+    pub controller: kiln_ci::facts::Negotiated,
     /// The endpoint's own report, from inside the microVM.
-    pub endpoint: Negotiated,
+    pub endpoint: kiln_ci::facts::Negotiated,
     /// The lanes its controller was granted on it as it dialed, by Shards' names (`control`,
     /// `stdin:0`, `stdout:0`, `stderr:0`, `exec`, `mcp:0`). Always said.
     #[serde(default)]
     pub lanes: Vec<String>,
 }
 
-/// One end's word on its handshake: its cipher suite and key exchange group, by rustls's names
-/// (`TLS13_AES_256_GCM_SHA384`, `X25519MLKEM768`), or by IANA code where rustls names none.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(rename = "AgentNegotiated"))]
-pub struct Negotiated {
-    pub suite: String,
-    pub group: String,
-}
-
 impl From<kiln_seams::sandbox::Link> for Link {
     fn from(l: kiln_seams::sandbox::Link) -> Self {
-        let end = |n: kiln_seams::sandbox::Negotiated| Negotiated { suite: n.suite, group: n.group };
-        Self { controller: end(l.controller), endpoint: end(l.endpoint), lanes: l.lanes }
+        Self { controller: l.controller, endpoint: l.endpoint, lanes: l.lanes }
     }
 }
 

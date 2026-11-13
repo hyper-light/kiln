@@ -738,8 +738,10 @@ Its page receives its first reading at once, then the newest pending reading at 
 declared `[telemetry] sample_seconds` cadence (W21-R15); placement measures independently.
 
 - **What one read gives** (each share exact over the interval since the previous read, any
-  interval; each level as read): CPU idle share (`/proc/stat`, Mach's `HOST_CPU_LOAD_INFO`,
-  `GetSystemTimes`), memory available (Linux's `MemAvailable`; on macOS the free pages and the
+  interval; each level as read): CPU idle share (`/proc/stat`, Mach's `PROCESSOR_CPU_LOAD_INFO`
+  for each CPU, `GetSystemTimes`; not `HOST_CPU_LOAD_INFO`, which XNU answers from a copy every
+  process but Apple's shares, fresh for only 2 to 10 calls a second), memory available (Linux's
+  `MemAvailable`; on macOS the free pages and the
   inactive ones beyond what the compressor holds, as `host_statistics64` counts them, since the
   kernel's own available memory counts pages in use; no more than the runner's cgroup leaves), the work
   directory's free space (APFS's important-use figure too), pressure (Linux PSI `some`/`full` for

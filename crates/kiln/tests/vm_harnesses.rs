@@ -127,6 +127,21 @@ mod checks {
     }
 
     #[test]
+    fn s34_the_runner_says_each_mcp_call_came_over_the_lane() {
+        // kiln's runner logs each call of its MCP it takes over a session's lane (`reach::mcp::serve_over`),
+        // as text or as JSON; another session's, another event's, or an id the line only starts with is
+        // none (dropping the session from the match passes a red below).
+        let s = "01a1d5280f617648b8b9dbc21c09f73c";
+        let text = format!("2026-11-13T14:00:00.000000Z  INFO {MCP_LANE_SAID} session={s} tool=\"runners\"");
+        let json = format!(r#"{{"timestamp":"2026-11-13T14:00:00Z","level":"INFO","fields":{{"message":"{MCP_LANE_SAID}","session":"{s}","tool":"runners"}}}}"#);
+        let log = format!("{text}\n2026-11-13T14:00:01.000000Z  INFO another event session={s}\n{json}\n");
+        assert_eq!(mcp_calls_over_lane(&log, s), 2);
+        assert_eq!(mcp_calls_over_lane(&log, "01a1d5280f617648b8b9dbc21c09f73d"), 0, "another session's");
+        assert_eq!(mcp_calls_over_lane(&format!("{MCP_LANE_SAID} session={s}ff\n"), s), 0, "an id it only starts with");
+        assert_eq!(mcp_calls_over_lane("", s), 0);
+    }
+
+    #[test]
     fn s34_kiln_says_the_session_holds_no_host_process_and_started_it_in_microvms_alone() {
         // kiln plan step 17's `runs` and `starts` on the session (dropping the host_pid test, or
         // checking only the last start, passes a red below).

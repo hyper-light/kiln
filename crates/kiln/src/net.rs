@@ -188,8 +188,8 @@ pub struct Secured {
 }
 
 impl Secured {
-    /// As kiln's API says it, as reach's links say theirs (`crate::reach::e2e::Negotiated`): rustls's names of its
-    /// suite and group.
+    /// As kiln's API says it, as reach's links say theirs (`crate::reach::e2e::Tls::negotiated`): rustls's names of
+    /// its suite and group.
     pub fn said(self) -> kiln_ci::facts::Negotiated {
         kiln_ci::facts::Negotiated { suite: format!("{:?}", self.suite), group: format!("{:?}", self.group) }
     }

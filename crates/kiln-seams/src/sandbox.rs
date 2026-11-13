@@ -261,23 +261,15 @@ pub enum Refusal {
     Ended,
 }
 
-/// One end's word on what its TLS 1.3 handshake negotiated: its cipher suite and key exchange group,
-/// by rustls's names (`TLS13_AES_256_GCM_SHA384`, `X25519MLKEM768`), or by their IANA code where rustls
-/// names none (`0x1303`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Negotiated {
-    pub suite: String,
-    pub group: String,
-}
-
 /// The link a run's stdio rides into its boundary (a microVM's: Shards' agent control, kiln plan
-/// 01a1cd8e862e7169a074db3d5fa33f3d step 11), as each end says it negotiated: the controller's, on the
-/// machine, and the endpoint's own report from inside; and the lanes its controller was granted on it
-/// as it dialed, by Shards' names (`control`, `stdin:0`, `stdout:0`, `stderr:0`, `exec`, `mcp:0`).
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 11), as each end says it negotiated
+/// ([`kiln_ci::facts::Negotiated`]): the controller's, on the machine, and the endpoint's own report
+/// from inside; and the lanes its controller was granted on it as it dialed, by Shards' names
+/// (`control`, `stdin:0`, `stdout:0`, `stderr:0`, `exec`, `mcp:0`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
-    pub controller: Negotiated,
-    pub endpoint: Negotiated,
+    pub controller: kiln_ci::facts::Negotiated,
+    pub endpoint: kiln_ci::facts::Negotiated,
     pub lanes: Vec<String>,
 }
 
