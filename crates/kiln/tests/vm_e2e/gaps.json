@@ -1,0 +1,295 @@
+{
+  "_about": "What each harness of kiln plan 01a1cd8e862e7169a074db3d5fa33f3d (steps 19-28) does through kiln's UI and API, on the host and in a microVM of its own, and each gap with its cited reason (step 35: 'each harness works as on the host, or its gap is listed with a cited reason'). Flags: linux_build (kiln ships an Agentfile pinning its Linux build); mcp (kiln gives it kiln's MCP server on the host, so an MCP round trip and an agent started from where it runs apply there); mcp_in_microvm (kiln gives it kiln's MCP server in a microVM, over the agent-control link's mcp lane, Shards D254, which plan 01a1d2c16eb074f19cf7ae7f1025c0be step 3 names: the drive reads its MCP round trip from inside and the session's link report naming that lane; null: not recorded yet, so the drive tries it); resume (kiln takes its conversation up again: spec.resume, agents_start's resume, an ended agent's Restart); ui_pick_up (the composer's past sessions list its conversations, to pick one up after its agent was ended). Every flag that is false or null has a gap naming it ({what, where, why, cites}); each caveat is {note, cites}; sources back the row's reason, its pin first. A cite is a URL; kiln's code by the text it holds (path#text: its lines move); or a recorded evidence file's line (docs/research/...:line). Held to kiln's code and to its sources by vm_e2e/step35.rs's checks.",
+  "claude": {
+    "linux_build": true,
+    "mcp": true,
+    "mcp_in_microvm": true,
+    "resume": true,
+    "ui_pick_up": true,
+    "gaps": [],
+    "caveats": [],
+    "reason": "Anthropic's own Linux builds for glibc and musl, pinned in its Agentfile (step 19); kiln's MCP server by --mcp-config; resumed with --resume; its transcripts in the machine history.",
+    "sources": [
+      ".kiln/images/harness-claude/pin.json",
+      "crates/kiln/src/reach/mcp.rs#pub fn claude_config(",
+      "crates/kiln/src/harness/claude.rs#\"--resume\"",
+      "crates/kiln/src/aisessions.rs#if want(\"claude\")"
+    ]
+  },
+  "codex": {
+    "linux_build": true,
+    "mcp": true,
+    "mcp_in_microvm": true,
+    "resume": true,
+    "ui_pick_up": true,
+    "gaps": [],
+    "caveats": [],
+    "reason": "OpenAI's whole Codex package, pinned in its Agentfile (step 20); kiln's MCP server by -c mcp_servers.kiln.*; resumed by thread/resume; its sessions in the machine history.",
+    "sources": [
+      ".kiln/images/harness-codex/pin.json",
+      "crates/kiln/src/reach/mcp.rs#pub fn codex_config(",
+      "crates/kiln/src/harness/codex.rs#\"thread/resume\"",
+      "crates/kiln/src/aisessions.rs#if want(\"codex\")"
+    ]
+  },
+  "gemini": {
+    "linux_build": true,
+    "mcp": true,
+    "mcp_in_microvm": true,
+    "resume": true,
+    "ui_pick_up": false,
+    "gaps": [
+      {
+        "what": "ui_pick_up",
+        "where": "the host and a microVM",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended Gemini CLI agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "cites": [
+          "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+        ]
+      }
+    ],
+    "caveats": [],
+    "reason": "Google's Gemini CLI npm package on Node.js's Linux build, pinned in its Agentfile (step 21); ACP (--acp), kiln's MCP server in session/new's mcpServers; Gemini CLI 0.68.0 says loadSession and mcpCapabilities.http.",
+    "sources": [
+      ".kiln/images/harness-gemini/pin.json",
+      "crates/kiln/src/harness/kinds.rs#pub fn acp_servers(",
+      "docs/research/s21-gemini-agentfile/evidence/e_run_adacachy2.txt:25"
+    ]
+  },
+  "opencode": {
+    "linux_build": true,
+    "mcp": true,
+    "mcp_in_microvm": true,
+    "resume": true,
+    "ui_pick_up": false,
+    "gaps": [
+      {
+        "what": "ui_pick_up",
+        "where": "the host and a microVM",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended opencode agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "cites": [
+          "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+        ]
+      }
+    ],
+    "caveats": [],
+    "reason": "opencode's own Linux builds for glibc and musl, pinned in its Agentfile (step 22); ACP (acp), kiln's MCP server in session/new's mcpServers; opencode 2.2.7 says loadSession and mcpCapabilities.http.",
+    "sources": [
+      ".kiln/images/harness-opencode/pin.json",
+      "crates/kiln/src/harness/kinds.rs#pub fn acp_servers(",
+      "docs/research/s22-opencode-agentfile/planning/evidence/m4-linux-x64.txt:35"
+    ]
+  },
+  "goose": {
+    "linux_build": true,
+    "mcp": true,
+    "mcp_in_microvm": true,
+    "resume": true,
+    "ui_pick_up": false,
+    "gaps": [
+      {
+        "what": "ui_pick_up",
+        "where": "the host and a microVM",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended Goose agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "cites": [
+          "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+        ]
+      }
+    ],
+    "caveats": [],
+    "reason": "Goose's own static musl build, pinned in its Agentfile (step 23); ACP (acp), kiln's MCP server in session/new's mcpServers; Goose 1.59.0 says loadSession and mcpCapabilities.http.",
+    "sources": [
+      ".kiln/images/harness-goose/pin.json",
+      "crates/kiln/src/harness/kinds.rs#pub fn acp_servers(",
+      "docs/research/s23-goose-agentfile/evidence/e_runtime_linux_x86_64.txt:26"
+    ]
+  },
+  "amp": {
+    "linux_build": true,
+    "mcp": true,
+    "mcp_in_microvm": true,
+    "resume": true,
+    "ui_pick_up": false,
+    "gaps": [
+      {
+        "what": "ui_pick_up",
+        "where": "the host and a microVM",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended Amp agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "cites": [
+          "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+        ]
+      }
+    ],
+    "caveats": [
+      {
+        "note": "kiln runs Amp through its ACP adapter, amp-acp (Kind amp's program), not the Amp CLI itself.",
+        "cites": [
+          "crates/kiln/src/harness/kinds.rs#program: \"amp-acp\""
+        ]
+      },
+      {
+        "note": "amp-acp 0.12.0 takes a message steered into a turn at its next turn (its initialize's _meta amp-acp/steering, mode next-turn).",
+        "cites": [
+          "docs/research/s35-every-harness/initialize-amp-devin.log:14"
+        ]
+      }
+    ],
+    "reason": "The Amp CLI and amp-acp, pinned in its Agentfile (step 24); kiln's MCP server in session/new's mcpServers; amp-acp 0.12.0 says loadSession and mcpCapabilities.http (plan 01a1d2c16eb074f19cf7ae7f1025c0be step 6's handshake).",
+    "sources": [
+      ".kiln/images/harness-amp/pin.json",
+      "crates/kiln/src/harness/kinds.rs#pub fn acp_servers(",
+      "docs/research/s35-every-harness/initialize-amp-devin.log:14"
+    ]
+  },
+  "devin": {
+    "linux_build": true,
+    "mcp": true,
+    "mcp_in_microvm": true,
+    "resume": true,
+    "ui_pick_up": true,
+    "gaps": [],
+    "caveats": [
+      {
+        "note": "Devin offers no branching of a conversation through ACP: a resume takes it up whole.",
+        "cites": [
+          "docs/agents.md#Devin does not offer conversation branching through ACP"
+        ]
+      }
+    ],
+    "reason": "Cognition's Devin for Terminal static builds, pinned in its Agentfile (step 25); devin acp, kiln's MCP server in session/new's mcpServers; Devin 3000.12.43 says loadSession and mcpCapabilities.http (plan 01a1d2c16eb074f19cf7ae7f1025c0be step 6's handshake); its past conversations in the machine history.",
+    "sources": [
+      ".kiln/images/harness-devin/pin.json",
+      "crates/kiln/src/harness/kinds.rs#pub fn acp_servers(",
+      "docs/research/s35-every-harness/initialize-amp-devin.log:17",
+      "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+    ]
+  },
+  "antigravity": {
+    "linux_build": true,
+    "mcp": true,
+    "mcp_in_microvm": false,
+    "resume": true,
+    "ui_pick_up": false,
+    "gaps": [
+      {
+        "what": "mcp_in_microvm",
+        "where": "a microVM",
+        "why": "Antigravity reads MCP servers only from its own config files: its global one, which in a microVM is in the person's volume, shared by their sessions, and its workspace's, which is the person's project; neither is a place for one session's own token (step 18). agy 1.5.7 expands no ${VAR} in a server's header and takes no MCP server by --settings, so neither carries a token per session. A stdio server it starts does get its environment: one stdio entry in the shared config, the same for every session and holding no token, can take its session from that environment over the agent-control link's mcp lane (Shards D254), plan 01a1d2c16eb074f19cf7ae7f1025c0be step 4's way. Until that is on kiln main, no MCP round trip and no agent started from inside.",
+        "cites": [
+          "https://antigravity.google/docs/mcp?tab=cli",
+          "crates/kiln/src/harness/kinds.rs#.gemini/config/mcp_config.json",
+          "docs/research/s35-every-harness/agy-mcp/probe-1.5.7-linux-x64.log:24",
+          "docs/research/s35-every-harness/agy-mcp/probe-1.5.7-linux-x64.log:41",
+          "docs/research/s35-every-harness/agy-mcp/probe-1.5.7-linux-x64.log:43"
+        ]
+      },
+      {
+        "what": "ui_pick_up",
+        "where": "the host and a microVM",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended Antigravity CLI agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "cites": [
+          "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+        ]
+      }
+    ],
+    "caveats": [
+      {
+        "note": "agy's headless stream-json mode can't be asked anything once started: a tool that needs approval is denied, and a stop ends its process, which kiln starts again on the same conversation (--conversation); a message steered in waits for the turn's end. All as on the host.",
+        "cites": [
+          "crates/kiln/src/harness/antigravity.rs#flag(\"--conversation\""
+        ]
+      }
+    ],
+    "reason": "Google's Antigravity CLI static musl build, pinned in its Agentfile (step 26); on the host kiln's MCP server put in agy's own config by `agy mcp add`; resumed by --conversation.",
+    "sources": [
+      ".kiln/images/harness-antigravity/pin.json",
+      "crates/kiln/src/reach/mcp.rs#pub fn agy_add(",
+      "crates/kiln/src/harness/antigravity.rs#flag(\"--conversation\""
+    ]
+  },
+  "cursor": {
+    "linux_build": true,
+    "mcp": true,
+    "mcp_in_microvm": true,
+    "resume": true,
+    "ui_pick_up": false,
+    "gaps": [
+      {
+        "what": "ui_pick_up",
+        "where": "the host and a microVM",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended Cursor CLI agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "cites": [
+          "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+        ]
+      }
+    ],
+    "caveats": [
+      {
+        "note": "Its sign-in opens no browser on the machine: its link is shown wherever the person is, in a microVM as on the host.",
+        "cites": [
+          "crates/kiln/src/harness/kinds.rs#NO_OPEN_BROWSER"
+        ]
+      }
+    ],
+    "reason": "Cursor's CLI agent Linux package, pinned in its Agentfile (step 27); ACP (agent acp), kiln's MCP server in session/new's mcpServers; its agent says loadSession and mcpCapabilities.http.",
+    "sources": [
+      ".kiln/images/harness-cursor/pin.json",
+      "crates/kiln/src/harness/kinds.rs#pub fn acp_servers(",
+      "docs/research/s27-cursor-agentfile/evidence/live-x64.log:61"
+    ]
+  },
+  "pi": {
+    "linux_build": true,
+    "mcp": false,
+    "mcp_in_microvm": false,
+    "resume": true,
+    "ui_pick_up": false,
+    "gaps": [
+      {
+        "what": "mcp",
+        "where": "the host and a microVM",
+        "why": "kiln gives Pi no MCP server: its RPC mode has no way to take one from kiln, so neither an MCP round trip nor an agent started from inside applies to Pi.",
+        "cites": [
+          "crates/kiln/src/harness/pi.rs#Pi's RPC mode has no way to manage its MCP servers"
+        ]
+      },
+      {
+        "what": "mcp_in_microvm",
+        "where": "a microVM",
+        "why": "As on the host: kiln gives Pi no MCP server.",
+        "cites": [
+          "crates/kiln/src/harness/pi.rs#Pi's RPC mode has no way to manage its MCP servers"
+        ]
+      },
+      {
+        "what": "ui_pick_up",
+        "where": "the host and a microVM",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended Pi agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "cites": [
+          "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history(",
+          "crates/kiln/src/harness/pi.rs#flag(\"--session-id\""
+        ]
+      }
+    ],
+    "caveats": [
+      {
+        "note": "Pi's Agentfile pins its Bun build for glibc alone, so its base is a glibc one.",
+        "cites": [
+          ".kiln/images/harness-pi/pin.json#buildpack-deps:trixie-scm"
+        ]
+      }
+    ],
+    "reason": "Pi's Bun build for glibc, pinned in its Agentfile (step 28); resumed by --session-id.",
+    "sources": [
+      ".kiln/images/harness-pi/pin.json",
+      "crates/kiln/src/harness/pi.rs#flag(\"--session-id\""
+    ]
+  }
+}
