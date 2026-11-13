@@ -8,6 +8,9 @@
 //!   Agentfile is built beside kiln's harness directory, so one copied from kiln's finds it where
 //!   kiln's does. Of a pin with several builds for the platform (one per libc), the build is the one
 //!   the Agentfile's own defaults name (`ARG CLAUDE_LIBC=gnu`), as a build given no argument takes it.
+//!   A person's own whose defaults name none of them reads none of kiln's harness directories, as no
+//!   build given no argument could: it's built from its text alone (one whose harness comes from a
+//!   source Shards fetches, such as a stand-in with no vendor's binary). kiln's own always name one.
 //! - **Its tag is its content's digest** (`NAME:<recipe>`, `context::recipe_with`). An image the
 //!   home's store holds under it is what a build would make, so it boots without one; a content the
 //!   store holds none of is built and tagged by its build. Builds in this process take turns, so the
@@ -68,7 +71,7 @@ pub enum Refusal {
     #[error("this machine's architecture, {0}, isn't one Shards builds images for (amd64, arm64)")]
     Platform(String),
     /// Its harness's pin has several builds for the platform, and its Agentfile's argument defaults
-    /// name none of them, or more than one.
+    /// name more than one of them, or, kiln's own, none.
     #[error("its Agentfile's argument defaults name none of its harness's builds for {platform} ({}), or more than one", builds.join(", "))]
     Which { platform: String, builds: Vec<String> },
     /// Its build context couldn't be made: its pin, a download, the disk.
@@ -135,9 +138,9 @@ impl Images {
         let (d, c) = (dir.to_path_buf(), config.clone());
         let made = crate::rt::blocking(move || crate::shards::private_dir(&d).and_then(|()| crate::shards::private_dir(&c))).await;
         made.and_then(|r| r).map_err(|e| Refusal::Context(format!("{e:#}")))?;
-        match source.harness() {
+        match &plan.beside {
             Some(b) => {
-                context::materialize_with(b, source.text(), std::slice::from_ref(&plan.platform), plan.variant.as_deref(), &context_dir).await.map_err(|e| Refusal::Context(e.to_string()))?;
+                context::materialize_with(b.harness, source.text(), std::slice::from_ref(&plan.platform), b.variant.as_deref(), &context_dir).await.map_err(|e| Refusal::Context(e.to_string()))?;
             }
             None => {
                 let (into, at, text) = (context_dir.clone(), context_dir.join("Agentfile"), source.text().to_owned());
@@ -162,28 +165,32 @@ impl Images {
     }
 }
 
-/// What a build of a source for this machine is: its image's name, the platform, its harness's build,
-/// its content's digest, and the tag it's built and found under.
+/// What a build of a source for this machine is: its image's name, the platform, kiln's harness
+/// directory beside its Agentfile, its content's digest, and the tag it's built and found under.
 struct Plan {
     name: String,
     platform: String,
-    variant: Option<String>,
+    beside: Option<Beside>,
     recipe: String,
     tag: String,
+}
+
+/// Kiln's harness directory a build is given beside its Agentfile: its harness's, of the build it takes.
+struct Beside {
+    harness: &'static Builtin,
+    variant: Option<String>,
 }
 
 impl Plan {
     fn of(source: Source<'_>) -> Result<Plan, Refusal> {
         let platform = platform()?;
         let text = source.text();
-        let variant = match source.harness() {
-            Some(b) => build_of(b, text, &platform)?,
-            None => None,
-        };
-        let recipe = context::recipe_with(text, source.harness(), context::default_base(text).unwrap_or_default(), variant.as_deref());
+        let beside = beside_of(source, &platform)?;
+        let (harness, variant) = beside.as_ref().map_or((None, None), |b| (Some(b.harness), b.variant.as_deref()));
+        let recipe = context::recipe_with(text, harness, context::default_base(text).unwrap_or_default(), variant);
         let name = source.name();
         let tag = format!("{name}:{recipe}");
-        Ok(Plan { name, platform, variant, recipe, tag })
+        Ok(Plan { name, platform, beside, recipe, tag })
     }
 
     /// The image of `digest`, named as Hex boots it.
@@ -202,21 +209,28 @@ fn platform() -> Result<String, Refusal> {
     }
 }
 
-/// Which of `b`'s builds for `platform` a build of `text` takes: the platform's only one, else the one
-/// its argument defaults name (`ARG CLAUDE_LIBC=gnu`), as a build given no argument takes it.
-fn build_of(b: &Builtin, text: &str, platform: &str) -> Result<Option<String>, Refusal> {
+/// Kiln's harness directory a build of `source` for `platform` is given beside its Agentfile, where
+/// kiln ships one for its harness. Of its builds for the platform, it takes the only one, else the one
+/// its argument defaults name (`ARG CLAUDE_LIBC=gnu`), as a build given no argument takes it. A person's
+/// own whose defaults name none of several reads none of them, and is given none. kiln's own always
+/// names one, and defaults that name none of kiln's or more than one are refused, naming its builds.
+fn beside_of(source: Source<'_>, platform: &str) -> Result<Option<Beside>, Refusal> {
+    let Some(b) = source.harness() else {
+        return Ok(None);
+    };
     let pin = context::Pin::read(b.pin).map_err(|e| Refusal::Context(e.to_string()))?;
     let builds: Vec<Option<&str>> = pin.builds.iter().filter(|x| x.platform == platform).map(|x| x.variant.as_deref()).collect();
     match builds.as_slice() {
         [] => return Err(Refusal::Context(pin.build(platform, None).err().map(|e| e.to_string()).unwrap_or_default())),
-        [only] => return Ok(only.map(str::to_owned)),
+        [only] => return Ok(Some(Beside { harness: b, variant: only.map(str::to_owned) })),
         _ => {}
     }
-    let mut named: Vec<&str> = text.lines().filter_map(|l| l.trim().strip_prefix("ARG ")).filter_map(|a| a.split_once('=')).map(|(_, v)| v.trim()).filter(|v| builds.contains(&Some(*v))).collect();
+    let mut named: Vec<&str> = source.text().lines().filter_map(|l| l.trim().strip_prefix("ARG ")).filter_map(|a| a.split_once('=')).map(|(_, v)| v.trim()).filter(|v| builds.contains(&Some(*v))).collect();
     named.sort_unstable();
     named.dedup();
-    match named.as_slice() {
-        [one] => Ok(Some((*one).to_owned())),
+    match (named.as_slice(), source) {
+        ([one], _) => Ok(Some(Beside { harness: b, variant: Some((*one).to_owned()) })),
+        ([], Source::Kept { .. }) => Ok(None),
         _ => Err(Refusal::Which { platform: platform.to_owned(), builds: builds.iter().map(|v| v.unwrap_or_default().to_owned()).collect() }),
     }
 }
@@ -309,26 +323,33 @@ pub(crate) mod tests {
         Box::leak(Box::new(Builtin { name: "harness-t", harness: "claude", text: Box::leak(text.to_owned().into_boxed_str()), pin: Box::leak(pin.into_boxed_str()), files: &[("harness.json", "{\"name\": \"claude\"}")] }))
     }
 
+    /// The build of kiln's harness `plan` gives its Agentfile beside it, if any.
+    fn variant(plan: &Plan) -> Option<&str> {
+        plan.beside.as_ref().and_then(|b| b.variant.as_deref())
+    }
+
     /// Step 17: each image's build for this machine is the platform's, its harness's build is the one
     /// its Agentfile's defaults name, and its tag changes exactly with its content; a person's own is
-    /// named by its id, built beside kiln's harness directory.
+    /// named by its id, built beside kiln's harness directory, or from its text alone where its
+    /// defaults name none of its harness's builds.
     #[test]
     fn s17_an_images_build_and_tag_are_its_contents() -> anyhow::Result<()> {
         let one = builtin("ARG BASE=scratch\nFROM ${BASE}\n", &[]);
         let plan = Plan::of(Source::Builtin(one))?;
         let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
-        assert_eq!((plan.name.as_str(), plan.platform.as_str(), plan.variant.as_deref()), ("harness-t", format!("linux/{arch}").as_str(), None));
+        assert_eq!((plan.name.as_str(), plan.platform.as_str(), variant(&plan)), ("harness-t", format!("linux/{arch}").as_str(), None));
+        assert!(plan.beside.as_ref().is_some_and(|b| std::ptr::eq(b.harness, one)), "kiln's own, its harness directory beside it");
         assert_eq!(plan.tag, format!("harness-t:{}", context::recipe_with(one.text, Some(one), "scratch", None)));
         assert_eq!(plan.pinned("sha256:00"), "harness-t@sha256:00");
         // A libc each: the one the Agentfile's default names, else refused, naming the builds.
         let libcs = builtin("ARG BASE=scratch\nARG T_LIBC=musl\nFROM ${BASE}\n", &["gnu", "musl"]);
-        assert_eq!(Plan::of(Source::Builtin(libcs))?.variant.as_deref(), Some("musl"));
+        assert_eq!(variant(&Plan::of(Source::Builtin(libcs))?), Some("musl"));
         let unnamed = builtin("FROM scratch\n", &["gnu", "musl"]);
         let refused = Plan::of(Source::Builtin(unnamed)).err();
         assert!(matches!(&refused, Some(Refusal::Which { builds, .. }) if *builds == ["gnu", "musl"]), "{refused:?}");
         // Kiln's own: each built-in shipped is planned for this machine, Claude Code's on glibc, its default.
         let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no Claude Code Agentfile"))?;
-        assert_eq!(Plan::of(Source::Builtin(claude))?.variant.as_deref(), Some("gnu"));
+        assert_eq!(variant(&Plan::of(Source::Builtin(claude))?), Some("gnu"));
         for b in crate::agentfiles::builtin::ALL {
             Plan::of(Source::Builtin(b))?;
         }
@@ -340,18 +361,28 @@ pub(crate) mod tests {
         assert_ne!(a.tag, kept("FROM scratch\nLABEL x=1\n", Some(one))?.tag);
         assert_ne!(a.tag, kept("FROM scratch\n", None)?.tag);
         assert_eq!(a.tag, kept("FROM scratch\n", Some(one))?.tag);
+        // Its defaults naming one of its harness's builds, it's given that one; naming none of them, it
+        // reads none and is given none, planned as one with no harness kiln ships is; naming two, refused.
+        assert_eq!(variant(&kept("ARG T_LIBC=gnu\nFROM scratch\n", Some(unnamed))?), Some("gnu"));
+        let alone = kept("FROM scratch\n", Some(unnamed))?;
+        assert!(alone.beside.is_none(), "no harness directory of kiln's beside it");
+        assert_eq!(alone.tag, kept("FROM scratch\n", None)?.tag);
+        let both = kept("ARG A=gnu\nARG B=musl\nFROM scratch\n", Some(unnamed)).err();
+        assert!(matches!(&both, Some(Refusal::Which { builds, .. }) if *builds == ["gnu", "musl"]), "{both:?}");
         Ok(())
     }
 
     /// A stand-in for the carried `shards`: each build asked of it is a line of `builds` (the home it's
-    /// given and its arguments), and does what Shards' does as far as kiln reads it: its image named in
-    /// its iidfile, and its tag in the home's store (a record Shards' own store code made of it
-    /// beforehand: [`StandIn::ready`]). A tag none was made for fails, in Shards' words.
+    /// given and its arguments) and one of `contexts` (what its build context holds), and does what
+    /// Shards' does as far as kiln reads it: its image named in its iidfile, and its tag in the home's
+    /// store (a record Shards' own store code made of it beforehand: [`StandIn::ready`]). A tag none
+    /// was made for fails, in Shards' words.
     #[cfg(unix)]
     struct StandIn {
         dir: tempfile::TempDir,
         program: PathBuf,
         builds: PathBuf,
+        contexts: PathBuf,
         made: PathBuf,
     }
 
@@ -364,16 +395,17 @@ pub(crate) mod tests {
         fn new() -> anyhow::Result<Self> {
             use std::os::unix::fs::PermissionsExt as _;
             let dir = tempfile::tempdir()?;
-            let (program, builds, made) = (dir.path().join("shards"), dir.path().join("builds"), dir.path().join("made"));
+            let (program, builds, contexts, made) = (dir.path().join("shards"), dir.path().join("builds"), dir.path().join("contexts"), dir.path().join("made"));
             std::fs::create_dir_all(&made)?;
             let script = format!(
-                "#!/bin/sh\necho \"$SHARDS_HOME $*\" >> '{builds}'\nwhile [ $# -gt 1 ]; do case \"$1\" in --tag) tag=\"$2\";; --iidfile) iid=\"$2\";; esac; shift; done\n[ -f \"$1/Agentfile\" ] || {{ echo \"no Agentfile in $1\" >&2; exit 2; }}\nmade='{made}'/$(printf %s \"$tag\" | tr ':/' '__')\n[ -d \"$made\" ] || {{ echo '{FAILED}' >&2; exit 1; }}\nmkdir -p \"$SHARDS_HOME/images\" && cp -R \"$made/images/.\" \"$SHARDS_HOME/images/\" && cp \"$made/iid\" \"$iid\"\n",
+                "#!/bin/sh\necho \"$SHARDS_HOME $*\" >> '{builds}'\nwhile [ $# -gt 1 ]; do case \"$1\" in --tag) tag=\"$2\";; --iidfile) iid=\"$2\";; esac; shift; done\n[ -f \"$1/Agentfile\" ] || {{ echo \"no Agentfile in $1\" >&2; exit 2; }}\necho $(ls -A \"$1\") >> '{contexts}'\nmade='{made}'/$(printf %s \"$tag\" | tr ':/' '__')\n[ -d \"$made\" ] || {{ echo '{FAILED}' >&2; exit 1; }}\nmkdir -p \"$SHARDS_HOME/images\" && cp -R \"$made/images/.\" \"$SHARDS_HOME/images/\" && cp \"$made/iid\" \"$iid\"\n",
                 builds = builds.display(),
+                contexts = contexts.display(),
                 made = made.display(),
             );
             std::fs::write(&program, script)?;
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
-            Ok(Self { dir, program, builds, made })
+            Ok(Self { dir, program, builds, contexts, made })
         }
 
         /// What a build of `source` makes: the image `digest`, its tag recorded as Shards' build records it.
@@ -388,6 +420,18 @@ pub(crate) mod tests {
         /// The builds asked of it so far.
         fn builds(&self) -> Vec<String> {
             std::fs::read_to_string(&self.builds).unwrap_or_default().lines().map(str::to_owned).collect()
+        }
+
+        /// What each build's context held, by name, in order of the builds.
+        fn contexts(&self) -> Vec<Vec<String>> {
+            let read = std::fs::read_to_string(&self.contexts).unwrap_or_default();
+            read.lines()
+                .map(|l| {
+                    let mut names: Vec<String> = l.split_whitespace().map(str::to_owned).collect();
+                    names.sort();
+                    names
+                })
+                .collect()
         }
 
         fn images(&self) -> Images {
@@ -443,6 +487,30 @@ pub(crate) mod tests {
             assert_eq!(images.pinned(b).await?, format!("agentfile-{id}@{}", digest_of("b")), "its changed text, built");
             assert_eq!(images.pinned(a).await?, format!("agentfile-{id}@{}", digest_of("a")), "the first text's, still held");
             assert_eq!(shards.builds().len(), 2, "{:?}", shards.builds());
+            Ok(())
+        })
+    }
+
+    /// Step 17: a person's own Agentfile for a harness kiln ships builds of several libcs is built beside
+    /// kiln's harness directory of the build its defaults name, as a copy of kiln's is; one whose
+    /// defaults name none, such as a stand-in whose harness comes from a source Shards fetches (no
+    /// vendor's binary, no vendor's turn), is built from its text alone.
+    #[cfg(unix)]
+    #[test]
+    fn s17_a_persons_agentfile_naming_no_build_of_kilns_is_built_from_its_text_alone() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let shards = StandIn::new()?;
+            let images = shards.images();
+            let id = crate::util::new_id();
+            let beside = Some(builtin("ARG BASE=scratch\nARG T_LIBC=gnu\nFROM ${BASE}\n", &["gnu", "musl"]));
+            let copy = Source::Kept { id: &id, text: "ARG T_LIBC=musl\nFROM scratch\nHARNESS claude FROM ./claude-${TARGETARCH}-${T_LIBC}\n", beside };
+            let stand_in = Source::Kept { id: &id, text: "FROM scratch\nHARNESS claude FROM https://example.com/stand-in.git#0123456789abcdef0123456789abcdef01234567:harness\n", beside };
+            shards.ready(copy, &digest_of("copy"))?;
+            shards.ready(stand_in, &digest_of("stand-in"))?;
+            assert_eq!(images.pinned(copy).await?, format!("agentfile-{id}@{}", digest_of("copy")));
+            assert_eq!(images.pinned(stand_in).await?, format!("agentfile-{id}@{}", digest_of("stand-in")));
+            let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
+            assert_eq!(shards.contexts(), [vec!["Agentfile".to_owned(), format!("claude-{arch}-musl")], vec!["Agentfile".to_owned()]]);
             Ok(())
         })
     }

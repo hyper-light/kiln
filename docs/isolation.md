@@ -22,7 +22,12 @@ the machine's network) is replaced by an Agentfile image's members.
   platform, tagged by the digest of everything its build takes (`NAME:<recipe>`, `agentfiles::context`):
   its Agentfile, and kiln's harness directory for its harness, files, pin and the build its own argument
   defaults name (`ARG CLAUDE_LIBC=gnu`). A person's own Agentfile is built beside kiln's harness
-  directory, so a copy of kiln's finds it where kiln's does. Where the home's store holds an image under
+  directory, so a copy of kiln's finds it where kiln's does. One whose defaults name none of its
+  harness's several builds reads none of kiln's directories, as no build given no argument could, and
+  is built from its text alone: kiln keeps a person's Agentfile as its text, so whatever else its build
+  takes comes from a source Shards fetches itself (a Git or http(s) URL, an image). That's how a
+  stand-in with no vendor's binary is built: its HARNESS named as the harness it stands in for, from a
+  Git URL at a commit, and no vendor's turn taken. Where the home's store holds an image under
   that tag, it boots without a build; else it's built, once, as the starts that ask for it at once wait
   for one build. A build Shards refuses is refused in Shards' own words; a build runs as long as it
   takes, and is ended, with all it started, when its start is given up.
