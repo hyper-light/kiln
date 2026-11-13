@@ -150,10 +150,10 @@ fn cpu_load(host: MachPort) -> Option<[u32; CPU_STATES]> {
     (r == 0 && usize::try_from(count).ok() == Some(CPU_STATES)).then_some(ticks)
 }
 
-/// What the host can give new work now, in bytes ([`kiln_ci::facts::VmPages::room`]): its pages as
-/// `host_statistics64(HOST_VM_INFO64)` counts them, each of `host_page_size`'s size. None when
-/// either can't be read.
-fn room_of(host: MachPort) -> Option<u64> {
+/// The host's pages as `host_statistics64(HOST_VM_INFO64)` counts them, and the size of each
+/// (`host_page_size`): what its room for new work is read from ([`kiln_ci::facts::VmPages::room`]).
+/// None when either can't be read.
+fn pages_of(host: MachPort) -> Option<(kiln_ci::facts::VmPages, u64)> {
     let mut page: usize = 0;
     // SAFETY: an out pointer to one live `vm_size_t`.
     let sized = unsafe { host_page_size(host, &raw mut page) } == 0;
@@ -165,19 +165,20 @@ fn room_of(host: MachPort) -> Option<u64> {
     // `HOST_VM_INFO64_COUNT` is; the kernel writes no more than that.
     let r = unsafe { nix::libc::host_statistics64(host, nix::libc::HOST_VM_INFO64, (&raw mut v).cast(), &raw mut count) };
     let pages = kiln_ci::facts::VmPages { free: u64::from(v.free_count), active: u64::from(v.active_count), inactive: u64::from(v.inactive_count), compressor: u64::from(v.compressor_page_count) };
-    (r == 0).then(|| pages.room(page))
+    (r == 0).then_some((pages, page))
 }
 
-/// What this host can give new work now ([`room_of`]), for its facts ([`kiln_ci::facts::Mem`]).
-pub(crate) fn memory_room() -> Option<u64> {
+/// This host's pages and their size now ([`pages_of`]): what its facts ([`kiln_ci::facts::Mem`])
+/// and its headroom's guard read its room for new work from, as its sample does.
+pub(crate) fn memory_pages() -> Option<(kiln_ci::facts::VmPages, u64)> {
     // SAFETY: no arguments; it returns a send right to this host, released below.
     let host = unsafe { mach_host_self() };
-    let room = room_of(host);
+    let pages = pages_of(host);
     // SAFETY: the send right taken above, released once.
     unsafe {
         mach_port_deallocate(mach_task_self_, host);
     }
-    room
+    pages
 }
 
 pub struct Reader {
@@ -234,7 +235,7 @@ impl Reader {
             cpus: u32::try_from(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)).unwrap_or(1),
             mem_total: self.mem_total,
             // No room said while the host's pages can't be read: none is placed on a guess.
-            mem_available: room_of(self.host).unwrap_or(0),
+            mem_available: pages_of(self.host).map_or(0, |(pages, page)| pages.room(page)),
             space,
             memory_level: super::metrics::memory_level(),
             device: self.device.as_mut().and_then(super::sense_disk_macos::Device::counters),

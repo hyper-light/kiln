@@ -338,7 +338,7 @@ fn mem(total: u64, free: u64, limit: Option<u64>) -> Mem {
 /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32), none while its pages can't be read.
 #[cfg(target_os = "macos")]
 fn free_memory(_sys: &sysinfo::System) -> u64 {
-    crate::os::sense::memory_room().unwrap_or(0)
+    crate::os::sense::memory_pages().map_or(0, |(pages, page)| pages.room(page))
 }
 
 /// What the machine can give new work, as its system says (Linux's `MemAvailable`, Windows'
