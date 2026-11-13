@@ -6529,6 +6529,126 @@ for line in sys.stdin:
         })
     }
 
+    /// A stand-in session of `program` (an ACP agent, as `gemini`), with `env`.
+    #[cfg(unix)]
+    fn acp_stand_in(dir: &std::path::Path, program: &std::path::Path, env: Vec<(String, String)>) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<(String, Update)>)> {
+        let (sink, updates) = async_channel::unbounded();
+        let files = Files {
+            host: None,
+            dir: dir.to_owned(), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}),
+            carried: Arc::new(|_| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            settle: Arc::new(|_, _, _| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}),
+        };
+        let s = start(crate::util::new_id(), Spec {
+            kind: "gemini".into(), cwd: Some(dir.to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()),
+            reach: Some("off".into()), env,
+            ..Spec::default()
+        }, sink, Arc::new(|| {}), files)?;
+        Ok((s, updates))
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35 (R03: no chosen constants): a harness
+    /// that starts slowly but gets ready, then ends soon after, three times in a row, is started
+    /// again each time: each start got ready, which is progress. The fixed rule before it (ended
+    /// within 20 s of each of its last three starts) gave it up.
+    #[cfg(unix)]
+    #[test]
+    fn s35_a_harness_that_gets_ready_then_ends_soon_is_started_again_each_time() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let program = dir.path().join("acp.py");
+            let ends = dir.path().join("ends");
+            // Slow to start (half a second before it answers), ready once its session is open, and
+            // ended soon after, for its first three starts.
+            std::fs::write(&program, r##"#!/usr/bin/env python3
+import json, os, sys, time
+ends = os.environ["ACP_ENDS"]
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        time.sleep(0.5)
+        result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
+    elif method in ("session/new", "session/load"):
+        result = {"sessionId": "s1"} if method == "session/new" else {}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+    if method in ("session/new", "session/load"):
+        n = len(open(ends).read()) if os.path.exists(ends) else 0
+        if n < 3:
+            time.sleep(0.3)
+            with open(ends, "a") as f:
+                f.write(".")
+            sys.exit(1)
+"##)?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+            let (s, updates) = acp_stand_in(dir.path(), &program, vec![("ACP_ENDS".into(), ends.to_string_lossy().into_owned())])?;
+            let result = async {
+                loop {
+                    if let (_, Update::State { state }) = updates.recv().await? {
+                        // Given up on: no wait, and why (an end's first word, before kiln's rule
+                        // decides, has neither).
+                        if state.status == Status::Exited && let Some(x) = state.exit.as_ref().filter(|x| x.again_at.is_none() && x.error.is_some()) {
+                            anyhow::bail!("given up on after {} ends, though each start got ready: {:?}", std::fs::read_to_string(&ends).unwrap_or_default().len(), x.error);
+                        }
+                        if state.status == Status::Idle && std::fs::read_to_string(&ends).is_ok_and(|e| e.len() == 3) {
+                            break;
+                        }
+                    }
+                }
+                anyhow::Ok(())
+            }.await;
+            s.close();
+            while !matches!(updates.recv().await?, (_, Update::Closed)) {}
+            result
+        })
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35 (R03): a harness that ends before it is
+    /// ready, every time, is started again once (its first end proves nothing about the next), and
+    /// given up on once that start ends before ready too: no progress. It waits for a person, its
+    /// exit saying why in those words.
+    #[cfg(unix)]
+    #[test]
+    fn s35_a_harness_that_ends_before_ready_every_time_is_given_up_on_saying_why() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let program = dir.path().join("acp.py");
+            let launches = dir.path().join("launches");
+            // Ends before it answers anything, each start counted.
+            std::fs::write(&program, r##"#!/usr/bin/env python3
+import os, sys
+with open(os.environ["ACP_LAUNCHES"], "a") as f:
+    f.write(".")
+sys.exit(1)
+"##)?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+            let (s, updates) = acp_stand_in(dir.path(), &program, vec![("ACP_LAUNCHES".into(), launches.to_string_lossy().into_owned())])?;
+            let result = async {
+                let why = loop {
+                    // Given up on: no wait, and why (an end's first word, before kiln's rule
+                    // decides, has neither).
+                    if let (_, Update::State { state }) = updates.recv().await? && state.status == Status::Exited
+                        && let Some(why) = state.exit.as_ref().filter(|x| x.again_at.is_none()).and_then(|x| x.error.clone()) {
+                        break why;
+                    }
+                };
+                anyhow::ensure!(why.contains("before it was ready") && why.contains("stopped starting it again"), "its reason: {why:?}");
+                let n = std::fs::read_to_string(&launches)?.len();
+                anyhow::ensure!(n == 2, "started {n} times: its first start, and kiln's one start again");
+                anyhow::Ok(())
+            }.await;
+            s.close();
+            while !matches!(updates.recv().await?, (_, Update::Closed)) {}
+            result
+        })
+    }
+
     /// CP-T3.2: a move gathers what a session was sent and hasn't taken (carried while its harness
     /// was down, then still in its channel) into its queue, in the order it came, to go with it; it
     /// holds back everything else; and from then on the session takes no message (its inbox takes
