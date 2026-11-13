@@ -85,6 +85,29 @@ can progress.
   wait follows the runner until its facts come, then takes their yes or no. The 60 s took facts that
   hadn't come yet for a runner that says nothing of microVMs.
 
+## What a wait wakes on
+
+No wait looks on a period of its own (the 250 ms `POLL` it had): between looks it waits for kiln's own
+next change notification (`Wake`, R05).
+
+- **A session's waits** (`Pace::until`) read the session's own socket,
+  `GET /api/harness/sessions/{id}/ws`. That is the stream kiln's UI reads a session from, and every
+  update of the server's copy of the session (its events, state and meta, each frame carrying the
+  copy's revision: docs/wire.md, "Revisions") comes down it as it's made. Its snapshot (up to
+  `synced`) is what's there, not a change, and is read past as the socket opens.
+- **Waits on kiln's own work and the setup waits** (`Pace::unlisted`, `setup`) read kiln's events socket,
+  `GET /api/events`: the hub's events as they come (docs/wire.md, "The events socket"). A session's
+  end comes down it (`HarnessClosed`), and so do a runner's record on its connect and its loss
+  (`Hub::emit_agent`). Every connected runner's periodic host samples come too, so a change kiln
+  announces nowhere (a runner's facts, its headroom applied) is looked at by the next one.
+- A frame wakes the wait, and the frames that follow within as long as a look took are read with it:
+  looks never outrun kiln's answers. A read that waits is bounded only by what's left of the wait's
+  window (`Watch::left`), and has no bound before a first answer.
+- The socket is opened as it's first waited on, and again after it ended. That wait returns at once,
+  so a change made while it opened is looked at. An opening that fails pauses as long as it took.
+- What a look reads (kiln's word and the timeline over the API), the typed refusals and the evidence
+  are as before.
+
 ## Alternatives weighed
 
 - **A picked bound** (the 600 s and 60 s this replaces). R03 forbids it.
@@ -96,7 +119,7 @@ can progress.
 
 ## Owed
 
-- `POLL` (250 ms) is a probe's period, which bounds nothing. R05 prefers kiln's own change
-  notifications, the session's event stream, to periodic looks.
+- The stand-in's steered gap (`STEERED_GAP`, 2 s, what `POLL * 8` was) is its own pace, which no
+  wait reads: to be derived from a measured round trip through kiln.
 - ROOT's runs: five of `cargo test -p kiln --test vm_harnesses -- step35::host:: host::` under load on
   a Mac Studio, and the microVM drives.
