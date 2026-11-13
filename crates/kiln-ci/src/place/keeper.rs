@@ -217,6 +217,12 @@ impl Waits {
         self.slowest
     }
 
+    /// The slowest answer at least `took`: one the party gave on another wait of this process, the
+    /// slowest answer it has given anywhere in it being the bound.
+    pub fn slowest_at_least(&mut self, took: u64) {
+        self.slowest = Some(self.slowest.map_or(took, |s| s.max(took)));
+    }
+
     /// How many words wait for their answers.
     pub fn waiting(&self) -> usize {
         self.said.len()

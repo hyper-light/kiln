@@ -1677,35 +1677,87 @@ for line in sys.stdin:
         Ok((program, heard))
     }
 
-    /// Listen before checking both source state and durable receipts. The protocol deadline is
-    /// a hang bound; no timer retries a predicate or grants source capacity.
+    /// The slowest gap between a source's moves seen in this run, ms, plus one (none: no gap yet): the
+    /// bound a source wait holds a still source to, the party's slowest answer seen (no ×2: R03, the
+    /// person's word, 2026-11-13).
+    static SLOWEST_GAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Listen before checking both source state and durable receipts. No timer retries a predicate or
+    /// grants source capacity, and none cuts a wait short: it follows its source's liveness and
+    /// progress (`kiln_ci::place::keeper::Waits`, as the capacity keeper's waits do). Each move of the
+    /// source's feed or the mail tables is a fresh look, and times the gap since the move before it.
+    /// While the source owes kiln no answer of its own the wait follows its liveness alone, with no
+    /// clock bound: before its harness has answered kiln (said its version), as a harness starting on
+    /// a loaded machine can use no CPU time for longer than any gap seen (all 17 waits such a bound
+    /// refused in kiln run r512 had harnesses that hadn't answered, 22 to 64 µs of CPU time used); and
+    /// while it has no turn under way, as what it waits for then is kiln's next move (a step's goal
+    /// comes at the goal driver's next look, `crate::goals::TICK`: kiln run r622 refused one, its
+    /// source idle). While a turn is under way, a source that hasn't moved for a whole window of the
+    /// slowest gap between moves seen in this run is asked whether its process's CPU time moved in
+    /// that window: the window starts again if it did, and the wait is refused if it didn't, saying
+    /// what it saw. Its whole wait had a deadline of an inbox's answer (`registry::ANSWER_WAIT`,
+    /// 10 s), which a loaded machine's healthy source outran: 3 of 230 tests in one parallel run
+    /// beside goals:: on adas-mac-studio.local (kiln run r222, 2026-11-13).
     pub(crate) async fn source_until<F, Fut>(hub: &Hub, id: &str, what: &str, mut check: F) -> anyhow::Result<()>
     where F: FnMut() -> Fut, Fut: std::future::Future<Output = anyhow::Result<bool>> {
-        use futures::{FutureExt as _, future::{Either, select}};
+        use futures::FutureExt as _;
         use kiln_seams::Bus as _;
+        use std::sync::atomic::Ordering;
         let attached = hub.harness.attach(id).ok_or_else(|| anyhow::anyhow!("{what}: no source"))?;
         let mut at = attached.at.ok_or_else(|| anyhow::anyhow!("{what}: no source feed"))?;
         let committed = hub.store.changes().watch(crate::harness::mail::TABLES);
-        let operation = async {
+        let clock = crate::rt::clock();
+        let began = clock.now();
+        let ms = || i64::try_from(clock.now().saturating_duration_since(began).as_millis()).unwrap_or(i64::MAX);
+        // Whether it owes kiln an answer of its own (its harness answered kiln, a turn under way), and
+        // its process's CPU time so far.
+        let owes = || hub.harness.local.get(id).is_some_and(|s| {
+            let core = s.core.lock();
+            !core.meta.version.is_empty() && core.state.status == crate::harness::model::Status::Running
+        });
+        let cpu = || hub.harness.local.get(id).and_then(|s| *s.pid.lock()).and_then(|pid| crate::os::metrics::cpu_us_of(&[pid]));
+        let mut waits = kiln_ci::place::keeper::Waits::default();
+        waits.said(0);
+        let (mut moved, mut spent) = (None, cpu());
+        loop {
+            let revision = hub.store.changes().of(crate::harness::mail::TABLES);
+            if check().await? { return Ok(()); }
+            anyhow::ensure!(attached.viewer.refusals() == attached.refusals, "{what}: source feed lost");
+            let batch = hub.bus.read(&attached.topic, at, 1).await.map_err(|e| anyhow::anyhow!("{what}: {e:?}"))?;
+            at = batch.next;
+            if !batch.messages.is_empty() || revision != hub.store.changes().of(crate::harness::mail::TABLES) {
+                let now = ms();
+                (moved, spent) = (Some(now), cpu());
+                if let Some(gap) = waits.answered(now) {
+                    SLOWEST_GAP.fetch_max(gap.saturating_add(1), Ordering::Relaxed);
+                }
+                waits.said(now);
+                continue;
+            }
             loop {
-                let revision = hub.store.changes().of(crate::harness::mail::TABLES);
-                if check().await? { return Ok(()); }
-                anyhow::ensure!(attached.viewer.refusals() == attached.refusals, "{what}: source feed lost");
-                let batch = hub.bus.read(&attached.topic, at, 1).await.map_err(|e| anyhow::anyhow!("{what}: {e:?}"))?;
-                at = batch.next;
-                if !batch.messages.is_empty() || revision != hub.store.changes().of(crate::harness::mail::TABLES) { continue; }
+                if let Some(slowest) = SLOWEST_GAP.load(Ordering::Relaxed).checked_sub(1) {
+                    waits.slowest_at_least(slowest);
+                }
+                let still = waits.due().filter(|_| owes()).map(|due| clock.sleep(Duration::from_millis(u64::try_from(due.saturating_sub(ms())).unwrap_or(0))));
                 futures::select_biased! {
-                    result = hub.bus.wait(&attached.topic, at).fuse() => result.map_err(|e| anyhow::anyhow!("{what}: {e:?}"))?,
-                    () = committed.notified().fuse() => {},
+                    result = hub.bus.wait(&attached.topic, at).fuse() => {
+                        result.map_err(|e| anyhow::anyhow!("{what}: {e:?}"))?;
+                        break;
+                    }
+                    () = committed.notified().fuse() => break,
+                    () = async move { match still { Some(s) => s.await, None => std::future::pending().await } }.fuse() => {
+                        let now = cpu();
+                        if now.is_some() && now != spent {
+                            spent = now;
+                            waits.heard(ms());
+                            continue;
+                        }
+                        let state = hub.harness.info(id).map(|i| format!("{:?}", i.status)).unwrap_or_else(|| "gone".into());
+                        let last = moved.map_or_else(|| "hasn't moved since the wait began".to_owned(), |at| format!("last moved {at} ms into the wait and hasn't since"));
+                        anyhow::bail!("{what}: its source {last}, a whole window of the slowest gap between moves seen in this run ({} ms), its CPU time {now:?} µs as it was at the window's start; its state {state}", waits.slowest().unwrap_or(0));
+                    }
                 }
             }
-        };
-        let clock = crate::rt::clock();
-        let deadline = clock.sleep(crate::harness::registry::ANSWER_WAIT);
-        futures::pin_mut!(operation, deadline);
-        match select(operation, deadline).await {
-            Either::Left((result, _)) => result,
-            Either::Right(_) => anyhow::bail!("{what}: source protocol deadline"),
         }
     }
 
