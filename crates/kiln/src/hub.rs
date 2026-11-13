@@ -4664,6 +4664,14 @@ impl Hub {
         if !jobs.is_empty() {
             self.lost_instances.update(|l| l.insert(peer, (name.to_owned(), Instant::now(), jobs.clone())));
         }
+        // The process that outranked a drained one is gone (retired: its identity with it, above):
+        // the drained one is the machine's newest now, and takes work again once it connects anew,
+        // where the server says it isn't drained (W05-R04). Left as it was, it refused every run
+        // placed by what it can do until something else made it reconnect.
+        if let Some(p) = self.instances.update(|i| i.undrain_newest(name)) {
+            tracing::info!(agent = name, peer = p, "the runner process that outranked this machine's other one is gone: that one is its newest again and reconnects to take new work");
+            let _ = self.net.command(crate::net::Out::Disconnect { peer: p }).await;
+        }
         self.newest_changed(name).await;
     }
 

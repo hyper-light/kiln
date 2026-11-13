@@ -267,6 +267,22 @@ impl Instances {
         self.newest_of(name)
     }
 
+    /// Machine `name`'s newest instance, when it was told to take nothing new while another
+    /// outranked it and that one is gone (W05-R04: 2026-11-13, a stale older service that started
+    /// again outranked adacachy's runner, was retired, and left it drained, so no run needing
+    /// linux/amd64 placed): no longer drained here, its peer returned for the hub to have it take
+    /// work again. A runner lifts its drain only as it connects anew (`agent.rs`: the server says
+    /// drained or not on each connection).
+    pub fn undrain_newest(&mut self, name: &str) -> Option<PeerId> {
+        let p = self.newest_of(name)?;
+        let i = self.by_peer.get_mut(&p)?;
+        if !i.drained {
+            return None;
+        }
+        i.drained = false;
+        Some(p)
+    }
+
     /// What machine `name`'s newest runner process can do, in 64 bits: `Build`'s 32 and what it
     /// said past them; 0 when none is connected.
     pub fn newest_wide_caps(&self, name: &str) -> u64 {
@@ -542,6 +558,26 @@ mod tests {
         m.set_features(30, vec![crate::proto::feature::PLACE.into()]);
         assert!(!crate::handovers::native_to(&m, "box"), "to the rolled-back build: words");
         assert!(!crate::handovers::native_to(&m, "nobody"), "no such machine");
+    }
+
+    /// W05-R04, 2026-11-13: an older service that started again outranked the machine's runner,
+    /// which was drained; once that one is gone the drained one is the newest again and no longer
+    /// drained, once (the hub has it reconnect); a newest never drained isn't touched.
+    #[test]
+    fn w05_r04_a_drained_runner_takes_work_again_once_the_one_that_outranked_it_is_gone() {
+        let mut m = Instances::default();
+        m.announce(10, ih("0199-live", 100));
+        m.join(10, "box", hello("live"), 1);
+        assert_eq!(m.undrain_newest("box"), None, "never drained: nothing to lift");
+        m.announce(20, ih("0199-stale-service", 200));
+        let j = m.join(20, "box", hello("stale"), 2);
+        assert_eq!(j.drain, vec![10], "outranked: the live runner takes nothing new");
+        assert_eq!(m.undrain_newest("box"), None, "the one that outranks it is still here");
+        let _ = m.lost(20);
+        assert_eq!(m.newest("box"), Some(10));
+        assert_eq!(m.undrain_newest("box"), Some(10), "the newest again: no longer drained");
+        assert_eq!(m.undrain_newest("box"), None, "once");
+        assert_eq!(m.undrain_newest("nobody"), None);
     }
 
     #[test]
