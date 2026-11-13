@@ -139,6 +139,14 @@ pub trait Runtime: Send + Sync {
     /// plan steps 12 and 14, C1): counters since the VM booted, so a reader's window is between two of its reads.
     /// Refused, typed, for a part its run host didn't read, never read as none, for a box not running, and by a class
     /// whose boxes run no VM process of their own, naming the class.
+    /// Deletes box `id` as [`Runtime::delete`] does, answering what its VM cost its host over its whole run, read as its
+    /// run ended (goal 54's change 3: a Shards image VM's final [`HostUse`], its window the whole run): `None` where the
+    /// box has no VM process of its own, or where none could be read at its end (its run had ended before its delete, or
+    /// its last read failed). A box already gone is refused `NoSuchBox`, never answered with a use made up.
+    fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<HostUse>, Refusal> {
+        self.delete(id).map(|()| None)
+    }
+
     fn host_use(&self, id: &BoxId) -> Result<HostUse, Refusal> {
         Err(Refusal::Invalid {
             what: "host_use",
@@ -162,6 +170,9 @@ pub struct HostUse {
     pub resident_bytes: u64,
     /// Nanoseconds each vCPU has run the guest, by vCPU index, one for each vCPU of the VM's size.
     pub guest_ns: Vec<u64>,
+    /// The time these counters span: from the VM's run's start, as its boot answered, to this read (goal 54's change
+    /// 3: kiln learns the overhead a VM costs its host over its window, at usage and at its delete).
+    pub window: Duration,
 }
 
 /// CPU milli, memory bytes and writable-volume bytes; devices are not inferred from a pool.
@@ -348,6 +359,13 @@ pub struct BackingOffer {
     /// Exact administrator-provisioned claims. These IDs supply no model, memory or load facts.
     #[serde(deserialize_with = "deserialize_provisioning")]
     pub devices: Vec<crate::DeviceId>,
+    /// Its guest's own overhead as its runtime measured it (joint plan step 14, C7; ROOT, 2026-11-13): what its guest
+    /// agent says it uses past what its boxes hold, the most seen in each dimension, only rising, each none until the
+    /// backing's first capacity answer measures it (its cold start: its boxes' sum alone). Never the census's
+    /// `guest_overhead`, which a census-free cost carries as none. A shared backing's payload fits its envelope with it
+    /// ([`BackingOffer::check_inner`]). Absent from an older JSON report, read as cold.
+    #[serde(default, skip_serializing_if = "LearnedOverhead::cold")]
+    pub guest: LearnedOverhead,
 }
 impl BackingOffer {
     /// A workload's exact selection is separate from its source observer's full grant. This
@@ -377,13 +395,24 @@ impl BackingOffer {
             cost: self.cost,
             phase: self.phase,
             devices: copy_provisioning(&self.devices)?,
+            guest: self.guest,
         })
     }
 
     /// Aggregate inner reservations must fit the SAME fixed profile, including its kernel/relay
     /// and host allowances and quantization. A residual host debit alone is not guest admission.
+    /// With them, the guest's own overhead as its runtime measured it, in each dimension it has
+    /// measured (joint plan step 14, C7): cold, the boxes' sum alone.
     pub fn check_inner(&self, used: CapacityResources) -> Result<(), Refusal> {
         let granted = self.allocation()?;
+        let guest = CapacityResources {
+            cpu_milli: self.guest.cpu_milli.unwrap_or(0),
+            mem_bytes: self.guest.mem_bytes.unwrap_or(0),
+            disk_bytes: self.guest.disk_bytes.unwrap_or(0),
+        };
+        let used = used.checked_add(guest).ok_or_else(|| {
+            invalid_route("aggregate payload and the guest's own overhead overflow")
+        })?;
         if self.cost.allocate(used)? != granted {
             return Err(invalid_route(
                 "aggregate payload differs from its fixed backing grant",
@@ -746,6 +775,18 @@ fn invalid_cost(why: &'static str) -> Refusal {
 }
 
 impl RuntimeCost {
+    /// The profile as a node takes it (joint plan step 14; ROOT, 2026-11-13, by decision 9's rule: a census row is
+    /// evidence only, never a starting number): its envelope alone, the VMM overhead and guest allowance its census
+    /// measured left in its evidence, which its id still names. What a VM takes past its envelope is learned from its
+    /// windows (`docs/design/learned-charge.md` C1); what a guest's own takes, from its backing's (C7).
+    pub fn census_free(self) -> Self {
+        Self {
+            guest_overhead: CapacityResources::default(),
+            overhead: CapacityResources::default(),
+            ..self
+        }
+    }
+
     pub fn check(self) -> Result<(), Refusal> {
         if self.id == [0; 32]
             || !self.ceiling.holds(self.floor)
@@ -1852,6 +1893,16 @@ pub struct BoxInfo {
     /// inspect says it too. After `published`, so absent means none (append-only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_resort: Option<LearnedEnd>,
+    /// Why its run ended where it failed, in its runtime's words (joint plan step 12): a Shards image VM's whose VM, run
+    /// host or guest failed, or whose own command never started (Shards' D249), or whose boot was refused, its exit then
+    /// `Unknown`. Kept in its record, so a restarted node's inspect says it too. After `last_resort`, so absent means
+    /// none (append-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<String>,
+    /// Its credential grants as its record holds them (joint plan step 33, Shards' D242; docs/design/credential-grants.md
+    /// C4): a Shards image VM's, none for any other class. After `ended`, so absent means none (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<crate::CredentialGrant>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -1877,6 +1928,30 @@ pub struct Usage {
     /// the wire means `None` (append-only, CLAUDE.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest: Option<GuestTime>,
+    /// How a Shards image VM's microVM started (D253; joint plan step 12), as its run host said it as the run started,
+    /// which the box's record keeps too: `None` for a box with no Shards image run. Added after `guest`, so absent on
+    /// the wire means `None` (append-only, CLAUDE.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_from: Option<StartedFrom>,
+}
+
+/// How a Shards image VM's microVM started (D253), as its run host says it as the run starts: Shards' own five
+/// (shards-api's `image::StartedFrom`), so Hex can say how a box came up. The node's wire tags each by its place here,
+/// so append only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StartedFrom {
+    /// Booted, with no template to restore or save: a guest its node gave (`SHARDS_KERNEL`, `SHARDS_INIT`), or a host
+    /// whose hypervisor restores no snapshot.
+    Booted,
+    /// Booted, saving its image's template on the way, none being saved.
+    Saved,
+    /// Restored from its image's template.
+    Restored,
+    /// Booted, saving another, its image's template having failed to restore: that one removed.
+    Replaced,
+    /// A warm run host's, its microVM ready before its run asked (D253's pools).
+    Warm,
 }
 
 /// A microVM's guest time per vCPU, or what its backend awaits to read it.
@@ -1965,6 +2040,19 @@ pub enum Refusal {
     /// says nothing of any box's state.
     #[error("this needs {needs}, which the revision Hex builds against doesn't give yet")]
     Awaits { needs: Upstream },
+    /// Box `id`'s run failed (joint plan step 12): its command never started, or its VM, its host or its guest failed,
+    /// in its runtime's words, `why`, which its [`BoxInfo::ended`] keeps beside an `Unknown` exit. The workload never
+    /// ran, or stopped running for its machine's sake, where every other refusal is the call's or its infrastructure's.
+    /// A run that started and then ended, at once or not, is no failure: its exit says how it ended. After `Awaits`
+    /// (append-only).
+    #[error("box {id}'s run failed: {why}")]
+    Failed { id: BoxId, why: String },
+    /// What its node isn't configured to serve, `what`, and why it's needed (joint plan step 33): a Shards image VM's
+    /// credential grants on a node its orchestrator gave no lessors ([`crate::lease::Lessors`]), whose values it could
+    /// lease from no one. Its configuration's, not its platform's or its revision's: the same node given lessors serves
+    /// it. After `Failed` (append-only).
+    #[error("this node is configured with no {what}: {why}")]
+    Unconfigured { what: &'static str, why: String },
 }
 
 /// A capability another product owes Hex, named by what it does, never by a plan step (a plan's
@@ -2121,6 +2209,11 @@ pub enum LifecycleCause {
     Uncertain,
     #[error("another operation owns this box's lifecycle")]
     Busy,
+    /// Its backing was retired at its node's start (joint plan step 14; ROOT, 2026-11-13): recorded under a census
+    /// cost, its identity is no longer its node's profile's. A box on it keeps its record, ready, until its owner's
+    /// delete. Appended (wire append-only).
+    #[error("its backing's identity changed with decision 9's census-free cost")]
+    Retired,
 }
 
 /// Why a CONNECT handshake failed: the phase it failed in and what it saw.
@@ -2501,6 +2594,7 @@ mod route_tests {
         })
         .unwrap();
         let backing = serde_json::to_value(BackingOffer {
+            guest: Default::default(),
             key: BackingKey {
                 pool: [1; 32],
                 generation: [2; 16],
@@ -2559,6 +2653,7 @@ mod route_tests {
         let error = serde_json::from_value::<BackingGrant>(input.clone()).unwrap_err();
         assert!(error.to_string().contains("physical claim count"));
         let mut offer = serde_json::to_value(BackingOffer {
+            guest: Default::default(),
             key: grant.key,
             cost: cost(),
             phase: BackingPhase::Prepared,
@@ -2621,10 +2716,53 @@ mod route_tests {
             learned: None,
         }
     }
+    /// Joint plan step 14 (C7; ROOT, 2026-11-13): a shared backing's payload fits its envelope with the guest's own
+    /// overhead its runtime measured, never the census's (a census-free cost carries none); cold, its boxes' sum alone.
+    /// Do check boxes summing 0.5 CPU and 512 MiB against a backing of a 1 CPU, 1 MiB-quantum envelope of 1 GiB, cold;
+    /// with a guest measured at 0.25 CPU and 256 MiB; then at 0.25 CPU and 600 MiB. Expect the first two to fit and the
+    /// third, its memory past the envelope with the boxes', refused.
+    #[test]
+    fn w14_a_shared_backings_payload_fits_with_its_guests_measured_overhead() {
+        let envelope = CapacityResources {
+            cpu_milli: 1000,
+            mem_bytes: 1 << 30,
+            disk_bytes: 0,
+        };
+        let mut backing = BackingOffer {
+            guest: Default::default(),
+            key: BackingKey {
+                pool: [2; 32],
+                generation: [3; 16],
+            },
+            cost: RuntimeCost {
+                floor: envelope,
+                ceiling: envelope,
+                ..cost()
+            },
+            phase: BackingPhase::Live,
+            devices: Vec::new(),
+        };
+        let boxes = CapacityResources {
+            cpu_milli: 500,
+            mem_bytes: 512 << 20,
+            disk_bytes: 0,
+        };
+        backing.check_inner(boxes).unwrap();
+        backing.guest = LearnedOverhead {
+            cpu_milli: Some(250),
+            mem_bytes: Some(256 << 20),
+            disk_bytes: None,
+        };
+        backing.check_inner(boxes).unwrap();
+        backing.guest.mem_bytes = Some(600 << 20);
+        assert!(backing.check_inner(boxes).is_err());
+    }
+
     /// AC-T7.4.1: original OCI form can identify a real Linux guest on Mac and alongside Windows HCS.
     #[test]
     fn typed_oci_routes_preserve_workload_form_and_distinguish_platform_and_charge() {
         let backing = BackingOffer {
+            guest: Default::default(),
             key: BackingKey {
                 pool: [2; 32],
                 generation: [3; 16],
@@ -2809,6 +2947,7 @@ mod route_tests {
         assert!(c.validate_route(&spec).is_err());
         c.device_routes[0] = 1;
         let backing = BackingOffer {
+            guest: Default::default(),
             key: BackingKey {
                 pool: [2; 32],
                 generation: [3; 16],
@@ -2876,12 +3015,14 @@ mod route_tests {
         c.routes = vec![historical, fresh];
         c.backings = vec![
             BackingOffer {
+                guest: Default::default(),
                 key: parent,
                 cost: cost(),
                 phase: BackingPhase::Released,
                 devices: vec![crate::DeviceId { key: 7, ..id }, id],
             },
             BackingOffer {
+                guest: Default::default(),
                 key: current,
                 cost: cost(),
                 phase: BackingPhase::Live,
@@ -2974,6 +3115,7 @@ mod route_tests {
             }),
         });
         let mut backing = BackingOffer {
+            guest: Default::default(),
             key: BackingKey {
                 pool: [2; 32],
                 generation: [3; 16],

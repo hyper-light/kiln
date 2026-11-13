@@ -192,8 +192,9 @@ fn shards(_: &BoxId) -> Result<Option<Met>, Refusal> {
 /// Joint plan step 14 (AC-T7.4.1), C4 and C5 in the node: the placement's cgroup paths and weights. Do run a window
 /// of two cold Shards VMs, each booked at its whole 16-CPU, 8 GiB receipt, on a 32-CPU machine whose fleet budget is
 /// half of it, beside another node's fleet budgeted 8 CPUs; then a second window with nothing changed. Expect each
-/// VM's own cgroup's `memory.max` its create wrote lifted to the kernel's none, its `memory.swap.max` with it (ROOT,
-/// 2026-11-13: no chosen memory bound), then its weight by booking and its `memory.high` its budget, 32 GiB, half the
+/// VM's own cgroup's `memory.max` its create wrote lifted to the kernel's none, its `memory.swap.max` kept off so all
+/// it holds is RAM (ROOT, 2026-11-13: no chosen memory bound; HEX-RT-15), then its weight by booking and its
+/// `memory.high` its budget, 32 GiB, half the
 /// fleet's (its `cpu.max` left as its create wrote it, its ceiling); `.vm/node-a` capped at 16 CPUs and weighing half
 /// the machine; `.vm` weighing both fleets' 24 CPUs of 32; and the second window writing nothing.
 #[test]
@@ -218,11 +219,9 @@ fn w14_the_learner_places_each_vm_its_fleet_and_vm_by_path_and_weight() {
         io.take(),
         vec![
             vm("vm-1", "memory.max", "max"),
-            vm("vm-1", "memory.swap.max", "max"),
             vm("vm-1", "cpu.weight", "10000"),
             vm("vm-1", "memory.high", &(32 * GIB).to_string()),
             vm("vm-2", "memory.max", "max"),
-            vm("vm-2", "memory.swap.max", "max"),
             vm("vm-2", "cpu.weight", "10000"),
             vm("vm-2", "memory.high", &(32 * GIB).to_string()),
             (fleet(), "cpu.weight", "5000".to_owned()),
@@ -1088,6 +1087,8 @@ fn w14_a_last_resort_end_shows_in_inspect_and_survives_a_restart() {
         grants: Vec::new(),
         published: Vec::new(),
         last_resort: None,
+        ended: None,
+        credentials: Vec::new(),
     };
     with_last_resort(&mut info, &ended).unwrap();
     assert_eq!(info.last_resort.as_ref(), Some(&end));
@@ -1190,4 +1191,27 @@ fn w14_the_window_is_the_period_of_the_cpu_max_the_node_writes() {
         .parse()
         .unwrap();
     assert_eq!(Duration::from_micros(period), WINDOW);
+}
+
+/// Joint plan step 14 (AC-T7.4.1; ROOT, 2026-11-13: the starving case the done-when names): a running VM whose cgroup
+/// can't be read counts whole, at its receipt, against the fleet's budget until a read succeeds, its learner untouched,
+/// and the failure is told. Do run a window of two Shards VMs of 16-CPU, 8 GiB receipts in a 16-CPU, 64 GiB fleet
+/// budget, the second's cgroup unread. Expect the first's memory budget the fleet's 64 GiB less the second's 8 GiB
+/// receipt, and the second named among the unread.
+#[test]
+fn w14_a_vm_whose_cgroup_cant_be_read_counts_whole_against_the_budget() {
+    let io = Record::default();
+    io.dir(&fleet(), &[]);
+    let vms = running(&[("vm-1", 1), ("vm-2", 2)]);
+    io.set(&fleet().join("vm-1"), 0, GIB);
+    let mut learner = Learner::new(&fleet(), machine()).unwrap();
+    learner
+        .window(&io, vms, shards, &[], res(16_000, 64 * GIB), Instant::now())
+        .unwrap();
+    assert_eq!(
+        io.file(&fleet().join("vm-1"), "memory.high"),
+        Some((56 * GIB).to_string())
+    );
+    let unread: Vec<&str> = learner.unread().iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(unread, ["vm-2"]);
 }

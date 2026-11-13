@@ -30,14 +30,13 @@ use hex_core::patience::Patience;
 use hex_quic::capacity::Link;
 use hex_quic::enroll::store;
 use hex_quic::{CipherSuite, Config, Endpoint, PeerId, Refused, Shape};
-use hex_testkit::waits::within;
+use hex_testkit::waits::follow::{self, Party};
 
-// No census records a holder's words yet: each wait is measuring, for its fact alone (hex-testkit's rule), and a
-// keeper that is gone is told by the transport, its idle timeout (`hex_quic::limits`, three probe timeouts).
-/// A dial's answer: the handshake, taken or refused.
-static DIAL: Patience = Patience::measuring("test.hex_cli.capacity_view.dial");
-/// Room on the link for a word.
-static SAY: Patience = Patience::measuring("test.hex_cli.capacity_view.say");
+// The keeper's next word is waited for measuring, following the keeper by its life alone (decision 9): past the slowest
+// answer seen the wait goes on, and ends with the word or the link's end, which the transport tells once its idle
+// timeout passes (`hex_quic::limits`, three probe timeouts). A dial and a word said wait for their answers with no
+// deadline of the test's: the driver ends a dial nothing answers at that timeout too (RFC 9000 §10.1), and a word cut
+// at a slice's end would leave half a message on the link.
 /// The keeper's next word: an answer, or a hint.
 static HEAR: Patience = Patience::measuring("test.hex_cli.capacity_view.hear");
 
@@ -173,8 +172,7 @@ impl StandIn {
         let peer = match self.peer {
             Some(peer) => peer,
             None => {
-                let peer =
-                    within(&DIAL, |by| end.dial(&self.keeper, self.address, by)).map_err(Lost)?;
+                let peer = end.dial(&self.keeper, self.address, None).map_err(Lost)?;
                 let (suite, _) = end.negotiated(peer).map_err(Lost)?.unwrap();
                 assert_eq!(suite, CipherSuite::TLS13_AES_256_GCM_SHA384);
                 self.peer = Some(peer);
@@ -212,13 +210,23 @@ impl StandIn {
     }
 
     fn say(&mut self, msg: &ToKeeper) -> Result<(), Lost> {
-        let said = within(&SAY, |by| self.link.as_ref().unwrap().say(msg, by));
+        let said = self.link.as_ref().unwrap().say(msg, None);
         said.map_err(|why| self.lose(why))
     }
 
     /// The keeper's next word, checked and given to the core; what the core says back is said in turn. The events.
     fn hear_one(&mut self) -> Result<(ToHolder, Vec<Event>), Lost> {
-        let heard = within(&HEAR, |by| self.link.as_mut().unwrap().hear(by));
+        let link = self.link.as_mut().unwrap();
+        let heard = follow::within(
+            &HEAR,
+            "the keeper's next word",
+            || Party::Live,
+            |by| match link.hear(by) {
+                Err(Refused::Deadline { .. }) => None,
+                heard => Some(heard),
+            },
+        )
+        .unwrap();
         let msg = heard.map_err(|why| self.lose(why))?;
         if let Some(view) = view_of(&msg) {
             self.tally.views += 1;

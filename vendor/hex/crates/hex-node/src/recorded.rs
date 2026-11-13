@@ -256,6 +256,13 @@ pub trait Recover: Runtime {
     /// Joint plan step 14 (C1): the period a Shards image VM's rate holds over (Shards' D247, its hold D191's governor),
     /// the window the charge learner caps image VMs through their rates over. Refused, typed, while Shards' API says
     /// none (`Awaits(RatePeriod)`): the learner then books image VMs whole.
+    /// Joint plan step 14 (ROOT, 2026-11-13): retires what its node recorded under a profile's census cost (each
+    /// backing and VM box, its boxes kept retired), run once at its node's start after native initialization, before
+    /// any preparation or recovery uses them; none where it keeps no such record.
+    fn retire_census(&self) -> Result<(), Refusal> {
+        Ok(())
+    }
+
     fn image_rate_period(&self) -> Result<std::time::Duration, Refusal> {
         Err(Refusal::Awaits {
             needs: hex_api::Upstream::RatePeriod,
@@ -681,6 +688,14 @@ pub(crate) fn preflight_records(
             .any(|process| process.pid == 0)
         {
             return Err(uncertain(id));
+        }
+        // A retired box (joint plan step 14) runs nothing, holds no device and names no backing any more: its record is
+        // kept for its owner's delete alone.
+        if record.retired {
+            if let Some(scope) = record.native_scope {
+                scopes.push(*scope.bytes());
+            }
+            continue;
         }
         let backend = record.spec.backend_class()?;
         let shared = record.spec.route_execution() == Some(hex_api::Execution::ShardsShared);
@@ -1388,6 +1403,14 @@ impl<R: Recover> Recorded<R> {
         self.runtime.initialize_native()
     }
 
+    /// Joint plan step 14 (ROOT, 2026-11-13): retires, once its natives are up, every backing and VM box this node
+    /// recorded under a profile's census cost ([`Recover::retire_census`]), before its preparation and recovery: the
+    /// preflight passes them for it, and no exact check sees them after.
+    pub fn retire_census(&self) -> Result<(), Refusal> {
+        self.initialize_native()?;
+        self.runtime.retire_census()
+    }
+
     fn native_transaction(
         &self,
         owner: TransactionOwner<'_>,
@@ -1629,6 +1652,8 @@ mod projection_tests {
             allocation: None,
             route: None,
             last_resort: None,
+            ended: None,
+            credentials: Vec::new(),
         }
     }
 
@@ -1736,12 +1761,9 @@ impl<R: Recover> Recorded<R> {
                     "changing a recorded box's lifecycle",
                     "recorded lifecycle methods",
                     crate::store::TURNS,
-                    // try_take never waits. Zero expresses immediate overlap refusal, not a
-                    // timeout guess; the existing Turns owner records the method's actual hold.
-                    hex_core::patience::Patience::seeded(
-                        "recorded.lifecycle",
-                        std::time::Duration::ZERO,
-                    ),
+                    // try_take never waits: an overlap is refused at once, no timeout guessed; the existing
+                    // Turns owner records the method's actual hold.
+                    hex_core::patience::Patience::measuring("recorded.lifecycle"),
                 ),
                 abandoned: Abandoned::default(),
                 adopted: Mutex::new(BTreeSet::new()),
@@ -1782,6 +1804,10 @@ impl<R: Recover> Recorded<R> {
             // Without a readable class/identity this owner cannot choose a cleanup backend.
             // Retain the row and its claims rather than run native host cleanup by guesswork.
             let r = record.as_ref().map_err(|_| uncertain(id))?;
+            // A retired box ran nothing past its retirement and is kept for its owner's delete (joint plan step 14).
+            if r.retired {
+                continue;
+            }
             // T-T7.1.2: a box this node keeps the record of, written in an earlier boot of the host, ran
             // nothing that outlived that boot. A backend that keeps its own records proves its own.
             let earlier_boot =
@@ -2841,6 +2867,10 @@ impl Recover for hex_runtime::windows::WinRuntime {
 /// ended). Neither has host processes to end; a box recovery removes that the guest still holds is deleted
 /// there.
 impl<P: Recover> Recover for hex_runtime::guest::WithGuest<P> {
+    fn retire_census(&self) -> Result<(), Refusal> {
+        self.guest().retire_census()
+    }
+
     fn project_routes(
         &self,
         pools: &[PoolRecord],

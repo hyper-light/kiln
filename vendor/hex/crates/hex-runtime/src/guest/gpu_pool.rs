@@ -142,55 +142,148 @@ impl GuestRuntime {
             ) {
                 return Err(refused(key, LifecycleCause::Uncertain));
             }
-            let mut receipt = match pool::read(&definition.path)? {
-                Some(receipt) => receipt,
-                None if record.init.is_none() => {
-                    let mut original = PoolRecord::decode(&record.encode()?)?;
-                    original.phase = BackingPhase::Granted;
-                    original.exit = None;
-                    Receipt::retained(original, self.catalog_physical(&record.devices)?)?
-                }
-                None => return Err(refused(key, LifecycleCause::Uncertain)),
-            };
-            receipt.matches(&record)?;
-            let identity = match &receipt.phase {
-                Phase::Running(identity)
-                | Phase::Stopping(identity)
-                | Phase::Released {
-                    identity: Some(identity),
-                    ..
-                } => {
-                    managed::same_native(NativeRecord::Pool(&record), identity)?;
-                    Some(super::shared::copy_identity(identity)?)
-                }
-                Phase::Intent | Phase::Released { identity: None, .. } => None,
-            };
-            record.phase = BackingPhase::Draining;
-            transaction.put_pool(&record)?;
-            if let Some(identity) = &identity {
-                receipt.phase = Phase::Stopping(super::shared::copy_identity(identity)?);
-            }
-            pool::write(&definition.path, &receipt)?;
-            let terminal = managed::stop_scope(
-                transaction,
-                identity.as_ref(),
-                budget.remaining()?,
-                refused(key, LifecycleCause::Uncertain),
-            )?;
-            receipt.phase = Phase::Released {
-                identity,
-                status: terminal.status,
-            };
-            pool::write(&definition.path, &receipt)?;
-            transaction.finalize_managed(receipt.released_identity()?)?;
-            record.phase = BackingPhase::Released;
-            record.exit = Some(super::shared::exit_of(terminal.status));
-            transaction.put_pool(&record)?;
+            self.stop_gpu_scope(transaction, &mut record, &definition, &budget)?;
             record.offer()
         })?;
         reservation.previous.take();
         reservation.publish(None)?;
         Ok(offer)
+    }
+
+    /// Stops and releases dedicated GPU backing `record`'s scope through its receipt at `definition`'s path, in
+    /// `transaction` (its pool turn), within `budget`: drained, its scope stopped where its receipt names one, its
+    /// controller finalized, and its exit recorded, Released.
+    fn stop_gpu_scope(
+        &self,
+        transaction: &dyn Transaction,
+        record: &mut PoolRecord,
+        definition: &GpuBacking,
+        budget: &managed::Budget,
+    ) -> Result<(), Refusal> {
+        let key = record.key;
+        let mut receipt = match pool::read(&definition.path)? {
+            Some(receipt) => receipt,
+            None if record.init.is_none() => {
+                let mut original = PoolRecord::decode(&record.encode()?)?;
+                original.phase = BackingPhase::Granted;
+                original.exit = None;
+                Receipt::retained(original, self.catalog_physical(&record.devices)?)?
+            }
+            None => return Err(refused(key, LifecycleCause::Uncertain)),
+        };
+        receipt.matches(record)?;
+        let identity = match &receipt.phase {
+            Phase::Running(identity)
+            | Phase::Stopping(identity)
+            | Phase::Released {
+                identity: Some(identity),
+                ..
+            } => {
+                managed::same_native(NativeRecord::Pool(record), identity)?;
+                Some(super::shared::copy_identity(identity)?)
+            }
+            Phase::Intent | Phase::Released { identity: None, .. } => None,
+        };
+        record.phase = BackingPhase::Draining;
+        transaction.put_pool(record)?;
+        if let Some(identity) = &identity {
+            receipt.phase = Phase::Stopping(super::shared::copy_identity(identity)?);
+        }
+        pool::write(&definition.path, &receipt)?;
+        let terminal = managed::stop_scope(
+            transaction,
+            identity.as_ref(),
+            budget.remaining()?,
+            refused(key, LifecycleCause::Uncertain),
+        )?;
+        receipt.phase = Phase::Released {
+            identity,
+            status: terminal.status,
+        };
+        pool::write(&definition.path, &receipt)?;
+        transaction.finalize_managed(receipt.released_identity()?)?;
+        record.phase = BackingPhase::Released;
+        record.exit = Some(super::shared::exit_of(terminal.status));
+        transaction.put_pool(record)?;
+        Ok(())
+    }
+
+    /// Whether pool `record` is this runtime's dedicated GPU backing as its node recorded it under its profile's census
+    /// cost (joint plan step 14): its cost the profile's but for its census numbers, and its definition, recomputed
+    /// under that cost, naming its identity. That definition, where it is, for its retirement.
+    pub(super) fn census_gpu_backing(
+        &self,
+        record: &PoolRecord,
+    ) -> Result<Option<GpuBacking>, Refusal> {
+        let Some(current) = self.runtime_cost else {
+            return Ok(None);
+        };
+        if record.execution != hex_api::Execution::ShardsDedicated
+            || record.cost == current
+            || record.cost.census_free() != current
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .gpu_backing_definition_under(Some(&record.devices), record.cost)?
+            .filter(|definition| definition.pool == record.key.pool))
+    }
+
+    /// Retires each dedicated GPU backing its node recorded under its profile's census cost
+    /// ([`Self::census_gpu_backing`]), its consumers retired before it ([`GuestRuntime::retire_census`]): in its pool
+    /// turn its scope is stopped and released through its receipt as its release's is, that receipt removed, and its
+    /// record removed.
+    pub(super) fn retire_census_gpu_backings(&self) -> Result<(), Refusal> {
+        let books = self
+            .books
+            .get()
+            .ok_or_else(|| Refusal::Broken("guest has no initialized record authority".into()))?;
+        for record in self.authority()?.pool_records()? {
+            let Some(definition) = self.census_gpu_backing(&record)? else {
+                continue;
+            };
+            let key = record.key;
+            let budget = managed::Budget::new(self.first_dial_bound()?)?;
+            let keys = self.turn_keys(&definition.devices)?;
+            let mut reservation =
+                self.reserve_owner(OwnerRef::Pool(&key.pool), Operation::Stopping)?;
+            devices::with_pool_transaction(books, &key, &keys, |transaction| {
+                let mut record = transaction
+                    .read_pool(&key)?
+                    .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+                match record.phase {
+                    BackingPhase::Released => {
+                        if let Some(receipt) = pool::read(&definition.path)? {
+                            receipt.matches(&record)?;
+                            transaction.finalize_managed(receipt.released_identity()?)?;
+                        }
+                    }
+                    BackingPhase::Prepared => {
+                        if reservation.previous.is_some()
+                            || pool::read(&definition.path)?.is_some()
+                            || record.allocation.is_some()
+                            || record.init.is_some()
+                            || record.exit.is_some()
+                        {
+                            return Err(refused(key, LifecycleCause::Uncertain));
+                        }
+                        transaction.check_unsubmitted_pool()?;
+                        record.phase = BackingPhase::Released;
+                        transaction.put_pool(&record)?;
+                    }
+                    BackingPhase::Granted | BackingPhase::Live | BackingPhase::Draining => {
+                        self.stop_gpu_scope(transaction, &mut record, &definition, &budget)?;
+                    }
+                }
+                if pool::read(&definition.path)?.is_some() {
+                    super::held::remove(&definition.path)?;
+                }
+                transaction.remove_pool(&key)
+            })?;
+            reservation.previous.take();
+            reservation.publish(None)?;
+        }
+        Ok(())
     }
 
     pub(super) fn stop_gpu_for_handoff(

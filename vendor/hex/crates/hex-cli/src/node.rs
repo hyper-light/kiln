@@ -672,6 +672,8 @@ fn host(args: &Args) -> Result<Hosted, (u8, String)> {
             let node =
                 Arc::new(Recorded::open_with_prober(routed, &args.state, prober).map_err(failed)?);
             node.bind_guest_books().map_err(failed)?;
+            // Joint plan step 14: what this node recorded under a census cost is retired first.
+            node.retire_census().map_err(failed)?;
             // AC-T7.4.1: the wrapper validates ALL retained owners before publishing
             // Prepared. Fresh GPU observation waits for its real Index/native grant.
             node.prepare_guest_backing()
@@ -791,6 +793,8 @@ fn host(args: &Args) -> Result<Hosted, (u8, String)> {
             let node =
                 Arc::new(Recorded::open_with_prober(routed, &args.state, prober).map_err(failed)?);
             node.bind_guest_books().map_err(failed)?;
+            // Joint plan step 14: what this node recorded under a census cost is retired first.
+            node.retire_census().map_err(failed)?;
             // AC-T7.4.1: the wrapper validates ALL retained owners before publishing
             // Prepared. Fresh GPU observation waits for its real Index/native grant.
             node.prepare_guest_backing()
@@ -876,15 +880,16 @@ fn configured_guest(
     })?;
     // The Shards class on Agentfile images (joint plan step 12): Shards' image boot, which every host runs, or
     // the refusal naming this node's SHARDS_KERNEL and SHARDS_INIT where its run hosts couldn't take them as a
-    // pair, read here once; and its waits seeded from their records, or the refusal naming the record to take.
-    // A create of the class says either.
+    // pair, read here once, which a create of the class then says; its waits learned from their own answers
+    // (decision 9: no record is read).
     let mut guest = GuestRuntime::new(Arc::new(provider), config)
         .recorded_at(backend_path(state, "@guest").map_err(failed)?)
         .with_runtime_paths(paths)
         .with_gpu_catalog(catalog)
         .with_images(
             hex_runtime::guest::host_images(),
-            hex_runtime::guest::ImageWaits::recorded(),
+            Ok(hex_runtime::guest::ImageWaits::new()),
+            backend_path(state, "image-diagnostics").map_err(failed)?,
         )
         .with_runtime_cost(cost)
         .map_err(failed)?;

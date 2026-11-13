@@ -14,6 +14,7 @@ use hex_api::Upstream;
 use crate::model::Class;
 
 pub mod sim;
+pub mod trace;
 pub mod trial;
 
 /// The fewest windows whose nearest-rank p99.9 is an observed sample rather than their maximum: decision 9's

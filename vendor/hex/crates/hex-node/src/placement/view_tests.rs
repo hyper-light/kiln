@@ -409,17 +409,28 @@ fn a_holder_reaches_the_nodes_keeper_over_quic() {
     use hex_core::patience::Patience;
     use hex_quic::capacity::{CAPACITY_PORT, Link, Server};
     use hex_quic::enroll::{self, sim::SimCa};
-    use hex_quic::{Config, Endpoint, Shape};
-    use hex_testkit::waits::within;
+    use hex_quic::{Config, Endpoint, Refused, Shape};
+    use hex_testkit::waits::follow::{self, Party};
 
-    // Each wait over loopback is for its own fact, named for it. No census over QUIC has recorded one yet, so each
-    // measures, for the fact alone, its answers recorded for the census that will seed it (hex-testkit's rule).
-    /// A dial's answer: its handshake and the node's Welcome.
-    static DIAL: Patience = Patience::measuring("test.hex_node.capacity.dial");
-    /// Room on the keeper's port for what the holder says: the keeper's grants.
-    static SAY: Patience = Patience::measuring("test.hex_node.capacity.say");
+    // The keeper's next word over loopback is waited for following the keeper by its life alone (decision 9): past the
+    // slowest answer seen the wait goes on, and ends with the word or the link's end, which the read says itself. The
+    // dial and each write wait for their answers with no deadline of the test's: the driver ends a dial nothing answers
+    // once QUIC's idle timeout passes (RFC 9000 §10.1), and a write cut at a slice's end would leave half a message.
     /// The keeper's next word to the holder: its answer to what it said, or a hint.
     static HEAR: Patience = Patience::measuring("test.hex_node.capacity.hear");
+    let heard = |link: &mut Link| {
+        follow::within(
+            &HEAR,
+            "the keeper's next word",
+            || Party::Live,
+            |by| match link.hear(by) {
+                Err(Refused::Deadline { .. }) => None,
+                heard => Some(heard),
+            },
+        )
+        .unwrap()
+        .unwrap()
+    };
 
     let dir = tempfile::tempdir().unwrap();
     let runtime: Arc<dyn Runtime> = Arc::new(hex_api::sim::SimRuntime::default());
@@ -477,19 +488,18 @@ fn a_holder_reaches_the_nodes_keeper_over_quic() {
         },
     })
     .unwrap();
-    let peer = within(&DIAL, |by| {
-        kiln_end.dial("node.capacity.test", node.local_addr(), by)
-    })
-    .unwrap();
+    let peer = kiln_end
+        .dial("node.capacity.test", node.local_addr(), None)
+        .unwrap();
     let mut link = Link::open(&kiln_end, peer).unwrap();
     let mut kiln = Holder::start("kiln.capacity.test".into(), 1, 4, &[]).unwrap();
     let mut said = VecDeque::from(vec![kiln.connect().unwrap()]);
     let mut events = Vec::new();
     let mut converse = |link: &mut Link, kiln: &mut Holder, said: &mut VecDeque<ToKeeper>| {
         while let Some(msg) = said.pop_front() {
-            within(&SAY, |by| link.say(&msg, by)).unwrap();
+            link.say(&msg, None).unwrap();
             let mut out = Out::default();
-            kiln.hear(within(&HEAR, |by| link.hear(by)).unwrap(), &mut out);
+            kiln.hear(heard(link), &mut out);
             said.extend(out.send);
             events.extend(out.events);
         }
@@ -509,7 +519,7 @@ fn a_holder_reaches_the_nodes_keeper_over_quic() {
     let (_, step) = driver.submit(d, p).unwrap();
     assert!(started(&quiesce(&driver, step)));
     server.hint().unwrap();
-    let ToHolder::Hint { view, .. } = within(&HEAR, |by| link.hear(by)).unwrap() else {
+    let ToHolder::Hint { view, .. } = heard(&mut link) else {
         panic!("no hint");
     };
     assert_eq!((view.room.cpu_milli, view.held.cpu_milli), (4000, 4000));

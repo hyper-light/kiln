@@ -67,6 +67,11 @@ fn a_node_starting_under_a_low_descriptor_limit_holds_its_own_or_refuses_typed()
             assert!(status.success(), "the delegated re-run failed ({direct})");
             return;
         }
+        // HEX_DELEGATED promised this binary a cgroup delegated to it: a preparation that fails there fails the test,
+        // never a skip that would hide the breakage.
+        Err(direct) if std::env::var_os("HEX_DELEGATED").is_some() => {
+            panic!("its cgroup isn't delegated to it ({direct})")
+        }
         Err(direct) => {
             hex_testkit::skip(
                 TEST,
@@ -213,7 +218,12 @@ fn runs_past_the_budget_are_refused(node: &Node, hard: u64) {
     for (id, proc) in ran {
         let _ = node.signal(&id, Signal::KILL);
         drop(proc);
-        node.delete(&id).expect("deleting a run's box");
+        // A run's box goes once its program ends (decision 7): the delete removes it, waits for that removal and
+        // answers as it went, or finds it gone already.
+        match node.delete(&id) {
+            Ok(()) | Err(Refusal::NoSuchBox(_)) => {}
+            Err(e) => panic!("deleting a run's box: {e:?}"),
+        }
     }
     assert!(
         matches!(&refused, Refusal::Exhausted { bound, .. } if *bound == budget),
@@ -234,32 +244,21 @@ fn have_systemd() -> bool {
         .unwrap_or(false)
 }
 
-/// This process's cgroup directory under /sys/fs/cgroup.
-fn own_cgroup() -> PathBuf {
-    let own = std::fs::read_to_string("/proc/self/cgroup").expect("/proc/self/cgroup");
-    let rel = own
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .expect("a 0:: cgroup line")
-        .trim_start_matches('/');
-    PathBuf::from("/sys/fs/cgroup").join(rel)
-}
-
-/// Moves this process into a leaf of its own cgroup and confirms the cgroup can hand every controller down (a box root
-/// opens with all of them). Returns the own cgroup dir; `Err` when the cgroup isn't ours to subdivide.
+/// This process's own cgroup, delegated to it and prepared once for every test in this binary
+/// (`hex_testkit::cgroup::delegated`: the process and every process of its own moved into a leaf), or why it isn't
+/// ours to subdivide. The probe root's opening proves every controller a box uses is delegated here: `BoxRoot::open`
+/// refuses by name otherwise (HEX-INST-1).
 fn prepare_cgroup(disk: &Path) -> Result<PathBuf, String> {
-    let own = own_cgroup();
-    let leaf = own.join("hex-agent");
-    std::fs::create_dir_all(&leaf).map_err(|e| format!("making a leaf for the agent: {e}"))?;
-    std::fs::write(leaf.join("cgroup.procs"), format!("{}", std::process::id()))
-        .map_err(|e| format!("moving self into a leaf: {e}"))?;
-    hex_runtime::linux::cgroup::BoxRoot::open(
-        &own.join("hex-probe"),
-        hex_runtime::linux::disks::under(disk).unwrap_or_default(),
-    )
-    .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_dir(own.join("hex-probe"));
-    Ok(own)
+    hex_testkit::cgroup::delegated(|own| {
+        let probe = hex_runtime::linux::cgroup::BoxRoot::open(
+            &own.join("hex-probe"),
+            hex_runtime::linux::disks::under(disk).unwrap_or_default(),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+        let _ = std::fs::remove_dir(own.join("hex-probe"));
+        probe
+    })
 }
 
 fn cache_dir() -> PathBuf {

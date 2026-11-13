@@ -25,13 +25,11 @@ use shards_api::{
     prepare_boot,
 };
 
-// One managed attempt's bound, as the node gives `managed::Budget` (`first_dial_bound`): twice the
-// guest's recorded boot to ready. Each wait is for a fact the attempt makes within itself, its observer's
-// entry or its end once published, and returns at that event.
+// One managed attempt's bound, as the node gives `managed::Budget` before any boot (`first_dial_bound`): the
+// guest's recorded boot to ready (decision 9: no margin). Each wait is for a fact the attempt makes within itself, its
+// observer's entry or its end once published, and returns at that event.
 fn guard() -> Duration {
-    hex_runtime::guest::recorded_boot()
-        .unwrap()
-        .saturating_mul(hex_core::patience::TIMES_SLOWEST)
+    hex_runtime::guest::recorded_dial_bound().unwrap()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

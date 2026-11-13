@@ -2,14 +2,14 @@ Subject: Hex builds on kiln's Shards and hyper-raft
 Why: kiln holds one copy of each project (docs/vendoring.md), and Hex pins an older hyper-raft (0856e05) with changes of its own. Its pin moves to kiln's (fb74b595), and its records of hyper-raft's changes are kiln's (Hex's suite reading among them, kiln's 0005; its qlog and buffer-growth changes left for Hex and kiln to agree). Its Shards pin is kiln's own (e82b9403) since Hex's steps 4 and 12 (daa36e99), which took Shards' API there too, so this change's Shards part dropped out as upstream's own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16).
 
 diff --git a/vendor/MANIFEST.toml b/vendor/MANIFEST.toml
-index 898176a0ff02a9205a76059db01ac933ef2a4464..5d8ea177615b52aad8fe50f968860069256a0ddd 100644
+index 52697a37a5fa576c0df842ec7ed65744cd231ede..ff20ca5c4170645f741a4791e7dc5b28408cbb9b 100644
 --- a/vendor/MANIFEST.toml
 +++ b/vendor/MANIFEST.toml
 @@ -33,7 +33,7 @@ own = ["UPSTREAM.md"]
  [projects.hyper-raft]
  kind = "git"
  repository = "https://github.com/hyper-light/hyper-raft"
--commit = "0856e05df3d136f0870a98808113294a73399206"
+-commit = "045cf3ff82e1d96d1f8c339d6e644d17afc998a3"
 +commit = "fb74b59533908472ade7e526eb08117601cede0e"
  path = "vendor/hyper-raft"
  take = [
@@ -96,7 +96,7 @@ index 0000000000000000000000000000000000000000..d1c272e19aa8dc358f646391a5ed4a14
 + pub use replica::{
 diff --git a/vendor/patches/hyper-raft/0002-hyper-transport-says-which-suite-and-group-a-connection.patch b/vendor/patches/hyper-raft/0002-hyper-transport-says-which-suite-and-group-a-connection.patch
 deleted file mode 100644
-index 0e8390c887eaec5220d0cee3418548aa6ffbe0e9..0000000000000000000000000000000000000000
+index 10af7d7aa2cbdc81dc2df53c415b4106624fefd7..0000000000000000000000000000000000000000
 --- a/vendor/patches/hyper-raft/0002-hyper-transport-says-which-suite-and-group-a-connection.patch
 +++ /dev/null
 @@ -1,37 +0,0 @@
@@ -104,10 +104,10 @@ index 0e8390c887eaec5220d0cee3418548aa6ffbe0e9..00000000000000000000000000000000
 -Why: Every link of the joint kiln, Hex and Shards plan takes TLS13_AES_256_GCM_SHA384 alone, and a test at each end of a connection asserts the suite it negotiated (Ada, 2026-11-11: "all such communications should be AESGCM256 bidirectional encrypted"); hyper-transport holds each connection's TLS session and gave no way to read it. Endpoint::negotiated reads it from hyper-quic's handshake data, as kiln's reach links read theirs from rustls.
 -
 -diff --git a/crates/hyper-transport/src/endpoint.rs b/crates/hyper-transport/src/endpoint.rs
--index 02865bb3a70485fbf765830109fce73cf016651d..2cab7925d53964cb99f03b8ce63261ecce9e059c 100644
+-index 0b3d6d8507b01a352e2fe19f93ff8c46f292a148..9760487f2c1222be65990fa569b66b57a2bd6466 100644
 ---- a/crates/hyper-transport/src/endpoint.rs
 -+++ b/crates/hyper-transport/src/endpoint.rs
--@@ -1768,6 +1768,29 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C,
+-@@ -1787,6 +1787,29 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C,
 -         Ok(conn.epoch)
 -     }
 - 

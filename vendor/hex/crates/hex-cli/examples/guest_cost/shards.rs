@@ -142,16 +142,12 @@ impl Places {
     }
 }
 
-/// A killed VMM's cgroup to `populated 0`: a killed box's emptying, the node's `node.emptying` record, seeded as the
-/// node seeds it (bench/competitive/probes/waits_census.md: release, run 4's largest max of the release arms, 19.771 ms,
-/// adacachy2's tmpfs arm of 17,569; debug, run 5's largest answer of the debug-build arms, 904.705 ms, the suites' of
-/// 14,977, hex_testkit::waits::EMPTYING) and learned from this run's own kills (decision 9).
+/// A killed VMM's cgroup to `populated 0`: a killed box's emptying, waited for as the tests wait for one, from the
+/// `node.emptying` census row's record (`hex_testkit::waits::EMPTYING`, test-only `Patience::seeded`; the node itself
+/// reads no record and follows the kill, decision 9), and learned from this run's own kills.
 #[cfg(target_os = "linux")]
-static EMPTYING: hex_core::patience::Patience = hex_core::patience::Patience::by_profile(
-    "node.emptying",
-    Duration::from_nanos(19_770_961),
-    Some(hex_testkit::waits::EMPTYING),
-);
+static EMPTYING: hex_core::patience::Patience =
+    hex_core::patience::Patience::seeded("node.emptying", hex_testkit::waits::EMPTYING);
 
 #[cfg(target_os = "linux")]
 impl Place {
@@ -378,7 +374,7 @@ impl Driver for Shards {
         Ok(Patience {
             bound: hex_runtime::guest::recorded_dial_bound().map_err(|e| e.to_string())?,
             source: format!(
-                "the guest's recorded first dial bound, twice boot_ready of {} in bench/native/guest/records.tsv (hex_runtime::guest::recorded_dial_bound)",
+                "the guest's recorded first dial bound, boot_ready of {} in bench/native/guest/records.tsv with no margin (hex_runtime::guest::recorded_dial_bound, decision 9)",
                 hex_runtime::guest::CLASS
             ),
         })

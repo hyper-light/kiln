@@ -8,7 +8,7 @@
 //!
 //! The policy — how many seeds a node keeps ([`hex_core::seeds::Seeds::growing`], up to the node's bound,
 //! [`crate::sizes::Sizes::seeds`]), which one each create is
-//! handed, how long a create waits, when a seed is taken for dead or hung and restarted, and what it
+//! handed, how long a create waits, when a seed is taken for dead and restarted, and what it
 //! counts — is the pure core's; this shell holds it behind one lock (no core call waits), and does each
 //! create's socket round-trip with the lock let go, so creates to different seeds run at once. The core's
 //! clock is the shell's monotonic time since the pool opened.
@@ -21,10 +21,12 @@
 //! to start, while the thread adds more, up to the bound.
 //!
 //! Bounds (CLAUDE.md §2), each a typed refusal past it: at most [`hex_core::seeds::Limits::seeds`] seeds
-//! up or starting, [`Limits::waiting`] creates in line, a wait learned from the line's waits, and a seed
-//! killed past the hang bound learned from its answers: the shell's wait for a seed's answer ends where the
-//! core takes the seed for hung. A seed that dies, or a round trip that breaks, refuses its create by type
-//! and leaves its slot, which the thread starts again, counted.
+//! up or starting, [`Limits::waiting`] creates in line, a wait learned from the line's waits, and the hang
+//! bound learned from the seeds' answers. Each is a bound only while answers come within it (decision 9, the
+//! person's ruling of 2026-11-13): past the hang bound the shell's wait for a seed's answer tells the core its
+//! run-out and follows the seed by its life, its pidfd, until it answers or ends; a seed is never killed as
+//! hung. A seed that dies, or a round trip that breaks, refuses its create by type and leaves its slot, which
+//! the thread starts again, counted.
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
@@ -87,9 +89,6 @@ pub struct CreatePool {
 }
 
 struct Shared {
-    /// The most seeds a create is tried on before it is refused: the pool's bound, each try past the first
-    /// having retired a seed taken for hung.
-    retries: usize,
     /// The `hex` binary re-exec'd as `hex __oci-seed`.
     exe: PathBuf,
     /// Where the create seeds work (goal 5 plan step 2): the node's one pruned mount namespace, made as the pool
@@ -107,8 +106,8 @@ struct Shared {
     inner: Mutex<Inner>,
     /// A create in line waits on it; a seed handed to one, a refusal of one, and shutdown wake it.
     free: Condvar,
-    /// The starting thread waits on it; a create that leaves it a seed to start, a seed's death or hang,
-    /// and shutdown wake it.
+    /// The starting thread waits on it; a create that leaves it a seed to start, a seed's death, and
+    /// shutdown wake it.
     wake: Condvar,
     /// Creates on the classic root path, counted by reason ([`ClassicReason`], a fixed set, so no
     /// high-cardinality label): through the shim when a pruned seed couldn't serve them or they join a
@@ -122,11 +121,10 @@ struct Shared {
     /// the way their mount namespace was made as the seed answered ([`MountNamespace::code`]'s index).
     /// Zero on a rootless node, whose seeds don't prune. Each stops at `u64::MAX`.
     made: [AtomicU64; 3],
-    /// Claims of a parked init that failed, by why: it didn't answer within the hang bound, or it refused or broke.
-    /// Each falls back to a seed's clone (the runtime's request, which the claim only borrowed, goes to
-    /// [`CloneInit::clone_init`]), so these say how often a parked init cost its create a clone. Each stops at
-    /// `u64::MAX`.
-    claims_failed: [AtomicU64; 2],
+    /// Claims of a parked init that failed: it refused, or broke or ended before its first word. Each falls back to a
+    /// seed's clone (the runtime's request, which the claim only borrowed, goes to [`CloneInit::clone_init`]), so this
+    /// says how often a parked init cost its create a clone. Stops at `u64::MAX`.
+    claims_failed: AtomicU64,
     /// The wakes sent the starting thread and the line, for the tests.
     #[cfg(test)]
     woke: [AtomicU64; 2],
@@ -187,9 +185,8 @@ impl CreatePool {
         )
     }
 
-    /// A pool with `limits`, every slot from the start, its waits seeded from the seeds' own record for this build, as
-    /// a node's are (decision 9, by build profile): a test's wait for a seed takes the record of the seeds' answers,
-    /// never another fact's.
+    /// A pool with `limits`, every slot from the start, its waits following its seeds until their first answers, as a
+    /// node's do (decision 9: no record is read).
     #[cfg(test)]
     pub fn with_limits(
         exe: PathBuf,
@@ -231,7 +228,6 @@ impl CreatePool {
         };
         let slots = limits.seeds.get();
         let shared = Arc::new(Shared {
-            retries: slots,
             exe,
             root,
             #[cfg(debug_assertions)]
@@ -249,7 +245,7 @@ impl CreatePool {
             classic: std::array::from_fn(|_| AtomicU64::new(0)),
             mount_namespace,
             made: std::array::from_fn(|_| AtomicU64::new(0)),
-            claims_failed: std::array::from_fn(|_| AtomicU64::new(0)),
+            claims_failed: AtomicU64::new(0),
             #[cfg(test)]
             woke: [AtomicU64::new(0), AtomicU64::new(0)],
         });
@@ -313,15 +309,10 @@ impl CreatePool {
         Ok((inner.seeds.slots(), inner.spare.size()))
     }
 
-    /// Claims of a parked init that failed and fell back to a seed's clone, by why: (hung, refused or broken).
-    pub fn claims_failed(&self) -> (u64, u64) {
-        let at = |i: usize| {
-            self.shared
-                .claims_failed
-                .get(i)
-                .map_or(0, |c| c.load(Ordering::Relaxed))
-        };
-        (at(0), at(1))
+    /// Claims of a parked init that failed and fell back to a seed's clone: it refused, or broke or ended before its
+    /// first word.
+    pub fn claims_failed(&self) -> u64 {
+        self.shared.claims_failed.load(Ordering::Relaxed)
     }
 
     pub fn counts(&self) -> Result<Counts, Refusal> {
@@ -350,22 +341,30 @@ impl CloneInit for CreatePool {
         let shared = &self.shared;
         let pruned = req.pruned.is_some();
         let (create, fds) = message(&req);
-        // A seed past its hang bound is retired, counted, and the create goes to another seed (the lead's rule of
-        // 2026-11-06: no caller failure where an alternative exists), at most once a slot.
-        let mut tries = 0usize;
-        loop {
-            tries = tries.saturating_add(1);
-            match self.try_seed(&create, &fds, pruned) {
-                Err(Trip::Hung(e)) => {
-                    // The hung seed is killed and reaped, so its clone either made the init in the box's cgroup or
-                    // never will: with the cgroup empty nothing of this create was made, and another seed may make
-                    // it; otherwise it is refused, by type.
-                    if tries >= shared.retries || req.cgroup.populated().unwrap_or(true) {
-                        return Err(e);
-                    }
+        let (id, proc, patience) = shared.acquire()?;
+        // The seed's answer is waited for within the hang bound, and past it by the seed's life (decision 9): the
+        // create ends at the seed's word or its end, never at the bound.
+        match round_trip(&proc, &create, &fds, patience, || shared.past_hang()) {
+            Ok((pid, pidfd, made)) => {
+                if pruned && let Some(count) = shared.made.get(usize::from(made.code())) {
+                    let _ = count.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        Some(n.saturating_add(1))
+                    });
                 }
-                Err(Trip::Refused(e) | Trip::Broken(e)) => return Err(e),
-                Ok(started) => return Ok(started),
+                shared.done(id, proc);
+                Ok((pid, pidfd))
+            }
+            // The seed refused by type (a bad request, or a container it can't make) and is whole: back
+            // to the pool, the refusal to the caller.
+            Err(Trip::Refused(e)) => {
+                shared.done(id, proc);
+                Err(e)
+            }
+            // The seed is unusable (its socket broke, it says its own machinery failed, or it ended before it
+            // answered): end it, free its slot for a restart, refuse this create.
+            Err(Trip::Broken(e)) => {
+                shared.died(id, proc);
+                Err(e)
             }
         }
     }
@@ -381,47 +380,6 @@ impl CloneInit for CreatePool {
 }
 
 impl CreatePool {
-    /// One try of a create on a seed the pool hands it: the init's pid and pidfd, or why not, the seed given
-    /// back, ended or retired as its answer says.
-    fn try_seed(
-        &self,
-        create: &Create,
-        fds: &[BorrowedFd<'_>],
-        pruned: bool,
-    ) -> Result<(i32, OwnedFd), Trip> {
-        let shared = &self.shared;
-        let (id, proc, patience) = shared.acquire().map_err(Trip::Refused)?;
-        match round_trip(proc.socket.as_fd(), create, fds, patience) {
-            Ok((pid, pidfd, made)) => {
-                if pruned && let Some(count) = shared.made.get(usize::from(made.code())) {
-                    let _ = count.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        Some(n.saturating_add(1))
-                    });
-                }
-                let started = (pid, pidfd);
-                shared.done(id, proc);
-                Ok(started)
-            }
-            // The seed refused by type (a bad request, or a container it can't make) and is whole: back
-            // to the pool, the refusal to the caller.
-            Err(Trip::Refused(e)) => {
-                shared.done(id, proc);
-                Err(Trip::Refused(e))
-            }
-            // The seed is unusable (its socket broke, or it says its own machinery failed): end it, free
-            // its slot for a restart, refuse this create.
-            Err(Trip::Broken(e)) => {
-                shared.died(id, proc);
-                Err(Trip::Broken(e))
-            }
-            // It didn't answer within the hang bound: retired, taken for hung and counted (no sample).
-            Err(Trip::Hung(e)) => {
-                shared.hung(id, proc);
-                Err(Trip::Hung(e))
-            }
-        }
-    }
-
     fn claim_parked(
         &self,
         parked: Parked,
@@ -436,9 +394,24 @@ impl CreatePool {
         };
         let (create, fds) = message(req);
         // The claim is taken at the init's first word on its sync pipe, with no answer before it (the lead's (A) of
-        // 2026-11-09), within the claim's own patience: its pid and pidfd are the park's.
+        // 2026-11-09), within the claim's W* and past it by the init's life (decision 9): its pid and pidfd are the
+        // park's.
         let began = Instant::now();
-        match claim_round(socket.as_fd(), sync, &create, &fds, CLAIMS.deadline()) {
+        let patience = CLAIMS.deadline();
+        let past = || {
+            if let Some(window) = patience {
+                CLAIMS.ran_out(window);
+            }
+        };
+        match claim_round(
+            socket.as_fd(),
+            sync,
+            pidfd.as_fd(),
+            &create,
+            &fds,
+            patience,
+            past,
+        ) {
             Ok(made) => {
                 CLAIMS.answered(began.elapsed());
                 // Counted by how its mount namespace was made, as a seed's clone is (clone_init).
@@ -450,9 +423,11 @@ impl CreatePool {
                 Ok((pid, pidfd))
             }
             Err(trip) => {
-                self.shared.claim_failed(&trip);
-                let (Trip::Refused(e) | Trip::Broken(e) | Trip::Hung(e)) = trip;
-                // Refused, the init ends itself; ended either way, and reaped, so none is left.
+                self.shared.claim_failed();
+                let (Trip::Refused(e) | Trip::Broken(e)) = trip;
+                // Refused, the init ends itself; ended either way, and reaped, so none is left. No word of its stands
+                // on the create's sync pipe for the seed's clone the claim falls back to: a word came before anything
+                // on its socket, and would have taken the claim.
                 drop(socket);
                 let _ = rustix::process::pidfd_send_signal(&pidfd, Signal::KILL);
                 let _ =
@@ -489,18 +464,10 @@ impl Parker {
             [cgroup, theirs.as_fd()],
         );
         drop(theirs);
-        let answered = match sent.and_then(|()| readable(proc.socket.as_fd(), patience)) {
-            Ok(true) => rt_seed::recv_answer(proc.socket.as_fd()),
-            // No answer within the hang bound: taken for hung, which backs the bound off.
-            Ok(false) => {
-                shared.hung(id, proc);
-                return Err(OciError::Broken(format!(
-                    "a create seed did not answer a park within {:?}",
-                    patience.unwrap_or_default()
-                )));
-            }
-            Err(e) => Err(e),
-        };
+        // Within the hang bound, and past it by the seed's life (decision 9), as a create's answer is waited for.
+        let answered = sent
+            .and_then(|()| wait_answer(&proc, patience, || shared.past_hang()))
+            .and_then(|()| rt_seed::recv_answer(proc.socket.as_fd()));
         match answered {
             Ok((Answer::Started { pid }, Some(pidfd))) => {
                 shared.done(id, proc);
@@ -509,8 +476,8 @@ impl Parker {
                 // Held from here, so ended and reaped if it never says it is parked, which it does within
                 // the hang bound the seeds' answers taught.
                 let parked = Parked::new(pid, pidfd, ours, flags);
-                // The hang bound, seeded from the record, is armed; were it measuring with nothing seen, the
-                // wait would be unbounded.
+                // The hang bound once a seed has answered; before, and from a run-out to the next, the wait follows
+                // the init, ending at its word or its end (decision 9).
                 let patience = shared.lock()?.seeds.deadlines().1;
                 parked.wait_parked(patience.unwrap_or(Duration::MAX))?;
                 Ok(parked)
@@ -654,17 +621,13 @@ impl Shared {
         self.base.elapsed()
     }
 
-    /// A parked init's claim failed with `trip`: counted by its kind.
-    fn claim_failed(&self, trip: &Trip) {
-        let i = match trip {
-            Trip::Hung(_) => 0,
-            Trip::Refused(_) | Trip::Broken(_) => 1,
-        };
-        if let Some(count) = self.claims_failed.get(i) {
-            let _ = count.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+    /// A parked init's claim failed: counted.
+    fn claim_failed(&self) {
+        let _ = self
+            .claims_failed
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_add(1))
             });
-        }
     }
 
     /// Wakes the starting thread, for a seed to start.
@@ -685,13 +648,11 @@ impl Shared {
     /// the core's bounds. The starting thread is woken when the create leaves it a seed to start, to keep
     /// its spare, and not otherwise: a wake is a system call, and the woken thread takes the lock this
     /// create holds. Returns the seed and its checked-out process (its slot's `procs` entry taken until
-    /// [`done`](Self::done) or [`died`](Self::died)), and how long the shell waits for its answer: until the
-    /// core takes it for hung, or `None` while the hang bound measures with nothing seen.
+    /// [`done`](Self::done) or [`died`](Self::died)), and how long the shell waits for its answer within the
+    /// hang bound: `None` while it follows the seed by its life (before the hang bound's first answer, and from
+    /// a run-out to the next).
     fn acquire(&self) -> Result<(SeedId, Proc, Option<Duration>), OciError> {
         let mut inner = self.lock()?;
-        // A seed that has served a create for the hang bound is taken for hung here, killed and its slot
-        // freed for a restart, so a wedged seed never holds a slot for ever.
-        self.reap_hung(&mut inner);
         let now = self.now();
         let slots_before = inner.seeds.slots();
         let admit = inner
@@ -750,22 +711,13 @@ impl Shared {
         Ok((id, take(inner, id)?, until.map(|u| u.saturating_sub(now))))
     }
 
-    /// Takes each seed past the hang bound over its create, killing and reaping it and freeing its slot;
-    /// the core refuses that create and asks for a restart. A waiting create handed the seed meets the
-    /// refusal at its claim, so the line and the starting thread are woken.
-    fn reap_hung(&self, inner: &mut Inner) {
+    /// The seeds past the hang bound now, each one's run-out told to the core, once, and from then followed by
+    /// its life (decision 9): what the shell's wait for a seed's answer does as it passes its bound.
+    fn past_hang(&self) -> Result<(), OciError> {
+        let mut inner = self.lock()?;
         let now = self.now();
-        let mut woke = false;
-        while let Some((id, _refused)) = inner.seeds.hung(now) {
-            if let Some(proc) = inner.procs.get_mut(id.slot()).and_then(Option::take) {
-                end(&proc);
-            }
-            woke = true;
-        }
-        if woke {
-            self.wake_line();
-            self.wake_starter();
-        }
+        inner.seeds.past_hang(now);
+        Ok(())
     }
 
     /// A healthy seed back to the pool after its create: its process returned to its slot, the core told
@@ -788,26 +740,12 @@ impl Shared {
         }
     }
 
-    /// A seed that didn't answer within its hang bound: killed and reaped, and taken for hung by the core,
-    /// which refuses its create, backs the bound off and asks for a restart. Were the core's clock short of
-    /// the bound (the shell's wait began after the core's), it is reported dead instead.
-    fn hung(&self, id: SeedId, proc: Proc) {
-        end(&proc);
-        if let Ok(mut inner) = self.lock() {
-            self.reap_hung(&mut inner);
-            if inner.seeds.died(id).is_ok() {
-                self.wake_line();
-                self.wake_starter();
-            }
-        }
-    }
-
     /// An unusable seed ended and its slot freed: killed and reaped, the core told it died (which counts
     /// it and asks for a restart), the waiters woken, and the starting thread woken to replace it.
     fn died(&self, id: SeedId, proc: Proc) {
         end(&proc);
         if let Ok(mut inner) = self.lock() {
-            let _ = inner.seeds.died(id);
+            let _ = inner.seeds.died(id, self.now());
             self.wake_line();
             self.wake_starter();
         }
@@ -992,27 +930,21 @@ enum Trip {
     Refused(OciError),
     /// The seed is unusable (its socket broke, or it says its own machinery failed): replace it.
     Broken(OciError),
-    /// The seed didn't answer within its hang bound: take it for hung and replace it.
-    Hung(OciError),
 }
 
 /// Sends the create and its descriptors to the seed and reads the answer: the init's pid and pidfd, or a
-/// refusal. The wait for the answer is bounded by `patience`, what is left of the hang bound the core
-/// learned, so a wedged seed is taken for hung rather than waited on for ever (CLAUDE.md §2, §4); `None`
-/// only while the hang bound measures with nothing seen.
+/// refusal. The answer is waited for as [`wait_answer`] waits: within `patience`, what is left of the hang
+/// bound, and past it, `past` told, by the seed's life (decision 9).
 fn round_trip(
-    socket: BorrowedFd<'_>,
+    proc: &Proc,
     create: &Create,
     fds: &[BorrowedFd<'_>],
     patience: Option<Duration>,
+    past: impl FnOnce() -> Result<(), OciError>,
 ) -> Result<(i32, OwnedFd, MountNamespace), Trip> {
+    let socket = proc.socket.as_fd();
     rt_seed::send_create(socket, create, fds).map_err(Trip::Broken)?;
-    if !readable(socket, patience).map_err(Trip::Broken)? {
-        return Err(Trip::Hung(OciError::Broken(format!(
-            "a create seed did not answer within {:?}",
-            patience.unwrap_or_default()
-        ))));
-    }
+    wait_answer(proc, patience, past).map_err(Trip::Broken)?;
     let (answer, pidfd) = rt_seed::recv_answer(socket).map_err(Trip::Broken)?;
     let (pid, made) = match answer {
         // A classic create's answer names no way: its namespace, if any, is the seed's copied.
@@ -1036,57 +968,94 @@ fn round_trip(
     }
 }
 
+/// Waits for seed `proc`'s answer on its socket, as decision 9 waits (the person's ruling of 2026-11-13: W* is a bound
+/// only while answers come within it): within `patience`, what is left of the hang bound the core learned; past it,
+/// `past` told (the core's run-out, once: [`Seeds::past_hang`]), and on by the seed's life alone until its answer or
+/// its end, its pidfd's word. With no `patience` (before the hang bound's first answer, and from a run-out to the
+/// next) it follows the seed's life from the start. Ok once its socket has something to read, its answer or its
+/// close; the seed's end with nothing on its socket is refused, the seed broken.
+fn wait_answer(
+    proc: &Proc,
+    patience: Option<Duration>,
+    past: impl FnOnce() -> Result<(), OciError>,
+) -> Result<(), OciError> {
+    const OP: &str = "poll on a create seed's socket and pidfd";
+    let fds = [proc.socket.as_fd(), proc.pidfd.as_fd()];
+    let mut first = first_readable(&fds, patience, OP)?;
+    if first.is_none() {
+        // Past the bound: no sample (Karn's point), the run-out told, once, and the wait goes on by the seed's life.
+        past()?;
+        first = first_readable(&fds, None, OP)?;
+    }
+    match first {
+        Some(0) => Ok(()),
+        // Its pidfd alone: the seed ended, its socket's other end held open (by an init it cloned).
+        _ => Err(OciError::Broken(
+            "a create seed ended before it answered".to_owned(),
+        )),
+    }
+}
+
 /// A claim's wait for its parked init's first word on its sync pipe, from the claim's send (the lead's (A) of
 /// 2026-11-09: no early answer): the init's ready on a root node's pruned path, its ask for its user namespace's maps
-/// on a rootless node's classic one. Seeded by build profile from the `parked.ready` rows of
-/// `bench/competitive/probes/waits_census.md` run 5 (decision 9): release, the largest max of the release arms,
-/// 12.896 ms (adacachy2, its tmpfs arm, of 29,007); debug, the largest answer of the debug-build arms, the debug arm and
-/// the suites', 652.431 ms (the suites', of 190,580). An init that ends or refuses is caught at once, its claim socket
-/// closed or carrying the refusal; one that says nothing within the claim's patience falls back to a seed's clone.
-static CLAIMS: hex_core::patience::Patience = hex_core::patience::Patience::by_profile(
-    "parked.ready",
-    std::time::Duration::from_nanos(12_896_493),
-    Some(std::time::Duration::from_nanos(652_430_750)),
-);
+/// on a rootless node's classic one. W*, the slowest such word this node has seen (decision 9), is a bound only while
+/// words come within it: past it the run-out is told and the claim follows the init by its life alone, to its word,
+/// its refusal or its end, never taking it for hung. (Taken for hung at a microsecond W*, a rootless init was killed
+/// just after it asked for its maps, and its word, left on the create's sync pipe, was answered for the seed's clone
+/// the claim fell back to: "writing uid_map failed: Operation not permitted", 2026-11-13.) The waits census's
+/// `parked.ready` rows are the evidence the rule is held to, never a seed.
+static CLAIMS: hex_core::patience::Patience =
+    hex_core::patience::Patience::measuring("parked.ready");
 
-/// Sends a parked init its claim and waits, within `patience` (`None` while the claim's wait measures: unbounded), for
-/// the claim to be taken or not: how the init makes its mount namespace, or why not. A claimed init says nothing on its
-/// claim socket once it takes the claim (the lead's (A) of 2026-11-09), so the claim is taken at the init's first word
-/// on `sync`, the read end of its sync pipe, which stays there for the handshake to read, and the init makes its mount
-/// namespace the create's way, the one it was parked for (the seed's `begin` refuses another). A word there is taken
-/// before anything on the socket, since an init that reports a setup failure ends after it. Not taken: its refusal on
-/// the socket, its end (the socket closed with no word on the pipe), or its silence past `patience`.
+/// Sends a parked init its claim and waits for the claim to be taken or not, as decision 9 waits: within `patience`
+/// (`None` while the claim's wait measures), and past it, `past` told (the run-out, once), by the init's life alone:
+/// how the init makes its mount namespace, or why not. A claimed init says nothing on its claim socket once it takes
+/// the claim (the lead's (A) of 2026-11-09), so the claim is taken at the init's first word on `sync`, the read end of
+/// its sync pipe, which stays there for the handshake to read, and the init makes its mount namespace the create's
+/// way, the one it was parked for (the seed's `begin` refuses another). A word there is taken before anything on the
+/// socket or the init's `pidfd`, since an init that reports a setup failure ends after it. Not taken: its refusal on
+/// the socket, or its end (the socket closed, or its pidfd's word) with no word on the pipe.
 fn claim_round(
     socket: BorrowedFd<'_>,
     sync: BorrowedFd<'_>,
+    pidfd: BorrowedFd<'_>,
     create: &Create,
     fds: &[BorrowedFd<'_>],
     patience: Option<Duration>,
+    past: impl FnOnce(),
 ) -> Result<MountNamespace, Trip> {
+    const OP: &str = "poll on a claimed init's pipe, socket and pidfd";
     rt_seed::send_create(socket, create, fds).map_err(Trip::Broken)?;
-    match first_readable([sync, socket], patience).map_err(Trip::Broken)? {
+    let watched = [sync, socket, pidfd];
+    let mut first = first_readable(&watched, patience, OP).map_err(Trip::Broken)?;
+    if first.is_none() {
+        // Past W*: no sample (Karn's point), the run-out told once, and the claim follows its init by its life.
+        past();
+        first = first_readable(&watched, None, OP).map_err(Trip::Broken)?;
+    }
+    match first {
         Some(0) => Ok(create.mount_namespace),
-        Some(_) => match rt_seed::recv_answer(socket) {
+        Some(1) => match rt_seed::recv_answer(socket) {
             Ok((Answer::Refused { failed, why }, _)) => Err(refusal(failed, why)),
             Ok(_) => Err(Trip::Broken(OciError::Broken(
                 "a claimed init answered other than to refuse its claim".to_owned(),
             ))),
             Err(e) => Err(Trip::Broken(e)),
         },
-        None => Err(Trip::Hung(OciError::Broken(format!(
-            "a claimed init said nothing within {:?}",
-            patience.unwrap_or_default()
-        )))),
+        _ => Err(Trip::Broken(OciError::Broken(
+            "a claimed init ended before its first word".to_owned(),
+        ))),
     }
 }
 
-/// Which of `fds` turns readable first within `patience`, the earlier in the list where both have: `None` past it, and
-/// with none (a wait measuring) it waits until one does. A peer's end (`POLLHUP`) counts, for the read that says so.
+/// Which of `fds` turns readable first within `patience`, the earliest in the list where several have: `None` past it,
+/// and with none (a wait following its party) it waits until one does. A peer's end (`POLLHUP`) counts, for the read
+/// that says so, as does a process's end on its pidfd. `op` names the poll in its error.
 fn first_readable(
-    fds: [BorrowedFd<'_>; 2],
+    fds: &[BorrowedFd<'_>],
     patience: Option<Duration>,
+    op: &'static str,
 ) -> Result<Option<usize>, OciError> {
-    let [first, second] = fds;
     let deadline = patience.and_then(|p| Instant::now().checked_add(p));
     loop {
         let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
@@ -1094,15 +1063,15 @@ fn first_readable(
             tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
             tv_nsec: i64::from(left.subsec_nanos()),
         });
-        let mut polled = [
-            PollFd::new(&first, PollFlags::IN),
-            PollFd::new(&second, PollFlags::IN),
-        ];
+        let mut polled: Vec<PollFd<'_>> = fds
+            .iter()
+            .map(|fd| PollFd::new(fd, PollFlags::IN))
+            .collect();
         match rustix::event::poll(&mut polled, ts.as_ref()) {
             Ok(n) if n > 0 => return Ok(polled.iter().position(|p| !p.revents().is_empty())),
             Ok(_) if left.is_some_and(|l| l.is_zero()) => return Ok(None),
             Ok(_) | Err(rustix::io::Errno::INTR) => {}
-            Err(e) => return Err(OciError::os("poll on a claimed init's pipe and socket", e)),
+            Err(e) => return Err(OciError::os(op, e)),
         }
     }
 }
@@ -1126,31 +1095,12 @@ fn refusal(failed: Failed, why: String) -> Trip {
     }
 }
 
-/// Whether `fd` turns readable within `patience`; with none (a wait measuring) it waits until it does.
-fn readable(fd: BorrowedFd<'_>, patience: Option<Duration>) -> Result<bool, OciError> {
-    let deadline = patience.and_then(|p| Instant::now().checked_add(p));
-    loop {
-        let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-        let ts = left.map(|left| Timespec {
-            tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
-            tv_nsec: i64::from(left.subsec_nanos()),
-        });
-        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-        match rustix::event::poll(&mut fds, ts.as_ref()) {
-            Ok(n) if n > 0 => return Ok(true),
-            Ok(_) if left.is_some_and(|l| l.is_zero()) => return Ok(false),
-            Ok(_) | Err(rustix::io::Errno::INTR) => {}
-            Err(e) => return Err(OciError::os("poll on a create seed's socket", e)),
-        }
-    }
-}
-
-/// A core refusal as a typed node error naming why. A line at the seeds' `bound` (full, or its wait ended) is
+/// A core refusal as a typed node error naming why. A line at the seeds' `bound` (full, or no seed able to come) is
 /// [`OciError::SeedsExhausted`], which reaches the caller as [`Refusal::Exhausted`] naming the bound: refused, never
 /// sent through the shim (one implementation per job, the lead's ruling of 2026-11-06), and counted by the core
 /// (`refused_busy`, `refused_waited`). Where the last seed start failed and none has started since, no seed could
-/// come at any bound, so the refusal names that cause instead, as a [`Refusal::Os`]; as does a seed that died or
-/// was taken for hung over the create.
+/// come at any bound, so the refusal names that cause instead, as a [`Refusal::Os`]; as does a seed that died over
+/// the create.
 fn refused(r: Refused, start_failure: Option<&str>, bound: usize) -> OciError {
     match (r, start_failure) {
         (Refused::Busy { .. } | Refused::Waited { .. }, None) => OciError::SeedsExhausted {
@@ -1161,7 +1111,7 @@ fn refused(r: Refused, start_failure: Option<&str>, bound: usize) -> OciError {
             op: "create via a seed",
             why: format!("{r}; the last create seed start failed: {cause}"),
         },
-        (Refused::Died { .. } | Refused::Hung { .. }, None) => OciError::Os {
+        (Refused::Died { .. }, None) => OciError::Os {
             op: "create via a seed",
             why: r.to_string(),
         },
@@ -1188,11 +1138,7 @@ mod tests {
     /// A create's wait in line for a seed, on the line's own record for this build: the seeds' answers'
     /// (`hex_core::seeds`, decision 9), as the pool's line wait starts from.
     fn in_line() -> Patience {
-        Patience::by_profile(
-            "test.createpool.in_line",
-            hex_core::seeds::CLONE_SLOWEST,
-            Some(hex_core::seeds::CLONE_SLOWEST_DEBUG),
-        )
+        Patience::seeded("test.createpool.in_line", hex_testkit::waits::SEEDS)
     }
 
     /// Goal 5 plan step 2 (AC-T7.1.4; CLAUDE.md §10): classic-path creates are counted by a fixed set
@@ -1245,7 +1191,7 @@ mod tests {
 
     /// Goal 5 plan step 4 (T-T7.1.4; CLAUDE.md §3): a node whose seeds can't start says why. Do: open a
     /// pool on a `hex` binary that isn't there, wait until it has counted a failed start, then ask for a
-    /// seed under the node's own bounds, its waits seeded from the record. Expect: the create is refused by
+    /// seed under the node's own bounds and waits (following its seeds: no record is read, decision 9). Expect: the create is refused by
     /// type once the start it asked for fails too (no seed is up or starting, so none can come), naming the
     /// failed start's cause, not the seeds' bound (no bound was reached); never left waiting, never sent
     /// another way.
@@ -1339,10 +1285,10 @@ mod tests {
     }
 
     /// The lead's rule of 2026-11-06 (AC-T7.1.3): a parked init's claim that fails falls back to a seed's clone, and
-    /// is counted by why, so a pass shows how often a parked init cost its create a clone. Do: tell a pool a claim
-    /// hung once and was refused twice. Expect: (1, 2), and none before.
+    /// is counted, so a pass shows how often a parked init cost its create a clone. Do: tell a pool a claim was refused
+    /// and one broke. Expect: 2, and none before.
     #[test]
-    fn a_failed_parked_claim_is_counted_by_why() {
+    fn a_failed_parked_claim_is_counted() {
         let pool = CreatePool::new(
             PathBuf::from("/nonexistent/hex-for-the-test"),
             crate::sizes::Sizes::now().unwrap(),
@@ -1352,12 +1298,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(pool.claims_failed(), (0, 0));
-        let e = || OciError::Broken("for the test".to_owned());
-        pool.shared.claim_failed(&Trip::Hung(e()));
-        pool.shared.claim_failed(&Trip::Refused(e()));
-        pool.shared.claim_failed(&Trip::Broken(e()));
-        assert_eq!(pool.claims_failed(), (1, 2));
+        assert_eq!(pool.claims_failed(), 0);
+        pool.shared.claim_failed();
+        pool.shared.claim_failed();
+        assert_eq!(pool.claims_failed(), 2);
     }
 
     /// The lead's (B) of 2026-11-09 (decision 8's claim), HEX-SEED-3: a request's descriptors are those its create
@@ -1446,12 +1390,11 @@ mod tests {
 
     /// The lead's (A) of 2026-11-09 (decision 8's claim): a claimed init says nothing on its claim socket once it takes
     /// the claim, so the claim is taken at the init's first word on its sync pipe, which stays there for the handshake
-    /// to read, and fails on the init's refusal, its end, or its silence past the claim's patience. Do: claim a
-    /// stand-in init that, given its claim, writes its ready; writes a setup failure and ends; refuses; ends without a
-    /// word; or holds its claim and says nothing. Expect: taken at the ready, still on the pipe; taken at the failure,
-    /// still on the pipe for the handshake to report; refused; broken; and hung, given no time at all to wait. The
-    /// others wait at most the claim's bound before (A), the seeds' answers' record, so a claim that waits for an
-    /// answer fails here rather than waiting for ever.
+    /// to read, and fails on the init's refusal or its end (an init silent past the claim's W* is followed, never taken
+    /// for hung: original_a_claim_past_its_w_star_follows_its_init_to_its_word). Do: claim a stand-in init that, given
+    /// its claim, writes its ready; writes a setup failure and ends; refuses; or ends without a word. Expect: taken at
+    /// the ready, still on the pipe; taken at the failure, still on the pipe for the handshake to report; refused;
+    /// broken.
     #[test]
     fn a_claim_is_taken_at_its_inits_first_word_and_otherwise_falls_back() {
         use hex_runtime::linux::cgroup::BoxCgroup;
@@ -1469,15 +1412,11 @@ mod tests {
         };
         let cgroup = BoxCgroup::at(lab.path().to_owned());
         let config = open();
-        let before = Patience::by_profile(
-            "test.createpool.claim_before",
-            hex_core::seeds::CLONE_SLOWEST,
-            Some(hex_core::seeds::CLONE_SLOWEST_DEBUG),
-        )
-        .deadline();
-        // A claim of a stand-in that does `then` with its claim's sync pipe end and its end of the claim socket, or,
-        // with none, holds its claim unread: what came of it, and what is left on the sync pipe.
-        let claim = |then: Option<fn(OwnedFd, OwnedFd)>, patience: Option<Duration>| {
+        let before =
+            Patience::seeded("test.createpool.claim_before", hex_testkit::waits::SEEDS).deadline();
+        // A claim of a stand-in that does `then` with its claim's sync pipe end and its end of the claim socket: what
+        // came of it, and what is left on the sync pipe.
+        let claim = |then: fn(OwnedFd, OwnedFd), patience: Option<Duration>| {
             let (sync_r, sync_w) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).unwrap();
             let (ours, theirs) = rt_seed::socketpair().unwrap();
             let req = CloneReq {
@@ -1503,31 +1442,32 @@ mod tests {
                 }),
             };
             let (create, fds) = message(&req);
-            let (stand_in, _held) = match then {
-                Some(then) => (
-                    Some(std::thread::spawn(move || {
-                        let mut buf = vec![0u8; hex_core::seed::MAX_REQUEST];
-                        let Ok(rt_seed::Received::Message { stdio, .. }) =
-                            rt_seed::recv_request(theirs.as_fd(), &mut buf)
-                        else {
-                            panic!("the stand-in was sent no claim");
-                        };
-                        then(stdio.into_iter().next().unwrap(), theirs);
-                    })),
-                    None,
-                ),
-                None => (None, Some(theirs)),
-            };
-            let came = match claim_round(ours.as_fd(), sync_r.as_fd(), &create, &fds, patience) {
+            let stand_in = std::thread::spawn(move || {
+                let mut buf = vec![0u8; hex_core::seed::MAX_REQUEST];
+                let Ok(rt_seed::Received::Message { stdio, .. }) =
+                    rt_seed::recv_request(theirs.as_fd(), &mut buf)
+                else {
+                    panic!("the stand-in was sent no claim");
+                };
+                then(stdio.into_iter().next().unwrap(), theirs);
+            });
+            let alive = rustix::process::pidfd_open(rustix::process::getpid(), PidfdFlags::empty())
+                .unwrap();
+            let came = match claim_round(
+                ours.as_fd(),
+                sync_r.as_fd(),
+                alive.as_fd(),
+                &create,
+                &fds,
+                patience,
+                || {},
+            ) {
                 Ok(MountNamespace::Copy) => "taken",
                 Ok(_) => "taken another way",
                 Err(Trip::Refused(_)) => "refused",
                 Err(Trip::Broken(_)) => "broken",
-                Err(Trip::Hung(_)) => "hung",
             };
-            if let Some(stand_in) = stand_in {
-                stand_in.join().unwrap();
-            }
+            stand_in.join().unwrap();
             let mut left = [0u8; 64];
             let n = rustix::io::read(&sync_r, &mut left).unwrap_or(0);
             (came, String::from_utf8_lossy(&left[..n]).into_owned())
@@ -1547,19 +1487,212 @@ mod tests {
             rt_seed::send_answer(socket.as_fd(), &refusal, None).unwrap();
         };
         let ends: fn(OwnedFd, OwnedFd) = |_sync, _socket| {};
-        assert_eq!(claim(Some(ready), before), ("taken", "R\n".to_owned()));
+        assert_eq!(claim(ready, before), ("taken", "R\n".to_owned()));
         assert_eq!(
-            claim(Some(failed), before),
+            claim(failed, before),
             ("taken", "Ea step failed\n".to_owned())
         );
-        assert_eq!(claim(Some(refuses), before), ("refused", String::new()));
-        assert_eq!(claim(Some(ends), before), ("broken", String::new()));
-        assert_eq!(claim(None, Some(Duration::ZERO)), ("hung", String::new()));
+        assert_eq!(claim(refuses, before), ("refused", String::new()));
+        assert_eq!(claim(ends, before), ("broken", String::new()));
+    }
+
+    /// Decision 9 (original; the person's ruling of 2026-11-13: W* is a bound only while answers come within it): the
+    /// shell's wait for a create seed's answer ended at the hang bound, the slowest create answer the pool had seen,
+    /// and the seed was killed as hung, its create refused ("a create seed did not answer within 1.16752ms", oci_box).
+    /// Do: a round trip with a stand-in seed, alive (its pidfd the test's own process's), that takes the create and
+    /// answers, refusing it by type, only once the round trip has passed its bound, a nanosecond, and told its
+    /// run-out; and one with a stand-in seed, a child of the test's, that answers nothing and ends once the round trip
+    /// has told its run-out. Expect: the first round trip takes the seed's answer, the seed whole; the second ends at
+    /// the seed's end, the seed broken; each told its run-out.
+    #[test]
+    fn original_a_round_trip_past_the_hang_bound_follows_its_seed_by_its_life() {
+        use hex_runtime::linux::cgroup::BoxCgroup;
+        use rustix::fs::{Mode, OFlags};
+        use rustix::pipe::{PipeFlags, pipe_with};
+        use std::sync::mpsc::channel;
+        let lab = tempfile::tempdir().unwrap();
+        let cgroup = BoxCgroup::at(lab.path().to_owned());
+        let config = rustix::fs::open(
+            lab.path(),
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let (_sync_r, sync_w) = pipe_with(PipeFlags::CLOEXEC).unwrap();
+        let (map_r, _map_w) = pipe_with(PipeFlags::CLOEXEC).unwrap();
+        let req = CloneReq {
+            bundle: lab.path(),
+            dir: lab.path(),
+            cgroup: &cgroup,
+            network: None,
+            sync_w,
+            map_r: Some(map_r),
+            config: config.as_fd(),
+            pruned: None,
+        };
+        let (create, fds) = message(&req);
+        let bound = Some(Duration::from_nanos(1));
+        let came = |got: Result<(i32, OwnedFd, MountNamespace), Trip>| match got {
+            Ok(_) => "started".to_owned(),
+            Err(Trip::Refused(_)) => "refused".to_owned(),
+            Err(Trip::Broken(e)) => format!("broken: {e}"),
+        };
+
+        // Alive throughout: the test's own process.
+        let (ours, theirs) = rt_seed::socketpair().unwrap();
+        let pidfd =
+            rustix::process::pidfd_open(rustix::process::getpid(), PidfdFlags::empty()).unwrap();
+        let proc = Proc {
+            socket: ours,
+            pidfd,
+        };
+        // It answers once told, the create left on its socket unread; a round trip that never tells drops `told`, and
+        // the stand-in ends without a word.
+        let (told, heard) = channel::<()>();
+        let seed = std::thread::spawn(move || {
+            if heard.recv().is_ok() {
+                let refusal = Answer::Refused {
+                    failed: Failed::Request,
+                    why: "refused for the test".to_owned(),
+                };
+                rt_seed::send_answer(theirs.as_fd(), &refusal, None).unwrap();
+            }
+            theirs
+        });
+        let past = move || {
+            told.send(())
+                .map_err(|_| OciError::Broken("the stand-in left".to_owned()))
+        };
+        let got = came(round_trip(&proc, &create, &fds, bound, past));
+        let _theirs = seed.join().unwrap();
+        assert_eq!(got, "refused", "the seed's answer past the bound");
+
+        // Ends once told: a child of the test's, `cat` on a pipe the test closes.
+        let mut child = Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+        let (ours, theirs) = rt_seed::socketpair().unwrap();
+        let proc = Proc {
+            socket: ours,
+            pidfd: rustix::process::pidfd_open(pid, PidfdFlags::empty()).unwrap(),
+        };
+        let stdin = child.stdin.take().unwrap();
+        let (told, heard) = channel::<()>();
+        let ender = std::thread::spawn(move || {
+            let _ = heard.recv();
+            drop(stdin);
+        });
+        let past = move || {
+            told.send(())
+                .map_err(|_| OciError::Broken("the stand-in left".to_owned()))
+        };
+        let got = came(round_trip(&proc, &create, &fds, bound, past));
+        ender.join().unwrap();
+        child.wait().unwrap();
+        drop(theirs);
+        assert!(
+            got.starts_with("broken") && got.contains("ended before it answered"),
+            "the round trip past the bound ended other than at the seed's end: {got}"
+        );
+    }
+
+    /// Decision 9 (original; the rootless "create: writing uid_map failed: Operation not permitted" of 2026-11-13): a
+    /// claim whose init said nothing within the claim's W* was taken for hung, its init killed, and its create cloned
+    /// afresh on the same sync pipe, where the word the killed init had written by then, its ask for its maps ("U"),
+    /// stood first: the handshake answered it with the new init's pid before that init had a user namespace of its
+    /// own, and the kernel refused the map. Do: claim a stand-in init, alive (its pidfd the test process's own), that
+    /// takes its claim and writes its ask for its maps only once the claim has passed its bound, a nanosecond, and told
+    /// its run-out. Expect: the claim taken at that word, the word still on the pipe for the handshake.
+    #[test]
+    fn original_a_claim_past_its_w_star_follows_its_init_to_its_word() {
+        use hex_runtime::linux::cgroup::BoxCgroup;
+        use hex_runtime::linux::oci::run::PrunedCreate;
+        use rustix::fs::{Mode, OFlags};
+        use rustix::pipe::{PipeFlags, pipe_with};
+        use std::sync::mpsc::channel;
+        let lab = tempfile::tempdir().unwrap();
+        let open = || {
+            rustix::fs::open(
+                lab.path(),
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap()
+        };
+        let cgroup = BoxCgroup::at(lab.path().to_owned());
+        let config = open();
+        let (sync_r, sync_w) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).unwrap();
+        let (ours, theirs) = rt_seed::socketpair().unwrap();
+        let req = CloneReq {
+            bundle: lab.path(),
+            dir: lab.path(),
+            cgroup: &cgroup,
+            network: None,
+            sync_w,
+            map_r: None,
+            config: config.as_fd(),
+            pruned: Some(PrunedCreate {
+                cgroup_dir: None,
+                container_dir: open(),
+                rootfs: open(),
+                mount_namespace: MountNamespace::Copy,
+                dev_mount: None,
+                ipc_uts: None,
+                proc_mount: None,
+                proc_sink: None,
+                masked_directory: None,
+                binds: Vec::new(),
+                path_joins: Vec::new(),
+            }),
+        };
+        let (create, fds) = message(&req);
+        let (told, heard) = channel::<()>();
+        // It takes its claim at once, and asks for its maps once told; a claim that never tells drops `told`, and the
+        // stand-in says nothing.
+        let stand_in = std::thread::spawn(move || {
+            let mut buf = vec![0u8; hex_core::seed::MAX_REQUEST];
+            let Ok(rt_seed::Received::Message { stdio, .. }) =
+                rt_seed::recv_request(theirs.as_fd(), &mut buf)
+            else {
+                panic!("the stand-in was sent no claim");
+            };
+            let sync = stdio.into_iter().next().unwrap();
+            if heard.recv().is_ok() {
+                rustix::io::write(&sync, b"U\n").unwrap();
+            }
+            theirs
+        });
+        let alive =
+            rustix::process::pidfd_open(rustix::process::getpid(), PidfdFlags::empty()).unwrap();
+        let got = claim_round(
+            ours.as_fd(),
+            sync_r.as_fd(),
+            alive.as_fd(),
+            &create,
+            &fds,
+            Some(Duration::from_nanos(1)),
+            move || {
+                let _ = told.send(());
+            },
+        );
+        let _theirs = stand_in.join().unwrap();
+        let came = match got {
+            Ok(_) => "taken",
+            Err(Trip::Refused(_)) => "refused",
+            Err(Trip::Broken(_)) => "broken",
+        };
+        assert_eq!(came, "taken", "a claim past its bound, its init alive");
+        let mut left = [0u8; 8];
+        let n = rustix::io::read(&sync_r, &mut left).unwrap_or(0);
+        assert_eq!(&left[..n], b"U\n", "the init's word left for the handshake");
     }
 
     /// Goal 5 extended step 6: a seed given back goes at once to the create waiting in line, woken by the
     /// hand-off and not by its wait's end. Do: open a pool of one slot, whose waits are seeded from the test's
-    /// patience, so a create in it is refused only past twice that; take its seed; ask for another from a thread of the test's, and
+    /// patience, so a create in it is refused only past that; take its seed; ask for another from a thread of the test's, and
     /// once that create waits in line, give the first back. Expect: the waiting create is handed the seed
     /// given back within the test's patience (a hand-off that woke no one fails).
     #[test]

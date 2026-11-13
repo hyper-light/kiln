@@ -225,11 +225,13 @@ impl Routes {
                     })?;
                 shared
                     .then(|| {
+                        // Its guest's own CPU as its runtime measured it (joint plan step 14, C7), none while cold: a
+                        // census-free cost carries no guest_overhead.
                         backing
                             .cost
                             .floor
                             .cpu_milli
-                            .checked_sub(backing.cost.guest_overhead.cpu_milli)?
+                            .checked_sub(backing.guest.cpu_milli.unwrap_or(0))?
                             .checked_sub(used)
                     })
                     .flatten()

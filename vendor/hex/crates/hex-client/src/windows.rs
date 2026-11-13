@@ -44,8 +44,8 @@ static ANSWERS: [Patience; KINDS] = [
     Patience::measuring("client.answer.links"),
 ];
 
-/// AC-T7.4.1: the kinds a box's class times, a wait for each (kind, class), named `client.answer.<kind>.<class>`; no
-/// census has timed any here: MEASURING, each, until one records it.
+/// AC-T7.4.1: the kinds a box's class times, a wait for each (kind, class), named `client.answer.<kind>.<class>`,
+/// each learned from this process's own answers, following the node agent until its first (decision 9).
 static CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [
     class_waits!("client.answer", "process", measuring),
     class_waits!("client.answer", "oci", measuring),

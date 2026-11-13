@@ -628,6 +628,8 @@ pub(crate) struct Learner {
     fault: Option<Refusal>,
     /// Why no VM's memory budget is held on this platform (C5), typed.
     unheld: Refusal,
+    /// The VMs its last window couldn't read and why, each counted whole against the fleet's budget (ROOT, 2026-11-13).
+    unread: Vec<(BoxId, Refusal)>,
     /// The last resort (C5).
     last: LastResort,
 }
@@ -656,6 +658,15 @@ pub(crate) fn bounds(machine: CapacityResources) -> Result<charge::Bounds, Refus
     })
 }
 
+/// `a` less `b` in each dimension, none below nothing.
+fn less(a: CapacityResources, b: CapacityResources) -> CapacityResources {
+    CapacityResources {
+        cpu_milli: a.cpu_milli.saturating_sub(b.cpu_milli),
+        mem_bytes: a.mem_bytes.saturating_sub(b.mem_bytes),
+        disk_bytes: a.disk_bytes.saturating_sub(b.disk_bytes),
+    }
+}
+
 /// A VM's vCPUs: its admitted guest's CPU in whole CPUs, rounded up.
 fn vcpus(allocation: hex_api::Allocation) -> Result<u32, Refusal> {
     let guest = allocation.guest()?;
@@ -679,6 +690,7 @@ impl Learner {
             learns,
             fault: None,
             last: LastResort::new(bounds.vms.min(MAX_LEARNED_HOLDINGS)),
+            unread: Vec::new(),
             unheld: Refusal::Platform {
                 what: "memory_high",
                 platform: std::env::consts::OS,
@@ -731,6 +743,9 @@ impl Learner {
         }
         // What each VM used of the cap it ran under in this window, for its next cap.
         let mut used = BTreeMap::new();
+        // What the VMs it couldn't read hold past their bookings, their receipts whole.
+        let mut unread = CapacityResources::default();
+        self.unread.clear();
         for record in running {
             let Some(scope) = scope_of(record) else {
                 continue;
@@ -738,9 +753,30 @@ impl Learner {
             let Some(allocation) = record.spec.allocation else {
                 continue;
             };
-            // A VM ending between the listing and its read is read no more; the next listing ends it.
-            let Ok(read) = Read::of(io, record) else {
-                continue;
+            // A VM its node can't read counts whole, at its receipt, against the fleet's budget this window, its learner
+            // untouched (ROOT, 2026-11-13: never starving its neighbours by holding nothing): no sample taken, its
+            // booking as it was, and the failure told ([`Learner::unread`]). One that ended since its listing is ended
+            // by the next.
+            let read = match Read::of(io, record) {
+                Ok(read) => read,
+                Err(why) => {
+                    let booked = self
+                        .vms
+                        .get(&scope)
+                        .and_then(|vm| self.node.booking(&vm.lifetime))
+                        .unwrap_or_default();
+                    let past = less(allocation.resources, booked);
+                    unread = unread.checked_add(past).ok_or_else(|| Refusal::Invalid {
+                        what: "a microVM's learned charge",
+                        why: "the unread VMs' receipts overflow".into(),
+                    })?;
+                    self.unread.try_reserve(1).map_err(|_| Refusal::Exhausted {
+                        what: "the charge learner's unread VMs",
+                        bound: running.len(),
+                    })?;
+                    self.unread.push((record.spec.id.try_clone()?, why));
+                    continue;
+                }
             };
             if let Some(vm) = self.vms.get_mut(&scope) {
                 let (before, at) = vm.last;
@@ -805,6 +841,8 @@ impl Learner {
                 .transpose()?;
             self.last.met(class, scope, intent)?;
         }
+        // The fleet's budget this window, less what its unread VMs hold past their bookings.
+        let budget = less(budget, unread);
         self.node.set_budget(budget);
         self.node.settle().map_err(refused)?;
         let rates = self
@@ -871,6 +909,13 @@ impl Learner {
         &self.unheld
     }
 
+    /// The VMs its last window couldn't read, and why: each counted whole, at its receipt, against the fleet's budget
+    /// until a read succeeds (joint plan step 14; ROOT, 2026-11-13).
+    #[cfg(test)]
+    pub(crate) fn unread(&self) -> &[(BoxId, Refusal)] {
+        &self.unread
+    }
+
     /// The cap each VM runs under now, by its lifetime.
     #[cfg(test)]
     fn rate(&self, scope: &Scope) -> Option<u64> {
@@ -894,6 +939,11 @@ impl Learner {
             let Some(scope) = Scope::of(record) else {
                 continue;
             };
+            // One its last window couldn't read carries no holding, so the scheduler counts it at its receipt, whole
+            // (C8; ROOT, 2026-11-13): the failure told where its booking would be.
+            if self.unread.iter().any(|(id, _)| *id == record.spec.id) {
+                continue;
+            }
             if let Some(vm) = self.vms.get(&scope)
                 && vm.class == class
             {

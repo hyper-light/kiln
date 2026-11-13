@@ -14,7 +14,7 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::net::{AddressFamily, SendFlags, SocketAddrUnix, SocketFlags, SocketType};
 use rustix::process::{Pid, Signal};
 
-use hex_api::conformance::PATIENCE;
+use hex_api::conformance::end_of;
 use hex_api::sim::SimRuntime;
 use hex_api::{Bounds, BoxInfo, BoxSpec, ClassSpec, Signal as HexSignal, Usage};
 use hex_client::Client;
@@ -24,7 +24,8 @@ use hex_testkit::waits::{EMPTYING, EXEC, until};
 /// Longest a test waits for the server's answer to a call over its socket: twice the slowest recorded answer of the
 /// kinds these tests ask (hello, inspect, netns counts, exec), an exec's (`client.answer.exec`, the census's debug
 /// arm, as the tests run debug builds: hex_testkit::waits::EXEC), so a server that never answers fails the test
-/// instead of hanging it. A program's end takes its own record, the suites' [`PATIENCE`]; each other fact, its own.
+/// instead of hanging it. A program's end is followed to it as the suites follow one ([`end_of`]); each other fact
+/// takes its own record.
 const ANSWERED: Duration = EXEC.saturating_mul(2);
 
 /// The server's ending of a program whose client went away: its kill, its reaping and its count in its box, a box's
@@ -757,11 +758,11 @@ fn execs_past_the_programs_bound_are_refused_naming_it() {
         Signal::KILL,
     )
     .unwrap();
-    assert_eq!(first.wait_for(PATIENCE).unwrap(), Some(Exit::Signal(9)));
+    assert_eq!(end_of(&mut first).unwrap(), Exit::Signal(9));
     let mut next = client
         .exec(&b(), Program::of(&["true"]), Stdio::null())
         .unwrap();
-    assert_eq!(next.wait_for(PATIENCE).unwrap(), Some(Exit::Code(0)));
+    assert_eq!(end_of(&mut next).unwrap(), Exit::Code(0));
 }
 
 /// HEX-SOCK-8: an exec's stdio crosses as descriptors: what the program writes reaches the pipes the
@@ -789,7 +790,7 @@ fn stdio_crosses_as_descriptors_and_only_pipes_are_taken() {
     out_r.read_to_string(&mut out).unwrap();
     err_r.read_to_string(&mut err).unwrap();
     assert_eq!((out.as_str(), err.as_str()), ("hi\n", "oops\n"));
-    assert_eq!(p.wait_for(PATIENCE).unwrap(), Some(Exit::Code(3)));
+    assert_eq!(end_of(&mut p).unwrap(), Exit::Code(3));
     let (in_r, mut in_w) = std::io::pipe().unwrap();
     let (mut out_r, out_w) = std::io::pipe().unwrap();
     let mut cat = client
@@ -809,7 +810,7 @@ fn stdio_crosses_as_descriptors_and_only_pipes_are_taken() {
     let mut back = String::new();
     out_r.read_to_string(&mut back).unwrap();
     assert_eq!(back, "round trip\n");
-    assert_eq!(cat.wait_for(PATIENCE).unwrap(), Some(Exit::Code(0)));
+    assert_eq!(end_of(&mut cat).unwrap(), Exit::Code(0));
 
     let fd = lab.raw();
     let devnull = std::fs::File::open("/dev/null").unwrap();
@@ -1071,14 +1072,14 @@ fn programs_watched_are_bounded_for_the_node_and_each_connection_keeps_its_one()
         })
     );
     let mut theirs = c.exec(&b(), Program::of(&["true"]), Stdio::null()).unwrap();
-    assert_eq!(theirs.wait_for(PATIENCE).unwrap(), Some(Exit::Code(0)));
+    assert_eq!(end_of(&mut theirs).unwrap(), Exit::Code(0));
     for mut p in held {
         rustix::process::kill_process(
             Pid::from_raw(i32::try_from(p.pid()).unwrap()).unwrap(),
             Signal::KILL,
         )
         .unwrap();
-        assert_eq!(p.wait_for(PATIENCE).unwrap(), Some(Exit::Signal(9)));
+        assert_eq!(end_of(&mut p).unwrap(), Exit::Signal(9));
     }
 }
 

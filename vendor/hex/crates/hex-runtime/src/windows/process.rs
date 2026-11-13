@@ -579,6 +579,7 @@ impl JobBox {
             io_read_bytes: a.read_bytes,
             io_write_bytes: a.write_bytes,
             guest: None,
+            started_from: None,
         })
     }
 

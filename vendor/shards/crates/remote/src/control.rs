@@ -40,9 +40,13 @@ use crate::tls;
 
 mod drive;
 pub mod exec;
+pub mod unix;
+pub use crate::tls::Negotiated;
 pub use drive::{
-    Controller, Dialed, Exec, ExecControl, Execs, Fault, Got, Hangup, Input, Output, Subscriptions,
+    Controller, Dialed, Exec, ExecControl, Execs, Fault, Got, Granted, Hangup, Input, Link, Linked,
+    McpConnection, Output, Socket, SocketReader, SocketWriter, Sockets, Subscriptions,
 };
+pub use unix::Admission as SocketAdmission;
 
 /// The application protocol of a control connection (RFC 7301), apart from a context's
 /// (`shards/1`) and the managed output's: a peer offering another is refused at its handshake.
@@ -215,6 +219,58 @@ pub fn refused(reason: Reason) -> [u8; REFUSED_BYTES] {
     out
 }
 
+/// The control lane's ask, which opens it: its tag alone (`Tag::Control`).
+const CONTROL_ASK: [u8; FRAME_HEAD] = [Tag::Control as u8, 0, 0, 0, 0];
+
+/// The endpoint's answer on the control lane, whole: a `Negotiated` frame of its own TLS's
+/// suite and group (u16 each, [`Negotiated`]), then the lane's end.
+const NEGOTIATED_BYTES: usize = FRAME_HEAD + 2 * size_of::<u16>();
+
+/// The most an answer that ends a lane takes: a refusal or the control lane's report.
+const ANSWER_MOST: usize = if REFUSED_BYTES > NEGOTIATED_BYTES {
+    REFUSED_BYTES
+} else {
+    NEGOTIATED_BYTES
+};
+
+/// `negotiated`'s report frame.
+fn negotiated_frame(negotiated: Negotiated) -> [u8; NEGOTIATED_BYTES] {
+    let mut out = [0; NEGOTIATED_BYTES];
+    let len = ((2 * size_of::<u16>()) as u32).to_be_bytes();
+    let (suite, group) = (negotiated.suite.to_be_bytes(), negotiated.group.to_be_bytes());
+    for (slot, byte) in out.iter_mut().zip(
+        std::iter::once(&(Tag::Negotiated as u8))
+            .chain(&len)
+            .chain(&suite)
+            .chain(&group),
+    ) {
+        *slot = *byte;
+    }
+    out
+}
+
+/// The endpoint's report at the front of `bytes`, once it has come whole; none before. Another
+/// frame there is no report: `Err` with what it is, as [`read_refused`] has it.
+fn read_negotiated(bytes: &[u8]) -> Result<Option<Negotiated>, Option<Tag>> {
+    let Some((tag, len)) = frame::peek(bytes).map_err(|_| None)? else {
+        return Ok(None);
+    };
+    if tag != Tag::Negotiated || len != 2 * size_of::<u16>() {
+        return Err(Some(tag));
+    }
+    let Some((suite, group)) = bytes
+        .get(FRAME_HEAD..NEGOTIATED_BYTES)
+        .and_then(|b| b.split_first_chunk::<2>())
+        .and_then(|(suite, rest)| Some((*suite, *rest.first_chunk::<2>()?)))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Negotiated {
+        suite: u16::from_be_bytes(suite),
+        group: u16::from_be_bytes(group),
+    }))
+}
+
 /// The reason of the refusal frame at the front of `bytes`, once it has come whole; none
 /// before. Another frame there is no refusal: `Err` with what it is, for the lane's own reader.
 pub fn read_refused(bytes: &[u8]) -> Result<Option<Reason>, Option<Tag>> {
@@ -250,6 +306,9 @@ pub struct Streams<'a> {
     /// What each exec's streams are admitted, where its host runs execs in the members
     /// ([`exec`]); none, and an ask is refused.
     pub execs: Option<exec::Admissions>,
+    /// What the run admits of lanes to its own command's sockets ([`unix`], D251); none, and
+    /// a socket lane is refused.
+    pub sockets: Option<unix::Admission>,
 }
 
 /// The endpoint's handles to what it serves, in the order [`Streams`] named them: each output's
@@ -263,6 +322,9 @@ pub struct Served {
     /// Each exec a controller asks for, for the host to start ([`exec::Start`]), where
     /// [`Streams::execs`] admitted them.
     pub execs: Option<std::sync::mpsc::Receiver<exec::Start>>,
+    /// Each socket lane a controller asks for, for the host to connect ([`unix::Connect`]),
+    /// where [`Streams::sockets`] admitted them.
+    pub sockets: Option<std::sync::mpsc::Receiver<unix::Connect>>,
 }
 
 /// Ends the endpoint's driver, its connections and every lane: the microVM's control is over.
@@ -306,8 +368,8 @@ impl std::fmt::Debug for Endpoint {
 impl Endpoint {
     /// Binds at `at` the endpoint of the microVM whose key is `vm`, which `controller` alone
     /// reaches, serving `streams`. Every value of its transport is its streams' (D238): each
-    /// lane's windows as its endpoint of one stream's, summed, the connection's patience the
-    /// least they admitted and its handshake and datagrams the most.
+    /// lane's windows as its endpoint of one stream's, summed, and its handshake and datagrams
+    /// the most they admitted; its liveness judged at use, as D180's links are.
     pub fn bind(
         vm: &Identity,
         controller: Fingerprint,
@@ -315,9 +377,21 @@ impl Endpoint {
         streams: Streams<'_>,
     ) -> Result<(Endpoint, Served), managed::Error> {
         let (link, mut windows) = admitted(streams)?;
+        let window = || managed::Error::Admission(AdmissionError::Window);
+        // The control lane its controller opens on each connection: its ask read through a
+        // stream's window, and its report or a refusal sent.
+        windows.streams = windows.streams.checked_add(1).ok_or_else(window)?;
+        windows.stream = windows.stream.max(CONTROL_ASK.len());
+        windows.connection = windows
+            .connection
+            .checked_add(CONTROL_ASK.len())
+            .ok_or_else(window)?;
+        windows.send = windows
+            .send
+            .checked_add(u64::try_from(NEGOTIATED_BYTES + REFUSED_BYTES).map_err(|_| window())?)
+            .ok_or_else(window)?;
         if streams.execs.is_some() {
             // One ask's lane at a time, read through a stream's window, and what it is told.
-            let window = || managed::Error::Admission(AdmissionError::Window);
             windows.streams = windows.streams.checked_add(1).ok_or_else(window)?;
             windows.connection = windows
                 .connection
@@ -326,6 +400,22 @@ impl Endpoint {
             windows.send = windows
                 .send
                 .checked_add(u64::try_from(exec::TOLD_BYTES + REFUSED_BYTES).map_err(|_| window())?)
+                .ok_or_else(window)?;
+        }
+        if let Some(admission) = streams.sockets {
+            // Each socket lane, and one more to refuse past the run's most, with what each
+            // reads and sends (unix.rs `added`); and each lane's window through one stream's.
+            let window = || managed::Error::Admission(AdmissionError::Window);
+            let (lanes, receive, send) = unix::added(admission.check()?).ok_or_else(window)?;
+            windows.streams = windows.streams.checked_add(lanes).ok_or_else(window)?;
+            windows.connection = usize::try_from(receive)
+                .ok()
+                .and_then(|r| windows.connection.checked_add(r))
+                .ok_or_else(window)?;
+            windows.send = windows.send.checked_add(send).ok_or_else(window)?;
+            windows.stream = usize::try_from(admission.window)
+                .ok()
+                .map(|w| windows.stream.max(w).max(unix::ASK_MOST))
                 .ok_or_else(window)?;
         }
         let mut config = endpoint(vm, controller, managed::transport_of(&link, windows)?)?;
@@ -339,7 +429,8 @@ impl Endpoint {
             send: windows.send,
         };
         let (execs, handed) = exec::Execs::new(streams.execs, base);
-        let lanes = Lanes::new(controller, streams, windows.streams, execs)?;
+        let (sockets, connects) = unix::Carried::new(streams.sockets);
+        let lanes = Lanes::new(controller, streams, windows.streams, execs, sockets)?;
         let (mut driver, sender) = Driver::bind_bounded(
             at,
             Some(config),
@@ -350,12 +441,12 @@ impl Endpoint {
                 // (Lanes::turn): one pending covers them all.
                 command_slots: 1,
                 queued_datagram_bytes: link.datagram_bytes,
-                handshake_patience: link.patience,
             },
         )?;
         let address = driver.local()?;
         let lanes = driver.handler_mut();
         lanes.execs.wake = Some(sender.try_clone()?);
+        lanes.sockets.wake = Some(sender.try_clone()?);
         let mut outputs = Vec::new();
         outputs
             .try_reserve_exact(lanes.outputs.len())
@@ -381,6 +472,7 @@ impl Endpoint {
                 inputs,
                 revoke: Revoke { sender },
                 execs: handed,
+                sockets: connects,
             },
         ))
     }
@@ -446,13 +538,13 @@ fn admitted(streams: Streams<'_>) -> Result<(Admitted, Windows), managed::Error>
             Some(link) => Admitted {
                 handshake_bytes: link.handshake_bytes.max(admitted.handshake_bytes),
                 datagram_bytes: link.datagram_bytes.max(admitted.datagram_bytes),
-                patience: link.patience.min(admitted.patience),
                 ..link
             },
         });
     }
-    let link = link.ok_or(managed::Error::Admission(AdmissionError::Capacity))?;
-    Ok((link, windows))
+    // An endpoint of no member stream takes the cited link (unix.rs `link`): its control lane,
+    // and its socket lanes where it admits them, have no link of their own to set it.
+    Ok((link.unwrap_or_else(unix::link), windows))
 }
 
 /// A lane's first frame, as it comes.
@@ -464,12 +556,13 @@ struct Opening {
     len: usize,
 }
 
-/// A lane's refusal, as much of its frame as has gone.
+/// A lane's last frame, its refusal or the control lane's report, as much of it as has gone.
 #[derive(Debug, Clone, Copy)]
-struct Refusing {
+struct Answering {
     conn: ConnKey,
     stream: StreamId,
-    frame: [u8; REFUSED_BYTES],
+    frame: [u8; ANSWER_MOST],
+    len: usize,
     written: usize,
 }
 
@@ -481,17 +574,18 @@ enum Serves {
 }
 
 /// The endpoint's handler. A lane is `Opening` while its first frame comes, then subscribed
-/// to its stream (step 5's states, one lane per stream) or `Refusing` while its refusal goes;
-/// a stream no lane holds is read no more. Its connections are its controller's alone, the
-/// newest last.
+/// to its stream (step 5's states, one lane per stream), or `Answering` while its last frame
+/// goes: a refusal, or the control lane's report. A stream no lane holds is read no more. Its
+/// connections are its controller's alone, the newest last.
 struct Lanes {
     controller: Fingerprint,
     outputs: Vec<managed::Service>,
     inputs: Vec<input::Service>,
     opening: Vec<Opening>,
-    refusing: Vec<Refusing>,
+    answering: Vec<Answering>,
     conns: Vec<ConnKey>,
     execs: exec::Execs,
+    sockets: unix::Carried,
 }
 
 /// Abandons `stream` both ways: what this side would send is let go (RESET_STREAM) and its
@@ -502,7 +596,7 @@ fn end(io: &mut Io<'_>, conn: ConnKey, stream: StreamId) {
 }
 
 impl Lanes {
-    /// Every stream once, each `Opening` and `Refusing` held to what the controller's
+    /// Every stream once, each `Opening` and `Answering` held to what the controller's
     /// connections may have open at once (QUIC's stream limit, RFC 9000 §4.6), so that nothing
     /// grows as the endpoint serves.
     fn new(
@@ -510,6 +604,7 @@ impl Lanes {
         streams: Streams<'_>,
         open: u32,
         execs: exec::Execs,
+        sockets: unix::Carried,
     ) -> Result<Lanes, managed::Error> {
         let allocation = managed::Error::Admission(AdmissionError::Allocation);
         let held = usize::try_from(open)
@@ -546,9 +641,10 @@ impl Lanes {
             outputs,
             inputs,
             opening: Vec::new(),
-            refusing: Vec::new(),
+            answering: Vec::new(),
             conns: Vec::new(),
             execs,
+            sockets,
         };
         let reserve = |held: usize| {
             managed::Error::Admission(if held == 0 {
@@ -559,7 +655,7 @@ impl Lanes {
         };
         lanes.opening.try_reserve_exact(held).map_err(|_| reserve(held))?;
         lanes
-            .refusing
+            .answering
             .try_reserve_exact(held)
             .map_err(|_| reserve(held))?;
         lanes
@@ -595,9 +691,10 @@ impl Lanes {
             }
         }
         self.opening.retain(|o| o.conn != conn);
-        self.refusing.retain(|r| r.conn != conn);
+        self.answering.retain(|r| r.conn != conn);
         self.conns.retain(|c| *c != conn);
         self.forget_execs(conn);
+        self.forget_sockets(conn);
     }
 
     /// The controller sent what a lane's protocol refuses: its connection is closed with why,
@@ -610,34 +707,59 @@ impl Lanes {
     /// Refuses the lane `(conn, stream)` alone: its refusal frame, then its end; nothing more of
     /// it is read. The connection and its other lanes go on.
     fn refuse_lane(&mut self, io: &mut Io<'_>, conn: ConnKey, stream: StreamId, reason: Reason) {
+        self.answer(io, conn, stream, &refused(reason));
+    }
+
+    /// Answers the control lane `(conn, stream)` with what this side's own TLS negotiated, then
+    /// its end: nothing more of it is read. A connection names both once its handshake is done,
+    /// which every lane follows; one that names none has its lane abandoned.
+    fn report(&mut self, io: &mut Io<'_>, conn: ConnKey, stream: StreamId) {
+        match io.negotiated(conn) {
+            Some(negotiated) => self.answer(io, conn, stream, &negotiated_frame(negotiated)),
+            None => end(io, conn, stream),
+        }
+    }
+
+    /// Ends the lane `(conn, stream)` with `last`, at most [`ANSWER_MOST`] bytes, as far as its
+    /// stream takes it now, and the rest as it has room ([`Lanes::turn`]); nothing more of it is
+    /// read. One with no room held for it is reset.
+    fn answer(&mut self, io: &mut Io<'_>, conn: ConnKey, stream: StreamId, last: &[u8]) {
         io.stop(conn, stream);
-        let mut refusing = Refusing {
+        let mut frame = [0; ANSWER_MOST];
+        let Some(slot) = frame.get_mut(..last.len()) else {
+            io.reset(conn, stream);
+            return;
+        };
+        slot.copy_from_slice(last);
+        let mut answering = Answering {
             conn,
             stream,
-            frame: refused(reason),
+            frame,
+            len: last.len(),
             written: 0,
         };
-        if self.refuse_more(io, &mut refusing) {
+        if self.answer_more(io, &mut answering) {
             return;
         }
-        if self.refusing.len() < self.refusing.capacity() {
-            self.refusing.push(refusing);
+        if self.answering.len() < self.answering.capacity() {
+            self.answering.push(answering);
         } else {
             io.reset(conn, stream);
         }
     }
 
-    /// Writes what is left of a refusal; whether it has all gone, its stream finished.
-    fn refuse_more(&self, io: &mut Io<'_>, refusing: &mut Refusing) -> bool {
-        while let Some(rest) = refusing.frame.get(refusing.written..).filter(|r| !r.is_empty()) {
-            match io.write(refusing.conn, refusing.stream, rest) {
+    /// Writes what is left of a lane's last frame; whether it has all gone, its stream finished.
+    fn answer_more(&self, io: &mut Io<'_>, answering: &mut Answering) -> bool {
+        let frame = answering.frame.get(..answering.len).unwrap_or_default();
+        while let Some(rest) = frame.get(answering.written..).filter(|r| !r.is_empty()) {
+            match io.write(answering.conn, answering.stream, rest) {
                 Ok(0) => return false,
-                Ok(n) => refusing.written = refusing.written.saturating_add(n),
+                Ok(n) => answering.written = answering.written.saturating_add(n),
                 // The stream is gone: nothing more to say on it.
                 Err(_) => return true,
             }
         }
-        let _ = io.finish(refusing.conn, refusing.stream);
+        let _ = io.finish(answering.conn, answering.stream);
         true
     }
 
@@ -668,8 +790,30 @@ impl Lanes {
         slot.copy_from_slice(&bytes);
         opening.len = end_at;
         let head = opening.head.get(..opening.len).unwrap_or_default();
-        // An exec's ask: read on as long as it is (exec.rs).
-        if let Ok(Some((Tag::MemberExec, len))) = frame::peek(head) {
+        // The control lane's ask, its tag alone: answered with this side's report.
+        if let Ok(Some((Tag::Control, len))) = frame::peek(head) {
+            let asked = len == 0 && head.len() == CONTROL_ASK.len();
+            self.opening.swap_remove(at);
+            if asked {
+                self.report(io, conn, stream);
+            } else {
+                self.refuse_lane(io, conn, stream, Reason::Protocol);
+            }
+            return;
+        }
+        // A socket lane's ask: read on as long as it is (unix.rs).
+        if let Ok(Some((Tag::UnixConnect, len))) = frame::peek(head) {
+            let mut came = [0; LANE_MOST];
+            let came = came.get_mut(..head.len()).map(|c| {
+                c.copy_from_slice(head);
+                &*c
+            });
+            self.opening.swap_remove(at);
+            self.begin_socket(io, conn, stream, came.unwrap_or_default(), len, ended);
+            return;
+        }
+        // An exec's ask, or an MCP connection's (D254): read on as long as it is (exec.rs).
+        if let Ok(Some((Tag::MemberExec | Tag::Mcp, len))) = frame::peek(head) {
             let mut came = [0; LANE_MOST];
             let came = came.get_mut(..head.len()).map(|c| {
                 c.copy_from_slice(head);
@@ -774,12 +918,13 @@ impl Lanes {
                 io.stop(conn, stream);
             }
         }
-        let mut refusing = std::mem::take(&mut self.refusing);
-        refusing.retain_mut(|r| !self.refuse_more(io, r));
-        self.refusing = refusing;
+        let mut answering = std::mem::take(&mut self.answering);
+        answering.retain_mut(|r| !self.answer_more(io, r));
+        self.answering = answering;
         // After the streams' own: an exec's finished outputs have ended their lanes before it
         // is let go.
         self.exec_turn(io);
+        self.socket_turn(io);
     }
 
     /// The lane `(conn, stream)` serving `which` is over: its stream waits for its next
@@ -836,6 +981,13 @@ impl Handler for Lanes {
                 why: "agent control: not the enrolled controller",
             });
         }
+        // Its TLS negotiated the suite the provider offers (D239), which its report says.
+        if !io.negotiated(conn).is_some_and(|n| n.is_provided()) {
+            return Err(Close {
+                code: Reason::Auth as u32,
+                why: "agent control: not TLS13_AES_256_GCM_SHA384",
+            });
+        }
         // Its newest connection is the one its controller uses: the older are let go, and the
         // streams their lanes held wait for the newer's.
         while let Some(old) = self.conns.pop() {
@@ -873,7 +1025,7 @@ impl Handler for Lanes {
             self.open(io, at);
             return;
         }
-        if self.read_exec(io, conn, stream) {
+        if self.read_socket(io, conn, stream) || self.read_exec(io, conn, stream) {
             self.turn(io);
             return;
         }
@@ -912,7 +1064,7 @@ impl Handler for Lanes {
     }
 
     fn stopped(&mut self, io: &mut Io<'_>, conn: ConnKey, stream: StreamId) {
-        if self.stop_exec(io, conn, stream) {
+        if self.stop_socket(io, conn, stream) || self.stop_exec(io, conn, stream) {
             return;
         }
         // Its controller reads no more of the lane, whose side here the driver has reset: the
@@ -921,7 +1073,7 @@ impl Handler for Lanes {
             Some(which) => self.leave(which),
             None => {
                 self.opening.retain(|o| o.conn != conn || o.stream != stream);
-                self.refusing.retain(|r| r.conn != conn || r.stream != stream);
+                self.answering.retain(|r| r.conn != conn || r.stream != stream);
             }
         }
         io.stop(conn, stream);
@@ -947,6 +1099,9 @@ mod tests {
 
     use super::*;
     use crate::handshake::{Side, connect};
+
+    /// How long a test waits for what it awaits: a patience of its own.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
     fn transport(serves: bool) -> TransportConfig {
         let mut transport = TransportConfig::default();
@@ -1029,7 +1184,7 @@ mod tests {
         let (vm, kiln) = (Identity::generate().unwrap(), Identity::generate().unwrap());
         let (endpoint, client) = connect(
             endpoint(&vm, kiln.fingerprint(), transport(true)).unwrap(),
-            tls::client(&kiln, vm.fingerprint()).unwrap(),
+            tls::client(&kiln, vm.fingerprint(), tls::Known::Never).unwrap(),
         );
         assert!(!endpoint.connected && !client.connected);
         assert_eq!(why(&endpoint), Ended::Protocol(By::This));
@@ -1246,7 +1401,6 @@ mod tests {
                 // RFC 8446 §4: a handshake message's uint24 length and its four-byte head.
                 handshake_bytes: (1 << 24) - 1 + 4,
                 datagram_bytes: managed::DATAGRAM_BYTES,
-                patience: tls::IDLE,
             }
         }
 
@@ -1294,6 +1448,7 @@ mod tests {
                         outputs: &[(output(Channel::Stdout), out), (output(Channel::Stderr), out)],
                         inputs: &[(stdin(), admitted(RECORD, input::TAKEN_BYTES))],
                         execs,
+                        sockets: None,
                     },
                 )
                 .unwrap();
@@ -1307,6 +1462,7 @@ mod tests {
                     mut inputs,
                     revoke,
                     execs: starts,
+                    sockets: _,
                 } = served;
                 let (relay, control) = inputs.pop().unwrap();
                 let input = Arc::new(control);
@@ -1532,7 +1688,6 @@ mod tests {
                         connections: 1,
                         command_slots: 16,
                         queued_datagram_bytes: managed::DATAGRAM_BYTES,
-                        handshake_patience: tls::IDLE,
                     },
                 )
                 .unwrap();
@@ -1556,7 +1711,7 @@ mod tests {
             /// Takes the next thing heard into what is kept of it; whether it was the
             /// connection made.
             fn hear(&mut self) -> bool {
-                match self.heard.recv_timeout(tls::IDLE * 2).unwrap() {
+                match self.heard.recv_timeout(PATIENCE * 2).unwrap() {
                     Heard::Connected => return true,
                     Heard::Bytes(lane, bytes) => self.bytes[lane].extend_from_slice(&bytes),
                     Heard::End(lane) => self.ends[lane] = Some(Heard::End(lane)),
@@ -1673,7 +1828,7 @@ mod tests {
             let mut frame = Vec::new();
             input::record(0, line, &mut frame).unwrap();
             live.send(STDIN, &frame);
-            assert_eq!(serving.records.recv_timeout(tls::IDLE).unwrap(), line.to_vec());
+            assert_eq!(serving.records.recv_timeout(PATIENCE).unwrap(), line.to_vec());
             let at = line.len() as u64;
             assert_eq!(live.take(STDIN, said), Said::Taken { accepted: at, room });
             live.send(STDIN, &input::end(at, 0));
@@ -1897,18 +2052,16 @@ mod tests {
 
         /// The endpoint's windows are its streams' own: each lane's as its endpoint of one
         /// stream bounds it, summed, the per-stream window the largest; one stream each; a
-        /// refusal's frame for each stream; the least patience and the largest handshake.
+        /// refusal's frame for each stream; the largest handshake.
         #[test]
         fn its_windows_are_its_streams_own_summed() {
             let out = admitted(100, 100 + DATA_HEAD);
-            let slow = Admitted {
-                patience: tls::QUIET,
-                ..admitted(50, input::TAKEN_BYTES)
-            };
+            let slow = admitted(50, input::TAKEN_BYTES);
             let (link, windows) = super::super::admitted(Streams {
                 outputs: &[(output(Channel::Stdout), out), (output(Channel::Stderr), out)],
                 inputs: &[(stdin(), slow)],
                 execs: None,
+                sockets: None,
             })
             .unwrap();
             let input_receive = input::receive_bytes(50).unwrap();
@@ -1921,16 +2074,40 @@ mod tests {
                     streams: 3,
                 }
             );
-            assert_eq!(link.patience, tls::IDLE);
             assert_eq!(link.handshake_bytes, out.handshake_bytes);
-            assert!(matches!(
-                super::super::admitted(Streams {
-                    outputs: &[],
-                    inputs: &[],
-                    execs: None,
-                }),
-                Err(managed::Error::Admission(AdmissionError::Capacity))
-            ));
+            // An endpoint of no stream still has its control lane (D252): the cited link, and
+            // no stream's window; it binds, serving its control lane alone.
+            let (bare, nothing) = super::super::admitted(Streams {
+                outputs: &[],
+                inputs: &[],
+                execs: None,
+                sockets: None,
+            })
+            .unwrap();
+            assert_eq!(bare.handshake_bytes, unix::HANDSHAKE_MOST);
+            assert_eq!(
+                nothing,
+                Windows {
+                    stream: 0,
+                    connection: 0,
+                    send: 0,
+                    streams: 0
+                }
+            );
+            assert!(
+                Endpoint::bind(
+                    &Identity::generate().unwrap(),
+                    [0; 32],
+                    loopback(),
+                    Streams {
+                        outputs: &[],
+                        inputs: &[],
+                        execs: None,
+                        sockets: None,
+                    },
+                )
+                .is_ok()
+            );
             let none = Admitted {
                 record_bytes: 0,
                 ..out
@@ -1940,6 +2117,7 @@ mod tests {
                     outputs: &[(output(Channel::Stdout), none)],
                     inputs: &[],
                     execs: None,
+                    sockets: None,
                 }),
                 Err(managed::Error::Admission(AdmissionError::Capacity))
             ));
@@ -1951,6 +2129,7 @@ mod tests {
                     outputs: &[(output(Channel::Stdout), out), (output(Channel::Stdout), out)],
                     inputs: &[],
                     execs: None,
+                    sockets: None,
                 },
             );
             assert!(matches!(
@@ -2056,11 +2235,14 @@ mod tests {
                 run: run(),
                 generation: GENERATION,
                 member: 0,
-                spec: spec.clone(),
+                kind: exec::Kind::Exec(Box::new(spec.clone())),
             };
             live.open(0, &ask.frame().unwrap());
-            let start = starts.recv_timeout(tls::IDLE).unwrap();
-            assert_eq!((start.exec, &start.ask.spec), (0, &spec));
+            let start = starts.recv_timeout(PATIENCE).unwrap();
+            assert_eq!(
+                (start.exec, &start.ask.kind),
+                (0, &exec::Kind::Exec(Box::new(spec.clone())))
+            );
             assert!(start.stderr.is_some() && start.stdin.is_some());
             let host = std::thread::spawn(move || stand_in(start));
             assert_eq!(live.take(0, told), exec::Told::Started(0));
@@ -2117,7 +2299,7 @@ mod tests {
                     run,
                     generation,
                     member,
-                    spec: shards_abi::run::Spec::default(),
+                    kind: exec::Kind::Exec(Box::default()),
                 }
                 .frame()
                 .unwrap()
@@ -2135,7 +2317,7 @@ mod tests {
                 assert_eq!(live.end(lane), Heard::End(lane));
             }
             live.open(3, &asked(run(), GENERATION, 0));
-            let start = starts.recv_timeout(tls::IDLE).unwrap();
+            let start = starts.recv_timeout(PATIENCE).unwrap();
             start
                 .replies
                 .tell(exec::Reply::Unstarted(exec::Unstarted::Capacity));
@@ -2157,7 +2339,7 @@ mod tests {
                 run: run(),
                 generation: GENERATION,
                 member: 0,
-                spec: shards_abi::run::Spec::default(),
+                kind: exec::Kind::Exec(Box::default()),
             };
             live.open(0, &ask.frame().unwrap());
             assert_eq!(live.take(0, refusal), Reason::Scope);
@@ -2174,15 +2356,15 @@ mod tests {
                 run: run(),
                 generation: GENERATION,
                 member: 0,
-                spec: shards_abi::run::Spec::default(),
+                kind: exec::Kind::Exec(Box::default()),
             };
             live.open(0, &ask.frame().unwrap());
-            let start = starts.recv_timeout(tls::IDLE).unwrap();
+            let start = starts.recv_timeout(PATIENCE).unwrap();
             start.replies.tell(exec::Reply::Started);
             assert_eq!(live.take(0, told), exec::Told::Started(0));
             let newer = Live::dial(&kiln, vm.fingerprint(), serving.address);
             assert_eq!(
-                start.steer.recv_timeout(tls::IDLE),
+                start.steer.recv_timeout(PATIENCE),
                 Err(mpsc::RecvTimeoutError::Disconnected)
             );
             drop(newer);
@@ -2209,13 +2391,14 @@ mod tests {
                     outputs: &outputs,
                     inputs: &inputs,
                     execs: Some(admissions),
+                    sockets: None,
                 },
             );
             let execs = dialed.execs.as_ref().unwrap();
             // Its host: the first exec it runs, the second it says did not start.
             let host = std::thread::spawn(move || {
-                stand_in(starts.recv_timeout(tls::IDLE).unwrap());
-                let refused = starts.recv_timeout(tls::IDLE).unwrap();
+                stand_in(starts.recv_timeout(PATIENCE).unwrap());
+                let refused = starts.recv_timeout(PATIENCE).unwrap();
                 refused
                     .replies
                     .tell(exec::Reply::Unstarted(exec::Unstarted::Refused));
@@ -2266,6 +2449,107 @@ mod tests {
             assert_eq!(control.wait(), Ok(0));
             assert_eq!(
                 execs.exec(0, spec).map(|_| ()),
+                Err(Fault::Unstarted(exec::Unstarted::Refused))
+            );
+            host.join().unwrap();
+        }
+
+        /// A stand-in for a host's MCP connection (D254): says it started as its harness
+        /// connected, the harness echoing every byte it is sent; as what it is sent ends,
+        /// finishes its output and says it ended, keeping its streams' controls until its
+        /// steering closes (`exec::Start::steer`).
+        fn mcp_stand_in(start: exec::Start) {
+            let exec::Start {
+                stdout,
+                stdin,
+                steer,
+                replies,
+                ..
+            } = start;
+            replies.tell(exec::Reply::Started);
+            let (relay, input) = stdin.unwrap();
+            let mut written = 0u64;
+            loop {
+                match relay.next() {
+                    Next::Record { bytes, .. } => {
+                        written += bytes.len() as u64;
+                        submit_to(&stdout, &bytes);
+                        relay.delivered(bytes);
+                    }
+                    Next::End => {
+                        input.ended(written, InputEnd::Closed);
+                        break;
+                    }
+                    Next::Abort(errno) => {
+                        input.ended(written, InputEnd::Aborted(errno));
+                        break;
+                    }
+                    Next::Gone => break,
+                }
+            }
+            stdout.1.finish().unwrap();
+            replies.tell(exec::Reply::Exited(0));
+            while steer.recv().is_ok() {}
+            drop((stdout, input));
+        }
+
+        /// An MCP connection (D254) is an exec in all but its start: the controller's ask is
+        /// handed its host as an MCP ask, one stream each way and no stderr; what the
+        /// controller sends reaches the harness exactly and what the harness sends comes back
+        /// exactly; its end is told once its bytes are consumed; and a member whose run asked
+        /// for no bridge refuses it, typed.
+        #[test]
+        fn the_controller_takes_a_members_mcp_connection_as_an_exec() {
+            let (vm, kiln) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+            let (serving, starts) = Serving::with_execs(&vm, kiln.fingerprint());
+            let (outputs, inputs) = all(0);
+            let admissions = exec::Admissions {
+                output: out_admitted(),
+                input: in_admitted(),
+            };
+            let (dialed, _driver) = drive(
+                &kiln,
+                vm.fingerprint(),
+                serving.address,
+                Subscriptions {
+                    outputs: &outputs,
+                    inputs: &inputs,
+                    execs: Some(admissions),
+                    sockets: None,
+                },
+            );
+            let execs = dialed.execs.as_ref().unwrap();
+            // Its host: the first, a harness that echoes; the second, a member with no bridge.
+            let host = std::thread::spawn(move || {
+                let start = starts.recv_timeout(PATIENCE).unwrap();
+                assert_eq!((start.exec, &start.ask.kind), (0, &exec::Kind::Mcp));
+                assert!(start.stderr.is_none() && start.stdin.is_some());
+                mcp_stand_in(start);
+                let refused = starts.recv_timeout(PATIENCE).unwrap();
+                assert_eq!(refused.ask.kind, exec::Kind::Mcp);
+                refused
+                    .replies
+                    .tell(exec::Reply::Unstarted(exec::Unstarted::Refused));
+            });
+            let McpConnection {
+                mut from,
+                mut to,
+                mut end,
+            } = execs.mcp(0).unwrap();
+            let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n";
+            assert_eq!(to.write(request).unwrap(), request.len());
+            assert_eq!(
+                from.next_record().unwrap(),
+                Got::Record {
+                    at: 0,
+                    bytes: request.to_vec()
+                }
+            );
+            assert_eq!(to.end().unwrap(), (request.len() as u64, InputEnd::Closed));
+            assert_eq!(from.next_record().unwrap(), Got::Finished);
+            assert_eq!(end.wait(), Ok(0));
+            assert_eq!(
+                execs.mcp(0).map(|_| ()),
                 Err(Fault::Unstarted(exec::Unstarted::Refused))
             );
             host.join().unwrap();
@@ -2327,6 +2611,7 @@ mod tests {
                     outputs: &outputs,
                     inputs: &inputs,
                     execs: None,
+                    sockets: None,
                 },
             );
             let out = b"\x00\xff\xfe not UTF-8 \x80, and no newline";
@@ -2360,7 +2645,7 @@ mod tests {
             }
             let mut relayed = Vec::new();
             while relayed.len() < line.len() {
-                let record = serving.records.recv_timeout(tls::IDLE).unwrap();
+                let record = serving.records.recv_timeout(PATIENCE).unwrap();
                 assert!(record.len() <= RECORD);
                 relayed.extend_from_slice(&record);
             }
@@ -2389,6 +2674,78 @@ mod tests {
             driver.join().unwrap().unwrap();
         }
 
+        /// The endpoint's report on the control lane: what its own TLS negotiated.
+        fn report(bytes: &[u8]) -> Option<(Negotiated, usize)> {
+            read_negotiated(bytes).unwrap().map(|n| (n, NEGOTIATED_BYTES))
+        }
+
+        /// A control lane's ask is answered with what the endpoint's own TLS negotiated, the
+        /// suite the provider offers under a group it names, then the lane's end; an ask of
+        /// more than its tag is refused alone, and the connection answers the next.
+        #[test]
+        fn the_control_lane_says_what_the_endpoints_own_tls_negotiated() {
+            let (vm, kiln) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+            let serving = Serving::bind(&vm, kiln.fingerprint());
+            let mut live = Live::dial(&kiln, vm.fingerprint(), serving.address);
+            live.open(0, &CONTROL_ASK);
+            let said = live.take(0, report);
+            assert_eq!(said.suite_name(), Some("TLS13_AES_256_GCM_SHA384"));
+            assert!(said.is_provided());
+            assert!(said.group_name().is_some(), "{said:?}");
+            assert!(matches!(live.end(0), Heard::End(0)));
+
+            let mut longer = CONTROL_ASK.to_vec();
+            longer[FRAME_HEAD - 1] = 1;
+            longer.push(0);
+            live.open(1, &longer);
+            assert_eq!(live.take(1, refusal), Reason::Protocol);
+            assert!(matches!(live.end(1), Heard::End(1)));
+
+            live.open(2, &CONTROL_ASK);
+            assert_eq!(live.take(2, report), said);
+            assert!(matches!(live.end(2), Heard::End(2)));
+            assert_eq!(live.lost, None);
+        }
+
+        /// kiln's side as Shards gives it: the controller reads its own TLS's negotiation and
+        /// hears the endpoint's on the control lane, the same suite and group, and again once
+        /// heard; the member's lanes go on beside it.
+        #[test]
+        fn the_controller_has_both_ends_word_on_its_tls() {
+            let (vm, kiln) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+            let serving = Serving::bind(&vm, kiln.fingerprint());
+            let (outputs, inputs) = all(0);
+            let (mut dialed, driver) = drive(
+                &kiln,
+                vm.fingerprint(),
+                serving.address,
+                Subscriptions {
+                    outputs: &outputs,
+                    inputs: &inputs,
+                    execs: None,
+                    sockets: None,
+                },
+            );
+            let link = dialed.link.wait().unwrap();
+            assert_eq!(link.controller, link.endpoint);
+            assert_eq!(
+                link.controller.suite,
+                u16::from(CipherSuite::TLS13_AES_256_GCM_SHA384)
+            );
+            assert!(link.endpoint.is_provided());
+            assert_eq!(dialed.link.wait(), Ok(link));
+            serving.submit(STDOUT, b"after");
+            assert_eq!(
+                dialed.outputs[0].next_record().unwrap(),
+                Got::Record {
+                    at: 0,
+                    bytes: b"after".to_vec()
+                }
+            );
+            drop(dialed);
+            driver.join().unwrap().unwrap();
+        }
+
         /// One record in flight, acknowledged only as the controller asks for the next: the
         /// endpoint holds a record handed out until then, and its next comes after, at its
         /// cursor.
@@ -2405,6 +2762,7 @@ mod tests {
                     outputs: &outputs,
                     inputs: &inputs,
                     execs: None,
+                    sockets: None,
                 },
             );
             serving.submit(STDOUT, b"first");
@@ -2420,7 +2778,7 @@ mod tests {
                 accepted: 5,
                 consumed: 0,
             };
-            std::thread::sleep(tls::IDLE / 10);
+            std::thread::sleep(PATIENCE / 10);
             assert_eq!(
                 serving.outputs[STDOUT].1.progress(),
                 held,
@@ -2433,8 +2791,8 @@ mod tests {
             });
             let asked = std::time::Instant::now();
             while serving.outputs[STDOUT].1.progress().consumed != 5 {
-                assert!(asked.elapsed() < tls::IDLE, "never acknowledged");
-                std::thread::sleep(tls::IDLE / 100);
+                assert!(asked.elapsed() < PATIENCE, "never acknowledged");
+                std::thread::sleep(PATIENCE / 100);
             }
             serving.submit(STDOUT, b"second");
             let (stdout, next) = reader.join().unwrap();
@@ -2481,6 +2839,7 @@ mod tests {
                     outputs: &outputs,
                     inputs: &inputs,
                     execs: None,
+                    sockets: None,
                 },
             );
             assert_eq!(
@@ -2521,6 +2880,7 @@ mod tests {
                 outputs: &outputs,
                 inputs: &inputs,
                 execs: None,
+                sockets: None,
             };
             let (mut dialed, driver) = drive(&stranger, vm.fingerprint(), serving.address, subscriptions);
             let refused = dialed.outputs[0].next_record();
@@ -2558,6 +2918,7 @@ mod tests {
                     outputs: &outputs,
                     inputs: &inputs,
                     execs: None,
+                    sockets: None,
                 },
             );
             serving.submit(STDOUT, b"once");
@@ -2584,6 +2945,7 @@ mod tests {
                     outputs: &outputs,
                     inputs: &inputs,
                     execs: None,
+                    sockets: None,
                 },
             );
             assert_eq!(
@@ -2598,8 +2960,8 @@ mod tests {
                 Err(Fault::Lost(Ended::Closed(By::Peer, Reason::Stale)))
             );
             assert_eq!(newer.inputs[0].write(b"more").unwrap(), 4);
-            assert_eq!(serving.records.recv_timeout(tls::IDLE).unwrap(), b"in");
-            assert_eq!(serving.records.recv_timeout(tls::IDLE).unwrap(), b"more");
+            assert_eq!(serving.records.recv_timeout(PATIENCE).unwrap(), b"in");
+            assert_eq!(serving.records.recv_timeout(PATIENCE).unwrap(), b"more");
             // Asking for the next acknowledges "once", which makes the endpoint's room for it.
             let mut stdout = newer.outputs.remove(0);
             let reader = std::thread::spawn(move || stdout.next_record());
@@ -2611,6 +2973,31 @@ mod tests {
                     bytes: b"twice".to_vec()
                 }
             );
+        }
+
+        /// What a controller was granted as it dialed is named as Shards names its lanes (goal
+        /// 60's `lanes`): its control lane, then each subscription's stream in its order; an
+        /// exec's, a socket's and an MCP bridge's names where they are granted.
+        #[test]
+        fn a_dials_lanes_are_named_as_granted() {
+            let (vm, kiln) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+            let serving = Serving::bind(&vm, kiln.fingerprint());
+            let (outputs, inputs) = all(0);
+            let (dialed, _driver) = drive(
+                &kiln,
+                vm.fingerprint(),
+                serving.address,
+                Subscriptions {
+                    outputs: &outputs,
+                    inputs: &inputs,
+                    execs: None,
+                    sockets: None,
+                },
+            );
+            let names: Vec<String> = dialed.lanes().iter().map(Granted::name).collect();
+            assert_eq!(names, ["control", "stdout:0", "stderr:0", "stdin:0"]);
+            let others = [Granted::Execs, Granted::Sockets, Granted::Mcp(2)].map(|g| g.name());
+            assert_eq!(others, ["exec", "socket", "mcp:2"]);
         }
 
         /// A revoked output ends its lane alone, `Revoked`; an aborted stdin ends with its
@@ -2629,6 +3016,7 @@ mod tests {
                     outputs: &outputs,
                     inputs: &inputs,
                     execs: None,
+                    sockets: None,
                 },
             );
             serving.submit(STDOUT, b"before");
@@ -2645,15 +3033,13 @@ mod tests {
             driver.join().unwrap().unwrap();
         }
 
-        /// The controller's windows are its lanes' own, from the endpoint's admissions: what
-        /// the endpoint sends on each before it is read, summed; what it sends on each, summed;
-        /// no stream the endpoint may open; the least patience and the largest handshake.
+        /// The controller's windows are its lanes' own, from the endpoint's admissions, the
+        /// control lane's among them: what the endpoint sends on each before it is read,
+        /// summed; what it sends on each, summed; no stream the endpoint may open; the largest
+        /// handshake.
         #[test]
         fn the_controllers_windows_are_its_lanes_own_summed() {
-            let slow = Admitted {
-                patience: tls::QUIET,
-                ..admitted(50, input::TAKEN_BYTES)
-            };
+            let slow = admitted(50, input::TAKEN_BYTES);
             let (link, windows) = super::super::drive::windows(Subscriptions {
                 outputs: &[
                     (output(Channel::Stdout), out_admitted(), 0),
@@ -2661,31 +3047,37 @@ mod tests {
                 ],
                 inputs: &[(stdin(), slow, 0)],
                 execs: None,
+                sockets: None,
             })
             .unwrap();
             let ack = 5 + 8;
+            // The control lane: its report or a refusal read, its ask sent.
+            let (report, ask) = (NEGOTIATED_BYTES.max(REFUSED_BYTES), CONTROL_ASK.len());
             assert_eq!(
                 windows,
                 Windows {
                     stream: RECORD + DATA_HEAD,
-                    connection: 2 * (RECORD + DATA_HEAD) + input::TAKEN_BYTES,
+                    connection: 2 * (RECORD + DATA_HEAD) + input::TAKEN_BYTES + report,
                     send: (2 * (managed::CONTROL_BYTES + ack)
                         + input::SUBSCRIBE_BYTES
                         + input::RECORD_HEAD
                         + 50
-                        + input::END_BYTES) as u64,
+                        + input::END_BYTES
+                        + ask) as u64,
                     streams: 0,
                 }
             );
-            assert_eq!(link.patience, tls::IDLE);
-            assert!(matches!(
-                super::super::drive::windows(Subscriptions {
-                    outputs: &[],
-                    inputs: &[],
-                    execs: None,
-                }),
-                Err(managed::Error::Admission(AdmissionError::Capacity))
-            ));
+            assert_eq!(link.handshake_bytes, slow.handshake_bytes);
+            // A controller of no stream still opens its control lane (D252), on the cited link.
+            let (bare, control) = super::super::drive::windows(Subscriptions {
+                outputs: &[],
+                inputs: &[],
+                execs: None,
+                sockets: None,
+            })
+            .unwrap();
+            assert_eq!(bare.handshake_bytes, unix::HANDSHAKE_MOST);
+            assert!(control.connection > 0 && control.send > 0, "{control:?}");
         }
     }
 }

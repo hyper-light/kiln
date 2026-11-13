@@ -32,11 +32,10 @@
 //!   the `build` legs kiln's CI ran from 2026-10-22 to 2026-11-05 (bench/sched/kiln-ci-20261022-20261105.trace), a CI
 //!   job's box beside the agents. macOS holds a process box at no CPU cap (refused, typed): there the box books its
 //!   memory alone and its spinners ask a CPU each, taking what the scheduler gives them;
-//! - the deadline guarding the node's start and each create (a VM's create boots it, past the client's learned create
-//!   bound): twice the node's own boot bound for the class, so the node's refusal, typed, comes first. `shards`: the
-//!   guest's dial bound, twice the slowest boot to ready this host's class records (bench/native/guest/records.tsv);
-//!   `shards-image`: the image boot's, twice its `image_boot` record, refused, naming the record to take, until
-//!   records.tsv holds one, as the class's creates are; `firecracker`: its configured `boot_ms`;
+//! - no wait of its own is a timer (the person's rule, 2026-11-13, and Shards' R03 for test waits): each call waits
+//!   for its answer while the node's connection stands, every wait of the run unarmed
+//!   (`hex_core::patience::measure_all`), and the node's start waits for its ready line while the node runs, its end
+//!   the refusal; the node's own waits refuse, typed, as theirs do. No boot record is read;
 //! - the run's window: the node's learner's, as the node says it.
 //!
 //! Inputs, each by its own variable, a missing one failing by name:
@@ -319,35 +318,6 @@ fn box_spec(id: BoxId, booked: CapacityResources) -> BoxSpec {
     }
 }
 
-/// The deadline guarding the node's start and each create of `kind`: twice the node's own boot bound for the class, so
-/// the node's refusal, typed, comes first (module docs).
-fn guard(kind: Kind) -> Duration {
-    let node = match kind {
-        Kind::Shards => {
-            2 * hex_runtime::guest::recorded_boot().unwrap_or_else(|why| panic!("{why}"))
-        }
-        Kind::Image => {
-            2 * hex_runtime::guest::recorded("image_boot").unwrap_or_else(|why| panic!("{why}"))
-        }
-        Kind::Firecracker => firecracker_boot(),
-    };
-    2 * node
-}
-
-/// The Firecracker backend's configured boot bound (`HEX_FIRECRACKER_CONFIG`'s `boot_ms`).
-#[cfg(target_os = "linux")]
-fn firecracker_boot() -> Duration {
-    let path = PathBuf::from(input("HEX_FIRECRACKER_CONFIG"));
-    hex_runtime::firecracker::Config::from_file(&path)
-        .unwrap_or_else(|why| panic!("HEX_FIRECRACKER_CONFIG: {why}"))
-        .boot_timeout
-}
-
-#[cfg(not(target_os = "linux"))]
-fn firecracker_boot() -> Duration {
-    panic!("firecracker VMs run on Linux alone")
-}
-
 /// The VMs' class, as `HEX_CHARGE_CLASS` names it, and the node class its capacity is asked of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -448,7 +418,7 @@ struct Node {
 }
 
 impl Node {
-    fn start(work: &Path, wait: Duration) -> Self {
+    fn start(work: &Path) -> Self {
         let socket = work.join("node.sock");
         let stderr = work.join("node.stderr");
         let mut command = Command::new(env!("CARGO_BIN_EXE_hex"));
@@ -478,15 +448,15 @@ impl Node {
                 }
             }
         });
-        // The node's own "ready <socket>" line is the fact waited on; the run's deadline only guards it.
+        // The node's own "ready <socket>" line is the fact waited on, as long as the node runs: its stdout's end, with
+        // it, is the refusal.
         let want = format!("ready {}", socket.display());
-        let until = Instant::now() + wait;
         loop {
-            match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            match rx.recv() {
                 Ok(line) if line == want => break,
                 Ok(line) => eprintln!("node: {line}"),
                 Err(e) => panic!(
-                    "node not ready: {e}; stderr: {}",
+                    "node ended before it was ready: {e}; stderr: {}",
                     fs::read_to_string(&stderr).unwrap_or_default()
                 ),
             }
@@ -670,10 +640,10 @@ const BOX: u32 = u32::MAX;
 #[test]
 #[ignore = "ROOT's run on a real host: VMs, a delegated cgroup on Linux, recorded traces (module docs)"]
 fn the_learned_charge_holds_density_and_fairness_on_this_host() {
+    // Every wait of the run measures, unarmed: each call waits for its answer while the node's connection stands.
     hex_core::patience::measure_all();
     let kind = Kind::named();
     let class = kind.class();
-    let wait = guard(kind);
     let out = PathBuf::from(input("HEX_CHARGE_OUT"));
     // A run's node starts from no records: one left by an earlier run would be recovered into this one.
     assert!(
@@ -687,11 +657,11 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
     if kind == Kind::Image {
         pull_image(&out.join("state"));
     }
-    let node = Node::start(&out, wait);
+    let node = Node::start(&out);
     let window = node.window();
     let client = Client::connect(&node.socket).unwrap();
     let capacity = client
-        .capacity_before(class, Instant::now() + wait)
+        .capacity(class)
         .unwrap()
         .expect("the class's capacity");
     let cost = capacity.cost.expect("the class's cost profile");
@@ -723,11 +693,10 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
     // The process box under contention: it books its caps and asks its CPU whole.
     let boxed = BoxId::new("charge-box").unwrap();
     let _spinning = client
-        .run_before(
+        .run(
             box_spec(boxed.clone(), box_booked),
             spinner(box_caps.cpu_milli),
             Stdio::null(),
-            Instant::now() + wait,
         )
         .unwrap();
     let begun = Instant::now();
@@ -758,7 +727,7 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
     while begun.elapsed() < run {
         hex_wait::rest_until(next).unwrap();
         let capacity = client
-            .capacity_before(class, Instant::now() + wait)
+            .capacity(class)
             .unwrap()
             .expect("the class's capacity");
         let held = holdings(&capacity);
@@ -800,10 +769,7 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
                 let n = u32::try_from(admitted).unwrap();
                 let id = BoxId::new(&format!("charge-vm-{n}")).unwrap();
                 let info = client
-                    .create_before(
-                        kind.spec(id.clone(), &player(trace, &steps), next_receipt, workload),
-                        Instant::now() + wait,
-                    )
+                    .create(kind.spec(id.clone(), &player(trace, &steps), next_receipt, workload))
                     .unwrap();
                 if info.state == BoxState::Created {
                     client.start(&id).unwrap();
@@ -918,7 +884,7 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
             }
             // The riser is kept to the end, for its inspect.
             if id.as_str() != "charge-vm-0"
-                && let Err(why) = client.delete_before(&id, Instant::now() + wait)
+                && let Err(why) = client.delete(&id)
             {
                 eprintln!("CHARGE delete {id}: {why}");
             }
@@ -935,10 +901,10 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
     let (learner, measured) = learner_cpu(node.child.id());
     let riser = client.inspect(&BoxId::new("charge-vm-0").unwrap()).ok();
     for vm in &vms {
-        let _ = client.delete_before(&vm.id, Instant::now() + wait);
+        let _ = client.delete(&vm.id);
     }
-    let _ = client.delete_before(&BoxId::new("charge-vm-0").unwrap(), Instant::now() + wait);
-    let _ = client.delete_before(&boxed, Instant::now() + wait);
+    let _ = client.delete(&BoxId::new("charge-vm-0").unwrap());
+    let _ = client.delete(&boxed);
     fs::write(out.join("windows.tsv"), tsv).unwrap();
 
     let cast = Cast {
@@ -968,12 +934,11 @@ fn the_learned_charge_holds_density_and_fairness_on_this_host() {
     );
     println!(
         "HEX-CHARGE-FLEET inputs workload_cpu_milli={} workload_mem_bytes={} allocation={:?} box_asks_milli={box_cpu} \
-         box_booked={:?} guard_ms={} traces={}",
+         box_booked={:?} traces={}",
         workload.cpu_milli,
         workload.mem_bytes,
         allocation.resources,
         box_booked,
-        wait.as_millis(),
         traces.len()
     );
     println!(
@@ -1061,6 +1026,25 @@ fn w14_the_box_beside_the_fleet_runs_its_spinners_under_its_bounds() {
         "the box's spinner ended before its {members} members ran, under {:?}: {usage:?}",
         box_spec(id, box_booking(caps)).bounds
     );
+}
+
+/// Joint plan step 14 (AC-T7.4.1; the person's rule, 2026-11-13, and Shards' R03 for test waits): the driver times
+/// none of its waits and reads no record. Each client call waits for its answer while the node's connection stands, its
+/// waits unarmed (`hex_core::patience::measure_all`), and the node's start for its ready line while the node runs.
+/// Do read the driver's own source; expect no caller deadline, no timed receive and no record of boots read.
+#[test]
+fn w14_the_driver_times_no_wait_and_reads_no_record() {
+    let source = include_str!("charge_fleet.rs");
+    for timer in [
+        concat!("_be", "fore("),
+        concat!("recv_", "timeout"),
+        concat!("guest::", "recorded"),
+    ] {
+        assert!(
+            !source.contains(timer),
+            "the driver still times a wait or reads a record: {timer}"
+        );
+    }
 }
 
 /// Joint plan step 14 (AC-T7.4.1): the process box is a CI job's, each of its caps derived from kiln's CI. Do reckon

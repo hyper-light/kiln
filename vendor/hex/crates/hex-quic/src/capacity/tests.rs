@@ -10,23 +10,41 @@ use hex_api::capacity::{
     Amounts, Budget, Close, Event, Holder, Out, ReservationId, ToHolder, ToKeeper, Why,
 };
 use hex_core::patience::Patience;
-use hex_testkit::waits::within;
+use hex_testkit::waits::follow::{self, Party};
 use hyper_quic::rustls;
 
 use super::*;
 use crate::enroll::{self, sim::SimCa};
 use crate::{Config, Shape, tls};
 
-// Each wait over loopback is for its own fact, named for it. No census over QUIC has recorded one yet, so each
-// measures, for the fact alone, its answers recorded for the census that will seed it (hex-testkit's rule).
-/// A dial's answer: its handshake, taken or refused, and the keeper's endpoint's Welcome.
-static DIAL: Patience = Patience::measuring("test.hex_quic.capacity.dial");
-/// Room on the keeper's port for what a holder says: the keeper's grants.
-static SAY: Patience = Patience::measuring("test.hex_quic.capacity.say");
+// Each read over loopback waits for its own fact, named for it, following the keeper by its life alone (decision 9):
+// past the slowest answer seen it goes on, and ends with the answer or the link's end, which the read says itself. A
+// dial and a write wait for their answers with no deadline of the test's: the driver ends a dial nothing answers once
+// QUIC's idle timeout passes (RFC 9000 §10.1), and a write cut at a slice's end would leave half a message on the link.
 /// The keeper's next word to a holder: its answer to what the holder said, or a hint.
 static HEAR: Patience = Patience::measuring("test.hex_quic.capacity.hear");
 /// The keeper's reset of a connection that broke the protocol.
 static RESET: Patience = Patience::measuring("test.hex_quic.capacity.reset");
+
+/// A read's answer within its slice of a following wait, or `None` where the slice ended first.
+fn sliced<T>(answer: Result<T, Refused>) -> Option<Result<T, Refused>> {
+    match answer {
+        Err(Refused::Deadline { .. }) => None,
+        answer => Some(answer),
+    }
+}
+
+/// The keeper's next word on `link`.
+fn heard(link: &mut Link) -> ToHolder {
+    follow::within(
+        &HEAR,
+        "the keeper's next word",
+        || Party::Live,
+        |by| sliced(link.hear(by)),
+    )
+    .unwrap()
+    .unwrap()
+}
 
 fn loopback() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
@@ -81,9 +99,9 @@ fn talk(link: &mut Link, holder: &mut Holder, first: Vec<ToKeeper>) -> Vec<Event
     let mut queue = VecDeque::from(first);
     let mut events = Vec::new();
     while let Some(msg) = queue.pop_front() {
-        within(&SAY, |by| link.say(&msg, by)).unwrap();
+        link.say(&msg, None).unwrap();
         loop {
-            let answer = within(&HEAR, |by| link.hear(by)).unwrap();
+            let answer = heard(link);
             let hint = matches!(answer, ToHolder::Hint { .. });
             let mut out = Out::default();
             holder.hear(answer, &mut out);
@@ -133,10 +151,9 @@ fn holders_reserve_through_their_keeper_over_quic() {
     };
 
     let a_end = endpoint(&ca, "kiln-a.capacity.test", false);
-    let a_peer = within(&DIAL, |by| {
-        a_end.dial("keeper.capacity.test", node.local_addr(), by)
-    })
-    .unwrap();
+    let a_peer = a_end
+        .dial("keeper.capacity.test", node.local_addr(), None)
+        .unwrap();
     let (suite, _) = a_end.negotiated(a_peer).unwrap().unwrap();
     assert_eq!(suite, rustls::CipherSuite::TLS13_AES_256_GCM_SHA384);
     let mut a_link = Link::open(&a_end, a_peer).unwrap();
@@ -149,10 +166,9 @@ fn holders_reserve_through_their_keeper_over_quic() {
     );
 
     let b_end = endpoint(&ca, "kiln-b.capacity.test", false);
-    let b_peer = within(&DIAL, |by| {
-        b_end.dial("keeper.capacity.test", node.local_addr(), by)
-    })
-    .unwrap();
+    let b_peer = b_end
+        .dial("keeper.capacity.test", node.local_addr(), None)
+        .unwrap();
     let mut b_link = Link::open(&b_end, b_peer).unwrap();
     let mut b = Holder::start("kiln-b.capacity.test".into(), 1, 8, &[]).unwrap();
     join(&mut b_link, &mut b);
@@ -162,7 +178,7 @@ fn holders_reserve_through_their_keeper_over_quic() {
         talk(&mut a_link, &mut a, vec![msg]),
         vec![Event::Granted(half)]
     );
-    let hint = within(&HEAR, |by| b_link.hear(by)).unwrap();
+    let hint = heard(&mut b_link);
     assert!(matches!(hint, ToHolder::Hint { .. }), "{hint:?}");
     let mut out = Out::default();
     b.hear(hint, &mut out);
@@ -220,17 +236,23 @@ fn a_connection_that_breaks_the_protocol_is_reset() {
         std::thread::spawn(move || server.serve(acceptor));
     }
     let end = endpoint(&ca, "kiln-bad.capacity.test", false);
-    let peer = within(&DIAL, |by| {
-        end.dial("keeper-bad.capacity.test", node.local_addr(), by)
-    })
-    .unwrap();
+    let peer = end
+        .dial("keeper-bad.capacity.test", node.local_addr(), None)
+        .unwrap();
     let conn = end.open(peer, CAPACITY_PORT).unwrap();
-    within(&SAY, |by| {
-        conn.write_all(&[0, 0, 0, 3, b'{', b'{', b'{'], by)
-    })
-    .unwrap();
+    conn.write_all(&[0, 0, 0, 3, b'{', b'{', b'{'], None)
+        .unwrap();
     let mut buf = [0u8; 16];
-    let read = within(&RESET, |by| conn.read(&mut buf, by));
+    let read = follow::within(
+        &RESET,
+        "the keeper's reset",
+        || Party::Live,
+        |by| match conn.read(&mut buf, by) {
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => None,
+            read => Some(read),
+        },
+    )
+    .unwrap();
     assert!(
         read.is_err() || read.as_ref().is_ok_and(|n| *n == 0),
         "{read:?}"
@@ -243,10 +265,9 @@ fn a_connection_that_breaks_the_protocol_is_reset() {
 /// A link to the keeper at `node` from a new endpoint enrolled as `name`.
 fn linked(ca: &SimCa, node: &Endpoint, name: &str) -> (Endpoint, Link) {
     let end = endpoint(ca, name, false);
-    let peer = within(&DIAL, |by| {
-        end.dial("keeper-auth.capacity.test", node.local_addr(), by)
-    })
-    .unwrap();
+    let peer = end
+        .dial("keeper-auth.capacity.test", node.local_addr(), None)
+        .unwrap();
     let link = Link::open(&end, peer).unwrap();
     (end, link)
 }
@@ -300,9 +321,9 @@ fn only_the_holders_its_host_authorizes_are_served() {
         id: ReservationId { epoch: 1, seq: 7 },
         amount: cpu(3000),
     };
-    within(&SAY, |by| m_link.say(&theirs, by)).unwrap();
+    m_link.say(&theirs, None).unwrap();
     assert_eq!(
-        within(&HEAR, |by| m_link.hear(by)).unwrap(),
+        heard(&mut m_link),
         ToHolder::Closed {
             rejected: Some(fence),
             why: Close::NotAuthorized

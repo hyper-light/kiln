@@ -558,7 +558,6 @@ fn delete_ends_a_boxs_grandchildren() {
 /// The grandchild's pid from the member's `grandchild=<pid>` line, read from the pipe (blocking until
 /// the member writes and flushes it).
 fn read_grandchild_pid(r: &mut std::io::PipeReader) -> u32 {
-    let deadline = Instant::now() + conformance::patience();
     let mut buf = Vec::new();
     let mut chunk = [0u8; 256];
     loop {
@@ -568,7 +567,6 @@ fn read_grandchild_pid(r: &mut std::io::PipeReader) -> u32 {
         {
             return pid;
         }
-        assert!(Instant::now() < deadline, "no grandchild pid: {buf:?}");
         let n = r.read(&mut chunk).expect("read");
         assert!(n > 0, "the member closed its output before a pid: {buf:?}");
         buf.extend_from_slice(&chunk[..n]);
@@ -586,27 +584,19 @@ fn alive(pid: u32) -> bool {
     text.contains(&format!("\"{pid}\""))
 }
 
-/// `p`'s end, waited for within the suite's learned wait ([`conformance::patience`]), which the end's
-/// time teaches (Hex's rule for learned waits); the time is printed, so a run's ends can be recorded.
+/// `p`'s end, followed to it as the suite waits ([`conformance::end_of`]), the end's time teaching the suite's wait;
+/// the time is printed, so a run's ends can be recorded.
 fn end_of(p: &mut dyn hex_api::Proc, what: &str) -> Exit {
     let asked = Instant::now();
-    let exit = p
-        .wait_for(conformance::patience())
-        .expect("wait")
-        .unwrap_or_else(|| panic!("{what}: no end within {:?}", conformance::patience()));
-    let took = asked.elapsed();
-    conformance::ENDS.saw(took);
-    eprintln!("END {what} {} ms", took.as_millis());
+    let exit = conformance::end_of(p).unwrap_or_else(|e| panic!("{what}: {e}"));
+    eprintln!("END {what} {} ms", asked.elapsed().as_millis());
     exit
 }
 
+/// Waits for `cond`, the fact `what`, as a test's wait waits for its fact (decision 9): until it holds.
 fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
-    let deadline = Instant::now() + conformance::patience();
-    while Instant::now() < deadline {
-        if cond() {
-            return;
-        }
+    let _ = what;
+    while !cond() {
         std::thread::yield_now();
     }
-    panic!("timed out waiting for: {what}");
 }

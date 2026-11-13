@@ -249,7 +249,8 @@ impl Config {
             stop_timeout: Duration::from_millis(u64::from(input.stop_ms)),
             operation_timeout: Duration::from_millis(u64::from(input.operation_ms)),
             cost_evidence: path(input.cost_evidence)?,
-            cost: input.cost,
+            // Its census's overheads are evidence alone (joint plan step 14, `RuntimeCost::census_free`).
+            cost: input.cost.census_free(),
             stage_limits: Limits {
                 entries: input.staging.entries,
                 bytes: input.staging.bytes,
@@ -1037,7 +1038,15 @@ mod tests {
         let original = json();
         let bytes = serde_json::to_vec(&original).unwrap();
         let parsed = Config::parse(&bytes).unwrap();
-        assert_eq!(parsed.cost, cost());
+        // Its census's overheads are evidence alone (joint plan step 14; ROOT, 2026-11-13, by decision 9's rule).
+        assert_eq!(
+            parsed.cost,
+            RuntimeCost {
+                guest_overhead: hex_api::CapacityResources::default(),
+                overhead: hex_api::CapacityResources::default(),
+                ..cost()
+            }
+        );
         assert_eq!(parsed.operation_timeout, Duration::from_secs(1));
         for key in original.as_object().unwrap().keys() {
             let mut absent = original.clone();
@@ -1121,9 +1130,22 @@ mod tests {
             passthrough("pci_7900", "0000:79:00.0", true),
             passthrough("pci_8100", "0000:81:00.0", true),
         ];
+        // Admitted against the parsed profile, its census's overheads evidence alone (joint plan step 14).
+        let mut spec = spec();
+        spec.allocation = spec
+            .allocation
+            .map(|_| {
+                config.cost.allocate(hex_api::CapacityResources {
+                    cpu_milli: 1500,
+                    mem_bytes: 65 << 20,
+                    disk_bytes: 0,
+                })
+            })
+            .transpose()
+            .unwrap();
         let vm = serde_json::to_value(
             config
-                .machine(&spec(), Path::new("/private/owned/vsock"), &devices)
+                .machine(&spec, Path::new("/private/owned/vsock"), &devices)
                 .unwrap(),
         )
         .unwrap();

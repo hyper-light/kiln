@@ -591,7 +591,7 @@ mod waits {
         let events = vec![user(1, "m", "go"), says(2, "STUB_DONE")];
         let over = json!({"delivery": {"m": "completed"}, "queue": []});
         let mut w = Watch::new(Asked::Message("m"), None);
-        assert!(w.wants_state(&idle, &events));
+        assert!(w.wants_state(&idle, &events, s(1)));
         assert_eq!(w.look(&idle, &events, Some(&over), false, s(1)), Verdict::Refuse(Stall::Stuck(Stuck::Answered)));
         let wait = |info: &Value, state: Option<&Value>| Watch::new(Asked::Message("m"), None).look(info, &events, state, false, s(1));
         assert_eq!(wait(&idle, None), Verdict::Wait, "its state unread says nothing");
@@ -600,9 +600,9 @@ mod waits {
         assert_eq!(wait(&idle, Some(&json!({"delivery": {"m": "completed"}, "queue": [{"id": "k"}]}))), Verdict::Wait, "kiln's queue holds one");
         for (key, value) in [("queued", json!(1)), ("room_wait", json!(5)), ("pause", json!({"why": "limit"})), ("last_turn", json!({"at": 3, "how": "cut"}))] {
             let held = with(&idle, key, value);
-            assert!(!Watch::new(Asked::Message("m"), None).wants_state(&held, &events), "{key}");
+            assert!(!Watch::new(Asked::Message("m"), None).wants_state(&held, &events, s(1)), "{key}");
         }
-        assert!(!w.wants_state(&word("running"), &events));
+        assert!(!w.wants_state(&word("running"), &events, s(1)));
         // The opening prompt, under kiln's id of the session's own; a message told by words it carries
         // (sent through kiln's MCP tools), under the client id kiln gave it.
         let opening = vec![user(1, &opening_id("s1"), "do the task")];
@@ -610,7 +610,7 @@ mod waits {
         assert_eq!(Watch::new(Asked::Opening, None).look(&idle, &opening, Some(&opened), false, s(1)), Verdict::Refuse(Stall::Stuck(Stuck::Answered)));
         let carried = vec![json!({"seq": 1, "at": 1, "kind": "user", "text": "SLOW=2000 keep going long-x1", "client_id": "k77"})];
         assert_eq!(Watch::new(Asked::Message("long-x1"), None).look(&idle, &carried, Some(&json!({"delivery": {"k77": "cancelled"}})), false, s(1)), Verdict::Refuse(Stall::Stuck(Stuck::Answered)));
-        assert!(!Watch::new(Asked::Message("long-x2"), None).wants_state(&idle, &carried), "another's words");
+        assert!(!Watch::new(Asked::Message("long-x2"), None).wants_state(&idle, &carried, s(1)), "another's words");
     }
 
     /// A setup wait refuses at once, typed, once a process of the fixture's own ended (its runner, its
@@ -678,6 +678,32 @@ mod waits {
         assert_eq!(opened(400, "agent:box is not connected", false), Setup::Wait, "between connections");
         assert_eq!(opened(503, "busy", true), Setup::Wait, "the server's own trouble");
         assert_eq!(opened(200, "[]", false), Setup::Refuse(SetupStuck::Refused { code: 200, body: "[]".into() }), "no session");
+    }
+
+    /// A message kiln holds in its custody (its delivery `queued`, as kiln's admission holds a resumed
+    /// prompt: ROOT's runs of 2026-11-13) is held, not quiet: past the window the wait says so and goes
+    /// on, the window starting again. A message kiln neither delivers nor holds for a whole window is
+    /// refused. Taking every quiet window for a refusal (the hold not read) refused cursor's, gemini's and
+    /// goose's held resumes at their slowest answers.
+    #[test]
+    fn s35_a_message_kiln_holds_is_held_not_quiet() {
+        let info = with(&with(&word("idle"), "queued", json!(1)), "admission", json!({"learning": "bootstrap", "target": 2, "admitted": 1, "depth": 2}));
+        let events = vec![user(1, "m", "again")];
+        let held = json!({"delivery": {"m": "queued"}, "queue": [{"id": "m", "text": "again"}]});
+        let mut w = Watch::new(Asked::Message("m"), Some(s(11)));
+        assert_eq!(w.look(&info, &events, None, false, s(0)), Verdict::Wait);
+        assert!(!w.wants_state(&info, &events, s(5)) && w.wants_state(&info, &events, s(12)), "its state read as its window runs out");
+        let first = w.look(&info, &events, Some(&held), false, s(12));
+        assert!(matches!(&first, Verdict::Held(why) if why.contains("m queued") && why.contains("bootstrap")), "{first:?}");
+        assert_eq!(w.look(&info, &events, Some(&held), false, s(20)), Verdict::Wait, "the window starts again at the hold");
+        assert!(matches!(w.look(&info, &events, Some(&held), false, s(24)), Verdict::Held(_)), "held still");
+        // Let go of, and neither delivered nor held for a whole window: refused.
+        let gone = json!({"delivery": {}, "queue": []});
+        assert_eq!(w.look(&info, &events, Some(&gone), false, s(36)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
+        // A message by words it carries is held under the client id kiln gave it.
+        let carried = vec![json!({"seq": 1, "at": 1, "kind": "user", "text": "do the task again x7", "client_id": "k9"})];
+        assert!(holds(&info, &carried, Some(&json!({"delivery": {"k9": "queued"}})), "again x7").is_some());
+        assert_eq!(holds(&info, &carried, None, "again x7"), None, "unread, it says nothing");
     }
 
     /// The stand-in's stopped turn says nothing once it heard, until it's stopped: a line of it after

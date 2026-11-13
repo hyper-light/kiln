@@ -26,8 +26,10 @@ use std::time::{Duration, Instant};
 
 use hex_api::conformance::{Act, Fixture};
 use hex_api::differential;
-use hex_api::{Bounds, BoxId, BoxSpec, ClassSpec, Program, Runtime, Signal, Stdio};
+use hex_api::{Bounds, BoxId, BoxSpec, ClassSpec, Exit, Program, Refusal, Runtime, Signal, Stdio};
+use hex_core::patience::Patience;
 use hex_node::Node;
+use hex_testkit::waits::until;
 
 struct BinFixture {
     exe: String,
@@ -74,35 +76,21 @@ impl Fixture for BinFixture {
     }
 }
 
-/// This process's cgroup directory under /sys/fs/cgroup.
-fn own_cgroup() -> PathBuf {
-    let own = std::fs::read_to_string("/proc/self/cgroup").expect("/proc/self/cgroup");
-    let rel = own
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .expect("a 0:: cgroup line")
-        .trim_start_matches('/');
-    PathBuf::from("/sys/fs/cgroup").join(rel)
-}
-
-/// Moves this process into a leaf of its own cgroup and confirms the cgroup can hand every controller
-/// down (a box root opens with all of them). Returns the own cgroup dir on success; `Err` when the
-/// cgroup isn't ours to subdivide (shared with other processes, or controllers not delegated).
+/// This process's own cgroup, delegated to it and prepared once for every test in this binary
+/// (`hex_testkit::cgroup::delegated`: the process and every process of its own moved into a leaf), or why it isn't
+/// ours to subdivide. The probe root's opening proves every controller a box uses is delegated here: `BoxRoot::open`
+/// refuses by name otherwise (HEX-INST-1).
 fn prepare_cgroup(disk: &Path) -> Result<PathBuf, String> {
-    let own = own_cgroup();
-    let leaf = own.join("hex-agent");
-    std::fs::create_dir_all(&leaf).map_err(|e| format!("making a leaf for the agent: {e}"))?;
-    std::fs::write(leaf.join("cgroup.procs"), format!("{}", std::process::id()))
-        .map_err(|e| format!("moving self into a leaf: {e}"))?;
-    // The probe root opening proves every controller a box uses is delegated here: `BoxRoot::open`
-    // refuses by name otherwise (HEX-INST-1).
-    hex_runtime::linux::cgroup::BoxRoot::open(
-        &own.join("hex-probe"),
-        hex_runtime::linux::disks::under(disk).unwrap_or_default(),
-    )
-    .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_dir(own.join("hex-probe"));
-    Ok(own)
+    hex_testkit::cgroup::delegated(|own| {
+        let probe = hex_runtime::linux::cgroup::BoxRoot::open(
+            &own.join("hex-probe"),
+            hex_runtime::linux::disks::under(disk).unwrap_or_default(),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+        let _ = std::fs::remove_dir(own.join("hex-probe"));
+        probe
+    })
 }
 
 fn cache_dir() -> PathBuf {
@@ -122,6 +110,7 @@ fn process_boxes_hold_the_contract_and_recover() {
             exercise_conformance(&own, &cache, &exe);
             exercise_recovery(&own, &cache, &exe);
             exercise_clone_into_cgroup(&own);
+            exercise_a_delete_beside_a_runs_removal(&own, &cache, &exe);
         }
         Err(direct) if std::env::var_os("HEX_DELEGATED").is_none() => {
             let has_systemd = Command::new("systemd-run")
@@ -155,14 +144,9 @@ fn process_boxes_hold_the_contract_and_recover() {
                 .expect("run the test in a delegated scope");
             assert!(status.success(), "the delegated re-run failed");
         }
-        Err(direct) => {
-            hex_testkit::skip(
-                "process_boxes_hold_the_contract_and_recover",
-                "cgroup v2 delegation",
-                &format!("none in the delegated scope either ({direct}); run on a cgroup-v2 host"),
-            )
-            .expect("recording the skip");
-        }
+        // HEX_DELEGATED promised this binary a cgroup delegated to it: a preparation that fails there fails the test,
+        // never a skip that would hide the breakage.
+        Err(direct) => panic!("its cgroup isn't delegated to it ({direct})"),
     }
 }
 
@@ -464,6 +448,69 @@ fn exercise_recovery(own: &Path, cache: &Path, exe: &str) {
         restarted.list().unwrap().is_empty(),
         "boxes left after cleanup"
     );
+}
+
+/// A claimer's stop at the hold on the runs' removals, and a delete's wait on that removal or its answer beside it:
+/// facts no recorded operation makes, each waited for measuring (`hex_testkit::waits`).
+static STOPPED: Patience = Patience::measuring("test.hex_cli.process_box.removal_stopped");
+static BESIDE: Patience = Patience::measuring("test.hex_cli.process_box.delete_beside_removal");
+
+/// Runtime goal 7 (decision 7), AC-T7.4.1: a delete of a run's box that its program's end is removing answers as that
+/// removal does, never beside it. Do: run a waiting program; hold the node's run removals at their start; kill the
+/// program through its run, so the supervising thread claims the run and stops before it removes the box, as a
+/// claimer descheduled there would; delete the box from another thread; once that delete waits on the removal or
+/// answers, let the removal go. Expect: the delete waits rather than answer while the removal is under way, then
+/// answers Ok; the run ends Signal(9); and the box is gone.
+fn exercise_a_delete_beside_a_runs_removal(own: &Path, cache: &Path, exe: &str) {
+    let state = tempfile::Builder::new()
+        .prefix("rundel-")
+        .tempdir_in(cache)
+        .expect("state dir");
+    let node =
+        Node::open(&own.join("hex-boxes-rundel"), state.path(), state.path()).expect("open a node");
+    let fx = BinFixture {
+        exe: exe.to_owned(),
+    };
+    let id = BoxId::new("rundel").unwrap();
+    let mut run = node
+        .run(
+            fx.spec(id.clone(), Bounds::default()),
+            fx.wait(),
+            Stdio::null(),
+        )
+        .expect("run a waiting program");
+    let held = node.hold_run_removals().expect("hold the runs' removals");
+    run.kill().expect("kill the run's program");
+    until(
+        &STOPPED,
+        "the supervising thread's claim of the run, stopped at the hold",
+        || held.stopped().unwrap() == 1,
+    )
+    .unwrap();
+    std::thread::scope(|s| {
+        let deleting = s.spawn(|| node.delete(&id));
+        until(
+            &BESIDE,
+            "the delete's wait on the removal, or its answer",
+            || held.waiting().unwrap() == 1 || deleting.is_finished(),
+        )
+        .unwrap();
+        assert!(
+            !deleting.is_finished(),
+            "the delete answered beside the run's removal under way"
+        );
+        drop(held);
+        assert_eq!(
+            deleting.join().unwrap(),
+            Ok(()),
+            "the delete once the removal went"
+        );
+    });
+    assert_eq!(
+        run.try_wait(),
+        Ok(Some(Exit::Signal(Signal::KILL.number())))
+    );
+    assert_eq!(node.inspect(&id), Err(Refusal::NoSuchBox(id.clone())));
 }
 
 fn orphan_id() -> BoxId {

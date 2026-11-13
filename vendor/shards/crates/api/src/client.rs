@@ -21,10 +21,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::progress::{self, Follow, Followed, Records};
 use crate::stream::{self, Socket};
 use crate::{
-    BorrowFailure, End, Guest, GuestSpec, Guests, HandshakeError, HandshakePhase, Identity, Init, Refusal,
-    ReplyError, RuntimePaths, Stream, allowed, backend, check,
+    Awaited, BorrowFailure, End, Guest, GuestSpec, Guests, HandshakeError, HandshakePhase, Identity, Init,
+    Refusal, ReplyError, RuntimePaths, Seen, Stream, allowed, backend, check,
 };
 
 /// The guests the `shards` binary boots: [`GuestSpec::binary`], else `SHARDS_BIN`, else
@@ -35,6 +36,15 @@ pub struct Shards;
 impl Shards {
     pub fn new() -> Shards {
         Shards
+    }
+
+    /// What this process has seen of `awaited`'s answers, which the waits that follow a
+    /// guest's VM process are judged by ([`Guest::connect_while_runs`],
+    /// [`Guest::wait_while_runs`]): [`Seen::Cold`] until its first, when such a wait follows
+    /// liveness alone, so a caller may bound its first wait with a cancel of its own (D215).
+    /// Kept in this process's memory, for every guest it boots or takes back.
+    pub fn seen(awaited: Awaited) -> Seen {
+        progress::RECORDS.seen(awaited)
     }
 
     /// A client's explicit runtime directories (`SHARDS_CACHE`, `SHARDS_HOME`), also given its
@@ -226,7 +236,17 @@ fn probe_gpu(
         .ok_or(Refusal::GpuProbe(crate::GpuProbeError::Pending))?;
     match guest.wait_for(left)? {
         Some(End::PowerOff) => {}
-        Some(end) => return Err(Refusal::Ended(end)),
+        // A VM process that refuses its selection prints the refusal in place of a receipt
+        // and fails (D232): typed where that record is all it said.
+        Some(end) => {
+            let mut tail = lock(&guest.shared.tail);
+            let refused = tail
+                .probe_error
+                .is_none()
+                .then(|| crate::physical::refused(tail.bytes.make_contiguous()))
+                .flatten();
+            return Err(refused.map_or(Refusal::Ended(end), Refusal::GpuProbe));
+        }
         None => {
             guest.stop()?;
             return Err(Refusal::GpuProbe(crate::GpuProbeError::Pending));
@@ -285,6 +305,8 @@ fn take_back(identity: &Identity, spec: &GuestSpec) -> Result<ShardsGuest, Refus
             managed: None,
             managed_ports: Vec::new(),
             report_cleanup: ReportCleanup::Complete,
+            ended_cpu: None,
+            rate_period: None,
         }),
         changed: Condvar::new(),
         tail: Mutex::new(Tail {
@@ -302,12 +324,21 @@ fn take_back(identity: &Identity, spec: &GuestSpec) -> Result<ShardsGuest, Refus
         report: Mutex::new(None),
     });
     let (watched, watcher) = (process.clone(), shared.clone());
+    #[cfg(unix)]
+    let (pid, started) = (identity.pid, identity.started);
     std::thread::Builder::new()
         .name("shards-api-taken".into())
         .spawn(move || {
             let awaited = watched.exited();
             let observed_exited = awaited.is_ok();
+            // What it ran, read as it is seen to exit, where its parent has not reaped it yet.
+            #[cfg(unix)]
+            let ended_cpu = progress::ran_by_end(pid, Some(started));
             let mut state = lock(&watcher.state);
+            #[cfg(unix)]
+            {
+                state.ended_cpu = ended_cpu;
+            }
             state.status = Some(Err(match awaited {
                 Ok(()) => NOT_ITS_PARENT.into(),
                 Err(e) => format!("waiting for it: {e}"),
@@ -325,6 +356,7 @@ fn take_back(identity: &Identity, spec: &GuestSpec) -> Result<ShardsGuest, Refus
             process,
         }),
         shared,
+        records: &progress::RECORDS,
         _dir: PrivateDir::adopt(&identity.vsock),
     })
 }
@@ -427,6 +459,8 @@ fn launch(
             managed: None,
             managed_ports: Vec::new(),
             report_cleanup: ReportCleanup::Complete,
+            ended_cpu: None,
+            rate_period: None,
         }),
         changed: Condvar::new(),
         tail: Mutex::new(Tail {
@@ -461,6 +495,7 @@ fn launch(
         vsock,
         process,
         shared,
+        records: &progress::RECORDS,
         _dir: Some(dir),
     })
 }
@@ -833,6 +868,12 @@ struct State {
     managed: Option<Result<crate::ManagedEnd, Refusal>>,
     managed_ports: Vec<u32>,
     report_cleanup: ReportCleanup,
+    /// What its VM process had run by its end, read by its watcher before it was reaped
+    /// (Unix): what a wait for its end learns from (`progress`).
+    ended_cpu: Option<Duration>,
+    /// The period a managed guest's governor holds a rate over, as its VM process said it
+    /// with its last rate's answer (D255); none until one.
+    rate_period: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -1008,6 +1049,11 @@ impl Exit {
     /// through what is in the pipe ahead of it, which is finite, with no clock.
     fn watch(self, shared: &Shared, writer: io::PipeWriter) {
         let awaited = self.awaited();
+        // What it ran by its end, read while it is a zombie, before it is reaped below.
+        #[cfg(unix)]
+        let ended_cpu = progress::ran_by_end(self.pid, None);
+        #[cfg(windows)]
+        let ended_cpu = None;
         let mut tail = finish_drain(shared, writer);
         let said = if shared.probe {
             String::new()
@@ -1027,6 +1073,7 @@ impl Exit {
         state.status = Some(lock(&self.child).wait().map_err(|e| e.to_string()));
         state.observed_exited = state.status.as_ref().is_some_and(Result::is_ok);
         state.said = said;
+        state.ended_cpu = ended_cpu;
         state.exited = true;
         shared.changed.notify_all();
     }
@@ -1053,6 +1100,9 @@ struct ShardsGuest {
     vsock: PathBuf,
     process: Process,
     shared: Arc<Shared>,
+    /// What its waits that follow its VM process learn from and are judged by: this
+    /// process's ([`progress::RECORDS`]), a test's own in this crate's tests.
+    records: &'static Records,
     /// Its socket's directory, removed as it drops: none where a guest taken back was given
     /// a socket in a directory this client does not make.
     _dir: Option<PrivateDir>,
@@ -1145,6 +1195,36 @@ impl ShardsGuest {
                 let _ = lock(child).kill();
             }
         }
+    }
+
+    /// A wait for an answer of `awaited`'s kind that follows its VM process, beginning now:
+    /// refused as `gone` says where the guest has ended; none where its process went as the
+    /// wait began, whose end is then the wait's.
+    fn follow(&self, awaited: Awaited) -> Result<Option<Follow<'static>>, Refusal> {
+        let identity = self.identity()?;
+        #[cfg(unix)]
+        let followed = Followed::of(&identity);
+        #[cfg(windows)]
+        let followed = {
+            use std::os::windows::io::AsHandle as _;
+            let process = |failure| Refusal::Process {
+                pid: identity.pid,
+                expected_started: identity.started,
+                failure,
+            };
+            let root = match &self.process {
+                Process::Booted(child) => lock(child).as_handle().try_clone_to_owned(),
+                Process::Taken(taken) => taken.process.duplicate(),
+            }
+            .map_err(|e| {
+                process(crate::taken::io_failure(
+                    crate::ProcessOperation::DuplicateHandle,
+                    e,
+                ))
+            })?;
+            Followed::of(root, identity.pid, identity.started).map_err(process)?
+        };
+        Follow::begin(self.records.of(awaited), followed).map_err(Refusal::from)
     }
 }
 
@@ -1331,9 +1411,14 @@ fn handshake_until(
         HandshakeWait::Until(at) => stream::connect_until(vsock, Some(at)),
         HandshakeWait::Unbounded => stream::connect_until(vsock, None),
     };
+    // A dial its deadline passed in is expired, as a write's and a read's are, whatever the
+    // dial said: Windows' connect waits for its connection to complete, to the deadline, and
+    // says TimedOut there (shards_afunix), which was the dial's own failure.
     let mut s = connected.map_err(|source| {
         *cost = began.elapsed();
-        HandshakeError::io(Dial, source)
+        remaining(wait, Dial)
+            .err()
+            .unwrap_or_else(|| HandshakeError::io(Dial, source))
     })?;
     let mut request = [0; REQUEST];
     let mut unused = request.as_mut_slice();
@@ -1602,6 +1687,8 @@ fn managed_shared(
             managed: None,
             managed_ports: Vec::new(),
             report_cleanup,
+            ended_cpu: None,
+            rate_period: None,
         }),
         changed: Condvar::new(),
         tail: Mutex::new(Tail {
@@ -1880,6 +1967,70 @@ impl ManagedGuest {
         })
     }
 
+    /// The CPU rate its VM's governor holds its vCPUs to together (D191, D255), in milli-CPU
+    /// of the host's time, as an image run's (`ImageGuest::rate`, D247): once a period's share
+    /// is spent, every vCPU is held out of its guest until the period ends, whatever its guest
+    /// does, and what a period overran comes off the next ones. None lifts the hold, the
+    /// guest's vCPUs its ceiling.
+    ///
+    /// Asked on its vsock socket (`RATE`, `shards_abi::rate`), which a dial of this host's
+    /// reaches and its guest never does. Answers what its vCPUs are held to, none where
+    /// nothing holds them (no rate, or every vCPU's whole CPU or more), waiting at most
+    /// `patience` (`Duration::MAX`: until it answers or the guest ends), and keeps the period
+    /// its governor holds over ([`rate_period`](Self::rate_period)). Refused as
+    /// [`Refusal::Rate`] in its VM process's words; [`Refusal::Unsupported`] where that
+    /// process takes no rate (one not booted `--host-managed`, or a shards before D255) or
+    /// does not answer within `patience`; [`Refusal::ManagedIo`] where its socket fails; and
+    /// [`Refusal::Ended`] once the guest has ended.
+    pub fn rate(
+        &self,
+        rate: Option<std::num::NonZeroU64>,
+        patience: Duration,
+    ) -> Result<Option<std::num::NonZeroU64>, Refusal> {
+        let gone = || {
+            self.end(&mut lock(&self.shared.state))
+                .map(|end| end.map(Refusal::Ended))
+        };
+        if let Some(ended) = gone()? {
+            return Err(ended);
+        }
+        let deadline = (patience != Duration::MAX)
+            .then(|| Instant::now().checked_add(patience))
+            .flatten();
+        let asked = rate.map_or(0, std::num::NonZeroU64::get);
+        let line = match rate_exchange(&self.process.identity()?.vsock, asked, deadline, patience) {
+            Ok(line) => line,
+            // Its process gone as it was asked: its end, which says why.
+            Err(refused) => return Err(gone()?.unwrap_or(refused)),
+        };
+        let (held, period_ns) = held_of(rate, shards_abi::rate::read_answer(&line))?;
+        lock(&self.shared.state).rate_period = Some(Duration::from_nanos(period_ns.get()));
+        Ok(held)
+    }
+
+    /// The period its VM's governor holds a [`rate`](Self::rate) over (D191, D255), as its VM
+    /// process said it with its last rate's answer, so that its caller derives its window from
+    /// the guest's own period and copies no number: none until a rate has been answered.
+    pub fn rate_period(&self) -> Option<Duration> {
+        lock(&self.shared.state).rate_period
+    }
+
+    /// The room a budget leaves the guest, as an image run's (`ImageGuest::room`, D188, D241):
+    /// refused, as nothing holds a managed guest within one (D255). D188's room is held inside
+    /// its guest by shards-init's `ROOM` built-in, and a managed guest runs its caller's own
+    /// PID 1, not shards-init; its guest's own kernel alone may drop its page cache, which its
+    /// host may not take without its guest reading it back (PM M309). Its caller holds its
+    /// guest's memory through its own PID 1, or its host's limits of the guest's process.
+    pub fn room(&self, _room: Option<i64>, _patience: Duration) -> Result<Option<u64>, Refusal> {
+        Err(Refusal::Unsupported {
+            what: "room",
+            why: managed_words(format_args!(
+                "a managed guest runs its caller's own PID 1, and D188's room is held inside \
+                 the guest by shards-init's ROOM built-in, which it does not run (D255)"
+            ))?,
+        })
+    }
+
     fn end(&self, state: &mut State) -> Result<Option<End>, Refusal> {
         let Some(result) = state.managed.as_mut() else {
             return Ok(None);
@@ -2030,6 +2181,111 @@ impl Drop for ManagedGuest {
     }
 }
 
+/// One rate asked of the VM process listening at `vsock`, and its answer's line, its newline
+/// last (D255, `shards_abi::rate`): one dial, its ask, then the line read a byte at a time to
+/// its newline or the longest answer, each within `deadline` (none: no clock), its caller's
+/// `patience`.
+fn rate_exchange(
+    vsock: &Path,
+    milli: u64,
+    deadline: Option<Instant>,
+    patience: Duration,
+) -> Result<Vec<u8>, Refusal> {
+    let failed = |operation| {
+        move |e: io::Error| Refusal::ManagedIo {
+            operation,
+            kind: e.kind(),
+            code: e.raw_os_error(),
+        }
+    };
+    let late = || {
+        managed_words(format_args!("no answer within {patience:?}"))
+            .map(|why| Refusal::Unsupported { what: "rate", why })
+    };
+    let left = || match deadline {
+        None => Ok(None),
+        Some(at) => match at.saturating_duration_since(Instant::now()) {
+            left if left.is_zero() => Err(late().unwrap_or_else(|refused| refused)),
+            left => Ok(Some(left)),
+        },
+    };
+    // A wait past its timeout fails as std's does: WouldBlock, or on Windows TimedOut.
+    let timed_out = |e: &io::Error| matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut);
+    let mut s = match stream::connect_until(vsock, deadline) {
+        Ok(s) => s,
+        Err(e) if timed_out(&e) => return Err(late()?),
+        Err(e) => return Err(failed("rate's dial")(e)),
+    };
+    Stream::set_write_timeout(&s, left()?).map_err(failed("rate's ask"))?;
+    if let Err(e) = s.write_all(shards_abi::rate::ask(milli).as_bytes()) {
+        return Err(if timed_out(&e) {
+            late()?
+        } else {
+            failed("rate's ask")(e)
+        });
+    }
+    let mut line = Vec::new();
+    loop {
+        Stream::set_read_timeout(&s, left()?).map_err(failed("rate's answer"))?;
+        let mut byte = [0u8; 1];
+        match s.read(&mut byte) {
+            Ok(0) => {
+                return Err(Refusal::Unsupported {
+                    what: "rate",
+                    why: managed_words(format_args!(
+                        "its VM process closed the ask unanswered: it takes no rate from its \
+                         host's clients (one not booted --host-managed, or a shards before D255)"
+                    ))?,
+                });
+            }
+            Ok(_) => {
+                line.try_reserve(1).map_err(|_| Refusal::Allocation {
+                    what: "a rate's answer",
+                })?;
+                line.extend_from_slice(&byte);
+                if byte == *b"\n" {
+                    return Ok(line);
+                }
+                if line.len() >= shards_abi::rate::ANSWER_MOST {
+                    return Err(Refusal::Rate(managed_words(format_args!(
+                        "its VM process answered past the longest answer, no line"
+                    ))?));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if timed_out(&e) => return Err(late()?),
+            Err(e) => return Err(failed("rate's answer")(e)),
+        }
+    }
+}
+
+/// A managed guest's refusal's words, allocated as its path allocates: fallibly.
+fn managed_words(args: std::fmt::Arguments<'_>) -> Result<String, Refusal> {
+    message(args).map_err(|()| Refusal::Allocation {
+        what: "a managed guest's refusal's words",
+    })
+}
+
+/// What a rate `asked` holds the guest's vCPUs to, as its VM process answered (D255): the
+/// rate asked, or none where it lets them be, and its governor's period. A VM holds what it
+/// is told or nothing (D247), so any other rate is a broken answer, never a hold.
+fn held_of(
+    asked: Option<std::num::NonZeroU64>,
+    answer: Result<shards_abi::rate::Answer<'_>, shards_abi::rate::Broken>,
+) -> Result<(Option<std::num::NonZeroU64>, std::num::NonZeroU64), Refusal> {
+    use shards_abi::rate::Answer;
+    match answer {
+        Ok(Answer::Held { milli, period_ns }) if milli.is_none() || milli == asked => Ok((milli, period_ns)),
+        Ok(Answer::Held { milli, .. }) => Err(Refusal::Rate(managed_words(format_args!(
+            "its VM process held its vCPUs to {milli:?} milli-CPU, asked {asked:?}"
+        ))?)),
+        Ok(Answer::Refused(why)) => Err(Refusal::Rate(managed_words(format_args!("{why}"))?)),
+        Err(broken) => Err(Refusal::Rate(managed_words(format_args!(
+            "its VM process answered {broken}"
+        ))?)),
+    }
+}
+
 fn connect_owned(
     shared: &Shared,
     vsock: &Path,
@@ -2150,9 +2406,120 @@ fn connect_with_budget(
     })
 }
 
+/// A connect that follows its guest's VM process ([`Guest::connect_while_runs`]): it dials as
+/// a connect with no clock does, until the guest answers or ends, and where `follow` is judged
+/// it looks at the VM process once each W*, no handshake or pause outlasting the next look.
+fn connect_following(
+    shared: &Shared,
+    vsock: &Path,
+    port: u32,
+    follow: &mut Follow<'_>,
+    mut gone: impl FnMut() -> Result<Option<Refusal>, Refusal>,
+) -> Result<Box<dyn Stream>, Refusal> {
+    let began = Instant::now();
+    loop {
+        if let Some(refusal) = gone()? {
+            return Err(refusal);
+        }
+        if let Err(stalled) = follow.look() {
+            // Its end, where it came as the look was made, refuses the connect as any would.
+            return Err(gone()?.unwrap_or(stalled.into()));
+        }
+        let due = follow.due();
+        let mut cost = Duration::ZERO;
+        let wait = due.map_or(HandshakeWait::Unbounded, HandshakeWait::Until);
+        match handshake_until(vsock, port, wait, &mut cost).map_err(owned_handshake_error) {
+            Ok(s) => {
+                lock(&shared.state).ready = true;
+                follow.answered();
+                return s.boxed().map_err(|_| Refusal::Allocation {
+                    what: "connection storage",
+                });
+            }
+            Err(Attempt::Allocation) => {
+                return Err(Refusal::Allocation {
+                    what: "connection storage",
+                });
+            }
+            Err(Attempt::Refused(why)) => return Err(Refusal::Channel { port, why }),
+            Err(Attempt::Again(_) | Attempt::Absolute(_)) => {}
+        }
+        // Waits out the pause, woken at once by the process's end, no later than the next look.
+        let state = lock(&shared.state);
+        if !state.exited {
+            let left = due.map_or(Duration::MAX, |at| at.saturating_duration_since(Instant::now()));
+            let _ = shared
+                .changed
+                .wait_timeout(state, pause(cost, began.elapsed(), left));
+        }
+    }
+}
+
 impl Guest for ShardsGuest {
     fn process_exited(&self) -> Result<bool, Refusal> {
         Ok(lock(&self.shared.state).observed_exited)
+    }
+
+    fn connect_while_runs(&self, port: u32) -> Result<Box<dyn Stream>, Refusal> {
+        allowed(&self.ports, port)?;
+        let awaited = if lock(&self.shared.state).ready {
+            Awaited::Connect
+        } else {
+            Awaited::Boot
+        };
+        let Some(mut follow) = self.follow(awaited)? else {
+            // Its process went as the wait began: refused as its end says.
+            return self.connect(port, Duration::MAX);
+        };
+        connect_following(&self.shared, &self.vsock, port, &mut follow, || {
+            Ok(self.gone(&mut lock(&self.shared.state)))
+        })
+    }
+
+    fn wait_while_runs(&self) -> Result<End, Refusal> {
+        let mut follow = match self.follow(Awaited::End) {
+            Ok(follow) => follow,
+            // Ended already: its end is the answer.
+            Err(refusal) => return self.end(&mut lock(&self.shared.state)).ok_or(refusal),
+        };
+        let mut state = lock(&self.shared.state);
+        loop {
+            if let Some(end) = self.end(&mut state) {
+                let ran = state.ended_cpu;
+                drop(state);
+                if let Some(follow) = follow.as_mut() {
+                    follow.ended(&end, ran);
+                }
+                return Ok(end);
+            }
+            let Some(due) = follow.as_ref().and_then(Follow::due) else {
+                state = self
+                    .shared
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            };
+            let left = due.saturating_duration_since(Instant::now());
+            if !left.is_zero() {
+                state = self
+                    .shared
+                    .changed
+                    .wait_timeout(state, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+                continue;
+            }
+            drop(state);
+            let looked = follow.as_mut().map_or(Ok(()), Follow::look);
+            state = lock(&self.shared.state);
+            // Its end, where it came as the look was made, is the wait's answer, not a stall.
+            if let Err(refusal) = looked
+                && self.end(&mut state).is_none()
+            {
+                return Err(refusal.into());
+            }
+        }
     }
     fn connect(&self, port: u32, patience: Duration) -> Result<Box<dyn Stream>, Refusal> {
         allowed(&self.ports, port)?;
@@ -2326,17 +2693,13 @@ mod tests {
             self.stops.fetch_add(1, Ordering::SeqCst);
             self.publish(crate::TerminalScope::Released);
             if self.coordinate_stop {
+                // The waiter's acknowledgement itself, not a clock's.
                 let state = self.state.lock().unwrap();
-                let (observed_state, timeout) = self
-                    .changed
-                    .wait_timeout_while(state, crate::conformance::PATIENCE.get(), |state| {
-                        !state.acknowledged
-                    })
-                    .unwrap();
-                drop(observed_state);
-                if timeout.timed_out() {
-                    return Err(Refusal::Launch(crate::LaunchError::Observer));
-                }
+                drop(
+                    self.changed
+                        .wait_while(state, |state| !state.acknowledged)
+                        .unwrap(),
+                );
             }
             Ok(())
         }
@@ -2363,7 +2726,15 @@ mod tests {
         // this test's directory, which on Windows is its drive's (`/model` is not absolute there).
         let here = std::env::current_dir().unwrap();
         let root = here.ancestors().last().unwrap();
-        let socket = root.join("model").join("native").join("v");
+        managed_model_at(coordinate_stop, root.join("model").join("native").join("v"))
+    }
+    /// [`managed_model`] whose vsock socket is `socket`, which a test may listen at.
+    fn managed_model_at(
+        coordinate_stop: bool,
+        socket: PathBuf,
+    ) -> (ManagedGuest, triomphe::Arc<ModelNative>) {
+        let here = std::env::current_dir().unwrap();
+        let root = here.ancestors().last().unwrap();
         let plan = prepare_boot(&spec(), &root.join("model").join("never-executed"), &socket, 0).unwrap();
         let native = triomphe::Arc::try_new(ModelNative {
             identity: Identity {
@@ -2379,6 +2750,129 @@ mod tests {
         .unwrap();
         let guest = boot_managed(plan, &mut ModelLauncher(native.clone())).unwrap();
         (guest, native)
+    }
+
+    /// A listener at `path` for a stand-in of a managed guest's VM process, as each OS binds
+    /// one.
+    #[cfg(unix)]
+    fn rate_listener(path: &Path) -> std::os::unix::net::UnixListener {
+        std::os::unix::net::UnixListener::bind(path).unwrap()
+    }
+    #[cfg(windows)]
+    fn rate_listener(path: &Path) -> shards_afunix::UnixListener {
+        shards_afunix::UnixListener::bind(path).unwrap()
+    }
+
+    /// A stand-in VM process at `path` (D255): for each of `answers` in turn, takes one dial,
+    /// reads its ask's line and answers it, or closes it unanswered (none); gives back the
+    /// asks' lines.
+    fn rate_stand_in(
+        path: &Path,
+        answers: Vec<Option<&'static [u8]>>,
+    ) -> std::thread::JoinHandle<Vec<Vec<u8>>> {
+        use std::io::{Read as _, Write as _};
+        let listener = rate_listener(path);
+        std::thread::spawn(move || {
+            let mut asks = Vec::new();
+            for answer in answers {
+                let (mut dial, _) = listener.accept().unwrap();
+                let mut line = Vec::new();
+                let mut byte = [0u8; 1];
+                while line.last() != Some(&b'\n') {
+                    assert_eq!(dial.read(&mut byte).unwrap(), 1, "an ask's whole line");
+                    line.push(byte[0]);
+                }
+                asks.push(line);
+                if let Some(answer) = answer {
+                    dial.write_all(answer).unwrap();
+                }
+            }
+            asks
+        })
+    }
+
+    /// D255: a managed guest's rate is asked on its vsock socket, `RATE <milli>`, and held as
+    /// its VM process answers: the rate asked, or none, its period kept; a refusal in its
+    /// words; a rate other than asked, or an answer none of the protocol's, refused and never
+    /// a hold; an ask closed unanswered, a VM process that takes no rate.
+    #[test]
+    fn a_managed_guests_rate_is_asked_on_its_socket_and_held_as_answered() {
+        let dir = shards_testdir::TempDir::new("api-rate").unwrap();
+        let socket = dir.join("v");
+        let quarter = std::num::NonZeroU64::new(250);
+        let stand_in = rate_stand_in(
+            &socket,
+            vec![
+                Some(b"RATED 250 100000000\n"),
+                Some(b"RATED 0 7\n"),
+                Some(b"REFUSED the microVM has not started\n"),
+                Some(b"RATED 300 1\n"),
+                Some(b"OK 5\n"),
+                None,
+            ],
+        );
+        let (guest, _native) = managed_model_at(false, socket);
+        assert_eq!(guest.rate_period(), None, "no rate answered yet");
+        assert_eq!(guest.rate(quarter, Duration::MAX), Ok(quarter));
+        assert_eq!(guest.rate_period(), Some(Duration::from_millis(100)));
+        assert_eq!(guest.rate(None, Duration::MAX), Ok(None));
+        assert_eq!(guest.rate_period(), Some(Duration::from_nanos(7)));
+        assert_eq!(
+            guest.rate(quarter, Duration::MAX),
+            Err(Refusal::Rate("the microVM has not started".into()))
+        );
+        for broken in ["held to another", "none of the protocol's"] {
+            assert!(
+                matches!(guest.rate(quarter, Duration::MAX), Err(Refusal::Rate(_))),
+                "{broken}"
+            );
+        }
+        assert_eq!(
+            guest.rate_period(),
+            Some(Duration::from_nanos(7)),
+            "kept from its last hold"
+        );
+        assert!(matches!(
+            guest.rate(quarter, Duration::MAX),
+            Err(Refusal::Unsupported { what: "rate", .. })
+        ));
+        let asks = stand_in.join().unwrap();
+        let mut expected = vec![b"RATE 250\n".to_vec(); asks.len()];
+        expected[1] = b"RATE 0\n".to_vec();
+        assert_eq!(asks, expected);
+    }
+
+    /// D255: a rate its VM process does not answer within its caller's patience is refused
+    /// as unanswered, typed: a patience of none, past before its ask.
+    #[test]
+    fn a_managed_rate_unanswered_within_its_patience_is_refused() {
+        let dir = shards_testdir::TempDir::new("api-rate-late").unwrap();
+        let socket = dir.join("v");
+        let listener = rate_listener(&socket);
+        let (guest, _native) = managed_model_at(false, socket);
+        let asked = guest.rate(std::num::NonZeroU64::new(250), Duration::ZERO);
+        assert!(
+            matches!(&asked, Err(Refusal::Unsupported { what: "rate", why }) if why.starts_with("no answer within")),
+            "{asked:?}"
+        );
+        drop(listener);
+    }
+
+    /// D255: a managed guest's room is refused, typed, as nothing holds a managed guest
+    /// within one; and once the guest has ended, its rate is its end, asking nothing.
+    #[test]
+    fn a_managed_guests_room_is_refused_and_an_ended_ones_rate_is_its_end() {
+        let (guest, native) = managed_model(false);
+        assert!(matches!(
+            guest.room(Some(64 << 20), Duration::MAX),
+            Err(Refusal::Unsupported { what: "room", .. })
+        ));
+        native.publish(crate::TerminalScope::Released);
+        assert_eq!(guest.wait_for(Duration::MAX).unwrap(), Some(End::PowerOff));
+        assert_eq!(
+            guest.rate(std::num::NonZeroU64::new(250), Duration::MAX),
+            Err(Refusal::Ended(End::PowerOff))
+        );
     }
 
     /// D215, D233: helper scope and handle ownership remain live after
@@ -2397,10 +2891,7 @@ mod tests {
         );
         assert_eq!(guest.wait_for(Duration::ZERO).unwrap(), None);
         native.publish(crate::TerminalScope::Released);
-        assert_eq!(
-            guest.wait_for(crate::conformance::PATIENCE.get()).unwrap(),
-            Some(End::PowerOff)
-        );
+        assert_eq!(guest.wait_for(Duration::MAX).unwrap(), Some(End::PowerOff));
         drop(guest);
         assert_eq!(native.stops.load(Ordering::SeqCst), 0);
     }
@@ -2413,7 +2904,7 @@ mod tests {
         let waiting = guest.try_clone().unwrap();
         let observed = native.clone();
         let waiter = std::thread::spawn(move || {
-            let result = waiting.wait_for(crate::conformance::PATIENCE.get());
+            let result = waiting.wait_for(Duration::MAX);
             observed.state.lock().unwrap().acknowledged = true;
             observed.changed.notify_all();
             result
@@ -2454,11 +2945,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn managed_report_last_api_drop_before_later_native_completion_reclaims_owner() {
-        let patience = crate::conformance::PATIENCE.get();
+        // The report never comes, so any kept wait shows its take give up: the least this
+        // host's streams keep, measured. The request's own deadline is none any wait reaches,
+        // as the take's is what the case turns on.
+        let patience = crate::while_runs::kept_wait();
         let request = crate::physical::report::Request {
             scope: [0x93; 16],
             selected: vec![crate::PhysicalGpu::MetalRegistry(7)],
-            deadline: Instant::now().checked_add(patience).unwrap(),
+            deadline: crate::while_runs::latest(),
         };
         let (receiver, mut writer) = crate::physical::report::Receiver::new(request).unwrap();
         // Caller error, first observer error, then the old observer's retry
@@ -2497,15 +2991,14 @@ mod tests {
         // The observer must first enter its error path while an API owner still
         // exists; otherwise Requested at its first failure can mask the old gap.
         native.publish(crate::TerminalScope::Released);
-        let (cleanup_before, uncertainty_timed_out) = {
+        // The observer's own publication of its uncertainty, a fact waited for as such.
+        let cleanup_before = {
             let state = lock(&shared.state);
-            let (state, timed) = shared
+            shared
                 .changed
-                .wait_timeout_while(state, patience, |state| {
-                    state.report_cleanup != ReportCleanup::Uncertain
-                })
-                .unwrap_or_else(PoisonError::into_inner);
-            (state.report_cleanup, timed.timed_out())
+                .wait_while(state, |state| state.report_cleanup != ReportCleanup::Uncertain)
+                .unwrap_or_else(PoisonError::into_inner)
+                .report_cleanup
         };
         drop(guest);
         let owners = shared.managed_owners.load(Ordering::Acquire);
@@ -2513,16 +3006,9 @@ mod tests {
         // alone completes its pending read as this owned writer writes/closes.
         let wrote = writer.write_all(b"later kernel completion");
         drop(writer);
-        let completed_without_api_wake = completed.recv_timeout(patience);
-        if completed_without_api_wake.is_err() {
-            // Failure cleanup only: the frozen5ba path needs an explicit wake
-            // after its already-positive pipe completion. This cannot turn the
-            // previously captured failed oracle into a passing observation.
-            native.publish(crate::TerminalScope::Released);
-            let mut state = lock(&shared.state);
-            request_report_cleanup(&mut state);
-            shared.changed.notify_all();
-        }
+        // The watcher's own completion, a fact waited for as such: a watcher the native
+        // completion does not wake leaves this wait, and the case, unanswered.
+        let completed_without_api_wake = completed.recv();
         let joined = watcher.join();
         drop(native);
         assert!(matches!(
@@ -2533,10 +3019,6 @@ mod tests {
             })
         ));
         assert_eq!(owners, 0);
-        assert!(
-            !uncertainty_timed_out,
-            "observer must publish the exact cleanup error"
-        );
         assert_eq!(cleanup_before, ReportCleanup::Uncertain);
         assert!(
             wrote.is_ok(),
@@ -2578,6 +3060,36 @@ mod tests {
             .unwrap()
     }
 
+    /// A muxer that closes its first CONNECT unanswered and answers its second `OK`, as a guest
+    /// that begins to listen between them: its dials, counted until the sentinel.
+    #[cfg(unix)]
+    fn muxer_answering_the_second(
+        listener: std::os::unix::net::UnixListener,
+    ) -> std::thread::JoinHandle<usize> {
+        std::thread::Builder::new()
+            .name("answering-muxer".into())
+            .spawn(move || {
+                let mut dials = 0;
+                for conn in listener.incoming() {
+                    let mut conn = conn.unwrap();
+                    let mut line = String::new();
+                    io::BufRead::read_line(&mut io::BufReader::new(&conn), &mut line).unwrap();
+                    match line.as_str() {
+                        "sentinel\n" => break,
+                        "CONNECT 5\n" => {
+                            dials += 1;
+                            if dials == 2 {
+                                io::Write::write_all(&mut conn, b"OK 1073741824\n").unwrap();
+                            }
+                        }
+                        other => panic!("not a CONNECT: {other:?}"),
+                    }
+                }
+                dials
+            })
+            .unwrap()
+    }
+
     #[cfg(unix)]
     fn sentinel(path: &Path) {
         let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
@@ -2586,8 +3098,8 @@ mod tests {
 
     /// D215, D233: dial once a port the guest no longer listens on; expect one dial,
     /// refused at once as closed unanswered, and an absent socket refused in the dial. The
-    /// retrying form, against the same muxer, dials again until its deadline: the cost a
-    /// later dial to a gone relay must not pay.
+    /// retrying form, against a muxer that closes its first dial and answers its second, asks
+    /// again: the cost a later dial to a gone relay must not pay.
     #[cfg(unix)]
     #[test]
     fn single_attempt_to_an_unserved_port_is_refused_at_once_after_one_dial() {
@@ -2596,11 +3108,10 @@ mod tests {
         let shared = managed_shared(0, false, None).unwrap();
 
         let muxer = unserved_muxer(std::os::unix::net::UnixListener::bind(&path).unwrap());
-        let at = Instant::now()
-            .checked_add(crate::conformance::PATIENCE.get())
-            .unwrap();
+        // A deadline no wait reaches: refused `Closed`, it was refused at its fact, the
+        // muxer's close, not at a deadline (which `Expired` would say).
+        let at = crate::while_runs::latest();
         let once = connect_with_budget(&shared, &path, 5, ConnectBudget::Once(at), || Ok(None));
-        let returned = Instant::now();
         sentinel(&path);
         assert_eq!(muxer.join().unwrap(), 1, "one dial, never asked again");
         assert!(
@@ -2614,21 +3125,16 @@ mod tests {
             "{:?}",
             once.as_ref().err()
         );
-        assert!(returned < at, "refused at once, not at its deadline");
 
+        // The retrying form asks again: closed unanswered once, it dials again, and is
+        // answered as the guest begins to listen, with no deadline to race.
         std::fs::remove_file(&path).unwrap();
-        let muxer = unserved_muxer(std::os::unix::net::UnixListener::bind(&path).unwrap());
-        let unserved = Instant::now()
-            .checked_add(crate::conformance::UNSERVED_PATIENCE)
-            .unwrap();
-        let before = connect_with_budget(&shared, &path, 5, ConnectBudget::Before(unserved), || Ok(None));
+        let muxer = muxer_answering_the_second(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let answered = managed_shared(0, false, None).unwrap();
+        let before = connect_with_budget(&answered, &path, 5, ConnectBudget::Before(at), || Ok(None));
         sentinel(&path);
-        assert!(muxer.join().unwrap() > 1, "the retrying form asks again");
-        assert!(
-            matches!(before, Err(Refusal::Connect { port: 5, .. })),
-            "{:?}",
-            before.as_ref().err()
-        );
+        assert_eq!(muxer.join().unwrap(), 2, "the retrying form asks again");
+        assert!(before.is_ok(), "{:?}", before.as_ref().err());
 
         std::fs::remove_file(&path).unwrap();
         let absent = connect_with_budget(&shared, &path, 5, ConnectBudget::Once(at), || Ok(None));
@@ -2650,20 +3156,34 @@ mod tests {
     }
 
     /// D215, D233: dial once a muxer that accepts and never answers; expect the CONNECT
-    /// refused by its deadline, in the read, and no second dial.
+    /// refused by its deadline, in the read, and no second dial. The deadline is this host's
+    /// own, one its dial and CONNECT fit in (`while_runs::until_reached`).
     #[cfg(unix)]
     #[test]
     fn single_attempt_to_a_silent_listener_is_refused_by_its_deadline() {
-        let dir = shards_testdir::TempDir::new("api-silent").unwrap();
-        let path = dir.join("v");
-        // Never accepted: the kernel completes the connection and holds the CONNECT unread.
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let shared = managed_shared(0, false, None).unwrap();
-        let at = Instant::now()
-            .checked_add(crate::conformance::UNSERVED_PATIENCE)
-            .unwrap();
-        let silent = connect_with_budget(&shared, &path, 5, ConnectBudget::Once(at), || Ok(None));
+        use crate::while_runs::Reached;
+        let (silent, at, listener, shared, _dir) = crate::while_runs::until_reached(|patience| {
+            let dir = shards_testdir::TempDir::new("api-silent").unwrap();
+            let path = dir.join("v");
+            // Never accepted: the kernel completes the connection and holds the CONNECT unread.
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let shared = managed_shared(0, false, None).unwrap();
+            let at = Instant::now().checked_add(patience).unwrap();
+            let silent = connect_with_budget(&shared, &path, 5, ConnectBudget::Once(at), || Ok(None));
+            if matches!(
+                silent,
+                Err(Refusal::Connect {
+                    failure: HandshakeError::Expired {
+                        phase: HandshakePhase::Dial | HandshakePhase::Write
+                    },
+                    ..
+                })
+            ) {
+                return Reached::Sooner;
+            }
+            Reached::Done((silent, at, listener, shared, dir))
+        });
         assert!(Instant::now() >= at, "refused by, not before, its deadline");
         assert!(
             matches!(
@@ -2696,8 +3216,9 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let shared = managed_shared(0, false, None).unwrap();
+        // The least wait this host's streams keep, measured: the observation outlasts any.
         let at = Instant::now()
-            .checked_add(crate::conformance::PATIENCE.get())
+            .checked_add(crate::while_runs::kept_wait())
             .unwrap();
         let mut observations = 0;
         let connected = connect_with_budget(&shared, &path, 5, ConnectBudget::Before(at), || {
@@ -2728,62 +3249,64 @@ mod tests {
         assert!(!lock(&shared.state).ready);
     }
 
-    /// D215: a finite owned connect that expires between a retry's lifetime
-    /// observation and dial must not become an unbounded handshake. Original
-    /// production is intentionally unchanged by this source-only control.
+    /// D215: a finite owned connect that expires between a retry's lifetime observation and
+    /// its dial must not become an unbounded handshake. Its socket appears as the retry is
+    /// held, served by a muxer that closes each CONNECT unanswered and counts it: an expired
+    /// retry that dialed shows as a dial, and ends there (closed unanswered), so the worker's
+    /// answer is waited for as a fact in both cases, no clock telling them apart. The retry
+    /// held must be the loop's (its third observation follows), not the one after the loop,
+    /// which dials nothing either way: an attempt whose patience ran out before its first dial
+    /// failed is asked again with this host's own patience (`while_runs::until_reached`).
     #[cfg(unix)]
     #[test]
     fn finite_owned_retry_expiry_cannot_start_an_unbounded_handshake() {
-        let patience = crate::conformance::PATIENCE.get();
-        let dir = shards_testdir::TempDir::new("api-finite-retry").unwrap();
-        let path = dir.join("v");
-        // Check the fixture socket path before any worker. The first actual
-        // attempt then sees this owned path absent, establishing a real retry.
-        let checked = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        drop(checked);
-        std::fs::remove_file(&path).unwrap();
-        let shared = managed_shared(0, true, None).unwrap();
-        let asked = path.clone();
-        let (retry, retried) = std::sync::mpsc::sync_channel(1);
-        let (resume, resumed) = std::sync::mpsc::sync_channel(1);
-        let (finished, result) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::Builder::new()
-            .name("finite-owned-retry-control".into())
-            .spawn(move || {
-                let mut visits = 0usize;
-                let mut first_deadline = None;
-                let connected = connect_owned(&shared, &asked, 5, patience, || {
-                    visits += 1;
-                    if visits == 1 {
-                        first_deadline = Instant::now().checked_add(patience);
-                    }
-                    if visits == 2 {
-                        let deadline = first_deadline.ok_or(Refusal::Launch(crate::LaunchError::Observer))?;
-                        retry
-                            .send(deadline)
-                            .map_err(|_| Refusal::Launch(crate::LaunchError::Observer))?;
-                        resumed
-                            .recv()
-                            .map_err(|_| Refusal::Launch(crate::LaunchError::Observer))?;
-                    }
-                    Ok(None)
-                });
-                let _ = finished.send(connected.map(drop));
-            })
-            .unwrap();
-        let reached_retry = retried.recv_timeout(patience);
-        let mut listener = None;
-        let mut before_cleanup = None;
-        let mut late_dial = None;
-        let mut resumed_ok = false;
-        if let Ok(deadline) = reached_retry {
-            listener = std::os::unix::net::UnixListener::bind(&path).ok();
-            if let Some(listener) = &listener {
-                let nonblocking = listener.set_nonblocking(true);
-                if nonblocking.is_ok() {
-                    // Wait for the actual deadline fact, not a guessed delay.
-                    // The API budget began before the first gone callback, so
-                    // this later deadline cannot release it before expiry.
+        use crate::while_runs::Reached;
+        let (reached_retry, resumed_ok, late_dials, connected) =
+            crate::while_runs::until_reached(|patience| {
+                let dir = shards_testdir::TempDir::new("api-finite-retry").unwrap();
+                let path = dir.join("v");
+                // Check the fixture socket path before any worker. The first actual
+                // attempt then sees this owned path absent, establishing a real retry.
+                let checked = std::os::unix::net::UnixListener::bind(&path).unwrap();
+                drop(checked);
+                std::fs::remove_file(&path).unwrap();
+                let shared = managed_shared(0, true, None).unwrap();
+                let asked = path.clone();
+                let (retry, retried) = std::sync::mpsc::sync_channel(1);
+                let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+                let worker = std::thread::Builder::new()
+                    .name("finite-owned-retry-control".into())
+                    .spawn(move || {
+                        let mut visits = 0usize;
+                        let mut first_deadline = None;
+                        let connected = connect_owned(&shared, &asked, 5, patience, || {
+                            visits += 1;
+                            if visits == 1 {
+                                first_deadline = Instant::now().checked_add(patience);
+                            }
+                            if visits == 2 {
+                                let deadline =
+                                    first_deadline.ok_or(Refusal::Launch(crate::LaunchError::Observer))?;
+                                retry
+                                    .send(deadline)
+                                    .map_err(|_| Refusal::Launch(crate::LaunchError::Observer))?;
+                                resumed
+                                    .recv()
+                                    .map_err(|_| Refusal::Launch(crate::LaunchError::Observer))?;
+                            }
+                            Ok(None)
+                        });
+                        (connected.map(drop), visits)
+                    })
+                    .unwrap();
+                // The retry itself, or the worker's end without one (its sender dropped).
+                let reached_retry = retried.recv();
+                let muxer = unserved_muxer(std::os::unix::net::UnixListener::bind(&path).unwrap());
+                let mut resumed_ok = false;
+                if let Ok(deadline) = reached_retry {
+                    // Wait for the actual deadline fact, not a guessed delay. The API budget
+                    // began before the first gone callback, so this later deadline cannot
+                    // release it before expiry.
                     let gate = Mutex::new(());
                     let clock = Condvar::new();
                     let mut held = lock(&gate);
@@ -2794,34 +3317,32 @@ mod tests {
                             .0;
                     }
                     resumed_ok = resume.send(()).is_ok();
-                    before_cleanup = Some(result.recv_timeout(patience));
-                    late_dial = Some(listener.accept());
                 }
-            }
-        }
-        // Even the original unbounded path is made terminal through this test's
-        // own accepted socket EOF, before joining or making an oracle assertion.
-        let observed_late_dial = late_dial.as_ref().is_some_and(Result::is_ok);
-        drop(late_dial);
-        drop((listener, resume));
-        let joined = worker.join();
+                drop(resume);
+                let (connected, visits) = worker.join().unwrap();
+                sentinel(&path);
+                let late_dials = muxer.join().unwrap();
+                if reached_retry.is_ok() && visits < 3 {
+                    return Reached::Sooner;
+                }
+                Reached::Done((reached_retry.is_ok(), resumed_ok, late_dials, connected))
+            });
         assert!(
-            reached_retry.is_ok(),
+            reached_retry,
             "a real failed first dial must reach the retry seam"
         );
         assert!(
             resumed_ok,
             "the exact expiry witness must release the retry callback"
         );
-        assert!(
-            !observed_late_dial,
+        assert_eq!(
+            late_dials, 0,
             "an expired finite retry performed a new native dial"
         );
         assert!(
-            matches!(before_cleanup, Some(Ok(Err(Refusal::Channel { port: 5, .. })))),
-            "finite expiry must return without the peer EOF used only for cleanup"
+            matches!(connected, Err(Refusal::Channel { port: 5, .. })),
+            "finite expiry must return refused, not answered: {connected:?}"
         );
-        assert!(joined.is_ok());
     }
 
     /// D215, D233: pure preparation launches nothing and preserves the exact
@@ -3312,6 +3833,180 @@ mod tests {
         assert_eq!(guest.wait_for(Duration::MAX).unwrap(), Some(End::Stopped));
     }
 
+    /// A stand-in for shards, `dir`'s `shards`, running `body`, started once first and ended
+    /// at once (`--warm`, which no launch gives shards): macOS assesses a new executable as it
+    /// is first started, from 0.1 s to past 8.8 s (PM M534), and a test of what a stand-in's
+    /// process runs times its own work, not that.
+    #[cfg(unix)]
+    fn warmed(dir: &shards_testdir::TempDir, body: &str) -> PathBuf {
+        let bin = dir.path().join("shards");
+        installed(
+            &bin,
+            &format!("#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\n{body}\n"),
+        );
+        let warm = Command::new(&bin)
+            .arg("--warm")
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(warm.success());
+        bin
+    }
+
+    /// Records of a test's own, apart from every other test's, each kind in `learned`
+    /// taught as an answer that came `slowest` after its wait began, `cpu` run meanwhile:
+    /// for the Unix tests that judge a VM process's CPU, its only callers.
+    #[cfg(unix)]
+    fn records(learned: &[(Awaited, Duration, Duration)]) -> &'static Records {
+        let records: &'static Records = Box::leak(Box::new(Records::new()));
+        for &(awaited, slowest, cpu) in learned {
+            records.teach(awaited, slowest, cpu);
+        }
+        records
+    }
+
+    /// A guest booted by the stand-in `bin`, its waits that follow its VM process learning
+    /// from, and judged by, `records` alone.
+    #[cfg(unix)]
+    fn following(bin: PathBuf, records: &'static Records) -> ShardsGuest {
+        let mut guest = start(&GuestSpec {
+            binary: Some(bin),
+            ..spec()
+        })
+        .unwrap();
+        guest.records = records;
+        guest
+    }
+
+    /// A VM process that runs nothing is refused `Stalled` once its kind has an answer: its
+    /// boot's connect and its end, each at the first look after it stopped running, a whole
+    /// W* with no CPU at all (D215). Inputs: W* the least wait this host's streams keep,
+    /// measured, any showing it; R* a CPU second a second, reported and no bound. The stand-in
+    /// sleeps, running nothing, then powers off: a wait that judged nothing would end there,
+    /// `Ended(PowerOff)` and `PowerOff`, not `Stalled`.
+    #[cfg(unix)]
+    #[test]
+    fn a_vm_process_that_runs_nothing_is_refused_stalled_once_its_kind_has_an_answer() {
+        let slowest = crate::while_runs::kept_wait();
+        let learned = records(&[
+            (Awaited::Boot, slowest, slowest),
+            (Awaited::End, slowest, slowest),
+        ]);
+        let dir = shards_testdir::TempDir::new("api-stall").unwrap();
+        let guest = following(warmed(&dir, "exec sleep 3"), learned);
+        let least = crate::Rate {
+            cpu: slowest,
+            over: slowest,
+        };
+        for (what, refused) in [
+            ("its boot's connect", guest.connect_while_runs(1024).err()),
+            ("its end", guest.wait_while_runs().err()),
+        ] {
+            match refused {
+                Some(Refusal::Stalled(stall)) => {
+                    assert_eq!((stall.least(), stall.slowest()), (least, slowest), "{what}");
+                    let (over, waited) = (stall.over(), stall.waited());
+                    assert!(over >= slowest && waited >= over, "{what}: {over:?} {waited:?}");
+                }
+                other => panic!("{what}: {other:?}"),
+            }
+        }
+        assert!(!guest.process_exited().unwrap(), "a stall stops no guest");
+    }
+
+    /// A VM process that runs is waited for past W*, look after look, until its guest
+    /// answers: a boot's connect until it listens, then its end (D215). Inputs: W* a tenth of
+    /// a second, past which any looked-at window of a runnable process holds some CPU; R* a
+    /// CPU second a second, more than a host under load gives the stand-in: reported, no
+    /// bound. The stand-in spins until the test leaves a file, and the test lets three of W*
+    /// go by before the guest listens and again before that file, so looks come and pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_vm_process_that_runs_is_waited_for_until_its_guest_answers() {
+        let slowest = Duration::from_millis(100);
+        let learned = records(&[
+            (Awaited::Boot, slowest, slowest),
+            (Awaited::End, slowest, slowest),
+        ]);
+        let dir = shards_testdir::TempDir::new("api-spin").unwrap();
+        let done = dir.path().join("done");
+        let body = format!("while [ ! -e '{}' ]; do :; done; exit 0", done.display());
+        let guest = Arc::new(following(warmed(&dir, &body), learned));
+        let vsock = guest.vsock.clone();
+        let asking = guest.clone();
+        let began = Instant::now();
+        let connected = std::thread::spawn(move || asking.connect_while_runs(1024).map(drop));
+        std::thread::sleep(slowest.saturating_mul(3));
+        // The guest listens: every CONNECT answered `OK`, the one the connect waits on among
+        // them, as a dial a look ended is closed by the connect.
+        let listener = std::os::unix::net::UnixListener::bind(&vsock).unwrap();
+        std::thread::spawn(move || {
+            for s in listener.incoming() {
+                let Ok(mut s) = s else { break };
+                let mut line = Vec::new();
+                let mut byte = [0u8; 1];
+                while line.last() != Some(&b'\n') && s.read_exact(&mut byte).is_ok() {
+                    line.push(byte[0]);
+                }
+                let _ = s.write_all(b"OK 1073741824\n");
+                std::mem::forget(s);
+            }
+        });
+        connected.join().unwrap().unwrap();
+        assert!(began.elapsed() >= slowest.saturating_mul(3));
+        let waiting = guest.clone();
+        let began = Instant::now();
+        let ended = std::thread::spawn(move || waiting.wait_while_runs());
+        std::thread::sleep(slowest.saturating_mul(3));
+        std::fs::write(&done, b"").unwrap();
+        assert_eq!(ended.join().unwrap().unwrap(), End::PowerOff);
+        assert!(began.elapsed() >= slowest.saturating_mul(3));
+    }
+
+    /// Before its kind's first answer a wait follows liveness alone: a VM process that runs
+    /// nothing is waited for to its end, its boot's connect refused as that end says, and its
+    /// end, which teaches its kind (D215). The stand-in sleeps a second, running nothing, and
+    /// powers off.
+    #[cfg(unix)]
+    #[test]
+    fn a_wait_before_its_kinds_first_answer_never_judges() {
+        let cold = records(&[]);
+        let dir = shards_testdir::TempDir::new("api-cold").unwrap();
+        let bin = warmed(&dir, "exec sleep 1");
+        let guest = following(bin.clone(), cold);
+        assert_eq!(
+            guest.connect_while_runs(1024).err(),
+            Some(Refusal::Ended(End::PowerOff))
+        );
+        assert_eq!(cold.seen(Awaited::Boot), Seen::Cold, "a refusal teaches nothing");
+        let guest = following(bin, cold);
+        assert_eq!(guest.wait_while_runs().unwrap(), End::PowerOff);
+        assert!(matches!(cold.seen(Awaited::End), Seen::Learned { .. }));
+    }
+
+    /// An answer teaches its own kind: a guest's first `OK` its boot's, a later one a
+    /// connect's, and an end that was not this client's stop the end's; a stop teaches
+    /// nothing (D215).
+    #[cfg(unix)]
+    #[test]
+    fn answers_teach_their_kind_and_a_stop_teaches_nothing() {
+        let learned = records(&[]);
+        let (_dir, mut guest, _) = listening_after(0);
+        guest.records = learned;
+        drop(guest.connect_while_runs(1024).unwrap());
+        assert!(matches!(learned.seen(Awaited::Boot), Seen::Learned { .. }));
+        assert_eq!(learned.seen(Awaited::Connect), Seen::Cold);
+        drop(guest.connect_while_runs(1024).unwrap());
+        assert!(matches!(learned.seen(Awaited::Connect), Seen::Learned { .. }));
+        guest.stop().unwrap();
+        assert_eq!(guest.wait_while_runs().unwrap(), End::Stopped);
+        assert_eq!(learned.seen(Awaited::End), Seen::Cold);
+        let dir = shards_testdir::TempDir::new("api-taught").unwrap();
+        let guest = following(warmed(&dir, "exec sleep 1"), learned);
+        assert_eq!(guest.wait_while_runs().unwrap(), End::PowerOff);
+        assert!(matches!(learned.seen(Awaited::End), Seen::Learned { .. }));
+    }
+
     /// The pid of a guest booted here.
     #[cfg(unix)]
     fn booted_pid(guest: &ShardsGuest) -> u32 {
@@ -3538,22 +4233,30 @@ mod tests {
     /// WSAENOBUFS (PM M205) was taken for a refusal (D215).
     #[test]
     fn a_dial_to_a_full_listener_is_asked_again_within_its_patience() {
-        let dir = PrivateDir::new().unwrap();
-        let path = dir.0.join("v");
-        let _full = a_full_listener(&path);
-        // An input: any patience shows it kept.
-        let patience = crate::conformance::UNSERVED_PATIENCE;
-        let (worker, rx) = crate::while_runs::on_a_thread(move || {
+        use crate::while_runs::Reached;
+        // Its patience this host's own, one its dial fits in (`while_runs::until_reached`); its
+        // answer the fact waited for.
+        let said = crate::while_runs::until_reached(|patience| {
+            let dir = PrivateDir::new().unwrap();
+            let path = dir.0.join("v");
+            let _full = a_full_listener(&path);
+            let at = Instant::now().checked_add(patience).unwrap();
             let mut cost = Duration::ZERO;
-            match handshake(&path, 5, Some(patience), &mut cost) {
-                Ok(_) => "connected".to_string(),
-                Err(Attempt::Again(why)) => format!("again: {why}"),
-                Err(Attempt::Refused(why)) => format!("refused: {why}"),
-                Err(Attempt::Allocation) => "allocation unavailable".to_string(),
-                Err(Attempt::Absolute(why)) => format!("absolute: {why}"),
-            }
+            Reached::Done(
+                match handshake_until(&path, 5, HandshakeWait::Until(at), &mut cost) {
+                    Err(HandshakeError::Expired {
+                        phase: HandshakePhase::Dial,
+                    }) => return Reached::Sooner,
+                    Ok(_) => "connected".to_string(),
+                    Err(failure) => match owned_handshake_error(failure) {
+                        Attempt::Again(why) => format!("again: {why}"),
+                        Attempt::Refused(why) => format!("refused: {why}"),
+                        Attempt::Allocation => "allocation unavailable".to_string(),
+                        Attempt::Absolute(why) => format!("absolute: {why}"),
+                    },
+                },
+            )
         });
-        let said = crate::while_runs::answer(&rx, worker, patience);
         assert!(said.starts_with("again: "), "{said}");
     }
 

@@ -302,6 +302,8 @@ mod tests {
             exit: None,
             abandoned: 0,
             last_resort: None,
+            ended: None,
+            credentials: Vec::new(),
         }
     }
 
@@ -1181,6 +1183,9 @@ impl GuestRuntime {
     /// The exact pair already held by the configured probe provider. Native
     /// launch borrows the same validated values from its prepared plan.
     pub fn with_runtime_paths(mut self, paths: shards_api::RuntimePaths) -> Self {
+        let paths = Arc::new(paths);
+        // Its image class's run hosts take the same home and cache.
+        self.images.set_paths(Arc::clone(&paths));
         self.native_paths = Some(paths);
         self
     }
@@ -1414,7 +1419,7 @@ impl GuestRuntime {
 
     pub fn validate_binding(&self, spec: &BoxSpec) -> Result<(), Refusal> {
         if matches!(spec.class, ClassSpec::ShardsImage(_)) {
-            return self.recover_image(spec);
+            return self.images.recover_image(spec);
         }
         if spec.devices.is_empty() && !matches!(spec.class, ClassSpec::Shards(_)) {
             return Ok(());
@@ -1573,7 +1578,7 @@ impl GuestRuntime {
 
     pub fn recover_managed(&self, spec: &BoxSpec) -> Result<(), Refusal> {
         if matches!(spec.class, ClassSpec::ShardsImage(_)) {
-            return self.recover_image(spec);
+            return self.images.recover_image(spec);
         }
         if !self.owns_record(spec) {
             return Ok(());

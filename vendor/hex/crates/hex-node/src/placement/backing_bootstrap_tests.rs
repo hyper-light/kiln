@@ -73,6 +73,7 @@ fn fixture() -> (Capacity, NodeSpec, BackingKey) {
         routes: routes.clone(),
         device_routes: Vec::new(),
         backings: vec![BackingOffer {
+            guest: Default::default(),
             key,
             cost,
             phase: BackingPhase::Prepared,

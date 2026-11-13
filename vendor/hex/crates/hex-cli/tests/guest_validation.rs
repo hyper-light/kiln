@@ -40,13 +40,14 @@ use hex_runtime::guest::{GuestConfig, GuestRuntime};
 /// (HEX-GUEST-20 on adas-mac-studio.local-2, aarch64 HVF, 2026-11-06; bench/native/guest/peak-rss/RECORD.md).
 const PEAK_MIB: u64 = 975;
 
-/// How long the lab may run before the test fails: twice (the margin) the slowest run of this test on
-/// record for this host's class (its `validation_run` row in bench/native/guest/records.tsv; the runs in
-/// bench/native/guest/validation-runs/RECORD.md), the lead's rule for a wait that can't end on a fact
-/// alone. Each run's time includes its boot and staging, so the lab's own is less. A class with no row
-/// fails here by name rather than borrow another's.
+/// How long the lab may run before the test fails: the slowest run of this test on record for this host's class
+/// (its `validation_run` row in bench/native/guest/records.tsv; the runs in
+/// bench/native/guest/validation-runs/RECORD.md), or with none, the slowest of any class's, with no margin past it
+/// (decision 9), the rule for a wait that can't end on a fact alone. Each run's time includes its boot and staging,
+/// so the lab's own is less. A run slower than every one on record fails here, and its time is the next record's. A
+/// measure no class records fails here by name.
 fn suite() -> Duration {
-    2 * hex_runtime::guest::recorded("validation_run").unwrap_or_else(|why| panic!("{why}"))
+    hex_runtime::guest::recorded("validation_run").unwrap_or_else(|why| panic!("{why}"))
 }
 
 /// Every capability Hex's runtime names (crates/hex-runtime/src/linux/oci/caps.rs), as a privileged

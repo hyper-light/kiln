@@ -97,6 +97,22 @@ impl ImageGuest for Run {
         &[]
     }
 
+    // No agent-control endpoint: the node VM's boot asks for none yet (D252, step 39's Link).
+    fn control(&self) -> Option<&shards_api::image::ControlAt> {
+        None
+    }
+
+    // The period its run host says its governor holds a rate over (D247): the test's fixture, which the node VM's boot
+    // never reads, holding it to no rate.
+    fn rate_period(&self) -> Duration {
+        Duration::from_millis(100)
+    }
+
+    // How its microVM started (D253): booted alone, as a run given its guest is, which the node VM's boot never reads.
+    fn started_from(&self) -> shards_api::image::StartedFrom {
+        shards_api::image::StartedFrom::Booted
+    }
+
     fn take_output(&self, _: &MemberName, _: Channel) -> Result<std::io::PipeReader, ImageRefusal> {
         Err(unasked())
     }
@@ -191,6 +207,10 @@ impl ImageGuest for Run {
 
     fn wait_for(&self, _: Duration) -> Result<Option<RunEnd>, ImageRefusal> {
         Ok(Some(RunEnd::Stopped))
+    }
+
+    fn keep_diagnostics(&self, _: std::fs::File) -> Result<(), ImageRefusal> {
+        Err(unasked())
     }
 }
 

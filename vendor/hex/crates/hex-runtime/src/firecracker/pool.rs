@@ -300,9 +300,36 @@ impl FirecrackerRuntime {
         )
     }
 
-    /// Pure second pass for the same owner's all-record preflight, before any native callback.
+    /// Whether `record` is this configuration's observer as its node recorded it under its profile's census cost
+    /// (joint plan step 14): its cost the profile's but for its census numbers, and its identity this configuration's
+    /// recomputed under that cost. Such an observer is retired ([`Self::retire_census_observers`]) before any exact
+    /// check sees it.
+    fn census_observer(&self, record: &PoolRecord) -> Result<bool, Refusal> {
+        let current = observer_cost(&self.config)?;
+        if record.execution != Execution::Firecracker
+            || record.cost == current
+            || record.cost.census_free() != current
+        {
+            return Ok(false);
+        }
+        let recorded = Config {
+            cost: RuntimeCost {
+                guest_overhead: record.cost.guest_overhead,
+                overhead: record.cost.overhead,
+                ..self.config.cost
+            },
+            ..self.config.clone()
+        };
+        Ok(record.key.pool == observer_configuration(&recorded, &record.devices)?)
+    }
+
+    /// Pure second pass for the same owner's all-record preflight, before any native callback. An observer its node
+    /// recorded under the profile's census cost passes, retired at the node's start ([`Self::census_observer`]).
     pub fn preflight_backing(&self, record: &PoolRecord) -> Result<(), Refusal> {
         record.check()?;
+        if self.census_observer(record)? {
+            return Ok(());
+        }
         let bad = || refused(record.key, LifecycleCause::Uncertain);
         if record.execution != Execution::Firecracker
             || record.cost != observer_cost(&self.config)?
@@ -672,55 +699,147 @@ impl FirecrackerRuntime {
             if record.phase == BackingPhase::Released {
                 return record.offer();
             }
-            if record.phase == BackingPhase::Prepared {
-                match fs::symlink_metadata(self.pool_paths(&record)?.dir) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(Refusal::os("checking unsubmitted observer Intent", error));
-                    }
-                    Ok(_) => return Err(refused(*key, LifecycleCause::Uncertain)),
-                }
-                transaction.check_unsubmitted_pool()?;
-                record.phase = BackingPhase::Released;
-                transaction.put_pool(&record)?;
-                return record.offer();
-            }
-            record.phase = BackingPhase::Draining;
-            transaction.put_pool(&record)?;
-            let identity = self.pool_identity(&record)?;
-            let native = transaction.attach_managed(identity.as_ref())?;
-            native
-                .stop()
-                .map_err(|_| refused(*key, LifecycleCause::Uncertain))?;
-            let patience = until
-                .map(remaining)
-                .transpose()?
-                .map_or(self.config.stop_timeout, |left| {
-                    left.min(self.config.stop_timeout)
-                });
-            let terminal = native
-                .wait_for(patience)
-                .map_err(|_| refused(*key, LifecycleCause::Uncertain))?
-                .filter(|end| end.scope == shards_api::TerminalScope::Released)
-                .ok_or_else(|| refused(*key, LifecycleCause::Uncertain))?;
-            record.exit = Some(exit(terminal.status));
-            transaction.put_pool(&record)?;
-            transaction.finalize_managed(identity.as_ref())?;
-            let paths = self.pool_paths(&record)?;
-            match fs::remove_dir_all(&paths.dir) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(Refusal::os("removing released observer directory", error));
-                }
-            }
-            File::open(&self.config.state_dir)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| Refusal::os("syncing released observer directory", error))?;
-            record.phase = BackingPhase::Released;
-            transaction.put_pool(&record)?;
+            self.stop_observer(transaction, &mut record, until)?;
             record.offer()
         })
+    }
+
+    /// Stops and releases observer `record`'s scope, in `transaction` (its pool turn), by `until` where given: a
+    /// Prepared one, its Intent never submitted, is released as it is; any other is drained, its VMM stopped and its
+    /// whole scope seen released, its exit recorded, its controller finalized and its folder removed.
+    fn stop_observer(
+        &self,
+        transaction: &dyn Transaction,
+        record: &mut PoolRecord,
+        until: Option<Instant>,
+    ) -> Result<(), Refusal> {
+        let key = record.key;
+        if record.phase == BackingPhase::Prepared {
+            match fs::symlink_metadata(self.pool_paths(record)?.dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(Refusal::os("checking unsubmitted observer Intent", error));
+                }
+                Ok(_) => return Err(refused(key, LifecycleCause::Uncertain)),
+            }
+            transaction.check_unsubmitted_pool()?;
+            record.phase = BackingPhase::Released;
+            return transaction.put_pool(record);
+        }
+        record.phase = BackingPhase::Draining;
+        transaction.put_pool(record)?;
+        let identity = self.pool_identity(record)?;
+        let native = transaction.attach_managed(identity.as_ref())?;
+        native
+            .stop()
+            .map_err(|_| refused(key, LifecycleCause::Uncertain))?;
+        let patience = until
+            .map(remaining)
+            .transpose()?
+            .map_or(self.config.stop_timeout, |left| {
+                left.min(self.config.stop_timeout)
+            });
+        let terminal = native
+            .wait_for(patience)
+            .map_err(|_| refused(key, LifecycleCause::Uncertain))?
+            .filter(|end| end.scope == shards_api::TerminalScope::Released)
+            .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+        record.exit = Some(exit(terminal.status));
+        transaction.put_pool(record)?;
+        transaction.finalize_managed(identity.as_ref())?;
+        let paths = self.pool_paths(record)?;
+        match fs::remove_dir_all(&paths.dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Refusal::os("removing released observer directory", error));
+            }
+        }
+        File::open(&self.config.state_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| Refusal::os("syncing released observer directory", error))?;
+        record.phase = BackingPhase::Released;
+        transaction.put_pool(record)
+    }
+
+    /// Retires each observer its node recorded under its profile's census cost (joint plan step 14; ROOT, 2026-11-13,
+    /// by decision 9's rule: the profile's identity changed with its census-free cost, `RuntimeCost::census_free`),
+    /// never leaking it: in its pool turn, each box consuming it is kept retired (`BoxRecord::retire`), every call but
+    /// its inspect and its owner's delete refused `Retired`; its VMM is stopped and its scope released as a release's
+    /// is; and its record is removed. An observer of another profile is none of this one's, left to the checks that
+    /// refuse it.
+    /// Retires what this backend's node recorded under its profile's census cost (joint plan step 14; ROOT,
+    /// 2026-11-13: no legacy receipt runs on with a census number as its bound), run by its node's preflight before
+    /// any exact cost check: each observer and its consumers ([`Self::retire_census_observers`]), then each VM box whose
+    /// receipt's cost is the profile's but for its census numbers, its VM stopped and its scope released and the box
+    /// kept retired (`BoxRecord::retire`).
+    pub fn retire_census(&self) -> Result<(), Refusal> {
+        self.retire_census_observers()?;
+        for (id, record) in self.authority()?.records()? {
+            let record = record.map_err(|_| uncertain(&id))?;
+            if record.retired || !matches!(record.spec.class, ClassSpec::Firecracker(_)) {
+                continue;
+            }
+            if !self.census_vm(&record) {
+                continue;
+            }
+            let keys = self.catalog.conflict_ids(&record.spec.devices)?;
+            crate::devices::with_transaction(&self.books, &id, &keys, |transaction| {
+                let mut current = transaction.read(&id)?.ok_or_else(|| missing(&id))?;
+                if current.init.is_some() {
+                    self.stop_vm(&mut current, transaction)?;
+                }
+                current.retire();
+                transaction.put(&current)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Whether VM box `record`'s receipt is this configuration's profile under its census numbers (joint plan step 14):
+    /// retired at its node's start ([`Self::retire_census`]), so the preflight passes it, and no exact check sees it.
+    pub(super) fn census_vm(&self, record: &BoxRecord) -> bool {
+        matches!(record.spec.class, ClassSpec::Firecracker(_))
+            && record.spec.allocation.is_some_and(|allocation| {
+                allocation.cost != self.config.cost
+                    && allocation.cost.census_free() == self.config.cost
+            })
+    }
+
+    fn retire_census_observers(&self) -> Result<(), Refusal> {
+        for record in self.authority()?.pool_records()? {
+            if !self.census_observer(&record)? {
+                continue;
+            }
+            let key = record.key;
+            let keys = self.catalog.conflict_ids(&record.devices)?;
+            crate::devices::with_pool_transaction(&self.books, &key, &keys, |transaction| {
+                let mut record = transaction
+                    .read_pool(&key)?
+                    .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+                for (id, boxed) in transaction.records()? {
+                    let mut boxed = boxed.map_err(|_| uncertain(&id))?;
+                    if boxed.retired
+                        || boxed.spec.route.and_then(|route| route.backing) != Some(key)
+                    {
+                        continue;
+                    }
+                    // A consumer that launched a VM of its own has it stopped and its scope released first.
+                    if boxed.init.is_some() {
+                        self.stop_vm(&mut boxed, transaction)?;
+                    }
+                    boxed.retire();
+                    transaction.put(&boxed)?;
+                }
+                if record.phase != BackingPhase::Released {
+                    self.stop_observer(transaction, &mut record, None)?;
+                } else if record.allocation.is_some() {
+                    transaction.finalize_managed(self.pool_identity(&record)?.as_ref())?;
+                }
+                transaction.remove_pool(&key)
+            })?;
+        }
+        Ok(())
     }
 
     /// This second protocol call is the caller's explicit Index ACK, not an inference from
@@ -1132,6 +1251,26 @@ pub(super) mod tests {
                 .observer_proposal(&configured, &records, &[source])
                 .is_err()
         );
+    }
+
+    /// Joint plan step 14 (AC-T7.4.1; ROOT, 2026-11-13: no legacy receipt runs on with a census number as its bound):
+    /// an observer and a VM box its node recorded under the profile's census cost are recognized exactly, the observer's
+    /// identity recomputed under its own cost, and pass the preflight to be retired at the node's start; the census-free
+    /// profile's own are no census ones. Do record a family row and a consuming VM under the fixture's census-carrying
+    /// cost, then take the profile census-free and record another row. Expect the first row and the VM recognized and
+    /// passing the preflight, and the second row not recognized.
+    #[test]
+    fn w14_census_records_are_recognized_by_their_identity_under_their_own_cost() {
+        let (mut runtime, _no_calls) = family_fixture();
+        let old = family_row(&runtime, &[256], BackingPhase::Live);
+        let consumer = consuming_box(&runtime, &old, "first-consumer");
+        runtime.config.cost = runtime.config.cost.census_free();
+        assert!(runtime.census_observer(&old).unwrap());
+        runtime.preflight_backing(&old).unwrap();
+        assert!(runtime.census_vm(&consumer));
+        runtime.preflight_record(&consumer).unwrap();
+        let current = family_row(&runtime, &[256], BackingPhase::Prepared);
+        assert!(!runtime.census_observer(&current).unwrap());
     }
 
     /// AC-T7.4.1: a metadata-only cold observer's fixed charge carries the full physical set;

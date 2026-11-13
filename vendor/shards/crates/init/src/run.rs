@@ -49,6 +49,16 @@ fn setup_failed(message: impl Into<String>) -> Failure {
     }
 }
 
+/// A spec the host sent, as its workload's or an exec's frame carries it, read before any
+/// of it is applied: refused in `malformed`'s words where it is no spec, and at an entry of
+/// its setup of a key the run protocol does not register (D257), naming the key, which this
+/// init has no reader for, and would otherwise neither apply nor say anything of.
+fn host_spec(payload: &[u8], malformed: &str) -> Result<Spec, String> {
+    let spec = Spec::decode(payload).ok_or_else(|| malformed.to_string())?;
+    run::setup::check(&spec.setup).map_err(|e| format!("its setup: {e}"))?;
+    Ok(spec)
+}
+
 /// Whether the run's owner hears each member's end (`member-ends`, D231): set as its spec
 /// arrives, once a boot, as init serves one run.
 static MEMBER_ENDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -895,6 +905,8 @@ fn sort_setup(entries: &[Vec<u8>], into: &mut Inherited) -> Result<Sorted, Failu
             // Init's, as the run starts (`Standby::start`).
         } else if entry.starts_with(b"devices=") {
             // Init's, done as the workload's limits are (`limit`).
+        } else if entry.starts_with(run::socket::DIR) {
+            // Init's, its lanes' to the command's sockets (D251, `Standby::start`).
         } else if entry == run::nesting::GRANT {
             // The nesting grant (D234): the standby's part of it, made after the run's
             // mounts (below).
@@ -2366,7 +2378,7 @@ fn receive(conn: &File, standby: Standby) -> Result<(Spec, Standby), Failure> {
     let mut payload = vec![0u8; len as usize];
     r.read_exact(&mut payload)
         .map_err(|e| setup_failed(format!("reading the workload: {e}")))?;
-    let spec = Spec::decode(&payload).ok_or_else(|| setup_failed("malformed workload"))?;
+    let spec = host_spec(&payload, "malformed workload").map_err(setup_failed)?;
     Ok((spec, standby))
 }
 
@@ -2475,6 +2487,9 @@ struct Workload {
     notify: Option<OwnedFd>,
     /// Its readiness, init's to move, under the nesting grant (D234).
     readiness: Option<crate::readiness::Readiness>,
+    /// The directory of its sockets its controller may reach (D251), none where the run
+    /// grants none.
+    sockets: crate::lanes::Granted,
 }
 
 /// A pty's master, and the path of its peer, which the standby opens as the workload's
@@ -3080,6 +3095,10 @@ impl Standby {
             .transpose()
             .map_err(|e| setup_failed(format!("its microVM's engine: {e}")))?;
         let mut w = standby.launch(spec, false, setup, &inherited)?;
+        // The directory of its sockets its controller may reach (D251): a run's own command's
+        // alone, so none for an orchestrator's run of its image's members (`ATTEND`).
+        w.sockets = crate::lanes::Granted::read(&spec.setup, spec.builtin != run::builtin::ATTEND)
+            .map_err(setup_failed)?;
         if let (Some(hosts), Some(listener)) = (&hosts, w.binds.take()) {
             hosts.listener(&listener, 0);
         }
@@ -3182,6 +3201,7 @@ impl Standby {
             engine: None,
             notify: None,
             readiness: None,
+            sockets: crate::lanes::Granted::default(),
         })
     }
 
@@ -3356,6 +3376,7 @@ impl Standby {
                 engine,
                 notify,
                 readiness: None,
+                sockets: crate::lanes::Granted::default(),
             });
         };
         // The terminal carries everything; the pipes go unused.
@@ -3380,6 +3401,7 @@ impl Standby {
             engine,
             notify,
             readiness: None,
+            sockets: crate::lanes::Granted::default(),
         })
     }
 }
@@ -4422,7 +4444,7 @@ impl Exec {
         let (token, rest) = payload.split_at_checked(run::TOKEN).ok_or(None)?;
         let (id, spec) = rest.split_at_checked(4).ok_or(None)?;
         let id = u32::from_be_bytes(id.try_into().map_err(|_| None)?);
-        let spec = Spec::decode(spec).ok_or_else(|| Some((id, "a malformed command".to_string())))?;
+        let spec = host_spec(spec, "a malformed command").map_err(|why| Some((id, why)))?;
         let conn = dial(run::EXEC_PORT, false)
             .map_err(|e| Some((id, format!("connecting to the host for the command: {e}"))))?;
         let mut exec = Exec {
@@ -5659,6 +5681,19 @@ impl Workload {
                                             Err(Some((id, why))) => exec_failed(&mut exec_failures, id, &why),
                                             Err(None) => {}
                                         },
+                                        // A lane to a socket of the run's own command (D251):
+                                        // refused at once where the host hears it, as an
+                                        // exec without its connection is.
+                                        kind::SOCKET => {
+                                            if let Err(Some((id, errno))) = crate::lanes::open(
+                                                payload,
+                                                &self.sockets,
+                                                running.then_some(pid),
+                                            ) {
+                                                exec_failures
+                                                    .extend(&[crate::lanes::refused(id, errno).as_slice()]);
+                                            }
+                                        }
                                         kind::EXEC_SIGNAL => {
                                             if let Some((id, rest)) = id_and(payload)
                                                 && let Some(sig) = sig(&rest)
@@ -7399,5 +7434,52 @@ mod nesting_tests {
         for dir in [format!("{w}/boxes"), format!("{w}/{LEAF}"), w] {
             std::fs::remove_dir(&dir).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod host_spec_tests {
+    use super::*;
+
+    fn payload(setup: &[&[u8]]) -> Vec<u8> {
+        Spec {
+            argv: vec![b"/bin/true".to_vec()],
+            setup: setup.iter().map(|e| e.to_vec()).collect(),
+            ..Spec::default()
+        }
+        .encode()
+    }
+
+    /// D257: a spec whose every setup entry is of a key the run protocol registers is read
+    /// as the host sent it; one holding an entry of a key it does not register is refused by
+    /// that key before any of it is applied, its value never said; and one that is no spec, in
+    /// its frame's words. The workload's frame and an exec's both read theirs through
+    /// `host_spec`.
+    #[test]
+    fn a_spec_holding_an_unregistered_setup_key_is_refused_by_it() {
+        let registered: [&[u8]; 4] = [
+            b"readonly",
+            b"tmpfs=/t\0rw",
+            b"member-arg=0\0--resume",
+            b"pid=host",
+        ];
+        let spec = host_spec(&payload(&registered), "malformed workload").unwrap();
+        assert_eq!(spec.setup, registered.map(<[u8]>::to_vec));
+        let refused = host_spec(
+            &payload(&[b"readonly", b"member-flag=0\0sk-secret", b"tmpfs=/t\0rw"]),
+            "malformed workload",
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("its setup")
+                && refused.contains("\"member-flag\"")
+                && !refused.contains("sk-secret"),
+            "{refused}"
+        );
+        assert_eq!(
+            host_spec(&[], "a malformed command").unwrap_err(),
+            "a malformed command"
+        );
     }
 }

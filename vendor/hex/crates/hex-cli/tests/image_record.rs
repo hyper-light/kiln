@@ -28,7 +28,10 @@
 //!   `shards` build carries (its build.rs's `OUT_DIR/shards-init`), which a run takes only beside a kernel given so
 //!   ("--kernel and --init (or SHARDS_KERNEL and SHARDS_INIT) go together", Shards' run.rs);
 //! - `IMAGE_RECORD_HOME`: the Shards home whose store holds the image; `IMAGE_RECORD_IMAGE`: the image, pinned
-//!   (`NAME@sha256:...`), an Agentfile image that runs at least one harness;
+//!   (`NAME@sha256:...`), an Agentfile image that runs at least one harness: on a host with no harness build of its
+//!   arch, the in-tree one (`crates/hex-cli/tests/image_harness`, which any arch builds), built into that home by
+//!   `shards build image -t NAME --metadata-file FILE crates/hex-cli/tests/image_harness` with `SHARDS_HOME` set to
+//!   it, and pinned by the `containerimage.digest` FILE says;
 //! - `IMAGE_RECORD_VCPUS` and `IMAGE_RECORD_MEMORY_MIB`: each VM's size, the node's guest envelope, as an image VM's
 //!   admission sizes it (`Allocation::vm_size`);
 //! - `IMAGE_RECORD_SERIES` and `IMAGE_RECORD_RUNS`: the series, and the runs in each, n their product (with n = 299
@@ -162,8 +165,11 @@ fn spec(
         nesting: false,
         ready_by: None,
         credentials: Vec::new(),
+        lessor: None,
         binary: Some(shards.to_path_buf()),
         env,
+        control: None,
+        gpu_devices: Vec::new(),
     }
 }
 

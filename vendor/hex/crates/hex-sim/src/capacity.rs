@@ -1205,15 +1205,7 @@ impl World {
             self.connect(Some(n));
         }
         self.forget_retired()?;
-        // Each runner says hello, syncs, and answers at most one message a reservation, each hint at
-        // most once a change: (reservations + its hello, sync and the replies) per runner, twice over.
-        let bound = self
-            .runners
-            .len()
-            .saturating_add(1)
-            .saturating_mul(RESERVATIONS.saturating_add(4))
-            .saturating_mul(4);
-        for _ in 0..bound {
+        for _ in 0..self.settle_bound()? {
             let pending = self
                 .runners
                 .iter()
@@ -1233,6 +1225,27 @@ impl World {
             self.check()?;
         }
         Err(Violation::Unsettled)
+    }
+
+    /// The most steps settling takes from here: the protocol's own count of what the links carry (CLAUDE.md §2), so
+    /// a settle past it says more than the protocol can. A word on a link to the keeper is answered once, and that
+    /// answer has its runner say at most one more (a welcome its sync; a grant of a reserve it abandoned, or of another
+    /// amount, its release), itself answered once: four deliveries. A word on a link to a runner starts at most three.
+    /// Once a runner, its sync's answer has it say the release of each reservation it released while it synced, at
+    /// most the [`RESERVATIONS`] it holds, each answered: two deliveries apiece. Once all is quiet the keeper owes each
+    /// runner at most one hint, and two looks find it quiet, the first draining those hints.
+    fn settle_bound(&self) -> Result<usize, Violation> {
+        let overflow = || stopped("the settle's bound overflows");
+        let releases = RESERVATIONS.checked_mul(2).ok_or_else(overflow)?;
+        self.runners.iter().try_fold(2usize, |bound, r| {
+            let to_keeper = r.link.to_keeper.len().checked_mul(4);
+            let to_holder = r.link.to_holder.len().checked_mul(3);
+            to_keeper
+                .zip(to_holder)
+                .and_then(|(k, h)| k.checked_add(h)?.checked_add(releases)?.checked_add(1))
+                .and_then(|runner| bound.checked_add(runner))
+                .ok_or_else(overflow)
+        })
     }
 
     fn agree(&self) -> Result<Report, Violation> {

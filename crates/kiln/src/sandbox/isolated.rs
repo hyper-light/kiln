@@ -105,7 +105,12 @@ pub async fn launch(kind: &Kind, spec: &Spec, vms: &Microvms, homes: Option<&std
             crate::rt::blocking(move || reach_of(b, person.as_deref(), model.as_deref(), homes.as_deref(), project.as_deref(), &env)).await?
         }
     };
-    launch.egress = egress_of(&reach);
+    let text = match source {
+        Source::Builtin(b) => b.text,
+        Source::Kept { text, .. } => text,
+    };
+    // Where it doesn't parse, its build says so in Shards' words; its egress stays as its image's.
+    launch.egress = egress_of(&reach, granted(text).ok().flatten());
     let image = vms.images.pinned(source).await.map_err(|r| anyhow::anyhow!("{}'s image, {}: {r}", kind.name, source.name()))?;
     launch.boundary = Boundary::MicroVm { image: image.clone() };
     let run = vms.sandbox.launch(launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
@@ -148,12 +153,34 @@ pub fn reach_of(b: &'static builtin::Builtin, person: Option<&str>, model: Optio
     super::narrow::reach(b.harness, &super::narrow::Reads { home: &layout.guest_home(), project, env: &env, model, read: &read })
 }
 
-/// The seam's egress for what a run reaches: its image's destinations narrowed to `hosts`, or its
-/// image's own grants, narrowed no further.
-pub fn egress_of(reach: &Reach) -> Egress {
+/// The destinations Agentfile `text` grants past its microVM, each `host:port`, as Shards reads them
+/// (`shards_agentfile::agentfile::grants`, D236): none where it grants a port to any address or any
+/// name, which no list of destinations is; why not, where it doesn't parse.
+pub fn granted(text: &str) -> Result<Option<Vec<String>>, String> {
+    use shards_agentfile::{agentfile, instructions, lint::Linter, parser};
+    let words = |m: &[u8]| String::from_utf8_lossy(m).into_owned();
+    let parsed = parser::parse_as(text.as_bytes(), parser::Dialect::Agentfile).map_err(|e| words(&e.message))?;
+    let read = instructions::parse(&parsed, &Linter::default()).map_err(|e| words(&e.message))?;
+    let directives: Vec<agentfile::Directive> = read
+        .stages
+        .into_iter()
+        .flat_map(|s| s.commands)
+        .filter_map(|c| match c.kind {
+            instructions::Kind::Agentfile(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    let g = agentfile::grants(&agentfile::resolve_targets(&directives).map_err(|e| words(&e))?);
+    Ok((g.egress.is_empty() && !g.dns).then(|| g.destinations.iter().map(|d| words(d)).collect()))
+}
+
+/// The seam's egress for what a run reaches: its image's destinations narrowed to `hosts`; or, kept
+/// whole, each destination its image grants (`whole`, [`granted`]), as a runtime that grants a run each
+/// one by name (Hex: default deny) takes them, else its image's own grants, narrowed no further.
+pub fn egress_of(reach: &Reach, whole: Option<Vec<String>>) -> Egress {
     match reach {
         Reach::Narrowed { hosts, .. } => Egress::Only(hosts.clone()),
-        Reach::Whole { .. } => Egress::Any,
+        Reach::Whole { .. } => whole.map_or(Egress::Any, Egress::Only),
     }
 }
 
@@ -250,7 +277,7 @@ mod tests {
         let reach = reach_of(goose, Some("user:u1"), None, Some(homes.path()), None, &[]);
         let Reach::Narrowed { uses, hosts } = &reach else { anyhow::bail!("not narrowed: {reach:?}") };
         assert_eq!((uses.as_slice(), hosts.as_slice()), (&["anthropic".to_owned()][..], &["api.anthropic.com:443".to_owned()][..]));
-        assert_eq!(egress_of(&reach), Egress::Only(hosts.clone()), "its egress, those alone");
+        assert_eq!(egress_of(&reach, Some(vec!["other.example:443".to_owned()])), Egress::Only(hosts.clone()), "its egress, those alone");
         // Its run's own environment comes before its configuration.
         let groq = reach_of(goose, Some("user:u1"), None, Some(homes.path()), None, &[("GOOSE_PROVIDER".to_owned(), "groq".to_owned())]);
         assert!(matches!(&groq, Reach::Narrowed { uses, .. } if uses == &["groq"]), "{groq:?}");
@@ -260,7 +287,13 @@ mod tests {
         assert_eq!(reach_of(goose, None, None, Some(homes.path()), None, &[]), Reach::Whole { why: Whole::NoHome });
         assert_eq!(reach_of(goose, Some("user:u1"), None, None, None, &[]), Reach::Whole { why: Whole::NoHome });
         assert!(Whole::NoHome.is_fallback());
-        assert_eq!(egress_of(&Reach::Whole { why: Whole::NoHome }), Egress::Any);
+        // Kept whole: each destination its image grants, by name, or its image's own where it grants more than names.
+        let goose_hosts = granted(goose.text).map_err(anyhow::Error::msg)?.ok_or_else(|| anyhow::anyhow!("goose's image grants more than names"))?;
+        assert!(goose_hosts.iter().any(|h| h == "api.anthropic.com:443") && goose_hosts.iter().any(|h| h == "api.groq.com:443"), "{goose_hosts:?}");
+        assert_eq!(egress_of(&Reach::Whole { why: Whole::NoHome }, Some(goose_hosts.clone())), Egress::Only(goose_hosts));
+        assert_eq!(egress_of(&Reach::Whole { why: Whole::NoHome }, None), Egress::Any);
+        assert_eq!(granted(&goose.text.replace("NETWORK --egress=", "NETWORK --egress=443/tcp --egress=")).map_err(anyhow::Error::msg)?, None, "a port to any address is no list of names");
+        assert!(granted("FROM\n").is_err(), "an Agentfile that doesn't parse says why");
         // opencode's project at its own path, read where it is.
         let project = tempfile::tempdir()?;
         std::fs::write(project.path().join("opencode.json"), "{\"model\": \"openai/gpt-5\"}")?;

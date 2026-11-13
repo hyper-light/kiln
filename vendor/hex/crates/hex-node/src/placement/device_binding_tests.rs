@@ -671,9 +671,7 @@ fn concurrent_isolation_group_admission_keeps_one_creating_holder() {
             let snapshot = records.lock().unwrap().clone();
             catalog.prepare(&spec, &snapshot, &[]).unwrap();
             holding.send(()).unwrap();
-            publishing
-                .recv_timeout(hex_api::conformance::patience())
-                .unwrap();
+            publishing.recv().unwrap();
             records.lock().unwrap().insert(
                 spec.id.clone(),
                 Ok(BoxRecord::new(spec, Phase::Creating, Vec::new())),
@@ -681,7 +679,7 @@ fn concurrent_isolation_group_admission_keeps_one_creating_holder() {
             made.fetch_add(1, Ordering::SeqCst);
         })
     };
-    held.recv_timeout(hex_api::conformance::patience()).unwrap();
+    held.recv().unwrap();
     let (attempting, attempted) = sync_channel(1);
     let second = {
         let (catalog, turns, records, made, refused) = (
@@ -729,9 +727,7 @@ fn concurrent_isolation_group_admission_keeps_one_creating_holder() {
             made.fetch_add(1, Ordering::SeqCst);
         })
     };
-    attempted
-        .recv_timeout(hex_api::conformance::patience())
-        .unwrap();
+    attempted.recv().unwrap();
     publish.send(()).unwrap();
     first.join().unwrap();
     second.join().unwrap();

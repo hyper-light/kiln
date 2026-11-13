@@ -349,6 +349,13 @@ pub mod kind {
     /// (shards_net::encode_grants), after its `NET_POLICY`, once; answered with the same kind
     /// and the run's CA's certificate (DER), made for those hosts alone.
     pub const NET_CREDENTIALS: u8 = 97;
+    /// Network process ⇄ its run host: a credential's lease (D242). The network process asks
+    /// it just in time, by reference, as a flow first needs its value: the ask's id (4
+    /// bytes, big-endian), then the reference (shards_net::lease::encode_ask). Its run host
+    /// answers with the same kind, by that id: how long the lease lives and the value, or why
+    /// not, typed (shards_net::lease::encode_answer). Asked only where the run has credential
+    /// grants (`NET_CREDENTIALS`), of a run host that relays it to its orchestrator.
+    pub const NET_LEASE: u8 = 100;
     /// Daemon → a running microVM's VM process: a run joins its network (D119). Its number
     /// (a big-endian u64, which `EXEC_TAKEN` answers), with the VM's end of the joiner's
     /// own connection to the daemon, on which the joiner's run goes as a warm VM's does
@@ -594,6 +601,28 @@ pub mod kind {
     /// `exec_failed` class (a byte), then what the guest said (D238). An exec that never
     /// started and says none of this could not be asked of its guest.
     pub const EXEC_UNSTARTED: u8 = 96;
+    /// Its owner → a VM: a lane to a socket of its run's own command (D251), by its number
+    /// (8, big-endian, below 2^63), then the socket's name in the run's socket directory
+    /// (`shards_abi::run::socket::DIR`). The VM answers with the same message, by the
+    /// number: then the lane's status (`shards_abi::run::socket::STATUS` bytes: 0 connected,
+    /// else the errno it was refused with), then, for a lane its guest could not be asked for
+    /// or never answered, why, in words; connected, on Unix the lane's connection beside it,
+    /// held by the VM until its owner says it has it with [`LANE_HELD`] (M24), and on
+    /// Windows, where a VM gives its owner no handle, none, its owner answering
+    /// [`LANE_HELD`] with the socket the VM relays the lane onto.
+    pub const LANE_OPEN: u8 = 98;
+    /// Its owner → a VM, by a lane's number (8, big-endian): the owner has the lane's
+    /// connection a VM handed it ([`LANE_OPEN`]'s answer, or any lane a VM hands it by
+    /// number), and the VM lets go of its copy (M24); on Windows beside it the socket the VM
+    /// relays the lane onto, or none for a lane its owner closes. Numbers its owner chose
+    /// ([`LANE_OPEN`]) are below 2^63; a VM's own, for lanes its guest begins, at or above.
+    pub const LANE_HELD: u8 = 99;
+    /// Warm VM → its daemon or run host, before its `DONE`: it could not serve its run, and
+    /// why, in words (warm.rs `finish`): its guest gone before its command ended, a frame it
+    /// could not read, a spec it could not send. Its `DONE` then carries the status its client
+    /// exits with for it (125, as `docker run` exits for dockerd's own failures), which no
+    /// command gave: the run failed, in these words.
+    pub const UNSERVED: u8 = 101;
 
     /// Whether a network process's control message of `kind` hands it sockets: published
     /// ports' (`PUBLISH`, `NET_PUBLISHED`) and a peer's link (`NET_PEER`). Beside the

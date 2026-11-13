@@ -177,22 +177,13 @@ pub fn own_link<L: Link>(link: L) -> Result<LinkOwner, Refusal> {
 }
 
 /// How long a call waits for the guest's node agent's answer, one wait a kind of call (`crate::calls::kind_of`'s
-/// order), as the socket's client waits (decision 9): twice the slowest answer this process has had to a call of
-/// that kind, through the guest. On macOS, Hello and capacity ([`CLASS_ANSWERS`]'s, the oci class's) use exact
-/// per-profile maxima from
-/// `bench/sched/runtime-pools/calibration-macos-cold-extension-1bb73f74.json` (AC-T7.4.1). Hello begins after dial/token setup;
-/// fresh-backend, subsequent and warm borrower cohorts are retained separately in the record, not per-row VM proof.
-/// Neither row measures VM boot or workload completion. A debug build's seed is never under the release record
-/// (`Patience::by_profile`): Hello's debug campaign met no cold first hello, so its debug seed is the release one.
-/// Other host platforms and operations remain measuring until their own actual rows are recorded; macOS evidence
-/// is not extrapolated across OS transports.
+/// order), as the socket's client waits (decision 9): the slowest answer this process has had to a call of that kind,
+/// through the guest; before the first, and after a run-out, it follows the guest's relay, lasting while its
+/// connection stands. No record is read: the macOS guest census
+/// (`bench/sched/runtime-pools/calibration-macos-cold-extension-1bb73f74.json`) is the evidence the rule is held to.
 static ANSWERS: [Patience; KINDS] = [
     #[cfg(target_os = "macos")]
-    Patience::by_profile(
-        "client.guest.answer.hello",
-        Duration::from_nanos(3_022_291),
-        Some(Duration::from_nanos(295_291)),
-    ),
+    Patience::measuring("client.guest.answer.hello"),
     #[cfg(not(target_os = "macos"))]
     Patience::measuring("client.guest.answer.hello"),
     Patience::measuring("client.guest.answer.list"),
@@ -217,9 +208,7 @@ static ANSWERS: [Patience; KINDS] = [
 ];
 
 /// AC-T7.4.1: the kinds a box's class times, a wait for each (kind, class), named
-/// `client.guest.answer.<kind>.<class>`. On macOS the guest's capacity row above is an `oci` box's (every guest
-/// capacity call asks `oci`): release 6.849583 ms, debug 6.826667 ms. No census has timed another kind or class
-/// through a guest: MEASURING, each, never another class's record, until a census records it.
+/// `client.guest.answer.<kind>.<class>`, each learned as [`ANSWERS`] are, no class's answers bounding another's.
 #[cfg(target_os = "macos")]
 static CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [
     class_waits!("client.guest.answer", "process", measuring),
@@ -227,20 +216,8 @@ static CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [
         "client.guest.answer",
         "oci",
         [
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            measuring,
-            (
-                Duration::from_nanos(6_849_583),
-                Some(Duration::from_nanos(6_826_667))
-            ),
+            measuring, measuring, measuring, measuring, measuring, measuring, measuring, measuring,
+            measuring, measuring, measuring,
         ]
     ),
     class_waits!("client.guest.answer", "firecracker", measuring),
@@ -277,8 +254,8 @@ impl Waits for Guest {
 }
 
 /// A node over QUIC (`hex-quic`'s link; docs/design/hex-quic.md Q7): the guest's protocol on hyper-transport's lanes,
-/// its waits its own, `client.quic.answer.<kind>` and `client.quic.answer.<kind>.<class>`, each MEASURING until a
-/// census over QUIC records it, never the guest's record.
+/// its waits its own, `client.quic.answer.<kind>` and `client.quic.answer.<kind>.<class>`, each learned from this
+/// process's own answers over QUIC (decision 9), never the guest's.
 pub struct Quic;
 
 static QUIC_ANSWERS: [Patience; KINDS] = [

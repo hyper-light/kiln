@@ -9,7 +9,12 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-hex-core.workspace = true
+hex-core = { workspace = true, features = ["test-seeds"] }
+
+# A thread as a party (waits::follow::Thread): macOS reads another thread through proc_pidinfo. A delegated cgroup's
+# preparation (cgroup::delegated): Linux's ESRCH, a process that ended before it was moved.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

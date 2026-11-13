@@ -130,7 +130,8 @@ fn guest_node(root: &Path) -> (Arc<Recorded<WithGuest<SimRuntime>>>, Arc<AtomicU
     // The image class as `hex node` configures its guest (hex-cli's configured_guest).
     .with_images(
         hex_runtime::guest::host_images(),
-        hex_runtime::guest::ImageWaits::recorded(),
+        Ok(hex_runtime::guest::ImageWaits::new()),
+        root.join("image-diagnostics"),
     )
     .with_runtime_cost(cost)
     .unwrap();

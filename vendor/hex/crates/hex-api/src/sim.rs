@@ -244,6 +244,11 @@ impl SimRuntime {
             // A simulated program has no caller to lose: only the node agent's socket abandons one.
             abandoned: 0,
             last_resort: None,
+            ended: None,
+            credentials: match &b.spec.class {
+                ClassSpec::ShardsImage(image) => image.credentials.clone(),
+                _ => Vec::new(),
+            },
         })
     }
 }

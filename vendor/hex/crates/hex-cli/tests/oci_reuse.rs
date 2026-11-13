@@ -57,14 +57,13 @@
 )]
 
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use hex_api::conformance::{Act, PATIENCE};
+use hex_api::conformance::{Act, end_of};
 use hex_api::{Bounds, BoxId, BoxOwner, BoxSpec, ClassSpec, Exit, Program, Runtime, Stdio};
 use hex_core::netns_reuse::Refused as NetRefused;
 use hex_core::patience::Patience;
@@ -118,9 +117,9 @@ fn a_boxs_cgroup_is_ended_without_the_lock_and_reused_within_its_owner() {
                 .expect("run the test in a delegated scope");
             assert!(status.success(), "the delegated re-run failed");
         }
-        Err(direct) => {
-            eprintln!("SKIP: no usable cgroup v2 delegation ({direct}); run on a cgroup-v2 host")
-        }
+        // HEX_DELEGATED promised this binary a cgroup delegated to it: a preparation that fails there fails the test,
+        // never a skip that would hide the breakage.
+        Err(direct) => panic!("its cgroup isn't delegated to it ({direct})"),
     }
 }
 
@@ -471,8 +470,8 @@ fn a_delete_ends_a_box_through_its_inits_pidfd(lab: &Lab, own: &Path) {
     );
     assert!(!cg.exists(), "the box's cgroup is gone");
     assert_eq!(
-        program.wait_for(PATIENCE).unwrap(),
-        Some(Exit::Signal(9)),
+        end_of(&mut program).unwrap(),
+        Exit::Signal(9),
         "the exec'd program ended with its namespace"
     );
     assert!(
@@ -550,7 +549,7 @@ fn a_delete_ends_a_box_through_its_inits_pidfd(lab: &Lab, own: &Path) {
         Some(false),
         "the delete wrote no cgroup.kill for the process box"
     );
-    assert_eq!(program.wait_for(PATIENCE).unwrap(), Some(Exit::Signal(9)));
+    assert_eq!(end_of(&mut program).unwrap(), Exit::Signal(9));
     eprintln!("test 1, process box: ended by cgroup.kill, counted");
 
     // The fourth: an oci box whose init ended on its own and was reaped before the delete, its exit read.
@@ -2986,37 +2985,21 @@ fn host_id(flag: &str) -> u32 {
         .expect("id is a number")
 }
 
-/// This process's cgroup directory under /sys/fs/cgroup.
-fn own_cgroup() -> PathBuf {
-    let mut own = String::new();
-    std::fs::File::open("/proc/self/cgroup")
-        .and_then(|mut f| f.read_to_string(&mut own))
-        .expect("/proc/self/cgroup");
-    let rel = own
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .expect("a 0:: cgroup line")
-        .trim_start_matches('/');
-    PathBuf::from("/sys/fs/cgroup").join(rel)
-}
-
-/// Moves this process into a leaf of its own cgroup and confirms every controller is delegated, as
-/// oci_box.rs does; returns the own cgroup dir, or why it isn't ours to subdivide.
+/// This process's own cgroup, delegated to it and prepared once for every test in this binary
+/// (`hex_testkit::cgroup::delegated`: the process and every process of its own moved into a leaf), or why it isn't
+/// ours to subdivide. The probe root's opening proves every controller a box uses is delegated here: `BoxRoot::open`
+/// refuses by name otherwise (HEX-INST-1).
 fn prepare_cgroup(disk: &Path) -> Result<PathBuf, String> {
-    let own = own_cgroup();
-    let leaf = own.join("hex-agent");
-    std::fs::create_dir_all(&leaf).map_err(|e| format!("making a leaf for the agent: {e}"))?;
-    std::fs::write(leaf.join("cgroup.procs"), format!("{}", std::process::id()))
-        .map_err(|e| format!("moving self into a leaf: {e}"))?;
-    // The probe root opening proves every controller a box uses is delegated here: `BoxRoot::open`
-    // refuses by name otherwise (HEX-INST-1).
-    hex_runtime::linux::cgroup::BoxRoot::open(
-        &own.join("hex-probe"),
-        hex_runtime::linux::disks::under(disk).unwrap_or_default(),
-    )
-    .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_dir(own.join("hex-probe"));
-    Ok(own)
+    hex_testkit::cgroup::delegated(|own| {
+        let probe = hex_runtime::linux::cgroup::BoxRoot::open(
+            &own.join("hex-probe"),
+            hex_runtime::linux::disks::under(disk).unwrap_or_default(),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+        let _ = std::fs::remove_dir(own.join("hex-probe"));
+        probe
+    })
 }
 
 fn cache_dir() -> PathBuf {

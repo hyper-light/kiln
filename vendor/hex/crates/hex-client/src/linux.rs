@@ -1,13 +1,14 @@
 //! The client on Linux: one `SOCK_SEQPACKET` connection to the node agent's socket, which keeps each message whole
 //! (unix(7)), an exec's stdio passed as `SCM_RIGHTS` descriptors, on the core every transport shares
 //! (`crate::calls`): no thread of its own reads it, and a call waits for its answer until its caller's deadline,
-//! or with none at most twice the slowest answer this process has had to a call of its kind ([`ANSWERS`]).
+//! or with none at most the slowest answer this process has had to a call of its kind, following the node agent before
+//! its first answer and after a run-out ([`ANSWERS`]; decision 9).
 
 use std::io::{IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use hex_api::{Class, Refusal};
 use hex_core::patience::Patience;
@@ -26,30 +27,14 @@ use crate::calls::{
 
 /// How long a call waits for the node agent's answer, and its send for room in the agent's socket, one wait a kind
 /// of call (`crate::calls::kind_of`'s order), since a list waits on its parts, so a fast hello's answer says nothing of
-/// its: twice the slowest answer this process has had to a call of that kind (decision 9; the lead's failure-bound rule
-/// of 2026-11-06), past which a call with no caller's deadline is refused by type, the only way left to it (under one,
-/// a run-out recorded). Each kind is seeded by build profile from its `client.answer.<kind>` rows of
-/// `bench/competitive/probes/waits_census.md`, in nanoseconds as the census keeps them: a release build from run 4's
-/// largest max of the release arms with a row's 1,000 samples (adacachy2), a debug build from run 5's largest answer
-/// of the debug-build arms, the debug arm and the suites' (adacachy2), never under a bound one ran out at (decision 9),
-/// nor under the release seed (`Patience::by_profile`). The scheduler operations have no rows yet: MEASURING until a
-/// census with them in records them. The kinds a box's class times are [`CLASS_ANSWERS`].
+/// its: the slowest answer this process has had to a call of that kind (decision 9), past which a call's run-out is
+/// recorded and its wait goes on, refusing nothing by itself (the person's ruling of 2026-11-13). A call's wait follows
+/// the node agent: it lasts while the connection stands, its reset or close the refusal, or to its caller's deadline. No record is read: the `client.answer.<kind>` rows of `bench/competitive/probes/waits_census.md` are the
+/// evidence the rule is held to. The kinds a box's class times are [`CLASS_ANSWERS`].
 static ANSWERS: [Patience; KINDS] = [
-    Patience::by_profile(
-        "client.answer.hello",
-        Duration::from_nanos(1_177_037),
-        Some(Duration::from_nanos(17_232_102)),
-    ),
-    Patience::by_profile(
-        "client.answer.list",
-        Duration::from_nanos(386_711_080),
-        Some(Duration::from_nanos(868_709_473)),
-    ),
-    Patience::by_profile(
-        "client.answer.netns",
-        Duration::from_nanos(715_105),
-        Some(Duration::from_nanos(2_733_541)),
-    ),
+    Patience::measuring("client.answer.hello"),
+    Patience::measuring("client.answer.list"),
+    Patience::measuring("client.answer.netns"),
     Patience::measuring("client.answer.schedule.describe"),
     Patience::measuring("client.answer.schedule.advertise"),
     Patience::measuring("client.answer.schedule.submit"),
@@ -69,86 +54,24 @@ static ANSWERS: [Patience; KINDS] = [
     Patience::measuring("client.answer.links"),
 ];
 
-/// AC-T7.4.1: the kinds a box's class times, a wait for each (kind, class), named `client.answer.<kind>.<class>`. The
-/// census's `client.answer.<kind>` rows (above) time `process` and `oci` boxes: run 4's release arms seam_oci's OCI
-/// boxes, run 5's debug arms the suites' process and OCI boxes too, a process box doing a subset of an OCI box's work;
-/// they seed both. A kill, an exec asking for streams, a run and a capacity have no rows yet, and no census has timed
-/// a `firecracker` or `shards` box here: MEASURING, each, never another class's record, until a census records it.
+/// AC-T7.4.1: the kinds a box's class times, a wait for each (kind, class), named `client.answer.<kind>.<class>`,
+/// each learned as [`ANSWERS`] are: a microVM's boot is orders of magnitude from a process's, so no class's answers
+/// bound another's.
 static CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [
     class_waits!(
         "client.answer",
         "process",
         [
-            (
-                Duration::from_nanos(43_655_221),
-                Some(Duration::from_nanos(49_798_121))
-            ),
-            (
-                Duration::from_nanos(11_263_989),
-                Some(Duration::from_nanos(16_120_605))
-            ),
-            (
-                Duration::from_nanos(17_330_544),
-                Some(Duration::from_nanos(100_780_659))
-            ),
-            (
-                Duration::from_nanos(583_198),
-                Some(Duration::from_nanos(3_952_426))
-            ),
-            (
-                Duration::from_nanos(10_914_126),
-                Some(Duration::from_nanos(12_007_514))
-            ),
-            (
-                Duration::from_nanos(757_183),
-                Some(Duration::from_nanos(386_833))
-            ),
-            (
-                Duration::from_nanos(35_715_197),
-                Some(Duration::from_nanos(706_090_511))
-            ),
-            measuring,
-            measuring,
-            measuring,
-            measuring,
+            measuring, measuring, measuring, measuring, measuring, measuring, measuring, measuring,
+            measuring, measuring, measuring,
         ]
     ),
     class_waits!(
         "client.answer",
         "oci",
         [
-            (
-                Duration::from_nanos(43_655_221),
-                Some(Duration::from_nanos(49_798_121))
-            ),
-            (
-                Duration::from_nanos(11_263_989),
-                Some(Duration::from_nanos(16_120_605))
-            ),
-            (
-                Duration::from_nanos(17_330_544),
-                Some(Duration::from_nanos(100_780_659))
-            ),
-            (
-                Duration::from_nanos(583_198),
-                Some(Duration::from_nanos(3_952_426))
-            ),
-            (
-                Duration::from_nanos(10_914_126),
-                Some(Duration::from_nanos(12_007_514))
-            ),
-            (
-                Duration::from_nanos(757_183),
-                Some(Duration::from_nanos(386_833))
-            ),
-            (
-                Duration::from_nanos(35_715_197),
-                Some(Duration::from_nanos(706_090_511))
-            ),
-            measuring,
-            measuring,
-            measuring,
-            measuring,
+            measuring, measuring, measuring, measuring, measuring, measuring, measuring, measuring,
+            measuring, measuring, measuring,
         ]
     ),
     class_waits!("client.answer", "firecracker", measuring),

@@ -12,8 +12,8 @@
 //!   [`sim::SimView`]; and [`conformance`], the contract both it and Hex's node pass.
 //!
 //! Pure (CLAUDE.md §9): no clock, disk, network or randomness. The keeper's records go through
-//! [`Records`]; its shell carries the messages and times nothing; a holder's shell times its waits
-//! (Patience, CV6) and says when one ran out ([`Holder::ran_out`]).
+//! [`Records`]; its shell carries the messages and times nothing; a holder's shell follows its waits
+//! (Patience, CV6) and says when one ended unanswered ([`Holder::ran_out`]).
 
 pub mod conformance;
 mod holder;

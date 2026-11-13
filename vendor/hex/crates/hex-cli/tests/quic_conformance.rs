@@ -271,7 +271,7 @@ fn exercise(host: Arc<dyn Host>) {
         .unwrap(),
     );
     // No deadline of the test's own: the dial until the driver tells it, the hello on its kind's learned wait
-    // (`client.quic.answer.hello`, measuring until a census over QUIC records it).
+    // (`client.quic.answer.hello`, following the node until its first answer: decision 9).
     let (client, peer) = hex_quic::link::connect(
         Arc::clone(&client_end),
         "node.quic.test",
@@ -1420,31 +1420,21 @@ mod linux {
     use std::process::Command;
     use std::sync::Arc;
 
-    /// This process's cgroup directory under /sys/fs/cgroup.
-    fn own_cgroup() -> PathBuf {
-        let own = std::fs::read_to_string("/proc/self/cgroup").expect("/proc/self/cgroup");
-        let rel = own
-            .lines()
-            .find_map(|l| l.strip_prefix("0::"))
-            .expect("a 0:: cgroup line")
-            .trim_start_matches('/');
-        PathBuf::from("/sys/fs/cgroup").join(rel)
-    }
-
-    /// This process in a leaf of its own cgroup, which hands every controller down (process_box.rs's).
+    /// This process's own cgroup, delegated to it and prepared once for every test in this binary
+    /// (`hex_testkit::cgroup::delegated`: the process and every process of its own moved into a leaf), or why it
+    /// isn't ours to subdivide. The probe root's opening proves every controller a box uses is delegated here:
+    /// `BoxRoot::open` refuses by name otherwise (HEX-INST-1).
     fn prepare_cgroup(disk: &Path) -> Result<PathBuf, String> {
-        let own = own_cgroup();
-        let leaf = own.join("hex-agent");
-        std::fs::create_dir_all(&leaf).map_err(|e| format!("making a leaf for the agent: {e}"))?;
-        std::fs::write(leaf.join("cgroup.procs"), format!("{}", std::process::id()))
-            .map_err(|e| format!("moving self into a leaf: {e}"))?;
-        hex_runtime::linux::cgroup::BoxRoot::open(
-            &own.join("hex-probe"),
-            hex_runtime::linux::disks::under(disk).unwrap_or_default(),
-        )
-        .map_err(|e| e.to_string())?;
-        let _ = std::fs::remove_dir(own.join("hex-probe"));
-        Ok(own)
+        hex_testkit::cgroup::delegated(|own| {
+            let probe = hex_runtime::linux::cgroup::BoxRoot::open(
+                &own.join("hex-probe"),
+                hex_runtime::linux::disks::under(disk).unwrap_or_default(),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+            let _ = std::fs::remove_dir(own.join("hex-probe"));
+            probe
+        })
     }
 
     /// Runs `body` with this process's cgroup, delegated: here where it is, else once more as `test` alone in a
@@ -1485,16 +1475,9 @@ mod linux {
                     .expect("run the test in a delegated scope");
                 assert!(status.success(), "the delegated re-run of {test} failed");
             }
-            Err(direct) => {
-                hex_testkit::skip(
-                    test,
-                    "cgroup v2 delegation",
-                    &format!(
-                        "none in the delegated scope either ({direct}); run on a cgroup-v2 host"
-                    ),
-                )
-                .expect("recording the skip");
-            }
+            // HEX_DELEGATED promised this binary a cgroup delegated to it: a preparation that fails there fails the
+            // test, never a skip that would hide the breakage.
+            Err(direct) => panic!("{test}: its cgroup isn't delegated to it ({direct})"),
         }
     }
 

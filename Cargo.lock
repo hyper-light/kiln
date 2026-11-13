@@ -1734,6 +1734,7 @@ dependencies = [
  "hex-wait",
  "serde",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]
@@ -4331,9 +4332,11 @@ dependencies = [
  "shards-afunix",
  "shards-dns",
  "shards-ipc",
+ "shards-remote",
  "triomphe",
  "unsize",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -4377,6 +4380,20 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "shards-abi",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "shards-remote"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "bytes",
+ "hyper-quic",
+ "libc",
+ "sha2 0.11.1",
+ "shards-abi",
+ "shards-ipc",
  "windows-sys 0.61.2",
 ]
 

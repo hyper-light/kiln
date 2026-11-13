@@ -612,6 +612,7 @@ mod tests {
         );
         vm.backing = Some(key);
         let backing = BackingOffer {
+            guest: Default::default(),
             key,
             cost: profile(),
             phase: BackingPhase::Prepared,
@@ -708,12 +709,14 @@ mod tests {
                     Vec::new(),
                     vec![
                         BackingOffer {
+                            guest: Default::default(),
                             key: cold,
                             cost: profile(),
                             phase,
                             devices: vec![id],
                         },
                         BackingOffer {
+                            guest: Default::default(),
                             key: warm,
                             cost: profile(),
                             phase: BackingPhase::Live,
@@ -905,12 +908,14 @@ mod tests {
                         Vec::new(),
                         vec![
                             BackingOffer {
+                                guest: Default::default(),
                                 key,
                                 cost: profile(),
                                 phase,
                                 devices: vec![id],
                             },
                             BackingOffer {
+                                guest: Default::default(),
                                 key: warm,
                                 cost: profile(),
                                 phase: BackingPhase::Live,
@@ -981,12 +986,14 @@ mod tests {
         let rows = || {
             vec![
                 BackingOffer {
+                    guest: Default::default(),
                     key: parent,
                     cost: profile(),
                     phase: BackingPhase::Released,
                     devices: vec![id, DeviceId { key: 2, ..id }],
                 },
                 BackingOffer {
+                    guest: Default::default(),
                     key: current,
                     cost: profile(),
                     phase: BackingPhase::Live,

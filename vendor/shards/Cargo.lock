@@ -497,7 +497,7 @@ dependencies = [
 [[package]]
 name = "hyper-quic"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=233b7fcef7a363327c5439b191724a38065062cd#233b7fcef7a363327c5439b191724a38065062cd"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=045cf3ff82e1d96d1f8c339d6e644d17afc998a3#045cf3ff82e1d96d1f8c339d6e644d17afc998a3"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -516,7 +516,7 @@ dependencies = [
 [[package]]
 name = "hyper-tls"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=233b7fcef7a363327c5439b191724a38065062cd#233b7fcef7a363327c5439b191724a38065062cd"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=045cf3ff82e1d96d1f8c339d6e644d17afc998a3#045cf3ff82e1d96d1f8c339d6e644d17afc998a3"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -1240,10 +1240,12 @@ dependencies = [
  "shards-afunix",
  "shards-dns",
  "shards-ipc",
+ "shards-remote",
  "shards-testdir",
  "triomphe",
  "unsize",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -1421,6 +1423,7 @@ dependencies = [
  "shards-testdir",
  "time",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

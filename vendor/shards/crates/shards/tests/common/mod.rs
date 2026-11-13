@@ -2035,28 +2035,60 @@ fn run_shards_with<S: AsRef<std::ffi::OsStr>>(
 }
 
 /// What a client that never ended shows before it is killed: its home's runs as its daemon
-/// has them (`ps -a`), whether the daemon took its run at all; and on Windows its threads'
-/// stacks and its daemon's, where this host has Microsoft's console debugger (cdb, the
-/// Windows SDK's Debugging Tools), attached without stopping them (`-pv`).
+/// has them (`ps -a`), whether the daemon took its run at all, and what each running one's
+/// guest runs ([`guests_processes`]); and on Windows its threads' stacks and its daemon's,
+/// where this host has Microsoft's console debugger (cdb, the Windows SDK's Debugging
+/// Tools), attached without stopping them (`-pv`).
 fn stuck(pid: u32, home: Option<&Path>) -> String {
     stacks_of(&[("its client", pid)], home)
 }
 
-/// [`stuck`]'s view of processes `pids`, each named, as a test that found one of them stuck
-/// shows them: its home's runs, and on Windows their stacks and its daemon's.
-pub fn stacks_of(pids: &[(&str, u32)], home: Option<&Path>) -> String {
-    // What `cmd` said by `timeout`; a word that it said nothing where it never ended, so
-    // that the failure this adds to is never lost to one of its own.
-    let said_by = |cmd: &mut Command, timeout: Duration| match std::panic::catch_unwind(
-        std::panic::AssertUnwindSafe(|| output_within(cmd, timeout)),
-    ) {
+/// What `cmd` said by `timeout`, its stdout then its stderr; a word that it said nothing
+/// where it never ended, so that the failure this adds to is never lost to one of its own.
+fn said_within(cmd: &mut Command, timeout: Duration) -> String {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| output_within(cmd, timeout))) {
         Ok(out) => format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ),
         Err(_) => format!("(it did not end within {timeout:?})"),
-    };
+    }
+}
+
+/// What each microVM running in `home` runs, as `top` lays its processes out (init's dump
+/// of the guest's `/proc`), with each one's state and the kernel function it waits in
+/// (`stat`, `wchan`): where in its guest a client that never ended, or a command that said
+/// nothing more, is held.
+pub fn guests_processes(home: &Path) -> String {
+    let mut ids = command();
+    ids.args(["ps", "-q", "--no-trunc"])
+        .env("SHARDS_HOME", home)
+        .stdin(Stdio::null());
+    let listed = said_within(&mut ids, Duration::from_secs(20));
+    let mut said = String::new();
+    for id in listed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        let mut top = command();
+        top.args(["top", id, "-o", "pid,ppid,stat,wchan:32,args"])
+            .env("SHARDS_HOME", home)
+            .stdin(Stdio::null());
+        said.push_str(&format!(
+            "\n--- the processes of its microVM {}\n{}",
+            id.get(..12).unwrap_or(id),
+            said_within(&mut top, Duration::from_secs(20))
+        ));
+    }
+    said
+}
+
+/// [`stuck`]'s view of processes `pids`, each named, as a test that found one of them stuck
+/// shows them: its home's runs and their guests' processes, and on Windows their stacks and
+/// its daemon's.
+pub fn stacks_of(pids: &[(&str, u32)], home: Option<&Path>) -> String {
     let mut said = String::new();
     if let Some(home) = home {
         let mut ps = command();
@@ -2065,8 +2097,9 @@ pub fn stacks_of(pids: &[(&str, u32)], home: Option<&Path>) -> String {
             .stdin(Stdio::null());
         said.push_str(&format!(
             "\n--- ps -a in its home\n{}",
-            said_by(&mut ps, Duration::from_secs(20))
+            said_within(&mut ps, Duration::from_secs(20))
         ));
+        said.push_str(&guests_processes(home));
         // What its daemon said last, of its runs and their groups' budgets: a run held or
         // stopped says why there alone.
         let log = std::fs::read(home.join("daemon.log")).unwrap_or_default();
@@ -2107,7 +2140,7 @@ pub fn stacks_of(pids: &[(&str, u32)], home: Option<&Path>) -> String {
                     .stdin(Stdio::null());
                 said.push_str(&format!(
                     "\n--- {who} ({pid}): its threads' stacks (cdb)\n{}",
-                    said_by(&mut stacks, Duration::from_secs(120))
+                    said_within(&mut stacks, Duration::from_secs(120))
                 ));
             }
         } else {
@@ -2120,28 +2153,38 @@ pub fn stacks_of(pids: &[(&str, u32)], home: Option<&Path>) -> String {
     said
 }
 
-/// How long a home's daemon may say nothing while a client of it is past its deadline
-/// before the client is taken for stuck ([`Said`]): the daemon's own `READY_TIMEOUT`
-/// (daemon.rs), the longest it waits on a starting microVM that runs nothing of its start.
-/// While one runs its start, however slowly its host runs it, the daemon says so each
-/// `READY_STALL` (10 s), and says why it gave up on one when it does; and while a microVM
-/// a client waits on runs its workload, a run's or an exec's, it says that each as long
-/// (D209), saying nothing of one that runs nothing.
+/// How long a home's daemon may say nothing of a client's subject while the client is past
+/// its deadline before the client is taken for stuck ([`Said`]): the daemon's own
+/// `READY_TIMEOUT` (daemon.rs), the longest it waits on a starting microVM that runs nothing
+/// of its start. While one runs its start, however slowly its host runs it, the daemon says
+/// so each `READY_STALL` (10 s), and says why it gave up on one when it does. What it says
+/// each as long of a microVM a client waits on as it runs its workload ([`HEARTBEAT`],
+/// D209) is no word of the test's subject.
 pub const DAEMON_QUIET: Duration = Duration::from_secs(60);
 
+/// The daemon's heartbeat of a microVM a client waits on (daemon.rs `log_progress`, D209),
+/// in each of its lines: said each `READY_STALL` while the microVM's CPU runs, whatever it
+/// runs, the same line again with its numbers grown. No progress of a test's subject: a
+/// nesting test whose runc hung waited on it to Linux CI's 56-minute limit (ROOT's R03
+/// ruling, 2026-11-13: a repeated, unchanged liveness line is no progress).
+pub const HEARTBEAT: &str = " runs as its client waits: ";
+
 /// What the daemon of a home has said in its log since this began watching: a client past
-/// its deadline is waited on while its daemon says something within [`DAEMON_QUIET`], as
-/// it does while it waits on a microVM its host boots slowly, or a client waits on one that
-/// runs its workload slowly (the parity plan's step 10: boots past a minute, and gigabytes
-/// allocated past four minutes, on an arm64 Windows host nested under QEMU's TCG). A test's
-/// deadline then holds where its host is fast, and follows the daemon's own judgment of
-/// progress where it is slow: never a fixed guess at the host's speed.
+/// its deadline is waited on while its daemon says something of it within [`DAEMON_QUIET`],
+/// as it does while it waits on a microVM its host boots slowly (the parity plan's step 10:
+/// boots past a minute on an arm64 Windows host nested under QEMU's TCG), each line but its
+/// [`HEARTBEAT`]. A test's deadline then holds where its host is fast, and follows the
+/// daemon's own judgment of a start where it is slow: never a fixed guess at the host's
+/// speed. A workload its host runs slowly is waited on through its own words and its run's
+/// own lines, never through its microVM's CPU alone.
 pub struct Said {
     log: PathBuf,
+    /// How far the log has been read: to the end of the last whole line in it.
     len: u64,
-    /// When the log last grew, since this began watching, to within a second.
+    /// When it last said something but its heartbeat, since this began watching, to within
+    /// a second.
     at: Option<Instant>,
-    /// When its length was last read: once a second at most.
+    /// When it was last read: once a second at most.
     read: Option<Instant>,
 }
 
@@ -2157,18 +2200,46 @@ impl Said {
         }
     }
 
-    /// Whether the daemon has said something within [`DAEMON_QUIET`]. Asked as often as
-    /// its caller likes, it reads the log's length once a second.
+    /// Whether the daemon has said something but its [`HEARTBEAT`] within [`DAEMON_QUIET`]:
+    /// a microVM's start said slowly among it (daemon.rs `ready`: liveness governs a cold
+    /// start, which the daemon gives up on itself past its `READY_TIMEOUT`). Asked as often
+    /// as its caller likes, it reads the log once a second.
     pub fn lately(&mut self) -> bool {
         if self.read.is_none_or(|r| r.elapsed() >= Duration::from_secs(1)) {
             self.read = Some(Instant::now());
-            let len = std::fs::metadata(&self.log).map(|m| m.len()).unwrap_or(0);
-            if len != self.len {
-                self.len = len;
+            if self.said_anew() {
                 self.at = Some(Instant::now());
             }
         }
         self.at.is_some_and(|at| at.elapsed() < DAEMON_QUIET)
+    }
+
+    /// Whether the whole lines the log gained since its last read say anything but its
+    /// heartbeat, read to the end of the last of them; a log begun again is read from its
+    /// start.
+    fn said_anew(&mut self) -> bool {
+        use std::io::Seek as _;
+        let Ok(mut log) = std::fs::File::open(&self.log) else {
+            return false;
+        };
+        let size = log.metadata().map(|m| m.len()).unwrap_or(0);
+        if size < self.len {
+            self.len = 0;
+        }
+        let mut new = Vec::new();
+        if size == self.len
+            || log.seek(io::SeekFrom::Start(self.len)).is_err()
+            || log.take(size - self.len).read_to_end(&mut new).is_err()
+        {
+            return false;
+        }
+        let Some(last) = new.iter().rposition(|&b| b == b'\n') else {
+            return false;
+        };
+        self.len += last as u64 + 1;
+        new[..last]
+            .split(|&b| b == b'\n')
+            .any(|line| !line.is_empty() && !String::from_utf8_lossy(line).contains(HEARTBEAT))
     }
 }
 

@@ -1,0 +1,16 @@
+Subject: Hex's hyper-raft pin is kiln's again
+Why: kiln takes hyper-raft at 045cf3ff, the revision Hex's upstream pins, since Shards' control link (crates/remote) reads the negotiated idle timeout patch Q34 gives
+
+diff --git a/vendor/MANIFEST.toml b/vendor/MANIFEST.toml
+index 2765ff07f13a2239207946758149128e08a24c91..c4cdbac5efecb6286f72715c4a3219c5778c9112 100644
+--- a/vendor/MANIFEST.toml
++++ b/vendor/MANIFEST.toml
+@@ -33,7 +33,7 @@ own = ["UPSTREAM.md"]
+ [projects.hyper-raft]
+ kind = "git"
+ repository = "https://github.com/hyper-light/hyper-raft"
+-commit = "fb74b59533908472ade7e526eb08117601cede0e"
++commit = "045cf3ff82e1d96d1f8c339d6e644d17afc998a3"
+ path = "vendor/hyper-raft"
+ take = [
+     "Cargo.toml",

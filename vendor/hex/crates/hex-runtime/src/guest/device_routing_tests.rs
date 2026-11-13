@@ -173,7 +173,6 @@ fn conformance_accepts_every_supported_host_backend() {
         port: stream::CONTROL_PORT,
         unserved: stream::STDIO_PORT,
         powering_off: serving,
-        patience: Duration::ZERO,
     };
     assert_eq!(
         shards_api::conformance::hosts_without_a_backend_are_named(&subject),

@@ -3,9 +3,9 @@
 //! reserve it heard no answer to is abandoned, never started, and freed; after every (re)join it lists
 //! its whole live set, and checks the keeper's count and sum against its own.
 //!
-//! Its shell persists its epoch (one more at every start of its process), carries the messages, times
-//! each wait for an answer by its learned patience and says when one ran out ([`Holder::ran_out`]), and
-//! says when the link dropped ([`Holder::link_down`]).
+//! Its shell persists its epoch (one more at every start of its process), carries the messages, follows
+//! each wait for an answer by its patience (CV6, decision 9) and says when one ended unanswered
+//! ([`Holder::ran_out`]), and says when the link dropped ([`Holder::link_down`]).
 
 use std::collections::BTreeMap;
 
@@ -247,7 +247,7 @@ impl Holder {
         }
     }
 
-    /// The wait for `id`'s answer ran out: it is abandoned, never started, and freed (CV5, CV6).
+    /// The wait for `id`'s answer ended unanswered: it is abandoned, never started, and freed (CV5, CV6).
     pub fn ran_out(&mut self, id: ReservationId, out: &mut Out) {
         if self
             .entries

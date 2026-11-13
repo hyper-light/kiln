@@ -28,7 +28,9 @@
 //!   and the bytes held in its own folders (one-time host caches left out). guest_overhead = the kernel's and
 //!   relay's use inside it, the envelope less what the guest agent reports free. Each is the maximum over
 //!   SEEDABLE guests (decision 9's census rule, bench/competitive/probes/waits_census.py), each booted, told
-//!   its deadline as the node tells it, within the class's recorded patience, doubled at each run-out.
+//!   its deadline as the node tells it, within the class's recorded patience, doubled at each run-out. Both are
+//!   evidence alone (joint plan step 14; ROOT, 2026-11-13, by decision 9's rule): the cost carries neither, and a
+//!   node learns a VM's overhead and a guest's own from their windows.
 // A measurement example, not production code (CLAUDE.md): the test crates' opt-outs.
 #![allow(
     clippy::unwrap_used,

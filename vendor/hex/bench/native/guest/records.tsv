@@ -1,8 +1,9 @@
-# The slowest recorded value of each wait that seeds a bound, by host class: the input that turns a class on.
-# A bound is twice (the margin) its row's value. A class with no row for a measure seeds from twice the slowest
-# row of any class (the lead's seed rule, 2026-11-07), then rises with its node's own; its own row, once its
-# record is taken and added here, becomes its seed (no code change). A measure no class records is refused.
-# Read at build time by hex_client::guest::shards (include_str!), which hex_runtime::guest re-exports.
+# The slowest recorded value of each guest wait, by host class.
+# Evidence of decision 9's rule (docs/design/runtime-architecture.md), cited there: no wait is seeded from a row
+# (2026-11-13), but for the guest's first boot to ready, whose bound is still its class's boot_ready row, or with none
+# the slowest of any class's, until a first boot that follows the guest's liveness replaces it (owed). Every other
+# wait follows its party until its first answer and is bounded by the slowest answer its node has seen.
+# Read at build time by hex_client::guest::shards (include_str!) for that one bound, re-exported by hex_runtime::guest.
 # Windows-WHP rows: shards.exe a debug build, AWS-LC without assembly (AWS_LC_SYS_NO_ASM), as its records say.
 # measure	class	slowest_us	record
 boot_ready	macOS-HVF	5263901	bench/native/guest/boot-ready/RECORD.md

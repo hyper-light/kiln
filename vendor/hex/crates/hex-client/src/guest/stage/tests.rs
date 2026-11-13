@@ -198,44 +198,188 @@ struct Budgeted {
 impl super::super::Link for Budgeted {
     fn dial(&self, _port: u32) -> Result<DuplexOwner, Refusal> {
         use std::os::unix::net::UnixStream;
-        let (near, mut far) = UnixStream::pair().unwrap();
-        let (entries, bytes) = self.budget;
-        std::thread::spawn(move || {
-            // OPEN_BYTES, the id `box-1`, and a stage's count of layers (none).
-            let mut open = [0u8; 10 + 5 + 2];
-            far.read_exact(&mut open).unwrap();
-            let budget = hex_core::stream::frame(
-                &files::budget(&files::Budget {
-                    entries,
-                    bytes,
-                    present: vec![],
-                    capacity: 1,
-                    admitting: true,
-                }),
-                wire::MAX_MESSAGE,
-            )
-            .unwrap();
-            far.write_all(&budget).unwrap();
-            let mut u = Unpack::new(LIMITS);
-            let mut buf = vec![0u8; 64 << 10];
-            let mut n = open.len();
-            buf[..n].copy_from_slice(&open);
-            while n > 0 {
-                let mut rest = &buf[..n];
-                while !rest.is_empty() {
-                    let Ok((took, _)) = u.take(rest) else { break };
-                    rest = &rest[took..];
-                }
-                if u.finish().is_ok() {
-                    break;
-                }
-                n = far.read(&mut buf).unwrap_or(0);
-            }
-            let done = wire::answer(0, &Answer::Done, wire::MAX_MESSAGE).unwrap();
-            let _ = far.write_all(&hex_core::stream::frame(&done, wire::MAX_MESSAGE).unwrap());
-        });
+        let (near, far) = UnixStream::pair().unwrap();
+        let budget = self.budget;
+        std::thread::spawn(move || serve_stage(far, budget, None));
         own_duplex(near)
     }
+}
+
+/// Where a [`Held`] relay waits for its test's word.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// Before it answers the stage's opening.
+    Opening,
+    /// Past the budget it answered, before it reads the stream.
+    Reading,
+}
+
+/// A relay stand-in as [`Budgeted`], held where `at` says until its test lets it go: its one dial's relay.
+#[cfg(unix)]
+struct Held {
+    at: Hold,
+    go: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+#[cfg(unix)]
+impl super::super::Link for Held {
+    fn dial(&self, _port: u32) -> Result<DuplexOwner, Refusal> {
+        use std::os::unix::net::UnixStream;
+        let (near, far) = UnixStream::pair().unwrap();
+        let go = self.go.lock().unwrap().take().expect("dialed once");
+        let at = self.at;
+        std::thread::spawn(move || serve_stage(far, (8, u64::MAX), Some((at, go))));
+        own_duplex(near)
+    }
+}
+
+/// A relay's far end serving one stage, as the relay does: it answers the opening with `budget`, reads to the
+/// stream's in-band end (or to the connection's end, where the packer refused part way and ended its sending half),
+/// and answers `Done`; held, where `held` says, until its test's word comes or its test has gone.
+#[cfg(unix)]
+fn serve_stage(
+    mut far: std::os::unix::net::UnixStream,
+    (entries, bytes): (u64, u64),
+    held: Option<(Hold, std::sync::mpsc::Receiver<()>)>,
+) {
+    let wait_at = |at: Hold| {
+        if let Some((hold, go)) = &held
+            && *hold == at
+        {
+            let _ = go.recv();
+        }
+    };
+    // OPEN_BYTES, the id `box-1`, and a stage's count of layers (none).
+    let mut open = [0u8; 10 + 5 + 2];
+    far.read_exact(&mut open).unwrap();
+    wait_at(Hold::Opening);
+    let budget = hex_core::stream::frame(
+        &files::budget(&files::Budget {
+            entries,
+            bytes,
+            present: vec![],
+            capacity: 1,
+            admitting: true,
+        }),
+        wire::MAX_MESSAGE,
+    )
+    .unwrap();
+    far.write_all(&budget).unwrap();
+    wait_at(Hold::Reading);
+    let mut u = Unpack::new(LIMITS);
+    let mut buf = vec![0u8; 64 << 10];
+    let mut n = open.len();
+    buf[..n].copy_from_slice(&open);
+    while n > 0 {
+        let mut rest = &buf[..n];
+        while !rest.is_empty() {
+            let Ok((took, _)) = u.take(rest) else { break };
+            rest = &rest[took..];
+        }
+        if u.finish().is_ok() {
+            break;
+        }
+        n = far.read(&mut buf).unwrap_or(0);
+    }
+    let done = wire::answer(0, &Answer::Done, wire::MAX_MESSAGE).unwrap();
+    let _ = far.write_all(&hex_core::stream::frame(&done, wire::MAX_MESSAGE).unwrap());
+}
+
+/// A file of `n` bytes, `config.json`, as a stage's item.
+#[cfg(unix)]
+fn bytes_item(n: usize) -> Item {
+    Item {
+        name: "config.json".to_owned(),
+        source: Source::Bytes(vec![b'x'; n]),
+    }
+}
+
+/// A stage of `items` for [`id`] on a thread of its own, through `relay`, its waits as `wait` has learned them.
+#[cfg(unix)]
+fn staging(
+    relay: Held,
+    wait: &'static Patience,
+    items: Vec<Item>,
+) -> std::thread::JoinHandle<Result<Staged, Refusal>> {
+    std::thread::spawn(move || stage_with(&relay, &id(), &items, &LIMITS, wait))
+}
+
+/// Waits until `wait` has run out, told (its next wait following), or `stage` has ended: at most 30 s, a bound so a
+/// stage that does neither fails the test rather than hanging it.
+#[cfg(unix)]
+fn ran_out_or_ended(wait: &Patience, stage: &std::thread::JoinHandle<Result<Staged, Refusal>>) {
+    let began = std::time::Instant::now();
+    while wait.deadline().is_some() && !stage.is_finished() {
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(30),
+            "the stage neither ran out nor ended"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// Decision 9 (original; the person's ruling of 2026-11-13: W* is a bound only while answers come within it): a staging
+/// connection's read timed out at W*, the slowest answer a stage had had, and the stage was refused (EAGAIN on
+/// "reading the relay's staging answer", hex-client's a_stage_spends_the_relays_learned_budget and seven hex-node
+/// relay::tests in run r433), though its relay was there to answer. Do: a wait whose W* is 1 ms; a relay that answers
+/// the stage's opening only once the stage's wait has run out (told) or the stage has ended. Expect: the stage staged,
+/// never refused at W*, and W* risen to its answer.
+#[cfg(unix)]
+#[test]
+fn original_a_stage_whose_relay_answers_past_w_star_is_followed_to_its_answer() {
+    static WAIT: Patience = Patience::measuring("test.hex_client.stage.answer_past");
+    let learned = std::time::Duration::from_millis(1);
+    WAIT.answered(learned);
+    let (go, held) = std::sync::mpsc::channel();
+    let relay = Held {
+        at: Hold::Opening,
+        go: std::sync::Mutex::new(Some(held)),
+    };
+    let stage = staging(relay, &WAIT, vec![bytes_item(4)]);
+    ran_out_or_ended(&WAIT, &stage);
+    let _ = go.send(());
+    let staged = stage.join().unwrap();
+    assert!(staged.is_ok(), "refused at W*: {staged:?}");
+    assert!(
+        WAIT.slowest().is_some_and(|slowest| slowest > learned),
+        "W* didn't rise to the answer past it: {:?}",
+        WAIT.slowest()
+    );
+}
+
+/// Decision 9 (original; the person's ruling of 2026-11-13, and past W* a connection followed by its relay's life
+/// alone, as at every local site): a staging connection's write timed out at W* and the stage was refused, though its
+/// relay went on to read it. Do: a wait whose W* is 1 ms; a relay that answers the opening at once, but reads the
+/// stream only once the stage's wait has run out (told) and a hundred windows of W* have passed, or the stage has
+/// ended; an item larger than a connection holds unread (16 MiB). Expect: the stage not ended while its relay holds,
+/// then staged, its writes followed past W* by the relay's life.
+#[cfg(unix)]
+#[test]
+fn original_a_stage_its_relay_reads_past_w_star_is_followed_while_it_reads() {
+    static WAIT: Patience = Patience::measuring("test.hex_client.stage.writes_past");
+    let learned = std::time::Duration::from_millis(1);
+    WAIT.answered(learned);
+    let (go, held) = std::sync::mpsc::channel();
+    let relay = Held {
+        at: Hold::Reading,
+        go: std::sync::Mutex::new(Some(held)),
+    };
+    let stage = staging(relay, &WAIT, vec![bytes_item(16 << 20)]);
+    ran_out_or_ended(&WAIT, &stage);
+    let told = std::time::Instant::now();
+    while !stage.is_finished() && told.elapsed() < learned.saturating_mul(100) {
+        std::thread::park_timeout(learned);
+    }
+    if stage.is_finished() {
+        panic!(
+            "the stage ended while its relay held: {:?}",
+            stage.join().unwrap()
+        );
+    }
+    let _ = go.send(());
+    let staged = stage.join().unwrap();
+    assert!(staged.is_ok(), "refused at W*: {staged:?}");
 }
 
 /// HEX-GUEST-15 (Ada's rule on constants: a learned bound): stage through a relay whose budget is 4 bytes,

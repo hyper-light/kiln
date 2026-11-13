@@ -17,7 +17,9 @@
 use std::time::Duration;
 
 use hex_api::CapacityResources;
+use hex_sim::charge::ChargeError;
 use hex_sim::charge::sim::{Report, Scenario, run};
+use hex_sim::charge::trace::{self, Memory, Step, Trace};
 
 const GIB: u64 = 1 << 30;
 /// Linux's `cpu.max` period, the window a Linux node enforces a VM's CPU over (`hex_core::cgroup::CPU_PERIOD_US`).
@@ -49,6 +51,7 @@ fn node(seed: u64) -> Scenario {
         life: (3_000, 12_000),
         rooms: true,
         riser: None,
+        traces: Vec::new(),
     }
 }
 
@@ -142,4 +145,67 @@ fn w14_a_riser_with_no_room_held_is_ended_last_and_alone() {
         assert_eq!(r.neighbours_short, 0, "seed {seed}: {r:?}");
         assert_eq!(r.guarantee_misses, 0, "seed {seed}: {r:?}");
     }
+}
+
+/// Joint plan step 14 (item 3; `bench/charge/record_trace.py`): a recorded trace's text is its `millis threads mib`
+/// steps, `#` comments and blank lines aside, its header naming where its memory came from. Do read a recorder's
+/// header naming its processes' resident sets, a blank line and three steps, one with a comment after it; then a
+/// trace whose header names its cgroup, one that names none (the recorder's only source before it named one, its
+/// cgroup's), a line of two numbers, and a trace with no step. Expect the three steps and `ProcsRss`; `Cgroup` twice;
+/// the short line and the empty trace refused, typed.
+#[test]
+fn w14_a_recorded_trace_reads_as_its_steps_and_its_memorys_source() {
+    let header = "# window: 100000 us, the CFS period of the nearest cpu.max on its path\n";
+    let text = format!(
+        "{header}# memory: procs-rss, the sum over its cgroup.procs\n# lines: millis threads mib\n\n30 3 512\n\
+         70 2 512 # the rest\n100 0 640\n"
+    );
+    let step = |millis, threads, mib| Step {
+        millis,
+        threads,
+        mib,
+    };
+    assert_eq!(
+        trace::parse(&text).unwrap(),
+        Trace {
+            memory: Memory::ProcsRss,
+            steps: vec![step(30, 3, 512), step(70, 2, 512), step(100, 0, 640)],
+        }
+    );
+    let cgroup = format!("{header}# memory: cgroup, its memory.current\n100 1 64\n");
+    assert_eq!(trace::parse(&cgroup).unwrap().memory, Memory::Cgroup);
+    assert_eq!(
+        trace::parse(&format!("{header}100 1 64\n")).unwrap().memory,
+        Memory::Cgroup
+    );
+    assert!(matches!(
+        trace::parse("30 3\n"),
+        Err(ChargeError::Invalid { .. })
+    ));
+    assert!(matches!(
+        trace::parse("# memory: cgroup\n"),
+        Err(ChargeError::Invalid { .. })
+    ));
+}
+
+/// Joint plan step 14 (item 3): the sim replays a recorded trace in place of the generator's draws, as hex-cli's
+/// charge_fleet replays it on hardware: each VM plays one trace, window by window, and ends once it has played. Do run
+/// one VM over a trace of a window at 3 busy threads holding 512 MiB, half a window at 1, then a window idle holding
+/// 640 MiB, on a node with room for it. Expect it admitted once and live three windows, asking 3 CPUs, then 0.5 (half a
+/// window at one thread), then none: 3,500 milli-CPU-windows asked, and given.
+#[test]
+fn w14_the_sim_replays_a_recorded_trace() {
+    let played = trace::parse("100 3 512\n50 1 512\n100 0 640\n").unwrap();
+    let scenario = Scenario {
+        vms: 1,
+        windows: 5,
+        life: (10, 10),
+        traces: vec![played],
+        ..node(1)
+    };
+    let r = run(&scenario).unwrap();
+    assert_eq!(r.admitted, 1, "{r:?}");
+    assert_eq!(r.live_windows, 3, "{r:?}");
+    assert_eq!(r.asked_milli, 3_500, "{r:?}");
+    assert_eq!(r.given_milli, 3_500, "{r:?}");
 }
