@@ -494,6 +494,33 @@ pub(crate) fn sleeper(secs: u32) -> Option<String> {
     Some(format!("sleep {secs}"))
 }
 
+/// [`sleeper`]'s process, started marked as `mark`'s and handed back once it runs as itself, its environment (and so
+/// its mark) shown from then on: on macOS once Python has said so on its first line (until it execs Python, what it
+/// passes through, `/usr/bin/python3`'s or a pyenv shim, is Apple's and shows none), elsewhere at once (`spawn`
+/// returns once it has exec'd). Every step is an exec, so its pid is the sleeper's. `None` where nothing sleeps so.
+#[cfg(all(test, unix))]
+pub(crate) fn marked_sleeper(secs: u32, mark: &str) -> std::io::Result<Option<std::process::Child>> {
+    use std::io::BufRead as _;
+    if !cfg!(target_os = "macos") {
+        return std::process::Command::new("sleep").arg(secs.to_string()).env(MARK, mark).spawn().map(Some);
+    }
+    if sleeper(secs).is_none() {
+        return Ok(None);
+    }
+    let mut child = std::process::Command::new("python3").arg("-c").arg(format!("import time; print(flush=True); time.sleep({secs})")).env(MARK, mark).stdout(std::process::Stdio::piped()).spawn()?;
+    let mut line = String::new();
+    let said = match child.stdout.take() {
+        Some(out) => std::io::BufReader::new(out).read_line(&mut line)?,
+        None => 0,
+    };
+    if said == 0 {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other("the sleeper ended before it said it runs"));
+    }
+    Ok(Some(child))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,7 +719,14 @@ mod tests {
     fn w27_r03_only_a_sessions_own_process_signs_as_its_agent() -> anyhow::Result<()> {
         // The marked session's harness: a process that's no one's ancestor here.
         let mut harness = std::process::Command::new("sleep").arg("30").spawn()?;
-        let mut outsider = std::process::Command::new("sleep").arg("30").env(MARK, "s-marked").spawn()?;
+        // The outsider: a process whose mark this machine shows (macOS hides an Apple program's environment, as
+        // `/bin/sleep`'s), running as itself.
+        let Some(mut outsider) = marked_sleeper(30, "s-marked")? else {
+            eprintln!("skipped: nothing here sleeps as a process whose environment can be read");
+            let _ = harness.kill();
+            let _ = harness.wait();
+            return Ok(());
+        };
         let marked_sessions = vec![("s-marked".to_owned(), Some(harness.id()))];
         let (marked, strict) = (session_of(outsider.id(), &marked_sessions), session_by_process(outsider.id(), &marked_sessions));
         // This test's process plays another session's harness: what it starts is under it.
