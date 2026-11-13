@@ -1,10 +1,18 @@
 //! Agent sessions on a runner of a test server: the runner process, the stand-in Claude Code it
-//! runs (`tests/fixtures/fake-claude`: no model), and a viewer's WebSocket to the server.
+//! runs (`tests/fixtures/fake-claude`: no model), and a viewer's WebSocket to the server. The runner
+//! and its PATH are Unix's (the stand-in is a Python script, its PATH `:`-joined, its system programs
+//! /usr/bin's); the server's REST and WebSocket helpers are any OS's, and `vm_e2e` drives Windows
+//! runners through them (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17).
 
 use std::io::{Read as _, Write as _};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::process::Child;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -28,6 +36,7 @@ pub struct Talk {
 
 /// A runner of the server at `port`, named `name`, the stand-in harness first on its PATH and
 /// `chaos` its faults (a `kiln agent --chaos` spec; a build with the `chaos` feature): its log.
+#[cfg(unix)]
 pub fn runner(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk) -> anyhow::Result<(Runner, PathBuf)> {
     let path = format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
     runner_env(dir, port, name, chaos, talk, &[("PATH", &path)])
@@ -36,6 +45,7 @@ pub fn runner(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk
 /// [`runner`], with `env` in its environment (and its harnesses'): `FAKE_CLAUDE_FIRST_LINES`, say,
 /// the stand-in harness first on its PATH. Started again under the same name, it's the same runner,
 /// its state where it left it.
+#[cfg(unix)]
 pub fn runner_with(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk, env: &[(&str, &str)]) -> anyhow::Result<(Runner, PathBuf)> {
     let path = format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
     let mut all = vec![("PATH", path.as_str())];
@@ -45,6 +55,7 @@ pub fn runner_with(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk:
 
 /// [`runner`], with `env` in its environment (its `PATH`, its `SHELL`): the stand-in harness is in
 /// `<dir>/bin`, on its PATH only if `env` puts it there.
+#[cfg(unix)]
 pub fn runner_env(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: Talk, env: &[(&str, &str)]) -> anyhow::Result<(Runner, PathBuf)> {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin)?;
@@ -86,6 +97,7 @@ pub fn runner_env(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: 
 /// knows ([`kiln::harness::kinds::Kind::all`]'s programs), as a PATH: a harness is on it only where a
 /// test puts one, also on a machine with one installed system-wide (adacachy: pacman's claude-code
 /// and codex in /usr/bin), which a runner or server would otherwise find first.
+#[cfg(unix)]
 pub fn path_without_harnesses(dir: &Path) -> anyhow::Result<String> {
     let system = dir.join("system-bin");
     std::fs::create_dir_all(&system)?;
