@@ -22,6 +22,14 @@ prompt asks with words:
     SPAWN=<kind>    an agent of that harness started through kiln's MCP server (`agents_start`), from
                     where this one runs: `SPAWN_OK <its id>`, or `SPAWN_FAIL <why>`
     SLOW=<ms>       that long between its lines, so a turn lasts long enough to steer and stop
+    CONNECT=<host>:<port>
+                    whether where it runs reaches <host> on TCP port <port>, as its network says: its
+                    resolver's answer for the name (`CONNECT_REFUSED <host>:<port> dns rcode <n>`
+                    where it answers other than NOERROR: a name no grant names is REFUSED, 5, in
+                    Shards' microVMs, D236), then a connection to the address it gave:
+                    `CONNECT_OK <host>:<port> <address>`, or `CONNECT_FAIL <host>:<port> <why>`. Its
+                    resolver is /etc/resolv.conf's first nameserver, or `VM_STUB_RESOLVER`
+                    (`<address>:<port>`); a failing turn waits `VM_STUB_CONNECT_SECS` (20) for each
 
 A message steered into a running turn is said as `STEERED <its words>`. A stopped turn ends where it
 was, as its harness ends one (Claude Code's interrupt, Codex's turn/interrupt, ACP's session/cancel,
@@ -30,6 +38,7 @@ Pi's abort; Antigravity's process is ended by kiln).
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -40,6 +49,7 @@ import uuid
 PROTO = os.environ.get("VM_STUB_PROTOCOL") or os.path.basename(sys.argv[0] or "")
 LINES = int(os.environ.get("VM_STUB_LINES", "2"))
 VERSION = os.environ.get("VM_STUB_VERSION", "9.9.9-stub")
+CONNECT_WITHIN = float(os.environ.get("VM_STUB_CONNECT_SECS", "20"))
 ACP_PROGRAMS = {"acp", "agent", "cursor-agent", "gemini", "opencode", "goose", "amp-acp", "devin"}
 
 _OUT = threading.Lock()
@@ -89,6 +99,86 @@ def write(name):
         return "WROTE " + name
     except OSError as e:
         return "WRITE_FAIL %s" % e
+
+
+# --- a destination, as the network where it runs grants it ------------------------------------------
+
+
+def _resolver():
+    """The resolver it asks: `VM_STUB_RESOLVER` (`<address>:<port>`), else /etc/resolv.conf's first
+    nameserver on DNS's port, 53 (RFC 1035 4.2)."""
+    given = os.environ.get("VM_STUB_RESOLVER")
+    if given:
+        host, _, port = given.rpartition(":")
+        return host.strip("[]"), int(port)
+    try:
+        with open("/etc/resolv.conf") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    return parts[1], 53
+    except OSError:
+        pass
+    return None
+
+
+def _skip_name(msg, at):
+    """Where the name at `at` ends: its labels and their zero, or a pointer's two bytes (RFC 1035 4.1.4)."""
+    while True:
+        n = msg[at]
+        if n & 0xC0 == 0xC0:
+            return at + 2
+        if n == 0:
+            return at + 1
+        at += 1 + n
+
+
+def _ask_a(server, name):
+    """An A question for `name` to `server` over UDP (RFC 1035 4.1): its answer's RCODE and the IPv4
+    addresses it gave."""
+    qid = os.urandom(2)
+    question = b"".join(bytes([len(l)]) + l.encode("ascii") for l in name.rstrip(".").split(".")) + b"\0\0\x01\0\x01"
+    query = qid + b"\x01\0\0\x01\0\0\0\0\0\0" + question
+    family = socket.AF_INET6 if ":" in server[0] else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as s:
+        s.settimeout(CONNECT_WITHIN)
+        s.sendto(query, server)
+        while True:
+            msg = s.recv(65535)
+            if msg[:2] == qid:
+                break
+    rcode = msg[3] & 0x0F
+    answers = int.from_bytes(msg[6:8], "big")
+    at = 12 + len(question)
+    addresses = []
+    for _ in range(answers):
+        at = _skip_name(msg, at)
+        kind, length = int.from_bytes(msg[at:at + 2], "big"), int.from_bytes(msg[at + 8:at + 10], "big")
+        if kind == 1 and length == 4:
+            addresses.append(socket.inet_ntoa(msg[at + 10:at + 14]))
+        at += 10 + length
+    return rcode, addresses
+
+
+def connect(host, port):
+    """Whether where it runs reaches `host`:`port`: its resolver's answer, then a TCP connection."""
+    to = "%s:%d" % (host, port)
+    server = _resolver()
+    if server is None:
+        return "CONNECT_FAIL %s no resolver: no nameserver in /etc/resolv.conf" % to
+    try:
+        rcode, addresses = _ask_a(server, host)
+    except (OSError, ValueError, IndexError) as e:
+        return "CONNECT_FAIL %s its resolver %s:%d: %s" % (to, server[0], server[1], e)
+    if rcode != 0:
+        return "CONNECT_REFUSED %s dns rcode %d" % (to, rcode)
+    if not addresses:
+        return "CONNECT_FAIL %s its resolver gave no IPv4 address" % to
+    try:
+        with socket.create_connection((addresses[0], port), timeout=CONNECT_WITHIN):
+            return "CONNECT_OK %s %s" % (to, addresses[0])
+    except OSError as e:
+        return "CONNECT_FAIL %s %s: %s" % (to, addresses[0], e)
 
 
 # --- kiln's MCP server, as its dialect was given it -----------------------------------------------
@@ -343,6 +433,8 @@ class Turn:
         kind = re.search(r"\bSPAWN=([a-z]+)\b", self.prompt)
         if kind:
             self.say(spawn(self.servers, kind.group(1)))
+        for host, port in re.findall(r"\bCONNECT=([A-Za-z0-9.-]+):(\d+)\b", self.prompt):
+            self.say(connect(host, int(port)))
         for n in range(LINES):
             if self.stopped.wait(every):
                 return False

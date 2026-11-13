@@ -165,6 +165,12 @@ impl Images {
     }
 }
 
+/// The tag `source`'s image is built under and found by in the home's store (its name, then its
+/// recipe: `agentfiles::context::recipe_with`), for this machine's platform.
+pub fn tag_of(source: Source<'_>) -> Result<String, Refusal> {
+    Ok(Plan::of(source)?.tag)
+}
+
 /// What a build of a source for this machine is: its image's name, the platform, kiln's harness
 /// directory beside its Agentfile, its content's digest, and the tag it's built and found under.
 struct Plan {
