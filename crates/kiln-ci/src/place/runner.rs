@@ -2713,6 +2713,13 @@ impl Admission {
             out.push(Reply { owner: o, token, run: name, msg: Up::Lapsed { fence, why: "its claim isn't live here" } });
             return None;
         };
+        // A run starts here only on its reserve's grant, and no reserve is said while its machine's
+        // capacity keeper isn't synced (Hex's capacity-view.md, the holder's items 1 and 6): the
+        // claim lapses, and the run waits here again saying why.
+        if self.keeper.unsynced().is_some() {
+            self.lapse(s, fence, "its machine's capacity keeper isn't synced: nothing starts here until it is", now, out);
+            return None;
+        }
         match state {
             Some(State::Offered { until, .. }) => {
                 self.deadlines.remove(&(until, s));
@@ -3260,17 +3267,24 @@ impl Admission {
             }
             self.deadlines.remove(&(until, s));
             let Some(State::Offered { fence, .. }) = self.state(s) else { continue };
-            self.release(s);
-            let Some(p) = self.get(s) else { continue };
-            let to = self.owner(p.owner).filter(|w| !w.away).map(|_| (p.owner, p.token, Arc::clone(&p.run)));
-            self.enter(s);
-            self.relook(s, now);
-            if let Some((owner, token, run)) = to {
-                out.push(Reply { owner, token, run, msg: Up::Lapsed { fence, why: "its offer wasn't taken in time" } });
-            }
-            self.boundaries(now, out);
-            self.tell_if_changed(s, now, out);
+            self.lapse(s, fence, "its offer wasn't taken in time", now, out);
         }
+    }
+
+    /// Run `s`'s claim `fence`, offered or taken, lapses (`why`): its room is freed, the run waits
+    /// here again at its place, and its owner is told, the one word on which it may place the run
+    /// elsewhere.
+    fn lapse(&mut self, s: u32, fence: Fence, why: &'static str, now: i64, out: &mut Vec<Reply>) {
+        self.release(s);
+        let Some(p) = self.get(s) else { return };
+        let to = self.owner(p.owner).filter(|w| !w.away).map(|_| (p.owner, p.token, Arc::clone(&p.run)));
+        self.enter(s);
+        self.relook(s, now);
+        if let Some((owner, token, run)) = to {
+            out.push(Reply { owner, token, run, msg: Up::Lapsed { fence, why } });
+        }
+        self.boundaries(now, out);
+        self.tell_if_changed(s, now, out);
     }
 
     /// The time: promotion's looks due by now are taken, offers not taken within their link's

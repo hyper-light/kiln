@@ -239,6 +239,30 @@ fn cv11_unsynced_it_cordons_its_kernel_and_what_runs_goes_on() -> Result<(), Str
     a.check()
 }
 
+/// The holder's items 1 and 6 (Hex's capacity-view.md): a run starts here only on its reserve's
+/// grant, and no reserve is said while the keeper isn't synced, so a start under a claim taken while
+/// synced lapses once it isn't: nothing starts and nothing is recorded, the run waits here again
+/// saying why, and its owner may place it elsewhere. Synced again, the run is offered again.
+#[test]
+fn cv11_a_start_while_unsynced_lapses_and_starts_nothing() -> Result<(), String> {
+    let mut a = runner(8, 16, 1000);
+    let _ = said(&mut a, synced(8, 16, (0, 0), (0, 0)), 0);
+    let w = probe(&mut a, "r1", "cpus=2", 1)?;
+    let f = offer(&w, "r1").ok_or(format!("{w:?}"))?;
+    let mut out = Vec::new();
+    a.take(O1, "r1", f, 2, &mut out);
+    let _ = said(&mut a, Keeper::Unsynced(Unsynced::Joining), 3);
+    let mut out = Vec::new();
+    assert_eq!(a.start(O1, "r1", f, 4, &mut out), None, "{out:?}");
+    assert!(out.iter().any(|(_, m)| matches!(m, ToOwner::Lapsed { run, fence, why } if run == "r1" && *fence == f && why.contains("capacity keeper"))), "{out:?}");
+    assert!(!running(&a, "r1") && a.records().is_empty(), "nothing started, nothing recorded");
+    assert!(matches!(waiting(&out, "r1"), Some(Reason::Unsynced { .. })), "it waits here again, saying why: {out:?}");
+    a.check()?;
+    let back = said(&mut a, synced(8, 16, (0, 0), (0, 0)), 5);
+    assert!(offer(&back, "r1").is_some(), "offered again once synced: {back:?}");
+    a.check()
+}
+
 /// The fold itself: what others hold is everything held less this runner's own, and the room left
 /// for it is the room less that, none in a dimension that is over, and no GPUs.
 #[test]

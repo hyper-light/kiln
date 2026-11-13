@@ -293,8 +293,9 @@ validates is what keeps deciders working on copies safe (§3.4). The runner's le
   is cordoned as for a battery or strain (above), so its words say no room and owners' kernels pick
   elsewhere; its waiting runs are told `Unsynced`, why in words, which owners widen past as past a
   strained runner, so probing places the work elsewhere too; what runs goes on, held in the keeper's
-  books. A keeper that stops answering is never taken for none: that would double-book what it still
-  holds (CV10).
+  books. A run starts here only on its reserve's grant, and no reserve is said while unsynced, so a
+  start under a claim offered before lapses and the run waits here again, saying why. A keeper that
+  stops answering is never taken for none: that would double-book what it still holds (CV10).
 - **Synced** (`Keeper::Synced`: the keeper's view as its last answer or hint said it, and what of it
   is the runner's own): the room it admits against, overcommitted and not, is held to what the view
   leaves it, the machine's room less what everyone else holds, the keeper's own rule (CV3: a charge
