@@ -215,15 +215,13 @@ passes on the tree as committed. Run with `scripts/mutate.py <kiln checkout>` th
 
 ## Owed
 
-- Wiring into step 17's launch seam (above), when ROOT says it has landed.
+- Wiring into step 17's launch seam (above): goal 60's launch, as it lands.
 - Steps 6 and 11's terminal lane and the microVM's key: sign-in, git signing, credential helpers
   (design above).
-- kiln's MCP over the `mcp` lane (D254, ROOT's word of 2026-11-13), this goal's next part: each
-  harness's MCP config pointed at the lane's endpoint inside the microVM, its form agreed with goal
-  58 from each harness's documented transports; the runner bridging the lane to kiln's MCP handler
-  in its own process, with no Unix socket, so Windows gets kiln's MCP too; and kiln's in-process
-  Agentfile check refusing an MCP network grant. The runner's loopback `/api/mcp` (plan step 35's
-  part 3) was the withdrawn design's.
+- kiln's MCP over the `mcp` lane (D254, ROOT's word of 2026-11-13) is built: each harness's MCP
+  config and the check's `ReachesKiln` in part 3a, the runner's end in part 3b (kiln main
+  dace992a6). The launch handing it each connection is goal 60's (part 3b's owed list). The
+  runner's loopback `/api/mcp` (plan step 35's part 3) was the withdrawn design's.
 - Real-VM runs (ROOT's): an isolated session's transcript read from its volume and resumed; kiln's
   MCP over the lane; H6's notices from a live microVM.
 
@@ -360,10 +358,9 @@ R03: no number of the rule's own. The address classes are RFCs' (loopback, RFC 3
 | the same Mac, at 027d1aacf (parts 1, 2 and 3 merged with kiln main d1f5b7f69) | step 18's whole filter set (`step18 step23 agentfiles:: wire::ts harness::homes harness::whose harness::moving harness::trouble harness::isolated harness::lineage mcp:: reach::mcp`) | 239 passed, 0 failed |
 | the same | the same clippy | passed (3 min 25 s) |
 
-Owed, this goal's part 3b:
+Owed then, as part 3b:
 - The runner's end of the lane: kiln's MCP served in the runner's own process over each
-  `McpConnection`, with no Unix socket, on every OS. `reach::mcp`, `reach::local`'s dispatch and
-  `reach::told`'s teller are Unix-only today, behind the reach socket.
+  `McpConnection`, with no Unix socket, on every OS. Built in part 3b (below).
 - Kiln's vendor/shards at or after e1995061f, with shards-remote linked (its owner's).
 - The wiring at the launch (`sandbox::microvm()`, step 17's next slice).
 - Real-VM MCP round trips on Linux, macOS and Windows hosts (ROOT's).
