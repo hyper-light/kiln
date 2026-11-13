@@ -392,11 +392,16 @@ fn local_tools(_spec: &Spec) -> Option<(std::path::PathBuf, &'static str, Option
 }
 
 /// The MCP servers an ACP agent's session gets (`session/new`'s `mcpServers`): the runner's own.
-/// None for an isolated one: the runner's socket and kiln's program aren't in its microVM (kiln plan
-/// 01a1cd8e862e7169a074db3d5fa33f3d step 18 brings kiln's tools there).
+/// For an isolated one, kiln's through its microVM's bridge (`isolated::mcp::for_harness`): the
+/// runner's socket and kiln's program aren't in its microVM.
 pub fn acp_servers(spec: &Spec, session: &str) -> Vec<serde_json::Value> {
+    // In a microVM of its own: kiln's MCP through its link's `mcp` lane's bridge, never this machine's socket (kiln
+    // plan 01a1cd8e862e7169a074db3d5fa33f3d step 18).
     if spec.isolation.is_some() {
-        return Vec::new();
+        return match Kind::get(&spec.kind).map(super::isolated::mcp::for_harness) {
+            Some(super::isolated::mcp::Config::Acp(server)) => vec![server],
+            _ => Vec::new(),
+        };
     }
     #[cfg(unix)]
     if let Some((kiln, sock, prefer)) = local_tools(spec) {
