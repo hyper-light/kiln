@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { condenseFrame, HEIGHT, lineAt, prismAt, Y } from "../src/views/harness/condense-light.ts";
+import { condenseFrame, grainsOf, HEIGHT, lineAt, prismAt, Y } from "../src/views/harness/condense-light.ts";
 
 // A compaction under way (condense-light.ts): a thread of the prism along the line, and grains
 // either side drifting in to it.
@@ -64,9 +64,15 @@ test("the thread wears the prism the summary's bar will, from its start to its e
   assert.ok(start[1]! > start[0]! && end[0]! > end[2]!, `green at the start (${start.map(Math.round)}), sand at the end (${end.map(Math.round)})`);
 });
 
-test("a frame across a desktop's conversation is quick to make", () => {
-  const begun = performance.now();
-  for (let t = 0; t < 1; t += 0.1) condenseFrame(920, t);
-  const each = (performance.now() - begun) / 10;
-  assert.ok(each < 15, `${each.toFixed(1)} ms a frame`);
+test("a frame across a desktop's conversation does a phone's work a point, and no more", () => {
+  // A frame's work is its grains, each a fixed few sums (condense-light.ts `grainsOf`): no clock
+  // here, since a frame's time on a loaded machine says nothing of the frame (17.7 ms once in a
+  // parallel run where it takes 3.4 alone, 2026-11-13). Two roundings move a count by one at most.
+  const sum = ({ thread, gather }: { thread: number; gather: number }) => thread + gather;
+  const desk = sum(grainsOf(920));
+  assert.ok(desk <= ((sum(grainsOf(W)) + 1) * 920) / W + 1, `${desk} grains across 920 points against ${sum(grainsOf(W))} across ${W}`);
+  for (let t = 0; t < 1; t += 0.1) {
+    const f = condenseFrame(920, t);
+    assert.ok(f.dots.length / 5 <= desk && f.soft.length / 6 <= 1, `${f.dots.length / 5} grains and ${f.soft.length / 6} lights at ${t.toFixed(1)}s`);
+  }
 });

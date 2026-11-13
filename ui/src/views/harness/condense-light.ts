@@ -72,13 +72,16 @@ function tone(u: number, k: number, lift: number) {
   return lift > 0.01 ? mix(lit, 0xf2, 0xee, 0xf8, Math.min(1, 0.7 * lift)) : lit;
 }
 
+/** The grains a frame across `w` points lays at most: the thread's and those coming in, a fixed few a point. A frame's work is its grains, each a fixed few sums. */
+export const grainsOf = (w: number) => ({ thread: Math.round(w * THREAD.grains), gather: Math.round(w * GATHER.grains) });
+
 /** The compaction's line across `w` at `t` (seconds), as stands-light's `paint` draws it. */
 export function condenseFrame(w: number, t: number, f: Frame = newFrame()): Frame {
   f.dots.length = 0;
   f.soft.length = 0;
   if (w < 2) return f;
+  const { thread: n, gather: m } = grainsOf(w);
   // The thread: grains flowing along the line, close about it.
-  const n = Math.round(w * THREAD.grains);
   for (let q = 0; q < n; q++) {
     const s0 = 70001 + q * 131;
     const x = frac(hash(s0) + ((0.6 + 0.8 * hash(s0 + 11)) * THREAD.flow * t) / w) * w;
@@ -92,7 +95,6 @@ export function condenseFrame(w: number, t: number, f: Frame = newFrame()): Fram
   }
   // The grains coming in: each from its own place either side, slowing as it nears the line and
   // fading into it, then again from somewhere else.
-  const m = Math.round(w * GATHER.grains);
   const [t0, t1] = GATHER.takes;
   const [near, far] = GATHER.from;
   for (let q = 0; q < m; q++) {
