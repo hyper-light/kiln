@@ -32,11 +32,12 @@ pub async fn spawn_duplex_in_pool(cmd: std::process::Command, group: Option<crat
 }
 
 /// A harness a boundary holds (a microVM's member of `image`, reaching what `reach` says of its
-/// image's destinations; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17) as the [`Duplex`] a
+/// image's destinations, keeping its conversations in `kept_in`; kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 17) as the [`Duplex`] a
 /// session drives it through: its pipes, end and stop the run's (`crate::sandbox::held`), served on
 /// the caller's shard, as a spawned harness's pipes are.
-pub fn duplex_of_run(run: Box<dyn kiln_seams::sandbox::Run>, image: String, reach: crate::sandbox::narrow::Reach) -> Duplex {
-    Duplex::held(crate::sandbox::held::pump(run, image, reach))
+pub fn duplex_of_run(run: Box<dyn kiln_seams::sandbox::Run>, image: String, reach: crate::sandbox::narrow::Reach, kept_in: Option<String>) -> Duplex {
+    Duplex::held(crate::sandbox::held::pump(run, image, reach, kept_in))
 }
 
 #[cfg(all(test, unix))]
