@@ -890,6 +890,7 @@ impl Scanner {
                 p.title.clone_from(n);
             }
             p.isolation.clone_from(&place.isolation);
+            ran_in(&mut p, self.homes.as_deref());
             out.push(p);
         }
         if self.past.len() > HISTORY_CACHE {
@@ -898,7 +899,11 @@ impl Scanner {
         if want("devin") {
             for place in &places {
                 if let Some(devin) = &place.devin {
-                    out.extend(devin::history(devin, limit, place.held(&skip, running)).into_iter().map(|p| PastSession { isolation: place.isolation.clone(), ..p }));
+                    out.extend(devin::history(devin, limit, place.held(&skip, running)).into_iter().map(|p| {
+                        let mut p = PastSession { isolation: place.isolation.clone(), ..p };
+                        ran_in(&mut p, self.homes.as_deref());
+                        p
+                    }));
                 }
             }
             out.sort_by_key(|p| std::cmp::Reverse(p.last_activity));
@@ -1076,6 +1081,21 @@ fn volumes_of(homes: &Path, person: &str) -> Result<Folders, Refusal> {
         devin: var("devin", "XDG_DATA_HOME")?.map(|d| d.join("devin").join("cli")),
         isolation: Some(Isolation { person: Some(person.to_owned()), ..Isolation::microvm() }),
     })
+}
+
+/// `p`, from a person's microVM volume under `homes`, goes on in the Agentfile it ran in, as kiln kept it
+/// beside the volume (`home::RanIn`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17, goal 65's
+/// finding), not the one a start would take today; one kiln kept nothing of stays as it is.
+fn ran_in(p: &mut PastSession, homes: Option<&Path>) {
+    let (Some(homes), Some(isolation)) = (homes, p.isolation.as_mut()) else {
+        return;
+    };
+    let Some(person) = isolation.person.as_deref() else {
+        return;
+    };
+    if let Some(ran) = home::ran_in_dir(homes, person, &p.kind).ok().and_then(|d| home::ran_in(&d, &p.id)) {
+        isolation.image = Some(ran.agentfile);
+    }
 }
 
 /// A transcript's head and tail (the whole of a small one) as one past session.
@@ -2045,6 +2065,34 @@ mod tests {
         for person in [None, Some("user:../user-u1")] {
             assert_eq!(sc.history(None, 50, &running, person).iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["c-machine"], "{person:?}");
         }
+        Ok(())
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 (goal 65's finding): a conversation of a
+    /// person's volume that kiln kept where it ran goes on in that Agentfile; one it kept nothing of
+    /// stays as a start would take it.
+    #[test]
+    fn s17_a_volumes_conversation_goes_on_in_the_agentfile_it_ran_in() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let homes = home::root(dir.path());
+        let layout = home::of_kilns(&homes, "user:u1", "claude")?.ok_or_else(|| anyhow::anyhow!("kiln ships no Agentfile for claude"))?;
+        let claude = layout.host_env().into_iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR").map(|(_, v)| PathBuf::from(v)).ok_or_else(|| anyhow::anyhow!("no CLAUDE_CONFIG_DIR"))?;
+        let projects = claude.join("projects").join("-work-a");
+        std::fs::create_dir_all(&projects)?;
+        for id in ["ran-own", "ran-unkept"] {
+            let said = serde_json::json!({"type": "user", "sessionId": id, "cwd": "/work/a", "timestamp": "t", "message": {"role": "user", "content": "go on"}});
+            std::fs::write(projects.join(format!("{id}.jsonl")), format!("{said}\n"))?;
+        }
+        let kept = home::RanIn { conversation: "ran-own".into(), agentfile: "agentfile:0123".into(), digest: "ab".repeat(32), image: "agentfile-0123@sha256:00".into() };
+        home::keep_ran_in(&home::ran_in_dir(&homes, "user:u1", "claude")?, &kept)?;
+        let mut sc = Scanner::new(dir.path().to_owned()).with_homes(homes.clone());
+        let machine = dir.path().join("machine");
+        (sc.claude, sc.codex, sc.devin) = (machine.join("claude"), machine.join("codex"), machine.join("devin"));
+        sc.running = Some(HashSet::new());
+        let past = sc.history(Some("claude"), 50, &HashSet::new(), Some("user:u1"));
+        let mut images: Vec<(&str, Option<&str>)> = past.iter().map(|p| (p.id.as_str(), p.isolation.as_ref().and_then(|i| i.image.as_deref()))).collect();
+        images.sort_unstable();
+        assert_eq!(images, [("ran-own", Some("agentfile:0123")), ("ran-unkept", None)]);
         Ok(())
     }
 

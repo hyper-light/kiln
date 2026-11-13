@@ -149,6 +149,62 @@ pub struct Ended {
     pub code: Option<i32>,
 }
 
+/// What an isolated session's run keeps beside its person's volume (kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 17, goal 65's finding): whose volume, and the Agentfile and
+/// image its conversation runs in, once its harness has said the conversation's id; none for a run of
+/// the machine's, or one that acts for no person.
+fn ran_in_of(spec: &Spec, runs: Option<&Runs>, conversation: Option<&str>) -> Option<(String, crate::harness::isolated::home::RanIn)> {
+    let Some(Runs::Microvm { image, .. }) = runs else {
+        return None;
+    };
+    let conversation = conversation.filter(|c| !c.is_empty())?;
+    let isolation = spec.isolation.as_ref()?;
+    let person = isolation.person.clone()?;
+    let kept = isolation.image.as_deref().map(str::trim).filter(|n| n.starts_with(crate::sandbox::isolated::KEPT));
+    let (agentfile, digest) = match kept {
+        Some(name) => (name.to_owned(), crate::util::sha256_hex(spec.agentfile.as_deref()?.as_bytes())),
+        None => {
+            let b = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == spec.kind)?;
+            (b.name.to_owned(), crate::util::sha256_hex(b.text.as_bytes()))
+        }
+    };
+    Some((person, crate::harness::isolated::home::RanIn { conversation: conversation.to_owned(), agentfile, digest, image: image.clone() }))
+}
+
+/// Keeps, beside its person's volume, which image `s`'s conversation runs in ([`ran_in_of`]), off the
+/// runtime's threads: a pick-up goes on there (`aisessions`, a history's `isolation`).
+fn keep_ran_in(s: &Session, files: &Files) {
+    let Some(homes) = files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.homes().map(std::path::Path::to_path_buf)) else {
+        return;
+    };
+    let (runs, conversation) = {
+        let core = s.core.lock();
+        (core.state.runs.clone(), core.state.harness_session.clone())
+    };
+    let spec = s.spec.lock().clone();
+    let Some((person, ran)) = ran_in_of(&spec, runs.as_ref(), conversation.as_deref()) else {
+        return;
+    };
+    let dir = match crate::harness::isolated::home::ran_in_dir(&homes, &person, &spec.kind) {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::warn!(session = %s.id, error = %e, "where its conversation ran isn't kept beside its person's volume");
+            return;
+        }
+    };
+    let id = s.id.clone();
+    crate::rt::spawn(async move {
+        let failed = match crate::rt::blocking(move || crate::harness::isolated::home::keep_ran_in(&dir, &ran)).await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(e) => Some(format!("{e:#}")),
+        };
+        if let Some(e) = failed {
+            tracing::warn!(session = %id, error = %e, "where its conversation ran isn't kept beside its person's volume");
+        }
+    });
+}
+
 /// What a microVM's session says where its run keeps its image's destinations whole because kiln
 /// couldn't tell what it uses (`narrow::Whole::is_fallback`): none for a narrowed run, or one whose
 /// image's destinations are all its own.
@@ -4543,6 +4599,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 // Its process here; none for a harness its boundary holds (a microVM's member).
                 *s.pid.lock() = p.host_pid();
                 s.began(&p);
+                keep_ran_in(&s, &files);
                 ran_here = true;
                 if adopted {
                     let mut core = s.core.lock();
@@ -4888,6 +4945,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 p.terminate(Duration::from_secs(2));
                                 let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
                                 *s.pid.lock() = None;
+                                keep_ran_in(&s, &files);
                                 s.ended_run(None);
                                 // What its adapter held goes with its record, in its queue.
                                 adapter.let_go(&mut s.core.lock());
@@ -4962,6 +5020,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             .await;
                             p.terminate(Duration::from_secs(3));
                             *s.pid.lock() = None;
+                            keep_ran_in(&s, &files);
                             s.ended_run(None);
                             if let Some(g) = group {
                                 end_group(g, Duration::from_millis(3500));
@@ -5105,6 +5164,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                 }
                 *s.pid.lock() = None;
+                keep_ran_in(&s, &files);
                 s.ended_run(code);
                 // A conversation carried in that it took is in its own session now, which it
                 // starts again on (Antigravity starts again for a new mode, model or effort); one
@@ -5446,6 +5506,30 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
 #[cfg(test)]
 mod tests {
     use crate::util::Must as _;
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 (goal 65's finding): what a microVM's run keeps
+    /// beside its person's volume names the Agentfile its conversation ran in, at its version, and its
+    /// image; nothing for a run of the machine's, before its harness said the conversation's id, or for
+    /// no person.
+    #[test]
+    fn s17_a_microvm_run_keeps_the_agentfile_and_image_its_conversation_ran_in() -> anyhow::Result<()> {
+        use super::{Isolation, Runs, Spec, ran_in_of};
+        use crate::harness::isolated::home::RanIn;
+        let run = Runs::Microvm { vm: None, image: "agentfile-0123@sha256:00".into(), host_pid: None, control: None, reach: None };
+        let isolated = |image: Option<&str>, person: Option<&str>| Isolation { image: image.map(str::to_owned), person: person.map(str::to_owned), ..Isolation::microvm() };
+        let own = Spec { kind: "claude".into(), isolation: Some(isolated(Some("agentfile:0123"), Some("user:u1"))), agentfile: Some("FROM x\n".into()), ..Spec::default() };
+        let ran = |agentfile: &str, digest: String| RanIn { conversation: "c-1".into(), agentfile: agentfile.into(), digest, image: "agentfile-0123@sha256:00".into() };
+        assert_eq!(ran_in_of(&own, Some(&run), Some("c-1")), Some(("user:u1".to_owned(), ran("agentfile:0123", crate::util::sha256_hex(b"FROM x\n")))));
+        let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
+        let kilns = Spec { kind: "claude".into(), isolation: Some(isolated(None, Some("owner"))), ..Spec::default() };
+        assert_eq!(ran_in_of(&kilns, Some(&run), Some("c-1")), Some(("owner".to_owned(), ran("harness-claude", crate::util::sha256_hex(claude.text.as_bytes())))));
+        assert_eq!(ran_in_of(&own, Some(&Runs::Host { pid: 1 }), Some("c-1")), None, "a run of the machine's");
+        assert_eq!(ran_in_of(&own, Some(&run), None), None, "no conversation said yet");
+        assert_eq!(ran_in_of(&own, Some(&run), Some("")), None);
+        let nobodys = Spec { isolation: Some(isolated(Some("agentfile:0123"), None)), ..own.clone() };
+        assert_eq!(ran_in_of(&nobodys, Some(&run), Some("c-1")), None, "no person");
+        Ok(())
+    }
 
     /// Step 17 part 6: a microVM's run kept whole for want of knowing what its session uses says so,
     /// and why; one narrowed, one whose image serves one use, and a process of the machine's say
