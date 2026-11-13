@@ -54,7 +54,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::ask::{self, Amounts, Ask, Peer, Sample};
-use super::keeper::{Keeper, NotGranted};
+use super::keeper::{self, Keeper, NotGranted};
 use super::keys::{FxMap, Interner};
 use super::line::{Item, Key, Line, Query};
 use super::link::Rtt;
@@ -442,6 +442,9 @@ pub struct Admission {
     whole_claims: u32,
     unpredicted_claims: u32,
     untimed_claims: u32,
+    /// Of its claims, those that ask something: each reserves its room through its machine's
+    /// keeper, where one is known (`keeper::reserves`; one that asks nothing reserves nothing).
+    reserving: u32,
     draining: bool,
     /// Its machine is under strain, and why (AUDIT L1, the shell's measure): it offers nothing new.
     strained: Option<String>,
@@ -590,6 +593,7 @@ impl Admission {
             whole_claims: 0,
             unpredicted_claims: 0,
             untimed_claims: 0,
+            reserving: 0,
             draining: false,
             strained: None,
             keeper: Keeper::None,
@@ -690,8 +694,9 @@ impl Admission {
     }
 
     /// What's free for an ordinary run now (W05-R03, as the engine's `fits_beside`): its CPUs
-    /// overcommitted beside what shares hold, the rest never; none while it holds as many claims as
-    /// its holder may reserve through its machine's keeper ([`Self::claims_spent`]).
+    /// overcommitted beside what shares hold, the rest never; none while it holds as many claims
+    /// asking something as its holder may reserve through its machine's keeper
+    /// ([`Self::claims_spent`]), so only a run that asks nothing fits.
     fn free_now(&self) -> Amounts {
         if self.claims_spent() {
             return [0; ask::DIMS];
@@ -888,6 +893,9 @@ impl Admission {
         let due = Due::of_parts(p.ask.p90, p.ask.median, p.ask.timeout, from);
         self.held = ask::plus(&self.held, &amounts);
         self.claims = self.claims.saturating_add(1);
+        if keeper::reserves(&amounts) {
+            self.reserving = self.reserving.saturating_add(1);
+        }
         match kind {
             Kind::Share => self.held_share = ask::plus(&self.held_share, &amounts),
             Kind::Whole => self.whole_claims = self.whole_claims.saturating_add(1),
@@ -929,6 +937,9 @@ impl Admission {
         self.settle(s, 0);
         self.held = ask::less(&self.held, &amounts);
         self.claims = self.claims.saturating_sub(1);
+        if keeper::reserves(&amounts) {
+            self.reserving = self.reserving.saturating_sub(1);
+        }
         match kind {
             Kind::Share => self.held_share = ask::less(&self.held_share, &amounts),
             Kind::Whole => self.whole_claims = self.whole_claims.saturating_sub(1),
@@ -1710,21 +1721,22 @@ impl Admission {
         self.keeper.unsynced().map(|u| Reason::Unsynced { why: u.why().to_owned() })
     }
 
-    /// Whether it holds as many claims as its holder may reserve through its machine's keeper
-    /// (`View::most_claims`; Hex's capacity-view.md CV8): a claim more would have its reserve
-    /// refused, so none fits, by probing or by its kernel, until one ends or the count moves. Every
-    /// claim counts, whatever it asks.
+    /// Whether it holds as many claims asking something as its holder may reserve through its
+    /// machine's keeper (`View::most_claims`; Hex's capacity-view.md CV8): one more would have its
+    /// reserve refused, so none fits, by probing or by its kernel, until one ends or the count
+    /// moves. A run that asks nothing reserves nothing, and starts beside them.
     fn claims_spent(&self) -> bool {
-        self.keeper.most_claims().is_some_and(|most| u64::from(self.claims) >= most)
+        self.keeper.most_claims().is_some_and(|most| u64::from(self.reserving) >= most)
     }
 
     /// Keeps the kernel's ledger saying what this one has room for (docs/lb.md, "One ledger";
     /// W05-R03): its budget this runner's cap, its room for a new run what's free here for an
-    /// ordinary one while it's [`Self::open_fast`], else none, and cordoned while it takes no work
-    /// ([`Self::cordoned`]) or no claim more ([`Self::claims_spent`]). What this ledger holds that
-    /// the kernel didn't admit (claims offered, taken or running by probing, room kept, use
-    /// measured outside every claim) is the kernel's `outside`; what the kernel admitted is a claim
-    /// here too. So a run takes its room once in each, whichever path admitted it.
+    /// ordinary one while it's [`Self::open_fast`] (none past what its holder may reserve:
+    /// [`Self::free_now`]), else none, and cordoned while it takes no work ([`Self::cordoned`]).
+    /// What this ledger holds that the kernel didn't admit (claims offered, taken or running by
+    /// probing, room kept, use measured outside every claim) is the kernel's `outside`; what the
+    /// kernel admitted is a claim here too. So a run takes its room once in each, whichever path
+    /// admitted it.
     fn sync_fast(&mut self) {
         let cap = self.cap();
         if cap != self.fast.budget() {
@@ -1736,9 +1748,7 @@ impl Admission {
             *o = f.saturating_sub(t);
         }
         self.fast.outside(outside, &mut self.fast_out);
-        // A kernel's start is a claim too, so none past what its holder may reserve (CV8), however
-        // little it asks.
-        let cordoned = self.cordoned() || self.claims_spent();
+        let cordoned = self.cordoned();
         self.fast.cordon(cordoned, &mut self.fast_out);
         // Its own line is never used (waiting is this ledger's): nothing it says here is news.
         self.fast_out.clear();
@@ -1810,8 +1820,8 @@ impl Admission {
     fn can_start(&self, s: u32) -> bool {
         let Some(p) = self.get(s) else { return false };
         // A claim past what its holder may reserve through its machine's keeper: its reserve would
-        // be refused (CV8), whatever it asks.
-        if self.claims_spent() {
+        // be refused (CV8). One that asks nothing reserves nothing.
+        if self.claims_spent() && keeper::reserves(&p.amounts) {
             return false;
         }
         if p.ask.needs.request.gpu > 0 && crate::sched::gpu::rank(&p.ask.needs, &self.facts, &self.labels, self.free_now()[3]).is_none() {
@@ -3447,14 +3457,15 @@ impl Admission {
             Kind::Whole => self.claims == 0 && self.sample.ci_jobs == 0 && ask::fits(&amounts, &free),
             Kind::Share => ask::fits(&ask::plus(&self.held, &amounts), &self.base),
             Kind::Ordinary => ask::fits(&amounts, &free),
-        } && self.whole_claims == 0 && !self.claims_spent();
+        } && self.whole_claims == 0
+            && !(self.claims_spent() && keeper::reserves(&amounts));
         let reason = if let Some(reason) = self.not_taking() {
             reason
         } else if let Some((_, at)) = self.kept {
             Reason::Kept { at }
         } else if fits {
             return Quote::Now;
-        } else if ask::fits(&amounts, &free) && !self.claims_spent() {
+        } else if ask::fits(&amounts, &free) {
             Reason::Whole { jobs: self.claims.saturating_add(self.sample.ci_jobs) }
         } else {
             Reason::Room { short: shortfall(&ask.needs.request, &ask::resources(&free)) }
@@ -3476,7 +3487,9 @@ impl Admission {
 
     /// The room run `run`'s live claim `fence` holds here (offered and not lapsed by `now`, or
     /// taken): what its reserve through its machine's keeper asks before the ledger starts it (Hex's
-    /// capacity-view.md, the holder's item 4). None for any other, whose start is answered as ever.
+    /// capacity-view.md, the holder's item 4), or nothing, where it asks nothing: such a run starts
+    /// without a reservation (`keeper::reserves`). None for any other claim, whose start is answered
+    /// as ever.
     pub fn claim(&self, from: Peer<'_>, run: &str, fence: Fence, now: i64) -> Option<Amounts> {
         let p = self.find(from, run).and_then(|s| self.get(s))?;
         let live = match p.state {
@@ -3538,13 +3551,14 @@ impl Admission {
     /// the model.
     pub fn check(&self) -> Result<(), String> {
         let mut held = [0u64; ask::DIMS];
-        let (mut claims, mut whole, mut waiting) = (0u32, 0u32, 0u32);
+        let (mut claims, mut whole, mut waiting, mut reserving) = (0u32, 0u32, 0u32, 0u32);
         for (s, p) in self.slots.iter().enumerate().filter_map(|(s, p)| p.as_ref().map(|p| (s, p))) {
             match p.state {
                 State::Offered { .. } | State::Taken { .. } | State::Running { .. } => {
                     held = ask::plus(&held, &p.amounts);
                     claims = claims.saturating_add(1);
                     whole = whole.saturating_add(u32::from(kind_of(&p.ask) == Kind::Whole));
+                    reserving = reserving.saturating_add(u32::from(keeper::reserves(&p.amounts)));
                 }
                 State::Waiting => {
                     waiting = waiting.saturating_add(1);
@@ -3559,6 +3573,9 @@ impl Admission {
         }
         if held != self.held || claims != self.claims {
             return Err(format!("{}: its books say {:?} held by {} claims, its claims hold {held:?} ({claims})", self.me, self.held, self.claims));
+        }
+        if reserving != self.reserving {
+            return Err(format!("{}: its books say {} claims ask something, {reserving} do", self.me, self.reserving));
         }
         if !ask::fits(&held, &self.cap()) {
             return Err(format!("{}: its claims hold {held:?}, past what kiln may place here, {:?} (G1)", self.me, self.cap()));

@@ -8,7 +8,7 @@
 //! waiting again, or a kernel start declined.
 
 use super::ask::{Ask, Peer, Sample};
-use super::keeper::{Keeper, NotGranted, Unsynced, View};
+use super::keeper::{Keeper, NotGranted, Unsynced, View, WaitEnded, Waits};
 use super::msg::{FastWhy, Reason, ToOwner};
 use super::runner::{Admission, Init, Quote, Records, Said, Settings, Start};
 use crate::facts::RunnerFacts;
@@ -292,11 +292,10 @@ fn cv3_the_room_left_a_holder_is_the_room_less_what_others_hold() {
 }
 
 /// CV8: a holder holds no more reservations than one sync lists (Hex's `most_held`), so the ledger
-/// holds no more claims than its shell says its holder may reserve: with two, r1 and r2 start and
-/// r3 waits for room, which its hint, its kernel's word and its quotes say too, a quote of a run
-/// asking nothing among them. r1's release, said and not yet answered, still holds its reservation,
-/// so as r1 ends nothing more is offered; once the keeper's answer frees it, r3 is offered in that
-/// input.
+/// holds no more claims asking something than its shell says its holder may reserve: with two, r1
+/// and r2 start, its hint, its kernel's word and its quotes then say no room, and r3 waits for room.
+/// r1's release, said and not yet answered, still holds its reservation, so as r1 ends nothing more
+/// is offered; once the keeper's answer frees it, r3 is offered in that input.
 #[test]
 fn cv8_it_holds_no_more_claims_than_its_holder_may_reserve() -> Result<(), String> {
     let mut a = runner(8, 16, 1000);
@@ -307,14 +306,12 @@ fn cv8_it_holds_no_more_claims_than_its_holder_may_reserve() -> Result<(), Strin
         run_it(&mut a, run, f, now)?;
     }
     let _ = said(&mut a, most(synced(8, 16, (0, 0), (2, 0)), 2), 3);
+    assert_eq!(a.hint(), Resources::default(), "its room hinted as none");
+    assert_eq!(a.fast_word().room, [0; 4], "its kernel's word says no room");
+    assert!(matches!(a.quote(&ask("q", "cpus=1")?, 3), Quote::Waits { reason: Reason::Room { .. }, .. }));
     let w = probe(&mut a, "r3", "cpus=1", 3)?;
     assert!(offer(&w, "r3").is_none(), "a third claim past the two its holder may reserve: {w:?}");
     assert!(matches!(waiting(&w, "r3"), Some(Reason::Room { .. })), "{w:?}");
-    assert_eq!(a.hint(), Resources::default(), "its room hinted as none");
-    assert_eq!(a.fast_word().room, [0; 4], "its kernel's word says no room");
-    for q in ["cpus=1", ""] {
-        assert!(matches!(a.quote(&ask("q", q)?, 3), Quote::Waits { reason: Reason::Room { .. }, .. }), "{q:?}");
-    }
     a.check()?;
     // r1 ends, its release said: until the keeper answers, its reservation is another's in the view
     // and one fewer is left to this runner's claims.
@@ -354,11 +351,11 @@ fn holder_a_reserve_not_granted_lapses_its_claim_and_the_run_waits() -> Result<(
     let g = offer(&back, "r1").ok_or(format!("offered again once its room is back: {back:?}"))?;
     assert_ne!(g, f, "under a new claim");
     let mut out = Vec::new();
-    a.not_granted(O1, "r1", f, NotGranted::Unanswered, 5, &mut out);
+    a.not_granted(O1, "r1", f, NotGranted::Unanswered(WaitEnded::Died), 5, &mut out);
     assert_eq!(a.claim(O1, "r1", g, 5), Some([4_000, 4 * GIB, 0, 0]), "a refusal of the lapsed claim leaves the new one: {out:?}");
     run_it(&mut a, "r1", g, 6)?;
     let mut out = Vec::new();
-    a.not_granted(O1, "r1", g, NotGranted::Unanswered, 7, &mut out);
+    a.not_granted(O1, "r1", g, NotGranted::Unanswered(WaitEnded::Stalled), 7, &mut out);
     assert!(running(&a, "r1") && !a.records().is_empty(), "a run started stays started: {out:?}");
     a.check()
 }
@@ -380,5 +377,72 @@ fn holder_a_kernel_start_not_granted_is_declined_for_room() -> Result<(), String
     let [cpu, ..] = room.ok_or(format!("declined for room: {out:?}"))?;
     assert_eq!(cpu, 2_000, "its word says the room the keeper leaves it");
     assert!(a.probes().is_empty() && a.room().1 == [0; 4] && a.records().is_empty(), "nothing here holds it");
+    a.check()
+}
+
+/// A run that asks nothing reserves nothing, as Hex's holder and keeper take no empty amount
+/// (agreed with Hex's lead through ROOT): its claim holds nothing, which is its shell's word to start
+/// it without a reservation, and it isn't counted against what its holder may reserve, so it starts
+/// while those are spent, beside a run that waits for one, and its end frees none. What it uses is
+/// in the keeper's measured room (CV12). That is its cold start: once kiln has learned what it asks,
+/// it reserves as any run does.
+#[test]
+fn holder_a_run_asking_nothing_starts_without_a_reservation() -> Result<(), String> {
+    let mut a = runner(8, 16, 1000);
+    let _ = said(&mut a, most(synced(8, 16, (0, 0), (0, 0)), 1), 0);
+    let w = probe(&mut a, "r1", "cpus=1", 1)?;
+    let f = offer(&w, "r1").ok_or(format!("{w:?}"))?;
+    run_it(&mut a, "r1", f, 1)?;
+    let w = probe(&mut a, "r2", "cpus=1", 2)?;
+    assert!(offer(&w, "r2").is_none(), "its holder's one reservation is r1's: {w:?}");
+    assert_eq!(a.quote(&ask("q", "")?, 2), Quote::Now, "a run asking nothing fits beside them");
+    let w = probe(&mut a, "z1", "", 3)?;
+    let z = offer(&w, "z1").ok_or(format!("offered though the reservations are spent: {w:?}"))?;
+    assert_eq!(a.claim(O1, "z1", z, 3), Some([0; 4]), "nothing to reserve: started without a reservation");
+    run_it(&mut a, "z1", z, 3)?;
+    assert!(running(&a, "z1") && !running(&a, "r2"), "z1 runs, and r2 still waits for a reservation");
+    a.check()?;
+    let mut out = Vec::new();
+    a.ended(O1, "z1", true, 4, &mut out);
+    assert!(offer(&out, "r2").is_none(), "z1 held no reservation, so its end frees none: {out:?}");
+    let mut out = Vec::new();
+    a.ended(O1, "r1", true, 5, &mut out);
+    assert!(offer(&out, "r2").is_some(), "r1's end does: {out:?}");
+    a.check()
+}
+
+/// The holder's waits (ROOT's R03 ruling for kiln's holder): nothing seeded, nothing multiplied.
+/// Before the keeper's first answer a word waits on liveness alone, however long; the first answer
+/// is the bound, and a word stalls only once it has waited longer than the slowest answer, timed
+/// from the answer before it where it waited behind one, so an answer as slow as the slowest is no
+/// stall. A late answer comes to its own word and makes the slowest what it took, which ends the
+/// stall. A link that dies ends every word on it, the slowest kept for the next link's. A runner
+/// told its keeper stalled takes nothing new, saying so.
+#[test]
+fn holder_waits_follow_the_keepers_liveness_and_progress_alone() -> Result<(), String> {
+    let mut w = Waits::default();
+    w.said(0);
+    assert_eq!((w.due(), w.stalled(i64::MAX)), (None, false), "a cold start waits on liveness alone");
+    assert_eq!(w.answered(40), Some(40));
+    assert_eq!(w.slowest(), Some(40));
+    w.said(100);
+    w.said(110);
+    assert_eq!(w.due(), Some(141), "the oldest word, past the slowest answer");
+    assert!(!w.stalled(140) && w.stalled(141));
+    assert_eq!(w.answered(140), Some(40), "as slow as the slowest: no stall");
+    assert_eq!(w.due(), Some(181), "the next word waited behind it, so it's timed from that answer");
+    assert!(w.stalled(181), "nothing answered for longer than the slowest answer");
+    assert_eq!(w.answered(300), Some(160), "a late answer comes to its own word");
+    assert_eq!((w.slowest(), w.due(), w.stalled(1_000)), (Some(160), None, false), "the slowest is what it took");
+    w.said(400);
+    assert_eq!(w.ended(), 1, "the link died: its word ends");
+    assert_eq!((w.waiting(), w.slowest()), (0, Some(160)), "the slowest stays the keeper's");
+    assert_eq!(w.answered(500), None, "an answer no word waited for");
+    w.said(600);
+    assert_eq!(w.due(), Some(761), "the next link's words wait on the slowest answer seen");
+    let mut a = runner(8, 16, 1000);
+    let _ = said(&mut a, Keeper::Unsynced(Unsynced::Stalled), 0);
+    assert_eq!(a.taking(), Err(Reason::Unsynced { why: Unsynced::Stalled.why().to_owned() }));
+    assert_eq!(NotGranted::Unanswered(WaitEnded::Stalled).why(), "its reserve went unanswered: its machine's capacity keeper answered nothing for longer than the slowest answer it has given");
     a.check()
 }
