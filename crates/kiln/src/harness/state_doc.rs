@@ -55,9 +55,12 @@ impl StateDoc {
             Kept::Object(fields) => fields.as_slice(),
             _ => &[],
         };
-        // Both in their type's order: each key looked for past the last one found, shared where `was` has it.
+        // Both in their type's order: each key looked for past the last one found, shared where `was` has it. Room for
+        // every field is made once: leaving `view` out makes the iterator's length unknown, and a `collect` would grow
+        // its vector by doubling, each a reallocation of a changed state (goal 9 step 5's budget, g9_s5).
         let mut from = 0;
-        let fields = spans
+        let mut fields = Vec::with_capacity(spans.len());
+        fields.extend(spans
             .into_iter()
             .filter(|(key, _)| *key != b"view")
             .map(|(key, value)| {
@@ -70,8 +73,7 @@ impl StateDoc {
                     None => key_of(key),
                 };
                 (key, text.slice(value))
-            })
-            .collect();
+            }));
         Self(Kept::Object(fields))
     }
 
