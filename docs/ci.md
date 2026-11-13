@@ -1698,7 +1698,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `[ci.scheduler] target_use` (at most 1) where a person sets it, else derived for each runner, its
   CPUs to the knee of an M/M/m queue of as many servers (Millsap, "Thinking Clearly About
   Performance", 2010: 74 % for 8 CPUs, 86 % for 32) and its memory to all that the kernel says is
-  available (MemAvailable). A sample stands until the next or until its runner's link is lost (no
+  available (MemAvailable; on macOS its free pages and the inactive ones beyond what its
+  compressor holds, docs/needs.md). A sample stands until the next or until its runner's link is lost (no
   clock ages it), and what was placed after it stops counting as it ends; a runner with no sample
   on its link is placed by its room alone, as before samples. `[ci.scheduler] headroom = false` places by room alone
   everywhere (kiln's integration tests do: their runners share the machine running the tests; so

@@ -81,6 +81,47 @@ pub struct RunReq {
     pub client: Option<u32>,
 }
 
+/// A run refused before anything of it starts, by kind (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
+/// step 32). It goes as the run's error ([`Ev::Error`]), its words led by its code, `refused
+/// (<code>): …`, which `kiln run` prints as they are and `kiln reach mcp` gives agents beside them
+/// as `refused` ([`Refused::code_of`]), its tool's and `kiln.machines.*`'s answer alike.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    /// Asked for by agent session `session`, which is held in a microVM of its own: its commands run
+    /// in microVMs alone, on runners that start them, and no runner runs kiln's commands in a microVM
+    /// yet (a microVM executor for them is owed), so it runs nowhere, never on a bare host.
+    Isolated { session: String },
+}
+
+impl Refused {
+    /// Every code there is.
+    pub const CODES: &[&str] = &["isolated"];
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Refused::Isolated { .. } => "isolated",
+        }
+    }
+
+    /// The code of a run's error that says one: its words as [`Refused`] writes them.
+    pub fn code_of(words: &str) -> Option<&'static str> {
+        let (code, _) = words.strip_prefix("refused (")?.split_once("): ")?;
+        Self::CODES.iter().find(|c| **c == code).copied()
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::Isolated { session } => write!(
+                f,
+                "refused ({}): agent session {session} is held in a microVM of its own, so its commands run only in microVMs, on runners that start them, and no runner runs kiln's commands in a microVM yet: none of them runs on a bare host (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32)",
+                self.code()
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Ev {
     Status(String),
