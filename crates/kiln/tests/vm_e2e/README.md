@@ -36,7 +36,7 @@ Then where it ran:
 | Acceptance | Check | Read from |
 |---|---|---|
 | the negotiated suite is `TLS13_AES_256_GCM_SHA384` on every link, both ends | `check_all_links`: every link of `REQUIRED_LINKS` (`server-runner`, `kiln-hex`, `agent-control`, `mcp`) read, and every link read at both ends | `VM_E2E_LINKS` (below); a required link not read is a failure |
-| nothing ran outside the microVMs | `harnesses_on_host`: no harness process in the session's process trees on the host (the runner's, and `VM_E2E_HOST_ROOTS`') at any of the drive's looks; `check_in_guest`: the kernel the harness's own shell said is Linux, and on a Linux host a boot other than the host's (a container shares the host's) | `ps` (Linux, macOS) or CIM's `Win32_Process` (Windows); the harness's `WHERE <uname -s> <boot id>` line |
+| nothing ran outside the microVMs | `harnesses_on_host`: no harness process in the session's process trees on the host (the runner's, and `VM_E2E_HOST_ROOTS`') at any of the drive's looks; `check_in_guest`: the kernel the harness's own shell said is Linux, and on a Linux host a boot other than the host's (a container shares the host's); `check_no_host_pid` and `check_starts`: kiln says the session runs in a microVM holding no process of the host, and every start of its harness was in one, so a harness that ran on the host and ended between two looks is found | `ps` (Linux, macOS) or CIM's `Win32_Process` (Windows); the harness's `WHERE <uname -s> <boot id>` line; the session's `/runs` and `/starts` (kiln plan step 17), read just before it is stopped and after its resumed turn |
 | the project at its host path | `check_project_path`: kiln's `cwd` is the host path, and the harness's own `CWD <path>` is that path as its guest sees it (the same path on Linux and macOS; Shards D235's WSL form on Windows, `C:\X` at `/mnt/c/X`); `check_written`: the file the harness wrote in its project (`{file}`, its name its words) is at the host path | `GET /api/harness/sessions/<id>`, the timeline, the host's file |
 | the harness reaches its provider | a real task's turns end with ROOT's marker, which only the model's answer says | the timeline |
 | kiln's MCP works from inside | `mcp_round_trip`: a call of a kiln tool that came back done (`server: kiln`), or the stand-in's `MCP_OK <tools>` | the timeline |
@@ -65,7 +65,7 @@ every one of the five `VM_E2E_*` words below (`untasked`): the stand-in's words 
 | Variable | What |
 |---|---|
 | `VM_E2E=1` | a runner that starts no microVMs fails the run rather than skips it |
-| `VM_E2E_LINKS` | the links to read, each end's path on kiln's API (`{session}`: the session's id) and the JSON pointer to its suite: `[{"name": "agent-control", "client": {"url": "…", "pointer": "…"}, "server": {"url": "…", "pointer": "…"}, "lanes": {"url": "…", "pointer": "…"}}, …]`, one for each of `server-runner`, `kiln-hex`, `agent-control` and `mcp` at least; `agent-control`'s `lanes` is where its report lists its lanes' names, among which `mcp` must be (Shards D254) |
+| `VM_E2E_LINKS` | the links to read, each end's path on kiln's API (`{session}`: the session's id) and the JSON pointer to its suite: `[{"name": "agent-control", "client": {"url": "…", "pointer": "…"}, "server": {"url": "…", "pointer": "…"}, "lanes": {"url": "…", "pointer": "…"}}, …]`, one for each of `server-runner`, `kiln-hex`, `agent-control` and `mcp` at least; `agent-control`'s `lanes` is where its report lists its lanes' names, among which a member's `mcp:<member>` lane must be (Shards D254). With kiln plan step 17's report, the agent-control entry is `{"name": "agent-control", "client": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/controller/suite"}, "server": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/endpoint/suite"}, "lanes": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/lanes"}}` |
 | `VM_E2E_HOST_ROOTS` | pids (comma-separated) of processes besides the runner whose trees hold the session's processes: a daemon its microVMs run under that left the runner's tree |
 | `VM_E2E_PROJECT` | a real project's folder on this host, for a real task (unset: an empty one of the test's own) |
 | `VM_E2E_PROMPT`, `VM_E2E_RESUMED_PROMPT`, `VM_E2E_STEERED_PROMPT`, `VM_E2E_STOPPED_PROMPT`, `VM_E2E_DONE_MARKER` | a real task, the resumed session's turn, a long one to steer into, a long one to stop, and what the harness says at a task's end; `{kind}` in each is the harness's id, `{file}` the file to write. Unset: the stand-in's, for an image ROOT names (the stand-in's); from kiln's own `harness-<kind>` the run skips unless all five are given (fails, with `VM_E2E=1`) |
@@ -156,9 +156,11 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
 8479be870 (2026-11-13).
 
 1. **The agent-control link's ends, the microVM's identity and no host pid, on the session**: step 17's
-   Shards slice. Read from `GET /api/harness/sessions/<id>`, through `VM_E2E_LINKS`' `agent-control`
-   entry (the controller's end from Shards' `control::Controller` in kiln, the endpoint's own report),
-   and by `check_in_guest`. Evidence: the session's info (`harness/session.rs`, `Info`) says its
+   Shards slice, as its agent names them: `/runs/in`, `/runs/vm`, `/runs/image`, `/runs/host_pid`,
+   `/runs/control/{controller,endpoint}/{suite,group}`, `/runs/control/lanes` and `/starts`. Read from
+   `GET /api/harness/sessions/<id>`, through `VM_E2E_LINKS`' `agent-control` entry, and by
+   `check_no_host_pid` and `check_starts`. The link's ends say nothing until it carries the stdio
+   (Shards' control link and kiln's re-vendor). Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
    `isolation` (kind and image) and no links, microVM identity or host pid; step 17's branch
    (`p/s17-launch-seam-v1`, 64dfab21f) reads its process's `host_pid()` inside (`session.rs` 4328 and
    4724) and says none of it; Shards' `control::Controller` (`crates/remote/src/control/drive.rs`)
@@ -195,7 +197,6 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    `VM_E2E_LINKS`' `kiln-hex` entry.
 7. **A microVM image without a vendor's turn**: step 17's Shards slice ("Without a vendor's turn",
    above).
-8. **A harness that ran a process on the host and ended it between two looks**: no step owns it yet. The
-   looks see the harness itself, a process of the whole session, and the kernel line is the harness's
-   own shell's word on where it ran. kiln's own record of what it started for a session would close
-   this.
+8. **A harness that ran on the host and ended between two looks**: step 17's `/starts`, kiln's record
+   of each start of the session's harness, every one kept, which `check_starts` reads: a start on the
+   host is found whenever it ran.

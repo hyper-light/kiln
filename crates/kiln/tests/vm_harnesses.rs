@@ -96,15 +96,38 @@ mod checks {
 
     #[test]
     fn s34_kilns_mcp_rides_the_agent_control_links_own_lane() {
-        // Shards D254: the agent-control link's report names the mcp lane (dropping the lane's name
-        // from the check, or taking a link that listed no lanes, passes a red below).
-        let (carrier, lane) = MCP_LANE;
+        // Shards D254: the agent-control link's report names a member's mcp lane, as Shards names its
+        // lanes (`control::Granted::name`; dropping the lane's test from the check, or taking a link
+        // that listed no lanes, passes a red below).
+        let (carrier, _) = MCP_LANE;
         let with = |name: &str, lanes: Option<&[&str]>| vec![LinkSuites { name: name.into(), client: None, server: None, lanes: lanes.map(|l| l.iter().map(|n| (*n).to_owned()).collect()) }];
-        assert_eq!(check_mcp_lane(&with(carrier, Some(&["control", lane]))), Ok(()));
-        assert!(check_mcp_lane(&with(carrier, Some(&["control", "terminal"]))).is_err_and(|e| e.contains("none is mcp")));
+        assert_eq!(check_mcp_lane(&with(carrier, Some(&["control", "stdin:0", "stdout:0", "stderr:0", "exec", "mcp:0"]))), Ok(()));
+        assert!(check_mcp_lane(&with(carrier, Some(&["control", "stdin:0", "exec"]))).is_err_and(|e| e.contains("none is a mcp:")));
+        assert!(check_mcp_lane(&with(carrier, Some(&["control", "mcp"]))).is_err(), "no lane Shards names");
         assert!(check_mcp_lane(&with(carrier, None)).is_err_and(|e| e.contains("no lanes")));
-        assert!(check_mcp_lane(&with("mcp", Some(&[lane]))).is_err_and(|e| e.contains(carrier)), "a lane on a link of its own isn't agent control's");
+        assert!(check_mcp_lane(&with("mcp", Some(&["mcp:0"]))).is_err_and(|e| e.contains(carrier)), "a lane on a link of its own isn't agent control's");
         assert!(check_mcp_lane(&[]).is_err());
+    }
+
+    #[test]
+    fn s34_kiln_says_the_session_holds_no_host_process_and_started_it_in_microvms_alone() {
+        // kiln plan step 17's `runs` and `starts` on the session (dropping the host_pid test, or
+        // checking only the last start, passes a red below).
+        let at = |runs: serde_json::Value| json!({"runs": runs, "starts": [{"at": 1, "runs": {"in": "microvm", "vm": "a", "host_pid": null}}, {"at": 2, "runs": {"in": "microvm", "vm": "b", "host_pid": null}}]});
+        let vm = at(json!({"in": "microvm", "vm": "b", "image": "harness-claude@sha256:00", "host_pid": null}));
+        assert_eq!(check_no_host_pid(&vm), Ok(()));
+        assert_eq!(check_starts(&vm), Ok(()));
+        assert!(check_no_host_pid(&at(json!({"in": "microvm", "vm": "b", "host_pid": 4242}))).is_err_and(|e| e.contains("4242")));
+        assert!(check_no_host_pid(&at(json!({"in": "microvm", "vm": "b"}))).is_err(), "host_pid not said");
+        assert!(check_no_host_pid(&at(json!({"in": "host", "pid": 4242}))).is_err_and(|e| e.contains("host")));
+        assert!(check_no_host_pid(&json!({})).is_err());
+        let mut on_host_once = vm;
+        if let Some(first) = on_host_once.pointer_mut("/starts/0/runs") {
+            *first = json!({"in": "host", "pid": 4242});
+        }
+        assert!(check_starts(&on_host_once).is_err_and(|e| e.contains("4242")), "a start on the host before a microVM's");
+        assert!(check_starts(&json!({"starts": []})).is_err());
+        assert!(check_starts(&json!({})).is_err());
     }
 
     #[test]

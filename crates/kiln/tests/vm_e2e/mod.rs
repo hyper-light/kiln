@@ -47,8 +47,9 @@ pub const REQUIRED_LINKS: [&str; 4] = ["server-runner", "kiln-hex", "agent-contr
 
 /// kiln's MCP from inside a microVM: a lane of the agent-control link's own (the person and ROOT,
 /// 2026-11-13; Shards D254), so its suite is that link's and no network grant reaches kiln for it
-/// ([`grants_to_kiln`]).
-pub const MCP_LANE: (&str, &str) = ("agent-control", "mcp");
+/// ([`grants_to_kiln`]). Shards names a member's MCP lane `mcp:<member>` (`control::Granted::name`), as
+/// the session's `/runs/control/lanes` lists it (kiln plan step 17).
+pub const MCP_LANE: (&str, &str) = ("agent-control", "mcp:");
 
 /// The ten harnesses of kiln plan steps 19 to 29, by kiln's ids (`harness::kinds::Kind`).
 pub const KINDS: [&str; 10] = ["claude", "codex", "gemini", "opencode", "goose", "amp", "devin", "antigravity", "cursor", "pi"];
@@ -162,10 +163,10 @@ pub fn lanes_at(body: &Value, pointer: &str) -> Option<Vec<String>> {
 /// Ok when the link that carries kiln's MCP from inside reported its lane ([`MCP_LANE`]).
 pub fn check_mcp_lane(links: &[LinkSuites]) -> Result<(), String> {
     let (carrier, lane) = MCP_LANE;
-    let link = links.iter().find(|l| l.name == carrier).ok_or_else(|| format!("no {carrier} link was read, which carries kiln's MCP as its {lane} lane (Shards D254)"))?;
+    let link = links.iter().find(|l| l.name == carrier).ok_or_else(|| format!("no {carrier} link was read, which carries kiln's MCP as a {lane}<member> lane (Shards D254)"))?;
     match &link.lanes {
-        Some(lanes) if lanes.iter().any(|l| l == lane) => Ok(()),
-        Some(lanes) => Err(format!("the {carrier} link's lanes are {lanes:?}: none is {lane}, on which kiln's MCP rides it (Shards D254)")),
+        Some(lanes) if lanes.iter().any(|l| l.starts_with(lane)) => Ok(()),
+        Some(lanes) => Err(format!("the {carrier} link's lanes are {lanes:?}: none is a {lane}<member> lane, on which kiln's MCP rides it (Shards D254)")),
         None => Err(format!("the {carrier} link's report listed no lanes: name where in VM_E2E_LINKS (tests/vm_e2e/README.md)")),
     }
 }
@@ -451,6 +452,30 @@ pub fn check_in_guest(said: Option<&Where>, host_os: &str, host_boot: Option<&st
         }
     }
     Ok(())
+}
+
+/// Ok when kiln says the session runs in a microVM and holds no process of the host: its `runs`
+/// (kiln plan step 17) says `in` "microvm" and its `host_pid` null.
+pub fn check_no_host_pid(info: &Value) -> Result<(), String> {
+    match (info.pointer("/runs/in").and_then(Value::as_str), info.pointer("/runs/host_pid")) {
+        (Some("microvm"), Some(Value::Null)) => Ok(()),
+        (Some("microvm"), Some(pid)) => Err(format!("kiln says the session holds the host's process {pid}")),
+        (Some("microvm"), None) => Err("kiln doesn't say whether the session holds a process of the host (runs.host_pid)".to_owned()),
+        (other, _) => Err(format!("kiln says the session runs in {}, not a microVM (runs.in)", other.unwrap_or("nothing it names"))),
+    }
+}
+
+/// Ok when kiln's record of each start of the session's harness (`starts`, kiln plan step 17) says
+/// every one ran in a microVM, so one that ran on the host and ended between two looks is found.
+pub fn check_starts(info: &Value) -> Result<(), String> {
+    let starts = info.get("starts").and_then(Value::as_array).ok_or("kiln keeps no record of the session's starts (starts)")?;
+    if starts.is_empty() {
+        return Err("kiln recorded no start of the session's harness".to_owned());
+    }
+    match starts.iter().find(|s| s.pointer("/runs/in").and_then(Value::as_str) != Some("microvm")) {
+        Some(s) => Err(format!("kiln started the session's harness outside a microVM: {s}")),
+        None => Ok(()),
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -910,8 +935,13 @@ pub struct Drove {
     /// The agent it started from where it ran, as kiln listed it, and the audit trail's rows on it.
     pub child: Option<Value>,
     pub audit: Vec<Value>,
-    /// The session that took its conversation up again once it was ended.
+    /// kiln's word on the first session just before it was stopped: where it ran and each start
+    /// (`runs`, `starts`).
+    pub last: Value,
+    /// The session that took its conversation up again once it was ended, and kiln's word on it
+    /// after its turn.
     pub resumed: String,
+    pub resumed_info: Value,
     /// The host's harness processes under the runner, looked at between the steps.
     pub inventory: Inventory,
 }
@@ -1008,17 +1038,19 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     }
 
     // Stop: ended for good.
-    let hs = info(f, &id)?.get("harness_session").and_then(Value::as_str).map(str::to_owned);
+    let last = info(f, &id)?;
+    let hs = last.get("harness_session").and_then(Value::as_str).map(str::to_owned);
     stop(f, &id)?;
 
     // Resume: a new session takes its conversation up again, its harness's own session.
     let hs = hs.ok_or_else(|| anyhow::anyhow!("{kind}: kiln knows no harness session of {id} to take up again"))?;
     let resumed = open(f, &ask.spec(&ask.resumed, Some(&hs)))?;
-    let (i, _) = until(f, &resumed, turn_within(), &format!("{kind} taking its conversation up again"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
+    let (resumed_info, _) = until(f, &resumed, turn_within(), &format!("{kind} taking its conversation up again"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
     look(&mut inventory)?;
-    anyhow::ensure!(i.get("harness_session").and_then(Value::as_str) == Some(hs.as_str()), "{kind}: the resumed session's harness session is {}, not {hs}", i.get("harness_session").unwrap_or(&Value::Null));
+    let took_up = resumed_info.get("harness_session").unwrap_or(&Value::Null);
+    anyhow::ensure!(took_up.as_str() == Some(hs.as_str()), "{kind}: the resumed session's harness session is {took_up}, not {hs}");
     stop(f, &resumed)?;
-    Ok(Drove { id, info: first_info, first, events, links, child, audit, resumed, inventory })
+    Ok(Drove { id, info: first_info, first, events, links, child, audit, last, resumed, resumed_info, inventory })
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1140,7 +1172,7 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
         return Ok(());
     }
     let to_kiln = grants_to_kiln(&agentfile_of(f, image)?, &kiln_ports(f)).map_err(|e| anyhow::anyhow!("{image}: {e}"))?;
-    anyhow::ensure!(to_kiln.is_empty(), "{kind} from {image}: its image grants a way to kiln past the agent-control link's {} lane (Shards D254): {to_kiln:?}", MCP_LANE.1);
+    anyhow::ensure!(to_kiln.is_empty(), "{kind} from {image}: its image grants a way to kiln past the agent-control link's {}<member> lane (Shards D254): {to_kiln:?}", MCP_LANE.1);
     let marker = std::env::var("VM_E2E_DONE_MARKER").unwrap_or_else(|_| STUB_DONE.to_owned());
     let probe = probe_name();
     let prompt = task("VM_E2E_PROMPT", kind, &probe, stub_prompt(kind, mcp, child, &probe));
@@ -1177,6 +1209,10 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
     anyhow::ensure!(d.inventory.looks > 0, "{what}: the host's processes were never looked at (VM_E2E_RUNNER_PID names ROOT's runner)");
     anyhow::ensure!(d.inventory.seen.is_empty(), "{what}: these ran on the host, outside its microVM: {:?}", d.inventory.seen);
     check_in_guest(where_said(&d.first).as_ref(), std::env::consts::OS, host_boot_id().as_deref()).map_err(fail)?;
+    // kiln's own word: no process of the host held, and every start of its harness in a microVM.
+    for (which, said) in [("its session", &d.last), ("its resumed session", &d.resumed_info)] {
+        check_no_host_pid(said).and_then(|()| check_starts(said)).map_err(|e| fail(format!("{which}: {e}")))?;
+    }
     check_all_links(&d.links).map_err(fail)?;
     Ok(())
 }
@@ -1245,5 +1281,6 @@ pub fn on_host(kind: &str, mcp: bool) -> anyhow::Result<()> {
     let said_where = where_said(&d.first);
     anyhow::ensure!(check_in_guest(said_where.as_ref(), std::env::consts::OS, host_boot_id().as_deref()).is_err(), "{kind}: the kernel check took the host's for a guest's: {said_where:?}");
     anyhow::ensure!(check_all_links(&d.links).is_err(), "{kind}: links read where there are none");
+    anyhow::ensure!(check_no_host_pid(&d.last).is_err() && check_starts(&d.last).is_err(), "{kind}: kiln says a session on the host ran in a microVM: {}", d.last.get("runs").unwrap_or(&Value::Null));
     Ok(())
 }
