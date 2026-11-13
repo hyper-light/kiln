@@ -1905,11 +1905,15 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R23 Preferences** (opt-in: only when a rule or the job declares them): weighted terms over
   facts (`higher`/`lower`), labels, pools, `affinity: { job: <id> }` (the runner that ran that
   job's leg last, for warm caches), `spread: host`. Score = Σ weight × term (each term
-  normalized to 0..1 across the eligible set). Ties break by the most headroom left by the
-  runners' live samples (W05-R03: the larger of the CPUs' and the memory's share in use after the
-  leg, I/O pressure on top, the lowest; runners without a fresh sample after those), then least
-  loaded, then most free capacity, then name. **Without preferences** the choice is the most
-  headroom left, then least loaded, then most free slots.
+  normalized to 0..1 across the eligible set). Ties break in the load balancer's order
+  (docs/lb.md "The CI engine"). **Without preferences** the choice is the load balancer's: of the
+  runners that take the leg now, the one where it's expected to finish soonest, from what its
+  kind's runs taught (its CPU time on the reference core, the most cores it kept busy, its bytes)
+  and each runner's room (its slots' or capacity's, and by its live sample what it can take within
+  its target use, less the time its tasks all stalled, W05-R03) and measured speed; with nothing
+  taught, the most free cores at their speed. Between runners it can't tell apart, the one where
+  the leg's kind of work (its job and matrix in its repository's workflow) last went well, quickly
+  as well as correctly, else the next in turn. Legs ready together go critical path first.
 - **W05-R24 Unroutable legs.** When no runner kiln has ever seen, and no pool, could satisfy a
   leg, it waits with reason `unroutable` and the failing requirements, or fails after
   `[ci.routing] unroutable_timeout` if one is set.
@@ -2114,7 +2118,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   first member's: a member queued while others wait joins their class, and a promotion (W05-R31)
   takes them all. When its turn comes it's granted whole, in one input: each member on a runner
   that would take it with room for it beside the members put there before it (members may share
-  a runner), as the reservations there let it, the least loaded first, then by name, the members
+  a runner), as the reservations there let it, in the load balancer's rank (the most whole cores
+  free with the members put there before it, docs/lb.md "The CI engine"), then by name, the members
   before it put elsewhere where one has no room (at most 4,096 places tried). When no way is
   found, none starts; with backfilling (W05-R39) a gang with no way by room alone (the room kept
   for others aside, as a leg's) keeps room for each member on the runner where its room frees

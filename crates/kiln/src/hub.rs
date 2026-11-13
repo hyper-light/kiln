@@ -811,6 +811,9 @@ pub struct Hub {
     /// The placement kernel for CI legs, the server their owner (docs/lb.md, "Adopted"; W05-R23):
     /// an ordinary leg's pick from the runners' kernel words, before the engine's own.
     legs: parking_lot::Mutex<legs::Legs>,
+    /// What runners' connections say to `legs` between the scheduling loop's looks (docs/lb.md "At
+    /// scale"): taken in by that loop alone, so the kernel's records stay in its core's cache.
+    legs_mail: parking_lot::Mutex<legs::Mail>,
     session_place_req: AtomicU64,
     /// The git repositories each machine holds, as it last said (`crate::sync::places`).
     pub places: crate::sync::places::Places,
@@ -1000,6 +1003,7 @@ impl Hub {
             topo: parking_lot::Mutex::default(),
             session_places: parking_lot::Mutex::default(),
             legs: parking_lot::Mutex::new(fast_legs),
+            legs_mail: parking_lot::Mutex::new(legs::Mail::default()),
             session_place_req: AtomicU64::new(1),
             places,
             tasks,
@@ -3482,7 +3486,7 @@ impl Hub {
                 }
             }
             // Its runner's admission took it: its room is in that runner's words from now.
-            AgentMsg::JobStarted { job } => self.legs.lock().heard(&job),
+            AgentMsg::JobStarted { job } => self.legs_mail.lock().heard(&job),
             AgentMsg::Sample(s) => {
                 self.change_agent(&agent, |a| {
                     a.sample = Some(s.clone());
@@ -3672,7 +3676,12 @@ impl Hub {
             AgentMsg::Offers { json } => {
                 if let Some(room) = crate::offers::heard(self, &agent, &json) {
                     if let Some(w) = &room.fast {
-                        self.legs.lock().hint(&agent, w);
+                        // Into the kernel's mail: the scheduling loop takes it in as it looks.
+                        let pace = self.legs_mail.lock().word(&agent, w);
+                        // Its pace, when it changed, to the CI engine's load balancer too.
+                        if let Some(pace) = pace {
+                            self.ci.send(crate::ci::dispatch::Msg::RunnerPace { agent: String::from(&*agent), pace });
+                        }
                     }
                     self.pass_room_on(peer, &room).await;
                 }
@@ -4802,7 +4811,7 @@ impl Hub {
     }
 
     pub(crate) fn release_slot(&self, agent: &str, job: &str) {
-        self.legs.lock().heard(job);
+        self.legs_mail.lock().heard(job);
         let what = crate::instances::Owned::Job(job.to_owned());
         self.instances.update(|i| i.disown(&what));
         self.change_agent(agent, |a| {
@@ -5159,6 +5168,12 @@ impl Hub {
 
     /// One look at the queue: each waiting job placed where it fits. Whether jobs were waiting as it looked.
     async fn schedule_once(&self) -> anyhow::Result<bool> {
+        // What runners' connections said since the last look, taken in by this loop alone (docs/lb.md
+        // "At scale"): its picks see each runner's newest word.
+        let mail = self.legs_mail.lock().take();
+        if !mail.is_empty() {
+            self.legs.lock().apply(mail);
+        }
         // The waiting jobs, how many run, and the waiting jobs' runs, as one read saw them (the DB query
         // audit, 2026-11-06: where it read the first two apart and then each run on its own).
         let crate::store::Scheduling { queued, running, runs } = self.store.scheduling(2000).await?;
@@ -7921,10 +7936,11 @@ pub(crate) mod tests {
         assert_eq!(v1_best([V1Candidate { name: "quiet", ..cand(&quiet) }], &asked, 0.85), Some("quiet"));
     }
 
-    /// The scheduler's headroom (W05, step 3): one rule places a CI leg, a v1 job and a command
-    /// alike. On one fleet (a at 80% of its CPUs, b at 30%, c at 10% with its disk under pressure),
-    /// asking 4 CPUs and 2 GiB: a would pass the target use, c's disk counts against it, and the
-    /// engine, the v1 dispatcher and kiln run's ranking all pick b.
+    /// The scheduler's headroom (W05, step 3): a CI leg, a v1 job and a command weigh one runner's
+    /// sample alike (the engine through its load balancer's rank, docs/lb.md "The CI engine"). On
+    /// one fleet (a at 80% of its CPUs, b at 30%, c at 10% with its disk under pressure), asking 4
+    /// CPUs and 2 GiB: a would pass the target use, c's stalls count against it, and the engine,
+    /// the v1 dispatcher and kiln run's ranking all pick b.
     #[test]
     fn one_headroom_rule_places_a_leg_a_v1_job_and_a_command_alike() -> anyhow::Result<()> {
         use kiln_ci::sched::routing::{LegRoute, RunnerView};
