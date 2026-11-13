@@ -253,7 +253,7 @@ from the UI), and step 34's own (kiln plan steps 16, 17, 18 and 33 and the links
 
 #### Linux x86_64 (KVM: adacachy, or adacachy2 through kiln run)
 
-With step 34's exports (`VM_E2E`, `VM_E2E_LINKS`, ROOT's server, the five task words, `VM_E2E_PROJECT`):
+With step 34's exports, every variable its "Variables" table lists (the runner's log among them, where the drive reads each MCP call over the lane):
 
 ```sh
 nice -n 10 cargo test -p kiln --test vm_harnesses step35::rest:: -- --nocapture --test-threads 1
