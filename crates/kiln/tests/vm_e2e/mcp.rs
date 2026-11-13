@@ -4,18 +4,22 @@
 //! `agents_start` taking the conversation up again (`resume`), as a person's or an agent's MCP client
 //! drives them. A part of `step35.rs`.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::vm_e2e::{self, Fixture};
 
+/// How long a tool's answer is waited for: as step 34's drive waits for the same server work over REST
+/// (`vm_e2e::open`, `command`, `stop`), longer than the server waits for its runner's answer
+/// (`kiln::hub::COMMAND_WITHIN`), so kiln's own refusal arrives before the client gives up.
+const ANSWERED_WITHIN: Duration = Duration::from_secs(75);
+
 /// One of kiln's MCP tools called as its server's client calls it (`tools/call` on `/api/mcp`), with
-/// the fixture's token, waited on as long as kiln lets a call take (`reach::mcp::call_most`): its
-/// answer, or what it said when it failed.
+/// the fixture's token, waited on for [`ANSWERED_WITHIN`]: its answer, or what it said when it failed.
 pub fn call(f: &Fixture, tool: &str, arguments: Value) -> anyhow::Result<Value> {
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}});
-    let (code, text) = crate::common::http_within(f.port, "POST", "/api/mcp", &f.admin, Some(&body), kiln::reach::mcp::call_most())?;
+    let (code, text) = crate::common::http_within(f.port, "POST", "/api/mcp", &f.admin, Some(&body), ANSWERED_WITHIN)?;
     anyhow::ensure!(code == 200, "{tool}: {code} {text}");
     let v: Value = serde_json::from_str(&text)?;
     let said = v.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default();
