@@ -195,34 +195,91 @@ fn add(a: &AtomicU64, v: u64) {
     a.store(a.load(Relaxed).saturating_add(v), Relaxed);
 }
 
-/// What a connection's writes cost a byte: what a write's bytes are held to within what's left of its poll's quantum
-/// ([`Writes::fitting`]).
+/// Format: the sizes [`Writes`] keeps apart, by the power of two a write's bytes fall in: 1 byte to 2 GiB, a longer write the
+/// last's.
+const CLASSES: usize = 32;
+
+/// What a connection's writes cost a byte, by their size: what a write's bytes are held to within what's left of its poll's
+/// quantum ([`Writes::fitting`]). Each power of two a write's bytes fall in keeps the dearest a byte of its writes cost, this
+/// window and the last (a window: as many writes of that size as the runtime's probes keep, `MIN_SAMPLES`), so what a write
+/// costs whatever it carries (its call) is in each size's as it is in each write: within a size a write's bytes are at most
+/// twice another's, its call shared by half as many at the most. Goal 9, plan 01a1a87b2cec step 3: kept as one cost a byte,
+/// every byte reckoned at the dearest any byte cost, a write's call spread over a few bytes held every write to the bytes
+/// that call allowed: about a hundred in a poll's whole quantum, written a hundred at a time (kiln's lab on Linux after
+/// train 65: 900 polls a second writing to their room's end, a write of 125 bytes with 225 µs left).
 #[derive(Debug)]
 pub struct Writes {
-    bytes: Costs,
+    sizes: [Size; CLASSES],
+}
+
+/// One size's writes: the dearest a byte cost this window and the last (f64 bits; 0: none), and its writes this window.
+#[derive(Debug)]
+struct Size {
+    now: AtomicU64,
+    last: AtomicU64,
+    writes: AtomicU64,
 }
 
 impl Writes {
     /// A [`Writes`] with nothing learned.
     pub const fn nothing_yet() -> Self {
-        Self { bytes: Costs::nothing_yet() }
+        Self { sizes: [const { Size { now: AtomicU64::new(0), last: AtomicU64::new(0), writes: AtomicU64::new(0) } }; CLASSES] }
     }
 
     /// A write of `len` bytes took `took` nanoseconds.
     pub fn learn(&self, len: u64, took: u64) {
-        self.bytes.learn(len, took);
+        let Some(s) = self.sizes.get(size_of_write(len)) else { return };
+        let rate = took.max(1) as f64 / len.max(1) as f64;
+        if rate > f64::from_bits(s.now.load(Relaxed)) {
+            s.now.store(rate.to_bits(), Relaxed);
+        }
+        let writes = s.writes.load(Relaxed).saturating_add(1);
+        if writes >= hyper_rt::machine::bench::MIN_SAMPLES as u64 {
+            s.last.store(s.now.load(Relaxed), Relaxed);
+            s.now.store(0, Relaxed);
+            s.writes.store(0, Relaxed);
+        } else {
+            s.writes.store(writes, Relaxed);
+        }
+    }
+
+    /// The dearest a byte of size `class`'s writes cost, this window and the last: none where none was written.
+    fn dearest(&self, class: usize) -> Option<f64> {
+        let s = self.sizes.get(class)?;
+        Some(f64::from_bits(s.now.load(Relaxed)).max(f64::from_bits(s.last.load(Relaxed)))).filter(|r| *r > 0.0)
     }
 
     /// The most bytes a write may carry in `room` nanoseconds, what's left of its poll's quantum (negative: the poll is past
-    /// it by that, and none fits): those whose cost at the dearest its window holds ends within it ([`Costs::fit`], nothing
-    /// put off). None until a write was timed: the first goes whole, and teaches. A write isn't let run past its poll's
-    /// quantum by what coming back to write the rest is expected to cost (goal 9, plan 01a1a87b2cec step 3: that held the
-    /// shard past the quantum by as much, and coming back was learned on the clock, the host's preemption and a core clocked
-    /// down in it: probe 17 on the M3, its clocks kept up, saw 256 KiB written in 99 µs with 4 µs of its poll's quantum left,
-    /// held to 18.7 MB).
+    /// it by that, and none fits): the most whose cost a byte at the dearest a write of that size has cost ends within it,
+    /// the biggest size that fits. Where a size wasn't written, at the dearest of the nearest smaller size that was (a byte of
+    /// a longer write costs no more), else of the smallest that was: a shorter write than any written yet is reckoned as
+    /// those are, short by at most its call, and teaches its size. None until a write was timed: the first goes whole, and
+    /// teaches. A write isn't let run past its poll's quantum by what coming back to write the rest is expected to cost (goal
+    /// 9, plan 01a1a87b2cec step 3: probe 17 on the M3, its clocks kept up, saw 256 KiB written in 99 µs with 4 µs of its
+    /// poll's quantum left, held to 18.7 MB by that).
     pub fn fitting(&self, room: i64) -> Option<usize> {
-        self.bytes.fit(room, 0).map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+        let smallest = (0..CLASSES).find_map(|c| self.dearest(c))?;
+        if room <= 0 {
+            return Some(0);
+        }
+        let mut rate = smallest;
+        let mut fits = 0usize;
+        for class in 0..CLASSES {
+            rate = self.dearest(class).unwrap_or(rate);
+            // The bytes that fit at this size's rate, where they're as many as a write of this size carries at least.
+            let n = (room as f64 / rate) as u64;
+            if n >= 1u64 << class {
+                let most = if class + 1 == CLASSES { u64::MAX } else { (2u64 << class) - 1 };
+                fits = usize::try_from(n.min(most)).unwrap_or(usize::MAX);
+            }
+        }
+        Some(fits)
     }
+}
+
+/// The size a write of `len` bytes is kept as: the power of two its bytes fall in, the last size taking what's past it.
+fn size_of_write(len: u64) -> usize {
+    usize::try_from(63 - len.max(1).leading_zeros()).map_or(CLASSES - 1, |p| p.min(CLASSES - 1))
 }
 
 thread_local! {
@@ -277,6 +334,28 @@ mod tests {
         let w = Writes::nothing_yet();
         w.learn(64 << 10, 131_072);
         assert_eq!((w.fitting(3_000), w.fitting(0), w.fitting(-2_000)), (Some(1_500), Some(0), Some(0)));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what a write costs whatever it carries (its call) doesn't hold every write to the
+    /// bytes it allows: a long write is sized by what long writes cost a byte. Do: writes of 100 bytes at 5 µs (their call:
+    /// 50 ns a byte), and of 256 KiB at 50 µs (0.19 ns a byte). Expect: a 200 µs room fits a megabyte (at 0.19 ns a byte),
+    /// where one cost a byte for every write held it to 4,000 bytes; 3 µs fits no 100-byte write. And a size's dearest is
+    /// forgotten two windows after its last: a slow write (preempted) holds its size back that long.
+    #[test]
+    fn g9_s3_a_writes_call_doesnt_hold_long_writes_to_what_short_ones_cost_a_byte() {
+        let w = Writes::nothing_yet();
+        for _ in 0..10 {
+            w.learn(100, 5_000);
+            w.learn(256 << 10, 50_000);
+        }
+        assert_eq!(w.fitting(200_000), Some(1 << 20), "200 µs at 0.19 ns a byte");
+        assert!(w.fitting(3_000).is_some_and(|n| n < 100), "a 100-byte write takes 5 µs: {:?}", w.fitting(3_000));
+        w.learn(256 << 10, 5_000_000);
+        assert!(w.fitting(200_000).is_some_and(|n| n < 256 << 10), "a write of 256 KiB took 5 ms: {:?}", w.fitting(200_000));
+        for _ in 0..2 * hyper_rt::machine::bench::MIN_SAMPLES {
+            w.learn(256 << 10, 50_000);
+        }
+        assert_eq!(w.fitting(200_000), Some(1 << 20), "the slow one forgotten");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: no gain is picked; the sketch forgets by halving each window. Do: a window of jobs
