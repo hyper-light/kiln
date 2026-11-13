@@ -343,7 +343,7 @@ mod tests {
     fn s17_an_instances_homes_are_adopted_into_kilns_state_and_none_is_dropped() -> anyhow::Result<()> {
         let state = tempfile::tempdir()?;
         let old = crate::upgrade::instance_dir(state.path(), "a").join(super::HOMES);
-        for (person, harness) in [("owner", "claude"), ("user:u1", "goose")] {
+        for (person, harness) in [("owner", "claude"), ("user-u1", "goose")] {
             let d = old.join(person).join(harness);
             std::fs::create_dir_all(&d)?;
             std::fs::write(d.join("kept.txt"), format!("{person} {harness}"))?;
@@ -353,12 +353,12 @@ mod tests {
         std::fs::write(taken.join("kept.txt"), "kiln's own")?;
         let mut said = adopt(state.path());
         said.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-        let moved_to = root(state.path()).join("user:u1").join("goose");
+        let moved_to = root(state.path()).join("user-u1").join("goose");
         assert_eq!(
             said,
             [
                 Adopted::Kept { from: old.join("owner").join("claude"), to: taken.clone() },
-                Adopted::Moved { from: old.join("user:u1").join("goose"), to: moved_to.clone() },
+                Adopted::Moved { from: old.join("user-u1").join("goose"), to: moved_to.clone() },
             ]
         );
         assert_eq!(std::fs::read_to_string(moved_to.join("kept.txt"))?, "user:u1 goose");

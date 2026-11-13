@@ -7053,13 +7053,13 @@ mod tests {
             anyhow::ensure!(found.as_deref().ok() == Some("kept\n"), "instance b keeps volumes at {}, and doesn't find instance a's: {found:?}", homes.display());
             drop(b);
             // One an older kiln's instance kept in its own folder is moved to where the next one keeps them.
-            let older = crate::upgrade::instance_dir(state.path(), "a").join("homes").join("user:u1").join("goose");
+            let older = crate::upgrade::instance_dir(state.path(), "a").join("homes").join("user-u1").join("goose");
             std::fs::create_dir_all(&older)?;
             std::fs::write(older.join("config.yaml"), "GOOSE_PROVIDER: anthropic\n")?;
             let (tx, _rx) = async_channel::unbounded();
             let c = harness_host(tx, state.path(), &crate::upgrade::instance_dir(state.path(), "c"), Limits::default());
             let homes = c.homes().ok_or_else(|| anyhow::anyhow!("instance c keeps no volumes"))?;
-            anyhow::ensure!(std::fs::read_to_string(homes.join("user:u1").join("goose").join("config.yaml")).is_ok(), "an older instance's volume wasn't adopted into {}", homes.display());
+            anyhow::ensure!(std::fs::read_to_string(homes.join("user-u1").join("goose").join("config.yaml")).is_ok(), "an older instance's volume wasn't adopted into {}", homes.display());
             anyhow::ensure!(!older.exists(), "{} was copied, not moved", older.display());
             Ok(())
         })
