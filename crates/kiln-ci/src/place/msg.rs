@@ -160,8 +160,10 @@ pub enum ToOwner {
     Never { run: String, why: String },
     /// Your take of claim `fence` holds: its room is yours until you start the run or go away.
     Held { run: String, fence: Fence },
-    /// Claim `fence` isn't yours any more (the offer wasn't taken in time, or this runner started
-    /// again): the run wasn't started under it. It waits here again if you still want it.
+    /// Claim `fence` isn't yours any more (the offer wasn't taken in time, this runner started
+    /// again, or its machine's capacity keeper isn't synced, so no reserve for it can be said, or
+    /// didn't grant its reserve): the run wasn't started under it. It waits here again if you still
+    /// want it.
     Lapsed { run: String, fence: Fence, why: String },
     /// Its process started here, under claim `fence`: the runner's word, and the only one on
     /// which its owner tells its asker that it started.
@@ -492,6 +494,12 @@ pub enum Reason {
     /// (AUDIT L2: its work volume ran full, a run was killed for memory, a tool wasn't found, its
     /// device's errors rose; `cause` as `sense::health` names it, `why` in words). Appended.
     Barred { cause: String, why: String },
+    /// The runner's machine has a capacity keeper (Hex's node keeps its room, kiln's runs hold room
+    /// there through it: docs/lb.md "A machine's keeper") and the runner holds no synced session
+    /// with it (`why`): it takes nothing new there until it does (Hex's capacity-view.md CV11).
+    /// Appended: an owner from before reads it as `Strained` where it reads health's words, else as
+    /// `Draining`.
+    Unsynced { why: String },
 }
 
 impl Reason {
@@ -507,6 +515,7 @@ impl Reason {
             Reason::Away => (5, None),
             Reason::Strained { .. } => (6, None),
             Reason::Barred { .. } => (7, None),
+            Reason::Unsynced { .. } => (8, None),
         }
     }
 }
