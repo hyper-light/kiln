@@ -395,13 +395,13 @@ impl Disks {
     }
 }
 
-/// Memory the machine has free for new work, in bytes: MemAvailable on Linux, on macOS what it
-/// counts as available itself (free and inactive pages alone said 37 GB were when a Mac's memory ran
-/// out, on 2026-11-05), what the system says is available elsewhere.
+/// Memory the machine has free for new work, in bytes: MemAvailable on Linux; on macOS the room its
+/// runner's sample and facts read ([`mac_free`]), so this guard holds work where the balancer sees no
+/// room; what the system says is available elsewhere.
 fn mem_free() -> f64 {
     #[cfg(target_os = "macos")]
-    if let Some(free) = crate::os::contain::memory_free() {
-        return free;
+    if let Some((pages, page)) = crate::os::sense::memory_pages() {
+        return mac_free(&pages, page);
     }
     std::fs::read_to_string("/proc/meminfo")
         .ok()
@@ -414,6 +414,17 @@ fn mem_free() -> f64 {
             },
             |kib| kib * 1024.0,
         )
+}
+
+/// A Mac's memory free for new work, read from its pages as its runner's sample and facts read them
+/// ([`kiln_ci::facts::VmPages::room`]: its free pages and the inactive ones beyond what its compressor
+/// holds; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32). This guard read `kern.memorystatus_level`
+/// of `hw.memsize` before, which counts pages in use as XNU's available memory does: 79 % of a Mac
+/// with 37 GB of swap in use (2026-11-13). Free and inactive pages alone, before that, said 37 GB
+/// were free when a Mac's memory ran out (2026-11-05).
+#[cfg(any(target_os = "macos", test))]
+fn mac_free(pages: &kiln_ci::facts::VmPages, page: u64) -> f64 {
+    pages.room(page) as f64
 }
 
 /// A group as the engine knows it: an agent session by its id (as it waits and is let in), anything
@@ -766,5 +777,25 @@ pub(crate) mod tests {
             assert!(d.rate().is_some_and(|(r, idle)| r >= 0.0 && idle.is_none_or(|i| (0.0..=1_000.0).contains(&i))));
             assert!(mem_free() > 0.0);
         }
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32 (ROOT, 2026-11-13): this guard reads a Mac's
+    /// free memory as the balancer does, here from the Macs recorded for `kiln_ci::facts`' test: the
+    /// two swapping ones their free pages alone, the others their free pages and the inactive ones
+    /// beyond what their compressor holds. Before, it read `kern.memorystatus_level` of `hw.memsize`,
+    /// which counts their active, inactive and free pages: 78.3 % of the recorded 06:55Z Mac's (the
+    /// kernel said 79), 69.1 % of the desktop's (70) and 86.6 % of the idle Mac's (87).
+    #[test]
+    fn step32_the_guard_reads_a_macs_free_memory_as_the_balancer_does() {
+        use kiln_ci::facts::VmPages;
+        let page = 16_384;
+        let swapping = VmPages { free: 3_805, active: 769_543, inactive: 750_125, compressor: 2_309_113 };
+        let crowded = VmPages { free: 3_971 + 31_637, active: 442_304, inactive: 408_933, compressor: 1_287_005 };
+        let after = VmPages { free: 539_938 + 696_358, active: 1_266_849, inactive: 782_394, compressor: 564_488 };
+        let desktop = VmPages { free: 337_310 + 472_318, active: 2_731_319, inactive: 2_259_298, compressor: 2_028_728 };
+        let idle = VmPages { free: 563_065 + 132_218, active: 719_425, inactive: 628_564, compressor: 95_903 };
+        let read = [swapping, crowded, after, desktop, idle].map(|mac| mac_free(&mac, page));
+        assert_eq!(read, [3_805, 35_608, 1_454_202, 1_040_198, 1_227_944].map(|pages: u64| (pages * page) as f64));
+        assert_eq!(read, [swapping, crowded, after, desktop, idle].map(|mac| mac.room(page) as f64), "the room the runner's sample and facts read");
     }
 }
