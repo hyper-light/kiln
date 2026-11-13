@@ -250,7 +250,7 @@ mod checks {
             assert!(refused(&text, kind, &harness_json)?.is_none(), "{kind}: {:?}\n{text}", refused(&text, kind, &harness_json)?);
             let simple = br#"{"entrypoint":"python3 /opt/vm-stub/stub","options":[]}"#;
             assert!(matches!(refused(&text, kind, simple)?, Some(Refusal::NoConfigVolume { .. })), "{kind}: a harness.json setting no HOME passed");
-            let off = String::from_utf8(harness_json.clone())?.replace("HOME=/home/stub", "HOME=/root");
+            let off = String::from_utf8(harness_json.clone())?.replace(&format!("HOME={STUB_HOME}"), "HOME=/root");
             assert!(matches!(refused(&text, kind, off.as_bytes())?, Some(Refusal::NoConfigVolume { .. })), "{kind}: a HOME off its volumes passed");
         }
         Ok(())
