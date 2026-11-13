@@ -1507,6 +1507,9 @@ mod tests{
                 }
             });
             let h=Arc::clone(&hub);crate::rt::spawn(async move{let _=super::super::registry::Registry::run_local(h).await;});
+            // The server's agent-mail child (server.rs): what goes to an agent as mail (the goal driver's words, W20's
+            // retained publications) is delivered by it, as in the server.
+            let h=Arc::clone(&hub);crate::rt::spawn(async move{let _=super::super::mail_delivery::run(h).await;});
             hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
             let dir=tempfile::tempdir()?;
             let(target,heard)=standing_in(&hub,dir.path()).await?;
