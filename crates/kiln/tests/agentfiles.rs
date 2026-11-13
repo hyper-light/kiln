@@ -163,6 +163,22 @@ fn step30_agentfiles_on_every_surface() -> anyhow::Result<()> {
     anyhow::ensure!(st == 200 && said == json!({ "deleted": true }), "{st} {said}");
     let (st, _) = call(&srv, &ada, "GET", &format!("/api/agentfiles/{id}/versions"), None)?;
     anyhow::ensure!(st == 404, "{st}");
+
+    // The live round trip (docs/research/s30-agentfiles/live.py, what ROOT runs against production)
+    // held to this server: each operation over REST and MCP, kept to its owner, Shards' refusal, and
+    // what it made taken back.
+    let harness = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/research/s30-agentfiles/live.py");
+    let out = Command::new("python3").arg(harness).env("KILN_URL", format!("http://127.0.0.1:{}", srv.port)).env("KILN_ADMIN_TOKEN", &srv.admin).output()?;
+    let said = String::from_utf8_lossy(&out.stdout);
+    print!("{said}");
+    let passed = |surface: &str| said.lines().filter(|l| l.starts_with(&format!("PASS {surface} "))).count();
+    anyhow::ensure!(
+        out.status.success() && !said.lines().any(|l| l.starts_with("FAIL ")) && passed("REST") > 0 && passed("MCP") > 0,
+        "live.py: {:?}\n{said}{}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+        srv.log()
+    );
     Ok(())
 }
 
