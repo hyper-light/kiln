@@ -212,8 +212,9 @@ fn cv3_a_run_asking_gpus_never_runs_where_a_keeper_is_known() -> Result<(), Stri
 
 /// CV11: a link to the keeper that drops while a run goes on leaves the run running, held in the
 /// keeper's books: the runner cordons its kernel and offers nothing new, so a run that ends there
-/// frees nothing for the run waiting; a newer process of the runner taking its place with the keeper
-/// tells the waiting run the new why.
+/// frees nothing for the run waiting. A newer process of the runner taking its place with the keeper
+/// changes why it takes nothing new, which it says from then; to the run already told it waits
+/// unsynced that is no news, as a strain's why moving isn't.
 #[test]
 fn cv11_unsynced_it_cordons_its_kernel_and_what_runs_goes_on() -> Result<(), String> {
     let mut a = runner(8, 16, 1000);
@@ -233,7 +234,8 @@ fn cv11_unsynced_it_cordons_its_kernel_and_what_runs_goes_on() -> Result<(), Str
     a.ended(O1, "r1", true, 5, &mut out);
     assert!(offer(&out, "r2").is_none(), "nothing new while unsynced: {out:?}");
     let news = said(&mut a, Keeper::Unsynced(Unsynced::Superseded), 6);
-    assert!(matches!(waiting(&news, "r2"), Some(Reason::Unsynced { why }) if why == Unsynced::Superseded.why()), "{news:?}");
+    assert!(news.is_empty(), "{news:?}");
+    assert!(matches!(a.taking(), Err(Reason::Unsynced { why }) if why == Unsynced::Superseded.why()));
     a.check()
 }
 

@@ -3068,9 +3068,9 @@ impl Admission {
             return;
         }
         self.begin(now, out);
-        // Whether it takes work, and why not, is news to every run waiting here; a view's room
-        // alone is told as a sample's is.
-        let news = self.keeper.unsynced() != keeper.unsynced();
+        // Whether it takes work is news to every run waiting here; why not is a reason's words,
+        // and a view's room is room, each told with the news as a strain's why and a sample are.
+        let news = self.keeper.unsynced().is_some() != keeper.unsynced().is_some();
         self.keeper = keeper;
         self.remeasure();
         self.admit(now, out);
