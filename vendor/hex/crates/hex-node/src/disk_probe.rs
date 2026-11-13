@@ -10,13 +10,14 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use hex_health::probe::DiskProbe;
 use hex_health::{HealthError, Level};
+use hex_wait::{Condvar, Mutex, MutexGuard};
 
 /// The record written each period: one byte, the least write that dirties a block, so the flush
 /// must write that block to the device (fdatasync(2)); nothing about the disk is assumed.
@@ -83,6 +84,9 @@ pub enum ProbeError {
     Health(#[from] HealthError),
     #[error("the disk probe's state lock was poisoned by a thread that panicked")]
     Poisoned,
+    /// The OS refused the prober's wait out its period (macOS's kqueue).
+    #[error("the disk probe's wait out its period: {0}")]
+    Wait(std::io::Error),
     #[error("the disk probe's thread could not start: {0}")]
     Spawn(std::io::Error),
     #[error("the disk probe's thread ended: {0}")]
@@ -250,7 +254,10 @@ fn probe_loop(
         let (stop, _) = shared
             .wake
             .wait_timeout_while(stop, period.saturating_sub(began.elapsed()), |s| !*s)
-            .map_err(|_| ProbeError::Poisoned)?;
+            .map_err(|why| match why {
+                hex_wait::Failed::Poisoned => ProbeError::Poisoned,
+                hex_wait::Failed::Os(why) => ProbeError::Wait(why),
+            })?;
         if *stop {
             return Ok(());
         }

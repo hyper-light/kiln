@@ -21,6 +21,8 @@
 pub const MAX_BOXES: usize = 65_536;
 
 pub mod devices;
+/// Firecracker runs only on Linux, under KVM: its configuration names that host's paths, and only its Linux node reads it.
+#[cfg(target_os = "linux")]
 pub mod firecracker;
 pub mod grants;
 pub mod guest;

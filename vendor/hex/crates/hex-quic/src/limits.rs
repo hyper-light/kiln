@@ -126,13 +126,36 @@ pub(crate) fn budget(limits: &Limits) -> Fixed {
     Fixed::new(capacity, usize::try_from(frames).unwrap_or(usize::MAX))
 }
 
-/// A connection's lanes on a client: what the process can bridge at once (docs/design/hex-quic.md Q8). On Unix each
-/// bridged connection is a socket pair of two descriptors, so half the soft `RLIMIT_NOFILE` (getrlimit(2)). On Windows
-/// each is a loopback TCP pair that holds two ports of the dynamic range (its listener's, which its accepted end keeps,
-/// and its connecting end's): half of the range's 16,384 ports, IANA's 49152-65535 (RFC 6335 §6), Windows' own since
-/// Vista (Microsoft KB 929851), not its handle table's 2^24, which no pair reaches. hyper-quic lays out a row for each
-/// lane a peer may open when a connection starts (quinn's `StreamsState::new`), so this is paid per connection.
-pub fn client_lanes() -> u32 {
+/// The lanes a node grants one peer (docs/design/hex-quic.md Q8): every connection to its ports that can do work at once,
+/// a control connection for each call it runs at once (`in_flight`, its workers: a connection past them has no call to
+/// run), a stdio connection for each thread it may run (`in_flight` again: each is named and copied by a thread of its
+/// own, so one past them has none), one log connection (a second reads the same lines), and where it stages a staging
+/// connection for each call it runs at once. The node shapes its endpoint by it (`hex_node::quic::shape`), and a client
+/// holds itself to it ([`client_lanes`], [`crate::link::connect`]): one derivation for both ends.
+pub fn peer_lanes(in_flight: usize, staging: bool) -> u32 {
+    let staged = if staging { in_flight } else { 0 };
+    let lanes = in_flight
+        .saturating_add(in_flight)
+        .saturating_add(1)
+        .saturating_add(staged);
+    u32::try_from(lanes).unwrap_or(u32::MAX)
+}
+
+/// A client's lanes toward a node whose calls in flight it knows (`in_flight`: the node's own, as its hello's budget
+/// says, `wire::Budgets::in_flight`, or its caller's configuration): no more than that node grants it ([`peer_lanes`]),
+/// and no more than the client can bridge at once (`bridgeable`). hyper-quic lays out a row for each lane a peer may
+/// open when a connection starts (quinn's `StreamsState::new`), so this is paid per connection, and a client laying out
+/// more than its node grants would pay for lanes no connection can use.
+pub fn client_lanes(in_flight: usize, staging: bool) -> u32 {
+    peer_lanes(in_flight, staging).min(bridgeable())
+}
+
+/// The connections a client can bridge at once (docs/design/hex-quic.md Q8). On Unix each bridged connection is a socket
+/// pair of two descriptors, so half the soft `RLIMIT_NOFILE` (getrlimit(2)). On Windows each is a loopback TCP pair that
+/// holds two ports of the dynamic range (its listener's, which its accepted end keeps, and its connecting end's): half of
+/// the range's 16,384 ports, IANA's 49152-65535 (RFC 6335 §6), Windows' own since Vista (Microsoft KB 929851), not its
+/// handle table's 2^24, which no pair reaches.
+fn bridgeable() -> u32 {
     #[cfg(unix)]
     let pairs = rustix::process::getrlimit(rustix::process::Resource::Nofile)
         .current
@@ -175,7 +198,7 @@ mod tests {
         assert_eq!(node.lanes_per_peer, 193);
         let client = limits(Shape {
             connections: 1,
-            lanes: client_lanes(),
+            lanes: client_lanes(64, true),
         });
         assert_eq!(client.admission.per_identity, 1);
         for limits in [node, client] {
@@ -194,6 +217,19 @@ mod tests {
             );
             assert!(endpoint.is_ok(), "{:?}", endpoint.err());
         }
+    }
+
+    /// HEX-QUIC-27 (Q8): one derivation for both ends. Expect a node of 16 calls in flight to grant a peer 33 lanes (a
+    /// control and a stdio connection a call, and its log's), 49 where it stages; a client toward it to ask that, or what
+    /// it can bridge where that is less; and calls in flight past `u32` to grant `u32`'s most, never wrapping.
+    #[test]
+    fn hex_quic_27_the_lanes_a_node_grants_are_the_lanes_its_client_asks() {
+        assert_eq!(peer_lanes(16, false), 33);
+        assert_eq!(peer_lanes(16, true), 49);
+        assert_eq!(client_lanes(16, false), 33.min(bridgeable()));
+        assert_eq!(client_lanes(16, true), 49.min(bridgeable()));
+        assert_eq!(peer_lanes(usize::MAX, false), u32::MAX);
+        assert_eq!(client_lanes(usize::MAX, true), bridgeable());
     }
 
     struct NoPeers;

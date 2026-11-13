@@ -3547,6 +3547,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(h) = &harness {
                             h.hold(false);
                         }
+                        // Each it took over signed for goes to the epoch its hand-on names: its ask, with
+                        // the hand-on and this process's receipt, goes now (and on the heartbeat until
+                        // it's certified), and once certified it goes on at that epoch (`go_on_at`). They
+                        // were held for good before: never asked, never moved on, fenced by the server
+                        // (adacachy, 2026-11-12 21:11:33Z: sessions at 5, 7, 1 handed on to 6, 8, 2).
+                        for (session, epoch) in promoted_asks() {
+                            if server_identity && connected {
+                                ask_agent_identity(&own, &mut identity_asked, &session, epoch).await;
+                            }
+                        }
                         legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Promoted);
                         instance_hello.created_at = real_created_at;
                         draining = false;
@@ -6336,6 +6346,13 @@ async fn installed_identity(given: crate::proto::IdentityGiven, state_dir: PathB
     Ok((crate::runner::identity::cert(&slot).is_some() && crate::runner::identity::uri(&slot).as_deref() == Some(uri.as_str())).then_some((session, epoch)))
 }
 
+/// This process was promoted (blue/green): the sessions it took over held at the epoch they go on
+/// at, each let go of so its ask for the next epoch (the one the hand-on names) may go
+/// ([`ask_agent_identity`], `custody::to_ask`), as `(session, epoch it goes on at now)`.
+fn promoted_asks() -> Vec<(String, u64)> {
+    crate::runner::custody::promoted()
+}
+
 /// Asks for agent session `session`'s identity at `epoch` (docs/ci.md W27-R01), unless this
 /// process holds one or asked lately ([`AGENT_IDENTITY_AGAIN`], doubling each time). A session kiln
 /// hasn't heard of yet is refused (the ask can come before its Open, which rides the channel), and
@@ -6940,6 +6957,21 @@ fn open_mirror(dir: &std::path::Path, up: &crate::memory::queue::Sender<Up>) -> 
 
 #[cfg(test)]
 mod tests {
+
+    /// W27-R08 (adacachy, 2026-11-12 21:11:33Z): a session the old process handed on to its next
+    /// epoch is taken over held at the one it goes on at, and once this process is promoted it's let
+    /// go of: its ask goes for the epoch the hand-on names, and once that's certified it goes on at it
+    /// (`go_on_at`), never held at the old one for good.
+    #[test]
+    fn w27_r08_a_session_handed_on_at_n_goes_on_at_n_plus_one_once_its_taker_is_promoted() {
+        crate::runner::custody::took_blue_green("promoted-n", 5, &[], None);
+        assert_eq!(crate::runner::custody::to_ask("promoted-n", 5), None, "held until promoted");
+        // Promotion lets every held one go (another test's promotion, in the same process, may have
+        // let this one go first: what holds either way is that its ask goes now, for epoch 6).
+        let _ = promoted_asks();
+        assert_eq!(crate::runner::custody::to_ask("promoted-n", 5), Some(6), "promoted: its ask is for the epoch its hand-on names");
+        assert_eq!(crate::runner::custody::certified("promoted-n", 6), crate::runner::custody::Certification::BlueGreen, "certified, it goes on at 6");
+    }
     use super::*;
 
     /// A session with no process running (idle, its harness exited) is handed to the new build as

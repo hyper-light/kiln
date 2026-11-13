@@ -2,7 +2,7 @@ Subject: Hex builds on kiln's Shards and hyper-raft
 Why: kiln holds one copy of each project (docs/vendoring.md), and Hex pins an older hyper-raft (0856e05) with changes of its own. Its pin moves to kiln's (fb74b595), and its records of hyper-raft's changes are kiln's (Hex's suite reading among them, kiln's 0005; its qlog and buffer-growth changes left for Hex and kiln to agree). Its Shards pin is kiln's own (e82b9403) since Hex's steps 4 and 12 (daa36e99), which took Shards' API there too, so this change's Shards part dropped out as upstream's own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16).
 
 diff --git a/vendor/MANIFEST.toml b/vendor/MANIFEST.toml
-index 0e25d8cc8d02e03f9fe4be3e82fb5c495435ee0e..0d32ac954010d0f5e673012140666f34feb33bb2 100644
+index fc4a5a2f4b649e2e32b84cc06e98f73295d02bfa..f4f8e11b97bf78f34801f0818211bc55acef17e7 100644
 --- a/vendor/MANIFEST.toml
 +++ b/vendor/MANIFEST.toml
 @@ -33,7 +33,7 @@ own = ["UPSTREAM.md"]

@@ -18,15 +18,46 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::conformance::{Act, Fixture};
 use crate::{
     Allocation, Bounds, BoxId, BoxInfo, BoxSpec, BoxState, CapacityResources, Class, ClassSpec,
-    Destination, Exit, Grant, GuestTime, Network, OciSpec, Proc, Program, Refusal, Rootfs, Runtime,
+    Exit, GuestTime, Member, Network, OciSpec, Proc, Program, Refusal, Rootfs, Runtime,
     RuntimeCost, ShardsImage, Signal, Stdio, Upstream, Usage,
 };
+
+/// The echo program: what comes in on `stdin` goes out on `stdout`, at most [`SIM_ECHO_BYTES`] of it, and it ends
+/// 0 at its input's end (1 past the most it copies), on a thread of its own.
+fn echo(
+    proc: Arc<SimProc>,
+    stdin: Option<std::io::PipeReader>,
+    stdout: Option<std::io::PipeWriter>,
+) -> Result<(), Refusal> {
+    std::thread::Builder::new()
+        .name("hex-sim-echo".to_owned())
+        .spawn(move || {
+            let code = match stdin {
+                None => 0,
+                Some(r) => {
+                    let mut r = r.take(SIM_ECHO_BYTES);
+                    let copied = match stdout {
+                        Some(mut w) => std::io::copy(&mut r, &mut w),
+                        None => std::io::copy(&mut r, &mut std::io::sink()),
+                    };
+                    if copied.is_ok_and(|n| n < SIM_ECHO_BYTES) {
+                        0
+                    } else {
+                        1
+                    }
+                }
+            };
+            let _ = proc.end(Exit::Code(code));
+        })
+        .map(|_| ())
+        .map_err(|e| Refusal::os("starting the echo program", e))
+}
 
 /// Most boxes a [`SimRuntime`] holds; past it `create` is refused with [`Refusal::Full`].
 pub const SIM_BOXES: usize = 10_000;
@@ -72,16 +103,18 @@ struct SimBox {
     vm: Option<SimVm>,
 }
 
-/// A simulated Shards image VM: its vCPUs, from its allocation, and when its start booted it.
+/// A simulated Shards image VM: its vCPUs, from its allocation, when its start booted it, and the members whose
+/// streams its caller took ([`Runtime::member`]), at most the members its spec names.
 struct SimVm {
     vcpus: u32,
     booted: Option<Instant>,
+    taken: Vec<Member>,
 }
 
 #[derive(Default)]
 struct SimProc {
-    exit: Mutex<Option<Exit>>,
-    ended: Condvar,
+    exit: hex_wait::Mutex<Option<Exit>>,
+    ended: hex_wait::Condvar,
     /// A run's program: the other programs of its box, which its end ends, as the node agent's removal
     /// of the run's box does.
     left: Mutex<Vec<Arc<SimProc>>>,
@@ -115,6 +148,17 @@ impl SimProc {
 
 fn poisoned<T>(_: std::sync::PoisonError<T>) -> Refusal {
     Refusal::Broken("a simulator lock was poisoned".to_owned())
+}
+
+/// A wait on a simulator lock that couldn't wait: its lock poisoned, or the OS refused it (macOS's kqueue).
+fn wait_refused(why: hex_wait::Failed) -> Refusal {
+    match why {
+        hex_wait::Failed::Poisoned => Refusal::Broken("a simulator lock was poisoned".to_owned()),
+        hex_wait::Failed::Os(why) => Refusal::Os {
+            op: "waiting on a simulator lock",
+            why: why.to_string(),
+        },
+    }
 }
 
 impl SimRuntime {
@@ -348,24 +392,9 @@ impl Runtime for SimRuntime {
                     }
                     .fits(&SIM_EXEC_LIMIT)?
                 }
-                // Grants as the class holds them (joint plan step 15, HEX-IMG-7): publishes alone, on a run of
-                // the members alone, the rest awaiting Shards, refused before anything is made.
-                for grant in &image.grants {
-                    let needs = match grant {
-                        Grant::Egress {
-                            to: Destination::Name(_),
-                            ..
-                        } => Upstream::MemberGrantsByName,
-                        Grant::Egress {
-                            to: Destination::Address(_),
-                            ..
-                        } => Upstream::MemberGrantsByAddress,
-                        Grant::Host { .. } => Upstream::MemberHostService,
-                        Grant::Publish { .. } if image.command.is_some() => {
-                            Upstream::PublishReceiver
-                        }
-                        Grant::Publish { .. } => continue,
-                    };
+                // Grants as the class holds them (joint plan step 15, HEX-IMG-7): publishes alone, on any run,
+                // the rest awaiting Shards (N4), refused before anything is made.
+                if let Some(needs) = crate::unheld(&image.grants) {
                     return Err(Refusal::Awaits { needs });
                 }
             }
@@ -381,6 +410,7 @@ impl Runtime for SimRuntime {
                     .vm_size()?
                     .vcpus,
                 booted: None,
+                taken: Vec::new(),
             }),
             _ => None,
         };
@@ -500,31 +530,7 @@ impl Runtime for SimRuntime {
                 write(stdio.stdout.as_mut(), format!("{cwd}\n").as_bytes());
                 proc.end(Exit::Code(0))?;
             }
-            "echo" => {
-                let p = Arc::clone(&proc);
-                let (stdin, stdout) = (stdio.stdin.take(), stdio.stdout.take());
-                std::thread::Builder::new()
-                    .name("hex-sim-echo".to_owned())
-                    .spawn(move || {
-                        let code = match stdin {
-                            None => 0,
-                            Some(r) => {
-                                let mut r = r.take(SIM_ECHO_BYTES);
-                                let copied = match stdout {
-                                    Some(mut w) => std::io::copy(&mut r, &mut w),
-                                    None => std::io::copy(&mut r, &mut std::io::sink()),
-                                };
-                                if copied.is_ok_and(|n| n < SIM_ECHO_BYTES) {
-                                    0
-                                } else {
-                                    1
-                                }
-                            }
-                        };
-                        let _ = p.end(Exit::Code(code));
-                    })
-                    .map_err(|e| Refusal::os("starting the echo program", e))?;
-            }
+            "echo" => echo(Arc::clone(&proc), stdio.stdin.take(), stdio.stdout.take())?,
             other => {
                 return Err(Refusal::Invalid {
                     what: "program",
@@ -537,6 +543,65 @@ impl Runtime for SimRuntime {
         if let Some(run) = &b.run {
             run.left.lock().map_err(poisoned)?.push(Arc::clone(&proc));
         }
+        b.procs.push(Arc::clone(&proc));
+        Ok(Box::new(SimHandle(proc, Some(given))))
+    }
+
+    /// A member its image box's spec names (joint plan step 17): the echo program, its stdin, stdout and stderr the
+    /// caller's, taken once, while the box's VM runs; its end the echo's, or KILL with its VM.
+    fn member(&self, id: &BoxId, member: &Member) -> Result<Box<dyn Proc>, Refusal> {
+        let mut stdio = Stdio {
+            ask: crate::Ask {
+                stdin: true,
+                stdout: true,
+                stderr: true,
+            },
+            ..Stdio::null()
+        };
+        let given = stdio.make_asked()?;
+        let mut boxes = self.boxes()?;
+        let b = boxes
+            .get_mut(id)
+            .ok_or_else(|| Refusal::NoSuchBox(id.clone()))?;
+        let named = match &b.spec.class {
+            ClassSpec::ShardsImage(image) => image.members.iter().any(|m| &m.member == member),
+            _ => {
+                return Err(Refusal::Invalid {
+                    what: "member",
+                    why: format!(
+                        "box {id} isn't a Shards image box: only one has members its caller drives"
+                    ),
+                });
+            }
+        };
+        if !named {
+            return Err(Refusal::Invalid {
+                what: "member",
+                why: format!("box {id}'s spec names no {member} its caller drives"),
+            });
+        }
+        let init_ended = match &b.init {
+            Some(init) => init.exit()?.is_some(),
+            None => true,
+        };
+        if !b.started || init_ended {
+            return Err(Refusal::NotRunning(id.clone(), "member"));
+        }
+        if b.procs.len() >= SIM_PROCS {
+            return Err(Refusal::Full(SIM_PROCS));
+        }
+        let vm =
+            b.vm.as_mut()
+                .ok_or_else(|| Refusal::Broken("a Shards image box has no VM".to_owned()))?;
+        if vm.taken.contains(member) {
+            return Err(Refusal::Invalid {
+                what: "member",
+                why: format!("{member}'s streams in box {id} were taken already"),
+            });
+        }
+        vm.taken.push(member.clone());
+        let proc = Arc::new(SimProc::default());
+        echo(Arc::clone(&proc), stdio.stdin.take(), stdio.stdout.take())?;
         b.procs.push(Arc::clone(&proc));
         Ok(Box::new(SimHandle(proc, Some(given))))
     }
@@ -664,7 +729,12 @@ impl Proc for SimHandle {
             if left.is_zero() {
                 return Ok(None);
             }
-            exit = self.0.ended.wait_timeout(exit, left).map_err(poisoned)?.0;
+            exit = self
+                .0
+                .ended
+                .wait_timeout(exit, left)
+                .map_err(wait_refused)?
+                .0;
         }
     }
     fn kill(&mut self) -> Result<(), Refusal> {
@@ -774,6 +844,7 @@ impl Fixture for SimFixture {
                 Self::ShardsImage => self.image(None),
             },
             owner: None,
+            band: 0,
         }
     }
     fn init(&self, id: BoxId, act: &Act) -> BoxSpec {
@@ -789,6 +860,7 @@ impl Fixture for SimFixture {
                 Self::ShardsImage => self.image(Some(act)),
             },
             owner: None,
+            band: 0,
         }
     }
     fn program(&self, act: &Act) -> Program {
@@ -807,6 +879,83 @@ impl Fixture for SimFixture {
 mod tests {
     use super::*;
     use crate::conformance;
+
+    /// Joint plan step 17, AC-T7.4.1: do take a running sim image box's member that its spec names; expect its
+    /// streams once, what it is given echoed back, and its end 0 at its input's end. Expect a second take refused,
+    /// a member its spec doesn't name refused, a take before the start NotRunning, and a process box's refused as
+    /// having no members.
+    #[test]
+    fn a_sim_image_boxs_member_echoes_once_taken_and_ends_at_its_inputs_end() {
+        use std::io::{Read as _, Write as _};
+        let runtime = SimRuntime::new();
+        let claude = Member {
+            kind: crate::MemberKind::Harness,
+            name: "claude".to_owned(),
+        };
+        let id = BoxId::new("sim-members").unwrap();
+        runtime
+            .create(BoxSpec {
+                id: id.clone(),
+                bounds: Bounds::default(),
+                class: ClassSpec::ShardsImage(Box::new(ShardsImage {
+                    members: vec![crate::ImageMember::new(claude.clone())],
+                    ..ShardsImage::new(SIM_IMAGE)
+                })),
+                owner: None,
+                devices: Vec::new(),
+                allocation: Some(sim_vm_allocation().unwrap()),
+                route: None,
+                band: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime.member(&id, &claude),
+            Err(Refusal::NotRunning(_, "member"))
+        ));
+        runtime.start(&id).unwrap();
+        let mut proc = runtime.member(&id, &claude).unwrap();
+        let given = proc.streams().unwrap();
+        let mut to = crate::OwnedStream::from(given.stdin.unwrap());
+        let mut from = crate::OwnedStream::from(given.stdout.unwrap());
+        to.write_all(b"hello").unwrap();
+        drop(to);
+        let mut echoed = String::new();
+        from.read_to_string(&mut echoed).unwrap();
+        assert_eq!(echoed, "hello");
+        assert_eq!(
+            proc.wait_for(Duration::from_secs(60)).unwrap(),
+            Some(Exit::Code(0))
+        );
+        assert!(matches!(
+            runtime.member(&id, &claude),
+            Err(Refusal::Invalid { what: "member", .. })
+        ));
+        let helper = Member {
+            kind: crate::MemberKind::Agent,
+            name: "helper".to_owned(),
+        };
+        assert!(matches!(
+            runtime.member(&id, &helper),
+            Err(Refusal::Invalid { what: "member", .. })
+        ));
+        let plain = BoxId::new("sim-process").unwrap();
+        runtime
+            .create(BoxSpec {
+                id: plain.clone(),
+                bounds: Bounds::default(),
+                class: ClassSpec::Process,
+                owner: None,
+                devices: Vec::new(),
+                allocation: None,
+                route: None,
+                band: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime.member(&plain, &claude),
+            Err(Refusal::Invalid { what: "member", .. })
+        ));
+    }
 
     #[test]
     fn the_simulator_passes_the_conformance_suite() {

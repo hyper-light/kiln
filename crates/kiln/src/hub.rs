@@ -4362,6 +4362,14 @@ impl Hub {
                 let own = inv.sessions.clone();
                 inv.sessions.extend(others);
                 self.harness.inventory(self, agent, me.as_deref(), &present, inv).await;
+                // A session a runner process was last known to hold that this server doesn't list (its
+                // restore at the start missed it): listed again now, crashed or offline, never left out.
+                let hub = Arc::clone(self);
+                crate::rt::spawn(async move {
+                    if let Err(e) = crate::harness::registry::Registry::restore_held(&hub).await {
+                        tracing::warn!(error = %format!("{e:#}"), "sessions runner processes were last known to hold couldn't be listed again: the next report tries again");
+                    }
+                });
                 // Those it holds that still read disconnected a little later: its link dropped and
                 // came back, and they've had nothing to say since. Their snapshots bring them back
                 // as they are. Not at once: after a server restart every session reads disconnected
@@ -7795,7 +7803,7 @@ pub(crate) mod tests {
             anyhow::ensure!(hub.harness.info("held").is_some_and(|i| i.status == Status::Disconnected));
             anyhow::ensure!(hub.fold_duplicates(ID).await? == ["fedora"]);
             anyhow::ensure!(hub.harness.location("held") == Some(Location::Machine(ID.into())), "{:?}", hub.harness.location("held"));
-            anyhow::ensure!(hub.harness.info("gone").is_none(), "one the machine doesn't hold is gone");
+            anyhow::ensure!(hub.harness.info("gone").is_some_and(|i| i.status == Status::Crashed), "one the machine doesn't hold reads crashed, never dropped (Ada, 2026-11-13)");
             // What the fold asked: the snapshot of the one it holds that reads disconnected.
             hub.harness.machine_lost(&hub, ID).await;
             let asked = hub.harness.moved_onto_connected(&hub, ID, &["held".to_owned()], &["held".to_owned()]).await;

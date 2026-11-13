@@ -1,0 +1,4 @@
+{
+  "entrypoint": "python3 /opt/vm-stub/stub",
+  "options": []
+}

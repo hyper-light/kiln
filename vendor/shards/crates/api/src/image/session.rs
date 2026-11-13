@@ -11,10 +11,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read as _, Write as _};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use super::spawn;
 use super::wire::{self, Channel, MemberInfo, Ready, RunEnd, Stats, StatsScope};
 use super::{ImageGuest, ImageRefusal, ImageSpec, MemberEnd, MemberName};
 
@@ -100,7 +100,7 @@ struct Shared {
     changed: Condvar,
     /// The host's stdin: closed once the run's end has come, which the host takes as the
     /// last of its owner, and by `stop`.
-    to_host: Mutex<Option<std::process::ChildStdin>>,
+    to_host: Mutex<Option<io::PipeWriter>>,
 }
 
 impl Shared {
@@ -149,86 +149,10 @@ impl Shared {
     }
 }
 
-/// The host's process: held to reap it, and its pid (Unix) or a handle of its own
-/// (Windows) to wait for its exit without the lock a kill takes.
-#[derive(Debug)]
-struct Host {
-    child: Mutex<Child>,
-    #[cfg(unix)]
-    pid: u32,
-    #[cfg(windows)]
-    handle: std::os::windows::io::OwnedHandle,
-}
-
-impl Host {
-    fn of(child: Child) -> io::Result<Host> {
-        #[cfg(unix)]
-        let pid = child.id();
-        #[cfg(windows)]
-        let handle = {
-            use std::os::windows::io::AsHandle as _;
-            child.as_handle().try_clone_to_owned()?
-        };
-        Ok(Host {
-            child: Mutex::new(child),
-            #[cfg(unix)]
-            pid,
-            #[cfg(windows)]
-            handle,
-        })
-    }
-
-    /// Waits for it to exit, leaving it unreaped.
-    fn awaited(&self) -> io::Result<()> {
-        #[cfg(unix)]
-        loop {
-            // SAFETY: a siginfo_t, plain data, for waitid(2) to fill.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            // SAFETY: waitid(2) of our own child into `info`; WNOWAIT leaves it unreaped.
-            let r = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    self.pid,
-                    &raw mut info,
-                    libc::WEXITED | libc::WNOWAIT,
-                )
-            };
-            if r == 0 {
-                return Ok(());
-            }
-            let e = io::Error::last_os_error();
-            if e.kind() != io::ErrorKind::Interrupted {
-                return Err(e);
-            }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle as _;
-            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-            use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
-            // SAFETY: a process handle this value owns.
-            if unsafe { WaitForSingleObject(self.handle.as_raw_handle(), INFINITE) } == WAIT_OBJECT_0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        }
-    }
-
-    /// Kills it at once, while `state` says it is unreaped.
-    fn kill(&self, state: &State) {
-        if state.exited {
-            return;
-        }
-        #[cfg(unix)]
-        if let Ok(pid) = libc::pid_t::try_from(self.pid) {
-            // SAFETY: kill(2) of our own child, unreaped while `exited` is false.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
-        #[cfg(windows)]
-        {
-            let _ = lock(&self.child).kill();
-        }
+/// Kills the host at once, while `state` says it is unreaped.
+fn kill(host: &spawn::Process, state: &State) {
+    if !state.exited {
+        host.kill();
     }
 }
 
@@ -236,7 +160,7 @@ impl Host {
 #[derive(Debug)]
 pub(super) struct Session {
     shared: Arc<Shared>,
-    host: Arc<Host>,
+    host: Arc<spawn::Process>,
     members: Vec<MemberInfo>,
     published: Vec<wire::Bound>,
     outputs: Mutex<HashMap<(u32, Channel), io::PipeReader>>,
@@ -257,24 +181,13 @@ impl Session {
             .or_else(|| std::env::var_os("SHARDS_BIN").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("shards"));
         let os = |what: &'static str| move |e: io::Error| ImageRefusal::Os { what, kind: e.kind() };
-        let mut child = Command::new(&binary)
-            .arg("api-run")
-            .envs(spec.env.iter().map(|(k, v)| (k, v)))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+        let spawn::Started {
+            process: host,
+            stdin: to_host,
+            stdout: from_host,
+            stderr: said,
+        } = spawn::start(&binary, &["api-run"], &spec.env)
             .map_err(|e| ImageRefusal::Boot(format!("{}: {e}", binary.display())))?;
-        let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-        let host = Host::of(child).map_err(os("the run host's handle"))?;
-        let (Some(to_host), Some(from_host), Some(said)) = pipes else {
-            let _ = lock(&host.child).kill();
-            let _ = lock(&host.child).wait();
-            return Err(ImageRefusal::Os {
-                what: "the run host's pipes",
-                kind: io::ErrorKind::BrokenPipe,
-            });
-        };
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
@@ -307,7 +220,7 @@ impl Session {
                 .map_err(os("the run host's request"))
         })();
         let end_it = |shared: &Shared| {
-            host.kill(&lock(&shared.state));
+            kill(&host, &lock(&shared.state));
             lock(&shared.to_host).take();
         };
         if let Err(e) = threads {
@@ -539,7 +452,7 @@ fn feed(shared: &Shared, member: u32, mut reader: io::PipeReader) {
 /// Reads the host's answers until it closes its stdout, each into the state; one that
 /// breaks the channel's contract ends the session as a failed run. The run's end closes
 /// the host's stdin: the host then ends.
-fn read_answers(shared: &Shared, mut from_host: std::process::ChildStdout) {
+fn read_answers(shared: &Shared, mut from_host: io::PipeReader) {
     let failed = loop {
         let (kind, payload) = match wire::read_frame(&mut from_host) {
             Ok(Some(frame)) => frame,
@@ -656,7 +569,7 @@ fn take(shared: &Shared, kind: u8, payload: &[u8]) -> Result<bool, String> {
 }
 
 /// Keeps the host's last diagnostics until they end.
-fn keep_said(shared: &Shared, mut said: std::process::ChildStderr) {
+fn keep_said(shared: &Shared, mut said: io::PipeReader) {
     let keep = said_kept();
     let mut buf = [0u8; 4096];
     while let Ok(n) = said.read(&mut buf) {
@@ -673,10 +586,10 @@ fn keep_said(shared: &Shared, mut said: std::process::ChildStderr) {
 }
 
 /// Waits for the host to exit, then reaps it under the state's lock as `exited` is set.
-fn watch(shared: &Shared, host: &Host) {
+fn watch(shared: &Shared, host: &spawn::Process) {
     let awaited = host.awaited();
     let mut state = lock(&shared.state);
-    let _ = lock(&host.child).wait();
+    let _ = host.reap();
     if let Err(e) = awaited {
         state
             .end
@@ -870,7 +783,7 @@ impl ImageGuest for Session {
         // (`STOP_ORDER`). A run that has ended is not asked: its host is cleaning up.
         let ended = lock(&self.shared.state).end.is_some();
         if !ended && self.shared.send(wire::to_host::STOP, &[]).is_err() {
-            self.host.kill(&lock(&self.shared.state));
+            kill(&self.host, &lock(&self.shared.state));
         }
         // The run's end comes as its VM goes, which the host kills at once; or the host is
         // gone. The host's own exit after (its cleanup) is the watcher's to reap.
@@ -962,15 +875,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_feed_sends_its_callers_bytes_within_its_room_then_its_end() {
+        use std::process::{Command, Stdio};
         let mut host = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        // The host's stdin as a session holds its run host's: a pipe's write end (spawn.rs).
+        let to_host = host
+            .stdin
+            .take()
+            .map(|stdin| io::PipeWriter::from(std::os::fd::OwnedFd::from(stdin)));
         let s = Arc::new(Shared {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
-            to_host: Mutex::new(host.stdin.take()),
+            to_host: Mutex::new(to_host),
         });
         lock(&s.state).inputs.insert(1, InputFlow::default());
         let (reader, mut writer) = io::pipe().unwrap();

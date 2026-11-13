@@ -197,6 +197,7 @@ impl Fixture<'_> {
             bounds: self.bounds.clone(),
             class,
             owner: None,
+            band: 0,
         }
     }
 

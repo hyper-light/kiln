@@ -423,6 +423,9 @@ impl<P: Privileged> Daemon<P> {
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => return Err(Refusal::os("accepting a helper connection", e)),
             };
+            // macOS's accept takes no close-on-exec flag: marked at once, as every descriptor the helper holds.
+            super::private_descriptor(&conn, false)
+                .map_err(|e| Refusal::os("accepting a helper connection", e))?;
             // macOS has no MSG_NOSIGNAL; SO_NOSIGPIPE keeps a dropped node from raising SIGPIPE on a send.
             let _ = rustix::net::sockopt::set_socket_nosigpipe(&conn, true);
             let _ = self.serve(conn.as_fd());
@@ -874,6 +877,9 @@ impl<P: Privileged> Daemon<P> {
 pub fn bind(path: &Path) -> Result<OwnedFd, Refusal> {
     let _ = rustix::fs::unlink(path);
     let fd = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)
+        .map_err(|e| Refusal::os("making the helper socket", e))?;
+    // macOS's socket takes no close-on-exec flag: marked at once, as every descriptor the helper holds.
+    super::private_descriptor(&fd, false)
         .map_err(|e| Refusal::os("making the helper socket", e))?;
     let addr = SocketAddrUnix::new(path).map_err(|e| Refusal::os("naming the helper socket", e))?;
     rustix::net::bind(&fd, &addr).map_err(|e| Refusal::os("binding the helper socket", e))?;

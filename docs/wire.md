@@ -646,6 +646,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   `AtState` applies queue actions only while that revision is current.
   `mail-flow`: receiver-owned admission and exact durable custody receipts.
   `mail-transfer`: event-driven Offered, Prepared, Committed or Aborted journal handover, with authenticated exact manifests and unchanged attempt tokens.
+  `place.keeper`: the owner reads a runner's word that it isn't synced with its machine's capacity
+  keeper (`Unsynced`, docs/lb.md "A machine's keeper"); to an owner on a link that didn't name it, a
+  runner says it as `Strained`, its why kept, where that owner named `place.health`, else as
+  `Draining`.
 
 ## Registry
 

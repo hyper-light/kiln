@@ -141,6 +141,7 @@ impl Lab {
                 bounds: Bounds::default(),
                 class: ClassSpec::Process,
                 owner: None,
+                band: 0,
             })
             .unwrap();
         let server = Server::bind(

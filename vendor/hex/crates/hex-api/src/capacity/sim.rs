@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    Amounts, Budget, CapacityView, Close, Held, Host, Keeper, Read, Records, Scope, Stop, ToHolder,
-    ToKeeper, View,
+    Amounts, Budget, CapacityView, Close, Held, Host, Keeper, Records, Stop, ToHolder, ToKeeper,
+    View,
 };
 use crate::Refusal;
 
@@ -154,31 +154,12 @@ impl CapacityView for SimView {
 }
 
 impl Host for SimView {
-    fn sample(&mut self, room: Amounts, used: &[(u64, Read)]) -> Result<(), Refusal> {
+    fn set_room(&mut self, room: Amounts) -> Result<(), Refusal> {
         self.room = room;
         if let Some(keeper) = self.keeper.as_mut() {
             keeper.set_room(room);
-            let by_session: Vec<_> = used
-                .iter()
-                .filter_map(|(link, read)| self.links.get(link).map(|s| (*s, *read)))
-                .collect();
-            keeper.sampled(&by_session);
         }
         Ok(())
-    }
-
-    fn scopes(&mut self) -> Result<Vec<(u64, Scope)>, Refusal> {
-        let keeper = self.keeper()?;
-        Ok(keeper
-            .scopes()
-            .into_iter()
-            .filter_map(|(session, _, scope)| {
-                self.links
-                    .iter()
-                    .find(|(_, s)| **s == session)
-                    .map(|(link, _)| (*link, scope))
-            })
-            .collect())
     }
 
     fn set_local(&mut self, local: Amounts) -> Result<(), Refusal> {
