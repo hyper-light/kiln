@@ -67,7 +67,20 @@ fn sent_ids(store: &Store, session: &str) -> anyhow::Result<Vec<String>> {
 
 /// The harness's record of `session` as the harness on the machine it goes to takes it; `events`,
 /// kiln's timeline, for a harness whose own record kiln doesn't keep.
-fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str>, events: &[Event], note: &str) -> anyhow::Result<Carry> {
+fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str>, events: &[Event], note: &str, in_place: bool) -> anyhow::Result<Carry> {
+    // Resumed in place (a crashed session, on its own machine): the harness's own record of the
+    // conversation is there, so every harness that keeps one goes on natively by its id; an ACP
+    // agent has the words too, for when it turns out not to load sessions (Ada, 2026-11-13).
+    if in_place
+        && let Some(own) = harness_session.filter(|h| !h.is_empty())
+        && kind.protocol != Protocol::Terminal
+    {
+        let words = match (kind.protocol, moving::words(events, note)) {
+            (Protocol::Acp(_), Carry::Words { text }) => Some(text),
+            _ => None,
+        };
+        return Ok(Carry::Native { session: own.to_owned(), words });
+    }
     if matches!(kind.protocol, Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc) {
         return Ok(moving::words(events, note));
     }
@@ -97,6 +110,12 @@ fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str
 /// when None), made from what `store` kept. `from` names the machine it was on; `shown`, the names
 /// people see of that machine and the one it goes to, for what the conversation is told. Blocking.
 pub fn package(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown: (&str, &str)) -> anyhow::Result<Package> {
+    package_for(store, id, from, cwd, shown, false)
+}
+
+/// [`package`], `in_place` when it goes on on the machine it was on (a crashed session resumed
+/// there): natively, from its harness's own record there ([`Carry::Native`]).
+pub fn package_for(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown: (&str, &str), in_place: bool) -> anyhow::Result<Package> {
     let kept = store.kept(id, MAX_EVENTS)?.ok_or_else(|| anyhow::anyhow!("the server's store has nothing of this session"))?;
     let info: Info = kept.info.as_deref().and_then(|j| serde_json::from_str(j).ok()).ok_or_else(|| anyhow::anyhow!("the server's store doesn't say what this session is"))?;
     let state: State = kept.state.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
@@ -110,8 +129,12 @@ pub fn package(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown: (&
     let goes_on_in = cwd.map(str::trim).filter(|c| !c.is_empty()).map_or_else(|| from_cwd.clone(), str::to_owned);
     let own = state.harness_session.clone().or_else(|| info.harness_session.clone());
     let (from_shown, to_shown) = shown;
-    let note = format!("This conversation went on from {from_shown} (where it worked in {from_cwd}), which is gone, to {to_shown} (it works in {goes_on_in} now). It was kept on the kiln server.");
-    let carry = carry(store, id, kind, own.as_deref(), &events, &note)?;
+    let note = if in_place {
+        format!("This conversation went on on {to_shown} after its agent's process there was lost: it was kept on the kiln server.")
+    } else {
+        format!("This conversation went on from {from_shown} (where it worked in {from_cwd}), which is gone, to {to_shown} (it works in {goes_on_in} now). It was kept on the kiln server.")
+    };
+    let carry = carry(store, id, kind, own.as_deref(), &events, &note, in_place)?;
     // What starts it there: its settings as last chosen. Its environment was its machine's, and
     // stays there (the machine it goes to runs it with its own).
     let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_owned());
@@ -174,6 +197,34 @@ mod tests {
         assert_eq!(pkg.state.epoch, 2);
         // Another folder there, if asked.
         assert_eq!(package(&store, "s1", "gone-box", Some("/elsewhere"), ("gone-box", "here"))?.spec.cwd.as_deref(), Some("/elsewhere"));
+        Ok(())
+    }
+
+    /// Ada, 2026-11-13: a crashed session resumed in place goes on natively, by its harness's own
+    /// id, for every harness kiln supports: the package names the id it resumes (`spec.resume`)
+    /// and writes nothing of the record (it's there); an ACP agent has the words too, for one that
+    /// can't load sessions. Off its machine, as before.
+    #[test]
+    fn resume_in_place_every_harness_goes_on_natively_by_its_own_id() -> anyhow::Result<()> {
+        use crate::harness::kinds::{Kind, Protocol};
+        for k in Kind::all() {
+            let (_d, store) = crate::convo::store::scratch()?;
+            let own = format!("own-{}", k.id);
+            store.send("s1", &Update::Open { info: Box::new(info(k.id, Some(&own))?), since: None });
+            store.send("s1", &Update::State { state: Box::new(State { harness_session: Some(own.clone()), ..State::default() }) });
+            store.send("s1", &Update::Events { events: vec![Event { id: "m1".into(), seq: 1, at: 5, parent: None, by: None, body: Body::Assistant { text: "half way there".into(), streaming: false } }] });
+            store.sync()?;
+            let pkg = package_for(&store, "s1", "box", None, ("box", "box"), true)?;
+            assert_eq!(pkg.spec.resume.as_deref(), Some(own.as_str()), "{}: resumes its own", k.id);
+            assert_eq!(pkg.version, 5, "{}", k.id);
+            match (&pkg.carry, k.protocol) {
+                (Carry::Native { session, words: Some(w) }, Protocol::Acp(_)) => anyhow::ensure!(*session == own && w.contains("half way there"), "{}: {w}", k.id),
+                (Carry::Native { session, words: None }, Protocol::ClaudeStreamJson | Protocol::CodexAppServer | Protocol::AgyStreamJson | Protocol::PiRpc) => anyhow::ensure!(*session == own, "{}", k.id),
+                (c, _) => anyhow::bail!("{}: {c:?}", k.id),
+            }
+            let seeded = crate::harness::moving::install(&pkg, "/work/parser").map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(seeded.is_some() == matches!(k.protocol, Protocol::Acp(_)), "{}: words only for ACP: {seeded:?}", k.id);
+        }
         Ok(())
     }
 
