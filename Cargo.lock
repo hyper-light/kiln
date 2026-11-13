@@ -2690,6 +2690,7 @@ dependencies = [
  "futures",
  "hex",
  "hex-api",
+ "kiln-ci",
  "parking_lot",
  "rcgen",
  "regex",

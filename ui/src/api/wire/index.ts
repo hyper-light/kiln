@@ -10,7 +10,6 @@ export type { AgentEnded } from "./AgentEnded";
 export type { AgentInfo } from "./AgentInfo";
 export type { AgentLink } from "./AgentLink";
 export type { AgentLive } from "./AgentLive";
-export type { AgentNegotiated } from "./AgentNegotiated";
 export type { AgentNotice } from "./AgentNotice";
 export type { AgentNoticeKind } from "./AgentNoticeKind";
 export type { AgentReach } from "./AgentReach";

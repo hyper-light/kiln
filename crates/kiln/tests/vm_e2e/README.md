@@ -71,7 +71,7 @@ every one of the five `VM_E2E_*` words below (`untasked`): the stand-in's words 
 | `VM_E2E_PROMPT`, `VM_E2E_RESUMED_PROMPT`, `VM_E2E_STEERED_PROMPT`, `VM_E2E_STOPPED_PROMPT`, `VM_E2E_DONE_MARKER` | a real task, the resumed session's turn, a long one to steer into, a long one to stop, and what the harness says at a task's end; `{kind}` in each is the harness's id, `{file}` the file to write. Unset: the stand-in's, for an image ROOT names (the stand-in's); from kiln's own `harness-<kind>` the run skips unless all five are given (fails, with `VM_E2E=1`) |
 | `VM_E2E_IMAGE_<KIND>` | the image a harness's microVM is made from (`agentfile:<id>`), or `stub` for the stand-in (below); unset: kiln's Agentfile for it, `harness-<kind>` |
 | `VM_E2E_TURN_SECS` | how long a turn may take before the test fails (600 unset): a failing test's patience, not a value kiln runs by |
-| `VM_E2E_SERVER`, `VM_E2E_TOKEN`, `VM_E2E_MACHINE`, `VM_E2E_RUNNER_PID` | ROOT's own kiln (one with the sign-ins and credentials real tasks need) at `http://127.0.0.1:<port>`, its admin token (from a file, never on a command line or in a log), its runner's machine id and that runner's pid; unset: a server and a runner of the test's own, its headroom off |
+| `VM_E2E_SERVER`, `VM_E2E_TOKEN`, `VM_E2E_MACHINE`, `VM_E2E_RUNNER_PID`, `VM_E2E_RUNNER_LOG` | ROOT's own kiln (one with the sign-ins and credentials real tasks need) at `http://127.0.0.1:<port>`, its admin token (from a file, never on a command line or in a log), its runner's machine id, that runner's pid and its log (where it writes each call of kiln's MCP over a lane); unset: a server and a runner of the test's own, its headroom off |
 
 On a busy host kiln holds a queued message in its own queue until the machine has room (docs/headroom.md),
 and the drive's turns then wait there. The test's own runner has its headroom off; turn ROOT's runner's off
@@ -178,7 +178,8 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    2026-11-13; Shards D254, which step 11 writes): kiln's MCP rides the agent-control link as its own
    `mcp` lane, so its suite is that link's and no network grant names kiln's MCP. Read by
    `mcp_round_trip`, through `VM_E2E_LINKS`' `mcp` entry, by `check_mcp_lane` (the agent-control
-   link's report naming the `mcp` lane), and, before the drive boots anything, by `grants_to_kiln`
+   link's report naming the `mcp` lane), by `mcp_calls_over_lane` (the runner's own log of each call
+   it took over the session's lane, `reach::mcp::serve_over`, kiln main dace992a6), and, before the drive boots anything, by `grants_to_kiln`
    (no grant of the image's Agentfile reaching kiln: a destination at the machine itself at kiln's
    port, a remote MCP server there, or kiln's port open to any address). Evidence of what it
    replaces: step 18's branch
