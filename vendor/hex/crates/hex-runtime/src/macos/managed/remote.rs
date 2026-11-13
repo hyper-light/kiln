@@ -1584,6 +1584,32 @@ pub(super) fn set_rate(
     helper.set_rate(key, rate).map_err(CallFailure::refusal)
 }
 
+/// Joint plan step 14 (C5 on macOS): the last resort ends the canonical scope through its native helper, as its
+/// receipt's own stop does (`Action::Stop`, [`Proxy`]'s `ManagedProcess::stop`); its end is observed as any other.
+pub(super) fn stop(runtime: &MacRuntime, record: NativeRecord<'_>) -> Result<(), Refusal> {
+    let helper = runtime
+        .managed_helper
+        .as_ref()
+        .ok_or_else(|| record.refusal(LifecycleCause::Uncertain))?;
+    let (process, _) = helper.identity(false, helper.until(None)?, None)?;
+    let key = protocol::Key::from_record(record, process)?;
+    let (answer, _) = helper
+        .rpc(
+            &protocol::Request::Control {
+                key,
+                action: protocol::Action::Stop,
+                controller: record.init(),
+            },
+            &[],
+            None,
+        )
+        .map_err(CallFailure::refusal)?;
+    match answer {
+        protocol::Answer::Done { .. } => Ok(()),
+        _ => Err(record.refusal(LifecycleCause::Uncertain)),
+    }
+}
+
 pub(super) fn usage(runtime: &MacRuntime, record: NativeRecord<'_>) -> Result<Usage, Refusal> {
     let helper = runtime
         .managed_helper

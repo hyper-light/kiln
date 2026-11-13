@@ -55,6 +55,14 @@ pub const EXEC: Duration = Duration::from_nanos(100_780_659);
 /// `node.listing`: a recovery's listing, an entry (137.124 us: the bound run 3's record ran out at in the suites, so it
 /// doubles), what a restart's recovery takes for each entry of the directories it lists.
 pub const LISTING_ENTRY: Duration = Duration::from_nanos(137_124);
+/// `timer.overshoot`: how late past its deadline macOS returns a timed wait on Hex's condition variable
+/// (`hex_wait::Condvar`), a one-shot `NOTE_CRITICAL` kqueue timer's (2.743 ms: the largest of 1,000 waits of 0.1 to
+/// 100 ms on 75694786 and 2768d0d5 at the kiln runner's utility QoS, to the microsecond,
+/// `bench/competitive/probes/deadline_waits.md`; docs/design/deadline-waits.md). A kernel timer's lateness, the same
+/// under a debug build as a release one, and an idle machine's: the seed of the precise-wait patience hex-client's
+/// deadline tests hold their refusals to, which each run's own poll(2) waits teach the lateness of a loaded host.
+#[cfg(target_os = "macos")]
+pub const OVERSHOOT: Duration = Duration::from_nanos(2_743_000);
 
 /// A wait's fact didn't come within its patience.
 #[derive(Debug, Clone, PartialEq, Eq)]

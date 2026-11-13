@@ -256,6 +256,7 @@ mod bench {
                 },
                 class: ClassSpec::Process,
                 owner: None,
+                band: 0,
             };
             self.rt.create(spec).expect("create");
             Some(())

@@ -1403,6 +1403,7 @@ mod queued_deadline_probe {
                     bounds: hex_api::Bounds::default(),
                     class: hex_api::ClassSpec::Bundle(directory.path().join("unused-bundle")),
                     owner: None,
+                    band: 0,
                 },
                 start: true,
             },

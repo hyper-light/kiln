@@ -3,12 +3,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::{fs::File, io::Read};
 
-#[cfg(any(target_os = "linux", test))]
 use hex_api::{BoxId, BoxSpec, ClassSpec};
 use hex_api::{Refusal, RuntimeCost};
 use hex_core::stream::files::Limits;
 use serde::Deserialize;
-#[cfg(any(target_os = "linux", test))]
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -145,7 +143,6 @@ fn path(text: Text) -> Result<PathBuf, Refusal> {
 }
 
 #[derive(Debug, Serialize)]
-#[cfg(any(target_os = "linux", test))]
 pub(super) struct Passthrough {
     pub id: String,
     pub sbdf: String,
@@ -155,7 +152,6 @@ pub(super) struct Passthrough {
 }
 
 #[derive(Serialize)]
-#[cfg(any(target_os = "linux", test))]
 #[serde(rename_all = "kebab-case")]
 pub(super) struct VmConfig<'a> {
     boot_source: BootSource<'a>,
@@ -169,7 +165,6 @@ pub(super) struct VmConfig<'a> {
 /// One passthrough function as the VMM's configuration names it, with its video BIOS image where
 /// one is configured (vendor patch 0004's `vbios_path`).
 #[derive(Serialize)]
-#[cfg(any(target_os = "linux", test))]
 struct DevicePassthrough<'a> {
     id: &'a str,
     sbdf: &'a str,
@@ -178,7 +173,6 @@ struct DevicePassthrough<'a> {
 }
 
 #[derive(Serialize)]
-#[cfg(any(target_os = "linux", test))]
 struct BootSource<'a> {
     kernel_image_path: &'a Path,
     initrd_path: &'a Path,
@@ -186,7 +180,6 @@ struct BootSource<'a> {
 }
 
 #[derive(Serialize)]
-#[cfg(any(target_os = "linux", test))]
 struct MachineConfig {
     vcpu_count: u8,
     mem_size_mib: u64,
@@ -194,7 +187,6 @@ struct MachineConfig {
 }
 
 #[derive(Serialize)]
-#[cfg(any(target_os = "linux", test))]
 struct Vsock<'a> {
     guest_cid: u32,
     uds_path: &'a Path,
@@ -356,7 +348,6 @@ impl Config {
         millis(self.boot_timeout)
     }
 
-    #[cfg(target_os = "linux")]
     pub(super) fn machine_memory(&self, spec: &BoxSpec) -> Result<u64, Refusal> {
         self.guest(spec)?
             .mem_bytes
@@ -367,7 +358,6 @@ impl Config {
             })
     }
 
-    #[cfg(any(target_os = "linux", test))]
     pub(super) fn guest(&self, spec: &BoxSpec) -> Result<hex_api::CapacityResources, Refusal> {
         if spec.bounds.cpu_max_milli.is_none() || spec.bounds.memory_max.is_none() {
             return Err(invalid(
@@ -386,7 +376,6 @@ impl Config {
         allocation.guest()
     }
 
-    #[cfg(any(target_os = "linux", test))]
     pub(super) fn machine<'a>(
         &'a self,
         spec: &BoxSpec,
@@ -403,7 +392,6 @@ impl Config {
         self.machine_guest(self.guest(spec)?, vsock, devices, &spec.id)
     }
 
-    #[cfg(any(target_os = "linux", test))]
     pub(super) fn machine_guest<'a>(
         &'a self,
         guest: hex_api::CapacityResources,
@@ -683,6 +671,7 @@ mod tests {
                     })
                     .unwrap(),
             ),
+            band: 0,
         }
     }
 

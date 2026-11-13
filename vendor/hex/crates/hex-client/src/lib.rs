@@ -34,6 +34,9 @@ mod copy;
 pub mod guest;
 
 pub use calls::{Deferred, Ended, Then};
+pub use copy::Cut;
+#[cfg(target_os = "macos")]
+pub use copy::wait_readable;
 
 #[cfg(target_os = "linux")]
 mod linux;

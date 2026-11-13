@@ -143,6 +143,7 @@ fn a_given_answers_sockets_arrive_alive_while_other_unix_sockets_close() {
             bounds: Bounds::default(),
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         })
         .unwrap();
     let server = Server::bind(

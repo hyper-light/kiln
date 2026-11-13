@@ -303,3 +303,16 @@ its crate, on Linux; CI on main runs the rest of the matrix.
 | the same | `cargo clippy --locked -p kiln -p kiln-ci --all-targets -- -D warnings` | passed (`evidence/part2/p2-clippy.log`) |
 | Linux x86_64, adacachy, at f1d7f28e8 (both parts, part 1's record, and kiln main fe9c17c7d, whose commits changed api.rs, harness/model.rs, moving.rs and session.rs) | the same light tests, then `cargo clippy --locked -p kiln --all-targets -- -D warnings` | 227 passed; 1 failed, main's own `harness::moving` version test, its line moved to 386 by main; clippy passed (`evidence/landing/f1d7f28e8-*`) |
 | Linux x86_64, adacachy, at 51de8f6c0 (the same, and kiln main cd224213c: resume in place, step 35's ACP capabilities) | the same | didn't run: the test binary failed to link, because adacachy's stable toolchain was updated under the build and its std rlibs were gone (`evidence/landing/51de8f6c0-adacachy-link-failure.log`). Its clippy was stopped there, and the lane (`~/g121-tmp/s18`, 94 GB) removed, on ROOT's word that kiln's checks leave adacachy, whose disk is saturated. |
+
+### Landing (2026-11-13): one host, macOS arm64
+
+ROOT's word of 2026-11-13: one `cargo test -p kiln --lib` with step 18's filters and one clippy, on
+one Mac, then a fast-forward. Windows, Linux and the rest of the matrix run in CI on main.
+
+| Where | What | Result |
+|---|---|---|
+| macOS 26.4 arm64, adas-mac-studio.local-2 (Apple M3 Ultra, 32 CPUs), rustc 1.99.1, `CARGO_INCREMENTAL=0`, at e951b2968 (both parts, the MCP grant taken out, kiln main eb91cc8f8) | `cargo test --locked -p kiln --lib -- step18 step23 agentfiles:: wire::ts harness::homes harness::whose harness::moving harness::trouble harness::isolated harness::lineage mcp:: reach::mcp` | 228 passed, 0 failed. Main's own `harness::moving` version test passes now. |
+| the same | `cargo clippy --locked -p kiln -p kiln-ci --all-targets -- -D warnings` | passed (3 min 29 s; a dependency's warnings only) |
+| the same Mac, at 0c64ad0e8: the same, merged with kiln main 522f14c31 (step 17's launch seam and images, conflicts in api.rs, session.rs and docs/agents.md resolved for both sides, and main's two `Isolation` test literals given part 1's `person`) | the same test | 230 passed, 0 failed, among them main's new `s17_*` tests in the filters |
+| the same | the same clippy | passed (3 min 4 s) |
+| adalundhe-macbook-pro (at a5ce21085), then adas-mac-studio-3.local (at e951b2968) | the same | stopped before a verdict, on ROOT's word: both Macs were thrashing (swap near full) under other lanes' kiln builds |

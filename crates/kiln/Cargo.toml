@@ -69,12 +69,19 @@ quiver-api = "=0.1.0"
 # The search across a change (docs/ci.md W26-R07): kiln-seams' Search on vorpal (vendor/vorpal).
 kiln-search = { path = "../kiln-search" }
 # Shards, at kiln's one revision (vendor/shards; docs/shards.md): its Agentfile parser, which checks every Agentfile
-# kiln keeps in-process (`agentfiles::check`), and its orchestrator's API, the client of the `shards` kiln carries
-# (`crate::shards`). Hex, the runtime kiln's harness microVMs run under (vendor/hex), built on it. Each name is
+# kiln keeps in-process (`agentfiles::check`), its orchestrator's API, the client of the `shards` kiln carries
+# (`crate::shards`), and its image store, where kiln finds what the carried `shards` built for a microVM
+# (`sandbox::image`). Hex, the runtime kiln's harness microVMs run under (vendor/hex), built on it. Each name is
 # patched to its copy in the root manifest.
 shards-agentfile = "=0.1.0"
 shards-api = "=0.1.0"
+shards-image = "=0.1.0"
 hex-node = "=0.1.0"
+# The holder's enrollment with kiln's CA, and its link to its machine's capacity keeper (`crate::capacity`;
+# kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 13): Hex's QUIC wire, the copy hex-node takes.
+hex-quic = "=0.1.0"
+hex-core = "=0.1.0"
+hex-api = "=0.1.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 anyhow = "1.0.104"
 base64 = "0.23.1"

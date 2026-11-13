@@ -214,6 +214,7 @@ fn spec(inputs: &Inputs, config: &Path, id: &BoxId, init: &[&str]) -> BoxSpec {
         devices: Vec::new(),
         allocation: Some(allocation),
         route: None,
+        band: 0,
     }
 }
 
@@ -625,6 +626,7 @@ fn gpu_spec(inputs: &Inputs, config: &Path, id: &BoxId) -> BoxSpec {
         }],
         allocation: Some(allocation),
         route: None,
+        band: 0,
     }
 }
 

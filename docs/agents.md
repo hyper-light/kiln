@@ -1103,9 +1103,12 @@ None is a process on its machine, as agents start without one. Its start names i
 microVM's image (`spec.isolation: {kind: "microvm", image}`, docs/api.md "Agentfiles"). It goes
 only to a runner that says it starts microVMs (its facts' `virt.microvm`), and anywhere else it's
 refused, never run as a process; where the machine picked would refuse it, the composer says so
-under the row. A runner's kiln starts no microVM itself yet: kiln holds Shards and Hex now
-(docs/shards.md), but it doesn't yet start a harness through Hex (the plan's step 17), so until then
-such a start is refused there, saying so.
+under the row. Once such a start goes through, its harness runs as its image's HARNESS member, its
+stdio the member's streams, and its session drives it through the same adapter as on the host: it
+starts, is steered, interrupted, resumed and stopped as a process is (docs/isolation.md, step 17).
+A runner's kiln starts no microVM itself yet: kiln holds Shards and Hex now (docs/shards.md), but it
+doesn't yet start a harness through Hex (the plan's step 17), so until then such a start is refused
+there, saying so (its facts' `isolation.why_not`).
 
 **Agentfiles** (Agents → Agentfiles, `/agents/agentfiles`) keeps yours: each opened on its own page
 in the code editor's Agentfile mode, checked by Shards as it's typed (`POST /api/agentfiles/check`,
@@ -1216,23 +1219,26 @@ to `s28-pi-agentfile`).
   naming the tools and the system each runs on. An isolated agent can't start a process (above):
   start it from your own session, or from an agent that isn't isolated.
 - **Reach what its Agentfile doesn't grant.** No other folder, port, host or device of the machine.
-  kiln's own MCP isn't reached over the network at all: it comes over the link kiln drives the
-  harness by, as that link's own MCP lane (Shards D254), on every OS kiln runs on. Inside the
-  microVM each harness names the lane's bridge, `/run/shards/mcp`, as a stdio server in its own
-  form (Claude Code's `--mcp-config`, Codex's `-c mcp_servers.kiln.*`, an ACP agent's
-  `mcpServers`, one fixed entry in Antigravity's own `mcp_config.json`), with no token: the lane
-  says which session asks. So no Agentfile grants anything for it, and kiln refuses to keep one that
-  grants a way to kiln itself, at its line, typed (`ReachesKiln`: "kiln's MCP rides the
-  agent-control lane (D254)"). That covers a destination or a remote MCP server that is the machine
-  its runner is (`host.docker.internal`; a loopback, link-local or unspecified address; a network's
-  own gateway) or kiln's server (the hosts its configuration names). Other remote MCP servers, a
-  GitHub MCP for one, stay yours to grant by name.
+  kiln's own MCP takes no grant at all: it comes over the encrypted link kiln drives the harness
+  by, as that link's own MCP lane (Shards D254), on every OS kiln runs on. Inside the microVM each
+  harness names the lane's bridge, `/run/shards/mcp`, as a stdio server in its own form (Claude
+  Code's `--mcp-config`, Codex's `-c mcp_servers.kiln.*`, an ACP agent's `mcpServers`, one fixed
+  entry in Antigravity's own `mcp_config.json`), and kiln answers it itself, with no token of
+  kiln's in the microVM: the lane says which session asks. So no Agentfile grants anything for it,
+  and kiln refuses to keep one that grants a way to kiln itself, at its line, typed (`ReachesKiln`:
+  "kiln's MCP rides the agent-control lane (D254)"). That covers a destination or a remote MCP
+  server that is the machine its runner is (`host.docker.internal`; a loopback, link-local or
+  unspecified address; a network's own gateway) or kiln's server (the hosts its configuration
+  names). Other remote MCP servers, a GitHub MCP for one, stay yours to grant by name. The runner's
+  end of the lane is still to come.
 - **Use a tool its image doesn't have.** The project's toolchain comes from the image: build your
   own Agentfile on your project's image (above).
+- **Move to another machine, or switch to another harness.** Not yet: it stays where it started, in
+  the harness it started with, and says so when asked. To go on elsewhere or in another harness, end
+  it and start a new one there.
 - **Not yet**, as well as the start itself: a terminal into the microVM, its sign-in and exec
   there; git signing and a git host's credentials by the microVM's own key; kiln's MCP, over that
-  lane; moving one to another machine, as
-  your volume stays on the one it ran on; and the commands it asks kiln to run on other machines,
+  lane; and the commands it asks kiln to run on other machines,
   which run in microVMs too or not at all, never on a bare host.
 
 ### Each feature, in a microVM of its own

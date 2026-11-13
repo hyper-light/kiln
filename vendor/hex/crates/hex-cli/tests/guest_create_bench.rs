@@ -142,6 +142,7 @@ fn a_multi_layer_create_through_a_real_guest_is_timed() {
                     hosts: Vec::new(),
                 })),
                 owner: None,
+                band: 0,
             };
             let began = Instant::now();
             node.create(spec)

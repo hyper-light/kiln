@@ -8,6 +8,7 @@
 use super::*;
 
 use std::collections::BTreeSet;
+use std::sync::MutexGuard;
 use std::sync::atomic::AtomicUsize;
 
 use hex_api::sim::SimRuntime;
@@ -619,6 +620,7 @@ impl SimHost {
                     bounds: Bounds::default(),
                     class: ClassSpec::Process,
                     owner: None,
+                    band: 0,
                 })
                 .unwrap();
         }
@@ -822,6 +824,7 @@ fn run(id: u64, name: &str) -> Vec<u8> {
                 bounds: Bounds::default(),
                 class: ClassSpec::Process,
                 owner: None,
+                band: 0,
             }),
             program: Program::of(&["p"]),
             streams: Streams::default(),

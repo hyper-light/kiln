@@ -1,7 +1,7 @@
 //! What the Shards image class's real-node tests share (joint plan steps 12 and 15): their inputs, each by its own
-//! variable; the cgroup each runs under; the node's Shards home and a pull into it; a `hex node` with the Shards class
-//! in the waits census; the census's lines; and each VM's admission, as the node's own cost sizes it. `image_real.rs`
-//! (the class's cases) and `image_grants_real.rs` (its network grants on booted VMs) take them.
+//! variable; the cgroup each runs under; the node's Shards home, and a pull or a build into it; a `hex node` with the
+//! Shards class in the waits census; the census's lines; and each VM's admission, as the node's own cost sizes it.
+//! `image_real.rs` (the class's cases) and `image_grants_real.rs` (its network grants on booted VMs) take them.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -24,7 +24,9 @@ pub fn number(name: &str) -> u64 {
         .unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
-/// This binary's own cgroup, made a parent: it moves into the leaf `leaf`, as native_firecracker_smoke does.
+/// This binary's own cgroup, made a parent: it moves into the leaf `leaf`, as native_firecracker_smoke does. Linux's
+/// alone: a node elsewhere holds its boxes without cgroups.
+#[cfg(target_os = "linux")]
 pub fn own_cgroup(leaf: &str) -> PathBuf {
     let line = fs::read_to_string("/proc/self/cgroup").unwrap();
     let own = Path::new("/sys/fs/cgroup").join(line.trim().strip_prefix("0::/").unwrap());
@@ -39,7 +41,7 @@ pub fn own_cgroup(leaf: &str) -> PathBuf {
 
 /// The node's Shards home and cache (`hex-node`'s `shards_native_paths`: beside its state's records), whose store
 /// its image VMs boot from.
-fn shards_dirs(state: &Path) -> (PathBuf, PathBuf) {
+pub fn shards_dirs(state: &Path) -> (PathBuf, PathBuf) {
     (
         state.join("shards-native-home"),
         state.join("shards-native-cache"),
@@ -66,6 +68,42 @@ pub fn pull(shards: &Path, image: &str, state: &Path) {
     shards_in_home(&["daemon", "stop"]);
 }
 
+/// Builds the Agentfile image in `context` into the node's Shards home (`work`'s state), tagged `tag`, as `shards build
+/// image` builds one, then ends the daemon the build left there, so none of its processes runs beside the node;
+/// returns the image pinned by the manifest digest its build says (`--metadata-file`'s `containerimage.digest`, kept
+/// in `work` beside the tag's name), which Shards' store finds whatever it is named.
+pub fn built(shards: &Path, context: &Path, work: &Path, tag: &str) -> String {
+    let (home, cache) = shards_dirs(&work.join("state"));
+    let metadata = work.join(format!("{}.build.json", tag.replace('/', "-")));
+    let in_home = |command: &mut Command| {
+        let status = command
+            .env("SHARDS_HOME", &home)
+            .env("SHARDS_CACHE", &cache)
+            .stdin(HostStdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{command:?}: {status}");
+    };
+    let begun = Instant::now();
+    in_home(
+        Command::new(shards)
+            .args(["build", "image", "-t", tag, "--metadata-file"])
+            .arg(&metadata)
+            .arg(context),
+    );
+    in_home(Command::new(shards).args(["daemon", "stop"]));
+    let said: serde_json::Value = serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+    let digest = said["containerimage.digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{metadata:?} names no containerimage.digest: {said}"));
+    let image = format!("{tag}@{digest}");
+    eprintln!(
+        "IMAGE built {image} from {context:?} in {:?}",
+        begun.elapsed()
+    );
+    image
+}
+
 /// A `hex node` with the Shards class, in the waits census, ended by its own PID when dropped: its image VMs' run
 /// hosts then see their channel close and end their VMs (D231's run ends with its owner).
 pub struct Node {
@@ -74,20 +112,22 @@ pub struct Node {
 }
 
 impl Node {
-    /// Starts the node, its boxes under the cgroup `own`'s child `boxes`, and waits for its own "ready" line within
-    /// the run's deadline `wait`.
-    pub fn start(work: &Path, own: &Path, wait: Duration, boxes: &str) -> Self {
+    /// Starts the node, its boxes in the cgroup `boxes` where one is named (Linux's `--box-root`), else where its OS's
+    /// node holds them, and waits for its own "ready" line within the run's deadline `wait`.
+    pub fn start(work: &Path, boxes: Option<&Path>, wait: Duration) -> Self {
         let socket = work.join("node.sock");
         let stderr = work.join("node.stderr");
         let begun = Instant::now();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_hex"))
-            .arg("node")
+        let mut node = Command::new(env!("CARGO_BIN_EXE_hex"));
+        node.arg("node")
             .arg("--socket")
             .arg(&socket)
             .arg("--state")
-            .arg(work.join("state"))
-            .arg("--box-root")
-            .arg(own.join(boxes))
+            .arg(work.join("state"));
+        if let Some(boxes) = boxes {
+            node.arg("--box-root").arg(boxes);
+        }
+        let mut child = node
             .env("HEX_WAITS_CENSUS", work.join("census.txt"))
             .env("HEX_WAITS_CENSUS_MAX", input("HEX_WAITS_CENSUS_MAX"))
             .stdin(HostStdio::null())

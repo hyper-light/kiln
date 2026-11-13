@@ -108,6 +108,8 @@ function listing(s: Start, ids: string[]): AgentInfo[] {
     summary: "",
     todos_done: 0,
     todos_total: 0,
+    // Not started yet: kiln has no start of its harness to record.
+    starts: [],
     files_changed: 0,
     lines_added: 0,
     lines_removed: 0,

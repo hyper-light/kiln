@@ -246,7 +246,7 @@ async fn backfill(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Resu
     let mut noted = 0usize;
     for _ in 0..BACKFILL_PAGES {
         let (c, a) = (convo.clone(), after.clone());
-        let page = crate::rt::blocking(move || c.ended(a, crate::convo::store::ENDED_MAX)).await??;
+        let page = crate::rt::blocking(move || c.ended_committed(a, crate::convo::store::ENDED_MAX)).await??;
         let Some((id, at)) = page.last().cloned() else { break };
         let full = page.len() >= crate::convo::store::ENDED_MAX;
         noted = noted.saturating_add(

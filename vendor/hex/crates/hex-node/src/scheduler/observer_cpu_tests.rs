@@ -314,6 +314,7 @@ fn failed_firecracker_observation_keeps_real_service_cpu_progress_without_gpu_fa
                         memory_max: Some(hex_api::MIN_MEMORY),
                         ..Bounds::default()
                     },
+                    band: 0,
                 },
                 start: false,
             },
@@ -572,6 +573,7 @@ fn uncertain_canonical_drain_keeps_cpu_progress_and_retains_original_charge() {
                         memory_max: Some(hex_api::MIN_MEMORY),
                         ..Bounds::default()
                     },
+                    band: 0,
                 },
                 start: false,
             },

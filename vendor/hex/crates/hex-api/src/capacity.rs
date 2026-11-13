@@ -168,9 +168,8 @@ impl View {
     }
 }
 
-/// Where a holder's reserved work runs, as its host's OS accounts that work's memory (CV12): the host reads it in
-/// the same sample as its free memory, which already lacks what the work uses, and credits the room that use, up
-/// to the holder's reservations, while the holder is synced.
+/// Where a holder's reserved work runs, as a hello may name it: on the wire since CV12, which is withdrawn
+/// (`docs/design/capacity-view.md` CV12), so no keeper reads it; it stays, the protocol only appending.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scope {
     /// A cgroup v2 directory, relative to the unified hierarchy's root (Linux).
@@ -181,28 +180,22 @@ pub enum Scope {
     Job(String),
 }
 
-/// Why a holder's scope earns no credit (CV12): the session that named it is closed, typed.
+/// Why a keeper that credited scopes refused one, said as [`Close::Scope`]: on the wire since CV12, which is
+/// withdrawn, so no keeper says it; it stays, the protocol only appending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScopeRefused {
-    /// The host's configuration declares no user for this holder, so nothing can prove the scope its own.
     NoUser,
-    /// The scope isn't the holder's user's: another user owns it, or runs in it.
     NotOwned,
-    /// The host couldn't read the scope: it doesn't exist, or the OS refused.
     Unreadable,
-    /// The scope names nothing a host could read: a path leaving the hierarchy, a name the OS can't take.
     Invalid,
-    /// This host's OS accounts no scope of that kind.
     NotThisPlatform,
 }
-
-/// What a host's sample read of one holder's scope (CV12): what its work used, or why it earns no credit.
-pub type Read = Result<Amounts, ScopeRefused>;
 
 /// A holder's word to the keeper.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToKeeper {
-    /// Opens a session: who it is, its process's epoch, and where its reserved work runs, if it says (CV12).
+    /// Opens a session: who it is and its process's epoch. `scope` is the wire's since CV12, which is withdrawn: the
+    /// keeper ignores it.
     Hello {
         holder: String,
         epoch: u64,
@@ -282,7 +275,8 @@ pub enum Close {
         bound: u64,
     },
     Invalid(Invalid),
-    /// The scope the hello named earns no credit, and why (CV12): the holder may say hello again without it.
+    /// A keeper that credited scopes closed a session for one (CV12, withdrawn): none says it now. It stays on the
+    /// wire, the protocol only appending; a holder told it says hello again.
     Scope(ScopeRefused),
     /// The peer isn't a holder the host's configuration authorizes, or said hello as another holder than the one its
     /// link authenticates (CV8, CV9).
@@ -347,15 +341,8 @@ pub trait CapacityView {
 
 /// The host's side of a machine, which the conformance suite drives besides its links.
 pub trait Host: CapacityView {
-    /// The room measured anew, with what each scoped holder's work uses read in the same sample, by the link its
-    /// holder is on (CV12). A synced holder whose scope isn't here earns no credit; one refused is closed, typed.
-    fn sample(&mut self, room: Amounts, used: &[(u64, Read)]) -> Result<(), Refusal>;
-    /// The room measured anew, no holder's use with it.
-    fn set_room(&mut self, room: Amounts) -> Result<(), Refusal> {
-        self.sample(room, &[])
-    }
-    /// The links whose synced holders named a scope, and each scope: what the host reads in its next sample.
-    fn scopes(&mut self) -> Result<Vec<(u64, Scope)>, Refusal>;
+    /// The room measured anew.
+    fn set_room(&mut self, room: Amounts) -> Result<(), Refusal>;
     /// The host's own admissions are now `local` (a booking rose, a box ended).
     fn set_local(&mut self, local: Amounts) -> Result<(), Refusal>;
     /// The keeper's process ends and starts again from what it kept: every link is gone.
