@@ -6406,12 +6406,19 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     if let Some(c) = &caller {
         may_run_on(c, &body.target, "open an agent there")?;
     }
-    match crate::harness::kinds::Kind::get(&body.spec.kind) {
+    let kind = match crate::harness::kinds::Kind::get(&body.spec.kind) {
         None => return Err(err(StatusCode::BAD_REQUEST, format!("unknown harness {:?}", body.spec.kind))),
         Some(k) if !k.structured() => {
             return Err(err(StatusCode::BAD_REQUEST, format!("{} has no structured mode: open a terminal and run `{}`", k.name, k.program)));
         }
-        Some(_) => {}
+        Some(k) => k,
+    };
+    // The Agentfile its microVM is made from is kiln's for its harness or one its person reaches
+    // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35), as `agents.start` holds it.
+    if let Some(image) = body.spec.isolation.as_mut().and_then(|i| i.image.as_mut()).filter(|i| !i.trim().is_empty()) {
+        let owner = crate::authz::Caller::owner();
+        let who = crate::agentfiles::Who::of(caller.as_ref().unwrap_or(&owner)).map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
+        *image = crate::harness::lineage::image_for(hub, &who, kind, image).await.map_err(|(status, why)| err(status, why))?;
     }
     // A person's own Agentfile for its microVM, read as the caller's (on a kiln nobody else signs in
     // to, the owner's, as its sessions act for: `crate::mcp::acts_for`).
