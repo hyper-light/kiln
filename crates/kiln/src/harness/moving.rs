@@ -291,19 +291,25 @@ pub fn install(pkg: &Package, cwd: &str) -> Result<Option<Vec<Value>>, String> {
             let config = super::transcript::config_dir(&pkg.spec.env);
             // A record of the session here already is the one it left moving away (it comes back):
             // the one coming holds all of it and what came since, and takes its place. One with
-            // turns of its own (resumed here meanwhile) is never written over.
+            // turns of its own (resumed here meanwhile, or a crashed one resumed in place after it
+            // went on here: Amphora, 2026-11-13) is never written over: holding all the one coming
+            // holds, it's what the session goes on from; turns of each the other lacks, refused.
             let left = super::transcript::find(&config, session);
+            let mut body = lines.join("\n");
             if let Some(old) = &left {
                 let had = std::fs::read_to_string(old).map_err(|e| format!("read {}: {e}", old.display()))?;
                 if !holds_all_of(lines, &had) {
-                    return Err(format!("Claude Code here has turns of session {session} that the one coming doesn't, and they are never written over"));
+                    let here: Vec<String> = had.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect();
+                    if !holds_all_of(&here, &body) {
+                        return Err(format!("Claude Code here has turns of session {session} that the one coming doesn't, and it has turns this one doesn't: neither is written over"));
+                    }
+                    body = here.join("\n");
                 }
             }
             let dir = super::handoff::claude_project_dir(&config, cwd);
             std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
             let path = dir.join(format!("{session}.jsonl"));
             let part = dir.join(format!(".{session}.jsonl.part"));
-            let mut body = lines.join("\n");
             body.push('\n');
             if let Err(e) = std::fs::write(&part, body).and_then(|()| std::fs::rename(&part, &path)) {
                 let _ = std::fs::remove_file(&part);
@@ -444,9 +450,13 @@ mod tests {
         assert!(found.starts_with(super::super::handoff::claude_project_dir(config.path(), &now)));
         assert_eq!(std::fs::read_to_string(&found)?.lines().count(), 4);
         assert!(!super::super::handoff::claude_project_dir(config.path(), &then).join("abc.jsonl").exists(), "one record of a session, not two");
-        // A record here with a turn the one coming doesn't have stays as it is.
-        let err = put(&now, vec![msg("u1"), msg("u2")]).err().unwrap_or_default();
-        assert!(err.contains("never written over"), "{err}");
+        // A record here with a turn the one coming doesn't have stays as it is, and the session goes
+        // on from it (Amphora, 2026-11-13: resumed in place after it went on here).
+        put(&now, vec![msg("u1"), msg("u2")]).map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(std::fs::read_to_string(&found)?.lines().count(), 4, "the record here, as it was");
+        // Turns of each the other lacks: neither is written over.
+        let err = put(&now, vec![msg("u1"), msg("u9")]).err().unwrap_or_default();
+        assert!(err.contains("neither is written over"), "{err}");
         assert_eq!(std::fs::read_to_string(&found)?.lines().count(), 4);
         Ok(())
     }
