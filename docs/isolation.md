@@ -118,9 +118,12 @@ What a session does to its harness maps onto the member:
   again in a microVM of the newer process, its conversation going on.
 - **A switch to another harness** (`NO_SWITCH`): its microVM runs its own harness's image. Refused as
   it's asked, as a switch kiln can't make is.
-- **kiln's own tools** aren't given it: kiln's MCP server, its skills and its hooks are reached through
-  the machine's runner's socket, which no microVM reaches (step 18 brings them in). An isolated ACP
-  agent is offered no MCP server.
+- **kiln's MCP** reaches it over its link's own MCP lane (Shards D254), never the network: its harness's
+  config names its microVM's bridge, `/run/shards/mcp`, and its runner serves each connection to it in its
+  own process (`sandbox::isolated::bridge`, over `reach::mcp::serve_lane`), knowing its session by the lane,
+  with no token in the microVM. Where its microVMs carry no lane (`Microvms::mcp`; the Hex kiln vendors
+  until it passes `MemberSpec::mcp` and takes `Execs::mcp`'s connections: `hexvm::NO_MCP_LANE`), its harness
+  starts without kiln's MCP, said, and an ACP agent is offered no MCP server.
 - **What its boundary doesn't hold** is refused by the boundary, typed (`Refusal::Unsupported`), and the
   session's start fails in its words.
 
@@ -142,7 +145,8 @@ state), and `sandbox::hexvm::HexVms` as the runner's sandbox; its facts then say
 the one placement holds for its session (`Holder::box_of`), else the next of placement's own numbering of boxes that
 reserve nothing (`kiln-z…`, shared with its holding), so no two share a name. Its charge is kept in placement's records as it
 ends (`hexvm::USE`), and placement reads its use from its VM's meter once it's launched (`Group::Hex`). A launch adds kiln's variables
-(`isolated::env::member_env`) and kiln's MCP through the link's bridge (`isolated::mcp`), and refuses a project built
+(`isolated::env::member_env`) and kiln's MCP through the link's bridge (`isolated::mcp`) where Hex carries its lane (`hexvm::HexMcp`: its harness
+member asked for its bridge, each connection taken for the runner's `isolated::bridge`), and refuses a project built
 with its host's own tools (`isolated::host_tools`). A kiln that carries no Shards holds no isolated agent, and the
 launch is held by the conformance suite and a stand-in alone (below).
 

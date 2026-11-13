@@ -5115,7 +5115,9 @@ while True:
             let lanes = ["control", "stdin:0", "stdout:0", "stderr:0"].map(str::to_owned).to_vec();
             let link = kiln_seams::sandbox::Link { controller: end(), endpoint: end(), lanes };
             let vms = Arc::new(crate::sandbox::fake::FakeVms::with(&pinned, "claude", &program).linked(link.clone()));
-            host.hold_isolated_in(crate::sandbox::Microvms::new(Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images));
+            // They carry kiln's MCP lane (Shards D254; #75 step 3), its connections a stand-in's: none.
+            let lanes = Arc::new(crate::sandbox::fake::FakeLanes::default());
+            host.hold_isolated_in(crate::sandbox::Microvms::new(Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images).with_lanes(Arc::clone(&lanes) as Arc<dyn crate::sandbox::Lanes>));
             let cwd = dir.path().to_string_lossy().into_owned();
             // Its person's volumes kept on the machine (goal 65's finding: where its conversation ran is kept beside them).
             host.keep_homes(dir.path().join("homes"));
@@ -5135,6 +5137,8 @@ while True:
             assert!(launch.env.contains(&("KILN_AGENT".to_owned(), "isolated".to_owned())), "its mark: {:?}", launch.env);
             let mcp = launch.args.iter().position(|a| a == "--mcp-config").and_then(|i| launch.args.get(i + 1));
             assert!(mcp.is_some_and(|c| c.contains(crate::harness::isolated::mcp::BRIDGE)), "kiln's MCP through its bridge: {:?}", launch.args);
+            // This runner takes its run's connections to that bridge from its lane (#75 step 3).
+            until_it("its lane asked for its run's connections", 60, || lanes.asked().first().is_some_and(|r| r == "fake-vm-1")).await?;
             // What it sees of the machine: its project at its own path, its person's volume here as its
             // HOME, made before it started (`harness::isolated::home::Layout::prepare`), and the plugin
             // folders Claude Code loads on the machine (kiln's skills, its session's), read-only at their
