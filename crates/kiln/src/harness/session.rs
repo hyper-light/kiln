@@ -172,8 +172,9 @@ fn ran_in_of(spec: &Spec, runs: Option<&Runs>, conversation: Option<&str>) -> Op
 }
 
 /// Keeps, beside its person's volume, which image `s`'s conversation runs in ([`ran_in_of`]), off the
-/// runtime's threads: a pick-up goes on there (`aisessions`, a history's `isolation`).
-fn keep_ran_in(s: &Session, files: &Files) {
+/// runtime's threads, done before its run's start or end goes on, so a run that follows finds it: a
+/// pick-up goes on there (`aisessions`, a history's `isolation`).
+async fn keep_ran_in(s: &Session, files: &Files) {
     let Some(homes) = files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.homes().map(std::path::Path::to_path_buf)) else {
         return;
     };
@@ -192,17 +193,14 @@ fn keep_ran_in(s: &Session, files: &Files) {
             return;
         }
     };
-    let id = s.id.clone();
-    crate::rt::spawn(async move {
-        let failed = match crate::rt::blocking(move || crate::harness::isolated::home::keep_ran_in(&dir, &ran)).await {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e.to_string()),
-            Err(e) => Some(format!("{e:#}")),
-        };
-        if let Some(e) = failed {
-            tracing::warn!(session = %id, error = %e, "where its conversation ran isn't kept beside its person's volume");
-        }
-    });
+    let failed = match crate::rt::blocking(move || crate::harness::isolated::home::keep_ran_in(&dir, &ran)).await {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(e) => Some(format!("{e:#}")),
+    };
+    if let Some(e) = failed {
+        tracing::warn!(session = %s.id, error = %e, "where its conversation ran isn't kept beside its person's volume");
+    }
 }
 
 /// What a microVM's session says where its run keeps its image's destinations whole because kiln
@@ -4599,7 +4597,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 // Its process here; none for a harness its boundary holds (a microVM's member).
                 *s.pid.lock() = p.host_pid();
                 s.began(&p);
-                keep_ran_in(&s, &files);
+                keep_ran_in(&s, &files).await;
                 ran_here = true;
                 if adopted {
                     let mut core = s.core.lock();
@@ -4945,7 +4943,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 p.terminate(Duration::from_secs(2));
                                 let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
                                 *s.pid.lock() = None;
-                                keep_ran_in(&s, &files);
+                                keep_ran_in(&s, &files).await;
                                 s.ended_run(None);
                                 // What its adapter held goes with its record, in its queue.
                                 adapter.let_go(&mut s.core.lock());
@@ -5020,7 +5018,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             .await;
                             p.terminate(Duration::from_secs(3));
                             *s.pid.lock() = None;
-                            keep_ran_in(&s, &files);
+                            keep_ran_in(&s, &files).await;
                             s.ended_run(None);
                             if let Some(g) = group {
                                 end_group(g, Duration::from_millis(3500));
@@ -5164,7 +5162,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                 }
                 *s.pid.lock() = None;
-                keep_ran_in(&s, &files);
+                keep_ran_in(&s, &files).await;
                 s.ended_run(code);
                 // A conversation carried in that it took is in its own session now, which it
                 // starts again on (Antigravity starts again for a new mode, model or effort); one
