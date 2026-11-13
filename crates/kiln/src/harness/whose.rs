@@ -55,14 +55,26 @@ pub struct Roots {
 impl Roots {
     /// This machine's, for a session whose environment is `env` (which may move a harness's home).
     pub fn here(env: &[(String, String)]) -> Self {
-        let dirs = super::homes::Dirs::here(env);
+        Self::of_dirs(Some(&super::homes::Dirs::here(env)))
+    }
+
+    /// Session `spec`'s: in a microVM of its own, its harness's homes are its person's volume as
+    /// this machine sees it (`homes::Dirs::of`), and none of this machine's own person's.
+    pub fn of(spec: &super::session::Spec) -> Self {
+        Self::of_dirs(super::homes::Dirs::of(spec).as_ref())
+    }
+
+    fn of_dirs(dirs: Option<&super::homes::Dirs>) -> Self {
         let mut own: Vec<PathBuf> = KILN.lock().clone();
-        own.push(dirs.cache());
+        if let Some(d) = dirs {
+            own.push(d.cache());
+        }
         own.push(std::env::temp_dir());
         if cfg!(unix) {
             own.extend([PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]);
         }
-        let mut roots = Self { home: dirs.home().to_path_buf(), harness: dirs.harness_homes(), own };
+        let (home, harness) = dirs.map_or_else(|| (PathBuf::new(), Vec::new()), |d| (d.home().to_path_buf(), d.harness_homes()));
+        let mut roots = Self { home, harness, own };
         roots.harness = with_real(std::mem::take(&mut roots.harness));
         roots.own = with_real(std::mem::take(&mut roots.own));
         roots

@@ -211,18 +211,38 @@ pub struct Dirs {
     env: Vec<(String, String)>,
     /// The machine's own environment counts after the session's.
     machine: bool,
+    /// Its harness runs on Linux whatever this machine is (a microVM's): Linux's places, not this
+    /// system's.
+    linux: bool,
 }
 
 impl Dirs {
     /// This machine's, for a session with environment `env`.
     pub fn here(env: &[(String, String)]) -> Self {
-        Self { home: crate::os::home_dir(), env: env.to_vec(), machine: true }
+        Self { home: crate::os::home_dir(), env: env.to_vec(), machine: true, linux: false }
+    }
+
+    /// Those of a harness in a microVM of its own, from `env`, its person's volume as this machine
+    /// sees it (`super::isolated::home::Layout::host_env`): its home is the one `env` names, its
+    /// places are Linux's, and nothing of this machine's own environment or home counts, where the
+    /// machine's own person's harnesses keep their files.
+    /// None when `env` names no home (an isolated session's environment that isn't its volume's
+    /// view): then nothing of its harness's is read here, never this machine's own instead.
+    pub fn microvm(env: &[(String, String)]) -> Option<Self> {
+        let home = env.iter().rev().find(|(k, _)| k == "HOME").map(|(_, v)| PathBuf::from(v)).filter(|h| h.is_absolute())?;
+        Some(Self { home, env: env.to_vec(), machine: false, linux: true })
+    }
+
+    /// Session `spec`'s: a microVM's when it's held in one ([`Self::microvm`]), else this
+    /// machine's.
+    pub fn of(spec: &super::session::Spec) -> Option<Self> {
+        if spec.isolation.is_some() { Self::microvm(&spec.env) } else { Some(Self::here(&spec.env)) }
     }
 
     /// Those of a machine whose home is `home`, from `env` alone (a test's).
     #[cfg(test)]
     pub fn at(home: &Path, env: &[(String, String)]) -> Self {
-        Self { home: home.to_path_buf(), env: env.to_vec(), machine: false }
+        Self { home: home.to_path_buf(), env: env.to_vec(), machine: false, linux: false }
     }
 
     fn var(&self, key: &str) -> Option<PathBuf> {
@@ -255,6 +275,7 @@ impl Dirs {
             return root.join("config");
         }
         if cfg!(windows)
+            && !self.linux
             && let Some(app) = self.var("APPDATA")
         {
             return app.join("Block").join("goose").join("config");
@@ -275,7 +296,7 @@ impl Dirs {
 
     /// The person's cache folder (`XDG_CACHE_HOME`; else `~/Library/Caches` on macOS, `~/.cache`).
     pub fn cache(&self) -> PathBuf {
-        self.var("XDG_CACHE_HOME").unwrap_or_else(|| if cfg!(target_os = "macos") { self.home.join("Library").join("Caches") } else { self.home.join(".cache") })
+        self.var("XDG_CACHE_HOME").unwrap_or_else(|| if cfg!(target_os = "macos") && !self.linux { self.home.join("Library").join("Caches") } else { self.home.join(".cache") })
     }
 
     /// `path` as the person knows it: from their home, else whole.

@@ -4,6 +4,6 @@
   "version": "1.5.2",
   "run": {
     "command": ["pi", "--mode", "rpc"],
-    "env": ["PI_CODING_AGENT_DIR=/home/pi/.pi/agent", "PI_SKIP_VERSION_CHECK=1"]
+    "env": ["HOME=/home/pi", "PI_CODING_AGENT_DIR=/home/pi/.pi/agent", "PI_SKIP_VERSION_CHECK=1", "XDG_CACHE_HOME=/tmp/.cache"]
   }
 }

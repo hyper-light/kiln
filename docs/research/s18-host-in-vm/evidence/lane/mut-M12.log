@@ -1,0 +1,21 @@
+vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18: warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14: warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10: warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18: warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10: warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+
+running 1 test
+harness::trouble::tests::step18_h6_an_answer_ends_it_and_another_kind_is_said_anew --- FAILED
+
+failures:
+
+---- harness::trouble::tests::step18_h6_an_answer_ends_it_and_another_kind_is_said_anew stdout ----
+Error: Condition failed: `core.state.trouble.is_none()`
+
+
+failures:
+    harness::trouble::tests::step18_h6_an_answer_ends_it_and_another_kind_is_said_anew
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4529 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p kiln --lib`
