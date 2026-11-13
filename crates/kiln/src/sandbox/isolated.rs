@@ -133,7 +133,7 @@ mod tests {
         assert!(not_its_own.contains("for codex, not Claude Code"), "{not_its_own}");
         assert!(name(claude, &spec(Some("agentfile:../etc"), Some("FROM scratch\n"))).is_err(), "an id is 32 lowercase hex digits");
         assert!(name(claude, &spec(Some("ubuntu:24.04"), None)).is_err(), "neither kiln's nor a person's Agentfile");
-        let container = Spec { isolation: Some(Isolation { kind: "container".into(), image: None, person: None }), ..Spec::default() };
+        let container = Spec { isolation: Some(Isolation { kind: "container".into(), ..Isolation::microvm() }), ..Spec::default() };
         assert!(name(claude, &container).is_err(), "only microVMs hold agents");
         assert!(name(claude, &Spec::default()).is_err(), "a session that isn't isolated has none");
         Ok(())
