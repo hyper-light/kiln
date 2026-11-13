@@ -152,7 +152,8 @@ WSL form. `stub::` and `host::` are Unix's (the stand-in is a Python script run 
 stand-in for each harness, and no `VM_E2E_PROMPT`: no vendor's CLI and no model anywhere. The drive
 writes the stand-in's Agentfile for the harness (`stub_agentfile`: its text alone, as kiln plan step
 17 builds a person's, kiln's own images' base, the harness named as kiln starts it, its home as
-kiln's images mount theirs, no network at all), keeps it in kiln (`POST /api/agentfiles`), boots `agentfile:<id>` and removes it after. Its
+kiln's images mount theirs: its harness.json's `run.env` sets `HOME=/home/stub` for every kind, and
+that is its harness's volume, else kiln refuses it (`NoConfigVolume`), no network at all), keeps it in kiln (`POST /api/agentfiles`), boots `agentfile:<id>` and removes it after. Its
 `HARNESS` comes from kiln's repository at this checkout's commit, which Shards' own git client fetches
 on the runner: the commit must be on GitHub, and the runner must reach github.com. ARGs expand in
 `HARNESS ... FROM`, as kiln's own Agentfiles use them; a Git source built so is a first (owed: ROOT's
