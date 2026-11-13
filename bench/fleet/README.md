@@ -22,7 +22,11 @@ whole stack a run measured. Hex is driven through its own scheduler's command li
 - **The host agent** (`fleet.py host`, one per host, under `kiln run`): owns everything the run starts
   on its host, in a scope of its own (`OUT/s`: the Shards home, its Docker config), fills the host,
   measures, takes the chaos, drains, verifies and tears down. Its processes are the kiln run's own,
-  so kiln's between-turns sweep leaves them; the run's end ends anything they left.
+  so kiln's between-turns sweep leaves them; the run's end ends anything they left. Each live VM's
+  lane holds two of its descriptors, so it lifts its open-file limit to the most the OS lets it hold
+  (the hard limit; on macOS kern.maxfilesperproc, where a shell's soft limit is 256) and records it
+  (`nofile` in its `host` record); an ask whose client the host can't spawn is refused, typed
+  (`start_failed`, `refused`), and the fill stops there. An ended ask's descriptors close with it.
 - **The driver** decides how a VM is asked for. Built: `shards`, the direct driver (below), which is
   the baseline every placer is held to and the harness's light test. Owed: `hex` and `kiln`
   (Owed, below).
@@ -49,14 +53,17 @@ clock, and the controller only starts, collects and reports.
 - The view (which VM process the daemon says runs each ask) is `shards inspect vm`'s `.State.Pid`.
   The scan is the OS's own process table: the daemon's descendants, and, for what a daemon that died
   left behind, every process whose arguments name the run's home; each `shards-net` is paired to its
-  `shards-vm` by the MAC address both are given (`--net …,MAC` and `--mac MAC`).
+  `shards-vm` by the MAC address both are given (`--net …,MAC` and `--mac MAC`). A network process
+  starts under its VM's parent and names no home (Shards' `crates/shards/src/netproc.rs`, D183), so
+  every MAC a scan has paired with one of the run's VMs is kept: a network process with one is the
+  run's while it lives, found even after its VM and its daemon are gone.
 
 ## What is measured
 
 | Metric | What one sample is | Where |
 |---|---|---|
 | density | VMs running at once on the host, at each scan of the hold; and each VM's host memory (its `shards-vm` and `shards-net` processes: PSS on Linux, physical footprint on macOS, working set on Windows) | `scan` |
-| start latency | an ask's client spawned to its lane's first echo: the VM booted, its workload answering | `started` |
+| start latency | an ask's client spawned to its lane's first echo: the VM booted, its workload answering. A wave's lanes are served between its spawns, so a start is charged its own spawn and those under way until its echo came, never the rest of its wave's (each ask's spawn is recorded, `spawn_ns`; the first light test's starts were charged up to the whole wave's, 414 ms of spawns in a wave of 25) | `started` |
 | control round trip | one control message (below) written on a lane and read back whole, every VM's lane at once, one outstanding each | `rtt` |
 | stream throughput, a turn | one turn's stream (below) written while its echo is read back, every lane at once; MiB/s per stream | `turn` |
 | stream throughput, bulk | one transfer of the converged size (below) written while its echo is read back, every lane at once; MiB/s per stream. Each size's round is kept (`bulk` with `size`, `bulk_round`); the report reads the converged size's | `bulk`, `bulk_size` |
@@ -96,7 +103,7 @@ scan, each read on its own (`fleetlib/witness.py`):
 | `doubled` | one ask has two VM processes, or one VM process two asks, or (controller) one ask is live on two hosts |
 | `lost` | an ask the ledger holds live has no VM process |
 | `leaked` | a VM process in scope that no live ask holds |
-| `orphan` | a network process whose VM is gone |
+| `orphan` | a network process whose VM is gone: one whose MAC a scan paired with a VM of the run's, or one under the daemon whose MAC no VM of the run's ever had |
 | `unasked` | the placer runs a VM for an ask never made, or one already ended |
 | `ended_unasked` | a live VM's run ended with nobody ending it (typed, with its client's exit) |
 | `stray`, `left` | any VM or network process before teardown, or any process naming the home after it |
@@ -152,6 +159,16 @@ kiln run --on HOST --needs mem=16g,cpus=8 -- \
 (From an agent: kiln MCP `run` with `on`, `needs`, `background: true` and `cwd` the checkout.) The
 host's `OUT/records.jsonl` and `OUT/summary.txt` stay on the host.
 
+kiln's checkout is large, and its sync to a busy host can fail to finish (the first light test's
+three syncs to adacachy timed out). Then copy the harness alone and name the revision it is, since a
+copy has none of its own:
+
+```sh
+git archive HEAD bench/fleet | ssh HOST 'rm -rf ~/.cache/kiln-fleet/src && mkdir -p ~/.cache/kiln-fleet/src && tar xf - -C ~/.cache/kiln-fleet/src'
+kiln run --on HOST --needs mem=16g,cpus=8 --no-sync -- \
+  'cd ~/.cache/kiln-fleet/src && nice -n 10 python3 bench/fleet/fleet.py host --rev REV …'   # REV: git rev-parse HEAD
+```
+
 **The fleet**: a plan, then one command.
 
 ```json
@@ -186,9 +203,12 @@ The light tests read "do X, expect Y": percentiles, every derivation, each witne
 (and not found where it must not be), the ask's state machine, the chaos scope and pid-reuse refusals,
 lanes on loopback (`cat`: round trips and a 4 MiB transfer on four lanes at once, a lane that alters
 bytes found `corrupt`, a lane's end as an event), the OS's process table, the scan's pairing, orphans
-and zombies, a lag that settles and one that doesn't, a hold over `cat` lanes (every kind of sample
-on every lane), a mute lane's stall backed off to the run's deadline, and the report. `mutate.py` removes each of 20
-guards in a copy and requires the tests to fail.
+and zombies, a network process found and judged `orphan` after its VM and daemon are gone, a lag
+that settles and one that doesn't, asks on the real direct driver with a stand-in `shards` that is
+`cat` (a wave's echoes read between its slow spawns, no descriptor left by an ended ask, a spawn the
+host refuses typed and stopping the fill), a hold over `cat` lanes (every kind of sample on every
+lane), a mute lane's stall backed off to the run's deadline, and the report. `mutate.py` removes
+each of 25 guards in a copy and requires the tests to fail.
 
 ## The profile
 
