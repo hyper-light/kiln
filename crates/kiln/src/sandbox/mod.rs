@@ -40,6 +40,20 @@ use kiln_seams::sandbox::{Exit, Link, Output, Refusal, Run, Signal};
 pub struct Microvms {
     pub sandbox: Arc<dyn Sandbox>,
     pub images: image::Images,
+    /// The sandbox as Hex's, where it is: what launches a run in the box placement named for it.
+    pub hex: Option<Arc<hexvm::HexVms>>,
+}
+
+impl Microvms {
+    /// Runs in `sandbox`, booting `images`: a stand-in's, launched as the seam launches.
+    pub fn new(sandbox: Arc<dyn Sandbox>, images: image::Images) -> Self {
+        Self { sandbox, images, hex: None }
+    }
+}
+
+/// The machine's microVMs held under kiln's `state` through Hex, the carried `shards` (`shards`) running them.
+pub fn held_in(_state: &std::path::Path, _shards: std::path::PathBuf) -> anyhow::Result<Microvms> {
+    anyhow::bail!("{NO_MICROVM}")
 }
 
 /// The microVMs this machine holds isolated agents' harnesses in: none until this kiln carries their
@@ -65,8 +79,13 @@ pub type Facts = kiln_ci::facts::Isolation;
 
 /// This machine's isolation facts: whether it holds isolated agents, on what, and why not.
 pub fn facts(kvm: bool) -> Facts {
+    facts_of(kvm, microvm().as_deref())
+}
+
+/// The isolation facts of a machine holding isolated agents in `held`, or in none.
+pub fn facts_of(kvm: bool, held: Option<&Microvms>) -> Facts {
     let hypervisor = hypervisor(kvm);
-    match microvm() {
+    match held {
         Some(_) => Facts { available: true, hypervisor, why_not: None },
         None => Facts { available: false, hypervisor, why_not: Some(NO_MICROVM.to_owned()) },
     }
@@ -223,5 +242,26 @@ mod tests {
         assert_eq!(with_kvm.why_not.as_deref(), Some(super::NO_MICROVM));
         assert_eq!(with_kvm.hypervisor.as_deref(), cfg!(target_os = "linux").then_some("KVM"));
         assert_eq!(super::facts(false).hypervisor, None);
+    }
+
+    /// #73 part 7 slice 2 (step 17): a runner whose kiln carries Shards holds its isolated agents' harnesses in Hex's
+    /// microVMs, the sandbox `HexVms` over Hex's image runtime (its records, Shards' home and cache beneath kiln's
+    /// state), and its facts say it holds them (`virt.microvm` is their `available`). No VM boots.
+    #[test]
+    fn s17_p7_a_carrying_runner_holds_harnesses_in_hex_and_says_so() -> anyhow::Result<()> {
+        let state = tempfile::tempdir()?;
+        let vms = super::held_in(state.path(), state.path().join("shards"))?;
+        anyhow::ensure!(vms.hex.is_some(), "its sandbox isn't Hex's");
+        anyhow::ensure!(vms.sandbox.boundaries() == vec!["microvm"] && vms.sandbox.holds() == super::hexvm::HOLDS, "its sandbox isn't HexVms");
+        anyhow::ensure!(state.path().join("hex-records").join("state").exists(), "Hex keeps no records beneath kiln's state");
+        let facts = super::facts_of(true, Some(&vms));
+        anyhow::ensure!(facts.available && facts.why_not.is_none(), "{facts:?}");
+        crate::rt::block_on(async move {
+            let (sink, _updates) = async_channel::unbounded::<(String, crate::harness::core::Update)>();
+            let host = crate::harness::host::Host::new(sink, None, crate::harness::host::Limits::default());
+            host.hold_isolated_in(vms);
+            anyhow::ensure!(host.microvm().is_some_and(|m| m.hex.is_some()), "its harness host holds them elsewhere");
+            Ok(())
+        })
     }
 }
