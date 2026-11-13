@@ -346,6 +346,11 @@ async fn record(hub: &Hub, who: &Who, id: &str) -> R<Record> {
     r.filter(|r| who.reaches(&r.owner)).ok_or(Error::Missing)
 }
 
+/// One the caller reaches, without its text; another's is as none.
+pub async fn brief(hub: &Hub, who: &Who, id: &str) -> R<Brief> {
+    record(hub, who, id).await.map(Record::brief)
+}
+
 /// One the caller reaches, its text read back from `blobs`; another's is as none.
 pub async fn get(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str) -> R<Agentfile> {
     let r = record(hub, who, id).await?;

@@ -44,6 +44,9 @@ const WORKFLOWS: &[(&str, &str, &str)] = &[
 /// KilnCD's files in `.kiln`, not workflows.
 const CD_FILES: &[&str] = &["deploy.yaml", "environments.yaml"];
 
+/// The repository's CI settings (`.kiln/config.yaml`, docs/ci.md Appendix E), not a workflow.
+const SETTINGS_FILES: &[&str] = &["config.yaml"];
+
 /// A runner as `ci.runners.list` gives it.
 #[derive(Deserialize)]
 struct Runner {
@@ -183,7 +186,8 @@ fn read(file: &str) -> Result<String, String> {
 }
 
 /// Every `.kiln` workflow has no errors and no `KCI6007`, runs on its own trigger, plans, and has
-/// a pool or one of production's runners for each leg; the CD files are CD's.
+/// a pool or one of production's runners for each leg; the CD files are CD's; kiln's settings put
+/// its `.kiln/` workflows on the engine (W29-R16 stage 3).
 #[test]
 fn w28_kilns_own_workflows_check_plan_and_route() -> Result<(), String> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln");
@@ -195,9 +199,9 @@ fn w28_kilns_own_workflows_check_plan_and_route() -> Result<(), String> {
         .filter(|n| n.ends_with(".yaml") || n.ends_with(".yml"))
         .collect();
     found.sort();
-    let mut known: Vec<String> = WORKFLOWS.iter().map(|(f, _, _)| (*f).to_owned()).chain(CD_FILES.iter().map(|f| (*f).to_owned())).collect();
+    let mut known: Vec<String> = WORKFLOWS.iter().map(|(f, _, _)| (*f).to_owned()).chain(CD_FILES.iter().chain(SETTINGS_FILES).map(|f| (*f).to_owned())).collect();
     known.sort();
-    assert_eq!(found, known, "each file of .kiln is a workflow here with its trigger, or a CD file");
+    assert_eq!(found, known, "each file of .kiln is a workflow here with its trigger, a CD file or its settings");
     let runners = production_runners()?;
     assert!(runners.len() >= 8, "production's runners: {}", runners.len());
     let pools = [k8s_pool()];
@@ -205,7 +209,7 @@ fn w28_kilns_own_workflows_check_plan_and_route() -> Result<(), String> {
     for (file, event, branch) in WORKFLOWS {
         all.extend(problems(file, &read(file)?, event, branch, &runners, &pools));
     }
-    for file in CD_FILES {
+    for file in CD_FILES.iter().chain(SETTINGS_FILES) {
         let path = format!(".kiln/{file}");
         assert_eq!(wf::file_kind(&path), Some(FileKind::Policy), "{path}");
         let (checked, model) = wf::check_model(&path, &read(file)?, None);
@@ -214,6 +218,8 @@ fn w28_kilns_own_workflows_check_plan_and_route() -> Result<(), String> {
     let envs: BTreeMap<String, kiln_cd::apps::EnvironmentSpec> = serde_yaml::from_str(&read("environments.yaml")?).map_err(|e| format!("environments.yaml: {e}"))?;
     let apps = kiln_cd::apps::from_deploy_file(&read("deploy.yaml")?, "https://github.com/hyper-light/kiln.git", "main", &envs, &kiln_cd::apps::Scope::default()).map_err(|e| format!("deploy.yaml: {}", e.0))?;
     assert!(!apps.is_empty(), "deploy.yaml deploys apps");
+    let settings: super::repo_config::RepoConfig = serde_yaml::from_str(&read("config.yaml")?).map_err(|e| format!("config.yaml: {e}"))?;
+    assert_eq!(settings.kiln_workflows(), Some(true), "kiln's .kiln/ workflows run on the engine");
     if all.is_empty() { Ok(()) } else { Err(all.join("\n")) }
 }
 
