@@ -1,0 +1,4 @@
+# kiln's own CI settings (docs/ci.md Appendix E), read from main, never from the commit being run.
+# Its .kiln/ workflows run on the CI engine, v1 standing aside (W29-R16 stage 3; Ada, 2026-11-12:
+# "Switch kiln directly").
+kiln_workflows: on

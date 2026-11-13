@@ -17,7 +17,7 @@
 //!   weak ETag the handler set is taken as that validator, its body not digested again: a read model's,
 //!   made once for what it answers ([`weak_etag`]; goal 9, plan 01a1a87b2cec step 5).
 //!
-//! The work runs on the shard when it fits a step's quantum, else on the compute pool
+//! The work runs on the shard when it fits what's left of its poll's step quantum, else on the compute pool
 //! (`crate::rt::compute`): a large body never holds the shard that serves every other socket on it.
 
 use std::io::{self, Write as _};
@@ -192,13 +192,14 @@ impl Work {
     }
 }
 
-/// Whether `len` bytes of `work` fit in this shard's step quantum (hyper-rt's measured wake cost,
-/// else its configured step budget): so it runs here; past it, the compute pool takes it. Off a
-/// shard (a thread of its own, a test) it always runs where it is.
+/// Whether `len` bytes of `work` fit what's left of this poll's step quantum (`kiln_http::turn::room`), at its measured
+/// rate: so it runs here; past it, the compute pool takes it. Off a shard (a thread of its own, a test) it always runs
+/// where it is. Goal 9, plan 01a1a87b2cec step 3: held to a whole quantum, a poll that had read its request, run its route
+/// and named its answer then compressed up to 26 KB of gzip, 33 KB of brotli or 75 KB of a WebSocket message on top.
 pub fn inline(work: Work, len: usize) -> bool {
-    match hyper_rt::futures::step_budget_ns() {
+    match kiln_http::turn::room() {
         None => true,
-        Some(quantum) => (len as u64).saturating_mul(work.ps_per_byte()) / 1000 <= quantum,
+        Some(room) => u64::try_from(room).is_ok_and(|room| (len as u64).saturating_mul(work.ps_per_byte()) / 1000 <= room),
     }
 }
 
@@ -439,8 +440,8 @@ pub struct Later {
     force: bool,
 }
 
-/// [`finish`] as far as it goes without waiting: an answer it leaves as it is, or works out here (its body fits a
-/// step's quantum, [`inline`]), done; one whose body's work doesn't fit, left for [`finish_later`]. So `crate::api`'s
+/// [`finish`] as far as it goes without waiting: an answer it leaves as it is, or works out here (its body's work fits
+/// what's left of its poll's quantum, [`inline`]), done; one whose body's work doesn't fit, left for [`finish_later`]. So `crate::api`'s
 /// handler makes a future for an answer only where its work goes to the compute pool (goal 9, plan 01a1a87b2cec
 /// step 5: every answer finish changed was a boxed future, its work done in that future's first poll).
 pub fn finish_here(asked: Asked, resp: Response) -> Finished {
@@ -1113,6 +1114,38 @@ pub(crate) mod tests {
             anyhow::ensure!(matches!(finish_here(Asked::of(&get(&[])), unnamed), Finished::Later(_)), "one to digest goes to the compute pool");
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an answer's work is done on its shard only where it fits what's left of its poll's
+    /// quantum, not a whole one. A body a quantum gzips in half fits a fresh poll, and once the poll has spent five eighths
+    /// of its quantum it doesn't: asked for in gzip, it goes to the compute pool. Off a shard it's done where it is. Held to
+    /// a whole quantum, a poll that had read its request and run its route compressed up to 26 KB of gzip on top.
+    #[test]
+    fn g9_s3_an_answers_work_is_done_here_only_where_it_fits_whats_left_of_its_poll() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let quantum = hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
+            let half = usize::try_from(quantum / 2 * 1000 / Work::Gzip.ps_per_byte())?;
+            // A fresh poll (after a yield; a host that holds the thread a whole quantum just after one is let try again).
+            let mut fitted = false;
+            for _ in 0..100 {
+                hyper_rt::futures::yield_now().await;
+                if inline(Work::Gzip, half) {
+                    fitted = true;
+                    break;
+                }
+            }
+            anyhow::ensure!(fitted, "half a quantum's gzip fits a fresh poll");
+            while hyper_rt::futures::poll_clock().is_some_and(|p| p.held_ns() < quantum / 2 + quantum / 8) {
+                std::hint::spin_loop();
+            }
+            anyhow::ensure!(!inline(Work::Gzip, half), "nor what's left of a poll past five eighths of its quantum");
+            let body: Vec<u8> = std::iter::once(b'[').chain(std::iter::repeat_n(b'1', half)).chain(*b"]").collect();
+            let resp = srv::response(StatusCode::OK, "application/json", srv::full(body));
+            anyhow::ensure!(matches!(finish_here(Asked::of(&get(&[("accept-encoding", "gzip")])), resp), Finished::Later(_)), "so its gzip goes to the compute pool");
+            Ok(())
+        })?;
+        anyhow::ensure!(inline(Work::Gzip, 1 << 30), "off a shard, where it is");
+        Ok(())
     }
 
     #[test]
