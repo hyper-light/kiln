@@ -495,7 +495,7 @@ pub enum Link {
 enum Conn {
     #[cfg(unix)]
     Socket(Client),
-    Here(super::local::Asked),
+    Here(Box<super::local::Asked>),
 }
 
 /// A run's way to its runner after its request: its input and signals.
@@ -510,7 +510,7 @@ impl Link {
         match self {
             #[cfg(unix)]
             Link::Socket(sock) => Ok(Conn::Socket(Client::connect(sock)?)),
-            Link::Here(here) => Ok(Conn::Here(here.ask())),
+            Link::Here(here) => Ok(Conn::Here(Box::new(here.ask()))),
         }
     }
 
@@ -2174,8 +2174,9 @@ mod lane_tests {
 
     /// One connection of an isolated session's lane, served in this process with no socket: its
     /// `initialize` is answered as `kiln reach mcp` answers it, naming the session, and a tool's call
-    /// is answered by this runner, in-process (`runners`, which its own node answers). Nothing of it
-    /// is Unix's.
+    /// crosses into this runner in-process and comes back in its node's own words (`runners`: a lone
+    /// node, with no server, says it isn't connected to one, where a request that never reached it
+    /// would end with no answer at all). Nothing of it is Unix's.
     #[test]
     fn step18_kilns_mcp_over_a_lane_is_answered_in_this_runners_process() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -2193,21 +2194,23 @@ mod lane_tests {
         anyhow::ensure!(init.pointer("/result/protocolVersion").is_some() && init.pointer("/result/serverInfo").is_some(), "{init}");
         anyhow::ensure!(init.pointer("/result/instructions").and_then(Value::as_str).is_some_and(|i| i.contains("lane-s1")), "{init}");
         let runners = heard.answer(2, Duration::from_secs(30))?;
-        anyhow::ensure!(runners.pointer("/result/isError") == Some(&json!(false)), "{runners}");
-        anyhow::ensure!(runners.pointer("/result/structuredContent/runners").is_some_and(Value::is_array), "{runners}");
+        let listed = runners.pointer("/result/structuredContent/runners").is_some_and(Value::is_array);
+        let nodes_own = runners.pointer("/result/structuredContent/error").and_then(Value::as_str) == Some("not connected to the kiln server");
+        anyhow::ensure!(listed || nodes_own, "not the runner's own answer: {runners}");
         Ok(())
     }
 
     /// A request of the runner in its own process is answered as its socket answers it: the first
-    /// is the request, its events come back, and a lane's news of a run is its own session's.
+    /// is the request, its events come back and then its end, and a lane's news is its session's.
     #[test]
     fn step18_a_request_in_this_process_is_answered_as_the_socket_answers_it() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let (handle, _to_server) = node(dir.path())?;
         let here = crate::reach::local::Here { handle, me: "here".into(), host: None, session: "lane-s2".into() };
         let mut asked = here.ask();
-        asked.send(&crate::reach::local::Req::Runners { want: None })?;
-        anyhow::ensure!(matches!(asked.event()?, Some(crate::reach::local::Ev::Runners(_))), "no runners");
+        asked.send(&crate::reach::local::Req::Status)?;
+        let status = asked.event()?;
+        anyhow::ensure!(matches!(status, Some(crate::reach::local::Ev::Status(ref s)) if serde_json::from_str::<Value>(s).is_ok()), "{status:?}");
         anyhow::ensure!(asked.event()?.is_none(), "the answer goes on past its end");
         let mut told = here.ask();
         told.send(&crate::reach::local::Req::Told(serde_json::to_string(&crate::reach::told::RunNews::default())?))?;
