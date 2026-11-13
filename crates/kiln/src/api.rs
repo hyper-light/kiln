@@ -6518,7 +6518,7 @@ async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
             b.command.as_ref().and_then(|v| serde_json::from_value::<crate::harness::model::Command>(v.clone()).ok()).map_or(Some("command"), |c| crate::harness::attention_hooks::command_kind(&c))
         };
         // Sent, or retained: kiln took the person's message into its custody (W20), waiting for the receiver's admission.
-        for row in report.results.iter().filter(|r| matches!(r.result.as_str(), "sent" | "retained")) {
+        for row in report.results.iter().filter(|r| matches!(r.result, "sent" | "retained")) {
             let Some(kind) = kind else { break };
             crate::harness::attention_hooks::record(hub, caller, &row.id, kind, &report.id, attention_at).await;
             if b.approvals.is_some() && let Some(info)=among.iter().find(|i|i.id==row.id) {
