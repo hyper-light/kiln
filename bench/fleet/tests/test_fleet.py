@@ -162,6 +162,19 @@ class Witnesses(unittest.TestCase):
     def kinds(self, found):
         return sorted(v["witness"] for v in found)
 
+    def test_asks_a_placer_names_no_process_for_are_judged_by_count(self):
+        ledger = live_ledger("a", "b")
+        view = {"a": None, "b": None}
+        vm = lambda pid: {"pid": pid, "role": "vm", "mem": 1000}  # noqa: E731
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10), vm(20)], view, self.room, None, True)), [])
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10)], view, self.room, None, True)), ["lost"])
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10), vm(20), vm(30)], view, self.room, None, True)), ["leaked"])
+        # A live ask the placer no longer holds is lost, and one it holds for an ask that ended is unasked.
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10)], {"a": None}, self.room, None, True)), ["lost"])
+        ledger["b"].move(W.STOPPING)
+        ledger["b"].move(W.ENDED)
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10), vm(20)], view, self.room, None, True)), ["leaked", "unasked"])
+
     def test_a_clean_scope_has_no_violation(self):
         ledger, scan, view = self.clean()
         self.assertEqual(W.check(ledger, scan, view, self.room, 4, True), [])
@@ -616,13 +629,13 @@ def shards_agent(d, delay_s=0.0, binary=None):
     a.waits["start"].answered(1_000_000_000)
     a.scan = lambda why: {}
     if delay_s:
-        real = a.shards.start_vm
+        real = a.driver.start_vm
 
         def slow(*args, **kw):
             time.sleep(delay_s)
             return real(*args, **kw)
 
-        a.shards.start_vm = slow
+        a.driver.start_vm = slow
     return a, rec
 
 
@@ -769,6 +782,242 @@ class Hold(unittest.TestCase):
             self.assertEqual([r.get("at") for r in outs if "at" in r], ["the run's deadline"])
             self.assertGreaterEqual(time.monotonic_ns(), a.deadline_ns)
             self.assertGreater(a.deadline_ns, began)
+
+
+def hex_agent(d, refuse=None, needs="mem=120m", refuse_after=0):
+    """An agent on the hex driver over the stand-in hex (tests/fake_hex.py) and the echo stand-in
+    `shards`."""
+    from types import SimpleNamespace
+
+    from fleetlib.agent import Agent
+
+    fake = os.path.join(d, "hex")
+    with open(fake, "w") as f:
+        f.write(f"#!{sys.executable}\n" + open(os.path.join(HERE, "fake_hex.py")).read())
+    os.chmod(fake, 0o755)
+    if refuse:
+        os.environ["FAKE_HEX_REFUSE"] = refuse
+        os.environ["FAKE_HEX_REFUSE_AFTER"] = str(refuse_after)
+    else:
+        os.environ.pop("FAKE_HEX_REFUSE", None)
+    o = SimpleNamespace(deadline_s=60, out=d, shards=standin_shards(d), hex=fake, vm="cpus=1,mem=64m", driver="hex", seed=1, needs=needs, label="h",
+                        image="i@sha256:00", ballast=0, chaos="vm,node,scheduler", rounds=1, repo=d, rev="", controller_t=0, keep_home=False)
+    rec = records.Records(os.path.join(d, "r.jsonl"), "h", "run")
+    return Agent(o, rec), rec
+
+
+@unittest.skipIf(sys.platform == "win32", "the stand-in hex is a POSIX script (Hex's image class boots no VM on Windows yet)")
+class HexDriver(unittest.TestCase):
+    """The hex driver over a stand-in that answers Submit, Status and Delete as Hex documents them."""
+
+    def tearDown(self):
+        os.environ.pop("FAKE_HEX_REFUSE", None)
+        os.environ.pop("FAKE_HEX_REFUSE_AFTER", None)
+
+    def test_a_run_fills_takes_its_chaos_and_leaves_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = hex_agent(d)
+            code = a.run()
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            kinds = [r["kind"] for r in got]
+            self.assertEqual([r for r in got if r["kind"] in ("failed", "witness")], [])
+            self.assertEqual(code, 0)
+            starts = [r for r in got if r["kind"] == "started"]
+            self.assertTrue(starts and all(r["by"] == "made" for r in starts), starts)
+            self.assertIn("hold_owed", kinds)
+            chaos = {r["action"]: r for r in got if r["kind"] == "chaos"}
+            self.assertEqual(sorted(chaos), ["node", "scheduler", "vm"])
+            self.assertEqual(chaos["vm"]["kill"], "killed")
+            self.assertEqual((chaos["vm"]["ended"], chaos["node"]["ended"], chaos["scheduler"]["ended"]), (1, 0, 0))
+            last = [r for r in got if r["kind"] == "verdict"][-1]
+            self.assertEqual(last["left"], [])
+            self.assertEqual(a.states().get(W.LIVE, 0), 0)
+            text = report.render(got)
+            self.assertIn("start (ask to the placer's word that it was made)", text)
+            self.assertIn("round trips and streams: owed (the hex driver gives no lane into a VM)", text)
+            self.assertIn("verdict: PASS", text)
+
+    def test_a_refused_create_is_typed_in_hexs_words_and_stops_the_fill(self):
+        with tempfile.TemporaryDirectory() as d:
+            # The first box is taken (the setup's first run), every ask after it refused.
+            a, rec = hex_agent(d, refuse="Awaits(RunHostStdioOnly)", refuse_after=1)
+            self.assertTrue(a.setup())
+            a.fill("test")
+            a.drain()
+            a.teardown()
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            failed = [r for r in got if r["kind"] == "start_failed"]
+            self.assertEqual(len(failed), 1)
+            self.assertEqual((failed[0]["refused"], failed[0]["why"]), (True, "refused: Awaits(RunHostStdioOnly)"))
+            self.assertEqual([r["refused"] for r in got if r["kind"] == "fill_stopped"], [[failed[0]["token"]]])
+            self.assertEqual(a.states(), {W.REFUSED: 1})
+
+    def test_a_first_box_hex_refuses_ends_the_setup_typed_and_leaves_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = hex_agent(d, refuse="Awaits(WindowsRunHost)")
+            code = a.run()
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            failed = [(r["what"], r["why"]) for r in got if r["kind"] == "failed"]
+            self.assertEqual(failed, [("first_run", "refused: Awaits(WindowsRunHost)")])
+            self.assertEqual([r["left"] for r in got if r["kind"] == "verdict" and r["at"] == "after teardown"], [[]])
+            self.assertEqual(code, 3)
+
+
+class FakeKiln:
+    """A stand-in kiln: the agents routes the kiln driver calls (`agents.start`, `.get`, `.list`,
+    `.stop`), each asked with the run's bearer token; an agent stands `starting` until it is
+    first read, then `idle`. `room` agents fit; past it a start is queued, as kiln's balancer
+    holds one for room, and starts once an agent stops. `refuse` is a refusal (409) every start
+    gets."""
+
+    TOKEN = "fleet-test-token"
+
+    def __init__(self, room=8, refuse=None):
+        import http.server
+
+        self.agents = {}
+        self.waiting = []
+        self.room = room
+        self.refuse = refuse
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def answer(self, status, body):
+                data = (json.dumps(body) if not isinstance(body, str) else body).encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def authed(self):
+                if self.headers.get("Authorization") != f"Bearer {FakeKiln.TOKEN}":
+                    self.answer(401, "no token")
+                    return False
+                return True
+
+            def do_GET(self):
+                if not self.authed():
+                    return
+                parts = self.path.strip("/").split("/")
+                if parts == ["api", "harness", "agents"]:
+                    return self.answer(200, {"agents": list(fake.agents.values())})
+                if parts[:3] == ["api", "harness", "agents"] and len(parts) == 4 and parts[3] in fake.agents:
+                    row = fake.agents[parts[3]]
+                    answer = dict(row)
+                    if row["stand"] == "starting":
+                        row["stand"] = "idle"
+                    return self.answer(200, answer)
+                self.answer(404, "no such agent")
+
+            def do_POST(self):
+                if not self.authed():
+                    return
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                parts = self.path.strip("/").split("/")
+                if parts == ["api", "harness", "agents"]:
+                    if fake.refuse:
+                        return self.answer(409, fake.refuse)
+                    if body.get("isolation") != "microvm" or body.get("on") != "microvm":
+                        return self.answer(400, "the driver asks for microVMs")
+                    live = sum(1 for a in fake.agents.values() if a["stand"] != "ended")
+                    if live >= fake.room:
+                        fake.waiting.append(body)
+                        return self.answer(200, {"agents": [], "queued": "no machine has room; it starts there as soon as there's room"})
+                    return self.answer(200, {"agents": [fake.made(body)]})
+                if parts[:3] == ["api", "harness", "agents"] and len(parts) == 5 and parts[4] == "stop" and parts[3] in fake.agents:
+                    fake.agents[parts[3]]["stand"] = "ended"
+                    if fake.waiting:
+                        fake.made(fake.waiting.pop(0))
+                    return self.answer(204, "")
+                self.answer(404, "no such route")
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, name="fake-kiln", daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def made(self, body):
+        agent_id = f"a{len(self.agents) + 1}"
+        self.agents[agent_id] = {"id": agent_id, "name": body["name"], "machine": "runner-a", "stand": "starting", "harness": body["kind"]}
+        return self.agents[agent_id]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def kiln_agent(d, fake, asks):
+    from types import SimpleNamespace
+
+    from fleetlib.agent import Agent
+
+    os.environ["KILN_URL"], os.environ["KILN_TOKEN"] = fake.url, FakeKiln.TOKEN
+    o = SimpleNamespace(deadline_s=30, out=d, shards="", driver="kiln", kind="claude", asks=asks, seed=1, needs="mem=1g", label="h",
+                        image="i@sha256:00", ballast=0, chaos="none", rounds=0, repo=d, rev="", controller_t=0, keep_home=False)
+    rec = records.Records(os.path.join(d, "r.jsonl"), "h", "run")
+    return Agent(o, rec), rec
+
+
+class KilnDriver(unittest.TestCase):
+    """The kiln driver over a stand-in kiln answering its agents routes."""
+
+    def tearDown(self):
+        os.environ.pop("KILN_URL", None)
+        os.environ.pop("KILN_TOKEN", None)
+
+    def run_agent(self, fake, asks):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = kiln_agent(d, fake, asks)
+            code = a.run()
+            rec.close()
+            return a, code, records.read_all(os.path.join(d, "r.jsonl"))
+
+    def test_sessions_are_started_followed_placed_and_stopped(self):
+        fake = FakeKiln(room=8)
+        try:
+            a, code, got = self.run_agent(fake, 5)
+        finally:
+            fake.close()
+        self.assertEqual([r for r in got if r["kind"] in ("failed", "witness")], [])
+        self.assertEqual(code, 0)
+        starts = [r for r in got if r["kind"] == "started"]
+        self.assertEqual(len(starts), 5)
+        self.assertEqual({(r["by"], r["on"]) for r in starts}, {("made", "runner-a")})
+        # The setup's first session and the five asked, each stopped.
+        self.assertEqual(sorted(r["name"] for r in fake.agents.values()), ["first-run", "h-1", "h-2", "h-3", "h-4", "h-5"])
+        self.assertEqual({r["stand"] for r in fake.agents.values()}, {"ended"})
+        self.assertIn("hold_owed", [r["kind"] for r in got])
+        self.assertEqual(a.states(), {W.ENDED: 5})
+
+    def test_a_full_fleet_queues_one_typed_and_the_fill_stops_there(self):
+        fake = FakeKiln(room=2)
+        try:
+            a, code, got = self.run_agent(fake, 4)
+        finally:
+            fake.close()
+        failed = [r for r in got if r["kind"] == "start_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertTrue(failed[0]["why"].startswith("queued: no machine has room"), failed[0])
+        self.assertEqual(a.states(), {W.ENDED: 2, W.REFUSED: 1})
+        # The queued one started once an agent stopped, and the drain stopped it too.
+        self.assertEqual(sorted((r["name"], r["stand"]) for r in fake.agents.values()), [("first-run", "ended"), ("h-1", "ended"), ("h-2", "ended"), ("h-3", "ended")])
+        self.assertEqual([r for r in got if r["kind"] == "witness"], [])
+
+    def test_a_refusal_ends_the_setup_in_kilns_words(self):
+        fake = FakeKiln(refuse="no machine suits a machine with claude: none starts microVMs")
+        try:
+            a, code, got = self.run_agent(fake, 3)
+        finally:
+            fake.close()
+        failed = [(r["what"], r["why"]) for r in got if r["kind"] == "failed"]
+        self.assertEqual(failed, [("first_run", "kiln answered 409: no machine suits a machine with claude: none starts microVMs")])
+        self.assertEqual((a.states(), code), ({}, 3))
 
 
 class Report(unittest.TestCase):

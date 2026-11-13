@@ -2484,6 +2484,25 @@ fn read_tail(p: &std::path::Path, since: Option<u64>) -> Option<(String, u64, bo
     Some((String::from_utf8_lossy(&buf).into_owned(), start + buf.len() as u64, start > want || (since.is_none() && start > 0)))
 }
 
+/// The whole lines `buf` holds now, taken out of it in order, each however long: a harness's line
+/// is one whole word of its protocol, never cut or dropped. (Until 2026-11-13 a line past 32 MiB was
+/// thrown away: a resumed Codex thread's `thread/turns/list` answer was, so its request stayed
+/// pending, the session never took its queue again, and the rest of that line was read as a line of
+/// its own.) `scanned`: how much of `buf` is known to hold no newline, so a long line that comes in
+/// pieces is searched once, not once a piece.
+fn whole_lines(buf: &mut Vec<u8>, scanned: &mut usize) -> Vec<Vec<u8>> {
+    let mut lines = Vec::new();
+    let (mut taken, mut at) = (0usize, (*scanned).min(buf.len()));
+    while let Some(nl) = buf.get(at..).and_then(|rest| rest.iter().position(|b| *b == b'\n')) {
+        let end = at.saturating_add(nl).saturating_add(1);
+        lines.push(buf.get(taken..end).map(<[u8]>::to_vec).unwrap_or_default());
+        (taken, at) = (end, end);
+    }
+    buf.drain(..taken.min(buf.len()));
+    *scanned = buf.len();
+    lines
+}
+
 /// An ending agent's group of processes, after `after` (its harness's time to stop): whatever is
 /// still in it ended at once, then the group removed.
 #[allow(clippy::disallowed_methods)] // (e) a picked grace before it acts
@@ -4316,6 +4335,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 on_change();
                 let mut jobs = flush(&s, &sink, Some(&p.stdin)).await;
                 let mut buf: Vec<u8> = partial;
+                // How much of `buf` is known to hold no newline ([`whole_lines`]).
+                let mut scanned = 0usize;
                 let mut stderr_tail: Vec<u8> = Vec::new();
                 let mut out_open = true;
                 let mut err_open = true;
@@ -4372,17 +4393,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         Ev::Out(Some(chunk)) => {
                             buf.extend_from_slice(&chunk);
                             let mut core = s.core.lock();
-                            while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
-                                let line: Vec<u8> = buf.drain(..=nl).collect();
+                            for line in whole_lines(&mut buf, &mut scanned) {
                                 adapter.line(&mut core, &String::from_utf8_lossy(&line));
                             }
                             // At its stop point in the middle of a turn: it stops at its next step.
                             if super::pause::stop_mid_turn(&mut core) {
                                 adapter.command(&mut core, Command::Interrupt);
-                            }
-                            if buf.len() > 32 << 20 {
-                                tracing::warn!(session = %s.id, "dropping an oversized line from the harness");
-                                buf.clear();
                             }
                         }
                         Ev::Out(None) => {
@@ -5174,6 +5190,30 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
 #[cfg(test)]
 mod tests {
     use crate::util::Must as _;
+
+    /// 2026-11-13: a harness line is taken whole however long, in pieces as it comes, and what
+    /// follows it is its own line, not the tail of one dropped (resumed Codex sessions held their
+    /// queue forever when a 32 MiB+ `thread/turns/list` answer was thrown away).
+    #[test]
+    fn a_harness_line_past_any_size_is_taken_whole_and_the_next_stays_its_own() {
+        let (mut buf, mut scanned) = (Vec::new(), 0usize);
+        let long = vec![b'x'; (32 << 20) + 5];
+        for piece in long.chunks(1 << 16) {
+            buf.extend_from_slice(piece);
+            assert!(super::whole_lines(&mut buf, &mut scanned).is_empty(), "no newline yet: nothing taken, nothing dropped");
+            assert_eq!(scanned, buf.len());
+        }
+        buf.extend_from_slice(b"\n{\"id\":2}\n{\"id\"");
+        let lines = super::whole_lines(&mut buf, &mut scanned);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.first().map(Vec::len), Some(long.len() + 1), "the long line, whole, with its newline");
+        assert_eq!(lines.get(1).map(Vec::as_slice), Some(&b"{\"id\":2}\n"[..]));
+        assert_eq!(buf, b"{\"id\"", "a partial line waits for the rest");
+        buf.extend_from_slice(b":3}\n");
+        assert_eq!(super::whole_lines(&mut buf, &mut scanned), vec![b"{\"id\":3}\n".to_vec()]);
+        assert!(buf.is_empty());
+    }
+
     #[test]
     fn deferred_bodies_retain_the_complete_compact_queue_index() -> anyhow::Result<()> {
         let state = State {

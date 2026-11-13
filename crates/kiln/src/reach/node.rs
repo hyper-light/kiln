@@ -998,6 +998,8 @@ struct Served {
     /// custody; and the frame handing its output on, once it's made (sent again with its exit).
     took: Option<super::custody::Took>,
     custody: bool,
+    /// The frame with its receipt, said as it's taken and again ahead of each exit said.
+    receipt_frame: Option<String>,
     out_frame: Option<String>,
     /// Its asker may never come back for it ([`wire::DETACHED`]): held output gives way rather
     /// than make it wait.
@@ -2501,13 +2503,16 @@ impl Node {
             self.refuse_run(key, id, format!("refused: {why}")).await;
             return;
         }
-        let took = if version >= wire::CUSTODY {
+        // Its receipt is kept with it and said again ahead of its exit (W27-R08): one said only
+        // now is lost to a link that's down or drops before it arrives, and its asker then
+        // refuses the run's output for want of it ("sent no receipt of it").
+        let (took, receipt_frame) = if version >= wire::CUSTODY {
             match super::custody::take_run(&self.root, &key.0, &key.1, &spec, &tree, frame.as_ref()) {
                 Ok((said, took)) => {
                     if let Some(link) = s.link.clone() {
-                        self.say_on(&link, &Say::Custody { json: said }).await;
+                        self.say_on(&link, &Say::Custody { json: said.clone() }).await;
                     }
-                    took
+                    (took, Some(said))
                 }
                 Err(why) => {
                     super::custody::refused(&format!("run {id}"), &key.0, &why);
@@ -2516,7 +2521,7 @@ impl Node {
                 }
             }
         } else {
-            super::custody::run_from_before(&key.0, &key.1, &spec, &tree)
+            (super::custody::run_from_before(&key.0, &key.1, &spec, &tree), None)
         };
         let Some(s) = self.served.get_mut(key) else { return };
         let mirror = match spec.mirror.as_deref() {
@@ -2592,6 +2597,7 @@ impl Node {
                 out: sha2::Sha256::default(),
                 took,
                 custody: version >= wire::CUSTODY,
+                receipt_frame,
                 out_frame: None,
                 detached: spec.linger_ms == Some(wire::DETACHED),
                 taken: now,
@@ -2710,6 +2716,9 @@ impl Node {
                         }
                     };
                     if r.custody {
+                        if let Some(receipt) = r.receipt_frame.clone() {
+                            self.say_on(&link, &Say::Custody { json: receipt }).await;
+                        }
                         self.say_on(&link, &Say::Custody { json: frame }).await;
                     }
                 }
@@ -3494,6 +3503,7 @@ mod tests {
             out: sha2::Sha256::default(),
             took: None,
             custody: false,
+            receipt_frame: None,
             out_frame: None,
             detached,
             taken,

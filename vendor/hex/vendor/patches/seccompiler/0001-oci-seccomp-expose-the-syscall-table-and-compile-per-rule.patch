@@ -1,0 +1,240 @@
+Subject: oci seccomp expose the syscall table and compile per-rule actions
+Why: Hex's oci class compiles an OCI linux.seccomp profile to BPF with this crate and loads it in the container init. It needs the arch syscall-name tables without the json feature (it parses the OCI format itself). An OCI profile names an action per syscall group and can give one syscall argument rules of differing actions (the default profile refuses socket(AF_NETLINK, _, NETLINK_AUDIT) but allows every other socket) - which SeccompFilter::new's single filter-wide match action can't express; SyscallRules carries a per-rule on-match action and the syscall's own fallthrough, and with_syscall_rules installs it. Sizing each syscall's BPF block for the unconditional case allocates it once instead of growing it, on the container-start path. SeccompFilter::new keeps its signature and byte-for-byte BPF output (upstream tests pass).
+
+diff --git a/src/backend/filter.rs b/src/backend/filter.rs
+index e7757a0aea9c60500c06c0cdb1436532aed2e97c..f7e09711f26bdce6bbf3da5f5a5cbf1bd1fc89af 100644
+--- a/src/backend/filter.rs
++++ b/src/backend/filter.rs
+@@ -10,16 +10,36 @@ use crate::backend::{Error, Result, SeccompAction, TargetArch};
+ /// Filter containing rules assigned to syscall numbers.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct SeccompFilter {
+-    /// Map of syscall numbers and corresponding rule chains.
+-    rules: BTreeMap<i64, Vec<SeccompRule>>,
+-    /// Default action to apply to syscalls that do not match the filter.
++    /// Map of syscall numbers to their rule chain and the actions applied to it.
++    rules: BTreeMap<i64, SyscallRules>,
++    /// Default action to apply to syscalls that are not present in `rules`.
+     mismatch_action: SeccompAction,
+-    /// Filter action to apply to syscalls that match the filter.
+-    match_action: SeccompAction,
+     /// Target architecture of the generated BPF filter.
+     target_arch: TargetArch,
+ }
+ 
++/// Hex addition (see vendor/seccompiler/UPSTREAM.md): one syscall's argument rules, the action when
++/// one of them matches, and the action when the syscall is made but none match. The stock
++/// [`SeccompFilter::new`] gives every matching syscall one filter-wide `match_action` and falls
++/// through to the filter-wide default; an OCI seccomp profile instead names an action per syscall
++/// group and can allow a syscall for most arguments while refusing one value (Docker's AF_NETLINK
++/// `socket` rule), or refuse one argument combination while allowing the rest — argument rules of
++/// differing actions. Carrying a per-rule on-match action, and the syscall's own fallthrough, lets a
++/// single installed filter model such a profile, which [`SeccompFilter::new`] cannot.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct SyscallRules {
++    /// The action a rule with no action of its own takes when it matches — and, when `rules` is
++    /// empty, the syscall's action unconditionally. [`SeccompFilter::new`] gives every rule this one.
++    pub on_match: SeccompAction,
++    /// The syscall's argument rules, each with the action it takes when its conditions all match
++    /// (`None` uses `on_match`); the first matching rule's action wins. An empty list means the
++    /// syscall is unconditional — `on_match` is its action.
++    pub rules: Vec<(SeccompRule, Option<SeccompAction>)>,
++    /// The action when the syscall is made but no rule matches. Usually the filter-wide default, but
++    /// an OCI profile may make it differ (allow in general, refuse one value).
++    pub otherwise: SeccompAction,
++}
++
+ impl SeccompFilter {
+     /// Creates a new filter with a set of rules, an on-match and default action.
+     ///
+@@ -88,26 +108,49 @@ impl SeccompFilter {
+         match_action: SeccompAction,
+         target_arch: TargetArch,
+     ) -> Result<Self> {
+-        let instance = Self {
++        // Doesn't make sense to have equal default and on-match actions.
++        if mismatch_action == match_action {
++            return Err(Error::IdenticalActions);
++        }
++        // Hex change (UPSTREAM.md): every syscall shares the one `match_action` and falls through to
++        // the filter-wide default, which reproduces the stock behaviour exactly.
++        let rules = rules
++            .into_iter()
++            .map(|(nr, chain)| {
++                (
++                    nr,
++                    SyscallRules {
++                        on_match: match_action.clone(),
++                        // Every rule takes the one filter-wide `match_action` (`None`), which
++                        // reproduces the stock BPF byte for byte.
++                        rules: chain.into_iter().map(|r| (r, None)).collect(),
++                        otherwise: mismatch_action.clone(),
++                    },
++                )
++            })
++            .collect();
++
++        Ok(Self {
+             rules,
+             mismatch_action,
+-            match_action,
+             target_arch,
+-        };
+-
+-        instance.validate()?;
+-
+-        Ok(instance)
++        })
+     }
+ 
+-    /// Performs semantic checks on the SeccompFilter.
+-    fn validate(&self) -> Result<()> {
+-        // Doesn't make sense to have equal default and on-match actions.
+-        if self.mismatch_action == self.match_action {
+-            return Err(Error::IdenticalActions);
+-        }
+-
+-        Ok(())
++    /// Hex addition (see vendor/seccompiler/UPSTREAM.md): a filter whose syscalls each carry their
++    /// own actions, which [`SeccompFilter::new`]'s single filter-wide `match_action` cannot express.
++    /// Used to compile an OCI seccomp profile, where each syscall group names its own action and the
++    /// action when no rule matches can differ from the filter-wide default.
++    pub fn with_syscall_rules(
++        rules: BTreeMap<i64, SyscallRules>,
++        mismatch_action: SeccompAction,
++        target_arch: TargetArch,
++    ) -> Result<Self> {
++        Ok(Self {
++            rules,
++            mismatch_action,
++            target_arch,
++        })
+     }
+ 
+     /// Appends a chain of rules to an accumulator, updating the length of the filter.
+@@ -120,7 +163,7 @@ impl SeccompFilter {
+     /// * `accumulator` - The expanding BPF program.
+     fn append_syscall_chain(
+         syscall_number: i64,
+-        chain: Vec<SeccompRule>,
++        chain: Vec<(SeccompRule, Option<SeccompAction>)>,
+         mismatch_action: SeccompAction,
+         match_action: SeccompAction,
+         accumulator: &mut Vec<Vec<sock_filter>>,
+@@ -128,18 +171,23 @@ impl SeccompFilter {
+         // The rules of the chain are translated into BPF statements.
+         let chain: Vec<_> = chain
+             .into_iter()
+-            .map(|rule| {
++            .map(|(rule, action)| {
+                 let mut bpf: BpfProgram = rule.into();
+-                // Last statement is the on-match action of the filter.
+-                bpf.push(bpf_stmt(BPF_RET | BPF_K, u32::from(match_action.clone())));
++                // Last statement is this rule's on-match action: its own, or the syscall's shared
++                // `match_action` when it names none (as every rule of `SeccompFilter::new` does).
++                let action = action.unwrap_or_else(|| match_action.clone());
++                bpf.push(bpf_stmt(BPF_RET | BPF_K, u32::from(action)));
+                 bpf
+             })
+             .collect();
+         let chain_len: usize = chain.iter().map(Vec::len).sum();
+ 
+         // The chain starts with a comparison checking the loaded syscall number against the
+-        // syscall number of the chain.
+-        let mut built_syscall = Vec::with_capacity(chain_len + 2);
++        // syscall number of the chain. Sizing the block for what it will hold — the chain and the
++        // fallthrough, or, for an unconditional syscall (empty chain), two jumps plus the on-match
++        // and fallthrough actions, five statements — allocates it once instead of growing it, on the
++        // container-start path. (Hex change, UPSTREAM.md: the empty-chain case was sized `+ 2`.)
++        let mut built_syscall = Vec::with_capacity(if chain.is_empty() { 5 } else { chain_len + 2 });
+         built_syscall.push(bpf_jump(
+             BPF_JMP | BPF_JEQ | BPF_K,
+             // Safe because linux system call numbers are nowhere near the u32::MAX value.
+@@ -195,16 +243,17 @@ impl TryFrom<SeccompFilter> for BpfProgram {
+ 
+         let mut iter = filter.rules.into_iter();
+ 
+-        // For each syscall adds its rule chain to the filter.
++        // For each syscall adds its rule chain to the filter, with that syscall's own actions
++        // (Hex change, UPSTREAM.md): the action when a rule matches, and the action when the syscall
++        // is made but no rule matches, which may differ from the filter-wide default.
+         let mismatch_action = filter.mismatch_action;
+-        let match_action = filter.match_action;
+ 
+         iter.try_for_each(|(syscall_number, chain)| {
+             SeccompFilter::append_syscall_chain(
+                 syscall_number,
+-                chain,
+-                mismatch_action.clone(),
+-                match_action.clone(),
++                chain.rules,
++                chain.otherwise,
++                chain.on_match,
+                 &mut accumulator,
+             )
+         })?;
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index e5730ce732d51a44dc2309dcc8749ec8e391849b..73dbc7ed9f22e61deab74eb97e0ef33a0e2a5cf9 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -10,7 +10,7 @@ mod filter;
+ mod rule;
+ 
+ pub use condition::SeccompCondition;
+-pub use filter::SeccompFilter;
++pub use filter::{SeccompFilter, SyscallRules};
+ pub use rule::SeccompRule;
+ 
+ #[cfg(feature = "json")]
+diff --git a/src/lib.rs b/src/lib.rs
+index ca9d8c23a40f47949ba4a8580f204f6c317ef971..4fab9b15d3278245e95cc8644296acb2bbfe13a8 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -188,7 +188,10 @@
+ mod backend;
+ #[cfg(feature = "json")]
+ mod frontend;
+-#[cfg(feature = "json")]
++// Hex change (UPSTREAM.md): the syscall-name tables build without the JSON frontend. Hex's OCI
++// class parses its own profile format but still resolves syscall names to numbers per target arch,
++// and does so without pulling in serde_json. The module was gated behind `json` only because that
++// was its sole consumer upstream.
+ mod syscall_table;
+ 
+ #[cfg(feature = "json")]
+@@ -206,9 +209,13 @@ use frontend::json::{Error as JsonFrontendError, JsonCompiler};
+ // Re-export the IR public types.
+ pub use backend::{
+     sock_filter, BpfProgram, BpfProgramRef, Error as BackendError, SeccompAction, SeccompCmpArgLen,
+-    SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule, TargetArch,
++    SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule, SyscallRules, TargetArch,
+ };
+ 
++// Hex change (UPSTREAM.md): resolve a syscall name to its number for a target arch, without the
++// `json` feature. See the `syscall_table` module note above.
++pub use syscall_table::SyscallTable;
++
+ // BPF structure definition for filter array.
+ // See /usr/include/linux/filter.h .
+ #[repr(C)]
+diff --git a/src/syscall_table/mod.rs b/src/syscall_table/mod.rs
+index f47fc3cabb4b94cb6bc177d4fd516bb2bc32632c..80ac94075c0d7fa18c6f2c1d0a6caf4255ccb226 100644
+--- a/src/syscall_table/mod.rs
++++ b/src/syscall_table/mod.rs
+@@ -9,12 +9,15 @@ use crate::backend::TargetArch;
+ use std::collections::HashMap;
+ 
+ /// Creates and owns a mapping from the arch-specific syscall name to the right number.
++// Hex change (UPSTREAM.md): `pub` so callers that parse their own filter format (Hex's OCI class)
++// can resolve syscall names without the JSON frontend.
+ #[derive(Debug)]
+-pub(crate) struct SyscallTable {
++pub struct SyscallTable {
+     map: HashMap<&'static str, i64>,
+ }
+ 
+ impl SyscallTable {
++    /// Builds the syscall-name table for `arch`.
+     pub fn new(arch: TargetArch) -> Self {
+         Self {
+             map: match arch {

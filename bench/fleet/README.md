@@ -27,13 +27,88 @@ whole stack a run measured. Hex is driven through its own scheduler's command li
   (the hard limit; on macOS kern.maxfilesperproc, where a shell's soft limit is 256) and records it
   (`nofile` in its `host` record); an ask whose client the host can't spawn is refused, typed
   (`start_failed`, `refused`), and the fill stops there. An ended ask's descriptors close with it.
-- **The driver** decides how a VM is asked for. Built: `shards`, the direct driver (below), which is
-  the baseline every placer is held to and the harness's light test. Owed: `hex` and `kiln`
-  (Owed, below).
+- **The driver** decides how a VM is asked for: `shards`, the direct driver (below), the baseline
+  every placer is held to and the harness's light test; `hex`, a Hex scheduler of the run's own
+  ("The hex driver", below); `kiln`, kiln's balancer ("The kiln driver", below).
 
 `kiln run`'s stdin is buffered until it ends (measured: eight lines written 2 s apart all arrived
 after the last), so it carries no commands to a running agent: each agent runs its plan on its own
 clock, and the controller only starts, collects and reports.
+
+## The hex driver
+
+`--driver hex --hex HEX --shards SHARDS --vm cpus=N,mem=SIZE`: the agent starts `hex node --socket
+--state` and `hex schedule serve --config` in its scope, as its children, each serving once it says
+`ready <socket>` (Hex's laptop deployment: one node, Hex's docs/scheduler-live.md). An ask is a
+`Submit` of a `ShardsImage` box (Hex's docs/design/shards-image-class.md: the image pinned by digest,
+the stub's command, class `shards` on the guest's `linux/<arch>`) through `hex schedule call`; its key
+is followed by `Status` until Hex says the box was made (its start: ask to made, no workload's
+answer, as Hex gives no lane into it), ended or refused; `Delete` removes it. The VM is the size the
+run asks Hex to admit (`--vm`, the person's input, recorded): Hex sizes a VM by what it admits, never
+by Shards' default. A refusal is recorded in Hex's own words (`start_failed`, `refused: Awaits(...)`)
+and stops the fill. The node takes its guest from the environment the agent is given (Hex's
+GuestConfig::from_env), with SHARDS_BIN the binary under test and SHARDS_HOME in the scope, where the
+image is pulled (Hex's node reads its Shards home from its environment as Shards does: confirmed by
+the live run, below).
+
+- **The view** is Hex's records: the boxes it holds made and not ended. A box's run host (`shards
+  api-run` under the node) names no box and Hex's records name no process, so the view names none,
+  and the witnesses judge such asks by count: fewer run hosts than live boxes is `lost`, more is
+  `leaked` (a doubled and a lost box cancel there; a placer that names its processes is judged one by
+  one). A box Hex says ended under a live ask is `ended_unasked`, as a lane's end is for the direct
+  driver.
+- **The scan** counts each run host as one VM, its memory and CPU its whole tree's (the run host's
+  own, its VM's and its network process's: what a VM costs the host through Hex).
+- **Chaos**: `vm` kills one run host (its tree then awaited gone); `node` and `scheduler` kill Hex's
+  own process, start it again in the same state, and settle until each live ask is either held by Hex
+  or ended. The asks Hex then says ended are `killed` and removed.
+- **The hold** has no lane into a VM: its round trips and streams are recorded owed (`hold_owed`), and
+  the report says so beside the start, which it names as the placer's word that the VM was made.
+
+Its live run waits on, each recorded typed if met first: Hex's waits' records (`image_boot`,
+`image_stats`, `image_stop`, ROOT's census; until they are in Hex every create outside the census is
+refused); Linux hosts alone (macOS `Awaits(RunHostStdioOnly)`, Windows `Awaits(WindowsRunHost)`);
+member exec (Shards' step 11) for round trips and streams; one host per Hex cluster until peers'
+SSH trust is set up (a forced command a peer, an administrator's step); and a run host that survives
+its node's kill is `Held` (`Awaits(AttachAfterCrash)`), refusing even a `Delete`, so `node` chaos
+leaves such VMs until Shards gives attach (the run reports them `left`).
+
+```sh
+kiln run --on HOST --needs mem=16g,cpus=8 -- \
+  nice -n 10 python3 bench/fleet/fleet.py host --driver hex --hex /path/to/hex --shards /path/to/shards \
+    --vm cpus=1,mem=512m --out "$OUT" --label HOST \
+    --image 'IMAGE@sha256:…' --chaos vm,node,scheduler --rounds 3 --deadline-s 3600 --seed 36
+```
+
+In a plan, a host (or the plan) says `"driver": "hex"`, `"hex": PATH` and `"vm": "cpus=1,mem=512m"`.
+
+## The kiln driver
+
+`--driver kiln --kind claude --asks N` with `KILN_URL` and `KILN_TOKEN` in the environment (the token
+is sent as a bearer token and never recorded): an ask is `agents.start` over kiln's API
+(`POST /api/harness/agents`): one agent of the harness, `isolation: microvm` and `on: microvm`, so
+kiln's balancer places it, by the runners' own admission, on a runner that says it starts microVMs
+(kiln plan steps 17 and 32). `agents.get` follows it until kiln says it stands ready (idle, working,
+waiting on a person: its start, and the machine it went to, `on`), ended or failed; `agents.list` is
+the view; `agents.stop` removes it. kiln's own admission is where the fleet is full: the run asks up to
+`--asks` (the person's number, recorded) in doubling waves, and an ask kiln holds for room (`queued`)
+or refuses is a typed refusal in kiln's words that stops the fill; the drain stops every ask's agent,
+a queued one too should it have started. Before anything is measured, one session (`first-run`) is
+started, followed until ready and stopped: the first start's costs paid once, and a start's time to
+seed the start wait with (kiln refusing it ends the setup, in kiln's words).
+
+Its VMs run on the runners kiln picks, not where the agent runs: it scans none of their processes,
+and the witnesses judge kiln's view alone (a live ask kiln no longer holds is `lost`; one it holds
+for an ended ask is `unasked`). Run it as one agent (one host of a plan), wherever kiln is reachable.
+
+Its live run waits on kiln steps 16 and 17 (no runner says `virt.microvm` until kiln carries Shards
+and Hex, and launches isolated sessions through Hex), and on a harness whose session needs no model
+or account: kiln's fake Claude Code (`crates/kiln/tests/fixtures/fake-claude`) in a user Agentfile,
+once an isolated session takes its image (step 17's `agentfile:<id>`). Owed past it: the hold (a
+control request's round trip and a turn's lines, through `agents.interrupt` and `agents.send`, once
+their answers' timing is read on a live server), each runner's own scan of the VMs kiln placed there,
+and chaos on runners of the run's own (a second runner per machine joined to a server of the run's
+own: production runners are never restarted).
 
 ## The direct driver and its workload
 
@@ -214,8 +289,12 @@ network process found and judged `orphan` after its VM and daemon are gone, a la
 one that doesn't, asks on the real direct driver with a stand-in `shards` that is an echo (a wave's
 echoes read between its slow spawns, no descriptor left by an ended ask, a spawn the host refuses
 and a lane it can't serve typed and stopping the fill), a hold over echo lanes (every kind of sample
-on every lane), a mute lane's stall backed off to the run's deadline, and the report. `mutate.py
-[WORDS…]` removes each of 31 guards (or those whose description holds a word) in a copy and requires
+on every lane), a mute lane's stall backed off to the run's deadline, the hex driver over a stand-in
+hex (`tests/fake_hex.py`: a run that fills, takes `vm`, `node` and `scheduler` chaos and leaves
+nothing; a refusal typed in Hex's words stopping the fill), the kiln driver over a stand-in kiln
+(sessions started, followed, placed and stopped; a full fleet's queue and a refusal typed in kiln's
+words stopping the fill), asks a placer names no process for judged by count, and the report. `mutate.py
+[WORDS…]` removes each of 37 guards (or those whose description holds a word) in a copy and requires
 the tests to fail.
 
 ## The profile
@@ -309,20 +388,11 @@ adas-mac-studio.local-2 (25 KB/s Wi-Fi) or jupiter (its kiln runs held by the he
 
 ## Owed
 
-- **The `hex` driver** (steps 12 to 15): asks as `hex schedule call --socket … Submit` with a
-  `ShardsImage` box (Hex's `docs/scheduler-live.md`), `Status` until created, `Delete`; the view from
-  Hex's records and each node's run hosts (`shards api-run` under `hex node`); the room from the
-  machine's capacity view (step 13, `docs/design/capacity-view.md`); chaos on `hex node`,
-  `hex schedule serve` and the peers' tunnels, each a process the agent starts. Hex's image class boots
-  on Linux only today (`Awaits(RunHostStdioOnly)` on macOS, `Awaits(WindowsRunHost)` on Windows) and
-  gives a member's stdio no lane yet (`Awaits(MemberExec)`, step 11), and a create is refused until
-  its waits are recorded outside the census (Hex `docs/design/shards-image-class.md` §6, §8).
-- **The `kiln` driver** (steps 17 and 32): an isolated session started by `agents.start` with
-  `isolation: microvm`, its harness kiln's fake Claude Code (`crates/kiln/tests/fixtures/fake-claude`,
-  no model, no account) in a user Agentfile; placed by the balancer among runners with `virt.microvm`;
-  its round trip a control request and its stream a turn's lines. Chaos on runners needs runners of the
-  run's own (a second runner process per machine, `KILN_MACHINE_ID`, joined to a server of the run's
-  own): production runners are never restarted.
+- **The `hex` driver's live run** ("The hex driver" says what it waits on), the room from Hex's
+  capacity view (step 13, `docs/design/capacity-view.md`) rather than `--needs`, and chaos on peers'
+  tunnels once peers are set up.
+- **The `kiln` driver's live run, its hold, per-runner scans and runner chaos** ("The kiln driver"
+  says what each waits on).
 - **jupiter's shards**: the Windows build below sits in adacachy's Windows 11 guest; copying it to
   jupiter (or building there once its headroom guard lets a build run) is ROOT's.
 - **Runs**: a few VMs on one Linux host were run (Record). Hundreds across the fleet, macOS hosts
