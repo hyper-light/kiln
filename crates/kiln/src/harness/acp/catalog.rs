@@ -263,6 +263,28 @@ mod tests {
         })
     }
 
+    /// A catalog that starts slowly, as a loaded machine starts one, then answers `initialize` and goes truly
+    /// unresponsive: blocked reading, writing nothing, answering nothing. It must be ended and cleaned up, and its
+    /// files (written before its first answer) must be there to show it: a clock that ends it before it has started
+    /// leaves no `config-path` (the reported "No such file or directory", adas-mac-studio-3.local, 2026-11-13).
+    #[cfg(unix)]
+    #[test]
+    fn a_catalog_slow_to_start_then_unresponsive_is_ended_and_cleaned_up() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let d = dir.path().display();
+            let answer = json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1}});
+            let script = format!("#!/bin/sh\nsleep 1\nprintf '%s\\n' \"$2\" > '{d}/config-path'\nprintf '%s\\n' \"$$\" > '{d}/pid'\nIFS= read -r line || exit\nprintf '%s\\n' '{answer}'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> '{d}/requests'; done\n");
+            let program = dir.path().join("agent");
+            std::fs::write(&program, script)?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+            assert!(discover(program, Duration::from_millis(200), &dir.path().join("user-config.json")).await.is_err());
+            cleaned(dir.path())?;
+            Ok(())
+        })
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_deadline_keeps_the_catalog_without_guessing_unanswered_models_efforts() -> anyhow::Result<()> {
