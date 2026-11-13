@@ -230,7 +230,7 @@ pub async fn run(hub: &Arc<Hub>, b: &Broadcast, by: &str, among: &[Info]) -> any
             };
             let mut retained = false;
             for c in commands {
-                match hub.harness.command(hub, &info.id, c).await {
+                match hub.harness.command_from(hub, &info.id, by, c).await {
                     Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => {}
                     Sent::Published(receipt) => match receipt.disposition {
                         super::mail::Disposition::Admitted | super::mail::Disposition::Consumed => {},
