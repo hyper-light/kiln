@@ -2566,6 +2566,8 @@ dependencies = [
  "const-oid 0.9.6",
  "der",
  "fancy-regex",
+ "hex-api",
+ "hex-core",
  "jiff",
  "kiln-sim",
  "proptest",
