@@ -1594,7 +1594,7 @@ impl Core {
     pub fn settle_status(&mut self, running: bool) {
         let was = self.state.status == Status::Running;
         let s = match self.state.status {
-            Status::Exited | Status::Disconnected | Status::Starting if !running => self.state.status,
+            Status::Exited | Status::Disconnected | Status::Crashed | Status::Starting if !running => self.state.status,
             _ if !self.state.approvals.is_empty() => Status::Waiting,
             _ if running => Status::Running,
             _ => Status::Idle,
