@@ -292,10 +292,18 @@ pub fn harness_env(store: &Path, pinned: &str, dir: &str) -> Result<Vec<(String,
         }
     };
     let osi = osi.ok_or_else(|| format!("its image holds no {path}: nothing of its says how its harness runs"))?;
-    let run = osi::Config::parse(&osi).map_err(|e| format!("{path}: {e}"))?.run.map(|r| r.env).unwrap_or_default();
-    let image = config.config.and_then(|c| c.env).unwrap_or_default();
+    let osi = osi::Config::parse(&osi).map_err(|e| format!("{path}: {e}"))?;
+    Ok(run_env(config.config.and_then(|c| c.env).unwrap_or_default(), &osi))
+}
+
+/// A harness's run environment from its image's environment (`image`, each `NAME=value`) and its OSI
+/// config (`osi`, its `<dir>.d/osi.json`), as Shards' init composes it (`harness_env`,
+/// crates/init/src/domains.rs): the image's but its `PATH` and `HOME`, which are init's, then the
+/// config's `run.env` over it.
+pub fn run_env(image: Vec<String>, osi: &shards_image::osi::Config) -> Vec<(String, String)> {
+    let run = osi.run.as_ref().map(|r| r.env.clone()).unwrap_or_default();
     let image = image.into_iter().filter(|e| !matches!(e.split_once('=').map(|(k, _)| k), Some("PATH" | "HOME")));
-    Ok(image.chain(run).filter_map(|e| e.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned()))).collect())
+    image.chain(run).filter_map(|e| e.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned()))).collect()
 }
 
 /// What one layer says of a file.

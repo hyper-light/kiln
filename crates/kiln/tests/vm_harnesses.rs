@@ -221,7 +221,38 @@ mod checks {
             assert!(text.lines().any(|l| l == format!("ENV VM_STUB_PROTOCOL={kind}")) && !text.contains("COPY "), "{text}");
         }
         let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(stub_path().with_file_name("harness.json"))?)?;
-        assert_eq!(manifest.get("entrypoint").and_then(serde_json::Value::as_str), Some(format!("python3 {at}/stub").as_str()));
+        assert_eq!(manifest.pointer("/run/command"), Some(&json!(["python3", format!("{at}/stub")])), "{manifest}");
+        Ok(())
+    }
+
+    #[test]
+    fn s17_the_stand_in_keeps_its_home_on_a_volume_of_its_own() -> anyhow::Result<()> {
+        // kiln refuses a person's Agentfile whose harness keeps its configuration in no volume
+        // (harness::isolated::Refusal::NoConfigVolume, step 18), checked as sandbox::isolated's launch
+        // checks it: its volumes as Shards reads its lines (kept_volumes), and its harness's run
+        // environment as Shards' build normalizes its harness.json to osi.json (startup::config) and
+        // its init composes it over the image's ENV (run_env). Each kind's stand-in passes; with a
+        // harness.json setting no HOME (the simple entrypoint form) or a HOME off its volumes, refused.
+        use kiln::harness::isolated::{Refusal, home::Layout};
+        let homes = tempfile::tempdir()?;
+        let harness_json = std::fs::read(stub_path().with_file_name("harness.json"))?;
+        let refused = |text: &str, kind: &str, harness_json: &[u8]| -> anyhow::Result<Option<Refusal>> {
+            let (volumes, _dir) = kiln::sandbox::isolated::kept_volumes(text, kind).map_err(anyhow::Error::msg)?;
+            let config = shards_agentfile::startup::config(harness_json, kind).map_err(anyhow::Error::msg)?;
+            let osi = shards_image::osi::Config::parse(&config.to_bytes()?)?;
+            let image: Vec<String> = text.lines().filter_map(|l| l.strip_prefix("ENV ")).map(str::to_owned).collect();
+            let env = kiln::sandbox::isolated::run_env(image, &osi);
+            Ok(Layout::new(homes.path(), "owner", kind, &volumes, &env).err())
+        };
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        for kind in ["claude", "codex", "goose", "antigravity", "pi", "devin"] {
+            let text = stub_agentfile(kind, kind, commit, &kiln_base()?, &kiln_repository()?);
+            assert!(refused(&text, kind, &harness_json)?.is_none(), "{kind}: {:?}\n{text}", refused(&text, kind, &harness_json)?);
+            let simple = br#"{"entrypoint":"python3 /opt/vm-stub/stub","options":[]}"#;
+            assert!(matches!(refused(&text, kind, simple)?, Some(Refusal::NoConfigVolume { .. })), "{kind}: a harness.json setting no HOME passed");
+            let off = String::from_utf8(harness_json.clone())?.replace("HOME=/home/stub", "HOME=/root");
+            assert!(matches!(refused(&text, kind, off.as_bytes())?, Some(Refusal::NoConfigVolume { .. })), "{kind}: a HOME off its volumes passed");
+        }
         Ok(())
     }
 
