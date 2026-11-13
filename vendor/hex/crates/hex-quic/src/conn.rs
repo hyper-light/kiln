@@ -7,13 +7,16 @@
 //! - **Out:** at most one frame waiting for the driver, which a writer waits to have gone before it places the next:
 //!   QUIC's stream holds what the peer's credit lets it, and the writer waits behind it, never a queue that grows.
 //!
-//! Every wait ends on a fact: bytes, room, the peer's End, or the connection's end with why (CLAUDE.md §4).
+//! Every wait ends on a fact: bytes, room, the peer's End, or the connection's end with why (CLAUDE.md §4). What came
+//! is the owner's to read whatever ends the connection after it, a Reset that follows the peer's End or the connection's
+//! close (CLAUDE.md §3): only the owner's own reset lets it go.
 
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::Instant;
 
 use hex_core::lanes::{self, Why};
+use hex_wait::{Condvar, Mutex, MutexGuard};
 
 use crate::driver::{Command, Commands};
 
@@ -74,20 +77,16 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> io::Error {
 }
 
 /// What of the front frame fits `buf`, and the bytes of a frame the owner has now read whole, to grant the peer
-/// back; `None` while nothing has come and the peer's half is open.
+/// back; `None` while nothing has come and the peer's half is open. What came is read before any end: then the peer's
+/// half's end where its End came, else why the connection is gone.
 fn take(state: &mut MutexGuard<'_, State>, buf: &mut [u8]) -> io::Result<Option<(usize, u64)>> {
-    if let Some(why) = state.gone
-        && state.there == There::Open
-    {
-        return Err(gone_error(why));
-    }
     let at = state.read;
     let Some(front) = state.inbound.front() else {
-        return Ok(if state.there == There::Ended {
-            Some((0, 0))
-        } else {
-            None
-        });
+        return match (state.there, state.gone) {
+            (There::Ended, _) => Ok(Some((0, 0))),
+            (There::Open, Some(why)) => Err(gone_error(why)),
+            (There::Open, None) => Ok(None),
+        };
     };
     let rest = front.get(at..).unwrap_or_default();
     let n = rest.len().min(buf.len());
@@ -164,17 +163,13 @@ impl Shared {
         self.told();
     }
 
-    /// The driver: the connection is gone both ways, for `why`. What the peer sent before its End stays the owner's
-    /// to read ([`There::Ended`]).
+    /// The driver: the connection is gone both ways, for `why`. What came before stays for the owner to read.
     pub(crate) fn gone(&self, why: Why) {
         if let Ok(mut state) = self.state.lock() {
             if state.gone.is_none() {
                 state.gone = Some(why);
             }
             state.outbox = None;
-            if state.there == There::Open {
-                state.inbound.clear();
-            }
         }
         self.told();
     }
@@ -242,7 +237,7 @@ impl Conn {
         loop {
             if let Some((n, read)) = take(&mut state, buf)? {
                 drop(state);
-                self.consumed(read)?;
+                self.consumed(read);
                 return Ok(n);
             }
             state = self.wait(state, deadline)?;
@@ -254,26 +249,24 @@ impl Conn {
         let mut state = self.shared.state()?;
         let taken = take(&mut state, buf)?;
         drop(state);
-        match taken {
-            Some((n, read)) => {
-                self.consumed(read)?;
-                Ok(Some(n))
-            }
-            None => Ok(None),
-        }
+        Ok(taken.map(|(n, read)| {
+            self.consumed(read);
+            n
+        }))
     }
 
     /// Tells the driver the owner read a frame's `bytes` whole, which it grants the peer back: never under the
-    /// connection's lock, which the driver takes to hand it bytes.
-    fn consumed(&self, bytes: u64) -> io::Result<()> {
+    /// connection's lock, which the driver takes to hand it bytes. A grant the driver can't take is moot, never a
+    /// failed read: it has ended, telling every connection so, and the bytes read are the owner's all the same.
+    fn consumed(&self, bytes: u64) {
         if bytes == 0 {
-            return Ok(());
+            return;
         }
-        self.shared.command(Command::Consumed {
+        let _ = self.shared.command(Command::Consumed {
             peer: self.shared.peer,
             conn: self.shared.key,
             bytes,
-        })
+        });
     }
 
     fn wait<'a>(
@@ -282,7 +275,7 @@ impl Conn {
         deadline: Option<Instant>,
     ) -> io::Result<MutexGuard<'a, State>> {
         match deadline {
-            None => self.shared.changed.wait(state).map_err(poisoned),
+            None => self.shared.changed.wait(state).map_err(io::Error::from),
             Some(at) => {
                 let left = at.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -295,7 +288,7 @@ impl Conn {
                     .changed
                     .wait_timeout(state, left)
                     .map(|(state, _)| state)
-                    .map_err(poisoned)
+                    .map_err(io::Error::from)
             }
         }
     }
@@ -372,6 +365,7 @@ impl Conn {
         }
         state.here_ended = true;
         drop(state);
+        self.shared.told();
         self.shared.command(Command::End {
             peer: self.shared.peer,
             conn: self.shared.key,
@@ -383,8 +377,8 @@ impl Conn {
         self.shared.peer
     }
 
-    /// Whether the peer's half has ended and all of it was read, or the connection went before it ended: a read now
-    /// returns its end.
+    /// Whether the peer is done: its half ended and all of it was read, or the connection went while its half was
+    /// open. Reads return what came before, then the end or why the connection went (HEX-QUIC-26).
     pub fn hung_up(&self) -> bool {
         self.shared
             .state
@@ -412,13 +406,30 @@ impl Conn {
         }
         state.here_ended = true;
         drop(state);
+        self.shared.told();
         self.shared.command(Command::End {
             peer: self.shared.peer,
             conn: self.shared.key,
         })
     }
 
-    /// Ends the connection both ways now, for `why`: what the peer sends from now is let go.
+    /// Waits until the connection is done: both halves ended (`Ok`), or it is gone (its end's error). What a bridge
+    /// waits on once the peer's half has ended, so the connection's end ends this side's too ([`crate::bridge`]).
+    pub(crate) fn finished(&self) -> io::Result<()> {
+        let mut state = self.shared.state()?;
+        loop {
+            if let Some(why) = state.gone {
+                return Err(gone_error(why));
+            }
+            if state.here_ended && state.there == There::Ended {
+                return Ok(());
+            }
+            state = self.shared.changed.wait(state).map_err(io::Error::from)?;
+        }
+    }
+
+    /// Ends the connection both ways now, for `why`: what the peer sent that wasn't read, and what it sends from now, is
+    /// let go.
     pub fn reset(&self, why: Why) {
         let first = match self.shared.state.lock() {
             Ok(mut state) => {

@@ -121,6 +121,7 @@ pub(super) fn oci(rootfs: Rootfs, mounts: Vec<Mount>) -> BoxSpec {
             hosts: Vec::new(),
         })),
         owner: None,
+        band: 0,
     }
 }
 
@@ -343,6 +344,7 @@ fn a_bundles_config_is_rewritten_to_the_guests_paths() {
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(bundle.clone()),
         owner: None,
+        band: 0,
     };
     let got = rewrite(spec.clone(), &shared, STAGED, &Known::new()).unwrap();
     assert_eq!(
@@ -467,6 +469,7 @@ fn where_shards_has_no_backend_the_class_is_refused_before_anything_boots() {
         bounds: Bounds::default(),
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     };
     assert!(matches!(
         runtime.create(process),

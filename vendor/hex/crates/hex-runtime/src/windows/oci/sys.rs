@@ -1875,6 +1875,7 @@ mod create_tests {
                 kind: DeviceKind::Gpu,
                 key: 256,
             }],
+            band: 0,
         };
         let bindings = rt.bindings(&spec).unwrap();
         let container = rt.container(&spec).unwrap();
@@ -1955,6 +1956,7 @@ mod create_tests {
             owner: None,
             class: ClassSpec::Process,
             devices: Vec::new(),
+            band: 0,
         };
         rt.create(sibling.clone()).unwrap();
         assert_eq!(

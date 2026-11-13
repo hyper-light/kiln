@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::io;
 #[cfg(not(target_os = "macos"))]
 use std::process::Child;
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 pub type OwnedChild = Arc<Mutex<Child>>;
@@ -21,8 +21,8 @@ struct State {
 }
 
 pub struct Stopping {
-    state: Mutex<State>,
-    wake: Condvar,
+    state: hex_wait::Mutex<State>,
+    wake: hex_wait::Condvar,
 }
 
 impl Default for Stopping {
@@ -68,11 +68,11 @@ impl Stopping {
     /// peers and overlapping live connections are refused instead of growing a child history.
     pub fn new(peers: impl IntoIterator<Item = u32>) -> Self {
         Self {
-            state: Mutex::new(State {
+            state: hex_wait::Mutex::new(State {
                 children: peers.into_iter().map(|node| (node, Weak::new())).collect(),
                 ..State::default()
             }),
-            wake: Condvar::new(),
+            wake: hex_wait::Condvar::new(),
         }
     }
 
@@ -129,7 +129,10 @@ impl Stopping {
         let (state, _) = self
             .wake
             .wait_timeout(state, duration)
-            .map_err(|_| poisoned("SSH retry"))?;
+            .map_err(|why| match why {
+                hex_wait::Failed::Poisoned => poisoned("SSH retry"),
+                hex_wait::Failed::Os(why) => why,
+            })?;
         Ok(state.stopped)
     }
 

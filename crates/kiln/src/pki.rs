@@ -204,24 +204,26 @@ pub fn covers(names: &[String], host: &str) -> bool {
 /// The certificates of a PEM text (a chain, or a chain and its key pasted together), PEM again:
 /// its `CERTIFICATE` sections and nothing else, so what comes out never carries a key.
 pub fn public_chain_pem(pem: &str) -> anyhow::Result<String> {
-    use base64::Engine as _;
     use hyper_quic::rustls::pki_types::CertificateDer;
     use hyper_quic::rustls::pki_types::pem::PemObject as _;
     let chain = CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("bad certificate pem: {e:?}"))?;
     anyhow::ensure!(!chain.is_empty(), "no certificate found (-----BEGIN CERTIFICATE-----)");
-    let mut out = String::new();
-    for der in &chain {
-        let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_ref());
-        out.push_str("-----BEGIN CERTIFICATE-----\n");
-        for line in b64.as_bytes().chunks(64) {
-            out.push_str(&String::from_utf8_lossy(line));
-            out.push('\n');
-        }
-        out.push_str("-----END CERTIFICATE-----\n");
+    Ok(chain.iter().map(|der| cert_pem(der.as_ref())).collect())
+}
+
+/// A certificate's DER as PEM (RFC 7468 §5): its base64 in lines of 64.
+pub fn cert_pem(der: &[u8]) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        out.push_str(&String::from_utf8_lossy(line));
+        out.push('\n');
     }
-    Ok(out)
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
 }
 
 /// A CSR for a front door's certificate: `names` signed with `key_pem` (the server decides the
@@ -423,6 +425,28 @@ impl Pki {
             .signed_by(&self.issuer)
             .context("sign CSR")?;
         Ok((name, signed.pem()))
+    }
+
+    /// The machine a request proves itself as: its current certificate, issued by this CA and still
+    /// valid, and a CSR for that certificate's key, whose signature shows the requester holds it
+    /// (the proof [`Self::sign_instance`] takes). Its name.
+    pub fn prove_machine(&self, cert_pem: &str, csr_pem: &str) -> anyhow::Result<String> {
+        self.proven(cert_pem, csr_pem).map(|(name, _)| name)
+    }
+
+    /// Sign a capacity holder's CSR (DER; Hex's capacity-view.md, the holder's item 1; kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d, step 13): a certificate for its key named `name` alone,
+    /// whatever it asked, for either side of a link as Hex's peers hold theirs (serverAuth and
+    /// clientAuth), valid as a machine's is, its serial its own. Parsing checks the CSR's signature
+    /// (possession of its key). DER.
+    pub fn sign_holder(&self, csr_der: &[u8], name: &str) -> anyhow::Result<Vec<u8>> {
+        let name = sanitize_name(name);
+        anyhow::ensure!(!reserved(&name), "{SERVER_NAME} is the server's own identity; a holder can't be named so");
+        let csr = CertificateSigningRequestParams::from_der(&csr_der.to_vec().into()).context("parse the holder's CSR")?;
+        let mut params = leaf_params(vec![name], LEAF_DAYS)?;
+        params.serial_number = Some(random_serial());
+        let signed = CertificateSigningRequestParams { params, public_key: csr.public_key }.signed_by(&self.issuer).context("sign the holder's CSR")?;
+        Ok(signed.der().to_vec())
     }
 
     /// A machine known by its name moving to its machine id (docs/machines.md): the same proof as

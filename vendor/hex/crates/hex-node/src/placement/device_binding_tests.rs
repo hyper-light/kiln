@@ -666,6 +666,7 @@ fn concurrent_isolation_group_admission_keeps_one_creating_holder() {
                 owner: None,
                 allocation: None,
                 devices: vec![GPU_A],
+                band: 0,
             };
             let snapshot = records.lock().unwrap().clone();
             catalog.prepare(&spec, &snapshot, &[]).unwrap();
@@ -714,6 +715,7 @@ fn concurrent_isolation_group_admission_keeps_one_creating_holder() {
                 owner: None,
                 allocation: None,
                 devices: vec![GPU_B],
+                band: 0,
             };
             let snapshot = records.lock().unwrap().clone();
             if catalog.prepare(&spec, &snapshot, &[]).is_err() {

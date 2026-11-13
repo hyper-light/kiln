@@ -423,6 +423,9 @@ enum Held {
     /// process's child, so its exit is seen through its process handle, and its job (kill-on-close)
     /// is held so nothing in it is taken while it runs.
     Adopted { process: OwnedHandle, job: OwnedHandle },
+    /// A harness a boundary holds (a microVM's member, kiln plan step 17): no process of this
+    /// machine's, its end its boundary's run's ([`Duplex::held`]).
+    Boundary(Arc<crate::sandbox::held::Held>),
 }
 
 impl Held {
@@ -439,6 +442,7 @@ impl Held {
                 // SAFETY: a job handle this owns; ending it ends the harness and all it started.
                 unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
             }
+            Held::Boundary(held) => held.kill(),
         }
     }
 
@@ -448,6 +452,8 @@ impl Held {
             Held::Agent(c, _) => c.try_wait(),
             // A process this one didn't start: its exit comes through its handle, not `wait`.
             Held::Adopted { process, .. } => Ok(process_exit(process.as_raw_handle()).map(|code| ExitStatus::from_raw(code.unwrap_or(0) as u32))),
+            // Its end is its run's, said through its own channel, never waited for here.
+            Held::Boundary(_) => Ok(None),
         }
     }
 }
@@ -497,9 +503,40 @@ fn child_pipe<T: IntoRawHandle>(pipe: T) -> File {
 }
 
 impl Duplex {
-    /// Windows has no SIGTERM for a job: kill it at once.
-    pub fn terminate(&self, _grace: Duration) {
-        self.job.lock().kill();
+    /// Windows has no SIGTERM for a job: kill it at once. Held by a boundary, it's ended as its
+    /// boundary ends a run ([`crate::sandbox::held::Held::terminate`]).
+    pub fn terminate(&self, grace: Duration) {
+        let mut held = self.job.lock();
+        if let Held::Boundary(run) = &*held {
+            run.terminate(grace);
+            return;
+        }
+        held.kill();
+    }
+
+    /// A harness a boundary holds, from its run's pipes and end ([`crate::sandbox::held::pump`]):
+    /// no process of this machine's, so no pid ([`Duplex::host_pid`]), nothing to hand over, and its
+    /// stop its boundary's.
+    pub fn held(parts: crate::sandbox::held::Parts) -> Duplex {
+        Duplex {
+            pid: 0,
+            stdin: parts.stdin,
+            stdout: parts.stdout,
+            stderr: parts.stderr,
+            exit: parts.exit,
+            usage: None,
+            job: Arc::new(Mutex::new(Held::Boundary(parts.held))),
+            pipes: [0; 3],
+            foreign: false,
+            stopped: Arc::new(AtomicBool::new(false)),
+            readers: Vec::new(),
+            writer: None,
+        }
+    }
+
+    /// Its process on this machine, where it is one; none for a harness a boundary holds.
+    pub fn host_pid(&self) -> Option<u32> {
+        (!matches!(&*self.job.lock(), Held::Boundary(_))).then_some(self.pid)
     }
 
     /// Let go of the harness without stopping it, for the runner after this one to take over
@@ -514,8 +551,9 @@ impl Duplex {
             match &*held {
                 Held::Agent(child, group) => (child.as_raw_handle(), group.job_handle()),
                 Held::Adopted { process, job } => (process.as_raw_handle(), job.as_raw_handle()),
-                // A plain job of its own isn't carried: its harness stops and resumes from its record.
-                Held::Own(_) => return None,
+                // A plain job of its own isn't carried: its harness stops and resumes from its record;
+                // nor is a boundary's run, which no handle of this process's holds.
+                Held::Own(_) | Held::Boundary(_) => return None,
             }
         };
         // Duplicate everything that must outlive the threads and the `Held`: the three pipes, the
@@ -624,8 +662,8 @@ fn serve(pid: u32, stdin: Option<File>, stdout: Option<File>, stderr: Option<Fil
         stderr.as_ref().map_or(0, |f| handle_to_i64(f.as_raw_handle())),
     ];
     let stopped = Arc::new(AtomicBool::new(false));
-    let (out_tx, stdout_rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, 256);
-    let (err_tx, stderr_rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, 64);
+    let (out_tx, stdout_rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, crate::proc::STDOUT_CHUNKS);
+    let (err_tx, stderr_rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, crate::proc::STDERR_CHUNKS);
     let mut readers = Vec::new();
     if let Some(p) = stdout {
         readers.push(pump_handed("kiln-harness-out", p, Arc::clone(&stopped), move |c| out_tx.send_blocking(c.to_vec()).is_ok())?);

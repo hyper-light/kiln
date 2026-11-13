@@ -126,6 +126,7 @@ fn spec() -> BoxSpec {
         owner: None,
         allocation: None,
         devices: Vec::new(),
+        band: 0,
     }
 }
 fn fixture(pauses: usize) -> (Arc<Gate>, Receiver<usize>, Vec<SyncSender<()>>) {

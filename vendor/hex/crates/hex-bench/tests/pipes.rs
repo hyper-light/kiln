@@ -26,7 +26,7 @@ fn repo() -> PathBuf {
 }
 
 /// Every `.rs` file under the workspace's crates, walked with an explicit stack (CLAUDE.md §11), its path relative to
-/// the repository.
+/// the repository as the repository names it: its components joined by `/` on every OS, where Windows walks `\`.
 fn sources() -> Vec<String> {
     let root = repo();
     let mut out = Vec::new();
@@ -37,12 +37,13 @@ fn sources() -> Vec<String> {
             if path.is_dir() {
                 walk.push(path);
             } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(
-                    path.strip_prefix(&root)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+                let names: Vec<String> = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                out.push(names.join("/"));
             }
         }
     }
@@ -63,10 +64,15 @@ fn flags_of(text: &str, at: usize) -> &str {
 fn inheritable_in(text: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut at = 0;
-    for (n, line) in text.lines().enumerate() {
+    // Each line with its own end, `\n` or a checkout's `\r\n`, so its offset in `text` is its own.
+    for (n, ended) in text.split_inclusive('\n').enumerate() {
+        let line = ended
+            .strip_suffix("\r\n")
+            .or_else(|| ended.strip_suffix('\n'))
+            .unwrap_or(ended);
         let code = line.trim_start();
         let start = at;
-        at += line.len() + 1;
+        at += ended.len();
         if code.starts_with("//") {
             continue;
         }
@@ -110,12 +116,9 @@ fn every_pipe_the_workspace_makes_is_close_on_exec() {
     );
 }
 
-/// Non-vacuity: the reading finds a pipe made without close-on-exec, and only that. Do: read a source with rustix's
-/// `pipe()`, a `pipe_with` of other flags, one of `CLOEXEC` with them across lines, std's pipe, and a comment naming
-/// `pipe()`. Expect: the first two named, by line, and none of the rest.
-#[test]
-fn the_reading_names_a_pipe_made_without_close_on_exec_alone() {
-    let text = "\
+/// A source with rustix's `pipe()`, a `pipe_with` of other flags, one of `CLOEXEC` with them across lines, std's pipe,
+/// and a comment naming `pipe()`: its first two lines alone make a pipe without close-on-exec.
+const CALLS: &str = "\
 let (r, w) = rustix::pipe::pipe().unwrap();
 let (r, w) = rustix::pipe::pipe_with(PipeFlags::NONBLOCK).unwrap();
 let (r, w) = rustix::pipe::pipe_with(
@@ -125,6 +128,25 @@ let (r, w) = rustix::pipe::pipe_with(
 let (r, w) = std::io::pipe().unwrap();
 // rustix::pipe::pipe() would leave it inheritable
 ";
-    let found: Vec<usize> = inheritable_in(text).into_iter().map(|(n, _)| n).collect();
+
+/// Non-vacuity: the reading finds a pipe made without close-on-exec, and only that. Do: read [`CALLS`]. Expect: the
+/// first two named, by line, and none of the rest.
+#[test]
+fn the_reading_names_a_pipe_made_without_close_on_exec_alone() {
+    let found: Vec<usize> = inheritable_in(CALLS).into_iter().map(|(n, _)| n).collect();
     assert_eq!(found, vec![1, 2]);
+}
+
+/// A checkout's lines may end `\r\n` (git's `core.autocrlf`, on by default on Windows), and a call's flags are read at
+/// its own offset however many such lines come before it (AC-T7.4.1). Do: read [`CALLS`] with `\r\n` ends, ten times
+/// over. Expect: the first two lines of each copy named, by line, and none of the rest.
+#[test]
+fn a_crlf_checkout_is_read_at_each_calls_own_offset() {
+    let lines = CALLS.lines().count();
+    let text = CALLS.replace('\n', "\r\n").repeat(10);
+    let found: Vec<usize> = inheritable_in(&text).into_iter().map(|(n, _)| n).collect();
+    let want: Vec<usize> = (0..10)
+        .flat_map(|copy| [copy * lines + 1, copy * lines + 2])
+        .collect();
+    assert_eq!(found, want);
 }

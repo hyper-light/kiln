@@ -9,9 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use hex_api::capacity::{
-    self, Amounts, Forgotten, Keeper, NotForgotten, Read, Scope, ToHolder, ToKeeper,
-};
+use hex_api::capacity::{self, Amounts, Forgotten, Keeper, NotForgotten, ToHolder, ToKeeper};
 use hex_sim::model::Resources;
 use hex_sim::peer::{Records as _, Stop};
 
@@ -77,10 +75,10 @@ pub(super) struct View {
 
 impl View {
     /// Opens the keeper's records in `dir`, its bounds derived from the node's (CV8): `holders`, the
-    /// holders the node authorizes; each holding at most as many as the node's records keep of its own
-    /// boxes (`ran`) and as one sync message lists (`hex_core::capacity::most_held`), so every holder's sync
-    /// fits its lane; a name at most a record's bytes less its epoch field.
-    pub(super) fn open(dir: &Path, holders: usize, ran: usize) -> Result<Self, Stop> {
+    /// holders the node authorizes; each holding at most as many as one sync message lists
+    /// (`hex_core::capacity::most_held`), so every holder's sync fits its lane, whatever runtime classes the node
+    /// has of its own; a name at most a record's bytes less its epoch field.
+    pub(super) fn open(dir: &Path, holders: usize) -> Result<Self, Stop> {
         let full = |what| Stop::Full {
             what,
             bound: usize::MAX,
@@ -88,9 +86,8 @@ impl View {
         let name_bytes = MAX_BYTES
             .checked_sub(EPOCH_FIELD)
             .ok_or_else(|| full("a capacity holder's name"))?;
-        let synced = hex_core::capacity::most_held()
+        let reservations = hex_core::capacity::most_held()
             .map_err(|e| Stop::Damaged(format!("a capacity sync's bound: {e}")))?;
-        let reservations = ran.min(synced);
         let budget = capacity::Budget {
             holders,
             reservations,
@@ -114,32 +111,7 @@ impl View {
 
     /// The machine's physical room, as the node's facts measured it.
     pub(super) fn set_room(&mut self, room: Amounts) {
-        self.sample(room, &[]);
-    }
-
-    /// The machine's physical room and what each scoped holder's work used, by its link, read in one sample
-    /// (CV12): a synced holder not in it earns no credit.
-    pub(super) fn sample(&mut self, room: Amounts, used: &[(u64, Read)]) {
         self.keeper.set_room(room);
-        let by_session: Vec<_> = used
-            .iter()
-            .filter_map(|(link, read)| self.links.get(link).map(|session| (*session, *read)))
-            .collect();
-        self.keeper.sampled(&by_session);
-    }
-
-    /// The links of every synced holder whose hello named a scope, its name, and the scope (CV12).
-    pub(super) fn scopes(&self) -> Vec<(u64, String, Scope)> {
-        self.keeper
-            .scopes()
-            .into_iter()
-            .filter_map(|(session, name, scope)| {
-                self.links
-                    .iter()
-                    .find(|(_, s)| **s == session)
-                    .map(|(link, _)| (*link, name, scope))
-            })
-            .collect()
     }
 
     /// The sum of every holder's reservations.
@@ -147,13 +119,8 @@ impl View {
         self.keeper.foreign()
     }
 
-    /// What the synced holders' scopes are credited to the room (CV12).
-    pub(super) fn credit(&self) -> Amounts {
-        self.keeper.credit()
-    }
-
     /// A holder's word on `link`, decided beside the node's own `local`: the answer, and whether the
-    /// holders' reservations or their credit changed, so the node's admission must be given its new room first.
+    /// holders' reservations changed, so the node's admission must be given its new room first.
     pub(super) fn hear(
         &mut self,
         link: u64,
@@ -170,7 +137,7 @@ impl View {
             };
             return Ok((closed, false));
         }
-        let before = (self.keeper.foreign(), self.keeper.credit());
+        let before = self.keeper.foreign();
         let answer = self
             .keeper
             .hear(msg, local, &mut self.records)
@@ -180,18 +147,14 @@ impl View {
             self.links.retain(|_, session| keeper.current(*session));
             self.links.insert(link, fence.session);
         }
-        let after = (self.keeper.foreign(), self.keeper.credit());
-        Ok((answer, after != before))
+        Ok((answer, self.keeper.foreign() != before))
     }
 
-    /// Link `link` dropped: its holder is away and keeps what it holds (CV5), its credit ending at once (CV12).
-    /// Whether the credit changed, so the node's admission must be given its new room first.
-    pub(super) fn link_down(&mut self, link: u64) -> bool {
-        let before = self.keeper.credit();
+    /// Link `link` dropped: its holder is away and keeps what it holds (CV5).
+    pub(super) fn link_down(&mut self, link: u64) {
         if let Some(session) = self.links.remove(&link) {
             self.keeper.link_down(session);
         }
-        self.keeper.credit() != before
     }
 
     /// The hints owed, by link: every synced holder is owed one when the node's own `local` moved since
@@ -241,7 +204,3 @@ mod tests;
 #[cfg(test)]
 #[path = "race_tests.rs"]
 mod race_tests;
-
-#[cfg(test)]
-#[path = "credit_tests.rs"]
-mod credit_tests;

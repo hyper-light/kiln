@@ -193,6 +193,11 @@ impl Link for ShardsLink {
         Some(self.bound)
     }
 
+    /// Shards carries a half-close (its D12, held by its conformance case).
+    fn carries_half_close(&self) -> bool {
+        true
+    }
+
     fn dial(&self, port: u32) -> Result<DuplexOwner, Refusal> {
         self.dial_before(port, None)
     }

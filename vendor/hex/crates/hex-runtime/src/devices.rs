@@ -1789,6 +1789,7 @@ mod authority_tests {
                 devices: Vec::new(),
                 allocation: None,
                 route: None,
+                band: 0,
             },
             hex_core::record::Phase::Creating,
             Vec::new(),

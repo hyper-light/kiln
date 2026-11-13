@@ -64,6 +64,7 @@ mod linux {
             bounds: bounds(),
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         }
     }
 

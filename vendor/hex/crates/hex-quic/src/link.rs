@@ -38,7 +38,7 @@ impl guest::Link for Link {
             .endpoint
             .open(self.peer, port)
             .map_err(refusal("opening a connection to the node over QUIC"))?;
-        let socket = bridge::socket(conn)
+        let socket = bridge::bridged(conn)
             .map_err(|e| Refusal::os("bridging a QUIC connection to a local socket", e))?;
         guest::own_duplex(socket)
     }
@@ -53,18 +53,26 @@ impl guest::Link for Link {
         }
         self.dial(port)
     }
+
+    /// A connection's End ends its half alone (docs/design/hex-quic.md Q3), and the bridge carries the owner's
+    /// half-close to it.
+    fn carries_half_close(&self) -> bool {
+        true
+    }
 }
 
 /// The node agent's client over QUIC: the guest's protocol, its waits QUIC's own (`hex_client::guest::Quic`).
 pub type Client = guest::Client<guest::Quic>;
 
-/// A client of the node agent named `name` at `address`, over `endpoint`: dialed, said hello to, and held to the
-/// node's own bound on connections, by `deadline` (none: the dial until the driver tells it, [`Endpoint::dial`], and
-/// the hello on its kind's learned wait, `client.quic.answer.hello`).
+/// A client of the node agent named `name` at `address`, over `endpoint`: dialed, said hello to, and held to the lanes
+/// the node grants a peer, as the node derives them from the calls in flight its hello says (its budget) and whether it
+/// stages (`staging`): [`crate::limits::peer_lanes`], the node's own shape. By `deadline` (none: the dial until the
+/// driver tells it, [`Endpoint::dial`], and the hello on its kind's learned wait, `client.quic.answer.hello`).
 pub fn connect(
     endpoint: Arc<Endpoint>,
     name: &str,
     address: SocketAddr,
+    staging: bool,
     deadline: Option<Instant>,
 ) -> Result<(Client, PeerId), Refused> {
     let peer = endpoint.dial(name, address, deadline)?;
@@ -74,7 +82,9 @@ pub fn connect(
     })
     .map_err(Refused::Node)?;
     let client = Client::connect_timed_before(link, deadline).map_err(Refused::Node)?;
-    let lanes = u32::try_from(client.limits().connections).unwrap_or(u32::MAX);
-    endpoint.limit(peer, lanes)?;
+    endpoint.limit(
+        peer,
+        crate::limits::peer_lanes(client.budgets().in_flight, staging),
+    )?;
     Ok((client, peer))
 }

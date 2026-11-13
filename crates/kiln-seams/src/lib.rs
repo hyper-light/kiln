@@ -12,6 +12,7 @@
 //! | [`Artifacts`](artifacts::Artifacts) | OCI repositories: blobs, manifests, tags, referrers | Reliquary (CP-T9.1) |
 //! | [`Sandbox`](sandbox::Sandbox) | a harness launched in a boundary | `host`, then Shards (CP-T4.1), then Hex |
 //! | [`Placement`](placement::Placement) | where work runs, by resources | Hex (CP-T7.1) |
+//! | [`Capacity`](capacity::Capacity) | a machine's capacity keeper: links that carry a holder's words and its answers | Hex's keeper on its node, over QUIC (kiln's `capacity`) |
 //! | [`HarnessPort`](harness::HarnessPort) | kiln's agents: who they are, and commands to them | kiln's harness registry |
 //! | [`Forge`](forge::Forge) | what a git host does with changes: stacks, its queue, updates, batched reviews, merges | githost: kiln's GitHub App, GitLab, Bitbucket (W26-R20) |
 //! | [`Search`](search::Search) | a tree's files, searched by text or by code's shape | vorpal (`kiln-search`, W26-R07) |
@@ -32,6 +33,7 @@
 pub mod artifacts;
 pub mod blobs;
 pub mod bus;
+pub mod capacity;
 pub mod clock;
 pub mod conformance;
 pub mod dependencies;
@@ -48,6 +50,7 @@ pub mod spawn;
 pub use artifacts::Artifacts;
 pub use blobs::Blobs;
 pub use bus::Bus;
+pub use capacity::Capacity;
 pub use clock::Clock;
 pub use dependencies::DependencySources;
 pub use forge::Forge;

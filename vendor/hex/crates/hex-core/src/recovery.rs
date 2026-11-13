@@ -151,6 +151,7 @@ mod strays_tests {
                 bounds: Bounds::default(),
                 class: ClassSpec::Process,
                 owner: None,
+                band: 0,
             },
             Phase::Ready,
             Vec::new(),
@@ -265,6 +266,7 @@ mod tests {
             bounds: Bounds::default(),
             class,
             owner: None,
+            band: 0,
         }
     }
 
