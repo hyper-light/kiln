@@ -316,3 +316,54 @@ one Mac, then a fast-forward. Windows, Linux and the rest of the matrix run in C
 | the same Mac, at 0c64ad0e8: the same, merged with kiln main 522f14c31 (step 17's launch seam and images, conflicts in api.rs, session.rs and docs/agents.md resolved for both sides, and main's two `Isolation` test literals given part 1's `person`) | the same test | 230 passed, 0 failed, among them main's new `s17_*` tests in the filters |
 | the same | the same clippy | passed (3 min 4 s) |
 | adalundhe-macbook-pro (at a5ce21085), then adas-mac-studio-3.local (at e951b2968) | the same | stopped before a verdict, on ROOT's word: both Macs were thrashing (swap near full) under other lanes' kiln builds |
+
+## Part 3: kiln's MCP over the agent-control lane (Shards D254), first slice
+
+The decisions, verbatim in `evidence/part3/`:
+- ROOT, 2026-11-13: kiln's MCP from inside a microVM rides the agent-control link as its own `mcp`
+  lane (D254), never a network grant. No Agentfile grants anything for it, and kiln's in-process
+  Agentfile check refuses a grant that reaches kiln itself. Third parties' remote MCP servers stay
+  grantable (ROOT's ruling (a), widened to all of kiln itself).
+- Goal 58, D254's API (Shards main e1995061f): `shards_remote::control::Execs::mcp(member)` hands
+  over each connection the member's harness makes to its bridge. The bridge is `/run/shards/mcp`
+  inside the microVM (shards-init's own binary: no arguments, environment or token), and each
+  connection carries newline-delimited JSON-RPC as `kiln reach mcp` does.
+- Goal 65, each harness's documented MCP forms. agy reads servers only from its shared
+  `mcp_config.json`, and a stdio server named there inherits agy's environment
+  (`docs/research/s35-every-harness/agy-mcp`).
+
+Built here:
+- `harness::isolated::mcp` names the bridge as a stdio server in each harness's own form, with no
+  token: Claude Code's `--mcp-config`, Codex's `-c mcp_servers.kiln.*` (its `tool_timeout_sec` as
+  on its machine), ACP's `mcpServers`, and one fixed entry in agy's shared config (`agy_config`,
+  keeping the person's other servers and a kiln entry they turned off). Pi is refused, typed.
+- Codex's timeout and `CODE_WALL_MAX` now live in `reach` itself with one owner, as Windows builds
+  `isolated::mcp` and reaches kiln's MCP only this way.
+- `agentfiles::check::Kiln` covers what is kiln itself: the machine its runner is
+  (`host.docker.internal`; loopback, link-local and unspecified literals, D124's host network; a
+  network's declared gateway, D31's `host-gateway`) and kiln's server (the hosts its configured URLs,
+  advertised and listening addresses and certificate names give).
+  - Every save and lint refuses, typed (`ReachesKiln`) and at its line, a destination or a remote MCP
+    server that is kiln itself, with ROOT's reason, "kiln's MCP rides the agent-control lane (D254)".
+  - The check reads the text with Shards' own parser, after Shards passed it, and resolves no name.
+  - A name that only resolves to the runner, or a literal of the runner's own interfaces, is the
+    run's to see on its machine, as goal 58 notes: owed with the launch.
+
+R03: no number of the rule's own. The address classes are RFCs' (loopback, RFC 3927's and RFC
+4291's link-local) and the names are kiln's configuration. Codex's timeout is main's
+`CODE_WALL_MAX` plus main's own allowance, moved, not copied.
+
+| Where | What | Result |
+|---|---|---|
+| macOS 26.4 arm64, adas-mac-studio.local-2 (M3 Ultra), rustc 1.99.1, `CARGO_INCREMENTAL=0`, at 053e79233 (part 3 on parts 1 and 2) | `cargo test --locked -p kiln --lib -- step18 agentfiles:: harness::isolated mcp:: reach::mcp wire::ts` | 199 passed, 0 failed |
+| the same | `cargo clippy --locked -p kiln -p kiln-ci --all-targets -- -D warnings` | 2 errors, `field_reassign_with_default` in two test helpers: fixed (943294258) |
+| the same Mac, at 027d1aacf (parts 1, 2 and 3 merged with kiln main d1f5b7f69) | step 18's whole filter set (`step18 step23 agentfiles:: wire::ts harness::homes harness::whose harness::moving harness::trouble harness::isolated harness::lineage mcp:: reach::mcp`) | 239 passed, 0 failed |
+| the same | the same clippy | passed (3 min 25 s) |
+
+Owed, this goal's part 3b:
+- The runner's end of the lane: kiln's MCP served in the runner's own process over each
+  `McpConnection`, with no Unix socket, on every OS. `reach::mcp`, `reach::local`'s dispatch and
+  `reach::told`'s teller are Unix-only today, behind the reach socket.
+- Kiln's vendor/shards at or after e1995061f, with shards-remote linked (its owner's).
+- The wiring at the launch (`sandbox::microvm()`, step 17's next slice).
+- Real-VM MCP round trips on Linux, macOS and Windows hosts (ROOT's).
