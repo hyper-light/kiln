@@ -207,9 +207,11 @@ impl Word {
     /// Whether the runner may yet start the run: it hasn't said never, its link is up, and its
     /// health doesn't bar new work there now (AUDIT L1, L2: a strained or barred runner is
     /// widened past as a never is, so retries don't land where the gate would yield or the work
-    /// would fail for the machine's sake; it's probed again once its word says it's well).
+    /// would fail for the machine's sake; it's probed again once its word says it's well). A runner
+    /// not synced with its machine's capacity keeper is widened past alike (Hex's capacity-view.md
+    /// CV11: it admits nothing new there, so the work goes elsewhere).
     fn live(&self) -> bool {
-        !matches!(self, Word::Never(_) | Word::Away | Word::Waiting { reason: Reason::Strained { .. } | Reason::Barred { .. }, .. })
+        !matches!(self, Word::Never(_) | Word::Away | Word::Waiting { reason: Reason::Strained { .. } | Reason::Barred { .. } | Reason::Unsynced { .. }, .. })
     }
 }
 
@@ -586,6 +588,7 @@ fn reason_words(r: &Reason) -> String {
         Reason::Away => "link down".into(),
         Reason::Strained { .. } => "machine under strain".into(),
         Reason::Barred { cause, .. } => format!("barred there by its health ({cause})"),
+        Reason::Unsynced { .. } => "its machine's capacity keeper not synced".into(),
     }
 }
 
