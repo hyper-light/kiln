@@ -18,25 +18,30 @@ FROM ${BASE}
 ARG TARGETARCH
 HARNESS cursor FROM ./cursor-${TARGETARCH}
 
-# Its network reach, every part named (default deny): a network for this harness alone, which it
-# joins with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443
-# out, opened at the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress), for
-# Cursor's backend speaks HTTPS alone (HTTP/2, falling back to HTTP/1.1). These are the bring-up's
-# grants (Shards' docs/examples/harness-claude) until step 9 grants providers by name. Nothing comes
-# in; no other port or protocol goes out.
-NETWORK --dns --egress=443/tcp provider FOR cursor
+# Its network, every part named (default deny; Shards D236, destinations by name): a network for this
+# harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
+# name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
+# resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
+# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
+# docs/research/s18-host-in-vm says where each host comes from).
+# - api2.cursor.sh (most of its requests, and its sign-in's poll) and api2direct.cursor.sh (its
+#   direct route to the same service), both named by the CLI's own code; api5.cursor.sh and its six
+#   agent hosts, an agent's requests; repo42.cursor.sh, codebase search (cursor.com/docs/enterprise/
+#   network-configuration). Cursor Tab's hosts (the editor's), its sign-in pages (the person's
+#   browser), and updates and extensions (off: --disable-auto-update) go nowhere.
+# kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
+# kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
+NETWORK --egress=agent.api5.cursor.sh:443 --egress=agent.global.api5.cursor.sh:443 --egress=agent.us.api5.cursor.sh:443 --egress=agentn.api5.cursor.sh:443 --egress=agentn.global.api5.cursor.sh:443 --egress=agentn.us.api5.cursor.sh:443 --egress=api2.cursor.sh:443 --egress=api2direct.cursor.sh:443 --egress=api5.cursor.sh:443 --egress=repo42.cursor.sh:443 provider FOR cursor
 EXPOSE --harnesses=cursor 443/tcp AS egress FOR provider
 CONNECT cursor WITH cursor ON provider
 
-# The project, which moves to its own host path with step 8, and the person's home. Cursor keeps its
-# config, sessions, MCP servers, rules, plugins and hooks in $HOME/.cursor, and on Linux its sign-in
-# in $HOME/.config/cursor. A harness sees the image read-only, with its own /tmp scratch and these
-# volumes alone writable, so a home that is writable and kept from run to run must be a volume: the
-# whole home is the person's volume (step 7's shape) and harness.json sets HOME=/home/cursor.
-# Cursor's own layout lands there, and so does what the programs it runs keep in a home (.gitconfig
-# ...). HOME in run.env needs a shards at or after 997f4e47e (release v0.8.0 and later), where
-# run.env replaces init's HOME=/tmp. harness.json also puts caches that follow XDG's rule on the
-# scratch (XDG_CACHE_HOME=/tmp/.cache), out of the person's volume. Both volumes are the harness's
-# alone, and outside /tmp, which the scratch covers.
-VOLUME --target-kind=harness /workspace FOR cursor
+# Its project is plugged in as it starts, at the path it has on the machine (Shards D235), so kiln
+# reads its diffs, HEAD and checkpoints at that same path, and no volume holds it. Its HOME is the
+# person's volume, whole: harness.json sets HOME=/home/cursor, kiln's one rule for every harness it
+# ships (step 18). A harness sees its image read-only, with its own /tmp scratch, so a HOME that is
+# writable and kept from run to run is a volume, and what the programs it runs keep in a home (a
+# .gitconfig, a tool's sign-in) is kept with it. Cursor keeps its config, sessions, MCP servers,
+# rules, plugins and hooks in $HOME/.cursor, and on Linux its sign-in in $HOME/.config/cursor.
+# HOME in run.env needs a shards at or after 997f4e47e (v0.8.0 and later), where run.env replaces
+# init's HOME=/tmp. The volume is the harness's alone, and outside /tmp, which the scratch covers.
 VOLUME --target-kind=harness /home/cursor FOR cursor

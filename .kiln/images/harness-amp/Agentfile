@@ -16,17 +16,31 @@ FROM ${BASE}
 ARG TARGETARCH
 HARNESS amp FROM ./amp-${TARGETARCH}
 
-# Its network reach, every part named (default deny): a network for this harness alone, which it
-# joins with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443
-# out, opened at the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress), for Amp
-# speaks HTTPS to ampcode.com. These are the bring-up's grants (Shards' docs/examples/harness-claude)
-# until step 9 grants providers by name. Nothing comes in; no other port or protocol goes out.
-NETWORK --dns --egress=443/tcp provider FOR amp
+# Its network, every part named (default deny; Shards D236, destinations by name): a network for this
+# harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
+# name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
+# resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
+# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
+# docs/research/s18-host-in-vm says where each host comes from).
+# - ampcode.com: Amp's server, where each of its requests goes (its own build: "AMP_URL optionally
+#   overrides ampcode.com"). Its downloads (static.ampcode.com; update checks off:
+#   AMP_SKIP_UPDATE_CHECK) go nowhere.
+# kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
+# kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
+NETWORK --egress=ampcode.com:443 provider FOR amp
 EXPOSE --harnesses=amp 443/tcp AS egress FOR provider
 CONNECT amp WITH amp ON provider
 
-# The project, and the person's Amp state: one home-shaped volume, since Amp keeps its settings and
-# sign-in under XDG config and data, and amp-acp the session mappings ACP's session/load needs under
-# XDG state. harness.json points the three variables into it. Each is the harness's alone.
-VOLUME --target-kind=harness /workspace FOR amp
+# Its project is plugged in as it starts, at the path it has on the machine (Shards D235), so kiln
+# reads its diffs, HEAD and checkpoints at that same path, and no volume holds it. Its HOME is the
+# person's volume, whole: harness.json sets HOME=/home/amp, kiln's one rule for every harness it
+# ships (step 18). A harness sees its image read-only, with its own /tmp scratch, so a HOME that is
+# writable and kept from run to run is a volume, and what the programs it runs keep in a home (a
+# .gitconfig, a tool's sign-in) is kept with it. Amp keeps its settings and sign-in under its XDG
+# config and data directories, and amp-acp the session mappings ACP's session/load needs under XDG
+# state, each pointed beneath it.
+# harness.json keeps caches that follow XDG's rule on the scratch (XDG_CACHE_HOME=/tmp/.cache),
+# where they were before its HOME moved onto the volume.
+# HOME in run.env needs a shards at or after 997f4e47e (v0.8.0 and later), where run.env replaces
+# init's HOME=/tmp. The volume is the harness's alone, and outside /tmp, which the scratch covers.
 VOLUME --target-kind=harness /home/amp FOR amp

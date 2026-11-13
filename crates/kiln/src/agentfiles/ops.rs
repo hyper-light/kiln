@@ -101,7 +101,7 @@ async fn check(cx: Cx, v: Value) -> Out {
     if let Some(p) = super::text_problem(text) {
         return Err((StatusCode::BAD_REQUEST, p));
     }
-    json_of(&super::check::check(text).await)
+    json_of(&super::check::check(text, &super::check::Kiln::of(&cx.hub.cfg.server)).await)
 }
 
 /// The operations, in the order they are listed.

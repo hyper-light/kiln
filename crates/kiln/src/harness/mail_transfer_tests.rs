@@ -88,7 +88,7 @@ fn same_certificate_with_a_new_instance_cannot_pass_stored_transfer_principal_ga
             assert!(allows_claim(&hub,b,session,Some(2)).await);assert!(allows_claim(&hub,b,session,None).await);
             assert!(allows_generic_adoption(&hub,b,session,true).await);assert!(dispatch_ready(&hub,session,&capacity(2)).await.map_err(refusal)?);
             assert!(!allows_claim(&hub,b,session,Some(1)).await,"current identity still needs the committed epoch");
-            hub.instances.update(|instances|instances.connected(b));
+            hub.instances.update(|instances|instances.connected(b, None));
             assert!(!hub.instances.load().current_connection(b));
             assert!(!allows_claim(&hub,b,session,Some(2)).await,"a certificate reconnect cannot reuse old Hello authority");
             assert!(!allows_generic_adoption(&hub,b,session,true).await);
@@ -99,7 +99,7 @@ fn same_certificate_with_a_new_instance_cannot_pass_stored_transfer_principal_ga
             assert!(hub.instances.load().current_connection(b));
             assert!(allows_claim(&hub,b,session,Some(2)).await);assert!(allows_generic_adoption(&hub,b,session,true).await);assert!(dispatch_ready(&hub,session,&capacity(2)).await.map_err(refusal)?);
             send(&hub,&original,TransferDown::Committed { manifest:committed.manifest.clone() }).await.map_err(refusal)?;
-            hub.instances.update(|instances|instances.connected(b));
+            hub.instances.update(|instances|instances.connected(b, None));
             let restarted=join(&hub,b,"machine-destination","destination-restarted",3).map_err(refusal)?;
             assert_eq!(restarted.peer,original.peer);assert_eq!(restarted.machine,original.machine);assert_ne!(restarted.instance,original.instance);
             assert!(hub.instances.load().current_connection(b));assert_eq!(hub.instances.load().owner(&Owned::Agent(session.into())),Some(b));

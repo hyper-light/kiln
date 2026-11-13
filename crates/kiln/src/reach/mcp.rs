@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 
 use super::local::{Client, Ev, Req, RunReq};
 use super::wire::Signal;
+use super::{CODE_WALL_MAX, codex_tool_timeout_sec};
 use crate::mcp::code;
 use crate::ops::Input;
 
@@ -42,7 +43,6 @@ const CODE_OUTPUT_MAX: usize = 1_000_000;
 const WAIT_DEFAULT_S: u64 = 600;
 /// A program runs this long by default, and at most `CODE_WALL_MAX`.
 const CODE_WALL_DEFAULT: Duration = Duration::from_secs(600);
-const CODE_WALL_MAX: Duration = Duration::from_secs(3600);
 /// kiln's operations, as the server lists them, are asked for again after this.
 const REGISTRY_TTL: Duration = Duration::from_secs(60);
 /// Word of what it couldn't read on its way to the server at once, at most.
@@ -460,6 +460,11 @@ fn report(id: &str, cell: &Cell, secs: u64, fresh: bool, max: usize) -> (Value, 
         }
         if let Some(e) = &r.error {
             o.insert("error".into(), json!(e));
+            // Refused before it started, by kind (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32):
+            // an agent can tell why without reading the words.
+            if let Some(code) = super::local::Refused::code_of(e) {
+                o.insert("refused".into(), json!(code));
+            }
         }
     }
     let failed = r.error.is_some() || r.exit.as_ref().and_then(|e| e.get("error")).is_some_and(|e| !e.is_null());
@@ -1215,7 +1220,7 @@ pub fn codex_config(kiln: &std::path::Path, sock: &str, prefer: Option<&str>, se
         "-c".into(),
         format!("mcp_servers.kiln.env={{{}}}", env.join(", ")),
         "-c".into(),
-        format!("mcp_servers.kiln.tool_timeout_sec={}", CODE_WALL_MAX.as_secs() + 60),
+        format!("mcp_servers.kiln.tool_timeout_sec={}", codex_tool_timeout_sec()),
     ]
 }
 

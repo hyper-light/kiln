@@ -4141,6 +4141,17 @@ impl Registry {
         {
             anyhow::bail!("{why}");
         }
+        // Placed by kiln's balancer however it's started, as `agents.start` places one: its microVM's own
+        // needs asked of the machine picked, each opened under its own claim there, which holds its room
+        // from its start to its end (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+        if spec.isolation.is_some() && spec.claim.is_none() {
+            return self.open_placed(hub, target, &loc, spec, count, ids).await;
+        }
+        self.open_at(hub, &loc, spec, count, ids).await
+    }
+
+    /// [`Registry::open_as`]'s start of `count` sessions of `spec` at `loc`, once it's checked.
+    async fn open_at(&self, hub: &Hub, loc: &Location, spec: Spec, count: usize, ids: &[String]) -> anyhow::Result<Vec<Info>> {
         let _held = self.claim(ids)?;
         let mut out = Vec::new();
         for i in 0..count {
@@ -4152,7 +4163,7 @@ impl Registry {
             if count > 1 {
                 spec.name = Some(format!("{} {}", spec.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| default_name(&spec.kind)), i + 1));
             }
-            match &loc {
+            match loc {
                 Location::Local => {
                     // Started on one of the server's own shells: in that shell's directory.
                     if let Some(pid) = spec.shell.as_ref().and_then(|t| self.local_shells.load().get(t).copied()) {
@@ -4277,6 +4288,34 @@ impl Registry {
         }
         for info in &out {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info.clone()) });
+        }
+        Ok(out)
+    }
+
+    /// [`Registry::open_as`] for isolated agents that came with no claim (kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 32): each placed by kiln's balancer on `target`
+    /// ([`crate::harness::lineage::place_on`]) and opened under its own claim, as `agents.start` opens
+    /// them; the claims of those that don't start are let go.
+    async fn open_placed(&self, hub: &Hub, target: &str, loc: &Location, spec: Spec, count: usize, ids: &[String]) -> anyhow::Result<Vec<Info>> {
+        let parent = spec.parent.as_deref().and_then(|p| self.info(p));
+        let claims = crate::harness::lineage::place_on(hub, target, &spec, count, parent.as_ref()).await.map_err(|(_, why)| anyhow::anyhow!("{why}"))?;
+        let mut out = Vec::new();
+        for (i, claim) in claims.iter().enumerate() {
+            let mut one = Spec { claim: Some(claim.clone()), ..spec.clone() };
+            if claims.len() > 1 {
+                one.name = Some(format!("{} {}", spec.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| default_name(&spec.kind)), i + 1));
+            }
+            match self.open_at(hub, loc, one, 1, ids.get(i..=i).unwrap_or_default()).await {
+                Ok(infos) => out.extend(infos),
+                Err(e) => {
+                    crate::harness::lineage::let_go_claims(hub, claims.get(i..).unwrap_or_default()).await;
+                    if out.is_empty() {
+                        return Err(e);
+                    }
+                    tracing::warn!(error = %format!("{e:#}"), "some of the isolated agents asked for didn't start");
+                    break;
+                }
+            }
         }
         Ok(out)
     }

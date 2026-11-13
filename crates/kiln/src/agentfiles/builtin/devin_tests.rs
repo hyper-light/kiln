@@ -154,9 +154,10 @@ fn acp_command(kind: &Kind) -> anyhow::Result<Vec<&'static str>> {
 
 /// harness.json is Shards' full OSI form, every field one its reader knows: schema version 1, Devin's
 /// name, the pin's version; the command kiln starts Devin with (its Kind's program and ACP arguments,
-/// f9), which Shards' init finds on the harness's PATH; and its env exactly the two XDG roots its
-/// volumes hold (f10, f12), set after init's PATH, HOME and SHARDS_DOMAIN. No update setting: Devin's
-/// updater stays off without the installer's marker (f26).
+/// f9), which Shards' init finds on the harness's PATH; and its env exactly its HOME, the person's
+/// volume (step 18), the two XDG roots beneath it (f10, f12), and its caches on the scratch, where
+/// they were (f12), set after init's PATH and SHARDS_DOMAIN. No update setting: Devin's updater stays
+/// off without the installer's marker (f26).
 #[test]
 fn step25_devins_harness_json_starts_it_as_kiln_does() -> anyhow::Result<()> {
     let b = devin()?;
@@ -171,35 +172,27 @@ fn step25_devins_harness_json_starts_it_as_kiln_does() -> anyhow::Result<()> {
     assert_eq!(command, acp_command(kind)?);
     // Changing the Kind's ACP arguments alone tells them apart.
     assert_ne!(command, acp_command(&Kind { protocol: Protocol::Acp(&["acp", "--stdio"]), ..*kind })?);
-    assert_eq!(strings(h.pointer("/run/env")), ["XDG_CONFIG_HOME=/home/devin/.config", "XDG_DATA_HOME=/home/devin/.local/share"]);
+    assert_eq!(strings(h.pointer("/run/env")), ["HOME=/home/devin", "XDG_CONFIG_HOME=/home/devin/.config", "XDG_DATA_HOME=/home/devin/.local/share", "XDG_CACHE_HOME=/tmp/.cache"]);
     Ok(())
 }
 
 /// Devin's Agentfile is the layout's: the pin's base by digest and no RUN, as both builds are static
-/// (f5); TARGETARCH naming the directory kiln writes; exactly the bring-up's three grants, until step
-/// 9's (f14); exactly the project's and Devin's two XDG volumes, the harness's alone (f10, f12); no ENV,
-/// and no ARG but those two.
+/// (f5); TARGETARCH naming the directory kiln writes; its hosts by name (step 18's grants, f14); its
+/// HOME as its one volume, the harness's alone, holding its two XDG roots (f10,
+/// f12); no ENV, and no ARG but those two.
 #[test]
 fn step25_devins_agentfile_is_the_layouts() -> anyhow::Result<()> {
     let b = devin()?;
     let pin: Value = serde_json::from_str(b.pin)?;
     assert!(text(&pin, "/base/digest").strip_prefix("sha256:").is_some_and(is_sha256), "the pin's base is not by digest");
     let base = format!("ARG BASE={}@{}", text(&pin, "/base/ref"), text(&pin, "/base/digest"));
-    assert_eq!(
-        instructions(b.text),
-        [
-            base.as_str(),
-            "FROM ${BASE}",
-            "ARG TARGETARCH",
-            "HARNESS devin FROM ./devin-${TARGETARCH}",
-            "NETWORK --dns --egress=443/tcp provider FOR devin",
-            "EXPOSE --harnesses=devin 443/tcp AS egress FOR provider",
-            "CONNECT devin WITH devin ON provider",
-            "VOLUME --target-kind=harness /workspace FOR devin",
-            "VOLUME --target-kind=harness /home/devin/.config/devin FOR devin",
-            "VOLUME --target-kind=harness /home/devin/.local/share/devin FOR devin",
-        ]
-    );
+    let want: Vec<String> = [base.as_str(), "FROM ${BASE}", "ARG TARGETARCH", "HARNESS devin FROM ./devin-${TARGETARCH}"]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .chain(super::grants_tests::grant_lines("devin"))
+        .chain([super::grants_tests::volume_line("devin")])
+        .collect();
+    assert_eq!(instructions(b.text), want);
     Ok(())
 }
 

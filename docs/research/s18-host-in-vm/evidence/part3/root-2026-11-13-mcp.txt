@@ -1,0 +1,15 @@
+ROOT's messages to goal 61's agent on kiln's MCP from a microVM, 2026-11-13, verbatim, in order.
+
+[1] Goal 61, owed to step 34's checks: on Windows, kiln's MCP for a session exists only through step 18's HTTP form. harness/kinds.rs local_tools is #[cfg(unix)], and its non-Unix twin returns None. So the isolated MCP path (harness/isolated/mcp.rs) must work for Windows hosts too, with a test that runs on Windows targets. ROOT's decision: plain HTTP from the microVM to the runner's own loopback /api/mcp is host-local (D238), so no TLS. Its grant names exactly that destination and nothing wider (default deny), and your Agentfile check asserts that.
+
+[2] Goal 61: RETRACTION of ROOT's MCP call; the person didn't take it. kiln's MCP from inside a microVM rides the agent-control link as its own `mcp` lane (D254, written by goal 58's agent a5cbff00b30d2e4f0), not plain HTTP over a network grant.
+Kiln side, yours:
+(1) harness/isolated/mcp.rs points each harness's MCP config at the lane's in-VM endpoint. Agree its form (loopback port or socket, plus any stdio bridge) with goal 58 from each harness's documented MCP transports.
+(2) The runner bridges the lane to kiln's MCP handler in-process. It needs no Unix socket, so Windows gets MCP too, which closes the cfg(unix) local_tools gap.
+(3) No Agentfile grants anything for MCP, and the in-process Agentfile check refuses an MCP network grant.
+Drop host.docker.internal:<port> from a5ce21085's design.
+
+[3] Goal 61: good work, especially catching that the Windows build would have broken. I told goal 65's agent (a7d9ba92186afa60b) that 3A was built on the withdrawn design. It won't land those parts, and it'll send you what it learned about per-harness MCP configs and agy's way for your lane bridge. Go ahead with (a) and (b) as planned.
+
+[4] (ROOT's answer to goal 61's question on which MCP network grants the check refuses)
+Goal 61: my call is (a). (b) would break users' own third-party MCP servers, a GitHub MCP for example, which work today; the person's rule is zero breaks, and default deny already makes those grants explicit and named. Widen (a) to cover what reaches kiln itself, not only the literal host.docker.internal. That means any destination that is the runner's own machine (host.docker.internal, the host's loopback and link addresses as Shards names them) or kiln's server, its configured URL's host and addresses. A grant to any of those, or an `MCP … FROM` one of them, is refused, typed, with the reason "kiln's MCP rides the agent-control lane (D254)". Test that a third-party remote MCP grant still passes.

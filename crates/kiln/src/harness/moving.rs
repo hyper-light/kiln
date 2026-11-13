@@ -358,7 +358,12 @@ pub fn install(pkg: &Package, cwd: &str) -> Result<Option<Vec<Value>>, String> {
 /// record is in ([`install`]): the session's own files take the place of what it left here only
 /// once its record did.
 pub fn install_home(pkg: &Package, cwd: &str, folder: bool) -> Vec<String> {
-    install_home_in(pkg, &super::homes::Dirs::here(&pkg.spec.env), cwd, folder)
+    match super::homes::Dirs::of(&pkg.spec) {
+        Some(dirs) => install_home_in(pkg, &dirs, cwd, folder),
+        // In a microVM of its own with no volume of its person's named here: nothing goes in this
+        // machine's own homes instead.
+        None => vec!["What its harness kept for it stays on the machine it left: this machine names no volume of its person's for it.".to_owned()],
+    }
 }
 
 /// [`install_home`], into the harnesses' homes `dirs` names.

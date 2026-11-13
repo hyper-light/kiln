@@ -20,7 +20,8 @@ fn is_zero_epoch(n: &u64) -> bool {
 }
 
 /// An isolated session's boundary (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 17 and 32), as kiln's T4 isolation
-/// named it: its kind, and the image it boots once one is chosen.
+/// named it: its kind, the image it boots once one is chosen, and its microVM's size where its start
+/// gave one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Isolation {
@@ -30,15 +31,31 @@ pub struct Isolation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub image: Option<String>,
+    /// The person whose volume its harness's configuration is on (`owner`, `user:<id>`; kiln plan
+    /// step 18, `harness::isolated::home`): whom it acts for, set by kiln from who started it (its
+    /// parent's, for an isolated agent's agents), never from what was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub person: Option<String>,
+    /// Its microVM's vCPUs, as CPUs (Shards' `--cpus`): what its placement asks and its claim holds
+    /// (step 32), never what its harness would need as a process. None: its start gave none, so its
+    /// placement asks none and it's charged what it's measured using.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(as = "Option<f64>", optional))]
+    pub cpus: Option<kiln_ci::sched::state::Cpus>,
+    /// Its microVM's memory, bytes (Shards' `--memory`), asked and held as its vCPUs are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub memory: Option<u64>,
 }
 
 impl Isolation {
     /// The kind every isolated session has today.
     pub const MICROVM: &'static str = "microvm";
 
-    /// A microVM of its own, its image not yet chosen.
+    /// A microVM of its own, its image not yet chosen and its size not given.
     pub fn microvm() -> Self {
-        Self { kind: Self::MICROVM.to_owned(), image: None }
+        Self { kind: Self::MICROVM.to_owned(), image: None, person: None, cpus: None, memory: None }
     }
 }
 
@@ -4048,12 +4065,14 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
         // Its record, and what its harness keeps for it in its home besides (`homes`).
         None => {
             let env = spec.env.clone();
+            // In a microVM of its own, what its harness keeps is in its person's volume here.
+            let dirs = super::homes::Dirs::of(&spec);
             let timeline: Vec<_> = handed_events(&events, &state.queue).into_iter().cloned().collect();
             let (cwd, objective) = (from_cwd.clone(), state.objective.clone());
             crate::rt::blocking(move || {
                 let carry = super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)?;
-                let home = super::homes::pack(kind.id, &super::homes::Dirs::here(&env), session.as_deref(), &cwd, super::moving::transcript_of(&carry), objective.as_ref());
-                Ok::<_, String>((carry, Some(home)))
+                let home = dirs.map(|d| super::homes::pack(kind.id, &d, session.as_deref(), &cwd, super::moving::transcript_of(&carry), objective.as_ref()));
+                Ok::<_, String>((carry, home))
             })
             .await
             .map_err(|e| format!("{e:#}"))??
@@ -4553,7 +4572,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 // Stopped by force (`Command::ForceStop`): it starts again now, whatever is under way.
                 let mut forcing = false;
                 // Where this machine keeps what's an agent's own: whose each file it changes is.
-                let roots = std::sync::Arc::new(super::whose::Roots::here(&spec.env));
+                let roots = std::sync::Arc::new(super::whose::Roots::of(&spec));
                 // The link its stdio rides into its microVM, said once it's made.
                 let mut linking = link_made(p.boundary());
                 loop {

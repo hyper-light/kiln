@@ -1,0 +1,33 @@
+Shards crates/agentfile/src/plan.rs at origin/main 1145bd3f282489fec6e73b40888fbec8e26e5204 (sha256 of the whole file 568f079ab6b8ad7b0314ba0d013809e1a1a8484d4f6255bcc5b5336383e3b216), lines as numbered there
+ 3106:             Kind::Expose(ports) => self.dispatch_expose(d, &ports, &loc, &lint)?,
+ 3107:             // What a Dockerfile's engine sees of an Agentfile's ports and volumes: the ports
+ 3108:             // it listens on, egress ones not (§12.6), and the mount points. Their direction,
+ 3109:             // networks, names and grants go in the normalized Agentfile (§8).
+ 3110:             Kind::Agentfile(crate::agentfile::Directive::Expose(e)) => {
+ 3111:                 if e.direction != crate::agentfile::Direction::Egress {
+ 3112:                     // The microVM's ports, which `-p` and `-P` publish: of a mapping to a
+ 3113:                     // member's port, the first (D122), where BuildKit's EXPOSE would keep
+ 3114:                     // the second.
+ 3115:                     let ports: Vec<Vec<u8>> = e.ports.iter().map(|p| crate::agentfile::outside(p)).collect();
+ 3116:                     self.dispatch_expose(d, &ports, &loc, &lint)?;
+ 3117:                 }
+ 3118:                 self.ds(d)?.agentfile.push(crate::agentfile::Directive::Expose(e));
+ 3119:             }
+ 3120:             Kind::Agentfile(crate::agentfile::Directive::Volume(v)) => {
+ 3121:                 let ds = self.ds(d)?;
+ 3122:                 for p in &v.paths {
+ 3123:                     if p.is_empty() {
+ 3124:                         return Err(Fail::new(b"VOLUME specified can not be an empty string".to_vec()));
+ 3125:                     }
+ 3126:                     ds.image.config.volumes.insert(p.clone(), ());
+ 3127:                 }
+ 3128:                 commit(ds, errb(&[b"VOLUME ", &go_list(&v.paths)]), false, false);
+ 3129:                 ds.agentfile.push(crate::agentfile::Directive::Volume(v));
+ 3130:             }
+ 3131:             // What declares and grants alone: the normalized Agentfile carries it.
+ 3132:             Kind::Agentfile(
+ 3133:                 directive @ (crate::agentfile::Directive::Network(_)
+ 3134:                 | crate::agentfile::Directive::Connect(_)
+ 3135:                 | crate::agentfile::Directive::Attach(_)
+ 3136:                 | crate::agentfile::Directive::Nesting),
+ 3137:             ) => self.ds(d)?.agentfile.push(directive),
