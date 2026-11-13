@@ -1,6 +1,7 @@
 //! macOS's reads for [`crate::sense`]: the CPUs' ticks (`host_statistics(HOST_CPU_LOAD_INFO)`),
-//! memory (`sysinfo`'s `host_statistics64`), the work volume's free space (`statfs`) and what
-//! APFS would make available for important use (Core Foundation's
+//! memory (`host_statistics64(HOST_VM_INFO64)`'s pages, the room in them
+//! [`kiln_ci::facts::VmPages::room`]), the work volume's free space (`statfs`) and what APFS would
+//! make available for important use (Core Foundation's
 //! `kCFURLVolumeAvailableCapacityForImportantUsageKey`), and the memory pressure level. Nothing
 //! privileged.
 
@@ -22,6 +23,8 @@ const CPU_STATE_IDLE: usize = 2;
 unsafe extern "C" {
     fn mach_host_self() -> MachPort;
     fn host_statistics(host: MachPort, flavor: i32, info: *mut i32, count: *mut u32) -> KernReturn;
+    /// `mach/mach_host.h`: the size of the pages the host counts, as `vm_stat` reads it.
+    fn host_page_size(host: MachPort, size: *mut usize) -> KernReturn;
     fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
     static mach_task_self_: MachPort;
 }
@@ -147,10 +150,42 @@ fn cpu_load(host: MachPort) -> Option<[u32; CPU_STATES]> {
     (r == 0 && usize::try_from(count).ok() == Some(CPU_STATES)).then_some(ticks)
 }
 
+/// The host's pages as `host_statistics64(HOST_VM_INFO64)` counts them, and the size of each
+/// (`host_page_size`): what its room for new work is read from ([`kiln_ci::facts::VmPages::room`]).
+/// None when either can't be read.
+fn pages_of(host: MachPort) -> Option<(kiln_ci::facts::VmPages, u64)> {
+    let mut page: usize = 0;
+    // SAFETY: an out pointer to one live `vm_size_t`.
+    let sized = unsafe { host_page_size(host, &raw mut page) } == 0;
+    let page = u64::try_from(page).ok().filter(|p| sized && *p > 0)?;
+    // SAFETY: plain integers, for which zero is a value.
+    let mut v: nix::libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = nix::libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: `v` is a whole `vm_statistics64` and `count` its length in `integer_t`s, as
+    // `HOST_VM_INFO64_COUNT` is; the kernel writes no more than that.
+    let r = unsafe { nix::libc::host_statistics64(host, nix::libc::HOST_VM_INFO64, (&raw mut v).cast(), &raw mut count) };
+    let pages = kiln_ci::facts::VmPages { free: u64::from(v.free_count), active: u64::from(v.active_count), inactive: u64::from(v.inactive_count), compressor: u64::from(v.compressor_page_count) };
+    (r == 0).then_some((pages, page))
+}
+
+/// This host's pages and their size now ([`pages_of`]): what its facts ([`kiln_ci::facts::Mem`])
+/// and its headroom's guard read its room for new work from, as its sample does.
+pub(crate) fn memory_pages() -> Option<(kiln_ci::facts::VmPages, u64)> {
+    // SAFETY: no arguments; it returns a send right to this host, released below.
+    let host = unsafe { mach_host_self() };
+    let pages = pages_of(host);
+    // SAFETY: the send right taken above, released once.
+    unsafe {
+        mach_port_deallocate(mach_task_self_, host);
+    }
+    pages
+}
+
 pub struct Reader {
     work_dir: PathBuf,
     host: MachPort,
-    sys: sysinfo::System,
+    /// The machine's memory (`hw.memsize`), read once.
+    mem_total: u64,
     /// The ticks as last read, and their sum since this reader began, widened to 64 bits.
     last: Option<[u32; CPU_STATES]>,
     wide: CpuTicks,
@@ -172,7 +207,9 @@ impl Reader {
         // SAFETY: no arguments; it returns a send right to this host, released in `drop`.
         let host = unsafe { mach_host_self() };
         let device = super::sense_disk_macos::Device::of(&work_dir);
-        Reader { work_dir, host, sys: sysinfo::System::new(), last: None, wide: CpuTicks::default(), device }
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
+        Reader { work_dir, host, mem_total: sys.total_memory(), last: None, wide: CpuTicks::default(), device }
     }
 
     pub fn work_dir(&self) -> &Path {
@@ -192,13 +229,13 @@ impl Reader {
     }
 
     pub fn read(&mut self) -> Raw {
-        self.sys.refresh_memory();
         let space = crate::os::disk_space(&self.work_dir).map(|(total, free)| Space { total, free, important: important(&self.work_dir).map(|i| i.max(free)) });
         Raw {
             cpu: self.cpu(),
             cpus: u32::try_from(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)).unwrap_or(1),
-            mem_total: self.sys.total_memory(),
-            mem_available: self.sys.available_memory(),
+            mem_total: self.mem_total,
+            // No room said while the host's pages can't be read: none is placed on a guess.
+            mem_available: pages_of(self.host).map_or(0, |(pages, page)| pages.room(page)),
             space,
             memory_level: super::metrics::memory_level(),
             device: self.device.as_mut().and_then(super::sense_disk_macos::Device::counters),

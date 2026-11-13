@@ -27,6 +27,19 @@ pub mod told;
 pub mod topo;
 pub mod wire;
 
+/// A program `kiln reach mcp`'s `code_run` runs lasts this long at most. It lives here, not in
+/// `mcp` (which only Unix builds have), because every platform's harnesses take Codex's timeout
+/// from it ([`codex_tool_timeout_sec`]).
+pub(crate) const CODE_WALL_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Codex's `tool_timeout_sec` for kiln's server, on its machine (`mcp::codex_config`) and in a
+/// microVM of its own (`harness::isolated::mcp`) alike: its tool calls wait as long as a program may
+/// run (Codex otherwise stops waiting after 60 s). Every platform has it: on Windows a harness reaches
+/// kiln's MCP only from a microVM, through the agent-control lane (Shards D254).
+pub(crate) fn codex_tool_timeout_sec() -> u64 {
+    CODE_WALL_MAX.as_secs() + 60
+}
+
 /// What a runner asks the server, for itself or one of its agent sessions
 /// ([`crate::proto::AgentMsg::ReachAsk`], read by `crate::wire::payload_of`), answered with
 /// [`crate::proto::ServerMsg::ReachAnswer`]. A kind the server doesn't know is refused `unknown`,

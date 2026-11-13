@@ -8,7 +8,7 @@
 # Cognition publishes no signature) and unpacks it there beside harness.json, adding nothing
 # (HARNESS would take an http(s) source with no checksum). It stays on its version with no setting:
 # Devin's updater stayed off without the installer's `distribution` marker, which nothing here
-# writes (f26). No credential is in the image: a person's sign-in lives in their data volume, or
+# writes (f26). No credential is in the image: a person's sign-in lives in their HOME volume, or
 # arrives through ACP's authenticate (f13).
 #
 #   kiln agentfiles context devin DIR --platform linux/amd64,linux/arm64
@@ -26,18 +26,33 @@ FROM ${BASE}
 ARG TARGETARCH
 HARNESS devin FROM ./devin-${TARGETARCH}
 
-# Its reach, every part named (networks are default deny): a network of its own, names through
-# the microVM's resolver, and TCP 443 out, which is all a session was seen to use: every Devin
-# endpoint is an https URL, and its sockets reached port 443 alone (f14). These are the bring-up's
-# three lines, until step 9 grants providers by name.
-NETWORK --dns --egress=443/tcp provider FOR devin
+# Its network, every part named (default deny; Shards D236, destinations by name): a network for this
+# harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
+# name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
+# resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
+# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
+# docs/research/s18-host-in-vm says where each host comes from).
+# - server.codeium.com: Devin's API server for a Windsurf account, the default its build names
+#   (WINDSURF_API_SERVER_URL moves it); api.devin.ai: the same for a devin.ai account;
+#   unleash.codeium.com: its feature flags, asked as it starts (f14). Its error reports (Sentry), its
+#   updater's manifests (static.devin.ai, static.windsurf.com; no updater in this layout, f26), its
+#   sign-in page (app.devin.ai, in the person's browser) and `devin ssh` go nowhere.
+# kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
+# kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
+NETWORK --egress=api.devin.ai:443 --egress=server.codeium.com:443 --egress=unleash.codeium.com:443 provider FOR devin
 EXPOSE --harnesses=devin 443/tcp AS egress FOR provider
 CONNECT devin WITH devin ON provider
 
-# The project, and the person's own Devin in its XDG directories under /home/devin, where
-# harness.json's XDG_CONFIG_HOME and XDG_DATA_HOME point: its config (config.json,
-# mcp_config.json) in .config/devin; its sign-in (credentials.toml), sessions and logs in
-# .local/share/devin (f10, f12). Its caches go under HOME, the domain's scratch /tmp, unkept.
-VOLUME --target-kind=harness /workspace FOR devin
-VOLUME --target-kind=harness /home/devin/.config/devin FOR devin
-VOLUME --target-kind=harness /home/devin/.local/share/devin FOR devin
+# Its project is plugged in as it starts, at the path it has on the machine (Shards D235), so kiln
+# reads its diffs, HEAD and checkpoints at that same path, and no volume holds it. Its HOME is the
+# person's volume, whole: harness.json sets HOME=/home/devin, kiln's one rule for every harness it
+# ships (step 18). A harness sees its image read-only, with its own /tmp scratch, so a HOME that is
+# writable and kept from run to run is a volume, and what the programs it runs keep in a home (a
+# .gitconfig, a tool's sign-in) is kept with it. Devin keeps its config (config.json,
+# mcp_config.json) in .config/devin and its sign-in (credentials.toml), sessions and logs in
+# .local/share/devin, where XDG_CONFIG_HOME and XDG_DATA_HOME point (f10, f12).
+# harness.json keeps caches that follow XDG's rule on the scratch (XDG_CACHE_HOME=/tmp/.cache),
+# where they were before its HOME moved onto the volume.
+# HOME in run.env needs a shards at or after 997f4e47e (v0.8.0 and later), where run.env replaces
+# init's HOME=/tmp. The volume is the harness's alone, and outside /tmp, which the scratch covers.
+VOLUME --target-kind=harness /home/devin FOR devin

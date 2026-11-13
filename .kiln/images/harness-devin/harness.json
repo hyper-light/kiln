@@ -5,8 +5,10 @@
   "run": {
     "command": ["devin", "acp"],
     "env": [
+      "HOME=/home/devin",
       "XDG_CONFIG_HOME=/home/devin/.config",
-      "XDG_DATA_HOME=/home/devin/.local/share"
+      "XDG_DATA_HOME=/home/devin/.local/share",
+      "XDG_CACHE_HOME=/tmp/.cache"
     ]
   }
 }

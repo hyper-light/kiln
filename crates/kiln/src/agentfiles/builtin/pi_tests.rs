@@ -274,22 +274,25 @@ fn layout(pin: &Value) -> Vec<String> {
     builds.iter().map(|b| b.get("files").and_then(Value::as_array).map(|f| f.iter().map(&file).collect::<Vec<_>>().join(", ")).unwrap_or_default()).collect()
 }
 
-/// The plan's shape of pi's Agentfile: a base by digest, pi's own build per platform with no RUN,
-/// exactly the bring-up's three grants (f20), exactly its two volumes (f22), and no ENV.
-const SHAPE: [&str; 9] = [
-    "ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
-    "FROM ${BASE}",
-    "ARG TARGETARCH",
-    "HARNESS pi FROM ./pi-${TARGETARCH}",
-    "NETWORK --dns --egress=443/tcp provider FOR pi",
-    "EXPOSE --harnesses=pi 443/tcp AS egress FOR provider",
-    "CONNECT pi WITH pi ON provider",
-    "VOLUME --target-kind=harness /workspace FOR pi",
-    "VOLUME --target-kind=harness /home/pi/.pi/agent FOR pi",
-];
+/// The plan's shape of pi's Agentfile: a base by digest, pi's own build per platform with no RUN, its
+/// providers' hosts by name (step 18's grants, f20), its HOME as its one volume (step 18, f22), and no
+/// ENV.
+fn shape() -> Vec<String> {
+    [
+        "ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10",
+        "FROM ${BASE}",
+        "ARG TARGETARCH",
+        "HARNESS pi FROM ./pi-${TARGETARCH}",
+    ]
+    .iter()
+    .map(|l| (*l).to_owned())
+    .chain(super::grants_tests::grant_lines("pi"))
+    .chain([super::grants_tests::volume_line("pi")])
+    .collect()
+}
 
 /// Where pi's Agentfile and pin depart from the plan's shape: the Agentfile's instructions are
-/// [`SHAPE`]'s; each platform's directory is laid out as pi needs it, its tarball whole at the root less
+/// [`shape`]'s; each platform's directory is laid out as pi needs it, its tarball whole at the root less
 /// its `pi/` (pi reads its package files beside its executable, f11) and ripgrep's and fd's builds at
 /// bin/rg and bin/fd, 0755, so pi downloads neither (f17, f18); and the smoke's line is the bytes
 /// 1.5.2's x64 `pi --version` wrote, 31 2e 35 2e 32 0a, less its newline (step 28's record,
@@ -297,7 +300,7 @@ const SHAPE: [&str; 9] = [
 fn shape_problems(text: &str, pin: &Value) -> Vec<String> {
     let mut found = Vec::new();
     let lines = instructions(text);
-    if lines != SHAPE {
+    if lines != shape() {
         found.push(format!("its Agentfile is {lines:#?}"));
     }
     let each = ". - strip 1, bin/rg 0755 rg, bin/fd 0755 fd";
@@ -425,11 +428,12 @@ fn step28_no_pi_file_holds_a_credential() -> anyhow::Result<()> {
 }
 
 /// pi runs as kiln's Pi kind starts it: harness.json's command is the kind's program and what
-/// `pi::args` gives every session before its own flags (`--mode rpc`, f14). Its env is exactly its
-/// config directory, on the volume the Agentfile gives it, and the version check off (f15, f19), so it
-/// sets nothing shards-init sets first (PATH, HOME, SHARDS_DOMAIN; f16); and the one file beside the
-/// Agentfile is harness.json, with no sign-in, as pi's auth.json lives on that volume (f27). A kind, an
-/// env, a volume or a file that drifts from them is caught.
+/// `pi::args` gives every session before its own flags (`--mode rpc`, f14). Its env is exactly its HOME,
+/// the volume the Agentfile gives it (step 18), its config directory beneath it, the version check off
+/// (f15, f19) and its caches on the scratch, where they were, so of what shards-init sets first it sets
+/// HOME alone (not PATH, nor SHARDS_DOMAIN; f16); and the one file beside the Agentfile is harness.json,
+/// with no sign-in, as pi's auth.json lives on that volume (f27). A kind, an env, a volume or a file
+/// that drifts from them is caught.
 #[test]
 fn step28_pi_runs_as_kilns_pi_kind_with_its_config_on_its_volume() -> anyhow::Result<()> {
     let pi = pi()?;
@@ -440,13 +444,16 @@ fn step28_pi_runs_as_kilns_pi_kind_with_its_config_on_its_volume() -> anyhow::Re
 
     let env: Vec<&str> = h.pointer("/run/env").and_then(Value::as_array).map(|e| e.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
     let config = env.iter().find_map(|e| e.strip_prefix("PI_CODING_AGENT_DIR=")).ok_or_else(|| anyhow::anyhow!("no PI_CODING_AGENT_DIR in {env:?}"))?;
-    let want = [format!("PI_CODING_AGENT_DIR={config}"), "PI_SKIP_VERSION_CHECK=1".to_owned()];
+    let home = env.iter().find_map(|e| e.strip_prefix("HOME=")).ok_or_else(|| anyhow::anyhow!("no HOME in {env:?}"))?;
+    let want = ["HOME=/home/pi".to_owned(), format!("PI_CODING_AGENT_DIR={config}"), "PI_SKIP_VERSION_CHECK=1".to_owned(), "XDG_CACHE_HOME=/tmp/.cache".to_owned()];
     anyhow::ensure!(env == want, "{env:?}");
-    anyhow::ensure!([env.as_slice(), &["HOME=/home/pi"]].concat() != want);
+    anyhow::ensure!(config.starts_with(&format!("{home}/")), "PI_CODING_AGENT_DIR={config} isn't beneath HOME={home}");
+    let homeless: Vec<&str> = env.iter().copied().filter(|e| !e.starts_with("HOME=")).collect();
+    anyhow::ensure!(homeless != want);
     let volumes = harness_volumes(pi.text, "pi");
-    anyhow::ensure!(volumes == ["/workspace", config], "{volumes:?}");
-    let moved = pi.text.replace("/home/pi/.pi/agent FOR pi", "/home/pi/.pi FOR pi");
-    anyhow::ensure!(harness_volumes(&moved, "pi").get(1) != Some(&config));
+    anyhow::ensure!(volumes == [home], "{volumes:?}");
+    let moved = pi.text.replace("/home/pi FOR pi", "/home/pi/.pi FOR pi");
+    anyhow::ensure!(harness_volumes(&moved, "pi").first() != Some(&home));
 
     let names = |files: &[(&str, &str)]| files.iter().map(|(n, _)| n.to_string()).collect::<Vec<_>>();
     anyhow::ensure!(names(pi.files) == ["harness.json"], "{:?}", names(pi.files));
@@ -455,7 +462,7 @@ fn step28_pi_runs_as_kilns_pi_kind_with_its_config_on_its_volume() -> anyhow::Re
 }
 
 /// pi's Agentfile and pin are the plan's shape ([`shape_problems`]); an Agentfile with a RUN or its
-/// config volume moved, a platform without rg, and a smoke line with its newline are each caught.
+/// HOME volume moved, a platform without rg, and a smoke line with its newline are each caught.
 #[test]
 fn step28_pi_agentfile_and_pin_are_the_plans_shape() -> anyhow::Result<()> {
     let pi = pi()?;
@@ -463,8 +470,8 @@ fn step28_pi_agentfile_and_pin_are_the_plans_shape() -> anyhow::Result<()> {
     let problems = shape_problems(pi.text, &pin);
     anyhow::ensure!(problems.is_empty(), "{problems:?}");
 
-    for text in [format!("{}RUN apt-get install -y ripgrep\n", pi.text), pi.text.replace("/home/pi/.pi/agent FOR pi", "/home/pi/.pi FOR pi")] {
-        anyhow::ensure!(!shape_problems(&text, &pin).is_empty(), "{text}");
+    for text in [format!("{}RUN apt-get install -y ripgrep\n", pi.text), pi.text.replace("/home/pi FOR pi", "/home/pi/.pi FOR pi")] {
+        anyhow::ensure!(text != pi.text && !shape_problems(&text, &pin).is_empty(), "{text}");
     }
     let mut no_rg = pin.clone();
     no_rg.pointer_mut("/builds/1/files").and_then(Value::as_array_mut).ok_or_else(|| anyhow::anyhow!("no arm64 files"))?.retain(|f| f.get("path") != Some(&Value::from("bin/rg")));

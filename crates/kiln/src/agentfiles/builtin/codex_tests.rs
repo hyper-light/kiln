@@ -164,9 +164,9 @@ fn harness_volumes(agentfile: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The Agentfile, exactly: the pin's base, one stage, the harness from each platform's directory, the
-/// bring-up's three provider grants, the project and CODEX_HOME volumes, and nothing that installs or
-/// configures beside the pin and harness.json (no RUN, no ENV).
+/// The Agentfile, exactly: the pin's base, one stage, the harness from each platform's directory, its
+/// hosts by name (step 18's three grant lines), its HOME as its one volume, and nothing that installs
+/// or configures beside the pin and harness.json (no RUN, no ENV).
 fn check_agentfile(agentfile: &str, pin: &Value) -> anyhow::Result<()> {
     let all = instructions(agentfile);
     let has = |keyword: &str, rest: &str| all.iter().any(|(k, r)| k == keyword && *r == rest);
@@ -176,12 +176,13 @@ fn check_agentfile(agentfile: &str, pin: &Value) -> anyhow::Result<()> {
     ensure!(has("FROM", "${BASE}") && count("FROM") == 1, "the Agentfile isn't one stage FROM ${{BASE}}");
     ensure!(has("ARG", "TARGETARCH") && count("ARG") == 2, "the Agentfile's ARGs aren't BASE and TARGETARCH");
     ensure!(has("HARNESS", "codex FROM ./codex-${TARGETARCH}") && count("HARNESS") == 1, "the Agentfile's harness isn't codex FROM ./codex-${{TARGETARCH}}");
-    let grants = [("NETWORK", "--dns --egress=443/tcp provider FOR codex"), ("EXPOSE", "--harnesses=codex 443/tcp AS egress FOR provider"), ("CONNECT", "codex WITH codex ON provider")];
-    for (keyword, rest) in grants {
-        ensure!(has(keyword, rest), "the Agentfile lacks `{keyword} {rest}`");
+    let grants = super::grants_tests::grant_lines("codex");
+    for line in &grants {
+        let (keyword, rest) = line.split_once(' ').unwrap_or((line, ""));
+        ensure!(has(keyword, rest), "the Agentfile lacks `{line}`");
     }
-    ensure!(count("NETWORK") + count("EXPOSE") + count("CONNECT") == grants.len(), "the Agentfile grants more than the bring-up's three lines");
-    ensure!(count("VOLUME") == 2 && harness_volumes(agentfile) == ["/workspace", "/home/codex/.codex"], "the Agentfile's volumes aren't /workspace and /home/codex/.codex, Codex's alone");
+    ensure!(count("NETWORK") + count("EXPOSE") + count("CONNECT") == grants.len(), "the Agentfile grants more than its three lines");
+    ensure!(count("VOLUME") == 1 && harness_volumes(agentfile) == ["/home/codex"], "the Agentfile's volume isn't /home/codex, Codex's HOME alone");
     let known = ["ARG", "FROM", "HARNESS", "NETWORK", "EXPOSE", "CONNECT", "VOLUME"];
     if let Some((keyword, rest)) = all.iter().find(|(k, _)| !known.contains(&k.as_str())) {
         bail!("the Agentfile has `{keyword} {rest}`: only the pin and harness.json install and configure Codex");
@@ -190,8 +191,8 @@ fn check_agentfile(agentfile: &str, pin: &Value) -> anyhow::Result<()> {
 }
 
 /// harness.json: Codex's (schema 1, the pin's version), starting what kiln starts for Kind `codex`
-/// (`command`) with the update check off, and CODEX_HOME, alone in its env, in the Agentfile's volume
-/// for it; no workdir, for kiln sends each thread its own.
+/// (`command`) with the update check off; its HOME the Agentfile's volume, CODEX_HOME beneath it, and
+/// caches on the scratch, alone in its env; no workdir, for kiln sends each thread its own.
 fn check_harness(harness: &str, pin: &Value, agentfile: &str, command: &[String]) -> anyhow::Result<()> {
     let h: Value = serde_json::from_str(harness).context("harness.json doesn't parse")?;
     ensure!(h.get("schemaVersion").and_then(Value::as_u64) == Some(1), "harness.json isn't an OSI config of schema 1");
@@ -203,8 +204,8 @@ fn check_harness(harness: &str, pin: &Value, agentfile: &str, command: &[String]
     ensure!(run == expected, "harness.json runs {run:?}, not {expected:?}: kiln's command for Kind codex with the update check off");
     ensure!(h.pointer("/run/workdir").is_none(), "harness.json sets a workdir");
     let env = strings(&h, "/run/env");
-    ensure!(env == ["CODEX_HOME=/home/codex/.codex"], "harness.json's env is {env:?}, not CODEX_HOME alone");
-    ensure!(harness_volumes(agentfile).contains(&"/home/codex/.codex"), "CODEX_HOME isn't one of the Agentfile's harness volumes");
+    ensure!(env == ["HOME=/home/codex", "CODEX_HOME=/home/codex/.codex", "XDG_CACHE_HOME=/tmp/.cache"], "harness.json's env is {env:?}, not HOME, CODEX_HOME and XDG_CACHE_HOME alone");
+    ensure!(harness_volumes(agentfile).contains(&"/home/codex"), "HOME isn't one of the Agentfile's harness volumes");
     Ok(())
 }
 
@@ -272,6 +273,8 @@ fn codex_harness_json_runs_kilns_command_with_codex_home_in_its_volume() -> anyh
     ensure!(check_harness(harness, &pin, b.text, &other).is_err(), "harness.json passes against other arguments for Kind codex");
     let homeless = harness.replace("/home/codex/.codex", "/root/.codex");
     ensure!(check_harness(&homeless, &pin, b.text, &command).is_err(), "a CODEX_HOME outside the Agentfile's volume passes");
+    let scratch = harness.replace("\"HOME=/home/codex\"", "\"HOME=/tmp\"");
+    ensure!(scratch != harness && check_harness(&scratch, &pin, b.text, &command).is_err(), "a HOME on the scratch passes");
     let older = harness.replace(str_at(&pin, "/version"), "0.0.1");
     ensure!(check_harness(&older, &pin, b.text, &command).is_err(), "a harness.json of another version passes");
     Ok(())
@@ -287,7 +290,7 @@ fn codex_agentfile_is_exactly_its_base_harness_grants_and_volumes() -> anyhow::R
         ("an ENV", format!("{}\nENV CODEX_HOME=/tmp\n", b.text)),
         ("another base", b.text.replace("@sha256:", "@sha256:0")),
         ("a fourth grant", format!("{}\nEXPOSE --harnesses=codex 80/tcp AS egress FOR provider\n", b.text)),
-        ("no CODEX_HOME volume", b.text.replace("VOLUME --target-kind=harness /home/codex/.codex FOR codex", "")),
+        ("no HOME volume", b.text.replace("VOLUME --target-kind=harness /home/codex FOR codex", "")),
     ];
     for (what, text) in mutants {
         ensure!(check_agentfile(&text, &pin).is_err(), "an Agentfile with {what} passes");

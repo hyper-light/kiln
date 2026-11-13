@@ -496,22 +496,6 @@ pub fn priority() -> String {
     format!("below normal: each leg's and agent's processes run at nice {NICE}, on every core")
 }
 
-/// Memory the machine has free for new work, in bytes: what macOS itself counts as available
-/// (`kern.memorystatus_level`, the percentage `memory_pressure` prints, which counts what can be
-/// reclaimed and what the compressor holds), of all of it (`hw.memsize`).
-pub fn memory_free() -> Option<f64> {
-    fn by_name<T: Default>(name: &std::ffi::CStr) -> Option<T> {
-        let mut v = T::default();
-        let mut size = std::mem::size_of::<T>();
-        // SAFETY: a value of `size` bytes for the sysctl, which says how much it wrote.
-        let r = unsafe { libc::sysctlbyname(name.as_ptr(), (&raw mut v).cast(), &raw mut size, std::ptr::null_mut(), 0) };
-        (r == 0 && size == std::mem::size_of::<T>()).then_some(v)
-    }
-    let level: u32 = by_name(c"kern.memorystatus_level")?;
-    let total: u64 = by_name(c"hw.memsize")?;
-    (level <= 100 && total > 0).then(|| total as f64 * f64::from(level) / 100.0)
-}
-
 /// How this machine holds an agent's processes together.
 pub fn how() -> String {
     match tracker() {
@@ -584,13 +568,6 @@ mod tests {
         anyhow::ensure!(a == Some(vec!["sleep".to_owned(), "33".to_owned()]), "{a:?}");
         anyhow::ensure!(here.as_deref() == Some(std::path::Path::new("/")), "{here:?}");
         Ok(())
-    }
-
-    #[test]
-    fn the_memory_macos_counts_available_is_read() {
-        let free = memory_free();
-        let total = sysinfo::System::new_all().total_memory() as f64;
-        assert!(free.is_some_and(|f| f > 0.0 && f <= total), "{free:?} of {total}");
     }
 
     /// A launchd job an agent starts (here as `launchd-run.sh` started one on 2026-11-05) is followed

@@ -23,17 +23,30 @@ ARG TARGETARCH
 ARG CLAUDE_LIBC
 HARNESS claude FROM ./claude-${TARGETARCH}-${CLAUDE_LIBC}
 
-# Its network reach, every part named (default deny): a network for this harness alone, which it joins
-# with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443 out,
-# opened at the network's boundary and at the microVM's. Nothing comes in, and no other port or protocol
-# goes out. Step 9 grants its providers by name instead (f30).
-NETWORK --dns --egress=443/tcp provider FOR claude
+# Its network, every part named (default deny; Shards D236, destinations by name): a network for this
+# harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
+# name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
+# resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
+# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
+# docs/research/s18-host-in-vm says where each host comes from).
+# - api.anthropic.com, claude.ai and platform.claude.com: Claude Code's API, and the sign-in and
+#   token refresh of claude.ai and Console accounts (code.claude.com/docs/en/network-config, "Network
+#   access requirements"). The rest of that list is a page a sign-in opens in the person's browser,
+#   a feature kiln doesn't drive (claude.ai's connectors, plugins' downloads, Chrome, artifacts), an
+#   update (off: DISABLE_UPDATES) or telemetry, and goes nowhere.
+# kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
+# kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
+NETWORK --egress=api.anthropic.com:443 --egress=claude.ai:443 --egress=platform.claude.com:443 provider FOR claude
 EXPOSE --harnesses=claude 443/tcp AS egress FOR provider
 CONNECT claude WITH claude ON provider
 
-# The project, until step 8 plugs it in at its host path (f25). And the person's own volume, given at run
-# time, as the whole HOME: a harness sees the image read-only, so only a volume makes HOME writable and
-# lasting, and Claude Code keeps everything there, ~/.claude and ~/.claude.json (f22, f33). No volume goes
-# under /tmp, which is each harness's own scratch (f23).
-VOLUME --target-kind=harness /workspace FOR claude
+# Its project is plugged in as it starts, at the path it has on the machine (Shards D235), so kiln
+# reads its diffs, HEAD and checkpoints at that same path, and no volume holds it. Its HOME is the
+# person's volume, whole: harness.json sets HOME=/home/claude, kiln's one rule for every harness it
+# ships (step 18). A harness sees its image read-only, with its own /tmp scratch, so a HOME that is
+# writable and kept from run to run is a volume, and what the programs it runs keep in a home (a
+# .gitconfig, a tool's sign-in) is kept with it. Claude Code keeps everything there, ~/.claude and
+# ~/.claude.json (f22, f33).
+# HOME in run.env needs a shards at or after 997f4e47e (v0.8.0 and later), where run.env replaces
+# init's HOME=/tmp. The volume is the harness's alone, and outside /tmp, which the scratch covers.
 VOLUME --target-kind=harness /home/claude FOR claude

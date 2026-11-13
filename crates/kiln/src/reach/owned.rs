@@ -96,6 +96,12 @@ where W:std::future::Future<Output=()>,B:std::future::Future<Output=()>{
 // W05-R07: only the Unix local socket admits owned launches; state-machine tests run on every OS.
 #[cfg(unix)]
 pub async fn run(host: Option<Arc<Host>>, handle:&super::node::Handle, me:&str, req:RunReq, ev:crate::memory::queue::Sender<Ev>, ctl:crate::memory::queue::Receiver<Req>, reuse:bool){
+    // An isolated agent's command runs in a microVM or not at all, never here or on another bare host: refused
+    // before anything of it starts, said by kind (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+    if let Some(refused)=host.as_deref().and_then(|h|h.refuses_run(&req)){
+        let _=ev.send(Ev::Error(refused.to_string())).await;
+        return;
+    }
     let Some(agent)=req.asker.as_deref() else{
         if reuse{super::reuse::run(handle,me,req,ev,ctl).await;}else{super::local::run(handle,me,req,ev,ctl).await;}return;
     };

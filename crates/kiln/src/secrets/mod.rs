@@ -8,6 +8,8 @@
 //! changing. Every backend is a module of kiln's one binary: no other process or store.
 
 pub mod kiln;
+pub mod broker;
+pub mod seam;
 
 use std::future::Future;
 use std::pin::Pin;

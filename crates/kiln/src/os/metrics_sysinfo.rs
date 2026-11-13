@@ -198,6 +198,47 @@ pub fn process_group(pgid: i32) -> ProcStats {
     acc
 }
 
+/// The CPU time, µs, those of `pids` that run have used so far, all told (each one's task info,
+/// in Mach's time base, as [`process_group`] reads it): none when none of them runs. What a group
+/// Shards keeps lists of its microVMs' processes is charged so (kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn cpu_us_of(pids: &[u32]) -> Option<u64> {
+    use nix::libc;
+    unsafe extern "C" {
+        fn mach_timebase_info(info: *mut [u32; 2]) -> i32;
+    }
+    let mut tb = [0u32; 2];
+    // SAFETY: a mach_timebase_info_data_t (numer, denom).
+    let [numer, denom] = if unsafe { mach_timebase_info(&raw mut tb) } == 0 { tb } else { [1, 1] };
+    let mut ticks: Option<u128> = None;
+    for pid in pids.iter().filter_map(|p| i32::try_from(*p).ok()) {
+        // SAFETY: plain integers, for which zero is a value.
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).unwrap_or(0);
+        // SAFETY: a whole proc_taskinfo, its size given.
+        let r = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
+        if r != size {
+            continue;
+        }
+        ticks = Some(ticks.unwrap_or(0).saturating_add(u128::from(info.pti_total_user.saturating_add(info.pti_total_system))));
+    }
+    ticks.map(|t| u64::try_from(t.saturating_mul(u128::from(numer)) / u128::from(denom.max(1)) / 1000).unwrap_or(u64::MAX))
+}
+
+/// The CPU time, µs, those of `pids` that run have used so far, all told (`sysinfo`'s, of each):
+/// none when none of them runs. What a group Shards keeps lists of its microVMs' processes is
+/// charged so (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+#[cfg(not(target_os = "macos"))]
+pub fn cpu_us_of(pids: &[u32]) -> Option<u64> {
+    let pids: Vec<Pid> = pids.iter().map(|p| Pid::from_u32(*p)).collect();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), false, ProcessRefreshKind::nothing().with_cpu());
+    let ms = pids.iter().filter_map(|p| sys.process(*p)).map(sysinfo::Process::accumulated_cpu_time).reduce(u64::saturating_add)?;
+    Some(ms.saturating_mul(1000))
+}
+
 /// Aggregate CPU time and RSS of the process tree rooted at `root`: the footprint of one job.
 #[cfg(not(target_os = "macos"))]
 pub fn process_group(root: i32) -> ProcStats {

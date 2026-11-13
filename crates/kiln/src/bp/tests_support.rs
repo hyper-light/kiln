@@ -61,6 +61,7 @@ pub fn agent(name: &str, busy: u32, cpu: f32, at: i64) -> crate::hub::AgentLive 
         facts: None,
         instances: Vec::new(),
         transport: None,
+        link: None,
         skew: crate::skew::Skew::default(),
         stale: false,
     }

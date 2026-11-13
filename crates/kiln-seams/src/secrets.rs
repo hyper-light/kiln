@@ -162,12 +162,15 @@ pub const WINDOW_MAX: Duration = Duration::from_secs(30 * 24 * 3600);
 /// The longest a lease lasts.
 pub const LEASE_MAX: Duration = Duration::from_secs(24 * 3600);
 
-fn check_name(name: &str) -> Result<(), Refusal> {
+/// Whether `name` is a secret's name as Secrets Manager takes one: 1 to [`NAME_MAX`] of
+/// `A-Z a-z 0-9 / _ + = . @ -`; refused `Invalid` otherwise, by every store alike.
+pub fn check_name(name: &str) -> Result<(), Refusal> {
     let ok = !name.is_empty() && name.len() <= NAME_MAX && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'+' | b'=' | b'.' | b'@' | b'-'));
     if ok { Ok(()) } else { Err(Refusal::Invalid { what: "a secret's name", why: format!("1 to {NAME_MAX} of A-Z a-z 0-9 / _ + = . @ - ({} bytes)", name.len()) }) }
 }
 
-fn check_value(v: &SecretValue) -> Result<(), Refusal> {
+/// Whether `v` fits a version: at most [`VALUE_MAX`]; refused `TooLarge` otherwise.
+pub fn check_value(v: &SecretValue) -> Result<(), Refusal> {
     if v.len() > VALUE_MAX { Err(Refusal::TooLarge { what: "a value", size: v.len(), limit: VALUE_MAX }) } else { Ok(()) }
 }
 

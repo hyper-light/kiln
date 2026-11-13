@@ -1042,7 +1042,7 @@ mod tests {
         let s = owned_by(1, shards, 0);
         let open = AgentMsg::Wire(Frame::Item { stream: format!("s:{s}#b1.0"), seq: 1, low: 0, body: crate::proto::encode(&harness(&s))? });
         let events = vec![
-            NetEvent::Connected { peer: 7, name: Some("box".into()), binding: None },
+            NetEvent::Connected { peer: 7, name: Some("box".into()), binding: None, secured: None },
             frame(7, &AgentMsg::Caps { caps: crate::proto::CAP_WIRE })?,
             frame(7, &open)?,
             frame(7, &AgentMsg::HarnessInventory { json: "{\"sessions\":[]}".into() })?,

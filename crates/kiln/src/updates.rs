@@ -2813,13 +2813,16 @@ pub async fn runner_build() -> AgentMsg {
 }
 
 /// What a runner says of itself after its build ([`AgentMsg::Facts`]): for now, the kiln it
-/// runs and where its kiln checkout is (`crate::fleet`).
-pub async fn runner_facts() -> AgentMsg {
+/// runs and where its kiln checkout is (`crate::fleet`), when it's one of the fleet (`fleet`); and
+/// what its own end of its connection to the server negotiated (`link`, kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d, step 34).
+pub async fn runner_facts(fleet: bool, link: Option<kiln_ci::facts::Negotiated>) -> AgentMsg {
     let facts = kiln_ci::facts::RunnerFacts {
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
-        kiln: Some(kiln_facts().await),
+        kiln: if fleet { Some(kiln_facts().await) } else { None },
         probed_at: crate::util::now_unix(),
+        link,
         ..kiln_ci::facts::RunnerFacts::default()
     };
     AgentMsg::Facts { json: serde_json::to_string(&facts).unwrap_or_default() }

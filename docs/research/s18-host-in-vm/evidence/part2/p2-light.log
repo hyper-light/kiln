@@ -1,0 +1,257 @@
+    Blocking waiting for file lock on package cache
+    Updating crates.io index
+vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18: warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14: warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10: warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18: warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10: warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+   Compiling kiln v0.2.0 (/home/adalundhe/g121-tmp/s18/kiln/crates/kiln)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 04s
+     Running unittests src/lib.rs (/home/adalundhe/g121-tmp/s18/target/debug/deps/kiln-721748ad308a6d67)
+
+running 228 tests
+test agentfiles::builtin::amp_tests::amp_files_carry_no_signin ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_files_carry_no_signin ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_is_listed_once_with_its_harness_file ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_harness_file_runs_agy_in_ask_mode_with_its_home_in_the_volume ... ok
+test agentfiles::builtin::amp_tests::amp_harness_file_starts_kinds_program_with_its_state_in_the_volume ... ok
+test agentfiles::builtin::amp_tests::amp_agentfile_grants_its_harness_what_it_lists_alone ... ok
+test agentfiles::builtin::amp_tests::amp_pin_names_both_programs_for_both_platforms ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_agentfile_grants_its_harness_what_it_lists_alone ... ok
+test agentfiles::builtin::claude_tests::step19_claude_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::claude_tests::step19_claude_runs_as_kilns_claude_kind_with_its_home_on_its_volume ... ok
+test agentfiles::builtin::claude_tests::step19_claude_pin_and_harness_files_hold ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_smoke_expects_what_agy_prints ... ok
+test agentfiles::builtin::claude_tests::step19_no_claude_file_holds_a_credential ... ok
+test agentfiles::builtin::codex_tests::codex_embedded_files_hold_no_credential ... ok
+test agentfiles::builtin::codex_tests::codex_agentfile_is_exactly_its_base_harness_grants_and_volumes ... ok
+test agentfiles::builtin::codex_tests::codex_harness_json_runs_kilns_command_with_codex_home_in_its_volume ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::devin_tests::step25_devins_agentfile_is_the_layouts ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_pin_names_agy_for_both_platforms ... ok
+test agentfiles::builtin::devin_tests::step25_devins_harness_json_starts_it_as_kiln_does ... ok
+test agentfiles::builtin::cursor_tests::step27_no_cursor_file_holds_a_credential ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it ... ok
+test agentfiles::builtin::devin_tests::step25_devins_pin_is_cognitions_two_linux_bundles ... ok
+test agentfiles::builtin::gemini_tests::step21_a_live_gemini_context_holds_the_pinned_builds ... ok
+test agentfiles::builtin::gemini_tests::step21_gemini_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::codex_tests::codex_pin_holds_both_platforms_with_arm64s_rg_in_place ... ok
+test agentfiles::builtin::claude_tests::step19_a_claude_pin_that_would_mislead_is_caught ... ok
+test agentfiles::builtin::gemini_tests::step21_gemini_system_settings_turn_its_update_check_off ... ok
+test agentfiles::builtin::gemini_tests::step21_gemini_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::gemini_tests::step21_gemini_runs_as_kilns_gemini_kind_launches_it ... ok
+test agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::builtin::goose_tests::step23_goose_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::goose_tests::step23_goose_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::goose_tests::step23_goose_runs_as_kilns_goose_kind_with_its_root_on_its_volume ... ok
+test agentfiles::builtin::goose_tests::step23_no_goose_file_holds_a_credential ... ok
+test agentfiles::builtin::goose_tests::step23_a_pin_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::builtin::gemini_tests::step21_no_gemini_file_holds_a_credential ... ok
+test agentfiles::builtin::grants_tests::step18_every_builtin_names_its_hosts_and_keeps_its_home_on_its_volume ... ok
+test agentfiles::builtin::opencode_tests::step22_opencode_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::gemini_tests::step21_gemini_smoke_runs_its_node_on_its_entry ... ok
+test agentfiles::builtin::pi_tests::step28_a_live_pi_context_holds_the_pinned_builds ... ok
+test agentfiles::builtin::opencode_tests::step22_opencode_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::opencode_tests::step22_opencode_runs_as_kilns_opencode_kind_launches_it ... ok
+test agentfiles::builtin::pi_tests::step28_no_pi_file_holds_a_credential ... ok
+test agentfiles::builtin::pi_tests::step28_pi_agentfile_and_pin_are_the_plans_shape ... ok
+test agentfiles::builtin::pi_tests::step28_pi_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::pi_tests::step28_pi_runs_as_kilns_pi_kind_with_its_config_on_its_volume ... ok
+test agentfiles::builtin::tests::every_builtin_is_a_valid_agentfile_once ... ok
+test agentfiles::builtin::tests::step19_a_harness_home_is_its_volume_and_none_is_under_tmp ... ok
+test agentfiles::builtin::tests::step23_kilns_dockerfile_copies_what_builtins_embed ... ok
+test agentfiles::builtin::devin_tests::step25_devins_files_carry_no_credential ... ok
+test agentfiles::check::tests::step30_a_refusal_without_a_line_in_its_words_names_it ... ok
+test agentfiles::check::tests::step30_any_other_error_refuses_it_in_shards_words_at_its_line ... ok
+test agentfiles::check::tests::step30_no_result_is_unchecked_saying_shards_last_error ... ok
+test agentfiles::check::tests::step30_shards_is_asked_for_its_check_in_a_folder_of_its_own ... ok
+test agentfiles::check::tests::step30_the_target_that_stops_shards_says_the_text_passed ... ok
+test agentfiles::check::tests::step30_warnings_are_diagnostics_that_refuse_nothing ... ok
+test agentfiles::cli::tests::step19_a_live_claude_context_holds_the_pinned_builds ... ok
+test agentfiles::cli::tests::step19_context_reads_its_words ... ok
+test agentfiles::cli::tests::step20_a_live_codex_context_holds_the_pinned_builds ... ok
+test agentfiles::cli::tests::step26_a_live_antigravity_context_holds_the_pinned_builds ... ok
+test agentfiles::builtin::pi_tests::step28_a_pin_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::context::tests::step19_a_recipe_changes_exactly_with_what_a_build_takes ... ok
+test agentfiles::context::tests::step19_a_variants_build_gets_its_own_harness_file ... ok
+test agentfiles::builtin::gemini_tests::step21_a_gemini_pin_or_harness_file_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::context::tests::step19_harness_dirs_are_named_as_each_builtins_harness_line_takes_them ... ok
+test agentfiles::context::tests::step19_modes_are_permissions_and_paths_stay_inside ... ok
+test agentfiles::context::tests::step19_pins_are_read_for_their_builds_alone ... ok
+test agentfiles::builtin::opencode_tests::step22_an_opencode_pin_or_harness_file_that_would_mislead_is_caught ... ok
+test agentfiles::builtin::opencode_tests::step22_no_opencode_file_holds_a_credential ... ok
+test agentfiles::context::unpack_tests::step20_a_codex_shaped_context_holds_ripgreps_rg_in_place_of_arm64s ... ok
+test agentfiles::context::tests::step19_a_context_is_written_whole_or_not_at_all ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_agentfile_passes_shards_own_check ... ok
+test agentfiles::check::tests::step30_a_real_shards_checks_without_resolving_bases ... ok
+test agentfiles::context::unpack_tests::step26_an_agy_shaped_context_holds_bin_agy_as_pinned ... ok
+test agentfiles::context::unpack_tests::step25_a_devin_shaped_context_holds_bin_devin_share_and_harness_json_alone ... ok
+test agentfiles::context::unpack_tests::step28_a_pi_shaped_context_unpacks_as_pinned ... ok
+test agentfiles::context::unpack_tests::step22_an_opencode_shaped_context_holds_bin_opencode_and_its_license_as_pinned ... ok
+test agentfiles::context::unpack_tests::step25_a_devin_bundle_of_another_digest_or_size_is_never_opened ... ok
+test agentfiles::context::unpack_tests::step20_a_codex_skip_that_fails_leaves_nothing ... ok
+test agentfiles::builtin::tests::step23_a_real_shards_checks_every_builtin ... ok
+test agentfiles::context::unpack_tests::step26_an_agy_archive_failing_a_check_leaves_nothing ... ok
+test agentfiles::tests::step30_ls_tree_entries ... ok
+test agentfiles::tests::step30_names_and_texts ... ok
+test agentfiles::tests::step30_a_project_is_listed_for_its_readers_alone ... ok
+test agentfiles::tests::step30_a_text_read_back_is_held_to_its_digest ... ok
+test agentfiles::tests::step30_a_delete_lets_go_of_texts_no_record_names ... ok
+test agentfiles::tests::step30_a_person_reaches_only_their_own ... ok
+test agentfiles::unpack::tests::a_directory_its_owner_may_not_search_is_kept_and_still_discarded_whole ... ok
+test agentfiles::unpack::tests::a_member_held_alone_is_held_to_its_size_and_digest ... ok
+test agentfiles::unpack::tests::a_member_held_alone_unpacks_as_its_file_and_nothing_else ... ok
+test agentfiles::unpack::tests::a_member_is_one_regular_file_held_to_its_pin ... ok
+test agentfiles::unpack::tests::a_member_not_held_alone_passes_over_what_is_beside_it ... ok
+test agentfiles::unpack::tests::a_pi_shaped_build_unpacks_its_tree_then_picks_its_members ... ok
+test agentfiles::unpack::tests::a_skipped_file_counts_in_the_trees_totals ... ok
+test agentfiles::unpack::tests::a_skipped_path_is_one_regular_file_the_archive_holds ... ok
+test agentfiles::unpack::tests::a_strip_1_tree_appears_whole_with_its_files_directories_and_modes ... ok
+test agentfiles::unpack::tests::a_target_already_there_is_refused_and_left_as_it_was ... ok
+test agentfiles::unpack::tests::a_tree_at_a_path_inside_appears_whole_beside_what_is_there ... ok
+test agentfiles::unpack::tests::a_trees_skip_is_a_trees_field ... ok
+test agentfiles::unpack::tests::alone_is_a_members_field ... ok
+test agentfiles::context::unpack_tests::step28_an_archive_the_unpacker_refuses_leaves_nothing ... ok
+test agentfiles::unpack::tests::an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing ... ok
+test agentfiles::unpack::tests::codex_arm64s_tree_skips_its_rg_and_ripgreps_static_rg_takes_its_place ... ok
+test agentfiles::unpack::tests::devins_shape_unpacks_at_strip_0_with_nothing_beside_it ... ok
+test agentfiles::unpack::tests::each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing ... ok
+test agentfiles::unpack::tests::every_builtins_pinned_unpack_is_a_spec ... ok
+test agentfiles::unpack::tests::nothing_of_a_tree_shows_until_all_of_it_is_in ... ok
+test agentfiles::unpack::tests::the_per_arch_directory_appears_only_once_the_whole_archive_is_in ... ok
+test agentfiles::unpack::tests::the_unpack_object_is_one_form_or_refused ... ok
+test agentfiles::unpack::tests::what_is_not_a_gzip_tar_is_refused_whole ... ok
+test agentfiles::unpack::tests::without_its_skip_ripgreps_rg_collides_with_the_packages_and_the_first_stays ... ok
+test api::tests::step18_an_isolated_agents_person_is_whoever_asks ... ok
+test harness::homes::tests::claude_codes_memory_is_the_main_folders_of_the_repository ... ok
+test harness::homes::tests::codexs_goal_is_read_from_its_database_else_from_kilns_view ... ok
+test harness::homes::tests::gemini_cli_finds_the_project_kiln_names_for_it ... ok
+test harness::homes::tests::indexes_take_the_lines_and_entries_they_lack_and_nothing_twice ... ok
+test harness::homes::tests::nothing_goes_outside_the_harnesss_own_folders ... ok
+test harness::homes::tests::what_doesnt_fit_stays_memories_first ... ok
+test harness::isolated::env::tests::step18_a_harness_in_a_microvm_gets_its_mark_and_no_machine_path ... ok
+test harness::isolated::env::tests::step18_every_kiln_variable_a_harness_gets_is_decided_for_a_microvm ... ok
+test harness::isolated::home::tests::step18_a_harness_home_is_its_persons_volume_and_read_here ... ok
+test harness::isolated::home::tests::step18_each_persons_and_harness_volume_is_its_own ... ok
+test harness::isolated::home::tests::step18_every_builtin_keeps_its_harness_configuration_in_a_volume ... ok
+test harness::isolated::home::tests::step18_its_directories_are_made_readable_by_this_user_alone ... ok
+test harness::isolated::home::tests::step18_no_read_of_an_isolated_session_falls_back_to_the_machine ... ok
+test harness::isolated::home::tests::step18_volumes_every_machine_can_keep_or_a_refusal ... ok
+test harness::isolated::host_tools::tests::step18_a_projects_own_files_say_which_host_tools_it_needs ... ok
+test harness::isolated::host_tools::tests::step18_a_session_that_needs_host_tools_is_refused_isolation_saying_why ... ok
+test harness::isolated::host_tools::tests::step18_git_finds_a_projects_host_tool_files ... ok
+test harness::isolated::mcp::tests::step18_each_harness_gets_kilns_mcp_in_its_own_form ... ok
+test harness::isolated::mcp::tests::step18_mcp_goes_only_where_the_image_grants_it ... ok
+test harness::isolated::tests::step18_a_microvms_harness_homes_are_its_volumes_on_any_machine ... ok
+test harness::isolated::tests::step18_an_isolated_session_without_its_volumes_view_reads_nothing_here ... ok
+test harness::isolated::tests::step18_claude_codes_transcript_is_read_from_its_persons_volume ... ok
+test harness::isolated::tests::step18_codex_rollouts_are_read_from_its_persons_volume ... ok
+test harness::isolated::tests::step18_no_credential_leaves_its_persons_volume ... ok
+test harness::lineage::tests::a_child_gets_no_more_than_its_parent ... ok
+test harness::lineage::tests::a_pause_holds_the_subagents_kiln_started_under_it_and_theirs_not_agents_it_started_beside_it ... ok
+test agentfiles::unpack::tests::an_archive_cut_short_leaves_nothing_behind ... ok
+test harness::lineage::tests::a_session_s_perms_are_its_parent_s_at_most_and_narrow_the_subagents_under_it ... ok
+test harness::lineage::tests::a_subagent_goes_where_and_as_its_agent_does ... ok
+test harness::lineage::tests::a_subagent_is_given_its_agent_s_session_settings_alone ... ok
+test agentfiles::tests::step30_the_migration_makes_its_tables ... ok
+test harness::lineage::tests::descendants_are_followed_down_the_chain ... ok
+test harness::lineage::tests::devin_children_keep_native_modes_within_their_parents_permissions ... ok
+test harness::lineage::tests::every_harness_s_modes_stand_in_one_order ... ok
+test agentfiles::tests::step30_a_text_the_store_cant_keep_writes_no_record ... ok
+test agentfiles::context::unpack_tests::step25_a_devin_bundle_the_unpacker_refuses_leaves_nothing ... ok
+test harness::lineage::tests::p2_one_pool_of_subagents_at_work_and_no_setting_is_no_limit ... ok
+test harness::lineage::tests::step18_an_isolated_agents_person_is_its_askers_else_its_parents ... ok
+test harness::lineage::tests::step32_an_isolated_agents_agents_are_isolated ... ok
+test agentfiles::tests::step30_versions_restore_and_delete ... ok
+test harness::lineage::tests::whose_agents_a_caller_reaches ... ok
+test harness::moving::stream::tests::w20_r09_transfer_spool_bounds_order_cleanup_and_exact_bytes ... ok
+test harness::moving::tests::a_claude_transcript_lands_where_claude_code_looks_for_the_new_folder ... ok
+test harness::moving::tests::a_harness_whose_record_kiln_doesnt_keep_moves_with_its_conversation_in_words ... FAILED
+test harness::moving::tests::a_package_carries_what_travels_and_leaves_the_machine_behind ... ok
+test harness::moving::tests::antigravitys_knowledge_and_gooses_memories_merge_into_the_ones_there ... ok
+test harness::moving::tests::claude_codes_memory_tasks_plans_and_checkpoints_go_where_it_looks_for_the_new_folder ... ok
+test harness::moving::tests::codexs_memories_merge_and_its_goal_goes_on_in_the_new_thread ... ok
+test harness::moving::tests::coming_back_it_takes_the_place_of_the_record_it_left_never_of_one_with_turns_of_its_own ... ok
+test harness::moving::tests::gemini_clis_memory_of_the_project_goes_to_the_name_it_has_there ... ok
+test harness::moving::tests::opencode_amp_and_devin_keep_nothing_that_travels ... ok
+test harness::trouble::tests::step18_h6_an_answer_ends_it_and_another_kind_is_said_anew ... ok
+test harness::trouble::tests::step18_h6_claude_says_its_401_at_its_first_retry ... ok
+test harness::trouble::tests::step18_h6_claude_signed_out_is_said_as_its_cli_says_it ... ok
+test agentfiles::tests::step30_texts_are_kept_once_in_the_store_of_bytes ... ok
+test harness::trouble::tests::step18_h6_codex_says_its_401_at_its_first_retry ... ok
+test harness::trouble::tests::step18_h6_codex_without_a_network_is_said_while_it_waits ... ok
+test harness::trouble::tests::step18_h6_other_errors_are_no_trouble ... ok
+test harness::whose::tests::whose_each_file_is ... ok
+test harness::whose::tests::this_projects_files_are_in_its_folders_and_their_repositories_worktrees ... ok
+test mcp::code::tests::a_refused_call_throws_with_its_answer_and_a_program_can_catch_it ... ok
+test mcp::code::tests::a_search_sees_the_hosts_registry ... ok
+test harness::lineage::tests::a_runner_known_by_its_machine_id_is_picked_by_the_name_people_see ... ok
+test agentfiles::tests::step30_who_reaches_everyones ... ok
+test mcp::code::tests::w28_r58_a_leaf_keeps_the_children_of_its_node ... ok
+test mcp::rpc::tests::a_line_that_isnt_utf8_is_refused_and_the_next_is_read ... ok
+test mcp::rpc::tests::a_message_is_a_request_or_refused_as_json_rpc_says ... ok
+test mcp::rpc::tests::a_notification_no_client_sends_is_noted_unknown ... ok
+test mcp::rpc::tests::g10_s5_params_taken_are_read_as_a_copy_was ... ok
+test mcp::rpc::tests::params_that_dont_fit_are_invalid_and_unknowns_are_said_so ... ok
+test mcp::skills::tests::every_skill_names_and_describes_itself ... ok
+test mcp::skills::tests::g10_s5_skills_described_once_are_described_as_each_time ... ok
+test harness::lineage::tests::p2_agents_held_to_goals_are_read_from_their_stacks ... ok
+test mcp::tests::an_agent_hears_who_it_is_and_of_its_goals_and_plans ... ok
+test harness::lineage::tests::g10_s2_access_decides_as_before_and_asks_the_store_only_where_it_must ... ok
+test mcp::tests::every_operation_is_a_tool_with_a_valid_name ... ok
+test harness::lineage::tests::step32_isolated_agents_go_only_where_the_runner_starts_microvms ... ok
+test mcp::tests::g10_s5_a_body_is_read_alike_wherever_it_is_read ... ok
+test mcp::tests::g10_s5_a_run_s_logs_in_parts_are_the_text_they_were ... ok
+test mcp::tests::g10_s5_a_tool_s_answer_is_the_bytes_it_was ... ok
+test mcp::code::tests::a_program_past_its_time_ends_and_what_it_left_running_is_stopped ... ok
+test mcp::tests::a_body_it_cant_read_whole_is_refused_and_noted ... ok
+test mcp::tests::code_mode_s_tools_are_typed ... ok
+test mcp::code::tests::at_most_parallel_calls_run_at_once ... ok
+test mcp::tests::mcp_tokens_verify_only_with_the_key_they_were_minted_with ... ok
+test mcp::tests::g9_s5_a_tool_is_found_without_making_every_name ... ok
+test mcp::tests::w20_ac01_every_operation_on_every_surface ... ok
+test mcp::code::tests::calls_a_program_starts_together_run_side_by_side ... ok
+test reach::mcp::tests::a_line_past_what_a_message_may_be_is_let_go_and_the_next_read ... ok
+test reach::mcp::tests::a_program_sees_the_machines_and_the_servers_operations ... ok
+test reach::mcp::tests::agent_tools_are_the_ones_the_server_names ... ok
+test reach::mcp::tests::antigravity_allows_its_page_tools_unless_a_person_said_otherwise ... ok
+test reach::mcp::tests::antigravity_gets_the_server_through_its_own_config ... ok
+test mcp::tests::g10_s5_answers_written_off_the_shard_are_the_bytes_they_were ... ok
+test reach::mcp::tests::harness_configs_name_the_socket_the_preference_and_the_session ... ok
+test reach::mcp::tests::its_tools_publish_their_types_saying_what_they_said_before ... ok
+test reach::mcp::tests::its_tools_refuse_what_they_dont_take_saying_which_and_where ... ok
+test reach::mcp::tests::long_output_keeps_its_head_and_tail ... ok
+test reach::mcp::tests::run_takes_needs_beside_on ... ok
+test reach::mcp::tests::what_the_agent_sends_is_read_as_json_rpc_says ... ok
+test wire::ts::a_field_added_in_rust_without_its_binding_names_the_file ... ok
+test wire::ts::bindings_are_current ... ok
+test wire::ts::every_update_goes_down_as_a_session_frame ... ok
+test wire::ts::hand_written_finds_definitions_not_re_exports ... ok
+test harness::lineage::tests::an_agent_never_starts_on_a_machine_kiln_knows_lacks_its_harness ... ok
+test wire::ts::tags_are_serdes_and_what_kiln_leaves_out_is_optional ... ok
+test mcp::tests::through_reach_what_couldnt_be_read_is_noted_against_its_session ... ok
+test wire::ts::w13_r01_gpu_wire_bindings_survive_crlf_checkouts ... ok
+test mcp::tests::g9_s3_agents_list_through_mcp_is_answered_whole ... ok
+test mcp::tests::what_mcp_cant_read_is_answered_as_json_rpc_says_and_noted ... ok
+test reach::mcp::tests::through_reach_a_misfit_reaches_the_server_as_a_note ... ok
+test wire::ts::no_generated_type_is_written_by_hand ... ok
+test mcp::tests::g10_s5_tools_list_is_written_once_and_answers_as_it_did ... ok
+test mcp::tests::every_operation_is_typed ... ok
+
+failures:
+
+---- harness::moving::tests::a_harness_whose_record_kiln_doesnt_keep_moves_with_its_conversation_in_words stdout ----
+
+thread 'harness::moving::tests::a_harness_whose_record_kiln_doesnt_keep_moves_with_its_conversation_in_words' (2353003) panicked at crates/kiln/src/harness/moving.rs:380:9:
+assertion failed: takes(pkg.version) && takes(1) && takes(3) && !takes(4)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    harness::moving::tests::a_harness_whose_record_kiln_doesnt_keep_moves_with_its_conversation_in_words
+
+test result: FAILED. 227 passed; 1 failed; 0 ignored; 0 measured; 4306 filtered out; finished in 1.71s
+
+error: test failed, to rerun pass `-p kiln --lib`

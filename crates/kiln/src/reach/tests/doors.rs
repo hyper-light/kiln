@@ -274,7 +274,7 @@ fn w05_r03_place_agents_holds_a_child_agents_claim_from_start_to_end() -> anyhow
         let [(on, Some(claim))] = first.as_slice() else { anyhow::bail!("one child, with its claim: {first:?}") };
         anyhow::ensure!(on == "agent:linux" && claim.owner == "mac" && claim.run.starts_with("session-"), "placed on linux by mac's owner, its parent's runner: {first:?}");
         anyhow::ensure!(hub.session_places.lock().is_empty(), "the server waits on no more words of it once it's placed");
-        anyhow::ensure!(lab.linux.session_started(claim.clone(), Some("child-1".into())).await?, "its claim was live on linux at its start");
+        anyhow::ensure!(lab.linux.session_started(claim.clone(), Some(crate::reach::place::Group::Session("child-1".into()))).await?, "its claim was live on linux at its start");
         let hc = held_and_cap(&lab.linux).await?;
         anyhow::ensure!(hc.0.first() == Some(&4_000) && within(hc), "its 4 CPUs held on linux from its start: {hc:?}");
 
@@ -296,13 +296,175 @@ fn w05_r03_place_agents_holds_a_child_agents_claim_from_start_to_end() -> anyhow
         let second = crate::rt::timeout(HANG, placed_rx.recv()).await??.map_err(refused)?;
         let [(on, Some(next))] = second.as_slice() else { anyhow::bail!("the second, with its claim: {second:?}") };
         anyhow::ensure!(on == "agent:linux" && next.owner == "mac" && next.run != claim.run, "the second placed on linux once the first ended: {second:?}");
-        anyhow::ensure!(lab.linux.session_started(next.clone(), Some("child-2".into())).await?, "the second's claim was live on linux at its start");
+        anyhow::ensure!(lab.linux.session_started(next.clone(), Some(crate::reach::place::Group::Session("child-2".into()))).await?, "the second's claim was live on linux at its start");
         let hc = held_and_cap(l).await?;
         anyhow::ensure!(hc.0.first() == Some(&6_000) && within(hc), "the second's 6 CPUs held, the first's 4 let go: {hc:?}");
         lab.linux.session_ended(next.clone()).await;
         let hc = held_and_cap(l).await?;
         anyhow::ensure!(hc.0 == [0, 0, 0, 0] && waiting(l, "interactive").await? == 0, "all of it free again: {hc:?}");
         drop(stop);
+        anyhow::Ok(())
+    })
+}
+
+/// Runners `mac` (process 1) and `linux` (process 2) joined to `hub`, each placing sessions and
+/// having Claude Code, `linux` alone saying it starts microVMs (its facts' `virt.microvm`), each idle
+/// as the server last heard (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+fn join_vm_runners(hub: &crate::hub::Hub) {
+    for (peer, name, microvm) in [(1, "mac", false), (2, "linux", true)] {
+        crate::hub::tests::join_runner(hub, peer, name, crate::proto::CAP_WIRE);
+        let facts = kiln_ci::facts::RunnerFacts { os: "linux".into(), arch: "x86_64".into(), virt: kiln_ci::facts::Virt { microvm, ..Default::default() }, ..Default::default() };
+        hub.put_agent(crate::hub::AgentLive { sample: Some(reading(0.0)), facts: Some(Box::new(facts)), ..crate::hub::tests::live_runner(name, "linux", "x86_64") });
+        hub.instances.update(|i| i.set_features(peer, vec![crate::proto::feature::SESSIONS.to_owned()]));
+        let kinds = crate::harness::kinds::offered()
+            .into_iter()
+            .map(|mut k| {
+                k.available = k.id == "claude";
+                k
+            })
+            .collect::<Vec<_>>();
+        hub.harness.set_kinds(&format!("agent:{name}"), kinds);
+    }
+}
+
+/// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32: an agent an agent in a microVM starts (MCP
+/// `agents.start`, its ask saying nothing of isolation or where) is isolated as its parent is, its
+/// image and size with it, and placed by the balancer as its parent was: an ask of its microVM's own
+/// 2 vCPUs and 4 GiB, among runners that start microVMs, owned by its parent's runner and admitted
+/// by linux's own admission, which holds that room from its start, its use read from its microVM's
+/// group, to its end. Sized by its start (`cpus=1,mem=2g`) it asks and holds that instead, still
+/// only where microVMs start, mac that doesn't among those it may go to. Where no runner says it
+/// starts microVMs, it's placed nowhere: placement's never, with the need none meets.
+#[test]
+fn step32_an_agent_a_microvm_agent_starts_is_isolated_and_placed_with_its_microvms_own_needs() -> anyhow::Result<()> {
+    use crate::harness::lineage::{Ask, place_start_for_tests as place_start};
+    use crate::harness::session::{Info, Isolation};
+    crate::rt::block_on(async move {
+        const GIB: u64 = 1 << 30;
+        let lab = lab_placing().await?;
+        // Whether linux starts microVMs, as its own facts say it (what its admission and its owner
+        // read of itself) and as the directory does (what other owners read of it); mac doesn't.
+        let microvm = |on: bool| In::LocalFacts(Box::new(kiln_ci::facts::RunnerFacts { os: "linux".into(), arch: "x86_64".into(), virt: kiln_ci::facts::Virt { microvm: on, ..Default::default() }, ..Default::default() }));
+        lab.linux.feed(microvm(true)).await;
+        lab.ctl.send(super::Ctl::Microvm("linux", true)).await?;
+        lab.ctl.send(super::Ctl::Microvm("mac", false)).await?;
+        lab.mac.feed(In::Sampled(reading(0.0))).await;
+        lab.linux.feed(In::Sampled(reading(0.0))).await;
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let hub = crate::hub::tests::scratch_hub().await?;
+        join_vm_runners(&hub);
+        let stop = connect(&hub, &lab);
+        let refused = |(code, why): crate::harness::lineage::Refused| anyhow::anyhow!("{code}: {why}");
+        let homes = tempfile::tempdir()?;
+        // Its parent, in a microVM of its own on linux: Claude Code's image, 2 vCPUs and 4 GiB.
+        let vm = Isolation { image: Some("harness-claude".into()), cpus: Some(kiln_ci::sched::state::Cpus::whole(2)), memory: Some(4 * GIB), ..Isolation::microvm() };
+        let parent = Info { id: "vm-parent".into(), kind: "claude".into(), target: "agent:linux".into(), isolation: Some(vm.clone()), ..Info::default() };
+
+        let (isolation, placed) = crate::rt::timeout(HANG, place_start(&hub, Some(&parent), &Ask { kind: "claude".into(), ..Ask::default() })).await?.map_err(refused)?;
+        anyhow::ensure!(isolation.as_ref() == Some(&vm), "isolated as its parent is, its image and size with it: {isolation:?}");
+        let [(on, Some(claim))] = placed.as_slice() else { anyhow::bail!("one agent, with its claim: {placed:?}") };
+        anyhow::ensure!(on == "agent:linux" && claim.owner == "linux", "placed on linux by its parent's runner: {placed:?}");
+        let group = crate::reach::place::vm_group("vm-child-1", homes.path());
+        anyhow::ensure!(lab.linux.session_started(claim.clone(), Some(group)).await?, "its claim was live on linux at its start");
+        let (held, cap) = held_and_cap(&lab.linux).await?;
+        anyhow::ensure!(held == [2_000, 4 * GIB, 0, 0] && held.iter().zip(&cap).all(|(h, c)| h <= c), "its microVM's 2 vCPUs and 4 GiB held from its start: {held:?} of {cap:?}");
+        lab.linux.session_ended(claim.clone()).await;
+        anyhow::ensure!(held_and_cap(&lab.linux).await?.0 == [0; 4], "and let go at its end");
+
+        let sized = Ask { kind: "claude".into(), on: Some("cpus=1,mem=2g".into()), ..Ask::default() };
+        let (isolation, placed) = crate::rt::timeout(HANG, place_start(&hub, Some(&parent), &sized)).await?.map_err(refused)?;
+        let small = Isolation { cpus: Some(kiln_ci::sched::state::Cpus::whole(1)), memory: Some(2 * GIB), ..vm.clone() };
+        anyhow::ensure!(isolation.as_ref() == Some(&small), "sized as its start asks: {isolation:?}");
+        let [(on, Some(claim))] = placed.as_slice() else { anyhow::bail!("one agent, with its claim: {placed:?}") };
+        anyhow::ensure!(on == "agent:linux", "only where microVMs start, though mac suits the rest of what it asks: {placed:?}");
+        anyhow::ensure!(lab.linux.session_started(claim.clone(), Some(crate::reach::place::vm_group("vm-child-2", homes.path()))).await?);
+        anyhow::ensure!(held_and_cap(&lab.linux).await?.0 == [1_000, 2 * GIB, 0, 0], "{:?}", held_and_cap(&lab.linux).await?);
+        lab.linux.session_ended(claim.clone()).await;
+
+        lab.linux.feed(microvm(false)).await;
+        lab.ctl.send(super::Ctl::Microvm("linux", false)).await?;
+        lab.linux.directory().await?;
+        let never = crate::rt::timeout(HANG, place_start(&hub, Some(&parent), &Ask { kind: "claude".into(), ..Ask::default() })).await?;
+        let why = never.as_ref().err().map(|(_, w)| w.clone()).unwrap_or_default();
+        anyhow::ensure!(why.contains("never") && why.contains("microvm"), "placed nowhere where no runner starts microVMs: {never:?}");
+        anyhow::ensure!(held_and_cap(&lab.linux).await?.0 == [0; 4] && waiting(&lab.linux, "interactive").await? == 0, "nothing held or waiting after");
+        drop(stop);
+        anyhow::Ok(())
+    })
+}
+
+/// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32: an agent in a microVM of its own has its
+/// commands run in microVMs or not at all, never on a bare host, and no runner runs kiln's commands
+/// in a microVM yet: every door refuses them before anything of them starts, saying so by kind
+/// (`refused (isolated)`; the MCP server's answer `refused: "isolated"`): the MCP `run` tool, code
+/// mode's `kiln.machines.run` and `kiln.machines.start`, and `kiln run` (with `--reuse` too) as its
+/// CLI asks over the runner's socket for an agent's process. Nothing of them is placed, held or run.
+/// The same agent, a process on its machine, has its command run as before.
+#[test]
+fn step32_an_isolated_agents_commands_are_refused_at_every_door_never_run_on_a_bare_host() -> anyhow::Result<()> {
+    use crate::harness::session::{Isolation, Spec};
+    use crate::reach::local::{Client, Ev, Refused, Req, RunReq};
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        lab.mac.feed(In::Sampled(reading(0.0))).await;
+        lab.linux.feed(In::Sampled(reading(0.0))).await;
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let (socks, work) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let wd = work.path().display().to_string();
+        let (tx, _updates) = async_channel::unbounded::<(String, crate::harness::core::Update)>();
+        let host = crate::harness::host::Host::new(tx, Some(work.path().join("harness.json")), Default::default());
+        let session = host.open(Some(crate::util::new_id()), Spec { kind: "claude".into(), program: Some(work.path().join("no-harness").display().to_string()), cwd: Some(wd.clone()), ..Spec::default() })?;
+        let sock = crate::reach::local::serve(lab.mac.clone(), "mac".to_owned(), socks.path().join("reach.sock"), true, Some(Arc::clone(&host)))?;
+        let tools = Tools(Arc::new(crate::reach::mcp::tools_on(&sock, &session.id)));
+        let touch = |n: &str| format!("touch '{}'", work.path().join(n).display());
+        let ran = |n: &str| work.path().join(n).exists();
+
+        // A process on its machine: its command runs, as ever.
+        let (as_process, failed) = tools.call("run", json!({"command": touch("as-a-process"), "cwd": wd, "sync": false})).await?;
+        anyhow::ensure!(!failed && ran("as-a-process"), "an agent on its machine has its command run: {as_process}");
+
+        // Held in a microVM of its own: refused at every door, by kind.
+        session.spec.lock().isolation = Some(Isolation::microvm());
+        let (run, failed) = tools.call("run", json!({"command": touch("mcp-run"), "cwd": wd, "sync": false})).await?;
+        let words = run.get("error").and_then(Value::as_str).unwrap_or_default();
+        anyhow::ensure!(failed && run.get("refused") == Some(&json!("isolated")) && Refused::code_of(words) == Some("isolated"), "the MCP run tool: {run}");
+        for (call, name) in [("run", "code-run"), ("start", "code-start")] {
+            let program = format!("try {{ await kiln.machines.{call}(input); return 'ran'; }} catch (e) {{ return e.result; }}");
+            let (out, failed) = tools.call("code_run", json!({"program": program, "input": {"command": touch(name), "cwd": wd, "sync": false}})).await?;
+            let result = out.get("result").cloned().unwrap_or_default();
+            let refused = result.get("refused") == Some(&json!("isolated")) || out.to_string().contains("refused (isolated)");
+            anyhow::ensure!(!failed && refused, "code mode's kiln.machines.{call}: {out}");
+        }
+        let agent = vec![(crate::reach::keeper::AGENT_ENV.to_owned(), session.id.clone())];
+        for (reuse, name) in [(false, "cli-run"), (true, "cli-reuse")] {
+            let req = RunReq { command: touch(name), cwd: Some(wd.clone()), remote_cwd: Some(wd.clone()), env: agent.clone(), ..RunReq::default() };
+            let sock = sock.clone();
+            let evs = crate::rt::blocking(move || -> anyhow::Result<Vec<Ev>> {
+                let mut c = Client::connect(&sock)?;
+                c.send(&if reuse { Req::RunReuse(Box::new(req)) } else { Req::Run(Box::new(req)) })?;
+                let mut evs = Vec::new();
+                while let Some(e) = c.event()? {
+                    let end = matches!(e, Ev::Exit { .. } | Ev::Error(_));
+                    evs.push(e);
+                    if end {
+                        break;
+                    }
+                }
+                Ok(evs)
+            })
+            .await??;
+            let said = evs.iter().find_map(|e| if let Ev::Error(w) = e { Refused::code_of(w) } else { None });
+            anyhow::ensure!(said == Some("isolated") && !evs.iter().any(|e| matches!(e, Ev::Started { .. } | Ev::Placed { .. } | Ev::Picked { .. })), "kiln run (reuse: {reuse}): {evs:?}");
+        }
+        for name in ["mcp-run", "code-run", "code-start", "cli-run", "cli-reuse"] {
+            anyhow::ensure!(!ran(name), "{name} ran on a bare host");
+        }
+        for h in [&lab.mac, &lab.linux] {
+            anyhow::ensure!(held_and_cap(h).await?.0 == [0; 4] && waiting(h, "interactive").await? == 0, "nothing of them placed: {}", h.place_view().await?);
+        }
+        let _ = host.close(&session.id);
         anyhow::Ok(())
     })
 }

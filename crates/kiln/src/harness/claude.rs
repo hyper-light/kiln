@@ -1857,6 +1857,10 @@ impl Claude {
             self.notice(core, Level::Warn, clip_middle(line, 2000).0, None);
             return;
         };
+        // A credential refused or a provider unreached, said at its first retry (`super::trouble`).
+        if let Some(seen) = super::trouble::of_claude(&v) {
+            super::trouble::take(core, seen);
+        }
         let parent = str_of(&v, "parent_tool_use_id").map(str::to_owned);
         match str_of(&v, "type").unwrap_or("") {
             "control_response" => self.control_response(core, &v),

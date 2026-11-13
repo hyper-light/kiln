@@ -1,0 +1,132 @@
+{
+  "what": "The files of a group Shards keeps (D183, slice 3), as real runs left them, recorded for kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32 on 2026-11-12: one microVM run under --cgroup-parent kiln-s32-fixture in a Shards home of its own, its workload one vCPU busy (`yes`) and 128 MiB held in a shell variable, the group's folder read twice while it ran (each file byte for byte, its time first), and each process the group listed read by the OS's own tools then (`ps` on macOS, PowerShell's Get-Process on Windows).",
+  "command": "shards run -d --name s32fix --cgroup-parent kiln-s32-fixture alpine:3.22 sh -c 'yes >/dev/null & x=$(head -c 134217728 /dev/zero | tr \"\\0\" a); sleep 90'",
+  "macos": {
+    "host": "adas-mac-studio.local-2: Apple M3 Ultra, 32 CPUs, 96 GiB; macOS 26.4 (25E246), Darwin 25.4.0, arm64",
+    "shards": "shards 0.7.0, hyper-light/shards ac87190d3 built test-release (~/.cache/s28-shards-ac87190d3/shards there)",
+    "reads": [
+      {
+        "at_ms": 1794522996476,
+        "files": {
+          "memory.current": "139758208\n",
+          "cgroup.procs": "33820\n",
+          "memory.high": "max\n",
+          "memory.max": "max\n",
+          "cpu.max": "max 100000\n"
+        },
+        "processes": [
+          {
+            "pid": 33820,
+            "name": "shards-vm",
+            "cpu_ms": 11840,
+            "rss_kib": 147120
+          }
+        ]
+      },
+      {
+        "at_ms": 1794523001564,
+        "files": {
+          "memory.current": "139758208\n",
+          "cgroup.procs": "33820\n",
+          "memory.high": "max\n",
+          "memory.max": "max\n",
+          "cpu.max": "max 100000\n"
+        },
+        "processes": [
+          {
+            "pid": 33820,
+            "name": "shards-vm",
+            "cpu_ms": 16420,
+            "rss_kib": 147120
+          }
+        ]
+      }
+    ]
+  },
+  "windows": {
+    "host": "jupiter: AMD Ryzen AI MAX+ 395, 32 CPUs, 124 GiB; Windows 11 (10.0.26200.9974), x86_64, WHP",
+    "shards": "shards 0.7.0, hyper-light/shards 3103d2eab (jupiter's g121-whp-stop-bin/3103d2eab/shards.exe)",
+    "reads": [
+      {
+        "at_ms": 1794523218224,
+        "files": {
+          "memory.current": "214929408\n",
+          "cgroup.procs": "136764\n70392\n72700\n71936\n",
+          "memory.high": "max\n",
+          "memory.max": "max\n",
+          "cpu.max": "max 100000\n"
+        },
+        "processes": [
+          {
+            "pid": 136764,
+            "name": "shards-vm",
+            "cpu_ms": 22781,
+            "working_set": 223354880,
+            "private": 781512704
+          },
+          {
+            "pid": 70392,
+            "name": "shards-net",
+            "cpu_ms": 0,
+            "working_set": 5918720,
+            "private": 1196032
+          },
+          {
+            "pid": 72700,
+            "name": "shards-vm",
+            "cpu_ms": 531,
+            "working_set": 199786496,
+            "private": 511500288
+          },
+          {
+            "pid": 71936,
+            "name": "shards-net",
+            "cpu_ms": 16,
+            "working_set": 5922816,
+            "private": 1200128
+          }
+        ]
+      },
+      {
+        "at_ms": 1794523225066,
+        "files": {
+          "memory.current": "214929408\n",
+          "cgroup.procs": "136764\n70392\n72700\n71936\n",
+          "memory.high": "max\n",
+          "memory.max": "max\n",
+          "cpu.max": "max 100000\n"
+        },
+        "processes": [
+          {
+            "pid": 136764,
+            "name": "shards-vm",
+            "cpu_ms": 29594,
+            "working_set": 223354880,
+            "private": 781512704
+          },
+          {
+            "pid": 70392,
+            "name": "shards-net",
+            "cpu_ms": 0,
+            "working_set": 5918720,
+            "private": 1196032
+          },
+          {
+            "pid": 72700,
+            "name": "shards-vm",
+            "cpu_ms": 656,
+            "working_set": 199798784,
+            "private": 511500288
+          },
+          {
+            "pid": 71936,
+            "name": "shards-net",
+            "cpu_ms": 16,
+            "working_set": 5922816,
+            "private": 1200128
+          }
+        ]
+      }
+    ]
+  }
+}
