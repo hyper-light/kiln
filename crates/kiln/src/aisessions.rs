@@ -366,7 +366,8 @@ impl Reporter {
     async fn scan_now(&self, up: &crate::memory::queue::Sender<crate::exec::Up>) -> Option<Vec<u32>> {
         self.scans.fetch_add(1, Ordering::Relaxed);
         let (scanner, terminals) = (Arc::clone(&self.scanner), self.shells.lock().clone());
-        let sessions = crate::rt::blocking(move || scanner.lock().scan(&terminals)).await.ok().unwrap_or_default();
+        // The processes read before the scanner is taken: a history or a view meanwhile doesn't wait on that read.
+        let sessions = crate::rt::blocking(move || { let sys = Scanner::processes(); scanner.lock().scan_with(sys, &terminals) }).await.ok().unwrap_or_default();
         let pids: Vec<u32> = sessions.iter().map(|s| s.pid).filter(|p| *p != 0).collect();
         let Ok(json) = serde_json::to_string(&sessions) else { return Some(pids) };
         {
@@ -394,7 +395,7 @@ impl Reporter {
         let me = self.clone();
         crate::rt::spawn(async move {
             let scanner = Arc::clone(&me.scanner);
-            let sessions = crate::rt::blocking(move || scanner.lock().scan(&terminals)).await;
+            let sessions = crate::rt::blocking(move || { let sys = Scanner::processes(); scanner.lock().scan_with(sys, &terminals) }).await;
             me.scanning.store(false, Ordering::Release);
             let Some(json) = sessions.ok().and_then(|s| serde_json::to_string(&s).ok()) else { return };
             {
@@ -425,7 +426,9 @@ impl Reporter {
         crate::rt::spawn(async move {
             let past = crate::rt::blocking(move || scanner.lock().history(kind.as_deref(), limit, &running)).await.ok();
             let json = past.and_then(|p| serde_json::to_string(&p).ok());
-            let _ = up.send(crate::exec::Up::Term(crate::proto::AgentMsg::HarnessHistory { req, json })).await;
+            // On the control lane: an answer the server waits on with a deadline, not behind what the sessions' streams
+            // carry on the terminal lane (2026-11-12: their snapshots, a megabyte a second, went ahead of it).
+            let _ = up.send(crate::exec::Up::Msg(crate::proto::AgentMsg::HarnessHistory { req, json })).await;
         });
     }
 
@@ -497,6 +500,9 @@ pub struct Scanner {
     /// Past sessions by transcript, with the length and mtime they were read at (`None`: not a
     /// conversation, e.g. nothing was ever asked).
     past: HashMap<PathBuf, (u64, SystemTime, Option<PastSession>)>,
+    /// The ids of the sessions the latest scan found running (None before the first): what a
+    /// history leaves out, read from the scans the tools' own changes make, not a scan of its own.
+    running: Option<HashSet<String>>,
 }
 
 impl Scanner {
@@ -516,6 +522,7 @@ impl Scanner {
             devin_open: HashMap::new(),
             devin_running: HashSet::new(),
             past: HashMap::new(),
+            running: None,
         }
     }
 
@@ -526,25 +533,39 @@ impl Scanner {
         vec![self.claude.join("sessions"), self.claude.join("projects"), self.codex.join("sessions"), self.devin.clone(), self.gemini.clone()]
     }
 
-    /// The sessions running now, most recently active first. `terminals` maps the shell pid of
-    /// each kiln terminal on this machine to its session id.
-    pub fn scan(&mut self, terminals: &HashMap<u32, String>) -> Vec<AiSession> {
-        // sysinfo keeps names across exec even when the PID and start time stay the same.
-        self.sys = System::new();
-        // Names, parents and command lines of everything; working directories only of the tools.
-        self.sys.refresh_processes_specifics(
+    /// The machine's processes as a scan reads them: names, parents and command lines of
+    /// everything; working directories and environments of the tools alone. Read without the
+    /// scanner (`Reporter::scan_now`): on a machine of thousands of processes that read is the
+    /// scan's time (2026-11-12, adacachy: 6,474 processes, ~80,000 reads, 0.8 s warm, 17.9 s
+    /// under load), and what else takes the scanner (a history, a view) didn't wait on it.
+    pub fn processes() -> System {
+        // sysinfo keeps names across exec even when the PID and start time stay the same: new.
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet).with_exe(UpdateKind::OnlyIfNotSet).without_tasks(),
         );
-        let tools: Vec<Pid> = self.sys.processes().iter().filter(|(_, p)| tool_of(p).is_some()).map(|(pid, _)| *pid).collect();
+        let tools: Vec<Pid> = sys.processes().iter().filter(|(_, p)| tool_of(p).is_some()).map(|(pid, _)| *pid).collect();
         if !tools.is_empty() {
-            self.sys.refresh_processes_specifics(
+            sys.refresh_processes_specifics(
                 ProcessesToUpdate::Some(&tools),
                 false,
                 ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always).with_environ(UpdateKind::OnlyIfNotSet).without_tasks(),
             );
         }
+        sys
+    }
+
+    /// The sessions running now, most recently active first. `terminals` maps the shell pid of
+    /// each kiln terminal on this machine to its session id.
+    pub fn scan(&mut self, terminals: &HashMap<u32, String>) -> Vec<AiSession> {
+        self.scan_with(Self::processes(), terminals)
+    }
+
+    /// [`Scanner::scan`] of the processes `sys` read ([`Scanner::processes`]).
+    pub fn scan_with(&mut self, sys: System, terminals: &HashMap<u32, String>) -> Vec<AiSession> {
+        self.sys = sys;
         let mut out = Vec::new();
         let mut open = HashMap::new();
         let mut seen: HashSet<u32> = HashSet::new();
@@ -659,6 +680,7 @@ impl Scanner {
         }
         out.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
         out.truncate(MAX_SESSIONS);
+        self.running = Some(out.iter().map(|s| s.id.clone()).filter(|id| !id.is_empty()).collect());
         out
     }
 
@@ -749,11 +771,16 @@ impl Scanner {
     /// session record (of any kind), and `running` (the harness ids of kiln's own sessions).
     /// Only the head and the tail of each transcript are read, once per change.
     pub fn history(&mut self, kind: Option<&str>, limit: usize, running: &HashSet<String>) -> Vec<PastSession> {
-        let found = self.scan(&HashMap::new());
+        // What runs, as the latest scan found it: the scans the tools' changes make keep it, so a
+        // history reads no process of its own (2026-11-12, adacachy: each read every one of 6,474
+        // processes, a 10 s ask's answer 17.9 s late under load). Before any scan, one.
+        if self.running.is_none() {
+            self.scan(&HashMap::new());
+        }
         let open: HashSet<PathBuf> = self.open.values().map(|(_, f)| f.clone()).collect();
         let mut skip: HashSet<String> = running.clone();
         skip.extend(self.devin_running.iter().cloned());
-        skip.extend(found.into_iter().map(|s| s.id).filter(|id| !id.is_empty()));
+        skip.extend(self.running.iter().flatten().cloned());
         for r in claude_records(&self.claude.join("sessions")) {
             if self.sys.process(Pid::from_u32(r.pid)).is_some_and(|p| tool_of(p) == Some(Tool::Claude)) {
                 skip.insert(r.session_id);
@@ -1672,6 +1699,24 @@ mod tests {
         Ok(())
     }
 
+
+    /// 2026-11-12, adacachy: each history read every one of the machine's 6,474 processes, its
+    /// answer 17.9 s late against a 10 s ask under load. A history reads no process once a scan
+    /// has said what runs (the scans the tools' changes make keep that); before any, it scans once.
+    #[test]
+    fn a_history_reads_no_process_once_a_scan_said_what_runs() {
+        let home = std::env::temp_dir().join(format!("kiln-history-scan-{}", std::process::id()));
+        let mut sc = Scanner::new(home);
+        assert!(sc.running.is_none());
+        let _ = sc.history(Some("claude"), 10, &HashSet::new());
+        assert!(sc.running.is_some(), "before any scan, the history scans once");
+        assert!(sc.sys.processes().len() > 0, "that scan read the processes");
+        sc.sys = System::new();
+        sc.running = Some(HashSet::from(["running-now".to_owned()]));
+        let _ = sc.history(Some("claude"), 10, &HashSet::new());
+        assert_eq!(sc.sys.processes().len(), 0, "a history after a scan reads no process");
+        assert_eq!(sc.running, Some(HashSet::from(["running-now".to_owned()])));
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn a_native_devin_session_uses_its_held_lock_and_enters_history_once_ended() -> anyhow::Result<()> {
@@ -1709,6 +1754,8 @@ mod tests {
         let ambiguous = devin_owners(&sc.sys, &[(child.id(), "native".into()), (child.id(), "another".into())]);
         let _ = end(child.id(), true);
         let _ = child.wait();
+        // Its process's end is a scan (`Reporter::watch`, `os::watch::exited`): a history reads what runs off it.
+        sc.scan(&HashMap::new());
         let past = sc.history(Some("devin"), 10, &HashSet::new());
         let found = found.ok_or_else(|| anyhow::anyhow!("native session not found"))?;
         assert_eq!((found.tool.as_str(), found.title.as_str(), found.model.as_str(), found.last_prompt.as_str(), found.last_reply.as_str()), ("devin", "Native conversation", "model", "native question", "native answer"));
