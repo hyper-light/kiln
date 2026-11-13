@@ -13,7 +13,8 @@
 //!   which the session's adapter speaks to as to a process's pipes (`super::held`).
 //! - **Its folder** is the session's own, at its own path, so what the harness says of its files
 //!   names them as the machine does.
-//! - **What it sees of the machine** ([`Launch::shares`]): its project at its own path, and its
+//! - **What it sees of the machine** ([`Launch::shares`]): its project at its own path (a Windows
+//!   folder, which no Linux path names, under `/work` by its name: [`guest_path`]), and its
 //!   harness's home, its person's volumes kept on the machine (`harness::isolated::home::Layout`), each
 //!   at its path in the microVM, as kiln's Agentfile for its harness declares them, or a person's own
 //!   ([`kept_volumes`], its run's environment read from its image: [`harness_env`]); and the plugin
@@ -74,7 +75,7 @@ pub fn source_of<'s>(kind: &Kind, spec: &'s Spec) -> Result<Source<'s>, String> 
 
 /// The seam's launch of `kind` for an isolated `spec`, its microVM booting `image`: its image's
 /// harness member, the arguments past its image's command, in the session's folder at its own path,
-/// which it sees there (its project, `Share::at_its_path`: [`launch`] adds its harness's home), with
+/// which it sees there (its project, [`project_share`]: [`launch`] adds its harness's home), with
 /// its image's grants (which [`launch`] narrows to what its session uses: [`reach_of`]) and the
 /// microVM sized as its boundary sizes one (the person's sizes reach it through its placement: plan
 /// step 32).
@@ -82,11 +83,11 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
     let cwd = crate::harness::session::resolve_cwd(spec.cwd.as_deref());
     anyhow::ensure!(std::path::Path::new(&cwd).is_dir(), "{cwd} is not a directory on this machine");
     let run = kind.elsewhere(spec)?;
-    let project = Share::at_its_path(&cwd);
+    let project = project_share(&cwd).map_err(anyhow::Error::msg)?;
     Ok(Launch {
         program: run.member.to_owned(),
         args: run.args,
-        folder: Some(cwd),
+        folder: Some(project.at.clone()),
         shares: vec![project],
         env: run.env,
         limits: Limits::NONE,
@@ -117,8 +118,8 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         Source::Kept { .. } => Reach::Whole { why: Whole::PersonsOwn },
         Source::Builtin(b) => {
             let person = spec.isolation.as_ref().and_then(|i| i.person.clone());
-            let (model, homes, project, env) = (spec.model.clone(), homes.map(std::path::Path::to_path_buf), launch.folder.clone(), launch.env.clone());
-            crate::rt::blocking(move || reach_of(b, person.as_deref(), model.as_deref(), homes.as_deref(), project.as_deref(), &env)).await?
+            let (model, homes, project, env) = (spec.model.clone(), homes.map(std::path::Path::to_path_buf), launch.shares.first().cloned(), launch.env.clone());
+            crate::rt::blocking(move || reach_of(b, person.as_deref(), model.as_deref(), homes.as_deref(), project.as_ref(), &env)).await?
         }
     };
     let text = match source {
@@ -136,11 +137,44 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     };
     launch.shares.extend(mounts.into_iter().map(|m| Share { host: m.host.to_string_lossy().into_owned(), at: m.guest, writable: true }));
     for dir in plugin_folders(kind, session) {
-        launch.args.extend(["--plugin-dir".to_owned(), dir.clone()]);
-        launch.shares.push(Share { host: dir.clone(), at: dir, writable: false });
+        let at = guest_path(&dir, PLUGINS).map_err(anyhow::Error::msg)?;
+        launch.args.extend(["--plugin-dir".to_owned(), at.clone()]);
+        launch.shares.push(Share { host: dir, at, writable: false });
     }
     let run = vms.sandbox.launch(launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
     Ok(crate::proc::duplex_of_run(run, image, reach, kept_in))
+}
+
+/// Where a microVM sees a Windows machine's project folder: beneath this, by its own name ([`guest_path`]).
+pub const PROJECTS: &str = "/work";
+
+/// Where a microVM sees a Windows machine's plugin folders: beneath this, each by its own name.
+pub const PLUGINS: &str = "/plugins";
+
+/// Where a microVM sees folder `host` of the machine, as Shards plugs one in (D235): a Unix path at its
+/// own path, so what the harness says of its files names them as the machine does; a Windows one
+/// (`C:\…`, `\\?\C:\…`, `\\server\share\…`), which no Linux path names, beneath `under` by its own
+/// name, its last part. Hex takes a Windows folder as a share's source, but a share's destination and a
+/// member's working folder are the guest's Linux paths, absolute and plain, and Hex maps none for kiln
+/// (Hex's lead, through ROOT, 2026-11-13). Why not, for a path of neither kind, or a Windows one with
+/// no name to go by (a drive's root).
+pub fn guest_path(host: &str, under: &str) -> Result<String, String> {
+    if host.starts_with('/') {
+        return Ok(host.to_owned());
+    }
+    let windows = host.starts_with(r"\\") || host.get(1..3).is_some_and(|s| s == ":\\" || s == ":/");
+    if !windows {
+        return Err(format!("{host:?} is neither a Unix path nor a Windows one"));
+    }
+    let name = host.rsplit(['\\', '/']).find(|c| !c.is_empty()).filter(|c| *c != "." && *c != ".." && !c.ends_with(':') && *c != "?");
+    let name = name.ok_or_else(|| format!("{host:?} has no folder's name to plug it in by"))?;
+    Ok(format!("{}/{name}", under.trim_end_matches('/')))
+}
+
+/// The project folder `cwd` as a launch shares it: writable, where [`guest_path`] puts it in the
+/// microVM, which is its member's working folder too.
+pub fn project_share(cwd: &str) -> Result<Share, String> {
+    Ok(Share { host: cwd.to_owned(), at: guest_path(cwd, PROJECTS)?, writable: true })
 }
 
 /// The folders of plugins `kind`'s harness loads for `session`, as the machine's launch gives them
@@ -321,9 +355,10 @@ fn in_layers(store: &shards_image::store::Store, layers: &[shards_image::store::
 /// session's own provider's or sign-in's, read as its harness reads them, from its run's environment
 /// as the microVM has it (its image's `run.env`, then `launch_env`), the model its session names, and
 /// its configuration in its person's home under `homes` (`harness::isolated::home::Layout`) or its
-/// project's own (at its own path, `project`, as Shards D235 plugs it in). Whole, saying why, where
+/// project's own (`project`, as the launch shares it: read at its folder here, where the microVM has
+/// it at its share's path). Whole, saying why, where
 /// its image serves one use or kiln keeps no home for it here. Reads files: off the runtime's threads.
-pub fn reach_of(b: &'static builtin::Builtin, person: Option<&str>, model: Option<&str>, homes: Option<&std::path::Path>, project: Option<&str>, launch_env: &[(String, String)]) -> Reach {
+pub fn reach_of(b: &'static builtin::Builtin, person: Option<&str>, model: Option<&str>, homes: Option<&std::path::Path>, project: Option<&Share>, launch_env: &[(String, String)]) -> Reach {
     if !builtin::destinations::BY_USE.iter().any(|t| t.harness == b.harness) {
         return Reach::Whole { why: Whole::OneUse };
     }
@@ -337,12 +372,11 @@ pub fn reach_of(b: &'static builtin::Builtin, person: Option<&str>, model: Optio
     };
     let env: Vec<(String, String)> = image_env.into_iter().chain(launch_env.iter().cloned()).collect();
     let read = |guest: &str| -> Result<Option<String>, String> {
-        let at = match project {
-            Some(p) if std::path::Path::new(guest).starts_with(p) => std::path::PathBuf::from(guest),
-            _ => match layout.host_of(guest) {
-                Some(at) => at,
-                None => return Ok(None),
-            },
+        // In its project: that folder here; else in its home's volumes, or nowhere here.
+        let in_project = project.and_then(|p| std::path::Path::new(guest).strip_prefix(&p.at).ok().map(|rest| std::path::Path::new(&p.host).join(rest)));
+        let at = match in_project.or_else(|| layout.host_of(guest)) {
+            Some(at) => at,
+            None => return Ok(None),
         };
         match std::fs::read_to_string(&at) {
             Ok(text) => Ok(Some(text)),
@@ -350,7 +384,7 @@ pub fn reach_of(b: &'static builtin::Builtin, person: Option<&str>, model: Optio
             Err(e) => Err(format!("{}: {e}", at.display())),
         }
     };
-    super::narrow::reach(b.harness, &super::narrow::Reads { home: &layout.guest_home(), project, env: &env, model, read: &read })
+    super::narrow::reach(b.harness, &super::narrow::Reads { home: &layout.guest_home(), project: project.map(|p| p.at.as_str()), env: &env, model, read: &read })
 }
 
 /// The destinations Agentfile `text` grants past its microVM, each `host:port`, as Shards reads them
@@ -431,6 +465,16 @@ mod tests {
         assert_eq!(codex.boundary, Boundary::MicroVm { image: "harness-codex@sha256:00".into() });
         assert_eq!(codex.folder.as_deref(), Some(cwd.as_str()));
         assert_eq!(codex.shares, [Share::at_its_path(&cwd)], "its project, at its own path: its home comes with its person's volume");
+        // A Windows machine's project: shared from where it is, at a Linux path of its own name, which is
+        // its working folder too; Unix's at its own path.
+        let windows = project_share(r"C:\Users\ada\proj").map_err(anyhow::Error::msg)?;
+        assert_eq!(windows, Share { host: r"C:\Users\ada\proj".into(), at: "/work/proj".into(), writable: true });
+        for (host, at) in [(r"\\?\C:\Users\ada\proj\", "/work/proj"), ("D:/src/kiln", "/work/kiln"), (r"\\server\share\repo", "/work/repo"), ("/Users/ada/proj", "/Users/ada/proj")] {
+            assert_eq!(guest_path(host, PROJECTS), Ok(at.to_owned()), "{host}");
+        }
+        for nameless in [r"C:\", "C:/", r"\\?\C:\", "relative\\proj"] {
+            assert!(guest_path(nameless, PROJECTS).is_err(), "{nameless}");
+        }
         assert_eq!(codex.env, vec![("LANG".to_owned(), "fr_FR.UTF-8".to_owned()), ("TZ".to_owned(), "Europe/Paris".to_owned())]);
         let resumed = Spec { resume: Some("conversation-1".into()), model: Some("claude-opus-5-5".into()), allow_bypass: false, ..spec("claude") };
         let claude = launch_of(kind("claude")?, &resumed, "harness-claude@sha256:00".into())?;
@@ -594,7 +638,8 @@ mod tests {
         // opencode's project at its own path, read where it is.
         let project = tempfile::tempdir()?;
         std::fs::write(project.path().join("opencode.json"), "{\"model\": \"openai/gpt-5\"}")?;
-        let opencode = reach_of(builtin_of("opencode")?, Some("user:u1"), None, Some(homes.path()), project.path().to_str(), &[]);
+        let shared = project_share(&project.path().to_string_lossy()).map_err(anyhow::Error::msg)?;
+        let opencode = reach_of(builtin_of("opencode")?, Some("user:u1"), None, Some(homes.path()), Some(&shared), &[]);
         assert!(matches!(&opencode, Reach::Narrowed { uses, .. } if uses == &["openai"]), "{opencode:?}");
         // One provider's image: its destinations are all its run's.
         assert_eq!(reach_of(builtin_of("claude")?, Some("user:u1"), None, Some(homes.path()), None, &[]), Reach::Whole { why: Whole::OneUse });
