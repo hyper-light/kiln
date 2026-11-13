@@ -78,12 +78,14 @@ def check(
     room: Dict[str, Optional[int]],
     limit: Optional[int],
     quiescent: bool,
+    scanned: bool = True,
 ) -> List[Dict[str, object]]:
     """Every forbidden effect in one scan.
 
     `scan`: the scope's processes, each {"pid", "role": "vm"|"net", "mem", "vm": the pid of the
     VM a network process serves, where known}. `view`: the placer's VM pids by ask token, None
-    for an ask it holds live without naming its process.
+    for an ask it holds live without naming its process. `scanned` False: the VMs run on machines
+    this scan doesn't see (a fleet's placer), so the unnamed asks are judged by the view alone.
     """
     procs = list(scan)
     out: List[Dict[str, object]] = []
@@ -122,7 +124,9 @@ def check(
             loose.append(int(p["pid"]))
         elif ask is None or ask.state not in HOLDS_VM:
             out.append(violation("leaked", pid=p["pid"], token=token, state=ask.state if ask else None))
-    if len(loose) > len(held_unnamed):
+    if not scanned:
+        pass
+    elif len(loose) > len(held_unnamed):
         out.append(violation("leaked", vms=sorted(loose), held=held_unnamed, by="count"))
     elif len(loose) < len(held_unnamed):
         out.append(violation("lost", vms=sorted(loose), held=held_unnamed, by="count"))
