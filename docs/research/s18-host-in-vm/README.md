@@ -415,6 +415,18 @@ JSON-RPC as `kiln reach mcp` does. So the runner serves the same server over tha
 - R05: `Link`, `Conn` and `Signals` each have two real callers, the socket and the lane, and no new
   wait or cache. R03: no number of its own; the watch's period is main's `REGISTRY_TTL`.
 
+- A lane connection that ends stops its runs, as a reach socket client that goes away stops its
+  own.
+
+| Where | What | Result |
+|---|---|---|
+| macOS 26.4 arm64, adas-mac-studio.local-2 (M3 Ultra), rustc 1.99.1, `CARGO_INCREMENTAL=0`, at 80cf5438f (part 3b on kiln main 36f46a0c2) | `cargo test --locked -p kiln --lib -- reach::mcp reach::told reach::local reach::tests::doors mcp:: step18 harness::isolated` | 91 passed, 2 failed: the new lane tests asked a lone node for its directory, which it answers "not connected to the kiln server" in its own words |
+| the same | `cargo clippy --locked -p kiln -p kiln-ci --all-targets -- -D warnings` | `large_enum_variant` on `Conn`: its in-process request is boxed now |
+| the same Mac, at 444f15ef0 (both fixed, the tests asking what a lone node answers itself) | the same test | 93 passed, 0 failed |
+| the same | the same clippy | passed (2 min 35 s) |
+
+Windows' build, clippy and tests of these (`reach::mcp` is built there now) are CI's on main.
+
 Owed:
 - Each `Execs::mcp(member)` connection handed to `serve_lane` on a thread of its own, at step 17's
   launch (`sandbox::microvm()`).
