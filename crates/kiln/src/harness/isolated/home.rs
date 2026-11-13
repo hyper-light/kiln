@@ -419,7 +419,7 @@ mod tests {
                 Adopted::Moved { from: old.join("user-u1").join("goose"), to: moved_to.clone() },
             ]
         );
-        assert_eq!(std::fs::read_to_string(moved_to.join("kept.txt"))?, "user:u1 goose");
+        assert_eq!(std::fs::read_to_string(moved_to.join("kept.txt"))?, "user-u1 goose");
         assert_eq!(std::fs::read_to_string(taken.join("kept.txt"))?, "kiln's own");
         assert_eq!(std::fs::read_to_string(old.join("owner").join("claude").join("kept.txt"))?, "owner claude", "the one kept stays where it was");
         assert!(adopt(state.path()).iter().all(|a| matches!(a, Adopted::Kept { .. })), "adopted once");
