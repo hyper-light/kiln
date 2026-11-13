@@ -441,6 +441,15 @@ mod waits {
         json!({"id": "s1", "status": status, "queued": 0, "tasks_running": 0, "runs": {"host": {"pid": 7}}, "starts": [{"at": 1, "runs": {"host": {"pid": 7}}}], "last_activity": 10})
     }
 
+    /// `v` with `key` set to `value`.
+    fn with(v: &Value, key: &str, value: Value) -> Value {
+        let mut v = v.clone();
+        if let Some(o) = v.as_object_mut() {
+            o.insert(key.to_owned(), value);
+        }
+        v
+    }
+
     fn user(seq: u64, client: &str, text: &str) -> Value {
         json!({"id": client, "seq": seq, "at": seq, "kind": "user", "text": text, "client_id": client})
     }
@@ -515,8 +524,7 @@ mod waits {
         assert_eq!(w.look(&word("running"), &line, None, false, s(10)), Verdict::Wait);
         assert_eq!(w.look(&word("running"), &line, None, false, s(21)), Verdict::Wait);
         // kiln's word moving is progress too (its queue, here).
-        let mut queued = word("running");
-        queued["queued"] = json!(1);
+        let queued = with(&word("running"), "queued", json!(1));
         assert_eq!(w.look(&queued, &line, None, false, s(30)), Verdict::Wait);
         assert_eq!(w.look(&queued, &line, None, false, s(41)), Verdict::Wait);
         assert_eq!(w.look(&queued, &line, None, false, s(42)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
@@ -543,34 +551,26 @@ mod waits {
     fn s35_a_wait_refuses_at_once_where_its_harness_is_gone_for_good() {
         let look = |info: &Value| Watch::new(Asked::Opening, None).look(info, &[], None, false, s(1));
         assert_eq!(look(&word("crashed")), Verdict::Refuse(Stall::Stuck(Stuck::Crashed)));
-        let mut refused = word("exited");
-        refused["exit"] = json!({"error": "Cursor isn't signed in", "at": 5});
+        let refused = with(&word("exited"), "exit", json!({"error": "Cursor isn't signed in", "at": 5}));
         assert_eq!(look(&refused), Verdict::Refuse(Stall::Stuck(Stuck::Refused { error: Some("Cursor isn't signed in".into()) })));
-        let mut ended = word("exited");
-        ended["runs"] = Value::Null;
-        ended["exit"] = json!({"code": 1, "at": 5, "again_at": 7});
+        let ended = with(&with(&word("exited"), "runs", Value::Null), "exit", json!({"code": 1, "at": 5, "again_at": 7}));
         assert_eq!(look(&ended), Verdict::Wait, "kiln starts it again by itself");
-        let mut never = ended.clone();
-        never["exit"] = json!({"code": 127, "error": "no such file", "at": 5});
-        never["starts"] = json!([]);
+        let never = with(&with(&ended, "exit", json!({"code": 127, "error": "no such file", "at": 5})), "starts", json!([]));
         assert_eq!(look(&never), Verdict::Refuse(Stall::Stuck(Stuck::Ended { code: Some(127), error: Some("no such file".into()) })));
         // Its end, then kiln's word on it: none yet, then one that set no restart.
         let mut w = Watch::new(Asked::Opening, None);
-        let mut gone = ended.clone();
-        gone["exit"] = json!({"code": 1, "at": 5});
+        let gone = with(&ended, "exit", json!({"code": 1, "at": 5}));
         assert_eq!(w.look(&gone, &[], None, false, s(1)), Verdict::Wait);
         assert_eq!(w.look(&gone, &[], None, false, s(2)), Verdict::Wait, "no word of kiln's since");
-        gone["last_activity"] = json!(11);
+        let gone = with(&gone, "last_activity", json!(11));
         assert_eq!(w.look(&gone, &[], None, false, s(3)), Verdict::Refuse(Stall::Stuck(Stuck::Ended { code: Some(1), error: None })));
         // An end of another time is a new one, decided on anew.
         let mut w = Watch::new(Asked::Opening, None);
         assert_eq!(w.look(&gone, &[], None, false, s(1)), Verdict::Wait);
-        gone["exit"] = json!({"code": 1, "at": 6});
-        gone["last_activity"] = json!(12);
+        let gone = with(&with(&gone, "exit", json!({"code": 1, "at": 6})), "last_activity", json!(12));
         assert_eq!(w.look(&gone, &[], None, false, s(2)), Verdict::Wait);
         // It waits for a person's answer, which a drive never gives.
-        let mut asks = word("waiting");
-        asks["approvals"] = json!([{"id": "a1", "title": "Run sleep 600"}]);
+        let asks = with(&word("waiting"), "approvals", json!([{"id": "a1", "title": "Run sleep 600"}]));
         assert_eq!(look(&asks), Verdict::Refuse(Stall::Stuck(Stuck::Asks(vec!["Run sleep 600".into()]))));
         // kiln's own work has none of these: it is judged by progress alone.
         assert_eq!(Watch::new(Asked::Kiln, None).look(&word("crashed"), &[], None, false, s(1)), Verdict::Wait);
@@ -594,8 +594,7 @@ mod waits {
         assert_eq!(wait(&idle, Some(&json!({"delivery": {"m": "completed", "k": "started"}, "queue": []}))), Verdict::Wait, "another under way");
         assert_eq!(wait(&idle, Some(&json!({"delivery": {"m": "completed"}, "queue": [{"id": "k"}]}))), Verdict::Wait, "kiln's queue holds one");
         for (key, value) in [("queued", json!(1)), ("room_wait", json!(5)), ("pause", json!({"why": "limit"})), ("last_turn", json!({"at": 3, "how": "cut"}))] {
-            let mut held = idle.clone();
-            held[key] = value;
+            let held = with(&idle, key, value);
             assert!(!Watch::new(Asked::Message("m"), None).wants_state(&held, &events), "{key}");
         }
         assert!(!w.wants_state(&word("running"), &events));
