@@ -14,7 +14,7 @@ use hex_api::capacity::sim::SimView;
 use hex_api::capacity::{self as hex, Budget, CapacityView, Held, Host, ReservationId, ToHolder, ToKeeper};
 
 use super::ask::{Ask, Peer, Sample};
-use super::holder::{BoxName, Event, Holding, Link, Out, Paired};
+use super::holder::{BoxName, Event, Holding, Link, Numbering, Out, Paired};
 use super::keeper::{Keeper, NotGranted, Unsynced, View, WaitEnded};
 use super::msg::{Reason, ToOwner};
 use super::runner::{Admission, Init, Records, Said, Settings, Start};
@@ -435,6 +435,22 @@ fn holder_refusals_are_typed_and_a_run_asking_nothing_reserves_nothing() -> Resu
     let events = talk(&mut keeper, 1, &mut h, said(vec![word]), 7)?;
     assert_eq!(not_granted(&events, gpu), Some(NotGranted::Devices), "{events:?}");
     assert!(books(&keeper, "runner-1")?.is_empty());
+    Ok(())
+}
+
+/// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 (#73 part 7 slice 2): a holding numbered by its process's
+/// shared numbering and a sandbox naming a box through that numbering never give two boxes one name; a numbering of
+/// another epoch's isn't taken (it names another process's boxes).
+#[test]
+fn s17_p7_a_holding_and_its_processs_sandbox_share_one_numbering() -> Result<(), String> {
+    let shared = Numbering::new(7);
+    let mut h = holding("runner-1", 7, &[])?.numbered_by(shared.clone());
+    let names = [h.unreserved(), shared.next(), h.unreserved(), shared.clone().next()];
+    let want: Vec<BoxName> = (0..4).map(|n| BoxName::Unreserved { epoch: 7, n }).collect();
+    assert_eq!(names.to_vec(), want);
+    let mut other = holding("runner-1", 7, &[])?.numbered_by(Numbering::new(8));
+    assert_eq!(other.unreserved(), BoxName::Unreserved { epoch: 7, n: 0 }, "another epoch's numbering taken");
+    assert_eq!(Numbering::new(8).next(), BoxName::Unreserved { epoch: 8, n: 0 });
     Ok(())
 }
 

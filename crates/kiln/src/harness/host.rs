@@ -1020,11 +1020,10 @@ impl Host {
         self.microvm.lock().clone()
     }
 
-    /// Holds isolated agents' harnesses in `vms` from now on: a test's stand-in for the machine's
-    /// microVMs.
-    #[cfg(test)]
-    pub fn hold_isolated_in(&self, vms: crate::sandbox::Microvms) {
-        *self.microvm.lock() = Some(Arc::new(vms));
+    /// Holds isolated agents' harnesses in `vms` from now on: the machine's microVMs as its runner holds them
+    /// (`crate::sandbox::hold`, through Hex), or a test's stand-in.
+    pub fn hold_isolated_in(&self, vms: impl Into<Arc<crate::sandbox::Microvms>>) {
+        *self.microvm.lock() = Some(vms.into());
     }
 
     /// Takes no messages (`on`), or takes them again: a new build that takes its sessions over from
@@ -5119,6 +5118,10 @@ while True:
             assert_eq!((launch.program.as_str(), &launch.boundary, launch.folder.as_deref()), ("claude", &Boundary::MicroVm { image: pinned.clone() }, Some(cwd.as_str())));
             assert!(pinned.starts_with("harness-claude@sha256:"), "kiln's image for Claude Code, pinned by its digest: {pinned}");
             assert!(launch.args.iter().any(|a| a == "--session-id"), "its session's own flags, past its image's: {:?}", launch.args);
+            // Step 18's launch pieces: kiln's variables as a microVM's member gets them, and kiln's MCP through its lane's bridge.
+            assert!(launch.env.contains(&("KILN_AGENT".to_owned(), "isolated".to_owned())), "its mark: {:?}", launch.env);
+            let mcp = launch.args.iter().position(|a| a == "--mcp-config").and_then(|i| launch.args.get(i + 1));
+            assert!(mcp.is_some_and(|c| c.contains(crate::harness::isolated::mcp::BRIDGE)), "kiln's MCP through its bridge: {:?}", launch.args);
             // Where it runs, on its info (step 34's checks read it): its microVM by name, its image pinned,
             // no host pid, said so, and the link its stdio rides, both ends' words once it's made.
             until_it("its link, said", 60, || matches!(s.info().runs, Some(session::Runs::Microvm { control: Some(_), .. }))).await?;

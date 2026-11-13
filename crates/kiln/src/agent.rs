@@ -1745,7 +1745,8 @@ fn gone_here(session: &str, moved: &std::collections::HashSet<crate::instances::
 /// A runner's harness host: its records in its own folder (`own_dir`, its instance's where it runs as
 /// one: `upgrade::own_dir`, which an upgrade replaces), and its people's volumes beneath kiln's state
 /// (`state_dir`), which outlives every instance; those an instance kept in its own folder first moved
-/// there, each said (`isolated::home::adopt`).
+/// there, each said (`isolated::home::adopt`). Its isolated agents run in its machine's microVMs, where this kiln
+/// carries them (`sandbox::hold`).
 fn harness_host(sink: impl Into<crate::harness::session::Sink>, state_dir: &std::path::Path, own_dir: &std::path::Path, limits: crate::harness::host::Limits) -> Arc<crate::harness::host::Host> {
     use crate::harness::isolated::home::{self, Adopted};
     let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), limits);
@@ -1757,6 +1758,16 @@ fn harness_host(sink: impl Into<crate::harness::session::Sink>, state_dir: &std:
         }
     }
     h.keep_homes(home::root(state_dir));
+    // Its isolated agents' harnesses in microVMs of their own through Hex, where this kiln carries Shards (kiln plan
+    // 01a1cd8e862e7169a074db3d5fa33f3d step 17, #73 part 7): written out and held beneath kiln's state. A unit test's
+    // runner writes none out.
+    if cfg!(not(test)) {
+        match crate::sandbox::hold(state_dir) {
+            Ok(Some(vms)) => h.hold_isolated_in(vms),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's microVMs couldn't be held: it holds no isolated agent"),
+        }
+    }
     h
 }
 

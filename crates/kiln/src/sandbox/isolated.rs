@@ -88,15 +88,29 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
     })
 }
 
-/// Starts `kind`'s harness for isolated `spec` in the machine's microVMs `vms`: what its microVM
-/// reaches of its image's destinations ([`reach_of`], read from its person's home under `homes`, the
-/// machine's), its image pinned by its digest (`image::Images::pinned`, built where their store holds
-/// none of its content), then its member's run as the `Duplex` its session drives
-/// (`crate::proc::duplex_of_run`); or why not, in the images' or the sandbox's own words. What its
-/// launch takes of the session is checked before anything is built.
-pub async fn launch(kind: &Kind, spec: &Spec, vms: &Microvms, homes: Option<&std::path::Path>) -> anyhow::Result<crate::proc::Duplex> {
+/// Starts `kind`'s harness for session `session`'s isolated `spec` in the machine's microVMs `vms`:
+/// what its microVM reaches of its image's destinations ([`reach_of`], read from its person's home
+/// under `homes`, the machine's), its image pinned by its digest (`image::Images::pinned`, built
+/// where their store holds none of its content), then its member's run as the `Duplex` its session
+/// drives (`crate::proc::duplex_of_run`), in the box placement holds for it (`Holder::box_of`, else
+/// placement's numbering); or why not, in the images' or the sandbox's own words. What its launch
+/// takes of the session is checked before anything is built: a project that builds with its host's
+/// own tools is refused (step 18, `host_tools`). Its harness gets kiln's variables as a microVM's
+/// member does (`isolated::env::member_env`) and kiln's MCP through its link's lane ([`offer_mcp`]).
+pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>) -> anyhow::Result<crate::proc::Duplex> {
+    use crate::harness::isolated::{env, host_tools};
     let source = source_of(kind, spec).map_err(anyhow::Error::msg)?;
     let mut launch = launch_of(kind, spec, source.name())?;
+    let folder = launch.folder.clone().unwrap_or_default();
+    let files = crate::rt::blocking(move || host_tools::tracked(std::path::Path::new(&folder))).await?;
+    host_tools::check(files.iter().map(String::as_str))?;
+    for (k, v) in env::member_env(session, kind) {
+        if !launch.env.iter().any(|(e, _)| *e == k) {
+            launch.env.push((k, v));
+        }
+    }
+    let person = spec.isolation.as_ref().and_then(|i| i.person.clone());
+    offer_mcp(kind, &source, person.as_deref(), homes, &mut launch.args).await;
     let reach = match source {
         Source::Kept { .. } => Reach::Whole { why: Whole::PersonsOwn },
         Source::Builtin(b) => {
@@ -113,8 +127,51 @@ pub async fn launch(kind: &Kind, spec: &Spec, vms: &Microvms, homes: Option<&std
     launch.egress = egress_of(&reach, granted(text).ok().flatten());
     let image = vms.images.pinned(source).await.map_err(|r| anyhow::anyhow!("{}'s image, {}: {r}", kind.name, source.name()))?;
     launch.boundary = Boundary::MicroVm { image: image.clone() };
-    let run = vms.sandbox.launch(launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
+    let name = match (&spec.claim, crate::reach::node::global()) {
+        (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
+        _ => None,
+    };
+    let run = vms.launch(name, launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
     Ok(crate::proc::duplex_of_run(run, image, reach))
+}
+
+/// kiln's MCP for `kind`'s harness in its microVM, through its link's `mcp` lane's bridge (step 18,
+/// `crate::harness::isolated::mcp`): its command line's form added to `args`; Antigravity's entry put
+/// in its own config in its person's volume under `homes` (the only place agy reads one from, kept as
+/// agy keeps it: `mcp::agy_config`), for kiln's own Agentfile, whose volumes kiln keeps; an ACP
+/// agent's is given at its `session/new` (`kinds::acp_servers`). A config that couldn't be written
+/// starts it without kiln's MCP, said, as on its machine (`Kind::prepare`).
+async fn offer_mcp(kind: &Kind, source: &Source<'_>, person: Option<&str>, homes: Option<&std::path::Path>, args: &mut Vec<String>) {
+    use crate::harness::isolated::{home, mcp};
+    match mcp::for_harness(kind) {
+        mcp::Config::Args(more) => args.extend(more),
+        mcp::Config::Shared(_) => {
+            let (Source::Builtin(b), Some(person), Some(root)) = (source, person, homes) else { return };
+            let (b, person, root) = (*b, person.to_owned(), root.to_path_buf());
+            let put = crate::rt::blocking(move || -> anyhow::Result<()> {
+                let (volumes, image_env) = home::of_builtin(b);
+                let layout = home::Layout::new(&root, &person, b.harness, &volumes, &image_env)?;
+                let guest = format!("{}/.gemini/config/mcp_config.json", layout.guest_home().trim_end_matches('/'));
+                let at = layout.host_of(&guest).ok_or_else(|| anyhow::anyhow!("{guest} isn't a path in its microVM"))?;
+                let config = match std::fs::read(&at) {
+                    Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Bool(false)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+                    Err(e) => return Err(anyhow::anyhow!("{}: {e}", at.display())),
+                };
+                if let Some(next) = mcp::agy_config(&config) {
+                    if let Some(dir) = at.parent() {
+                        std::fs::create_dir_all(dir)?;
+                    }
+                    std::fs::write(&at, serde_json::to_vec_pretty(&next)?)?;
+                }
+                Ok(())
+            });
+            if let Err(e) = put.await.and_then(|r| r) {
+                tracing::warn!(harness = kind.id, error = %format!("{e:#}"), "kiln's MCP couldn't be put in its config: it starts without it");
+            }
+        }
+        mcp::Config::Acp(_) | mcp::Config::Refused(_) => {}
+    }
 }
 
 /// What a run of kiln's Agentfile `b` reaches of its image's destinations (`super::narrow`): its

@@ -6,8 +6,9 @@
 //!   refuses them typed.
 //! - The machine's microVMs ([`microvm`]): an isolated agent's harness runs as a member of its
 //!   Agentfile's image in a microVM of its own (Shards' D231), through Hex; its stdio are the
-//!   member's streams. This kiln carries their runtime once step 16's Shards and Hex are wired in;
-//!   until then a machine holds no isolated agent, and refuses one rather than run it as a process.
+//!   member's streams. A kiln that carries Shards holds them ([`hold`]: Hex's image runtime under
+//!   kiln's state, [`hexvm`]); one that carries none holds no isolated agent, and refuses one rather
+//!   than run it as a process.
 //! - [`isolated`]: an isolated session's launch, its image, and what it can't do yet.
 //! - [`narrow`]: what its microVM reaches past it, of what its image grants: its session's own
 //!   provider's or sign-in's destinations alone, else its image's whole and why.
@@ -42,25 +43,70 @@ pub struct Microvms {
     pub images: image::Images,
     /// The sandbox as Hex's, where it is: what launches a run in the box placement named for it.
     pub hex: Option<Arc<hexvm::HexVms>>,
+    /// The carried Shards they run, written out and held as long as they are (`crate::shards::write_out`).
+    shards: Option<crate::shards::Held>,
 }
 
 impl Microvms {
     /// Runs in `sandbox`, booting `images`: a stand-in's, launched as the seam launches.
     pub fn new(sandbox: Arc<dyn Sandbox>, images: image::Images) -> Self {
-        Self { sandbox, images, hex: None }
+        Self { sandbox, images, hex: None, shards: None }
+    }
+
+    /// `launch` in a microVM of its own: in box `name` where placement named one for its run (its reservation's,
+    /// `Holder::box_of`) and its sandbox is Hex's; else named as its sandbox names one (placement's numbering).
+    pub async fn launch(&self, name: Option<kiln_ci::place::holder::BoxName>, launch: kiln_seams::sandbox::Launch) -> Result<Box<dyn Run>, Refusal> {
+        match (&self.hex, name) {
+            (Some(hex), Some(name)) => hex.launch_as(name, launch).await,
+            _ => self.sandbox.launch(launch).await,
+        }
     }
 }
 
-/// The machine's microVMs held under kiln's `state` through Hex, the carried `shards` (`shards`) running them.
-pub fn held_in(_state: &std::path::Path, _shards: std::path::PathBuf) -> anyhow::Result<Microvms> {
-    anyhow::bail!("{NO_MICROVM}")
+/// The machine's microVMs held under kiln's `state` through Hex, the carried `shards` (`shards`) running them
+/// (#73 part 7): Hex's image runtime, its boxes' records in `<state>/hex-records`, Shards' home and cache beneath
+/// kiln's state ([`shards_home`], `<state>/shards-cache`), its images built there (in `<state>/shards-builds`), each
+/// launch's box named by placement's numbering ([`box_name`]). Nothing boots until a launch.
+pub fn held_in(state: &std::path::Path, shards: std::path::PathBuf) -> anyhow::Result<Microvms> {
+    let state = std::path::absolute(state)?;
+    let paths = shards_api::RuntimePaths::new(state.join("shards-cache"), shards_home(&state)).map_err(|r| anyhow::anyhow!("Shards' home and cache beneath {}: {r:?}", state.display()))?;
+    let runtime = hex_node::images::ImageRuntime::new(shards.clone(), paths, &state.join("hex-records")).map_err(|r| anyhow::anyhow!("Hex's image runtime under {}: {r}", state.display()))?;
+    let hex = Arc::new(hexvm::HexVms::new(runtime, box_name));
+    let images = image::Images::new(shards, shards_home(&state), state.join("shards-builds"));
+    Ok(Microvms { sandbox: Arc::clone(&hex) as Arc<dyn Sandbox>, images, hex: Some(hex), shards: None })
 }
 
-/// The microVMs this machine holds isolated agents' harnesses in: none until this kiln carries their
-/// runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16's Shards and Hex, wired here by step
-/// 17's next slice).
+/// The name of a launch's box no start here named: placement's numbering of this process's boxes that reserve nothing
+/// (`reach::node::Handle::unreserved_box`, its holding's own where it holds through a keeper); none where placement
+/// isn't running.
+fn box_name() -> Option<kiln_ci::place::holder::BoxName> {
+    crate::reach::node::global().map(crate::reach::node::Handle::unreserved_box)
+}
+
+/// The microVMs this process holds, once [`hold`] held them.
+static HELD: std::sync::OnceLock<Arc<Microvms>> = std::sync::OnceLock::new();
+
+/// The microVMs this machine holds isolated agents' harnesses in: those [`hold`] held, where this kiln carries their
+/// runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 16 and 17); else none.
 pub fn microvm() -> Option<Arc<Microvms>> {
-    None
+    HELD.get().cloned()
+}
+
+/// This machine's microVMs, held under kiln's `state` from now on, where this kiln carries Shards: it written out
+/// beneath `state` (`crate::shards::write_out`) and held, then [`held_in`]. None where it carries none. The first
+/// held is this process's ([`microvm`], its facts' `virt.microvm`).
+pub fn hold(state: &std::path::Path) -> anyhow::Result<Option<Arc<Microvms>>> {
+    if let Some(held) = HELD.get() {
+        return Ok(Some(Arc::clone(held)));
+    }
+    if !crate::shards::carried() {
+        return Ok(None);
+    }
+    let shards = crate::shards::write_out(state)?;
+    let mut vms = held_in(state, shards.shards.clone())?;
+    vms.shards = Some(shards);
+    let vms = Arc::new(vms);
+    Ok(Some(Arc::clone(HELD.get_or_init(|| vms))))
 }
 
 /// Where a runner keeps its microVMs' Shards home (`SHARDS_HOME`: the store their images are built

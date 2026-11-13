@@ -48,13 +48,18 @@ pub struct HexVms {
     /// Hex's runtime. Shared, as Hex hands it out: `hex_node::images::ImageRuntime::new` answers an `Arc` (its books
     /// hold a weak reference to it), and each run holds a clone for its box's delete, which outlives any borrow.
     runtime: Arc<dyn Runtime>,
-    /// Names the box of a launch the seam names none for: placement's numbering (module docs).
-    names: Box<dyn Fn() -> BoxName + Send + Sync>,
+    /// Names the box of a launch the seam names none for: placement's numbering (module docs); none where no
+    /// placement runs to number it.
+    names: Box<dyn Fn() -> Option<BoxName> + Send + Sync>,
 }
 
+/// Why a launch with no box named is refused where no placement numbers one.
+pub const UNNAMED: &str = "a microVM whose box no placement here names: kiln's placement isn't running on this machine";
+
 impl HexVms {
-    /// Over Hex's runtime `runtime`, naming each launch's box with `names`.
-    pub fn new(runtime: Arc<dyn Runtime>, names: impl Fn() -> BoxName + Send + Sync + 'static) -> Self {
+    /// Over Hex's runtime `runtime`, naming each launch's box with `names`, which answers none where nothing numbers
+    /// one (a launch then refused).
+    pub fn new(runtime: Arc<dyn Runtime>, names: impl Fn() -> Option<BoxName> + Send + Sync + 'static) -> Self {
         Self { runtime, names: Box::new(names) }
     }
 
@@ -83,7 +88,10 @@ impl HexVms {
 
 impl Sandbox for HexVms {
     fn launch<'a>(&'a self, launch: Launch) -> BoxFuture<'a, Result<Box<dyn Run>, Refusal>> {
-        Box::pin(self.launch_as((self.names)(), launch))
+        match (self.names)() {
+            Some(name) => Box::pin(self.launch_as(name, launch)),
+            None => Box::pin(async { Err(Refusal::Unsupported(UNNAMED.into())) }),
+        }
     }
 
     fn boundaries(&self) -> Vec<&'static str> {
@@ -444,7 +452,7 @@ mod tests {
     fn vms() -> (Arc<SimRuntime>, HexVms) {
         let sim = Arc::new(SimRuntime::new());
         let n = AtomicU64::new(0);
-        let vms = HexVms::new(Arc::<SimRuntime>::clone(&sim), move || BoxName::Unreserved { epoch: 7, n: n.fetch_add(1, Ordering::Relaxed) });
+        let vms = HexVms::new(Arc::<SimRuntime>::clone(&sim), move || Some(BoxName::Unreserved { epoch: 7, n: n.fetch_add(1, Ordering::Relaxed) }));
         (sim, vms)
     }
 

@@ -315,6 +315,8 @@ pub enum Local {
     SessionEnded { claim: super::place::Claim },
     /// What this runner's admission holds, for a view (JSON).
     PlaceView { reply: oneshot::Sender<Value> },
+    /// The box an agent session placed here under `claim` runs as (`Handle::box_of`).
+    BoxOf { claim: super::place::Claim, reply: oneshot::Sender<Option<kiln_ci::place::holder::BoxName>> },
 }
 
 /// How the agent and local tools reach the node. What the network and the node's own runs say
@@ -333,6 +335,8 @@ pub struct Handle {
     dir: PathBuf,
     /// kiln's root, for what other runners sign (docs/ci.md W27-R08).
     root: Arc<Vec<u8>>,
+    /// Placement's numbering of this process's boxes that reserve nothing (`Placer::numbering`).
+    boxes: kiln_ci::place::holder::Numbering,
 }
 
 static GLOBAL: std::sync::OnceLock<Handle> = std::sync::OnceLock::new();
@@ -413,6 +417,19 @@ impl Handle {
     /// `super::place::vm_group`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
     pub async fn session_started(&self, claim: super::place::Claim, at: Option<super::place::Group>) -> anyhow::Result<bool> {
         self.ask(|reply| Local::SessionStarted { claim, at, reply }).await
+    }
+
+    /// The box an agent session placed here under `claim` runs as, as its machine's keeper pairs it
+    /// (`Placer::box_of`: its reservation's, or one numbered for it as it started): None where no keeper is named, or
+    /// its start isn't held here (yet).
+    pub async fn box_of(&self, claim: super::place::Claim) -> Option<kiln_ci::place::holder::BoxName> {
+        self.ask(|reply| Local::BoxOf { claim, reply }).await.ok().flatten()
+    }
+
+    /// The next name of a box of this process's that no start here named: placement's own numbering
+    /// (`Placer::numbering`), so it's never another box's.
+    pub fn unreserved_box(&self) -> kiln_ci::place::holder::BoxName {
+        self.boxes.next()
     }
 
     /// An agent session placed here under `claim` ended: its room is free.
@@ -807,6 +824,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         root: Arc::clone(&root),
         keeper: Keeping::default(),
     };
+    let boxes = node.place.numbering();
     let busy = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&busy);
     // Kept open by the node itself, so local tools going away never ends it.
@@ -844,7 +862,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
             counted.store(node.busy(), Ordering::Relaxed);
         }
     });
-    Ok((Handle { net: net_tx, tx, announce, busy, name: node_name, dir, root }, out_rx))
+    Ok((Handle { net: net_tx, tx, announce, busy, name: node_name, dir, root, boxes }, out_rx))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3085,6 +3103,9 @@ impl Node {
                     None => self.keeper.sessions.entry((claim.owner, claim.epoch, claim.run)).or_default().push(reply),
                 }
                 self.place_do(outs).await;
+            }
+            Local::BoxOf { claim, reply } => {
+                let _ = reply.send(self.place.box_of(&claim.owner, claim.epoch, &claim.run));
             }
             Local::SessionEnded { claim } => {
                 let outs = self.place.session_ended(&claim, crate::util::now_ms());

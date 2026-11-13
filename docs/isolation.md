@@ -135,9 +135,15 @@ refuses an isolated start on a runner that says no, in the runner's own words.
 The machine's microVMs are a `Sandbox` implementation of their own (`sandbox::microvm`): Shards' image
 boot (its D231) of the member, through Hex, its stdio carried on Shards' own member streams
 (`shards-api`'s image channel with member stdin, version 6, Shards e7825cb3) until the agent-control
-endpoint (step 11) carries them over hyper-transport. Until this kiln carries that runtime (step 16
-vendors Shards and Hex), `sandbox::microvm` is none, every machine says it holds no isolated agent,
-and the launch is held by the conformance suite and a stand-in alone (below).
+endpoint (step 11) carries them over hyper-transport. A runner whose kiln carries Shards (`shards::carried`)
+holds them as it starts (`sandbox::hold`): the carried `shards` written out beneath kiln's state, Hex's image runtime
+over it (`hex_node::images::ImageRuntime`, its records in `<state>/hex-records`, Shards' home and cache beneath the
+state), and `sandbox::hexvm::HexVms` as the runner's sandbox; its facts then say `virt.microvm`. Each launch's box is
+the one placement holds for its session (`Holder::box_of`), else the next of placement's own numbering of boxes that
+reserve nothing (`kiln-z…`, shared with its holding), so no two share a name. A launch adds kiln's variables
+(`isolated::env::member_env`) and kiln's MCP through the link's bridge (`isolated::mcp`), and refuses a project built
+with its host's own tools (`isolated::host_tools`). A kiln that carries no Shards holds no isolated agent, and the
+launch is held by the conformance suite and a stand-in alone (below).
 
 Owed, each with whose it is:
 
