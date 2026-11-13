@@ -475,10 +475,7 @@ mod tests {
 
     /// A kiln whose server is `kiln.example.test`, and 10.1.2.3 among its certificate's names.
     fn kiln() -> Kiln {
-        let mut server = crate::config::Server::default();
-        server.public_url = "https://kiln.example.test/".into();
-        server.tls_names = vec!["10.1.2.3".into()];
-        Kiln::of(&server)
+        Kiln::of(&crate::config::Server { public_url: "https://kiln.example.test/".into(), tls_names: vec!["10.1.2.3".into()], ..crate::config::Server::default() })
     }
 
     /// An agent's network out to `grant`, its boundary open on 443 and 7070, and a remote MCP server
@@ -535,13 +532,15 @@ mod tests {
     /// names and addresses are kiln whatever the configuration.
     #[test]
     fn step18_kiln_is_what_its_configuration_names() -> anyhow::Result<()> {
-        let mut server = crate::config::Server::default();
-        server.public_url = "https://user@Kiln.Example.test:8443/x".into();
-        server.pages_url = Some("https://pages.example.test".into());
-        server.quic_advertise = "[2001:db8::7]:7071".into();
-        server.http_addr = "0.0.0.0:7070".into();
-        server.quic_addr = "192.0.2.10:7071".into();
-        server.tls_names = vec!["kiln.lan".into(), "198.51.100.4".into()];
+        let server = crate::config::Server {
+            public_url: "https://user@Kiln.Example.test:8443/x".into(),
+            pages_url: Some("https://pages.example.test".into()),
+            quic_advertise: "[2001:db8::7]:7071".into(),
+            http_addr: "0.0.0.0:7070".into(),
+            quic_addr: "192.0.2.10:7071".into(),
+            tls_names: vec!["kiln.lan".into(), "198.51.100.4".into()],
+            ..crate::config::Server::default()
+        };
         let k = Kiln::of(&server);
         for host in ["kiln.example.test", "KILN.EXAMPLE.TEST", "pages.example.test", "kiln.lan", "2001:db8::7", "[2001:db8::7]", "192.0.2.10", "198.51.100.4"] {
             anyhow::ensure!(k.itself(host, &[]) == Some(Itself::Server), "{host}: {k:?}");
