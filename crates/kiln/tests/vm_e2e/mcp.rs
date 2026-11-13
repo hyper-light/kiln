@@ -4,7 +4,7 @@
 //! `agents_start` taking the conversation up again (`resume`), as a person's or an agent's MCP client
 //! drives them. A part of `step35.rs`.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -63,10 +63,11 @@ pub fn drive(f: &Fixture, kind: &str, image: &str, project: &str) -> anyhow::Res
     let prompt = vm_e2e::task("VM_E2E_PROMPT", kind, &n, format!("do the task {n}"));
     let what = format!("{kind} from {image} through kiln's MCP");
     let done = |i: &Value, e: &[Value]| vm_e2e::status(i) == "idle" && vm_e2e::said_marker(&vm_e2e::said(e), &marker);
+    let mut pace = vm_e2e::Pace::default();
 
     // Start, naming its Agentfile and the runner that starts microVMs.
     let id = started(&call(f, "agents_start", json!({"kind": kind, "on": f.machine, "cwd": project, "prompt": prompt, "image": image}))?)?;
-    let (info, _) = vm_e2e::until(f, &id, vm_e2e::turn_within(), &format!("{what}: its first turn"), done)?;
+    let (info, _) = pace.until(f, &id, vm_e2e::Asked::Opening, &format!("{what}: its first turn"), done)?;
     anyhow::ensure!(
         info.pointer("/isolation/kind").and_then(Value::as_str) == Some("microvm") && info.pointer("/isolation/image").and_then(Value::as_str) == Some(image),
         "{what}: kiln holds it as {}",
@@ -78,9 +79,9 @@ pub fn drive(f: &Fixture, kind: &str, image: &str, project: &str) -> anyhow::Res
     // Its words carry the drive's own, whoever's they are, so its delivery is told from any other.
     let long_text = format!("{} {long}", vm_e2e::task("VM_E2E_STEERED_PROMPT", kind, &n, vm_e2e::stub_steered_turn()));
     call(f, "agents_send", json!({"agent": id, "text": long_text, "mode": "queue"}))?;
-    vm_e2e::until(f, &id, vm_e2e::turn_within(), &format!("{what}: its long turn under way"), |i, e| under_way(i, e, &long))?;
+    pace.until(f, &id, vm_e2e::Asked::Message(&long), &format!("{what}: its long turn under way"), |i, e| under_way(i, e, &long))?;
     call(f, "agents_send", json!({"agent": id, "text": steer, "mode": "steer"}))?;
-    vm_e2e::until(f, &id, vm_e2e::turn_within(), &format!("{what}: answering what was steered in"), |i, e| {
+    pace.until(f, &id, vm_e2e::Asked::Steered(&steer), &format!("{what}: answering what was steered in"), |i, e| {
         vm_e2e::status(i) == "idle" && (!stub || vm_e2e::said(e).iter().any(|l| (l.starts_with("STEERED ") || l.starts_with("HEARD ")) && l.contains(&steer)))
     })?;
 
@@ -88,25 +89,21 @@ pub fn drive(f: &Fixture, kind: &str, image: &str, project: &str) -> anyhow::Res
     let stop_me = format!("stop-{n}");
     let stop_text = format!("{} {stop_me}", vm_e2e::task("VM_E2E_STOPPED_PROMPT", kind, &n, vm_e2e::stub_stopped_turn()));
     call(f, "agents_send", json!({"agent": id, "text": stop_text, "mode": "queue"}))?;
-    vm_e2e::until(f, &id, vm_e2e::turn_within(), &format!("{what}: its turn to stop under way"), |i, e| under_way(i, e, &stop_me))?;
+    pace.until(f, &id, vm_e2e::Asked::Message(&stop_me), &format!("{what}: its turn to stop under way"), |i, e| under_way(i, e, &stop_me))?;
     call(f, "agents_interrupt", json!({"agent": id}))?;
-    let (_, e) = vm_e2e::until(f, &id, vm_e2e::turn_within(), &format!("{what}: stopping its turn"), |i, _| vm_e2e::status(i) == "idle")?;
+    let (_, e) = pace.until(f, &id, vm_e2e::Asked::Stop { said: None }, &format!("{what}: stopping its turn"), |i, _| vm_e2e::status(i) == "idle")?;
     anyhow::ensure!(!stub || !vm_e2e::said_marker(&said_after(&e, &stop_me), &marker), "{what}: the interrupted turn ran to its end");
 
     // Stop: ended for good, its conversation kept to take up again.
     let hs = vm_e2e::info(f, &id)?.get("harness_session").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("{what}: kiln knows no harness session of {id}"))?;
     let ended = call(f, "agents_stop", json!({"agent": id}))?;
     anyhow::ensure!(ended.get("ended").and_then(Value::as_array).is_some_and(|a| a.iter().any(|x| x.as_str() == Some(id.as_str()))), "{what}: agents_stop said {ended}");
-    let deadline = Instant::now() + vm_e2e::turn_within();
-    while crate::common::http(f.port, "GET", &format!("/api/harness/sessions/{id}"), &f.admin, None)?.0 != 404 {
-        anyhow::ensure!(Instant::now() < deadline, "{what}: {id} still listed a turn's time after agents_stop");
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    }
+    pace.unlisted(f, &id, &format!("{what}: {id} still listed after agents_stop"))?;
 
     // Resume: a new agent takes the conversation up again, in a microVM from the same Agentfile.
     let again = vm_e2e::task("VM_E2E_RESUMED_PROMPT", kind, &n, format!("do the task again {n}"));
     let resumed = started(&call(f, "agents_start", json!({"kind": kind, "on": f.machine, "cwd": project, "prompt": again, "image": image, "resume": hs}))?)?;
-    let (i, _) = vm_e2e::until(f, &resumed, vm_e2e::turn_within(), &format!("{what}: taking its conversation up again"), done)?;
+    let (i, _) = pace.until(f, &resumed, vm_e2e::Asked::Opening, &format!("{what}: taking its conversation up again"), done)?;
     anyhow::ensure!(i.get("harness_session").and_then(Value::as_str) == Some(hs.as_str()), "{what}: the resumed agent's harness session is {}, not {hs}", i.get("harness_session").unwrap_or(&Value::Null));
     anyhow::ensure!(i.pointer("/isolation/image").and_then(Value::as_str) == Some(image), "{what}: resumed outside its Agentfile: {}", i.get("isolation").unwrap_or(&Value::Null));
     call(f, "agents_stop", json!({"agent": resumed}))?;
