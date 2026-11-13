@@ -1510,18 +1510,19 @@ impl Node {
                     self.send_or_queue(&peer, Ask::Place { json }).await;
                 }
                 Out::Say { peer, json } => {
-                    use crate::proto::feature::{PLACE, PLACE_HEALTH, PLACE_TOKENS, speaks};
+                    use crate::proto::feature::{PLACE, PLACE_HEALTH, PLACE_KEEPER, PLACE_TOKENS, speaks};
                     // To the owner's session that speaks placement, on its link.
-                    let link = self.served.iter().filter(|((p, _), s)| *p == peer && speaks(&s.features, PLACE)).find_map(|(_, s)| s.link.clone().map(|l| (l, speaks(&s.features, PLACE_HEALTH), speaks(&s.features, PLACE_TOKENS))));
+                    let link = self.served.iter().filter(|((p, _), s)| *p == peer && speaks(&s.features, PLACE)).find_map(|(_, s)| s.link.clone().map(|l| (l, speaks(&s.features, PLACE_HEALTH), speaks(&s.features, PLACE_TOKENS), speaks(&s.features, PLACE_KEEPER))));
                     match link {
                         // A runner's word to an owner alone under room tokens goes only to an
                         // owner whose link named them (docs/lb.md "Room tokens"; LB08).
-                        Some((_, _, false)) if super::place::tokens_word(&json) => {
+                        Some((_, _, false, _)) if super::place::tokens_word(&json) => {
                             tracing::debug!(%peer, "a word of room tokens for an owner whose link didn't name them: not said");
                         }
-                        Some((link, health, _)) => {
-                            // An owner from before health's words reads them as draining (L1, L2).
-                            let json = if health { json } else { super::place::for_older_owner(json) };
+                        Some((link, health, _, keeper)) => {
+                            // An owner from before health's words reads them as draining (L1, L2),
+                            // and one from before the keeper's reads its word as one it knows (CV11).
+                            let json = super::place::for_owner(json, health, keeper);
                             self.say_on(&link, &Say::Place { json }).await;
                         }
                         None => tracing::debug!(%peer, "a placement word for an owner with no link: it hears where its runs stand when it's back"),

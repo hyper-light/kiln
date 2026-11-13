@@ -492,6 +492,12 @@ pub enum Reason {
     /// (AUDIT L2: its work volume ran full, a run was killed for memory, a tool wasn't found, its
     /// device's errors rose; `cause` as `sense::health` names it, `why` in words). Appended.
     Barred { cause: String, why: String },
+    /// The runner's machine has a capacity keeper (Hex's node keeps its room, kiln's runs hold room
+    /// there through it: docs/lb.md "A machine's keeper") and the runner holds no synced session
+    /// with it (`why`): it takes nothing new there until it does (Hex's capacity-view.md CV11).
+    /// Appended: an owner from before reads it as `Strained` where it reads health's words, else as
+    /// `Draining`.
+    Unsynced { why: String },
 }
 
 impl Reason {
@@ -507,6 +513,7 @@ impl Reason {
             Reason::Away => (5, None),
             Reason::Strained { .. } => (6, None),
             Reason::Barred { .. } => (7, None),
+            Reason::Unsynced { .. } => (8, None),
         }
     }
 }
