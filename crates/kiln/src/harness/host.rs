@@ -2977,7 +2977,9 @@ impl Host {
                 if !outlived.is_empty() {
                     super::survivors::stop(&outlived.iter().map(|r| r.pid).collect::<Vec<_>>());
                 }
-                let found = super::survivors::scan(&[(rec.id.clone(), None)]);
+                // Also by the process groups and sessions what it was seen running made (macOS hides Apple programs' marks).
+                let known = HashMap::from([(rec.id.clone(), rec.harness.iter().chain(&rec.ran).cloned().collect())]);
+                let found = super::survivors::scan_known(&[(rec.id.clone(), None)], &known);
                 let apart = found.get(&rec.id).map(|f| f.apart.clone()).unwrap_or_default();
                 let now_s = u64::try_from(self.clock.unix_s()).unwrap_or(0);
                 let seed = (rec.epoch > 0).then(|| session::Seed { events: Vec::new(), state: super::model::State { epoch: rec.epoch, ..Default::default() }, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: true });
@@ -3115,8 +3117,10 @@ impl Host {
             super::survivors::stop(&outlived.iter().map(|r| r.pid).collect::<Vec<_>>());
         }
         let now_s = u64::try_from(self.clock.unix_s()).unwrap_or(0);
-        // What the sessions started that still runs: found by their mark, and as recorded.
-        let found = super::survivors::scan(&saved.iter().map(|s| (s.id.clone(), None)).collect::<Vec<_>>());
+        // What the sessions started that still runs: found by their mark, by the process groups and sessions what
+        // they were seen running made (macOS hides Apple programs' marks), and as recorded.
+        let known: HashMap<String, Vec<super::survivors::Ran>> = saved.iter().map(|s| (s.id.clone(), s.harness.iter().chain(&s.ran).cloned().collect())).collect();
+        let found = super::survivors::scan_known(&saved.iter().map(|s| (s.id.clone(), None)).collect::<Vec<_>>(), &known);
         for s in saved {
             let id = s.id.clone();
             if foreign_or_busy.contains(&id) {
@@ -3301,8 +3305,9 @@ impl Host {
                 let settled: std::collections::HashSet<String> = sessions.iter().filter(|s| s.pid.lock().is_some() && super::session::settled(s)).map(|s| s.id.clone()).collect();
                 let adopted: Vec<(String, super::survivors::Ran)> = sessions.iter().filter(|s| settled.contains(&s.id)).flat_map(|s| s.left.lock().iter().map(|r| (s.id.clone(), r.clone())).collect::<Vec<_>>()).collect();
                 let harnesses = sessions.clone();
+                let seen_running: HashMap<String, Vec<super::survivors::Ran>> = sessions.iter().map(|s| (s.id.clone(), { let r = s.ran.lock(); r.0.iter().chain(&r.1).cloned().collect() })).collect();
                 let look = move || {
-                    let mut seen = super::survivors::scan(&which);
+                    let mut seen = super::survivors::scan_known(&which, &seen_running);
                     // Never an agent's own harness (`survivors::spare`): each is read again once the
                     // look is over, for one that started while it went on.
                     let now: HashMap<String, Option<u32>> = harnesses.iter().map(|s| (s.id.clone(), *s.pid.lock())).collect();
@@ -5067,7 +5072,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let heard = dir.join("heard.jsonl");
         let fake = dir.join("fake-claude.py");
-        std::fs::write(&fake, r##"import json, os, sys, time, uuid
+        std::fs::write(&fake, r##"import json, math, os, sys, time, uuid
 HEARD = sys.argv[1]
 args = sys.argv[2:]
 def out(o):
@@ -5084,6 +5089,7 @@ while True:
     line = sys.stdin.readline()
     if not line:
         break
+    started = time.monotonic_ns()
     with open(HEARD, "a") as f:
         f.write(json.dumps({"pid": os.getpid(), "line": line.strip()}) + "\n")
     try:
@@ -5103,7 +5109,10 @@ while True:
         if "long" in json.dumps(m.get("message")):
             time.sleep(60)
         out({"type": "assistant", "message": {"id": "msg_%s" % uuid.uuid4(), "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "done"}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}}, "parent_tool_use_id": None, "session_id": session})
-        out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+        # Claude Code's result for a turn that took its message (W20): which message it took, and how long the turn
+        # took, as kiln's consumption reads them (claude.rs `inputs_consumed`).
+        elapsed_ms = math.ceil((time.monotonic_ns() - started) / 1000000)
+        out({"type": "result", "subtype": "success", "terminal_reason": "completed", "is_error": False, "duration_ms": elapsed_ms, "duration_api_ms": elapsed_ms, "num_turns": 1, "user_message_uuid": uid, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
         out({"type": "command_lifecycle", "command_uuid": uid, "state": "completed", "session_id": session})
 "##)?;
         let program = dir.join("claude-stand-in");
