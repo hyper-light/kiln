@@ -4,7 +4,7 @@
 //! build on too.
 //!
 //! - `checks`: the acceptance's checks, against samples (any OS).
-//! - `stub`: the stand-in harness (`tests/fixtures/vm-stub/stub`) speaking each harness's interface,
+//! - `stub`: the stand-in harness (`tests/fixtures/vm-stub/harness/stub`) speaking each harness's interface,
 //!   driven as a process (Unix: it's a Python script, as `fake-claude` is).
 //! - `host`: Claude Code's and Codex's interfaces driven through kiln on the host, the stand-in behind
 //!   each: start, steer, interrupt, stop, resume, a file written in the project, the MCP round trip,
@@ -157,6 +157,32 @@ mod checks {
         for line in [format!("NETWORK --egress={MACHINE}:{above} db FOR claude"), format!("NETWORK --egress=api.example.com:{port} other FOR claude"), format!("NETWORK --egress={port}/udp quic FOR claude")] {
             assert_eq!(grants_to_kiln(&with(&line), &[port]), Ok(vec![]), "{line}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn s34_the_stand_in_is_an_image_of_its_text_alone() -> anyhow::Result<()> {
+        // kiln plan step 17 builds a person's agentfile:<id> from its text alone (no context, no build
+        // arguments): the stand-in's harness is named as kind's, which kiln starts by that name, comes
+        // from kiln's repository at a commit to where its harness.json runs it, and nothing of it
+        // reaches past its microVM (a COPY, a name of its own or any grant fails here).
+        use shards_agentfile::agentfile::{Directive, Source, source_of};
+        let (dir, at) = STUB_HARNESS;
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        for kind in ["claude", "codex"] {
+            let text = stub_agentfile(kind, kind, commit, &kiln_base()?, &kiln_repository()?);
+            let all = directives(&text).map_err(|e| anyhow::anyhow!(e))?;
+            let harnesses: Vec<_> = all.iter().filter_map(|d| if let Directive::Harness(h) = d { Some(h) } else { None }).collect();
+            let [h] = harnesses.as_slice() else { anyhow::bail!("one HARNESS, not {}: {text}", harnesses.len()) };
+            assert_eq!(h.name, kind.as_bytes(), "{text}");
+            assert_eq!(h.to.as_deref(), Some(at.as_bytes()), "{text}");
+            let Ok(Source::Git(g)) = source_of(&h.source) else { anyhow::bail!("not a Git source: {text}") };
+            assert_eq!((g.reference.as_slice(), g.subdir.as_slice()), (commit.as_bytes(), dir.as_bytes()), "{text}");
+            assert!(!all.iter().any(|d| matches!(d, Directive::Network(_) | Directive::Expose(_) | Directive::Connect(_) | Directive::Mcp(_))), "a grant past the microVM: {text}");
+            assert!(text.lines().any(|l| l == format!("ENV VM_STUB_PROTOCOL={kind}")) && !text.contains("COPY "), "{text}");
+        }
+        let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(stub_path().with_file_name("harness.json"))?)?;
+        assert_eq!(manifest.get("entrypoint").and_then(serde_json::Value::as_str), Some(format!("python3 {at}/stub").as_str()));
         Ok(())
     }
 

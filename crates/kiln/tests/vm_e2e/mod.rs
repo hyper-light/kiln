@@ -202,6 +202,23 @@ pub fn kiln_default_port() -> Option<u16> {
     kiln::config::Server::default().http_addr.rsplit_once(':')?.1.parse().ok()
 }
 
+/// Every stage's Agentfile directives, read with Shards' own parser.
+pub fn directives(agentfile: &str) -> Result<Vec<shards_agentfile::agentfile::Directive>, String> {
+    let words = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    let parsed = shards_agentfile::parser::parse_as(agentfile.as_bytes(), shards_agentfile::parser::Dialect::Agentfile).map_err(|e| format!("the Agentfile doesn't parse: {}", words(&e.message)))?;
+    let linter = shards_agentfile::lint::Linter::new(shards_agentfile::lint::Config::default());
+    let ins = shards_agentfile::instructions::parse(&parsed, &linter).map_err(|e| format!("the Agentfile doesn't parse: {}", words(&e.message)))?;
+    Ok(ins
+        .stages
+        .into_iter()
+        .flat_map(|s| s.commands)
+        .filter_map(|c| match c.kind {
+            shards_agentfile::instructions::Kind::Agentfile(d) => Some(d),
+            _ => None,
+        })
+        .collect())
+}
+
 /// What an Agentfile grants past its microVM that reaches kiln at one of `ports`: a destination at
 /// the machine itself there, a remote MCP server there, or a TCP port open to any address that takes
 /// one in. Every stage's grants count, as a run can drop what its image grants and never add one
@@ -210,15 +227,9 @@ pub fn kiln_default_port() -> Option<u16> {
 pub fn grants_to_kiln(agentfile: &str, ports: &[u16]) -> Result<Vec<String>, String> {
     use shards_agentfile::agentfile::{Direction, Directive, destination_of, mcp_endpoint, port_range};
     let words = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-    let parsed = shards_agentfile::parser::parse_as(agentfile.as_bytes(), shards_agentfile::parser::Dialect::Agentfile).map_err(|e| format!("the Agentfile doesn't parse: {}", words(&e.message)))?;
-    let linter = shards_agentfile::lint::Linter::new(shards_agentfile::lint::Config::default());
-    let ins = shards_agentfile::instructions::parse(&parsed, &linter).map_err(|e| format!("the Agentfile doesn't parse: {}", words(&e.message)))?;
     let at_kiln = |host: &[u8], port: u16| host.eq_ignore_ascii_case(MACHINE.as_bytes()) && ports.contains(&port);
     let mut found = Vec::new();
-    for directive in ins.stages.iter().flat_map(|s| &s.commands).filter_map(|c| match &c.kind {
-        shards_agentfile::instructions::Kind::Agentfile(d) => Some(d),
-        _ => None,
-    }) {
+    for directive in &directives(agentfile)? {
         match directive {
             Directive::Network(n) => {
                 for (p, direction) in n.ports.iter().filter(|(_, d)| *d != Direction::Ingress) {
@@ -1057,9 +1068,9 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
 // One harness's run: in a microVM of its own, or on a Unix host as a process behind the stand-in
 // ------------------------------------------------------------------------------------------------
 
-/// The stand-in harness (`tests/fixtures/vm-stub/stub`), a Python script run by its name.
+/// The stand-in harness (`tests/fixtures/vm-stub/harness/stub`), a Python script run by its name.
 pub fn stub_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vm-stub/stub")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vm-stub/harness/stub")
 }
 
 /// kiln's own name for kind's program, which its runner starts (`Kind::program`).
@@ -1127,6 +1138,74 @@ pub fn builtin_image(kind: &str) -> String {
     std::env::var(format!("VM_E2E_IMAGE_{}", kind.to_ascii_uppercase())).unwrap_or_else(|_| format!("harness-{kind}"))
 }
 
+/// `VM_E2E_IMAGE_<KIND>`'s word for the stand-in as kind's image: the drive keeps its Agentfile in
+/// kiln for the run ([`keep_stub`]) and boots `agentfile:<id>`, so no vendor's CLI runs anywhere.
+pub const STUB_IMAGE: &str = "stub";
+
+/// The stand-in's harness directory in kiln's repository, and where its image has it (its
+/// `harness.json` runs it there).
+pub const STUB_HARNESS: (&str, &str) = ("crates/kiln/tests/fixtures/vm-stub/harness", "/opt/vm-stub");
+
+/// The stand-in's Agentfile for harness `kind` (its program `program`), its text alone, as kiln
+/// builds a person's `agentfile:<id>` (kiln plan step 17: no build context, no build arguments): kiln's
+/// own images' base (`base`, their `ARG BASE=` line); the harness named as kind's, which kiln starts
+/// by that name, from `repository` at `commit` (fetched by Shards' own git client where the runner
+/// is) to [`STUB_HARNESS`]'s path, speaking kind's interface; its project and home as kiln's images
+/// mount theirs; and no network at all, as it calls no model and reaches kiln on the agent-control
+/// link alone (default deny; Shards D254).
+pub fn stub_agentfile(kind: &str, program: &str, commit: &str, base: &str, repository: &str) -> String {
+    let (dir, at) = STUB_HARNESS;
+    format!(
+        "{base}\nFROM ${{BASE}}\nENV VM_STUB_PROTOCOL={program}\nHARNESS {kind} FROM {repository}.git#{commit}:{dir} TO {at}\nVOLUME --target-kind=harness /workspace FOR {kind}\nVOLUME --target-kind=harness /home/{kind} FOR {kind}\n"
+    )
+}
+
+/// kiln's own images' base, as their `ARG BASE=` line names it (`.kiln/images/harness-claude`).
+pub fn kiln_base() -> anyhow::Result<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln/images/harness-claude/Agentfile");
+    let text = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    text.lines().find(|l| l.starts_with("ARG BASE=")).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("{} names no ARG BASE", path.display()))
+}
+
+/// kiln's repository, as its workspace declares it (`Cargo.toml`'s `[workspace.package]`).
+pub fn kiln_repository() -> anyhow::Result<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+    let manifest: toml::Table = toml::from_str(&std::fs::read_to_string(&path)?)?;
+    let repository = manifest.get("workspace").and_then(|w| w.get("package")).and_then(|p| p.get("repository")).and_then(toml::Value::as_str);
+    repository.map(str::to_owned).ok_or_else(|| anyhow::anyhow!("{} declares no repository", path.display()))
+}
+
+/// The commit this checkout is at, which the stand-in's image is built from: Shards fetches it from
+/// kiln's repository, so it must be there.
+pub fn this_commit() -> anyhow::Result<String> {
+    let out = std::process::Command::new("git").arg("-C").arg(env!("CARGO_MANIFEST_DIR")).args(["rev-parse", "HEAD"]).output()?;
+    anyhow::ensure!(out.status.success(), "git rev-parse HEAD: {}", String::from_utf8_lossy(&out.stderr));
+    Ok(String::from_utf8(out.stdout)?.trim().to_owned())
+}
+
+/// An Agentfile the drive keeps in kiln for a run, removed as it drops.
+pub struct Kept<'a> {
+    f: &'a Fixture,
+    pub id: String,
+}
+
+impl Drop for Kept<'_> {
+    fn drop(&mut self) {
+        let _ = common::http(self.f.port, "DELETE", &format!("/api/agentfiles/{}", self.id), &self.f.admin, None);
+    }
+}
+
+/// The stand-in kept in kiln as kind's image ([`stub_agentfile`], at [`this_commit`]).
+pub fn keep_stub<'a>(f: &'a Fixture, kind: &str) -> anyhow::Result<Kept<'a>> {
+    let text = stub_agentfile(kind, program(kind)?, &this_commit()?, &kiln_base()?, &kiln_repository()?);
+    let ask = json!({"name": format!("vm-stub-{kind}-{}", nonce()), "text": text});
+    let (code, body) = common::http(f.port, "POST", "/api/agentfiles", &f.admin, Some(&ask))?;
+    anyhow::ensure!((200..300).contains(&code), "kiln kept no Agentfile for the stand-in as {kind}: {code} {body}");
+    let saved: Value = serde_json::from_str(&body)?;
+    let id = saved.pointer("/agentfile/id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("kiln named no Agentfile for the stand-in as {kind}: {body}"))?;
+    Ok(Kept { f, id: id.to_owned() })
+}
+
 /// The Agentfile `image` is made from: a person's as kiln keeps it (`agentfile:<id>`), else kiln's
 /// own, as kiln carries it (`.kiln/images/<image>/Agentfile`, `agentfiles::builtin`).
 pub fn agentfile_of(f: &Fixture, image: &str) -> anyhow::Result<String> {
@@ -1171,6 +1250,9 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
         eprintln!("{why}");
         return Ok(());
     }
+    let kept = if image == STUB_IMAGE { Some(keep_stub(f, kind)?) } else { None };
+    let image = kept.as_ref().map_or_else(|| image.to_owned(), |k| format!("agentfile:{}", k.id));
+    let image = image.as_str();
     let to_kiln = grants_to_kiln(&agentfile_of(f, image)?, &kiln_ports(f)).map_err(|e| anyhow::anyhow!("{image}: {e}"))?;
     anyhow::ensure!(to_kiln.is_empty(), "{kind} from {image}: its image grants a way to kiln past the agent-control link's {}<member> lane (Shards D254): {to_kiln:?}", MCP_LANE.1);
     let marker = std::env::var("VM_E2E_DONE_MARKER").unwrap_or_else(|_| STUB_DONE.to_owned());

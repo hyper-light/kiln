@@ -11,8 +11,8 @@ at one.
 |---|---|
 | `crates/kiln/tests/vm_harnesses.rs` | step 34's tests: `checks` (the acceptance's checks against samples), `stub` (the stand-in driven as a process), `host` (Claude Code's and Codex's interfaces driven through kiln on the host), `step34` (each in a microVM of its own) |
 | `crates/kiln/tests/vm_e2e/mod.rs` | the drive (start, steer, interrupt, stop, resume, through the API), the checks it feeds, `in_microvm` and `on_host`, which step 35's file builds on |
-| `crates/kiln/tests/fixtures/vm-stub/stub` | the stand-in harness: Claude Code's stream-json, Codex's app-server, ACP, Antigravity's stream-json and Pi's RPC; no model |
-| `crates/kiln/tests/fixtures/vm-stub/Agentfile`, `harness/` | the stand-in as a microVM image, its grants as kiln's built-in Agentfiles grant theirs |
+| `crates/kiln/tests/fixtures/vm-stub/harness/stub` | the stand-in harness: Claude Code's stream-json, Codex's app-server, ACP, Antigravity's stream-json and Pi's RPC; no model |
+| `crates/kiln/tests/fixtures/vm-stub/harness/`, `vm_e2e::stub_agentfile` | the stand-in as a microVM image: its harness directory, and its Agentfile, its text alone, which the drive writes for each harness and keeps in kiln for the run |
 
 Step 35's own (`vm_e2e/step35.rs`, `vm_e2e/gaps.json`, `vm_e2e/mcp.rs`, `ui/e2e/vm-harnesses.spec.ts`)
 are its agent's and say how they run.
@@ -69,7 +69,7 @@ every one of the five `VM_E2E_*` words below (`untasked`): the stand-in's words 
 | `VM_E2E_HOST_ROOTS` | pids (comma-separated) of processes besides the runner whose trees hold the session's processes: a daemon its microVMs run under that left the runner's tree |
 | `VM_E2E_PROJECT` | a real project's folder on this host, for a real task (unset: an empty one of the test's own) |
 | `VM_E2E_PROMPT`, `VM_E2E_RESUMED_PROMPT`, `VM_E2E_STEERED_PROMPT`, `VM_E2E_STOPPED_PROMPT`, `VM_E2E_DONE_MARKER` | a real task, the resumed session's turn, a long one to steer into, a long one to stop, and what the harness says at a task's end; `{kind}` in each is the harness's id, `{file}` the file to write. Unset: the stand-in's, for an image ROOT names (the stand-in's); from kiln's own `harness-<kind>` the run skips unless all five are given (fails, with `VM_E2E=1`) |
-| `VM_E2E_IMAGE_<KIND>` | the image a harness's microVM is made from (`agentfile:<id>`); unset: kiln's Agentfile for it, `harness-<kind>` |
+| `VM_E2E_IMAGE_<KIND>` | the image a harness's microVM is made from (`agentfile:<id>`), or `stub` for the stand-in (below); unset: kiln's Agentfile for it, `harness-<kind>` |
 | `VM_E2E_TURN_SECS` | how long a turn may take before the test fails (600 unset): a failing test's patience, not a value kiln runs by |
 | `VM_E2E_SERVER`, `VM_E2E_TOKEN`, `VM_E2E_MACHINE`, `VM_E2E_RUNNER_PID` | ROOT's own kiln (one with the sign-ins and credentials real tasks need) at `http://127.0.0.1:<port>`, its admin token (from a file, never on a command line or in a log), its runner's machine id and that runner's pid; unset: a server and a runner of the test's own, its headroom off |
 
@@ -142,12 +142,15 @@ WSL form. `stub::` and `host::` are Unix's (the stand-in is a Python script run 
 
 ### Without a vendor's turn
 
-The stand-in's Agentfile runs the same drive with no model once kiln builds it as a microVM image:
-step 17 takes kiln's own images (`harness-<kind>`) and a person's own Agentfiles (`agentfile:<id>`)
-alone, a person's Agentfile is kept as its text alone today, and the stand-in's HARNESS needs its
-script and `harness.json` beside it and the harness's own name (`claude`, `codex`). Owed to step 17's
-Shards slice; then `VM_E2E_IMAGE_CLAUDE=agentfile:<id>` and `VM_E2E_IMAGE_CODEX=agentfile:<id>` with
-no `VM_E2E_PROMPT`.
+`VM_E2E_IMAGE_CLAUDE=stub` and `VM_E2E_IMAGE_CODEX=stub` run the same drive in microVMs with the
+stand-in for each harness, and no `VM_E2E_PROMPT`: no vendor's CLI and no model anywhere. The drive
+writes the stand-in's Agentfile for the harness (`stub_agentfile`: its text alone, as kiln plan step
+17 builds a person's, kiln's own images' base, the harness named as kiln starts it, no network at
+all), keeps it in kiln (`POST /api/agentfiles`), boots `agentfile:<id>` and removes it after. Its
+`HARNESS` comes from kiln's repository at this checkout's commit, which Shards' own git client fetches
+on the runner: the commit must be on GitHub, and the runner must reach github.com. ARGs expand in
+`HARNESS ... FROM`, as kiln's own Agentfiles use them; a Git source built so is a first (owed: ROOT's
+run).
 
 ## What's owed, by whom, and what isn't checked yet
 
@@ -195,8 +198,8 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
 6. **The kiln-Hex link's Hex end**: step 34's plan step 3, through Hex's lead (the node's own report of
    each peer link's suite and group); the kiln end is step 17's Hex client. Read through
    `VM_E2E_LINKS`' `kiln-hex` entry.
-7. **A microVM image without a vendor's turn**: step 17's Shards slice ("Without a vendor's turn",
-   above).
+7. **A microVM image without a vendor's turn**: built from its text alone since step 17 (kiln main
+   522f14c31); the stand-in's is written so ("Without a vendor's turn", above). Owed: ROOT's run of it.
 8. **A harness that ran on the host and ended between two looks**: step 17's `/starts`, kiln's record
    of each start of the session's harness, every one kept, which `check_starts` reads: a start on the
    host is found whenever it ran.
