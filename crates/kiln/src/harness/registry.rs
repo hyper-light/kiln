@@ -8386,9 +8386,10 @@ mod tests {
     /// A person's message to an agent whose runner predates mail-flow goes to that runner's inbox,
     /// as it did before W20, and is answered there: the runner never pushes the capacity custody
     /// waits for, so custody refused it ("waiting for capacity") for as long as the runner was old.
-    /// An agent's message to it stays in custody's hands (W20's bound). Once the runner speaks
-    /// mail-flow, a person's is queued in custody, in a queue of its own, before the agent's
-    /// capacity has come; an agent's and kiln's own wait for that capacity.
+    /// An agent's message to it stays in custody's hands (W20's bound), taken and waiting there:
+    /// none is refused for an owner whose capacity is pending (Ada, 2026-11-12; 2e1a968d055c).
+    /// Once the runner speaks mail-flow, a person's is queued in custody, in a queue of its own,
+    /// before the agent's capacity has come; an agent's and kiln's own are taken and wait for it.
     #[test]
     fn w20_a_persons_message_reaches_a_runner_from_before_mail_flow_through_its_inbox() -> anyhow::Result<()> {
         use super::super::asked::Taken;
@@ -8418,11 +8419,12 @@ mod tests {
             anyhow::ensure!(matches!(sent, Sent::Accepted(ref a) if a.message == "m1"), "its inbox took it: {sent:?}");
             // Kiln's own and a person's through the API go there too.
             anyhow::ensure!(matches!(hub.harness.dispatch(&hub, "s1", send("m2")).await, Pending::Answer { ref message, .. } if message == "m2"), "to its inbox");
-            // An agent's stays with custody, which takes nothing for a runner that pushes no capacity.
+            // An agent's stays with custody: taken, and waiting there while the runner pushes no capacity.
+            let waiting = |sent: &Sent| matches!(sent, Sent::Published(r) if r.disposition == super::super::mail::Disposition::Waiting);
             let agent = asked("agent:a1", "c3", "m3")?;
             hub.harness.send_asked(&hub, "s1", "agent:a1", "c3", send("m3")).await;
             let sent = agent.await?;
-            anyhow::ensure!(matches!(sent, Sent::PublicationRefused(super::super::mail::Error::Unavailable { .. })), "an agent's is held to custody: {sent:?}");
+            anyhow::ensure!(waiting(&sent), "an agent's is held to custody, taken and waiting: {sent:?}");
             // Its runner upgraded, speaking mail-flow, its capacity not come yet: a person's is
             // queued in custody, in the person's own queue; an agent's and kiln's wait for it.
             hub.instances.update(|i| i.set_features(1, vec![crate::proto::feature::MAIL_FLOW.to_owned()]));
@@ -8434,8 +8436,9 @@ mod tests {
             let agent = asked("agent:a1", "c5", "m5")?;
             hub.harness.send_asked(&hub, "s1", "agent:a1", "c5", send("m5")).await;
             let sent = agent.await?;
-            anyhow::ensure!(matches!(sent, Sent::PublicationRefused(super::super::mail::Error::Unavailable { .. })), "an agent's waits for its capacity: {sent:?}");
-            anyhow::ensure!(matches!(hub.harness.dispatch(&hub, "s1", send("m6")).await, Pending::Now(Sent::PublicationRefused(_))), "and kiln's own");
+            anyhow::ensure!(waiting(&sent), "an agent's is taken and waits for its capacity: {sent:?}");
+            let Pending::Now(own) = hub.harness.dispatch(&hub, "s1", send("m6")).await else { anyhow::bail!("kiln's own went on to an inbox, not to custody") };
+            anyhow::ensure!(waiting(&own), "and kiln's own: {own:?}");
             Ok(())
         })
     }

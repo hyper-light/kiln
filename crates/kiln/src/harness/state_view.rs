@@ -164,6 +164,11 @@ impl<'a> QueueEntryRef<'a> {
     }
 }
 
+/// The index of `queue`'s entries from `start` that fits `budget` as compact JSON. Each entry and
+/// the index's wrapper are measured as they'd be written (`measured`: their bytes counted, none
+/// kept), and each entry is made once from its item: every state a server's copy takes builds one
+/// for its `Info` (`super::session::Info::apply`), so an index costs an entry's own id and digest
+/// alone, and an empty queue's nothing (goal 9 step 5's budget, g9_s5).
 pub fn queue_index(queue: &[super::model::QueueItem], start: usize, budget: usize) -> Result<QueueIndex, Error> {
     let remaining = queue.get(start..).ok_or(Error::InvalidCursor)?;
     let mut result = QueueIndex {
@@ -174,8 +179,9 @@ pub fn queue_index(queue: &[super::model::QueueItem], start: usize, budget: usiz
     let mut entries_bytes = 0usize;
     for (relative, item) in remaining.iter().enumerate() {
         let index = start.checked_add(relative).ok_or(Error::InvalidCursor)?;
-        let entry = match encoded(&QueueEntryRef::of(item), budget) {
-            Ok(entry) => entry,
+        let entry = QueueEntryRef::of(item);
+        let entry_bytes = match measured(&entry, budget) {
+            Ok(n) => n,
             Err(Error::Budget) if !result.entries.is_empty() => break,
             Err(e) => return Err(e),
         };
@@ -184,24 +190,27 @@ pub fn queue_index(queue: &[super::model::QueueItem], start: usize, budget: usiz
         let complete = start == 0 && next.is_none();
         let wrapper = QueueIndex { entries: Vec::new(), complete, next };
         let candidate_bytes = entries_bytes
-            .checked_add(entry.len())
+            .checked_add(entry_bytes)
             .and_then(|n| n.checked_add(usize::from(!result.entries.is_empty())))
             .ok_or(Error::Budget)?;
         // Compact JSON replaces the empty array's interior with these exact entry bytes and
         // separators. Only the constant-size wrapper is remeasured when its cursor changes.
-        let total = encoded(&wrapper, budget)?.len().checked_add(candidate_bytes).ok_or(Error::Budget)?;
+        let total = measured(&wrapper, budget)?.checked_add(candidate_bytes).ok_or(Error::Budget)?;
         if total > budget.min(FRAME) {
             if result.entries.is_empty() {
                 return Err(Error::Budget);
             }
             break;
         }
-        result.entries.push(serde_json::from_slice(&entry).map_err(|_| Error::Unreadable)?);
+        if result.entries.is_empty() {
+            result.entries.try_reserve(remaining.len()).map_err(|_| Error::Budget)?;
+        }
+        result.entries.push(QueueEntry { id: entry.id.to_owned(), digest: entry.digest, len: entry.len });
         entries_bytes = candidate_bytes;
         result.next = next;
         result.complete = complete;
     }
-    encoded(&result, budget)?;
+    measured(&result, budget)?;
     Ok(result)
 }
 
@@ -335,6 +344,31 @@ pub(crate) fn encode<T: Serialize + ?Sized>(value: &T, budget: usize) -> Result<
 
 fn encoded<T: Serialize + ?Sized>(value: &T, budget: usize) -> Result<Vec<u8>, Error> {
     encode(value, budget)
+}
+
+/// How many bytes `value` is as compact JSON, counted as it's written and none kept: `Budget` past
+/// `budget` (at most [`FRAME`]), as [`encode`] is.
+fn measured<T: Serialize + ?Sized>(value: &T, budget: usize) -> Result<usize, Error> {
+    let mut counter = Counted { len: 0, budget: budget.min(FRAME) };
+    serde_json::to_writer(&mut counter, value).map_err(|e| if e.is_io() { Error::Budget } else { Error::Unreadable })?;
+    Ok(counter.len)
+}
+
+/// A writer that only counts what's written, refusing past its budget.
+struct Counted {
+    len: usize,
+    budget: usize,
+}
+impl Write for Counted {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next = self.len.checked_add(bytes.len()).filter(|n| *n <= self.budget).ok_or_else(|| io::Error::other("state view byte budget"))?;
+        self.len = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn value<T: Serialize + ?Sized>(v: &T, budget: usize) -> Result<Value, Error> {
