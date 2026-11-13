@@ -1154,6 +1154,9 @@ pub enum Verdict {
     Done,
     /// Its answer may still come.
     Wait,
+    /// kiln holds what it was asked in its custody (its queue), and why where kiln says: a hold, which
+    /// the window doesn't run through (R03: a host's hold is said as held, and the wait goes on).
+    Held(String),
     /// It won't.
     Refuse(Stall),
 }
@@ -1203,11 +1206,12 @@ impl<'a> Watch<'a> {
         }
     }
 
-    /// Whether this look's verdict needs the session's state (each of its messages' delivery, which
-    /// only its viewers are sent): kiln's word says it may have answered what it was asked
-    /// ([`may_have_answered`]).
-    pub fn wants_state(&self, info: &Value, events: &[Value]) -> bool {
-        self.message(info).is_some_and(|m| may_have_answered(info, events, &m).is_some())
+    /// Whether a look `at` after the wait began needs the session's state (each of its messages'
+    /// delivery, which only its viewers are sent): kiln's word says it may have answered what it was
+    /// asked ([`may_have_answered`]), or its window runs out and only the state says whether kiln holds it
+    /// ([`holds`]).
+    pub fn wants_state(&self, info: &Value, events: &[Value], at: Duration) -> bool {
+        self.message(info).is_some_and(|m| may_have_answered(info, events, &m).is_some() || self.window.is_some_and(|w| at.saturating_sub(self.moved) > w))
     }
 
     /// A look at kiln's word on the session (`info`), its timeline (`events`) and, where
@@ -1230,7 +1234,14 @@ impl<'a> Watch<'a> {
         }
         let quiet = at.saturating_sub(self.moved);
         match self.window {
-            Some(slowest) if quiet > slowest => Verdict::Refuse(Stall::Quiet { quiet, slowest }),
+            Some(slowest) if quiet > slowest => match self.message(info).and_then(|m| holds(info, events, state, &m)) {
+                // kiln's custody of it is kiln's progress on it: the window starts again.
+                Some(why) => {
+                    self.moved = at;
+                    Verdict::Held(why)
+                }
+                None => Verdict::Refuse(Stall::Quiet { quiet, slowest }),
+            },
             _ => Verdict::Wait,
         }
     }
@@ -1333,6 +1344,21 @@ fn answered_in(state: &Value, client: &str) -> bool {
     delivery.is_some_and(|d| d.get(client).is_some_and(over) && d.values().all(over)) && state.get("queue").and_then(Value::as_array).is_none_or(Vec::is_empty)
 }
 
+/// What holds message `m` (a client id, or words its message carries) in kiln's custody, where the
+/// session's `state` says kiln holds it: its delivery `queued`, or it waits in kiln's queue. Said with
+/// what kiln says of its holding where it says (its admission, room, pause, freeze). None: not held.
+pub fn holds(info: &Value, events: &[Value], state: Option<&Value>, m: &str) -> Option<String> {
+    let state = state?;
+    let client = events.iter().find(|e| is_message(e, m)).and_then(|e| e.get("client_id")).and_then(Value::as_str).unwrap_or(m);
+    let queued = state.get("delivery").and_then(|d| d.get(client)).and_then(Value::as_str) == Some("queued");
+    let waits = state.get("queue").and_then(Value::as_array).into_iter().flatten().any(|q| q.get("id").and_then(Value::as_str) == Some(client));
+    if !(queued || waits) {
+        return None;
+    }
+    let why: Vec<String> = ["admission", "room_wait", "pause", "frozen"].iter().filter_map(|key| info.get(*key).filter(|v| !v.is_null()).map(|v| format!("{key} {v}"))).collect();
+    Some(if why.is_empty() { format!("{client} queued in kiln's queue") } else { format!("{client} queued in kiln's queue; {}", why.join(", ")) })
+}
+
 /// What of a session moves as its harness and kiln work on it: kiln's word on it ([`MOVES`]) and its
 /// timeline.
 fn moving(info: &Value, events: &[Value]) -> Value {
@@ -1428,17 +1454,28 @@ impl Pace {
     pub fn until(&mut self, f: &Fixture, id: &str, asked: Asked<'_>, what: &str, done: impl Fn(&Value, &[Value]) -> bool) -> anyhow::Result<(Value, Vec<Value>)> {
         let began = Instant::now();
         let mut watch = Watch::new(asked, self.window(asked));
+        let mut said_held = String::new();
         loop {
             let (i, e) = (info(f, id)?, events(f, id)?);
             let held = done(&i, &e);
-            // Its state read only where kiln's word says it may have answered; unread, it says nothing.
-            let state = if !held && watch.wants_state(&i, &e) { state_of(f, id).ok() } else { None };
-            match watch.look(&i, &e, state.as_ref(), held, began.elapsed()) {
+            let at = began.elapsed();
+            // Its state read only where kiln's word says it may have answered, or its window runs out;
+            // unread, it says nothing.
+            let state = if !held && watch.wants_state(&i, &e, at) { state_of(f, id).ok() } else { None };
+            match watch.look(&i, &e, state.as_ref(), held, at) {
                 Verdict::Done => {
                     self.answered(began.elapsed());
                     return Ok((i, e));
                 }
                 Verdict::Wait => std::thread::sleep(POLL),
+                Verdict::Held(why) => {
+                    // Said as held, once a hold: the wait goes on.
+                    if why != said_held {
+                        eprintln!("{what}: held by kiln, the wait going on: {why}");
+                        said_held = why;
+                    }
+                    std::thread::sleep(POLL);
+                }
                 Verdict::Refuse(stall) => return Err(refused(f, id, what, stall, &i, &e)),
             }
         }
@@ -1459,7 +1496,7 @@ impl Pace {
             let i: Value = serde_json::from_str(&body)?;
             match watch.look(&i, &[], None, false, began.elapsed()) {
                 Verdict::Refuse(stall) => return Err(refused(f, id, what, stall, &i, &[])),
-                Verdict::Done | Verdict::Wait => std::thread::sleep(POLL),
+                Verdict::Done | Verdict::Wait | Verdict::Held(_) => std::thread::sleep(POLL),
             }
         }
     }
