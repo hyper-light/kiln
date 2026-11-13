@@ -739,7 +739,9 @@ declared `[telemetry] sample_seconds` cadence (W21-R15); placement measures inde
 
 - **What one read gives** (each share exact over the interval since the previous read, any
   interval; each level as read): CPU idle share (`/proc/stat`, Mach's `HOST_CPU_LOAD_INFO`,
-  `GetSystemTimes`), memory available (no more than the runner's cgroup leaves), the work
+  `GetSystemTimes`), memory available (Linux's `MemAvailable`; on macOS the free pages and the
+  inactive ones beyond what the compressor holds, as `host_statistics64` counts them, since the
+  kernel's own available memory counts pages in use; no more than the runner's cgroup leaves), the work
   directory's free space (APFS's important-use figure too), pressure (Linux PSI `some`/`full` for
   CPU, memory and I/O, the machine's and the runner's own cgroup's, from their cumulative stall
   times; macOS's memory pressure level) and the work device's throughput, latency, queue and

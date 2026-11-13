@@ -3,7 +3,8 @@
 
 /**
  * An isolated session's boundary (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 17 and 32), as kiln's T4 isolation
- * named it: its kind, and the image it boots once one is chosen.
+ * named it: its kind, the image it boots once one is chosen, and its microVM's size where its start
+ * gave one.
  */
 export type Isolation = { 
 /**
@@ -19,4 +20,14 @@ image?: string,
  * step 18, `harness::isolated::home`): whom it acts for, set by kiln from who started it (its
  * parent's, for an isolated agent's agents), never from what was asked.
  */
-person?: string, };
+person?: string, 
+/**
+ * Its microVM's vCPUs, as CPUs (Shards' `--cpus`): what its placement asks and its claim holds
+ * (step 32), never what its harness would need as a process. None: its start gave none, so its
+ * placement asks none and it's charged what it's measured using.
+ */
+cpus?: number, 
+/**
+ * Its microVM's memory, bytes (Shards' `--memory`), asked and held as its vCPUs are.
+ */
+memory?: number, };

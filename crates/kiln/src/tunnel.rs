@@ -1362,7 +1362,7 @@ mod tests {
             while !(log && hello) {
                 futures::select_biased! {
                     ev = next(&server_ev).fuse() => match ev? {
-                        NetEvent::Connected { peer: p, name, binding } => {
+                        NetEvent::Connected { peer: p, name, binding, .. } => {
                             assert_eq!(name.as_deref(), Some("bench-1"));
                             registry.connected(p, binding);
                             peer = Some(p);

@@ -460,6 +460,11 @@ fn report(id: &str, cell: &Cell, secs: u64, fresh: bool, max: usize) -> (Value, 
         }
         if let Some(e) = &r.error {
             o.insert("error".into(), json!(e));
+            // Refused before it started, by kind (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32):
+            // an agent can tell why without reading the words.
+            if let Some(code) = super::local::Refused::code_of(e) {
+                o.insert("refused".into(), json!(code));
+            }
         }
     }
     let failed = r.error.is_some() || r.exit.as_ref().and_then(|e| e.get("error")).is_some_and(|e| !e.is_null());

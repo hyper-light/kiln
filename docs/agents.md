@@ -1110,6 +1110,21 @@ A runner's kiln starts no microVM itself yet: kiln holds Shards and Hex now (doc
 doesn't yet start a harness through Hex (the plan's step 17), so until then such a start is refused
 there, saying so (its facts' `isolation.why_not`).
 
+**Placed and charged by kiln's balancer** (step 32). An isolated agent is placed as runs are
+(docs/lb.md), or not at all: its placement asks its microVM's own vCPUs and memory, never what its
+harness would need as a process: those `on` asks (`cpus=2,mem=4g`), or `spec.isolation`'s `cpus`
+and `memory` in a start that names its machine; an agent an isolated agent starts keeps its
+parent's. It's asked only of runners that start microVMs, and its claim holds that room on the
+runner it's placed on from its start to its end. A start with no size asks no room. What its
+microVM uses is charged as it's measured, from its own group: on Linux its session's cgroup, which
+its microVM is made in; on macOS and Windows the group Shards keeps for it (`groups/kiln-<session>`
+of Shards' home: its `memory.current`, and the CPU time of the processes its `cgroup.procs` lists).
+An agent it starts (`agents.start`, from inside its microVM) is isolated and placed the same way.
+Its commands (`kiln run`, the MCP `run` tool, `kiln.machines.run` and `kiln.machines.start`) run in
+microVMs or not at all: no runner runs them in a microVM yet, so each is refused before anything of
+it starts, saying `refused (isolated): …` (the MCP answer's `refused: "isolated"`), and none runs on
+a bare host.
+
 **Agentfiles** (Agents → Agentfiles, `/agents/agentfiles`) keeps yours: each opened on its own page
 in the code editor's Agentfile mode, checked by Shards as it's typed (`POST /api/agentfiles/check`,
 what it finds marked on its lines and said under the editor), saved with a new version for each new
