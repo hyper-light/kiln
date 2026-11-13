@@ -952,15 +952,23 @@ impl Host {
     /// sessions' inboxes keeping their records beside its own record of them.
     pub fn counting_into(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
         let records = file.as_ref().and_then(|f| f.parent()).and_then(open_records);
-        Self::build(sink, file, limits, clock, records, metrics)
+        Self::build(sink, file, limits, clock, records, metrics, crate::memory::room::server())
     }
 
     /// A host whose sessions' inboxes keep their records in `records` (none: no inboxes).
     pub fn with_records(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>) -> Arc<Self> {
-        Self::build(sink, file, limits, clock, records, crate::metrics::agents())
+        Self::build(sink, file, limits, clock, records, crate::metrics::agents(), crate::memory::room::server())
     }
 
-    fn build(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
+    /// [`Self::with_records`], its sessions' input budgets resized by `shares` alone: a test that is its host's
+    /// resource authority (`set_input_budget`), which no other host's resource event in the process resizes (the
+    /// server's shares are the process's: each host built on them measures them again, `Shares::follow_input`).
+    #[cfg(test)]
+    pub(crate) fn with_records_following(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>, shares: &crate::memory::room::Shares) -> Arc<Self> {
+        Self::build(sink, file, limits, clock, records, crate::metrics::agents(), shares)
+    }
+
+    fn build(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>, metrics: &'static crate::metrics::AgentMetrics, shares: &crate::memory::room::Shares) -> Arc<Self> {
         let sink: Sink = sink.into();
         // The models its harnesses' sessions list are kept beside its record of them.
         if let Some(dir) = file.as_ref().and_then(|f| f.parent()) {
@@ -1001,7 +1009,7 @@ impl Host {
             microvm: Mutex::new(crate::sandbox::microvm()),
             homes: std::sync::OnceLock::new(),
         });
-        crate::memory::room::follow_input(&host);
+        shares.follow_input(&host);
         host
     }
 
