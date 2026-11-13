@@ -514,6 +514,15 @@ impl Link {
         }
     }
 
+    /// Whether it's an isolated session's lane, in the runner's own process.
+    fn is_lane(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            Link::Socket(_) => false,
+            Link::Here(_) => true,
+        }
+    }
+
     /// What tells its runner of its runs (docs/reach.md §7).
     fn teller(&self) -> super::told::Teller {
         match self {
@@ -1131,7 +1140,7 @@ pub fn serve_lane(here: super::local::Here, cwd: String, input: &mut impl BufRea
 /// Serve MCP read from `input` and answered on `output`, its calls asked of the runner over
 /// `link`, until `input` ends. Tool calls run side by side.
 fn serve_over(link: Link, prefer: Option<String>, cwd: String, session: String, input: &mut impl BufRead, output: Box<dyn std::io::Write + Send>) -> anyhow::Result<()> {
-    let lane = matches!(link, Link::Here(_));
+    let lane = link.is_lane();
     let machines = machines(&link);
     let server = Arc::new(Server { link, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
     let out: Out = Arc::new(Mutex::new(output));
