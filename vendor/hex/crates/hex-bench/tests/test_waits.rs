@@ -27,7 +27,7 @@ fn repo() -> PathBuf {
 const CONFORMANCE: &str = "crates/hex-api/src/conformance.rs";
 
 /// Every `.rs` file under the workspace's crates, walked with an explicit stack (CLAUDE.md §11), its path relative to
-/// the repository.
+/// the repository as the repository names it: its components joined by `/` on every OS, where Windows walks `\`.
 fn sources() -> Vec<String> {
     let root = repo();
     let mut out = Vec::new();
@@ -38,12 +38,13 @@ fn sources() -> Vec<String> {
             if path.is_dir() {
                 walk.push(path);
             } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(
-                    path.strip_prefix(&root)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+                let names: Vec<String> = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                out.push(names.join("/"));
             }
         }
     }
@@ -133,6 +134,22 @@ fn the_program_end_record_bounds_a_programs_end_alone() {
         found.len(),
         found.join("\n")
     );
+}
+
+/// The walk names each source as the repository does, so the file defining the record, whose bare `PATIENCE` is the
+/// record, and this one, which isn't read, are found by their names on every OS (AC-T7.4.1). Do: walk the workspace.
+/// Expect: [`CONFORMANCE`] and [`SELF`] each named once.
+#[test]
+fn the_walk_names_the_record_and_this_file_as_the_repository_does() {
+    let files = sources();
+    for named in [CONFORMANCE, SELF] {
+        assert_eq!(
+            files.iter().filter(|f| f.as_str() == named).count(),
+            1,
+            "{named} among the {} sources walked",
+            files.len()
+        );
+    }
 }
 
 /// Non-vacuity: the reading finds the record where it is used rightly and where it isn't. Do: read a test source

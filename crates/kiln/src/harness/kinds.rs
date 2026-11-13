@@ -148,10 +148,7 @@ impl Kind {
             // Model, mode and resume go over the protocol (thread/start, turn/start).
             Protocol::CodexAppServer => {
                 p.args(super::codex::args());
-                // The most subagents it runs at once (its Agent settings), as Codex's own limit.
-                if let Some(n) = spec.max_subagents {
-                    p.arg("-c").arg(format!("agents.max_concurrent_threads_per_session={n}"));
-                }
+                p.args(codex_limit(spec));
                 #[cfg(unix)]
                 if let Some((kiln, sock, prefer)) = local_tools(spec) {
                     p.args(crate::reach::mcp::codex_config(&kiln, sock, prefer, session));
@@ -190,6 +187,79 @@ impl Kind {
         }
         Ok(p)
     }
+}
+
+/// The most subagents a Codex session runs at once (its Agent settings), as Codex's own limit.
+fn codex_limit(spec: &Spec) -> Vec<String> {
+    spec.max_subagents.map(|n| vec!["-c".to_owned(), format!("agents.max_concurrent_threads_per_session={n}")]).unwrap_or_default()
+}
+
+/// What runs a harness in a microVM of its own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 17):
+/// the member of its image that's the harness, the arguments kiln's adapter adds to its image's
+/// command for this session, and the environment kiln gives it over its image's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Elsewhere {
+    /// The image's member: the HARNESS its Agentfile declares by the harness's id, as each one kiln
+    /// ships does (`.kiln/images/harness-<id>/Agentfile`).
+    pub member: &'static str,
+    /// Past its image's command, which runs it as kiln's adapter drives it ([`Kind::base_args`]).
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+impl Kind {
+    /// [`Kind::launch`]'s harness, in a microVM of its own: what it's started with past what its
+    /// image's command gives it. kiln's own tools aren't given it (its MCP server and its hooks are
+    /// reached through this machine's runner's socket, which no microVM reaches: plan step 18 brings
+    /// them in), nor this machine's environment, nor kiln's own variables: only the locale and time
+    /// zone the session was given, and what kiln fixes for the harness.
+    pub fn elsewhere(&self, spec: &Spec) -> anyhow::Result<Elsewhere> {
+        let all = match self.protocol {
+            Protocol::Terminal => anyhow::bail!("{} has no structured mode; run it in a terminal ({})", self.name, self.program),
+            Protocol::ClaudeStreamJson => {
+                let session_id = spec.resume.is_none().then(|| uuid::Uuid::now_v7().to_string());
+                super::claude::args(spec, session_id.as_deref())
+            }
+            Protocol::CodexAppServer => [super::codex::args(), codex_limit(spec)].concat(),
+            Protocol::Acp(args) => args.iter().map(|a| (*a).to_owned()).collect(),
+            Protocol::AgyStreamJson => super::antigravity::args(spec),
+            Protocol::PiRpc => super::pi::args(spec),
+        };
+        let base = self.base_args();
+        let args = all.strip_prefix(base.as_slice()).ok_or_else(|| anyhow::anyhow!("kiln starts {} with {all:?}, not past its image's command ({base:?})", self.name))?.to_vec();
+        let mut env: Vec<(String, String)> = spec.env.iter().filter(|(k, _)| locale_or_zone(k)).cloned().collect();
+        match self.protocol {
+            Protocol::ClaudeStreamJson => env.extend(super::claude::FIXED_ENV.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))),
+            // Cursor's sign-in opens no browser (its link is shown wherever the person is).
+            Protocol::Acp(_) if self.id == "cursor" => env.push(("NO_OPEN_BROWSER".to_owned(), "1".to_owned())),
+            _ => {}
+        }
+        Ok(Elsewhere { member: self.id, args, env })
+    }
+
+    /// The arguments kiln's adapter starts its harness with whatever the session asks: what the
+    /// command of the image kiln ships for it gives it (`harness.json`'s `run.command`, held to these
+    /// by `kinds::tests::s17_each_images_command_runs_its_harness_as_its_adapter_drives_it`), and
+    /// what every launch of it begins with (`s17_every_launch_begins_with_its_base`).
+    pub fn base_args(&self) -> Vec<String> {
+        let words = |w: &[&str]| w.iter().map(|a| (*a).to_owned()).collect();
+        match self.protocol {
+            // Its stream-json flags: those a session that asks for nothing is started with.
+            Protocol::ClaudeStreamJson => super::claude::args(&Spec { allow_bypass: false, ..Spec::default() }, None),
+            Protocol::CodexAppServer => super::codex::args(),
+            Protocol::Acp(args) => words(args),
+            Protocol::AgyStreamJson => words(&["--input-format", "stream-json", "--output-format", "stream-json"]),
+            Protocol::PiRpc => words(&["--mode", "rpc"]),
+            Protocol::Terminal => Vec::new(),
+        }
+    }
+}
+
+/// Whether `key` is a person's locale or time zone, the variables POSIX gives them (POSIX.1-2017,
+/// Base Definitions §8.2, Internationalization Variables: `LANG`, `LC_ALL` and the `LC_*`
+/// categories; §8.3, `TZ`): what an isolated harness takes of the session's environment.
+fn locale_or_zone(key: &str) -> bool {
+    matches!(key, "TZ" | "LANG" | "LC_ALL" | "LC_COLLATE" | "LC_CTYPE" | "LC_MESSAGES" | "LC_MONETARY" | "LC_NUMERIC" | "LC_TIME")
 }
 
 impl Kind {
@@ -322,7 +392,12 @@ fn local_tools(_spec: &Spec) -> Option<(std::path::PathBuf, &'static str, Option
 }
 
 /// The MCP servers an ACP agent's session gets (`session/new`'s `mcpServers`): the runner's own.
+/// None for an isolated one: the runner's socket and kiln's program aren't in its microVM (kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 18 brings kiln's tools there).
 pub fn acp_servers(spec: &Spec, session: &str) -> Vec<serde_json::Value> {
+    if spec.isolation.is_some() {
+        return Vec::new();
+    }
     #[cfg(unix)]
     if let Some((kiln, sock, prefer)) = local_tools(spec) {
         return vec![crate::reach::mcp::acp_config(&kiln, sock, prefer, session)];
@@ -1829,5 +1904,46 @@ mod tests {
             assert_eq!(shown(&core, "m1"), if legacy { "Plans, one tab" } else { "" });
             assert_eq!(shown(&core, "m2"), if legacy { "Research" } else { "" });
         }
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17: every launch kiln's adapter makes of a
+    /// harness begins with its base, so an isolated one is its image's command and the session's
+    /// own arguments past it, whatever the session asks.
+    #[test]
+    fn s17_every_launch_begins_with_its_base() -> anyhow::Result<()> {
+        let asks = [
+            Spec::default(),
+            Spec { allow_bypass: false, ..Spec::default() },
+            Spec { model: Some("m".into()), mode: Some("plan".into()), effort: Some("high".into()), resume: Some("0198c9a2-1c4b-7a8e-9e2d-5f3a1b2c3d4e".into()), max_subagents: Some(3), ..Spec::default() },
+        ];
+        for kind in Kind::all().iter().filter(|k| k.structured()) {
+            for ask in &asks {
+                let run = kind.elsewhere(&Spec { kind: kind.id.into(), ..ask.clone() })?;
+                assert_eq!(run.member, kind.id);
+                // kiln's MCP server, its skills and its hooks are reached through this machine's
+                // runner, which no microVM reaches.
+                let tools = |a: &String| a == "--mcp-config" || a == "--plugin-dir" || a.starts_with("mcp_servers.") || a.starts_with("hooks.");
+                assert!(!run.args.iter().any(tools), "{}: none of kiln's own tools in a microVM: {:?}", kind.id, run.args);
+            }
+        }
+        Ok(())
+    }
+
+    /// Step 17: each image kiln ships runs its harness as kiln's adapter drives it: its Agentfile
+    /// declares the harness by its id, the member an isolated launch names, and its command
+    /// (`harness.json`'s `run.command`) carries the adapter's base arguments, in order.
+    #[test]
+    fn s17_each_images_command_runs_its_harness_as_its_adapter_drives_it() -> anyhow::Result<()> {
+        for b in crate::agentfiles::builtin::ALL {
+            let kind = Kind::get(b.harness).ok_or_else(|| anyhow::anyhow!("{} runs no harness kiln knows ({})", b.name, b.harness))?;
+            assert!(b.text.lines().any(|l| l.trim_start().starts_with(&format!("HARNESS {} ", kind.id))), "{} declares no HARNESS {}", b.name, kind.id);
+            let json = b.files.iter().find(|(n, _)| *n == "harness.json").map(|(_, t)| *t).ok_or_else(|| anyhow::anyhow!("{} has no harness.json", b.name))?;
+            let config: serde_json::Value = serde_json::from_str(json)?;
+            let command: Vec<String> = config.pointer("/run/command").and_then(serde_json::Value::as_array).map(|c| c.iter().filter_map(|w| w.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+            let args = command.get(1..).unwrap_or_default();
+            let base = kind.base_args();
+            assert!(base.is_empty() || args.windows(base.len()).any(|w| w == base.as_slice()), "{}'s command {command:?} lacks {}'s base {base:?}", b.name, kind.name);
+        }
+        Ok(())
     }
 }

@@ -850,14 +850,17 @@ pub fn isolation_for(asked: Option<&str>, parent: Option<&Info>) -> Result<Optio
 
 /// Whether agents on `target` (`local`, `agent:<machine>`) can be held isolated, in microVMs of
 /// their own: its runner says it starts microVMs (`virt.microvm`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
-/// step 32); else why not. The server's own kiln starts none until it carries their runtime (step 16).
+/// step 32); else why not, in its own words where it says them (`isolation.why_not`, step 17). The
+/// server's own kiln starts none until it carries their runtime (step 16).
 pub fn isolation_on(hub: &Hub, target: &str) -> Result<(), String> {
     let Some(machine) = target.strip_prefix("agent:") else {
         return Err("the server's kiln starts no microVM itself until it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16): pick a runner that does with `on` (`microvm`)".to_owned());
     };
-    match hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().map(|f| f.virt.microvm)) {
-        Some(true) => Ok(()),
-        Some(false) => Err(format!("{} doesn't start microVMs: its kiln starts them once it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16)", hub.shown(machine))),
+    let said = hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().map(|f| (f.virt.microvm, f.isolation.as_ref().and_then(|i| i.why_not.clone()))));
+    match said {
+        Some((true, _)) => Ok(()),
+        Some((false, Some(why))) => Err(format!("{} doesn't start microVMs: {why}", hub.shown(machine))),
+        Some((false, None)) => Err(format!("{} doesn't start microVMs: its kiln starts them once it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16)", hub.shown(machine))),
         None => Err(format!("{} hasn't said yet whether it starts microVMs: try again in a minute", hub.shown(machine))),
     }
 }
@@ -1363,6 +1366,27 @@ mod tests {
                 let why = isolation_on(&hub, target).err().unwrap_or_default();
                 anyhow::ensure!(!why.is_empty(), "{target} refuses an isolated agent, saying why");
             }
+            Ok(())
+        })
+    }
+
+    /// Step 17: a runner that says why it holds no isolated agent (its facts' `isolation.why_not`) is
+    /// refused in its own words; one from before those facts, in kiln's.
+    #[test]
+    fn s17_an_isolated_agent_refused_on_a_runner_says_the_runners_own_reason() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let why = "this runner has no hypervisor it can use";
+            let said = |name: &str, isolation: Option<kiln_ci::facts::Isolation>| crate::hub::AgentLive {
+                facts: Some(Box::new(kiln_ci::facts::RunnerFacts { isolation, ..Default::default() })),
+                ..crate::hub::tests::live_runner(name, "linux", "x86_64")
+            };
+            hub.put_agent(said("no-hypervisor", Some(kiln_ci::facts::Isolation { available: false, hypervisor: None, why_not: Some(why.to_owned()) })));
+            hub.put_agent(said("older", None));
+            let refused = isolation_on(&hub, "agent:no-hypervisor").err().unwrap_or_default();
+            anyhow::ensure!(refused.ends_with(why), "the runner's own reason: {refused}");
+            let older = isolation_on(&hub, "agent:older").err().unwrap_or_default();
+            anyhow::ensure!(older.contains("once it carries their runtime"), "kiln's reason: {older}");
             Ok(())
         })
     }

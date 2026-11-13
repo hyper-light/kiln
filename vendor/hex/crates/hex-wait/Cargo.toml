@@ -1,0 +1,18 @@
+[package]
+name = "hex-wait"
+description = "Hex's deadline waits: a condition variable, and the mutex it waits with, whose timed waits return by their deadline on every platform Hex runs on"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# macOS only: a waiter's kqueue, made by rustix's safe kqueue(2) and armed through libc's kevent(2), which alone
+# marks a timer NOTE_CRITICAL (docs/design/deadline-waits.md). Elsewhere the crate is std's Condvar and Mutex.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+rustix.workspace = true
+
+[lints]
+workspace = true

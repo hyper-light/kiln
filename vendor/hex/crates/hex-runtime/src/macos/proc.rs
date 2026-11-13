@@ -221,12 +221,14 @@ impl BoxProc {
                 Some(actual) if actual.started != started => Err(ProcessFailure::DifferentStart {
                     observed: actual.started,
                 }),
-                Some(actual) if actual.ended || exiting => {
+                Some(actual) if !actual.ended && !exiting => Ok(None),
+                // Ended, or no process at its pid at all: its parent reaped it since (launchd reaps a helper whose
+                // node ended), so its end is no longer knowable here, as a Retained child reaped elsewhere
+                // (ECHILD) reads (AC-T7.4.1).
+                _ => {
                     self.exit = Some(Exit::Unknown);
                     Ok(self.exit)
                 }
-                Some(_) => Ok(None),
-                None => Err(ProcessFailure::InvalidStartRecord),
             };
         }
         let pid = Pid::from_raw(self.pid).ok_or(ProcessFailure::PidOutOfRange {
@@ -548,5 +550,43 @@ fn exit_of(status: &rustix::process::WaitIdStatus) -> Exit {
         Exit::Code(code)
     } else {
         Exit::Unknown
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AC-T7.4.1 (the original of macos_pool_restart's release refused "observing exact helper: process stat has
+    /// no valid starttime"): a Borrowed observer, as a restarted node holds of the helper it isn't the parent
+    /// of, polls a process whose parent reaped it after the observer was bound (launchd reaps the helper as
+    /// the node polls it). Do: bind one to a live child, then end and reap the child here, and poll. Expect its
+    /// end read, Unknown (its reaper took its status), never an invalid start record: no process at its pid is
+    /// the end the poll waits for.
+    #[test]
+    fn a_borrowed_observer_reads_a_process_reaped_since_as_ended() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("100000")
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let started = super::super::sys::rusage(pid).unwrap().unwrap().started;
+        let (mut observer, registered) =
+            Prepared::new()
+                .unwrap()
+                .bind(pid, None, Reaping::Borrowed { started });
+        registered.unwrap();
+        assert_eq!(
+            observer.native_poll(),
+            Ok(None),
+            "a live process read as ended"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            super::super::sys::rusage(pid).unwrap().is_none(),
+            "the reaped child's pid is another process's"
+        );
+        assert_eq!(observer.native_poll(), Ok(Some(Exit::Unknown)));
     }
 }

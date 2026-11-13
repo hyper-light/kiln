@@ -28,6 +28,7 @@ hex-health = { path = "crates/hex-health", version = "0.1.0" }
 hex-gpu = { path = "crates/hex-gpu", version = "0.1.0" }
 hex-afunix = { path = "crates/hex-afunix", version = "0.1.0" }
 hex-quic = { path = "crates/hex-quic", version = "0.1.0" }
+hex-wait = { path = "crates/hex-wait", version = "0.1.0" }
 # Shards' guests (docs/design/shards-guest.md §2, Appendix A): the oci class's Linux guest on macOS and
 # Windows. By name and version, patched below to a copy of Shards' draft until Shards lands it, then to
 # vendor/shards as every other vendored project (vendor/shards/Cargo.toml says which).
@@ -91,7 +92,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
-    "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",

@@ -186,7 +186,7 @@ impl Report {
 
 /// Jain, Chiu and Hawe's fairness index (DEC-TR-301, 1984) of `shares`, each in parts per million: `(sum x)^2 / (n
 /// sum x^2)`, a million when every share is equal.
-fn jain(shares: &[u64]) -> u64 {
+pub(super) fn jain(shares: &[u64]) -> u64 {
     let (sum, squares) = shares.iter().fold((0u128, 0u128), |(s, q), x| {
         let x = u128::from(*x);
         (s.saturating_add(x), q.saturating_add(x.saturating_mul(x)))

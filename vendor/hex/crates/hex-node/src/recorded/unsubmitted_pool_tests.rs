@@ -73,6 +73,7 @@ fn cpu_sibling(store: &Store) -> BoxRecord {
             allocation: None,
             devices: Vec::new(),
             route: None,
+            band: 0,
         },
         Phase::Ready,
         Vec::new(),

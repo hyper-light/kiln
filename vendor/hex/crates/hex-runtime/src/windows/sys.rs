@@ -19,19 +19,14 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, CompareObjectHandles, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS,
-    DuplicateHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
-    ERROR_MORE_DATA, ERROR_NOT_ENOUGH_QUOTA, FILETIME, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+    DuplicateHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA,
+    ERROR_NOT_ENOUGH_QUOTA, FILETIME, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
     INVALID_SOCKET, POLLERR, POLLHUP, POLLNVAL, POLLRDNORM, SOCKET, SOCKET_ERROR, WSAEINTR,
     WSAGetLastError, WSAPOLLFD, WSAPoll,
 };
-use windows_sys::Win32::Security::{
-    GetKernelObjectSecurity, GetLengthSid, GetSecurityDescriptorOwner, IsValidSid,
-    OWNER_SECURITY_INFORMATION, PSID,
-};
-use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
     JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
@@ -42,18 +37,18 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation, OpenJobObjectW,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::ProcessStatus::{
-    K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
-};
 use windows_sys::Win32::System::Threading::{
-    ALL_PROCESSOR_GROUPS, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    CreateEventW, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetActiveProcessorCount, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_DUP_HANDLE,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResetEvent,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetEvent, TerminateProcess,
-    WaitForMultipleObjects, WaitForSingleObject,
+    ALL_PROCESSOR_GROUPS, BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW,
+    CreateProcessW, CreateWaitableTimerExW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetActiveProcessorCount, GetCurrentProcess, GetCurrentThread,
+    GetExitCodeProcess, GetProcessTimes, GetSystemTimes, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_DUP_HANDLE, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResetEvent, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetEvent, SetPriorityClass,
+    SetThreadPriority, SetWaitableTimer, THREAD_PRIORITY_TIME_CRITICAL, TIMER_ALL_ACCESS,
+    TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use hex_core::job::Cpu;
@@ -445,9 +440,6 @@ pub struct Limits {
 /// `_SET_ATTRIBUTES`, `_QUERY`, `_TERMINATE`; windows-sys has them only under
 /// `Win32_System_SystemServices`): start members in it, set its limits, read it, end it.
 const JOB_RIGHTS: u32 = 0x0001 | 0x0002 | 0x0004 | 0x0008;
-/// What a capacity scope's read takes of a holder's job (CV12), and no more: `JOB_OBJECT_QUERY` (winnt.h, 0x0004) to list
-/// its processes, and `READ_CONTROL` to read its owner.
-const SCOPE_RIGHTS: u32 = 0x0004 | READ_CONTROL;
 
 /// A box's job: created, limited, its member started inside it, its accounting read, and ended. The
 /// handle is closed on drop; with kill-on-close set, that ends every process still in the job.
@@ -685,176 +677,6 @@ impl Job {
             }
         }
         Ok(list)
-    }
-
-    /// The job named `name`, opened to read alone (`SCOPE_RIGHTS`), if one is: a capacity holder's scope, whose owner
-    /// and memory the host reads for its room's credit (joint plan step 13, CV12).
-    pub fn open_to_read(name: &str) -> io::Result<Option<Job>> {
-        let wide = job_name_wide(name)?;
-        // SAFETY: `wide` is a NUL-terminated name alive for the call; not inherited. The handle returned is owned
-        // below.
-        let h = unsafe { OpenJobObjectW(SCOPE_RIGHTS, 0, wide.as_ptr()) };
-        if h.is_null() {
-            let e = last_error();
-            if e.raw_os_error() == i32::try_from(ERROR_FILE_NOT_FOUND).ok() {
-                return Ok(None);
-            }
-            return Err(e);
-        }
-        // SAFETY: h is a job handle this call returned, owned from here.
-        Ok(Some(Job(unsafe { Handle::own(h) })))
-    }
-
-    /// The job's owner, its SID's binary form (MS-DTYP 2.4.2), read from the job's security descriptor.
-    pub fn owner(&self) -> io::Result<Vec<u8>> {
-        let mut needed = 0u32;
-        // SAFETY: with a null buffer and a length of 0, GetKernelObjectSecurity writes only the length it needs into
-        // `needed`, alive for the call.
-        unsafe {
-            GetKernelObjectSecurity(
-                self.0.raw(),
-                OWNER_SECURITY_INFORMATION,
-                null_mut(),
-                0,
-                &raw mut needed,
-            )
-        };
-        let len = usize::try_from(needed).map_err(io::Error::other)?;
-        if len == 0 {
-            return Err(last_error());
-        }
-        // Held in pointer-sized words, so the descriptor is aligned as the SDK lays its parts out.
-        let words = len.div_ceil(size_of::<usize>());
-        let mut sd = Vec::<usize>::new();
-        sd.try_reserve_exact(words).map_err(io::Error::from)?;
-        sd.resize(words, 0);
-        let bytes = words
-            .checked_mul(size_of::<usize>())
-            .and_then(|b| u32::try_from(b).ok())
-            .ok_or_else(|| io::Error::other("a job's security descriptor exceeds a DWORD"))?;
-        // SAFETY: `sd` holds `bytes` writable bytes, alive for the call, and GetKernelObjectSecurity writes at most
-        // that many.
-        if unsafe {
-            GetKernelObjectSecurity(
-                self.0.raw(),
-                OWNER_SECURITY_INFORMATION,
-                sd.as_mut_ptr().cast(),
-                bytes,
-                &raw mut needed,
-            )
-        } == 0
-        {
-            return Err(last_error());
-        }
-        let mut owner: PSID = null_mut();
-        let mut defaulted = 0;
-        // SAFETY: `sd` holds the descriptor just written, alive; the owner pointer given back points into it.
-        if unsafe {
-            GetSecurityDescriptorOwner(sd.as_mut_ptr().cast(), &raw mut owner, &raw mut defaulted)
-        } == 0
-        {
-            return Err(last_error());
-        }
-        // SAFETY: a null owner is refused first; else it points into `sd`, which outlives these reads.
-        if owner.is_null() || unsafe { IsValidSid(owner) } == 0 {
-            return Err(io::Error::other(
-                "the job's descriptor names no valid owner",
-            ));
-        }
-        // SAFETY: owner is a valid SID inside `sd`.
-        let n = usize::try_from(unsafe { GetLengthSid(owner) }).map_err(io::Error::other)?;
-        // SAFETY: owner points at a valid SID of `n` bytes inside `sd`, alive for this copy.
-        Ok(unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), n) }.to_vec())
-    }
-
-    /// What the job's processes hold resident of their own now: the sum of each one's private working set
-    /// (`PROCESS_MEMORY_COUNTERS_EX2`), which the machine's available physical memory lacks. Memory they share
-    /// isn't counted, so the sum is never more than what they take of it. A process that ended since the listing
-    /// holds nothing; one this process may not read is an error.
-    pub fn private_resident(&self) -> io::Result<u64> {
-        let count = usize::try_from(self.process_list()?.NumberOfAssignedProcesses)
-            .map_err(io::Error::other)?;
-        if count == 0 {
-            return Ok(0);
-        }
-        let header = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
-        let header_words = header.div_ceil(size_of::<usize>());
-        let words = header_words
-            .checked_add(count)
-            .ok_or_else(|| io::Error::other("a job's process list overflows"))?;
-        let mut list = Vec::<usize>::new();
-        list.try_reserve_exact(words).map_err(io::Error::from)?;
-        list.resize(words, 0);
-        let bytes = words
-            .checked_mul(size_of::<usize>())
-            .and_then(|b| u32::try_from(b).ok())
-            .ok_or_else(|| io::Error::other("a job's process list exceeds a DWORD"))?;
-        // SAFETY: `list` holds `bytes` writable bytes, aligned for the SDK structure and alive for the call; the
-        // query writes at most that many. A list that grew since the count is cut to what was written.
-        if unsafe {
-            QueryInformationJobObject(
-                self.0.raw(),
-                JobObjectBasicProcessIdList,
-                list.as_mut_ptr().cast(),
-                bytes,
-                null_mut(),
-            )
-        } == 0
-        {
-            let error = last_error();
-            if error.raw_os_error() != i32::try_from(ERROR_MORE_DATA).ok() {
-                return Err(error);
-            }
-        }
-        // SAFETY: `list` begins with the structure's header, written by the query, and holds at least one whole
-        // structure (one id a process, and `count` is at least one).
-        let written =
-            unsafe { std::ptr::read(list.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()) };
-        let listed = usize::try_from(written.NumberOfProcessIdsInList)
-            .map_err(io::Error::other)?
-            .min(count);
-        let ids = list
-            .get(header_words..)
-            .and_then(|ids| ids.get(..listed))
-            .unwrap_or_default();
-        let cb = u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS_EX2>())
-            .map_err(|_| io::Error::other("memory counters exceed a DWORD"))?;
-        let mut sum = 0u64;
-        for id in ids {
-            let pid = u32::try_from(*id).map_err(io::Error::other)?;
-            // SAFETY: opens process `pid` for a limited query, not inherited; the handle returned is owned below.
-            let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-            if h.is_null() {
-                let e = last_error();
-                // The process ended since the listing: it holds nothing.
-                if e.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() {
-                    continue;
-                }
-                return Err(e);
-            }
-            // SAFETY: h is a process handle this call returned, owned from here.
-            let process = unsafe { Handle::own(h) };
-            let mut counters: PROCESS_MEMORY_COUNTERS_EX2 = zeroed_struct();
-            counters.cb = cb;
-            // SAFETY: K32GetProcessMemoryInfo writes at most `cb` bytes, one PROCESS_MEMORY_COUNTERS_EX2, into
-            // `counters`, alive for the call; the handle has PROCESS_QUERY_LIMITED_INFORMATION.
-            if unsafe {
-                K32GetProcessMemoryInfo(
-                    process.raw(),
-                    (&raw mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
-                    cb,
-                )
-            } == 0
-            {
-                return Err(last_error());
-            }
-            let private =
-                u64::try_from(counters.PrivateWorkingSetSize).map_err(io::Error::other)?;
-            sum = sum
-                .checked_add(private)
-                .ok_or_else(|| io::Error::other("a job's resident memory overflows"))?;
-        }
-        Ok(sum)
     }
 
     /// Ends every process in the job with `code`, at once. Idempotent: an already-empty job is fine.
@@ -1252,6 +1074,86 @@ pub(crate) fn wait_either(first: &Handle, second: &Handle) -> io::Result<bool> {
             Ok(false)
         }
         _ => Err(last_error()),
+    }
+}
+
+/// Joint plan step 14 (AC-T7.4.1): runs the calling thread at `THREAD_PRIORITY_TIME_CRITICAL`, so a sampler keeps its own
+/// deadlines beside busy threads of normal priority (the Windows charge-window probe's,
+/// crates/hex-runtime/tests/windows_charge_window.rs).
+pub fn time_critical() -> io::Result<()> {
+    // SAFETY: GetCurrentThread returns the calling thread's pseudo-handle, valid for this call and closing nothing;
+    // SetThreadPriority takes it and a documented priority level.
+    if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) } == 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// Joint plan step 14 (AC-T7.4.1): runs the calling process at `BELOW_NORMAL_PRIORITY_CLASS`, so its busy threads give
+/// way to a sampler of normal priority or above (the charge-window probe's spinners).
+pub fn below_normal() -> io::Result<()> {
+    // SAFETY: GetCurrentProcess returns the calling process's pseudo-handle, valid for this call and closing nothing;
+    // SetPriorityClass takes it and a documented priority class.
+    if unsafe { SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS) } == 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// Joint plan step 14 (AC-T7.4.1): the machine's idle, kernel and user time so far, in 100 ns, summed over its
+/// processors (`GetSystemTimes`; kernel time holds idle time), so the charge-window probe can say what else ran.
+pub fn system_times() -> io::Result<[u64; 3]> {
+    let (mut idle, mut kernel, mut user): (FILETIME, FILETIME, FILETIME) =
+        (zeroed_struct(), zeroed_struct(), zeroed_struct());
+    // SAFETY: three FILETIMEs this frame owns, each written by the call.
+    if unsafe { GetSystemTimes(&raw mut idle, &raw mut kernel, &raw mut user) } == 0 {
+        return Err(last_error());
+    }
+    let time = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    Ok([time(idle), time(kernel), time(user)])
+}
+
+/// A high-resolution waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`): a wait on it ends near its due time, not
+/// at the system timer's tick (15.6 ms unless raised), so a sampler can keep a 1 ms cadence without spinning (joint
+/// plan step 14's charge-window probe).
+pub struct HighResTimer(Handle);
+
+impl HighResTimer {
+    pub fn new() -> io::Result<Self> {
+        // SAFETY: no security attributes and no name are allowed; the flag and the access are documented values. The
+        // handle returned, where not null, is this process's own and owned below.
+        let h = unsafe {
+            CreateWaitableTimerExW(
+                null(),
+                null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS,
+            )
+        };
+        if h.is_null() {
+            return Err(last_error());
+        }
+        // SAFETY: a timer handle just made, owned from here.
+        Ok(Self(unsafe { Handle::own(h) }))
+    }
+
+    /// Waits `after` from now: the timer is set that far ahead, relative (a negative due time, in 100 ns), and waited
+    /// on.
+    pub fn wait(&self, after: std::time::Duration) -> io::Result<()> {
+        let due = i64::try_from(after.as_nanos() / 100)
+            .ok()
+            .and_then(i64::checked_neg)
+            .ok_or_else(|| io::Error::other("a timer's due time passes an i64 of 100 ns"))?;
+        // SAFETY: the timer is a valid handle this value owns; `due` outlives the call; no period, no completion
+        // routine and no argument for one, and no resume from suspend.
+        if unsafe { SetWaitableTimer(self.0.raw(), &due, 0, None, null(), 0) } == 0 {
+            return Err(last_error());
+        }
+        // SAFETY: the timer is a valid handle this value owns; the wait ends when it is signalled.
+        match unsafe { WaitForSingleObject(self.0.raw(), u32::MAX) } {
+            WAIT_OBJECT_0 => Ok(()),
+            _ => Err(last_error()),
+        }
     }
 }
 

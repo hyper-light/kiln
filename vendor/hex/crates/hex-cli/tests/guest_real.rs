@@ -70,6 +70,7 @@ impl OciBoxes {
                 hosts: Vec::new(),
             })),
             owner: None,
+            band: 0,
         }
     }
 }

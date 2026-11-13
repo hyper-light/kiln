@@ -400,3 +400,44 @@ fn hex_quic_22_a_node_that_stages_nothing_refuses_staging_by_type() {
     });
     assert!(big.is_ok(), "{:?}", big.err());
 }
+
+/// HEX-QUIC-23's cause on Windows (docs/design/hex-quic.md Q8; AC-T7.4.1): do dial a node whose endpoint is shaped by
+/// a Windows host's platform, jupiter's as its node reads it (2^24 handles, 41,150 threads by its commit room over a
+/// worker's stack, 2^23 programs by half its handle table); expect the peer connected, the node laying out at the
+/// connection's start (quinn's `StreamsState::new`) a lane for each connection that can do work at once: a control
+/// connection a call, a stdio connection a thread, and the log's. Counted by its programs' streams it laid out
+/// 25,330,425, which held its driver past QUIC's idle timeout, and the dial was refused Unreachable.
+#[test]
+fn a_peer_connects_to_a_node_shaped_by_a_windows_hosts_platform() {
+    let host = crate::serve::limits(&crate::serve::Platform {
+        descriptors: 1 << 24,
+        threads: 41_150,
+        programs: 1 << 23,
+    });
+    let ca = SimCa::new().unwrap();
+    let node = Endpoint::start(Config {
+        credentials: enrolled(&ca, "node.windows-host.test"),
+        bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        listen: true,
+        serves: ports(false),
+        shape: shape(&host, false),
+    })
+    .unwrap();
+    let client = Endpoint::start(Config {
+        credentials: enrolled(&ca, "client.windows-host.test"),
+        bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        listen: false,
+        serves: Vec::new(),
+        shape: Shape {
+            connections: 1,
+            lanes: 4,
+        },
+    })
+    .unwrap();
+    let dialed = within(&DIAL, |by| {
+        client.dial("node.windows-host.test", node.local_addr(), by)
+    });
+    assert!(dialed.is_ok(), "{:?}", dialed.err());
+    let lanes = usize::try_from(shape(&host, false).lanes).unwrap();
+    assert_eq!(lanes, 2 * host.in_flight + 1);
+}

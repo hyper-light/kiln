@@ -22,6 +22,8 @@ rcgen.workspace = true
 rustix.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+# Condition variables whose timed waits end at their deadlines on macOS too (docs/design/deadline-waits.md).
+hex-wait.workspace = true
 webpki.workspace = true
 
 [dev-dependencies]

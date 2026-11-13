@@ -45,6 +45,7 @@ pub fn rewrite(
         devices,
         allocation,
         route,
+        band,
     } = spec;
     let mut items = Vec::new();
     let class = match class {
@@ -109,6 +110,7 @@ pub fn rewrite(
             devices,
             allocation,
             route,
+            band,
         },
         items,
     })
