@@ -29,7 +29,7 @@ whole stack a run measured. Hex is driven through its own scheduler's command li
   (`start_failed`, `refused`), and the fill stops there. An ended ask's descriptors close with it.
 - **The driver** decides how a VM is asked for: `shards`, the direct driver (below), the baseline
   every placer is held to and the harness's light test; `hex`, a Hex scheduler of the run's own
-  ("The hex driver", below). Owed: `kiln` (Owed, below).
+  ("The hex driver", below); `kiln`, kiln's balancer ("The kiln driver", below).
 
 `kiln run`'s stdin is buffered until it ends (measured: eight lines written 2 s apart all arrived
 after the last), so it carries no commands to a running agent: each agent runs its plan on its own
@@ -81,6 +81,34 @@ kiln run --on HOST --needs mem=16g,cpus=8 -- \
 ```
 
 In a plan, a host (or the plan) says `"driver": "hex"`, `"hex": PATH` and `"vm": "cpus=1,mem=512m"`.
+
+## The kiln driver
+
+`--driver kiln --kind claude --asks N` with `KILN_URL` and `KILN_TOKEN` in the environment (the token
+is sent as a bearer token and never recorded): an ask is `agents.start` over kiln's API
+(`POST /api/harness/agents`): one agent of the harness, `isolation: microvm` and `on: microvm`, so
+kiln's balancer places it, by the runners' own admission, on a runner that says it starts microVMs
+(kiln plan steps 17 and 32). `agents.get` follows it until kiln says it stands ready (idle, working,
+waiting on a person: its start, and the machine it went to, `on`), ended or failed; `agents.list` is
+the view; `agents.stop` removes it. kiln's own admission is where the fleet is full: the run asks up to
+`--asks` (the person's number, recorded) in doubling waves, and an ask kiln holds for room (`queued`)
+or refuses is a typed refusal in kiln's words that stops the fill; the drain stops every ask's agent,
+a queued one too should it have started. Before anything is measured, one session (`first-run`) is
+started, followed until ready and stopped: the first start's costs paid once, and a start's time to
+seed the start wait with (kiln refusing it ends the setup, in kiln's words).
+
+Its VMs run on the runners kiln picks, not where the agent runs: it scans none of their processes,
+and the witnesses judge kiln's view alone (a live ask kiln no longer holds is `lost`; one it holds
+for an ended ask is `unasked`). Run it as one agent (one host of a plan), wherever kiln is reachable.
+
+Its live run waits on kiln steps 16 and 17 (no runner says `virt.microvm` until kiln carries Shards
+and Hex, and launches isolated sessions through Hex), and on a harness whose session needs no model
+or account: kiln's fake Claude Code (`crates/kiln/tests/fixtures/fake-claude`) in a user Agentfile,
+once an isolated session takes its image (step 17's `agentfile:<id>`). Owed past it: the hold (a
+control request's round trip and a turn's lines, through `agents.interrupt` and `agents.send`, once
+their answers' timing is read on a live server), each runner's own scan of the VMs kiln placed there,
+and chaos on runners of the run's own (a second runner per machine joined to a server of the run's
+own: production runners are never restarted).
 
 ## The direct driver and its workload
 
@@ -263,9 +291,10 @@ echoes read between its slow spawns, no descriptor left by an ended ask, a spawn
 and a lane it can't serve typed and stopping the fill), a hold over echo lanes (every kind of sample
 on every lane), a mute lane's stall backed off to the run's deadline, the hex driver over a stand-in
 hex (`tests/fake_hex.py`: a run that fills, takes `vm`, `node` and `scheduler` chaos and leaves
-nothing; a refusal typed in Hex's words stopping the fill), asks a placer names no process for judged
-by count, and the report. `mutate.py
-[WORDS…]` removes each of 35 guards (or those whose description holds a word) in a copy and requires
+nothing; a refusal typed in Hex's words stopping the fill), the kiln driver over a stand-in kiln
+(sessions started, followed, placed and stopped; a full fleet's queue and a refusal typed in kiln's
+words stopping the fill), asks a placer names no process for judged by count, and the report. `mutate.py
+[WORDS…]` removes each of 37 guards (or those whose description holds a word) in a copy and requires
 the tests to fail.
 
 ## The profile
@@ -362,12 +391,8 @@ adas-mac-studio.local-2 (25 KB/s Wi-Fi) or jupiter (its kiln runs held by the he
 - **The `hex` driver's live run** ("The hex driver" says what it waits on), the room from Hex's
   capacity view (step 13, `docs/design/capacity-view.md`) rather than `--needs`, and chaos on peers'
   tunnels once peers are set up.
-- **The `kiln` driver** (steps 17 and 32): an isolated session started by `agents.start` with
-  `isolation: microvm`, its harness kiln's fake Claude Code (`crates/kiln/tests/fixtures/fake-claude`,
-  no model, no account) in a user Agentfile; placed by the balancer among runners with `virt.microvm`;
-  its round trip a control request and its stream a turn's lines. Chaos on runners needs runners of the
-  run's own (a second runner process per machine, `KILN_MACHINE_ID`, joined to a server of the run's
-  own): production runners are never restarted.
+- **The `kiln` driver's live run, its hold, per-runner scans and runner chaos** ("The kiln driver"
+  says what each waits on).
 - **jupiter's shards**: the Windows build below sits in adacachy's Windows 11 guest; copying it to
   jupiter (or building there once its headroom guard lets a build run) is ROOT's.
 - **Runs**: a few VMs on one Linux host were run (Record). Hundreds across the fleet, macOS hosts
