@@ -1560,13 +1560,17 @@ impl Acp {
                 let cwd = core.state.cwd.clone();
                 match self.resume.clone().filter(|_| self.can_load) {
                     Some(sid) => {
+                        // Its own session, loaded: the conversation in words (a crashed session's
+                        // resume carries them for an agent that can't load) would say it twice.
+                        self.context = None;
                         self.session = Some(sid.clone());
                         core.state.harness_session = Some(sid.clone());
                         self.request(core, Pending::Session, "session/load", json!({"sessionId": sid, "cwd": cwd, "mcpServers": self.mcp}));
                     }
                     None => {
                         if self.resume.is_some() {
-                            self.notice(core, Level::Warn, "This agent cannot load earlier sessions; starting a new one.");
+                            let how = if self.context.is_some() { "starting a new one, given the conversation in words" } else { "starting a new one" };
+                            self.notice(core, Level::Warn, format!("This agent cannot load earlier sessions; {how}."));
                         }
                         self.request(core, Pending::Session, "session/new", json!({"cwd": cwd, "mcpServers": self.mcp}));
                     }
@@ -2550,6 +2554,34 @@ mod tests {
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s2"}})]);
         assert_eq!(core.meta.modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), [KILN_ASK, KILN_BYPASS]);
         assert_eq!(core.state.mode, KILN_BYPASS);
+        Ok(())
+    }
+
+    /// Ada, 2026-11-13: an ACP agent's crashed session resumed in place loads its own session
+    /// (`session/load` with the stored id) when the agent can, and the words it was given go with
+    /// none of its messages; one that can't load starts a new session, given the words, and says so.
+    #[test]
+    fn resume_in_place_an_acp_agent_loads_its_own_session_by_its_id_else_takes_the_words() -> anyhow::Result<()> {
+        for loads in [true, false] {
+            let mut core = TestCore::new();
+            core.state.cwd = "/w".into();
+            let mut a = Acp::new(Some("acp-own".into()));
+            a.offer_context(Some("<kiln_handoff>earlier</kiln_handoff>".into()));
+            a.start(&mut core);
+            let _ = written(&mut core);
+            feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": loads}}})]);
+            let w = written(&mut core);
+            let asked = w.iter().find(|v| matches!(v.get("method").and_then(Value::as_str), Some("session/load" | "session/new"))).cloned().unwrap_or_default();
+            if loads {
+                assert_eq!(asked.get("method").and_then(Value::as_str), Some("session/load"));
+                assert_eq!(asked.pointer("/params/sessionId").and_then(Value::as_str), Some("acp-own"), "its own id");
+                assert!(a.seeded(), "loaded: the words go with nothing");
+            } else {
+                assert_eq!(asked.get("method").and_then(Value::as_str), Some("session/new"));
+                assert!(!a.seeded(), "the words wait for its first message");
+                assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text.contains("in words"))), "it says so");
+            }
+        }
         Ok(())
     }
 

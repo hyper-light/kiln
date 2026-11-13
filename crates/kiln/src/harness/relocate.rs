@@ -61,12 +61,54 @@ pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     let to = to.strip_prefix("agent:").unwrap_or(to);
     let to = &hub.machine_named(to).unwrap_or_else(|| to.to_owned());
     let moved = start_one(hub, id, to, now, kind, model).await?;
-    for c in all.iter().filter(|c| c.subagent && c.parent.as_deref() == Some(id) && c.status != super::model::Status::Exited && hub.harness.location(&c.id) == leaves) {
+    // Gone on where it was (a stranded session taken up again by its own runner): its subagents are
+    // there already.
+    let stays = leaves.as_ref().is_some_and(|l| *l == Location::Machine(to.clone()));
+    for c in all.iter().filter(|c| !stays && c.subagent && c.parent.as_deref() == Some(id) && c.status != super::model::Status::Exited && hub.harness.location(&c.id) == leaves) {
         if let Err(e) = start_one(hub, &c.id, to, now, None, None).await {
             say(hub, &c.id, &format!("Couldn't go along with its agent to {}: {e}", hub.shown(to))).await;
         }
     }
     Ok(moved)
+}
+
+/// A crashed session (`Status::Crashed`) resumed in place: a fresh harness process on its own
+/// machine, under its own id, continuing its conversation the way its harness does
+/// (`super::moving`: Claude Code its own transcript, Codex a thread of its conversation's items,
+/// the rest its conversation in words), so its plans and goal stack stay its own; then each of
+/// its subagents that crashed with it, still its children. One that ended or errored stays so.
+pub async fn resume(hub: &Arc<Hub>, id: &str) -> Result<serde_json::Value, String> {
+    let all = hub.harness.list();
+    let info = all.iter().find(|i| i.id == id).ok_or_else(|| "no such agent".to_owned())?;
+    if info.status != super::model::Status::Crashed {
+        return Err(format!("only a crashed agent is resumed in place: this one is {}", super::wait::stand(info)));
+    }
+    let Some(Location::Machine(machine)) = hub.harness.location(id) else { return Err("it runs on no machine".into()) };
+    let resumed = start_one(hub, id, &machine, true, None, None).await?;
+    say(hub, id, &resumed_how(&info.kind)).await;
+    let mut children = Vec::new();
+    for c in all.iter().filter(|c| c.parent.as_deref() == Some(id) && c.status == super::model::Status::Crashed) {
+        match start_one(hub, &c.id, &machine, true, None, None).await {
+            Ok(_) => children.push(c.id.clone()),
+            Err(e) => say(hub, &c.id, &format!("Couldn't resume with its agent: {e}")).await,
+        }
+    }
+    Ok(serde_json::json!({ "resumed": resumed, "subagents": children }))
+}
+
+/// What a crashed session of harness `kind` is resumed as, in its timeline: in its own conversation
+/// where its harness keeps one kiln can continue, else said plainly that it's given it in words.
+fn resumed_how(kind: &str) -> String {
+    use super::kinds::{Kind, Protocol};
+    let named = Kind::get(kind).map_or(kind, |k| k.name);
+    match Kind::get(kind).map(|k| k.protocol) {
+        Some(Protocol::ClaudeStreamJson) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own conversation (--resume)."),
+        Some(Protocol::CodexAppServer) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own thread (thread/resume)."),
+        Some(Protocol::AgyStreamJson) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own conversation."),
+        Some(Protocol::PiRpc) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own session (--session-id)."),
+        Some(Protocol::Acp(_)) => format!("It crashed and is resumed in place: a fresh {named} process loading its own session (session/load), or, if it can't load sessions, given the conversation in words, as it says."),
+        Some(Protocol::Terminal) | None => format!("It crashed and can't be resumed in its own conversation: {named} keeps none kiln can continue."),
+    }
 }
 
 /// [`start`], for session `id` alone.
@@ -80,6 +122,13 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
         Some(Location::Local) if hub.harness.never_started(id) => "the kiln server".to_owned(),
         _ => return Err("the kiln server keeps the agents it runs once they've started: only one whose harness never started there moves".into()),
     };
+    // Crashed (its harness gone with the runner process that held it, its machine up: Amphora,
+    // 2026-11-12 21:12:49Z): it goes on there again, under its own id, from the server's copy of
+    // its conversation, as one whose machine is away does on another.
+    if from == to && info.status == super::model::Status::Crashed && kind.is_none() {
+        hub.harness.resume_on(hub, id, &to, Some(info.cwd.clone())).await?;
+        return Ok(serde_json::json!({ "moving": to, "from_store": true }));
+    }
     if from == to {
         return Err(format!("it runs on {} already", hub.shown(&to)));
     }
@@ -292,5 +341,26 @@ mod tests {
         assert_eq!(homed("/tmp", Some("/tmp")), "~");
         assert_eq!(homed("/srv/app", Some("/home/kiln")), "/srv/app");
         assert_eq!(homed("/srv/app", None), "/srv/app");
+    }
+
+    /// Ada, 2026-11-12: a crashed session of every harness kiln supports says how it's resumed in
+    /// place: in its own conversation where its harness keeps one kiln continues (Claude Code), a
+    /// thread of it (Codex), else plainly that it's given it in words, never pretending.
+    #[test]
+    fn resume_in_place_says_how_every_harness_goes_on() {
+        use super::super::kinds::{Kind, Protocol};
+        for k in Kind::all() {
+            let said = resumed_how(k.id);
+            assert!(said.contains(k.name), "{}: {said}", k.id);
+            match k.protocol {
+                Protocol::ClaudeStreamJson => assert!(said.contains("--resume"), "{said}"),
+                Protocol::CodexAppServer => assert!(said.contains("thread/resume"), "{said}"),
+                Protocol::PiRpc => assert!(said.contains("--session-id"), "{said}"),
+                Protocol::AgyStreamJson => assert!(said.contains("its own conversation"), "{said}"),
+                Protocol::Acp(_) => assert!(said.contains("session/load") && said.contains("in words"), "{said}"),
+                Protocol::Terminal => assert!(said.contains("can't be resumed"), "{said}"),
+            }
+        }
+        assert!(resumed_how("no-such-harness").contains("can't be resumed"));
     }
 }
