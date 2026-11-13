@@ -2151,32 +2151,25 @@ mod lane_tests {
         }
     }
 
-    /// A runner's reach node of its own, alone: no server, no peers. What it would send its server
-    /// is kept, unread, as long as the test holds it.
+    /// A runner's reach node of its own, alone: no server, no peers, a runner's usual settings but
+    /// its copies, which stay in `dir`. What it would send its server is kept, unread, as long as
+    /// the test holds it.
     fn node(dir: &std::path::Path) -> anyhow::Result<(crate::reach::node::Handle, crate::memory::queue::Receiver<crate::proto::AgentMsg>)> {
         let config = crate::reach::node::Config {
-            name: "here".into(),
-            dir: dir.join("reach"),
-            accept: true,
             mirrors: dir.join("mirrors"),
-            adopt: None,
             adopt_policy: crate::harness::moving::stream::StoragePolicy::Off,
-            using: Arc::default(),
-            objects: None,
             sense: false,
-            on_battery: kiln_ci::pace::power::OnBattery::default(),
-            place: kiln_ci::place::runner::Settings::default(),
-            version: crate::reach::wire::VERSION,
-            root: Vec::new(),
+            ..crate::reach::node::Config::for_runner("here", dir, true)
         };
         crate::reach::node::start(config)
     }
 
     /// One connection of an isolated session's lane, served in this process with no socket: its
-    /// `initialize` is answered as `kiln reach mcp` answers it, naming the session, and a tool's call
-    /// crosses into this runner in-process and comes back in its node's own words (`runners`: a lone
-    /// node, with no server, says it isn't connected to one, where a request that never reached it
-    /// would end with no answer at all). Nothing of it is Unix's.
+    /// `initialize` is answered as `kiln reach mcp` answers it, naming the session, its `tools/list`
+    /// gives `kiln reach mcp`'s tools, and a tool's call crosses into this runner in-process and
+    /// comes back in its node's own words (`runners`: a lone node, with no server, says it isn't
+    /// connected to one, where a request that never reached it would end with no answer at all).
+    /// Nothing of it is Unix's.
     #[test]
     fn step18_kilns_mcp_over_a_lane_is_answered_in_this_runners_process() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -2185,7 +2178,8 @@ mod lane_tests {
         let asked = [
             json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "lane", "version": "1"}}}),
             json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "runners", "arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "runners", "arguments": {}}}),
         ];
         let input: String = asked.iter().map(|v| format!("{v}\n")).collect();
         let heard = Heard::default();
@@ -2193,7 +2187,10 @@ mod lane_tests {
         let init = heard.answer(1, Duration::from_secs(30))?;
         anyhow::ensure!(init.pointer("/result/protocolVersion").is_some() && init.pointer("/result/serverInfo").is_some(), "{init}");
         anyhow::ensure!(init.pointer("/result/instructions").and_then(Value::as_str).is_some_and(|i| i.contains("lane-s1")), "{init}");
-        let runners = heard.answer(2, Duration::from_secs(30))?;
+        let list = heard.answer(2, Duration::from_secs(30))?;
+        let names: Vec<&str> = list.pointer("/result/tools").and_then(Value::as_array).into_iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str)).collect();
+        anyhow::ensure!(names.get(..6) == Some(&["code_run", "code_search", "runners", "run", "output", "stop"][..]), "not kiln reach mcp's tools: {list}");
+        let runners = heard.answer(3, Duration::from_secs(30))?;
         let listed = runners.pointer("/result/structuredContent/runners").is_some_and(Value::is_array);
         let nodes_own = runners.pointer("/result/structuredContent/error").and_then(Value::as_str) == Some("not connected to the kiln server");
         anyhow::ensure!(listed || nodes_own, "not the runner's own answer: {runners}");
