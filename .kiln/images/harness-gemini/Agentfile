@@ -20,27 +20,32 @@ FROM ${BASE}
 ARG TARGETARCH
 HARNESS gemini FROM ./gemini-${TARGETARCH}
 
-# Its network reach, every part named (default deny): a network for this harness alone, which it joins
-# with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443 out,
-# opened at the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Every endpoint
-# Gemini CLI reaches by default speaks HTTPS (f27): Code Assist (cloudcode-pa.googleapis.com) for a
-# Google sign-in, the Gemini API (generativelanguage.googleapis.com) for a key, Google's OAuth
-# endpoints, and its usage statistics (play.googleapis.com). The npm registry, which only its update
-# check reaches, is never reached: kiln starts it over ACP, which checks for no update, and its system
-# settings turn the check off in every mode (f23). These are the bring-up's grants (Shards'
-# docs/examples/harness-claude) until step 9 grants providers by name. Nothing comes in; no other
-# port or protocol goes out.
-NETWORK --dns --egress=443/tcp provider FOR gemini
-EXPOSE --harnesses=gemini 443/tcp AS egress FOR provider
+# Its network, every part named (default deny; Shards D236, destinations by name): a network for this
+# harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
+# name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
+# resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
+# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
+# docs/research/s18-host-in-vm says where each host comes from).
+# - cloudcode-pa.googleapis.com: Code Assist, where a Google sign-in's turns go
+#   (packages/core/src/code_assist/server.ts at v0.68.0); generativelanguage.googleapis.com: the
+#   Gemini API, a key's (@google/genai 1.30.0's base URL); oauth2.googleapis.com: Google's token
+#   endpoint, a sign-in's refresh and its check that a token isn't revoked (google-auth-library
+#   10.9.0); www.googleapis.com: the signed-in account's user info (oauth2.ts). Its usage statistics
+#   (play.googleapis.com), Vertex AI's regional hosts and npm's update check (off, f23) go nowhere.
+# - host.docker.internal:7070: kiln's MCP at /api/mcp on the machine itself, at kiln's own port (its
+#   http_addr's default, 0.0.0.0:7070). A kiln on another port isn't reached: the image doesn't
+#   grant it, and kiln says so as it starts the harness.
+NETWORK --egress=cloudcode-pa.googleapis.com:443 --egress=generativelanguage.googleapis.com:443 --egress=oauth2.googleapis.com:443 --egress=www.googleapis.com:443 --egress=host.docker.internal:7070 provider FOR gemini
+EXPOSE --harnesses=gemini 443/tcp 7070/tcp AS egress FOR provider
 CONNECT gemini WITH gemini ON provider
 
-# The project, which moves to its own host path with step 8, and the person's home. Gemini CLI keeps
-# its settings, its sign-in, its history, its projects and their memory under $HOME/.gemini (f20,
-# f21). A harness sees the image read-only, with its own /tmp scratch and these volumes alone
-# writable, so a home that is writable and kept from run to run must be a volume: the whole home is
-# the person's volume (step 7's shape) and harness.json sets HOME=/home/gemini. What the programs it
-# runs keep in a home lands there too. HOME in run.env needs a shards at or after 997f4e47e (release
-# v0.8.0 and later), where run.env replaces init's HOME=/tmp. Both volumes are the harness's alone,
-# and outside /tmp, which the scratch covers.
-VOLUME --target-kind=harness /workspace FOR gemini
+# Its project is plugged in as it starts, at the path it has on the machine (Shards D235), so kiln
+# reads its diffs, HEAD and checkpoints at that same path, and no volume holds it. Its HOME is the
+# person's volume, whole: harness.json sets HOME=/home/gemini, kiln's one rule for every harness it
+# ships (step 18). A harness sees its image read-only, with its own /tmp scratch, so a HOME that is
+# writable and kept from run to run is a volume, and what the programs it runs keep in a home (a
+# .gitconfig, a tool's sign-in) is kept with it. Gemini CLI keeps its settings, its sign-in, its
+# history, its projects and their memory under $HOME/.gemini (f20, f21).
+# HOME in run.env needs a shards at or after 997f4e47e (v0.8.0 and later), where run.env replaces
+# init's HOME=/tmp. The volume is the harness's alone, and outside /tmp, which the scratch covers.
 VOLUME --target-kind=harness /home/gemini FOR gemini

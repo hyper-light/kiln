@@ -17,8 +17,8 @@
 //!
 //! Which volumes hold its configuration is read from the image, not named here: those at, above or
 //! beneath a path its harness's run environment names (`HOME=/home/claude`, `CODEX_HOME`,
-//! `XDG_CONFIG_HOME` ...). The project's volume (`/workspace`, until step 8 plugs the project at its
-//! host path) is named by none.
+//! `XDG_CONFIG_HOME` ...). The project is no volume: Shards plugs it in at its host path (D235). A
+//! volume none of those names (an older image's `/workspace`) isn't taken for its configuration.
 
 use std::path::{Path, PathBuf};
 

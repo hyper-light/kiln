@@ -21,18 +21,32 @@ FROM ${BASE}
 ARG TARGETARCH
 HARNESS pi FROM ./pi-${TARGETARCH}
 
-# Its providers over HTTPS, as the bring-up proved them (f20): a network for pi alone, names resolved
-# by the microVM (--dns), and TCP 443 out at the network's boundary and the microVM's, where pi's
-# hosted providers, pi.dev and GitHub answer. Nothing in, and no other port or protocol out: an
-# endpoint on another port (a local Ollama, say) waits for step 9's grants by name, which replace
-# these three lines.
-NETWORK --dns --egress=443/tcp provider FOR pi
+# Its network, every part named (default deny; Shards D236, destinations by name): a network for this
+# harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
+# name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
+# resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
+# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
+# docs/research/s18-host-in-vm says where each host comes from).
+# - pi takes the provider its person configures, so each provider pi 1.5.2's own build carries at a
+#   fixed public host is granted (its model catalog's base URLs), with the sign-in hosts of those it
+#   signs in to itself (Anthropic, GitHub Copilot, Kimi, Meta, OpenAI, xAI), and pi.dev, its
+#   catalog's refreshes (f19). Not granted: a cloud platform's model service, which its own account
+#   places (Bedrock, Vertex AI, Azure, Cloudflare); a local server or an endpoint on another port (a
+#   local Ollama, f20). Each of those needs an Agentfile of your own, made from this one. kiln's MCP
+#   isn't granted: pi takes none from kiln.
+NETWORK --egress=ai-gateway.vercel.sh:443 --egress=api.ant-ling.com:443 --egress=api.anthropic.com:443 --egress=api.cerebras.ai:443 --egress=api.deepseek.com:443 --egress=api.fireworks.ai:443 --egress=api.github.com:443 --egress=api.groq.com:443 --egress=api.individual.githubcopilot.com:443 --egress=api.kimi.com:443 --egress=api.meta.ai:443 --egress=api.minimax.io:443 --egress=api.minimaxi.com:443 --egress=api.mistral.ai:443 --egress=api.moonshot.ai:443 --egress=api.moonshot.cn:443 --egress=api.openai.com:443 --egress=api.together.ai:443 --egress=api.typesafe.ai:443 --egress=api.x.ai:443 --egress=api.xiaomimimo.com:443 --egress=api.z.ai:443 --egress=auth.kimi.com:443 --egress=auth.meta.com:443 --egress=auth.openai.com:443 --egress=auth.x.ai:443 --egress=chatgpt.com:443 --egress=claude.ai:443 --egress=generativelanguage.googleapis.com:443 --egress=github.com:443 --egress=inference.baseten.co:443 --egress=integrate.api.nvidia.com:443 --egress=open.bigmodel.cn:443 --egress=opencode.ai:443 --egress=openrouter.ai:443 --egress=pi.dev:443 --egress=platform.claude.com:443 --egress=radius.pi.dev:443 --egress=router.huggingface.co:443 --egress=token-plan-ams.xiaomimimo.com:443 --egress=token-plan-cn.xiaomimimo.com:443 --egress=token-plan-sgp.xiaomimimo.com:443 --egress=token-plan.ap-southeast-1.maas.aliyuncs.com:443 --egress=token-plan.cn-beijing.maas.aliyuncs.com:443 provider FOR pi
 EXPOSE --harnesses=pi 443/tcp AS egress FOR provider
 CONNECT pi WITH pi ON provider
 
-# Two volumes of pi's alone (f22): the project, and the person's pi config directory,
-# PI_CODING_AGENT_DIR in harness.json, which holds everything pi keeps for them (its sign-in in
-# auth.json, its settings, models and sessions; f15). No credential is in the image, in a file, an
-# ENV or an ARG (f27).
-VOLUME --target-kind=harness /workspace FOR pi
-VOLUME --target-kind=harness /home/pi/.pi/agent FOR pi
+# Its project is plugged in as it starts, at the path it has on the machine (Shards D235), so kiln
+# reads its diffs, HEAD and checkpoints at that same path, and no volume holds it. Its HOME is the
+# person's volume, whole: harness.json sets HOME=/home/pi, kiln's one rule for every harness it
+# ships (step 18). A harness sees its image read-only, with its own /tmp scratch, so a HOME that is
+# writable and kept from run to run is a volume, and what the programs it runs keep in a home (a
+# .gitconfig, a tool's sign-in) is kept with it. pi keeps its sign-in (auth.json), settings, models
+# and sessions in PI_CODING_AGENT_DIR beneath it (f15, f22).
+# harness.json keeps caches that follow XDG's rule on the scratch (XDG_CACHE_HOME=/tmp/.cache),
+# where they were before its HOME moved onto the volume.
+# HOME in run.env needs a shards at or after 997f4e47e (v0.8.0 and later), where run.env replaces
+# init's HOME=/tmp. The volume is the harness's alone, and outside /tmp, which the scratch covers.
+VOLUME --target-kind=harness /home/pi FOR pi

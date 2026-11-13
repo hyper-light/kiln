@@ -226,8 +226,8 @@ fn step19_claude_runs_as_kilns_claude_kind_with_its_home_on_its_volume() -> anyh
     let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
     anyhow::ensure!(matches!(kind.protocol, Protocol::ClaudeStreamJson), "kiln's claude kind isn't stream-json");
     let vs = volumes(b.text);
-    anyhow::ensure!(vs == ["/workspace", "/home/claude"], "{vs:?}");
-    let home = vs.get(1).copied().unwrap_or_default();
+    anyhow::ensure!(vs == ["/home/claude"], "{vs:?}");
+    let home = vs.first().copied().unwrap_or_default();
     let variants: [(&str, &[&str]); 2] = [("harness.json", &[]), ("harness.musl.json", &["USE_BUILTIN_RIPGREP=0"])];
     for (name, extra) in variants {
         let problems = launch_problems(&harness_file(b, name)?, kind, home, extra);
@@ -249,8 +249,8 @@ fn step19_claude_runs_as_kilns_claude_kind_with_its_home_on_its_volume() -> anyh
 }
 
 /// Claude Code's Agentfile is the plan's shape: the base by digest, a stage for each libc with a RUN only
-/// in musl's (Anthropic's packages), Anthropic's own build per platform and libc, exactly the bring-up's
-/// three grants, exactly its two volumes, and no ENV.
+/// in musl's (Anthropic's packages), Anthropic's own build per platform and libc, its hosts by name and
+/// kiln's MCP (step 18's grants), its HOME its one volume, and no ENV.
 #[test]
 fn step19_claude_agentfile_is_the_plans_shape() -> anyhow::Result<()> {
     let lines = instructions(claude()?.text);
@@ -264,12 +264,8 @@ fn step19_claude_agentfile_is_the_plans_shape() -> anyhow::Result<()> {
         "ARG TARGETARCH",
         "ARG CLAUDE_LIBC",
         "HARNESS claude FROM ./claude-${TARGETARCH}-${CLAUDE_LIBC}",
-        "NETWORK --dns --egress=443/tcp provider FOR claude",
-        "EXPOSE --harnesses=claude 443/tcp AS egress FOR provider",
-        "CONNECT claude WITH claude ON provider",
-        "VOLUME --target-kind=harness /workspace FOR claude",
-        "VOLUME --target-kind=harness /home/claude FOR claude",
     ];
+    let want: Vec<String> = want.iter().map(|l| (*l).to_owned()).chain(super::grants_tests::grant_lines("claude")).chain([super::grants_tests::volume_line("claude")]).collect();
     anyhow::ensure!(lines == want, "{lines:#?}");
     Ok(())
 }

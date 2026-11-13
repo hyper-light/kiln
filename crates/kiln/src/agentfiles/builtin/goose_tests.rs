@@ -250,8 +250,9 @@ fn step23_no_goose_file_holds_a_credential() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Goose runs as kiln's Goose kind starts it (`goose acp`), with its root on the volume the
-/// Agentfile gives it; a kind or a volume that drifts from the files is caught.
+/// Goose runs as kiln's Goose kind starts it (`goose acp`), its HOME the volume the Agentfile gives it
+/// (step 18), its root beneath it and its caches on the scratch; a kind or a volume that drifts from
+/// the files is caught.
 #[test]
 fn step23_goose_runs_as_kilns_goose_kind_with_its_root_on_its_volume() -> anyhow::Result<()> {
     let goose = goose()?;
@@ -263,17 +264,19 @@ fn step23_goose_runs_as_kilns_goose_kind_with_its_root_on_its_volume() -> anyhow
 
     let env: Vec<&str> = h.pointer("/run/env").and_then(Value::as_array).map(|e| e.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
     let root = env.iter().find_map(|e| e.strip_prefix("GOOSE_PATH_ROOT=")).ok_or_else(|| anyhow::anyhow!("no GOOSE_PATH_ROOT in {env:?}"))?;
-    anyhow::ensure!(env.len() == 1, "{env:?}");
+    let home = env.iter().find_map(|e| e.strip_prefix("HOME=")).ok_or_else(|| anyhow::anyhow!("no HOME in {env:?}"))?;
+    anyhow::ensure!(env == ["HOME=/home/goose", "GOOSE_PATH_ROOT=/home/goose/.local/share/goose", "XDG_CACHE_HOME=/tmp/.cache"], "{env:?}");
+    anyhow::ensure!(root.starts_with(&format!("{home}/")), "GOOSE_PATH_ROOT={root} isn't beneath HOME={home}");
     let volumes = harness_volumes(goose.text, "goose");
-    anyhow::ensure!(volumes == ["/workspace", root], "{volumes:?}");
-    let moved = goose.text.replace("/home/goose/.local/share/goose FOR goose", "/home/goose/.goose FOR goose");
-    anyhow::ensure!(harness_volumes(&moved, "goose").get(1) != Some(&root));
+    anyhow::ensure!(volumes == [home], "{volumes:?}");
+    let moved = goose.text.replace("/home/goose FOR goose", "/home/goose/.goose FOR goose");
+    anyhow::ensure!(harness_volumes(&moved, "goose").first() != Some(&home));
     Ok(())
 }
 
 /// Goose's Agentfile is the plan's shape: a base by digest, Goose's own build per platform with no
-/// RUN, exactly the bring-up's three grants, exactly its two volumes, and no ENV; its pin's smoke
-/// line is what Goose prints.
+/// RUN, its providers' hosts by name and kiln's MCP (step 18's grants), its HOME as its one volume,
+/// and no ENV; its pin's smoke line is what Goose prints.
 #[test]
 fn step23_goose_agentfile_is_the_plans_shape() -> anyhow::Result<()> {
     let goose = goose()?;
@@ -283,12 +286,8 @@ fn step23_goose_agentfile_is_the_plans_shape() -> anyhow::Result<()> {
         "FROM ${BASE}",
         "ARG TARGETARCH",
         "HARNESS goose FROM ./goose-${TARGETARCH}",
-        "NETWORK --dns --egress=443/tcp provider FOR goose",
-        "EXPOSE --harnesses=goose 443/tcp AS egress FOR provider",
-        "CONNECT goose WITH goose ON provider",
-        "VOLUME --target-kind=harness /workspace FOR goose",
-        "VOLUME --target-kind=harness /home/goose/.local/share/goose FOR goose",
     ];
+    let want: Vec<String> = want.iter().map(|l| (*l).to_owned()).chain(super::grants_tests::grant_lines("goose")).chain([super::grants_tests::volume_line("goose")]).collect();
     anyhow::ensure!(lines == want, "{lines:#?}");
     anyhow::ensure!(!lines.iter().any(|l| l.starts_with("RUN ") || l.starts_with("ENV ")));
     // The bytes 1.59.0's `goose --version` wrote (step 23's research, f12): the pin's line, then its

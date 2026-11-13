@@ -109,9 +109,9 @@ fn harness_volumes(agentfile: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The Agentfile: the pin's base, one stage, the harness from each platform's directory, the
-/// bring-up's three provider grants and nothing more, the project and the person's whole home as
-/// volumes, and nothing that installs or configures beside the pin and harness.json.
+/// The Agentfile: the pin's base, one stage, the harness from each platform's directory, its hosts by
+/// name (step 18's three grant lines) and nothing more, the person's whole home as its one volume, and
+/// nothing that installs or configures beside the pin and harness.json.
 fn check_agentfile(agentfile: &str, pin: &Value) -> anyhow::Result<()> {
     let all = instructions(agentfile);
     let has = |keyword: &str, rest: &str| all.iter().any(|(k, r)| k == keyword && *r == rest);
@@ -121,16 +121,13 @@ fn check_agentfile(agentfile: &str, pin: &Value) -> anyhow::Result<()> {
     ensure!(has("FROM", "${BASE}") && count("FROM") == 1, "the Agentfile isn't one stage FROM ${{BASE}}");
     ensure!(has("ARG", "TARGETARCH") && count("ARG") == 2, "the Agentfile's ARGs aren't BASE and TARGETARCH");
     ensure!(has("HARNESS", "antigravity FROM ./antigravity-${TARGETARCH}") && count("HARNESS") == 1, "the Agentfile's harness isn't antigravity FROM ./antigravity-${{TARGETARCH}}");
-    let grants = [
-        ("NETWORK", "--dns --egress=443/tcp provider FOR antigravity"),
-        ("EXPOSE", "--harnesses=antigravity 443/tcp AS egress FOR provider"),
-        ("CONNECT", "antigravity WITH antigravity ON provider"),
-    ];
-    for (keyword, rest) in grants {
-        ensure!(has(keyword, rest), "the Agentfile lacks `{keyword} {rest}`");
+    let grants = super::grants_tests::grant_lines("antigravity");
+    for line in &grants {
+        let (keyword, rest) = line.split_once(' ').unwrap_or((line, ""));
+        ensure!(has(keyword, rest), "the Agentfile lacks `{line}`");
     }
-    ensure!(count("NETWORK") + count("EXPOSE") + count("CONNECT") == grants.len(), "the Agentfile grants more than the bring-up's three lines");
-    ensure!(count("VOLUME") == 2 && harness_volumes(agentfile) == ["/workspace", "/home/antigravity"], "the Agentfile's volumes aren't /workspace and /home/antigravity, agy's alone");
+    ensure!(count("NETWORK") + count("EXPOSE") + count("CONNECT") == grants.len(), "the Agentfile grants more than its three lines");
+    ensure!(count("VOLUME") == 1 && harness_volumes(agentfile) == ["/home/antigravity"], "the Agentfile's volume isn't /home/antigravity, agy's HOME alone");
     let known = ["ARG", "FROM", "HARNESS", "NETWORK", "EXPOSE", "CONNECT", "VOLUME"];
     if let Some((keyword, rest)) = all.iter().find(|(k, _)| !known.contains(&k.as_str())) {
         bail!("the Agentfile has `{keyword} {rest}`: only the pin and harness.json install and configure agy");
@@ -163,9 +160,9 @@ fn check_harness(harness: &str, pin: &Value, agentfile: &str, command: &[String]
     names.sort_unstable();
     ensure!(env.len() == 3 && names == ["AGY_CLI_DISABLE_AUTO_UPDATE", "HOME", "XDG_CACHE_HOME"], "harness.json's env is {env:?}, not HOME, AGY_CLI_DISABLE_AUTO_UPDATE and XDG_CACHE_HOME once each");
     let value = |name: &str| env.iter().find_map(|e| e.strip_prefix(name)?.strip_prefix('=')).unwrap_or_default();
-    let homes: Vec<&str> = harness_volumes(agentfile).into_iter().filter(|v| *v != "/workspace").collect();
+    let homes: Vec<&str> = harness_volumes(agentfile);
     let home = value("HOME");
-    ensure!(homes == [home], "HOME={home} isn't the Agentfile's home volume (its volumes beside /workspace are {homes:?})");
+    ensure!(homes == [home], "HOME={home} isn't the Agentfile's home volume (its volumes are {homes:?})");
     ensure!(value("AGY_CLI_DISABLE_AUTO_UPDATE") == "true", "harness.json doesn't turn agy's self-updater off");
     let cache = value("XDG_CACHE_HOME");
     ensure!(cache.starts_with("/tmp/") && !cache.starts_with(&format!("{home}/")), "XDG_CACHE_HOME={cache} isn't on the harness's /tmp scratch");

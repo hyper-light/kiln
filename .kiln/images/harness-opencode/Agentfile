@@ -34,16 +34,34 @@ ARG OPENCODE_LIBC
 
 HARNESS opencode FROM ./opencode-${TARGETARCH}-${OPENCODE_LIBC}
 
-# Its reach, every part named (networks are default deny): a network of its own, names through
-# the microVM's resolver, and TCP 443 out, for its providers, models.dev, npm and GitHub (f21).
-# These are the bring-up's three lines, until step 9 grants providers by name. The server that
-# `opencode acp` talks to listens on the harness's own loopback, which needs no grant (f15, f16).
-NETWORK --dns --egress=443/tcp provider FOR opencode
-EXPOSE --harnesses=opencode 443/tcp AS egress FOR provider
+# Its network, every part named (default deny; Shards D236, destinations by name): a network for this
+# harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
+# name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
+# resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
+# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
+# docs/research/s18-host-in-vm says where each host comes from).
+# - opencode takes the provider its person configures, so each provider its pinned build carries at
+#   a fixed public host is granted (its provider modules' base URLs), with the sign-in hosts of those
+#   it signs in to itself (ChatGPT, GitHub Copilot, GitLab); opencode.ai (OpenCode Zen and Go);
+#   models.dev, its model catalog (f21); and github.com with release-assets.githubusercontent.com,
+#   for the ripgrep it fetches, checked against its own SHA-256s, where its base has none (f21). Not
+#   granted: a cloud platform's model service, which its own account places (Bedrock, Vertex AI,
+#   Azure, Cloudflare, SAP AI Core, Snowflake); a local or self-hosted server; and npm, for providers
+#   its build lacks and plugins. Each of those needs an Agentfile of your own, made from this one.
+# - host.docker.internal:7070: kiln's MCP at /api/mcp on the machine itself, at kiln's own port (its
+#   http_addr's default, 0.0.0.0:7070). A kiln on another port isn't reached: the image doesn't
+#   grant it, and kiln says so as it starts the harness.
+NETWORK --egress=ai-gateway.vercel.sh:443 --egress=api.anthropic.com:443 --egress=api.cerebras.ai:443 --egress=api.cohere.ai:443 --egress=api.deepinfra.com:443 --egress=api.deepseek.com:443 --egress=api.fireworks.ai:443 --egress=api.github.com:443 --egress=api.githubcopilot.com:443 --egress=api.groq.com:443 --egress=api.meta.ai:443 --egress=api.minimax.io:443 --egress=api.mistral.ai:443 --egress=api.moonshot.ai:443 --egress=api.openai.com:443 --egress=api.poe.com:443 --egress=api.together.xyz:443 --egress=api.typesafe.ai:443 --egress=api.venice.ai:443 --egress=api.x.ai:443 --egress=api.z.ai:443 --egress=auth.openai.com:443 --egress=chatgpt.com:443 --egress=generativelanguage.googleapis.com:443 --egress=github.com:443 --egress=gitlab.com:443 --egress=inference.baseten.co:443 --egress=inference.do-ai.run:443 --egress=models.dev:443 --egress=opencode.ai:443 --egress=openrouter.ai:443 --egress=release-assets.githubusercontent.com:443 --egress=host.docker.internal:7070 provider FOR opencode
+EXPOSE --harnesses=opencode 443/tcp 7070/tcp AS egress FOR provider
 CONNECT opencode WITH opencode ON provider
 
-# The project, and the user's own opencode: harness.json puts the four XDG roots under
-# /home/opencode, where opencode keeps its settings, its sessions and sign-in (opencode.db) and its
-# cache (f17, f18, f19). HOME stays the domain's /tmp, a scratch tmpfs lost when it ends (f16).
-VOLUME --target-kind=harness /workspace FOR opencode
+# Its project is plugged in as it starts, at the path it has on the machine (Shards D235), so kiln
+# reads its diffs, HEAD and checkpoints at that same path, and no volume holds it. Its HOME is the
+# person's volume, whole: harness.json sets HOME=/home/opencode, kiln's one rule for every harness
+# it ships (step 18). A harness sees its image read-only, with its own /tmp scratch, so a HOME that
+# is writable and kept from run to run is a volume, and what the programs it runs keep in a home (a
+# .gitconfig, a tool's sign-in) is kept with it. opencode keeps its settings, its sessions and
+# sign-in (opencode.db) and its cache in the four XDG roots beneath it (f17, f18, f19).
+# HOME in run.env needs a shards at or after 997f4e47e (v0.8.0 and later), where run.env replaces
+# init's HOME=/tmp. The volume is the harness's alone, and outside /tmp, which the scratch covers.
 VOLUME --target-kind=harness /home/opencode FOR opencode

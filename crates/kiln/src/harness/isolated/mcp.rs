@@ -122,7 +122,7 @@ pub fn for_harness(kind: &Kind, endpoint: &Endpoint) -> Config {
                     "-c".to_owned(),
                     format!("mcp_servers.kiln.bearer_token_env_var={}", q(TOKEN_VAR)),
                     "-c".to_owned(),
-                    format!("mcp_servers.kiln.tool_timeout_sec={}", crate::reach::mcp::CODE_WALL_MAX.as_secs() + 60),
+                    format!("mcp_servers.kiln.tool_timeout_sec={}", crate::reach::mcp::codex_tool_timeout_sec()),
                 ],
                 env: Some(McpEnv { name: TOKEN_VAR, value: endpoint.token.clone() }),
             }

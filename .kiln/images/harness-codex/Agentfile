@@ -4,7 +4,7 @@
 # Linux installer installs (pin.sh checks it three ways), into ./codex-<arch>/: harness.json,
 # codex-package.json, bin/ (codex, its code-mode host and exec server), codex-resources/ (bwrap) and
 # codex-path/ (rg), the layout Codex finds its helpers through. Nothing else installs it, and no sign-in
-# is in the image: a person's lives in their CODEX_HOME volume until step 33 brings sign-ins from
+# is in the image: a person's lives in their HOME volume, in its CODEX_HOME, until step 33 brings sign-ins from
 # outside the microVM.
 
 # Every program kiln has Codex run is static, so any base runs it with nothing added and there is no
@@ -20,16 +20,32 @@ FROM ${BASE}
 ARG TARGETARCH
 HARNESS codex FROM ./codex-${TARGETARCH}
 
-# Its network reach, every part named (default deny): a network for this harness alone, which it
-# joins with no flow to any member; names past the microVM through its resolver (--dns); and TCP 443
-# out, opened at the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress), for Codex
-# speaks HTTPS to OpenAI. These are the bring-up's grants (Shards' docs/examples/harness-codex) until
-# step 9 grants providers by name. Nothing comes in; no other port or protocol goes out.
-NETWORK --dns --egress=443/tcp provider FOR codex
-EXPOSE --harnesses=codex 443/tcp AS egress FOR provider
+# Its network, every part named (default deny; Shards D236, destinations by name): a network for this
+# harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
+# name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
+# resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
+# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
+# docs/research/s18-host-in-vm says where each host comes from).
+# - api.openai.com: the Responses API, signed in with an API key; chatgpt.com: Codex's Responses
+#   through ChatGPT's backend, signed in with ChatGPT; auth.openai.com: that sign-in, its token
+#   refresh and its revocation (codex-rs rust-v0.167.2: cli/src/doctor.rs's reachability plan,
+#   login/src/server.rs's issuer, login/src/auth/manager.rs's token URLs).
+# - host.docker.internal:7070: kiln's MCP at /api/mcp on the machine itself, at kiln's own port (its
+#   http_addr's default, 0.0.0.0:7070). A kiln on another port isn't reached: the image doesn't
+#   grant it, and kiln says so as it starts the harness.
+NETWORK --egress=api.openai.com:443 --egress=auth.openai.com:443 --egress=chatgpt.com:443 --egress=host.docker.internal:7070 provider FOR codex
+EXPOSE --harnesses=codex 443/tcp 7070/tcp AS egress FOR provider
 CONNECT codex WITH codex ON provider
 
-# The project, and the person's Codex home (D109's harness-scoped volumes): harness.json points
-# CODEX_HOME here, where Codex keeps its config.toml and its sign-in. Each is the harness's alone.
-VOLUME --target-kind=harness /workspace FOR codex
-VOLUME --target-kind=harness /home/codex/.codex FOR codex
+# Its project is plugged in as it starts, at the path it has on the machine (Shards D235), so kiln
+# reads its diffs, HEAD and checkpoints at that same path, and no volume holds it. Its HOME is the
+# person's volume, whole: harness.json sets HOME=/home/codex, kiln's one rule for every harness it
+# ships (step 18). A harness sees its image read-only, with its own /tmp scratch, so a HOME that is
+# writable and kept from run to run is a volume, and what the programs it runs keep in a home (a
+# .gitconfig, a tool's sign-in) is kept with it. Codex keeps its config.toml, its sign-in and its
+# sessions in its CODEX_HOME beneath it.
+# harness.json keeps caches that follow XDG's rule on the scratch (XDG_CACHE_HOME=/tmp/.cache),
+# where they were before its HOME moved onto the volume.
+# HOME in run.env needs a shards at or after 997f4e47e (v0.8.0 and later), where run.env replaces
+# init's HOME=/tmp. The volume is the harness's alone, and outside /tmp, which the scratch covers.
+VOLUME --target-kind=harness /home/codex FOR codex

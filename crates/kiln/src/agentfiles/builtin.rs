@@ -169,6 +169,9 @@ mod opencode_tests;
 mod gemini_tests;
 
 #[cfg(test)]
+mod grants_tests;
+
+#[cfg(test)]
 mod tests {
     use std::path::Path;
 

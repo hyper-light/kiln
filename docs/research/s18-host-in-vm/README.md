@@ -17,6 +17,12 @@ and no credential leaves its person's volume.
   receipt is beside ROOT's brief, `/tmp/g121-shot/s18-POLICY_READ.txt`, and goes again with the
   report.
 - Branch `p/s18-host-in-vm-v1`, worktree `~/Projects/kiln/.claude/worktrees/s18-host-in-vm`.
+- ROOT's goal #61 (7c8235c884a68fd987874e76afb718c0) then went to a goal agent, which planned it with
+  kiln (plan 01a1d2bd5014705d918ad1f2ce1154f2, research 01a1d2bd5014705d944b487c232fc750) as two
+  steps: part 1 landed as committed, then part 2. The Agent tool refused its children (the session's
+  20-subagent cap), so it worked both steps itself, per ROOT's brief. Its readback is kiln origin/main
+  e86ec22c6 (AGENTS.md, CLAUDE.md and docs/ci.md §0.3 as above) and Shards origin/main 1145bd3f2
+  (AGENTS.md, development-rules.md and development-evidence.md as above).
 - The person's rule of 2026-11-12 (subagents test their own change, merge it to main themselves
   and end) is the current word over R15's older "do not merge themselves".
 
@@ -199,7 +205,7 @@ passes on the tree as committed. Run with `scripts/mutate.py <kiln checkout>` th
 |---|---|
 | R01 | No panics: every fallible step returns its refusal or `None`; the tests use `anyhow::Result` and `ensure!` as the workspace's lints ask. |
 | R02 | Each decision rests on the sources cited beside it (Shards D231, D235, D236, D240; Claude Code's and Codex's own sources and docs; RFC 9110; POSIX; Microsoft's and Apple's docs). |
-| R03 | No chosen numbers: Codex's MCP tool timeout is kiln's own `CODE_WALL_MAX` plus its existing allowance (`reach::mcp::codex_config`'s); the statuses are HTTP's; the test's 240,673 and 246,515 are the record's own. |
+| R03 | No chosen numbers. Codex's MCP tool timeout in a microVM is `reach::mcp::codex_tool_timeout_sec()`, the one its machine's config takes too (main's `CODE_WALL_MAX` and main's own allowance), not a copy of it. The statuses are HTTP's. The test's 240,673 and 246,515 are the record's own. The built-ins' one port, kiln's MCP at `host.docker.internal:7070`, is kiln's own default `http_addr` (`config::Server`). An image must name its port as written (Shards carries NETWORK unexpanded, plan.rs; a run can drop a destination but never add one, D236), so `grants_tests` derives the destination it holds every image to from `config::Server::default()`, with no literal of its own: a changed default fails it until every image follows. At start the running kiln's own port (`mcp::Kit::for_microvm`) is checked against the image's grant (`isolated::mcp::granted`), and a kiln on another port is refused `McpNotGranted`, naming the destination it needs. Nothing is estimated, so there's no cold start. |
 | R04 | Refusals are typed (`isolated::Refusal`, `trouble::TroubleKind`), matched by callers; words are presentation. |
 | R05 | No new cache, wait or thread; one owner each (the layout, the session's state). |
 | R06, R07, R13 | Small pure functions at existing seams; comments say why, not what. |
@@ -216,5 +222,58 @@ passes on the tree as committed. Run with `scripts/mutate.py <kiln checkout>` th
 - Steps 6 and 11's terminal lane and the microVM's key: sign-in, git signing, credential helpers,
   the MCP token (design above).
 - `/api/mcp` on a runner's loopback, so an isolated session on a runner's machine gets kiln's MCP.
+  Plan step 35 (ROOT's goal #65) builds it. Agreed with that step's agent: it changes only
+  `isolated::mcp::on_this_machine`, so that a runner serving its loopback MCP gives an `Endpoint`
+  where `McpUnserved` stands today. Its port must be the one the built-ins grant, or their grant must
+  follow it.
 - Real-VM runs (ROOT's): an isolated session's transcript read from its volume and resumed; kiln's
   MCP reached through `host.docker.internal`; H6's notices from a live microVM.
+
+## Part 2: the built-ins' grants and HOME (ROOT's routed findings)
+
+- **Destinations by name** (Shards D236), every built-in: its harness's own hosts on TCP 443, and
+  kiln's MCP at `host.docker.internal:7070` (kiln's default `http_addr`, config.rs) for the eight
+  that take it; no `--dns`, no port grant. The rule: the hosts a harness reaches on its own to sign
+  in, keep its sign-in fresh and work, as its vendor documents them, else as kiln saw it reach them,
+  else as its own pinned build names them; none for a browser's page, an update (off in each
+  image), telemetry, a registry, the editor's features, the web, or a provider whose host its
+  account, region or person gives. A harness that takes any provider (Goose, opencode, Pi) gets
+  each hosted provider its pinned build knows at a fixed public host, with their sign-ins, so the
+  image holds what any configured provider needs; a run can drop destinations, never add them
+  (D236), so narrowing to the provider in use is the launch's to do (owed with step 17).
+  `crates/kiln/src/agentfiles/builtin/grants_tests.rs` holds every list, its sources beside it.
+  It holds each built-in's hosts alone. kiln's MCP joins a list from `config::Server::default()`'s
+  `http_addr` exactly where `isolated::mcp::for_harness` gives that harness kiln's MCP, so the test
+  names no port of its own (R03 above). Its bent texts include kiln's MCP at a port not kiln's, and
+  the boundary not open at kiln's port.
+- **The project** isn't a volume: the launch plugs it in at its host path (D235). A project under
+  `/tmp` can't be (D235's known limit).
+- **HOME, one rule**: the person's volume, whole, `HOME=/home/<harness>` in run.env and one
+  `VOLUME --target-kind=harness /home/<harness>`. Each harness's own variables keep pointing beneath
+  it; caches that were on the scratch stay there (`XDG_CACHE_HOME=/tmp/.cache` for Codex, Devin,
+  Amp, Goose and Pi). Why: every harness's documented state lives under HOME (Claude Code's
+  `~/.claude.json` and agy's `~/.gemini` have no variable at all), a domain sees its image
+  read-only (Shards D59, D240: HOME is the deepest volume holding it, else the scratch), and the
+  programs a harness runs write their own files under HOME. kiln's layout keeps a volume's directory
+  at its guest path beneath the person's base, so a Codex volume made at `/home/codex/.codex` sits
+  inside the new `/home/codex` one unmoved.
+- **Sources** (each cited in its Agentfile): code.claude.com/docs/en/network-config.md
+  (`evidence/claude-network-config`, sha256 f8772ba8…); cursor.com/docs/enterprise/
+  network-configuration.md (`evidence/cursor-network-config`, 300a70aa…); openai/codex rust-v0.167.2
+  `codex-rs/cli/src/doctor.rs` (b3c964ba…), `login/src/server.rs` (2f66d1c0…),
+  `login/src/auth/manager.rs` (584348a4…); google-gemini/gemini-cli v0.68.0 (`evidence/gemini-cli-v0.68.0`),
+  @google/genai 1.30.0, google-auth-library 10.9.0's npm build; Goose 1.59.0's and pi 1.5.2's
+  provider sources; and the pinned builds of Amp, agy, Devin, Cursor, opencode and pi, each
+  downloaded at its pin, its SHA-256 matched, and read for the hosts it names
+  (`scripts/hostscan.sh`, `evidence/part2-hostscan.out`).
+- **docs/agents.md** lists each host assumption and each feature for an isolated session, working
+  or refused with its reason: "What kiln's Agentfiles give it", "What an isolated agent can't do"
+  and "Each feature, in a microVM of its own". The last now includes kiln's `KILN_*` variables:
+  `KILN_AGENT` set, and the machine's sockets and `kiln reach mcp`'s left out (`isolated::env`).
+  It also says how to reach a kiln on another port: your own Agentfile granting that port.
+- **The plan's evidence** (`evidence/plan/`): ROOT's goal text, verbatim, and numbered excerpts of
+  Shards' D235, D236 and D240 and of `plan.rs` at Shards origin/main 1145bd3f2, each headed by its
+  whole file's SHA-256. kiln research 01a1d2bd5014705d944b487c232fc750 (plan
+  01a1d2bd5014705d918ad1f2ce1154f2) cites them.
+- **Owed (ROOT)**: each built-in run in a real microVM with these grants, a signed-in turn of each
+  harness reaching its provider and nothing else (no vendor turn was run here).

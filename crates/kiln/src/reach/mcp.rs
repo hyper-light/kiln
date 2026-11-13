@@ -42,7 +42,7 @@ const CODE_OUTPUT_MAX: usize = 1_000_000;
 const WAIT_DEFAULT_S: u64 = 600;
 /// A program runs this long by default, and at most `CODE_WALL_MAX`.
 const CODE_WALL_DEFAULT: Duration = Duration::from_secs(600);
-pub(crate) const CODE_WALL_MAX: Duration = Duration::from_secs(3600);
+const CODE_WALL_MAX: Duration = Duration::from_secs(3600);
 /// kiln's operations, as the server lists them, are asked for again after this.
 const REGISTRY_TTL: Duration = Duration::from_secs(60);
 /// Word of what it couldn't read on its way to the server at once, at most.
@@ -1215,8 +1215,14 @@ pub fn codex_config(kiln: &std::path::Path, sock: &str, prefer: Option<&str>, se
         "-c".into(),
         format!("mcp_servers.kiln.env={{{}}}", env.join(", ")),
         "-c".into(),
-        format!("mcp_servers.kiln.tool_timeout_sec={}", CODE_WALL_MAX.as_secs() + 60),
+        format!("mcp_servers.kiln.tool_timeout_sec={}", codex_tool_timeout_sec()),
     ]
+}
+
+/// Codex's `tool_timeout_sec` for kiln's server, on its machine and in a microVM of its own
+/// (`harness::isolated::mcp`) alike: its tool calls given as long as a program may run.
+pub(crate) fn codex_tool_timeout_sec() -> u64 {
+    CODE_WALL_MAX.as_secs() + 60
 }
 
 /// The same for an ACP agent: its session's `mcpServers` (stdio).

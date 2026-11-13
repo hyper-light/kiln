@@ -88,9 +88,9 @@ fn harness_volumes(agentfile: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The Agentfile: the pin's base, one stage, the harness from each platform's directory, the
-/// bring-up's three provider grants and nothing more, the project and /home/amp volumes, and nothing
-/// that installs or configures beside the pin and harness.json.
+/// The Agentfile: the pin's base, one stage, the harness from each platform's directory, its hosts by
+/// name and kiln's MCP (step 18's three grant lines) and nothing more, its HOME /home/amp as its one
+/// volume, and nothing that installs or configures beside the pin and harness.json.
 fn check_agentfile(agentfile: &str, pin: &Value) -> anyhow::Result<()> {
     let all = instructions(agentfile);
     let has = |keyword: &str, rest: &str| all.iter().any(|(k, r)| k == keyword && *r == rest);
@@ -100,12 +100,13 @@ fn check_agentfile(agentfile: &str, pin: &Value) -> anyhow::Result<()> {
     ensure!(has("FROM", "${BASE}") && count("FROM") == 1, "the Agentfile isn't one stage FROM ${{BASE}}");
     ensure!(has("ARG", "TARGETARCH") && count("ARG") == 2, "the Agentfile's ARGs aren't BASE and TARGETARCH");
     ensure!(has("HARNESS", "amp FROM ./amp-${TARGETARCH}") && count("HARNESS") == 1, "the Agentfile's harness isn't amp FROM ./amp-${{TARGETARCH}}");
-    let grants = [("NETWORK", "--dns --egress=443/tcp provider FOR amp"), ("EXPOSE", "--harnesses=amp 443/tcp AS egress FOR provider"), ("CONNECT", "amp WITH amp ON provider")];
-    for (keyword, rest) in grants {
-        ensure!(has(keyword, rest), "the Agentfile lacks `{keyword} {rest}`");
+    let grants = super::grants_tests::grant_lines("amp");
+    for line in &grants {
+        let (keyword, rest) = line.split_once(' ').unwrap_or((line, ""));
+        ensure!(has(keyword, rest), "the Agentfile lacks `{line}`");
     }
-    ensure!(count("NETWORK") + count("EXPOSE") + count("CONNECT") == grants.len(), "the Agentfile grants more than the bring-up's three lines");
-    ensure!(count("VOLUME") == 2 && harness_volumes(agentfile) == ["/workspace", "/home/amp"], "the Agentfile's volumes aren't /workspace and /home/amp, Amp's alone");
+    ensure!(count("NETWORK") + count("EXPOSE") + count("CONNECT") == grants.len(), "the Agentfile grants more than its three lines");
+    ensure!(count("VOLUME") == 1 && harness_volumes(agentfile) == ["/home/amp"], "the Agentfile's volume isn't /home/amp, Amp's HOME alone");
     let known = ["ARG", "FROM", "HARNESS", "NETWORK", "EXPOSE", "CONNECT", "VOLUME"];
     if let Some((keyword, rest)) = all.iter().find(|(k, _)| !known.contains(&k.as_str())) {
         bail!("the Agentfile has `{keyword} {rest}`: only the pin and harness.json install and configure Amp");
@@ -114,8 +115,8 @@ fn check_agentfile(agentfile: &str, pin: &Value) -> anyhow::Result<()> {
 }
 
 /// harness.json: Amp's (schema 1, the pin's versions), starting what kiln starts for Kind `amp`
-/// (`command`), with Amp's and amp-acp's state in the Agentfile's /home/amp volume through the XDG
-/// variables (a HOME would sit beside init's HOME=/tmp, not replace it) and no update checks.
+/// (`command`), its HOME the Agentfile's /home/amp volume with Amp's and amp-acp's state beneath it
+/// through the XDG variables, its caches on the scratch, and no update checks.
 fn check_harness(harness: &str, pin: &Value, agentfile: &str, command: &[String]) -> anyhow::Result<()> {
     let h: Value = serde_json::from_str(harness).context("harness.json doesn't parse")?;
     ensure!(h.get("schemaVersion").and_then(Value::as_u64) == Some(1), "harness.json isn't an OSI config of schema 1");
@@ -130,11 +131,12 @@ fn check_harness(harness: &str, pin: &Value, agentfile: &str, command: &[String]
     let env = strings(&h, "/run/env");
     let mut names: Vec<&str> = env.iter().filter_map(|e| e.split_once('=').map(|(name, _)| name)).collect();
     names.sort_unstable();
-    ensure!(names == ["AMP_SKIP_UPDATE_CHECK", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"], "harness.json's env names {names:?}");
+    ensure!(names == ["AMP_SKIP_UPDATE_CHECK", "HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"], "harness.json's env names {names:?}");
+    ensure!(env.contains(&"HOME=/home/amp") && env.contains(&"XDG_CACHE_HOME=/tmp/.cache"), "harness.json's HOME isn't its volume, or its caches aren't on the scratch");
     ensure!(env.contains(&"AMP_SKIP_UPDATE_CHECK=1"), "harness.json doesn't turn Amp's update checks off");
-    let state = harness_volumes(agentfile).into_iter().filter(|v| *v != "/workspace").collect::<Vec<_>>();
+    let state = harness_volumes(agentfile);
     ensure!(state == ["/home/amp"], "the Agentfile has no /home/amp volume for Amp's state");
-    for e in env.iter().filter(|e| e.starts_with("XDG_")) {
+    for e in env.iter().filter(|e| e.starts_with("XDG_") && !e.starts_with("XDG_CACHE_HOME=")) {
         let path = e.split_once('=').map(|(_, path)| path).unwrap_or_default();
         ensure!(state.iter().any(|v| path.starts_with(&format!("{v}/"))), "{e} is outside the Agentfile's /home/amp volume");
     }

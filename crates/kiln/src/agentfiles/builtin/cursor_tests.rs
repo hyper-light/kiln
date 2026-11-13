@@ -264,9 +264,9 @@ fn step27_cursor_pin_and_harness_file_hold() -> anyhow::Result<()> {
     let env = strings(h.pointer("/run/env")).unwrap_or_default();
     anyhow::ensure!(env == ["HOME=/home/cursor", "XDG_CACHE_HOME=/tmp/.cache", "NO_OPEN_BROWSER=1"], "{env:?}");
     let home = env.iter().find_map(|e| e.strip_prefix("HOME=")).unwrap_or_default();
-    anyhow::ensure!(harness_volumes(cursor.text, "cursor") == ["/workspace", home], "HOME {home} isn't Cursor's second volume");
+    anyhow::ensure!(harness_volumes(cursor.text, "cursor") == [home], "HOME {home} isn't Cursor's one volume");
     let moved = cursor.text.replace("harness /home/cursor FOR", "harness /home/cursor/.cursor FOR");
-    anyhow::ensure!(harness_volumes(&moved, "cursor") != ["/workspace", home]);
+    anyhow::ensure!(harness_volumes(&moved, "cursor") != [home]);
     Ok(())
 }
 
@@ -354,8 +354,8 @@ fn step27_cursor_runs_as_kilns_cursor_kind_launches_it() -> anyhow::Result<()> {
 }
 
 /// Cursor's Agentfile is the plan's shape: ARG BASE by digest and ARG TARGETARCH alone, Cursor's own
-/// package per platform, exactly the bring-up's three grants, exactly its two harness volumes, and no
-/// ENV or RUN.
+/// package per platform, its hosts by name and kiln's MCP (step 18's grants), its HOME as its one
+/// harness volume, and no ENV or RUN.
 #[test]
 fn step27_cursor_agentfile_is_the_plans_shape() -> anyhow::Result<()> {
     let lines = instructions(cursor()?.text);
@@ -364,12 +364,8 @@ fn step27_cursor_agentfile_is_the_plans_shape() -> anyhow::Result<()> {
         "FROM ${BASE}",
         "ARG TARGETARCH",
         "HARNESS cursor FROM ./cursor-${TARGETARCH}",
-        "NETWORK --dns --egress=443/tcp provider FOR cursor",
-        "EXPOSE --harnesses=cursor 443/tcp AS egress FOR provider",
-        "CONNECT cursor WITH cursor ON provider",
-        "VOLUME --target-kind=harness /workspace FOR cursor",
-        "VOLUME --target-kind=harness /home/cursor FOR cursor",
     ];
+    let want: Vec<String> = want.iter().map(|l| (*l).to_owned()).chain(super::grants_tests::grant_lines("cursor")).chain([super::grants_tests::volume_line("cursor")]).collect();
     anyhow::ensure!(lines == want, "{lines:#?}");
     Ok(())
 }
