@@ -148,6 +148,27 @@ pub fn reach_of(b: &'static builtin::Builtin, person: Option<&str>, model: Optio
     super::narrow::reach(b.harness, &super::narrow::Reads { home: &layout.guest_home(), project, env: &env, model, read: &read })
 }
 
+/// The destinations Agentfile `text` grants past its microVM, each `host:port`, as Shards reads them
+/// (`shards_agentfile::agentfile::grants`, D236): none where it grants a port to any address or any
+/// name, which no list of destinations is; why not, where it doesn't parse.
+pub fn granted(text: &str) -> Result<Option<Vec<String>>, String> {
+    use shards_agentfile::{agentfile, instructions, lint::Linter, parser};
+    let words = |m: &[u8]| String::from_utf8_lossy(m).into_owned();
+    let parsed = parser::parse_as(text.as_bytes(), parser::Dialect::Agentfile).map_err(|e| words(&e.message))?;
+    let read = instructions::parse(&parsed, &Linter::default()).map_err(|e| words(&e.message))?;
+    let directives: Vec<agentfile::Directive> = read
+        .stages
+        .into_iter()
+        .flat_map(|s| s.commands)
+        .filter_map(|c| match c.kind {
+            instructions::Kind::Agentfile(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    let g = agentfile::grants(&agentfile::resolve_targets(&directives).map_err(|e| words(&e))?);
+    Ok((g.egress.is_empty() && !g.dns).then(|| g.destinations.iter().map(|d| words(d)).collect()))
+}
+
 /// The seam's egress for what a run reaches: its image's destinations narrowed to `hosts`, or its
 /// image's own grants, narrowed no further.
 pub fn egress_of(reach: &Reach) -> Egress {
