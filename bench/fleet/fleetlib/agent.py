@@ -27,7 +27,6 @@ import random
 import shutil
 import signal
 import subprocess
-import sys
 import time
 from typing import Callable, Dict, List, Optional
 
@@ -296,7 +295,15 @@ class Agent:
         def ended(why: str, t: str = token) -> None:
             self.vms[t].lane_ended = why
 
-        self.lanes.add(lane.Stream(token, popen.stdin.fileno(), popen.stdout.fileno(), ended, popen.stdin.close))
+        try:
+            self.lanes.add(lane.Stream(token, popen.stdin.fileno(), popen.stdout.fileno(), ended, popen.stdin.close))
+        except OSError as e:
+            # No descriptor or thread for its lane: its client is let go (its stdin closed, `cat`
+            # and its run end), the ask is a typed failure, and the fill stops at it.
+            popen.stdin.close()
+            a.move(W.FAILED)
+            self.rec.write("start_failed", token=token, why=f"lane: {e}", wave=self.wave)
+            return token
 
         def started(ok: bool, _took: int, why: str, t: str = token) -> None:
             vm = self.vms[t]
@@ -390,7 +397,7 @@ class Agent:
         began = time.monotonic_ns()
         gone = self.settle(lambda: not any(p["role"] in ("vm", "net") for p in self.scope_procs()), "first_run.gone")
         self.rec.write("first_run_gone", gone=gone, ns=time.monotonic_ns() - began)
-        if shutil.which("cat") and sys.platform != "win32":
+        if shutil.which("cat"):
             self.floor = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
             if self.floor.stdin is not None and self.floor.stdout is not None:
                 self.lanes.add(lane.Stream("floor", self.floor.stdin.fileno(), self.floor.stdout.fileno(), lambda why: None, self.floor.stdin.close))

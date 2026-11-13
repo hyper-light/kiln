@@ -9,9 +9,12 @@ import gc
 import json
 import os
 import random
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -23,6 +26,33 @@ from fleetlib.agent import needs_room  # noqa: E402
 from fleetlib.shards import Shards  # noqa: E402
 
 W = witness
+
+# A local echo: `cat` where the host has one, else Python copying its stdin to its stdout as each
+# read returns (Windows without Git's tools).
+ECHO = ["cat"] if shutil.which("cat") else [sys.executable, "-u", "-c", "import shutil,sys;shutil.copyfileobj(sys.stdin.buffer.raw,sys.stdout.buffer.raw)"]
+
+
+def standin_shards(d):
+    """A stand-in `shards` whose every call is ECHO (each VM a local echo; `list` and `remove`
+    answer nothing): a shell script, or on Windows a command script."""
+    if sys.platform == "win32":
+        path = os.path.join(d, "shards.cmd")
+        with open(path, "w") as f:
+            f.write("@" + subprocess.list2cmdline(ECHO) + "\r\n")
+        return path
+    path = os.path.join(d, "shards")
+    with open(path, "w") as f:
+        f.write("#!/bin/sh\nexec " + " ".join(shlex.quote(a) for a in ECHO) + "\n")
+    os.chmod(path, 0o755)
+    return path
+
+
+def lane_threads_end():
+    """Waits for every thread lane's threads to end (after their pipes did): a test's count of
+    descriptors then sees none of theirs."""
+    for t in threading.enumerate():
+        if t.name.startswith("lane-"):
+            t.join()
 
 
 class Stats(unittest.TestCase):
@@ -194,11 +224,15 @@ class Witnesses(unittest.TestCase):
         self.assertEqual(a.history, [W.ASKED, W.STARTING, W.LIVE, W.KILLED, W.ENDED])
 
 
-@unittest.skipIf(sys.platform == "win32", "lanes select on pipes, which Windows can't (README, Owed)")
-class Lanes(unittest.TestCase):
+class LaneCases:
+    """Each kind of lane, read the same way: the host's own (`lane.Lanes`) and, where the selector
+    runs, the threaded kind too, so Windows' is held to it on every OS."""
+
+    impl = None
+
     def setUp(self):
         self.ps = []
-        self.lanes = lane.Lanes()
+        self.lanes = self.impl()
         self.ended = {}
 
     def tearDown(self):
@@ -210,12 +244,14 @@ class Lanes(unittest.TestCase):
     def spawn(self, name, argv):
         p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
         self.ps.append(p)
-        self.lanes.add(lane.Stream(name, p.stdin.fileno(), p.stdout.fileno(), lambda why, n=name: self.ended.__setitem__(n, why)))
+        # Its stdin's own close ends the lane's input, as the agent's does: the file object never
+        # closes a descriptor that's gone.
+        self.lanes.add(lane.Stream(name, p.stdin.fileno(), p.stdout.fileno(), lambda why, n=name: self.ended.__setitem__(n, why), p.stdin.close))
         return p
 
     def test_round_trips_and_transfers_come_back_whole_on_every_lane_at_once(self):
         for i in range(4):
-            self.spawn(f"c{i}", ["cat"])
+            self.spawn(f"c{i}", ECHO)
         got = []
         for i in range(4):
             self.assertTrue(self.lanes.begin(f"c{i}", lane.control_message(i), lambda ok, took, why: got.append((ok, took, why))))
@@ -236,7 +272,7 @@ class Lanes(unittest.TestCase):
         self.assertIn("corrupt", got[0][1])
 
     def test_a_lane_whose_process_ends_says_so_as_an_event(self):
-        p = self.spawn("c", ["cat"])
+        p = self.spawn("c", ECHO)
         self.lanes.close("c")
         self.lanes.run(lambda: "c" in self.ended, time.monotonic_ns() + 10_000_000_000)
         self.assertEqual(self.ended.get("c"), "ended")
@@ -247,6 +283,63 @@ class Lanes(unittest.TestCase):
         self.assertEqual(len(p), 1 << 16)
         self.assertNotEqual(p[4:8], p[8:12])
         self.assertNotEqual(p[:4096], p[4096:8192])
+
+    def test_bytes_past_what_was_written_are_corrupt(self):
+        # A lane that says each line twice.
+        self.spawn("twice", [sys.executable, "-u", "-c", "import sys\nfor line in sys.stdin: sys.stdout.write(line + line)"])
+        got = []
+        self.lanes.begin("twice", b"x\n", lambda ok, took, why: got.append((ok, why)))
+        self.lanes.run(lambda: "twice" in self.ended, time.monotonic_ns() + 10_000_000_000)
+        self.assertIn("corrupt", self.ended.get("twice", ""))
+
+
+@unittest.skipIf(sys.platform == "win32", "select() waits on sockets alone on Windows (Python's select docs)")
+class SelectedLanes(LaneCases, unittest.TestCase):
+    impl = lane.Selected
+
+
+class ThreadedLanes(LaneCases, unittest.TestCase):
+    impl = lane.Threaded
+
+    def test_a_dropped_lanes_late_word_reaches_no_one(self):
+        # The lane answers after a pause; it is dropped before its answer comes.
+        self.spawn("late", [sys.executable, "-u", "-c", "import sys, time\nline = sys.stdin.readline()\ntime.sleep(0.2)\nsys.stdout.write(line)"])
+        heard = []
+        self.lanes.begin("late", b"x\n", lambda ok, took, why: heard.append((ok, why)))
+        self.lanes.drop("late")
+        for p in self.ps:
+            p.wait()
+        lane_threads_end()
+        self.lanes.poll()
+        self.assertEqual((heard, self.ended), ([], {}))
+
+    def test_a_lane_the_os_gives_no_thread_is_refused_and_leaves_nothing(self):
+        p = self.spawn("first", ECHO)
+        before = open_fds()
+        real = threading.Thread.start
+        calls = []
+
+        def second_fails(t):
+            calls.append(t.name)
+            if len(calls) == 2:
+                raise RuntimeError("can't start new thread")
+            return real(t)
+
+        threading.Thread.start = second_fails
+        try:
+            q = subprocess.Popen(ECHO, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+            self.ps.append(q)
+            with self.assertRaises(OSError):
+                self.lanes.add(lane.Stream("second", q.stdin.fileno(), q.stdout.fileno(), lambda why: None, q.stdin.close))
+        finally:
+            threading.Thread.start = real
+        self.assertNotIn("second", self.lanes.streams)
+        q.stdin.close()
+        q.wait()
+        q.stdout.close()
+        lane_threads_end_for("second")
+        self.assertEqual(open_fds(), before)
+        self.assertIsNone(p.poll())
 
 
 class Procs(unittest.TestCase):
@@ -288,6 +381,45 @@ class Procs(unittest.TestCase):
         self.assertGreaterEqual(got[0], soft)
         if sys.platform.startswith("linux"):
             self.assertEqual(got[0], got[1])
+
+    def test_one_reads_a_process_as_the_table_does(self):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            row = procs.table().get(p.pid)
+            me = procs.one(p.pid)
+            self.assertIsNotNone(row)
+            self.assertIsNotNone(me)
+            self.assertEqual((me.pid, me.start, me.name), (row.pid, row.start, row.name))
+            self.assertTrue(me.start)
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_a_windows_image_name_is_named_without_its_exe(self):
+        self.assertEqual([procs._image(n) for n in ("shards-vm.exe", "SHARDS-NET.EXE", "System", "exe")], ["shards-vm", "SHARDS-NET", "System", "exe"])
+
+    @unittest.skipIf(sys.platform == "win32", "Windows' exited processes are held by handles, not unreaped (test_kill_refuses_a_pid_whose_start_differs)")
+    def test_an_exited_process_is_gone_not_killed(self):
+        import select
+
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            # Its exit awaited as an event and left unreaped: a zombie, which nothing can kill.
+            if hasattr(os, "waitid") and hasattr(os, "WNOWAIT"):
+                os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)
+            else:
+                kq = select.kqueue()
+                try:
+                    kq.control([select.kevent(p.pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)], 1, None)
+                except ProcessLookupError:
+                    pass  # it had exited already
+                finally:
+                    kq.close()
+            me = procs.one(p.pid)
+            self.assertTrue(me is not None and me.zombie, me and me.brief())
+            self.assertEqual(procs.kill(p.pid, me.start), "gone")
+        finally:
+            p.wait()
 
     def test_kill_refuses_a_pid_whose_start_differs(self):
         p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -475,10 +607,7 @@ def shards_agent(d, delay_s=0.0, binary=None):
     from fleetlib.agent import Agent
 
     if binary is None:
-        binary = os.path.join(d, "shards")
-        with open(binary, "w") as f:
-            f.write("#!/bin/sh\nexec cat\n")
-        os.chmod(binary, 0o755)
+        binary = standin_shards(d)
     o = SimpleNamespace(deadline_s=60, out=d, shards=binary, seed=1, needs="mem=1g", label="h", image="i@sha256:00",
                         ballast=0, chaos="none", rounds=0, repo=d, rev="", controller_t=0, keep_home=False)
     rec = records.Records(os.path.join(d, "r.jsonl"), "h", "run")
@@ -497,13 +626,30 @@ def shards_agent(d, delay_s=0.0, binary=None):
     return a, rec
 
 
+def lane_threads_end_for(name):
+    for t in threading.enumerate():
+        if t.name.startswith(f"lane-{name}-"):
+            t.join()
+
+
 def open_fds():
-    # Earlier tests' cyclic garbage (agents, their pipes) is collected first, never mid-count.
+    """This process's open descriptors (on Windows its handles). Earlier tests' cyclic garbage
+    (agents, their pipes) is collected first, never mid-count."""
     gc.collect()
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.GetProcessHandleCount.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        n = wintypes.DWORD()
+        if not k32.GetProcessHandleCount(k32.GetCurrentProcess(), ctypes.byref(n)):
+            raise OSError(ctypes.get_last_error(), "GetProcessHandleCount")
+        return n.value
     return len(os.listdir("/dev/fd"))
 
 
-@unittest.skipIf(sys.platform == "win32", "lanes select on pipes, which Windows can't (README, Owed)")
 class Asks(unittest.TestCase):
     """Asks on the real direct driver, each VM a local `cat`."""
 
@@ -533,6 +679,7 @@ class Asks(unittest.TestCase):
             self.assertEqual(len(a.live()), 5)
             self.assertGreater(open_fds(), before)
             a.drain()
+            lane_threads_end()
             self.assertEqual(open_fds(), before)
             self.assertEqual(a.states(), {W.ENDED: 5})
             rec.close()
@@ -550,7 +697,25 @@ class Asks(unittest.TestCase):
             self.assertEqual([r["refused"] for r in got if r["kind"] == "fill_stopped"], [[failed[0]["token"]]])
 
 
-@unittest.skipIf(sys.platform == "win32", "lanes select on pipes, which Windows can't (README, Owed)")
+    def test_a_lane_the_host_gives_nothing_for_is_a_typed_failure_that_stops_the_fill(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = shards_agent(d)
+
+            def refuse(stream):
+                raise OSError(24, "Too many open files")
+
+            a.lanes.add = refuse
+            a.fill("test")
+            a.drain()
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            failed = [r for r in got if r["kind"] == "start_failed"]
+            self.assertEqual(a.states(), {W.ENDED: 1})
+            self.assertEqual(len(failed), 1)
+            self.assertTrue(failed[0]["why"].startswith("lane: "), failed[0])
+            self.assertEqual([r["refused"] for r in got if r["kind"] == "fill_stopped"], [[failed[0]["token"]]])
+
+
 class Hold(unittest.TestCase):
     """The hold on live lanes: round trips, a turn's stream, then bulk rounds to a converged size."""
 
@@ -563,7 +728,7 @@ class Hold(unittest.TestCase):
     def test_a_hold_takes_every_kind_of_sample_on_every_lane(self):
         with tempfile.TemporaryDirectory() as d:
             # A room of 1 MiB bounds the bulk rounds at a few hundred KiB, so the test stays light.
-            a, rec, ps = lane_agent(d, 60, "mem=1m", {"t1": ["cat"], "t2": ["cat"]})
+            a, rec, ps = lane_agent(d, 60, "mem=1m", {"t1": ECHO, "t2": ECHO})
             a.waits["start"].answered(1_000_000_000)
             try:
                 a.hold("test")

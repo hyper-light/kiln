@@ -7375,7 +7375,7 @@ mod tests {
         let send = Command::Send { id: "m1".into(), text: "go on".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None };
         let moved: std::collections::HashSet<Owned> = [Owned::Agent("s1".into())].into_iter().collect();
         let me = Me { machine: "box".into(), instance: "01a17502".into(), root: Vec::new() };
-        let mut words = vec![("a local MoveTo".to_owned(), cmd(&Command::MoveTo { to: "box".into(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true })?)];
+        let mut words = vec![("a local MoveTo".to_owned(), cmd(&Command::MoveTo { to: "box".into(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native: false })?)];
         for w in [Word::Taken, Word::Refused("no room".into()), Word::NotPassed("x".into()), Word::Unsure("x".into()), Word::NoneNewer("x".into())] {
             words.push((format!("HandedOver ({w:?})"), cmd(&w.command())?));
         }
@@ -7383,7 +7383,7 @@ mod tests {
             ("a person's message", cmd(&send)?),
             ("a message for its epoch", ServerMsg::HarnessSend { session: "s1".into(), epoch: 2, json: serde_json::to_string(&send)? }),
             ("an interrupt", cmd(&Command::Interrupt)?),
-            ("a move to another machine", cmd(&Command::MoveTo { to: "other".into(), cwd: "~/w".into(), note: None, now: false, kind: None, model: None, local: false })?),
+            ("a move to another machine", cmd(&Command::MoveTo { to: "other".into(), cwd: "~/w".into(), note: None, now: false, kind: None, model: None, local: false, native: false })?),
             ("a close", ServerMsg::HarnessClose { session: "s1".into() }),
         ];
         let b64 = |m: &ServerMsg| -> anyhow::Result<String> { Ok(base64::engine::general_purpose::STANDARD.encode(proto::encode(m)?)) };

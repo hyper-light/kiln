@@ -250,7 +250,10 @@ impl Hub {
             asks.extend(due.into_iter().map(|id| (name.clone(), peer, id)));
         }
         for (name, peer, id) in asks {
-            let c = Command::MoveTo { to: name.clone(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true };
+            // Native where the newest process reads a native package: an ACP agent or Antigravity
+            // goes on in its own conversation there; else (an older build, a rollback) in words.
+            let native = native_to(&self.instances.load(), &name);
+            let c = Command::MoveTo { to: name.clone(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native };
             let Some(json) = self.worded(&name, peer, &id, &c).await else { continue };
             tracing::info!(agent = %name, peer, session = %id, "an older runner process of this machine hands this agent session to the newest once its turn is over");
             self.command_peers(&name, vec![peer], &ServerMsg::HarnessCmd { session: id, json }).await.log_when_answered(LOG_WITHIN);
@@ -414,6 +417,14 @@ impl Hub {
         let Some(json) = self.worded(agent, to, session, &word.command()).await else { return };
         self.command_peers(agent, vec![to], &ServerMsg::HarnessCmd { session: session.to_owned(), json }).await.log_when_answered(LOG_WITHIN);
     }
+}
+
+
+/// Whether machine `name`'s newest runner process reads a native package
+/// (`proto::feature::NATIVE_RESUME`): what a hand-over to it carries an ACP agent's or
+/// Antigravity's conversation as. One that says no features, or not that one, can't.
+pub(crate) fn native_to(inst: &crate::instances::Instances, name: &str) -> bool {
+    inst.newest(name).and_then(|p| inst.get(p)).is_some_and(|i| crate::proto::feature::speaks(&i.features, crate::proto::feature::NATIVE_RESUME))
 }
 
 #[cfg(test)]

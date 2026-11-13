@@ -144,8 +144,9 @@ memory and load), `view_lag`, `witness`, `fill_stopped`, `rtt`, `turn`, `bulk` (
 ## Commands
 
 From a kiln checkout at the revision under test (its `git rev-parse HEAD` is recorded). The shards
-binary is the one under test, on each host (a test-release build of the Shards revision, or the
-copy kiln carries once step 16 lands).
+binary is the one under test, on each host: a release build of the Shards revision (every
+measurement keeps `release`, Shards' CLAUDE.md; "A known Shards on each host", below), or the copy
+kiln carries once step 16 lands.
 
 **One host** (the light test's form), as a background `kiln run` so kiln's sweep leaves it:
 
@@ -180,7 +181,7 @@ kiln run --on HOST --needs mem=16g,cpus=8 --no-sync -- \
   "hosts": [
     {"on": "adacachy", "needs": "mem=32g,cpus=8", "shards": "/home/adalundhe/…/shards"},
     {"on": "adalundhe-macbook-pro", "needs": "mem=24g,cpus=6", "shards": "/Users/ada.lundhe/…/shards"},
-    {"on": "jupiter", "needs": "mem=32g,cpus=8", "shards": "C:/Users/corph/…/shards.exe", "python": "python3.14"}
+    {"on": "jupiter", "needs": "mem=32g,cpus=8", "shards": "C:/Users/corph/…/shards.exe", "python": "C:/Users/corph/.cache/kiln-fleet/python-3.14.10/python.exe"}
   ]
 }
 ```
@@ -203,14 +204,19 @@ python3 bench/fleet/tests/mutate.py                   # every guard removed in t
 
 The light tests read "do X, expect Y": percentiles, every derivation, each witness planted and found
 (and not found where it must not be), the ask's state machine, the chaos scope and pid-reuse refusals,
-lanes on loopback (`cat`: round trips and a 4 MiB transfer on four lanes at once, a lane that alters
-bytes found `corrupt`, a lane's end as an event), the OS's process table, the scan's pairing, orphans
-and zombies, a network process found and judged `orphan` after its VM and daemon are gone, a lag
-that settles and one that doesn't, asks on the real direct driver with a stand-in `shards` that is
-`cat` (a wave's echoes read between its slow spawns, no descriptor left by an ended ask, a spawn the
-host refuses typed and stopping the fill), a hold over `cat` lanes (every kind of sample on every
-lane), a mute lane's stall backed off to the run's deadline, and the report. `mutate.py` removes
-each of 25 guards in a copy and requires the tests to fail.
+lanes on loopback, each kind (`Selected` where it runs, and `Threaded` everywhere) held to the same
+cases (`cat`, or a Python echo where there's none: round trips and a 4 MiB transfer on four lanes at
+once, a lane that alters bytes or says them twice found `corrupt`, a lane's end as an event), a
+threaded lane's late word after it was dropped reaching no one and a lane the OS gives no thread
+refused leaving no descriptor, the OS's process table (one process read alone as the table reads
+it, Windows' image names, an exited process `gone`), the scan's pairing, orphans and zombies, a
+network process found and judged `orphan` after its VM and daemon are gone, a lag that settles and
+one that doesn't, asks on the real direct driver with a stand-in `shards` that is an echo (a wave's
+echoes read between its slow spawns, no descriptor left by an ended ask, a spawn the host refuses
+and a lane it can't serve typed and stopping the fill), a hold over echo lanes (every kind of sample
+on every lane), a mute lane's stall backed off to the run's deadline, and the report. `mutate.py
+[WORDS…]` removes each of 31 guards (or those whose description holds a word) in a copy and requires
+the tests to fail.
 
 ## The profile
 
@@ -247,8 +253,59 @@ again (the second's byte for byte).
 Light tests (`python3 -m unittest discover -s bench/fleet/tests`), at the revision that adds this
 record: macOS arm64 (this checkout, Python 3.9.6) 44 pass; Linux x86_64 (adacachy, Python 3.14.8) 44
 pass; Windows x86_64 (jupiter, python.org's 3.14.10 embeddable build, its SHA-256 checked, in a
-directory removed after) 34 pass and 10 skip (the lanes, owed below, and the open-file limit, which
+directory removed after) 34 pass and 10 skip (the lanes, then owed, and the open-file limit, which
 Windows doesn't keep). `mutate.py`: 25 of 25 on macOS.
+
+## Windows
+
+select() waits on sockets alone on Windows (Python's select docs), so there each lane's reader and
+writer block in threads of their own (`lane.Threaded`; on Linux and macOS one selector serves every
+lane, `lane.Selected`, and the light tests hold both to the same cases). Each lane thread keeps a
+duplicate of its descriptor that it alone closes, so a descriptor the agent closes and the OS numbers
+again is never one a lane thread reads; the reader times an operation where its last byte is read,
+in that thread, and hands the agent's thread only the outcome. Two threads a VM at hundreds of VMs:
+a lane the OS gives no thread or descriptor is a typed failed start (`start_failed`, `lane: …`) that
+stops the fill, as a refused spawn does. The process table names Windows images without `.exe`
+(Win32_Process's Name is the file's), and a process's start, CPU time and working set come from the
+Win32 API (GetProcessTimes, K32GetProcessMemoryInfo), read alone for one pid (no PowerShell per ask)
+and the same in the table; an exited process (one a handle still holds) is `gone`, never killed. The
+floor runs wherever a `cat` is found (under `kiln run` on jupiter, Git's).
+
+jupiter has no Python of its own (only the Microsoft Store's alias). It has python.org's nuget.org
+package, the distribution meant for CI and build machines with no system-wide Python (Python's
+"Using Python on Windows", 4.3; its full installer is deprecated since 3.14):
+`C:/Users/corph/.cache/kiln-fleet/python-3.14.10/python.exe`, the package's SHA-512 checked against
+nuget.org's catalog (`7d9967d9…902a5371`) before it was unpacked. Again, from Git Bash under
+`kiln run --on jupiter`:
+
+```sh
+v=3.14.10; d="$HOME/.cache/kiln-fleet/python-$v"; t="$d.part"; mkdir -p "$t"
+curl -fsSL -o "$t/p.zip" "https://api.nuget.org/v3-flatcontainer/python/$v/python.$v.nupkg"
+sha512sum "$t/p.zip"   # equal to the catalog's packageHash (https://api.nuget.org/v3/registration5-semver1/python/$v.json → catalogEntry), base64 there
+powershell -NoProfile -Command "Expand-Archive -Path '$(cygpath -w "$t/p.zip")' -DestinationPath '$(cygpath -w "$t/x")'"
+mv "$t/x/tools" "$d" && rm -rf "$t"
+```
+
+## A known Shards on each host
+
+`shards-build.sh REV [OUT]` (and `shards-build.ps1 -Rev REV` on a Windows host with no POSIX shell)
+fetches REV alone from Shards' public repository and builds it as Shards' release workflow does
+(`cargo build --locked --release -p shards`, `SHARDS_GIT_COMMIT` its first seven characters, so
+`shards --version` names it), without the GPU's renderer (such a `shards` carries no GPU VM process
+and refuses a GPU, which no fleet run asks for), into `~/.cache/kiln-fleet/shards/REV/` with
+`BUILD.txt`, and removes its build tree. Built on 2026-11-13 at e82b9403b (the Shards kiln's step 16
+and Hex pin), each `shards version 0.7.0, build e82b940`:
+
+| Host | Binary | SHA-256 |
+|---|---|---|
+| adacachy (Linux 7.2.9 x86_64) | `/home/adalundhe/.cache/kiln-fleet/shards/e82b9403b863718930fe9f224186d3ae862bfd61/shards` | `fa18ba38ff1b5ea3e8898cc2e07d45a626b1d90d6aa43d06c6c86f8d6d00f576` |
+| adacachy2 (Linux 7.3.3 x86_64) | the same path | the same: the two builds are byte for byte one |
+| adalundhe-macbook-pro (Darwin 25.5 arm64) | `/Users/ada.lundhe/.cache/kiln-fleet/shards/e82b9403b863718930fe9f224186d3ae862bfd61/shards` | `ca19e40f252e535338626ac84ce870abb5e2da774412210c7256ecf238a20ac9` |
+| adas-mac-studio-3.local (Darwin 25.2 arm64) | `/Users/adalundhe/.cache/kiln-fleet/shards/e82b9403b863718930fe9f224186d3ae862bfd61/shards` | `5e17e42cc9bf6025bafa524b4a36fdbabe8efd629ea4130bdea5ec907e8f65ec` |
+| adacachy's Windows 11 guest (x86_64) | `C:\Users\shards\.cache\kiln-fleet\shards\e82b9403b863718930fe9f224186d3ae862bfd61\shards.exe` | `f271d140d5677dc3780bf53c77c8766bad463ec83422f3435d38c964d70d52fd` |
+
+None was built on adas-mac-studio.local or adas-mac-studio-2.local (19 and 11 GiB free, 96-98% full),
+adas-mac-studio.local-2 (25 KB/s Wi-Fi) or jupiter (its kiln runs held by the headroom guard).
 
 ## Owed
 
@@ -266,12 +323,8 @@ Windows doesn't keep). `mutate.py`: 25 of 25 on macOS.
   its round trip a control request and its stream a turn's lines. Chaos on runners needs runners of the
   run's own (a second runner process per machine, `KILN_MACHINE_ID`, joined to a server of the run's
   own): production runners are never restarted.
-- **Windows lanes**: its pipes can't be selected on; the agent there needs a lane per thread. jupiter
-  has no Python of its own (only the Microsoft Store's alias): a run there needs one, as the light
-  tests above had.
-- **A Shards build of a known revision on each host**: the light tests' binary has none (Record).
-  adacachy2 keeps one of ac87190d3 (`~/.cache/s28-shards-ac87190d3/shards`), but its `/home` was
-  full on 2026-11-12 (64 KiB free), so nothing ran there.
+- **jupiter's shards**: the Windows build below sits in adacachy's Windows 11 guest; copying it to
+  jupiter (or building there once its headroom guard lets a build run) is ROOT's.
 - **Runs**: a few VMs on one Linux host were run (Record). Hundreds across the fleet, macOS hosts
   (through launchd-run.sh), jupiter, Linux arm64 (no KVM host), and every chaos round at density are
   ROOT's.
