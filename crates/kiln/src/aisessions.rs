@@ -837,7 +837,7 @@ impl Scanner {
         let mut places = vec![Folders { claude: Some(self.claude.clone()), codex: Some(self.codex.clone()), devin: Some(self.devin.clone()), isolation: None }];
         if let (Some(homes), Some(person)) = (&self.homes, person) {
             match volumes_of(homes, person) {
-                Ok(theirs) => places.push(theirs),
+                Ok(theirs) => places.extend(theirs),
                 Err(refused) => tracing::warn!(error = %refused, "a history reads no microVM volume of this person's"),
             }
         }
@@ -1067,20 +1067,35 @@ impl Folders {
 }
 
 /// `person`'s microVM volumes under `homes` (`<state>/homes/<person>/<harness>/`, kiln plan
-/// 01a1d2c16eb074f19cf7ae7f1025c0be step 5), as kiln's Agentfile for each harness lays them out
-/// (`home::of_kilns`): each harness's folder at its path on this machine, its conversations saying they
-/// ran in a microVM of that person's. Refused, typed, for a person kiln keeps no volume for.
-fn volumes_of(homes: &Path, person: &str) -> Result<Folders, Refusal> {
-    let var = |harness: &str, key: &str| -> Result<Option<PathBuf>, Refusal> {
-        Ok(home::of_kilns(homes, person, harness)?.and_then(|l| l.host_env().into_iter().find(|(k, _)| k == key)).map(|(_, v)| PathBuf::from(v)))
-    };
-    Ok(Folders {
-        claude: var("claude", "CLAUDE_CONFIG_DIR")?,
-        codex: var("codex", "CODEX_HOME")?,
-        // In its microVM Devin keeps its sessions in XDG's data folder, as on any Linux (`Scanner::new`).
-        devin: var("devin", "XDG_DATA_HOME")?.map(|d| d.join("devin").join("cli")),
-        isolation: Some(Isolation { person: Some(person.to_owned()), ..Isolation::microvm() }),
-    })
+/// 01a1d2c16eb074f19cf7ae7f1025c0be step 5): for each harness, where its conversations are kept there
+/// as kiln's Agentfile for it lays them out (`home::of_kilns`), and where the records beside them say
+/// one of theirs ran (`home::kept_ins`: a person's own Agentfile lays its volumes out as it likes; kiln
+/// plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7), each folder once, at its path on this
+/// machine, its conversations saying they ran in a microVM of that person's. Refused, typed, for a
+/// person kiln keeps no volume for.
+fn volumes_of(homes: &Path, person: &str) -> Result<Vec<Folders>, Refusal> {
+    let isolation = Some(Isolation { person: Some(person.to_owned()), ..Isolation::microvm() });
+    let mut out: Vec<Folders> = Vec::new();
+    for harness in ["claude", "codex", "devin"] {
+        let kilns = home::of_kilns(homes, person, harness)?.and_then(|l| l.kept_in());
+        let mut folders: Vec<PathBuf> = Vec::new();
+        for guest in kilns.into_iter().chain(home::kept_ins(&home::ran_in_dir(homes, person, harness)?)) {
+            if let Some(at) = home::kept_at(homes, person, harness, &guest)?
+                && !folders.contains(&at)
+            {
+                folders.push(at);
+            }
+        }
+        out.extend(folders.into_iter().map(|at| {
+            let (claude, codex, devin) = match harness {
+                "claude" => (Some(at), None, None),
+                "codex" => (None, Some(at), None),
+                _ => (None, None, Some(at)),
+            };
+            Folders { claude, codex, devin, isolation: isolation.clone() }
+        }));
+    }
+    Ok(out)
 }
 
 /// `p`, from a person's microVM volume under `homes`, goes on in the Agentfile it ran in, as kiln kept it
@@ -2083,7 +2098,7 @@ mod tests {
             let said = serde_json::json!({"type": "user", "sessionId": id, "cwd": "/work/a", "timestamp": "t", "message": {"role": "user", "content": "go on"}});
             std::fs::write(projects.join(format!("{id}.jsonl")), format!("{said}\n"))?;
         }
-        let kept = home::RanIn { conversation: "ran-own".into(), agentfile: "agentfile:0123".into(), digest: "ab".repeat(32), image: "agentfile-0123@sha256:00".into() };
+        let kept = home::RanIn { conversation: "ran-own".into(), agentfile: "agentfile:0123".into(), digest: "ab".repeat(32), image: "agentfile-0123@sha256:00".into(), kept_in: None };
         home::keep_ran_in(&home::ran_in_dir(&homes, "user:u1", "claude")?, &kept)?;
         let mut sc = Scanner::new(dir.path().to_owned()).with_homes(homes.clone());
         let machine = dir.path().join("machine");
@@ -2093,6 +2108,44 @@ mod tests {
         let mut images: Vec<(&str, Option<&str>)> = past.iter().map(|p| (p.id.as_str(), p.isolation.as_ref().and_then(|i| i.image.as_deref()))).collect();
         images.sort_unstable();
         assert_eq!(images, [("ran-own", Some("agentfile:0123")), ("ran-unkept", None)]);
+        Ok(())
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: a conversation a person's own
+    /// Agentfile kept elsewhere than kiln's does (Claude Code's folder at `/data/claude` in its microVM,
+    /// a volume kiln's Agentfile has none of) is found where its record beside their volume says its
+    /// harness keeps them (`home::RanIn::kept_in`), and goes on in that Agentfile; never for another
+    /// person, nor at a folder a record names outside its person's volume.
+    #[test]
+    fn s17_a_history_finds_a_conversation_kept_where_a_persons_own_agentfile_keeps_them() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let homes = home::root(dir.path());
+        let said = |id: &str| serde_json::json!({"type": "user", "sessionId": id, "cwd": "/work/a", "timestamp": "t", "message": {"role": "user", "content": "go on"}});
+        let projects = homes.join("user-u1").join("claude").join("data").join("claude").join("projects").join("-work-a");
+        std::fs::create_dir_all(&projects)?;
+        std::fs::write(projects.join("own-layout.jsonl"), format!("{}\n", said("own-layout")))?;
+        let kept = home::RanIn { conversation: "own-layout".into(), agentfile: "agentfile:0123".into(), digest: "ab".repeat(32), image: "agentfile-0123@sha256:00".into(), kept_in: Some("/data/claude".into()) };
+        home::keep_ran_in(&home::ran_in_dir(&homes, "user:u1", "claude")?, &kept)?;
+        // A record that names a folder out of its person's volume leads nowhere: u2's folder holds a
+        // conversation that a record of u1's would reach by climbing out of u1's.
+        let theirs = homes.join("user-u2").join("claude").join("c").join("projects").join("-work-a");
+        std::fs::create_dir_all(&theirs)?;
+        std::fs::write(theirs.join("theirs.jsonl"), format!("{}\n", said("theirs")))?;
+        let climbing = home::RanIn { conversation: "climbing".into(), kept_in: Some("/../../user-u2/claude/c".into()), ..kept.clone() };
+        home::keep_ran_in(&home::ran_in_dir(&homes, "user:u1", "claude")?, &climbing)?;
+        // The machine's own folders hold nothing.
+        let machine = dir.path().join("machine");
+        let mut sc = Scanner::new(dir.path().to_owned()).with_homes(homes.clone());
+        (sc.claude, sc.codex, sc.devin, sc.running) = (machine.join("claude"), machine.join("codex"), machine.join("devin"), Some(HashSet::new()));
+        let mut found = |person: Option<&str>| -> Vec<(String, Option<String>, Option<String>)> {
+            let past = sc.history(Some("claude"), 50, &HashSet::new(), person);
+            past.into_iter().map(|p| (p.id, p.isolation.as_ref().and_then(|i| i.person.clone()), p.isolation.and_then(|i| i.image))).collect()
+        };
+        let own = [("own-layout".to_owned(), Some("user:u1".to_owned()), Some("agentfile:0123".to_owned()))];
+        assert_eq!(found(Some("user:u1")), own);
+        assert_eq!(found(Some("user:u1")), own, "the same, asked again");
+        assert!(found(Some("user:u2")).is_empty(), "u1's records are read for u1 alone, and u2 keeps none");
+        assert!(found(None).is_empty(), "asked for nobody: the machine's own alone");
         Ok(())
     }
 

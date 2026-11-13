@@ -5122,6 +5122,19 @@ while True:
             assert!(launch.env.contains(&("KILN_AGENT".to_owned(), "isolated".to_owned())), "its mark: {:?}", launch.env);
             let mcp = launch.args.iter().position(|a| a == "--mcp-config").and_then(|i| launch.args.get(i + 1));
             assert!(mcp.is_some_and(|c| c.contains(crate::harness::isolated::mcp::BRIDGE)), "kiln's MCP through its bridge: {:?}", launch.args);
+            // What it sees of the machine: its project at its own path, its person's volume here as its
+            // HOME, made before it started (`harness::isolated::home::Layout::prepare`), and the plugin
+            // folders Claude Code loads on the machine (kiln's skills, its session's), read-only at their
+            // own paths and named to it as there.
+            let volume = dir.path().join("homes").join("owner").join("claude").join("home").join("claude");
+            let home = kiln_seams::sandbox::Share { host: volume.to_string_lossy().into_owned(), at: "/home/claude".into(), writable: true };
+            let plugins = crate::sandbox::isolated::plugin_folders(crate::harness::kinds::Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude"))?, "isolated");
+            anyhow::ensure!(plugins.len() == 2, "kiln's skills and its session's: {plugins:?}");
+            let read_only = plugins.iter().map(|p| kiln_seams::sandbox::Share { host: p.clone(), at: p.clone(), writable: false });
+            let shares: Vec<_> = [kiln_seams::sandbox::Share::at_its_path(&cwd), home].into_iter().chain(read_only).collect();
+            assert_eq!(launch.shares, shares);
+            assert!(volume.is_dir(), "its volume, made before it started");
+            assert!(plugins.iter().all(|p| launch.args.windows(2).any(|w| w == ["--plugin-dir", p.as_str()])), "named to it: {:?}", launch.args);
             // Where it runs, on its info (step 34's checks read it): its microVM by name, its image pinned,
             // no host pid, said so, and the link its stdio rides, both ends' words once it's made.
             until_it("its link, said", 60, || matches!(s.info().runs, Some(session::Runs::Microvm { control: Some(_), .. }))).await?;
@@ -5154,9 +5167,16 @@ while True:
             let conversation_id = conversation.clone().unwrap_or_default();
             assert!(resumed.args.windows(2).any(|w| w == ["--resume", conversation_id.as_str()]), "resumed through its launch's arguments: {:?}", resumed.args);
             // Where its conversation ran, kept beside its person's volume as its first run ended, before its
-            // second started: kiln's Agentfile for Claude Code, at this kiln's text, and its image pinned.
+            // second started: kiln's Agentfile for Claude Code, at this kiln's text, its image pinned, and where
+            // Claude Code keeps its conversations in its volume.
             let ran_in = crate::harness::isolated::home::ran_in_dir(&dir.path().join("homes"), "owner", "claude")?;
-            let kept = crate::harness::isolated::home::RanIn { conversation: conversation_id.clone(), agentfile: "harness-claude".into(), digest: crate::util::sha256_hex(claude.text.as_bytes()), image: pinned.clone() };
+            let kept = crate::harness::isolated::home::RanIn {
+                conversation: conversation_id.clone(),
+                agentfile: "harness-claude".into(),
+                digest: crate::util::sha256_hex(claude.text.as_bytes()),
+                image: pinned.clone(),
+                kept_in: Some("/home/claude/.claude".into()),
+            };
             assert_eq!(crate::harness::isolated::home::ran_in(&ran_in, &conversation_id), Some(kept), "kept as its run ended");
             until_it("it back", 60, idle).await?;
             // kiln's record: two starts, each in a microVM of its own, none on the host, the first ended.
