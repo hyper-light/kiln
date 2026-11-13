@@ -252,7 +252,7 @@ fn executable(path: &Path) -> std::io::Result<fs::File> {
 }
 
 /// `path`, made if it isn't there, only this user's: what's in it runs as kiln.
-fn private_dir(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn private_dir(path: &Path) -> anyhow::Result<()> {
     let mut b = fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]

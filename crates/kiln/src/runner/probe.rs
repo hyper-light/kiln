@@ -292,6 +292,9 @@ fn machine(work_dir: &Path) -> RunnerFacts {
     });
     let (kvm, nested) = kvm();
     let arch = std::env::consts::ARCH.to_owned();
+    // Whether it holds isolated agents in microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step
+    // 17): one answer, which `virt.microvm` says too.
+    let isolation = crate::sandbox::facts(kvm);
     RunnerFacts {
         os: std::env::consts::OS.to_owned(),
         os_version: System::os_version(),
@@ -306,9 +309,8 @@ fn machine(work_dir: &Path) -> RunnerFacts {
         cpu: Cpu { model, cores, threads, flags: cpu_flags() },
         mem: mem(sys.total_memory(), sys.available_memory(), crate::os::cgroup::memory_limit()),
         disk,
-        // It starts no microVM itself until kiln carries their runtime (kiln plan
-        // 01a1cd8e862e7169a074db3d5fa33f3d step 16).
-        virt: Virt { kvm, hvf: false, nested, microvm: false },
+        virt: Virt { kvm, hvf: false, nested, microvm: isolation.available },
+        isolation: Some(isolation),
         binfmt: binfmt(),
         // Its load, for admission (W24-R19).
         work: Some({
