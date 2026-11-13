@@ -3,8 +3,10 @@
 The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 12,
 16 and 17; Hex's `docs/design/`), built on kiln's one Shards and hyper-raft.
 
-- **Upstream:** https://github.com/hyper-light/hex, commit `d84730ee93558b67b95db02f61a4d50290236e50`
-  (2026-11-12), MIT (`LICENSE`): Hex's `main` with the joint plan's steps 13 and 14 merged, its newest. Hex's lead
+- **Upstream:** https://github.com/hyper-light/hex, commit `106c7b94c93edc0fd7e8fb9004503c26c32a0030`
+  (2026-11-12), MIT (`LICENSE`): Hex's `main` as kiln found it, with the joint plan's steps 13 and 14 merged (over
+  `d84730ee`, kiln's pin before, it adds only its design index, which kiln's copy leaves out). Its steps 4 and 12 aren't
+  on it yet, and a re-vendor takes them once they land. Hex's lead
   is gone (2026-11-12), so kiln chose it: it pins Shards at `482c5d78` and hyper-raft at `0856e05`, both older than
   kiln's, and with the first change below its crates build on kiln's (`cargo check -p hex-node` in kiln's
   workspace, then kiln's clippy and tests, on macOS, Linux and Windows: docs/shards.md).
