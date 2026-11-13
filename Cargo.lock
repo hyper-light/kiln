@@ -2685,6 +2685,7 @@ dependencies = [
  "event-listener",
  "futures",
  "hex",
+ "hex-api",
  "parking_lot",
  "rcgen",
  "regex",
