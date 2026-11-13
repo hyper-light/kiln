@@ -368,6 +368,7 @@ mod tests {
                 bounds: hex_api::Bounds::default(),
                 class: hex_api::ClassSpec::Process,
                 owner: None,
+                band: 0,
             },
             start: true,
         };

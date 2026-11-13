@@ -208,6 +208,20 @@ fn a_malformed_grant_is_refused_by_the_field_it_names() {
     assert!(why.starts_with("grants[7].to address"), "{why}");
 }
 
+/// Joint plan step 15 (N1; Shards D236): do check egress to `host.docker.internal`, the name Shards' destinations give
+/// the VM's own host, which its network process takes to the host's loopback. Expect it refused by its field, naming
+/// the host grant, since the host is reached through a `Host` grant alone; and another name under `.internal`, which
+/// no Shards rule makes the host, passed.
+#[test]
+fn the_vms_host_by_its_shards_name_is_a_host_grant_never_an_egress_one() {
+    let why = refused_why(&[to_name("host.docker.internal")]);
+    assert!(
+        why.starts_with("grants[0].to name \"host.docker.internal\"") && why.contains("host grant"),
+        "{why}"
+    );
+    assert_eq!(check_grants(&[to_name("kiln.internal")]), Ok(()));
+}
+
 /// Joint plan step 15, AC-T7.7.2: do check grants that name one flow twice (overlapping ports to one destination or
 /// the host, one published port for two members, one publish twice, one host socket for two ports); expect each
 /// refused naming both grants, while grants that only look alike (another protocol, adjacent ports, another member,

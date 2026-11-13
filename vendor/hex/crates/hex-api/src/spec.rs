@@ -53,6 +53,16 @@ pub struct BoxSpec {
     /// Actual initialized execution selected before admission, beside the original workload form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<crate::runtime::RouteReceipt>,
+    /// Its priority band as its submitter gave it, 0 the lowest: where its node must end one of its microVMs to hold
+    /// its fleet's memory, the lowest band goes first (joint plan step 14, `docs/design/learned-charge.md` C5), as
+    /// Kubernetes' kubelet evicts by priority. Added after the spec's other fields, so a spec without it is band 0
+    /// (append-only), and a band-0 spec's record and native commitment are those of a spec before it.
+    #[serde(default, skip_serializing_if = "is_lowest")]
+    pub band: u8,
+}
+
+fn is_lowest(band: &u8) -> bool {
+    *band == 0
 }
 
 impl BoxSpec {
@@ -290,6 +300,72 @@ pub struct ShardsImage {
     /// (append-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub grants: Vec<crate::Grant>,
+    /// The members its caller drives (joint plan step 17): each started with its stdin a pipe the caller
+    /// writes and its stdout and stderr pipes the caller reads, as Shards' image boot hands an orchestrator a
+    /// member's input (`MemberSpec::stdin`, `ImageGuest::take_input`) and output (`take_output`); the caller
+    /// takes them, with the member's end, through [`crate::Runtime::member`]. The image's other members run
+    /// as it declares them, their stdin the null device. After the grants (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<ImageMember>,
+}
+
+/// A member of a Shards image its caller drives ([`ShardsImage::members`]): which one, by the kind and name
+/// its Agentfile gives it, the variables it gets over its image's, and the folder it works in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageMember {
+    pub member: crate::Member,
+    /// Variables over its image's, each `(KEY, VALUE)`, as an exec's are checked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<(String, String)>,
+    /// Its working directory, absolute and plain, which must be there as it starts (Shards' D231); none for
+    /// its image's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+}
+
+impl ImageMember {
+    /// `member`, given nothing over its image's, in its image's working directory.
+    pub fn new(member: crate::Member) -> Self {
+        Self {
+            member,
+            env: Vec::new(),
+            workdir: None,
+        }
+    }
+
+    /// Whether Shards can be asked to start it: its name as a grant's member's is checked, its variables as
+    /// an exec's (no empty key, no `=` in a key, no NUL), and its working directory absolute and plain (no
+    /// empty, `.` or `..` component, no NUL), as D231's `MemberSpec::workdir` takes one.
+    fn check(&self, at: usize) -> Result<(), Refusal> {
+        self.member
+            .check_named(&format!("members[{at}].member"))
+            .map_err(invalid_image)?;
+        if let Some((k, _)) = self
+            .env
+            .iter()
+            .find(|(k, v)| k.is_empty() || k.contains('=') || k.contains('\0') || v.contains('\0'))
+        {
+            return Err(invalid_image(format!(
+                "members[{at}].env's variable {k:?} can't be set"
+            )));
+        }
+        if let Some(dir) = &self.workdir {
+            let plain = dir.starts_with('/')
+                && !dir.contains('\0')
+                && (dir == "/"
+                    || dir
+                        .get(1..)
+                        .unwrap_or_default()
+                        .split('/')
+                        .all(|c| !c.is_empty() && c != "." && c != ".."));
+            if !plain {
+                return Err(invalid_image(format!(
+                    "members[{at}].workdir {dir:?} isn't absolute and plain"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ShardsImage {
@@ -299,13 +375,15 @@ impl ShardsImage {
             image: image.to_owned(),
             command: None,
             grants: Vec::new(),
+            members: Vec::new(),
         }
     }
 
     /// Whether Shards can be asked to boot it: the image pinned by a digest go-digest validates (the
     /// algorithm `sha256`, `sha384` or `sha512` and exactly that many lowercase hex digits, as Shards'
     /// reference parser checks it), a command, where there is one, of a non-empty program and no NUL,
-    /// and grants [`crate::check_grants`] takes. Refused by its field's name (CLAUDE.md §3); the rest of
+    /// grants [`crate::check_grants`] takes, and members its caller drives each named once and checked as
+    /// [`ImageMember`] checks one. Refused by its field's name (CLAUDE.md §3); the rest of
     /// the name's grammar is Shards' to refuse as it resolves the image, and a grant Shards can't hold
     /// exactly is the runtime's to refuse as it programs the boot.
     pub fn check(&self) -> Result<(), Refusal> {
@@ -357,7 +435,23 @@ impl ShardsImage {
                 return Err(invalid_image(format!("command[{at}] holds a NUL")));
             }
         }
-        crate::check_grants(&self.grants)
+        crate::check_grants(&self.grants)?;
+        for (at, member) in self.members.iter().enumerate() {
+            member.check(at)?;
+            if self
+                .members
+                .get(..at)
+                .unwrap_or_default()
+                .iter()
+                .any(|m| m.member == member.member)
+            {
+                return Err(invalid_image(format!(
+                    "members[{at}] names {} again",
+                    member.member
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1133,6 +1227,7 @@ mod tests {
                     kind: crate::DeviceKind::Gpu,
                     key: u64::MAX,
                 }],
+                band: 0,
             };
             assert_eq!(boxed.class.class(), class);
             boxed.check().unwrap();
@@ -1163,7 +1258,76 @@ mod tests {
             devices: Vec::new(),
             allocation: Some(crate::sim::sim_vm_allocation().unwrap()),
             route: None,
+            band: 0,
         }
+    }
+
+    /// AC-T7.4.1 (joint plan step 17): do check an image VM naming the members its caller drives, a harness with a
+    /// variable and a working directory and an agent with neither; expect it passes. Do name a member twice, give
+    /// one a key with `=`, a value with a NUL, a relative, `..` or empty-component directory, and a name Shards'
+    /// parser refuses; expect each refused as Invalid, naming the member's field.
+    #[test]
+    fn the_members_an_image_vms_caller_drives_are_named_once_and_checked() {
+        let harness = crate::Member {
+            kind: crate::MemberKind::Harness,
+            name: "claude".to_owned(),
+        };
+        let driven = ImageMember {
+            member: harness.clone(),
+            env: vec![("TZ".to_owned(), "UTC".to_owned())],
+            workdir: Some("/home/me/project".to_owned()),
+        };
+        let agent = ImageMember::new(crate::Member {
+            kind: crate::MemberKind::Agent,
+            name: "helper".to_owned(),
+        });
+        let with = |members: Vec<ImageMember>| ShardsImage {
+            members,
+            ..ShardsImage::new(crate::sim::SIM_IMAGE)
+        };
+        with(vec![driven.clone(), agent]).check().unwrap();
+        image_box(with(vec![driven.clone()])).check().unwrap();
+        let refused = |m: ImageMember| match with(vec![m]).check() {
+            Err(Refusal::Invalid { what, why }) => (what, why),
+            other => panic!("not refused as Invalid: {other:?}"),
+        };
+        match with(vec![driven.clone(), ImageMember::new(harness.clone())]).check() {
+            Err(Refusal::Invalid { why, .. }) => assert!(why.contains("again"), "{why}"),
+            other => panic!("a member named twice: {other:?}"),
+        }
+        let bad_key = ImageMember {
+            env: vec![("A=B".to_owned(), "1".to_owned())],
+            ..driven.clone()
+        };
+        let (what, why) = refused(bad_key);
+        assert_eq!(
+            (what, why.contains("members[0].env")),
+            ("shards image", true),
+            "{why}"
+        );
+        let bad_value = ImageMember {
+            env: vec![("A".to_owned(), "1\0".to_owned())],
+            ..driven.clone()
+        };
+        assert!(refused(bad_value).1.contains("members[0].env"));
+        for dir in [
+            "relative/dir",
+            "/home/../etc",
+            "/home//me",
+            "/home/./me",
+            "",
+        ] {
+            let m = ImageMember {
+                workdir: Some(dir.to_owned()),
+                ..driven.clone()
+            };
+            assert!(refused(m).1.contains("members[0].workdir"), "{dir:?}");
+        }
+        let bad_name = ImageMember::new(crate::Member {
+            kind: crate::MemberKind::Harness,
+            name: "Claude".to_owned(),
+        });
+        assert!(refused(bad_name).1.contains("members[0].member.name"));
     }
 
     /// AC-T7.4.1 (joint plan step 12): a Shards image VM of class Shards, its image pinned by a digest

@@ -1108,6 +1108,18 @@ impl Runtime for GuestRuntime {
         })
     }
 
+    fn member(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
+        match self.routed(id)? {
+            books::Routed::Image(record) => self.member_image(record, member),
+            books::Routed::Other(_) => Err(Refusal::Invalid {
+                what: "member",
+                why: format!(
+                    "box {id} isn't a Shards image box: only one has members its caller drives"
+                ),
+            }),
+        }
+    }
+
     fn signal(&self, id: &BoxId, signal: Signal) -> Result<(), Refusal> {
         match self.routed(id)? {
             books::Routed::Image(record) => self.signal_image(record, signal),
@@ -1549,6 +1561,10 @@ impl<P: Runtime> Runtime for WithGuest<P> {
 
     fn signal(&self, id: &BoxId, signal: Signal) -> Result<(), Refusal> {
         self.holder(id)?.signal(id, signal)
+    }
+
+    fn member(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
+        self.holder(id)?.member(id, member)
     }
 
     fn inspect(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {

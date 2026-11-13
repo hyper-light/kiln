@@ -163,6 +163,10 @@ pub struct Store {
     /// The host's boot session ([`host_boot`]), which every record it writes carries; `None` where it
     /// can't be read, with why in [`Store::boot_unread`].
     boot: Option<BootSession>,
+    /// The next place in the node's start order (joint plan step 14, C3) the store gives a VM lifetime it begins
+    /// ([`BoxRecord::started`]): one past the most any of its records held when it opened, so the order runs on
+    /// across the node's restarts. Shared by clones.
+    begun: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Default)]
@@ -233,7 +237,9 @@ impl Store {
             #[cfg(all(debug_assertions, target_os = "linux"))]
             crash_before_write: Arc::default(),
             boot: host_boot().as_ref().ok().cloned().flatten(),
+            begun: Arc::new(AtomicU64::new(1)),
         };
+        store.count_starts()?;
         Ok(store)
     }
 
@@ -502,11 +508,61 @@ impl Store {
             return Err(uncertain(&record.spec.id));
         }
         let scope = fresh_scope()?;
+        let started = self.next_start()?;
         self.write_encoded(
             record,
-            record.encode_fresh_scope(scope, self.boot.as_ref())?,
+            record.encode_fresh_scope(scope, started, self.boot.as_ref())?,
             true,
         )
+    }
+
+    /// The node's start order as the store opens (joint plan step 14, C3): the next place is one past the most any
+    /// record holds; then each VM record of this boot that holds none, begun by an earlier node agent, is given the next,
+    /// in box-id order, so every VM that may run holds one before the node takes a create. A record of an earlier boot
+    /// names nothing that runs and is recovery's to remove, so it is left as that boot wrote it, as is a torn one.
+    fn count_starts(&self) -> Result<(), Refusal> {
+        let records = self.all()?;
+        let most = records
+            .values()
+            .filter_map(|record| record.as_ref().ok()?.started)
+            .max()
+            .unwrap_or(0);
+        let next = most.checked_add(1).ok_or(Refusal::Exhausted {
+            what: "a node's start order",
+            bound: usize::MAX,
+        })?;
+        self.begun.store(next, Ordering::Relaxed);
+        for (id, record) in &records {
+            let Ok(record) = record else {
+                continue;
+            };
+            let unplaced = record.native_scope.is_some()
+                && record.started.is_none()
+                && record.boot == self.boot;
+            if !unplaced {
+                continue;
+            }
+            let place = self.next_start()?;
+            let scope = record.native_scope;
+            self.update(id, |current| {
+                if current.native_scope != scope || current.started.is_some() {
+                    return false;
+                }
+                current.started = Some(place);
+                true
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The next place in the node's start order (C3), refused once the count would pass a `u64`.
+    fn next_start(&self) -> Result<u64, Refusal> {
+        self.begun
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| Refusal::Exhausted {
+                what: "a node's start order",
+                bound: usize::MAX,
+            })
     }
 
     /// Writes `record` in its place, carrying the host's boot session (T-T7.1.2).
@@ -1191,6 +1247,7 @@ mod tests {
             class: ClassSpec::Process,
             owner: None,
             allocation: None,
+            band: 0,
         };
         BoxRecord::new(spec, Phase::Ready, vec![])
     }
@@ -1441,11 +1498,14 @@ mod tests {
         let store = store_in(dir.path());
         let held = record("held");
         let turn = store.claim(&held.spec.id).unwrap();
-        let (done, written) = std::sync::mpsc::channel();
+        // Hex's channel: std's receive comes late on macOS by the thread's QoS leeway (docs/design/deadline-waits.md).
+        let (done, written) = hex_wait::mpsc::sync_channel(31).unwrap();
         std::thread::scope(|s| {
             for n in 0..31 {
                 let (store, done) = (&store, done.clone());
-                s.spawn(move || done.send(store.put(&record(&format!("b{n}")))).unwrap());
+                s.spawn(move || {
+                    done.try_send(store.put(&record(&format!("b{n}")))).unwrap();
+                });
             }
             for _ in 0..31 {
                 let put = written
@@ -1795,5 +1855,66 @@ mod tests {
         assert!(!store.before_this_boot(None));
         assert_eq!(fs::read_to_string(&marker).unwrap(), this_boot);
         assert!(!dir.path().join("state").join(BOOT_MARKER_TEMP).exists());
+    }
+
+    /// A Shards VM's record as its create begins it: the store introduces its lifetime's scope.
+    fn vm_record(id: &str) -> BoxRecord {
+        let mut record = record(id);
+        record.spec.class = ClassSpec::Shards(Box::new(hex_api::OciSpec {
+            rootfs: hex_api::Rootfs::Dir(PathBuf::from("/images/agent")),
+            init: hex_api::Program::of(&["/bin/true"]),
+            mounts: Vec::new(),
+            hostname: None,
+            network: hex_api::Network::Private,
+            hosts: Vec::new(),
+        }));
+        record.phase = Phase::Creating;
+        record
+    }
+
+    /// Joint plan step 14 (AC-T7.4.1), C3's order (ROOT, 2026-11-12): the store gives each VM lifetime it begins its
+    /// place in the node's start order, kept in its record across the node's restarts and never its scope's; a VM of this
+    /// boot begun by an earlier node agent, its record holding no place, is given one as the store opens, in box-id order;
+    /// a process box's record holds none. Do begin vm-b then vm-a, reopen the store as a restarted node does, and begin
+    /// vm-c and a process box; then take the three VMs' places out of their records, as an earlier node agent wrote them,
+    /// reopen, and begin vm-d. Expect vm-b 1, vm-a 2 and vm-c 3, past the most on disk after the restart, and the process
+    /// box none; after the second reopening vm-a 1, vm-b 2 and vm-c 3, by box id, and vm-d 4.
+    #[test]
+    fn w14_the_store_keeps_each_vms_place_in_its_start_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = |store: &Store, id: &str| {
+            store
+                .get(&BoxId::new(id).unwrap())
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .started
+        };
+        let places = |store: &Store| ["vm-a", "vm-b", "vm-c"].map(|id| started(store, id));
+        let store = store_in(dir.path());
+        for id in ["vm-b", "vm-a"] {
+            store.begin(&vm_record(id)).unwrap();
+        }
+        drop(store);
+        let store = store_in(dir.path());
+        store.begin(&vm_record("vm-c")).unwrap();
+        let mut process = record("process");
+        process.phase = Phase::Creating;
+        store.begin(&process).unwrap();
+        assert_eq!(places(&store), [Some(2), Some(1), Some(3)]);
+        assert_eq!(started(&store, "process"), None);
+        for id in ["vm-a", "vm-b", "vm-c"] {
+            store
+                .update(&BoxId::new(id).unwrap(), |r| {
+                    r.started = None;
+                    true
+                })
+                .unwrap();
+        }
+        drop(store);
+        let store = store_in(dir.path());
+        assert_eq!(places(&store), [Some(1), Some(2), Some(3)]);
+        store.begin(&vm_record("vm-d")).unwrap();
+        assert_eq!(started(&store, "vm-d"), Some(4));
     }
 }

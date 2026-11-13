@@ -25,6 +25,7 @@ fn spec(name: &str, key: u64) -> BoxSpec {
             kind: DeviceKind::Gpu,
             key,
         }],
+        band: 0,
     }
 }
 
@@ -371,30 +372,16 @@ fn luid_route_retains_stable_device_identity_without_claiming_native_corresponde
     ));
 }
 
-/// AC-T7.4.1: a catalog label cannot grant trusted guest render authority or bypass host CDI.
+/// AC-T7.4.1: a catalog label cannot grant trusted guest render authority or bypass host CDI. Do: catalog a guest
+/// recipe and ask host CDI for its device; parse rows whose selector, size or model differs from a recipe's. Expect:
+/// the recipe apart from host CDI, the host plan refused, and each such row refused.
 #[test]
-fn guest_recipe_is_separate_and_requires_exact_boot_owner_and_full_set() {
+fn guest_recipe_is_separate_from_host_cdi_and_its_rows_are_exact() {
     let catalog = Catalog::parse(b"hex-devices-1\ngpu\t256\tshards-renderer\t0\tguest-gpu\t/private/guest.cdi\thex.shards/gpu=256\n").unwrap();
     assert_eq!(catalog.entries_for(Route::GuestGpu).count(), 1);
     assert_eq!(catalog.entries_for(Route::Cdi).count(), 0);
     let selected = spec("dedicated", 256);
     assert!(catalog.cdi(&selected.devices).is_err());
-    let foreign = crate::guest::gpu::Authority {
-        owner: BoxId::new("foreign").unwrap(),
-        devices: selected.devices.clone(),
-    };
-    assert!(catalog.guest_cdi(&selected, &foreign).is_err());
-    let subset = crate::guest::gpu::Authority {
-        owner: selected.id.clone(),
-        devices: vec![
-            selected.devices[0],
-            DeviceId {
-                kind: DeviceKind::Gpu,
-                key: 512,
-            },
-        ],
-    };
-    assert!(catalog.guest_cdi(&selected, &subset).is_err());
     for row in [
         "gpu\t256\tshards-renderer\t0\tguest-gpu\t/private/g\thex.shards/gpu=512",
         "gpu\t256\tshards-renderer\t4096\tguest-gpu\t/private/g\thex.shards/gpu=256",
@@ -402,24 +389,103 @@ fn guest_recipe_is_separate_and_requires_exact_boot_owner_and_full_set() {
     ] {
         assert!(Catalog::parse(format!("hex-devices-1\n{row}\n").as_bytes()).is_err());
     }
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("guest.cdi");
+}
+
+/// A guest recipe for device 256, written in `dir` and catalogued there. A guest-gpu file is the Linux guest's own
+/// path: the catalog takes one only from `/`, and only the Linux node's attachments read it, so the tests that read
+/// one run on Linux, where a test's file is named so.
+#[cfg(target_os = "linux")]
+fn guest_recipe(dir: &std::path::Path) -> Catalog {
+    let path = dir.join("guest.cdi");
     std::fs::write(&path, br#"{"cdiVersion":"1.1.0","kind":"hex.shards/gpu","devices":[{"name":"256","containerEdits":{"deviceNodes":[{"path":"/dev/dri/renderD128","type":"c","major":226,"minor":128,"permissions":"rw"}]}}]}"#).unwrap();
-    let catalog = Catalog::parse(
+    Catalog::parse(
         format!(
             "hex-devices-1\ngpu\t256\tshards-renderer\t0\tguest-gpu\t{}\thex.shards/gpu=256\n",
             path.display()
         )
         .as_bytes(),
     )
-    .unwrap();
-    let authority = crate::guest::gpu::Authority {
-        owner: selected.id.clone(),
-        devices: selected.devices.clone(),
-    };
-    let plan = catalog.guest_cdi(&selected, &authority).unwrap();
+    .unwrap()
+}
+
+/// The dedicated VM's boot authority: `owner`, granted `devices`.
+#[cfg(target_os = "linux")]
+fn boot(owner: &BoxId, devices: &[DeviceId]) -> crate::guest::gpu::Authority {
+    crate::guest::gpu::Authority {
+        owner: owner.clone(),
+        devices: devices.to_vec(),
+    }
+}
+
+/// Whether `planned` is the boot authority's own refusal, not a later one (an absent file's, a binding's).
+#[cfg(target_os = "linux")]
+fn refused_by_authority(planned: Result<CdiPlan<'_>, Refusal>) -> bool {
+    matches!(
+        planned,
+        Err(Refusal::Invalid {
+            what: "guest GPU boot authority",
+            ..
+        })
+    )
+}
+
+/// AC-T7.4.1: the exact boot owner's full set plans a guest recipe from its file, and host CDI still refuses it. Do:
+/// catalog a recipe file and plan the selected box with its exact owner and full set. Expect: the file's one device
+/// node, and host CDI refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn guest_recipe_plans_its_file_for_the_exact_boot_owner_and_full_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = guest_recipe(dir.path());
+    let selected = spec("dedicated", 256);
+    let plan = catalog
+        .guest_cdi(&selected, &boot(&selected.id, &selected.devices))
+        .unwrap();
     assert_eq!(plan.edits().unwrap().device_nodes.len(), 1);
     assert!(catalog.cdi(&selected.devices).is_err());
+}
+
+/// AC-T7.4.1: another box's boot authority plans no guest recipe, though it grants the full set and the recipe's file
+/// is there, so its owner check alone stands between them. Do: plan the selected box with its own authority, then with
+/// another owner's over the same set. Expect: the first planned; the second refused by the boot authority.
+#[cfg(target_os = "linux")]
+#[test]
+fn guest_recipe_refuses_another_boot_owner_with_the_full_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = guest_recipe(dir.path());
+    let selected = spec("dedicated", 256);
+    catalog
+        .guest_cdi(&selected, &boot(&selected.id, &selected.devices))
+        .unwrap();
+    let foreign = BoxId::new("foreign").unwrap();
+    assert!(refused_by_authority(
+        catalog.guest_cdi(&selected, &boot(&foreign, &selected.devices))
+    ));
+}
+
+/// AC-T7.4.1: a box that selects part of its boot authority's set plans no guest recipe, though it is the authority's
+/// owner and the recipe's file is there, so its full-set check alone stands between them. Do: plan the selected box
+/// with its own authority, then with its owner's authority over that set and one device more. Expect: the first
+/// planned; the second refused by the boot authority.
+#[cfg(target_os = "linux")]
+#[test]
+fn guest_recipe_refuses_its_owner_selecting_part_of_the_boot_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = guest_recipe(dir.path());
+    let selected = spec("dedicated", 256);
+    catalog
+        .guest_cdi(&selected, &boot(&selected.id, &selected.devices))
+        .unwrap();
+    let more = [
+        selected.devices[0],
+        DeviceId {
+            kind: DeviceKind::Gpu,
+            key: 512,
+        },
+    ];
+    assert!(refused_by_authority(
+        catalog.guest_cdi(&selected, &boot(&selected.id, &more))
+    ));
 }
 
 /// AC-T7.4.1: a strict subset is one consuming reference while the original full source owns P.

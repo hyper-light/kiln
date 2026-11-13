@@ -3,13 +3,13 @@
 The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 12,
 16 and 17; Hex's `docs/design/`), built on kiln's one Shards and hyper-raft.
 
-- **Upstream:** https://github.com/hyper-light/hex, commit `daa36e99a6b357ba8b8f1425e3803463e6a2f734`
-  (2026-11-12), MIT (`LICENSE`): Hex's `main` with the joint plan's steps 4 and 12 merged (Hex's wire over
-  hyper-transport, and its Shards class on Agentfile images under shards-init) beside 13 and 14, its newest. It pins
-  Shards at kiln's own `e82b9403` and hyper-raft at `0856e05`, older than kiln's, and with the first change below its
-  crates build on kiln's (`cargo check -p hex-node` in kiln's workspace, then kiln's clippy and the tests of what
-  kiln touches: docs/shards.md). The pin is interim: Hex's lead is converging Hex's main with its own line of the
-  joint plan's steps 4, 12, 13 and 15, and kiln re-vendors Hex at that converged revision once it lands.
+- **Upstream:** https://github.com/hyper-light/hex, commit `2bd61f1838ea7c52c419607ebb423556570dcd1e`
+  (2026-11-12), MIT (`LICENSE`): Hex's `main` converged with its lead's line of the joint plan's steps 4, 12, 13 and
+  15 (Hex's wire over hyper-transport, its Shards class on Agentfile images under shards-init, one capacity view per
+  machine, and each member's reach of the destinations kept) beside 14. It pins Shards at kiln's own `e82b9403`,
+  with two changes of Hex's to Shards' image API that kiln's one copy of Shards carries too
+  (`vendor/shards/UPSTREAM.md`), and hyper-raft at `0856e05`, older than kiln's; with the changes below its crates
+  build on kiln's (kiln's clippy and the tests of what kiln touches: docs/shards.md).
 - **How kiln uses it:** `hex-node`, and through it Hex's runtime, client, QUIC wire, scheduler simulation, health
   and GPU telemetry, by name; kiln's root `[patch.crates-io]` points the name here, and `seccompiler` (third-party
   code only Hex vendors) at `vendor/seccompiler` here. Nothing of Hex runs in kiln yet: kiln's launch seam takes it
@@ -30,8 +30,9 @@ Each change is recorded in `vendor/patches/hex/`, applied in this order on upstr
 | `vendor/MANIFEST.toml`, `vendor/patches/hyper-raft/` | Hex's hyper-raft pin moved to kiln's (`fb74b595`), and its records of hyper-raft's changes made kiln's. Its Shards pin is kiln's own (`e82b9403`), and its image class takes Shards' API there itself, since Hex's steps 4 and 12: that part of this change dropped out as upstream's own | kiln holds one copy of each project, and Hex must build on it: one Shards revision serves Hex and kiln (the joint plan's step 16) | `0001-hex-builds-on-kiln-s-shards-and-hyper-raft.patch` |
 | `crates/hex-sim/src/lib.rs`, `crates/hex-gpu/src/nvml.rs`, `crates/hex-gpu/src/adl.rs`, `crates/hex-gpu/src/amd.rs` | the files Hex includes by path (hyper-swim's `coordinates.rs`, cuda-rust's loader, all-smi's AMD readers) named at kiln's copies (`vendor/hyper-raft`, `vendor/cuda-rust`, `vendor/all-smi`) | kiln's copy leaves Hex's own copies of them out | `0002-files-hex-includes-by-path-from-kiln-s-copies.patch` |
 | `vendor/MANIFEST.toml` | its `shards-gpu` entry left out | it names the GPU renderer build Hex's `scripts/shards-gpu/build.sh` makes, which Hex compiles nothing of and kiln's copy holds nothing of; kiln carries no GPU VM process (docs/shards.md) | `0003-no-gpu-renderer-build-of-hex-s-in-kiln-s-copy.patch` |
+| `vendor/patches/shards/` | Hex's records of its two changes to Shards made kiln's, byte for byte (kiln's `0002` and `0003`) | kiln's one copy of Shards carries them, numbered after kiln's own first change to Shards, a change of kiln's layout alone | `0004-hex-s-records-of-its-changes-to-shards-are-kiln-s.patch` |
 
-The second and third changes are kiln's layout alone (`Kiln-only:`). The first is offered to Hex as it stands,
+The second, third and fourth changes are kiln's layout alone (`Kiln-only:`). The first is offered to Hex as it stands,
 with what it leaves for Hex and kiln to agree on:
 - Hex's own hyper-raft changes beside the one kiln takes (`Endpoint::negotiated`, kiln's fifth): hyper-transport
   taking hyper-quic without its qlog traces, which would turn serde_json's `preserve_order` off for every crate

@@ -807,6 +807,9 @@ pub(super) fn attach(
 pub(super) fn usage(runtime: &MacRuntime, record: NativeRecord<'_>) -> Result<Usage, Refusal> {
     remote::usage(runtime, record)
 }
+pub(super) fn stop(runtime: &MacRuntime, record: NativeRecord<'_>) -> Result<(), Refusal> {
+    remote::stop(runtime, record)
+}
 pub(super) fn set_rate(
     runtime: &MacRuntime,
     record: NativeRecord<'_>,

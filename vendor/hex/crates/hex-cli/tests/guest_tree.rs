@@ -286,6 +286,7 @@ impl Side for Guest {
                 bounds: Bounds::default(),
                 class: ClassSpec::Process,
                 owner: None,
+                band: 0,
             })
             .unwrap();
         let layers = box_layers(stage::STAGED, id, image);
@@ -449,6 +450,7 @@ impl Guest {
                 bounds: Bounds::default(),
                 class: ClassSpec::Process,
                 owner: None,
+                band: 0,
             })
             .unwrap();
         let (mut r, w) = std::io::pipe().unwrap();

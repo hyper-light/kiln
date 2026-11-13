@@ -3,10 +3,23 @@
 use std::cell::{Cell, RefCell};
 
 use super::*;
-use hex_api::{LearnedPrior, LearnedUse};
+use crate::recorded::charges::{Resort, record_last_resort, with_last_resort};
+use hex_api::{LearnedEnd, LearnedPrior, LearnedUse};
+use hex_core::record::BoxRecord;
 use hex_sim::charge::{SEEDABLE, WEIGHT_MAX};
 
 const GIB: u64 = 1 << 30;
+
+/// A VM's first read: its class, its receipt and its band, no place in a start order nor intent on its record.
+fn met(class: Class, allocation: Allocation, band: u8) -> Option<Met> {
+    Some(Met {
+        class,
+        allocation,
+        band,
+        started: None,
+        intent: None,
+    })
+}
 
 /// A Shards VM's profile: half of a 32-CPU host and 8 GiB, its envelope its floor and ceiling.
 fn cost() -> RuntimeCost {
@@ -51,6 +64,10 @@ struct Record {
     /// Every cgroup killed, in order, and whether a kill is refused.
     kills: RefCell<Vec<PathBuf>>,
     refuse_kills: Cell<bool>,
+    /// The node's records, where the test keeps them: an intent is written there, as the node writes it.
+    records: RefCell<Option<crate::store::Store>>,
+    /// Every intent asked and every kill, in order: `intend <box>`, `kill <cgroup>`.
+    events: RefCell<Vec<String>>,
 }
 
 impl Cgroups for Record {
@@ -100,7 +117,17 @@ impl Cgroups for Record {
             return Err(Refusal::Broken("cgroup.kill refused".into()));
         }
         self.kills.borrow_mut().push(cgroup.dir().to_path_buf());
+        let name = cgroup.dir().file_name().and_then(|n| n.to_str()).unwrap();
+        self.events.borrow_mut().push(format!("kill {name}"));
         Ok(())
+    }
+
+    fn intend(&self, id: &BoxId, scope: Scope, end: &LearnedEnd) -> Result<bool, Refusal> {
+        self.events.borrow_mut().push(format!("intend {id}"));
+        match self.records.borrow().as_ref() {
+            Some(store) => record_last_resort(store, id, scope, Some(end)),
+            None => Ok(false),
+        }
     }
 }
 
@@ -158,8 +185,8 @@ fn whole() -> Allocation {
     cost().allocate(CapacityResources::default()).unwrap()
 }
 
-fn shards(_: &BoxId) -> Result<Option<(Class, Allocation)>, Refusal> {
-    Ok(Some((Class::Shards, whole())))
+fn shards(_: &BoxId) -> Result<Option<Met>, Refusal> {
+    Ok(met(Class::Shards, whole(), 0))
 }
 
 /// Joint plan step 14 (AC-T7.4.1), C4 and C5 in the node: the placement's cgroup paths and weights. Do run a window
@@ -211,36 +238,31 @@ fn w14_the_learner_places_each_vm_its_fleet_and_vm_by_path_and_weight() {
     assert_eq!(io.take(), Vec::new(), "nothing changed, nothing written");
 }
 
-/// Joint plan step 14 (AC-T7.4.1), C7: a Shards guest can't yet be held within its room. Do run a window of a Shards
-/// VM and a Firecracker VM; expect the Shards guest's room refused as awaiting `GuestRoom`, its being told it, and
-/// `RingPinsWithinRoom`, its ring pins kept within it, the Firecracker one's neither.
+/// Joint plan step 14 (AC-T7.4.1), C7: a Shards guest can't yet be told its room, though its ring pins keep within any
+/// room it is told (Shards' ring-pins-v1, D230, vendored at 66113379). Do run a window of a Shards VM and a Firecracker
+/// VM; expect the Shards guest's room refused as awaiting `GuestRoom` alone, its being told it, the Firecracker one's
+/// nothing.
 #[test]
-fn w14_a_shards_guests_room_awaits_guest_room_and_its_ring_pins_within_it() {
+fn w14_a_shards_guests_room_awaits_guest_room_alone() {
     let io = Record::default();
     let vms = running(&[("vm-1", 1), ("vm-2", 2)]);
     for (_, _, cgroup) in &vms {
         io.set(cgroup.dir(), 0, GIB);
     }
     let mut learner = Learner::new(&fleet(), machine()).unwrap();
-    let record = |id: &BoxId| -> Result<Option<(Class, Allocation)>, Refusal> {
+    let record = |id: &BoxId| -> Result<Option<Met>, Refusal> {
         let class = if id.as_str() == "vm-1" {
             Class::Shards
         } else {
             Class::Firecracker
         };
-        Ok(Some((class, whole())))
+        Ok(met(class, whole(), 0))
     };
     learner
         .window(&io, vms, record, &[], machine(), Instant::now())
         .unwrap();
     let vm1 = BoxId::new("vm-1").unwrap();
-    assert_eq!(
-        learner.awaits(),
-        vec![
-            (&vm1, Upstream::GuestRoom),
-            (&vm1, Upstream::RingPinsWithinRoom)
-        ]
-    );
+    assert_eq!(learner.awaits(), vec![(&vm1, Upstream::GuestRoom)]);
 }
 
 /// Joint plan step 14 (AC-T7.4.1), C2 and C8 in the node: what a capacity answer carries. Do warm one VM, booked at
@@ -276,13 +298,13 @@ fn w14_a_capacity_answer_carries_priors_use_and_holdings_most_past_first() {
     assert_eq!(booked.booking(), prior);
     let both = running(&[("vm-1", 1), ("vm-2", 2)]);
     io.set(both[1].2.dir(), 0, 2 * GIB);
-    let record = move |id: &BoxId| -> Result<Option<(Class, Allocation)>, Refusal> {
+    let record = move |id: &BoxId| -> Result<Option<Met>, Refusal> {
         let allocation = if id.as_str() == "vm-2" {
             booked
         } else {
             whole()
         };
-        Ok(Some((Class::Shards, allocation)))
+        Ok(met(Class::Shards, allocation, 0))
     };
     let later = start + WINDOW * 2_000;
     learner
@@ -512,11 +534,12 @@ fn w14_every_child_of_the_nodes_cgroup_weighs_on_one_scale() {
 
 /// Three Shards VMs of 16 CPUs and 8 GiB, each booked at 4 GiB of memory (their class's prior), in a fleet whose
 /// memory budget is 16 GiB, so each VM's budget is its booking and a third of the 4 GiB slack: what `running` lists.
-fn booked_at_four(_: &BoxId) -> Result<Option<(Class, Allocation)>, Refusal> {
-    Ok(Some((
+fn booked_at_four(_: &BoxId) -> Result<Option<Met>, Refusal> {
+    Ok(met(
         Class::Shards,
         whole().booked_at(res(16_000, 4 * GIB)),
-    )))
+        0,
+    ))
 }
 
 fn fleet_of_three() -> Vec<(BoxId, Scope, BoxCgroup)> {
@@ -618,6 +641,117 @@ fn w14_the_last_resort_ends_the_vm_most_past_its_budget_and_no_other() {
     );
 }
 
+/// Joint plan step 14 (AC-T7.4.1), C3 and C5 in the node agent: each VM in the band its record names. Do run a window
+/// of three VMs booked at 4 GiB in a 16 GiB fleet, vm-1 in band 2, vm-2 in band 3 and vm-3 in band 1, then one in
+/// which each holds its whole 8 GiB. Expect the fleet's 4 GiB of room raising vm-2's booking, the highest band's, to its
+/// 8 GiB, so vm-1 and vm-3 are each 4 GiB past their budgets; vm-3, the lower band of the two, ended; and its end
+/// saying band 1.
+#[test]
+fn w14_the_last_resort_ends_the_lowest_band_first() {
+    let banded = |id: &BoxId| -> Result<Option<Met>, Refusal> {
+        let band = match id.as_str() {
+            "vm-1" => 2,
+            "vm-2" => 3,
+            _ => 1,
+        };
+        Ok(met(
+            Class::Shards,
+            whole().booked_at(res(16_000, 4 * GIB)),
+            band,
+        ))
+    };
+    let io = Record::default();
+    let fleet_budget = res(32_000, 16 * GIB);
+    let mut learner = Learner::new(&fleet(), machine()).unwrap();
+    let start = Instant::now();
+    for (_, _, cgroup) in &fleet_of_three() {
+        io.set(cgroup.dir(), 0, 0);
+    }
+    learner
+        .window(&io, fleet_of_three(), banded, &[], fleet_budget, start)
+        .unwrap();
+    for id in ["vm-1", "vm-2", "vm-3"] {
+        io.set(&fleet().join(id), 0, 8 * GIB);
+    }
+    learner
+        .window(
+            &io,
+            fleet_of_three(),
+            banded,
+            &[],
+            fleet_budget,
+            start + WINDOW,
+        )
+        .unwrap();
+    assert_eq!(*io.kills.borrow(), vec![fleet().join("vm-3")]);
+    let learned = learner.learned(Class::Shards, &[cost()]).unwrap().unwrap();
+    let ends: Vec<_> = learned
+        .ended
+        .iter()
+        .map(|end| (end.id.as_str(), end.band, end.held, end.budget))
+        .collect();
+    assert_eq!(ends, [("vm-3", 1, 8 * GIB, 4 * GIB)]);
+}
+
+/// Joint plan step 14 (AC-T7.4.1), C3's order in the node agent (ROOT, 2026-11-12): of two VMs rising past their
+/// bookings into the same room, the one begun later is over and the last resort ends it, whatever their scopes. Do run a
+/// window of three VMs booked at 4 GiB in a 16 GiB fleet, begun first, second and third on the node (their records' places
+/// in its start order), their scopes in the opposite order (the first's the largest), then one where the first two hold
+/// 7 GiB each and the third 2 GiB. Expect the fleet's 4 GiB of room to the first (its budget 7 GiB) and the rest, 1 GiB,
+/// to the second (its budget 5 GiB), so the second, 2 GiB past its budget, its cgroup killed and no other; and its why
+/// on the class's capacity answer naming it: 7 GiB held against its 5 GiB budget, the fleet's 16 GiB held, 16 GiB of
+/// growth, its 16 GiB budget.
+#[test]
+fn w14_of_two_vms_rising_into_one_room_the_later_begun_is_ended() {
+    let begun = |id: &BoxId| -> Result<Option<Met>, Refusal> {
+        let started = match id.as_str() {
+            "vm-first" => 1,
+            "vm-second" => 2,
+            _ => 3,
+        };
+        Ok(Some(Met {
+            started: Some(started),
+            ..booked_at_four(id)?.unwrap()
+        }))
+    };
+    let vms = || running(&[("vm-first", 9), ("vm-second", 5), ("vm-third", 1)]);
+    let io = Record::default();
+    for (_, _, cgroup) in &vms() {
+        io.set(cgroup.dir(), 0, 0);
+    }
+    let fleet_budget = res(32_000, 16 * GIB);
+    let mut learner = Learner::new(&fleet(), machine()).unwrap();
+    let start = Instant::now();
+    learner
+        .window(&io, vms(), begun, &[], fleet_budget, start)
+        .unwrap();
+    for (id, held) in [
+        ("vm-first", 7 * GIB),
+        ("vm-second", 7 * GIB),
+        ("vm-third", 2 * GIB),
+    ] {
+        io.set(&fleet().join(id), 0, held);
+    }
+    learner
+        .window(&io, vms(), begun, &[], fleet_budget, start + WINDOW)
+        .unwrap();
+    assert_eq!(*io.kills.borrow(), vec![fleet().join("vm-second")]);
+    let learned = learner.learned(Class::Shards, &[cost()]).unwrap().unwrap();
+    assert_eq!(
+        learned.ended,
+        vec![LearnedEnd {
+            id: BoxId::new("vm-second").unwrap(),
+            held: 7 * GIB,
+            budget: 5 * GIB,
+            band: 0,
+            fleet_held: 16 * GIB,
+            fleet_growth: 16 * GIB,
+            fleet_budget: 16 * GIB,
+            unmoved: Some(Upstream::LiveMove),
+        }]
+    );
+}
+
 /// Joint plan step 14 (AC-T7.4.1), C5's last resort where the node can't act. Do run a window of three VMs booked at
 /// 4 GiB in a 16 GiB fleet, then one past its budget whose kill the cgroup refuses. Expect no end taken for done, and
 /// the state the kill's refusal, typed.
@@ -661,46 +795,6 @@ fn w14_a_refused_end_is_kept_typed() {
     );
 }
 
-/// Joint plan step 14 (AC-T7.4.1), C5's record of why, bounded (CLAUDE.md §2). Do record three ends on a learner for a
-/// 20 milli-CPU machine, whose population is two VMs, the third of another class. Expect the class's capacity answer
-/// to carry its two latest ends, latest first, and the oldest forgotten once a third came.
-#[test]
-fn w14_the_last_resorts_ends_are_kept_to_the_machines_population() {
-    let mut learner = Learner::new(&fleet(), res(20, 64 * GIB)).unwrap();
-    let why = |held: u64| charge::Excess {
-        held,
-        budget: GIB,
-        band: 0,
-        fleet: charge::Pressure {
-            held: 4 * GIB,
-            growth: GIB,
-            budget: 4 * GIB,
-        },
-    };
-    for (n, class) in [
-        (1, Class::Shards),
-        (2, Class::Shards),
-        (3, Class::Firecracker),
-    ] {
-        let id = BoxId::new(&format!("vm-{n}")).unwrap();
-        learner
-            .record_end(class, &id, [u8::try_from(n).unwrap(); 16], why(n * GIB))
-            .unwrap();
-    }
-    let ids = |class| -> Vec<String> {
-        learner
-            .learned(class, &[])
-            .unwrap()
-            .unwrap()
-            .ended
-            .iter()
-            .map(|end| end.id.as_str().to_owned())
-            .collect()
-    };
-    assert_eq!(ids(Class::Shards), ["vm-2"], "vm-1 forgotten past two");
-    assert_eq!(ids(Class::Firecracker), ["vm-3"]);
-}
-
 /// A Shards VM's spec of `cost()`'s 16 CPUs and 8 GiB, as a node records it.
 fn shards_spec(id: &BoxId) -> hex_api::BoxSpec {
     hex_api::BoxSpec {
@@ -722,7 +816,185 @@ fn shards_spec(id: &BoxId) -> hex_api::BoxSpec {
         devices: Vec::new(),
         allocation: Some(whole()),
         route: None,
+        band: 0,
     }
+}
+
+/// Three Shards VMs recorded in `store` as a node's create records them, and their running list.
+fn recorded_three(store: &crate::store::Store) -> Vec<(BoxId, Scope, BoxCgroup)> {
+    let mut vms = Vec::new();
+    for name in ["vm-1", "vm-2", "vm-3"] {
+        let id = BoxId::new(name).unwrap();
+        let made = BoxRecord::new(
+            shards_spec(&id),
+            hex_core::record::Phase::Creating,
+            Vec::new(),
+        );
+        store.begin(&made).unwrap();
+        store.made(&made).unwrap();
+        let record = store.get(&id).unwrap().unwrap().unwrap();
+        let scope = *record.native_scope.unwrap().bytes();
+        vms.push((id, scope, BoxCgroup::at(fleet().join(name))));
+    }
+    vms
+}
+
+/// Joint plan step 14 (AC-T7.4.1), C5 intent first: why survives a node that crashes after a VM's end and before the
+/// window's writes. Do record three Shards VMs in a node's store as its create does, run the learner's windows past
+/// their fleet's 16 GiB memory budget, vm-2 holding 12 GiB, until it ends vm-2, then crash: leave unmade the writes
+/// the window keeps for after it, and reopen the store as the restarted node does. Expect vm-2's record to say why it
+/// was ended, its intent written before its cgroup's kill, and vm-1's and vm-3's records to say nothing.
+#[test]
+fn w14_why_survives_a_crash_between_the_end_and_the_windows_writes() {
+    use crate::store::Store;
+    let dir = tempfile::tempdir().unwrap();
+    let open = || Store::open(&dir.path().join("state"), &dir.path().join("run")).unwrap();
+    let store = open();
+    let vms = recorded_three(&store);
+    let io = Record::default();
+    *io.records.borrow_mut() = Some(store.clone());
+    for (_, _, cgroup) in &vms {
+        io.set(cgroup.dir(), 0, 0);
+    }
+    let fleet_budget = res(32_000, 16 * GIB);
+    let mut learner = Learner::new(&fleet(), machine()).unwrap();
+    let start = Instant::now();
+    learner
+        .window(&io, vms.clone(), booked_at_four, &[], fleet_budget, start)
+        .unwrap();
+    for (name, held) in [("vm-1", 2 * GIB), ("vm-2", 12 * GIB), ("vm-3", 2 * GIB)] {
+        io.set(&fleet().join(name), 0, held);
+    }
+    learner
+        .window(
+            &io,
+            vms.clone(),
+            booked_at_four,
+            &[],
+            fleet_budget,
+            start + WINDOW,
+        )
+        .unwrap();
+    assert_eq!(*io.kills.borrow(), vec![fleet().join("vm-2")]);
+    let events = io.events.take();
+    // The crash: the learner and its store go with the node, the window's writes unmade.
+    drop(learner);
+    drop(io);
+    drop(store);
+    let store = open();
+    let end = store.get(&vms[1].0).unwrap().unwrap().unwrap().last_resort;
+    let end = end.expect("vm-2's why, written before its end");
+    assert_eq!(
+        (end.id.as_str(), end.held, end.budget),
+        ("vm-2", 12 * GIB, 8 * GIB)
+    );
+    for other in [&vms[0].0, &vms[2].0] {
+        assert_eq!(
+            store.get(other).unwrap().unwrap().unwrap().last_resort,
+            None
+        );
+    }
+    assert_eq!(events, ["intend vm-2", "kill vm-2"]);
+}
+
+/// Joint plan step 14 (AC-T7.4.1), C5 intent first: a node that crashed between a VM's intent and its end leaves that
+/// end to the next. Do record three Shards VMs in a node's store, vm-2's record naming why it is to be ended as a
+/// node that crashed right after writing it leaves it, then run a restarted node's learner over the three, each
+/// holding 2 GiB of their 16 GiB fleet, within every budget, then another window. Expect vm-2 ended in the first window
+/// for the why its record names, that why on its class's capacity answer, and no other VM ended.
+#[test]
+fn w14_a_restarted_node_carries_out_the_end_its_intent_names() {
+    use crate::store::Store;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("state"), &dir.path().join("run")).unwrap();
+    let vms = recorded_three(&store);
+    let intent = LearnedEnd {
+        id: vms[1].0.clone(),
+        held: 12 * GIB,
+        budget: 8 * GIB,
+        band: 0,
+        fleet_held: 16 * GIB,
+        fleet_growth: 16 * GIB,
+        fleet_budget: 16 * GIB,
+        unmoved: Some(Upstream::LiveMove),
+    };
+    assert!(record_last_resort(&store, &vms[1].0, vms[1].1, Some(&intent)).unwrap());
+    let record = |id: &BoxId| -> Result<Option<Met>, Refusal> {
+        let recorded = store.get(id).unwrap().unwrap().unwrap();
+        Ok(Some(Met {
+            intent: recorded.last_resort,
+            ..met(Class::Shards, whole().booked_at(res(16_000, 4 * GIB)), 0).unwrap()
+        }))
+    };
+    let io = Record::default();
+    for (_, _, cgroup) in &vms {
+        io.set(cgroup.dir(), 0, 2 * GIB);
+    }
+    let fleet_budget = res(32_000, 16 * GIB);
+    let mut learner = Learner::new(&fleet(), machine()).unwrap();
+    let start = Instant::now();
+    learner
+        .window(&io, vms.clone(), record, &[], fleet_budget, start)
+        .unwrap();
+    assert_eq!(*io.kills.borrow(), vec![fleet().join("vm-2")]);
+    assert!(
+        matches!(learner.resort(), Resort::Ending { .. }),
+        "{:?}",
+        learner.resort()
+    );
+    let learned = learner.learned(Class::Shards, &[cost()]).unwrap().unwrap();
+    assert_eq!(learned.ended, vec![intent]);
+    learner
+        .window(&io, vms, record, &[], fleet_budget, start + WINDOW)
+        .unwrap();
+    assert_eq!(io.kills.borrow().len(), 1, "one end is never two");
+}
+
+/// Joint plan step 14 (AC-T7.4.1), C5 intent first: an end refused withdraws its intent, so no record says a VM the node
+/// couldn't end was ended. Do record three Shards VMs in a node's store, refuse their cgroups' kills, run the learner's
+/// windows past their fleet's 16 GiB memory budget, vm-2 holding 12 GiB, then make the window's writes as the node does
+/// after it. Expect vm-2's intent asked and its kill refused, the state that refusal, typed, and vm-2's record naming
+/// no end.
+#[test]
+fn w14_a_refused_end_withdraws_its_intent() {
+    use crate::store::Store;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("state"), &dir.path().join("run")).unwrap();
+    let vms = recorded_three(&store);
+    let io = Record::default();
+    *io.records.borrow_mut() = Some(store.clone());
+    io.refuse_kills.set(true);
+    for (_, _, cgroup) in &vms {
+        io.set(cgroup.dir(), 0, 0);
+    }
+    let fleet_budget = res(32_000, 16 * GIB);
+    let mut learner = Learner::new(&fleet(), machine()).unwrap();
+    let start = Instant::now();
+    learner
+        .window(&io, vms.clone(), booked_at_four, &[], fleet_budget, start)
+        .unwrap();
+    for (name, held) in [("vm-1", 2 * GIB), ("vm-2", 12 * GIB), ("vm-3", 2 * GIB)] {
+        io.set(&fleet().join(name), 0, held);
+    }
+    learner
+        .window(
+            &io,
+            vms.clone(),
+            booked_at_four,
+            &[],
+            fleet_budget,
+            start + WINDOW,
+        )
+        .unwrap();
+    assert_eq!(*io.events.borrow(), ["intend vm-2"]);
+    assert_eq!(
+        learner.resort(),
+        &Resort::Refused(Refusal::Broken("cgroup.kill refused".into()))
+    );
+    let (left, failed) = write_ends(&store, learner.unrecorded());
+    assert!(left.is_empty() && failed.is_none(), "{left:?} {failed:?}");
+    let record = store.get(&vms[1].0).unwrap().unwrap().unwrap();
+    assert_eq!(record.last_resort, None, "its intent withdrawn");
 }
 
 /// Joint plan step 14 (AC-T7.4.1), C5 on the box itself (ROOT, 2026-11-12): a last-resort end shows in inspect and
@@ -777,7 +1049,7 @@ fn w14_a_last_resort_end_shows_in_inspect_and_survives_a_restart() {
     assert_eq!(*io.kills.borrow(), vec![fleet().join("vm-2")]);
     let mut ends = learner.unrecorded();
     assert_eq!(ends.len(), 1);
-    ends.retain(|(id, scope, end)| !record_last_resort(&store, id, *scope, end).unwrap());
+    ends.retain(|(id, scope, end)| !record_last_resort(&store, id, *scope, end.as_ref()).unwrap());
     assert!(ends.is_empty(), "every end written");
     assert!(learner.unrecorded().is_empty(), "taken once");
     drop(store);
@@ -828,5 +1100,5 @@ fn w14_a_last_resort_end_shows_in_inspect_and_survives_a_restart() {
     assert_eq!(read, answer);
 
     let made_again = [7; 16];
-    assert!(!record_last_resort(&store, &vms[1].0, made_again, &end).unwrap());
+    assert!(!record_last_resort(&store, &vms[1].0, made_again, Some(&end)).unwrap());
 }

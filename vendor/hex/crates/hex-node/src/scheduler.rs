@@ -76,7 +76,7 @@ pub struct Config {
 }
 
 /// The machine's capacity view served on a QUIC lane of its own (joint plan step 13, `docs/design/capacity-view.md`
-/// CV9 and CV12): where it binds, the enrollment it presents, and the holders it serves.
+/// CV9): where it binds, the enrollment it presents, and the holders it serves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapacityLane {
@@ -88,23 +88,18 @@ pub struct CapacityLane {
     pub holders: Vec<CapacityHolder>,
 }
 
-/// A holder the person authorizes on this machine: the name kiln's CA enrolled it as, and the user its work runs as
-/// (a uid, or a SID on Windows), by which a scope it names is proved its own (CV12). Without one, no scope it names
-/// earns credit.
+/// A holder the person authorizes on this machine: the name kiln's CA enrolled it as.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapacityHolder {
     pub name: String,
-    #[serde(default)]
-    pub user: Option<crate::scopes::User>,
 }
 
-/// The capacity view's lane, where the configuration asks for one: its server, the endpoint it is served on, each
-/// holder's declared user, and the log its events go to.
+/// The capacity view's lane, where the configuration asks for one: its server, the endpoint it is served on, and the
+/// log its events go to.
 struct Lane {
     server: Arc<hex_quic::capacity::Server<crate::placement::DriverView>>,
     endpoint: hex_quic::Endpoint,
-    users: BTreeMap<String, Option<crate::scopes::User>>,
     log: hex_quic::capacity::Log,
 }
 
@@ -126,9 +121,6 @@ impl Lane {
                     "holder {:?} is empty or named twice",
                     holder.name
                 )));
-            }
-            if let Some(user) = &holder.user {
-                user.check()?;
             }
         }
         hex_quic::enroll::store::load(&config.credentials).map_err(|e| {
@@ -159,21 +151,26 @@ impl Lane {
                 what: "capacity lane connections",
                 bound: usize::MAX,
             })?;
-        let endpoint = hex_quic::Endpoint::start(hex_quic::Config {
-            credentials,
-            bind: config.bind,
-            listen: true,
-            serves: vec![hex_quic::capacity::CAPACITY_PORT],
-            shape: hex_quic::Shape {
-                connections,
-                lanes: 2,
+        let names: Vec<String> = config.holders.iter().map(|h| h.name.clone()).collect();
+        // A peer the lane doesn't name is refused at its handshake, so it holds none of these connections
+        // (docs/design/hex-quic.md Q10).
+        let endpoint = hex_quic::Endpoint::start_admitting(
+            hex_quic::Config {
+                credentials,
+                bind: config.bind,
+                listen: true,
+                serves: vec![hex_quic::capacity::CAPACITY_PORT],
+                shape: hex_quic::Shape {
+                    connections,
+                    lanes: 2,
+                },
             },
-        })
+            hex_quic::Admits::Named(names.iter().cloned().collect()),
+        )
         .map_err(|e| Refusal::Invalid {
             what: "capacity lane",
             why: e.to_string(),
         })?;
-        let names: Vec<String> = config.holders.iter().map(|h| h.name.clone()).collect();
         let server = hex_quic::capacity::Server::new(
             crate::placement::DriverView(Arc::clone(driver)),
             &names,
@@ -192,11 +189,6 @@ impl Lane {
         Ok(Self {
             server,
             endpoint,
-            users: config
-                .holders
-                .iter()
-                .map(|h| (h.name.clone(), h.user.clone()))
-                .collect(),
             log,
         })
     }
@@ -891,6 +883,17 @@ impl Service {
         )?;
         capacity::retain_unavailable(&mut local, None, &snapshot.unavailable)?;
         charges::apply(&mut local, &learned)?;
+        // With a capacity lane, the room measured here is the Driver's before its view opens, so a keeper started, or
+        // started again after a kill (CV11), decides a holder's first reserve in the room there is, no command of Hex's
+        // needed to measure it first (joint plan step 13).
+        let measured = if capacity.is_some() {
+            Some(local.try_clone().map_err(|_| Refusal::Exhausted {
+                what: "local node snapshot",
+                bound: 1,
+            })?)
+        } else {
+            None
+        };
         if let Some(slot) = cluster.nodes.iter_mut().find(|node| node.id == id) {
             *slot = local;
         }
@@ -909,6 +912,9 @@ impl Service {
             )
             .map_err(failed)?,
         );
+        if let Some(measured) = measured {
+            driver.refresh_node(measured).map_err(failed)?;
+        }
         // The view opens before any admission this process makes, so none is made without it (CV1).
         let lane = match capacity {
             Some((lane, credentials)) => {
@@ -1289,12 +1295,8 @@ impl Service {
             .ok_or_else(|| capacity::invalid("measured native resource sum overflows"))?;
         // All native RPCs finish before acquiring the cluster/model lock. The scheduling process
         // owns no GPU provider, and a changed Store/turn owner cannot inherit retained claims.
-        // Each synced holder's scope is read on either side of the free memory's read (joint plan step 13, CV12).
-        let holders = self.scoped_holders()?;
-        let (observed, sample) = crate::scopes::around(&holders, || {
-            runtime_observations(&self.facts_dir, self.initialized, &self.runtimes)
-        });
-        let (facts, physical_authority, unavailable) = observed?;
+        let (facts, physical_authority, unavailable) =
+            runtime_observations(&self.facts_dir, self.initialized, &self.runtimes)?;
         for observation in unavailable {
             snapshot.add_unavailable(observation)?;
         }
@@ -1337,13 +1339,10 @@ impl Service {
         capacity::retain_unavailable(&mut local, previous.as_ref(), &snapshot.unavailable)?;
         charges::apply(&mut local, &learned)?;
         self.driver
-            .refresh_node_sampled(
-                local.try_clone().map_err(|_| Refusal::Exhausted {
-                    what: "local node snapshot",
-                    bound: 1,
-                })?,
-                &sample,
-            )
+            .refresh_node(local.try_clone().map_err(|_| Refusal::Exhausted {
+                what: "local node snapshot",
+                bound: 1,
+            })?)
             .map_err(failed)?;
         // Joint plan step 14 (C8): each VM at the holding its node's learner carried, booked against its key.
         let ids = self.driver.running_ids().map_err(failed)?;
@@ -1355,26 +1354,6 @@ impl Service {
         }
         self.rebudget(&cluster)?;
         Ok(actions)
-    }
-
-    /// The synced holders whose hellos named a scope, by link, each with the user the configuration declares for it
-    /// (joint plan step 13, CV12): none without a lane.
-    fn scoped_holders(
-        &self,
-    ) -> Result<Vec<(u64, hex_api::capacity::Scope, Option<crate::scopes::User>)>, Refusal> {
-        let Some(lane) = &self.lane else {
-            return Ok(Vec::new());
-        };
-        Ok(self
-            .driver
-            .view_scopes()
-            .map_err(failed)?
-            .into_iter()
-            .map(|(link, name, scope)| {
-                let user = lane.users.get(&name).cloned().flatten();
-                (link, scope, user)
-            })
-            .collect())
     }
 
     /// The person's release of `holder`'s reservations (joint plan step 13, CV6), logged as `hex.capacity

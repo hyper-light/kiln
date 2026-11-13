@@ -9,30 +9,36 @@
 //! neither take back nor prove gone, so its claim is kept and every call refused
 //! `Awaits(AttachAfterCrash)` until a reboot of the host proves it ended).
 //!
-//! D231's own boot and stop wait without a bound of their own, so each runs on a thread of its own and
-//! answers in a [`Slot`]; a caller waits at most its learned patience ([`ImageWaits`]) and is refused
-//! `Lifecycle { Pending }` past it, the answer recorded when it comes. No lock is held over a Shards call,
-//! and a run is let go of only once its stop has returned, since D231 stops a run it drops.
+//! D231's boot waits at most the patience it is given, and its stop for its run's end: each runs on a thread
+//! of its own and answers in a [`Slot`]. A caller waits at most its learned patience ([`ImageWaits`]), which
+//! a boot is given as its own, and is refused `Lifecycle { Pending }` past it, the answer recorded when it
+//! comes. No lock is held over a Shards call, and a run is let go of only once its stop has returned, since
+//! D231 stops a run it drops.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hex_api::{
-    BoxId, BoxInfo, BoxSpec, BoxState, ClassSpec, Exit, GuestTime, LifecycleCause, Refusal,
-    ShardsImage, Signal, Upstream, Usage, VmSize,
+    BoxId, BoxInfo, BoxSpec, BoxState, ClassSpec, Exit, Given, GuestTime, ImageMember,
+    LifecycleCause, Member, MemberKind, Proc, Refusal, ShardsImage, Signal, Upstream, Usage,
+    VmSize,
 };
 use hex_core::patience::Patience;
 use hex_core::record::{BootSession, BoxRecord, Phase};
-use shards_api::image::{ImageGuest, ImageRefusal, ImageSpec, Images, RunEnd, Stats, StatsScope};
+use shards_api::image::{
+    Channel, ImageGuest, ImageRefusal, ImageSpec, Images, MemberEnd, MemberName, MemberSpec,
+    RunEnd, Secret, Stats, StatsScope,
+};
 
 use super::{GuestRuntime, poisoned};
 use crate::devices;
 
 /// The waits an image box's calls make, each learned (decision 9) and seeded from this host class's
 /// slowest recorded answer (bench/native/guest/records.tsv): Shards' boot of an image to its members'
-/// start, a stats answer, and a stop to its run host's exit.
+/// start, a stats answer, and a stop to its run's end.
 pub struct ImageWaits {
     boot: Patience,
     stats: Patience,
@@ -70,7 +76,7 @@ impl ImageWaits {
     }
 }
 
-/// Shards' image boot as the guest runtime holds it: the booter or why this host has none, its waits or
+/// Shards' image boot as the guest runtime holds it: the booter or why this node has none, its waits or
 /// why it has none, this process's runs, and the host's boot session, which proves a run of an earlier
 /// boot ended.
 pub(super) struct ImageBoot {
@@ -88,7 +94,7 @@ enum Run {
     Booting(Arc<Slot<Result<Box<dyn ImageGuest>, ImageRefusal>>>),
     /// Its run, held. D231 stops a run it drops, so it leaves only through its stop.
     Running(Arc<dyn ImageGuest>),
-    /// Its stop, on a thread of its own, answers here: the run's end, once its host has exited.
+    /// Its stop, on a thread of its own, answers here: the run's end, once its VM is gone.
     Stopping(Arc<Slot<RunEnd>>),
     /// Its end, known, until its record says it.
     Ended(Exit),
@@ -96,15 +102,15 @@ enum Run {
 
 /// One answer a thread of its own gives: a boot's or a stop's.
 struct Slot<T> {
-    answer: Mutex<Option<T>>,
-    came: Condvar,
+    answer: hex_wait::Mutex<Option<T>>,
+    came: hex_wait::Condvar,
 }
 
 impl<T> Slot<T> {
     fn new() -> Self {
         Self {
-            answer: Mutex::new(None),
-            came: Condvar::new(),
+            answer: hex_wait::Mutex::new(None),
+            came: hex_wait::Condvar::new(),
         }
     }
 
@@ -123,19 +129,32 @@ impl<T> Slot<T> {
             Some(wait) => {
                 self.came
                     .wait_timeout_while(answer, wait, |a| a.is_none())
-                    .map_err(poisoned)?
+                    .map_err(wait_refused)?
                     .0
             }
             None => self
                 .came
                 .wait_while(answer, |a| a.is_none())
-                .map_err(poisoned)?,
+                .map_err(wait_refused)?,
         };
         Ok(answer.is_some())
     }
 
     fn take(&self) -> Result<Option<T>, Refusal> {
         Ok(self.answer.lock().map_err(poisoned)?.take())
+    }
+}
+
+/// A wait for a slot's answer that couldn't wait: its lock poisoned, or the OS refused it (macOS's kqueue).
+fn wait_refused(why: hex_wait::Failed) -> Refusal {
+    match why {
+        hex_wait::Failed::Poisoned => {
+            Refusal::Broken("the guest runtime's lock is poisoned".to_owned())
+        }
+        hex_wait::Failed::Os(why) => Refusal::Os {
+            op: "waiting for a Shards image's answer",
+            why: why.to_string(),
+        },
     }
 }
 
@@ -196,14 +215,14 @@ fn refused(id: &BoxId, op: &'static str, why: ImageRefusal) -> Refusal {
             op,
             why: format!("the run host: {why}"),
         },
-        ImageRefusal::Plug(cause, why) => Refusal::Os {
-            op,
-            why: format!("the plug: {cause:?}: {why}"),
-        },
         ImageRefusal::Os { what, kind } => Refusal::Os {
             op: what,
             why: format!("{kind:?}"),
         },
+        // Only a plug or an unplug (D235) is refused so, and this class makes neither.
+        ImageRefusal::Plug(cause, why) => {
+            Refusal::Broken(format!("Shards refused {op} as a plug ({cause:?}): {why}"))
+        }
     }
 }
 
@@ -278,6 +297,90 @@ fn info(spec: &BoxSpec, state: BoxState, exit: Option<Exit>) -> Result<BoxInfo, 
     })
 }
 
+/// What Shards' image boot gives a member its caller drives (joint plan step 17): its stdin a pipe the caller
+/// writes (`MemberSpec::stdin`), its variables and working directory as the box's spec says them, no file and no
+/// terminal. Its stdout and stderr are D231's pipes for every member that runs.
+fn member_spec(m: &ImageMember) -> MemberSpec {
+    MemberSpec {
+        member: member_name(&m.member),
+        env: m
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), Secret::from(v.as_str())))
+            .collect(),
+        files: Vec::new(),
+        workdir: m.workdir.clone(),
+        stdin: true,
+        terminal: false,
+    }
+}
+
+/// A member as Shards' image boot names it.
+fn member_name(m: &Member) -> MemberName {
+    match m.kind {
+        MemberKind::Harness => MemberName::harness(&m.name),
+        MemberKind::Agent => MemberName::agent(&m.name),
+    }
+}
+
+/// A member its caller drives, as a program (joint plan step 17): no process of this host, its end D231's
+/// `wait_member` (the run's end, where it ended with its run), and the caller's ends of its streams, given once.
+/// A signal to the member alone is the agent-control endpoint's (step 11), so its own kill awaits it; the box's
+/// stop (`signal(KILL)`, `delete`) ends it with its VM.
+struct MemberProc {
+    id: BoxId,
+    guest: Arc<dyn ImageGuest>,
+    name: MemberName,
+    given: Option<Given>,
+    ended: Option<Exit>,
+}
+
+impl Proc for MemberProc {
+    /// D231 names no member's pid in its guest: none is told.
+    fn pid(&self) -> u32 {
+        0
+    }
+
+    fn on_this_host(&self) -> bool {
+        false
+    }
+
+    fn try_wait(&mut self) -> Result<Option<Exit>, Refusal> {
+        self.wait_for(Duration::ZERO)
+    }
+
+    fn wait_for(&mut self, timeout: Duration) -> Result<Option<Exit>, Refusal> {
+        if let Some(exit) = self.ended {
+            return Ok(Some(exit));
+        }
+        let exit = match self.guest.wait_member(&self.name, timeout) {
+            Ok(None) => return Ok(None),
+            Ok(Some(MemberEnd::Exited(status))) => {
+                i32::try_from(status).map_or(Exit::Unknown, Exit::Code)
+            }
+            // Its run ended first, and the member with it: the run's end is its own.
+            Ok(Some(MemberEnd::WithRun)) => match self.guest.wait_for(Duration::ZERO) {
+                Ok(Some(end)) | Err(ImageRefusal::Ended(end)) => exit_of(&end),
+                Ok(None) | Err(_) => Exit::Unknown,
+            },
+            Err(ImageRefusal::Ended(end)) => exit_of(&end),
+            Err(why) => return Err(refused(&self.id, "waiting for a member's end", why)),
+        };
+        self.ended = Some(exit);
+        Ok(Some(exit))
+    }
+
+    fn kill(&mut self) -> Result<(), Refusal> {
+        Err(Refusal::Awaits {
+            needs: Upstream::MemberSignal,
+        })
+    }
+
+    fn streams(&mut self) -> Result<Given, Refusal> {
+        Ok(self.given.take().unwrap_or_default())
+    }
+}
+
 fn pending(id: &BoxId) -> Result<Refusal, Refusal> {
     Ok(Refusal::Lifecycle {
         id: id.try_clone()?,
@@ -332,8 +435,8 @@ impl ImageBoot {
         )
     }
 
-    /// Stops `guest` on a thread of its own: D231's stop returns once the run host has said its run's
-    /// end and exited, and the guest goes with the thread, its host gone.
+    /// Stops `guest` on a thread of its own: D231's stop returns once its run's end is told, its VM gone;
+    /// the guest goes with the thread, and its run host then exits on its own.
     fn stop(&self, guest: Arc<dyn ImageGuest>) -> Result<Arc<Slot<RunEnd>>, Refusal> {
         let slot = Arc::new(Slot::new());
         let answer = Arc::clone(&slot);
@@ -355,28 +458,55 @@ impl ImageBoot {
     }
 }
 
-/// Shards' image boot (D231) as this host can run it, or why it can't (docs/design/shards-image-class.md
-/// §1). D231 starts its run host through std's `Command`, which hands it what the node holds inheritable at
-/// that moment, where every program Hex starts holds only its stdio. On macOS std's spawn passes no
-/// `POSIX_SPAWN_CLOEXEC_DEFAULT`, and pipe, socket, socketpair and accept take no close-on-exec flag, so the
-/// run host would hold whatever another thread had just made (`crate::macos::command`). On Windows std's
-/// spawn passes `bInheritHandles` with no handle list, so the run host would hold every inheritable handle
-/// the node has: its own stdio, which it inherited, and each box member's while it starts (`crate::windows`'s
-/// keeper and `sys::create`). On Linux std and rustix open descriptors close-on-exec in the same call
-/// (`O_CLOEXEC`, `SOCK_CLOEXEC`, `pipe2`, `accept4`), so the node holds none for the run host to inherit.
+/// Shards' image boot (D231), or why this node serves no image VM: every host runs it, its run host started
+/// holding only its stdio (vendor/patches/shards 0001) and booting the guest the node's environment names, which
+/// it inherits: `SHARDS_KERNEL` and `SHARDS_INIT`, read here once, as the node starts ([`guest_pair`];
+/// docs/design/shards-image-class.md §1).
 pub fn host_images() -> Result<Arc<dyn Images>, Refusal> {
-    if cfg!(any(windows, target_os = "macos")) {
-        return Err(Refusal::Awaits {
-            needs: Upstream::RunHostStdioOnly,
-        });
-    }
+    guest_pair(
+        std::env::var_os("SHARDS_KERNEL").as_deref(),
+        std::env::var_os("SHARDS_INIT").as_deref(),
+    )?;
     Ok(Arc::new(shards_api::image::ImageShards::new()))
 }
 
+/// The guest a node's run hosts would boot, from its `SHARDS_KERNEL` and `SHARDS_INIT` (`kernel`, `init`) as D231's
+/// run host reads them (Shards 66113379, api_run.rs `as_run`): each none or empty, or a UTF-8 absolute path, and both
+/// or neither, as the daemon refuses one alone ("SHARDS_KERNEL and SHARDS_INIT go together"). A value the run host
+/// would drop without a word (relative, or not UTF-8) is refused too: its VMs would boot Shards' own guest instead,
+/// or be refused as the other alone. Refused `Platform` naming both variables (ROOT, 2026-11-12).
+fn guest_pair(kernel: Option<&OsStr>, init: Option<&OsStr>) -> Result<(), Refusal> {
+    let refused = |why: String| Refusal::Platform {
+        what: "Shards image VMs",
+        platform: std::env::consts::OS,
+        why: format!(
+            "{why}: Shards' run host boots the guest SHARDS_KERNEL and SHARDS_INIT name together, each an \
+             absolute path, or its own with neither set"
+        ),
+    };
+    let given = |name: &str, value: Option<&OsStr>| match value {
+        None => Ok(false),
+        Some(value) if value.is_empty() => Ok(false),
+        Some(value) if value.to_str().is_some() && Path::new(value).is_absolute() => Ok(true),
+        Some(value) => Err(refused(format!(
+            "{name} is {value:?}, which the run host drops, as it takes only a UTF-8 absolute path"
+        ))),
+    };
+    match (given("SHARDS_KERNEL", kernel)?, given("SHARDS_INIT", init)?) {
+        (true, false) => Err(refused(
+            "SHARDS_KERNEL is set and SHARDS_INIT is not".to_owned(),
+        )),
+        (false, true) => Err(refused(
+            "SHARDS_INIT is set and SHARDS_KERNEL is not".to_owned(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 impl GuestRuntime {
-    /// Shards' image boot (D231) or why this host has none ([`host_images`]), and the waits its calls
+    /// Shards' image boot (D231) or why this node has none ([`host_images`]), and the waits its calls
     /// make or why there are none: a create is refused with either refusal, so no box exists that this
-    /// host couldn't boot or a wait of its own couldn't bound (docs/design/shards-image-class.md §6).
+    /// node couldn't boot or a wait of its own couldn't bound (docs/design/shards-image-class.md §6).
     pub fn with_images(
         mut self,
         images: Result<Arc<dyn Images>, Refusal>,
@@ -449,11 +579,11 @@ impl GuestRuntime {
             vcpus: size.vcpus,
             memory_mib: size.memory_mib,
             command: image.command.clone(),
-            members: Vec::new(),
+            members: image.members.iter().map(member_spec).collect(),
             publish: network.publish,
             egress: network.egress,
             shares: Vec::new(),
-            // D234's nesting grant is no harness's: the image class asks none.
+            // No nesting grant (D234): a harness VM's command is never a nested runtime's here.
             nesting: false,
             ready_by: None,
             binary: Some(self.config.binary.clone()),
@@ -636,13 +766,15 @@ impl GuestRuntime {
         let slot = Arc::new(Slot::new());
         image.insert(&id, Run::Booting(Arc::clone(&slot)))?;
         let answer = Arc::clone(&slot);
+        // The boot's learned bound, Shards' patience too: past it D231 kills its run host and refuses the
+        // boot, so no box stays Booting. None while it measures, as the census's waits do: Shards waits for
+        // the run's start or its host's end alone, as the caller does.
+        let bound = waits.boot.deadline();
+        let patience = bound.unwrap_or(Duration::MAX);
         let asked = Instant::now();
         let spawned = std::thread::Builder::new()
             .name("hex-image-boot".to_owned())
-            // No patience of D231's own: the box's learned wait bounds its caller (`waits.boot`), and a boot
-            // slower than that bound is still answered and learned, where one killed at it would teach the wait
-            // nothing past its own bound (docs/design/shards-image-class.md §6).
-            .spawn(move || answer.put(images.boot(&spec, Duration::MAX)));
+            .spawn(move || answer.put(images.boot(&spec, patience)));
         if let Err(why) = spawned {
             // No boot began: the box ends, its intent's record kept with its end.
             image.insert(&id, Run::Ended(Exit::Unknown))?;
@@ -650,7 +782,6 @@ impl GuestRuntime {
             image.forget(&id)?;
             return Err(Refusal::os("starting a Shards image VM's boot", why));
         }
-        let bound = waits.boot.deadline();
         if !slot.came_within(bound)? {
             if let Some(bound) = bound {
                 waits.boot.ran_out(bound);
@@ -818,6 +949,61 @@ impl GuestRuntime {
             }
             Err(why) => Err(refused(&id, "reading a Shards image VM's stats", why)),
         }
+    }
+
+    /// Member `member` of a running image box, which its spec says its caller drives (joint plan step 17): its
+    /// stdin, stdout and stderr taken from the run (D231's `take_input`, `take_output`: each once, so a second
+    /// call is refused as Shards refuses it), with its end. Refused, typed, for a member the spec doesn't name and
+    /// as every call is for a box that isn't running here; a take refused part-way leaves the member's earlier
+    /// streams taken, named in the refusal.
+    pub(super) fn member_image(
+        &self,
+        record: BoxRecord,
+        member: &Member,
+    ) -> Result<Box<dyn Proc>, Refusal> {
+        let id = record.spec.id.try_clone()?;
+        let driven = match &record.spec.class {
+            ClassSpec::ShardsImage(image) => image.members.iter().any(|m| &m.member == member),
+            _ => false,
+        };
+        if !driven {
+            return Err(Refusal::Invalid {
+                what: "member",
+                why: format!("box {id}'s spec names no {member} its caller drives"),
+            });
+        }
+        let guest = match self.settle(&record)? {
+            State::Running(guest) => guest,
+            State::Held => return Err(held()),
+            State::Booting | State::Stopping(_) => return Err(pending(&id)?),
+            State::Created | State::Ended(_) => return Err(Refusal::NotRunning(id, "member")),
+        };
+        let name = member_name(member);
+        let stdin = guest
+            .take_input(&name)
+            .map_err(|why| refused(&id, "taking a member's stdin", why))?;
+        let stdout = guest
+            .take_output(&name, Channel::Stdout)
+            .map_err(|why| refused(&id, "taking a member's stdout (its stdin taken)", why))?;
+        let stderr = guest.take_output(&name, Channel::Stderr).map_err(|why| {
+            refused(
+                &id,
+                "taking a member's stderr (its stdin and stdout taken)",
+                why,
+            )
+        })?;
+        let given = Given {
+            stdin: Some(stdin.into()),
+            stdout: Some(stdout.into()),
+            stderr: Some(stderr.into()),
+        };
+        Ok(Box::new(MemberProc {
+            id,
+            guest,
+            name,
+            given: Some(given),
+            ended: None,
+        }))
     }
 
     pub(super) fn delete_image(&self, record: BoxRecord) -> Result<(), Refusal> {

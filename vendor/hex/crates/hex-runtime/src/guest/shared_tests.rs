@@ -12,16 +12,23 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 struct Native {
     released: AtomicBool,
     stops: AtomicUsize,
+    /// A stop ends what of the scope outlived its controller, as the helper's does, so the scope is Released.
+    stop_releases: AtomicBool,
+    /// The controller a launch published, where the model has one.
+    identity: std::sync::OnceLock<shards_api::Identity>,
 }
 
 impl shards_api::ManagedProcess for Native {
     fn identity(&self) -> Result<&shards_api::Identity, shards_api::Refusal> {
-        Err(shards_api::Refusal::Launch(
+        self.identity.get().ok_or(shards_api::Refusal::Launch(
             shards_api::LaunchError::Observer,
         ))
     }
     fn stop(&self) -> Result<(), shards_api::Refusal> {
         self.stops.fetch_add(1, Ordering::SeqCst);
+        if self.stop_releases.load(Ordering::SeqCst) {
+            self.released.store(true, Ordering::SeqCst);
+        }
         Ok(())
     }
     fn terminal(&self) -> Result<Option<shards_api::ManagedEnd>, shards_api::Refusal> {
@@ -215,14 +222,15 @@ impl Transaction for Owner {
         &self,
         identity: Option<&shards_api::Identity>,
     ) -> Result<shards_api::ManagedReceipt, Refusal> {
-        assert!(
-            identity.is_none(),
-            "no controller was published in this model"
+        assert_eq!(
+            identity.map(controller),
+            self.row().init,
+            "an attach names the controller the canonical row published, or none before it"
         );
         Ok(shards_api::managed_receipt(self.native.clone()))
     }
     fn finalize_managed(&self, identity: Option<&shards_api::Identity>) -> Result<(), Refusal> {
-        assert!(identity.is_none());
+        assert_eq!(identity.map(controller), self.row().init);
         assert!(self.native.released.load(Ordering::SeqCst));
         if self.fail_finalize.load(Ordering::SeqCst) {
             return Err(refused(self.row().key, LifecycleCause::Uncertain));
@@ -388,6 +396,14 @@ fn grant(offer: &BackingOffer) -> BackingGrant {
         key: offer.key,
         allocation: offer.allocation().unwrap(),
         devices: Vec::new(),
+    }
+}
+
+/// The canonical row's name for a published controller.
+fn controller(identity: &shards_api::Identity) -> hex_core::record::ProcId {
+    hex_core::record::ProcId {
+        pid: identity.pid,
+        start_ticks: identity.started,
     }
 }
 
@@ -612,6 +628,66 @@ fn ended_shared_scope_allows_inner_cleanup_while_the_original_grant_stays_charge
         1,
         "recovery never boots another VM"
     );
+}
+
+/// AC-T7.4.1 (restart, controller gone; the original of macos_pool_restart's restarted node that dialed the
+/// gone VM's guest until its deadline and exited): a shared pool Live under its published controller, which
+/// ended while no node ran as a member of its scope outlived it, so the native end is the controller's alone
+/// (`Process`, not `Released`). Do: recover it on a restarted runtime. Expect recovery to take nothing back and
+/// boot nothing: the survivor ended by one stop of the same scope, which releases it, and the pool Draining with
+/// the controller's exit recorded; then its release finalizes that scope without a second stop.
+#[test]
+fn a_pool_whose_controller_ended_while_no_node_ran_drains_and_its_survivor_is_ended() {
+    let dir = socket_fixture();
+    let (runtime, owner) = configured(dir.path());
+    let offer = runtime.prepare_backing().unwrap();
+    // The model's launch refuses after its intent; the row and receipt then say what a node that crashed
+    // after making the pool Live leaves: its controller published, the pool Live, the receipt Running.
+    assert!(runtime.initialize_backing(grant(&offer)).is_err());
+    let identity = shards_api::Identity {
+        pid: 41,
+        started: 43,
+        vsock: runtime.pool_socket(offer.key).unwrap(),
+    };
+    let mut row = owner.row();
+    row.init = Some(controller(&identity));
+    Transaction::put_pool(owner.as_ref(), &row).unwrap();
+    row.phase = BackingPhase::Live;
+    Transaction::put_pool(owner.as_ref(), &row).unwrap();
+    let path = dir.path().join("@guest");
+    let mut receipt = pool::read(&path).unwrap().unwrap();
+    receipt.phase = Phase::Running(copy_identity(&identity).unwrap());
+    pool::write(&path, &receipt).unwrap();
+    owner.native.identity.set(identity).unwrap();
+    owner.native.stop_releases.store(true, Ordering::SeqCst);
+
+    let restarted = configured_for(dir.path(), &owner);
+    assert_eq!(restarted.prepare_backing().unwrap().key, offer.key);
+    assert_eq!(
+        restarted.recover_backing(),
+        Ok(()),
+        "recovery refused a pool whose controller ended"
+    );
+    assert_eq!(owner.row().phase, BackingPhase::Draining);
+    assert_eq!(owner.row().exit, Some(hex_api::Exit::Code(7)));
+    assert_eq!(
+        owner.native.stops.load(Ordering::SeqCst),
+        1,
+        "recovery didn't end the survivor with one stop"
+    );
+    assert_eq!(
+        owner.launches.load(Ordering::SeqCst),
+        1,
+        "recovery booted another VM"
+    );
+    let released = restarted.release_backing(offer.key).unwrap();
+    assert_eq!(released.phase, BackingPhase::Released);
+    assert_eq!(
+        owner.native.stops.load(Ordering::SeqCst),
+        1,
+        "the release stopped an ended scope again"
+    );
+    assert_eq!(owner.finalized.load(Ordering::SeqCst), 1);
 }
 
 /// AC-T7.4.1: a checked renderer/native join can supply a factual device when

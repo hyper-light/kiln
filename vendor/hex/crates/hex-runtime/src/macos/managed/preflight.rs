@@ -290,6 +290,7 @@ mod tests {
                 },
                 backing: Some(source.key),
             }),
+            band: 0,
         };
         spec.check().unwrap();
         let mut record = BoxRecord::new(spec, hex_core::record::Phase::Creating, Vec::new());

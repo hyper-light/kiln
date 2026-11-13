@@ -264,6 +264,17 @@ pub trait Recover: Runtime {
         })
     }
 
+    /// Joint plan step 14 (C5): ends the managed VM through its receipt, the charge learner's last resort, its end then
+    /// observed as any other; refused, typed, by an owner that holds no managed VM.
+    fn stop_managed(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
+        let _ = record;
+        Err(Refusal::Platform {
+            what: "a managed VM's last resort",
+            platform: std::env::consts::OS,
+            why: "this native owner holds no managed VM to end".to_owned(),
+        })
+    }
+
     /// Initialized native routes only; physical claims are overlaid from this owner's Store.
     fn attachment_offers(&self) -> Result<Vec<hex_api::DeviceInfo>, Refusal> {
         Ok(self
@@ -364,7 +375,10 @@ struct Books {
     last_boot: Option<hex_core::record::BootSession>,
     /// Joint plan step 14: the charge learner of the managed VMs, where the node's platform caps them, and the end its
     /// window's thread waits on beside the window: dropped with the node.
-    charges: std::sync::OnceLock<(Mutex<charges::Learner>, Mutex<std::sync::mpsc::Sender<()>>)>,
+    charges: std::sync::OnceLock<(
+        Mutex<charges::Learner>,
+        Mutex<hex_wait::mpsc::SyncSender<()>>,
+    )>,
 }
 
 /// Concrete shared transaction; its caller keeps the same method/device Turn on stack.
@@ -1588,6 +1602,7 @@ mod projection_tests {
                 },
                 backing: None,
             }),
+            band: 0,
         }
     }
     fn factual() -> BoxInfo {
@@ -1957,25 +1972,42 @@ impl<R: Recover> Recorded<R> {
     }
 }
 
-/// The charge learner's reads and writes of the node's managed VMs, through their native owner.
-struct Managed<'a, R>(&'a R);
+/// The charge learner's reads and writes of the node's managed VMs, through their native owner, and of their records.
+struct Managed<'a, R> {
+    runtime: &'a R,
+    store: &'a Store,
+}
 
 impl<R: Recover> charges::Managed for Managed<'_, R> {
     fn usage(&self, record: &BoxRecord) -> Result<Usage, Refusal> {
-        self.0.managed_usage(NativeRecord::Box(record))
+        self.runtime.managed_usage(NativeRecord::Box(record))
     }
 
     fn set_rate(&self, record: &BoxRecord, rate: u64) -> Result<(), Refusal> {
-        self.0.set_managed_rate(NativeRecord::Box(record), rate)
+        self.runtime
+            .set_managed_rate(NativeRecord::Box(record), rate)
+    }
+
+    fn stop(&self, record: &BoxRecord) -> Result<(), Refusal> {
+        self.runtime.stop_managed(NativeRecord::Box(record))
+    }
+
+    fn intend(
+        &self,
+        id: &BoxId,
+        scope: charges::Scope,
+        end: &hex_api::LearnedEnd,
+    ) -> Result<bool, Refusal> {
+        charges::record_last_resort(self.store, id, scope, Some(end))
     }
 }
 
 impl<R: Recover + Send + Sync + 'static> Recorded<R> {
     /// Joint plan step 14 (C1, C4, C5): starts the charge learner of the node's managed VMs, a thread that runs a window
-    /// each time the platform's window passes, until the node is gone, and says what of the rule the platform can't
-    /// hold, typed: each VM's memory budget. Refused, typed, where the platform derives no window
+    /// each time the platform's window passes, until the node is gone, and says its window and what of the rule the
+    /// platform can't hold, typed: each VM's memory budget. Refused, typed, where the platform derives no window
     /// (`Recover::charge_window`): the node runs on, its VMs booked whole, as before.
-    pub fn start_charges(self: &Arc<Self>) -> Result<Vec<Refusal>, Refusal> {
+    pub fn start_charges(self: &Arc<Self>) -> Result<(std::time::Duration, Vec<Refusal>), Refusal> {
         let window = self.runtime.charge_window()?;
         let learner = charges::Learner::new(window, self.machine()?)?;
         let mut unheld = Vec::new();
@@ -1986,7 +2018,9 @@ impl<R: Recover + Send + Sync + 'static> Recorded<R> {
                 bound: 1,
             })?;
         unheld.push(learner.unheld().clone());
-        let (end, ended) = std::sync::mpsc::channel();
+        // Nothing is sent on it: the end is its sender's drop, with the node.
+        let (end, ended) = hex_wait::mpsc::sync_channel(1)
+            .map_err(|why| Refusal::os("making the charge learner's end", why))?;
         self.books
             .charges
             .set((Mutex::new(learner), Mutex::new(end)))
@@ -1997,8 +2031,21 @@ impl<R: Recover + Send + Sync + 'static> Recorded<R> {
             .spawn(move || {
                 loop {
                     match ended.recv_timeout(window) {
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(hex_wait::mpsc::RecvTimeoutError::Timeout) => {}
+                        Ok(()) | Err(hex_wait::mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(hex_wait::mpsc::RecvTimeoutError::Failed(why)) => {
+                            // It can't wait out a window: it says so where its failures are kept, and stops.
+                            if let Some(node) = node.upgrade()
+                                && let Some((learner, _)) = node.books.charges.get()
+                                && let Ok(mut learner) = learner.lock()
+                            {
+                                learner.failed(Refusal::os(
+                                    "waiting out the charge learner's window",
+                                    why,
+                                ));
+                            }
+                            return;
+                        }
                     }
                     let Some(node) = node.upgrade() else {
                         return;
@@ -2007,7 +2054,7 @@ impl<R: Recover + Send + Sync + 'static> Recorded<R> {
                 }
             })
             .map_err(|e| Refusal::os("starting the charge learner", e))?;
-        Ok(unheld)
+        Ok((window, unheld))
     }
 
     /// The machine's resources, as its facts say them.
@@ -2019,7 +2066,7 @@ impl<R: Recover + Send + Sync + 'static> Recorded<R> {
     /// machine less what its native boxes are capped at (C4: their bookings off the fleet's budget). Its failure is
     /// kept for the capacity answers.
     fn learn_window(&self) {
-        let Some((learner, _)) = self.books.charges.get() else {
+        let Some((shared, _)) = self.books.charges.get() else {
             return;
         };
         let read = self
@@ -2027,7 +2074,7 @@ impl<R: Recover + Send + Sync + 'static> Recorded<R> {
             .store
             .all()
             .and_then(|records| Ok((records, self.machine()?)));
-        let Ok(mut learner) = learner.lock() else {
+        let Ok(mut learner) = shared.lock() else {
             return;
         };
         let (records, machine) = match read {
@@ -2056,12 +2103,22 @@ impl<R: Recover + Send + Sync + 'static> Recorded<R> {
             disk_bytes: machine.disk_bytes,
         };
         // Its outcome is kept as the learner's fault, which the capacity answers read.
-        let _ = learner.window(
-            &Managed(&self.runtime),
-            &running,
-            budget,
-            std::time::Instant::now(),
-        );
+        let io = Managed {
+            runtime: &self.runtime,
+            store: &self.books.store,
+        };
+        let _ = learner.window(&io, &running, budget, std::time::Instant::now());
+        // Each end the last resort made goes into its box's record (C5), off the learner's lock; a write that fails
+        // is kept for the next window and fails this one.
+        let ends = learner.unrecorded();
+        drop(learner);
+        let (left, failed) = charges::write_ends(&self.books.store, ends);
+        if let Some(why) = failed
+            && let Ok(mut learner) = shared.lock()
+        {
+            learner.keep_unrecorded(left);
+            learner.failed(why);
+        }
     }
 }
 
@@ -2190,6 +2247,8 @@ impl Books {
         let recorded = match self.store.get(&info.id)? {
             Some(Ok(record)) => {
                 let abandoned = record.abandoned;
+                // Why the last resort ended it, where it did (joint plan step 14, C5), across the node's restarts.
+                charges::with_last_resort(&mut info, &record)?;
                 project_info(&mut info, &projection(record.spec)?)?;
                 abandoned
             }
@@ -2384,6 +2443,10 @@ impl<R: Recover> Runtime for Recorded<R> {
         self.runtime_at(id)?.usage(id)
     }
 
+    fn member(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
+        self.runtime_at(id)?.member(id, member)
+    }
+
     fn list(&self) -> Result<Vec<BoxInfo>, Refusal> {
         self.runtime
             .list()?
@@ -2551,6 +2614,10 @@ impl Recover for hex_runtime::macos::MacRuntime {
         hex_runtime::macos::MacRuntime::set_managed_rate(self, record, rate)
     }
 
+    fn stop_managed(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
+        hex_runtime::macos::MacRuntime::stop_managed(self, record)
+    }
+
     fn charge_window(&self) -> Result<std::time::Duration, Refusal> {
         hex_runtime::macos::MacRuntime::charge_window(self)
     }
@@ -2655,6 +2722,10 @@ impl Recover for hex_runtime::windows::WinRuntime {
 
     fn set_managed_rate(&self, record: NativeRecord<'_>, rate: u64) -> Result<(), Refusal> {
         hex_runtime::windows::WinRuntime::set_managed_rate(self, record, rate)
+    }
+
+    fn stop_managed(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
+        hex_runtime::windows::WinRuntime::stop_managed(self, record)
     }
 
     /// A job's hard cap holds per scheduling interval, whose length Windows doesn't document
@@ -2842,6 +2913,10 @@ impl<P: Recover> Recover for hex_runtime::guest::WithGuest<P> {
         self.host().set_managed_rate(record, rate)
     }
 
+    fn stop_managed(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
+        self.host().stop_managed(record)
+    }
+
     fn charge_window(&self) -> Result<std::time::Duration, Refusal> {
         self.host().charge_window()
     }
@@ -3010,9 +3085,9 @@ impl<P: Recover> Recover for hex_runtime::guest::WithGuest<P> {
         forward_guest(self.guest(), call, stdio, reply, ended)
     }
 
-    /// A box of the guest's goes to the guest's node, but a Shards image VM's: its guest runs no node of Hex's,
-    /// so its calls run on the worker, where the guest runtime's image class answers them, as Linux's node runs
-    /// an exec into one there (docs/design/shards-image-class.md §8).
+    /// A box its guest runtime holds goes to that guest's node, but a Shards image VM, whose guest runs no node of
+    /// Hex's: the guest runtime here answers it, as the Linux node runs an image VM's exec here (`guest_node_class`;
+    /// joint plan step 12, docs/design/shards-image-class.md §2).
     fn forward_for(
         &self,
         spec: &BoxSpec,
@@ -3021,10 +3096,12 @@ impl<P: Recover> Recover for hex_runtime::guest::WithGuest<P> {
         reply: Reply,
         ended: serve::Ended,
     ) -> Forward {
-        if matches!(spec.class, hex_api::ClassSpec::ShardsImage(_)) {
-            return Forward::Back(Box::new((call, stdio)));
-        }
         match self.route_for(spec) {
+            Ok(hex_runtime::guest::Side::Guest)
+                if matches!(spec.class, hex_api::ClassSpec::ShardsImage(_)) =>
+            {
+                Forward::Back(Box::new((call, stdio)))
+            }
             Ok(hex_runtime::guest::Side::Guest) => {
                 forward_guest(self.guest(), call, stdio, reply, ended)
             }
@@ -3358,6 +3435,7 @@ mod macos_unsubmitted_tests {
                     generation: [0x93; 16],
                 }),
             }),
+            band: 0,
         };
         spec.check().unwrap();
         let mut record = BoxRecord::new(spec, Phase::Creating, Vec::new());
@@ -3391,6 +3469,7 @@ mod macos_unsubmitted_tests {
                 devices: Vec::new(),
                 allocation: None,
                 route: None,
+                band: 0,
             })
             .unwrap();
         assert!(matches!(
