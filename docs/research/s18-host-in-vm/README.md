@@ -389,3 +389,79 @@ the commit messages give from before the rewrite map as follows:
 | b352ff8b6, e951b2968, 0c64ad0e8, 0aea534f2, c7bce6d2c, 4b558f733 (merges and the record) | 355f6b9ed, 33c1010b9, 8b4021fbe, 541ec016e, 24a0af22e, 95e6bf9a7 |
 | a428cdf9c, 61f284289, 943294258, 3dd57e3f1 (part 3) | d99dbff5e, 5f80c108d, 14dcdd7de, bbf4936d8 |
 | 053e79233, 027d1aacf, b8065ba0e, fdc5feff4 (part 3's merges, record and tested tip) | 8b3cba8ab, b163ae9fb, 7a0ab1aa5, 5055d8115 |
+
+## Part 4: each built-in names exactly the provider hosts its vendor documents
+
+ROOT's item of 2026-11-13 (`evidence/part4/root-2026-11-13-hosts.txt`): each of the ten built-ins names exactly the
+provider hosts its vendor documents, cited in its harness's record, and checked by the in-process Agentfile check's
+unit tests. Plan 01a1d2bd5014705d918ad1f2ce1154f2, step 4 (research 01a1d2bd5014705d944b487c232fc750, f17-f22).
+
+**What each record now holds.** Each harness's record (`docs/research/s19-claude-agentfile` to `s28-pi-agentfile`) has
+a "Hosts by name" section: each host, what it's for, and its citation. Each record also has an `evidence/hosts/`
+directory. It holds the vendor's own pages, saved as published (`.md` where the vendor has one), and a `SOURCES.tsv`
+giving each file's URL, its fetch date (2026-11-13) and its SHA-256, each re-checked against the file. Where the docs
+name only a wildcard, or nothing, the record also holds numbered excerpts of the vendor's own source, or of its pinned
+build, headed by the file's URL and whole SHA-256. Each Agentfile's comments cite the record for each host.
+
+**ROOT's calls, 2026-11-13**, each on the person's bar of zero breaks against today:
+- **Antigravity** (`evidence/part4/root-2026-11-13-agy-signins.txt`): the image serves the four sign-ins Antigravity
+  documents (a personal Google account, a Gemini API key, Gemini Enterprise through SSO or WIF, and ADC). Each run is
+  narrowed at launch to its own. The `*.mtls.googleapis.com` twins stay out: a client uses them only with a device
+  certificate (Google's AIP-4114), which no microVM holds.
+- **Goose, opencode and pi** (`evidence/part4/root-2026-11-13-providers.txt`): every provider each pinned build reaches
+  at a fixed public host. Each host is cited to that provider's own API docs and to the harness's source; a host
+  neither backs is dropped. Hosts the person gives stay out, and each run is narrowed at launch to its own provider.
+  This replaces the plan's "each provider their docs list". Goose's and opencode's docs list fewer providers than
+  their builds reach, and dropping the rest would break people who use them today.
+
+**The narrowing is the launch's** (goal 60, plan step 17): kiln drops at launch every destination not belonging to the
+session's provider or sign-in. D236 lets a run drop destinations, never add them. Part 4 sent goal 60's agent the
+rule for each harness, in documented terms:
+- agy's sign-ins (`modelProvider` and `GEMINI_API_KEY`; `AGY_ADC_AUTH` and `GOOGLE_CLOUD_LOCATION`; settings' `gcp`);
+- Goose's `GOOSE_PROVIDER`;
+- opencode's `model`;
+- pi's `defaultProvider` and `--provider`.
+`agentfiles::builtin::destinations::BY_USE` holds those four's hosts by what a session uses, typed, so the launch only
+picks a row: agy's sign-ins, Goose's `GOOSE_PROVIDER` ids, opencode's catalog keys, pi's providers, and what every run
+keeps (opencode's catalog and ripgrep, pi's `pi.dev`). Goal 60's agent asked for it. Two `grants_tests` tests hold each
+table to its image: `step18_each_builtins_hosts_by_use_are_its_image_together` and
+`step18_agy_sign_ins_name_the_image_together_and_no_mtls_host`. Until the launch narrows, a run of these four is
+granted every host its image names.
+
+**What changed, per harness** (part 2's lists are the baseline):
+- **Claude Code, Codex, Gemini CLI, Cursor, Devin, Amp:** unchanged. Each host is now cited in its record:
+  - Claude Code and Cursor to their network docs;
+  - Codex to OpenAI's pages and codex-rs, since its docs list no hosts;
+  - Gemini CLI to Google's pages and its sources;
+  - Devin's `.codeium.com` hosts to its documented wildcard and its build;
+  - Cursor's `api2direct` to its documented `*.cursor.sh` and its CLI;
+  - Amp to its docs' own words and its build.
+- **Antigravity**, 2 hosts to 13. Added: sign-in 2's `generativelanguage`; Antigravity's nine documented non-mTLS
+  enterprise hosts (`businessaicode`, `aiplatform` and `discoveryengine`, each with its US and EU twins); and `sts`,
+  workforce identity federation's token endpoint, which agy's build names and Google documents.
+- **Goose**, 64 to 67. Dropped `www.googleapis.com`: Goose names it only in OAuth scopes. Added four providers'
+  defaults behind variables, which part 2's scan missed (`api.routstr.com`, `api.moonshot.cn`, `open.bigmodel.cn`,
+  iFlytek Astron's `maas-token-api.cn-huabei-1.xf-yun.com`). `api.typesafe.ai` stays, now cited to Goose's auto effort.
+- **opencode**, 32 to 218. Its build reads its catalog from `models.opencode.ai`, the opencode team's own, not
+  models.dev. So `models.dev` is dropped and `models.opencode.ai` added. Also dropped: `api.typesafe.ai`, where no
+  catalog provider routes. Added: every catalog provider the build's packages reach at a fixed host, Cloudflare's two
+  hosts, and `api.digitalocean.com` and `auth.x.ai` for their sign-ins.
+- **pi**, 44 to 45. Dropped `claude.ai`: pi opens it only in the person's browser. Added Cloudflare's AI Gateway and
+  Workers AI hosts: they're fixed, with the account only in the path, and pi's docs list both providers.
+
+**Provider pages** (Goose, opencode, pi) are cited by their words naming the host, their URL, fetch date and the
+page's SHA-256 (`evidence/part4/provider-docs.tsv`, and each record's `hosts.tsv`). They aren't saved whole, as
+they're the providers' documents, not the harness's, and come to about 27 MB, mostly HTML.
+- Goose: 56 of 67 hosts named on their provider's own page, 1 in GitHub's documented wildcard, 10 on Goose's source
+  alone.
+- pi: 38 of 45, 1 and 6.
+- opencode: 128 of 218, 1 and 89.
+Each such host's row says which, and the pages it tried. The method is reproducible from `evidence/part4/scripts/`
+(`fetch.sh`, `doccheck.py`, `oc_hosts.py`, `assemble.py`, `tables.py`, `excerpts.py`, `buildexcerpt.py`) and
+`evidence/part4/inputs/`. Downloads went each into a new empty directory, as data, and no vendor CLI ran. agy's build
+embeds Google's installed-app OAuth client secrets, and its excerpt redacts them.
+
+**Findings beside the lists:**
+- Together's docs now name `api.together.ai`, where Goose and opencode still ask `api.together.xyz`.
+- MiniMax's China docs now name `api.minimax.cn`, where pi asks `api.minimaxi.com`.
+- Each stays as its harness asks; a harness's update would move it.
