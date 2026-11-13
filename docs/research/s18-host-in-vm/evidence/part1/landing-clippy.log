@@ -1,0 +1,12 @@
+    Blocking waiting for file lock on package cache
+    Updating crates.io index
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18: warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14: warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10: warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18: warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10: warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+   Compiling kiln v0.2.0 (/home/adalundhe/g121-tmp/s18/kiln/crates/kiln)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5m 45s
