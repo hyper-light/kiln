@@ -378,7 +378,7 @@ mod tests {
         let images = || super::image::Images::new(state.path().join("shards"), state.path().join("home"), state.path().join("builds"));
         let none = super::Microvms::new(std::sync::Arc::new(kiln_seams::sandbox::SimSandbox::new()), images());
         anyhow::ensure!(none.mcp().err() == Some(Refusal::Unsupported(super::NO_LANES.into())), "no lane");
-        let hex = super::held_in(state.path(), state.path().join("shards"), None)?;
+        let hex = super::held_in(state.path(), state.path().join("shards"), None, None)?;
         anyhow::ensure!(hex.mcp().err() == Some(Refusal::Unsupported(super::hexvm::NO_MCP_LANE.into())), "the vendored Hex's");
         let carried = super::Microvms::new(std::sync::Arc::new(kiln_seams::sandbox::SimSandbox::new()), images()).with_lanes(std::sync::Arc::new(super::fake::FakeLanes::default()));
         anyhow::ensure!(carried.mcp().is_ok(), "a lane that carries it");
