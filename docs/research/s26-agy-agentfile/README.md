@@ -213,3 +213,59 @@ Each rule, the proof that applies, and what's left.
   This Mac has 118 GiB free. Left: adas-mac-studio.local was 100% full (145 MiB free) when last
   seen. Nothing on it is this step's, and ROOT has the report. The test target on kiln-a094a12d
   (`~/.cache/s26-agy-step6/target`) is removed after the landing.
+
+## Hosts by name
+
+Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18, part 4 (plan 01a1d2bd5014705d918ad1f2ce1154f2, step 4).
+`.kiln/images/harness-antigravity/Agentfile` grants these 13 hosts by name (Shards D236), on TCP 443, HTTPS's port
+(RFC 9110 §4.2.2, and the port Antigravity's allowlist names), and nothing else. Antigravity is Google's. Each host is
+cited to Google's own documentation, saved as Google publishes it in `evidence/hosts/` (`SOURCES.tsv`: URL, fetch date
+2026-11-13, SHA-256). Each is also cited to agy's own pinned build (1.5.7), quoted in `evidence/hosts/agy-build.txt`
+with the build's URL and SHA-256, matched against pin.json's as it downloaded. The build embeds Google's installed-app
+OAuth client secrets; the excerpt redacts them.
+
+**Which sign-ins the image serves** is ROOT's call of 2026-11-13: all four that Antigravity documents for agy, each run
+narrowed at launch to its own (`docs/research/s18-host-in-vm/evidence/part4/root-2026-11-13-agy-signins.txt`). The
+reason is the person's bar of zero breaks against today. Kiln runs agy on the host today, where an enterprise sign-in
+works, and an image naming fewer would break those users in a microVM. A run may drop an image's destinations but
+never add one (D236). So kiln's launch (goal 60, plan step 17) keeps only the destinations of the session's own
+sign-in.
+
+| Host | For | Google's page | agy's build |
+|---|---|---|---|
+| `cloudcode-pa.googleapis.com` | a Google account's model service (sign-ins 1 and 3, 4) | `enterprise.md`, "Network allowlists": "Cloud Code Telemetry & Client Services" `cloudcode-pa.googleapis.com`; and "the client connects to the global endpoints (`businessaicode.googleapis.com` and `cloudcode-pa.googleapis.com`) during sign-in" | `https://cloudcode-pa.googleapis.com` |
+| `oauth2.googleapis.com` | Google's token endpoint: a sign-in's code exchange and refresh (1, 3, 4) | "OAuth 2.0 for iOS & Desktop Apps", `google-oauth-native-app.html`: `https://oauth2.googleapis.com/token` | `https://oauth2.googleapis.com/token` |
+| `generativelanguage.googleapis.com` | the Gemini API, signed in with a key (2) | `install.md`, "Using a Gemini API key": "Model requests go directly to the Gemini API"; the Gemini API reference, `gemini-api-reference.md`: `https://generativelanguage.googleapis.com` | `https://generativelanguage.googleapis.com` |
+| `businessaicode.googleapis.com`, `businessaicode.us.rep.googleapis.com`, `businessaicode.eu.rep.googleapis.com` | AI Developer Tools orchestration, global, US and EU (3, 4) | `enterprise.md`, "Network allowlists", each by name | `businessaicode.googleapis.com`, 28 times (its Business AI Code API) |
+| `aiplatform.googleapis.com`, `aiplatform.us.rep.googleapis.com`, `aiplatform.eu.rep.googleapis.com` | Vertex AI / Gemini Enterprise API, global, US and EU (3, 4) | the same table, each by name | `aiplatform.googleapis.com`, 316 times (its Vertex AI client) |
+| `discoveryengine.googleapis.com`, `us-discoveryengine.googleapis.com`, `eu-discoveryengine.googleapis.com` | Discovery Engine, global, US and EU (3, 4) | the same table, each by name | its API's package (`google/cloud/discoveryengine`), not the host: the documented allowlist alone |
+| `sts.googleapis.com` | Workforce Identity Federation's token exchange and refresh (3, its BYOID/WIF sign-in; 4 with an external-account ADC file) | "Obtain short-lived credentials for workforce identity federation", `google-workforce-short-lived-credentials.html`: `"token_url": "https://sts.googleapis.com/v1/oauthtoken"` | `https://sts.googleapis.com/v1/oauthtoken` |
+
+**The sign-ins and their hosts**, from `install.md`'s "Authenticate" and `enterprise.md`'s "Sign in and license
+selection". This is the rule kiln's launch narrows by.
+1. **A personal Google account** (the browser sign-in; Free, Pro or Ultra): `cloudcode-pa`, `oauth2`.
+2. **A Gemini API key** (`modelProvider: "gemini"` in `~/.gemini/antigravity-cli/settings.json` with `GEMINI_API_KEY`
+   set): `generativelanguage` alone. A `GOOGLE_GEMINI_BASE_URL` is a host the person gives, and isn't granted.
+3. **Gemini Enterprise through Google Cloud SSO, or BYOID/WIF** (the license's project and location are saved under
+   `gcp` in that settings file): `cloudcode-pa`, `oauth2` and `businessaicode.googleapis.com`, plus the location's
+   hosts. For `global`, that's `aiplatform.googleapis.com` and `discoveryengine.googleapis.com`. For `us` or `eu`, it's
+   that location's `businessaicode`, `aiplatform` and `discoveryengine` twins. WIF adds `sts`.
+4. **ADC** (`AGY_ADC_AUTH=true`, or `enableAdc`; the location is `GOOGLE_CLOUD_LOCATION`, `global` by default): sign-in
+   3's hosts for that location. An authorized-user ADC file refreshes at `oauth2`; an external-account one exchanges at
+   `sts`.
+
+**Not granted:**
+- **The mTLS twins** (`businessaicode.mtls.googleapis.com`, `aiplatform.mtls.googleapis.com` and the three
+  `discoveryengine` `*.mtls.googleapis.com`). Google's own rule for its clients is to use the mTLS endpoint only "if a
+  device certificate is available and the default regular endpoint otherwise". The certificate comes from the
+  platform's credential store through EndpointVerification (AIP-4114, `aip-4114-device-certificate-authentication.md`),
+  and no microVM holds one. An organization whose policy requires certificate-based access can't sign in to agy from a
+  microVM: docs/agents.md says so.
+- **Logging and updates:** `play.googleapis.com`, and the updater's `storage.googleapis.com`, which is off.
+- **The person's browser:** `accounts.google.com` and `auth.cloud.google`, the sign-in pages.
+
+**Changed from part 2** (2 hosts):
+- Added sign-in 2's host and sign-ins 3 and 4's ten: the nine documented non-mTLS enterprise hosts, and `sts`.
+- `oauth2` and `cloudcode-pa` were already there.
+- Before applying the call, part 4 told ROOT that sign-ins 3 and 4 also take `oauth2`, and WIF takes `sts` once the
+  build and Google's docs showed it. ROOT raised no objection.

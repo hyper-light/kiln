@@ -1,0 +1,9 @@
+ripgrep 15.1.0's release download, as opencode 2.2.7's packages/core/src/ripgrep/binary.ts builds its URL, asked with
+curl -sSI on 2026-11-13 (status line and Location's scheme, host and path only; its signed query left out):
+
+GET https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz
+HTTP/2 302 
+location: https://release-assets.githubusercontent.com/github-production-release-asset/53631945/488a88f7-4e31-4ab6-9a7d-a7342551549f?<signed query left out>
+
+GitHub publishes release-assets.githubusercontent.com by name in its /meta API's domains (actions):
+https://api.github.com/meta, fetched 2026-11-13, sha256 b8f0041694d6391ca141422e3bbc7073b88b5a8e5c708e8a47afad38638d9a2e.

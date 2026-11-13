@@ -1,0 +1,3 @@
+file	url (fetched 2026-11-13 with curl -L)	sha256
+windsurf-common-issues.md	https://docs.devin.ai/desktop/troubleshooting/windsurf-common-issues.md	8aad681949935b0d2d383ede416fb673982ebc9c3f83c5c53dc05fb2b84a25a6
+devin-build.txt	kiln's excerpt of Devin 3000.12.43's pinned build (its URL and SHA-256 inside)	305c727448bb1c880b688510a0ea6ef4432573335a40416147a961948f34c2ca

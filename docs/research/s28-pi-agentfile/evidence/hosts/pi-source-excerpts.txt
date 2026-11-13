@@ -1,0 +1,217 @@
+Numbered excerpts of pi's own source at its pin, fetched 2026-11-13 with curl -L: each file's lines naming
+the hosts its row in hosts.tsv cites it for, with the whole file's SHA-256, so each line can be checked against the tag.
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/ant-ling.ts
+   sha256 013c67590ef8cd19dc199e1d92ef2649ff6a7101bf80912a3852287c24e4ca79  1688 bytes  (lines naming: api.ant-ling.com)
+    17  		baseUrl: "https://api.ant-ling.com/v1",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/anthropic.ts
+   sha256 b4e09f431218c6fcf5a7643cb79cc82e93e0cd77db7a1a497c3c4178666bb665  3521 bytes  (lines naming: api.anthropic.com)
+    26  	baseUrl: "https://api.anthropic.com",
+   ...
+    41  				baseUrl: "https://api.anthropic.com",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/baseten.ts
+   sha256 c907a6ccd076e69c64fe9df2ccbfbc2c8986078b946a280d6472e5c641ba1466  2843 bytes  (lines naming: inference.baseten.co)
+    58  			baseUrl: "https://inference.baseten.co/v1",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/cerebras.ts
+   sha256 205c913bf1289768b862bdb414aea4259c21da22f981efb3e8ef0701ab62b5fe  333 bytes  (lines naming: api.cerebras.ai)
+     6  		modelsDevModels(ctx, "cerebras", { api: "openai-completions", baseUrl: "https://api.cerebras.ai/v1" }),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/deepseek.ts
+   sha256 2094212cff13c16ca9b2f594439c190cd8696e049a9ec9edabd164d093e3edef  1791 bytes  (lines naming: api.deepseek.com)
+    13  		baseUrl: "https://api.deepseek.com",
+   ...
+    27  		baseUrl: "https://api.deepseek.com",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/fireworks.ts
+   sha256 8b54992c69de29ad07b770df87c87814d7e3314572a6c087dbc9f8dab8504b91  4379 bytes  (lines naming: api.fireworks.ai)
+    46  			baseUrl: "https://api.fireworks.ai/inference",
+   ...
+    52  						baseUrl: "https://api.fireworks.ai/inference/v1",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/github-copilot.ts
+   sha256 8ec4e3ed3a01cf0691ef815c44a95d7aa8e3263302f631b446d4e025e24961f5  5312 bytes  (lines naming: api.individual.githubcopilot.com)
+    10  const BASE_URL = "https://api.individual.githubcopilot.com";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/google.ts
+   sha256 9b576fc54123e3264c60dcfd681e31de2476df734c4c1262ca99df658a6f0527  1507 bytes  (lines naming: generativelanguage.googleapis.com)
+    17  			baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/groq.ts
+   sha256 447a5a438e54d2fc5bfd6e1fe070ee82e2b2283a37b130681d7b955f48666fa5  477 bytes  (lines naming: api.groq.com)
+     6  		modelsDevModels(ctx, "groq", { api: "openai-completions", baseUrl: "https://api.groq.com/openai/v1" }),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/huggingface.ts
+   sha256 fb8b413cd7f45d3f4b1e2033edcb9515eff2159d9d1d91f57c0ce07201cc8791  373 bytes  (lines naming: router.huggingface.co)
+     8  			baseUrl: "https://router.huggingface.co/v1",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/kimi-coding.ts
+   sha256 0b671154d03017b71ca25fd982373ca1c14ff4611d1673905e4dc8db892fe037  2699 bytes  (lines naming: api.kimi.com)
+    23  			baseUrl: "https://api.kimi.com/coding/v1",
+   ...
+    27  				// later system messages) in https://api.kimi.com/coding/v1/models; models.dev mirrors
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/meta.ts
+   sha256 71cfc67cf496a3671835b3787529a724db82cd2a68bf5a409cabfffaaca9d0c0  226 bytes  (lines naming: api.meta.ai)
+     5  	models: (ctx) => modelsDevModels(ctx, "meta", { api: "openai-responses", baseUrl: "https://api.meta.ai/v1" }),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/minimax-cn.ts
+   sha256 eb17f5c6eeec6736640e3f2bcf9dd8ad57450557a19f40cc5458ced465b2f748  239 bytes  (lines naming: api.minimaxi.com)
+     6  	models: (ctx) => minimaxModels(ctx, "minimax-cn", "https://api.minimaxi.com/anthropic"),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/minimax.ts
+   sha256 0f3a5bb7b7669c25915bad364617b1c2dfdde50eb19df15d558368453a716566  1209 bytes  (lines naming: api.minimax.io)
+    25  	models: (ctx) => minimaxModels(ctx, "minimax", "https://api.minimax.io/anthropic"),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/mistral.ts
+   sha256 f5669adb9d9facfb244e8a252f4df812cd4022bd48941d18252ad9273ae2a07d  1590 bytes  (lines naming: api.mistral.ai)
+    11  				baseUrl: "https://api.mistral.ai",
+   ...
+    36  					baseUrl: "https://api.mistral.ai",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/moonshotai-cn.ts
+   sha256 5437054d5bc6ce74ada782051a6989073015fe4619da28407cba910d4cd2c9fa  392 bytes  (lines naming: api.moonshot.cn)
+     6  	models: (ctx) => moonshotModels(ctx, "moonshotai-cn", "https://api.moonshot.cn/v1"),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/moonshotai.ts
+   sha256 994d88db4c173b06f54584604314640b07f73f1ff2342b6fb942ba3ee8bd4b00  2522 bytes  (lines naming: api.moonshot.ai)
+    68  	models: (ctx) => moonshotModels(ctx, "moonshotai", "https://api.moonshot.ai/v1"),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/openai-codex.ts
+   sha256 369c10a2f7f105f30626dee8bd52366c1eb1d313e4af783ae49f243e69469ae1  2410 bytes  (lines naming: chatgpt.com)
+    49  				baseUrl: "https://chatgpt.com/backend-api",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/openai.ts
+   sha256 8b9f4f3973fa45dad7030a7c54f2fb1e82144ba59733bede8b24818558a43ef6  5061 bytes  (lines naming: api.openai.com)
+    20  const BASE_URL = "https://api.openai.com/v1";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/opencode.ts
+   sha256 a4346e62b9e8545e501bc293e9ac260f4c6661b2879dac60b5a5762239a25291  8745 bytes  (lines naming: opencode.ai)
+   189  // https://opencode.ai/docs/zen
+   ...
+   197  		baseUrl: "https://opencode.ai/inference/systemone/v1",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/openrouter.ts
+   sha256 032f47644d3f825d87615f1bc18730a01d258aff09617d6f7e08c9adcd03944d  4483 bytes  (lines naming: openrouter.ai)
+     7  const BASE_URL = "https://openrouter.ai/api/v1";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/qwen-token-plan.ts
+   sha256 17937a20a958ce9116bdb89281f84a0c613fc22fbf64b2babd7331caa68e8eb7  2146 bytes  (lines naming: token-plan.ap-southeast-1.maas.aliyuncs.com, token-plan.cn-beijing.maas.aliyuncs.com)
+     8  export const INTERNATIONAL_BASE_URL = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+     9  export const CN_BASE_URL = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/together.ts
+   sha256 d9bc2e64799ac178876456c46dbd63af9f81e18b0f3dbc5bb55d845392fba523  2216 bytes  (lines naming: api.together.ai)
+    35  			baseUrl: "https://api.together.ai/v1",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/typesafe.ts
+   sha256 a4d269944c72c74c4deb310f06db4c58036903be1b04c5776bed221a3c437c21  1308 bytes  (lines naming: api.typesafe.ai)
+    19  				baseUrl: "https://api.typesafe.ai/v1/",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/xai.ts
+   sha256 1c939eccaedbbf50b5f8ec9c1e86a83c3cb61bfce458e6afd40d1862385cbd08  855 bytes  (lines naming: api.x.ai)
+    18  			baseUrl: "https://api.x.ai/v1",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/xiaomi-token-plan-ams.ts
+   sha256 aaee6ae9d411b205cfc7b137f46b50690d22e4b89a0539e48115c76d9dbf66a2  328 bytes  (lines naming: token-plan-ams.xiaomimimo.com)
+     6  	models: (ctx) => xiaomiModels(ctx, "https://token-plan-ams.xiaomimimo.com/v1"),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/xiaomi-token-plan-cn.ts
+   sha256 90ecb7dbb8944de3a95588bb72c1a73fa9c554d55a91d596386400e6aa88b98e  326 bytes  (lines naming: token-plan-cn.xiaomimimo.com)
+     6  	models: (ctx) => xiaomiModels(ctx, "https://token-plan-cn.xiaomimimo.com/v1"),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/xiaomi-token-plan-sgp.ts
+   sha256 7ba76a6c320f58348b6aa46248e9fd9ee96a93ddf34dec9ac6081bd8effc10ab  328 bytes  (lines naming: token-plan-sgp.xiaomimimo.com)
+     6  	models: (ctx) => xiaomiModels(ctx, "https://token-plan-sgp.xiaomimimo.com/v1"),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/xiaomi.ts
+   sha256 9d5004dc43be1f827cc1318ea3097d5b04c8ed6a671dfac6f76f78f77f8f85b6  1416 bytes  (lines naming: api.xiaomimimo.com)
+    44  	models: (ctx) => xiaomiModels(ctx, "https://api.xiaomimimo.com/v1"),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/zai-coding-cn.ts
+   sha256 261df5914d6499deffb48b7de8044743d4681d616701fcd4d84772276fcb3a20  351 bytes  (lines naming: open.bigmodel.cn)
+     6  	models: (ctx) => zaiCodingPlanModels(ctx, "zhipuai-coding-plan", "https://open.bigmodel.cn/api/coding/paas/v4"),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/providers/zai.ts
+   sha256 387f6fdca15795e39bf5d8f7f4d6e4a2c624390e4fbf3503ce6d9fb10c7dfa17  2083 bytes  (lines naming: api.z.ai)
+    48  	models: (ctx) => zaiCodingPlanModels(ctx, "zai-coding-plan", "https://api.z.ai/api/coding/paas/v4"),
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/catalog/sources/index.ts
+   sha256 c5f52cbbcdcde8c1561577eaa37af978578ed25e5f4cda1134af17ea43b16400  3528 bytes  (lines naming: integrate.api.nvidia.com)
+    16  export const NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/src/api/cloudflare.ts
+   sha256 08b69898fff115d1cd11339feb12ba35b3694f879e278838f3a13f6b22594d1e  1041 bytes  (lines naming: api.cloudflare.com, gateway.ai.cloudflare.com)
+     3  	"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1";
+   ...
+     7  	"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai";
+   ...
+    11  	"https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat";
+   ...
+    15  	"https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/openai";
+   ...
+    19  	"https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/anthropic";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/src/auth/oauth/anthropic.ts
+   sha256 f72cd3bdb5d4fc8cc647487a69ed38464548c397062fbc2acfcef6431c9c0b0c  9698 bytes  (lines naming: platform.claude.com)
+    16  const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+   ...
+    23  const COPY_CODE_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/src/auth/oauth/github-copilot.ts
+   sha256 bf2d70b0be3efd66ebfbc875ea22655faca8104e3cff075d1414351c7ea77f5a  15471 bytes  (lines naming: api.github.com, github.com)
+   312  	const domain = enterpriseDomain || "github.com";
+   ...
+   431  		message: "GitHub Enterprise URL/domain (blank for github.com)",
+   ...
+   439  	const domain = enterpriseDomain || "github.com";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/src/auth/oauth/kimi-coding.ts
+   sha256 b6e2211a82cd2a90a926ffa74986ae51dac607721f65fc0140d4fa46f8ede781  9228 bytes  (lines naming: auth.kimi.com)
+     4   * RFC 8628 device authorization grant against https://auth.kimi.com with JSON
+   ...
+    16  const DEFAULT_OAUTH_HOST = "https://auth.kimi.com";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/src/auth/oauth/meta.ts
+   sha256 5927b98a5e399dd53fa2d9cda8a65310d235af68457cad93a678932635e069f7  7317 bytes  (lines naming: auth.meta.com)
+     4   * RFC 8628 device authorization grant against https://auth.meta.com (JSON
+   ...
+    11   * (auth.meta.com answers grant_type=refresh_token with 404 and issues no
+   ...
+    22  const AUTH_HOST = "https://auth.meta.com";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/src/auth/oauth/openai-chatgpt.ts
+   sha256 ad9dbdd7ffa52fcbaff1d1be2d0ba97b643476aaf8930e6dd67147bf35c837de  11605 bytes  (lines naming: auth.openai.com)
+    19  const AUTHORIZE_URL = "https://auth.openai.com/api/accounts/authorize";
+    20  const TOKEN_URL = "https://auth.openai.com/api/accounts/oauth/token";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/src/auth/oauth/openai-codex.ts
+   sha256 2b73b65d0a65b770708a4aead7d89c11f3656c4c2a1b055acd98a4186bab0865  13447 bytes  (lines naming: auth.openai.com)
+    23  const AUTH_BASE_URL = "https://auth.openai.com";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/src/auth/oauth/openrouter.ts
+   sha256 3d90d1955672b64e3039e760c41b4ff1c43f5b3fc6fcbe7f80fa6f552997893a  5807 bytes  (lines naming: openrouter.ai)
+    19  const AUTHORIZE_URL = "https://openrouter.ai/auth";
+    20  const TOKEN_URL = "https://openrouter.ai/api/v1/auth/keys";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/src/auth/oauth/xai.ts
+   sha256 d78bc70b7031326d51bf1348266fcd576e77590ceefdea9a4ed962e403444a78  7624 bytes  (lines naming: auth.x.ai)
+    10  const XAI_DEVICE_CODE_URL = "https://auth.x.ai/oauth2/device/code";
+    11  const XAI_TOKEN_URL = "https://auth.x.ai/oauth2/token";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/src/providers/radius-config.ts
+   sha256 0e8c55d29039d760ba4cb8a763e61ea742ac13b3acdf42891c82486a610ab4f4  3392 bytes  (lines naming: radius.pi.dev)
+     5  export const DEFAULT_RADIUS_GATEWAY = "https://radius.pi.dev";
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/ai/src/providers/vercel-ai-gateway.ts
+   sha256 f469f498e7de52915525d3ac645ae8c73bdb6dee7624e7ab68d139c7e91cc279  981 bytes  (lines naming: ai-gateway.vercel.sh)
+    11  		baseUrl: "https://ai-gateway.vercel.sh",
+
+== https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/coding-agent/docs/models.md
+   sha256 a1a373ac64d62afc3a039d7b614caf1216d3ef9c9278179f9d859eee5ca0855d  14120 bytes  (lines naming: pi.dev)
+    15  Browse the [model catalog](https://pi.dev/models) for current providers, model IDs, capabilities, context limits, and pricing. Pi starts with its bundled catalog and can overlay newer catalog data from pi.dev. Cached catalog data remains av
+   ...
+    51    "$schema": "https://pi.dev/schemas/models.schema.json",
+

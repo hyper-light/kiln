@@ -98,3 +98,34 @@ made by `scripts/ctx.py` from the pinned archive); and its docs pages as fetched
 | cli_reference_configuration.md | aab79ccc8949c23f30c45e0928ea80cefb5ee4ee6ff1723a3864ac61851f2a87 |
 | cli_reference_parameters.md | da76369d0deeda7ebe45206ef5705ba89a8c83a6baa5bd91aba2736220de1ae7 |
 | enterprise_network-configuration.md | 1899324badbf5381754d1ca518258f7738d7ec7804ba79b892dab558094ae030 |
+
+## Hosts by name
+
+Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18, part 4 (plan 01a1d2bd5014705d918ad1f2ce1154f2, step 4).
+`.kiln/images/harness-cursor/Agentfile` grants these hosts by name (Shards D236), on TCP 443, HTTPS's port (RFC 9110
+§4.2.2), and nothing else.
+
+Each is cited to Cursor's "Network Configuration" page, `evidence/hosts/network-configuration.md`, saved as Cursor
+publishes it (`SOURCES.tsv`: URL, fetch date 2026-11-13, SHA-256). The page is byte for byte the copy step 18 saved
+for part 2. A host the page covers only by its wildcard `*.cursor.sh` is named from Cursor's own pinned CLI and cited
+to both. The CLI is quoted in `evidence/hosts/cursor-build.txt`, with its URL and SHA-256, matched against pin.json's
+as it downloaded. Step 27 kept its own copies of Cursor's pages untracked (above). These are part 4's, saved at ROOT's
+direction that each harness record hold its vendor's documentation of the hosts it reaches.
+
+| Host | For | Cursor's page | Cursor's CLI (2026.11.11-b912975) |
+|---|---|---|---|
+| `api2.cursor.sh` | most of its requests, and its sign-in's poll | "`api2.cursor.sh`: Used for most API requests." | `index.js`: `` `${r}/auth/poll` `` and `` `${r}/auth/exchange_user_api_key` `` on its API base |
+| `api2direct.cursor.sh` | the same service by its direct route | the wildcard `*.cursor.sh` | `5006.index.js`: `r.replace("api2.cursor.sh","api2direct.cursor.sh")` |
+| `api5.cursor.sh` | an agent's requests, and the network access layer | "`api5.cursor.sh`: Used for Cursor's agent requests." | the agent hosts its server gives (`agentUrl`, `agentnUrl`) |
+| `agent.api5.cursor.sh`, `agentn.api5.cursor.sh`, `agent.us.api5.cursor.sh`, `agentn.us.api5.cursor.sh`, `agent.global.api5.cursor.sh`, `agentn.global.api5.cursor.sh` | the agent hosts by region | "These subdomains are also used:", each by name | the same |
+| `repo42.cursor.sh` | codebase search | "`repo42.cursor.sh`: Used for codebase search (HTTP/2 only)." | `index.js`: `"https://repo42.cursor.sh"` |
+
+The page's other hosts aren't granted.
+- **Cursor Tab:** `api3.cursor.sh`, `api4.cursor.sh` and the `gcpp` hosts. That's the editor's.
+- **Sign-in pages and token issuers:** `authenticate.cursor.sh`, `authenticator.cursor.sh`, `accounts.spacex.ai`,
+  `accounts.x.ai`, `prod.authentication.cursor.sh` and `authentication.cursor.sh`. The CLI's sign-in opens its page in
+  the person's browser and polls `api2.cursor.sh`, and its pinned CLI names none of these hosts.
+- **SSO setup:** `adminportal42.cursor.sh`.
+- **Updates and extensions:** off (`--disable-auto-update`).
+
+Unchanged from part 2.

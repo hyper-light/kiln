@@ -24,12 +24,16 @@ HARNESS codex FROM ./codex-${TARGETARCH}
 # harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
 # name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
 # resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
-# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
-# docs/research/s18-host-in-vm says where each host comes from).
-# - api.openai.com: the Responses API, signed in with an API key; chatgpt.com: Codex's Responses
-#   through ChatGPT's backend, signed in with ChatGPT; auth.openai.com: that sign-in, its token
-#   refresh and its revocation (codex-rs rust-v0.167.2: cli/src/doctor.rs's reachability plan,
-#   login/src/server.rs's issuer, login/src/auth/manager.rs's token URLs).
+# port or protocol goes out. 443 is HTTPS's port (RFC 9110 4.2.2). Each host is cited to its vendor's own
+# documentation, or, where that names a wildcard or nothing, to the vendor's own source or build, in its
+# harness's record's "Hosts by name" (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18, part 4):
+# docs/research/s20-codex-agentfile/README.md. OpenAI's Codex docs list no hosts of the CLI's, so each is cited to the
+# OpenAI page that names it and to codex-rs at rust-v0.167.2:
+# - api.openai.com: the Responses API, signed in with an API key (OpenAI's API reference; cli/src/doctor.rs).
+# - chatgpt.com: Codex's Responses through ChatGPT's backend, signed in with ChatGPT (Codex's gateway docs:
+#   https://chatgpt.com/backend-api/codex; cli/src/doctor.rs).
+# - auth.openai.com: that sign-in, its token refresh and its revocation (Codex's app-server docs, the device sign-in's
+#   page; login/src/server.rs's issuer, login/src/auth/manager.rs's token URLs).
 # kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
 # kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
 NETWORK --egress=api.openai.com:443 --egress=auth.openai.com:443 --egress=chatgpt.com:443 provider FOR codex

@@ -1,0 +1,8 @@
+file	url (fetched 2026-11-13 with curl -L)	sha256
+enterprise.md	https://antigravity.google/docs/enterprise.md	4ed503f1f428c0618893d260e2424a86d7d28dec03ab773a8e71b66008c90525
+install.md	https://antigravity.google/docs/install.md	c7cc67bc8523dbf7869e04cdfbf1316a6e53331c194542c9ec2a0855b4acd2b2
+gemini-api-reference.md	https://ai.google.dev/api.md	7e66971e5699e5b0aea05b13b3e9030c811004fbdda0cd964c5f87bbabf9f6c4
+google-oauth-native-app.html	https://developers.google.com/identity/protocols/oauth2/native-app (as published, sha256 dfef9d465c8e6994bdef379614228ae41b2b2c6245ab5517f34aff4342bfad7c; saved with its 9 embedded Google browser API keys redacted; and its 1 OAuth client id and its 2 example refresh tokens redacted; and its 1 example signed token redacted)	e22cd588d23089880a4a933520f72a90f502679a3c45f47d5c6d0a5b4efa31a4
+google-workforce-short-lived-credentials.html	https://cloud.google.com/iam/docs/workforce-obtaining-short-lived-credentials (as published, sha256 213bafdd477b383025c63b816211a09e264853d5cf1d6858fc7325ab4b207cd2; saved with its 9 embedded Google browser API keys redacted; and its 1 OAuth client id redacted)	65be3239c6737241fb5e4945cf621591c515cf4f4c92923f2f16584e5c1afff9
+aip-4114-device-certificate-authentication.md	https://raw.githubusercontent.com/aip-dev/google.aip.dev/master/aip/auth/4114.md	40682d57dbf6de511db58d1a542f3b174f515386c6c5e418dc1c04056eda401a
+agy-build.txt	kiln's excerpt of agy 1.5.7's pinned build (its URL and SHA-256 inside; Google's installed-app client secrets redacted)	64885d65bc3225a5fe7a2b56e895faf5bcfd625755bf6cc8d5b81c846fdc94ef
