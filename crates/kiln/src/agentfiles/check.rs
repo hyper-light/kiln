@@ -20,6 +20,12 @@
 //! whole failed resolving `ubuntu:24.04` ("Network is unreachable"). Here no base can be resolved at all
 //! ([`Unresolved`]): a check that reached one would say so in its refusal. Warnings Shards finds only as
 //! it dispatches steps (`UndefinedVar` ...) are the build's to say.
+//!
+//! kiln adds one rule of its own, on a text Shards passed: no grant may reach kiln itself
+//! ([`Kiln`]), as kiln's MCP rides the agent-control link's own `mcp` lane (Shards D254) and never
+//! the network (ROOT's decision, 2026-11-13; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 18).
+
+use std::net::IpAddr;
 
 use serde::Serialize;
 use shards_agentfile::{lint as rules, parser, plan, platform::Platform};
@@ -116,11 +122,11 @@ impl Check {
     }
 }
 
-/// `text` checked by Shards, on the compute pool (its parse and plan are CPU work): unchecked only if
-/// the check itself never ended there.
-pub async fn check(text: &str) -> Check {
-    let text = text.to_owned();
-    match crate::rt::compute(move || lint(&text)).await {
+/// `text` checked by Shards, then by kiln's own rule ([`reaching_kiln`]), on the compute pool (its
+/// parse and plan are CPU work): unchecked only if the check itself never ended there.
+pub async fn check(text: &str, kiln: &Kiln) -> Check {
+    let (text, kiln) = (text.to_owned(), kiln.clone());
+    match crate::rt::compute(move || with_kiln(lint(&text), &text, &kiln)).await {
         Ok(c) => c,
         Err(e) => Check::unchecked(Unchecked::Failed { status: None, said: format!("{e:#}") }),
     }
@@ -168,6 +174,176 @@ pub fn lint(text: &str) -> Check {
     }
     diagnostics.sort_by_key(|d| (d.range.start.line, d.severity == Severity::Warning));
     Check { checked: true, unchecked: None, diagnostics }
+}
+
+/// Shards' check `c` of `text`, with each grant that reaches kiln refused at its line where Shards
+/// refused nothing.
+fn with_kiln(mut c: Check, text: &str, kiln: &Kiln) -> Check {
+    if c.checked && c.refusal().is_none() {
+        c.diagnostics.extend(reaching_kiln(text, kiln));
+        c.diagnostics.sort_by_key(|d| (d.range.start.line, d.severity == Severity::Warning));
+    }
+    c
+}
+
+/// The code of kiln's refusal of a grant that reaches kiln itself.
+pub const REACHES_KILN: &str = "ReachesKiln";
+
+/// The machine itself, as a microVM names it (Shards D236's name, Docker Desktop's: `.internal` is
+/// the top-level domain ICANN reserved for private use, so no name in the DNS is it).
+const HOST: &str = "host.docker.internal";
+
+/// What is kiln itself, which no Agentfile may grant a way to (ROOT, 2026-11-13): kiln's MCP rides
+/// the agent-control link's `mcp` lane (Shards D254), so a grant to kiln is a way around that lane.
+/// Third-party servers stay grantable by name, as default deny has them. kiln is:
+/// - the machine its runner is: `host.docker.internal` (D236), and, as literals, its loopback,
+///   link-local and unspecified addresses (D124's host network) and a network's declared gateway
+///   (D31's `host-gateway`);
+/// - kiln's own server: the hosts its configured URLs, advertised addresses and certificate names
+///   give, a name by its name and an address by its address.
+///
+/// A name that only resolves to one of these, or a literal address of the runner's own interfaces,
+/// is for the run to see as it starts on that machine (owed with step 17's launch): this check
+/// resolves no name, as it pulls no base.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Kiln {
+    /// kiln's server's names, lowercase.
+    names: Vec<String>,
+    /// kiln's server's addresses.
+    addrs: Vec<IpAddr>,
+}
+
+/// Which part of kiln a grant reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Itself {
+    /// The machine the runner is.
+    Machine,
+    /// kiln's server.
+    Server,
+}
+
+impl Kiln {
+    /// kiln's server as `server` configures it: its public and pages URLs' hosts, its advertised
+    /// QUIC and HTTP/3 addresses, the addresses it listens on where they name one, and its
+    /// certificate's extra names.
+    pub fn of(server: &crate::config::Server) -> Kiln {
+        let mut k = Kiln::default();
+        for url in [Some(server.public_url.as_str()), server.pages_url.as_deref()].into_iter().flatten() {
+            k.add(url_host(url));
+        }
+        for at in [Some(server.quic_advertise.as_str()), server.h3_advertise.as_deref(), Some(server.http_addr.as_str()), Some(server.quic_addr.as_str()), server.h3_addr.as_deref()].into_iter().flatten() {
+            k.add(authority_host(at));
+        }
+        for name in &server.tls_names {
+            k.add(name);
+        }
+        k
+    }
+
+    /// One of kiln's hosts: an address (an unspecified one listens everywhere, naming none) or a name.
+    fn add(&mut self, host: &str) {
+        let host = host.trim().trim_start_matches('[').trim_end_matches(']').trim_end_matches('.');
+        match host.parse::<IpAddr>() {
+            Ok(ip) if ip.is_unspecified() => {}
+            Ok(ip) => {
+                if !self.addrs.contains(&ip) {
+                    self.addrs.push(ip);
+                }
+            }
+            Err(_) if host.is_empty() => {}
+            Err(_) => {
+                let name = host.to_ascii_lowercase();
+                if !self.names.contains(&name) {
+                    self.names.push(name);
+                }
+            }
+        }
+    }
+
+    /// Whether `host`, a grant's, is kiln itself, given the gateways its Agentfile declares.
+    fn itself(&self, host: &str, gateways: &[IpAddr]) -> Option<Itself> {
+        let host = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
+        if host == HOST {
+            return Some(Itself::Machine);
+        }
+        match host.parse::<IpAddr>() {
+            Ok(ip) if ip.is_loopback() || ip.is_unspecified() || link_local(ip) || gateways.contains(&ip) => Some(Itself::Machine),
+            Ok(ip) => self.addrs.contains(&ip).then_some(Itself::Server),
+            Err(_) => self.names.contains(&host).then_some(Itself::Server),
+        }
+    }
+}
+
+/// Whether `ip` is link-local (RFC 3927's 169.254.0.0/16, RFC 4291's fe80::/10).
+fn link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local(),
+    }
+}
+
+/// The host a URL names: its authority's, without user or port.
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    authority_host(rest.split(['/', '?', '#']).next().unwrap_or_default())
+}
+
+/// The host of `host:port`, `[v6]:port` or a bare host, without user or port.
+fn authority_host(at: &str) -> &str {
+    let at = at.rsplit('@').next().unwrap_or_default();
+    if let Some(v6) = at.strip_prefix('[') {
+        return v6.split(']').next().unwrap_or_default();
+    }
+    match at.rsplit_once(':') {
+        // One colon: a port after a name or an IPv4 address; more: a bare IPv6 address.
+        Some((host, port)) if !host.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => at,
+    }
+}
+
+/// Each grant of `text` that reaches kiln itself, refused at its line: a network's destination
+/// (`NETWORK --egress=HOST:PORT`, D236) or a remote MCP server (`MCP <name> FROM <url>`), in any
+/// stage. Read with Shards' own parser, as `lint` passed it.
+fn reaching_kiln(text: &str, kiln: &Kiln) -> Vec<Diagnostic> {
+    use shards_agentfile::agentfile::{self, Directive, Direction};
+    use shards_agentfile::instructions::{self, Kind};
+    let Ok(parsed) = parser::parse_as(text.as_bytes(), parser::Dialect::Agentfile) else { return Vec::new() };
+    let Ok(read) = instructions::parse(&parsed, &rules::Linter::default()) else { return Vec::new() };
+    let commands: Vec<&instructions::Command> = read.stages.iter().flat_map(|s| &s.commands).collect();
+    let gateways: Vec<IpAddr> = commands
+        .iter()
+        .filter_map(|c| match &c.kind {
+            Kind::Agentfile(Directive::Network(n)) => Some(&n.gateways),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|g| std::str::from_utf8(g).ok()?.parse().ok())
+        .collect();
+    let mut out = Vec::new();
+    for c in commands {
+        let hosts: Vec<(Vec<u8>, u16)> = match &c.kind {
+            Kind::Agentfile(Directive::Network(n)) => n.ports.iter().filter(|(_, d)| *d == Direction::Egress).filter_map(|(p, _)| agentfile::destination_of(p)?.ok()).collect(),
+            Kind::Agentfile(Directive::Mcp(m)) => agentfile::mcp_endpoint(&m.source).into_iter().collect(),
+            _ => continue,
+        };
+        for (host, port) in hosts {
+            let host = String::from_utf8_lossy(&host).into_owned();
+            let Some(what) = kiln.itself(&host, &gateways) else { continue };
+            let what = match what {
+                Itself::Machine => "the machine kiln's runner is",
+                Itself::Server => "kiln's own server",
+            };
+            out.push(Diagnostic {
+                code: REACHES_KILN.into(),
+                severity: Severity::Error,
+                message: format!("{host}:{port} is {what}, which no Agentfile may grant: kiln's MCP rides the agent-control lane (D254)"),
+                path: "Agentfile".into(),
+                range: range(&c.location),
+                url: None,
+            });
+        }
+    }
+    out
 }
 
 /// A check's warning, as the lint subrequest's JSON says it: its detail, else its rule's description.
@@ -274,7 +450,7 @@ mod tests {
     /// and no base is resolved (none can be here) for a text that names one Shards would have to pull.
     #[test]
     fn step16_every_text_is_checked_in_process_without_resolving_bases() -> anyhow::Result<()> {
-        let c = crate::rt::block_on(async { Ok(check("FROM ubuntu:24.04\nFORM ubuntu\n").await) })?;
+        let c = crate::rt::block_on(async { Ok(check("FROM ubuntu:24.04\nFORM ubuntu\n", &Kiln::default()).await) })?;
         anyhow::ensure!(c.checked && c.refusal().is_some_and(|r| r.starts_with("dockerfile parse error on line 2: unknown instruction: FORM")), "{c:?}");
         let c = lint("FROM registry.example.invalid/nobody/base:1\nAGENT main FROM ./agent\nCMD echo hi\n");
         anyhow::ensure!(c.checked && c.diagnostics.is_empty(), "{c:?}");
@@ -295,5 +471,101 @@ mod tests {
     fn step16_an_empty_text_is_refused_as_shards_refuses_it() {
         let c = lint("");
         assert_eq!(c.refusal().as_deref(), Some("line 1: the Dockerfile cannot be empty"));
+    }
+
+    /// A kiln whose server is `kiln.example.test`, and 10.1.2.3 among its certificate's names.
+    fn kiln() -> Kiln {
+        let mut server = crate::config::Server::default();
+        server.public_url = "https://kiln.example.test/".into();
+        server.tls_names = vec!["10.1.2.3".into()];
+        Kiln::of(&server)
+    }
+
+    /// An agent's network out to `grant`, its boundary open on 443 and 7070, and a remote MCP server
+    /// from `mcp` where one is given (line 6): a text Shards passes.
+    fn granting(grant: &str, mcp: Option<&str>) -> String {
+        let mut text = format!("FROM ubuntu:24.04\nAGENT main FROM ./agent\nNETWORK --egress={grant} out FOR main\nEXPOSE --agents=main 443/tcp 7070/tcp AS egress FOR out\nCONNECT main WITH main ON out\n");
+        if let Some(url) = mcp {
+            text.push_str(&format!("MCP tools FROM {url} FOR main\n"));
+        }
+        text
+    }
+
+    /// kiln's own rule (ROOT, 2026-11-13): a destination or a remote MCP server that is kiln itself (the
+    /// machine its runner is, or kiln's server) is refused at its line, typed, saying kiln's MCP rides
+    /// the agent-control lane; Shards passed each text.
+    #[test]
+    fn step18_a_grant_that_reaches_kiln_is_refused_at_its_line() -> anyhow::Result<()> {
+        let kiln = kiln();
+        let cases = [
+            (granting("host.docker.internal:7070", None), 3),
+            (granting("127.0.0.1:7070", None), 3),
+            (granting("169.254.1.1:7070", None), 3),
+            (granting("kiln.example.test:443", None), 3),
+            (granting("10.1.2.3:7070", None), 3),
+            (granting("api.github.com:443", Some("http://host.docker.internal:7070/api/mcp")), 6),
+            (granting("api.github.com:443", Some("https://KILN.example.test/api/mcp")), 6),
+        ];
+        for (text, line) in cases {
+            let shards = lint(&text);
+            anyhow::ensure!(shards.refusal().is_none(), "Shards refused {text:?}: {shards:?}");
+            let c = with_kiln(shards, &text, &kiln);
+            let ours: Vec<&Diagnostic> = c.diagnostics.iter().filter(|d| d.code == REACHES_KILN).collect();
+            let [d] = ours.as_slice() else { anyhow::bail!("{text:?}: {c:?}") };
+            anyhow::ensure!(d.severity == Severity::Error && (d.range.start.line, d.range.end.line) == (line, line), "{text:?}: {d:?}");
+            anyhow::ensure!(d.message.ends_with("kiln's MCP rides the agent-control lane (D254)"), "{d:?}");
+            anyhow::ensure!(c.refusal().is_some_and(|r| r.starts_with(&format!("line {line}: "))), "{c:?}");
+        }
+        Ok(())
+    }
+
+    /// A third party's remote MCP server, and destinations that aren't kiln, stay grantable: default deny
+    /// already names them, and refusing them would break what people run today.
+    #[test]
+    fn step18_a_third_partys_mcp_server_still_passes() {
+        let text = granting("api.github.com:443", Some("https://api.githubcopilot.com/mcp/"));
+        let c = with_kiln(lint(&text), &text, &kiln());
+        assert!(c.checked && c.refusal().is_none() && c.diagnostics.iter().all(|d| d.code != REACHES_KILN), "{c:?}");
+        let text = granting("10.1.2.4:7070", None);
+        assert!(with_kiln(lint(&text), &text, &kiln()).refusal().is_none());
+    }
+
+    /// kiln's server is every host its configuration names, a name by its name in any case and an
+    /// address by its address; an address it listens on everywhere names none; the machine's own
+    /// names and addresses are kiln whatever the configuration.
+    #[test]
+    fn step18_kiln_is_what_its_configuration_names() -> anyhow::Result<()> {
+        let mut server = crate::config::Server::default();
+        server.public_url = "https://user@Kiln.Example.test:8443/x".into();
+        server.pages_url = Some("https://pages.example.test".into());
+        server.quic_advertise = "[2001:db8::7]:7071".into();
+        server.http_addr = "0.0.0.0:7070".into();
+        server.quic_addr = "192.0.2.10:7071".into();
+        server.tls_names = vec!["kiln.lan".into(), "198.51.100.4".into()];
+        let k = Kiln::of(&server);
+        for host in ["kiln.example.test", "KILN.EXAMPLE.TEST", "pages.example.test", "kiln.lan", "2001:db8::7", "[2001:db8::7]", "192.0.2.10", "198.51.100.4"] {
+            anyhow::ensure!(k.itself(host, &[]) == Some(Itself::Server), "{host}: {k:?}");
+        }
+        for host in ["host.docker.internal", "127.0.0.2", "::1", "0.0.0.0", "169.254.0.9", "fe80::1"] {
+            anyhow::ensure!(Kiln::default().itself(host, &[]) == Some(Itself::Machine), "{host}");
+        }
+        // A network's declared gateway is the machine too (D31's `host-gateway`).
+        let gateway: IpAddr = "10.9.0.1".parse()?;
+        anyhow::ensure!(Kiln::default().itself("10.9.0.1", &[gateway]) == Some(Itself::Machine) && Kiln::default().itself("10.9.0.1", &[]).is_none());
+        for host in ["api.github.com", "192.0.2.11", "kiln.example.test.evil"] {
+            anyhow::ensure!(k.itself(host, &[]).is_none(), "{host}");
+        }
+        Ok(())
+    }
+
+    /// Every built-in passes kiln's rule as it passes Shards' check: none grants a way to kiln.
+    #[test]
+    fn step18_no_builtin_grants_a_way_to_kiln() -> anyhow::Result<()> {
+        let kiln = Kiln::of(&crate::config::Server::default());
+        for b in crate::agentfiles::builtin::ALL {
+            let c = with_kiln(lint(b.text), b.text, &kiln);
+            anyhow::ensure!(c.checked && c.refusal().is_none(), "{}: {c:?}", b.name);
+        }
+        Ok(())
     }
 }
