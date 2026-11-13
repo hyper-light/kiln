@@ -540,6 +540,57 @@ mod tests {
         Ok(())
     }
 
+    /// An Apple program an agent's shell double-forked (`sh -c '… &'`, its parent gone before it's listed) shows no
+    /// environment on macOS 26, so no mark: the sweep still finds it as the agent's, and ending the agent ends it.
+    #[test]
+    fn what_an_agent_double_forked_before_it_was_followed_is_its_and_ends_with_it() -> anyhow::Result<()> {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        let session = format!("df{}", std::process::id());
+        hold_agents();
+        let group = Group::of(&session).ok_or_else(|| anyhow::anyhow!("no kqueue"))?;
+        // Started as kiln starts a harness (a process group of its own, marked), its inner shell gone at once.
+        let mut harness = Command::new("/bin/sh");
+        harness.args(["-c", "/bin/sh -c '/bin/sleep 43 >/dev/null 2>&1 & echo $!'; exec /bin/sleep 44"]);
+        harness.env(crate::harness::survivors::MARK, &session).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).process_group(0);
+        let mut child = harness.spawn()?;
+        let mut line = String::new();
+        if let Some(out) = child.stdout.take() {
+            std::io::BufReader::new(out).read_line(&mut line)?;
+        }
+        let orphan: i32 = line.trim().parse()?;
+        // Reparented (its shell exited) before its harness is followed: no fork of a followed process shows it.
+        for _ in 0..100 {
+            if parent(orphan) == Some(1) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = child.id();
+        group.started(pid);
+        let t = tracker().ok_or_else(|| anyhow::anyhow!("no kqueue"))?;
+        t.sweep();
+        let whose = session_of(u32::try_from(orphan)?);
+        let listed = group.pids().contains(&u32::try_from(orphan)?);
+        group.kill();
+        let _ = child.wait();
+        let left = alive(orphan);
+        if left {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(orphan), nix::sys::signal::Signal::SIGKILL);
+        }
+        group.remove();
+        anyhow::ensure!(whose.as_deref() == Some(session.as_str()), "the double-forked /bin/sleep {orphan} isn't the agent's: {whose:?}");
+        anyhow::ensure!(listed, "the double-forked /bin/sleep {orphan} isn't among the agent's processes");
+        anyhow::ensure!(!left, "the double-forked /bin/sleep {orphan} outlived the agent");
+        Ok(())
+    }
+
+    /// Process `pid`'s parent, as `ps` says it.
+    fn parent(pid: i32) -> Option<u32> {
+        let out = Command::new("ps").args(["-o", "ppid=", "-p", &pid.to_string()]).output().ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+
     /// What `launchctl` starts is read from its arguments, for every way it starts a job.
     #[test]
     fn what_launchctl_starts_is_read_from_its_arguments() {

@@ -688,6 +688,42 @@ mod tests {
         Ok(())
     }
 
+    /// An Apple program a session's shell double-forked (`sh -c '… &'`, the shell gone at once) shows no environment
+    /// on macOS 26, so no mark: a look still finds it apart from its harness, as the session's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn what_a_session_double_forked_is_found_apart_without_its_mark() -> anyhow::Result<()> {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        let id = format!("forked-{}", std::process::id());
+        // Started as kiln starts a harness: a process group of its own, marked.
+        let mut harness = std::process::Command::new("/bin/sh")
+            .args(["-c", "/bin/sh -c '/bin/sleep 45 >/dev/null 2>&1 & echo $!'; exec /bin/sleep 46"])
+            .env(MARK, &id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()?;
+        let mut line = String::new();
+        if let Some(out) = harness.stdout.take() {
+            std::io::BufReader::new(out).read_line(&mut line)?;
+        }
+        let orphan: u32 = line.trim().parse()?;
+        let sessions = [(id.clone(), Some(harness.id()))];
+        // Looked at again until its shell has gone (it's under the harness until then), up to a hang's bound.
+        let until = std::time::Instant::now() + Duration::from_secs(60);
+        let mut seen = scan(&sessions);
+        while !seen.get(&id).is_some_and(|s| s.apart.iter().any(|r| r.pid == orphan)) && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(100));
+            seen = scan(&sessions);
+        }
+        let found = seen.get(&id).is_some_and(|s| s.apart.iter().any(|r| r.pid == orphan));
+        stop(&[orphan, harness.id()]);
+        let _ = harness.wait();
+        anyhow::ensure!(found, "the double-forked /bin/sleep {orphan} isn't found apart: {:?}", seen.get(&id));
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn what_a_harness_s_helper_runs_is_the_harness_s_and_never_left_running() -> anyhow::Result<()> {
