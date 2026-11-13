@@ -121,7 +121,8 @@ fn write_out_of(base: &Path, carried: &[Carried], signer: &Signer) -> anyhow::Re
     Ok(held)
 }
 
-/// What's carried, named: the SHA-256 of each executable's length and bytes, its first 12 hex digits.
+/// What's carried, named: the SHA-256 of each executable's length and bytes, its first 12 hex digits, as Shards
+/// names its own helpers' folder by theirs (its `helpers.rs`, D182) and moby its IDs (`stringid.TruncateID`).
 fn hash_of(carried: &[Carried]) -> String {
     let mut h = Sha256::new();
     for c in carried {
@@ -343,7 +344,7 @@ mod tests {
         let id = hash_of(&carried);
         assert_eq!(format!("{id}{}", Signer::NotNeeded.tag()), id);
         assert_eq!(format!("{id}{}", Signer::AdHoc.tag()), format!("{id}-a"));
-        assert_eq!(Signer::Kiln("0123456789ABCDEF".into()).tag(), "-k01234567");
+        assert_eq!(Signer::Kiln("2B69812442C0B2F687D4E3A7457F270114BB36D6".into()).tag(), "-k2b69812442c0b2f687d4e3a7457f270114bb36d6");
         assert_ne!(hash_of(&fake([b"s", b"v", b"n2"])), id);
     }
 

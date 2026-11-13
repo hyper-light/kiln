@@ -70,10 +70,11 @@ pub enum Signer {
 }
 
 impl Signer {
-    /// What tells one signer's copies from another's in a folder's name: none where nothing is signed.
+    /// What tells one signer's copies from another's in a folder's name: none where nothing is signed;
+    /// kiln's identity whole (its SHA-1, as `security find-identity` names it), so no two identities share one.
     pub fn tag(&self) -> String {
         match self {
-            Self::Kiln(id) => format!("-k{}", id.get(..8).unwrap_or(id).to_ascii_lowercase()),
+            Self::Kiln(id) => format!("-k{}", id.to_ascii_lowercase()),
             Self::AdHoc => "-a".to_owned(),
             Self::NotNeeded => String::new(),
         }
