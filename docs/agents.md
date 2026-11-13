@@ -1094,6 +1094,102 @@ read and any made current again (as a new version), and deleted with its version
 asked in place. A new one is written in place on the list; kiln's are read there and copied as
 yours, under a name that isn't kiln's, to change.
 
+### What an isolated agent is
+
+An isolated agent runs its harness in a Linux microVM of its own instead of as a process on its
+machine. kiln drives it as it drives any agent: the same session, the same harness protocol, the
+same controls. It reaches only what its Agentfile grants: no folder of the machine but the volumes
+given to it, no network but the ports and hosts its grants name, nothing coming in.
+
+- **Asking for one.** The composer's Agentfile choice (above); `agents.start` with `isolation:
+  "microvm"`; or `POST /api/harness/sessions` with `spec.isolation` (docs/api.md, "Agentfiles").
+- **What it starts is isolated too.** An agent an isolated agent starts runs in a microVM of its
+  own as well. Asked for as a process on its machine (`isolation: "none"`), it's refused: "an
+  isolated agent's agents are isolated too: it can't start one as a process on its machine".
+- **Where it runs.** Only on a runner that says it starts microVMs (its facts' `virt.microvm`, the
+  need `microvm`). Anywhere else it's refused, never run as a process.
+- **Not yet.** No runner starts microVMs yet: a runner's kiln starts them once it carries Shards,
+  and Hex to run them. Until then every isolated start is refused, saying so. The rest of this
+  section is what one gets once its start goes through.
+
+### What kiln's Agentfiles give it
+
+kiln ships an Agentfile for each harness it drives, `harness-<id>`. Read one on the Agentfiles page
+(Agents → Agentfiles), or in kiln's repository at `.kiln/images/harness-<id>/`. Each one holds:
+
+- **The publisher's own Linux build**, pinned by its version and the checksum its publisher
+  publishes, for amd64 and arm64, and checked as kiln fetches it. kiln turns off a harness's own
+  updater where it has one, so the pinned version is the one that runs. Gemini CLI, whose Linux
+  build is an npm package, runs on a pinned Node.js of its own.
+- **How kiln drives it**, in its `harness.json`: the program and the protocol kiln's adapter speaks
+  (the harness table at the top of this page).
+- **Its network, every part named.** Names resolve through the microVM's resolver, TCP 443 goes
+  out, and nothing comes in; no other port or protocol goes out. TCP 443 goes to any address for
+  now: naming each provider's hosts instead (Shards' destinations by name) comes with a kiln that
+  carries such a Shards.
+- **Your project at `/workspace`**, until kiln plugs it in at the path it has on your machine, so
+  that the same absolute paths work inside and out.
+- **A volume of yours**, given to it at run time, where the harness keeps its settings, sign-in,
+  history and sessions (the table below).
+- **No credential.** An image is shared; your sign-in isn't (below).
+
+| Harness | Agentfile | Your volume |
+|---|---|---|
+| Claude Code | `harness-claude` | `/home/claude`, its whole HOME |
+| Codex | `harness-codex` | `/home/codex/.codex`, its `CODEX_HOME` |
+| Gemini CLI | `harness-gemini` | `/home/gemini`, its whole HOME |
+| opencode | `harness-opencode` | `/home/opencode`, its config, data, state and cache |
+| Goose | `harness-goose` | `/home/goose/.local/share/goose` |
+| Amp | `harness-amp` | `/home/amp`, its config, data and state |
+| Devin | `harness-devin` | `/home/devin/.config/devin` and `/home/devin/.local/share/devin` |
+| Antigravity CLI | `harness-antigravity` | `/home/antigravity`, its whole HOME |
+| Cursor CLI | `harness-cursor` | `/home/cursor`, its whole HOME |
+| Pi | `harness-pi` | `/home/pi/.pi/agent` |
+
+The harness sees its image read-only, so only your volume makes its files writable and lasting.
+Where your volume is less than its whole HOME, the rest of its HOME (a `git config --global`, say)
+is on the microVM's scratch and goes when the microVM does. No volume goes under `/tmp`, which is
+each harness's scratch.
+
+Its base is `buildpack-deps:trixie-scm`, pinned by digest: git, an ssh client, curl and CA
+certificates, for both platforms. For your project's own toolchain, copy kiln's Agentfile into one of
+yours and set its `ARG BASE` to your project's image, or add what your project needs to it. Claude
+Code's Agentfile also builds on a musl base (`CLAUDE_LIBC=musl`). What each harness needs of its base
+is in its notes (below, "Notes per harness") and its pin's records (`docs/research/s19-claude-agentfile`
+to `s28-pi-agentfile`).
+
+### Signing in, and your credentials
+
+- **None in an image.** kiln's Agentfiles carry no credential, and neither should yours: whoever can
+  read an image can read what's in it. A key or a token belongs to a run, given to its harness alone.
+- **Yours stay in your volume.** What a harness keeps of its sign-in it keeps in your volume, which
+  no other person's agent is given.
+- **Signing in.** The harness's own sign-in, as the account card runs it on a machine today
+  ("Signing harnesses in and out"), will run inside its microVM, on its own terminal. Not yet: kiln
+  has no terminal into a microVM yet.
+- **Where credentials are going.** No real value inside the microVM at all: kiln keeps it (in its
+  secret store, Veil's later), the harness holds a placeholder, and the microVM's own egress puts the
+  real value in only for the hosts that credential is granted to, never for any other. You sign in
+  once, the token's refresh happens outside the microVM, and a run's credentials are revoked as it
+  ends. A harness that pins its certificates, or checks its token itself, gets its value in a file
+  on the microVM's scratch instead, revoked as the run ends, each such case listed. Not yet built.
+
+### What an isolated agent can't do
+
+- **Use your machine's own tools.** The microVM is Linux. Xcode, the macOS SDKs and simulators, MSVC
+  and the Windows SDK aren't in it and can't be. Work that needs them runs on the machine itself: an
+  agent started as a process (no isolation). An isolated agent can't start one (above): start it
+  from your own session, or from an agent that isn't isolated.
+- **Reach what its Agentfile doesn't grant.** No other folder, port, host or device of the machine.
+  kiln's own MCP is reached the same way, through a grant naming kiln's address and port, which
+  kiln's Agentfiles don't make yet.
+- **Use a tool its image doesn't have.** The project's toolchain comes from the image: build your
+  own Agentfile on your project's image (above).
+- **Not yet**, as well as the start itself: the project at its own path; a terminal into the
+  microVM, its sign-in and exec there; kiln reading its sessions from your volume to resume them;
+  and the commands it asks kiln to run on other machines, which run in microVMs too or not at all,
+  never on a bare host.
+
 ## The Changes tab
 
 An agent's Changes tab shows what it changed, its change request above (see "Change requests from

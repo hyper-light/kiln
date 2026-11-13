@@ -1,0 +1,15 @@
+host Linux 7.3.3-1-cachyos x86_64 adacachy2
+674161d08555d7eb02f8ae5867c252105d366f35d21dc7a4ae5aa04cd4548b6e  src/unpack.rs
+d68fbebb0324d5a65b3cefe10d8b8ceb48e84500799462a498f63bbdcaa465bf  src/unpack/tests.rs
+8bde0bc3b19c8d8f0ba298d55d098a86ac95fc1384fce4db164d25efaac11fd4  mutants.py
+control: exit 0
+M1 a skipped file is written: exit 101; failing: unpack::tests::codex_arm64s_tree_skips_its_rg_and_ripgreps_static_rg_takes_its_place
+M2 no Missing for a skip path the archive lacks: exit 101; failing: unpack::tests::a_skipped_path_is_one_regular_file_the_archive_holds
+M3 skipped files left out of the totals: exit 101; failing: unpack::tests::a_skipped_file_counts_in_the_trees_totals, unpack::tests::codex_arm64s_tree_skips_its_rg_and_ripgreps_static_rg_takes_its_place
+M4 a directory at a skip path taken: exit 101; failing: unpack::tests::a_skipped_path_is_one_regular_file_the_archive_holds
+M5 skip paths not held inside the tree: exit 101; failing: unpack::tests::a_skipped_path_is_one_regular_file_the_archive_holds
+M6 a skip path named twice taken: exit 101; failing: unpack::tests::a_skipped_path_is_one_regular_file_the_archive_holds
+M7 skip not a tree's field when parsed: exit 101; failing: unpack::tests::a_trees_skip_is_a_trees_field
+restored: exit 0
+MUTANTS_ALL_CAUGHT
+kiln exit 0

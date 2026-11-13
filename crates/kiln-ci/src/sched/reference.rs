@@ -50,8 +50,14 @@
 //!   mode, what they ask in resource mode), never overcommitted. An ordinary leg takes a slot of
 //!   the share no exclusive leg holds (slots mode), or fits beside what's held within capacity ×
 //!   overcommit (resource mode); none while an exclusive leg holds the runner whole.
-//! - The best runner (W05-R23, without preferences): least loaded, then most free slots, then
-//!   name.
+//! - The best runner (W05-R23, without preferences): the load balancer's (docs/lb.md "The CI
+//!   engine"), the most whole CPUs free for an ordinary leg (its free slots' share of the CPUs no
+//!   exclusive leg holds, its slots as CPUs where its size isn't known, in slots mode; what its
+//!   capacity × overcommit leaves in resource mode; none while a leg holds it whole); between
+//!   runners as free, the one the engine's load balancer took (its turn, or its kind's good place:
+//!   the kernel's to keep, tested in `lb` and `sched::balance`), which must be one of them, else by
+//!   name. A leg is offered to the runners it may run on in that rank, by name among equals, and
+//!   a leg a runner takes goes to the best runner too.
 //! - Attempts end: success and failure settle the leg; `runner-lost` is retried once, then settles
 //!   (W05-R16); a runner refusing a leg puts it back in the queue, same attempt, kept off that
 //!   runner unless it was draining (W05-R02, R35); refused by a runner at work that alone could
@@ -111,7 +117,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::retry::{Failed, FailureClass};
 use super::routing::{LegRoute, RunnerView};
-use super::state::{Class, ClassConfig, Command, Config, Cpus, FairBy, Fence, Gang, Input, LeaseLoss, LegIn, Outcome, REFUSED_AGAIN_MS, Resources, RunnerIn, Scheduler, default_classes, own_order};
+use super::state::{Class, ClassConfig, Command, Config, Cpus, FairBy, Fence, Gang, Input, LeaseLoss, LegIn, Outcome, REFUSED_AGAIN_MS, Resources, RunnerIn, Scheduler, default_classes, own_order, slots_left};
 use super::tests::Draw;
 use crate::facts::RunnerFacts;
 
@@ -446,6 +452,38 @@ fn signature(l: &LegIn) -> String {
     labels.join(",")
 }
 
+/// The load balancer's rank of runner `r` with legs `on` on it (docs/lb.md "The CI engine"): the
+/// whole CPUs free for an ordinary leg there, as the engine tells the kernel them. Slots mode: its
+/// free slots' share of the CPUs no exclusive leg holds (its slots as CPUs where its size isn't
+/// known); resource mode: what its capacity × overcommit leaves beside what's used; none while a
+/// leg holds it whole.
+fn rank_of(cfg: &Config, r: &RunnerIn, on: &[&LegIn]) -> u64 {
+    let size = size(r);
+    if on.iter().any(|l| claim(l, size) == Some(Claim::Whole)) {
+        return 0;
+    }
+    let held = on.iter().filter_map(|l| match claim(l, size) {
+        Some(Claim::Share(q)) => Some(q),
+        _ => None,
+    });
+    let held = held.fold(Resources::default(), |a, q| sum(a, &q));
+    let room = match (cfg.resources, r.capacity) {
+        (true, Some(cap)) => {
+            let used = on.iter().fold(Resources::default(), |a, l| sum(a, &l.request));
+            let limit = u128::from(cap.cpu.saturating_sub(held.cpu).get()) * u128::from(cfg.overcommit_cpu) / 1000;
+            u64::try_from(limit).unwrap_or(u64::MAX).saturating_sub(used.cpu.saturating_sub(held.cpu).get())
+        }
+        _ => {
+            let all = size.map_or_else(|| u64::from(r.slots.max(1)) * 1000, |s| s.cpu.get());
+            let left = slots_left(r.slots, size, &held);
+            let ordinary = on.iter().filter(|l| claim(l, size).is_none()).count();
+            let free = left.saturating_sub(ordinary);
+            u64::try_from(u128::from(all.saturating_sub(held.cpu.get())) * free as u128 / left.max(1) as u128).unwrap_or(u64::MAX)
+        }
+    };
+    room / 1000
+}
+
 /// Whether a runner carries every label a leg asks for.
 fn carries(r: &RunnerIn, l: &LegIn) -> bool {
     l.route.labels.iter().all(|x| r.view.labels.iter().any(|y| y.eq_ignore_ascii_case(x)))
@@ -500,6 +538,9 @@ struct Reference {
     whole: u64,
     kept_whole: u64,
     back: u64,
+    /// Where the engine put each leg after the input being handled, when the differential test
+    /// says it: of the runners the load balancer can't tell apart, the one a leg goes to.
+    oracle: BTreeMap<String, String>,
 }
 
 impl Reference {
@@ -535,6 +576,7 @@ impl Reference {
             whole: 0,
             kept_whole: 0,
             back: 0,
+            oracle: BTreeMap::new(),
         }
     }
 
@@ -864,7 +906,9 @@ impl Reference {
             if self.cfg.backfill && passed.iter().any(|(c, p)| *p && *c <= class) && self.reserve(runner, &passed, class, now) {
                 continue;
             }
-            self.assign(&id, runner, now, over);
+            // It goes to the best runner that takes it now: this one, or one as free or freer.
+            let to = self.best(&id).unwrap_or_else(|| runner.to_owned());
+            self.assign(&id, &to, now, over);
         }
     }
 
@@ -959,9 +1003,10 @@ impl Reference {
             return;
         }
         let Some(l) = self.legs.get(id) else { return };
-        let mut runners: Vec<&Runner> = self.runners.values().filter(|r| self.may_run(l, r)).collect();
-        runners.sort_by(|a, b| self.better(a, b));
-        let runners: Vec<String> = runners.into_iter().map(|r| r.input.id.clone()).collect();
+        // The most free first, by name among equals.
+        let mut runners: Vec<(std::cmp::Reverse<u64>, String)> = self.runners.values().filter(|r| self.may_run(l, r)).map(|r| (std::cmp::Reverse(self.rank(&r.input)), r.input.id.clone())).collect();
+        runners.sort();
+        let runners: Vec<String> = runners.into_iter().map(|(_, r)| r).collect();
         for r in runners {
             if !self.legs.get(id).is_some_and(|l| matches!(l.at, At::Queued(..))) {
                 return;
@@ -1279,9 +1324,9 @@ impl Reference {
 
     /// Where a whole gang would start now, if it can: each member, in queue order, on a runner
     /// that would take it with room for it beside the members put there before it, as the room
-    /// kept there lets it, the least loaded first (the fewest legs, counting those members), then
-    /// by name; where a member has no such runner, the members before it put elsewhere, in that
-    /// order, trying at most 4,096 places in all.
+    /// kept there lets it, in the load balancer's rank (the most whole CPUs free, counting those
+    /// members), then by name; where a member has no such runner, the members before it put
+    /// elsewhere, in that order, trying at most 4,096 places in all.
     fn gang_plan(&self, g: &str) -> Option<Vec<(String, String)>> {
         self.plan_gang(g, true)
     }
@@ -1315,14 +1360,13 @@ impl Reference {
 
     fn gang_places(&self, m: &str, plan: &[(String, String)], held: bool) -> Vec<String> {
         let Some(l) = self.legs.get(m) else { return Vec::new() };
-        let mut places: Vec<(usize, String)> = Vec::new();
+        let mut places: Vec<(std::cmp::Reverse<u64>, String)> = Vec::new();
         for r in self.runners.values().filter(|r| r.connected && carries(&r.input, &l.input) && self.admits(r, l)) {
             let mates: Vec<&LegIn> = plan.iter().filter(|(_, on)| *on == r.input.id).filter_map(|(x, _)| self.legs.get(x)).map(|x| &x.input).collect();
             let mut on: Vec<&LegIn> = self.on(&r.input.id).iter().filter_map(|id| self.legs.get(id)).map(|x| &x.input).collect();
-            let running = on.len();
             on.extend(mates.iter().copied());
             if room(&self.cfg, &r.input, &on, &l.input) && (!held || self.allowed(r, l, &mates)) {
-                places.push((running + mates.len(), r.input.id.clone()));
+                places.push((std::cmp::Reverse(rank_of(&self.cfg, &r.input, &on)), r.input.id.clone()));
             }
         }
         places.sort();
@@ -1524,21 +1568,27 @@ impl Reference {
         on.into_iter().map(|(_, id)| id.clone()).collect()
     }
 
-    /// The best runner a leg may run on now, as the room kept there lets it: least loaded, then
-    /// most free slots, then name.
+    /// The best runner a leg may run on now, as the room kept there lets it: the most whole CPUs
+    /// free ([`Self::rank`]); of runners as free, the one the engine's load balancer took, when
+    /// it's one of them, else by name.
     fn best(&self, id: &str) -> Option<String> {
         let l = self.legs.get(id)?;
-        let best = self.runners.values().filter(|r| self.may_run(l, r) && self.allowed(r, l, &[])).min_by(|a, b| self.better(a, b));
-        best.map(|r| r.input.id.clone())
+        let may: Vec<(u64, &String)> = self.runners.values().filter(|r| self.may_run(l, r) && self.allowed(r, l, &[])).map(|r| (self.rank(&r.input), &r.input.id)).collect();
+        let top = may.iter().map(|(k, _)| *k).max()?;
+        let equals: Vec<&String> = may.into_iter().filter(|(k, _)| *k == top).map(|(_, r)| r).collect();
+        match self.oracle.get(id) {
+            Some(took) if equals.contains(&took) => Some(took.clone()),
+            _ => equals.first().map(|r| (*r).clone()),
+        }
     }
 
-    /// Which of two runners a leg goes to first: the less loaded, then the one with more free
-    /// slots, then by name.
-    fn better(&self, a: &Runner, b: &Runner) -> std::cmp::Ordering {
-        let load = |r: &Runner| (self.on(&r.input.id).len() as u128, u128::from(r.input.slots.max(1)));
-        let ((na, sa), (nb, sb)) = (load(a), load(b));
-        (na * sb).cmp(&(nb * sa)).then_with(|| sb.saturating_sub(nb).cmp(&sa.saturating_sub(na))).then_with(|| a.input.id.cmp(&b.input.id))
+    /// The load balancer's rank of a runner (docs/lb.md "The CI engine"): [`rank_of`] the legs on
+    /// it.
+    fn rank(&self, r: &RunnerIn) -> u64 {
+        let on: Vec<&LegIn> = self.on(&r.id).iter().filter_map(|id| self.legs.get(id)).map(|l| &l.input).collect();
+        rank_of(&self.cfg, r, &on)
     }
+
 
     /// Whether a runner takes a leg now: it would ([`Self::admits`]), it carries the leg's labels,
     /// and it has room for it.
@@ -2111,10 +2161,12 @@ fn run(cfg: &Config, epoch: u64, steps: &[(Step, i64)], mut tell: impl FnMut(&st
         }
         let before = r.placement();
         let commands = s.handle(step.input(), *now);
+        let theirs = engine(cfg, &s, step, &before, &commands, &runners, &legs).map_err(|why| (applied.clone(), format!("the engine broke an invariant: {why}")))?;
+        // Of runners its load balancer can't tell apart, the reference takes the one it took.
+        r.oracle = theirs.0.iter().map(|(l, (runner, ..))| (l.clone(), runner.clone())).collect();
         r.handle(step, *now);
         let mine = r.placement();
         tell(&format!("{:>4}:{:02} {}\n      {}", now / MINUTE, now % MINUTE / 1000, step.words(), show(&mine)));
-        let theirs = engine(cfg, &s, step, &before, &commands, &runners, &legs).map_err(|why| (applied.clone(), format!("the engine broke an invariant: {why}")))?;
         if theirs != mine {
             return Err((applied, format!("they part:\n  engine:    {}\n  reference: {}", show(&theirs), show(&mine))));
         }

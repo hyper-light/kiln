@@ -150,11 +150,12 @@ its CPUs' M/M/m knee, 74% for 8 CPUs and 86% for 32, and all its available memor
 memory, so memory is never placed past what a runner has. A runner confined to some of its
 machine's CPUs (an affinity, a cgroup's quota) counts the machine's load on them, the machine's
 spread over all its CPUs, so its load against its CPUs is the machine's against its cores. Among
-those it takes its preferences' best (W05-R23) when the job or a rule declares any, then the one it
-leaves the most headroom: the larger of its CPUs' and its memory's share in use after it, its I/O
-pressure on top, the lowest; then the least loaded. A runner whose latest sample is over a minute
-old is placed as before samples, by its room alone, after the runners with one. A v1 job goes by
-the same rule. One that
+those it takes its preferences' best (W05-R23) when the job or a rule declares any, else the load
+balancer's pick (docs/lb.md "The CI engine"): the most free cores at the runner's measured speed
+(what its slots or capacity leave and, by its latest sample, what it can take within its target
+use, less the time its tasks all stalled on memory and on I/O), and between runners as free, the
+one where the leg's kind of work (its job and matrix) last went well, else the next in turn. A v1
+job goes to the server's kernel's pick first, else by the most headroom (docs/pipelines.md). One that
 can't go anywhere yet waits saying why: `oversized` when it asks for more than any eligible runner
 has, naming what each has ("Too big for any runner"), `headroom` while every runner with room
 would pass the target with it ("Runners at their target use"), `capacity` while none has room,
@@ -166,8 +167,9 @@ for ("waiting for 14 CPUs and 1 GiB of memory free on a linux/x86_64 runner: a i
 room about 09:42"). Fair share between repositories counts the CPUs legs ask, so a repository of
 big legs gets no more of the fleet than one of small legs at the same weight.
 
-**One rule, in the shape Hex's placement takes.** The engine and the v1 dispatcher place through
-one function, `kiln_ci::sched::place` (reach ranks a command by the same measure): what's needed and
+**One rule, in the shape Hex's placement takes.** The engine checks a runner's target use, and the
+v1 dispatcher places, through one function, `kiln_ci::sched::place` (reach ranks a command by the
+same measure; the engine ranks by the load balancer, docs/lb.md "The CI engine"): what's needed and
 the nodes in, a node or a refusal saying why out, the shape of kiln-seams' `Placement`
 (docs/seams.md), whose suite it passes. Hex's placement (CP-T7.1, with priorities, quotas and fair
 share) takes its place behind that shape: which node, what's held for whom, and each node's use.
