@@ -4347,6 +4347,14 @@ impl Hub {
                 let own = inv.sessions.clone();
                 inv.sessions.extend(others);
                 self.harness.inventory(self, agent, me.as_deref(), &present, inv).await;
+                // A session a runner process was last known to hold that this server doesn't list (its
+                // restore at the start missed it): listed again now, crashed or offline, never left out.
+                let hub = Arc::clone(self);
+                crate::rt::spawn(async move {
+                    if let Err(e) = crate::harness::registry::Registry::restore_held(&hub).await {
+                        tracing::warn!(error = %format!("{e:#}"), "sessions runner processes were last known to hold couldn't be listed again: the next report tries again");
+                    }
+                });
                 // Those it holds that still read disconnected a little later: its link dropped and
                 // came back, and they've had nothing to say since. Their snapshots bring them back
                 // as they are. Not at once: after a server restart every session reads disconnected

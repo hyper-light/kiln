@@ -261,8 +261,28 @@ pub enum Refusal {
     Ended,
 }
 
+/// One end's word on what its TLS 1.3 handshake negotiated: its cipher suite and key exchange group,
+/// by rustls's names (`TLS13_AES_256_GCM_SHA384`, `X25519MLKEM768`), or by their IANA code where rustls
+/// names none (`0x1303`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Negotiated {
+    pub suite: String,
+    pub group: String,
+}
+
+/// The link a run's stdio rides into its boundary (a microVM's: Shards' agent control, kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 11), as each end says it negotiated: the controller's, on the
+/// machine, and the endpoint's own report from inside; and the lanes its controller was granted on it
+/// as it dialed, by Shards' names (`control`, `stdin:0`, `stdout:0`, `stderr:0`, `exec`, `mcp:0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub controller: Negotiated,
+    pub endpoint: Negotiated,
+    pub lanes: Vec<String>,
+}
+
 /// A run under way: what it's given on stdin, what it says (its output, then its end, once), the
-/// signals it's sent, and a way to end it.
+/// signals it's sent, a way to end it, and where its boundary holds it.
 pub trait Run: Send + Sync {
     /// Gives the program `bytes` on its stdin, after what it was given before; refused `Ended`
     /// once the run has ended.
@@ -277,6 +297,14 @@ pub trait Run: Send + Sync {
     /// Ends it, unless it has ended: its end is then `Exited(Killed)`. A microVM's run ends with its
     /// microVM.
     fn kill(&self);
+    /// Its boundary's own name for it, where its boundary names its runs (a microVM's, as its runtime
+    /// names it); none for a process of the machine's, which its pid names. The same each time.
+    fn id(&self) -> Option<String>;
+    /// The link its stdio rides into its boundary, as each end says it negotiated, once it's made: it
+    /// waits for the link's handshake and its endpoint's report. None at once for a run whose stdio
+    /// ride no link (a process of the machine's, whose stdio are its pipes), and none where its link
+    /// ends before it's made. Asked again, it says the same.
+    fn link(&self) -> BoxFuture<'_, Option<Link>>;
 }
 
 /// Harnesses launched in boundaries.
@@ -437,6 +465,15 @@ impl Run for SimRun {
     fn kill(&self) {
         self.state.lock().say(Output::Exited(Exit::Killed));
         self.said.notify(usize::MAX);
+    }
+
+    // Its runs are the host boundary's: no name of a boundary's, and their stdio no link.
+    fn id(&self) -> Option<String> {
+        None
+    }
+
+    fn link(&self) -> BoxFuture<'_, Option<Link>> {
+        Box::pin(async { None })
     }
 }
 
@@ -774,6 +811,22 @@ fn c11<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c12<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let launch = f.say("where");
+        let host = launch.boundary == Boundary::Host;
+        let run = fine("launch", f.sandbox().launch(launch).await)?;
+        let (id, link) = (run.id(), run.link().await);
+        if host {
+            same("a process of the machine's id", id.clone(), None)?;
+            same("a process of the machine's link", link.clone(), None)?;
+        }
+        drain(run.as_ref()).await;
+        same("its id, asked again after its end", run.id(), id)?;
+        same("its link, asked again after its end", run.link().await, link)
+    })
+}
+
 /// The `Sandbox` contract, clause by clause (docs/seams.md, "Sandbox").
 pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
     vec![
@@ -807,6 +860,11 @@ pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
             id: "SANDBOX-11",
             says: "a run sent a signal to end ends, its end said once, and a signal after its end is refused Ended; a sandbox that delivers no signals refuses one Unsupported, and its run goes on",
             check: c11::<F>,
+        },
+        Case {
+            id: "SANDBOX-12",
+            says: "a run on the host has no id of a boundary's and no link, and a run says the same id and link after its end as before",
+            check: c12::<F>,
         },
     ]
 }

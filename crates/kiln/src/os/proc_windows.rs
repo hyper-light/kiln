@@ -539,6 +539,15 @@ impl Duplex {
         (!matches!(&*self.job.lock(), Held::Boundary(_))).then_some(self.pid)
     }
 
+    /// The boundary's run that holds it, where one does (a microVM's member): its name there, its
+    /// image and the link its stdio rides.
+    pub fn boundary(&self) -> Option<Arc<crate::sandbox::held::Held>> {
+        match &*self.job.lock() {
+            Held::Boundary(h) => Some(Arc::clone(h)),
+            _ => None,
+        }
+    }
+
     /// Let go of the harness without stopping it, for the runner after this one to take over
     /// ([`adopt_duplex`]) across a successor upgrade: its pump and stdin threads are stopped without
     /// closing the pipes (an aborted blocking `ReadFile` consumes nothing, so what it hadn't read
