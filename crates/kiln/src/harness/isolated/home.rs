@@ -77,6 +77,46 @@ pub fn adopt(state: &Path) -> Vec<Adopted> {
     out
 }
 
+/// Where kiln keeps, beside a person's volumes for `harness` under `root`, the image each of their
+/// conversations ran in (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17, goal 65's finding): a
+/// folder beside the harness's own, outside every volume beneath that, so no harness writes it.
+pub fn ran_in_dir(root: &Path, person: &str, harness: &str) -> Result<PathBuf, Refusal> {
+    Ok(root.join(person_dir(person)?).join(format!("{harness}.ran-in")))
+}
+
+/// The image a conversation ran in, kept beside its person's volume, for a pick-up to go on in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RanIn {
+    /// Its harness's own id for it.
+    pub conversation: String,
+    /// The Agentfile it ran in, as a start names one: kiln's (`harness-claude`) or its person's own
+    /// (`agentfile:<id>`).
+    pub agentfile: String,
+    /// That Agentfile's text's SHA-256, hex: the version of it (kiln keeps a person's by it).
+    pub digest: String,
+    /// Its image, pinned: `NAME@sha256:…`.
+    pub image: String,
+}
+
+/// Keeps `ran` in `dir` ([`ran_in_dir`]): a file for each conversation, named by its id's SHA-256 (any
+/// id names one), written whole, then put in place.
+pub fn keep_ran_in(dir: &Path, ran: &RanIn) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let name = crate::util::sha256_hex(ran.conversation.as_bytes());
+    let part = dir.join(format!(".{name}.{}", crate::util::new_id()));
+    std::fs::write(&part, serde_json::to_vec(ran).map_err(std::io::Error::other)?)?;
+    std::fs::rename(&part, dir.join(format!("{name}.json"))).inspect_err(|_| {
+        let _ = std::fs::remove_file(&part);
+    })
+}
+
+/// What `dir` keeps of `conversation`: none where it keeps nothing of it.
+pub fn ran_in(dir: &Path, conversation: &str) -> Option<RanIn> {
+    let name = crate::util::sha256_hex(conversation.as_bytes());
+    let kept: RanIn = serde_json::from_slice(&std::fs::read(dir.join(format!("{name}.json"))).ok()?).ok()?;
+    (kept.conversation == conversation).then_some(kept)
+}
+
 /// A harness's home when its run environment names none: init's, its scratch (Shards D231,
 /// "its scratch at `/tmp` (`HOME=/tmp`, init's)").
 pub const INIT_HOME: &str = "/tmp";
@@ -333,8 +373,26 @@ pub fn of_kilns(root: &Path, person: &str, harness: &str) -> Result<Option<Layou
 mod tests {
     use std::path::Path;
 
-    use super::{Adopted, Layout, Mount, SCRATCH, adopt, guest_plain, of_builtin, person_dir, root};
+    use super::{Adopted, Layout, Mount, RanIn, SCRATCH, adopt, guest_plain, keep_ran_in, of_builtin, person_dir, ran_in, ran_in_dir, root};
     use crate::harness::isolated::Refusal;
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 (goal 65's finding): the image a conversation
+    /// ran in is kept beside its person's volume, outside it, by any id its harness gives, and read back
+    /// for that conversation alone.
+    #[test]
+    fn s17_the_image_a_conversation_ran_in_is_kept_beside_its_persons_volume() -> anyhow::Result<()> {
+        let t = tempfile::tempdir()?;
+        let dir = ran_in_dir(&root(t.path()), "user:u1", "codex")?;
+        assert_eq!(dir, root(t.path()).join("user-u1").join("codex.ran-in"), "beside the harness's volumes, never beneath");
+        let ran = RanIn { conversation: "thread/1:a".into(), agentfile: "agentfile:0123".into(), digest: "ab".repeat(32), image: "agentfile-0123@sha256:00".into() };
+        keep_ran_in(&dir, &ran)?;
+        assert_eq!(ran_in(&dir, "thread/1:a"), Some(ran.clone()));
+        assert_eq!(ran_in(&dir, "thread/2"), None);
+        keep_ran_in(&dir, &RanIn { image: "agentfile-0123@sha256:11".into(), ..ran.clone() })?;
+        assert_eq!(ran_in(&dir, "thread/1:a").map(|r| r.image), Some("agentfile-0123@sha256:11".to_owned()), "its last run's");
+        assert!(ran_in_dir(&root(t.path()), "nobody", "codex").is_err(), "no person, no folder");
+        Ok(())
+    }
 
     /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17: a home an instance kept in its own folder is
     /// moved beneath kiln's state; one kiln already keeps there is left as it is, and so is the
@@ -343,7 +401,7 @@ mod tests {
     fn s17_an_instances_homes_are_adopted_into_kilns_state_and_none_is_dropped() -> anyhow::Result<()> {
         let state = tempfile::tempdir()?;
         let old = crate::upgrade::instance_dir(state.path(), "a").join(super::HOMES);
-        for (person, harness) in [("owner", "claude"), ("user:u1", "goose")] {
+        for (person, harness) in [("owner", "claude"), ("user-u1", "goose")] {
             let d = old.join(person).join(harness);
             std::fs::create_dir_all(&d)?;
             std::fs::write(d.join("kept.txt"), format!("{person} {harness}"))?;
@@ -353,15 +411,15 @@ mod tests {
         std::fs::write(taken.join("kept.txt"), "kiln's own")?;
         let mut said = adopt(state.path());
         said.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-        let moved_to = root(state.path()).join("user:u1").join("goose");
+        let moved_to = root(state.path()).join("user-u1").join("goose");
         assert_eq!(
             said,
             [
                 Adopted::Kept { from: old.join("owner").join("claude"), to: taken.clone() },
-                Adopted::Moved { from: old.join("user:u1").join("goose"), to: moved_to.clone() },
+                Adopted::Moved { from: old.join("user-u1").join("goose"), to: moved_to.clone() },
             ]
         );
-        assert_eq!(std::fs::read_to_string(moved_to.join("kept.txt"))?, "user:u1 goose");
+        assert_eq!(std::fs::read_to_string(moved_to.join("kept.txt"))?, "user-u1 goose");
         assert_eq!(std::fs::read_to_string(taken.join("kept.txt"))?, "kiln's own");
         assert_eq!(std::fs::read_to_string(old.join("owner").join("claude").join("kept.txt"))?, "owner claude", "the one kept stays where it was");
         assert!(adopt(state.path()).iter().all(|a| matches!(a, Adopted::Kept { .. })), "adopted once");
