@@ -1232,17 +1232,40 @@ to `s28-pi-agentfile`).
 
 - **None in an image.** kiln's Agentfiles carry no credential, and neither should yours: whoever can
   read an image can read what's in it. A key or a token belongs to a run, given to its harness alone.
+- **None inside the microVM.** A run's credential is granted by name, never by value. What its
+  harness holds is a placeholder: a marked random string that stands for that credential in that
+  run, and is worth nothing anywhere else.
+- **Filled in on the way out, for its own hosts alone.** Outside the microVM, its egress ends the TLS
+  of a request to a host the credential is granted to, and puts the real value where the placeholder
+  stands in its `Authorization: Bearer` or `x-api-key` header. A request to any other host leaves as
+  it came, placeholder and all, and one whose host isn't the name its TLS asked for is refused. To
+  allow this, the harness trusts a certificate authority made for its run alone, good only for the
+  granted hosts, and nothing else of the microVM's trust changes. A value a server echoes back is
+  masked before the reply reaches the harness.
+- **Leased as it's needed, given back as the run ends.** The value is fetched from kiln's secret store
+  the first time a request needs it, held outside the microVM while its lease lasts, and every lease
+  is given back as the run ends, however it ends. kiln keeps a ledger of them, so not even a restart
+  of kiln leaves one live past its run's end.
+- **Signing in.** The harness's own sign-in will run inside its microVM, on its own terminal. For
+  Claude Code and Codex, the tokens their providers send back are taken out on the way in: kiln is to
+  keep them, the harness gets placeholders, and its refreshes and sign-outs are answered outside, so a
+  refresh never brings a new token in, and signing out inside ends nothing outside. Codex keeps what
+  it reads of its ID token (your email, plan and account), never its signature. A request that would
+  make an API key from a taken token is refused.
 - **Yours stay in your volume.** What a harness keeps of its sign-in it keeps in your volume, which
-  no other person's agent is given.
-- **Signing in.** The harness's own sign-in, as the account card runs it on a machine today
-  ("Signing harnesses in and out"), will run inside its microVM, on its own terminal. Not yet: kiln
-  has no terminal into a microVM yet.
-- **Where credentials are going.** No real value inside the microVM at all: kiln keeps it (in its
-  secret store, Veil's later), the harness holds a placeholder, and the microVM's own egress puts the
-  real value in only for the hosts that credential is granted to, never for any other. You sign in
-  once, the token's refresh happens outside the microVM, and a run's credentials are revoked as it
-  ends. A harness that pins its certificates, or checks its token itself, gets its value in a file
-  on the microVM's scratch instead, revoked as the run ends, each such case listed. Not yet built.
+  no other person's agent is given. Once its tokens are taken outside, what it keeps there are
+  placeholders.
+- **Not yet.** A request over HTTP/2 isn't filled in: the egress speaks HTTP/1.1 to the harness. A
+  sign-in isn't wired end to end: its tokens don't yet reach kiln's store, and kiln has no terminal
+  into a microVM yet. kiln doesn't yet start a harness through Hex (above), whose part of this isn't
+  on its main yet. And none of this has run in a real microVM yet: the check that no value is
+  anywhere in a run's memory, disk or environment is built, its runs still to come.
+- **When a value has to be inside.** Every harness kiln ships reads its trust from where its run's
+  certificate authority is laid, and none pins its provider's certificates, as its own build shows,
+  so none should need its value inside. Claude Code signed in
+  through an LLM gateway or XAA, and Bedrock credentials from `aws login`, can't be served this way:
+  for them a value in a file on the microVM's scratch, revoked as the run ends, is the last resort,
+  and it isn't built.
 
 ### What an isolated agent can't do
 
