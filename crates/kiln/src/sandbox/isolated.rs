@@ -16,7 +16,8 @@
 //! - **What it sees of the machine** ([`Launch::shares`]): its project at its own path, and its
 //!   harness's home, its person's volumes kept on the machine (`harness::isolated::home::Layout`), each
 //!   at its path in the microVM, as kiln's Agentfile for its harness declares them, or a person's own
-//!   ([`kept_volumes`], its run's environment read from its image: [`harness_env`]).
+//!   ([`kept_volumes`], its run's environment read from its image: [`harness_env`]); and the plugin
+//!   folders its harness loads on the machine, read-only at their own paths ([`plugin_folders`]).
 //! - **What it reaches** past its microVM is its image's destinations narrowed to its session's own
 //!   provider's or sign-in's ([`reach_of`], `super::narrow`), else its image's whole and why.
 //! - **What it can't do yet**, refused rather than done another way: move to another machine, or
@@ -31,7 +32,7 @@ use super::image::{Images, Source};
 use super::narrow::{Reach, Whole};
 use crate::agentfiles::builtin;
 use crate::harness::isolated::home;
-use crate::harness::kinds::Kind;
+use crate::harness::kinds::{Kind, Protocol};
 use crate::harness::session::{Isolation, Spec};
 
 /// Why an isolated agent doesn't move to another machine.
@@ -104,8 +105,9 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
 /// the `Duplex` its session drives (`crate::proc::duplex_of_run`), saying where its harness keeps its
 /// conversations; or why not, in the images', the home's or the sandbox's own words. What its launch
 /// takes of the session, and of a person's own Agentfile, is checked before anything is built. With no
-/// person or no homes kept on this machine its harness has no home of theirs, and keeps nothing.
-pub async fn launch(kind: &Kind, spec: &Spec, vms: &Microvms, homes: Option<&std::path::Path>) -> anyhow::Result<crate::proc::Duplex> {
+/// person or no homes kept on this machine its harness has no home of theirs, and keeps nothing. The
+/// plugin folders its harness loads for `session` are given it as on the machine ([`plugin_folders`]).
+pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>) -> anyhow::Result<crate::proc::Duplex> {
     let source = source_of(kind, spec).map_err(anyhow::Error::msg)?;
     let mut launch = launch_of(kind, spec, source.name())?;
     if let Source::Kept { text, .. } = source {
@@ -133,8 +135,25 @@ pub async fn launch(kind: &Kind, spec: &Spec, vms: &Microvms, homes: Option<&std
         _ => (Vec::new(), None),
     };
     launch.shares.extend(mounts.into_iter().map(|m| Share { host: m.host.to_string_lossy().into_owned(), at: m.guest, writable: true }));
+    for dir in plugin_folders(kind, session) {
+        launch.args.extend(["--plugin-dir".to_owned(), dir.clone()]);
+        launch.shares.push(Share { host: dir.clone(), at: dir, writable: false });
+    }
     let run = vms.sandbox.launch(launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
     Ok(crate::proc::duplex_of_run(run, image, reach, kept_in))
+}
+
+/// The folders of plugins `kind`'s harness loads for `session`, as the machine's launch gives them
+/// (`Kind::launch`, `--plugin-dir`): Claude Code's, kiln's own skills (`crate::mcp`) and those kiln
+/// installed for the session (`skills::place::session_folder`, made if it isn't there); none for another
+/// harness. An isolated launch plugs each in read-only at its own path (docs/agents.md, "Skills kiln
+/// installs, and kiln's own") and names it to its harness as on the machine.
+pub fn plugin_folders(kind: &Kind, session: &str) -> Vec<String> {
+    if !matches!(kind.protocol, Protocol::ClaudeStreamJson) {
+        return Vec::new();
+    }
+    let own = crate::mcp::kit().map(|k| k.plugin_dir.clone()).or_else(|| crate::mcp::plugin_dir().map(Path::to_path_buf));
+    own.into_iter().chain(crate::skills::place::session_folder(session)).map(|d| d.to_string_lossy().into_owned()).collect()
 }
 
 /// `person`'s home for `kind`'s harness under `root` (the machine's `<state>/homes`), as image `pinned`
@@ -518,6 +537,17 @@ mod tests {
         }
         let unheld = harness_env(&root, &format!("agentfile-0123@sha256:{}", "0".repeat(64)), "/harness/codex").err().unwrap_or_default();
         assert!(unheld.contains("holds no agentfile-0123@sha256:"), "{unheld}");
+        Ok(())
+    }
+
+    /// Step 17 part 7: Claude Code loads kiln's own skills and those kiln installed for its session
+    /// from their folders, as on the machine; another harness takes none.
+    #[test]
+    fn s17_claude_codes_plugin_folders_are_kilns_skills_and_its_sessions() -> anyhow::Result<()> {
+        let own = crate::mcp::plugin_dir().map(|d| d.to_string_lossy().into_owned()).ok_or_else(|| anyhow::anyhow!("no folder of kiln's skills"))?;
+        let installed = crate::skills::place::session_folder("s-1").map(|d| d.to_string_lossy().into_owned()).ok_or_else(|| anyhow::anyhow!("no folder of its installed skills"))?;
+        assert_eq!(plugin_folders(kind("claude")?, "s-1"), [own, installed]);
+        assert!(plugin_folders(kind("codex")?, "s-1").is_empty());
         Ok(())
     }
 

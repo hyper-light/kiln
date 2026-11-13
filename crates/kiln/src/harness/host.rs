@@ -5119,12 +5119,19 @@ while True:
             assert_eq!((launch.program.as_str(), &launch.boundary, launch.folder.as_deref()), ("claude", &Boundary::MicroVm { image: pinned.clone() }, Some(cwd.as_str())));
             assert!(pinned.starts_with("harness-claude@sha256:"), "kiln's image for Claude Code, pinned by its digest: {pinned}");
             assert!(launch.args.iter().any(|a| a == "--session-id"), "its session's own flags, past its image's: {:?}", launch.args);
-            // What it sees of the machine: its project at its own path, and its person's volume here as its
-            // HOME, made before it started (`harness::isolated::home::Layout::prepare`).
+            // What it sees of the machine: its project at its own path, its person's volume here as its
+            // HOME, made before it started (`harness::isolated::home::Layout::prepare`), and the plugin
+            // folders Claude Code loads on the machine (kiln's skills, its session's), read-only at their
+            // own paths and named to it as there.
             let volume = dir.path().join("homes").join("owner").join("claude").join("home").join("claude");
             let home = kiln_seams::sandbox::Share { host: volume.to_string_lossy().into_owned(), at: "/home/claude".into(), writable: true };
-            assert_eq!(launch.shares, [kiln_seams::sandbox::Share::at_its_path(&cwd), home]);
+            let plugins = crate::sandbox::isolated::plugin_folders(crate::harness::kinds::Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude"))?, "isolated");
+            anyhow::ensure!(plugins.len() == 2, "kiln's skills and its session's: {plugins:?}");
+            let read_only = plugins.iter().map(|p| kiln_seams::sandbox::Share { host: p.clone(), at: p.clone(), writable: false });
+            let shares: Vec<_> = [kiln_seams::sandbox::Share::at_its_path(&cwd), home].into_iter().chain(read_only).collect();
+            assert_eq!(launch.shares, shares);
             assert!(volume.is_dir(), "its volume, made before it started");
+            assert!(plugins.iter().all(|p| launch.args.windows(2).any(|w| w == ["--plugin-dir", p.as_str()])), "named to it: {:?}", launch.args);
             // Where it runs, on its info (step 34's checks read it): its microVM by name, its image pinned,
             // no host pid, said so, and the link its stdio rides, both ends' words once it's made.
             until_it("its link, said", 60, || matches!(s.info().runs, Some(session::Runs::Microvm { control: Some(_), .. }))).await?;
