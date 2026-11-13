@@ -281,3 +281,16 @@ passes on the tree as committed. Run with `scripts/mutate.py <kiln checkout>` th
   01a1d2bd5014705d918ad1f2ce1154f2) cites them.
 - **Owed (ROOT)**: each built-in run in a real microVM with these grants, a signed-in turn of each
   harness reaching its provider and nothing else (no vendor turn was run here).
+
+### What ran where (part 2, and both parts' landing)
+
+One host, as ROOT's word of 2026-11-13 has it: the focused tests of the code touched, and clippy for
+its crate, on Linux; CI on main runs the rest of the matrix.
+
+| Where | What | Result |
+|---|---|---|
+| Linux x86_64, adacachy, at eaf76bee4 (part 2 on part 1's landing tree 5fe18df48) | `cargo test -p kiln --lib` with `light.sh`'s filters, `KILN_TEST_SHARDS` = shards e82b9403 (D236 and run.env's HOME) | 227 passed, among them `grants_tests::step18_every_builtin_names_its_hosts_and_keeps_its_home_on_its_volume` and `step23_a_real_shards_checks_every_builtin` (a real shards checking the ten new texts); 1 failed, main's own `harness::moving` version test (`evidence/part2/p2-light.log`) |
+| the same | the grants guard's red and green: kiln's default `http_addr` moved to `0.0.0.0:7071` in `config.rs`, every image still granting 7070 | red: the grants test failed at harness-goose, its NETWORK line naming `host.docker.internal:7070` where `host.docker.internal:7071` was due (`evidence/part2/p2-mutant.log`); restored, green (`p2-green.log`). It ran before ROOT's word against mutation runs reached the step, and none ran after. |
+| the same | `cargo clippy --locked -p kiln -p kiln-ci --all-targets -- -D warnings` | passed (`evidence/part2/p2-clippy.log`) |
+| Linux x86_64, adacachy, at f1d7f28e8 (both parts, part 1's record, and kiln main fe9c17c7d, whose commits changed api.rs, harness/model.rs, moving.rs and session.rs) | the same light tests, then `cargo clippy --locked -p kiln --all-targets -- -D warnings` | 227 passed; 1 failed, main's own `harness::moving` version test, its line moved to 386 by main; clippy passed (`evidence/landing/f1d7f28e8-*`) |
+| Linux x86_64, adacachy, at 51de8f6c0 (the same, and kiln main cd224213c: resume in place, step 35's ACP capabilities) | the same | didn't run: the test binary failed to link, because adacachy's stable toolchain was updated under the build and its std rlibs were gone (`evidence/landing/51de8f6c0-adacachy-link-failure.log`). Its clippy was stopped there, and the lane (`~/g121-tmp/s18`, 94 GB) removed, on ROOT's word that kiln's checks leave adacachy, whose disk is saturated. |

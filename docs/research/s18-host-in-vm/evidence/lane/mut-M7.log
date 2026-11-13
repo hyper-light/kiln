@@ -1,0 +1,52 @@
+vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18: warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14: warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10: warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18: warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10: warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+warning: unused variable: `i`
+    --> crates/kiln/src/api.rs:6360:17
+     |
+6360 |     if let Some(i) = spec.isolation.as_mut() {
+     |                 ^ help: if this is intentional, prefix it with an underscore: `_i`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates/kiln/src/harness/lineage.rs:1201:20
+     |
+1201 |     isolation.map(|mut i| {
+     |                    ----^
+     |                    |
+     |                    help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `refused` is never used
+  --> crates/kiln/src/harness/trouble/mod.rs:79:4
+   |
+79 | fn refused(status: u16) -> bool {
+   |    ^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+
+running 1 test
+harness::isolated::host_tools::tests::step18_a_session_that_needs_host_tools_is_refused_isolation_saying_why --- FAILED
+
+failures:
+
+---- harness::isolated::host_tools::tests::step18_a_session_that_needs_host_tools_is_refused_isolation_saying_why stdout ----
+
+thread 'harness::isolated::host_tools::tests::step18_a_session_that_needs_host_tools_is_refused_isolation_saying_why' (4097171) panicked at crates/kiln/src/harness/isolated/host_tools.rs:116:9:
+assertion `left == right` failed
+  left: Ok(())
+ right: Err(HostTools([Xcode, Msvc]))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    harness::isolated::host_tools::tests::step18_a_session_that_needs_host_tools_is_refused_isolation_saying_why
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4529 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p kiln --lib`
