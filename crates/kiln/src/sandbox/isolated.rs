@@ -239,7 +239,9 @@ mod tests {
         let goose = builtin_of("goose")?;
         let (volumes, env) = crate::harness::isolated::home::of_builtin(goose);
         let layout = crate::harness::isolated::home::Layout::new(homes.path(), "user:u1", "goose", &volumes, &env)?;
-        let config = layout.host_of(&format!("{}/.config/goose/config.yaml", layout.guest_home())).ok_or_else(|| anyhow::anyhow!("no host path for goose's config"))?;
+        // kiln's goose image roots Goose's files at its harness.json's GOOSE_PATH_ROOT, its config beneath it.
+        let root = env.iter().find(|(k, _)| k == "GOOSE_PATH_ROOT").map(|(_, v)| v.clone()).ok_or_else(|| anyhow::anyhow!("kiln's goose image roots no GOOSE_PATH_ROOT"))?;
+        let config = layout.host_of(&format!("{root}/config/config.yaml")).ok_or_else(|| anyhow::anyhow!("no host path for goose's config"))?;
         std::fs::create_dir_all(config.parent().ok_or_else(|| anyhow::anyhow!("a config with no folder"))?)?;
         std::fs::write(&config, "GOOSE_PROVIDER: anthropic\n")?;
         let reach = reach_of(goose, Some("user:u1"), None, Some(homes.path()), None, &[]);

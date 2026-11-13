@@ -18,6 +18,9 @@
 //! - `step35` (`vm_e2e/step35.rs`, `vm_e2e/mcp.rs`): every harness of steps 19 to 28 on the same drive,
 //!   through kiln's REST API and its MCP tools, from kiln's Agentfile and from a person's own, each gap
 //!   in `vm_e2e/gaps.json` with its cited reason (kiln plan step 35).
+//! - `narrowed` (`vm_e2e/narrowed.rs`): a Goose session of kiln's own Agentfile in a microVM, the
+//!   stand-in in Goose's place, reaching past it only its person's provider's hosts, and saying so; one
+//!   whose home can't be read keeps every destination, saying why (kiln plan step 17 part 6).
 //!
 //! No real harness and no model runs here unless ROOT points these at one (`VM_E2E_*`).
 //!
@@ -27,6 +30,8 @@ mod common;
 mod vm_e2e;
 #[path = "vm_e2e/step35.rs"]
 mod step35;
+#[path = "vm_e2e/narrowed.rs"]
+mod narrowed;
 
 // =================================================================================================
 // The checks, against samples. Each guard has its red beside its green; the comment names the
@@ -843,6 +848,64 @@ mod stub {
         s.send(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "kept"}}))?;
         let cut = s.until(|v| v.get("id") == Some(&json!(4)))?;
         assert_eq!(cut.last().map(|v| at(v, "/result/stopReason")), Some("cancelled"));
+        Ok(())
+    }
+
+    /// A resolver as a microVM's network answers names (Shards' D236): `granted.test` at 127.0.0.1, and
+    /// every other name REFUSED (RFC 1035 4.1.1, RCODE 5), as its network process answers a name no
+    /// grant names.
+    fn network_answer(q: &[u8]) -> Option<Vec<u8>> {
+        let mut at = 12;
+        let mut labels = Vec::new();
+        loop {
+            let n = usize::from(*q.get(at)?);
+            if n == 0 {
+                break;
+            }
+            labels.push(String::from_utf8_lossy(q.get(at + 1..at + 1 + n)?).into_owned());
+            at += 1 + n;
+        }
+        let question = q.get(12..at + 5)?;
+        let mut out = q.get(..2)?.to_vec();
+        if labels.join(".") == "granted.test" {
+            out.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+            out.extend_from_slice(question);
+            out.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
+        } else {
+            out.extend_from_slice(&[0x81, 0x85, 0, 1, 0, 0, 0, 0, 0, 0]);
+            out.extend_from_slice(question);
+        }
+        Some(out)
+    }
+
+    /// Kiln plan step 17 part 6's probe: the stand-in's `CONNECT=` says what its network answers for a
+    /// destination, typed: a granted name's address, connected to; a name its resolver REFUSES, by the
+    /// answer's code, as a microVM's network refuses a name no grant names.
+    #[test]
+    fn s17_the_stand_in_says_what_its_network_answers_for_a_destination() -> anyhow::Result<()> {
+        let dns = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let resolver = dns.local_addr()?.to_string();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = dns.recv_from(&mut buf) {
+                if let Some(reply) = buf.get(..n).and_then(network_answer) {
+                    let _ = dns.send_to(&reply, from);
+                }
+            }
+        });
+        let open = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = open.local_addr()?.port();
+        let mut s = start("acp", &["acp"], &[("VM_STUB_RESOLVER", resolver.as_str())], None)?;
+        s.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}}))?;
+        s.until(|v| v.get("id") == Some(&json!(1)))?;
+        s.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/load", "params": {"sessionId": "kept", "cwd": "/", "mcpServers": []}}))?;
+        s.until(|v| v.get("id") == Some(&json!(2)))?;
+        let words = format!("CONNECT=granted.test:{port} CONNECT=refused.test:{port} go");
+        s.send(&json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "kept", "prompt": [{"type": "text", "text": words}]}}))?;
+        let turn = s.until(|v| v.get("id") == Some(&json!(3)))?;
+        let text = said(&turn, "/params/update/content/text").join("\n");
+        assert!(text.contains(&format!("CONNECT_OK granted.test:{port} 127.0.0.1")), "{text}");
+        assert!(text.contains(&format!("CONNECT_REFUSED refused.test:{port} dns rcode 5")), "{text}");
         Ok(())
     }
 

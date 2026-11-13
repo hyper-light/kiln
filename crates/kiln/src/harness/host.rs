@@ -704,9 +704,11 @@ pub struct Host {
     /// carries no microVM runtime, and then it holds no isolated agent.
     microvm: Mutex<Option<Arc<crate::sandbox::Microvms>>>,
     /// Where this machine keeps its persons' harness homes, one per person and harness
-    /// (`<state>/homes`, `super::isolated::home`), as an isolated launch reads what its session uses
-    /// (`crate::sandbox::isolated::reach_of`): none where this host keeps no sessions file.
-    homes: Option<PathBuf>,
+    /// (`<state>/homes`, `super::isolated::home::root` of kiln's state, which outlives a runner's
+    /// instances), as an isolated launch reads what its session uses
+    /// (`crate::sandbox::isolated::reach_of`): as its maker keeps them ([`Host::keep_homes`]), none
+    /// till then.
+    homes: std::sync::OnceLock<PathBuf>,
 }
 
 /// Most of what waits in one session's lane: past it, what's sent is refused (a message, `Full`).
@@ -969,7 +971,6 @@ impl Host {
             |d| d.join("attachments"),
         );
         let handovers = file.as_ref().and_then(|f| f.parent()).map(Handovers::of);
-        let homes = file.as_ref().and_then(|f| f.parent()).map(super::isolated::home::root);
         let host = Arc::new_cyclic(|me| Self {
             input_budgets: super::admission::SessionBudgets::default(),
             sessions: Mutex::new(HashMap::new()),
@@ -996,15 +997,21 @@ impl Host {
             held: AtomicBool::new(false),
             handovers,
             microvm: Mutex::new(crate::sandbox::microvm()),
-            homes,
+            homes: std::sync::OnceLock::new(),
         });
         crate::memory::room::follow_input(&host);
         host
     }
 
+    /// Keeps its persons' harness homes in `root` (`super::isolated::home::root` of kiln's state): the
+    /// first it's given.
+    pub fn keep_homes(&self, root: PathBuf) {
+        let _ = self.homes.set(root);
+    }
+
     /// Where this machine keeps its persons' harness homes (`<state>/homes`), if it keeps any.
     pub fn homes(&self) -> Option<&std::path::Path> {
-        self.homes.as_deref()
+        self.homes.get().map(PathBuf::as_path)
     }
 
     /// Where this machine holds isolated agents' harnesses (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d

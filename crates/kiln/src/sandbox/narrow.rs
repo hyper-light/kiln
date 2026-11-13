@@ -195,9 +195,15 @@ fn enterprise(what: &str, location: &str) -> Result<String, Whole> {
 }
 
 /// Goose's provider (`GOOSE_PROVIDER`, its environment's over its `config.yaml`'s), and TypeSafe's auto
-/// effort where it's enabled (`GOOSE_AUTO_EFFORT_ENABLED`; its key the session's own).
+/// effort where it's enabled (`GOOSE_AUTO_EFFORT_ENABLED`; its key the session's own). Its `config.yaml`
+/// is under `config/` in `GOOSE_PATH_ROOT` where its environment roots Goose's files there, as kiln's
+/// image does (its harness.json's `run.env`), else under `goose/` in its configuration directory, as
+/// `goose info -v` says (docs/research/s23-goose-agentfile/evidence/e_runtime_linux_x86_64.txt).
 fn goose(r: &Reads<'_>) -> Uses {
-    let file = format!("{}/goose/config.yaml", r.config_dir());
+    let file = match r.var("GOOSE_PATH_ROOT") {
+        Some(root) => format!("{}/config/config.yaml", root.trim_end_matches('/')),
+        None => format!("{}/goose/config.yaml", r.config_dir()),
+    };
     let config = r.yaml(&file)?;
     let said = |key: &str| r.var(key).map(str::to_owned).or_else(|| config.as_ref().and_then(|c| c.get(key)).and_then(yaml_text));
     let provider = said("GOOSE_PROVIDER").ok_or_else(|| Whole::Untold { what: format!("GOOSE_PROVIDER, in its environment or {file}") })?;
@@ -237,9 +243,12 @@ fn opencode(r: &Reads<'_>) -> Uses {
     Ok(vec![(from, provider)])
 }
 
-/// pi's provider: its settings' `defaultProvider` (`~/.pi/agent/settings.json`).
+/// pi's provider: its settings' `defaultProvider`, in `settings.json` in its agent directory:
+/// `PI_CODING_AGENT_DIR` where its environment names one, as kiln's image does (its harness.json's
+/// `run.env`), else `~/.pi/agent`.
 fn pi(r: &Reads<'_>) -> Uses {
-    let file = format!("{}/.pi/agent/settings.json", r.home);
+    let dir = r.var("PI_CODING_AGENT_DIR").map_or_else(|| format!("{}/.pi/agent", r.home), |d| d.trim_end_matches('/').to_owned());
+    let file = format!("{dir}/settings.json");
     let provider = r.json(&file)?.and_then(|s| s.get("defaultProvider").and_then(Value::as_str).map(str::to_owned));
     let provider = provider.ok_or_else(|| Whole::Untold { what: format!("defaultProvider, in {file}") })?;
     Ok(vec![(format!("{file}'s defaultProvider"), provider)])
@@ -313,6 +322,11 @@ mod tests {
         assert_eq!(narrowed(&from_env), (vec!["groq".to_owned()], row("goose", "groq")));
         assert!(matches!(of("goose", &[], None, &[]), Reach::Whole { why: Whole::Untold { .. } }));
         assert!(matches!(of("goose", &[("GOOSE_PROVIDER", "mine")], None, &[]), Reach::Whole { why: Whole::Unnamed { .. } }));
+        // Where its environment roots Goose's files (kiln's image does), its config is there, not in XDG's place.
+        let root = [("GOOSE_PATH_ROOT", "/home/h/.local/share/goose")];
+        let rooted = of("goose", &root, None, &[("/home/h/.local/share/goose/config/config.yaml", "GOOSE_PROVIDER: openai\n"), (config, "GOOSE_PROVIDER: anthropic\n")]);
+        assert_eq!(narrowed(&rooted).0, ["openai"]);
+        assert!(matches!(of("goose", &root, None, &[(config, "GOOSE_PROVIDER: anthropic\n")]), Reach::Whole { why: Whole::Untold { .. } }), "XDG's config isn't the rooted Goose's");
     }
 
     /// Step 17 part 6: opencode keeps its catalog's and its model's provider's hosts: its session's
@@ -342,6 +356,9 @@ mod tests {
         hosts.dedup();
         assert_eq!(narrowed(&pi), (vec!["anthropic".to_owned()], hosts));
         assert!(matches!(of("pi", &[], None, &[]), Reach::Whole { why: Whole::Untold { .. } }));
+        // Its agent directory where its environment names one (kiln's image does).
+        let elsewhere = of("pi", &[("PI_CODING_AGENT_DIR", "/v/agent/")], None, &[("/v/agent/settings.json", "{\"defaultProvider\": \"openai\"}")]);
+        assert_eq!(narrowed(&elsewhere).0, ["openai"]);
         let claude = of("claude", &[], None, &[]);
         assert_eq!(claude, Reach::Whole { why: Whole::OneUse });
         assert!(!Whole::OneUse.is_fallback() && !Whole::PersonsOwn.is_fallback() && Whole::NoHome.is_fallback());

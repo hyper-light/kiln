@@ -47,6 +47,13 @@ pub fn microvm() -> Option<Arc<Microvms>> {
     None
 }
 
+/// Where a runner keeps its microVMs' Shards home (`SHARDS_HOME`: the store their images are built
+/// into and booted from): beneath kiln's `state`, which outlives its instances (`upgrade::own_dir`), as
+/// its people's volumes are (`harness::isolated::home::root`).
+pub fn shards_home(state: &std::path::Path) -> std::path::PathBuf {
+    state.join("shards-home")
+}
+
 /// Why this machine holds no isolated agent, where it holds none.
 pub const NO_MICROVM: &str = "this machine's kiln carries no microVM runtime yet, so it can't hold an isolated agent (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 16 and 17)";
 
