@@ -85,7 +85,7 @@ pub fn stand(info: &Info) -> &'static str {
     }
     // Attention plan 01a199e1b177: a person's pause stops live processes where they are, including
     // a running turn or a message on its way. Retained flags don't turn an ended or offline agent into paused.
-    if info.frozen.is_some() && !matches!(info.status, Status::Exited | Status::Disconnected) {
+    if info.frozen.is_some() && !matches!(info.status, Status::Exited | Status::Disconnected | Status::Crashed) {
         return "paused";
     }
     if on_its_way(info) {
@@ -96,6 +96,8 @@ pub fn stand(info: &Info) -> &'static str {
         Status::Exited if info.exit.as_ref().is_some_and(|e| e.error.is_some()) => "stopped",
         Status::Exited => "ended",
         Status::Disconnected => "offline",
+        // Its process gone on a machine that's up: never offline (only a machine that is).
+        Status::Crashed => "crashed",
         _ if info.pause.is_some() && info.status != Status::Running => "paused",
         Status::Running | Status::Starting | Status::Waiting => "working",
         Status::Idle if info.queued > 0 || info.room_wait.is_some() => "working",

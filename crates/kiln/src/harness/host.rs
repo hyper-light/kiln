@@ -1310,6 +1310,12 @@ impl Host {
         }
     }
 
+    /// Whether this host holds no agent session: a runner that handed everything to its new build
+    /// retires only then, so a session the new build didn't take ends with it, never with no one.
+    pub fn holds_none(&self) -> bool {
+        self.sessions.lock().is_empty()
+    }
+
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
         self.sessions.lock().get(id).cloned()
     }
@@ -5504,6 +5510,32 @@ while True:
             assert!(again.command("kept", message("m1", "ship it")));
             let said = answers(&rx, 1).await?;
             assert_eq!(said.first().map(|s| s.answer.clone()), Some(Ok(Answer { repeat: true, ..first })));
+            Ok(())
+        })
+    }
+
+    /// Amphora, 2026-11-12 21:12:49Z: a session the new build doesn't take is never left to no one.
+    /// Handed out, the host holds nothing (the runner may retire); taken back as its record alone,
+    /// with no process, the host holds it again (the runner waits for it) and it takes messages.
+    #[test]
+    fn a_session_the_new_build_refuses_comes_back_from_its_record() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, rx) = async_channel::unbounded();
+            let blue = with_inbox(tx);
+            blue.open(Some("refused".into()), no_harness(dir.path()))?;
+            assert!(!blue.holds_none(), "it holds the session it opened");
+            let moved = blue.move_out().await.map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(moved.len() == 1, "one session handed over");
+            assert!(blue.holds_none(), "handed out, it holds nothing");
+            for (rec, _) in moved {
+                blue.move_in(rec, None).await?;
+            }
+            assert!(!blue.holds_none(), "taken back, it holds the session again");
+            assert!(blue.get("refused").is_some(), "the same session, by its id");
+            assert!(blue.command("refused", message("m1", "still here")));
+            let said = answers(&rx, 1).await?;
+            assert!(matches!(said.first().map(|s| &s.answer), Some(Ok(_))), "it takes messages again: {said:?}");
             Ok(())
         })
     }
