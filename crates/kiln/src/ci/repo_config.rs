@@ -1,6 +1,8 @@
 //! A repository's CI settings: `.kiln/config.yaml` on its default branch (docs/ci.md Appendix E).
 //!
 //! - `github_workflows`: `auto`, `on` or `off` (W02-R02), over the server's `[ci] github_workflows`.
+//! - `kiln_workflows`: `on` or `off` (W29-R16), over the server's `[ci] kiln_workflows`: whether the
+//!   CI engine runs the repository's `.kiln/` workflows, v1 standing aside.
 //! - `default_token_permissions`: `read` or `write` (W10-R04), what `GITHUB_TOKEN` gets when a
 //!   workflow and its job say nothing.
 //! - `actions`: the repository's action policy (W07-R04): `allow`, `deny`, `require_sha_pins`,
@@ -29,6 +31,9 @@ use crate::store::Repo;
 #[serde(default)]
 pub struct RepoConfig {
     pub github_workflows: Option<GithubWorkflows>,
+    /// W29-R16: `on` moves the repository's `.kiln/` workflows to the CI engine, `off` keeps them
+    /// on v1; unset, the server's `[ci] kiln_workflows` decides.
+    pub kiln_workflows: Option<serde_yaml::Value>,
     pub default_token_permissions: Option<String>,
     pub actions: Option<Policy>,
     pub untrusted: Option<serde_yaml::Value>,
@@ -72,6 +77,16 @@ impl RepoConfig {
         let u = self.updates.clone().unwrap_or_default();
         let (actions, cooldown) = (u.actions.as_ref().and_then(scalar), u.cooldown.as_ref().and_then(scalar));
         kiln_ci::updates::of_config(actions.as_deref(), cooldown.as_deref(), u.group.as_deref())
+    }
+
+    /// `kiln_workflows` as written (W29-R16): `on` or `true`, `off` or `false`; anything else says
+    /// nothing, as if unset.
+    pub fn kiln_workflows(&self) -> Option<bool> {
+        match self.kiln_workflows.as_ref().and_then(scalar)?.to_ascii_lowercase().as_str() {
+            "on" | "true" => Some(true),
+            "off" | "false" => Some(false),
+            _ => None,
+        }
     }
 
     /// Who may use its actions and reusable workflows (W29-R17): not shared unless it says.
@@ -157,6 +172,12 @@ pub async fn load(hub: &Hub, repo: &Repo) -> RepoConfig {
     config
 }
 
+/// Whether the CI engine runs `repo`'s `.kiln/` workflows, v1 standing aside (W29-R16): the
+/// repository's own `kiln_workflows`, else the server's `[ci] kiln_workflows`.
+pub async fn kiln_workflows(hub: &Hub, repo: &Repo) -> bool {
+    load(hub, repo).await.kiln_workflows().unwrap_or(hub.cfg.ci.kiln_workflows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +206,25 @@ mod tests {
         for (yaml, access) in [("share: owner\n", kiln_ci::sharing::Access::Owner), ("share: everyone\n", kiln_ci::sharing::Access::Everyone), ("share: none\n", kiln_ci::sharing::Access::None), ("share: nobody\n", kiln_ci::sharing::Access::None)] {
             let c: RepoConfig = serde_yaml::from_str(yaml)?;
             assert_eq!(c.share(), access, "{yaml}");
+        }
+        Ok(())
+    }
+
+    /// W29-R16: `kiln_workflows` moves the repository's `.kiln/` workflows to the engine (`on`) or
+    /// keeps them on v1 (`off`); unset, or anything else, the server decides.
+    #[test]
+    fn w29_r16_kiln_workflows_from_config() -> anyhow::Result<()> {
+        let said = [
+            ("kiln_workflows: on\n", Some(true)),
+            ("kiln_workflows: true\n", Some(true)),
+            ("kiln_workflows: Off\n", Some(false)),
+            ("kiln_workflows: false\n", Some(false)),
+            ("kiln_workflows: soon\n", None),
+            ("share: owner\n", None),
+        ];
+        for (yaml, on) in said {
+            let c: RepoConfig = serde_yaml::from_str(yaml)?;
+            assert_eq!(c.kiln_workflows(), on, "{yaml}");
         }
         Ok(())
     }
