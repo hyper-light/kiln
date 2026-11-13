@@ -9,6 +9,7 @@
 
 pub mod kiln;
 pub mod broker;
+pub mod lessor;
 pub mod seam;
 
 use std::future::Future;

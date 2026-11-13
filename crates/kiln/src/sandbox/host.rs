@@ -1,9 +1,11 @@
 //! The host's sandbox (CP-T4.1; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 17): a program as
 //! kiln has always run one, a process on the machine as the runner's user, in its folder, with the
 //! machine's environment under its own. It holds none of the seam's limits: a launch that asks for a
-//! memory or process limit, a share other than an even one, egress short of any host, or a folder
-//! shared at another path or read-only is refused `Unsupported`, typed, never taken and ignored (on
-//! Linux, CP-T7.1's process boxes are what will hold them). Signals reach its process group on Unix.
+//! memory or process limit, a share other than an even one, egress short of any host, a folder
+//! shared at another path or read-only, or a credential to fill in at its egress (D242: a process on
+//! the machine has no egress outside itself) is refused `Unsupported`, typed, never taken and ignored
+//! (on Linux, CP-T7.1's process boxes are what will hold them). Signals reach its process group on
+//! Unix.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,7 +16,7 @@ use kiln_seams::sandbox::{Boundary, Holds, Launch, Refusal, Run, Sandbox};
 use super::ProcRun;
 
 /// What the host holds a run to: nothing of the seam's but signals, where its processes take them.
-pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: false, egress_by_host: false, shares: false, signals: cfg!(unix) };
+pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: false, egress_by_host: false, shares: false, signals: cfg!(unix), credentials: false };
 
 /// The host's sandbox.
 #[derive(Debug, Clone, Copy, Default)]
@@ -78,7 +80,7 @@ mod tests {
     use std::net::TcpListener;
     use std::time::Duration;
 
-    use kiln_seams::sandbox::{Egress, Limits, SandboxFixture, Share, cases};
+    use kiln_seams::sandbox::{CredentialGrant, Egress, Limits, SandboxFixture, Share, cases};
 
     use super::*;
 
@@ -131,6 +133,10 @@ mod tests {
         fn connect(&self, host: &str, egress: Egress) -> Launch {
             let port = self.hosts.iter().find(|(h, _)| *h == host).and_then(|(_, l)| l.as_ref()?.local_addr().ok()).map_or(0, |a| a.port());
             Launch { limits: Limits::NONE, egress, ..Launch::of("bash", &["-c", "exec 3<>\"/dev/tcp/127.0.0.1/$1\"", "bash", &port.to_string()]) }
+        }
+        // The host fills in no credential, so a launch asking it to is refused before it runs.
+        fn fill(&self, _host: &str, _reference: &str, credentials: Vec<CredentialGrant>, egress: Egress) -> Launch {
+            Launch { limits: Limits::NONE, egress, credentials, ..Launch::of("true", &[]) }
         }
         fn pwd(&self, folder: &str) -> Launch {
             Launch { folder: Some(folder.to_owned()), ..self.sh("exec pwd -P", &[]) }
