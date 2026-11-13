@@ -1,0 +1,16 @@
+== host adacachy: adacachy Linux 7.2.9-2-cachyos #1 SMP PREEMPT_DYNAMIC Thu, 08 Oct 2026 15:06:16 +0000 x86_64, 32 CPUs (AMD Ryzen 9 9950X3D2 16-Core Processor), 122.9 GiB memory
+   kiln 5e925445319b8ada71ea094084cf2a005fe0ce62; shards Client: Version:           0.7.0 API version:       none Go version:        rustc 1.98.1 (48a229cea 2026-09-01) Git commit:        unknown-commit sha256 3298d7d4c1eeae7990580b726dda31a3468cc00ce10825c8d62698c46db30e5d (/home/adalundhe/g121-tmp/fleet-36/bin/shards); python 3.14.8; load at start [30.68, 40.53, 47.98]
+   driver shards; image alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf; ballast 0 B; room {'cpu': None, 'mem': 268435456} (needs mem=256m); seed 36; chaos vm,daemon,client x1
+   density: limit 12 VMs (cost {'mem': 21344256}); VMs at once n=9 p50=12.000 p90=12.000 p99=12.000 max=12.000 VMs (p99 is the max: under 100 samples)
+   memory per VM at density: n=94 p50=13.773 p90=18.024 p99=18.389 max=18.389 MiB (p99 is the max: under 100 samples)
+   start (ask to first echo): n=26 p50=64.134 p90=82.289 p99=149.143 max=149.143 ms (p99 is the max: under 100 samples); after chaos n=14 p50=65.608 p90=89.132 p99=149.143 max=149.143 ms (p99 is the max: under 100 samples)
+   control round trip: n=216 p50=838.097 p90=1665.603 p99=6281.229 max=7301.416 us; floor (local cat, same loop) n=200 p50=21.851 p90=125.926 p99=649.715 max=1238.144 us
+   stream throughput, a turn's 60783 B: n=216 p50=63.061 p90=107.652 p99=172.492 max=201.172 MiB/s; floor n=200 p50=1387.173 p90=5417.494 p99=5820.583 max=5898.167 MiB/s
+   stream throughput, bulk at the converged [524288, 65536] B: n=216 p50=147.130 p90=328.679 p99=754.947 max=925.722 MiB/s; floor n=200 p50=3466.445 p90=5342.737 p99=5697.356 max=5901.794 MiB/s
+   the daemon's view behind the OS (settled lags): n=1 p50=88.172 p90=88.172 p99=88.172 max=88.172 ms (p99 is the max: under 100 samples)
+   asks 26, start failures 0, waits run out 0
+   chaos client: n=1 kills {'killed': 1} settle n=1 p50=346.274 p90=346.274 p99=346.274 max=346.274 ms (p99 is the max: under 100 samples) {'run_after_client': ['running'], 'gone': [True]}
+   chaos daemon: n=1 kills {'killed': 1} settle n=1 p50=190.768 p90=190.768 p99=190.768 max=190.768 ms (p99 is the max: under 100 samples) {'survived': [0], 'ended': [12], 'settled': [True]}
+   chaos vm: n=1 kills {'killed': 1} settle n=1 p50=238.921 p90=238.921 p99=238.921 max=238.921 ms (p99 is the max: under 100 samples) {'gone': [True]}
+   witnesses: none; stray before teardown 0; left after teardown 0
+   verdict: PASS
