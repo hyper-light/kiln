@@ -762,7 +762,11 @@ export function Composer({
       const to = toSub ? { task: toSub.id } : {};
       let accepted: boolean;
       if (taken.uploading.length) accepted = await holdWith(agent, { ...m, mode: go, at: Date.now(), ...to }, taken);
-      else if (behind || !reachable) accepted = await useHeld.getState().hold(agent, { ...m, mode: go, at: Date.now(), ...to, originals: taken.originals });
+      // Kept here until it can go; a browser that can't keep it sends it now instead (the server holds it).
+      else if (behind || !reachable)
+        accepted =
+          (await useHeld.getState().hold(agent, { ...m, mode: go, at: Date.now(), ...to, originals: taken.originals })) ||
+          (await store.sendMail({ type: "send", ...m, mode: go, ...to }, taken.originals));
       else accepted = await store.sendMail({ type: "send", ...m, mode: go, ...to }, taken.originals);
       if (!accepted) {
         if (!taken.uploading.length) taken.back();

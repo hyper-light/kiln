@@ -31,6 +31,8 @@ import time
 from typing import Callable, Dict, List, Optional
 
 from . import chaos, derive, hostfacts, lane, procs, witness
+from .hex import Hex
+from .kilnapi import Kiln
 from .records import Records
 from .shards import Shards
 
@@ -52,6 +54,26 @@ class Vm:
         self.asked_ns = asked_ns
         self.lane_ended: Optional[str] = None
         self.wave = wave
+
+
+def driver_for(opts, scope: str):
+    """The placer the run asks VMs of: Shards' daemon (`shards`, the direct driver), a Hex
+    scheduler of the run's own (`hex`, sized by `--vm`), or kiln's balancer (`kiln`: isolated agent
+    sessions, kiln's address and token from KILN_URL and KILN_TOKEN)."""
+    driver = getattr(opts, "driver", "shards")
+    if driver == "hex":
+        return Hex(opts.hex, opts.shards, scope, needs_room(opts.vm), guest_platform())
+    if driver == "kiln":
+        return Kiln(os.environ.get("KILN_URL", ""), os.environ.get("KILN_TOKEN", ""), opts.kind, opts.shards, scope)
+    return Shards(opts.shards, scope)
+
+
+def guest_platform() -> str:
+    """A Shards guest's OCI platform: Linux, of the host's architecture."""
+    import platform
+
+    machine = platform.machine().lower()
+    return "linux/" + {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(machine, machine)
 
 
 def needs_room(needs: str) -> Dict[str, Optional[int]]:
@@ -83,7 +105,7 @@ class Agent:
         self.deadline_ns = time.monotonic_ns() + int(opts.deadline_s * 1e9)
         self.scope = os.path.join(opts.out, "s")
         self.logs = os.path.join(opts.out, "logs")
-        self.shards = Shards(opts.shards, self.scope)
+        self.driver = driver_for(opts, self.scope)
         self.ledger: Dict[str, W.Ask] = {}
         self.vms: Dict[str, Vm] = {}
         self.lanes = lane.Lanes()
@@ -97,13 +119,17 @@ class Agent:
         self.scans = 0
         self.floor: Optional[subprocess.Popen] = None
         self.stopping = False
+        # Failures recorded (`failed`): any fails the run, as a witness does.
+        self.failures = 0
         first = derive.Patience("first_run")
         daemon = derive.Patience("daemon")
         start = derive.Patience("start", first)
         self.waits: Dict[str, derive.Patience] = {"first_run": first, "daemon": daemon, "start": start}
         for kind in ("rtt", "turn", "reap", "drain.lanes", "drain.gone", "chaos.vm.lane", "chaos.vm.gone", "chaos.client.lane", "chaos.client.gone"):
             self.waits[kind] = derive.Patience(kind, start)
-        self.waits["chaos.daemon.settle"] = derive.Patience("chaos.daemon.settle", daemon)
+        for role in ("daemon", "node", "scheduler"):
+            self.waits[f"chaos.{role}.settle"] = derive.Patience(f"chaos.{role}.settle", daemon)
+        self.asked_ns: Dict[str, int] = {}
         # Per byte: each bulk round's transfers are twice the last's (derive's docstring).
         self.waits["bulk"] = derive.Patience("bulk", self.waits["turn"], 1 / derive.TURN_BYTES)
         self.waits["view.settle"] = derive.Patience("view.settle", start)
@@ -122,6 +148,7 @@ class Agent:
         self.rec.write("phase", phase=name, at=at, **more)
 
     def failed(self, what: str, why: str, **more: object) -> None:
+        self.failures += 1
         self.rec.write("failed", what=what, why=why, **more)
 
     def check_stop(self) -> None:
@@ -190,29 +217,34 @@ class Agent:
     # ------------------------------------------------------------------ scans
 
     def roots(self) -> List[int]:
-        d = self.shards.daemon
-        return [d.pid] if d is not None and d.poll() is None else []
+        return self.driver.roots()
 
     def scope_procs(self) -> List[Dict[str, object]]:
-        return self.shards.scan(procs.table(), self.roots())
+        return self.driver.scan(procs.table(), self.roots())
 
     def quiescent(self) -> bool:
         return not any(a.state in W.IN_FLIGHT for a in self.ledger.values())
 
+    def ended_on_its_own(self, token: str) -> Optional[str]:
+        """Why a live ask's run ended with nobody ending it: its lane's end, or the placer's word."""
+        if self.driver.lanes:
+            return self.vms[token].lane_ended
+        return "the placer says it ended" if token in self.driver.ended else None
+
     def sweep_ended(self) -> None:
-        """A live ask whose lane ended without the harness ending it: its VM's run ended on its
-        own. Typed (`ended_unasked`, with the client's exit), never left to look lost."""
+        """A live ask whose run ended on its own (its lane's end, or the placer's word). Typed
+        (`ended_unasked`), never left to look lost."""
         for t in self.live():
-            v = self.vms[t]
-            if v.lane_ended is not None:
+            why = self.ended_on_its_own(t)
+            if why is not None:
                 self.ledger[t].move(W.FAILED)
-                self.rec.write("ended_unasked", token=t, lane=v.lane_ended)
+                self.rec.write("ended_unasked", token=t, lane=why)
                 self.found["ended_unasked"] = self.found.get("ended_unasked", 0) + 1
                 self.finish(t)
 
     def observe(self):
         found = self.scope_procs()
-        view, view_err = self.shards.view()
+        view, view_err = self.driver.view()
         return found, view, view_err
 
     def scan(self, why: str) -> Dict[str, object]:
@@ -228,14 +260,14 @@ class Agent:
         quiet = self.quiescent()
         if quiet:
             lagging = lambda vs: [v for v in vs if v["witness"] in W.LAGGING]  # noqa: E731
-            first = lagging(W.check(self.ledger, found, view, self.room, self.limit, True))
+            first = lagging(W.check(self.ledger, found, view, self.room, self.limit, True, self.driver.scans))
             if first:
                 began = time.monotonic_ns()
                 latest = {"found": found, "view": view, "err": view_err}
 
                 def settled() -> bool:
                     latest["found"], latest["view"], latest["err"] = self.observe()
-                    return not lagging(W.check(self.ledger, latest["found"], latest["view"], self.room, self.limit, True))
+                    return not lagging(W.check(self.ledger, latest["found"], latest["view"], self.room, self.limit, True, self.driver.scans))
 
                 ok = self.settle(settled, "view.settle")
                 found, view, view_err = latest["found"], latest["view"], latest["err"]
@@ -246,7 +278,7 @@ class Agent:
         if per_vm and max(per_vm) > 0:
             self.cost["mem"] = max(self.cost.get("mem", 0), max(per_vm))
             self.limit = derive.density_limit(self.room, self.cost)
-        violations = W.check(self.ledger, found, view, self.room, self.limit, quiet)
+        violations = W.check(self.ledger, found, view, self.room, self.limit, quiet, self.driver.scans)
         mem = hostfacts.memory()
         rec = self.rec.write(
             "scan", n=self.scans, why=why, quiescent=quiet, vms=len(vms), per_vm_mem=per_vm,
@@ -273,8 +305,10 @@ class Agent:
         a = W.Ask(token)
         self.ledger[token] = a
         asked = time.perf_counter_ns()
+        if not self.driver.lanes:
+            return self.place(token, a, asked)
         try:
-            popen = self.shards.start_vm(token, self.o.image, self.o.ballast, os.path.join(self.logs, f"vm-{token}.err"))
+            popen = self.driver.start_vm(token, self.o.image, self.o.ballast, os.path.join(self.logs, f"vm-{token}.err"))
         except OSError as e:
             # The host gave the harness no client (no descriptor or process left): refused here,
             # typed, and the fill stops at it.
@@ -321,10 +355,55 @@ class Agent:
         self.lanes.begin(token, lane.control_message(self.seq), started)
         return token
 
+    def place(self, token: str, a: W.Ask, asked: int) -> str:
+        """An ask of a placer that gives no lane: its box submitted. Refused, typed in the placer's
+        words, the fill stops at it; taken, it is starting until the placer says it was made."""
+        why = self.driver.place(token, self.o.image, self.o.ballast)
+        took = time.perf_counter_ns() - asked
+        if why is not None:
+            a.move(W.REFUSED)
+            self.rec.write("start_failed", token=token, why=why, wave=self.wave, refused=True, after_ns=took)
+            return token
+        a.move(W.STARTING)
+        self.asked_ns[token] = asked
+        self.rec.write("ask", token=token, wave=self.wave, place_ns=took)
+        return token
+
+    def await_placed(self, tokens: List[str]) -> None:
+        """Follows each starting ask's box (the wave's, and any earlier one still starting) until
+        the placer says it was made (`started`: asked to made, its start; the placer gives no lane,
+        so no workload's answer is in it), ended or refused, or its learned wait passes. A probe at
+        doubling intervals from 1 ms, as the placer gives no event (R05: a probe, said as one)."""
+        tokens = sorted(set(tokens) | set(self.starting()))
+
+        def settled() -> bool:
+            for t in tokens:
+                if self.ledger[t].state != W.STARTING:
+                    continue
+                state = self.driver.placed(t)
+                took = time.perf_counter_ns() - self.asked_ns[t]
+                if state == "live":
+                    self.ledger[t].move(W.LIVE)
+                    self.waits["start"].answered(took)
+                    self.rec.write("started", token=t, start_ns=took, wave=self.wave, concurrency=self.wave_size, by="made", on=self.driver.where(t))
+                elif state != "starting":
+                    self.ledger[t].move(W.FAILED)
+                    self.rec.write("start_failed", token=t, why=state, after_ns=took, wave=self.wave)
+            return all(self.ledger[t].state != W.STARTING for t in tokens)
+
+        self.settle(settled, "start")
+
     def finish(self, token: str) -> None:
         """An ask whose run is over: its client reaped (within its learned wait), its lane
-        dropped, its state ENDED."""
+        dropped, its state ENDED. A placer's ask has no client: its state alone moves."""
         a = self.ledger[token]
+        if not self.driver.lanes:
+            if a.state in (W.LIVE, W.STARTING):
+                a.move(W.STOPPING)
+            if a.state in (W.STOPPING, W.KILLED, W.FAILED):
+                a.move(W.ENDED)
+            self.rec.write("ended", token=token)
+            return
         v = self.vms[token]
         code = v.popen.poll()
         if code is None:
@@ -363,29 +442,30 @@ class Agent:
         facts = hostfacts.facts(self.o.repo)
         if self.o.rev:
             facts["kiln_rev"], facts["kiln_dirty"] = self.o.rev, False
+        identity = self.driver.identity()
         self.rec.write(
-            "host", facts=facts, shards=self.o.shards, shards_sha256=self.shards.identity(), image=self.o.image,
+            "host", facts=facts, shards=self.o.shards, shards_sha256=identity.get("shards"), identity=identity, image=self.o.image,
             ballast=self.o.ballast, needs=self.o.needs, room=self.room, seed=self.o.seed, chaos=self.o.chaos, rounds=self.o.rounds,
-            deadline_s=self.o.deadline_s, driver="shards", controller_t=self.o.controller_t, nofile=nofile,
+            deadline_s=self.o.deadline_s, driver=self.driver.name, vm=getattr(self.o, "vm", None), controller_t=self.o.controller_t, nofile=nofile,
         )
         if self.room.get("mem") is None:
             self.failed("setup", "no memory room: run the agent through `kiln run --needs mem=…`, which holds it to that room (KILN_NEEDS), or give --needs")
             return False
         began = time.monotonic_ns()
-        ok, why = self.shards.start_daemon(os.path.join(self.logs, "daemon.log"), self.deadline_ns)
+        ok, why = self.driver.start(os.path.join(self.logs, "daemon.log"), self.deadline_ns)
         if not ok:
             self.failed("daemon", why)
             return False
         self.waits["daemon"].answered(time.monotonic_ns() - began)
-        self.rec.write("daemon", pid=self.shards.daemon.pid, start=self.shards.daemon_start, took_ns=time.monotonic_ns() - began, version=self.shards.version())
+        self.rec.write("daemon", took_ns=time.monotonic_ns() - began, version=self.driver.version(), **self.driver.placer())
         began = time.monotonic_ns()
-        ok, said = self.shards.pull(self.o.image)
+        ok, said = self.driver.pull(self.o.image)
         self.rec.write("pulled", ok=ok, took_ns=time.monotonic_ns() - began, said=said[-300:])
         if not ok:
             self.failed("pull", said)
             return False
         began = time.monotonic_ns()
-        ok, said = self.shards.run_once(self.o.image)
+        ok, said = self.driver.run_once(self.o.image, self.deadline_ns)
         took = time.monotonic_ns() - began
         self.rec.write("first_run", ok=ok, took_ns=took, said=said[-300:])
         if not ok:
@@ -413,17 +493,25 @@ class Agent:
         last = 0
         while True:
             self.check_stop()
-            if self.limit is None and self.ledger and any(a.state == W.LIVE for a in self.ledger.values()):
+            if not self.driver.scans:
+                # A placer whose VMs run elsewhere admits them itself: the run asks up to the
+                # person's number (`--asks`), and its own refusal or queue is where it is full.
+                room_left = self.o.asks - len(self.live()) - len(self.starting())
+            elif self.limit is None and self.ledger and any(a.state == W.LIVE for a in self.ledger.values()):
                 self.failed("fill", "no VM's memory could be read: no limit can be derived, so nothing more is started")
                 break
-            room_left = 1 if self.limit is None else self.limit - len(self.live()) - len(self.starting())
+            else:
+                room_left = 1 if self.limit is None else self.limit - len(self.live()) - len(self.starting())
             n = derive.next_wave(last, room_left)
             if n <= 0:
                 break
             self.wave += 1
             self.wave_size = n
             tokens = self.ask_wave(n)
-            self.serve(lambda ts=tokens: all(self.ledger[t].state != W.STARTING for t in ts), "start")
+            if self.driver.lanes:
+                self.serve(lambda ts=tokens: all(self.ledger[t].state != W.STARTING for t in ts), "start")
+            else:
+                self.await_placed(tokens)
             failed = [t for t in tokens if self.ledger[t].state == W.FAILED]
             refused = failed + [t for t in tokens if self.ledger[t].state == W.REFUSED]
             for t in failed:
@@ -502,6 +590,12 @@ class Agent:
         if not self.live():
             self.phase("hold", "end", live=0)
             return
+        if not self.driver.lanes:
+            # Round trips and streams need a lane into each VM's workload, which this placer
+            # doesn't give yet (Hex: member exec, Shards' step 11): owed, never measured here.
+            self.rec.write("hold_owed", hold=why, why=f"the {self.driver.name} driver gives no lane into a VM", live=len(self.live()))
+            self.phase("hold", "end", live=len(self.live()), owed=True)
+            return
         self.ops(self.counts(self.live()), lane.control_message, "rtt", hold=why)
         self.scan(f"after round trips ({why})")
         self.ops(self.counts(self.live()), lambda _s: lane.pattern(derive.TURN_BYTES), "turn", hold=why)
@@ -533,6 +627,9 @@ class Agent:
 
     def chaos_round(self, action: str, round_no: int) -> None:
         self.check_stop()
+        if not self.driver.lanes:
+            self.chaos_placer(action, round_no)
+            return
         began = time.monotonic_ns()
         before = self.scan(f"before chaos {action} {round_no}")
         scope_pids = {int(p["pid"]): str(p["start"]) for p in before["procs"]}
@@ -550,10 +647,10 @@ class Agent:
             self.serve(lambda: self.vms[token].lane_ended is not None, "chaos.vm.lane")
             result["gone"] = self.settle(self.gone([pid] + nets), "chaos.vm.gone")
             self.finish(token)
-            view, _ = self.shards.view()
+            view, _ = self.driver.view()
             if view.get(token):
                 result["left_listed"] = view[token]
-                self.shards.remove([token])
+                self.driver.remove([token])
         elif action == "client":
             token = chaos.pick(self.rng, self.live())
             if token is None:
@@ -562,42 +659,42 @@ class Agent:
             v = self.vms[token]
             result.update(token=token, client_pid=v.popen.pid, kill=procs.kill(v.popen.pid, v.client_start))
             self.serve(lambda: v.lane_ended is not None, "chaos.client.lane")
-            view, _ = self.shards.view()
+            view, _ = self.driver.view()
             vm_pids = list(view.get(token, []))
             result["run_after_client"] = "running" if vm_pids else "gone"
             self.ledger[token].move(W.STOPPING)
-            code, said = self.shards.remove([token])
+            code, said = self.driver.remove([token])
             result["removed"] = {"code": code, "said": said[-200:]}
             nets = [int(p["pid"]) for p in before["procs"] if p.get("role") == "net" and p.get("vm") in vm_pids]
             result["gone"] = self.settle(self.gone(vm_pids + nets), "chaos.client.gone")
             self.finish(token)
         elif action == "daemon":
-            d = self.shards.daemon
+            d = self.driver.daemon
             if d is None:
                 self.rec.write("chaos", skipped="no daemon", **result)
                 return
-            result.update(pid=d.pid, kill=procs.kill(d.pid, self.shards.daemon_start))
+            result.update(pid=d.pid, kill=procs.kill(d.pid, self.driver.daemon_start))
             try:
                 d.wait(timeout=None)
             except subprocess.SubprocessError:
                 pass
             live_before = self.live()
             restarted = time.monotonic_ns()
-            ok, why = self.shards.start_daemon(os.path.join(self.logs, "daemon.log"), self.deadline_ns)
+            ok, why = self.driver.start(os.path.join(self.logs, "daemon.log"), self.deadline_ns)
             result["restarted"] = ok
             if not ok:
                 self.failed("daemon restart", why)
                 self.stopping = True
                 raise Stop()
             self.waits["daemon"].answered(time.monotonic_ns() - restarted)
-            self.rec.write("daemon", pid=self.shards.daemon.pid, start=self.shards.daemon_start, restarted=True)
+            self.rec.write("daemon", restarted=True, **self.driver.placer())
 
             def resolved() -> bool:
-                view, _ = self.shards.view()
+                view, _ = self.driver.view()
                 return all(self.vms[t].lane_ended is not None or view.get(t) for t in live_before)
 
             result["settled"] = self.settle(resolved, "chaos.daemon.settle")
-            view, _ = self.shards.view()
+            view, _ = self.driver.view()
             ended = [t for t in live_before if self.vms[t].lane_ended is not None]
             survived = [t for t in live_before if t not in ended and view.get(t)]
             for t in ended:
@@ -609,7 +706,60 @@ class Agent:
         self.scan(f"after chaos {action} {round_no}")
         self.fill(f"after chaos {action} {round_no}")
 
+    def chaos_placer(self, action: str, round_no: int) -> None:
+        """Chaos on a placer that gives no lane: one VM's run host (`vm`), or the placer's own node or
+        scheduler, killed by its pid and start (a pid the OS gave another process refused), the
+        placer started again where it was one of its own. The placer names no VM's ask, so the asks
+        a kill ended are those it then says ended (`killed`); one it still holds with no VM is
+        `lost`, by count, at the next quiescent scan."""
+        began = time.monotonic_ns()
+        before = self.scan(f"before chaos {action} {round_no}")
+        scope_pids = {int(p["pid"]): str(p["start"]) for p in before["procs"]}
+        result: Dict[str, object] = {"action": action, "round": round_no}
+        live_before = self.live()
+        if action == "vm":
+            hosts = {str(p["pid"]): p for p in before["procs"] if p.get("role") == "vm"}
+            pick = chaos.pick(self.rng, sorted(hosts))
+            if pick is None:
+                self.rec.write("chaos", skipped="no VM", **result)
+                return
+            host = hosts[pick]
+            pid = int(host["pid"])
+            result.update(pid=pid, kill=chaos.kill_in_scope(pid, scope_pids.get(pid, ""), scope_pids))
+            result["gone"] = self.settle(self.gone(list(host.get("tree") or [pid])), "chaos.vm.gone")
+        else:
+            result.update(self.driver.placer().get(action, {}), kill=self.driver.kill(action))
+            restarted = time.monotonic_ns()
+            ok, why = self.driver.start_one(action, os.path.join(self.logs, "daemon.log"), self.deadline_ns)
+            result["restarted"] = ok
+            if not ok:
+                self.failed(f"{action} restart", why)
+                self.stopping = True
+                raise Stop()
+            self.waits["daemon"].answered(time.monotonic_ns() - restarted)
+            self.rec.write("daemon", restarted=action, **self.driver.placer())
+
+            def resolved() -> bool:
+                view, _ = self.driver.view()
+                return all(t in view or t in self.driver.ended for t in live_before)
+
+            result["settled"] = self.settle(resolved, f"chaos.{action}.settle")
+        self.driver.view()
+        ended = [t for t in live_before if t in self.driver.ended]
+        for t in ended:
+            self.ledger[t].move(W.KILLED)
+            self.finish(t)
+        if ended:
+            self.driver.remove(ended)
+        result.update(ended=len(ended), survived=len(live_before) - len(ended), settle_ns=time.monotonic_ns() - began)
+        self.rec.write("chaos", **result)
+        self.scan(f"after chaos {action} {round_no}")
+        self.fill(f"after chaos {action} {round_no}")
+
     def drain(self) -> None:
+        if not self.driver.lanes:
+            self.drain_placer()
+            return
         self.phase("drain", "begin")
         for t in self.live() + self.starting():
             self.ledger[t].move(W.STOPPING)
@@ -619,15 +769,36 @@ class Agent:
         for t in stopping:
             if self.vms[t].lane_ended is not None:
                 self.finish(t)
-        view, _ = self.shards.view()
+        view, _ = self.driver.view()
         left = sorted(view)
         if left:
             self.rec.write("drain_left", tokens=left)
-            self.shards.remove(left)
+            self.driver.remove(left)
         self.settle(lambda: not any(p["role"] in ("vm", "net") for p in self.scope_procs()), "drain.gone")
         for t, a in sorted(self.ledger.items()):
             if a.state not in (W.ENDED, W.REFUSED):
                 if a.state in (W.ASKED,):
+                    a.move(W.REFUSED)
+                    continue
+                self.finish(t)
+        self.phase("drain", "end")
+
+    def drain_placer(self) -> None:
+        """Every ask's box removed (the placer's own remove), and anything it still holds; then the
+        scope awaited until no VM is left in it."""
+        self.phase("drain", "begin")
+        stopping = sorted(t for t, a in self.ledger.items() if a.state in (W.LIVE, W.STARTING))
+        for t in stopping:
+            self.ledger[t].move(W.STOPPING)
+        # Every ask, refused ones too: a placer that queued one may have started it since.
+        code, said = self.driver.remove(sorted(self.ledger))
+        view, _ = self.driver.view()
+        if view:
+            self.rec.write("drain_left", tokens=sorted(view), removed={"code": code, "said": said[-200:]})
+        self.settle(lambda: not any(p["role"] == "vm" for p in self.scope_procs()) and (self.driver.scans or not self.driver.view()[0]), "drain.gone")
+        for t, a in sorted(self.ledger.items()):
+            if a.state not in (W.ENDED, W.REFUSED):
+                if a.state == W.ASKED:
                     a.move(W.REFUSED)
                     continue
                 self.finish(t)
@@ -656,8 +827,8 @@ class Agent:
         if self.floor is not None and self.floor.poll() is None:
             self.floor.kill()
             self.floor.wait()
-        code = self.shards.stop_daemon()
-        left = [p.brief() for p in procs.table().values() if any(self.shards.home in a for a in p.args)]
+        code = self.driver.stop()
+        left = [p.brief() for p in procs.table().values() if any(self.driver.mark in a for a in p.args)]
         if left:
             self.found["left_after_teardown"] = self.found.get("left_after_teardown", 0) + len(left)
         self.rec.write("verdict", at="after teardown", daemon_exit=code, left=left, witnesses=dict(self.found), states=self.states())
@@ -672,7 +843,7 @@ class Agent:
         for s in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
             if s is not None:
                 signal.signal(s, on_signal)
-        actions = chaos.parse(self.o.chaos)
+        actions = chaos.parse(self.o.chaos, self.driver.actions)
         try:
             if self.setup():
                 self.fill("initial")
@@ -694,4 +865,4 @@ class Agent:
             except Exception as e:
                 self.failed("drain", f"{type(e).__name__}: {e}")
             self.teardown()
-        return 0 if not self.found else 3
+        return 0 if not self.found and not self.failures else 3
