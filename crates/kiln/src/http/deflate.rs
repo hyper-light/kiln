@@ -19,8 +19,8 @@
 //!
 //! It lies under tungstenite, as the connection it reads and writes ([`Socket`]): what goes up to
 //! tungstenite is plain RFC 6455 frames, and what tungstenite writes is compressed on its way out.
-//! A large message is compressed on the compute pool, in order, so it never holds the shard
-//! (`super::compress::inline`).
+//! A message whose deflate won't fit what's left of its poll's quantum is compressed on the compute pool, in order, so it
+//! never holds the shard past it (`super::compress::inline`).
 
 use std::future::Future;
 use std::io;
