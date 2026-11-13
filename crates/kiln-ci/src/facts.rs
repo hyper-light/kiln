@@ -76,8 +76,11 @@ pub struct RunnerFacts {
     pub link: Option<Negotiated>,
 }
 
-/// What one end of a TLS 1.3 connection negotiated, as rustls names its cipher suite and key exchange group
-/// (`TLS13_AES_256_GCM_SHA384`, `secp384r1MLKEM1024`): a link's `secured`, as kiln's reach says its links'.
+/// What one end of a TLS 1.3 connection negotiated: its cipher suite and key exchange group, as rustls
+/// names them (`TLS13_AES_256_GCM_SHA384`, `secp384r1MLKEM1024`), or by their IANA code where rustls names
+/// none (`0x1303`). kiln's one type for it: a runner's link to the server (`RunnerFacts::link`), a reach
+/// link's `secured`, and both ends of the link a sandboxed run's stdio rides (`kiln_seams::sandbox::Link`,
+/// a session's `AgentLink`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
