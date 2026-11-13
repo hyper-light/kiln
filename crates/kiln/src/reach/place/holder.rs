@@ -169,7 +169,7 @@ impl Placer {
         self.keeper.as_ref().and_then(|h| h.holding.due())
     }
 
-    /// The time, for its holding's waits: a keeper that, its link alive, has answered nothing for
+    /// The time, for its holding's waits: a keeper that, its link alive, has said nothing for
     /// longer than the slowest answer it has given is stalled, and each reserve waiting on it isn't
     /// granted (docs/lb.md "Waits").
     pub(super) fn keeper_woke(&mut self, now: i64) -> Vec<Out> {

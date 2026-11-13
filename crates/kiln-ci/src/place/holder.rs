@@ -13,9 +13,9 @@
 //!   `Admission::fast` for a kernel start), and a start not granted lapses its claim or declines
 //!   its kernel start (`Admission::not_granted`, `Admission::fast_not_granted`);
 //! - its room given back once its work can no longer run ([`Holding::release`]);
-//! - when to wake it ([`Holding::due`]): a keeper that, its link alive, has answered nothing for
-//!   longer than the slowest answer it has given is stalled, and each reserve waiting on it is not
-//!   granted.
+//! - when to wake it ([`Holding::due`]): a keeper that, its link alive, has said nothing (no
+//!   answer, no hint) for a whole window of the slowest answer it has given is stalled, and each
+//!   reserve waiting on it is not granted.
 //!
 //! Pure, as the rest of the place core: its shell carries each word to the keeper and each answer
 //! back on one link, in order, says when a link opens and ends, and passes its monotonic clock in,
@@ -281,7 +281,11 @@ impl Holding {
     /// The keeper's word on the link at `now`: the answer to its oldest word waiting, or a hint.
     pub fn heard(&mut self, msg: ToHolder, now: i64) -> Out {
         let mut out = Out::default();
-        if !matches!(msg, ToHolder::Hint { .. }) {
+        if matches!(msg, ToHolder::Hint { .. }) {
+            // It answers nothing, and shows the keeper going on: the oldest word's window runs from
+            // it (Waits).
+            self.waits.heard(now);
+        } else {
             // The keeper answers in the order said (CV9): this is its oldest word's answer.
             let _ = self.waits.answered(now);
             self.stalled = false;
@@ -310,7 +314,7 @@ impl Holding {
     }
 
     /// Its shell's wake-up at `now`, at [`Self::due`] or after: where the keeper, its link alive,
-    /// has answered nothing for longer than the slowest answer it has given, it is stalled
+    /// has said nothing for a whole window of the slowest answer it has given, it is stalled
     /// ([`Waits`]): each reserve waiting on it is not granted and given back at once (the keeper
     /// may have granted it: CV5), and nothing new is admitted there until it answers again.
     pub fn woke(&mut self, now: i64) -> Out {

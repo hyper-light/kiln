@@ -327,15 +327,17 @@ picks again. A grant that comes for a claim that lapsed meanwhile starts nothing
 
 **Waits.** Every wait the holder makes on its keeper (a hello's, a sync's, a reserve's, a release's,
 and so the sync again after a lost link) follows the keeper's liveness and progress alone
-(`place::keeper::Waits`): no time is seeded from records and none is multiplied (no constants:
-Shards' R03, as the user restated it on 2026-11-13; Hex's own holders seed theirs from its waits
-census, CV6, which kiln's doesn't). Its words go on one link and are answered in the order said
+(`place::keeper::Waits`; Hex's holder wait contract, decision 9, as its lead restated it on
+2026-11-13): no time is seeded from records and none is multiplied (no constants: Shards' R03, as
+the user restated it on 2026-11-13). Its words go on one link and are answered in the order said
 (CV9), so the answer due is the oldest word's. A wait ends, typed (`WaitEnded`), when the link dies,
 by the transport's own liveness rule (QUIC's idle timeout, three probe timeouts of the measured
 round trip: RFC 9000 §10.1, RFC 9002 §6.2); when the keeper starts again or resets the link
 (`Reset`: a stateless reset, RFC 9000 §10.3, or `Closed { Session }`); or when the keeper, its link
-alive, has answered nothing for longer than the slowest answer it has given in this process
-(`Stalled`), each answer timed from its word, or from the answer before it where that came later.
+alive, has said nothing for a whole window of the slowest answer it has given in this process
+(`Stalled`): the window runs from the word, or from the keeper's last word on the link where that
+came later, an answer or a hint (which answers nothing, but shows the keeper going on). Each answer
+is timed from its word, or from the answer before it where that came later; a hint times nothing.
 Until its first answer there is no such bound: a cold start waits on liveness alone, the runner
 admitting nothing new there meanwhile (CV11). A reserve whose wait ended is not granted
 (`NotGranted::Unanswered`); a stall leaves the runner `Unsynced` (`Stalled`), taking nothing new

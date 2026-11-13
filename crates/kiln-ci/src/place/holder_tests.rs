@@ -235,7 +235,7 @@ fn holder_a_run_starts_only_once_synced_and_granted() -> Result<(), String> {
 /// The holder's item 5 under its waits (no constants: Shards' R03): its hello answered in 10 ms
 /// and its sync in 20, the slowest answer is 20 ms. Before then nothing is due (a cold start waits
 /// on liveness alone). A reserve said at 100 is due at 121: at 120 it still waits; at 121 the
-/// keeper, its link alive, has answered nothing for longer than the slowest answer it has given,
+/// keeper, its link alive, has said nothing for longer than the slowest answer it has given,
 /// so it is stalled: the reserve isn't granted and is given back at once (the keeper may have
 /// granted it), and the runner stands `Stalled`, saying no reserve. The keeper's grant that comes
 /// late starts nothing and is given back too; its answer ends the stall and makes the slowest what
@@ -275,6 +275,35 @@ fn holder_a_reserve_with_no_answer_is_given_up_and_given_back() -> Result<(), St
     assert!(books(&keeper, "runner-1")?.is_empty(), "both releases answered, the keeper holds nothing of its");
     let _ = reserve(&mut h, amounts(1, 1), 300)?;
     assert_eq!(h.due(), Some(401), "the slowest answer now the late grant's, 100 ms");
+    Ok(())
+}
+
+/// Hex's holder wait contract (decision 9, as its lead restated it on 2026-11-13): a reserve is
+/// given up only after a whole window of the slowest answer with nothing from the keeper. Its hello
+/// answered in 10 ms and its sync in 20, a reserve said at 100 would be due at 121; Hex's boxes
+/// moving the view at 115 have the keeper hint the runner, something from it that answers nothing,
+/// so the reserve's window runs from 115: at 121 it is still waited for, at 136 a whole window has
+/// passed with nothing, and it is given up and given back. The hint times no answer.
+#[test]
+fn holder_a_hint_from_the_keeper_starts_its_reserves_window_again() -> Result<(), String> {
+    let mut keeper = machine(8, 16, 1, most()?)?;
+    let mut h = holding("runner-1", 1, &[])?;
+    let hello = h.linked(0);
+    let welcome = keeper.hear(1, hello.send.into_iter().next().ok_or("hello")?).map_err(debug)?;
+    let sync = h.heard(welcome, 10);
+    let synced = keeper.hear(1, sync.send.into_iter().next().ok_or("sync")?).map_err(debug)?;
+    let _ = h.heard(synced, 30);
+    let (id, _) = reserve(&mut h, amounts(2, 4), 100)?;
+    assert_eq!(h.due(), Some(121));
+    keeper.set_local(hex_amounts(1, 1)).map_err(debug)?;
+    let hints: Vec<ToHolder> = keeper.hints().map_err(debug)?.into_iter().filter(|(to, _)| *to == 1).map(|(_, hint)| hint).collect();
+    let [hint @ ToHolder::Hint { .. }] = hints.as_slice() else { return Err(format!("a hint for the synced link: {hints:?}")) };
+    let _ = h.heard(hint.clone(), 115);
+    assert_eq!(h.due(), Some(136), "the window runs from the keeper's last word");
+    assert_eq!(h.woke(121), Out::default(), "something came from the keeper within the window: still waited for");
+    let stalled = h.woke(136);
+    assert_eq!(stalled.events, vec![Event::Keeper(Keeper::Unsynced(Unsynced::Stalled)), Event::NotGranted(id, NotGranted::Unanswered(WaitEnded::Stalled))]);
+    assert!(matches!(stalled.send.as_slice(), [ToKeeper::Release { id: r, .. }] if *r == id), "given back at once: {stalled:?}");
     Ok(())
 }
 

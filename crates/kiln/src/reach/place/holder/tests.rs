@@ -309,7 +309,7 @@ fn holder_a_reserve_refused_starts_nothing_and_says_why() -> anyhow::Result<()> 
 
 /// The holder's item 5 under its waits (no constants: Shards' R03): its hello answered in 10 ms and
 /// its sync in 20, the slowest answer is 20 ms; a leg's reserve said at 100 is due at 121, placement's
-/// timer then. At 121 the keeper, its link alive, has answered nothing for longer than the slowest
+/// timer then. At 121 the keeper, its link alive, has said nothing for longer than the slowest
 /// answer it has given: the reserve isn't granted (the leg refused, saying so) and is given back at
 /// once (the keeper may have granted it), and the runner stands stalled. The grant that comes late
 /// starts nothing and is given back too; the keeper's answer ends the stall, and once both releases
