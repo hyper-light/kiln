@@ -1,0 +1,4 @@
+file	url (fetched 2026-11-13 with curl -L)	sha256
+providers.md	https://raw.githubusercontent.com/aaif-goose/goose/v1.59.0/documentation/docs/getting-started/providers.md	794ba732a3c6eace46ed9e3a62387b7b11284c16540a7238511dba9ce2c57939
+hosts.tsv	kiln's table: each host, its provider ids, Goose's source at v1.59.0 (URL, SHA-256) and its provider's own page (URL, fetch date, SHA-256, quote)	2ff7cd021e633d8f0f0669b1ca0206f708174f121cf544e1727bf4f0fa71ae62
+goose-source-excerpts.txt	kiln's numbered excerpt of Goose's source at v1.59.0: each file's URL and whole SHA-256 are inside	d05d1829ae35b91d3654c297ac74b7211a4408e3a6bebd6dc7018dc72781c320

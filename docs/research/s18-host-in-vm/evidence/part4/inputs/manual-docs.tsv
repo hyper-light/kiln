@@ -1,0 +1,52 @@
+api.anthropic.com	https://platform.claude.com/docs/en/api/overview.md https://docs.claude.com/en/api/overview
+api.openai.com	https://developers.openai.com/api/reference/overview.md
+generativelanguage.googleapis.com	https://ai.google.dev/api
+api.groq.com	https://console.groq.com/docs/openai https://console.groq.com/docs/quickstart
+api.mistral.ai	https://docs.mistral.ai/api https://docs.mistral.ai/getting-started/quickstart
+api.deepseek.com	https://api-docs.deepseek.com/
+api.x.ai	https://docs.x.ai/docs/api-reference https://docs.x.ai/docs/overview https://docs.x.ai/docs/tutorial
+openrouter.ai	https://openrouter.ai/docs/quickstart https://openrouter.ai/docs/api-reference/overview
+api.together.xyz	https://docs.together.ai/docs/openai-api-compatibility https://docs.together.ai/intro
+api.together.ai	https://docs.together.ai/docs/openai-api-compatibility https://docs.together.ai/intro https://docs.together.ai/reference/chat-completions-1
+api.fireworks.ai	https://docs.fireworks.ai/tools-sdks/openai-compatibility
+api.cerebras.ai	https://inference-docs.cerebras.ai/resources/openai https://inference-docs.cerebras.ai/quickstart
+router.huggingface.co	https://huggingface.co/docs/inference-providers/index
+huggingface.co	https://huggingface.co/docs/hub/oauth
+ai-gateway.vercel.sh	https://vercel.com/docs/ai-gateway/openai-compat https://vercel.com/docs/ai-gateway
+api.z.ai	https://docs.z.ai/guides/overview/quick-start https://docs.z.ai/devpack/tool/goose
+open.bigmodel.cn	https://docs.bigmodel.cn/cn/guide/start/quick-start
+api.moonshot.ai	https://platform.moonshot.ai/docs/guide/start-using-kimi-api
+api.moonshot.cn	https://platform.moonshot.cn/docs/guide/start-using-kimi-api
+api.minimax.io	https://platform.minimax.io/docs/guides/quickstart-preparation https://platform.minimax.io/docs/api-reference/text-openai-api
+api.minimaxi.com	https://platform.minimaxi.com/docs/guides/quickstart-preparation https://platform.minimaxi.com/docs/api-reference/text-openai-api
+api.kimi.com	https://www.kimi.com/code/docs/en/
+integrate.api.nvidia.com	https://docs.api.nvidia.com/nim/reference/llm-apis
+api.meta.ai	https://dev.meta.ai/docs https://ai.developer.meta.com/docs/muse-code/subscriptions
+inference.baseten.co	https://docs.baseten.co/development/model-apis/overview
+github.com	https://docs.github.com/en/copilot/reference/copilot-allowlist-reference
+api.github.com	https://docs.github.com/en/copilot/reference/copilot-allowlist-reference
+api.githubcopilot.com	https://docs.github.com/en/copilot/reference/copilot-allowlist-reference
+api.individual.githubcopilot.com	https://docs.github.com/en/copilot/reference/copilot-allowlist-reference
+gateway.ai.cloudflare.com	https://developers.cloudflare.com/ai-gateway/usage/unified-api/ https://developers.cloudflare.com/ai-gateway/get-started/
+api.cloudflare.com	https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/
+auth.openai.com	https://learn.chatgpt.com/docs/app-server.md
+chatgpt.com	https://learn.chatgpt.com/docs/enterprise/connect-to-a-gateway.md
+platform.claude.com	https://code.claude.com/docs/en/network-config.md
+cloudcode-pa.googleapis.com	https://developers.google.com/gemini-code-assist/docs/network-access
+oauth2.googleapis.com	https://developers.google.com/identity/protocols/oauth2/native-app
+pi.dev	https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/coding-agent/docs/models.md
+radius.pi.dev	https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/coding-agent/docs/providers.md
+opencode.ai	https://opencode.ai/docs/console/api/inference https://opencode.ai/docs/network
+gitlab.com	https://docs.gitlab.com/api/oauth2/
+api.poe.com	https://creator.poe.com/docs/external-applications/openai-compatible-api
+auth.x.ai	https://docs.x.ai/docs/guides/oauth https://docs.x.ai/llms.txt
+auth.kimi.com	https://www.kimi.com/code/docs/en/
+auth.meta.com	https://ai.developer.meta.com/docs/muse-code/subscriptions https://dev.meta.ai/docs
+api.typesafe.ai	https://typesafe.ai/docs https://docs.typesafe.ai
+api.ant-ling.com	https://ant-ling.com/docs https://www.ant-ling.com/docs
+api.aigateway.sh	https://aigateway.sh/docs https://docs.aigateway.sh
+api.avian.io	https://avian.io/docs
+api.gondola-ai.com	https://gondola-ai.com/guides
+api.router.tetrate.ai	https://router.tetrate.ai/docs https://docs.tetrate.io/router
+api.tensorix.ai	https://docs.tensorix.ai https://tensorix.ai/docs
+futurmix.ai	https://futurmix.ai/docs https://docs.futurmix.ai

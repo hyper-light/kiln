@@ -454,10 +454,15 @@ def run_claude():
 
         t = Turn(prompt, servers, say)
         current[0] = t
+        began = time.monotonic()
         whole = t.run()
         current[0] = None
         if whole:
-            emit({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+            # As Claude Code's own: the messages the turn took, by kiln's ids, and the time it worked,
+            # its own measured in whole milliseconds, which kiln reads as a turn that did real work
+            # (harness/claude.rs releases each message's admission there, and nowhere else).
+            ms = max(1, round((time.monotonic() - began) * 1000))
+            emit({"type": "result", "subtype": "success", "terminal_reason": "completed", "is_error": False, "duration_ms": ms, "duration_api_ms": ms, "num_turns": 1, "result": "done", "session_id": session, "user_message_uuids": commands, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
         else:
             emit({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}, "parent_tool_use_id": None, "session_id": session})
             emit({"type": "result", "subtype": "error_during_execution", "terminal_reason": "aborted_streaming", "is_error": False, "duration_ms": 1, "num_turns": 1, "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})

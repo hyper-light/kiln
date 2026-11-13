@@ -1,0 +1,5214 @@
+
+
+
+
+
+
+
+
+
+<!doctype html>
+<html 
+      lang="en"
+      dir="ltr">
+  <head>
+    <meta name="google-signin-client-id" content="[redacted: the page's OAuth client id].apps.googleusercontent.com"><meta name="google-signin-scope"
+          content="profile email https://www.googleapis.com/auth/developerprofiles https://www.googleapis.com/auth/developerprofiles.award https://www.googleapis.com/auth/devprofiles.full_control.firstparty"><meta property="og:site_name" content="Google for Developers">
+    <meta property="og:type" content="website"><meta name="theme-color" content="#1a73e8"><meta charset="utf-8">
+    <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    
+
+    <link rel="manifest" href="/_pwa/developers/manifest.json"
+          crossorigin="use-credentials">
+    <link rel="preconnect" href="//www.gstatic.com" crossorigin>
+    <link rel="preconnect" href="//fonts.googleapis.com" crossorigin>
+    <link rel="preconnect" href="//www.google-analytics.com" crossorigin><link rel="stylesheet" href="//fonts.googleapis.com/css?family=Google+Sans:400,500|Roboto:400,400italic,500,500italic,700,700italic|Roboto+Mono:400,500,700&display=swap">
+      <link rel="stylesheet"
+            href="//fonts.googleapis.com/css2?family=Material+Icons&family=Material+Symbols+Outlined&display=block"><link rel="stylesheet" href="https://www.gstatic.com/devrel-devsite/prod/v579d635a54d6e1f40caad46ce407560c5106c8915e5ff7e6341f5b13eb245c5a/developers/css/app.css">
+      <link rel="shortcut icon" href="https://www.gstatic.com/devrel-devsite/prod/v579d635a54d6e1f40caad46ce407560c5106c8915e5ff7e6341f5b13eb245c5a/developers/images/favicon-new.png">
+    <link rel="apple-touch-icon" href="https://www.gstatic.com/devrel-devsite/prod/v579d635a54d6e1f40caad46ce407560c5106c8915e5ff7e6341f5b13eb245c5a/developers/images/touchicon-180-new.png"><link rel="canonical" href="https://developers.google.com/identity/protocols/oauth2/native-app"><link rel="search" type="application/opensearchdescription+xml"
+            title="Google for Developers" href="https://developers.google.com/s/opensearch.xml">
+      <link rel="alternate" hreflang="en"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app" /><link rel="alternate" hreflang="x-default" href="https://developers.google.com/identity/protocols/oauth2/native-app" /><link rel="alternate" hreflang="ar"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=ar" /><link rel="alternate" hreflang="bn"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=bn" /><link rel="alternate" hreflang="zh-Hans"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=zh-cn" /><link rel="alternate" hreflang="zh-Hant"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=zh-tw" /><link rel="alternate" hreflang="fa"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=fa" /><link rel="alternate" hreflang="fr"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=fr" /><link rel="alternate" hreflang="de"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=de" /><link rel="alternate" hreflang="he"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=he" /><link rel="alternate" hreflang="hi"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=hi" /><link rel="alternate" hreflang="id"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=id" /><link rel="alternate" hreflang="it"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=it" /><link rel="alternate" hreflang="ja"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=ja" /><link rel="alternate" hreflang="ko"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=ko" /><link rel="alternate" hreflang="pl"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=pl" /><link rel="alternate" hreflang="pt-BR"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=pt-br" /><link rel="alternate" hreflang="pt"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=pt" /><link rel="alternate" hreflang="ru"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=ru" /><link rel="alternate" hreflang="es"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=es" /><link rel="alternate" hreflang="es-419"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=es-419" /><link rel="alternate" hreflang="th"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=th" /><link rel="alternate" hreflang="tr"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=tr" /><link rel="alternate" hreflang="vi"
+          href="https://developers.google.com/identity/protocols/oauth2/native-app?hl=vi" /><link rel="alternate" type="text/markdown" href="https://developers.google.com/identity/protocols/oauth2/native-app.md.txt"><title>OAuth 2.0 for Desktop Apps &nbsp;|&nbsp; Google for Developers</title>
+
+<meta property="og:title" content="OAuth 2.0 for Desktop Apps &nbsp;|&nbsp; Google for Developers"><meta property="og:url" content="https://developers.google.com/identity/protocols/oauth2/native-app"><meta property="og:locale" content="en"><script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "Article",
+    
+    "headline": "OAuth 2.0 for Desktop Apps"
+  }
+</script>
+  
+    
+    
+    
+    
+  
+
+    </head>
+  <body class="color-scheme--light"
+        template="page"
+        theme="google-blue"
+        type="article"
+        
+        
+        
+        layout="docs"
+        
+        
+        
+        
+        
+          
+            concierge='closed'
+          
+        
+        display-toc
+        pending>
+  
+    <devsite-progress type="indeterminate" id="app-progress"></devsite-progress>
+  
+  
+    <a href="#main-content" class="skip-link button">
+      
+      Skip to main content
+    </a>
+    <section class="devsite-wrapper">
+      <devsite-cookie-notification-bar></devsite-cookie-notification-bar>
+        <devsite-header role="banner">
+  
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="devsite-header--inner" data-nosnippet>
+  <div class="devsite-top-logo-row-wrapper-wrapper">
+    <div class="devsite-top-logo-row-wrapper">
+      <div class="devsite-top-logo-row">
+        <button type="button" id="devsite-hamburger-menu"
+          class="devsite-header-icon-button button-flat material-icons gc-analytics-event"
+          data-category="Site-Wide Custom Events"
+          data-label="Navigation menu button"
+          visually-hidden
+          aria-label="Open menu">
+        </button>
+        
+<div class="devsite-product-name-wrapper">
+
+  <a href="/" class="devsite-site-logo-link gc-analytics-event"
+   data-category="Site-Wide Custom Events" data-label="Site logo" track-type="globalNav"
+   track-name="googleForDevelopers" track-metadata-position="nav"
+   track-metadata-eventDetail="nav">
+  
+  <picture>
+    
+    <img src="https://www.gstatic.com/devrel-devsite/prod/v579d635a54d6e1f40caad46ce407560c5106c8915e5ff7e6341f5b13eb245c5a/developers/images/lockup-new.svg" class="devsite-site-logo" alt="Google for Developers">
+  </picture>
+  
+</a>
+
+
+
+</div>
+        <div class="devsite-top-logo-row-middle">
+          <div class="devsite-header-upper-tabs">
+            
+              
+              
+  <devsite-tabs class="upper-tabs">
+
+    <nav class="devsite-tabs-wrapper" aria-label="Upper tabs">
+      
+        
+          <tab class="devsite-dropdown
+    
+    
+    
+    ">
+  
+    <a href="https://developers.google.com/identity/siwg"
+    class="devsite-tabs-content gc-analytics-event "
+      track-metadata-eventdetail="https://developers.google.com/identity/siwg"
+    
+       track-type="nav"
+       track-metadata-position="nav - authentication"
+       track-metadata-module="primary nav"
+       
+       
+         
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Tab: Authentication"
+         
+           track-name="authentication"
+         
+       >
+    Authentication
+  
+    </a>
+    
+      <button
+         aria-haspopup="menu"
+         aria-expanded="false"
+         aria-label="Dropdown menu for Authentication"
+         track-type="nav"
+         track-metadata-eventdetail="https://developers.google.com/identity/siwg"
+         track-metadata-position="nav - authentication"
+         track-metadata-module="primary nav"
+         
+          
+            data-category="Site-Wide Custom Events"
+          
+            data-label="Tab: Authentication"
+          
+            track-name="authentication"
+          
+        
+         class="devsite-tabs-dropdown-toggle devsite-icon devsite-icon-arrow-drop-down"></button>
+    
+  
+  <div class="devsite-tabs-dropdown" role="menu" aria-label="submenu" hidden>
+    <div class="devsite-tabs-dropdown-content">
+      
+      
+        <div class="devsite-tabs-dropdown-column
+                    ">
+          
+            <ul class="devsite-tabs-dropdown-section
+                       ">
+              
+              
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developers.google.com/identity/siwg"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developers.google.com/identity/siwg"
+                     track-metadata-position="nav - authentication"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      Sign In with Google
+                    </div>
+                    
+                  </a>
+                </li>
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developers.google.com/identity/verification/authentication-policy-compliance"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developers.google.com/identity/verification/authentication-policy-compliance"
+                     track-metadata-position="nav - authentication"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      App Verification
+                    </div>
+                    
+                  </a>
+                </li>
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developers.google.com/identity/passkeys"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developers.google.com/identity/passkeys"
+                     track-metadata-position="nav - authentication"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      Passkeys
+                    </div>
+                    
+                  </a>
+                </li>
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developers.google.com/identity/credential-sharing"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developers.google.com/identity/credential-sharing"
+                     track-metadata-position="nav - authentication"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      Credential sharing
+                    </div>
+                    
+                  </a>
+                </li>
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developers.google.com/identity/samples"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developers.google.com/identity/samples"
+                     track-metadata-position="nav - authentication"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      Samples
+                    </div>
+                    
+                  </a>
+                </li>
+              
+            </ul>
+          
+        </div>
+      
+    </div>
+  </div>
+</tab>
+        
+      
+        
+          <tab class="devsite-dropdown
+    
+    devsite-active
+    
+    ">
+  
+    <a href="https://developers.google.com/identity/protocols/oauth2"
+    class="devsite-tabs-content gc-analytics-event "
+      track-metadata-eventdetail="https://developers.google.com/identity/protocols/oauth2"
+    
+       track-type="nav"
+       track-metadata-position="nav - authorization"
+       track-metadata-module="primary nav"
+       aria-label="Authorization, selected" 
+       
+         
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Tab: Authorization"
+         
+           track-name="authorization"
+         
+       >
+    Authorization
+  
+    </a>
+    
+      <button
+         aria-haspopup="menu"
+         aria-expanded="false"
+         aria-label="Dropdown menu for Authorization"
+         track-type="nav"
+         track-metadata-eventdetail="https://developers.google.com/identity/protocols/oauth2"
+         track-metadata-position="nav - authorization"
+         track-metadata-module="primary nav"
+         
+          
+            data-category="Site-Wide Custom Events"
+          
+            data-label="Tab: Authorization"
+          
+            track-name="authorization"
+          
+        
+         class="devsite-tabs-dropdown-toggle devsite-icon devsite-icon-arrow-drop-down"></button>
+    
+  
+  <div class="devsite-tabs-dropdown" role="menu" aria-label="submenu" hidden>
+    <div class="devsite-tabs-dropdown-content">
+      
+      
+        <div class="devsite-tabs-dropdown-column
+                    ">
+          
+            <ul class="devsite-tabs-dropdown-section
+                       ">
+              
+              
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developers.google.com/identity/protocols/oauth2"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developers.google.com/identity/protocols/oauth2"
+                     track-metadata-position="nav - authorization"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      Account Authorization
+                    </div>
+                    
+                  </a>
+                </li>
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developers.google.com/identity/protocols/oauth2/production-readiness/policy-compliance"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developers.google.com/identity/protocols/oauth2/production-readiness/policy-compliance"
+                     track-metadata-position="nav - authorization"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      App verification to use Google Authorization APIs
+                    </div>
+                    
+                  </a>
+                </li>
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developers.google.com/identity/account-linking"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developers.google.com/identity/account-linking"
+                     track-metadata-position="nav - authorization"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      Account Linking
+                    </div>
+                    
+                  </a>
+                </li>
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developers.google.com/identity/protocols/oauth2/resources/best-practices"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developers.google.com/identity/protocols/oauth2/resources/best-practices"
+                     track-metadata-position="nav - authorization"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      Resources
+                    </div>
+                    
+                  </a>
+                </li>
+              
+            </ul>
+          
+        </div>
+      
+    </div>
+  </div>
+</tab>
+        
+      
+        
+          <tab class="devsite-dropdown
+    
+    
+    
+    ">
+  
+    <a href="https://developers.google.com/identity/sign-in/ios/start-integrating"
+    class="devsite-tabs-content gc-analytics-event "
+      track-metadata-eventdetail="https://developers.google.com/identity/sign-in/ios/start-integrating"
+    
+       track-type="nav"
+       track-metadata-position="nav - cross-platform"
+       track-metadata-module="primary nav"
+       
+       
+         
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Tab: Cross-platform"
+         
+           track-name="cross-platform"
+         
+       >
+    Cross-platform
+  
+    </a>
+    
+      <button
+         aria-haspopup="menu"
+         aria-expanded="false"
+         aria-label="Dropdown menu for Cross-platform"
+         track-type="nav"
+         track-metadata-eventdetail="https://developers.google.com/identity/sign-in/ios/start-integrating"
+         track-metadata-position="nav - cross-platform"
+         track-metadata-module="primary nav"
+         
+          
+            data-category="Site-Wide Custom Events"
+          
+            data-label="Tab: Cross-platform"
+          
+            track-name="cross-platform"
+          
+        
+         class="devsite-tabs-dropdown-toggle devsite-icon devsite-icon-arrow-drop-down"></button>
+    
+  
+  <div class="devsite-tabs-dropdown" role="menu" aria-label="submenu" hidden>
+    <div class="devsite-tabs-dropdown-content">
+      
+      
+        <div class="devsite-tabs-dropdown-column
+                    ">
+          
+            <ul class="devsite-tabs-dropdown-section
+                       ">
+              
+              
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developer.android.com/identity"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developer.android.com/identity"
+                     track-metadata-position="nav - cross-platform"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      Implement identity for Android ⍈
+                    </div>
+                    
+                  </a>
+                </li>
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developer.chrome.com/docs/identity"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developer.chrome.com/docs/identity"
+                     track-metadata-position="nav - cross-platform"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      Implement identity for Web ⍈
+                    </div>
+                    
+                  </a>
+                </li>
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developers.google.com/identity/sign-in/ios/start-integrating"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developers.google.com/identity/sign-in/ios/start-integrating"
+                     track-metadata-position="nav - cross-platform"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      Implement identity for iOS
+                    </div>
+                    
+                  </a>
+                </li>
+              
+            </ul>
+          
+        </div>
+      
+    </div>
+  </div>
+</tab>
+        
+      
+        
+          <tab  >
+            
+    <a href="https://developers.google.com/identity/protocols/risc"
+    class="devsite-tabs-content gc-analytics-event "
+      track-metadata-eventdetail="https://developers.google.com/identity/protocols/risc"
+    
+       track-type="nav"
+       track-metadata-position="nav - cross-account protection (risc)"
+       track-metadata-module="primary nav"
+       
+       
+         
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Tab: Cross-Account Protection (RISC)"
+         
+           track-name="cross-account protection (risc)"
+         
+       >
+    Cross-Account Protection (RISC)
+  
+    </a>
+    
+  
+          </tab>
+        
+      
+        
+          <tab class="devsite-dropdown
+    
+    
+    
+    ">
+  
+    <a href="https://developers.google.com/identity/protocols/oauth2/policies"
+    class="devsite-tabs-content gc-analytics-event "
+      track-metadata-eventdetail="https://developers.google.com/identity/protocols/oauth2/policies"
+    
+       track-type="nav"
+       track-metadata-position="nav - policies"
+       track-metadata-module="primary nav"
+       
+       
+         
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Tab: Policies"
+         
+           track-name="policies"
+         
+       >
+    Policies
+  
+    </a>
+    
+      <button
+         aria-haspopup="menu"
+         aria-expanded="false"
+         aria-label="Dropdown menu for Policies"
+         track-type="nav"
+         track-metadata-eventdetail="https://developers.google.com/identity/protocols/oauth2/policies"
+         track-metadata-position="nav - policies"
+         track-metadata-module="primary nav"
+         
+          
+            data-category="Site-Wide Custom Events"
+          
+            data-label="Tab: Policies"
+          
+            track-name="policies"
+          
+        
+         class="devsite-tabs-dropdown-toggle devsite-icon devsite-icon-arrow-drop-down"></button>
+    
+  
+  <div class="devsite-tabs-dropdown" role="menu" aria-label="submenu" hidden>
+    <div class="devsite-tabs-dropdown-content">
+      
+      
+        <div class="devsite-tabs-dropdown-column
+                    ">
+          
+            <ul class="devsite-tabs-dropdown-section
+                       ">
+              
+              
+              
+                <li class="devsite-nav-item">
+                  <a href="https://developers.google.com/identity/protocols/oauth2/policies"
+                    
+                     track-type="nav"
+                     track-metadata-eventdetail="https://developers.google.com/identity/protocols/oauth2/policies"
+                     track-metadata-position="nav - policies"
+                     track-metadata-module="tertiary nav"
+                     
+                     tooltip
+                  >
+                    
+                    <div class="devsite-nav-item-title">
+                      OAuth 2.0 Policy
+                    </div>
+                    
+                  </a>
+                </li>
+              
+            </ul>
+          
+        </div>
+      
+    </div>
+  </div>
+</tab>
+        
+      
+    </nav>
+
+  </devsite-tabs>
+
+            
+           </div>
+          
+<devsite-search
+    enable-signin
+    enable-search
+    enable-suggestions
+      enable-query-completion
+    
+    enable-search-summaries
+    
+    tenant-name="Google for Developers"
+    
+    
+    
+    
+    
+    >
+  <form class="devsite-search-form" action="https://developers.google.com/s/results" method="GET">
+    <div class="devsite-search-container">
+      <button type="button"
+              search-open
+              class="devsite-search-button devsite-header-icon-button button-flat material-icons"
+              
+              aria-label="Open search"></button>
+      <div class="devsite-searchbox">
+        <input
+          aria-activedescendant=""
+          aria-autocomplete="list"
+          
+          aria-label="Search"
+          aria-expanded="false"
+          aria-haspopup="listbox"
+          autocomplete="off"
+          class="devsite-search-field devsite-search-query"
+          name="q"
+          
+          placeholder="Search"
+          role="combobox"
+          type="text"
+          value=""
+          >
+          <div class="devsite-search-image material-icons" aria-hidden="true">
+            
+              <svg class="devsite-search-ai-image" width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <g clip-path="url(#clip0_6641_386)">
+                    <path d="M19.6 21L13.3 14.7C12.8 15.1 12.225 15.4167 11.575 15.65C10.925 15.8833 10.2333 16 9.5 16C7.68333 16 6.14167 15.375 4.875 14.125C3.625 12.8583 3 11.3167 3 9.5C3 7.68333 3.625 6.15 4.875 4.9C6.14167 3.63333 7.68333 3 9.5 3C10.0167 3 10.5167 3.05833 11 3.175C11.4833 3.275 11.9417 3.43333 12.375 3.65L10.825 5.2C10.6083 5.13333 10.3917 5.08333 10.175 5.05C9.95833 5.01667 9.73333 5 9.5 5C8.25 5 7.18333 5.44167 6.3 6.325C5.43333 7.19167 5 8.25 5 9.5C5 10.75 5.43333 11.8167 6.3 12.7C7.18333 13.5667 8.25 14 9.5 14C10.6667 14 11.6667 13.625 12.5 12.875C13.35 12.1083 13.8417 11.15 13.975 10H15.975C15.925 10.6333 15.7833 11.2333 15.55 11.8C15.3333 12.3667 15.05 12.8667 14.7 13.3L21 19.6L19.6 21ZM17.5 12C17.5 10.4667 16.9667 9.16667 15.9 8.1C14.8333 7.03333 13.5333 6.5 12 6.5C13.5333 6.5 14.8333 5.96667 15.9 4.9C16.9667 3.83333 17.5 2.53333 17.5 0.999999C17.5 2.53333 18.0333 3.83333 19.1 4.9C20.1667 5.96667 21.4667 6.5 23 6.5C21.4667 6.5 20.1667 7.03333 19.1 8.1C18.0333 9.16667 17.5 10.4667 17.5 12Z" fill="#5F6368"/>
+                  </g>
+                <defs>
+                <clipPath id="clip0_6641_386">
+                <rect width="24" height="24" fill="white"/>
+                </clipPath>
+                </defs>
+              </svg>
+            
+          </div>
+          <div class="devsite-search-shortcut-icon-container" aria-hidden="true">
+            <kbd class="devsite-search-shortcut-icon">/</kbd>
+          </div>
+      </div>
+    </div>
+  </form>
+  <button type="button"
+          search-close
+          class="devsite-search-button devsite-header-icon-button button-flat material-icons"
+          
+          aria-label="Close search"></button>
+</devsite-search>
+
+        </div>
+
+        
+
+          
+
+          
+
+          
+
+          
+
+          
+<devsite-language-selector>
+  <ul role="presentation">
+    
+    
+    <li role="presentation">
+      <a role="menuitem" lang="en"
+        >English</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="de"
+        >Deutsch</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="es"
+        >Español</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="es_419"
+        >Español – América Latina</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="fr"
+        >Français</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="id"
+        >Indonesia</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="it"
+        >Italiano</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="pl"
+        >Polski</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="pt"
+        >Português</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="pt_br"
+        >Português – Brasil</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="vi"
+        >Tiếng Việt</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="tr"
+        >Türkçe</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ru"
+        >Русский</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="he"
+        >עברית</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ar"
+        >العربيّة</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="fa"
+        >فارسی</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="hi"
+        >हिंदी</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="bn"
+        >বাংলা</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="th"
+        >ภาษาไทย</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="zh_cn"
+        >中文 – 简体</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="zh_tw"
+        >中文 – 繁體</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ja"
+        >日本語</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ko"
+        >한국어</a>
+    </li>
+    
+  </ul>
+</devsite-language-selector>
+
+
+          
+
+        
+
+        
+          <devsite-user 
+                        
+                        
+                          enable-profiles
+                        
+                        
+                          fp-auth
+                        
+                        id="devsite-user">
+            
+              
+              <span class="button devsite-top-button" aria-hidden="true" visually-hidden>Sign in</span>
+            
+          </devsite-user>
+        
+        
+        
+      </div>
+    </div>
+  </div>
+
+
+
+  <div class="devsite-collapsible-section
+    ">
+    <div class="devsite-header-background">
+      
+        
+      
+      
+        <div class="devsite-doc-set-nav-row">
+          
+          
+            
+            
+  <devsite-tabs class="lower-tabs">
+
+    <nav class="devsite-tabs-wrapper" aria-label="Lower tabs">
+      
+        
+          <tab  class="devsite-active">
+            
+    <a href="https://developers.google.com/identity/protocols/oauth2"
+    class="devsite-tabs-content gc-analytics-event "
+      track-metadata-eventdetail="https://developers.google.com/identity/protocols/oauth2"
+    
+       track-type="nav"
+       track-metadata-position="nav - google account authorization"
+       track-metadata-module="primary nav"
+       aria-label="Google Account Authorization, selected" 
+       
+         
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Tab: Google Account Authorization"
+         
+           track-name="google account authorization"
+         
+       >
+    Google Account Authorization
+  
+    </a>
+    
+  
+          </tab>
+        
+      
+        
+          <tab  >
+            
+    <a href="https://developers.google.com/identity/protocols/oauth2/production-readiness/overview"
+    class="devsite-tabs-content gc-analytics-event "
+      track-metadata-eventdetail="https://developers.google.com/identity/protocols/oauth2/production-readiness/overview"
+    
+       track-type="nav"
+       track-metadata-position="nav - app verification to use google authorization apis"
+       track-metadata-module="primary nav"
+       
+       
+         
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Tab: App verification to use Google Authorization APIs"
+         
+           track-name="app verification to use google authorization apis"
+         
+       >
+    App verification to use Google Authorization APIs
+  
+    </a>
+    
+  
+          </tab>
+        
+      
+        
+          <tab  >
+            
+    <a href="https://developers.google.com/identity/account-linking"
+    class="devsite-tabs-content gc-analytics-event "
+      track-metadata-eventdetail="https://developers.google.com/identity/account-linking"
+    
+       track-type="nav"
+       track-metadata-position="nav - google account linking"
+       track-metadata-module="primary nav"
+       
+       
+         
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Tab: Google Account Linking"
+         
+           track-name="google account linking"
+         
+       >
+    Google Account Linking
+  
+    </a>
+    
+  
+          </tab>
+        
+      
+        
+          <tab  >
+            
+    <a href="https://developers.google.com/identity/protocols/oauth2/resources/best-practices"
+    class="devsite-tabs-content gc-analytics-event "
+      track-metadata-eventdetail="https://developers.google.com/identity/protocols/oauth2/resources/best-practices"
+    
+       track-type="nav"
+       track-metadata-position="nav - resources"
+       track-metadata-module="primary nav"
+       
+       
+         
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Tab: Resources"
+         
+           track-name="resources"
+         
+       >
+    Resources
+  
+    </a>
+    
+  
+          </tab>
+        
+      
+    </nav>
+
+  </devsite-tabs>
+
+          
+          
+        </div>
+      
+    </div>
+  </div>
+
+</div>
+
+
+
+  
+
+  
+</devsite-header>
+        <devsite-book-nav scrollbars >
+          
+            
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="devsite-book-nav-filter"
+     >
+  <span class="filter-list-icon material-icons" aria-hidden="true"></span>
+  <input type="text"
+         placeholder="Filter"
+         
+         aria-label="Type to filter"
+         role="searchbox">
+  
+  <span class="filter-clear-button hidden"
+        data-title="Clear filter"
+        aria-label="Clear filter"
+        role="button"
+        tabindex="0"></span>
+</div>
+
+<nav class="devsite-book-nav devsite-nav nocontent" data-nosnippet
+     aria-label="Side menu">
+  <div class="devsite-mobile-header">
+    <button type="button"
+            id="devsite-close-nav"
+            class="devsite-header-icon-button button-flat material-icons gc-analytics-event"
+            data-category="Site-Wide Custom Events"
+            data-label="Close navigation"
+            aria-label="Close navigation">
+    </button>
+    <div class="devsite-product-name-wrapper">
+
+  <a href="/" class="devsite-site-logo-link gc-analytics-event"
+   data-category="Site-Wide Custom Events" data-label="Site logo" track-type="globalNav"
+   track-name="googleForDevelopers" track-metadata-position="nav"
+   track-metadata-eventDetail="nav">
+  
+  <picture>
+    
+    <img src="https://www.gstatic.com/devrel-devsite/prod/v579d635a54d6e1f40caad46ce407560c5106c8915e5ff7e6341f5b13eb245c5a/developers/images/lockup-new.svg" class="devsite-site-logo" alt="Google for Developers">
+  </picture>
+  
+</a>
+
+
+</div>
+  </div>
+
+  <div class="devsite-book-nav-wrapper">
+    <div class="devsite-mobile-nav-top">
+      
+        <ul class="devsite-nav-list">
+          
+            <li class="devsite-nav-item">
+              
+  
+  <a href="/identity/siwg"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Authentication"
+      
+        track-name="authentication"
+      
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Authentication"
+     track-type="globalNav"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Authentication
+   </span>
+    
+  
+  </a>
+  
+
+  
+    <ul class="devsite-nav-responsive-tabs devsite-nav-has-menu
+               ">
+      
+<li class="devsite-nav-item">
+
+  
+  <span
+    
+       class="devsite-nav-title"
+       tooltip
+    
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Authentication"
+      
+        track-name="authentication"
+      
+    >
+  
+    <span class="devsite-nav-text" tooltip menu="Authentication">
+      More
+   </span>
+    
+    <span class="devsite-nav-icon material-icons" data-icon="forward"
+          menu="Authentication">
+    </span>
+    
+  
+  </span>
+  
+
+</li>
+
+    </ul>
+  
+              
+            </li>
+          
+            <li class="devsite-nav-item">
+              
+  
+  <a href="/identity/protocols/oauth2"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              devsite-nav-active"
+    
+
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Authorization"
+      
+        track-name="authorization"
+      
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Authorization"
+     track-type="globalNav"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Authorization
+   </span>
+    
+  
+  </a>
+  
+
+  
+    <ul class="devsite-nav-responsive-tabs devsite-nav-has-menu
+               ">
+      
+<li class="devsite-nav-item">
+
+  
+  <span
+    
+       class="devsite-nav-title"
+       tooltip
+    
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Authorization"
+      
+        track-name="authorization"
+      
+    >
+  
+    <span class="devsite-nav-text" tooltip menu="Authorization">
+      More
+   </span>
+    
+    <span class="devsite-nav-icon material-icons" data-icon="forward"
+          menu="Authorization">
+    </span>
+    
+  
+  </span>
+  
+
+</li>
+
+    </ul>
+  
+              
+                <ul class="devsite-nav-responsive-tabs">
+                  
+                    
+                    
+                    
+                    <li class="devsite-nav-item">
+                      
+  
+  <a href="/identity/protocols/oauth2"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              devsite-nav-active"
+    
+
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Google Account Authorization"
+      
+        track-name="google account authorization"
+      
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Google Account Authorization"
+     track-type="globalNav"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip menu="_book">
+      Google Account Authorization
+   </span>
+    
+  
+  </a>
+  
+
+  
+                    </li>
+                  
+                    
+                    
+                    
+                    <li class="devsite-nav-item">
+                      
+  
+  <a href="/identity/protocols/oauth2/production-readiness/overview"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: App verification to use Google Authorization APIs"
+      
+        track-name="app verification to use google authorization apis"
+      
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: App verification to use Google Authorization APIs"
+     track-type="globalNav"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      App verification to use Google Authorization APIs
+   </span>
+    
+  
+  </a>
+  
+
+  
+                    </li>
+                  
+                    
+                    
+                    
+                    <li class="devsite-nav-item">
+                      
+  
+  <a href="/identity/account-linking"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Google Account Linking"
+      
+        track-name="google account linking"
+      
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Google Account Linking"
+     track-type="globalNav"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Google Account Linking
+   </span>
+    
+  
+  </a>
+  
+
+  
+                    </li>
+                  
+                    
+                    
+                    
+                    <li class="devsite-nav-item">
+                      
+  
+  <a href="/identity/protocols/oauth2/resources/best-practices"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Resources"
+      
+        track-name="resources"
+      
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Resources"
+     track-type="globalNav"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Resources
+   </span>
+    
+  
+  </a>
+  
+
+  
+                    </li>
+                  
+                </ul>
+              
+            </li>
+          
+            <li class="devsite-nav-item">
+              
+  
+  <a href="/identity/sign-in/ios/start-integrating"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Cross-platform"
+      
+        track-name="cross-platform"
+      
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Cross-platform"
+     track-type="globalNav"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Cross-platform
+   </span>
+    
+  
+  </a>
+  
+
+  
+    <ul class="devsite-nav-responsive-tabs devsite-nav-has-menu
+               ">
+      
+<li class="devsite-nav-item">
+
+  
+  <span
+    
+       class="devsite-nav-title"
+       tooltip
+    
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Cross-platform"
+      
+        track-name="cross-platform"
+      
+    >
+  
+    <span class="devsite-nav-text" tooltip menu="Cross-platform">
+      More
+   </span>
+    
+    <span class="devsite-nav-icon material-icons" data-icon="forward"
+          menu="Cross-platform">
+    </span>
+    
+  
+  </span>
+  
+
+</li>
+
+    </ul>
+  
+              
+            </li>
+          
+            <li class="devsite-nav-item">
+              
+  
+  <a href="/identity/protocols/risc"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Cross-Account Protection (RISC)"
+      
+        track-name="cross-account protection (risc)"
+      
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Cross-Account Protection (RISC)"
+     track-type="globalNav"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Cross-Account Protection (RISC)
+   </span>
+    
+  
+  </a>
+  
+
+  
+              
+            </li>
+          
+            <li class="devsite-nav-item">
+              
+  
+  <a href="/identity/protocols/oauth2/policies"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Policies"
+      
+        track-name="policies"
+      
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Policies"
+     track-type="globalNav"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Policies
+   </span>
+    
+  
+  </a>
+  
+
+  
+    <ul class="devsite-nav-responsive-tabs devsite-nav-has-menu
+               ">
+      
+<li class="devsite-nav-item">
+
+  
+  <span
+    
+       class="devsite-nav-title"
+       tooltip
+    
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Policies"
+      
+        track-name="policies"
+      
+    >
+  
+    <span class="devsite-nav-text" tooltip menu="Policies">
+      More
+   </span>
+    
+    <span class="devsite-nav-icon material-icons" data-icon="forward"
+          menu="Policies">
+    </span>
+    
+  
+  </span>
+  
+
+</li>
+
+    </ul>
+  
+              
+            </li>
+          
+          
+          
+        </ul>
+      
+    </div>
+    
+      <div class="devsite-mobile-nav-bottom">
+        
+          
+          <ul class="devsite-nav-list" menu="_book">
+            <li class="devsite-nav-item
+           devsite-nav-heading"><div class="devsite-nav-title devsite-nav-title-no-path">
+        <span class="devsite-nav-text" tooltip>Google account authorization</span>
+      </div></li>
+
+  <li class="devsite-nav-item"><a href="/identity/protocols/oauth2"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Overview</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/identity/protocols/oauth2/cross-client-identity"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Cross-client identity</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/identity/protocols/oauth2/scopes"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>OAuth 2.0 scopes</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/identity/protocols/oauth2/policies"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>OAuth 2.0 policies</span></a></li>
+
+  <li class="devsite-nav-item
+           devsite-nav-heading"><div class="devsite-nav-title devsite-nav-title-no-path">
+        <span class="devsite-nav-text" tooltip>Authorization considerations by app type</span>
+      </div></li>
+
+  <li class="devsite-nav-item"><a href="/identity/protocols/oauth2/web-server"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>for Server-side Web Apps</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/identity/protocols/oauth2/javascript-implicit-flow"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>for JavaScript Web Apps</span></a></li>
+
+  <li class="devsite-nav-item
+           devsite-nav-external"><a href="https://developer.android.com/identity/authorization"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>for Android Apps</span><span class="devsite-nav-icon material-icons"
+        data-icon="external"
+        data-title="External"
+        aria-hidden="true"></span></a></li>
+
+  <li class="devsite-nav-item"><a href="/identity/sign-in/ios/api-access"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>for iOS Apps</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/identity/protocols/oauth2/native-app"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>for Desktop Apps</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/identity/protocols/oauth2/limited-input-device"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>for TV &amp; Device Apps</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/identity/protocols/oauth2/service-account"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>for Service Accounts</span></a></li>
+          </ul>
+        
+        
+          
+    
+      
+      <ul class="devsite-nav-list" menu="Authentication"
+          aria-label="Side menu" hidden>
+        
+          
+            
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="/identity/siwg"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Sign In with Google"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Sign In with Google
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="/identity/verification/authentication-policy-compliance"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: App Verification"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      App Verification
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="/identity/passkeys"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Passkeys"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Passkeys
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="/identity/credential-sharing"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Credential sharing"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Credential sharing
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="/identity/samples"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Samples"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Samples
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+          
+        
+      </ul>
+    
+  
+    
+      
+      <ul class="devsite-nav-list" menu="Authorization"
+          aria-label="Side menu" hidden>
+        
+          
+            
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="/identity/protocols/oauth2"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Account Authorization"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Account Authorization
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="/identity/protocols/oauth2/production-readiness/policy-compliance"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: App verification to use Google Authorization APIs"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      App verification to use Google Authorization APIs
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="/identity/account-linking"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Account Linking"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Account Linking
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="/identity/protocols/oauth2/resources/best-practices"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Resources"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Resources
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+          
+        
+      </ul>
+    
+  
+    
+      
+      <ul class="devsite-nav-list" menu="Cross-platform"
+          aria-label="Side menu" hidden>
+        
+          
+            
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="https://developer.android.com/identity"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Implement identity for Android ⍈"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Implement identity for Android ⍈
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="https://developer.chrome.com/docs/identity"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Implement identity for Web ⍈"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Implement identity for Web ⍈
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="/identity/sign-in/ios/start-integrating"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Implement identity for iOS"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Implement identity for iOS
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+          
+        
+      </ul>
+    
+  
+    
+  
+    
+      
+      <ul class="devsite-nav-list" menu="Policies"
+          aria-label="Side menu" hidden>
+        
+          
+            
+            
+              
+<li class="devsite-nav-item">
+
+  
+  <a href="/identity/protocols/oauth2/policies"
+    
+       class="devsite-nav-title gc-analytics-event
+              
+              "
+    
+
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: OAuth 2.0 Policy"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      OAuth 2.0 Policy
+   </span>
+    
+  
+  </a>
+  
+
+</li>
+
+            
+          
+        
+      </ul>
+    
+  
+        
+        
+          
+    
+  
+    
+  
+    
+  
+    
+  
+        
+      </div>
+    
+  </div>
+</nav>
+          
+        </devsite-book-nav>
+      
+      <section id="gc-wrapper">
+        <main role="main" id="main-content" class="devsite-main-content"
+            
+              has-book-nav
+              has-sidebar
+            >
+          <div class="devsite-sidebar">
+            <div class="devsite-sidebar-content">
+                
+                <devsite-toc class="devsite-nav"
+                            role="navigation"
+                            aria-label="On this page"
+                            depth="2"
+                            scrollbars
+                            data-nosnippet
+                  ></devsite-toc>
+                <devsite-recommendations-sidebar class="nocontent devsite-nav" data-nosnippet>
+                </devsite-recommendations-sidebar>
+            </div>
+          </div>
+          <devsite-content>
+            
+              
+
+
+
+
+
+
+
+
+
+
+<article class="devsite-article"><style>
+      .code-var-color {
+        color: #ec407a;
+        font-weight: bold;
+      }
+      </style>
+  
+  
+  
+  
+  
+
+  <div class="devsite-article-meta nocontent" role="navigation" data-nosnippet>
+    
+    
+    <ul class="devsite-breadcrumb-list"
+  >
+  
+  <li class="devsite-breadcrumb-item
+             ">
+    
+    
+    
+      
+        
+  <a href="https://developers.google.com/identity/protocols/oauth2"
+      
+        class="devsite-breadcrumb-link gc-analytics-event"
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Breadcrumbs"
+      
+        data-value="1"
+      
+        track-type="globalNav"
+      
+        track-name="breadcrumb"
+      
+        track-metadata-position="1"
+      
+        track-metadata-eventdetail=""
+      
+    >
+    
+          Authorization
+        
+  </a>
+  
+      
+    
+  </li>
+  
+</ul>
+    
+      
+    <devsite-thumb-rating position="header">
+    </devsite-thumb-rating>
+  
+    
+  </div>
+  
+    <h1 class="devsite-page-title" tabindex="-1">
+      OAuth 2.0 for Desktop Apps<devsite-actions hidden data-nosnippet><devsite-feature-tooltip
+      ack-key="AckCollectionsBookmarkTooltipDismiss"
+      analytics-category="Site-Wide Custom Events"
+      analytics-action-show="Callout Profile displayed"
+      analytics-action-close="Callout Profile dismissed"
+      analytics-label="Create Collection Callout"
+      class="devsite-page-bookmark-tooltip nocontent"
+      data-nosnippet
+      dismiss-button="true"
+      id="devsite-collections-dropdown"
+      
+      dismiss-button-text="Dismiss"
+
+      
+      close-button-text="Got it">
+
+    
+    
+      <devsite-bookmark></devsite-bookmark>
+    
+
+    <span slot="popout-heading">
+      
+      Stay organized with collections
+    </span>
+    <span slot="popout-contents">
+      
+      Save and categorize content based on your preferences.
+    </span>
+  </devsite-feature-tooltip>
+    <devsite-llm-tools></devsite-llm-tools></devsite-actions>
+  
+      
+    </h1>
+  <div class="devsite-page-title-meta"><devsite-view-release-notes></devsite-view-release-notes></div>
+  
+
+  <devsite-toc class="devsite-nav"
+    depth="2"
+    devsite-toc-embedded
+    >
+  </devsite-toc>
+  <div class="devsite-article-body clearfix
+  ">
+
+  
+    
+      <devsite-key-takeaways-panel role="region" aria-labelledby="key-takeaways-panel-title">
+  <div class="devsite-key-takeaways-panel-header" aria-labelledby="key-takeaways-panel-title" aria-expanded="false" role="button" tabindex="0">
+    
+    <img src="/_static/images/icons/spark.svg" alt="Spark icon" />
+    <div class="devsite-key-takeaways-panel-title">
+      
+      <h2 class="no-link hide-from-toc" id="key-takeaways-panel-title" data-tooltip="Generated with AI">Page Summary</h2>
+    </div>
+    <span
+      class="material-icons devsite-key-takeaways-panel-toggle-button" aria-hidden="true"></span>
+  </div>
+  <div class="devsite-key-takeaways-panel-content">
+    <devsite-feedback
+      product-id="5123748"
+      bucket="8963846920012181156"
+      disable-product-feedback>
+      <button
+        class="button-flat button-primary devsite-key-takeaways-report-button"
+        
+        data-title="Report Key Takeaways!"
+        
+        aria-label="Report Key Takeaways!">
+        <span
+          class="material-icons"
+          
+          aria-label="Report Key Takeaways!"
+          >outlined_flag</span
+        >
+      </button>
+    </devsite-feedback>
+    <ul class="devsite-key-takeaways-panel-list">
+      
+        <li>
+          <p>This document explains how installed applications use Google&#39;s OAuth 2.0 endpoints to authorize access to Google APIs, allowing users to share data without exposing sensitive information.</p>
+
+        </li>
+      
+        <li>
+          <p>Prerequisites for using Google&#39;s OAuth 2.0 with installed apps include enabling necessary APIs in the API Console and creating authorization credentials.</p>
+
+        </li>
+      
+        <li>
+          <p>The process for obtaining OAuth 2.0 access tokens involves generating a code verifier and challenge, sending a request to Google&#39;s authorization server, handling the user consent prompt, and exchanging the authorization code for access and refresh tokens.</p>
+
+        </li>
+      
+        <li>
+          <p>After obtaining an access token, you can call Google APIs by including the token in the request header or as a query parameter, and access tokens can be refreshed without user interaction if offline access was requested.</p>
+
+        </li>
+      
+        <li>
+          <p>To enhance security and prevent app impersonation, it is recommended to implement features like App Check for iOS clients and verify app ownership for Chrome applications.</p>
+
+        </li>
+      
+    </ul>
+  </div>
+</devsite-key-takeaways-panel>
+    
+    
+
+    
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+
+    
+    
+
+    
+
+    <aside class="note"><b>Note:</b> If you are new to OAuth 2.0, we
+      recommend that you read the
+      <a href="/identity/protocols/oauth2">OAuth 2.0 overview</a> before
+      getting started. The overview summarizes OAuth 2.0 flows that Google
+      supports, which can help you to ensure that you've selected the right flow
+      for your application.</aside>
+
+    
+    <p>This document explains how desktop applications (such as applications
+      running on Windows, macOS, or Linux, or command-line interface (CLI)
+      tools) use Google's OAuth 2.0 endpoints to authorize access to
+      Google APIs.</p>
+    
+
+    <p>OAuth 2.0 allows users to share specific data with an application while
+      keeping their usernames, passwords, and other information
+      private. 
+For example, an application can use OAuth 2.0 to obtain permission from
+users to store files in their Google Drives.
+</p>
+
+    <p>Desktop applications are installed locally on a user's machine (such as
+      standalone desktop software, developer CLI tools, background sync
+      utilities, or scripts). Because these apps are distributed to individual
+      devices, it is assumed that these apps cannot keep secrets (they are
+      public clients). They can access Google APIs while the user is actively
+      interacting with the app or when the app is running in the background.</p>
+
+    <p>This authorization flow is similar to the one used for
+      <a href="/identity/protocols/oauth2/web-server">web server applications</a>. The
+      main difference is that desktop apps must open the system browser and
+      supply a local redirect URI (such as a loopback IP address) to handle
+      responses from Google's authorization server.</p>
+
+    
+    
+
+    
+
+    <h2 id="libraries" data-text="Libraries and samples" tabindex="-1">Libraries and samples</h2>
+
+    <p>We recommend using the Google API Client Libraries for your programming
+      language (e.g., Python, Java, Node.js, Go, .NET) when implementing
+      OAuth 2.0 for desktop applications. The client libraries handle user
+      authorization and token management, making implementation simpler and less
+      error-prone than using the lower-level HTTP/REST endpoints directly.</p>
+    <p>For mobile apps, see the
+      <a href="https://developer.android.com/identity/authorization"
+        >Android</a> and
+      <a href="/identity/sign-in/ios/api-access">iOS</a> authorization
+      guides.</p>
+    <p>For apps running on devices that don't support a system browser or that
+        have limited input capabilities, such as TVs, game consoles, cameras,
+        or printers, see
+        <a href="/identity/protocols/oauth2/limited-input-device">OAuth 2.0 for TVs &amp; Devices</a>
+        or <a href="/identity/gsi/web/guides/devices">Sign-In on TVs and Limited Input Devices</a>.</p>
+    
+
+    
+
+    <h2 id="prerequisites" data-text="Prerequisites" tabindex="-1">Prerequisites</h2>
+
+    
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<h3 id="enable-apis" data-text="Enable APIs for your project" tabindex="-1">Enable APIs for your project</h3>
+
+<p>Any application that calls Google APIs needs to enable those APIs in the
+  API Console.</p>
+
+
+
+<p>To enable an API for your project:</p>
+
+<ol>
+  <li><a href="https://console.developers.google.com/apis/library">Open the API Library</a> in the Google API Console.</li>
+  <li>If prompted, select a project, or create a new one.</li>
+
+  <li>The API Library lists all available APIs, grouped by product family and popularity.
+    If the API you want to enable isn't visible in the list, use search to find it, or click
+    <b>View All</b> in the product family it belongs to.</li>
+  <li>Select the API you want to enable, then click the <b>Enable</b> button.</li>
+  <li>If prompted, enable billing.</li>
+  <li>If prompted, read and accept the API's Terms of Service.</li>
+
+</ol>
+    
+
+    
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <h3 id="creatingcred" data-text="Create authorization credentials" tabindex="-1">Create authorization credentials</h3>
+
+<p>Any application that uses OAuth 2.0 to access Google APIs must have
+  authorization credentials that identify the application to Google's OAuth 2.0
+  server. The following steps explain how to create credentials for your
+  project. Your applications can then use the credentials to access APIs that
+  you have enabled for that project.</p>
+
+
+
+
+<ol>
+  <li>Go to the <a href="https://console.developers.google.com/auth/clients">Clients page</a>.</li>
+  <li>Click <b>Create client</b>.</li>
+  <li>Select the <b>Desktop app</b> application type.</li>
+  <li>In the <b>Name</b> field, enter a name for the OAuth client. This name
+    is displayed on your project's
+    <a href="https://console.developers.google.com/auth/clients">Clients page</a> to identify the client.</li>
+  <li>Click <b>Create</b>.</li>
+</ol>
+<p>
+  Your client ID and client secret are generated and displayed in the Google
+  Cloud console. Desktop apps are public clients and cannot keep secrets
+  confidential. Always use PKCE (Proof Key for Code Exchange) when requesting
+  authorization codes.
+</p>
+
+
+     
+
+    
+    <h3 id="identify-access-scopes" data-text="Identify access scopes" tabindex="-1">Identify access scopes</h3>
+
+<p>Scopes enable your application to only request access to the resources that it needs while also
+  enabling users to control the amount of access that they grant to your application. Thus, there
+  may be an inverse relationship between the number of scopes requested and the likelihood of
+  obtaining user consent.</p>
+
+<p>Before you start implementing OAuth 2.0 authorization, we recommend that you identify the scopes
+  that your app will need permission to access.</p>
+
+
+
+
+<aside class="note"><b>Note:</b> Incremental authorization is not supported for installed apps or
+  devices.</aside>
+
+
+
+
+
+<p>The <a href="/identity/protocols/oauth2/scopes">OAuth 2.0 API Scopes</a> document contains a full
+  list of scopes that you might use to access Google APIs.</p>
+
+
+<aside class="warning">If your public application uses scopes that permit access to
+  certain user data, it must complete a verification process. If you see <strong>unverified
+  app</strong> on the screen when testing your application, you must submit a
+  verification request to remove it. Find out more about
+  <a href="https://support.google.com/cloud/answer/7454865" class="external" target="_blank">unverified apps</a>
+  and get answers to <a href="https://support.google.com/cloud/answer/9110914" class="external" target="_blank">
+  frequently asked questions about app verification</a> in the Help Center.
+</aside>
+     
+
+     
+
+    
+
+    
+    <h2 id="obtainingaccesstokens" data-text="Obtaining OAuth 2.0 access tokens" tabindex="-1">Obtaining OAuth 2.0 access tokens</h2>
+
+<p>The following steps show how your application interacts with Google's OAuth 2.0 server to obtain
+  a user's consent to perform an API request on the user's behalf. Your application must have that
+  consent before it can execute a Google API request that requires user authorization.</p>
+
+
+    
+
+    
+
+    
+
+    
+
+    <h3 id="step1-code-verifier" data-text="Step 1: Generate a code verifier and challenge" tabindex="-1">Step 1: Generate a code verifier and challenge</h3>
+
+    <p>Google supports the <a href="https://tools.ietf.org/html/rfc7636">Proof Key for Code Exchange</a>
+  (PKCE) protocol to make the installed app flow more secure. A unique code verifier is created for every
+  authorization request, and its transformed value, called "code_challenge", is sent to the
+  authorization server to obtain the authorization code.</p>
+
+<h4 id="create-code-challenge" data-text="Create the code verifier" tabindex="-1">Create the code verifier</h4>
+
+<p>A <code translate="no" dir="ltr">code_verifier</code> is a high-entropy cryptographic random string using the unreserved
+  characters [A-Z] / [a-z] / [0-9] / "-" / "." / "_" / "~", with a minimum length of 43 characters
+  and a maximum length of 128 characters.</p>
+
+<p>The code verifier should have enough entropy to make it impractical to guess the value.</p>
+
+<h4 id="create-the-code-challenge" data-text="Create the code challenge" tabindex="-1">Create the code challenge</h4>
+
+<p>Two methods of creating the code challenge are supported.</p>
+
+<table class="responsive">
+  <thead>
+    <tr>
+      <th colspan="2">Code Challenge Generation Methods</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>S256 (recommended)</b></td>
+      <td>The code challenge is the Base64URL (with no padding) encoded SHA256 hash of the code
+        verifier.<br>
+        <div></div><devsite-code><pre class="notranslate" dir="ltr" is-upgraded>
+<code translate="no" dir="ltr">code_challenge</code> = BASE64URL-ENCODE(SHA256(ASCII(<code translate="no" dir="ltr">code_verifier</code>)))</pre></devsite-code>
+      </td>
+    </tr>
+    <tr>
+      <td><b>plain</b></td>
+      <td>The code challenge is the same value as the code verifier generated above.<br>
+        <div></div><devsite-code><pre class="notranslate" dir="ltr" is-upgraded>
+<code translate="no" dir="ltr">code_challenge</code> = <code translate="no" dir="ltr">code_verifier</code></pre></devsite-code>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+    <h3 id="step-2:-send-a-request-to-googles-oauth-2.0-server" data-text="Step 2: Send a request to Google's OAuth 2.0 server" tabindex="-1">Step 2: Send a request to Google's OAuth 2.0 server</h3>
+
+    <p>To obtain user authorization, send a request to Google's authorization server at
+  <code translate="no" dir="ltr">https://accounts.google.com/o/oauth2/v2/auth</code>. This endpoint handles active session lookup,
+  authenticates the user, and obtains user consent. The endpoint is only accessible over SSL, and it
+  refuses HTTP (non-SSL) connections.</p>
+
+<p>The authorization server supports the following query string parameters for installed
+  applications:</p>
+
+<table class="responsive details">
+  <thead>
+    <tr>
+      <th colspan="2">Parameters</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr id="request-parameter-client_id">
+      <td><code translate="no" dir="ltr">client_id</code></td>
+      <td><strong>Required</strong>
+        <p>The client ID for your application. You can find this value in the
+          Cloud Console
+          <a href="https://console.developers.google.com/auth/clients">Clients page</a>.</p>
+        
+      </td>
+    </tr>
+
+    
+    <tr id="request-parameter-redirect_uri">
+      <td><code translate="no" dir="ltr">redirect_uri</code></td>
+      <td><strong>Required</strong>
+        
+          <p>Determines how Google's authorization server sends a response to your app. There are
+            several redirect options available to installed apps, and you will have set up your
+            <a href="#creatingcred">authorization credentials</a> with a particular redirect method
+            in mind.</p>
+          <p>The value must exactly match one of the authorized redirect URIs for the OAuth 2.0
+            client, which you configured in your client's
+            Cloud Console
+            <a href="https://console.developers.google.com/auth/clients">Clients page</a>. If this value doesn't match an
+            authorized URI, you will get a <code translate="no" dir="ltr">redirect_uri_mismatch</code> error.</p>
+          <p>The table shows the appropriate <code translate="no" dir="ltr">redirect_uri</code> parameter value for
+            each method:</p>
+          <table class="responsive">
+            <thead>
+              <tr>
+                <th colspan="2"><code translate="no" dir="ltr">redirect_uri</code> values</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Custom URI scheme</strong></td>
+                <td><code translate="no" dir="ltr"><var translate="no">com.example.app</var>:<var translate="no">redirect_uri_path</var></code>
+                  <p>or</p>
+                  <code translate="no" dir="ltr"><var translate="no">com.googleusercontent.apps.123</var>:<var translate="no">redirect_uri_path</var>
+                  </code>
+                  <ul>
+                    <li><var translate="no">com.example.app</var> is the reverse DNS notation of a domain under
+                      your control. The custom scheme must contain a period to be valid.</li>
+                    <li><var translate="no">com.googleusercontent.apps.123</var> is the reverse DNS notation of the
+                      client ID.</li>
+                    <li><var translate="no">redirect_uri_path</var> is an optional path component, such as
+                      <code translate="no" dir="ltr">/oauth2redirect</code>. Note that the path should begin with a single
+                      slash, which is different from regular HTTP URLs.</li>
+                  </ul>
+
+                  <aside class="deprecated">
+                    <b>Note</b> : Custom URI schemes are no longer supported on Android and Chrome apps.
+                    <a href="#redirect-uri_custom-scheme">Learn more</a> about custom scheme alternatives.
+                  </aside>
+                </td>
+              </tr>
+              <tr>
+                <td><strong>Loopback IP address</strong></td>
+                <td><code translate="no" dir="ltr">http://127.0.0.1:<var translate="no">port</var></code> or
+                  <code translate="no" dir="ltr">http://[::1]:<var translate="no">port</var></code>
+                  <p>Query your platform for the relevant loopback IP address and start an HTTP
+                    listener on a random available port. Substitute <var translate="no">port</var> with the actual
+                    port number your app listens on.</p>
+                  <p>Note that support for the loopback IP address redirect option on <b>mobile
+                    apps</b> is
+                    <a href="https://developers.googleblog.com/2022/02/making-oauth-flows-safer.html#disallowed-loopback">
+                    DEPRECATED</a>.</p></td>
+              </tr>
+            </tbody>
+          </table>
+        
+      </td>
+    </tr>
+
+    
+
+    
+      
+      <tr id="request-parameter-response_type">
+        <td><code translate="no" dir="ltr">response_type</code></td>
+        <td><strong>Required</strong>
+        
+        <p>Determines whether the Google OAuth 2.0 endpoint returns an authorization code.</p>
+          
+          <p>Set the parameter value to <code translate="no" dir="ltr">code</code> for installed applications.</p>
+          
+        
+        </td>
+      </tr>
+      
+    
+
+    <tr id="request-parameter-scope">
+      <td id="scope"><code translate="no" dir="ltr">scope</code></td>
+      <td><strong>Required</strong>
+        <p>A
+          space-delimited
+          list of scopes that identify the resources that your application could access on the
+          user's behalf. These values inform the consent screen that Google displays to the
+          user.</p>
+
+        <p>Scopes enable your application to only request access to the resources that it needs
+          while also enabling users to control the amount of access that they grant to your
+          application. Thus, there is an inverse relationship between the number of scopes requested
+          and the likelihood of obtaining user consent.</p>
+        
+        
+        
+      </td>
+    </tr>
+
+    
+
+    
+    <tr id="request-parameter-code-challenge">
+      <td><code translate="no" dir="ltr">code_challenge</code></td>
+      <td><strong>Recommended</strong>
+        <p>Specifies an encoded <code translate="no" dir="ltr">code_verifier</code> that will be used as a server-side
+          challenge during authorization code exchange. See
+          <a href="/identity/protocols/oauth2/native-app#create-code-challenge">create code
+            challenge</a> for more information.</p></td>
+    </tr>
+    
+
+    
+    <tr id="request-parameter-code-challenge-method">
+      <td><code translate="no" dir="ltr">code_challenge_method</code></td>
+      <td><strong>Recommended</strong>
+        <p>Specifies what method was used to encode a <code translate="no" dir="ltr">code_verifier</code> that will be used
+          during authorization code exchange. This parameter must be used with the
+          <code translate="no" dir="ltr">code_challenge</code> parameter. The value of the <code translate="no" dir="ltr">code_challenge_method</code>
+          defaults to <code translate="no" dir="ltr">plain</code> if not present in the request that includes a
+          <code translate="no" dir="ltr">code_challenge</code>. The only supported values for this parameter are
+          <code translate="no" dir="ltr">S256</code> or <code translate="no" dir="ltr">plain</code>.</p></td>
+    </tr>
+    
+
+    
+    <tr id="request-parameter-state">
+      <td><code translate="no" dir="ltr">state</code></td>
+      <td><strong>Recommended</strong>
+        <p>Specifies any string value that your application uses to maintain state between your
+          authorization request and the authorization server's response.
+          The server returns the exact value that you send as a <code translate="no" dir="ltr">name=value</code> pair in the
+          URL fragment identifier (<code translate="no" dir="ltr">#</code>)
+           of the
+          <code translate="no" dir="ltr">redirect_uri</code> after the user consents to or denies your application's
+          access request.</p>
+        <p>You can use this parameter for several purposes, such as directing the user to the
+          correct resource in your application, sending nonces, and mitigating cross-site request
+          forgery. Since your <code translate="no" dir="ltr">redirect_uri</code> can be guessed, using a <code translate="no" dir="ltr">state</code>
+          value can increase your assurance that an incoming connection is the result of an
+          authentication request. If you generate a random string or encode the hash of a cookie or
+          another value that captures the client's state, you can validate the response to
+          additionally ensure that the request and response originated in the same browser,
+          providing protection against attacks such as
+          <a href="https://datatracker.ietf.org/doc/html/rfc6749#section-10.12">cross-site request
+          forgery</a>. See the
+          <a href="/identity/protocols/oauth2/openid-connect#createxsrftoken">OpenID Connect</a>
+          documentation for an example of how to create and confirm a <code translate="no" dir="ltr">state</code> token.</p>
+        
+        
+        <aside class="special">
+          <b>Important:</b> The OAuth client must prevent CSRF as called out in the
+          <a href="https://datatracker.ietf.org/doc/html/rfc6749#section-10.12">OAuth2 Specification
+          </a>. One way to achieve this is by using the <code translate="no" dir="ltr">state</code> parameter to maintain
+          state between your authorization request and the authorization server's response.
+        </aside>
+      </td>
+    </tr>
+    
+
+    
+
+    
+
+    
+    <tr id="request-parameter-login_hint">
+      <td><code translate="no" dir="ltr">login_hint</code></td>
+      <td><strong>Optional</strong>
+        <p>If your application knows which user is trying to authenticate, it can use this parameter
+          to provide a hint to the Google Authentication Server. The server uses the hint to
+          simplify the login flow either by prefilling the email field in the sign-in form or by
+          selecting the appropriate multi-login session.</p>
+        <p>Set the parameter value to an email address or <code translate="no" dir="ltr">sub</code> identifier, which is
+          equivalent to the user's Google ID.</p>
+        
+      </td>
+    </tr>
+    
+
+    
+
+    
+  </tbody>
+</table>
+
+
+<aside class="note"><b>Note:</b> incremental authorization with installed apps is not supported due
+  to the fact that the client cannot keep the <code translate="no" dir="ltr">client_secret</code> confidential.</aside>
+
+
+<h4 id="sample-authorization-urls" data-text="Sample authorization URLs" tabindex="-1">Sample authorization URLs</h4>
+
+<p>The tabs below show sample authorization URLs for the different redirect URI options.</p>
+
+
+
+<p>The URLs are identical except for the value of the <code translate="no" dir="ltr">redirect_uri</code> parameter. The URLs
+  also contain the required <code translate="no" dir="ltr">response_type</code> and <code translate="no" dir="ltr">client_id</code> parameters as well
+  as the optional <code translate="no" dir="ltr">state</code> parameter. Each URL contains line breaks and spaces for
+  readability.</p>
+
+<div class="ds-selector-tabs" data-ds-scope="lang">
+  <section>
+
+    <h3 class="hide-from-toc" id="custom-uri-scheme" data-text="Custom URI scheme" tabindex="-1">Custom URI scheme</h3>
+
+    
+
+    <div></div><devsite-code><pre translate="no" dir="ltr" is-upgraded>https://accounts.google.com/o/oauth2/v2/auth?
+ scope=email%20profile&amp;
+ response_type=code&amp;
+ state=security_token%3D138r5719ru3e1%26url%3Dhttps%3A%2F%2Foauth2.example.com%2Ftoken&amp;
+ redirect_uri=<strong>com.example.app%3A/oauth2redirect</strong>&amp;
+ client_id=<var translate="no">client_id</var></pre></devsite-code>
+
+  </section>
+
+  <section>
+
+    <h3 class="hide-from-toc" id="loopback-ip-address" data-text="Loopback IP address" tabindex="-1">Loopback IP address</h3>
+
+    
+
+    <div></div><devsite-code><pre translate="no" dir="ltr" is-upgraded>https://accounts.google.com/o/oauth2/v2/auth?
+ scope=email%20profile&amp;
+ response_type=code&amp;
+ state=security_token%3D138r5719ru3e1%26url%3Dhttps%3A%2F%2Foauth2.example.com%2Ftoken&amp;
+ redirect_uri=<strong>http%3A//127.0.0.1%3A9004</strong>&amp;
+ client_id=<var translate="no">client_id</var></pre></devsite-code>
+
+  </section>
+
+</div>
+
+    
+
+     
+
+    
+
+    <h3 id="userprompts" data-text="Step 3: Google prompts user for consent" tabindex="-1">Step 3: Google prompts user for consent</h3>
+
+    
+<p>In this step, the user decides whether to grant your application the requested access. At this
+  stage, Google displays a consent window that shows the name of your application and the Google API
+  services that it is requesting permission to access with the user's authorization credentials and
+  a summary of the scopes of access to be granted. The
+  user can then consent to grant access to one or more scopes requested by your application or
+  refuse the request.</p>
+
+<p>Your application doesn't need to do anything at this stage as it waits for the response from
+  Google's OAuth 2.0 server indicating whether any access was granted. That response is explained in
+  the following step.</p>
+
+
+
+<section aria-labelledby="authorization-errors">
+<h4 id="authorization-errors" data-text="Errors" tabindex="-1">Errors</h4>
+
+<p>Requests to Google's OAuth 2.0 authorization endpoint may display user-facing
+  error messages instead of the expected authentication and authorization flows.
+  Common error codes and suggested resolutions are:</p>
+
+<section aria-labelledby="authorization-errors-admin-policy-enforced">
+<h5 id="authorization-errors-admin-policy-enforced" data-text="   admin_policy_enforced " tabindex="-1">
+  <code translate="no" dir="ltr">admin_policy_enforced</code>
+</h5>
+
+<p>The Google Account is unable to authorize one or more scopes requested due to
+  the policies of their Google Workspace administrator. See the Google Workspace
+  Admin help article
+  <a href="https://support.google.com/a/answer/7281227">
+    Control which third-party &amp; internal apps access Google Workspace
+    data</a>
+  for more information about how an administrator may restrict access to all
+  scopes or sensitive and restricted scopes until access is explicitly granted
+  to your OAuth client ID.</p>
+</section>
+
+<section aria-labelledby="authorization-errors-disallowed-useragent">
+<h5 id="authorization-errors-disallowed-useragent" data-text="   disallowed_useragent " tabindex="-1">
+  <code translate="no" dir="ltr">disallowed_useragent</code>
+</h5>
+
+<p>The authorization endpoint is displayed inside an embedded user-agent
+  disallowed by Google's
+  <a href="/identity/protocols/oauth2/policies#browsers">OAuth 2.0
+    Policies</a>.</p>
+
+<p>iOS and macOS developers may encounter this error when opening authorization
+  requests in
+  <a href="https://developer.apple.com/documentation/webkit/wkwebview"><code translate="no" dir="ltr">WKWebView</code></a>.
+  Developers should instead use iOS libraries such as
+  <a href="/identity/sign-in/ios">Google Sign-In for iOS</a> or OpenID
+  Foundation's
+  <a href="https://openid.github.io/AppAuth-iOS/">AppAuth for
+    iOS</a>.</p>
+<p>Web developers may encounter this error when an iOS or macOS app opens a
+  general web link in an embedded user-agent and a user navigates to Google's
+  OAuth 2.0 authorization endpoint from your site. Developers should allow
+  general links to open in the default link handler of the operating system,
+  which includes both
+  <a href="https://developer.apple.com/ios/universal-links/">Universal Links</a>
+  handlers or the default browser app. The
+  <a href="https://developer.apple.com/documentation/safariservices/sfsafariviewcontroller"><code translate="no" dir="ltr">SFSafariViewController</code></a>
+  library is also a supported option.</p>
+</section>
+
+<section aria-labelledby="authorization-errors-org-internal">
+<h5 id="authorization-errors-org-internal" data-text="org_internal" tabindex="-1"><code translate="no" dir="ltr">org_internal</code></h5>
+
+<p>The OAuth client ID in the request is part of a project limiting access to
+  Google Accounts in a specific
+  <a href="https://cloud.google.com/resource-manager/docs/cloud-platform-resource-hierarchy#organizations">Google Cloud Organization</a>.
+  For more information about this configuration option see the
+  <a href="https://support.google.com/cloud/answer/10311615#user-type">User type</a>
+  section in the Setting up your OAuth consent screen help article.</p>
+</section>
+
+
+
+<section aria-labelledby="authorization-errors-deleted-client">
+  <h5 id="authorization-errors-deleted-client" data-text="deleted_client" tabindex="-1"><code translate="no" dir="ltr">deleted_client</code></h5>
+
+  <p>The OAuth client being used to make the request has been deleted. Deletion
+    can happen manually or automatically in the case of
+    <a href="https://support.google.com/cloud/answer/15549257#unused-client-deletion">unused clients</a>. Deleted clients can be restored
+    within 30 days of the deletion.
+    <a href="https://support.google.com/cloud/answer/15549257#delete-oauth-clients">Learn more</a>.
+  </p>
+</section>
+
+<section aria-labelledby="authorization-errors-invalid-grant">
+  <h5 id="authorization-errors-invalid-grant" data-text="invalid_grant" tabindex="-1"><code translate="no" dir="ltr">invalid_grant</code></h5>
+
+  <p>
+    
+
+    
+
+    
+    If you are using a
+    <a href="/identity/protocols/oauth2/native-app#step1-code-verifier">code
+      verifier and challenge</a>, the <code translate="no" dir="ltr">code_challenge</code> parameter is
+    invalid or missing. Ensure that the <code translate="no" dir="ltr">code_challenge</code> parameter is
+    set correctly.</p>
+  <p><a href="#offline">When refreshing an access token</a>, the token may have
+    expired or has been invalidated.
+    
+
+    Authenticate the user again and ask for user consent to obtain new tokens.
+    If you are continuing to see this error, ensure that your application has
+    been configured correctly and that you are using the correct tokens and
+    parameters in your request. Otherwise, the user account may have been
+    deleted or disabled.</p>
+</section>
+
+
+
+<section aria-labelledby="authorization-errors-redirect-uri-mismatch">
+<h5 id="authorization-errors-redirect-uri-mismatch" data-text="   redirect_uri_mismatch " tabindex="-1">
+  <code translate="no" dir="ltr">redirect_uri_mismatch</code>
+</h5>
+
+<p>The <code translate="no" dir="ltr">redirect_uri</code> passed in the authorization request does not
+  match an authorized redirect URI for the OAuth client ID. Review authorized
+  redirect URIs in the Google Cloud Console
+  <a href="https://console.developers.google.com/auth/clients">Clients page</a>.</p>
+
+
+<p>The passed <code translate="no" dir="ltr">redirect_uri</code> may be invalid for the client type.</p>
+
+
+
+
+<p>The <code translate="no" dir="ltr">redirect_uri</code> parameter may refer to the OAuth out-of-band
+  (OOB) flow that has been deprecated and is no longer supported. Refer to the
+  <a href="/identity/protocols/oauth2/resources/oob-migration">migration
+    guide</a> to update your integration.</p>
+</section>
+
+<section aria-labelledby="authorization-errors-invalid-request">
+  <h5 id="authorization-errors-invalid-request" data-text="     invalid_request   " tabindex="-1">
+    <code translate="no" dir="ltr">invalid_request</code>
+  </h5>
+  <p>There was something wrong with the request you made. This could be due to
+    a number of reasons:</p>
+
+  <ul>
+    <li>The request was not properly formatted</li>
+    <li>The request was missing required parameters</li>
+    <li>The request uses an authorization method that Google doesn't support.
+      Verify your OAuth integration uses a recommended integration method</li>
+    
+    <li>An unsupported custom scheme was used for the redirect uri. If you see
+      the error message <strong>Custom URI scheme is not supported on Android or
+      Chrome apps</strong>,
+      <a href="#redirect-uri_custom-scheme">learn more</a> about custom URI
+      scheme alternatives.</li>
+    
+  </ul>
+</section>
+
+</section>
+
+     
+
+    
+    
+
+    <h3 id="handlingresponse" data-text="Step 4: Handle the OAuth 2.0 server response" tabindex="-1">Step 4: Handle the OAuth 2.0 server response</h3>
+
+    <p>The manner in which your application receives the authorization response depends on the
+      <a href="#creatingcred">redirect URI scheme</a> that it uses. Regardless of the scheme, the
+      response will either contain an authorization code (<code translate="no" dir="ltr">code</code>) or an error
+      (<code translate="no" dir="ltr">error</code>). For example, <code translate="no" dir="ltr">error=access_denied</code> indicates that the user
+      declined the request.</p>
+
+
+    <p>If the user grants access to your application, you can exchange the authorization code for an
+      access token and a refresh token as described in the next step.</p>
+
+     
+
+    <h3 id="exchange-authorization-code" data-text="Step 5: Exchange authorization code for refresh and access       tokens" tabindex="-1">Step 5: Exchange authorization code for refresh and access
+      tokens</h3>
+
+    
+    
+
+    
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<p>To exchange an authorization code for an access token, call the
+  <code translate="no" dir="ltr">https://oauth2.googleapis.com/token</code> endpoint and set the following parameters:</p>
+
+<table class="responsive">
+  <thead>
+    <tr>
+      <th colspan="2">Fields</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code translate="no" dir="ltr">client_id</code></td>
+      <td>The client ID obtained from the Cloud Console
+        <a href="https://console.developers.google.com/auth/clients">Clients page</a>.</td>
+    </tr>
+
+    <tr>
+      <td><code translate="no" dir="ltr">client_secret</code></td>
+      <td><strong>Optional</strong>
+        <p>The client secret obtained from the Cloud Console
+        <a href="https://console.developers.google.com/auth/clients">Clients page</a>.</p></td>
+    </tr>
+
+    <tr>
+      <td><code translate="no" dir="ltr">code</code></td>
+      <td>The authorization code returned from the initial request.</td>
+    </tr>
+
+    
+    <tr>
+      <td><code translate="no" dir="ltr">code_verifier</code></td>
+      <td>The code verifier you created in
+        <a href="/identity/protocols/oauth2/native-app#step1-code-verifier">Step 1</a>.</td>
+    </tr>
+    
+
+    <tr>
+      <td><code translate="no" dir="ltr">grant_type</code></td>
+      <td><a href="https://tools.ietf.org/html/rfc6749#section-4.1.3">As defined in the OAuth 2.0
+        specification</a>, this field's value must be set to <code translate="no" dir="ltr">authorization_code</code>.</td>
+    </tr>
+    <tr>
+      <td><code translate="no" dir="ltr">redirect_uri</code></td>
+      <td>One of the redirect URIs listed for your project in the
+        Cloud Console
+        <a href="https://console.developers.google.com/auth/clients">Clients page</a> for the given
+        <code translate="no" dir="ltr">client_id</code>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>While the use of DPoP is optional, it is recommended for increased security.
+  The security of DPoP relies on the private key being restricted to a single device; we recommend
+  storing it in a way that it cannot be copied off-device, for example by using TPMs, Secure
+  Enclaves, or other hardware-backed keystores.
+
+  To use DPoP, your application must generate a new, unique DPoP proof JWT for each request to
+  the token endpoint and add it as a HTTP request header.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Header</th>
+      <th>Required</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code translate="no" dir="ltr">DPoP</code></td>
+      <td>Optional</td>
+      <td>A <a href="https://tools.ietf.org/html/rfc9449">DPoP proof</a> is a JWT that proves the
+        possession of a private key. This is a header, not a parameter. If provided, the returned
+        tokens are bound to this key. A new, unique proof must be generated for each request and
+        must include <code translate="no" dir="ltr">htm</code> (HTTP method) and <code translate="no" dir="ltr">htu</code> (HTTP URI) claims that
+        match the request.</td>
+    </tr>
+  </tbody>
+</table>
+<p>The following snippet shows a sample request:</p>
+
+
+<div></div><devsite-code><pre class="notranslate" dir="ltr" is-upgraded>POST /token HTTP/1.1
+Host: oauth2.googleapis.com
+Content-Type: application/x-www-form-urlencoded
+DPoP: [redacted: an example signed token]
+
+code=4/P7q7W91a-oMsCeLvIaQm6bTrgtp7&amp;
+client_id=<var class="apiparam" translate="no">your_client_id</var>&amp;
+redirect_uri=http://127.0.0.1:9004&amp;
+grant_type=authorization_code
+</pre></devsite-code>
+
+<h4 id="constructing-dpop-proof" data-text="Construct a DPoP proof" tabindex="-1">Construct a DPoP proof</h4>
+
+<p>The following steps show how to construct a DPoP proof using OpenSSL from the command line:</p>
+
+<ol>
+  <li><strong>Generate an EC P-256 key pair:</strong>
+    <div></div><devsite-code><pre class="notranslate" dir="ltr" is-upgraded>openssl ecparam -name prime256v1 -genkey -noout -out dpop_private.pem
+openssl ec -in dpop_private.pem -pubout -out dpop_public.pem</pre></devsite-code>
+  </li>
+  <li><strong>Create the DPoP header:</strong>
+    <p>The header must include the <code translate="no" dir="ltr">typ</code>, <code translate="no" dir="ltr">alg</code>, and
+      <code translate="no" dir="ltr">jwk</code> (public key) claims. The <code translate="no" dir="ltr">x</code> and <code translate="no" dir="ltr">y</code>
+      values are the Base64Url-encoded coordinates of your EC public key.
+      Base64Url encode this JSON:</p>
+    <div></div><devsite-code><pre class="notranslate" dir="ltr" is-upgraded>{
+  "typ":"dpop+jwt",
+  "alg":"ES256",
+  "jwk": {
+    "kty":"EC",
+    "x":"<var translate="no">YOUR_PUBLIC_KEY_X</var>",
+    "y":"<var translate="no">YOUR_PUBLIC_KEY_Y</var>",
+    "crv":"P-256"
+  }
+}</pre></devsite-code>
+  </li>
+  <li><strong>Create the DPoP payload:</strong>
+    <p>The payload must include <code translate="no" dir="ltr">jti</code> (a unique identifier for the request),
+      <code translate="no" dir="ltr">htm</code> (HTTP method, e.g., <code translate="no" dir="ltr">POST</code>), <code translate="no" dir="ltr">htu</code>
+      (HTTP URI, e.g., <code translate="no" dir="ltr">https://oauth2.googleapis.com/token</code>), and
+      <code translate="no" dir="ltr">iat</code> (issued at time). If you received a nonce from the server in a
+      <code translate="no" dir="ltr">DPoP-Nonce</code> header on the response to a previous request, you must include that
+      nonce value in a <code translate="no" dir="ltr">nonce</code> claim. The nonce claim is optional for authorization
+      code exchanges and used only when the DPoP-Nonce header was previously received.
+      Base64Url encode this JSON:</p>
+    <div></div><devsite-code><pre class="notranslate" dir="ltr" is-upgraded>{
+  "jti":"<var translate="no">JTI_VALUE</var>",
+  "htm":"POST",
+  "htu":"https://oauth2.googleapis.com/token",
+  "iat":<var translate="no">YOUR_JWT_ISSUED_TIME</var>,
+  "nonce":"<var translate="no">SERVER_PROVIDED_NONCE</var>"
+}</pre></devsite-code>
+    <p>The <code translate="no" dir="ltr">jti</code> value depends on the type of exchange:</p>
+    <ul>
+      <li>For <strong>authorization code exchanges</strong>, the <code translate="no" dir="ltr">jti</code> must be the
+        Base64Url-encoded SHA256 hash of the authorization code:
+        <code translate="no" dir="ltr">"jti":"<var translate="no">BASE64URL(SHA256(AUTHORIZATION_CODE))</var>"</code>.</li>
+      <li>For <strong>refresh token exchanges</strong>, the <code translate="no" dir="ltr">jti</code> must be a unique
+        per-request identifier:
+        <code translate="no" dir="ltr">"jti":"<var translate="no">YOUR_UNIQUE_PER_REQUEST_IDENTIFIER</var>"</code>.</li>
+    </ul>
+  </li>
+  <li><strong>Sign the proof:</strong>
+    <p>Concatenate the encoded header and payload with a period (<code translate="no" dir="ltr">.</code>),
+      then sign the result with your private key using ES256. Note that JWS
+      requires the signature to be in a raw <code translate="no" dir="ltr">R | S</code> concatenated
+      format (64 bytes for P-256). If using OpenSSL directly, you must convert
+      the default ASN.1 DER-encoded signature to this raw format.</p>
+  </li>
+</ol>
+
+<p>A <strong>successful exchange</strong> is indicated by a <code translate="no" dir="ltr">200 OK</code>
+  response containing the tokens. If a valid DPoP proof is used during
+  the exchange, the refresh token Google returns will be DPoP-bound to your key, but access tokens
+  won't be DPoP bound. Access tokens will retain the <code translate="no" dir="ltr">token_type</code> of
+  <code translate="no" dir="ltr">Bearer</code> rather than <code translate="no" dir="ltr">DPoP</code>.
+  Additionally, Google returns a <code translate="no" dir="ltr">DPoP-Nonce</code> HTTP header in the response.
+  Your client must cache this nonce and include it in the <code translate="no" dir="ltr">nonce</code> claim of the DPoP proof
+  in subsequent requests (such as when exchanging a refresh token for a new access token, or when
+  calling DPoP-protected APIs). By using this early-issued nonce, you can avoid an extra round-trip
+  failure (<code translate="no" dir="ltr">use_dpop_nonce</code>) on your next request.</p>
+<p>DPoP proofs must be included for token exchange requests made with DPoP-bound refresh tokens.</p>
+
+<p id="failed-exchange-errors">A <strong>failed exchange</strong> occurs if the <code translate="no" dir="ltr">DPoP</code> header is
+  missing when expected, invalid, or if the proof uses a different key than the
+  one bound to the token. In these cases, the server returns a
+  <code translate="no" dir="ltr">400 Bad Request</code> error.
+  If the DPoP proof has mismatching <code translate="no" dir="ltr">htm</code> or <code translate="no" dir="ltr">htu</code> claims, an expired
+  <code translate="no" dir="ltr">iat</code>, an invalid <code translate="no" dir="ltr">jti</code>, or an invalid signature, Google returns an
+  <code translate="no" dir="ltr">invalid_dpop_proof</code> error code.
+  If a DPoP nonce is required, such as during a refresh token exchange, and the DPoP proof is
+  missing a <code translate="no" dir="ltr">nonce</code> claim, or the nonce value is unacceptable to the server (for
+  example, if it is expired or invalid), Google returns a <code translate="no" dir="ltr">use_dpop_nonce</code>
+  error code along with a <code translate="no" dir="ltr">DPoP-Nonce</code> HTTP header containing a new nonce that you can
+  use in a subsequent request.
+  Other failures might return <code translate="no" dir="ltr">invalid_grant</code>.</p>
+
+<p>Google responds to this request by returning a JSON object that contains a short-lived access
+  token and a refresh token.
+
+</p>
+
+<p>The response contains the following fields:</p>
+
+<table class="responsive details">
+  <thead>
+    <tr>
+      <th colspan="2">Fields</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code translate="no" dir="ltr">access_token</code></td>
+      <td>The token that your application sends to authorize a Google API request.</td>
+    </tr>
+    <tr>
+      <td><code translate="no" dir="ltr">expires_in</code></td>
+      <td>The remaining lifetime of the access token in seconds.</td>
+    </tr>
+
+    
+    <tr>
+      <td><code translate="no" dir="ltr">id_token</code></td>
+      <td><b>Note:</b> This property is only returned if your request included an identity scope,
+        such as <code translate="no" dir="ltr">openid</code>, <code translate="no" dir="ltr">profile</code>, or <code translate="no" dir="ltr">email</code>. The value is a
+        JSON Web Token (JWT) that contains digitally signed identity information about the
+        user.</td>
+    </tr>
+    
+    <tr>
+      <td><code translate="no" dir="ltr">refresh_token</code></td>
+      <td>A token that you can use to obtain a new access token. Refresh tokens are valid until the
+        user revokes access or the refresh token expires. If DPoP was used, the
+        refresh token is bound to the private key used to sign the DPoP proof.
+    
+        Note that refresh tokens are always returned for installed applications.
+    
+      </td>
+    </tr>
+    <tr>
+      <td><code translate="no" dir="ltr">refresh_token_expires_in</code></td>
+      <td>The remaining lifetime of the refresh token in seconds. This value is only set when the
+      user grants <a href="/identity/protocols/oauth2/web-server#time-based-access">time-based
+      access</a>.
+      </td>
+    </tr>
+    <tr>
+      <td><code translate="no" dir="ltr">scope</code></td>
+      <td>The scopes of access granted by the <code translate="no" dir="ltr">access_token</code> expressed as a list of
+        space-delimited, case-sensitive strings.</td>
+    </tr>
+    <tr>
+      <td><code translate="no" dir="ltr">token_type</code></td>
+      <td>The type of token returned. This value is always <code translate="no" dir="ltr">Bearer</code>, even when DPoP is used.</td>
+    </tr>
+  </tbody>
+</table>
+
+<aside class="key-point"><b>Important:</b> Your application should store both tokens in a secure,
+  long-lived location that is accessible between different invocations of your application. The
+  refresh token enables your application to obtain a new access token if the one that you have
+  expires. As such, if your application loses the refresh token, the user will need to repeat the
+  OAuth 2.0 consent flow so that your application can obtain a new refresh token.</aside>
+
+
+
+<p>The following snippet shows a sample successful response headers and body when DPoP is used:</p>
+
+<div></div><devsite-code><pre class="notranslate" dir="ltr" is-upgraded>HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+DPoP-Nonce: AN3XwJjZsjnb0ZuWkRlek8QU7wY-Zhf-5IP6tO0tORz0KgtDT1Bo8FX-w4nz3r5lnepI
+
+{
+  "access_token": "1/fFAGRNJru1FTz70BzhT3Zg",
+  "expires_in": 3920,
+  "token_type": "Bearer",
+  "scope": "https://www.googleapis.com/auth/drive.metadata.readonly https://www.googleapis.com/auth/calendar.readonly",
+  "refresh_token": "1//[redacted: an example refresh token]"
+}</pre></devsite-code>
+
+<aside class="note"><b>Note:</b> Your application should ignore any unrecognized fields included in
+  the response.</aside>
+
+<aside class="note"><b>Note:</b> If your application already has a refresh token for
+  the user and you want to obtain a new DPoP-bound refresh token, the user must
+  revoke the existing grant or you must use the <code translate="no" dir="ltr">prompt=consent</code>
+  parameter in the initial authorization request to ensure a new refresh token is
+  issued.</aside>
+
+    
+     
+
+    
+
+    <h3 id="check-granted-scopes" data-text="Step 6: Check which scopes users granted" tabindex="-1">Step 6: Check which scopes users granted</h3>
+
+    <p>When requesting <b>multiple</b> permissions (scopes), users may not grant your app access to
+      all of them. Your app must verify which scopes were actually granted and gracefully handle
+      situations where some permissions are denied, typically by disabling the features that rely
+      on those denied scopes.</p>
+
+    <p>However, there are exceptions. Google Workspace Enterprise apps with
+      <a href="https://support.google.com/a/answer/162106">domain-wide delegation of authority</a>,
+      or apps marked as
+      <a href="https://support.google.com/a/answer/7281227#zippy=%2Cchange-access-from-the-app-list">Trusted</a>,
+      bypass the granular permissions consent screen. For these apps, users won't see the
+      granular permission consent screen. Instead, your app will either receive all requested
+      scopes or none.</p>
+
+    <p>For more detailed information, see
+      <a href="/identity/protocols/oauth2/resources/granular-permissions">How to handle granular permissions</a>.
+    </p>
+    
+
+    <p>
+  To check whether the user has granted your application access to a particular scope,
+  exam the <code translate="no" dir="ltr">scope</code> field in the access token response. The scopes of access granted by
+  the access_token expressed as a list of space-delimited, case-sensitive strings.
+</p>
+
+<p>
+  For example, the following sample access token response indicates that the user has granted your
+  application access to the read-only Drive activity and Calendar events permissions:
+</p>
+
+<div></div><devsite-code><pre class="devsite-click-to-copy" translate="no" dir="ltr" is-upgraded syntax="Carbon" syntax-guessed><span class="devsite-syntax-w">  </span><span class="devsite-syntax-p">{</span>
+<span class="devsite-syntax-w">    </span><span class="devsite-syntax-s">"access_token"</span><span class="devsite-syntax-p">:</span><span class="devsite-syntax-w"> </span><span class="devsite-syntax-s">"1/fFAGRNJru1FTz70BzhT3Zg"</span><span class="devsite-syntax-p">,</span>
+<span class="devsite-syntax-w">    </span><span class="devsite-syntax-s">"expires_in"</span><span class="devsite-syntax-p">:</span><span class="devsite-syntax-w"> </span><span class="devsite-syntax-mi">3920</span><span class="devsite-syntax-p">,</span>
+<span class="devsite-syntax-w">    </span><span class="devsite-syntax-s">"token_type"</span><span class="devsite-syntax-p">:</span><span class="devsite-syntax-w"> </span><span class="devsite-syntax-s">"Bearer"</span><span class="devsite-syntax-p">,</span>
+<span class="devsite-syntax-w">    </span><b><span class="devsite-syntax-s">"scope"</span><span class="devsite-syntax-p">:</span><span class="devsite-syntax-w"> </span><span class="devsite-syntax-s">"https://www.googleapis.com/auth/drive.metadata.readonly https://www.googleapis.com/auth/calendar.readonly"</span></b><span class="devsite-syntax-p">,</span>
+<span class="devsite-syntax-w">    </span><span class="devsite-syntax-s">"refresh_token"</span><span class="devsite-syntax-p">:</span><span class="devsite-syntax-w"> </span><span class="devsite-syntax-s">"1//[redacted: an example refresh token]"</span>
+<span class="devsite-syntax-w">  </span><span class="devsite-syntax-p">}</span></pre></devsite-code>
+
+     
+
+    
+
+    <h2 id="callinganapi" data-text="Call Google APIs" tabindex="-1">Call Google APIs</h2>
+
+    
+     
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<p>After your application obtains an access token, you can use the token to make calls to a Google
+  API on behalf of a given
+  user account if the scope(s) of access required by the API have been granted. To do this, include
+  the access token in a request to the API by including either an <code translate="no" dir="ltr">access_token</code> query
+  parameter or an <code translate="no" dir="ltr">Authorization</code> HTTP header <code translate="no" dir="ltr">Bearer</code> value. When possible,
+  the HTTP header is preferable, because query strings tend to be visible in server logs. In most
+  cases you can use a client library to set up your calls to Google APIs (for example, when
+  <a href="/drive/api/v2/reference#Files">calling the Drive Files API</a>).</p>
+
+
+
+<p>You can try out all the Google APIs and view their scopes at the
+  <a href="https://developers.google.com/oauthplayground/">OAuth 2.0 Playground</a>.</p>
+
+<h4 id="http-get-examples" data-text="HTTP GET examples" tabindex="-1">HTTP GET examples</h4>
+
+<p>A call to the
+  <a href="/drive/v2/reference/files/list">
+    <code translate="no" dir="ltr">drive.files</code></a>
+  endpoint (the Drive Files API) using the <code translate="no" dir="ltr">Authorization: Bearer</code> HTTP
+  header might look like the following. Note that you need to specify your own access token:<p>
+
+<div></div><devsite-code><pre translate="no" dir="ltr" is-upgraded>
+GET /drive/v2/files HTTP/1.1
+Host: www.googleapis.com
+<strong>Authorization: Bearer <var translate="no">access_token</var></strong></pre></devsite-code>
+
+<p>Here is a call to the same API for the authenticated user using the <code translate="no" dir="ltr">access_token</code>
+  query string parameter:</p>
+
+<div></div><devsite-code><pre translate="no" dir="ltr" is-upgraded>
+GET https://www.googleapis.com/drive/v2/files?access_token=<var translate="no">access_token</var></pre></devsite-code>
+
+<h4 id="curl-examples" data-text="curl examples" tabindex="-1"><code translate="no" dir="ltr">curl</code> examples</h4>
+
+<p>You can test these commands with the <code translate="no" dir="ltr">curl</code> command-line application. Here's an
+  example that uses the HTTP header option (preferred):</p>
+
+<div></div><devsite-code><pre class="devsite-terminal" translate="no" dir="ltr" is-upgraded>
+curl -H "Authorization: Bearer <var translate="no">access_token</var>" https://www.googleapis.com/drive/v2/files</pre></devsite-code>
+
+<p>Or, alternatively, the query string parameter option:</p>
+
+<div></div><devsite-code><pre class="devsite-terminal" translate="no" dir="ltr" is-upgraded>
+curl https://www.googleapis.com/drive/v2/files?access_token=<var translate="no">access_token</var></pre></devsite-code>
+     
+
+     
+     
+
+    
+
+    <h2 id="offline" data-text="Refresh an access token" tabindex="-1">Refresh an access token</h2>
+
+    
+
+<p>Access tokens periodically expire and become invalid credentials for a related API request. You
+  can refresh an access token without prompting the user for permission (including when the user is
+  not present) if you requested offline access to the scopes associated with the token.</p>
+
+    
+     
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<p>To refresh an access token, your application sends an HTTPS <code class="notranslate" dir="ltr">POST</code>
+  request to Google's authorization server (<code translate="no" dir="ltr">https://oauth2.googleapis.com/token</code>) that
+  includes the following parameters in the request body:</p>
+
+<table class="responsive">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code translate="no" dir="ltr">client_id</code></td>
+      <td>The client ID obtained from the <a href="https://console.developers.google.com/">API Console</a>.</td>
+    </tr>
+    <tr>
+      <td><code translate="no" dir="ltr">client_secret</code></td>
+      <td><strong>Optional</strong>
+        <p>The client secret obtained from the <a href="https://console.developers.google.com/">API Console</a>.
+        
+        (The <code translate="no" dir="ltr">client_secret</code> is not applicable to requests from clients registered as
+        Android, iOS, or Chrome applications.)
+        </p>
+      </td>
+    </tr>
+    <tr>
+      <td><code translate="no" dir="ltr">grant_type</code></td>
+      <td>As
+        <a href="https://tools.ietf.org/html/rfc6749#section-6">defined in the
+          OAuth 2.0 specification</a>,
+        this field's value must be set to <code translate="no" dir="ltr">refresh_token</code>.</td>
+    </tr>
+    <tr>
+      <td><code translate="no" dir="ltr">refresh_token</code></td>
+      <td>The refresh token returned from the authorization code exchange.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>While the use of DPoP is optional, it is recommended for increased security.
+  To use DPoP with a refresh token, your application must generate a new, unique DPoP proof JWT
+  for each request to the token endpoint. This proof must be signed with the same private key that
+  was used during the initial authorization code exchange. Your application adds the proof as a
+  HTTP request header.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Header</th>
+      <th>Required</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code translate="no" dir="ltr">DPoP</code></td>
+      <td>Optional</td>
+      <td>A <a href="https://tools.ietf.org/html/rfc9449">DPoP proof</a> is a JWT that proves the
+        possession of a private key. This is a header, not a parameter. If provided, the returned
+        tokens are bound to this key. A new, unique proof must be generated for each request and
+        must include <code translate="no" dir="ltr">htm</code> (HTTP method) and <code translate="no" dir="ltr">htu</code> (HTTP URI) claims that
+        match the request.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>The following snippet shows a sample request:</p>
+
+<div></div><devsite-code><pre class="notranslate" dir="ltr" is-upgraded>
+POST /token HTTP/1.1
+Host: oauth2.googleapis.com
+Content-Type: application/x-www-form-urlencoded
+DPoP: <var translate="no">DPOP_PROOF_JWT</var>
+
+client_id=<var translate="no">your_client_id</var>&amp;
+refresh_token=<var translate="no">refresh_token</var>&amp;
+grant_type=refresh_token</pre></devsite-code>
+
+<p>To use DPoP with a refresh token, you must generate a new, unique DPoP proof JWT
+  for the request. See <a href="#constructing-dpop-proof">Construct a DPoP proof</a>
+  for step-by-step instructions on generating the key pair and constructing the JWT.</p>
+
+<p>A <strong>successful exchange</strong> is indicated by a <code translate="no" dir="ltr">200 OK</code>
+  response containing a new access token. When DPoP is used, the
+  <code translate="no" dir="ltr">token_type</code> is <code translate="no" dir="ltr">Bearer</code>. A successful response confirms
+  the DPoP proof for the refresh token was accepted. Google may also return a new
+  <code translate="no" dir="ltr">DPoP-Nonce</code> HTTP header in the response; if returned, your client must cache this
+  nonce and include it in the <code translate="no" dir="ltr">nonce</code> claim of the DPoP proof in subsequent requests.</p>
+
+<p>A <strong>failed exchange</strong> occurs if the <code translate="no" dir="ltr">DPoP</code> header is missing, invalid, or uses an incorrect key. For details on specific DPoP error codes and handling nonces, see <a href="#failed-exchange-errors">Failed exchange</a>.</p>
+
+<p>The following snippet shows a sample successful response headers and body when DPoP is used:</p>
+
+<div></div><devsite-code><pre class="notranslate" dir="ltr" is-upgraded>HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+DPoP-Nonce: AN3XwJjZsjnb0ZuWkRlek8QU7wY-Zhf-5IP6tO0tORz0KgtDT1Bo8FX-w4nz3r5lnepI
+
+{
+  "access_token": "1/fFAGRNJru1FTz70BzhT3Zg",
+  "expires_in": 3920,
+  "scope": "https://www.googleapis.com/auth/drive.metadata.readonly https://www.googleapis.com/auth/calendar.readonly",
+  "token_type": "Bearer"
+}</pre></devsite-code>
+
+<p>Note that there are limits on the number of refresh tokens that will be issued; one limit per
+  client/user combination, and another per user across all clients. You should save refresh tokens
+  in long-term storage and continue to use them as long as they remain valid. If your application
+  requests too many refresh tokens, it may run into these limits, in which case older refresh tokens
+  will stop working.</p>
+    
+
+    
+
+    <h2 id="tokenrevoke" data-text="Token revocation" tabindex="-1">Token revocation</h2>
+
+<p>In some cases a user may wish to revoke access given to an application. A user can revoke access
+  by visiting <a href="https://myaccount.google.com/permissions" class="external">
+  Account Settings</a>. See the
+  <a href="https://support.google.com/accounts/answer/3466521#remove-access" class="external">Remove
+    site or app access section of the Third-party sites &amp; apps with access to your account</a>
+  support document for more information.</p>
+
+<p>It is also possible for an application to programmatically revoke the access given to it.
+  Programmatic revocation is important in instances where a user unsubscribes, removes an
+  application, or the API resources required by an app have significantly changed. In other words,
+  part of the removal process can include an API request to ensure the permissions previously
+  granted to the application are removed.</p>
+
+    
+
+    
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<p>To programmatically revoke a token, your application makes a request to
+<code translate="no" dir="ltr">https://oauth2.googleapis.com/revoke</code> and includes the token as a parameter:</p>
+
+<div></div><devsite-code><pre class="devsite-terminal" translate="no" dir="ltr" is-upgraded>
+curl -d -X -POST --header "Content-type:application/x-www-form-urlencoded" \
+        https://oauth2.googleapis.com/revoke?token=<var translate="no">{token}</var></pre></devsite-code>
+
+<p>The token can be an access token or a refresh token. If the token is an access token and it has a
+  corresponding refresh token, the refresh token will also be revoked.</p>
+
+
+
+<p>If the revocation is successfully processed, then the HTTP status code of the response is
+  <code translate="no" dir="ltr">200</code>. For error conditions, an HTTP status code <code translate="no" dir="ltr">400</code> is returned along
+  with an error code.</p>
+
+
+
+<aside class="key-point">
+<b>Key Point:</b> Revocation removes all OAuth 2.0 scopes previously granted to a project, invalidating any issued access or refresh tokens for all clients registered under that project.
+</aside>
+    
+
+    
+
+    <aside class="note"><b>Note:</b> Following a successful revocation response, it might take some
+  time before the revocation has full effect.</aside>
+
+    
+
+    
+    <h2 id="installed_app_redirect_methods" data-text="App redirect methods" tabindex="-1">App redirect methods</h2>
+
+<section>
+  <h3 id="redirect-uri_custom-scheme" data-text="Custom URI scheme" tabindex="-1">Custom URI scheme</h3>
+
+  <p>
+    Custom URI schemes are a form of deeplinking that use a custom-defined scheme to open your app.
+  </p>
+
+  <aside class="deprecated">
+    <b>Important:</b> Custom URI schemes are no longer supported due to the risk of app
+    impersonation.
+  </aside>
+
+  <h4 id="alternative-to-using-custom-uri-schemes-on-chrome-apps" data-text=" Alternative to using custom URI schemes on Chrome apps" tabindex="-1"> Alternative to using custom URI schemes on Chrome apps</h4>
+    <p>
+      Use the
+      <a href="https://developer.chrome.com/docs/extensions/mv3/tut_oauth/">Chrome Identity API</a>
+      which delivers the OAuth 2.0 response directly to your app, eliminating the need for a
+      redirect URI.
+    </p>
+</section>
+
+<section>
+  <h3 id="redirect-uri_loopback" data-text="Loopback IP address (macOS, Linux, Windows desktop)" tabindex="-1">Loopback IP address (macOS, Linux, Windows desktop)</h3>
+
+    <aside class="deprecated"><b>Important:</b> The loopback IP address redirect option is
+      DEPRECATED for <b>Android</b>, <b>Chrome app</b> and <b>iOS</b> OAuth client types.
+      Review the <a href="/identity/protocols/oauth2/resources/loopback-migration">loopback IP
+      address migration guide</a> for instructions on how to migrate to a supported alternative.
+  </aside>
+
+  <p>To receive the authorization code using this URL, your application must be listening on the
+    local web server. That is possible on many, but not all, platforms. However, if your platform
+    supports it, this is the recommended mechanism for obtaining the authorization code.</p>
+  <p>When your app receives the authorization response, for best usability it should respond by
+    displaying an HTML page that instructs the user to close the browser and return to your app.</p>
+
+  <table class="responsive details">
+    <tr>
+      <td><b>Recommended usage</b></td>
+      <td>macOS, Linux, and Windows desktop apps</td>
+    </tr>
+    <tr>
+      <td><b>Form values</b></td>
+      <td>Set the application type to <b>Desktop app</b>.</td>
+    </tr>
+  </table>
+
+  <aside class="note"><b>Note:</b> See the
+    <a href="#request-parameter-redirect_uri"><code translate="no" dir="ltr">redirect_uri</code></a> parameter definition for
+    more information about the loopback IP address. It is also possible to use
+    <code translate="no" dir="ltr">localhost</code> in place of the loopback IP, but this configuration may cause issues with
+    client firewalls. Most, but not all, firewalls allow loopback communication.</aside>
+</section>
+
+<section>
+  <h3 id="manual-copypaste-deprecated" data-text="Manual copy/paste (Deprecated)" tabindex="-1">Manual copy/paste (Deprecated)</h3>
+
+  <aside class="deprecated"><b>Important:</b> The manual copy/paste option, also referred to as an
+    out of band (OOB) redirect method, is
+    <a href="https://developers.googleblog.com/2022/02/making-oauth-flows-safer.html">
+      no longer supported</a>.
+    Review the <a href="/identity/protocols/oauth2/resources/oob-migration">OOB migration guide</a>
+    for instructions on how to migrate to a secure alternative.
+  </aside>
+
+</section>
+    
+
+    
+
+    <h2 id="protect_your_apps" data-text="Protect your apps" tabindex="-1">Protect your apps</h2>
+    
+
+
+
+
+
+
+
+
+
+
+
+<section>
+  <h3 id="verify-app-ownership" data-text="Verify app ownership for Chrome" tabindex="-1">Verify app ownership for Chrome</h3>
+
+  <p>You can verify ownership of your application to reduce the risk of app impersonation.</p>
+
+  <p>
+    To complete the verification process, you would use your Chrome Web Store Developer account.
+    The following requirements must be met for a successful verification:
+  </p>
+
+  <ul>
+    <li>
+      You must have a registered item in the
+      <a href="https://chrome.google.com/webstore/devconsole/"
+        >Chrome Web Store Developer Dashboard</a
+      >
+      with the same item ID as the Chrome Extension OAuth client you are completing the
+      verification for.
+    </li>
+    <li>
+      You must be a publisher for the Chrome Web Store item.
+      <a href="https://developer.chrome.com/docs/webstore/group-publishers/">Learn more</a>
+      about access management in the Chrome Web Store Developer Dashboard.
+    </li>
+  </ul>
+
+  <p>
+    In the <strong>Verify App Ownership</strong> section of the Chrome Extension client, click
+    the <strong>Verify Ownership</strong> button to complete the verification process.
+  </p>
+
+  <p>
+    <b>Note:</b> Wait a few minutes before completing the verification process after
+    granting access to your account.
+  </p>
+
+  <p>
+    If the verification is successful, a notification will be displayed to confirm the success
+    of the verification process. Otherwise, an error prompt will be shown.
+  </p>
+
+  <p>To fix a failed verification, try the following:</p>
+
+  <ul>
+    <li>
+      Make sure there is a registered item in the Chrome Web Store Developer Dashboard with the
+      same item ID as the Chrome Extension OAuth client you are completing the verification for.
+    </li>
+    <li>
+      Make sure you are a publisher for the app, that is, you must either be the individual
+      publisher of the app or a member of the group publisher of the app.
+      <a href="https://developer.chrome.com/docs/webstore/group-publishers/">Learn more</a>
+      about access management in the Chrome Web Store Developer Dashboard.
+    </li>
+    <li>
+      If you just updated your group publisher list, verify that the group publisher membership
+      list is synced in the Chrome Web Store Developer Dashboard.
+      <a
+        href="https://developer.chrome.com/docs/webstore/group-publishers/#adding-developers-to-or-removing-them-from-the-group-publisher"
+        >Learn more</a
+      >
+      about syncing your publisher membership list.
+    </li>
+  </ul>
+
+</section>
+    
+
+    <h2 id="time-based-access" data-text="Time-based access" tabindex="-1">Time-based access</h2>
+
+<p>Time-based access allows a user to grant your app access to their data for a limited duration
+  to complete an action. Time-based access is available in select Google products during the consent
+  flow, giving users the option to grant access for a limited period of time. An example is the
+  <a href="https://developers.google.com/data-portability"> Data Portability API</a> which enables a
+  one-time transfer of data.</p>
+
+<p>When a user grants your application time-based access, the refresh token will expire after the
+  specified duration. Note that refresh tokens may be invalidated earlier under specific
+  circumstances; see <a href="/identity/protocols/oauth2#expiration">these cases</a> for
+  details. The <code translate="no" dir="ltr">refresh_token_expires_in</code> field returned in the
+  <a href="/identity/protocols/oauth2/web-server#httprest_3">authorization code
+    exchange</a> response represents the time remaining until the refresh token expires in such cases.
+</p>
+
+    
+
+    <h2 id="further_reading" data-text="Further Reading" tabindex="-1">Further Reading</h2>
+
+    
+    <p>The IETF Best Current Practice <a href="https://tools.ietf.org/html/rfc8252">OAuth 2.0 for
+      Native Apps</a> establishes many of the best practices documented here.</p>
+    
+
+    <section>
+      <h2 id="cross-account-protection" data-text="Implement Cross-Account Protection" tabindex="-1">Implement Cross-Account Protection</h2>
+
+      <p>
+  An additional step you should take to protect your users' accounts is implementing Cross-Account
+  Protection by utilizing Google's Cross-Account Protection Service. This service lets you
+  subscribe to security event notifications which provide information to your application about
+  major changes to the user account. You can then use the information to take action depending on
+  how you decide to respond to events.
+</p>
+<p>
+  Some examples of the event types sent to your app by Google's Cross-Account Protection Service are:
+</p>
+<ul>
+  <li>
+    <code translate="no" dir="ltr">https://schemas.openid.net/secevent/risc/event-type/sessions-revoked</code>
+  </li>
+  <li>
+    <code translate="no" dir="ltr">https://schemas.openid.net/secevent/oauth/event-type/token-revoked</code>
+  </li>
+  <li>
+    <code translate="no" dir="ltr">https://schemas.openid.net/secevent/risc/event-type/account-disabled</code>
+  </li>
+</ul>
+<p>
+  See the
+  <a href="https://developers.google.com/identity/protocols/risc">
+    Protect user accounts with Cross-Account Protection page
+  </a>
+  for more information on how to implement Cross Account Protection and for the full list of available events.
+</p>
+    </section>
+  
+  
+
+  
+</div>
+
+  
+    
+      <devsite-recommendations display="in-page" hidden yield>
+      </devsite-recommendations>
+    
+    
+      
+    <devsite-thumb-rating position="footer">
+    </devsite-thumb-rating>
+  
+       
+    
+    
+      <devsite-recommendations id="recommendations-link" yield></devsite-recommendations>
+    
+  
+
+  <div class="devsite-floating-action-buttons"></div></article>
+
+
+<devsite-content-footer class="nocontent" data-nosnippet>
+  <p>Except as otherwise noted, the content of this page is licensed under the <a href="https://creativecommons.org/licenses/by/4.0/">Creative Commons Attribution 4.0 License</a>, and code samples are licensed under the <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache 2.0 License</a>. For details, see the <a href="https://developers.google.com/site-policies">Google Developers Site Policies</a>. Java is a registered trademark of Oracle and/or its affiliates.</p>
+  <p>Last updated 2026-10-30 UTC.</p>
+</devsite-content-footer>
+
+
+<devsite-notification
+>
+</devsite-notification>
+
+
+  
+<div class="devsite-content-data">
+  
+  
+    <template class="devsite-content-data-template">
+      [[["Easy to understand","easyToUnderstand","thumb-up"],["Solved my problem","solvedMyProblem","thumb-up"],["Other","otherUp","thumb-up"]],[["Missing the information I need","missingTheInformationINeed","thumb-down"],["Too complicated / too many steps","tooComplicatedTooManySteps","thumb-down"],["Out of date","outOfDate","thumb-down"],["Samples / code issue","samplesCodeIssue","thumb-down"],["Other","otherDown","thumb-down"]],["Last updated 2026-10-30 UTC."],[],[]]
+    </template>
+  
+</div>
+            
+          </devsite-content>
+        </main>
+        <devsite-footer-promos class="devsite-footer">
+          
+            
+          
+        </devsite-footer-promos>
+        <devsite-footer-linkboxes class="devsite-footer">
+          
+            
+<nav class="devsite-footer-linkboxes nocontent"
+     aria-label="Footer links"
+     data-nosnippet>
+  
+  <ul class="devsite-footer-linkboxes-list">
+    
+    <li class="devsite-footer-linkbox ">
+    <h3 class="devsite-footer-linkbox-heading no-link">Engage</h3>
+      <ul class="devsite-footer-linkbox-list">
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://discuss.ai.google.dev/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 1)"
+            >
+            
+          
+            Google AI Forum
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="/program"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 2)"
+            >
+            
+          
+            Google Developer Program
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="/community"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 3)"
+            >
+            
+          
+            Google Developer Groups
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="/community/experts"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 4)"
+            >
+            
+          
+            Google Developer Experts
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="/community/accelerators"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 5)"
+            >
+            
+          
+            Accelerators
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="/community/nvidia"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 6)"
+            >
+            
+              
+              
+            
+          
+            Google Cloud & NVIDIA
+          
+          </a>
+          
+          
+        </li>
+        
+      </ul>
+    </li>
+    
+    <li class="devsite-footer-linkbox ">
+    <h3 class="devsite-footer-linkbox-heading no-link">Connect</h3>
+      <ul class="devsite-footer-linkbox-list">
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="//googledevelopers.blogspot.com"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 1)"
+            >
+            
+          
+            Blog
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://bsky.app/profile/developers.google.com"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 2)"
+            >
+            
+          
+            Bluesky
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://www.instagram.com/googlefordevs/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 3)"
+            >
+            
+          
+            Instagram
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://www.linkedin.com/showcase/googledevelopers/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 4)"
+            >
+            
+          
+            LinkedIn
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="//twitter.com/googledevs"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 5)"
+            >
+            
+          
+            X (Twitter)
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="//www.youtube.com/user/GoogleDevelopers"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 6)"
+            >
+            
+              
+              
+            
+          
+            YouTube
+          
+          </a>
+          
+          
+        </li>
+        
+      </ul>
+    </li>
+    
+    <li class="devsite-footer-linkbox ">
+    <h3 class="devsite-footer-linkbox-heading no-link">Build</h3>
+      <ul class="devsite-footer-linkbox-list">
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://developer.android.com/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 1)"
+            >
+            
+          
+            Android
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://developer.chrome.com/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 2)"
+            >
+            
+          
+            Chrome
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://firebase.google.com/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 3)"
+            >
+            
+          
+            Firebase
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://aistudio.google.com/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 4)"
+            >
+            
+          
+            Google AI Studio
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://antigravity.google/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 5)"
+            >
+            
+          
+            Google Antigravity
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://cloud.google.com/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 6)"
+            >
+            
+          
+            Google Cloud
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://play.google.com/console/about/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 7)"
+            >
+            
+          
+            Google Play
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="/products"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 8)"
+            >
+            
+              
+              
+            
+          
+            View all
+          
+          </a>
+          
+          
+        </li>
+        
+      </ul>
+    </li>
+    
+  </ul>
+  
+</nav>
+          
+        </devsite-footer-linkboxes>
+        <devsite-footer-utility class="devsite-footer">
+          
+            
+
+<div class="devsite-footer-utility nocontent" data-nosnippet>
+  
+  
+  <nav class="devsite-footer-sites" aria-label="Other Google Developers websites">
+    <a href="https://developers.google.com/"
+       class="devsite-footer-sites-logo-link gc-analytics-event"
+       data-category="Site-Wide Custom Events"
+       data-label="Footer Google Developers Link">
+      <picture>
+        
+        <img class="devsite-footer-sites-logo"
+             src="https://www.gstatic.com/devrel-devsite/prod/v579d635a54d6e1f40caad46ce407560c5106c8915e5ff7e6341f5b13eb245c5a/developers/images/lockup-google-for-developers.svg"
+             loading="lazy"
+             alt="Google Developers">
+      </picture>
+    </a>
+    <ul class="devsite-footer-sites-list">
+      
+      <li class="devsite-footer-sites-item">
+        <a href="//developer.android.com"
+           class="devsite-footer-sites-link
+                  gc-analytics-event"
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Footer Android Link"
+         
+         >
+          Android
+        </a>
+      </li>
+      
+      <li class="devsite-footer-sites-item">
+        <a href="//developer.chrome.com/home"
+           class="devsite-footer-sites-link
+                  gc-analytics-event"
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Footer Chrome Link"
+         
+         >
+          Chrome
+        </a>
+      </li>
+      
+      <li class="devsite-footer-sites-item">
+        <a href="//firebase.google.com"
+           class="devsite-footer-sites-link
+                  gc-analytics-event"
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Footer Firebase Link"
+         
+         >
+          Firebase
+        </a>
+      </li>
+      
+      <li class="devsite-footer-sites-item">
+        <a href="//cloud.google.com"
+           class="devsite-footer-sites-link
+                  gc-analytics-event"
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Footer Google Cloud Platform Link"
+         
+         >
+          Google Cloud Platform
+        </a>
+      </li>
+      
+      <li class="devsite-footer-sites-item">
+        <a href="//ai.google.dev/"
+           class="devsite-footer-sites-link
+                  gc-analytics-event"
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Footer Google AI Link"
+         
+         >
+          Google AI
+        </a>
+      </li>
+      
+      <li class="devsite-footer-sites-item">
+        <a href="/products"
+           class="devsite-footer-sites-link
+                  gc-analytics-event"
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Footer All products Link"
+         
+         >
+          All products
+        </a>
+      </li>
+      
+    </ul>
+  </nav>
+  
+
+  
+  <nav class="devsite-footer-utility-links" aria-label="Utility links">
+    
+    <ul class="devsite-footer-utility-list">
+      
+      <li class="devsite-footer-utility-item
+                 ">
+        
+        
+        <a class="devsite-footer-utility-link gc-analytics-event"
+           href="/terms/site-terms"
+           data-category="Site-Wide Custom Events"
+           data-label="Footer Terms link"
+         >
+          Terms
+        </a>
+        
+      </li>
+      
+      <li class="devsite-footer-utility-item
+                 ">
+        
+        
+        <a class="devsite-footer-utility-link gc-analytics-event"
+           href="//policies.google.com/privacy"
+           data-category="Site-Wide Custom Events"
+           data-label="Footer Privacy link"
+         >
+          Privacy
+        </a>
+        
+      </li>
+      
+      <li class="devsite-footer-utility-item
+                 glue-cookie-notification-bar-control">
+        
+        
+        <a class="devsite-footer-utility-link gc-analytics-event"
+           href="#"
+           data-category="Site-Wide Custom Events"
+           data-label="Footer Manage cookies link"
+         
+           aria-hidden="true"
+         >
+          Manage cookies
+        </a>
+        
+      </li>
+      
+    </ul>
+    
+    
+<devsite-language-selector>
+  <ul role="presentation">
+    
+    
+    <li role="presentation">
+      <a role="menuitem" lang="en"
+        >English</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="de"
+        >Deutsch</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="es"
+        >Español</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="es_419"
+        >Español – América Latina</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="fr"
+        >Français</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="id"
+        >Indonesia</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="it"
+        >Italiano</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="pl"
+        >Polski</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="pt"
+        >Português</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="pt_br"
+        >Português – Brasil</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="vi"
+        >Tiếng Việt</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="tr"
+        >Türkçe</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ru"
+        >Русский</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="he"
+        >עברית</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ar"
+        >العربيّة</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="fa"
+        >فارسی</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="hi"
+        >हिंदी</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="bn"
+        >বাংলা</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="th"
+        >ภาษาไทย</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="zh_cn"
+        >中文 – 简体</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="zh_tw"
+        >中文 – 繁體</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ja"
+        >日本語</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ko"
+        >한국어</a>
+    </li>
+    
+  </ul>
+</devsite-language-selector>
+
+  </nav>
+</div>
+          
+        </devsite-footer-utility>
+        <devsite-panel>
+          
+        </devsite-panel>
+        
+          <devsite-concierge
+  
+  
+    data-info-panel
+  
+  
+    data-ai-panel
+  
+  
+  
+  
+    data-api-explorer-panel
+  >
+</devsite-concierge>
+        
+      </section>
+      </section>
+    <devsite-sitemask></devsite-sitemask>
+    <devsite-snackbar></devsite-snackbar>
+    <devsite-tooltip ></devsite-tooltip>
+    <devsite-heading-link></devsite-heading-link>
+    <devsite-analytics>
+      
+        <script type="application/json" analytics>[{&#34;dimensions&#34;: {&#34;dimension5&#34;: &#34;en&#34;, &#34;dimension1&#34;: &#34;Signed out&#34;, &#34;dimension11&#34;: false, &#34;dimension3&#34;: false, &#34;dimension6&#34;: &#34;en&#34;}, &#34;gaid&#34;: &#34;UA-24532603-1&#34;, &#34;metrics&#34;: {&#34;ratings_value&#34;: &#34;metric1&#34;, &#34;ratings_count&#34;: &#34;metric2&#34;}, &#34;purpose&#34;: 1}]</script>
+<script type="application/json" tag-management>{&#34;at&#34;: &#34;True&#34;, &#34;ga4&#34;: [{&#34;id&#34;: &#34;G-272J68FCRF&#34;, &#34;purpose&#34;: 1}], &#34;ga4p&#34;: [{&#34;id&#34;: &#34;G-272J68FCRF&#34;, &#34;purpose&#34;: 1}], &#34;gtm&#34;: [{&#34;id&#34;: &#34;GTM-T98GCPGN&#34;, &#34;purpose&#34;: 1}], &#34;parameters&#34;: {&#34;internalUser&#34;: &#34;False&#34;, &#34;language&#34;: {&#34;machineTranslated&#34;: &#34;False&#34;, &#34;requested&#34;: &#34;en&#34;, &#34;served&#34;: &#34;en&#34;}, &#34;pageType&#34;: &#34;article&#34;, &#34;projectName&#34;: null, &#34;signedIn&#34;: &#34;False&#34;, &#34;tenant&#34;: &#34;developers&#34;, &#34;recommendations&#34;: {&#34;sourcePage&#34;: &#34;&#34;, &#34;sourceType&#34;: 0, &#34;sourceRank&#34;: 0, &#34;sourceIdenticalDescriptions&#34;: 0, &#34;sourceTitleWords&#34;: 0, &#34;sourceDescriptionWords&#34;: 0, &#34;experiment&#34;: &#34;&#34;}, &#34;experiment&#34;: {&#34;ids&#34;: &#34;&#34;}}}</script>
+      
+    </devsite-analytics>
+    
+      <devsite-badger></devsite-badger>
+    
+    
+    
+    
+    
+<script nonce="FXnOYj2yLvmYChDU+wEhzmJ1ddDGkT">
+  
+  (function(d,e,v,s,i,t,E){d['GoogleDevelopersObject']=i;
+    t=e.createElement(v);t.async=1;t.src=s;E=e.getElementsByTagName(v)[0];
+    E.parentNode.insertBefore(t,E);})(window, document, 'script',
+    'https://www.gstatic.com/devrel-devsite/prod/v579d635a54d6e1f40caad46ce407560c5106c8915e5ff7e6341f5b13eb245c5a/developers/js/app_loader.js', '[1,"en",null,"/js/devsite_app_module.js","https://www.gstatic.com/devrel-devsite/prod/v579d635a54d6e1f40caad46ce407560c5106c8915e5ff7e6341f5b13eb245c5a","https://www.gstatic.com/devrel-devsite/prod/v579d635a54d6e1f40caad46ce407560c5106c8915e5ff7e6341f5b13eb245c5a/developers","https://developers-dot-devsite-v2-prod.appspot.com",null,null,["/_pwa/developers/manifest.json","https://www.gstatic.com/devrel-devsite/prod/v579d635a54d6e1f40caad46ce407560c5106c8915e5ff7e6341f5b13eb245c5a/images/video-placeholder.svg","https://www.gstatic.com/devrel-devsite/prod/v579d635a54d6e1f40caad46ce407560c5106c8915e5ff7e6341f5b13eb245c5a/developers/images/favicon-new.png","https://www.gstatic.com/devrel-devsite/prod/v579d635a54d6e1f40caad46ce407560c5106c8915e5ff7e6341f5b13eb245c5a/developers/images/lockup-new.svg","https://fonts.googleapis.com/css?family=Google+Sans:400,500|Roboto:400,400italic,500,500italic,700,700italic|Roboto+Mono:400,500,700&display=swap"],1,null,[1,6,8,12,14,17,21,25,50,52,63,70,75,76,80,87,91,92,93,97,98,100,101,102,103,104,105,107,108,109,110,112,113,116,117,118,120,122,124,125,126,127,129,130,131,132,133,134,135,136,138,140,141,147,148,149,151,152,156,157,158,159,161,163,164,168,169,170,179,180,182,183,186,191,193,196],"AIza[redacted: a public browser key of the page]","AIza[redacted: a public browser key of the page]","developers.google.com","AIza[redacted: a public browser key of the page]","AIza[redacted: a public browser key of the page]",null,null,null,["Profiles__enable_playlist_community_acl","DevPro__remove_eu_tax_intake_form","Profiles__enable_join_program_group_endpoint","Home__enable_chatbot","MiscFeatureFlags__enable_variable_operator","Profiles__enable_developer_profile_benefits_ui_redesign","DevPro__enable_google_payments_buyflow","Analytics__enable_devpro_interaction_logging","TpcFeatures__proxy_prod_host","Profiles__enable_page_saving","Search__enable_suggestions_from_borg","Concierge__enable_concierge","Profiles__enable_developer_profiles_callout","MiscFeatureFlags__enable_framebox_badge_methods","DevPro__enable_firebase_workspaces_card","Search__enable_ai_eligibility_checks","DevPro__enable_credits_banner","Profiles__enable_targeted_hero","Profiles__enable_recognition_badges","DevPro__enable_developer_subscriptions","MiscFeatureFlags__enable_view_transitions","Profiles__enable_completequiz_endpoint","MiscFeatureFlags__enable_variable_operator_index_yaml","Search__enable_page_map","Cloud__enable_free_trial_server_call","MiscFeatureFlags__developers_footer_image","MiscFeatureFlags__gdp_dashboard_reskin_enabled","Profiles__enable_stripe_subscription_management","AIStudioInteractionsToggle__interactions_are_default","Cloud__enable_cloud_shell","Concierge__enable_remove_info_panel_tags","Profiles__enable_complete_playlist_endpoint","BookNav__enable_tenant_cache_key","Cloud__fast_free_trial","Search__enable_ai_search_summaries_restricted","EngEduTelemetry__enable_engedu_telemetry","MiscFeatureFlags__fix_lower_breadcrumbs","Cloud__cache_serialized_dynamic_content","MiscFeatureFlags__developers_footer_dark_image","Profiles__enable_dashboard_curated_recommendations","Cloud__enable_cloudx_experiment_ids","Profiles__enable_user_type","DevPro__enable_nvidia_credits_card","DevPro__enable_g1_integration","MiscFeatureFlags__enable_firebase_utm","CloudShell__cloud_shell_button","Profiles__enable_release_notes_notifications","MiscFeatureFlags__enable_explain_this_code","DevPro__enable_vertex_credit_card","DevPro__enable_google_one_card","CloudShell__cloud_code_overflow_menu","ProgramGroups__enable_auto_enroll","DevPro__enable_devsite_captcha","Cloud__enable_cloud_dlp_service","DevPro__enable_g1_ineligible_redirect","DevPro__enable_cloud_innovators_plus","DevPro__enable_code_assist","Profiles__enable_callout_notifications","MiscFeatureFlags__enable_appearance_cookies","Profiles__enable_completecodelab_endpoint","MiscFeatureFlags__enable_markdown_accept_header","Profiles__enable_purchase_prompts","DevPro__enable_google_payments","Cloud__enable_legacy_calculator_redirect","Experiments__reqs_query_experiments","Search__enable_ai_search_summaries_for_all","Profiles__enable_developer_profile_pages_as_content","Significatio__enable_by_tenant","Concierge__enable_concierge_restricted","MiscFeatureFlags__remove_cross_domain_tracking_params","Concierge__enable_pushui","Concierge__enable_key_takeaways_new_ui","DevPro__enable_devpro_offers","Cloud__enable_cloud_shell_fte_user_flow","DevPro__enable_embed_profile_creation","Concierge__enable_actions_menu","Analytics__enable_clearcut_logging","Search__enable_ai_search_summaries","Profiles__enable_auto_apply_credits","Concierge__enable_devsite_llm_tools","DevPro__enable_enterprise","SignIn__enable_l1_signup_flow","MiscFeatureFlags__enable_project_variables","Profiles__enable_public_developer_profiles","DevPro__enable_free_benefits","MiscFeatureFlags__enable_markdown_noindex_and_link_tags","Profiles__enable_awarding_url","Concierge__enable_key_takeaways","TpcFeatures__enable_unmirrored_page_left_nav","Profiles__enable_profile_collections","MiscFeatureFlags__enable_explicit_template_dependencies","Search__enable_dynamic_content_confidential_banner","Profiles__require_profile_eligibility_for_signin"],null,null,"AIza[redacted: a public browser key of the page]","https://developerscontentserving-pa.clients6.google.com","AIza[redacted: a public browser key of the page]","https://developerscontentsearch-pa.clients6.google.com",1,4,null,"https://developerprofiles-pa.clients6.google.com",[1,"developers","Google for Developers","developers.google.com",null,"developers-dot-devsite-v2-prod.appspot.com",null,null,[1,1,[1],null,null,null,null,null,null,null,null,[1],null,null,null,null,null,null,[1],[1,null,null,[1,20],"/recommendations/information"],null,null,null,[1,1,1],[1,1,null,1,1,null,null,["/meridian"]],[1,null,null,null,null,null,null,["/admob","/ad-manager/mobile-ads-sdk","/ml-kit"]],null,[null,["/meridian","/youtube/devices/"]],1,null,[1]],null,[null,null,null,null,null,null,"/images/lockup-new.svg","/images/touchicon-180-new.png",null,null,null,null,1,null,null,null,null,null,null,null,null,1,null,null,null,"/images/lockup-dark-theme-new.svg",[]],[],null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,[6,1,14,15,20,22,23,29,32,36],null,[[null,null,null,[3,7,10,2,39,17,4,32,24,11,12,13,34,15,25],null,null,[1,[["docType","Choose a content type",[["Tutorial",null,null,null,null,null,null,null,null,"Tutorial"],["Guide",null,null,null,null,null,null,null,null,"Guide"],["Sample",null,null,null,null,null,null,null,null,"Sample"]]],["product","Choose a product",[["Android",null,null,null,null,null,null,null,null,"Android"],["ARCore",null,null,null,null,null,null,null,null,"ARCore"],["ChromeOS",null,null,null,null,null,null,null,null,"ChromeOS"],["Firebase",null,null,null,null,null,null,null,null,"Firebase"],["Flutter",null,null,null,null,null,null,null,null,"Flutter"],["Assistant",null,null,null,null,null,null,null,null,"Google Assistant"],["GoogleCloud",null,null,null,null,null,null,null,null,"Google Cloud"],["GoogleMapsPlatform",null,null,null,null,null,null,null,null,"Google Maps Platform"],["GooglePay",null,null,null,null,null,null,null,null,"Google Pay & Google Wallet"],["GooglePlay",null,null,null,null,null,null,null,null,"Google Play"],["Tensorflow",null,null,null,null,null,null,null,null,"TensorFlow"]]],["category","Choose a topic",[["AiAndMachineLearning",null,null,null,null,null,null,null,null,"AI and Machine Learning"],["Data",null,null,null,null,null,null,null,null,"Data"],["Enterprise",null,null,null,null,null,null,null,null,"Enterprise"],["Gaming",null,null,null,null,null,null,null,null,"Gaming"],["Mobile",null,null,null,null,null,null,null,null,"Mobile"],["Web",null,null,null,null,null,null,null,null,"Web"]]]]]],[1,1],null,1],[[["UA-24532603-1"],["UA-22084204-5"],null,null,["UA-24532603-5"],["GTM-T98GCPGN"],null,[["G-272J68FCRF"],null,null,[["G-272J68FCRF",2]]],[["UA-24532603-1",2]],null,[["UA-24532603-5",2]],[["GTM-T98GCPGN",2]],1],[[6,5],[12,9],[3,2],[1,1],[14,11],[15,12],[11,8],[4,3],[16,13],[5,4],[13,10]],[[2,2],[1,1]]],null,4,null,null,null,null,null,null,null,null,null,null,null,null,null,"developers.devsite.google",null,null,null,null,null,[]],null,"pk_live_5170syrHvgGVmSx9sBrnWtA5luvk9BwnVcvIi7HizpwauFG96WedXsuXh790rtij9AmGllqPtMLfhe2RSwD6Pn38V00uBCydV4m",1,1,"https://developerscontentinsights-pa.clients6.google.com","AIza[redacted: a public browser key of the page]","AIza[redacted: a public browser key of the page]","https://developers.clients6.google.com",["https://codeassist.google.com","https://code-assist-free-tier.corp.google.com","https://pay.google.com","https://pay-merchant-console-autopush-qual.corp.google.com","https://pay-merchant-console-dev.corp.google.com","https://pay-merchant-console-preprod-qual.corp.google.com"],null,"AIza[redacted: a public browser key of the page]\n",null,null,"https://developers.googleapis.com"]')
+  
+</script>
+
+    <devsite-a11y-announce></devsite-a11y-announce>
+  </body>
+</html>

@@ -89,7 +89,9 @@ included, and nothing sent to them arrived.
 **Holding.** Writes and CPU aren't held for: the pacer shares the budgets among what runs, from
 the first moment it runs, so holding work it could slow would protect nothing and only delay it.
 Memory can't be slowed: a session's next turn, a turn kiln continues after a restart, or a goal
-starts when its learned peak memory fits what's free, highest response ratio first, with
+starts when its learned peak memory fits what's free (Linux's `MemAvailable`; on macOS the free
+pages and the inactive ones beyond what the compressor holds, the room kiln's balancer places by,
+docs/needs.md), highest response ratio first, with
 conservative backfilling, so short work goes first and nothing starves. It waits in kiln's queue
 and goes the moment the engine lets it (held sessions are woken; nothing polls). A message a
 person sends "now" never waits.

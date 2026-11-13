@@ -1167,12 +1167,18 @@ kiln ships an Agentfile for each harness it drives, `harness-<id>`. Read one on 
 - **Its network, every part named.** TCP out to its harness's own hosts alone, each by name: its
   provider's API and its sign-in's token hosts (the table below). Only those names resolve, nothing
   comes in, and no other host, port or protocol goes out. kiln's MCP isn't among them: it comes over
-  the link kiln drives the harness by, never the network, so no Agentfile grants anything for it. A harness that takes any provider (Goose, opencode, Pi) is granted
-  every hosted provider its own build knows at a fixed public host. A cloud platform's model
-  service (Bedrock, Vertex AI, Azure), a self-hosted or local server, and a provider whose address
-  you give it are none of those: copy kiln's Agentfile into one of yours and add your provider's
-  `--egress=HOST:PORT`. Each Agentfile's comments say what each host is for and where it comes
-  from; kiln's step 18 record (`docs/research/s18-host-in-vm`) has the sources.
+  the link kiln drives the harness by, never the network, so no Agentfile grants anything for it.
+  A harness that takes any provider (Goose, opencode, Pi) is granted every provider its own build
+  reaches at a fixed public host, with their sign-ins. Antigravity is granted every sign-in it
+  documents: your Google account, a Gemini API key, Gemini Enterprise and ADC. A run is to keep only
+  its own provider's or sign-in's hosts, dropped as kiln starts it. Not yet: until the launch does
+  that, a run of these four is granted every host its image names. A cloud platform's model service
+  (Bedrock, Vertex AI, Azure), a self-hosted or local server, and a provider whose address you give
+  it are none of those: copy kiln's Agentfile into one of yours and add your provider's
+  `--egress=HOST:PORT`. Each Agentfile's comments say what each host is for. Each harness's record
+  (`docs/research/s19-claude-agentfile` to `s28-pi-agentfile`, "Hosts by name") cites each host to
+  its vendor's own documentation, or, where that names only a wildcard or nothing, to the vendor's
+  own source or build.
 - **Your project at the path it has on your machine**, plugged in as the agent starts, so the same
   absolute paths work inside and out and kiln reads its changes where it always does. No volume
   holds it. A project under `/tmp` can't be plugged in: that's the microVM's own scratch.
@@ -1186,13 +1192,13 @@ kiln ships an Agentfile for each harness it drives, `harness-<id>`. Read one on 
 | Claude Code | `harness-claude` | `/home/claude` | `api.anthropic.com`, `claude.ai`, `platform.claude.com` |
 | Codex | `harness-codex` | `/home/codex` (`CODEX_HOME` in it) | `api.openai.com`, `chatgpt.com`, `auth.openai.com` |
 | Gemini CLI | `harness-gemini` | `/home/gemini` | `cloudcode-pa`, `generativelanguage`, `oauth2` and `www.googleapis.com` |
-| opencode | `harness-opencode` | `/home/opencode` | each provider its build knows and their sign-ins, `opencode.ai`, `models.dev`, GitHub for its ripgrep (32 hosts) |
-| Goose | `harness-goose` | `/home/goose` | each provider its build knows and their sign-ins (64 hosts) |
+| opencode | `harness-opencode` | `/home/opencode` | each provider in its catalog (`models.opencode.ai`) its build reaches at a fixed host, Cloudflare's two, their sign-ins, GitHub for its ripgrep (218 hosts) |
+| Goose | `harness-goose` | `/home/goose` | each provider its build reaches at a fixed host, their sign-ins, TypeSafe for its auto effort (67 hosts) |
 | Amp | `harness-amp` | `/home/amp` | `ampcode.com` |
 | Devin | `harness-devin` | `/home/devin` | `server.codeium.com`, `api.devin.ai`, `unleash.codeium.com` |
-| Antigravity CLI | `harness-antigravity` | `/home/antigravity` | `cloudcode-pa.googleapis.com`, `oauth2.googleapis.com` |
+| Antigravity CLI | `harness-antigravity` | `/home/antigravity` | its four sign-ins': `cloudcode-pa`, `oauth2`, `generativelanguage`, `sts`, and `businessaicode`, `aiplatform` and `discoveryengine` with their US and EU twins (13 hosts, all `.googleapis.com`) |
 | Cursor CLI | `harness-cursor` | `/home/cursor` | `api2`, `api2direct`, `repo42`, `api5` and its six agent hosts `.cursor.sh` |
-| Pi | `harness-pi` | `/home/pi` | each provider its build knows and their sign-ins, `pi.dev` (44 hosts) |
+| Pi | `harness-pi` | `/home/pi` | each provider its build reaches at a fixed host, their sign-ins, `pi.dev` (45 hosts) |
 
 The harness sees its image read-only, so only your volume makes its files writable and lasting,
 and with it as the whole HOME everything the harness and the programs it runs keep in a home lasts
@@ -1233,6 +1239,11 @@ to `s28-pi-agentfile`).
   them (an Xcode project or workspace, a Visual C++ project), kiln refuses to start it isolated,
   naming the tools and the system each runs on. An isolated agent can't start a process (above):
   start it from your own session, or from an agent that isn't isolated.
+- **Sign in to Antigravity under certificate-based access.** Where an organization's policy requires a
+  device certificate, Google's APIs answer only at their mTLS endpoints (`*.mtls.googleapis.com`).
+  A client uses those only with a certificate from the machine's own credential store (Google's
+  AIP-4114), and a microVM holds none, so kiln's Agentfile grants none of them and that sign-in
+  can't work in a microVM. Antigravity's other sign-ins do.
 - **Reach what its Agentfile doesn't grant.** No other folder, port, host or device of the machine.
   kiln's own MCP takes no grant at all: it comes over the encrypted link kiln drives the harness
   by, as that link's own MCP lane (Shards D254), on every OS kiln runs on. Inside the microVM each

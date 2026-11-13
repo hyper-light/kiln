@@ -1,0 +1,3 @@
+file	url (fetched 2026-11-13 with curl -L)	sha256
+network-configuration.md	https://cursor.com/docs/enterprise/network-configuration.md	300a70aa8e59670fa24142449b000e0750f99ce8e29661ae4ff04b9f1a7e6f13
+cursor-build.txt	kiln's excerpt of Cursor's CLI 2026.11.11-b912975 pinned build (its URL and SHA-256 inside)	6f95745d5703404d99f112c6c06a8547cbb5b617aa37e79b683351f32008502a

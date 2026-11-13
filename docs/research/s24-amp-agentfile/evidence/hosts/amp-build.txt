@@ -1,0 +1,7 @@
+== amp: https://static.ampcode.com/cli/0.0.1794456033-gb2ff22/amp-linux-x64
+   archive sha256 8e7d7f19cb2321bba7821fe8d1869cbd071be403dffdb47875dfc23dd0487db2 (pin.json's, matched on download); file amp-linux-x64, sha256 8e7d7f19cb2321bba7821fe8d1869cbd071be403dffdb47875dfc23dd0487db2
+## AMP_URL optionally overrides ampcode.com: 1 occurrence(s); first 1:
+   @131794762:  to its thread actor so Amp can set it up and start the agent. Runs for the life of the orb. Reads ORB_TOKEN; AMP_URL optionally overrides ampcode.com........A.Invalid JSON...._...Expected a JSON object......I...amp.#...z...Setting keys must start with "amp.".
+## Amp server URL: 2 occurrence(s); first 1:
+   @131776244: rb providers for this token; only when your backend shares state across them......._..--amp-url <url>.........Amp server URL..........AMP_URL.4...o#F.S.h.a.r.i.n.g. .t.h.i.s. .M.a.c.. s. .d.i.s.p.l.a.y. .w.i.t.h. .t.h.r.e.a.d.s. .s.e.
+

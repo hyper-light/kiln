@@ -25,16 +25,37 @@ HARNESS pi FROM ./pi-${TARGETARCH}
 # harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
 # name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
 # resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
-# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
-# docs/research/s18-host-in-vm says where each host comes from).
-# - pi takes the provider its person configures, so each provider pi 1.5.2's own build carries at a
-#   fixed public host is granted (its model catalog's base URLs), with the sign-in hosts of those it
-#   signs in to itself (Anthropic, GitHub Copilot, Kimi, Meta, OpenAI, xAI), and pi.dev, its
-#   catalog's refreshes (f19). Not granted: a cloud platform's model service, which its own account
-#   places (Bedrock, Vertex AI, Azure, Cloudflare); a local server or an endpoint on another port (a
-#   local Ollama, f20). Each of those needs an Agentfile of your own, made from this one. Pi takes no
-#   MCP server from kiln, and no Agentfile of kiln's grants anything for kiln's MCP.
-NETWORK --egress=ai-gateway.vercel.sh:443 --egress=api.ant-ling.com:443 --egress=api.anthropic.com:443 --egress=api.cerebras.ai:443 --egress=api.deepseek.com:443 --egress=api.fireworks.ai:443 --egress=api.github.com:443 --egress=api.groq.com:443 --egress=api.individual.githubcopilot.com:443 --egress=api.kimi.com:443 --egress=api.meta.ai:443 --egress=api.minimax.io:443 --egress=api.minimaxi.com:443 --egress=api.mistral.ai:443 --egress=api.moonshot.ai:443 --egress=api.moonshot.cn:443 --egress=api.openai.com:443 --egress=api.together.ai:443 --egress=api.typesafe.ai:443 --egress=api.x.ai:443 --egress=api.xiaomimimo.com:443 --egress=api.z.ai:443 --egress=auth.kimi.com:443 --egress=auth.meta.com:443 --egress=auth.openai.com:443 --egress=auth.x.ai:443 --egress=chatgpt.com:443 --egress=claude.ai:443 --egress=generativelanguage.googleapis.com:443 --egress=github.com:443 --egress=inference.baseten.co:443 --egress=integrate.api.nvidia.com:443 --egress=open.bigmodel.cn:443 --egress=opencode.ai:443 --egress=openrouter.ai:443 --egress=pi.dev:443 --egress=platform.claude.com:443 --egress=radius.pi.dev:443 --egress=router.huggingface.co:443 --egress=token-plan-ams.xiaomimimo.com:443 --egress=token-plan-cn.xiaomimimo.com:443 --egress=token-plan-sgp.xiaomimimo.com:443 --egress=token-plan.ap-southeast-1.maas.aliyuncs.com:443 --egress=token-plan.cn-beijing.maas.aliyuncs.com:443 provider FOR pi
+# port or protocol goes out. 443 is HTTPS's port (RFC 9110 4.2.2). Each host is cited to its vendor's own
+# documentation, or, where that names a wildcard or nothing, to the vendor's own source or build, in its
+# harness's record's "Hosts by name" (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18, part 4):
+# docs/research/s28-pi-agentfile/README.md and its evidence/hosts/hosts.tsv: every provider pi 1.5.2's own build
+# reaches at a fixed public host (its providers docs list them), with the sign-in hosts of those it signs in to
+# itself, and pi.dev, its catalog's refreshes. Not granted: a provider whose resource or region places its host
+# (Azure, Bedrock, Vertex AI); a local server or an endpoint the person gives in models.json (a local Ollama, a
+# regional OpenRouter). Each of those needs an Agentfile of your own, made from this one.
+# Each host is cited to its provider's own API docs and to the harness's own source, or to that source alone where
+# no page of the provider's own docs names it (ROOT's call of 2026-11-13, the person's bar: zero breaks against
+# today); kiln's launch is to keep only the session's own provider's hosts (plan step 17). Each host, by its provider:
+#   ai-gateway.vercel.sh (Vercel AI Gateway), api.ant-ling.com (Ant Ling), api.anthropic.com (Anthropic),
+#   api.cerebras.ai (Cerebras), api.cloudflare.com (Cloudflare Workers AI), api.deepseek.com (DeepSeek),
+#   api.fireworks.ai (Fireworks), api.github.com (GitHub Copilot token), api.groq.com (Groq),
+#   api.individual.githubcopilot.com (GitHub Copilot), api.kimi.com (Kimi For Coding), api.meta.ai (Meta),
+#   api.minimax.io (MiniMax), api.minimaxi.com (MiniMax (China)), api.mistral.ai (Mistral), api.moonshot.ai
+#   (Moonshot AI (Global)), api.moonshot.cn (Moonshot AI (China)), api.openai.com (OpenAI), api.together.ai
+#   (Together AI), api.typesafe.ai (TypeSafe), api.x.ai (xAI), api.xiaomimimo.com (Xiaomi MiMo), api.z.ai (ZAI
+#   Coding Plan (Global)), auth.kimi.com (Kimi For Coding sign-in), auth.meta.com (Meta sign-in), auth.openai.com
+#   (OpenAI ChatGPT sign-in), auth.x.ai (xAI sign-in), chatgpt.com (OpenAI ChatGPT (Codex)),
+#   gateway.ai.cloudflare.com (Cloudflare AI Gateway), generativelanguage.googleapis.com (Google Gemini), github.com
+#   (GitHub Copilot device sign-in), inference.baseten.co (Baseten), integrate.api.nvidia.com (NVIDIA NIM),
+#   open.bigmodel.cn (ZAI Coding Plan (China)), opencode.ai (OpenCode Zen and Go), openrouter.ai (OpenRouter),
+#   pi.dev (pi's catalog overlays (models.md)), platform.claude.com (Anthropic sign-in (token exchange and
+#   refresh)), radius.pi.dev (Radius), router.huggingface.co (Hugging Face), token-plan-ams.xiaomimimo.com (Xiaomi
+#   MiMo Token Plan (Amsterdam)), token-plan-cn.xiaomimimo.com (Xiaomi MiMo Token Plan (China)),
+#   token-plan-sgp.xiaomimimo.com (Xiaomi MiMo Token Plan (Singapore)), token-plan.ap-southeast-1.maas.aliyuncs.com
+#   (Qwen Token Plan and Individual), token-plan.cn-beijing.maas.aliyuncs.com (Qwen Token Plan (China) and
+#   Individual (China)).
+# Pi takes no MCP server from kiln, and no Agentfile of kiln's grants anything for kiln's MCP.
+NETWORK --egress=ai-gateway.vercel.sh:443 --egress=api.ant-ling.com:443 --egress=api.anthropic.com:443 --egress=api.cerebras.ai:443 --egress=api.cloudflare.com:443 --egress=api.deepseek.com:443 --egress=api.fireworks.ai:443 --egress=api.github.com:443 --egress=api.groq.com:443 --egress=api.individual.githubcopilot.com:443 --egress=api.kimi.com:443 --egress=api.meta.ai:443 --egress=api.minimax.io:443 --egress=api.minimaxi.com:443 --egress=api.mistral.ai:443 --egress=api.moonshot.ai:443 --egress=api.moonshot.cn:443 --egress=api.openai.com:443 --egress=api.together.ai:443 --egress=api.typesafe.ai:443 --egress=api.x.ai:443 --egress=api.xiaomimimo.com:443 --egress=api.z.ai:443 --egress=auth.kimi.com:443 --egress=auth.meta.com:443 --egress=auth.openai.com:443 --egress=auth.x.ai:443 --egress=chatgpt.com:443 --egress=gateway.ai.cloudflare.com:443 --egress=generativelanguage.googleapis.com:443 --egress=github.com:443 --egress=inference.baseten.co:443 --egress=integrate.api.nvidia.com:443 --egress=open.bigmodel.cn:443 --egress=opencode.ai:443 --egress=openrouter.ai:443 --egress=pi.dev:443 --egress=platform.claude.com:443 --egress=radius.pi.dev:443 --egress=router.huggingface.co:443 --egress=token-plan-ams.xiaomimimo.com:443 --egress=token-plan-cn.xiaomimimo.com:443 --egress=token-plan-sgp.xiaomimimo.com:443 --egress=token-plan.ap-southeast-1.maas.aliyuncs.com:443 --egress=token-plan.cn-beijing.maas.aliyuncs.com:443 provider FOR pi
 EXPOSE --harnesses=pi 443/tcp AS egress FOR provider
 CONNECT pi WITH pi ON provider
 
