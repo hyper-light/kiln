@@ -1594,6 +1594,16 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub exit: Option<ExitInfo>,
+    /// Where its harness runs now (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17): a process of
+    /// its machine's, or its image's member in a microVM of its own. None while none runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub runs: Option<super::session::Runs>,
+    /// kiln's record of each start of its harness (`session::Start`): one a start, as kiln's restart
+    /// rule paces them (`AGAIN_*`, `SOON_TRIES`), kept with the session, and handed to kiln's next
+    /// image with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub starts: Vec<super::session::Start>,
     /// Events dropped from the front of the timeline to bound memory.
     #[serde(default)]
     pub dropped: u64,

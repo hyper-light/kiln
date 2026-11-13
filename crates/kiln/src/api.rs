@@ -6386,6 +6386,8 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     body.spec.plan_run = None;
     body.spec.helper = None;
     body.spec.subagent = false;
+    // The text of a person's own Agentfile is read by kiln, as theirs, never taken from what's asked.
+    body.spec.agentfile = None;
     // A workspace of its own is asked for by its kind alone (its machine makes it), and only of a
     // machine that can make one: one that can't would let it work in the folder itself, unasked.
     match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {
@@ -6411,6 +6413,14 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
         }
         Some(_) => {}
     }
+    // A person's own Agentfile for its microVM, read as the caller's (on a kiln nobody else signs in
+    // to, the owner's, as its sessions act for: `crate::mcp::acts_for`).
+    let person = match &caller {
+        Some(c) => crate::harness::lineage::person_of(c),
+        None if !crate::authz::gate::has_users(hub).await => Some("owner".to_owned()),
+        None => None,
+    };
+    body.spec.agentfile = crate::harness::lineage::kept_agentfile(hub, body.spec.isolation.as_ref(), person.as_deref()).await.map_err(|why| err(StatusCode::BAD_REQUEST, why))?;
     let count = body.count.unwrap_or(1);
     if !body.ids.is_empty() {
         let n = count.clamp(1, 16);

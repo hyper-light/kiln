@@ -10,9 +10,35 @@ the machine's network) is replaced by an Agentfile image's members.
 
 ## How an isolated agent runs
 
-- **Its image** is the one its start chose: one kiln ships by its name (`harness-claude`, for that
-  harness alone), or one of a person's own Agentfiles by its id (`agentfile:<id>`); none chosen, kiln's
-  own for its harness (`sandbox::isolated::image_of`). Anything else is refused, saying what it takes.
+- **Its image** is made from the Agentfile its start chose: one kiln ships by its name
+  (`harness-claude`, for that harness alone), or one of a person's own Agentfiles by its id
+  (`agentfile:<id>`); none chosen, kiln's own for its harness (`sandbox::isolated::source_of`). Anything
+  else is refused, saying what it takes. A person's own is theirs alone: kiln's server reads its text
+  from their Agentfiles as the agent starts, at its latest version, and refuses another person's, even
+  to whoever reaches everyone's (`harness::lineage::kept_agentfile`; the text travels in the start's
+  `Spec::agentfile`, which kiln sets and never takes from what's asked).
+- **It boots pinned by its digest** (`NAME@sha256:…`, as Hex boots one: `sandbox::image`). The
+  machine's carried `shards` builds it into the Shards home its microVMs boot from, for the machine's
+  platform, tagged by the digest of everything its build takes (`NAME:<recipe>`, `agentfiles::context`):
+  its Agentfile, and kiln's harness directory for its harness, files, pin and the build its own argument
+  defaults name (`ARG CLAUDE_LIBC=gnu`). A person's own Agentfile is built beside kiln's harness
+  directory, so a copy of kiln's finds it where kiln's does. One whose defaults name none of its
+  harness's several builds reads none of kiln's directories, as no build given no argument could, and
+  is built from its text alone: kiln keeps a person's Agentfile as its text, so whatever else its build
+  takes comes from a source Shards fetches itself (a Git or http(s) URL, an image). That's how a
+  stand-in with no vendor's binary is built: its HARNESS named as the harness it stands in for, from a
+  Git URL at a commit, and no vendor's turn taken. Where the home's store holds an image under
+  that tag, it boots without a build; else it's built, once, as the starts that ask for it at once wait
+  for one build. A build Shards refuses is refused in Shards' own words; a build runs as long as it
+  takes, and is ended, with all it started, when its start is given up.
+- **Nothing in it is a picked number.** Its platform is the machine's own architecture, as OCI names
+  it; the build of its harness is the one its Agentfile's own default names; its tag is its content's
+  digest. It waits for no fixed time: a build ends by itself or with its start. What Shards says of a
+  refused build is kept whole, as kiln keeps a program's output (`proc::output`); with
+  `--progress=quiet`, that is Shards' error and its warnings. Its cold start is a machine's first
+  isolated agent of each content: that start builds (its harness's files downloaded and checked
+  against their pin, its base pulled), and the starts after it boot what it built. One whose image
+  Shards' store collected builds it again.
 - **Its harness is a member of the image**: the HARNESS its Agentfile declares by the harness's id, as
   each one kiln ships does. It runs by its image's command (`harness.json`'s `run.command`), which runs
   the harness as kiln's adapter drives it (`kinds::tests::s17_each_images_command_runs_its_harness_as_its_adapter_drives_it`
@@ -32,6 +58,24 @@ the machine's network) is replaced by an Agentfile image's members.
 - **It's no process of the machine's**: its session has no pid (`Duplex::host_pid` is none), nothing
   of it is in the session's group of processes, and it is never handed across an in-place upgrade
   (it stops, and starts again in the next image, its conversation going on).
+- **Its session says where it runs** (`GET /api/harness/sessions/:id`, the session's state): `runs`
+  is `{"in": "host", "pid": N}` for a process of the machine's, and for a microVM's member `{"in":
+  "microvm", "vm": <the microVM's own name, as its runtime gives it>, "image": "NAME@sha256:…",
+  "host_pid": null, "control": {"controller": {"suite", "group"}, "endpoint": {"suite", "group"},
+  "lanes": ["control", "stdin:0", "stdout:0", "stderr:0", "exec", "mcp:0" …]}}`.
+  `host_pid` is read from its run's handle and always said, so a check reads it rather than an
+  absence. `control` is the link its stdio rides into the microVM, as each end says its TLS 1.3
+  handshake negotiated (rustls's names, or the IANA code where rustls has none): the controller's on
+  the machine and the endpoint's own report from inside (Shards' agent control, step 11), and the
+  lanes its controller was granted on it as it dialed (`Dialed::lanes`, Shards' names). It's
+  absent until that link is made (`Run::link`, awaited once, never polled), and today's stdio are
+  Shards' run pipes, which ride no link.
+- **kiln's record of what it started for it** (`starts`): each start of its harness, when (`at`),
+  where (`runs`, as it was as it started) and how it ended (`ended`: when, and its exit code where it
+  was seen), kept with the session and handed to kiln's next image with it. A harness that ran and
+  ended between two looks at the machine's processes is still in it; a start taken over in an
+  in-place upgrade is the same start. It grows one entry a start, as kiln's restart rule paces
+  starts (`AGAIN_*`, `SOON_TRIES`): no number of its own.
 
 What a session does to its harness maps onto the member:
 
@@ -79,8 +123,9 @@ and the launch is held by the conformance suite and a stand-in alone (below).
 Owed, each with whose it is:
 
 - **The Shards implementation** of the seam (step 17's next slice, after step 16 lands with a Shards
-  revision at e7825cb3 or later, the first with member stdin): the image built from its Agentfile,
-  pinned by digest, booted with the member's stdin asked for; the one real launch, red then green.
+  revision at e7825cb3 or later, the first with member stdin): the image, built and pinned as above,
+  booted through Hex with the member's stdin asked for; the one real launch, red then green, and a real
+  `shards build` of each image kiln ships, on each platform.
 - **A member's run-time arguments** (Shards: steps 5 and 7). A member runs its image's command alone:
   `MemberSpec` takes its environment, files, working directory and stdin, no arguments. Codex and the
   ACP harnesses take everything a session asks over their protocols, so their launches carry no
@@ -104,7 +149,12 @@ Owed, each with whose it is:
   input in order, its end, terminate's signal or input's end then kill, a run let go of killed, and
   its `Duplex` with no pid, nothing to hand over and its stop its boundary's; an isolated session's
   image and launch; a machine without microVMs saying why in its facts.
-- `cargo test -p kiln --lib harness::lineage::tests::s17_`: a runner's own reason in a refusal.
+- `cargo test -p kiln --lib sandbox::image`: each image's build planned from its content (platform,
+  its harness's build, its tag), with a stand-in `shards`: a built-in built once and pinned by digest,
+  found in the store without a build after, a changed Agentfile built again, starts at once waiting
+  for one build, a refused build in Shards' words, nothing of a build left behind.
+- `cargo test -p kiln --lib harness::lineage::tests::s17_`: a runner's own reason in a refusal; a
+  person's own Agentfile read for them alone, at its latest version.
 - `cargo test -p kiln --lib harness::kinds::tests::s17_`: every launch beginning with its base, and each
   built-in image's command carrying it.
 - `cargo test -p kiln --lib harness::host::tests::s17_`: an isolated Claude Code session in the

@@ -433,9 +433,16 @@ Methods: `launch`, `boundaries`, `holds`.
 
 A launch gives a `Run`: stdin given to it in order, what it says (its output, then its end, once),
 signals (refused `Unsupported` where its boundary delivers none), and a kill (its end, unless it had
-one, is `Killed`).
+one, is `Killed`). It says where its boundary holds it, the same each time it's asked: its
+boundary's own name for it (`id`: a microVM's, as its runtime names it; none for a process of the
+machine's, which its pid names), and the link its stdio rides into its boundary, as each end says
+its TLS 1.3 handshake negotiated (`link`: a microVM's Shards agent control, kiln plan
+01a1cd8e862e7169a074db3d5fa33f3d step 11, the controller's word and the endpoint's own report, and
+the lanes its controller was granted on it as it dialed, by Shards' names). A
+link is awaited: it's said once it's made, none at once for a process of the machine's, whose stdio
+are its pipes, and none where its link ends before it's made.
 
-Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`.
+Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`.
 
 - **SANDBOX-1** what a run writes reaches its stdout in order, then its end, then nothing
 - **SANDBOX-2** stdin reaches the program in order, and closing it is the end of its input
@@ -448,6 +455,7 @@ Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`.
 - **SANDBOX-9** a run works in the folder it's given
 - **SANDBOX-10** cpu and io weights outside cgroup v2's 1 to 10,000 are refused Invalid; at its ends a run goes ahead where the sandbox holds weights, and is refused Unsupported where it doesn't
 - **SANDBOX-11** a run sent a signal to end ends, its end said once, and a signal after its end is refused Ended; a sandbox that delivers no signals refuses one Unsupported, and its run goes on
+- **SANDBOX-12** a run on the host has no id of a boundary's and no link, and a run says the same id and link after its end as before
 
 ## Placement
 

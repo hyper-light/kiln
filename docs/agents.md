@@ -1206,8 +1206,9 @@ to `s28-pi-agentfile`).
   agent started as a process (no isolation). An isolated agent can't start one (above): start it
   from your own session, or from an agent that isn't isolated.
 - **Reach what its Agentfile doesn't grant.** No other folder, port, host or device of the machine.
-  kiln's own MCP is reached the same way, through a grant naming kiln's address and port, which
-  kiln's Agentfiles don't make yet.
+  kiln's own MCP takes no grant at all: it is to come over the encrypted link kiln drives the agent
+  through, as a stdio server inside its microVM that kiln answers itself, with no token of kiln's in
+  the microVM (Shards' D254). Not yet built.
 - **Use a tool its image doesn't have.** The project's toolchain comes from the image: build your
   own Agentfile on your project's image (above).
 - **Move to another machine, or switch to another harness.** Not yet: it stays where it started, in

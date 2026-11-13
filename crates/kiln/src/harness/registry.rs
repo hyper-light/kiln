@@ -4178,6 +4178,8 @@ impl Registry {
                         no_bypass: !spec.allow_bypass,
                         workspace: spec.workspace.clone(),
                         isolation: spec.isolation.clone(),
+                        runs: None,
+                        starts: Vec::new(),
                     };
                     let mut seed = Mirror::new(info.clone(), loc.clone(), Arc::clone(&self.bus));
                     seed.opened_at = Some(std::time::Instant::now());

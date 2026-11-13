@@ -9,6 +9,8 @@
 //!   member's streams. This kiln carries their runtime once step 16's Shards and Hex are wired in;
 //!   until then a machine holds no isolated agent, and refuses one rather than run it as a process.
 //! - [`isolated`]: an isolated session's launch, its image, and what it can't do yet.
+//! - [`image`]: what its microVM is made from: its Agentfile's image, built by the carried `shards`
+//!   once for each content, pinned by its digest.
 //! - [`held`]: a boundary's run as the `Duplex` a session drives its harness through, so a session's
 //!   loop and its adapter treat a microVM's member as they treat a process of the machine's.
 
@@ -16,6 +18,7 @@
 pub mod fake;
 pub mod held;
 pub mod host;
+pub mod image;
 pub mod isolated;
 
 use std::sync::Arc;
@@ -25,12 +28,19 @@ use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use kiln_seams::Sandbox;
-use kiln_seams::sandbox::{Exit, Output, Refusal, Run, Signal};
+use kiln_seams::sandbox::{Exit, Link, Output, Refusal, Run, Signal};
 
-/// The sandbox this machine holds isolated agents' harnesses in, microVMs of their own: none until
-/// this kiln carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16's Shards and
-/// Hex, wired here by step 17's next slice).
-pub fn microvm() -> Option<Arc<dyn Sandbox>> {
+/// A machine's microVMs: the sandbox an isolated agent's harness runs in, a microVM of its own, and
+/// the images they boot.
+pub struct Microvms {
+    pub sandbox: Arc<dyn Sandbox>,
+    pub images: image::Images,
+}
+
+/// The microVMs this machine holds isolated agents' harnesses in: none until this kiln carries their
+/// runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16's Shards and Hex, wired here by step
+/// 17's next slice).
+pub fn microvm() -> Option<Arc<Microvms>> {
     None
 }
 
@@ -152,6 +162,15 @@ impl Run for ProcRun {
             return;
         }
         self.proc.terminate(Duration::ZERO);
+    }
+
+    // A process of the machine's: its pid names it, and its stdio are its pipes.
+    fn id(&self) -> Option<String> {
+        None
+    }
+
+    fn link(&self) -> BoxFuture<'_, Option<Link>> {
+        Box::pin(async { None })
     }
 }
 
