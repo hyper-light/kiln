@@ -178,10 +178,13 @@
       {
         "what": "mcp_in_microvm",
         "where": "a microVM",
-        "why": "Antigravity reads MCP servers only from its own config file, which kiln puts kiln's server in on the host; in a microVM that file is in the person's volume, shared by their sessions, where one session's own token can't go (step 18). So no MCP round trip and no agent started from inside, until plan 01a1d2c16eb074f19cf7ae7f1025c0be step 4 finds a way or records why not.",
+        "why": "Antigravity reads MCP servers only from its own config files: its global one, which in a microVM is in the person's volume, shared by their sessions, and its workspace's, which is the person's project; neither is a place for one session's own token (step 18). agy 1.5.7 expands no ${VAR} in a server's header and takes no MCP server by --settings, so neither carries a token per session. A stdio server it starts does get its environment: a stdio server in the shared config, holding no token, can take each session's own from it, plan 01a1d2c16eb074f19cf7ae7f1025c0be step 4's way once step 18's isolated launch is on kiln main. Until then, no MCP round trip and no agent started from inside.",
         "cites": [
           "https://antigravity.google/docs/mcp?tab=cli",
-          "crates/kiln/src/harness/kinds.rs#.gemini/config/mcp_config.json"
+          "crates/kiln/src/harness/kinds.rs#.gemini/config/mcp_config.json",
+          "docs/research/s35-every-harness/agy-mcp/probe-1.5.7-linux-x64.log:24",
+          "docs/research/s35-every-harness/agy-mcp/probe-1.5.7-linux-x64.log:41",
+          "docs/research/s35-every-harness/agy-mcp/probe-1.5.7-linux-x64.log:43"
         ]
       },
       {
