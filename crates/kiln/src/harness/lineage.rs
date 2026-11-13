@@ -1460,6 +1460,8 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         isolation,
         resume,
         agentfile,
+        // Whose its opening prompt is: its input admits it as theirs (step 35).
+        opener: person.clone(),
         ..Spec::default()
     };
     tune(&mut spec);

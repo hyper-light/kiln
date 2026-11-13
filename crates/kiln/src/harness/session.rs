@@ -325,6 +325,19 @@ pub struct Spec {
     /// the same ledger as CI legs and commands. Set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<crate::reach::place::Claim>,
+    /// Whom it acts for, the person whose words its opening prompt (`prompt`) is
+    /// (`lineage::person_of`'s form: `owner`, `user:<id>`; kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 35): its input admits that prompt as theirs, held to
+    /// no depth (`mail::person`). Set by kiln, never from what was asked; none from a server before
+    /// it, or for a start that acts for no person, and the prompt is then held to the depth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opener: Option<String>,
+}
+
+/// The id of session `session`'s opening prompt (`Spec::prompt`), its own (CP-T3.2): made once,
+/// the same if it's ever made again.
+pub fn opening_prompt_id(session: &str) -> String {
+    crate::util::derive_id(&["first-prompt", session])
 }
 
 fn yes() -> bool {
@@ -366,6 +379,7 @@ impl Default for Spec {
             isolation: None,
             agentfile: None,
             variant_of: None,
+            opener: None,
         }
     }
 }
@@ -4535,7 +4549,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             },
             None => {
                 let mut adapter = kind.adapter(&spec);
-                adapter.offer_mcp(super::kinds::acp_servers(&spec, &s.id));
+                let mut servers = super::kinds::acp_servers(&spec, &s.id);
+                // In a microVM, kiln's MCP only where its microVMs carry its lane (Shards D254): its bridge is there.
+                if spec.isolation.is_some() && files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm()).is_none_or(|v| v.mcp().is_err()) {
+                    servers.clear();
+                }
+                adapter.offer_mcp(servers);
                 if let Some(items) = &seed {
                     adapter.seed(items.clone());
                 }
@@ -4558,7 +4577,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     None if isolated => {
                         let host = files.host.as_ref().and_then(std::sync::Weak::upgrade);
                         match host.as_ref().and_then(|h| h.microvm()) {
-                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes())).await,
+                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone()).await,
                             None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
                         }
                     }
@@ -4630,7 +4649,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     adapter.start(&mut core);
                     if !s.prompted.swap(true, std::sync::atomic::Ordering::Relaxed) && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
                         // Its id is the session's own (CP-T3.2): made once, the same if it's ever made again.
-                        let id = crate::util::derive_id(&["first-prompt", &s.id]);
+                        let id = opening_prompt_id(&s.id);
                         adapter.command(&mut core, Command::Send { id, text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None });
                     }
                     for c in carry.drain(..) {
