@@ -197,10 +197,12 @@ fn step35_a_start_names_only_an_agentfile_its_person_reaches() -> anyhow::Result
     anyhow::ensure!(listed == json!([]), "nothing started: {listed}");
 
     // Ada's own passes the check (what refuses her next is where it would run: no machine here starts
-    // microVMs), on every surface.
+    // microVMs), on every surface. Asked of the server itself, so it's refused for being isolated
+    // whatever harnesses this host has on its PATH (with no runner, a start goes to the server only
+    // where it has the harness).
     let (st, said) = call(&srv, &ada, "POST", "/api/harness/sessions", Some(session(&hers)))?;
     anyhow::ensure!(!refused_as_none(&said.to_string()), "the sessions route, hers: {st} {said}");
-    let (failed, said) = mcp(&srv, &ada, "agents_start", json!({ "kind": "claude", "image": hers }))?;
+    let (failed, said) = mcp(&srv, &ada, "agents_start", json!({ "kind": "claude", "image": hers, "on": "local" }))?;
     anyhow::ensure!(failed && !refused_as_none(&said) && said.contains("microVM"), "agents_start, hers: {said}");
 
     // kiln's own for another harness, an Agentfile as a process, and a conversation taken up twice.
