@@ -2,7 +2,7 @@
 
 On a machine where kiln's server runs beside its own work, the server comes first: it runs at the
 most CPU weight, and CI legs and agents below it, each in a group of its own at the least weight
-(Linux), below normal (macOS: nice 10, on every core; Windows); headroom slows them when the
+(Linux), below normal (macOS: nice 10 past the runner's, on every core; Windows); headroom slows them when the
 server's own delay rises; and the server can be given cores of its own. This is plan 01a1a59c2b29
 (goal 8) and the CPU-priority part of plan 01a19617's step 10. It
 joins `docs/baremetal.md` (the bare-metal design, on its own branch until it lands) as that lands:
@@ -93,8 +93,10 @@ settings of its own under cgroup v2 (f22). A microVM deployment's VMM runs as th
 The server's launchd job (a LaunchDaemon installed system-wide, else a LaunchAgent) runs with
 `ProcessType` `Interactive`: no limits for its purpose, as an app has none. Left unset, launchd
 throttles a job's CPU and I/O (f25). Each agent's harness and each CI step starts below normal,
-nice 10 (`setpriority(PRIO_PROCESS, 0, 10)` between fork and exec), inherited by everything it
-starts. A step on a pty is put there as it starts.
+nice 10 past the runner's own (`setpriority(PRIO_PROCESS, 0, …)` between fork and exec; 10 under a
+runner at normal, at most 20, `PRIO_MAX`), inherited by everything it starts: below what the runner
+starts plainly, a person's run, even where the runner itself was started under `nice`. A step on a
+pty is put there as it starts.
 
 Not under Darwin background policy (`PRIO_DARWIN_BG`, `taskpolicy -b`, f26), as they did until
 2026-11-05: Apple silicon runs background work on its efficiency cores alone and throttles its disk

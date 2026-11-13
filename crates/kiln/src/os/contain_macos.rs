@@ -24,7 +24,7 @@
 //! as launchd jobs, outside everything kiln knew of the agent, when the Mac ran out of memory.
 //!
 //! Priority (docs/priority.md): an agent's harness, and each CI step, starts below normal
-//! ([`background`]: nice [`NICE`]), and so does all they start. Not under Darwin background policy:
+//! ([`background`]: nice [`NICE`] past the runner's own), and so does all they start. Not under Darwin background policy:
 //! Apple silicon runs that on its efficiency cores alone and throttles its disk and network I/O, so
 //! agents had a fraction of the machine and moved their work where kiln couldn't see it (launchd
 //! jobs, VMs). Below normal, their work has every core the machine isn't using for something
@@ -46,9 +46,12 @@ const SWEEP: Duration = Duration::from_secs(60);
 const MOST_CHILDREN: usize = 1024;
 /// How deep a fork's descendants are listed when it's seen.
 const DEPTH: usize = 8;
-/// The nice value agents' and legs' processes start at: below a process started plainly (0), so the
-/// server and what a person runs come first, on every core alike.
+/// How far below the runner's own priority agents' and legs' processes start: nice [`NICE`] past
+/// the runner's, below a process it starts plainly (a person's run), so the server and what a
+/// person runs come first, on every core alike ([`agents_nice`]).
 pub const NICE: i32 = 10;
+/// The highest nice value: `PRIO_MAX` in macOS's `<sys/resource.h>` (libc doesn't export it here).
+const PRIO_MAX: i32 = 20;
 /// How often launchd is asked for the processes of agents' jobs, at most.
 const JOBS_EVERY: Duration = Duration::from_secs(1);
 
@@ -243,6 +246,7 @@ impl Tracker {
                 continue;
             }
             self.watch(pid, &session, DEPTH);
+            let nice = agents_nice();
             let mut tree = vec![pid];
             let mut i = 0;
             while let Some(p) = tree.get(i).copied() {
@@ -254,7 +258,7 @@ impl Tracker {
             }
             for p in tree {
                 // SAFETY: one system call on a process id.
-                unsafe { libc::setpriority(libc::PRIO_PROCESS, u32::try_from(p).unwrap_or(0), NICE) };
+                unsafe { libc::setpriority(libc::PRIO_PROCESS, u32::try_from(p).unwrap_or(0), nice) };
             }
             tracing::info!(session = %session, label = %label, pid, "an agent's launchd job runs: its processes are the agent's");
         }
@@ -546,30 +550,42 @@ pub fn groups_of(pid: u32) -> [Option<u32>; 2] {
     [group, session].map(|i| u32::try_from(i).ok().filter(|i| *i > 1))
 }
 
-/// Makes `cmd`'s process start below normal (docs/priority.md): nice [`NICE`], set between fork and
-/// exec, which everything it starts inherits. Every core, and its I/O unthrottled; only ranked
-/// below what runs at normal.
+/// The nice value agents' and legs' processes run at: [`NICE`] past this process's own (the
+/// runner's, which a process it starts plainly inherits), at most [`PRIO_MAX`]. A runner at normal
+/// (0) puts them at 10; one started under `nice -n 10` at 20, not level with a person's run, as a
+/// fixed 10 put them (and a fixed 10 under a runner niced past it was refused: lowering a nice
+/// value takes root).
+fn agents_nice() -> i32 {
+    // SAFETY: one system call on this process, which can't fail: -1 is nice -1, not an error.
+    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    own.saturating_add(NICE).min(PRIO_MAX)
+}
+
+/// Makes `cmd`'s process start below normal (docs/priority.md): [`agents_nice`], set between fork
+/// and exec, which everything it starts inherits. Every core, and its I/O unthrottled; only ranked
+/// below what the runner and a person run.
 pub fn background(cmd: &mut Command) {
     use std::os::unix::process::CommandExt as _;
+    let nice = agents_nice();
     // SAFETY: the closure runs in the child between fork and exec, and makes one system call.
     unsafe {
-        cmd.pre_exec(|| {
-            let _ = libc::setpriority(libc::PRIO_PROCESS, 0, NICE);
+        cmd.pre_exec(move || {
+            let _ = libc::setpriority(libc::PRIO_PROCESS, 0, nice);
             Ok(())
         });
     }
 }
 
-/// Process `pid`, started some other way (a CI step on a pty), below normal from now on, as
-/// `renice` puts one: whether it was.
+/// Process `pid`, started some other way (a CI step on a pty), below normal from now on
+/// ([`agents_nice`]), as `renice` puts one: whether it was.
 pub fn background_pid(pid: u32) -> bool {
     // SAFETY: one system call on a process id.
-    unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, NICE) == 0 }
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, agents_nice()) == 0 }
 }
 
 /// How legs and agents run here (docs/priority.md), for the runner's facts and its log.
 pub fn priority() -> String {
-    format!("below normal: each leg's and agent's processes run at nice {NICE}, on every core")
+    format!("below normal: each leg's and agent's processes run at nice {}, {NICE} past the runner's own, on every core", agents_nice())
 }
 
 /// How this machine holds an agent's processes together.
@@ -738,7 +754,8 @@ mod tests {
         boot_out(&label);
         anyhow::ensure!(job.is_some(), "launchd never ran the job");
         anyhow::ensure!(followed, "the job's process {job:?} isn't the agent's");
-        anyhow::ensure!(lowered == Some(NICE), "the job's process runs at nice {lowered:?}, not below normal");
+        let below = agents_nice();
+        anyhow::ensure!(lowered == Some(below), "the job's process runs at nice {lowered:?}, not below normal ({below})");
         anyhow::ensure!(after.is_none() && !listed, "ending the agent left its job: {after:?}");
         Ok(())
     }
@@ -752,7 +769,9 @@ mod tests {
 
     /// Goal 8 (plan 01a1a59c2b29 step 3, docs/priority.md): an agent's harness, and what it starts,
     /// run below normal (nice), below a process started plainly; a person's run doesn't; a
-    /// process started some other way (a step on a pty) is put there as it runs.
+    /// process started some other way (a step on a pty) is put there as it runs. Relative to the
+    /// runner (this test's process): under a runner already niced (a `kiln run` shell runs at 10)
+    /// the agents still run below what it starts plainly; at the least priority (20) level with it.
     #[test]
     fn g8_s3_an_agents_processes_run_under_background_policy() -> anyhow::Result<()> {
         let session = format!("g8agent{}", std::process::id());
@@ -791,9 +810,12 @@ mod tests {
         }
         person.remove();
         let normal = normal.ok_or_else(|| anyhow::anyhow!("ps said nothing of a plain process"))?;
-        anyhow::ensure!(pids.len() >= 2 && agents.iter().all(|p| *p == Some(NICE) && NICE > normal), "the harness and its sleep, each at nice {NICE}, a plain process at {normal}: {pids:?} {agents:?}");
+        // Below it, unless it already runs at the least priority there is.
+        let below = (normal + NICE).min(PRIO_MAX);
+        anyhow::ensure!(below > normal || normal == PRIO_MAX, "agents at nice {below}, not below a plain process at {normal}");
+        anyhow::ensure!(pids.len() >= 2 && agents.iter().all(|p| *p == Some(below)), "the harness and its sleep, each at nice {below}, a plain process at {normal}: {pids:?} {agents:?}");
         anyhow::ensure!(persons_before == Some(normal), "a person's run lowered: {persons_before:?}, a plain process {normal}");
-        anyhow::ensure!(put && persons_after == Some(NICE), "a running process not put below normal: {persons_after:?}");
+        anyhow::ensure!(put && persons_after == Some(below), "a running process not put below normal ({below}): {persons_after:?}");
         Ok(())
     }
 }
