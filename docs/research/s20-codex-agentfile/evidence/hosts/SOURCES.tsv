@@ -1,0 +1,8 @@
+file	url (fetched 2026-11-13 with curl -L)	sha256
+learn-chatgpt-llms.txt	https://developers.openai.com/codex/llms.txt	91f6ce7beb8d26014ce6e85e7e61100e8f706a4a638397d7f996863849c44067
+auth.md	https://developers.openai.com/codex/auth.md	67d3f0c64897ea26b48e62a634ced7dbd2763a47104e12a0923cc528986de588
+connect-to-a-gateway.md	https://learn.chatgpt.com/docs/enterprise/connect-to-a-gateway.md	b877a6fcc0a5948c1edff68b9c6a30cffda02ba3a129bdd10e4dacb12c8a7f3b
+app-server.md	https://learn.chatgpt.com/docs/app-server.md	b9e75507755ba0be2ebc615ca1f4399a54a386125f3935f615405ea93efe77f2
+config-sample.md	https://learn.chatgpt.com/docs/config-file/config-sample.md	f5200b38f5d7ff485c3fe9f54995f1c1876d2a1ac8e38424919a1ade6dab8664
+openai-api-reference-overview.md	https://developers.openai.com/api/reference/overview.md	a046d08b9f57f2d8e5e540c2a9ae201b93a6c64647679e81bea0eabe787f58b7
+codex-rs-excerpts.txt	kiln's numbered excerpt of openai/codex at rust-v0.167.2: each file's URL and whole SHA-256 are inside	e4787773b830137fa7482d81a2eb15633bf9be3ef1a963a76a9f738972f8dd72

@@ -1,0 +1,160 @@
+How kiln derives opencode 2.2.7's reachable provider hosts (docs/research/s18-host-in-vm/evidence/part4/scripts/oc_hosts.py):
+every API of a chat, decision or image model in opencode's catalog whose @opencode/ai package the build ships
+(provider.ts's builtins), at an https base_url with a fixed public name, leaving out the packages that build their
+own URL from an account, region or resource (models-dev.ts's BUILDS_OWN_URL). Of those, Cloudflare's two build it at
+a fixed host with the account in the path (gateway.ai.cloudflare.com, api.cloudflare.com), so those hosts are named
+from their own modules (hosts.tsv); Azure's, Bedrock's and Vertex AI's hosts follow the person's resource or region
+and stay out (ROOT's call of 2026-11-13). The catalog is opencode's default
+source (models-dev.ts's defaultSource and catalogPath), as fetched 2026-11-13: sha256 in hosts.tsv. Numbered
+excerpts of opencode at tag v2.2.7, fetched 2026-11-13 with curl -L, each with the whole file's SHA-256.
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/core/src/models-dev.ts
+   sha256 0c31c35c88881a9e4c2ba46f9a7890f824f9e93586b46583da168808e897fa61  30113 bytes  (lines naming: const TYPES, const defaultSource, export const catalogPath)
+   129  const TYPES: readonly string[] = ["chat", "decision", "image"]
+   ...
+   494  const defaultSource = "https://models.opencode.ai"
+   ...
+   497  export const catalogPath = `/experimental/v2.0/api.json?type=${TYPES.join(",")}`
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/core/src/models-dev.ts
+   sha256 0c31c35c88881a9e4c2ba46f9a7890f824f9e93586b46583da168808e897fa61  30113 bytes  (lines naming: const BUILDS_OWN_URL = new Set([)
+   138  const decodeMediaInput = Schema.decodeUnknownOption(MediaInput)
+   139  const decodeStatus = Schema.decodeUnknownOption(Schema.Literals(["alpha", "beta", "deprecated"]))
+   140  
+   141  export type Snapshot = {
+   142    readonly info: Provider.Info
+   143    readonly models: readonly Model.Info[]
+   144    readonly environment: readonly string[]
+   145  }
+   146  
+   147  type Route = {
+   148    readonly package: string
+   149    readonly baseURL?: string
+   150    readonly compatibility?: Model.Compatibility
+   151  }
+   152  
+   153  // These packages build their URL from provider settings (region, resource, account, project…), which
+   154  // only happens when no baseURL is set. The catalog's URL for them is a template or SDK default.
+   155  const BUILDS_OWN_URL = new Set([
+   156    "@opencode/ai/providers/amazon-bedrock",
+   157    "@opencode/ai/providers/azure/chat",
+   158    "@opencode/ai/providers/azure/images",
+   159    "@opencode/ai/providers/azure/messages",
+   160    "@opencode/ai/providers/azure/responses",
+   161    "@opencode/ai/providers/cloudflare-ai-gateway",
+   162    "@opencode/ai/providers/cloudflare-ai-gateway/decisions",
+   163    "@opencode/ai/providers/cloudflare-workers-ai",
+   164    "@opencode/ai/providers/cloudflare-workers-ai/decisions",
+   165    "@opencode/ai/providers/cloudflare-workers-ai/images",
+   166    "@opencode/ai/providers/google-vertex/gemini",
+   167    "@opencode/ai/providers/google-vertex/images",
+   168    "@opencode/ai/providers/google-vertex/messages",
+   169    "aisdk:@jerome-benoit/sap-ai-provider-v2",
+   170    "aisdk:watsonx-ai-provider",
+   171  ])
+   172  
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/core/src/provider.ts
+   sha256 abc3244f71a8da97d9b127aec47bd7373fd82be8082c68eb00f1b217022ce07c  28978 bytes  (lines naming: ["@opencode/ai/providers/, export const builtinPackages)
+    48    ["@opencode/ai/providers/alibaba", () => import("@opencode/ai/providers/alibaba")],
+    49    ["@opencode/ai/providers/alibaba/chat", () => import("@opencode/ai/providers/alibaba/chat")],
+    50    ["@opencode/ai/providers/alibaba/messages", () => import("@opencode/ai/providers/alibaba/messages")],
+    51    ["@opencode/ai/providers/alibaba/responses", () => import("@opencode/ai/providers/alibaba/responses")],
+    52    ["@opencode/ai/providers/alibaba/images", () => import("@opencode/ai/providers/alibaba/images")],
+    53    ["@opencode/ai/providers/alibaba/embeddings", () => import("@opencode/ai/providers/alibaba/embeddings")],
+    54    ["@opencode/ai/providers/amazon-bedrock", () => import("@opencode/ai/providers/amazon-bedrock")],
+    55    ["@opencode/ai/providers/amazon-bedrock/mantle", () => import("@opencode/ai/providers/amazon-bedrock/mantle")],
+   ...
+    68    ["@opencode/ai/providers/anthropic", () => import("@opencode/ai/providers/anthropic")],
+    69    ["@opencode/ai/providers/anthropic-compatible", () => import("@opencode/ai/providers/anthropic-compatible")],
+    70    ["@opencode/ai/providers/azure", () => import("@opencode/ai/providers/azure")],
+    71    ["@opencode/ai/providers/azure/chat", () => import("@opencode/ai/providers/azure/chat")],
+    72    ["@opencode/ai/providers/azure/responses", () => import("@opencode/ai/providers/azure/responses")],
+    73    ["@opencode/ai/providers/azure/images", () => import("@opencode/ai/providers/azure/images")],
+    74    ["@opencode/ai/providers/azure/embeddings", () => import("@opencode/ai/providers/azure/embeddings")],
+    75    ["@opencode/ai/providers/azure/messages", () => import("@opencode/ai/providers/azure/messages")],
+    76    ["@opencode/ai/providers/baseten", () => import("@opencode/ai/providers/baseten")],
+    77    ["@opencode/ai/providers/baseten/decisions", () => import("@opencode/ai/providers/baseten/decisions")],
+    78    ["@opencode/ai/providers/cerebras", () => import("@opencode/ai/providers/cerebras")],
+    79    ["@opencode/ai/providers/cloudflare-ai-gateway", () => import("@opencode/ai/providers/cloudflare-ai-gateway")],
+   ...
+    84    ["@opencode/ai/providers/cloudflare-workers-ai", () => import("@opencode/ai/providers/cloudflare-workers-ai")],
+   ...
+    93    ["@opencode/ai/providers/cohere", () => import("@opencode/ai/providers/cohere")],
+    94    ["@opencode/ai/providers/cohere/chat", () => import("@opencode/ai/providers/cohere/chat")],
+    95    ["@opencode/ai/providers/cohere/embeddings", () => import("@opencode/ai/providers/cohere/embeddings")],
+    96    ["@opencode/ai/providers/deepinfra", () => import("@opencode/ai/providers/deepinfra")],
+    97    ["@opencode/ai/providers/deepinfra/embeddings", () => import("@opencode/ai/providers/deepinfra/embeddings")],
+    98    ["@opencode/ai/providers/deepseek", () => import("@opencode/ai/providers/deepseek")],
+    99    ["@opencode/ai/providers/digitalocean", () => import("@opencode/ai/providers/digitalocean")],
+   100    ["@opencode/ai/providers/digitalocean/decisions", () => import("@opencode/ai/providers/digitalocean/decisions")],
+   101    ["@opencode/ai/providers/digitalocean/embeddings", () => import("@opencode/ai/providers/digitalocean/embeddings")],
+   102    ["@opencode/ai/providers/digitalocean/images", () => import("@opencode/ai/providers/digitalocean/images")],
+   103    ["@opencode/ai/providers/digitalocean/responses", () => import("@opencode/ai/providers/digitalocean/responses")],
+   104    ["@opencode/ai/providers/fireworks", () => import("@opencode/ai/providers/fireworks")],
+   105    ["@opencode/ai/providers/fireworks/embeddings", () => import("@opencode/ai/providers/fireworks/embeddings")],
+   106    ["@opencode/ai/providers/google", () => import("@opencode/ai/providers/google")],
+   107    ["@opencode/ai/providers/google/interactions", () => import("@opencode/ai/providers/google/interactions")],
+   108    ["@opencode/ai/providers/google/embeddings", () => import("@opencode/ai/providers/google/embeddings")],
+   109    ["@opencode/ai/providers/google/images", () => import("@opencode/ai/providers/google/images")],
+   110    ["@opencode/ai/providers/google-vertex", () => import("@opencode/ai/providers/google-vertex")],
+   111    ["@opencode/ai/providers/google-vertex/chat", () => import("@opencode/ai/providers/google-vertex/chat")],
+   112    ["@opencode/ai/providers/google-vertex/gemini", () => import("@opencode/ai/providers/google-vertex/gemini")],
+   ...
+   117    ["@opencode/ai/providers/google-vertex/messages", () => import("@opencode/ai/providers/google-vertex/messages")],
+   118    ["@opencode/ai/providers/google-vertex/mistral", () => import("@opencode/ai/providers/google-vertex/mistral")],
+   119    ["@opencode/ai/providers/google-vertex/responses", () => import("@opencode/ai/providers/google-vertex/responses")],
+   120    ["@opencode/ai/providers/google-vertex/embeddings", () => import("@opencode/ai/providers/google-vertex/embeddings")],
+   121    ["@opencode/ai/providers/google-vertex/images", () => import("@opencode/ai/providers/google-vertex/images")],
+   122    ["@opencode/ai/providers/google-vertex-messages", () => import("@opencode/ai/providers/google-vertex-messages")],
+   123    ["@opencode/ai/providers/groq", () => import("@opencode/ai/providers/groq")],
+   124    ["@opencode/ai/providers/meta", () => import("@opencode/ai/providers/meta")],
+   125    ["@opencode/ai/providers/meta/chat", () => import("@opencode/ai/providers/meta/chat")],
+   126    ["@opencode/ai/providers/meta/images", () => import("@opencode/ai/providers/meta/images")],
+   127    ["@opencode/ai/providers/meta/messages", () => import("@opencode/ai/providers/meta/messages")],
+   128    ["@opencode/ai/providers/meta/responses", () => import("@opencode/ai/providers/meta/responses")],
+   129    ["@opencode/ai/providers/minimax", () => import("@opencode/ai/providers/minimax")],
+   130    ["@opencode/ai/providers/minimax/chat", () => import("@opencode/ai/providers/minimax/chat")],
+   131    ["@opencode/ai/providers/minimax/images", () => import("@opencode/ai/providers/minimax/images")],
+   132    ["@opencode/ai/providers/minimax/messages", () => import("@opencode/ai/providers/minimax/messages")],
+   133    ["@opencode/ai/providers/minimax/responses", () => import("@opencode/ai/providers/minimax/responses")],
+   134    ["@opencode/ai/providers/mistral", () => import("@opencode/ai/providers/mistral")],
+   135    ["@opencode/ai/providers/moonshot", () => import("@opencode/ai/providers/moonshot")],
+   136    ["@opencode/ai/providers/moonshot/chat", () => import("@opencode/ai/providers/moonshot/chat")],
+   137    ["@opencode/ai/providers/moonshot/messages", () => import("@opencode/ai/providers/moonshot/messages")],
+   138    ["@opencode/ai/providers/moonshot/responses", () => import("@opencode/ai/providers/moonshot/responses")],
+   139    ["@opencode/ai/providers/openai", () => import("@opencode/ai/providers/openai")],
+   140    ["@opencode/ai/providers/openai/chat", () => import("@opencode/ai/providers/openai/chat")],
+   141    ["@opencode/ai/providers/openai/responses", () => import("@opencode/ai/providers/openai/responses")],
+   142    ["@opencode/ai/providers/openai/images", () => import("@opencode/ai/providers/openai/images")],
+   143    ["@opencode/ai/providers/openai/embeddings", () => import("@opencode/ai/providers/openai/embeddings")],
+   144    ["@opencode/ai/providers/openai-compatible", () => import("@opencode/ai/providers/openai-compatible")],
+   ...
+   149    ["@opencode/ai/providers/openai-compatible/images", () => import("@opencode/ai/providers/openai-compatible/images")],
+   ...
+   158    ["@opencode/ai/providers/opencode/decisions", () => import("@opencode/ai/providers/opencode/decisions")],
+   159    ["@opencode/ai/providers/openrouter", () => import("@opencode/ai/providers/openrouter")],
+   160    ["@opencode/ai/providers/openrouter/decisions", () => import("@opencode/ai/providers/openrouter/decisions")],
+   161    ["@opencode/ai/providers/openrouter/embeddings", () => import("@opencode/ai/providers/openrouter/embeddings")],
+   162    ["@opencode/ai/providers/openrouter/images", () => import("@opencode/ai/providers/openrouter/images")],
+   163    ["@opencode/ai/providers/openrouter/responses", () => import("@opencode/ai/providers/openrouter/responses")],
+   164    ["@opencode/ai/providers/togetherai", () => import("@opencode/ai/providers/togetherai")],
+   165    ["@opencode/ai/providers/typesafe-ai/decisions", () => import("@opencode/ai/providers/typesafe-ai/decisions")],
+   166    ["@opencode/ai/providers/venice", () => import("@opencode/ai/providers/venice")],
+   167    ["@opencode/ai/providers/venice/responses", () => import("@opencode/ai/providers/venice/responses")],
+   168    ["@opencode/ai/providers/vercel-ai-gateway", () => import("@opencode/ai/providers/vercel-ai-gateway")],
+   169    ["@opencode/ai/providers/vercel-ai-gateway/chat", () => import("@opencode/ai/providers/vercel-ai-gateway/chat")],
+   ...
+   182    ["@opencode/ai/providers/vercel-ai-gateway/images", () => import("@opencode/ai/providers/vercel-ai-gateway/images")],
+   ...
+   187    ["@opencode/ai/providers/xai", () => import("@opencode/ai/providers/xai")],
+   188    ["@opencode/ai/providers/xai/images", () => import("@opencode/ai/providers/xai/images")],
+   189    ["@opencode/ai/providers/zai", () => import("@opencode/ai/providers/zai")],
+   190    ["@opencode/ai/providers/zai/chat", () => import("@opencode/ai/providers/zai/chat")],
+   191    ["@opencode/ai/providers/zai/images", () => import("@opencode/ai/providers/zai/images")],
+   192    ["@opencode/ai/providers/zai-coding-plan", () => import("@opencode/ai/providers/zai-coding-plan")],
+   193    ["@opencode/ai/providers/zai-coding-plan/chat", () => import("@opencode/ai/providers/zai-coding-plan/chat")],
+   194    ["@opencode/ai/providers/zai-coding-plan/messages", () => import("@opencode/ai/providers/zai-coding-plan/messages")],
+   ...
+   202  export const builtinPackages: ReadonlySet<string> = new Set(builtins.keys())
+

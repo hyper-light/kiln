@@ -1152,13 +1152,13 @@ mod release_frame {
 
 /// AC-T7.4.1: the plain kinds' waits keep their order, the scheduler's and a physical report's after a hello, a list
 /// and the network namespaces' counts; a call naming a box or a class is no plain kind's, its box kind's wait its
-/// class's ([`BoxKind`]). Do: map each plain kind and each box kind's request. Expect: each plain kind at its place
-/// in a table of 18, the person's release of a capacity holder appended last; each box kind's none there, and its own
-/// kind and class.
+/// class's ([`BoxKind`]), a member's hand-over (joint plan step 17) appended last among them. Do: map each plain kind
+/// and each box kind's request. Expect: each plain kind at its place in a table of 19, the person's release of a
+/// capacity holder appended, then the node's links last; each box kind's none there, and its own kind and class.
 #[test]
 fn plain_kinds_keep_their_order_and_box_kinds_are_their_classs() {
     let waits = <Memory as Transport>::answers();
-    assert_eq!((KINDS, BOX_KINDS, CLASSES), (18, 11, 4));
+    assert_eq!((KINDS, BOX_KINDS, CLASSES), (19, 12, 4));
     for (request, index) in [
         (
             Request::Hello {
@@ -1198,6 +1198,7 @@ fn plain_kinds_keep_their_order_and_box_kinds_are_their_classs() {
             ))),
             17,
         ),
+        (Request::Call(Call::Links), 18),
     ] {
         assert!(
             std::ptr::eq(kind_of(waits, &request).unwrap(), &waits[index]),
@@ -1213,9 +1214,69 @@ fn plain_kinds_keep_their_order_and_box_kinds_are_their_classs() {
             Request::Call(Call::Capacity(Class::Shards)),
             BoxKind::Capacity,
         ),
+        (
+            Request::Call(Call::Member {
+                id: b.clone(),
+                member: hex_api::Member {
+                    kind: hex_api::MemberKind::Harness,
+                    name: "claude".to_owned(),
+                },
+                streams: hex_core::wire::Streams::default(),
+                ask: hex_core::wire::Streams::default(),
+            }),
+            BoxKind::Member,
+        ),
     ] {
         assert!(kind_of(waits, &request).is_none(), "{request:?}");
         assert_eq!(box_kind_of(&request).map(|(kind, _)| kind), Some(kind));
+    }
+}
+
+/// HEX-QUIC-30 (docs/design/hex-quic.md Q12): a node's links report comes in as many parts as it needs and is gathered
+/// whole, in order; parts carrying more links than the node's hello said it holds connections are refused, typed,
+/// gathered no further. Do: answer the client's first call (id 1) with three links in two parts under a bound of
+/// three, then with three links before the last part under a bound of two. Expect: the three links, in order; then
+/// `Exhausted` naming the bound.
+#[test]
+fn hex_quic_30_a_links_report_is_gathered_from_its_parts_within_the_nodes_connections() {
+    let link = |n: u32| wire::Link {
+        peer: format!("peer-{n}.links.test"),
+        suite: 0x1302,
+        group: Some(0x11ed),
+    };
+    for (bound, parts, last, expected) in [
+        (3, vec![vec![link(0), link(1)]], vec![link(2)], Some(3)),
+        (
+            2,
+            vec![vec![link(0), link(1)], vec![link(2)]],
+            Vec::new(),
+            None,
+        ),
+    ] {
+        let client = client();
+        client.conn.shared.state().unwrap().links_bound = Some(bound);
+        let memory = &client.conn.shared.transport;
+        for links in parts {
+            memory.queue(1, Answer::Links { links, more: true });
+        }
+        *memory.reply.lock().unwrap() = Some(Answer::Links {
+            links: last,
+            more: false,
+        });
+        let got = client.links();
+        match expected {
+            Some(n) => assert_eq!(got.unwrap(), (0..n).map(link).collect::<Vec<_>>()),
+            None => assert!(
+                matches!(
+                    got,
+                    Err(Refusal::Exhausted {
+                        what: "links in one report",
+                        bound: 2
+                    })
+                ),
+                "{got:?}"
+            ),
+        }
     }
 }
 
@@ -1243,6 +1304,7 @@ fn every_kind_and_class_has_its_own_census_name() {
             "exec_streams",
             "run",
             "capacity",
+            "member",
         ];
         for wait in T::answers() {
             assert!(seen.insert(wait.name()), "{} twice", wait.name());

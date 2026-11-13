@@ -27,7 +27,7 @@ use hex_sim::model::Class;
 
 use super::Node;
 use crate::recorded::charges::{
-    LastResort, Lifetime, Reach, Scope, Writes, record_last_resort, write_ends,
+    LastResort, Lifetime, Reach, Scope, Writes, bounds, record_last_resort, write_ends,
 };
 
 /// The window the learner reads over (C1): `cpu.max`'s period, the one the kernel enforces a VM's CPU over.
@@ -147,6 +147,9 @@ struct Vm {
     last: (u64, Instant),
     /// What its cgroup holds as the learner last wrote it, or as its create wrote it.
     written: Vec<Write>,
+    /// The CPU cap its cgroup holds it at, in milli-CPU (`cpu.max`), as last written: a window that reaches it is no
+    /// sample of its VMM's own CPU (C1).
+    cap: Option<u64>,
 }
 
 /// The node's learner (module docs).
@@ -171,21 +174,6 @@ pub(super) struct Learner {
     last: LastResort,
 }
 
-/// The most VMs a machine of `machine` could hold, each at least the least reservation placement takes
-/// (`MIN_CPU_MILLI` of its CPU, `MIN_MEMORY` of its memory).
-fn population(machine: CapacityResources) -> Result<usize, Refusal> {
-    let cpus = machine
-        .cpu_milli
-        .checked_div(u64::from(hex_api::MIN_CPU_MILLI));
-    let memory = machine.mem_bytes.checked_div(hex_api::MIN_MEMORY);
-    cpus.zip(memory)
-        .and_then(|(cpus, memory)| usize::try_from(cpus.min(memory)).ok())
-        .ok_or_else(|| Refusal::Invalid {
-            what: "a microVM's learned charge",
-            why: "the machine's population passes a usize".into(),
-        })
-}
-
 /// A VM's vCPUs: its admitted guest's CPU in whole CPUs, rounded up.
 fn vcpus(allocation: Allocation) -> Result<u32, Refusal> {
     let guest = allocation.guest()?;
@@ -195,7 +183,8 @@ fn vcpus(allocation: Allocation) -> Result<u32, Refusal> {
     })
 }
 
-/// Writes what `bounds` holds that `written` doesn't, in the order the kernel needs, and keeps it as written.
+/// Writes what `bounds` holds that `written` doesn't, in the order the kernel needs, and keeps it as written; a file
+/// written before that `bounds` sets no more goes back to the kernel's default.
 fn rewrite(
     io: &impl Cgroups,
     cgroup: &BoxCgroup,
@@ -203,6 +192,17 @@ fn rewrite(
     written: &mut Vec<Write>,
 ) -> Result<(), Refusal> {
     let writes = hex_core::cgroup::writes(bounds, &[])?;
+    // A file written before that `bounds` sets no more goes back to the kernel's default first, before any bound is
+    // raised past it: a VM's `memory.max` its create wrote is lifted, with the `memory.swap.max` it came with (C5).
+    let defaults = hex_core::cgroup::writes_all(bounds, &[])?;
+    for before in written.iter() {
+        if writes.iter().any(|write| write.file == before.file) {
+            continue;
+        }
+        if let Some(default) = defaults.iter().find(|default| default.file == before.file) {
+            io.write(cgroup, default)?;
+        }
+    }
     for write in &writes {
         if !written.contains(write) {
             io.write(cgroup, write)?;
@@ -361,21 +361,13 @@ impl Learner {
             what: "a microVM fleet's parent cgroup",
             why: format!("{} has no parent", fleet.display()),
         })?;
-        let bound = population(machine)?;
+        let bounds = bounds(machine)?;
         let root = parent.parent().ok_or_else(|| Refusal::Invalid {
             what: "a node's root cgroup",
             why: format!("{} has no parent", parent.display()),
         })?;
         Ok(Self {
-            node: charge::Node::new(
-                WINDOW,
-                machine,
-                charge::Bounds {
-                    vms: bound,
-                    classes: bound,
-                },
-            )
-            .map_err(refused)?,
+            node: charge::Node::new(WINDOW, machine, bounds).map_err(refused)?,
             vms: BTreeMap::new(),
             machine: machine.cpu_milli,
             fleet: (BoxCgroup::at(fleet.to_path_buf()), Vec::new()),
@@ -384,7 +376,7 @@ impl Learner {
             oci: root.join(super::OCI_BOXES),
             rooms: BTreeMap::new(),
             fault: None,
-            last: LastResort::new(bound.min(MAX_LEARNED_HOLDINGS)),
+            last: LastResort::new(bounds.vms.min(MAX_LEARNED_HOLDINGS)),
         })
     }
 
@@ -446,6 +438,7 @@ impl Learner {
                             span: now.saturating_duration_since(at),
                             mem_bytes: usage.memory_bytes,
                             disk_bytes: None,
+                            cap_milli: vm.cap,
                         },
                     )
                     .map_err(refused)?;
@@ -467,7 +460,7 @@ impl Learner {
             self.node
                 .track(
                     lifetime,
-                    ClassKey::new(class, allocation.cost.id, allocation.resources),
+                    ClassKey::of(class, allocation)?,
                     band,
                     vcpus(allocation)?,
                     receipt,
@@ -494,6 +487,7 @@ impl Learner {
                     cgroup,
                     last: (usage.cpu_usec, now),
                     written: hex_core::cgroup::writes(&created, &[])?,
+                    cap: created.cpu_max_milli.map(u64::from),
                 },
             );
             self.last.met(class, scope, intent)?;
@@ -564,6 +558,7 @@ impl Learner {
         for (lifetime, bounds) in &placed.vms {
             if let Some(vm) = self.vms.get_mut(&lifetime.scope) {
                 rewrite(io, &vm.cgroup, bounds, &mut vm.written)?;
+                vm.cap = bounds.cpu_max_milli.map(u64::from);
             }
         }
         rewrite(io, &self.fleet.0, &placed.fleet, &mut self.fleet.1)?;
@@ -688,7 +683,10 @@ impl Node {
         };
         let read = self.supervisor.running_vms().and_then(|running| {
             Ok((
-                running,
+                running
+                    .into_iter()
+                    .map(|(id, scope, cgroup)| (id, Scope::Native(scope), cgroup))
+                    .collect::<Vec<_>>(),
                 self.cgroups.held_slots()?,
                 self.native_capacity()?.total,
             ))

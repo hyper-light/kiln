@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 pub mod managed;
 pub mod members;
 pub mod nesting;
+pub mod notice;
 pub mod plug;
 pub mod quiesce;
 
@@ -358,10 +359,12 @@ impl HostListen {
 }
 
 /// Why an exec did not start, as its [`kind::SYSTEM_ERR`] says first: the microVM's init
-/// could not start it, or the daemon refuses it (an unknown user).
+/// could not start it, or the daemon refuses it (an unknown user), or init refuses to run
+/// it in a member, by type ([`members::Refusal`](super::run::members::Refusal), D243).
 pub mod exec_failed {
     pub const RUNTIME: u8 = 0;
     pub const DAEMON: u8 = 1;
+    pub const MEMBER: u8 = 2;
 }
 
 pub fn header(kind: u8, len: u32) -> [u8; HEADER] {
@@ -717,6 +720,18 @@ pub mod builtin {
     /// command of the image's runs, and the microVM holds as for [`HOLD`], but the image's
     /// agents and harnesses start; the run ends as it is stopped.
     pub const ATTEND: u8 = 19;
+    /// What its host saw change in the directories it shares, told to the guest's own
+    /// inotify (D235): read from stdin until it closes, each a [`notice`](super::notice)
+    /// record, `TAG\0PATH\0`, PATH within the share whose virtio-fs tag is TAG. Each named
+    /// file is touched through a mount of TAG of the built-in's own, as
+    /// [`NOTICE_ID`](crate::NOTICE_ID), which its server answers without changing anything;
+    /// one gone, its directory.
+    pub const NOTICE: u8 = 20;
+    /// A member's own terminal sized (plan step 6, D244), its arguments
+    /// [`members::resize_args`](super::members::resize_args)': its index, rows and
+    /// columns. TIOCSWINSZ on the terminal init holds for it, which tells the terminal's
+    /// foreground process group SIGWINCH where its size changed (TIOCSWINSZ(2const)).
+    pub const RESIZE: u8 = 21;
 
     /// [`STATS`]'s one argument, whose cgroup it reads (D231): none for the workload's, as
     /// `stats` reads it; [`RUN`](stats::RUN) for the run's, its command's and every

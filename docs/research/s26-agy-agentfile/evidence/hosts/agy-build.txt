@@ -1,0 +1,19 @@
+== agy: https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.7-6190022064472064/linux-x64-musl/cli_linux_x64_musl.tar.gz
+   archive sha256 5000036342e1269ff91624a9eb49890613e8b88ab24de22081546f5ec625c654 (pin.json's, matched on download); file antigravity, sha256 bd643ae267d521b8febe5cd9fbce6533a1c7c0831aa0b28325401cb3e3b2035d
+## https://oauth2.googleapis.com/token: 1 occurrence(s); first 1:
+   @78841430: OID: x509: unknown ML-DSA parameters: %sUnknown chat tool choice option: %vinvalid or truncated WebM containerhttps://oauth2.googleapis.com/tokenoauth2/google: no credentials foundmissing 'type' field in credentialsconvert model function response: %wconve
+## https://sts.googleapis.com/v1/oauthtoken: 1 occurrence(s); first 1:
+   @78985794:  %d MCP servers of the sessionFailed to encode tool call update %s: %vAgent execution terminated due to error.https://sts.googleapis.com/v1/oauthtokenLoadCodeAssist response has no paid tierfailed to read AI Code response body: %wfailed to create FetchConfig r
+## https://generativelanguage.googleapis.com: 2 occurrence(s); first 1:
+   @79022327: t must specify text or mediaPOST_ONBOARDING_STEP_TYPE_MANAGER_WELCOMEsigning out the server accounts of %s: %whttps://generativelanguage.googleapis.comarchive url redirected more than %d timesFailed to resolve rename for %q in %q: %verror parsing %q, oneof %v i
+## https://cloudcode-pa.googleapis.com: 1 occurrence(s); first 1:
+   @78834535: ns=%tFailed to get working directory: %vhttps://auth.cloud.google/authorizeGOCSPX-[redacted]://cloudcode-pa.googleapis.comnil media at index %d of %s message%s/v1beta/models/%s:generateContentGOCSPX-[redacted]
+## businessaicode.googleapis.com: 28 occurrence(s); first 1:
+   @81507052: orage/datapol/annotations/proto/semantic_annotations.proto"....SendTelemetryRequest.{..parent.. .(.Bc.A...A(.&businessaicode.googleapis.com/Location............'..RESOURCE".AUDIT,AUDIT_TARGET_RESOURCER.parent.`..feedback_events.. .(.21.google.cloud.
+## aiplatform.googleapis.com: 316 occurrence(s); first 1:
+   @78613752:  to send context updatefailed to send activity_startanswer_permission_or_question[voice-debug] read dir %s: %vaiplatform.googleapis.com:443failed to write media to filecloudproxy: uVM setup stopped%w: resource type is required%w: workspace_uri i
+## package:google/cloud/discoveryengine: 3 occurrence(s); first 1:
+   @81287670: bigquery/v2..package:google/cloud/chronicle..package:google/apps/rsvp.%package:google/cloud/contentwarehouse.$package:google/cloud/discoveryengine.'package:google/cloud/kubernetesmetadata..package:google/cloud/retail..package:google/cloud/serverless.#packa
+## GOOGLE_GEMINI_BASE_URL: 3 occurrence(s); first 1:
+   @78188846: protocol not availableprotocol not supportedaddress already in usenetwork is unreachableAlready authenticated.GOOGLE_GEMINI_BASE_URLModel ID %s recognized<talker_agent_context>EXCLUSION_TOKEN_BUDGETEMBEDDING_PRIORITY_LOWCOMPLETION_TYPE_SINGLE
+

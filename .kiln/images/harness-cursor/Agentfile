@@ -22,13 +22,17 @@ HARNESS cursor FROM ./cursor-${TARGETARCH}
 # harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
 # name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
 # resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
-# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
-# docs/research/s18-host-in-vm says where each host comes from).
-# - api2.cursor.sh (most of its requests, and its sign-in's poll) and api2direct.cursor.sh (its
-#   direct route to the same service), both named by the CLI's own code; api5.cursor.sh and its six
-#   agent hosts, an agent's requests; repo42.cursor.sh, codebase search (cursor.com/docs/enterprise/
-#   network-configuration). Cursor Tab's hosts (the editor's), its sign-in pages (the person's
-#   browser), and updates and extensions (off: --disable-auto-update) go nowhere.
+# port or protocol goes out. 443 is HTTPS's port (RFC 9110 4.2.2). Each host is cited to its vendor's own
+# documentation, or, where that names a wildcard or nothing, to the vendor's own source or build, in its
+# harness's record's "Hosts by name" (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18, part 4):
+# docs/research/s27-cursor-agentfile/README.md, from Cursor's network docs (cursor.com/docs/enterprise/
+# network-configuration.md) and its pinned CLI:
+# - api2.cursor.sh: most of its requests, and its sign-in's poll.
+# - api2direct.cursor.sh: its direct route to the same service, within the docs' *.cursor.sh, named by the CLI's code.
+# - api5.cursor.sh and its six agent hosts: an agent's requests.
+# - repo42.cursor.sh: codebase search.
+# Cursor Tab's hosts (the editor's), its sign-in pages and token issuers (the person's browser), and updates and
+# extensions (off: --disable-auto-update) go nowhere.
 # kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
 # kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
 NETWORK --egress=agent.api5.cursor.sh:443 --egress=agent.global.api5.cursor.sh:443 --egress=agent.us.api5.cursor.sh:443 --egress=agentn.api5.cursor.sh:443 --egress=agentn.global.api5.cursor.sh:443 --egress=agentn.us.api5.cursor.sh:443 --egress=api2.cursor.sh:443 --egress=api2direct.cursor.sh:443 --egress=api5.cursor.sh:443 --egress=repo42.cursor.sh:443 provider FOR cursor

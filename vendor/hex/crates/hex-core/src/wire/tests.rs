@@ -742,6 +742,42 @@ fn requests() -> Vec<(u64, Request, usize)> {
             0,
         ),
         (203, Request::Call(Call::BackingUsage(route_wire_key())), 0),
+        // Joint plan step 17: a member handed over, its streams asked for (a local socket's), and carried (QUIC's).
+        (
+            204,
+            Request::Call(Call::Member {
+                id: id("image"),
+                member: Member {
+                    kind: MemberKind::Harness,
+                    name: "claude".to_owned(),
+                },
+                streams: Streams::default(),
+                ask: Streams {
+                    stdin: true,
+                    stdout: true,
+                    stderr: true,
+                },
+            }),
+            0,
+        ),
+        (
+            205,
+            Request::Call(Call::Member {
+                id: id("image"),
+                member: Member {
+                    kind: MemberKind::Agent,
+                    name: "helper".to_owned(),
+                },
+                streams: Streams {
+                    stdin: true,
+                    stdout: true,
+                    stderr: true,
+                },
+                ask: Streams::default(),
+            }),
+            3,
+        ),
+        (206, Request::Call(Call::Links), 0),
     ]
 }
 
@@ -1037,6 +1073,33 @@ fn answers() -> Vec<(u64, Answer)> {
     out.push((
         201,
         Answer::BackingOffer(route_wire_backing(BackingPhase::Live)),
+    ));
+    // TLS_AES_256_GCM_SHA384 (0x1302, RFC 8446 §B.4) under SecP384r1MLKEM1024 (0x11ed, IANA's TLS Supported
+    // Groups), and a link whose handshake named no group, in a part with more to come.
+    out.push((
+        204,
+        Answer::Links {
+            links: vec![
+                Link {
+                    peer: "kiln.links.test".to_owned(),
+                    suite: 0x1302,
+                    group: Some(0x11ed),
+                },
+                Link {
+                    peer: "other.links.test".to_owned(),
+                    suite: 0x1302,
+                    group: None,
+                },
+            ],
+            more: true,
+        },
+    ));
+    out.push((
+        204,
+        Answer::Links {
+            links: Vec::new(),
+            more: false,
+        },
     ));
     out
 }
@@ -1629,6 +1692,48 @@ fn a_long_list_is_split_into_messages_within_the_bound() {
     );
 }
 
+/// HEX-QUIC-30 (docs/design/hex-quic.md Q12): a node's links report longer than one message carries is split as a
+/// list is, each message within the bound and each but the last marked `more`, and the parts read back as the whole
+/// report, in order. Do: split 2,000 links with 253-byte names, and none. Expect: more than one part, each within the
+/// bound, read back whole; none as one part.
+#[test]
+fn hex_quic_30_a_long_links_report_is_split_into_messages_within_the_bound() {
+    let all: Vec<Link> = (0..2_000)
+        .map(|n| Link {
+            peer: format!("{n:06}-{}", "l".repeat(246)),
+            suite: 0x1302,
+            group: Some(0x11ed),
+        })
+        .collect();
+    let parts = links(10, &all, MAX_MESSAGE).unwrap();
+    assert!(parts.len() > 1, "2,000 links fit one message");
+    let mut back = Vec::new();
+    for (n, bytes) in parts.iter().enumerate() {
+        assert!(
+            bytes.len() <= MAX_MESSAGE,
+            "part {n} is {} bytes",
+            bytes.len()
+        );
+        match read_answer(&received(bytes, 0), MAX_MESSAGE).unwrap() {
+            (Header { id: 10, .. }, Answer::Links { links, more }) => {
+                assert_eq!(more, n + 1 < parts.len(), "part {n}'s more");
+                back.extend(links);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(back, all);
+    let one = links(10, &[], MAX_MESSAGE).unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(
+        read_answer(&received(&one[0], 0), MAX_MESSAGE).unwrap().1,
+        Answer::Links {
+            links: Vec::new(),
+            more: false
+        }
+    );
+}
+
 /// HEX-SOCK-1: every truncation of every request and answer is refused, by type, never a panic.
 #[test]
 fn every_truncation_is_refused() {
@@ -1755,7 +1860,7 @@ fn a_run_is_a_create_and_an_exec_in_one_request() {
 #[test]
 fn unknown_kinds_are_refused() {
     let hello = request(5, &Request::Hello { build: build() }, MAX_MESSAGE).unwrap();
-    for kind in [0u16, 0x0017, 0x7fff, 0x8001, 0x8009, 0xffff] {
+    for kind in [0u16, 0x0019, 0x7fff, 0x8001, 0x8009, 0xffff] {
         let mut bytes = hello.clone();
         bytes[12..14].copy_from_slice(&kind.to_le_bytes());
         let got = read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap_err();
@@ -4202,6 +4307,15 @@ fn learned_capacity() -> Capacity {
             learned_holding("hex-place-a-1-0-8", 300, 1),
         ],
         ended: vec![learned_end("hex-place-a-1-0-6", 5)],
+        ceilings: vec![LearnedCeiling {
+            profile: [3; 32],
+            envelope: learned_resources(2_000, 4),
+            overhead: LearnedOverhead {
+                cpu_milli: Some(120),
+                mem_bytes: None,
+                disk_bytes: Some(0),
+            },
+        }],
     });
     capacity
 }
@@ -4277,16 +4391,48 @@ fn w14_a_capacitys_learned_use_is_held_to_its_bounds() {
     if let Some(learned) = one.learned.as_mut() {
         learned.holdings = vec![learned_holding("x", 1, 1)];
         learned.ended = Vec::new();
+        learned.ceilings = Vec::new();
     }
     let mut bytes = answer(14, &Answer::Capacity(Some(one)), MAX_MESSAGE).unwrap();
-    // The holdings' count, then the one holding (its id's length, the id and its resources), then no end's count.
-    let at = bytes.len() - (3 * size_of::<u32>() + 1 + 3 * size_of::<u64>());
+    // The holdings' count, then the one holding (its id's length, the id and its resources), then no end's count and
+    // no ceiling's.
+    let at = bytes.len() - (4 * size_of::<u32>() + 1 + 3 * size_of::<u64>());
     let count = u32::try_from(MAX_LEARNED_HOLDINGS + 1).unwrap();
     bytes[at..at + size_of::<u32>()].copy_from_slice(&count.to_le_bytes());
     assert!(matches!(
         read_answer(&received(&bytes, 0), MAX_MESSAGE),
         Err(Fault::Value { .. })
     ));
+}
+
+/// Joint plan step 14 (AC-T7.4.1, C1): a capacity's learned ceilings are held to its bounds and cross the wire whole.
+/// Do: round-trip one whose ceiling has a cold dimension; check one with more ceilings than a class has profiles, then
+/// one naming a profile and envelope twice. Expect the first read back as it was, each cold dimension still none; the
+/// other two refused.
+#[test]
+fn w14_a_capacitys_ceilings_are_held_to_its_bounds() {
+    let bytes = answer(14, &Answer::Capacity(Some(learned_capacity())), MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        Answer::Capacity(Some(learned_capacity()))
+    );
+    let ceiling = learned_capacity().learned.unwrap().ceilings[0];
+    let mut too_many = learned_capacity();
+    if let Some(learned) = too_many.learned.as_mut() {
+        learned.ceilings = (0..=MAX_LEARNED_PRIORS)
+            .map(|n| LearnedCeiling {
+                profile: [u8::try_from(n % 256).unwrap(); 32],
+                envelope: learned_resources(2_000 + u64::try_from(n).unwrap(), 4),
+                ..ceiling
+            })
+            .collect();
+    }
+    assert!(too_many.learned.as_ref().unwrap().check().is_err());
+    let mut twice = learned_capacity();
+    if let Some(learned) = twice.learned.as_mut() {
+        learned.ceilings.push(ceiling);
+    }
+    assert!(twice.learned.as_ref().unwrap().check().is_err());
 }
 
 /// Joint plan step 14 (AC-T7.4.1, C8): a node's holdings are kept to what one message holds, in their order. Do: fit a
@@ -4341,11 +4487,12 @@ fn w14_a_capacitys_ends_are_held_to_its_bounds_and_fitted_after_its_holdings() {
     let mut one = learned_capacity();
     if let Some(learned) = one.learned.as_mut() {
         learned.ended = vec![learned_end("x", 5)];
+        learned.ceilings = Vec::new();
     }
     let mut bytes = answer(14, &Answer::Capacity(Some(one)), MAX_MESSAGE).unwrap();
     // The ends' count, then the one end: its id's length, the id, five u64s, its band and its unmoved capability's
-    // option and tag.
-    let at = bytes.len() - (2 * size_of::<u32>() + 1 + 5 * size_of::<u64>() + 1 + 2);
+    // option and tag; then no ceiling's count.
+    let at = bytes.len() - (3 * size_of::<u32>() + 1 + 5 * size_of::<u64>() + 1 + 2);
     let count = u32::try_from(MAX_LEARNED_HOLDINGS + 1).unwrap();
     bytes[at..at + size_of::<u32>()].copy_from_slice(&count.to_le_bytes());
     assert!(matches!(

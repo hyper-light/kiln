@@ -218,6 +218,7 @@ pub fn run(s: &Scenario) -> Result<Report, ChargeError> {
             classes: 1,
         },
     )?;
+    // Its VMs are admitted at their envelope; the sim models no VMM of their own, so none shows past it.
     let class = ClassKey::new(Class::Shards, [14; 32], s.envelope);
     let mut report = Report {
         envelope_density: envelope_density(s.capacity, s.envelope),
@@ -357,6 +358,7 @@ pub fn run(s: &Scenario) -> Result<Report, ChargeError> {
                     span: s.window,
                     mem_bytes: held,
                     disk_bytes: Some(0),
+                    cap_milli: None,
                 },
             )?;
         }

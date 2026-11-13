@@ -4,12 +4,15 @@ use super::*;
 
 use std::net::{Ipv4Addr, SocketAddr};
 
+use hex_api::sim::SimRuntime;
+use hex_api::{BoxId, BoxInfo, BoxSpec, Class, Proc, Program, Runtime, Signal, Usage};
+use hex_core::netns;
 use hex_core::patience::Patience;
 use hex_quic::enroll::{self, sim::SimCa};
-use hex_quic::{Config, Shape};
+use hex_quic::{CipherSuite, Config, NamedGroup, Shape};
 use hex_testkit::waits::within;
 
-use crate::serve::Native;
+use crate::serve::{Host, Native, Server};
 
 /// The log's reader registered by the node: no recorded operation makes it, so measuring, for the fact alone.
 static READER: Patience = Patience::measuring("test.hex_node.quic.log_reader");
@@ -440,4 +443,141 @@ fn a_peer_connects_to_a_node_shaped_by_a_windows_hosts_platform() {
     assert!(dialed.is_ok(), "{:?}", dialed.err());
     let lanes = usize::try_from(shape(&host, false).lanes).unwrap();
     assert_eq!(lanes, 2 * host.in_flight + 1);
+}
+
+/// The simulator's boxes, as a node's host: the links test asks the node for none of them.
+struct Simulated(SimRuntime);
+
+impl Runtime for Simulated {
+    fn classes(&self) -> Vec<Class> {
+        self.0.classes()
+    }
+    fn create(&self, spec: BoxSpec) -> Result<BoxInfo, Refusal> {
+        self.0.create(spec)
+    }
+    fn start(&self, id: &BoxId) -> Result<(), Refusal> {
+        self.0.start(id)
+    }
+    fn exec(&self, id: &BoxId, program: Program, stdio: Stdio) -> Result<Box<dyn Proc>, Refusal> {
+        self.0.exec(id, program, stdio)
+    }
+    fn run(&self, spec: BoxSpec, program: Program, stdio: Stdio) -> Result<Box<dyn Proc>, Refusal> {
+        self.0.run(spec, program, stdio)
+    }
+    fn signal(&self, id: &BoxId, signal: Signal) -> Result<(), Refusal> {
+        self.0.signal(id, signal)
+    }
+    fn inspect(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {
+        self.0.inspect(id)
+    }
+    fn usage(&self, id: &BoxId) -> Result<Usage, Refusal> {
+        self.0.usage(id)
+    }
+    fn list(&self) -> Result<Vec<BoxInfo>, Refusal> {
+        self.0.list()
+    }
+    fn delete(&self, id: &BoxId) -> Result<(), Refusal> {
+        self.0.delete(id)
+    }
+}
+
+impl Host for Simulated {
+    fn abandoned(&self, _id: &BoxId) -> Result<(), Refusal> {
+        Ok(())
+    }
+    fn netns(&self) -> Result<netns::Counts, Refusal> {
+        Ok(netns::Counts::default())
+    }
+}
+
+/// HEX-QUIC-29 (Q12; Shards plan step 34's `kiln-hex` link): a client that reached the node over QUIC asks the node,
+/// over that link, for its links, and a local client asks on the node's socket: each report names the client as its
+/// certificate does, with the suite and group the node's own TLS negotiated, `TLS13_AES_256_GCM_SHA384` under a hybrid
+/// post-quantum group. A node serving its local socket alone refuses the call by type.
+#[test]
+fn hex_quic_29_the_nodes_report_names_each_peer_with_its_suite_and_group() {
+    let ca = SimCa::new().unwrap();
+    let limits = limits();
+    let node = Arc::new(
+        Endpoint::start(Config {
+            credentials: enrolled(&ca, "node.links.test"),
+            bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            listen: true,
+            serves: ports(false),
+            shape: shape(&limits, false),
+        })
+        .unwrap(),
+    );
+    let dir = scratch("k-");
+    let socket = dir.path().join("node.sock");
+    let quic = Quic::new(
+        Native::bind(&socket).unwrap(),
+        Arc::clone(&node),
+        Bounds::of(&limits),
+        None,
+    )
+    .unwrap();
+    let host = Arc::new(Simulated(SimRuntime::new()));
+    let _server = Server::with_os(quic, host, limits, limits.in_flight, &socket).unwrap();
+    let client_end = Arc::new(
+        Endpoint::start(Config {
+            credentials: enrolled(&ca, "client.links.test"),
+            bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            listen: false,
+            serves: Vec::new(),
+            shape: Shape {
+                connections: 1,
+                lanes: hex_quic::limits::client_lanes(limits.in_flight, false),
+            },
+        })
+        .unwrap(),
+    );
+    // No deadline of the test's own: the dial until the driver tells it, the hello and the links on their kinds'
+    // learned waits (`client.quic.answer.<kind>`).
+    let (client, _) = hex_quic::link::connect(
+        client_end,
+        "node.links.test",
+        node.local_addr(),
+        false,
+        None,
+    )
+    .unwrap();
+    let local = hex_client::Client::connect(&socket).unwrap();
+    for links in [client.links().unwrap(), local.links().unwrap()] {
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].peer, "client.links.test");
+        assert_eq!(
+            CipherSuite::from(links[0].suite),
+            CipherSuite::TLS13_AES_256_GCM_SHA384
+        );
+        let group = links[0].group.map(NamedGroup::from);
+        assert!(
+            matches!(
+                group,
+                Some(
+                    NamedGroup::secp384r1MLKEM1024
+                        | NamedGroup::X25519MLKEM768
+                        | NamedGroup::secp256r1MLKEM768
+                )
+            ),
+            "{group:?}"
+        );
+    }
+    let other = scratch("k-");
+    let alone = other.path().join("node.sock");
+    let _plain = Server::bind(
+        &alone,
+        Arc::new(Simulated(SimRuntime::new())),
+        limits,
+        limits.in_flight,
+    )
+    .unwrap();
+    let refused = hex_client::Client::connect(&alone)
+        .unwrap()
+        .links()
+        .unwrap_err();
+    assert!(
+        matches!(refused, Refusal::Invalid { what: "links", .. }),
+        "{refused:?}"
+    );
 }

@@ -212,6 +212,8 @@ static ANSWERS: [Patience; KINDS] = [
     Patience::measuring("client.guest.answer.release_backing"),
     Patience::measuring("client.guest.answer.backing_usage"),
     Patience::measuring("client.guest.answer.schedule.forget"),
+    // MEASURING until a waits census records the node's links (docs/design/hex-quic.md Q12).
+    Patience::measuring("client.guest.answer.links"),
 ];
 
 /// AC-T7.4.1: the kinds a box's class times, a wait for each (kind, class), named
@@ -298,6 +300,8 @@ static QUIC_ANSWERS: [Patience; KINDS] = [
     Patience::measuring("client.quic.answer.release_backing"),
     Patience::measuring("client.quic.answer.backing_usage"),
     Patience::measuring("client.quic.answer.schedule.forget"),
+    // MEASURING until a waits census records the node's links (docs/design/hex-quic.md Q12).
+    Patience::measuring("client.quic.answer.links"),
 ];
 
 static QUIC_CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [

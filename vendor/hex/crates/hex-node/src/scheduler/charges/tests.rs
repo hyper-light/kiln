@@ -83,6 +83,7 @@ fn w14_the_scheduler_takes_the_priors_its_nodes_learner_carries() {
         used: LearnedUse::default(),
         holdings: Vec::new(),
         ended: Vec::new(),
+        ceilings: Vec::new(),
     };
     let reports = vec![(Class::Shards, Some(capacity(Some(carried([14; 32])))))];
     let mut local = node();
@@ -92,6 +93,10 @@ fn w14_the_scheduler_takes_the_priors_its_nodes_learner_carries() {
         Some(Prior {
             profile: [14; 32],
             booking,
+            ceiling: cost()
+                .allocate(CapacityResources::default())
+                .unwrap()
+                .resources,
         })
     );
     assert_eq!(local.capacity, node().capacity);
@@ -139,6 +144,7 @@ fn w14_the_scheduler_books_each_vm_it_runs_at_its_holding() {
         used: LearnedUse::default(),
         holdings,
         ended: Vec::new(),
+        ceilings: Vec::new(),
     };
     let learned = vec![
         (
@@ -159,4 +165,58 @@ fn w14_the_scheduler_books_each_vm_it_runs_at_its_holding() {
             (key(2), holding("vm-b", 1).holding),
         ]
     );
+}
+
+/// Joint plan step 14 (AC-T7.4.1), C2 through the scheduler: a class is its profile and its ceiling, so a prior books a
+/// receipt of its own ceiling alone. Do take an answer carrying a prior for a profile's least VM (1 CPU, 1 GiB), then
+/// book at the node's prior a receipt of that size and one of the profile's largest (8 CPUs, 8 GiB); expect the first
+/// booked at the prior, and the second whole, no VM of its size having warmed for it.
+#[test]
+fn w14_a_prior_books_a_receipt_of_its_own_ceiling_alone() {
+    let unit = CapacityResources {
+        cpu_milli: 1,
+        mem_bytes: 1,
+        disk_bytes: 1,
+    };
+    let sizes = RuntimeCost {
+        id: [16; 32],
+        floor: CapacityResources {
+            cpu_milli: 1_000,
+            mem_bytes: GIB,
+            disk_bytes: 0,
+        },
+        ceiling: CapacityResources {
+            cpu_milli: 8_000,
+            mem_bytes: 8 * GIB,
+            disk_bytes: 0,
+        },
+        quantum: unit,
+        guest_overhead: CapacityResources::default(),
+        overhead: CapacityResources::default(),
+    };
+    let least = sizes.allocate(CapacityResources::default()).unwrap();
+    let largest = sizes.allocate(sizes.ceiling).unwrap();
+    let booking = CapacityResources {
+        cpu_milli: 100,
+        mem_bytes: GIB / 2,
+        disk_bytes: 0,
+    };
+    let carried = Learned {
+        priors: vec![LearnedPrior {
+            profile: sizes.id,
+            ceiling: least.resources,
+            booking,
+        }],
+        used: LearnedUse::default(),
+        holdings: Vec::new(),
+        ended: Vec::new(),
+        ceilings: Vec::new(),
+    };
+    let mut local = node();
+    local.costs[Class::Shards.index()] = Some(sizes);
+    apply(&mut local, &[(Class::Shards, carried)]).unwrap();
+    let prior = local.priors[Class::Shards.index()];
+    let at = |receipt| hex_sim::model::booked_at(Some(receipt), prior).unwrap();
+    assert_eq!(at(least).booking(), booking);
+    assert_eq!(at(largest).booking(), largest.resources, "booked whole");
 }

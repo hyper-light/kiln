@@ -138,6 +138,8 @@ pub fn views() -> Vec<View> {
     ALL.iter().map(|b| View { name: b.name.to_owned(), harness: b.harness.to_owned(), text: b.text.to_owned() }).collect()
 }
 
+pub mod destinations;
+
 #[cfg(test)]
 mod goose_tests;
 

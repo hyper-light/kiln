@@ -15,11 +15,14 @@
 //! what the machine ran beside the job (`GetSystemTimes`: busy, and busy less the job's), so a low rate tells other
 //! work from the job held back. The first run is uncapped: the longest
 //! gap between two of its CPU time's steps is the accounting's own step (Windows charges CPU time as its clock ticks),
-//! so a gap longer than that in a capped run is the cap stopping the job. Then one run per cap, 10%, 20% and 50% of
-//! the machine (`JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP`, 1,000, 2,000 and 5,000 of 10,000). For each it prints one
-//! `HEX-CHARGE-WINDOW` line: the rate the job got, and n, p50, p99 and max (nearest rank) of its runs (from the first
-//! step after a stop to the last before the next), its stops (the gaps past the accounting's step) and its periods
-//! (from one run's start to the next's): the period is the interval the cap holds over.
+//! so a gap longer than that in a capped run is the cap stopping the job. Then one run per cap
+//! (`JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP`, per 10,000 of the machine): first the least cap the charge learner sets on
+//! this machine (the window has to hold at every rate it sets; 3 of 10,000 on jupiter's 32 processors), then ROOT's
+//! 10%, 20% and 50% (1,000, 2,000 and 5,000). For each it prints one `HEX-CHARGE-WINDOW` line: the rate the job got,
+//! and n, p50, p99 and max (nearest rank) of its runs (from the first step after a stop to the last before the next),
+//! its stops (the gaps past the accounting's step) and its periods (from one run's start to the next's): the period is
+//! the interval the cap holds over. A run whose CPU time stepped too rarely to show a whole period says so, with its
+//! steps, and no number.
 //!
 //! Run on a Windows host with nothing else busy (ROOT's, on jupiter), from the repository's root:
 //!   cargo test --locked -p hex-runtime --test windows_charge_window -- --ignored --nocapture --test-threads=1
@@ -52,9 +55,23 @@ use hex_runtime::windows::sys::{self, Job, Limits, Spawn};
 const EVERY: Duration = Duration::from_millis(1);
 #[cfg(windows)]
 const FOR: Duration = Duration::from_secs(10);
-/// The caps, per `hex_core::job::RATE_SCALE` (10,000) of the machine: 10%, 20% and 50%.
-#[cfg(windows)]
-const CAPS: [u32; 3] = [1_000, 2_000, 5_000];
+/// The caps a run is capped at on a machine of `processors`, per `hex_core::job::RATE_SCALE` (10,000) of it: the least
+/// cap the charge learner sets there, then ROOT's 10%, 20% and 50%.
+fn caps(processors: u32) -> Vec<u32> {
+    vec![least_cap(processors), 1_000, 2_000, 5_000]
+}
+
+/// The least hard cap the Windows charge learner sets a VM's job at on a machine of `processors`: its least rate, Hex's
+/// least CPU bound (`hex_api::MIN_CPU_MILLI`, `hex-node`'s `recorded::charges` caps no VM below it), raised to the
+/// machine's least cap (one of `RATE_SCALE` of its processors, rounded up, as the runtime raises a rate), as
+/// `hex_core::job::cap` maps it.
+fn least_cap(processors: u32) -> u32 {
+    let processors = std::num::NonZeroU32::new(processors).unwrap();
+    let machine =
+        (u64::from(processors.get()) * 1000).div_ceil(u64::from(hex_core::job::RATE_SCALE));
+    let milli = u64::from(hex_api::MIN_CPU_MILLI).max(machine);
+    hex_core::job::cap(u32::try_from(milli).unwrap(), processors).unwrap()
+}
 /// What the child is told: how many threads to spin.
 const SPIN: &str = "HEX_TEST_SPIN_THREADS";
 
@@ -136,10 +153,13 @@ fn run(cap: Option<u32>, threads: u32, timer: &HighResTimer) -> (Vec<(Duration, 
     let started = sys::create(&mut spawn, &[job.raw()]).unwrap();
     sys::resume(&started.thread).unwrap();
     let cpu = || job.accounting().unwrap().cpu_100ns;
-    // The run starts once the spinners are charged: the job's first step.
-    let deadline = Instant::now() + FOR;
+    // The run starts once the spinners are charged, the job's first step: waited for while they run, their end before
+    // it the refusal, no timer guarding it (R03; the person's rule, 2026-11-13).
     while cpu() == 0 {
-        assert!(Instant::now() < deadline, "the spinners were never charged");
+        assert!(
+            !sys::wait(&started.process, 0).unwrap(),
+            "the spinners ended before the job was charged"
+        );
         until(timer, Instant::now() + EVERY);
     }
     let count = usize::try_from(FOR.as_micros() / EVERY.as_micros()).unwrap();
@@ -320,7 +340,8 @@ fn the_interval_a_jobs_cpu_hard_cap_holds_over() {
         panic!("REFUSED, the uncapped run: {why}");
     }
     let demand = u64::from(threads) * 10_000 / u64::from(processors);
-    for cap in CAPS {
+    let least = least_cap(processors);
+    for cap in caps(processors) {
         assert!(
             demand > u64::from(cap),
             "{threads} spinners of {processors} processors ask {demand}/10000, not past the cap {cap}/10000"
@@ -329,20 +350,32 @@ fn the_interval_a_jobs_cpu_hard_cap_holds_over() {
         keep(&cap.to_string(), &samples);
         let kept = cadence(&samples, step);
         let (mut runs, mut stops, mut periods) = cycles(&samples, step);
-        println!(
-            "HEX-CHARGE-WINDOW cap={cap}/10000 rate={}/10000 {} runs[{}] stops[{}] periods[{}] cadence[{}]",
-            rate(&samples),
-            machine(&samples, busy),
-            quantiles(&mut runs),
-            quantiles(&mut stops),
-            quantiles(&mut periods),
-            kept.as_deref().unwrap_or_else(String::as_str)
-        );
+        let cadence_said = kept.as_deref().unwrap_or_else(String::as_str);
+        if periods.is_empty() {
+            // Too few steps to time a period at this cap: said, with no number (ROOT, 2026-11-13).
+            println!(
+                "HEX-CHARGE-WINDOW cap={cap}/10000 rate={}/10000 {} steps={}: its CPU time stepped too rarely to time \
+                 a period cadence[{cadence_said}]",
+                rate(&samples),
+                machine(&samples, busy),
+                steps(&samples).len()
+            );
+        } else {
+            println!(
+                "HEX-CHARGE-WINDOW cap={cap}/10000 rate={}/10000 {} runs[{}] stops[{}] periods[{}] cadence[{cadence_said}]",
+                rate(&samples),
+                machine(&samples, busy),
+                quantiles(&mut runs),
+                quantiles(&mut stops),
+                quantiles(&mut periods)
+            );
+        }
         if let Err(why) = kept {
             panic!("REFUSED, the run capped at {cap}/10000: {why}");
         }
+        // Above the learner's least, a cap stops the job within a run: one that never did is the probe's own fault.
         assert!(
-            !periods.is_empty(),
+            cap == least || !periods.is_empty(),
             "a job capped at {cap}/10000 never stopped past the accounting's step of {step:?}"
         );
     }
@@ -400,4 +433,15 @@ fn w14_the_machines_busy_cpu_is_kernel_and_user_less_idle() {
     let second = Duration::from_secs(1);
     assert_eq!(per_machine(busy, second, 32), 5_000);
     assert_eq!(per_machine(busy - 12 * u128::from(s), second, 32), 1_250);
+}
+
+/// Joint plan step 14 (AC-T7.4.1), C1 on Windows: the window has to hold at every rate the charge learner sets, so the
+/// probe runs the least cap the learner sets on its machine besides ROOT's (ROOT, 2026-11-13). Do reckon the probe's
+/// caps for jupiter's 32 processors, a machine of one and one of 128; expect each first at the learner's least: Hex's
+/// least CPU bound of 32 processors, 3 per 10,000; of one, 100; of 128, the machine's own least, 1.
+#[test]
+fn w14_the_probe_runs_the_least_cap_the_learner_sets() {
+    assert_eq!(caps(32), [3, 1_000, 2_000, 5_000]);
+    assert_eq!(caps(1).first(), Some(&100));
+    assert_eq!(caps(128).first(), Some(&1));
 }

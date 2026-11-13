@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio as HostStdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use hex_api::{Allocation, CapacityResources};
 
@@ -113,8 +113,10 @@ pub struct Node {
 
 impl Node {
     /// Starts the node, its boxes in the cgroup `boxes` where one is named (Linux's `--box-root`), else where its OS's
-    /// node holds them, and waits for its own "ready" line within the run's deadline `wait`.
-    pub fn start(work: &Path, boxes: Option<&Path>, wait: Duration) -> Self {
+    /// node holds them, and waits for its own "ready" line while it lives: a node that ends first ends its stdout,
+    /// which refuses the start with its stderr (the person's rule of 2026-11-13: a cold start waits while its party
+    /// lives, with no deadline picked for it).
+    pub fn start(work: &Path, boxes: Option<&Path>) -> Self {
         let socket = work.join("node.sock");
         let stderr = work.join("node.stderr");
         let begun = Instant::now();
@@ -135,25 +137,25 @@ impl Node {
             .stderr(fs::File::create(&stderr).unwrap())
             .spawn()
             .unwrap();
-        // The node's own "ready <socket>" line is the fact waited on; the run's deadline only guards it.
+        // The node's own "ready <socket>" line is the fact waited on. Its stdout is read for its whole life, every line
+        // after the wait shown, so the node never writes to a pipe no one reads.
         let (tx, rx) = mpsc::channel();
         let stdout = child.stdout.take().unwrap();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
-                    break;
+                if let Err(mpsc::SendError(line)) = tx.send(line) {
+                    eprintln!("node: {line}");
                 }
             }
         });
         let want = format!("ready {}", socket.display());
-        let until = begun + wait;
         loop {
-            match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            match rx.recv() {
                 Ok(line) if line == want => break,
                 Ok(line) => eprintln!("node: {line}"),
-                Err(error) => panic!(
-                    "node not ready: {error}; stderr: {}",
+                Err(mpsc::RecvError) => panic!(
+                    "node not ready: its stdout ended; stderr: {}",
                     fs::read_to_string(&stderr).unwrap_or_default()
                 ),
             }

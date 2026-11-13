@@ -15,6 +15,7 @@ fn res(cpu_milli: u64, mem_bytes: u64, disk_bytes: u64) -> Amounts {
     }
 }
 
+/// Class `n` of VMs admitted at `cpu` and `mem`.
 fn class_of(n: u8, cpu: u64, mem: u64) -> ClassKey {
     ClassKey::new(Class::Shards, [n; 32], res(cpu, mem, 0))
 }
@@ -46,6 +47,7 @@ fn sample(cpu_milli: u64, mem: u64) -> Sample {
         span: WINDOW,
         mem_bytes: mem,
         disk_bytes: Some(0),
+        cap_milli: None,
     }
 }
 
@@ -196,29 +198,45 @@ proptest! {
 fn w14_a_cold_vm_is_charged_its_booking_until_its_tail_is_full() {
     let mut n = node(res(4_000, 8 * GIB, 0));
     let class = class_of(1, 4_000, 4 * GIB);
-    assert_eq!(n.admit(1, class, 0, 4).unwrap(), class.ceiling());
+    assert_eq!(n.admit(1, class, 0, 4).unwrap(), class.admission());
     for _ in 0..SEEDABLE - 1 {
         window(&mut n, &[(1, 100, GIB)]);
     }
     assert_eq!(n.warmed(&1), Some(false));
-    assert_eq!(n.charge(&1).unwrap(), class.ceiling());
+    assert_eq!(n.charge(&1).unwrap(), class.admission());
     window(&mut n, &[(1, 100, GIB)]);
     assert_eq!(n.warmed(&1), Some(true));
     assert_eq!(n.charge(&1).unwrap(), res(100, GIB, 0));
     assert_eq!(n.booking(&1).unwrap(), res(100, GIB, 0));
 }
 
-/// Joint plan step 14 (AC-T7.4.1), C1's ceiling (R03, learning never raises authority): do read a warmed VM past its
-/// allocation in CPU and memory; expect its charge to stop at the allocation.
+/// Joint plan step 14 (AC-T7.4.1), C1's ceiling (decision 9; ROOT, 2026-11-13: no census number is a ceiling): a
+/// class's ceiling is its admission until its VMs' windows show their VMM's own past it, then its admission and the
+/// most they have shown; a window at its CPU cap is no sample. Do ask a cold class's ceiling; then read a VM of it
+/// admitted at 2 CPUs and 4 GiB, its every window at its 2-CPU cap and at 9 GiB. Expect the ceiling the admission, its
+/// overhead none, typed; then the VM charged its 2 CPUs, the cap's windows no CPU sample, and its 9 GiB, its memory
+/// past the envelope learned.
 #[test]
-fn w14_the_charge_never_passes_the_allocation() {
+fn w14_the_ceiling_is_the_admission_and_the_vmm_overhead_its_windows_show() {
     let mut n = node(res(16_000, 64 * GIB, 0));
     let class = class_of(1, 2_000, 4 * GIB);
+    assert_eq!(n.ceiling(&class), class.admission());
+    assert_eq!(n.overhead(&class), [None; 3]);
     n.admit(1, class, 0, 2).unwrap();
     for _ in 0..SEEDABLE {
-        window(&mut n, &[(1, 5_000, 9 * GIB)]);
+        n.observe(
+            1,
+            &Sample {
+                cap_milli: Some(2_000),
+                ..sample(2_000, 9 * GIB)
+            },
+        )
+        .unwrap();
+        n.settle().unwrap();
     }
-    assert_eq!(n.charge(&1).unwrap(), class.ceiling());
+    assert_eq!(n.overhead(&class), [None, Some(5 * GIB), Some(0)]);
+    assert_eq!(n.ceiling(&class), res(2_000, 9 * GIB, 0));
+    assert_eq!(n.charge(&1).unwrap(), res(2_000, 9 * GIB, 0));
 }
 
 /// Joint plan step 14 (AC-T7.4.1), C1's window: do read CPU over twice the window and over half of it; expect the
@@ -235,6 +253,7 @@ fn w14_a_reading_is_charged_over_its_span_never_less_than_the_window() {
                 span,
                 mem_bytes: 0,
                 disk_bytes: Some(0),
+                cap_milli: None,
             },
         )
         .unwrap();
@@ -265,6 +284,7 @@ fn w14_per_vcpu_guest_time_awaits_upstream() {
         span: WINDOW,
         mem_bytes: 0,
         disk_bytes: Some(0),
+        cap_milli: None,
     };
     assert!(matches!(
         n.observe(1, &split(vec![WINDOW])),
@@ -278,16 +298,18 @@ fn w14_per_vcpu_guest_time_awaits_upstream() {
     );
 }
 
-/// Joint plan step 14 (AC-T7.4.1), C2: do admit a VM of a class no VM has warmed; expect its allocation. Do warm one
-/// whose windows are low but for two high; expect the class's prior the high one (the p99.9 of its last SEEDABLE
-/// warmed windows) and a second VM booked at it. Do read SEEDABLE more low windows; expect the prior to fall to the
-/// low, as the outlier's windows leave the sample.
+/// Joint plan step 14 (AC-T7.4.1), C2: do admit a VM of a class no VM has warmed, admitted at an 8-CPU, 8 GiB
+/// envelope; expect it booked at the envelope, what its workload is admitted at (ROOT, 2026-11-13: the census is
+/// evidence only). Do warm one whose windows are low but for two high; expect the class's prior the high one (the
+/// p99.9 of its last SEEDABLE warmed windows) and a second VM booked at it. Do read SEEDABLE more low windows; expect
+/// the prior to fall to the low, as the outlier's windows leave the sample.
 #[test]
 fn w14_the_prior_is_the_p999_of_the_class_last_warmed_windows_and_falls() {
     let mut n = node(res(16_000, 64 * GIB, 0));
-    let class = class_of(1, 8_000, 8 * GIB);
-    assert_eq!(n.prior(&class), class.ceiling());
-    n.admit(1, class, 0, 8).unwrap();
+    let envelope = res(8_000, 8 * GIB, 0);
+    let class = ClassKey::new(Class::Shards, [1; 32], envelope);
+    assert_eq!(n.prior(&class), envelope);
+    assert_eq!(n.admit(1, class, 0, 8).unwrap(), envelope);
     for t in 0..SEEDABLE {
         let cpu = if t == 10 || t == 20 { 3_000 } else { 200 };
         window(&mut n, &[(1, cpu, GIB)]);
@@ -312,7 +334,7 @@ fn w14_admission_refuses_with_the_room_and_counts_memory_held_past_bookings() {
     assert_eq!(
         n.admit(2, class, 0, 4),
         Err(ChargeError::NoRoom {
-            booking: class.ceiling(),
+            booking: class.admission(),
             room: res(0, 12 * GIB, 0),
         })
     );
@@ -516,7 +538,7 @@ fn w14_classes_past_their_bound_forget_the_oldest_without_a_live_vm() {
     assert!(matches!(n.admit(3, c, 0, 1), Err(ChargeError::Full { .. })));
     n.end(&1).unwrap();
     n.admit(3, c, 0, 1).unwrap();
-    assert_eq!(n.prior(&a), a.ceiling());
+    assert_eq!(n.prior(&a), a.admission());
     assert_eq!(n.prior(&b), res(10, GIB / 2, 0));
 }
 
@@ -732,11 +754,12 @@ proptest! {
 }
 
 /// Joint plan step 14 (AC-T7.4.1), C4 and C5: the bounds that hold the rule. Do place three cold VMs (booked at their
-/// ceilings) on a machine of twice the fleet's CPU budget; expect the parent capped at the budget and weighing half
-/// the machine, each VM weighed by its booking and capped at its ceiling, its budget past its ceiling held at the
-/// ceiling. Then warm them below their ceilings and narrow the fleet's memory budget; expect each held at its budget,
-/// the budgets summing to the fleet's. A fleet with no CPU budget is capped at the kernel's least quota. Every bound
-/// is one the kernel holds.
+/// admissions) on a machine of twice the fleet's CPU budget; expect the parent capped at the budget and weighing half
+/// the machine, each VM weighed by its booking, capped in CPU at its ceiling, and held in memory at its budget alone,
+/// no `memory.max` (ROOT, 2026-11-13: Hex can't read a VMM's own memory apart from its guest's touched RAM, so a hard
+/// cap there would be a chosen bound). Then warm them below their admissions and narrow the fleet's memory budget;
+/// expect each held at its budget, the budgets summing to the fleet's. A fleet with no CPU budget is capped at the
+/// kernel's least quota. Every bound is one the kernel holds.
 #[test]
 fn w14_the_placement_caps_the_fleet_at_its_budget_and_holds_each_vm_by_its_booking_budget_and_ceiling()
  {
@@ -746,13 +769,14 @@ fn w14_the_placement_caps_the_fleet_at_its_budget_and_holds_each_vm_by_its_booki
         n.admit(id, class_of(u8::try_from(id).unwrap(), cpu, mem), 0, 1)
             .unwrap();
     }
-    let vm = |weight: u16, cpu: u64, high: u64, max: u64| hex_api::Bounds {
+    let vm = |weight: u16, cpu: u64, high: u64| hex_api::Bounds {
         cpu_weight: Some(weight),
         cpu_max_milli: Some(u32::try_from(cpu).unwrap()),
         memory_high: Some(high),
-        memory_max: Some(max),
         ..hex_api::Bounds::default()
     };
+    let budgets: BTreeMap<u32, Budget> = n.budgets().unwrap().into_iter().collect();
+    let budget = |id: u32| budgets[&id].bytes;
     let placed = n.placement(32_000).unwrap();
     assert_eq!(
         placed.fleet,
@@ -765,9 +789,9 @@ fn w14_the_placement_caps_the_fleet_at_its_budget_and_holds_each_vm_by_its_booki
     assert_eq!(
         placed.vms,
         vec![
-            (1, vm(2_500, 1_000, GIB, GIB)),
-            (2, vm(5_000, 2_000, 2 * GIB, 2 * GIB)),
-            (3, vm(WEIGHT_MAX, 4_000, 3 * GIB, 3 * GIB)),
+            (1, vm(2_500, 1_000, budget(1))),
+            (2, vm(5_000, 2_000, budget(2))),
+            (3, vm(WEIGHT_MAX, 4_000, budget(3))),
         ]
     );
     for _ in 0..SEEDABLE {
@@ -792,8 +816,7 @@ fn w14_the_placement_caps_the_fleet_at_its_budget_and_holds_each_vm_by_its_booki
             vm(
                 [2_500, 5_000, WEIGHT_MAX][usize::try_from(*id - 1).unwrap()],
                 cpu,
-                budget,
-                mem
+                budget
             )
         );
         held += budget;
@@ -809,6 +832,32 @@ fn w14_the_placement_caps_the_fleet_at_its_budget_and_holds_each_vm_by_its_booki
             "{bounds:?} is no bound the kernel holds"
         );
     }
+}
+
+/// Joint plan step 14 (AC-T7.4.1), C5 with no chosen bound (ROOT, 2026-11-13): a VMM whose memory rises past the most
+/// its windows have shown is held by its budget and the last resort, never killed at a cap. Do place a VM admitted at
+/// 2 CPUs and 4 GiB, alone in a 16 GiB fleet, after windows at 5 GiB; then read it at 7 GiB, past every window before,
+/// and place it again. Expect each placement's `memory.max` none and its `memory.high` its budget, the whole fleet's;
+/// the most seen risen to 3 GiB past the envelope; and the last resort holding, the fleet within its budget.
+#[test]
+fn w14_a_vmm_rising_past_the_most_seen_is_held_by_its_budget_and_the_last_resort() {
+    let mut n = node(res(16_000, 16 * GIB, 0));
+    let class = class_of(1, 2_000, 4 * GIB);
+    n.admit(1, class, 0, 2).unwrap();
+    for _ in 0..3 {
+        window(&mut n, &[(1, 100, 5 * GIB)]);
+    }
+    let held = hex_api::Bounds {
+        cpu_weight: Some(WEIGHT_MAX),
+        cpu_max_milli: Some(2_000),
+        memory_high: Some(16 * GIB),
+        ..hex_api::Bounds::default()
+    };
+    assert_eq!(n.placement(16_000).unwrap().vms, vec![(1, held.clone())]);
+    window(&mut n, &[(1, 100, 7 * GIB)]);
+    assert_eq!(n.overhead(&class), [Some(0), Some(3 * GIB), Some(0)]);
+    assert_eq!(n.placement(16_000).unwrap().vms, vec![(1, held)]);
+    assert_eq!(n.last_resort().unwrap(), Resort::Held);
 }
 
 /// Joint plan step 14 (AC-T7.4.1), C4 across the node's cgroup: every child on one scale. Do weigh the VM fleet by its

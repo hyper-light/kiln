@@ -18,7 +18,7 @@ use hyper_transport::{Authenticated, Directory, Event, PeerId};
 use crate::classes::{Hex, Role};
 use crate::conn::{Conn, Shared};
 use crate::limits::Derived;
-use crate::{Admits, Refused};
+use crate::{Admits, Negotiated, Refused};
 
 /// The endpoint the driver owns.
 type Endpoint = hyper_transport::Endpoint<Hex, hyper_transport::Fixed, Names>;
@@ -58,6 +58,9 @@ pub(crate) enum Command {
     Negotiated {
         peer: PeerId,
         reply: SyncSender<Option<(CipherSuite, Option<NamedGroup>)>>,
+    },
+    Links {
+        reply: SyncSender<Vec<Negotiated>>,
     },
     /// The peer holds at most `lanes` connections at once: this side opens no more.
     Limit {
@@ -159,6 +162,10 @@ pub(crate) struct Names {
     /// The names this side dials, by id: the name a server's certificate is checked against.
     dialing: BTreeMap<PeerId, String>,
     admits: Admits,
+    /// The name each handshake identified since the driver last polled the endpoint's events. hyper-transport queues
+    /// an admitted connection's `Event::Connected` within the call that identifies it, so the poll after takes each
+    /// admitted one's name; what is left was refused, and goes then.
+    identified: BTreeMap<PeerId, String>,
 }
 
 /// A peer's id: the first eight bytes of the SHA-256 of its name, so a dialer knows the id of the peer it dials
@@ -193,6 +200,7 @@ impl Directory for Names {
             None => self.admits.admits(&name),
         };
         if admitted {
+            self.identified.insert(peer, name);
             Some((peer, Role::Member))
         } else {
             None
@@ -207,6 +215,8 @@ impl Directory for Names {
 /// What the driver keeps for one peer it is connected to.
 struct PeerState {
     epoch: hyper_transport::Epoch,
+    /// The name its certificate carries.
+    name: String,
     /// The peer admitted this side (its Welcome came), or this side accepted it.
     welcomed: bool,
     mux: Mux,
@@ -364,6 +374,7 @@ impl Driver {
         let names = Names {
             dialing: BTreeMap::new(),
             admits,
+            identified: BTreeMap::new(),
         };
         let ep = Endpoint::new(ep_config, budget, names, Instant::now())
             .map_err(|refusal| Refused::Transport { refusal })?;
@@ -568,6 +579,21 @@ impl Driver {
             Command::Negotiated { peer, reply } => {
                 let _ = reply.try_send(self.ep.negotiated(peer));
             }
+            Command::Links { reply } => {
+                let links = self
+                    .peers
+                    .iter()
+                    .filter_map(|(peer, state)| {
+                        let (suite, group) = self.ep.negotiated(*peer)?;
+                        Some(Negotiated {
+                            peer: state.name.clone(),
+                            suite,
+                            group,
+                        })
+                    })
+                    .collect();
+                let _ = reply.try_send(links);
+            }
             Command::Limit { peer, lanes } => {
                 if let Some(state) = self.peers.get_mut(&peer) {
                     state.mux.limit(lanes);
@@ -628,11 +654,20 @@ impl Driver {
         while let Some(event) = self.ep.poll_event() {
             self.event(event);
         }
+        self.ep.directory_mut().identified.clear();
     }
 
     fn event(&mut self, event: Event<Hex>) {
         match event {
             Event::Connected { peer, epoch, .. } => {
+                let Some(name) = self.ep.directory_mut().identified.remove(&peer) else {
+                    // A connection whose handshake's name the driver didn't see can't be named: refused, as an
+                    // identity it can't take is.
+                    self.peer_gone(peer, Refused::Identity);
+                    self.ep
+                        .refuse(Instant::now(), peer, hyper_transport::Refusal::Identity);
+                    return;
+                };
                 let mux = Mux::new(
                     lanes::Limits {
                         lanes: self.derived.lanes,
@@ -647,6 +682,7 @@ impl Driver {
                     peer,
                     PeerState {
                         epoch,
+                        name,
                         welcomed: !dialed,
                         mux,
                         conns: BTreeMap::new(),

@@ -1,0 +1,14 @@
+ROOT's call for goal 61 part 4 on Antigravity's sign-ins, 2026-11-13, verbatim, as ROOT sent it to part 4's
+implementer in answer to its question (which agy sign-ins kiln's built-in image serves):
+
+Goal 61 part 4, my call on agy's sign-ins: serve all four, with each run narrowed to its own sign-in. That's the alternative, made complete.
+- Why: the person's bar is zero breaks against today. Today kiln runs agy on the host, where an enterprise sign-in works. A built-in that names only 1 and 2 would break those users in a microVM unless they write their own Agentfile.
+- The built-in image names, per sign-in and each cited: (1) cloudcode-pa + oauth2; (2) generativelanguage.googleapis.com; (3)/(4) the 9 non-mTLS enterprise hosts (businessaicode, aiplatform, discoveryengine and their .us/.eu twins) plus cloudcode-pa.
+- Default deny still holds per run: kiln drops, at launch, every destination not belonging to the sign-in the session uses (D236 lets a run drop, never add). That narrowing is required, not "later". Build it here if it's in your files; otherwise give goal 60's agent (abd99fd6636ac88dc, step 17 launch) the exact rule and your test.
+- The *.mtls.googleapis.com twins stay out: they need a device certificate no microVM holds (certificate-based access, cite it). Record that sign-in path as unsupported in a microVM, with the reason, in docs/agents.md.
+Record the decision as ROOT's call, 2026-11-13, in the harness record.
+
+Part 4 told ROOT before applying it that sign-ins 3 and 4 also take oauth2.googleapis.com (Google's token endpoint,
+which their refresh uses) and, for the WIF sign-in, sts.googleapis.com when agy's build names it and Google documents
+it: both hold (s26's evidence/hosts/agy-build.txt; google-workforce-short-lived-credentials.html, "token_url":
+"https://sts.googleapis.com/v1/oauthtoken"). ROOT raised no objection.

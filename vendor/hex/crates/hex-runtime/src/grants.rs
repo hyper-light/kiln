@@ -1,8 +1,7 @@
 //! A box's network grants as Shards' image boot (D231) takes them (joint plan step 15; docs/design/network-grants.md
-//! N4 and N6): exactly what Shards `66113379`, with Hex's recorded change holding each member to its reach of the
-//! destinations kept, can hold, or a typed refusal naming the capability Hex awaits. Pure: the Shards image class hands
-//! [`ImageNetwork`] to `shards_api::image::ImageSpec` as it boots, and holds the run to its grants as the boot returns
-//! ([`bound`]).
+//! N4 and N6): exactly what Shards at the revision vendor/shards pins can hold, its run host holding each member to its
+//! reach of the names kept (D246), or a typed refusal naming the capability Hex awaits. Pure: the Shards image class hands [`ImageNetwork`] to
+//! `shards_api::image::ImageSpec` as it boots, and holds the run to its grants as the boot returns ([`bound`]).
 
 use std::borrow::Cow;
 
@@ -10,8 +9,7 @@ use hex_api::{
     Destination, Grant, MemberKind, Proto, Published, Receiver, Refusal, ShardsImage, check_grants,
     unheld,
 };
-use shards_api::image::wire::MemberReach;
-use shards_api::image::{Bound, Keep, MemberInfo, Narrowing, Publish, Receiving};
+use shards_api::image::{Bound, Keep, MemberInfo, MemberReach, Narrowing, Publish, Receiving};
 
 /// What an image boot is told of a box's grants: the ports it publishes, and how the image's own grants past the
 /// microVM are narrowed.
@@ -23,14 +21,17 @@ pub struct ImageNetwork {
 
 /// `image`'s grants as its boot takes them, or the refusal of what D236's destinations can't express at all
 /// ([`hex_api::unheld`], N4). Each destination a grant names by TCP (a host's name, an IPv4 address, the host itself)
-/// is kept as D236 writes it, `host:port`, one for each port of the grant's range, and each member is held to its own
-/// (`Narrowing::members`): the run host refuses the boot, before anything starts, where any member the image declares
-/// would reach other than that, Hex's recorded change to Shards (vendor/shards UPSTREAM.md). A publish is programmed on
-/// any run: Shards names whom each reaches as the boot returns, and [`bound`] holds the run to them there (N6).
+/// is kept as D236 writes it, `host:port`, one for each port of the grant's range, and every member is held to its own
+/// on every boot (`Narrowing::members`, D246): the run host refuses the boot, before anything starts, where any member
+/// the image declares would reach other than that of the names kept, a member in no entry nothing. A publish is
+/// programmed on any run: Shards names whom each reaches as the boot returns, and [`bound`] holds the run to them there
+/// (N6).
 ///
 /// Nothing else of the image's grants is kept, where `Narrowing::default()` would keep them whole: no port egress, no
-/// remote MCP server, no name past the VM but the destinations'. So with no grant the run has no network at all
-/// (`shards api-run`'s `network none`), and every published port is a grant's, at the host address it names.
+/// remote MCP server (so of D246's names kept, destinations and remote MCP servers alike, every one is a grant's
+/// destination), no name past the VM but the destinations'. So with no grant nothing passes the microVM: the run has
+/// no network, or, where its image links its members past the microVM, one whose network process lets nothing past
+/// (D250); and every published port is a grant's, at the host address it names.
 pub fn program(image: &ShardsImage) -> Result<ImageNetwork, Refusal> {
     let grants = image.grants.as_slice();
     check_grants(grants)?;
@@ -70,13 +71,7 @@ pub fn program(image: &ShardsImage) -> Result<ImageNetwork, Refusal> {
             mcp: Keep::Only(Vec::new()),
             destinations: Keep::Only(kept),
             dns: false,
-            // Version 9 of D231's channel only where a destination is kept, so a stock run host of version 6 serves
-            // every boot but those.
-            members: if members.is_empty() {
-                None
-            } else {
-                Some(members)
-            },
+            members: Some(members),
         },
     })
 }

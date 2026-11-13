@@ -24,14 +24,17 @@ HARNESS gemini FROM ./gemini-${TARGETARCH}
 # harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
 # name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
 # resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
-# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
-# docs/research/s18-host-in-vm says where each host comes from).
-# - cloudcode-pa.googleapis.com: Code Assist, where a Google sign-in's turns go
-#   (packages/core/src/code_assist/server.ts at v0.68.0); generativelanguage.googleapis.com: the
-#   Gemini API, a key's (@google/genai 1.30.0's base URL); oauth2.googleapis.com: Google's token
-#   endpoint, a sign-in's refresh and its check that a token isn't revoked (google-auth-library
-#   10.9.0); www.googleapis.com: the signed-in account's user info (oauth2.ts). Its usage statistics
-#   (play.googleapis.com), Vertex AI's regional hosts and npm's update check (off, f23) go nowhere.
+# port or protocol goes out. 443 is HTTPS's port (RFC 9110 4.2.2). Each host is cited to its vendor's own
+# documentation, or, where that names a wildcard or nothing, to the vendor's own source or build, in its
+# harness's record's "Hosts by name" (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18, part 4):
+# docs/research/s21-gemini-agentfile/README.md, each from Google's own documentation and the pinned build's source:
+# - cloudcode-pa.googleapis.com: Code Assist, where a Google sign-in's turns go (Google's Gemini Code Assist network
+#   page; code_assist/server.ts at v0.68.0).
+# - generativelanguage.googleapis.com: the Gemini API, signed in with a key (the Gemini API reference; @google/genai).
+# - oauth2.googleapis.com: Google's token endpoint, a sign-in's refresh and its check that a token isn't revoked (Google's
+#   OAuth docs for desktop apps; google-auth-library).
+# - www.googleapis.com: the signed-in account's user info (Google's OAuth2 API definition; oauth2.ts).
+# Its usage statistics (play.googleapis.com), Vertex AI's regional hosts and npm's update check (off, f23) go nowhere.
 # kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
 # kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
 NETWORK --egress=cloudcode-pa.googleapis.com:443 --egress=generativelanguage.googleapis.com:443 --egress=oauth2.googleapis.com:443 --egress=www.googleapis.com:443 provider FOR gemini

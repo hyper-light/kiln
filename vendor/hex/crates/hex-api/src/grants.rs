@@ -423,8 +423,7 @@ fn check_name(at: usize, name: &str) -> Result<(), Refusal> {
 /// capability, UDP to a name ([`Upstream::MemberGrantsByName`]), to an address, or to an IPv6 address by TCP
 /// ([`Upstream::MemberGrantsByAddress`]), and the host's service by UDP ([`Upstream::MemberHostService`]). Every other
 /// grant is held: a destination by TCP kept for its own members alone, which the run host holds every member of the
-/// image to before the VM starts (Hex's recorded change to Shards, vendor/shards UPSTREAM.md), and a publish to the
-/// receiver Shards names (N6).
+/// image to before the VM starts (Shards' D246), and a publish to the receiver Shards names (N6).
 pub fn unheld(grants: &[Grant]) -> Option<Upstream> {
     grants.iter().find_map(|grant| match grant {
         Grant::Egress {
