@@ -161,6 +161,10 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         _ => None,
     };
     let run = vms.launch(name, launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
+    // Placement reads its use from its VM's meter from now on (#73 part 7 slice 3).
+    if let (Some(claim), Some(reach), Some(group)) = (&spec.claim, crate::reach::node::global(), super::group_of(vms, run.as_ref())) {
+        reach.session_grouped(claim.clone(), group).await;
+    }
     Ok(crate::proc::duplex_of_run(run, image, reach, kept_in))
 }
 

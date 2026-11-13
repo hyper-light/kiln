@@ -317,6 +317,10 @@ pub enum Local {
     PlaceView { reply: oneshot::Sender<Value> },
     /// The box an agent session placed here under `claim` runs as (`Handle::box_of`).
     BoxOf { claim: super::place::Claim, reply: oneshot::Sender<Option<kiln_ci::place::holder::BoxName>> },
+    /// An agent session placed here under `claim` reads its use from `at` (`Handle::session_grouped`).
+    SessionGrouped { claim: super::place::Claim, at: super::place::Group },
+    /// Placement's records (`Handle::records`).
+    Records { reply: oneshot::Sender<Option<Arc<dyn kiln_seams::Records>>> },
 }
 
 /// How the agent and local tools reach the node. What the network and the node's own runs say
@@ -424,6 +428,18 @@ impl Handle {
     /// its start isn't held here (yet).
     pub async fn box_of(&self, claim: super::place::Claim) -> Option<kiln_ci::place::holder::BoxName> {
         self.ask(|reply| Local::BoxOf { claim, reply }).await.ok().flatten()
+    }
+
+    /// An agent session placed here under `claim` reads its use from `at` from now on: its microVM's meter once its
+    /// harness is launched in one (`Group::Hex`, #73 part 7 slice 3). Its start and its room are as they were.
+    pub async fn session_grouped(&self, claim: super::place::Claim, at: super::place::Group) {
+        let _ = self.tx.send(In::Local(Local::SessionGrouped { claim, at })).await;
+    }
+
+    /// Placement's records (`Placer::records`), once the node opened them: where its machine's microVMs keep each
+    /// run's charge (`sandbox::hexvm::USE`). None where they couldn't be opened, or the node isn't running.
+    pub async fn records(&self) -> Option<Arc<dyn kiln_seams::Records>> {
+        self.ask(|reply| Local::Records { reply }).await.ok().flatten()
     }
 
     /// The next name of a box of this process's that no start here named: placement's own numbering
@@ -3106,6 +3122,10 @@ impl Node {
             }
             Local::BoxOf { claim, reply } => {
                 let _ = reply.send(self.place.box_of(&claim.owner, claim.epoch, &claim.run));
+            }
+            Local::SessionGrouped { claim, at } => self.place.grouped(&claim.owner, claim.epoch, &claim.run, at),
+            Local::Records { reply } => {
+                let _ = reply.send(self.place.records());
             }
             Local::SessionEnded { claim } => {
                 let outs = self.place.session_ended(&claim, crate::util::now_ms());

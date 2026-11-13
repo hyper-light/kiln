@@ -140,7 +140,8 @@ holds them as it starts (`sandbox::hold`): the carried `shards` written out bene
 over it (`hex_node::images::ImageRuntime`, its records in `<state>/hex-records`, Shards' home and cache beneath the
 state), and `sandbox::hexvm::HexVms` as the runner's sandbox; its facts then say `virt.microvm`. Each launch's box is
 the one placement holds for its session (`Holder::box_of`), else the next of placement's own numbering of boxes that
-reserve nothing (`kiln-z…`, shared with its holding), so no two share a name. A launch adds kiln's variables
+reserve nothing (`kiln-z…`, shared with its holding), so no two share a name. Its charge is kept in placement's records as it
+ends (`hexvm::USE`), and placement reads its use from its VM's meter once it's launched (`Group::Hex`). A launch adds kiln's variables
 (`isolated::env::member_env`) and kiln's MCP through the link's bridge (`isolated::mcp`), and refuses a project built
 with its host's own tools (`isolated::host_tools`). A kiln that carries no Shards holds no isolated agent, and the
 launch is held by the conformance suite and a stand-in alone (below).
