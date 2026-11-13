@@ -114,7 +114,7 @@ impl Placer {
             }
         }
         let mut said = Vec::new();
-        match Holding::start(self.me.clone(), self.epoch, &survivors) {
+        match Holding::start(self.me.clone(), self.epoch, &survivors).map(|h| h.numbered_by(self.numbering.clone())) {
             Ok(holding) => {
                 let stands = holding.keeper();
                 if !survivors.is_empty() {
@@ -183,6 +183,13 @@ impl Placer {
     /// not started here, or where no keeper is named.
     pub fn box_of(&self, owner: &str, epoch: u64, run: &str) -> Option<BoxName> {
         self.keeper.as_ref()?.runs.get(&(owner.to_owned(), epoch, run.to_owned())).copied()
+    }
+
+    /// Its process's numbering of boxes that reserve nothing, its holding's own ([`Self::box_of`]'s `kiln-z…`): for
+    /// whatever names a box here no start of its named (the machine's microVMs, kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 17), so no two boxes share a name.
+    pub fn numbering(&self) -> kiln_ci::place::holder::Numbering {
+        self.numbering.clone()
     }
 
     /// Where it stands with its machine's keeper, for its view: none where none is named.

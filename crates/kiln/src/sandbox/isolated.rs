@@ -108,9 +108,22 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
 /// takes of the session, and of a person's own Agentfile, is checked before anything is built. With no
 /// person or no homes kept on this machine its harness has no home of theirs, and keeps nothing. The
 /// plugin folders its harness loads for `session` are given it as on the machine ([`plugin_folders`]).
+/// It launches in the box placement holds for it (`Holder::box_of`, else placement's numbering). A
+/// project that builds with its host's own tools is refused before anything is built (step 18,
+/// `host_tools`); its harness gets kiln's variables as a microVM's member does
+/// (`isolated::env::member_env`) and kiln's MCP through its link's lane ([`offer_mcp`]).
 pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>) -> anyhow::Result<crate::proc::Duplex> {
+    use crate::harness::isolated::{env, host_tools};
     let source = source_of(kind, spec).map_err(anyhow::Error::msg)?;
     let mut launch = launch_of(kind, spec, source.name())?;
+    let folder = crate::harness::session::resolve_cwd(spec.cwd.as_deref());
+    let files = crate::rt::blocking(move || host_tools::tracked(Path::new(&folder))).await?;
+    host_tools::check(files.iter().map(String::as_str))?;
+    for (k, v) in env::member_env(session, kind) {
+        if !launch.env.iter().any(|(e, _)| *e == k) {
+            launch.env.push((k, v));
+        }
+    }
     if let Source::Kept { text, .. } = source {
         kept_volumes(text, kind.id).map_err(|e| anyhow::anyhow!("{}: {e}", source.name()))?;
     }
@@ -141,7 +154,17 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         launch.args.extend(["--plugin-dir".to_owned(), at.clone()]);
         launch.shares.push(Share { host: dir, at, writable: false });
     }
-    let run = vms.sandbox.launch(launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
+    // kiln's MCP once its person's volume is made (agy's config is kept there).
+    offer_mcp(kind, &source, person, homes, &mut launch.args).await;
+    let name = match (&spec.claim, crate::reach::node::global()) {
+        (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
+        _ => None,
+    };
+    let run = vms.launch(name, launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
+    // Placement reads its use from its VM's meter from now on (#73 part 7 slice 3).
+    if let (Some(claim), Some(reach), Some(group)) = (&spec.claim, crate::reach::node::global(), super::group_of(vms, run.as_ref())) {
+        reach.session_grouped(claim.clone(), group).await;
+    }
     Ok(crate::proc::duplex_of_run(run, image, reach, kept_in))
 }
 
@@ -357,6 +380,45 @@ fn in_layers(store: &shards_image::store::Store, layers: &[shards_image::store::
         }
     }
     Ok(None)
+}
+
+/// kiln's MCP for `kind`'s harness in its microVM, through its link's `mcp` lane's bridge (step 18,
+/// `crate::harness::isolated::mcp`): its command line's form added to `args`; Antigravity's entry put
+/// in its own config in its person's volume under `homes` (the only place agy reads one from, kept as
+/// agy keeps it: `mcp::agy_config`), for kiln's own Agentfile, whose volumes kiln keeps; an ACP
+/// agent's is given at its `session/new` (`kinds::acp_servers`). A config that couldn't be written
+/// starts it without kiln's MCP, said, as on its machine (`Kind::prepare`).
+async fn offer_mcp(kind: &Kind, source: &Source<'_>, person: Option<&str>, homes: Option<&Path>, args: &mut Vec<String>) {
+    use crate::harness::isolated::mcp;
+    match mcp::for_harness(kind) {
+        mcp::Config::Args(more) => args.extend(more),
+        mcp::Config::Shared(_) => {
+            let (Source::Builtin(b), Some(person), Some(root)) = (source, person, homes) else { return };
+            let (b, person, root) = (*b, person.to_owned(), root.to_path_buf());
+            let put = crate::rt::blocking(move || -> anyhow::Result<()> {
+                let (volumes, image_env) = home::of_builtin(b);
+                let layout = home::Layout::new(&root, &person, b.harness, &volumes, &image_env)?;
+                let guest = format!("{}/.gemini/config/mcp_config.json", layout.guest_home().trim_end_matches('/'));
+                let at = layout.host_of(&guest).ok_or_else(|| anyhow::anyhow!("{guest} isn't a path in its microVM"))?;
+                let config = match std::fs::read(&at) {
+                    Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Bool(false)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+                    Err(e) => return Err(anyhow::anyhow!("{}: {e}", at.display())),
+                };
+                if let Some(next) = mcp::agy_config(&config) {
+                    if let Some(dir) = at.parent() {
+                        std::fs::create_dir_all(dir)?;
+                    }
+                    std::fs::write(&at, serde_json::to_vec_pretty(&next)?)?;
+                }
+                Ok(())
+            });
+            if let Err(e) = put.await.and_then(|r| r) {
+                tracing::warn!(harness = kind.id, error = %format!("{e:#}"), "kiln's MCP couldn't be put in its config: it starts without it");
+            }
+        }
+        mcp::Config::Acp(_) | mcp::Config::Refused(_) => {}
+    }
 }
 
 /// What a run of kiln's Agentfile `b` reaches of its image's destinations (`super::narrow`): its
