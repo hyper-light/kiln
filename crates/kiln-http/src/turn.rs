@@ -277,6 +277,24 @@ impl Writes {
     }
 }
 
+impl Writes {
+    /// What a write of `len` bytes is expected to take at the dearest a byte of writes of its size has cost (an unwritten
+    /// size's as [`Writes::fitting`] reckons it: the nearest smaller written size's, else the smallest's), nanoseconds: none
+    /// until a write was timed.
+    pub fn cost_ns(&self, len: u64) -> Option<u64> {
+        let size = size_of_write(len);
+        let rate = (0..=size).rev().find_map(|c| self.dearest(c)).or_else(|| (size..CLASSES).find_map(|c| self.dearest(c)))?;
+        Some((rate * len as f64) as u64)
+    }
+}
+
+/// What a write of `len` bytes is expected to take on this shard's thread, at what its writes of that size have cost
+/// ([`Writes::cost_ns`], [`WRITES`]), nanoseconds: none before a write was timed here, or off a shard's thread. What a
+/// writer outside an answer (a WebSocket's frames) weighs a write by against what's left of its turn's quantum.
+pub fn write_cost_ns(len: usize) -> Option<u64> {
+    WRITES.try_with(|w| w.cost_ns(u64::try_from(len).unwrap_or(u64::MAX))).ok().flatten()
+}
+
 /// The size a write of `len` bytes is kept as: the power of two its bytes fall in, the last size taking what's past it.
 fn size_of_write(len: u64) -> usize {
     usize::try_from(63 - len.max(1).leading_zeros()).map_or(CLASSES - 1, |p| p.min(CLASSES - 1))
@@ -356,6 +374,11 @@ mod tests {
             w.learn(256 << 10, 50_000);
         }
         assert_eq!(w.fitting(200_000), Some(1 << 20), "the slow one forgotten");
+        // What a write is expected to take: at its size's rate, or the nearest smaller written size's.
+        assert_eq!(w.cost_ns(256 << 10), Some(50_000), "256 KiB at its size's rate");
+        assert_eq!(w.cost_ns(1 << 20), Some(200_000), "a megabyte at 256 KiB's rate, the nearest smaller written");
+        assert_eq!(w.cost_ns(100), Some(5_000), "100 bytes at their size's");
+        assert_eq!(Writes::nothing_yet().cost_ns(100), None, "nothing learned");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: no gain is picked; the sketch forgets by halving each window. Do: a window of jobs

@@ -550,6 +550,68 @@ impl Link<'_> {
         self.conn.prepare(sql).map_err(fail)
     }
 
+    /// As [`super::store::Engine::unended`], on this link's connection (a reader's beside the writer).
+    fn unended(&self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        let mut stmt = self.prepare(sql::SESSIONS_UNENDED)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[int(since)], |r| {
+            if let (Ok(id), Ok(info)) = (r.get::<String>(0), r.get::<String>(1)) {
+                out.push(Unended { id, info, meta: r.get::<String>(2).ok(), state: r.get::<String>(3).ok(), machine: r.get::<String>(4).ok() });
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// As [`super::store::Read::restorable`], on this link's connection: its row by its key, its newest events by
+    /// `events_by_seq` alone.
+    fn restorable(&self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        let mut get = self.prepare(sql::SESSION_GET)?;
+        let mut kept: Option<Kept> = None;
+        self.run(&mut get, &[Value::from_text(session.to_owned())], |r| {
+            let s = |i: usize| r.get::<String>(i).ok();
+            kept = Some(Kept { info: s(0), meta: s(1), state: s(2), changes: s(3), updated_at: r.get::<i64>(4).unwrap_or(0), closed_at: r.get::<i64>(5).ok(), events: Vec::new() });
+            Ok(())
+        })?;
+        let Some(mut k) = kept else { return Ok(None) };
+        let mut events = self.event_rows(sql::EVENTS_NEWEST, &[Value::from_text(session.to_owned()), int(i64::try_from(last).unwrap_or(i64::MAX))])?;
+        events.reverse();
+        k.events = events;
+        Ok(Some(k))
+    }
+
+    /// As [`super::store::Engine::ended`], on this link's connection.
+    fn ended(&self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        let mut stmt = self.prepare(sql::SESSIONS_ENDED_AFTER)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[int(after.0), txt(after.1), int(i64::try_from(limit).unwrap_or(i64::MAX))], |r| {
+            if let (Ok(id), Ok(at)) = (r.get::<String>(0), r.get::<i64>(1)) {
+                out.push((id, at));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// As [`super::store::Engine::kept`], on this link's connection.
+    fn kept(&self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        let mut get = self.prepare(sql::SESSION_GET)?;
+        let mut kept: Option<Kept> = None;
+        self.run(&mut get, &[Value::from_text(session.to_owned())], |r| {
+            let s = |i: usize| r.get::<String>(i).ok();
+            kept = Some(Kept { info: s(0), meta: s(1), state: s(2), changes: s(3), updated_at: r.get::<i64>(4).unwrap_or(0), closed_at: r.get::<i64>(5).ok(), events: Vec::new() });
+            Ok(())
+        })?;
+        let mut events = self.event_rows(sql::EVENTS_LAST, &[Value::from_text(session.to_owned()), int(i64::try_from(last).unwrap_or(i64::MAX))])?;
+        if kept.is_none() && events.is_empty() {
+            return Ok(None);
+        }
+        events.reverse();
+        let mut k = kept.unwrap_or_default();
+        k.events = events;
+        Ok(Some(k))
+    }
+
     /// Run `stmt` with `params`, handing each row to `each`.
     fn run(&self, stmt: &mut Statement, params: &[Value], mut each: impl FnMut(&TRow) -> anyhow::Result<()>) -> anyhow::Result<()> {
         self.run_while(stmt, params, |r| each(r).map(|()| true))
@@ -694,6 +756,22 @@ impl TursoRead {
 impl Read for TursoRead {
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         self.link().events(session, before, limit)
+    }
+
+    fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        self.link().unended(since)
+    }
+
+    fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        self.link().kept(session, last)
+    }
+
+    fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        self.link().ended(after, limit)
+    }
+
+    fn restorable(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        self.link().restorable(session, last)
     }
 }
 
@@ -1514,6 +1592,10 @@ impl Engine for Turso {
         Ok(Look { bytes: pages("page_count")? * page, free: pages("freelist_count")? * page, wal: size(&beside(&self.path, "-wal")), top: self.rev, sessions, compacting })
     }
 
+    fn restorable(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        self.link().restorable(session, last)
+    }
+
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
         let mut stmt = self.prepare(sql::SESSIONS_UNENDED)?;
         let mut out = Vec::new();
@@ -1591,6 +1673,46 @@ mod tests {
 
     fn said(id: &str, seq: u64, text: &str) -> Update {
         Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] }
+    }
+
+    /// 2026-11-13 08:41Z: listing a session again reads its row by its key and its newest events by `events_by_seq`
+    /// alone, no sort of its timeline: on a session of 100,000 events in a large store, Turso's plan for it uses the
+    /// index with no temporary sort, and the read answers in a small part of the store's wait (READ_WAIT), where the
+    /// whole timeline's sorted read (`kept`, EVENTS_LAST) is measured beside it.
+    #[test]
+    fn restore_reads_a_huge_sessions_row_and_newest_events_by_index_alone() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("conversations.db"))?;
+        let body = "x".repeat(400);
+        let open = Update::Open { info: Box::new(crate::harness::session::Info { id: "huge".into(), kind: "claude".into(), ..Default::default() }), since: None };
+        t.apply(&super::super::rows::of("huge", &open, 0))?;
+        const EVENTS: u64 = 100_000;
+        for chunk in (1..=EVENTS).collect::<Vec<_>>().chunks(5_000) {
+            let rows: Vec<_> = chunk.iter().flat_map(|i| super::super::rows::of("huge", &said(&format!("m{i}"), *i, &body), 0)).collect();
+            t.apply(&rows)?;
+        }
+        // Its plan: the index, read backwards, no sort.
+        let link = t.link();
+        let mut plan = link.prepare(&format!("EXPLAIN QUERY PLAN {}", sql::EVENTS_NEWEST))?;
+        let mut said_plan = Vec::new();
+        link.run(&mut plan, &[Value::from_text("huge".to_owned()), int(200)], |r| {
+            said_plan.push((0..4).filter_map(|i| r.get::<String>(i).ok()).collect::<Vec<_>>().join(" "));
+            Ok(())
+        })?;
+        let plan_text = said_plan.join(" | ");
+        assert!(plan_text.contains("events_by_seq") && !plan_text.to_uppercase().contains("TEMP B-TREE"), "{plan_text}");
+        let mut reader = t.reader().ok_or_else(|| anyhow::anyhow!("no reader"))?;
+        let began = Instant::now();
+        let k = reader.restorable("huge", 200)?.ok_or_else(|| anyhow::anyhow!("nothing of it"))?;
+        let cheap = began.elapsed();
+        assert_eq!(k.events.len(), 200);
+        assert_eq!(k.events.last().map(|e| e.seq), Some(EVENTS), "its newest, oldest first");
+        let began = Instant::now();
+        let _ = reader.kept("huge", 4_000)?;
+        let whole = began.elapsed();
+        eprintln!("restore read of a 100k-event session: {cheap:?} (kept with EVENTS_LAST: {whole:?}); plan: {plan_text}");
+        assert!(cheap < super::super::store::READ_WAIT / 20, "{cheap:?}");
+        Ok(())
     }
 
     /// Plan 01a1cc09, step 2: a reader beside the writer reads what's committed while the writer holds a write it hasn't

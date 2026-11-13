@@ -163,5 +163,70 @@ fn step30_agentfiles_on_every_surface() -> anyhow::Result<()> {
     anyhow::ensure!(st == 200 && said == json!({ "deleted": true }), "{st} {said}");
     let (st, _) = call(&srv, &ada, "GET", &format!("/api/agentfiles/{id}/versions"), None)?;
     anyhow::ensure!(st == 404, "{st}");
+
+    // The live round trip (docs/research/s30-agentfiles/live.py, what ROOT runs against production)
+    // held to this server: each operation over REST and MCP, kept to its owner, Shards' refusal, and
+    // what it made taken back.
+    let harness = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/research/s30-agentfiles/live.py");
+    let out = Command::new("python3").arg(harness).env("KILN_URL", format!("http://127.0.0.1:{}", srv.port)).env("KILN_ADMIN_TOKEN", &srv.admin).output()?;
+    let said = String::from_utf8_lossy(&out.stdout);
+    print!("{said}");
+    let passed = |surface: &str| said.lines().filter(|l| l.starts_with(&format!("PASS {surface} "))).count();
+    anyhow::ensure!(
+        out.status.success() && !said.lines().any(|l| l.starts_with("FAIL ")) && passed("REST") > 0 && passed("MCP") > 0,
+        "live.py: {:?}\n{said}{}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+        srv.log()
+    );
+    Ok(())
+}
+
+/// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: a start names the Agentfile an isolated agent's
+/// microVM is made from, through every surface a person or an agent starts one by (the sessions route,
+/// `agents.start` as a route and as an MCP tool): kiln's own for its harness, or one of its person's
+/// own. Another person's is as none (404), before anything is placed for it; kiln's for another harness
+/// and an Agentfile with `isolation` "none" are refused; `resume` takes up one conversation, so with
+/// `count` past 1 it's refused. Taking out `image_for`'s owner rule passes Bo's starts; taking out the
+/// sessions route's call passes his first; taking out the count rule passes the last.
+#[test]
+fn step35_a_start_names_only_an_agentfile_its_person_reaches() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let srv = start_env(dir.path(), &Options::default(), false, &[])?;
+    // Each may open agents on a runner (`runners.terminal`), which the sessions route asks first.
+    let ada = person(&srv, "ada", &["developer", "runners.terminal"])?;
+    let bo = person(&srv, "bo", &["developer", "runners.terminal"])?;
+    let (st, made) = call(&srv, &ada, "POST", "/api/agentfiles", Some(json!({ "name": "claude-rust", "text": CLAUDE })))?;
+    anyhow::ensure!(st == 200, "{st} {made}\n{}", srv.log());
+    let hers = format!("agentfile:{}", s(&made, "/agentfile/id"));
+    let session = |image: &str| json!({ "target": "agent:vmbox", "spec": { "kind": "claude", "isolation": { "kind": "microvm", "image": image } } });
+    let refused_as_none = |said: &str| said.contains("names no Agentfile of yours");
+
+    // Bo can't name Ada's, on any surface; nothing is started for him.
+    let (st, said) = call(&srv, &bo, "POST", "/api/harness/sessions", Some(session(&hers)))?;
+    anyhow::ensure!(st == 404 && refused_as_none(&said.to_string()), "the sessions route: {st} {said}");
+    let (st, said) = call(&srv, &bo, "POST", "/api/harness/agents", Some(json!({ "kind": "claude", "image": hers })))?;
+    anyhow::ensure!(st == 404 && refused_as_none(&said.to_string()), "agents.start's route: {st} {said}");
+    let (failed, said) = mcp(&srv, &bo, "agents_start", json!({ "kind": "claude", "image": hers }))?;
+    anyhow::ensure!(failed && refused_as_none(&said), "agents_start: {said}");
+    let (_, listed) = call(&srv, &srv.admin, "GET", "/api/harness/sessions", None)?;
+    anyhow::ensure!(listed == json!([]), "nothing started: {listed}");
+
+    // Ada's own passes the check (what refuses her next is where it would run: no machine here starts
+    // microVMs), on every surface. Asked of the server itself, so it's refused for being isolated
+    // whatever harnesses this host has on its PATH (with no runner, a start goes to the server only
+    // where it has the harness).
+    let (st, said) = call(&srv, &ada, "POST", "/api/harness/sessions", Some(session(&hers)))?;
+    anyhow::ensure!(!refused_as_none(&said.to_string()), "the sessions route, hers: {st} {said}");
+    let (failed, said) = mcp(&srv, &ada, "agents_start", json!({ "kind": "claude", "image": hers, "on": "local" }))?;
+    anyhow::ensure!(failed && !refused_as_none(&said) && said.contains("microVM"), "agents_start, hers: {said}");
+
+    // kiln's own for another harness, an Agentfile as a process, and a conversation taken up twice.
+    let (st, said) = call(&srv, &ada, "POST", "/api/harness/sessions", Some(session("harness-codex")))?;
+    anyhow::ensure!(st == 400 && said.to_string().contains("harness-codex is kiln's Agentfile for codex, not Claude Code"), "{st} {said}");
+    let (failed, said) = mcp(&srv, &ada, "agents_start", json!({ "kind": "claude", "image": "harness-claude", "isolation": "none" }))?;
+    anyhow::ensure!(failed && said.contains("`image` can't go with `isolation` \"none\""), "{said}");
+    let (failed, said) = mcp(&srv, &ada, "agents_start", json!({ "kind": "claude", "resume": "c-1", "count": 2 }))?;
+    anyhow::ensure!(failed && said.contains("one conversation is taken up by one agent"), "{said}");
     Ok(())
 }
