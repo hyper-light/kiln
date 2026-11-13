@@ -36,10 +36,6 @@ pub use check::Check;
 /// What reaches everyone's Agentfiles (an admin's, as the role has every capability).
 pub const MANAGE: &str = "agentfiles.manage";
 
-/// How a start names one of a person's own as an isolated agent's image (`Spec.isolation.image`):
-/// `agentfile:<id>`, as the console's `views/agentfiles/choose.ts` (`keptImage`) names it.
-pub const IMAGE: &str = "agentfile:";
-
 /// An Agentfile's most bytes: the most buildx reads of a Dockerfile (`maxDockerfileSize`, buildx
 /// v0.37.1 build/url.go), which Shards holds the Dockerfiles it fetches to (shards'
 /// `crates/shards/src/build/mod.rs`).

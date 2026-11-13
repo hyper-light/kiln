@@ -867,7 +867,7 @@ pub fn isolation_for(asked: Option<&str>, image: Option<String>, parent: Option<
 /// (`agentfile:<id>`), which another's is as none to (`agentfiles::brief`). Else why not.
 pub async fn image_for(hub: &Hub, who: &crate::agentfiles::Who, kind: &Kind, asked: &str) -> Result<String, Refused> {
     let name = asked.trim();
-    if let Some(id) = name.strip_prefix(crate::agentfiles::IMAGE) {
+    if let Some(id) = name.strip_prefix(crate::sandbox::isolated::KEPT) {
         return match crate::agentfiles::brief(hub, who, id).await {
             Ok(_) => Ok(name.to_owned()),
             Err(crate::agentfiles::Error::Missing) => Err((StatusCode::NOT_FOUND, format!("{name} names no Agentfile of yours"))),
@@ -877,7 +877,7 @@ pub async fn image_for(hub: &Hub, who: &crate::agentfiles::Who, kind: &Kind, ask
     match crate::agentfiles::builtin::ALL.iter().find(|b| b.name == name) {
         Some(b) if b.harness == kind.id => Ok(name.to_owned()),
         Some(b) => Err(bad(format!("{name} is kiln's Agentfile for {}, not {}", b.harness, kind.name))),
-        None => Err(bad(format!("`image` is kiln's Agentfile for its harness (`harness-<harness>`) or one of yours (`{}<id>`), not {name:?}", crate::agentfiles::IMAGE))),
+        None => Err(bad(format!("`image` is kiln's Agentfile for its harness (`harness-<harness>`) or one of yours (`{}<id>`), not {name:?}", crate::sandbox::isolated::KEPT))),
     }
 }
 
