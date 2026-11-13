@@ -1565,7 +1565,7 @@ mod tests{
                 // the goal, the other agent's message and the person's four messages.
                 let completed=hub.harness.state(&target).is_some_and(|state|state.status==Status::Idle && state.queue.is_empty() && state.turn_started.is_none() && state.delivery.len()==6 && state.delivery.values().all(|delivery|matches!(delivery,super::super::model::Delivery::Completed)));
                 if all_in && completed{break;}
-                anyhow::ensure!(std::time::Instant::now()<deadline,"its messages' turns never ended");
+                anyhow::ensure!(std::time::Instant::now()<deadline,"its messages' turns never ended: all heard {all_in}, state {:?}",hub.harness.state(&target).map(|s|(s.status,s.queue.len(),s.turn_started,s.delivery)));
                 crate::rt::sleep(std::time::Duration::from_millis(20)).await;
             }
             written_through(&hub,&target).await?;
