@@ -61,11 +61,13 @@ the machine's network) is replaced by an Agentfile image's members.
 - **Its session says where it runs** (`GET /api/harness/sessions/:id`, the session's state): `runs`
   is `{"in": "host", "pid": N}` for a process of the machine's, and for a microVM's member `{"in":
   "microvm", "vm": <the microVM's own name, as its runtime gives it>, "image": "NAME@sha256:…",
-  "host_pid": null, "control": {"controller": {"suite", "group"}, "endpoint": {"suite", "group"}}}`.
+  "host_pid": null, "control": {"controller": {"suite", "group"}, "endpoint": {"suite", "group"},
+  "lanes": ["control", "stdin:0", "stdout:0", "stderr:0", "exec", "mcp:0" …]}}`.
   `host_pid` is read from its run's handle and always said, so a check reads it rather than an
   absence. `control` is the link its stdio rides into the microVM, as each end says its TLS 1.3
   handshake negotiated (rustls's names, or the IANA code where rustls has none): the controller's on
-  the machine and the endpoint's own report from inside (Shards' agent control, step 11). It's
+  the machine and the endpoint's own report from inside (Shards' agent control, step 11), and the
+  lanes its controller was granted on it as it dialed (`Dialed::lanes`, Shards' names). It's
   absent until that link is made (`Run::link`, awaited once, never polled), and today's stdio are
   Shards' run pipes, which ride no link.
 - **kiln's record of what it started for it** (`starts`): each start of its harness, when (`at`),

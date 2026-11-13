@@ -437,7 +437,8 @@ one, is `Killed`). It says where its boundary holds it, the same each time it's 
 boundary's own name for it (`id`: a microVM's, as its runtime names it; none for a process of the
 machine's, which its pid names), and the link its stdio rides into its boundary, as each end says
 its TLS 1.3 handshake negotiated (`link`: a microVM's Shards agent control, kiln plan
-01a1cd8e862e7169a074db3d5fa33f3d step 11, the controller's word and the endpoint's own report). A
+01a1cd8e862e7169a074db3d5fa33f3d step 11, the controller's word and the endpoint's own report, and
+the lanes its controller was granted on it as it dialed, by Shards' names). A
 link is awaited: it's said once it's made, none at once for a process of the machine's, whose stdio
 are its pipes, and none where its link ends before it's made.
 

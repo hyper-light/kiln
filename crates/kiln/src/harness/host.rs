@@ -5030,7 +5030,8 @@ while True:
             let (images, pinned) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
             // Its stdio said to ride a link whose ends each negotiated AES-256-GCM (Shards' agent control).
             let end = || kiln_seams::sandbox::Negotiated { suite: "TLS13_AES_256_GCM_SHA384".into(), group: "X25519MLKEM768".into() };
-            let link = kiln_seams::sandbox::Link { controller: end(), endpoint: end() };
+            let lanes = ["control", "stdin:0", "stdout:0", "stderr:0"].map(str::to_owned).to_vec();
+            let link = kiln_seams::sandbox::Link { controller: end(), endpoint: end(), lanes };
             let vms = Arc::new(crate::sandbox::fake::FakeVms::with(&pinned, "claude", &program).linked(link.clone()));
             host.hold_isolated_in(crate::sandbox::Microvms { sandbox: Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images });
             let cwd = dir.path().to_string_lossy().into_owned();
@@ -5053,6 +5054,7 @@ while True:
             assert_eq!(info.pointer("/runs/in"), Some(&serde_json::json!("microvm")));
             assert_eq!(info.pointer("/runs/host_pid"), Some(&serde_json::Value::Null), "no host pid, said rather than left out");
             assert_eq!(info.pointer("/runs/control/endpoint/suite"), Some(&serde_json::json!("TLS13_AES_256_GCM_SHA384")));
+            assert_eq!(info.pointer("/runs/control/lanes/2"), Some(&serde_json::json!("stdout:0")));
             assert_eq!(info.pointer("/starts/0/runs/vm"), Some(&serde_json::json!("fake-vm-1")));
             // Steered: a message is a turn, answered.
             assert!(host.command("isolated", message("m1", "hello")));

@@ -81,6 +81,10 @@ pub struct Link {
     pub controller: Negotiated,
     /// The endpoint's own report, from inside the microVM.
     pub endpoint: Negotiated,
+    /// The lanes its controller was granted on it as it dialed, by Shards' names (`control`,
+    /// `stdin:0`, `stdout:0`, `stderr:0`, `exec`, `mcp:0`). Always said.
+    #[serde(default)]
+    pub lanes: Vec<String>,
 }
 
 /// One end's word on its handshake: its cipher suite and key exchange group, by rustls's names
@@ -96,7 +100,7 @@ pub struct Negotiated {
 impl From<kiln_seams::sandbox::Link> for Link {
     fn from(l: kiln_seams::sandbox::Link) -> Self {
         let end = |n: kiln_seams::sandbox::Negotiated| Negotiated { suite: n.suite, group: n.group };
-        Self { controller: end(l.controller), endpoint: end(l.endpoint) }
+        Self { controller: end(l.controller), endpoint: end(l.endpoint), lanes: l.lanes }
     }
 }
 
