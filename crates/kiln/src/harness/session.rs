@@ -4547,7 +4547,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             },
             None => {
                 let mut adapter = kind.adapter(&spec);
-                adapter.offer_mcp(super::kinds::acp_servers(&spec, &s.id));
+                let mut servers = super::kinds::acp_servers(&spec, &s.id);
+                // In a microVM, kiln's MCP only where its microVMs carry its lane (Shards D254): its bridge is there.
+                if spec.isolation.is_some() && files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm()).is_none_or(|v| v.mcp().is_err()) {
+                    servers.clear();
+                }
+                adapter.offer_mcp(servers);
                 if let Some(items) = &seed {
                     adapter.seed(items.clone());
                 }
@@ -4570,7 +4575,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     None if isolated => {
                         let host = files.host.as_ref().and_then(std::sync::Weak::upgrade);
                         match host.as_ref().and_then(|h| h.microvm()) {
-                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes())).await,
+                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone()).await,
                             None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
                         }
                     }

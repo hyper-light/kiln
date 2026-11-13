@@ -21,8 +21,12 @@
 //!   folders its harness loads on the machine, read-only at their own paths ([`plugin_folders`]).
 //! - **What it reaches** past its microVM is its image's destinations narrowed to its session's own
 //!   provider's or sign-in's ([`reach_of`], `super::narrow`), else its image's whole and why.
+//! - **kiln's MCP** reaches it over its link's own `mcp` lane (Shards D254; #75 step 3), never the network: its
+//!   harness's config names its microVM's bridge, and this runner serves each connection to it in its own process
+//!   ([`bridge`]), where its microVMs carry the lane (`super::Microvms::mcp`); where they don't, its harness starts
+//!   without it, said.
 //! - **What it can't do yet**, refused rather than done another way: move to another machine, or
-//!   switch to another harness ([`NO_MOVE`], [`NO_SWITCH`]); reach kiln's own tools (plan step 18).
+//!   switch to another harness ([`NO_MOVE`], [`NO_SWITCH`]).
 
 use std::path::Path;
 
@@ -111,8 +115,9 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
 /// It launches in the box placement holds for it (`Holder::box_of`, else placement's numbering). A
 /// project that builds with its host's own tools is refused before anything is built (step 18,
 /// `host_tools`); its harness gets kiln's variables as a microVM's member does
-/// (`isolated::env::member_env`) and kiln's MCP through its link's lane ([`offer_mcp`]).
-pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>) -> anyhow::Result<crate::proc::Duplex> {
+/// (`isolated::env::member_env`) and kiln's MCP through its link's lane ([`offer_mcp`]), served by this runner for
+/// `session` ([`bridge`], its asks `host`'s), where its microVMs carry the lane.
+pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>) -> anyhow::Result<crate::proc::Duplex> {
     use crate::harness::isolated::{env, host_tools};
     let source = source_of(kind, spec).map_err(anyhow::Error::msg)?;
     let mut launch = launch_of(kind, spec, source.name())?;
@@ -154,18 +159,69 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         launch.args.extend(["--plugin-dir".to_owned(), at.clone()]);
         launch.shares.push(Share { host: dir, at, writable: false });
     }
-    // kiln's MCP once its person's volume is made (agy's config is kept there).
-    offer_mcp(kind, &source, person, homes, &mut launch.args).await;
+    // kiln's MCP once its person's volume is made (agy's config is kept there), where its lane is carried.
+    let lanes = match vms.mcp() {
+        Ok(lanes) => Some(lanes),
+        Err(why) => {
+            tracing::warn!(harness = kind.id, %why, "it starts without kiln's MCP");
+            None
+        }
+    };
+    if lanes.is_some() {
+        offer_mcp(kind, &source, person, homes, &mut launch.args).await;
+    }
     let name = match (&spec.claim, crate::reach::node::global()) {
         (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
         _ => None,
     };
     let run = vms.launch(name, launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
+    if let Some(lanes) = lanes {
+        let here = crate::reach::node::global().map(|h| crate::reach::local::Here { handle: h.clone(), me: h.name().to_owned(), host, session: session.to_owned() });
+        let served = run.id().ok_or_else(|| std::io::Error::other("its run names no microVM")).and_then(|vm| bridge(lanes, vm, here, crate::harness::session::resolve_cwd(spec.cwd.as_deref())));
+        if let Err(e) = served {
+            tracing::warn!(harness = kind.id, error = %e, "kiln's MCP isn't served to it");
+        }
+    }
     // Placement reads its use from its VM's meter from now on (#73 part 7 slice 3).
     if let (Some(claim), Some(reach), Some(group)) = (&spec.claim, crate::reach::node::global(), super::group_of(vms, run.as_ref())) {
         reach.session_grouped(claim.clone(), group).await;
     }
     Ok(crate::proc::duplex_of_run(run, image, reach, kept_in))
+}
+
+/// Serves kiln's MCP to run `vm`'s harness in this runner's own process (Shards D254; #75 step 3): each connection
+/// it makes to its microVM's bridge, taken from `lanes` as it comes, on a thread of its own
+/// (`reach::mcp::serve_lane`: its calls asked here for `here`'s session, `cwd` its folder on this machine), until
+/// `lanes` says its run is over. No token is given anything: the lane says whose a connection is. Where this
+/// process runs no reach node (`here` none) a connection is let go of at once, said, so its harness finds kiln's MCP
+/// gone rather than waiting on it.
+pub fn bridge(lanes: std::sync::Arc<dyn super::Lanes>, vm: String, here: Option<crate::reach::local::Here>, cwd: String) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name("kiln-mcp-lane".into()).spawn(move || {
+        loop {
+            let conn = match lanes.next(&vm) {
+                Ok(conn) => conn,
+                Err(kiln_seams::sandbox::Refusal::Ended) => return,
+                Err(why) => {
+                    tracing::warn!(%vm, %why, "kiln's MCP takes no more of its harness's connections");
+                    return;
+                }
+            };
+            let Some(here) = here.clone() else {
+                tracing::warn!(%vm, "a connection to kiln's MCP let go of: this process runs no reach node to serve it");
+                continue;
+            };
+            let (cwd, session) = (cwd.clone(), here.session.clone());
+            let served = std::thread::Builder::new().name("kiln-mcp-conn".into()).spawn(move || {
+                let super::McpConnection { from, to } = conn;
+                if let Err(e) = crate::reach::mcp::serve_lane(here, cwd, &mut std::io::BufReader::new(from), to) {
+                    tracing::warn!(%session, error = %format!("{e:#}"), "a connection to kiln's MCP ended in error");
+                }
+            });
+            if let Err(e) = served {
+                tracing::warn!(%vm, error = %e, "a connection to kiln's MCP let go of: no thread to serve it");
+            }
+        }
+    })
 }
 
 /// Where a microVM sees a Windows machine's project folder: beneath this, by its own name ([`guest_path`]).
@@ -480,6 +536,74 @@ pub fn egress_of(reach: &Reach, whole: Option<Vec<String>>) -> Egress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An MCP `initialize`, numbered `id`, as a harness's client sends one first.
+    fn initialize(id: u64) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}})
+    }
+
+    /// The answer numbered `id` that `said` holds, waited for up to 30 seconds.
+    fn answer(said: &super::super::fake::Said, id: u64) -> anyhow::Result<serde_json::Value> {
+        for _ in 0..3000 {
+            if let Some(a) = said.lines().into_iter().find(|l| l.get("id") == Some(&serde_json::json!(id))) {
+                return Ok(a);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        anyhow::bail!("no answer {id}: {:?}", said.lines())
+    }
+
+    /// #75 step 3 (Shards D254): this runner serves kiln's MCP over each connection its run's harness makes to its
+    /// microVM's bridge, in its own process, as the lane hands them out for its run, until the lane says the run is
+    /// over: each connection's `initialize` is answered as `kiln reach mcp` answers it, naming its session, and its
+    /// tools are kiln's. No token or address is said on any: the lane is whose it is.
+    #[test]
+    fn s35_mcp_the_runner_serves_kilns_mcp_over_each_connection_of_its_lane() -> anyhow::Result<()> {
+        use super::super::fake::{FakeLanes, connection};
+        let dir = tempfile::tempdir()?;
+        let config = crate::reach::node::Config {
+            mirrors: dir.path().join("mirrors"),
+            adopt_policy: crate::harness::moving::stream::StoragePolicy::Off,
+            sense: false,
+            ..crate::reach::node::Config::for_runner("here", dir.path(), true)
+        };
+        let (handle, _to_server) = crate::reach::node::start(config)?;
+        let here = crate::reach::local::Here { handle, me: "here".into(), host: None, session: "iso-s1".into() };
+        let listed = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+        let (one, said_one) = connection(&[initialize(1), serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), listed]);
+        let (two, said_two) = connection(&[initialize(7)]);
+        let lanes = std::sync::Arc::new(FakeLanes::of(vec![one, two]));
+        let served = bridge(lanes.clone(), "vm-1".into(), Some(here), dir.path().to_string_lossy().into_owned())?;
+        served.join().map_err(|_| anyhow::anyhow!("its bridge panicked"))?;
+        assert_eq!(lanes.asked(), ["vm-1", "vm-1", "vm-1"], "each connection of its run's, until its lane said it was over");
+        for (said, id) in [(&said_one, 1), (&said_two, 7)] {
+            let init = answer(said, id)?;
+            anyhow::ensure!(init.pointer("/result/serverInfo").is_some(), "{init}");
+            anyhow::ensure!(init.pointer("/result/instructions").and_then(serde_json::Value::as_str).is_some_and(|i| i.contains("iso-s1")), "its session named: {init}");
+        }
+        let list = answer(&said_one, 2)?;
+        let names: Vec<&str> = list.pointer("/result/tools").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|t| t.get("name").and_then(serde_json::Value::as_str)).collect();
+        anyhow::ensure!(names.contains(&"code_run") && names.contains(&"run"), "kiln's tools: {list}");
+        for said in [&said_one, &said_two] {
+            let all = String::from_utf8_lossy(&said.0.lock()).into_owned();
+            anyhow::ensure!(!all.contains("Bearer") && !all.contains("KILN_SESSION") && !all.contains("/api/mcp"), "a token or an address said: {all}");
+        }
+        Ok(())
+    }
+
+    /// #75 step 3: where this process runs no reach node, a connection is let go of at once, so its harness finds
+    /// kiln's MCP gone rather than waiting on it, and the bridge ends with its lane.
+    #[test]
+    fn s35_mcp_with_no_reach_node_a_connection_is_let_go_of() -> anyhow::Result<()> {
+        use super::super::fake::{FakeLanes, connection};
+        let (one, said) = connection(&[initialize(1)]);
+        let lanes = std::sync::Arc::new(FakeLanes::of(vec![one]));
+        bridge(lanes.clone(), "vm-1".into(), None, "/".into())?.join().map_err(|_| anyhow::anyhow!("its bridge panicked"))?;
+        assert_eq!(lanes.asked(), ["vm-1", "vm-1"]);
+        assert_eq!(std::sync::Arc::strong_count(&said.0), 1, "its connection let go of");
+        assert!(said.lines().is_empty(), "nothing answered");
+        Ok(())
+    }
 
     fn microvm(image: Option<&str>) -> Isolation {
         Isolation { image: image.map(str::to_owned), ..Isolation::microvm() }

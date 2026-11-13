@@ -37,6 +37,66 @@ impl FakeVms {
     }
 }
 
+/// A stand-in for kiln's MCP lane through Hex (Shards D254's controller, `Execs::mcp`): the connections its runs'
+/// harnesses make, handed out in turn, then `Ended`; and each run asked for one, in order.
+#[derive(Default)]
+pub struct FakeLanes {
+    conns: Mutex<std::collections::VecDeque<super::McpConnection>>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl FakeLanes {
+    /// Handing out `conns` in turn.
+    pub fn of(conns: Vec<super::McpConnection>) -> Self {
+        Self { conns: Mutex::new(conns.into()), asked: Mutex::new(Vec::new()) }
+    }
+
+    /// Each run a connection was asked for, in order.
+    pub fn asked(&self) -> Vec<String> {
+        self.asked.lock().clone()
+    }
+}
+
+impl super::Lanes for FakeLanes {
+    fn carried(&self) -> Result<(), Refusal> {
+        Ok(())
+    }
+
+    fn next(&self, run: &str) -> Result<super::McpConnection, Refusal> {
+        self.asked.lock().push(run.to_owned());
+        self.conns.lock().pop_front().ok_or(Refusal::Ended)
+    }
+}
+
+/// What a stand-in connection is sent, kept to be read.
+#[derive(Clone, Default)]
+pub struct Said(pub std::sync::Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Said {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Said {
+    /// Each JSON line said so far.
+    pub fn lines(&self) -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(&self.0.lock()).lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+    }
+}
+
+/// A stand-in connection that sends `lines`, each a JSON-RPC message, then ends; what it's sent kept in the [`Said`].
+pub fn connection(lines: &[serde_json::Value]) -> (super::McpConnection, Said) {
+    let input: String = lines.iter().map(|v| format!("{v}\n")).collect();
+    let said = Said::default();
+    (super::McpConnection { from: Box::new(std::io::Cursor::new(input.into_bytes())), to: Box::new(said.clone()) }, said)
+}
+
 impl Sandbox for FakeVms {
     fn launch<'a>(&'a self, launch: Launch) -> BoxFuture<'a, Result<Box<dyn Run>, Refusal>> {
         Box::pin(async move {
