@@ -343,12 +343,36 @@ there until the keeper answers again; and a late answer comes to its own word an
 answer what it took.
 
 The view is the decider's copy (CV7): the keeper validates every reserve, so a stale view costs a
-refusal and a placement again, never a double booking. Its `own` is the holder's reservations whose
-work may run; one being released counts as another's until the keeper's word drops it, so the view
-never says more room than the keeper has. A release goes on the runner's one ordered link before any
-later reserve, so the room of a run that ended here is the keeper's again by the time the next run's
-reserve reaches it. No number here is the ledger's own: each is the keeper's measured room and books,
-or the runner's.
+refusal and a placement again, never a double booking. Its `own` is the reservations granted the
+starts of the runs its ledger holds; one being released, and an earlier process's runs that outlived
+it, count as another's until the keeper's word drops them, so the view never says more room than the
+keeper has. A release goes on the runner's one ordered link before any later reserve, so the room of
+a run that ended here is the keeper's again by the time the next run's reserve reaches it. No number
+here is the ledger's own: each is the keeper's measured room and books, or the runner's.
+
+**The holding** (`place::holder::Holding`). Hex's holder core, `hex_api::capacity::Holder`, keeps
+the order of words, kiln driving it rather than a copy of it (Shards' R12: one implementation); the
+holding drives it for the ledger with the waits above and the starts its reservations are for. Its
+shell says when a link opens (`linked`: the hello) and ends (`ended`, died or reset), carries each
+answer and hint (`heard`), wakes it at `due` (`woke`), and asks it to reserve a start's room
+(`reserve`: none for a start that asks nothing, which starts at once) and to give back a
+reservation whose work can no longer run (`release`). Each input says where the runner stands first
+(`Event::Keeper`, for `Admission::keeper_said`: the refusal's view before the refusal), then each
+start's reserve granted or not (`Event::Granted`, `Event::NotGranted`) and each sync's counts
+(`Event::Synced`). It stands joining until its sync is answered, the core's link going down,
+joining, syncing and up; a close it says hello again after (`Session`, `NotSynced`, a refused
+`Scope`) it says hello at once, on the same link; `OlderEpoch` leaves it superseded for good, never
+saying hello again; `HoldersFull` and `NotAuthorized` leave it not served, and `Invalid` malformed,
+until a new link. The most it may hold is the most reservations one sync lists within the wire's
+message bound (`hex_core::capacity::most_held`, CV8, CV9), less its survivors (the reservations its
+records list from earlier processes, whose work still runs) and its releases not yet answered: the
+ledger's `most_claims`. kiln-ci's simulator (`place::holder_tests`) drives one to three holdings
+through Hex's own keeper over records in memory (`capacity::sim::SimView`), beside Hex's boxes,
+under a nemesis that restarts the keeper, crashes runners (their work dying or outliving them),
+cuts links with what was on them, drops sessions behind live links, delays words until the keeper
+stalls and gives up starts: on each of 24 seeds the work running fits the machine and is in the
+keeper's books after every step, and once healed and settled the keeper's books of each runner, its
+own, its records and what runs are the same, no sync disagreeing.
 
 Its words to owners from before it: `Unsynced` is appended to the waiting reasons under the link
 feature `place.keeper` (docs/wire.md); to an owner whose link didn't name it a runner says `Strained`,
@@ -1173,17 +1197,14 @@ however many came.
   still passes each runner's word on to every owner (owners that hear hints, and its own kernel,
   need it), and an owner that hears tokens drops it. Cutting that fan-out needs the server to know
   which owners hear tokens from which runners.
-- A machine's keeper ("A machine's keeper"): the ledger's side is built (where it stands with the
-  keeper, the room and claims the view leaves it, a start's reserve not granted, a run that asks
-  nothing, the holder's waits); the runner's shell as the keeper's holder is not, so nothing names a
-  keeper yet. It waits on Hex's `hex_api::capacity` vendored in kiln: `Holder` driven over
-  `hex_quic::capacity::Link` on `CAPACITY_PORT`, its identity enrolled with kiln's CA by CSR and
-  named in the keeper's configuration, its epoch durable and one more at each start of its process,
-  a reserve before each run's process starts and the process started only on its grant, a release
-  once its work can no longer run, each sync listing every reservation whose work may still run, its
-  waits held by `place::keeper::Waits` (a wake-up at each stalled wait's due time), and each change
-  said to `Admission::keeper_said`, its holder's count of claims among them; and kiln-ci's simulator
-  driving that holder against Hex's `capacity::sim::SimView` under crash seeds.
+- A machine's keeper ("A machine's keeper"): the ledger's side and the holding are built (where it
+  stands with the keeper, the room and claims the view leaves it, a start's reserve not granted, a
+  run that asks nothing, the holder's waits, Hex's holder core driven, and kiln-ci's simulator
+  against Hex's `SimView`); the runner's shell is not, so nothing names a keeper yet: the holding
+  over `hex_quic::capacity::Link` on `CAPACITY_PORT`, its identity enrolled with kiln's CA by CSR
+  and named in the keeper's configuration, `TLS13_AES_256_GCM_SHA384` asserted, its epoch durable
+  and one more at each start of its process, its records written before each run's process starts,
+  and a keeper named in its configuration; and kiln-seams' capacity seam.
 
 ## GPU fit and load (W05-R03, W05-R22, W05-R23, W13-R01)
 
