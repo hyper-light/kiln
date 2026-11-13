@@ -2480,8 +2480,10 @@ impl Shard {
     /// time and own CPU time as it started (`from`) where they were read ([`Shard::slow_poll_cpu_from`],
     /// [`Shard::slow_poll_own_from`]): counted against the task's spawn site and the label its code set (kiln's goal 9, plan
     /// 01a1a87b2cec step 2), with its time on the CPU and its own where read (step 3), and as the host's when the poll was
-    /// found preempted (`host`; steps 3 and 4). One past `quantum_ns` left unread teaches the shard its site
-    /// ([`Shard::learn_cpu_site`]).
+    /// found preempted (`host`; steps 3 and 4). One left unread teaches the shard its site ([`Shard::learn_cpu_site`]): a
+    /// site is learned at its first poll past the slow table's threshold, so its first past the quantum is read (kiln's lab,
+    /// 2026-11-13: learned only past the quantum, every round's fresh server left each site's first such poll unread, and
+    /// the step-3 check counted each as past by its own time).
     #[cold]
     fn note_slow(&mut self, slot: u32, elapsed: u64, from: (Option<u64>, Option<u64>), quantum_ns: u64, host: bool) {
         let (cpu_from, own_from) = from;
@@ -2491,7 +2493,7 @@ impl Shard {
             entry.slow.note_with_cpu(entry.spawned_at(slot), self.desk.label.get(), elapsed, cpu, own, host, quantum_ns);
         }
         let unread = (THREAD_CPU_FOR_SLOW_POLLS && cpu_from.is_none()) || (OWN_CPU_FOR_SLOW_POLLS && own_from.is_none());
-        if unread && elapsed > quantum_ns {
+        if unread {
             self.learn_cpu_site(slot);
         }
     }
@@ -2500,8 +2502,9 @@ impl Shard {
     /// taken should it run slow (kiln's goal 9, plan 01a1a87b2cec step 3: the lab's check reads each listed path's polls on
     /// the CPU). Its task clock where one opened (Linux: a page read, no call; `crate::task_clock`), at every poll. With
     /// none, on macOS ([`THREAD_CPU_FOR_SLOW_POLLS`]), the thread's CPU clock, one Mach trap a reading (107 to 129 ns on
-    /// Apple silicon: too dear for every poll, `crate::attribution`'s notes), only for a task whose spawn site ran past the
-    /// quantum before ([`Shard::learn_cpu_site`]): any other poll costs the load of its record's flag. Elsewhere none.
+    /// Apple silicon: too dear for every poll, `crate::attribution`'s notes), only for a task whose spawn site held its shard
+    /// past the slow table's threshold before ([`Shard::learn_cpu_site`]): any other poll costs the load of its record's
+    /// flag. Elsewhere none.
     #[inline(always)]
     fn slow_poll_cpu_from(&self, slot: u32) -> Option<u64> {
         match self.desk.task_clock.as_ref() {
@@ -2522,8 +2525,9 @@ impl Shard {
     }
 
     /// The shard thread's own CPU time as a poll of the task in `slot` starts, nanoseconds, from which a slow poll's own is
-    /// taken (kiln's goal 9, plan 01a1a87b2cec step 3): Linux ([`OWN_CPU_FOR_SLOW_POLLS`]), for a task whose spawn site ran
-    /// past the quantum before ([`Shard::learn_cpu_site`]), its thread's CPU clock, one call a reading (`clock_gettime`). Its
+    /// taken (kiln's goal 9, plan 01a1a87b2cec step 3): Linux ([`OWN_CPU_FOR_SLOW_POLLS`]), for a task whose spawn site held
+    /// its shard past the slow table's threshold before ([`Shard::learn_cpu_site`]), its thread's CPU clock, one call a
+    /// reading (`clock_gettime`). Its
     /// task clock counts the interrupts and softirqs its CPU served while it ran, its CPU clock doesn't (the kernel's
     /// `IRQ_TIME_ACCOUNTING`): in kiln's lab (probe 22, Linux) socket writes of 230 to 820 µs on the task clock had 8 to 24 µs
     /// of their own, so polls a write held past the quantum had their own time within it. Any other poll costs the load of
@@ -2542,11 +2546,11 @@ impl Shard {
             .is_some_and(|task| task.cpu_watched)
     }
 
-    /// Learns the spawn site of the task in `slot`, whose poll ran past the quantum with its time on the CPU unread, so
-    /// the polls of every task spawned there read it from their next on (kiln's goal 9, plan 01a1a87b2cec step 3): those
-    /// live now, this one among them, and those installed later ([`Shard::install_slot`]). So a site's first poll past the
-    /// quantum goes unread, and a site whose polls never ran past it costs no reading. A simulated shard learns none: its
-    /// clock is not the thread's.
+    /// Learns the spawn site of the task in `slot`, whose poll held its shard past the slow table's threshold with its time
+    /// on the CPU (or its own) unread, so the polls of every task spawned there read it from their next on (kiln's goal 9,
+    /// plan 01a1a87b2cec step 3): those live now, this one among them, and those installed later ([`Shard::install_slot`]).
+    /// So a site's first slow poll goes unread, and a site whose polls never held their shard that long costs no reading.
+    /// A simulated shard learns none: its clock is not the thread's.
     #[cold]
     fn learn_cpu_site(&mut self, slot: u32) {
         let Some(entry) = self.desk.entry else {
@@ -2886,14 +2890,15 @@ fn count_long_poll(counters: &LiveCounters, attributed: Attribution) {
 
 /// Whether a shard with no task clock reads its thread's CPU clock for its slow polls' time on the CPU (kiln's goal 9,
 /// plan 01a1a87b2cec step 3): on macOS, where no task clock opens and a reading is one Mach trap
-/// (`attribution::thread_cpu_now`, 107 to 129 ns on Apple silicon), for the polls of tasks whose spawn sites ran past the
-/// quantum before ([`crate::slow::CpuSites`]). Not elsewhere: Linux reads its task clock (a page, no call) at every poll as
-/// before, and a Linux whose perf event is refused, Windows and Miri read none.
+/// (`attribution::thread_cpu_now`, 107 to 129 ns on Apple silicon), for the polls of tasks whose spawn sites held their
+/// shard past the slow table's threshold before ([`crate::slow::CpuSites`]). Not elsewhere: Linux reads its task clock (a
+/// page, no call) at every poll as before, and a Linux whose perf event is refused, Windows and Miri read none.
 pub(crate) const THREAD_CPU_FOR_SLOW_POLLS: bool = cfg!(all(target_os = "macos", not(miri)));
 
 /// Whether a shard reads its thread's CPU clock for its slow polls' own time beside its task clock's (kiln's goal 9, plan
 /// 01a1a87b2cec step 3): on Linux, where the task clock counts the interrupts and softirqs the thread's CPU served while it
-/// ran and the thread's CPU clock doesn't, for the polls of tasks whose spawn sites ran past the quantum before
+/// ran and the thread's CPU clock doesn't, for the polls of tasks whose spawn sites held their shard past the slow table's
+/// threshold before
 /// ([`crate::slow::CpuSites`]): a reading is a call (`clock_gettime`). Not under Miri.
 pub(crate) const OWN_CPU_FOR_SLOW_POLLS: bool = cfg!(all(target_os = "linux", not(miri)));
 
