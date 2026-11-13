@@ -424,13 +424,18 @@ JSON-RPC as `kiln reach mcp` does. So the runner serves the same server over tha
 | the same | `cargo clippy --locked -p kiln -p kiln-ci --all-targets -- -D warnings` | `large_enum_variant` on `Conn`: its in-process request is boxed now |
 | the same Mac, at 444f15ef0 (both fixed, the tests asking what a lone node answers itself) | the same test | 93 passed, 0 failed |
 | the same | the same clippy | passed (2 min 35 s) |
+| the same Mac, at a54be7987 (merged with kiln main 8c1595f26, part 4) | the same test | 95 passed, 0 failed |
+| the same | the same clippy | passed |
+| the same Mac, at 5dfa3d24b (merged with kiln main 9d2bd5707: step 17's re-vendor, Hex 025aae6d and Shards 1389dc0b6, and step 35's tests, none of them in part 3b's files) | the same test | 95 passed, 0 failed, 4461 filtered out, among them both `reach::mcp::lane_tests` |
+| the same | the same clippy | passed (3 min 46 s; a dependency's warnings only) |
 
 Windows' build, clippy and tests of these (`reach::mcp` is built there now) are CI's on main.
 
 Owed:
 - Each `Execs::mcp(member)` connection handed to `serve_lane` on a thread of its own, at step 17's
   launch (`sandbox::microvm()`).
-- Kiln's vendor/shards at or after Shards e1995061f, with shards-remote linked (its owner's).
+- Kiln's vendor/shards at or after Shards e1995061f, with shards-remote linked (its owner's). Step 17's
+  re-vendor (kiln ba75aa819) pins Shards 1389dc0b6, from before it: its shards-remote has no `Execs::mcp`.
 - Real-VM MCP round trips on Linux, macOS and Windows hosts (ROOT's).
 
 ## Part 4: each built-in names exactly the provider hosts its vendor documents
