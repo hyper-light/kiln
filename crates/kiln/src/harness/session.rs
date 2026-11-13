@@ -1675,7 +1675,7 @@ pub fn turn_open(status: Status, was: bool) -> bool {
     match status {
         Status::Running | Status::Waiting => true,
         Status::Idle => false,
-        Status::Starting | Status::Exited | Status::Disconnected => was,
+        Status::Starting | Status::Exited | Status::Disconnected | Status::Crashed => was,
     }
 }
 

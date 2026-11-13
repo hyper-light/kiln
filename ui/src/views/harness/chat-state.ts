@@ -11,6 +11,8 @@ export function chatStand(a: ChatInfo, stateHasWork = false, subagents = subagen
   if (a.approvals.length > 0 || a.status === "waiting" || a.held) return "needs";
   if (a.status === "exited") return a.exit?.again_at != null ? "working" : a.exit?.error ? "crashed" : "ended";
   if (a.status === "disconnected") return "offline";
+  // Its harness gone while its machine is up: never offline, resumed in place.
+  if (a.status === "crashed") return "crashed";
   if (a.frozen != null || (a.pause && a.status !== "running")) return "paused";
   if (a.status === "running" || a.status === "starting" || a.queued > 0 || a.room_wait != null || subagents > 0) return "working";
   return idleWorkFinished(a, stateHasWork) ? "finished" : "ready";
@@ -48,6 +50,7 @@ export function turnSignal(status: Status, conn: string, state: State | null, in
       if (status === "idle" && activity.queued > 0) return { tone: "active", label: "Message queued" };
       return { tone: "active", label: status === "idle" && subs > 0 ? `Working · ${subs} subagent${subs === 1 ? "" : "s"}` : "Working" };
     case "crashed":
+      return { tone: "stopped", label: status === "crashed" ? "Crashed" : "Stopped" };
     case "ended":
       return { tone: "stopped", label: "Stopped" };
     case "offline":

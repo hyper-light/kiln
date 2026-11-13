@@ -236,6 +236,27 @@ machine holds as many agents at work as it may, it starts again once there's roo
 A runner that starts again (an upgrade, a crash, the system stopping it) starts each of its agents
 again the same way, from its record (above).
 
+### Crashed agents
+
+An agent reads **offline** only when its machine is: the computer is off, or its runner can't reach
+kiln. One whose harness is gone while its machine is up reads **crashed** (stand `crashed`, status
+`crashed`), its `exit.error` saying why. kiln knows one so when the runner process that held it
+ended and the one its machine runs now doesn't hold it (a blue/green upgrade whose new build didn't
+take it: Amphora, 2026-11-12 21:12:49Z). A blue/green hand-over never leaves one so itself: a
+session the new build refuses with its process running goes again as its record alone, which the
+new build starts again from; refused even so, it stays with the old runner, which retires only
+once it holds none.
+
+A crashed agent is resumed in place (`agents.resume`, `POST /api/harness/sessions/:id/resume`, its
+page's **Resume**): a fresh harness process on its own machine, under its own id, from the server's
+copy of its conversation, so its plans and goal stack stay its own, and each of its subagents that
+crashed with it is resumed with it, still its child (one that ended or errored stays so). Never
+beside a process of it: only a crashed agent is resumed so, and no runner holds a crashed one. How
+its conversation goes on is its harness's: Claude Code resumes its own transcript; Codex goes on in
+a thread of its conversation's items; ACP agents, Antigravity and the other harnesses kiln keeps no
+record of are given the conversation in words with their first message (`harness/moving.rs`), which
+its timeline says.
+
 **Not on Windows yet** (owed, Windows parity: kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, 2026-11-12).
 W20's native hand-over moves a native session between kiln processes with its descriptors passed
 over Unix sockets (`SCM_RIGHTS`), so these exist on Linux and macOS alone, their callers Unix's
@@ -813,6 +834,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
 | `agents.interrupt` | `POST /api/harness/agents/:id/interrupt` | → `{interrupted}` |
+| `agents.resume` | `POST /api/harness/sessions/:id/resume` | → `{resumed, subagents: [id]}`: a crashed agent (stand `crashed`) goes on in place, under its id ("Crashed agents", below) |
 | `agents.stop` | `POST /api/harness/agents/:id/stop` | `{children?}` → `{ended: [id]}`: with `children`, what it started (and theirs) end first |
 | `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, ready?, trunk?, fix_checks?, threads?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version; `draft` opens it a draft on every host, `ready` marks its draft ready, and `threads` names the threads a new version fixes ("Change requests from agents", below) |
 | `agents.changes` | `GET /api/harness/changes` | `agent?` → `{changes: [Change]}`, newest first |
