@@ -30,8 +30,9 @@
 //!   `HEX_GUEST_COST_EVIDENCE`;
 //! - `HEX_IMAGE_CPU_MILLI` and `HEX_IMAGE_MEMORY_BYTES`: the workload each VM is admitted for, which the guest
 //!   cost sizes (`Allocation::vm_size`);
-//! - `HEX_IMAGE_WORK`: a directory of this run's own, made here; `HEX_IMAGE_WAIT_MS`: the run's explicit deadline,
-//!   for the node's start and the whole suite; `HEX_WAITS_CENSUS_MAX`: the census's most lines.
+//! - `HEX_IMAGE_WORK`: a directory of this run's own, made here; `HEX_IMAGE_WAIT_MS`: the run's explicit deadline
+//!   for the whole suite (the node's start waits for the node while it lives, `image_node::Node::start`);
+//!   `HEX_WAITS_CENSUS_MAX`: the census's most lines.
 //!
 //! Run on Linux: build it with `cargo test --release --locked -p hex-cli --test image_real --no-run`, which names the
 //! test binary it built (`target/release/deps/image_real-<hash>`), then start that binary alone in the delegated
@@ -185,7 +186,7 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
         }
     };
     ShardsImage::new(&image).check().unwrap();
-    let node = Node::start(&work, boxes.as_deref(), wait);
+    let node = Node::start(&work, boxes.as_deref());
     let socket = node.socket.clone();
     let (done, verdicts) = mpsc::channel();
     std::thread::spawn(move || {

@@ -4328,6 +4328,8 @@ dependencies = [
  "sha2 0.11.1",
  "shards-abi",
  "shards-afunix",
+ "shards-dns",
+ "shards-ipc",
  "triomphe",
  "unsize",
  "windows-sys 0.61.2",
@@ -4365,6 +4367,15 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "shards-erofs",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "shards-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "shards-abi",
  "windows-sys 0.61.2",
 ]
 

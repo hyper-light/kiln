@@ -241,10 +241,29 @@ impl Endpoint {
         answer.recv().map_err(|_| Refused::Ended)
     }
 
+    /// Each peer connected now, with the suite and group its connection's TLS negotiated: what a node reports of its
+    /// links (docs/design/hex-quic.md Q12). A connection that has ended is none of them, though the driver hasn't
+    /// heard yet.
+    pub fn links(&self) -> Result<Vec<Negotiated>, Refused> {
+        let (reply, answer) = sync_channel(1);
+        self.commands.send(Command::Links { reply })?;
+        answer.recv().map_err(|_| Refused::Ended)
+    }
+
     /// `peer` holds at most `lanes` connections at once (its hello's bound): this side opens no more.
     pub fn limit(&self, peer: PeerId, lanes: u32) -> Result<(), Refused> {
         self.commands.send(Command::Limit { peer, lanes })
     }
+}
+
+/// What a connection to a peer negotiated, as this side's TLS took it ([`Endpoint::links`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Negotiated {
+    /// The peer, by the name its certificate carries, which kiln's CA bound at its enrollment (Q5).
+    pub peer: String,
+    pub suite: CipherSuite,
+    /// The key exchange group, where the handshake named one.
+    pub group: Option<NamedGroup>,
 }
 
 /// One port's accepted connections, taken apart from the endpoint ([`Endpoint::acceptor`]).

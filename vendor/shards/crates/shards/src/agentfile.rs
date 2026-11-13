@@ -45,6 +45,19 @@ pub struct Agentfile {
     /// The setup entries giving its agents and harnesses the image's environment (D59),
     /// [`members_env`]'s.
     pub image_env: Vec<Vec<u8>>,
+    /// What each agent and harness it declares reaches past the microVM by name (D236,
+    /// §4.4), as `shards_agentfile::agentfile::named_reach` reads it: what a run host holds
+    /// each member to where an orchestrator holds its members apart (D246).
+    pub named: Vec<NamedReach>,
+}
+
+/// One member's reach by name: its kind and name, and each `host:port` it reaches, as the
+/// build lists a destination or a remote MCP server (D236, §4.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedReach {
+    pub kind: shards_agentfile::agentfile::TargetKind,
+    pub name: String,
+    pub reaches: Vec<String>,
 }
 
 /// The setup entries giving the agents and harnesses of `agentfile` its image's environment
@@ -205,6 +218,14 @@ pub fn joining(run: &shards_ipc::Run, joins_granted: bool) -> Result<(), Nesting
 }
 
 impl Agentfile {
+    /// Whether it links its agents past the microVM: grants them what lies past it, or their
+    /// flows or names cross init's network namespace to eth0 (D59). Their init links them so
+    /// whatever a run keeps of those grants (its `/.agentfile.json`), through the microVM's
+    /// network, which `--network none` does not give it (D250).
+    pub fn linked_past(&self) -> bool {
+        self.domains > 0 && (self.grants.past() || self.uplink)
+    }
+
     /// Whether its agents' flows past the microVM go by IPv6 too (D99): they have IPv6, and
     /// are granted ports, remote MCP servers or destinations past it. Their run's eth0 then
     /// needs an IPv6 address, which a network without IPv6 does not give it.
@@ -272,7 +293,7 @@ impl Agentfile {
             return Err(beside::link_local(&ip.to_string()));
         }
         self.ids(&run.user, &run.group_add)?;
-        if run.network == "none" && (self.grants.past() || self.uplink) {
+        if run.network == "none" && self.linked_past() {
             return Err(
                 "cannot run without a network: the image's Agentfile grants its agents what lies past the microVM, and --network none gives the microVM none".into(),
             );
@@ -405,6 +426,21 @@ pub fn agentfile(rootfs: &std::path::Path, digest: &str) -> Result<Agentfile, St
         _ => false,
     });
     let (managed_labels, active_members) = managed_plan(&mut image, &directives).map_err(fail)?;
+    let utf8 = |b: Vec<u8>| {
+        String::from_utf8(b)
+            .map_err(|_| fail("a member's name or a name it reaches that is not UTF-8".into()))
+    };
+    let mut named = Vec::new();
+    for (kind, name, reaches) in af::named_reach(&directives) {
+        named.push(NamedReach {
+            kind,
+            name: utf8(name)?,
+            reaches: reaches
+                .into_iter()
+                .map(|(host, port)| utf8([host.as_slice(), b":", port.to_string().as_bytes()].concat()))
+                .collect::<Result<_, _>>()?,
+        });
+    }
     let agentfile = Agentfile {
         managed_labels,
         active_members,
@@ -416,6 +452,7 @@ pub fn agentfile(rootfs: &std::path::Path, digest: &str) -> Result<Agentfile, St
         receivers,
         // The image's config's, given with it (`members_env`).
         image_env: Vec::new(),
+        named,
     };
     Ok(agentfile)
 }

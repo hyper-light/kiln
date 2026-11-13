@@ -12,6 +12,7 @@ mod family;
 pub mod gpu;
 mod gpu_pool;
 pub mod held;
+pub mod hosted;
 mod image;
 mod managed;
 #[cfg(any(test, feature = "native-trusted-entry-measurement"))]
@@ -91,6 +92,10 @@ pub const ENV_CPUS: &str = "HEX_GUEST_CPUS";
 pub const ENV_MEMORY_MIB: &str = "HEX_GUEST_MEMORY_MIB";
 /// Explicit shared Venus enable; absent preserves the CPU-only guest configuration.
 pub const ENV_GPU: &str = "HEX_GUEST_GPU";
+/// The node's guest under shards-init (docs/design/node-under-shards-init.md §4): an Agentfile image of Hex's own
+/// init, pinned by digest, which Shards boots with its nesting grant. It is the other form of the guest to the kernel
+/// and initramfs above, and a node boots one form.
+pub const ENV_IMAGE: &str = "HEX_GUEST_IMAGE";
 
 impl GuestConfig {
     /// The guest named by the environment ([`GuestConfig::from_vars`] over the process's).
@@ -104,7 +109,31 @@ impl GuestConfig {
     /// guessed), and `HEX_GUEST_SHARES` (else [`shares::defaults`]). Every one missing is named in one
     /// refusal, read before anything boots, so an operator fixes them in one go. Shards refuses vCPUs or
     /// memory past the host's (its `Bounds`) when it boots.
+    ///
+    /// A guest under shards-init ([`ENV_IMAGE`]) is refused `Awaits(NestedChannel)` before anything else is read
+    /// or booted: its host would reach its node only through a lane of Shards' agent-control endpoint to the node's
+    /// sockets, which Shards doesn't give yet (docs/design/node-under-shards-init.md §5). Named beside the kernel or
+    /// the initramfs, it is refused naming both forms.
     pub fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, Refusal> {
+        if var(ENV_IMAGE).is_some() {
+            let direct: Vec<&str> = [ENV_KERNEL, ENV_INITRD]
+                .into_iter()
+                .filter(|name| var(name).is_some())
+                .collect();
+            if direct.is_empty() {
+                return Err(Refusal::Awaits {
+                    needs: hex_api::Upstream::NestedChannel,
+                });
+            }
+            return Err(Refusal::Invalid {
+                what: "the oci class's guest",
+                why: format!(
+                    "{ENV_IMAGE} and {} are both set: a node boots one form of its guest, the image under \
+                     shards-init or the kernel and initramfs",
+                    direct.join(", ")
+                ),
+            });
+        }
         let needed = [
             ENV_SHARDS_BIN,
             ENV_KERNEL,
@@ -594,8 +623,9 @@ impl GuestRuntime {
 
     /// Takes back the guest a node before this one recorded, if there is one: attached, dialed and
     /// greeted as a boot's is, its boxes then the node's. One gone or ended is forgotten, and the node boots
-    /// its own; one that runs and won't answer is stopped first, so none is left beside the next. A guest
-    /// that can't be told gone or taken back refuses the node by type, naming why, rather than boot
+    /// its own: Shards' take-back (D215, on every host) proves it by its process seen to have exited or its
+    /// pid another start's. One that runs and won't answer is stopped first, so none is left beside the next.
+    /// A guest that can't be told gone or taken back refuses the node by type, naming why, rather than boot
     /// another beside one that may run.
     fn attach_recorded(&self) -> Result<(), Refusal> {
         let Some(path) = &self.record else {
@@ -607,7 +637,16 @@ impl GuestRuntime {
         let guest: Arc<dyn shards_api::Guest> =
             match self.guests.attach(&identity, &self.cpu_spec()) {
                 Ok(guest) => guest.into(),
-                Err(shards_api::Refusal::Gone { .. } | shards_api::Refusal::Ended(_)) => {
+                Err(
+                    shards_api::Refusal::Gone { .. }
+                    | shards_api::Refusal::Ended(_)
+                    | shards_api::Refusal::Process {
+                        failure:
+                            shards_api::ProcessFailure::Exited
+                            | shards_api::ProcessFailure::DifferentStart { .. },
+                        ..
+                    },
+                ) => {
                     return held::remove(path);
                 }
                 Err(why) => return Err(refusal("taking back the node's guest", &why)),
@@ -1120,6 +1159,61 @@ impl Runtime for GuestRuntime {
         }
     }
 
+    /// Joint plan step 14 (C7): an image VM's guest told its room (D241); a Shards guest VM's awaits its room call, its
+    /// guest's init having none from Hex; any other box's refused as the trait refuses it.
+    fn room(&self, id: &BoxId, room: Option<i64>) -> Result<Option<u64>, Refusal> {
+        match self.routed(id)? {
+            books::Routed::Image(record) => self.room_image(record, room),
+            books::Routed::Other(None) => Err(Refusal::NoSuchBox(id.try_clone()?)),
+            books::Routed::Other(Some(record))
+                if matches!(record.spec.class, ClassSpec::Shards(_)) =>
+            {
+                Err(Refusal::Awaits {
+                    needs: hex_api::Upstream::GuestRoom,
+                })
+            }
+            books::Routed::Other(Some(_)) => Err(Refusal::Invalid {
+                what: "room",
+                why: format!(
+                    "box {id} isn't a Shards image box: only its guest holds itself within a room"
+                ),
+            }),
+        }
+    }
+
+    /// Joint plan step 14 (C4): an image VM's vCPUs held to `rate` (D247); any other box's refused as the trait
+    /// refuses it, a Shards guest VM's CPU being its host's cap.
+    fn rate(
+        &self,
+        id: &BoxId,
+        rate: Option<std::num::NonZeroU64>,
+    ) -> Result<Option<std::num::NonZeroU64>, Refusal> {
+        match self.routed(id)? {
+            books::Routed::Image(record) => self.rate_image(record, rate),
+            books::Routed::Other(None) => Err(Refusal::NoSuchBox(id.try_clone()?)),
+            books::Routed::Other(Some(_)) => Err(Refusal::Invalid {
+                what: "rate",
+                why: format!(
+                    "box {id} isn't a Shards image box: only its VM holds its vCPUs to a rate"
+                ),
+            }),
+        }
+    }
+
+    /// Joint plan step 14 (C1): what an image VM costs its host (D241); any other box's refused as the trait refuses it.
+    fn host_use(&self, id: &BoxId) -> Result<hex_api::HostUse, Refusal> {
+        match self.routed(id)? {
+            books::Routed::Image(record) => self.host_use_image(record),
+            books::Routed::Other(None) => Err(Refusal::NoSuchBox(id.try_clone()?)),
+            books::Routed::Other(Some(_)) => Err(Refusal::Invalid {
+                what: "host_use",
+                why: format!(
+                    "box {id} runs no VM process of its own: only a Shards image VM's run host reads its cost"
+                ),
+            }),
+        }
+    }
+
     fn signal(&self, id: &BoxId, signal: Signal) -> Result<(), Refusal> {
         match self.routed(id)? {
             books::Routed::Image(record) => self.signal_image(record, signal),
@@ -1565,6 +1659,22 @@ impl<P: Runtime> Runtime for WithGuest<P> {
 
     fn member(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
         self.holder(id)?.member(id, member)
+    }
+
+    fn room(&self, id: &BoxId, room: Option<i64>) -> Result<Option<u64>, Refusal> {
+        self.holder(id)?.room(id, room)
+    }
+
+    fn rate(
+        &self,
+        id: &BoxId,
+        rate: Option<std::num::NonZeroU64>,
+    ) -> Result<Option<std::num::NonZeroU64>, Refusal> {
+        self.holder(id)?.rate(id, rate)
+    }
+
+    fn host_use(&self, id: &BoxId) -> Result<hex_api::HostUse, Refusal> {
+        self.holder(id)?.host_use(id)
     }
 
     fn inspect(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {

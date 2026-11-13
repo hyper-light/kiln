@@ -292,6 +292,42 @@ fn inputs(request: &wire::Request, members: &[wire::MemberInfo]) -> Result<Vec<u
     Ok(inputs)
 }
 
+/// The members whose stdio the request asks to be a terminal of their own (plan step 6,
+/// D244), by their declared index: each one of the image's that runs a program, each asked
+/// once, refused by name otherwise.
+fn terminals(request: &wire::Request, members: &[wire::MemberInfo]) -> Result<Vec<u32>, No> {
+    let mut terminals = Vec::new();
+    for m in request.members.iter().filter(|m| m.terminal) {
+        let info = members
+            .iter()
+            .find(|i| i.kind == m.kind && i.name == m.name)
+            .ok_or_else(|| {
+                No(
+                    Cause::Image,
+                    format!("{:?} {}: the image declares no such member", m.kind, m.name),
+                )
+            })?;
+        if !info.runs {
+            return Err(No(
+                Cause::Image,
+                format!(
+                    "{:?} {}: files alone, which run nothing to have a terminal",
+                    m.kind, m.name
+                ),
+            ));
+        }
+        if terminals.contains(&info.index) {
+            return Err(No(
+                Cause::Request,
+                format!("{:?} {}: its terminal asked for twice", m.kind, m.name),
+            ));
+        }
+        terminals.push(info.index);
+    }
+    terminals.sort_unstable();
+    Ok(terminals)
+}
+
 /// What of `granted` the orchestrator keeps: all of it, or each it names, each one
 /// `granted` holds as written; any other is a widening, refused by name.
 fn kept(what: &str, granted: &[Vec<u8>], keep: &wire::Keep) -> Result<Vec<Vec<u8>>, No> {
@@ -348,6 +384,156 @@ fn egress(
         }
     }
     Ok(Some(shards_net::encode_policy(&ports, &named, dns)))
+}
+
+/// The run's credential grants for its network process (D242), by reference and never a
+/// value: each toward one host at least, and each host one its egress grants reach (D236),
+/// as a grant that could never be filled is refused, not kept silently; the network process
+/// checks them again as it takes them (D109). None where the run has none.
+fn credentials(grants: &[wire::CredentialGrant], egress: Option<&[u8]>) -> Result<Option<Vec<u8>>, No> {
+    if grants.is_empty() {
+        return Ok(None);
+    }
+    let (ports, named, _) = egress.and_then(shards_net::decode_policy).unwrap_or_default();
+    let mut held = Vec::with_capacity(grants.len());
+    for g in grants {
+        if g.toward.is_empty() {
+            return Err(No(
+                Cause::Request,
+                format!(
+                    "credential {}: a grant toward no host could never be filled",
+                    g.reference
+                ),
+            ));
+        }
+        if let Some(host) = g.toward.iter().find(|h| !shards_net::reaches(&ports, &named, h)) {
+            return Err(No(
+                Cause::Request,
+                format!(
+                    "credential {} toward {host}: none of the run's egress grants reaches it (D236), so it could never be filled",
+                    g.reference
+                ),
+            ));
+        }
+        held.push(shards_net::Grant {
+            reference: g.reference.clone(),
+            toward: g.toward.clone(),
+        });
+    }
+    shards_net::encode_grants(&held).map(Some).ok_or_else(|| {
+        No(
+            Cause::Request,
+            "the run's credential grants: a reference past 65535 bytes, or a host past 255".into(),
+        )
+    })
+}
+
+/// Each member held to its reach of the names kept, where the request holds its members
+/// apart (`Narrowing::members`, version 12, D246). A member reaches each destination and
+/// remote MCP server kept that it reaches by name (`Agentfile::named`): its init lets it out
+/// on their ports alone, the network process holds the whole microVM to the names kept
+/// (D236), and `held` makes the members that reach a port by name reach it alike. So a run
+/// in which a member the image declares would reach other than the request lets it (one the
+/// request names in no entry: nothing) is refused before it starts, a widening of what was
+/// asked; as is an entry for a member the image declares not, or a member's second entry.
+fn held_apart(
+    agentfile: Option<&crate::agentfile::Agentfile>,
+    narrowing: &wire::Narrowing,
+) -> Result<(), No> {
+    use shards_agentfile::agentfile::TargetKind;
+    let Some(asked) = &narrowing.members else {
+        return Ok(());
+    };
+    let none = crate::agentfile::Agentfile::default();
+    let a = agentfile.unwrap_or(&none);
+    let mut names = kept("destination", &a.grants.destinations, &narrowing.destinations)?;
+    names.extend(kept("remote MCP server", &a.grants.mcp, &narrowing.mcp)?);
+    let kind_of = |k: TargetKind| match k {
+        TargetKind::Agent => wire::MemberKind::Agent,
+        TargetKind::Harness => wire::MemberKind::Harness,
+    };
+    for (i, m) in asked.iter().enumerate() {
+        if !a
+            .named
+            .iter()
+            .any(|n| kind_of(n.kind) == m.kind && n.name == m.name)
+        {
+            return Err(No(
+                Cause::Image,
+                format!("{:?} {}: the image declares no such member", m.kind, m.name),
+            ));
+        }
+        if asked.iter().take(i).any(|o| o.kind == m.kind && o.name == m.name) {
+            return Err(No(
+                Cause::Request,
+                format!("{:?} {}: its reach is named twice", m.kind, m.name),
+            ));
+        }
+    }
+    let said = |list: &[&str]| {
+        if list.is_empty() {
+            "nothing".to_string()
+        } else {
+            list.join(", ")
+        }
+    };
+    for n in &a.named {
+        let mut reach: Vec<&str> = n
+            .reaches
+            .iter()
+            .map(String::as_str)
+            .filter(|r| names.iter().any(|k| k.as_slice() == r.as_bytes()))
+            .collect();
+        reach.sort_unstable();
+        reach.dedup();
+        let mut lets: Vec<&str> = asked
+            .iter()
+            .find(|m| m.kind == kind_of(n.kind) && m.name == n.name)
+            .map(|m| m.destinations.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        lets.sort_unstable();
+        lets.dedup();
+        if reach != lets {
+            let word = match n.kind {
+                TargetKind::Agent => "agent",
+                TargetKind::Harness => "harness",
+            };
+            return Err(No(
+                Cause::Widening,
+                format!(
+                    "{word} {}: of the names kept it would reach {}, where the request lets it reach {} (D246)",
+                    n.name,
+                    said(&reach),
+                    said(&lets)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The run's network and its network process's policy (D231, D250): the image's grants as the
+/// request narrows them ([`egress`]), each member held apart where asked ([`held_apart`]),
+/// and a bridge where the request keeps anything past the microVM or the image links its
+/// members past it (`Agentfile::linked_past`), whatever is kept. Their init links them to
+/// eth0 as their image grants (its `/.agentfile.json`, which no narrowing reaches), and the
+/// network process holds the microVM to what is kept, nothing where nothing is (no policy
+/// told: its `Policy::DenyAll`). Then the run refused what of it would reach the image's
+/// domains ([`crate::agentfile::Agentfile::refuse`]).
+fn network(
+    agentfile: Option<&crate::agentfile::Agentfile>,
+    request: &wire::Request,
+    run: &mut shards_ipc::Run,
+) -> Result<Option<Vec<u8>>, No> {
+    let egress = egress(agentfile.map(|a| &a.grants), &request.egress)?;
+    held_apart(agentfile, &request.egress)?;
+    if egress.is_some() || agentfile.is_some_and(crate::agentfile::Agentfile::linked_past) {
+        run.network = "bridge".into();
+    }
+    if let Some(a) = agentfile {
+        a.refuse(run).map_err(no(Cause::Request))?;
+    }
+    Ok(egress)
 }
 
 /// Refuses a published port that would widen the run: one the image's Agentfile declares
@@ -467,6 +653,57 @@ fn run_request(spec: &shards_abi::run::Spec, published: bool) -> Vec<u8> {
     payload
 }
 
+/// What its VM said it holds a run's vCPUs to (`RATED`'s answer, D247), as asked with
+/// `rate`: the rate it was asked where it holds them, nothing where it lets them be. A VM
+/// holds what it is told or nothing, so any other word is a broken one, never a hold.
+fn rated_of(rate: Option<std::num::NonZeroU64>, said: &str) -> Result<Option<std::num::NonZeroU64>, String> {
+    if said.is_empty() {
+        return Ok(None);
+    }
+    match (said.parse::<std::num::NonZeroU64>(), rate) {
+        (Ok(held), Some(asked)) if held == asked => Ok(Some(held)),
+        (Ok(held), _) => Err(format!(
+            "its VM held its vCPUs to {held} milli-CPU, asked {rate:?}"
+        )),
+        (Err(_), _) => Err(format!("its VM held its vCPUs to {said:?}, no rate")),
+    }
+}
+
+/// What init said it held a run within past what it uses (`builtin::ROOM`'s answer, D241),
+/// as asked with `room`: a decimal where it was told one, nothing where it was told none.
+fn held_of(room: Option<i64>, out: &[u8]) -> Result<Option<u64>, String> {
+    match (room, std::str::from_utf8(out).map(str::trim)) {
+        (None, Ok("")) => Ok(None),
+        (Some(_), Ok(n)) => n
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| format!("its init held it within {n:?}, no number of bytes")),
+        (None, Ok(n)) => Err(format!("its init held it within {n:?} with no budget")),
+        (_, Err(_)) => Err("its init's answer is no text".into()),
+    }
+}
+
+/// How a run ended, from its VM's link (D249): why the link failed, else its `DONE`. That is
+/// the command's status and, where the command never started (its guest said no `STARTED`),
+/// why not, read as the daemon reads them (warm.rs `finish`, daemon.rs `run_ended`). Such a
+/// run failed, in its VM's words: the status alone, the code dockerd gives a run whose
+/// command never started, would read as the command's own exit.
+fn run_end(failed: Option<String>, done: Option<&[u8]>, started: bool) -> wire::RunEnd {
+    if let Some(why) = failed {
+        return wire::RunEnd::Failed(why);
+    }
+    match done.and_then(<[u8]>::split_first) {
+        Some((status, said)) if !started && !said.is_empty() => wire::RunEnd::Failed(format!(
+            "its command never started (status {status}): {}",
+            String::from_utf8_lossy(said)
+        )),
+        Some((status, _)) => wire::RunEnd::Exited(u32::from(*status)),
+        None => wire::RunEnd::Failed(
+            "the VM ended without its run's end; its last words are on this host's stderr".into(),
+        ),
+    }
+}
+
 mod hosted {
     use std::collections::HashMap;
     use std::ffi::{OsStr, OsString};
@@ -498,6 +735,9 @@ mod hosted {
         members: Vec<wire::MemberInfo>,
         listeners: Vec<publish::Listener>,
         egress: Option<Vec<u8>>,
+        /// Its credential grants as its network process takes them (`NET_CREDENTIALS`), where
+        /// it has any.
+        credentials: Option<Vec<u8>>,
         dirs: Vec<(OwnedFd, bool, OsString)>,
         /// The anonymous volumes its `VOLUME`s made, removed as it ends (`--rm`'s).
         made: Vec<String>,
@@ -525,8 +765,9 @@ mod hosted {
     }
 
     /// The request as `shards run` would have asked it of a daemon: the image, its own
-    /// command or none, its published ports, its shares as `-v`, a network only where
-    /// something goes past the microVM, and the nesting grant as `--security-opt
+    /// command or none, its published ports, its shares as `-v`, a network where a port is
+    /// published (`super::network` gives one where more needs it), and the nesting grant as
+    /// `--security-opt
     /// nesting=true` asks for it (D234), with `ready_by`, its deadline as an instant
     /// (`super::deadline`).
     pub(super) fn as_run(request: &wire::Request, ready_by: Option<u64>) -> shards_ipc::Run {
@@ -619,14 +860,10 @@ mod hosted {
         let members = super::members_of(&labels, &active);
         let staged = super::staged(request, &members)?;
         let inputs = super::inputs(request, &members)?;
+        let terminals = super::terminals(request, &members)?;
         super::ports_granted(&request.publish, agentfile.as_ref(), request.command.is_some())?;
-        let egress = super::egress(agentfile.as_ref().map(|a| &a.grants), &request.egress)?;
-        if egress.is_some() {
-            run.network = "bridge".into();
-        }
-        if let Some(a) = &agentfile {
-            a.refuse(&run).map_err(no(Cause::Request))?;
-        }
+        let egress = super::network(agentfile.as_ref(), request, &mut run)?;
+        let credentials = super::credentials(&request.credentials, egress.as_deref())?;
         let nesting = super::nesting(agentfile.as_ref(), &run, &say)?;
         let bridge = if run.network == "bridge" {
             Some(
@@ -737,6 +974,7 @@ mod hosted {
             Some((count, active.clone()))
         };
         setup.extend(staged);
+        setup.extend(terminals.iter().map(|&m| protocol::members::terminal(m)));
         setup.push(protocol::members::ENDS.to_vec());
         prepared.spec.setup = setup;
         prepared.spec.cgroup = crate::resources::cgroup(&run.resources, prepared.cpus)
@@ -760,6 +998,7 @@ mod hosted {
             members,
             listeners: bound.listeners,
             egress,
+            credentials,
             dirs: opened.dirs,
             made,
             bridge,
@@ -794,6 +1033,9 @@ mod hosted {
         door: Stream,
         #[cfg(windows)]
         ends: Vec<OwnedFd>,
+        /// The pipe it tells what its host changes on (D235), until its guest's NOTICE
+        /// built-in is given it.
+        notices: Option<OwnedFd>,
     }
 
     impl Shares {
@@ -809,7 +1051,9 @@ mod hosted {
                 door,
                 #[cfg(windows)]
                 ends,
+                notices,
             } = self;
+            drop(notices);
             #[cfg(unix)]
             drop(door);
             #[cfg(windows)]
@@ -885,8 +1129,14 @@ mod hosted {
         let (net, side) = match &plan.bridge {
             Some(bridge) => {
                 let mac = shards_net::random_mac().map_err(|e| boot(format!("a guest's MAC: {e}")))?;
-                let (child, side) =
-                    crate::netproc::start(shards_net::Policy::DenyAll, &mac, bridge, None).map_err(boot)?;
+                let (child, side) = crate::netproc::start(
+                    shards_net::Policy::DenyAll,
+                    &mac,
+                    bridge,
+                    None,
+                    plan.credentials.is_some(),
+                )
+                .map_err(boot)?;
                 (Some((child, mac)), Some(side))
             }
             None => (None, None),
@@ -894,7 +1144,7 @@ mod hosted {
         let shares = if plan.dirs.is_empty() {
             None
         } else {
-            Some(start_shares(home, &plan.dirs).map_err(boot)?)
+            Some(start_shares(home, &plan.dirs, Some(&run_tags(plan.dirs.len()))).map_err(boot)?)
         };
         let (ours, theirs) = Stream::pair().map_err(|e| boot(format!("the VM's link: {e}")))?;
         let grants = if cfg!(target_os = "macos") {
@@ -998,8 +1248,13 @@ mod hosted {
         let network = match &plan.bridge {
             Some(bridge) => {
                 let mac = shards_net::random_mac().map_err(|e| boot(format!("a guest's MAC: {e}")))?;
-                let (ready, side) =
-                    crate::netproc::prepare(shards_net::Policy::DenyAll, &mac, bridge).map_err(boot)?;
+                let (ready, side) = crate::netproc::prepare(
+                    shards_net::Policy::DenyAll,
+                    &mac,
+                    bridge,
+                    plan.credentials.is_some(),
+                )
+                .map_err(boot)?;
                 Some((mac, ready, side))
             }
             None => None,
@@ -1007,7 +1262,7 @@ mod hosted {
         let shares = if plan.dirs.is_empty() {
             None
         } else {
-            Some(start_shares(home, &plan.dirs, &job).map_err(boot)?)
+            Some(start_shares(home, &plan.dirs, &job, Some(&run_tags(plan.dirs.len()))).map_err(boot)?)
         };
         let (ours, theirs) = Stream::pair().map_err(|e| boot(format!("the VM's link: {e}")))?;
         // Its end, the VM's alone once given it: this process's copy goes, so that the
@@ -1133,10 +1388,23 @@ mod hosted {
     /// the home's private directory after them. The VM's end of its connection goes with
     /// the run, which hands the VM each share's stream (`SHARE_ENDS`).
     #[cfg(unix)]
-    fn start_shares(home: &Path, dirs: &[(OwnedFd, bool, OsString)]) -> Result<Shares, String> {
+    fn start_shares(
+        home: &Path,
+        dirs: &[(OwnedFd, bool, OsString)],
+        tags: Option<&[String]>,
+    ) -> Result<Shares, String> {
         let exe = std::env::current_exe().map_err(|e| format!("this binary: {e}"))?;
         let (door, share) = Stream::pair().map_err(|e| format!("the share process's connection: {e}"))?;
         let mut args: Vec<&OsStr> = vec![OsStr::new("share")];
+        // Its notices of what its host changes (D235), on a pipe past its others.
+        let told = tags.filter(|t| t.len() == dirs.len()).map(|t| t.join(","));
+        let notices = match &told {
+            Some(told) => {
+                args.extend([OsStr::new(crate::share::NOTICES), OsStr::new(told)]);
+                Some(io::pipe().map_err(|e| format!("its notices' pipe: {e}"))?)
+            }
+            None => None,
+        };
         for (_, read_only, only) in dirs {
             args.push(OsStr::new(if *read_only { "ro" } else { "rw" }));
             args.push(only.as_os_str());
@@ -1149,9 +1417,22 @@ mod hosted {
             fds.push((dir.as_fd(), number(4usize.saturating_add(i))?));
         }
         fds.push((ghosts.as_fd(), number(4usize.saturating_add(dirs.len()))?));
+        if let Some((_, w)) = &notices {
+            fds.push((w.as_fd(), number(5usize.saturating_add(dirs.len()))?));
+        }
         let child = shards_ipc::spawn_in(&exe, &args, &fds, false, &[])
             .map_err(|e| format!("starting the share process: {e}"))?;
-        Ok(Shares { child, door })
+        Ok(Shares {
+            child,
+            door,
+            notices: notices.map(|(r, _)| OwnedFd::from(r)),
+        })
+    }
+
+    /// The tags of a run's `n` shares, as its VM names their devices (vm::Config,
+    /// `shards{i}`).
+    fn run_tags(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("shards{i}")).collect()
     }
 
     /// [`start_shares`] on Windows (D197), as a direct boot's (cli/shares.rs `served`): each
@@ -1165,6 +1446,7 @@ mod hosted {
         home: &Path,
         dirs: &[(OwnedFd, bool, OsString)],
         job: &shards_ipc::GroupJob,
+        tags: Option<&[String]>,
     ) -> Result<Shares, String> {
         let exe = std::env::current_exe().map_err(|e| format!("this binary: {e}"))?;
         let streams = dirs
@@ -1173,6 +1455,15 @@ mod hosted {
             .collect::<io::Result<Vec<_>>>()
             .map_err(|e| format!("a share's stream: {e}"))?;
         let mut args: Vec<&OsStr> = vec![OsStr::new("share")];
+        // Its notices of what its host changes (D235), on a pipe past its others.
+        let told = tags.filter(|t| t.len() == dirs.len()).map(|t| t.join(","));
+        let notices = match &told {
+            Some(told) => {
+                args.extend([OsStr::new(crate::share::NOTICES), OsStr::new(told)]);
+                Some(io::pipe().map_err(|e| format!("its notices' pipe: {e}"))?)
+            }
+            None => None,
+        };
         for (_, read_only, only) in dirs {
             args.push(OsStr::new(if *read_only { "ro" } else { "rw" }));
             args.push(only.as_os_str());
@@ -1192,6 +1483,9 @@ mod hosted {
                 number(5usize.saturating_add(n).saturating_add(i))?,
             ));
         }
+        if let Some((_, w)) = &notices {
+            fds.push((w.as_fd(), number(5usize.saturating_add(n.saturating_mul(2)))?));
+        }
         let env = crate::netproc::child_env();
         let child =
             shards_ipc::spawn_detached(Some(job), &exe, &args, &fds, &crate::netproc::env_pairs(&env))
@@ -1199,6 +1493,7 @@ mod hosted {
         Ok(Shares {
             child,
             ends: streams.into_iter().map(|(_, vm)| vm).collect(),
+            notices: notices.map(|(r, _)| OwnedFd::from(r)),
         })
     }
 
@@ -1209,7 +1504,8 @@ mod hosted {
         net: &crate::netproc::Control,
         listeners: &[publish::Listener],
         egress: Option<&[u8]>,
-    ) -> Result<(), String> {
+        credentials: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, String> {
         let mut asked = Vec::new();
         for batch in listeners.chunks(shards_ipc::MAX_FDS) {
             let ports: Vec<u8> = batch
@@ -1237,7 +1533,19 @@ mod hosted {
                 Err(e) => return Err(format!("{what}: the network process: {e}")),
             }
         }
-        Ok(())
+        // The run's credential grants (D242), once its policy is taken, which the network
+        // process checks them against: answered with the run's CA's certificate, made for
+        // their hosts alone.
+        let Some(grants) = credentials else {
+            return Ok(None);
+        };
+        crate::netproc::send(net, kind::NET_CREDENTIALS, grants, &[])
+            .map_err(|e| format!("credential grants: {e}"))?;
+        match crate::netproc::recv(net) {
+            Ok(Some(m)) if m.kind == kind::NET_CREDENTIALS && !m.payload.is_empty() => Ok(Some(m.payload)),
+            Ok(_) => Err("credential grants: the network process did not take them".into()),
+            Err(e) => Err(format!("credential grants: the network process: {e}")),
+        }
     }
 
     /// The run's managed output, owned here: each active member channel's credit and what
@@ -1310,8 +1618,17 @@ mod hosted {
         /// Each device step asked of the VM and not yet answered (`DEVICED`), by its number;
         /// none once the VM's link has closed, as nothing will answer one then.
         devices: Mutex<Option<Vec<Asked>>>,
+        /// Each guest time asked of the VM and not yet answered (`GUEST_TIMED`), as devices.
+        guest_times: Mutex<Option<Vec<Asked>>>,
+        /// Each rate told the VM and not yet answered (`RATED`, D247), as devices.
+        rates: Mutex<Option<Vec<Asked>>>,
         /// What is plugged into the run's members, by the path it is at.
         plugged: Mutex<HashMap<String, Plugged>>,
+        /// The pipe the run's share process tells what its host changes on (D235), until
+        /// its guest's NOTICE built-in is given it as the run starts; and the streams each
+        /// of those built-ins' ends are told on, held while the run is.
+        notices_due: Mutex<Option<OwnedFd>>,
+        notices: Mutex<Vec<Stream>>,
         /// On Windows the run's job, which each plug's share process is made in too.
         #[cfg(windows)]
         job: &'a shards_ipc::GroupJob,
@@ -1327,6 +1644,9 @@ mod hosted {
         address: String,
         member: u32,
         share: Shares,
+        /// The stream its guest's NOTICE built-in's end is told on (D235), held while it is
+        /// plugged in.
+        _told: Option<Stream>,
     }
 
     fn channel_of(c: managed::Channel) -> Channel {
@@ -1474,14 +1794,29 @@ mod hosted {
             "prepared {}, {} vCPUs, {} MiB; starting its VM",
             plan.prepared.image_id, plan.prepared.size.0, plan.prepared.size.1
         ));
-        let launched = launch(home, &plan)?;
+        let mut launched = launch(home, &plan)?;
         super::say(format_args!(
             "its VM process {} started; waiting for its guest",
             launched.vm.id()
         ));
+        // Its share process's notices (D235), given its guest as its run starts.
+        let due = launched.shares.as_mut().and_then(|s| s.notices.take());
         let served = (|| -> Result<(), No> {
             if let Some((_, control)) = &launched.net {
-                tell_net(control, &plan.listeners, plan.egress.as_deref()).map_err(boot)?;
+                let ca = tell_net(
+                    control,
+                    &plan.listeners,
+                    plan.egress.as_deref(),
+                    plan.credentials.as_deref(),
+                )
+                .map_err(boot)?;
+                if let Some(der) = &ca {
+                    let digest = <sha2::Sha256 as sha2::Digest>::digest(der);
+                    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                    super::say(format_args!(
+                        "its credential grants taken; its CA's SHA-256 {hex}"
+                    ));
+                }
             }
             let (client, client_theirs) =
                 handed_pair().map_err(|e| boot(format!("the run's client: {e}")))?;
@@ -1533,7 +1868,11 @@ mod hosted {
                 members: &plan.members,
                 roots: &plan.roots,
                 devices: Mutex::new(Some(Vec::new())),
+                guest_times: Mutex::new(Some(Vec::new())),
+                rates: Mutex::new(Some(Vec::new())),
                 plugged: Mutex::new(HashMap::new()),
+                notices_due: Mutex::new(due),
+                notices: Mutex::new(Vec::new()),
                 #[cfg(windows)]
                 job: &launched.job,
             };
@@ -1647,9 +1986,10 @@ mod hosted {
 
     /// Reads the VM's link until it closes: each member's end and the command's readiness
     /// to the orchestrator as they come (`super::relayed`), each exec's client end let go of
-    /// as the VM takes it, the run's status from its `DONE`.
+    /// as the VM takes it, the run's end from its `DONE` (`super::run_end`).
     fn follow(live: &Live<'_>, link: &Stream) -> RunEnd {
-        let mut status = None;
+        let mut done = None;
+        let mut started = false;
         let failed = loop {
             let m = match shards_ipc::recv(link) {
                 Ok(Some(m)) => m,
@@ -1657,7 +1997,18 @@ mod hosted {
                 Err(e) => break Some(format!("the VM's link: {e}")),
             };
             if m.kind == kind::DONE {
-                status = m.payload.first().copied();
+                done = Some(m.payload);
+            } else if m.kind == kind::STARTED {
+                started = true;
+                // Its guest told what its host changes in its shares from now on (D235).
+                if let Some(pipe) = lock(&live.notices_due).take() {
+                    match notice_exec(live, pipe) {
+                        Ok(told) => lock(&live.notices).push(told),
+                        Err(e) => {
+                            super::say(format_args!("its guest is told none of its shares' changes: {e}"))
+                        }
+                    }
+                }
             } else if m.kind == kind::EXEC_TAKEN {
                 if let Some(number) = m.payload.first_chunk::<8>()
                     && let Some(held) = lock(&live.held).as_mut()
@@ -1665,7 +2016,11 @@ mod hosted {
                     held.remove(&u64::from_be_bytes(*number));
                 }
             } else if m.kind == kind::DEVICED {
-                answered_device(live, &m.payload);
+                answered(&live.devices, &m.payload);
+            } else if m.kind == kind::GUEST_TIMED {
+                answered(&live.guest_times, &m.payload);
+            } else if m.kind == kind::RATED {
+                answered(&live.rates, &m.payload);
             } else if m.kind == kind::MANAGED_INPUT {
                 input_arrived(live, &m.payload, m.fds);
             } else if m.kind == kind::MANAGED_INPUT_ENDED {
@@ -1677,22 +2032,17 @@ mod hosted {
         // No VM takes an exec now: their clients' ends go, and each waiting for its exit
         // hears its end.
         lock(&live.held).take();
-        // Device steps no answer will come for: their askers hear the VM has gone.
+        // Device steps and guest times no answer will come for: their askers hear the VM has
+        // gone.
         *lock(&live.devices) = None;
+        *lock(&live.guest_times) = None;
+        *lock(&live.rates) = None;
         // Its VM gone: no input goes on.
         let members: Vec<u32> = lock(&live.feeds).keys().copied().collect();
         for member in members {
             end_input(live, member);
         }
-        if let Some(why) = failed {
-            return RunEnd::Failed(why);
-        }
-        match status {
-            Some(s) => RunEnd::Exited(u32::from(s)),
-            None => RunEnd::Failed(
-                "the VM ended without its run's end; its last words are on this host's stderr".into(),
-            ),
-        }
+        super::run_end(failed, done.as_deref(), started)
     }
 
     /// The orchestrator's asks, until its channel closes: credit, stats, stop. A channel
@@ -1740,13 +2090,53 @@ mod hosted {
                     let Ok(ask) = wire::StatsAsk::decode(&payload) else {
                         break;
                     };
+                    let vm = vm.id();
                     let asked = std::thread::Builder::new()
                         .name("api-run stats".into())
-                        .spawn_scoped(scope, move || stats(live, ask));
+                        .spawn_scoped(scope, move || stats(live, ask, vm));
                     if asked.is_err()
                         && let Ok(answer) = wire::StatsAnswer::encode(ask.id, Err("no thread to ask it on"))
                     {
                         let _ = live.answers.send(wire::to_client::STATS, &[&answer]);
+                    }
+                }
+                // On a thread of its own, as stats: a guest slow to hold its run holds up
+                // nothing else.
+                wire::to_host::ROOM => {
+                    let Ok(ask) = wire::RoomAsk::decode(&payload) else {
+                        break;
+                    };
+                    let asked = std::thread::Builder::new()
+                        .name("api-run room".into())
+                        .spawn_scoped(scope, move || held(live, ask.id, room(live, ask.room)));
+                    if asked.is_err() {
+                        held(live, ask.id, Err("no thread to ask it on".into()));
+                    }
+                }
+                // On a thread of its own, as a room: a VM slow to answer holds up nothing
+                // else.
+                wire::to_host::RATE => {
+                    let Ok(ask) = wire::RateAsk::decode(&payload) else {
+                        break;
+                    };
+                    let asked = std::thread::Builder::new()
+                        .name("api-run rate".into())
+                        .spawn_scoped(scope, move || rated(live, ask.id, rate(live, ask.rate)));
+                    if asked.is_err() {
+                        rated(live, ask.id, Err("no thread to ask it on".into()));
+                    }
+                }
+                // On a thread of its own, as a room: a guest slow to size a member's terminal
+                // holds up nothing else (D244).
+                wire::to_host::RESIZE => {
+                    let Ok(ask) = wire::ResizeAsk::decode(&payload) else {
+                        break;
+                    };
+                    let asked = std::thread::Builder::new()
+                        .name("api-run resize".into())
+                        .spawn_scoped(scope, move || resized(live, ask.id, resize(live, ask)));
+                    if asked.is_err() {
+                        resized(live, ask.id, Err("no thread to ask it on".into()));
                     }
                 }
                 // On a thread of its own, as stats: a plug's guest steps hold up nothing else.
@@ -2068,12 +2458,25 @@ mod hosted {
     }
 
     /// Answers `ask` with init's `STATS` of its scope, through an exec on the VM's link as
-    /// a health check's exec is sent (daemon/health.rs `send_exec`), on a thread of its own.
-    fn stats(live: &Live<'_>, ask: wire::StatsAsk) {
-        let answer = |result: Result<&[u8], &str>| {
+    /// a health check's exec is sent (daemon/health.rs `send_exec`), on a thread of its own;
+    /// for the run's, beside it what its microVM costs its host (D43's `microvm`, D241): its
+    /// vCPUs' guest time, then its VM process `vm`'s use, which holds that time, so that the
+    /// later read is never the less.
+    fn stats(live: &Live<'_>, ask: wire::StatsAsk, vm: u32) {
+        let answer = |result: Result<(&[u8], Option<&wire::Microvm>), &str>| {
             if let Ok(payload) = wire::StatsAnswer::encode(ask.id, result) {
                 let _ = live.answers.send(wire::to_client::STATS, &[&payload]);
             }
+        };
+        let microvm = || wire::Microvm {
+            guest: guest_times(live),
+            host: shards_vmm::platform::process_usage(vm)
+                .map(|u| wire::HostUse {
+                    cpu_ns: u.cpu_ns,
+                    resident_bytes: u.resident,
+                    footprint_bytes: u.footprint,
+                })
+                .map_err(|e| format!("its VM process: {e}")),
         };
         let args: Vec<Vec<u8>> = match ask.scope {
             wire::StatsScope::Command => Vec::new(),
@@ -2086,9 +2489,71 @@ mod hosted {
         match builtin(live, protocol::builtin::STATS, args) {
             Ok(Said {
                 status: Some(0), out, ..
-            }) => answer(Ok(&out)),
+            }) => {
+                let microvm = matches!(ask.scope, wire::StatsScope::Run).then(microvm);
+                answer(Ok((&out, microvm.as_ref())))
+            }
             Ok(Said { err, .. }) => answer(Err(String::from_utf8_lossy(&err).trim_end())),
             Err(e) => answer(Err(&e)),
+        }
+    }
+
+    /// The room its orchestrator's budget leaves the run (D241), told its init as the
+    /// daemon tells a run of its budget's (daemon/budget.rs, `builtin::ROOM`): what init
+    /// holds it within past what it uses, none where no budget holds it, or why not.
+    fn room(live: &Live<'_>, room: Option<i64>) -> Result<Option<u64>, String> {
+        let args = room.map(|r| r.to_string().into_bytes()).into_iter().collect();
+        match builtin(live, protocol::builtin::ROOM, args)? {
+            Said {
+                status: Some(0), out, ..
+            } => super::held_of(room, &out),
+            Said { err, .. } => Err(String::from_utf8_lossy(&err).trim_end().to_string()),
+        }
+    }
+
+    /// The CPU rate its orchestrator holds the run's vCPUs to (D247), told its VM as the
+    /// daemon tells a run's its CPUs (`CPUS`, D191) but answered (`RATED`): what the VM
+    /// holds them to, none where it lets them be, or why not.
+    fn rate(
+        live: &Live<'_>,
+        rate: Option<std::num::NonZeroU64>,
+    ) -> Result<Option<std::num::NonZeroU64>, String> {
+        let milli = rate.map_or(0, std::num::NonZeroU64::get);
+        let said = ask_vm(live, &live.rates, kind::RATE, &milli.to_be_bytes(), &[])?;
+        super::rated_of(rate, &said)
+    }
+
+    /// A rate's outcome, told its orchestrator (`RATED`).
+    fn rated(live: &Live<'_>, id: u32, result: Result<Option<std::num::NonZeroU64>, String>) {
+        if let Ok(payload) = (wire::RateAnswer { id, result }).encode() {
+            let _ = live.answers.send(wire::to_client::RATED, &[&payload]);
+        }
+    }
+
+    /// A room's outcome, told its orchestrator (`HELD`).
+    fn held(live: &Live<'_>, id: u32, result: Result<Option<u64>, String>) {
+        if let Ok(payload) = (wire::RoomAnswer { id, result }).encode() {
+            let _ = live.answers.send(wire::to_client::HELD, &[&payload]);
+        }
+    }
+
+    /// A member's own terminal sized (plan step 6, D244), as its init's `RESIZE` built-in
+    /// sizes it; refused in its init's words.
+    fn resize(live: &Live<'_>, ask: wire::ResizeAsk) -> Result<(), String> {
+        let size = protocol::Size {
+            rows: ask.rows,
+            cols: ask.cols,
+        };
+        let args = protocol::members::resize_args(ask.member, size);
+        match builtin(live, protocol::builtin::RESIZE, args)? {
+            Said { status: Some(0), .. } => Ok(()),
+            Said { err, .. } => Err(String::from_utf8_lossy(&err).trim_end().to_string()),
+        }
+    }
+
+    fn resized(live: &Live<'_>, id: u32, result: Result<(), String>) {
+        if let Ok(payload) = (wire::ResizeAnswer { id, result }).encode() {
+            let _ = live.answers.send(wire::to_client::RESIZED, &[&payload]);
         }
     }
 
@@ -2149,6 +2614,38 @@ mod hosted {
             out: said,
             err: why,
         })
+    }
+
+    /// Starts the guest's NOTICE built-in (D235): its stdin `pipe`, on which a share
+    /// process tells what its host changes, its output this process's stderr; the stream
+    /// its end is told on, to be held while it runs.
+    fn notice_exec(live: &Live<'_>, pipe: OwnedFd) -> Result<Stream, String> {
+        let spec = protocol::Spec {
+            builtin: protocol::builtin::NOTICE,
+            ..Default::default()
+        };
+        let (client, theirs) = Stream::pair().map_err(|e| e.to_string())?;
+        let number = live.next_exec.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut payload = number.to_be_bytes().to_vec();
+        payload.push(shards_ipc::EXEC_INTERACTIVE);
+        spec.encode_into(&mut payload);
+        let handed = shards_ipc::handed(&theirs).map_err(|e| e.to_string())?;
+        let err = io::stderr();
+        let fds = [handed.as_fd(), pipe.as_fd(), err.as_fd(), err.as_fd()];
+        // Held until the VM says it has it; none once its link has closed.
+        match lock(&live.held).as_mut() {
+            Some(held) => {
+                held.insert(number, theirs.try_clone().map_err(|e| e.to_string())?);
+            }
+            None => return Err("the run has ended".into()),
+        }
+        if let Err(e) = shards_ipc::send(&lock(&live.link), kind::EXEC_RUN, &payload, &fds) {
+            if let Some(held) = lock(&live.held).as_mut() {
+                held.remove(&number);
+            }
+            return Err(e.to_string());
+        }
+        Ok(client)
     }
 
     /// A plug's or an unplug's outcome, told its orchestrator (`PLUGGED`).
@@ -2220,15 +2717,16 @@ mod hosted {
             return Err((R::Host, format!("{}: not a directory", ask.host)));
         }
         let dirs = [(OwnedFd::from(dir), ask.read_only, OsString::new())];
-        #[cfg(unix)]
-        let share = start_shares(live.home, &dirs).map_err(|e| (R::Host, e))?;
-        #[cfg(windows)]
-        let share = start_shares(live.home, &dirs, live.job).map_err(|e| (R::Host, e))?;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let tag = format!(
             "shards-plug{}",
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
+        let tags = [tag.clone()];
+        #[cfg(unix)]
+        let mut share = start_shares(live.home, &dirs, Some(&tags)).map_err(|e| (R::Host, e))?;
+        #[cfg(windows)]
+        let mut share = start_shares(live.home, &dirs, live.job, Some(&tags)).map_err(|e| (R::Host, e))?;
         let step = [&[shards_ipc::device::SHARE][..], tag.as_bytes()].concat();
         // On Unix its connection, which the share process sends and holds until it is
         // taken (M24); on Windows its stream itself, a duplex pipe made here (D197).
@@ -2271,6 +2769,17 @@ mod hosted {
             share.end();
             return Err((R::Device, e));
         }
+        // Its guest told what its host changes beneath it from now on (D235).
+        let told = share.notices.take().and_then(|pipe| {
+            notice_exec(live, pipe)
+                .map_err(|e| {
+                    super::say(format_args!(
+                        "{}: its guest is told none of its changes: {e}",
+                        ask.at
+                    ))
+                })
+                .ok()
+        });
         lock(&live.plugged).insert(
             ask.at.clone(),
             Plugged {
@@ -2278,6 +2787,7 @@ mod hosted {
                 address,
                 member: ask.member,
                 share,
+                _told: told,
             },
         );
         Ok(())
@@ -2329,15 +2839,47 @@ mod hosted {
     /// Asks the VM device step `step` (`DEVICE`), with `fds`, and waits for its answer
     /// (`DEVICED`), as the daemon asks one (daemon/devices.rs `ask_device`).
     fn ask_device(live: &Live<'_>, step: &[u8], fds: &[BorrowedFd<'_>]) -> Result<String, String> {
+        ask_vm(live, &live.devices, kind::DEVICE, step, fds)
+    }
+
+    /// What each of the VM's vCPUs has run of its guest (`GUEST_TIME`, answered
+    /// `GUEST_TIMED`), as the daemon asks it (daemon/commands.rs `guest_times_of`).
+    fn guest_times(live: &Live<'_>) -> Result<wire::GuestTimes, String> {
+        let said = ask_vm(live, &live.guest_times, kind::GUEST_TIME, &[], &[])?;
+        let times = shards_vmm::vm::GuestTimes::decode(&said)
+            .ok_or_else(|| format!("its microVM's guest time is none: {said:?}"))?;
+        Ok(wire::GuestTimes {
+            departed_ns: times.departed_ns,
+            vcpus: times
+                .vcpus
+                .into_iter()
+                .map(|v| wire::VcpuTime {
+                    index: v.index,
+                    guest_ns: v.guest_ns,
+                    unread: v.unread,
+                })
+                .collect(),
+        })
+    }
+
+    /// Asks the VM `which` with `step` after its number, and `fds`, and waits for its answer
+    /// by that number (`answered`), which comes as long as its link is open.
+    fn ask_vm(
+        live: &Live<'_>,
+        asks: &Mutex<Option<Vec<Asked>>>,
+        which: u8,
+        step: &[u8],
+        fds: &[BorrowedFd<'_>],
+    ) -> Result<String, String> {
         let number = live.next_exec.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (told, answer) = std::sync::mpsc::channel();
-        match lock(&live.devices).as_mut() {
+        match lock(asks).as_mut() {
             Some(asked) => asked.push((number, told)),
             None => return Err("its microVM stopped".into()),
         }
         let ask = [&number.to_be_bytes()[..], step].concat();
-        if let Err(e) = shards_ipc::send(&lock(&live.link), kind::DEVICE, &ask, fds) {
-            if let Some(asked) = lock(&live.devices).as_mut() {
+        if let Err(e) = shards_ipc::send(&lock(&live.link), which, &ask, fds) {
+            if let Some(asked) = lock(asks).as_mut() {
                 asked.retain(|(n, _)| *n != number);
             }
             return Err(format!("asking its microVM: {e}"));
@@ -2348,14 +2890,15 @@ mod hosted {
             .map_err(|e| format!("its microVM: {e}"))
     }
 
-    /// The VM's answer to the device step its payload numbers (`DEVICED`), to its asker.
-    fn answered_device(live: &Live<'_>, payload: &[u8]) {
+    /// The VM's answer to the ask its payload numbers (`DEVICED`, `GUEST_TIMED`): its number,
+    /// then 0 and what it said, or anything else and why not; to its asker in `asks`.
+    fn answered(asks: &Mutex<Option<Vec<Asked>>>, payload: &[u8]) {
         let Some((number, said)) = payload.split_first_chunk::<8>() else {
             return;
         };
         let number = u64::from_be_bytes(*number);
-        let mut devices = lock(&live.devices);
-        let Some(asked) = devices.as_mut() else {
+        let mut asks = lock(asks);
+        let Some(asked) = asks.as_mut() else {
             return;
         };
         if let Some(i) = asked.iter().position(|(n, _)| *n == number) {
@@ -2376,6 +2919,83 @@ mod tests {
 
     fn members() -> Vec<wire::MemberInfo> {
         members_of(&["agent helper".into(), "harness codex".into()], &[1])
+    }
+
+    /// Do end a run whose guest said `STARTED` with a `DONE` of a status alone; one whose
+    /// guest never did with a status and the words of a command that never started (warm.rs
+    /// `finish`); one that started with such words; one after a broken link; and one with no
+    /// `DONE`. Expect: the status as the run's exit; a failure saying the command never
+    /// started, its status and the VM's words, never that status as an exit; the status, as
+    /// the daemon keeps a started command's (daemon.rs `run_ended`); the link's failure; a
+    /// failure.
+    #[test]
+    fn a_command_that_never_started_ends_its_run_failed_saying_why() {
+        assert_eq!(run_end(None, Some(&[3]), true), wire::RunEnd::Exited(3));
+        assert_eq!(run_end(None, Some(&[0]), true), wire::RunEnd::Exited(0));
+        let never = b"\x80exec: \"/bin/sh\": operation not permitted";
+        assert_eq!(run_end(None, Some(never), true), wire::RunEnd::Exited(128));
+        match run_end(None, Some(never), false) {
+            wire::RunEnd::Failed(why) => assert_eq!(
+                why,
+                "its command never started (status 128): exec: \"/bin/sh\": operation not permitted"
+            ),
+            other => panic!("a command that never started ended its run as {other:?}"),
+        }
+        assert_eq!(
+            run_end(Some("the VM's link: reset".into()), Some(&[3]), true),
+            wire::RunEnd::Failed("the VM's link: reset".into())
+        );
+        assert!(matches!(run_end(None, None, false), wire::RunEnd::Failed(_)));
+    }
+
+    /// A run that keeps nothing past the microVM of what the image grants its members has
+    /// the network their links need all the same (their init links each member granted
+    /// anything past the microVM through eth0, D59, D250), and its network process lets
+    /// nothing past (no policy told: `Policy::DenyAll`). Do: narrow an image whose harness is
+    /// granted egress and DNS to nothing, as Hex's image class asks by default (kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 12); keep it whole; and run an image that
+    /// grants nothing. Expect: the first on a bridge with no policy, never refused "cannot
+    /// run without a network"; the second on a bridge with the image's policy; the third on
+    /// none.
+    #[test]
+    fn a_run_keeping_nothing_past_the_microvm_has_its_members_network_and_no_policy() {
+        let granted = crate::agentfile::Agentfile {
+            domains: 2,
+            uplink: true,
+            grants: shards_agentfile::agentfile::Grants {
+                egress: vec![b"443/tcp".to_vec()],
+                dns: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut nothing = request(Vec::new());
+        nothing.egress = wire::Narrowing {
+            egress: wire::Keep::Only(Vec::new()),
+            mcp: wire::Keep::Only(Vec::new()),
+            destinations: wire::Keep::Only(Vec::new()),
+            dns: false,
+            members: None,
+        };
+        let mut run = hosted::as_run(&nothing, None);
+        let policy = network(Some(&granted), &nothing, &mut run);
+        assert!(
+            matches!(&policy, Ok(None)),
+            "{}",
+            policy.err().map(|No(_, why)| why).unwrap_or_default()
+        );
+        assert_eq!(run.network, "bridge");
+        let whole = request(Vec::new());
+        let mut run = hosted::as_run(&whole, None);
+        assert!(matches!(network(Some(&granted), &whole, &mut run), Ok(Some(_))));
+        assert_eq!(run.network, "bridge");
+        let plain = crate::agentfile::Agentfile {
+            domains: 2,
+            ..Default::default()
+        };
+        let mut run = hosted::as_run(&whole, None);
+        assert!(matches!(network(Some(&plain), &whole, &mut run), Ok(None)));
+        assert_eq!(run.network, "none");
     }
 
     /// Labels become members by their declared index; only an active one runs.
@@ -2405,6 +3025,7 @@ mod tests {
             shares: Vec::new(),
             nesting: false,
             ready_by: None,
+            credentials: Vec::new(),
         }
     }
 
@@ -2420,6 +3041,51 @@ mod tests {
             }],
             workdir: Some("/Users/ada/proj".into()),
             input: false,
+            terminal: false,
+        }
+    }
+
+    /// A terminal of its own (D244) goes to a member the image runs, by its index, each
+    /// asked once; one the image does not declare, one of files alone, or one asked twice
+    /// is refused by name, and none asked is none.
+    #[test]
+    fn a_terminal_is_a_running_members_once() {
+        let with_terminal = |kind, name: &str| wire::MemberStage {
+            terminal: true,
+            ..stage(kind, name)
+        };
+        assert!(matches!(
+            terminals(&request(vec![stage(wire::MemberKind::Harness, "codex")]), &members()),
+            Ok(none) if none.is_empty()
+        ));
+        assert!(matches!(
+            terminals(
+                &request(vec![with_terminal(wire::MemberKind::Harness, "codex")]),
+                &members()
+            ),
+            Ok(asked) if asked == [1]
+        ));
+        for (asked, cause) in [
+            (
+                vec![with_terminal(wire::MemberKind::Harness, "nosuch")],
+                Cause::Image,
+            ),
+            (
+                vec![with_terminal(wire::MemberKind::Agent, "helper")],
+                Cause::Image,
+            ),
+            (
+                vec![
+                    with_terminal(wire::MemberKind::Harness, "codex"),
+                    with_terminal(wire::MemberKind::Harness, "codex"),
+                ],
+                Cause::Request,
+            ),
+        ] {
+            assert!(
+                matches!(terminals(&request(asked.clone()), &members()), Err(No(c, _)) if c == cause),
+                "{asked:?}"
+            );
         }
     }
 
@@ -2496,6 +3162,7 @@ mod tests {
             mcp: wire::Keep::Only(Vec::new()),
             destinations: wire::Keep::Only(vec!["host.docker.internal:7070".into()]),
             dns: false,
+            members: None,
         };
         let one = egress(Some(&grants), &narrowed).ok().unwrap().unwrap();
         assert_ne!(Some(one.clone()), all);
@@ -2508,6 +3175,7 @@ mod tests {
             mcp: wire::Keep::Only(Vec::new()),
             destinations: wire::Keep::Only(Vec::new()),
             dns: false,
+            members: None,
         };
         assert_eq!(egress(Some(&grants), &none).ok().unwrap(), None);
         // A destination the image does not grant, of another port or host: a widening.
@@ -2536,6 +3204,174 @@ mod tests {
             ..wire::Narrowing::default()
         };
         assert!(matches!(egress(None, &asked), Err(No(Cause::Widening, _))));
+    }
+
+    /// The run's credential grants reach its network process by reference alone, each
+    /// toward a host its egress grants reach (D242, D236); a grant toward a host past them,
+    /// or toward none, could never be filled and is refused before anything starts, and a
+    /// run with none sends none (R10: each refusal's test fails without it).
+    #[test]
+    fn credential_grants_reach_the_network_process_by_reference() {
+        let grant = |reference: &str, toward: &[&str]| wire::CredentialGrant {
+            reference: reference.into(),
+            toward: toward.iter().map(|h| (*h).to_string()).collect(),
+        };
+        let named = shards_net::encode_policy(
+            &shards_net::Ports::default(),
+            &[("api.anthropic.com".into(), 443)],
+            false,
+        );
+        assert_eq!(credentials(&[], Some(&named)).ok().unwrap(), None);
+        let sent = credentials(
+            &[grant("anthropic/claude-max", &["api.anthropic.com"])],
+            Some(&named),
+        )
+        .ok()
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            shards_net::decode_grants(&sent),
+            Some(vec![shards_net::Grant {
+                reference: "anthropic/claude-max".into(),
+                toward: vec!["api.anthropic.com".into()],
+            }])
+        );
+        for refused in [
+            credentials(&[grant("openai/chatgpt", &["chatgpt.com"])], Some(&named)),
+            credentials(&[grant("anthropic/claude-max", &[])], Some(&named)),
+            credentials(&[grant("anthropic/claude-max", &["api.anthropic.com"])], None),
+        ] {
+            assert!(matches!(refused, Err(No(Cause::Request, _))));
+        }
+        // A TCP port granted reaches every host on it.
+        let any443 = shards_net::encode_policy(&shards_net::Ports::parse("443/tcp").unwrap(), &[], false);
+        assert!(credentials(&[grant("openai/chatgpt", &["chatgpt.com"])], Some(&any443)).is_ok());
+    }
+
+    /// Each member held to its reach of the names kept (D246). Do: keep a destination that
+    /// harness codex and agent helper both reach by name, the host itself that codex alone
+    /// reaches, and a remote MCP server helper alone reaches, and hold each member to what
+    /// the request lets it reach. Expect: a request letting each reach exactly its own passes;
+    /// one letting codex alone reach the shared destination, which helper would reach too,
+    /// letting codex nothing, letting helper more than it would reach, or leaving out the MCP
+    /// server helper would reach, is refused as a widening naming the member and both
+    /// reaches; an entry for a member the image declares not is the image's refusal, a
+    /// member's second entry the request's; and a request holding no member apart, or keeping
+    /// nothing, passes.
+    #[test]
+    fn each_member_is_held_to_its_reach_of_the_names_kept() {
+        use crate::agentfile::{Agentfile, NamedReach};
+        use shards_agentfile::agentfile::TargetKind;
+        let agentfile = Agentfile {
+            grants: shards_agentfile::agentfile::Grants {
+                mcp: vec![b"mcp.example:9443".to_vec()],
+                destinations: vec![b"api.example:443".to_vec(), b"host.docker.internal:7070".to_vec()],
+                ..Default::default()
+            },
+            named: vec![
+                NamedReach {
+                    kind: TargetKind::Harness,
+                    name: "codex".into(),
+                    reaches: vec!["api.example:443".into(), "host.docker.internal:7070".into()],
+                },
+                NamedReach {
+                    kind: TargetKind::Agent,
+                    name: "helper".into(),
+                    reaches: vec!["api.example:443".into(), "mcp.example:9443".into()],
+                },
+            ],
+            ..Agentfile::default()
+        };
+        let reach = |kind, name: &str, destinations: &[&str]| wire::MemberReach {
+            kind,
+            name: name.into(),
+            destinations: destinations.iter().map(|d| (*d).to_string()).collect(),
+        };
+        let held = |members: Option<Vec<wire::MemberReach>>| wire::Narrowing {
+            egress: wire::Keep::Only(Vec::new()),
+            mcp: wire::Keep::Only(vec!["mcp.example:9443".into()]),
+            destinations: wire::Keep::Only(vec![
+                "api.example:443".into(),
+                "host.docker.internal:7070".into(),
+            ]),
+            dns: false,
+            members,
+        };
+        let (harness, agent) = (wire::MemberKind::Harness, wire::MemberKind::Agent);
+        let codex_whole = || {
+            reach(
+                harness,
+                "codex",
+                &["host.docker.internal:7070", "api.example:443"],
+            )
+        };
+        let helper_whole = || reach(agent, "helper", &["mcp.example:9443", "api.example:443"]);
+        assert!(held_apart(Some(&agentfile), &held(Some(vec![codex_whole(), helper_whole()]))).is_ok());
+        for (members, says) in [
+            (
+                vec![codex_whole()],
+                "agent helper: of the names kept it would reach api.example:443, mcp.example:9443, \
+                 where the request lets it reach nothing",
+            ),
+            (
+                vec![reach(harness, "codex", &[]), helper_whole()],
+                "harness codex: of the names kept it would reach api.example:443, \
+                 host.docker.internal:7070, where the request lets it reach nothing",
+            ),
+            (
+                vec![
+                    codex_whole(),
+                    reach(
+                        agent,
+                        "helper",
+                        &["api.example:443", "host.docker.internal:7070", "mcp.example:9443"],
+                    ),
+                ],
+                "agent helper: of the names kept it would reach api.example:443, mcp.example:9443, \
+                 where the request lets it reach api.example:443, host.docker.internal:7070, mcp.example:9443",
+            ),
+            (
+                vec![codex_whole(), reach(agent, "helper", &["api.example:443"])],
+                "agent helper: of the names kept it would reach api.example:443, mcp.example:9443, \
+                 where the request lets it reach api.example:443",
+            ),
+        ] {
+            match held_apart(Some(&agentfile), &held(Some(members))) {
+                Err(No(Cause::Widening, why)) => assert_eq!(why, format!("{says} (D246)")),
+                other => panic!("{says}: {:?}", other.map_err(|No(c, w)| (c, w))),
+            }
+        }
+        assert!(matches!(
+            held_apart(Some(&agentfile), &held(Some(vec![reach(harness, "nobody", &[])]))),
+            Err(No(Cause::Image, _))
+        ));
+        assert!(matches!(
+            held_apart(
+                Some(&agentfile),
+                &held(Some(vec![codex_whole(), helper_whole(), helper_whole()]))
+            ),
+            Err(No(Cause::Request, _))
+        ));
+        assert!(held_apart(Some(&agentfile), &held(None)).is_ok());
+        let nothing_kept = wire::Narrowing {
+            mcp: wire::Keep::Only(Vec::new()),
+            destinations: wire::Keep::Only(Vec::new()),
+            ..held(Some(Vec::new()))
+        };
+        assert!(held_apart(Some(&agentfile), &nothing_kept).is_ok());
+        // An image with no Agentfile declares no member to hold: none named passes, any
+        // named is the image's refusal.
+        let bare = wire::Narrowing {
+            mcp: wire::Keep::Only(Vec::new()),
+            destinations: wire::Keep::Only(Vec::new()),
+            ..held(Some(Vec::new()))
+        };
+        assert!(held_apart(None, &bare).is_ok());
+        let named = wire::Narrowing {
+            members: Some(vec![codex_whole()]),
+            ..bare
+        };
+        assert!(matches!(held_apart(None, &named), Err(No(Cause::Image, _))));
     }
 
     /// The run's request is one a warm VM takes: its log keeps something by the VM's own
@@ -2852,6 +3688,50 @@ mod tests {
         );
         for other in [kind::READY, kind::PROCESS, kind::DONE] {
             assert_eq!(relayed(other, &[1; 9]), None);
+        }
+    }
+
+    /// What its VM says it holds a run's vCPUs to reads as it was asked (D247): the rate it
+    /// was asked where it holds them, nothing where it lets them be; another rate, no rate
+    /// or a word that is no number is a broken word from its VM, never a hold.
+    #[test]
+    fn a_rates_answer_reads_as_it_was_asked() {
+        let rate = std::num::NonZeroU64::new;
+        assert_eq!(rated_of(rate(1500), "1500"), Ok(rate(1500)));
+        assert_eq!(
+            rated_of(rate(4000), ""),
+            Ok(None),
+            "every vCPU's whole CPU: no hold"
+        );
+        assert_eq!(rated_of(None, ""), Ok(None));
+        for (asked, said) in [
+            (rate(1500), "1000"),
+            (None, "1500"),
+            (rate(1500), "0"),
+            (rate(1500), "-1500"),
+            (rate(1500), "1500 milli"),
+            (rate(1500), " 1500"),
+        ] {
+            assert!(rated_of(asked, said).is_err(), "{asked:?} {said:?}");
+        }
+    }
+
+    /// What init says it held a run within reads as it was asked (D241): a number where it
+    /// was told a room, nothing where it was told none; anything else is a broken word from
+    /// its init, never a hold.
+    #[test]
+    fn a_rooms_answer_reads_as_it_was_asked() {
+        assert_eq!(held_of(Some(64 << 20), b"67108864"), Ok(Some(64 << 20)));
+        assert_eq!(held_of(Some(-1), b"3407872\n"), Ok(Some(3_407_872)));
+        assert_eq!(held_of(None, b""), Ok(None));
+        for (room, said) in [
+            (Some(1), &b""[..]),
+            (Some(1), b"-5"),
+            (Some(1), b"5 bytes"),
+            (None, b"5"),
+            (Some(1), &[0xff]),
+        ] {
+            assert!(held_of(room, said).is_err(), "{room:?} {said:?}");
         }
     }
 }

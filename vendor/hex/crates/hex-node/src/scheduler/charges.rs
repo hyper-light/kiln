@@ -66,6 +66,7 @@ pub(super) fn apply(local: &mut NodeSpec, learned: &[(Class, Learned)]) -> Resul
             *slot = Some(Prior {
                 profile: cost.id,
                 booking: prior.booking,
+                ceiling,
             });
         }
     }

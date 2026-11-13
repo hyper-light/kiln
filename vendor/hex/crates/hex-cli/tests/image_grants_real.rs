@@ -7,10 +7,13 @@
 //!
 //! - **A destination its image grants not refuses the boot.** The probe granted a name its image doesn't grant is made,
 //!   and its start refused `Invalid`, past the image's grants: Shards' run host refused it before anything started.
-//! - **No grant, no network.** A VM granted nothing runs a command, in its image's own shell, that ends 0 only where
-//!   `lo` is its one interface: with no NIC, no name is answered and no packet leaves. A VM of its members alone
-//!   granted nothing runs with no network process (Shards' `shards-net`, one per networked microVM, D36), and no
-//!   process of its run holds a listening TCP or UDP socket.
+//! - **No grant, nothing past the microVM.** A VM of its members alone granted nothing, its probe driven by this test
+//!   (`ShardsImage::members`), is asked on the probe's stdin: its provider's name and its ungranted name unresolved
+//!   (no DNS answer, T-T7.7.1) and none of its targets connected, the host's service and the image's port egress
+//!   among them; inspect shows no grant and nothing published, and the host's service took nothing. Its image links
+//!   its harness past the microVM, so its run keeps its network, whose network process (Shards' `shards-net`, D36),
+//!   told nothing kept, lets nothing past (D250): one network process, no process of its run holding a listening
+//!   TCP or UDP socket or a flow past the host's loopback.
 //! - **One publish, published alone, to its member.** A VM of its members alone is granted one publish: the probe's
 //!   port at the host's loopback, on a host port the OS picks. Inspect shows that one grant, and its one published
 //!   port at 127.0.0.1 reaching the probe at that port, as Shards names it. Its run listens there alone: at no
@@ -21,7 +24,7 @@
 //! - **Its granted destinations alone, reached.** A VM of its members alone is granted that publish and, by TCP, the
 //!   probe's provider by name and the host's service (kiln's endpoint, `host.docker.internal`): the probe says it
 //!   reached both, its ungranted name and the image's port egress nowhere, and the host's service, this test's
-//!   listener, took its connection (N4: the run host holds every member to its reach of the destinations kept).
+//!   listener, took its connection (N4: the run host holds every member to its reach of the names kept, D246).
 //! - **A publish reaching the run's own command stops it.** A VM with a command of its own is granted a publish of a
 //!   port its image gives no member, which Shards gives that command (D122): its start is refused `Invalid`, naming
 //!   the run's own command, the VM is stopped, and no run host is left.
@@ -31,13 +34,17 @@
 //! read fails it: what can't be seen isn't passed. macOS and Windows keep no /proc: there those readings are owed, and
 //! the run says so (`GRANTS-OWED`), while every check of the VM itself, its inspect and the host's service runs alike.
 //!
+//! Every wait measures as the run goes, with no deadline picked for it: each waits for its fact while its party lives
+//! (the node's ready line while the node runs, the probe's answer while its VM runs, its report on its stdout until
+//! that ends), the person's rule of 2026-11-13.
+//!
 //! Explicit inputs only, each by its own variable; a missing one fails by name. Run alone, `--ignored`: on Linux
-//! inside a cgroup delegated to this binary (`HEX_DELEGATED`); with image_real's node inputs (`SHARDS_BIN`, which
-//! must be Hex's `shards`, `scripts/shards-gpu/build.sh`'s, whose run host holds each member to its reach;
-//! `SHARDS_KERNEL` and `SHARDS_INIT`, the kernel the run hosts boot and the init beside it, which Shards takes
-//! together, the init the `shards` build carries (build.sh's `shards-init`); the node's `HEX_GUEST_*`,
-//! `HEX_IMAGE_CPU_MILLI`, `HEX_IMAGE_MEMORY_BYTES`, `HEX_IMAGE_WORK`, a short path where the node's socket lies,
-//! `HEX_IMAGE_WAIT_MS` and `HEX_WAITS_CENSUS_MAX`), and the probe's:
+//! inside a cgroup delegated to this binary (`HEX_DELEGATED`); with image_real's node inputs (`SHARDS_BIN`, Hex's
+//! `shards`, `scripts/shards-gpu/build.sh`'s at the Shards revision vendor/shards pins, whose run host speaks the image
+//! channel the node's vendored API writes; `SHARDS_KERNEL` and `SHARDS_INIT`, the kernel the run hosts boot and the
+//! init beside it, which Shards takes together, the init that same `shards` build carries (build.sh's
+//! `shards-init`); the node's `HEX_GUEST_*`, `HEX_IMAGE_CPU_MILLI`, `HEX_IMAGE_MEMORY_BYTES`, `HEX_IMAGE_WORK`, a
+//! short path where the node's socket lies, and `HEX_WAITS_CENSUS_MAX`), and the probe's:
 //! - the probe image, in the node's Shards home before the node starts: `HEX_GRANTS_CONTEXT`, the context
 //!   `scripts/grants-probe/build.sh` made, built there; or else `HEX_GRANTS_IMAGE`, `NAME@sha256:...`, pulled there;
 //! - the recipe's own inputs, as it was given them: `HEX_GRANTS_MEMBER`, `HEX_GRANTS_PORT`,
@@ -57,15 +64,14 @@
 )]
 
 use std::fs;
-use std::io::{ErrorKind, Read};
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
+use std::sync::mpsc;
 
 use hex_api::{
     Allocation, Bounds, BoxId, BoxSpec, BoxState, Class, ClassSpec, Destination, Exit, Grant,
-    Member, MemberKind, Ports, Proto, Receiver, Refusal, Runtime, ShardsImage, Signal,
+    ImageMember, Member, MemberKind, Ports, Proto, Receiver, Refusal, Runtime, ShardsImage, Signal,
 };
 use hex_client::Client;
 use hex_core::patience::Patience;
@@ -76,11 +82,10 @@ use image_node::{Node, allocation, built, input, number, pull, records, step};
 
 #[path = "image_grants_probe/probe.rs"]
 mod probe;
-use probe::{Outcome, Report};
+use probe::{Ingress, Outcome, Report};
 
-/// What this test waits for, each fact its own: no recorded operation makes either, so each measures, for its fact
-/// alone (hex_testkit::waits; the lead's rule of 2026-11-08), and the run's deadline bounds the whole.
-static PROBE_ENDED: Patience = Patience::measuring("test.hex_cli.image_grants_probe_ended");
+/// The probe's answer at a published port, which no recorded operation makes: it measures, for its fact alone
+/// (hex_testkit::waits), with no deadline, while the VM runs ([`answered_at`]).
 static MEMBER_ANSWERED: Patience = Patience::measuring("test.hex_cli.image_grants_member_answered");
 
 /// The name the probe image is tagged with where this test builds it into the node's Shards home.
@@ -373,8 +378,9 @@ mod host {
         run.iter().filter(|p| p.name == name).count()
     }
 
-    /// A VM granted nothing: its run's VM process beside its run host, no network process, and no socket that
-    /// listens or leaves the host.
+    /// A VM granted nothing whose image links its harness past the microVM: its run's VM process beside its run host,
+    /// and one network process (D250: the run keeps its network, the network process told nothing kept, so it lets
+    /// nothing past), and no socket that listens or leaves the host.
     pub fn granted_nothing(node: u32) {
         let run = run_of(node);
         assert_eq!(
@@ -384,8 +390,8 @@ mod host {
         );
         assert_eq!(
             named(&run, "shards-net"),
-            0,
-            "a network process in the run of a VM granted nothing: {run:#?}"
+            1,
+            "the run's network process (D250): {run:#?}"
         );
         let sockets = sockets_of(&run);
         let listening: Vec<&Socket> = sockets.iter().filter(|s| s.listens()).collect();
@@ -515,7 +521,9 @@ mod host {
     }
 
     pub fn granted_nothing(_: u32) {
-        owed("a VM granted nothing: no network process, no listening socket");
+        owed(
+            "a VM granted nothing: its one network process, no listening socket, no flow past the host's loopback",
+        );
     }
 
     pub fn listens_alone(_: u32, at: SocketAddr, ungranted: u16) {
@@ -581,56 +589,144 @@ fn a_destination_its_image_grants_not_refuses_the_boot(
     client.delete(&id).unwrap();
 }
 
-/// Joint plan step 15, T-T7.7.1: do run a VM granted nothing whose command, in its image's own shell, ends 0 only where
-/// `lo` is its one interface; expect it to end 0. Do run one of its members alone granted nothing; expect its run to
-/// hold no network process and no listening socket, the VM process found beside its run host.
-fn no_grant_no_network(client: &Client, node: u32, probe: &Probe, allocation: Allocation) {
-    let only_lo = r#"set -- /sys/class/net/*; [ "$#" -eq 1 ] && [ "$1" = /sys/class/net/lo ]"#;
-    let command = vec!["/bin/sh".to_owned(), "-c".to_owned(), only_lo.to_owned()];
-    let none = image_box(
-        "grants-none-probe",
-        &probe.image,
-        allocation,
-        Some(command),
-        Vec::new(),
-    );
-    let id = none.id.clone();
-    client.create(none).unwrap();
-    client.start(&id).unwrap();
-    let mut ended = None;
-    let looks = hex_testkit::waits::until(&PROBE_ENDED, &format!("{id} ended"), || {
-        let info = client.inspect(&id).unwrap();
-        let done = info.state == BoxState::Empty;
-        ended = Some(info);
-        done
-    })
-    .unwrap();
-    let ended = ended.unwrap();
-    eprintln!(
-        "GRANTS-CHECK-2 {id} ended {:?} after {looks} looks, granted {:?}",
-        ended.exit, ended.grants
-    );
-    assert!(ended.grants.is_empty() && ended.published.is_empty());
-    assert_eq!(
-        ended.exit,
-        Some(Exit::Code(0)),
-        "a VM granted nothing has an interface other than lo, or no /sys/class/net"
-    );
-    client.delete(&id).unwrap();
+/// The probe's report, asked on its stdin, as its caller drives it (`ShardsImage::members`): one line written, its
+/// answer read from its stdout up to the empty line that ends it. The read waits for the probe's answer with no
+/// deadline of its own; a probe that ends first ends its stdout, which refuses the read.
+fn asked_on_stdin(client: &Client, id: &BoxId, probe: &Probe) -> Report {
+    let mut member = client.member(id, &probe.member).unwrap();
+    let given = member.streams().unwrap();
+    let mut stdin = hex_api::OwnedStream::from(given.stdin.unwrap());
+    let stdout = hex_api::OwnedStream::from(given.stdout.unwrap());
+    stdin.write_all(b"\n").unwrap();
+    let mut text = String::new();
+    for line in BufReader::new(stdout).lines() {
+        let line = line.unwrap();
+        if line.is_empty() {
+            return Report::parse(&text).unwrap();
+        }
+        text.push_str(&line);
+        text.push('\n');
+    }
+    panic!("the probe's stdout ended before its report's end: {text:?}");
+}
 
-    let held = image_box(
-        "grants-none-held",
-        &probe.image,
-        allocation,
-        None,
-        Vec::new(),
-    );
-    let id = held.id.clone();
-    client.create(held).unwrap();
+/// Joint plan step 15, T-T7.7.1 (N4, D250): do run a VM of its members alone granted nothing, its probe driven by this
+/// test, while this test listens on the host's loopback at the service port the image grants as
+/// `host.docker.internal`, and ask the probe on its stdin. Expect: inspect shows no grant and nothing published; on
+/// Linux its run holds its VM process and one network process (D250: its image links its harness past the microVM,
+/// so the run keeps its network, whose network process, told nothing kept, lets nothing past), no listening socket and
+/// no flow past the host's loopback; the probe says it was asked on its stdin, its provider's name and its ungranted
+/// name unresolved (no DNS answer), and none of its targets connected (no packet past the microVM: the host's service
+/// by the name its image grants it, and the image's port egress, among them); and the host's service took nothing.
+fn no_grant_lets_nothing_past(client: &Client, node: u32, probe: &Probe, allocation: Allocation) {
+    let service = TcpListener::bind((Ipv4Addr::LOCALHOST, probe.host_port)).unwrap();
+    service.set_nonblocking(true).unwrap();
+    let mut spec = image_box("grants-none", &probe.image, allocation, None, Vec::new());
+    if let ClassSpec::ShardsImage(image) = &mut spec.class {
+        image.members = vec![ImageMember::new(probe.member.clone())];
+    }
+    let id = spec.id.clone();
+    client.create(spec).unwrap();
     client.start(&id).unwrap();
+    let shown = client.inspect(&id).unwrap();
+    assert!(
+        shown.grants.is_empty() && shown.published.is_empty(),
+        "{shown:?}"
+    );
     host::granted_nothing(node);
-    eprintln!("GRANTS-CHECK-2 {id}: no network process, no listening socket");
+    let report = asked_on_stdin(client, &id, probe);
+    eprintln!("GRANTS-CHECK-2 {id}: the probe said {report:?}");
+    assert_eq!(report.ingress, Ingress::Stdin);
+    assert_eq!(
+        targets_of(&report),
+        recipe_targets(probe),
+        "the probe's targets: its context isn't the recipe's of these inputs"
+    );
+    for label in ["provider", "ungranted"] {
+        assert_eq!(
+            outcome_of(&report, label),
+            Outcome::Unresolved,
+            "{label}: a DNS answer in a VM granted nothing"
+        );
+    }
+    for (target, outcome) in &report.egress {
+        assert_ne!(
+            *outcome,
+            Outcome::Connected,
+            "the probe of a VM granted nothing reached {} ({})",
+            target.at,
+            target.label
+        );
+    }
+    host::nothing_leaves(node);
+    match service.accept() {
+        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+        taken => panic!("the host's service at {}: {taken:?}", probe.host_port),
+    }
+    eprintln!("GRANTS-CHECK-2 {id}: no DNS answer, no packet past the microVM");
     stop_and_delete(client, &id);
+}
+
+/// Each target of a report, as `(label, host:port)`.
+fn targets_of(report: &Report) -> Vec<(String, String)> {
+    report
+        .egress
+        .iter()
+        .map(|(target, _)| (target.label.clone(), target.at.clone()))
+        .collect()
+}
+
+/// The targets the recipe gives the probe of these inputs, in its order (scripts/grants-probe/build.sh).
+fn recipe_targets(probe: &Probe) -> Vec<(String, String)> {
+    [
+        ("provider", format!("{}:443", probe.provider)),
+        ("ungranted", format!("{}:443", probe.ungranted)),
+        ("host", format!("host.docker.internal:{}", probe.host_port)),
+        ("open", format!("{}:80", probe.open)),
+    ]
+    .map(|(label, at)| (label.to_owned(), at))
+    .to_vec()
+}
+
+/// The outcome of the target labelled `label` in `report`.
+fn outcome_of(report: &Report, label: &str) -> Outcome {
+    report
+        .egress
+        .iter()
+        .find(|(target, _)| target.label == label)
+        .map(|(_, outcome)| outcome.clone())
+        .unwrap_or_else(|| panic!("no {label} target in {report:?}"))
+}
+
+/// The probe's answer at the published socket `at`, waited for while its VM runs: each look is one connection read to
+/// its end, which Shards closes where the probe doesn't take it yet, and a VM that ends first ends the wait, refused
+/// naming its end. It measures, with no deadline of its own (the person's rule of 2026-11-13: a wait follows its
+/// answering party while that lives); says the answer and how many looks it took.
+fn answered_at(client: &Client, id: &BoxId, at: SocketAddr) -> (String, u64) {
+    let mut answer = String::new();
+    let looks = hex_testkit::waits::until(
+        &MEMBER_ANSWERED,
+        &format!("the probe's answer at {at}"),
+        || {
+            answer.clear();
+            if TcpStream::connect(at)
+                .and_then(|mut c| c.read_to_string(&mut answer))
+                .is_ok()
+                && !answer.is_empty()
+            {
+                return true;
+            }
+            let shown = client.inspect(id).unwrap();
+            assert_eq!(
+                shown.state,
+                BoxState::Running,
+                "{id} ended before its probe answered at {at}: {shown:?}"
+            );
+            false
+        },
+    )
+    .unwrap();
+    (answer, looks)
 }
 
 /// Joint plan step 15, AC-T7.7.2: do run a VM of its members alone granted one publish, the probe's port at the host's
@@ -674,43 +770,17 @@ fn one_publish_published_alone(client: &Client, node: u32, probe: &Probe, alloca
     );
     let at = published.at;
     host::listens_alone(node, at, probe.ungranted_port);
-    // The probe answers once its program listens: each look is one connection read to its end, which Shards closes
-    // where the probe doesn't take it yet.
-    let mut answer = String::new();
-    let looks = hex_testkit::waits::until(
-        &MEMBER_ANSWERED,
-        &format!("the probe's answer at {at}"),
-        || {
-            answer.clear();
-            TcpStream::connect(at)
-                .and_then(|mut c| c.read_to_string(&mut answer))
-                .is_ok()
-                && !answer.is_empty()
-        },
-    )
-    .unwrap();
+    let (answer, looks) = answered_at(client, &id, at);
     eprintln!("GRANTS-CHECK-3 the probe said {answer:?} after {looks} looks");
     let report = Report::parse(&answer).unwrap();
-    assert_eq!(report.ingress, probe.port, "the port it came in on");
-    let (provider, ungranted, service_at, open) = (
-        format!("{}:443", probe.provider),
-        format!("{}:443", probe.ungranted),
-        format!("host.docker.internal:{}", probe.host_port),
-        format!("{}:80", probe.open),
-    );
-    let tried: Vec<(&str, &str)> = report
-        .egress
-        .iter()
-        .map(|(target, _)| (target.label.as_str(), target.at.as_str()))
-        .collect();
     assert_eq!(
-        tried,
-        [
-            ("provider", provider.as_str()),
-            ("ungranted", ungranted.as_str()),
-            ("host", service_at.as_str()),
-            ("open", open.as_str())
-        ],
+        report.ingress,
+        Ingress::Port(probe.port),
+        "the port it came in on"
+    );
+    assert_eq!(
+        targets_of(&report),
+        recipe_targets(probe),
         "the probe's targets: its context isn't the recipe's of these inputs"
     );
     for (target, outcome) in &report.egress {
@@ -780,30 +850,11 @@ fn granted_destinations_are_reached_alone(client: &Client, probe: &Probe, alloca
     };
     assert_eq!(published.receiver, Receiver::Named { port: probe.port });
     let at = published.at;
-    let mut answer = String::new();
-    let looks = hex_testkit::waits::until(
-        &MEMBER_ANSWERED,
-        &format!("the probe's answer at {at}"),
-        || {
-            answer.clear();
-            TcpStream::connect(at)
-                .and_then(|mut c| c.read_to_string(&mut answer))
-                .is_ok()
-                && !answer.is_empty()
-        },
-    )
-    .unwrap();
+    let (answer, looks) = answered_at(client, &id, at);
     eprintln!("GRANTS-CHECK-4 the probe said {answer:?} after {looks} looks");
     let report = Report::parse(&answer).unwrap();
-    assert_eq!(report.ingress, probe.port);
-    let outcome = |label: &str| {
-        report
-            .egress
-            .iter()
-            .find(|(target, _)| target.label == label)
-            .map(|(_, outcome)| outcome.clone())
-            .unwrap_or_else(|| panic!("no {label} target in {answer:?}"))
-    };
+    assert_eq!(report.ingress, Ingress::Port(probe.port));
+    let outcome = |label: &str| outcome_of(&report, label);
     assert_eq!(
         outcome("provider"),
         Outcome::Connected,
@@ -870,21 +921,14 @@ fn a_publish_reaching_the_runs_own_command_stops_it(
     client.delete(&id).unwrap();
 }
 
-/// Joint plan step 15 (the probe, no VM): do start the probe at the host's loopback with three targets, a listener of
-/// this test's, a port nothing holds and a name RFC 6761 §6.4 reserves as never resolving, then connect to it. Expect
-/// its answer to read back typed: the port it came in on, then each target in turn, connected, refused and
-/// unresolved. Each target is decided by this host at once (a listener, a closed port's reset, the resolver's
-/// answer), so the probe's wait is its largest: the test waits on those facts, never on a guess.
-#[test]
-fn the_probe_answers_each_connection_with_its_targets_outcomes() {
-    let open = TcpListener::bind("127.0.0.1:0").unwrap();
+/// The probe's arguments for three targets: a listener of this test's, a port nothing holds and a name RFC 6761 §6.4
+/// reserves as never resolving, the probe listening at the host's loopback on a port the OS picks.
+fn three_targets(open: &TcpListener) -> Vec<std::ffi::OsString> {
     let closed = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap();
-    let args: Vec<std::ffi::OsString> = [
-        "--wait-ms".to_owned(),
-        u64::MAX.to_string(),
+    [
         "--address".to_owned(),
         "127.0.0.1".to_owned(),
         "--listen".to_owned(),
@@ -897,8 +941,19 @@ fn the_probe_answers_each_connection_with_its_targets_outcomes() {
         "nowhere=nowhere.invalid:80".to_owned(),
     ]
     .map(Into::into)
-    .to_vec();
-    let started = probe::start(&args).unwrap();
+    .to_vec()
+}
+
+/// Joint plan step 15 (the probe, no VM): do start the probe at the host's loopback with three targets, a listener of
+/// this test's, a port nothing holds and a name RFC 6761 §6.4 reserves as never resolving, then connect to it. Expect
+/// its answer to read back typed: the port it came in on, then each target in turn, connected, refused and
+/// unresolved. Each target is answered by this host's own TCP stack and resolver (a listener, a closed port's reset,
+/// the resolver's answer), which the probe waits for, with no wait of its own: the test waits on those facts.
+#[test]
+fn the_probe_answers_each_connection_with_its_targets_outcomes() {
+    let open = TcpListener::bind("127.0.0.1:0").unwrap();
+    let told = probe::Told::read(&three_targets(&open)).unwrap();
+    let started = probe::start(&told).unwrap();
     let [at] = started.at.as_slice() else {
         panic!("{:?}", started.at);
     };
@@ -908,7 +963,7 @@ fn the_probe_answers_each_connection_with_its_targets_outcomes() {
         .read_to_string(&mut answer)
         .unwrap();
     let report = Report::parse(&answer).unwrap();
-    assert_eq!(report.ingress, at.port());
+    assert_eq!(report.ingress, Ingress::Port(at.port()));
     let outcomes: Vec<(&str, &Outcome)> = report
         .egress
         .iter()
@@ -927,41 +982,81 @@ fn the_probe_answers_each_connection_with_its_targets_outcomes() {
     drop(started.servers);
 }
 
-/// Joint plan step 15 (the probe, no VM): do write a report of every outcome and read it back; expect it whole. Do
-/// read reports with no ingress line first, an egress line short of a word, and an outcome no outcome is; expect
-/// each refused, never read as another. Do read the probe's arguments short of each one it needs, with a wait of 0,
-/// and with a flag it has no use for; expect each refused by name.
+/// Joint plan step 15, T-T7.7.1 (the probe, no VM): do ask the probe on its stdin, as its harness is asked where its
+/// caller drives it (`ShardsImage::members`), two lines, then end its stdin. Expect two reports on its stdout, each
+/// ended by an empty line and read back typed: asked on its stdin, then each of the three targets in turn, connected,
+/// refused and unresolved; and the answering done at its stdin's end.
+#[test]
+fn the_probe_answers_each_line_on_its_stdin_with_its_targets_outcomes() {
+    let open = TcpListener::bind("127.0.0.1:0").unwrap();
+    let told = probe::Told::read(&three_targets(&open)).unwrap();
+    let mut out = Vec::new();
+    probe::answer("\nagain\n".as_bytes(), &mut out, &told.targets).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let reports: Vec<Report> = text
+        .split_terminator("\n\n")
+        .map(|report| Report::parse(report).unwrap())
+        .collect();
+    assert_eq!(reports.len(), 2, "{text:?}");
+    for report in reports {
+        assert_eq!(report.ingress, Ingress::Stdin);
+        let outcomes: Vec<(&str, &Outcome)> = report
+            .egress
+            .iter()
+            .map(|(target, outcome)| (target.label.as_str(), outcome))
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                ("open", &Outcome::Connected),
+                ("closed", &Outcome::Refused),
+                ("nowhere", &Outcome::Unresolved)
+            ],
+            "{text}"
+        );
+    }
+}
+
+/// Joint plan step 15 (the probe, no VM): do write a report of every outcome, asked on a port and on the probe's
+/// stdin, and read each back; expect each whole. Do read reports with no ingress line first, an ingress that is no
+/// port and not stdin, an egress line short of a word, and an outcome no outcome is; expect each refused, never read
+/// as another. Do read the probe's arguments short of each one it needs, and with a flag it has no use for, a wait of
+/// its own among them (it waits for each try's answer); expect each refused by name.
 #[test]
 fn the_probes_report_and_arguments_read_back_typed() {
     let target = |label: &str| probe::Target {
         label: label.to_owned(),
         at: "api.example:443".to_owned(),
     };
-    let every = Report {
-        ingress: 7101,
-        egress: [
-            Outcome::Connected,
-            Outcome::Refused,
-            Outcome::Unresolved,
-            Outcome::Unreachable,
-            Outcome::TimedOut,
-            Outcome::Failed("PermissionDenied".to_owned()),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(n, outcome)| (target(&format!("t{n}")), outcome))
-        .collect(),
-    };
-    let text = every
-        .egress
-        .iter()
-        .fold(format!("ingress {}\n", every.ingress), |text, (t, o)| {
+    let egress: Vec<(probe::Target, Outcome)> = [
+        Outcome::Connected,
+        Outcome::Refused,
+        Outcome::Unresolved,
+        Outcome::Unreachable,
+        Outcome::TimedOut,
+        Outcome::Failed("PermissionDenied".to_owned()),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(n, outcome)| (target(&format!("t{n}")), outcome))
+    .collect();
+    for (ingress, line) in [
+        (Ingress::Port(7101), "ingress 7101\n"),
+        (Ingress::Stdin, "ingress stdin\n"),
+    ] {
+        let every = Report {
+            ingress,
+            egress: egress.clone(),
+        };
+        let text = every.egress.iter().fold(line.to_owned(), |text, (t, o)| {
             text + &format!("egress {} {} {o}\n", t.label, t.at)
         });
-    assert_eq!(Report::parse(&text).unwrap(), every);
+        assert_eq!(Report::parse(&text).unwrap(), every);
+    }
     for bad in [
         "",
         "egress a api.example:443 connected\n",
+        "ingress stdout\negress a api.example:443 connected\n",
         "ingress 7101\negress a api.example:443\n",
         "ingress 7101\negress a api.example:443 connected-ish\n",
         "ingress 7101\negress a api.example:443 failed:\n",
@@ -973,8 +1068,6 @@ fn the_probes_report_and_arguments_read_back_typed() {
         probe::Told::read(&args)
     };
     let whole = [
-        "--wait-ms",
-        "1000",
         "--address",
         "0.0.0.0",
         "--listen",
@@ -984,25 +1077,18 @@ fn the_probes_report_and_arguments_read_back_typed() {
     ];
     let told = read(&whole).unwrap();
     assert_eq!(
-        (told.wait, told.address, told.listen, told.targets.len()),
-        (
-            Duration::from_secs(1),
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            vec![7101],
-            1
-        )
+        (told.address, told.listen, told.targets.len()),
+        (IpAddr::V4(Ipv4Addr::UNSPECIFIED), vec![7101], 1)
     );
-    let short_of_address = [&whole[..2], &whole[4..]].concat();
-    let no_wait = ["--wait-ms", "0", "--address", "0.0.0.0", "--listen", "1"];
     let no_label = [&whole[..], &["--egress", "nolabel"]].concat();
     let unknown = [&whole[..], &["--shout", "x"]].concat();
+    let waits = [&whole[..], &["--wait-ms", "1000"]].concat();
     for (args, says) in [
-        (&whole[2..], "--wait-ms"),
-        (&short_of_address[..], "--address"),
-        (&whole[..4], "--listen"),
-        (&no_wait[..], "--wait-ms"),
+        (&whole[2..], "--address"),
+        (&whole[..2], "--listen"),
         (&no_label[..], "--egress"),
         (&unknown[..], "--shout"),
+        (&waits[..], "--wait-ms"),
     ] {
         let refused = read(args).unwrap_err();
         assert!(refused.contains(says), "{args:?}: {refused}");
@@ -1018,8 +1104,6 @@ fn a_vms_network_is_its_grants_alone_on_a_real_node() {
     // A kernel goes with its init in Shards (`--kernel` and `--init` together); the node's run hosts inherit both.
     let init = PathBuf::from(input("SHARDS_INIT"));
     assert!(init.is_file(), "SHARDS_INIT {init:?} is no file");
-    let wait = Duration::from_millis(number("HEX_IMAGE_WAIT_MS"));
-    assert!(!wait.is_zero(), "HEX_IMAGE_WAIT_MS is 0");
     let work = PathBuf::from(input("HEX_IMAGE_WORK"));
     assert!(!work.exists(), "a run's own directory: {work:?} exists");
     fs::create_dir_all(work.join("state")).unwrap();
@@ -1047,8 +1131,9 @@ fn a_vms_network_is_its_grants_alone_on_a_real_node() {
         open: input("HEX_GRANTS_OPEN"),
         command_port: port("HEX_GRANTS_COMMAND_PORT"),
     };
-    // As image_real: a VM's start boots it, which the client's learned bounds (an OCI box's records) would refuse
-    // first, so every wait measures, and the run's deadline bounds the whole.
+    // A VM's start boots it, which the client's learned bounds (an OCI box's records) would refuse first: every wait
+    // measures, learned as the run goes, and each waits for its answer while its party lives (the person's rule of
+    // 2026-11-13), the run's whole with no deadline of its own.
     hex_core::patience::measure_all();
     assert!(
         hex_core::patience::census(step),
@@ -1067,7 +1152,7 @@ fn a_vms_network_is_its_grants_alone_on_a_real_node() {
     };
     #[cfg(not(target_os = "linux"))]
     let boxes: Option<PathBuf> = None;
-    let node = Node::start(&work, boxes.as_deref(), wait);
+    let node = Node::start(&work, boxes.as_deref());
     let (socket, pid) = (node.socket.clone(), node.child.id());
     let (done, finished) = mpsc::channel();
     std::thread::spawn(move || {
@@ -1078,16 +1163,15 @@ fn a_vms_network_is_its_grants_alone_on_a_real_node() {
             client.classes()
         );
         a_destination_its_image_grants_not_refuses_the_boot(&client, &probe, allocation);
-        no_grant_no_network(&client, pid, &probe, allocation);
+        no_grant_lets_nothing_past(&client, pid, &probe, allocation);
         one_publish_published_alone(&client, pid, &probe, allocation);
         granted_destinations_are_reached_alone(&client, &probe, allocation);
         a_publish_reaching_the_runs_own_command_stops_it(&client, pid, &probe, allocation);
         let _ = done.send(client.list().unwrap());
     });
-    let left = match finished.recv_timeout(wait) {
+    let left = match finished.recv() {
         Ok(left) => left,
-        Err(RecvTimeoutError::Timeout) => panic!("the checks did not end within {wait:?}"),
-        Err(RecvTimeoutError::Disconnected) => panic!("a check failed: its panic is above"),
+        Err(mpsc::RecvError) => panic!("a check failed: its panic is above"),
     };
     drop(node);
     records(&work.join("census.txt"));

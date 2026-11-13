@@ -2,20 +2,21 @@
 //! image_grants_real's probe image, whose program `scripts/grants-probe/build.sh` builds from `bin.rs` and this
 //! file, std alone, static. It takes each TCP port it is told to coming in; on each connection there it tries
 //! each egress target it is told of, once, and answers with one line for the port the connection came in on
-//! and one for each target, its outcome typed ([`Outcome`]), then closes. It never ends on its own: its VM's
-//! stop ends it. The test reads its answer with [`Report::parse`].
+//! and one for each target, its outcome typed ([`Outcome`]), then closes. Each line on its stdin asks the same of
+//! it, answered on its stdout ([`answer`]): where its caller drives its harness (`ShardsImage::members`), a VM
+//! granted nothing, so publishing no port, is asked so; elsewhere its stdin is the null device. It never ends on its
+//! own: its VM's stop ends it. The test reads its answer with [`Report::parse`].
 //!
-//! Arguments, its harness.json's options, each explicit: `--wait-ms <n>`, how long a connection neither made nor
-//! refused is waited for (the recipe's input, never a number of the probe's own); `--address <ip>`, where it
-//! listens (in its VM, every address: `0.0.0.0`); then any number of `--listen <port>` and
-//! `--egress <label>=<host>:<port>`.
+//! Each try waits for its own TCP stack's answer, as a connect does: made, refused (a reset), no route, or its own
+//! retransmissions run out (RFC 9293 §3.8.3, RFC 6298), never a wait of the probe's own. Arguments, its
+//! harness.json's options, each explicit: `--address <ip>`, where it listens (in its VM, every address: `0.0.0.0`);
+//! then any number of `--listen <port>` and `--egress <label>=<host>:<port>`.
 
 use std::ffi::OsString;
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 /// How a try to reach a target ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +29,7 @@ pub enum Outcome {
     Unresolved,
     /// No route to its network or host.
     Unreachable,
-    /// Neither made nor refused within the probe's wait.
+    /// Neither made nor refused before its TCP stack's own retransmissions ran out.
     TimedOut,
     /// Another failure, by its `io::ErrorKind` as Rust names it.
     Failed(String),
@@ -81,17 +82,39 @@ pub struct Target {
     pub at: String,
 }
 
-/// What the probe answers one connection with: the port it came in on, then each target's outcome, in the order
-/// it was told them. Its text is a line `ingress <port>`, then a line `egress <label> <host:port> <outcome>` each.
+/// Where the probe was asked for its report: a connection to a TCP port it listens on, or a line on its stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ingress {
+    Port(u16),
+    Stdin,
+}
+
+/// What the probe answers one ask with: where it was asked, then each target's outcome, in the order it was told
+/// them. Its text is a line `ingress <port>` or `ingress stdin`, then a line `egress <label> <host:port> <outcome>`
+/// each.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
-    pub ingress: u16,
+    pub ingress: Ingress,
     pub egress: Vec<(Target, Outcome)>,
 }
 
 impl Report {
+    /// The report for `ingress` of each of `targets` tried once, in turn.
+    fn of(ingress: Ingress, targets: &[Target]) -> Self {
+        Self {
+            ingress,
+            egress: targets
+                .iter()
+                .map(|target| (target.clone(), reach(target)))
+                .collect(),
+        }
+    }
+
     fn text(&self) -> String {
-        let mut out = format!("ingress {}\n", self.ingress);
+        let mut out = match self.ingress {
+            Ingress::Port(port) => format!("ingress {port}\n"),
+            Ingress::Stdin => "ingress stdin\n".to_owned(),
+        };
         for (target, outcome) in &self.egress {
             out.push_str(&format!(
                 "egress {} {} {outcome}\n",
@@ -104,11 +127,14 @@ impl Report {
     /// The report `text` says, or why it is none.
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut lines = text.lines();
-        let ingress = lines
-            .next()
-            .and_then(|line| line.strip_prefix("ingress "))
-            .and_then(|port| port.parse().ok())
-            .ok_or_else(|| format!("no ingress line first: {text:?}"))?;
+        let ingress = match lines.next().and_then(|line| line.strip_prefix("ingress ")) {
+            Some("stdin") => Ingress::Stdin,
+            Some(port) => Ingress::Port(
+                port.parse()
+                    .map_err(|_| format!("ingress {port:?} is no port and not stdin"))?,
+            ),
+            None => return Err(format!("no ingress line first: {text:?}")),
+        };
         let mut egress = Vec::new();
         for line in lines {
             let words: Vec<&str> = line.split(' ').collect();
@@ -125,21 +151,18 @@ impl Report {
     }
 }
 
-/// What the probe was told: how long it waits, where and on which ports it listens, its targets.
+/// What the probe was told: where and on which ports it listens, its targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Told {
-    pub wait: Duration,
     pub address: IpAddr,
     pub listen: Vec<u16>,
     pub targets: Vec<Target>,
 }
 
 impl Told {
-    /// Its arguments, read whole, or why they say nothing it can do: each flag with its value, a wait, an address
-    /// and at least one port, every port 0 to 65535 (0 the OS's pick, for the probe's own tests), every label one
-    /// word.
+    /// Its arguments, read whole, or why they say nothing it can do: each flag with its value, an address and at
+    /// least one port, every port 0 to 65535 (0 the OS's pick, for the probe's own tests), every label one word.
     pub fn read(args: &[OsString]) -> Result<Self, String> {
-        let mut wait = None;
         let mut address = None;
         let mut listen = Vec::new();
         let mut targets = Vec::new();
@@ -150,12 +173,6 @@ impl Told {
                 .and_then(|value| value.to_str())
                 .ok_or_else(|| format!("{flag:?} has no value, or one that isn't UTF-8"))?;
             match flag.to_str() {
-                Some("--wait-ms") => {
-                    let ms: u64 = value
-                        .parse()
-                        .map_err(|_| format!("--wait-ms {value:?} is no count of milliseconds"))?;
-                    wait = Some(Duration::from_millis(ms)).filter(|wait| !wait.is_zero());
-                }
                 Some("--address") => {
                     address = Some(
                         value
@@ -183,13 +200,11 @@ impl Told {
                 _ => return Err(format!("{flag:?} is no flag of the probe's")),
             }
         }
-        let wait = wait.ok_or("no --wait-ms above 0")?;
         let address = address.ok_or("no --address")?;
         if listen.is_empty() {
             return Err("no --listen port".to_owned());
         }
         Ok(Self {
-            wait,
             address,
             listen,
             targets,
@@ -198,14 +213,14 @@ impl Told {
 }
 
 /// Tries `target` once: its name resolved through the VM's own resolver, then each address it gave in turn, until
-/// one connects.
-pub fn reach(target: &Target, wait: Duration) -> Outcome {
+/// one connects, each connect waiting for its TCP stack's answer.
+pub fn reach(target: &Target) -> Outcome {
     let Ok(addresses) = target.at.to_socket_addrs() else {
         return Outcome::Unresolved;
     };
     let mut outcome = Outcome::Unresolved;
     for address in addresses {
-        match TcpStream::connect_timeout(&address, wait) {
+        match TcpStream::connect(address) {
             Ok(_) => return Outcome::Connected,
             Err(error) => outcome = Outcome::of(&error),
         }
@@ -219,9 +234,8 @@ pub struct Started {
     pub servers: Vec<JoinHandle<()>>,
 }
 
-/// Takes each port the arguments name, at their address, and serves each on a thread of its own.
-pub fn start(args: &[OsString]) -> Result<Started, String> {
-    let told = Told::read(args)?;
+/// Takes each port `told` names, at its address, and serves each on a thread of its own.
+pub fn start(told: &Told) -> Result<Started, String> {
     let mut at = Vec::new();
     let mut servers = Vec::new();
     for port in &told.listen {
@@ -230,10 +244,10 @@ pub fn start(args: &[OsString]) -> Result<Started, String> {
         let bound = listener
             .local_addr()
             .map_err(|e| format!("the address listening on {port}: {e}"))?;
-        let (wait, targets) = (told.wait, told.targets.clone());
+        let targets = told.targets.clone();
         let server = std::thread::Builder::new()
             .name(format!("probe-{}", bound.port()))
-            .spawn(move || serve(&listener, bound.port(), &targets, wait))
+            .spawn(move || serve(&listener, bound.port(), &targets))
             .map_err(|e| format!("a thread for {port}: {e}"))?;
         at.push(bound);
         servers.push(server);
@@ -243,18 +257,25 @@ pub fn start(args: &[OsString]) -> Result<Started, String> {
 
 /// Answers each connection `listener` takes with its report, one at a time; a connection that fails as it is taken
 /// or answered is that connection's end alone.
-fn serve(listener: &TcpListener, port: u16, targets: &[Target], wait: Duration) {
+fn serve(listener: &TcpListener, port: u16, targets: &[Target]) {
     for connection in listener.incoming() {
         let Ok(mut connection) = connection else {
             continue;
         };
-        let report = Report {
-            ingress: port,
-            egress: targets
-                .iter()
-                .map(|target| (target.clone(), reach(target, wait)))
-                .collect(),
-        };
+        let report = Report::of(Ingress::Port(port), targets);
         let _ = connection.write_all(report.text().as_bytes());
     }
+}
+
+/// Answers each line `input` gives with its report on `output`, ended by an empty line and flushed, until `input`
+/// ends: the probe's stdin and stdout, where its caller drives its harness.
+pub fn answer(input: impl BufRead, mut output: impl Write, targets: &[Target]) -> io::Result<()> {
+    for line in input.lines() {
+        line?;
+        let report = Report::of(Ingress::Stdin, targets);
+        output.write_all(report.text().as_bytes())?;
+        output.write_all(b"\n")?;
+        output.flush()?;
+    }
+    Ok(())
 }

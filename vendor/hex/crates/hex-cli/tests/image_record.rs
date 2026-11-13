@@ -161,6 +161,7 @@ fn spec(
         shares: Vec::new(),
         nesting: false,
         ready_by: None,
+        credentials: Vec::new(),
         binary: Some(shards.to_path_buf()),
         env,
     }

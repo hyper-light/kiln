@@ -1238,6 +1238,8 @@ dependencies = [
  "sha2",
  "shards-abi",
  "shards-afunix",
+ "shards-dns",
+ "shards-ipc",
  "shards-testdir",
  "triomphe",
  "unsize",
@@ -1408,6 +1410,8 @@ name = "shards-net"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rcgen",
+ "rustls",
  "shards-abi",
  "shards-afunix",
  "shards-dns",
@@ -1415,6 +1419,7 @@ dependencies = [
  "shards-netring",
  "shards-syscall-filter",
  "shards-testdir",
+ "time",
  "windows-sys 0.61.2",
 ]
 
@@ -1605,6 +1610,7 @@ dependencies = [
  "libc",
  "shards-abi",
  "shards-afunix",
+ "shards-apple",
  "shards-ipc",
  "shards-netring",
  "shards-ntfs",

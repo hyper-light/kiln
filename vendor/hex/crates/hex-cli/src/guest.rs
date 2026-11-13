@@ -18,6 +18,14 @@
 //! as PID 1 must. When the node or the relay ends, it says why and powers the guest off, so the host sees
 //! the guest end.
 //!
+//! Under shards-init (docs/design/node-under-shards-init.md), the same init is a Shards run's own command under
+//! Shards' nesting grant (D234): PID 1 of the workload's own PID namespace, which it knows by `NOTIFY_SOCKET`. There
+//! shards-init has made the root and its mounts, the run's shares and its descriptor limit. So init mounts a tmpfs for
+//! its node's state and staged roots, takes the deadline shards-init gives (`SHARDS_READY_BY`), and starts the node and
+//! the relay, which listens on AF_UNIX sockets in `/run/hex/channel` (its `--unix`). It then says READY=1 on
+//! shards-init's socket (sd_notify(3)) and reaps as PID 1 of its namespace. When the node or the relay ends, it exits,
+//! and its namespace and its run end with it.
+//!
 //! With `--vsock` it listens on the guest's vsock ports ([`hex_core::stream::CONTROL_PORT`],
 //! [`hex_core::stream::STDIO_PORT`] and [`hex_core::stream::files::FILES_PORT`], any CID); with `--unix` on
 //! `control.sock`, `stdio.sock` and `files.sock` in `<dir>`, which tests dial as the host would. It stages
@@ -55,6 +63,7 @@ const USAGE: &str =
     "usage: hex guest relay --node <socket> (--vsock | --unix <dir>) [--staged <dir>]";
 
 /// Where the relay listens.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum On {
     Vsock,
     Unix(PathBuf),
@@ -256,12 +265,15 @@ fn boot_deadline(
     };
     let bad =
         || format!("{BOOT_READY_BY} is {given:?}, not a CLOCK_BOOTTIME instant in nanoseconds");
-    let at = given
-        .to_str()
+    let at = clock_ns(given).ok_or_else(bad)?;
+    deadline_at(at, now, boot_ns).map(Some).ok_or_else(bad)
+}
+
+/// `text` as an instant on the guest's clock in nanoseconds: decimal digits alone, within a `u128`.
+fn clock_ns(text: &OsStr) -> Option<u128> {
+    text.to_str()
         .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
         .and_then(|text| text.parse::<u128>().ok())
-        .ok_or_else(bad)?;
-    deadline_at(at, now, boot_ns).map(Some).ok_or_else(bad)
 }
 
 /// Nanoseconds since the kernel began keeping time: `CLOCK_BOOTTIME` (clock_gettime(2)), the guest's own
@@ -305,16 +317,199 @@ const BOX_ROOT: &str = "/sys/fs/cgroup/hex";
 /// The controllers the node's boxes are bounded by (`docs/design/runtime.md`), enabled for the root's
 /// children.
 const CONTROLLERS: &str = "+cpu +io +memory +pids";
+/// Where the relay listens under a service manager: AF_UNIX sockets its host's channel reaches, as a workload under
+/// Docker's default filter opens no vsock socket (docs/design/node-under-shards-init.md §2, §5; Shards' D234 f27).
+const CHANNEL: &str = "/run/hex/channel";
+
+/// The variable by which a service manager names the socket its service says it is ready on (sd_notify(3)):
+/// shards-init's `/run/shards/notify` under Shards' nesting grant (D234). Only a service manager sets it, so it alone
+/// says init's host is one (docs/design/node-under-shards-init.md §3).
+const NOTIFY_SOCKET: &str = "NOTIFY_SOCKET";
+/// The boot's deadline a service manager gives (D234): an instant on the guest's `CLOCK_BOOTTIME` in nanoseconds, the
+/// clock, unit and form of [`BOOT_READY_BY`], counted from its run's arrival; 0 for one that passed before it arrived.
+const SHARDS_READY_BY: &str = "SHARDS_READY_BY";
+
+/// Who started init (docs/design/node-under-shards-init.md §3), read once as it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Host {
+    /// The VM's kernel: init is the VM's own init (Shards' direct boot, Firecracker), its host's words on the
+    /// kernel's command line.
+    Kernel,
+    /// A service manager: shards-init, whose run's own command init is under Shards' nesting grant (D234), PID 1 of
+    /// the workload's own PID namespace. It names the socket init says it is ready on, and the boot's deadline where
+    /// its run gives one.
+    Manager {
+        notify: PathBuf,
+        ready_by: Option<u128>,
+    },
+}
+
+/// Init's host, from the words only each host sets (`var`, init's environment): a service manager where
+/// [`NOTIFY_SOCKET`] names an absolute path (sd_notify(3)'s file-system form, the one shards-init gives), with
+/// [`SHARDS_READY_BY`]'s deadline where it is given; the kernel where [`NOTIFY_SOCKET`] is absent. Refused, naming the
+/// word: a socket that isn't an absolute path, a deadline that isn't nanoseconds on the guest's clock, or a deadline
+/// with no service manager to have given it.
+fn host(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<Host, String> {
+    let ready_by = var(SHARDS_READY_BY);
+    let Some(notify) = var(NOTIFY_SOCKET) else {
+        return match ready_by {
+            None => Ok(Host::Kernel),
+            Some(given) => Err(format!(
+                "{SHARDS_READY_BY} is {given:?} with no {NOTIFY_SOCKET}: only a service manager gives that deadline"
+            )),
+        };
+    };
+    let notify = PathBuf::from(notify);
+    if !notify.is_absolute() {
+        return Err(format!(
+            "{NOTIFY_SOCKET} is {notify:?}, not an absolute path"
+        ));
+    }
+    let ready_by = ready_by
+        .map(|given| {
+            clock_ns(&given).ok_or_else(|| {
+                format!(
+                    "{SHARDS_READY_BY} is {given:?}, not a CLOCK_BOOTTIME instant in nanoseconds"
+                )
+            })
+        })
+        .transpose()?;
+    Ok(Host::Manager { notify, ready_by })
+}
+
+/// One duty of init's boot, in the order init does them under its host (docs/design/node-under-shards-init.md §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Duty {
+    /// Move off the kernel's initramfs onto a tmpfs root and run again from there ([`leave_rootfs`]).
+    LeaveInitramfs,
+    /// Mount each file system, each on a directory made for it.
+    Mount(Vec<Mount>),
+    /// Make each directory the node's paths need.
+    Dirs(&'static [&'static str]),
+    /// Mount the shares the kernel's command line names ([`mount_shares`]).
+    KernelShares,
+    /// Take the boot's deadline where its host tells it.
+    Deadline(Deadline),
+    /// Enable the controllers the node's boxes are bounded by, at the root of the hierarchy init sees.
+    Controllers,
+    /// Find `/init` itself, which the node and the relay are run as, through `/proc/self/exe`.
+    FindExe,
+    /// Write the GPU catalog the kernel's command line grants ([`hex_runtime::guest::gpu::initialize`]).
+    GpuAuthority,
+    /// Give the node its descriptor limit ([`give_descriptors`]).
+    Descriptors,
+    /// Start the node, then the relay listening where it says, each within the boot's deadline.
+    Start(On),
+    /// Tell Firecracker the guest is ready, where the kernel's command line asks ([`notify_firecracker_ready`]).
+    TellFirecracker,
+    /// Tell the service manager the guest is ready: READY=1 on the socket it named (sd_notify(3)).
+    Notify(PathBuf),
+    /// Say the guest is ready, reap every process that ends until the node or the relay does, then end as it says.
+    Serve(End),
+}
+
+#[cfg(test)]
+impl Duty {
+    /// Whether it reads the kernel's `/proc`, mounted before it: by init's own Mount duty as the VM's init, by its
+    /// service manager under one. Leaving the initramfs reads `/proc/self/mountinfo` through a `/proc` it mounts and
+    /// unmounts itself.
+    fn reads_proc(&self) -> bool {
+        matches!(
+            self,
+            Duty::KernelShares
+                | Duty::Deadline(Deadline::Kernel)
+                | Duty::FindExe
+                | Duty::GpuAuthority
+                | Duty::Descriptors
+        )
+    }
+
+    /// Whether it mounts `/proc` for the duties after it.
+    fn mounts_proc(&self) -> bool {
+        matches!(self, Duty::Mount(mounts) if mounts.iter().any(|m| m.fs == "proc"))
+    }
+}
+
+/// Where init takes the boot's deadline from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deadline {
+    /// The kernel's command line: `hex.ready-ms` or Firecracker's, counted from the kernel's start ([`boot_budget`]).
+    Kernel,
+    /// What its service manager told it ([`SHARDS_READY_BY`]), none where it told none.
+    Told(Option<u128>),
+}
+
+/// How init ends once the node or the relay has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    /// Powers the VM off (reboot(2)), so its host sees it end.
+    PowerOff,
+    /// Exits: its PID namespace ends with it, every process left in it killed (pid_namespaces(7)), and its service
+    /// manager's run with them.
+    Exit,
+}
+
+/// What init does under `host`, in order (docs/design/node-under-shards-init.md §2). As the VM's init, everything its
+/// node needs of a Linux machine. Under a service manager, what shards-init leaves it: shards-init has made the root,
+/// mounted `/proc`, `/sys`, the delegated cgroup hierarchy and `/dev`, mounted the run's shares, set `fs.nr_open` and
+/// the run's descriptor limit, and holds no GPU authority it could pass on (D234's `gpus=` isn't built).
+fn duties(host: &Host) -> Vec<Duty> {
+    match host {
+        Host::Kernel => vec![
+            Duty::LeaveInitramfs,
+            Duty::Mount(mounts().to_vec()),
+            Duty::Dirs(&[RUN, STATE, BOX_ROOT]),
+            Duty::KernelShares,
+            Duty::Deadline(Deadline::Kernel),
+            Duty::Controllers,
+            // `/proc/self/exe`: as the VM's init, only once the Mount duty above has mounted `/proc`.
+            Duty::FindExe,
+            Duty::GpuAuthority,
+            Duty::Descriptors,
+            Duty::Start(On::Vsock),
+            Duty::TellFirecracker,
+            Duty::Serve(End::PowerOff),
+        ],
+        Host::Manager { notify, ready_by } => vec![
+            Duty::Mount(node_tmpfs().to_vec()),
+            Duty::Dirs(&[CHANNEL, BOX_ROOT]),
+            Duty::Deadline(Deadline::Told(*ready_by)),
+            Duty::Controllers,
+            Duty::FindExe,
+            Duty::Start(On::Unix(PathBuf::from(CHANNEL))),
+            Duty::Notify(notify.clone()),
+            Duty::Serve(End::Exit),
+        ],
+    }
+}
+
+/// The tmpfs init mounts for its node under a service manager: on the node's state and on the relay's staged roots,
+/// the two directories its boxes' overlays take their layers and upper directories from. The run's root is itself an
+/// overlay, which overlayfs refuses as an upper directory (`ovl_mount_dir_check`, fs/overlayfs/params.c: "not supported
+/// as upperdir"). Each is root's alone to write, 0755, as each is when made under the VM's own init's tmpfs `/run`
+/// (tmpfs(5) would make its root 01777). shards-init's `/run/shards` and the shares beside them stay as it mounted them.
+fn node_tmpfs() -> [Mount; 2] {
+    let tmpfs = |target| Mount {
+        source: "tmpfs",
+        target,
+        fs: "tmpfs",
+        flags: rustix::mount::MountFlags::NOSUID | rustix::mount::MountFlags::NODEV,
+        data: Some(c"mode=0755"),
+        expedite: false,
+    };
+    [tmpfs(STATE), tmpfs(STAGED)]
+}
 
 /// How the kernel names the initramfs's first process: `rdinit`'s default, passed as its `argv[0]`
 /// (init/main.c, `ramdisk_execute_command` and `run_init_process`).
 const KERNEL_INIT: &str = "/init";
 
-/// Whether `hex` runs as the guest's init: PID 1, and the kernel's first process, whatever other words it
-/// is given. PID 1 alone isn't enough: a container's first program is PID 1 of its own PID namespace, and
-/// `/hex selftest-box` or the runtime's `__oci-init` there must run as themselves, so its `argv[0]` tells them
-/// apart. A container that names its own program `/init` and is `hex` fails init's first privileged step
-/// or stays inside its namespaces: it reaches nothing a container can't.
+/// Whether `hex` runs as the guest's init: PID 1, named `/init`, whatever other words it is given. That is the
+/// kernel's first process, or under shards-init the run's own command, which Hex's node image names `/init`
+/// (docs/design/node-under-shards-init.md §4). PID 1 alone isn't enough: a container's first program is PID 1 of
+/// its own PID namespace, and `/hex selftest-box` or the runtime's `__oci-init` there must run as themselves, so
+/// its `argv[0]` tells them apart. A container that names its own program `/init` and is `hex` fails init's first
+/// privileged step or stays inside its namespaces: it reaches nothing a container can't.
 pub fn runs_as_init(pid: u32, argv0: Option<&std::ffi::OsStr>) -> bool {
     pid == 1 && argv0 == Some(std::ffi::OsStr::new(KERNEL_INIT))
 }
@@ -337,80 +532,170 @@ fn init() -> Result<(), (u8, String)> {
         .ok()
         .and_then(|t| t.parse::<u128>().ok())
         .unwrap_or_else(boottime_ns);
-    leave_rootfs(t0).map_err(fail)?;
-    mount_all().map_err(fail)?;
-    mount_shares().map_err(fail)?;
-    let cmdline = kernel_cmdline().map_err(fail)?;
-    let ready_budget = firecracker_ready_budget(&cmdline).map_err(fail)?;
-    // AC-T7.4.1: the boot's deadline on the guest's clock, its host's readiness bound from the kernel's start, within
-    // which init waits for each child's ready line and the relay's calls to its node take it as their caller's.
-    let ready_by = boot_budget(&cmdline, ready_budget)
-        .map_err(fail)?
-        .map(|budget| budget.as_nanos());
-    std::fs::write("/sys/fs/cgroup/cgroup.subtree_control", CONTROLLERS).map_err(|e| {
-        fail(format!(
-            "enabling the cgroup controllers {CONTROLLERS}: {e}"
-        ))
-    })?;
-    let mounted = boottime_ns();
-    let exe = std::env::current_exe().map_err(|e| fail(format!("finding /init: {e}")))?;
-    let socket = Path::new(RUN).join("node.sock");
-    let state = Path::new(STATE);
-    // AC-T7.4.1: only immutable host boot authority can materialize the selected renderer's
-    // guest catalog; do this before the node reads its configured attachment routes.
-    let _ = hex_runtime::guest::gpu::initialize(state)
-        .map_err(|why| fail(format!("initializing guest GPU authority: {why}")))?;
-    give_descriptors(state)
-        .map_err(|why| fail(format!("giving the node its descriptor limit: {why}")))?;
-    let node = start(
-        &exe,
-        &[
-            "node".as_ref(),
-            "--socket".as_ref(),
-            socket.as_os_str(),
-            "--state".as_ref(),
-            state.as_os_str(),
-            "--box-root".as_ref(),
-            BOX_ROOT.as_ref(),
-        ],
-        &format!("ready {}\n", socket.display()),
-        None,
-        ready_by,
-    )
-    .map_err(|why| fail(why.to_string()))?;
-    let node_ready = boottime_ns();
-    let relay = start(
-        &exe,
-        &[
+    let host = host(|name| std::env::var_os(name)).map_err(fail)?;
+    let mut boot = Boot {
+        exe: None,
+        t0,
+        mounted: t0,
+        node_ready: t0,
+        ready_by: None,
+        firecracker: None,
+        started: None,
+    };
+    for duty in duties(&host) {
+        boot.perform(duty).map_err(fail)?;
+    }
+    Ok(())
+}
+
+/// What init's duties hand on to later ones as it boots.
+struct Boot {
+    /// `/init`, which runs the node and the relay, once its FindExe duty has found it.
+    exe: Option<PathBuf>,
+    /// The boot split's stamps on the guest's clock: init's first entry, its mounts done, its node ready.
+    t0: u128,
+    mounted: u128,
+    node_ready: u128,
+    /// The boot's deadline on the guest's clock, once its host has told it: the instant by which its host waits for
+    /// it to be ready, within which init waits for each child's ready line and the relay's calls to its node take it
+    /// as their caller's (AC-T7.4.1). None where its host told none.
+    ready_by: Option<u128>,
+    /// Firecracker's readiness budget, where the kernel's command line asked for its ready word.
+    firecracker: Option<Duration>,
+    /// The node's and the relay's process IDs, once both are started.
+    started: Option<(u32, u32)>,
+}
+
+impl Boot {
+    fn perform(&mut self, duty: Duty) -> Result<(), String> {
+        match duty {
+            Duty::LeaveInitramfs => leave_rootfs(self.t0),
+            Duty::Mount(mounts) => mount_each(&mounts),
+            Duty::Dirs(dirs) => dirs.iter().try_for_each(|dir| {
+                std::fs::create_dir_all(dir).map_err(|e| format!("making {dir}: {e}"))
+            }),
+            Duty::KernelShares => mount_shares(),
+            Duty::Deadline(Deadline::Kernel) => {
+                let cmdline = kernel_cmdline()?;
+                self.firecracker = firecracker_ready_budget(&cmdline)?;
+                // AC-T7.4.1: its host's readiness bound from the kernel's start, an instant on the guest's clock.
+                self.ready_by =
+                    boot_budget(&cmdline, self.firecracker)?.map(|budget| budget.as_nanos());
+                Ok(())
+            }
+            Duty::Deadline(Deadline::Told(ready_by)) => {
+                self.ready_by = ready_by;
+                Ok(())
+            }
+            Duty::Controllers => {
+                std::fs::write("/sys/fs/cgroup/cgroup.subtree_control", CONTROLLERS)
+                    .map_err(|e| format!("enabling the cgroup controllers {CONTROLLERS}: {e}"))?;
+                self.mounted = boottime_ns();
+                Ok(())
+            }
+            Duty::FindExe => {
+                let exe = std::env::current_exe().map_err(|e| format!("finding /init: {e}"))?;
+                self.exe = Some(exe);
+                Ok(())
+            }
+            // AC-T7.4.1: only immutable host boot authority can materialize the selected renderer's
+            // guest catalog; do this before the node reads its configured attachment routes.
+            Duty::GpuAuthority => hex_runtime::guest::gpu::initialize(Path::new(STATE))
+                .map(|_| ())
+                .map_err(|why| format!("initializing guest GPU authority: {why}")),
+            Duty::Descriptors => give_descriptors(Path::new(STATE))
+                .map(|_| ())
+                .map_err(|why| format!("giving the node its descriptor limit: {why}")),
+            Duty::Start(on) => self.start_node_and_relay(&on),
+            Duty::TellFirecracker => match self.firecracker {
+                Some(budget) => notify_firecracker_ready(budget)
+                    .map_err(|e| format!("notifying Firecracker that the guest is ready: {e}")),
+                None => Ok(()),
+            },
+            Duty::Notify(socket) => {
+                let by = self
+                    .ready_by
+                    .map(|at| {
+                        deadline_at(at, Instant::now(), boottime_ns()).ok_or_else(|| {
+                            format!("the boot's deadline, {at} ns on the guest's clock, is past a monotonic instant")
+                        })
+                    })
+                    .transpose()?;
+                notify_ready(&socket, by)
+                    .map_err(|e| format!("telling {} the guest is ready: {e}", socket.display()))
+            }
+            Duty::Serve(end) => self.serve(end),
+        }
+    }
+
+    /// Starts the node, then the relay listening `on` it, each within the boot's deadline.
+    fn start_node_and_relay(&mut self, on: &On) -> Result<(), String> {
+        let exe = self
+            .exe
+            .clone()
+            .ok_or_else(|| "starting the node before init found itself".to_owned())?;
+        let socket = Path::new(RUN).join("node.sock");
+        let node = start(
+            &exe,
+            &[
+                "node".as_ref(),
+                "--socket".as_ref(),
+                socket.as_os_str(),
+                "--state".as_ref(),
+                STATE.as_ref(),
+                "--box-root".as_ref(),
+                BOX_ROOT.as_ref(),
+            ],
+            &format!("ready {}\n", socket.display()),
+            None,
+            self.ready_by,
+        )
+        .map_err(|why| why.to_string())?;
+        self.node_ready = boottime_ns();
+        let mut args: Vec<&OsStr> = vec![
             "guest".as_ref(),
             "relay".as_ref(),
             "--node".as_ref(),
             socket.as_os_str(),
-            "--vsock".as_ref(),
-        ],
-        "ready\n",
-        Some(format!("{t0} {mounted} {node_ready}")),
-        ready_by,
-    )
-    .map_err(|why| fail(why.to_string()))?;
-    if let Some(budget) = ready_budget {
-        notify_firecracker_ready(budget).map_err(|e| {
-            fail(format!(
-                "notifying Firecracker that the guest is ready: {e}"
-            ))
-        })?;
+        ];
+        match on {
+            On::Vsock => args.push("--vsock".as_ref()),
+            On::Unix(dir) => args.extend(["--unix".as_ref(), dir.as_os_str()]),
+        }
+        let relay = start(
+            &exe,
+            &args,
+            "ready\n",
+            Some(format!("{} {} {}", self.t0, self.mounted, self.node_ready)),
+            self.ready_by,
+        )
+        .map_err(|why| why.to_string())?;
+        self.started = Some((node, relay));
+        Ok(())
     }
-    let mut out = std::io::stdout().lock();
-    let _ = out
-        .write_all(b"hex guest ready\n")
-        .and_then(|()| out.flush());
-    drop(out);
-    let why = reap(node, relay);
-    let _ = std::io::stderr()
-        .lock()
-        .write_all(format!("hex guest: {why}; powering off\n").as_bytes());
-    rustix::system::reboot(rustix::system::RebootCommand::PowerOff)
-        .map_err(|e| fail(format!("powering off: {e}")))
+
+    /// Says the guest is ready, reaps until the node or the relay ends, and ends as `end` says.
+    fn serve(&self, end: End) -> Result<(), String> {
+        let (node, relay) = self
+            .started
+            .ok_or_else(|| "serving before the node and the relay started".to_owned())?;
+        let mut out = std::io::stdout().lock();
+        let _ = out
+            .write_all(b"hex guest ready\n")
+            .and_then(|()| out.flush());
+        drop(out);
+        let why = reap(node, relay);
+        match end {
+            End::PowerOff => {
+                let _ = std::io::stderr()
+                    .lock()
+                    .write_all(format!("hex guest: {why}; powering off\n").as_bytes());
+                rustix::system::reboot(rustix::system::RebootCommand::PowerOff)
+                    .map_err(|e| format!("powering off: {e}"))
+            }
+            End::Exit => Err(format!("{why}; ending its run")),
+        }
+    }
 }
 
 /// What init gives the node of RLIMIT_NOFILE, as the guest's service manager.
@@ -490,16 +775,19 @@ fn give_descriptors(state: &Path) -> Result<NodeDescriptors, Refusal> {
 }
 
 /// One file system `init` mounts: its source, target, type and flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Mount {
     source: &'static str,
     target: &'static str,
     fs: &'static str,
     flags: rustix::mount::MountFlags,
+    /// Its file system's options; none for its defaults.
+    data: Option<&'static std::ffi::CStr>,
     /// Made with RCU's grace periods expedited ([`RCU_EXPEDITED`]).
     expedite: bool,
 }
 
-/// What `init` mounts, in order.
+/// What `init` mounts as the VM's init, in order.
 fn mounts() -> [Mount; 6] {
     use rustix::mount::MountFlags;
     let quiet = MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::NODEV;
@@ -508,6 +796,7 @@ fn mounts() -> [Mount; 6] {
         target,
         fs,
         flags,
+        data: None,
         expedite: false,
     };
     [
@@ -750,6 +1039,30 @@ fn notify_firecracker_ready(budget: Duration) -> io::Result<()> {
     Ok(())
 }
 
+/// sd_notify(3)'s word that "service startup is finished".
+const READY: &[u8] = b"READY=1";
+
+/// Tells the service manager listening on `socket` that the guest is ready (docs/design/node-under-shards-init.md §2):
+/// [`READY`] in one datagram, as sd_notify(3) sends it ("a single datagram with the state string as payload"), from a
+/// socket of init's own, unbound. Within what is left of the boot's deadline where init has one, timed out at once
+/// where the boot has spent it, as Firecracker's notice is ([`notify_firecracker_ready`]). With none it waits on the
+/// manager, the VM's init, whose end is the VM's. A datagram is sent whole or not at all (unix(7)), so a short send
+/// is refused.
+fn notify_ready(socket: &Path, by: Option<Instant>) -> io::Result<()> {
+    let sender = std::os::unix::net::UnixDatagram::unbound()?;
+    if let Some(by) = by {
+        let left = by
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+        sender.set_write_timeout(Some(left))?;
+    }
+    match sender.send_to(READY, socket)? {
+        sent if sent == READY.len() => Ok(()),
+        _ => Err(io::ErrorKind::WriteZero.into()),
+    }
+}
+
 /// The shares the kernel's command line names, in tag order. Only the kernel's own parameters count:
 /// what follows `--` is init's arguments.
 fn shares(cmdline: &str) -> Result<Vec<Share>, String> {
@@ -817,23 +1130,20 @@ fn expedite_rcu(on: bool) -> Result<(), String> {
         .map_err(|e| format!("writing {on} to {RCU_EXPEDITED}: {e}"))
 }
 
-/// Mounts what the node needs, each on a directory made for it.
-fn mount_all() -> Result<(), String> {
-    for m in mounts() {
+/// Mounts each of `mounts` in order, each on a directory made for it.
+fn mount_each(mounts: &[Mount]) -> Result<(), String> {
+    for m in mounts {
         let (target, fs) = (m.target, m.fs);
         std::fs::create_dir_all(target).map_err(|e| format!("making {target}: {e}"))?;
         if m.expedite {
             expedite_rcu(true)?;
         }
-        let mounted = rustix::mount::mount(m.source, target, fs, m.flags, None)
+        let mounted = rustix::mount::mount(m.source, target, fs, m.flags, m.data)
             .map_err(|e| format!("mounting {fs} on {target}: {e}"));
         if m.expedite {
             expedite_rcu(false)?;
         }
         mounted?;
-    }
-    for dir in [RUN, STATE, BOX_ROOT] {
-        std::fs::create_dir_all(dir).map_err(|e| format!("making {dir}: {e}"))?;
     }
     Ok(())
 }
@@ -1308,6 +1618,180 @@ mod tests {
             );
         }
         assert!(!runs_as_init(1, None));
+    }
+
+    /// The environment shards-init gives its run's own command under Shards' nesting grant (D234), as `var` reads it.
+    fn shards_inits(ready_by: Option<&str>) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |name| match name {
+            NOTIFY_SOCKET => Some("/run/shards/notify".into()),
+            SHARDS_READY_BY => ready_by.map(Into::into),
+            _ => None,
+        }
+    }
+
+    /// AC-T7.4.1, joint plan step 39 (original; docs/design/node-under-shards-init.md §2, §3): under shards-init,
+    /// Hex's init is its run's own command under Shards' nesting grant (D234), PID 1 of the workload's own PID
+    /// namespace, and shards-init has done the VM's part. Do: read init's host from shards-init's environment
+    /// (`NOTIFY_SOCKET`, `SHARDS_READY_BY`), then its duties. Expect: no initramfs to leave and no kernel mount,
+    /// share, GPU word or descriptor raise, which are shards-init's; a tmpfs for the node's state and its staged
+    /// roots, whose overlays the run's own overlay root can't hold; the deadline shards-init told; the controllers;
+    /// the node, then the relay on AF_UNIX sockets (no vsock under Docker's filter); READY=1 to shards-init's
+    /// socket; and an exit at the end, not a power-off.
+    #[test]
+    fn original_under_shards_init_init_does_its_own_duties_alone() {
+        let host = host(shards_inits(Some("4200000000"))).unwrap();
+        assert_eq!(
+            host,
+            Host::Manager {
+                notify: PathBuf::from("/run/shards/notify"),
+                ready_by: Some(4_200_000_000),
+            }
+        );
+        let tmpfs = |target| Mount {
+            source: "tmpfs",
+            target,
+            fs: "tmpfs",
+            flags: MountFlags::NOSUID | MountFlags::NODEV,
+            data: Some(c"mode=0755"),
+            expedite: false,
+        };
+        assert_eq!(
+            duties(&host),
+            vec![
+                Duty::Mount(vec![tmpfs(STATE), tmpfs(STAGED)]),
+                Duty::Dirs(&[CHANNEL, BOX_ROOT]),
+                Duty::Deadline(Deadline::Told(Some(4_200_000_000))),
+                Duty::Controllers,
+                Duty::FindExe,
+                Duty::Start(On::Unix(PathBuf::from(CHANNEL))),
+                Duty::Notify(PathBuf::from("/run/shards/notify")),
+                Duty::Serve(End::Exit),
+            ]
+        );
+    }
+
+    /// AC-T7.4.1 (docs/design/node-under-shards-init.md §2; sd_notify(3)): init tells its service manager it is ready
+    /// with one datagram, READY=1, on the socket the manager named, within what is left of the boot's deadline. Do:
+    /// bind a datagram socket as shards-init binds its own, tell it ready with no deadline and with the latest the
+    /// guest's clock names, then with one passed. Expect: READY=1 read whole each time, and past the deadline a
+    /// refusal as timed out, with nothing sent.
+    #[test]
+    fn init_tells_its_manager_it_is_ready_in_one_datagram_within_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("notify");
+        let manager = std::os::unix::net::UnixDatagram::bind(&socket).unwrap();
+        // A local datagram is on the manager's queue once its send returns (unix(7)), so nothing is waited for.
+        manager.set_nonblocking(true).unwrap();
+        let latest = deadline_at(u128::from(u64::MAX), Instant::now(), boottime_ns());
+        assert!(latest.is_some());
+        for by in [None, latest] {
+            notify_ready(&socket, by).unwrap();
+            let mut got = [0u8; 64];
+            let n = manager.recv(&mut got).unwrap();
+            assert_eq!(&got[..n], READY, "{by:?}");
+        }
+        let passed = notify_ready(&socket, Some(Instant::now()));
+        assert!(
+            matches!(&passed, Err(e) if e.kind() == io::ErrorKind::TimedOut),
+            "{passed:?}"
+        );
+        let mut got = [0u8; 64];
+        assert_eq!(
+            manager.recv(&mut got).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    /// AC-T7.4.1, joint plan step 39 (docs/design/node-under-shards-init.md §8): Hex's PID-1 path is kept whole. Do:
+    /// read init's host from a kernel's environment, which holds no `NOTIFY_SOCKET`, then its duties. Expect: every
+    /// duty it has as the VM's init, in the order it has done them: leave the initramfs, mount §4's file systems, make
+    /// the node's directories, mount the kernel's shares, take the kernel's deadline, enable the controllers, write
+    /// the GPU catalog, give the node its descriptors, start the node and the relay on vsock, tell Firecracker where
+    /// it asks, and power off at the end.
+    #[test]
+    fn as_the_vms_init_init_keeps_every_duty_it_had() {
+        let host = host(|_| None).unwrap();
+        assert_eq!(host, Host::Kernel);
+        assert_eq!(
+            duties(&host),
+            vec![
+                Duty::LeaveInitramfs,
+                Duty::Mount(mounts().to_vec()),
+                Duty::Dirs(&[RUN, STATE, BOX_ROOT]),
+                Duty::KernelShares,
+                Duty::Deadline(Deadline::Kernel),
+                Duty::Controllers,
+                Duty::FindExe,
+                Duty::GpuAuthority,
+                Duty::Descriptors,
+                Duty::Start(On::Vsock),
+                Duty::TellFirecracker,
+                Duty::Serve(End::PowerOff),
+            ]
+        );
+    }
+
+    /// AC-T7.4.1, joint plan step 39 (original): the VM's own init found itself through `/proc/self/exe` before it had
+    /// mounted `/proc`, and died: "hex guest: finding /init: no /proc/self/exe available. Is /proc mounted?", then
+    /// "Kernel panic - not syncing: Attempted to kill init!" (guest_cost on KVM, adacachy2, main 7095f460; 219a8844
+    /// resolved it ahead of every duty). Do: walk each host's duties in order. Expect: as the VM's init, no duty reads
+    /// `/proc` before the duty that mounts it; under shards-init, whose `/proc` is its manager's, no duty mounts it.
+    #[test]
+    fn original_as_the_vms_init_nothing_reads_proc_before_it_is_mounted() {
+        let mut mounted = false;
+        for duty in duties(&Host::Kernel) {
+            assert!(
+                mounted || !duty.reads_proc(),
+                "{duty:?} reads /proc before init mounts it"
+            );
+            mounted |= duty.mounts_proc();
+        }
+        assert!(mounted, "the VM's init mounts no /proc");
+        let manager = Host::Manager {
+            notify: PathBuf::from("/run/shards/notify"),
+            ready_by: None,
+        };
+        let duties = duties(&manager);
+        assert!(duties.iter().any(Duty::reads_proc));
+        assert!(
+            !duties.iter().any(Duty::mounts_proc),
+            "init mounts a /proc over its manager's"
+        );
+    }
+
+    /// AC-T7.4.1 (docs/design/node-under-shards-init.md §3): init's host comes from the words only that host sets. Do:
+    /// read the host from shards-init's environment with no deadline and with one passed before its run arrived (0),
+    /// then from environments whose socket isn't an absolute path, whose deadline isn't nanoseconds on the guest's
+    /// clock, and with a deadline and no socket. Expect: a service manager with no deadline, one with the deadline 0,
+    /// and a refusal naming the word for each of the rest.
+    #[test]
+    fn init_reads_its_host_from_the_words_only_its_host_sets() {
+        let notify = PathBuf::from("/run/shards/notify");
+        assert_eq!(
+            host(shards_inits(None)),
+            Ok(Host::Manager {
+                notify: notify.clone(),
+                ready_by: None,
+            })
+        );
+        assert_eq!(
+            host(shards_inits(Some("0"))),
+            Ok(Host::Manager {
+                notify,
+                ready_by: Some(0),
+            })
+        );
+        let past = (u128::MAX).to_string() + "0";
+        for bad in ["", "x", "-1", "+1", "1.5", " 1", "1 ", past.as_str()] {
+            let why = host(shards_inits(Some(bad))).unwrap_err();
+            assert!(why.contains(SHARDS_READY_BY), "{bad:?}: {why}");
+        }
+        for socket in ["", "run/shards/notify", "@shards", "vsock:2:9"] {
+            let why = host(|name| (name == NOTIFY_SOCKET).then(|| socket.into())).unwrap_err();
+            assert!(why.contains(NOTIFY_SOCKET), "{socket:?}: {why}");
+        }
+        let why = host(|name| (name == SHARDS_READY_BY).then(|| "1".into())).unwrap_err();
+        assert!(why.contains(NOTIFY_SOCKET), "{why}");
     }
 
     /// HEX-GUEST-37 (the boot split, bench/native/guest/boot-split): the relay's stamps line is init's three
