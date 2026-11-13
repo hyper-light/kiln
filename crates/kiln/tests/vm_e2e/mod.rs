@@ -1212,6 +1212,9 @@ pub enum Stall {
     Stuck(Stuck),
     /// No progress for a whole window as long as the slowest answer its harness gave in this drive.
     Quiet { quiet: Duration, slowest: Duration },
+    /// Its message waits in kiln's queue (its delivery `queued`, or in the queue) on an idle session for
+    /// a whole window, and no cause kiln states applies to it ([`holds`]): kiln never hands it over.
+    DeliveryStuck { message: String, quiet: Duration, slowest: Duration },
 }
 
 impl std::fmt::Display for Stall {
@@ -1219,6 +1222,10 @@ impl std::fmt::Display for Stall {
         match self {
             Self::Stuck(s) => std::fmt::Display::fmt(s, f),
             Self::Quiet { quiet, slowest } => write!(f, "no progress for {quiet:?}, a whole window as long as its slowest answer in this drive ({slowest:?})"),
+            Self::DeliveryStuck { message, quiet, slowest } => write!(
+                f,
+                "delivery stuck: {message} waits in kiln's queue on an idle session, and no cause kiln states applies to it (admission's own wait on it, a room wait, a pause, a freeze), for {quiet:?}, a whole window as long as its slowest answer in this drive ({slowest:?})"
+            ),
         }
     }
 }
@@ -1278,6 +1285,28 @@ const TOLD_FIELDS: [&str; 21] = [
 /// it (2026-11-13), whole where shorter.
 const TOLD: usize = 80;
 
+/// kiln's admission's word on each message it was offered, as the session's feed says it: each
+/// `mail_flow` frame (`harness::admission::FlowEvent`, `wire::ui::SessionFrame::MailFlow`) with the
+/// message's publication, whose id is the message's. The latest word on each message, by its id. The
+/// admission capacity kiln's word on a session carries names no message and states no cause.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Admission {
+    said: std::collections::BTreeMap<String, Value>,
+}
+
+impl Admission {
+    /// A frame of the session's feed: a `mail_flow` frame naming its message's publication is
+    /// admission's latest word on that message; any other frame says nothing of admission.
+    pub fn heard(&mut self, frame: &Value) {
+        if frame.get("t").and_then(Value::as_str) != Some("mail_flow") {
+            return;
+        }
+        if let (Some(id), Some(event)) = (frame.pointer("/publication/id").and_then(Value::as_str), frame.get("event")) {
+            self.said.insert(id.to_owned(), event.clone());
+        }
+    }
+}
+
 /// One wait's memory of its looks at its session ([`Watch::look`]).
 #[derive(Debug, Clone)]
 pub struct Watch<'a> {
@@ -1290,11 +1319,19 @@ pub struct Watch<'a> {
     /// An end of its harness's that kiln had set no restart for yet: its `exit.at`, and kiln's word's
     /// time (`last_activity`) when it was seen.
     end: Option<(i64, i64)>,
+    /// kiln's admission's word on each message, from the session's feed ([`Watch::heard`]).
+    admission: Admission,
 }
 
 impl<'a> Watch<'a> {
     pub fn new(asked: Asked<'a>, window: Option<Duration>) -> Self {
-        Self { asked, window, seen: None, moved: Duration::ZERO, end: None }
+        Self { asked, window, seen: None, moved: Duration::ZERO, end: None, admission: Admission::default() }
+    }
+
+    /// A frame of the session's feed, as the wait's socket read it ([`Wake::next`]): admission's word
+    /// on a message, where it is one ([`Admission::heard`]).
+    pub fn heard(&mut self, frame: &Value) {
+        self.admission.heard(frame);
     }
 
     /// The message the wait asked for an answer to, by what [`is_message`] takes: none for a stop and
