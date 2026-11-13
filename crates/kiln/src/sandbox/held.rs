@@ -16,10 +16,11 @@ use std::time::Duration;
 use futures::channel::oneshot;
 use kiln_seams::sandbox::{Exit, Link, Output, Refusal, Run, Signal};
 
-/// A boundary's run, the image it runs, and whether its end has come.
+/// A boundary's run, the image it runs and what it reaches of it, and whether its end has come.
 pub struct Held {
     run: Arc<dyn Run>,
     image: String,
+    reach: crate::sandbox::narrow::Reach,
     ended: AtomicBool,
     changed: crate::rt::Changed,
 }
@@ -33,11 +34,11 @@ pub struct Parts {
     pub held: Arc<Held>,
 }
 
-/// `run`'s stdio and end as a `Duplex`'s, `run` a member of `image`: one task writes what's sent to
-/// its stdin, in order, and closes its stdin once nothing more can be sent; another hands on what it
-/// says and its end.
-pub fn pump(run: Box<dyn Run>, image: String) -> Parts {
-    let held = Arc::new(Held { run: Arc::from(run), image, ended: AtomicBool::new(false), changed: crate::rt::Changed::new() });
+/// `run`'s stdio and end as a `Duplex`'s, `run` a member of `image` reaching `reach` of its
+/// destinations: one task writes what's sent to its stdin, in order, and closes its stdin once
+/// nothing more can be sent; another hands on what it says and its end.
+pub fn pump(run: Box<dyn Run>, image: String, reach: crate::sandbox::narrow::Reach) -> Parts {
+    let held = Arc::new(Held { run: Arc::from(run), image, reach, ended: AtomicBool::new(false), changed: crate::rt::Changed::new() });
     let (in_tx, in_rx) = crate::memory::queue::unbounded::<Vec<u8>>(&crate::memory::owners::CHANNELS);
     // A process's pipes' bounds, so its session's loop reads it as it reads a process.
     let (out_tx, stdout) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, crate::proc::STDOUT_CHUNKS);
@@ -142,6 +143,11 @@ impl Held {
     pub fn image(&self) -> &str {
         &self.image
     }
+
+    /// What it reaches past its boundary, of what its image grants, as it was launched.
+    pub fn reach(&self) -> &crate::sandbox::narrow::Reach {
+        &self.reach
+    }
 }
 
 #[cfg(test)]
@@ -149,9 +155,14 @@ mod tests {
     use super::*;
     use kiln_seams::sandbox::{Holds, Launch, Sandbox as _, SimSandbox};
 
+    /// A simulated run's reach: its image's whole, one use.
+    fn sim_reach() -> crate::sandbox::narrow::Reach {
+        crate::sandbox::narrow::Reach::Whole { why: crate::sandbox::narrow::Whole::OneUse }
+    }
+
     async fn launched(s: &SimSandbox, program: &str) -> anyhow::Result<Parts> {
         let run = s.launch(Launch::of(program, &[])).await.map_err(anyhow::Error::msg)?;
-        Ok(pump(run, "sim".to_owned()))
+        Ok(pump(run, "sim".to_owned(), sim_reach()))
     }
 
     /// Step 17: what a session writes reaches the run in order and comes back on its stdout; the
@@ -203,7 +214,7 @@ mod tests {
     fn s17_a_held_duplex_is_no_process_hands_nothing_over_and_stops_through_its_boundary() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let run = SimSandbox::new().launch(Launch::of("wait", &[])).await.map_err(anyhow::Error::msg)?;
-            let mut p = crate::proc::duplex_of_run(run, "sim".to_owned());
+            let mut p = crate::proc::duplex_of_run(run, "sim".to_owned(), sim_reach());
             assert_eq!(p.host_pid(), None);
             assert!(p.detach().await.is_none(), "nothing of it is this process's to hand over");
             p.terminate(Duration::from_secs(30));
@@ -219,7 +230,7 @@ mod tests {
         crate::rt::block_on(async {
             let s = SimSandbox::new();
             let run = s.launch(Launch::of("echo", &[])).await.map_err(anyhow::Error::msg)?;
-            let p = pump(run, "sim".to_owned());
+            let p = pump(run, "sim".to_owned(), sim_reach());
             let held = Arc::clone(&p.held);
             let Parts { stdin, stdout, .. } = p;
             drop(stdout);

@@ -99,6 +99,12 @@ impl Returning {
         !reported.sessions.contains(id) && self.expected.load().iter().all(|m| reported.machines.contains(m))
     }
 
+    /// Whether the server can say now, without waiting, that it has session `id` or hasn't: as [`Returning::wait`]
+    /// would be back at once (no server armed it, past the runners' grace, or settled).
+    pub fn says(&self, id: &str, has: impl FnOnce() -> bool) -> bool {
+        self.until.get().is_none_or(|until| Instant::now() >= *until) || self.settled(id, has)
+    }
+
     /// Back once the server can say it has session `id` or hasn't ([`Returning::settled`]), `has` saying whether it
     /// has a copy of it. Back at once past the runners' grace, and in a registry no server armed.
     pub async fn wait(&self, id: &str, has: impl Fn() -> bool) {

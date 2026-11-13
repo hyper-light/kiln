@@ -228,7 +228,10 @@ another, as before. A step alone (nothing beside it ready or under way) is the a
   how ("Met by its subagent “Step 3: API” (01a1b2c3): the agent said so: its tests pass"); the
   subagent ends once it has settled, so it holds no room, and the next steps go.
 - **Not met there** (given up, skipped or cleared there, or the subagent ended): the step comes back
-  to the stack ("Back from its subagent: …"), and the agent takes it itself.
+  to the stack ("Back from its subagent: …"), and the agent takes it itself. A subagent's end brings
+  its step back as it ends, however it ends (stopped, or closed on its machine); a step held by one
+  the server no longer has comes back at the driver's next look, and before any change it would
+  refuse (a split, an update, an order, a plan), saying its subagent is gone.
 - **Paused**: the stack paused (by you, by the agent, for usage), its steps' subagents pause too,
   and resume with it. A step taken out of the stack, said met here by someone else, or the stack
   cleared: its subagent ends. Its own stack doesn't wait for them as it waits for agents it started
@@ -321,7 +324,7 @@ turned off):
 - **Under way there, under way here.** A goal out on a subagent is under way on the stack
   (`active`, its `subagent` kept) while the agent's own goal under way goes on beside it. Met
   there, it's met here, saying which subagent met it and how; not met there (given up, skipped or
-  cleared there, the subagent ended), it comes back and the agent takes it itself. The stack paused,
+  cleared there, the subagent ended or gone), it comes back and the agent takes it itself. The stack paused,
   its subagents pause, and resume with it; a goal taken out, said met here, skipped, or the stack
   cleared: its subagent ends. A hand-off cut short by a restart is taken up by the subagent it
   started, never by a second one.
