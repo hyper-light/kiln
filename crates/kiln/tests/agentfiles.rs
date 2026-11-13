@@ -1,9 +1,8 @@
 //! Agentfiles kept in kiln (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 30), through each surface
 //! people and agents reach them by: the routes, the operations over HTTP, MCP and code mode. Two
-//! developers each keep their own and reach no one else's; an admin reaches both; a text the server's
-//! Shards refuses isn't kept, in Shards' words; a project's own are listed read only. The server's
-//! `shards` is a stand-in that answers as shards 0.7.0 answers its check (`crate::agentfiles::check`'s
-//! recorded answers): a `FORM` line refused at its line, anything else passed.
+//! developers each keep their own and reach no one else's; an admin reaches both; a text Shards refuses
+//! isn't kept, in Shards' words; a project's own are listed read only. Shards checks each text in the
+//! server's own process (`crate::agentfiles::check`, step 16): no `shards` is on its `PATH`.
 //!
 //! `cargo test -p kiln --test agentfiles`
 
@@ -11,31 +10,12 @@
 
 mod common;
 
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::{Options, Server, http, start_env};
 use serde_json::{Value, json};
-
-/// Answers as `shards build --call=check,format=json --target kiln:static-check` does.
-const SHARDS: &str = r#"#!/bin/sh
-f=""
-while [ $# -gt 0 ]; do
-  if [ "$1" = "-f" ]; then f="$2"; fi
-  shift
-done
-line=$(grep -n '^FORM' "$f" | head -n 1 | cut -d: -f1)
-if [ -n "$line" ]; then
-  printf '{"warnings":null,"sources":[{"filename":"Agentfile","language":"Agentfile"}],"buildError":{"message":"dockerfile parse error on line %s: unknown instruction: FORM (did you mean FROM?)","location":{"ranges":[{"start":{"line":%s},"end":{"line":%s}}]}}}\n' "$line" "$line" "$line"
-  echo "ERROR: dockerfile parse error on line $line: unknown instruction: FORM (did you mean FROM?)" >&2
-else
-  printf '{"warnings":null,"sources":[{"filename":"Agentfile","language":"Agentfile"}],"buildError":{"message":"target stage \\"kiln:static-check\\" could not be found","location":{}}}\n'
-  echo 'ERROR: target stage "kiln:static-check" could not be found' >&2
-fi
-exit 1
-"#;
 
 const CLAUDE: &str = "FROM ubuntu:24.04\nHARNESS claude FROM ./harness\nAGENT main FROM ./agent\nATTACH main FOR claude\nCMD [\"claude\"]\n";
 const CLAUDE_2: &str = "FROM rust:1.91\nHARNESS claude FROM ./harness\nAGENT main FROM ./agent\nATTACH main FOR claude\nCMD [\"claude\"]\n";
@@ -83,12 +63,7 @@ fn s(v: &Value, pointer: &str) -> String {
 #[test]
 fn step30_agentfiles_on_every_surface() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let bin = dir.path().join("bin");
-    std::fs::create_dir_all(&bin)?;
-    std::fs::write(bin.join("shards"), SHARDS)?;
-    std::fs::set_permissions(bin.join("shards"), std::fs::Permissions::from_mode(0o755))?;
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
-    let srv = start_env(dir.path(), &Options::default(), false, &[("PATH", &path)])?;
+    let srv = start_env(dir.path(), &Options::default(), false, &[])?;
     let ada = person(&srv, "ada", &["developer"])?;
     let bo = person(&srv, "bo", &["developer"])?;
     let root = person(&srv, "root", &["admin"])?;
@@ -188,5 +163,21 @@ fn step30_agentfiles_on_every_surface() -> anyhow::Result<()> {
     anyhow::ensure!(st == 200 && said == json!({ "deleted": true }), "{st} {said}");
     let (st, _) = call(&srv, &ada, "GET", &format!("/api/agentfiles/{id}/versions"), None)?;
     anyhow::ensure!(st == 404, "{st}");
+
+    // The live round trip (docs/research/s30-agentfiles/live.py, what ROOT runs against production)
+    // held to this server: each operation over REST and MCP, kept to its owner, Shards' refusal, and
+    // what it made taken back.
+    let harness = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/research/s30-agentfiles/live.py");
+    let out = Command::new("python3").arg(harness).env("KILN_URL", format!("http://127.0.0.1:{}", srv.port)).env("KILN_ADMIN_TOKEN", &srv.admin).output()?;
+    let said = String::from_utf8_lossy(&out.stdout);
+    print!("{said}");
+    let passed = |surface: &str| said.lines().filter(|l| l.starts_with(&format!("PASS {surface} "))).count();
+    anyhow::ensure!(
+        out.status.success() && !said.lines().any(|l| l.starts_with("FAIL ")) && passed("REST") > 0 && passed("MCP") > 0,
+        "live.py: {:?}\n{said}{}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+        srv.log()
+    );
     Ok(())
 }

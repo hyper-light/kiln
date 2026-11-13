@@ -1048,7 +1048,15 @@ def takes(spec: dict, path: str) -> bool:
     return not take or take == ["."] or any(path == t or path.startswith(t.rstrip("/") + "/") or t.startswith(path + "/") for t in take)
 
 
-def pin_problems(manifest: Manifest, project: Project, revision: str, upstream: GitUpstream | BunUpstream) -> list[str]:
+def holds_its_pins(project: Project) -> bool:
+    """Whether kiln's copy of a project holds the project's own manifest, so that its pins (and its
+    records of changes to what it vendors) are read from kiln's copy, kiln's recorded changes to
+    them included: a product whose upstream pins another revision than kiln's is held to kiln's by
+    a recorded change that moves its pins (as Hex's to kiln's Shards and hyper-raft)."""
+    return project.kind == "git" and takes(project.spec, MANIFEST)
+
+
+def pin_problems(manifest: Manifest, project: Project, revision: str, upstream: GitUpstream | BunUpstream, tree: Tree | None = None, layout_only: bool = False) -> list[str]:
     """kiln holds one copy of each project, so a project that vendors others (a hyper-light
     product) must agree with kiln on each of them:
     - one kiln vendors too it takes at kiln's revision with the same recorded changes (but those
@@ -1057,13 +1065,22 @@ def pin_problems(manifest: Manifest, project: Project, revision: str, upstream: 
       points at its own copy);
     - a hyper-light product is always one kiln holds itself, and so is caught by the rule above;
     - anything else (third-party code only that product vendors, as Turso in Amphora) stays inside
-      the product's copy, which is kiln's one copy of it."""
+      the product's copy, which is kiln's one copy of it.
+    Its pins and records are upstream's at revision, or, where kiln's copy holds its manifest
+    (`holds_its_pins`), those of `tree`: kiln's copy as its recorded changes leave it. With
+    `layout_only`, only what kiln's own manifest must change for (a second copy taken), which no
+    recorded change can mend."""
     if not isinstance(upstream, GitUpstream):
         return []
     tool = upstream.show(revision, "scripts/vendor.py")
     if tool is not None and tool != Path(__file__).read_bytes():
         say(f"{project.name} at {revision[:12]} carries a scripts/vendor.py other than kiln's: give it kiln's")
-    text = upstream.show(revision, MANIFEST)
+    held = tree is not None and holds_its_pins(project)
+    if held and tree is not None:
+        entry = tree.get(MANIFEST)
+        text = entry[1] if entry else None
+    else:
+        text = upstream.show(revision, MANIFEST)
     if text is None:
         return []
     try:
@@ -1076,18 +1093,24 @@ def pin_problems(manifest: Manifest, project: Project, revision: str, upstream: 
         pin = spec.get("commit") or spec.get("version")
         ours = manifest.projects.get(name)
         if ours is None:
-            if is_product(spec.get("repository", "")):
+            if is_product(spec.get("repository", "")) and not layout_only:
                 out.append(f"{at} vendors the hyper-light product {name} at {pin}; kiln holds one copy of each product: add {name} to {MANIFEST} at {pin}")
+            continue
+        if takes(project.spec, spec.get("path", f"vendor/{name}")):
+            out.append(f"kiln's copy of {project.name} would hold a second {name}: add \"{spec.get('path', f'vendor/{name}')}\" to [projects.{project.name}] exclude")
+        if layout_only:
             continue
         if ours.revision != pin:
             out.append(f"{at} takes {name} at {pin}; kiln takes {name} at {ours.revision}: the pins must agree")
-        theirs_changes = upstream.files(revision, f"{PATCHES}/{name}")
+        if held and tree is not None:
+            prefix = f"{PATCHES}/{name}/"
+            theirs_changes = {rel.removeprefix(prefix): data for rel, (_, data) in tree.items() if rel.startswith(prefix)}
+        else:
+            theirs_changes = upstream.files(revision, f"{PATCHES}/{name}")
         ours_changes = {c.name: c.header.encode("utf-8") + c.diff for c in load_changes(manifest.root, ours) if not c.kiln_only}
         if theirs_changes != ours_changes:
             differ = sorted(n for n in set(theirs_changes) | set(ours_changes) if theirs_changes.get(n) != ours_changes.get(n))
             out.append(f"{at} records other changes to {name} than kiln does ({', '.join(differ)}): kiln's must be the product's")
-        if takes(project.spec, spec.get("path", f"vendor/{name}")):
-            out.append(f"kiln's copy of {project.name} would hold a second {name}: add \"{spec.get('path', f'vendor/{name}')}\" to [projects.{project.name}] exclude")
     return out
 
 
@@ -1108,7 +1131,7 @@ def check(manifest: Manifest, names: list[str], sources: dict[str, str], kind: s
             if diffs:
                 problems.append(f"{project.path}: record kiln's edits with `scripts/vendor.py record {name} <title> --why <why>`")
             problems += missing_from_notes(root, project, exp.changes)
-            problems += pin_problems(manifest, project, project.revision, exp.upstream)
+            problems += pin_problems(manifest, project, project.revision, exp.upstream, exp.tree)
             if isinstance(exp.upstream, BunUpstream) and exp.facts:
                 problems += exp.upstream.notice_problems(exp.facts)
             say(f"{name}: {len(exp.tree)} files at {project.revision}, {len(exp.changes)} recorded changes, {len(diffs)} differences")
@@ -1237,11 +1260,11 @@ def revendor(manifest: Manifest, name: str, revision: str, source: str | None, g
             return finish(manifest, project, revision, here, new_tree, [], facts, up_b, old.facts if old else None, gate)
         up_g = GitUpstream(project, source)
         base = up_g.tree(revision)
-        problems = pin_problems(manifest, project, revision, up_g)
+        problems = pin_problems(manifest, project, revision, up_g, layout_only=holds_its_pins(project))
         if problems:
             raise Refused("\n  ".join(["the projects' pins don't agree:", *problems]))
         if old is None or old.scratch is None or not old.changes:
-            return finish(manifest, project, revision, here, base, [], None, up_g, None, gate)
+            return finish_held(manifest, project, revision, here, base, [], up_g, gate)
         s = old.scratch
         s.git(["switch", "-q", "--orphan", "next"])
         s.set_tree(base)
@@ -1252,7 +1275,27 @@ def revendor(manifest: Manifest, name: str, revision: str, source: str | None, g
     finally:
         if old and old.scratch and not old.scratch.kept:
             old.scratch.close()
-    return finish(manifest, project, revision, here, new_tree, new_changes, None, up_g, None, gate)
+    return finish_held(manifest, project, revision, here, new_tree, new_changes, up_g, gate)
+
+
+def finish_held(manifest: Manifest, project: Project, revision: str, here: Tree, new_tree: Tree, new_changes: list[Change], upstream: GitUpstream, gate: bool) -> int:
+    """`finish` for a git project; where kiln's copy holds the project's own pins, they are checked
+    on that copy as its recorded changes leave it. Pins that don't agree there leave the new tree in
+    place, the gate not run, for the change that moves them to be recorded (the first take of a
+    product can't carry one yet)."""
+    if not holds_its_pins(project):
+        return finish(manifest, project, revision, here, new_tree, new_changes, None, upstream, None, gate)
+    problems = pin_problems(manifest, project, revision, upstream, new_tree)
+    rc = finish(manifest, project, revision, here, new_tree, new_changes, None, upstream, None, gate and not problems)
+    if not problems:
+        return rc
+    for p in problems:
+        say(p)
+    say(
+        f"{project.name}: the pins kiln's copy holds ({project.path}/{MANIFEST}) don't agree with kiln's; the new tree is in place, "
+        f"the gate not run: move them to kiln's there, and record it (scripts/vendor.py record {project.name} <title> --why <why>)"
+    )
+    return 1
 
 
 def resume(manifest: Manifest, name: str, gate: bool) -> int:
@@ -1279,7 +1322,7 @@ def resume(manifest: Manifest, name: str, gate: bool) -> int:
     commit_step(s, r, step, Change(file=Path(step["file"]), header=step["header"], diff=b"").title)
     r.save(s)
     new_tree, new_changes = carry(root, project, s, r)
-    rc = finish(manifest, project, r.revision, here, new_tree, new_changes, None, GitUpstream(project, r.source), None, gate)
+    rc = finish_held(manifest, project, r.revision, here, new_tree, new_changes, GitUpstream(project, r.source), gate)
     shutil.rmtree(where, ignore_errors=True)
     return rc
 

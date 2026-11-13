@@ -1,0 +1,58 @@
+[package]
+name = "shards-vmm"
+version = "0.1.0"
+description = "The shards virtual machine monitor (library)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The GPU's renderer, linked from the libraries scripts/gpu-libs builds (SHARDS_GPU_LIBS):
+# `shards-vm-gpu` alone has it (D144, PM M214).
+gpu = []
+
+[dependencies]
+shards-abi = { path = "../abi" }
+shards-netring = { path = "../netring" }
+# A share's server hands the VM process a file's object for a DAX window (D189): a descriptor
+# on Unix, a section's handle's value on Windows.
+shards-ipc = { path = "../ipc" }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+shards-syscall-filter = { path = "../syscall-filter" }
+
+[target.'cfg(windows)'.dependencies]
+shards-afunix = { path = "../afunix" }
+shards-ntfs = { path = "../ntfs" }
+windows-sys = { workspace = true, features = [
+  "Wdk_Foundation",
+  "Wdk_Storage_FileSystem",
+  "Win32_Globalization",
+  "Win32_Security",
+  "Win32_System_Hypervisor",
+  "Win32_System_Ioctl",
+  # A job's commit limits, a thread's TEB and the image's stack commit, for how many threads
+  # a process may have (platform::thread_limit).
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_JobObjects",
+  "Win32_System_Kernel",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Performance",
+  "Win32_System_Pipes",
+  "Win32_System_ProcessStatus",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+  # A DAX window's answer must name a section or a file (NtQueryObject's type record).
+  "Wdk_Foundation",
+  "Win32_System_WindowsProgramming",
+] }
+
+[dev-dependencies]
+shards-testdir = { path = "../testdir" }

@@ -1,0 +1,46 @@
+[package]
+name = "hex-client"
+description = "Hex's Runtime seam over the node agent's local socket: a hex_api::Runtime whose boxes are a node agent's in another process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex-api.workspace = true
+hex-core.workspace = true
+# A root given as a tarball, staged from its own entries (docs/design/shards-guest.md §4a).
+flate2.workspace = true
+shards-api.workspace = true
+tar.workspace = true
+# The reader's turn waits on the node agent's connection with poll(2), Winsock's WSAPoll on Windows (src/calls.rs).
+rustix.workspace = true
+# A layer tarball's digest, its name in the guest's layer store (docs/design/shards-guest.md §4a).
+sha2.workspace = true
+triomphe = { workspace = true, features = ["unsize"] }
+unsize.workspace = true
+# Condition variables whose timed waits end at their deadlines on macOS too (docs/design/deadline-waits.md).
+hex-wait.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+hex-afunix.workspace = true
+
+[dev-dependencies]
+# The tests wait on their own facts' patiences (src/calls/budget_tests.rs, src/copy/tests.rs).
+hex-testkit.workspace = true
+tempfile.workspace = true
+# tests/shards_borrowed_contract.rs, Hex's campaign over shards-api's borrowed connector: its directories,
+# and on Windows the AF_UNIX listener and the process calls it counts handles with, as when Shards' API carried it.
+shards-testdir = { path = "../../vendor/shards/crates/testdir" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+shards-afunix = { path = "../../vendor/shards/crates/afunix" }
+windows-sys.workspace = true
+
+[lints]
+workspace = true

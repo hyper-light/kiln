@@ -26,6 +26,8 @@ pub mod answer;
 pub mod handoff;
 pub mod ask;
 pub mod budget;
+pub mod holder;
+pub mod keeper;
 pub mod keys;
 pub mod line;
 pub mod link;
@@ -39,6 +41,10 @@ mod balance_tests;
 mod durable_tests;
 #[cfg(test)]
 mod fair_tests;
+#[cfg(test)]
+mod holder_tests;
+#[cfg(test)]
+mod keeper_tests;
 #[cfg(test)]
 mod model;
 #[cfg(test)]

@@ -9,9 +9,12 @@ import gc
 import json
 import os
 import random
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -23,6 +26,33 @@ from fleetlib.agent import needs_room  # noqa: E402
 from fleetlib.shards import Shards  # noqa: E402
 
 W = witness
+
+# A local echo: `cat` where the host has one, else Python copying its stdin to its stdout as each
+# read returns (Windows without Git's tools).
+ECHO = ["cat"] if shutil.which("cat") else [sys.executable, "-u", "-c", "import shutil,sys;shutil.copyfileobj(sys.stdin.buffer.raw,sys.stdout.buffer.raw)"]
+
+
+def standin_shards(d):
+    """A stand-in `shards` whose every call is ECHO (each VM a local echo; `list` and `remove`
+    answer nothing): a shell script, or on Windows a command script."""
+    if sys.platform == "win32":
+        path = os.path.join(d, "shards.cmd")
+        with open(path, "w") as f:
+            f.write("@" + subprocess.list2cmdline(ECHO) + "\r\n")
+        return path
+    path = os.path.join(d, "shards")
+    with open(path, "w") as f:
+        f.write("#!/bin/sh\nexec " + " ".join(shlex.quote(a) for a in ECHO) + "\n")
+    os.chmod(path, 0o755)
+    return path
+
+
+def lane_threads_end():
+    """Waits for every thread lane's threads to end (after their pipes did): a test's count of
+    descriptors then sees none of theirs."""
+    for t in threading.enumerate():
+        if t.name.startswith("lane-"):
+            t.join()
 
 
 class Stats(unittest.TestCase):
@@ -132,6 +162,19 @@ class Witnesses(unittest.TestCase):
     def kinds(self, found):
         return sorted(v["witness"] for v in found)
 
+    def test_asks_a_placer_names_no_process_for_are_judged_by_count(self):
+        ledger = live_ledger("a", "b")
+        view = {"a": None, "b": None}
+        vm = lambda pid: {"pid": pid, "role": "vm", "mem": 1000}  # noqa: E731
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10), vm(20)], view, self.room, None, True)), [])
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10)], view, self.room, None, True)), ["lost"])
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10), vm(20), vm(30)], view, self.room, None, True)), ["leaked"])
+        # A live ask the placer no longer holds is lost, and one it holds for an ask that ended is unasked.
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10)], {"a": None}, self.room, None, True)), ["lost"])
+        ledger["b"].move(W.STOPPING)
+        ledger["b"].move(W.ENDED)
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10), vm(20)], view, self.room, None, True)), ["leaked", "unasked"])
+
     def test_a_clean_scope_has_no_violation(self):
         ledger, scan, view = self.clean()
         self.assertEqual(W.check(ledger, scan, view, self.room, 4, True), [])
@@ -194,11 +237,15 @@ class Witnesses(unittest.TestCase):
         self.assertEqual(a.history, [W.ASKED, W.STARTING, W.LIVE, W.KILLED, W.ENDED])
 
 
-@unittest.skipIf(sys.platform == "win32", "lanes select on pipes, which Windows can't (README, Owed)")
-class Lanes(unittest.TestCase):
+class LaneCases:
+    """Each kind of lane, read the same way: the host's own (`lane.Lanes`) and, where the selector
+    runs, the threaded kind too, so Windows' is held to it on every OS."""
+
+    impl = None
+
     def setUp(self):
         self.ps = []
-        self.lanes = lane.Lanes()
+        self.lanes = self.impl()
         self.ended = {}
 
     def tearDown(self):
@@ -210,12 +257,14 @@ class Lanes(unittest.TestCase):
     def spawn(self, name, argv):
         p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
         self.ps.append(p)
-        self.lanes.add(lane.Stream(name, p.stdin.fileno(), p.stdout.fileno(), lambda why, n=name: self.ended.__setitem__(n, why)))
+        # Its stdin's own close ends the lane's input, as the agent's does: the file object never
+        # closes a descriptor that's gone.
+        self.lanes.add(lane.Stream(name, p.stdin.fileno(), p.stdout.fileno(), lambda why, n=name: self.ended.__setitem__(n, why), p.stdin.close))
         return p
 
     def test_round_trips_and_transfers_come_back_whole_on_every_lane_at_once(self):
         for i in range(4):
-            self.spawn(f"c{i}", ["cat"])
+            self.spawn(f"c{i}", ECHO)
         got = []
         for i in range(4):
             self.assertTrue(self.lanes.begin(f"c{i}", lane.control_message(i), lambda ok, took, why: got.append((ok, took, why))))
@@ -236,7 +285,7 @@ class Lanes(unittest.TestCase):
         self.assertIn("corrupt", got[0][1])
 
     def test_a_lane_whose_process_ends_says_so_as_an_event(self):
-        p = self.spawn("c", ["cat"])
+        p = self.spawn("c", ECHO)
         self.lanes.close("c")
         self.lanes.run(lambda: "c" in self.ended, time.monotonic_ns() + 10_000_000_000)
         self.assertEqual(self.ended.get("c"), "ended")
@@ -247,6 +296,63 @@ class Lanes(unittest.TestCase):
         self.assertEqual(len(p), 1 << 16)
         self.assertNotEqual(p[4:8], p[8:12])
         self.assertNotEqual(p[:4096], p[4096:8192])
+
+    def test_bytes_past_what_was_written_are_corrupt(self):
+        # A lane that says each line twice.
+        self.spawn("twice", [sys.executable, "-u", "-c", "import sys\nfor line in sys.stdin: sys.stdout.write(line + line)"])
+        got = []
+        self.lanes.begin("twice", b"x\n", lambda ok, took, why: got.append((ok, why)))
+        self.lanes.run(lambda: "twice" in self.ended, time.monotonic_ns() + 10_000_000_000)
+        self.assertIn("corrupt", self.ended.get("twice", ""))
+
+
+@unittest.skipIf(sys.platform == "win32", "select() waits on sockets alone on Windows (Python's select docs)")
+class SelectedLanes(LaneCases, unittest.TestCase):
+    impl = lane.Selected
+
+
+class ThreadedLanes(LaneCases, unittest.TestCase):
+    impl = lane.Threaded
+
+    def test_a_dropped_lanes_late_word_reaches_no_one(self):
+        # The lane answers after a pause; it is dropped before its answer comes.
+        self.spawn("late", [sys.executable, "-u", "-c", "import sys, time\nline = sys.stdin.readline()\ntime.sleep(0.2)\nsys.stdout.write(line)"])
+        heard = []
+        self.lanes.begin("late", b"x\n", lambda ok, took, why: heard.append((ok, why)))
+        self.lanes.drop("late")
+        for p in self.ps:
+            p.wait()
+        lane_threads_end()
+        self.lanes.poll()
+        self.assertEqual((heard, self.ended), ([], {}))
+
+    def test_a_lane_the_os_gives_no_thread_is_refused_and_leaves_nothing(self):
+        p = self.spawn("first", ECHO)
+        before = open_fds()
+        real = threading.Thread.start
+        calls = []
+
+        def second_fails(t):
+            calls.append(t.name)
+            if len(calls) == 2:
+                raise RuntimeError("can't start new thread")
+            return real(t)
+
+        threading.Thread.start = second_fails
+        try:
+            q = subprocess.Popen(ECHO, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+            self.ps.append(q)
+            with self.assertRaises(OSError):
+                self.lanes.add(lane.Stream("second", q.stdin.fileno(), q.stdout.fileno(), lambda why: None, q.stdin.close))
+        finally:
+            threading.Thread.start = real
+        self.assertNotIn("second", self.lanes.streams)
+        q.stdin.close()
+        q.wait()
+        q.stdout.close()
+        lane_threads_end_for("second")
+        self.assertEqual(open_fds(), before)
+        self.assertIsNone(p.poll())
 
 
 class Procs(unittest.TestCase):
@@ -288,6 +394,45 @@ class Procs(unittest.TestCase):
         self.assertGreaterEqual(got[0], soft)
         if sys.platform.startswith("linux"):
             self.assertEqual(got[0], got[1])
+
+    def test_one_reads_a_process_as_the_table_does(self):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            row = procs.table().get(p.pid)
+            me = procs.one(p.pid)
+            self.assertIsNotNone(row)
+            self.assertIsNotNone(me)
+            self.assertEqual((me.pid, me.start, me.name), (row.pid, row.start, row.name))
+            self.assertTrue(me.start)
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_a_windows_image_name_is_named_without_its_exe(self):
+        self.assertEqual([procs._image(n) for n in ("shards-vm.exe", "SHARDS-NET.EXE", "System", "exe")], ["shards-vm", "SHARDS-NET", "System", "exe"])
+
+    @unittest.skipIf(sys.platform == "win32", "Windows' exited processes are held by handles, not unreaped (test_kill_refuses_a_pid_whose_start_differs)")
+    def test_an_exited_process_is_gone_not_killed(self):
+        import select
+
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            # Its exit awaited as an event and left unreaped: a zombie, which nothing can kill.
+            if hasattr(os, "waitid") and hasattr(os, "WNOWAIT"):
+                os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)
+            else:
+                kq = select.kqueue()
+                try:
+                    kq.control([select.kevent(p.pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)], 1, None)
+                except ProcessLookupError:
+                    pass  # it had exited already
+                finally:
+                    kq.close()
+            me = procs.one(p.pid)
+            self.assertTrue(me is not None and me.zombie, me and me.brief())
+            self.assertEqual(procs.kill(p.pid, me.start), "gone")
+        finally:
+            p.wait()
 
     def test_kill_refuses_a_pid_whose_start_differs(self):
         p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -475,10 +620,7 @@ def shards_agent(d, delay_s=0.0, binary=None):
     from fleetlib.agent import Agent
 
     if binary is None:
-        binary = os.path.join(d, "shards")
-        with open(binary, "w") as f:
-            f.write("#!/bin/sh\nexec cat\n")
-        os.chmod(binary, 0o755)
+        binary = standin_shards(d)
     o = SimpleNamespace(deadline_s=60, out=d, shards=binary, seed=1, needs="mem=1g", label="h", image="i@sha256:00",
                         ballast=0, chaos="none", rounds=0, repo=d, rev="", controller_t=0, keep_home=False)
     rec = records.Records(os.path.join(d, "r.jsonl"), "h", "run")
@@ -487,23 +629,40 @@ def shards_agent(d, delay_s=0.0, binary=None):
     a.waits["start"].answered(1_000_000_000)
     a.scan = lambda why: {}
     if delay_s:
-        real = a.shards.start_vm
+        real = a.driver.start_vm
 
         def slow(*args, **kw):
             time.sleep(delay_s)
             return real(*args, **kw)
 
-        a.shards.start_vm = slow
+        a.driver.start_vm = slow
     return a, rec
 
 
+def lane_threads_end_for(name):
+    for t in threading.enumerate():
+        if t.name.startswith(f"lane-{name}-"):
+            t.join()
+
+
 def open_fds():
-    # Earlier tests' cyclic garbage (agents, their pipes) is collected first, never mid-count.
+    """This process's open descriptors (on Windows its handles). Earlier tests' cyclic garbage
+    (agents, their pipes) is collected first, never mid-count."""
     gc.collect()
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.GetProcessHandleCount.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        n = wintypes.DWORD()
+        if not k32.GetProcessHandleCount(k32.GetCurrentProcess(), ctypes.byref(n)):
+            raise OSError(ctypes.get_last_error(), "GetProcessHandleCount")
+        return n.value
     return len(os.listdir("/dev/fd"))
 
 
-@unittest.skipIf(sys.platform == "win32", "lanes select on pipes, which Windows can't (README, Owed)")
 class Asks(unittest.TestCase):
     """Asks on the real direct driver, each VM a local `cat`."""
 
@@ -533,6 +692,7 @@ class Asks(unittest.TestCase):
             self.assertEqual(len(a.live()), 5)
             self.assertGreater(open_fds(), before)
             a.drain()
+            lane_threads_end()
             self.assertEqual(open_fds(), before)
             self.assertEqual(a.states(), {W.ENDED: 5})
             rec.close()
@@ -550,7 +710,25 @@ class Asks(unittest.TestCase):
             self.assertEqual([r["refused"] for r in got if r["kind"] == "fill_stopped"], [[failed[0]["token"]]])
 
 
-@unittest.skipIf(sys.platform == "win32", "lanes select on pipes, which Windows can't (README, Owed)")
+    def test_a_lane_the_host_gives_nothing_for_is_a_typed_failure_that_stops_the_fill(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = shards_agent(d)
+
+            def refuse(stream):
+                raise OSError(24, "Too many open files")
+
+            a.lanes.add = refuse
+            a.fill("test")
+            a.drain()
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            failed = [r for r in got if r["kind"] == "start_failed"]
+            self.assertEqual(a.states(), {W.ENDED: 1})
+            self.assertEqual(len(failed), 1)
+            self.assertTrue(failed[0]["why"].startswith("lane: "), failed[0])
+            self.assertEqual([r["refused"] for r in got if r["kind"] == "fill_stopped"], [[failed[0]["token"]]])
+
+
 class Hold(unittest.TestCase):
     """The hold on live lanes: round trips, a turn's stream, then bulk rounds to a converged size."""
 
@@ -563,7 +741,7 @@ class Hold(unittest.TestCase):
     def test_a_hold_takes_every_kind_of_sample_on_every_lane(self):
         with tempfile.TemporaryDirectory() as d:
             # A room of 1 MiB bounds the bulk rounds at a few hundred KiB, so the test stays light.
-            a, rec, ps = lane_agent(d, 60, "mem=1m", {"t1": ["cat"], "t2": ["cat"]})
+            a, rec, ps = lane_agent(d, 60, "mem=1m", {"t1": ECHO, "t2": ECHO})
             a.waits["start"].answered(1_000_000_000)
             try:
                 a.hold("test")
@@ -604,6 +782,242 @@ class Hold(unittest.TestCase):
             self.assertEqual([r.get("at") for r in outs if "at" in r], ["the run's deadline"])
             self.assertGreaterEqual(time.monotonic_ns(), a.deadline_ns)
             self.assertGreater(a.deadline_ns, began)
+
+
+def hex_agent(d, refuse=None, needs="mem=120m", refuse_after=0):
+    """An agent on the hex driver over the stand-in hex (tests/fake_hex.py) and the echo stand-in
+    `shards`."""
+    from types import SimpleNamespace
+
+    from fleetlib.agent import Agent
+
+    fake = os.path.join(d, "hex")
+    with open(fake, "w") as f:
+        f.write(f"#!{sys.executable}\n" + open(os.path.join(HERE, "fake_hex.py")).read())
+    os.chmod(fake, 0o755)
+    if refuse:
+        os.environ["FAKE_HEX_REFUSE"] = refuse
+        os.environ["FAKE_HEX_REFUSE_AFTER"] = str(refuse_after)
+    else:
+        os.environ.pop("FAKE_HEX_REFUSE", None)
+    o = SimpleNamespace(deadline_s=60, out=d, shards=standin_shards(d), hex=fake, vm="cpus=1,mem=64m", driver="hex", seed=1, needs=needs, label="h",
+                        image="i@sha256:00", ballast=0, chaos="vm,node,scheduler", rounds=1, repo=d, rev="", controller_t=0, keep_home=False)
+    rec = records.Records(os.path.join(d, "r.jsonl"), "h", "run")
+    return Agent(o, rec), rec
+
+
+@unittest.skipIf(sys.platform == "win32", "the stand-in hex is a POSIX script (Hex's image class boots no VM on Windows yet)")
+class HexDriver(unittest.TestCase):
+    """The hex driver over a stand-in that answers Submit, Status and Delete as Hex documents them."""
+
+    def tearDown(self):
+        os.environ.pop("FAKE_HEX_REFUSE", None)
+        os.environ.pop("FAKE_HEX_REFUSE_AFTER", None)
+
+    def test_a_run_fills_takes_its_chaos_and_leaves_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = hex_agent(d)
+            code = a.run()
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            kinds = [r["kind"] for r in got]
+            self.assertEqual([r for r in got if r["kind"] in ("failed", "witness")], [])
+            self.assertEqual(code, 0)
+            starts = [r for r in got if r["kind"] == "started"]
+            self.assertTrue(starts and all(r["by"] == "made" for r in starts), starts)
+            self.assertIn("hold_owed", kinds)
+            chaos = {r["action"]: r for r in got if r["kind"] == "chaos"}
+            self.assertEqual(sorted(chaos), ["node", "scheduler", "vm"])
+            self.assertEqual(chaos["vm"]["kill"], "killed")
+            self.assertEqual((chaos["vm"]["ended"], chaos["node"]["ended"], chaos["scheduler"]["ended"]), (1, 0, 0))
+            last = [r for r in got if r["kind"] == "verdict"][-1]
+            self.assertEqual(last["left"], [])
+            self.assertEqual(a.states().get(W.LIVE, 0), 0)
+            text = report.render(got)
+            self.assertIn("start (ask to the placer's word that it was made)", text)
+            self.assertIn("round trips and streams: owed (the hex driver gives no lane into a VM)", text)
+            self.assertIn("verdict: PASS", text)
+
+    def test_a_refused_create_is_typed_in_hexs_words_and_stops_the_fill(self):
+        with tempfile.TemporaryDirectory() as d:
+            # The first box is taken (the setup's first run), every ask after it refused.
+            a, rec = hex_agent(d, refuse="Awaits(RunHostStdioOnly)", refuse_after=1)
+            self.assertTrue(a.setup())
+            a.fill("test")
+            a.drain()
+            a.teardown()
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            failed = [r for r in got if r["kind"] == "start_failed"]
+            self.assertEqual(len(failed), 1)
+            self.assertEqual((failed[0]["refused"], failed[0]["why"]), (True, "refused: Awaits(RunHostStdioOnly)"))
+            self.assertEqual([r["refused"] for r in got if r["kind"] == "fill_stopped"], [[failed[0]["token"]]])
+            self.assertEqual(a.states(), {W.REFUSED: 1})
+
+    def test_a_first_box_hex_refuses_ends_the_setup_typed_and_leaves_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = hex_agent(d, refuse="Awaits(WindowsRunHost)")
+            code = a.run()
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            failed = [(r["what"], r["why"]) for r in got if r["kind"] == "failed"]
+            self.assertEqual(failed, [("first_run", "refused: Awaits(WindowsRunHost)")])
+            self.assertEqual([r["left"] for r in got if r["kind"] == "verdict" and r["at"] == "after teardown"], [[]])
+            self.assertEqual(code, 3)
+
+
+class FakeKiln:
+    """A stand-in kiln: the agents routes the kiln driver calls (`agents.start`, `.get`, `.list`,
+    `.stop`), each asked with the run's bearer token; an agent stands `starting` until it is
+    first read, then `idle`. `room` agents fit; past it a start is queued, as kiln's balancer
+    holds one for room, and starts once an agent stops. `refuse` is a refusal (409) every start
+    gets."""
+
+    TOKEN = "fleet-test-token"
+
+    def __init__(self, room=8, refuse=None):
+        import http.server
+
+        self.agents = {}
+        self.waiting = []
+        self.room = room
+        self.refuse = refuse
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def answer(self, status, body):
+                data = (json.dumps(body) if not isinstance(body, str) else body).encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def authed(self):
+                if self.headers.get("Authorization") != f"Bearer {FakeKiln.TOKEN}":
+                    self.answer(401, "no token")
+                    return False
+                return True
+
+            def do_GET(self):
+                if not self.authed():
+                    return
+                parts = self.path.strip("/").split("/")
+                if parts == ["api", "harness", "agents"]:
+                    return self.answer(200, {"agents": list(fake.agents.values())})
+                if parts[:3] == ["api", "harness", "agents"] and len(parts) == 4 and parts[3] in fake.agents:
+                    row = fake.agents[parts[3]]
+                    answer = dict(row)
+                    if row["stand"] == "starting":
+                        row["stand"] = "idle"
+                    return self.answer(200, answer)
+                self.answer(404, "no such agent")
+
+            def do_POST(self):
+                if not self.authed():
+                    return
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                parts = self.path.strip("/").split("/")
+                if parts == ["api", "harness", "agents"]:
+                    if fake.refuse:
+                        return self.answer(409, fake.refuse)
+                    if body.get("isolation") != "microvm" or body.get("on") != "microvm":
+                        return self.answer(400, "the driver asks for microVMs")
+                    live = sum(1 for a in fake.agents.values() if a["stand"] != "ended")
+                    if live >= fake.room:
+                        fake.waiting.append(body)
+                        return self.answer(200, {"agents": [], "queued": "no machine has room; it starts there as soon as there's room"})
+                    return self.answer(200, {"agents": [fake.made(body)]})
+                if parts[:3] == ["api", "harness", "agents"] and len(parts) == 5 and parts[4] == "stop" and parts[3] in fake.agents:
+                    fake.agents[parts[3]]["stand"] = "ended"
+                    if fake.waiting:
+                        fake.made(fake.waiting.pop(0))
+                    return self.answer(204, "")
+                self.answer(404, "no such route")
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, name="fake-kiln", daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def made(self, body):
+        agent_id = f"a{len(self.agents) + 1}"
+        self.agents[agent_id] = {"id": agent_id, "name": body["name"], "machine": "runner-a", "stand": "starting", "harness": body["kind"]}
+        return self.agents[agent_id]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def kiln_agent(d, fake, asks):
+    from types import SimpleNamespace
+
+    from fleetlib.agent import Agent
+
+    os.environ["KILN_URL"], os.environ["KILN_TOKEN"] = fake.url, FakeKiln.TOKEN
+    o = SimpleNamespace(deadline_s=30, out=d, shards="", driver="kiln", kind="claude", asks=asks, seed=1, needs="mem=1g", label="h",
+                        image="i@sha256:00", ballast=0, chaos="none", rounds=0, repo=d, rev="", controller_t=0, keep_home=False)
+    rec = records.Records(os.path.join(d, "r.jsonl"), "h", "run")
+    return Agent(o, rec), rec
+
+
+class KilnDriver(unittest.TestCase):
+    """The kiln driver over a stand-in kiln answering its agents routes."""
+
+    def tearDown(self):
+        os.environ.pop("KILN_URL", None)
+        os.environ.pop("KILN_TOKEN", None)
+
+    def run_agent(self, fake, asks):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = kiln_agent(d, fake, asks)
+            code = a.run()
+            rec.close()
+            return a, code, records.read_all(os.path.join(d, "r.jsonl"))
+
+    def test_sessions_are_started_followed_placed_and_stopped(self):
+        fake = FakeKiln(room=8)
+        try:
+            a, code, got = self.run_agent(fake, 5)
+        finally:
+            fake.close()
+        self.assertEqual([r for r in got if r["kind"] in ("failed", "witness")], [])
+        self.assertEqual(code, 0)
+        starts = [r for r in got if r["kind"] == "started"]
+        self.assertEqual(len(starts), 5)
+        self.assertEqual({(r["by"], r["on"]) for r in starts}, {("made", "runner-a")})
+        # The setup's first session and the five asked, each stopped.
+        self.assertEqual(sorted(r["name"] for r in fake.agents.values()), ["first-run", "h-1", "h-2", "h-3", "h-4", "h-5"])
+        self.assertEqual({r["stand"] for r in fake.agents.values()}, {"ended"})
+        self.assertIn("hold_owed", [r["kind"] for r in got])
+        self.assertEqual(a.states(), {W.ENDED: 5})
+
+    def test_a_full_fleet_queues_one_typed_and_the_fill_stops_there(self):
+        fake = FakeKiln(room=2)
+        try:
+            a, code, got = self.run_agent(fake, 4)
+        finally:
+            fake.close()
+        failed = [r for r in got if r["kind"] == "start_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertTrue(failed[0]["why"].startswith("queued: no machine has room"), failed[0])
+        self.assertEqual(a.states(), {W.ENDED: 2, W.REFUSED: 1})
+        # The queued one started once an agent stopped, and the drain stopped it too.
+        self.assertEqual(sorted((r["name"], r["stand"]) for r in fake.agents.values()), [("first-run", "ended"), ("h-1", "ended"), ("h-2", "ended"), ("h-3", "ended")])
+        self.assertEqual([r for r in got if r["kind"] == "witness"], [])
+
+    def test_a_refusal_ends_the_setup_in_kilns_words(self):
+        fake = FakeKiln(refuse="no machine suits a machine with claude: none starts microVMs")
+        try:
+            a, code, got = self.run_agent(fake, 3)
+        finally:
+            fake.close()
+        failed = [(r["what"], r["why"]) for r in got if r["kind"] == "failed"]
+        self.assertEqual(failed, [("first_run", "kiln answered 409: no machine suits a machine with claude: none starts microVMs")])
+        self.assertEqual((a.states(), code), ({}, 3))
 
 
 class Report(unittest.TestCase):

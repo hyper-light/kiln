@@ -154,13 +154,14 @@ keeps a person to their own, and answers 404 for another's. The server's owner, 
 Each route is an operation too (`agentfiles.*`: `POST /api/ops/<name>`, kiln's MCP tools
 `agentfiles_*`, code mode's `kiln.agentfiles.*`), and each change is audited.
 
-Kept, a text is checked by Shards itself: the `shards` on the server's `PATH`, asked for its build
-check (`shards build --call=check,format=json`, BuildKit's lint subrequest as Shards ports it) with a
-target no stage can be named, so that its planning stops before it resolves any base: the text parsed,
-its instructions and directives read, its names and grants checked (`CONNECT`, `ATTACH`, `FOR`,
-`EXPOSE … FOR`), its stages linted. No base image is pulled and no registry is asked. A text Shards
-refuses isn't kept: 422, `Shards refuses this Agentfile: <Shards' words>`. Where the server has no
-`shards`, or it answers no check, the text is kept and `check` says why (`checked: false`).
+Kept, a text is checked by Shards itself: Shards' own Agentfile parser and build checks, in the
+server's process (`shards-agentfile`, kiln's vendored Shards; docs/shards.md), as `shards build
+--call=check,format=json` checks it (BuildKit's lint subrequest as Shards ports it), with a target no
+stage can be named, so that its planning stops before it resolves any base: the text parsed, its
+instructions and directives read, its names and grants checked (`CONNECT`, `ATTACH`, `FOR`, `EXPOSE …
+FOR`), its stages linted. No base image is pulled and no registry is asked. A text Shards refuses isn't
+kept: 422, `Shards refuses this Agentfile: <Shards' words>`. Every text is checked; `check` says
+`checked: false`, and why, only where the check itself never ended.
 
 A text is kept in kiln's store of bytes (docs/blobs.md) at `agentfiles/sha256/<its SHA-256>`, once for
 every Agentfile and version that has it, whoever's; kiln.db keeps the records, each naming its text
@@ -196,7 +197,8 @@ interface AgentfileListing { agentfiles: AgentfileBrief[]; reaches_all: boolean 
 An agent starts from one in a microVM of its own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step
 31): `POST /api/harness/sessions` with `spec.isolation: { kind: "microvm", image }`, `image` naming
 one kiln ships by its name (`harness-claude`: an image's, so never with a `:`) or one of yours by its
-id (`agentfile:<id>`), at the version it has when the microVM is made. Such a start goes only to a
+id (`agentfile:<id>`), at its latest version as the agent starts. Another person's is refused, whoever
+asks (400, `agentfile:<id> names no Agentfile of yours`). Such a start goes only to a
 runner that says it starts microVMs, and is refused anywhere else (400, `an agent can't run isolated
 there: …`). The console keeps them at `/agents/agentfiles` and chooses one as an agent starts
 (docs/agents.md, "From an Agentfile, in a microVM of its own").

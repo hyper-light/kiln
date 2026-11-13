@@ -72,13 +72,16 @@ files = { "ld-musl-aarch64.so.1" = "/lib/ld-musl-aarch64.so.1", "libstdc++.so.6"
 
 # Quiver, the topic store (docs/bus.md): kiln's bus, behind kiln-seams' `Bus`. Its own vendored
 # projects (Focal's bus, hyper-raft) are kiln's below, so kiln's copy of it leaves them out, and
-# its benchmarks' records, which are Quiver's evidence and no part of what kiln builds.
+# its benchmarks' records, which are Quiver's evidence and no part of what kiln builds. Its record
+# of what it vendors (its vendor/MANIFEST.toml and vendor/patches) is kept, so kiln's pins are
+# checked against Quiver's as kiln's copy holds them (vendor/quiver/UPSTREAM.md).
 [projects.quiver]
 kind = "git"
 repository = "https://github.com/hyper-light/quiver"
 commit = "966ea139a18d590afd64cc3e30ba3807302d42b1"
 path = "vendor/quiver"
-exclude = ["vendor", "bench/records"]
+exclude = ["vendor/focal-bus", "vendor/hyper-raft", "bench/records"]
+own = ["UPSTREAM.md"]
 
 # Focal's event bus, which Quiver is built on, at the commit Quiver takes (Quiver's
 # docs/design/focal-bus.md); its recorded change is Quiver's.
@@ -196,6 +199,87 @@ repository = "https://github.com/hyper-light/mantle"
 commit = "87ab09e1c94149c7b669cb0de5975e228125c867"
 path = "vendor/mantle"
 exclude = [".github", ".kiln", "vendor", "docs", "loomdoc.html", "mantle-strata.svg", "mantle-strata-dark.svg", "mantle-strata-light.svg"]
+own = ["UPSTREAM.md"]
+
+# Shards, the microVMs kiln's harnesses run in (docs/shards.md; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16):
+# the one Shards revision kiln and Hex build on. kiln links its Agentfile parser (shards-agentfile: every Agentfile is
+# checked in-process) and, through Hex, its orchestrator's API (shards-api); and it carries Shards' binary, `shards`,
+# with its VM and network processes beside it, built from here (ci/shards/pack.sh) and written out and signed by kiln
+# (crates/kiln/src/shards). Upstream's tree less what no build reads: its docs, examples, fuzzing, CI, its scripts
+# but the C compiler wrappers its guests are built with, its crates' recorded test data, and its byte-for-byte copies
+# of aws-lc-rs and aws-lc-sys, which are kiln's: kiln's vendor/aws-lc-rs, and crates.io's aws-lc-sys as kiln links it
+# (vendor/shards/UPSTREAM.md). It builds in its own folder, so Shards' toolchain file applies there: its Rust, and the
+# musl targets its guest binaries need.
+[projects.shards]
+kind = "git"
+repository = "https://github.com/hyper-light/shards"
+commit = "e82b9403b863718930fe9f224186d3ae862bfd61"
+path = "vendor/shards"
+take = [
+  ".cargo",
+  "Cargo.lock",
+  "Cargo.toml",
+  "LICENSE",
+  "clippy.toml",
+  "crates",
+  "resources",
+  "rust-toolchain.toml",
+  "rustfmt.toml",
+  "scripts/hvf-run",
+  "scripts/install-zig",
+  "scripts/zig-ar",
+  "scripts/zig-cc",
+  "vendor/rquickjs-sys",
+]
+exclude = [
+  "crates/agentfile/testdata",
+  "crates/archive/testdata",
+  "crates/build/testdata",
+  "crates/devcgroup/testdata",
+  "crates/ext4/testdata",
+  "crates/flate/testdata",
+  "crates/gateway/testdata",
+  "crates/gitsign/testdata",
+  "crates/image/testdata",
+  "crates/init/testdata",
+  "crates/rego/testdata",
+  "crates/seccomp/testdata",
+  "crates/shards/src/build/testdata",
+  "crates/shards/src/daemon/engine/testdata",
+  "crates/shards/src/daemon/testdata",
+  "crates/shards/src/logging/testdata",
+  "crates/shards/testdata",
+  "crates/sigstore/testdata",
+  "crates/tuf/testdata",
+  "crates/zstd/testdata",
+]
+own = ["UPSTREAM.md"]
+
+# Hex, the runtime and scheduler kiln's harness microVMs run under (its docs/design; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
+# steps 12 and 16), built on kiln's one Shards and hyper-raft: its upstream pins kiln's Shards and an older hyper-raft,
+# and a recorded change moves that pin to kiln's (vendor/hex/UPSTREAM.md). The pair kiln builds:
+# Hex daa36e99 on Shards e82b9403 (and hyper-raft fb74b595), the one Shards revision Hex and kiln both build on. Its
+# crates, the two records they include as they build, and the record of what it vendors (its vendor/MANIFEST.toml and
+# vendor/patches, which kiln's pins are checked against) with seccompiler, the third-party code only Hex vendors; less
+# its copies of what kiln vendors itself (hyper-raft, Shards, cuda-rust, all-smi), the GPU renderer and Firecracker
+# sources only its own scripts build, and its docs, benchmarks and CI, which are Hex's.
+[projects.hex]
+kind = "git"
+repository = "https://github.com/hyper-light/hex"
+commit = "2bd61f1838ea7c52c419607ebb423556570dcd1e"
+path = "vendor/hex"
+take = [
+  "Cargo.toml",
+  "LICENSE",
+  "bench/competitive/probes/mntns_default.txt",
+  "bench/native/guest/records.tsv",
+  "clippy.toml",
+  "crates",
+  "vendor/MANIFEST.toml",
+  "vendor/patches",
+  "vendor/seccompiler",
+]
+exclude = ["vendor/patches/firecracker", "vendor/patches/shards-gpu"]
 own = ["UPSTREAM.md"]
 
 # cuda-rust (NVIDIA): hex-gpu loads NVML at run time by its CUDA driver loader's policy (library names

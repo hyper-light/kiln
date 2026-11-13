@@ -1,0 +1,101 @@
+[package]
+name = "hex-bench"
+description = "Hex's benchmarks: the records a performance claim names (CLAUDE.md §7)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bench]]
+name = "node_memory"
+harness = false
+
+[[bench]]
+name = "seam_box"
+harness = false
+
+[[bench]]
+name = "seam_oci"
+harness = false
+
+[[bench]]
+name = "seccomp_compile"
+harness = false
+
+[[bench]]
+name = "spec_parse"
+harness = false
+
+[[bench]]
+name = "sched_fast_path"
+harness = false
+
+[[bench]]
+name = "sched_packing"
+harness = false
+
+[[bench]]
+name = "sched_proximity"
+harness = false
+
+[[bench]]
+name = "sched_million"
+harness = false
+
+[[bench]]
+name = "sched_cells"
+harness = false
+
+# The macOS `process` class's own path: overshoot past the memory bound and the watcher's CPU
+# (bench/native/macos/RESULT.md), through hex-runtime's macOS runtime and real `hex selftest-box` members.
+[[bench]]
+name = "macos_box"
+harness = false
+
+# The Windows `oci` class's create, start and delete through the seam (native plan step 4), beside Docker's
+# and containerd's runhcs on the same image (bench/native/windows/oci_compare.ps1).
+[[bench]]
+name = "windows_oci"
+harness = false
+
+# Each OS's `process` class against its named competitors on the same machine (native plan step 7,
+# bench/native/RESULT.md).
+[[bench]]
+name = "native_box"
+harness = false
+
+[dependencies]
+hex-sim.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hex-api.workspace = true
+hex-client.workspace = true
+hex-core.workspace = true
+hex-node.workspace = true
+hex-runtime.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+hex-api.workspace = true
+hex-core.workspace = true
+hex-runtime.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+hex-api.workspace = true
+hex-runtime.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+# Goal 17's classic arm (seam_oci's HEXBENCH_ROOT=classic) builds its node with Node::with_classic_roots, a test
+# control: a dev-dependency edge, which builds the benches and no production binary (scripts/check-production.sh).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+hex-node = { workspace = true, features = ["test-controls"] }
+
+[lints]
+workspace = true

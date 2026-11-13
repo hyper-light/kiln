@@ -699,6 +699,10 @@ pub struct Host {
     /// The hand-overs this machine took (CP-T3.2), kept for every runner process of it: none
     /// without a record file.
     handovers: Option<Handovers>,
+    /// Where this machine holds isolated agents' harnesses, microVMs of their own (kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 17, `crate::sandbox::microvm`): none where its kiln
+    /// carries no microVM runtime, and then it holds no isolated agent.
+    microvm: Mutex<Option<Arc<crate::sandbox::Microvms>>>,
 }
 
 /// Most of what waits in one session's lane: past it, what's sent is refused (a message, `Full`).
@@ -986,9 +990,23 @@ impl Host {
             ending: Mutex::new(HashMap::new()),
             held: AtomicBool::new(false),
             handovers,
+            microvm: Mutex::new(crate::sandbox::microvm()),
         });
         crate::memory::room::follow_input(&host);
         host
+    }
+
+    /// Where this machine holds isolated agents' harnesses (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+    /// step 17): its microVMs, where its kiln carries their runtime.
+    pub fn microvm(&self) -> Option<Arc<crate::sandbox::Microvms>> {
+        self.microvm.lock().clone()
+    }
+
+    /// Holds isolated agents' harnesses in `vms` from now on: a test's stand-in for the machine's
+    /// microVMs.
+    #[cfg(test)]
+    pub fn hold_isolated_in(&self, vms: crate::sandbox::Microvms) {
+        *self.microvm.lock() = Some(Arc::new(vms));
     }
 
     /// Takes no messages (`on`), or takes them again: a new build that takes its sessions over from
@@ -1404,10 +1422,11 @@ impl Host {
     /// Start a session (`id` keeps a known one's identity, e.g. one the server named). A subagent
     /// opens as its parent runs here ([`Host::like_its_parent`]).
     pub fn open(&self, id: Option<String>, spec: Spec) -> anyhow::Result<Arc<Session>> {
-        // Held in a microVM of its own or not at all: this kiln starts no microVM yet (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
-        // steps 16 and 17), so an isolated agent is refused here, never run as a process (step 32).
-        if spec.isolation.is_some() {
-            anyhow::bail!("this machine's kiln starts no microVM yet, so it can't hold an isolated agent (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 16 and 17)");
+        // Held in a microVM of its own or not at all (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+        // steps 17 and 32): a machine whose kiln carries no microVM runtime refuses an isolated
+        // agent, never running it as a process.
+        if spec.isolation.is_some() && self.microvm().is_none() {
+            anyhow::bail!("{}", crate::sandbox::NO_MICROVM);
         }
         let spec = self.like_its_parent(spec);
         let claim = spec.claim.clone();
@@ -3799,6 +3818,8 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
         isolation: spec.isolation.clone(),
+        runs: None,
+        starts: Vec::new(),
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info), since: None }, super::core::Update::State { state: Box::new(state) }]
@@ -4984,6 +5005,141 @@ while True:
         Ok((program, heard))
     }
 
+    /// Kiln's Agentfile for Claude Code, as an isolated session started with none named is made from.
+    fn claude_image() -> anyhow::Result<crate::sandbox::image::Source<'static>> {
+        let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("kiln ships no Agentfile for Claude Code"))?;
+        Ok(crate::sandbox::image::Source::Builtin(claude))
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17: an isolated agent's harness runs as its
+    /// image's member in a microVM of its own (here the machine's microVMs' stand-in,
+    /// `crate::sandbox::fake`), no process of the machine's, and its session drives it as on the
+    /// host through the same adapter: it starts, takes a message and answers, is interrupted (the
+    /// adapter's control request reaches the member), is stopped by force and starts again on the
+    /// same conversation (resumed through the launch's arguments past its image's command), is
+    /// refused a switch to another harness and a move to another machine (each said, its member
+    /// going on, launched no more), and ends with nothing of it left running.
+    #[cfg(unix)]
+    #[test]
+    fn s17_an_isolated_agent_runs_in_its_microvm_and_is_driven_as_on_the_host() -> anyhow::Result<()> {
+        use kiln_seams::sandbox::Boundary;
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (program, heard) = stand_in(dir.path())?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            // Its image already in the store of the machine's microVMs, as its build left it: nothing is built.
+            let (images, pinned) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
+            // Its stdio said to ride a link whose ends each negotiated AES-256-GCM (Shards' agent control).
+            let end = || kiln_seams::sandbox::Negotiated { suite: "TLS13_AES_256_GCM_SHA384".into(), group: "X25519MLKEM768".into() };
+            let lanes = ["control", "stdin:0", "stdout:0", "stderr:0"].map(str::to_owned).to_vec();
+            let link = kiln_seams::sandbox::Link { controller: end(), endpoint: end(), lanes };
+            let vms = Arc::new(crate::sandbox::fake::FakeVms::with(&pinned, "claude", &program).linked(link.clone()));
+            host.hold_isolated_in(crate::sandbox::Microvms { sandbox: Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images });
+            let cwd = dir.path().to_string_lossy().into_owned();
+            let spec = Spec { kind: "claude".into(), cwd: Some(cwd.clone()), isolation: Some(session::Isolation::microvm()), ..Spec::default() };
+            let s = host.open(Some("isolated".into()), spec)?;
+            let heard_lines = || std::fs::read_to_string(&heard).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).collect::<Vec<_>>();
+            let idle = || s.core.lock().state.status == Status::Idle && !s.core.lock().meta.features.is_empty();
+            until_it("its start in its microVM", 300, idle).await?;
+            assert_eq!(*s.pid.lock(), None, "no process of the machine's is its harness");
+            let first = vms.launched();
+            let launch = first.first().ok_or_else(|| anyhow::anyhow!("nothing was launched"))?;
+            assert_eq!((launch.program.as_str(), &launch.boundary, launch.folder.as_deref()), ("claude", &Boundary::MicroVm { image: pinned.clone() }, Some(cwd.as_str())));
+            assert!(pinned.starts_with("harness-claude@sha256:"), "kiln's image for Claude Code, pinned by its digest: {pinned}");
+            assert!(launch.args.iter().any(|a| a == "--session-id"), "its session's own flags, past its image's: {:?}", launch.args);
+            // Where it runs, on its info (step 34's checks read it): its microVM by name, its image pinned,
+            // no host pid, said so, and the link its stdio rides, both ends' words once it's made.
+            until_it("its link, said", 60, || matches!(s.info().runs, Some(session::Runs::Microvm { control: Some(_), .. }))).await?;
+            assert_eq!(s.info().runs, Some(session::Runs::Microvm { vm: Some("fake-vm-1".into()), image: pinned.clone(), host_pid: None, control: Some(link.clone().into()) }));
+            let info = serde_json::to_value(s.info())?;
+            assert_eq!(info.pointer("/runs/in"), Some(&serde_json::json!("microvm")));
+            assert_eq!(info.pointer("/runs/host_pid"), Some(&serde_json::Value::Null), "no host pid, said rather than left out");
+            assert_eq!(info.pointer("/runs/control/endpoint/suite"), Some(&serde_json::json!("TLS13_AES_256_GCM_SHA384")));
+            assert_eq!(info.pointer("/runs/control/lanes/2"), Some(&serde_json::json!("stdout:0")));
+            assert_eq!(info.pointer("/starts/0/runs/vm"), Some(&serde_json::json!("fake-vm-1")));
+            // Steered: a message is a turn, answered.
+            assert!(host.command("isolated", message("m1", "hello")));
+            until_it("m1's turn, over", 60, || idle() && s.core.lock().state.harness_session.is_some()).await?;
+            let conversation = s.core.lock().state.harness_session.clone();
+            // Interrupted: the adapter's control request reaches the member's stdin.
+            assert!(host.command("isolated", Command::Interrupt));
+            let interrupted = || heard_lines().iter().any(|w| w.get("line").and_then(serde_json::Value::as_str).is_some_and(|l| l.contains("\"interrupt\"")));
+            until_it("the interrupt at its member", 60, interrupted).await?;
+            // Stopped by force, it starts again by itself, in a new microVM run on the same conversation.
+            assert!(host.command("isolated", Command::ForceStop));
+            until_it("its second launch", 60, || vms.launched().len() >= 2).await?;
+            let again = vms.launched();
+            let resumed = again.get(1).ok_or_else(|| anyhow::anyhow!("no second launch"))?;
+            let conversation_id = conversation.clone().unwrap_or_default();
+            assert!(resumed.args.windows(2).any(|w| w == ["--resume", conversation_id.as_str()]), "resumed through its launch's arguments: {:?}", resumed.args);
+            until_it("it back", 60, idle).await?;
+            // kiln's record: two starts, each in a microVM of its own, none on the host, the first ended.
+            let starts = s.info().starts;
+            assert_eq!(starts.len(), 2, "{starts:?}");
+            assert!(starts.first().is_some_and(|x| x.ended.is_some()), "the first ended: {starts:?}");
+            assert!(starts.iter().all(|x| matches!(&x.runs, session::Runs::Microvm { host_pid: None, .. })), "none on the host: {starts:?}");
+            assert!(matches!(starts.get(1).map(|x| &x.runs), Some(session::Runs::Microvm { vm: Some(vm), .. }) if vm == "fake-vm-2"), "{starts:?}");
+            let answers = || s.core.lock().events().filter(|e| matches!(e.body, super::super::model::Body::Assistant { .. })).count();
+            assert!(host.command("isolated", message("m2", "and again")));
+            until_it("m2's turn, over", 60, || idle() && answers() >= 2).await?;
+            assert_eq!(s.core.lock().state.harness_session, conversation, "the same conversation");
+            // Neither switched to another harness nor moved to another machine: each refused before
+            // anything of it stops, saying why, and its member goes on, launched no more.
+            let launches = vms.launched().len();
+            let said = |words: &str| s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains(words)));
+            assert!(host.command("isolated", Command::SetModel { model: "gpt-5.5".into(), kind: Some("codex".into()) }));
+            until_it("its switch refused", 60, || said(crate::sandbox::isolated::NO_SWITCH)).await?;
+            assert!(host.command("isolated", Command::MoveTo { to: "elsewhere".into(), cwd: cwd.clone(), note: None, now: true, kind: None, model: None, local: false, native: false }));
+            until_it("its move refused", 60, || said(crate::sandbox::isolated::NO_MOVE)).await?;
+            assert!(host.command("isolated", message("m3", "still here")));
+            until_it("m3's turn, over", 60, || idle() && answers() >= 3).await?;
+            assert_eq!(vms.launched().len(), launches, "its member went on: nothing was launched again");
+            assert!(!s.core.lock().hold, "nothing waits on a move or a switch");
+            // Ended: nothing of it runs on afterwards.
+            let members: std::collections::HashSet<u32> = heard_lines().iter().filter_map(|w| w.get("pid").and_then(serde_json::Value::as_u64)).filter_map(|p| u32::try_from(p).ok()).collect();
+            assert!(members.len() >= 2, "two runs of its member read what it was sent: {members:?}");
+            assert!(host.close("isolated"));
+            until_it("every run of its member ended", 60, || members.iter().all(|p| !crate::os::pid_alive(*p))).await?;
+            until_it("kiln's record, each start ended", 60, || s.info().runs.is_none() && s.info().starts.iter().all(|x| x.ended.is_some())).await?;
+            assert_eq!(s.info().starts.len(), 2, "no start but the two");
+            Ok(())
+        })
+    }
+
+    /// Step 17: a machine whose kiln holds no microVMs refuses an isolated agent before anything
+    /// starts, saying so, and never runs it as a process; given microVMs that refuse its launch,
+    /// it opens, and its start fails in their words, nothing of it running anywhere.
+    #[test]
+    fn s17_an_isolated_agent_is_refused_where_no_microvm_holds_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let spec = Spec { isolation: Some(session::Isolation::microvm()), ..no_harness(dir.path()) };
+            let refused = host.open(Some("nowhere".into()), spec.clone()).err().map(|e| format!("{e:#}")).unwrap_or_default();
+            assert_eq!(refused, crate::sandbox::NO_MICROVM);
+            assert!(host.get("nowhere").is_none(), "nothing was opened");
+            // The simulator holds no microVM run: the launch is refused, typed, and said as its end.
+            let (images, _) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
+            host.hold_isolated_in(crate::sandbox::Microvms { sandbox: Arc::new(kiln_seams::sandbox::SimSandbox::new()), images });
+            let s = host.open(Some("somewhere".into()), spec)?;
+            let said = crate::rt::timeout(Duration::from_secs(60), async {
+                loop {
+                    if let Some(why) = s.core.lock().state.exit.as_ref().and_then(|x| x.error.clone()) {
+                        return why;
+                    }
+                    crate::rt::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await?;
+            assert!(said.contains("couldn't start in a microVM of harness-claude") && said.contains("can't hold a run in a microVM"), "{said}");
+            assert_eq!(*s.pid.lock(), None, "no process of the machine's ran it");
+            host.close("somewhere");
+            Ok(())
+        })
+    }
+
     /// An agent lives until it's ended (docs/agents.md): its harness's process ending by a signal
     /// from outside it (kiln's own left-running sweep sent 26 agents' one on 2026-10-31, and they
     /// ended) ends nothing. It starts again by itself, its conversation resumed, and one that was
@@ -5011,6 +5167,13 @@ while True:
             until_it("it ending, to start again", 30, || s.core.lock().state.exit.as_ref().is_some_and(|x| x.again_at.is_some())).await?;
             assert_eq!(super::super::wait::stand(&s.info()), "working", "{:?}", s.info().exit);
             until_it("it back by itself", 60, || idle() && s.pid.lock().is_some_and(|p| p != first)).await?;
+            // kiln's record (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17): where it runs now, and each
+            // start, the first ended by the signal (no code).
+            let now = s.pid.lock().ok_or_else(|| anyhow::anyhow!("no harness"))?;
+            let info = s.info();
+            assert_eq!(info.runs, Some(session::Runs::Host { pid: now }));
+            let record: Vec<_> = info.starts.iter().map(|x| (x.runs.clone(), x.ended.as_ref().map(|e| e.code))).collect();
+            assert_eq!(record, [(session::Runs::Host { pid: first }, Some(None)), (session::Runs::Host { pid: now }, None)]);
             assert_eq!(s.core.lock().state.harness_session, conversation, "the same conversation");
             assert!(s.core.lock().state.exit.is_none(), "it runs again");
             let said = |words: &str| s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains(words)));
@@ -6111,7 +6274,7 @@ while True:
             until_it("m2 waiting behind m1's turn", 30, || s.core.lock().state.queue.iter().any(|q| q.id == "m2")).await?;
             // The server asks the older process to hand it to the newest (`crate::handovers`): it
             // goes once m1's turn is over.
-            assert!(older.command("h", Command::MoveTo { to: String::new(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true }));
+            assert!(older.command("h", Command::MoveTo { to: String::new(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native: false }));
             // Its package, in pieces, as the server gets them, passed on to the newer process.
             let mut bytes = Vec::new();
             let got = crate::rt::timeout(Duration::from_secs(60), async {

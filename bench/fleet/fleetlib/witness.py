@@ -3,7 +3,8 @@ for it in what the OS shows, beside what the placer says.
 
 Three sources meet here, each read on its own:
 - the harness's ledger: every ask it made and the state it is in (`Ask`);
-- the placer's view: which VM processes it says run each ask (Shards' inspect, Hex's records);
+- the placer's view: which VM processes it says run each ask (Shards' inspect), or, where it holds
+  an ask live but names no process (Hex's records: a box's run host names no box), None;
 - the scan: the VM and network processes the OS shows in the harness's scope.
 
 The effects:
@@ -17,6 +18,9 @@ The effects:
 
 `lost`, `leaked`, `orphan` and `unasked` are judged only at quiescent points (no start or stop
 in flight), when a transition can't be mistaken for the effect; the room and `doubled` always.
+Asks the view holds live without naming a process are judged by count: fewer VM processes no
+named ask holds than such asks is `lost`, more is `leaked` (one doubled and one lost cancel there:
+a placer that names its processes is judged one by one).
 """
 
 from __future__ import annotations
@@ -70,15 +74,18 @@ def violation(witness: str, **detail: object) -> Dict[str, object]:
 def check(
     ledger: Dict[str, Ask],
     scan: Iterable[Dict[str, object]],
-    view: Dict[str, List[int]],
+    view: Dict[str, Optional[List[int]]],
     room: Dict[str, Optional[int]],
     limit: Optional[int],
     quiescent: bool,
+    scanned: bool = True,
 ) -> List[Dict[str, object]]:
     """Every forbidden effect in one scan.
 
     `scan`: the scope's processes, each {"pid", "role": "vm"|"net", "mem", "vm": the pid of the
-    VM a network process serves, where known}. `view`: the placer's VM pids by ask token.
+    VM a network process serves, where known}. `view`: the placer's VM pids by ask token, None
+    for an ask it holds live without naming its process. `scanned` False: the VMs run on machines
+    this scan doesn't see (a fleet's placer), so the unnamed asks are judged by the view alone.
     """
     procs = list(scan)
     out: List[Dict[str, object]] = []
@@ -92,7 +99,9 @@ def check(
         out.append(violation("over_limit", vms=len(vms), limit=limit))
 
     owner: Dict[int, str] = {}
-    for token, pids in view.items():
+    unnamed = sorted(t for t, pids in view.items() if pids is None)
+    named = {t: pids for t, pids in view.items() if pids is not None}
+    for token, pids in named.items():
         if len(set(pids)) > 1:
             out.append(violation("doubled", token=token, pids=sorted(set(pids))))
         for pid in pids:
@@ -104,17 +113,27 @@ def check(
         return out
 
     for token, ask in ledger.items():
-        if ask.state in HOLDS_VM and not any(pid in vm_pids for pid in view.get(token, [])):
-            out.append(violation("lost", token=token, state=ask.state, view=view.get(token, [])))
+        if ask.state in HOLDS_VM and token not in unnamed and not any(pid in vm_pids for pid in named.get(token, [])):
+            out.append(violation("lost", token=token, state=ask.state, view=named.get(token, [])))
+    held_unnamed = [t for t in unnamed if t in ledger and ledger[t].state in HOLDS_VM]
+    loose = []
     for p in vms:
         token = owner.get(int(p["pid"]))
         ask = ledger.get(token) if token is not None else None
-        if ask is None or ask.state not in HOLDS_VM:
+        if token is None and unnamed:
+            loose.append(int(p["pid"]))
+        elif ask is None or ask.state not in HOLDS_VM:
             out.append(violation("leaked", pid=p["pid"], token=token, state=ask.state if ask else None))
+    if not scanned:
+        pass
+    elif len(loose) > len(held_unnamed):
+        out.append(violation("leaked", vms=sorted(loose), held=held_unnamed, by="count"))
+    elif len(loose) < len(held_unnamed):
+        out.append(violation("lost", vms=sorted(loose), held=held_unnamed, by="count"))
     for token in view:
         ask = ledger.get(token)
         if ask is None or ask.state not in HOLDS_VM | IN_FLIGHT:
-            if any(pid in vm_pids for pid in view[token]):
+            if token in unnamed or any(pid in vm_pids for pid in named[token]):
                 out.append(violation("unasked", token=token, state=ask.state if ask else None))
     for p in procs:
         if p.get("role") == "net" and p.get("vm") is not None and int(p["vm"]) not in vm_pids:

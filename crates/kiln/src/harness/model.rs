@@ -1594,6 +1594,16 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub exit: Option<ExitInfo>,
+    /// Where its harness runs now (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17): a process of
+    /// its machine's, or its image's member in a microVM of its own. None while none runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub runs: Option<super::session::Runs>,
+    /// kiln's record of each start of its harness (`session::Start`): one a start, as kiln's restart
+    /// rule paces them (`AGAIN_*`, `SOON_TRIES`), kept with the session, and handed to kiln's next
+    /// image with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub starts: Vec<super::session::Start>,
     /// Events dropped from the front of the timeline to bound memory.
     #[serde(default)]
     pub dropped: u64,
@@ -2198,6 +2208,11 @@ pub enum Command {
         /// its folder or its harness's record travels, and it goes by way of the server.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         local: bool,
+        /// With `local`: the newer process reads a package that goes on natively from the harness's
+        /// own record here (`proto::feature::NATIVE_RESUME`), so an ACP agent or Antigravity goes on
+        /// in its own conversation; else (an older build, a rollback) its conversation goes in words.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        native: bool,
     },
     /// How a move is getting on before it starts (its repository being copied over): shown.
     Moving {

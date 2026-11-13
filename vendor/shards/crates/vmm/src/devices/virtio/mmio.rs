@@ -1,0 +1,587 @@
+//! virtio-mmio transport, version 2 (virtio 1.3 §4.2).
+
+use std::sync::{Arc, Mutex};
+
+use super::queue::{Queue, QueueConfig, QueueState};
+use super::{Activation, DeviceInterrupt, VirtioDevice, feature, status};
+use crate::devices::{Interrupt, MmioDevice, get_le, put_le};
+use crate::memory::GuestMemory;
+use crate::snapshot::codec::{self, Reader, Writer};
+use crate::sync::lock;
+use crate::warn;
+
+/// The registers' offsets: virtio 1.3 §4.2.2, "MMIO Device Register Layout" (QueueNumMax
+/// at 0x034); include/uapi/linux/virtio_mmio.h (l. 81, `VIRTIO_MMIO_QUEUE_NUM_MAX`).
+const MAGIC: u64 = 0x000;
+const VERSION: u64 = 0x004;
+const DEVICE_ID: u64 = 0x008;
+const VENDOR_ID: u64 = 0x00c;
+pub(super) const DEVICE_FEATURES: u64 = 0x010;
+pub(super) const DEVICE_FEATURES_SEL: u64 = 0x014;
+pub(super) const DRIVER_FEATURES: u64 = 0x020;
+pub(super) const DRIVER_FEATURES_SEL: u64 = 0x024;
+pub(super) const QUEUE_SEL: u64 = 0x030;
+pub(super) const QUEUE_NUM_MAX: u64 = 0x034;
+pub(super) const QUEUE_NUM: u64 = 0x038;
+pub(super) const QUEUE_READY: u64 = 0x044;
+pub(super) const QUEUE_NOTIFY: u64 = 0x050;
+pub(super) const INTERRUPT_STATUS: u64 = 0x060;
+pub(super) const INTERRUPT_ACK: u64 = 0x064;
+pub(super) const STATUS: u64 = 0x070;
+pub(super) const QUEUE_DESC_LOW: u64 = 0x080;
+pub(super) const QUEUE_DESC_HIGH: u64 = 0x084;
+pub(super) const QUEUE_DRIVER_LOW: u64 = 0x090;
+pub(super) const QUEUE_DRIVER_HIGH: u64 = 0x094;
+pub(super) const QUEUE_DEVICE_LOW: u64 = 0x0a0;
+pub(super) const QUEUE_DEVICE_HIGH: u64 = 0x0a4;
+pub(super) const SHM_SEL: u64 = 0x0ac;
+pub(super) const SHM_LEN_LOW: u64 = 0x0b0;
+pub(super) const SHM_LEN_HIGH: u64 = 0x0b4;
+pub(super) const SHM_BASE_LOW: u64 = 0x0b8;
+pub(super) const SHM_BASE_HIGH: u64 = 0x0bc;
+pub(super) const CONFIG_GENERATION: u64 = 0x0fc;
+pub(super) const CONFIG: u64 = 0x100;
+
+const MAGIC_VALUE: u32 = 0x7472_6976; // "virt"
+/// "SHRD" read as a little-endian u32.
+const VENDOR: u32 = 0x4452_4853;
+/// Bytes of MMIO window each transport occupies.
+pub const WINDOW: u64 = 0x200;
+
+struct State {
+    device: Box<dyn VirtioDevice>,
+    status: u32,
+    device_features_sel: u32,
+    driver_features_sel: u32,
+    driver_features: u64,
+    queue_sel: u32,
+    /// The shared memory region the driver selected (SHMSel): not in a snapshot, as a
+    /// driver selects one each time before it reads it (Linux virtio_mmio.c,
+    /// vm_get_shm_region).
+    shm_sel: u32,
+    queues: Vec<QueueConfig>,
+    config_generation: u32,
+    /// Each queue's progress while paused, for a snapshot.
+    paused: Vec<QueueState>,
+    /// The driver's faults already said, once each: a guest repeating one gets no more
+    /// lines of the host's log for it. Kept across resets.
+    said_status: bool,
+    said_activate: bool,
+}
+
+/// One virtio device behind an MMIO register window.
+pub struct MmioTransport {
+    state: Mutex<State>,
+    interrupt: Arc<DeviceInterrupt>,
+    memory: Arc<GuestMemory>,
+}
+
+impl std::fmt::Debug for MmioTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MmioTransport").finish_non_exhaustive()
+    }
+}
+
+fn low(v: u64) -> u32 {
+    v as u32
+}
+
+fn high(v: u64) -> u32 {
+    (v >> 32) as u32
+}
+
+fn set_low(v: &mut u64, x: u32) {
+    *v = (*v & !0xffff_ffff) | u64::from(x);
+}
+
+fn set_high(v: &mut u64, x: u32) {
+    *v = (*v & 0xffff_ffff) | (u64::from(x) << 32);
+}
+
+impl MmioTransport {
+    pub fn new(
+        device: Box<dyn VirtioDevice>,
+        memory: Arc<GuestMemory>,
+        line: Arc<dyn Interrupt>,
+    ) -> MmioTransport {
+        MmioTransport::with_interrupt(device, memory, DeviceInterrupt::new(line))
+    }
+
+    /// The transport of `device`, which signals through `interrupt`: virtio over PCI's
+    /// ([`super::pci`]), whose registers are this transport's, read and written for it.
+    pub fn with_interrupt(
+        device: Box<dyn VirtioDevice>,
+        memory: Arc<GuestMemory>,
+        interrupt: DeviceInterrupt,
+    ) -> MmioTransport {
+        let queues = vec![QueueConfig::default(); device.queue_max_sizes().len()];
+        MmioTransport {
+            state: Mutex::new(State {
+                device,
+                status: 0,
+                device_features_sel: 0,
+                driver_features_sel: 0,
+                driver_features: 0,
+                queue_sel: 0,
+                shm_sel: 0,
+                queues,
+                config_generation: 0,
+                paused: Vec::new(),
+                said_status: false,
+                said_activate: false,
+            }),
+            interrupt: Arc::new(interrupt),
+            memory,
+        }
+    }
+
+    fn reset(&self, s: &mut State) {
+        s.device.reset();
+        s.status = 0;
+        s.device_features_sel = 0;
+        s.driver_features_sel = 0;
+        s.driver_features = 0;
+        s.queue_sel = 0;
+        s.shm_sel = 0;
+        s.queues.iter_mut().for_each(|q| *q = QueueConfig::default());
+        self.interrupt.clear();
+    }
+
+    fn set_status(&self, s: &mut State, new: u32) {
+        if new == 0 {
+            self.reset(s);
+            return;
+        }
+        // Status bits are only ever added (virtio 1.3 §3.1.1); clearing requires reset.
+        if new & s.status != s.status {
+            if !std::mem::replace(&mut s.said_status, true) {
+                warn!(
+                    "virtio: driver cleared status bits {:#x} -> {new:#x} without reset",
+                    s.status
+                );
+            }
+            return;
+        }
+        let added = new & !s.status;
+        if added & status::FEATURES_OK != 0 {
+            let offered = s.device.features();
+            let accepted = s.driver_features;
+            if accepted & !offered != 0 || accepted & feature::VERSION_1 == 0 {
+                // Leave FEATURES_OK clear: the driver reads it back and gives up.
+                s.status = new & !status::FEATURES_OK;
+                return;
+            }
+        }
+        s.status = new;
+        if added & status::DRIVER_OK != 0
+            && let Err(e) = self.activate(s, None)
+        {
+            if !std::mem::replace(&mut s.said_activate, true) {
+                warn!("virtio device {}: {e}", s.device.device_id());
+            }
+            s.status |= status::DEVICE_NEEDS_RESET;
+            self.interrupt.config_change();
+        }
+    }
+
+    /// Starts the device on the driver's queues, continuing from `progress` where a
+    /// snapshot recorded it (empty: from the beginning; none: not restored).
+    fn activate(&self, s: &mut State, restored: Option<&[QueueState]>) -> Result<(), String> {
+        let progress = restored.unwrap_or_default();
+        if s.status & status::FEATURES_OK == 0 {
+            return Err("DRIVER_OK before FEATURES_OK".into());
+        }
+        // A restored queue is the ring its driver made against what the device offered
+        // then, which another build may have offered more of (a ring's size since derived
+        // from its traffic, D12): it is held to the specification's maximum, as its
+        // driver will not size it again.
+        let max: Vec<u16> = match restored {
+            None => s.device.queue_max_sizes().to_vec(),
+            Some(_) => vec![super::queue::MAX_QUEUE_SIZE; s.queues.len()],
+        };
+        let mut queues = Vec::with_capacity(s.queues.len());
+        for (i, (cfg, max)) in s.queues.iter().zip(max).enumerate() {
+            if !cfg.ready {
+                return Err(format!("queue {i} not ready at DRIVER_OK"));
+            }
+            let mut queue = Queue::new(*cfg, max, &self.memory, s.driver_features)
+                .map_err(|e| format!("queue {i}: {e}"))?;
+            if let Some(&st) = progress.get(i) {
+                queue.set_state(st);
+            }
+            queues.push(queue);
+        }
+        s.device.activate(Activation {
+            memory: self.memory.clone(),
+            queues,
+            interrupt: self.interrupt.clone(),
+            features: s.driver_features,
+            restored: !progress.is_empty(),
+        })
+    }
+
+    fn selected_queue(s: &mut State) -> Option<&mut QueueConfig> {
+        s.queues.get_mut(s.queue_sel as usize)
+    }
+}
+
+impl MmioDevice for MmioTransport {
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        let mut s = lock(&self.state);
+        if offset >= CONFIG {
+            s.device.read_config(offset - CONFIG, data);
+            return;
+        }
+        if data.len() != 4 {
+            // Registers below the config space are 32-bit only (virtio 1.3 §4.2.2.2).
+            data.fill(0);
+            return;
+        }
+        let v: u32 = match offset {
+            MAGIC => MAGIC_VALUE,
+            VERSION => 2,
+            DEVICE_ID => s.device.device_id(),
+            VENDOR_ID => VENDOR,
+            DEVICE_FEATURES => match s.device_features_sel {
+                0 => low(s.device.features()),
+                1 => high(s.device.features()),
+                _ => 0,
+            },
+            QUEUE_NUM_MAX => {
+                let sel = s.queue_sel as usize;
+                s.device.queue_max_sizes().get(sel).copied().map_or(0, u32::from)
+            }
+            QUEUE_READY => Self::selected_queue(&mut s).map_or(0, |q| u32::from(q.ready)),
+            INTERRUPT_STATUS => self.interrupt.status(),
+            STATUS if self.interrupt.failed() => s.status | status::DEVICE_NEEDS_RESET,
+            STATUS => s.status,
+            // The selected shared memory region's length and base; one the device has not
+            // reads as all-ones (§4.2.2).
+            SHM_LEN_LOW | SHM_LEN_HIGH | SHM_BASE_LOW | SHM_BASE_HIGH => {
+                let sel = s.shm_sel;
+                match s.device.shm_regions().iter().find(|r| u32::from(r.id) == sel) {
+                    Some(r) => match offset {
+                        SHM_LEN_LOW => low(r.len),
+                        SHM_LEN_HIGH => high(r.len),
+                        SHM_BASE_LOW => low(r.base),
+                        _ => high(r.base),
+                    },
+                    None => u32::MAX,
+                }
+            }
+            CONFIG_GENERATION => s.config_generation.wrapping_add(s.device.config_generation()),
+            _ => 0,
+        };
+        put_le(data, u64::from(v));
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) {
+        let mut s = lock(&self.state);
+        if offset >= CONFIG {
+            s.device.write_config(offset - CONFIG, data);
+            return;
+        }
+        if data.len() != 4 {
+            return;
+        }
+        let v = get_le(data) as u32;
+        // Queue and feature layout may only change before the device goes live.
+        let configurable = s.status & status::DRIVER_OK == 0;
+        match offset {
+            DEVICE_FEATURES_SEL => s.device_features_sel = v,
+            DRIVER_FEATURES_SEL => s.driver_features_sel = v,
+            DRIVER_FEATURES if configurable && s.status & status::FEATURES_OK == 0 => {
+                match s.driver_features_sel {
+                    0 => set_low(&mut s.driver_features, v),
+                    1 => set_high(&mut s.driver_features, v),
+                    _ => {}
+                }
+            }
+            QUEUE_SEL => s.queue_sel = v,
+            SHM_SEL => s.shm_sel = v,
+            QUEUE_NUM if configurable => {
+                if let Some(q) = Self::selected_queue(&mut s) {
+                    q.size = v as u16;
+                }
+            }
+            QUEUE_READY if configurable => {
+                if let Some(q) = Self::selected_queue(&mut s) {
+                    q.ready = v == 1;
+                }
+            }
+            QUEUE_DESC_LOW | QUEUE_DESC_HIGH | QUEUE_DRIVER_LOW | QUEUE_DRIVER_HIGH | QUEUE_DEVICE_LOW
+            | QUEUE_DEVICE_HIGH
+                if configurable =>
+            {
+                if let Some(q) = Self::selected_queue(&mut s) {
+                    match offset {
+                        QUEUE_DESC_LOW => set_low(&mut q.desc, v),
+                        QUEUE_DESC_HIGH => set_high(&mut q.desc, v),
+                        QUEUE_DRIVER_LOW => set_low(&mut q.avail, v),
+                        QUEUE_DRIVER_HIGH => set_high(&mut q.avail, v),
+                        QUEUE_DEVICE_LOW => set_low(&mut q.used, v),
+                        _ => set_high(&mut q.used, v),
+                    }
+                }
+            }
+            QUEUE_NOTIFY if s.status & status::DRIVER_OK != 0 => s.device.notify(v as u16),
+            INTERRUPT_ACK => self.interrupt.ack(v),
+            STATUS => self.set_status(&mut s, v),
+            _ => {}
+        }
+    }
+
+    fn pause(&self) {
+        let mut s = lock(&self.state);
+        s.paused = s.device.pause();
+    }
+
+    fn resume(&self) -> Result<(), String> {
+        lock(&self.state).device.resume()
+    }
+
+    fn unsaved(&self) -> Option<String> {
+        lock(&self.state).device.unsaved()
+    }
+
+    fn memory_fault(&self, gpa: Option<u64>) -> bool {
+        lock(&self.state).device.memory_fault(gpa)
+    }
+
+    fn save(&self, w: &mut Writer) {
+        let s = lock(&self.state);
+        for v in [
+            s.status,
+            s.device_features_sel,
+            s.driver_features_sel,
+            s.queue_sel,
+            s.config_generation,
+            self.interrupt.status(),
+        ] {
+            w.u32(v);
+        }
+        w.u64(s.driver_features);
+        w.bool(self.interrupt.failed());
+        w.seq(&s.queues, |w, q| {
+            w.u16(q.size);
+            w.u64(q.desc);
+            w.u64(q.avail);
+            w.u64(q.used);
+            w.bool(q.ready);
+        });
+        w.seq(&s.paused, |w, p| {
+            w.u16(p.next_avail);
+            w.u16(p.next_used);
+            w.bool(p.signalled_used.is_some());
+            w.u16(p.signalled_used.unwrap_or(0));
+        });
+        s.device.save(w);
+    }
+
+    /// A device that was live resumes on its queues at the saved progress, so requests
+    /// published before the snapshot but not yet consumed are served.
+    fn restore(&self, r: &mut Reader<'_>) -> codec::Result<()> {
+        let mut s = lock(&self.state);
+        let [status_reg, dev_sel, drv_sel, queue_sel, generation, interrupt] =
+            [r.u32()?, r.u32()?, r.u32()?, r.u32()?, r.u32()?, r.u32()?];
+        let driver_features = r.u64()?;
+        let failed = r.bool()?;
+        let queues = r.seq(s.queues.len(), 1, |r| {
+            Ok(QueueConfig {
+                size: r.u16()?,
+                desc: r.u64()?,
+                avail: r.u64()?,
+                used: r.u64()?,
+                ready: r.bool()?,
+            })
+        })?;
+        if queues.len() != s.queues.len() {
+            return Err(codec::DecodeError(format!(
+                "virtio snapshot has {} queues; the device has {}",
+                queues.len(),
+                s.queues.len()
+            )));
+        }
+        let progress = r.seq(s.queues.len(), 7, |r| {
+            let (next_avail, next_used, signalled) = (r.u16()?, r.u16()?, r.bool()?);
+            let at = r.u16()?;
+            Ok(QueueState {
+                next_avail,
+                next_used,
+                signalled_used: signalled.then_some(at),
+            })
+        })?;
+        s.device.restore(r)?;
+        s.status = status_reg;
+        s.device_features_sel = dev_sel;
+        s.driver_features_sel = drv_sel;
+        s.queue_sel = queue_sel;
+        s.config_generation = generation;
+        s.driver_features = driver_features;
+        s.queues = queues;
+        self.interrupt.set_state(interrupt, failed);
+        let live = status::DRIVER_OK;
+        let dead = status::DEVICE_NEEDS_RESET | status::FAILED;
+        if s.status & live != 0 && s.status & dead == 0 && !failed {
+            self.activate(&mut s, Some(&progress))
+                .map_err(|e| codec::DecodeError(format!("restoring virtio device: {e}")))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::devices::virtio::ShmRegion;
+
+    /// A device with nothing but shared memory regions.
+    struct Regions(Vec<ShmRegion>);
+
+    impl VirtioDevice for Regions {
+        fn device_id(&self) -> u32 {
+            16
+        }
+        fn features(&self) -> u64 {
+            0
+        }
+        fn queue_max_sizes(&self) -> &[u16] {
+            &[]
+        }
+        fn read_config(&self, _: u64, data: &mut [u8]) {
+            data.fill(0);
+        }
+        fn write_config(&mut self, _: u64, _: &[u8]) {}
+        fn shm_regions(&self) -> &[ShmRegion] {
+            &self.0
+        }
+        fn activate(&mut self, _: Activation) -> Result<(), String> {
+            Ok(())
+        }
+        fn notify(&self, _: u16) {}
+        fn reset(&mut self) {}
+        fn pause(&mut self) -> Vec<QueueState> {
+            Vec::new()
+        }
+        fn resume(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct Line;
+
+    impl Interrupt for Line {
+        fn set_level(&self, _: bool) {}
+    }
+
+    /// A device of one queue of at most `.0` entries, which says the sizes it is started
+    /// on.
+    struct Ring(u16, Arc<Mutex<Vec<u16>>>);
+
+    impl VirtioDevice for Ring {
+        fn device_id(&self) -> u32 {
+            16
+        }
+        fn features(&self) -> u64 {
+            feature::VERSION_1
+        }
+        fn queue_max_sizes(&self) -> &[u16] {
+            std::slice::from_ref(&self.0)
+        }
+        fn read_config(&self, _: u64, data: &mut [u8]) {
+            data.fill(0);
+        }
+        fn write_config(&mut self, _: u64, _: &[u8]) {}
+        fn activate(&mut self, a: Activation) -> Result<(), String> {
+            *self.1.lock().unwrap() = a.queues.iter().map(Queue::size).collect();
+            Ok(())
+        }
+        fn notify(&self, _: u16) {}
+        fn reset(&mut self) {}
+        fn pause(&mut self) -> Vec<QueueState> {
+            Vec::new()
+        }
+        fn resume(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A ring its driver made against what another build offered, more than this one's
+    /// device offers, is restored as it was made (a ring's size derived anew, D12); a
+    /// driver of this build is held to what the device offers.
+    #[test]
+    fn a_restored_ring_keeps_the_size_its_driver_made() {
+        let memory = Arc::new(GuestMemory::anonymous(&[(0, 1 << 16)]).unwrap());
+        let drive = |t: &MmioTransport, size: u32| {
+            for (at, v) in [
+                (DRIVER_FEATURES_SEL, 1),
+                (DRIVER_FEATURES, (feature::VERSION_1 >> 32) as u32),
+                (QUEUE_SEL, 0),
+                (QUEUE_NUM, size),
+                (QUEUE_DESC_LOW, 0x1000),
+                (QUEUE_DRIVER_LOW, 0x2000),
+                (QUEUE_DEVICE_LOW, 0x3000),
+                (QUEUE_READY, 1),
+                (STATUS, status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK),
+                (
+                    STATUS,
+                    status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK,
+                ),
+            ] {
+                t.write(at, &v.to_le_bytes());
+            }
+        };
+        let then = Arc::new(Mutex::new(Vec::new()));
+        let old = MmioTransport::new(Box::new(Ring(8, then.clone())), memory.clone(), Arc::new(Line));
+        drive(&old, 8);
+        assert_eq!(*then.lock().unwrap(), [8]);
+        old.pause();
+        let mut w = Writer::default();
+        old.save(&mut w);
+        let saved = w.into_bytes();
+
+        let now = Arc::new(Mutex::new(Vec::new()));
+        let new = MmioTransport::new(Box::new(Ring(4, now.clone())), memory.clone(), Arc::new(Line));
+        new.restore(&mut Reader::new(&saved)).unwrap();
+        assert_eq!(*now.lock().unwrap(), [8], "restored as its driver made it");
+
+        let fresh = Arc::new(Mutex::new(Vec::new()));
+        let driven = MmioTransport::new(Box::new(Ring(4, fresh.clone())), memory, Arc::new(Line));
+        drive(&driven, 8);
+        assert!(
+            fresh.lock().unwrap().is_empty(),
+            "a new driver's past the device's"
+        );
+        assert_ne!(read(&driven, STATUS) & status::DEVICE_NEEDS_RESET, 0);
+    }
+
+    fn read(t: &MmioTransport, offset: u64) -> u32 {
+        let mut data = [0u8; 4];
+        t.read(offset, &mut data);
+        u32::from_le_bytes(data)
+    }
+
+    /// The region the driver selects reads its length and base, each in two halves; one
+    /// the device has not reads as all-ones, as virtio 1.3 §4.2.2 has it; a reset selects
+    /// region 0 again.
+    #[test]
+    fn shared_memory_regions_read_as_selected() {
+        let region = ShmRegion {
+            id: 1,
+            base: 0x1_2345_0000,
+            len: 0x2_0000_0000,
+        };
+        let memory = Arc::new(GuestMemory::anonymous(&[(0x8000_0000, 1 << 16)]).unwrap());
+        let t = MmioTransport::new(Box::new(Regions(vec![region])), memory, Arc::new(Line));
+        assert_eq!(read(&t, SHM_LEN_LOW), u32::MAX, "region 0 is not the device's");
+        assert_eq!(read(&t, SHM_LEN_HIGH), u32::MAX);
+        t.write(SHM_SEL, &1u32.to_le_bytes());
+        assert_eq!(read(&t, SHM_LEN_LOW), 0);
+        assert_eq!(read(&t, SHM_LEN_HIGH), 2);
+        assert_eq!(read(&t, SHM_BASE_LOW), 0x2345_0000);
+        assert_eq!(read(&t, SHM_BASE_HIGH), 1);
+        t.write(STATUS, &0u32.to_le_bytes());
+        assert_eq!(read(&t, SHM_LEN_LOW), u32::MAX, "a reset selects region 0");
+    }
+}

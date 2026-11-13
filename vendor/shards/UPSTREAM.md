@@ -1,0 +1,50 @@
+# Shards, vendored
+
+The microVMs kiln's harnesses run in (`docs/shards.md`; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16), at
+the one Shards revision kiln and Hex build on.
+
+- **Upstream:** https://github.com/hyper-light/shards, commit `e82b9403b863718930fe9f224186d3ae862bfd61`
+  (2026-11-12), MIT (`LICENSE`): its `main`, the one revision kiln's copy of Hex pins too. It has Shards' D237
+  (landed at `e55eea10`), a `shards` built to be carried (`SHARDS_HELPERS=beside`) that starts the VM and network
+  processes beside it, which the program carrying it wrote out and signed; and `shards-afunix`'s fix of a blocking
+  read on Windows that slept through its peer's end (`7ea3ce27`, PM M536), which Hex's client and node link.
+- **How kiln uses it:**
+  - its Agentfile parser and build checks, `shards-agentfile`, linked: every Agentfile kiln keeps is checked in
+    kiln's own process (`crates/kiln/src/agentfiles/check.rs`);
+  - its orchestrator's API, `shards-api`, linked: Hex's client of Shards (`vendor/hex`), and kiln's own;
+  - its binary, `shards`, built to be carried, and its VM and network processes: built from here by
+    `ci/shards/pack.sh`, embedded in kiln's binary by `crates/kiln/build.rs`, written out and signed by kiln
+    (`crates/kiln/src/shards.rs`).
+
+  kiln's workspace excludes `vendor/shards`, which keeps its own workspace, lock file, toolchain
+  (`rust-toolchain.toml`: its builds here take its Rust and the musl targets its guests need) and lints. kiln's
+  root `[patch.crates-io]` points `shards-api` and `shards-agentfile` here, and `rquickjs-sys` at
+  `vendor/rquickjs-sys`.
+- **What is here:** upstream's tree less what no build reads: `docs/`, `examples/`, `fuzz/`, `.github/`, `.kiln/`;
+  its scripts but `zig-cc`, `zig-ar` and `install-zig` (the C compiler its guests' build names) and `hvf-run`
+  (cargo's runner on macOS, `.cargo/config.toml`); its crates' recorded test data (each `testdata/`, which only
+  their tests include); and its copies of aws-lc-rs and aws-lc-sys (the change below). `vendor/rquickjs-sys`
+  (crates.io's rquickjs-sys 0.14.0, QuickJS-NG's C) stays: no other project kiln vendors holds it, so it is kiln's
+  one copy, which kiln's own `rquickjs` builds too.
+
+## Changes from upstream
+
+Each change is recorded in `vendor/patches/shards/`, applied in this order on upstream's tree (docs/vendoring.md).
+
+| File | Change | Why | Recorded as |
+|---|---|---|---|
+| `Cargo.toml`, `Cargo.lock` | aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0 from crates.io, their lock entries holding the SHA-256s upstream's `vendor/README.md` lists, instead of from `vendor/` | upstream's copies are those crates.io packages byte for byte, and kiln vendors aws-lc-rs itself (`vendor/aws-lc-rs`, 1.18.2 with Mantle's change): kiln's tree holds one copy of each project. Shards' own crates name 1.18.1 and aws-lc-sys 0.45.0 (`shards-sigstore` calls it), so its build keeps those versions; as T4 took it on 2026-10-21 | `0001-aws-lc-rs-and-aws-lc-sys-from-crates-io.patch` |
+| `crates/api/Cargo.toml`, `crates/api/src/image.rs`, `crates/api/src/image/session.rs`, `crates/api/src/image/spawn.rs` | the run host (`shards api-run`) started holding its three standard streams alone: through posix_spawn with file actions for 0, 1 and 2 (`POSIX_SPAWN_CLOEXEC_DEFAULT` on Apple's), and through `CreateProcessW` with a handle list of those three alone | Hex's change to Shards (its joint plan step 12), which Hex's copy of Shards carries at this revision and kiln's one copy carries with it: std's `Command` hands the run host whatever another thread of its orchestrator holds inheritable at that moment, on macOS and Windows | `0002-image-the-run-host-started-holding-its-three-standard.patch` |
+| `crates/api/src/image/wire.rs` | each member's reach of the destinations kept, which its run host holds it to (D236, the image channel's version 9) | Hex's change to Shards (its joint plan step 15), carried as the one above: a harness held to exactly the providers and host its grants name, a run refused before its VM starts where a member would reach other than that | `0003-image-each-member-s-reach-of-the-destinations-kept-which-its.patch` |
+
+The first change is kiln's layout alone (`Kiln-only:`), so it isn't offered upstream. The second and third are
+Hex's own, offered to Shards by Hex's lead (their records in `vendor/hex/vendor/patches/shards` are kiln's, byte for
+byte: `vendor/hex/UPSTREAM.md`).
+
+## Taking a newer upstream
+
+`scripts/vendor.py shards <commit>` takes the tree at that commit and re-applies the change above by three-way
+merge. Hex's copy pins the same commit (`vendor/hex/vendor/MANIFEST.toml`, as kiln's copy of Hex holds it), so the
+two move together: the re-vendor of Shards, then the change that moves Hex's pin and whatever of Shards' API Hex
+must take (`vendor/hex/UPSTREAM.md`), then `scripts/vendor.py check`. ci/shards/pack.sh builds what kiln carries
+from the new tree.

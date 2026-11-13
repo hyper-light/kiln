@@ -92,6 +92,10 @@ def host_summary(recs: List[dict]) -> Dict[str, object]:
         "chaos": chaos,
         "unparsed": len(kinds.get("unparsed", [])),
         "shards_version": next((r.get("version") for r in kinds.get("daemon", []) if r.get("version")), None),
+        # A placer that gives no lane: its starts are its own word that a VM was made, and the
+        # hold's round trips and streams are owed.
+        "start_by": "made" if any(r.get("by") == "made" for r in kinds.get("started", [])) else "echo",
+        "hold_owed": sorted({str(r.get("why")) for r in kinds.get("hold_owed", [])}),
     }
 
 
@@ -123,10 +127,15 @@ def render(records: List[dict], cross: Optional[List[dict]] = None) -> str:
         f = h.get("facts", {}) if isinstance(h, dict) else {}
         lines.append(f"== host {name}: {f.get('hostname')} {f.get('os')} {f.get('os_release')} {f.get('os_version')} {f.get('arch')}, {f.get('cpus')} CPUs ({f.get('cpu')}), {_gib(f.get('mem_total'))} memory")
         lines.append(f"   kiln {f.get('kiln_rev')}{' (dirty)' if f.get('kiln_dirty') else ''}; shards {s['shards_version']} sha256 {h.get('shards_sha256')} ({h.get('shards')}); python {f.get('python')}; load at start {f.get('load')}")
+        if isinstance(h, dict) and (h.get("identity") or {}).get("hex"):
+            lines.append(f"   hex sha256 {h['identity']['hex']}; each VM {h.get('vm')}")
         lines.append(f"   driver {h.get('driver')}; image {h.get('image')}; ballast {h.get('ballast')} B; room {h.get('room')} (needs {h.get('needs')}); seed {h.get('seed')}; chaos {h.get('chaos')} x{h.get('rounds')}")
         lines.append(f"   density: limit {s['limit']} VMs (cost {s['cost']}); VMs at once {_fmt(s['density_vms'], 'VMs', 1)}")
         lines.append(f"   memory per VM at density: {_fmt(s['density_mem'], 'MiB', MIB)}")
-        lines.append(f"   start (ask to first echo): {_fmt(s['start'], 'ms', 1e6)}; after chaos {_fmt(s['start_after_chaos'], 'ms', 1e6)}")
+        said = "ask to the placer's word that it was made" if s["start_by"] == "made" else "ask to first echo"
+        lines.append(f"   start ({said}): {_fmt(s['start'], 'ms', 1e6)}; after chaos {_fmt(s['start_after_chaos'], 'ms', 1e6)}")
+        for why in s["hold_owed"]:
+            lines.append(f"   round trips and streams: owed ({why})")
         lines.append(f"   control round trip: {_fmt(s['rtt'], 'us', 1e3)}; floor (local cat, same loop) {_fmt(s['rtt_floor'], 'us', 1e3)}")
         lines.append(f"   stream throughput, a turn's {s['turn_bytes']} B: {_fmt(s['turn_mib_s'], 'MiB/s', 1)}; floor {_fmt(s['turn_floor_mib_s'], 'MiB/s', 1)}")
         lines.append(f"   stream throughput, bulk at the converged {s['bulk_bytes']} B: {_fmt(s['bulk_mib_s'], 'MiB/s', 1)}; floor {_fmt(s['bulk_floor_mib_s'], 'MiB/s', 1)}")

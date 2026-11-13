@@ -1,0 +1,40 @@
+Subject: No GPU renderer build of Hex's in kiln's copy
+Why: Hex's shards-gpu entry names the files its scripts/shards-gpu/build.sh rebuilds Shards' GPU renderer from; Hex compiles none of them, kiln's copy takes none, and kiln carries no GPU VM process (docs/shards.md), so kiln's copy of Hex's manifest names no such copy of Shards.
+Kiln-only: kiln's copy leaves out what only Hex's own scripts build
+
+diff --git a/vendor/MANIFEST.toml b/vendor/MANIFEST.toml
+index f4f8e11b97bf78f34801f0818211bc55acef17e7..f21e75e548ef6ec6bc7ec744143f22a785ec26f1 100644
+--- a/vendor/MANIFEST.toml
++++ b/vendor/MANIFEST.toml
+@@ -118,31 +118,6 @@ path = "vendor/shards"
+ take = ["LICENSE", "AGENTS.md", "CLAUDE.md", "clippy.toml", "rustfmt.toml", "docs/development-rules.md", "docs/development-evidence.md", "crates/api", "crates/abi", "crates/afunix", "crates/testdir", "docs/research/measurements/managed-borrowed-nowait/focused.rs", "docs/research/measurements/managed-borrowed-nowait/contract.rs", "docs/research/measurements/managed-proc-main/allocation.rs", "docs/research/measurements/managed-proc-main/repro.rs", "docs/research/measurements/managed-proc-main/reader-tests.rs", "docs/research/measurements/api-flakes/spawns.rs", "docs/research/measurements/api-flakes/half-close.rs"]
+ own = ["Cargo.toml", "UPSTREAM.md"]
+ 
+-# Hex's `shards` build (hyper-light): the `shards` binary a node boots its Shards guests and image VMs with
+-# (SHARDS_BIN; crates/hex-runtime/src/guest), at the same Shards main as vendor/shards, with Hex's recorded
+-# changes to it: its GPU VM process built and carried for Windows on arm64, which Shards' GPU lane holds (D232,
+-# "Held"); and the run host of an image's boot holding each member to its reach of the destinations kept (D236,
+-# joint plan step 15), whose API half is vendor/shards'. The run host's files (crates/shards/src/api_run.rs and
+-# agentfile.rs, crates/agentfile's) are taken for its changes of joint plan steps 12 and 15. Hex compiles none of
+-# it: only the files the changes touch are taken, so `check` proves each applies to this commit, and
+-# scripts/shards-gpu/build.sh rebuilds `shards` from this commit plus vendor/patches/shards and
+-# vendor/patches/shards-gpu, on Linux, macOS and Windows. MIT, its LICENSE taken beside it.
+-[projects.shards-gpu]
+-kind = "git"
+-repository = "https://github.com/hyper-light/shards"
+-commit = "e82b9403b863718930fe9f224186d3ae862bfd61"
+-path = "vendor/shards-gpu"
+-take = [
+-    "LICENSE",
+-    "crates/agentfile/src/agentfile.rs",
+-    "crates/agentfile/tests/agentfile.rs",
+-    "crates/shards/build.rs",
+-    "crates/shards/src/agentfile.rs",
+-    "crates/shards/src/api_run.rs",
+-    "scripts/gpu-libs",
+-]
+-own = ["UPSTREAM.md"]
+-
+ # Firecracker (AWS): the VMM Hex's `firecracker` class launches (crates/hex-runtime/src/firecracker; its
+ # PREBOOT_REVISION is this commit). Upstream's VFIO development chain (feature/vfio, in no release yet)
+ # assigns PCI devices before boot here. Hex's recorded changes route a passthrough device's MSI/MSI-X
