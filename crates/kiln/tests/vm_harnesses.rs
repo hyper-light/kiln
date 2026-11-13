@@ -627,11 +627,65 @@ mod waits {
                 Ok(Setup::Ready(()))
             },
             |stuck| anyhow::Error::new(SetupRefused { what: "runner box connecting".into(), stuck, evidence: String::new() }),
+            |_| (),
         );
         assert!(waited.as_ref().err().and_then(|e| e.downcast_ref::<SetupRefused>()).is_some_and(|r| r.stuck == gone), "{waited:?}");
         assert_eq!(looks, 0);
         // Both alive: it looks, and takes its answer.
-        assert_eq!(setup(|| None, || Ok(Setup::Ready(7)), |stuck| anyhow::anyhow!("{stuck}")).ok(), Some(7));
+        assert_eq!(setup(|| None, || Ok(Setup::Ready(7)), |stuck| anyhow::anyhow!("{stuck}"), |_| ()).ok(), Some(7));
+    }
+
+    /// Between looks a setup wait waits on kiln's next change notification ([`Wake`]), given how long
+    /// the look took, never on a period of its own. Sleeping a period between looks (the 250 ms `POLL`
+    /// it replaces) never asks kiln.
+    #[test]
+    fn s35_a_setup_wait_wakes_on_kilns_changes_between_looks() {
+        let (mut looks, mut woken) = (0, Vec::new());
+        let ready = setup(
+            || None,
+            || {
+                looks += 1;
+                Ok(if looks < 3 { Setup::Wait } else { Setup::Ready(looks) })
+            },
+            |stuck| anyhow::anyhow!("{stuck}"),
+            |took| woken.push(took),
+        );
+        assert_eq!(ready.ok(), Some(3));
+        assert_eq!(woken.len(), 2, "woken between each two looks");
+    }
+
+    /// A wait reads kiln's change notifications a frame at a time: none pending is quiet and reads
+    /// nothing of the socket, so the next frame comes whole; a frame wakes it, and its words are read
+    /// (admission's word on a message among them); a socket that ended ends it. A reader that took a
+    /// quiet socket for a frame would never wait at all.
+    #[test]
+    fn s35_a_wait_hears_kilns_changes_a_frame_at_a_time() -> anyhow::Result<()> {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let mut client = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        client.set_nonblocking(true)?;
+        assert_eq!(frame_or_quiet(&mut client)?, None, "none pending");
+        client.set_nonblocking(false)?;
+        server.write_all(&[0x81, 5, b'h', b'e', b'l', b'l', b'o', 0x81, 2, b'h', b'i'])?;
+        assert_eq!((frame_or_quiet(&mut client)?, frame_or_quiet(&mut client)?), (Some(b"hello".to_vec()), Some(b"hi".to_vec())), "two frames, each whole");
+        drop(server);
+        assert!(frame_or_quiet(&mut client).is_err(), "it ended");
+        Ok(())
+    }
+
+    /// A wait's socket read is bounded by what's left of its window, never more: none before a first
+    /// answer; from its last progress once there's one. Bounding the read by a period of its own would
+    /// refuse late or look for nothing.
+    #[test]
+    fn s35_a_wait_reads_kiln_for_what_is_left_of_its_window() {
+        assert_eq!(Watch::new(Asked::Opening, None).left(s(600)), None);
+        let mut w = Watch::new(Asked::Message("m"), Some(s(11)));
+        assert_eq!(w.look(&word("running"), &[user(1, "m", "go")], None, false, s(0)), Verdict::Wait);
+        assert_eq!(w.left(s(4)), Some(s(7)));
+        assert_eq!(w.look(&word("running"), &[user(1, "m", "go"), says(2, "line 00000")], None, false, s(10)), Verdict::Wait);
+        assert_eq!(w.left(s(15)), Some(s(6)), "from its last progress");
+        assert_eq!(w.left(s(30)), Some(s(0)));
     }
 
     /// The runner connecting (`up`): connected is its answer; listed but not connected, it's between
@@ -680,30 +734,111 @@ mod waits {
         assert_eq!(opened(200, "[]", false), Setup::Refuse(SetupStuck::Refused { code: 200, body: "[]".into() }), "no session");
     }
 
-    /// A message kiln holds in its custody (its delivery `queued`, as kiln's admission holds a resumed
-    /// prompt: ROOT's runs of 2026-11-13) is held, not quiet: past the window the wait says so and goes
-    /// on, the window starting again. A message kiln neither delivers nor holds for a whole window is
-    /// refused. Taking every quiet window for a refusal (the hold not read) refused cursor's, gemini's and
-    /// goose's held resumes at their slowest answers.
+    /// kiln's word on a session's admission (`harness::admission::Capacity`), which every session's
+    /// word carries once it takes messages: `admitted` of its learned depth's 2 taken.
+    fn capacity(admitted: u64) -> Value {
+        json!({"epoch": 0, "generation": 2, "retry_generation": 0, "learning": "bootstrap", "target": 2, "admitted": admitted, "bytes": 30, "peers": 1, "depth": 2})
+    }
+
+    /// kiln's admission's word on message `m`, as the session's feed says it (`mail_flow`: its
+    /// `FlowEvent`, `event` `waiting` with its `WaitCause`, or `accepted`, ..., and the message's
+    /// publication).
+    fn admission_said(m: &str, event: &str, cause: Option<&str>) -> Value {
+        let mut said = json!({"event": event, "token": {"revision": 4, "generation": 1}, "epoch": 0, "capacity": capacity(2)});
+        if let (Some(o), Some(c)) = (said.as_object_mut(), cause) {
+            o.insert("cause".into(), json!(c));
+        }
+        json!({"t": "mail_flow", "event": said, "publication": {"id": m, "revision": 4, "generation": 1, "disposition": "waiting", "repeat": false}, "mail_scope": "s", "rev": 9})
+    }
+
+    /// A message kiln's admission holds, saying its own wait cause for it (the session's feed's
+    /// `mail_flow` `waiting` for the message's publication, `harness::admission::WaitCause`), is held:
+    /// past the window the wait says so with that cause and goes on, the window starting again. Once
+    /// admission takes it (`accepted`), nothing kiln states holds it, and a whole window without
+    /// progress is quiet; admission's wait on another message is no cause of this one's. A drive that
+    /// doesn't hear admission's word (the one before this) refuses the held message as quiet.
     #[test]
-    fn s35_a_message_kiln_holds_is_held_not_quiet() {
-        let info = with(&with(&word("idle"), "queued", json!(1)), "admission", json!({"learning": "bootstrap", "target": 2, "admitted": 1, "depth": 2}));
-        let events = vec![user(1, "m", "again")];
-        let held = json!({"delivery": {"m": "queued"}, "queue": [{"id": "m", "text": "again"}]});
+    fn s35_a_message_admission_holds_with_its_own_cause_is_held() {
+        let info = with(&word("idle"), "admission", capacity(2));
+        let events = vec![user(1, "k", "earlier")];
+        // Not handed to the session yet: admission holds it before its queue.
+        let state = json!({"delivery": {"k": "completed"}, "queue": []});
         let mut w = Watch::new(Asked::Message("m"), Some(s(11)));
-        assert_eq!(w.look(&info, &events, None, false, s(0)), Verdict::Wait);
-        assert!(!w.wants_state(&info, &events, s(5)) && w.wants_state(&info, &events, s(12)), "its state read as its window runs out");
-        let first = w.look(&info, &events, Some(&held), false, s(12));
-        assert!(matches!(&first, Verdict::Held(why) if why.contains("m queued") && why.contains("bootstrap")), "{first:?}");
-        assert_eq!(w.look(&info, &events, Some(&held), false, s(20)), Verdict::Wait, "the window starts again at the hold");
-        assert!(matches!(w.look(&info, &events, Some(&held), false, s(24)), Verdict::Held(_)), "held still");
-        // Let go of, and neither delivered nor held for a whole window: refused.
-        let gone = json!({"delivery": {}, "queue": []});
-        assert_eq!(w.look(&info, &events, Some(&gone), false, s(36)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
-        // A message by words it carries is held under the client id kiln gave it.
+        w.heard(&json!({"t": "events", "events": []}));
+        w.heard(&admission_said("m", "waiting", Some("bootstrap")));
+        assert_eq!(w.look(&info, &events, Some(&state), false, s(0)), Verdict::Wait);
+        let first = w.look(&info, &events, Some(&state), false, s(12));
+        assert!(matches!(&first, Verdict::Held(why) if why.contains("m held by kiln's admission") && why.contains("bootstrap")), "{first:?}");
+        assert_eq!(w.look(&info, &events, Some(&state), false, s(20)), Verdict::Wait, "the window starts again at the hold");
+        assert!(matches!(w.look(&info, &events, Some(&state), false, s(24)), Verdict::Held(_)), "held still");
+        // Taken by admission: nothing kiln states holds it, and a whole window passes without progress.
+        w.heard(&admission_said("m", "accepted", None));
+        assert_eq!(w.look(&info, &events, Some(&state), false, s(36)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
+        let mut other = Watch::new(Asked::Message("m"), Some(s(11)));
+        other.heard(&admission_said("n", "waiting", Some("peer_turn")));
+        assert_eq!(other.look(&info, &events, Some(&state), false, s(0)), Verdict::Wait);
+        assert_eq!(other.look(&info, &events, Some(&state), false, s(12)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }), "another's wait");
+    }
+
+    /// ROOT's five runs at eeebb5cbd: three resumed sessions idle, each with its opening prompt in
+    /// kiln's queue (delivery `queued`) that kiln never handed over (ACP's hand-off to a resumed, idle
+    /// session). kiln's word on each carried admission's capacity (`learning bootstrap, target 2,
+    /// admitted 1, depth 2`), as every session's does: it names no message and states no cause, and no
+    /// room wait, pause or freeze applied. Past its window the wait refuses at once, typed (delivery
+    /// stuck), and says where the session stands: status, queue, delivery, admission, timeline. Taking
+    /// the capacity for a cause (the drive before this) waits on forever, said held; a running
+    /// session's queued message waits for its turn's end, so its quiet window is quiet, not stuck.
+    #[test]
+    fn s35_a_message_queued_with_no_cause_on_an_idle_session_is_delivery_stuck() {
+        let opening = opening_id("s1");
+        let info = with(&with(&word("idle"), "queued", json!(1)), "admission", capacity(1));
+        let events = vec![user(1, &opening, "take it up again")];
+        let state = json!({"delivery": {opening.clone(): "queued"}, "queue": [{"id": opening, "text": "take it up again", "at": 1}]});
+        let mut w = Watch::new(Asked::Opening, Some(s(11)));
+        assert_eq!(w.look(&info, &events, Some(&state), false, s(0)), Verdict::Wait);
+        assert_eq!(w.look(&info, &events, Some(&state), false, s(11)), Verdict::Wait, "within its window");
+        let stuck = Stall::DeliveryStuck { message: opening.clone(), quiet: s(12), slowest: s(11) };
+        assert_eq!(w.look(&info, &events, Some(&state), false, s(12)), Verdict::Refuse(stuck.clone()));
+        let refused = Refused { what: "cursor taking its conversation up again".into(), stall: stuck, evidence: told(&info, &Ok(state.clone()), &events) };
+        let text = refused.to_string();
+        assert!(text.starts_with(&format!("cursor taking its conversation up again: delivery stuck: {opening} waits in kiln's queue on an idle session")), "{text}");
+        for said in [r#""status":"idle""#.to_owned(), r#""queued":1"#.to_owned(), r#""admission":{"#.to_owned(), format!(r#""{opening}":"queued""#), format!("{opening} take it up again"), format!("#1 user {opening}: take it up again")] {
+            assert!(text.contains(&said), "{said} in {text}");
+        }
+        let running = with(&info, "status", json!("running"));
+        let mut w = Watch::new(Asked::Opening, Some(s(11)));
+        assert_eq!(w.look(&running, &events, Some(&state), false, s(0)), Verdict::Wait);
+        assert_eq!(w.look(&running, &events, Some(&state), false, s(12)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
+    }
+
+    /// A paused session's message waits in kiln's queue (nothing goes to its harness until the pause
+    /// ends, `State::pause`), held by the pause and said so: past the window the wait goes on, the
+    /// window starting again. So is one held for room (`room_wait`) or by a person's freeze (`frozen`).
+    /// The capacity kiln's word carries is said of none of them, as it names no message: saying it (the
+    /// drive before this), or dropping any of the three causes, fails its line.
+    #[test]
+    fn s35_a_paused_sessions_message_is_held() {
+        let base = with(&with(&word("idle"), "queued", json!(1)), "admission", capacity(1));
+        let events = vec![user(1, "m", "again")];
+        let state = json!({"delivery": {"m": "queued"}, "queue": [{"id": "m", "text": "again", "at": 1}]});
+        let pause = json!({"reason": "limit", "window": "five_hour", "since": 5, "auto": true, "by": "harness"});
+        for (key, value) in [("pause", pause.clone()), ("room_wait", json!(1234)), ("frozen", json!(77))] {
+            let info = with(&base, key, value);
+            let mut w = Watch::new(Asked::Message("m"), Some(s(11)));
+            assert_eq!(w.look(&info, &events, Some(&state), false, s(0)), Verdict::Wait, "{key}");
+            assert!(!w.wants_state(&info, &events, s(5)) && w.wants_state(&info, &events, s(12)), "{key}: its state read as its window runs out");
+            let held = w.look(&info, &events, Some(&state), false, s(12));
+            assert!(matches!(&held, Verdict::Held(why) if why.contains("m in kiln's queue") && why.contains(key) && !why.contains("admission")), "{key}: {held:?}");
+            assert_eq!(w.look(&info, &events, Some(&state), false, s(20)), Verdict::Wait, "{key}: the window starts again at the hold");
+        }
+        // A message by words it carries is held under the client id kiln gave it; queued with no cause,
+        // or its state unread, nothing holds it.
         let carried = vec![json!({"seq": 1, "at": 1, "kind": "user", "text": "do the task again x7", "client_id": "k9"})];
-        assert!(holds(&info, &carried, Some(&json!({"delivery": {"k9": "queued"}})), "again x7").is_some());
-        assert_eq!(holds(&info, &carried, None, "again x7"), None, "unread, it says nothing");
+        let queued = json!({"delivery": {"k9": "queued"}});
+        let paused = with(&base, "pause", pause);
+        assert!(holds(&paused, &carried, Some(&queued), &Admission::default(), "again x7").is_some_and(|why| why.starts_with("k9 in kiln's queue; pause")));
+        assert_eq!(holds(&base, &carried, Some(&queued), &Admission::default(), "again x7"), None, "queued, no cause");
+        assert_eq!(holds(&paused, &carried, None, &Admission::default(), "again x7"), None, "unread, it says nothing");
     }
 
     /// The stand-in's stopped turn says nothing once it heard, until it's stopped: a line of it after
