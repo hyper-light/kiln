@@ -26,7 +26,9 @@ the machine's network) is replaced by an Agentfile image's members.
 - **Its stdio are the member's streams.** The seam's run is the `Duplex` its session drives
   (`crate::proc::duplex_of_run`, `sandbox::held`): what the adapter writes reaches the member's stdin in
   order, the end of its stdin is the member's, what the member writes fills its stdout and stderr, and
-  its end is the session's exit. The adapters are the ones host sessions use, unchanged.
+  its end is the session's exit. Its stdout and stderr hold as many chunks unread as a process's pipes
+  do (`proc::STDOUT_CHUNKS`, `STDERR_CHUNKS`, one bound for both): no number of its own, and the same
+  backpressure on the member as on a process. The adapters are the ones host sessions use, unchanged.
 - **It's no process of the machine's**: its session has no pid (`Duplex::host_pid` is none), nothing
   of it is in the session's group of processes, and it is never handed across an in-place upgrade
   (it stops, and starts again in the next image, its conversation going on).
@@ -48,8 +50,11 @@ What a session does to its harness maps onto the member:
   (`sandbox::NO_MICROVM`), never running it as a process; its runner says so in its facts
   (`isolation.why_not`, and `virt.microvm` false), where placement (step 32) reads it.
 - **A move to another machine** (`sandbox::isolated::NO_MOVE`): its microVM and what its harness keeps
-  there are its machine's.
-- **A switch to another harness** (`NO_SWITCH`): its microVM runs its own harness's image.
+  there are its machine's. Refused as it's asked, before anything of it stops, so its member goes on.
+  A move to the machine's newer runner process (an in-place upgrade) isn't refused: there it starts
+  again in a microVM of the newer process, its conversation going on.
+- **A switch to another harness** (`NO_SWITCH`): its microVM runs its own harness's image. Refused as
+  it's asked, as a switch kiln can't make is.
 - **kiln's own tools** aren't given it: kiln's MCP server, its skills and its hooks are reached through
   the machine's runner's socket, which no microVM reaches (step 18 brings them in). An isolated ACP
   agent is offered no MCP server.
@@ -96,12 +101,15 @@ Owed, each with whose it is:
   and a sandbox that takes what it says it doesn't hold failing exactly those clauses (signals among
   them, SANDBOX-11).
 - `cargo test -p kiln --lib sandbox::`: the host's sandbox passing the suite (Unix); the held run's
-  input in order, its end, terminate's signal or input's end then kill, and a run let go of killed;
-  an isolated session's image and launch.
+  input in order, its end, terminate's signal or input's end then kill, a run let go of killed, and
+  its `Duplex` with no pid, nothing to hand over and its stop its boundary's; an isolated session's
+  image and launch; a machine without microVMs saying why in its facts.
+- `cargo test -p kiln --lib harness::lineage::tests::s17_`: a runner's own reason in a refusal.
 - `cargo test -p kiln --lib harness::kinds::tests::s17_`: every launch beginning with its base, and each
   built-in image's command carrying it.
 - `cargo test -p kiln --lib harness::host::tests::s17_`: an isolated Claude Code session in the
   machine's microVMs' stand-in (`sandbox::fake`): it starts as the image's member with no process of
   the machine's, takes a message and answers, is interrupted (the control request at its member),
   is stopped by force and starts again on the same conversation (`--resume` past its image's command),
-  and ends with nothing of it running; and a machine without microVMs refusing one.
+  is refused a switch and a move with its member going on, and ends with nothing of it running; and a
+  machine without microVMs refusing one.
