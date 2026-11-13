@@ -463,6 +463,10 @@ pub struct Codex {
     /// Its thread runs with web search off: what the person lets it do turned it off (`web_off`).
     #[serde(default)]
     web_off: bool,
+    /// Where it sees its project, in a microVM that sees it elsewhere than this machine
+    /// (`sandbox::isolated::Seen`): each request that names its folder names it as it sees it.
+    #[serde(default)]
+    seen: Option<crate::sandbox::isolated::Seen>,
 }
 
 impl Codex {
@@ -480,7 +484,13 @@ impl Codex {
         if spec.fork {
             c.fork_at = Some(spec.resume_at.clone());
         }
+        c.seen = crate::sandbox::isolated::Seen::of(spec);
         c
+    }
+
+    /// The folder it works in, as it sees it ([`Self::seen`]).
+    fn cwd(&self, core: &Core) -> String {
+        crate::sandbox::isolated::said(self.seen.as_ref(), &core.state.cwd)
     }
 
     pub fn new(resume: Option<String>, model: Option<String>, mode: Option<String>, allow_bypass: bool) -> Self {
@@ -556,6 +566,7 @@ impl Codex {
             hook_asks: HashMap::new(),
             hook_warned: false,
             web_off: false,
+            seen: None,
         }
     }
 
@@ -1544,7 +1555,7 @@ impl Codex {
                 self.refresh_speeds(core);
             }
             Command::Suggest { client, query } => {
-                let root = core.state.cwd.clone();
+                let root = self.cwd(core);
                 self.request(core, Pending::Suggest(client), "fuzzyFileSearch", json!({"query": query, "roots": [root]}));
             }
             Command::SetEffort { effort } => {
@@ -1606,7 +1617,7 @@ impl Codex {
                 self.mcp_reload(core);
             }
             Command::McpRefresh => {
-                self.request(core, Pending::Config, "config/read", json!({"cwd": core.state.cwd.clone()}));
+                self.request(core, Pending::Config, "config/read", json!({"cwd": self.cwd(core)}));
                 self.ask_mcp(core);
             }
             Command::McpAuth { name, client, redirect } => match redirect.filter(|r| !r.trim().is_empty()) {
@@ -1681,7 +1692,7 @@ impl Codex {
             Command::SkillsReload => {
                 core.skills_changed();
                 self.installed_skill_roots(core);
-                let cwd = core.state.cwd.clone();
+                let cwd = self.cwd(core);
                 self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd], "forceReload": true}));
             }
         }
@@ -2639,7 +2650,7 @@ impl Codex {
                 Pending::McpAdded { client, .. } => answer(core, client, json!({"ok": false, "error": msg})),
                 Pending::McpConfig(what) => {
                     self.notice(core, Level::Warn, format!("{what}: {msg}"));
-                    self.request(core, Pending::Config, "config/read", json!({"cwd": core.state.cwd.clone()}));
+                    self.request(core, Pending::Config, "config/read", json!({"cwd": self.cwd(core)}));
                 }
                 Pending::McpReload => {
                     self.notice(core, Level::Warn, format!("Reloading the MCP servers: {msg}"));
@@ -2674,7 +2685,7 @@ impl Codex {
                 core.write(&json!({"method": "initialized"}));
                 self.installed_skill_roots(core);
                 let (approval, sandbox, _) = self.policies(core);
-                let cwd = core.state.cwd.clone();
+                let cwd = self.cwd(core);
                 let mut params = json!({"cwd": cwd, "approvalPolicy": approval, "sandbox": sandbox});
                 if let (Some(m), Some(o)) = (&self.model, params.as_object_mut()) {
                     o.insert("model".into(), json!(m));
@@ -2933,7 +2944,7 @@ impl Codex {
             }
             Pending::InstalledSkillRoots => {
                 core.installed_skill_roots = true;
-                let cwd = core.state.cwd.clone();
+                let cwd = self.cwd(core);
                 self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd], "forceReload": true}));
                 self.steer_waiting(core);
                 self.next(core);
@@ -3082,7 +3093,7 @@ impl Codex {
                 self.mcp_reload(core);
             }
             Pending::McpReload => {
-                self.request(core, Pending::Config, "config/read", json!({"cwd": core.state.cwd.clone()}));
+                self.request(core, Pending::Config, "config/read", json!({"cwd": self.cwd(core)}));
                 self.ask_mcp(core);
             }
             Pending::McpAuth { client, name } => match result.get("authorizationUrl").and_then(Value::as_str) {
@@ -3896,7 +3907,7 @@ impl Codex {
                 self.mcp_reload(core);
             }
             "skills/changed" => {
-                let cwd = core.state.cwd.clone();
+                let cwd = self.cwd(core);
                 self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd], "forceReload": true}));
             }
             _ => {}

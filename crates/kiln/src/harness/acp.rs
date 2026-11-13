@@ -236,6 +236,10 @@ pub struct Acp {
     /// Cursor's to-dos' ids, in `state.todos`' order (`cursor/update_todos` merges by them).
     #[serde(default)]
     todo_ids: Vec<String>,
+    /// Where it sees its project, in a microVM that sees it elsewhere than this machine
+    /// (`sandbox::isolated::Seen`): its session opens there.
+    #[serde(default)]
+    seen: Option<crate::sandbox::isolated::Seen>,
 }
 
 fn ready() -> bool {
@@ -318,6 +322,7 @@ impl Acp {
             kind: String::new(),
             auth: Vec::new(),
             todo_ids: Vec::new(),
+            seen: None,
         }
     }
 
@@ -337,7 +342,13 @@ impl Acp {
             }
         }
         a.speed_start.clone_from(&spec.speed);
+        a.seen = crate::sandbox::isolated::Seen::of(spec);
         a
+    }
+
+    /// The folder it works in, as it sees it ([`Self::seen`]).
+    fn cwd(&self, core: &Core) -> String {
+        crate::sandbox::isolated::said(self.seen.as_ref(), &core.state.cwd)
     }
 
     /// The conversation so far, in words, to give with the first message it sends.
@@ -665,7 +676,7 @@ impl Acp {
         }
         self.ready = false;
         self.replaying = core.events().any(|e| matches!(e.body, Body::User { .. } | Body::Assistant { .. }));
-        let cwd = core.state.cwd.clone();
+        let cwd = self.cwd(core);
         match self.session.clone() {
             Some(s) if self.can_load => self.request(core, Pending::Refresh, "session/load", json!({"sessionId": s, "cwd": cwd, "mcpServers": self.mcp})),
             Some(_) => self.notice(core, Level::Error, "This agent cannot reload its account in an open session."),
@@ -1525,7 +1536,8 @@ impl Acp {
                     core.state.harness_session = None;
                     self.replaying = false;
                     core.touch_state();
-                    self.request(core, Pending::RefreshNew, "session/new", json!({"cwd": core.state.cwd, "mcpServers": self.mcp}));
+                    let cwd = self.cwd(core);
+                    self.request(core, Pending::RefreshNew, "session/new", json!({"cwd": cwd, "mcpServers": self.mcp}));
                 }
                 Pending::Refresh | Pending::RefreshNew => {
                     self.replaying = false;
@@ -1557,7 +1569,7 @@ impl Acp {
                 core.state.harness_status = status_rows(&result);
                 self.auth = result.get("authMethods").and_then(Value::as_array).into_iter().flatten().filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_owned)).collect();
                 core.touch_state();
-                let cwd = core.state.cwd.clone();
+                let cwd = self.cwd(core);
                 match self.resume.clone().filter(|_| self.can_load) {
                     Some(sid) => {
                         // Its own session, loaded: the conversation in words (a crashed session's

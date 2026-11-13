@@ -311,7 +311,9 @@ impl ArchivedSession {
         let items = match kind.protocol {
             Protocol::ClaudeStreamJson => {
                 let native = uuid::Uuid::now_v7().to_string();
-                let cwd = session::resolve_cwd(spec.cwd.as_deref());
+                // Where Claude Code resumes it looks for it: under its folder as it sees it, in a microVM its project's
+                // place there (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7).
+                let cwd = crate::sandbox::isolated::harness_cwd(&spec);
                 let records = super::handoff::to_claude(&conversation, Some(note), &native, &cwd, &state.model);
                 let path = super::handoff::write_claude(&spec.env, &cwd, &native, &records).map_err(|e| format!("The retained conversation could not be installed: {e:#}. The archive is kept."))?;
                 #[cfg(unix)]
