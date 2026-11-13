@@ -30,7 +30,7 @@ recorded changes, and one command takes a new revision.
   this against the product's own `vendor/MANIFEST.toml` and `vendor/patches/`: upstream's, or, where
   kiln's copy of the product takes them (its `take` brings in `vendor/MANIFEST.toml`), kiln's copy's,
   its recorded changes applied. A product whose upstream pins another revision than kiln's is so held
-  to kiln's by a recorded change that moves its pins (Hex's, to kiln's Shards and hyper-raft;
+  to kiln's by a recorded change that moves its pins (Hex's, to kiln's hyper-raft;
   `vendor/hex/UPSTREAM.md`): its first take is written with the pins that disagree named, the gate not
   run, for that change to be recorded.
 - **One revision linked.** `crates/kiln/tests/vendored.rs` fails the gate when `Cargo.lock` links a

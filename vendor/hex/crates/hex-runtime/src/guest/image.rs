@@ -356,17 +356,16 @@ impl ImageBoot {
 }
 
 /// Shards' image boot (D231) as this host can run it, or why it can't (docs/design/shards-image-class.md
-/// §1): Shards' Windows run host is owed, and on macOS D231 starts its run host through std's `Command`,
-/// whose spawn passes no `POSIX_SPAWN_CLOEXEC_DEFAULT` while macOS's pipe, socket, socketpair and accept
-/// take no close-on-exec flag, so the run host would hold whatever another thread had just made, where
-/// every program Hex starts on macOS holds only its stdio (`crate::macos::command`).
+/// §1). D231 starts its run host through std's `Command`, which hands it what the node holds inheritable at
+/// that moment, where every program Hex starts holds only its stdio. On macOS std's spawn passes no
+/// `POSIX_SPAWN_CLOEXEC_DEFAULT`, and pipe, socket, socketpair and accept take no close-on-exec flag, so the
+/// run host would hold whatever another thread had just made (`crate::macos::command`). On Windows std's
+/// spawn passes `bInheritHandles` with no handle list, so the run host would hold every inheritable handle
+/// the node has: its own stdio, which it inherited, and each box member's while it starts (`crate::windows`'s
+/// keeper and `sys::create`). On Linux std and rustix open descriptors close-on-exec in the same call
+/// (`O_CLOEXEC`, `SOCK_CLOEXEC`, `pipe2`, `accept4`), so the node holds none for the run host to inherit.
 pub fn host_images() -> Result<Arc<dyn Images>, Refusal> {
-    if cfg!(windows) {
-        return Err(Refusal::Awaits {
-            needs: Upstream::WindowsRunHost,
-        });
-    }
-    if cfg!(target_os = "macos") {
+    if cfg!(any(windows, target_os = "macos")) {
         return Err(Refusal::Awaits {
             needs: Upstream::RunHostStdioOnly,
         });
@@ -640,8 +639,9 @@ impl GuestRuntime {
         let asked = Instant::now();
         let spawned = std::thread::Builder::new()
             .name("hex-image-boot".to_owned())
-            // Unbounded there, as D231's boot was before it took a patience: the box's own wait bounds the
-            // call (`waits.boot`), and the run host ends with the boot it no longer waits for.
+            // No patience of D231's own: the box's learned wait bounds its caller (`waits.boot`), and a boot
+            // slower than that bound is still answered and learned, where one killed at it would teach the wait
+            // nothing past its own bound (docs/design/shards-image-class.md §6).
             .spawn(move || answer.put(images.boot(&spec, Duration::MAX)));
         if let Err(why) = spawned {
             // No boot began: the box ends, its intent's record kept with its end.

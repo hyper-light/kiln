@@ -385,3 +385,58 @@ fn a_nodes_image_class_takes_this_boot_from_its_stores_own_stamp() {
         Err(Refusal::Broken(_))
     ));
 }
+
+/// Joint plan step 12 (AC-T7.4.1; docs/design/shards-image-class.md §8): an image VM's guest runs no node of Hex's,
+/// so a macOS or Windows node, whose runtime is a `WithGuest`, answers its box's calls with its guest runtime's image
+/// class, as Linux's node runs an exec into one here (`guest_node_class`). Do: forward an inspect, a start, a usage, a
+/// signal and an exec of a Shards image box's spec through the guest-backed node's runtime. Expect: each comes back to
+/// run on the worker; none goes to a guest's node, and no guest boots.
+#[test]
+fn a_shards_image_boxs_calls_come_back_to_its_guest_runtime_never_to_a_guest_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, boots) = guest_node(dir.path());
+    let id = BoxId::new("image-box").unwrap();
+    let spec = BoxSpec {
+        id: id.clone(),
+        bounds: Bounds::default(),
+        class: ClassSpec::ShardsImage(Box::new(hex_api::ShardsImage::new(hex_api::sim::SIM_IMAGE))),
+        owner: None,
+        allocation: Some(hex_api::sim::sim_vm_allocation().unwrap()),
+        route: None,
+        devices: Vec::new(),
+    };
+    let calls = [
+        Call::Inspect(id.clone()),
+        Call::Start(id.clone()),
+        Call::Usage(id.clone()),
+        Call::Signal {
+            id: id.clone(),
+            signal: Signal::KILL,
+        },
+        Call::Exec {
+            id: id.clone(),
+            program: Program::of(&["/bin/true"]),
+            streams: hex_core::wire::Streams {
+                stdin: false,
+                stdout: false,
+                stderr: false,
+            },
+        },
+    ];
+    for call in calls {
+        let asked = format!("{call:?}");
+        let forwarded = Recover::forward_for(
+            &node.runtime,
+            &spec,
+            call,
+            Stdio::null(),
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        );
+        assert!(
+            matches!(forwarded, Forward::Back(_)),
+            "{asked} on a Shards image box went past its guest runtime"
+        );
+    }
+    assert_eq!(boots.load(Ordering::SeqCst), 0);
+}

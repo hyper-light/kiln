@@ -24,9 +24,10 @@ pub const HELD_AT: usize = 2;
 /// A connection's end as its owner sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum There {
-    /// The peer may still send.
+    /// The peer may still send: the connection gone now cuts its bytes short, and a read says why.
     Open,
-    /// The peer's half ended: what was read is all.
+    /// The peer's half ended: all it sent has come, and is read to its end however the connection goes after
+    /// (a peer that drops a connection whose other half is open resets it after its End; HEX-QUIC-26).
     Ended,
 }
 
@@ -75,7 +76,9 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> io::Error {
 /// What of the front frame fits `buf`, and the bytes of a frame the owner has now read whole, to grant the peer
 /// back; `None` while nothing has come and the peer's half is open.
 fn take(state: &mut MutexGuard<'_, State>, buf: &mut [u8]) -> io::Result<Option<(usize, u64)>> {
-    if let Some(why) = state.gone {
+    if let Some(why) = state.gone
+        && state.there == There::Open
+    {
         return Err(gone_error(why));
     }
     let at = state.read;
@@ -161,14 +164,17 @@ impl Shared {
         self.told();
     }
 
-    /// The driver: the connection is gone both ways, for `why`.
+    /// The driver: the connection is gone both ways, for `why`. What the peer sent before its End stays the owner's
+    /// to read ([`There::Ended`]).
     pub(crate) fn gone(&self, why: Why) {
         if let Ok(mut state) = self.state.lock() {
             if state.gone.is_none() {
                 state.gone = Some(why);
             }
             state.outbox = None;
-            state.inbound.clear();
+            if state.there == There::Open {
+                state.inbound.clear();
+            }
         }
         self.told();
     }
@@ -377,12 +383,16 @@ impl Conn {
         self.shared.peer
     }
 
-    /// Whether the peer's half has ended and all of it was read, or the connection is gone: a read now returns
-    /// its end.
+    /// Whether the peer's half has ended and all of it was read, or the connection went before it ended: a read now
+    /// returns its end.
     pub fn hung_up(&self) -> bool {
-        self.shared.state.lock().is_ok_and(|state| {
-            state.gone.is_some() || (state.there == There::Ended && state.inbound.is_empty())
-        })
+        self.shared
+            .state
+            .lock()
+            .is_ok_and(|state| match state.there {
+                There::Open => state.gone.is_some(),
+                There::Ended => state.inbound.is_empty(),
+            })
     }
 
     /// Ends this side's half once what was written has gone: the peer reads to its end.

@@ -3010,6 +3010,9 @@ impl<P: Recover> Recover for hex_runtime::guest::WithGuest<P> {
         forward_guest(self.guest(), call, stdio, reply, ended)
     }
 
+    /// A box of the guest's goes to the guest's node, but a Shards image VM's: its guest runs no node of Hex's,
+    /// so its calls run on the worker, where the guest runtime's image class answers them, as Linux's node runs
+    /// an exec into one there (docs/design/shards-image-class.md §8).
     fn forward_for(
         &self,
         spec: &BoxSpec,
@@ -3018,6 +3021,9 @@ impl<P: Recover> Recover for hex_runtime::guest::WithGuest<P> {
         reply: Reply,
         ended: serve::Ended,
     ) -> Forward {
+        if matches!(spec.class, hex_api::ClassSpec::ShardsImage(_)) {
+            return Forward::Back(Box::new((call, stdio)));
+        }
         match self.route_for(spec) {
             Ok(hex_runtime::guest::Side::Guest) => {
                 forward_guest(self.guest(), call, stdio, reply, ended)

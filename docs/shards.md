@@ -11,8 +11,8 @@ kiln vendors Shards (`vendor/shards`) and Hex (`vendor/hex`) as it vendors every
 each at one revision, with kiln's recorded changes, and one copy of each project in kiln's tree.
 
 - **Shards** is pinned at a revision of its `main` (`vendor/MANIFEST.toml`; `vendor/shards/UPSTREAM.md`).
-- **Hex** is pinned at its `main`, with a recorded change that moves its own pins of Shards and hyper-raft to
-  kiln's and takes Shards' API at kiln's revision (`vendor/hex/UPSTREAM.md`). kiln's copy holds Hex's
+- **Hex** is pinned at its `main`, which builds on kiln's Shards revision itself, with a recorded change that
+  moves its own pin of hyper-raft to kiln's (`vendor/hex/UPSTREAM.md`). kiln's copy holds Hex's
   `vendor/MANIFEST.toml` and `vendor/patches`, so `scripts/vendor.py check` holds Hex's pins to kiln's as kiln's
   copy has them: one Shards revision serves Hex and kiln.
 - **hyper-raft** gains Hex's one change Hex's code calls (`Endpoint::negotiated`, the suite and group a QUIC

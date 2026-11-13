@@ -1754,7 +1754,7 @@ pub enum GuestTime {
 impl GuestTime {
     /// One entry for every 8-bit vCPU index: a Shards VM numbers its vCPUs by 8-bit APIC id on x86_64
     /// (its MADT, at most 255; crates/vmm/src/arch/x86_64/acpi.rs) and has fewer on arm64 (123, its
-    /// GIC redistributor region; crates/vmm/src/arch/aarch64/mod.rs), at Shards 482c5d78. Bounds a
+    /// GIC redistributor region; crates/vmm/src/arch/aarch64/mod.rs), at Shards 482c5d78 and e82b9403. Bounds a
     /// report read off the wire, never a VM's admission, which is Shards' to refuse.
     pub const MAX_VCPUS: usize = 1 << u8::BITS;
 }
@@ -1834,8 +1834,9 @@ pub enum Refusal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Upstream {
-    /// A Shards microVM's guest time per vCPU, with a monotone total, on HVF, KVM and WHP: Shards'
-    /// guest CPU time work, in no Shards revision yet.
+    /// A Shards microVM's guest time per vCPU, with a monotone total, on HVF, KVM and WHP, through what
+    /// Hex boots it with: Shards reads it for its daemon's runs (6396a78b, `GUEST_TIME`), but D231's image
+    /// boot says none in its stats (Shards e82b9403).
     GuestCpuTimePerVcpu,
     /// A program started in a member of a Shards microVM: the exec of Shards' agent-control
     /// endpoint.
@@ -1846,8 +1847,9 @@ pub enum Upstream {
     /// What a runtime nested under shards-init needs: a delegated cgroup subtree, CAP_SYS_ADMIN for
     /// its boxes' namespaces and DRM render nodes, granted by name.
     NestedRuntime,
-    /// The Windows host of an image's run: `shards api-run` on Windows, whose AppContainer launch
-    /// Shards' D231 owes.
+    /// The Windows host of an image's run: `shards api-run` on Windows, which D231 owed and gives at
+    /// Shards e82b9403, its VM process confined in an AppContainer. No call is refused for it there; Windows
+    /// awaits [`Upstream::RunHostStdioOnly`] instead.
     WindowsRunHost,
     /// Taking back an image's run after its owner's crash: a run ends with its owner in D231's
     /// first version, which owes `attach`.
@@ -1863,10 +1865,11 @@ pub enum Upstream {
     /// A Shards guest told the room its host's budget leaves it (D188): init's `ROOM`, which
     /// shards-api's image boot (D231) has no call to send (joint plan step 14).
     GuestRoom,
-    /// The host of an image's run started holding only its stdio, as every program Hex starts on
-    /// macOS is: D231 starts `shards api-run` through std's `Command`, whose macOS spawn passes no
-    /// `POSIX_SPAWN_CLOEXEC_DEFAULT`, so it would inherit every descriptor another thread holds
-    /// without close-on-exec at that moment (CVE-2024-21626's class).
+    /// The host of an image's run started holding only its stdio, as every program Hex starts on macOS
+    /// and Windows is: D231 starts `shards api-run` through std's `Command`, whose macOS spawn passes no
+    /// `POSIX_SPAWN_CLOEXEC_DEFAULT`, so it would inherit every descriptor another thread holds without
+    /// close-on-exec at that moment, and whose Windows spawn passes `bInheritHandles` with no handle
+    /// list, so it would inherit every handle the node holds inheritable (CVE-2024-21626's class).
     RunHostStdioOnly,
     /// The member a published port reaches, named by Shards' image boot (D231): its `Bound` names none, and a run
     /// with a command of its own gives that command every port its Agentfile gives no member (D122), so a publish
@@ -1904,12 +1907,12 @@ impl std::fmt::Display for Upstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::GuestCpuTimePerVcpu => {
-                "a Shards microVM's guest time per vCPU (Shards' guest CPU time work)"
+                "a Shards microVM's guest time per vCPU (in Shards' image boot's stats)"
             }
             Self::MemberExec => "a program run in a Shards member (its agent-control endpoint)",
             Self::MemberGrantsByName => "a Shards member's grants by name",
             Self::NestedRuntime => "a runtime nested under shards-init, with its grants",
-            Self::WindowsRunHost => "Shards' Windows host of an image's run (owed by D231)",
+            Self::WindowsRunHost => "Shards' Windows host of an image's run (given by D231)",
             Self::AttachAfterCrash => {
                 "taking back an image's run after its owner's crash (owed by D231)"
             }
