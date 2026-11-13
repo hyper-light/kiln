@@ -149,6 +149,10 @@ pub fn package_for(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown
         parent: info.parent.clone(),
         plan_run: info.plan_run.clone(),
         allow_bypass: !info.no_bypass,
+        // Held as it was: one in a microVM goes on in a microVM of its own, from its image and for its
+        // person, never as a process on its machine (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
+        // Its Agentfile's text, a person's own, is kiln's to read again (`registry::resume_on`).
+        isolation: info.isolation.clone(),
         ..Spec::default()
     };
     let mut pkg = moving::pack(id, spec, &goes_on_in, from, &from_cwd, carry, events, state);
@@ -224,6 +228,28 @@ mod tests {
             }
             let seeded = crate::harness::moving::install(&pkg, "/work/parser").map_err(anyhow::Error::msg)?;
             anyhow::ensure!(seeded.is_some() == matches!(k.protocol, Protocol::Acp(_)), "{}: words only for ACP: {seeded:?}", k.id);
+        }
+        Ok(())
+    }
+
+    /// Kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5: a crashed agent that ran in a microVM, resumed
+    /// in place from the server's copy, goes on in one again, from its image and for its person, never
+    /// as a process on its machine; one that ran as a process stays one. Mutation: leaving `isolation`
+    /// out of the package's spec fails it.
+    #[test]
+    fn s35_a_crashed_isolated_agent_resumed_in_place_stays_isolated() -> anyhow::Result<()> {
+        use crate::harness::session::Isolation;
+        let held = Isolation { image: Some("agentfile:0123456789abcdef0123456789abcdef".into()), person: Some("user:u1".into()), memory: Some(4 << 30), ..Isolation::microvm() };
+        for isolation in [Some(held), None] {
+            let (_d, store) = crate::convo::store::scratch()?;
+            let mut i = info("codex", Some("thread-1"))?;
+            i.isolation.clone_from(&isolation);
+            store.send("s1", &Update::Open { info: Box::new(i), since: None });
+            store.send("s1", &Update::State { state: Box::new(State { harness_session: Some("thread-1".into()), ..State::default() }) });
+            store.sync()?;
+            let pkg = package_for(&store, "s1", "box", None, ("box", "box"), true)?;
+            assert_eq!((pkg.spec.isolation, pkg.spec.resume.as_deref()), (isolation, Some("thread-1")));
+            assert_eq!(pkg.spec.agentfile, None, "its Agentfile's text is kiln's to read, as at its start");
         }
         Ok(())
     }

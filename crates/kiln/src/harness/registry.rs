@@ -2783,20 +2783,31 @@ impl Registry {
     }
 
     /// A machine's past sessions, newest first, as JSON (`None`: that machine does not look, e.g.
-    /// an ephemeral runner). The server's own skip what its sessions are running.
-    pub async fn history(&self, hub: &Hub, target: &str, kind: Option<String>, limit: usize) -> anyhow::Result<Option<Value>> {
+    /// an ephemeral runner), with those kept in `person`'s microVM volumes there, each saying so
+    /// (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5). The server's own skip what its sessions
+    /// are running.
+    pub async fn history(&self, hub: &Hub, target: &str, kind: Option<String>, limit: usize, person: Option<String>) -> anyhow::Result<Option<Value>> {
         match Location::of_target(target) {
             Location::Local => {
                 let running: std::collections::HashSet<String> = self.local.list().into_iter().filter_map(|i| i.harness_session).collect();
                 let scanner = Arc::clone(&self.scanner);
+                // Its people's microVM volumes, where its own host's isolated launches keep them.
+                let homes = self.local.homes().map(std::path::Path::to_path_buf);
                 let past = crate::rt::blocking(move || {
                     let mut g = scanner.lock();
-                    g.get_or_insert_with(|| crate::aisessions::Scanner::new(crate::os::home_dir())).history(kind.as_deref(), limit, &running)
+                    let made = || {
+                        let s = crate::aisessions::Scanner::new(crate::os::home_dir());
+                        match homes {
+                            Some(root) => s.with_homes(root),
+                            None => s,
+                        }
+                    };
+                    g.get_or_insert_with(made).history(kind.as_deref(), limit, &running, person.as_deref())
                 })
                 .await?;
                 Ok(Some(serde_json::to_value(past)?))
             }
-            Location::Machine(m) => hub.harness_history(&m, kind, u32::try_from(limit).unwrap_or(u32::MAX)).await?.map(serde_json::to_value).transpose().map_err(Into::into),
+            Location::Machine(m) => hub.harness_history(&m, kind, u32::try_from(limit).unwrap_or(u32::MAX), person).await?.map(serde_json::to_value).transpose().map_err(Into::into),
         }
     }
 
@@ -3150,10 +3161,11 @@ impl Registry {
             if let Some(store) = store.filter(|_| matches!(u, Update::Events { .. })) {
                 store.send(id, &u);
             }
-            // A session this server does not know yet (it restarted): ask for all of it.
-            if let Location::Machine(machine) = &from
-                && !matches!(u, Update::Closed)
-            {
+            // A session this server does not know yet (it restarted): ask for all of it. One that ended (on its
+            // machine while this server was down) has its goals let go of.
+            if matches!(u, Update::Closed) {
+                goals_ended(hub, id);
+            } else if let Location::Machine(machine) = &from {
                 self.request_snapshot(hub, machine, id);
             }
             return None;
@@ -3243,6 +3255,7 @@ impl Registry {
             Update::Reply { .. } | Update::Inbox { .. } | Update::MailFlow { .. } => {}
             Update::Closed => {
                 gone = true;
+                goals_ended(hub, id);
                 // Its identities with it (docs/ci.md W27-R01).
                 let (store, id) = (hub.store.clone(), id.to_owned());
                 drop(crate::rt::spawn(async move {
@@ -3944,6 +3957,11 @@ impl Registry {
     /// its runners' grace.
     pub async fn returned(&self, id: &str) {
         self.returning.wait(id, || self.sessions.slot(id).is_some()).await;
+    }
+
+    /// Whether this server can say now whether it has session `id`: [`Registry::returned`] without the wait.
+    pub fn can_say(&self, id: &str) -> bool {
+        self.returning.says(id, || self.sessions.slot(id).is_some())
     }
 
     /// Join a session's stream as a viewer that had it through revision `after` (`(born, rev)`),
@@ -4928,6 +4946,11 @@ impl Registry {
         .await
         .map_err(|e| format!("{e:#}"))?
         .map_err(|e| format!("{e:#}"))?;
+        // One in a microVM made from its person's own Agentfile: that Agentfile's text, read as theirs
+        // at its latest version, for its machine to build its microVM from again, as at its start (kiln
+        // plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5; `lineage::kept_agentfile`).
+        let person = pkg.spec.isolation.as_ref().and_then(|i| i.person.clone());
+        pkg.spec.agentfile = super::lineage::kept_agentfile(hub, pkg.spec.isolation.as_ref(), person.as_deref()).await?;
         // kiln takes it for the process that held it, which can't hand it on: the package carries
         // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
         let heard = hub.agents.load().get(&from_name).map(|a| a.last_seen).unwrap_or_default();
@@ -5083,6 +5106,11 @@ impl Registry {
             }
             super::archive::closed(hub, id);
             super::attention::forget(id);
+            // Its goal stack with it, and what it held as another stack's subagent back there (`crate::goals::forget`),
+            // whoever closed it (its port, not kiln's own end of it, which forgets it too).
+            if let Err(e) = crate::goals::forget(hub, id).await {
+                tracing::warn!(session = %id, error = %format!("{e:#}"), "a closed agent's goal stack wasn't let go of");
+            }
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
         ok || loc.is_some()
@@ -5278,6 +5306,20 @@ fn unsigned(hub: &Hub, id: &str, epoch: u64, took: &str, why: String) {
         }
     });
 }
+
+/// Agent `id` ended on its machine, or where this server had no copy of it: its goal stack with it, and
+/// what it held as another stack's subagent back there, in one transaction (`crate::goals::forget`),
+/// as kiln's own end of an agent does. Before, only that end forgot an agent's stack: one ended on its
+/// machine left the goal it held held, for its follower to find gone on a later look.
+fn goals_ended(hub: &Arc<Hub>, id: &str) {
+    let (hub, id) = (Arc::clone(hub), id.to_owned());
+    drop(crate::rt::spawn(async move {
+        if let Err(e) = crate::goals::forget(&hub, &id).await {
+            tracing::warn!(session = %id, error = %format!("{e:#}"), "an ended agent's goal stack wasn't let go of");
+        }
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

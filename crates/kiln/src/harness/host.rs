@@ -703,6 +703,10 @@ pub struct Host {
     /// 01a1cd8e862e7169a074db3d5fa33f3d step 17, `crate::sandbox::microvm`): none where its kiln
     /// carries no microVM runtime, and then it holds no isolated agent.
     microvm: Mutex<Option<Arc<crate::sandbox::Microvms>>>,
+    /// Where this machine keeps its persons' harness homes, one per person and harness
+    /// (`<state>/homes`, `super::isolated::home`), as an isolated launch reads what its session uses
+    /// (`crate::sandbox::isolated::reach_of`): none where this host keeps no sessions file.
+    homes: Option<PathBuf>,
 }
 
 /// Most of what waits in one session's lane: past it, what's sent is refused (a message, `Full`).
@@ -965,6 +969,7 @@ impl Host {
             |d| d.join("attachments"),
         );
         let handovers = file.as_ref().and_then(|f| f.parent()).map(Handovers::of);
+        let homes = file.as_ref().and_then(|f| f.parent()).map(super::isolated::home::root);
         let host = Arc::new_cyclic(|me| Self {
             input_budgets: super::admission::SessionBudgets::default(),
             sessions: Mutex::new(HashMap::new()),
@@ -991,9 +996,15 @@ impl Host {
             held: AtomicBool::new(false),
             handovers,
             microvm: Mutex::new(crate::sandbox::microvm()),
+            homes,
         });
         crate::memory::room::follow_input(&host);
         host
+    }
+
+    /// Where this machine keeps its persons' harness homes (`<state>/homes`), if it keeps any.
+    pub fn homes(&self) -> Option<&std::path::Path> {
+        self.homes.as_deref()
     }
 
     /// Where this machine holds isolated agents' harnesses (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
@@ -5101,7 +5112,11 @@ while True:
             // Where it runs, on its info (step 34's checks read it): its microVM by name, its image pinned,
             // no host pid, said so, and the link its stdio rides, both ends' words once it's made.
             until_it("its link, said", 60, || matches!(s.info().runs, Some(session::Runs::Microvm { control: Some(_), .. }))).await?;
-            assert_eq!(s.info().runs, Some(session::Runs::Microvm { vm: Some("fake-vm-1".into()), image: pinned.clone(), host_pid: None, control: Some(link.clone().into()) }));
+            // Claude Code's image serves one provider: its destinations are all its run's, kept whole, no fallback said.
+            let one_use = crate::sandbox::narrow::Reach::Whole { why: crate::sandbox::narrow::Whole::OneUse };
+            assert_eq!(s.info().runs, Some(session::Runs::Microvm { vm: Some("fake-vm-1".into()), image: pinned.clone(), host_pid: None, control: Some(link.clone().into()), reach: Some(Box::new(one_use)) }));
+            assert_eq!(launch.egress, kiln_seams::sandbox::Egress::Any, "its image's own grants, narrowed no further");
+            assert!(!s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains("isn't narrowed"))), "no fallback to say");
             let info = serde_json::to_value(s.info())?;
             assert_eq!(info.pointer("/runs/in"), Some(&serde_json::json!("microvm")));
             assert_eq!(info.pointer("/runs/host_pid"), Some(&serde_json::Value::Null), "no host pid, said rather than left out");

@@ -51,7 +51,7 @@ use crate::harness::session::Info;
 use crate::hub::Hub;
 
 /// Where kiln keeps the step each subagent it started is for, by the subagent (`kv`).
-const MARK: &str = "goals/subagent/";
+pub(super) const MARK: &str = "goals/subagent/";
 /// After a subagent couldn't be started for an agent's steps, how long before kiln tries again: the
 /// agent takes its steps itself meanwhile.
 const RETRY_MS: i64 = 5 * 60_000;
@@ -369,19 +369,19 @@ async fn keep_mark(hub: &Hub, child: &str, mark: &Mark) -> anyhow::Result<()> {
 /// someone else) ends now. A hand-off cut short (the server stopped between the subagent's start
 /// and its goal marked here) is taken up by this subagent, so none other starts for that goal.
 async fn follow_one(hub: &Hub, metrics: &crate::metrics::AgentMetrics, child: &str, mark: &mut Mark) -> anyhow::Result<()> {
-    let mut stack = super::get(hub, &mark.agent).await?;
     let Some(info) = hub.harness.info(child) else {
-        // Not known right now (its machine reconnecting, the server just started) is waited for;
-        // ended for good, its goal stack went with it, and its step comes back.
-        if kept(hub, child).await? {
-            return Ok(());
+        // Not known right now (its machine reconnecting, the server just started) is waited for, as
+        // long as the server can't say yet whether it has it (`Registry::can_say`). Gone, it's
+        // forgotten as its end would have it, what it held coming back in the same transaction
+        // (`goals::forget_with`): whether a stack of its is still there says nothing, since its harness's
+        // last goal, adopted as it ended, made its stack again (01a1d2a9b720's, 2026-11-13), and
+        // the step it held waited on it for good.
+        if hub.harness.can_say(child) {
+            super::forget_with(hub, child, "its subagent ended before it was met").await?;
         }
-        if let Some(g) = stack.items.iter().find(|i| i.id == mark.goal && i.subagent.as_deref() == Some(child) && open(i)) {
-            back(hub, &mark.agent, &g.id, child, "its subagent ended before it was met").await?;
-        }
-        let _ = hub.store.kv_delete(format!("{MARK}{child}")).await;
         return Ok(());
     };
+    let mut stack = super::get(hub, &mark.agent).await?;
     let theirs = super::get(hub, child).await?;
     // Cut short: its goal not marked here as its, still the stack's to hand, and held there.
     let cut_short = !stack.items.iter().any(|i| i.id == mark.goal && i.subagent.as_deref() == Some(child))
@@ -474,6 +474,56 @@ async fn met_here(hub: &Hub, metrics: &crate::metrics::AgentMetrics, agent: &str
     Ok(())
 }
 
+/// Goal `goal`, held by subagent `child`, back on its stack in `c` (a transaction's) unmet
+/// (`reason`): to go, the stack's agent's to take ([`back`], [`release`]).
+fn hand_back(c: &rusqlite::Connection, goal: &str, child: &str, reason: &str) -> anyhow::Result<()> {
+    c.execute(
+        "UPDATE goal_items SET subagent = NULL, subagent_back = 1, reason = ?3, status = 'pending', how = NULL, started_at = NULL, reminded_at = 0, reminders = 0, busy_at = 0
+         WHERE id = ?1 AND subagent = ?2 AND status IN ('pending', 'active')",
+        params![goal, child, reason],
+    )?;
+    Ok(())
+}
+
+/// What subagent `child` held, in `c` (a transaction's), as it's forgotten (`goals::forget_with`): each goal a
+/// stack handed it back there unmet (`reason`), as [`back`] brings one, its parts let go of with it.
+/// The stacks that had them, and whether each runs.
+pub(super) fn release(c: &rusqlite::Connection, child: &str, reason: &str, now: i64) -> anyhow::Result<Vec<(String, bool)>> {
+    let held: Vec<(String, String, Option<String>)> = c
+        .prepare("SELECT agent, id, part_of FROM goal_items WHERE subagent = ?1 AND status IN ('pending', 'active')")?
+        .query_map(params![child], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut stacks: Vec<String> = Vec::new();
+    for (agent, id, part_of) in &held {
+        // The goal handed it, not one of its parts (they go with it, below).
+        if !part_of.as_deref().is_some_and(|p| held.iter().any(|(_, h, _)| h == p)) {
+            hand_back(c, id, child, reason)?;
+        }
+        if !stacks.contains(agent) {
+            stacks.push(agent.clone());
+        }
+    }
+    c.execute("UPDATE goal_items SET subagent = NULL WHERE subagent = ?1 AND status IN ('pending', 'active')", params![child])?;
+    let mut out = Vec::new();
+    for a in stacks {
+        touch(c, &a, None, None, now)?;
+        let state: String = c.query_row("SELECT state FROM goal_stacks WHERE agent = ?1", params![a], |r| r.get(0))?;
+        out.push((a, state == "running"));
+    }
+    Ok(out)
+}
+
+/// Whether subagent `id`, holding a goal, is gone for good: the server has no such agent and can say
+/// so (`Registry::can_say`: its sessions listed, and no runner that may still come back holds it), or
+/// it's there but ended, its own goal stack gone with its end (`goals::forget`). No timer: how it
+/// stands now.
+pub(super) async fn gone(hub: &Hub, id: &str) -> anyhow::Result<bool> {
+    if hub.harness.info_shared(id).is_none() {
+        return Ok(hub.harness.can_say(id));
+    }
+    Ok(!kept(hub, id).await?)
+}
+
 /// Goal `goal` of `agent`'s stack back from its subagent `child` unmet (`why`), with its parts: the
 /// agent takes it itself (at once, when it's free). One that was under way here while it was there
 /// (G2) is to go again, the agent's.
@@ -485,11 +535,7 @@ async fn back(hub: &Hub, agent: &str, goal: &str, child: &str, why: &str) -> any
         .store
         .call(move |db| {
             let tx = crate::store::tx(db)?;
-            tx.execute(
-                "UPDATE goal_items SET subagent = NULL, subagent_back = 1, reason = ?3, status = 'pending', how = NULL, started_at = NULL, reminded_at = 0, reminders = 0, busy_at = 0
-                 WHERE id = ?1 AND subagent = ?2 AND status IN ('pending', 'active')",
-                params![g, c, reason],
-            )?;
+            hand_back(&tx, &g, &c, &reason)?;
             tx.execute("UPDATE goal_items SET subagent = NULL WHERE agent = ?1 AND subagent = ?2 AND status IN ('pending', 'active')", params![a, c])?;
             touch(&tx, &a, None, None, now)?;
             let state: String = tx.query_row("SELECT state FROM goal_stacks WHERE agent = ?1", params![a], |r| r.get(0))?;
@@ -1355,6 +1401,106 @@ mod hub_tests {
             tick(&hub, &metrics).await;
             assert!(children(&hub, main).is_empty(), "cleared: their subagents go too: {:?}", children(&hub, main));
             assert!(hub.store.kv_prefix(MARK.to_owned()).await?.is_empty(), "none left to follow");
+            Ok(())
+        })
+    }
+
+    /// The goals with words `texts`, ready together on `main`, each out on a subagent of its own after
+    /// the driver's look: their ids, and their subagents'.
+    async fn out_on_subagents(hub: &Hub, main: &str, texts: &[&str]) -> anyhow::Result<Vec<(String, String)>> {
+        tick(hub, &crate::metrics::AgentMetrics::default()).await;
+        let s = super::super::get(hub, main).await?;
+        texts.iter().map(|t| s.items.iter().find(|i| i.text == *t).and_then(|i| Some((i.id.clone(), i.subagent.clone()?))).ok_or_else(|| anyhow::anyhow!("{t:?} isn't out on a subagent: {s:?}"))).collect()
+    }
+
+    /// Goal `id` of `main`'s stack: whom it's held by, whether it came back from its subagent, and why.
+    async fn held(hub: &Hub, main: &str, id: &str) -> anyhow::Result<(Option<String>, bool, Option<String>)> {
+        let s = super::super::get(hub, main).await?;
+        s.items.iter().find(|i| i.id == id).map(|i| (i.subagent.clone(), i.back, i.reason.clone())).ok_or_else(|| anyhow::anyhow!("no goal {id}: {s:?}"))
+    }
+
+    /// Goal `id`, out on its subagent, held instead by `gone`: an agent the server has none of, its
+    /// goal stack still there (and the mark kiln follows it by moved to it, `marked`), as
+    /// 01a1d2a9b720's was on 2026-11-13: stopped, its stack made again by its harness's last goal.
+    async fn held_by_one_gone(hub: &Hub, id: &str, gone: &str, marked: bool) -> anyhow::Result<()> {
+        let (id, gone) = (id.to_owned(), gone.to_owned());
+        hub.store
+            .call(move |c| {
+                let sub: String = c.query_row("SELECT subagent FROM goal_items WHERE id = ?1", params![id], |r| r.get(0))?;
+                c.execute("UPDATE goal_items SET subagent = ?2 WHERE subagent = ?1", params![sub, gone])?;
+                c.execute("INSERT INTO goal_stacks (agent, state, created_at, updated_at) VALUES (?1, 'running', 0, 0)", params![gone])?;
+                c.execute("INSERT INTO goal_items (id, agent, pos, text, status, how) VALUES (?1, ?2, 0, 'its goal', 'active', 'goal')", params![format!("{gone}-g"), gone])?;
+                if marked {
+                    c.execute("UPDATE kv SET k = ?2 WHERE k = ?1", params![format!("{MARK}{sub}"), format!("{MARK}{gone}")])?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// The fault of 2026-11-13: ROOT stopped 01a1d2a9b720 (agents_stop: `harness::ops::end`), the
+    /// subagent its step 11 was out on, and the step stayed held by it for good. Its end forgot its
+    /// stack and left the goal held, for the follower to bring back on a later look, by whether it
+    /// still had a stack; the round's adoption of its harness's last goal made one again in that
+    /// millisecond. Now its end brings the goal back as it forgets the stack, in one transaction:
+    /// back at once, no look of the follower's needed, its mark gone, the other goal still out.
+    #[test]
+    fn a_subagent_ended_brings_its_goal_back_as_it_ends() -> anyhow::Result<()> {
+        within(async {
+            let (hub, main, _folder) = goals_on_main(None, &[("Write the parser", Some(&[])), ("Write the docs", Some(&[]))]).await?;
+            let main = main.as_str();
+            let out = out_on_subagents(&hub, main, &["Write the parser", "Write the docs"]).await?;
+            let [(parser, p), (docs, d)] = <[(String, String); 2]>::try_from(out).map_err(|o| anyhow::anyhow!("{o:?}"))?;
+            anyhow::ensure!(crate::harness::ops::end(&hub, &p, "you").await, "its subagent wasn't ended");
+            assert_eq!(held(&hub, main, &parser).await?, (None, true, Some("Back from its subagent: its subagent ended before it was met.".to_owned())));
+            assert!(!kept(&hub, &p).await? && hub.store.kv_prefix(MARK.to_owned()).await?.iter().all(|(k, _)| !k.ends_with(&p)), "its stack and its mark go with it");
+            assert_eq!(held(&hub, main, &docs).await?.0, Some(d), "the other stays out");
+            Ok(())
+        })
+    }
+
+    /// Goals held by subagents that are gone (the server has none of them; their stacks stay) are
+    /// split and changed as asked, each holder gone brought back first as its end would have, saying
+    /// why: no look of the follower's needed, nor any wait. Before, goals_split refused such a goal
+    /// ("under way on a subagent") and so did goals_update, for good (ROOT's step 11, 2026-11-13).
+    #[test]
+    fn a_goal_held_by_a_subagent_that_is_gone_is_split_and_changed_as_asked() -> anyhow::Result<()> {
+        within(async {
+            let (hub, main, _folder) = goals_on_main(None, &[("Write the parser", Some(&[])), ("Write the docs", Some(&[])), ("Write the CLI", Some(&[]))]).await?;
+            let main = main.as_str();
+            let out = out_on_subagents(&hub, main, &["Write the parser", "Write the docs", "Write the CLI"]).await?;
+            let [(parser, _), (docs, _), (cli, _)] = <[(String, String); 3]>::try_from(out).map_err(|o| anyhow::anyhow!("{o:?}"))?;
+            held_by_one_gone(&hub, &parser, "gone-parser", false).await?;
+            held_by_one_gone(&hub, &docs, "gone-docs", false).await?;
+            let s = super::super::split(&hub, main, Some(&parser), vec!["Lex it".to_owned(), "Parse it".to_owned()]).await?;
+            let parts: Vec<&str> = s.items.iter().filter(|i| i.part_of.as_deref() == Some(parser.as_str())).map(|i| i.text.as_str()).collect();
+            assert_eq!(parts, ["Lex it", "Parse it"], "{s:?}");
+            let (by, back, _) = held(&hub, main, &parser).await?;
+            assert!(by.is_none() && back, "back from the holder that's gone, then split");
+            assert_eq!(held(&hub, main, &docs).await?, (None, true, Some("Back from its subagent: its subagent is gone.".to_owned())), "every holder gone on the stack, brought back with it");
+            assert!(!kept(&hub, "gone-parser").await? && !kept(&hub, "gone-docs").await?, "their stacks go as their ends would have taken them");
+            held_by_one_gone(&hub, &cli, "gone-cli", false).await?;
+            super::super::update(&hub, main, &cli, Change { active: Some(true), ..Change::default() }, &By::You).await?;
+            assert!(held(&hub, main, &cli).await?.0.is_none() && !kept(&hub, "gone-cli").await?, "changed as asked, its holder gone brought back first");
+            Ok(())
+        })
+    }
+
+    /// A goal held by a subagent that's gone, kiln's mark on it kept (the server has none of it; its
+    /// stack stays): the follower's next look brings it back. Before, a stack still there said the
+    /// subagent might come back, and the follower waited for it for ever.
+    #[test]
+    fn a_goal_whose_subagent_is_gone_comes_back_at_the_followers_next_look() -> anyhow::Result<()> {
+        within(async {
+            let (hub, main, _folder) = goals_on_main(None, &[("Write the parser", Some(&[])), ("Write the docs", Some(&[]))]).await?;
+            let main = main.as_str();
+            let out = out_on_subagents(&hub, main, &["Write the parser", "Write the docs"]).await?;
+            let [(parser, _), (docs, d)] = <[(String, String); 2]>::try_from(out).map_err(|o| anyhow::anyhow!("{o:?}"))?;
+            held_by_one_gone(&hub, &parser, "gone-parser", true).await?;
+            tick(&hub, &crate::metrics::AgentMetrics::default()).await;
+            assert_eq!(held(&hub, main, &parser).await?, (None, true, Some("Back from its subagent: its subagent ended before it was met.".to_owned())));
+            assert!(!kept(&hub, "gone-parser").await? && hub.store.kv_prefix(MARK.to_owned()).await?.iter().all(|(k, _)| !k.ends_with("gone-parser")), "its stack and its mark go");
+            assert_eq!(held(&hub, main, &docs).await?.0, Some(d), "the other stays out");
             Ok(())
         })
     }

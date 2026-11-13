@@ -1832,8 +1832,21 @@ impl Hub {
     }
 
     /// A machine's past sessions.
-    pub async fn harness_history(&self, machine: &str, kind: Option<String>, limit: u32) -> anyhow::Result<Option<Vec<crate::aisessions::PastSession>>> {
-        self.ai_ask(machine, move |req| ServerMsg::HarnessHistory { req, kind, limit }).await
+    /// Machine `machine`'s past sessions, with those kept in `person`'s microVM volumes there where its
+    /// runner reads them (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5); a runner from before is
+    /// asked for its own alone, as it was.
+    pub async fn harness_history(&self, machine: &str, kind: Option<String>, limit: u32, person: Option<String>) -> anyhow::Result<Option<Vec<crate::aisessions::PastSession>>> {
+        let reads_volumes = {
+            let inst = self.instances.load();
+            inst.newest(machine).and_then(|p| inst.get(p)).is_some_and(|i| crate::proto::feature::speaks(&i.features, crate::proto::feature::HISTORY_VOLUMES))
+        };
+        match person.filter(|_| reads_volumes) {
+            Some(person) => {
+                let json = serde_json::to_string(&crate::aisessions::Asked { kind, limit, person: Some(person) })?;
+                self.ai_ask(machine, move |req| ServerMsg::HarnessHistoryFor { req, json }).await
+            }
+            None => self.ai_ask(machine, move |req| ServerMsg::HarnessHistory { req, kind, limit }).await,
+        }
     }
 
     async fn ai_ask<T: serde::de::DeserializeOwned + Serialize + Send + 'static>(&self, machine: &str, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<T>> {

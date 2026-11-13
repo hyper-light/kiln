@@ -1128,6 +1128,9 @@ pub enum FromServer {
     /// `Custody`: work kiln's server handed one of the runner's agent sessions, `{session, hand_on}`
     /// (docs/ci.md W27-R08).
     Custody(Value),
+    /// `HarnessHistoryFor`: this machine's past sessions, asked for a person (kiln plan
+    /// 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
+    HarnessHistoryFor { req: u64, asked: crate::aisessions::Asked },
 }
 
 impl Carries for ServerMsg {
@@ -1186,6 +1189,7 @@ impl Carries for ServerMsg {
             ServerMsg::Observe { json, bytes } => FromServer::Observe { msg: payload(W, "Observe", &json)?, bytes },
             ServerMsg::Headroom { json } => FromServer::Headroom(payload(W, "Headroom", &json)?),
             ServerMsg::Custody { json } => FromServer::Custody(payload(W, "Custody", &json)?),
+            ServerMsg::HarnessHistoryFor { req, json } => FromServer::HarnessHistoryFor { req, asked: payload(W, "HarnessHistoryFor", &json).map_err(|e| e.waits(Waits::Asking(req)))? },
             m @ (ServerMsg::Welcome { .. }
             | ServerMsg::Refused { .. }
             | ServerMsg::Assign(_)

@@ -1452,6 +1452,7 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
     if !change.remove && text.is_none() && at.is_none() && change.needs.is_none() && change.active.is_none() {
         return Err(Error::Bad("say what changes: `text`, `before`, `after`, `next`, `needs`, `active` or `remove`".into()));
     }
+    release_gone(hub, agent).await?;
     let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     let it = stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?;
@@ -1611,6 +1612,7 @@ pub async fn order(hub: &Hub, agent: &str, given: Vec<(String, Vec<String>)>, by
     if given.is_empty() {
         return Err(Error::Bad("say what at least one goal waits for: `goals`, each {id, needs}".into()));
     }
+    release_gone(hub, agent).await?;
     let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     for (k, (id, _)) in given.iter().enumerate() {
@@ -1645,6 +1647,7 @@ pub async fn order(hub: &Hub, agent: &str, given: Vec<(String, Vec<String>)>, by
 pub async fn split(hub: &Hub, agent: &str, id: Option<&str>, parts: Vec<String>) -> R<Stack> {
     let info = known(hub, agent)?;
     let given_parts = parts.iter().map(|p| clean(p)).collect::<R<Vec<_>>>()?;
+    release_gone(hub, agent).await?;
     let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     let target = match id.map(str::trim).filter(|i| !i.is_empty()) {
@@ -2073,17 +2076,58 @@ async fn push(hub: &Hub, agent: &str, metrics: &crate::metrics::AgentMetrics) {
     }
 }
 
-/// Forgets an agent's stack (the agent was closed).
+/// Forgets an agent's stack (the agent was closed), and brings back what it held as another stack's
+/// subagent ([`forget_with`]).
 pub async fn forget(hub: &Hub, agent: &str) -> R<()> {
+    forget_with(hub, agent, "its subagent ended before it was met").await
+}
+
+/// Agent `agent` gone for good: its stack forgotten, with kiln's mark on it, and each goal another
+/// stack handed it back there unmet, saying `why` ("Back from its subagent: …";
+/// `subagents::release`), in one transaction under the stacks' lock. Its stack went alone before,
+/// what it held left for the follower to bring back on a later look by whether it still had a
+/// stack: ended by agents_stop on 2026-11-13, 01a1d2a9b720 had one again in that millisecond (its
+/// harness's last goal adopted, [`adopt`]), and ROOT's step 11 stayed held by it for good.
+pub(crate) async fn forget_with(hub: &Hub, agent: &str, why: &str) -> R<()> {
     SAID.lock().remove(agent);
-    let agent = agent.to_owned();
-    hub.store
+    let _one = CHANGING.turn().await;
+    let (a, reason, now) = (agent.to_owned(), format!("Back from its subagent: {why}."), now_ms(hub));
+    let holders = hub
+        .store
         .call(move |c| {
-            c.execute("DELETE FROM goal_items WHERE agent = ?1", params![agent])?;
-            c.execute("DELETE FROM goal_stacks WHERE agent = ?1", params![agent])?;
-            Ok(())
+            let tx = crate::store::tx(c)?;
+            let holders = subagents::release(&tx, &a, &reason, now)?;
+            tx.execute("DELETE FROM kv WHERE k = ?1", params![format!("{}{a}", subagents::MARK)])?;
+            tx.execute("DELETE FROM goal_items WHERE agent = ?1", params![a])?;
+            tx.execute("DELETE FROM goal_stacks WHERE agent = ?1", params![a])?;
+            tx.commit()?;
+            Ok(holders)
         })
         .await?;
+    for (holder, running) in holders {
+        tracing::info!(agent = %holder, subagent = %agent, why, "a goal back from its subagent");
+        if running {
+            push(hub, &holder, crate::metrics::agents()).await;
+        }
+    }
+    Ok(())
+}
+
+/// Each goal of `agent`'s stack held by a subagent that's gone (`subagents::gone`: none such once
+/// the server can say, or one ended, its own stack gone) brought back first, as that subagent's end
+/// would have brought it ([`forget_with`]: "its subagent is gone"), so what its holding gates goes on: on
+/// 2026-11-13 goals_split and goals_update refused ROOT's step 11 for good, held by 01a1d2a9b720
+/// after it had ended. No timer: whether each holder is there, and how it stands, as it's used.
+async fn release_gone(hub: &Hub, agent: &str) -> R<()> {
+    let stack = get(hub, agent).await?;
+    let mut holders: Vec<&str> = stack.items.iter().filter(|i| matches!(i.status.as_str(), "pending" | "active")).filter_map(|i| i.subagent.as_deref()).collect();
+    holders.sort_unstable();
+    holders.dedup();
+    for h in holders {
+        if subagents::gone(hub, h).await? {
+            forget_with(hub, h, "its subagent is gone").await?;
+        }
+    }
     Ok(())
 }
 
@@ -2571,6 +2615,11 @@ where
 /// next. The stack runs.
 async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result<()> {
     let Some(o) = set_goal(info) else { return Ok(()) };
+    // Gone since the round looked (ended, its stack forgotten: [`forget_with`]): its goal makes it no
+    // stack again.
+    if d.port.agent(&info.id).is_none() {
+        return Ok(());
+    }
     let Ok(text) = clean(&o.text) else { return Ok(()) };
     let (agent, how, at, now, gave_up) = (info.id.clone(), how(d.port, &info.id), o.at, d.clock.unix_ms(), o.status == "unmet");
     d.store
@@ -2676,6 +2725,7 @@ pub struct Planned {
 /// than the agent, a goal it isn't on yet is for a subagent of its to plan now ([`Planned`]).
 pub async fn plan(hub: &Hub, agent: &str, id: Option<&str>, title: Option<&str>, by: &str, delegated: bool) -> R<Planned> {
     let info = known(hub, agent)?;
+    release_gone(hub, agent).await?;
     let _one = CHANGING.turn().await;
     let (planned, sends) = plan_locked(hub, &info, agent, id, title, by, delegated).await?;
     // The goal under way put back after its planning: that goes to the agent at once.
@@ -3922,6 +3972,38 @@ mod tests {
     /// agent stops short of its goal again and again: it's sent the goal 30 s after the goal joined
     /// its stack, then each time twice the gap before, up to 15 minutes, each at exactly its time and
     /// none in between (a tick short of each, nothing has gone).
+    /// A goal set in an agent that's gone since the round looked (ended: agents_stop, its stack
+    /// forgotten) makes it no stack again. 01a1d2a9b720's harness still had its goal set as ROOT
+    /// stopped it on 2026-11-13, and the round's adoption of that goal made its stack again in the
+    /// stop's millisecond (running, its planning goal under way), the agent gone: the step it held
+    /// stayed held, its follower waiting on the stack. There, its goal joins as before.
+    #[test]
+    fn a_goal_set_in_an_agent_gone_since_makes_it_no_stack() -> anyhow::Result<()> {
+        use kiln_seams::Clock as _;
+        use kiln_seams::clock::SimClock;
+        use kiln_seams::harness::SimHarness;
+        crate::rt::block_on(async {
+            let clock = SimClock::new();
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            let shutdown = crate::rt::Shutdown::new();
+            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let id = "goals-gone";
+            // As the round saw it before its end: its harness's goal set; the agent isn't there now.
+            let objective = Objective { text: "the plan is ready".into(), status: "active".into(), reason: None, at: clock.unix_ms() };
+            let seen = Info { id: id.into(), status: Status::Idle, objective: Some(objective), ..Info::default() };
+            let metrics = crate::metrics::AgentMetrics::default();
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
+            adopt(&driver, &seen).await?;
+            let had: bool = store.read(move |c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM goal_stacks WHERE agent = ?1)", params![id], |r| r.get(0))?)).await?;
+            anyhow::ensure!(!had, "a stack made for an agent that's gone: {:?}", stack_of(&store, id).await?);
+            anyhow::ensure!(port.open(id, seen.clone()), "not opened");
+            adopt(&driver, &seen).await?;
+            let s = stack_of(&store, id).await?;
+            anyhow::ensure!(s.items.first().is_some_and(|i| i.status == "active" && i.text == "the plan is ready"), "there, its goal joins: {s:?}");
+            Ok(())
+        })
+    }
+
     #[test]
     fn reminders_go_30_s_after_then_doubling_to_15_min_by_the_driver_s_clock() -> anyhow::Result<()> {
         use kiln_seams::Clock as _;

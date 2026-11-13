@@ -47,8 +47,27 @@ the machine's network) is replaced by an Agentfile image's members.
 - **Its launch goes through the `Sandbox` seam** (docs/seams.md "Sandbox"): `Boundary::MicroVm`, its
   program the member, its folder the session's at its own path, its environment only the session's
   locale and time zone (POSIX's `LANG`, `LC_*`, `TZ`) and what kiln fixes for the harness, its grants
-  its image's own (default deny), narrowed no further, and the microVM sized as its boundary sizes
-  one (the person's sizes reach it through its placement, step 32).
+  its image's own (default deny) narrowed to what its session uses (below), and the microVM sized as
+  its boundary sizes one (the person's sizes reach it through its placement, step 32).
+- **What it reaches past its microVM** is its image's destinations, narrowed to its session's own
+  provider's or sign-in's (`sandbox::narrow`, step 17 part 6; Shards D236: a run drops destinations,
+  never adds one). Each of kiln's Agentfiles for a harness of several providers or sign-ins names
+  every host its harness reaches for each (step 18 part 4, `agentfiles::builtin::destinations::BY_USE`,
+  each held to its Agentfile by `grants_tests`), and a run keeps those of what its session uses alone,
+  read as its harness reads it: its run's environment first, then the model its session names, then
+  its configuration in its person's home on the machine (`harness::isolated::home`) or its project's
+  own. Antigravity's by its sign-in (a Gemini API key, ADC at its location, an enterprise license's
+  location, else a personal Google account), Goose's by `GOOSE_PROVIDER` (and TypeSafe's auto
+  effort), opencode's by its `model`'s provider, with its catalog and ripgrep's hosts always, pi's by
+  its `defaultProvider`, with `pi.dev` always.
+  Where kiln can't tell what it uses (no person or no home kept on the machine, a file it can't read,
+  a provider its image names no hosts for, nothing that says), the run keeps every destination its
+  image names, and the session says so and why: its `runs.reach` (`{"as": "whole", "why": "no_home"}`,
+  or with what it read, `{"as": "whole", "why": {"unread": {"file", "error"}}}`) and a notice in its
+  conversation. That's the one fallback, never a silent widening. An image of one
+  provider (Claude Code's, Codex's) keeps its own whole (`"why": "one_use"`), as does a person's own
+  Agentfile (`"persons_own"`), whose grants are as its person wrote them; neither is a fallback.
+  `runs.reach` of a narrowed run is `{"as": "narrowed", "uses": [...], "hosts": ["host:443", ...]}`.
 - **Its stdio are the member's streams.** The seam's run is the `Duplex` its session drives
   (`crate::proc::duplex_of_run`, `sandbox::held`): what the adapter writes reaches the member's stdin in
   order, the end of its stdin is the member's, what the member writes fills its stdout and stderr, and
@@ -62,7 +81,7 @@ the machine's network) is replaced by an Agentfile image's members.
   is `{"in": "host", "pid": N}` for a process of the machine's, and for a microVM's member `{"in":
   "microvm", "vm": <the microVM's own name, as its runtime gives it>, "image": "NAME@sha256:…",
   "host_pid": null, "control": {"controller": {"suite", "group"}, "endpoint": {"suite", "group"},
-  "lanes": ["control", "stdin:0", "stdout:0", "stderr:0", "exec", "mcp:0" …]}}`.
+  "lanes": ["control", "stdout:0", "stderr:0", "stdin:0", "exec", "socket", "mcp:0" …]}}`.
   `host_pid` is read from its run's handle and always said, so a check reads it rather than an
   absence. `control` is the link its stdio rides into the microVM, as each end says its TLS 1.3
   handshake negotiated (rustls's names, or the IANA code where rustls has none): the controller's on

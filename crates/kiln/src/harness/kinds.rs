@@ -1929,6 +1929,22 @@ mod tests {
         Ok(())
     }
 
+    /// Step 17 (Shards' D256, `MemberSpec::args`): a harness that takes its session on its command
+    /// line is given it past its image's command in a microVM as on the host: the model it runs and the
+    /// conversation it resumes, each as its own CLI reads it (Claude Code's, Antigravity's and pi's).
+    #[test]
+    fn s17_a_harness_taking_its_session_as_flags_gets_them_past_its_images_command() -> anyhow::Result<()> {
+        let resume = "0198c9a2-1c4b-7a8e-9e2d-5f3a1b2c3d4e";
+        let has = |args: &[String], flag: &str, value: &str| args.windows(2).any(|w| w == [flag, value]);
+        for (id, conversation) in [("claude", "--resume"), ("antigravity", "--conversation"), ("pi", "--session-id")] {
+            let kind = Kind::get(id).ok_or_else(|| anyhow::anyhow!("no harness {id}"))?;
+            let args = kind.elsewhere(&Spec { kind: id.into(), model: Some("m".into()), resume: Some(resume.into()), ..Spec::default() })?.args;
+            assert!(has(&args, "--model", "m") && has(&args, conversation, resume), "{id}: {args:?}");
+            assert!(!args.starts_with(&kind.base_args()) || kind.base_args().is_empty(), "{id}: its image's command gives its base, not its launch: {args:?}");
+        }
+        Ok(())
+    }
+
     /// Step 17: each image kiln ships runs its harness as kiln's adapter drives it: its Agentfile
     /// declares the harness by its id, the member an isolated launch names, and its command
     /// (`harness.json`'s `run.command`) carries the adapter's base arguments, in order.

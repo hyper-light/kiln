@@ -8,13 +8,14 @@
     "ui_pick_up": true,
     "gaps": [],
     "caveats": [],
-    "reason": "Anthropic's own Linux builds for glibc and musl, pinned in its Agentfile (step 19); kiln's MCP server by --mcp-config; resumed with --resume; its transcripts in the machine history. In a microVM, kiln's MCP comes through the member's bridge (/run/shards/mcp) over the agent-control link's mcp lane, Shards D254.",
+    "reason": "Anthropic's own Linux builds for glibc and musl, pinned in its Agentfile (step 19); kiln's MCP server by --mcp-config; resumed with --resume; its transcripts in the machine history. In a microVM, kiln's MCP comes through the member's bridge (/run/shards/mcp) over the agent-control link's mcp lane, Shards D254. Kept in a person's microVM volume, its transcripts are in that person's machine history too, each saying it ran in a microVM, and picked up in one (plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5).",
     "sources": [
       ".kiln/images/harness-claude/pin.json",
       "crates/kiln/src/reach/mcp.rs#pub fn claude_config(",
       "crates/kiln/src/harness/isolated/mcp.rs#Protocol::ClaudeStreamJson => Config::Args(",
       "crates/kiln/src/harness/claude.rs#\"--resume\"",
-      "crates/kiln/src/aisessions.rs#if want(\"claude\")"
+      "crates/kiln/src/aisessions.rs#if want(\"claude\")",
+      "crates/kiln/src/aisessions.rs#fn volumes_of("
     ]
   },
   "codex": {
@@ -25,13 +26,14 @@
     "ui_pick_up": true,
     "gaps": [],
     "caveats": [],
-    "reason": "OpenAI's whole Codex package, pinned in its Agentfile (step 20); kiln's MCP server by -c mcp_servers.kiln.*; resumed by thread/resume; its sessions in the machine history. In a microVM, kiln's MCP comes through the member's bridge (/run/shards/mcp) over the agent-control link's mcp lane, Shards D254.",
+    "reason": "OpenAI's whole Codex package, pinned in its Agentfile (step 20); kiln's MCP server by -c mcp_servers.kiln.*; resumed by thread/resume; its sessions in the machine history. In a microVM, kiln's MCP comes through the member's bridge (/run/shards/mcp) over the agent-control link's mcp lane, Shards D254. Kept in a person's microVM volume, its sessions are in that person's machine history too, each saying it ran in a microVM, and picked up in one (plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5).",
     "sources": [
       ".kiln/images/harness-codex/pin.json",
       "crates/kiln/src/reach/mcp.rs#pub fn codex_config(",
       "crates/kiln/src/harness/isolated/mcp.rs#Protocol::CodexAppServer => {",
       "crates/kiln/src/harness/codex.rs#\"thread/resume\"",
-      "crates/kiln/src/aisessions.rs#if want(\"codex\")"
+      "crates/kiln/src/aisessions.rs#if want(\"codex\")",
+      "crates/kiln/src/aisessions.rs#fn volumes_of("
     ]
   },
   "gemini": {
@@ -44,10 +46,11 @@
       {
         "what": "ui_pick_up",
         "where": "the host and a microVM",
-        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended Gemini CLI agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone, on the machine and in a person's microVM volume: an ended Gemini CLI agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
         "cites": [
           "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
-          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history(",
+          "crates/kiln/src/aisessions.rs#fn volumes_of("
         ]
       }
     ],
@@ -70,10 +73,11 @@
       {
         "what": "ui_pick_up",
         "where": "the host and a microVM",
-        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended opencode agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone, on the machine and in a person's microVM volume: an ended opencode agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
         "cites": [
           "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
-          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history(",
+          "crates/kiln/src/aisessions.rs#fn volumes_of("
         ]
       }
     ],
@@ -96,10 +100,11 @@
       {
         "what": "ui_pick_up",
         "where": "the host and a microVM",
-        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended Goose agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone, on the machine and in a person's microVM volume: an ended Goose agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
         "cites": [
           "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
-          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history(",
+          "crates/kiln/src/aisessions.rs#fn volumes_of("
         ]
       }
     ],
@@ -122,10 +127,11 @@
       {
         "what": "ui_pick_up",
         "where": "the host and a microVM",
-        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended Amp agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone, on the machine and in a person's microVM volume: an ended Amp agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
         "cites": [
           "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
-          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history(",
+          "crates/kiln/src/aisessions.rs#fn volumes_of("
         ]
       }
     ],
@@ -166,13 +172,14 @@
         ]
       }
     ],
-    "reason": "Cognition's Devin for Terminal static builds, pinned in its Agentfile (step 25); devin acp, kiln's MCP server in session/new's mcpServers; Devin 3000.12.43 says loadSession and mcpCapabilities.http (plan 01a1d2c16eb074f19cf7ae7f1025c0be step 6's handshake); its past conversations in the machine history. In a microVM, kiln's MCP comes through the member's bridge (/run/shards/mcp) over the agent-control link's mcp lane, Shards D254.",
+    "reason": "Cognition's Devin for Terminal static builds, pinned in its Agentfile (step 25); devin acp, kiln's MCP server in session/new's mcpServers; Devin 3000.12.43 says loadSession and mcpCapabilities.http (plan 01a1d2c16eb074f19cf7ae7f1025c0be step 6's handshake); its past conversations in the machine history. In a microVM, kiln's MCP comes through the member's bridge (/run/shards/mcp) over the agent-control link's mcp lane, Shards D254. Kept in a person's microVM volume, its past conversations are in that person's machine history too, each saying it ran in a microVM, and picked up in one (plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5).",
     "sources": [
       ".kiln/images/harness-devin/pin.json",
       "crates/kiln/src/harness/kinds.rs#pub fn acp_servers(",
       "crates/kiln/src/harness/isolated/mcp.rs#Protocol::Acp(_) => Config::Acp(",
       "docs/research/s35-every-harness/initialize-amp-devin.log:17",
-      "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+      "crates/kiln/src/aisessions/devin.rs#pub(super) fn history(",
+      "crates/kiln/src/aisessions.rs#fn volumes_of("
     ]
   },
   "antigravity": {
@@ -185,10 +192,11 @@
       {
         "what": "ui_pick_up",
         "where": "the host and a microVM",
-        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended Antigravity CLI agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone, on the machine and in a person's microVM volume: an ended Antigravity CLI agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
         "cites": [
           "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
-          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history(",
+          "crates/kiln/src/aisessions.rs#fn volumes_of("
         ]
       }
     ],
@@ -226,10 +234,11 @@
       {
         "what": "ui_pick_up",
         "where": "the host and a microVM",
-        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended Cursor CLI agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone, on the machine and in a person's microVM volume: an ended Cursor CLI agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
         "cites": [
           "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
-          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history("
+          "crates/kiln/src/aisessions/devin.rs#pub(super) fn history(",
+          "crates/kiln/src/aisessions.rs#fn volumes_of("
         ]
       }
     ],
@@ -275,11 +284,12 @@
       {
         "what": "ui_pick_up",
         "where": "the host and a microVM",
-        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone: an ended Pi agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
+        "why": "The machine history the composer picks past conversations from reads Claude Code's, Codex's and Devin's alone, on the machine and in a person's microVM volume: an ended Pi agent's conversation is taken up again through the API (spec.resume, agents_start's resume), not picked from the UI.",
         "cites": [
           "crates/kiln/src/aisessions.rs#pub fn history(&mut self, kind: Option<&str>",
           "crates/kiln/src/aisessions/devin.rs#pub(super) fn history(",
-          "crates/kiln/src/harness/pi.rs#flag(\"--session-id\""
+          "crates/kiln/src/harness/pi.rs#flag(\"--session-id\"",
+          "crates/kiln/src/aisessions.rs#fn volumes_of("
         ]
       }
     ],

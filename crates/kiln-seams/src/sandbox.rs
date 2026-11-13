@@ -265,7 +265,7 @@ pub enum Refusal {
 /// 01a1cd8e862e7169a074db3d5fa33f3d step 11), as each end says it negotiated
 /// ([`kiln_ci::facts::Negotiated`]): the controller's, on the machine, and the endpoint's own report
 /// from inside; and the lanes its controller was granted on it as it dialed, by Shards' names
-/// (`control`, `stdin:0`, `stdout:0`, `stderr:0`, `exec`, `mcp:0`).
+/// (`control`, `stdout:0`, `stderr:0`, `stdin:0`, `exec`, `socket`, `mcp:0`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
     pub controller: kiln_ci::facts::Negotiated,

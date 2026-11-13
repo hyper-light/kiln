@@ -697,7 +697,13 @@ harness, `limit` up to 200 (50 by
 default). Each: `kind`, `id` (the harness's session or thread id), `title` (Claude Code's
 `/rename` or generated title, Codex's thread name; else the last prompt's first line), `cwd`,
 `branch?`, `model?`, `last_activity` (unix seconds of the transcript's last write),
-`last_prompt?` (clipped).
+`last_prompt?` (clipped), `isolation?`.
+
+With them come the conversations kept in your own microVM volumes on that machine
+(`<kiln's state>/homes/<you>/<harness>/`, read as kiln's Agentfile for each harness lays it out),
+each with `isolation: {kind: "microvm", person}`: they ran in a microVM of yours, and go on in one.
+Only yours: the person is whoever asks, never what's asked. A runner from before lists its own
+conversations alone.
 
 Not listed: sessions running in a terminal (they are in `/api/ai-sessions`), Claude Code sessions
 with a live session record of any kind, and the conversations kiln's own agent sessions on that
@@ -707,7 +713,10 @@ changed. Errors: 400 (a bad `target` or `kind`), 404 (an ephemeral runner, which
 (the machine is not connected or did not answer).
 
 Continue one with `POST /api/harness/sessions` and `spec: {kind, cwd, resume: id}` on the same
-target. Leave `model` unset: the harness keeps the conversation's own. Its history is in the
+target, and for one that ran in a microVM `spec.isolation: {kind: "microvm", image}` too, so it goes
+on in a microVM, never as a process on the machine (whose own harness home doesn't hold it). The
+composer's past sessions do this, naming the Agentfile kept for its harness in its folder, else kiln's
+for its harness. Leave `model` unset: the harness keeps the conversation's own. Its history is in the
 timeline when the session turns idle (Codex's latest 100 turns, listed with
 `thread/turns/list`; a notice says when earlier ones are not shown). Claude Code writes a
 `/rename` into its transcript with the next exchange: a name given just before the session ends

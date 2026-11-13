@@ -224,7 +224,7 @@ reason (plan 01a1d2c16eb074f19cf7ae7f1025c0be, steps 2 and 7).
 | `vm_e2e/step35.rs` | `step35::checks` (gaps.json held to kiln's code and its sources, the cite rule, the vendor-CLI rule), `step35::host` (the eight harnesses step 34 doesn't drive, through kiln on the host, the stand-in behind each name), `step35::rest` (the ten in microVMs through REST: start, steer, interrupt, stop, resume, kiln's MCP from inside, an agent started there) |
 | `vm_e2e/mcp.rs` | `step35::mcp`: the ten in microVMs through kiln's MCP tools: `agents_start` naming the Agentfile, `agents_send` steering, `agents_interrupt`, `agents_stop`, `agents_start` with `resume` |
 | `vm_e2e/gaps.json` | each harness's flags (`linux_build`, `mcp`, `mcp_in_microvm`, `resume`, `ui_pick_up`), each gap with why and its cites, caveats, and the sources its reason rests on; kiln's code cited by the text it holds (`path#text`), recorded evidence by its line |
-| `ui/e2e/vm-harnesses.spec.ts` | against the mock: kiln's ten Agentfiles listed read-only, Claude Code and Codex started in a microVM from kiln's (step 34's), Codex from a person's own; against ROOT's server: each harness from kiln's Agentfile and a person's own, started, steered, its turn stopped, ended, and picked up again from the composer where `ui_pick_up` holds |
+| `ui/e2e/vm-harnesses.spec.ts` | against the mock: kiln's ten Agentfiles listed read-only, Claude Code and Codex started in a microVM from kiln's (step 34's), Codex from a person's own, a Codex conversation kept in a person's microVM volume picked up from the composer's past sessions in a microVM (one of the machine's own as a process); against ROOT's server: each harness from kiln's Agentfile and a person's own, started, steered, its turn stopped, ended, and picked up again from the composer where `ui_pick_up` holds |
 
 A vendor's own CLI takes ROOT's task alone: from kiln's Agentfile, and from a person's own made from
 kiln's text, a drive skips unless all five task words are given (`VM_E2E=1`: fails). An image of the
@@ -256,7 +256,7 @@ They wait on (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be): step 1 (`agents_start
 `resume`, on kiln main), step 3 (kiln's MCP from inside a microVM, over the agent-control link's
 `mcp` lane, Shards D254: goals 58's and 61's, read as step 34's drive reads it, by `mcp_round_trip`
 and `VM_E2E_LINKS`' `mcp` entry), step 4 (Antigravity's, one fixed entry in its shared config, over that lane), step 5 (a microVM conversation picked up again in one
-from the UI), and step 34's own (kiln plan steps 16, 17, 18 and 33 and the links' owners).
+from the UI, on kiln main), and step 34's own (kiln plan steps 16, 17, 18 and 33 and the links' owners).
 
 #### Linux x86_64 (KVM: adacachy, or adacachy2 through kiln run)
 
