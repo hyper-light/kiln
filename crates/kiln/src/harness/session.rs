@@ -3252,12 +3252,15 @@ struct Move {
     model: Option<String>,
     /// To this machine's newer runner process, which takes this one's place (`super::handing`).
     local: bool,
+    /// With `local`: that process reads a native package (`Command::MoveTo::native`).
+    native: bool,
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
 /// `now`: the turn under way isn't waited for (the caller interrupts it).
 #[allow(clippy::too_many_arguments)]
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool) -> Move {
+#[allow(clippy::too_many_arguments)]
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool, native: bool) -> Move {
     let mut core = s.core.lock();
     core.hold = true;
     let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
@@ -3274,7 +3277,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     };
     core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
     core.touch_state();
-    Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local }
+    Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local, native: native && local }
 }
 
 /// A person pauses it, or resumes it (`Command::Pause` without a task): its processes held stopped by
@@ -3710,7 +3713,14 @@ where
     let carry = match kind.protocol {
         super::kinds::Protocol::Acp(_) | super::kinds::Protocol::AgyStreamJson => {
             let history: Vec<_> = handed_events(&events, &state.queue).into_iter().cloned().collect();
-            super::moving::words(&history, "This conversation went on in this machine's newer kiln runner, which took the older one's place.")
+            let words = super::moving::words(&history, "This conversation went on in this machine's newer kiln runner, which took the older one's place.");
+            // The newer process reads a native package, and the harness has a conversation of its own
+            // here: it goes on in it, natively (an ACP agent keeps the words for one that turns out
+            // not to load sessions). Else (an older build, a rollback) in words, as before.
+            match (resume.clone().filter(|r| !r.trim().is_empty()), words) {
+                (Some(own), Carry::Words { text }) if mv.native => Carry::Native { session: own, words: matches!(kind.protocol, super::kinds::Protocol::Acp(_)).then_some(text) },
+                (_, words) => words,
+            }
         }
         _ => Carry::Nothing,
     };
@@ -4456,8 +4466,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                     switching = Some(sw);
                                 }
                             }
-                            Command::MoveTo { to, cwd, note, now, kind: into, model, local } => {
-                                let mv = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local);
+                            Command::MoveTo { to, cwd, note, now, kind: into, model, local, native } => {
+                                let mv = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native);
                                 // Not waiting for the turn: it stops here, and goes on there.
                                 if mv.picks_up {
                                     adapter.command(&mut s.core.lock(), Command::Interrupt);
@@ -4991,8 +5001,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         }
                     }
                     // Another runner: it goes there, now.
-                    Command::MoveTo { to, cwd, note, now, kind: into, model, local } => {
-                        moving = Some(move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local));
+                    Command::MoveTo { to, cwd, note, now, kind: into, model, local, native } => {
+                        moving = Some(move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native));
                         break;
                     }
                     Command::Moving { text } => moving_note(&s, &text),
@@ -5882,7 +5892,7 @@ for line in sys.stdin:
         use super::super::handing::NotHanded;
         use super::super::host::Decided;
         let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
-        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true };
+        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native: false };
         let kept: CarriedIds = Arc::new(|_| Box::pin(async { Ok(vec![("m1".to_owned(), "d1".to_owned()), ("m2".to_owned(), "d2".to_owned())]) }));
         let unreadable: CarriedIds = Arc::new(|_| Box::pin(async { Err("its records are gone".to_owned()) }));
         let unknown = || -> Result<(), NotHanded> { Err(NotHanded::Unknown("the link dropped".into())) };
@@ -5955,13 +5965,59 @@ for line in sys.stdin:
         })
     }
 
+    /// Ada, 2026-11-13: a session handed to its machine's newer runner process goes on natively,
+    /// by its own id, where that process reads a native package (new→new): an ACP agent with the
+    /// words kept for one that can't load, Antigravity without them; to one that doesn't (new→old,
+    /// a rollback) in words, as before; and the words package an older runner sends (old→new) is
+    /// one this build takes. A harness whose record kiln keeps goes on from it either way.
+    #[test]
+    fn native_handover_new_to_new_natively_new_to_old_in_words_old_to_new_taken() -> anyhow::Result<()> {
+        use super::super::moving::{Carry, Package};
+        crate::rt::block_on(async move {
+            for (kid, native) in [("gemini", true), ("gemini", false), ("antigravity", true), ("antigravity", false), ("claude", true), ("claude", false)] {
+                let kind = Kind::get(kid).ok_or_else(|| anyhow::anyhow!("no {kid}"))?;
+                let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native };
+                let (s, _rx) = idle("h1");
+                {
+                    let mut core = s.core.lock();
+                    core.state.harness_session = Some("own-1".into());
+                    core.upsert("m1", None, super::super::model::Body::Assistant { text: "half way there".into(), streaming: false });
+                }
+                let s = Arc::new(s);
+                let fence: FenceFor = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+                let ids: CarriedIds = Arc::new(|_| Box::pin(async { Ok(Vec::new()) }));
+                let settle: SettleFor = Arc::new(|_, _, _| Box::pin(async { Ok(None) }));
+                let sent = Arc::new(Mutex::new(Vec::new()));
+                let got = Arc::clone(&sent);
+                let send = move |bytes: Vec<u8>| {
+                    got.lock().push(bytes);
+                    async { Ok(()) }
+                };
+                hand_to_newer_by(&s, kind, &mv, &ids, &fence, &settle, send, |_| async {}).await.map_err(|e| anyhow::anyhow!(e))?;
+                let bytes = sent.lock().first().cloned().ok_or_else(|| anyhow::anyhow!("{kid}: nothing went"))?;
+                let pkg: Package = serde_json::from_slice(&bytes)?;
+                match (kid, native, &pkg.carry) {
+                    ("gemini", true, Carry::Native { session, words: Some(w) }) => anyhow::ensure!(session == "own-1" && w.contains("half way there") && pkg.spec.resume.as_deref() == Some("own-1"), "{kid}"),
+                    ("antigravity", true, Carry::Native { session, words: None }) => anyhow::ensure!(session == "own-1" && pkg.spec.resume.as_deref() == Some("own-1"), "{kid}"),
+                    ("gemini" | "antigravity", false, Carry::Words { text }) => anyhow::ensure!(text.contains("half way there") && pkg.version == 2, "{kid}: words for an older build"),
+                    ("claude", _, Carry::Nothing) => anyhow::ensure!(pkg.spec.resume.as_deref() == Some("own-1"), "{kid}: its own record, either way"),
+                    (k, n, c) => anyhow::bail!("{k} native={n}: {c:?}"),
+                }
+                anyhow::ensure!(super::super::moving::takes(pkg.version), "{kid}: this build takes what it sent");
+            }
+            // Old→new: the words package an older runner makes is one this build takes, and gives.
+            anyhow::ensure!(super::super::moving::takes(2));
+            Ok(())
+        })
+    }
+
     /// The hand-over review's point 2: a session handed to its machine's newer runner process fences
     /// its inbox, then reads the ids that go with it, then copies what it holds. What it holds once
     /// its ids are read goes, with every id, so no id goes without its message.
     #[test]
     fn a_hand_over_fences_its_inbox_then_reads_its_ids_then_copies_what_it_holds() -> anyhow::Result<()> {
         let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
-        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true };
+        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native: false };
         crate::rt::block_on(async move {
             let (s, _rx) = idle("h1");
             let s = Arc::new(s);
