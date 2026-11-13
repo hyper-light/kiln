@@ -613,6 +613,73 @@ mod waits {
         assert!(!Watch::new(Asked::Message("long-x2"), None).wants_state(&idle, &carried), "another's words");
     }
 
+    /// A setup wait refuses at once, typed, once a process of the fixture's own ended (its runner, its
+    /// server): nothing of it answers again, so it isn't even looked at. Its old deadlines (120 s, 90 s,
+    /// 60 s) waited them out; dropping the liveness look waits on, its look answering.
+    #[test]
+    fn s35_a_setup_wait_refuses_at_once_when_a_partys_process_ended() {
+        let gone = SetupStuck::Exited { party: Party::Runner, how: "exit status: 3".into() };
+        let mut looks = 0;
+        let waited = setup(
+            || Some(gone.clone()),
+            || {
+                looks += 1;
+                Ok(Setup::Ready(()))
+            },
+            |stuck| anyhow::Error::new(SetupRefused { what: "runner box connecting".into(), stuck, evidence: String::new() }),
+        );
+        assert!(waited.as_ref().err().and_then(|e| e.downcast_ref::<SetupRefused>()).is_some_and(|r| r.stuck == gone), "{waited:?}");
+        assert_eq!(looks, 0);
+        // Both alive: it looks, and takes its answer.
+        assert_eq!(setup(|| None, || Ok(Setup::Ready(7)), |stuck| anyhow::anyhow!("{stuck}")).ok(), Some(7));
+    }
+
+    /// The runner connecting (`up`): connected is its answer; listed but not connected, it's between
+    /// connections, waited on while its process lives; the server's client error is its final word, its
+    /// own trouble (5xx) looked past. Refusing every answer but 200 (the old `get`'s) refuses a 503.
+    #[test]
+    fn s35_the_runner_connecting_follows_it_not_a_deadline() {
+        let agents = json!([{"name": "box", "connected": false}, {"name": "other", "connected": true}]);
+        assert!(!connected(&agents, "box"), "between connections");
+        assert!(connected(&json!({"agents": [{"name": "box", "connected": true}]}), "box"));
+        assert_eq!(server_said::<()>(503, "busy"), Setup::Wait);
+        assert_eq!(server_said::<()>(401, "who are you"), Setup::Refuse(SetupStuck::Refused { code: 401, body: "who are you".into() }));
+    }
+
+    /// Its headroom off: kiln's word that the runner applied it is the answer; not yet, it's waited on,
+    /// as is the server's own trouble with the setting (the old one refused anything but 200 at once).
+    #[test]
+    fn s35_headroom_off_waits_for_the_runner_to_say_it_applied_it() {
+        assert_eq!(headroom_applied(&json!({"enabled": false, "applied": true})), Setup::Ready(()));
+        assert_eq!(headroom_applied(&json!({"enabled": false, "applied": false})), Setup::Wait);
+        assert_eq!(server_said::<()>(502, "its runner didn't answer"), Setup::Wait);
+        assert_eq!(server_said::<()>(404, "no runner box"), Setup::Refuse(SetupStuck::Refused { code: 404, body: "no runner box".into() }));
+    }
+
+    /// Its facts on microVMs (`isolation_ready`): they always say `virt.microvm` once they came, so until
+    /// then the wait follows the runner; then it's the answer, yes or no and why. The old 60 s took
+    /// facts that hadn't come yet for a runner that says nothing of microVMs.
+    #[test]
+    fn s35_a_runners_word_on_microvms_is_waited_for_not_timed_out() {
+        assert_eq!(microvms_said(None), Setup::Wait, "not listed yet");
+        assert_eq!(microvms_said(Some(&json!({"name": "box", "facts": null}))), Setup::Wait, "its facts not come yet");
+        let says = json!({"name": "box", "facts": {"virt": {"microvm": false}, "isolation": {"why_not": "no hypervisor"}}});
+        assert_eq!(microvms_said(Some(&says)), Setup::Ready((false, Some("no hypervisor".into()))));
+        assert_eq!(microvms_said(Some(&json!({"facts": {"virt": {"microvm": true}}}))), Setup::Ready((true, None)));
+    }
+
+    /// A start (`open`): its session's id; a refusal given while the runner stayed connected is kiln's
+    /// word on what was asked, final; the runner between connections, it's asked again. Asking again on
+    /// every refusal (the old 90 s) waits out a refusal no retry changes.
+    #[test]
+    fn s35_a_start_refused_while_its_runner_is_connected_is_final() {
+        assert_eq!(opened(200, r#"[{"id": "s1"}]"#, false), Setup::Ready("s1".into()));
+        assert_eq!(opened(400, "unknown harness \"x\"", true), Setup::Refuse(SetupStuck::Refused { code: 400, body: "unknown harness \"x\"".into() }));
+        assert_eq!(opened(400, "agent:box is not connected", false), Setup::Wait, "between connections");
+        assert_eq!(opened(503, "busy", true), Setup::Wait, "the server's own trouble");
+        assert_eq!(opened(200, "[]", false), Setup::Refuse(SetupStuck::Refused { code: 200, body: "[]".into() }), "no session");
+    }
+
     /// The stand-in's stopped turn says nothing once it heard, until it's stopped: a line of it after
     /// the stop was taken says it didn't stop, at once. Uncounted (a real harness's), it is judged by
     /// idle and progress alone.

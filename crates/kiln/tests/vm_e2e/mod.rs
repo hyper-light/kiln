@@ -25,6 +25,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -685,6 +686,13 @@ pub fn skip_reason(machine: &str, says: Option<bool>, why_not: Option<&str>) -> 
 /// A runner process, ended with the test.
 pub struct Runner(Child);
 
+impl Runner {
+    /// How its process ended, once it has; none while it runs.
+    fn ended(&mut self) -> Option<String> {
+        self.0.try_wait().ok().flatten().map(|status| status.to_string())
+    }
+}
+
 impl Drop for Runner {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -702,9 +710,10 @@ pub struct Fixture {
     /// The runner's pid, whose processes are looked at for harnesses: its own runner's, or ROOT's
     /// (`VM_E2E_RUNNER_PID`).
     pub runner_pid: Option<u32>,
-    /// Its own server and runner, or none when it drives ROOT's (`VM_E2E_SERVER`).
-    _server: Option<common::Server>,
-    _runner: Option<Runner>,
+    /// Its own server and runner, or none when it drives ROOT's (`VM_E2E_SERVER`): held so a wait can
+    /// tell whether their processes still run ([`Fixture::ended`]).
+    _server: Option<Mutex<common::Server>>,
+    _runner: Option<Mutex<Runner>>,
     pub log: Option<PathBuf>,
 }
 
@@ -719,11 +728,152 @@ impl Fixture {
         self.log.as_ref().map(|l| common::tail(l, 60)).unwrap_or_default()
     }
 
+    /// One of its own processes ended: which, and how. ROOT's runner (`VM_E2E_RUNNER_PID`), which it
+    /// didn't start, is looked at by its pid where kiln can tell a pid runs (Unix: `os::pid_alive`).
+    pub fn ended(&self) -> Option<SetupStuck> {
+        let server = self._server.as_ref().and_then(|s| s.lock().unwrap_or_else(PoisonError::into_inner).ended());
+        if let Some(how) = server {
+            return Some(SetupStuck::Exited { party: Party::Server, how });
+        }
+        let runner = self._runner.as_ref().and_then(|r| r.lock().unwrap_or_else(PoisonError::into_inner).ended());
+        if let Some(how) = runner {
+            return Some(SetupStuck::Exited { party: Party::Runner, how });
+        }
+        #[cfg(unix)]
+        if self._runner.is_none()
+            && let Some(pid) = self.runner_pid
+            && !kiln::os::pid_alive(pid)
+        {
+            return Some(SetupStuck::Exited { party: Party::Runner, how: format!("its pid {pid} runs no more") });
+        }
+        None
+    }
+
     /// Its runner's whole log: its own runner's, or ROOT's runner's (`VM_E2E_RUNNER_LOG`).
     pub fn runner_log_whole(&self) -> anyhow::Result<String> {
         let path = self.log.clone().or_else(|| std::env::var_os("VM_E2E_RUNNER_LOG").map(PathBuf::from)).ok_or_else(|| anyhow::anyhow!("name ROOT's runner's log in VM_E2E_RUNNER_LOG (tests/vm_e2e/README.md)"))?;
         std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("the runner's log {}: {e}", path.display()))
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// The fixture's setup waits: its server's and runner's liveness and kiln's word, never a clock
+// (docs/research/s35-every-harness/waits/README.md)
+// ------------------------------------------------------------------------------------------------
+
+/// A party of a fixture's setup, as its waits follow it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Party {
+    Server,
+    Runner,
+}
+
+/// Why a setup wait can't get its answer: each a state no waiting changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupStuck {
+    /// A process of the fixture's own ended, and how.
+    Exited { party: Party, how: String },
+    /// The server's final word on what was asked: a refusal (`code`, its words) that asking again
+    /// doesn't change.
+    Refused { code: u16, body: String },
+}
+
+impl std::fmt::Display for SetupStuck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exited { party, how } => write!(f, "the {party:?} process ended ({how}): nothing of it answers again"),
+            Self::Refused { code, body } => write!(f, "the server refused it ({code} {body}): asking again changes nothing"),
+        }
+    }
+}
+
+/// What one look of a setup wait says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Setup<T> {
+    /// Its answer.
+    Ready(T),
+    /// It may still come: its parties live.
+    Wait,
+    /// It won't.
+    Refuse(SetupStuck),
+}
+
+/// A setup wait's refusal: what it waited for, why it ended (typed), and its runner's log.
+#[derive(Debug)]
+pub struct SetupRefused {
+    pub what: String,
+    pub stuck: SetupStuck,
+    pub evidence: String,
+}
+
+impl std::fmt::Display for SetupRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}\nits runner's log, its last lines:\n{}", self.what, self.stuck, self.evidence)
+    }
+}
+
+impl std::error::Error for SetupRefused {}
+
+/// Follows a setup wait: `look`, once a [`POLL`], until it gives its answer, refused at once, typed,
+/// where it says none can come or `ended` says a party's process ended. A look that couldn't reach the
+/// server (an `Err`) is looked again while the parties live. No time bound: a setup wait is its
+/// parties' cold start, before anything of theirs has answered.
+pub fn setup<T>(ended: impl Fn() -> Option<SetupStuck>, mut look: impl FnMut() -> anyhow::Result<Setup<T>>, refuse: impl Fn(SetupStuck) -> anyhow::Error) -> anyhow::Result<T> {
+    loop {
+        if let Some(stuck) = ended() {
+            return Err(refuse(stuck));
+        }
+        match look() {
+            Ok(Setup::Ready(answer)) => return Ok(answer),
+            Ok(Setup::Refuse(stuck)) => return Err(refuse(stuck)),
+            Ok(Setup::Wait) | Err(_) => std::thread::sleep(POLL),
+        }
+    }
+}
+
+/// [`setup`] on fixture `f`'s parties, refused with its runner's log.
+fn setup_on<T>(f: &Fixture, what: &str, look: impl FnMut() -> anyhow::Result<Setup<T>>) -> anyhow::Result<T> {
+    setup(|| f.ended(), look, |stuck| anyhow::Error::new(SetupRefused { what: what.to_owned(), stuck, evidence: f.runner_log() }))
+}
+
+/// What a server's answer other than the one looked for says: a refusal at its word (a client error,
+/// 4xx), or its own trouble (5xx), looked past while it lives.
+pub fn server_said<T>(code: u16, body: &str) -> Setup<T> {
+    if (400..500).contains(&code) { Setup::Refuse(SetupStuck::Refused { code, body: body.to_owned() }) } else { Setup::Wait }
+}
+
+/// Whether kiln's list of runners (`GET /api/agents`) has `machine` connected; listed but not
+/// connected, it's between connections.
+pub fn connected(agents: &Value, machine: &str) -> bool {
+    let list = agents.as_array().or_else(|| agents.get("agents").and_then(Value::as_array));
+    list.into_iter().flatten().any(|a| a.get("name").and_then(Value::as_str) == Some(machine) && a.get("connected").and_then(Value::as_bool) == Some(true))
+}
+
+/// What a runner's entry in kiln's reach (`GET /api/reach/runners`) says of microVMs: once its facts
+/// came (they always say `virt.microvm`, `kiln_ci::facts::Virt`), whether it starts them and why not;
+/// before, nothing yet.
+pub fn microvms_said(entry: Option<&Value>) -> Setup<(bool, Option<String>)> {
+    match entry.and_then(|r| r.pointer("/facts/virt/microvm")).and_then(Value::as_bool) {
+        Some(says) => Setup::Ready((says, entry.and_then(|r| r.pointer("/facts/isolation/why_not")).and_then(Value::as_str).map(str::to_owned))),
+        None => Setup::Wait,
+    }
+}
+
+/// What the server's answer to a start (`POST /api/harness/sessions`) says: its session's id; a
+/// refusal given while the runner was connected before and after it, kiln's word on what was asked;
+/// else, the runner between connections, one to ask again.
+pub fn opened(code: u16, body: &str, connected_throughout: bool) -> Setup<String> {
+    let id = || serde_json::from_str::<Value>(body).ok().and_then(|v| v.pointer("/0/id").and_then(Value::as_str).map(str::to_owned));
+    match (code, connected_throughout) {
+        (200, _) => id().map_or_else(|| Setup::Refuse(SetupStuck::Refused { code, body: body.to_owned() }), Setup::Ready),
+        (_, true) => server_said(code, body),
+        (_, false) => Setup::Wait,
+    }
+}
+
+/// Whether kiln says a runner applied its headroom setting (`GET /api/runners/<machine>/headroom`).
+pub fn headroom_applied(body: &Value) -> Setup<()> {
+    if body.get("applied").and_then(Value::as_bool) == Some(true) { Setup::Ready(()) } else { Setup::Wait }
 }
 
 /// A server of its own under `dir` and a runner `name` of it, connected, `env` in the runner's
@@ -746,22 +896,38 @@ pub fn up(dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Fixtur
 pub fn up_own(dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Fixture> {
     let server = common::start(dir, &common::Options::default())?;
     let (runner, log) = runner(dir, server.port, name, env)?;
-    let f = Fixture { port: server.port, admin: server.admin.clone(), machine: common::machine(name), dir: dir.to_path_buf(), runner_pid: Some(runner.0.id()), _server: Some(server), _runner: Some(runner), log: Some(log) };
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        let agents = f.get("/api/agents")?;
-        let list = agents.as_array().cloned().or_else(|| agents.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-        if list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(f.machine.as_str()) && a.get("connected").and_then(Value::as_bool) == Some(true)) {
-            // Its headroom off: a test's runner shares a machine the rest of the tests (and, on a shared host,
-            // everyone else) keep busy, past which kiln holds a queued message in its own queue for room
-            // (`harness::claude`'s `write_send`): the drive's turns waited there, not at work (adacachy, load
-            // ~50 on 32 cores), which isn't what it checks (as `agent_limit.rs` turns its runner's off).
-            common::agents::headroom_off(f.port, &f.admin, name, Duration::from_secs(60))?;
-            return Ok(f);
+    let f = Fixture { port: server.port, admin: server.admin.clone(), machine: common::machine(name), dir: dir.to_path_buf(), runner_pid: Some(runner.0.id()), _server: Some(Mutex::new(server)), _runner: Some(Mutex::new(runner)), log: Some(log) };
+    setup_on(&f, &format!("runner {name} connecting"), || {
+        let (code, body) = common::http(f.port, "GET", "/api/agents", &f.admin, None)?;
+        if code != 200 {
+            return Ok(server_said(code, &body));
         }
-        anyhow::ensure!(Instant::now() < deadline, "runner {name} never connected:\n{}", f.runner_log());
-        std::thread::sleep(Duration::from_millis(300));
-    }
+        Ok(if connected(&serde_json::from_str(&body)?, &f.machine) { Setup::Ready(()) } else { Setup::Wait })
+    })?;
+    // Its headroom off: a test's runner shares a machine the rest of the tests (and, on a shared host,
+    // everyone else) keep busy, past which kiln holds a queued message in its own queue for room
+    // (`harness::claude`'s `write_send`): the drive's turns waited there, not at work (adacachy, load
+    // ~50 on 32 cores), which isn't what it checks (as `agent_limit.rs` turns its runner's off).
+    headroom_off(&f, name)?;
+    Ok(f)
+}
+
+/// Turns the fixture's runner `name`'s headroom off (docs/headroom.md) and waits until it says it
+/// applied that, following its parties ([`setup`]), as `common::agents::headroom_off` does by a deadline.
+fn headroom_off(f: &Fixture, name: &str) -> anyhow::Result<()> {
+    let path = format!("/api/runners/{}/headroom", common::machine(name));
+    let what = format!("{name}'s headroom off");
+    setup_on(f, &what, || {
+        let (code, body) = common::http(f.port, "PUT", &path, &f.admin, Some(&json!({"enabled": false})))?;
+        Ok(if code == 200 { Setup::Ready(()) } else { server_said(code, &body) })
+    })?;
+    setup_on(f, &what, || {
+        let (code, body) = common::http(f.port, "GET", &path, &f.admin, None)?;
+        if code != 200 {
+            return Ok(server_said(code, &body));
+        }
+        Ok(headroom_applied(&serde_json::from_str(&body)?))
+    })
 }
 
 /// The folder runner `name` of a fixture under `dir` keeps its state in (`--state-dir`): its own folder
@@ -798,27 +964,22 @@ fn runner(dir: &Path, port: u16, name: &str, env: &[(&str, &str)]) -> anyhow::Re
 /// The gate: whether the fixture's runner starts microVMs. Ok(false) after saying why it skips;
 /// an error where `VM_E2E=1` requires it.
 pub fn isolation_ready(f: &Fixture) -> anyhow::Result<bool> {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let (says, why_not) = loop {
-        let entry = runner_entry(f)?;
-        let says = entry.as_ref().and_then(|r| r.pointer("/facts/virt/microvm").and_then(Value::as_bool));
-        if says.is_some() || Instant::now() >= deadline {
-            break (says, entry.and_then(|r| r.pointer("/facts/isolation/why_not").and_then(Value::as_str).map(str::to_owned)));
+    let (says, why_not) = setup_on(f, &format!("{}'s facts on microVMs", f.machine), || {
+        let (code, body) = common::http(f.port, "GET", "/api/reach/runners", &f.admin, None)?;
+        if code != 200 {
+            return Ok(server_said(code, &body));
         }
-        std::thread::sleep(Duration::from_millis(500));
-    };
-    if says == Some(true) {
+        let reach: Value = serde_json::from_str(&body)?;
+        let entry = reach.get("runners").and_then(Value::as_array).and_then(|rs| rs.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(f.machine.as_str())));
+        Ok(microvms_said(entry))
+    })?;
+    if says {
         return Ok(true);
     }
-    let why = skip_reason(&f.machine, says, why_not.as_deref());
+    let why = skip_reason(&f.machine, Some(says), why_not.as_deref());
     anyhow::ensure!(!isolation_required(), "{why} (VM_E2E=1 requires microVMs here)");
     eprintln!("{why}");
     Ok(false)
-}
-
-fn runner_entry(f: &Fixture) -> anyhow::Result<Option<Value>> {
-    let d = f.get("/api/reach/runners")?;
-    Ok(d.get("runners").and_then(Value::as_array).and_then(|rs| rs.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(f.machine.as_str())).cloned()))
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -826,21 +987,20 @@ fn runner_entry(f: &Fixture) -> anyhow::Result<Option<Value>> {
 // ------------------------------------------------------------------------------------------------
 
 /// Starts a session of `spec` on the fixture's runner: its id. Asked again while the runner is
-/// between connections, as `common::agents::open_session` does.
+/// between connections ([`opened`]), following the fixture's parties ([`setup`]).
 pub fn open(f: &Fixture, spec: &Value) -> anyhow::Result<String> {
     let body = json!({"target": format!("agent:{}", f.machine), "spec": spec});
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
+    let up = || -> anyhow::Result<bool> {
+        let (code, text) = common::http(f.port, "GET", "/api/agents", &f.admin, None)?;
+        Ok(code == 200 && connected(&serde_json::from_str(&text)?, &f.machine))
+    };
+    setup_on(f, &format!("starting {spec}"), || {
+        let before = up()?;
         // Longer than the server waits for its runner's answer (`hub::COMMAND_WITHIN`).
         let (code, text) = common::http_within(f.port, "POST", "/api/harness/sessions", &f.admin, Some(&body), Duration::from_secs(75))?;
-        if code == 200
-            && let Some(id) = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.pointer("/0/id").and_then(Value::as_str).map(str::to_owned))
-        {
-            return Ok(id);
-        }
-        anyhow::ensure!(Instant::now() < deadline, "couldn't start {spec}: {code} {text}\n{}", f.runner_log());
-        std::thread::sleep(Duration::from_secs(1));
-    }
+        let throughout = code != 200 && before && up()?;
+        Ok(opened(code, &text, throughout))
+    })
 }
 
 /// The session as kiln lists it.

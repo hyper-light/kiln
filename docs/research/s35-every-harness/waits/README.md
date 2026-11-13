@@ -66,6 +66,25 @@ None of these refuse:
 
 These follow progress and the window.
 
+## The fixture's setup waits
+
+Before any harness has answered, the fixture waits on its own parties: the runner connecting (`up`),
+its headroom turned off, its facts on microVMs (`isolation_ready`), and each session's start (`open`).
+These waits were 120 s, 60 s, 60 s and 90 s. Each is now a cold start (`setup`): it follows its
+parties with no time bound, looking each `POLL`, and refuses at once, typed (`SetupStuck`), where nothing
+can progress.
+
+- **A process of the fixture's own ended** (`Exited`). The server's and the runner's processes are the
+  fixture's children (`Child::try_wait`, on every OS). ROOT's runner (`VM_E2E_RUNNER_PID`) is looked at
+  by its pid where kiln can tell one runs (`os::pid_alive`, Unix; on Windows it says nothing of a pid).
+- **The server's final word** (`Refused`): a client error (4xx). A start refused while the runner was
+  listed connected before and after it is final. Refused while the runner was between connections, it's
+  asked again (kiln answers 400 to both). The server's own trouble (5xx), and a look that couldn't reach
+  it, are looked past while its process lives.
+- **Facts on microVMs**: a runner's facts always say `virt.microvm` (`kiln_ci::facts::Virt`), so the
+  wait follows the runner until its facts come, then takes their yes or no. The 60 s took facts that
+  hadn't come yet for a runner that says nothing of microVMs.
+
 ## Alternatives weighed
 
 - **A picked bound** (the 600 s and 60 s this replaces). R03 forbids it.
@@ -79,7 +98,5 @@ These follow progress and the window.
 
 - `POLL` (250 ms) is a probe's period, which bounds nothing. R05 prefers kiln's own change
   notifications, the session's event stream, to periodic looks.
-- The fixture's setup waits keep picked numbers: `open` 90 s, `up` 120 s, `isolation_ready` 60 s and
-  `headroom_off` 60 s.
 - ROOT's runs: five of `cargo test -p kiln --test vm_harnesses -- step35::host:: host::` under load on
   a Mac Studio, and the microVM drives.

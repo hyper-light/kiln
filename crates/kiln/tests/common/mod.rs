@@ -994,6 +994,12 @@ impl Server {
         self.leave = true;
     }
 
+    /// How its process ended, once it has (it's reaped then); none while it runs.
+    #[allow(dead_code)]
+    pub fn ended(&mut self) -> Option<String> {
+        self.child.try_wait().ok().flatten().map(|status| status.to_string())
+    }
+
     /// The end of the server's log.
     #[allow(dead_code)]
     pub fn log(&self) -> String {
