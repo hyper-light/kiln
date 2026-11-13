@@ -87,8 +87,9 @@ pub enum Runs {
         control: Option<Link>,
         /// What it reaches past the microVM, of what its image grants (step 17 part 6): its session's
         /// own provider's or sign-in's destinations, or its image's whole and why. None from a runner
-        /// before it. Boxed, as a variant this large beside `Host`'s pid is clippy's
-        /// `large_enum_variant`.
+        /// before it.
+        // Boxed: unboxed, this variant is 232 bytes beside `Host`'s pid, past clippy's
+        // `large_enum_variant` bound.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(test, ts(optional))]
         reach: Option<Box<crate::sandbox::narrow::Reach>>,
