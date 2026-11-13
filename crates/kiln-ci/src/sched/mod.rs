@@ -4,6 +4,7 @@
 //! - [`sim`]: a simulator driving it.
 //! - [`actor`]: whose a commit is, from kiln's records (W28-R67).
 //! - [`admit`]: admission: coalescing, cadence, speculation windows (W28-R60 to R63, R68).
+//! - [`balance`]: where a leg goes: the load balancer's pick (docs/lb.md "The CI engine", W05-R23).
 //! - [`demand`]: demands, the work in flight, and what becomes of work no one wants (W28-R40 to R44).
 //! - [`groups`]: concurrency groups.
 //! - [`intent`]: priority and class by intent: gate, waiting, trunk, work in progress (W28-R64, W05-R30).
@@ -25,6 +26,7 @@
 
 pub mod actor;
 pub mod admit;
+pub mod balance;
 pub mod demand;
 pub mod load;
 pub mod groups;

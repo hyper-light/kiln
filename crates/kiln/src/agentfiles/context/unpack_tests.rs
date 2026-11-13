@@ -6,8 +6,10 @@
 //! libc, each archive's one entry, the member opencode held alone, at bin/opencode, and LICENSE beside it,
 //! a plain file. So are Devin's (plan 01a1ce705e4d7008993f5c7291ef4476, step 2), through kiln's own
 //! Agentfile and harness.json for it: each bundle a tree at the harness directory's root, stripped of
-//! nothing. Each archive the unpacker refuses comes back as its typed error, naming its URL and its entry,
-//! and leaves nothing behind; one of another digest or size is never opened.
+//! nothing. And Codex's (plan 01a1ce705d7076648c1d9f9ee26214d3, step 3): OpenAI's package at the root,
+//! arm64's skipping its codex-path/rg for ripgrep's member at that path. Each archive the unpacker refuses
+//! comes back as its typed error, naming its URL and its entry, and leaves nothing behind; one of another
+//! digest or size is never opened.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -705,6 +707,154 @@ fn step25_a_devin_bundle_the_unpacker_refuses_leaves_nothing() -> anyhow::Result
                     anyhow::bail!("{what}: {:?}, not the unpacker's refusal", refused.map(|m| m.len()));
                 };
                 assert_eq!((u.url.as_str(), u.entry.as_deref()), (url.as_str(), entry), "{what}: {u}");
+                assert!(is(&u.why), "{what}: {:?}", u.why);
+                let left = if ctx.exists() { names(ctx)? } else { BTreeSet::new() };
+                assert!(left.is_empty(), "{what}: left {left:?}");
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Codex's harness file and Agentfile for a test: its HARNESS line takes `./codex-${TARGETARCH}`.
+const CODEX_AGENTFILE: &str = "FROM scratch\nARG TARGETARCH\nHARNESS codex FROM ./codex-${TARGETARCH}\n";
+const CODEX_HARNESS_JSON: &str = "{\"schemaVersion\":1,\"name\":\"codex\"}\n";
+/// The member Codex's arm64 pin takes from ripgrep's archive, under the directory that archive leads with.
+const RG_MEMBER: &str = "ripgrep-15.2.0-aarch64-unknown-linux-musl/rg";
+/// Each rg, in small: amd64's package's own (a static build, which stays), arm64's package's (a glibc
+/// build, which its tree skips) and ripgrep's static build, the member that takes arm64's place.
+const AMD64_RG: &[u8] = b"\x7fELF rg, the amd64 package's static build\n";
+const GLIBC_RG: &[u8] = b"\x7fELF rg, the arm64 package's glibc build\n";
+const STATIC_RG: &[u8] = b"\x7fELF rg, ripgrep's static aarch64 build\n";
+
+/// OpenAI's package for `arch`, in small, as Codex's pin takes it whole at strip 0 (no leading
+/// directory): bin/codex, bwrap in codex-resources/, the package's own `rg` at codex-path/rg, and its
+/// layout file.
+fn codex_package(arch: &str, rg: &[u8]) -> Vec<E> {
+    vec![
+        dir("bin/"),
+        file("bin/codex", 0o755, format!("\x7fELF codex {arch}\n").as_bytes()),
+        dir("codex-resources/"),
+        file("codex-resources/bwrap", 0o755, b"\x7fELF bwrap\n"),
+        dir("codex-path/"),
+        file("codex-path/rg", 0o755, rg),
+        file("codex-package.json", 0o644, b"{\"layoutVersion\":1}\n"),
+    ]
+}
+
+/// One platform of Codex's shape, as the test's server serves it and as its pin names it: `package` a
+/// tree at `.`, its totals the archive's own, with `skip` where it's given one; on arm64, ripgrep's
+/// archive too (a README and its rg), whose member is written at codex-path/rg, 0755.
+fn codex_build(origin: &str, arch: &str, package: &[E], skip: &[&str]) -> anyhow::Result<(Vec<(String, Vec<u8>)>, Value)> {
+    let gz = targz(package)?;
+    let (entries, bytes) = totals(package);
+    let unpack = match skip {
+        [] => json!({ "format": "tar.gz", "strip": 0, "unpacked_bytes": bytes, "entries": entries }),
+        _ => json!({ "format": "tar.gz", "strip": 0, "unpacked_bytes": bytes, "entries": entries, "skip": skip }),
+    };
+    let mut files = vec![json!({ "url": format!("{origin}/{arch}/codex-package.tar.gz"), "sha256": sha(&gz), "size": gz.len(), "path": ".", "unpack": unpack })];
+    let mut routes = vec![(format!("/{arch}/codex-package.tar.gz"), gz)];
+    if arch == "arm64" {
+        let lead = RG_MEMBER.rsplit_once('/').map_or(RG_MEMBER, |(lead, _)| lead);
+        let rg = targz(&[dir(format!("{lead}/")), file(format!("{lead}/README.md"), 0o644, b"# ripgrep\n"), file(RG_MEMBER, 0o755, STATIC_RG)])?;
+        files.push(json!({ "url": format!("{origin}/arm64/ripgrep.tar.gz"), "sha256": sha(&rg), "size": rg.len(), "path": "codex-path/rg", "mode": "0755",
+            "unpack": { "format": "tar.gz", "member": RG_MEMBER, "sha256": sha(STATIC_RG), "size": STATIC_RG.len() } }));
+        routes.push(("/arm64/ripgrep.tar.gz".to_owned(), rg));
+    }
+    Ok((routes, json!({ "platform": format!("linux/{arch}"), "files": files })))
+}
+
+/// Codex's built-in for a test: the pin of `builds`.
+fn codex(builds: Vec<Value>) -> Builtin {
+    let pin = json!({ "version": "0.167.2", "verified": "by the test", "builds": builds }).to_string();
+    Builtin { name: "harness-codex", harness: "codex", text: CODEX_AGENTFILE, pin: pin.leak(), files: &[("harness.json", CODEX_HARNESS_JSON)] }
+}
+
+/// A context of Codex's shape for linux/amd64 and linux/arm64 holds the Agentfile and codex-amd64/ and
+/// codex-arm64/, and nothing else: no staging directory, no archive. Each holds harness.json and its
+/// package's tree at its root, its archived modes kept. amd64's codex-path/rg is its package's own;
+/// arm64's package skips its glibc rg, and ripgrep's static rg, the member, is written there at 0755.
+#[test]
+fn step20_a_codex_shaped_context_holds_ripgreps_rg_in_place_of_arm64s() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let mut builds = Vec::new();
+        let origin = serve(|o| {
+            let (mut routes, amd64) = codex_build(o, "amd64", &codex_package("amd64", AMD64_RG), &[])?;
+            let (arm, arm64) = codex_build(o, "arm64", &codex_package("arm64", GLIBC_RG), &["codex-path/rg"])?;
+            routes.extend(arm);
+            builds.extend([amd64, arm64]);
+            Ok(routes)
+        })
+        .await?;
+        let tmp = tempfile::tempdir()?;
+        let ctx = tmp.path().join("ctx");
+
+        let made = materialize(&codex(builds), &both(), None, &ctx).await?;
+
+        assert_eq!(made, [ctx.join("codex-amd64"), ctx.join("codex-arm64")], "from {origin}");
+        assert_eq!(names(&ctx)?, set(["Agentfile", "codex-amd64", "codex-arm64"]));
+        assert_eq!(std::fs::read_to_string(ctx.join("Agentfile"))?, CODEX_AGENTFILE);
+        for (arch, rg) in [("amd64", AMD64_RG), ("arm64", STATIC_RG)] {
+            let d = ctx.join(format!("codex-{arch}"));
+            assert_eq!(names(&d)?, set(["bin", "codex-package.json", "codex-path", "codex-resources", "harness.json"]), "{arch}");
+            assert_eq!(names(&d.join("codex-path"))?, set(["rg"]), "{arch}");
+            assert_eq!(std::fs::read(d.join("codex-path/rg"))?, rg, "{arch}");
+            assert_eq!(std::fs::read(d.join("bin/codex"))?, format!("\x7fELF codex {arch}\n").into_bytes(), "{arch}");
+            assert_eq!(std::fs::read_to_string(d.join("harness.json"))?, CODEX_HARNESS_JSON, "{arch}");
+            #[cfg(unix)]
+            {
+                for (path, bits) in [("bin/codex", 0o755), ("codex-resources/bwrap", 0o755), ("codex-path", 0o755), ("codex-path/rg", 0o755), ("codex-package.json", 0o644)] {
+                    assert_eq!(mode(&d.join(path))?, bits, "{arch}: {path}");
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Each way arm64's skip can fail comes back as the unpacker's typed error, naming the pinned URL and
+/// the entry at fault: a skip path the package doesn't hold; a skipped path that's a directory, or a
+/// symlink (a skipped entry is checked as every entry is, though never written); and no skip at all,
+/// where ripgrep's rg finds the package's there already, since nothing is overwritten. Each is arm64's,
+/// after amd64's directory was made, and leaves nothing in the context's directory.
+#[test]
+fn step20_a_codex_skip_that_fails_leaves_nothing() -> anyhow::Result<()> {
+    type Is = fn(&Why) -> bool;
+    let package = || codex_package("arm64", GLIBC_RG);
+    let mut linked = package();
+    linked.retain(|e| e.name != b"codex-path/rg");
+    linked.push(link("codex-path/rg", EntryType::Symlink, "/usr/bin/rg"));
+    // Each case: what it is, arm64's package, its skip, the archive refused, the entry it names, and why.
+    let cases: [(&str, Vec<E>, &[&str], &str, &str, Is); 4] = [
+        ("a skip path the package lacks", package(), &["codex-path/fd"], "codex-package", "codex-path/fd", |w| matches!(w, Why::Missing)),
+        ("a skipped directory", package(), &["codex-path"], "codex-package", "codex-path/", |w| matches!(w, Why::Kind(b'5'))),
+        ("a skipped symlink", linked, &["codex-path/rg"], "codex-package", "codex-path/rg", |w| matches!(w, Why::Link)),
+        ("no skip", package(), &[], "ripgrep", RG_MEMBER, |w| matches!(w, Why::Exists(at) if at == Path::new("codex-path/rg"))),
+    ];
+    for (what, arm64, skip, fails, entry, is) in cases {
+        crate::rt::block_on(async move {
+            let mut builds = Vec::new();
+            let origin = serve(|o| {
+                let (mut routes, b) = codex_build(o, "amd64", &codex_package("amd64", AMD64_RG), &[])?;
+                builds.push(b);
+                let (r, b) = codex_build(o, "arm64", &arm64, skip)?;
+                routes.extend(r);
+                builds.push(b);
+                Ok(routes)
+            })
+            .await?;
+            let b = codex(builds);
+            let url = format!("{origin}/arm64/{fails}.tar.gz");
+            let tmp = tempfile::tempdir()?;
+            let (absent, empty) = (tmp.path().join("absent"), tmp.path().join("empty"));
+            std::fs::create_dir(&empty)?;
+            for ctx in [&absent, &empty] {
+                let refused = materialize(&b, &both(), None, ctx).await;
+                let Err(Error::Unpack(u)) = refused else {
+                    anyhow::bail!("{what}: {:?}, not the unpacker's refusal", refused.map(|m| m.len()));
+                };
+                assert_eq!((u.url.as_str(), u.entry.as_deref()), (url.as_str(), Some(entry)), "{what}: {u}");
                 assert!(is(&u.why), "{what}: {:?}", u.why);
                 let left = if ctx.exists() { names(ctx)? } else { BTreeSet::new() };
                 assert!(left.is_empty(), "{what}: left {left:?}");
