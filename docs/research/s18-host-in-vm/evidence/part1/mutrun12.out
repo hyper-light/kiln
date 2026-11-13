@@ -1,0 +1,3 @@
+START 2026-11-13T01:45:25Z 567f429a56a4 +M12 alone
+M12 rc=101 harness::trouble::tests::step18_h6_an_answer_ends_it_and_another_kind_is_said_anew :: Error: Condition failed: `core.state.trouble.is_none()`
+END 2026-11-13T01:47:46Z

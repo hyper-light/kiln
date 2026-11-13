@@ -1194,6 +1194,16 @@ pub async fn settle_settings(hub: &Hub) {
     }
 }
 
+/// An isolated agent's isolation as it starts (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 18):
+/// its person, whose volume its harness's configuration is on, is `person`, who asked, else its
+/// parent's ([`isolation_for`] inherits it); never what was asked.
+fn with_person(isolation: Option<Isolation>, person: Option<&str>) -> Option<Isolation> {
+    isolation.map(|mut i| {
+        i.person = person.map(str::to_owned).or(i.person.take());
+        i
+    })
+}
+
 /// [`start`], the spec made for the ask then tuned by `tune` before anything starts.
 async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec) + Send) -> Result<Vec<Info>, Refused> {
     let kind = harness(&ask.kind)?;
@@ -1247,6 +1257,10 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         }
     };
     let target = placed.first().map_or_else(|| "local".to_owned(), |(t, _)| t.clone());
+    // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
+    // person they act for's.
+    let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
+    let isolation = with_person(isolation, person.as_deref());
     // Its folder: the one asked for, else its parent's where they share a machine, else home.
     let cwd = ask.cwd.clone().filter(|c| !c.trim().is_empty()).or_else(|| by.parent.as_ref().filter(|p| placed.iter().all(|(t, _)| same_machine(p, t))).map(|p| p.cwd.clone()).filter(|c| !c.is_empty()));
     let mut spec = Spec {
@@ -1287,9 +1301,6 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         }
         at += n;
     }
-    // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
-    // person they act for's.
-    let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
     for i in &infos {
         if let Some(o) = &by.opener {
             let _ = hub.store.kv_set(crate::mcp::opener_key(&i.id), o.clone()).await;
@@ -1326,6 +1337,17 @@ pub fn children_brief(hub: &Hub, id: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Step 18: an isolated agent's person is whoever asked for it, else its parent's; an agent that
+    /// isn't isolated gets no isolation.
+    #[test]
+    fn step18_an_isolated_agents_person_is_its_askers_else_its_parents() {
+        let parents = Isolation { person: Some("user:u1".into()), ..Isolation::microvm() };
+        assert_eq!(with_person(Some(parents.clone()), Some("user:u2")).and_then(|i| i.person).as_deref(), Some("user:u2"));
+        assert_eq!(with_person(Some(parents), None).and_then(|i| i.person).as_deref(), Some("user:u1"));
+        assert_eq!(with_person(Some(Isolation::microvm()), None).map(|i| i.person), Some(None));
+        assert_eq!(with_person(None, Some("user:u2")), None);
+    }
 
     /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32: an agent is isolated as asked, an isolated agent's agents are
     /// isolated whatever they ask (its own image with them), and one asked as a process under it is refused.

@@ -1,0 +1,18 @@
+START 2026-11-13T02:58:02Z eaf76bee4fdf dirty=0
+TEST rc=101 2026-11-13T03:01:09Z
+test harness::moving::tests::a_harness_whose_record_kiln_doesnt_keep_moves_with_its_conversation_in_words ... FAILED
+thread 'harness::moving::tests::a_harness_whose_record_kiln_doesnt_keep_moves_with_its_conversation_in_words' (2353003) panicked at crates/kiln/src/harness/moving.rs:380:9:
+test result: FAILED. 227 passed; 1 failed; 0 ignored; 0 measured; 4306 filtered out; finished in 1.71s
+1
+MUTANT  1 file changed, 1 insertion(+), 1 deletion(-)
+MUTANT TEST rc=101 2026-11-13T03:03:27Z (a failure is the guard holding)
+test agentfiles::builtin::grants_tests::step18_every_builtin_names_its_hosts_and_keeps_its_home_on_its_volume ... FAILED
+Error: harness-goose: ["its NETWORK lines are [\"NETWORK --egress=ai-gateway.vercel.sh:443 --egress=ai.salad.cloud:443 --egress=aihubmix.com:443 --egress=api.aigateway.sh:443 --egress=api.aimlapi.com:443 --egress=api.anthropic.com:443 --egress=api.avian.io:443 --egress=api.cerebras.ai:443 --egress=api.deepseek.com:443 --egress=api.empiriolabs.ai:443 --egress=api.eurouter.ai:443 --egress=api.firewo
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4533 filtered out; finished in 0.00s
+RESTORED dirty=0
+GREEN TEST rc=0 2026-11-13T03:05:39Z
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4533 filtered out; finished in 0.00s
+CLIPPY rc=0 2026-11-13T03:06:57Z
+      1 warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+
+[exited with code 0]

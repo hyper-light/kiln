@@ -1,0 +1,183 @@
+{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"$id": "https://ampcode.com/cli-settings.schema.json",
+	"title": "Amp CLI settings",
+	"description": "Settings for the Amp CLI user and workspace configuration files.",
+	"type": "object",
+	"properties": {
+		"$schema": { "type": "string", "description": "The JSON Schema URL used by your editor." },
+		"amp.fuzzy.alwaysIncludePaths": {
+			"type": "array",
+			"description": "Glob patterns for paths that should always be included in fuzzy file search, even if they are ignored by Git. This is useful for build output directories or generated files you want to reference with @ mentions.",
+			"items": { "type": "string" },
+			"default": []
+		},
+		"amp.showCosts": {
+			"type": "boolean",
+			"description": "Show cost information for threads in the CLI while working. Workspace admins can also hide costs for all workspace members in workspace settings.",
+			"default": true
+		},
+		"amp.git.commit.ampThread.enabled": {
+			"type": "boolean",
+			"description": "Add the Amp thread trailer to Git commits. When disabled, commits made by the agent will not include the Amp-Thread-ID: trailer. You can also set the environment variable AMP_DISABLE_AMP_THREAD_TRAILER=1. Amp links a pushed commit to its thread only through this trailer, so while it is disabled, new commits are not linked to their threads and do not mark those threads as shipped. While disabled, Amp also refuses to run a git commit whose message writes the trailer by hand and asks the agent to remove it; the same applies to Co-authored-by: Amp when amp.git.commit.coauthor.enabled is off.",
+			"default": true
+		},
+		"amp.git.commit.coauthor.enabled": {
+			"type": "boolean",
+			"description": "Add Amp as a coauthor in Git commits. When disabled, commits made by the agent will not include the Co-authored-by: Amp trailer. In orbs, use **Commit Author** in a personal project's settings or **Credit Amp as Co-author** in a workspace project's settings instead. In orbs whose project Git identity is Amp, Amp is already the commit author and this trailer is never added; the thread creator is credited as a co-author instead.",
+			"default": true
+		},
+		"amp.keymap": {
+			"type": "object",
+			"description": "Customize the CLI keymap. Keymap entries in user settings override entries in workspace settings. See Customize the Keymap for more information.",
+			"default": {},
+			"additionalProperties": {
+				"oneOf": [
+					{ "type": "string" },
+					{ "type": "array", "items": { "type": "string" } },
+					{ "type": "null" }
+				]
+			}
+		},
+		"amp.mcpServers": {
+			"type": "object",
+			"description": "Model Context Protocol servers that expose tools. See the MCP documentation.",
+			"additionalProperties": {
+				"oneOf": [
+					{ "$ref": "#/definitions/stdioMCPServer" },
+					{ "$ref": "#/definitions/httpMCPServer" }
+				]
+			}
+		},
+		"amp.notifications.enabled": {
+			"type": "boolean",
+			"description": "Play notification sounds when the agent completes a task or is blocked waiting for user input. Over SSH, or when AMP_FORCE_BEL is set, Amp sends a terminal bell instead of using host audio.",
+			"default": true
+		},
+		"amp.remoteThreadCreation.enabled": {
+			"type": "boolean",
+			"description": "Let ampcode.com create new threads that open in the interactive Amp TUI on this machine, in the directory where it was started. Toggle it from the TUI command palette with amp: enable remote creation of threads.",
+			"default": false
+		},
+		"amp.runner.autoUpdate.enabled": {
+			"type": "boolean",
+			"description": "Let amp --no-tui runners install CLI updates and restart into them. A runner restarts once no thread is running there, at most once every 12 hours, and keeps its command-line flags. Setting amp.updates.mode to \"disabled\" also turns this off.",
+			"default": true
+		},
+		"amp.runner.env.enabled": {
+			"type": "boolean",
+			"description": "Let amp --no-tui runners inject the Secrets & Env Vars configured on ampcode.com into the shell commands, MCP servers, and plugins of the threads they serve. Same as starting the runner with --amp-env. See Secrets & Env Vars on runners.",
+			"default": false
+		},
+		"amp.skills.disableClaudeCodeSkills": {
+			"type": "boolean",
+			"description": "Disable loading skills from Claude Code directories (.claude/skills/, ~/.claude/skills/, and ~/.claude/plugins/cache/). This does not affect .agents/skills/, ~/.config/agents/skills/, ~/.agents/skills/, ~/.config/amp/skills/, amp.skills.path, built-in skills, personal skills, or workspace skills.",
+			"default": false
+		},
+		"amp.skills.disableGlobalAgentsSkills": {
+			"type": "boolean",
+			"description": "Disable loading skills from the global agent-agnostic directories (~/.config/agents/skills/ and ~/.agents/skills/). Use this when another tool owns ~/.config/agents/ and you want Amp to read only ~/.config/amp/skills/ or amp.skills.path. This does not affect ~/.config/amp/skills/, .agents/skills/, Claude Code directories, amp.skills.path, built-in skills, personal skills, or workspace skills. amp skill add --global installs to ~/.config/agents/skills/ and warns that those skills are not loaded while this is set.",
+			"default": false
+		},
+		"amp.skills.path": {
+			"type": "string",
+			"description": "Path to additional directories containing skills. This setting supports colon-separated paths, or semicolon-separated paths on Windows. Use ~ for your home directory. Relative paths resolve against the workspace root, so a workspace .amp/settings.json can use .amp/skills. Example: ~/my-skills:/shared/team-skills"
+		},
+		"amp.terminal.copyOnSelect": {
+			"type": "boolean",
+			"description": "By default, the Amp TUI copies the selection to the clipboard. When set to false, selecting text in the thread transcript does not copy it automatically. Press Ctrl+C to copy an active transcript selection manually.",
+			"default": true
+		},
+		"amp.terminal.detailsExpandedByDefault": {
+			"type": "boolean",
+			"description": "Expand thinking and tool call details by default in the CLI transcript. Press Alt+T to collapse or expand details for the current session.",
+			"default": false
+		},
+		"amp.thread.autoArchiveOnQuit": {
+			"type": "boolean",
+			"description": "Automatically archive open CLI threads when quitting Amp. This applies to the active thread and any background threads connected in the current CLI session.",
+			"default": false
+		},
+		"amp.tools.disable": {
+			"type": "array",
+			"description": "Disable specific tools by name. Use builtin:toolname to disable only the built-in tool with that name while allowing an MCP server to provide a tool by the same name. Glob patterns using * are supported.",
+			"items": { "type": "string" },
+			"default": []
+		},
+		"amp.mcpPermissions": {
+			"type": "array",
+			"description": "Allow or block MCP servers that match a pattern. Amp applies the first matching rule. If no rule matches an MCP server, Amp allows it.",
+			"items": {
+				"type": "object",
+				"properties": {
+					"matches": {
+						"type": "object",
+						"additionalProperties": { "$ref": "#/definitions/mcpMatchCondition" }
+					},
+					"action": { "enum": ["allow", "reject"] }
+				},
+				"required": ["matches", "action"],
+				"additionalProperties": false
+			},
+			"default": []
+		},
+		"amp.updates.mode": {
+			"type": "string",
+			"description": "Control update checking. \"warn\" shows update notifications. \"disabled\" turns off update checks. \"auto\" installs updates automatically. Setting the AMP_SKIP_UPDATE_CHECK=1 environment variable overrides this setting and disables all update checks.",
+			"default": "auto",
+			"enum": ["auto", "warn", "disabled"]
+		},
+		"amp.admin.compatibilityDate": {
+			"type": "string",
+			"description": "The date used to determine which migrations Amp must apply for backward compatibility. Use the YYYY-MM-DD format, such as 2024-01-15.",
+			"pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+		}
+	},
+	"patternProperties": { "^amp\\.": true },
+	"additionalProperties": false,
+	"definitions": {
+		"mcpMatchCondition": {
+			"oneOf": [
+				{ "type": "string" },
+				{ "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/mcpMatchCondition" } },
+				{ "type": "object", "additionalProperties": { "$ref": "#/definitions/mcpMatchCondition" } },
+				{ "type": "boolean" },
+				{ "type": "number" },
+				{ "type": "null" }
+			]
+		},
+		"stdioMCPServer": {
+			"type": "object",
+			"properties": {
+				"command": { "type": "string" },
+				"args": { "type": "array", "items": { "type": "string" } },
+				"env": { "type": "object", "additionalProperties": { "type": "string" } }
+			},
+			"required": ["command"],
+			"additionalProperties": false
+		},
+		"httpMCPServer": {
+			"type": "object",
+			"properties": {
+				"url": { "type": "string" },
+				"headers": { "type": "object", "additionalProperties": { "type": "string" } },
+				"transport": { "enum": ["http", "sse", "http-first"] },
+				"oauth": {
+					"type": "object",
+					"properties": {
+						"clientId": { "type": "string" },
+						"clientSecret": { "type": "string" },
+						"authUrl": { "type": "string" },
+						"tokenUrl": { "type": "string" },
+						"scopes": { "type": "array", "items": { "type": "string" } },
+						"redirectUrl": { "type": "string" }
+					},
+					"required": ["clientId", "authUrl", "tokenUrl"],
+					"additionalProperties": false
+				}
+			},
+			"required": ["url"],
+			"additionalProperties": false
+		}
+	}
+}

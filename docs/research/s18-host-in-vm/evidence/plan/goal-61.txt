@@ -1,0 +1,16 @@
+ROOT's goal #61, id 7c8235c884a68fd987874e76afb718c0, on kiln agent 01a148884a4770fdaf0111f3f792a248's goal stack, as goals_get returned it on 2026-11-12 (its text, verbatim):
+Plan step 18 [kiln]: everything kiln assumes of the host holds inside the VM, or is refused with its reason, and docs/agents.md lists each:
+- the project plugged at its host path (Shards D235);
+- a per-user config volume, read on the host;
+- MCP to /api/mcp through the step 9 grant (D236);
+- KILN_* env;
+- auth and reach failures surfaced from the harness's stream as they happen (H6);
+- host-OS tools refused where isolation is required. Full step: kiln plan 01a1cd8e862e7169a074db3d5fa33f3d items[17]. ALSO:
+- Move the ten built-in Agentfiles from TCP 443 to any address to destinations by name (D236), and the project from /workspace to its host path.
+- Make one HOME-volume rule, from each harness's documented HOME writes. STATE: a previous agent's work is in /Users/adalundhe/Projects/kiln/.claude/worktrees/s18-host-in-vm (branch p/s18-host-in-vm-v1). Keep its edits. The VM-key identity waits on step 11, and the sign-in terminal lane on steps 6 and 11. RULES (the person, 2026-11-13):
+- Implement this goal only: no side fixes, research campaigns or measurements.
+- Run no real VMs, E2E, whole suites or repeated rounds: only the unit tests of the code you touch and the clippy your landing needs.
+- No baked-in constants (R03).
+- Read kiln's AGENTS.md first.
+- Sign with /Users/adalundhe/.kiln-run/bin/gits, and land fast-forward on kiln main yourself, never force.
+- Then say this goal met, with the SHAs and what's owed.
