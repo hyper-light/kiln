@@ -590,6 +590,8 @@ export const harnessApi = {
   /** Move an agent to runner `to`: once its turn is over, or `now` (the turn stops here and goes on there). */
   move: (id: string, to: string, now = false, kind?: string, model?: string) =>
     call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to, now, ...(kind ? { kind } : {}), ...(model ? { model } : {}) }),
+  /** Resume a crashed agent in place: a fresh harness under its id, its conversation, plans, goals and subagents its own. */
+  resume: (id: string) => call<{ resumed: unknown; subagents: string[] }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/resume`),
   /** Every agent of `machine`, which is gone, goes on elsewhere from the server's copy of its conversation: each on the machine that suits it, or all on `to`. */
   recover: (machine: string, to?: string) =>
     call<{ moved: { id: string; name: string; to?: string; error?: string }[] }>("POST", `/api/harness/machines/${encodeURIComponent(machine)}/recover`, to ? { to } : {}),

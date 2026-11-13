@@ -169,7 +169,11 @@ What the launch does with these, in order, for an isolated session:
 | Linux x86_64, adacachy | `cargo test -p kiln --lib -- step18 wire::ts harness::homes harness::whose harness::moving harness::trouble harness::isolated mcp:: reach::mcp` | 89 passed, 2 failed: `wire::ts::bindings_are_current` (regenerated with `KILN_WRITE_TS=1`, then 7 of 7) and `harness::moving::tests::a_harness_whose_record_kiln_doesnt_keep_moves_with_its_conversation_in_words` (moving.rs:380's version check, failing on main too: ROOT's list of main failures without an owner) |
 | Linux x86_64, adacachy | `cargo clippy --locked -p kiln -p kiln-ci --all-targets -- -D warnings` (the gate's clippy step) | passed (7 min 58 s) |
 | macOS arm64, adalundhe-macbook-pro, at 28b96170e | `ci/gate.sh -p kiln -p kiln-ci --cpus 8 --mem 16g clippy` | `GATE: PASS`, 766 s, resident peak 11.0 GiB |
-| Windows x86_64, jupiter, at 28b96170e | the same | below |
+| Windows x86_64, jupiter, at 28b96170e | the same | not run to its end |
+| Linux x86_64, adacachy, landing at 5fe18df48 (part 1 merged with main 819e7f13e) | `cargo test -p kiln --lib` with the filters of `light.sh` (step18, step23's real-shards check with `KILN_TEST_SHARDS` = shards e82b9403, agentfiles::, wire::ts, harness::{homes,whose,moving,trouble,isolated,lineage}, mcp::, reach::mcp) | 226 passed, among them every step18 test and `step23_a_real_shards_checks_every_builtin` (not skipped); 1 failed, main's own `harness::moving` version test: main's package `VERSION` is 4 and the test holds `!takes(4)` (`evidence/part1/landing-light.log`, `landing-light.out`) |
+| Linux x86_64, adacachy, at 5fe18df48 | `cargo clippy --locked -p kiln -p kiln-ci --all-targets -- -D warnings` | passed, 5 min 45 s (`evidence/part1/landing-clippy.log`) |
+| macOS arm64, adalundhe-macbook-pro, at 5fe18df48 | `ci/gate.sh -p kiln -p kiln-ci --cpus 8 --mem 16g clippy` | `GATE: PASS`, 1,248 s, resident peak 10.4 GiB |
+| Windows x86_64, jupiter, at 5fe18df48 | the same | stopped on ROOT's word (2026-11-13): tests and clippy on one host, CI on main for the rest |
 
 ### Guard-removal mutants (R10)
 

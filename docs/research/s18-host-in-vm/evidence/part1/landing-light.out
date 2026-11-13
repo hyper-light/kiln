@@ -1,0 +1,9 @@
+START 2026-11-13T02:40:30Z 5fe18df48cf7 dirty=0
+TEST rc=101 2026-11-13T02:45:54Z
+test harness::moving::tests::a_harness_whose_record_kiln_doesnt_keep_moves_with_its_conversation_in_words ... FAILED
+thread 'harness::moving::tests::a_harness_whose_record_kiln_doesnt_keep_moves_with_its_conversation_in_words' (1845558) panicked at crates/kiln/src/harness/moving.rs:380:9:
+test result: FAILED. 226 passed; 1 failed; 0 ignored; 0 measured; 4306 filtered out; finished in 2.93s
+CLIPPY rc=0 2026-11-13T02:51:41Z
+      1 warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+
+[exited with code 0]

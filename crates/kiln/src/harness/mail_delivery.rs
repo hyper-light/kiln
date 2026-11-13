@@ -42,7 +42,7 @@ pub(super) fn storage_floor(hub: &Hub) -> Result<u64, Error> {
 /// and have pushed capacity for this epoch. Missing/legacy evidence remains explicitly held.
 pub fn capacity(hub: &Hub, id: &str) -> Option<Capacity> {
     let info = hub.harness.info_shared(id)?;
-    if info.status == super::model::Status::Disconnected { return None; }
+    if matches!(info.status, super::model::Status::Disconnected | super::model::Status::Crashed) { return None; }
     let capacity = info.admission.clone().filter(|c| c.epoch == hub.harness.epoch_of(id))?;
     match hub.harness.location(id)? {
         Location::Local => Some(capacity),

@@ -100,3 +100,10 @@ test("mc_attention: live tasks and owned work keep a quiet header Ready", () => 
   assert.equal(signal(agent(), state({ left_behind: 1 })).tone, "ready");
   assert.equal(signal(agent({ tasks_running: 1 }), state()).tone, "ready");
 });
+
+test("crashed_state: an agent whose harness is gone while its machine is up reads Crashed in the list and header, never offline", () => {
+  const crashed = agent({ status: "crashed", exit: { code: null, error: "its runner process ended", at: 2 } });
+  assert.equal(standOf(crashed), "crashed");
+  assert.deepEqual(signal(crashed), { tone: "stopped", label: "Crashed" });
+  assert.notEqual(signal(crashed).tone, "disconnected");
+});
