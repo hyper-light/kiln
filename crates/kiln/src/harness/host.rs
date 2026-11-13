@@ -5125,7 +5125,9 @@ while True:
             // Claude Code's image serves one provider: its destinations are all its run's, kept whole, no fallback said.
             let one_use = crate::sandbox::narrow::Reach::Whole { why: crate::sandbox::narrow::Whole::OneUse };
             assert_eq!(s.info().runs, Some(session::Runs::Microvm { vm: Some("fake-vm-1".into()), image: pinned.clone(), host_pid: None, control: Some(link.clone().into()), reach: Some(Box::new(one_use)) }));
-            assert_eq!(launch.egress, kiln_seams::sandbox::Egress::Any, "its image's own grants, narrowed no further");
+            let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
+            let granted = crate::sandbox::isolated::granted(claude.text).map_err(anyhow::Error::msg)?.ok_or_else(|| anyhow::anyhow!("claude's image grants more than names"))?;
+            assert_eq!(launch.egress, kiln_seams::sandbox::Egress::Only(granted), "its image's own grants, each by name, narrowed no further");
             assert!(!s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains("isn't narrowed"))), "no fallback to say");
             let info = serde_json::to_value(s.info())?;
             assert_eq!(info.pointer("/runs/in"), Some(&serde_json::json!("microvm")));
@@ -5148,13 +5150,12 @@ while True:
             let resumed = again.get(1).ok_or_else(|| anyhow::anyhow!("no second launch"))?;
             let conversation_id = conversation.clone().unwrap_or_default();
             assert!(resumed.args.windows(2).any(|w| w == ["--resume", conversation_id.as_str()]), "resumed through its launch's arguments: {:?}", resumed.args);
-            until_it("it back", 60, idle).await?;
-            // Where its conversation ran, kept beside its person's volume once its first run ended: kiln's
-            // Agentfile for Claude Code, at this kiln's text, and its image pinned.
+            // Where its conversation ran, kept beside its person's volume as its first run ended, before its
+            // second started: kiln's Agentfile for Claude Code, at this kiln's text, and its image pinned.
             let ran_in = crate::harness::isolated::home::ran_in_dir(&dir.path().join("homes"), "owner", "claude")?;
-            let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
             let kept = crate::harness::isolated::home::RanIn { conversation: conversation_id.clone(), agentfile: "harness-claude".into(), digest: crate::util::sha256_hex(claude.text.as_bytes()), image: pinned.clone() };
-            until_it("where its conversation ran, kept", 60, || crate::harness::isolated::home::ran_in(&ran_in, &conversation_id).as_ref() == Some(&kept)).await?;
+            assert_eq!(crate::harness::isolated::home::ran_in(&ran_in, &conversation_id), Some(kept), "kept as its run ended");
+            until_it("it back", 60, idle).await?;
             // kiln's record: two starts, each in a microVM of its own, none on the host, the first ended.
             let starts = s.info().starts;
             assert_eq!(starts.len(), 2, "{starts:?}");

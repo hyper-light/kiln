@@ -39,6 +39,13 @@ slowest answer seen."
   subagents, pause, freeze, `room_wait`, admission credit, harness session and mode. In the timeline, a
   new event, growing words, or a tool's status count. `last_activity` doesn't count, since kiln moves it
   on every state it is sent, the same one again included.
+- A message kiln holds in its custody is held, not quiet (`Verdict::Held`). R03: a host's hold is said as
+  held, and the wait goes on. As its window runs out, the wait reads the session's state: where the
+  message's delivery is `queued` (or it waits in kiln's queue), the wait says so with what kiln says
+  holds it (its admission, room, pause, freeze), and the window starts again. ROOT's runs of 2026-11-13
+  found cursor's, gemini's and goose's resumed prompts held so: idle, queued 1, admission
+  `{learning: bootstrap, target 2, admitted 1, depth 2}`, delivery `queued`. A message kiln neither
+  delivers nor holds for a whole window is refused (`Stall::Quiet`).
 - A turn the drive asked to be long (the steered turn, `Asked::Steered`) waits as a first one does: no
   earlier answer bounds a turn asked to take longer. Bound by the slowest answer, the stand-in's steered
   turn would be refused, since it is silent for `POLL * 8` between lines by the drive's own ask. That
