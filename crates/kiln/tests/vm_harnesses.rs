@@ -13,6 +13,9 @@
 //! - `step34`: the same drive with each harness in a microVM of its own. It skips, in the runner's own
 //!   words, until the runner says it starts microVMs (kiln plan steps 16 and 17); `VM_E2E=1` makes
 //!   that a failure. ROOT runs it on each host OS: `tests/vm_e2e/README.md`.
+//! - `step35` (`vm_e2e/step35.rs`, `vm_e2e/mcp.rs`): every harness of steps 19 to 28 on the same drive,
+//!   through kiln's REST API and its MCP tools, from kiln's Agentfile and from a person's own, each gap
+//!   in `vm_e2e/gaps.json` with its cited reason (kiln plan step 35).
 //!
 //! No real harness and no model runs here unless ROOT points these at one (`VM_E2E_*`).
 //!
@@ -20,6 +23,8 @@
 
 mod common;
 mod vm_e2e;
+#[path = "vm_e2e/step35.rs"]
+mod step35;
 
 // =================================================================================================
 // The checks, against samples. Each guard has its red beside its green; the comment names the

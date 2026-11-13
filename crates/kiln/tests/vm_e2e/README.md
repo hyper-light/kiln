@@ -203,3 +203,88 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    looks see the harness itself, a process of the whole session, and the kernel line is the harness's
    own shell's word on where it ran. kiln's own record of what it started for a session would close
    this.
+
+## Step 35: every harness through kiln's UI and API (its agent's)
+
+Step 35 runs all ten harnesses (steps 19 to 28: `claude`, `codex`, `gemini`, `opencode`, `goose`,
+`amp`, `devin`, `antigravity`, `cursor`, `pi`) on step 34's drive, each in a microVM of its own from
+kiln's Agentfile (`harness-<kind>`) and from a person's own (`agentfile:<id>`), through kiln's REST
+API, its MCP tools and its UI. Each works as on the host, or its gap is in `gaps.json` with its cited
+reason (plan 01a1d2c16eb074f19cf7ae7f1025c0be, steps 2 and 7).
+
+| Path | What |
+|---|---|
+| `vm_e2e/step35.rs` | `step35::checks` (gaps.json held to kiln's code and its sources, the cite rule, the vendor-CLI rule), `step35::host` (the eight harnesses step 34 doesn't drive, through kiln on the host, the stand-in behind each name), `step35::rest` (the ten in microVMs through REST: start, steer, interrupt, stop, resume, kiln's MCP from inside, an agent started there) |
+| `vm_e2e/mcp.rs` | `step35::mcp`: the ten in microVMs through kiln's MCP tools: `agents_start` naming the Agentfile, `agents_send` steering, `agents_interrupt`, `agents_stop`, `agents_start` with `resume` |
+| `vm_e2e/gaps.json` | each harness's flags (`linux_build`, `mcp`, `mcp_in_microvm`, `resume`, `ui_pick_up`), each gap with why and its cites, caveats, and the sources its reason rests on; kiln's code cited by the text it holds (`path#text`), recorded evidence by its line |
+| `ui/e2e/vm-harnesses.spec.ts` | against the mock: kiln's ten Agentfiles listed read-only, Claude Code and Codex started in a microVM from kiln's (step 34's), Codex from a person's own; against ROOT's server: each harness from kiln's Agentfile and a person's own, started, steered, its turn stopped, ended, and picked up again from the composer where `ui_pick_up` holds |
+
+A vendor's own CLI takes ROOT's task alone: from kiln's Agentfile, and from a person's own made from
+kiln's text, a drive skips unless all five task words are given (`VM_E2E=1`: fails). An image of the
+stand-in that ROOT names (`VM_E2E_IMAGE_<KIND>`) takes the stand-in's words.
+
+### What runs anywhere, now (light: no VM, no vendor)
+
+```sh
+cargo test -p kiln --test vm_harnesses step35::checks::   # any OS, Windows included
+cargo test -p kiln --test vm_harnesses step35::host::     # Linux, macOS (python3): the eight through kiln on the host
+cd ui && npm run build && npx playwright test e2e/vm-harnesses.spec.ts                 # the mock: Chromium, desktop and phone
+cd ui && E2E_WEBKIT=1 npx playwright test e2e/vm-harnesses.spec.ts                      # and WebKit (`npx playwright install webkit` once)
+```
+
+`step35::rest::` and `step35::mcp::` skip, in the runner's own words, until the runner a test starts
+says it starts microVMs (`facts.virt.microvm`); `VM_E2E=1` makes that a failure.
+
+### The microVM runs (ROOT)
+
+Step 34's variables (above), and:
+
+| Variable | What |
+|---|---|
+| `VM_E2E_KINDS` | the harnesses to drive, comma-separated (`claude,codex`); unset: all ten |
+| `VM_E2E_OWN_<KIND>` | a file holding the text of a person's own Agentfile for the harness (`VM_E2E_OWN_GEMINI=gemini.Agentfile`), kept through `POST /api/agentfiles` and started as `agentfile:<id>`; unset: kiln's own text kept as the person's (the vendor's CLI, so it takes ROOT's task); with `VM_E2E_IMAGE_<KIND>` (a stand-in run) and no text named, the person's own is skipped, saying so |
+| `E2E_BASE_URL`, `E2E_TOKEN`, `E2E_VM_MACHINE` | the UI spec against ROOT's server: its URL, its admin token (from a file), and the name of its runner that starts microVMs as the composer's machine picker shows it |
+
+They wait on (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be): step 1 (`agents_start`'s `image` and
+`resume`, on kiln main), step 3 (kiln's MCP from inside a microVM, over the agent-control link's
+`mcp` lane, Shards D254: goals 58's and 61's, read as step 34's drive reads it, by `mcp_round_trip`
+and `VM_E2E_LINKS`' `mcp` entry), step 4 (Antigravity's MCP over that lane, or its gap), step 5 (a microVM conversation picked up again in one
+from the UI), and step 34's own (kiln plan steps 16, 17, 18 and 33 and the links' owners).
+
+#### Linux x86_64 (KVM: adacachy, or adacachy2 through kiln run)
+
+With step 34's exports (`VM_E2E`, `VM_E2E_LINKS`, ROOT's server, the five task words, `VM_E2E_PROJECT`):
+
+```sh
+nice -n 10 cargo test -p kiln --test vm_harnesses step35::rest:: -- --nocapture --test-threads 1
+nice -n 10 cargo test -p kiln --test vm_harnesses step35::mcp:: -- --nocapture --test-threads 1
+```
+
+The stand-in first, with no vendor's turn, once kiln builds it as a microVM image (step 34's
+"Without a vendor's turn"): each harness's `VM_E2E_IMAGE_<KIND>` as that section says, and
+`VM_E2E_OWN_<KIND>` naming a file of the stand-in's Agentfile text for a person's own, none of the
+five task words.
+
+#### macOS arm64 (Hypervisor.framework: adalundhe-macbook-pro or adas-mac-studio.local, through kiln run)
+
+The same commands, as step 34's.
+
+#### Windows x86_64 (WHP: jupiter, through kiln run)
+
+```powershell
+cargo test -p kiln --test vm_harnesses step35::rest:: -- --nocapture --test-threads 1
+cargo test -p kiln --test vm_harnesses step35::mcp:: -- --nocapture --test-threads 1
+```
+
+With step 34's `$env:` lines first. `step35::host::` is Unix's.
+
+#### The UI, against ROOT's server (desktop, once per harness)
+
+```sh
+cd ui && E2E_BASE_URL=https://<ROOT's kiln> E2E_TOKEN="$(cat <admin token file>)" E2E_VM_MACHINE=<runner name> \
+  VM_E2E_PROMPT="$(cat prompt.txt)" VM_E2E_RESUMED_PROMPT="$(cat resumed.txt)" VM_E2E_STEERED_PROMPT="$(cat steered.txt)" \
+  VM_E2E_STOPPED_PROMPT="$(cat stopped.txt)" VM_E2E_DONE_MARKER=E2E-DONE \
+  npx playwright test e2e/vm-harnesses.spec.ts --project desktop
+```
+
+A harness whose `ui_pick_up` is false says its gap (a test annotation) in place of the pick-up.
