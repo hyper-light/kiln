@@ -425,6 +425,61 @@ fn the_image_cases_hold_through_a_nodes_socket() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// Joint plan step 17's remote callers, AC-T7.4.1 (docs/design/shards-image-class.md §8): a member of a Shards image
+/// VM that its caller drives is handed over through a node's socket as it is in process (`Runtime::member`): the
+/// caller's ends of its stdin, stdout and stderr, and its end. Do: through a socket the simulator serves, create and
+/// start a VM whose spec names a member its caller drives, take that member, write to its stdin and close it, and
+/// read its stdout to its end; then take it again. Expect: its stdout the bytes written, its end Code(0), waited for
+/// as it comes; the second take refused Invalid, as in process.
+#[test]
+fn a_member_is_handed_over_through_a_nodes_socket() {
+    use std::io::{Read as _, Write as _};
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("node.sock");
+    let node = Arc::new(SimRuntime::new());
+    let _server = crate::serve::Server::bind(&socket, node, socket_limits(), 2).unwrap();
+    let client = hex_client::Client::connect(&socket).unwrap();
+    let claude = hex_api::Member {
+        kind: hex_api::MemberKind::Harness,
+        name: "claude".to_owned(),
+    };
+    let id = client
+        .create(BoxSpec {
+            id: BoxId::new("member-over-the-wire").unwrap(),
+            bounds: Bounds::default(),
+            class: ClassSpec::ShardsImage(Box::new(hex_api::ShardsImage {
+                members: vec![hex_api::ImageMember::new(claude.clone())],
+                ..hex_api::ShardsImage::new(hex_api::sim::SIM_IMAGE)
+            })),
+            owner: None,
+            allocation: Some(hex_api::sim::sim_vm_allocation().unwrap()),
+            route: None,
+            devices: Vec::new(),
+            band: 0,
+        })
+        .unwrap()
+        .id;
+    client.start(&id).unwrap();
+    let mut member = client.member(&id, &claude).unwrap();
+    let given = member.streams().unwrap();
+    let mut stdin = hex_api::OwnedStream::from(given.stdin.unwrap());
+    let mut stdout = hex_api::OwnedStream::from(given.stdout.unwrap());
+    stdin.write_all(b"a session's line\n").unwrap();
+    drop(stdin);
+    let mut echoed = String::new();
+    stdout.read_to_string(&mut echoed).unwrap();
+    assert_eq!(echoed, "a session's line\n");
+    assert_eq!(
+        member.wait_for(std::time::Duration::MAX).unwrap(),
+        Some(hex_api::Exit::Code(0))
+    );
+    assert!(matches!(
+        client.member(&id, &claude),
+        Err(Refusal::Invalid { what: "member", .. })
+    ));
+    client.delete(&id).unwrap();
+}
+
 /// Joint plan step 12, AC-T7.4.1 (docs/design/shards-image-class.md §8): a macOS or Windows node holds a Shards image
 /// VM in its guest runtime, beside its host runtime, and the VM's guest runs no node of Hex's. Do forward a start, an
 /// inspect, a usage, a signal and an exec of an image VM's spec through the node's runtime. Expect: each back to run

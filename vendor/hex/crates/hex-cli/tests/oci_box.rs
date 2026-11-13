@@ -2399,6 +2399,25 @@ fn create_seeds_share_the_nodes_one_pruned_namespace(lab: &Lab, own: &Path) {
             .map(|t| t.lines().count())
             .ok()
     };
+    let own_space = std::fs::metadata("/proc/self/ns/mnt").unwrap().ino();
+    // The pool starts seeds ahead of the creates on a thread of its own, and a seed joins the pruned namespace at
+    // its start, before it reads its first request (`seed::join_pruned`): one found between its spawn and its
+    // `setns` is still in this process's namespace. Each seed found is read once it has left this namespace or
+    // ended, waiting on that fact alone (R03), not on a timer; a seed that never joins holds the test here.
+    let joined = |seeds: Vec<u32>| -> Vec<u32> {
+        seeds
+            .into_iter()
+            .filter(|&pid| {
+                loop {
+                    match namespace(pid) {
+                        Some(space) if space == own_space => std::thread::yield_now(),
+                        Some(_) => break true,
+                        None => break false,
+                    }
+                }
+            })
+            .collect()
+    };
     let create = |id: &BoxId| {
         let dir = tempfile::Builder::new()
             .prefix("bundle-")
@@ -2425,7 +2444,7 @@ fn create_seeds_share_the_nodes_one_pruned_namespace(lab: &Lab, own: &Path) {
     let first = BoxId::new("seedns-first").unwrap();
     // The first create is answered by a live seed, so one is up to read the namespace of before the rest.
     create(&first);
-    let before = create_seeds()
+    let before = joined(create_seeds())
         .into_iter()
         .find_map(mounts)
         .expect("a create seed's mount table after the first create");
@@ -2446,7 +2465,7 @@ fn create_seeds_share_the_nodes_one_pruned_namespace(lab: &Lab, own: &Path) {
         });
         ids.extend(pair);
     }
-    let seeds = create_seeds();
+    let seeds = joined(create_seeds());
     let spaces: BTreeSet<u64> = seeds.iter().filter_map(|&p| namespace(p)).collect();
     let tables: BTreeSet<usize> = seeds.iter().filter_map(|&p| mounts(p)).collect();
     for id in &ids {
@@ -2461,7 +2480,6 @@ fn create_seeds_share_the_nodes_one_pruned_namespace(lab: &Lab, own: &Path) {
         1,
         "every create seed in one mount namespace: {spaces:?}"
     );
-    let own_space = std::fs::metadata("/proc/self/ns/mnt").unwrap().ino();
     assert!(
         !spaces.contains(&own_space),
         "the seeds' namespace is pruned, not the node's own"

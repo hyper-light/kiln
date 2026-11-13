@@ -631,21 +631,27 @@ fn no_priors(priors: &[Option<Prior>; Class::COUNT]) -> bool {
 }
 
 /// A class's learned booking on a node (joint plan step 14, `docs/design/learned-charge.md` C2): for VMs of the cost
-/// profile `profile`, what a new one is booked at, at most its allocation.
+/// profile `profile` and allocation `ceiling`, a class, what a new one is booked at, at most its allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Prior {
     pub profile: [u8; 32],
     pub booking: hex_api::CapacityResources,
+    /// The class's allocation, appended: a prior recorded before it reads as none's, booking no receipt.
+    #[serde(default)]
+    pub ceiling: hex_api::CapacityResources,
 }
 
-/// A receipt `allocation` booked at `prior` where it names the same cost profile (C2); as it was otherwise.
+/// A receipt `allocation` booked at `prior` where it is of the prior's class, its cost profile and its allocation
+/// (C2); as it was otherwise, so a VM of a size none has warmed for is booked whole.
 pub fn booked_at(
     allocation: Option<hex_api::Allocation>,
     prior: Option<Prior>,
 ) -> Option<hex_api::Allocation> {
     match (allocation, prior) {
-        (Some(allocation), Some(prior)) if allocation.cost.id == prior.profile => {
+        (Some(allocation), Some(prior))
+            if allocation.cost.id == prior.profile && allocation.resources == prior.ceiling =>
+        {
             Some(allocation.booked_at(prior.booking))
         }
         _ => allocation,

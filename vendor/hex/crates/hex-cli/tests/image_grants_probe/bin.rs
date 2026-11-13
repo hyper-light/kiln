@@ -11,18 +11,28 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let started = match probe::start(&args) {
+    let started = match probe::Told::read(&args).and_then(|told| Ok((probe::start(&told)?, told)))
+    {
         Ok(started) => started,
         Err(why) => {
             let _ = writeln!(std::io::stderr(), "grants probe: {why}");
             return ExitCode::FAILURE;
         }
     };
+    let (started, told) = started;
     let _ = writeln!(
         std::io::stderr(),
         "grants probe: listening at {:?}",
         started.at
     );
+    // Each line on its stdin is answered too, until its stdin ends: at once where it is the null device.
+    if let Err(why) = probe::answer(
+        std::io::stdin().lock(),
+        std::io::stdout().lock(),
+        &told.targets,
+    ) {
+        let _ = writeln!(std::io::stderr(), "grants probe: answering its stdin: {why}");
+    }
     for server in started.servers {
         let _ = server.join();
     }

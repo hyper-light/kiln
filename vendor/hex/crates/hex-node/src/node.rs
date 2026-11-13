@@ -2043,6 +2043,55 @@ impl Runtime for Node {
         })
     }
 
+    fn room(&self, id: &BoxId, room: Option<i64>) -> Result<Option<u64>, Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.room(id, room);
+        }
+        if self.cgroup(id).is_none() {
+            return Err(Refusal::NoSuchBox(id.clone()));
+        }
+        Err(Refusal::Invalid {
+            what: "room",
+            why: format!(
+                "box {id} isn't a Shards image box: only its guest holds itself within a room"
+            ),
+        })
+    }
+
+    fn rate(
+        &self,
+        id: &BoxId,
+        rate: Option<std::num::NonZeroU64>,
+    ) -> Result<Option<std::num::NonZeroU64>, Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.rate(id, rate);
+        }
+        if self.cgroup(id).is_none() {
+            return Err(Refusal::NoSuchBox(id.clone()));
+        }
+        Err(Refusal::Invalid {
+            what: "rate",
+            why: format!(
+                "box {id} isn't a Shards image box: only its VM holds its vCPUs to a rate"
+            ),
+        })
+    }
+
+    fn host_use(&self, id: &BoxId) -> Result<hex_api::HostUse, Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.host_use(id);
+        }
+        if self.cgroup(id).is_none() {
+            return Err(Refusal::NoSuchBox(id.clone()));
+        }
+        Err(Refusal::Invalid {
+            what: "host_use",
+            why: format!(
+                "box {id} runs no VM process of its own: only a Shards image VM's run host reads its cost"
+            ),
+        })
+    }
+
     fn usage(&self, id: &BoxId) -> Result<Usage, Refusal> {
         if let Some(backend) = self.backend_record(id)? {
             return backend.usage(id);

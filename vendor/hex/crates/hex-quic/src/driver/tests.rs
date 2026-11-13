@@ -35,8 +35,8 @@ fn identify(names: &mut Names, certificate: &[u8], dialed: Option<PeerId>) -> Op
 /// identify a connection kiln-a opened, one mallory (enrolled too) opened, this side's dial of mallory, and a dial of
 /// mallory that kiln-a answered. Expect, where it names kiln-a alone: kiln-a named, mallory's own connection named no
 /// peer (hyper-transport refuses it Identity, charged to no identity), the dial of mallory named mallory (a dial names
-/// its peer itself, Q5), and the dial answered by another refused; where it admits every enrolled peer, mallory's
-/// connection named too.
+/// its peer itself, Q5), and the dial answered by another refused, a name kept for the driver's links report only for
+/// a handshake admitted (Q12); where it admits every enrolled peer, mallory's connection named too.
 #[test]
 fn an_endpoint_that_names_its_peers_admits_their_connections_alone() {
     let ca = SimCa::new().unwrap();
@@ -45,9 +45,14 @@ fn an_endpoint_that_names_its_peers_admits_their_connections_alone() {
     let mut named = Names {
         dialing: BTreeMap::new(),
         admits: Admits::Named([KILN.to_owned()].into()),
+        identified: BTreeMap::new(),
     };
     assert_eq!(identify(&mut named, &kiln, None), Some(peer_id(KILN)));
     assert_eq!(identify(&mut named, &mallory, None), None);
+    assert_eq!(
+        named.identified,
+        BTreeMap::from([(peer_id(KILN), KILN.to_owned())])
+    );
     assert_eq!(
         identify(&mut named, &mallory, Some(peer_id(MALLORY))),
         Some(peer_id(MALLORY))
@@ -56,6 +61,7 @@ fn an_endpoint_that_names_its_peers_admits_their_connections_alone() {
     let mut enrolled = Names {
         dialing: BTreeMap::new(),
         admits: Admits::Enrolled,
+        identified: BTreeMap::new(),
     };
     assert_eq!(
         identify(&mut enrolled, &mallory, None),

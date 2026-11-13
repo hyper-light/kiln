@@ -47,12 +47,12 @@ use hex_api::{
     BoxId, BoxInfo, BoxOwner, BoxSpec, BoxState, Capacity, CapacityResources, Class, ClassSpec,
     ConnectFailure, ConnectPhase, ConnectReply, Destination, DeviceHolder, DeviceId, DeviceInfo,
     DeviceKind, DeviceUnavailable, Execution, Exit, GpuEligibility, Grant, GuestTime, ImageArch,
-    ImageMember, ImageOs, ImagePlatform, IoKind, IoRates, Learned, LearnedEnd, LearnedHolding,
-    LearnedPrior, LearnedUse, LifecycleCause, MAX_DEVICES, MAX_LEARNED_HOLDINGS,
-    MAX_LEARNED_PRIORS, MAX_RUNTIME_ROUTES, Member, MemberKind, Mount, Network, OciSpec,
-    PhysicalDevice, PhysicalReport, Ports, Program, Proto, Published, Receiver, Refusal, Rootfs,
-    RouteKey, RouteOffer, RouteReceipt, RuntimeCost, ShardsImage, Signal, Upstream, Usage, User,
-    check_grants, check_published,
+    ImageMember, ImageOs, ImagePlatform, IoKind, IoRates, Learned, LearnedCeiling, LearnedEnd,
+    LearnedHolding, LearnedOverhead, LearnedPrior, LearnedUse, LifecycleCause, MAX_DEVICES,
+    MAX_LEARNED_HOLDINGS, MAX_LEARNED_PRIORS, MAX_RUNTIME_ROUTES, Member, MemberKind, Mount,
+    Network, OciSpec, PhysicalDevice, PhysicalReport, Ports, Program, Proto, Published, Receiver,
+    Refusal, Rootfs, RouteKey, RouteOffer, RouteReceipt, RuntimeCost, ShardsImage, Signal,
+    Upstream, Usage, User, check_grants, check_published,
 };
 
 use crate::netns;
@@ -159,6 +159,9 @@ mod kind {
     pub const RELEASE_BACKING: u16 = 0x0015;
     pub const BACKING_OFFER: u16 = 0x800f;
     pub const BACKING_USAGE: u16 = 0x0016;
+    pub const MEMBER: u16 = 0x0017;
+    pub const LINKS: u16 = 0x0018;
+    pub const LINKS_ANSWER: u16 = 0x8010;
 }
 
 /// A message's header, once its wire identity is read as this side's.
@@ -244,6 +247,20 @@ pub enum Call {
     ReleaseBacking(BackingKey),
     /// Factual host counters from the same native backing owner, answered with Usage.
     BackingUsage(BackingKey),
+    /// Member `member` of running Shards image box `id` that its spec says its caller drives (`Runtime::member`;
+    /// joint plan step 17): the streams `streams` names travel with it as an exec's do, each joined to the member's
+    /// own, and those `ask` names the node gives as an exec's asked streams, the member's own ends ([`Answer::Given`]).
+    /// Answered as an exec is, [`Answer::Started`] (no pid: the member is its guest's) or [`Answer::Given`], and later
+    /// [`Answer::Exited`] with its end. A stream both carried and asked for is refused.
+    Member {
+        id: BoxId,
+        member: Member,
+        streams: Streams,
+        ask: Streams,
+    },
+    /// The node's links over QUIC (docs/design/hex-quic.md Q12): answered [`Answer::Links`], refused by type where the
+    /// node serves no QUIC listener.
+    Links,
 }
 
 /// Which of a program's standard streams travel with its exec, in this order; the rest are the null
@@ -324,6 +341,24 @@ pub enum Answer {
     Capacity(Option<Capacity>),
     PhysicalReport(PhysicalReport),
     BackingOffer(BackingOffer),
+    /// links': each peer connected to the node's QUIC endpoint, in as many messages as they need ([`links`]), all
+    /// with the call's id, each but the last with `more`.
+    Links {
+        links: Vec<Link>,
+        more: bool,
+    },
+}
+
+/// A peer's connection to the node over QUIC, as the node's own TLS negotiated it (docs/design/hex-quic.md Q12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    /// The name the peer's certificate carries, which kiln's CA bound at its enrollment.
+    pub peer: String,
+    /// The TLS 1.3 cipher suite, its value in IANA's TLS Cipher Suites registry (RFC 8446 §B.4).
+    pub suite: u16,
+    /// The key exchange group, its value in IANA's TLS Supported Groups registry (RFC 8446 §4.2.7), where the
+    /// handshake named one.
+    pub group: Option<u16>,
 }
 
 /// A Shards guest's identity and the names of an exec's caller-owned streams (HEX-RT-17).
@@ -648,6 +683,11 @@ pub fn answer(id: u64, answer: &Answer, bound: usize) -> Result<Vec<u8>, Fault> 
                 })?;
             }
         }
+        Answer::Links { links, more } => {
+            w.header(kind::LINKS_ANSWER, id);
+            w.bool(*more);
+            w.list(links, put_link)?;
+        }
     }
     w.done()
 }
@@ -685,27 +725,51 @@ fn snapshot(
 /// message but the last marked `more`, so a node holding more boxes than one message carries still
 /// answers a list whole. An empty list is one message.
 pub fn boxes(id: u64, infos: &[BoxInfo], bound: usize) -> Result<Vec<Vec<u8>>, Fault> {
-    // A message's bytes before its boxes: the header, `more` and the list's count.
+    parts(id, infos, bound, put_info, |infos, more| Answer::Boxes {
+        infos,
+        more,
+    })
+}
+
+/// A links answer as messages of at most `bound` bytes each, split as [`boxes`] splits a list: a node's connections
+/// bound admits more peers than one message names.
+pub fn links(id: u64, links: &[Link], bound: usize) -> Result<Vec<Vec<u8>>, Fault> {
+    parts(id, links, bound, put_link, |links, more| Answer::Links {
+        links,
+        more,
+    })
+}
+
+/// `items` as `whole`'s answers of at most `bound` bytes each: as many in each as fit, every one but the last marked
+/// `more`; none is one answer.
+fn parts<T: Clone>(
+    id: u64,
+    items: &[T],
+    bound: usize,
+    put: fn(&mut Writer, &T) -> Result<(), Fault>,
+    whole: fn(Vec<T>, bool) -> Answer,
+) -> Result<Vec<Vec<u8>>, Fault> {
+    // A message's bytes before its items: the header, `more` and the list's count.
     const OVERHEAD: usize = HEADER_BYTES + 1 + 4;
     let room = bound.checked_sub(OVERHEAD).ok_or(Fault::Oversized {
         bytes: OVERHEAD,
         bound,
     })?;
-    let mut parts: Vec<Vec<BoxInfo>> = vec![Vec::new()];
+    let mut parts: Vec<Vec<T>> = vec![Vec::new()];
     let mut used = 0usize;
-    for info in infos {
+    for item in items {
         let mut w = Writer::new(room);
-        put_info(&mut w, info)?;
+        put(&mut w, item)?;
         let size = w.done()?.len();
         let fits = used.checked_add(size).filter(|u| *u <= room);
         match (fits, parts.last_mut()) {
             (Some(u), Some(part)) => {
                 used = u;
-                part.push(info.clone());
+                part.push(item.clone());
             }
             _ => {
                 used = size;
-                parts.push(vec![info.clone()]);
+                parts.push(vec![item.clone()]);
             }
         }
     }
@@ -713,16 +777,7 @@ pub fn boxes(id: u64, infos: &[BoxInfo], bound: usize) -> Result<Vec<Vec<u8>>, F
     parts
         .into_iter()
         .enumerate()
-        .map(|(n, infos)| {
-            answer(
-                id,
-                &Answer::Boxes {
-                    infos,
-                    more: n < last,
-                },
-                bound,
-            )
-        })
+        .map(|(n, items)| answer(id, &whole(items, n < last), bound))
         .collect()
 }
 
@@ -787,6 +842,18 @@ fn parse_request(
             Request::Call(Call::ReleaseBacking(backing_key(&mut r).map_err(bad)?))
         }
         kind::BACKING_USAGE => Request::Call(Call::BackingUsage(backing_key(&mut r).map_err(bad)?)),
+        kind::MEMBER => {
+            let id = box_id(&mut r).map_err(bad)?;
+            let member = member(&mut r).map_err(bad)?;
+            let streams = r.u8().and_then(Streams::of).map_err(bad)?;
+            let ask = r.u8().and_then(Streams::of).map_err(bad)?;
+            Request::Call(Call::Member {
+                id,
+                member,
+                streams,
+                ask,
+            })
+        }
         kind::CREATE => Request::Call(Call::Create(Box::new(box_spec(&mut r).map_err(bad)?))),
         kind::START => Request::Call(Call::Start(box_id(&mut r).map_err(bad)?)),
         kind::EXEC => {
@@ -811,6 +878,7 @@ fn parse_request(
         kind::LIST => Request::Call(Call::List),
         kind::DELETE => Request::Call(Call::Delete(box_id(&mut r).map_err(bad)?)),
         kind::NETNS => Request::Call(Call::Netns),
+        kind::LINKS => Request::Call(Call::Links),
         kind::KILL => Request::Call(Call::Kill {
             exec: r.u64().map_err(bad)?,
         }),
@@ -849,7 +917,8 @@ fn parse_request(
         Request::Call(
             Call::Exec { streams, .. }
             | Call::ExecStreams { streams, .. }
-            | Call::Run { streams, .. },
+            | Call::Run { streams, .. }
+            | Call::Member { streams, .. },
         ) if carried => streams.count(),
         _ => 0,
     };
@@ -1022,6 +1091,10 @@ pub fn read_answer(msg: &Received<'_>, bound: usize) -> Result<(Header, Answer),
             };
             Answer::Netns(counts)
         }
+        kind::LINKS_ANSWER => Answer::Links {
+            more: r.bool("more")?,
+            links: r.list(link)?,
+        },
         kind::GIVEN => {
             let pid = r.u32()?;
             let given = r.u8().and_then(Streams::of)?;
@@ -1112,6 +1185,8 @@ fn request_name(kind: u16) -> &'static str {
         kind::INITIALIZE_BACKING => "an initialize backing",
         kind::RELEASE_BACKING => "a release backing",
         kind::BACKING_USAGE => "a backing usage",
+        kind::MEMBER => "a member",
+        kind::LINKS => "a links",
         _ => "a request",
     }
 }
@@ -1129,6 +1204,19 @@ fn put_call(w: &mut Writer, id: u64, call: &Call) -> Result<(), Fault> {
         Call::BackingUsage(key) => {
             w.header(kind::BACKING_USAGE, id);
             put_backing_key(w, *key)
+        }
+        Call::Member {
+            id: b,
+            member,
+            streams,
+            ask,
+        } => {
+            w.header(kind::MEMBER, id);
+            w.string(b.as_str())?;
+            put_member(w, member)?;
+            w.u8(streams.bits());
+            w.u8(ask.bits());
+            Ok(())
         }
         Call::PhysicalReport => {
             w.header(kind::PHYSICAL_REPORT, id);
@@ -1191,6 +1279,10 @@ fn put_call(w: &mut Writer, id: u64, call: &Call) -> Result<(), Fault> {
         }
         Call::Netns => {
             w.header(kind::NETNS, id);
+            Ok(())
+        }
+        Call::Links => {
+            w.header(kind::LINKS, id);
             Ok(())
         }
         Call::Kill { exec } => {
@@ -1645,6 +1737,11 @@ const LEARNED_END_BYTES: usize = 5 * size_of::<u64>() + 1 + 2;
 /// One learned end at its least: a one-byte box id with its length, then the rest with no unmoved capability.
 const LEARNED_END_MIN_BYTES: usize = size_of::<u32>() + 1 + LEARNED_END_BYTES - 1;
 
+/// One learned ceiling at its least (C1): its profile's id, its envelope, and each dimension of its overhead none.
+const LEARNED_CEILING_MIN_BYTES: usize = 32 + RESOURCE_BYTES + 3;
+/// One learned ceiling at its most: each dimension of its overhead learned.
+const LEARNED_CEILING_BYTES: usize = 32 + RESOURCE_BYTES + 3 * (1 + size_of::<u64>());
+
 /// Joint plan step 14 (C8): keeps as many of `capacity`'s learned holdings, in their order, as its answer has room
 /// for within [`MAX_MESSAGE`], so a node's capacity answer is never refused for them. The node orders them most past
 /// their receipts first, and a holding left out counts at its receipt: only those least past theirs are dropped.
@@ -1726,6 +1823,18 @@ fn put_learned(w: &mut Writer, learned: &Learned) -> Result<(), Fault> {
     for end in &learned.ended {
         put_learned_end(w, end)?;
     }
+    // Last (C1): each profile's ceiling, its envelope and the overhead learned past it, a dimension none while cold.
+    w.reserve_fixed(size_of::<u32>())?;
+    w.device_count(learned.ceilings.len(), LEARNED_CEILING_MIN_BYTES)?;
+    for ceiling in &learned.ceilings {
+        w.reserve_fixed(LEARNED_CEILING_BYTES)?;
+        w.raw(&ceiling.profile);
+        put_resources(w, ceiling.envelope);
+        let overhead = ceiling.overhead;
+        for dim in [overhead.cpu_milli, overhead.mem_bytes, overhead.disk_bytes] {
+            w.option(dim, Writer::u64);
+        }
+    }
     Ok(())
 }
 
@@ -1790,11 +1899,28 @@ fn learned(r: &mut Reader<'_>) -> Result<Learned, Fault> {
         "learned ends",
         learned_end,
     )?;
+    let ceilings = r.bounded_list(
+        LEARNED_CEILING_MIN_BYTES,
+        MAX_LEARNED_PRIORS,
+        "learned ceilings",
+        |r| {
+            Ok(LearnedCeiling {
+                profile: r.array::<32>()?,
+                envelope: resources(r)?,
+                overhead: LearnedOverhead {
+                    cpu_milli: r.option(Reader::u64)?,
+                    mem_bytes: r.option(Reader::u64)?,
+                    disk_bytes: r.option(Reader::u64)?,
+                },
+            })
+        },
+    )?;
     Ok(Learned {
         priors,
         used,
         holdings,
         ended,
+        ceilings,
     })
 }
 
@@ -2464,6 +2590,21 @@ fn class(r: &mut Reader<'_>) -> Result<Class, Fault> {
         3 => Ok(Class::Shards),
         t => Err(Fault::value("class", format!("variant {t}"))),
     }
+}
+
+fn put_link(w: &mut Writer, link: &Link) -> Result<(), Fault> {
+    w.string(&link.peer)?;
+    w.u16(link.suite);
+    w.option(link.group, Writer::u16);
+    Ok(())
+}
+
+fn link(r: &mut Reader<'_>) -> Result<Link, Fault> {
+    Ok(Link {
+        peer: r.string("a link's peer")?,
+        suite: r.u16()?,
+        group: r.option(Reader::u16)?,
+    })
 }
 
 fn put_info(w: &mut Writer, info: &BoxInfo) -> Result<(), Fault> {
@@ -3410,7 +3551,7 @@ impl<'a> Reader<'a> {
                     "count exceeds the u16 device index address space"
                 } else if what == "physical report.unavailable" {
                     "count exceeds the supported VM backend classes"
-                } else if what == "learned priors" {
+                } else if what == "learned priors" || what == "learned ceilings" {
                     "count exceeds a class's profiles"
                 } else if what == "learned holdings" || what == "learned ends" {
                     "count exceeds a node's boxes"

@@ -81,8 +81,19 @@ pub(crate) fn move_vm(parsed: &Parsed, home: &Path, ask: &Ask<'_>) -> ExitCode {
         return failed("shards: move vm: a microVM and a context");
     };
     match moved(home, name, to, parsed.bool("live"), ask) {
-        Ok(()) => {
+        Ok(keys) => {
             let _ = writeln!(io::stdout(), "{name}");
+            // Its run's own key there and the one it replaced (D176 part 6, D238): for its
+            // controller to pin anew and its leases' broker to reissue them (step 33).
+            if keys.key.is_some() || keys.replaces.is_some() {
+                let answer = serde_json::json!({
+                    "name": name,
+                    "context": to,
+                    "key": keys.key,
+                    "replaces": keys.replaces,
+                });
+                let _ = writeln!(io::stdout(), "{answer}");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => failed(&format!("shards: {e}")),
@@ -138,7 +149,7 @@ pub(crate) fn cpu(args: &[std::ffi::OsString]) -> ExitCode {
             _ => Ok(()),
         },
         ["configure", "--baseline", contexts] => baseline_of(&home, contexts).and_then(|regs| {
-            let text = format!("{}\n{contexts}\n", shards_vmm::arch::aarch64::cpu::encode(&regs));
+            let text = format!("{}\n{contexts}\n", shards_vmm::arch::cpu::encode(&regs));
             std::fs::write(&at, text).map_err(|e| format!("{}: {e}", at.display()))
         }),
         _ => Err("usage: shards configure cpu --baseline CONTEXT[,CONTEXT...] | --none".into()),
@@ -151,13 +162,13 @@ pub(crate) fn cpu(args: &[std::ffi::OsString]) -> ExitCode {
 
 /// The CPU this machine and every one `contexts` (comma-separated) reach share: each
 /// one's, as its daemon asks its hypervisor (`move step cpu`), met field by field.
-fn baseline_of(home: &Path, contexts: &str) -> Result<Vec<(u16, u64)>, String> {
+fn baseline_of(home: &Path, contexts: &str) -> Result<shards_vmm::arch::cpu::Id, String> {
     let step = || vec![shards_ipc::MOVE_STEP.to_string(), "cpu".to_string()];
-    let read = |what: &str, (status, out, err): There| -> Result<Vec<(u16, u64)>, String> {
+    let read = |what: &str, (status, out, err): There| -> Result<shards_vmm::arch::cpu::Id, String> {
         if status != 0 {
             return Err(format!("{what}: {}", String::from_utf8_lossy(&err).trim()));
         }
-        shards_vmm::arch::aarch64::cpu::decode(String::from_utf8_lossy(&out).trim())
+        shards_vmm::arch::cpu::decode(String::from_utf8_lossy(&out).trim())
     };
     let daemon = super::shardsd()?;
     let command = shards_ipc::Command {
@@ -197,7 +208,8 @@ fn baseline_of(home: &Path, contexts: &str) -> Result<Vec<(u16, u64)>, String> {
     if cpus.len() < 2 {
         return Err("a baseline names the contexts of the machines it is every one's of".into());
     }
-    Ok(shards_vmm::arch::aarch64::cpu::baseline(&cpus))
+    shards_vmm::arch::cpu::baseline(&cpus)
+        .map_err(|lacks| format!("these machines' CPUs have no baseline: {lacks}"))
 }
 
 fn failed(said: &str) -> ExitCode {
@@ -214,6 +226,16 @@ fn said(step: &str, (_, _, err): &There) -> String {
         format!("{step} failed")
     } else {
         text.to_string()
+    }
+}
+
+/// Why the other machine's `ready` step does not take a move: its refusal, typed
+/// (daemon/moves.rs `Refused`), or, from a daemon of an earlier build or a step that failed,
+/// its words.
+fn unready(step: &str, answer: &There) -> String {
+    match serde_json::from_slice::<crate::daemon::Refused>(&answer.1) {
+        Ok(refused) => refused.to_string(),
+        Err(_) => said(step, answer),
     }
 }
 
@@ -292,7 +314,15 @@ fn sent_line(tally: Option<crate::packing::Tally>, seen: &Seen, took: std::time:
     )
 }
 
-fn moved(home: &Path, name: &str, to: &str, live: bool, ask: &Ask<'_>) -> Result<(), String> {
+/// A moved run's own key on the machine it landed on, and the one it had here, each a key's
+/// SHA-256 in lowercase hex (`move step key`).
+#[derive(Debug, Default, PartialEq, Eq, serde::Deserialize)]
+struct Keys {
+    key: Option<String>,
+    replaces: Option<String>,
+}
+
+fn moved(home: &Path, name: &str, to: &str, live: bool, ask: &Ask<'_>) -> Result<Keys, String> {
     let times = Times {
         on: std::env::var_os("SHARDS_MOVE_TIMES").is_some(),
         began: Instant::now(),
@@ -332,7 +362,7 @@ fn moved(home: &Path, name: &str, to: &str, live: bool, ask: &Ask<'_>) -> Result
     // 1. Saved here; or, moved live, its plan alone, as it runs on (D176 part 7).
     let saved = ask(step(&[mv, if live { "plan" } else { "save" }, name]), &[])?;
     if saved.0 != 0 {
-        return Err(said(if live { "its plan" } else { "its save" }, &saved));
+        return Err(unready(if live { "its plan" } else { "its save" }, &saved));
     }
     let plan_json = String::from_utf8(saved.1).map_err(|_| "its plan is not UTF-8".to_string())?;
     let plan_json = plan_json.trim().to_string();
@@ -361,7 +391,7 @@ fn moved(home: &Path, name: &str, to: &str, live: bool, ask: &Ask<'_>) -> Result
     let ready = |phase: &str| -> Result<Needs, String> {
         let answer = there(step(&[mv, "ready", &plan_json]), None)?;
         if answer.0 != 0 {
-            return Err(format!("{to} cannot take it: {}", said(phase, &answer)));
+            return Err(format!("{to} cannot take it: {}", unready(phase, &answer)));
         }
         serde_json::from_slice(&answer.1).map_err(|e| format!("{to}'s answer: {e}"))
     };
@@ -538,6 +568,12 @@ fn moved(home: &Path, name: &str, to: &str, live: bool, ask: &Ask<'_>) -> Result
         },
     }
     times.step("resumed there");
+    // Its run's key there, made after its restore, and the one it replaced: none from a
+    // daemon of an earlier build, which has no such step.
+    let keys = match there(step(&[mv, "key", name]), None) {
+        Ok((0, out, _)) => serde_json::from_slice::<Keys>(&out).unwrap_or_default(),
+        _ => Keys::default(),
+    };
     // How long it ran nowhere, as this machine's clock says: from its last save asked,
     // which held it here, to its restore there said done.
     if times.on
@@ -567,5 +603,39 @@ fn moved(home: &Path, name: &str, to: &str, live: bool, ask: &Ask<'_>) -> Result
         ));
     }
     times.step("removed here");
-    Ok(())
+    Ok(keys)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refusal the other machine answers typed is said from what it is; one of a daemon of
+    /// an earlier build, or a step that failed, in the step's own words.
+    #[test]
+    fn a_refusal_is_said_from_its_type_and_else_in_the_steps_words() {
+        let refused = crate::daemon::Refused::NameTaken { name: "web".into() };
+        let typed = (
+            1,
+            serde_json::to_vec(&refused).unwrap(),
+            b"shards: anything\n".to_vec(),
+        );
+        assert_eq!(
+            unready("its check", &typed),
+            "a microVM named web is here already"
+        );
+        let worded = (
+            1,
+            Vec::new(),
+            b"shards: a microVM named web is here already\n".to_vec(),
+        );
+        assert_eq!(
+            unready("its check", &worded),
+            "a microVM named web is here already"
+        );
+        assert_eq!(
+            unready("its check", &(1, Vec::new(), Vec::new())),
+            "its check failed"
+        );
+    }
 }
