@@ -242,9 +242,11 @@ impl Drop for SimLink {
 
 /// What a `Capacity` conformance suite runs against: a fresh machine per case, its room Hex's
 /// conformance room (`hex_api::capacity::conformance::ROOM`: 8 CPUs, 16 GiB of memory and of disk,
-/// a GPU), nothing held, its keeper serving two holders, `conformance-a` and `conformance-b`.
+/// a GPU), nothing held, its keeper serving two holders, `conformance-a` and `conformance-b`, and
+/// the keeper as each of them reaches it: a real link authenticates one holder alone (CV8, CV9), so
+/// each has its own.
 pub trait CapacityFixture: Send + Sync {
-    fn capacity(&self) -> Result<&dyn Capacity, Failure>;
+    fn capacity(&self, holder: &str) -> Result<&dyn Capacity, Failure>;
 }
 
 /// The fixture for a [`SimCapacity`]: its keeper serves the two holders, and as many reservations
@@ -259,7 +261,8 @@ impl Default for SimCapacityFixture {
 }
 
 impl CapacityFixture for SimCapacityFixture {
-    fn capacity(&self) -> Result<&dyn Capacity, Failure> {
+    /// The one keeper, which every holder's links reach alike.
+    fn capacity(&self, _holder: &str) -> Result<&dyn Capacity, Failure> {
         self.0.as_ref().map(|c| c as &dyn Capacity).map_err(|e| format!("the simulator didn't start: {e}"))
     }
 }
@@ -301,7 +304,7 @@ async fn synced(c: &dyn Capacity, name: &str, epoch: u64) -> Result<(Box<dyn Lin
 
 fn c1<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
-        let link = fine("link", f.capacity()?.link().await)?;
+        let link = fine("link", f.capacity(A)?.link().await)?;
         match ask(&*link, hello(A, 1)).await? {
             ToHolder::Welcome { fence, view } => {
                 same("its fence's holder epoch", fence.holder, 1)?;
@@ -315,7 +318,7 @@ fn c1<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 
 fn c2<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
-        let link = fine("link", f.capacity()?.link().await)?;
+        let link = fine("link", f.capacity(A)?.link().await)?;
         let fence = match ask(&*link, hello(A, 1)).await? {
             ToHolder::Welcome { fence, .. } => fence,
             other => return Err(format!("its hello: {other:?}")),
@@ -334,7 +337,7 @@ fn c2<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 
 fn c3<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
-        let c = f.capacity()?;
+        let c = f.capacity(A)?;
         let id = ReservationId { epoch: 1, seq: 0 };
         let (link, fence, _) = synced(c, A, 1).await?;
         match ask(&*link, ToKeeper::Reserve { fence, id, amount: cpus(2) }).await? {
@@ -359,9 +362,8 @@ fn c3<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 
 fn c4<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
-        let c = f.capacity()?;
-        let (a, a_fence, _) = synced(c, A, 1).await?;
-        let (b, _, _) = synced(c, B, 1).await?;
+        let (a, a_fence, _) = synced(f.capacity(A)?, A, 1).await?;
+        let (b, _, _) = synced(f.capacity(B)?, B, 1).await?;
         let id = ReservationId { epoch: 1, seq: 0 };
         match ask(&*b, ToKeeper::Reserve { fence: a_fence, id, amount: cpus(1) }).await? {
             ToHolder::Closed { why: Close::Session, .. } => {}
@@ -376,7 +378,7 @@ fn c4<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 
 fn c5<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
-        let (link, fence, view) = synced(f.capacity()?, A, 1).await?;
+        let (link, fence, view) = synced(f.capacity(A)?, A, 1).await?;
         let past = Amounts { cpu_milli: view.room.cpu_milli.saturating_add(1), ..Amounts::ZERO };
         match ask(&*link, ToKeeper::Reserve { fence, id: ReservationId { epoch: 1, seq: 0 }, amount: past }).await? {
             ToHolder::Refused { why: Why::Room, view, .. } => same("the refusal's view: its room", view.room, hex_api::capacity::conformance::ROOM)?,
@@ -391,9 +393,8 @@ fn c5<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 
 fn c6<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
-        let c = f.capacity()?;
-        let (a, _, _) = synced(c, A, 1).await?;
-        let (b, b_fence, _) = synced(c, B, 1).await?;
+        let (a, _, _) = synced(f.capacity(A)?, A, 1).await?;
+        let (b, b_fence, _) = synced(f.capacity(B)?, B, 1).await?;
         match ask(&*b, ToKeeper::Reserve { fence: b_fence, id: ReservationId { epoch: 1, seq: 0 }, amount: cpus(3) }).await? {
             ToHolder::Granted { .. } => {}
             other => return Err(format!("another holder's reserve: {other:?}")),
@@ -407,7 +408,7 @@ fn c6<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 
 fn c7<F: CapacityFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
-        let c = f.capacity()?;
+        let c = f.capacity(A)?;
         let newer = fine("link", c.link().await)?;
         match ask(&*newer, hello(A, 2)).await? {
             ToHolder::Welcome { .. } => {}
