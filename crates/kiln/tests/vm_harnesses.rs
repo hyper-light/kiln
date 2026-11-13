@@ -30,7 +30,7 @@ mod checks {
     use serde_json::json;
 
     fn link(name: &str, client: Option<&str>, server: Option<&str>) -> LinkSuites {
-        LinkSuites { name: name.into(), client: client.map(str::to_owned), server: server.map(str::to_owned) }
+        LinkSuites { name: name.into(), client: client.map(str::to_owned), server: server.map(str::to_owned), lanes: None }
     }
 
     /// Every link the plan names, both ends at `suite`.
@@ -76,7 +76,7 @@ mod checks {
     #[test]
     fn s34_links_to_read_are_named_end_by_end() {
         let specs = link_specs(r#"[{"name": "agent-control", "client": {"url": "/api/a/{session}", "pointer": "/suite"}, "server": {"url": "/api/b", "pointer": "/peers/0/secured/suite"}}]"#);
-        assert_eq!(specs, Ok(vec![LinkSpec { name: "agent-control".into(), client: End { url: "/api/a/{session}".into(), pointer: "/suite".into() }, server: End { url: "/api/b".into(), pointer: "/peers/0/secured/suite".into() } }]));
+        assert_eq!(specs, Ok(vec![LinkSpec { name: "agent-control".into(), client: End { url: "/api/a/{session}".into(), pointer: "/suite".into() }, server: End { url: "/api/b".into(), pointer: "/peers/0/secured/suite".into() }, lanes: None }]));
         assert!(link_specs(r#"[{"name": "half", "client": {"url": "/x", "pointer": "/s"}}]"#).is_err(), "a link with one end");
         assert!(link_specs(r#"[{"client": {"url": "/x", "pointer": "/s"}, "server": {"url": "/y", "pointer": "/s"}}]"#).is_err(), "a link of no name, which no required link can be");
         assert!(link_specs(r#"{"name": "not a list"}"#).is_err());
@@ -84,6 +84,57 @@ mod checks {
         let body = json!({"peers": [{"secured": {"suite": REQUIRED_SUITE, "group": "secp384r1MLKEM1024"}}]});
         assert_eq!(suite_at(&body, "/peers/0/secured/suite").as_deref(), Some(REQUIRED_SUITE));
         assert_eq!(suite_at(&body, "/peers/1/secured/suite"), None);
+        // A link's lanes, where its report lists them (a lanes reader of no pointer, or a list of
+        // other than names, is none).
+        let carried = link_specs(r#"[{"name": "agent-control", "client": {"url": "/a", "pointer": "/s"}, "server": {"url": "/b", "pointer": "/s"}, "lanes": {"url": "/api/harness/sessions/{session}", "pointer": "/links/0/lanes"}}]"#);
+        assert_eq!(carried.map(|s| s.into_iter().map(|l| l.lanes).collect::<Vec<_>>()), Ok(vec![Some(End { url: "/api/harness/sessions/{session}".into(), pointer: "/links/0/lanes".into() })]));
+        assert!(link_specs(r#"[{"name": "x", "client": {"url": "/a", "pointer": "/s"}, "server": {"url": "/b", "pointer": "/s"}, "lanes": {"url": "/c"}}]"#).is_err());
+        let report = json!({"links": [{"lanes": ["control", "mcp"]}, {"lanes": ["control", 7]}]});
+        assert_eq!(lanes_at(&report, "/links/0/lanes"), Some(vec!["control".to_owned(), "mcp".to_owned()]));
+        assert_eq!(lanes_at(&report, "/links/1/lanes"), None);
+    }
+
+    #[test]
+    fn s34_kilns_mcp_rides_the_agent_control_links_own_lane() {
+        // Shards D254: the agent-control link's report names the mcp lane (dropping the lane's name
+        // from the check, or taking a link that listed no lanes, passes a red below).
+        let (carrier, lane) = MCP_LANE;
+        let with = |name: &str, lanes: Option<&[&str]>| vec![LinkSuites { name: name.into(), client: None, server: None, lanes: lanes.map(|l| l.iter().map(|n| (*n).to_owned()).collect()) }];
+        assert_eq!(check_mcp_lane(&with(carrier, Some(&["control", lane]))), Ok(()));
+        assert!(check_mcp_lane(&with(carrier, Some(&["control", "terminal"]))).is_err_and(|e| e.contains("none is mcp")));
+        assert!(check_mcp_lane(&with(carrier, None)).is_err_and(|e| e.contains("no lanes")));
+        assert!(check_mcp_lane(&with("mcp", Some(&[lane]))).is_err_and(|e| e.contains(carrier)), "a lane on a link of its own isn't agent control's");
+        assert!(check_mcp_lane(&[]).is_err());
+    }
+
+    #[test]
+    fn s34_no_grant_of_an_image_reaches_kiln_past_its_mcp_lane() -> anyhow::Result<()> {
+        // kiln's MCP rides the agent-control link (Shards D254): kiln's own images for Claude Code
+        // and Codex grant no way to kiln, at its own default port (`kiln::config`), and each way an
+        // image could is found (dropping the destination's, the any-address range's or the MCP
+        // server's guard fails its line below).
+        let port = kiln_default_port().ok_or_else(|| anyhow::anyhow!("kiln's default listens at no port"))?;
+        let images = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln/images");
+        for kind in ["claude", "codex"] {
+            let text = std::fs::read_to_string(images.join(format!("harness-{kind}/Agentfile")))?;
+            assert_eq!(grants_to_kiln(&text, &[port]), Ok(vec![]), "harness-{kind}");
+        }
+        let claude = std::fs::read_to_string(images.join("harness-claude/Agentfile"))?;
+        let with = |line: &str| format!("{claude}\n{line}\n");
+        let (below, above) = (port.saturating_sub(1), port.saturating_add(1));
+        for line in [
+            format!("NETWORK --egress={MACHINE}:{port} kiln FOR claude"),
+            format!("NETWORK --egress={port}/tcp kiln FOR claude"),
+            format!("NETWORK --expose={below}-{above} kiln FOR claude"),
+            format!("MCP kiln http://{MACHINE}:{port}/api/mcp"),
+        ] {
+            assert_eq!(grants_to_kiln(&with(&line), &[port]).map(|found| found.len()), Ok(1), "{line}");
+        }
+        // Not kiln: the machine at another port, a host past it at kiln's port, or UDP.
+        for line in [format!("NETWORK --egress={MACHINE}:{above} db FOR claude"), format!("NETWORK --egress=api.example.com:{port} other FOR claude"), format!("NETWORK --egress={port}/udp quic FOR claude")] {
+            assert_eq!(grants_to_kiln(&with(&line), &[port]), Ok(vec![]), "{line}");
+        }
+        Ok(())
     }
 
     fn process(pid: u32, ppid: u32, argv: &[&str]) -> HostProc {
@@ -557,13 +608,9 @@ mod stub {
 // =================================================================================================
 #[cfg(unix)]
 mod host {
-    /// kiln hands a Claude Code session no command after a message steered into its turn: the next
-    /// queued message, and a steered one, each answered 202 and never reached the harness, with or
-    /// without an agent started from inside, and with the stand-in saying Claude Code 2.1's `queued`
-    /// lifecycle and replay (Linux on adacachy and macOS on adalundhe-macbook-pro, 2026-11-13; ROOT
-    /// has the finding). It runs again once kiln delivers past a steer.
+    /// Past a steer too. kiln frees a message's place in its admission window only when a completed
+    /// turn's `result` names it (`harness/claude.rs`, `user_message_uuids`), as the stand-in's does.
     #[test]
-    #[ignore = "kiln delivers no command to a Claude Code session after a steered message (reproduced 2026-11-13; ROOT has the finding)"]
     fn s34_claude_code_through_kiln_on_the_host() -> anyhow::Result<()> {
         crate::vm_e2e::on_host("claude", true)
     }

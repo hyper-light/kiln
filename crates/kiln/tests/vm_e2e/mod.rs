@@ -40,10 +40,15 @@ pub const REQUIRED_SUITE: &str = "TLS13_AES_256_GCM_SHA384";
 /// 01a1cd8e862e7169a074db3d5fa33f3d, its architecture and step 34's "on every link"): kiln's server to
 /// the runner holding the session (`crate::net`'s QUIC), kiln to Hex (Hex's `docs/design/hex-quic.md`),
 /// the controller to the microVM's agent-control endpoint (Shards D238), and the harness to kiln's
-/// MCP server, agent control too (step 18 designs it as HTTP to `host.docker.internal`, crossing no
-/// TLS: D238's open item, Ada's and ROOT's). A run that reads fewer never passes; a hop the built
-/// system turns out not to have is a change to this list, with its reason beside it.
+/// MCP server, a lane of its own on agent control ([`MCP_LANE`], Shards D254). A run that reads
+/// fewer never passes; a hop the built system turns out not to have is a change to this list, with
+/// its reason beside it.
 pub const REQUIRED_LINKS: [&str; 4] = ["server-runner", "kiln-hex", "agent-control", "mcp"];
+
+/// kiln's MCP from inside a microVM: a lane of the agent-control link's own (the person and ROOT,
+/// 2026-11-13; Shards D254), so its suite is that link's and no network grant reaches kiln for it
+/// ([`grants_to_kiln`]).
+pub const MCP_LANE: (&str, &str) = ("agent-control", "mcp");
 
 /// The ten harnesses of kiln plan steps 19 to 29, by kiln's ids (`harness::kinds::Kind`).
 pub const KINDS: [&str; 10] = ["claude", "codex", "gemini", "opencode", "goose", "amp", "devin", "antigravity", "cursor", "pi"];
@@ -103,18 +108,20 @@ pub struct End {
     pub pointer: String,
 }
 
-/// A link to read, both ends: `VM_E2E_LINKS`' entries.
+/// A link to read, both ends: `VM_E2E_LINKS`' entries. `lanes`: where its report lists its lanes'
+/// names, for the link that carries one ([`MCP_LANE`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkSpec {
     pub name: String,
     pub client: End,
     pub server: End,
+    pub lanes: Option<End>,
 }
 
 /// The links of `VM_E2E_LINKS`: a JSON array of `{"name", "client": {"url", "pointer"}, "server":
-/// {"url", "pointer"}}`, each named as [`REQUIRED_LINKS`] names its hop. Where agent control
-/// terminates, and so where each end says its suite, is kiln plan steps 10 and 11's to decide and
-/// build, so ROOT names the endpoints.
+/// {"url", "pointer"}, "lanes"?: {"url", "pointer"}}`, each named as [`REQUIRED_LINKS`] names its hop.
+/// Where agent control terminates, and so where each end says its suite, is kiln plan steps 10 and
+/// 11's to decide and build, so ROOT names the endpoints.
 pub fn link_specs(text: &str) -> Result<Vec<LinkSpec>, String> {
     let v: Value = serde_json::from_str(text).map_err(|e| format!("VM_E2E_LINKS isn't JSON: {e}"))?;
     let end = |l: &Value, which: &str| -> Result<End, String> {
@@ -126,22 +133,41 @@ pub fn link_specs(text: &str) -> Result<Vec<LinkSpec>, String> {
         .iter()
         .map(|l| {
             let name = l.get("name").and_then(Value::as_str).ok_or_else(|| format!("a link has no name: {l}"))?;
-            Ok(LinkSpec { name: name.to_owned(), client: end(l, "client")?, server: end(l, "server")? })
+            let lanes = l.get("lanes").map(|_| end(l, "lanes")).transpose()?;
+            Ok(LinkSpec { name: name.to_owned(), client: end(l, "client")?, server: end(l, "server")?, lanes })
         })
         .collect()
 }
 
-/// What each end of a link said it negotiated (`None`: it said nothing).
+/// What each end of a link said it negotiated (`None`: it said nothing), and the lanes its report
+/// listed, where its spec asks for them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkSuites {
     pub name: String,
     pub client: Option<String>,
     pub server: Option<String>,
+    pub lanes: Option<Vec<String>>,
 }
 
 /// The suite a body says at `pointer`.
 pub fn suite_at(body: &Value, pointer: &str) -> Option<String> {
     body.pointer(pointer).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// The lanes' names a body lists at `pointer`.
+pub fn lanes_at(body: &Value, pointer: &str) -> Option<Vec<String>> {
+    body.pointer(pointer)?.as_array()?.iter().map(|l| l.as_str().map(str::to_owned)).collect()
+}
+
+/// Ok when the link that carries kiln's MCP from inside reported its lane ([`MCP_LANE`]).
+pub fn check_mcp_lane(links: &[LinkSuites]) -> Result<(), String> {
+    let (carrier, lane) = MCP_LANE;
+    let link = links.iter().find(|l| l.name == carrier).ok_or_else(|| format!("no {carrier} link was read, which carries kiln's MCP as its {lane} lane (Shards D254)"))?;
+    match &link.lanes {
+        Some(lanes) if lanes.iter().any(|l| l == lane) => Ok(()),
+        Some(lanes) => Err(format!("the {carrier} link's lanes are {lanes:?}: none is {lane}, on which kiln's MCP rides it (Shards D254)")),
+        None => Err(format!("the {carrier} link's report listed no lanes: name where in VM_E2E_LINKS (tests/vm_e2e/README.md)")),
+    }
 }
 
 /// Ok when both ends of `link` negotiated [`REQUIRED_SUITE`]; else which end said what.
@@ -165,6 +191,52 @@ pub fn check_all_links(links: &[LinkSuites]) -> Result<(), String> {
         return Err(format!("no negotiated suite was read for the links {unread:?}: name each one's ends in VM_E2E_LINKS (tests/vm_e2e/README.md)"));
     }
     links.iter().try_for_each(check_link)
+}
+
+/// The machine itself, as a microVM names it (Shards D236).
+pub const MACHINE: &str = "host.docker.internal";
+
+/// The port kiln listens at unless told another, which kiln's own images name (`kiln::config`).
+pub fn kiln_default_port() -> Option<u16> {
+    kiln::config::Server::default().http_addr.rsplit_once(':')?.1.parse().ok()
+}
+
+/// What an Agentfile grants past its microVM that reaches kiln at one of `ports`: a destination at
+/// the machine itself there, a remote MCP server there, or a TCP port open to any address that takes
+/// one in. Every stage's grants count, as a run can drop what its image grants and never add one
+/// (D236), so these bound what any run of it reaches. kiln's MCP rides the agent-control link
+/// ([`MCP_LANE`]), so an image passes with none.
+pub fn grants_to_kiln(agentfile: &str, ports: &[u16]) -> Result<Vec<String>, String> {
+    use shards_agentfile::agentfile::{Direction, Directive, destination_of, mcp_endpoint, port_range};
+    let words = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    let parsed = shards_agentfile::parser::parse_as(agentfile.as_bytes(), shards_agentfile::parser::Dialect::Agentfile).map_err(|e| format!("the Agentfile doesn't parse: {}", words(&e.message)))?;
+    let linter = shards_agentfile::lint::Linter::new(shards_agentfile::lint::Config::default());
+    let ins = shards_agentfile::instructions::parse(&parsed, &linter).map_err(|e| format!("the Agentfile doesn't parse: {}", words(&e.message)))?;
+    let at_kiln = |host: &[u8], port: u16| host.eq_ignore_ascii_case(MACHINE.as_bytes()) && ports.contains(&port);
+    let mut found = Vec::new();
+    for directive in ins.stages.iter().flat_map(|s| &s.commands).filter_map(|c| match &c.kind {
+        shards_agentfile::instructions::Kind::Agentfile(d) => Some(d),
+        _ => None,
+    }) {
+        match directive {
+            Directive::Network(n) => {
+                for (p, direction) in n.ports.iter().filter(|(_, d)| *d != Direction::Ingress) {
+                    let wide = port_range(p).is_some_and(|(proto, lo, hi)| proto == 6 && ports.iter().any(|q| (lo..=hi).contains(q)));
+                    let named = matches!(destination_of(p), Some(Ok((host, port))) if *direction == Direction::Egress && at_kiln(&host, port));
+                    if wide || named {
+                        found.push(format!("NETWORK {} {}{}", words(&n.name), words(p), if wide { " (any address)" } else { "" }));
+                    }
+                }
+            }
+            Directive::Mcp(m) => {
+                if mcp_endpoint(&m.source).is_some_and(|(host, port)| at_kiln(&host, port)) {
+                    found.push(format!("MCP {} {}", words(&m.name), words(&m.source)));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(found)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -908,8 +980,10 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     let mut links = Vec::new();
     if let Ok(text) = std::env::var("VM_E2E_LINKS") {
         for l in link_specs(&text).map_err(|e| anyhow::anyhow!(e))? {
-            let end = |e: &End| -> anyhow::Result<Option<String>> { Ok(suite_at(&f.get(&e.url.replace("{session}", &id))?, &e.pointer)) };
-            links.push(LinkSuites { client: end(&l.client)?, server: end(&l.server)?, name: l.name });
+            let read = |e: &End| f.get(&e.url.replace("{session}", &id));
+            let end = |e: &End| -> anyhow::Result<Option<String>> { Ok(suite_at(&read(e)?, &e.pointer)) };
+            let lanes = l.lanes.as_ref().map(|e| -> anyhow::Result<Option<Vec<String>>> { Ok(lanes_at(&read(e)?, &e.pointer)) }).transpose()?.flatten();
+            links.push(LinkSuites { client: end(&l.client)?, server: end(&l.server)?, lanes, name: l.name });
         }
     }
 
@@ -1021,6 +1095,25 @@ pub fn builtin_image(kind: &str) -> String {
     std::env::var(format!("VM_E2E_IMAGE_{}", kind.to_ascii_uppercase())).unwrap_or_else(|_| format!("harness-{kind}"))
 }
 
+/// The Agentfile `image` is made from: a person's as kiln keeps it (`agentfile:<id>`), else kiln's
+/// own, as kiln carries it (`.kiln/images/<image>/Agentfile`, `agentfiles::builtin`).
+pub fn agentfile_of(f: &Fixture, image: &str) -> anyhow::Result<String> {
+    if let Some(id) = image.strip_prefix("agentfile:") {
+        let kept = f.get(&format!("/api/agentfiles/{id}"))?;
+        return kept.get("text").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("kiln keeps no text for {image}: {kept}"));
+    }
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln/images").join(image).join("Agentfile");
+    std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("{image}'s Agentfile ({}): {e}", path.display()))
+}
+
+/// The ports a microVM's grants must not reach kiln at: the server this run drives, and kiln's
+/// default, which kiln's own images name.
+fn kiln_ports(f: &Fixture) -> Vec<u16> {
+    let mut ports = vec![f.port];
+    ports.extend(kiln_default_port().filter(|p| *p != f.port));
+    ports
+}
+
 /// A file name of this drive's own, for its harness to write in its project.
 fn probe_name() -> String {
     format!("vm-e2e-{}.txt", nonce())
@@ -1036,16 +1129,18 @@ fn written_and_removed(project: &str, probe: &str) -> Result<(), String> {
 
 /// Drives `kind` in a microVM made from `image`, in `project`, and checks it ran there and nowhere
 /// else: kiln holds it isolated; the project at its host path, inside and out; kiln's MCP from
-/// inside where kiln gives it (`mcp`), and an agent started from there (`child`); no harness in the
-/// session's process trees on the host at any look; a Linux kernel of its own; every link's suite at
-/// both ends. A vendor's own CLI runs only with ROOT's task ([`untasked`]): it skips without it, and
-/// `VM_E2E=1` makes that a failure.
+/// inside where kiln gives it (`mcp`), on the agent-control link's lane alone ([`MCP_LANE`]), and an
+/// agent started from there (`child`); no harness in the session's process trees on the host at any
+/// look; a Linux kernel of its own; every link's suite at both ends. A vendor's own CLI runs only
+/// with ROOT's task ([`untasked`]): it skips without it, and `VM_E2E=1` makes that a failure.
 pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool, child: bool) -> anyhow::Result<()> {
     if let Some(why) = untasked(kind, image, |v| std::env::var_os(v).is_some()) {
         anyhow::ensure!(!isolation_required(), "{why} (VM_E2E=1 requires a real task)");
         eprintln!("{why}");
         return Ok(());
     }
+    let to_kiln = grants_to_kiln(&agentfile_of(f, image)?, &kiln_ports(f)).map_err(|e| anyhow::anyhow!("{image}: {e}"))?;
+    anyhow::ensure!(to_kiln.is_empty(), "{kind} from {image}: its image grants a way to kiln past the agent-control link's {} lane (Shards D254): {to_kiln:?}", MCP_LANE.1);
     let marker = std::env::var("VM_E2E_DONE_MARKER").unwrap_or_else(|_| STUB_DONE.to_owned());
     let probe = probe_name();
     let prompt = task("VM_E2E_PROMPT", kind, &probe, stub_prompt(kind, mcp, child, &probe));
@@ -1071,6 +1166,7 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
     written_and_removed(project, &probe).map_err(fail)?;
     if mcp {
         mcp_round_trip(&d.events, &d.first).map_err(fail)?;
+        check_mcp_lane(&d.links).map_err(fail)?;
     }
     if let Some(c) = &d.child {
         check_child(c, &d.id, &vm_runners(&f.get("/api/reach/runners")?)).map_err(fail)?;

@@ -65,7 +65,7 @@ every one of the five `VM_E2E_*` words below (`untasked`): the stand-in's words 
 | Variable | What |
 |---|---|
 | `VM_E2E=1` | a runner that starts no microVMs fails the run rather than skips it |
-| `VM_E2E_LINKS` | the links to read, each end's path on kiln's API (`{session}`: the session's id) and the JSON pointer to its suite: `[{"name": "agent-control", "client": {"url": "…", "pointer": "…"}, "server": {"url": "…", "pointer": "…"}}, …]`, one for each of `server-runner`, `kiln-hex`, `agent-control` and `mcp` at least |
+| `VM_E2E_LINKS` | the links to read, each end's path on kiln's API (`{session}`: the session's id) and the JSON pointer to its suite: `[{"name": "agent-control", "client": {"url": "…", "pointer": "…"}, "server": {"url": "…", "pointer": "…"}, "lanes": {"url": "…", "pointer": "…"}}, …]`, one for each of `server-runner`, `kiln-hex`, `agent-control` and `mcp` at least; `agent-control`'s `lanes` is where its report lists its lanes' names, among which `mcp` must be (Shards D254) |
 | `VM_E2E_HOST_ROOTS` | pids (comma-separated) of processes besides the runner whose trees hold the session's processes: a daemon its microVMs run under that left the runner's tree |
 | `VM_E2E_PROJECT` | a real project's folder on this host, for a real task (unset: an empty one of the test's own) |
 | `VM_E2E_PROMPT`, `VM_E2E_RESUMED_PROMPT`, `VM_E2E_STEERED_PROMPT`, `VM_E2E_STOPPED_PROMPT`, `VM_E2E_DONE_MARKER` | a real task, the resumed session's turn, a long one to steer into, a long one to stop, and what the harness says at a task's end; `{kind}` in each is the harness's id, `{file}` the file to write. Unset: the stand-in's, for an image ROOT names (the stand-in's); from kiln's own `harness-<kind>` the run skips unless all five are given (fails, with `VM_E2E=1`) |
@@ -172,8 +172,11 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
 3. **kiln's MCP from inside, and its suite**: step 11 with step 18, as decided (the person and ROOT,
    2026-11-13; Shards D254, which step 11 writes): kiln's MCP rides the agent-control link as its own
    `mcp` lane, so its suite is that link's and no network grant names kiln's MCP. Read by
-   `mcp_round_trip`, and through `VM_E2E_LINKS`' `mcp` entry, the session's link report naming the
-   `mcp` lane on the agent-control link. Evidence of what it replaces: step 18's branch
+   `mcp_round_trip`, through `VM_E2E_LINKS`' `mcp` entry, by `check_mcp_lane` (the agent-control
+   link's report naming the `mcp` lane), and, before the drive boots anything, by `grants_to_kiln`
+   (no grant of the image's Agentfile reaching kiln: a destination at the machine itself at kiln's
+   port, a remote MCP server there, or kiln's port open to any address). Evidence of what it
+   replaces: step 18's branch
    (`p/s18-host-in-vm-v1`, a5ce21085) reaches `/api/mcp` as plain HTTP at
    `host.docker.internal:<port>` (`harness/isolated/mcp.rs`), which crosses no TLS, and its built-ins
    grant `--egress=host.docker.internal:7070`; D238's "Control that crosses no TLS" (ROOT's ruling,
@@ -192,14 +195,7 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    `VM_E2E_LINKS`' `kiln-hex` entry.
 7. **A microVM image without a vendor's turn**: step 17's Shards slice ("Without a vendor's turn",
    above).
-8. **Claude Code past a steer**: kiln's own, found here (ROOT has the finding). kiln hands a Claude Code
-   session no command after a message steered into its turn (the next queued message and a steered
-   one each answered 202 and never reached the harness; Linux and macOS, 2026-11-13, with or without
-   an agent started from inside, the stand-in saying Claude Code 2.1's `queued` lifecycle and replay).
-   `host::s34_claude_code_through_kiln_on_the_host` is ignored until kiln delivers past a steer
-   (`cargo test -p kiln --test vm_harnesses -- --ignored host::` shows it), and step 34's Claude Code
-   run stops at its interrupt step until then.
-9. **A harness that ran a process on the host and ended it between two looks**: no step owns it yet. The
+8. **A harness that ran a process on the host and ended it between two looks**: no step owns it yet. The
    looks see the harness itself, a process of the whole session, and the kernel line is the harness's
    own shell's word on where it ran. kiln's own record of what it started for a session would close
    this.
