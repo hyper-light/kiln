@@ -11991,9 +11991,11 @@ is kiln research `01a1947b2b0270fa9d1e32d07aebaa7e` (44 findings, 37 sources) an
      Production's commit for this stage is `9ce4e445d0`, deployed by itself, after main's head is
      deployed and healthy.
   2. **Each repository, by its own change.** Its `.kiln/config.yaml` on the default branch says
-     `github_workflows: on` (`repo_config.rs`, existing). It gains `kiln_workflows: on`, so a
-     repository's `.kiln/` workflows move to the engine one repository at a time. The server-wide
-     `[ci] kiln_workflows` stays as the default. Pipelines' Settings writes these lines as a draft
+     `github_workflows: on` (`repo_config.rs`, existing), and `kiln_workflows: on` (built
+     2026-11-12: `repo_config::kiln_workflows`, which every place that chooses between the engine
+     and v1 asks), so a repository's `.kiln/` workflows move to the engine one repository at a
+     time. The server-wide `[ci] kiln_workflows` stays as the default
+     (`w29_r16_a_repository_moves_its_kiln_workflows_to_the_engine`). Pipelines' Settings writes these lines as a draft
      (W29-R10, R11), reviewed like any change.
   3. **kiln's own `.kiln/` workflows**, after W24 M0's side-by-side replay of main's commits agrees
      with v1.
