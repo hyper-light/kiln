@@ -2358,6 +2358,11 @@ impl Host {
     async fn reconcile_legacy_mail(&self, s: &Session, input: &super::admission::Input, mode: LegacyReconciliation) -> Result<(), inbox::PromotionError> {
         use super::admission::{Lease, Stage};
         let invalid = |error| inbox::PromotionError::Invalid { why: format!("{error:?}") };
+        // Its opening prompt is its opener's, a person's, held to no depth (`mail::person`); what
+        // else it holds with no row is held to the depth: whose it is isn't known here (step 35).
+        let opening = session::opening_prompt_id(&s.id);
+        let opener = s.spec.lock().opener.as_deref().and_then(super::mail::opener_sender).unwrap_or_default();
+        let peer_of = |message: &str| if message == opening { opener.clone() } else { String::new() };
         let mut after: Option<String> = None;
         loop {
             let next = {
@@ -2381,7 +2386,7 @@ impl Host {
                 let item = core.state.queue.iter().map(|item| (None, item)).chain(core.state.tasks.iter().flat_map(|task| task.queue.iter().map(move |item| (Some(task.id.as_str()), item)))).find(|(_, item)| item.id == message);
                 let Some((task, item)) = item else { continue };
                 let bytes = super::admission::queued_command_bytes(item, task).map_err(invalid)?;
-                let lease = Lease { message: message.clone(), peer: String::new(), epoch: core.state.epoch, bytes, stage: Stage::Queued, token: None, handoff: None };
+                let lease = Lease { message: message.clone(), peer: peer_of(&message), epoch: core.state.epoch, bytes, stage: Stage::Queued, token: None, handoff: None };
                 {
                     let mut controller = input.controller.lock();
                     if let LegacyReconciliation::Debt { from, to } = mode {
@@ -2419,7 +2424,7 @@ impl Host {
                 let Some(flight) = core.input_legacy_flights.iter().find(|flight| flight.id == message) else { continue };
                 let bytes = core.writes.iter().filter(|wire| flight.matches(wire)).fold(std::mem::size_of::<super::admission::LegacyFlight>().checked_add(flight.id.capacity()), |bytes, wire| bytes.and_then(|bytes| bytes.checked_add(std::mem::size_of::<String>())).and_then(|bytes| bytes.checked_add(wire.capacity())));
                 let bytes = bytes.ok_or_else(|| inbox::PromotionError::Invalid { why: "legacy retained byte count overflowed".into() })?;
-                let lease = Lease { message: message.clone(), peer: String::new(), epoch: core.state.epoch, bytes, stage: Stage::ProviderFlight, token: None, handoff: None };
+                let lease = Lease { message: message.clone(), peer: peer_of(&message), epoch: core.state.epoch, bytes, stage: Stage::ProviderFlight, token: None, handoff: None };
                 {
                     let mut controller = input.controller.lock();
                     if let LegacyReconciliation::Debt { from, to } = mode {

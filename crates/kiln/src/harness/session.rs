@@ -334,6 +334,12 @@ pub struct Spec {
     pub opener: Option<String>,
 }
 
+/// The id of session `session`'s opening prompt (`Spec::prompt`), its own (CP-T3.2): made once,
+/// the same if it's ever made again.
+pub fn opening_prompt_id(session: &str) -> String {
+    crate::util::derive_id(&["first-prompt", session])
+}
+
 fn yes() -> bool {
     true
 }
@@ -4634,7 +4640,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     adapter.start(&mut core);
                     if !s.prompted.swap(true, std::sync::atomic::Ordering::Relaxed) && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
                         // Its id is the session's own (CP-T3.2): made once, the same if it's ever made again.
-                        let id = crate::util::derive_id(&["first-prompt", &s.id]);
+                        let id = opening_prompt_id(&s.id);
                         adapter.command(&mut core, Command::Send { id, text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None });
                     }
                     for c in carry.drain(..) {

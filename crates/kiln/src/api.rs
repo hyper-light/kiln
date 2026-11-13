@@ -6395,6 +6395,9 @@ fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::aut
     if let Some(i) = spec.isolation.as_mut() {
         i.person = caller.and_then(crate::harness::lineage::person_of);
     }
+    // Whose its opening prompt is, which its input admits as a person's, held to no depth: whoever
+    // asks (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 35), never what's asked.
+    spec.opener = caller.and_then(crate::harness::lineage::person_of);
 }
 
 async fn harness_open(hub: &Hub, req: Request) -> R {

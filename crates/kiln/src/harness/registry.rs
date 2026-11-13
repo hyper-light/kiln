@@ -31,6 +31,13 @@ use crate::proto::{LANE_TERM, ServerMsg};
 /// a report from the machine that leaves it out ends it.
 const OPEN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Whether command `c` from `sender` to session `id` goes into custody (W20): a message, unless
+/// it's a person's and its session's runner predates mail-flow ([`super::mail_delivery::legacy_owner`]),
+/// when it goes to that runner's inbox, as before.
+fn into_custody(hub: &Hub, id: &str, sender: &str, c: &Command) -> bool {
+    super::session::is_message(c) && (!super::mail::person(sender) || !super::mail_delivery::legacy_owner(hub, id))
+}
+
 /// A message's id (what its session's inbox takes once): none for a command that isn't a message,
 /// or a message without one.
 pub fn message_id(c: &Command) -> Option<String> {
@@ -4597,9 +4604,16 @@ impl Registry {
 
     /// [`Registry::command`] for whoever sent it (`sender`, as `ops::key_scope` names a caller:
     /// `admin`, `user:<id>`, `agent:<id>`): an API call's command (kiln plan
-    /// 01a1cd8e862e7169a074db3d5fa33f3d step 35).
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 35). A message goes into custody as its sender's, as
+    /// [`Registry::send_asked`] sends one: a person's held to no depth and taking no turn, an
+    /// agent's held to the recipient's, never as kiln's own (`server`).
     pub async fn command_from(&self, hub: &Hub, id: &str, sender: &str, c: Command) -> Sent {
-        let _ = sender;
+        if into_custody(hub, id, sender, &c) {
+            return match self.publish_command(hub, id, c, None, sender.to_owned(), sender.to_owned(), None).await {
+                Ok(receipt) => Sent::Published(receipt),
+                Err(error) => Sent::PublicationRefused(error),
+            };
+        }
         self.command(hub, id, c).await
     }
 
@@ -4685,7 +4699,7 @@ impl Registry {
         // A message goes into custody (W20), a person's in a queue of its own, unless it's a
         // person's and its session's runner predates mail-flow: then it goes to that runner's
         // inbox, as before, through `dispatch` below ([`super::mail_delivery::legacy_owner`]).
-        if super::session::is_message(&c) && (!super::mail::person(scope) || !super::mail_delivery::legacy_owner(hub, id)) {
+        if into_custody(hub, id, scope, &c) {
             let sent = match self.publish_command(hub, id, c, None, scope.to_owned(), scope.to_owned(), None).await {
                 Ok(receipt) => Sent::Published(receipt),
                 Err(error) => Sent::PublicationRefused(error),
