@@ -40,6 +40,7 @@ class Hex:
     lanes = False
     actions = ("vm", "node", "scheduler")
     name = "hex"
+    scans = True
 
     def __init__(self, binary: str, shards: str, scope: str, vm: Dict[str, Optional[int]], platform: str) -> None:
         self.binary = binary
@@ -248,6 +249,9 @@ class Hex:
         if reply.get("ended") or not reply.get("tracked", True):
             return "ended"
         return "live" if reply.get("created") else "starting"
+
+    def where(self, token: str) -> str:
+        return "this host"
 
     def view(self) -> Tuple[Dict[str, Optional[List[int]]], str]:
         """The asks whose boxes Hex holds created and not ended, each naming no process."""

@@ -37,6 +37,8 @@ class Shards:
     actions = ("vm", "daemon", "client")
     # Asks whose run the placer says ended: the direct driver learns that from each lane's end.
     ended: frozenset = frozenset()
+    # Its VMs run on this host, where the agent scans.
+    scans = True
 
     def __init__(self, binary: str, scope: str) -> None:
         self.binary = binary
