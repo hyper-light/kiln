@@ -76,7 +76,16 @@ export function StateWord({ a }: { a: { status: Status; approvals: readonly unkn
   // Paused for a usage limit: once a turn under way ends, it waits for the reset.
   const gone = a.status === "exited" || a.status === "disconnected" || a.status === "crashed";
   const s = a.approvals.length > 0 ? "waiting" : a.pause && a.status !== "running" && !gone ? "paused" : a.status;
-  const word = { waiting: "Needs you", running: "Working", starting: a.harness_session ? "Resuming" : "Starting", idle: "Ready", exited: "Ended", disconnected: "Offline", crashed: "Crashed", paused: "Paused" }[s];
+  const word = {
+    waiting: "Needs you",
+    running: "Working",
+    starting: a.harness_session ? "Resuming" : "Starting",
+    idle: "Ready",
+    exited: "Ended",
+    disconnected: "Offline",
+    crashed: "Crashed",
+    paused: "Paused",
+  }[s];
   return (
     <span className="st-word" data-state={s}>
       <i aria-hidden="true" />
