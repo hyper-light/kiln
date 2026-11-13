@@ -23,9 +23,16 @@
 //!   ([`USE`], [`HexVms::with_ledger`]) before anything acts on that end. The charge is Hex's final use (its
 //!   window the whole run, read with its end), or the use last read where the delete answers none or
 //!   `NoSuchBox`. A run never read and given no final use (it never started) is charged nothing.
+//! - **Its credentials** (plan step 33, Shards' D242) are granted by reference: each of its launch's grants one of
+//!   `ShardsImage::credentials`, to its harness member, toward the hosts it names, the reference the secret's name in
+//!   kiln's store and never its value. Hex leases each value as the VM's egress first needs it, through the lessors
+//!   its runtime was given (`hex_node::images::ImageRuntime::leasing`, kiln's `secrets::lessor::Lessors` over the
+//!   node's run-lease broker), and fills it in outside the VM; the run sees placeholders alone. A sandbox whose
+//!   runtime was given none ([`HexVms::leasing`] not called) holds no credentials: a launch granting one is refused,
+//!   `Unsupported` ([`NO_BROKER`]), never run without them.
 //! - **What it refuses, typed:** egress to whatever its image grants (`Egress::Any`): Hex's grants are default
-//!   deny, so a run names its destinations; limits and credentials it doesn't hold ([`HOLDS`]); and what Hex
-//!   refuses, in Hex's words (`Awaits` as `Unsupported`).
+//!   deny, so a run names its destinations; limits it doesn't hold ([`HOLDS`]), and credentials where no broker
+//!   leases them ([`NO_BROKER`]); and what Hex refuses, in Hex's words (`Awaits` as `Unsupported`).
 
 use std::io::{BufRead as _, Write as _};
 use std::collections::HashMap;
@@ -47,8 +54,12 @@ use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, R
 /// member), and folders shared at any path, read-only or not (`ShardsImage::shares`). Not memory or process limits
 /// (Hex reads no OOM kill or refused fork of an image VM's guest: its `usage_of`), weights, signals (Hex awaits
 /// `MemberSignal`, Shards' agent-control endpoint: they're asked of Hex all the same, so a Hex that delivers them
-/// needs only this flag), or credentials (not mapped yet).
+/// needs only this flag). Credentials it holds where its runtime leases them ([`HexVms::leasing`], its
+/// [`Sandbox::holds`]); these say none.
 pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: false, credentials: false };
+
+/// Why a launch granting a credential is refused where no broker leases this machine's credentials (module docs).
+pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (kiln's credential store is its server's, which this runner doesn't hold), and a run granted one is never run without it (Shards' D242)";
 
 /// The cost profile its allocations are made under: Shards' least VM, its envelope alone. No overhead and no guest
 /// allowance: what a VM takes past its envelope Hex learns from its windows (decision 9, `RuntimeCost::census_free`).
@@ -67,6 +78,8 @@ pub struct HexVms {
     ledger: Option<Arc<dyn Records>>,
     /// Each live run's VM by its box's name, for its [`Meter`]. Let go of with its run.
     vms: parking_lot::Mutex<HashMap<String, Weak<Vm>>>,
+    /// Whether its runtime leases its VMs' credentials, given lessors over a run-lease broker ([`HexVms::leasing`]).
+    leases: bool,
 }
 
 /// The family of kiln's records each microVM's charge is kept in as its run ends: keyed by its box's name, a
@@ -192,7 +205,13 @@ impl HexVms {
     /// Over Hex's runtime `runtime`, naming each launch's box with `names`, which answers none where nothing numbers
     /// one (a launch then refused).
     pub fn new(runtime: Arc<dyn Runtime>, names: impl Fn() -> Option<BoxName> + Send + Sync + 'static) -> Self {
-        Self { runtime, names: Box::new(names), ledger: None, vms: parking_lot::Mutex::new(HashMap::new()) }
+        Self { runtime, names: Box::new(names), ledger: None, vms: parking_lot::Mutex::new(HashMap::new()), leases: false }
+    }
+
+    /// Its runtime was given lessors over the node's run-lease broker (`hex_node::images::ImageRuntime::leasing`), so
+    /// it holds launches granting credentials, each by reference (module docs).
+    pub fn leasing(self) -> Self {
+        Self { leases: true, ..self }
     }
 
     /// Keeps each run's charge in `ledger`, kiln's records ([`USE`]), as it ends.
@@ -209,10 +228,15 @@ impl HexVms {
     /// `launch` in a box named `name`: created, started and its harness member's streams taken, or refused, typed,
     /// with no box left behind.
     pub async fn launch_as(&self, name: BoxName, launch: Launch) -> Result<Box<dyn Run>, Refusal> {
-        HOLDS.check(&launch)?;
+        // Its grants checked as any sandbox's would be first (`Invalid`), then refused where no broker leases them.
+        Holds { credentials: true, ..HOLDS }.check(&launch)?;
+        if !launch.credentials.is_empty() && !self.leases {
+            return Err(Refusal::Unsupported(NO_BROKER.into()));
+        }
         let Boundary::MicroVm { image } = &launch.boundary else { return Err(Refusal::Unsupported("a run outside a microVM".into())) };
         let member = Member { kind: MemberKind::Harness, name: launch.program.clone() };
         let grants = grants_of(&member, &launch.egress)?;
+        let credentials = credentials_of(&member, &launch.credentials);
         let mut shares: Vec<Mount> = launch.shares.iter().map(|s| Mount { source: PathBuf::from(&s.host), destination: s.at.clone(), read_only: !s.writable }).collect();
         if let Some(folder) = &launch.folder
             && !shares.iter().any(|s| &s.destination == folder)
@@ -220,7 +244,7 @@ impl HexVms {
             shares.push(Mount { source: PathBuf::from(folder), destination: folder.clone(), read_only: false });
         }
         let driven = ImageMember { member: member.clone(), env: launch.env.clone(), workdir: launch.folder.clone(), args: launch.args.clone() };
-        let class = ShardsImage { grants, members: vec![driven], shares, ..ShardsImage::new(image) };
+        let class = ShardsImage { grants, members: vec![driven], shares, credentials, ..ShardsImage::new(image) };
         let id = name.id().map_err(seam)?;
         let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation()?), route: None, band: 0 };
         let name = id.to_string();
@@ -263,8 +287,25 @@ impl Sandbox for HexVms {
     }
 
     fn holds(&self) -> Holds {
-        HOLDS
+        Holds { credentials: self.leases, ..HOLDS }
     }
+}
+
+/// `granted`'s credentials as Hex grants them to `member`: by reference alone, toward each host lowercased as its
+/// egress grants name it ([`grants_of`]; RFC 4343), each once. Hex checks them against its grants as the box is made.
+fn credentials_of(member: &Member, granted: &[kiln_seams::sandbox::CredentialGrant]) -> Vec<hex_api::CredentialGrant> {
+    granted
+        .iter()
+        .map(|g| {
+            let mut toward: Vec<String> = Vec::with_capacity(g.toward.len());
+            for host in g.toward.iter().map(|h| h.to_ascii_lowercase()) {
+                if !toward.contains(&host) {
+                    toward.push(host);
+                }
+            }
+            hex_api::CredentialGrant { member: member.clone(), reference: g.reference.clone(), toward }
+        })
+        .collect()
 }
 
 /// The grants of `egress` for `member`: one by TCP for each destination it names, `host:port` (a name, lowercase
@@ -667,7 +708,10 @@ pub(crate) mod tests {
     /// Hex's simulator with a VM's host use as Hex's image runtime answers it (`host_use`, and the final use
     /// `delete_with_host_use` answers, its window the whole run, `None` for a box never started), which the
     /// simulator doesn't model. Read `n` is `use_at(n)`. Its first delete may lose its answer (the box deleted,
-    /// an error said), and its start may be refused.
+    /// an error said), and its start may be refused. Its credentials as Hex's image class leases them (plan step 33),
+    /// which the simulator doesn't model either: a box granting one refused `Unconfigured` as it is created where it
+    /// was given no lessors (`ImageClass::can_lease`), else its run's lessor asked of them as it starts
+    /// (`ImageClass::run_lessor`) and kept by box; and each spec it was asked to create kept as its wire writes it.
     #[derive(Default)]
     pub(crate) struct Metered {
         sim: SimRuntime,
@@ -676,6 +720,9 @@ pub(crate) mod tests {
         deletes: AtomicU64,
         lose_first_answer: AtomicBool,
         refuse_start: AtomicBool,
+        lessors: parking_lot::Mutex<Option<Arc<dyn hex_api::lease::Lessors>>>,
+        lessees: parking_lot::Mutex<Vec<(String, Arc<dyn hex_api::lease::Lessor>)>>,
+        specs: parking_lot::Mutex<Vec<String>>,
     }
 
     /// Read `n` of a VM's use: its CPU time growing as n squared, its window as n, so a read's CPUs are its
@@ -694,11 +741,20 @@ pub(crate) mod tests {
             self.sim.classes()
         }
         fn create(&self, spec: BoxSpec) -> Result<BoxInfo, H> {
+            self.specs.lock().push(serde_json::to_string(&spec).map_err(|e| H::Broken(e.to_string()))?);
+            if matches!(&spec.class, hex_api::ClassSpec::ShardsImage(image) if !image.credentials.is_empty()) && self.lessors.lock().is_none() {
+                return Err(H::Unconfigured { what: "lessors for its image VMs' credentials", why: "given none".into() });
+            }
             self.sim.create(spec)
         }
         fn start(&self, id: &BoxId) -> Result<(), H> {
             if self.refuse_start.load(Ordering::Acquire) {
                 return Err(H::Invalid { what: "start", why: "refused by the test".into() });
+            }
+            if !self.sim.inspect(id)?.credentials.is_empty() {
+                let lessors = self.lessors.lock().clone().ok_or_else(|| H::Broken("a box granting credentials with no lessors".into()))?;
+                let lessor = lessors.lessor(id)?;
+                self.lessees.lock().push((id.to_string(), lessor));
             }
             self.sim.start(id)?;
             self.started.lock().insert(id.to_string());
@@ -827,6 +883,78 @@ pub(crate) mod tests {
             assert_eq!(rt.sim.list()?, []);
             assert_eq!(charged(&records, "kiln-z7-0").await?, None, "charged nothing");
             assert!(vms.meter("kiln-z7-0").is_none());
+            anyhow::Ok(())
+        })
+    }
+
+    /// Credential `reference`'s value in the store the tests' broker leases from: never in a spec, a log or the VM.
+    const REFERENCE: &str = "providers/anthropic";
+    const VALUE: &str = "sk-ant-api03-s33-never-in-a-spec";
+
+    /// Claude Code's launch reaching api.anthropic.com by TCP on 443, granted [`REFERENCE`] toward it.
+    fn granted() -> Launch {
+        let credentials = vec![kiln_seams::sandbox::CredentialGrant { reference: REFERENCE.to_owned(), toward: vec!["api.anthropic.com".to_owned()] }];
+        Launch { credentials, ..launch(Egress::Only(vec!["api.anthropic.com:443".into()])) }
+    }
+
+    /// #74 credentials (plan step 33, Shards' D242): a launch granting a credential reaches Hex with it by reference,
+    /// to its harness member toward its host, and a lessor of kiln's (`secrets::lessor::Lessors`, over the run-lease
+    /// broker) asked for its run as it starts, which leases the value by that reference alone. No spec Hex was asked
+    /// to create holds the value.
+    #[test]
+    fn s33_a_credential_grant_reaches_hex_by_reference_with_a_lessor() -> anyhow::Result<()> {
+        use kiln_seams::secrets::{SecretValue, Secrets as _, SimSecrets};
+
+        let clock = kiln_seams::clock::SimClock::new();
+        let lessors = crate::rt::block_on(async move {
+            let secrets = Arc::new(SimSecrets::new(Arc::new(clock.clone())));
+            secrets.create(REFERENCE, SecretValue::new(VALUE.as_bytes().to_vec())).await.map_err(anyhow::Error::msg)?;
+            let broker = crate::secrets::broker::Broker::open(secrets, crate::store::Store::in_memory()?, Arc::new(clock.clone())).await?;
+            anyhow::Ok(crate::secrets::lessor::Lessors::new(Arc::new(broker), Arc::new(clock.clone())))
+        })?;
+        let (rt, _records, vms) = metered();
+        *rt.lessors.lock() = Some(Arc::new(lessors));
+        let vms = vms.leasing();
+        anyhow::ensure!(vms.holds().credentials, "a sandbox whose runtime leases says it holds no credentials");
+        let (vms, run) = crate::rt::block_on(async move {
+            let run = vms.launch(granted()).await?;
+            anyhow::Ok((vms, run))
+        })?;
+        let id = BoxId::new("kiln-z7-0")?;
+        let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
+        let by_reference = hex_api::CredentialGrant { member: harness, reference: REFERENCE.to_owned(), toward: vec!["api.anthropic.com".to_owned()] };
+        assert_eq!(rt.sim.inspect(&id)?.credentials, [by_reference], "its grant, by reference, to its harness member");
+        let specs = rt.specs.lock().clone();
+        anyhow::ensure!(specs.len() == 1 && specs.iter().all(|s| s.contains(REFERENCE) && !s.contains(VALUE)), "a spec holds the value or no reference: {specs:?}");
+        let lessee = rt.lessees.lock().iter().find(|(b, _)| b == "kiln-z7-0").map(|(_, l)| Arc::clone(l));
+        let lessor = lessee.ok_or_else(|| anyhow::anyhow!("no lessor was asked for its run"))?;
+        // As Hex's run host asks, off kiln's runtime: the value leased by its reference.
+        let leased = lessor.lease(REFERENCE, None).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        anyhow::ensure!(leased.value.expose() == VALUE.as_bytes(), "the lessor leased another value");
+        lessor.release(&leased.lease);
+        crate::rt::block_on(async move {
+            run.kill();
+            let (_, ends) = drain(run.as_ref()).await;
+            assert_eq!(ends, [Exit::Killed]);
+            drop(vms);
+            anyhow::Ok(())
+        })
+    }
+
+    /// #74 credentials (plan step 33): where no broker leases this machine's credentials, a launch granting one is
+    /// refused, typed (`Unsupported`, [`super::NO_BROKER`]), and leaves no box: never run without its credential.
+    /// A grant toward a host its egress doesn't reach is `Invalid` first, as any sandbox's is.
+    #[test]
+    fn s33_a_credential_grant_with_no_broker_is_refused_typed() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (sim, vms) = vms();
+            anyhow::ensure!(!vms.holds().credentials, "a sandbox with no broker says it holds credentials");
+            let refused = vms.launch(granted()).await.err();
+            anyhow::ensure!(matches!(&refused, Some(Refusal::Unsupported(why)) if why == super::NO_BROKER), "{refused:?}");
+            let unreached = Launch { egress: Egress::Only(vec!["example.com:443".into()]), ..granted() };
+            let refused = vms.launch(unreached).await.err();
+            anyhow::ensure!(matches!(&refused, Some(Refusal::Invalid { what: "a credential grant", .. })), "{refused:?}");
+            assert_eq!(sim.list()?, [], "a refused launch leaves no box");
             anyhow::Ok(())
         })
     }

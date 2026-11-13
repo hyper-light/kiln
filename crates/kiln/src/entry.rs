@@ -791,6 +791,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 outpost: false,
                 // `[agent.facts]` and `[agent.probes]` of its config file (docs/ci.md W13-R02).
                 declared: kiln::runner::probe::Declared::from_file(&config_path),
+                // A runner process reaches no credential store: its microVMs hold no credentials (plan step 33).
+                leasing: None,
             };
             let result = boxed(|| run_agent(opts, shutdown)).await;
             if let Some(ann) = announcer {
@@ -836,6 +838,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 observe: false,
                 outpost: true,
                 declared: kiln::runner::probe::Declared::default(),
+                leasing: None,
             };
             boxed(|| run_agent(opts, shutdown)).await
         }

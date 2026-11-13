@@ -550,6 +550,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         observe: true,
         outpost: false,
         declared: crate::runner::probe::Declared::default(),
+        leasing: None,
     };
     crate::agent::enroll_only(&opts).await?;
     say(format!("enrolled    as {} with {server}", crate::pki::sanitize_name(&name)));

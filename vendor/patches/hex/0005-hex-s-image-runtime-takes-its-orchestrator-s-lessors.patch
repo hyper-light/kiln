@@ -1,0 +1,54 @@
+Subject: Hex's image runtime takes its orchestrator's lessors
+Why: kiln's sandbox gives Hex's image class the lessors over its run-lease broker (Shards' D242, joint plan step 33 C3): ImageRuntime made its ImageClass with none and kept it, so no orchestrator linking hex-node could lease its image VMs' credentials
+
+diff --git a/crates/hex-node/src/images.rs b/crates/hex-node/src/images.rs
+index 100b9361ce6fe83646a0437a109603957198a337..d6c41dfc9be33a04647628fb89428a95081f39c1 100644
+--- a/crates/hex-node/src/images.rs
++++ b/crates/hex-node/src/images.rs
+@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
++use hex_api::lease::Lessors;
+ use hex_api::{
+     BoxId, BoxInfo, BoxSpec, Class, HostUse, Member, Proc, Program, Refusal, Runtime, Signal,
+     Stdio, Usage,
+@@ -48,11 +49,38 @@ impl ImageRuntime {
+         records: &Path,
+         images: Result<Arc<dyn Images>, Refusal>,
+         waits: Result<ImageWaits, Refusal>,
++    ) -> Result<Arc<Self>, Refusal> {
++        Self::built(shards, paths, records, images, waits, None)
++    }
++
++    /// [`ImageRuntime::new`], its VMs' credentials leased through `lessors`, its orchestrator's (Shards' D242; joint
++    /// plan step 33, C3: [`ImageClass::with_lessors`]). A runtime made without them refuses a box granting a
++    /// credential as it is created, `Unconfigured`.
++    pub fn leasing(
++        shards: PathBuf,
++        paths: shards_api::RuntimePaths,
++        records: &Path,
++        lessors: Arc<dyn Lessors>,
++    ) -> Result<Arc<Self>, Refusal> {
++        Self::built(shards, paths, records, host_images(), Ok(ImageWaits::new()), Some(lessors))
++    }
++
++    fn built(
++        shards: PathBuf,
++        paths: shards_api::RuntimePaths,
++        records: &Path,
++        images: Result<Arc<dyn Images>, Refusal>,
++        waits: Result<ImageWaits, Refusal>,
++        lessors: Option<Arc<dyn Lessors>>,
+     ) -> Result<Arc<Self>, Refusal> {
+         let store = Store::open(&records.join("state"), &records.join("run"))?;
+         let class = ImageClass::new(shards)
+             .with_boot(images, waits, records.join("image-diagnostics"))
+             .with_paths(Arc::new(paths));
++        let class = match lessors {
++            Some(lessors) => class.with_lessors(lessors),
++            None => class,
++        };
+         let runtime = Arc::new(Self {
+             store,
+             turn: Mutex::new(()),

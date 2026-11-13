@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hex_api::lease::Lessors;
 use hex_api::{
     BoxId, BoxInfo, BoxSpec, Class, HostUse, Member, Proc, Program, Refusal, Runtime, Signal,
     Stdio, Usage,
@@ -49,10 +50,37 @@ impl ImageRuntime {
         images: Result<Arc<dyn Images>, Refusal>,
         waits: Result<ImageWaits, Refusal>,
     ) -> Result<Arc<Self>, Refusal> {
+        Self::built(shards, paths, records, images, waits, None)
+    }
+
+    /// [`ImageRuntime::new`], its VMs' credentials leased through `lessors`, its orchestrator's (Shards' D242; joint
+    /// plan step 33, C3: [`ImageClass::with_lessors`]). A runtime made without them refuses a box granting a
+    /// credential as it is created, `Unconfigured`.
+    pub fn leasing(
+        shards: PathBuf,
+        paths: shards_api::RuntimePaths,
+        records: &Path,
+        lessors: Arc<dyn Lessors>,
+    ) -> Result<Arc<Self>, Refusal> {
+        Self::built(shards, paths, records, host_images(), Ok(ImageWaits::new()), Some(lessors))
+    }
+
+    fn built(
+        shards: PathBuf,
+        paths: shards_api::RuntimePaths,
+        records: &Path,
+        images: Result<Arc<dyn Images>, Refusal>,
+        waits: Result<ImageWaits, Refusal>,
+        lessors: Option<Arc<dyn Lessors>>,
+    ) -> Result<Arc<Self>, Refusal> {
         let store = Store::open(&records.join("state"), &records.join("run"))?;
         let class = ImageClass::new(shards)
             .with_boot(images, waits, records.join("image-diagnostics"))
             .with_paths(Arc::new(paths));
+        let class = match lessors {
+            Some(lessors) => class.with_lessors(lessors),
+            None => class,
+        };
         let runtime = Arc::new(Self {
             store,
             turn: Mutex::new(()),

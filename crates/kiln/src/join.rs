@@ -1119,6 +1119,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             observe: true,
             outpost: false,
             declared: crate::runner::probe::Declared::default(),
+            leasing: None,
         }));
     }
     crate::install::install(crate::install::InstallArgs {

@@ -636,6 +636,15 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         let creds = (pki.ca_der.clone(), pki.issue_local(&name)?);
         let http_port = cfg.server.http_addr.rsplit_once(':').map_or("7070", |(_, p)| p).to_owned();
+        // Its microVMs' credentials leased from the run-lease broker over kiln's credential store (plan step 33, Shards'
+        // D242). A broker that doesn't open leaves it none: a launch granting a credential is then refused, typed.
+        let leasing = match crate::secrets::lessor::open(&hub).await {
+            Ok(lessors) => Some(crate::sandbox::Leasing(Arc::new(lessors))),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the run-lease broker didn't open: this machine's microVMs hold no credentials");
+                None
+            }
+        };
         let opts = crate::agent::Opts {
             server_url: format!("http://127.0.0.1:{http_port}"),
             quic: Some(format!("127.0.0.1:{}", quic_bind.port())),
@@ -658,6 +667,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             observe: false,
             outpost: false,
             declared: cfg.agent.clone(),
+            leasing,
         };
         // `kiln workflow run`'s server stops its runner itself, once the runs it follows ended.
         let agent_down = if cfg.ci.local { shutdown.clone() } else { shutdown_child() };

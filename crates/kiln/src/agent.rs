@@ -74,6 +74,9 @@ pub struct Opts {
     pub outpost: bool,
     /// What its administrator declares of it (docs/ci.md W13-R02).
     pub declared: crate::runner::probe::Declared,
+    /// What leases its microVMs' credentials (plan step 33, Shards' D242): the server's broker, for the server's own
+    /// runner alone; none elsewhere, where a launch granting a credential is refused (`sandbox::hexvm::NO_BROKER`).
+    pub leasing: Option<crate::sandbox::Leasing>,
 }
 
 /// Probes this runner's facts and sends them (docs/ci.md W13-R01), one probe at a time.
@@ -2512,7 +2515,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Some(r) => r.records().await,
             None => None,
         };
-        match crate::sandbox::hold(&o.state_dir, ledger).await {
+        match crate::sandbox::hold(&o.state_dir, ledger, o.leasing.clone()).await {
             Ok(Some(vms)) => h.hold_isolated_in(vms),
             Ok(None) => {}
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's microVMs couldn't be held: it holds no isolated agent"),

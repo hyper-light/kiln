@@ -22,8 +22,9 @@
 //!   ([`crate::rt::block_on`]); a lessor let go of on one of the runtime's shards, where nothing may
 //!   block, ends its run on a task of its own.
 //!
-//! The sandbox that gives Hex these lessors as it boots a harness's microVM, its launch's credential
-//! grants carried into its image's, is owed (docs/research/s33-veil-creds/STEP6.md in Shards).
+//! The server opens its broker over kiln's credential store and gives these lessors to its own runner
+//! ([`open`]), whose sandbox hands them to Hex's image runtime and carries each launch's credential
+//! grants into its image's, by reference (`sandbox::hexvm`, `hex_node::images::ImageRuntime::leasing`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +47,15 @@ fn refused(why: Refused) -> LeaseRefused {
         Refused::Store(e @ (Refusal::NotFound(_) | Refusal::Invalid { .. })) => LeaseRefused::Denied(e.to_string()),
         other => LeaseRefused::Unavailable(other.to_string()),
     }
+}
+
+/// The lessors of the server's own runner's microVMs, over the run-lease broker [`Broker::open`] opens on kiln's
+/// credential store (`KilnSecrets`) with its ledger in the server's store, on the process's clock: what its runner's
+/// sandbox leases its VMs' credentials through (`sandbox::Leasing`). Opening it revokes what a restart left leased.
+pub async fn open(hub: &Arc<crate::hub::Hub>) -> anyhow::Result<Lessors> {
+    let secrets: Arc<dyn kiln_seams::secrets::Secrets> = Arc::new(super::seam::KilnSecrets::new(Arc::clone(hub), crate::rt::clock()));
+    let broker = Broker::open(secrets, hub.store.clone(), crate::rt::clock()).await?;
+    Ok(Lessors::new(Arc::new(broker), crate::rt::clock()))
 }
 
 /// The lessors of a machine's runs: one for each run, over the broker.

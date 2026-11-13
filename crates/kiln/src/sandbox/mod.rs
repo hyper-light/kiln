@@ -63,17 +63,38 @@ impl Microvms {
     }
 }
 
+/// What leases a machine's microVMs' credentials (plan step 33, Shards' D242): Hex's lease seam, kiln's
+/// `secrets::lessor::Lessors` over the run-lease broker its server opens over kiln's credential store. Only the
+/// server's own runner holds one: a runner elsewhere reaches no store, so its microVMs hold no credentials
+/// (`hexvm::NO_BROKER`).
+#[derive(Clone)]
+pub struct Leasing(pub Arc<dyn hex_api::lease::Lessors>);
+
+impl std::fmt::Debug for Leasing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Leasing")
+    }
+}
+
 /// The machine's microVMs held under kiln's `state` through Hex, the carried `shards` (`shards`) running them
 /// (#73 part 7): Hex's image runtime, its boxes' records in `<state>/hex-records`, Shards' home and cache beneath
 /// kiln's state ([`shards_home`], `<state>/shards-cache`), its images built there (in `<state>/shards-builds`), each
-/// launch's box named by placement's numbering ([`box_name`]), each run's charge kept in `ledger` ([`of_hex`]).
-/// Nothing boots until a launch. Blocking.
-pub fn held_in(state: &std::path::Path, shards: std::path::PathBuf, ledger: Option<Arc<dyn kiln_seams::Records>>) -> anyhow::Result<Microvms> {
+/// launch's box named by placement's numbering ([`box_name`]), each run's charge kept in `ledger` ([`of_hex`]), and
+/// its VMs' credentials leased through `leasing` where it is given (plan step 33; else a launch granting one is
+/// refused). Nothing boots until a launch. Blocking.
+pub fn held_in(state: &std::path::Path, shards: std::path::PathBuf, ledger: Option<Arc<dyn kiln_seams::Records>>, leasing: Option<Leasing>) -> anyhow::Result<Microvms> {
     let state = std::path::absolute(state)?;
     let paths = shards_api::RuntimePaths::new(state.join("shards-cache"), shards_home(&state)).map_err(|r| anyhow::anyhow!("Shards' home and cache beneath {}: {r:?}", state.display()))?;
-    let runtime = hex_node::images::ImageRuntime::new(shards.clone(), paths, &state.join("hex-records")).map_err(|r| anyhow::anyhow!("Hex's image runtime under {}: {r}", state.display()))?;
+    let records = state.join("hex-records");
+    let leases = leasing.is_some();
+    let runtime = match leasing {
+        Some(Leasing(lessors)) => hex_node::images::ImageRuntime::leasing(shards.clone(), paths, &records, lessors),
+        None => hex_node::images::ImageRuntime::new(shards.clone(), paths, &records),
+    }
+    .map_err(|r| anyhow::anyhow!("Hex's image runtime under {}: {r}", state.display()))?;
     let images = image::Images::new(shards, shards_home(&state), state.join("shards-builds"));
-    Ok(of_hex(hexvm::HexVms::new(runtime, box_name), images, ledger))
+    let hex = hexvm::HexVms::new(runtime, box_name);
+    Ok(of_hex(if leases { hex.leasing() } else { hex }, images, ledger))
 }
 
 /// The machine's microVMs as `hex` holds them, booting `images`: each run's charge kept in `ledger` as it ends (the
@@ -110,9 +131,10 @@ pub fn microvm() -> Option<Arc<Microvms>> {
 }
 
 /// This machine's microVMs, held under kiln's `state` from now on, where this kiln carries Shards: it written out
-/// beneath `state` (`crate::shards::write_out`) and held, then [`held_in`], each run's charge kept in `ledger`. None
-/// where it carries none. The first held is this process's ([`microvm`], its facts' `virt.microvm`).
-pub async fn hold(state: &std::path::Path, ledger: Option<Arc<dyn kiln_seams::Records>>) -> anyhow::Result<Option<Arc<Microvms>>> {
+/// beneath `state` (`crate::shards::write_out`) and held, then [`held_in`], each run's charge kept in `ledger`, their
+/// credentials leased through `leasing` where it is given. None where it carries none. The first held is this
+/// process's ([`microvm`], its facts' `virt.microvm`).
+pub async fn hold(state: &std::path::Path, ledger: Option<Arc<dyn kiln_seams::Records>>, leasing: Option<Leasing>) -> anyhow::Result<Option<Arc<Microvms>>> {
     if let Some(held) = HELD.get() {
         return Ok(Some(Arc::clone(held)));
     }
@@ -122,7 +144,7 @@ pub async fn hold(state: &std::path::Path, ledger: Option<Arc<dyn kiln_seams::Re
     let state = state.to_path_buf();
     let vms = crate::rt::blocking(move || -> anyhow::Result<Microvms> {
         let shards = crate::shards::write_out(&state)?;
-        let mut vms = held_in(&state, shards.shards.clone(), ledger)?;
+        let mut vms = held_in(&state, shards.shards.clone(), ledger, leasing)?;
         vms.shards = Some(shards);
         Ok(vms)
     })
@@ -318,7 +340,7 @@ mod tests {
     #[test]
     fn s17_p7_a_carrying_runner_holds_harnesses_in_hex_and_says_so() -> anyhow::Result<()> {
         let state = tempfile::tempdir()?;
-        let vms = super::held_in(state.path(), state.path().join("shards"), None)?;
+        let vms = super::held_in(state.path(), state.path().join("shards"), None, None)?;
         anyhow::ensure!(vms.hex.is_some(), "its sandbox isn't Hex's");
         anyhow::ensure!(vms.sandbox.boundaries() == vec!["microvm"] && vms.sandbox.holds() == super::hexvm::HOLDS, "its sandbox isn't HexVms");
         anyhow::ensure!(state.path().join("hex-records").join("state").exists(), "Hex keeps no records beneath kiln's state");
@@ -331,6 +353,29 @@ mod tests {
             anyhow::ensure!(host.microvm().is_some_and(|m| m.hex.is_some()), "its harness host holds them elsewhere");
             Ok(())
         })
+    }
+
+    /// #74 credentials (plan step 33): a runner given the broker's lessors holds its microVMs through Hex's image
+    /// runtime given them (`ImageRuntime::leasing`), and says it holds credentials; one given none says it doesn't.
+    /// No VM boots.
+    #[test]
+    fn s33_a_runner_given_lessors_holds_credentials_and_one_without_doesnt() -> anyhow::Result<()> {
+        use std::sync::Arc;
+
+        struct Refusing;
+        impl hex_api::lease::Lessors for Refusing {
+            fn lessor(&self, _: &hex_api::BoxId) -> Result<Arc<dyn hex_api::lease::Lessor>, hex_api::Refusal> {
+                Err(hex_api::Refusal::Broken("no run boots here".into()))
+            }
+        }
+        let state = tempfile::tempdir()?;
+        let leasing = super::Leasing(Arc::new(Refusing));
+        let vms = super::held_in(state.path(), state.path().join("shards"), None, Some(leasing))?;
+        anyhow::ensure!(vms.sandbox.holds() == kiln_seams::sandbox::Holds { credentials: true, ..super::hexvm::HOLDS }, "{:?}", vms.sandbox.holds());
+        let other = tempfile::tempdir()?;
+        let vms = super::held_in(other.path(), other.path().join("shards"), None, None)?;
+        anyhow::ensure!(!vms.sandbox.holds().credentials, "a runner with no broker says it holds credentials");
+        Ok(())
     }
 
     /// #73 part 7 slices 2 and 3: a run launched in the box placement holds for it is grouped for placement by its
