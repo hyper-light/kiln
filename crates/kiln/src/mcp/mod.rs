@@ -1669,17 +1669,27 @@ mod tests {
 
     /// Step 30: an agent on a runner keeps, reads, changes, restores, lists and deletes an Agentfile
     /// through reach, each call answered as its operation answers it, the Agentfile its person's (the
-    /// owner's, on a kiln nobody else signs in to). Whose an agent reaches is `agentfiles::tests`'.
+    /// owner's, on a kiln nobody else signs in to). One Shards refuses is refused in Shards' words and
+    /// kept nowhere, and checking it answers what Shards said. Whose an agent reaches is
+    /// `agentfiles::tests`'.
     #[test]
     fn step30_an_agent_on_a_runner_round_trips_an_agentfile() -> anyhow::Result<()> {
         const V1: &str = "FROM ubuntu:24.04\nAGENT main FROM ./agent\nCMD [\"claude\"]\n";
         const V2: &str = "FROM ubuntu:24.04\nAGENT main FROM ./agent\nAGENT helper FROM ./helper\nCMD [\"claude\"]\n";
+        const INVALID: &str = "FROM ubuntu:24.04\nFORM ubuntu\n";
+        const SAID: &str = "dockerfile parse error on line 2: unknown instruction: FORM";
         crate::rt::block_on(async {
             let hub = session_on_box().await?;
             let at = |v: &Value, p: &str| v.pointer(p).cloned().unwrap_or(Value::Null);
             let made = s1_calls(&hub, "agentfiles.create", json!({"name": "claude", "text": V1})).await?;
             let id = at(&made, "/ok/agentfile/id").as_str().unwrap_or_default().to_owned();
             anyhow::ensure!(!id.is_empty() && at(&made, "/ok/agentfile/version") == json!(1) && at(&made, "/ok/agentfile/owner") == json!("owner"), "{made}");
+            let refused = s1_calls(&hub, "agentfiles.create", json!({"name": "claude-invalid", "text": INVALID})).await?;
+            let refusal = at(&refused, "/error");
+            anyhow::ensure!(at(&refused, "/status") == json!(422) && refusal.as_str().is_some_and(|e| e.starts_with(&format!("Shards refuses this Agentfile: {SAID}"))), "{refused}");
+            let checked = s1_calls(&hub, "agentfiles.check", json!({"text": INVALID})).await?;
+            let said = at(&checked, "/ok/diagnostics/0/message");
+            anyhow::ensure!(at(&checked, "/ok/checked") == json!(true) && at(&checked, "/ok/diagnostics/0/severity") == json!("error") && said.as_str().is_some_and(|m| m.starts_with(SAID)), "{checked}");
             let got = s1_calls(&hub, "agentfiles.get", json!({"id": id})).await?;
             anyhow::ensure!(at(&got, "/ok/text") == json!(V1) && at(&got, "/ok/version") == json!(1), "{got}");
             let v2 = s1_calls(&hub, "agentfiles.update", json!({"id": id, "text": V2})).await?;
