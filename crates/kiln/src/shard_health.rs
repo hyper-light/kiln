@@ -1049,7 +1049,8 @@ fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
     }
     // Each shard's entries by what the exposition names them (two labels of one name are one series): polls,
     // their time, the longest, those of them the host held with their time, those whose thread said its time on
-    // the CPU with their holds, that time and the longest of it, and those past the step quantum.
+    // the CPU with their holds, that time and the longest of it, those whose thread said its own time too with their
+    // time on the CPU, their own and the longest of it, and those past the step quantum.
     #[derive(Default)]
     struct Row {
         polls: u64,
@@ -1063,6 +1064,12 @@ fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
         longest_cpu: u64,
         past_polls: u64,
         past_cpu_polls: u64,
+        own_polls: u64,
+        own_cpu_ns: u64,
+        own_ns: u64,
+        longest_own: u64,
+        past_own_polls: u64,
+        past_cpu_interrupts_polls: u64,
     }
     let mut rows: std::collections::BTreeMap<(usize, String, &'static str), Row> = std::collections::BTreeMap::new();
     for (i, holder) in crate::rt::shard_holders().into_iter().take(shards().len()).enumerate() {
@@ -1080,6 +1087,12 @@ fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
             row.longest_cpu = row.longest_cpu.max(p.longest_cpu_ns);
             row.past_polls = row.past_polls.saturating_add(p.past_polls);
             row.past_cpu_polls = row.past_cpu_polls.saturating_add(p.past_cpu_polls);
+            row.own_polls = row.own_polls.saturating_add(p.own_polls);
+            row.own_cpu_ns = row.own_cpu_ns.saturating_add(p.own_cpu_ns);
+            row.own_ns = row.own_ns.saturating_add(p.own_ns);
+            row.longest_own = row.longest_own.max(p.longest_own_ns);
+            row.past_own_polls = row.past_own_polls.saturating_add(p.past_own_polls);
+            row.past_cpu_interrupts_polls = row.past_cpu_interrupts_polls.saturating_add(p.past_cpu_interrupts_polls);
         }
     }
     let series = |o: &mut String, name: &str, value: &dyn Fn(&Row) -> String| {
@@ -1114,6 +1127,21 @@ fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
     series(o, "kiln_shard_held_past_quantum_polls_total", &|r| r.past_polls.to_string());
     help(o, "kiln_shard_held_cpu_past_quantum_polls_total", "counter", "Of those polls, the ones that ran on the CPU past the step quantum (Linux).");
     series(o, "kiln_shard_held_cpu_past_quantum_polls_total", &|r| r.past_cpu_polls.to_string());
+    // Goal 9, plan 01a1a87b2cec step 3: of a poll's time on the CPU, its thread's own (Linux: its CPU clock, read for the
+    // polls of a site that ran past the quantum before): the task clock counts the interrupts and softirqs the thread's CPU
+    // served while it ran, the host's, and in kiln's lab those took socket writes to 820 µs with 24 µs of their own.
+    help(o, "kiln_shard_held_own_polls_total", "counter", "Of those polls, the ones whose shard's thread said its own time too (Linux).");
+    series(o, "kiln_shard_held_own_polls_total", &|r| r.own_polls.to_string());
+    help(o, "kiln_shard_held_own_cpu_seconds_total", "counter", "Their time on the CPU, added up.");
+    series(o, "kiln_shard_held_own_cpu_seconds_total", &|r| secs(Duration::from_nanos(r.own_cpu_ns)).to_string());
+    help(o, "kiln_shard_held_own_seconds_total", "counter", "Their own time, added up: the rest of their time on the CPU was the interrupts and softirqs their CPU served (the host's).");
+    series(o, "kiln_shard_held_own_seconds_total", &|r| secs(Duration::from_nanos(r.own_ns)).to_string());
+    help(o, "kiln_shard_held_longest_own_seconds", "gauge", "The longest own time of any of them.");
+    series(o, "kiln_shard_held_longest_own_seconds", &|r| secs(Duration::from_nanos(r.longest_own)).to_string());
+    help(o, "kiln_shard_held_own_past_quantum_polls_total", "counter", "Of those polls, the ones whose own time passed the step quantum (Linux).");
+    series(o, "kiln_shard_held_own_past_quantum_polls_total", &|r| r.past_own_polls.to_string());
+    help(o, "kiln_shard_held_cpu_past_quantum_interrupts_polls_total", "counter", "Of the polls past the step quantum on the CPU, the ones whose own time was within it: the interrupts their CPU served took them past (Linux).");
+    series(o, "kiln_shard_held_cpu_past_quantum_interrupts_polls_total", &|r| r.past_cpu_interrupts_polls.to_string());
 }
 
 /// A label's value as the exposition writes it: its backslashes, quotes and line ends escaped.

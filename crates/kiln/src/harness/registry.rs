@@ -2437,6 +2437,39 @@ impl Registry {
     /// store, and said in the log; one the store has nothing of, said too, with why. As the server
     /// starts, and again as a runner's report finds one missing (`Hub`'s inventory).
     pub async fn restore_held(hub: &Arc<Hub>) -> anyhow::Result<()> {
+        let tried = Self::restore_held_once(hub).await;
+        // Not all of them listed (the store didn't answer in time): tried again at each of the store's commits, until
+        // every one is listed or said to be beyond it, whether or not a runner reports again (2026-11-13 08:41Z).
+        if Self::held_missing(hub) && !RESTORE_RETRYING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            if let Some(commits) = hub.harness.convo.as_ref().map(crate::convo::store::Store::watch) {
+                let hub = Arc::clone(hub);
+                crate::rt::spawn(async move {
+                    let mut tries = 1u64;
+                    while Self::held_missing(&hub) {
+                        commits.notified().await;
+                        tries = tries.saturating_add(1);
+                        if let Err(e) = Self::restore_held_once(&hub).await {
+                            tracing::warn!(error = %format!("{e:#}"), tries, "sessions runner processes were last known to hold still couldn't be listed again: tried again at the store's next commit");
+                        }
+                    }
+                    RESTORE_RETRYING.store(false, std::sync::atomic::Ordering::Release);
+                    tracing::info!(tries, "every session runner processes were last known to hold is listed, or said to be beyond the store");
+                });
+            } else {
+                RESTORE_RETRYING.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        tried
+    }
+
+    /// Whether a session holders.json names is neither listed nor said to be beyond the store.
+    fn held_missing(hub: &Hub) -> bool {
+        let said = NOT_RESTORED.lock();
+        hub.harness.holders.load().keys().any(|id| !hub.harness.sessions.contains(id) && !said.contains(id))
+    }
+
+    /// [`Registry::restore_held`], once.
+    async fn restore_held_once(hub: &Arc<Hub>) -> anyhow::Result<()> {
         let Some(st) = hub.harness.convo.clone() else { return Ok(()) };
         let missing: Vec<String> = hub.harness.holders.load().keys().filter(|id| !hub.harness.sessions.contains(id)).cloned().collect();
         if missing.is_empty() {
@@ -2445,9 +2478,12 @@ impl Registry {
         let found = crate::rt::blocking(move || -> anyhow::Result<Vec<(String, Result<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>), String>)>> {
             let mut out = Vec::new();
             for id in missing {
-                let got = match st.kept_committed(&id, MAX_EVENTS)? {
+                // Its row by its key and its newest events by an index's order alone (`Store::restorable_committed`):
+                // cheap whatever its size (a session's whole timeline read and sorted outlasted the store's wait,
+                // 2026-11-13 08:41Z). The rest of its timeline comes as a viewer pages back.
+                let got = match st.restorable_committed(&id, RESTORE_EVENTS)? {
                     Some(k) => match k.info {
-                        Some(info) => Ok((crate::convo::store::Unended { id: id.clone(), info, meta: k.meta, state: k.state, machine: None }, cut(k.events, MAX_EVENTS))),
+                        Some(info) => Ok((crate::convo::store::Unended { id: id.clone(), info, meta: k.meta, state: k.state, machine: None }, cut(k.events, RESTORE_EVENTS))),
                         None => Err("the conversation store keeps its events but not what it is".to_owned()),
                     },
                     None => Err("the conversation store has nothing of it".to_owned()),
@@ -2471,7 +2507,13 @@ impl Registry {
         let reopened: Vec<(String, String)> = away.iter().map(|(u, _)| (u.id.clone(), u.info.clone())).collect();
         hub.harness.restore_away(hub, away).await;
         for (id, info) in reopened {
-            let status = hub.harness.info(&id).map(|i| i.status);
+            let Some(status) = hub.harness.info(&id).map(|i| i.status) else {
+                // Its record doesn't say what it is or which machine it's on: it can't be listed, said once.
+                if NOT_RESTORED.lock().insert(id.clone()) {
+                    tracing::warn!(session = %id, "a session a runner process was last known to hold couldn't be listed again: its record doesn't say what it is or which machine it's on");
+                }
+                continue;
+            };
             tracing::info!(session = %id, status = ?status, "a session a runner process was last known to hold, listed again");
             if let (Some(store), Ok(info)) = (hub.harness.convo.as_ref(), serde_json::from_str::<Info>(&info)) {
                 store.send(&id, &Update::Open { info: Box::new(info), since: None });
@@ -5138,6 +5180,13 @@ fn cut(mut events: Vec<crate::convo::rows::EventRow>, keep: usize) -> Vec<crate:
     }
     events
 }
+
+/// The newest events a session is listed again with (`Registry::restore_held`): as many as an away session's copy
+/// keeps that hasn't changed in a day (`Registry::list_away`); a viewer pages back for the rest.
+const RESTORE_EVENTS: usize = 200;
+
+/// A retry of `Registry::restore_held` is under way: one at a time.
+static RESTORE_RETRYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Held sessions said in the log already as not listed again (`Registry::restore_held`): once each,
 /// not at every runner's report.

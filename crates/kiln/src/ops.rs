@@ -385,7 +385,7 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     if name.starts_with("deploy.") {
         return crate::deploy::ops::call(cx, name, input).await;
     }
-    if let Some(op) = own().iter().find(|o| o.name == name) {
+    if let Some((at, op)) = own().iter().enumerate().find(|(_, o)| o.name == name) {
         let (method, segs) = (op.route)(&input)?;
         let path = format!("/{}", segs.join("/"));
         let run = async {
@@ -394,7 +394,7 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
             // Read as its type, once its caller may run it: what doesn't fit is refused, saying
             // where and why.
             op.input.fits(&input).map_err(|m| (StatusCode::BAD_REQUEST, m.said(name)))?;
-            run_recorded(&cx, op, input).await
+            run_piece(&cx, at, op, input).await
         };
         if op.read_only {
             return run.await;
@@ -430,8 +430,28 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
 /// Runs one of kiln's own operations for its HTTP route, which the route table has let through
 /// and the audit trail records already.
 pub async fn run_own(cx: Cx, name: &str, input: Value) -> Out {
-    let op = own().iter().find(|o| o.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no operation {name}")))?;
-    run_recorded(&cx, op, input).await
+    let (at, op) = own().iter().enumerate().find(|(_, o)| o.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no operation {name}")))?;
+    run_piece(&cx, at, op, input).await
+}
+
+/// What each of kiln's own operations holds its shard for as it runs, before it first waits, by its place in [`own`]:
+/// learned as each runs on a shard, so its next run is a piece of its poll's turn (`crate::rt::piece`; goal 9, plan
+/// 01a1a87b2cec step 3).
+fn run_costs(at: usize) -> Option<&'static kiln_http::turn::Costs> {
+    static COSTS: std::sync::OnceLock<Box<[kiln_http::turn::Costs]>> = std::sync::OnceLock::new();
+    COSTS.get_or_init(|| own().iter().map(|_| kiln_http::turn::Costs::nothing_yet()).collect()).get(at)
+}
+
+/// [`run_recorded`] of `op`, the operation at `at` in [`own`], as a piece of its poll's turn on a shard: where what its runs
+/// hold their shard for before they first wait won't fit what's left of the poll's quantum, the shard goes to its other
+/// tasks first and the run starts a poll of its own (`crate::rt::piece`). Goal 9, plan 01a1a87b2cec step 3: an MCP call's
+/// steps, each 5 to 70 µs (its body read, its operation found, gated and fitted, then run), held one poll of its
+/// connection to 0.49 ms on the CPU in the lab, the operation's run last.
+async fn run_piece(cx: &Cx, at: usize, op: &Op, input: Value) -> Out {
+    match run_costs(at) {
+        Some(costs) => crate::rt::piece(costs, run_recorded(cx, op, input)).await,
+        None => run_recorded(cx, op, input).await,
+    }
 }
 
 /// Attention plan 01a199e1b177752e84dad5dc990e6a15: preserve the authenticated
