@@ -23,6 +23,7 @@
 #![allow(dead_code, reason = "each test uses what it needs")]
 
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Mutex, PoisonError};
@@ -814,26 +815,130 @@ impl std::fmt::Display for SetupRefused {
 
 impl std::error::Error for SetupRefused {}
 
-/// Follows a setup wait: `look`, once a [`POLL`], until it gives its answer, refused at once, typed,
-/// where it says none can come or `ended` says a party's process ended. A look that couldn't reach the
-/// server (an `Err`) is looked again while the parties live. No time bound: a setup wait is its
-/// parties' cold start, before anything of theirs has answered.
-pub fn setup<T>(ended: impl Fn() -> Option<SetupStuck>, mut look: impl FnMut() -> anyhow::Result<Setup<T>>, refuse: impl Fn(SetupStuck) -> anyhow::Error) -> anyhow::Result<T> {
+/// Follows a setup wait: `look` until it gives its answer, refused at once, typed, where it says none
+/// can come or `ended` says a party's process ended. Between looks it waits on `wake`, kiln's next
+/// change notification, given how long the look took. A look that couldn't reach the server (an
+/// `Err`) is looked again while the parties live. No time bound: a setup wait is its parties' cold
+/// start, before anything of theirs has answered.
+pub fn setup<T>(ended: impl Fn() -> Option<SetupStuck>, mut look: impl FnMut() -> anyhow::Result<Setup<T>>, refuse: impl Fn(SetupStuck) -> anyhow::Error, mut wake: impl FnMut(Duration)) -> anyhow::Result<T> {
     loop {
         if let Some(stuck) = ended() {
             return Err(refuse(stuck));
         }
+        let looked = Instant::now();
         match look() {
             Ok(Setup::Ready(answer)) => return Ok(answer),
             Ok(Setup::Refuse(stuck)) => return Err(refuse(stuck)),
-            Ok(Setup::Wait) | Err(_) => std::thread::sleep(POLL),
+            Ok(Setup::Wait) | Err(_) => wake(looked.elapsed()),
         }
     }
 }
 
-/// [`setup`] on fixture `f`'s parties, refused with its runner's log.
+/// [`setup`] on fixture `f`'s parties, woken by kiln's events socket, refused with its runner's log.
 fn setup_on<T>(f: &Fixture, what: &str, look: impl FnMut() -> anyhow::Result<Setup<T>>) -> anyhow::Result<T> {
-    setup(|| f.ended(), look, |stuck| anyhow::Error::new(SetupRefused { what: what.to_owned(), stuck, evidence: f.runner_log() }))
+    let mut wake = Wake::events(f);
+    setup(|| f.ended(), look, |stuck| anyhow::Error::new(SetupRefused { what: what.to_owned(), stuck, evidence: f.runner_log() }), |took| wake.next(None, took))
+}
+
+// ------------------------------------------------------------------------------------------------
+// What a wait wakes on: kiln's own change notifications (R05; the waits note)
+// ------------------------------------------------------------------------------------------------
+
+/// kiln's change notifications a wait wakes on: a socket kiln pushes its changes down, a session's
+/// own ([`Wake::session`]: what its viewers are sent, every update of its copy) or the events socket
+/// ([`Wake::events`]: the hub's events, runners' records among them), read a frame at a time.
+pub struct Wake {
+    port: u16,
+    admin: String,
+    path: String,
+    /// The session's socket sends what the session has first, up to `synced`: what's there, not a change.
+    snapshot: bool,
+    sock: Option<std::net::TcpStream>,
+}
+
+impl Wake {
+    /// Session `id`'s own socket, its viewers'.
+    pub fn session(f: &Fixture, id: &str) -> Self {
+        Self { port: f.port, admin: f.admin.clone(), path: format!("/api/harness/sessions/{id}/ws"), snapshot: true, sock: None }
+    }
+
+    /// kiln's events socket (`GET /api/events`, each event as it comes).
+    pub fn events(f: &Fixture) -> Self {
+        Self { port: f.port, admin: f.admin.clone(), path: "/api/events".to_owned(), snapshot: false, sock: None }
+    }
+
+    /// Waits for kiln's next change: until a frame comes down the socket, or `within` passes (none: no
+    /// bound). Frames that follow it within `settle` (how long a look takes) are read with it, so looks
+    /// never outrun kiln's answers. The socket is opened as it's first waited on, and again after it
+    /// ended; that wait returns at once, so a change made while it opened is looked at. An opening
+    /// that fails pauses as long as it took.
+    pub fn next(&mut self, within: Option<Duration>, settle: Duration) {
+        if self.sock.is_none() {
+            let began = Instant::now();
+            match self.open() {
+                Ok(s) => self.sock = Some(s),
+                Err(_) => std::thread::sleep(began.elapsed()),
+            }
+            return;
+        }
+        if within.is_some_and(|w| w.is_zero()) {
+            return;
+        }
+        let Some(s) = self.sock.as_mut() else { return };
+        // A frame within `t` (none: no bound), each read with its own bound: a frame that began is
+        // read whole, with none.
+        let read = |s: &mut std::net::TcpStream, t: Option<Duration>| -> anyhow::Result<bool> {
+            s.set_read_timeout(t)?;
+            frame_or_quiet(s)
+        };
+        let ended = match read(s, within) {
+            Ok(true) => {
+                !settle.is_zero()
+                    && loop {
+                        match read(s, Some(settle)) {
+                            Ok(true) => {}
+                            Ok(false) => break false,
+                            Err(_) => break true,
+                        }
+                    }
+            }
+            Ok(false) => false,
+            Err(_) => true,
+        };
+        if ended {
+            self.sock = None;
+        }
+    }
+
+    fn open(&self) -> anyhow::Result<std::net::TcpStream> {
+        let mut s = common::agents::socket(self.port, &self.admin, &self.path)?;
+        if self.snapshot {
+            common::agents::until_synced(&mut s)?;
+        }
+        Ok(s)
+    }
+}
+
+/// One WebSocket frame off `s`, the server's (unmasked): `true` one came; `false` none began within
+/// its read timeout, so nothing of one was read and the socket stays whole; an error: it ended or
+/// broke. A frame that began is read whole, its sender writing it whole.
+pub fn frame_or_quiet(s: &mut std::net::TcpStream) -> anyhow::Result<bool> {
+    let mut first = [0u8; 1];
+    match s.read(&mut first) {
+        Ok(0) => anyhow::bail!("the socket ended"),
+        Ok(_) => {}
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+    s.set_read_timeout(None)?;
+    let second = common::agents::take(s, 1)?.first().copied().unwrap_or_default();
+    let len = match second & 0x7f {
+        126 => common::agents::take(s, 2)?.iter().fold(0usize, |a, b| (a << 8) | usize::from(*b)),
+        127 => common::agents::take(s, 8)?.iter().fold(0usize, |a, b| (a << 8) | usize::from(*b)),
+        n => usize::from(n),
+    };
+    common::agents::take(s, len)?;
+    Ok(true)
 }
 
 /// What a server's answer other than the one looked for says: a refusal at its word (a client error,
@@ -1042,10 +1147,6 @@ pub fn said_after(events: &[Value], client: &str) -> Vec<String> {
 // 01a1cd8e862e7169a074db3d5fa33f3d step 35; docs/research/s35-every-harness/waits/README.md)
 // ------------------------------------------------------------------------------------------------
 
-/// How often a wait looks at its session: a probe's period, which bounds nothing. kiln's own change
-/// notifications (a session's event stream) would take its place (R05; owed, as the note says).
-const POLL: Duration = Duration::from_millis(250);
-
 /// What a wait asked of its harness: how its answer is told, and whether an earlier answer bounds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Asked<'a> {
@@ -1244,6 +1345,12 @@ impl<'a> Watch<'a> {
             },
             _ => Verdict::Wait,
         }
+    }
+
+    /// How long it may yet go without progress, `at` after it began, before a look refuses it: none,
+    /// where no window bounds it.
+    pub fn left(&self, at: Duration) -> Option<Duration> {
+        self.window.map(|w| self.moved.saturating_add(w).saturating_sub(at))
     }
 
     fn stuck(&mut self, info: &Value, events: &[Value], state: Option<&Value>) -> Option<Stuck> {
@@ -1454,8 +1561,10 @@ impl Pace {
     pub fn until(&mut self, f: &Fixture, id: &str, asked: Asked<'_>, what: &str, done: impl Fn(&Value, &[Value]) -> bool) -> anyhow::Result<(Value, Vec<Value>)> {
         let began = Instant::now();
         let mut watch = Watch::new(asked, self.window(asked));
+        let mut wake = Wake::session(f, id);
         let mut said_held = String::new();
         loop {
+            let looked = Instant::now();
             let (i, e) = (info(f, id)?, events(f, id)?);
             let held = done(&i, &e);
             let at = began.elapsed();
@@ -1467,14 +1576,14 @@ impl Pace {
                     self.answered(began.elapsed());
                     return Ok((i, e));
                 }
-                Verdict::Wait => std::thread::sleep(POLL),
+                Verdict::Wait => wake.next(watch.left(began.elapsed()), looked.elapsed()),
                 Verdict::Held(why) => {
                     // Said as held, once a hold: the wait goes on.
                     if why != said_held {
                         eprintln!("{what}: held by kiln, the wait going on: {why}");
                         said_held = why;
                     }
-                    std::thread::sleep(POLL);
+                    wake.next(watch.left(began.elapsed()), looked.elapsed());
                 }
                 Verdict::Refuse(stall) => return Err(refused(f, id, what, stall, &i, &e)),
             }
@@ -1482,11 +1591,13 @@ impl Pace {
     }
 
     /// Waits until kiln lists session `id` no more (it was ended), as [`Pace::until`] waits: on kiln's
-    /// word on it moving while it's listed.
+    /// word on it moving while it's listed, woken by kiln's events socket, which says each session's end.
     pub fn unlisted(&mut self, f: &Fixture, id: &str, what: &str) -> anyhow::Result<()> {
         let began = Instant::now();
         let mut watch = Watch::new(Asked::Kiln, self.window(Asked::Kiln));
+        let mut wake = Wake::events(f);
         loop {
+            let looked = Instant::now();
             let (code, body) = common::http(f.port, "GET", &format!("/api/harness/sessions/{id}"), &f.admin, None)?;
             if code == 404 {
                 self.answered(began.elapsed());
@@ -1496,7 +1607,7 @@ impl Pace {
             let i: Value = serde_json::from_str(&body)?;
             match watch.look(&i, &[], None, false, began.elapsed()) {
                 Verdict::Refuse(stall) => return Err(refused(f, id, what, stall, &i, &[])),
-                Verdict::Done | Verdict::Wait | Verdict::Held(_) => std::thread::sleep(POLL),
+                Verdict::Done | Verdict::Wait | Verdict::Held(_) => wake.next(watch.left(began.elapsed()), looked.elapsed()),
             }
         }
     }
@@ -1514,10 +1625,16 @@ impl Pace {
 // The drive: start, steer, interrupt, stop and resume, as a person does through kiln's API
 // ------------------------------------------------------------------------------------------------
 
-/// The stand-in's long turn, steered into: each line a few looks of the drive apart, so a message
-/// steered in as the drive sees the turn begin lands while it still runs.
+/// The stand-in's steered turn's gap between its lines, its own pace (`POLL * 8` it was, while the
+/// drive looked every `POLL`): long enough for the drive to see the turn under way and steer a message
+/// in, each a round trip through kiln, before its next line. No wait reads it: the steered turn's wait
+/// follows the harness alone (`Asked::Steered`). Measured for it from a round trip, owed (the note).
+const STEERED_GAP: Duration = Duration::from_secs(2);
+
+/// The stand-in's long turn, steered into: its lines [`STEERED_GAP`] apart, so a message steered in as
+/// the drive sees the turn begin lands while it still runs.
 pub fn stub_steered_turn() -> String {
-    format!("SLOW={} keep going", (POLL * 8).as_millis())
+    format!("SLOW={} keep going", STEERED_GAP.as_millis())
 }
 
 /// The stand-in's turn to stop: it holds once it said what it heard, and only a stop ends it, so a

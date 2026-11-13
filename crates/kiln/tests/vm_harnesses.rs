@@ -627,11 +627,64 @@ mod waits {
                 Ok(Setup::Ready(()))
             },
             |stuck| anyhow::Error::new(SetupRefused { what: "runner box connecting".into(), stuck, evidence: String::new() }),
+            |_| (),
         );
         assert!(waited.as_ref().err().and_then(|e| e.downcast_ref::<SetupRefused>()).is_some_and(|r| r.stuck == gone), "{waited:?}");
         assert_eq!(looks, 0);
         // Both alive: it looks, and takes its answer.
-        assert_eq!(setup(|| None, || Ok(Setup::Ready(7)), |stuck| anyhow::anyhow!("{stuck}")).ok(), Some(7));
+        assert_eq!(setup(|| None, || Ok(Setup::Ready(7)), |stuck| anyhow::anyhow!("{stuck}"), |_| ()).ok(), Some(7));
+    }
+
+    /// Between looks a setup wait waits on kiln's next change notification ([`Wake`]), given how long
+    /// the look took, never on a period of its own. Sleeping a period between looks (the 250 ms `POLL`
+    /// it replaces) never asks kiln.
+    #[test]
+    fn s35_a_setup_wait_wakes_on_kilns_changes_between_looks() {
+        let (mut looks, mut woken) = (0, Vec::new());
+        let ready = setup(
+            || None,
+            || {
+                looks += 1;
+                Ok(if looks < 3 { Setup::Wait } else { Setup::Ready(looks) })
+            },
+            |stuck| anyhow::anyhow!("{stuck}"),
+            |took| woken.push(took),
+        );
+        assert_eq!(ready.ok(), Some(3));
+        assert_eq!(woken.len(), 2, "woken between each two looks");
+    }
+
+    /// A wait reads kiln's change notifications a frame at a time: none pending is quiet and reads
+    /// nothing of the socket, so the next frame comes whole; a frame wakes it; a socket that ended ends
+    /// it. A reader that took a quiet socket for a frame would never wait at all.
+    #[test]
+    fn s35_a_wait_hears_kilns_changes_a_frame_at_a_time() -> anyhow::Result<()> {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let mut client = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        client.set_nonblocking(true)?;
+        assert!(!frame_or_quiet(&mut client)?, "none pending");
+        client.set_nonblocking(false)?;
+        server.write_all(&[0x81, 5, b'h', b'e', b'l', b'l', b'o', 0x81, 2, b'h', b'i'])?;
+        assert!(frame_or_quiet(&mut client)? && frame_or_quiet(&mut client)?, "two frames, each whole");
+        drop(server);
+        assert!(frame_or_quiet(&mut client).is_err(), "it ended");
+        Ok(())
+    }
+
+    /// A wait's socket read is bounded by what's left of its window, never more: none before a first
+    /// answer; from its last progress once there's one. Bounding the read by a period of its own would
+    /// refuse late or look for nothing.
+    #[test]
+    fn s35_a_wait_reads_kiln_for_what_is_left_of_its_window() {
+        assert_eq!(Watch::new(Asked::Opening, None).left(s(600)), None);
+        let mut w = Watch::new(Asked::Message("m"), Some(s(11)));
+        assert_eq!(w.look(&word("running"), &[user(1, "m", "go")], None, false, s(0)), Verdict::Wait);
+        assert_eq!(w.left(s(4)), Some(s(7)));
+        assert_eq!(w.look(&word("running"), &[user(1, "m", "go"), says(2, "line 00000")], None, false, s(10)), Verdict::Wait);
+        assert_eq!(w.left(s(15)), Some(s(6)), "from its last progress");
+        assert_eq!(w.left(s(30)), Some(s(0)));
     }
 
     /// The runner connecting (`up`): connected is its answer; listed but not connected, it's between
