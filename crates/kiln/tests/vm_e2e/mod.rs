@@ -1173,13 +1173,13 @@ pub const STUB_HARNESS: (&str, &str) = ("crates/kiln/tests/fixtures/vm-stub/harn
 /// builds a person's `agentfile:<id>` (kiln plan step 17: no build context, no build arguments): kiln's
 /// own images' base (`base`, their `ARG BASE=` line); the harness named as kind's, which kiln starts
 /// by that name, from `repository` at `commit` (fetched by Shards' own git client where the runner
-/// is) to [`STUB_HARNESS`]'s path, speaking kind's interface; its project and home as kiln's images
-/// mount theirs; and no network at all, as it calls no model and reaches kiln on the agent-control
-/// link alone (default deny; Shards D254).
+/// is) to [`STUB_HARNESS`]'s path, speaking kind's interface; its home as kiln's images mount theirs
+/// (its project is plugged in at its host path, as every harness's is: Shards D235); and no network at
+/// all, as it calls no model and reaches kiln on the agent-control link alone (default deny; D254).
 pub fn stub_agentfile(kind: &str, program: &str, commit: &str, base: &str, repository: &str) -> String {
     let (dir, at) = STUB_HARNESS;
     format!(
-        "{base}\nFROM ${{BASE}}\nENV VM_STUB_PROTOCOL={program}\nHARNESS {kind} FROM {repository}.git#{commit}:{dir} TO {at}\nVOLUME --target-kind=harness /workspace FOR {kind}\nVOLUME --target-kind=harness /home/{kind} FOR {kind}\n"
+        "{base}\nFROM ${{BASE}}\nENV VM_STUB_PROTOCOL={program}\nHARNESS {kind} FROM {repository}.git#{commit}:{dir} TO {at}\nVOLUME --target-kind=harness /home/{kind} FOR {kind}\n"
     )
 }
 
