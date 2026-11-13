@@ -65,11 +65,14 @@ class Op:
 class Stream:
     """One lane: what is written into (`wfd`) and what comes back (`rfd`)."""
 
-    def __init__(self, name: str, wfd: int, rfd: int, ended: Callable[[str], None]) -> None:
+    def __init__(self, name: str, wfd: int, rfd: int, ended: Callable[[str], None], closer: Optional[Callable[[], None]] = None) -> None:
         self.name = name
         self.wfd = wfd
         self.rfd = rfd
         self.ended = ended
+        # What ends our side of the lane: the file object that owns `wfd` where there is one, so it
+        # isn't closed twice.
+        self.closer = closer
         self.op: Optional[Op] = None
         self.open = True
         os.set_blocking(wfd, False)
@@ -101,13 +104,21 @@ class Lanes:
             return
         self._want_write(s, False)
         try:
-            os.close(s.wfd)
+            if s.closer is not None:
+                s.closer()
+            else:
+                os.close(s.wfd)
         except OSError:
             pass
         s.wfd = -1
 
     def busy(self) -> int:
         return sum(1 for s in self.streams.values() if s.op is not None)
+
+    def outstanding(self) -> Dict[str, int]:
+        """Each lane's operation in flight, and how long it has been (ns)."""
+        now = time.perf_counter_ns()
+        return {name: now - s.op.began for name, s in sorted(self.streams.items()) if s.op is not None}
 
     def _want_write(self, s: Stream, on: bool) -> None:
         if s.wfd < 0:

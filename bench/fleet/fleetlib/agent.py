@@ -7,7 +7,8 @@ Its phases, each recorded as it begins and ends:
    holds no more (`derive.density_limit`); start latency is each ask's spawn to its lane's first
    echo, the VM usable.
 3. hold: on every VM at once, round trips of a real control message (100 samples a host at
-   least), then transfers at the converged size; the scope scanned after each batch.
+   least), a recorded turn's stream, then transfers doubling in size until their median rate
+   stops rising; the scope scanned after each batch.
 4. chaos: each action of `--chaos`, `--rounds` times, each target drawn by the seeded generator;
    after each the scope settles, the fill tops it up again and the witnesses judge; then a second
    hold, at density after chaos.
@@ -101,9 +102,13 @@ class Agent:
         daemon = derive.Patience("daemon")
         start = derive.Patience("start", first)
         self.waits: Dict[str, derive.Patience] = {"first_run": first, "daemon": daemon, "start": start}
-        for kind in ("rtt", "converge", "bulk", "reap", "drain.lanes", "drain.gone", "chaos.vm.lane", "chaos.vm.gone", "chaos.client.lane", "chaos.client.gone"):
+        for kind in ("rtt", "turn", "reap", "drain.lanes", "drain.gone", "chaos.vm.lane", "chaos.vm.gone", "chaos.client.lane", "chaos.client.gone"):
             self.waits[kind] = derive.Patience(kind, start)
         self.waits["chaos.daemon.settle"] = derive.Patience("chaos.daemon.settle", daemon)
+        # Per byte: each bulk round's transfers are twice the last's (derive's docstring).
+        self.waits["bulk"] = derive.Patience("bulk", self.waits["turn"], 1 / derive.TURN_BYTES)
+        self.waits["view.settle"] = derive.Patience("view.settle", start)
+        self.waits["first_run.gone"] = derive.Patience("first_run.gone", first)
 
     # ------------------------------------------------------------------ plumbing
 
@@ -136,6 +141,33 @@ class Agent:
         self.waits[kind].ran_out(took)
         self.rec.write("ran_out", wait=kind, after_ns=took)
         return False
+
+    def serve_ops(self, done: Callable[[], bool], finished: Callable[[], int], kind: str, units: float) -> bool:
+        """Serves a batch of operations until `done()`: each has finished or its lane ended.
+
+        Its bound is on the wait for the next operation to finish, never on the batch's length:
+        twice the slowest operation of `kind` for `units`, which each operation teaches (`ops`;
+        RFC 6298's timer is a segment's, not a transfer's). A stall past it is recorded (`ran_out`,
+        `stalled`: each lane's operation in flight and for how long) and the bound doubled (RFC
+        6298 §5.5); it never cuts the batch short, since what that drops is the slowest operations,
+        the tail being measured. Only a signal or the run's deadline ends it unfinished (False)."""
+        last_n, last_t = finished(), time.monotonic_ns()
+        while not done():
+            bound = self.waits[kind].bound_ns(units)
+            deadline = self.deadline_ns if bound is None else min(self.deadline_ns, last_t + bound)
+            self.lanes.run(lambda n=last_n: done() or self.stopping or finished() != n, deadline)
+            self.check_stop()
+            now = time.monotonic_ns()
+            if finished() != last_n:
+                last_n, last_t = finished(), now
+            elif not done() and now >= self.deadline_ns:
+                self.rec.write("ran_out", wait=kind, after_ns=now - last_t, units=units, at="the run's deadline", stalled=self.lanes.outstanding())
+                return False
+            elif not done() and now >= deadline:
+                self.waits[kind].ran_out(now - last_t, units)
+                self.rec.write("ran_out", wait=kind, after_ns=now - last_t, units=units, stalled=self.lanes.outstanding())
+                last_t = now
+        return True
 
     def settle(self, done: Callable[[], bool], kind: str) -> bool:
         """A probe of the process table at doubling intervals from 1 ms until `done()` or
@@ -179,13 +211,36 @@ class Agent:
                 self.found["ended_unasked"] = self.found.get("ended_unasked", 0) + 1
                 self.finish(t)
 
-    def scan(self, why: str) -> Dict[str, object]:
-        """The scope as the OS shows it and as the daemon says, judged by every witness."""
-        self.sweep_ended()
-        self.scans += 1
+    def observe(self):
         found = self.scope_procs()
         view, view_err = self.shards.view()
+        return found, view, view_err
+
+    def scan(self, why: str) -> Dict[str, object]:
+        """The scope as the OS shows it and as the daemon says, judged by every witness.
+
+        At a quiescent point, an effect that a lag could make (`leaked`, `lost`, `unasked`,
+        `orphan`: the daemon's records behind its VMs, a VM still exiting) is judged again until
+        it is gone or a VM's start has passed twice over (`view.settle`, seeded from the slowest
+        start): it is a violation only if it outlasts that, and the lag is recorded either way."""
+        self.sweep_ended()
+        self.scans += 1
+        found, view, view_err = self.observe()
         quiet = self.quiescent()
+        if quiet:
+            lagging = lambda vs: [v for v in vs if v["witness"] in W.LAGGING]  # noqa: E731
+            first = lagging(W.check(self.ledger, found, view, self.room, self.limit, True))
+            if first:
+                began = time.monotonic_ns()
+                latest = {"found": found, "view": view, "err": view_err}
+
+                def settled() -> bool:
+                    latest["found"], latest["view"], latest["err"] = self.observe()
+                    return not lagging(W.check(self.ledger, latest["found"], latest["view"], self.room, self.limit, True))
+
+                ok = self.settle(settled, "view.settle")
+                found, view, view_err = latest["found"], latest["view"], latest["err"]
+                self.rec.write("view_lag", scan=self.scans, ns=time.monotonic_ns() - began, resolved=ok, first=[v["witness"] for v in first], detail=first[:20])
         vms = [p for p in found if p["role"] == "vm"]
         nets = {p["vm"]: p for p in found if p["role"] == "net" and p.get("vm") is not None}
         per_vm = [int(p["mem"] or 0) + int((nets.get(p["pid"]) or {}).get("mem") or 0) for p in vms]
@@ -233,7 +288,7 @@ class Agent:
         def ended(why: str, t: str = token) -> None:
             self.vms[t].lane_ended = why
 
-        self.lanes.add(lane.Stream(token, popen.stdin.fileno(), popen.stdout.fileno(), ended))
+        self.lanes.add(lane.Stream(token, popen.stdin.fileno(), popen.stdout.fileno(), ended, popen.stdin.close))
 
         def started(ok: bool, _took: int, why: str, t: str = token) -> None:
             vm = self.vms[t]
@@ -319,10 +374,15 @@ class Agent:
             self.failed("first_run", said)
             return False
         self.waits["first_run"].answered(took)
+        # The first run's VM may still be exiting when its client returns: its linger is recorded,
+        # and nothing is measured until it is gone.
+        began = time.monotonic_ns()
+        gone = self.settle(lambda: not any(p["role"] in ("vm", "net") for p in self.scope_procs()), "first_run.gone")
+        self.rec.write("first_run_gone", gone=gone, ns=time.monotonic_ns() - began)
         if shutil.which("cat") and sys.platform != "win32":
             self.floor = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
             if self.floor.stdin is not None and self.floor.stdout is not None:
-                self.lanes.add(lane.Stream("floor", self.floor.stdin.fileno(), self.floor.stdout.fileno(), lambda why: None))
+                self.lanes.add(lane.Stream("floor", self.floor.stdin.fileno(), self.floor.stdout.fileno(), lambda why: None, self.floor.stdin.close))
         self.scan("setup")
         self.phase("setup", "end")
         return True
@@ -357,10 +417,14 @@ class Agent:
             last = n
         self.phase("fill", "end", live=len(self.live()), limit=self.limit, cost=dict(self.cost))
 
-    def ops(self, counts: Dict[str, int], make: Callable[[int], bytes], kind: str) -> None:
-        """`counts[lane]` operations on each lane, one outstanding per lane, every lane at once."""
+    def ops(self, counts: Dict[str, int], make: Callable[[int], bytes], kind: str, units: float = 1, **tags: object) -> List[float]:
+        """`counts[lane]` operations on each lane, one outstanding per lane, every lane at once;
+        the VMs' (not the floor's) rates in bytes a nanosecond. Ended unfinished (a signal, the
+        run's deadline), it starts nothing more: what is in flight still lands as its sample."""
+        rates: List[float] = []
         left = dict(counts)
         seq = [0]
+        finished = [0]
 
         def next_on(t: str) -> None:
             if left.get(t, 0) <= 0:
@@ -370,8 +434,12 @@ class Agent:
             out = make(seq[0])
 
             def done(ok: bool, took: int, why: str, t: str = t, size: int = len(out)) -> None:
+                finished[0] += 1
                 if ok:
-                    self.rec.write(kind, token=t, ns=took, bytes=size, floor=(t == "floor"), vms=len(self.live()))
+                    self.waits[kind].answered(took, units)
+                    self.rec.write(kind, token=t, ns=took, bytes=size, floor=(t == "floor"), vms=len(self.live()), **tags)
+                    if t != "floor" and took > 0:
+                        rates.append(size / took)
                     next_on(t)
                 else:
                     left[t] = 0
@@ -382,59 +450,49 @@ class Agent:
 
         for t in list(counts):
             next_on(t)
-        self.serve(lambda: all(v <= 0 for v in left.values()) and self.lanes.busy() == 0, kind)
+        if not self.serve_ops(lambda: all(v <= 0 for v in left.values()) and self.lanes.busy() == 0, lambda: finished[0], kind, units):
+            for t in left:
+                left[t] = 0
+        return rates
 
-    def converge_size(self, token: str) -> int:
-        """The transfer size at which doubling stops raising one lane's rate, bounded by the
-        room the VMs leave the harness for its buffers."""
-        size = derive.FIRST_CHUNK
-        before: List[float] = []
-        while True:
-            self.check_stop()
-            rates: List[float] = []
-            for _ in range(derive.PER_SIZE):
-                got: List[int] = []
-                if not self.lanes.begin(token, lane.pattern(size), lambda ok, took, why, g=got: g.append(took if ok else -1)):
-                    return size
-                self.serve(lambda g=got: bool(g), "converge")
-                if not got or got[0] <= 0:
-                    return size
-                rates.append(size / got[0])
-            self.rec.write("converge", token=token, bytes=size, rates_bytes_per_ns=rates)
-            if derive.converged(before, rates):
-                return size // 2
-            before = rates
-            spare = (self.room["mem"] or 0) - sum(int(p.get("mem") or 0) for p in self.scope_procs())
-            if size * 4 > spare:
-                self.rec.write("converge_bounded", bytes=size, spare=spare)
-                return size
-            size *= 2
+    def counts(self, live: List[str]) -> Dict[str, int]:
+        k = derive.per_vm(len(live))
+        out = {t: k for t in live}
+        if self.floor is not None:
+            out["floor"] = derive.per_vm(1)
+        return out
 
     def hold(self, why: str) -> None:
+        """At density: round trips, a recorded turn's stream, then transfers doubling in size until
+        the VMs' median rate stops rising (`derive.median`); every lane at once in each."""
         self.phase("hold", "begin", why=why)
-        live = self.live()
-        if not live:
+        if not self.live():
             self.phase("hold", "end", live=0)
             return
-        k = derive.per_vm(len(live))
-        counts = {t: k for t in live}
-        if self.floor is not None:
-            counts["floor"] = derive.per_vm(1)
-        self.ops(counts, lane.control_message, "rtt")
+        self.ops(self.counts(self.live()), lane.control_message, "rtt", hold=why)
         self.scan(f"after round trips ({why})")
-        live = self.live()
-        if not live:
-            self.phase("hold", "end", live=0)
-            return
-        size = self.converge_size(live[0])
-        self.rec.write("bulk_size", bytes=size)
-        k = derive.per_vm(len(live))
-        counts = {t: k for t in live}
-        if self.floor is not None:
-            counts["floor"] = derive.per_vm(1)
-        self.ops(counts, lambda _s, n=size: lane.pattern(n), "bulk")
+        self.ops(self.counts(self.live()), lambda _s: lane.pattern(derive.TURN_BYTES), "turn", hold=why)
+        self.scan(f"after turns ({why})")
+        size, best, prev = derive.FIRST_CHUNK, None, None
+        while self.live():
+            self.check_stop()
+            rates = self.ops(self.counts(self.live()), lambda _s, n=size: lane.pattern(n), "bulk", size, hold=why, size=size)
+            med = derive.median(rates)
+            self.rec.write("bulk_round", hold=why, bytes=size, median_bytes_per_ns=med, n=len(rates))
+            if med is None or (prev is not None and med <= prev):
+                break
+            best, prev = size, med
+            # The harness holds every size's pattern it has written (a geometric sum under twice
+            # the largest) and the next, twice this one: four times this size, from the room the
+            # VMs leave.
+            spare = (self.room["mem"] or 0) - sum(int(p.get("mem") or 0) for p in self.scope_procs())
+            if size * 4 > spare:
+                self.rec.write("bulk_bounded", bytes=size, spare=spare)
+                break
+            size *= 2
+        self.rec.write("bulk_size", hold=why, bytes=best)
         self.scan(f"after transfers ({why})")
-        self.phase("hold", "end", live=len(self.live()), per_vm=k, bulk_bytes=size)
+        self.phase("hold", "end", live=len(self.live()), bulk_bytes=best)
 
     def gone(self, pids: List[int]) -> Callable[[], bool]:
         want = set(pids)

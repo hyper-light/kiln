@@ -37,8 +37,13 @@ def host_summary(recs: List[dict]) -> Dict[str, object]:
     starts = kinds.get("started", [])
     rtt = [r for r in kinds.get("rtt", []) if not r.get("floor")]
     rtt_floor = [r for r in kinds.get("rtt", []) if r.get("floor")]
-    bulk = [r for r in kinds.get("bulk", []) if not r.get("floor")]
-    bulk_floor = [r for r in kinds.get("bulk", []) if r.get("floor")]
+    # The bulk distribution is each hold's round at its converged size (`bulk_size`).
+    converged = {(r.get("hold"), r.get("bytes")) for r in kinds.get("bulk_size", [])}
+    at_size = [r for r in kinds.get("bulk", []) if (r.get("hold"), r.get("size", r.get("bytes"))) in converged]
+    bulk = [r for r in at_size if not r.get("floor")]
+    bulk_floor = [r for r in at_size if r.get("floor")]
+    turn = [r for r in kinds.get("turn", []) if not r.get("floor")]
+    turn_floor = [r for r in kinds.get("turn", []) if r.get("floor")]
     witnesses: Dict[str, int] = {}
     for w in kinds.get("witness", []):
         witnesses[w["witness"]] = witnesses.get(w["witness"], 0) + 1
@@ -72,7 +77,11 @@ def host_summary(recs: List[dict]) -> Dict[str, object]:
         "rtt_floor": stats.summary(r["ns"] for r in rtt_floor),
         "bulk_mib_s": stats.summary(r["bytes"] / r["ns"] * 1e9 / MIB for r in bulk if r.get("ns")),
         "bulk_floor_mib_s": stats.summary(r["bytes"] / r["ns"] * 1e9 / MIB for r in bulk_floor if r.get("ns")),
-        "bulk_bytes": next((r.get("bytes") for r in kinds.get("bulk_size", [])), None),
+        "bulk_bytes": sorted({r.get("bytes") for r in kinds.get("bulk_size", [])}, key=str),
+        "turn_mib_s": stats.summary(r["bytes"] / r["ns"] * 1e9 / MIB for r in turn if r.get("ns")),
+        "turn_floor_mib_s": stats.summary(r["bytes"] / r["ns"] * 1e9 / MIB for r in turn_floor if r.get("ns")),
+        "turn_bytes": next((r.get("bytes") for r in turn), None),
+        "view_lag": stats.summary(r["ns"] for r in kinds.get("view_lag", [])),
         "asks": len(kinds.get("ask", [])),
         "start_failed": len(kinds.get("start_failed", [])),
         "ran_out": _count(kinds.get("ran_out", []), "wait"),
@@ -119,7 +128,9 @@ def render(records: List[dict], cross: Optional[List[dict]] = None) -> str:
         lines.append(f"   memory per VM at density: {_fmt(s['density_mem'], 'MiB', MIB)}")
         lines.append(f"   start (ask to first echo): {_fmt(s['start'], 'ms', 1e6)}; after chaos {_fmt(s['start_after_chaos'], 'ms', 1e6)}")
         lines.append(f"   control round trip: {_fmt(s['rtt'], 'us', 1e3)}; floor (local cat, same loop) {_fmt(s['rtt_floor'], 'us', 1e3)}")
-        lines.append(f"   stream throughput at {s['bulk_bytes']} B: {_fmt(s['bulk_mib_s'], 'MiB/s', 1)}; floor {_fmt(s['bulk_floor_mib_s'], 'MiB/s', 1)}")
+        lines.append(f"   stream throughput, a turn's {s['turn_bytes']} B: {_fmt(s['turn_mib_s'], 'MiB/s', 1)}; floor {_fmt(s['turn_floor_mib_s'], 'MiB/s', 1)}")
+        lines.append(f"   stream throughput, bulk at the converged {s['bulk_bytes']} B: {_fmt(s['bulk_mib_s'], 'MiB/s', 1)}; floor {_fmt(s['bulk_floor_mib_s'], 'MiB/s', 1)}")
+        lines.append(f"   the daemon's view behind the OS (settled lags): {_fmt(s['view_lag'], 'ms', 1e6)}")
         lines.append(f"   asks {s['asks']}, start failures {s['start_failed']}, waits run out {s['ran_out'] or 0}")
         for action, a in sorted(s["chaos"].items()):
             settle = stats.summary(a.get("settle_ns", []))

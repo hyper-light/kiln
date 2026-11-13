@@ -38,7 +38,9 @@ clock, and the controller only starts, collects and reports.
   and no local image store, as Shards' control-end harness runs one.
 - The image is pulled once into that home, pinned by digest (a tag that moved would measure another
   image), and run once to its end before anything is measured: the guest kernel's download and the
-  image's template are first-run costs no fleet start pays again.
+  image's template are first-run costs no fleet start pays again. That run's VM may still be exiting
+  as its client returns: the agent waits for it to go (`first_run_gone`, its linger recorded) before
+  the first scan.
 - Each VM is `shards run vm -i --rm --name fleet-<token> IMAGE cat`: the stub harness. Its lane is
   its client's stdin and stdout, and `cat` echoes what it reads, so a round trip is bytes written and
   the same bytes back, checked byte for byte (`corrupt` otherwise). Closing its stdin ends `cat` and
@@ -56,8 +58,9 @@ clock, and the controller only starts, collects and reports.
 | density | VMs running at once on the host, at each scan of the hold; and each VM's host memory (its `shards-vm` and `shards-net` processes: PSS on Linux, physical footprint on macOS, working set on Windows) | `scan` |
 | start latency | an ask's client spawned to its lane's first echo: the VM booted, its workload answering | `started` |
 | control round trip | one control message (below) written on a lane and read back whole, every VM's lane at once, one outstanding each | `rtt` |
-| stream throughput | one transfer of the converged size written while its echo is read back, every lane at once; MiB/s per stream | `bulk` |
-| floor | the same round trips and transfers through the same loop to a local `cat`: the harness's own cost, beside every number | `rtt`/`bulk` with `floor` |
+| stream throughput, a turn | one turn's stream (below) written while its echo is read back, every lane at once; MiB/s per stream | `turn` |
+| stream throughput, bulk | one transfer of the converged size (below) written while its echo is read back, every lane at once; MiB/s per stream. Each size's round is kept (`bulk` with `size`, `bulk_round`); the report reads the converged size's | `bulk`, `bulk_size` |
+| floor | the same round trips and transfers through the same loop to a local `cat`: the harness's own cost, beside every number | `rtt`/`turn`/`bulk` with `floor` |
 
 Each host's report gives n, p50, p90, p99 and max of each (nearest rank, Hyndman and Fan's definition
 1: every value a measured sample), with the host's name, OS and version, kernel, CPU, memory, kiln
@@ -70,10 +73,11 @@ revision, the shards binary's SHA-256 and version, and the load at the start.
 | The room | what `kiln run --needs mem=…,cpus=…` asked for and kiln holds the run to, which the agent reads from `KILN_NEEDS`; no memory room, no run |
 | Density limit | min over dimensions of floor(room / cost), the cost the most any VM on the host was measured holding, re-derived at every scan (`derive.density_limit`) |
 | Ramp | waves doubling from 1 up to the room left: every concurrency from one to the limit within a factor of two, in log2(limit) waves |
-| Waits | twice the slowest answer of their kind (Hex's failure-bound rule, `hex_core::patience` TIMES_SLOWEST), only rising, a run-out doubling it (Karn's point, RFC 6298 §5.5); seeded before their own first answer from an answer that bounds them from above: a start from the setup's run of the image, a round trip, a transfer and a VM's settle from the slowest start (a start ends with a round trip on its lane), the daemon's settle from its start. Setup's first waits have nothing before them and are bounded by the run's deadline alone |
+| Waits | twice the slowest answer of their kind (Hex's failure-bound rule, `hex_core::patience` TIMES_SLOWEST), only rising, a run-out doubling it (Karn's point, RFC 6298 §5.5); seeded before their own first answer from an answer that bounds them from above: a start from the setup's run of the image, a round trip, a transfer, a VM's settle and the view's settle from the slowest start (a start ends with a round trip on its lane), the daemon's settle from its start, the first run's linger from the first run. A batch of operations on the lanes (round trips, turns, a bulk round) is bounded on a stall, the wait for its next operation to finish, never on its length: twice the slowest single operation of its kind, which each operation teaches, per byte for transfers (each bulk round's are twice the last's), seeded from a turn's time per byte (RFC 6298's timer is a segment's). A stall is recorded (`ran_out`, with each lane's operation in flight) and backed off; it never cuts the batch short, since that would drop the slowest samples, the tail being measured. Only a signal or the run's deadline ends a batch unfinished. Setup's first waits have nothing before them and are bounded by the run's deadline alone |
 | Samples | 100 a host, the fewest whose nearest-rank p99 is a sample below the max (`stats.least_n`): each VM is asked ceil(100 / VMs) round trips and transfers |
 | Control message | the bytes kiln writes to interrupt a Claude Code turn (`crates/kiln/src/harness/claude.rs` `request`, kiln d6ffa45d8): `{"request":{"subtype":"interrupt"},"request_id":"kiln_N","type":"control_request"}` and a newline, 83 bytes at N = 1 |
-| Transfer size | doubled from one vsock packet (64 KiB, `VIRTIO_VSOCK_MAX_PKT_BUF_SIZE`) on one lane until doubling raises its median rate no higher than the highest at the size before; three transfers a size, the fewest whose median is neither their min nor their max; bounded by the room the VMs leave |
+| A turn's stream | the bytes a real harness turn wrote: Claude Code's signed-in turn, the largest turn recorded (Shards e7825cb32, `docs/research/measurements/harness-bringup-v2/records/claude-signed-in/stdout.bin`: 60,783 bytes; Codex's turn there wrote 765) |
+| Transfer size | doubled from one vsock packet (64 KiB, `VIRTIO_VSOCK_MAX_PKT_BUF_SIZE`), a full round a size (the samples above, every lane at once), until the VMs' median rate no longer rises: the size before is the converged one. A median over every lane's samples, because three samples on one lane spread fourfold on a loaded host (the first light test); bounded by the room the VMs leave (the harness holds every size's pattern and the next: four times the size) |
 | Probes | where the OS gives no event (a process gone), the process table is read at doubling intervals from 1 ms: O(log T) reads for a settle of T. A lane's end and a client's exit are events (its read end at EOF) |
 
 The run's own inputs are the person's (ROOT's) and are recorded in its `host` record: the room
@@ -98,7 +102,13 @@ scan, each read on its own (`fleetlib/witness.py`):
 | `stray`, `left` | any VM or network process before teardown, or any process naming the home after it |
 
 `lost`, `leaked`, `orphan` and `unasked` are judged only at quiescent points (nothing starting or
-stopping). A run passes when every witness counted zero, no failure was recorded and nothing was left.
+stopping). A lag can make each of them for a moment: the daemon's records behind its VMs, a VM still
+exiting after its run ended. So at a quiescent scan, one that shows is judged again, at doubling
+intervals, until it is gone or twice the slowest start has passed (`view.settle`): it is a witness
+only if it outlasts that, and the lag is recorded either way (`view_lag`, with whether it resolved).
+A process the OS lists as a zombie (exited, its parent yet to reap it) runs no VM and holds no
+memory: the scan leaves it out. A run passes when every witness counted zero, no failure was
+recorded and nothing was left.
 
 ## Chaos
 
@@ -116,10 +126,11 @@ to the limit and lets the witnesses judge. Targets are drawn by a generator seed
 
 `records.jsonl`, one JSON object a line, each with `kind`, `t` (the host's wall clock, ns),
 `mono` (its monotonic clock, ns), `host` and `run`. Kinds: `host` (facts, knobs, the controller's
-clock at launch for the skew), `phase`, `daemon`, `pulled`, `first_run`, `ask`, `started`, `late`,
-`start_failed`, `scan` (every scope process, the view, the room, the limit, free memory and load),
-`witness`, `rtt`, `bulk`, `converge`, `bulk_size`, `chaos`, `ended`, `ended_unasked`, `ran_out`,
-`failed`, `verdict`. `fleet.py report records.jsonl…` prints the report from them alone.
+clock at launch for the skew), `phase`, `daemon`, `pulled`, `first_run`, `first_run_gone`, `ask`,
+`started`, `late`, `start_failed`, `scan` (every scope process, the view, the room, the limit, free
+memory and load), `view_lag`, `witness`, `rtt`, `turn`, `bulk`, `bulk_round`, `bulk_bounded`,
+`bulk_size`, `chaos`, `ended`, `ended_unasked`, `ran_out`, `failed`, `verdict`.
+`fleet.py report records.jsonl…` prints the report from them alone.
 
 ## Commands
 
@@ -174,9 +185,10 @@ python3 bench/fleet/tests/mutate.py                   # every guard removed in t
 The light tests read "do X, expect Y": percentiles, every derivation, each witness planted and found
 (and not found where it must not be), the ask's state machine, the chaos scope and pid-reuse refusals,
 lanes on loopback (`cat`: round trips and a 4 MiB transfer on four lanes at once, a lane that alters
-bytes found `corrupt`, a lane's end as an event), the OS's process table, the scan's pairing and
-orphans, and the report. `mutate.py` removes each of 16 guards in a copy and requires the tests to
-fail.
+bytes found `corrupt`, a lane's end as an event), the OS's process table, the scan's pairing, orphans
+and zombies, a lag that settles and one that doesn't, a hold over `cat` lanes (every kind of sample
+on every lane), a mute lane's stall backed off to the run's deadline, and the report. `mutate.py` removes each of 20
+guards in a copy and requires the tests to fail.
 
 ## The profile
 

@@ -12,7 +12,12 @@
   measured answer that bounds it from above (Hex seeds each wait from a record): a VM's start
   from the run of the image the setup makes (`first_run`), and a lane's round trip, a transfer's
   first chunk and a chaos action's settle from the slowest start (a start ends with a round trip
-  on the lane, so a round trip past twice every start is past any). Setup's own first waits
+  on the lane, so a round trip past twice every start is past any). A batch of operations on the
+  lanes (round trips, turns, transfers) is bounded on the wait for its next operation to finish,
+  a stall, never on its length: twice the slowest single operation of its kind, which each
+  operation teaches (RFC 6298's timer is a segment's). A transfer's is kept per byte, since each
+  bulk round's transfers are twice the last's, and seeded from a turn's time per byte (the same
+  stream, smaller). Setup's own first waits
   have no record before them and are bounded by the run's deadline alone, which the person
   running it gives, as Hex's image_real bounds its first waits (HEX_IMAGE_WAIT_MS). An answer
   that comes after its wait ran out is still recorded.
@@ -20,11 +25,14 @@
   (`stats.least_n`), so each VM is asked ceil(100 / VMs) round trips and transfers.
 - **Ramp.** Waves of starts double from one (1, 2, 4, ...) up to the room left: every
   concurrency from one to the limit is met within a factor of two, in log2(limit) waves.
-- **Transfer size.** A stream's size doubles from one vsock packet (64 KiB,
-  VIRTIO_VSOCK_MAX_PKT_BUF_SIZE in linux include/linux/virtio_vsock.h, as Shards'
-  managed-engine-relay-throughput-v1 took it) until doubling it no longer raises the rate past
-  the spread of the samples at the size before: the rate has converged. Each size is measured
-  three times, the fewest whose median is neither their min nor their max.
+- **Transfer size.** Two streams are timed. A turn's: the bytes a real harness turn wrote (Claude
+  Code's signed-in turn, `TURN_BYTES`, from its committed record). And a bulk one, whose size
+  doubles from one vsock packet (64 KiB, VIRTIO_VSOCK_MAX_PKT_BUF_SIZE in linux
+  include/linux/virtio_vsock.h, as Shards' managed-engine-relay-throughput-v1 took it), a full
+  round of 100 samples a size on every lane at once, until the VMs' median rate no longer rises:
+  the size before is the converged one, and its round is the bulk distribution. A median over
+  every lane's samples holds under a loaded host where three samples on one lane did not (the
+  light test, 2026-11-12: rates on one lane at one size spread fourfold).
 """
 
 from __future__ import annotations
@@ -37,36 +45,45 @@ from . import stats
 
 TIMES_SLOWEST = 2
 FIRST_CHUNK = 64 * 1024
-PER_SIZE = 3
+# A real turn's stream: Claude Code 2.1.322's stream-json stdout of one signed-in turn, the largest
+# turn recorded (Shards e7825cb32, docs/research/measurements/harness-bringup-v2/records/
+# claude-signed-in/stdout.bin: 60,783 bytes; Codex 0.167.2's turn there wrote 765).
+TURN_BYTES = 60783
 
 
 class Patience:
-    """One kind of wait's bound, learned from its answers, seeded from another kind's."""
+    """One kind of wait's bound, learned from its answers, seeded from another kind's.
 
-    def __init__(self, name: str, seed: Optional["Patience"] = None) -> None:
+    A wait is kept per unit of its work (`units`: one, or a transfer's bytes), and `per_seed`
+    turns its seed's unit into its own (a turn's round into a byte of it)."""
+
+    def __init__(self, name: str, seed: Optional["Patience"] = None, per_seed: float = 1.0) -> None:
         self.name = name
         self.seed = seed
-        self._slowest_ns = 0
+        self.per_seed = per_seed
+        self._slowest = 0.0
         self._lock = threading.Lock()
 
-    def slowest_ns(self) -> int:
+    def slowest(self) -> float:
+        """The slowest answer of a unit, its own or its seed's in its units; 0 while unarmed."""
         with self._lock:
-            own = self._slowest_ns
+            own = self._slowest
         if own == 0 and self.seed is not None:
-            return self.seed.slowest_ns()
+            return self.seed.slowest() * self.per_seed
         return own
 
-    def bound_ns(self) -> Optional[int]:
-        """The wait's bound, or None while neither it nor its seed has an answer (unarmed)."""
-        slowest = self.slowest_ns()
-        return slowest * TIMES_SLOWEST if slowest else None
+    def bound_ns(self, units: float = 1) -> Optional[int]:
+        """The wait's bound for `units` of work, or None while neither it nor its seed has an
+        answer (unarmed)."""
+        slowest = self.slowest()
+        return math.ceil(slowest * units * TIMES_SLOWEST) if slowest else None
 
-    def answered(self, took_ns: int) -> None:
+    def answered(self, took_ns: int, units: float = 1) -> None:
         with self._lock:
-            self._slowest_ns = max(self._slowest_ns, max(1, took_ns))
+            self._slowest = max(self._slowest, max(1, took_ns) / units)
 
-    def ran_out(self, after_ns: int) -> None:
-        self.answered(after_ns)
+    def ran_out(self, after_ns: int, units: float = 1) -> None:
+        self.answered(after_ns, units)
 
 
 def density_limit(room: Dict[str, Optional[int]], cost: Dict[str, int]) -> Optional[int]:
@@ -88,10 +105,9 @@ def next_wave(last: int, room_left: int) -> int:
     return max(0, min(room_left, 1 if last <= 0 else last * 2))
 
 
-def converged(before: Sequence[float], after: Sequence[float]) -> bool:
-    """Whether rates at twice the size (`after`) gain nothing past the spread at the size
-    before: the median after is no higher than the highest before."""
-    if not before or not after:
-        return False
-    ordered = sorted(after)
-    return ordered[(len(ordered) - 1) // 2] <= max(before)
+def median(xs: Sequence[float]) -> Optional[float]:
+    """The lower median (a measured sample), or None for no samples."""
+    if not xs:
+        return None
+    ordered = sorted(xs)
+    return ordered[(len(ordered) - 1) // 2]

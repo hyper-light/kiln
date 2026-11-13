@@ -29,9 +29,9 @@ from typing import Dict, Iterable, List, Optional
 
 
 class Proc:
-    __slots__ = ("pid", "ppid", "name", "args", "start", "mem", "mem_kind", "cpu_ns")
+    __slots__ = ("pid", "ppid", "name", "args", "start", "mem", "mem_kind", "cpu_ns", "zombie")
 
-    def __init__(self, pid: int, ppid: int, name: str, args: List[str], start: str, mem: Optional[int], mem_kind: str, cpu_ns: Optional[int]) -> None:
+    def __init__(self, pid: int, ppid: int, name: str, args: List[str], start: str, mem: Optional[int], mem_kind: str, cpu_ns: Optional[int], zombie: bool = False) -> None:
         self.pid = pid
         self.ppid = ppid
         self.name = name
@@ -40,6 +40,8 @@ class Proc:
         self.mem = mem
         self.mem_kind = mem_kind
         self.cpu_ns = cpu_ns
+        # Exited, its parent yet to reap it: it runs nothing and holds no memory.
+        self.zombie = zombie
 
     def brief(self) -> Dict[str, object]:
         return {"pid": self.pid, "ppid": self.ppid, "name": self.name, "start": self.start, "mem": self.mem, "mem_kind": self.mem_kind, "cpu_ns": self.cpu_ns}
@@ -73,9 +75,9 @@ def _linux_one(pid: int, tick_ns: int, with_mem: bool = True) -> Optional[Proc]:
     except OSError:
         args = []
     if not with_mem:
-        return Proc(pid, ppid, name, args, start, None, "pss", cpu_ns)
+        return Proc(pid, ppid, name, args, start, None, "pss", cpu_ns, fields[0] == "Z")
     mem, kind = _linux_mem(pid)
-    return Proc(pid, ppid, name, args, start, mem, kind, cpu_ns)
+    return Proc(pid, ppid, name, args, start, mem, kind, cpu_ns, fields[0] == "Z")
 
 
 def _linux_mem(pid: int):
@@ -175,22 +177,22 @@ def _mac_rusage(pid: int):
 
 
 def _mac_table() -> Dict[int, Proc]:
-    out = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,args="], capture_output=True, text=True, errors="replace", check=False).stdout
+    out = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,stat=,args="], capture_output=True, text=True, errors="replace", check=False).stdout
     table: Dict[int, Proc] = {}
     for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        parts = line.split(None, 3)
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
             continue
-        pid, ppid = int(parts[0]), int(parts[1])
+        pid, ppid, zombie = int(parts[0]), int(parts[1]), parts[2].startswith("Z")
         # Arguments split at spaces: enough to know a Shards helper by its path, which has none.
-        args = parts[2].split() if len(parts) > 2 else []
+        args = parts[3].split() if len(parts) > 3 else []
         name = os.path.basename(args[0]) if args else ""
         got = _mac_rusage(pid)
         if got is None:
-            table[pid] = Proc(pid, ppid, name, args, "", None, "footprint", None)
+            table[pid] = Proc(pid, ppid, name, args, "", None, "footprint", None, zombie)
         else:
             mem, cpu_ns, start = got
-            table[pid] = Proc(pid, ppid, name, args, start, mem, "footprint", cpu_ns)
+            table[pid] = Proc(pid, ppid, name, args, start, mem, "footprint", cpu_ns, zombie)
     return table
 
 

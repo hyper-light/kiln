@@ -160,7 +160,7 @@ class Shards:
         vm_by_mac: Dict[str, int] = {}
         for pid in under | named:
             p = table.get(pid)
-            if p is not None and p.name == "shards-vm":
+            if p is not None and p.name == "shards-vm" and not p.zombie:
                 mac = _flag(p.args, "--net")
                 if mac:
                     vm_by_mac[mac.split(",")[-1]] = pid
@@ -169,7 +169,7 @@ class Shards:
         out: List[Dict[str, object]] = []
         for pid in sorted(under | named | nets):
             p = table.get(pid)
-            if p is None or (pid in roots and p.name not in ("shards-vm", "shards-net")):
+            if p is None or p.zombie or (pid in roots and p.name not in ("shards-vm", "shards-net")):
                 continue
             role = "vm" if p.name == "shards-vm" else "net" if p.name == "shards-net" else "shards"
             rec: Dict[str, object] = {"pid": pid, "start": p.start, "role": role, "mem": p.mem, "cpu_ns": p.cpu_ns}

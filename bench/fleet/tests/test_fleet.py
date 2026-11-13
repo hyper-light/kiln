@@ -73,10 +73,24 @@ class Derive(unittest.TestCase):
         start.ran_out(600)
         self.assertEqual(start.bound_ns(), 1200)
 
-    def test_converged_when_doubling_gains_nothing_past_the_spread(self):
-        self.assertFalse(derive.converged([], [1.0]))
-        self.assertTrue(derive.converged([1.0, 2.0, 3.0], [2.5, 3.0, 4.0]))
-        self.assertFalse(derive.converged([1.0, 2.0, 3.0], [3.5, 4.0, 5.0]))
+    def test_a_wait_kept_per_byte_scales_with_a_rounds_bytes(self):
+        turn = derive.Patience("turn")
+        bulk = derive.Patience("bulk", turn, 1 / 100)
+        turn.answered(1000)
+        # Seeded from the turn: 1000 ns for its 100 bytes, 10 ns a byte, twice over.
+        self.assertEqual(bulk.bound_ns(200), 4000)
+        bulk.answered(3000, 100)
+        self.assertEqual(bulk.bound_ns(200), 12000)
+        # A round of twice the bytes at the same rate fits its doubled bound.
+        self.assertLessEqual(2 * 3000, bulk.bound_ns(200))
+
+    def test_the_median_is_a_measured_sample(self):
+        self.assertIsNone(derive.median([]))
+        self.assertEqual(derive.median([3.0, 1.0, 2.0]), 2.0)
+        self.assertEqual(derive.median([4.0, 1.0, 3.0, 2.0]), 2.0)
+
+    def test_a_turns_stream_is_the_recorded_turns_size(self):
+        self.assertEqual(derive.TURN_BYTES, 60783)
 
     def test_per_vm_gives_each_host_100_samples(self):
         for vms in (1, 3, 33, 100, 250):
@@ -318,6 +332,8 @@ class Scan(unittest.TestCase):
             # A VM a dead daemon left behind, and its network process.
             200: P(200, 1, "shards-vm", ["shards-vm", "run", "--net", "5,6,7,0a:02", "--kernel", sh.home + "/guest/k"], "5", 300, "pss", 0),
             201: P(201, 1, "shards-net", ["shards-net", "--mac", "0a:02"], "6", 20, "pss", 0),
+            # A VM process that exited, its parent yet to reap it: no VM.
+            400: P(400, 101, "shards-vm", ["shards-vm", "run", "--net", "5,6,7,0a:04", "--kernel", sh.home + "/guest/k"], "9", None, "pss", 0, True),
             # Someone else's VM: never ours.
             300: P(300, 1, "shards-vm", ["shards-vm", "run", "--net", "5,6,7,0a:03", "--kernel", "/other/guest/k"], "7", 300, "pss", 0),
             301: P(301, 1, "shards-net", ["shards-net", "--mac", "0a:03"], "8", 20, "pss", 0),
@@ -329,6 +345,138 @@ class Scan(unittest.TestCase):
         self.assertEqual((got[103]["role"], got[101]["role"]), ("vm", "shards"))
 
 
+class Settle(unittest.TestCase):
+    """The agent's scan judges a lagging effect again until it passes or outlasts its settle."""
+
+    def agent(self, d, observations):
+        from types import SimpleNamespace
+
+        from fleetlib.agent import Agent
+
+        o = SimpleNamespace(deadline_s=30, out=d, shards="/bin/true", seed=1, needs="mem=1g", label="h", image="i@sha256:00",
+                            ballast=0, chaos="none", rounds=0, repo=d, rev="", controller_t=0, keep_home=False)
+        rec = records.Records(os.path.join(d, "r.jsonl"), "h", "run")
+        a = Agent(o, rec)
+        a.waits["start"].answered(50_000_000)
+        a.ledger = live_ledger("t1")
+        seq = iter(observations)
+        last = [None]
+
+        def observe():
+            last[0] = next(seq, last[0])
+            return last[0]
+
+        a.observe = observe
+        a.sweep_ended = lambda: None
+        return a, rec
+
+    vm = {"pid": 10, "role": "vm", "mem": 100, "start": "1"}
+    stray = {"pid": 11, "role": "vm", "mem": 100, "start": "2"}
+
+    def kinds(self, path):
+        return [r["kind"] for r in records.read_all(path)]
+
+    def test_a_vm_the_view_catches_up_with_is_a_lag_not_a_leak(self):
+        with tempfile.TemporaryDirectory() as d:
+            lagging = ([self.vm, self.stray], {"t1": [10]}, "")
+            caught_up = ([self.vm], {"t1": [10]}, "")
+            a, rec = self.agent(d, [lagging, lagging, caught_up])
+            a.scan("test")
+            rec.close()
+            kinds = self.kinds(os.path.join(d, "r.jsonl"))
+            self.assertIn("view_lag", kinds)
+            self.assertNotIn("witness", kinds)
+
+    def test_a_vm_no_ask_ever_holds_is_leaked_once_it_outlasts_the_settle(self):
+        with tempfile.TemporaryDirectory() as d:
+            lagging = ([self.vm, self.stray], {"t1": [10]}, "")
+            a, rec = self.agent(d, [lagging])
+            a.scan("test")
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            self.assertEqual([r["witness"] for r in got if r["kind"] == "witness"], ["leaked"])
+            lag = [r for r in got if r["kind"] == "view_lag"]
+            self.assertEqual((len(lag), lag[0]["resolved"]), (1, False))
+
+
+def lane_agent(d, deadline_s, needs, workloads):
+    """An agent whose live asks' lanes are local processes (`workloads`: argv by token)."""
+    from types import SimpleNamespace
+
+    from fleetlib.agent import Agent, Vm
+
+    o = SimpleNamespace(deadline_s=deadline_s, out=d, shards="/bin/true", seed=1, needs=needs, label="h", image="i@sha256:00",
+                        ballast=0, chaos="none", rounds=0, repo=d, rev="", controller_t=0, keep_home=False)
+    rec = records.Records(os.path.join(d, "r.jsonl"), "h", "run")
+    a = Agent(o, rec)
+    a.ledger = live_ledger(*workloads)
+    a.scan = lambda why: {}
+    a.scope_procs = lambda: []
+    ps = []
+    for i, (t, argv) in enumerate(sorted(workloads.items())):
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+        ps.append(p)
+        a.vms[t] = Vm(t, i, p, "", 0, 1)
+        a.lanes.add(lane.Stream(t, p.stdin.fileno(), p.stdout.fileno(), lambda why: None, p.stdin.close))
+    return a, rec, ps
+
+
+@unittest.skipIf(sys.platform == "win32", "lanes select on pipes, which Windows can't (README, Owed)")
+class Hold(unittest.TestCase):
+    """The hold on live lanes: round trips, a turn's stream, then bulk rounds to a converged size."""
+
+    def finish(self, ps):
+        for p in ps:
+            if p.poll() is None:
+                p.kill()
+            p.wait()
+
+    def test_a_hold_takes_every_kind_of_sample_on_every_lane(self):
+        with tempfile.TemporaryDirectory() as d:
+            # A room of 1 MiB bounds the bulk rounds at a few hundred KiB, so the test stays light.
+            a, rec, ps = lane_agent(d, 60, "mem=1m", {"t1": ["cat"], "t2": ["cat"]})
+            a.waits["start"].answered(1_000_000_000)
+            try:
+                a.hold("test")
+            finally:
+                self.finish(ps)
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            count = lambda kind: sum(1 for r in got if r["kind"] == kind)  # noqa: E731
+            # A stall may be recorded on a loaded host (`ran_out`); no sample is ever dropped for it.
+            self.assertEqual([r for r in got if r["kind"] == "failed"], [])
+            self.assertEqual((count("rtt"), count("turn")), (100, 100))
+            self.assertGreaterEqual(count("bulk_round"), 1)
+            size = [r["bytes"] for r in got if r["kind"] == "bulk_size"]
+            self.assertEqual(len(size), 1)
+            self.assertEqual(sum(1 for r in got if r["kind"] == "bulk" and r["size"] == size[0]), 100)
+
+    def test_a_stall_is_recorded_and_backed_off_but_never_cuts_the_batch_short(self):
+        # The lane echoes its first message, then reads on and answers nothing.
+        mute = [sys.executable, "-u", "-c", "import sys, time\nsys.stdout.write(sys.stdin.readline())\ntime.sleep(60)"]
+        with tempfile.TemporaryDirectory() as d:
+            a, rec, ps = lane_agent(d, 1.5, "mem=1g", {"m": mute})
+            a.waits["start"].answered(10_000_000)
+            began = time.monotonic_ns()
+            try:
+                a.ops({"m": 3}, lane.control_message, "rtt")
+            finally:
+                self.finish(ps)
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            outs = [r for r in got if r["kind"] == "ran_out"]
+            stalls = [r for r in outs if "at" not in r]
+            self.assertEqual(sum(1 for r in got if r["kind"] == "rtt"), 1)
+            self.assertGreaterEqual(len(stalls), 2)
+            self.assertIn("m", stalls[0]["stalled"])
+            # Backed off: each stall's wait at least doubles the one before.
+            self.assertTrue(all(b["after_ns"] >= 2 * x["after_ns"] * 0.99 for x, b in zip(stalls, stalls[1:])), [s["after_ns"] for s in stalls])
+            # Only the run's deadline ended it.
+            self.assertEqual([r.get("at") for r in outs if "at" in r], ["the run's deadline"])
+            self.assertGreaterEqual(time.monotonic_ns(), a.deadline_ns)
+            self.assertGreater(a.deadline_ns, began)
+
+
 class Report(unittest.TestCase):
     def records(self, extra=()):
         recs = [
@@ -337,7 +485,10 @@ class Report(unittest.TestCase):
             {"kind": "started", "host": "h1", "start_ns": 4_000_000, "t": 2},
             {"kind": "rtt", "host": "h1", "ns": 50_000, "bytes": 83, "floor": False},
             {"kind": "rtt", "host": "h1", "ns": 5_000, "bytes": 83, "floor": True},
-            {"kind": "bulk", "host": "h1", "ns": 1_000_000_000, "bytes": 1 << 20, "floor": False},
+            {"kind": "bulk", "host": "h1", "ns": 1_000_000_000, "bytes": 1 << 20, "floor": False, "hold": "at density", "size": 1 << 20},
+            {"kind": "bulk", "host": "h1", "ns": 1_000_000_000, "bytes": 2 << 20, "floor": False, "hold": "at density", "size": 2 << 20},
+            {"kind": "bulk_size", "host": "h1", "hold": "at density", "bytes": 1 << 20},
+            {"kind": "turn", "host": "h1", "ns": 1_000_000, "bytes": 60783, "floor": False},
             {"kind": "scan", "host": "h1", "why": "after round trips (at density)", "vms": 2, "per_vm_mem": [100 << 20, 120 << 20], "limit": 2, "cost": {"mem": 120 << 20}},
             {"kind": "verdict", "host": "h1", "at": "after teardown", "left": []},
         ]
@@ -348,7 +499,8 @@ class Report(unittest.TestCase):
         self.assertIn("verdict: PASS", text)
         self.assertIn("start (ask to first echo): n=2 p50=2.000", text)
         self.assertIn("control round trip: n=1 p50=50.000", text)
-        self.assertIn("n=1 p50=1.000 p90=1.000 p99=1.000 max=1.000 MiB/s", text)
+        self.assertIn("bulk at the converged [1048576] B: n=1 p50=1.000 p90=1.000 p99=1.000 max=1.000 MiB/s", text)
+        self.assertIn("a turn's 60783 B: n=1 p50=57.967", text)
         self.assertIn("limit 2 VMs", text)
 
     def test_any_witness_or_leftover_fails_it(self):

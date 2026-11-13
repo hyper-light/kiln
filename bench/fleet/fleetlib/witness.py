@@ -39,6 +39,9 @@ MOVES = {
 HOLDS_VM = {LIVE}
 # An ask in these may still have one, coming or going.
 IN_FLIGHT = {STARTING, STOPPING, KILLED, FAILED}
+# The effects a lag can make for a moment (the placer's records behind its VMs, a VM still
+# exiting): judged again until they pass or outlast a settle (agent.scan).
+LAGGING = {"leaked", "lost", "unasked", "orphan"}
 
 
 class IllegalMove(Exception):

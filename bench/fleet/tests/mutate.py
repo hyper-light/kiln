@@ -30,9 +30,13 @@ MUTATIONS = [
     ("chaos.py", "if scope_pids.get(pid) != start:", "if False:", "chaos scope"),
     ("procs.py", "if start and now.start != start:", "if False:", "pid reuse"),
     ("lane.py", "if chunk != op.out[op.got : op.got + len(chunk)]:", "if False:", "lane corruption"),
-    ("derive.py", "self._slowest_ns = max(self._slowest_ns, max(1, took_ns))", "self._slowest_ns = max(1, took_ns)", "waits only rise"),
+    ("derive.py", "self._slowest = max(self._slowest, max(1, took_ns) / units)", "self._slowest = max(1, took_ns) / units", "waits only rise"),
+    ("derive.py", "self._slowest = max(self._slowest, max(1, took_ns) / units)", "self._slowest = max(self._slowest, max(1, took_ns))", "a wait is kept per unit"),
     ("derive.py", "limits.append(max(0, have // per))", "limits.append(max(0, have // per) + 1)", "density limit"),
     ("stats.py", "return max(1, math.ceil(p * n))", "return max(1, round(p * n))", "nearest rank"),
+    ("agent.py", "                last_t = now\n        return True", "                return False\n        return True", "a stall never cuts a batch short"),
+    ("agent.py", "            if first:\n", "            if False:\n", "a lag settles before it is judged"),
+    ("shards.py", "if p is None or p.zombie or", "if p is None or", "zombies are no VMs"),
 ]
 
 
