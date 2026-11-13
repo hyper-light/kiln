@@ -178,6 +178,21 @@ fn speaks_for(hub: &Hub, sender: PeerId, owner: &Principal, epoch: Option<u64>, 
     (me.instance.is_some() && me.instance == owner.instance) || (epoch.is_some_and(|epoch| epoch > minimum) && successor(hub, owner) == Some(sender))
 }
 
+/// [`speaks_for`], and at the binding's own epoch its successor too when the bound process signed a hand-on of
+/// `session` (`custody::handed_on_by`): that process's word that it let the session go, which the epoch alone can't
+/// say. 2026-11-12, adacachy: its old process handed each session on to its next epoch and the new one held them on
+/// at the one they had (each's epoch the binding's: 1, 7 and 5), and none could be claimed, their mail refused.
+async fn speaks_for_session(hub: &Hub, sender: PeerId, owner: &Principal, epoch: Option<u64>, minimum: u64, session: &str) -> bool {
+    if speaks_for(hub, sender, owner, epoch, minimum) {
+        return true;
+    }
+    let Some(instance) = owner.instance.as_deref() else { return false };
+    if epoch != Some(minimum) || successor(hub, owner) != Some(sender) {
+        return false;
+    }
+    crate::custody::handed_on_by(&hub.store, session, minimum, &owner.machine, instance).await.unwrap_or(false)
+}
+
 /// Whether the process `owner` names is connected now.
 fn lives(hub: &Hub, owner: &Principal) -> bool {
     let instances = hub.instances.load();
@@ -212,7 +227,7 @@ pub async fn allows_claim(hub: &Hub, sender: PeerId, session: &str, epoch: Optio
         Phase::Offered | Phase::Prepared | Phase::Aborted => (&record.source, record.manifest.source_epoch),
         Phase::Committed => (&record.destination, record.manifest.destination_epoch),
     };
-    speaks_for(hub, sender, owner, epoch, minimum) && epoch.is_none_or(|epoch| epoch >= minimum)
+    epoch.is_none_or(|epoch| epoch >= minimum) && speaks_for_session(hub, sender, owner, epoch, minimum, session).await
 }
 
 pub async fn allows_generic_adoption(hub: &Hub, sender: PeerId, session: &str, success: bool) -> bool {
@@ -235,7 +250,8 @@ pub async fn dispatch_ready(hub: &Hub, session: &str, capacity: &super::admissio
         Phase::Committed => {
             let owner = hub.instances.load().owner(&Owned::Agent(session.to_owned()));
             let minimum = record.manifest.destination_epoch;
-            Ok(capacity.epoch >= minimum && owner.is_some_and(|owner| speaks_for(hub, owner, &record.destination, Some(capacity.epoch), minimum)))
+            let Some(owner) = owner.filter(|_| capacity.epoch >= minimum) else { return Ok(false) };
+            Ok(speaks_for_session(hub, owner, &record.destination, Some(capacity.epoch), minimum, session).await)
         }
     }
 }

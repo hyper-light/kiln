@@ -1,0 +1,167 @@
+[workspace]
+members = ["crates/*"]
+# vendor/ holds what Hex vendors (vendor/MANIFEST.toml), each project a workspace of its own.
+exclude = ["vendor"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+# The minimum kiln's toolchain can build this vendored under; Hex's own gate runs on 1.99.1
+# (rust-toolchain.toml). Hex uses no feature newer than 1.99.0.
+rust-version = "1.99.0"
+repository = "https://github.com/hyper-light/hex"
+publish = false
+
+# Versions match kiln's lockfile where kiln links the same crate, so vendoring Hex adds no second
+# copy of any of them.
+[workspace.dependencies]
+hex-api = { path = "crates/hex-api", version = "0.1.0" }
+hex-core = { path = "crates/hex-core", version = "0.1.0" }
+hex-runtime = { path = "crates/hex-runtime", version = "0.1.0" }
+hex-node = { path = "crates/hex-node", version = "0.1.0" }
+hex-client = { path = "crates/hex-client", version = "0.1.0" }
+hex-testkit = { path = "crates/hex-testkit", version = "0.1.0" }
+hex-sim = { path = "crates/hex-sim", version = "0.1.0" }
+hex-health = { path = "crates/hex-health", version = "0.1.0" }
+hex-gpu = { path = "crates/hex-gpu", version = "0.1.0" }
+hex-afunix = { path = "crates/hex-afunix", version = "0.1.0" }
+hex-quic = { path = "crates/hex-quic", version = "0.1.0" }
+# Shards' guests (docs/design/shards-guest.md §2, Appendix A): the oci class's Linux guest on macOS and
+# Windows. By name and version, patched below to a copy of Shards' draft until Shards lands it, then to
+# vendor/shards as every other vendored project (vendor/shards/Cargo.toml says which).
+shards-api = "0.1"
+flate2 = "1.1.10"
+# hyper-swim's failure detector and the timing it runs on, for hex-sim's crash class (hyper-raft,
+# vendored at vendor/hyper-raft, vendor/MANIFEST.toml): by name, patched to that copy below, as kiln
+# patches the same names.
+hyper-swim = "0.1.0"
+hyper-timing = "0.1.0"
+# Hex's wire over QUIC (docs/design/hex-quic.md): hyper-raft's application layer and its QUIC, by name and
+# pinned exactly, as kiln names them (crates.io holds unrelated crates under some hyper names, and a newer
+# compatible one there would be chosen over the patch); hyper-quic without its qlog traces, which would turn
+# on serde_json's preserve_order for every crate here (vendor/hyper-raft/UPSTREAM.md, change 1).
+hyper-quic = { version = "=0.1.0", default-features = false }
+hyper-transport = "=0.1.0"
+# A peer's key and its signing request, and the simulator CA that issues from one (crates/hex-quic enroll; Q6):
+# kiln's own version and features (kiln crates/kiln/Cargo.toml), so kiln vendoring Hex adds no second copy.
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+# A peer's enrollment kept in its folder as PEM (crates/hex-quic enroll/store.rs): rcgen's own.
+pem = "4.0.0"
+# The name a peer's certificate carries, and the CA conformance suite's chain check: hyper-tls's own webpki.
+webpki = { package = "rustls-webpki", version = "0.103.15", default-features = false, features = ["alloc", "std", "aws-lc-rs"] }
+libc = "0.2.190"
+# AF_VSOCK, for the guest relay: its safe `SockAddr::vsock` needs feature `all` (docs/design/shards-guest.md §3).
+socket2 = { version = "0.6", features = ["all"] }
+rustix = { version = "1.1.5", features = ["fs", "process", "thread", "mount", "pipe", "pty", "net", "termios", "system", "event", "stdio", "param", "time"] }
+# OCI seccomp: compiles a profile to a BPF program and loads it in the container init. Vendored
+# (vendor/seccompiler) so Hex can lean its compile path; patched to that copy below.
+seccompiler = "0.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10.9"
+tar = "0.4.46"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+# Same fallibly allocated native scope receipt passed to shards-api (AC-T7.4.1).
+triomphe = { version = "=0.1.17", default-features = false, features = ["std"] }
+unsize = "=1.1.0"
+ureq = "3"
+# The Windows `process` class: job objects, suspended process creation with a job and handle list, and
+# the job's accounting and guaranteed memory-limit violation (crates/hex-runtime/src/windows). Security
+# is for the SECURITY_ATTRIBUTES the process- and job-creation signatures name (Hex passes null). The
+# Windows `oci` class (crates/hex-runtime/src/windows/oci) adds the Host Compute Service's and the virtual
+# disk's types (their calls are resolved at run time, docs/research/runtime/windows-hcs.md §7), the
+# loader, RtlGetVersion, file version resources, device interface lists and the job access rights. UI_Shell
+# and System_Com read the users folder from its known folder and free it, the oci guest's default share.
+# Networking_WinSock and System_IO are the node agent's socket: AF_UNIX streams on one completion port
+# (crates/hex-afunix).
+windows-sys = { version = "0.61.2", features = [
+    "Wdk_Graphics_Direct3D",
+    "Wdk_System_SystemServices",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_HostComputeSystem",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+# WMI COM interfaces used only by hex-runtime on Windows (native plan step 6, HEX-INST-9).
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Rpc", "Win32_System_Variant", "Win32_System_Wmi"] }
+
+# The no-panic rule and the rest of CLAUDE.md as lints. Production code is checked again by
+# scripts/check-production.sh, without the test allowances.
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+string_slice = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+disallowed_macros = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+undocumented_unsafe_blocks = "deny"
+mem_forget = "deny"
+exit = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# A dependency's overflow unwinds to the boundary that contains it instead of wrapping into a wrong
+# value; Hex's own arithmetic is checked and never reaches this.
+overflow-checks = true
+# Symbols for profilers; no effect on generated code.
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"
+
+# hex-sim's tests replay recorded days and generated clusters of thousands of nodes; the gates' `cargo test` is a
+# debug build, where an unoptimized simulator took G4's fair-share tests past the gates' two hours. Optimized
+# in test builds as a release build runs them; overflow checks and debug assertions stay on (they are the dev
+# profile's own settings, not opt-level's).
+[profile.dev.package.hex-sim]
+opt-level = 3
+
+# hex-cli's own code optimized in test builds too: its `selftest-box` acts are the members the macOS tests
+# box, and a hog has to fill memory at the speed a release program does for a test's overshoot to say what
+# a box can do (the lead, 2026-11-06). Its dependencies keep the dev profile.
+[profile.dev.package.hex-cli]
+opt-level = 3
+
+# Hex vendors seccompiler (vendor/MANIFEST.toml) and builds against that copy, as the no-package-takes-
+# a-kiln-name rule has kiln patch its own vendored products (CLAUDE.md, Vendoring). vendor/ is its own
+# workspace (excluded above); the patch points at the crate directory inside it.
+[patch.crates-io]
+seccompiler = { path = "vendor/seccompiler" }
+hyper-swim = { path = "vendor/hyper-raft/crates/hyper-swim" }
+hyper-timing = { path = "vendor/hyper-raft/crates/hyper-timing" }
+hyper-quic = { path = "vendor/hyper-raft/crates/hyper-quic" }
+hyper-transport = { path = "vendor/hyper-raft/crates/hyper-transport" }
+shards-api = { path = "vendor/shards/crates/api" }
