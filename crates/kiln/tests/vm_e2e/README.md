@@ -248,7 +248,7 @@ Step 34's variables (above), and:
 They wait on (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be): step 1 (`agents_start`'s `image` and
 `resume`, on kiln main), step 3 (kiln's MCP from inside a microVM, over the agent-control link's
 `mcp` lane, Shards D254: goals 58's and 61's, read as step 34's drive reads it, by `mcp_round_trip`
-and `VM_E2E_LINKS`' `mcp` entry), step 4 (Antigravity's MCP over that lane, or its gap), step 5 (a microVM conversation picked up again in one
+and `VM_E2E_LINKS`' `mcp` entry), step 4 (Antigravity's, one fixed entry in its shared config, over that lane), step 5 (a microVM conversation picked up again in one
 from the UI), and step 34's own (kiln plan steps 16, 17, 18 and 33 and the links' owners).
 
 #### Linux x86_64 (KVM: adacachy, or adacachy2 through kiln run)
