@@ -326,7 +326,7 @@ fn cv8_it_holds_no_more_claims_than_its_holder_may_reserve() -> Result<(), Strin
 }
 
 /// The holder's items 4 and 5: its shell reserves a claim's room before the ledger starts it, the
-/// claim's own amount ([`Admission::claim`]). Refused for room as Hex's boxes took the machine
+/// claim's own amount ([`Admission::live_claim`]). Refused for room as Hex's boxes took the machine
 /// meanwhile (the refusal's view said first), the claim lapses: its owner is told why, nothing is
 /// started or recorded, and the run waits here on the room there is, offered again under a new claim
 /// once that room is back. A refusal for a claim no longer live, or for a run started, changes
@@ -337,7 +337,7 @@ fn holder_a_reserve_not_granted_lapses_its_claim_and_the_run_waits() -> Result<(
     let _ = said(&mut a, synced(8, 16, (0, 0), (0, 0)), 0);
     let w = probe(&mut a, "r1", "cpus=4,mem=4g", 1)?;
     let f = offer(&w, "r1").ok_or(format!("{w:?}"))?;
-    assert_eq!(a.claim(O1, "r1", f, 1), Some([4_000, 4 * GIB, 0, 0]), "what its reserve asks");
+    assert_eq!(a.live_claim(O1, "r1", f, 1), Some([4_000, 4 * GIB, 0, 0]), "what its reserve asks");
     let mut out = Vec::new();
     a.take(O1, "r1", f, 2, &mut out);
     let _ = said(&mut a, synced(8, 16, (6, 0), (0, 0)), 3);
@@ -345,14 +345,14 @@ fn holder_a_reserve_not_granted_lapses_its_claim_and_the_run_waits() -> Result<(
     a.not_granted(O1, "r1", f, NotGranted::Room, 3, &mut out);
     assert!(out.iter().any(|(_, m)| matches!(m, ToOwner::Lapsed { run, fence, why } if run == "r1" && *fence == f && why == NotGranted::Room.why())), "{out:?}");
     assert!(matches!(waiting(&out, "r1"), Some(Reason::Room { .. })), "it waits on the room there is: {out:?}");
-    assert!(!running(&a, "r1") && a.records().is_empty() && a.claim(O1, "r1", f, 3).is_none(), "nothing started, nothing recorded");
+    assert!(!running(&a, "r1") && a.records().is_empty() && a.live_claim(O1, "r1", f, 3).is_none(), "nothing started, nothing recorded");
     a.check()?;
     let back = said(&mut a, synced(8, 16, (0, 0), (0, 0)), 4);
     let g = offer(&back, "r1").ok_or(format!("offered again once its room is back: {back:?}"))?;
     assert_ne!(g, f, "under a new claim");
     let mut out = Vec::new();
     a.not_granted(O1, "r1", f, NotGranted::Unanswered(WaitEnded::Died), 5, &mut out);
-    assert_eq!(a.claim(O1, "r1", g, 5), Some([4_000, 4 * GIB, 0, 0]), "a refusal of the lapsed claim leaves the new one: {out:?}");
+    assert_eq!(a.live_claim(O1, "r1", g, 5), Some([4_000, 4 * GIB, 0, 0]), "a refusal of the lapsed claim leaves the new one: {out:?}");
     run_it(&mut a, "r1", g, 6)?;
     let mut out = Vec::new();
     a.not_granted(O1, "r1", g, NotGranted::Unanswered(WaitEnded::Stalled), 7, &mut out);
@@ -381,11 +381,11 @@ fn holder_a_kernel_start_not_granted_is_declined_for_room() -> Result<(), String
 }
 
 /// A run that asks nothing reserves nothing, as Hex's holder and keeper take no empty amount
-/// (agreed with Hex's lead through ROOT): its claim holds nothing, which is its shell's word to start
-/// it without a reservation, and it isn't counted against what its holder may reserve, so it starts
-/// while those are spent, beside a run that waits for one, and its end frees none. What it uses is
-/// in the keeper's measured room (CV12). That is its cold start: once kiln has learned what it asks,
-/// it reserves as any run does.
+/// (agreed with Hex's lead, 2026-11-13): its claim holds nothing, which is its shell's word to
+/// start it without a reservation, and it isn't counted against what its holder may reserve, so it
+/// starts while those are spent, beside a run that waits for one, and its end frees none. What it
+/// uses is in the keeper's measured room (CV12). That is its cold start: once kiln has learned what
+/// it asks, it reserves as any run does.
 #[test]
 fn holder_a_run_asking_nothing_starts_without_a_reservation() -> Result<(), String> {
     let mut a = runner(8, 16, 1000);
@@ -398,7 +398,7 @@ fn holder_a_run_asking_nothing_starts_without_a_reservation() -> Result<(), Stri
     assert_eq!(a.quote(&ask("q", "")?, 2), Quote::Now, "a run asking nothing fits beside them");
     let w = probe(&mut a, "z1", "", 3)?;
     let z = offer(&w, "z1").ok_or(format!("offered though the reservations are spent: {w:?}"))?;
-    assert_eq!(a.claim(O1, "z1", z, 3), Some([0; 4]), "nothing to reserve: started without a reservation");
+    assert_eq!(a.live_claim(O1, "z1", z, 3), Some([0; 4]), "nothing to reserve: started without a reservation");
     run_it(&mut a, "z1", z, 3)?;
     assert!(running(&a, "z1") && !running(&a, "r2"), "z1 runs, and r2 still waits for a reservation");
     a.check()?;
@@ -411,13 +411,13 @@ fn holder_a_run_asking_nothing_starts_without_a_reservation() -> Result<(), Stri
     a.check()
 }
 
-/// The holder's waits (ROOT's R03 ruling for kiln's holder): nothing seeded, nothing multiplied.
-/// Before the keeper's first answer a word waits on liveness alone, however long; the first answer
-/// is the bound, and a word stalls only once it has waited longer than the slowest answer, timed
-/// from the answer before it where it waited behind one, so an answer as slow as the slowest is no
-/// stall. A late answer comes to its own word and makes the slowest what it took, which ends the
-/// stall. A link that dies ends every word on it, the slowest kept for the next link's. A runner
-/// told its keeper stalled takes nothing new, saying so.
+/// The holder's waits (no constants: Shards' R03, as the user restated it on 2026-11-13): nothing
+/// seeded, nothing multiplied. Before the keeper's first answer a word waits on liveness alone,
+/// however long; the first answer is the bound, and a word stalls only once it has waited longer
+/// than the slowest answer, timed from the answer before it where it waited behind one, so an
+/// answer as slow as the slowest is no stall. A late answer comes to its own word and makes the
+/// slowest what it took, which ends the stall. A link that dies ends every word on it, the slowest
+/// kept for the next link's. A runner told its keeper stalled takes nothing new, saying so.
 #[test]
 fn holder_waits_follow_the_keepers_liveness_and_progress_alone() -> Result<(), String> {
     let mut w = Waits::default();

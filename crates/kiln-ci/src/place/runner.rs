@@ -3490,7 +3490,7 @@ impl Admission {
     /// capacity-view.md, the holder's item 4), or nothing, where it asks nothing: such a run starts
     /// without a reservation (`keeper::reserves`). None for any other claim, whose start is answered
     /// as ever.
-    pub fn claim(&self, from: Peer<'_>, run: &str, fence: Fence, now: i64) -> Option<Amounts> {
+    pub fn live_claim(&self, from: Peer<'_>, run: &str, fence: Fence, now: i64) -> Option<Amounts> {
         let p = self.find(from, run).and_then(|s| self.get(s))?;
         let live = match p.state {
             State::Offered { fence: f, until } => f == fence && until > now,

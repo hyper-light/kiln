@@ -74,10 +74,10 @@ impl View {
     }
 }
 
-/// Whether a claim of `amounts` reserves its room through the keeper: one that asks nothing doesn't,
-/// as Hex's holder and keeper take no empty amount (refused `Empty`). It starts without a
+/// Whether a claim of `amounts` reserves its room through the keeper: one that asks nothing
+/// doesn't, as Hex's holder and keeper take no empty amount (refused `Empty`). It starts without a
 /// reservation: what it uses is in the keeper's measured room (CV12) and CPU is shared, its cold
-/// start until kiln has learned what it asks (agreed with Hex's lead through ROOT, 2026-11-13).
+/// start until kiln has learned what it asks (agreed with Hex's lead, 2026-11-13).
 pub fn reserves(amounts: &Amounts) -> bool {
     amounts.iter().any(|&a| a > 0)
 }
@@ -134,17 +134,17 @@ pub enum WaitEnded {
 }
 
 /// A holder's waits on its keeper's answers (docs/lb.md "A machine's keeper"). Its words go on one
-/// link and the keeper answers them in the order said (CV9), so the answer due is the oldest word's,
-/// and the keeper's progress is its answers. A wait follows the keeper's liveness and progress
-/// alone: no time is seeded from records, and none is multiplied (R03, as ROOT ruled for kiln's
-/// holder, 2026-11-13). It ends, typed ([`WaitEnded`]), when the link dies or resets, or when the
-/// keeper, its link alive, has answered nothing for longer than the slowest answer it has given in
-/// this process: each answer timed from its word, or from the answer before it where that came
-/// later (the word waited behind it, the keeper answering in order). Until its first answer there
-/// is no such bound: a cold start waits on liveness alone, and admits nothing new there meanwhile
-/// (CV11). A word whose wait ended stays in its place, so an answer that comes late is matched to
-/// its own word, and makes the slowest answer what it took. `now` is the shell's monotonic clock,
-/// in milliseconds.
+/// link and the keeper answers them in the order said (CV9), so the answer due is the oldest
+/// word's, and the keeper's progress is its answers. A wait follows the keeper's liveness and
+/// progress alone: no time is seeded from records, and none is multiplied (no constants: Shards'
+/// R03, as the user restated it on 2026-11-13). It ends, typed ([`WaitEnded`]), when the link dies
+/// or resets, or when the keeper, its link alive, has answered nothing for longer than the slowest
+/// answer it has given in this process: each answer timed from its word, or from the answer before
+/// it where that came later (the word waited behind it, the keeper answering in order). Until its
+/// first answer there is no such bound: a cold start waits on liveness alone, and admits nothing
+/// new there meanwhile (CV11). A word whose wait ended stays in its place, so an answer that comes
+/// late is matched to its own word, and makes the slowest answer what it took. `now` is the shell's
+/// monotonic clock, in milliseconds.
 #[derive(Debug, Clone, Default)]
 pub struct Waits {
     /// When each word said on the link and not yet answered was said, oldest first.
