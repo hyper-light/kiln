@@ -178,6 +178,23 @@ impl Directory for AgentBook {
 /// The TLS exporter label (RFC 8446 §7.5) of a connection's binding ([`NetEvent::Connected`]).
 pub const BINDING_LABEL: &[u8] = b"EXPORTER-kiln-transport-binding";
 
+/// What this end of a connection's TLS 1.3 handshake negotiated, as rustls has it (hyper-transport's
+/// `Endpoint::negotiated`): its cipher suite and key exchange group, which each end of a link between the server and a
+/// runner says on kiln's API (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34; its provider, `LINK_PROVIDER`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Secured {
+    pub suite: hyper_quic::rustls::CipherSuite,
+    pub group: hyper_quic::rustls::NamedGroup,
+}
+
+impl Secured {
+    /// As kiln's API says it, as reach's links say theirs (`crate::reach::e2e::Negotiated`): rustls's names of its
+    /// suite and group.
+    pub fn said(self) -> kiln_ci::facts::Negotiated {
+        kiln_ci::facts::Negotiated { suite: format!("{:?}", self.suite), group: format!("{:?}", self.group) }
+    }
+}
+
 /// Commands into the net thread.
 #[derive(Debug)]
 pub enum Out {
@@ -365,8 +382,9 @@ fn sample<D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, Spares, D>) -> 
 #[derive(Debug)]
 pub enum NetEvent {
     /// `binding`: the connection's TLS exporter value under [`BINDING_LABEL`], the same at both
-    /// ends of one connection and unknowable to anyone else (see `crate::tunnel`).
-    Connected { peer: PeerId, name: Option<String>, binding: Option<[u8; 32]> },
+    /// ends of one connection and unknowable to anyone else (see `crate::tunnel`). `secured`: what
+    /// this end's TLS negotiated ([`Secured`]), none before its handshake has chosen both.
+    Connected { peer: PeerId, name: Option<String>, binding: Option<[u8; 32]>, secured: Option<Secured> },
     Closed { peer: PeerId, reason: String },
     Unreachable { peer: PeerId, reason: String },
     /// `at`: when the network thread took it off the link, so the hub can say how long it waited
@@ -1481,7 +1499,8 @@ fn on_event<B, D>(
         Event::Connected { peer, .. } => {
             let mut binding = [0u8; 32];
             let binding = ep.export_keying_material(peer, BINDING_LABEL, b"", &mut binding).ok().map(|_| binding);
-            out.push(NetEvent::Connected { peer, name: ep.directory().name_of(peer), binding });
+            let secured = ep.negotiated(peer).and_then(|(suite, group)| Some(Secured { suite, group: group? }));
+            out.push(NetEvent::Connected { peer, name: ep.directory().name_of(peer), binding, secured });
         }
         Event::Frame { peer, lane, kind, frame } => {
             crate::metrics::global().quic_streams.inc();
@@ -2341,7 +2360,7 @@ mod tests {
                 };
                 deadline = Instant::now() + hang;
                 match ev {
-                    (true, NetEvent::Connected { peer, name, binding }) => {
+                    (true, NetEvent::Connected { peer, name, binding, .. }) => {
                         assert_eq!(name.as_deref(), Some("bench-1"));
                         assert!(binding.is_some());
                         assert_ne!(binding, srv_binding, "a new connection has a new binding");
@@ -2496,6 +2515,45 @@ mod tests {
             assert!(refused(handshake(runner()?, server_on(provider, &server_creds)?)?), "a server taking {bad} alone refuses the runner");
         }
         Ok(())
+    }
+
+    /// What the next connection of `rx`'s endpoint said its own TLS negotiated ([`NetEvent::Connected`]), skipping other
+    /// events.
+    async fn secured_of(rx: &crate::memory::queue::Receiver<crate::wire::fan::Routed>, deadline: Instant) -> anyhow::Result<Option<Secured>> {
+        loop {
+            if let NetEvent::Connected { secured, .. } = next_event(rx, deadline).await? {
+                return Ok(secured);
+            }
+        }
+    }
+
+    /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34: each end of a link between the server and a runner (their
+    /// endpoints on loopback) says what its own TLS negotiated as the link comes up: `TLS13_AES_256_GCM_SHA384` under
+    /// [`LINK_PROVIDER`]'s first key exchange group, a hybrid post-quantum one, at both ends, named as kiln's API says
+    /// them. An end that says none fails this.
+    #[test]
+    fn s34_both_ends_of_a_server_runner_link_say_aes_256_gcm_under_the_hybrid_group() -> anyhow::Result<()> {
+        use hyper_quic::rustls::{CipherSuite, NamedGroup};
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open_scratch(dir.path())?;
+            let addr = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
+            let (_srv, srv_ev) = in_order(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, agent_ev) = in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("box")?, server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
+            agent.command(Out::Connect { addr }).await;
+            // Only ends a hang, as the other loopback tests' bounds do.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let server_end = secured_of(&srv_ev, deadline).await?;
+            let runner_end = secured_of(&agent_ev, deadline).await?;
+            let group = LINK_PROVIDER.kx_groups.first().map(|g| g.name()).ok_or_else(|| anyhow::anyhow!("the links' provider has no group"))?;
+            assert!(matches!(group, NamedGroup::secp384r1MLKEM1024 | NamedGroup::X25519MLKEM768 | NamedGroup::secp256r1MLKEM768), "{group:?} is a hybrid post-quantum group");
+            let want = Secured { suite: CipherSuite::TLS13_AES_256_GCM_SHA384, group };
+            assert_eq!(server_end, Some(want), "the server's end");
+            assert_eq!(runner_end, Some(want), "the runner's end");
+            let said = want.said();
+            assert_eq!((said.suite.as_str(), said.group.as_str()), ("TLS13_AES_256_GCM_SHA384", "secp384r1MLKEM1024"), "named as kiln's API says them");
+            Ok(())
+        })
     }
 }
 

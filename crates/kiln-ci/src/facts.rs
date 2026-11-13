@@ -62,6 +62,22 @@ pub struct RunnerFacts {
     /// facts.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<crate::runtime::Observation>,
+    /// What its own end of its link to the server negotiated (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34):
+    /// said with the facts it sends as it connects, kept by the server with that connection, and not kept with the
+    /// facts. None from a runner from before it, and in a probe's report.
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<Negotiated>,
+}
+
+/// What one end of a TLS 1.3 connection negotiated, as rustls names its cipher suite and key exchange group
+/// (`TLS13_AES_256_GCM_SHA384`, `secp384r1MLKEM1024`): a link's `secured`, as kiln's reach says its links'.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(default)]
+pub struct Negotiated {
+    pub suite: String,
+    pub group: String,
 }
 
 /// The work directory's file system and the devices it is on, as found without privilege

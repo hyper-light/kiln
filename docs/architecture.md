@@ -114,7 +114,10 @@ Agents keep one QUIC connection to the server (hyper-transport, mutual TLS: the 
 server's certificate under the fixed name `kiln-server`, the server the agent's, both against the
 kiln CA; TLS 1.3 at `TLS13_AES_256_GCM_SHA384` alone under the hybrid post-quantum groups, a peer
 offering no AES-256-GCM refused at its handshake: `net::LINK_PROVIDER`, kiln plan
-01a1cd8e862e7169a074db3d5fa33f3d step 34). **No ports beyond the HTTP one are required; UDP is used when reachable.** An agent dials
+01a1cd8e862e7169a074db3d5fa33f3d step 34). Each end says what its own TLS negotiated, as each agent's `link` in
+`GET /api/agents` while it's connected: `server`, the server's end of its connection, and `runner`, the runner's own,
+which it says in the facts it sends as it connects (each a cipher suite and a key exchange group as rustls names them,
+`TLS13_AES_256_GCM_SHA384` and `secp384r1MLKEM1024`, as reach's links say theirs). **No ports beyond the HTTP one are required; UDP is used when reachable.** An agent dials
 the QUIC address over UDP first. When two direct dials in a row get no answer (or direct dials go
 unanswered for 20 s) it opens the HTTP tunnel instead: a WebSocket to `GET /api/agents/tunnel` on
 the server's HTTP port (`ws://`, or `wss://` when the server URL is `https://`), with a UDP socket
