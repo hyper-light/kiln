@@ -1437,6 +1437,14 @@ impl Sent {
         matches!(self, Self::Ok | Self::Accepted(_) | Self::Taken | Self::Parked)
     }
 
+    /// A person's command kiln took (attention plan 01a199e1b177752e84dad5dc990e6a15, step 1: their use of the agent):
+    /// it [went](Self::went), or kiln committed its custody as mail (W20: a message published, waiting for or past the
+    /// receiver's admission), unless that publication was cancelled or superseded.
+    pub fn kept_for_person(&self) -> bool {
+        use super::mail::Disposition;
+        self.went() || matches!(self, Self::Published(r) if !matches!(r.disposition, Disposition::Cancelled | Disposition::Superseded))
+    }
+
     /// What a runner's answer to a command says of it (`crate::wire::commands`).
     pub fn of(a: crate::wire::commands::Answer) -> Self {
         use crate::wire::commands::Answer;

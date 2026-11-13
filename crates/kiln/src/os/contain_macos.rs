@@ -3,10 +3,17 @@
 //! whenever one of the agent's processes forks, its children (`proc_listchildpids`) are the
 //! agent's too, and watched in turn, so the agent's processes are known as they come and go
 //! without looking at the machine's. A process that forked and ended before its children were
-//! listed (a quick double fork) leaves those children unseen: once a minute, the user's processes
-//! are looked at for the agent's mark (`crate::harness::survivors::MARK`), and what carries it is
-//! followed from then on. After a runner restart nothing is followed until the agent's harness
-//! starts again; until then its processes are found by their mark, as before.
+//! listed (a quick double fork: `sh -c '… &'`, `nohup … &`) leaves those children unseen: once a
+//! minute, and as the agent ends, the user's processes are looked at for a process group or session
+//! one of the agent's processes made (getpgid(2), getsid(2)), and for the agent's mark
+//! (`crate::harness::survivors::MARK`), and what is in one or carries it is followed from then on.
+//! The groups come first: macOS 26 shows no environment of Apple's own programs (`/bin/sh`,
+//! `/bin/sleep`, `/usr/bin/ssh`, `/usr/bin/perl`), so no mark, while every process stays in the group
+//! and session it was born in until it calls setpgid(2) or setsid(2), however it's parented, and
+//! nothing outside a session can join it (docs/agents.md, "What an agent left running"). After a
+//! runner restart nothing is followed until the agent's harness starts again; until then its
+//! processes are found by the groups its recorded processes made, and by their mark
+//! (`crate::harness::survivors::scan_known`).
 //!
 //! What an agent starts through launchd (`launchctl bootstrap`, `load`, `submit`, `start`,
 //! `kickstart`) leaves the agent's tree for launchd's, with nothing of the agent's environment, so
@@ -17,7 +24,7 @@
 //! as launchd jobs, outside everything kiln knew of the agent, when the Mac ran out of memory.
 //!
 //! Priority (docs/priority.md): an agent's harness, and each CI step, starts below normal
-//! ([`background`]: nice [`NICE`]), and so does all they start. Not under Darwin background policy:
+//! ([`background`]: nice [`NICE`] past the runner's own), and so does all they start. Not under Darwin background policy:
 //! Apple silicon runs that on its efficiency cores alone and throttles its disk and network I/O, so
 //! agents had a fraction of the machine and moved their work where kiln couldn't see it (launchd
 //! jobs, VMs). Below normal, their work has every core the machine isn't using for something
@@ -39,9 +46,12 @@ const SWEEP: Duration = Duration::from_secs(60);
 const MOST_CHILDREN: usize = 1024;
 /// How deep a fork's descendants are listed when it's seen.
 const DEPTH: usize = 8;
-/// The nice value agents' and legs' processes start at: below a process started plainly (0), so the
-/// server and what a person runs come first, on every core alike.
+/// How far below the runner's own priority agents' and legs' processes start: nice [`NICE`] past
+/// the runner's, below a process it starts plainly (a person's run), so the server and what a
+/// person runs come first, on every core alike ([`agents_nice`]).
 pub const NICE: i32 = 10;
+/// The highest nice value: `PRIO_MAX` in macOS's `<sys/resource.h>` (libc doesn't export it here).
+const PRIO_MAX: i32 = 20;
 /// How often launchd is asked for the processes of agents' jobs, at most.
 const JOBS_EVERY: Duration = Duration::from_secs(1);
 
@@ -51,6 +61,10 @@ struct Tracker {
     members: Mutex<HashMap<i32, String>>,
     /// The sessions with a group: those whose marks the sweep looks for.
     sessions: Mutex<HashSet<String>>,
+    /// The process groups and sessions a followed process made (each named by its maker's pid), by id:
+    /// whose each is. Kept after its maker ends, while any process is still in it: XNU gives no new
+    /// process, group or session that id until then (`kern_fork.c`, its pid's allocation).
+    led: Mutex<HashMap<i32, String>>,
     /// The launchd jobs agents started, by label: whose each is.
     jobs: Mutex<HashMap<String, String>>,
 }
@@ -64,7 +78,7 @@ fn tracker() -> Option<&'static Tracker> {
             tracing::info!("no kqueue: agents' processes are found by their mark");
             return None;
         }
-        Some(Tracker { kq, members: Mutex::new(HashMap::new()), sessions: Mutex::new(HashSet::new()), jobs: Mutex::new(HashMap::new()) })
+        Some(Tracker { kq, members: Mutex::new(HashMap::new()), sessions: Mutex::new(HashSet::new()), led: Mutex::new(HashMap::new()), jobs: Mutex::new(HashMap::new()) })
     })
     .as_ref()
     .inspect(|t| t.run_once())
@@ -100,6 +114,7 @@ impl Tracker {
             self.members.lock().remove(&pid);
             return;
         }
+        self.note_led(pid, session);
         if depth > 0 {
             for c in children(pid) {
                 self.watch(c, session, depth - 1);
@@ -131,6 +146,9 @@ impl Tracker {
                 if ev.fflags & libc::NOTE_EXEC != 0
                     && let Some(session) = self.members.lock().get(&pid).cloned()
                 {
+                    // Made a group or session of its own between its fork and this exec (a harness's
+                    // tool shell: Claude Code's are session leaders).
+                    self.note_led(pid, &session);
                     for label in launchd_labels(pid) {
                         tracing::info!(session = %session, label = %label, "an agent started a launchd job: it's followed as the agent's");
                         self.jobs.lock().insert(label, session.clone());
@@ -151,29 +169,70 @@ impl Tracker {
         }
     }
 
-    /// What carries a followed session's mark and isn't followed yet (it left between a fork and
-    /// its listing): followed from now on.
+    /// The process group or session `pid` made, where it made one (its id is its pid): `session`'s from now on.
+    fn note_led(&self, pid: i32, session: &str) {
+        if groups_of(u32::try_from(pid).unwrap_or(0)).contains(&u32::try_from(pid).ok()) {
+            self.led.lock().insert(pid, session.to_owned());
+        }
+    }
+
+    /// What is in a followed session's group or session, or carries its mark, and isn't followed yet (it left
+    /// between a fork and its listing): followed from now on.
     fn sweep(&self) {
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
         let sessions = self.sessions.lock().clone();
         if sessions.is_empty() {
             return;
         }
+        self.adopt(None, &sessions);
+    }
+
+    /// What is in `only`'s groups and sessions (every followed session's where `None`, their marks too) and isn't
+    /// followed yet: followed from now on. Groups and sessions no process is in any more are forgotten.
+    fn adopt(&self, only: Option<&str>, sessions: &HashSet<String>) {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        // What followed processes made since they were followed (one that called setsid(2) after its exec).
+        let followed: Vec<(i32, String)> = self.members.lock().iter().map(|(p, s)| (*p, s.clone())).collect();
+        for (p, s) in &followed {
+            self.note_led(*p, s);
+        }
+        let marks = only.is_none();
+        let mut kind = ProcessRefreshKind::nothing().with_user(UpdateKind::Always).without_tasks();
+        if marks {
+            kind = kind.with_environ(UpdateKind::Always);
+        }
         let mut sys = System::new();
-        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_environ(UpdateKind::Always).with_user(UpdateKind::Always).without_tasks());
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
         let me = sys.process(sysinfo::Pid::from_u32(std::process::id())).and_then(|p| p.user_id().cloned());
         let prefix = format!("{}=", crate::harness::survivors::MARK);
+        let mut carried: HashSet<i32> = HashSet::new();
+        let mut found: Vec<(i32, String)> = Vec::new();
         for (pid, p) in sys.processes() {
+            let ids = groups_of(pid.as_u32());
+            carried.extend(ids.iter().flatten().filter_map(|i| i32::try_from(*i).ok()));
             if me.is_some() && p.user_id() != me.as_ref() {
                 continue;
             }
-            let Some(session) = p.environ().iter().find_map(|kv| kv.to_str().and_then(|s| s.strip_prefix(prefix.as_str()))) else { continue };
             let Ok(pid) = i32::try_from(pid.as_u32()) else { continue };
+            // Its group or session first: no process outside a session can join it, while any can set a mark.
+            let grouped = ids.iter().flatten().filter_map(|i| i32::try_from(*i).ok()).find_map(|i| self.led.lock().get(&i).cloned());
+            let marked = || p.environ().iter().find_map(|kv| kv.to_str().and_then(|s| s.strip_prefix(prefix.as_str()))).map(str::to_owned);
+            let Some(session) = grouped.or_else(|| if marks { marked() } else { None }) else { continue };
+            if only.is_some_and(|o| o != session) || !sessions.contains(&session) {
+                continue;
+            }
             // Looked up and let go of before it's followed (`watch` takes the lock).
             let followed = self.members.lock().contains_key(&pid);
-            if sessions.contains(session) && !followed {
-                self.watch(pid, session, DEPTH);
+            if !followed {
+                found.push((pid, session));
             }
+        }
+        if marks {
+            // Its maker still followed: made since the processes were listed.
+            let makers: HashSet<i32> = self.members.lock().keys().copied().collect();
+            self.led.lock().retain(|id, _| carried.contains(id) || makers.contains(id));
+        }
+        for (pid, session) in found {
+            self.watch(pid, &session, DEPTH);
         }
     }
 
@@ -187,6 +246,7 @@ impl Tracker {
                 continue;
             }
             self.watch(pid, &session, DEPTH);
+            let nice = agents_nice();
             let mut tree = vec![pid];
             let mut i = 0;
             while let Some(p) = tree.get(i).copied() {
@@ -198,7 +258,7 @@ impl Tracker {
             }
             for p in tree {
                 // SAFETY: one system call on a process id.
-                unsafe { libc::setpriority(libc::PRIO_PROCESS, u32::try_from(p).unwrap_or(0), NICE) };
+                unsafe { libc::setpriority(libc::PRIO_PROCESS, u32::try_from(p).unwrap_or(0), nice) };
             }
             tracing::info!(session = %session, label = %label, pid, "an agent's launchd job runs: its processes are the agent's");
         }
@@ -427,6 +487,8 @@ impl Group {
     /// launchd jobs booted out first so launchd doesn't start them again.
     pub fn kill(&self) {
         let Some(t) = tracker() else { return };
+        // What its groups and sessions hold that no fork showed yet (a double fork since the last sweep).
+        t.adopt(Some(&self.session), &HashSet::from([self.session.clone()]));
         let jobs: Vec<String> = t.jobs.lock().iter().filter(|(_, s)| **s == self.session).map(|(l, _)| l.clone()).collect();
         for label in &jobs {
             boot_out(label);
@@ -450,6 +512,7 @@ impl Group {
         if let Some(t) = tracker() {
             t.members.lock().retain(|_, s| *s != self.session);
             t.sessions.lock().remove(&self.session);
+            t.led.lock().retain(|_, s| *s != self.session);
             t.jobs.lock().retain(|_, s| *s != self.session);
         }
     }
@@ -464,42 +527,71 @@ pub fn sessions() -> Vec<String> {
     s
 }
 
-/// The agent session process `pid` belongs to, when it's one followed.
+/// The agent session process `pid` belongs to: it's followed as its, or it's in a process group or session one of
+/// its processes made (a double fork's, however it's parented since). By the process alone: no process can join a
+/// group or session from outside it (setpgid(2): EPERM).
 pub fn session_of(pid: u32) -> Option<String> {
-    let pid = i32::try_from(pid).ok()?;
-    tracker()?.members.lock().get(&pid).cloned()
+    let t = tracker()?;
+    let ipid = i32::try_from(pid).ok()?;
+    if let Some(s) = t.members.lock().get(&ipid).cloned() {
+        return Some(s);
+    }
+    groups_of(pid).iter().flatten().filter_map(|i| i32::try_from(*i).ok()).find_map(|i| t.led.lock().get(&i).cloned())
 }
 
-/// Makes `cmd`'s process start below normal (docs/priority.md): nice [`NICE`], set between fork and
-/// exec, which everything it starts inherits. Every core, and its I/O unthrottled; only ranked
-/// below what runs at normal.
+/// The process group and the session process `pid` is in (getpgid(2), getsid(2), which XNU answers for any process,
+/// to any), each named by the pid of the process that made it: a process stays in both, however it's parented, until
+/// it calls setpgid(2) or setsid(2). `None` for an ended process, and for launchd's and the kernel's (0, 1), which
+/// hold everything nothing else does.
+pub fn groups_of(pid: u32) -> [Option<u32>; 2] {
+    let Ok(p) = i32::try_from(pid) else { return [None, None] };
+    // SAFETY: two system calls on a process id; each returns -1 for one that doesn't run.
+    let (group, session) = unsafe { (libc::getpgid(p), libc::getsid(p)) };
+    [group, session].map(|i| u32::try_from(i).ok().filter(|i| *i > 1))
+}
+
+/// The nice value agents' and legs' processes run at: [`NICE`] past this process's own (the
+/// runner's, which a process it starts plainly inherits), at most [`PRIO_MAX`]. A runner at normal
+/// (0) puts them at 10; one started under `nice -n 10` at 20, not level with a person's run, as a
+/// fixed 10 put them (and a fixed 10 under a runner niced past it was refused: lowering a nice
+/// value takes root).
+fn agents_nice() -> i32 {
+    // SAFETY: one system call on this process, which can't fail: -1 is nice -1, not an error.
+    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    own.saturating_add(NICE).min(PRIO_MAX)
+}
+
+/// Makes `cmd`'s process start below normal (docs/priority.md): [`agents_nice`], set between fork
+/// and exec, which everything it starts inherits. Every core, and its I/O unthrottled; only ranked
+/// below what the runner and a person run.
 pub fn background(cmd: &mut Command) {
     use std::os::unix::process::CommandExt as _;
+    let nice = agents_nice();
     // SAFETY: the closure runs in the child between fork and exec, and makes one system call.
     unsafe {
-        cmd.pre_exec(|| {
-            let _ = libc::setpriority(libc::PRIO_PROCESS, 0, NICE);
+        cmd.pre_exec(move || {
+            let _ = libc::setpriority(libc::PRIO_PROCESS, 0, nice);
             Ok(())
         });
     }
 }
 
-/// Process `pid`, started some other way (a CI step on a pty), below normal from now on, as
-/// `renice` puts one: whether it was.
+/// Process `pid`, started some other way (a CI step on a pty), below normal from now on
+/// ([`agents_nice`]), as `renice` puts one: whether it was.
 pub fn background_pid(pid: u32) -> bool {
     // SAFETY: one system call on a process id.
-    unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, NICE) == 0 }
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, agents_nice()) == 0 }
 }
 
 /// How legs and agents run here (docs/priority.md), for the runner's facts and its log.
 pub fn priority() -> String {
-    format!("below normal: each leg's and agent's processes run at nice {NICE}, on every core")
+    format!("below normal: each leg's and agent's processes run at nice {}, {NICE} past the runner's own, on every core", agents_nice())
 }
 
 /// How this machine holds an agent's processes together.
 pub fn how() -> String {
     match tracker() {
-        Some(_) => "followed fork by fork (kqueue), with a sweep for the agent's mark each minute".to_owned(),
+        Some(_) => "followed fork by fork (kqueue), with a sweep each minute for the process groups and sessions the agent's processes made, and for its mark".to_owned(),
         None => "none (processes are found by their mark)".to_owned(),
     }
 }
@@ -538,6 +630,57 @@ mod tests {
         anyhow::ensure!(after.is_empty(), "ending the group ends all of it: {after:?}");
         anyhow::ensure!(session_of(std::process::id()).is_none(), "the runner isn't an agent's");
         Ok(())
+    }
+
+    /// An Apple program an agent's shell double-forked (`sh -c '… &'`, its parent gone before it's listed) shows no
+    /// environment on macOS 26, so no mark: the sweep still finds it as the agent's, and ending the agent ends it.
+    #[test]
+    fn what_an_agent_double_forked_before_it_was_followed_is_its_and_ends_with_it() -> anyhow::Result<()> {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        let session = format!("df{}", std::process::id());
+        hold_agents();
+        let group = Group::of(&session).ok_or_else(|| anyhow::anyhow!("no kqueue"))?;
+        // Started as kiln starts a harness (a process group of its own, marked), its inner shell gone at once.
+        let mut harness = Command::new("/bin/sh");
+        harness.args(["-c", "/bin/sh -c '/bin/sleep 43 >/dev/null 2>&1 & echo $!'; exec /bin/sleep 44"]);
+        harness.env(crate::harness::survivors::MARK, &session).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).process_group(0);
+        let mut child = harness.spawn()?;
+        let mut line = String::new();
+        if let Some(out) = child.stdout.take() {
+            std::io::BufReader::new(out).read_line(&mut line)?;
+        }
+        let orphan: i32 = line.trim().parse()?;
+        // Reparented (its shell exited) before its harness is followed: no fork of a followed process shows it.
+        for _ in 0..100 {
+            if parent(orphan) == Some(1) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = child.id();
+        group.started(pid);
+        let t = tracker().ok_or_else(|| anyhow::anyhow!("no kqueue"))?;
+        t.sweep();
+        let whose = session_of(u32::try_from(orphan)?);
+        let listed = group.pids().contains(&u32::try_from(orphan)?);
+        group.kill();
+        let _ = child.wait();
+        let left = alive(orphan);
+        if left {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(orphan), nix::sys::signal::Signal::SIGKILL);
+        }
+        group.remove();
+        anyhow::ensure!(whose.as_deref() == Some(session.as_str()), "the double-forked /bin/sleep {orphan} isn't the agent's: {whose:?}");
+        anyhow::ensure!(listed, "the double-forked /bin/sleep {orphan} isn't among the agent's processes");
+        anyhow::ensure!(!left, "the double-forked /bin/sleep {orphan} outlived the agent");
+        Ok(())
+    }
+
+    /// Process `pid`'s parent, as `ps` says it.
+    fn parent(pid: i32) -> Option<u32> {
+        let out = Command::new("ps").args(["-o", "ppid=", "-p", &pid.to_string()]).output().ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
     }
 
     /// What `launchctl` starts is read from its arguments, for every way it starts a job.
@@ -611,7 +754,8 @@ mod tests {
         boot_out(&label);
         anyhow::ensure!(job.is_some(), "launchd never ran the job");
         anyhow::ensure!(followed, "the job's process {job:?} isn't the agent's");
-        anyhow::ensure!(lowered == Some(NICE), "the job's process runs at nice {lowered:?}, not below normal");
+        let below = agents_nice();
+        anyhow::ensure!(lowered == Some(below), "the job's process runs at nice {lowered:?}, not below normal ({below})");
         anyhow::ensure!(after.is_none() && !listed, "ending the agent left its job: {after:?}");
         Ok(())
     }
@@ -625,7 +769,9 @@ mod tests {
 
     /// Goal 8 (plan 01a1a59c2b29 step 3, docs/priority.md): an agent's harness, and what it starts,
     /// run below normal (nice), below a process started plainly; a person's run doesn't; a
-    /// process started some other way (a step on a pty) is put there as it runs.
+    /// process started some other way (a step on a pty) is put there as it runs. Relative to the
+    /// runner (this test's process): under a runner already niced (a `kiln run` shell runs at 10)
+    /// the agents still run below what it starts plainly; at the least priority (20) level with it.
     #[test]
     fn g8_s3_an_agents_processes_run_under_background_policy() -> anyhow::Result<()> {
         let session = format!("g8agent{}", std::process::id());
@@ -664,9 +810,12 @@ mod tests {
         }
         person.remove();
         let normal = normal.ok_or_else(|| anyhow::anyhow!("ps said nothing of a plain process"))?;
-        anyhow::ensure!(pids.len() >= 2 && agents.iter().all(|p| *p == Some(NICE) && NICE > normal), "the harness and its sleep, each at nice {NICE}, a plain process at {normal}: {pids:?} {agents:?}");
+        // Below it, unless it already runs at the least priority there is.
+        let below = (normal + NICE).min(PRIO_MAX);
+        anyhow::ensure!(below > normal || normal == PRIO_MAX, "agents at nice {below}, not below a plain process at {normal}");
+        anyhow::ensure!(pids.len() >= 2 && agents.iter().all(|p| *p == Some(below)), "the harness and its sleep, each at nice {below}, a plain process at {normal}: {pids:?} {agents:?}");
         anyhow::ensure!(persons_before == Some(normal), "a person's run lowered: {persons_before:?}, a plain process {normal}");
-        anyhow::ensure!(put && persons_after == Some(NICE), "a running process not put below normal: {persons_after:?}");
+        anyhow::ensure!(put && persons_after == Some(below), "a running process not put below normal ({below}): {persons_after:?}");
         Ok(())
     }
 }
