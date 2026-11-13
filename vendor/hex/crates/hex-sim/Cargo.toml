@@ -1,0 +1,27 @@
+[package]
+name = "hex-sim"
+description = "Hex's deterministic cluster simulator: fake nodes, a crash nemesis at every control-plane write, and the scheduler's serial specification as the oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex-api.workspace = true
+serde.workspace = true
+hex-health.workspace = true
+hyper-swim.workspace = true
+hyper-timing.workspace = true
+thiserror.workspace = true
+triomphe.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+# AC-T7.11.4's counting allocator (tests/memory.rs): a safe count of live heap bytes over System.
+cap = "0.1.2"
+proptest = "1.12.0"
+
+[lints]
+workspace = true

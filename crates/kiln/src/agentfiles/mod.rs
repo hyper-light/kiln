@@ -382,11 +382,11 @@ pub async fn versions(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str) -> R<Ve
 }
 
 /// `text` as Shards checks it: refused, in Shards' words, when Shards says it's no Agentfile.
-async fn checked(hub: &Hub, text: &str) -> R<Check> {
+async fn checked(text: &str) -> R<Check> {
     if let Some(p) = text_problem(text) {
         return Err(Error::Bad(p));
     }
-    let c = check::check(hub, text).await;
+    let c = check::check(text).await;
     match c.refusal() {
         Some(said) => Err(Error::Refused(said)),
         None => Ok(c),
@@ -400,7 +400,7 @@ pub async fn create(hub: &Hub, blobs: &dyn Blobs, who: &Who, name: &str, text: &
     if let Some(p) = name_problem(&name) {
         return Err(Error::Bad(p));
     }
-    let check = checked(hub, text).await?;
+    let check = checked(text).await?;
     let (id, owner) = (crate::util::new_id(), who.person.clone());
     let (o, n, i) = (owner.clone(), name.clone(), id.clone());
     if hub.store.read(move |c| Ok(named_in(c, &o, &n, &i)?)).await? {
@@ -459,7 +459,7 @@ pub async fn update(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str, patch: Pa
         }
         None => (read(blobs, &old.digest).await?, false),
     };
-    let check = if new_version { checked(hub, &text).await? } else { check::check(hub, &text).await };
+    let check = if new_version { checked(&text).await? } else { check::check(&text).await };
     if name == old.name && !new_version {
         return Ok(Saved { agentfile: old.with(text), check });
     }
@@ -524,7 +524,7 @@ pub async fn restore(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str, version:
     let text = read(blobs, &digest).await?;
     if digest == a.digest {
         // As it is already: nothing to make again.
-        let check = check::check(hub, &text).await;
+        let check = check::check(&text).await;
         return Ok(Saved { agentfile: a.with(text), check });
     }
     update(hub, blobs, who, id, Patch { name: None, text: Some(text) }, by).await

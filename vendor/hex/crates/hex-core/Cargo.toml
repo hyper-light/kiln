@@ -1,0 +1,27 @@
+[package]
+name = "hex-core"
+description = "Hex's sans-IO cores: bounds as cgroup writes, usage from cgroup files, box records, crash recovery, the node agent's wire format and the rule a macOS box is bounded by"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+triomphe.workspace = true
+
+[dev-dependencies]
+proptest = "1.12.0"
+
+# The doc-truth tests of `darwin`'s signal table against each kernel's own numbers.
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

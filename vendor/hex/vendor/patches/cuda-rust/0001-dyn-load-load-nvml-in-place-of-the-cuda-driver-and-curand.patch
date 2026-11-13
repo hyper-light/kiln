@@ -1,0 +1,240 @@
+Subject: dyn_load: load NVML in place of the CUDA driver and cuRAND, without libloading
+Why: hex-gpu reads NVIDIA GPUs through NVML (docs/design/gpu-telemetry.md G1), which cuda-rust does not bind; its CUDA driver loader's policy is what carries over: try each library name in turn, WSL's own path among them, keep the library loaded for the process, and report a library that did not load apart from one missing a symbol. The library is opened through Hex's own FFI file (crates/hex-gpu/src/nvml/sys.rs, CLAUDE.md §12) rather than libloading, which Hex does not link; the expect on the candidate list goes (CLAUDE.md §1); NVML is initialised once and never shut down, so device handles stay valid; and a failed load is not cached, so a driver loaded after the node started is found at its next open.
+
+diff --git a/cuda-bindings/src/dyn_load.rs b/cuda-bindings/src/dyn_load.rs
+index a13a7c3c682c656620441112d3e392d1cee66c70..c42795011e32753103ce1aec0904647d8428ceb3 100644
+--- a/cuda-bindings/src/dyn_load.rs
++++ b/cuda-bindings/src/dyn_load.rs
+@@ -1,29 +1,32 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ // SPDX-License-Identifier: Apache-2.0
++//
++// Changed by Hex (github.com/hyper-light/hex): this loads NVML, the NVIDIA Management Library, in place
++// of the CUDA driver and cuRAND, for hex-gpu (crates/hex-gpu/src/nvml.rs includes it by path). Each
++// change and why is a row of vendor/cuda-rust/UPSTREAM.md.
+ 
+-//! Runtime loading policy for CUDA driver and cuRAND.
++//! Runtime loading policy for NVML.
+ //!
+-//! Bindgen-generated wrappers own the ABI surface and function signatures.
+-//! This module only chooses library names, caches the generated wrappers, and
+-//! exposes the stable flat free-function API used throughout the workspace.
++//! [`super::sys`] owns the ABI surface and function signatures (NVIDIA's NVML reference, `nvml.h`).
++//! This module only chooses library names, keeps the loaded and initialised library for the process,
++//! and tells a library that didn't load from one that loaded without a symbol Hex calls or whose
++//! initialisation failed.
+ 
+ use std::sync::OnceLock;
+ 
+-#[allow(unused_imports)]
+-use crate::*;
++use super::sys::Api;
+ 
+-type GeneratedCudaDriverApi = crate::generated_cuda::CudaDriverApi;
+-type GeneratedCurandApi = crate::generated_curand::CurandApi;
+-
+-#[derive(Debug)]
++#[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum DynLoadError {
+     LoadFailed {
+         names: &'static [&'static str],
+-        source: libloading::Error,
++        source: String,
++    },
++    MissingSymbol {
++        name: &'static str,
+     },
+-    RuntimeTooOld {
+-        compile_version: u32,
+-        runtime_version: u32,
++    InitFailed {
++        code: i32,
+     },
+ }
+ 
+@@ -33,152 +36,58 @@ impl std::fmt::Display for DynLoadError {
+             DynLoadError::LoadFailed { names, source } => {
+                 write!(f, "failed to load any of {names:?}: {source}")
+             }
+-            DynLoadError::RuntimeTooOld {
+-                compile_version,
+-                runtime_version,
+-            } => {
+-                write!(
+-                    f,
+-                    "CUDA driver too old: built against {}.{} but runtime is {}.{}",
+-                    compile_version / 1000,
+-                    (compile_version % 1000) / 10,
+-                    runtime_version / 1000,
+-                    (runtime_version % 1000) / 10,
+-                )
++            DynLoadError::MissingSymbol { name } => {
++                write!(f, "the NVML library loaded has no {name}")
++            }
++            DynLoadError::InitFailed { code } => {
++                write!(f, "nvmlInit_v2 returned {code}")
+             }
+         }
+     }
+ }
+ 
+-impl std::error::Error for DynLoadError {
+-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+-        match self {
+-            DynLoadError::LoadFailed { source, .. } => Some(source),
+-            DynLoadError::RuntimeTooOld { .. } => None,
+-        }
+-    }
+-}
+-
+-#[cfg(target_os = "linux")]
+-const CUDA_LIB_NAMES: &[&str] = &[
+-    "libcuda.so.1",
+-    "/usr/lib/wsl/lib/libcuda.so.1",
+-    "libcuda.so",
+-    "/usr/lib/wsl/lib/libcuda.so",
+-    "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+-];
+-#[cfg(target_os = "macos")]
+-const CUDA_LIB_NAMES: &[&str] = &["libcuda.dylib"];
+-#[cfg(target_os = "windows")]
+-const CUDA_LIB_NAMES: &[&str] = &["nvcuda.dll"];
+-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+-const CUDA_LIB_NAMES: &[&str] = &["libcuda.so"];
++impl std::error::Error for DynLoadError {}
+ 
++// The soname NVIDIA's driver installs, then WSL's copy, which WSL 2 keeps outside the loader's default
++// path.
+ #[cfg(target_os = "linux")]
+-const CURAND_LIB_NAMES: &[&str] = &["libcurand.so.10", "libcurand.so"];
+-#[cfg(target_os = "macos")]
+-const CURAND_LIB_NAMES: &[&str] = &["libcurand.dylib"];
++const NVML_LIB_NAMES: &[&str] = &["libnvidia-ml.so.1", "/usr/lib/wsl/lib/libnvidia-ml.so.1"];
++// Searched in System32 alone (super::sys), where NVIDIA's driver installs it.
+ #[cfg(target_os = "windows")]
+-const CURAND_LIB_NAMES: &[&str] = &["curand64_10.dll"];
+-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+-const CURAND_LIB_NAMES: &[&str] = &["libcurand.so"];
++const NVML_LIB_NAMES: &[&str] = &["nvml.dll"];
+ 
+-// The generated shims are `extern "C"`, so nothing reachable from them may
+-// panic (unwinding out of extern "C" aborts). `load_api`'s expect below is
+-// reachable from every shim; these make its precondition a compile-time
+-// fact rather than a runtime hope.
+-const _: () = assert!(!CUDA_LIB_NAMES.is_empty());
+-const _: () = assert!(!CURAND_LIB_NAMES.is_empty());
+-
+-trait GeneratedApi: Sized {
+-    unsafe fn open(path: &str) -> Result<Self, libloading::Error>;
+-}
+-
+-impl GeneratedApi for GeneratedCudaDriverApi {
+-    unsafe fn open(path: &str) -> Result<Self, libloading::Error> {
+-        unsafe { Self::new(path) }
+-    }
+-}
+-
+-impl GeneratedApi for GeneratedCurandApi {
+-    unsafe fn open(path: &str) -> Result<Self, libloading::Error> {
+-        unsafe { Self::new(path) }
+-    }
+-}
+-
+-fn load_api<T: GeneratedApi>(names: &'static [&'static str]) -> Result<T, DynLoadError> {
+-    let mut last_error = None;
++/// The first of `names` that `open` loads. A library that loaded but lacks a symbol is the right
++/// library broken, so it stops the search; one that didn't load moves it to the next name.
++pub(crate) fn load_api<T>(
++    names: &'static [&'static str],
++    mut open: impl FnMut(&'static str) -> Result<T, DynLoadError>,
++) -> Result<T, DynLoadError> {
++    let mut last_error = String::new();
+     for &name in names {
+-        match unsafe { T::open(name) } {
++        match open(name) {
+             Ok(api) => return Ok(api),
+-            Err(error) => last_error = Some(error),
++            Err(DynLoadError::LoadFailed { source, .. }) => last_error = source,
++            Err(other) => return Err(other),
+         }
+     }
+ 
+     Err(DynLoadError::LoadFailed {
+         names,
+-        source: last_error.expect("library candidate lists must be non-empty"),
++        source: last_error,
+     })
+ }
+ 
+-fn cached_api<T: GeneratedApi>(
+-    slot: &'static OnceLock<Result<T, DynLoadError>>,
+-    names: &'static [&'static str],
+-) -> Result<&'static T, &'static DynLoadError> {
+-    slot.get_or_init(|| load_api::<T>(names)).as_ref()
+-}
+-
+-static CUDA_DRIVER: OnceLock<Result<GeneratedCudaDriverApi, DynLoadError>> = OnceLock::new();
+-static CURAND: OnceLock<Result<GeneratedCurandApi, DynLoadError>> = OnceLock::new();
++/// Set once NVML has loaded and initialised; never closed or shut down, so the device handles taken
++/// through it stay valid for the process. A failure isn't kept: the next call tries again, so a
++/// driver installed or loaded after the node started is found at its next open.
++static NVML: OnceLock<Api> = OnceLock::new();
+ 
+-fn load_and_verify_cuda_driver() -> Result<GeneratedCudaDriverApi, DynLoadError> {
+-    let api = load_api::<GeneratedCudaDriverApi>(CUDA_LIB_NAMES)?;
+-
+-    // Since CUDA 11, minor-version compatibility allows newer toolkits on
+-    // older same-major drivers, so only reject on a major-version mismatch.
+-    // https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html
+-    if let Ok(get_version) = &api.cuDriverGetVersion {
+-        let mut runtime_version: std::ffi::c_int = 0;
+-        if unsafe { get_version(&mut runtime_version) } == 0 {
+-            let compile_major = crate::CUDA_VERSION / 1000;
+-            let runtime_major = (runtime_version as u32) / 1000;
+-            if runtime_major < compile_major {
+-                return Err(DynLoadError::RuntimeTooOld {
+-                    compile_version: crate::CUDA_VERSION,
+-                    runtime_version: runtime_version as u32,
+-                });
+-            }
+-        }
++pub(crate) fn nvml() -> Result<&'static Api, DynLoadError> {
++    if let Some(api) = NVML.get() {
++        return Ok(api);
+     }
+-
+-    Ok(api)
+-}
+-
+-fn cuda_driver() -> Result<&'static GeneratedCudaDriverApi, &'static DynLoadError> {
+-    CUDA_DRIVER
+-        .get_or_init(load_and_verify_cuda_driver)
+-        .as_ref()
+-}
+-
+-fn curand_api() -> Result<&'static GeneratedCurandApi, &'static DynLoadError> {
+-    cached_api(&CURAND, CURAND_LIB_NAMES)
+-}
+-
+-pub fn is_cuda_driver_available() -> bool {
+-    cuda_driver().is_ok()
+-}
+-
+-pub fn cuda_driver_load_error() -> Option<&'static DynLoadError> {
+-    cuda_driver().err()
++    let api = load_api(NVML_LIB_NAMES, Api::open)?;
++    api.init()
++        .map_err(|code| DynLoadError::InitFailed { code })?;
++    Ok(NVML.get_or_init(|| api))
+ }
+-
+-pub fn is_curand_available() -> bool {
+-    curand_api().is_ok()
+-}
+-
+-pub fn curand_load_error() -> Option<&'static DynLoadError> {
+-    curand_api().err()
+-}
+-
+-include!(concat!(env!("OUT_DIR"), "/cuda_driver_shims.rs"));
+-include!(concat!(env!("OUT_DIR"), "/curand_shims.rs"));

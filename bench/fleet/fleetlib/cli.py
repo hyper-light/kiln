@@ -29,7 +29,9 @@ def host_main(argv: List[str]) -> int:
     p.add_argument("--out", required=True, help="the run's directory on this host: records.jsonl, logs, and the scope (s/) it removes at the end")
     p.add_argument("--label", default=socket.gethostname().split(".")[0], help="this host's name in the records")
     p.add_argument("--shards", required=True, help="the shards binary under test")
-    p.add_argument("--driver", choices=("shards", "hex"), default="shards", help="who places the VMs: Shards' daemon (shards, the direct driver) or a Hex scheduler of the run's own (hex)")
+    p.add_argument("--driver", choices=("shards", "hex", "kiln"), default="shards", help="who places the VMs: Shards' daemon (shards, the direct driver), a Hex scheduler of the run's own (hex), or kiln's balancer, as isolated agent sessions (kiln: KILN_URL and KILN_TOKEN in the environment)")
+    p.add_argument("--kind", default="claude", help="the harness each kiln agent session runs (--driver kiln)")
+    p.add_argument("--asks", type=int, default=0, help="how many sessions the run asks kiln for at once (--driver kiln: kiln's own admission places, queues or refuses them)")
     p.add_argument("--hex", default="", help="the hex binary under test (--driver hex)")
     p.add_argument("--vm", default="", help="each VM's size, as the run asks Hex to admit it: cpus=N,mem=SIZE (--driver hex; Hex sizes a VM by what it admits, never by Shards' default)")
     p.add_argument("--image", required=True, help="the workload's image, pinned by digest (NAME@sha256:...)")
@@ -58,6 +60,11 @@ def host_main(argv: List[str]) -> int:
         if vm["cpu"] is None or vm["mem"] is None or vm["cpu"] <= 0 or vm["cpu"] % 1000 or vm["mem"] <= 0:
             p.error(f"--vm {o.vm!r}: whole CPUs and a memory size (cpus=1,mem=512m): a Shards VM's vCPUs are whole")
         o.hex = os.path.abspath(os.path.expanduser(o.hex))
+    if o.driver == "kiln":
+        if o.asks <= 0:
+            p.error("--driver kiln needs --asks N, how many sessions the run asks kiln for")
+        if not os.environ.get("KILN_URL") or not os.environ.get("KILN_TOKEN"):
+            p.error("--driver kiln needs KILN_URL and KILN_TOKEN in the environment (the token is never recorded)")
     o.out = os.path.abspath(os.path.expanduser(o.out))
     o.shards = os.path.abspath(os.path.expanduser(o.shards))
     rec = Records(os.path.join(o.out, "records.jsonl"), o.label, os.path.basename(os.path.dirname(o.out)) or o.label, sys.stdout if o.echo else None)

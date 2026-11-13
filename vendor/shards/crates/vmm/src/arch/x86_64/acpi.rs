@@ -1,0 +1,798 @@
+//! ACPI tables for x86_64 guests (ACPI 6.5; research doc §3.5, §4.4). The guest kernel
+//! has neither MP-table parsing nor `virtio_mmio.device=`, so these are how it finds its
+//! CPUs, the IOAPIC, COM1, the virtio devices, and how it powers off:
+//!
+//! - RSDP (rev 2) → XSDT → FADT (HW-reduced, rev 6.5) + MADT, FADT → DSDT
+//! - MADT: one Local APIC per vCPU (APIC id = index) and the IOAPIC, GSI base 0
+//! - DSDT: COM1 (`PNP0501`), each virtio-mmio device (`LNRO0005`), the VM generation ID
+//!   (`VMGENCTR`) with the Generic Event Device (`ACPI0013`) that tells the guest of a
+//!   new one, and `\_S5`
+//! - FADT SLEEP_CONTROL/STATUS registers on a port pair, so `reboot(RB_POWER_OFF)`
+//!   writes SLP_TYP 5 | SLP_EN and the VMM sees a power-off
+
+use super::layout;
+
+/// A PCI host bridge to describe (D153): its ECAM window and the 32-bit memory window
+/// its functions' BARs are placed in, each an address and a length.
+#[derive(Debug, Clone)]
+pub struct PciBridge {
+    pub ecam: (u64, u64),
+    pub mem32: (u64, u64),
+    /// Its 64-bit window, above 4 GiB, where its functions have 64-bit BARs (D154).
+    pub mem64: Option<(u64, u64)>,
+    /// Each device that raises INTx, and its pin (1 for INTA#), all on `gsi` (D154).
+    pub intx: Vec<(u8, u8)>,
+    pub gsi: u32,
+    /// The requester IDs of its functions the machine's IOMMU translates (D154).
+    pub iommu: Vec<u16>,
+}
+
+/// A virtio-mmio transport to describe.
+#[derive(Debug, Clone, Copy)]
+pub struct MmioDevice {
+    pub base: u64,
+    pub size: u64,
+    pub gsi: u32,
+    /// Whether it is the machine's IOMMU (virtio-iommu, D154), which `PciBridge::iommu`'s
+    /// functions' DMA goes through.
+    pub iommu: bool,
+}
+
+#[derive(Debug)]
+pub struct Tables {
+    /// `(guest-physical address, bytes)` for each table, RSDP included.
+    pub blobs: Vec<(u64, Vec<u8>)>,
+}
+
+/// SLP_TYP the DSDT's `\_S5` names, and so what the guest writes to power off.
+pub const S5_SLP_TYP: u8 = 5;
+/// SLEEP_CONTROL_REG's SLP_EN bit (ACPI 6.5 Table 4.19).
+pub const SLP_EN: u8 = 1 << 5;
+
+const OEM_ID: &[u8; 6] = b"SHARDS";
+const OEM_TABLE: &[u8; 8] = b"SHARDSVM";
+const CREATOR: &[u8; 4] = b"SHRD";
+
+fn checksum(bytes: &[u8]) -> u8 {
+    0u8.wrapping_sub(bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b)))
+}
+
+/// A system description table: the 36-byte header, then `body`; checksummed.
+fn sdt(signature: &[u8; 4], revision: u8, body: &[u8]) -> Vec<u8> {
+    let len = (36 + body.len()) as u32;
+    let mut t = Vec::with_capacity(len as usize);
+    t.extend_from_slice(signature);
+    t.extend_from_slice(&len.to_le_bytes());
+    t.push(revision);
+    t.push(0); // checksum, below
+    t.extend_from_slice(OEM_ID);
+    t.extend_from_slice(OEM_TABLE);
+    t.extend_from_slice(&1u32.to_le_bytes()); // OEM revision
+    t.extend_from_slice(CREATOR);
+    t.extend_from_slice(&1u32.to_le_bytes()); // creator revision
+    t.extend_from_slice(body);
+    let sum = checksum(&t);
+    if let Some(c) = t.get_mut(9) {
+        *c = sum;
+    }
+    t
+}
+
+/// A Generic Address Structure for an 8-bit SystemIO register (ACPI 6.5 §5.2.3.2).
+fn gas_io8(port: u16) -> [u8; 12] {
+    let mut g = [0u8; 12];
+    g[0] = 1; // SystemIO
+    g[1] = 8; // register bit width
+    g[3] = 1; // access size: byte
+    g[4..12].copy_from_slice(&u64::from(port).to_le_bytes());
+    g
+}
+
+/// FADT revision 6.5 (276 bytes), hardware-reduced (ACPI 6.5 §5.2.9, Tables 5.9/5.10).
+fn fadt(dsdt: u64) -> Vec<u8> {
+    let mut b = vec![0u8; 276 - 36];
+    let mut put = |at: usize, bytes: &[u8]| {
+        if let Some(dst) = b.get_mut(at - 36..at - 36 + bytes.len()) {
+            dst.copy_from_slice(bytes);
+        }
+    };
+    // IAPC_BOOT_ARCH: VGA not present (2), CMOS RTC not present (5). The 8042 bit stays
+    // clear, so the guest binds no i8042 driver (research §3.1, §5.6).
+    put(109, &((1u16 << 2) | (1 << 5)).to_le_bytes());
+    // Flags: PWR_BUTTON (4) and SLP_BUTTON (5), i.e. no fixed buttons; HW_REDUCED_ACPI (20).
+    put(112, &((1u32 << 4) | (1 << 5) | (1 << 20)).to_le_bytes());
+    put(131, &[5]); // FADT minor version
+    put(140, &dsdt.to_le_bytes()); // X_DSDT
+    put(244, &gas_io8(layout::ACPI_SLEEP)); // SLEEP_CONTROL_REG
+    put(256, &gas_io8(layout::ACPI_SLEEP + 1)); // SLEEP_STATUS_REG
+    put(268, b"SHARDSVM"); // hypervisor vendor identity
+    sdt(b"FACP", 6, &b)
+}
+
+/// The most vCPUs a machine has: one for each 8-bit APIC id a MADT Local APIC entry holds
+/// (ACPI 6.5 §5.2.12.2, Table 5.22) but 0xFF, the broadcast destination (Intel SDM Vol. 3A
+/// §11.6.2.1), which Linux ignores in one (arch/x86/kernel/acpi/boot.c l. 270-272,
+/// `acpi_parse_lapic`) and which is past its xAPIC driver's highest id, 0xFE
+/// (arch/x86/kernel/apic/apic_flat_64.c l. 44; Linux 1590cf03): 255. The IOAPIC's id is
+/// another namespace's (the MADT gives it 0, as CPU 0's).
+pub const MAX_VCPUS: u32 = u8::MAX as u32;
+
+/// MADT (ACPI 6.5 §5.2.12): Local APIC address, no PC-AT dual-8259 flag, one
+/// processor Local APIC per vCPU (8-bit ids, [`MAX_VCPUS`]) and the IOAPIC at GSI 0.
+fn madt(vcpus: u32) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&(layout::LAPIC as u32).to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    for i in 0..vcpus {
+        let id = i as u8;
+        b.extend_from_slice(&[0, 8, id, id]); // type, length, ACPI processor UID, APIC id
+        b.extend_from_slice(&1u32.to_le_bytes()); // enabled
+    }
+    b.extend_from_slice(&[1, 12, 0, 0]); // IOAPIC: type, length, id 0, reserved
+    b.extend_from_slice(&(layout::IOAPIC as u32).to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes()); // global system interrupt base
+    sdt(b"APIC", 6, &b)
+}
+
+/// AML (ACPI 6.5 §20): just the terms the DSDT needs.
+mod aml {
+    /// PkgLength counts its own bytes (§20.2.4).
+    pub fn pkg_length(content: usize) -> Vec<u8> {
+        let total = [content + 1, content + 2, content + 3, content + 4];
+        if total[0] <= 0x3f {
+            vec![total[0] as u8]
+        } else if total[1] <= 0xfff {
+            vec![0x40 | (total[1] & 0xf) as u8, (total[1] >> 4) as u8]
+        } else if total[2] <= 0xf_ffff {
+            let n = total[2];
+            vec![0x80 | (n & 0xf) as u8, (n >> 4) as u8, (n >> 12) as u8]
+        } else {
+            let n = total[3];
+            vec![
+                0xc0 | (n & 0xf) as u8,
+                (n >> 4) as u8,
+                (n >> 12) as u8,
+                (n >> 20) as u8,
+            ]
+        }
+    }
+
+    fn with_pkg(op: &[u8], content: Vec<u8>) -> Vec<u8> {
+        let mut out = op.to_vec();
+        out.extend(pkg_length(content.len()));
+        out.extend(content);
+        out
+    }
+
+    /// A NameSeg: 4 characters, padded with '_'.
+    pub fn seg(name: &str) -> [u8; 4] {
+        let mut s = [b'_'; 4];
+        for (d, c) in s.iter_mut().zip(name.bytes()) {
+            *d = c;
+        }
+        s
+    }
+
+    pub fn integer(v: u64) -> Vec<u8> {
+        match v {
+            0 => vec![0x00],
+            1 => vec![0x01],
+            v if v <= 0xff => vec![0x0a, v as u8],
+            v if v <= 0xffff => [&[0x0b][..], &(v as u16).to_le_bytes()].concat(),
+            v if v <= 0xffff_ffff => [&[0x0c][..], &(v as u32).to_le_bytes()].concat(),
+            v => [&[0x0e][..], &v.to_le_bytes()].concat(),
+        }
+    }
+
+    pub fn string(s: &str) -> Vec<u8> {
+        let mut out = vec![0x0d];
+        out.extend(s.bytes());
+        out.push(0);
+        out
+    }
+
+    /// A compressed EISA id, e.g. "PNP0501" (as ACPICA's EisaId() macro encodes it).
+    pub fn eisa_id(id: &str) -> Vec<u8> {
+        let b = id.as_bytes();
+        let letter = |i: usize| u32::from(b.get(i).copied().unwrap_or(b'@').saturating_sub(0x40)) & 0x1f;
+        let hex = |i: usize| b.get(i).and_then(|c| char::from(*c).to_digit(16)).unwrap_or(0);
+        let v = letter(0) << 26
+            | letter(1) << 21
+            | letter(2) << 16
+            | hex(3) << 12
+            | hex(4) << 8
+            | hex(5) << 4
+            | hex(6);
+        integer(u64::from(v.swap_bytes()))
+    }
+
+    /// `Name (NAME, value)` (§20.2.5.1).
+    pub fn name(path: &[u8], value: Vec<u8>) -> Vec<u8> {
+        let mut out = vec![0x08];
+        out.extend_from_slice(path);
+        out.extend(value);
+        out
+    }
+
+    /// `Device (NAME) { ... }` (§20.2.5.2).
+    pub fn device(name: &str, body: Vec<u8>) -> Vec<u8> {
+        let mut content = seg(name).to_vec();
+        content.extend(body);
+        with_pkg(&[0x5b, 0x82], content)
+    }
+
+    /// `Scope (\NAME) { ... }`.
+    pub fn scope_root(name: &str, body: Vec<u8>) -> Vec<u8> {
+        let mut content = vec![b'\\'];
+        content.extend(seg(name));
+        content.extend(body);
+        with_pkg(&[0x10], content)
+    }
+
+    /// `Package () { ... }` of elements already encoded, as packages of packages are.
+    pub fn package_of(elements: &[Vec<u8>]) -> Vec<u8> {
+        let mut content = vec![elements.len() as u8];
+        for e in elements {
+            content.extend_from_slice(e);
+        }
+        with_pkg(&[0x12], content)
+    }
+
+    /// `Package () { ... }` of integers.
+    pub fn package(elements: &[u64]) -> Vec<u8> {
+        let mut content = vec![elements.len() as u8];
+        for &e in elements {
+            content.extend(integer(e));
+        }
+        with_pkg(&[0x12], content)
+    }
+
+    /// A ResourceTemplate buffer: the descriptors plus an End Tag (§6.4).
+    pub fn resources(descriptors: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes: Vec<u8> = descriptors.concat();
+        bytes.extend_from_slice(&[0x79, 0x00]); // End Tag, checksum 0 = "not computed"
+        let mut content = integer(bytes.len() as u64);
+        content.extend(bytes);
+        with_pkg(&[0x11], content)
+    }
+
+    /// I/O Port descriptor, 16-bit decode (§6.4.2.5).
+    pub fn io(port: u16, len: u8) -> Vec<u8> {
+        let mut d = vec![0x47, 0x01];
+        d.extend_from_slice(&port.to_le_bytes());
+        d.extend_from_slice(&port.to_le_bytes());
+        d.extend_from_slice(&[1, len]);
+        d
+    }
+
+    /// 32-bit Fixed Memory Range descriptor, read/write (§6.4.3.4).
+    pub fn memory32_fixed(base: u32, len: u32) -> Vec<u8> {
+        let mut d = vec![0x86, 9, 0, 0x01];
+        d.extend_from_slice(&base.to_le_bytes());
+        d.extend_from_slice(&len.to_le_bytes());
+        d
+    }
+
+    /// Word Address Space descriptor of bus numbers `min..=max`, produced, its range fixed
+    /// (§6.4.3.5.3).
+    pub fn bus_numbers(min: u16, max: u16) -> Vec<u8> {
+        let mut d = vec![0x88, 13, 0, 2, 0x0c, 0];
+        for v in [0, min, max, 0, max - min + 1] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d
+    }
+
+    /// DWord Address Space descriptor of memory `base..base+len`, produced, its range
+    /// fixed, read/write and non-cacheable (§6.4.3.5.2).
+    pub fn memory_window(base: u32, len: u32) -> Vec<u8> {
+        let mut d = vec![0x87, 23, 0, 0, 0x0c, 0x01];
+        for v in [0, base, base + (len - 1), 0, len] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d
+    }
+
+    /// QWord Address Space descriptor of memory `base..base+len`, as [`memory_window`]'s
+    /// (§6.4.3.5.1).
+    pub fn memory_window64(base: u64, len: u64) -> Vec<u8> {
+        let mut d = vec![0x8a, 43, 0, 0, 0x0c, 0x01];
+        for v in [0, base, base + (len - 1), 0, len] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d
+    }
+
+    /// Extended Interrupt descriptor: consumer, edge, active-high, exclusive (§6.4.3.6).
+    pub fn interrupt_edge(gsi: u32) -> Vec<u8> {
+        let mut d = vec![0x89, 6, 0, 0b0000_0011, 1];
+        d.extend_from_slice(&gsi.to_le_bytes());
+        d
+    }
+
+    /// `\SCOPE.NAME`, from the root: RootChar, DualNamePrefix, two NameSegs (§20.2.2).
+    pub fn root_path(scope: &str, name: &str) -> Vec<u8> {
+        let mut out = vec![b'\\', 0x2e];
+        out.extend(seg(scope));
+        out.extend(seg(name));
+        out
+    }
+
+    /// `Method (NAME, args, Serialized) { ... }` (§20.2.5.2): flags hold the argument
+    /// count and, in bit 3, SerializeFlag.
+    pub fn method(name: &str, args: u8, body: Vec<u8>) -> Vec<u8> {
+        let mut content = seg(name).to_vec();
+        content.push((args & 0x7) | 0x08);
+        content.extend(body);
+        with_pkg(&[0x14], content)
+    }
+
+    /// `If (predicate) { ... }` (§20.2.5.3).
+    pub fn if_then(predicate: Vec<u8>, body: Vec<u8>) -> Vec<u8> {
+        let mut content = predicate;
+        content.extend(body);
+        with_pkg(&[0xa0], content)
+    }
+
+    /// `LEqual (a, b)` (§20.2.5.4).
+    pub fn lequal(a: Vec<u8>, b: Vec<u8>) -> Vec<u8> {
+        [vec![0x93], a, b].concat()
+    }
+
+    /// `ArgN` (§20.2.6.1).
+    pub fn arg(n: u8) -> Vec<u8> {
+        vec![0x68 + (n & 0x7)]
+    }
+
+    /// `Notify (object, value)` (§20.2.5.3).
+    pub fn notify(object: Vec<u8>, value: u64) -> Vec<u8> {
+        [vec![0x86], object, integer(value)].concat()
+    }
+}
+
+/// The VM generation ID's device, as Linux's driver finds it (drivers/virt/vmgenid.c:
+/// `VMGENCTR`, and `ADDR`, the ID's address as two 32-bit halves), and the Generic Event
+/// Device whose interrupt, on [`layout::GSI_GED`], notifies it of a new ID (ACPI 6.5
+/// §5.6.9; drivers/acpi/evged.c), as Firecracker declares both.
+fn vmgenid_devices(vmgenid: u64) -> Vec<u8> {
+    let crs = |descriptors: &[Vec<u8>]| aml::name(b"_CRS", aml::resources(descriptors));
+    let mut devices = aml::device(
+        "VGEN",
+        [
+            aml::name(b"_HID", aml::string("VMGENCTR")),
+            aml::name(b"_CID", aml::string("VM_Gen_Counter")),
+            aml::name(b"_DDN", aml::string("VM_Gen_Counter")),
+            aml::name(b"ADDR", aml::package(&[vmgenid & 0xffff_ffff, vmgenid >> 32])),
+        ]
+        .concat(),
+    );
+    devices.extend(aml::device(
+        "GED",
+        [
+            aml::name(b"_HID", aml::string("ACPI0013")),
+            aml::name(b"_UID", aml::integer(0)),
+            crs(&[aml::interrupt_edge(layout::GSI_GED)]),
+            aml::method(
+                "_EVT",
+                1,
+                aml::if_then(
+                    aml::lequal(aml::arg(0), aml::integer(u64::from(layout::GSI_GED))),
+                    aml::notify(aml::root_path("_SB", "VGEN"), 0x80),
+                ),
+            ),
+        ]
+        .concat(),
+    ));
+    devices
+}
+
+/// The PCI host bridge (PCI Firmware 3.3 §4.1.2; ACPI 6.5 §6.1.5, §6.2.2): PNP0A08, a
+/// PCI Express root, compatible with PNP0A03, segment 0 and bus 0, and its 32-bit memory
+/// window, where the VMM placed its functions' BARs.
+fn pci_bridge(p: &PciBridge) -> Result<Vec<u8>, String> {
+    let (base, len) = (
+        u32::try_from(p.mem32.0).map_err(|_| "a 32-bit PCI window above 4 GiB")?,
+        u32::try_from(p.mem32.1).map_err(|_| "a 32-bit PCI window past 4 GiB")?,
+    );
+    // Each device's INTx (ACPI 6.5 §6.2.13, _PRT): its address (device in the high word,
+    // every function), its pin from 0 for INTA#, no link device (0) and so its GSI.
+    let routes: Vec<Vec<u8>> = p
+        .intx
+        .iter()
+        .map(|&(device, pin)| {
+            aml::package(&[
+                (u64::from(device) << 16) | 0xffff,
+                u64::from(pin.saturating_sub(1)),
+                0,
+                u64::from(p.gsi),
+            ])
+        })
+        .collect();
+    let prt = if routes.is_empty() {
+        Vec::new()
+    } else {
+        aml::name(b"_PRT", aml::package_of(&routes))
+    };
+    Ok(aml::device(
+        "PCI0",
+        [
+            aml::name(b"_HID", aml::eisa_id("PNP0A08")),
+            aml::name(b"_CID", aml::eisa_id("PNP0A03")),
+            aml::name(b"_UID", aml::integer(0)),
+            aml::name(b"_SEG", aml::integer(0)),
+            aml::name(b"_BBN", aml::integer(0)),
+            aml::name(
+                b"_CRS",
+                aml::resources(
+                    &[
+                        vec![aml::bus_numbers(0, 0), aml::memory_window(base, len)],
+                        p.mem64
+                            .map(|(base, len)| aml::memory_window64(base, len))
+                            .into_iter()
+                            .collect(),
+                    ]
+                    .concat(),
+                ),
+            ),
+            prt,
+        ]
+        .concat(),
+    ))
+}
+
+/// The VIOT table (Virtual I/O Translation; ACPICA's actbl3.h, Linux drivers/acpi/viot.c):
+/// the virtio-iommu at `base` on virtio-mmio, and each requester ID of segment 0 it
+/// translates, its own endpoint ID; its nodes start past the table's header and the
+/// node count, offset and eight reserved bytes after it.
+fn viot(base: u64, rids: &[u16]) -> Vec<u8> {
+    const NODES: u16 = 48;
+    let mut body = Vec::new();
+    body.extend_from_slice(&(1 + rids.len() as u16).to_le_bytes());
+    body.extend_from_slice(&NODES.to_le_bytes());
+    body.extend_from_slice(&[0; 8]);
+    // ACPI_VIOT_NODE_VIRTIO_IOMMU_MMIO: its type, a reserved byte, its length, four
+    // reserved bytes, its base address.
+    body.extend_from_slice(&[4, 0]);
+    body.extend_from_slice(&16u16.to_le_bytes());
+    body.extend_from_slice(&[0; 4]);
+    body.extend_from_slice(&base.to_le_bytes());
+    // ACPI_VIOT_NODE_PCI_RANGE, one requester ID each: its endpoint ID, segments 0 to 0,
+    // the requester IDs, the IOMMU's node by its offset, and six reserved bytes.
+    for &rid in rids {
+        body.extend_from_slice(&[1, 0]);
+        body.extend_from_slice(&24u16.to_le_bytes());
+        body.extend_from_slice(&u32::from(rid).to_le_bytes());
+        body.extend_from_slice(&[0, 0, 0, 0]);
+        body.extend_from_slice(&rid.to_le_bytes());
+        body.extend_from_slice(&rid.to_le_bytes());
+        body.extend_from_slice(&NODES.to_le_bytes());
+        body.extend_from_slice(&[0; 6]);
+    }
+    sdt(b"VIOT", 0, &body)
+}
+
+/// The MCFG table (PCI Firmware 3.3 §4.1.2): segment 0's ECAM window, bus 0 alone.
+fn mcfg(p: &PciBridge) -> Vec<u8> {
+    let mut body = vec![0u8; 8];
+    body.extend_from_slice(&p.ecam.0.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&[0, 0]);
+    body.extend_from_slice(&[0; 4]);
+    sdt(b"MCFG", 1, &body)
+}
+
+fn dsdt(virtio: &[MmioDevice], vmgenid: u64, pci: Option<&PciBridge>) -> Result<Vec<u8>, String> {
+    let crs = |descriptors: &[Vec<u8>]| aml::name(b"_CRS", aml::resources(descriptors));
+    let mut devices = Vec::new();
+    devices.extend(aml::device(
+        "COM1",
+        [
+            aml::name(b"_HID", aml::eisa_id("PNP0501")),
+            aml::name(b"_UID", aml::integer(0)),
+            crs(&[aml::io(layout::COM1, 8), aml::interrupt_edge(layout::GSI_COM1)]),
+        ]
+        .concat(),
+    ));
+    // Device order fixes the guest's /dev/vdX names.
+    for (i, d) in virtio.iter().enumerate() {
+        devices.extend(aml::device(
+            &format!("V{i:03}"),
+            [
+                aml::name(b"_HID", aml::string("LNRO0005")),
+                aml::name(b"_UID", aml::integer(i as u64)),
+                aml::name(b"_CCA", aml::integer(1)),
+                crs(&[
+                    aml::memory32_fixed(d.base as u32, d.size as u32),
+                    aml::interrupt_edge(d.gsi),
+                ]),
+            ]
+            .concat(),
+        ));
+    }
+    devices.extend(vmgenid_devices(vmgenid));
+    if let Some(p) = pci {
+        devices.extend(pci_bridge(p)?);
+    }
+    let mut body = aml::scope_root("_SB", devices);
+    body.extend(aml::name(b"\\_S5_", aml::package(&[u64::from(S5_SLP_TYP), 0])));
+    Ok(sdt(b"DSDT", 2, &body))
+}
+
+/// Every table, laid out from [`layout::SYSTEM`] with the RSDP at [`layout::RSDP`].
+pub fn build(vcpus: u32, virtio: &[MmioDevice], pci: Option<&PciBridge>) -> Result<Tables, String> {
+    if vcpus == 0 || vcpus > MAX_VCPUS {
+        return Err(format!(
+            "{vcpus} vCPUs: the MADT holds 8-bit APIC ids, at most {MAX_VCPUS}"
+        ));
+    }
+    // After the VM generation ID, which the VMM writes itself (devices/vmgenid.rs).
+    let mut at = layout::VMGENID + crate::devices::vmgenid::SIZE as u64;
+    let mut blobs = Vec::new();
+    let mut place = |bytes: Vec<u8>| {
+        let addr = at.next_multiple_of(8);
+        at = addr + bytes.len() as u64;
+        blobs.push((addr, bytes));
+        addr
+    };
+    let dsdt_at = place(dsdt(virtio, layout::VMGENID, pci)?);
+    let fadt_at = place(fadt(dsdt_at));
+    let madt_at = place(madt(vcpus));
+    let mut entries = Vec::new();
+    entries.extend_from_slice(&fadt_at.to_le_bytes());
+    entries.extend_from_slice(&madt_at.to_le_bytes());
+    if let Some(p) = pci {
+        let mcfg_at = place(mcfg(p));
+        entries.extend_from_slice(&mcfg_at.to_le_bytes());
+        if let Some(iommu) = virtio.iter().find(|d| d.iommu)
+            && !p.iommu.is_empty()
+        {
+            let viot_at = place(viot(iommu.base, &p.iommu));
+            entries.extend_from_slice(&viot_at.to_le_bytes());
+        }
+    }
+    let xsdt_at = place(sdt(b"XSDT", 1, &entries));
+    if at > layout::RSDP {
+        return Err("ACPI tables overflow the firmware area".into());
+    }
+
+    let mut rsdp = Vec::with_capacity(36);
+    rsdp.extend_from_slice(b"RSD PTR ");
+    rsdp.push(0); // checksum over the first 20 bytes
+    rsdp.extend_from_slice(OEM_ID);
+    rsdp.push(2); // revision: ACPI 2.0+
+    rsdp.extend_from_slice(&0u32.to_le_bytes()); // RSDT: none, the XSDT only
+    rsdp.extend_from_slice(&36u32.to_le_bytes());
+    rsdp.extend_from_slice(&xsdt_at.to_le_bytes());
+    rsdp.push(0); // extended checksum over all 36 bytes
+    rsdp.extend_from_slice(&[0; 3]);
+    let first = rsdp.get(..20).map_or(0, checksum);
+    if let Some(c) = rsdp.get_mut(8) {
+        *c = first;
+    }
+    let all = checksum(&rsdp);
+    if let Some(c) = rsdp.get_mut(32) {
+        *c = all;
+    }
+    blobs.push((layout::RSDP, rsdp));
+    Ok(Tables { blobs })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    fn sum(b: &[u8]) -> u8 {
+        b.iter().fold(0u8, |a, &x| a.wrapping_add(x))
+    }
+
+    #[test]
+    fn every_table_checksums_and_links() {
+        let virtio = [MmioDevice {
+            base: 0xc000_1000,
+            size: 0x200,
+            gsi: 5,
+            iommu: false,
+        }];
+        let t = build(4, &virtio, None).unwrap();
+        let find = |sig: &[u8]| t.blobs.iter().find(|(_, b)| &b[..sig.len()] == sig).unwrap();
+        let (rsdp_at, rsdp) = find(b"RSD PTR ");
+        assert_eq!(*rsdp_at, layout::RSDP);
+        assert_eq!(sum(&rsdp[..20]), 0);
+        assert_eq!(sum(rsdp), 0);
+        for sig in [&b"XSDT"[..], b"FACP", b"APIC", b"DSDT"] {
+            let (_, t) = find(sig);
+            assert_eq!(sum(t), 0, "{}", String::from_utf8_lossy(sig));
+            assert_eq!(u32::from_le_bytes(t[4..8].try_into().unwrap()) as usize, t.len());
+        }
+        let xsdt_at = u64::from_le_bytes(rsdp[24..32].try_into().unwrap());
+        assert_eq!(find(b"XSDT").0, xsdt_at);
+        let (_, fadt) = find(b"FACP");
+        assert_eq!(fadt.len(), 276);
+        assert_eq!(
+            u64::from_le_bytes(fadt[140..148].try_into().unwrap()),
+            find(b"DSDT").0
+        );
+        assert_eq!(fadt[112..116], (0x0010_0030u32).to_le_bytes());
+        let (_, madt) = find(b"APIC");
+        assert_eq!(madt.len(), 36 + 8 + 4 * 8 + 12);
+    }
+
+    /// A PCI host bridge (D153): an MCFG table, linked and checksummed, of segment 0's
+    /// ECAM window for bus 0, and a PNP0A08 host bridge in the DSDT whose _CRS is bus 0,
+    /// the 32-bit memory window and the 64-bit one, and whose _PRT routes its devices'
+    /// INTx (D154); none of it without one.
+    #[test]
+    fn a_pci_bridge_is_described_where_there_is_one() {
+        let without = build(1, &[], None).unwrap();
+        assert!(!without.blobs.iter().any(|(_, b)| b.starts_with(b"MCFG")));
+        let bridge = PciBridge {
+            ecam: (layout::PCI_ECAM, 1 << 20),
+            mem32: (layout::PCI_MEM32, layout::PCI_MEM32_SIZE),
+            mem64: Some((0x2_0000_0000, 0x10_0000)),
+            intx: vec![(1, 1), (2, 2)],
+            gsi: layout::GSI_PCI,
+            iommu: vec![0x8],
+        };
+        let t = build(1, &[], Some(&bridge)).unwrap();
+        assert!(
+            !t.blobs.iter().any(|(_, b)| b.starts_with(b"VIOT")),
+            "no IOMMU, no VIOT"
+        );
+        // With the machine's IOMMU among its virtio devices, a VIOT, linked and
+        // checksummed: the IOMMU on virtio-mmio at its base, and device 1's requester ID
+        // translated by it, its own endpoint ID (D154).
+        let iommu = [MmioDevice {
+            base: 0xc000_1000,
+            size: 0x200,
+            gsi: 5,
+            iommu: true,
+        }];
+        let with = build(1, &iommu, Some(&bridge)).unwrap();
+        let (viot_at, viot) = with.blobs.iter().find(|(_, b)| b.starts_with(b"VIOT")).unwrap();
+        assert_eq!(sum(viot), 0);
+        assert_eq!(viot.len(), 48 + 16 + 24);
+        assert_eq!(&viot[36..40], &[2, 0, 48, 0], "two nodes from offset 48");
+        assert_eq!(&viot[48..52], &[4, 0, 16, 0]);
+        assert_eq!(&viot[56..64], &0xc000_1000u64.to_le_bytes());
+        assert_eq!(&viot[64..68], &[1, 0, 24, 0]);
+        assert_eq!(&viot[68..72], &8u32.to_le_bytes(), "endpoint 8");
+        assert_eq!(
+            &viot[76..82],
+            &[8, 0, 8, 0, 48, 0],
+            "requester IDs 8 to 8, to the IOMMU"
+        );
+        let (_, xsdt) = with.blobs.iter().find(|(_, b)| b.starts_with(b"XSDT")).unwrap();
+        assert!(xsdt[36..].chunks(8).any(|e| e == viot_at.to_le_bytes()));
+        let find = |sig: &[u8]| t.blobs.iter().find(|(_, b)| b.starts_with(sig)).unwrap();
+        let (mcfg_at, mcfg) = find(b"MCFG");
+        assert_eq!(sum(mcfg), 0);
+        assert_eq!(mcfg.len(), 36 + 8 + 16);
+        assert_eq!(&mcfg[44..52], &layout::PCI_ECAM.to_le_bytes());
+        assert_eq!(&mcfg[52..56], &[0, 0, 0, 0]);
+        let (_, xsdt) = find(b"XSDT");
+        assert!(xsdt[36..].chunks(8).any(|e| e == mcfg_at.to_le_bytes()));
+        let (_, dsdt) = find(b"DSDT");
+        assert_eq!(sum(dsdt), 0);
+        let has = |needle: &[u8]| dsdt.windows(needle.len()).any(|w| w == needle);
+        assert!(has(&aml::eisa_id("PNP0A08")) && has(&aml::eisa_id("PNP0A03")));
+        assert!(has(&aml::bus_numbers(0, 0)));
+        assert!(has(&aml::memory_window(
+            layout::PCI_MEM32 as u32,
+            layout::PCI_MEM32_SIZE as u32
+        )));
+        assert!(has(&aml::memory_window64(0x2_0000_0000, 0x10_0000)));
+        // _PRT: Package (2) { Package (4) { 0x1FFFF, 0, 0, 22 }, Package (4) { 0x2FFFF,
+        // 1, 0, 22 } }, as iasl encodes it.
+        let entry = |device: u8, pin: u8| {
+            [
+                &[0x12, 0x0b, 0x04, 0x0c][..],
+                &((u32::from(device) << 16) | 0xffff).to_le_bytes(),
+                &[pin, 0x00, 0x0a, layout::GSI_PCI as u8],
+            ]
+            .concat()
+        };
+        let prt = [
+            &b"\x08_PRT"[..],
+            &[0x12, 0x1a, 0x02],
+            &entry(1, 0x00),
+            &entry(2, 0x01),
+        ]
+        .concat();
+        assert!(has(&prt), "no _PRT as iasl encodes it");
+    }
+
+    #[test]
+    fn aml_encodings_match_the_spec() {
+        // WordBusNumber (ResourceProducer, MinFixed, MaxFixed, PosDecode, 0, 0, 0, 0, 1)
+        // and DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed, NonCacheable,
+        // ReadWrite, 0, 0x1000, 0x1fff, 0, 0x1000), as iasl compiles them.
+        assert_eq!(
+            aml::bus_numbers(0, 0),
+            vec![0x88, 0x0d, 0x00, 0x02, 0x0c, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]
+        );
+        assert_eq!(
+            aml::memory_window(0x1000, 0x1000),
+            [
+                &[0x87, 0x17, 0x00, 0x00, 0x0c, 0x01][..],
+                &0u32.to_le_bytes(),
+                &0x1000u32.to_le_bytes(),
+                &0x1fffu32.to_le_bytes(),
+                &0u32.to_le_bytes(),
+                &0x1000u32.to_le_bytes(),
+            ]
+            .concat()
+        );
+        // QWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed, NonCacheable,
+        // ReadWrite, 0, 0x2_0000_0000, 0x2_000F_FFFF, 0, 0x10_0000): the same flags, the
+        // QWord descriptor's tag and 43 bytes after its header (§6.4.3.5.1).
+        assert_eq!(
+            aml::memory_window64(0x2_0000_0000, 0x10_0000),
+            [
+                &[0x8a, 0x2b, 0x00, 0x00, 0x0c, 0x01][..],
+                &0u64.to_le_bytes(),
+                &0x2_0000_0000u64.to_le_bytes(),
+                &0x2_000f_ffffu64.to_le_bytes(),
+                &0u64.to_le_bytes(),
+                &0x10_0000u64.to_le_bytes(),
+            ]
+            .concat()
+        );
+        assert_eq!(aml::memory_window64(0, 0x1000).len(), 3 + 43);
+        assert_eq!(aml::pkg_length(10), vec![11]);
+        assert_eq!(aml::pkg_length(62), vec![63]);
+        assert_eq!(aml::pkg_length(63), vec![0x41, 0x04]); // 65 = 0x41
+        assert_eq!(aml::pkg_length(0xffd), vec![0x4f, 0xff]);
+        assert_eq!(aml::pkg_length(0xffe), vec![0x81, 0x00, 0x01]);
+        // EisaId("PNP0501") packs to 0x41D00501 and is stored byte-swapped: 41 D0 05 01.
+        assert_eq!(aml::eisa_id("PNP0501"), vec![0x0c, 0x41, 0xd0, 0x05, 0x01]);
+        assert_eq!(aml::integer(0x1234), vec![0x0b, 0x34, 0x12]);
+        assert_eq!(aml::package(&[5, 0]), vec![0x12, 0x05, 0x02, 0x0a, 0x05, 0x00]);
+        // \_SB_.VGEN, and Notify (\_SB_.VGEN, 0x80): as iasl compiles them.
+        let path = aml::root_path("_SB", "VGEN");
+        assert_eq!(path, b"\\.\x5fSB_VGEN".to_vec());
+        assert_eq!(
+            aml::notify(path, 0x80),
+            [&[0x86][..], b"\\.\x5fSB_VGEN", &[0x0a, 0x80]].concat()
+        );
+        // Method (_EVT, 1, Serialized) { If (LEqual (Arg0, 23)) { } }
+        assert_eq!(
+            aml::method(
+                "_EVT",
+                1,
+                aml::if_then(aml::lequal(aml::arg(0), aml::integer(23)), vec![])
+            ),
+            vec![
+                0x14, 0x0c, b'_', b'E', b'V', b'T', 0x09, 0xa0, 0x05, 0x93, 0x68, 0x0a, 23
+            ]
+        );
+    }
+
+    #[test]
+    fn the_dsdt_names_the_vm_generation_id() {
+        let t = build(1, &[], None).unwrap();
+        let (_, dsdt) = t.blobs.iter().find(|(_, b)| b.starts_with(b"DSDT")).unwrap();
+        let has = |needle: &[u8]| dsdt.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"VMGENCTR\0") && has(b"ACPI0013\0"));
+        let addr = [
+            aml::integer(layout::VMGENID & 0xffff_ffff),
+            aml::integer(layout::VMGENID >> 32),
+        ]
+        .concat();
+        assert!(has(&addr), "ADDR holds {:#x}", layout::VMGENID);
+        assert_eq!(layout::VMGENID % 8, 0);
+        assert!(
+            t.blobs.iter().all(|&(at, _)| at >= layout::VMGENID + 16),
+            "no table overlaps the ID"
+        );
+    }
+
+    #[test]
+    fn refuses_what_the_madt_cannot_hold() {
+        assert!(build(0, &[], None).is_err());
+        assert!(build(MAX_VCPUS + 1, &[], None).is_err());
+        assert!(build(MAX_VCPUS, &[], None).is_ok());
+        // The last vCPU's APIC id is 0xFE, the highest Linux's xAPIC driver takes.
+        assert_eq!(MAX_VCPUS - 1, 0xfe);
+    }
+}

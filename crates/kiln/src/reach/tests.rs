@@ -486,6 +486,44 @@ fn a_dropped_connection_mid_run_loses_nothing() -> anyhow::Result<()> {
     })
 }
 
+/// W27-R08 (2026-11-13: "refused: e30189… sent no receipt of it"): a run's receipt is said again
+/// ahead of its exit, so one lost to a link that's down or drops as the run is taken can't refuse
+/// a run that did its work. The asker takes it twice (as the run is taken, and with its exit), its
+/// output's hand-on once, and the run ends unrefused across a dropped link.
+#[cfg(unix)]
+#[test]
+fn w27_r08_a_runs_receipt_is_said_again_with_its_exit_so_a_lost_one_refuses_nothing() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let ctl = lab.ctl.clone();
+        let req = RunReq { target: "linux".into(), command: "echo one; sleep 0.3; echo two".into(), ..RunReq::default() };
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = Arc::clone(&dropped);
+        let evs = run_from_mac(&lab, req, move |e| {
+            if let Ev::Output { data, .. } = e
+                && String::from_utf8_lossy(data).contains("one")
+                && !d.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let ctl = ctl.clone();
+                crate::rt::spawn(async move {
+                    crate::rt::sleep(Duration::from_millis(200)).await;
+                    let _ = ctl.send(Ctl::Back("mac")).await;
+                });
+                return Some(Ctl::Drop("mac"));
+            }
+            None
+        })
+        .await?;
+        assert!(dropped.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(output(&evs, false), "one\ntwo\n");
+        assert_eq!(exit(&evs), Some((Some(0), None, 0)), "the run ends unrefused: {evs:?}");
+        let m = lab.mac.status().await?;
+        let frames = m.pointer("/peers/0/custody").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        assert!(frames >= 3, "its receipt as it's taken, again with its exit, and its output's hand-on: {frames} ({m})");
+        Ok(())
+    })
+}
+
 #[cfg(unix)]
 #[test]
 fn a_tree_syncs_over_and_the_command_runs_in_the_copy() -> anyhow::Result<()> {

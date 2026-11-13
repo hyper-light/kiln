@@ -1,0 +1,44 @@
+Subject: aws-lc-rs and aws-lc-sys from crates.io
+Why: kiln's copy leaves out vendor/aws-lc-rs and vendor/aws-lc-sys, Shards' byte-for-byte copies of crates.io's aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0 (its vendor/README.md), so they build from crates.io, Cargo.lock holding the same SHA-256s: kiln vendors aws-lc-rs itself (vendor/aws-lc-rs, 1.18.2 with Mantle's change), and kiln's tree holds one copy of each project. QuickJS's C (vendor/rquickjs-sys, crates.io's rquickjs-sys 0.14.0) stays, the copy kiln's own rquickjs builds too, as T4 took it on 2026-10-21 with all three.
+Kiln-only: kiln's layout: Shards' tree holds the copies kiln's leaves out
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 50b950c4fc7be1cdb1c1edee324b59b2af3449e9..25e5c8583d6151dd97cc0cc849606c6cb4fec47f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -86,6 +86,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+ [[package]]
+ name = "aws-lc-rs"
+ version = "1.18.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
+ dependencies = [
+  "aws-lc-sys",
+  "untrusted 0.7.1",
+@@ -95,6 +97,8 @@ dependencies = [
+ [[package]]
+ name = "aws-lc-sys"
+ version = "0.45.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
+ dependencies = [
+  "cc",
+  "cmake",
+diff --git a/Cargo.toml b/Cargo.toml
+index 7dae13acc848860d15ee2ef48ecde05ec8ee826e..e86d49a9c05b50526ae48de7460c7708af6c68ab 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -92,10 +92,10 @@ string_slice = "deny"
+ print_stdout = "deny"
+ print_stderr = "deny"
+ 
+-# The TLS provider builds from our vendored copies (vendor/README.md).
++# The TLS provider builds from our vendored copies (vendor/README.md). In kiln's copy, aws-lc-rs and
++# aws-lc-sys are crates.io's, the packages those copies are byte for byte (Cargo.lock holds their SHA-256s,
++# vendor/README.md's); QuickJS's C is this folder's copy, which kiln links too.
+ [patch.crates-io]
+-aws-lc-rs = { path = "vendor/aws-lc-rs" }
+-aws-lc-sys = { path = "vendor/aws-lc-sys" }
+ rquickjs-sys = { path = "vendor/rquickjs-sys" }
+ 
+ [profile.release]

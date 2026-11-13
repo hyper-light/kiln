@@ -6172,7 +6172,14 @@ fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &cr
     use crate::harness::core::Update;
     let key = crate::wire::uplink::session_key(session);
     let frames = match u {
-        Update::State { .. } | Update::Open { .. } if !sent.state_pages => legacy_harness_frames(session, u),
+        // To a server without bounded views (CP-T3.2): as before, and an Open still starts its
+        // changeset over, as the arm below does for one that takes views.
+        Update::State { .. } | Update::Open { .. } if !sent.state_pages => {
+            if matches!(u, Update::Open { .. }) {
+                sent.forget(session);
+            }
+            legacy_harness_frames(session, u)
+        }
         Update::Changes { files } => sent.frames(session, files, picture),
         // Its server's copy starts its changeset over (an Open), or lets the session go.
         Update::Open { .. } | Update::Closed => {
@@ -7666,7 +7673,14 @@ mod tests {
         use crate::harness::model::{State, Status};
         // Dropped, its page would go on showing a turn under way that no longer is.
         let state = State { status: Status::Idle, summary: format!("begin {}", "x".repeat(900_000)), ..State::default() };
-        let frames = harness_frames("s", &Update::State { state: Box::new(state) });
+        // To a server that takes bounded views (CP-T3.2), the state goes as one, its status whole.
+        let views = harness_frames("s", &Update::State { state: Box::new(state.clone()) });
+        assert_eq!(views.len(), 1);
+        assert!(views.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let view: serde_json::Value = serde_json::from_str(views.first().map_or("", String::as_str)).unwrap_or_default();
+        assert_eq!(view.pointer("/state/status").and_then(serde_json::Value::as_str), Some("idle"), "{view:.200}");
+        // To one that doesn't, it's cut to fit, as before.
+        let frames = legacy_harness_frames("s", &Update::State { state: Box::new(state) });
         assert_eq!(frames.len(), 1);
         assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
         let state = match serde_json::from_str::<Update>(frames.first().map_or("", String::as_str)) {
@@ -7689,7 +7703,14 @@ mod tests {
         let mut tasks: Vec<Task> = (0..3000).map(ended).collect();
         tasks.insert(1, Task { id: "server".into(), status: "running".into(), class: Some("shell".into()), ..Task::default() });
         let state = State { status: Status::Running, tasks, ..State::default() };
-        let frames = harness_frames("s", &Update::State { state: Box::new(state) });
+        // To a server that takes bounded views (CP-T3.2), the state goes as one, its status whole.
+        let views = harness_frames("s", &Update::State { state: Box::new(state.clone()) });
+        assert_eq!(views.len(), 1);
+        assert!(views.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let view: serde_json::Value = serde_json::from_str(views.first().map_or("", String::as_str)).unwrap_or_default();
+        assert_eq!(view.pointer("/state/status").and_then(serde_json::Value::as_str), Some("running"), "{view:.200}");
+        // To one that doesn't, the oldest finished tasks are shed, as before.
+        let frames = legacy_harness_frames("s", &Update::State { state: Box::new(state) });
         assert_eq!(frames.len(), 1);
         assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
         let state = match serde_json::from_str::<Update>(frames.first().map_or("", String::as_str)) {
