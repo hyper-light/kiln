@@ -174,7 +174,7 @@ await test("a command waits for its ack or nack, and goes again once on the next
   }
 });
 
-await test("unsupported durable storage opens no cross-tab channel and still sends the message, without this browser's copy", async () => {
+await test("unsupported durable storage opens no cross-tab channel and still sends the message, its copy in this page's memory", async () => {
   assert.equal(typeof indexedDB, "undefined", "this command-only browser fixture has no durable mail store");
   assert.equal(channelsOpened, 0, "importing Held must not open a channel when its storage is unsupported");
   setMailScope("unsupported-storage-test");
@@ -200,8 +200,9 @@ await test("unsupported durable storage opens no cross-tab channel and still sen
     assert.equal(await store.sendMail(command, files), true, "storage this browser lacks never stops a send");
     await tick();
     assert.equal(ws.said().filter((f) => (f as { t?: string; c?: { id?: string } }).t === "cmd" && (f as { c?: { id?: string } }).c?.id === command.id).length, 1, "the message goes on the wire once");
-    assert.equal(useHeld.getState().held[store.id], undefined, "no browser copy was kept");
-    assert.match(store.get().error ?? "", /without this browser's copy/);
+    assert.equal(useHeld.getState().held[store.id]?.[0]?.id, command.id, "this page's memory keeps the copy until the server takes it");
+    await new Promise((r) => setTimeout(r, 0));
+    assert.match(useHeld.getState().error ?? "", /couldn't keep a copy/);
     assert.deepEqual(command, original, "the caller keeps the exact original command");
     assert.equal(await files[0]!.blob.text(), "original", "the caller keeps the complete original file");
     assert.equal(channelsOpened, 0);
