@@ -1144,7 +1144,7 @@ pub async fn holder_at(store: &Store, session: &str, epoch: u64) -> anyhow::Resu
 /// `machine` than the one certified for it (docs/ci.md W27-R08, the 14:18 drop).
 async fn stale_words(hub: &Hub, machine: &str, was: crate::instances::PeerId, session: &str) {
     use crate::harness::model::Command;
-    let words = [Command::MoveTo { to: machine.to_owned(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true }, crate::handovers::Word::Taken.command()];
+    let words = [Command::MoveTo { to: machine.to_owned(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native: false }, crate::handovers::Word::Taken.command()];
     for c in words {
         if let Some(json) = hub.worded(machine, was, session, &c).await {
             tracing::info!(target: "kiln.custody", %session, %machine, was, "chaos: a stale hand-over's word to the process kiln counted before");
