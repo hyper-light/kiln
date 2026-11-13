@@ -342,7 +342,7 @@ mod tests {
 
         use kiln_ci::place::holder::BoxName;
         use kiln_seams::Records as _;
-        use kiln_seams::sandbox::{Boundary, Egress, Launch, Limits, Refusal, Run as _};
+        use kiln_seams::sandbox::{Boundary, Egress, Launch, Limits, Refusal};
         use super::hexvm::tests::Metered;
         crate::rt::block_on(async {
             let state = tempfile::tempdir()?;
