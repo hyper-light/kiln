@@ -2321,7 +2321,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut relaunch_wanted = successor && supervised && !channel && started_as == Start::ReExecuted;
     let mut relaunch_asked: Option<Instant> = None;
     // AI coding sessions running on this machine (job pods have none), reported as they change.
-    let ai = (!o.ephemeral).then(|| crate::aisessions::Reporter::new(crate::os::home_dir()).with_homes(crate::harness::isolated::home::root(&o.state_dir)));
+    let ai = (!o.ephemeral).then(|| crate::aisessions::Reporter::new(crate::os::home_dir()));
     // Kiln-native agent sessions on this machine (not in job pods, and not in the server's own
     // in-process agent: the server hosts those itself). They outlive the server connection and
     // this process's restarts: each continues its harness session.
@@ -2481,6 +2481,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         h
     });
+    // Its history reads its people's microVM volumes where its harness host's isolated launches keep
+    // them (`Host::homes`; kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
+    if let (Some(ai), Some(homes)) = (&ai, harness.as_ref().and_then(|h| h.homes())) {
+        ai.read_homes(homes.to_path_buf());
+    }
     // Bind the local Reach endpoint to the actual Host before restoring adapters that
     // can immediately ask it to run work (attention plan 01a199e1b177752e84dad5dc990e6a15).
     if let Some(handle)=&reach{

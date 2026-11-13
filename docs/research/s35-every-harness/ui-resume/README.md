@@ -39,7 +39,10 @@ decided before the code (R02), from kiln main 8d36e0d35.
    `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_DATA_HOME` (Devin's `devin/cli` below it), read with the same
    readers as the machine's own folders. A person's own Agentfile is built beside kiln's harness directory
    (`sandbox::image`), so one made from kiln's keeps that layout. One that keeps its harness's configuration
-   at other paths isn't read: only its launch knows its image's volumes (owed, below).
+   at other paths isn't read: only its launch knows its image's volumes (owed, below). The root is the
+   harness host's own (`harness::host::Host::homes`, step 17's narrowing, kiln main ccd990941), so a history
+   reads where that host's isolated launches do: the runner's `<own folder>/homes`, the server's
+   `<its harness folder>/homes`.
    - What lives in a volume is a microVM's, so the machine's own signs of a live session don't apply
      there: Claude Code's session records name guest pids, and no process here is its harness. A volume's
      conversation is left out only where kiln's own sessions hold it (`running`), as on the machine.
@@ -86,6 +89,10 @@ decided before the code (R02), from kiln main 8d36e0d35.
 
 ## Owed
 
+- To step 17 (a finding): `Host::homes` is the folder of the host's sessions file, `own_dir`, which for a
+  runner started as an instance (a blue/green upgrade) is `<state>/instances/<id>`: a person's volumes
+  there would change with each upgrade, where docs/agents.md has them at `<kiln's state>/homes/<you>/<harness>/`.
+  A history reads where the host says, so it follows any fix there.
 - To step 17's launch, as it prepares a person's volume: keep the layout it prepared and the image it ran,
   beside the volume, so the history reads a person's own Agentfile's layout and names the image a
   conversation ran in.

@@ -2791,10 +2791,18 @@ impl Registry {
             Location::Local => {
                 let running: std::collections::HashSet<String> = self.local.list().into_iter().filter_map(|i| i.harness_session).collect();
                 let scanner = Arc::clone(&self.scanner);
-                let homes = super::isolated::home::root(&hub.cfg.server.data_dir);
+                // Its people's microVM volumes, where its own host's isolated launches keep them.
+                let homes = self.local.homes().map(std::path::Path::to_path_buf);
                 let past = crate::rt::blocking(move || {
                     let mut g = scanner.lock();
-                    g.get_or_insert_with(|| crate::aisessions::Scanner::new(crate::os::home_dir()).with_homes(homes)).history(kind.as_deref(), limit, &running, person.as_deref())
+                    let made = || {
+                        let s = crate::aisessions::Scanner::new(crate::os::home_dir());
+                        match homes {
+                            Some(root) => s.with_homes(root),
+                            None => s,
+                        }
+                    };
+                    g.get_or_insert_with(made).history(kind.as_deref(), limit, &running, person.as_deref())
                 })
                 .await?;
                 Ok(Some(serde_json::to_value(past)?))

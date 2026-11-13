@@ -31,8 +31,8 @@ pub const SCRATCH: &str = ".scratch";
 /// an Agentfile, in a microVM of its own": `<kiln's state>/homes/<you>/<harness>/`).
 pub const HOMES: &str = "homes";
 
-/// Where a kiln whose state is `state` (a runner's state directory, the server's data directory)
-/// keeps its people's volumes: the root [`Layout::new`] takes.
+/// Where a kiln whose harness host keeps its records in `state` keeps its people's volumes
+/// (`harness::host::Host::homes`): the root [`Layout::new`] takes.
 pub fn root(state: &Path) -> PathBuf {
     state.join(HOMES)
 }

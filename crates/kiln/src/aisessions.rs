@@ -443,11 +443,10 @@ impl Reporter {
         });
     }
 
-    /// Reads this machine's people's microVM volumes under `root` too ([`Scanner::with_homes`]).
-    #[must_use]
-    pub fn with_homes(self, root: PathBuf) -> Self {
+    /// Reads this machine's people's microVM volumes under `root` too, from now on
+    /// ([`Scanner::with_homes`]): where its harness host keeps them (`harness::host::Host::homes`).
+    pub fn read_homes(&self, root: PathBuf) {
         self.scanner.lock().homes = Some(root);
-        self
     }
 
     /// Answer the server's request for this machine's past sessions (`running`: the harness ids
@@ -534,7 +533,7 @@ pub struct Scanner {
     /// The ids of the sessions the latest scan found running (None before the first): what a
     /// history leaves out, read from the scans the tools' own changes make, not a scan of its own.
     running: Option<HashSet<String>>,
-    /// Where this machine keeps its people's microVM volumes (`harness::isolated::home::root`), whose
+    /// Where this machine keeps its people's microVM volumes (`harness::host::Host::homes`), whose
     /// conversations a history asked for a person lists too; none where it keeps none.
     homes: Option<PathBuf>,
 }
@@ -562,7 +561,7 @@ impl Scanner {
     }
 
     /// Reads the conversations in this machine's people's microVM volumes under `root`
-    /// (`harness::isolated::home::root` of its kiln's state) too, each for its own person.
+    /// (`harness::host::Host::homes`) too, each for its own person.
     #[must_use]
     pub fn with_homes(mut self, root: PathBuf) -> Self {
         self.homes = Some(root);
