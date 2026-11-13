@@ -1318,8 +1318,8 @@ impl Host {
     /// 01a1cd8e862e7169a074db3d5fa33f3d step 32): one an agent session here held in a microVM of its own
     /// asks for, as its client's process tells it or as the run names its agent (`KILN_REACH_AGENT`,
     /// either enough), runs in a microVM or not at all, never on a bare host, and no runner runs kiln's
-    /// commands in a microVM yet.
-    #[cfg(any(unix, test))]
+    /// commands in a microVM yet. Unix alone, as its one caller is (`crate::reach::owned::run`).
+    #[cfg(unix)]
     pub(crate) fn refuses_run(&self, req: &crate::reach::local::RunReq) -> Option<crate::reach::local::Refused> {
         let isolated = |s: &str| self.get(s).is_some_and(|s| s.spec.lock().isolation.is_some());
         req.asker.clone().into_iter().chain(crate::reach::keeper::agent_of(&req.env)).find(|s| isolated(s)).map(|session| crate::reach::local::Refused::Isolated { session })
