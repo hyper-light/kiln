@@ -17,6 +17,6 @@ controller: AgentNegotiated,
 endpoint: AgentNegotiated, 
 /**
  * The lanes its controller was granted on it as it dialed, by Shards' names (`control`,
- * `stdin:0`, `stdout:0`, `stderr:0`, `exec`, `mcp:0`). Always said.
+ * `stdout:0`, `stderr:0`, `stdin:0`, `exec`, `socket`, `mcp:0`). Always said.
  */
 lanes: Array<string>, };
