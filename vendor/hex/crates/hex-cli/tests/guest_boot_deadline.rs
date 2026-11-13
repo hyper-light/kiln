@@ -21,15 +21,22 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use hex_api::Class;
+use hex_core::patience::Patience;
 use hex_core::wire::{self, Answer, Received, Request};
+use hex_testkit::waits::follow::{self, Party};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType};
 
 /// The variable init hands the relay the boot's deadline in.
 const READY_BY: &str = "HEX_BOOT_READY_BY";
-/// The most a fixture step waits before the test fails rather than hangs, and the boot's deadline the second relay is
-/// given: a bound nothing here comes near.
-const FIXTURE: Duration = Duration::from_secs(30);
+/// The boot's deadline the second relay is handed, as init hands it: the 60 s the 00aad boot had, an input of the
+/// scenario's, not a wait of the test's.
+const BOOT: Duration = Duration::from_secs(60);
+
+// The facts the test waits for, each followed by the relay's life (decision 9; hex_testkit::waits::follow): measuring,
+// no record making them.
+static CONNECTED: Patience = Patience::measuring("test.hex_cli.guest_boot.connected");
+static HELLO: Patience = Patience::measuring("test.hex_cli.guest_boot.hello");
 
 /// A stand-in node agent's listening socket, in a directory of its own.
 fn agent_socket() -> (tempfile::TempDir, PathBuf, OwnedFd) {
@@ -58,11 +65,24 @@ fn readable(fd: &OwnedFd, within: Duration) -> bool {
     rustix::event::poll(&mut ready, Some(&Timespec::try_from(within).unwrap())).unwrap() == 1
 }
 
-/// The relay's connection and its hello's id, taken from `listener`, and when the hello was read.
-fn hello(listener: &OwnedFd) -> (OwnedFd, u64, Instant) {
-    assert!(readable(listener, FIXTURE), "the relay never connected");
+/// The relay's connection and its hello's id, taken from `listener`, and when the hello was read: each waited for while
+/// `relay` lives.
+fn hello(listener: &OwnedFd, relay: &mut Reaped) -> (OwnedFd, u64, Instant) {
+    follow::until(
+        &CONNECTED,
+        "the relay's connection",
+        || relay.party(),
+        || readable(listener, Duration::ZERO),
+    )
+    .unwrap();
     let conn = rustix::net::accept_with(listener, SocketFlags::CLOEXEC).unwrap();
-    assert!(readable(&conn, FIXTURE), "the relay never said hello");
+    follow::until(
+        &HELLO,
+        "the relay's hello",
+        || relay.party(),
+        || readable(&conn, Duration::ZERO),
+    )
+    .unwrap();
     let read = Instant::now();
     let mut buf = vec![0u8; wire::MAX_MESSAGE];
     let (n, _) = rustix::net::recv(&conn, &mut buf, RecvFlags::empty()).unwrap();
@@ -99,6 +119,16 @@ fn answer_hello(conn: &OwnedFd, id: u64) {
 
 /// A relay ended and reaped when dropped, so a failing assertion leaves none running.
 struct Reaped(Child);
+
+impl Reaped {
+    /// The relay as a wait's party: live until it has ended.
+    fn party(&mut self) -> Party {
+        match self.0.try_wait() {
+            Ok(None) => Party::Live,
+            Ok(Some(_)) | Err(_) => Party::Ended,
+        }
+    }
+}
 
 impl Drop for Reaped {
     fn drop(&mut self) {
@@ -152,36 +182,48 @@ fn boottime() -> u128 {
     u128::try_from(t.tv_sec).unwrap() * 1_000_000_000 + u128::try_from(t.tv_nsec).unwrap()
 }
 
-/// AC-T7.4.1 (original): do start `hex guest relay` to a stand-in node that never answers its hello, with no boot
-/// deadline, measuring `m` from reading the hello to the relay's end; then start it again with the boot's deadline as
-/// init hands it, to a node that answers `2m` after reading its hello: past the hello's learned wait, well inside the
-/// boot's deadline. Expect: the first refused at its learned bound, "twice the slowest", unchanged where no caller
-/// gives a deadline; the second ready.
+/// AC-T7.4.1 (original), under decision 9 (the person's ruling of 2026-11-13: a wait with no bound follows its party,
+/// refused only at its end): do start `hex guest relay` with no boot deadline to a stand-in node that takes its hello
+/// and doesn't answer, and once the relay waits on, alive and silent, let the node go (its socket closed); then start
+/// it again with the boot's deadline as init hands it, to a node that answers only once the relay waits on. Expect:
+/// the first waiting while its node lives, its hello bound by no learned wait (a fresh relay has seen no answer: no
+/// record seeds one) and no caller's deadline, then refused at its node's end, asking the node its bounds, never at
+/// "the slowest answer to a call of its kind"; the second ready.
 #[test]
 fn original_the_relays_hello_waits_out_a_busy_node_within_the_boots_deadline() {
     let (dir, node, listener) = agent_socket();
-    let first = relay(&node, &dir.path().join("first"), None);
-    let (conn, _, read) = hello(&listener);
-    assert!(readable(&conn, FIXTURE), "the relay never ended");
-    let m = read.elapsed();
-    let (line, err) = said(first);
+    let mut first = relay(&node, &dir.path().join("first"), None);
+    let (conn, _, read) = hello(&listener, &mut first);
+    assert_eq!(
+        first.party(),
+        Party::Live,
+        "the relay ended while its node lived"
+    );
+    let held = read.elapsed();
+    // The node goes: the relay's hello, waiting on, is refused at its end.
     drop(conn);
-    eprintln!("guest_boot_deadline ready_by=none m={m:?} said={line:?} stderr={err:?}");
+    let (line, err) = said(first);
+    eprintln!("guest_boot_deadline ready_by=none held={held:?} said={line:?} stderr={err:?}");
     assert_eq!(line, "", "{err}");
     assert!(
-        err.contains("asking the node its bounds") && err.contains("twice the slowest answer"),
+        err.contains("asking the node its bounds")
+            && !err.contains("the slowest answer to a call of its kind"),
         "{err}"
     );
-    let ready_by = boottime() + FIXTURE.as_nanos();
-    let second = relay(&node, &dir.path().join("second"), Some(ready_by));
-    let (conn, id, read) = hello(&listener);
-    // Held 2m, a span the relay sends nothing in: the poll ends at its timeout, or at the relay's end.
-    let ended = readable(&conn, 2 * m);
+    let ready_by = boottime() + BOOT.as_nanos();
+    let mut second = relay(&node, &dir.path().join("second"), Some(ready_by));
+    let (conn, id, read) = hello(&listener, &mut second);
+    // Answered once the relay waits on, alive, past its hello: it sends nothing in that span.
+    assert_eq!(
+        second.party(),
+        Party::Live,
+        "the relay ended before its node answered"
+    );
     answer_hello(&conn, id);
     let (line, err) = said(second);
     drop(conn);
     eprintln!(
-        "guest_boot_deadline ready_by={ready_by} held={:?} ended_first={ended} said={line:?} stderr={err:?}",
+        "guest_boot_deadline ready_by={ready_by} held={:?} said={line:?} stderr={err:?}",
         read.elapsed()
     );
     assert_eq!(line, "ready\n", "{err}");

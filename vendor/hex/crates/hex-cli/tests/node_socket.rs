@@ -131,14 +131,9 @@ fn the_seam_holds_its_contract_over_the_node_agents_socket() {
                 .expect("run the test in a delegated scope");
             assert!(status.success(), "the delegated re-run failed");
         }
-        Err(direct) => {
-            hex_testkit::skip(
-                "the_seam_holds_its_contract_over_the_node_agents_socket",
-                "cgroup v2 delegation",
-                &format!("none in the delegated scope either ({direct}); run on a cgroup-v2 host"),
-            )
-            .expect("recording the skip");
-        }
+        // HEX_DELEGATED promised this binary a cgroup delegated to it: a preparation that fails there fails the test,
+        // never a skip that would hide the breakage.
+        Err(direct) => panic!("its cgroup isn't delegated to it ({direct})"),
     }
 }
 
@@ -249,10 +244,7 @@ fn nofile_seen(client: &Client, class: ClassSpec) -> String {
         .unwrap();
     let mut said = String::new();
     out.read_to_string(&mut said).unwrap();
-    assert_eq!(
-        proc.wait_for(conformance::PATIENCE).unwrap(),
-        Some(Exit::Code(0))
-    );
+    assert_eq!(conformance::end_of(&mut proc).unwrap(), Exit::Code(0));
     client.delete(&id).unwrap();
     said.trim().to_owned()
 }
@@ -1101,10 +1093,7 @@ fn example(lab: &Lab, client: &Client) -> Result<(), String> {
     let mut said = String::new();
     out.read_to_string(&mut said).unwrap();
     assert_eq!(said, "", "true says nothing");
-    assert_eq!(
-        proc.wait_for(conformance::PATIENCE).unwrap(),
-        Some(Exit::Code(0))
-    );
+    assert_eq!(conformance::end_of(&mut proc).unwrap(), Exit::Code(0));
     let (mut out, w) = std::io::pipe().unwrap();
     let mut proc = client
         .exec(
@@ -1119,10 +1108,7 @@ fn example(lab: &Lab, client: &Client) -> Result<(), String> {
     let mut said = String::new();
     out.read_to_string(&mut said).unwrap();
     assert_eq!(said, "from the socket\n");
-    assert_eq!(
-        proc.wait_for(conformance::PATIENCE).unwrap(),
-        Some(Exit::Code(0))
-    );
+    assert_eq!(conformance::end_of(&mut proc).unwrap(), Exit::Code(0));
     client.delete(&id).unwrap();
     Ok(())
 }
@@ -2544,33 +2530,21 @@ fn host_id(flag: &str) -> u32 {
         .expect("id is a number")
 }
 
-fn own_cgroup() -> PathBuf {
-    let own = std::fs::read_to_string("/proc/self/cgroup").expect("/proc/self/cgroup");
-    let rel = own
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .expect("a 0:: cgroup line")
-        .trim_start_matches('/');
-    PathBuf::from("/sys/fs/cgroup").join(rel)
-}
-
-/// Moves this process into a leaf of its own cgroup and confirms every controller is delegated, as
-/// oci_box.rs does; the agent this test starts inherits the leaf, and makes its boxes beside it.
+/// This process's own cgroup, delegated to it and prepared once for every test in this binary
+/// (`hex_testkit::cgroup::delegated`: the process and every process of its own moved into a leaf), or why it isn't
+/// ours to subdivide. The probe root's opening proves every controller a box uses is delegated here: `BoxRoot::open`
+/// refuses by name otherwise (HEX-INST-1).
 fn prepare_cgroup(disk: &Path) -> Result<PathBuf, String> {
-    let own = own_cgroup();
-    let leaf = own.join("hex-agent");
-    std::fs::create_dir_all(&leaf).map_err(|e| format!("making a leaf for the agent: {e}"))?;
-    std::fs::write(leaf.join("cgroup.procs"), format!("{}", std::process::id()))
-        .map_err(|e| format!("moving self into a leaf: {e}"))?;
-    // The probe root opening proves every controller a box uses is delegated here: `BoxRoot::open`
-    // refuses by name otherwise (HEX-INST-1).
-    hex_runtime::linux::cgroup::BoxRoot::open(
-        &own.join("hex-probe"),
-        hex_runtime::linux::disks::under(disk).unwrap_or_default(),
-    )
-    .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_dir(own.join("hex-probe"));
-    Ok(own)
+    hex_testkit::cgroup::delegated(|own| {
+        let probe = hex_runtime::linux::cgroup::BoxRoot::open(
+            &own.join("hex-probe"),
+            hex_runtime::linux::disks::under(disk).unwrap_or_default(),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+        let _ = std::fs::remove_dir(own.join("hex-probe"));
+        probe
+    })
 }
 
 fn cache_dir() -> PathBuf {

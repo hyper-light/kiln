@@ -115,11 +115,12 @@ impl Node {
             .ok_or_else(|| record.refusal(LifecycleCause::Pending))?;
         allocation.guest()?;
         record.commitment()?;
+        // No memory.max (joint plan step 14, ruling B): a VM's memory is held by its budget's memory.high, the last
+        // resort and its fleet's budget, and its swap stays off, which its managed create writes itself.
         Ok(hex_api::Bounds {
             cpu_max_milli: Some(
                 u32::try_from(allocation.resources.cpu_milli).map_err(|_| refused())?,
             ),
-            memory_max: Some(allocation.resources.mem_bytes),
             ..hex_api::Bounds::default()
         })
     }
@@ -226,6 +227,15 @@ impl Node {
         program.fits(&process::exec_limit())?;
         let scope = managed_native_scope_id(record)?;
         let cgroup = self.vm_root(record)?.create_managed(&scope, &bounds)?;
+        // Its swap stays off with no memory bound of its own (joint plan step 14, ruling B; HEX-RT-15), so all it
+        // holds is RAM: a scope that can't hold that is removed again, refused by name.
+        if let Err(why) = cgroup.set(&hex_core::cgroup::Write {
+            file: "memory.swap.max",
+            value: "0".to_owned(),
+        }) {
+            cgroup.remove()?;
+            return Err(why);
+        }
         let native = self
             .supervisor
             .reserve_managed(record, cgroup, plan.vsock())?;
@@ -483,6 +493,14 @@ impl Node {
             .backends
             .get()
             .ok_or_else(|| projection_refused("initialized node backends were not published"))?;
+        // Joint plan step 14 (ROOT, 2026-11-13): what this node recorded under a profile's census cost is retired, its
+        // natives up, before any preparation or recovery uses it; the preflight above passed it for this alone.
+        if let Some(backend) = &backends.firecracker {
+            backend.retire_census()?;
+        }
+        if let Some(backend) = &backends.shards {
+            backend.retire_census()?;
+        }
         if let Some(backend) = &backends.firecracker {
             backend.prepare_backing()?;
         }
@@ -634,6 +652,10 @@ impl Node {
             .map_err(|_| Refusal::Full(MAX_BOXES))?;
         for (id, record) in &records {
             let record = record.as_ref().map_err(|_| uncertain(id))?;
+            // A retired box's VM is gone with its retirement (joint plan step 14): no native scope to adopt.
+            if record.retired {
+                continue;
+            }
             if matches!(
                 record.spec.backend_class()?,
                 Class::Firecracker | Class::Shards
@@ -848,6 +870,10 @@ impl Node {
             .map_err(|_| Refusal::Full(MAX_BOXES))?;
         for (id, record) in records {
             let record = record.as_ref().map_err(|_| uncertain(id))?;
+            // A retired box ran nothing past its retirement and is kept for its owner's delete (joint plan step 14).
+            if record.retired {
+                continue;
+            }
             let Some(backend) = self
                 .backend(record.spec.backend_class()?)
                 .map_err(|_| uncertain(id))?
@@ -1197,6 +1223,41 @@ mod forward_route_tests {
         assert_eq!(
             guest_node_class(&spec(ClassSpec::Process, None)).unwrap(),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod managed_bounds_tests {
+    use super::*;
+
+    /// Joint plan step 14 (AC-T7.4.1; ROOT, 2026-11-13, ruling B; goal 15's finding): a VM's native scope gets no
+    /// memory.max at its create. With a census-free cost its allocation is its guest's RAM alone, so a cap there would
+    /// leave its VMM's own memory no room before its first window; its budget's memory.high, the last resort and its
+    /// fleet's budget hold it. Do bound a Shards image VM's record for its create. Expect its CPU capped at its
+    /// allocation and no memory bound.
+    #[test]
+    fn w14_a_vm_scope_gets_no_memory_max_at_create() {
+        let allocation = hex_api::sim::sim_vm_allocation().unwrap();
+        let spec = BoxSpec {
+            id: BoxId::new("image-vm").unwrap(),
+            bounds: hex_api::Bounds::default(),
+            class: ClassSpec::ShardsImage(Box::new(hex_api::ShardsImage::new(
+                hex_api::sim::SIM_IMAGE,
+            ))),
+            owner: None,
+            devices: Vec::new(),
+            allocation: Some(allocation),
+            route: None,
+            band: 0,
+        };
+        let mut record = BoxRecord::new(spec, Phase::Creating, Vec::new());
+        record.native_scope = Some(hex_core::record::NativeScope::from_bytes([7; 16]));
+        let bounds = Node::managed_bounds(NativeRecord::Box(&record)).unwrap();
+        assert_eq!(bounds.memory_max, None);
+        assert_eq!(
+            bounds.cpu_max_milli,
+            Some(u32::try_from(allocation.resources.cpu_milli).unwrap())
         );
     }
 }

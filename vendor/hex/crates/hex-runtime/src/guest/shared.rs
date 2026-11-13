@@ -168,13 +168,30 @@ impl GuestRuntime {
             // fabricated metadata is advertised for an uninitialized observer.
             return Ok(None);
         };
-        let entries = self.physical_entries()?;
-        if entries.is_empty() {
+        if self.physical_entries()?.is_empty() {
             return Ok(None);
         }
         let allocation = self.configured_allocation()?;
         observer.check_allocation(allocation)?;
-        let cost = allocation.cost;
+        self.gpu_backing_definition_under(selected, allocation.cost)
+    }
+
+    /// The GPU backing `selected` names under `cost`: the configured profile's, or a retained record's own (joint plan
+    /// step 14: a backing recorded under the profile's census cost is recognized by its identity recomputed under
+    /// that cost). No observer, catalog or physical entry: none.
+    pub(super) fn gpu_backing_definition_under(
+        &self,
+        selected: Option<&[hex_api::DeviceId]>,
+        cost: hex_api::RuntimeCost,
+    ) -> Result<Option<GpuBacking>, Refusal> {
+        let (Some(_), Some(observer)) = (self.gpu_catalog.as_ref(), self.gpu_observer.as_ref())
+        else {
+            return Ok(None);
+        };
+        let entries = self.physical_entries()?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
         let mut devices = Vec::new();
         devices
             .try_reserve_exact(entries.len())
@@ -295,6 +312,11 @@ impl GuestRuntime {
     /// the SAME owner's whole-record preflight. The caller joins every canonical
     /// backing/holder first; this never probes, launches, cleans up or writes.
     pub fn preflight_box(&self, record: &hex_core::record::BoxRecord) -> Result<(), Refusal> {
+        // A retired box is kept for its owner's delete, and a VM recorded under the census cost is its node start's to
+        // retire (joint plan step 14): neither meets the exact checks below.
+        if record.retired || self.census_vm(record)? {
+            return Ok(());
+        }
         let spec = &record.spec;
         route::guest_spec(spec)?;
         match spec.route_execution() {
@@ -303,6 +325,16 @@ impl GuestRuntime {
                     .route
                     .and_then(|receipt| receipt.backing)
                     .ok_or(super::books::uncertain(&spec.id)?)?;
+                // A box on a backing its node recorded under the census cost goes with that backing's retirement.
+                if let Some(backing) = self
+                    .authority()?
+                    .pool_records()?
+                    .into_iter()
+                    .find(|backing| backing.key == key)
+                    && self.census_backing(&backing)?
+                {
+                    return Ok(());
+                }
                 let cost = self
                     .runtime_cost
                     .ok_or(super::books::uncertain(&spec.id)?)?;
@@ -414,7 +446,25 @@ impl GuestRuntime {
         Ok(gpu)
     }
 
+    /// Whether pool `record` is this runtime's shared backing as its node recorded it under its profile's census cost
+    /// (joint plan step 14): its cost the profile's but for its census numbers, and its identity this runtime's
+    /// configuration recomputed under that cost. It is retired ([`Self::retire_census`]) at its node's start, so the
+    /// preflight passes it, and no exact check sees it.
+    pub(super) fn census_backing(&self, record: &PoolRecord) -> Result<bool, Refusal> {
+        let Some(current) = self.runtime_cost else {
+            return Ok(false);
+        };
+        Ok(record.execution == Execution::ShardsShared
+            && record.devices.is_empty()
+            && record.cost != current
+            && record.cost.census_free() == current
+            && record.key.pool == self.pool_configuration(record.cost)?)
+    }
+
     pub fn preflight_backing(&self, record: &PoolRecord) -> Result<(), Refusal> {
+        if self.census_backing(record)? || self.census_gpu_backing(record)?.is_some() {
+            return Ok(());
+        }
         let gpu = self.backing_configuration(record)?;
         let (path, physical): (&Path, &[shards_api::PhysicalGpu]) = match &gpu {
             Some(definition) => (definition.path.as_path(), &definition.physical),
@@ -596,7 +646,9 @@ impl GuestRuntime {
                     Ok(boxed) => boxed,
                     Err(_) => return Err(super::books::uncertain(id)?),
                 };
-                if boxed.spec.route_execution() == Some(Execution::ShardsShared)
+                // A retired box's backing went with its retirement: it names no backing to agree with.
+                if !boxed.retired
+                    && boxed.spec.route_execution() == Some(Execution::ShardsShared)
                     && boxed.spec.route.and_then(|route| route.backing)
                         != current.map(|row| row.key)
                 {
@@ -676,6 +728,115 @@ impl GuestRuntime {
             part(&[u8::from(share.read_only)])?;
         }
         Ok(hash.finalize().into())
+    }
+
+    /// Retires what this backend's node recorded under its profile's census cost (joint plan step 14; ROOT,
+    /// 2026-11-13: no legacy receipt runs on with a census number as its bound), run at its node's start once its
+    /// natives are up, before any preparation or recovery: each shared backing and the boxes on it
+    /// ([`Self::retire_census_backings`]), each VM box ([`Self::retire_census_vms`]) and each dedicated GPU backing
+    /// (`retire_census_gpu_backings`). The preflight passes each of them for this, and no exact check sees them.
+    pub fn retire_census(&self) -> Result<(), Refusal> {
+        self.retire_census_backings()?;
+        // VM boxes before the GPU backings they consume, so each backing goes with nothing left on it.
+        self.retire_census_vms()?;
+        self.retire_census_gpu_backings()
+    }
+
+    /// Whether VM box `record` is one this runtime owns whose receipt is its profile's under its census numbers (joint
+    /// plan step 14): its receipt's cost the profile's but for them, and the envelope it admits this runtime's
+    /// configured one. Retired at its node's start ([`Self::retire_census`]), so the preflight passes it.
+    pub(super) fn census_vm(&self, record: &hex_core::record::BoxRecord) -> Result<bool, Refusal> {
+        let (Some(current), Some(allocation)) = (self.runtime_cost, record.spec.allocation) else {
+            return Ok(false);
+        };
+        if record.retired
+            || !self.owns_record(&record.spec)
+            || allocation.cost == current
+            || allocation.cost.census_free() != current
+        {
+            return Ok(false);
+        }
+        let guest = allocation.guest()?;
+        let configured = self.dedicated_resources()?;
+        Ok(guest.cpu_milli == configured.cpu_milli && guest.mem_bytes == configured.mem_bytes)
+    }
+
+    /// Retires each VM box this runtime owns whose receipt carries its profile's census numbers ([`Self::census_vm`]):
+    /// its VM stopped through its receipt as its delete stops it and that receipt finalized and forgotten, and the box
+    /// kept retired (`BoxRecord::retire`).
+    fn retire_census_vms(&self) -> Result<(), Refusal> {
+        let books = self
+            .books
+            .get()
+            .ok_or_else(|| Refusal::Broken("guest has no initialized record authority".into()))?;
+        for (id, record) in self.authority()?.records()? {
+            let Ok(record) = record else {
+                continue;
+            };
+            if !self.census_vm(&record)? {
+                continue;
+            }
+            if matches!(record.spec.class, hex_api::ClassSpec::ShardsImage(_)) {
+                self.images.retire_image(record)?;
+                continue;
+            }
+            let keys = self.turn_keys(&record.spec.devices)?;
+            let launched = selected::read(&self.selected_path(&id)?)?.is_some();
+            devices::with_transaction(books, &id, &keys, |transaction| {
+                let mut current = transaction
+                    .read(&id)?
+                    .ok_or(Refusal::NoSuchBox(id.try_clone()?))?;
+                if launched {
+                    self.delete_selected(&id, transaction)?;
+                    self.finalize_selected(&id, transaction)?;
+                }
+                current.retire();
+                transaction.put(&current)
+            })?;
+            if launched {
+                self.forget_selected(&id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Retires each shared backing its node recorded under its profile's census cost (joint plan step 14; ROOT,
+    /// 2026-11-13, by decision 9's rule: a census row is evidence alone, so the profile's identity changed with its
+    /// census-free cost, `RuntimeCost::census_free`), never leaking it: in its pool turn, each box on it is kept, ready,
+    /// its end unknown and marked retired, so every call but its owner's delete is refused `Retired`; its scope is stopped
+    /// and released through its receipt as a release's is; and its record is removed. A backing of another profile is
+    /// none of this one's, left to the checks that refuse it.
+    fn retire_census_backings(&self) -> Result<(), Refusal> {
+        for record in self.authority()?.pool_records()? {
+            if !self.census_backing(&record)? {
+                continue;
+            }
+            let key = record.key;
+            let books = self
+                .books
+                .get()
+                .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+            devices::with_pool_transaction(books, &key, &[], |transaction| {
+                let mut record = transaction
+                    .read_pool(&key)?
+                    .ok_or_else(|| refused(key, LifecycleCause::Uncertain))?;
+                for boxed in transaction.records()?.into_values() {
+                    let mut boxed = boxed.map_err(|_| refused(key, LifecycleCause::Uncertain))?;
+                    if boxed.retired
+                        || boxed.spec.route.and_then(|route| route.backing) != Some(key)
+                    {
+                        continue;
+                    }
+                    boxed.retire();
+                    transaction.put(&boxed)?;
+                }
+                if record.phase != BackingPhase::Released {
+                    self.stop_and_release(transaction, &mut record, &|_| Ok(()))?;
+                }
+                transaction.remove_pool(&key)
+            })?;
+        }
+        Ok(())
     }
 
     pub(super) fn pool_record(&self, key: BackingKey) -> Result<PoolRecord, Refusal> {
@@ -1034,6 +1195,51 @@ impl GuestRuntime {
         Ok(())
     }
 
+    /// The shared backing `key`'s guest overhead, measured at this capacity answer where its guest runs (joint plan
+    /// step 14, C7; [`guest_seen`]), kept per backing generation: a new generation starts cold. A read that fails, or a
+    /// guest not running, is no sample: what was seen stays. No lock is held over the guest's answers.
+    fn measured_guest(&self, key: BackingKey) -> Result<hex_api::LearnedOverhead, Refusal> {
+        let kept = match *self
+            .guest_overhead
+            .lock()
+            .map_err(|_| refused(key, LifecycleCause::Uncertain))?
+        {
+            Some((seen, overhead)) if seen == key => overhead,
+            _ => hex_api::LearnedOverhead::default(),
+        };
+        let measured = self
+            .shared_running()
+            .ok()
+            .and_then(|booted| {
+                let guest = booted.client.capacity(Class::Oci).ok()??;
+                let records = self.authority().ok()?.records().ok()?;
+                let mut boxes = 0u64;
+                for record in records.values().flatten() {
+                    if record.spec.route.and_then(|route| route.backing) == Some(key) {
+                        boxes = boxes.saturating_add(
+                            booted.client.usage(&record.spec.id).ok()?.memory_bytes,
+                        );
+                    }
+                }
+                Some(guest_seen(kept, &guest, boxes))
+            })
+            .unwrap_or(kept);
+        let mut seen = self
+            .guest_overhead
+            .lock()
+            .map_err(|_| refused(key, LifecycleCause::Uncertain))?;
+        // Another answer may have measured meanwhile: the most of the two.
+        let merged = match *seen {
+            Some((at, other)) if at == key => hex_api::LearnedOverhead {
+                mem_bytes: measured.mem_bytes.max(other.mem_bytes),
+                ..measured
+            },
+            _ => measured,
+        };
+        *seen = Some((key, merged));
+        Ok(merged)
+    }
+
     pub(super) fn shared_running(&self) -> Result<triomphe::Arc<Booted>, Refusal> {
         let key = self
             .shared_key()?
@@ -1062,6 +1268,9 @@ impl GuestRuntime {
             .filter(|route| route.key.execution == Execution::ShardsShared)
             .and_then(|route| route.backing)
             .ok_or(super::books::uncertain(&boxed.spec.id)?)?;
+        if boxed.retired {
+            return Err(boxed.retired_refusal()?);
+        }
         if self.shared_key()? != Some(key) {
             return Err(super::books::uncertain(&boxed.spec.id)?);
         }
@@ -1193,7 +1402,9 @@ impl GuestRuntime {
                         what: "initialized native backings",
                         bound: hex_api::MAX_RUNTIME_ROUTES,
                     })?;
-                capacity.backings.push(record.offer()?);
+                let mut offer = record.offer()?;
+                offer.guest = self.measured_guest(key)?;
+                capacity.backings.push(offer);
             }
             push_offer(
                 capacity,
@@ -1395,87 +1606,101 @@ impl GuestRuntime {
                     return Err(refused(key, LifecycleCause::Busy));
                 }
             }
-            let path = self.pool_path()?;
-            if record.phase == BackingPhase::Prepared {
-                if pool::read(path)?.is_some() {
-                    return Err(refused(key, LifecycleCause::Uncertain));
-                }
-                self.preflight_backing(&record)?;
-                transaction.check_unsubmitted_pool()?;
-                record.phase = BackingPhase::Released;
-                transaction.put_pool(&record)?;
-                return record.offer();
-            }
-            let mut receipt = match pool::read(path)? {
-                Some(receipt) => receipt,
-                None if record.init.is_none() => {
-                    let mut original = PoolRecord::decode(&record.encode()?)?;
-                    original.phase = BackingPhase::Granted;
-                    original.exit = None;
-                    Receipt::retained(original, Vec::new())?
-                }
-                None => return Err(refused(key, LifecycleCause::Uncertain)),
-            };
-            receipt.matches(&record)?;
-            record.phase = BackingPhase::Draining;
-            transaction.put_pool(&record)?;
-            let identity = match &receipt.phase {
-                Phase::Running(identity)
-                | Phase::Stopping(identity)
-                | Phase::Released {
-                    identity: Some(identity),
-                    ..
-                } => {
-                    managed::same_native(NativeRecord::Pool(&record), identity)?;
-                    Some(identity)
-                }
-                Phase::Intent | Phase::Released { identity: None, .. } if record.init.is_none() => {
-                    None
-                }
-                _ => return Err(refused(key, LifecycleCause::Uncertain)),
-            };
-            let terminal = match &receipt.phase {
-                Phase::Released { status, .. } => *status,
-                _ => {
-                    let identity = identity.map(copy_identity).transpose()?;
-                    if let Some(identity) = &identity {
-                        receipt.phase = Phase::Stopping(copy_identity(identity)?);
-                        pool::write(path, &receipt)?;
-                    }
-                    let terminal = managed::stop_scope(
-                        transaction,
-                        identity.as_ref(),
-                        self.first_dial_bound()?,
-                        refused(key, LifecycleCause::Uncertain),
-                    )?;
-                    receipt.phase = Phase::Released {
-                        identity,
-                        status: terminal.status,
-                    };
-                    pool::write(path, &receipt)?;
-                    terminal.status
-                }
-            };
-            let identity = match &receipt.phase {
-                Phase::Released { identity, .. } => identity.as_ref(),
-                _ => return Err(refused(key, LifecycleCause::Uncertain)),
-            };
-            transaction.finalize_managed(identity)?;
-            record.exit = Some(exit_of(terminal));
-            record.phase = BackingPhase::Released;
-            transaction.put_pool(&record)?;
-            {
-                let mut state = self.lock()?;
-                if state
-                    .as_ref()
-                    .is_some_and(|booted| booted.backing.is_some_and(|backing| backing.key == key))
-                {
-                    *state = None;
-                }
-            }
-            remove_receipt(path)?;
+            self.stop_and_release(transaction, &mut record, &|record| {
+                self.preflight_backing(record)
+            })?;
             record.offer()
         })
+    }
+
+    /// Stops and releases backing `record`'s scope through its receipt, in `transaction` (its pool turn): a Prepared
+    /// one, with no receipt, checked by `prepared` and no native submission proved, is released as it is; any other is
+    /// drained, its scope stopped where its receipt names one and not already released, its controller finalized, and
+    /// its exit recorded; and its receipt removed.
+    fn stop_and_release(
+        &self,
+        transaction: &dyn Transaction,
+        record: &mut PoolRecord,
+        prepared: &dyn Fn(&PoolRecord) -> Result<(), Refusal>,
+    ) -> Result<(), Refusal> {
+        let key = record.key;
+        let path = self.pool_path()?;
+        if record.phase == BackingPhase::Prepared {
+            if pool::read(path)?.is_some() {
+                return Err(refused(key, LifecycleCause::Uncertain));
+            }
+            prepared(record)?;
+            transaction.check_unsubmitted_pool()?;
+            record.phase = BackingPhase::Released;
+            return transaction.put_pool(record);
+        }
+        let mut receipt = match pool::read(path)? {
+            Some(receipt) => receipt,
+            None if record.init.is_none() => {
+                let mut original = PoolRecord::decode(&record.encode()?)?;
+                original.phase = BackingPhase::Granted;
+                original.exit = None;
+                Receipt::retained(original, Vec::new())?
+            }
+            None => return Err(refused(key, LifecycleCause::Uncertain)),
+        };
+        receipt.matches(record)?;
+        record.phase = BackingPhase::Draining;
+        transaction.put_pool(record)?;
+        let identity = match &receipt.phase {
+            Phase::Running(identity)
+            | Phase::Stopping(identity)
+            | Phase::Released {
+                identity: Some(identity),
+                ..
+            } => {
+                managed::same_native(NativeRecord::Pool(record), identity)?;
+                Some(identity)
+            }
+            Phase::Intent | Phase::Released { identity: None, .. } if record.init.is_none() => None,
+            _ => return Err(refused(key, LifecycleCause::Uncertain)),
+        };
+        let terminal = match &receipt.phase {
+            Phase::Released { status, .. } => *status,
+            _ => {
+                let identity = identity.map(copy_identity).transpose()?;
+                if let Some(identity) = &identity {
+                    receipt.phase = Phase::Stopping(copy_identity(identity)?);
+                    pool::write(path, &receipt)?;
+                }
+                let terminal = managed::stop_scope(
+                    transaction,
+                    identity.as_ref(),
+                    self.first_dial_bound()?,
+                    refused(key, LifecycleCause::Uncertain),
+                )?;
+                receipt.phase = Phase::Released {
+                    identity,
+                    status: terminal.status,
+                };
+                pool::write(path, &receipt)?;
+                terminal.status
+            }
+        };
+        let identity = match &receipt.phase {
+            Phase::Released { identity, .. } => identity.as_ref(),
+            _ => return Err(refused(key, LifecycleCause::Uncertain)),
+        };
+        transaction.finalize_managed(identity)?;
+        record.exit = Some(exit_of(terminal));
+        record.phase = BackingPhase::Released;
+        transaction.put_pool(record)?;
+        {
+            let mut state = self.lock()?;
+            if state
+                .as_ref()
+                .is_some_and(|booted| booted.backing.is_some_and(|backing| backing.key == key))
+            {
+                *state = None;
+            }
+        }
+        remove_receipt(path)?;
+        Ok(())
     }
 }
 
@@ -1635,6 +1860,25 @@ fn push_offer(
         }
     }
     Ok(())
+}
+
+/// A shared backing's guest's own overhead after one capacity answer (joint plan step 14, C7; ROOT, 2026-11-13): what
+/// its agent says it uses (its total memory less its free) past what its boxes hold, `boxes_memory`, the most seen,
+/// only rising from `kept`. Its CPU and disk its agent's answer doesn't read, so they stay as kept: none.
+fn guest_seen(
+    kept: hex_api::LearnedOverhead,
+    guest: &hex_api::Capacity,
+    boxes_memory: u64,
+) -> hex_api::LearnedOverhead {
+    let own = guest
+        .total
+        .mem_bytes
+        .saturating_sub(guest.free.mem_bytes)
+        .saturating_sub(boxes_memory);
+    hex_api::LearnedOverhead {
+        mem_bytes: Some(kept.mem_bytes.map_or(own, |seen| seen.max(own))),
+        ..kept
+    }
 }
 
 #[cfg(test)]

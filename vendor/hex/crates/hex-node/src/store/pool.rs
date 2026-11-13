@@ -368,6 +368,10 @@ impl Store {
         &self,
         record: &hex_core::record::BoxRecord,
     ) -> Result<Option<BackingPhase>, Refusal> {
+        // A box whose backing was retired (joint plan step 14, `LifecycleCause::Retired`) references none any more.
+        if record.retired {
+            return Ok(None);
+        }
         let Some(route) = record.spec.route else {
             return Ok(None);
         };
@@ -456,7 +460,9 @@ impl Store {
                 ));
             }
             row.spec.check()?;
-            if let Some(source) = row.spec.route.and_then(|route| route.backing)
+            // A retired box's backing is gone with its retirement: it holds no reference.
+            if !row.retired
+                && let Some(source) = row.spec.route.and_then(|route| route.backing)
                 && source.pool == *pool
             {
                 return Ok(Some(source));

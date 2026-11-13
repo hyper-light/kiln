@@ -50,6 +50,9 @@ native-trusted-entry-measurement = []
 [dev-dependencies]
 # The image class's tests wait on their own facts' patiences (src/guest/image_tests.rs).
 hex-testkit.workspace = true
+# A vCPU's typed unread cause (shards_abi::guest_time::Unread), which the image class's usage test reads as its run
+# host says it (src/guest/image_tests.rs); shards-api names the type without re-exporting it.
+shards-abi = { path = "../../vendor/shards/crates/abi" }
 proptest = "1.12.0"
 tempfile.workspace = true
 

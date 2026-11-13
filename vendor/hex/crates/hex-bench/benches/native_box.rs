@@ -218,19 +218,11 @@ mod bench {
             s
         }
         fn ended(&mut self) -> String {
-            // The suite's learned wait: twice the slowest end of the record and this run.
-            let asked = Instant::now();
-            match self
-                .proc
-                .wait_for(hex_api::conformance::patience())
-                .expect("wait")
-            {
-                Some(e) => {
-                    hex_api::conformance::ENDS.saw(asked.elapsed());
-                    format!("{e:?}")
-                }
-                None => "running".to_owned(),
-            }
+            // Followed to its end, as the suite follows one (decision 9).
+            format!(
+                "{:?}",
+                hex_api::conformance::end_of(&mut self.proc).expect("wait")
+            )
         }
     }
 

@@ -156,7 +156,7 @@ impl Transaction for Owner {
     }
     fn remove_pool(&self, key: &BackingKey) -> Result<(), Refusal> {
         let boxes = self.boxes.lock().unwrap();
-        if boxes.values().any(|boxed| matches!(boxed, Ok(boxed) if boxed.spec.route.and_then(|route| route.backing) == Some(*key))) {
+        if boxes.values().any(|boxed| matches!(boxed, Ok(boxed) if !boxed.retired && boxed.spec.route.and_then(|route| route.backing) == Some(*key))) {
             return Err(refused(*key, LifecycleCause::Busy));
         }
         let mut held = self.pool.lock().unwrap();
@@ -391,6 +391,14 @@ fn configured_for(path: &Path, owner: &Arc<Owner>) -> GuestRuntime {
     runtime
 }
 
+/// A runtime bound to `owner`'s books whose profile is the census-free one (joint plan step 14,
+/// `RuntimeCost::census_free`): a node restarted after decision 9's census-free cost.
+fn configured_census_free(path: &Path, owner: &Arc<Owner>) -> GuestRuntime {
+    let mut runtime = configured_for(path, owner);
+    runtime.runtime_cost = runtime.runtime_cost.map(hex_api::RuntimeCost::census_free);
+    runtime
+}
+
 fn grant(offer: &BackingOffer) -> BackingGrant {
     BackingGrant {
         key: offer.key,
@@ -558,6 +566,148 @@ fn shared_charge_survives_controller_only_exit_and_failed_native_finalization() 
     assert_eq!(owner.row().exit, Some(hex_api::Exit::Code(7)));
     assert_eq!(owner.native.stops.load(Ordering::SeqCst), stops);
     assert_eq!(owner.finalized.load(Ordering::SeqCst), 1);
+}
+
+/// Joint plan step 14 (AC-T7.4.1; ROOT, 2026-11-13, by decision 9's rule: a census row is evidence only): a shared
+/// backing its node recorded under a census cost is retired at the node's start, never leaked. Do prepare and grant a
+/// shared backing under a cost whose census measured both overheads, with one box on it; then start a node whose
+/// profile is the census-free one, prepare its backing, and call the box. Expect its inspect to say why (goal 12's
+/// `BoxInfo::ended`, the cause's words) with its end unknown, its every other call but delete refused as retired, typed,
+/// its record kept, ready, until its owner's delete removes it; the old backing's scope stopped and released, no VM
+/// process left; and neither its pool record nor its receipt kept.
+#[test]
+fn w14_a_census_backing_is_retired_at_start_and_its_box_says_why() {
+    let dir = socket_fixture();
+    let (old, owner) = configured(dir.path());
+    let offer = old.prepare_backing().unwrap();
+    assert!(old.initialize_backing(grant(&offer)).is_err());
+    let mut spec = super::super::tests::oci(
+        hex_api::Rootfs::Dir(dir.path().join("rootfs.tar")),
+        Vec::new(),
+    );
+    spec.route = Some(hex_api::RouteReceipt {
+        key: old.capacity(Class::Oci).unwrap().unwrap().routes[0].key,
+        backing: Some(offer.key),
+    });
+    let id = spec.id.clone();
+    Transaction::put(
+        owner.as_ref(),
+        &BoxRecord::new(spec, hex_core::record::Phase::Ready, Vec::new()),
+    )
+    .unwrap();
+    owner.native.stop_releases.store(true, Ordering::SeqCst);
+    let restarted = configured_census_free(dir.path(), &owner);
+    // The node's preflight retires first, before any exact cost check; then its backing is prepared afresh.
+    restarted.retire_census().unwrap();
+    let fresh = restarted.prepare_backing().unwrap();
+    assert_ne!(fresh.key, offer.key);
+    let info = restarted.inspect(&id).unwrap();
+    assert_eq!(
+        info.ended.as_deref(),
+        Some("its backing's identity changed with decision 9's census-free cost")
+    );
+    assert_eq!(info.exit, Some(hex_api::Exit::Unknown));
+    assert_eq!(
+        restarted.usage(&id),
+        Err(Refusal::Backing {
+            key: offer.key,
+            cause: LifecycleCause::Retired,
+        })
+    );
+    let kept = Transaction::read(owner.as_ref(), &id).unwrap().unwrap();
+    assert!(kept.retired);
+    assert_eq!(kept.ended, info.ended);
+    assert_eq!(kept.phase, hex_core::record::Phase::Ready);
+    assert_eq!(kept.exit, Some(hex_api::Exit::Unknown));
+    assert!(
+        owner.native.released.load(Ordering::SeqCst),
+        "its scope released: no VM process left"
+    );
+    assert_eq!(owner.removals.load(Ordering::SeqCst), 1);
+    assert!(pool::read(&dir.path().join("@guest")).unwrap().is_none());
+    restarted.delete(&id).unwrap();
+}
+
+/// Joint plan step 14 (AC-T7.4.1; ROOT, 2026-11-13: no legacy receipt runs on with a census number as its bound): a
+/// node's start retires every VM box and backing it recorded under its profile's census cost, before any exact check.
+/// Do record, under a cost whose census measured both overheads, a Shards VM box and a shared backing holding an OCI
+/// box; then start a census-free node: preflight each record, retire, and prepare its backing. Expect each preflight to
+/// pass; both boxes retired, ended in the cause's words, every call but inspect and delete refused; the backing's scope
+/// released, its pool record and receipt gone; and a receipt the node admits now census-free.
+#[test]
+fn w14_a_node_start_retires_every_census_record_before_its_exact_checks() {
+    let dir = socket_fixture();
+    let (old, owner) = configured(dir.path());
+    let offer = old.prepare_backing().unwrap();
+    assert!(old.initialize_backing(grant(&offer)).is_err());
+    let mut oci = super::super::tests::oci(
+        hex_api::Rootfs::Dir(dir.path().join("rootfs.tar")),
+        Vec::new(),
+    );
+    oci.route = Some(hex_api::RouteReceipt {
+        key: old.capacity(Class::Oci).unwrap().unwrap().routes[0].key,
+        backing: Some(offer.key),
+    });
+    let census = old.runtime_cost.unwrap();
+    let mut vm = super::super::tests::oci(
+        hex_api::Rootfs::Dir(dir.path().join("rootfs.tar")),
+        Vec::new(),
+    );
+    vm.id = BoxId::new("vm-census").unwrap();
+    vm.class = match vm.class {
+        hex_api::ClassSpec::Oci(spec) => hex_api::ClassSpec::Shards(spec),
+        other => other,
+    };
+    vm.allocation = Some(census.allocate(CapacityResources::default()).unwrap());
+    for spec in [oci.clone(), vm.clone()] {
+        Transaction::put(
+            owner.as_ref(),
+            &BoxRecord::new(spec, hex_core::record::Phase::Ready, Vec::new()),
+        )
+        .unwrap();
+    }
+    owner.native.stop_releases.store(true, Ordering::SeqCst);
+    let restarted = configured_census_free(dir.path(), &owner);
+    for id in [&oci.id, &vm.id] {
+        let record = Transaction::read(owner.as_ref(), id).unwrap().unwrap();
+        restarted.preflight_box(&record).unwrap();
+    }
+    restarted.preflight_backing(&owner.row()).unwrap();
+    restarted.retire_census().unwrap();
+    for id in [&oci.id, &vm.id] {
+        let kept = Transaction::read(owner.as_ref(), id).unwrap().unwrap();
+        assert!(kept.retired, "{id} kept retired");
+        let info = restarted.inspect(id).unwrap();
+        assert_eq!(
+            info.ended.as_deref(),
+            Some("its backing's identity changed with decision 9's census-free cost")
+        );
+        assert_eq!(info.exit, Some(hex_api::Exit::Unknown));
+        assert!(matches!(
+            restarted.usage(id),
+            Err(Refusal::Backing {
+                cause: LifecycleCause::Retired,
+                ..
+            } | Refusal::Lifecycle {
+                cause: LifecycleCause::Retired,
+                ..
+            })
+        ));
+    }
+    assert!(owner.native.released.load(Ordering::SeqCst));
+    assert_eq!(owner.removals.load(Ordering::SeqCst), 1);
+    assert!(pool::read(&dir.path().join("@guest")).unwrap().is_none());
+    assert_ne!(restarted.prepare_backing().unwrap().key, offer.key);
+    let fresh = restarted
+        .runtime_cost
+        .unwrap()
+        .allocate(CapacityResources::default())
+        .unwrap();
+    assert_eq!(fresh.resources, fresh.guest().unwrap());
+    for id in [&oci.id, &vm.id] {
+        restarted.delete(id).unwrap();
+        assert!(Transaction::read(owner.as_ref(), id).unwrap().is_none());
+    }
 }
 
 #[test]
@@ -1079,4 +1229,54 @@ fn shared_prepared_cancel_and_ack_recheck_native_absence_without_a_scope_end() {
     assert_eq!(owner.native.stops.load(Ordering::SeqCst), 0);
     assert!(!owner.native.released.load(Ordering::SeqCst));
     assert!(owner.boxes.lock().unwrap().is_empty());
+}
+
+/// Joint plan step 14 (C7; ROOT, 2026-11-13): a shared backing's guest's own overhead is what its agent says it uses past
+/// what its boxes hold, the most seen, only rising; its CPU and disk unread, so none. Do measure a guest of 8 GiB with
+/// 5 GiB free whose boxes hold 2 GiB, from cold; then one with 6 GiB free and 1.5 GiB in its boxes; then one whose
+/// boxes hold more than it says it uses. Expect 1 GiB, then still 1 GiB (0.5 GiB less is no fall), and 1 GiB again.
+#[test]
+fn w14_a_shared_guests_own_overhead_is_its_use_past_its_boxes_the_most_seen() {
+    let gib = 1u64 << 30;
+    let guest = |free: u64| {
+        let mut capacity = hex_api::Capacity {
+            id: "guest".into(),
+            total: CapacityResources {
+                cpu_milli: 2_000,
+                mem_bytes: 8 * gib,
+                disk_bytes: 0,
+            },
+            free: CapacityResources {
+                cpu_milli: 2_000,
+                mem_bytes: free,
+                disk_bytes: 0,
+            },
+            devices: Vec::new(),
+            cost: None,
+            routes: Vec::new(),
+            device_routes: Vec::new(),
+            backings: Vec::new(),
+            unavailable: Vec::new(),
+            learned: None,
+        };
+        capacity.free.mem_bytes = free;
+        capacity
+    };
+    let first = super::guest_seen(
+        hex_api::LearnedOverhead::default(),
+        &guest(5 * gib),
+        2 * gib,
+    );
+    assert_eq!(
+        first,
+        hex_api::LearnedOverhead {
+            cpu_milli: None,
+            mem_bytes: Some(gib),
+            disk_bytes: None,
+        }
+    );
+    let second = super::guest_seen(first, &guest(6 * gib), 3 * gib / 2);
+    assert_eq!(second.mem_bytes, Some(gib));
+    let third = super::guest_seen(second, &guest(5 * gib), 4 * gib);
+    assert_eq!(third.mem_bytes, Some(gib));
 }

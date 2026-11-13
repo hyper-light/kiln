@@ -107,7 +107,7 @@ own = ["UPSTREAM.md"]
 [projects.hyper-raft]
 kind = "git"
 repository = "https://github.com/hyper-light/hyper-raft"
-commit = "fb74b59533908472ade7e526eb08117601cede0e"
+commit = "045cf3ff82e1d96d1f8c339d6e644d17afc998a3"
 path = "vendor/hyper-raft"
 take = [
   "Cargo.toml",
@@ -213,7 +213,7 @@ own = ["UPSTREAM.md"]
 [projects.shards]
 kind = "git"
 repository = "https://github.com/hyper-light/shards"
-commit = "1389dc0b60c92d33b3897af6d08690d7a459bba0"
+commit = "740fa37268c9200616f6fd543d96625953e23b81"
 path = "vendor/shards"
 take = [
   ".cargo",
@@ -266,7 +266,7 @@ own = ["UPSTREAM.md"]
 [projects.hex]
 kind = "git"
 repository = "https://github.com/hyper-light/hex"
-commit = "025aae6d336e2f0513a620dfb89ce4215b35e307"
+commit = "c7603b0b821d7e1700aacded9849fb0fceb220e6"
 path = "vendor/hex"
 take = [
   "Cargo.toml",

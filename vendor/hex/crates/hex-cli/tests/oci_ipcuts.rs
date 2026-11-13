@@ -25,7 +25,6 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use hex_api::{Bounds, BoxId, BoxSpec, ClassSpec, Exit, Program, Refusal, Runtime, Stdio};
 use hex_core::patience::Patience;
@@ -33,8 +32,6 @@ use hex_node::{Node, OCI_BOXES};
 use hex_testkit::waits::until;
 
 const TEST: &str = "a_root_nodes_boxes_join_ipc_and_uts_namespaces_made_ahead";
-/// The conformance suite's patience for a program's end (Ada's 2026-11-06 rule).
-const PATIENCE: Duration = hex_api::conformance::PATIENCE;
 /// The ipc and uts pool's refill thread's makes, which no recorded operation makes and no census row times yet: measuring,
 /// for the fact alone, each answer recorded for the census to come (hex_testkit::waits; the lead's rule of 2026-11-08).
 static PAIRS: Patience = Patience::measuring("test.oci_ipcuts.pairs");
@@ -70,10 +67,9 @@ fn a_root_nodes_boxes_join_ipc_and_uts_namespaces_made_ahead() {
             assert!(status.success(), "the delegated re-run failed");
             return;
         }
-        Err(why) => {
-            eprintln!("SKIP {TEST}: no cgroup v2 subtree of this process's own ({why})");
-            return;
-        }
+        // HEX_DELEGATED promised this binary a cgroup delegated to it: a preparation that fails there fails the test,
+        // never a skip that would hide the breakage.
+        Err(why) => panic!("its cgroup isn't delegated to it ({why})"),
     };
     let lab = Lab::new(&cache, &exe);
     if host_id("-u") != 0 {
@@ -366,8 +362,8 @@ fn run_in(node: &Node, id: &BoxId, args: &[&str]) -> String {
     let mut text = String::new();
     out.read_to_string(&mut text).unwrap();
     assert_eq!(
-        proc.wait_for(PATIENCE).unwrap(),
-        Some(Exit::Code(0)),
+        hex_api::conformance::end_of(&mut proc).unwrap(),
+        Exit::Code(0),
         "{args:?} in {id}: {text}"
     );
     text
@@ -520,34 +516,21 @@ fn host_id(flag: &str) -> u32 {
         .expect("id is a number")
 }
 
-/// This process's cgroup directory under /sys/fs/cgroup.
-fn own_cgroup() -> PathBuf {
-    let own = std::fs::read_to_string("/proc/self/cgroup").expect("/proc/self/cgroup");
-    let rel = own
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .expect("a 0:: cgroup line")
-        .trim_start_matches('/');
-    PathBuf::from("/sys/fs/cgroup").join(rel)
-}
-
-/// Moves this process into a leaf of its own cgroup and confirms every controller is delegated, as oci_box.rs does;
-/// returns the own cgroup dir, or why it isn't ours to subdivide.
+/// This process's own cgroup, delegated to it and prepared once for every test in this binary
+/// (`hex_testkit::cgroup::delegated`: the process and every process of its own moved into a leaf), or why it isn't
+/// ours to subdivide. The probe root's opening proves every controller a box uses is delegated here: `BoxRoot::open`
+/// refuses by name otherwise (HEX-INST-1).
 fn prepare_cgroup(disk: &Path) -> Result<PathBuf, String> {
-    let own = own_cgroup();
-    let leaf = own.join("hex-agent");
-    std::fs::create_dir_all(&leaf).map_err(|e| format!("making a leaf for the agent: {e}"))?;
-    std::fs::write(leaf.join("cgroup.procs"), format!("{}", std::process::id()))
-        .map_err(|e| format!("moving self into a leaf: {e}"))?;
-    // The probe root opening proves every controller a box uses is delegated here: `BoxRoot::open`
-    // refuses by name otherwise (HEX-INST-1).
-    hex_runtime::linux::cgroup::BoxRoot::open(
-        &own.join("hex-probe"),
-        hex_runtime::linux::disks::under(disk).unwrap_or_default(),
-    )
-    .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_dir(own.join("hex-probe"));
-    Ok(own)
+    hex_testkit::cgroup::delegated(|own| {
+        let probe = hex_runtime::linux::cgroup::BoxRoot::open(
+            &own.join("hex-probe"),
+            hex_runtime::linux::disks::under(disk).unwrap_or_default(),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+        let _ = std::fs::remove_dir(own.join("hex-probe"));
+        probe
+    })
 }
 
 fn cache_dir() -> PathBuf {

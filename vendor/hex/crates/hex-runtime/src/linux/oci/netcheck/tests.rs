@@ -475,12 +475,12 @@ fn a_dumps_reads_are_bounded_by_its_bytes() {
     assert_eq!(scratch.answer.len(), reads * NLMSG_HDR + done.len());
 }
 
-/// The lead's failure bound (2026-11-06), with decision 9's rule (d6bfb3f0): measuring, with no record, a dump is
-/// waited for with no bound, and its answers are recorded for the census that seeds it, never arming one, so no first
-/// answer becomes the bound. Do: dump, with nothing recorded, through a socket pair whose other end has answered each of
-/// the five dumps with its end. Expect: the dumps read, their answers seen, and still no bound.
+/// Decision 9's cold start: with no answer seen, a dump is waited for on the kernel's answer alone, with no bound, and
+/// its answers are learned, the slowest the next read's bound. Do: dump, with nothing seen, through a socket pair whose
+/// other end has answered each of the five dumps with its end. Expect: no bound before; the dumps read, their answers
+/// seen, and the wait then bounded at the slowest of them.
 #[test]
-fn a_measuring_dump_is_waited_for_and_its_answers_recorded_unarmed() {
+fn a_cold_dump_is_waited_for_and_its_slowest_answer_bounds_the_next() {
     let (ours, theirs) = rustix::net::socketpair(
         AddressFamily::UNIX,
         SocketType::SEQPACKET,
@@ -493,6 +493,11 @@ fn a_measuring_dump_is_waited_for_and_its_answers_recorded_unarmed() {
         rustix::net::send(&theirs, &done, SendFlags::empty()).unwrap();
     }
     let slowest = Patience::measuring("test");
+    assert_eq!(
+        slowest.deadline(),
+        None,
+        "no answer seen: the first read follows the kernel"
+    );
     let mut scratch = Scratch::default();
     assert_eq!(
         dumps(&ours, &mut scratch, &slowest),
@@ -502,14 +507,18 @@ fn a_measuring_dump_is_waited_for_and_its_answers_recorded_unarmed() {
         slowest.slowest().is_some(),
         "the dumps' answers are recorded"
     );
-    assert_eq!(slowest.deadline(), None, "a measuring wait is never armed");
+    assert_eq!(
+        slowest.deadline(),
+        slowest.slowest(),
+        "bounded at the slowest answer seen"
+    );
 }
 
-/// The lead's failure bound (2026-11-06): a read unanswered past twice the slowest answer recorded is refused, the
-/// namespace thrown away, and it is no sample (Karn's point), but its answer is slower than the bound it ran out at,
-/// so the next read's bound backs off to twice that (AC-T7.4.1: `Patience::ran_out`, RFC 6298 §5.5). Do: seed the
-/// wait at 1 ms, then dump through a socket pair whose other end never answers. Expect: refused as unreadable once
-/// 2 ms have passed, not held for good, and the bound 4 ms after.
+/// Decision 9's bound: a read unanswered past the slowest answer seen is refused, the namespace thrown away, and it is
+/// no sample (Karn's point); the next read follows the kernel's answer alone, with no factor. Do: start the wait as it
+/// is once an answer of 1 ms has been seen (test-only `Patience::seeded`), then dump through a socket pair whose other
+/// end never answers. Expect: refused as unreadable once 1 ms has passed, not held for good; the slowest still 1 ms,
+/// and no bound after.
 #[test]
 fn a_dump_unanswered_past_its_bound_is_refused_and_no_sample() {
     let (ours, _theirs) = rustix::net::socketpair(
@@ -525,5 +534,8 @@ fn a_dump_unanswered_past_its_bound_is_refused_and_no_sample() {
         dumps(&ours, &mut scratch, &slowest),
         Err(Refused::Unreadable)
     );
-    assert_eq!(slowest.deadline(), Some(Duration::from_millis(4)));
+    assert_eq!(
+        (slowest.deadline(), slowest.slowest()),
+        (None, Some(Duration::from_millis(1)))
+    );
 }

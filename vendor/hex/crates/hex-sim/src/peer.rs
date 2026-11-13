@@ -3261,6 +3261,7 @@ mod tests {
                 offers: vec![native, shared],
                 device_routes: Vec::new(),
                 backings: vec![BackingOffer {
+                    guest: Default::default(),
                     key,
                     cost: cost_fixture(),
                     phase: BackingPhase::Live,
@@ -3366,6 +3367,7 @@ mod tests {
                 ],
                 device_routes: Vec::new(),
                 backings: vec![BackingOffer {
+                    guest: Default::default(),
                     key: replacement,
                     cost: cost_fixture(),
                     phase: BackingPhase::Live,
@@ -3409,6 +3411,7 @@ mod tests {
             key,
         });
         let mut parent = BackingOffer {
+            guest: Default::default(),
             key: BackingKey {
                 pool: [0x71; 32],
                 generation: [0x72; 16],
@@ -3527,6 +3530,7 @@ mod tests {
         assert_eq!(runner.assigned_route(key).unwrap(), Some(receipt));
         assert_eq!(runner.assigned_allocation(key).unwrap(), Some(allocation));
         let current = BackingOffer {
+            guest: Default::default(),
             key: BackingKey {
                 pool: [0x73; 32],
                 generation: [0x74; 16],

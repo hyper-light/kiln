@@ -176,6 +176,27 @@ fn crediting_any_use_is_caught() {
     );
 }
 
+/// AC-T7.4.1, joint plan step 13 (CLAUDE.md §2: a loop's bound derived, never picked): do have one runner, synced,
+/// ask for 300 runs and let each one's wait run out before its answer, so 600 words wait on its link to the keeper,
+/// then settle; expect it to settle with the books agreeing: settling is bounded by the protocol's own count of what
+/// its links carry, not by a multiple of a runner's reservations.
+#[test]
+fn a_backlog_on_a_link_settles_within_the_protocols_own_bound() {
+    let mut world = World::new(0, 1, None).unwrap();
+    world.connect(Some(0));
+    for _ in 0..4 {
+        world.deliver_any().unwrap();
+    }
+    assert!(world.runners[0].holder.as_ref().unwrap().is_up());
+    for _ in 0..300 {
+        world.ask(Some(0));
+        world.ran_out(Some(0)).unwrap();
+    }
+    assert_eq!(world.runners[0].link.to_keeper.len(), 600);
+    let settled = world.settle();
+    assert!(settled.is_ok(), "{settled:?}");
+}
+
 /// T-T7.4.1's determinism: one seed, one run.
 #[test]
 fn a_seed_names_one_run() {

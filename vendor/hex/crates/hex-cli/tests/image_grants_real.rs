@@ -35,8 +35,9 @@
 //! the run says so (`GRANTS-OWED`), while every check of the VM itself, its inspect and the host's service runs alike.
 //!
 //! Every wait measures as the run goes, with no deadline picked for it: each waits for its fact while its party lives
-//! (the node's ready line while the node runs, the probe's answer while its VM runs, its report on its stdout until
-//! that ends), the person's rule of 2026-11-13.
+//! (the node's ready line while the node runs; the probe's hand-over, asked again while its box answers Pending as its
+//! run settles, and its answer at a port, while its VM runs; its report on its stdout until that ends), the person's
+//! rule of 2026-11-13.
 //!
 //! Explicit inputs only, each by its own variable; a missing one fails by name. Run alone, `--ignored`: on Linux
 //! inside a cgroup delegated to this binary (`HEX_DELEGATED`); with image_real's node inputs (`SHARDS_BIN`, Hex's
@@ -71,7 +72,8 @@ use std::sync::mpsc;
 
 use hex_api::{
     Allocation, Bounds, BoxId, BoxSpec, BoxState, Class, ClassSpec, Destination, Exit, Grant,
-    ImageMember, Member, MemberKind, Ports, Proto, Receiver, Refusal, Runtime, ShardsImage, Signal,
+    ImageMember, LifecycleCause, Member, MemberKind, Ports, Proto, Receiver, Refusal, Runtime,
+    ShardsImage, Signal,
 };
 use hex_client::Client;
 use hex_core::patience::Patience;
@@ -87,6 +89,9 @@ use probe::{Ingress, Outcome, Report};
 /// The probe's answer at a published port, which no recorded operation makes: it measures, for its fact alone
 /// (hex_testkit::waits), with no deadline, while the VM runs ([`answered_at`]).
 static MEMBER_ANSWERED: Patience = Patience::measuring("test.hex_cli.image_grants_member_answered");
+/// The probe's hand-over to its caller, while its box settles ([`handed_over`]): measuring alike.
+static MEMBER_HANDED_OVER: Patience =
+    Patience::measuring("test.hex_cli.image_grants_member_handed_over");
 
 /// The name the probe image is tagged with where this test builds it into the node's Shards home.
 const BUILT: &str = "hex-image-grants/probe";
@@ -589,11 +594,58 @@ fn a_destination_its_image_grants_not_refuses_the_boot(
     client.delete(&id).unwrap();
 }
 
-/// The probe's report, asked on its stdin, as its caller drives it (`ShardsImage::members`): one line written, its
-/// answer read from its stdout up to the empty line that ends it. The read waits for the probe's answer with no
-/// deadline of its own; a probe that ends first ends its stdout, which refuses the read.
+/// What `ask` hands over (`Runtime::member` of box `id`), asked again while it answers `Lifecycle { Pending }`, as a
+/// box whose run is settling answers it, and `shown` (the box's state, its exit and a failed run's words,
+/// `BoxInfo.ended`) says the box lives: each ask the node's own answer, with no timer of the test's (R03), the wait
+/// measuring (`MEMBER_HANDED_OVER`). A box that ends first ends the wait, refused naming its end; any other refusal
+/// ends it at once. Says it and how many asks it took.
+fn handed_over<P>(
+    id: &BoxId,
+    mut ask: impl FnMut() -> Result<P, Refusal>,
+    mut shown: impl FnMut() -> Result<(BoxState, Option<Exit>, Option<String>), Refusal>,
+) -> Result<(P, u64), String> {
+    let mut answer = None;
+    let asks = hex_testkit::waits::until(
+        &MEMBER_HANDED_OVER,
+        &format!("{id}'s member handed over"),
+        || {
+            answer = Some(match ask() {
+                Err(Refusal::Lifecycle {
+                    cause: LifecycleCause::Pending,
+                    ..
+                }) => match shown() {
+                    Ok((BoxState::Empty, exit, ended)) => Err(format!(
+                        "{id} ended before its member was handed over: {exit:?}, {ended:?}"
+                    )),
+                    Ok(_) => return false,
+                    Err(why) => Err(format!("{id}, its member pending: {why:?}")),
+                },
+                given => given.map_err(|why| format!("{id}'s member: {why:?}")),
+            });
+            true
+        },
+    )
+    .map_err(|waited| waited.to_string())?;
+    let given = answer.ok_or_else(|| format!("{id}'s member: no answer"))??;
+    Ok((given, asks))
+}
+
+/// The probe's report, asked on its stdin, as its caller drives it (`ShardsImage::members`): the probe handed over
+/// ([`handed_over`]), one line written, its answer read from its stdout up to the empty line that ends it. The read
+/// waits for the probe's answer with no deadline of its own; a probe that ends first ends its stdout, which refuses
+/// the read.
 fn asked_on_stdin(client: &Client, id: &BoxId, probe: &Probe) -> Report {
-    let mut member = client.member(id, &probe.member).unwrap();
+    let (mut member, asks) = handed_over(
+        id,
+        || client.member(id, &probe.member),
+        || {
+            client
+                .inspect(id)
+                .map(|shown| (shown.state, shown.exit, shown.ended))
+        },
+    )
+    .unwrap();
+    eprintln!("GRANTS-CHECK-2 {id}: its probe handed over at ask {asks}");
     let given = member.streams().unwrap();
     let mut stdin = hex_api::OwnedStream::from(given.stdin.unwrap());
     let stdout = hex_api::OwnedStream::from(given.stdout.unwrap());
@@ -980,6 +1032,57 @@ fn the_probe_answers_each_connection_with_its_targets_outcomes() {
     );
     // Its servers run on for the VM's life; this test's end ends them.
     drop(started.servers);
+}
+
+/// Joint plan step 15 (the hand-over, no VM; R03): do ask a hand-over of a fake that answers `Lifecycle { Pending }`
+/// twice, its box running, as a box settling does, then hands its member over. Expect it handed over at the third ask.
+/// Do ask one that answers Pending while its box has ended; expect the wait refused naming the box's end, its exit and
+/// its run's words (`BoxInfo.ended`). Do ask one that refuses otherwise; expect that refusal, at the first ask.
+#[test]
+fn a_members_hand_over_is_asked_again_while_its_box_settles() {
+    let id = BoxId::new("grants-handover").unwrap();
+    let pending = || Refusal::Lifecycle {
+        id: id.clone(),
+        cause: LifecycleCause::Pending,
+    };
+    let mut answers = vec![Err(pending()), Err(pending()), Ok("the probe")].into_iter();
+    let handed = handed_over(
+        &id,
+        || answers.next().unwrap(),
+        || Ok((BoxState::Running, None, None)),
+    );
+    assert_eq!(handed, Ok(("the probe", 3)));
+    let ended = handed_over(
+        &id,
+        || Err::<(), _>(pending()),
+        || {
+            Ok((
+                BoxState::Empty,
+                Some(Exit::Code(1)),
+                Some("its run host's words".to_owned()),
+            ))
+        },
+    );
+    assert!(
+        matches!(&ended, Err(why) if why.contains("ended")
+            && why.contains("Code(1)")
+            && why.contains("its run host's words")),
+        "{ended:?}"
+    );
+    let mut asked = 0;
+    let other = handed_over(
+        &id,
+        || {
+            asked += 1;
+            Err::<(), _>(Refusal::NotRunning(id.clone(), "member"))
+        },
+        || Ok((BoxState::Running, None, None)),
+    );
+    assert!(
+        matches!(&other, Err(why) if why.contains("NotRunning")),
+        "{other:?}"
+    );
+    assert_eq!(asked, 1);
 }
 
 /// Joint plan step 15, T-T7.7.1 (the probe, no VM): do ask the probe on its stdin, as its harness is asked where its

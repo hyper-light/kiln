@@ -28,7 +28,9 @@ use crate::store::Store;
 
 mod managed_preflight;
 mod run;
-pub use run::{Run, RunProc};
+#[cfg(all(debug_assertions, feature = "test-controls"))]
+pub use run::RemovalHold;
+pub use run::{Claimed, Run, RunProc, Said, Taken};
 
 /// What [`Refusal::Exhausted`] names the supervisor's budget: its pidfds, one for each live `oci` box's init and
 /// one for each run's program (decision 7), each box holding one at most.
@@ -274,6 +276,9 @@ pub struct Supervisor {
     /// reaped (decision 3); the caller's [`Proc`] usually reaps its program, but a delete beats it, so
     /// the agent reaps what is left and records each exit for the caller to read.
     programs: Mutex<BTreeMap<BoxId, Vec<Program>>>,
+    /// A debug build's hold on the runs' removals, armed by the node's caller alone ([`run::Removals`]).
+    #[cfg(all(debug_assertions, feature = "test-controls"))]
+    removals: run::Removals,
 }
 
 /// An exec'd program the agent may reap on its box's delete: the agent's own duplicate of its pidfd,
@@ -711,6 +716,8 @@ impl Supervisor {
             store,
             fault: Mutex::new(None),
             programs: Mutex::new(BTreeMap::new()),
+            #[cfg(all(debug_assertions, feature = "test-controls"))]
+            removals: run::Removals::default(),
         });
         let weak = Arc::downgrade(&supervisor);
         std::thread::Builder::new()
@@ -960,7 +967,14 @@ impl Supervisor {
     /// its namespace's first process doesn't finish until every process in the namespace is reaped
     /// (kernel/pid_namespace.c, `zap_pid_ns_processes`), so a program left to the sweep held the box for as long as
     /// [`SWEEP_PERIOD`] (the waits census's run 5: `oci_box`'s delete "326.645366ms after SIGKILL" in every loop).
-    pub fn reap_programs(&self, id: &BoxId, patience: Duration) -> Result<(), Refusal> {
+    /// Each program's end is waited for by `ended`, its caller's wait on a killed box's processes (the node's, decision
+    /// 9: it follows the box past its learned wait, and gives up only on a wedge), then the program reaped; one a
+    /// wedge holds is left, and the box's emptying reports it, as it does for any wedge.
+    pub fn reap_programs(
+        &self,
+        id: &BoxId,
+        ended: &mut dyn FnMut(BorrowedFd<'_>) -> Result<bool, Refusal>,
+    ) -> Result<(), Refusal> {
         let watched = self
             .programs
             .lock()
@@ -968,23 +982,8 @@ impl Supervisor {
             .remove(id)
             .unwrap_or_default();
         let mut owned = owned()?;
-        let deadline = Instant::now().checked_add(patience);
         for program in watched {
-            // Wait (bounded) for the cgroup.kill'd program to end, then reap it, so the container's init
-            // can finish its pid-namespace teardown. Bounded so a process wedged uninterruptibly doesn't
-            // hang the delete; wait_empty then reports the box still populated, as it does for any wedge.
-            let left = deadline
-                .map(|d| d.saturating_duration_since(Instant::now()))
-                .unwrap_or(patience);
-            let ts = Timespec {
-                tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
-                tv_nsec: i64::from(left.subsec_nanos()),
-            };
-            let mut fds = [PollFd::new(&program.pidfd, PollFlags::IN)];
-            match rustix::event::poll(&mut fds, Some(&ts)) {
-                Ok(_) | Err(Errno::INTR) => {}
-                Err(e) => return Err(Refusal::os("waiting on a deleted box's program", e)),
-            }
+            ended(program.pidfd.as_fd())?;
             reap_into(program.pidfd.as_fd(), &program.exit)?;
             owned.remove(&program.pid);
         }
@@ -1890,6 +1889,22 @@ impl Forgotten {
     }
 }
 
+/// Whether the process `pidfd` names has ended within `timeout` (`Duration::MAX`: until it does).
+pub fn pidfd_ends_within(pidfd: BorrowedFd<'_>, timeout: Duration) -> Result<bool, Refusal> {
+    let ts = Timespec {
+        tv_sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+        tv_nsec: i64::from(timeout.subsec_nanos()),
+    };
+    let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
+    loop {
+        match rustix::event::poll(&mut fds, Some(&ts)) {
+            Ok(n) => return Ok(n > 0),
+            Err(Errno::INTR) => {}
+            Err(e) => return Err(Refusal::os("waiting on a deleted box's program", e)),
+        }
+    }
+}
+
 /// Reaps a deleted box's init, which has ended since its box is empty, and disowns it. One the
 /// supervisor reaped already was disowned then.
 pub fn reap(init: &Forgotten) -> Result<(), Refusal> {
@@ -2272,7 +2287,9 @@ mod tests {
         let look = rustix::process::pidfd_open(pid, PidfdFlags::empty()).unwrap();
         rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
         supervisor
-            .reap_programs(&id, hex_testkit::waits::EMPTYING)
+            .reap_programs(&id, &mut |pidfd| {
+                pidfd_ends_within(pidfd, hex_testkit::waits::EMPTYING)
+            })
             .unwrap();
         assert_eq!(
             rustix::process::waitid(

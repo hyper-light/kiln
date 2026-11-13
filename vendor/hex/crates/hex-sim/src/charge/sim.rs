@@ -2,9 +2,11 @@
 //! hex-sim"): one node window by window, its VMs admitted, booked and shared by [`super::Node`] as a node's shell
 //! drives it, and what the rule gives them measured: density, fairness and the guarantee.
 //!
-//! A VM's use is an agent's, thinking while its harness waits on its model and bursting in tool calls, drawn per VM
-//! from the published agent studies' ranges ([`Agent::draw`]): the generator's input space, as `generate.rs`'s draws
-//! are, until ROOT's recorded Shards traces replace it. The kernel is modelled by what the rule gives it: CPU shared
+//! A VM's use is an agent's, thinking while its harness waits on its model and bursting in tool calls: a recorded
+//! session's, where the run is given traces (`Scenario::traces`, `bench/charge/record_trace.py`), each VM playing one
+//! in the order it started and ending once it has played, as hex-cli's `charge_fleet` replays them (item 3); else drawn
+//! per VM from the published agent studies' ranges ([`Agent::draw`]), the generator's input space, as `generate.rs`'s
+//! draws are. The kernel is modelled by what the rule gives it: CPU shared
 //! by water-filling on bookings ([`super::shares`], as `cpu.weight` shares it), memory held at its budget where the
 //! node holds it there (Linux's `memory.high`) and at its ceiling where nothing does yet (`Awaits(GuestRoom)`).
 
@@ -13,6 +15,7 @@ use std::time::Duration;
 
 use hex_api::CapacityResources as Amounts;
 
+use super::trace::{Played, Trace};
 use super::{Bounds, ChargeError, ClassKey, Cpu, Node, Resort, Sample};
 use crate::model::Class;
 use crate::rng::Rng;
@@ -132,8 +135,12 @@ pub struct Scenario {
     pub life: (u64, u64),
     /// Whether the node holds each VM's memory at its budget (Linux's `memory.high`).
     pub rooms: bool,
-    /// From window `at`, the `nth` VM to start asks for its whole ceiling; it lives the run out.
+    /// From window `at`, the `nth` VM to start asks for its whole ceiling; it lives the run out. One playing a trace
+    /// rises there or once its trace has played, whichever comes first, as the driver's riser does.
     pub riser: Option<(u64, usize)>,
+    /// Recorded traces its VMs replay (`super::trace`), the `n`th VM to start playing the `n`th, round the list, and
+    /// ending once it has played (its life its trace's, `life` unread); none, and every VM's use is drawn.
+    pub traces: Vec<Trace>,
 }
 
 /// What a run measured.
@@ -200,11 +207,31 @@ pub(super) fn jain(shares: &[u64]) -> u64 {
     u64::try_from(parts).unwrap_or(u64::MAX)
 }
 
-/// A VM in a run: its use, when it ends, and whether it is the riser.
+/// A VM's use in a run: drawn from an agent's ranges, or a recorded trace played.
+enum Uses {
+    Drawn(Use),
+    Played(Played),
+}
+
+/// A VM in a run: its use, when it ends, whether it is the riser, and when it rises.
 struct Live {
-    used: Use,
+    used: Uses,
     ends: u64,
     riser: bool,
+    rises_at: Option<u64>,
+}
+
+impl Live {
+    /// What it asks in window `at`, of its `ceiling`, over `window`: CPU in milli-CPU and memory in bytes.
+    fn ask(&mut self, rng: &mut Rng, at: u64, ceiling: Amounts, window: Duration) -> (u64, u64) {
+        match &mut self.used {
+            Uses::Drawn(used) => used.ask(rng, at, ceiling),
+            Uses::Played(_) if self.rises_at.is_some_and(|from| at >= from) => {
+                (ceiling.cpu_milli, ceiling.mem_bytes)
+            }
+            Uses::Played(played) => played.ask(window).unwrap_or((0, 0)),
+        }
+    }
 }
 
 /// Runs `s` and reports what it measured.
@@ -243,22 +270,52 @@ pub fn run(s: &Scenario) -> Result<Report, ChargeError> {
                 Ok(_) => {
                     line.pop_front();
                     let riser = s.riser.is_some_and(|(_, nth)| nth == started);
-                    let agent = Agent::draw(&mut rng, s.envelope, s.window);
-                    let drawn = rng.range(s.life.0, s.life.1);
-                    // The riser lives the run out, so it is there to rise.
-                    let (life, rises_at) = if riser {
-                        (s.windows, riser_rises)
-                    } else {
-                        (drawn, None)
+                    let traced = started
+                        .checked_rem(s.traces.len())
+                        .and_then(|n| s.traces.get(n));
+                    let vm = match traced {
+                        // Its trace's life: it is live the windows its trace lasts, ending in the last of them. The
+                        // riser lives the run out, so it is there to rise, rising once its trace has played if that
+                        // comes first.
+                        Some(trace) => {
+                            let played = Played::new(trace);
+                            let windows = played.windows(s.window);
+                            let (ends, rises_at) = if riser {
+                                let played_out = at.saturating_add(windows);
+                                (
+                                    s.windows,
+                                    Some(
+                                        riser_rises.map_or(played_out, |from| from.min(played_out)),
+                                    ),
+                                )
+                            } else {
+                                (at.saturating_add(windows.saturating_sub(1)), None)
+                            };
+                            Live {
+                                used: Uses::Played(played),
+                                ends,
+                                riser,
+                                rises_at,
+                            }
+                        }
+                        None => {
+                            let agent = Agent::draw(&mut rng, s.envelope, s.window);
+                            let drawn = rng.range(s.life.0, s.life.1);
+                            // The riser lives the run out, so it is there to rise.
+                            let (life, rises_at) = if riser {
+                                (s.windows, riser_rises)
+                            } else {
+                                (drawn, None)
+                            };
+                            Live {
+                                used: Uses::Drawn(Use::new(agent, rises_at)),
+                                ends: at.saturating_add(life),
+                                riser,
+                                rises_at,
+                            }
+                        }
                     };
-                    live.insert(
-                        id,
-                        Live {
-                            used: Use::new(agent, rises_at),
-                            ends: at.saturating_add(life),
-                            riser,
-                        },
-                    );
+                    live.insert(id, vm);
                     started = started.saturating_add(1);
                     report.admitted = report.admitted.saturating_add(1);
                     refused_at = None;
@@ -267,7 +324,7 @@ pub fn run(s: &Scenario) -> Result<Report, ChargeError> {
                     report.refused = report.refused.saturating_add(1);
                     let rising = live
                         .values()
-                        .any(|vm| vm.riser && riser_rises.is_some_and(|from| at >= from));
+                        .any(|vm| vm.riser && vm.rises_at.is_some_and(|from| at >= from));
                     if rising {
                         report.refused_while_rising = report.refused_while_rising.saturating_add(1);
                     }
@@ -291,7 +348,7 @@ pub fn run(s: &Scenario) -> Result<Report, ChargeError> {
         let mut asks: BTreeMap<u32, u64> = BTreeMap::new();
         let mut memory: BTreeMap<u32, u64> = BTreeMap::new();
         for (id, vm) in &mut live {
-            let (cpu, mem) = vm.used.ask(&mut rng, at, s.envelope);
+            let (cpu, mem) = vm.ask(&mut rng, at, s.envelope, s.window);
             asks.insert(*id, cpu.min(s.envelope.cpu_milli));
             memory.insert(*id, mem.min(s.envelope.mem_bytes));
         }
@@ -305,6 +362,9 @@ pub fn run(s: &Scenario) -> Result<Report, ChargeError> {
             .fold(0u64, u64::saturating_add)
             <= s.capacity.cpu_milli;
         let given = node.shares(s.capacity.cpu_milli, &asks)?;
+        let rising = live
+            .values()
+            .any(|vm| vm.riser && vm.rises_at.is_some_and(|from| at >= from));
         let asked: u64 = asks.values().fold(0, |a, b| a.saturating_add(*b));
         let contended = asked > s.capacity.cpu_milli;
         let mut fractions = Vec::new();
@@ -318,7 +378,7 @@ pub fn run(s: &Scenario) -> Result<Report, ChargeError> {
                 report.guarantee_misses = report.guarantee_misses.saturating_add(1);
             }
             let riser = live.get(id).is_some_and(|vm| vm.riser);
-            if short && !riser && riser_rises.is_some_and(|from| at >= from) {
+            if short && !riser && rising {
                 report.neighbours_short = report.neighbours_short.saturating_add(1);
             }
             if contended && ask > 0 {

@@ -307,6 +307,21 @@ pub struct ShardsImage {
     /// as it declares them, their stdin the null device. After the grants (append-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<ImageMember>,
+    /// The host directories its guest sees (Shards' D231 shares, as `shards run -v HOST:AT[:ro]` gives one; kiln's
+    /// step 18: a person's home volumes, and a project at its host path, D235): each a `Mount`, its `source` the host
+    /// directory, absolute on the host its node runs on, its `destination` where the guest sees it, absolute, and
+    /// `read_only` whether the guest may write it. A member gets one where its image's `VOLUME` at that path is for it
+    /// (Shards' D109), the run's own command where no `VOLUME` declares it. None by default: the guest sees only the
+    /// shares named here, the image's own grants widening none. After the members (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shares: Vec<Mount>,
+    /// Its members' credentials, granted by reference (Shards' D242; joint plan step 33; docs/design/credential-grants.md):
+    /// each a credential its orchestrator's store names, never its value, which its member's requests to the hosts its
+    /// grant names alone may have filled in at the VM's egress, leased as they first need it ([`crate::lease`]). None by
+    /// default: nothing is filled in toward any host. The orchestrator keeps or drops them, and Hex adds none. After the
+    /// shares (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<crate::CredentialGrant>,
 }
 
 /// A member of a Shards image its caller drives ([`ShardsImage::members`]): which one, by the kind and name
@@ -321,21 +336,30 @@ pub struct ImageMember {
     /// its image's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+    /// Its run-time arguments (Shards' D256, `MemberSpec::args`; kiln's step 17), in their order: its command line
+    /// is its image's command for it (its startup descriptor's), then these, as a harness takes its session's own
+    /// flags (Claude Code's `--resume`, `--model`) on the host. None: its image's command alone. No argument holds a
+    /// NUL. A command line is no secret, read by whatever sees the member's processes: a credential goes in `env`.
+    /// After the working directory (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }
 
 impl ImageMember {
-    /// `member`, given nothing over its image's, in its image's working directory.
+    /// `member`, given nothing over its image's, in its image's working directory, its image's command alone.
     pub fn new(member: crate::Member) -> Self {
         Self {
             member,
             env: Vec::new(),
             workdir: None,
+            args: Vec::new(),
         }
     }
 
     /// Whether Shards can be asked to start it: its name as a grant's member's is checked, its variables as
-    /// an exec's (no empty key, no `=` in a key, no NUL), and its working directory absolute and plain (no
-    /// empty, `.` or `..` component, no NUL), as D231's `MemberSpec::workdir` takes one.
+    /// an exec's (no empty key, no `=` in a key, no NUL), its working directory absolute and plain (no
+    /// empty, `.` or `..` component, no NUL), as D231's `MemberSpec::workdir` takes one, and no run-time
+    /// argument holding a NUL, which no command line exec'd holds (D256), told by its place, never its bytes.
     fn check(&self, at: usize) -> Result<(), Refusal> {
         self.member
             .check_named(&format!("members[{at}].member"))
@@ -364,18 +388,25 @@ impl ImageMember {
                 )));
             }
         }
+        if let Some(i) = self.args.iter().position(|a| a.contains('\0')) {
+            return Err(invalid_image(format!(
+                "members[{at}].args[{i}] holds a NUL, which no command line holds"
+            )));
+        }
         Ok(())
     }
 }
 
 impl ShardsImage {
-    /// The image `image` (pinned by digest), its members alone, granted nothing.
+    /// The image `image` (pinned by digest), its members alone, granted and shared nothing.
     pub fn new(image: &str) -> Self {
         Self {
             image: image.to_owned(),
             command: None,
             grants: Vec::new(),
             members: Vec::new(),
+            shares: Vec::new(),
+            credentials: Vec::new(),
         }
     }
 
@@ -385,7 +416,8 @@ impl ShardsImage {
     /// grants [`crate::check_grants`] takes, and members its caller drives each named once and checked as
     /// [`ImageMember`] checks one. Refused by its field's name (CLAUDE.md §3); the rest of
     /// the name's grammar is Shards' to refuse as it resolves the image, and a grant Shards can't hold
-    /// exactly is the runtime's to refuse as it programs the boot.
+    /// exactly is the runtime's to refuse as it programs the boot. Its credentials, last, as
+    /// [`crate::check_credentials`] takes them over its grants (refused naming `credentials`).
     pub fn check(&self) -> Result<(), Refusal> {
         let (name, digest) = self.image.rsplit_once('@').ok_or_else(|| {
             invalid_image(format!(
@@ -451,7 +483,37 @@ impl ShardsImage {
                 )));
             }
         }
-        Ok(())
+        // Each share as a mount's paths are checked (its host directory absolute and UTF-8 with no NUL, where the guest
+        // sees it absolute with no `..`), never at the guest's root, which it would hide, and each path seen once.
+        for (at, share) in self.shares.iter().enumerate() {
+            let as_image = |e: Refusal| match e {
+                Refusal::Invalid { why, .. } => invalid_image(why),
+                other => other,
+            };
+            host_path(&format!("shares[{at}].source"), &share.source).map_err(as_image)?;
+            let field = format!("shares[{at}].destination");
+            container_path(&field, &share.destination).map_err(as_image)?;
+            if path_parts(&share.destination).all(|part| part.is_empty() || part == ".") {
+                return Err(invalid_image(format!(
+                    "{field} is the guest's root, which a share would hide"
+                )));
+            }
+            if self
+                .shares
+                .get(..at)
+                .unwrap_or_default()
+                .iter()
+                .any(|s| s.destination == share.destination)
+            {
+                return Err(invalid_image(format!(
+                    "{field} {:?} is another share's too",
+                    share.destination
+                )));
+            }
+        }
+        // Its credentials, each one that could be filled in exactly as it says over the grants just taken (joint plan
+        // step 33, docs/design/credential-grants.md C2).
+        crate::check_credentials(&self.credentials, &self.grants)
     }
 }
 
@@ -1264,8 +1326,9 @@ mod tests {
 
     /// AC-T7.4.1 (joint plan step 17): do check an image VM naming the members its caller drives, a harness with a
     /// variable and a working directory and an agent with neither; expect it passes. Do name a member twice, give
-    /// one a key with `=`, a value with a NUL, a relative, `..` or empty-component directory, and a name Shards'
-    /// parser refuses; expect each refused as Invalid, naming the member's field.
+    /// one a key with `=`, a value with a NUL, a relative, `..` or empty-component directory, a run-time argument
+    /// holding a NUL (D256), and a name Shards' parser refuses; expect each refused as Invalid, naming the member's
+    /// field, an argument by its place and never its bytes.
     #[test]
     fn the_members_an_image_vms_caller_drives_are_named_once_and_checked() {
         let harness = crate::Member {
@@ -1276,6 +1339,11 @@ mod tests {
             member: harness.clone(),
             env: vec![("TZ".to_owned(), "UTC".to_owned())],
             workdir: Some("/home/me/project".to_owned()),
+            args: vec![
+                "--model".to_owned(),
+                String::new(),
+                "claude-opus-4".to_owned(),
+            ],
         };
         let agent = ImageMember::new(crate::Member {
             kind: crate::MemberKind::Agent,
@@ -1310,6 +1378,20 @@ mod tests {
             ..driven.clone()
         };
         assert!(refused(bad_value).1.contains("members[0].env"));
+        let bad_arg = ImageMember {
+            args: vec!["--resume".to_owned(), "s-1\0--model".to_owned()],
+            ..driven.clone()
+        };
+        let (what, why) = refused(bad_arg);
+        assert_eq!(
+            (
+                what,
+                why.contains("members[0].args[1]"),
+                why.contains("s-1")
+            ),
+            ("shards image", true, false),
+            "{why}"
+        );
         for dir in [
             "relative/dir",
             "/home/../etc",
@@ -1328,6 +1410,69 @@ mod tests {
             name: "Claude".to_owned(),
         });
         assert!(refused(bad_name).1.contains("members[0].member.name"));
+    }
+
+    /// Joint plan step 12 for kiln's step 18 (AC-T7.4.1): the host directories an image VM's guest sees, each a share
+    /// as Shards takes one (its host directory, where the guest sees it, read-only or not). Do check a VM sharing a
+    /// home volume read-write and a project read-only, and one sharing none; then a share whose host directory is
+    /// relative or holds a NUL, one the guest sees at a relative path, at its root or through `..`, and two the guest
+    /// sees at one path. Expect the first two to pass and read back whole from JSON, none left out of it when there
+    /// are none; each other refused as Invalid naming the share's field, by its place.
+    #[test]
+    fn w12_an_image_vms_shares_are_checked_by_field() {
+        let share = |source: &str, destination: &str, read_only: bool| Mount {
+            source: PathBuf::from(source),
+            destination: destination.to_owned(),
+            read_only,
+        };
+        let home = share(
+            "/var/lib/kiln/homes/ada/.claude",
+            "/home/agent/.claude",
+            false,
+        );
+        let project = share("/srv/projects/hex", "/work/hex", true);
+        let with = |shares: Vec<Mount>| ShardsImage {
+            shares,
+            ..ShardsImage::new(crate::sim::SIM_IMAGE)
+        };
+        let shared = with(vec![home.clone(), project.clone()]);
+        shared.check().unwrap();
+        let json = serde_json::to_value(&shared).unwrap();
+        assert_eq!(serde_json::from_value::<ShardsImage>(json).unwrap(), shared);
+        let none = with(Vec::new());
+        none.check().unwrap();
+        assert!(serde_json::to_value(&none).unwrap().get("shares").is_none());
+        let refused = |shares: Vec<Mount>| match with(shares).check() {
+            Err(Refusal::Invalid { what, why }) => (what, why),
+            other => panic!("not refused as Invalid: {other:?}"),
+        };
+        for (bad, field) in [
+            (
+                share("relative/home", "/home/agent", false),
+                "shares[1].source",
+            ),
+            (share("/srv/a\0b", "/home/agent", false), "shares[1].source"),
+            (
+                share("/srv/home", "home/agent", false),
+                "shares[1].destination",
+            ),
+            (share("/srv/home", "/", false), "shares[1].destination"),
+            (
+                share("/srv/home", "/home/../etc", false),
+                "shares[1].destination",
+            ),
+            (
+                share("/srv/other", "/work/hex", false),
+                "shares[1].destination",
+            ),
+        ] {
+            let (what, why) = refused(vec![project.clone(), bad.clone()]);
+            assert_eq!(
+                (what, why.contains(field)),
+                ("shards image", true),
+                "{bad:?}: {why}"
+            );
+        }
     }
 
     /// AC-T7.4.1 (joint plan step 12): a Shards image VM of class Shards, its image pinned by a digest

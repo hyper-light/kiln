@@ -42,7 +42,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
-use std::time::Duration;
 
 use hex_api::{BoxId, Refusal};
 use hex_core::patience::Patience;
@@ -216,22 +215,19 @@ impl Store {
             disk_fd: Arc::new(open_directory(disk)?),
             #[cfg(target_os = "linux")]
             run_fd: Arc::new(open_directory(run)?),
-            // A change waits for the change of the same box before it: that one's write and its fsyncs.
-            // How long is learned from the changes made (decision 9), so a disk that has stopped answering is
-            // reported as a fault, refused by type, never waited on for ever (CLAUDE.md §4): a record write has
-            // no other path. Seeded by build profile from the `store.turns` rows of
-            // `bench/competitive/probes/waits_census.md`: release, run 4's largest max of the release arms, 3.136 ms
-            // (adacachy2, its tmpfs arm, of 138,598); debug, run 5's largest answer of the debug-build arms, the debug
-            // arm and the suites' (adacachy2), 367.733 ms (the suites', of 4,109,178).
+            // A change waits for the change of the same box before it: that one's write and its fsyncs, made by
+            // this process's own thread. The slowest hold is learned from the changes made (decision 9); a hold
+            // past it is a run-out, told to the census, and the wait follows the holder until it lets go, as before
+            // the first change is let go: a live holder is waited for, so changes of one box made at once all land
+            // (HEX-SOCK-6). A disk that has stopped answering holds its writer in the kernel; refusing that wait,
+            // typed, takes the hold's progress, owed (`docs/research/runtime/learned-waits.md`'s sites). No record
+            // is read (the `store.turns` rows of `bench/competitive/probes/waits_census.md` are evidence, never a
+            // seed).
             turns: Arc::new(Turns::new(
                 "changing a box's record",
                 "record changes under way",
                 TURNS,
-                Patience::by_profile(
-                    "store.turns",
-                    Duration::from_nanos(3_135_674),
-                    Some(Duration::from_nanos(367_732_601)),
-                ),
+                Patience::measuring("store.turns"),
             )),
             synced: Arc::default(),
             #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -252,8 +248,8 @@ impl Store {
     }
 
     /// Box `id`'s turn to change its record: waits for a change of the same box under way, never for
-    /// another box's, and refuses past the wait the store's changes taught it, or past [`TURNS`] boxes
-    /// changed at once.
+    /// another box's, bounded by the slowest hold the store's changes taught it and following the holder
+    /// past it ([`Turns::take`]); refused past [`TURNS`] boxes changed at once.
     fn claim(&self, id: &BoxId) -> Result<Turn<'_>, Refusal> {
         self.turns.take(id)
     }
@@ -439,6 +435,27 @@ impl Store {
         let slot = lifecycle_fact(current.slot, record.slot, introducing, &record.spec.id)?;
         let run = lifecycle_fact(current.run, record.run, introducing, &record.spec.id)?;
         let exit = lifecycle_fact(current.exit, record.exit, true, &record.spec.id)?;
+        // A run's words where it failed (D249) and how its microVM started (D253) are facts as its exit is, a Shards
+        // image VM's written through here (joint plan step 12).
+        let ended = lifecycle_fact(
+            current.ended.take(),
+            record.ended.clone(),
+            true,
+            &record.spec.id,
+        )?;
+        let started_from = lifecycle_fact(
+            current.started_from,
+            record.started_from,
+            true,
+            &record.spec.id,
+        )?;
+        // The file its run host's diagnostics are kept in (D258), named with its start's intent alone.
+        let diagnostics = lifecycle_fact(
+            current.diagnostics.take(),
+            record.diagnostics.clone(),
+            introducing,
+            &record.spec.id,
+        )?;
         // Scope is introduced only by write_fresh before the first canonical publication. An old
         // legacy row can never gain authority over an already-alive native scope by an update.
         let native_scope = lifecycle_fact(
@@ -452,6 +469,9 @@ impl Store {
         current.slot = slot;
         current.run = run;
         current.exit = exit;
+        current.ended = ended;
+        current.started_from = started_from;
+        current.diagnostics = diagnostics;
         current.native_scope = native_scope;
         // Both writers count monotonically: publishing a backend completion cannot discard a
         // disconnect counted by the existing socket owner while native I/O was in flight.
@@ -1040,7 +1060,7 @@ fn fresh_scope() -> Result<hex_core::record::NativeScope, Refusal> {
 }
 
 /// A stale absence preserves an observed fact; two different positive facts are uncertainty.
-fn lifecycle_fact<T: Copy + PartialEq>(
+fn lifecycle_fact<T: PartialEq>(
     current: Option<T>,
     proposed: Option<T>,
     introducing: bool,
@@ -1358,6 +1378,117 @@ mod tests {
         assert!(store.read_lifecycle(&original.spec.id).unwrap().is_none());
     }
 
+    /// Joint plan step 12 (AC-T7.4.1): the VM adapters' lifecycle writes keep how a box's run ended, in its runtime's
+    /// words (D249, `BoxRecord::ended`), and how its microVM started (D253, `BoxRecord::started_from`), as they keep its
+    /// exit: a Shards image VM writes both through them. Do write a Ready record, then it with how its microVM started,
+    /// then with its exit and its run's words, then as a writer that read it before either; then other words, and
+    /// another start. Expect each fact kept as written, a stale writer's absence keeping it, and another value refused
+    /// as uncertain, the record as it was.
+    #[test]
+    fn w12_lifecycle_writes_keep_a_runs_words_and_how_its_vm_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let mut stale = record("image-words");
+        stale.phase = Phase::Creating;
+        store.put_lifecycle(&stale).unwrap();
+        stale.phase = Phase::Ready;
+        store.put_lifecycle(&stale).unwrap();
+        let started = BoxRecord {
+            started_from: Some(hex_api::StartedFrom::Restored),
+            ..stale.clone()
+        };
+        store.put_lifecycle(&started).unwrap();
+        let words = "its VM failed: the guest's kernel panicked";
+        let ended = BoxRecord {
+            exit: Some(hex_api::Exit::Unknown),
+            ended: Some(words.to_owned()),
+            ..started.clone()
+        };
+        store.put_lifecycle(&ended).unwrap();
+        let read = || store.read_lifecycle(&stale.spec.id).unwrap().unwrap();
+        let kept = read();
+        assert_eq!(
+            (kept.started_from, kept.exit, kept.ended.as_deref()),
+            (
+                Some(hex_api::StartedFrom::Restored),
+                Some(hex_api::Exit::Unknown),
+                Some(words)
+            )
+        );
+        store.put_lifecycle(&stale).unwrap();
+        assert_eq!(read(), kept, "a stale writer's absence keeps both");
+        let other_words = BoxRecord {
+            ended: Some("other words".to_owned()),
+            ..ended.clone()
+        };
+        assert!(store.put_lifecycle(&other_words).is_err());
+        let other_start = BoxRecord {
+            started_from: Some(hex_api::StartedFrom::Booted),
+            ..ended.clone()
+        };
+        assert!(store.put_lifecycle(&other_start).is_err());
+        assert_eq!(read(), kept);
+    }
+
+    /// Joint plan step 12 (D258; AC-T7.4.1): a Shards image VM's record names the file its run host's diagnostics are
+    /// kept in as its start's intent is written (its record's step from Creating to Ready), and the VM adapters' later
+    /// writes keep it. Do write a Creating record, then it Ready naming its file; then as a writer that read it before,
+    /// then naming another file; then another box's Ready record naming one after its start. Expect the file kept as
+    /// named, a stale writer's absence keeping it, and another file refused as uncertain, as is one named past a start.
+    #[test]
+    fn w12_lifecycle_writes_keep_the_file_a_vms_start_names_for_its_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let mut created = record("image-diagnostics");
+        created.phase = Phase::Creating;
+        store.put_lifecycle(&created).unwrap();
+        let file = dir
+            .path()
+            .join("image-diagnostics")
+            .join("image-diagnostics.log");
+        let started = BoxRecord {
+            phase: Phase::Ready,
+            diagnostics: Some(file.clone()),
+            ..created.clone()
+        };
+        store.put_lifecycle(&started).unwrap();
+        let named = |id: &str| {
+            store
+                .read_lifecycle(&BoxId::new(id).unwrap())
+                .unwrap()
+                .unwrap()
+                .diagnostics
+        };
+        assert_eq!(named("image-diagnostics"), Some(file.clone()));
+        let stale = BoxRecord {
+            phase: Phase::Ready,
+            ..created.clone()
+        };
+        store.put_lifecycle(&stale).unwrap();
+        assert_eq!(
+            named("image-diagnostics"),
+            Some(file.clone()),
+            "a stale writer's absence keeps it"
+        );
+        let other = BoxRecord {
+            diagnostics: Some(file.with_file_name("other.log")),
+            ..started.clone()
+        };
+        assert!(store.put_lifecycle(&other).is_err());
+        let mut late = record("image-late");
+        late.phase = Phase::Creating;
+        store.put_lifecycle(&late).unwrap();
+        late.phase = Phase::Ready;
+        store.put_lifecycle(&late).unwrap();
+        let named_late = BoxRecord {
+            diagnostics: Some(file.with_file_name("image-late.log")),
+            ..late.clone()
+        };
+        assert!(store.put_lifecycle(&named_late).is_err());
+        assert_eq!(named("image-late"), None);
+        assert_eq!(named("image-diagnostics"), Some(file));
+    }
+
     /// The names of the records in the runtime record directory `run`'s shards, sorted.
     fn sharded(run: &Path) -> Vec<String> {
         let mut out: Vec<String> = (0..=SHARD_MASK)
@@ -1486,14 +1617,13 @@ mod tests {
     /// Goal 5 plan step 2: writes of two boxes never wait on each other; two of one box do. While one
     /// box's turn is held, as its write holds it across the fsyncs, 31 other boxes' records are written
     /// from 31 threads at once, none of them waiting; a second write of the held box waits, its record
-    /// not written, until the turn is let go, and then is. Every wait here is a write's, bounded by twice the
+    /// not written, until the turn is let go, and then is. Every wait here is a write's, bounded by the
     /// `store.turns` record (hex_testkit::waits::STORE_TURN, the store's own bound in this build): each other box's
     /// write is answered within it; and the held box's turn is taken again just before its second write, so the hold
-    /// that write waits on is that write's own wait starting, within the record, never the test's whole first half
-    /// (decision 9: a hold past twice the slowest recorded is a fault the store refuses).
+    /// that write waits on is that write's own wait starting, within the record, never the test's whole first half.
     #[test]
     fn writes_of_two_boxes_never_wait_on_each_other_and_of_one_box_do() {
-        let write = STORE_TURN.saturating_mul(2);
+        let write = STORE_TURN;
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(dir.path());
         let held = record("held");

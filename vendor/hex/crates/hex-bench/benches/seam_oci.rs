@@ -1295,13 +1295,12 @@ mod linux {
     fn seeds_rise(before: seeds::Counts, after: seeds::Counts) -> Value {
         json!({"asked": after.asked - before.asked,
                "waited": after.waited - before.waited,
-               "refused": (after.refused_busy + after.refused_waited + after.refused_died + after.refused_hung)
-                   - (before.refused_busy + before.refused_waited + before.refused_died + before.refused_hung),
+               "refused": (after.refused_busy + after.refused_waited + after.refused_died)
+                   - (before.refused_busy + before.refused_waited + before.refused_died),
                "started": after.started - before.started,
                "restarted": after.restarted - before.restarted,
                "start_failed": after.start_failed - before.start_failed,
                "died": after.died - before.died,
-               "hung": after.hung - before.hung,
                "most_busy": after.most_busy})
     }
 

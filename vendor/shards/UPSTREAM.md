@@ -3,12 +3,13 @@
 The microVMs kiln's harnesses run in (`docs/shards.md`; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16), at
 the one Shards revision kiln and Hex build on.
 
-- **Upstream:** https://github.com/hyper-light/shards, commit `1389dc0b60c92d33b3897af6d08690d7a459bba0`
-  (2026-11-12), MIT (`LICENSE`): its `main`, the one revision kiln's copy of Hex pins too (Hex `025aae6d`, which
-  makes no change to Shards). Beside what `e82b9403` had (D237's `shards` built to be carried, `shards-afunix`'s
-  fix of a read that slept through its peer's end, PM M536), it has the two changes Hex had made to its image API:
-  each member's reach of the destinations kept (D246) and the run host started holding its three standard
-  streams alone (D248).
+- **Upstream:** https://github.com/hyper-light/shards, commit `740fa37268c9200616f6fd543d96625953e23b81`
+  (2026-11-13), MIT (`LICENSE`): its `main`, the one revision kiln's copy of Hex pins too (Hex `c7603b0b`, which
+  makes no change to Shards). Since `1389dc0b6` it has a member's run-time arguments (D256), and Hex's image
+  class drives its agent-control link's client (`shards-remote`, whose QUIC is kiln's hyper-raft's). Beside
+  what `e82b9403` had (D237's `shards` built to be carried, `shards-afunix`'s fix of a read that slept through its
+  peer's end, PM M536), it has each member's reach of the destinations kept (D246) and the run host started
+  holding its three standard streams alone (D248).
 - **How kiln uses it:**
   - its Agentfile parser and build checks, `shards-agentfile`, linked: every Agentfile kiln keeps is checked in
     kiln's own process (`crates/kiln/src/agentfiles/check.rs`);

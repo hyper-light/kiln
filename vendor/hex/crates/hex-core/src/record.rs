@@ -73,6 +73,29 @@ pub struct BoxRecord {
     /// agent, reads as `None` (append-only) until its store counts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started: Option<u64>,
+    /// Why its run ended where it failed, in its runtime's words ([`hex_api::BoxInfo::ended`]; joint plan step 12),
+    /// which its inspect reports across the node's restarts. Outside the spec, so no native commitment covers it. Added
+    /// within version 1, so a record without it reads as `None` (append-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<String>,
+    /// Its backing was retired at its node's start, its identity no longer its node's profile's (joint plan step 14;
+    /// `hex_api::LifecycleCause::Retired`): the box is kept, ready, until its owner's delete, every other call refused
+    /// with why. Outside the spec, so no native commitment covers it. Added within version 1, so a record without it
+    /// reads as not retired (append-only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retired: bool,
+    /// How its Shards image VM's microVM started (D253; joint plan step 12), as its run host said it as the run started
+    /// ([`hex_api::Usage::started_from`]), kept across the node's restarts so Hex can say how the box came up. Outside the
+    /// spec, so no native commitment covers it. Added within version 1, so a record without it reads as `None`
+    /// (append-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_from: Option<hex_api::StartedFrom>,
+    /// The file its Shards image VM's run host's diagnostics are kept in, whole (D258's `keep_diagnostics`; joint plan
+    /// step 12), named as its start's intent is written, before its boot: a failed run's `ended` quotes its last bytes,
+    /// and it goes with the box's delete. Outside the spec, so no native commitment covers it. Added within version 1,
+    /// so a record without it reads as `None` (append-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<PathBuf>,
 }
 
 /// The host's boot session as its kernel names it, a new one each boot: Linux's
@@ -170,6 +193,52 @@ pub struct ProcId {
 }
 
 impl BoxRecord {
+    /// Marks the box retired with its backing (joint plan step 14, `hex_api::LifecycleCause::Retired`): kept, ready, its
+    /// end unknown where none was read, and why in its `ended`, the cause's own words, until its owner's delete.
+    pub fn retire(&mut self) {
+        self.phase = Phase::Ready;
+        self.exit.get_or_insert(Exit::Unknown);
+        self.retired = true;
+        self.ended = Some(hex_api::LifecycleCause::Retired.to_string());
+    }
+
+    /// What every call on a retired box but its inspect and its delete answers: its backing's refusal, `Retired`.
+    pub fn retired_refusal(&self) -> Result<Refusal, Refusal> {
+        Ok(match self.spec.route.and_then(|route| route.backing) {
+            Some(key) => Refusal::Backing {
+                key,
+                cause: hex_api::LifecycleCause::Retired,
+            },
+            None => Refusal::Lifecycle {
+                id: self.spec.id.try_clone()?,
+                cause: hex_api::LifecycleCause::Retired,
+            },
+        })
+    }
+
+    /// What a retired box's inspect shows, from its record alone, with no backing left to ask: nothing running, its
+    /// end, and why in its `ended`.
+    pub fn retired_info(&self) -> Result<hex_api::BoxInfo, Refusal> {
+        let spec = &self.spec;
+        Ok(hex_api::BoxInfo {
+            id: spec.id.try_clone()?,
+            class: spec.class.class(),
+            state: hex_api::BoxState::Empty,
+            bounds: spec.bounds.clone(),
+            allocation: spec.allocation,
+            adopted: false,
+            membership: None,
+            exit: self.exit,
+            abandoned: self.abandoned,
+            route: spec.route,
+            grants: Vec::new(),
+            published: Vec::new(),
+            last_resort: None,
+            ended: self.ended.clone(),
+            credentials: Vec::new(),
+        })
+    }
+
     /// The native keeper commits to the immutable scope and original workload/admission receipt.
     /// Mutable lifecycle/accounting fields do not change that cleanup identity.
     pub fn native_commitment(&self) -> Result<[u8; 32], Refusal> {
@@ -194,6 +263,10 @@ impl BoxRecord {
             boot: None,
             last_resort: None,
             started: None,
+            ended: None,
+            retired: false,
+            started_from: None,
+            diagnostics: None,
         }
     }
 

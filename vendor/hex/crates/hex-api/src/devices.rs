@@ -927,6 +927,7 @@ mod unavailable_tests {
             generation: [3; 16],
         };
         let mut backing = BackingOffer {
+            guest: Default::default(),
             key,
             cost,
             phase: BackingPhase::Prepared,
@@ -987,6 +988,7 @@ mod unavailable_tests {
             backing: Some(other),
         };
         let warm = BackingOffer {
+            guest: Default::default(),
             key: other,
             cost,
             phase: BackingPhase::Live,

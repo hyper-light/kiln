@@ -15,11 +15,13 @@ use hex_core::patience::Patience;
 use hex_sim::index::Pick;
 use hex_sim::model::{Class, NodeId, NodeSpec};
 use hex_sim::peer::{Budget, Msg};
+use hex_testkit::waits::follow::{self, Party};
 
 use super::tests::{cpu, demand_of, four_cpus, holding, quiesce, started, talk};
 use crate::placement::{Driver, Envelope, Notice, Runtimes, Step};
 
-// No recorded operation makes these facts: each is waited for measuring, for the fact alone (hex_testkit::waits).
+// No recorded operation makes these facts: each is waited for measuring, following the thread that makes it by its life
+// alone (decision 9), so past the slowest answer seen the wait goes on, and ends with the fact or that thread's end.
 static PARKED: Patience = Patience::measuring("test.hex_node.capacity_race.parked");
 static LET_ON: Patience = Patience::measuring("test.hex_node.capacity_race.let_on");
 static ENDED: Patience = Patience::measuring("test.hex_node.capacity_race.ended");
@@ -43,9 +45,13 @@ impl Runtime for Gated {
     fn classes(&self) -> Vec<hex_api::Class> {
         if self.gate.armed.swap(false, Ordering::SeqCst) {
             self.gate.parked.store(true, Ordering::SeqCst);
-            hex_testkit::waits::until(&LET_ON, "the test's word to go on", || {
-                self.gate.open.load(Ordering::SeqCst)
-            })
+            // The test's thread gives the word once its own word on the view is said.
+            follow::until(
+                &LET_ON,
+                "the test's word to go on",
+                || Party::Live,
+                || self.gate.open.load(Ordering::SeqCst),
+            )
             .unwrap();
         }
         self.inner.classes()
@@ -132,13 +138,26 @@ fn raced(driver: &Arc<Driver>, gate: &Gate, start: Envelope, word: impl FnOnce()
         let driver = Arc::clone(driver);
         std::thread::spawn(move || driver.hear(NodeId(0), start))
     };
-    hex_testkit::waits::until(&PARKED, "the admission at its backend's check", || {
-        gate.parked.load(Ordering::SeqCst)
-    })
+    let admitting = || {
+        if admission.is_finished() {
+            Party::Ended
+        } else {
+            Party::Live
+        }
+    };
+    follow::until(
+        &PARKED,
+        "the admission at its backend's check",
+        admitting,
+        || gate.parked.load(Ordering::SeqCst),
+    )
     .unwrap();
     word();
     gate.open.store(true, Ordering::SeqCst);
-    hex_testkit::waits::until(&ENDED, "the admission's end", || admission.is_finished()).unwrap();
+    follow::until(&ENDED, "the admission's end", admitting, || {
+        admission.is_finished()
+    })
+    .unwrap();
     let step = admission.join().unwrap().unwrap();
     quiesce(driver, step)
 }

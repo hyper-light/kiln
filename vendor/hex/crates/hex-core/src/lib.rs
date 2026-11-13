@@ -45,7 +45,7 @@ pub mod limits;
 mod meet;
 pub mod netns;
 pub mod netns_reuse;
-pub mod patience;
+pub use hex_api::patience;
 pub mod pool;
 pub mod record;
 pub mod recovery;

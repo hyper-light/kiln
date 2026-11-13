@@ -33,7 +33,7 @@ own = ["UPSTREAM.md"]
 [projects.hyper-raft]
 kind = "git"
 repository = "https://github.com/hyper-light/hyper-raft"
-commit = "fb74b59533908472ade7e526eb08117601cede0e"
+commit = "045cf3ff82e1d96d1f8c339d6e644d17afc998a3"
 path = "vendor/hyper-raft"
 take = [
     "Cargo.toml",
@@ -105,17 +105,17 @@ own = ["UPSTREAM.md"]
 
 # Shards' public API (shards-api: the direct boot D215, launches through a client's native owner D233, GPU
 # selection by exact identity D232, and images booted under shards-init for an orchestrator D231, with D234's
-# nesting grant, D235's plugs, D236's destinations and a member's stdin), its ABI,
-# AF_UNIX transport and test-directory crates, at a Shards main. Every patch Hex carried before is upstream; Hex's
-# changes since, each offered upstream, are vendor/patches/shards (vendor/shards/UPSTREAM.md): D231's run host
-# started holding its three standard streams alone, and each member's reach of the destinations kept named in an
-# image's boot request (D236). The take list holds the fixtures the API's tests include.
+# nesting grant and its GPUs, D235's plugs, D236's destinations, a member's stdin, and D251/D252's agent-control
+# endpoint, whose controller is shards-remote's), its ABI, IPC, DNS-name, remote-control, AF_UNIX transport and
+# test-directory crates, at a Shards main. Every change Hex carried before is upstream (vendor/shards/UPSTREAM.md).
+# shards-remote takes hyper-quic from hyper-raft by git upstream; Hex's workspace and vendor/shards' scaffold patch it
+# to the one vendored copy (vendor/hyper-raft). The take list holds the fixtures the API's tests include.
 [projects.shards]
 kind = "git"
 repository = "https://github.com/hyper-light/shards"
-commit = "1389dc0b60c92d33b3897af6d08690d7a459bba0"
+commit = "740fa37268c9200616f6fd543d96625953e23b81"
 path = "vendor/shards"
-take = ["LICENSE", "AGENTS.md", "CLAUDE.md", "clippy.toml", "rustfmt.toml", "docs/development-rules.md", "docs/development-evidence.md", "crates/api", "crates/abi", "crates/afunix", "crates/dns", "crates/ipc", "crates/testdir", "docs/research/measurements/managed-borrowed-nowait/focused.rs", "docs/research/measurements/managed-borrowed-nowait/contract.rs", "docs/research/measurements/managed-proc-main/allocation.rs", "docs/research/measurements/managed-proc-main/repro.rs", "docs/research/measurements/managed-proc-main/reader-tests.rs", "docs/research/measurements/api-flakes/spawns.rs", "docs/research/measurements/api-flakes/half-close.rs"]
+take = ["LICENSE", "AGENTS.md", "CLAUDE.md", "clippy.toml", "rustfmt.toml", "docs/development-rules.md", "docs/development-evidence.md", "crates/api", "crates/abi", "crates/afunix", "crates/dns", "crates/ipc", "crates/remote", "crates/testdir", "docs/research/measurements/managed-borrowed-nowait/focused.rs", "docs/research/measurements/managed-borrowed-nowait/contract.rs", "docs/research/measurements/managed-proc-main/allocation.rs", "docs/research/measurements/managed-proc-main/repro.rs", "docs/research/measurements/managed-proc-main/reader-tests.rs", "docs/research/measurements/api-flakes/spawns.rs", "docs/research/measurements/api-flakes/half-close.rs"]
 own = ["Cargo.toml", "UPSTREAM.md"]
 
 # Firecracker (AWS): the VMM Hex's `firecracker` class launches (crates/hex-runtime/src/firecracker; its

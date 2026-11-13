@@ -281,23 +281,8 @@ impl Fixture<'_> {
                 },
             )
             .expect("actual native exec through backend socket");
-        let end = proc
-            .wait_for(hex_api::conformance::PATIENCE)
-            .expect("bounded native completion");
-        if end.is_none() {
-            proc.kill().expect("kill only this owned exec");
-            assert!(
-                proc.wait_for(hex_api::conformance::PATIENCE)
-                    .unwrap()
-                    .is_some(),
-                "owned exec reaped"
-            );
-        }
-        assert_eq!(
-            end,
-            Some(Exit::Code(0)),
-            "workload completed without timeout"
-        );
+        let end = hex_api::conformance::end_of(&mut proc).expect("native completion");
+        assert_eq!(end, Exit::Code(0), "workload completed");
         // The fixed workload writes three short open receipts (or one CPU word); it cannot fill
         // its pipe. Wait first, then read under the existing wire byte bound, including one excess.
         let mut bytes = Vec::new();

@@ -121,3 +121,8 @@ tree-sitter-rust = { path = "vendor/vorpal/grammars/tree-sitter-rust" }
 tree-sitter-toml-ng = { path = "vendor/vorpal/grammars/tree-sitter-toml-ng" }
 tree-sitter-typescript = { path = "vendor/vorpal/grammars/tree-sitter-typescript" }
 tree-sitter-yaml = { path = "vendor/vorpal/grammars/tree-sitter-yaml" }
+
+# Shards names hyper-raft's QUIC by its git revision (vendor/shards/crates/remote, the agent-control link's client
+# Hex's image class drives, and crates/shards), the revision kiln takes: its one copy here (vendor/hyper-raft).
+[patch."https://github.com/hyper-light/hyper-raft"]
+hyper-quic = { path = "vendor/hyper-raft/crates/hyper-quic" }

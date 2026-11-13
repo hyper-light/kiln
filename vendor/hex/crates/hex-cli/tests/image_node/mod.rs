@@ -48,20 +48,33 @@ pub fn shards_dirs(state: &Path) -> (PathBuf, PathBuf) {
     )
 }
 
+/// Runs `command` in the node's Shards home and cache to its end, its stdout the test's and its stderr echoed whole as it
+/// ends; one that fails is refused naming its command, its exit and its stderr, so a pull or build says why in its own
+/// words (HVF (a), ROOT's HVF run at c8b4ce6b, whose build named only its command).
+fn in_home(command: &mut Command, home: &Path, cache: &Path) {
+    let ran = command
+        .env("SHARDS_HOME", home)
+        .env("SHARDS_CACHE", cache)
+        .stdin(HostStdio::null())
+        .stdout(HostStdio::inherit())
+        .stderr(HostStdio::piped())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&ran.stderr);
+    eprint!("{said}");
+    assert!(
+        ran.status.success(),
+        "{command:?}: {}; its stderr:\n{}",
+        ran.status,
+        said.trim_end()
+    );
+}
+
 /// Pulls `image` by its digest into the node's Shards home, then ends the daemon the pull started there, so no
 /// process of the pull's runs beside the node.
 pub fn pull(shards: &Path, image: &str, state: &Path) {
     let (home, cache) = shards_dirs(state);
-    let shards_in_home = |args: &[&str]| {
-        let status = Command::new(shards)
-            .args(args)
-            .env("SHARDS_HOME", &home)
-            .env("SHARDS_CACHE", &cache)
-            .stdin(HostStdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "shards {args:?}: {status}");
-    };
+    let shards_in_home = |args: &[&str]| in_home(Command::new(shards).args(args), &home, &cache);
     let begun = Instant::now();
     shards_in_home(&["pull", image]);
     eprintln!("IMAGE pulled {image} in {:?}", begun.elapsed());
@@ -75,15 +88,7 @@ pub fn pull(shards: &Path, image: &str, state: &Path) {
 pub fn built(shards: &Path, context: &Path, work: &Path, tag: &str) -> String {
     let (home, cache) = shards_dirs(&work.join("state"));
     let metadata = work.join(format!("{}.build.json", tag.replace('/', "-")));
-    let in_home = |command: &mut Command| {
-        let status = command
-            .env("SHARDS_HOME", &home)
-            .env("SHARDS_CACHE", &cache)
-            .stdin(HostStdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "{command:?}: {status}");
-    };
+    let in_home = |command: &mut Command| in_home(command, &home, &cache);
     let begun = Instant::now();
     in_home(
         Command::new(shards)

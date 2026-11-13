@@ -43,9 +43,8 @@ mod builder_prune;
 mod commit;
 #[cfg(target_os = "linux")]
 mod cuts;
-mod demand;
 mod devices;
-mod ends;
+pub(crate) mod ends;
 mod engine;
 /// The Engine API's socket in the home (D170), relative to it: what Docker's clients reach;
 /// on Windows the file that names its named pipe.
@@ -67,12 +66,13 @@ mod info;
 mod inspect;
 mod inspect_doc;
 mod layers;
+pub(crate) use layers::LayerFile;
 mod load;
 mod logs;
 mod managed;
 mod metrics;
 mod moves;
-pub(crate) use moves::Refused;
+pub(crate) use moves::{Refused, home_baseline};
 mod network;
 mod networks;
 mod packed;
@@ -126,8 +126,9 @@ const USAGE: &str = "usage: shards run daemon [--detached] [--listen ADDR:PORT]
 /// waited for as long as it takes its host, whose speed sets a boot's cost (PM M357).
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a VM's network process may take to say it has a run's published ports: a
-/// round trip on a socket pair to a process polling it, the grace one is given to end
-/// (`netproc::GRACE`).
+/// round trip on a socket pair to a process polling it. It was the second a network
+/// process was given to end, `netproc::GRACE`, which a network process's own progress
+/// replaced (PM M546); its own basis is owed (R03).
 const PUBLISH_PATIENCE: Duration = Duration::from_secs(1);
 /// A template whose warm VMs fail this many times in a row is removed and saved again.
 const MAX_FAILURES: u32 = 3;
@@ -146,10 +147,9 @@ pub(crate) fn pci_slots() -> u8 {
 /// shares, so the default holds about 55 MiB (PM M49).
 const DEFAULT_WARM_MAX: usize = 16;
 const DEFAULT_IDLE: Duration = Duration::from_secs(900);
-/// How long a pool keeps warm VMs after its last claim unless `SHARDS_POOL_KEEP` says: as
-/// AWS keeps an idle function, 10 minutes (Shahrad et al., "Serverless in the Wild",
-/// USENIX ATC 2020, §1).
-const DEFAULT_KEEP: Duration = Duration::from_secs(600);
+/// How long a pool keeps warm VMs after its last claim unless `SHARDS_POOL_KEEP` says: D26's
+/// keep-alive, an orchestrator's pools' too (`shards_api::demand::KEEP`).
+const DEFAULT_KEEP: Duration = shards_api::demand::KEEP;
 /// Warm VMs a run may try: one can end while it waits, or before it has taken the run.
 const HANDOFF_TRIES: usize = 3;
 /// A stopped microVM's writable layer, in its directory (D37): kept whole, and being
@@ -160,10 +160,6 @@ pub(super) const REQUEST: &str = "request";
 const LAYER_NEW: &str = "layer.new";
 /// A running microVM's swap (D159), in its directory until its VM holds it.
 const SWAP: &str = "swap";
-
-/// A VM process's link to its daemon, as `--warm` and `--resume` name it: its descriptor 3
-/// on Unix; on Windows the handle given it as `daemon` (`start`).
-const VM_LINK: &str = if cfg!(windows) { "daemon" } else { "3" };
 
 /// What a run's VM is handed of its shares (D38): its connection to their share process,
 /// which hands it each share's stream; on Windows each share's stream itself, whose other
@@ -754,7 +750,7 @@ struct Pool {
     waiting: usize,
     /// Its runs' arrivals and its refills' times, which say how many VMs it keeps; its
     /// last claim orders eviction, least recent first.
-    demand: demand::Demand,
+    demand: shards_api::demand::Demand,
 }
 
 /// Collections due, for the collector's thread ([`Daemon::collect_all`]).
@@ -980,7 +976,7 @@ struct Inbox {
     records: Option<Records>,
     working_set: WorkingSet,
     /// The pool its warm VM came from, which counts it among its runs going until it ends
-    /// (demand.rs).
+    /// (`shards_api::demand`).
     pool: Option<PoolKey>,
     /// The run's directory, and the log segment the VM writes there, which
     /// the daemon made.
@@ -1148,7 +1144,7 @@ fn pool_of<'s>(state: &'s mut State, key: &PoolKey, rootfs: &Path, stamp: Option
 }
 
 /// `rootfs` as the VM saving a template records it: resolved, links and all.
-fn resolved(rootfs: &Path) -> PathBuf {
+pub(crate) fn resolved(rootfs: &Path) -> PathBuf {
     std::fs::canonicalize(rootfs).unwrap_or_else(|_| rootfs.to_path_buf())
 }
 
@@ -1183,7 +1179,7 @@ struct Daemon<D: Disk = Real> {
     /// shards-vm, beside this binary: each VM runs in a process of its own.
     vm: PathBuf,
     identity: Identity,
-    /// The most warm VMs a template's pool keeps ([`demand`]).
+    /// The most warm VMs a template's pool keeps ([`shards_api::demand`]).
     target: usize,
     /// Warm VMs kept ahead of runs, all pools together ([`DEFAULT_WARM_MAX`]).
     warm_max: usize,
@@ -1234,9 +1230,9 @@ struct Daemon<D: Disk = Real> {
     /// Told as a client leaves, under its lock: a slot's client past the most in hand waits
     /// on it for its turn.
     room: (Mutex<()>, Condvar),
-    /// Set once [`end_clients`](Self::end_clients) has ended the clients in hand: a slot's
-    /// client whose request is not whole yet waits on it too (slots.rs), and is told to ask
-    /// the next daemon.
+    /// Set once the daemon has closed ([`close`](Self::close)), or [`end_clients`](Self::end_clients)
+    /// has ended the clients in hand: a slot's client whose request is not whole yet waits on
+    /// it too (slots.rs), and is told to ask the next daemon.
     requests_end: shards_ipc::Latch,
     /// When it last said its clients in hand reached its most (slots.rs).
     at_most_said: Mutex<Option<Instant>>,
@@ -1248,9 +1244,6 @@ struct Daemon<D: Disk = Real> {
     /// off before the slot passed it on ("the command's microVM stopped before the command
     /// ended", x86_64 CI; PM M261).
     live: Mutex<HashMap<u64, slots::Live>>,
-    /// When it closed ([`close`](Self::close)): what a slot waits on its client from, once
-    /// it has.
-    closed_at: Mutex<Option<Instant>>,
     /// Held as the Engine API's socket is removed by [`close`](Self::close) and as the
     /// listener binds it again ([`relisten_api`](Self::relisten_api)): a daemon's own
     /// removal is never undone.
@@ -1297,6 +1290,10 @@ struct Daemon<D: Disk = Real> {
     ports_freed: Condvar,
     /// The microVMs `shards remove vm` is removing.
     removing: Mutex<HashSet<String>>,
+    /// The microVMs whose request a client is changing ([`Daemon::request_turn`], D37), and
+    /// told as each is no more.
+    changing: Mutex<HashSet<String>>,
+    changed_request: Condvar,
     /// What has happened, for `shards watch system`.
     events: events::Events,
     /// Containers whose writable layer their stopped VM is still saving (D37), and when
@@ -1386,6 +1383,9 @@ struct Daemon<D: Disk = Real> {
     groups: groups::Groups,
     /// When each running microVM's health check is next due (health.rs).
     checks: health::Checks,
+    /// What its microVMs' answers to its own execs have taught it, each kind apart, which its
+    /// waits on them while they run are judged by ([`health::Wait::WhileRuns`]).
+    answers: health::Answers,
     /// Runs waiting for a VM booted for them, by number: told as the daemon stops.
     booting: Mutex<HashMap<u64, mpsc::Sender<Result<Ready, String>>>>,
     next_cold: AtomicU64,
@@ -1638,7 +1638,7 @@ const VM_OWN_MAPPINGS_CPUS: u64 = 32;
 /// failing with it. Linux's default, 65,530, holds a VM of one volume (two windows, the
 /// join share's the other) to 16,286 ranges a window, 31.8 GiB, on 32 CPUs; Fedora's
 /// 1,048,576 to more than its host's memory.
-fn share_window_bound_mib(limit: u64, windows: u64, cpus: u64) -> u64 {
+pub(crate) fn share_window_bound_mib(limit: u64, windows: u64, cpus: u64) -> u64 {
     let own = VM_OWN_MAPPINGS.saturating_add(2 * cpus.saturating_sub(VM_OWN_MAPPINGS_CPUS));
     let ranges = limit.saturating_sub(own) / MAPPINGS_A_RANGE.saturating_mul(windows.max(1));
     ranges.saturating_mul(2)
@@ -1646,7 +1646,7 @@ fn share_window_bound_mib(limit: u64, windows: u64, cpus: u64) -> u64 {
 
 /// Linux's `vm.max_map_count` (/proc/sys/vm/max_map_count); none on hosts with no such limit.
 #[cfg(target_os = "linux")]
-fn max_map_count() -> Option<u64> {
+pub(crate) fn max_map_count() -> Option<u64> {
     std::fs::read_to_string("/proc/sys/vm/max_map_count")
         .ok()
         .and_then(|n| n.trim().parse().ok())
@@ -1654,8 +1654,34 @@ fn max_map_count() -> Option<u64> {
 
 /// Linux's `vm.max_map_count`; none on hosts with no such limit.
 #[cfg(not(target_os = "linux"))]
-fn max_map_count() -> Option<u64> {
+pub(crate) fn max_map_count() -> Option<u64> {
     None
+}
+
+/// Each share's DAX window in MiB (D189), as every microVM a run boots is given it, the
+/// daemon's and an orchestrator's run host's alike (D253): `SHARDS_SHARE_WINDOW_MIB`, else as
+/// long as the host's memory, the most of its files the host's page cache holds at once, as a
+/// run's swap window is (D159); its guest makes what it maps of it as it maps it (PM M306), and
+/// its VM fits it to its guest's addresses. None where the host is itself a virtual machine on
+/// an AMD CPU (PM M308), which `say` is told. Refused where it is no whole 2 MiB ranges.
+pub(crate) fn share_window_mib(say: &dyn Fn(&str)) -> Result<u64, String> {
+    let host_mib = crate::build::host_memory().map_or(0, |bytes| (bytes >> 20) & !1);
+    let cpu = host_cpu();
+    let window_default = share_window_default(host_mib, &cpu);
+    if window_default == 0 && host_mib > 0 && std::env::var_os("SHARDS_SHARE_WINDOW_MIB").is_none() {
+        say(
+            "volumes have no DAX window by default: this host is a virtual machine on an AMD CPU, \
+             whose hypervisor maps each page a window gives a guest afresh, reads through one 9 to 37 \
+             times slower than FUSE's (PM M308); SHARDS_SHARE_WINDOW_MIB gives one",
+        );
+    }
+    let share_window_mib = count("SHARDS_SHARE_WINDOW_MIB", window_default)?;
+    if !share_window_mib.is_multiple_of(2) {
+        return Err(format!(
+            "SHARDS_SHARE_WINDOW_MIB: {share_window_mib} MiB: a DAX window is whole 2 MiB ranges"
+        ));
+    }
+    Ok(share_window_mib)
 }
 
 /// The daemon's settings, checked before it serves: a malformed or excessive one stops it
@@ -1704,26 +1730,7 @@ fn settings() -> Result<Settings, String> {
     } else {
         None
     };
-    // Each share's window as long as the host's memory, the most of its files the host's
-    // page cache holds at once, as a run's swap window is (D159); its guest makes what it
-    // maps of it as it maps it (PM M306), and its VM fits it to its guest's addresses. None
-    // where the host is itself a virtual machine on an AMD CPU (PM M308).
-    let host_mib = crate::build::host_memory().map_or(0, |bytes| (bytes >> 20) & !1);
-    let cpu = host_cpu();
-    let window_default = share_window_default(host_mib, &cpu);
-    if window_default == 0 && host_mib > 0 && std::env::var_os("SHARDS_SHARE_WINDOW_MIB").is_none() {
-        log(
-            "volumes have no DAX window by default: this host is a virtual machine on an AMD CPU, \
-             whose hypervisor maps each page a window gives a guest afresh, reads through one 9 to 37 \
-             times slower than FUSE's (PM M308); SHARDS_SHARE_WINDOW_MIB gives one",
-        );
-    }
-    let share_window_mib = count("SHARDS_SHARE_WINDOW_MIB", window_default)?;
-    if !share_window_mib.is_multiple_of(2) {
-        return Err(format!(
-            "SHARDS_SHARE_WINDOW_MIB: {share_window_mib} MiB: a DAX window is whole 2 MiB ranges"
-        ));
-    }
+    let share_window_mib = share_window_mib(&|line| log(line))?;
     Ok(Settings {
         pool,
         warm_max,
@@ -2104,7 +2111,6 @@ impl<D: Disk> Daemon<D> {
             at_most_said: Mutex::new(None),
             clients_ended: AtomicBool::new(false),
             live: Mutex::default(),
-            closed_at: Mutex::new(None),
             socket_at: Mutex::new(()),
             stoppers: Mutex::default(),
             runs: Mutex::default(),
@@ -2123,6 +2129,8 @@ impl<D: Disk> Daemon<D> {
             ports_held: Mutex::default(),
             ports_freed: Condvar::new(),
             removing: Mutex::default(),
+            changing: Mutex::default(),
+            changed_request: Condvar::new(),
             paused: Mutex::default(),
             plugged: Mutex::default(),
             join_shares: Mutex::default(),
@@ -2162,6 +2170,7 @@ impl<D: Disk> Daemon<D> {
             #[cfg(any(target_os = "macos", windows))]
             groups: groups::Groups::default(),
             checks: health::Checks::default(),
+            answers: health::Answers::default(),
             booting: Mutex::default(),
             next_cold: AtomicU64::new(0),
             boots: Boots::new(shards_vmm::vm::booting_vcpus_at_most(
@@ -2180,9 +2189,12 @@ impl<D: Disk> Daemon<D> {
             if self.closed.load(Ordering::SeqCst) {
                 return;
             }
-            // When first, so that no look at the slots finds it closed and not since when.
-            *lock(&self.closed_at) = Some(Instant::now());
             self.closed.store(true, Ordering::SeqCst);
+            // A request still being read is taken no more: its reader ends, and its client,
+            // told RESTART, asks the next daemon, as a closed daemon tells one whose request
+            // came whole (`serve_slot`). So no slot's client holds a closed daemon past its
+            // serving's own end.
+            self.requests_end.set();
             let _ = std::fs::remove_file(engine::SOCKET);
             // Its slots' lists go at once: a client looking for one asks the next daemon.
             shards_ipc::slots::unoffer(&self.home);
@@ -2434,8 +2446,9 @@ impl<D: Disk> Daemon<D> {
     /// long (`shards_vmm::platform::progressed`, PM M357): its CPU time and page faults, and
     /// what each grew by. The durable word by which the wait of a client whose workload its
     /// host runs slowly is told from one on a microVM that runs nothing (D209), which is
-    /// said nothing of, as an idle microVM has nothing to say. How long until the next look
-    /// is due; none where no client waits.
+    /// said nothing of, as an idle microVM has nothing to say: a liveness line, which the
+    /// tests' waits take for no progress of their subject (tests/common `HEARTBEAT` matches
+    /// it). How long until the next look is due; none where no client waits.
     fn log_progress(&self) -> Option<Duration> {
         let inboxes: Vec<(String, Arc<Mutex<Inbox>>)> = lock(&self.runs)
             .iter()
@@ -4427,8 +4440,9 @@ impl<D: Disk> Daemon<D> {
 
     /// Whose host address `at`, found in use, is: the host's; a running microVM's of
     /// this daemon, which knows its own bindings (`published`); or a run's that ended, waited
-    /// for until its network process has gone (its grace, `netproc::GRACE`, and as long
-    /// again), where that process never said it closed the run's ports. A run's VM says
+    /// for until its network process has gone, for as long as this host gives one before it
+    /// looks at it (`ends::End::Helper`, `netproc::reap`), where that process never said it
+    /// closed the run's ports. A run's VM says
     /// PORTS_FREE, as that process has, and DONE, before it tells its client (warm.rs
     /// `finish`), whose next program may bind the port at once: what the holder's run has
     /// sent is taken first, as a name's holder's is (`create`), so that a run its client
@@ -4436,7 +4450,9 @@ impl<D: Disk> Daemon<D> {
     /// free (PM M134, M158).
     fn in_use(&self, at: std::net::SocketAddr, proto: u8) -> publish::InUse {
         let began = Instant::now();
-        let deadline = began + crate::netproc::GRACE.saturating_mul(2);
+        let deadline = began
+            .checked_add(self.ends.slice(ends::End::Helper))
+            .unwrap_or(began);
         let mut held = lock(&self.ports_held);
         // A run of this daemon's held it: gone from every run, it was freed, while this
         // waited or while it took the holder's messages without the lock.
@@ -5117,6 +5133,27 @@ impl<D: Disk> Daemon<D> {
     }
 
     /// Waits until reserved microVM `id` is seen.
+    /// MicroVM `id`'s turn to change its request (D37), once no other client has it: held
+    /// from the request's read to the keep of what changed, as moby holds a container's lock
+    /// across an update and a network connect (daemon/update.go, ConnectToNetwork), so that no
+    /// client keeps a request another changed after it read it. An update holds it across its
+    /// exec into the VM, which `TAKE_TIMEOUT` bounds.
+    fn request_turn(&self, id: &str) -> RequestTurn<'_> {
+        let mut changing = lock(&self.changing);
+        while changing.contains(id) {
+            changing = self
+                .changed_request
+                .wait(changing)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        changing.insert(id.to_string());
+        RequestTurn {
+            changing: &self.changing,
+            changed: &self.changed_request,
+            id: id.to_string(),
+        }
+    }
+
     fn await_arrival(&self, id: &str) {
         let mut registry = lock(&self.containers);
         while registry.is_arriving(id) {
@@ -5626,7 +5663,7 @@ impl<D: Disk> Daemon<D> {
             link_local: _,
             engine,
         } = keep;
-        // A pool's run keeps its pool in use until it ends (demand.rs).
+        // A pool's run keeps its pool in use until it ends (`shards_api::demand`).
         if let Some(key) = &ready.pool
             && let Some(pool) = lock(&self.state).pools.get_mut(key)
         {
@@ -5831,6 +5868,12 @@ impl<D: Disk> Daemon<D> {
                     self.run_started(id, inbox);
                 }
                 kind::DONE => self.run_ended(id, inbox, Some(&m.payload)),
+                // Why its VM could not serve it, before its `DONE`: its client heard it as it
+                // exited, and the log keeps it for a run that had none.
+                kind::UNSERVED => log(format!(
+                    "container {id}: its VM could not serve its run: {}",
+                    String::from_utf8_lossy(&m.payload)
+                )),
                 // Its network process has closed its published ports: the daemon's copies
                 // close, and the ports are free (PM M380).
                 kind::PORTS_FREE => self.free_ports(Some(id), None),
@@ -6548,7 +6591,8 @@ impl<D: Disk> Daemon<D> {
     /// Run `id` ended: `done` is its DONE, or `None` for a VM that ended without one.
     fn run_ended(&self, id: &str, inbox: &mut Inbox, done: Option<&[u8]>) {
         self.managed.end(id);
-        // Its pool has one run fewer going, and is idle from the last to end (demand.rs).
+        // Its pool has one run fewer going, and is idle from the last to end
+        // (`shards_api::demand`).
         if let Some(key) = inbox.pool.take()
             && let Some(pool) = lock(&self.state).pools.get_mut(&key)
         {
@@ -7683,56 +7727,26 @@ impl<D: Disk> Daemon<D> {
         } else {
             None
         };
-        // Sized as a run without a limit, with the host's memory to plug, which each run
-        // asks for as its workload needs it within its own most (D148): one template for
-        // every limit (run::template). Plugged memory comes online as the kernel's own, as
-        // a builder's does (D133).
         // The CPU baseline its home's microVMs are told (D176 part 6), read once a run.
         let cpu_baseline = moves::home_baseline(&self.home);
-        let on_network = |cfg: &mut Config| {
-            (cfg.vcpus, cfg.memory_mib) = prepared.size;
-            cfg.cpu_baseline.clone_from(&cpu_baseline);
-            cfg.hotplug_mib = crate::build::host_memory()
-                .map_or(0, |bytes| ((bytes >> 20) & !1).saturating_sub(cfg.memory_mib));
-            if cfg.hotplug_mib > 0 {
-                cfg.cmdline.push_str(" memhp_default_state=online_kernel");
-            }
-            // And memory its workload frees given back to the host, as it reports it
-            // free, as a microVM's own is (D151).
-            cfg.reporting = true;
-            // And a swap window as long as the host's memory (D159), which a run with a
-            // memory limit swaps to: as much as the most memory a run may have, the swap
-            // that limit gives by default.
-            cfg.swap_mib = crate::build::host_memory().map_or(0, |bytes| (bytes >> 20) & !1);
-            cfg.pmem.extend(server.iter().cloned());
-            // Another CPU's image (D179): the emulator image's root after them, and its init
-            // told the device and the architecture to register, before its root is mounted.
-            if let Some(e) = &prepared.emulator {
-                cfg.pmem.push(e.root.clone());
-                cfg.cmdline.push_str(&format!(
-                    " shards_emulate=/dev/pmem{}:{}",
-                    cfg.pmem.len(),
-                    e.architecture
-                ));
-            }
-            // A slot for each directory it shares (D38), which its run fills.
-            cfg.shares = (0..prepared.shares).map(|_| Arc::default()).collect();
-            // And each share's DAX window, where the daemon gives one (D189), as its join
-            // share's, every range of all of them within the host's mappings where it limits
-            // them: on Windows of the files its share process gives (D197's slice 4).
-            cfg.share_window_mib = self.share_window_mib;
-            if let Some(limit) = self.max_map_count {
-                let windows = u64::try_from(cfg.shares.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(1);
-                let bound = share_window_bound_mib(limit, windows, u64::from(cfg.vcpus));
-                cfg.share_window_mib = cfg.share_window_mib.min(bound);
-            }
-            if let Some(bridge) = &bridge {
-                cfg.cmdline.push(' ');
-                cfg.cmdline.push_str(&bridge.cmdline());
-            }
+        // Every microVM a run boots is made one shape beside its guest (run::Shape), the
+        // daemon's and an orchestrator's run host's alike (D253).
+        let shape = crate::run::Shape {
+            size: prepared.size,
+            cpu_baseline: &cpu_baseline,
+            host_memory: crate::build::host_memory(),
+            server: server.as_deref(),
+            emulator: prepared.emulator.as_ref(),
+            shares: prepared.shares,
+            share_window_mib: self.share_window_mib,
+            max_map_count: self.max_map_count,
+            // PCI slots in every microVM, empty until a device is plugged into its run (D214):
+            // its templates have them, and so every restore of them. SHARDS_PCI_SLOTS gives
+            // another count, 0 for none (PM M430's A/B).
+            pci_slots: pci_slots(),
+            bridge: bridge.as_ref(),
         };
+        let on_network = |cfg: &mut Config| shape.give(cfg);
         // A run given a host's VFIO groups (D154), or VFIO's own nodes to take a host's
         // functions plugged in as it runs (D214): a microVM booted for it, their functions,
         // and its slots, behind its own IOMMU, with a kernel with VFIO; of no template, as
@@ -7786,14 +7800,10 @@ impl<D: Disk> Daemon<D> {
         // A run given a GPU boots the pinned GPU kernel in the GPU's VM process
         // (D144), and restores a template of its own, saved before its guest made anything
         // of the GPU's, which its host driver would hold (D150).
-        let gpu_guest = prepared.gpu.as_ref().map(|kernel| crate::guest::Guest {
-            kernel: kernel.clone(),
-            init: guest.init.clone(),
-            kernel_digest: crate::kernel::KERNEL_GPU
-                .map(|k| format!("sha256:{}", k.sha256))
-                .unwrap_or_default(),
-            init_digest: guest.init_digest.clone(),
-        });
+        let gpu_guest = prepared
+            .gpu
+            .as_deref()
+            .map(|kernel| crate::run::gpu_guest(guest, kernel));
         let guest = gpu_guest.as_ref().unwrap_or(guest);
         let mut cfg = Config::new(guest.kernel.clone(), Some(guest.init.clone()));
         on_network(&mut cfg);
@@ -7851,8 +7861,10 @@ impl<D: Disk> Daemon<D> {
             &prepared.parent,
             prepared.layer,
         );
-        if ready.is_ok()
-            && let Err(e) = crate::run::Origin::of(
+        // Its template only where its VM was ready, its record written beside it; a VM that
+        // saved its snapshot and then failed makes none (run::settle_boot).
+        let record = || {
+            crate::run::Origin::of(
                 guest,
                 &prepared.rootfs,
                 stamp.as_deref(),
@@ -7861,10 +7873,10 @@ impl<D: Disk> Daemon<D> {
                 prepared.emulator.as_ref().map(|e| e.root.as_path()),
             )
             .write(&dir)
-        {
+        };
+        if let Err(e) = crate::run::settle_boot(ready.is_ok(), &fresh, &dir, record) {
             log(format!("{}: its origin: {e}", dir.display()));
         }
-        crate::run::settle(&fresh, &dir);
         if let Ok(r) = &mut ready
             && shards_vmm::snapshot::exists(&dir)
         {
@@ -8217,80 +8229,7 @@ impl<D: Disk> Daemon<D> {
         parent: &str,
         layer: u64,
     ) -> Result<Ready, String> {
-        let mut args: Vec<OsString> = vec![
-            "run".into(),
-            "--kernel".into(),
-            cfg.kernel.clone().into(),
-            "--cmdline".into(),
-            cfg.cmdline.clone().into(),
-            "--cpus".into(),
-            cfg.vcpus.to_string().into(),
-            "--memory".into(),
-            cfg.memory_mib.to_string().into(),
-            "--rootfs".into(),
-            rootfs.into(),
-        ];
-        if cfg.hotplug_mib > 0 {
-            let max = cfg.memory_mib.saturating_add(cfg.hotplug_mib);
-            args.extend(["--memory-max".into(), max.to_string().into()]);
-        }
-        if cfg.reporting {
-            args.push("--reporting".into());
-        }
-        if cfg.swap_mib > 0 {
-            args.extend(["--swap-window".into(), cfg.swap_mib.to_string().into()]);
-        }
-        if let Some(init) = &cfg.init {
-            args.extend(["--init".into(), init.into()]);
-        }
-        for pmem in &cfg.pmem {
-            args.extend(["--pmem".into(), pmem.into()]);
-        }
-        if let Some(fresh) = save {
-            args.extend(["--snapshot-dir".into(), fresh.into()]);
-        }
-        if cfg.gpu {
-            args.push("--gpu".into());
-        }
-        for f in &cfg.vfio {
-            let flag = if f.iommu { "--vfio-iommu" } else { "--vfio" };
-            // By its device node where it is taken by that (D154).
-            let given: OsString = f
-                .cdev
-                .as_ref()
-                .map_or_else(|| f.name.clone().into(), |c| c.clone().into_os_string());
-            args.extend([flag.into(), given]);
-        }
-        if !cfg.shares.is_empty() {
-            args.extend(["--shares".into(), cfg.shares.len().to_string().into()]);
-        }
-        if cfg.share_window_mib > 0 {
-            args.extend(["--share-window".into(), cfg.share_window_mib.to_string().into()]);
-        }
-        // PCI slots in every microVM, empty until a device is plugged into its run (D214):
-        // its templates have them, and so every restore of them. SHARDS_PCI_SLOTS gives
-        // another count, 0 for none (PM M430's A/B).
-        let slots = pci_slots();
-        if slots > 0 {
-            args.extend(["--pci-slots".into(), slots.to_string().into()]);
-            // Behind its IOMMU where it was booted to take a host's functions (D214).
-            if cfg.pci_slots_iommu {
-                args.push("--pci-slots-iommu".into());
-            }
-        }
-        // The CPU baseline its guest is told (D176 part 6).
-        if !cfg.cpu_baseline.is_empty() {
-            args.extend([
-                "--cpu-baseline".into(),
-                shards_vmm::arch::cpu::encode(&cfg.cpu_baseline).into(),
-            ]);
-        }
-        // A join disk and a join share in every microVM, empty and unserved until a
-        // joiner joins its network (D119): its templates have them, and so every restore
-        // of them.
-        args.push("--join".into());
-        args.push("--join-share".into());
-        args.extend(["--warm".into(), VM_LINK.into()]);
+        let args = crate::run::boot_args(cfg, rootfs, save, crate::launch::LINK);
         // A guest on a network: a fresh MAC, which a template it saves keeps.
         let net = if cfg.cmdline.contains("shards_net=") {
             Some(shards_net::random_mac().map_err(|e| format!("a guest's MAC: {e}"))?)
@@ -8375,11 +8314,11 @@ impl<D: Disk> Daemon<D> {
         }
     }
 
-    /// Starts shards-vm with `args` as a warm VM whose daemon socket is its descriptor 3,
-    /// on a network of its own if `net` names its MAC, with `layer` as its writable layer's
-    /// file where it has one (D190), unlinked once it is ready or has failed to start; and
-    /// watches it.
-    #[cfg(unix)]
+    /// Starts shards-vm with `args` as a warm VM whose link to the daemon is
+    /// [`crate::launch::LINK`], on a network of its own if `net` names its MAC, with `layer`
+    /// as its writable layer's file where it has one (D190), unlinked once it is ready or has
+    /// failed to start; and watches it. It and its network process are launched as every VM
+    /// of shards' is (launch.rs), under `parent` (D183).
     fn start<'s, 'e>(
         &'s self,
         threads: &'s Threads<'s, 'e>,
@@ -8391,68 +8330,31 @@ impl<D: Disk> Daemon<D> {
     ) -> Result<(), String> {
         // Under its parent (D183): it and its network process made by the parent's
         // spawner, in its scope from their first instruction.
+        #[cfg(unix)]
         let group = self.group_of(parent)?;
+        // On Windows, under a group shards keeps (D183, slice 3): made in its job, their own
+        // nested under it, as a warm VM of the parent's pool is made (PM M359).
+        #[cfg(windows)]
+        let job = if parent.is_empty() {
+            None
+        } else {
+            Some(self.group_job(parent)?)
+        };
         // A run's microVM is on Docker's default bridge, and reaches nothing through it
         // until a grant opens it (AGENTFILE_ARCH.md §3, default deny); its published
         // ports' connections come in all the same.
-        let network = match &net {
-            Some(mac) => {
-                let bridge = self.bridge.as_ref().ok_or(shards_net::bridge::NO_SUBNET)?;
-                Some(crate::netproc::start(
-                    shards_net::Policy::DenyAll,
-                    mac,
-                    bridge,
-                    group,
-                    false,
-                )?)
-            }
+        let network = match net {
+            Some(mac) => Some(crate::launch::Network {
+                policy: shards_net::Policy::DenyAll,
+                mac,
+                bridge: self.bridge.as_ref().ok_or(shards_net::bridge::NO_SUBNET)?,
+                credentials: false,
+            }),
             None => None,
         };
-        let (ours, theirs) = UnixStream::pair().map_err(|e| format!("a VM's socket: {e}"))?;
-        let null = File::open("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
-        let err = io::stderr();
-        // On macOS the VM is in App Sandbox from its launch and asks the daemon, on a socket
-        // of its own, for the files its arguments name (grant).
-        let grants = if cfg!(target_os = "macos") {
-            Some(UnixStream::pair().map_err(|e| format!("a VM's grants socket: {e}"))?)
-        } else {
-            None
-        };
-        let fds: Vec<_> = [
-            (null.as_fd(), 0),
-            (err.as_fd(), 1),
-            (err.as_fd(), 2),
-            (theirs.as_fd(), 3),
-        ]
-        .into_iter()
-        .chain(grants.as_ref().map(|(_, granted)| (granted.as_fd(), 4)))
-        .chain(network.iter().flat_map(|(_, side)| {
-            let [r, s, w] = crate::netproc::VM_FDS;
-            [
-                (side.region.as_fd(), r),
-                (side.sleeps.as_fd(), s),
-                (side.rings.as_fd(), w),
-                (side.release.as_fd(), crate::netproc::VM_RELEASE_FD),
-            ]
-        }))
-        .collect();
-        let release_fd = crate::netproc::VM_RELEASE_FD.to_string();
-        let net_arg = net.map(|mac| OsString::from(crate::netproc::VmSide::arg(&mac)));
-        let given = grants
-            .iter()
-            .flat_map(|_| [OsStr::new("--grants"), OsStr::new("4")])
-            .chain(net_arg.iter().flat_map(|a| [OsStr::new("--net"), a.as_os_str()]))
-            .chain(
-                net_arg
-                    .iter()
-                    .flat_map(|_| [OsStr::new("--net-release"), OsStr::new(&release_fd)]),
-            );
         let args: Vec<&OsStr> = args
             .iter()
-            .take(1)
             .map(OsString::as_os_str)
-            .chain(given)
-            .chain(args.iter().skip(1).map(OsString::as_os_str))
             .chain(
                 layer
                     .iter()
@@ -8465,44 +8367,31 @@ impl<D: Disk> Daemon<D> {
                     .flat_map(|g| [OsStr::new("--layer-cloned"), OsStr::new(g)]),
             )
             .collect();
-        let mut env = crate::netproc::child_env();
-        // A GPU's VM process is the GPU's build (D144), which says MoltenVK's errors alone.
-        let gpu = args.iter().any(|a| *a == "--gpu");
-        let binary = if gpu {
-            crate::helpers::vm_gpu()?
-        } else {
-            self.vm.clone()
-        };
-        if gpu {
-            env.push(("MVK_CONFIG_LOG_LEVEL", "1".into()));
-        }
-        let child = match shards_ipc::spawn_in_group(
+        let (launched, ours) = crate::launch::run(crate::launch::Plan {
+            args: &args,
+            vm: &self.vm,
+            network,
+            ends: &self.ends,
+            #[cfg(unix)]
             group,
-            &binary,
-            &args,
-            &fds,
-            false,
-            &crate::netproc::env_pairs(&env),
-        ) {
-            Ok(child) => child,
-            Err(e) => {
-                if let Some((net, side)) = network {
-                    drop(side);
-                    crate::netproc::reap(&net);
-                }
-                return Err(format!("starting {}: {e}", binary.display()));
-            }
-        };
-        drop(fds);
+            #[cfg(windows)]
+            group: job.as_ref(),
+            // What it asks to reach is answered by its watch on macOS, which judges its
+            // start by it (PM M166); on Windows by the launch.
+            #[cfg(target_os = "macos")]
+            grants: crate::launch::Grants::Kept,
+        })?;
+        #[cfg(target_os = "macos")]
+        let grants = launched.grants;
+        #[cfg(not(target_os = "macos"))]
+        let grants = None;
         // The VM holds its side of its network now; its network process goes with it.
         // The control socket stays the daemon's.
-        let mac = net;
-        let (net_process, net_control) = match network {
-            Some((net, side)) => (Some(net), Some((side.control, mac))),
+        let (net_process, net_control) = match launched.net {
+            Some((process, control)) => (Some(process), Some((control, net))),
             None => (None, None),
         };
-        let grants = grants.map(|(grants, _)| grants);
-        let vm = Arc::new(child);
+        let vm = Arc::new(launched.vm);
         // Among those the daemon ends as it exits from now on: before its watcher can find
         // it ready, which takes it out.
         let pooled = matches!(dest, For::Pool(_));
@@ -8510,9 +8399,17 @@ impl<D: Disk> Daemon<D> {
             lock(&self.state).starting.insert(vm.id(), vm.clone());
         }
         let watched = vm.clone();
+        // Ended by `unwatched` where its watcher's thread does not start: its closure is
+        // dropped unrun then (std's `thread::Builder::spawn_scoped`).
+        let unwatched = Unwatched {
+            vm: Some(vm.clone()),
+            net: net_process,
+            ends: &self.ends,
+        };
         let watching = std::thread::Builder::new()
             .name("warm vm".into())
             .spawn_scoped(threads, move || {
+                let net_process = unwatched.watched();
                 self.watch(
                     threads,
                     watched,
@@ -8528,200 +8425,6 @@ impl<D: Disk> Daemon<D> {
             if pooled {
                 lock(&self.state).starting.remove(&vm.id());
             }
-            let _ = vm.kill(shards_ipc::signal::SIGKILL);
-            return Err(format!("watching VM {}: {e}", vm.id()));
-        }
-        Ok(())
-    }
-
-    /// [`start`](Self::start) on Windows (D141, D142, D195): the VM process confined in an
-    /// AppContainer of its own, made suspended, given by name its link to the daemon
-    /// (`daemon`, the other end of a pair of this process's) and its network's ring and
-    /// doorbells; its network process started next, given the VM's process to watch; then
-    /// the VM runs, and the daemon answers what it asks for (its files, its vsock path) on a
-    /// thread of its own, which ends as the VM does. Its writable layer goes by its path,
-    /// which it asks for.
-    #[cfg(windows)]
-    fn start<'s, 'e>(
-        &'s self,
-        threads: &'s Threads<'s, 'e>,
-        args: &[OsString],
-        net: Option<[u8; 6]>,
-        dest: For,
-        parent: &str,
-        layer: Option<layers::LayerFile>,
-    ) -> Result<(), String> {
-        use std::os::windows::io::{AsHandle as _, OwnedHandle};
-        // Under a parent, a group shards keeps (D183, slice 3): the VM process made in its
-        // job, its own nested under it, as a warm VM of the parent's pool is made (PM M359).
-        let group = if parent.is_empty() {
-            None
-        } else {
-            Some(self.group_job(parent)?)
-        };
-        let network = match &net {
-            Some(mac) => {
-                let bridge = self.bridge.as_ref().ok_or(shards_net::bridge::NO_SUBNET)?;
-                Some(crate::netproc::prepare(
-                    shards_net::Policy::DenyAll,
-                    mac,
-                    bridge,
-                    false,
-                )?)
-            }
-            None => None,
-        };
-        let (ours, theirs) = UnixStream::pair().map_err(|e| format!("a VM's link: {e}"))?;
-        // Its end, the VM's alone once given it: the daemon's copy goes, so that the VM's
-        // end is the end the daemon reads.
-        let link = theirs.share().map_err(|e| format!("a VM's link: {e}"))?;
-        drop(theirs);
-        let container = crate::helpers::containers().and_then(|records| {
-            shards_ipc::AppContainer::new("vm", &records).map_err(|e| format!("a VM's AppContainer: {e}"))
-        })?;
-        // A pipe each way: the VM's requests, and the answers.
-        let pipes = std::io::pipe().and_then(|asks| Ok((asks, std::io::pipe()?)));
-        let ((asks_from, asks_to), (answers_from, answers_to)) =
-            pipes.map_err(|e| format!("a VM's grants: {e}"))?;
-        let (asks_to, answers_from) = (OwnedHandle::from(asks_to), OwnedHandle::from(answers_from));
-        // The null device, for the clients' stdio it lets go of: its AppContainer opens no
-        // file by name, NUL among them on Windows Server (PM M351).
-        let null = File::open(crate::os::NULL).map_err(|e| format!("{}: {e}", crate::os::NULL))?;
-        let mut given = vec![
-            shards_ipc::Given {
-                name: "ask",
-                handle: asks_to.as_handle(),
-            },
-            shards_ipc::Given {
-                name: "answer",
-                handle: answers_from.as_handle(),
-            },
-            shards_ipc::Given {
-                name: VM_LINK,
-                handle: link.as_handle(),
-            },
-            shards_ipc::Given {
-                name: "null",
-                handle: null.as_handle(),
-            },
-        ];
-        let mut sockets = Vec::new();
-        if let Some((_, side)) = &network {
-            given.extend(side.given());
-            sockets.extend([side.shared(), side.release()]);
-        }
-        let net_arg = net.map(|mac| OsString::from(crate::netproc::VmSide::arg(&mac)));
-        let args: Vec<&OsStr> = args
-            .iter()
-            .map(OsString::as_os_str)
-            .chain(net_arg.iter().flat_map(|a| [OsStr::new("--net"), a.as_os_str()]))
-            .chain(
-                layer
-                    .iter()
-                    .flat_map(|l| [OsStr::new("--layer"), l.path().as_os_str()]),
-            )
-            .chain(
-                layer
-                    .iter()
-                    .filter_map(|l| l.cloned_of())
-                    .flat_map(|g| [OsStr::new("--layer-cloned"), OsStr::new(g)]),
-            )
-            .collect();
-        let err = io::stderr();
-        let env = crate::netproc::child_env();
-        // A GPU's VM process is the GPU's build, which runs its host's GPU driver (D144,
-        // D202).
-        let gpu = args.iter().any(|a| *a == "--gpu");
-        let binary = if gpu {
-            crate::helpers::vm_gpu()?
-        } else {
-            self.vm.clone()
-        };
-        let suspended = shards_ipc::spawn_suspended(&shards_ipc::Spawn {
-            program: &binary,
-            args: &args,
-            grants_at: 1,
-            given: &given,
-            stdin: None,
-            stdout: err.as_handle(),
-            stderr: err.as_handle(),
-            sockets: &sockets,
-            env: &crate::netproc::env_pairs(&env),
-            container: Some(&container),
-            holds: shards_ipc::Holds::Hypervisor,
-            group: group.as_ref(),
-            graphics: gpu,
-        })
-        .map_err(|e| format!("starting {}: {e}", binary.display()))?;
-        // Shared with it already, and its handles duplicated into it.
-        drop((given, sockets));
-        // Its network process, given the VM's process to watch, before the VM runs: ended
-        // with the suspended VM, a Job's, where it cannot start. Its control is the
-        // daemon's, where the run's published ports go; the VM holds its release.
-        let (net_process, net_control) = match network {
-            Some((ready, side)) => {
-                let started = crate::netproc::start(ready, &suspended, group.as_ref())?;
-                let control = crate::netproc::Control {
-                    socket: side.control,
-                    pid: started.id(),
-                };
-                (Some(started), Some((control, net)))
-            }
-            None => (None, None),
-        };
-        let giver = suspended.giver().map_err(|e| format!("answering a VM: {e}"))?;
-        let gives = suspended
-            .giver()
-            .map_err(|e| format!("a VM's link: {e}"))?
-            .into_handle();
-        let mut child = suspended
-            .resume()
-            .map_err(|e| format!("starting {}: {e}", binary.display()))?;
-        // Its AppContainer's profile goes once it has, as its follower lets it go.
-        child.hold(container);
-        // What the daemon sends on its link goes to the VM: handles duplicated into it.
-        ours.gives_to(gives);
-        drop((asks_to, answers_from, link, null));
-        let grants = crate::grant::Link {
-            from: File::from(OwnedHandle::from(asks_from)),
-            to: File::from(OwnedHandle::from(answers_to)),
-        };
-        let vm = Arc::new(child);
-        // Its grants answered while it runs.
-        let answering =
-            std::thread::Builder::new()
-                .name("vm grants".into())
-                .spawn_scoped(threads, move || {
-                    let _ = crate::grant_answer::serve(&grants, &giver);
-                });
-        if let Err(e) = answering {
-            let _ = vm.kill(shards_ipc::signal::SIGKILL);
-            return Err(format!("answering VM {}: {e}", vm.id()));
-        }
-        let pooled = matches!(dest, For::Pool(_));
-        if pooled {
-            lock(&self.state).starting.insert(vm.id(), vm.clone());
-        }
-        let watched = vm.clone();
-        let watching = std::thread::Builder::new()
-            .name("warm vm".into())
-            .spawn_scoped(threads, move || {
-                self.watch(
-                    threads,
-                    watched,
-                    ours,
-                    None,
-                    net_control,
-                    dest,
-                    net_process,
-                    layer,
-                );
-            });
-        if let Err(e) = watching {
-            if pooled {
-                lock(&self.state).starting.remove(&vm.id());
-            }
-            let _ = vm.kill(shards_ipc::signal::SIGKILL);
             return Err(format!("watching VM {}: {e}", vm.id()));
         }
         Ok(())
@@ -9065,6 +8768,20 @@ fn newest_log(dir: &Path) -> io::Result<Log> {
     })
 }
 
+/// A microVM's turn to change its request ([`Daemon::request_turn`]), given back as it goes.
+struct RequestTurn<'a> {
+    changing: &'a Mutex<HashSet<String>>,
+    changed: &'a Condvar,
+    id: String,
+}
+
+impl Drop for RequestTurn<'_> {
+    fn drop(&mut self) {
+        lock(self.changing).remove(&self.id);
+        self.changed.notify_all();
+    }
+}
+
 /// Keeps `bytes` at `path` whole or not at all: written beside it, under a name of this
 /// write's alone, then renamed over it. So a write that fails leaves what was there and
 /// nothing beside it, and no reader finds part of one, which each record's reader can take
@@ -9078,15 +8795,37 @@ fn newest_log(dir: &Path) -> io::Result<Log> {
 /// with the rename costs 4.3 ms at the median (PM M46), on the path each new microVM takes
 /// to start. So a power loss may still leave one cut, as it may the record.
 fn keep_whole(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    static WRITES: AtomicU64 = AtomicU64::new(0);
-    let mut new = path.as_os_str().to_owned();
-    new.push(format!(".new.{}", WRITES.fetch_add(1, Ordering::Relaxed)));
-    let new = PathBuf::from(new);
+    let new = beside(path);
     let kept = std::fs::write(&new, bytes).and_then(|()| std::fs::rename(&new, path));
     if kept.is_err() {
         let _ = std::fs::remove_file(&new);
     }
     kept
+}
+
+/// Keeps `bytes` at `path` whole where nothing is kept there yet, as [`keep_whole`] does, but
+/// linked as `path` rather than renamed over it. A link fails where another writer kept its
+/// own there first (link(2)'s EEXIST, CreateHardLinkW's ERROR_ALREADY_EXISTS), so callers
+/// making a home's first record at once each take the one kept, never their own beside it.
+/// `Ok(true)` where these bytes are the record, `Ok(false)` where another's are.
+fn keep_first(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    let new = beside(path);
+    let kept = std::fs::write(&new, bytes).and_then(|()| std::fs::hard_link(&new, path));
+    let _ = std::fs::remove_file(&new);
+    match kept {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// A name beside `path` of this write's alone: a count of this process's writes, the one
+/// daemon that holds the home ([`keep_whole`]).
+fn beside(path: &Path) -> PathBuf {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let mut new = path.as_os_str().to_owned();
+    new.push(format!(".new.{}", WRITES.fetch_add(1, Ordering::Relaxed)));
+    PathBuf::from(new)
 }
 
 /// The request microVM `id` was made by, as a client asks to start it again: attached
@@ -9239,6 +8978,36 @@ fn new_log(dir: &Path) -> io::Result<Log> {
         index: made(index)?,
         seq: 0,
     })
+}
+
+/// A launched VM process a watcher is to follow (`Daemon::start`), and its network process:
+/// ended where no watcher takes them, as a watcher's thread that does not start drops them
+/// unrun. Its VM is killed and waited for, then its network process, which goes as its VM
+/// does, is followed to its end by the home's record (`netproc::reap`, D217).
+struct Unwatched<'s> {
+    vm: Option<Arc<shards_ipc::Child>>,
+    net: Option<crate::netproc::NetProcess>,
+    ends: &'s ends::Ends,
+}
+
+impl Unwatched<'_> {
+    /// Its network process, for the watcher that takes them: neither is ended as this goes.
+    fn watched(mut self) -> Option<crate::netproc::NetProcess> {
+        self.vm = None;
+        self.net.take()
+    }
+}
+
+impl Drop for Unwatched<'_> {
+    fn drop(&mut self) {
+        if let Some(vm) = self.vm.take() {
+            let _ = vm.kill(shards_ipc::signal::SIGKILL);
+            let _ = vm.wait();
+        }
+        if let Some(net) = self.net.take() {
+            crate::netproc::reap(&net, self.ends);
+        }
+    }
 }
 
 /// How long a VM process may take to send its first request for access before its stacks
@@ -11206,13 +10975,16 @@ mod tests {
     /// A closed daemon's slots hold it while each client takes what it is given: one read
     /// late is still whole, as a stepping-aside daemon's RESTART must reach its client
     /// (cut off by its exit before its slot passed it on, x86_64 CI); and a client that
-    /// takes nothing holds it no longer than a request's time from the start of the piece
-    /// it leaves untaken, so that a stopped client keeps no daemon from exiting (PM M261).
+    /// takes nothing holds it no longer than the slowest take seen, from when its answer's
+    /// writer began waiting on it, so that a stopped client keeps no daemon from exiting (PM
+    /// M261, M549). Unix's: a named pipe says nothing of its room before a write, so on
+    /// Windows a closed daemon follows its clients' ends alone.
+    #[cfg(unix)]
     #[test]
     fn a_closed_daemon_waits_for_its_clients_to_take_their_answers() {
         use shards_ipc::slots as s;
         let t = Test::new("la");
-        lock(&t.daemon.seen).least = Duration::from_millis(500);
+        lock(&t.daemon.seen).taken(Duration::from_millis(500));
         t.run(|t| {
             t.t.daemon
                 .serve_slots(t.threads, s::Requests::open(&t.home).unwrap());
@@ -11242,7 +11014,7 @@ mod tests {
             let never = ask();
             t.until("its answers were not being written", |d| {
                 d.busy.load(Ordering::SeqCst) == 0
-                    && lock(&d.live).values().filter(|l| l.writing.is_some()).count() == 2
+                    && lock(&d.live).values().filter(|l| l.waiting.is_some()).count() == 2
             });
             t.daemon.close();
             assert!(t.daemon.slots_hold().0, "closed, held by no answer being written");
@@ -11270,13 +11042,13 @@ mod tests {
             drop(late);
             let since = lock(&t.daemon.live)
                 .values()
-                .find_map(|l| l.writing)
+                .find_map(|l| l.waiting)
                 .expect("its write");
             t.until("a client that takes nothing held its closed daemon", |d| {
                 !d.slots_hold().0
             });
             assert!(
-                since.elapsed() >= lock(&t.daemon.seen).answer_wait(),
+                since.elapsed() >= lock(&t.daemon.seen).answer_wait().unwrap(),
                 "{:?}",
                 since.elapsed()
             );
@@ -11295,22 +11067,24 @@ mod tests {
     /// nothing. Let go of a request's time after the close, the daemon exited as the run's
     /// end came, before its slot passed on the EXIT the run's VM wrote, and the run's client
     /// said its microVM stopped before its command ended (125: budget E2E 40162744975's a,
-    /// `a_daemon_ending_its_runs_is_waited_for`, PM M331). Its client's piece left untaken
-    /// lets go of it as before.
+    /// `a_daemon_ending_its_runs_is_waited_for`, PM M331). Its client leaving its answer
+    /// untaken lets go of it once the slowest take seen has passed, no more: before, twice
+    /// the longest piece, at least TCP's R2, 100 s (PM M549). Unix's, as the test above.
+    #[cfg(unix)]
     #[test]
     fn a_closed_daemon_waits_for_what_a_slot_it_passed_on_has_yet_to_hear() {
         let t = Test::new("sp");
-        lock(&t.daemon.seen).least = Duration::from_millis(200);
+        lock(&t.daemon.seen).taken(Duration::from_millis(200));
         t.run(|t| {
             let living = slots::Living::new(&t.daemon, 0);
             living.passed();
             t.daemon.close();
-            std::thread::sleep(lock(&t.daemon.seen).answer_wait() * 3);
+            std::thread::sleep(lock(&t.daemon.seen).answer_wait().unwrap() * 3);
             assert!(
                 t.daemon.slots_hold().0,
                 "a slot whose request went on let go of with its answer still to come"
             );
-            // An answer its client leaves untaken lets go of it a request's time in.
+            // An answer its client leaves untaken lets go of it the slowest take in.
             let (client, ours) = shards_ipc::slots::joined().unwrap();
             let answer = vec![b'x'; 1 << 20];
             std::thread::scope(|s| {
@@ -11326,18 +11100,49 @@ mod tests {
         });
     }
 
+    /// Before any take has been seen, a closed daemon follows a client that takes nothing of
+    /// its answer by its end alone (PM M549): held, with no time it lets go at, until the
+    /// client ends, and its writer's write fails then. Unix's, as the tests above.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_daemon_with_no_take_seen_holds_a_client_until_it_ends() {
+        let t = Test::new("cold");
+        t.run(|t| {
+            let living = slots::Living::new(&t.daemon, 0);
+            living.passed();
+            t.daemon.close();
+            let (client, ours) = shards_ipc::slots::joined().unwrap();
+            let answer = vec![b'x'; 1 << 20];
+            std::thread::scope(|s| {
+                let writer = s.spawn(|| living.answer(&ours, kind::ERR, &answer));
+                t.until("its writer did not wait on its client", |d| {
+                    lock(&d.live).values().any(|l| l.waiting.is_some())
+                });
+                assert_eq!(lock(&t.daemon.seen).answer_wait(), None);
+                assert_eq!(t.daemon.slots_hold(), (true, None), "let go of with no take seen");
+                drop(client);
+                assert!(writer.join().unwrap().is_err());
+            });
+            drop(living);
+            assert!(lock(&t.daemon.live).is_empty());
+        });
+    }
+
     /// A closed daemon's slot holds it while its client takes a long answer slowly, though
-    /// all of it takes that client far past a request's time: each piece it takes is a step
-    /// on. Timed from the whole answer's write, its client was let go of a request's time
-    /// in, still reading, and the daemon would have exited mid-answer.
+    /// all of it takes that client far past the slowest take: each room it makes is a take.
+    /// Timed from the whole answer's write, its client would be let go of, still reading,
+    /// and the daemon would exit mid-answer.
     #[test]
     fn a_closed_daemon_waits_for_a_client_taking_its_answer_slowly() {
         let t = Test::new("sl");
-        // The wait each piece has, many times what one takes this client: a host at a load
-        // of 31 slowed its reads fourfold, and a piece of 64 KiB missed 500 ms.
-        lock(&t.daemon.seen).least = Duration::from_secs(3);
+        // The slowest take seen, many times what one takes this client: a host at a load of
+        // 31 slowed its reads fourfold.
+        lock(&t.daemon.seen).taken(Duration::from_secs(3));
         t.run(|t| {
+            // Its client opened it, and its request went on, as a slot's serving says.
             let living = slots::Living::new(&t.daemon, 0);
+            living.opened();
+            living.passed();
             t.daemon.close();
             let (mut client, ours) = shards_ipc::slots::joined().unwrap();
             let answer = vec![b'x'; 1 << 20];
@@ -11367,7 +11172,7 @@ mod tests {
                 written.unwrap();
                 assert_eq!(taken, answer.len() + 5);
                 assert!(
-                    t0.elapsed() > lock(&t.daemon.seen).answer_wait(),
+                    t0.elapsed() > lock(&t.daemon.seen).answer_wait().unwrap(),
                     "{:?}",
                     t0.elapsed()
                 );
@@ -11846,71 +11651,178 @@ mod tests {
         assert!(matches!(e, Untaken::Surely(_)), "{e:?}");
     }
 
-    /// A client whose request does not come whole within its wait is cut, and told to ask
-    /// again (RESTART), as a request is cut only where asking again is a restart (D222's
-    /// cutoff, `slots::Seen`); the cut is learned, the next wait doubled (RFC 6298 §5.5).
-    /// Before, its slot ended unanswered after 10 s, which its client took for its
-    /// command's end.
+    /// A request's rest is waited for while its client goes on with it (D185, PM M545). A
+    /// request whole at once is answered, and teaches nothing: its rest was there as its first
+    /// byte was read, and waited on no client (R03's cold start). A
+    /// client whose rest has begun is not cut, however long it then pauses: past the old
+    /// cutoff's longest draw (a second at least before any cut, from [1 s, 2 s)), it has
+    /// heard nothing; told to ask again (RESTART) only as the daemon ends its clients, as one
+    /// whose request no thread had taken is. Before, a request not whole within a second or
+    /// more of its first byte was cut, and the next wait doubled for each cut in a row.
     #[test]
-    fn a_request_cut_tells_its_client_to_ask_again() {
+    fn a_request_is_waited_for_while_its_client_goes_on_with_it() {
         use shards_ipc::slots as s;
         let t = Test::new("cut");
         t.run(|t| {
             t.t.daemon
                 .serve_slots(t.threads, s::Requests::open(&t.home).unwrap());
-            let s::Taken::Slot(client) = s::take(&t.home, 0).unwrap() else {
-                panic!("no daemon");
+            let take = || {
+                let s::Taken::Slot(client) = s::take(&t.home, 0).unwrap() else {
+                    panic!("no daemon");
+                };
+                client
             };
-            // Its first byte and a part of the rest: a request begun, never whole (no
-            // streams, no descriptors, a frame of kind 0 whose length is two bytes short).
-            let t0 = Instant::now();
-            client.sender().unwrap().send(0, &[]).unwrap();
-            let said = client.recv().unwrap().expect("its slot ended unanswered");
-            let took = t0.elapsed();
-            assert_eq!(said.kind, kind::RESTART);
-            // Before any request was whole, a second, drawn from [1 s, 2 s).
-            assert!(took >= Duration::from_secs(1) && took < PATIENCE, "{took:?}");
-            {
-                let seen = lock(&t.daemon.seen);
-                assert_eq!(seen.cuts, 1);
-                assert!(seen.request_wait(0.0) >= Duration::from_secs(2));
+            // An inspect of a microVM there is none of, which the daemon answers alone.
+            let command = shards_ipc::Command {
+                argv: vec!["inspect".to_string(), "none".to_string()],
+                registry_env: Vec::new(),
+                east_asian: false,
+                now: 0,
+                utc_offset: 0,
+                terminal: false,
+                width: 0,
+                color: false,
+                daemon: Identity::default(),
+                client: String::new(),
+            };
+            let whole = take();
+            whole.ask(kind::CONTAINER, &command.encode(), &[]).unwrap();
+            let end = loop {
+                match whole.recv().unwrap() {
+                    Some(f) if f.kind == kind::END => break f.payload,
+                    Some(f) => assert_ne!(f.kind, kind::RESTART, "a whole request told to ask again"),
+                    None => panic!("a whole request's answer ended unsaid"),
+                }
+            };
+            assert_eq!(end, [1]);
+            assert_eq!(
+                lock(&t.daemon.seen).request_stall(),
+                None,
+                "a rest there at once taught a wait"
+            );
+            drop(whole);
+            // Its first byte and a part of the rest (no streams, no descriptors, a frame of
+            // kind 0 whose length is two bytes short), then nothing.
+            let begun = take();
+            begun.sender().unwrap().send(0, &[]).unwrap();
+            match begun.recv_within(Duration::from_millis(2500)) {
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {}
+                said => panic!("a client whose rest had begun heard {said:?}"),
             }
-            drop(client);
+            t.daemon.end_clients();
+            let said = begun.recv().unwrap().expect("its slot ended unanswered");
+            assert_eq!(said.kind, kind::RESTART);
+            drop(begun);
             // Its slots' maker ends as the daemon closes.
             t.daemon.close();
         });
     }
 
-    /// A request's rest is waited for as its clients' requests have shown makes them come
-    /// soonest when a cut is asked again (D222's cutoff): a second before any, drawn from
-    /// [t, 2t); doubled for each cut in a row, and no longer once one comes whole; the least
-    /// second where requests come whole at once (RFC 6298 §2.4); past what slow clients take.
-    /// A client that takes nothing of its answer is waited for twice the longest one took a
-    /// piece in, RFC 1122's R2 at least.
+    /// A client paused past its first byte is waited for until its rest comes while no
+    /// client has been waited on for one (D185, R03's cold start): a request whole at once,
+    /// its rest there as its first byte was read, waited on no client and teaches nothing, so
+    /// a stand-in client that writes its first byte, then its rest after a pause longer than
+    /// any rest seen, is answered. Its rest, waited on, teaches the wait: a client that sends
+    /// nothing past its first byte for longer than that is told to ask again (RESTART).
+    /// Before, the first request's rest, read 2.334 µs after its first byte on a KVM x86_64
+    /// host, cut every client after it that paused there (CI's
+    /// `clients_past_the_cap_wait_their_turn`).
+    #[cfg(unix)]
+    #[test]
+    fn a_client_paused_past_its_first_byte_is_waited_for() {
+        use shards_ipc::slots as s;
+        let t = Test::new("pause");
+        t.run(|t| {
+            t.t.daemon
+                .serve_slots(t.threads, s::Requests::open(&t.home).unwrap());
+            let take = || {
+                let s::Taken::Slot(client) = s::take(&t.home, 0).unwrap() else {
+                    panic!("no daemon");
+                };
+                client
+            };
+            // A writer of the slot's `say` of the test's own, as a client's would be.
+            let say = |client: &s::Client| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(t.home.join(s::DIR).join(format!("{}.say", client.n)))
+                    .unwrap()
+            };
+            // Its answer's last word: END or RESTART.
+            let last = |client: &s::Client| loop {
+                match client.recv().unwrap() {
+                    Some(f) if f.kind == kind::END || f.kind == kind::RESTART => break f.kind,
+                    Some(_) => {}
+                    None => panic!("an answer ended unsaid"),
+                }
+            };
+            // An inspect of a microVM there is none of, which the daemon answers alone.
+            let command = shards_ipc::Command {
+                argv: vec!["inspect".to_string(), "none".to_string()],
+                registry_env: Vec::new(),
+                east_asian: false,
+                now: 0,
+                utc_offset: 0,
+                terminal: false,
+                width: 0,
+                color: false,
+                daemon: Identity::default(),
+                client: String::new(),
+            }
+            .encode();
+            let whole = take();
+            whole.ask(kind::CONTAINER, &command, &[]).unwrap();
+            assert_eq!(last(&whole), kind::END);
+            drop(whole);
+            // Its first byte (no streams), then after a pause, the rest: no descriptors, and
+            // the request.
+            let pause = Duration::from_millis(300);
+            let paused = take();
+            let mut writes = say(&paused);
+            writes.write_all(&[0]).unwrap();
+            std::thread::sleep(pause);
+            let mut rest = vec![0u8];
+            rest.extend(s::frame(kind::CONTAINER, &command).unwrap());
+            writes.write_all(&rest).unwrap();
+            assert_eq!(
+                last(&paused),
+                kind::END,
+                "a client paused past its first byte was told to ask again"
+            );
+            // The whole request's rest taught nothing; the paused one's, waited on, teaches.
+            let learned = lock(&t.daemon.seen).request_stall();
+            assert!(learned.is_some_and(|w| w >= pause), "{learned:?}");
+            drop((writes, paused));
+            // Nothing past its first byte for longer than the slowest rest seen: told to ask
+            // again, no sooner.
+            let silent = take();
+            let mut writes = say(&silent);
+            let t0 = Instant::now();
+            writes.write_all(&[0]).unwrap();
+            assert_eq!(last(&silent), kind::RESTART);
+            assert!(t0.elapsed() >= pause, "{:?}", t0.elapsed());
+            drop((writes, silent));
+            t.daemon.close();
+        });
+    }
+
+    /// While none of a request's rest has come, it is waited for as long as the slowest
+    /// rest seen whole (D185, PM M545): none before any, the client's end alone then; a
+    /// slower rest raises it, a faster one leaves it. A client that takes nothing of its
+    /// answer is waited for as long as the slowest take seen, none before any (PM M549).
     #[test]
     fn a_requests_wait_is_learned_from_its_clients() {
         let mut seen = slots::Seen::default();
-        assert_eq!(seen.request_wait(0.0), Duration::from_secs(1));
-        assert_eq!(seen.request_wait(0.5), Duration::from_millis(1500));
-        seen.cut(Duration::from_secs(1));
-        assert_eq!(seen.request_wait(0.0), Duration::from_secs(2));
-        seen.cut(Duration::from_secs(2));
-        assert_eq!(seen.request_wait(0.0), Duration::from_secs(4));
-        for _ in 0..100 {
-            seen.whole(Duration::from_micros(300));
-        }
-        assert_eq!(seen.cuts, 0);
-        assert_eq!(seen.request_wait(0.0), Duration::from_secs(1));
-        let mut slow = slots::Seen::default();
-        for _ in 0..100 {
-            slow.whole(Duration::from_secs(3));
-        }
-        let wait = slow.request_wait(0.0);
-        assert!(
-            wait >= Duration::from_secs(3) && wait < Duration::from_secs(4),
-            "{wait:?}"
-        );
-        assert_eq!(seen.answer_wait(), Duration::from_secs(100));
+        assert_eq!(seen.request_stall(), None);
+        seen.whole(Duration::from_micros(300));
+        assert_eq!(seen.request_stall(), Some(Duration::from_micros(300)));
+        seen.whole(Duration::from_secs(3));
+        seen.whole(Duration::from_micros(40));
+        assert_eq!(seen.request_stall(), Some(Duration::from_secs(3)));
+        assert_eq!(seen.answer_wait(), None);
+        seen.taken(Duration::from_millis(240));
+        seen.taken(Duration::from_millis(60));
+        assert_eq!(seen.answer_wait(), Some(Duration::from_millis(240)));
     }
 
     /// A client no descriptor is left for is refused with the listener's spare: accepted with
@@ -11956,6 +11868,37 @@ mod tests {
             living.answered();
             assert_eq!(t.daemon.slots_hold(), (false, None));
             drop(living);
+        });
+    }
+
+    /// A closed daemon judges no request by its answers' record: a slot whose client opened
+    /// it, its request not yet gone on, holds it until its serving ends, however long past
+    /// the slowest take seen, its request's wait its own; and a slot no client opened has no
+    /// client, and holds nothing. Before, both were let go of the slowest take after the
+    /// close, and said to be left: "request slot 2: its client went no further in
+    /// 3.096667ms; exiting without it" (an HVF host at dc7f45bc6).
+    #[test]
+    fn a_closed_daemon_judges_no_request_by_its_answers() {
+        let t = Test::new("rq");
+        lock(&t.daemon.seen).taken(Duration::from_millis(1));
+        t.run(|t| {
+            let offered = slots::Living::new(&t.daemon, 0);
+            let opened = slots::Living::new(&t.daemon, 1);
+            opened.opened();
+            t.daemon.close();
+            std::thread::sleep(lock(&t.daemon.seen).answer_wait().unwrap() * 3);
+            assert_eq!(
+                t.daemon.slots_hold(),
+                (true, None),
+                "a request not gone on let go of by the answers' record"
+            );
+            drop(opened);
+            assert_eq!(
+                t.daemon.slots_hold(),
+                (false, None),
+                "held by a slot no client opened"
+            );
+            drop(offered);
         });
     }
 
@@ -13089,7 +13032,8 @@ mod tests {
             );
             let asked = Instant::now();
             assert_eq!(t.daemon.in_use(at, publish::TCP), publish::InUse::Host);
-            assert!(asked.elapsed() < crate::netproc::GRACE, "{:?}", asked.elapsed());
+            let slice = t.daemon.ends.slice(ends::End::Helper);
+            assert!(asked.elapsed() < slice, "{:?}", asked.elapsed());
             say(&vm, kind::DONE, &[0]);
             t.until("the run did not end", |d| {
                 !matches!(lock(&d.runs).get(&id), Some(RunState::Tracked(_)))
@@ -13098,10 +13042,58 @@ mod tests {
         });
     }
 
-    /// A VM's network process is given its grace once the VM has ended, then ended, and
-    /// the VM's ports are freed once both have gone, not before.
+    /// A launched VM no watcher takes is ended, and its network process reaped, as a
+    /// watcher's thread that does not start drops what it was given (`start`). The VM here is
+    /// a stand-in, `cat` on a pipe the test holds open, holding the doorbell a stand-in
+    /// network process (`cat`) reads, which goes as that VM goes, as shards-net goes as its
+    /// ring's doorbell hangs up. Reaped, neither's pid is any process's, not even a zombie's.
+    #[cfg(unix)]
     #[test]
-    fn a_network_process_is_ended_past_its_grace_and_the_ports_freed() {
+    fn a_vm_no_watcher_takes_is_ended_and_its_network_process_reaped() {
+        let null = File::open(crate::os::NULL).unwrap();
+        let (doorbell, rings) = io::pipe().unwrap();
+        let net = shards_ipc::spawn(
+            Path::new("/bin/cat"),
+            &[],
+            &[(doorbell.as_fd(), 0), (null.as_fd(), 1), (null.as_fd(), 2)],
+            false,
+        )
+        .unwrap();
+        drop(doorbell);
+        let (held, open) = io::pipe().unwrap();
+        let vm = shards_ipc::spawn(
+            Path::new("/bin/cat"),
+            &[],
+            &[
+                (held.as_fd(), 0),
+                (null.as_fd(), 1),
+                (null.as_fd(), 2),
+                (rings.as_fd(), 3),
+            ],
+            false,
+        )
+        .unwrap();
+        drop((held, rings));
+        let pids = [vm.id(), net.id()];
+        let home = shards_testdir::TempDir::new("unwatched").unwrap();
+        let record = ends::Ends::kept_in(&home);
+        drop(Unwatched {
+            vm: Some(Arc::new(vm)),
+            net: Some(net),
+            ends: &record,
+        });
+        for pid in pids {
+            assert!(reaped(pid), "process {pid} is left");
+        }
+        drop(open);
+    }
+
+    /// A VM's network process is given a slice of this host's once the VM has ended,
+    /// looked at, and ended once it has run nothing and freed nothing for it (D217, PM
+    /// M546): a sleeping one is, at its first look. The VM's ports are freed once both have
+    /// gone, not before, and an end the daemon made is kept as no end of the host's.
+    #[test]
+    fn a_network_process_is_ended_once_it_goes_on_no_more_and_the_ports_freed() {
         let t = Test::new("net-end");
         t.run(|t| {
             let (ready, _theirs) = t.warm_vm(None);
@@ -13118,8 +13110,14 @@ mod tests {
             let ended = Instant::now();
             let _ = vm.kill(shards_ipc::signal::SIGKILL);
             t.until("the ports were not freed", |d| lock(&d.ports_held).is_empty());
-            assert!(ended.elapsed() >= crate::netproc::GRACE, "freed within the grace");
+            let slice = t.daemon.ends.slice(ends::End::Helper);
+            assert!(ended.elapsed() >= slice, "freed within its slice");
             assert!(reaped(net_pid), "the network process was not reaped");
+            let kept = std::fs::read_to_string(t.home.join(ends::RECORD)).unwrap_or_default();
+            assert!(
+                !kept.lines().any(|l| l.starts_with("helper ") && l != "helper 0"),
+                "an end the daemon made was kept as the host's: {kept}"
+            );
             // The VM is reaped once its ports are freed (follow.rs), which the wait above
             // could see first.
             t.until("the VM was not reaped", |_| reaped(vm.id()));
@@ -13149,7 +13147,8 @@ mod tests {
             let ended = Instant::now();
             let _ = vm.kill(shards_ipc::signal::SIGKILL);
             t.until("the ports were not freed", |d| lock(&d.ports_held).is_empty());
-            assert!(ended.elapsed() < crate::netproc::GRACE, "{:?}", ended.elapsed());
+            let slice = t.daemon.ends.slice(ends::End::Helper);
+            assert!(ended.elapsed() < slice, "{:?}", ended.elapsed());
         });
     }
 
@@ -13467,7 +13466,7 @@ mod tests {
     /// The warm VMs a refill plans count as starting at once, before any is started, so
     /// that a claim or refill planning meanwhile starts none of them again; outside the
     /// pools' lock, those that cannot start count no more. A pool never claimed from keeps
-    /// one (demand.rs).
+    /// one (`shards_api::demand`).
     #[test]
     fn a_refills_vms_count_as_starting_once_planned() {
         let mut t = Test::new("planned");
@@ -14576,6 +14575,78 @@ mod tests {
     /// clients change it at once, each served on a thread of its own (an `update` and a
     /// `network disconnect`): every write is kept, a reader finds a request whole at every
     /// read, and nothing is left beside it.
+    /// An `update` and a `network connect` of one microVM at once each keep their change, as
+    /// moby keeps them under its container's lock (request-sites-v1's item 3): two clients on
+    /// threads of their own, each reading, changing and keeping the microVM's request while
+    /// the other does, round after round.
+    #[test]
+    fn an_update_and_a_connect_at_once_each_keep_their_change() {
+        const ROUNDS: usize = 200;
+        let t = Test::new("request-turns");
+        t.run(|t| {
+            let id = t.create("both");
+            let dir = lock(&t.daemon.containers).dir(&id);
+            std::fs::write(dir.join(REQUEST), Run::default().encode()).unwrap();
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    for shares in 2..2 + ROUNDS {
+                        let (status, _, err) =
+                            t.ask(&["update", "--cpu-shares", &shares.to_string(), "both"]);
+                        assert_eq!(status, 0, "{err}");
+                    }
+                });
+                s.spawn(|| {
+                    for round in 0..ROUNDS {
+                        let (status, _, err) = t.ask(&["network", "connect", &format!("n{round}"), "both"]);
+                        assert_eq!(status, 0, "{err}");
+                    }
+                });
+            });
+            let run = Run::decode(&std::fs::read(dir.join(REQUEST)).unwrap()).unwrap();
+            assert_eq!(
+                (run.endpoints.len(), run.resources.cpu_shares),
+                (ROUNDS, i64::try_from(1 + ROUNDS).unwrap()),
+                "the networks connected and the last shares, as kept"
+            );
+        });
+    }
+
+    /// Callers that ask a fresh home's engine ID at once each take the one the home keeps
+    /// (request-sites-v1's review): as many callers as this host runs at once (two at the
+    /// least, a race's own), released together, round after round on a home with none.
+    #[test]
+    fn a_homes_first_engine_id_is_one_however_many_ask_at_once() {
+        const ROUNDS: usize = 200;
+        let t = Test::new("engine-id");
+        let callers = std::thread::available_parallelism().map_or(2, |n| n.get().max(2));
+        let path = t.home.join("networks").join("engine-id");
+        let mut split = Vec::new();
+        for round in 0..ROUNDS {
+            let _ = std::fs::remove_file(&path);
+            let start = std::sync::Barrier::new(callers);
+            let ids: Vec<String> = std::thread::scope(|s| {
+                let asked: Vec<_> = (0..callers)
+                    .map(|_| {
+                        s.spawn(|| {
+                            start.wait();
+                            t.daemon.engine_id()
+                        })
+                    })
+                    .collect();
+                asked.into_iter().map(|a| a.join().unwrap()).collect()
+            });
+            let kept = std::fs::read_to_string(&path).unwrap();
+            if ids.iter().any(|id| id != kept.trim()) {
+                split.push(round);
+            }
+        }
+        assert!(
+            split.is_empty(),
+            "{} of {ROUNDS} rounds of {callers} callers took an ID the home did not keep: {split:?}",
+            split.len()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_request_kept_at_once_is_whole() {
@@ -14751,14 +14822,20 @@ mod tests {
         });
     }
 
-    /// The exec of `read metrics` its microVM never answers is ended once the VM process has
-    /// run nothing for as long as the daemon judges it by: told SIGKILL, its end waited for,
-    /// and the read refused as stalled (finding 4 of audit-fix-host-v1: it was waited for
-    /// with no end, holding its client and a daemon thread).
+    /// The exec of `read metrics` its microVM never answers is ended, once the daemon has seen
+    /// a metrics read answered, where the VM process ran nothing for a whole W* past the
+    /// slowest it has seen: told SIGKILL, its end waited for, and the read refused, saying so
+    /// (finding 4 of audit-fix-host-v1: it was waited for with no end, holding its client and
+    /// a daemon thread; D215's judge, which follows a cold kind's microVM while it lives).
     #[test]
     fn metrics_whose_microvm_runs_nothing_are_ended() {
         let t = Test::new("metrics-stalled");
         t.run(|t| {
+            // A metrics read answered before, in 50 ms, its microVM running 50 us of it.
+            t.daemon
+                .answers
+                .metrics
+                .teach(Duration::from_millis(50), Duration::from_micros(50));
             let (_, starting, vm) = running(t, "stalled");
             let out = t.home.join("metrics.json");
             let asked = metrics(t, "stalled", &out);
@@ -14777,16 +14854,15 @@ mod tests {
                 matches!(&told, Ok(Some((kind::SIGNAL, n))) if n.as_slice() == 9u32.to_be_bytes()),
                 "an exec its microVM never answered was waited for with no end: {told:?}"
             );
-            assert_eq!(
-                (status, err),
-                (
-                    1,
-                    format!(
-                        "shards: read metrics: stalled: its microVM ran nothing for {} s, so its \
-                         metrics were not read\n",
-                        TAKE_TIMEOUT.as_secs()
-                    )
-                )
+            assert_eq!(status, 1, "{err}");
+            assert!(
+                err.starts_with("shards: read metrics: stalled: its microVM ran no CPU in ")
+                    && err.contains(" past the slowest answer seen (50ms), ")
+                    && err.ends_with(
+                        " into the wait (the least a microVM ran and still answered: 50µs in \
+                         50ms), so its metrics were not read\n"
+                    ),
+                "{err}"
             );
             say(&vm, kind::DONE, &[0]);
             drop(vm);

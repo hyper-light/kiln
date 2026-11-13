@@ -567,7 +567,6 @@ impl Endpoint {
                 connections: 1,
                 command_slots: 1,
                 queued_datagram_bytes: admitted.datagram_bytes,
-                handshake_patience: admitted.patience,
             },
         )?;
         let address = driver.local()?;
@@ -1091,6 +1090,8 @@ mod tests {
     use super::*;
 
     const CONN: ConnKey = 1;
+    /// How long a test waits for what it awaits: a patience of its own.
+    const PATIENCE: Duration = Duration::from_secs(10);
     /// The guest's errnos, Linux's (include/uapi/asm-generic/errno-base.h, errno.h), as its
     /// init reports them whatever the host's own.
     const EIO: i32 = 5;
@@ -1107,14 +1108,13 @@ mod tests {
         }
     }
 
-    fn admitted(patience: Duration) -> Admitted {
+    fn admitted() -> Admitted {
         Admitted {
             record_bytes: ROOM_TEST,
             transport_bytes: TAKEN_BYTES as u64,
             // RFC 8446: uint24 handshake length plus its four-byte header.
             handshake_bytes: (1 << 24) - 1 + 4,
             datagram_bytes: super::super::DATAGRAM_BYTES,
-            patience,
         }
     }
 
@@ -1137,13 +1137,7 @@ mod tests {
 
     fn bound() -> (Endpoint, Relay, Control) {
         let identity = Identity::generate().unwrap();
-        Endpoint::bind(
-            &identity,
-            identity.fingerprint(),
-            scope(),
-            admitted(Duration::from_secs(1)),
-        )
-        .unwrap()
+        Endpoint::bind(&identity, identity.fingerprint(), scope(), admitted()).unwrap()
     }
 
     fn record_frame(offset: u64, bytes: &[u8]) -> Vec<u8> {
@@ -1474,8 +1468,7 @@ mod tests {
 
     impl Live {
         fn connect(identity: &Identity, server: Fingerprint, to: SocketAddr, offset: u64) -> Live {
-            let patience = tls::IDLE;
-            let config = client_config(identity, server, admitted(patience)).unwrap();
+            let config = client_config(identity, server, admitted()).unwrap();
             let (hears, heard) = mpsc::channel();
             let (mut driver, asks) = Driver::bind_bounded(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -1493,7 +1486,6 @@ mod tests {
                     connections: 1,
                     command_slots: 4,
                     queued_datagram_bytes: super::super::DATAGRAM_BYTES,
-                    handshake_patience: patience,
                 },
             )
             .unwrap();
@@ -1510,7 +1502,7 @@ mod tests {
         }
 
         fn hear(&self) -> Heard {
-            self.heard.recv_timeout(tls::IDLE).unwrap()
+            self.heard.recv_timeout(PATIENCE).unwrap()
         }
 
         fn taken(&self) -> u64 {
@@ -1547,7 +1539,7 @@ mod tests {
     /// An owner's subscription at `offset`, made again while the endpoint still holds a
     /// connection it has not let go of, told its first record goes at `at`.
     fn subscribed(owner: &Identity, server: Fingerprint, address: SocketAddr, offset: u64, at: u64) -> Live {
-        let deadline = std::time::Instant::now() + tls::IDLE * 3;
+        let deadline = std::time::Instant::now() + PATIENCE * 3;
         loop {
             let live = Live::connect(owner, server, address, offset);
             match live.hear() {
@@ -1596,7 +1588,7 @@ mod tests {
         let server = Identity::generate().unwrap();
         let owner = Identity::generate().unwrap();
         let (endpoint, relay, control) =
-            Endpoint::bind(&server, owner.fingerprint(), scope(), admitted(tls::IDLE)).unwrap();
+            Endpoint::bind(&server, owner.fingerprint(), scope(), admitted()).unwrap();
         let address = endpoint.address;
         let control = Arc::new(control);
         let endpoint_driver = std::thread::Builder::new()
@@ -1624,7 +1616,7 @@ mod tests {
             panic!("heard while its record was held: {heard:?}");
         }
         gate.send(()).unwrap();
-        assert_eq!(records.recv_timeout(tls::IDLE).unwrap(), first);
+        assert_eq!(records.recv_timeout(PATIENCE).unwrap(), first);
         let at = live.taken();
         assert_eq!(at, first.len() as u64);
 
@@ -1633,11 +1625,12 @@ mod tests {
         let second: &[u8] = b"no-newline\xc3\x28";
         live.send(record_frame(at, second));
         gate.send(()).unwrap();
-        assert_eq!(records.recv_timeout(tls::IDLE).unwrap(), second);
+        assert_eq!(records.recv_timeout(PATIENCE).unwrap(), second);
         live.vanish();
         let at = at + second.len() as u64;
-        // The endpoint lets the vanished owner go within its patience; until then a second
-        // connection is refused, as an output's is.
+        // The endpoint finds the vanished owner gone as the next contends for its one place,
+        // each connection holding one asked for an answer (D180's liveness at use); until then
+        // a second connection is refused, as an output's is.
         let live = subscribed(&owner, server.fingerprint(), address, first.len() as u64, at);
         live.send(end(at, 0).to_vec());
         match live.hear() {

@@ -21,6 +21,7 @@ pub mod census;
 pub mod disk_probe;
 mod emptying;
 pub mod facts;
+pub mod images;
 pub mod placement;
 pub mod quic;
 pub mod recorded;

@@ -17,23 +17,127 @@ use hex_core::stream::Deframer;
 use hex_core::stream::files::{self, Entry, Limits, Meta, Mtime, Op, What, Xattr};
 use hex_core::wire::{self, Answer, Received};
 
-use super::{Duplex, DuplexOwner, Link};
+use super::{DuplexOwner, Link};
 
 /// How long a staging connection waits on the guest's relay, each read for its answer and each write for room
-/// (decision 9): twice the slowest answer to a stage's request this process has had, from its last byte sent to the
-/// relay's answer. MEASURING: no record of a relay's answers yet; the `guest.stage` rows of
-/// `bench/competitive/probes/waits_census.md` will seed it, and until then a staging connection waits for its relay
-/// alone.
+/// (decision 9): W*, the slowest answer to a stage's request this process has had, from its last byte sent to the
+/// relay's answer, a bound only while answers come within it ([`Staging`]). Before its first answer, and from a
+/// run-out to the next, a staging connection waits for its relay alone, as long as its connection stands. No record is
+/// read: the `guest.stage` rows of `bench/competitive/probes/waits_census.md` are evidence.
 static STAGING: Patience = Patience::measuring("guest.stage");
 
-/// Reads the relay's answer to what was sent at `sent`, the time it took taught to [`STAGING`].
+/// A staging connection, its waits on the relay as decision 9 waits them (the person's ruling of 2026-11-13): each read
+/// and each write within W* ([`STAGING`], or a test's own). Past it the run-out is told to the census, once and with no
+/// sample, and the connection is followed by its relay's life alone, as at every local site
+/// (docs/research/runtime/learned-waits.md), its timeouts let go: only the connection's end or reset ends a read or a
+/// write then.
+///
+/// With no W* each waits for the relay alone. The answer, however long it took, is the sample W* rises to, and the
+/// connection's next waits are bounded again, by the W* it rose to ([`Staging::answered`]). Its timeouts are set at its
+/// next read or write, never on a connection its relay closed after its last answer: macOS refuses a closed socket's
+/// options (`EINVAL`).
+struct Staging<'a> {
+    conn: DuplexOwner,
+    wait: &'a Patience,
+    /// W*, the connection's timeouts while within it: none with no W*, and none past it.
+    window: Option<std::time::Duration>,
+    /// Whether the connection's timeouts are `window`'s: false from a change of it to the next read or write.
+    armed: bool,
+}
+
+impl Staging<'_> {
+    /// Within W* as `wait` has it now (none with none), from the next read or write.
+    fn within(&mut self) {
+        self.window = self.wait.deadline();
+        self.armed = false;
+    }
+
+    /// An answer of the relay's, `took` after what it answers was sent: the sample W* rises to, and the connection's
+    /// next waits bounded by it.
+    fn answered(&mut self, took: std::time::Duration) {
+        self.wait.answered(took);
+        self.within();
+    }
+
+    /// Sets the connection's timeouts to its window, where they aren't already.
+    fn arm(&mut self) -> io::Result<()> {
+        if !self.armed {
+            self.conn.set_write_timeout(self.window)?;
+            self.conn.set_read_timeout(self.window)?;
+            self.armed = true;
+        }
+        Ok(())
+    }
+
+    /// A read or a write, begun at `began`, whose timeout ended: once W*, `window`, has passed since it began, past W*
+    /// from now on, its run-out told, once, and the connection followed by its relay's life alone, its timeouts let go
+    /// until an answer bounds it again. A socket's timeout counts the kernel's ticks, and can end before its window
+    /// has passed (a timeout of one tick ends at the next): such a read or write is only tried again.
+    fn timed_out(
+        &mut self,
+        began: std::time::Instant,
+        window: std::time::Duration,
+    ) -> io::Result<()> {
+        if began.elapsed() < window {
+            return Ok(());
+        }
+        self.wait.ran_out(window);
+        self.window = None;
+        self.armed = false;
+        self.arm()
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.conn.shutdown(how)
+    }
+}
+
+/// Whether `e` is a timeout's end of a read or a write.
+fn timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+impl Read for Staging<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.arm()?;
+        let began = std::time::Instant::now();
+        loop {
+            match (self.conn.read(buf), self.window) {
+                (Err(e), Some(window)) if timeout(&e) => self.timed_out(began, window)?,
+                (got, _) => return got,
+            }
+        }
+    }
+}
+
+impl Write for Staging<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.arm()?;
+        let began = std::time::Instant::now();
+        loop {
+            match (self.conn.write(buf), self.window) {
+                (Err(e), Some(window)) if timeout(&e) => self.timed_out(began, window)?,
+                (got, _) => return got,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.conn.flush()
+    }
+}
+
+/// Reads the relay's answer to what was sent at `sent`, the time it took taught to the connection's wait.
 fn relay_answer(
-    conn: &mut dyn Duplex,
+    conn: &mut Staging<'_>,
     deframer: &mut Deframer,
     sent: std::time::Instant,
 ) -> Result<Vec<u8>, Refusal> {
     let got = message(conn, deframer)?;
-    STAGING.answered(sent.elapsed());
+    conn.answered(sent.elapsed());
     Ok(got)
 }
 
@@ -180,6 +284,17 @@ pub fn stage(
     items: &[Item],
     limits: &Limits,
 ) -> Result<Staged, Refusal> {
+    stage_with(link, id, items, limits, &STAGING)
+}
+
+/// [`stage`], its waits on the relay as `wait` has learned them.
+fn stage_with(
+    link: &dyn Link,
+    id: &BoxId,
+    items: &[Item],
+    limits: &Limits,
+    wait: &Patience,
+) -> Result<Staged, Refusal> {
     // The root's layers, by digest: the store's names for them (§4a). A stage stages one root.
     let layers: Vec<&Layer> = items
         .iter()
@@ -190,13 +305,13 @@ pub fn stage(
         .flatten()
         .collect();
     let digests: Vec<Option<files::Digest>> = layers.iter().map(|l| l.digest).collect();
-    let mut conn = dial(link)?;
+    let mut conn = dial(link, wait)?;
     let mut deframer = Deframer::new(wire::MAX_MESSAGE);
     conn.write_all(&files::open_stage(id.as_str(), &digests).map_err(refused)?)
         .map_err(|e| Refusal::os("sending staged files", e))?;
     // The relay answers the opening with the stage's budget, what its file system has free and which of
     // the layers it already holds, or refuses.
-    let first = relay_answer(&mut *conn, &mut deframer, std::time::Instant::now())?;
+    let first = relay_answer(&mut conn, &mut deframer, std::time::Instant::now())?;
     let Some(budget) = files::read_budget(&first) else {
         return Err(answer_of(&first).err().unwrap_or_else(|| {
             Refusal::Broken("the relay answered a stage's opening with no budget".to_owned())
@@ -215,7 +330,7 @@ pub fn stage(
         path: limits.path,
     };
     let sent = {
-        let mut out = BufWriter::with_capacity(64 << 10, Writer(&mut *conn));
+        let mut out = BufWriter::with_capacity(64 << 10, &mut conn);
         pack_items(&mut out, items, &learned, &budget.present, budget.admitting).and_then(
             |hashed| {
                 out.write_all(&files::END)
@@ -239,7 +354,7 @@ pub fn stage(
     // The answer is read first, so the relay has removed a partial copy before this returns. Its
     // answer names a stream cut short when the packer refused part way; the packer's own refusal names
     // the entry, and is the one returned, unless it was only the connection failing.
-    let answered = relay_answer(&mut *conn, &mut deframer, ended).and_then(|m| answer_of(&m));
+    let answered = relay_answer(&mut conn, &mut deframer, ended).and_then(|m| answer_of(&m));
     match (answered, sent) {
         (_, Err(why)) if !matches!(&why, Refusal::Os { op, .. } if op.starts_with("sending")) => {
             Err(why)
@@ -254,22 +369,26 @@ pub fn stage(
 
 /// Removes `id`'s staged copy through `link`. A copy that isn't there is [`Refusal::NoSuchBox`].
 pub fn unstage(link: &dyn Link, id: &BoxId) -> Result<(), Refusal> {
-    let mut conn = dial(link)?;
+    let wait = &STAGING;
+    let mut conn = dial(link, wait)?;
     let open = files::open(Op::Remove, id.as_str()).map_err(refused)?;
     conn.write_all(&open)
         .map_err(|e| Refusal::os("asking for a staged copy's removal", e))?;
     // A removal ends at its opening, where the relay answers: read with the connection whole, as a stage's is.
     let sent = std::time::Instant::now();
     let mut deframer = Deframer::new(wire::MAX_MESSAGE);
-    relay_answer(&mut *conn, &mut deframer, sent).and_then(|m| answer_of(&m))
+    relay_answer(&mut conn, &mut deframer, sent).and_then(|m| answer_of(&m))
 }
 
-fn dial(link: &dyn Link) -> Result<DuplexOwner, Refusal> {
-    let conn = link.dial(files::FILES_PORT)?;
-    let patience = STAGING.deadline();
-    conn.set_write_timeout(patience)
-        .and_then(|()| conn.set_read_timeout(patience))
-        .map_err(|e| Refusal::os("bounding a staging connection", e))?;
+/// A staging connection to the relay, its waits as `wait` has learned them ([`Staging`]).
+fn dial<'a>(link: &dyn Link, wait: &'a Patience) -> Result<Staging<'a>, Refusal> {
+    let mut conn = Staging {
+        conn: link.dial(files::FILES_PORT)?,
+        wait,
+        window: None,
+        armed: false,
+    };
+    conn.within();
     Ok(conn)
 }
 
@@ -280,21 +399,8 @@ fn refused(why: files::Refused) -> Refusal {
     }
 }
 
-/// A `&mut dyn Duplex` as a writer a `BufWriter` can own.
-struct Writer<'a>(&'a mut dyn Duplex);
-
-impl Write for Writer<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
-    }
-}
-
 /// The relay's next framed message.
-fn message(conn: &mut dyn Duplex, deframer: &mut Deframer) -> Result<Vec<u8>, Refusal> {
+fn message(conn: &mut impl Read, deframer: &mut Deframer) -> Result<Vec<u8>, Refusal> {
     // A whole message's bound, so one read can hold an answer.
     let mut buf = vec![0u8; wire::MAX_MESSAGE];
     loop {

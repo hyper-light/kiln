@@ -178,7 +178,7 @@ pub fn load_runtime_evidence(
     }
     let (responses, rest) = cpu::split(&evidence)?;
     let native = images::parse(rest, cost.id)?;
-    Ok((cost, native, responses))
+    Ok((cost.census_free(), native, responses))
 }
 
 impl GuestConfig {
@@ -261,8 +261,18 @@ mod tests {
         }
     }
 
+    /// The profile `cost` as the node takes it: the census's overheads evidence alone (joint plan step 14).
+    fn census_free(cost: RuntimeCost) -> RuntimeCost {
+        RuntimeCost {
+            guest_overhead: CapacityResources::default(),
+            overhead: CapacityResources::default(),
+            ..cost
+        }
+    }
+
     /// AC-T7.4.1: an explicit measured profile is admitted only with both exact
-    /// file integrity and the fixed evidence identity, before any native effect.
+    /// file integrity and the fixed evidence identity, before any native effect; its census's
+    /// overheads are evidence alone (joint plan step 14; ROOT, 2026-11-13, by decision 9's rule).
     #[test]
     fn runtime_cost_file_and_evidence_must_both_match_exact_digests() {
         let dir = tempfile::tempdir().unwrap();
@@ -274,11 +284,33 @@ mod tests {
         let bytes = serde_json::to_vec(&cost).unwrap();
         std::fs::write(&file, &bytes).unwrap();
         let expected = Sha256::digest(&bytes).into();
-        assert_eq!(load_runtime_cost(&file, expected, &evidence).unwrap(), cost);
+        assert_eq!(
+            load_runtime_cost(&file, expected, &evidence).unwrap(),
+            census_free(cost)
+        );
         assert!(load_runtime_cost(&file, [0; 32], &evidence).is_err());
         std::fs::write(&evidence, b"changed evidence").unwrap();
         assert!(load_runtime_cost(&file, expected, &evidence).is_err());
         assert!(load_runtime_cost(Path::new("relative"), expected, &evidence).is_err());
+    }
+
+    /// Joint plan step 14 (AC-T7.4.1; ROOT, 2026-11-13, by decision 9's rule: a census row is evidence only, never a
+    /// starting number): a node whose census measured a guest allowance and a VMM overhead admits by the envelope at
+    /// its cold start. Do load such a cost and admit a workload of its whole envelope. Expect the workload admitted,
+    /// its receipt the envelope alone, no census number in it.
+    #[test]
+    fn w14_a_census_overhead_is_evidence_and_fit_is_on_the_envelope_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = dir.path().join("evidence.json");
+        let file = dir.path().join("cost.json");
+        std::fs::write(&evidence, b"model census").unwrap();
+        let cost = profile(Sha256::digest(b"model census").into());
+        let bytes = serde_json::to_vec(&cost).unwrap();
+        std::fs::write(&file, &bytes).unwrap();
+        let loaded = load_runtime_cost(&file, Sha256::digest(&bytes).into(), &evidence).unwrap();
+        let receipt = loaded.allocate(cost.ceiling).unwrap();
+        assert_eq!(receipt.resources, cost.ceiling);
+        assert_eq!(receipt.guest().unwrap(), cost.ceiling);
     }
 
     /// AC-T7.4.1: missing fields, unknown inputs, malformed digests and excessive

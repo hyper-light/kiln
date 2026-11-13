@@ -342,8 +342,8 @@ fn observed(dir: &std::path::Path, deleted: bool) -> Observed {
     })
     .unwrap();
     let native_calls = Arc::new(AtomicUsize::new(0));
-    let budget =
-        managed::Budget::new(crate::guest::recorded_boot().unwrap().saturating_mul(2)).unwrap();
+    // One observer attempt's budget, as the node gives one before any boot (`first_dial_bound`).
+    let budget = managed::Budget::new(crate::guest::recorded_dial_bound().unwrap()).unwrap();
     let worker = std::thread::Builder::new()
         .name("observer-known-facts".into())
         .spawn(move || failed_workload(peer, stdout, stderr, budget, deleted))

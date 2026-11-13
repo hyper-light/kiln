@@ -659,6 +659,16 @@ fn executable(d: &Domain, env: &[CString]) -> Result<CString, String> {
         })
 }
 
+/// `d`'s command line (D256): its program as found ([`executable`]), the rest of its config's
+/// `run.command` (its entrypoint's words, then its options), then the run-time arguments its
+/// run stages, in their order; none staged, its config's alone.
+fn command_line<'a>(program: &'a CStr, d: &'a Domain, args: &'a [CString]) -> Vec<&'a CStr> {
+    std::iter::once(program)
+        .chain(d.argv.iter().skip(1).map(CString::as_c_str))
+        .chain(args.iter().map(CString::as_c_str))
+        .collect()
+}
+
 /// Where `home`, a member's `HOME`, lies among the mounts it may write as it starts, each by
 /// its mount point in its view (`points`: its scratch's `/tmp`, a writable volume's as
 /// declared and as it lies in the image): the deepest that is `home` or holds it, by its
@@ -872,6 +882,9 @@ struct Prepared {
     hosts: Option<Vec<u8>>,
     /// Its `/etc/resolv.conf`, where it reaches past the microVM.
     resolv: Option<Vec<u8>>,
+    /// Where its image's trust bundle lies, and the bundle with the run's CA laid over it
+    /// (D242), where its link reaches a host the run's credential grants name.
+    trust: Option<(CString, Vec<u8>)>,
     /// Where it waits for its link, before it holds nothing of init's.
     go: Option<RawFd>,
     /// Where it sends the listener of the chooser's filter, and the filter, for a domain
@@ -1773,6 +1786,15 @@ pub fn start(
         .map_err(|e| format!("the image's layers: {e}"))?;
     let passwd = built_file(&built, "/etc/passwd")?;
     let group = built_file(&built, "/etc/group")?;
+    // The run's CA (D242), for each member whose link reaches a host the run's credential
+    // grants name: the image's own bundle with the CA appended, made once.
+    let trust = crate::trust::Run::of(setup).map_err(|e| e.to_string())?;
+    let laid = match &trust {
+        Some(t) if domains.iter().any(|d| t.reaches(d.link.as_ref())) => {
+            Some(t.lay(&built).map_err(|e| e.to_string())?)
+        }
+        _ => None,
+    };
     // Each share staged, and where it lies in the image.
     let mut staged: Vec<(Share, String, String)> = Vec::new();
     for (k, sh) in shares_of(setup).into_iter().enumerate() {
@@ -2041,8 +2063,21 @@ pub fn start(
             .into_iter()
             .map(|e| CString::new(e).map_err(|_| format!("{}: a NUL in its environment", d.label)))
             .collect::<Result<Vec<_>, _>>()?;
-        let env = crate::staged::env(&own, member, setup).map_err(|e| format!("{}: {e}", d.label))?;
+        let mut env = crate::staged::env(&own, member, setup).map_err(|e| format!("{}: {e}", d.label))?;
+        // The run's CA, where its link reaches a host the run's credential grants name: its
+        // bundle named by each variable its TLS stacks read roots from, and laid as it starts.
+        let given = laid
+            .as_ref()
+            .filter(|_| trust.as_ref().is_some_and(|t| t.reaches(d.link.as_ref())));
+        if let Some(l) = given {
+            if scratch.is_none() {
+                return Err(format!("{}: {}", d.label, crate::trust::Refused::NoScratch));
+            }
+            l.name_in(&mut env).map_err(|e| format!("{}: {e}", d.label))?;
+        }
         let argv0 = executable(d, &env)?;
+        // Its run-time arguments (D256): its command line points into them until it execs.
+        let given_args = crate::staged::args(member, setup).map_err(|e| format!("{}: {e}", d.label))?;
         let workdir = crate::staged::workdir(member, setup)
             .map_err(|e| format!("{}: {e}", d.label))?
             .unwrap_or_else(|| d.workdir.clone());
@@ -2149,14 +2184,15 @@ pub fn start(
                 .collect(),
             hostname: CString::new(d.cgroup.as_str())
                 .map_err(|_| format!("{}: a NUL in its name", d.label))?,
-            argv: [argv0.as_ptr()]
+            argv: command_line(&argv0, d, &given_args)
                 .into_iter()
-                .chain(d.argv.iter().skip(1).map(|a| a.as_ptr()))
+                .map(CStr::as_ptr)
                 .chain([std::ptr::null()])
                 .collect(),
             envp: env.iter().map(|a| a.as_ptr()).chain([std::ptr::null()]).collect(),
             hosts: d.link.as_ref().map(|l| l.hosts.clone()),
             resolv: d.resolv.clone(),
+            trust: given.map(|l| (l.path.clone(), l.bundle.clone())),
             go: None,
             chooser: None,
             stdin: None,
@@ -2852,6 +2888,27 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
                 fail(out, mounting);
             }
         }
+        // Its trust bundle with the run's CA (D242), over its image's, read-only, made as its
+        // names are; never passed over, as a member given it does not start without it (its
+        // bundle and its scratch were found before the clone).
+        if let Some((target, content)) = &p.trust {
+            let made = c"/tmp/.trust";
+            let fd = libc::open(
+                made.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC,
+                0o444,
+            );
+            if fd < 0 || libc::write(fd, content.as_ptr().cast(), content.len()) != content.len() as isize {
+                fail(out, c"writing its trust bundle");
+            }
+            libc::close(fd);
+            if libc::mount(made.as_ptr(), target.as_ptr(), null, libc::MS_BIND, nil) != 0
+                || libc::mount(null, target.as_ptr(), null, ro, nil) != 0
+                || libc::unlink(made.as_ptr()) != 0
+            {
+                fail(out, c"mounting its trust bundle");
+            }
+        }
         // Its Unix sockets' directories, each its own mount, read-only where it only
         // connects: connecting needs no write to the directory, and making a socket does.
         for (copy, at) in &p.sockets {
@@ -3486,6 +3543,39 @@ mod tests {
         );
         let e = found(&["tool"], "PATH=/nowhere".into()).unwrap_err();
         assert!(e.contains("\"tool\" is on no directory of PATH"), "{e}");
+    }
+
+    /// A member's command line (D256): its program as found, the rest of its config's
+    /// `run.command` (its entrypoint's words, then its options), then its run's arguments in
+    /// their order, an empty one among them; none staged, its config's alone, as before.
+    #[test]
+    fn a_members_command_line_is_its_command_then_its_runs_arguments() {
+        let d = domain_at(
+            "/agents/claude",
+            &["claude", "-p", "--output-format", "stream-json"],
+        );
+        let program = CString::new("/usr/local/bin/claude").unwrap();
+        let line = |args: &[CString]| -> Vec<Vec<u8>> {
+            command_line(&program, &d, args)
+                .iter()
+                .map(|a| a.to_bytes().to_vec())
+                .collect()
+        };
+        let own = [
+            &b"/usr/local/bin/claude"[..],
+            b"-p",
+            b"--output-format",
+            b"stream-json",
+        ];
+        assert_eq!(line(&[]), own);
+        let given: Vec<CString> = ["--resume", "s-1", "", "--model"]
+            .iter()
+            .map(|a| CString::new(*a).unwrap())
+            .collect();
+        assert_eq!(
+            line(&given),
+            [&own[..], &[&b"--resume"[..], b"s-1", b"", b"--model"][..]].concat()
+        );
     }
 
     /// The host's entries (volumes.rs, `open`): those for the domains, with their tag,

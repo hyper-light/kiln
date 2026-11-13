@@ -65,6 +65,9 @@ sha2 = "0.10.9"
 tar = "0.4.46"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
+# A credential's value wiped as it drops (hex-api's lease::Value; joint plan step 33): the version shards-api already
+# brings into the lock, so no second copy.
+zeroize = "1.9.1"
 # Same fallibly allocated native scope receipt passed to shards-api (AC-T7.4.1).
 triomphe = { version = "=0.1.17", default-features = false, features = ["std"] }
 unsize = "=1.1.0"
@@ -165,3 +168,7 @@ hyper-timing = { path = "vendor/hyper-raft/crates/hyper-timing" }
 hyper-quic = { path = "vendor/hyper-raft/crates/hyper-quic" }
 hyper-transport = { path = "vendor/hyper-raft/crates/hyper-transport" }
 shards-api = { path = "vendor/shards/crates/api" }
+# shards-api's controller of a run's agent-control endpoint (shards-remote, D238 and D252) takes hyper-quic from
+# hyper-raft by git upstream: here it is the one vendored copy above, so hex builds one hyper-quic and fetches none.
+[patch."https://github.com/hyper-light/hyper-raft"]
+hyper-quic = { path = "vendor/hyper-raft/crates/hyper-quic" }

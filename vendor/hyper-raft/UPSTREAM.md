@@ -4,11 +4,14 @@ The crates Focal's bus, Quiver and Mantle are built on (`vendor/focal-bus`, `ven
 `vendor/mantle`), at one revision of hyper-raft for all of them.
 
 - **Upstream:** https://github.com/hyper-light/hyper-raft, commit
-  `fb74b59533908472ade7e526eb08117601cede0e` (2026-11-07), MIT (`LICENSE`): hyper-raft's `main`, which
-  holds what Mantle's `main` at `87ab09e1` snapshots its hyper-* crates at (`5e40eb9`: `0a182ae` and the
-  driver fix `main` landed as `fb74b59`, a driver reading what its sockets took before it judges its
-  timers, upstream's docs/transport.md §4ap), taken with Quiver's `966ea139` for kiln's refresh of
-  Mantle, so kiln holds one copy (CP-M1). Before it, `main` at `f45fc56` and `8203466` (2026-11-07, a
+  `045cf3ff82e1d96d1f8c339d6e644d17afc998a3` (2026-11-13), MIT (`LICENSE`): hyper-raft's `main`, the
+  revision Hex and Shards' control link (`crates/remote`) take, whose hyper-quic gives a connection its
+  negotiated idle timeout (patch Q34), taken with Hex's `c7603b0b` (kiln plan
+  01a1cd8e862e7169a074db3d5fa33f3d step 17). Before it, `fb74b59` (2026-11-07), which holds what
+  Mantle's `main` at `87ab09e1` snapshots its hyper-* crates at (`5e40eb9`: `0a182ae` and the driver
+  fix, a driver reading what its sockets took before it judges its timers, upstream's
+  docs/transport.md §4ap), taken with Quiver's `966ea139` for kiln's refresh of Mantle, so kiln holds
+  one copy (CP-M1); before that, `main` at `f45fc56` and `8203466` (2026-11-07, a
   member's catch-up read off the log's device and kept a run ahead, for kiln's API runtime program),
   and `0856e05` (2026-11-02), the merge of hyper-raft's `main` (`22d5037`, kiln's CP-T2.2 line) and
   Mantle's `progress-notes-reachable` (`0a182ae`, what Mantle's `main` at `17eb8032` snapshots), made
