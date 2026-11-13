@@ -428,14 +428,22 @@ JSON-RPC as `kiln reach mcp` does. So the runner serves the same server over tha
 | the same | the same clippy | passed |
 | the same Mac, at 5dfa3d24b (merged with kiln main 9d2bd5707: step 17's re-vendor, Hex 025aae6d and Shards 1389dc0b6, and step 35's tests, none of them in part 3b's files) | the same test | 95 passed, 0 failed, 4461 filtered out, among them both `reach::mcp::lane_tests` |
 | the same | the same clippy | passed (3 min 46 s; a dependency's warnings only) |
+| the same Mac, at 3382bfa73 (merged with kiln main 8d36e0d35, step 13's node holding, which gives the node's `Config` a `capacity`: the lane test's node takes a runner's usual settings now, and the test asks `tools/list` too) | the same test | 95 passed, 0 failed, 4469 filtered out, both `reach::mcp::lane_tests` among them |
+| the same | the same clippy | passed (3 min 05 s; a dependency's warnings only), run on its own after kiln's restart at 15:06Z ended the run before its clippy began |
+
+It landed merged with kiln main 13991fea1, the run-lease broker's ledger (`secrets/`, kiln-seams' `secrets.rs`, a
+store migration and docs/seams.md), none of whose files are part 3b's, and wasn't run again.
 
 Windows' build, clippy and tests of these (`reach::mcp` is built there now) are CI's on main.
 
 Owed:
 - Each `Execs::mcp(member)` connection handed to `serve_lane` on a thread of its own, at step 17's
-  launch (`sandbox::microvm()`).
+  launch (`sandbox::microvm()`), on top of goal 60's part 7 and goal 75's listen half (ROOT,
+  2026-11-13).
 - Kiln's vendor/shards at or after Shards e1995061f, with shards-remote linked (its owner's). Step 17's
   re-vendor (kiln ba75aa819) pins Shards 1389dc0b6, from before it: its shards-remote has no `Execs::mcp`.
+  Goal 60's next re-vendor, at the Hex lead's next SHA, pins Shards main at or after 237f3ebe7, which
+  holds e1995061f.
 - Real-VM MCP round trips on Linux, macOS and Windows hosts (ROOT's).
 
 ## Part 4: each built-in names exactly the provider hosts its vendor documents
