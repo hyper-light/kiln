@@ -452,8 +452,8 @@ fn step22_opencode_runs_as_kilns_opencode_kind_launches_it() -> anyhow::Result<(
 /// opencode's Agentfile is the plan's shape (step 19's layout): the pin's base by digest; a stage for
 /// each libc, a RUN only in musl's (libstdc++, which brings libgcc, and the distribution's ripgrep, as
 /// the one opencode fetches for arm64 is a glibc build: f13, f22); opencode's own build per platform and
-/// libc from the directory kiln writes (f26); its providers' hosts by name and kiln's MCP (step 18's
-/// grants; its ACP server is on the harness's own loopback, which needs no grant, f15, f16); its HOME
+/// libc from the directory kiln writes (f26); its providers' hosts by name (step 18's grants; its ACP
+/// server is on the harness's own loopback, which needs no grant, f15, f16); its HOME
 /// as its one volume, the harness's alone; and no ENV.
 #[test]
 fn step22_opencode_agentfile_is_the_plans_shape() -> anyhow::Result<()> {

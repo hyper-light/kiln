@@ -32,7 +32,7 @@ and no credential leaves its person's volume.
 |---|---|---|
 | Its project is at its path, so kiln's diff, HEAD and checkpoint reads work there | Shards plugs the project in at its host path (D235); kiln's Agentfiles mount no `/workspace` (part 2) | the plug's call is step 17's launch |
 | Its config dir (CLAUDE_CONFIG_DIR, CODEX_HOME …) is on the machine, read for transcripts and resume | its person's volume, kept on the machine per person and harness, read there through its host view | `harness::isolated::home` |
-| kiln's MCP and its plugin dir are on the machine | MCP at `/api/mcp` on the machine through the image's grant (D236); the plugin dirs plugged read-only at their host paths | `harness::isolated::mcp`; the plugs are step 17's |
+| kiln's MCP and its plugin dir are on the machine | MCP over the link kiln drives the harness by, as its own `mcp` lane (Shards D254), never a network grant; the plugin dirs plugged read-only at their host paths | owed with the lane (below); the plugs are step 17's |
 | `KILN_*` are set for it | each one decided: the session's mark given, the machine's sockets left out | `harness::isolated::env` |
 | git signing and credential helpers know it by its process | by the microVM's key (step 11) | design below |
 | Its sign-in runs on its terminal | on the microVM's terminal lane (steps 6 and 11) | design below |
@@ -70,23 +70,18 @@ Every variable kiln gives a harness on its machine has its fate decided in `env:
 reads `kinds.rs` and `reach/mcp.rs` for each `"KILN_…"` they set: one added there without a fate
 fails it. `KILN_AGENT` (the session's mark) is given; `KILN_REACH_SOCK`, `KILN_HARNESS_SOCK` and
 `KILN_RUNNER_SOCK` are left out, as sockets of the machine a microVM can't reach (kiln's MCP does
-their work there); `KILN_REACH_ON` and `KILN_SESSION` are left out, as kiln's MCP knows the session
-by its own token. Nothing of the machine's own environment goes.
+their work there); `KILN_REACH_ON` and `KILN_SESSION` are left out, as kiln's MCP in a microVM knows
+the session by the link it rides, the session's own. Nothing of the machine's own environment goes.
 
-### kiln's MCP (`harness::isolated::mcp`)
+### kiln's MCP: over the agent-control link, never the network
 
-- The harness reaches `http://host.docker.internal:<port>/api/mcp`, the machine itself as Shards
-  names it (D236), at the one port its image grants. An image that grants no such destination gets
-  no server (`Refusal::McpNotGranted`, naming the destination it needs); a run can only keep or drop
-  an image's destinations, never add one (D236's `Narrowing.destinations`).
-- The token is the session's own MCP token (`crate::mcp::session_token`), in each harness's form:
-  Claude Code's `--mcp-config` as JSON (an `http` server, its token in its headers); Codex's `-c`
-  settings of a streamable-HTTP server, its token in `KILN_MCP_TOKEN` (`bearer_token_env_var`:
-  Codex takes no token in its configuration, codex-rs `config/src/mcp_types.rs`); ACP's `http`
-  server. Antigravity reads servers only from its own config file, in its person's volume, where a
-  session's own token can't go; Pi takes none from kiln.
-- A runner's kiln serves kiln's MCP over its own socket alone, which a microVM can't reach:
-  `Refusal::McpUnserved` until a runner serves `/api/mcp` on its loopback (owed).
+Built first as `harness::isolated::mcp`: each harness given `http://host.docker.internal:<port>/api/mcp`
+with the session's own token, through a destination its image granted (D236). ROOT withdrew that on
+2026-11-13, as the person didn't take it. kiln's MCP from inside a microVM rides the link kiln drives
+the harness by, as that link's own `mcp` lane (Shards D254, goal 58's), so default deny holds with
+no grant at all. The module, its typed refusals (`McpNotGranted`, `McpUnserved`), `Kit::for_microvm`,
+the MCP token in the member's environment and every built-in's `host.docker.internal:7070` grant
+came out before landing. What the lane needs on kiln's side is this goal's next part (Owed, below).
 
 ### The host's own tools (`harness::isolated::host_tools`)
 
@@ -135,9 +130,8 @@ What the launch does with these, in order, for an isolated session:
    (`C:\X` at `/mnt/c/X`).
 4. Set the session's `spec.env` to `Layout::host_env()` for kiln's own reads (transcripts, resume,
    memories, whose a file is). The member never gets it.
-5. Give the member `env::member_env(session, kind, mcp env)`, its image's run.env applied by Shards
-   under it, and kiln's MCP from `mcp::on_this_machine(session)` and `mcp::for_harness`, once
-   `mcp::granted(image destinations, port)` holds.
+5. Give the member `env::member_env(session, kind)`, its image's run.env applied by Shards under it.
+   kiln's MCP comes over the run's `mcp` lane (D254), owed with it.
 6. A path the harness reports (a tool call's file, a file a message mentions) is the microVM's: the
    project's is the host's own by the plug; one in its home is `Layout::host_of`'s; one on its
    scratch is nowhere here. Reading `/tmp/shot.png` on the machine for an isolated session would
@@ -157,9 +151,8 @@ What the launch does with these, in order, for an isolated session:
   a microVM doesn't have on the machine. The helper is the same `kiln-git-sign` contract
   (`gpg.format x509`), its transport the lane. A credential helper for git hosts follows the same
   path: the lane, then kiln's own credential, never a token written into the volume.
-- **kiln's MCP token.** Until step 11, the session's own MCP token goes in as above, revoked as
-  the session ends. With step 11, the microVM's key says which session asks, and no token goes in
-  at all.
+- **kiln's MCP** rides the run's own `mcp` lane (D254), whose link says which session asks: no
+  token goes into the microVM for it.
 
 ## What ran where (part 1)
 
@@ -188,7 +181,7 @@ once), then M12 again alone, as its test's first assertion leans on the 401 retr
 | M3 | an image keeping its configuration in no volume refused | `isolated::home::tests::step18_volumes_every_machine_can_keep_or_a_refusal` | `/workspace` alone not refused `NoConfigVolume` |
 | M4 | an isolated session's dirs from its volume's view alone (`Dirs::of`) | `isolated::tests::step18_an_isolated_session_without_its_volumes_view_reads_nothing_here` | the machine's own home read |
 | M5 | `KILN_HARNESS_SOCK`'s fate decided | `isolated::env::tests::step18_every_kiln_variable_a_harness_gets_is_decided_for_a_microvm` | "no fate in a microVM for KILN_HARNESS_SOCK" |
-| M6 | kiln's MCP only through the image's grant | `isolated::mcp::tests::step18_mcp_goes_only_where_the_image_grants_it` | `host.docker.internal:7071` granted for 7070 |
+| M6 | kiln's MCP only through the image's grant (withdrawn with that design, before landing) | `isolated::mcp::tests::step18_mcp_goes_only_where_the_image_grants_it` | `host.docker.internal:7071` granted for 7070 |
 | M7 | the host-tools refusal | `isolated::host_tools::tests::step18_a_session_that_needs_host_tools_is_refused_isolation_saying_why` | Xcode and MSVC projects not refused |
 | M8 | Claude Code's 401 retry as a credential refused | `trouble::tests::step18_h6_claude_says_its_401_at_its_first_retry` | "not said at its first retry" |
 | M9 | Codex's 401 status as a credential refused | `trouble::tests::step18_h6_codex_says_its_401_at_its_first_retry` | "not said at its first retry" |
@@ -209,35 +202,35 @@ passes on the tree as committed. Run with `scripts/mutate.py <kiln checkout>` th
 |---|---|
 | R01 | No panics: every fallible step returns its refusal or `None`; the tests use `anyhow::Result` and `ensure!` as the workspace's lints ask. |
 | R02 | Each decision rests on the sources cited beside it (Shards D231, D235, D236, D240; Claude Code's and Codex's own sources and docs; RFC 9110; POSIX; Microsoft's and Apple's docs). |
-| R03 | No chosen numbers. Codex's MCP tool timeout in a microVM is `reach::mcp::codex_tool_timeout_sec()`, the one its machine's config takes too (main's `CODE_WALL_MAX` and main's own allowance), not a copy of it. The statuses are HTTP's. The test's 240,673 and 246,515 are the record's own. The built-ins' one port, kiln's MCP at `host.docker.internal:7070`, is kiln's own default `http_addr` (`config::Server`). An image must name its port as written (Shards carries NETWORK unexpanded, plan.rs; a run can drop a destination but never add one, D236), so `grants_tests` derives the destination it holds every image to from `config::Server::default()`, with no literal of its own: a changed default fails it until every image follows. At start the running kiln's own port (`mcp::Kit::for_microvm`) is checked against the image's grant (`isolated::mcp::granted`), and a kiln on another port is refused `McpNotGranted`, naming the destination it needs. Nothing is estimated, so there's no cold start. |
+| R03 | No chosen numbers. The statuses are HTTP's. The test's 240,673 and 246,515 are the record's own. The built-ins' one port is 443, HTTPS's (RFC 9110 §4.2.2): no port of kiln's is in any image, as kiln's MCP is no network grant. The tests' bent images name kiln's own port from `config::Server::default()`, no literal of their own. Nothing is estimated, so there's no cold start. |
 | R04 | Refusals are typed (`isolated::Refusal`, `trouble::TroubleKind`), matched by callers; words are presentation. |
 | R05 | No new cache, wait or thread; one owner each (the layout, the session's state). |
 | R06, R07, R13 | Small pure functions at existing seams; comments say why, not what. |
 | R08, R14 | No performance claim: nothing on a hot path but one match per stream line. |
 | R09 | H6 is the bring-up's own live record (Shards harness-bringup-v1); the tests replay it. |
 | R10 | Each guard has a test that fails without it (part 1's mutation record below). |
-| R11, R12 | Pure code for every platform; Linux's places in a microVM whatever the host (`Dirs::microvm`); Windows' ACL inheritance named. Clippy on Linux, macOS and Windows below. |
+| R11, R12 | Pure code for every platform; Linux's places in a microVM whatever the host (`Dirs::microvm`); Windows' ACL inheritance named. Clippy on Linux and macOS below; Windows' build, clippy and tests are CI's on main (ROOT's word of 2026-11-13). The withdrawn `isolated::mcp` called the Unix-only `reach::mcp`, which Windows couldn't build; with it gone, nothing of step 18 calls Unix-only code outside a `cfg(unix)` twin. |
 | R15 | Light tests only; real-VM runs are ROOT's (owed). |
 | R16 | Builds in `~/g121-tmp/s18` on adacachy and `~/.cache/s18-gate` on the gates' runners, removed after. |
 
 ## Owed
 
 - Wiring into step 17's launch seam (above), when ROOT says it has landed.
-- Steps 6 and 11's terminal lane and the microVM's key: sign-in, git signing, credential helpers,
-  the MCP token (design above).
-- `/api/mcp` on a runner's loopback, so an isolated session on a runner's machine gets kiln's MCP.
-  Plan step 35 (ROOT's goal #65) builds it. Agreed with that step's agent: it changes only
-  `isolated::mcp::on_this_machine`, so that a runner serving its loopback MCP gives an `Endpoint`
-  where `McpUnserved` stands today. Its port must be the one the built-ins grant, or their grant must
-  follow it.
+- Steps 6 and 11's terminal lane and the microVM's key: sign-in, git signing, credential helpers
+  (design above).
+- kiln's MCP over the `mcp` lane (D254, ROOT's word of 2026-11-13), this goal's next part: each
+  harness's MCP config pointed at the lane's endpoint inside the microVM, its form agreed with goal
+  58 from each harness's documented transports; the runner bridging the lane to kiln's MCP handler
+  in its own process, with no Unix socket, so Windows gets kiln's MCP too; and kiln's in-process
+  Agentfile check refusing an MCP network grant. The runner's loopback `/api/mcp` (plan step 35's
+  part 3) was the withdrawn design's.
 - Real-VM runs (ROOT's): an isolated session's transcript read from its volume and resumed; kiln's
-  MCP reached through `host.docker.internal`; H6's notices from a live microVM.
+  MCP over the lane; H6's notices from a live microVM.
 
 ## Part 2: the built-ins' grants and HOME (ROOT's routed findings)
 
 - **Destinations by name** (Shards D236), every built-in: its harness's own hosts on TCP 443, and
-  kiln's MCP at `host.docker.internal:7070` (kiln's default `http_addr`, config.rs) for the eight
-  that take it; no `--dns`, no port grant. The rule: the hosts a harness reaches on its own to sign
+  nothing for kiln's MCP (above); no `--dns`, no port grant. The rule: the hosts a harness reaches on its own to sign
   in, keep its sign-in fresh and work, as its vendor documents them, else as kiln saw it reach them,
   else as its own pinned build names them; none for a browser's page, an update (off in each
   image), telemetry, a registry, the editor's features, the web, or a provider whose host its
@@ -246,10 +239,8 @@ passes on the tree as committed. Run with `scripts/mutate.py <kiln checkout>` th
   image holds what any configured provider needs; a run can drop destinations, never add them
   (D236), so narrowing to the provider in use is the launch's to do (owed with step 17).
   `crates/kiln/src/agentfiles/builtin/grants_tests.rs` holds every list, its sources beside it.
-  It holds each built-in's hosts alone. kiln's MCP joins a list from `config::Server::default()`'s
-  `http_addr` exactly where `isolated::mcp::for_harness` gives that harness kiln's MCP, so the test
-  names no port of its own (R03 above). Its bent texts include kiln's MCP at a port not kiln's, and
-  the boundary not open at kiln's port.
+  It holds each built-in's hosts alone. Its bent texts include kiln's MCP as a destination on the
+  machine, and the boundary opened at kiln's port.
 - **The project** isn't a volume: the launch plugs it in at its host path (D235). A project under
   `/tmp` can't be (D235's known limit).
 - **HOME, one rule**: the person's volume, whole, `HOME=/home/<harness>` in run.env and one
@@ -274,13 +265,31 @@ passes on the tree as committed. Run with `scripts/mutate.py <kiln checkout>` th
   or refused with its reason: "What kiln's Agentfiles give it", "What an isolated agent can't do"
   and "Each feature, in a microVM of its own". The last now includes kiln's `KILN_*` variables:
   `KILN_AGENT` set, and the machine's sockets and `kiln reach mcp`'s left out (`isolated::env`).
-  It also says how to reach a kiln on another port: your own Agentfile granting that port.
+  It says kiln's MCP comes over the link kiln drives the harness by, never the network, and that no
+  Agentfile grants anything for it.
 - **The plan's evidence** (`evidence/plan/`): ROOT's goal text, verbatim, and numbered excerpts of
   Shards' D235, D236 and D240 and of `plan.rs` at Shards origin/main 1145bd3f2, each headed by its
   whole file's SHA-256. kiln research 01a1d2bd5014705d944b487c232fc750 (plan
   01a1d2bd5014705d918ad1f2ce1154f2) cites them.
 - **Owed (ROOT)**: each built-in run in a real microVM with these grants, a signed-in turn of each
   harness reaching its provider and nothing else (no vendor turn was run here).
+
+### No grant for kiln's MCP, read as Shards reads it (ROOT's routed findings, 2026-11-13)
+
+Step 34's checks found that on Windows a harness could reach kiln's MCP only from a microVM, since
+`harness::kinds::local_tools` (`kiln reach mcp` over the runner's socket) is Unix-only, and that
+`isolated::mcp` didn't build there. It called `reach::mcp`, which only Unix builds have. ROOT first
+decided on plain HTTP to the machine's loopback, then withdrew that within the hour: kiln's MCP
+rides the agent-control link's `mcp` lane (D254). This landing therefore takes the network design
+out (above) rather than porting it.
+
+`grants_tests`' `step18_shards_grants_each_builtin_its_hosts_alone_and_nothing_for_kilns_mcp` reads
+every built-in through Shards' own parser and `agentfile::grants` in kiln's process, the same
+reading Shards' daemon holds a run to (D109). Each built-in's destinations are its harness's hosts
+alone. None names the machine itself (`host.docker.internal`) or a remote MCP server, none opens a
+port to any address, and none grants `--dns`. Bent images are caught too: one granting kiln's MCP
+as a destination on the machine reads as an MCP grant, and ones granting kiln's port or TCP 443 to
+any address, or any name, read as wider.
 
 ### What ran where (part 2, and both parts' landing)
 
@@ -290,7 +299,7 @@ its crate, on Linux; CI on main runs the rest of the matrix.
 | Where | What | Result |
 |---|---|---|
 | Linux x86_64, adacachy, at eaf76bee4 (part 2 on part 1's landing tree 5fe18df48) | `cargo test -p kiln --lib` with `light.sh`'s filters, `KILN_TEST_SHARDS` = shards e82b9403 (D236 and run.env's HOME) | 227 passed, among them `grants_tests::step18_every_builtin_names_its_hosts_and_keeps_its_home_on_its_volume` and `step23_a_real_shards_checks_every_builtin` (a real shards checking the ten new texts); 1 failed, main's own `harness::moving` version test (`evidence/part2/p2-light.log`) |
-| the same | the grants guard's red and green: kiln's default `http_addr` moved to `0.0.0.0:7071` in `config.rs`, every image still granting 7070 | red: the grants test failed at harness-goose, its NETWORK line naming `host.docker.internal:7070` where `host.docker.internal:7071` was due (`evidence/part2/p2-mutant.log`); restored, green (`p2-green.log`). It ran before ROOT's word against mutation runs reached the step, and none ran after. |
+| the same | the grants guard's red and green (for the MCP grant withdrawn since): kiln's default `http_addr` moved to `0.0.0.0:7071` in `config.rs`, every image still granting 7070 | red: the grants test failed at harness-goose, its NETWORK line naming `host.docker.internal:7070` where `host.docker.internal:7071` was due (`evidence/part2/p2-mutant.log`); restored, green (`p2-green.log`). It ran before ROOT's word against mutation runs reached the step, and none ran after. |
 | the same | `cargo clippy --locked -p kiln -p kiln-ci --all-targets -- -D warnings` | passed (`evidence/part2/p2-clippy.log`) |
 | Linux x86_64, adacachy, at f1d7f28e8 (both parts, part 1's record, and kiln main fe9c17c7d, whose commits changed api.rs, harness/model.rs, moving.rs and session.rs) | the same light tests, then `cargo clippy --locked -p kiln --all-targets -- -D warnings` | 227 passed; 1 failed, main's own `harness::moving` version test, its line moved to 386 by main; clippy passed (`evidence/landing/f1d7f28e8-*`) |
 | Linux x86_64, adacachy, at 51de8f6c0 (the same, and kiln main cd224213c: resume in place, step 35's ACP capabilities) | the same | didn't run: the test binary failed to link, because adacachy's stable toolchain was updated under the build and its std rlibs were gone (`evidence/landing/51de8f6c0-adacachy-link-failure.log`). Its clippy was stopped there, and the lane (`~/g121-tmp/s18`, 94 GB) removed, on ROOT's word that kiln's checks leave adacachy, whose disk is saturated. |

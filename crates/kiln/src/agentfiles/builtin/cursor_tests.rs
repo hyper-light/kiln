@@ -354,7 +354,7 @@ fn step27_cursor_runs_as_kilns_cursor_kind_launches_it() -> anyhow::Result<()> {
 }
 
 /// Cursor's Agentfile is the plan's shape: ARG BASE by digest and ARG TARGETARCH alone, Cursor's own
-/// package per platform, its hosts by name and kiln's MCP (step 18's grants), its HOME as its one
+/// package per platform, its hosts by name (step 18's grants), its HOME as its one
 /// harness volume, and no ENV or RUN.
 #[test]
 fn step27_cursor_agentfile_is_the_plans_shape() -> anyhow::Result<()> {

@@ -89,8 +89,8 @@ fn harness_volumes(agentfile: &str) -> Vec<&str> {
 }
 
 /// The Agentfile: the pin's base, one stage, the harness from each platform's directory, its hosts by
-/// name and kiln's MCP (step 18's three grant lines) and nothing more, its HOME /home/amp as its one
-/// volume, and nothing that installs or configures beside the pin and harness.json.
+/// name (step 18's three grant lines) and nothing more, its HOME /home/amp as its one volume, and
+/// nothing that installs or configures beside the pin and harness.json.
 fn check_agentfile(agentfile: &str, pin: &Value) -> anyhow::Result<()> {
     let all = instructions(agentfile);
     let has = |keyword: &str, rest: &str| all.iter().any(|(k, r)| k == keyword && *r == rest);

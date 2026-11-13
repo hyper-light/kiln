@@ -177,8 +177,8 @@ fn step25_devins_harness_json_starts_it_as_kiln_does() -> anyhow::Result<()> {
 }
 
 /// Devin's Agentfile is the layout's: the pin's base by digest and no RUN, as both builds are static
-/// (f5); TARGETARCH naming the directory kiln writes; its hosts by name and kiln's MCP (step 18's
-/// grants, f14); its HOME as its one volume, the harness's alone, holding its two XDG roots (f10,
+/// (f5); TARGETARCH naming the directory kiln writes; its hosts by name (step 18's grants, f14); its
+/// HOME as its one volume, the harness's alone, holding its two XDG roots (f10,
 /// f12); no ENV, and no ARG but those two.
 #[test]
 fn step25_devins_agentfile_is_the_layouts() -> anyhow::Result<()> {

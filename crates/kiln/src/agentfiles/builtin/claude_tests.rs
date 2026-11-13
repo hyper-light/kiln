@@ -249,8 +249,8 @@ fn step19_claude_runs_as_kilns_claude_kind_with_its_home_on_its_volume() -> anyh
 }
 
 /// Claude Code's Agentfile is the plan's shape: the base by digest, a stage for each libc with a RUN only
-/// in musl's (Anthropic's packages), Anthropic's own build per platform and libc, its hosts by name and
-/// kiln's MCP (step 18's grants), its HOME its one volume, and no ENV.
+/// in musl's (Anthropic's packages), Anthropic's own build per platform and libc, its hosts by name
+/// (step 18's grants), its HOME its one volume, and no ENV.
 #[test]
 fn step19_claude_agentfile_is_the_plans_shape() -> anyhow::Result<()> {
     let lines = instructions(claude()?.text);

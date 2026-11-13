@@ -34,11 +34,10 @@ HARNESS claude FROM ./claude-${TARGETARCH}-${CLAUDE_LIBC}
 #   access requirements"). The rest of that list is a page a sign-in opens in the person's browser,
 #   a feature kiln doesn't drive (claude.ai's connectors, plugins' downloads, Chrome, artifacts), an
 #   update (off: DISABLE_UPDATES) or telemetry, and goes nowhere.
-# - host.docker.internal:7070: kiln's MCP at /api/mcp on the machine itself, at kiln's own port (its
-#   http_addr's default, 0.0.0.0:7070). A kiln on another port isn't reached: the image doesn't
-#   grant it, and kiln says so as it starts the harness.
-NETWORK --egress=api.anthropic.com:443 --egress=claude.ai:443 --egress=platform.claude.com:443 --egress=host.docker.internal:7070 provider FOR claude
-EXPOSE --harnesses=claude 443/tcp 7070/tcp AS egress FOR provider
+# kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
+# kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
+NETWORK --egress=api.anthropic.com:443 --egress=claude.ai:443 --egress=platform.claude.com:443 provider FOR claude
+EXPOSE --harnesses=claude 443/tcp AS egress FOR provider
 CONNECT claude WITH claude ON provider
 
 # Its project is plugged in as it starts, at the path it has on the machine (Shards D235), so kiln

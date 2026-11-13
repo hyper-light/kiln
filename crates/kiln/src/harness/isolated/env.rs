@@ -9,8 +9,6 @@
 //! environment of: its paths are the machine's (`HOME=/Users/…`, its `PATH`), which name nothing in
 //! the microVM, and its `KILN_*` are the server's or runner's (a data folder, an admin token).
 
-use super::mcp::McpEnv;
-
 /// What becomes of one of kiln's variables a harness on its machine gets, in a microVM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fate {
@@ -28,19 +26,16 @@ pub const HOST: &[(&str, Fate)] = &[
     ("KILN_HARNESS_SOCK", Fate::LeftOut("a socket of its machine, which its microVM can't reach: its `kiln spawn` and `kiln agents` are kiln's MCP `agents_*` there")),
     ("KILN_RUNNER_SOCK", Fate::LeftOut("a socket of its runner, which its microVM can't reach: what its hooks ask comes over its microVM's control lane (kiln plan steps 10 and 11)")),
     ("KILN_REACH_ON", Fate::LeftOut("the runner `kiln reach mcp` prefers, which kiln's MCP keeps for the session itself")),
-    ("KILN_SESSION", Fate::LeftOut("whom `kiln reach mcp` asks for; kiln's MCP knows the session by its own token")),
+    ("KILN_SESSION", Fate::LeftOut("whom `kiln reach mcp` asks for; kiln's MCP in a microVM knows the session by the link it rides, the session's own (its `mcp` lane, Shards D254)")),
 ];
 
 /// The environment for session `session`'s harness of `kind` in its microVM: kiln's variables
-/// that go ([`HOST`]), what kiln's adapter has its harness run with (Claude Code's file
-/// checkpoints), and kiln's MCP's token where its harness reads it from the environment ([`McpEnv`]).
-pub fn member_env(session: &str, kind: &crate::harness::kinds::Kind, mcp: Option<&McpEnv>) -> Vec<(String, String)> {
+/// that go ([`HOST`]), and what kiln's adapter has its harness run with (Claude Code's file
+/// checkpoints).
+pub fn member_env(session: &str, kind: &crate::harness::kinds::Kind) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = HOST.iter().filter(|(_, f)| *f == Fate::Given).map(|(k, _)| ((*k).to_owned(), session.to_owned())).collect();
     if kind.protocol == crate::harness::kinds::Protocol::ClaudeStreamJson {
         out.extend(crate::harness::claude::FIXED_ENV.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
-    }
-    if let Some(m) = mcp {
-        out.push((m.name.to_owned(), m.value.clone()));
     }
     out
 }
@@ -85,7 +80,7 @@ mod tests {
     #[test]
     fn step18_a_harness_in_a_microvm_gets_its_mark_and_no_machine_path() -> anyhow::Result<()> {
         let claude = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
-        let env = member_env("s1", claude, None);
+        let env = member_env("s1", claude);
         anyhow::ensure!(env.contains(&("KILN_AGENT".into(), "s1".into())), "{env:?}");
         anyhow::ensure!(env.iter().any(|(k, _)| k == "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"), "{env:?}");
         for (k, f) in HOST {
@@ -96,7 +91,7 @@ mod tests {
         let machine: Vec<String> = std::env::vars().map(|(k, _)| k).filter(|k| k != "KILN_AGENT" && !k.starts_with("CLAUDE_CODE_")).collect();
         anyhow::ensure!(!env.iter().any(|(k, _)| machine.contains(k)), "{env:?}");
         let codex = Kind::get("codex").ok_or_else(|| anyhow::anyhow!("no codex kind"))?;
-        anyhow::ensure!(member_env("s2", codex, None) == vec![("KILN_AGENT".to_owned(), "s2".to_owned())]);
+        anyhow::ensure!(member_env("s2", codex) == vec![("KILN_AGENT".to_owned(), "s2".to_owned())]);
         Ok(())
     }
 }

@@ -1146,9 +1146,9 @@ kiln ships an Agentfile for each harness it drives, `harness-<id>`. Read one on 
 - **How kiln drives it**, in its `harness.json`: the program and the protocol kiln's adapter speaks
   (the harness table at the top of this page).
 - **Its network, every part named.** TCP out to its harness's own hosts alone, each by name: its
-  provider's API, its sign-in's token hosts, and kiln's MCP on the machine where kiln gives that
-  harness one (the table below). Only those names resolve, nothing comes in, and no other host,
-  port or protocol goes out. A harness that takes any provider (Goose, opencode, Pi) is granted
+  provider's API and its sign-in's token hosts (the table below). Only those names resolve, nothing
+  comes in, and no other host, port or protocol goes out. kiln's MCP isn't among them: it comes over
+  the link kiln drives the harness by, never the network, so no Agentfile grants anything for it. A harness that takes any provider (Goose, opencode, Pi) is granted
   every hosted provider its own build knows at a fixed public host. A cloud platform's model
   service (Bedrock, Vertex AI, Azure), a self-hosted or local server, and a provider whose address
   you give it are none of those: copy kiln's Agentfile into one of yours and add your provider's
@@ -1164,15 +1164,15 @@ kiln ships an Agentfile for each harness it drives, `harness-<id>`. Read one on 
 
 | Harness | Agentfile | Your volume, its HOME | What it reaches, by name |
 |---|---|---|---|
-| Claude Code | `harness-claude` | `/home/claude` | `api.anthropic.com`, `claude.ai`, `platform.claude.com`; kiln's MCP |
-| Codex | `harness-codex` | `/home/codex` (`CODEX_HOME` in it) | `api.openai.com`, `chatgpt.com`, `auth.openai.com`; kiln's MCP |
-| Gemini CLI | `harness-gemini` | `/home/gemini` | `cloudcode-pa`, `generativelanguage`, `oauth2` and `www.googleapis.com`; kiln's MCP |
-| opencode | `harness-opencode` | `/home/opencode` | each provider its build knows and their sign-ins, `opencode.ai`, `models.dev`, GitHub for its ripgrep (32 hosts); kiln's MCP |
-| Goose | `harness-goose` | `/home/goose` | each provider its build knows and their sign-ins (64 hosts); kiln's MCP |
-| Amp | `harness-amp` | `/home/amp` | `ampcode.com`; kiln's MCP |
-| Devin | `harness-devin` | `/home/devin` | `server.codeium.com`, `api.devin.ai`, `unleash.codeium.com`; kiln's MCP |
+| Claude Code | `harness-claude` | `/home/claude` | `api.anthropic.com`, `claude.ai`, `platform.claude.com` |
+| Codex | `harness-codex` | `/home/codex` (`CODEX_HOME` in it) | `api.openai.com`, `chatgpt.com`, `auth.openai.com` |
+| Gemini CLI | `harness-gemini` | `/home/gemini` | `cloudcode-pa`, `generativelanguage`, `oauth2` and `www.googleapis.com` |
+| opencode | `harness-opencode` | `/home/opencode` | each provider its build knows and their sign-ins, `opencode.ai`, `models.dev`, GitHub for its ripgrep (32 hosts) |
+| Goose | `harness-goose` | `/home/goose` | each provider its build knows and their sign-ins (64 hosts) |
+| Amp | `harness-amp` | `/home/amp` | `ampcode.com` |
+| Devin | `harness-devin` | `/home/devin` | `server.codeium.com`, `api.devin.ai`, `unleash.codeium.com` |
 | Antigravity CLI | `harness-antigravity` | `/home/antigravity` | `cloudcode-pa.googleapis.com`, `oauth2.googleapis.com` |
-| Cursor CLI | `harness-cursor` | `/home/cursor` | `api2`, `api2direct`, `repo42`, `api5` and its six agent hosts `.cursor.sh`; kiln's MCP |
+| Cursor CLI | `harness-cursor` | `/home/cursor` | `api2`, `api2direct`, `repo42`, `api5` and its six agent hosts `.cursor.sh` |
 | Pi | `harness-pi` | `/home/pi` | each provider its build knows and their sign-ins, `pi.dev` (44 hosts) |
 
 The harness sees its image read-only, so only your volume makes its files writable and lasting,
@@ -1215,16 +1215,14 @@ to `s28-pi-agentfile`).
   naming the tools and the system each runs on. An isolated agent can't start a process (above):
   start it from your own session, or from an agent that isn't isolated.
 - **Reach what its Agentfile doesn't grant.** No other folder, port, host or device of the machine.
-  kiln's own MCP is reached the same way: kiln's Agentfiles grant `host.docker.internal:7070`,
-  kiln's own port on the machine, and kiln gives the harness the session's own token. A kiln that
-  serves another port isn't reached, and kiln says so as it starts the agent: copy kiln's Agentfile
-  into one of yours and grant `host.docker.internal:<its port>` instead. Antigravity reads its
-  MCP servers from its own config alone and Pi takes none, so neither gets kiln's.
+  kiln's own MCP isn't reached over the network at all: it comes over the link kiln drives the
+  harness by, as that link's own MCP lane (Shards D254), on every OS kiln runs on, so no Agentfile
+  grants anything for it.
 - **Use a tool its image doesn't have.** The project's toolchain comes from the image: build your
   own Agentfile on your project's image (above).
 - **Not yet**, as well as the start itself: a terminal into the microVM, its sign-in and exec
-  there; git signing and a git host's credentials by the microVM's own key; kiln's MCP for one on a
-  runner's machine, which serves it over its own socket alone; moving one to another machine, as
+  there; git signing and a git host's credentials by the microVM's own key; kiln's MCP, over that
+  lane; moving one to another machine, as
   your volume stays on the one it ran on; and the commands it asks kiln to run on other machines,
   which run in microVMs too or not at all, never on a bare host.
 
@@ -1239,13 +1237,13 @@ What this page describes, once an isolated agent's start goes through:
 | The Changes tab, Commits, Compare, whose a file is, a subagent's edits, change requests | Works: the project is at its own path inside, so kiln reads its diffs, HEAD and checkpoints where it always does. |
 | Continuing a past session | Works: kiln reads its transcript from your volume on the machine. |
 | Its harness's settings, sign-in and memories | Kept in your volume, yours alone; no credential leaves it. |
-| Agents that run agents, and kiln's other tools | Through kiln's MCP, where its machine serves it at `/api/mcp` (the server's own); what it starts is isolated too. Not yet on a runner's machine. Antigravity and Pi take no MCP server from kiln. |
+| Agents that run agents, and kiln's other tools | Not yet: through kiln's MCP, which comes over the link kiln drives the harness by (its own MCP lane), never the network; what it starts is isolated too. Pi takes no MCP server from kiln. |
 | Skills kiln installs, and kiln's own | Its plugin folders are plugged in read-only at their own paths as it starts. |
 | Files in messages | A file in your project or in its home shows; one on the microVM's scratch (`/tmp`) can't, as it's nowhere on the machine. |
 | What it leaves running | Inside its microVM, and ends with it. |
 | Signing it in and out; a terminal beside it; exec | Not yet: they run on the microVM's own terminal (plan steps 6 and 11). |
 | git signing and a git host's credentials | Not yet: by the microVM's own key (step 11), never a socket of the machine. |
-| kiln's variables in its environment (`KILN_*`, above) | `KILN_AGENT`, the session's mark, is set as on the machine. The machine's sockets (`KILN_HARNESS_SOCK`, `KILN_RUNNER_SOCK`, `KILN_REACH_SOCK`) and `kiln reach mcp`'s (`KILN_REACH_ON`, `KILN_SESSION`) aren't: a microVM can't reach the machine's sockets, and kiln's MCP does their work. Codex reads the session's MCP token from `KILN_MCP_TOKEN`. Nothing else of the machine's environment goes in. |
+| kiln's variables in its environment (`KILN_*`, above) | `KILN_AGENT`, the session's mark, is set as on the machine. The machine's sockets (`KILN_HARNESS_SOCK`, `KILN_RUNNER_SOCK`, `KILN_REACH_SOCK`) and `kiln reach mcp`'s (`KILN_REACH_ON`, `KILN_SESSION`) aren't: a microVM can't reach the machine's sockets, and kiln's MCP does their work. Nothing else of the machine's environment goes in. |
 | `kiln spawn` and `kiln agents` from a kiln shell | Can't: they use the machine's own sockets, which a microVM doesn't have; kiln's MCP does their work. |
 | Taking over a found session | Can't: a microVM's harness is never found on the machine. |
 | Moving it to another machine | Not yet: your volume stays on the machine it ran on. |

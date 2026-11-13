@@ -25,11 +25,10 @@ HARNESS amp FROM ./amp-${TARGETARCH}
 # - ampcode.com: Amp's server, where each of its requests goes (its own build: "AMP_URL optionally
 #   overrides ampcode.com"). Its downloads (static.ampcode.com; update checks off:
 #   AMP_SKIP_UPDATE_CHECK) go nowhere.
-# - host.docker.internal:7070: kiln's MCP at /api/mcp on the machine itself, at kiln's own port (its
-#   http_addr's default, 0.0.0.0:7070). A kiln on another port isn't reached: the image doesn't
-#   grant it, and kiln says so as it starts the harness.
-NETWORK --egress=ampcode.com:443 --egress=host.docker.internal:7070 provider FOR amp
-EXPOSE --harnesses=amp 443/tcp 7070/tcp AS egress FOR provider
+# kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
+# kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
+NETWORK --egress=ampcode.com:443 provider FOR amp
+EXPOSE --harnesses=amp 443/tcp AS egress FOR provider
 CONNECT amp WITH amp ON provider
 
 # Its project is plugged in as it starts, at the path it has on the machine (Shards D235), so kiln

@@ -26,8 +26,9 @@ HARNESS antigravity FROM ./antigravity-${TARGETARCH}
 # - cloudcode-pa.googleapis.com: agy's model service, the host kiln saw it reach for its work (step
 #   26's probes); oauth2.googleapis.com: Google's token endpoint, which agy's own build names for its
 #   Google sign-in's refresh. Its logging (play.googleapis.com) and its updater's downloads
-#   (storage.googleapis.com; off) go nowhere. kiln's MCP isn't granted: agy reads its MCP servers from
-#   its own config file alone, where no session's own token can go.
+#   (storage.googleapis.com; off) go nowhere.
+# kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
+# kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
 NETWORK --egress=cloudcode-pa.googleapis.com:443 --egress=oauth2.googleapis.com:443 provider FOR antigravity
 EXPOSE --harnesses=antigravity 443/tcp AS egress FOR provider
 CONNECT antigravity WITH antigravity ON provider

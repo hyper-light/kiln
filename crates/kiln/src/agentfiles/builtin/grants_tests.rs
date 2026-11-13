@@ -1,16 +1,14 @@
 //! What each built-in grants and mounts (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18): its
-//! harness's hosts by name (Shards D236, destinations by name), never TCP 443 to any address, and kiln's
-//! MCP on the machine where kiln gives its harness one; its project plugged in at its host path (Shards
-//! D235), so no volume holds it; and its HOME the person's volume, whole, `/home/<harness>`. Every
-//! harness's own tests pin these lines from here. Where each host comes from is
-//! docs/research/s18-host-in-vm.
+//! harness's hosts by name (Shards D236, destinations by name), never TCP 443 to any address, and
+//! nothing for kiln's MCP, which rides the link kiln drives its harness by (that link's own `mcp` lane,
+//! Shards D254), never the network; its project plugged in at its host path (Shards D235), so no
+//! volume holds it; and its HOME the person's volume, whole, `/home/<harness>`. Every harness's own
+//! tests pin these lines from here. Where each host comes from is docs/research/s18-host-in-vm.
 
 use super::ALL;
-use crate::harness::isolated::mcp::{Config, Endpoint, HOST, for_harness};
-use crate::harness::kinds::Kind;
 
 /// Each built-in's harness and the hosts it reaches by name, as its NETWORK line names them (sorted, once
-/// each); kiln's MCP follows them where kiln gives its harness one ([`destinations`]).
+/// each), and nothing else ([`destinations`]).
 const HOSTS: &[(&str, &[&str])] = &[
     // code.claude.com/docs/en/network-config, "Network access requirements".
     ("claude", &["api.anthropic.com:443", "claude.ai:443", "platform.claude.com:443"]),
@@ -34,27 +32,11 @@ const HOSTS: &[(&str, &[&str])] = &[
     ("pi", &["ai-gateway.vercel.sh:443", "api.ant-ling.com:443", "api.anthropic.com:443", "api.cerebras.ai:443", "api.deepseek.com:443", "api.fireworks.ai:443", "api.github.com:443", "api.groq.com:443", "api.individual.githubcopilot.com:443", "api.kimi.com:443", "api.meta.ai:443", "api.minimax.io:443", "api.minimaxi.com:443", "api.mistral.ai:443", "api.moonshot.ai:443", "api.moonshot.cn:443", "api.openai.com:443", "api.together.ai:443", "api.typesafe.ai:443", "api.x.ai:443", "api.xiaomimimo.com:443", "api.z.ai:443", "auth.kimi.com:443", "auth.meta.com:443", "auth.openai.com:443", "auth.x.ai:443", "chatgpt.com:443", "claude.ai:443", "generativelanguage.googleapis.com:443", "github.com:443", "inference.baseten.co:443", "integrate.api.nvidia.com:443", "open.bigmodel.cn:443", "opencode.ai:443", "openrouter.ai:443", "pi.dev:443", "platform.claude.com:443", "radius.pi.dev:443", "router.huggingface.co:443", "token-plan-ams.xiaomimimo.com:443", "token-plan-cn.xiaomimimo.com:443", "token-plan-sgp.xiaomimimo.com:443", "token-plan.ap-southeast-1.maas.aliyuncs.com:443", "token-plan.cn-beijing.maas.aliyuncs.com:443"]),
 ];
 
-/// The port the built-ins grant kiln's MCP at: kiln's own `http_addr`'s, as `crate::config::Server`
-/// defaults it, never a number of these tests'. An image names its destinations as written (Shards
-/// carries NETWORK unexpanded, and a run can drop a destination but never add one, D236), so the
-/// built-ins name kiln's default port, and a change to that default fails here until every image
-/// follows. A kiln serving another port is refused as it starts the harness, naming the destination
-/// it needs (`isolated::mcp::granted`, from the port the running kiln gives its agents). None where
-/// the default names no port.
-fn mcp_port() -> Option<u16> {
-    crate::config::Server::default().http_addr.rsplit_once(':')?.1.parse().ok()
-}
-
-/// kiln's MCP on the machine itself (`host.docker.internal`, Shards D236's name for it) at
-/// [`mcp_port`].
-fn mcp() -> Option<String> {
-    mcp_port().map(|port| format!("{HOST}:{port}"))
-}
-
-/// Whether kiln gives harness `harness` its MCP in a microVM (`isolated::mcp::for_harness`).
-fn takes_mcp(harness: &str) -> bool {
-    let endpoint = Endpoint::new(mcp_port().unwrap_or_default(), String::new());
-    Kind::get(harness).is_some_and(|kind| !matches!(for_harness(kind, &endpoint), Config::Refused(_)))
+/// kiln's own port on its machine, where it serves its MCP (its `http_addr`, as `crate::config::Server`
+/// defaults it): what an Agentfile granting kiln's MCP over the network would name.
+fn kiln_port() -> anyhow::Result<u16> {
+    let addr = crate::config::Server::default().http_addr;
+    addr.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).ok_or_else(|| anyhow::anyhow!("kiln's default http_addr {addr} names no port"))
 }
 
 /// One built-in's hosts.
@@ -62,10 +44,9 @@ fn hosts(harness: &str) -> &'static [&'static str] {
     HOSTS.iter().find(|(h, _)| *h == harness).map(|(_, d)| *d).unwrap_or(&[])
 }
 
-/// One built-in's destinations: its hosts, then kiln's MCP where its harness takes it.
+/// One built-in's destinations: its hosts, and nothing for kiln's MCP.
 fn destinations(harness: &str) -> Vec<String> {
-    let mcp = mcp().filter(|_| takes_mcp(harness));
-    hosts(harness).iter().map(|h| (*h).to_owned()).chain(mcp).collect()
+    hosts(harness).iter().map(|h| (*h).to_owned()).collect()
 }
 
 /// Its NETWORK, EXPOSE and CONNECT lines, as its Agentfile has them: its destinations by name, its
@@ -137,12 +118,12 @@ fn problems(harness: &str, text: &str, files: &[(&str, &str)]) -> anyhow::Result
     Ok(found)
 }
 
-/// Every built-in names its harness's hosts and nothing else (sorted, once each), then kiln's MCP at
-/// kiln's own port exactly where kiln gives its harness one in a microVM; mounts no project; and keeps
-/// HOME on its one volume. Each guard catches a text the old way or bent.
+/// Every built-in names its harness's hosts and nothing else (sorted, once each), nothing for kiln's MCP
+/// among them; mounts no project; and keeps HOME on its one volume. Each guard catches a text the old
+/// way or bent.
 #[test]
 fn step18_every_builtin_names_its_hosts_and_keeps_its_home_on_its_volume() -> anyhow::Result<()> {
-    let (port, mcp) = mcp_port().zip(mcp()).ok_or_else(|| anyhow::anyhow!("kiln's default http_addr names no port"))?;
+    let port = kiln_port()?;
     anyhow::ensure!(HOSTS.len() == ALL.len() && ALL.iter().all(|b| !hosts(b.harness).is_empty()), "a built-in without its hosts here, or a row for none");
     for b in ALL {
         let found = problems(b.harness, b.text, b.files)?;
@@ -152,15 +133,13 @@ fn step18_every_builtin_names_its_hosts_and_keeps_its_home_on_its_volume() -> an
         anyhow::ensure!(hosts.is_sorted() && hosts.windows(2).all(|w| w.first() != w.get(1)), "{}: not sorted once each", b.name);
     }
     let claude = ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
-    let other = format!("{HOST}:{}", port.checked_add(1).unwrap_or(1));
     let bent = [
         ("TCP 443 to any address", claude.text.replace("NETWORK --egress=api", "NETWORK --dns --egress=443/tcp --egress=api")),
         ("the project at /workspace", format!("{}VOLUME --target-kind=harness /workspace FOR claude\n", claude.text)),
         ("a host more", claude.text.replace("--egress=claude.ai:443", "--egress=claude.ai:443 --egress=example.com:443")),
         ("a host less", claude.text.replace(" --egress=claude.ai:443", "")),
-        ("kiln's MCP not granted", claude.text.replace(&format!(" --egress={mcp}"), "")),
-        ("kiln's MCP at a port not kiln's", claude.text.replace(&format!("--egress={mcp}"), &format!("--egress={other}"))),
-        ("its boundary not open at kiln's port", claude.text.replace(&format!(" {port}/tcp AS egress"), " AS egress")),
+        ("kiln's MCP as a destination on the machine", granting(claude.text, &format!("--egress=host.docker.internal:{port}"), Some(port))),
+        ("its boundary open at kiln's port", claude.text.replace(" 443/tcp AS egress", &format!(" 443/tcp {port}/tcp AS egress"))),
         ("its home a folder of the volume", claude.text.replace("/home/claude FOR claude", "/home/claude/.claude FOR claude")),
     ];
     for (what, text) in bent {
@@ -171,6 +150,73 @@ fn step18_every_builtin_names_its_hosts_and_keeps_its_home_on_its_volume() -> an
     anyhow::ensure!(!problems("claude", claude.text, &scratch)?.is_empty(), "HOME on the scratch passed");
     for bad in ["example.com", "443", "10.0.0.1:443", "-x.com:443", "a..b:443", "x.com:0", "x.123:443"] {
         anyhow::ensure!(!destination_ok(bad), "{bad} passed");
+    }
+    Ok(())
+}
+
+/// What Shards grants `text`'s microVM, read the way its daemon reads an image's grants (D109): Shards'
+/// own parser and `agentfile::grants`, in kiln's process (shards-agentfile, kiln plan step 16).
+fn shards_grants(text: &str) -> anyhow::Result<shards_agentfile::agentfile::Grants> {
+    use shards_agentfile::{agentfile, instructions, lint::Linter, parser};
+    let words = |m: &[u8]| anyhow::anyhow!("{}", String::from_utf8_lossy(m));
+    let parsed = parser::parse_as(text.as_bytes(), parser::Dialect::Agentfile).map_err(|e| words(&e.message))?;
+    let read = instructions::parse(&parsed, &Linter::default()).map_err(|e| words(&e.message))?;
+    let directives: Vec<agentfile::Directive> = read
+        .stages
+        .into_iter()
+        .flat_map(|s| s.commands)
+        .filter_map(|c| match c.kind {
+            instructions::Kind::Agentfile(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    Ok(agentfile::grants(&agentfile::resolve_targets(&directives).map_err(|e| words(&e))?))
+}
+
+/// `text` with `grant` added to its network and, given one, `port` opened at its microVM's boundary:
+/// an image of kiln's bent to grant more.
+fn granting(text: &str, grant: &str, port: Option<u16>) -> String {
+    let text = text.replace("NETWORK --egress=api", &format!("NETWORK {grant} --egress=api"));
+    match port {
+        Some(p) => text.replace(" 443/tcp AS egress", &format!(" 443/tcp {p}/tcp AS egress")),
+        None => text,
+    }
+}
+
+/// Whether Shards' reading of an image grants a way to kiln's MCP over the network: a remote MCP
+/// server, or a destination on the machine itself (`host.docker.internal`, Shards D236's name for it).
+fn mcp_over_the_network(g: &shards_agentfile::agentfile::Grants) -> bool {
+    !g.mcp.is_empty() || g.destinations.iter().any(|d| d.starts_with(b"host.docker.internal:"))
+}
+
+/// Shards' own reading of every built-in ([`shards_grants`]): its destinations are its harness's hosts
+/// alone. Nothing grants a way to kiln's MCP over the network, which reaches a harness over the link kiln
+/// drives it by (Shards D254), and nothing is wider: no port to any address, no other name. An image bent
+/// to grant kiln's MCP as a destination on the machine reads as such, and one granting kiln's port or
+/// TCP 443 to any address, or any name, reads as wider.
+#[test]
+fn step18_shards_grants_each_builtin_its_hosts_alone_and_nothing_for_kilns_mcp() -> anyhow::Result<()> {
+    for b in ALL {
+        let g = shards_grants(b.text)?;
+        let mut got: Vec<String> = g.destinations.iter().map(|d| String::from_utf8_lossy(d).into_owned()).collect();
+        let mut want = destinations(b.harness);
+        got.sort_unstable();
+        want.sort_unstable();
+        anyhow::ensure!(got == want, "{}: Shards grants {got:?}, not {want:?}", b.name);
+        anyhow::ensure!(g.egress.is_empty() && !g.dns && !mcp_over_the_network(&g), "{}: more than its hosts: {g:?}", b.name);
+    }
+    let claude = ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
+    let port = kiln_port()?;
+    let mcp = shards_grants(&granting(claude.text, &format!("--egress=host.docker.internal:{port}"), Some(port)))?;
+    anyhow::ensure!(mcp_over_the_network(&mcp), "kiln's MCP as a destination on the machine read as none: {mcp:?}");
+    let wider = [
+        ("kiln's port to any address", granting(claude.text, &format!("--egress={port}/tcp"), Some(port))),
+        ("TCP 443 to any address", granting(claude.text, "--egress=443/tcp", None)),
+        ("any name", granting(claude.text, "--dns", None)),
+    ];
+    for (what, text) in wider {
+        let g = shards_grants(&text)?;
+        anyhow::ensure!(text != claude.text && (!g.egress.is_empty() || g.dns), "{what} read as no wider: {g:?}");
     }
     Ok(())
 }

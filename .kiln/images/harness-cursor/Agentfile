@@ -29,11 +29,10 @@ HARNESS cursor FROM ./cursor-${TARGETARCH}
 #   agent hosts, an agent's requests; repo42.cursor.sh, codebase search (cursor.com/docs/enterprise/
 #   network-configuration). Cursor Tab's hosts (the editor's), its sign-in pages (the person's
 #   browser), and updates and extensions (off: --disable-auto-update) go nowhere.
-# - host.docker.internal:7070: kiln's MCP at /api/mcp on the machine itself, at kiln's own port (its
-#   http_addr's default, 0.0.0.0:7070). A kiln on another port isn't reached: the image doesn't
-#   grant it, and kiln says so as it starts the harness.
-NETWORK --egress=agent.api5.cursor.sh:443 --egress=agent.global.api5.cursor.sh:443 --egress=agent.us.api5.cursor.sh:443 --egress=agentn.api5.cursor.sh:443 --egress=agentn.global.api5.cursor.sh:443 --egress=agentn.us.api5.cursor.sh:443 --egress=api2.cursor.sh:443 --egress=api2direct.cursor.sh:443 --egress=api5.cursor.sh:443 --egress=repo42.cursor.sh:443 --egress=host.docker.internal:7070 provider FOR cursor
-EXPOSE --harnesses=cursor 443/tcp 7070/tcp AS egress FOR provider
+# kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
+# kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
+NETWORK --egress=agent.api5.cursor.sh:443 --egress=agent.global.api5.cursor.sh:443 --egress=agent.us.api5.cursor.sh:443 --egress=agentn.api5.cursor.sh:443 --egress=agentn.global.api5.cursor.sh:443 --egress=agentn.us.api5.cursor.sh:443 --egress=api2.cursor.sh:443 --egress=api2direct.cursor.sh:443 --egress=api5.cursor.sh:443 --egress=repo42.cursor.sh:443 provider FOR cursor
+EXPOSE --harnesses=cursor 443/tcp AS egress FOR provider
 CONNECT cursor WITH cursor ON provider
 
 # Its project is plugged in as it starts, at the path it has on the machine (Shards D235), so kiln

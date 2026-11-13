@@ -275,7 +275,7 @@ fn step23_goose_runs_as_kilns_goose_kind_with_its_root_on_its_volume() -> anyhow
 }
 
 /// Goose's Agentfile is the plan's shape: a base by digest, Goose's own build per platform with no
-/// RUN, its providers' hosts by name and kiln's MCP (step 18's grants), its HOME as its one volume,
+/// RUN, its providers' hosts by name (step 18's grants), its HOME as its one volume,
 /// and no ENV; its pin's smoke line is what Goose prints.
 #[test]
 fn step23_goose_agentfile_is_the_plans_shape() -> anyhow::Result<()> {

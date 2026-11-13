@@ -56,18 +56,9 @@ impl Kit {
         }
     }
 
-    /// What agent session `session` in a microVM of its own on this machine reaches kiln's MCP with
-    /// (`harness::isolated::mcp`): the port its own agents reach the server at, and the session's
-    /// own token, as [`Self::config_for`] writes it. None when that names no port.
-    pub fn for_microvm(&self, session: &str) -> Option<(u16, String)> {
-        let safe = safe_session(session)?;
-        let authority = self.url.split_once("://").map_or(self.url.as_str(), |(_, rest)| rest).split('/').next()?;
-        let port = authority.rsplit_once(':')?.1.parse().ok()?;
-        Some((port, session_token(&self.key, &safe)))
-    }
-
     fn write_for(&self, session: &str) -> anyhow::Result<std::path::PathBuf> {
-        let safe = safe_session(session).ok_or_else(|| anyhow::anyhow!("no session"))?;
+        let safe: String = session.chars().filter(char::is_ascii_alphanumeric).take(64).collect();
+        anyhow::ensure!(!safe.is_empty(), "no session");
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join(format!("{safe}.json"));
         let body = json!({"mcpServers": {"kiln": {"type": "http", "url": format!("{}/api/mcp", self.url.trim_end_matches('/')),
@@ -75,12 +66,6 @@ impl Kit {
         write_private(&path, &serde_json::to_vec_pretty(&body)?)?;
         Ok(path)
     }
-}
-
-/// A session's id as its own MCP token's label takes it: its letters and digits, the first 64.
-fn safe_session(session: &str) -> Option<String> {
-    let safe: String = session.chars().filter(char::is_ascii_alphanumeric).take(64).collect();
-    (!safe.is_empty()).then_some(safe)
 }
 
 /// `bytes` as `path`, readable by this user alone, whole or not at all.

@@ -32,11 +32,10 @@ HARNESS gemini FROM ./gemini-${TARGETARCH}
 #   endpoint, a sign-in's refresh and its check that a token isn't revoked (google-auth-library
 #   10.9.0); www.googleapis.com: the signed-in account's user info (oauth2.ts). Its usage statistics
 #   (play.googleapis.com), Vertex AI's regional hosts and npm's update check (off, f23) go nowhere.
-# - host.docker.internal:7070: kiln's MCP at /api/mcp on the machine itself, at kiln's own port (its
-#   http_addr's default, 0.0.0.0:7070). A kiln on another port isn't reached: the image doesn't
-#   grant it, and kiln says so as it starts the harness.
-NETWORK --egress=cloudcode-pa.googleapis.com:443 --egress=generativelanguage.googleapis.com:443 --egress=oauth2.googleapis.com:443 --egress=www.googleapis.com:443 --egress=host.docker.internal:7070 provider FOR gemini
-EXPOSE --harnesses=gemini 443/tcp 7070/tcp AS egress FOR provider
+# kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
+# kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
+NETWORK --egress=cloudcode-pa.googleapis.com:443 --egress=generativelanguage.googleapis.com:443 --egress=oauth2.googleapis.com:443 --egress=www.googleapis.com:443 provider FOR gemini
+EXPOSE --harnesses=gemini 443/tcp AS egress FOR provider
 CONNECT gemini WITH gemini ON provider
 
 # Its project is plugged in as it starts, at the path it has on the machine (Shards D235), so kiln
