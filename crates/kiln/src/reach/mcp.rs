@@ -663,6 +663,19 @@ impl Server {
         self.runs.lock().ok().and_then(|r| r.get(id).cloned())
     }
 
+    /// Its runs, stopped as a client going away stops its own on the reach socket: its stream (an
+    /// isolated session's lane connection) ended.
+    fn let_go(&self) {
+        let Ok(runs) = self.runs.lock() else { return };
+        for cell in runs.values() {
+            if let Ok(mut r) = cell.0.lock()
+                && let Some(w) = r.signal.as_mut()
+            {
+                let _ = w.send(&Req::Signal(Signal::Terminate));
+            }
+        }
+    }
+
     /// Stop run `id`: Ctrl-C, then terminate if it still runs 5 s later.
     fn stop(&self, id: &str, max: usize) -> (Value, bool) {
         let Some(cell) = self.cell(id) else { return (json!({"error": format!("no run {id}")}), true) };
@@ -1194,6 +1207,10 @@ fn serve_over(link: Link, prefer: Option<String>, cwd: String, session: String, 
         }
     }
     ended.store(true, std::sync::atomic::Ordering::Relaxed);
+    // A lane's stream ended: its runs stop, as a socket client's do when it goes (`local::serve`).
+    if lane {
+        server.let_go();
+    }
     Ok(())
 }
 

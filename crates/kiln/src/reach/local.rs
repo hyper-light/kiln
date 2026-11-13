@@ -1041,8 +1041,8 @@ impl Here {
 }
 
 /// One request of [`Here`]'s: the first sent is answered, as the socket answers it ([`answer`]),
-/// and what's sent after it is a run's input and signals. For a thread of its own, as a socket
-/// [`Client`] is: its sends and reads wait.
+/// and what's sent after it is a run's input and signals. For a thread of its own, as a socket's
+/// client is: its sends and reads wait.
 pub struct Asked {
     here: Here,
     req_tx: crate::memory::queue::Sender<Req>,
