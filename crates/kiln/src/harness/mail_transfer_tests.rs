@@ -103,12 +103,45 @@ fn same_certificate_with_a_new_instance_cannot_pass_stored_transfer_principal_ga
             let restarted=join(&hub,b,"machine-destination","destination-restarted",3).map_err(refusal)?;
             assert_eq!(restarted.peer,original.peer);assert_eq!(restarted.machine,original.machine);assert_ne!(restarted.instance,original.instance);
             assert!(hub.instances.load().current_connection(b));assert_eq!(hub.instances.load().owner(&Owned::Agent(session.into())),Some(b));
-            assert!(!allows_claim(&hub,b,session,Some(2)).await,"same certificate and valid epoch are insufficient after instance change");
-            assert!(!allows_claim(&hub,b,session,None).await,"inventory also requires the stored instance");
-            assert!(!allows_generic_adoption(&hub,b,session,true).await);
-            assert!(!dispatch_ready(&hub,session,&capacity(2)).await.map_err(refusal)?);
-            assert_eq!(send(&hub,&original,TransferDown::Committed { manifest:committed.manifest.clone() }).await,Err(Refusal::Stale));
+            // 2026-11-13: the destination's process restarted, its sessions with it (a runner
+            // restart keeps them): the machine's newest process holds what it held, at its
+            // committed epoch. Before, it never could, and they read offline with their mail held.
+            assert!(allows_claim(&hub,b,session,Some(2)).await,"the destination's successor on its machine holds its sessions");
+            assert!(!allows_claim(&hub,b,session,Some(1)).await,"still at the committed epoch");
+            assert!(allows_generic_adoption(&hub,b,session,true).await);
+            assert!(dispatch_ready(&hub,session,&capacity(2)).await.map_err(refusal)?);
+            assert_eq!(send(&hub,&original,TransferDown::Committed { manifest:committed.manifest.clone() }).await,Err(Refusal::Unavailable),"the original process is gone");
             assert_eq!(handoffs::latest(&hub.store,session.into()).await.map_err(refusal)?,Some(committed),"new process metadata cannot rewrite durable authenticated binding");
+            Ok(())
+        }.await;
+        hub.shutdown.cancel();
+        result
+    })
+}
+
+/// 2026-11-13: while a handover's source lives, only it holds the session and mail waits; a
+/// process still alive on the machine fences off one that isn't the machine's newest; and once the
+/// source is gone (a runner restart left three handovers Prepared, Amphora's among them) the
+/// destination that was ready for it holds it, and mail goes there.
+#[test]
+fn a_handover_its_source_left_unfinished_is_held_by_the_destination() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub=crate::hub::tests::scratch_hub().await?;
+        let result: anyhow::Result<()>=async {
+            let session="transfer-source-gone";let (a,b)=(0x1a_u64,0x1b_u64);
+            let source=join(&hub,a,"machine-one","old-process",1).map_err(refusal)?;
+            let destination=join(&hub,b,"machine-one","new-process",2).map_err(refusal)?;
+            let manifest=manifest("source-gone",session,0)?;
+            handoffs::offer(&hub.store,manifest.clone(),source,destination.clone()).await.map_err(refusal)?;
+            assert_eq!(handoffs::prepare(&hub.store,manifest,destination).await.map_err(refusal)?.phase,Phase::Prepared);
+            hub.instances.update(|instances|instances.own(Owned::Agent(session.into()),b));
+            assert!(!allows_claim(&hub,b,session,Some(1)).await,"its source lives: the handover may still finish");
+            assert!(!dispatch_ready(&hub,session,&capacity(1)).await.map_err(refusal)?,"mail waits for it");
+            assert!(allows_claim(&hub,a,session,Some(0)).await,"the source still holds it");
+            hub.instances.update(|instances|instances.connected(a));
+            assert!(allows_claim(&hub,b,session,Some(1)).await,"the source gone, the destination holds it");
+            assert!(allows_generic_adoption(&hub,b,session,true).await);
+            assert!(dispatch_ready(&hub,session,&capacity(1)).await.map_err(refusal)?,"its mail goes");
             Ok(())
         }.await;
         hub.shutdown.cancel();

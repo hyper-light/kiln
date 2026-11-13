@@ -3956,7 +3956,11 @@ impl Hub {
         match *update {
             crate::harness::core::Update::MailFlow { event } => {
                 let owner = self.instances.load().owner(&crate::instances::Owned::Agent(session.clone()));
-                if owner == Some(peer) && self.peers.load().contains_key(&peer) && self.harness.runs_on(&session, runner) {
+                // Only a session kiln knows runs there settles its mail: `runs_on` says yes of
+                // one it doesn't know, and each of its reports failed as stale, thousands a
+                // minute (2026-11-13: three live sessions a handover's check had locked out). Its
+                // next Open brings it back, and its journal is replayed then.
+                if owner == Some(peer) && self.peers.load().contains_key(&peer) && self.harness.located_on(&session, runner) {
                     let from = crate::harness::registry::Location::Machine(runner.to_string());
                     if let Err(error) = crate::harness::mail_delivery::flow(self, &session, from, *event).await {
                         tracing::warn!(session = %session, error = %error, "source communication receipt remains unacknowledged");
