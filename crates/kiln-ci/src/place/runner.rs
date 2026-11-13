@@ -54,7 +54,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::ask::{self, Amounts, Ask, Peer, Sample};
-use super::keeper::Keeper;
+use super::keeper::{Keeper, NotGranted};
 use super::keys::{FxMap, Interner};
 use super::line::{Item, Key, Line, Query};
 use super::link::Rtt;
@@ -690,8 +690,12 @@ impl Admission {
     }
 
     /// What's free for an ordinary run now (W05-R03, as the engine's `fits_beside`): its CPUs
-    /// overcommitted beside what shares hold, the rest never.
+    /// overcommitted beside what shares hold, the rest never; none while it holds as many claims as
+    /// its holder may reserve through its machine's keeper ([`Self::claims_spent`]).
     fn free_now(&self) -> Amounts {
+        if self.claims_spent() {
+            return [0; ask::DIMS];
+        }
         let [bc, bm, bd, bg] = self.base;
         let [hc, hm, hd, hg] = self.held;
         let [sc, sm, _, _] = self.held_share;
@@ -1706,13 +1710,21 @@ impl Admission {
         self.keeper.unsynced().map(|u| Reason::Unsynced { why: u.why().to_owned() })
     }
 
+    /// Whether it holds as many claims as its holder may reserve through its machine's keeper
+    /// (`View::most_claims`; Hex's capacity-view.md CV8): a claim more would have its reserve
+    /// refused, so none fits, by probing or by its kernel, until one ends or the count moves. Every
+    /// claim counts, whatever it asks.
+    fn claims_spent(&self) -> bool {
+        self.keeper.most_claims().is_some_and(|most| u64::from(self.claims) >= most)
+    }
+
     /// Keeps the kernel's ledger saying what this one has room for (docs/lb.md, "One ledger";
     /// W05-R03): its budget this runner's cap, its room for a new run what's free here for an
     /// ordinary one while it's [`Self::open_fast`], else none, and cordoned while it takes no work
-    /// ([`Self::cordoned`]). What this ledger holds that the kernel didn't admit (claims offered,
-    /// taken or running by probing, room kept, use measured outside every claim) is the kernel's
-    /// `outside`; what the kernel admitted is a claim here too. So a run takes its room once in
-    /// each, whichever path admitted it.
+    /// ([`Self::cordoned`]) or no claim more ([`Self::claims_spent`]). What this ledger holds that
+    /// the kernel didn't admit (claims offered, taken or running by probing, room kept, use
+    /// measured outside every claim) is the kernel's `outside`; what the kernel admitted is a claim
+    /// here too. So a run takes its room once in each, whichever path admitted it.
     fn sync_fast(&mut self) {
         let cap = self.cap();
         if cap != self.fast.budget() {
@@ -1724,7 +1736,9 @@ impl Admission {
             *o = f.saturating_sub(t);
         }
         self.fast.outside(outside, &mut self.fast_out);
-        let cordoned = self.cordoned();
+        // A kernel's start is a claim too, so none past what its holder may reserve (CV8), however
+        // little it asks.
+        let cordoned = self.cordoned() || self.claims_spent();
         self.fast.cordon(cordoned, &mut self.fast_out);
         // Its own line is never used (waiting is this ledger's): nothing it says here is news.
         self.fast_out.clear();
@@ -1795,6 +1809,11 @@ impl Admission {
     /// leg); a share fits in what's not held, never overcommitted; any other fits beside.
     fn can_start(&self, s: u32) -> bool {
         let Some(p) = self.get(s) else { return false };
+        // A claim past what its holder may reserve through its machine's keeper: its reserve would
+        // be refused (CV8), whatever it asks.
+        if self.claims_spent() {
+            return false;
+        }
         if p.ask.needs.request.gpu > 0 && crate::sched::gpu::rank(&p.ask.needs, &self.facts, &self.labels, self.free_now()[3]).is_none() {
             return false;
         }
@@ -2174,6 +2193,16 @@ impl Admission {
         started
     }
 
+    /// [`Self::not_granted_r`], its words as the wire has them.
+    pub fn not_granted(&mut self, from: Peer<'_>, run: &str, fence: Fence, why: NotGranted, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.not_granted_r(from, run, fence, why, now, r));
+    }
+
+    /// [`Self::fast_not_granted_r`], with no handle of the owner's.
+    pub fn fast_not_granted(&mut self, from: Peer<'_>, run: &str, kernel: lb::Handle, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.fast_not_granted_r(from, run, 0, kernel, now, r));
+    }
+
     /// [`Self::fast_release_r`], its words as the wire has them.
     pub fn fast_release(&mut self, from: Peer<'_>, epoch: u32, amount: lb::Amounts, now: i64, out: &mut Vec<Said>) {
         self.wire(out, |a, r| a.fast_release_r(from, epoch, amount, now, r));
@@ -2493,6 +2522,23 @@ impl Admission {
         started
     }
 
+    /// Run `run`'s kernel start (`kernel`, as [`Self::fast_r`] takes it) whose reserve through its
+    /// machine's keeper wasn't granted, as its shell heard it before asking the ledger to start it
+    /// (Hex's capacity-view.md, the holder's items 4 and 5): nothing here holds it, and its owner is
+    /// told it was declined for room, in this runner's word as the input leaves it (the refusal's
+    /// view said first), so its kernel picks again on the room there is.
+    pub fn fast_not_granted_r(&mut self, from: Peer<'_>, run: &str, token: u64, kernel: lb::Handle, now: i64, out: &mut Vec<Reply>) {
+        let mark = out.len();
+        self.begin(now, out);
+        if let Some(o) = self.speaker(from, now, out) {
+            let word = self.fast_word_for(o);
+            out.push(Reply { owner: o, token, run: Arc::from(run), msg: Up::FastDeclined { kernel, why: lb::Why::Room, word } });
+        }
+        self.close(now);
+        self.fresh_words(out.get_mut(mark..).unwrap_or_default());
+        self.tokens_out(out);
+    }
+
     /// The kernel's words said in an input carry its room as the input left it: what was offered,
     /// held or freed after they were made is in it (each owner's, under room tokens, its own).
     fn fresh_words(&mut self, said: &mut [Reply]) {
@@ -2752,6 +2798,28 @@ impl Admission {
             }
         }
         Some(Start::New)
+    }
+
+    /// Run `run`'s reserve for its live claim `fence` wasn't granted by its machine's keeper
+    /// (`why`), as its shell heard it before asking the ledger to start it (Hex's capacity-view.md,
+    /// the holder's items 4 and 5): the run never started, so the claim lapses, the run waits here
+    /// again at its place, and its owner is told, the one word on which it may place the run
+    /// elsewhere. A claim no longer live (it lapsed meanwhile, its owner told then) and a run
+    /// started are left as they are. Its shell says the refusal's view first, so the run waits on
+    /// the room there is.
+    pub fn not_granted_r(&mut self, from: Peer<'_>, run: &str, fence: Fence, why: NotGranted, now: i64, out: &mut Vec<Reply>) {
+        self.begin(now, out);
+        self.lapse_due(now, out);
+        if let Some(o) = self.speaker(from, now, out)
+            && let Some(s) = self.owner(o).and_then(|w| w.runs.get(run)).copied()
+            && matches!(self.state(s), Some(State::Offered { fence: f, .. } | State::Taken { fence: f }) if f == fence)
+        {
+            self.lapse(s, fence, why.why(), now, out);
+        }
+        self.admit(now, out);
+        self.boundaries(now, out);
+        self.close(now);
+        self.tokens_out(out);
     }
 
     /// Its shell started the run's process: its owner is told it started (the runner's word).
@@ -3365,10 +3433,10 @@ impl Admission {
     /// What a probe of `ask` (in its class) would be answered here now, without probing it (the
     /// `offers` hint's quotes, docs/needs.md E5): never and why, as a probe of it would be; now, by
     /// the same room rule a probe is admitted by ([`Self::can_start`]'s), unless the runner takes
-    /// nothing new (draining, strained, not synced with its keeper) or keeps room for the first in
-    /// line; else it would wait, with its one reason and when it would start, estimated as a
-    /// waiting probe's is from the work ahead of the end of its class's line. O(log n); changes
-    /// nothing.
+    /// nothing new (draining, strained, not synced with its keeper), holds as many claims as its
+    /// holder may reserve, or keeps room for the first in line; else it would wait, with its one
+    /// reason and when it would start, estimated as a waiting probe's is from the work ahead of the
+    /// end of its class's line. O(log n); changes nothing.
     pub fn quote(&self, ask: &Ask, now: i64) -> Quote {
         if let Some(why) = self.never(ask) {
             return Quote::Never { why };
@@ -3379,14 +3447,14 @@ impl Admission {
             Kind::Whole => self.claims == 0 && self.sample.ci_jobs == 0 && ask::fits(&amounts, &free),
             Kind::Share => ask::fits(&ask::plus(&self.held, &amounts), &self.base),
             Kind::Ordinary => ask::fits(&amounts, &free),
-        } && self.whole_claims == 0;
+        } && self.whole_claims == 0 && !self.claims_spent();
         let reason = if let Some(reason) = self.not_taking() {
             reason
         } else if let Some((_, at)) = self.kept {
             Reason::Kept { at }
         } else if fits {
             return Quote::Now;
-        } else if ask::fits(&amounts, &free) {
+        } else if ask::fits(&amounts, &free) && !self.claims_spent() {
             Reason::Whole { jobs: self.claims.saturating_add(self.sample.ci_jobs) }
         } else {
             Reason::Room { short: shortfall(&ask.needs.request, &ask::resources(&free)) }
@@ -3404,6 +3472,19 @@ impl Admission {
     /// Where it stands with its machine's capacity keeper, as its shell last said.
     pub fn keeper(&self) -> Keeper {
         self.keeper
+    }
+
+    /// The room run `run`'s live claim `fence` holds here (offered and not lapsed by `now`, or
+    /// taken): what its reserve through its machine's keeper asks before the ledger starts it (Hex's
+    /// capacity-view.md, the holder's item 4). None for any other, whose start is answered as ever.
+    pub fn claim(&self, from: Peer<'_>, run: &str, fence: Fence, now: i64) -> Option<Amounts> {
+        let p = self.find(from, run).and_then(|s| self.get(s))?;
+        let live = match p.state {
+            State::Offered { fence: f, until } => f == fence && until > now,
+            State::Taken { fence: f } => f == fence,
+            State::Running { .. } | State::Waiting | State::Aside => false,
+        };
+        live.then_some(p.amounts)
     }
 
     /// The room it admits against now, and what its claims hold of it.

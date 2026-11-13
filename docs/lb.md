@@ -305,6 +305,21 @@ validates is what keeps deciders working on copies safe (§3.4). The runner's le
   The kernel's budget stays the runner's own (`cap`): what others hold is room the ledger doesn't
   hold, so it reaches the kernel as its `outside`, through `sync_fast`. A view over its room (the
   room measured below what is held) admits nothing new until it fits, and what runs keeps its room.
+  It holds no more claims than its holder may reserve (`View::most_claims`): the most its holder may
+  hold, Hex's `most_held` (the wire's message bound over the widest reservation, so that one sync
+  lists them all: CV8, CV9), less those it holds for no live claim here (an earlier process's runs
+  that outlived it, releases not yet answered). A claim more fits nowhere, by probing or by its
+  kernel, whatever it asks, and its waiting runs say they wait for room.
+
+**A run's start.** The shell reserves a claim's room (`Admission::claim`: the room the claim holds)
+before the ledger starts its run, and starts it only on the keeper's grant, as Hex's stand-in holder
+writes a run down on its grant, before its work starts: `Admission::start` on the grant, its record
+then written before the process starts, as ever. A reserve refused, or with no answer within its
+learned wait (`NotGranted`), lapses the claim (`Admission::not_granted`): the run waits here again
+on the room there is (the shell says the refusal's view first), and its owner is told why, the one
+word on which it may place the run elsewhere. A kernel start refused is declined for room
+(`Admission::fast_not_granted`), in the runner's word as it stands, so the owner's kernel picks
+again. A grant that comes for a claim that lapsed meanwhile starts nothing, and is given back.
 
 The view is the decider's copy (CV7): the keeper validates every reserve, so a stale view costs a
 refusal and a placement again, never a double booking. Its `own` is the holder's reservations whose
@@ -1137,15 +1152,18 @@ however many came.
   still passes each runner's word on to every owner (owners that hear hints, and its own kernel,
   need it), and an owner that hears tokens drops it. Cutting that fan-out needs the server to know
   which owners hear tokens from which runners.
-- A machine's keeper ("A machine's keeper"): the ledger's side is built; the runner's shell as the
-  keeper's holder is not, so nothing names a keeper yet. It waits on Hex's `hex_api::capacity`
-  vendored in kiln: `Holder` driven over `hex_quic::capacity::Link` on `CAPACITY_PORT`, its identity
-  enrolled with kiln's CA by CSR and named in the keeper's configuration, its epoch durable and one
-  more at each start of its process, a reserve before each run's process starts and the process
-  started only on its grant, a release once its work can no longer run, each sync listing every
-  reservation whose work may still run, its waits learned by hex-core's `Patience`, and each change
-  said to `Admission::keeper_said`; and kiln-ci's simulator driving that holder against Hex's
-  `capacity::sim::SimView` under crash seeds.
+- A machine's keeper ("A machine's keeper"): the ledger's side is built (where it stands with the
+  keeper, the room and claims the view leaves it, a start's reserve not granted); the runner's shell
+  as the keeper's holder is not, so nothing names a keeper yet. It waits on Hex's
+  `hex_api::capacity` vendored in kiln: `Holder` driven over `hex_quic::capacity::Link` on
+  `CAPACITY_PORT`, its identity enrolled with kiln's CA by CSR and named in the keeper's
+  configuration, its epoch durable and one more at each start of its process, a reserve before each
+  run's process starts and the process started only on its grant, a release once its work can no
+  longer run, each sync listing every reservation whose work may still run, its waits learned by
+  hex-core's `Patience`, and each change said to `Admission::keeper_said`, its holder's count of
+  claims among them; and kiln-ci's simulator driving that holder against Hex's
+  `capacity::sim::SimView` under crash seeds. How a run that asks nothing starts there (Hex's
+  holder reserves no empty amount) waits on Hex's word.
 
 ## GPU fit and load (W05-R03, W05-R22, W05-R23, W13-R01)
 

@@ -1,5 +1,5 @@
 //! A machine's capacity keeper, as the runner's ledger takes it (docs/lb.md "A machine's keeper";
-//! Hex's `docs/design/capacity-view.md` CV1, CV3, CV7, CV10, CV11; kiln plan
+//! Hex's `docs/design/capacity-view.md` CV1, CV3, CV7, CV8, CV10, CV11; kiln plan
 //! 01a1cd8e862e7169a074db3d5fa33f3d, step 13). Where Hex's node keeps a machine's room, Hex's boxes
 //! and kiln's runs admit against that one ledger: kiln's runner holds room there by reserving it
 //! through the keeper, its run starting only on the keeper's grant (its shell's). This is the ledger's
@@ -15,13 +15,15 @@
 //! - **Synced** ([`Keeper::Synced`]): what it admits is held to the room the keeper's last word leaves
 //!   it ([`View::room_for_holder`]): the machine's room less what everyone else holds, the keeper's
 //!   own rule (CV3: a charge fits iff `c <= room - local - foreign` in every dimension). Its CPUs are
-//!   never overcommitted past that room, which the keeper grants none past, and it holds no GPUs (CV3:
-//!   a holder's reserve asking any is refused, typed, until device grants by identity). The keeper
-//!   still validates each reserve: this is the decider's copy (CV7; Omega, Schwarzkopf et al.,
-//!   EuroSys 2013, §3.4), kept current by every answer and hint, so a refusal costs a placement
-//!   again, never a double booking.
+//!   never overcommitted past that room, which the keeper grants none past, it holds no GPUs (CV3:
+//!   a holder's reserve asking any is refused, typed, until device grants by identity), and it holds
+//!   no more claims than its holder may reserve ([`View::most_claims`], CV8). The keeper still
+//!   validates each reserve: this is the decider's copy (CV7; Omega, Schwarzkopf et al., EuroSys
+//!   2013, §3.4), kept current by every answer and hint, so a refusal ([`NotGranted`]) costs a
+//!   placement again, never a double booking.
 //!
-//! Every amount here is the keeper's or the runner's own: nothing is a number of this module's.
+//! Every amount and count here is the keeper's or the runner's own: nothing is a number of this
+//! module's.
 
 use super::ask::{self, Amounts};
 
@@ -37,6 +39,13 @@ pub struct View {
     /// This runner's reservations among `held`: what the keeper granted it that it hasn't released,
     /// its holder's own count (which each sync holds to the keeper's, CV5).
     pub own: Amounts,
+    /// The most claims this runner may hold live there at once, each claim's room reserved through
+    /// the keeper as one reservation: the most its holder may hold (Hex's `most_held`, the wire's
+    /// message bound over the widest reservation, so that one sync lists them all: CV8, CV9), less
+    /// those it holds for no live claim here (an earlier process's runs that outlived it, releases
+    /// not yet answered). Its shell's count, said again as it moves: a claim past it fits nowhere,
+    /// since its reserve would be refused for it.
+    pub most_claims: u64,
 }
 
 impl View {
@@ -118,6 +127,46 @@ impl Keeper {
         match self {
             Keeper::Synced(view) => Some(view.room_for_holder()),
             Keeper::None | Keeper::Unsynced(_) => None,
+        }
+    }
+
+    /// The most claims it may hold live there, while synced ([`View::most_claims`]).
+    pub fn most_claims(&self) -> Option<u64> {
+        match self {
+            Keeper::Synced(view) => Some(view.most_claims),
+            Keeper::None | Keeper::Unsynced(_) => None,
+        }
+    }
+}
+
+/// Why a run's reserve through its machine's keeper wasn't granted, as its shell heard it (the
+/// holder contract's items 4 and 5): the run never starts under that claim. Its shell reserves a
+/// claim's room before the ledger starts it (as Hex's stand-in holder does: the run is written down
+/// on its grant, before its work starts), and says each refusal's view first, so the run then
+/// waits on the room and claims there are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotGranted {
+    /// It doesn't fit the room the keeper has left (`Refused { Room }`).
+    Room,
+    /// Its holder holds as many reservations as the keeper keeps for one (`Refused { Full }`, or
+    /// the holder core's own `NotNow::Full`).
+    Full,
+    /// The keeper granted another amount than its reserve asked, which its holder gave back
+    /// (`Disagrees`).
+    Disagrees,
+    /// No answer came, or none could be asked: its link dropped, its wait ran out (the holder
+    /// core's `Event::Unanswered`), or its holder wasn't synced as it asked (`NotNow::Down`).
+    Unanswered,
+}
+
+impl NotGranted {
+    /// Why, in words, as the run's owner is told it.
+    pub fn why(self) -> &'static str {
+        match self {
+            NotGranted::Room => "its machine's capacity keeper refused its reserve: no room for it there now",
+            NotGranted::Full => "its machine's capacity keeper refused its reserve: this runner holds as many as the keeper keeps for it",
+            NotGranted::Disagrees => "its machine's capacity keeper granted another amount than its reserve asked, given back",
+            NotGranted::Unanswered => "its reserve with its machine's capacity keeper went unanswered (its link dropped, or its wait ran out)",
         }
     }
 }
