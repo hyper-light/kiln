@@ -171,17 +171,6 @@ impl FirecrackerRuntime {
         })
     }
 
-    /// The RLIMIT_MEMLOCK the VMM of a VM given a device whole, its guest's RAM `ram` bytes, runs under, under this
-    /// process's own limit and capabilities ([`vfio::dma_memlock`]). A VM given none maps no RAM for DMA, and its VMM
-    /// runs under the node's own.
-    fn dma_memlock(ram: u64) -> Result<Option<rustix::process::Rlimit>, Refusal> {
-        vfio::dma_memlock(
-            ram,
-            rustix::process::getrlimit(rustix::process::Resource::Memlock),
-            vfio::vmm_holds_ipc_lock()?,
-        )
-    }
-
     fn vm_program(&self, paths: &Paths) -> Result<Program, Refusal> {
         let mut program = Program::default();
         program
@@ -464,7 +453,7 @@ impl FirecrackerRuntime {
                 .machine_memory(&spec)?
                 .checked_mul(1 << 20)
                 .ok_or_else(|| invalid("guest memory overflow"))?;
-            Self::dma_memlock(ram)?
+            self.host.dma_memlock(ram)?
         };
         let id = spec.id.try_clone()?;
         // The optional handoff already persisted this SAME scope before stopping its observer.
@@ -1593,33 +1582,111 @@ mod io_tests {
         assert_eq!(&read, wrote);
     }
 
-    /// A stand-in VMM: a real child process, observed as the native receipt observes one.
+    /// A stand-in VMM: a real child process, observed as the native receipt observes one. Its start
+    /// time is read while it waits on its gate, its stdin, as the node's launcher reads a VMM's while
+    /// it is held before its exec (hex-node `ManagedVm::observe_identity`): the read never races its end.
     struct StandIn {
         identity: shards_api::Identity,
         child: std::sync::Mutex<std::process::Child>,
     }
 
+    /// A stand-in's run from its gate to its end: a program this test runs as its own child.
+    static STAND_IN_ENDS: hex_core::patience::Patience = hex_core::patience::Patience::seeded(
+        "test.hex_runtime.firecracker.stand_in_ends",
+        hex_testkit::waits::PROGRAM,
+    );
+
+    /// What a VMM whose DMA map RLIMIT_MEMLOCK refused writes as it ends.
+    const MEMLOCK: &str = "vfio: RLIMIT_MEMLOCK (8388608) exceeded";
+
     impl StandIn {
-        fn start(script: &str, stdout: std::io::PipeWriter, stderr: std::io::PipeWriter) -> Self {
-            let child = std::process::Command::new("/bin/sh")
-                .args(["-c", script])
-                .stdin(std::process::Stdio::null())
+        /// Starts `script` on `stdout` and `stderr`, held until a line comes on the gate it returns.
+        fn held(
+            script: &str,
+            stdout: std::io::PipeWriter,
+            stderr: std::io::PipeWriter,
+        ) -> (Self, std::process::ChildStdin) {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("read -r gate; {script}")])
+                .stdin(std::process::Stdio::piped())
                 .stdout(stdout)
                 .stderr(stderr)
                 .spawn()
                 .unwrap();
+            let gate = child.stdin.take().unwrap();
             let pid = child.id();
             let started =
                 crate::linux::oci::state::start_time(i32::try_from(pid).unwrap()).unwrap();
-            Self {
+            let vmm = Self {
                 identity: shards_api::Identity {
                     pid,
                     started,
                     vsock: PathBuf::from("/nonexistent/stand-in.vsock"),
                 },
                 child: std::sync::Mutex::new(child),
-            }
+            };
+            (vmm, gate)
         }
+
+        /// Starts `script` held, and lets it run once its start time is read.
+        fn start(script: &str, stdout: std::io::PipeWriter, stderr: std::io::PipeWriter) -> Self {
+            let (vmm, mut gate) = Self::held(script, stdout, stderr);
+            gate.write_all(b"\n").unwrap();
+            vmm
+        }
+
+        fn pid(&self) -> rustix::process::Pid {
+            rustix::process::Pid::from_raw(i32::try_from(self.identity.pid).unwrap()).unwrap()
+        }
+
+        /// Lets it run, and waits until it has ended, unreaped: `waitid` with `WNOWAIT` sees its end
+        /// and leaves it a zombie.
+        fn end(&self, mut gate: std::process::ChildStdin) {
+            gate.write_all(b"\n").unwrap();
+            drop(gate);
+            let pid = self.pid();
+            hex_testkit::waits::until(&STAND_IN_ENDS, "the stand-in VMM's end", || {
+                rustix::process::waitid(
+                    rustix::process::WaitId::Pid(pid),
+                    rustix::process::WaitIdOptions::EXITED
+                        | rustix::process::WaitIdOptions::NOWAIT
+                        | rustix::process::WaitIdOptions::NOHANG,
+                )
+                .unwrap()
+                .is_some()
+            })
+            .unwrap();
+        }
+
+        /// Has its receipt collect its end, as the node's supervisor collects an ended VMM's at once
+        /// (its pidfd turns readable in the supervisor's epoll set: hex-node supervise.rs `ready`,
+        /// `ManagedVm::collect`); then no child of this process has its pid.
+        fn reap(&self) {
+            assert!(
+                shards_api::ManagedProcess::terminal(self)
+                    .unwrap()
+                    .is_some()
+            );
+            let left = rustix::process::waitid(
+                rustix::process::WaitId::Pid(self.pid()),
+                rustix::process::WaitIdOptions::EXITED
+                    | rustix::process::WaitIdOptions::NOWAIT
+                    | rustix::process::WaitIdOptions::NOHANG,
+            );
+            assert!(
+                matches!(left, Err(rustix::io::Errno::CHILD)),
+                "reaped: {left:?}"
+            );
+        }
+    }
+
+    /// Waits for `vmm`'s guest readiness as create does, on an endpoint no guest reaches, within the
+    /// create's deadline as `create` takes it, its config's boot deadline.
+    fn readiness(vmm: &StandIn, output: &mut std::io::PipeReader) -> Result<(), Refusal> {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(dir.path().join("ready")).unwrap();
+        let until = Instant::now() + pool::tests::config().boot_timeout;
+        transport::ready(&listener, vmm, output, until)
     }
 
     impl shards_api::ManagedProcess for StandIn {
@@ -1646,26 +1713,59 @@ mod io_tests {
     }
 
     /// AC-T7.4.1: original. A VMM that says why it stops and ends before its guest is ready (as
-    /// a DMA map refused by RLIMIT_MEMLOCK ends one). Do: start a stand-in on the configured output
-    /// sinks and wait for readiness as create does; expect the refusal to carry what it wrote. The
-    /// wait ends on the stand-in's exit; the deadline is only an outer guard.
+    /// a DMA map refused by RLIMIT_MEMLOCK ends one), ended before readiness first looks at it, its
+    /// end not yet collected. Do: start a stand-in on the configured output sinks, its start time
+    /// read while it is held; let it write and end, and see it a zombie (`waitid` with `WNOWAIT`);
+    /// then wait for readiness as create does. Expect the refusal to carry what it wrote. Red at
+    /// 925882c1 (and racy before, 2 of 7 runs at af9131d4): readiness read no start time for the
+    /// zombie and refused it Invalid, "native readiness identity changed".
     #[test]
     fn original_a_vmm_ending_before_readiness_is_refused_with_what_it_wrote() {
         let (shards_api::LaunchIo { stdout, stderr, .. }, mut output) =
             FirecrackerRuntime::vm_io().unwrap();
-        let vmm = StandIn::start(
-            "echo 'vfio: RLIMIT_MEMLOCK (8388608) exceeded' >&2; exit 1",
-            stdout,
-            stderr,
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let listener = UnixListener::bind(dir.path().join("ready")).unwrap();
-        let until = Instant::now() + std::time::Duration::from_secs(60);
-        let refusal = transport::ready(&listener, &vmm, &mut output, until).unwrap_err();
+        let (vmm, gate) = StandIn::held(&format!("echo '{MEMLOCK}' >&2; exit 1"), stdout, stderr);
+        vmm.end(gate);
+        let refusal = readiness(&vmm, &mut output).unwrap_err();
         assert!(
-            matches!(&refusal, Refusal::Broken(why) if why.contains("vfio: RLIMIT_MEMLOCK (8388608) exceeded")),
+            matches!(&refusal, Refusal::Broken(why) if why.contains(MEMLOCK)),
             "{refusal:?}"
         );
+    }
+
+    /// AC-T7.4.1: original. As above, but its receipt has collected its end before readiness first
+    /// looks, as the node's supervisor collects an ended VMM's at once. Do: start the stand-in held,
+    /// let it write and end, have its receipt reap it and see no child has its pid; then wait for
+    /// readiness as create does. Expect the refusal to carry what it wrote. Red at 925882c1:
+    /// readiness opened no pidfd at the reaped pid and refused Os, "observing native readiness
+    /// controller" (ESRCH).
+    #[test]
+    fn original_a_vmm_reaped_before_readiness_is_refused_with_what_it_wrote() {
+        let (shards_api::LaunchIo { stdout, stderr, .. }, mut output) =
+            FirecrackerRuntime::vm_io().unwrap();
+        let (vmm, gate) = StandIn::held(&format!("echo '{MEMLOCK}' >&2; exit 1"), stdout, stderr);
+        vmm.end(gate);
+        vmm.reap();
+        let refusal = readiness(&vmm, &mut output).unwrap_err();
+        assert!(
+            matches!(&refusal, Refusal::Broken(why) if why.contains(MEMLOCK)),
+            "{refusal:?}"
+        );
+    }
+
+    /// AC-T7.4.1: non-vacuity of the identity check the originals above pass. Do: hold a stand-in
+    /// on its gate, so it runs throughout, and wait for readiness through a receipt naming its pid
+    /// with another start. Expect Invalid, "native readiness identity changed": its receipt says
+    /// it runs, and no process with that identity does.
+    #[test]
+    fn a_running_vmm_whose_identity_names_another_start_is_refused() {
+        let (shards_api::LaunchIo { stdout, stderr, .. }, mut output) =
+            FirecrackerRuntime::vm_io().unwrap();
+        let (mut vmm, gate) = StandIn::held("exit 0", stdout, stderr);
+        vmm.identity.started += 1;
+        let refused = readiness(&vmm, &mut output);
+        vmm.end(gate);
+        vmm.reap();
+        assert_eq!(refused, Err(invalid("native readiness identity changed")));
     }
 
     /// AC-T7.4.1: do have a stand-in VMM write twice what one wire answer holds, as invalid
@@ -1703,6 +1803,190 @@ mod io_tests {
             answer.len() > hex_core::wire::MAX_MESSAGE - 4,
             "{}",
             answer.len()
+        );
+    }
+
+    /// One CPU box's record, as a Store keeps it, and its launcher, as the node's: the launch starts a
+    /// stand-in VMM on the create's own output, held until its identity is read and published in the
+    /// record (hex-node supervise.rs `bind_managed` publishes it before the gate's release); then lets
+    /// it run, and answers once it has ended and its receipt has collected its end, as the node's
+    /// supervisor collects an ended VMM's at once.
+    #[derive(Default)]
+    struct Launcher {
+        record: std::cell::RefCell<Option<BoxRecord>>,
+        vmm: std::cell::RefCell<Option<triomphe::Arc<StandIn>>>,
+    }
+
+    impl Transaction for Launcher {
+        fn records(&self) -> Result<crate::devices::Records, Refusal> {
+            Ok(crate::devices::Records::new())
+        }
+        fn pool_records(&self) -> Result<crate::devices::PoolRecords, Refusal> {
+            Ok(crate::devices::PoolRecords::new())
+        }
+        fn read_pool(&self, _: &hex_api::BackingKey) -> Result<Option<PoolRecord>, Refusal> {
+            panic!("a CPU box reads no pool")
+        }
+        fn put_pool(&self, _: &PoolRecord) -> Result<(), Refusal> {
+            panic!("a CPU box writes no pool")
+        }
+        fn grant_pool(&self, _: &hex_api::BackingGrant) -> Result<PoolRecord, Refusal> {
+            panic!("a CPU box is granted no pool")
+        }
+        fn remove_pool(&self, _: &hex_api::BackingKey) -> Result<(), Refusal> {
+            panic!("a CPU box removes no pool")
+        }
+        fn check_unsubmitted_pool(&self) -> Result<(), Refusal> {
+            panic!("a CPU box checks no pool")
+        }
+        fn read(&self, _: &BoxId) -> Result<Option<BoxRecord>, Refusal> {
+            Ok(self.record.borrow().clone())
+        }
+        fn put(&self, record: &BoxRecord) -> Result<(), Refusal> {
+            let mut kept = record.clone();
+            kept.native_scope
+                .get_or_insert(hex_core::record::NativeScope::from_bytes([7; 16]));
+            *self.record.borrow_mut() = Some(kept);
+            Ok(())
+        }
+        fn remove(&self, _: &BoxId) -> Result<(), Refusal> {
+            *self.record.borrow_mut() = None;
+            Ok(())
+        }
+        fn launch_managed(
+            &self,
+            _: &ManagedLaunch<'_>,
+            io: shards_api::LaunchIo,
+            _: std::time::Duration,
+        ) -> Result<shards_api::ManagedReceipt, Refusal> {
+            let (vmm, gate) = StandIn::held(
+                &format!("echo '{MEMLOCK}' >&2; exit 1"),
+                io.stdout,
+                io.stderr,
+            );
+            let mut record = self.record.borrow().clone().unwrap();
+            record.init = Some(hex_core::record::ProcId {
+                pid: vmm.identity.pid,
+                start_ticks: vmm.identity.started,
+            });
+            *self.record.borrow_mut() = Some(record);
+            vmm.end(gate);
+            vmm.reap();
+            let vmm = triomphe::Arc::new(vmm);
+            *self.vmm.borrow_mut() = Some(triomphe::Arc::clone(&vmm));
+            Ok(shards_api::managed_receipt(vmm))
+        }
+        fn attach_managed(
+            &self,
+            identity: Option<&shards_api::Identity>,
+        ) -> Result<shards_api::ManagedReceipt, Refusal> {
+            let vmm = triomphe::Arc::clone(self.vmm.borrow().as_ref().unwrap());
+            assert_eq!(
+                identity.map(|identity| (identity.pid, identity.started)),
+                Some((vmm.identity.pid, vmm.identity.started)),
+                "the cleanup attaches the receipt its record names"
+            );
+            Ok(shards_api::managed_receipt(vmm))
+        }
+        fn finalize_managed(&self, _: Option<&shards_api::Identity>) -> Result<(), Refusal> {
+            Ok(())
+        }
+        fn managed_usage(&self) -> Result<hex_api::Usage, Refusal> {
+            panic!("a VM whose guest never came up reads no usage")
+        }
+    }
+
+    /// AC-T7.4.1: original. A create whose VMM says why it stops and ends before its guest is ready,
+    /// its end collected before readiness first looks, as on a node whose supervisor reaps it at once.
+    /// Do: create a CPU box through the launcher above, its stand-in VMM's identity published while it
+    /// is held, then the VMM ended and reaped as the launch answers. Expect the create refused with
+    /// what the VMM wrote, and nothing of the box kept. Red at 925882c1: refused Os, "observing
+    /// native readiness controller" (ESRCH).
+    #[test]
+    fn original_a_create_whose_vmm_ends_before_readiness_is_refused_with_what_it_wrote() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            (path, <[u8; 32]>::from(sha2::Sha256::digest(bytes)))
+        };
+        let mut config = pool::tests::config();
+        (config.binary, config.binary_sha256) = pinned("firecracker", b"a stand-in VMM, never run");
+        (config.cost_evidence, config.cost.id) = pinned("evidence", b"a stand-in cost's evidence");
+        config.state_dir = dir.path().join("state");
+        fs::create_dir(&config.state_dir).unwrap();
+        let catalog = crate::devices::Catalog::parse(b"hex-devices-1\n").unwrap();
+        let owner: Arc<dyn Books> = Arc::new(super::handoff_tests::NoOwnerCalls);
+        let allocation = config
+            .cost
+            .allocate(hex_api::CapacityResources {
+                cpu_milli: 1000,
+                mem_bytes: hex_api::MIN_MEMORY,
+                disk_bytes: 0,
+            })
+            .unwrap();
+        let runtime = FirecrackerRuntime {
+            config,
+            catalog: triomphe::Arc::try_new(catalog).unwrap(),
+            books: Arc::downgrade(&owner),
+            initialized: std::sync::OnceLock::new(),
+            host: vfio::Host::system().unwrap(),
+            marks: single_use::MarksAt {
+                dir: PathBuf::from("/nonexistent/runtime"),
+                unshared: None,
+            },
+            uid: rustix::process::geteuid().as_raw(),
+            boot: None,
+            joins: std::sync::Mutex::new(None),
+            evented: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        };
+        let id = BoxId::new("ends-before-readiness").unwrap();
+        let spec = BoxSpec {
+            id: id.clone(),
+            bounds: hex_api::Bounds {
+                cpu_max_milli: Some(1000),
+                memory_max: Some(hex_api::MIN_MEMORY),
+                ..hex_api::Bounds::default()
+            },
+            class: ClassSpec::Firecracker(Box::new(hex_api::OciSpec {
+                rootfs: hex_api::Rootfs::Dir("/fixture/root".into()),
+                init: Program::of(&["true"]),
+                mounts: Vec::new(),
+                hostname: None,
+                network: hex_api::Network::Private,
+                hosts: Vec::new(),
+            })),
+            owner: None,
+            devices: Vec::new(),
+            allocation: Some(allocation),
+            route: Some(hex_api::RouteReceipt {
+                key: hex_api::RouteKey {
+                    class: Class::Firecracker,
+                    image: hex_api::ImagePlatform {
+                        os: hex_api::ImageOs::Linux,
+                        arch: hex_api::ImageArch::Amd64,
+                    },
+                    execution: hex_api::Execution::Firecracker,
+                    gpu: hex_api::GpuEligibility::None,
+                },
+                backing: None,
+            }),
+            band: 0,
+        };
+        let launcher = Launcher::default();
+        // The create's deadline, as `create` takes it from its config.
+        let until = Instant::now() + runtime.config.boot_timeout;
+        let refused = runtime.create_or_cleanup(&id, spec, None, &launcher, until);
+        assert!(
+            matches!(&refused, Err(Refusal::Broken(why)) if why.contains(MEMLOCK)),
+            "{refused:?}"
+        );
+        assert!(launcher.record.borrow().is_none(), "no record is kept");
+        assert_eq!(
+            fs::read_dir(&runtime.config.state_dir).unwrap().count(),
+            0,
+            "no VM state is kept"
         );
     }
 }
@@ -1862,6 +2146,7 @@ mod handoff_tests {
                 },
                 backing: Some(source.key),
             }),
+            band: 0,
         };
         let mut record = BoxRecord::new(spec, Phase::Creating, Vec::new());
         record.native_scope = Some(hex_core::record::NativeScope::from_bytes([6; 16]));
@@ -2146,6 +2431,7 @@ mod cleanup_tests {
                 },
                 backing: None,
             }),
+            band: 0,
         };
         let records = Unattachable(RefCell::new(None));
         let until = Instant::now() + std::time::Duration::from_secs(30);
@@ -2381,6 +2667,7 @@ mod memlock_tests {
                 },
                 backing: None,
             }),
+            band: 0,
         };
         let vm_ram = runtime.config.machine_memory(&spec).unwrap() * (1 << 20);
         let records = Unlaunched(RefCell::new(None));
@@ -2564,6 +2851,9 @@ mod single_use_tests {
         (config.cost_evidence, config.cost.id) = pinned("evidence", b"a stand-in cost's evidence");
         config.state_dir = dir.join("state");
         fs::create_dir(&config.state_dir).unwrap();
+        // Its VMMs may pin the RAM of the VMs these tests create (`spec`'s, one RAM whatever the name) and no more,
+        // whatever this machine's own limit (AC-T7.4.1).
+        let ram = config.machine_memory(&spec(&config, "vm")).unwrap() * (1 << 20);
         FirecrackerRuntime {
             config,
             catalog: triomphe::Arc::try_new(Catalog::parse(catalog).unwrap()).unwrap(),
@@ -2573,6 +2863,7 @@ mod single_use_tests {
                 sys: host.join("sys"),
                 dev: host.join("dev"),
                 open: vfio::stand_in::opened,
+                memlock: vfio::stand_in::memlock(ram),
             },
             marks: single_use::MarksAt {
                 dir: runtime.to_path_buf(),
@@ -2587,8 +2878,8 @@ mod single_use_tests {
 
     const GPU: &[u8] = b"hex-devices-1\ngpu\t256\ta\t1\tvfio\t0000:01:00.0\t7\n";
 
-    /// A VM given the stand-in GPU on `node`.
-    fn spec(node: &FirecrackerRuntime, name: &str) -> BoxSpec {
+    /// A VM given the stand-in GPU on a node configured with `config`.
+    fn spec(config: &Config, name: &str) -> BoxSpec {
         BoxSpec {
             id: BoxId::new(name).unwrap(),
             bounds: hex_api::Bounds {
@@ -2610,7 +2901,7 @@ mod single_use_tests {
                 key: 256,
             }],
             allocation: Some(
-                node.config
+                config
                     .cost
                     .allocate(CapacityResources {
                         cpu_milli: 1000,
@@ -2631,6 +2922,7 @@ mod single_use_tests {
                 },
                 backing: None,
             }),
+            band: 0,
         }
     }
 
@@ -2638,7 +2930,7 @@ mod single_use_tests {
         let until = Instant::now() + std::time::Duration::from_secs(30);
         node.create_or_cleanup(
             &BoxId::new(name).unwrap(),
-            spec(node, name),
+            spec(&node.config, name),
             None,
             books,
             until,

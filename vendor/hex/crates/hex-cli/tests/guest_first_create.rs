@@ -102,6 +102,7 @@ fn an_upgrades_first_create_is_timed() {
             hosts: Vec::new(),
         })),
         owner: None,
+        band: 0,
     })
     .unwrap();
     let created = creating.elapsed().as_secs_f64() * 1e3;

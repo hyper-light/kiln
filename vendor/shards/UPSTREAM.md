@@ -34,8 +34,12 @@ Each change is recorded in `vendor/patches/shards/`, applied in this order on up
 | File | Change | Why | Recorded as |
 |---|---|---|---|
 | `Cargo.toml`, `Cargo.lock` | aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0 from crates.io, their lock entries holding the SHA-256s upstream's `vendor/README.md` lists, instead of from `vendor/` | upstream's copies are those crates.io packages byte for byte, and kiln vendors aws-lc-rs itself (`vendor/aws-lc-rs`, 1.18.2 with Mantle's change): kiln's tree holds one copy of each project. Shards' own crates name 1.18.1 and aws-lc-sys 0.45.0 (`shards-sigstore` calls it), so its build keeps those versions; as T4 took it on 2026-10-21 | `0001-aws-lc-rs-and-aws-lc-sys-from-crates-io.patch` |
+| `crates/api/Cargo.toml`, `crates/api/src/image.rs`, `crates/api/src/image/session.rs`, `crates/api/src/image/spawn.rs` | the run host (`shards api-run`) started holding its three standard streams alone: through posix_spawn with file actions for 0, 1 and 2 (`POSIX_SPAWN_CLOEXEC_DEFAULT` on Apple's), and through `CreateProcessW` with a handle list of those three alone | Hex's change to Shards (its joint plan step 12), which Hex's copy of Shards carries at this revision and kiln's one copy carries with it: std's `Command` hands the run host whatever another thread of its orchestrator holds inheritable at that moment, on macOS and Windows | `0002-image-the-run-host-started-holding-its-three-standard.patch` |
+| `crates/api/src/image/wire.rs` | each member's reach of the destinations kept, which its run host holds it to (D236, the image channel's version 9) | Hex's change to Shards (its joint plan step 15), carried as the one above: a harness held to exactly the providers and host its grants name, a run refused before its VM starts where a member would reach other than that | `0003-image-each-member-s-reach-of-the-destinations-kept-which-its.patch` |
 
-The change is kiln's layout alone (`Kiln-only:`), so it isn't offered upstream.
+The first change is kiln's layout alone (`Kiln-only:`), so it isn't offered upstream. The second and third are
+Hex's own, offered to Shards by Hex's lead (their records in `vendor/hex/vendor/patches/shards` are kiln's, byte for
+byte: `vendor/hex/UPSTREAM.md`).
 
 ## Taking a newer upstream
 

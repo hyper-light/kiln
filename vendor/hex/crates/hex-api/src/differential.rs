@@ -497,7 +497,7 @@ impl Play<'_> {
                 until(want, patience, || match rt.inspect(&id) {
                     Ok(info) => Seen::Box(info.state, info.exit),
                     Err(e) => Seen::Refused(kind(&e)),
-                })
+                })?
             }
             Step::Listed(b) => {
                 let id = self.id(*b)?;
@@ -509,7 +509,7 @@ impl Play<'_> {
                 until(want, patience, || match rt.usage(&id) {
                     Ok(u) => Seen::Killed(u.oom_kills > 0),
                     Err(e) => Seen::Refused(kind(&e)),
-                })
+                })?
             }
             Step::Delete(b) => done(rt.delete(&self.id(*b)?)),
         })
@@ -519,7 +519,11 @@ impl Play<'_> {
 /// Reads with `look` until it shows `want`, or `patience` has passed; returns the last reading. A box's
 /// state has no event to wait on, so it is read again after waiting as long as the last read took: at most
 /// half the time reading, at whatever a read costs on this platform.
-fn until(want: Option<&Seen>, patience: Duration, mut look: impl FnMut() -> Seen) -> Seen {
+fn until(
+    want: Option<&Seen>,
+    patience: Duration,
+    mut look: impl FnMut() -> Seen,
+) -> Result<Seen, String> {
     let asked = Instant::now();
     let deadline = asked.checked_add(patience);
     loop {
@@ -529,13 +533,13 @@ fn until(want: Option<&Seen>, patience: Duration, mut look: impl FnMut() -> Seen
         if want.is_some_and(|w| *w == seen) {
             // The answer came: it teaches the suite's learned wait how long a box's answer takes.
             conformance::ENDS.saw(asked.elapsed());
-            return seen;
+            return Ok(seen);
         }
         let late = deadline.is_none_or(|d| Instant::now() >= d);
         if want.is_none() || late {
-            return seen;
+            return Ok(seen);
         }
-        conformance::rest(took);
+        conformance::rest(took)?;
     }
 }
 
@@ -578,6 +582,7 @@ fn kind(r: &Refusal) -> &'static str {
             crate::Upstream::PublishReceiver => "Awaits(PublishReceiver)",
             crate::Upstream::RingPinsWithinRoom => "Awaits(RingPinsWithinRoom)",
             crate::Upstream::LiveMove => "Awaits(LiveMove)",
+            crate::Upstream::MemberDestinations => "Awaits(MemberDestinations)",
         },
     }
 }
@@ -804,7 +809,8 @@ mod tests {
             }
             reads.borrow_mut().push((start, Instant::now()));
             Seen::Listed(false)
-        });
+        })
+        .unwrap();
         let reads = reads.into_inner();
         assert!(reads.len() >= 3, "{} reads", reads.len());
         for pair in reads.windows(2) {
@@ -844,10 +850,10 @@ mod tests {
             }
             let left = self.after.saturating_sub(self.started.elapsed());
             if timeout < left {
-                conformance::rest(timeout);
+                conformance::rest(timeout).map_err(Refusal::Broken)?;
                 return self.try_wait();
             }
-            conformance::rest(left);
+            conformance::rest(left).map_err(Refusal::Broken)?;
             self.try_wait()
         }
         fn kill(&mut self) -> Result<(), Refusal> {

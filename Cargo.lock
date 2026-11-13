@@ -1731,6 +1731,7 @@ name = "hex-api"
 version = "0.1.0"
 dependencies = [
  "hex-afunix",
+ "hex-wait",
  "serde",
  "thiserror 2.0.21",
 ]
@@ -1743,6 +1744,7 @@ dependencies = [
  "hex-afunix",
  "hex-api",
  "hex-core",
+ "hex-wait",
  "rustix",
  "sha2 0.10.9",
  "shards-api",
@@ -1793,6 +1795,7 @@ dependencies = [
  "hex-quic",
  "hex-runtime",
  "hex-sim",
+ "hex-wait",
  "rustix",
  "serde",
  "serde_json",
@@ -1809,6 +1812,7 @@ dependencies = [
  "hex-api",
  "hex-client",
  "hex-core",
+ "hex-wait",
  "hyper-quic",
  "hyper-transport",
  "pem",
@@ -1827,6 +1831,7 @@ dependencies = [
  "hex-client",
  "hex-core",
  "hex-gpu",
+ "hex-wait",
  "libc",
  "rustix",
  "seccompiler",
@@ -1852,6 +1857,14 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "triomphe",
+]
+
+[[package]]
+name = "hex-wait"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]
@@ -2440,7 +2453,10 @@ dependencies = [
  "futures",
  "glob",
  "hex",
+ "hex-api",
+ "hex-core",
  "hex-node",
+ "hex-quic",
  "hmac 0.13.0",
  "http",
  "http-body",
@@ -2672,6 +2688,7 @@ dependencies = [
  "event-listener",
  "futures",
  "hex",
+ "hex-api",
  "parking_lot",
  "rcgen",
  "regex",

@@ -4,6 +4,7 @@ import type { Cpu } from "./Cpu";
 import type { Disk } from "./Disk";
 import type { ExecutorFacts } from "./ExecutorFacts";
 import type { Gpu } from "./Gpu";
+import type { IsolationFacts } from "./IsolationFacts";
 import type { KilnFacts } from "./KilnFacts";
 import type { Mem } from "./Mem";
 import type { Net } from "./Net";
@@ -67,6 +68,12 @@ kiln: KilnFacts | null,
  * Whether its agents can have workspaces of their own (Slates volumes), and why not.
  */
 workspaces: Workspaces | null,
+/**
+ * Whether it holds isolated agents in microVMs of their own, on what, and why not (kiln plan
+ * 01a1cd8e862e7169a074db3d5fa33f3d step 17): [`Virt::microvm`] is its `available`. Absent from a
+ * runner from before it.
+ */
+isolation?: IsolationFacts,
 /**
  * What W24's work needs to know of the machine (docs/ci.md W24, `RunnerFacts.work`).
  */

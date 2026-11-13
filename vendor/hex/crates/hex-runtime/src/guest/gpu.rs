@@ -883,6 +883,7 @@ mod tests {
             devices: devices.clone(),
             allocation: None,
             route: None,
+            band: 0,
         };
         authority.check(&spec).unwrap();
         let mut wrong_class = spec.clone();
@@ -1184,6 +1185,7 @@ mod tests {
                 .collect(),
             allocation: None,
             route: None,
+            band: 0,
         };
         boot.check(&spec("fc-box", &[24])).unwrap();
         assert!(boot.check(&spec("foreign", &[24])).is_err());

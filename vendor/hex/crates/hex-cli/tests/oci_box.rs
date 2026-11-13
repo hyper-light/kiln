@@ -479,6 +479,7 @@ impl Lab {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(self.bundle(args)),
             owner: None,
+            band: 0,
         }
     }
 
@@ -492,6 +493,7 @@ impl Lab {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(self.bundle_with(&Self::act(&Act::Wait), true)),
             owner: None,
+            band: 0,
         }
     }
 
@@ -529,6 +531,7 @@ impl Fixture for Lab {
             bounds,
             class: ClassSpec::Bundle(self.bundle(&Self::act(&Act::Wait))),
             owner: None,
+            band: 0,
         }
     }
 
@@ -541,6 +544,7 @@ impl Fixture for Lab {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(self.bundle(&Self::act(act))),
             owner: None,
+            band: 0,
         }
     }
 
@@ -766,6 +770,7 @@ fn prepared_devs_preserve_order_and_are_never_shared(lab: &Lab, own: &Path) {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir.to_owned()),
             owner: None,
+            band: 0,
         })
     };
     let prime = bundle("prime", None, false);
@@ -1068,6 +1073,7 @@ fn every_mount_kind_is_in_the_box_as_its_spec_asks(lab: &Lab, own: &Path) {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir),
             owner: None,
+            band: 0,
         })
         .unwrap_or_else(|e| panic!("create the {path} box: {e:?}"));
         node.start(&id).expect("start");
@@ -1466,6 +1472,7 @@ fn mount_namespaces_made_each_way(lab: &Lab, own: &Path) {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir),
             owner: None,
+            band: 0,
         });
         let Some(want) = want else {
             assert!(
@@ -1616,6 +1623,7 @@ fn procs_made_ahead_carry_their_masks(lab: &Lab, own: &Path) {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir.clone()),
             owner: None,
+            band: 0,
         })
         .expect("create a box with masks beneath /proc");
         node.start(id).expect("start");
@@ -1796,6 +1804,7 @@ fn a_parked_inits_proc_is_its_own_and_taken_once(lab: &Lab, own: &Path) {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir.to_path_buf()),
             owner: None,
+            band: 0,
         })
         .expect("create a box of no owner with masks beneath /proc");
     };
@@ -2100,6 +2109,7 @@ fn a_parked_init_takes_a_create_made_each_way(lab: &Lab, own: &Path) {
                 bounds: Bounds::default(),
                 class: ClassSpec::Bundle(dir.clone()),
                 owner: None,
+                band: 0,
             })
             .expect("create a box of no owner")
         };
@@ -2282,6 +2292,7 @@ fn masked_directories_are_the_nodes_one_empty_filesystem(lab: &Lab, own: &Path) 
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir),
             owner: None,
+            band: 0,
         })
         .expect("create a box masking directories");
         assert_eq!(
@@ -2407,6 +2418,7 @@ fn create_seeds_share_the_nodes_one_pruned_namespace(lab: &Lab, own: &Path) {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir),
             owner: None,
+            band: 0,
         })
         .expect("create a box through a seed");
     };
@@ -2536,6 +2548,7 @@ fn a_bind_and_a_volume_are_present_the_host_unreachable(lab: &Lab, own: &Path) {
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(dir.clone()),
         owner: None,
+        band: 0,
     })
     .expect("create a box with a read-only bind and a volume");
     node.start(&id).expect("start");
@@ -2745,6 +2758,7 @@ fn classic_reasons_are_counted(lab: &Lab, own: &Path) {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir),
             owner: None,
+            band: 0,
         });
         let _ = node.delete(&id);
         assert_eq!(
@@ -2863,6 +2877,7 @@ fn create_and_start_container_hooks_run_in_the_containers_namespaces(lab: &Lab, 
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir),
             owner: None,
+            band: 0,
         })
     };
     let read =
@@ -3098,6 +3113,7 @@ fn a_failing_create_container_hook_fails_the_create_naming_it(lab: &Lab, own: &P
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir),
             owner: None,
+            band: 0,
         })
         .expect_err("a failing createContainer hook fails the create");
     assert!(
@@ -3129,6 +3145,7 @@ fn a_failing_start_container_hook_fails_the_start_naming_it(lab: &Lab, own: &Pat
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(dir),
         owner: None,
+        band: 0,
     })
     .expect("create a box whose startContainer hook fails");
     let refused = node
@@ -3289,6 +3306,7 @@ fn rootfs_propagation_shows_in_the_box_not_the_agent(lab: &Lab, own: &Path) {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(case.path().to_owned()),
             owner: None,
+            band: 0,
         })
         .unwrap_or_else(|e| panic!("create the {prop} shared-source box: {e:?}"));
         let mut made = Created {
@@ -3412,6 +3430,7 @@ fn an_init_that_refuses_or_dies_mid_build_leaves_nothing(lab: &Lab, own: &Path) 
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir.clone()),
             owner: None,
+            band: 0,
         });
         assert!(
             matches!(&refused, Err(Refusal::Os { why, .. }) if why.contains("nosuchfs") && why.contains("/bad")),
@@ -3528,6 +3547,7 @@ fn an_init_that_refuses_or_dies_mid_build_leaves_nothing(lab: &Lab, own: &Path) 
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir),
             owner: None,
+            band: 0,
         })
         .expect("the box whose spec sets the inject variable is created: the init never saw it");
         node.start(&id).expect("start");
@@ -3734,6 +3754,7 @@ fn a_bundle_joining_a_namespace_by_path_runs_through_the_seam(lab: &Lab, own: &P
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(dir),
         owner: None,
+        band: 0,
     })
     .expect("a bundle joining a namespace by path is made through the seam");
     node.start(&joiner).expect("start the joiner");
@@ -3793,6 +3814,7 @@ fn play_the_agent(dirs: &Path, exe: &str) -> ! {
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(bundle),
         owner: None,
+        band: 0,
     });
     match made {
         // Waits to be killed either way, as the harness ends it.
@@ -4356,6 +4378,7 @@ fn orphans_are_reaped(lab: &Lab, own: &Path) {
         bounds: Bounds::default(),
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .unwrap();
     let (mut out, w) = std::io::pipe().unwrap();
@@ -4483,6 +4506,7 @@ fn held_record_write(lab: &Lab, own: &Path) {
             hosts: Vec::new(),
         })),
         owner: None,
+        band: 0,
     };
     let busy = specs("busy", 31);
     let ids: Vec<BoxId> = busy.iter().map(|s| s.id.clone()).collect();
@@ -4655,6 +4679,7 @@ fn a_config_swapped_after_the_check_never_makes_the_container(lab: &Lab, own: &P
                 bounds: Bounds::default(),
                 class: ClassSpec::Bundle(bundle.clone()),
                 owner: None,
+                band: 0,
             })
         });
         wait_for(
@@ -4699,6 +4724,7 @@ fn a_config_swapped_after_the_check_never_makes_the_container(lab: &Lab, own: &P
                 bounds: Bounds::default(),
                 class: ClassSpec::Bundle(bundle.clone()),
                 owner: None,
+                band: 0,
             })
         });
         wait_for(
@@ -4824,6 +4850,7 @@ fn a_start_runs_the_checked_specs_hooks_not_the_bundle_swapped_after_create(lab:
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(bundle.clone()),
         owner: None,
+        band: 0,
     })
     .expect("create");
     std::fs::write(bundle.join("config.json"), with_hook(&swapped_mark)).unwrap();
@@ -4876,6 +4903,7 @@ fn a_create_or_delete_of_a_box_being_made_waits_for_it(lab: &Lab, own: &Path) {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(bundle),
             owner: None,
+            band: 0,
         };
         let waited = node.waited_for_a_box();
         let (made, then, both_waited) = std::thread::scope(|s| {
@@ -4995,6 +5023,7 @@ fn a_second_create_of_an_owned_box_being_made_waits_and_takes_no_slot(lab: &Lab,
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(bundle),
         owner: Some(owner.clone()),
+        band: 0,
     };
     let (made, then, both_waited) = std::thread::scope(|s| {
         let first = s.spawn(|| node.create(spec));
@@ -5012,6 +5041,7 @@ fn a_second_create_of_an_owned_box_being_made_waits_and_takes_no_slot(lab: &Lab,
                 bounds: Bounds::default(),
                 class: ClassSpec::Bundle(lab.bundle(&wait)),
                 owner: Some(owner.clone()),
+                band: 0,
             })
         });
         // The second waits, or (a node without the turn) ends at once; either way the first is let go below,
@@ -5106,6 +5136,7 @@ fn a_delete_racing_a_create_of_one_id_leaves_the_node_consistent(lab: &Lab, own:
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(bundle),
             owner: None,
+            band: 0,
         };
         let waited = node.waited_for_a_box();
         let (created, deleted) = std::thread::scope(|s| {
@@ -5255,6 +5286,7 @@ fn records_in_both_places_are_found_after_a_restart(lab: &Lab, own: &Path) {
             hosts: Vec::new(),
         })),
         owner: None,
+        band: 0,
     })
     .expect("create a box with its bundle's writable layer on disk");
     assert_eq!(
@@ -5349,6 +5381,7 @@ fn created_through_a_seed_in_its_cgroup_and_namespaces(lab: &Lab, own: &Path) {
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(bundle),
         owner: None,
+        band: 0,
     })
     .expect("create through a seed");
     // The inits the node then makes ahead for boxes of no owner go through its create seeds too (decision 8):

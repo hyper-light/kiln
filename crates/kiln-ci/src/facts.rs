@@ -45,6 +45,12 @@ pub struct RunnerFacts {
     pub kiln: Option<KilnFacts>,
     /// Whether its agents can have workspaces of their own (Slates volumes), and why not.
     pub workspaces: Option<Workspaces>,
+    /// Whether it holds isolated agents in microVMs of their own, on what, and why not (kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 17): [`Virt::microvm`] is its `available`. Absent from a
+    /// runner from before it.
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<Isolation>,
     /// What W24's work needs to know of the machine (docs/ci.md W24, `RunnerFacts.work`).
     pub work: Option<WorkFacts>,
     /// The machine itself: a hash of the id its OS keeps for it (W13-R01). The server keeps it with
@@ -221,6 +227,22 @@ pub struct WorkFacts {
     /// macOS's memory pressure level (`normal`, `warn`, `critical`); it keeps no stall times.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_level: Option<String>,
+}
+
+/// Isolated agents on a machine (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17; kiln's
+/// docs/isolation.md): each harness in a microVM of its own, a member of an Agentfile's image.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(rename = "IsolationFacts"))]
+#[serde(default)]
+pub struct Isolation {
+    /// Agents here can be held isolated: its kiln carries the microVMs' runtime, and the machine has
+    /// a hypervisor it can use.
+    pub available: bool,
+    /// The hypervisor its microVMs run on (`KVM`, `Hypervisor.framework`, `WHP`), where known.
+    pub hypervisor: Option<String>,
+    /// Why agents here can't be held isolated.
+    pub why_not: Option<String>,
 }
 
 /// Agents' workspaces of their own on a machine: Slates volumes over their folders.

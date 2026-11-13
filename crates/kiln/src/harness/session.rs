@@ -2943,8 +2943,15 @@ fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<S
     let target = Kind::get(to).filter(|k| k.switchable() && from.switchable());
     let installed = target.is_some_and(Kind::available);
     // Its spec before its core: never the one lock inside the other.
-    let allow_bypass = s.spec.lock().allow_bypass;
+    let (allow_bypass, isolated) = {
+        let spec = s.spec.lock();
+        (spec.allow_bypass, spec.isolation.is_some())
+    };
     let mut core = s.core.lock();
+    if isolated {
+        core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: crate::sandbox::isolated::NO_SWITCH.to_owned() });
+        return None;
+    }
     let Some(target) = target else {
         core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("A conversation can't be carried from {} to {to}.", from.name) });
         return None;
@@ -3287,10 +3294,20 @@ struct Move {
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
-/// `now`: the turn under way isn't waited for (the caller interrupts it).
+/// `now`: the turn under way isn't waited for (the caller interrupts it). None: an isolated agent
+/// doesn't go to another machine (its microVM and what its harness keeps there are this one's, kiln
+/// plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), refused before anything of it stops, saying so.
 #[allow(clippy::too_many_arguments)]
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool, native: bool) -> Move {
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool, native: bool) -> Option<Move> {
+    // Its spec before its core: never the one lock inside the other.
+    let isolated = s.spec.lock().isolation.is_some();
     let mut core = s.core.lock();
+    if isolated && !local {
+        let text = format!("Couldn't move to {to}: {} — it goes on here", crate::sandbox::isolated::NO_MOVE);
+        core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text });
+        core.touch_state();
+        return None;
+    }
     core.hold = true;
     let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
     let picks_up = now && busy;
@@ -3306,7 +3323,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     };
     core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
     core.touch_state();
-    Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local, native: native && local }
+    Some(Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local, native: native && local })
 }
 
 /// A person pauses it, or resumes it (`Command::Pause` without a task): its processes held stopped by
@@ -4259,17 +4276,25 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     adapter.seed(items.clone());
                 }
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
+                let isolated = spec.isolation.is_some();
                 // One the machine's own PATH lacks may be on its user's: their login shell is asked
                 // first (once, then kept ten minutes).
-                if blocked.is_none() && spec.program.is_none() && !kind.available() {
+                if blocked.is_none() && !isolated && spec.program.is_none() && !kind.available() {
                     crate::reach::serve::login_env().await;
                 }
                 // What it needs before it starts (kiln's MCP server in Antigravity's own config).
-                if blocked.is_none() {
+                if blocked.is_none() && !isolated {
                     kind.prepare(&spec).await;
                 }
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
+                    // Isolated: its harness is a member of its image in a microVM of its own, through
+                    // the machine's microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), and
+                    // never a process here; a machine without them refuses it.
+                    None if isolated => match files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm()) {
+                        Some(sandbox) => crate::sandbox::isolated::launch(kind, &spec, sandbox.as_ref()).await,
+                        None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
+                    },
                     // In the session's group of processes where the machine has them, and marked as
                     // its, and so is everything it starts (`survivors`).
                     None => match kind.launch(&spec, &s.id) {
@@ -4310,7 +4335,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
         match spawned {
             Err(e) => error = Some(format!("{e:#}")),
             Ok(mut p) => {
-                *s.pid.lock() = Some(p.pid);
+                // Its process here; none for a harness its boundary holds (a microVM's member).
+                *s.pid.lock() = p.host_pid();
                 ran_here = true;
                 if adopted {
                     let mut core = s.core.lock();
@@ -4493,12 +4519,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 }
                             }
                             Command::MoveTo { to, cwd, note, now, kind: into, model, local, native } => {
-                                let mv = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native);
-                                // Not waiting for the turn: it stops here, and goes on there.
-                                if mv.picks_up {
-                                    adapter.command(&mut s.core.lock(), Command::Interrupt);
+                                if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native) {
+                                    // Not waiting for the turn: it stops here, and goes on there.
+                                    if mv.picks_up {
+                                        adapter.command(&mut s.core.lock(), Command::Interrupt);
+                                    }
+                                    moving = Some(mv);
                                 }
-                                moving = Some(mv);
                             }
                             Command::Moving { text } => moving_note(&s, &text),
                             // What it left running that kiln took back over: kiln stops it.
@@ -4704,18 +4731,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 let _ = flush(&s, &sink, Some(&p.stdin)).await;
                                 crate::rt::sleep(Duration::from_millis(1500)).await;
                             }
-                            let root = p.pid;
+                            // Its process here; a microVM's member has none, and nothing of it runs here.
+                            let root = p.host_pid();
                             let left = std::mem::take(&mut *s.left.lock());
                             let group = crate::os::contain::Group::existing(&s.id);
                             let members = group.clone();
                             let _ = crate::rt::blocking(move || {
                                 // Everything in its group where it has one (what left its tree
                                 // too), else what's under it now.
-                                let pids: Vec<u32> = match &members {
-                                    Some(g) => g.pids().into_iter().filter(|p| *p != root).collect(),
-                                    None => descendants(root).into_iter().map(|(pid, _)| pid).collect(),
+                                let pids: Vec<u32> = match (&members, root) {
+                                    (Some(g), _) => g.pids().into_iter().filter(|p| Some(*p) != root).collect(),
+                                    (None, Some(root)) => descendants(root).into_iter().map(|(pid, _)| pid).collect(),
+                                    (None, None) => Vec::new(),
                                 };
-                                crate::os::stop_processes(&pids, Some(root), Duration::from_secs(2));
+                                crate::os::stop_processes(&pids, root, Duration::from_secs(2));
                                 for r in &left {
                                     super::survivors::stop_tree(r);
                                 }
@@ -5028,8 +5057,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     // Another runner: it goes there, now.
                     Command::MoveTo { to, cwd, note, now, kind: into, model, local, native } => {
-                        moving = Some(move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native));
-                        break;
+                        if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native) {
+                            moving = Some(mv);
+                            break;
+                        }
                     }
                     Command::Moving { text } => moving_note(&s, &text),
                     Command::StopTask { task } if task.starts_with(crate::reach::owned::PREFIX) => {

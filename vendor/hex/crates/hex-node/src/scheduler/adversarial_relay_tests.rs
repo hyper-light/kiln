@@ -158,6 +158,7 @@ fn relay_start(key: Key) -> Envelope {
                     hosts: Vec::new(),
                 }),
                 owner: None,
+                band: 0,
             },
             start: false,
         }),

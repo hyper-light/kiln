@@ -38,6 +38,7 @@ fn device_spec(devices: Vec<DeviceId>) -> BoxSpec {
         class: ClassSpec::Process,
         owner: None,
         devices,
+        band: 0,
     }
 }
 
@@ -84,11 +85,11 @@ fn with_device_tail(offer: bool, tail: &[u8]) -> Vec<u8> {
     };
     // Replace the device list while retaining valid absent charge/route receipts. Capacity
     // additionally ends with four empty u32 lists and no learned use (joint plan step 14); a spec
-    // ends with one route option.
+    // ends with one route option and its band, 0 here (joint plan step 14).
     let following = if offer {
         1 + 4 * size_of::<u32>() + 1
     } else {
-        2
+        3
     };
     bytes.truncate(bytes.len() - size_of::<u32>() - following);
     bytes.extend_from_slice(tail);
@@ -621,6 +622,7 @@ fn oci_spec() -> BoxSpec {
             hosts: vec![("db".to_owned(), "10.0.0.2".to_owned())],
         })),
         owner: None,
+        band: 0,
     }
 }
 
@@ -657,6 +659,7 @@ fn requests() -> Vec<(u64, Request, usize)> {
                 bounds: bounds(),
                 class: ClassSpec::Bundle(PathBuf::from("/run/bundle-sleep")),
                 owner: None,
+                band: 0,
             }))),
             0,
         ),
@@ -671,6 +674,7 @@ fn requests() -> Vec<(u64, Request, usize)> {
                 bounds: Bounds::default(),
                 class: ClassSpec::Process,
                 owner: None,
+                band: 0,
             }))),
             0,
         ),
@@ -752,6 +756,7 @@ fn run() -> Request {
             bounds: bounds(),
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         }),
         program: program(),
         streams: Streams {
@@ -2048,6 +2053,7 @@ fn any_spec() -> impl Strategy<Value = BoxSpec> {
         bounds,
         class,
         owner: owner.map(|(name, reuse)| BoxOwner { name, reuse }),
+        band: 0,
     })
 }
 
@@ -2766,9 +2772,12 @@ fn route_wire_spec_and_info_route_tails_roundtrip() {
             MAX_MESSAGE,
         )
         .unwrap();
+        // The route's option, then the band (0 here), end a spec (joint plan step 14).
         assert_eq!(plain.last(), Some(&0));
-        assert_eq!(&plain[..plain.len() - 1], &bytes[..plain.len() - 1]);
-        assert_eq!(bytes[plain.len() - 1], 1);
+        let route_at = plain.len() - 2;
+        assert_eq!(plain[route_at], 0);
+        assert_eq!(&plain[..route_at], &bytes[..route_at]);
+        assert_eq!(bytes[route_at], 1);
 
         let expected = Answer::Info(BoxInfo {
             class: spec.class.class(),
@@ -3150,8 +3159,9 @@ fn route_wire_spec_and_info_inconsistent_route_receipts_refuse() {
     }
     // Keep a valid encoded body and change only the committed original class.
     let mut bad = good;
+    // The band's byte follows the route (joint plan step 14).
     let route_bytes = 1 + ROUTE_KEY_BYTES + 1 + BACKING_KEY_BYTES;
-    let route_at = bad.len() - route_bytes;
+    let route_at = bad.len() - route_bytes - 1;
     assert_eq!(bad[route_at], 1);
     assert_eq!(bad[route_at + 1], class_tag(Class::Oci));
     assert_eq!(bad[route_at + 1 + ROUTE_KEY_BYTES], 1);
@@ -4049,6 +4059,7 @@ fn a_shards_image_spec_is_class_tag_5_then_its_image_and_command() {
         devices: Vec::new(),
         allocation: Some(hex_api::sim::sim_vm_allocation().unwrap()),
         route: None,
+        band: 0,
     };
     let image = hex_api::sim::SIM_IMAGE.as_bytes();
     let length = u32::try_from(image.len()).unwrap().to_le_bytes();
@@ -4398,6 +4409,36 @@ fn w14_an_infos_last_resort_crosses_the_wire_last() {
     assert_eq!(serde_json::from_value::<BoxInfo>(older).unwrap(), plain);
 }
 
+/// Joint plan step 14 (AC-T7.4.1), C5: a box's priority band reaches its node. Do send a create of a spec in band 3
+/// through the node's wire, then the same cut by its last byte, and the spec as JSON, then a band-0 spec as JSON. Expect
+/// the create back exactly, its band its last byte, the cut one refused as every truncation is, and the JSON back
+/// exactly, a band-0 spec's naming no band (its record and commitment those of a spec before the band).
+#[test]
+fn w14_a_specs_band_crosses_the_wire_last() {
+    let banded = BoxSpec {
+        band: 3,
+        ..oci_spec()
+    };
+    let call = Request::Call(Call::Create(Box::new(banded.clone())));
+    let bytes = request(4, &call, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        call
+    );
+    assert_eq!(bytes.last(), Some(&3), "the band ends it");
+    let cut = &bytes[..bytes.len() - 1];
+    assert!(matches!(
+        read_request(&received(cut, 0), MAX_MESSAGE).map_err(|bad| bad.fault),
+        Err(Fault::Truncated { .. })
+    ));
+    let json = serde_json::to_value(&banded).unwrap();
+    assert_eq!(serde_json::from_value::<BoxSpec>(json).unwrap(), banded);
+    let plain = oci_spec();
+    let older = serde_json::to_value(&plain).unwrap();
+    assert!(older.get("band").is_none(), "none named at band 0");
+    assert_eq!(serde_json::from_value::<BoxSpec>(older).unwrap(), plain);
+}
+
 fn harness() -> Member {
     Member {
         kind: MemberKind::Harness,
@@ -4561,6 +4602,45 @@ fn unknown_grant_tags_are_refused_by_name() {
     }
 }
 
+/// Joint plan step 17, AC-T7.4.1: do create a Shards image VM whose spec names the members its caller drives, one
+/// with variables and a working directory and one with neither; expect it read back whole, its members after its
+/// grants.
+#[test]
+fn a_shards_image_vm_carries_the_members_its_caller_drives_on_the_wire() {
+    let members = vec![
+        hex_api::ImageMember {
+            member: Member {
+                kind: MemberKind::Harness,
+                name: "claude".to_owned(),
+            },
+            env: vec![("LANG".to_owned(), "C.UTF-8".to_owned())],
+            workdir: Some("/home/me/project".to_owned()),
+        },
+        hex_api::ImageMember::new(Member {
+            kind: MemberKind::Agent,
+            name: "helper".to_owned(),
+        }),
+    ];
+    let create = Request::Call(Call::Create(Box::new(BoxSpec {
+        id: id("image-members"),
+        bounds: Bounds::default(),
+        class: ClassSpec::ShardsImage(Box::new(ShardsImage {
+            members,
+            ..ShardsImage::new(hex_api::sim::SIM_IMAGE)
+        })),
+        owner: None,
+        devices: Vec::new(),
+        allocation: Some(hex_api::sim::sim_vm_allocation().unwrap()),
+        route: None,
+        band: 0,
+    })));
+    let bytes = request(93, &create, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        create
+    );
+}
+
 /// Joint plan step 15 (every grant visible in Hex's record of the VM): do create a Shards image VM granted a provider
 /// by name, kiln on its host and a publish; expect it read back whole, its grants written after its command. Do
 /// write one whose grants the check refuses (a loopback destination), and read it as a peer that skipped the check
@@ -4578,6 +4658,7 @@ fn a_shards_image_vm_carries_its_grants_on_the_wire() {
         devices: Vec::new(),
         allocation: Some(hex_api::sim::sim_vm_allocation().unwrap()),
         route: None,
+        band: 0,
     };
     let create = Request::Call(Call::Create(Box::new(spec(each_way()))));
     let bytes = request(92, &create, MAX_MESSAGE).unwrap();
@@ -4619,16 +4700,17 @@ fn a_shards_image_vm_carries_its_grants_on_the_wire() {
 }
 
 /// Joint plan step 15 (N6): do answer an inspect of a running Shards image VM with its grants and its publish as
-/// the host bound it. Expect: read back whole, the bound port's grant, socket and receiver last but for the last
-/// resort's none tag (joint plan step 14). Do: answer one
-/// whose report names an egress grant, and read one whose receiver tag no receiver has. Expect: refused as
-/// "published" written, and by the receiver's name read.
+/// the host bound it, its receiver the member Shards named (at its own port) and, as an older run said it, the
+/// image's declaration. Expect: each read back whole, the bound port's grant, socket and receiver last but for the
+/// last resort's none tag (joint plan step 14): the named receiver its tag 1 and the member's port, the declared
+/// one its tag 0. Do: answer one whose report names an egress grant, and read one whose receiver tag no receiver
+/// has. Expect: refused as "published" written, and by the receiver's name read.
 #[test]
 fn an_inspect_carries_its_grants_and_their_ports_as_bound() {
     let published = Published {
         grant: 2,
         at: "127.0.0.1:49152".parse().unwrap(),
-        receiver: Receiver::Declared,
+        receiver: Receiver::Named { port: 1455 },
     };
     let shown = Answer::Info(BoxInfo {
         class: Class::Shards,
@@ -4645,9 +4727,25 @@ fn an_inspect_carries_its_grants_and_their_ports_as_bound() {
     tail.extend(2u32.to_le_bytes());
     tail.extend([4, 127, 0, 0, 1]);
     tail.extend(49152u16.to_le_bytes());
-    tail.push(0);
+    tail.push(1);
+    tail.extend(1455u16.to_le_bytes());
     tail.extend([0; NO_END]);
     assert!(bytes.ends_with(&tail));
+    let declared = Answer::Info(BoxInfo {
+        class: Class::Shards,
+        grants: each_way(),
+        published: vec![Published {
+            receiver: Receiver::Declared,
+            ..published
+        }],
+        ..info()
+    });
+    let older = answer(96, &declared, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&older, 0), MAX_MESSAGE).unwrap().1,
+        declared
+    );
+    assert!(older.ends_with(&[&[0][..], &[0; NO_END][..]].concat()));
     let wrong = Answer::Info(BoxInfo {
         class: Class::Shards,
         grants: each_way(),
@@ -4665,8 +4763,8 @@ fn an_inspect_carries_its_grants_and_their_ports_as_bound() {
         })
     ));
     let mut hostile = bytes.clone();
-    let receiver = hostile.len() - 1 - NO_END;
-    hostile[receiver] = 1;
+    let receiver = hostile.len() - 1 - size_of::<u16>() - NO_END;
+    hostile[receiver] = 2;
     assert!(matches!(
         read_answer(&received(&hostile, 0), MAX_MESSAGE),
         Err(Fault::Value {

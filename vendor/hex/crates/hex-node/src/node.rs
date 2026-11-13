@@ -960,7 +960,7 @@ impl Node {
                 return Err(backends::uncertain(id));
             }
             info.adopted = adopted;
-            charges::with_last_resort(&mut info, record)?;
+            crate::recorded::charges::with_last_resort(&mut info, record)?;
             return Ok(info);
         }
         let state = match record.spec.class {
@@ -2028,6 +2028,21 @@ impl Runtime for Node {
         self.info(&record, false)
     }
 
+    fn member(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.member(id, member);
+        }
+        if self.cgroup(id).is_none() {
+            return Err(Refusal::NoSuchBox(id.clone()));
+        }
+        Err(Refusal::Invalid {
+            what: "member",
+            why: format!(
+                "box {id} isn't a Shards image box: only one has members its caller drives"
+            ),
+        })
+    }
+
     fn usage(&self, id: &BoxId) -> Result<Usage, Refusal> {
         if let Some(backend) = self.backend_record(id)? {
             return backend.usage(id);
@@ -2716,6 +2731,7 @@ mod tests {
                 class: ClassSpec::Bundle(PathBuf::from("bundle")),
                 owner: None,
                 allocation: None,
+                band: 0,
             },
             Phase::Ready,
             Vec::new(),

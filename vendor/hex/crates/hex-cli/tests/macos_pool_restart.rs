@@ -5,10 +5,10 @@
 //! joins the connection to a node served in this process over the simulator, whose capacity is the pool's
 //! room. The pool is made Live through the node's socket (its offer granted), the node is SIGKILLed, and a
 //! node started on the same state takes the pool back: with its controller still running, the same
-//! process, re-attached and Live; with its controller ended while no node ran (its vsock gone with it),
-//! Draining with its end recorded. Either is then released through the restarted node and nothing of it
-//! is left. Each test waits on the fact it needs, within PATIENCE, and checks what is left by pid and
-//! birth.
+//! process, re-attached and Live; with its controller ended while no node ran (its vsock gone with it)
+//! and a descendant outliving it, Draining with its end recorded and the descendant ended. Either is then
+//! released through the restarted node and nothing of it is left. Each test waits on the fact it needs,
+//! within PATIENCE, and checks what is left by pid and birth.
 #![cfg(target_os = "macos")]
 #![allow(
     clippy::unwrap_used,
@@ -40,9 +40,11 @@ use sha2::{Digest, Sha256};
 const PATIENCE: Duration = Duration::from_secs(60);
 
 /// The controller: argv as the SDK prepares it, plus the helper's `--host-lifeline FD`. It records itself
-/// and its descendant in the lab's `records` folder (`RECORDS`, written in when the lab writes the script);
-/// the descendant ignores SIGHUP and never reads the lifeline. The controller then reads its lifeline until
-/// the helper's end closes it.
+/// in the lab's `records` folder (`RECORDS`, written in when the lab writes the script), and its descendant
+/// records itself there once it ignores SIGHUP, so it outlives the controller: a controller's end orphans
+/// its group, which the kernel hangs up where a member is stopped (XNU's `orphanpg`), and one hung up
+/// before its trap would end with the controller by chance. The descendant never reads the lifeline. The
+/// controller then reads its lifeline until the helper's end closes it.
 const CONTROLLER: &str = r#"#!/bin/sh
 echo $$ > "RECORDS/controller.$$"
 lifeline=""
@@ -50,8 +52,7 @@ while [ $# -gt 0 ]; do
   if [ "$1" = "--host-lifeline" ]; then lifeline="$2"; shift; fi
   shift
 done
-/bin/sh -c 'trap "" HUP; exec /bin/sleep 100000' &
-echo $! > "RECORDS/descendant.$$"
+/bin/sh -c 'trap "" HUP; echo $$ > "$1"; exec /bin/sleep 100000' descendant "RECORDS/descendant.$$" &
 eval "/bin/cat <&$lifeline" > /dev/null
 "#;
 
@@ -384,10 +385,10 @@ impl Lab {
             .collect()
     }
 
-    /// The controller's descendant, as the controller recorded it.
+    /// The controller's descendant, as it recorded itself once it ignores SIGHUP.
     fn descendant(&self, controller: i32) -> i32 {
         let path = self.path(&format!("records/descendant.{controller}"));
-        wait_for("the controller to record its descendant", || {
+        wait_for("the descendant to record itself", || {
             std::fs::read_to_string(&path).is_ok_and(|text| text.ends_with('\n'))
         });
         std::fs::read_to_string(&path)
@@ -616,8 +617,9 @@ fn a_restarted_node_takes_back_a_live_pool_whose_controller_runs() {
 }
 
 /// AC-T7.4.1 (restart, controller gone): make the node's shared pool Live, SIGKILL the node, then its
-/// controller while no node runs; start another node on the same state: expect it ready with the pool
-/// Draining, its end recorded, never Live and never a second controller; then release it: expect it
+/// controller while no node runs, its descendant outliving it; start another node on the same state:
+/// expect it ready, never dialing the gone VM's guest, with the pool Draining, its end recorded, the
+/// descendant ended by its recovery, never Live and never a second controller; then release it: expect it
 /// Released, nothing of its scope left, and the helper ended with it.
 #[test]
 fn a_restarted_node_releases_a_live_pool_whose_controller_ended() {
@@ -650,6 +652,10 @@ fn a_restarted_node_releases_a_live_pool_whose_controller_ended() {
     let client = node.client();
     let offer = shared_offer(&client);
     assert_eq!((offer.key, offer.phase), (key, BackingPhase::Draining));
+    assert!(
+        !alive(descendant),
+        "the restarted node left the ended pool's descendant running"
+    );
     assert_eq!(
         lab.controllers(),
         vec![controller],

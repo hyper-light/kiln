@@ -971,19 +971,9 @@ impl Driver {
         })
     }
 
+    /// A node's facts refreshed; for this node's, the capacity view's room with them (joint plan step 13), under the
+    /// lock every admission commits under.
     pub fn refresh_node(&self, spec: NodeSpec) -> Result<(), Error> {
-        self.refresh_node_sampled(spec, &[])
-    }
-
-    /// A node's facts refreshed; for this node's, with what each scoped holder's work used, by the link its holder
-    /// is on, read in the same sample as its free memory (joint plan step 13, CV12): the view's room and its holders'
-    /// credit move together, under the lock every admission commits under. A synced holder not in `used` earns no
-    /// credit.
-    pub fn refresh_node_sampled(
-        &self,
-        spec: NodeSpec,
-        used: &[(u64, hex_api::capacity::Read)],
-    ) -> Result<(), Error> {
         let _operation = self.operation()?;
         let mut state = self.lock()?;
         let local = spec.id == state.node.id();
@@ -993,7 +983,7 @@ impl Driver {
                 bound: 1,
             })?;
             if let Some(view) = state.view.as_mut() {
-                view.sample(view::amounts(&spec.capacity), used);
+                view.set_room(view::amounts(&spec.capacity));
             }
             state.facts = Some(kept);
             let admits = admission_spec(&state);
@@ -1014,7 +1004,7 @@ impl Driver {
     }
 
     /// Opens the machine's capacity view in `dir` (joint plan step 13, `docs/design/capacity-view.md`),
-    /// serving `holders` holders, each bounded as the node's own records are. The node admits nothing of
+    /// serving `holders` holders, each holding as many as one sync lists (CV8). The node admits nothing of
     /// its own until its next facts refresh gives the view its room: the reservations the view recovered
     /// come off the node's room first.
     pub fn open_view(&self, dir: &Path, holders: usize) -> Result<(), Error> {
@@ -1027,7 +1017,7 @@ impl Driver {
             }
             .into());
         }
-        let opened = view::View::open(dir, holders, state.node.budget().ran);
+        let opened = view::View::open(dir, holders);
         let mut opened = finish(&mut state, opened, false)?;
         match state.facts.as_ref() {
             Some(facts) => {
@@ -1108,25 +1098,11 @@ impl Driver {
         Ok(answer)
     }
 
-    /// Link `link` dropped: its holder keeps what it holds (CV5); its scope's credit ends at once, the node's admission
-    /// given the room without it before the lock is let go (CV12).
+    /// Link `link` dropped: its holder keeps what it holds (CV5), so the room it leaves the node is the same.
     pub fn view_link_down(&self, link: u64) -> Result<(), Error> {
         let mut state = self.lock()?;
-        if view_mut(&mut state)?.link_down(link) {
-            readmit(&mut state)?;
-        }
+        view_mut(&mut state)?.link_down(link);
         Ok(())
-    }
-
-    /// The links of every synced holder whose hello named a scope, its name, and the scope: what this node's next
-    /// sample reads beside its free memory (joint plan step 13, CV12). None while no view is open.
-    pub fn view_scopes(&self) -> Result<Vec<(u64, String, hex_api::capacity::Scope)>, Error> {
-        let state = self.lock()?;
-        Ok(state
-            .view
-            .as_ref()
-            .map(view::View::scopes)
-            .unwrap_or_default())
     }
 
     /// The hints owed to the holders, by link, with the view as it is now (CV7).
@@ -1901,29 +1877,20 @@ fn readmit(state: &mut State) -> Result<(), Error> {
 }
 
 /// The spec this node's ledger admits against (joint plan steps 13 and 14): its facts, the machine's
-/// physical room with what the holders' scopes are credited (CV12) less every holder's reservations (CV3),
-/// plus what its boxes' learned holdings leave of the receipts its ledger books, less what they take past
-/// them, so its free room is the physical room less what everything holds. None before its first facts.
+/// physical room less every holder's reservations (CV3), plus what its boxes' learned holdings leave of the
+/// receipts its ledger books, less what they take past them, so its free room is the physical room less what
+/// everything holds. None before its first facts.
 fn admission_spec(state: &State) -> Result<Option<NodeSpec>, Stop> {
     let Some(facts) = state.facts.as_ref() else {
         return Ok(None);
     };
-    let (foreign, credited) = state.view.as_ref().map_or(
-        (
-            hex_api::capacity::Amounts::ZERO,
-            hex_api::capacity::Amounts::ZERO,
-        ),
-        |view| (view.foreign(), view.credit()),
-    );
+    let foreign = state
+        .view
+        .as_ref()
+        .map_or(hex_api::capacity::Amounts::ZERO, |view| view.foreign());
     let booked = hex_api::capacity::Amounts::from_array(state.node.booked()?);
     let held = hex_api::capacity::Amounts::from_array(state.node.held()?);
-    let (unused, debit) = (booked.less(held), held.less(booked));
-    let credit = hex_api::capacity::Amounts {
-        cpu_milli: unused.cpu_milli.saturating_add(credited.cpu_milli),
-        mem_bytes: unused.mem_bytes.saturating_add(credited.mem_bytes),
-        disk_bytes: unused.disk_bytes.saturating_add(credited.disk_bytes),
-        gpus: 0,
-    };
+    let (credit, debit) = (booked.less(held), held.less(booked));
     let room = |physical: u64, credit: u64, foreign: u64, debit: u64| {
         physical
             .saturating_add(credit)

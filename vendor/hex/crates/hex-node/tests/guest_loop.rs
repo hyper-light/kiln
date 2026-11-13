@@ -1090,6 +1090,7 @@ fn a_call_its_guest_holds_holds_no_other_clients_call_through_the_guest_client()
         bounds: Bounds::default(),
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .unwrap();
     let node = WithGuest::new(
@@ -1143,6 +1144,7 @@ fn a_guest_booted_again_answers_on_the_loop_too() {
         bounds: Bounds::default(),
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .unwrap();
     let node = WithGuest::new(
@@ -1176,6 +1178,7 @@ fn a_guest_booted_again_answers_on_the_loop_too() {
             hosts: Vec::new(),
         })),
         owner: None,
+        band: 0,
     });
     drop(client);
     assert_eq!(guests.boots(), 2, "the ended guest wasn't booted again");
@@ -1560,6 +1563,7 @@ fn process(id: &BoxId) -> BoxSpec {
         bounds: Bounds::default(),
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     }
 }
 

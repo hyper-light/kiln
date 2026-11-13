@@ -9,6 +9,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Condition variables whose timed waits end at their deadlines on macOS too (docs/design/deadline-waits.md).
+hex-wait.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
