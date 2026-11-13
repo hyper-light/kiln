@@ -367,3 +367,25 @@ Owed, this goal's part 3b:
 - Kiln's vendor/shards at or after e1995061f, with shards-remote linked (its owner's).
 - The wiring at the launch (`sandbox::microvm()`, step 17's next slice).
 - Real-VM MCP round trips on Linux, macOS and Windows hosts (ROOT's).
+
+## Landed history, rewritten once before landing
+
+GitHub's push protection refused the first push of step 18 to kiln main (2026-11-13). Part 2's
+saved copy of gemini-cli v0.68.0's `oauth2.ts` (`evidence/gemini-cli-v0.68.0/oauth2.ts`) carries
+gemini-cli's OAuth client ID and installed-app client secret, at lines 77 and 85. Upstream says it
+ships them on purpose: the installed-app flow doesn't treat that secret as one. kiln keeps no
+credential, so both values are redacted in place, the file otherwise as upstream has it. Step 18's
+32 unlanded commits were rewritten so that none holds them
+(`/tmp/g121-shot/s18-scripts/redact_rewrite.py`): every other file of every tree, each commit's
+parents, author, committer and message are unchanged, and each commit is signed again. The tested
+tip fdc5feff4 became 5055d8115; their trees differ in those two lines alone. SHAs this record and
+the commit messages give from before the rewrite map as follows:
+
+| Before | Landed |
+|---|---|
+| 28b96170e, 567f429a5, f2bbee814, 99c0b19db (part 1) | 4e5058509, f000dca74, c40c87fcd, cbd56b475 |
+| e0996d9dc (part 2) | f616b23b2 |
+| 226d40011 (the MCP grant taken out) | a4bbef79f |
+| b352ff8b6, e951b2968, 0c64ad0e8, 0aea534f2, c7bce6d2c, 4b558f733 (merges and the record) | 355f6b9ed, 33c1010b9, 8b4021fbe, 541ec016e, 24a0af22e, 95e6bf9a7 |
+| a428cdf9c, 61f284289, 943294258, 3dd57e3f1 (part 3) | d99dbff5e, 5f80c108d, 14dcdd7de, bbf4936d8 |
+| 053e79233, 027d1aacf, b8065ba0e, fdc5feff4 (part 3's merges, record and tested tip) | 8b3cba8ab, b163ae9fb, 7a0ab1aa5, 5055d8115 |
