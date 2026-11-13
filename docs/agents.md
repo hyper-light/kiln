@@ -26,9 +26,14 @@ steering without cancellation. Concurrent prompts share a turn; kiln records the
 and usage once. A runner upgrade refreshes this capability on existing Devin sessions without
 restarting their processes. Other ACP agents keep steering queued.
 
-Before a Devin session starts, each machine loads its model catalog with a bounded ACP handshake
+Before a Devin session starts, each machine loads its model catalog with an ACP handshake
 in a temporary configuration that keeps its native default model, with imports, MCP servers and
-automatic updates off. It sends no prompts. Each model's effort choices are read from the agent
+automatic updates off. It sends no prompts. How long the handshake may take follows the catalog's
+liveness and progress, never a time of kiln's own: each request is timed to its answer, and a
+catalog owing an answer that says nothing for a whole window of the slowest answer a catalog has
+given on that machine since kiln started, its CPU time unmoved in that window, is ended (a moving
+CPU time starts the window again). Until its first answer there is no window, so it is waited on
+for as long as its process lives, and its end ends the ask. Each model's effort choices are read from the agent
 and kept in the existing model cache for Mission control's composer, which starts agents. Shared effort choices are offered only
 when every listed model
 supports them. The composer uses the native default model's levels before a model is chosen,
