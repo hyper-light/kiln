@@ -240,6 +240,8 @@ export type { ToolKind } from "./ToolKind";
 export type { ToolStatus } from "./ToolStatus";
 export type { Transport } from "./Transport";
 export type { Trigger } from "./Trigger";
+export type { Trouble } from "./Trouble";
+export type { TroubleKind } from "./TroubleKind";
 export type { TurnEnd } from "./TurnEnd";
 export type { UncommittedCounts } from "./UncommittedCounts";
 export type { Unread } from "./Unread";

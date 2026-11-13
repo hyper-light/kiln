@@ -6,9 +6,11 @@
   "run": {
     "command": ["amp-acp"],
     "env": [
+      "HOME=/home/amp",
       "XDG_CONFIG_HOME=/home/amp/.config",
       "XDG_DATA_HOME=/home/amp/.local/share",
       "XDG_STATE_HOME=/home/amp/.local/state",
+      "XDG_CACHE_HOME=/tmp/.cache",
       "AMP_SKIP_UPDATE_CHECK=1"
     ]
   }

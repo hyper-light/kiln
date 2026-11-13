@@ -17,10 +17,12 @@ const REPO: &str = "anomalyco/opencode";
 const SIGNER: &str = "anomalyco/opencode/.github/workflows/release.yml";
 const SLSA: &str = "https://slsa.dev/provenance/v1";
 
-/// harness.json's env: opencode's four XDG roots on the person's volume, where it keeps its settings,
-/// its sessions and sign-in (opencode.db) and its cache (f17, f19), and its update check off (f20). HOME
-/// stays the harness's scratch, as nothing of opencode's own lands there (f17, f35).
-const ENV: [&str; 5] = [
+/// harness.json's env: its HOME the person's volume, whole (step 18's rule for every built-in: what the
+/// programs it runs keep in a home lands there too); opencode's four XDG roots beneath it, where it keeps
+/// its settings, its sessions and sign-in (opencode.db) and its cache (f17, f19); and its update check
+/// off (f20).
+const ENV: [&str; 6] = [
+    "HOME=/home/opencode",
     "XDG_CONFIG_HOME=/home/opencode/.config",
     "XDG_DATA_HOME=/home/opencode/.local/share",
     "XDG_STATE_HOME=/home/opencode/.local/state",
@@ -207,13 +209,17 @@ fn osi_problems(h: &Value) -> Vec<String> {
     found
 }
 
-/// Where a harness file departs from opencode's own: its env must be exactly [`ENV`], each XDG root on
-/// `home`, the person's volume, and no workdir, as kiln gives each ACP session its own folder.
+/// Where a harness file departs from opencode's own: its env must be exactly [`ENV`], its HOME `home`,
+/// the person's volume, each XDG root on it, and no workdir, as kiln gives each ACP session its own
+/// folder.
 fn env_problems(h: &Value, home: &str) -> Vec<String> {
     let mut found = Vec::new();
     let env = strings(h.pointer("/run/env")).unwrap_or_default();
     if env != ENV {
         found.push(format!("its env {env:?} isn't {ENV:?}"));
+    }
+    if !env.iter().any(|e| e.strip_prefix("HOME=") == Some(home)) {
+        found.push(format!("its HOME isn't the person's volume {home}"));
     }
     for (var, root) in env.iter().filter_map(|e| e.split_once('=')).filter(|(n, _)| n.starts_with("XDG_")) {
         if !root.strip_prefix(home).is_some_and(|rest| rest.starts_with('/')) {
@@ -339,7 +345,7 @@ fn step22_opencode_pin_and_harness_file_hold() -> anyhow::Result<()> {
     anyhow::ensure!(h.get("name").and_then(Value::as_str) == Some(b.harness), "{h}");
     anyhow::ensure!(h.get("version").is_some() && h.get("version") == pin.get("version"), "{h} isn't at the pin's version");
     let vs = volumes(b.text);
-    anyhow::ensure!(vs == ["/workspace", "/home/opencode"], "{vs:?}");
+    anyhow::ensure!(vs == ["/home/opencode"], "{vs:?}");
     let problems = env_problems(&h, "/home/opencode");
     anyhow::ensure!(problems.is_empty(), "{problems:?}");
     Ok(())
@@ -353,7 +359,7 @@ fn step22_opencode_pin_and_harness_file_hold() -> anyhow::Result<()> {
 /// at another commit, and a smoke that runs another program, asks something else, expects another line
 /// or carries an env; in the harness file, a schema it isn't, a field Shards refuses, a name no
 /// Agentfile gives, no command, an env entry with no value or the runtime's own, an XDG root off the
-/// person's volume, a HOME, the update check on, and a workdir.
+/// person's volume, a HOME on the scratch, the update check on, and a workdir.
 #[test]
 fn step22_an_opencode_pin_or_harness_file_that_would_mislead_is_caught() -> anyhow::Result<()> {
     let b = opencode()?;
@@ -403,13 +409,13 @@ fn step22_an_opencode_pin_or_harness_file_that_would_mislead_is_caught() -> anyh
     anyhow::ensure!(osi_says("/run/cwd", Some(Value::from("/workspace")), "`run.cwd`")?);
     anyhow::ensure!(osi_says("/name", Some(Value::from("OpenCode")), "no name")?);
     anyhow::ensure!(osi_says("/run/command", Some(serde_json::json!([])), "run.command")?);
-    anyhow::ensure!(osi_says("/run/env/4", Some(Value::from("OPENCODE_DISABLE_AUTOUPDATE")), "NAME=value")?);
-    anyhow::ensure!(osi_says("/run/env/4", Some(Value::from("SHARDS_DOMAIN=opencode")), "NAME=value")?);
+    anyhow::ensure!(osi_says("/run/env/5", Some(Value::from("OPENCODE_DISABLE_AUTOUPDATE")), "NAME=value")?);
+    anyhow::ensure!(osi_says("/run/env/5", Some(Value::from("SHARDS_DOMAIN=opencode")), "NAME=value")?);
     let env_says = |path: &str, to: Option<Value>, what: &str| -> anyhow::Result<bool> { Ok(env_problems(&serde_json::from_str(&edited(h, path, to)?)?, "/home/opencode").iter().any(|p| p.contains(what))) };
-    anyhow::ensure!(env_says("/run/env/1", Some(Value::from("XDG_DATA_HOME=/tmp/.local/share")), "isn't on the person's volume")?);
-    anyhow::ensure!(env_says("/run/env/0", Some(Value::from("XDG_CONFIG_HOME=/home/opencode2/.config")), "isn't on the person's volume")?);
-    anyhow::ensure!(env_says("/run/env/5", Some(Value::from("HOME=/home/opencode")), "its env")?);
-    anyhow::ensure!(env_says("/run/env/4", None, "its env")?);
+    anyhow::ensure!(env_says("/run/env/2", Some(Value::from("XDG_DATA_HOME=/tmp/.local/share")), "isn't on the person's volume")?);
+    anyhow::ensure!(env_says("/run/env/1", Some(Value::from("XDG_CONFIG_HOME=/home/opencode2/.config")), "isn't on the person's volume")?);
+    anyhow::ensure!(env_says("/run/env/0", Some(Value::from("HOME=/tmp")), "its HOME isn't the person's volume")?);
+    anyhow::ensure!(env_says("/run/env/5", None, "its env")?);
     anyhow::ensure!(env_says("/run/workdir", Some(Value::from("/workspace")), "a workdir")?);
     anyhow::ensure!(osi_problems(&serde_json::from_str(h)?).is_empty() && env_problems(&serde_json::from_str(h)?, "/home/opencode").is_empty());
     Ok(())
@@ -446,9 +452,9 @@ fn step22_opencode_runs_as_kilns_opencode_kind_launches_it() -> anyhow::Result<(
 /// opencode's Agentfile is the plan's shape (step 19's layout): the pin's base by digest; a stage for
 /// each libc, a RUN only in musl's (libstdc++, which brings libgcc, and the distribution's ripgrep, as
 /// the one opencode fetches for arm64 is a glibc build: f13, f22); opencode's own build per platform and
-/// libc from the directory kiln writes (f26); exactly the bring-up's three grants (f21: DNS and TCP 443
-/// out; its ACP server is on the harness's own loopback, which needs no grant, f15, f16); exactly its
-/// two volumes, the harness's alone; and no ENV.
+/// libc from the directory kiln writes (f26); its providers' hosts by name (step 18's grants; its ACP
+/// server is on the harness's own loopback, which needs no grant, f15, f16); its HOME
+/// as its one volume, the harness's alone; and no ENV.
 #[test]
 fn step22_opencode_agentfile_is_the_plans_shape() -> anyhow::Result<()> {
     let b = opencode()?;
@@ -465,12 +471,8 @@ fn step22_opencode_agentfile_is_the_plans_shape() -> anyhow::Result<()> {
         "ARG TARGETARCH",
         "ARG OPENCODE_LIBC",
         "HARNESS opencode FROM ./opencode-${TARGETARCH}-${OPENCODE_LIBC}",
-        "NETWORK --dns --egress=443/tcp provider FOR opencode",
-        "EXPOSE --harnesses=opencode 443/tcp AS egress FOR provider",
-        "CONNECT opencode WITH opencode ON provider",
-        "VOLUME --target-kind=harness /workspace FOR opencode",
-        "VOLUME --target-kind=harness /home/opencode FOR opencode",
     ];
+    let want: Vec<String> = want.iter().map(|l| (*l).to_owned()).chain(super::grants_tests::grant_lines("opencode")).chain([super::grants_tests::volume_line("opencode")]).collect();
     anyhow::ensure!(lines == want, "{lines:#?}");
     Ok(())
 }

@@ -346,10 +346,14 @@ and `Display` say only how long it is, and dropped, its buffer is zeroed (`zeroi
 of it is the copy's to clear.
 
 - **Implementations:** Veil (CP-T8.1); `kiln_seams::secrets::SimSecrets`: in memory, timed by its
-  clock, 100,000 secrets and leases.
-- **Used by:** kiln's deploy and CI secrets (behind the secrets service's `Backend`), once CP-T8.1
-  lands Veil.
-- **Passed by:** the simulator, every clause; Veil, when CP-T8.1 lands it.
+  clock, 100,000 secrets and leases; kiln's own store (`crates/kiln/src/secrets/seam.rs`,
+  `KilnSecrets`), each value sealed with AES-256-GCM under the secrets service's data keys, bound
+  to its name and version, until Veil's.
+- **Used by:** the run-lease broker (`crates/kiln/src/secrets/broker.rs`: a run's credential
+  leases, bound to its microVM's key and revoked as it ends or moves; sign-ins kept outside the
+  microVM, refreshed one at a time; Shards' plan step 33, CP-T8.3); kiln's deploy and CI secrets
+  (behind the secrets service's `Backend`), once CP-T8.1 lands Veil.
+- **Passed by:** the simulator and kiln's store, every clause; Veil, when CP-T8.1 lands it.
 - **Bounds:** names 1 to 512 of `A-Z a-z 0-9 / _ + = . @ -` and values to 64 KiB (Secrets
   Manager's); 100 names a listing; 100 versions kept a secret (the oldest without a stage go
   first); deletes 7 to 30 days out (Secrets Manager's); leases up to a day.
