@@ -921,7 +921,7 @@ fn short(commit: &str) -> &str {
 }
 
 /// Runs the release pipeline on `commit` of the release branch: on the CI engine when kiln's own
-/// workflows run there (`[ci] kiln_workflows`), else on v1. Its binaries are what runners of every
+/// workflows run there (the repository's `kiln_workflows`, else `[ci] kiln_workflows`), else on v1. Its binaries are what runners of every
 /// other platform upgrade to once it succeeds (`adopts`). A run of it at that commit still under
 /// way is the build: nothing more starts.
 pub async fn build_commit(hub: &Hub, repo: &crate::store::Repo, commit: &str) -> anyhow::Result<crate::store::Run> {
@@ -932,7 +932,7 @@ pub async fn build_commit(hub: &Hub, repo: &crate::store::Repo, commit: &str) ->
     }
     let missing = || anyhow::anyhow!("{} has no pipeline called {} at {}", u.release_repo, u.release_pipeline, short(commit));
     let t = crate::gitops::Trigger { event: "manual", branch: u.release_branch.clone(), sha: commit.to_owned(), before: None, pipeline: Some(u.release_pipeline.clone()), payload: None };
-    if hub.cfg.ci.kiln_workflows && hub.ci.enabled() {
+    if crate::ci::repo_config::kiln_workflows(hub, repo).await && hub.ci.enabled() {
         let id = crate::ci::events::start_one(hub, repo, &t).await?.ok_or_else(missing)?;
         return hub.store.run(id).await?.ok_or_else(missing);
     }

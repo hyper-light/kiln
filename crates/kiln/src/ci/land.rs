@@ -1512,7 +1512,8 @@ pub(crate) async fn start_checks(hub: &Hub, repo: &Repo, events: &(Event, Event)
     }
     let commit = super::load::load(hub, repo, &events.0.sha).await?;
     let mut started = Vec::new();
-    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
+    let kiln = super::repo_config::kiln_workflows(hub, repo).await;
+    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || kiln)) {
         for e in [&events.0, &events.1] {
             if super::events::start(hub, repo, e, l, "land candidate", "kiln", Value::Null).await? {
                 started.push(l.path.clone());
