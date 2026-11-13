@@ -84,7 +84,7 @@ for a run (`PUT /api/runners/<machine>/headroom` with `{"enabled": false}`) and 
 | `server-runner` | the runner's own view of its link to the server | the server's view of that runner's connection | kiln plan 01a1d2c1ef09707daafe3fe9b77754e6 step 2 (AES-256-GCM alone there, each end on kiln's API, read from step 16's `Endpoint::negotiated`) |
 | `kiln-hex` | kiln's Hex client | the Hex node's own report of each peer link | kiln's step 17 (its Hex wiring) and plan 01a1d2c1 step 3 (Hex's node report) |
 | `agent-control` | Shards' `control::controller` in kiln | the agent-control endpoint's own report | Shards step 11 (on its control lane) and kiln's step 17 (on the session) |
-| `mcp` | the harness's client | kiln's `/api/mcp` as the microVM reaches it | step 18 designs it as plain HTTP to `host.docker.internal:<port>`, which crosses no TLS: Ada's and ROOT's decision (Shards D238, "control that crosses no TLS"). Until it is TLS 1.3 at AES-256-GCM (or rides the agent-control link) this link has no suite and the run fails, saying so |
+| `mcp` | the harness's client | kiln's MCP as the microVM reaches it | Decided (2026-11-13, Shards D254): kiln's MCP rides the agent-control link as its own `mcp` lane (step 11 with step 18), so no network grant names it. Until that lane is built and the session's link report names it, this link has no suite and the run fails, saying so |
 
 ### A real task's words
 
@@ -169,21 +169,21 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    Evidence: D238 asks for a test asserting each link's suite (D239), and Shards main has it, with no
    report at run time; step 11's branches (`p/s11-control-v1`, `p/s11-controller-v1`) are on Shards
    main.
-3. **kiln's MCP from inside, and its suite**: step 18, and Ada's and ROOT's decision (D238). Read by
-   `mcp_round_trip`, and through `VM_E2E_LINKS`' `mcp` entry. Evidence: step 18's branch
+3. **kiln's MCP from inside, and its suite**: step 11 with step 18, as decided (the person and ROOT,
+   2026-11-13; Shards D254, which step 11 writes): kiln's MCP rides the agent-control link as its own
+   `mcp` lane, so its suite is that link's and no network grant names kiln's MCP. Read by
+   `mcp_round_trip`, and through `VM_E2E_LINKS`' `mcp` entry, the session's link report naming the
+   `mcp` lane on the agent-control link. Evidence of what it replaces: step 18's branch
    (`p/s18-host-in-vm-v1`, a5ce21085) reaches `/api/mcp` as plain HTTP at
-   `host.docker.internal:<port>` (`harness/isolated/mcp.rs`), which crosses no TLS; D238's "Control
-   that crosses no TLS" (ROOT's ruling, 2026-11-13) takes the request slots, `engine.sock` and the
-   endpoint's AF_UNIX and vsock leg as host-local and names no MCP; kiln's own Agentfiles grant their
-   provider's 443/tcp alone (`.kiln/images/harness-claude/Agentfile`, `harness-codex/Agentfile`), and
-   the runner's loopback `/api/mcp` is step 35's. The ways: the MCP hop taken as host-local too (the
-   drive then drops `mcp` from `REQUIRED_LINKS`), TLS 1.3 at AES-256-GCM to the runner's `/api/mcp`,
-   or carried on the agent-control link. Until one is decided and built, `mcp` has no suite and step
-   34's runs fail, saying so.
+   `host.docker.internal:<port>` (`harness/isolated/mcp.rs`), which crosses no TLS, and its built-ins
+   grant `--egress=host.docker.internal:7070`; D238's "Control that crosses no TLS" (ROOT's ruling,
+   2026-11-13) takes the request slots, `engine.sock` and the endpoint's AF_UNIX and vsock leg as
+   host-local and names no MCP. Until the lane is built, `mcp` has no suite and step 34's runs fail,
+   saying so.
 4. **kiln's MCP on a Windows host**: step 18. Read by `mcp_round_trip` on a Windows runner. Evidence: on
    the host, kiln gives a session its MCP server over the runner's Unix socket alone
    (`harness/kinds.rs`, `local_tools`, `#[cfg(unix)]`; its other twin gives none), so Codex and the ACP
-   harnesses on Windows reach it only through step 18's HTTP form.
+   harnesses on Windows reach it only from a microVM, over item 3's `mcp` lane.
 5. **The server-runner link's ends**: step 34's plan step 2 (AES-256-GCM alone on the link,
    `net::LINK_PROVIDER`, and each end's negotiated suite on kiln's API). Read through `VM_E2E_LINKS`'
    `server-runner` entry.
