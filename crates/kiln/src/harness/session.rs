@@ -1594,7 +1594,9 @@ impl Session {
             if codex && let Some(t) = t.as_ref().filter(|t| t.class.as_deref() == Some("agent")) {
                 return codex_task_output(&core, t);
             }
-            (t, core.task_output.get(task).cloned(), core.state.harness_session.clone(), core.state.cwd.clone(), spec.env.clone(), codex)
+            // Claude Code names its folder for the folder it works in as it sees it (`sandbox::isolated::Seen`).
+            let cwd = crate::sandbox::isolated::said(crate::sandbox::isolated::Seen::of(&spec).as_ref(), &core.state.cwd);
+            (t, core.task_output.get(task).cloned(), core.state.harness_session.clone(), cwd, spec.env.clone(), codex)
         };
         let Some(t) = t else { return json!({"error": "no such task in this session"}) };
         // Kept by kiln (a harness that streams it).

@@ -250,6 +250,53 @@ pub fn guest_path(host: &str, under: &str) -> Result<String, String> {
     Ok(format!("{}/{name}", under.trim_end_matches('/')))
 }
 
+/// Where an isolated session's harness sees the project kiln holds for it on this machine, where the two
+/// differ: a Windows machine's folder, which its microVM sees at [`guest_path`]'s `/work/<name>` (a Unix
+/// one it sees at its own path). The harness knows only its microVM's paths, so what tells it of a
+/// folder (Codex's and ACP's requests) or names something after one for it (Claude Code's folder of a
+/// project's conversations) says the folder as [`Seen::said`] has it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Seen {
+    host: String,
+    at: String,
+}
+
+impl Seen {
+    /// `spec`'s, for an isolated session whose microVM sees its project elsewhere; none for a harness on
+    /// its machine, for a Unix project, and for one [`guest_path`] refuses, which [`launch_of`] refuses
+    /// before its harness is told anything.
+    pub fn of(spec: &Spec) -> Option<Self> {
+        spec.isolation.as_ref()?;
+        let cwd = crate::harness::session::resolve_cwd(spec.cwd.as_deref());
+        let at = guest_path(&cwd, PROJECTS).ok()?;
+        (at != cwd).then(|| Self { host: cwd.trim_end_matches(['\\', '/']).to_owned(), at })
+    }
+
+    /// `path`, a folder or file of this machine's, as the harness sees it: its project and what's beneath
+    /// it at its place in the microVM, with `/` between its parts; anything else as it is.
+    pub fn said(&self, path: &str) -> String {
+        match path.strip_prefix(self.host.as_str()) {
+            Some(rest) if rest.is_empty() || rest.starts_with(['\\', '/']) => {
+                let rest = rest.replace('\\', "/");
+                format!("{}{}", self.at, rest.trim_end_matches('/'))
+            }
+            _ => path.to_owned(),
+        }
+    }
+}
+
+/// `path` as the harness `seen` says where it sees its project ([`Seen::said`]); as it is for a harness
+/// that sees the machine's own paths.
+pub fn said(seen: Option<&Seen>, path: &str) -> String {
+    seen.map_or_else(|| path.to_owned(), |s| s.said(path))
+}
+
+/// The folder `spec`'s harness is told it works in: its project as its microVM sees it, isolated
+/// ([`Seen`]); the machine's own, on its machine.
+pub fn harness_cwd(spec: &Spec) -> String {
+    said(Seen::of(spec).as_ref(), &crate::harness::session::resolve_cwd(spec.cwd.as_deref()))
+}
+
 /// The project folder `cwd` as a launch shares it: writable, where [`guest_path`] puts it in the
 /// microVM, which is its member's working folder too.
 pub fn project_share(cwd: &str) -> Result<Share, String> {
@@ -643,6 +690,23 @@ mod tests {
         assert!(name(claude, &container).is_err(), "only microVMs hold agents");
         assert!(name(claude, &Spec::default()).is_err(), "a session that isn't isolated has none");
         Ok(())
+    }
+
+    /// Step 17 part 7: an isolated harness on a Windows machine is told its project, and what's beneath it,
+    /// at its place in its microVM, and anything else as it is; one on a Unix machine, and one on its
+    /// machine, the machine's own paths.
+    #[test]
+    fn s17_an_isolated_harness_is_told_its_folder_as_its_microvm_sees_it() {
+        let spec = |cwd: &str, isolated: bool| Spec { kind: "codex".into(), cwd: Some(cwd.into()), isolation: isolated.then(|| microvm(None)), ..Spec::default() };
+        let seen = Seen::of(&spec(r"C:\src\app\", true));
+        for (path, told) in [(r"C:\src\app", "/work/app"), (r"C:\src\app\", "/work/app"), (r"C:\src\app\crates\kiln", "/work/app/crates/kiln"), ("C:\\src\\app/docs", "/work/app/docs"), (r"C:\src\application", r"C:\src\application"), ("/work/app/sub", "/work/app/sub")] {
+            assert_eq!(said(seen.as_ref(), path), told, "{path}");
+        }
+        assert_eq!(harness_cwd(&spec(r"\\?\D:\repos\kiln", true)), "/work/kiln");
+        for (cwd, isolated) in [("/Users/ada/src/app", true), (r"C:\src\app", false), (r"C:\", true)] {
+            assert_eq!(Seen::of(&spec(cwd, isolated)), None, "{cwd}");
+            assert_eq!(harness_cwd(&spec(cwd, isolated)), cwd);
+        }
     }
 
     /// Step 17: an isolated launch is its image's harness member, in the session's folder at its own
