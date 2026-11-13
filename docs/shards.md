@@ -21,8 +21,10 @@ each at one revision, with kiln's recorded changes, and one copy of each project
   connection negotiated), and Quiver, which records kiln's changes to hyper-raft, records it too
   (`vendor/hyper-raft/UPSTREAM.md`, `vendor/quiver/UPSTREAM.md`).
 
-kiln links `shards-agentfile`, `shards-api` and `hex-node` by name (each pinned exactly in
-`crates/kiln/Cargo.toml`, patched to its copy in the root manifest).
+kiln links `shards-agentfile`, `shards-api`, `shards-image` and `hex-node` by name (each pinned exactly in
+`crates/kiln/Cargo.toml`, patched to its copy in the root manifest). `shards-image` is Shards' image store, where
+kiln finds the images the carried `shards` built for its microVMs (`sandbox::image`, docs/isolation.md): one
+revision of Shards writes the store and reads it.
 
 ## kiln carries Shards
 

@@ -457,6 +457,12 @@ impl Duplex {
     pub fn host_pid(&self) -> Option<u32> {
         self.boundary.is_none().then_some(self.pid)
     }
+
+    /// The boundary's run that holds it, where one does (a microVM's member): its name there, its
+    /// image and the link its stdio rides.
+    pub fn boundary(&self) -> Option<std::sync::Arc<crate::sandbox::held::Held>> {
+        self.boundary.clone()
+    }
 }
 
 /// Spawn `cmd` with piped stdin/stdout/stderr in a new process group.
