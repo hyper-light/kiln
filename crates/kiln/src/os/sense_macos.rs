@@ -194,12 +194,13 @@ fn pages_of(host: MachPort) -> Option<(kiln_ci::facts::VmPages, u64)> {
     // SAFETY: `v` is a whole `vm_statistics64` and `count` its length in `integer_t`s, as
     // `HOST_VM_INFO64_COUNT` is; the kernel writes no more than that.
     let r = unsafe { nix::libc::host_statistics64(host, nix::libc::HOST_VM_INFO64, (&raw mut v).cast(), &raw mut count) };
-    let pages = kiln_ci::facts::VmPages { free: u64::from(v.free_count), active: u64::from(v.active_count), inactive: u64::from(v.inactive_count), compressor: u64::from(v.compressor_page_count) };
+    let pages = kiln_ci::facts::VmPages { free: u64::from(v.free_count), active: u64::from(v.active_count), inactive: u64::from(v.inactive_count), compressor: u64::from(v.compressor_page_count), swapins: v.swapins };
     (r == 0).then_some((pages, page))
 }
 
 /// This host's pages and their size now ([`pages_of`]): what its facts ([`kiln_ci::facts::Mem`])
-/// and its headroom's guard read its room for new work from, as its sample does.
+/// and its headroom's guard read its room for new work from, as its sample does, and its pace its
+/// swap-ins (`crate::os::pace`).
 pub(crate) fn memory_pages() -> Option<(kiln_ci::facts::VmPages, u64)> {
     // SAFETY: no arguments; it returns a send right to this host, released below.
     let host = unsafe { mach_host_self() };
