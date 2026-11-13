@@ -14,7 +14,7 @@ use hex_api::capacity::sim::SimView;
 use hex_api::capacity::{self as hex, Budget, CapacityView, Held, Host, ReservationId, ToHolder, ToKeeper};
 
 use super::ask::{Ask, Peer, Sample};
-use super::holder::{Event, Holding, Link, Out};
+use super::holder::{BoxName, Event, Holding, Link, Out, Paired};
 use super::keeper::{Keeper, NotGranted, Unsynced, View, WaitEnded};
 use super::msg::{Reason, ToOwner};
 use super::runner::{Admission, Init, Records, Said, Settings, Start};
@@ -235,7 +235,7 @@ fn holder_a_run_starts_only_once_synced_and_granted() -> Result<(), String> {
 /// The holder's item 5 under its waits (no constants: Shards' R03): its hello answered in 10 ms
 /// and its sync in 20, the slowest answer is 20 ms. Before then nothing is due (a cold start waits
 /// on liveness alone). A reserve said at 100 is due at 121: at 120 it still waits; at 121 the
-/// keeper, its link alive, has answered nothing for longer than the slowest answer it has given,
+/// keeper, its link alive, has said nothing for longer than the slowest answer it has given,
 /// so it is stalled: the reserve isn't granted and is given back at once (the keeper may have
 /// granted it), and the runner stands `Stalled`, saying no reserve. The keeper's grant that comes
 /// late starts nothing and is given back too; its answer ends the stall and makes the slowest what
@@ -275,6 +275,35 @@ fn holder_a_reserve_with_no_answer_is_given_up_and_given_back() -> Result<(), St
     assert!(books(&keeper, "runner-1")?.is_empty(), "both releases answered, the keeper holds nothing of its");
     let _ = reserve(&mut h, amounts(1, 1), 300)?;
     assert_eq!(h.due(), Some(401), "the slowest answer now the late grant's, 100 ms");
+    Ok(())
+}
+
+/// Hex's holder wait contract (decision 9, as its lead restated it on 2026-11-13): a reserve is
+/// given up only after a whole window of the slowest answer with nothing from the keeper. Its hello
+/// answered in 10 ms and its sync in 20, a reserve said at 100 would be due at 121; Hex's boxes
+/// moving the view at 115 have the keeper hint the runner, something from it that answers nothing,
+/// so the reserve's window runs from 115: at 121 it is still waited for, at 136 a whole window has
+/// passed with nothing, and it is given up and given back. The hint times no answer.
+#[test]
+fn holder_a_hint_from_the_keeper_starts_its_reserves_window_again() -> Result<(), String> {
+    let mut keeper = machine(8, 16, 1, most()?)?;
+    let mut h = holding("runner-1", 1, &[])?;
+    let hello = h.linked(0);
+    let welcome = keeper.hear(1, hello.send.into_iter().next().ok_or("hello")?).map_err(debug)?;
+    let sync = h.heard(welcome, 10);
+    let synced = keeper.hear(1, sync.send.into_iter().next().ok_or("sync")?).map_err(debug)?;
+    let _ = h.heard(synced, 30);
+    let (id, _) = reserve(&mut h, amounts(2, 4), 100)?;
+    assert_eq!(h.due(), Some(121));
+    keeper.set_local(hex_amounts(1, 1)).map_err(debug)?;
+    let hints: Vec<ToHolder> = keeper.hints().map_err(debug)?.into_iter().filter(|(to, _)| *to == 1).map(|(_, hint)| hint).collect();
+    let [hint @ ToHolder::Hint { .. }] = hints.as_slice() else { return Err(format!("a hint for the synced link: {hints:?}")) };
+    let _ = h.heard(hint.clone(), 115);
+    assert_eq!(h.due(), Some(136), "the window runs from the keeper's last word");
+    assert_eq!(h.woke(121), Out::default(), "something came from the keeper within the window: still waited for");
+    let stalled = h.woke(136);
+    assert_eq!(stalled.events, vec![Event::Keeper(Keeper::Unsynced(Unsynced::Stalled)), Event::NotGranted(id, NotGranted::Unanswered(WaitEnded::Stalled))]);
+    assert!(matches!(stalled.send.as_slice(), [ToKeeper::Release { id: r, .. }] if *r == id), "given back at once: {stalled:?}");
     Ok(())
 }
 
@@ -406,6 +435,29 @@ fn holder_refusals_are_typed_and_a_run_asking_nothing_reserves_nothing() -> Resu
     let events = talk(&mut keeper, 1, &mut h, said(vec![word]), 7)?;
     assert_eq!(not_granted(&events, gpu), Some(NotGranted::Devices), "{events:?}");
     assert!(books(&keeper, "runner-1")?.is_empty());
+    Ok(())
+}
+
+/// The boxes kiln runs on its machine are named so its keeper pairs each with what kiln holds there
+/// (agreed with Hex's lead): a reservation's box `kiln-r<epoch>-<seq>`, the box of a run that asks
+/// nothing `kiln-z<epoch>-<n>`, numbered from 0 in its runner process, each number decimal. Each is
+/// a name Hex's boxes take and pairs back with itself; an id that isn't one written so (a leading
+/// zero, a sign, a part more or fewer, a number past a `u64`, another prefix) pairs with nothing.
+#[test]
+fn holder_boxes_are_named_by_what_they_hold_and_pair_byte_for_byte() -> Result<(), String> {
+    let mut h = holding("runner-1", 7, &[])?;
+    let reserved = BoxName::Reserved(ReservationId { epoch: 7, seq: 12 });
+    assert_eq!(reserved.to_string(), "kiln-r7-12");
+    assert_eq!(h.unreserved(), BoxName::Unreserved { epoch: 7, n: 0 });
+    assert_eq!(h.unreserved().to_string(), "kiln-z7-1");
+    let widest = BoxName::Reserved(ReservationId { epoch: u64::MAX, seq: u64::MAX });
+    for name in [reserved, BoxName::Unreserved { epoch: 7, n: 1 }, widest] {
+        assert_eq!(name.id().map_err(debug)?.as_str(), name.to_string(), "a name Hex's boxes take");
+        assert_eq!(BoxName::pair(&name.to_string()), Paired::Kiln(name));
+    }
+    for id in ["kiln-r07-12", "kiln-r+7-12", "kiln-r7-012", "kiln-r7-12-1", "kiln-r7", "kiln-r7-", "kiln-r-12", "kiln-z7-01", "kiln-x7-12", "Kiln-r7-12", "kiln-r18446744073709551616-0", "box-1", ""] {
+        assert_eq!(BoxName::pair(id), Paired::Unpaired, "{id:?}");
+    }
     Ok(())
 }
 

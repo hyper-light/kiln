@@ -417,7 +417,10 @@ fn holder_a_run_asking_nothing_starts_without_a_reservation() -> Result<(), Stri
 /// than the slowest answer, timed from the answer before it where it waited behind one, so an
 /// answer as slow as the slowest is no stall. A late answer comes to its own word and makes the
 /// slowest what it took, which ends the stall. A link that dies ends every word on it, the slowest
-/// kept for the next link's. A runner told its keeper stalled takes nothing new, saying so.
+/// kept for the next link's. A hint, something from the keeper that answers no word, starts the
+/// oldest word's window again and times nothing (Hex's wait contract, decision 9: given up only
+/// after a whole window with nothing from the keeper). A runner told its keeper stalled takes
+/// nothing new, saying so.
 #[test]
 fn holder_waits_follow_the_keepers_liveness_and_progress_alone() -> Result<(), String> {
     let mut w = Waits::default();
@@ -440,9 +443,16 @@ fn holder_waits_follow_the_keepers_liveness_and_progress_alone() -> Result<(), S
     assert_eq!(w.answered(500), None, "an answer no word waited for");
     w.said(600);
     assert_eq!(w.due(), Some(761), "the next link's words wait on the slowest answer seen");
+    // Hex's wait contract (decision 9): given up only after a whole window with nothing from the
+    // keeper. A hint answers nothing and shows it going on: the window runs from it.
+    w.heard(700);
+    assert_eq!(w.due(), Some(861), "a hint, something from the keeper, starts the window again");
+    assert!(!w.stalled(860) && w.stalled(861), "a whole window with nothing after it");
+    assert_eq!(w.answered(900), Some(300), "the answer is timed from its word, not from the hint");
+    assert_eq!(w.slowest(), Some(300));
     let mut a = runner(8, 16, 1000);
     let _ = said(&mut a, Keeper::Unsynced(Unsynced::Stalled), 0);
     assert_eq!(a.taking(), Err(Reason::Unsynced { why: Unsynced::Stalled.why().to_owned() }));
-    assert_eq!(NotGranted::Unanswered(WaitEnded::Stalled).why(), "its reserve went unanswered: its machine's capacity keeper answered nothing for longer than the slowest answer it has given");
+    assert_eq!(NotGranted::Unanswered(WaitEnded::Stalled).why(), "its reserve went unanswered: its machine's capacity keeper said nothing for longer than the slowest answer it has given");
     a.check()
 }

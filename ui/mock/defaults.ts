@@ -8,7 +8,7 @@
 import type { AgentInfo, Meta, State, Task } from "../src/api/harness.ts";
 import type { Agent } from "../src/api/types.ts";
 
-export const defaultInfo = (): Pick<AgentInfo, "goal" | "summary" | "todos_done" | "todos_total" | "files_changed" | "lines_added" | "lines_removed"> => ({
+export const defaultInfo = (): Pick<AgentInfo, "goal" | "summary" | "todos_done" | "todos_total" | "files_changed" | "lines_added" | "lines_removed" | "starts"> => ({
   goal: "",
   summary: "",
   todos_done: 0,
@@ -16,6 +16,8 @@ export const defaultInfo = (): Pick<AgentInfo, "goal" | "summary" | "todos_done"
   files_changed: 0,
   lines_added: 0,
   lines_removed: 0,
+  // kiln's record of what it started for the session (server-sent, always): none in these mocks.
+  starts: [],
 });
 
 export const defaultState = (): Pick<
