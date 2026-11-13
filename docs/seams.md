@@ -396,41 +396,58 @@ Methods: `push_blob`, `blob`, `push_manifest`, `manifest`, `tags`, `delete_manif
 ## Sandbox
 
 A harness or a CI leg launched in a boundary (the host, a rootless OCI container, a microVM): its
-program, its folder, its limits and the hosts it may reach, its stdio streamed back and its end said
-once, last. Its limits are memory and processes, and its shares of the CPU and the disk, on cgroup
-v2's weights (1 to 10,000, 100 an even share: a build held below an agent). The suite asks its
-fixture for programs by what they do (echo, exit with a code, use memory, start processes,
-connect), so each implementation supplies its own.
+program, its folder and the folders shared with it, its environment, its limits and the hosts it may
+reach, its stdio streamed back, the signals it's sent, and its end said once, last. Its limits are
+memory and processes, and its shares of the CPU and the disk, on cgroup v2's weights (1 to 10,000,
+100 an even share: a build held below an agent). A limit can be none, and a grant can be any host its
+boundary lets it reach: a process on the host, as kiln runs harnesses today; a microVM's image's own
+grants. In a microVM, what runs is a member of its image (an Agentfile's HARNESS or AGENT), with its
+image's command and the arguments the launch adds. The suite asks its fixture for programs by what
+they do (echo, exit with a code, use memory, start processes, connect), so each implementation
+supplies its own.
+
+A sandbox says what it holds its runs to (`holds`): a memory limit, a process limit, shares other
+than an even one, no egress at all, egress to named hosts alone, folders shared at another path or
+read-only, signals. What it holds it enforces; a launch that asks for what it doesn't hold is refused
+`Unsupported`, never taken and ignored, and the suite checks both halves.
 
 How a limit ends a run, as Linux's cgroup v2 has it (agreed with Hex's track, CP-T7.1): memory when
 the boundary killed it for going over (`memory.events` counts an `oom_kill`); processes when it was
 refused one past its limit (`pids.max` fails the fork, the run isn't stopped) and then failed. A run
 refused a process that copes and ends well ends with its code.
 
-- **Implementations:** `host` (today's launch), Shards, then Hex's classes: `process`, `oci`,
-  `firecracker`, `shards` (CP-T4.1, CP-T7.1, CP-T7.2); `kiln_seams::sandbox::SimSandbox`: built-in
-  programs that do those things on the host boundary (a container or a microVM is refused
-  `Unsupported`), 1000 runs at once, 10,000 outputs unread a run (past it, the run is killed).
-- **Used by:** every harness kiln launches and its CI legs, once CP-T4.1 and CP-T7.1 land them.
-- **Passed by:** the simulator, every clause; `host`, Shards and Hex's, when their tracks land them.
+- **Implementations:** `host` (today's launch, which holds none of it: `kiln::sandbox::host`), the
+  microVMs kiln's isolated harnesses run in (`kiln::sandbox`: Shards' members, through Hex, kiln plan
+  01a1cd8e862e7169a074db3d5fa33f3d step 17; docs/isolation.md), then Hex's classes: `process`, `oci`,
+  `firecracker`, `shards` (CP-T7.1, CP-T7.2); `kiln_seams::sandbox::SimSandbox`: built-in programs
+  that do those things on the host boundary (a container or a microVM is refused `Unsupported`),
+  holding everything unless made to hold less, 1000 runs at once, 10,000 outputs unread a run (past
+  it, the run is killed).
+- **Used by:** every isolated harness kiln launches (step 17), and its CI legs once CP-T7.1 lands
+  them.
+- **Passed by:** the simulator, every clause, holding everything and holding nothing; `host`
+  (`kiln::sandbox::host`, on Unix); the microVMs' when their implementation lands on a machine that
+  runs them.
 
-Methods: `launch`, `boundaries`.
+Methods: `launch`, `boundaries`, `holds`.
 
 A launch gives a `Run`: stdin given to it in order, what it says (its output, then its end, once),
-and a kill (its end, unless it had one, is `Killed`).
+signals (refused `Unsupported` where its boundary delivers none), and a kill (its end, unless it had
+one, is `Killed`).
 
-Methods of Run: `stdin`, `close_stdin`, `next`, `kill`.
+Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`.
 
 - **SANDBOX-1** what a run writes reaches its stdout in order, then its end, then nothing
 - **SANDBOX-2** stdin reaches the program in order, and closing it is the end of its input
 - **SANDBOX-3** a run's stderr and exit code are said as they are, and its end comes once, last
 - **SANDBOX-4** a run killed ends Killed, and takes no more input
-- **SANDBOX-5** a run over its memory limit is ended OverLimit(Memory); under it, it runs to its end
-- **SANDBOX-6** a run refused processes past its process limit, that then fails, ends OverLimit(Processes); under it, it runs to its end
-- **SANDBOX-7** a run reaches only the hosts it's granted
+- **SANDBOX-5** a run over its memory limit is ended OverLimit(Memory); under it, it runs to its end; a sandbox that holds no memory limit refuses one Unsupported, and runs a launch without one
+- **SANDBOX-6** a run refused processes past its process limit, that then fails, ends OverLimit(Processes); under it, it runs to its end; a sandbox that holds no process limit refuses one Unsupported, and runs a launch without one
+- **SANDBOX-7** a run reaches only the hosts it's granted, none when granted none, and a host when granted any; a sandbox refuses Unsupported the grants it doesn't hold
 - **SANDBOX-8** a launch of a program that doesn't exist is refused NoSuchProgram
 - **SANDBOX-9** a run works in the folder it's given
-- **SANDBOX-10** cpu and io weights outside cgroup v2's 1 to 10,000 are refused Invalid; at its ends a run goes ahead
+- **SANDBOX-10** cpu and io weights outside cgroup v2's 1 to 10,000 are refused Invalid; at its ends a run goes ahead where the sandbox holds weights, and is refused Unsupported where it doesn't
+- **SANDBOX-11** a run sent a signal to end ends, its end said once, and a signal after its end is refused Ended; a sandbox that delivers no signals refuses one Unsupported, and its run goes on
 
 ## Placement
 

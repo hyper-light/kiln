@@ -2913,8 +2913,15 @@ fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<S
     let target = Kind::get(to).filter(|k| k.switchable() && from.switchable());
     let installed = target.is_some_and(Kind::available);
     // Its spec before its core: never the one lock inside the other.
-    let allow_bypass = s.spec.lock().allow_bypass;
+    let (allow_bypass, isolated) = {
+        let spec = s.spec.lock();
+        (spec.allow_bypass, spec.isolation.is_some())
+    };
     let mut core = s.core.lock();
+    if isolated {
+        core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: crate::sandbox::isolated::NO_SWITCH.to_owned() });
+        return None;
+    }
     let Some(target) = target else {
         core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("A conversation can't be carried from {} to {to}.", from.name) });
         return None;
@@ -3803,6 +3810,11 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
     let reach = crate::reach::node::global().ok_or_else(|| "this runner can't reach other runners (an older one?)".to_owned())?;
     let me = reach.name().to_owned();
     let mut spec = s.resume_spec();
+    // Its microVM and what its harness keeps there are this machine's: refused, never carried to run
+    // elsewhere as something else (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17).
+    if spec.isolation.is_some() {
+        return Err(crate::sandbox::isolated::NO_MOVE.to_owned());
+    }
     // Going on there in another harness: its timeline says so (there too, as it travels with it).
     if let Some(to) = mv.kind {
         if !(kind.switchable() && to.switchable()) {
@@ -4220,17 +4232,25 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     adapter.seed(items.clone());
                 }
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
+                let isolated = spec.isolation.is_some();
                 // One the machine's own PATH lacks may be on its user's: their login shell is asked
                 // first (once, then kept ten minutes).
-                if blocked.is_none() && spec.program.is_none() && !kind.available() {
+                if blocked.is_none() && !isolated && spec.program.is_none() && !kind.available() {
                     crate::reach::serve::login_env().await;
                 }
                 // What it needs before it starts (kiln's MCP server in Antigravity's own config).
-                if blocked.is_none() {
+                if blocked.is_none() && !isolated {
                     kind.prepare(&spec).await;
                 }
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
+                    // Isolated: its harness is a member of its image in a microVM of its own, through
+                    // the machine's microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), and
+                    // never a process here; a machine without them refuses it.
+                    None if isolated => match files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm()) {
+                        Some(sandbox) => crate::sandbox::isolated::launch(kind, &spec, sandbox.as_ref()).await,
+                        None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
+                    },
                     // In the session's group of processes where the machine has them, and marked as
                     // its, and so is everything it starts (`survivors`).
                     None => match kind.launch(&spec, &s.id) {
@@ -4271,7 +4291,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
         match spawned {
             Err(e) => error = Some(format!("{e:#}")),
             Ok(mut p) => {
-                *s.pid.lock() = Some(p.pid);
+                // Its process here; none for a harness its boundary holds (a microVM's member).
+                *s.pid.lock() = p.host_pid();
                 ran_here = true;
                 if adopted {
                     let mut core = s.core.lock();
@@ -4668,18 +4689,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 let _ = flush(&s, &sink, Some(&p.stdin)).await;
                                 crate::rt::sleep(Duration::from_millis(1500)).await;
                             }
-                            let root = p.pid;
+                            // Its process here; a microVM's member has none, and nothing of it runs here.
+                            let root = p.host_pid();
                             let left = std::mem::take(&mut *s.left.lock());
                             let group = crate::os::contain::Group::existing(&s.id);
                             let members = group.clone();
                             let _ = crate::rt::blocking(move || {
                                 // Everything in its group where it has one (what left its tree
                                 // too), else what's under it now.
-                                let pids: Vec<u32> = match &members {
-                                    Some(g) => g.pids().into_iter().filter(|p| *p != root).collect(),
-                                    None => descendants(root).into_iter().map(|(pid, _)| pid).collect(),
+                                let pids: Vec<u32> = match (&members, root) {
+                                    (Some(g), _) => g.pids().into_iter().filter(|p| Some(*p) != root).collect(),
+                                    (None, Some(root)) => descendants(root).into_iter().map(|(pid, _)| pid).collect(),
+                                    (None, None) => Vec::new(),
                                 };
-                                crate::os::stop_processes(&pids, Some(root), Duration::from_secs(2));
+                                crate::os::stop_processes(&pids, root, Duration::from_secs(2));
                                 for r in &left {
                                     super::survivors::stop_tree(r);
                                 }

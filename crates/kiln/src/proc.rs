@@ -25,6 +25,13 @@ pub async fn spawn_duplex_in_pool(cmd: std::process::Command, group: Option<crat
     crate::rt::blocking(move || spawn_duplex_in(cmd, group.as_ref(), home)).await?
 }
 
+/// A harness a boundary holds (a microVM's member, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step
+/// 17) as the [`Duplex`] a session drives it through: its pipes, end and stop the run's
+/// (`crate::sandbox::held`), served on the caller's shard, as a spawned harness's pipes are.
+pub fn duplex_of_run(run: Box<dyn kiln_seams::sandbox::Run>) -> Duplex {
+    Duplex::held(crate::sandbox::held::pump(run))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

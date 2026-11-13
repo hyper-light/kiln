@@ -850,14 +850,17 @@ pub fn isolation_for(asked: Option<&str>, parent: Option<&Info>) -> Result<Optio
 
 /// Whether agents on `target` (`local`, `agent:<machine>`) can be held isolated, in microVMs of
 /// their own: its runner says it starts microVMs (`virt.microvm`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
-/// step 32); else why not. The server's own kiln starts none until it carries their runtime (step 16).
+/// step 32); else why not, in its own words where it says them (`isolation.why_not`, step 17). The
+/// server's own kiln starts none until it carries their runtime (step 16).
 pub fn isolation_on(hub: &Hub, target: &str) -> Result<(), String> {
     let Some(machine) = target.strip_prefix("agent:") else {
         return Err("the server's kiln starts no microVM itself until it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16): pick a runner that does with `on` (`microvm`)".to_owned());
     };
-    match hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().map(|f| f.virt.microvm)) {
-        Some(true) => Ok(()),
-        Some(false) => Err(format!("{} doesn't start microVMs: its kiln starts them once it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16)", hub.shown(machine))),
+    let said = hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().map(|f| (f.virt.microvm, f.isolation.as_ref().and_then(|i| i.why_not.clone()))));
+    match said {
+        Some((true, _)) => Ok(()),
+        Some((false, Some(why))) => Err(format!("{} doesn't start microVMs: {why}", hub.shown(machine))),
+        Some((false, None)) => Err(format!("{} doesn't start microVMs: its kiln starts them once it carries their runtime (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 16)", hub.shown(machine))),
         None => Err(format!("{} hasn't said yet whether it starts microVMs: try again in a minute", hub.shown(machine))),
     }
 }

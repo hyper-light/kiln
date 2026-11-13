@@ -1079,8 +1079,12 @@ None is a process on its machine, as agents start without one. Its start names i
 microVM's image (`spec.isolation: {kind: "microvm", image}`, docs/api.md "Agentfiles"). It goes
 only to a runner that says it starts microVMs (its facts' `virt.microvm`), and anywhere else it's
 refused, never run as a process; where the machine picked would refuse it, the composer says so
-under the row. A runner's kiln starts no microVM itself until it carries Shards (the plan's steps
-16 and 17), so until then such a start is refused there, saying so.
+under the row. Its harness runs as its image's HARNESS member, its stdio the member's streams, and
+its session drives it through the same adapter as on the host: it starts, is steered, interrupted,
+resumed and stopped as a process is (docs/isolation.md, step 17). It doesn't move to another machine
+or switch to another harness, and kiln's own tools aren't reachable from inside it yet (step 18). A
+runner's kiln starts no microVM itself until it carries Shards (step 16), so until then such a start
+is refused there, saying so (its facts' `isolation.why_not`).
 
 **Agentfiles** (Agents → Agentfiles, `/agents/agentfiles`) keeps yours: each opened on its own page
 in the code editor's Agentfile mode, checked by Shards as it's typed (`POST /api/agentfiles/check`,
