@@ -655,8 +655,9 @@ mod waits {
     }
 
     /// A wait reads kiln's change notifications a frame at a time: none pending is quiet and reads
-    /// nothing of the socket, so the next frame comes whole; a frame wakes it; a socket that ended ends
-    /// it. A reader that took a quiet socket for a frame would never wait at all.
+    /// nothing of the socket, so the next frame comes whole; a frame wakes it, and its words are read
+    /// (admission's word on a message among them); a socket that ended ends it. A reader that took a
+    /// quiet socket for a frame would never wait at all.
     #[test]
     fn s35_a_wait_hears_kilns_changes_a_frame_at_a_time() -> anyhow::Result<()> {
         use std::io::Write as _;
@@ -664,10 +665,10 @@ mod waits {
         let mut client = std::net::TcpStream::connect(listener.local_addr()?)?;
         let (mut server, _) = listener.accept()?;
         client.set_nonblocking(true)?;
-        assert!(!frame_or_quiet(&mut client)?, "none pending");
+        assert_eq!(frame_or_quiet(&mut client)?, None, "none pending");
         client.set_nonblocking(false)?;
         server.write_all(&[0x81, 5, b'h', b'e', b'l', b'l', b'o', 0x81, 2, b'h', b'i'])?;
-        assert!(frame_or_quiet(&mut client)? && frame_or_quiet(&mut client)?, "two frames, each whole");
+        assert_eq!((frame_or_quiet(&mut client)?, frame_or_quiet(&mut client)?), (Some(b"hello".to_vec()), Some(b"hi".to_vec())), "two frames, each whole");
         drop(server);
         assert!(frame_or_quiet(&mut client).is_err(), "it ended");
         Ok(())
@@ -731,32 +732,6 @@ mod waits {
         assert_eq!(opened(400, "agent:box is not connected", false), Setup::Wait, "between connections");
         assert_eq!(opened(503, "busy", true), Setup::Wait, "the server's own trouble");
         assert_eq!(opened(200, "[]", false), Setup::Refuse(SetupStuck::Refused { code: 200, body: "[]".into() }), "no session");
-    }
-
-    /// A message kiln holds in its custody (its delivery `queued`, as kiln's admission holds a resumed
-    /// prompt: ROOT's runs of 2026-11-13) is held, not quiet: past the window the wait says so and goes
-    /// on, the window starting again. A message kiln neither delivers nor holds for a whole window is
-    /// refused. Taking every quiet window for a refusal (the hold not read) refused cursor's, gemini's and
-    /// goose's held resumes at their slowest answers.
-    #[test]
-    fn s35_a_message_kiln_holds_is_held_not_quiet() {
-        let info = with(&with(&word("idle"), "queued", json!(1)), "admission", json!({"learning": "bootstrap", "target": 2, "admitted": 1, "depth": 2}));
-        let events = vec![user(1, "m", "again")];
-        let held = json!({"delivery": {"m": "queued"}, "queue": [{"id": "m", "text": "again"}]});
-        let mut w = Watch::new(Asked::Message("m"), Some(s(11)));
-        assert_eq!(w.look(&info, &events, None, false, s(0)), Verdict::Wait);
-        assert!(!w.wants_state(&info, &events, s(5)) && w.wants_state(&info, &events, s(12)), "its state read as its window runs out");
-        let first = w.look(&info, &events, Some(&held), false, s(12));
-        assert!(matches!(&first, Verdict::Held(why) if why.contains("m queued") && why.contains("bootstrap")), "{first:?}");
-        assert_eq!(w.look(&info, &events, Some(&held), false, s(20)), Verdict::Wait, "the window starts again at the hold");
-        assert!(matches!(w.look(&info, &events, Some(&held), false, s(24)), Verdict::Held(_)), "held still");
-        // Let go of, and neither delivered nor held for a whole window: refused.
-        let gone = json!({"delivery": {}, "queue": []});
-        assert_eq!(w.look(&info, &events, Some(&gone), false, s(36)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
-        // A message by words it carries is held under the client id kiln gave it.
-        let carried = vec![json!({"seq": 1, "at": 1, "kind": "user", "text": "do the task again x7", "client_id": "k9"})];
-        assert!(holds(&info, &carried, Some(&json!({"delivery": {"k9": "queued"}})), "again x7").is_some());
-        assert_eq!(holds(&info, &carried, None, "again x7"), None, "unread, it says nothing");
     }
 
     /// kiln's word on a session's admission (`harness::admission::Capacity`), which every session's
@@ -847,14 +822,23 @@ mod waits {
         let events = vec![user(1, "m", "again")];
         let state = json!({"delivery": {"m": "queued"}, "queue": [{"id": "m", "text": "again", "at": 1}]});
         let pause = json!({"reason": "limit", "window": "five_hour", "since": 5, "auto": true, "by": "harness"});
-        for (key, value) in [("pause", pause), ("room_wait", json!(1234)), ("frozen", json!(77))] {
+        for (key, value) in [("pause", pause.clone()), ("room_wait", json!(1234)), ("frozen", json!(77))] {
             let info = with(&base, key, value);
             let mut w = Watch::new(Asked::Message("m"), Some(s(11)));
             assert_eq!(w.look(&info, &events, Some(&state), false, s(0)), Verdict::Wait, "{key}");
+            assert!(!w.wants_state(&info, &events, s(5)) && w.wants_state(&info, &events, s(12)), "{key}: its state read as its window runs out");
             let held = w.look(&info, &events, Some(&state), false, s(12));
             assert!(matches!(&held, Verdict::Held(why) if why.contains("m in kiln's queue") && why.contains(key) && !why.contains("admission")), "{key}: {held:?}");
             assert_eq!(w.look(&info, &events, Some(&state), false, s(20)), Verdict::Wait, "{key}: the window starts again at the hold");
         }
+        // A message by words it carries is held under the client id kiln gave it; queued with no cause,
+        // or its state unread, nothing holds it.
+        let carried = vec![json!({"seq": 1, "at": 1, "kind": "user", "text": "do the task again x7", "client_id": "k9"})];
+        let queued = json!({"delivery": {"k9": "queued"}});
+        let paused = with(&base, "pause", pause);
+        assert!(holds(&paused, &carried, Some(&queued), &Admission::default(), "again x7").is_some_and(|why| why.starts_with("k9 in kiln's queue; pause")));
+        assert_eq!(holds(&base, &carried, Some(&queued), &Admission::default(), "again x7"), None, "queued, no cause");
+        assert_eq!(holds(&paused, &carried, None, &Admission::default(), "again x7"), None, "unread, it says nothing");
     }
 
     /// The stand-in's stopped turn says nothing once it heard, until it's stopped: a line of it after
