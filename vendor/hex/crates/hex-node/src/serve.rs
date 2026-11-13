@@ -49,7 +49,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -513,9 +513,9 @@ struct Shared<O: Os> {
     /// place among the programs until its client says it took them; changed under the table's lock, as the programs
     /// watched are.
     kept: AtomicUsize,
-    table: Mutex<Table<O>>,
+    table: hex_wait::Mutex<Table<O>>,
     /// Signalled when a remote program's end is taken, for a stopping server that waits on them.
-    remote_ended: Condvar,
+    remote_ended: hex_wait::Condvar,
     /// The host's own connections watched in the event set, by token ([`Source`]).
     sources: Mutex<BTreeMap<u64, Sourced>>,
     jobs: Mutex<Jobs<O>>,
@@ -563,9 +563,9 @@ impl<O: Os> Table<O> {
 struct Conn<O: Os> {
     token: u64,
     sock: O::Conn,
-    out: Mutex<Out>,
+    out: hex_wait::Mutex<Out>,
     /// Signalled when its waiting answers are sent, or it closes.
-    drained: Condvar,
+    drained: hex_wait::Condvar,
 }
 
 /// The single admission owner shared by an offer, its guest answer and cancellation.
@@ -765,6 +765,17 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> Refusal {
     Refusal::Broken("a socket lock was poisoned".to_owned())
 }
 
+/// A wait on a socket lock that couldn't wait: the lock poisoned, or the OS refused it (macOS's kqueue).
+fn wait_refused(why: hex_wait::Failed) -> Refusal {
+    match why {
+        hex_wait::Failed::Poisoned => Refusal::Broken("a socket lock was poisoned".to_owned()),
+        hex_wait::Failed::Os(why) => Refusal::Os {
+            op: "waiting on a socket lock",
+            why: why.to_string(),
+        },
+    }
+}
+
 impl Server<Native> {
     /// Serves `host` on this OS's socket at `path`, readable and writable by this user alone, holding
     /// `limits` and running calls on at most `workers` threads. A socket left at `path` by an agent that
@@ -805,8 +816,8 @@ impl<O: Os> Server<O> {
             idle_programs: AtomicUsize::new(0),
             reserving: AtomicUsize::new(0),
             kept: AtomicUsize::new(0),
-            table: Mutex::new(Table::default()),
-            remote_ended: Condvar::new(),
+            table: hex_wait::Mutex::new(Table::default()),
+            remote_ended: hex_wait::Condvar::new(),
             sources: Mutex::new(BTreeMap::new()),
             jobs: Mutex::new(Jobs::default()),
             work: Condvar::new(),
@@ -892,7 +903,7 @@ fn check_limits(limits: &Limits, workers: usize) -> Result<(), Refusal> {
 }
 
 impl<O: Os> Shared<O> {
-    fn table(&self) -> Result<MutexGuard<'_, Table<O>>, Refusal> {
+    fn table(&self) -> Result<hex_wait::MutexGuard<'_, Table<O>>, Refusal> {
         self.table.lock().map_err(poisoned)
     }
 
@@ -1071,7 +1082,7 @@ impl<O: Os> Shared<O> {
             Arc::new(Conn {
                 token,
                 sock,
-                out: Mutex::new(Out {
+                out: hex_wait::Mutex::new(Out {
                     open: true,
                     in_flight: 0,
                     programs: BTreeMap::new(),
@@ -1082,7 +1093,7 @@ impl<O: Os> Shared<O> {
                     kept: 0,
                     reading: true,
                 }),
-                drained: Condvar::new(),
+                drained: hex_wait::Condvar::new(),
             }),
         );
         self.idle_calls.fetch_add(1, Ordering::AcqRel);
@@ -1349,7 +1360,7 @@ impl<O: Os> Shared<O> {
             let waited = out.open && !out.backlog.is_empty();
             while out.open && !out.backlog.is_empty() {
                 out = match deadline {
-                    None => conn.drained.wait(out).map_err(poisoned)?,
+                    None => conn.drained.wait(out).map_err(wait_refused)?,
                     Some(deadline) => {
                         let left = deadline.saturating_duration_since(Instant::now());
                         if left.is_zero() {
@@ -1358,7 +1369,10 @@ impl<O: Os> Shared<O> {
                             self.os.shutdown(&conn.sock);
                             return Ok(());
                         }
-                        conn.drained.wait_timeout(out, left).map_err(poisoned)?.0
+                        conn.drained
+                            .wait_timeout(out, left)
+                            .map_err(wait_refused)?
+                            .0
                     }
                 };
             }
@@ -2387,7 +2401,7 @@ impl<O: Os> Shared<O> {
     /// started is ended by the disconnect rule. A remote end that came before is taken now.
     fn started(
         self: &Arc<Self>,
-        mut table: MutexGuard<'_, Table<O>>,
+        mut table: hex_wait::MutexGuard<'_, Table<O>>,
         conn: &Arc<Conn<O>>,
         header: Header,
         start: Start,

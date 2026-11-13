@@ -10,8 +10,8 @@
 //! Each owner seeds its turns from the record of its holds, or, with none yet, measures ([`Patience::measuring`]):
 //! until the first sample a measuring wait is unarmed and lasts until the turn is let go.
 
+use std::sync::PoisonError;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, PoisonError};
 #[cfg(test)]
 use std::time::Duration;
 use std::time::Instant;
@@ -19,6 +19,7 @@ use std::time::Instant;
 use hex_api::{BoxId, DeviceId, Refusal};
 use hex_core::patience::Patience;
 use hex_core::record::{OwnerKey, OwnerRef};
+use hex_wait::{Condvar, Mutex};
 
 /// The boxes whose turns are taken now, and what a refusal of one names.
 #[derive(Debug)]
@@ -344,7 +345,7 @@ impl Turns {
             let patience = held.patience.deadline();
             held = match patience.and_then(|p| since.checked_add(p)) {
                 // Unarmed: measuring, and no turn has been let go; this wait is the first sample's.
-                None => self.free.wait(held).map_err(|e| self.poisoned(e))?,
+                None => self.free.wait(held).map_err(|e| self.wait_refused(e))?,
                 Some(deadline) => {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
@@ -356,7 +357,7 @@ impl Turns {
                     }
                     self.free
                         .wait_timeout(held, left)
-                        .map_err(|e| self.poisoned(e))?
+                        .map_err(|e| self.wait_refused(e))?
                         .0
                 }
             };
@@ -393,6 +394,19 @@ impl Turns {
 
     fn poisoned<T>(&self, _: PoisonError<T>) -> Refusal {
         Refusal::Broken(format!("the lock on {} was poisoned", self.what))
+    }
+
+    /// A wait for a turn that couldn't wait: its lock poisoned, or the OS refused it (macOS's kqueue).
+    fn wait_refused(&self, why: hex_wait::Failed) -> Refusal {
+        match why {
+            hex_wait::Failed::Poisoned => {
+                Refusal::Broken(format!("the lock on {} was poisoned", self.what))
+            }
+            hex_wait::Failed::Os(why) => Refusal::Os {
+                op: self.op,
+                why: format!("waiting for a turn: {why}"),
+            },
+        }
     }
 }
 

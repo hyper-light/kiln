@@ -4,20 +4,13 @@
 mod config;
 pub use config::{Config, PREBOOT_REVISION};
 
-#[cfg(any(target_os = "linux", test))]
 mod observations;
 
-#[cfg(target_os = "linux")]
 mod native;
-#[cfg(target_os = "linux")]
 mod single_use;
-#[cfg(target_os = "linux")]
 pub use single_use::MarksAt;
-#[cfg(target_os = "linux")]
 mod transport;
-#[cfg(target_os = "linux")]
 mod vfio;
-#[cfg(target_os = "linux")]
 pub use native::FirecrackerRuntime;
 
 pub use crate::devices::{Books, Transaction};
@@ -39,7 +32,6 @@ fn invalid(why: impl AsRef<str>) -> Refusal {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
 fn exhausted(what: &'static str, bound: usize) -> Refusal {
     Refusal::Exhausted { what, bound }
 }

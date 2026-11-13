@@ -512,6 +512,7 @@ mod native {
                 } else {
                     Vec::new()
                 },
+                band: 0,
             }
         }
 

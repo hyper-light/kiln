@@ -161,8 +161,9 @@ pub enum ToOwner {
     /// Your take of claim `fence` holds: its room is yours until you start the run or go away.
     Held { run: String, fence: Fence },
     /// Claim `fence` isn't yours any more (the offer wasn't taken in time, this runner started
-    /// again, or its machine's capacity keeper isn't synced, so no reserve for it can be said): the
-    /// run wasn't started under it. It waits here again if you still want it.
+    /// again, or its machine's capacity keeper isn't synced, so no reserve for it can be said, or
+    /// didn't grant its reserve): the run wasn't started under it. It waits here again if you still
+    /// want it.
     Lapsed { run: String, fence: Fence, why: String },
     /// Its process started here, under claim `fence`: the runner's word, and the only one on
     /// which its owner tells its asker that it started.

@@ -1,0 +1,29 @@
+# The stand-in harness (./stub) as a Shards microVM, for kiln's microVM E2E (kiln plan
+# 01a1cd8e862e7169a074db3d5fa33f3d, steps 34 and 35; crates/kiln/tests/vm_e2e/README.md). It speaks the
+# interface of whichever harness kiln drives (PROTOCOL: claude, codex, acp, agy or pi) and calls no
+# model, so the whole path (kiln, Hex, the microVM, shards-init, the harness) runs with no vendor's
+# turn. Build it from this folder, one image per interface:
+#
+#   shards build -t vm-stub-claude --build-arg PROTOCOL=claude -f Agentfile .
+#
+# The base kiln's own Agentfiles start from (Debian trixie's buildpack-deps, pinned by digest as kiln
+# plan step 19 chose it), which has the python3 the stand-in runs on: its scm variant installs
+# mercurial, which needs it (docker-library/buildpack-deps, debian/trixie/scm/Dockerfile).
+ARG BASE=buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+FROM ${BASE}
+
+ARG PROTOCOL
+ENV VM_STUB_PROTOCOL=${PROTOCOL}
+COPY stub /opt/vm-stub/stub
+HARNESS stub FROM ./harness
+
+# Its reach as kiln's Agentfiles grant it, every part named (default deny): a network for it alone,
+# names past the microVM (--dns) and TCP 443 out, opened at the network's boundary and the microVM's.
+# It reaches kiln's MCP server as its kiln launch gives it one (kiln plan step 18).
+NETWORK --dns --egress=443/tcp provider FOR stub
+EXPOSE --harnesses=stub 443/tcp AS egress FOR provider
+CONNECT stub WITH stub ON provider
+
+# The project, and a home that lasts (a harness sees its image read-only).
+VOLUME --target-kind=harness /workspace FOR stub
+VOLUME --target-kind=harness /home/stub FOR stub

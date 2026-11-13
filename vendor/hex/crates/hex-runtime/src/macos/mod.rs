@@ -296,6 +296,12 @@ impl MacRuntime {
         managed::set_rate(self, record, rate)
     }
 
+    /// Joint plan step 14 (C5 on macOS): the node's last resort ends the managed VM through its persistent native owner,
+    /// as its receipt's stop ends it; the VM's end is observed and finalized as any other.
+    pub fn stop_managed(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
+        managed::stop(self, record)
+    }
+
     /// The growth rates the node's boxes are paced at, as its watchers have learned them (observability:
     /// what the watchers pace by).
     pub fn pacing(&self) -> Result<hex_core::watch::Rates, Refusal> {

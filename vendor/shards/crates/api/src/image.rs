@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 mod session;
+mod spawn;
 pub mod wire;
 
 pub use wire::{

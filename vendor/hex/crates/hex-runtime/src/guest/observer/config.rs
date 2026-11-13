@@ -538,6 +538,8 @@ pub(in crate::guest) mod tests {
         dir: &std::path::Path,
     ) -> (GuestConfig, GpuObserverInput, Allocation) {
         let mut config = crate::guest::tests::config();
+        // Absolute on every host (a drive's on Windows), as a launch's plan requires of its binary.
+        config.binary = dir.join("shards");
         config.shares = vec![shares::Share {
             dir: dir.to_path_buf(),
             read_only: true,

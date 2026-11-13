@@ -94,6 +94,7 @@ fn box_spec(directory: &Path, pool: &PoolRecord, id: &str) -> BoxSpec {
             },
             backing: Some(pool.key),
         }),
+        band: 0,
     };
     spec.check().unwrap();
     spec

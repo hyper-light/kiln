@@ -126,6 +126,11 @@ pub const EVENT_UPSERT: &str = "INSERT INTO events (session, id, seq, at, parent
 pub const EVENTS_RESET: &str = "DELETE FROM events WHERE session = ?1 AND seq >= ?2";
 /// A session's last `?2` events, newest first (the caller turns them around). W21-R02: a
 /// replacement id at the same sequence is newest by durable revision, including at a row limit.
+/// A session's newest events by number alone, for listing a session again (`Store::restorable_committed`):
+/// `events_by_seq` (session, seq) gives them in order, read backwards and stopped at the limit, with no sort of the
+/// session's events (EVENTS_LAST's `rev` key isn't in an index; on a session of hundreds of thousands of events its
+/// sort outlasted READ_WAIT, 2026-11-13 08:41Z).
+pub const EVENTS_NEWEST: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 ORDER BY seq DESC LIMIT ?2";
 pub const EVENTS_LAST: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 ORDER BY seq DESC, rev DESC LIMIT ?2";
 /// A session's `?3` events before event number `?2`, newest first.
 pub const EVENTS_BEFORE: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 AND seq < ?2 ORDER BY seq DESC, rev DESC LIMIT ?3";

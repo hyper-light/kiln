@@ -87,11 +87,15 @@ hyper-transport = { path = "vendor/hyper-raft/crates/hyper-transport" }
 # kiln's one Shards revision (docs/shards.md): the crates kiln names, each at its copy, as their own root manifests
 # point them; with what Hex vendors itself (seccompiler, its OCI seccomp profiles' compiler) and Shards' copy of
 # QuickJS's C, which kiln's rquickjs builds too (vendor/shards/UPSTREAM.md).
+hex-api = { path = "vendor/hex/crates/hex-api" }
+hex-core = { path = "vendor/hex/crates/hex-core" }
 hex-node = { path = "vendor/hex/crates/hex-node" }
+hex-quic = { path = "vendor/hex/crates/hex-quic" }
 rquickjs-sys = { path = "vendor/shards/vendor/rquickjs-sys" }
 seccompiler = { path = "vendor/hex/vendor/seccompiler" }
 shards-agentfile = { path = "vendor/shards/crates/agentfile" }
 shards-api = { path = "vendor/shards/crates/api" }
+shards-image = { path = "vendor/shards/crates/image" }
 quiver = { path = "vendor/quiver/crates/quiver" }
 quiver-api = { path = "vendor/quiver/crates/quiver-api" }
 # vorpal, the search across a change (docs/ci.md W26-R07): its crates, the tree-sitter runtime it

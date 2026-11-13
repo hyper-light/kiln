@@ -43,6 +43,11 @@ const-oid = { version = "0.9", features = ["db"] }
 # the copy kiln-search links (docs/vendoring.md).
 vorpal-core = "=0.10.2"
 vorpal-language = { version = "=0.10.2", default-features = false, features = ["tree-sitter-typescript"] }
+# A machine's capacity keeper, held through Hex's own holder core and its lane's bound (`place::holder`;
+# kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 13): Hex's sans-IO crates, vendored at vendor/hex
+# (kiln's [patch.crates-io] names each copy, as it does hex-node's).
+hex-api = "=0.1.0"
+hex-core = "=0.1.0"
 
 [dev-dependencies]
 anyhow = "1.0.104"

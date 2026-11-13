@@ -68,6 +68,7 @@ impl Fixture for BinFixture {
             bounds,
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         }
     }
 
@@ -242,6 +243,7 @@ fn a_box_past_its_bound_is_ended_as_memory() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let mut p = rt
@@ -279,6 +281,7 @@ fn a_box_under_its_bound_runs_and_reports_its_exit() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let mut p = rt
@@ -346,6 +349,7 @@ fn the_end_reason_is_memory() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let mut p = rt
@@ -417,6 +421,7 @@ fn hex_rt_5_one_bounded_program_reports_its_memory_end() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let end = bound_end(&rt, &id, fx.act(&Act::Hog(GIB)), conformance::patience());
@@ -448,6 +453,7 @@ fn hex_rt_6_one_process_tree_reports_its_bound_and_deletes() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let mut program = rt
@@ -487,6 +493,7 @@ fn a_programs_end_is_seen_when_it_ends_not_at_the_waits_budget() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     const RUNS: usize = 60;
@@ -534,6 +541,7 @@ fn measure_exec_to_exit() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let shell = Program::of(&["/bin/sh", "-c", r#"echo "$(ulimit -Sn):$(ulimit -Hn)""#]);
@@ -574,6 +582,7 @@ fn overshoot(rt: &MacRuntime, fx: &BinFixture, what: &str, members: usize, pass:
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let procs: Vec<_> = (0..members)
@@ -703,6 +712,7 @@ fn hex_mac_4_a_fast_grower_near_its_bound_is_held_while_its_idle_members_run() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let guard = HANG_GUARD.as_secs().to_string();
@@ -817,6 +827,7 @@ fn the_watcher_takes_no_priority_over_other_programs() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let mut p = rt
@@ -878,6 +889,7 @@ fn a_steady_box_redoes_no_membership_work_per_read() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let mut procs: Vec<_> = (0..2)
@@ -953,6 +965,7 @@ fn a_box_runs_at_the_qos_its_declared_weight_asks() {
             },
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         })
         .expect("create");
         let mut p = rt
@@ -1004,6 +1017,7 @@ fn measure_a_cpu_bound_members_work_rate() {
         bounds: Bounds::default(),
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let mut p = rt
@@ -1084,6 +1098,7 @@ fn a_program_killed_outside_the_bound_is_no_bounds_end() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let killed = bound_end(
@@ -1435,6 +1450,7 @@ fn a_program_whose_caller_goes_is_no_memory_end_of_its_box() {
             },
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         })
         .expect("create");
     let mut caller = UnixStream::connect(&node.socket).unwrap();

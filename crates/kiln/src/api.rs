@@ -399,6 +399,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "me"]) => return Ok(boxed(|| me(&hub, req.headers())).await),
         (&Method::POST, ["api", "agents", "enroll"]) => return boxed(|| enroll(&hub, req)).await,
         (&Method::POST, ["api", "agents", "instance"]) => return boxed(|| enroll_instance(&hub, req)).await,
+        (&Method::POST, ["api", "agents", "capacity"]) => return boxed(|| enroll_capacity(&hub, req)).await,
         (&Method::POST, ["api", "agents", "rekey"]) => return boxed(|| rekey_agent(&hub, req)).await,
         (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
         (&Method::POST, ["api", "join-requests"]) => return boxed(|| create_join(&hub, req)).await,
@@ -4301,6 +4302,29 @@ fn reach_offers(hub: &Hub, req: &Request) -> Response {
     r
 }
 
+/// `POST /api/agents/capacity`: the certificate a runner holds room through its machine's capacity
+/// keeper with (`crate::capacity`; Hex's capacity-view.md, the holder's item 1; kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d, step 13): for its holder's key, made on the runner, named the
+/// machine the request proves itself as, whatever it asked. Needs no token: the request proves the
+/// machine as `POST /api/agents/instance`'s does, and only a machine this server still knows gets
+/// one.
+async fn enroll_capacity(hub: &Hub, req: Request) -> R {
+    let ask: crate::capacity::EnrollHolder = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = hub.pki.prove_machine(&ask.cert_pem, &ask.proof_csr).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let known = hub.store.agents().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.iter().any(|a| a.name == name);
+    if !known {
+        return Err(err(StatusCode::FORBIDDEN, format!("{name} is not enrolled here any more; enroll it again")));
+    }
+    let enrolled = crate::capacity::issue(&hub.pki, &ask).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    // Every certificate kiln issues is recorded first (W27-R01).
+    let leaf = enrolled.chain.first().ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "no certificate was issued".to_owned()))?;
+    let der = { use base64::Engine as _; base64::engine::general_purpose::STANDARD.decode(leaf) }.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::identities::record(&hub.store, "holder", &name, &crate::pki::cert_pem(&der)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit(name.clone(), "agent.capacity".into(), String::new()).await;
+    tracing::info!(agent = %name, "issued a capacity holder's certificate");
+    Ok(srv::json(StatusCode::OK, &enrolled))
+}
+
 /// `POST /api/agents/instance`: a certificate for a second runner process of a machine that is
 /// already enrolled, so a new runner can work beside the old one (which keeps its terminals until
 /// they end) instead of replacing it. Needs no token: the request carries the machine's current
@@ -6362,6 +6386,8 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     body.spec.plan_run = None;
     body.spec.helper = None;
     body.spec.subagent = false;
+    // The text of a person's own Agentfile is read by kiln, as theirs, never taken from what's asked.
+    body.spec.agentfile = None;
     // A workspace of its own is asked for by its kind alone (its machine makes it), and only of a
     // machine that can make one: one that can't would let it work in the folder itself, unasked.
     match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {
@@ -6387,6 +6413,14 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
         }
         Some(_) => {}
     }
+    // A person's own Agentfile for its microVM, read as the caller's (on a kiln nobody else signs in
+    // to, the owner's, as its sessions act for: `crate::mcp::acts_for`).
+    let person = match &caller {
+        Some(c) => crate::harness::lineage::person_of(c),
+        None if !crate::authz::gate::has_users(hub).await => Some("owner".to_owned()),
+        None => None,
+    };
+    body.spec.agentfile = crate::harness::lineage::kept_agentfile(hub, body.spec.isolation.as_ref(), person.as_deref()).await.map_err(|why| err(StatusCode::BAD_REQUEST, why))?;
     let count = body.count.unwrap_or(1);
     if !body.ids.is_empty() {
         let n = count.clamp(1, 16);

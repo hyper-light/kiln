@@ -295,6 +295,7 @@ fn the_oci_runtime_spec_validation_passes_in_the_guest_as_on_linux() {
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(bundle.path().to_owned()),
         owner: None,
+        band: 0,
     })
     .expect("create the lab in the guest");
     node.start(&id).expect("start the lab");

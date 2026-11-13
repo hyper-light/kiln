@@ -19,6 +19,7 @@ fn cpu(id: &str, phase: Phase) -> BoxRecord {
             devices: Vec::new(),
             allocation: None,
             route: None,
+            band: 0,
         },
         phase,
         Vec::new(),
@@ -272,8 +273,9 @@ fn family_snapshot_fences_ordinary_record_and_pool_writers() {
         .unwrap();
     let expected = PoolRecord::decode(&released.encode().unwrap()).unwrap();
     let worker_store = store.clone();
-    let (paused, entered) = std::sync::mpsc::sync_channel(1);
-    let (resume, released_callback) = std::sync::mpsc::sync_channel(1);
+    // Hex's channels: std's receive comes late on macOS by the thread's QoS leeway (docs/design/deadline-waits.md).
+    let (paused, entered) = hex_wait::mpsc::sync_channel(1).unwrap();
+    let (resume, released_callback) = hex_wait::mpsc::sync_channel(1).unwrap();
     // The existing macOS test hang guard is only a finite unit-test coordination budget.
     let guard = Duration::from_millis(39_507);
     let worker = std::thread::Builder::new()
@@ -296,7 +298,7 @@ fn family_snapshot_fences_ordinary_record_and_pool_writers() {
                             return Err(invalid("model sibling changed"));
                         }
                     }
-                    paused.send(()).unwrap();
+                    paused.try_send(()).unwrap();
                     released_callback.recv_timeout(guard).unwrap();
                     Ok(())
                 },
@@ -327,7 +329,7 @@ fn family_snapshot_fences_ordinary_record_and_pool_writers() {
             })
             .map(|_| ()),
     ];
-    resume.send(()).unwrap();
+    resume.try_send(()).unwrap();
     let returned = worker.join().unwrap().unwrap();
     assert!(results.iter().all(Result::is_err));
     assert_eq!(returned, released);
