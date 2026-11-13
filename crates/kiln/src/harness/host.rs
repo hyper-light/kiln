@@ -2975,7 +2975,9 @@ impl Host {
                 if !outlived.is_empty() {
                     super::survivors::stop(&outlived.iter().map(|r| r.pid).collect::<Vec<_>>());
                 }
-                let found = super::survivors::scan(&[(rec.id.clone(), None)]);
+                // Also by the process groups and sessions what it was seen running made (macOS hides Apple programs' marks).
+                let known = HashMap::from([(rec.id.clone(), rec.harness.iter().chain(&rec.ran).cloned().collect())]);
+                let found = super::survivors::scan_known(&[(rec.id.clone(), None)], &known);
                 let apart = found.get(&rec.id).map(|f| f.apart.clone()).unwrap_or_default();
                 let now_s = u64::try_from(self.clock.unix_s()).unwrap_or(0);
                 let seed = (rec.epoch > 0).then(|| session::Seed { events: Vec::new(), state: super::model::State { epoch: rec.epoch, ..Default::default() }, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: true });
@@ -3113,8 +3115,10 @@ impl Host {
             super::survivors::stop(&outlived.iter().map(|r| r.pid).collect::<Vec<_>>());
         }
         let now_s = u64::try_from(self.clock.unix_s()).unwrap_or(0);
-        // What the sessions started that still runs: found by their mark, and as recorded.
-        let found = super::survivors::scan(&saved.iter().map(|s| (s.id.clone(), None)).collect::<Vec<_>>());
+        // What the sessions started that still runs: found by their mark, by the process groups and sessions what
+        // they were seen running made (macOS hides Apple programs' marks), and as recorded.
+        let known: HashMap<String, Vec<super::survivors::Ran>> = saved.iter().map(|s| (s.id.clone(), s.harness.iter().chain(&s.ran).cloned().collect())).collect();
+        let found = super::survivors::scan_known(&saved.iter().map(|s| (s.id.clone(), None)).collect::<Vec<_>>(), &known);
         for s in saved {
             let id = s.id.clone();
             if foreign_or_busy.contains(&id) {
@@ -3299,8 +3303,9 @@ impl Host {
                 let settled: std::collections::HashSet<String> = sessions.iter().filter(|s| s.pid.lock().is_some() && super::session::settled(s)).map(|s| s.id.clone()).collect();
                 let adopted: Vec<(String, super::survivors::Ran)> = sessions.iter().filter(|s| settled.contains(&s.id)).flat_map(|s| s.left.lock().iter().map(|r| (s.id.clone(), r.clone())).collect::<Vec<_>>()).collect();
                 let harnesses = sessions.clone();
+                let seen_running: HashMap<String, Vec<super::survivors::Ran>> = sessions.iter().map(|s| (s.id.clone(), { let r = s.ran.lock(); r.0.iter().chain(&r.1).cloned().collect() })).collect();
                 let look = move || {
-                    let mut seen = super::survivors::scan(&which);
+                    let mut seen = super::survivors::scan_known(&which, &seen_running);
                     // Never an agent's own harness (`survivors::spare`): each is read again once the
                     // look is over, for one that started while it went on.
                     let now: HashMap<String, Option<u32>> = harnesses.iter().map(|s| (s.id.clone(), *s.pid.lock())).collect();
