@@ -128,7 +128,13 @@ impl Numbering {
     /// The next box's name.
     pub fn next(&self) -> BoxName {
         use std::sync::atomic::Ordering;
-        let n = self.next.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1)).unwrap_or_else(|max| max);
+        let mut n = self.next.load(Ordering::Acquire);
+        while let Some(after) = n.checked_add(1) {
+            match self.next.compare_exchange_weak(n, after, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
+        }
         BoxName::Unreserved { epoch: self.epoch, n }
     }
 }
