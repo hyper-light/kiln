@@ -4095,6 +4095,7 @@ mod tests {
     /// as the repeat it is, and the agent is sent the goal's first message once.
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_goal_message_refused_on_its_retry_keeps_its_id() -> anyhow::Result<()> {
         async fn item(hub: &Hub) -> anyhow::Result<(String, Option<String>)> {
             hub.store.call(|c| Ok(c.query_row("SELECT status, send_id FROM goal_items WHERE id = 'kept-g1'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?)).await
@@ -4163,6 +4164,7 @@ mod tests {
     /// stack, and used to write that one without its id.
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_goal_sent_before_a_restart_keeps_its_message_s_id_when_cleared_goals_are_brought_back() -> anyhow::Result<()> {
         async fn item(hub: &Hub) -> anyhow::Result<(String, Option<String>)> {
             hub.store.call(|c| Ok(c.query_row("SELECT status, send_id FROM goal_items WHERE id = 'kept-g1'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?)).await
@@ -4238,6 +4240,7 @@ mod tests {
     /// in the harness a goal it doesn't know went; its stack used to keep the goal without the id.
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_goal_sent_before_a_restart_then_cleared_and_brought_back_reaches_its_agent_once() -> anyhow::Result<()> {
         async fn item(hub: &Hub) -> anyhow::Result<Option<(String, Option<String>)>> {
             hub.store
@@ -4993,6 +4996,7 @@ mod stack_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_cleared_stack_comes_back_and_runs_and_edits_never_lose_or_repeat_a_goal() -> anyhow::Result<()> {
         within(async {
             // No conversation store: what's changed is goals, not conversations.
@@ -5539,9 +5543,17 @@ mod stack_tests {
         });
         let folder = tempfile::tempdir()?;
         if native {
-            let program = native_goal_program(&hub, folder.path()).await?;
-            hub.harness.set_test_program(&program.to_string_lossy());
-        } else { hub.harness.set_test_program("/nonexistent/kiln-test-no-harness"); }
+            // The native recording program is a shell script ([`native_goal_program`]): unix's.
+            #[cfg(unix)]
+            {
+                let program = native_goal_program(&hub, folder.path()).await?;
+                hub.harness.set_test_program(&program.to_string_lossy());
+            }
+            #[cfg(not(unix))]
+            anyhow::bail!("a native goal agent's program is a shell script: unix only");
+        } else {
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+        }
         let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
         let ask = Ask {
             kind: "claude".into(),
@@ -5553,7 +5565,14 @@ mod stack_tests {
             ..Ask::default()
         };
         let a = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent started"))?;
-        if native { settled_native(&hub, &a.id).await?; } else { settled(&hub, &a.id).await; }
+        #[cfg(unix)]
+        if native {
+            settled_native(&hub, &a.id).await?;
+        } else {
+            settled(&hub, &a.id).await;
+        }
+        #[cfg(not(unix))]
+        settled(&hub, &a.id).await;
         add(&hub, &a.id, strs(goals), true).await?;
         Ok((hub, a.id, folder))
     }
@@ -5910,6 +5929,7 @@ mod stack_tests {
     /// Asked again under its key, nothing more (not run, now nothing waits). An agent's run of it is
     /// refused, and it still waits; once nothing waits on its review, it runs as asked.
     #[test]
+    #[cfg(unix)]
     fn running_a_plan_held_for_review_approves_it() -> anyhow::Result<()> {
         within(async {
             let (hub, id, _folder) = agent_with_goals_fixture(&["one"], true).await?;

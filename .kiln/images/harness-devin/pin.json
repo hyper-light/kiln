@@ -1,12 +1,12 @@
 {
   "harness": "devin",
   "version": "3000.12.43",
-  "verified": "sha256 from Cognition's versioned manifest over HTTPS, equal to current/ when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403 or 404)",
+  "verified": "sha256 from Cognition's versioned manifest over HTTPS; current/ named 3000.12.57 when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403 or 404)",
   "manifest": {
     "url": "https://static.devin.ai/cli/3000.12.43/manifest.json",
     "sha256": "093e9492b3227bfc7be8a57114448611bf8af6573af7ac3866d3ff85abadb1c1"
   },
-  "read_at": "2026-11-12T08:48:32Z",
+  "read_at": "2026-11-12T22:05:20Z",
   "base": {
     "ref": "buildpack-deps:trixie-scm",
     "digest": "sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10"
@@ -21,7 +21,10 @@
           "size": 71424183,
           "path": ".",
           "unpack": {
-            "format": "tar.gz"
+            "format": "tar.gz",
+            "strip": 0,
+            "unpacked_bytes": 210206170,
+            "entries": 250
           }
         }
       ]
@@ -35,7 +38,10 @@
           "size": 67806876,
           "path": ".",
           "unpack": {
-            "format": "tar.gz"
+            "format": "tar.gz",
+            "strip": 0,
+            "unpacked_bytes": 192507154,
+            "entries": 250
           }
         }
       ]

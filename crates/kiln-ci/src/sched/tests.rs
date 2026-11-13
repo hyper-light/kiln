@@ -5,6 +5,7 @@ use super::pools::PoolSpec;
 use super::reserve::ReservationSpec;
 use super::retry::{FailureClass, RetryPolicy};
 use super::routing::{LegRoute, Preference, RunnerView, github_label_rules};
+use super::balance::{Pace, Profile};
 use super::sim::Sim;
 use super::state::{Command, Config, Cpus, Fence, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason, room};
 use crate::facts::{Disk, RunnerFacts};
@@ -4131,4 +4132,148 @@ fn w13_r07_gpu_pods_need_reported_device_capacity() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- the load balancer (docs/lb.md "The CI engine")
+
+/// A Linux runner of `cpus` CPUs (its facts say so) and `slots` slots.
+fn of_cpus(name: &str, cpus: u32, slots: u32) -> RunnerIn {
+    let mut r = linux(name, slots);
+    r.view.facts.cpu.threads = cpus;
+    r.view.facts.mem.total = 64 << 30;
+    r
+}
+
+/// A leg of kind `kind`: its job and matrix, as its runner keys its runs of it.
+fn kinded(id: &str, kind: &str) -> LegIn {
+    LegIn { kind: kind.into(), ..leg(id, "acme/x", 60) }
+}
+
+/// Where each of `legs` last ran.
+fn ran_on<'a>(sim: &'a Sim, legs: &[&str]) -> Vec<&'a str> {
+    legs.iter().map(|l| sim.assigned.iter().rev().find(|a| a.leg == *l).map_or("-", |a| a.runner.as_str())).collect()
+}
+
+/// W05-R23 (docs/lb.md "The CI engine"): a leg goes where the load balancer ranks the most free
+/// cores, whatever the runners are called: of two with every slot free, the one with more CPUs.
+#[test]
+fn w05_r23_a_leg_goes_to_the_most_free_cores() {
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, of_cpus("a", 4, 2));
+    sim.runner(0, of_cpus("b", 16, 2));
+    sim.leg(1, leg("l0", "acme/x", 60), MIN);
+    sim.run(2);
+    assert_eq!(ran_on(&sim, &["l0"]), ["b"]);
+}
+
+/// W05-R26: the load balancer ranks free cores at each runner's measured speed, and a leg is wide
+/// (its steps use every core they find free): of runners with eight cores free, the one that
+/// measured itself twice as fast; and a runner of 32 cores at the reference's speed over it, as
+/// more core-equivalents, though its cores are slower.
+#[test]
+fn w05_r26_cores_at_their_measured_speed() {
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, of_cpus("a", 8, 2));
+    sim.runner(0, of_cpus("b", 8, 2));
+    sim.input(0, Input::RunnerPace { runner: "b".into(), pace: Pace { speed: 2048, measured: 1, ..Pace::default() } });
+    sim.leg(1, leg("l0", "acme/x", 60), MIN);
+    sim.run(2);
+    assert_eq!(ran_on(&sim, &["l0"]), ["b"]);
+    sim.runner(3, of_cpus("c", 32, 2));
+    sim.leg(4, leg("l1", "acme/x", 60), MIN);
+    sim.run(5);
+    assert_eq!(ran_on(&sim, &["l1"]), ["c"]);
+}
+
+/// One leg at a time on two runners as free, each of kind `build` but those named `x…` (each a
+/// kind of its own, never seen before: they take the turn), the ones in `fails` failing as said:
+/// where each ran, with good places on or off.
+fn one_at_a_time(legs: &[&str], fails: &[(&str, FailureClass)], good_places: bool) -> Vec<String> {
+    let mut sim = Sim::new(Config { good_places, ..Config::default() });
+    sim.runner(0, of_cpus("a", 8, 2));
+    sim.runner(0, of_cpus("b", 8, 2));
+    for (leg, class) in fails {
+        sim.fail(leg, &[*class]);
+    }
+    for (i, l) in (0i64..).zip(legs) {
+        let kind = if l.starts_with('x') { l } else { "build" };
+        sim.leg(1 + i * 2 * MIN, kinded(l, kind), MIN);
+    }
+    sim.run(100 * MIN);
+    ran_on(&sim, legs).into_iter().map(str::to_owned).collect()
+}
+
+/// W05-R04, docs/lb.md "Good places": of runners as free, a leg goes back to where its kind of
+/// work last went well; with good places off, equals take turns.
+#[test]
+fn w05_r04_a_legs_kind_goes_back_to_where_it_went_well() {
+    assert_eq!(one_at_a_time(&["k0", "k1", "k2", "k3"], &[], true), ["a", "a", "a", "a"]);
+    assert_eq!(one_at_a_time(&["k0", "k1", "k2", "k3"], &[], false), ["a", "b", "a", "b"]);
+}
+
+/// docs/lb.md "Good places": a runner that let a kind's leg down (its infrastructure failed it) is
+/// passed over for that kind when its turn comes while another is as free; the kind's next leg,
+/// gone well there, stays there.
+#[test]
+fn w05_r04_a_runner_that_let_a_kind_down_is_passed_over() {
+    let fails = [("k0", FailureClass::Infra)];
+    // k0 on a, let down there; the lint leg takes b's turn; a's turn comes, but not for the build.
+    assert_eq!(one_at_a_time(&["k0", "x0", "k1", "k2"], &fails, true), ["a", "b", "b", "b"]);
+    assert_eq!(one_at_a_time(&["k0", "x0", "k1", "k2"], &fails, false), ["a", "b", "a", "b"]);
+}
+
+/// docs/lb.md "Good places": a failure no one can explain (its steps failed) is settled by
+/// comparison: the kind's next leg goes elsewhere once; failing there too, it's the work's own,
+/// and the kind keeps its place; going well there, the first runner stays passed over.
+#[test]
+fn w05_r04_an_unexplained_failure_is_settled_by_comparison() {
+    let both = [("k0", FailureClass::Failure), ("k1", FailureClass::Failure)];
+    assert_eq!(one_at_a_time(&["k0", "x0", "k1", "x1", "k2"], &both, true), ["a", "b", "b", "a", "b"]);
+    let first = [("k0", FailureClass::Failure)];
+    assert_eq!(one_at_a_time(&["k0", "x0", "k1", "x1", "k2"], &first, true), ["a", "b", "b", "a", "b"]);
+    assert_eq!(one_at_a_time(&["k0", "x0", "k1", "x1", "k2"], &first, false), ["a", "b", "a", "b", "a"]);
+}
+
+/// docs/ci.md §0.3: a leg's explanation says which runner its kind of work last went well on,
+/// where the load balancer sends it back among equals; none with good places off.
+#[test]
+fn a_legs_explanation_marks_its_kinds_good_place() {
+    for on in [true, false] {
+        let mut sim = Sim::new(Config { good_places: on, ..Config::default() });
+        sim.runner(0, of_cpus("a", 8, 2));
+        sim.runner(0, of_cpus("b", 8, 2));
+        sim.leg(1, kinded("k0", "build"), MIN);
+        sim.leg(2 * MIN, kinded("k1", "build"), 10 * MIN);
+        sim.run(3 * MIN);
+        let good: Vec<String> = sim.sched.explain("k1").into_iter().filter(|e| e.good_place).map(|e| e.runner).collect();
+        assert_eq!(good, if on { vec!["a".to_owned()] } else { Vec::new() }, "good places {on}");
+    }
+}
+
+/// docs/lb.md "The CI engine": a leg is placed by when its kind's runs say it will finish. a has
+/// 32 cores at the reference's speed, b 4 cores measured twice as fast. A kind that keeps one core
+/// busy (60 s of the reference core's work) finishes sooner on b's faster core, 30 s to 60 s; one
+/// that keeps 16 busy, on a's many cores, 3.75 s to 7.5 s. A kind no run has taught follows what
+/// the kinds so far taught (their median): after the narrow kind, b.
+#[test]
+fn a_leg_goes_where_its_kinds_runs_say_it_finishes_first() {
+    let profile = |parallel: u64| Some(Profile { cpu_ms: 60_000, parallel, io_bytes: 0 });
+    let place = |legs: Vec<LegIn>| -> Vec<String> {
+        let mut sim = Sim::new(Config::default());
+        sim.runner(0, of_cpus("a", 32, 4));
+        sim.runner(0, of_cpus("b", 4, 4));
+        sim.input(0, Input::RunnerPace { runner: "b".into(), pace: Pace { speed: 2048, measured: 1, ..Pace::default() } });
+        let ids: Vec<String> = legs.iter().map(|l| l.id.clone()).collect();
+        for (i, l) in (1i64..).zip(legs) {
+            sim.leg(i * 2 * MIN, l, MIN);
+        }
+        sim.run(100 * MIN);
+        ids.iter().map(|id| sim.assigned.iter().find(|a| a.leg == *id).map_or("-".to_owned(), |a| a.runner.clone())).collect()
+    };
+    assert_eq!(place(vec![LegIn { profile: profile(1_000), ..kinded("narrow", "one-core") }]), ["b"]);
+    assert_eq!(place(vec![LegIn { profile: profile(16_000), ..kinded("wide", "sixteen") }]), ["a"]);
+    // Nothing taught: the most cores free at their speed, a's 32 to b's 8 core-equivalents.
+    assert_eq!(place(vec![kinded("new", "unknown")]), ["a"]);
+    // Once a narrow kind has taught, a kind with nothing of its own is expected to be like it.
+    assert_eq!(place(vec![LegIn { profile: profile(1_000), ..kinded("narrow", "one-core") }, kinded("new", "unknown")]), ["b", "b"]);
 }

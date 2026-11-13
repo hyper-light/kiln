@@ -4,8 +4,12 @@
 //! 01a1ce705e55753182217afdfe607de9, step 3): each archive's one entry, the member antigravity held
 //! alone, at bin/agy. So are opencode's (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 22): for each
 //! libc, each archive's one entry, the member opencode held alone, at bin/opencode, and LICENSE beside it,
-//! a plain file. Each archive the unpacker refuses comes back as its typed error, naming its URL and its
-//! entry, and leaves nothing behind.
+//! a plain file. So are Devin's (plan 01a1ce705e4d7008993f5c7291ef4476, step 2), through kiln's own
+//! Agentfile and harness.json for it: each bundle a tree at the harness directory's root, stripped of
+//! nothing. And Codex's (plan 01a1ce705d7076648c1d9f9ee26214d3, step 3): OpenAI's package at the root,
+//! arm64's skipping its codex-path/rg for ripgrep's member at that path. Each archive the unpacker refuses
+//! comes back as its typed error, naming its URL and its entry, and leaves nothing behind; one of another
+//! digest or size is never opened.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -481,4 +485,382 @@ fn step22_an_opencode_shaped_context_holds_bin_opencode_and_its_license_as_pinne
         }
         Ok(())
     })
+}
+
+/// Devin's built-in (kiln plan 01a1ce705e4d7008993f5c7291ef4476, step 2) for a test: kiln's own Agentfile
+/// and harness.json for it, with a pin of `builds`.
+fn devin(builds: Vec<Value>) -> anyhow::Result<Builtin> {
+    let real = super::super::builtin::ALL.iter().find(|b| b.name == "harness-devin").ok_or_else(|| anyhow::anyhow!("kiln ships no harness-devin"))?;
+    let pin = json!({ "version": "3000.12.43", "verified": "by the test", "builds": builds }).to_string();
+    Ok(Builtin { name: real.name, harness: real.harness, text: real.text, pin: pin.leak(), files: real.files })
+}
+
+/// Devin's executable for `arch`, in small.
+fn devin_bin(arch: &str) -> Vec<u8> {
+    format!("#!/bin/sh\necho 'devin 3000.12.43 {arch}'\n").into_bytes()
+}
+
+/// Devin's bundle for `arch`, in small, as Cognition's 3000.12.43 bundles begin (step 2's raw headers:
+/// directories and regular files alone, no `./` and no leading directory): bin/devin at 0755 and its
+/// documents at 0644 under share/, each directory listed before what it holds.
+fn devin_tree(arch: &str) -> Vec<E> {
+    vec![
+        dir("bin/"),
+        file("bin/devin", 0o755, &devin_bin(arch)),
+        dir("share/"),
+        dir("share/devin/"),
+        dir("share/devin/docs/"),
+        file("share/devin/docs/adaptive.mdx", 0o644, b"# Adaptive\n"),
+    ]
+}
+
+/// The URL path of Devin's bundle for `arch` on the test's server.
+fn devin_path(arch: &str) -> String {
+    format!("/cli/3000.12.43/devin-{arch}.tar.gz")
+}
+
+/// One platform of Devin's shape as its pin.sh pins it: the bundle at `.`, by `sha256` and `size`, a tree
+/// stripped of nothing, of `totals`; the test's server serves `gz` for it.
+fn devin_build(origin: &str, arch: &str, gz: Vec<u8>, sha256: &str, size: usize, totals: (u64, u64)) -> (Vec<(String, Vec<u8>)>, Value) {
+    let file = json!({ "url": format!("{origin}{}", devin_path(arch)), "sha256": sha256, "size": size, "path": ".",
+        "unpack": { "format": "tar.gz", "strip": 0, "unpacked_bytes": totals.1, "entries": totals.0 } });
+    (vec![(devin_path(arch), gz)], json!({ "platform": format!("linux/{arch}"), "files": [file] }))
+}
+
+/// `arch`'s Devin bundle served and pinned as it is.
+fn devin_as_pinned(origin: &str, arch: &str) -> anyhow::Result<(Vec<(String, Vec<u8>)>, Value)> {
+    let tree = devin_tree(arch);
+    let gz = targz(&tree)?;
+    let (sha256, size) = (sha(&gz), gz.len());
+    Ok(devin_build(origin, arch, gz, &sha256, size, totals(&tree)))
+}
+
+/// Every path under `root`, relative to it with `/` between names, directories included.
+fn walk(root: &Path) -> anyhow::Result<BTreeSet<String>> {
+    let (mut found, mut todo) = (BTreeSet::new(), vec![root.to_path_buf()]);
+    while let Some(dir) = todo.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let rel = entry.path().strip_prefix(root)?.iter().map(|n| n.to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
+            if entry.file_type()?.is_dir() {
+                todo.push(entry.path());
+            }
+            found.insert(rel);
+        }
+    }
+    Ok(found)
+}
+
+/// A context of Devin's shape for linux/amd64 and linux/arm64, made through kiln's own Agentfile for it,
+/// holds the Agentfile, devin-amd64/ and devin-arm64/, and nothing else. Each holds bin/devin, its own
+/// arch's bytes (size and SHA-256 as the bundle holds them) at 0755, share/ as the bundle holds it, and
+/// kiln's harness.json, and nothing else: no archive, no distribution marker, no staging directory, no
+/// temporary file.
+#[test]
+fn step25_a_devin_shaped_context_holds_bin_devin_share_and_harness_json_alone() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let mut builds = Vec::new();
+        let origin = serve(|o| {
+            let mut routes = Vec::new();
+            for arch in ["amd64", "arm64"] {
+                let (r, b) = devin_as_pinned(o, arch)?;
+                routes.extend(r);
+                builds.push(b);
+            }
+            Ok(routes)
+        })
+        .await?;
+        let b = devin(builds)?;
+        let harness = b.files.iter().find(|(name, _)| *name == "harness.json").map(|(_, text)| *text).ok_or_else(|| anyhow::anyhow!("no harness.json"))?;
+        let tmp = tempfile::tempdir()?;
+        let ctx = tmp.path().join("ctx");
+
+        let made = materialize(&b, &both(), None, &ctx).await?;
+
+        assert_eq!(made, [ctx.join("devin-amd64"), ctx.join("devin-arm64")], "from {origin}");
+        assert_eq!(names(&ctx)?, set(["Agentfile", "devin-amd64", "devin-arm64"]));
+        assert_eq!(std::fs::read_to_string(ctx.join("Agentfile"))?, b.text);
+        for arch in ["amd64", "arm64"] {
+            let d = ctx.join(format!("devin-{arch}"));
+            assert_eq!(walk(&d)?, set(["bin", "bin/devin", "harness.json", "share", "share/devin", "share/devin/docs", "share/devin/docs/adaptive.mdx"]), "{arch}");
+            let devin = std::fs::read(d.join("bin/devin"))?;
+            assert_eq!((devin.len(), sha(&devin)), (devin_bin(arch).len(), sha(&devin_bin(arch))), "{arch}");
+            assert_eq!(std::fs::read_to_string(d.join("harness.json"))?, harness, "{arch}");
+            #[cfg(unix)]
+            {
+                for (path, bits) in [("bin", 0o755), ("bin/devin", 0o755), ("share", 0o755), ("share/devin/docs", 0o755), ("share/devin/docs/adaptive.mdx", 0o644)] {
+                    assert_eq!(mode(&d.join(path))?, bits, "{arch}: {path}");
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A Devin bundle whose SHA-256 or size isn't its pin's is refused as it arrives and never opened.
+/// arm64's URL serves a bundle whose first entry is a symlink: pinned as it is (the control), the
+/// unpacker opens it and refuses that entry; pinned with another SHA-256, or a size larger or smaller,
+/// the fetcher names the URL and the digest or size pinned and found instead. Each comes after amd64's
+/// directory was made, and leaves nothing in the context's directory.
+#[test]
+fn step25_a_devin_bundle_of_another_digest_or_size_is_never_opened() -> anyhow::Result<()> {
+    type Is = Box<dyn Fn(&Error) -> bool + Send>;
+    let served = targz(&[link("bin/devin", EntryType::Symlink, "/bin/sh"), dir("share/")])?;
+    let (len, digest) = (served.len(), sha(&served));
+    let (n, other) = (len as u64, sha(&targz(&devin_tree("arm64"))?));
+    let (pinned, found) = (other.clone(), digest.clone());
+    let cases: Vec<(&str, String, usize, Is)> = vec![
+        ("as pinned (the control)", digest.clone(), len, Box::new(|e: &Error| matches!(e, Error::Unpack(u) if u.entry.as_deref() == Some("bin/devin") && matches!(u.why, Why::Link)))),
+        ("another SHA-256", other, len, Box::new(move |e: &Error| matches!(e, Error::Digest { expected, observed, .. } if *expected == pinned && *observed == found))),
+        ("a size larger than served", digest.clone(), len + 1, Box::new(move |e: &Error| matches!(e, Error::Size { expected, observed, .. } if *expected == n + 1 && *observed == n))),
+        ("a size smaller than served", digest.clone(), len.saturating_sub(1), Box::new(move |e: &Error| matches!(e, Error::Size { expected, observed, .. } if *expected == n - 1 && *observed > *expected))),
+    ];
+    for (what, sha256, size, is) in cases {
+        let served = served.clone();
+        crate::rt::block_on(async move {
+            let mut builds = Vec::new();
+            let origin = serve(|o| {
+                let (mut routes, b) = devin_as_pinned(o, "amd64")?;
+                builds.push(b);
+                let (r, b) = devin_build(o, "arm64", served, &sha256, size, totals(&devin_tree("arm64")));
+                routes.extend(r);
+                builds.push(b);
+                Ok(routes)
+            })
+            .await?;
+            let b = devin(builds)?;
+            let url = format!("{origin}{}", devin_path("arm64"));
+            let tmp = tempfile::tempdir()?;
+            let (absent, empty) = (tmp.path().join("absent"), tmp.path().join("empty"));
+            std::fs::create_dir(&empty)?;
+            for ctx in [&absent, &empty] {
+                let refused = materialize(&b, &both(), None, ctx).await;
+                let Err(e) = refused else {
+                    anyhow::bail!("{what}: {:?}, not refused", refused.map(|m| m.len()));
+                };
+                let named = match &e {
+                    Error::Unpack(u) => u.url.as_str(),
+                    Error::Digest { url, .. } | Error::Size { url, .. } => url.as_str(),
+                    _ => "",
+                };
+                assert_eq!(named, url, "{what}: {e}");
+                assert!(is(&e), "{what}: {e:?}");
+                let left = if ctx.exists() { names(ctx)? } else { BTreeSet::new() };
+                assert!(left.is_empty(), "{what}: left {left:?}");
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Each Devin bundle the unpacker refuses comes back as its typed error, naming the pinned URL and the
+/// entry at fault, at Devin's strip 0: a symlink, a hard link, a character or a block device, a FIFO, an
+/// absolute path, a `..` path, harness.json at its root (where kiln writes the harness's own), and an entry
+/// or a byte fewer than pinned. Each is arm64's, after amd64's directory was made, and leaves nothing in
+/// the context's directory.
+#[test]
+fn step25_a_devin_bundle_the_unpacker_refuses_leaves_nothing() -> anyhow::Result<()> {
+    type Is = Box<dyn Fn(&Why) -> bool + Send>;
+    let with = |extra: E| {
+        let mut t = devin_tree("arm64");
+        t.insert(2, extra);
+        t
+    };
+    let node = |name: &str, kind: EntryType| E { name: name.into(), kind, mode: 0o644, data: Vec::new(), link: None };
+    let (n, bytes) = totals(&devin_tree("arm64"));
+    let cases: Vec<(&str, Vec<E>, Option<(u64, u64)>, Option<&str>, Is)> = vec![
+        ("a symlink", with(link("bin/devin-link", EntryType::Symlink, "devin")), None, Some("bin/devin-link"), Box::new(|w: &Why| matches!(w, Why::Link))),
+        ("a hard link", with(link("bin/devin-hard", EntryType::Link, "bin/devin")), None, Some("bin/devin-hard"), Box::new(|w: &Why| matches!(w, Why::Link))),
+        ("a character device", with(node("share/null", EntryType::Char)), None, Some("share/null"), Box::new(|w: &Why| matches!(w, Why::Device))),
+        ("a block device", with(node("share/disk", EntryType::Block)), None, Some("share/disk"), Box::new(|w: &Why| matches!(w, Why::Device))),
+        ("a FIFO", with(node("share/fifo", EntryType::Fifo)), None, Some("share/fifo"), Box::new(|w: &Why| matches!(w, Why::Device))),
+        ("an absolute path", with(file("/etc/devin", 0o755, b"x\n")), None, Some("/etc/devin"), Box::new(|w: &Why| matches!(w, Why::Escapes))),
+        ("a .. path", with(file("../devin", 0o755, b"x\n")), None, Some("../devin"), Box::new(|w: &Why| matches!(w, Why::Escapes))),
+        ("a .. path under share/", with(file("share/../../devin", 0o755, b"x\n")), None, Some("share/../../devin"), Box::new(|w: &Why| matches!(w, Why::Escapes))),
+        ("harness.json at its root", with(file("harness.json", 0o644, b"{}\n")), None, Some("harness.json"), Box::new(|w: &Why| matches!(w, Why::HarnessFile))),
+        ("an entry fewer than pinned", devin_tree("arm64"), Some((n + 1, bytes)), None, Box::new(move |w: &Why| matches!(w, Why::Entries { expected, got } if *expected == n + 1 && *got == n))),
+        ("a byte fewer than pinned", devin_tree("arm64"), Some((n, bytes + 1)), None, Box::new(move |w: &Why| matches!(w, Why::Bytes { expected, got } if *expected == bytes + 1 && *got == bytes))),
+    ];
+    for (what, tree, pinned, entry, is) in cases {
+        crate::rt::block_on(async move {
+            let mut builds = Vec::new();
+            let origin = serve(|o| {
+                let (mut routes, b) = devin_as_pinned(o, "amd64")?;
+                builds.push(b);
+                let gz = targz(&tree)?;
+                let (sha256, size) = (sha(&gz), gz.len());
+                let (r, b) = devin_build(o, "arm64", gz, &sha256, size, pinned.unwrap_or_else(|| totals(&tree)));
+                routes.extend(r);
+                builds.push(b);
+                Ok(routes)
+            })
+            .await?;
+            let b = devin(builds)?;
+            let url = format!("{origin}{}", devin_path("arm64"));
+            let tmp = tempfile::tempdir()?;
+            let (absent, empty) = (tmp.path().join("absent"), tmp.path().join("empty"));
+            std::fs::create_dir(&empty)?;
+            for ctx in [&absent, &empty] {
+                let refused = materialize(&b, &both(), None, ctx).await;
+                let Err(Error::Unpack(u)) = refused else {
+                    anyhow::bail!("{what}: {:?}, not the unpacker's refusal", refused.map(|m| m.len()));
+                };
+                assert_eq!((u.url.as_str(), u.entry.as_deref()), (url.as_str(), entry), "{what}: {u}");
+                assert!(is(&u.why), "{what}: {:?}", u.why);
+                let left = if ctx.exists() { names(ctx)? } else { BTreeSet::new() };
+                assert!(left.is_empty(), "{what}: left {left:?}");
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Codex's harness file and Agentfile for a test: its HARNESS line takes `./codex-${TARGETARCH}`.
+const CODEX_AGENTFILE: &str = "FROM scratch\nARG TARGETARCH\nHARNESS codex FROM ./codex-${TARGETARCH}\n";
+const CODEX_HARNESS_JSON: &str = "{\"schemaVersion\":1,\"name\":\"codex\"}\n";
+/// The member Codex's arm64 pin takes from ripgrep's archive, under the directory that archive leads with.
+const RG_MEMBER: &str = "ripgrep-15.2.0-aarch64-unknown-linux-musl/rg";
+/// Each rg, in small: amd64's package's own (a static build, which stays), arm64's package's (a glibc
+/// build, which its tree skips) and ripgrep's static build, the member that takes arm64's place.
+const AMD64_RG: &[u8] = b"\x7fELF rg, the amd64 package's static build\n";
+const GLIBC_RG: &[u8] = b"\x7fELF rg, the arm64 package's glibc build\n";
+const STATIC_RG: &[u8] = b"\x7fELF rg, ripgrep's static aarch64 build\n";
+
+/// OpenAI's package for `arch`, in small, as Codex's pin takes it whole at strip 0 (no leading
+/// directory): bin/codex, bwrap in codex-resources/, the package's own `rg` at codex-path/rg, and its
+/// layout file.
+fn codex_package(arch: &str, rg: &[u8]) -> Vec<E> {
+    vec![
+        dir("bin/"),
+        file("bin/codex", 0o755, format!("\x7fELF codex {arch}\n").as_bytes()),
+        dir("codex-resources/"),
+        file("codex-resources/bwrap", 0o755, b"\x7fELF bwrap\n"),
+        dir("codex-path/"),
+        file("codex-path/rg", 0o755, rg),
+        file("codex-package.json", 0o644, b"{\"layoutVersion\":1}\n"),
+    ]
+}
+
+/// One platform of Codex's shape, as the test's server serves it and as its pin names it: `package` a
+/// tree at `.`, its totals the archive's own, with `skip` where it's given one; on arm64, ripgrep's
+/// archive too (a README and its rg), whose member is written at codex-path/rg, 0755.
+fn codex_build(origin: &str, arch: &str, package: &[E], skip: &[&str]) -> anyhow::Result<(Vec<(String, Vec<u8>)>, Value)> {
+    let gz = targz(package)?;
+    let (entries, bytes) = totals(package);
+    let unpack = match skip {
+        [] => json!({ "format": "tar.gz", "strip": 0, "unpacked_bytes": bytes, "entries": entries }),
+        _ => json!({ "format": "tar.gz", "strip": 0, "unpacked_bytes": bytes, "entries": entries, "skip": skip }),
+    };
+    let mut files = vec![json!({ "url": format!("{origin}/{arch}/codex-package.tar.gz"), "sha256": sha(&gz), "size": gz.len(), "path": ".", "unpack": unpack })];
+    let mut routes = vec![(format!("/{arch}/codex-package.tar.gz"), gz)];
+    if arch == "arm64" {
+        let lead = RG_MEMBER.rsplit_once('/').map_or(RG_MEMBER, |(lead, _)| lead);
+        let rg = targz(&[dir(format!("{lead}/")), file(format!("{lead}/README.md"), 0o644, b"# ripgrep\n"), file(RG_MEMBER, 0o755, STATIC_RG)])?;
+        files.push(json!({ "url": format!("{origin}/arm64/ripgrep.tar.gz"), "sha256": sha(&rg), "size": rg.len(), "path": "codex-path/rg", "mode": "0755",
+            "unpack": { "format": "tar.gz", "member": RG_MEMBER, "sha256": sha(STATIC_RG), "size": STATIC_RG.len() } }));
+        routes.push(("/arm64/ripgrep.tar.gz".to_owned(), rg));
+    }
+    Ok((routes, json!({ "platform": format!("linux/{arch}"), "files": files })))
+}
+
+/// Codex's built-in for a test: the pin of `builds`.
+fn codex(builds: Vec<Value>) -> Builtin {
+    let pin = json!({ "version": "0.167.2", "verified": "by the test", "builds": builds }).to_string();
+    Builtin { name: "harness-codex", harness: "codex", text: CODEX_AGENTFILE, pin: pin.leak(), files: &[("harness.json", CODEX_HARNESS_JSON)] }
+}
+
+/// A context of Codex's shape for linux/amd64 and linux/arm64 holds the Agentfile and codex-amd64/ and
+/// codex-arm64/, and nothing else: no staging directory, no archive. Each holds harness.json and its
+/// package's tree at its root, its archived modes kept. amd64's codex-path/rg is its package's own;
+/// arm64's package skips its glibc rg, and ripgrep's static rg, the member, is written there at 0755.
+#[test]
+fn step20_a_codex_shaped_context_holds_ripgreps_rg_in_place_of_arm64s() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let mut builds = Vec::new();
+        let origin = serve(|o| {
+            let (mut routes, amd64) = codex_build(o, "amd64", &codex_package("amd64", AMD64_RG), &[])?;
+            let (arm, arm64) = codex_build(o, "arm64", &codex_package("arm64", GLIBC_RG), &["codex-path/rg"])?;
+            routes.extend(arm);
+            builds.extend([amd64, arm64]);
+            Ok(routes)
+        })
+        .await?;
+        let tmp = tempfile::tempdir()?;
+        let ctx = tmp.path().join("ctx");
+
+        let made = materialize(&codex(builds), &both(), None, &ctx).await?;
+
+        assert_eq!(made, [ctx.join("codex-amd64"), ctx.join("codex-arm64")], "from {origin}");
+        assert_eq!(names(&ctx)?, set(["Agentfile", "codex-amd64", "codex-arm64"]));
+        assert_eq!(std::fs::read_to_string(ctx.join("Agentfile"))?, CODEX_AGENTFILE);
+        for (arch, rg) in [("amd64", AMD64_RG), ("arm64", STATIC_RG)] {
+            let d = ctx.join(format!("codex-{arch}"));
+            assert_eq!(names(&d)?, set(["bin", "codex-package.json", "codex-path", "codex-resources", "harness.json"]), "{arch}");
+            assert_eq!(names(&d.join("codex-path"))?, set(["rg"]), "{arch}");
+            assert_eq!(std::fs::read(d.join("codex-path/rg"))?, rg, "{arch}");
+            assert_eq!(std::fs::read(d.join("bin/codex"))?, format!("\x7fELF codex {arch}\n").into_bytes(), "{arch}");
+            assert_eq!(std::fs::read_to_string(d.join("harness.json"))?, CODEX_HARNESS_JSON, "{arch}");
+            #[cfg(unix)]
+            {
+                for (path, bits) in [("bin/codex", 0o755), ("codex-resources/bwrap", 0o755), ("codex-path", 0o755), ("codex-path/rg", 0o755), ("codex-package.json", 0o644)] {
+                    assert_eq!(mode(&d.join(path))?, bits, "{arch}: {path}");
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Each way arm64's skip can fail comes back as the unpacker's typed error, naming the pinned URL and
+/// the entry at fault: a skip path the package doesn't hold; a skipped path that's a directory, or a
+/// symlink (a skipped entry is checked as every entry is, though never written); and no skip at all,
+/// where ripgrep's rg finds the package's there already, since nothing is overwritten. Each is arm64's,
+/// after amd64's directory was made, and leaves nothing in the context's directory.
+#[test]
+fn step20_a_codex_skip_that_fails_leaves_nothing() -> anyhow::Result<()> {
+    type Is = fn(&Why) -> bool;
+    let package = || codex_package("arm64", GLIBC_RG);
+    let mut linked = package();
+    linked.retain(|e| e.name != b"codex-path/rg");
+    linked.push(link("codex-path/rg", EntryType::Symlink, "/usr/bin/rg"));
+    // Each case: what it is, arm64's package, its skip, the archive refused, the entry it names, and why.
+    let cases: [(&str, Vec<E>, &[&str], &str, &str, Is); 4] = [
+        ("a skip path the package lacks", package(), &["codex-path/fd"], "codex-package", "codex-path/fd", |w| matches!(w, Why::Missing)),
+        ("a skipped directory", package(), &["codex-path"], "codex-package", "codex-path/", |w| matches!(w, Why::Kind(b'5'))),
+        ("a skipped symlink", linked, &["codex-path/rg"], "codex-package", "codex-path/rg", |w| matches!(w, Why::Link)),
+        ("no skip", package(), &[], "ripgrep", RG_MEMBER, |w| matches!(w, Why::Exists(at) if at == Path::new("codex-path/rg"))),
+    ];
+    for (what, arm64, skip, fails, entry, is) in cases {
+        crate::rt::block_on(async move {
+            let mut builds = Vec::new();
+            let origin = serve(|o| {
+                let (mut routes, b) = codex_build(o, "amd64", &codex_package("amd64", AMD64_RG), &[])?;
+                builds.push(b);
+                let (r, b) = codex_build(o, "arm64", &arm64, skip)?;
+                routes.extend(r);
+                builds.push(b);
+                Ok(routes)
+            })
+            .await?;
+            let b = codex(builds);
+            let url = format!("{origin}/arm64/{fails}.tar.gz");
+            let tmp = tempfile::tempdir()?;
+            let (absent, empty) = (tmp.path().join("absent"), tmp.path().join("empty"));
+            std::fs::create_dir(&empty)?;
+            for ctx in [&absent, &empty] {
+                let refused = materialize(&b, &both(), None, ctx).await;
+                let Err(Error::Unpack(u)) = refused else {
+                    anyhow::bail!("{what}: {:?}, not the unpacker's refusal", refused.map(|m| m.len()));
+                };
+                assert_eq!((u.url.as_str(), u.entry.as_deref()), (url.as_str(), Some(entry)), "{what}: {u}");
+                assert!(is(&u.why), "{what}: {:?}", u.why);
+                let left = if ctx.exists() { names(ctx)? } else { BTreeSet::new() };
+                assert!(left.is_empty(), "{what}: left {left:?}");
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
 }

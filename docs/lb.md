@@ -439,11 +439,15 @@ the fleet (64).
 - **The auction** (`[reach] auction`, "The auction" above): `Owner::ask_many` takes asks that
   arrive in one step; `Owner::configure` reads both settings, and the reach `Placer` calls it as
   it's made.
-- **The server** owns CI legs (`crates/kiln/src/hub/legs.rs`): an ordinary leg's runner is the
+- **The server** owns v1 jobs (`crates/kiln/src/hub/legs.rs`): an ordinary job's runner is the
   kernel's pick among the runners that named `place.fast` and hint their words, by the same rules
-  the engine's pick filters by; the leg's room is taken from the view until its runner is heard
-  of (started, refused, released). What the kernel can't place, the engine's own pick does. A
-  run's ordinary legs waiting together in one look at the queue go to `Legs::pick_batch` first.
+  the v1 dispatcher's pick filters by; the job's room is taken from the view until its runner is
+  heard of (started, refused, released). What the kernel can't place, the v1 dispatcher's own pick
+  does. A run's ordinary jobs waiting together in one look at the queue go to `Legs::pick_batch`
+  first. Runners' words and the jobs heard of at them come by mail (`legs::Mail`: each runner's
+  newest word, behind a lock held for a map insert), which the scheduling loop takes in as it looks,
+  so the kernel's records are written by that loop alone. The CI engine's legs go through a kernel
+  of the engine's own (below).
 - **Room tokens** (`[reach] tokens`, off until declared; below): a runner that declares them tells
   each owner whose link named `place.tokens` what it holds there, its own word (`tokens` in its
   answers' words, and `FastHint` for what's owed besides), and that owner takes no hint of the
@@ -451,6 +455,102 @@ the fleet (64).
   name it hear its hints, as before.
 
 Measured (`cargo bench -p kiln-ci --bench place_fast`): see below.
+
+## The CI engine
+
+Every leg of a `.kiln` or GitHub workflow is placed by this kernel (`kiln_ci::sched::balance`;
+docs/ci.md W05-R04, W05-R23): the engine keeps one, as the one owner of its legs, and its own
+pick, the order it kept of its candidates (preference, headroom, then the least loaded and the
+most free slots), is gone. The queue still decides which leg goes next (classes, fair share,
+priorities, W05-R09 to R10, R30, R31); routing, which runners may take it (W05-R19 to R22); the
+engine's rules, whether one takes it now (its room, a slot or its request within capacity ×
+overcommit, W05-R03; its target use by its live sample; room kept for another, W05-R39; a runner a
+retry stays off or is pinned to, W05-R16, R28); and the kernel, which of those it goes to. What a
+winner is decides it: the runner where the leg completes as quickly, efficiently, completely and
+correctly as it can.
+
+- **What the kernel is told.** Each runner joins it at its first word, with its whole budget (its
+  CPUs, memory, disk and GPUs as it offers them or its facts say, else its CPUs as its latest
+  sample says, else one for each slot; CPUs overcommitted in resource mode), and its room for an
+  ordinary leg now, whenever that changes (a leg granted or ended there, an executor started or
+  stopped, a sample, the runner up or changed): the least of what each of the engine's measures
+  leaves, its free slots' share of the CPUs no exclusive leg holds (slot mode) or what its capacity
+  leaves (resource mode), and, by its live sample, what it can still take within its target use,
+  less its CPUs' share of the time its tasks all stalled on memory and on I/O (PSI's `full`: time
+  lost, not used). None while a leg holds it whole. Its pace is what its own kernel's words say
+  (the fleet's fitted per-core speed, its slowness under contention now, its disk's and network's
+  rates): the server passes it on when it changes (`Input::RunnerPace`; one said before the runner
+  is up is kept for it). A signature's members are its eligible runners that aren't draining,
+  synced when which runners those are may have changed. A runner leaves the kernel with its link,
+  and joins it again, under its next epoch, when it's back.
+- **Each leg by when it will finish there.** A leg comes with what its kind's runs taught
+  (`Profile`): its CPU time on the reference core (the fleet's speed fit, `pace::speed`, every run
+  of it kept, each machine's speed taken out: `Fleet::work`), the most cores a run of it kept busy
+  (CPU time over wall time, the most of its newest runs: a lower bound of what it can use, that only
+  rises as runs find more cores free), and its bytes. The kernel ranks each runner by when the leg
+  is expected to finish there ("Per-ask terms", `Owner::ask_with_kind`): its CPU time over the
+  cores it would get, no more than it can use, at that runner's speed under contention, and its
+  bytes at the runner's disk rate. So a leg that keeps one core busy goes to the fastest cores,
+  and a build that uses every core it finds to the most of them at their speed. A kind no run has
+  taught is expected to be like the kinds so far, the median of their profiles, each term apart
+  (an empirical prior: Robbins, 1956); before any kind has taught one, a leg ranks runners by
+  their free cores at their speed (`Owner::ask_kind_wide`). Legs rebuilt after a restart take the
+  prior until their kind's next leg is queued.
+- **The pick.** The kernel proposes the signature's members in its order: the soonest finish
+  first, and between runners it can't tell apart (within 1/64, the orders' resolution), the leg's
+  kind's good place, else the next in turn, passing over the runner that last let its kind down
+  when another is that close ("Good places"). The first that takes the leg now by the engine's
+  rules gets it; one that doesn't is set aside for that pick alone. The pick takes its turn; nothing
+  of the kernel's view is left changed by it, since the engine tells the kernel the runner's room
+  once the leg is granted.
+- **Where it's asked.** A runner with room takes its best legs in queue order (W05-R04), and each
+  goes where the kernel puts it: that runner, or one where it finishes as soon or sooner, or its
+  kind's good place among equals. A leg queued is offered to the runners with room for it in the
+  kernel's rank (the most whole cores free first, by id among equals), each taking its best legs,
+  as before. A runner's lost legs, coming back together, each go straight where the kernel puts it.
+- **A run's critical path first.** What people wait on is the run. Legs that become ready
+  together go to the scheduler in order of their jobs' upward ranks (HEFT's `rank_u`: Topcuoglu,
+  Hariri & Wu, IEEE TPDS 13(3), 2002): a job's median duration and the longest chain of medians
+  among the jobs that need it, from the workflow's `needs` and its jobs' history
+  (`ci::dispatch::critical_first`). The leg the run waits on longest takes the best runner first;
+  in the queue, legs queued together keep that order among those of one priority.
+- **Preferences and GPUs.** A leg whose job or a rule declares preferences (W05-R23's terms over
+  facts and labels, W24-R18's `warm` and `affinity`), or that asks for GPUs (W05-R22's device fit),
+  goes to the runners those rank first, of those that take it now, and between them where the
+  kernel puts it: where they rank none above another (a cold fleet), exactly as a leg without.
+- **Kinds and ends.** A leg's kind is the key its runner keys its runs of it by
+  (`sense::run::leg_key`: its repository, its job's workflow, its job and its matrix), so the
+  engine, the runner and the run-time model name the same work alike. As an attempt ends on its
+  runner, the kernel is told how it went: success, it went well (its kind's good place from now);
+  lost with its runner, its infrastructure, its image, killed for memory or its disk full, the
+  runner let it down; failed in its steps or timed out, no one knows whose fault it was, which the
+  kernel settles by comparison; cancelled, nothing.
+- **Quickly.** A winner completes quickly as well as correctly. A leg that succeeded but took
+  longer from its grant than every earlier run of its kind that went well on that runner is a
+  record: something there may have slowed it (a throttled or contended machine, a failing disk) or
+  its work grew, and no one can say which, so it's judged as a failure no one can explain, and the
+  comparison settles it: its kind's next leg goes elsewhere once; going well there, the runner was
+  at fault and is passed over; a record there too, the work grew, and it keeps its place. No
+  threshold is picked: of n exchangeable runs the last is the longest with probability 1/n
+  (Foster & Stuart, JRSS B 16(1), 1954), so a runner that hasn't slowed sees about ln N such moves
+  over N runs of a kind there (H_N - 1: Rényi, 1962; Glick, Amer. Math. Monthly 85(1), 1978),
+  fewer the longer the kind has run there. `[reach] good_places = false` turns kinds off for CI
+  legs too: equals take turns alone, and no end is judged.
+- **Pools.** A pool's leg (W13-R09) runs in an idle executor of its pool: of the hosts with one,
+  where the kernel puts it, as any leg (its GPUs' fit first when it asks for GPUs). Where a pool
+  starts its next executor is the kernel's pick as well (`host_for`): of the hosts that may run
+  them, the most free by the rank, and between hosts as free, back to the one where the pool's
+  executors last started well (an executor ready is its good place's win), past one where a start
+  last failed; one at its `per_host_max`, backing off, without the GPUs or the room beside its
+  exclusive legs is set aside for that pick.
+- **Gangs.** A gang's members (W05-R40) start together or not at all, placed by the engine's
+  all-or-nothing planner, which tries the runners for each member in the kernel's rank (the most
+  whole cores free with the members put there before it, then by id).
+
+The reference scheduler (`sched::reference`, docs/needs.md E1.5) holds the engine to this: a leg
+goes to a runner with the most whole cores free of those that take it now, and of runners as free,
+the one the kernel took (its turn and good places are the kernel's own tests'); its replay digest
+(`sched::replay`) moved with it.
 ## Room tokens
 
 Hints cost 2(W - 1) words a run for W owners watching a runner. The least messaging that keeps
@@ -839,7 +939,8 @@ Where the step goes, measured apart at N = 100, rho = 0.5: the owner's side 17 n
 7.8), the runners' side 11 ns, the bench's carrying of messages the rest. Each part is a short chain
 of dependent loads through a different structure (the owner's record of the runner, its run slab,
 the index, the runner's ledger, its run slab): it is latency, not instructions, at every N, and at
-N = 10,000 those structures (about 10 MB) are in L2.
+N = 10,000 those structures (about 10 MB) are in the M3 Ultra's L2 (16 MB for each cluster of six
+cores); on a core with 1 MB of L2 they're in L3 already (below, "At scale").
 
 The competitors on the same machine, one run each of the bench's drivers at rho = 0.5 (the
 interleaved rounds of `ci/bench/run.py` are the comparison that decides):
@@ -862,6 +963,100 @@ Against the load-aware algorithms it would take 4.4 ns at N = 100 (HAProxy least
 10,000; kiln's step, at 33 and 99, is the five chains above one after the other. The competitors
 without admission oversubscribe (static-rr 372 picks onto full backends in this run, Maglev
 5,471, nginx random 5,000); kiln never does.
+
+## At scale
+
+Where a step leaves each level of cache, whether owners on several cores slow each other, and what
+a lock other cores write through costs (Ada's questions, 2026-11-12). `--profile` runs (one
+stretch of 2^23 steps after the fill and 25 N warm-up steps), ns a step with the harness's own
+bookkeeping in it (null); `--impl owner` is the owner's side alone, what a node that places holds
+(the whole bench also keeps every runner's ledger, which lives on the runner). Commit `1a5a8da8b`
+(main `efb40ea0f` and the bench's two modes below); `~/.cache/kiln-lb/sync-scale` runs it.
+
+**One owner, 10,000 to 1,000,000 runners.** adacachy2 (AMD Ryzen 9 9950X3D2: 48 KB L1d and 1 MB L2
+a core, 96 MB L3 for eight; load 4 to 7) and adas-mac-studio.local-2 (Apple M3 Ultra: 16 MB L2 for
+each cluster of six performance cores, no L3 but the system cache; load about 8, a CI job beside):
+
+| N | rho | x86 owner | x86 whole | M3 owner | M3 whole |
+|---|---|---|---|---|---|
+| 10,000 | 0.5 | 19.2 | 25.3 | 14.8 | 27.1 |
+| 30,000 | 0.5 | 22.7 | 29.6 | 19.8 | 49.8 |
+| 100,000 | 0.5 | 23.8 | 33.6 | 46.3 | 74.6 |
+| 300,000 | 0.5 | 31.7 | 105.3 | 84.0 | 125.2 |
+| 1,000,000 | 0.5 | 112.9 | 171.0 | 125.0 | 156.3 |
+| 10,000 | 0.9 | 25.4 | 32.6 | 22.2 | 33.7 |
+| 100,000 | 0.9 | 29.3 | 47.2 | 64.7 | 113.5 |
+| 300,000 | 0.9 | 88.4 | 145.4 | 113.0 | 156.3 |
+| 1,000,000 | 0.9 | 132.5 | 210.2 | 134.5 | 172.3 |
+
+On a core with 1 MB of L2 a step left it below 10,000 runners (the 10k audit: 15 of its 25 ns
+wait on L3); the 96 MB L3 then holds the owner's side nearly flat to 300,000 runners at half load
+(to 100,000 at 90%), the whole bench to 100,000; past that each miss is memory's, and the owner's
+step costs four to five times what it did on the plateau. On the M3 Ultra the owner's side leaves the 16 MB L2 between 30,000 and 100,000 runners,
+the whole bench between 10,000 and 30,000. At a million runners a decision takes 113 to 135 ns of
+the owner's on either machine.
+
+**Owners on several cores** (`--owners K`): K owners at once, one a thread, each with its own
+fleet and requests; every owner's steps a second together, over K times one owner's alone:
+
+| N | rho | K = 2 | 4 | 8 | 16 | machine |
+|---|---|---|---|---|---|---|
+| 10,000 | 0.5 | 0.98 | 0.98 | 0.94 | 0.87 | x86 |
+| 10,000 | 0.9 | 1.00 | 0.96 | 0.93 | 0.90 | x86 |
+| 100,000 | 0.5 | 0.64 | 0.29 | 0.26 | 0.14 | x86 |
+| 100,000 | 0.9 | 0.43 | 0.31 | 0.22 | 0.15 | x86 |
+| 10,000 | 0.5 | 1.01 | 0.92 | 0.82 | 0.75 | M3 |
+| 100,000 | 0.5 | 0.80 | 0.73 | 0.61 | 0.51 | M3 |
+
+Owners share no memory, and two owners on two cores lose nothing at 10,000 runners: no line goes
+back and forth between them. What they share is the machine's: at 100,000 runners each owner of the
+whole bench holds about 100 MB (ten times the 10 MB at 10,000 above), so two of them no longer fit the 96 MB L3 they share, and from four
+on they're held to memory's bandwidth (x86: 35 to 66 million steps a second together). The
+M3 Ultra's memory carries several times more, and its owners keep half their
+pace at 16. Most of the whole bench's footprint is the runners' ledgers (640 bytes each, the 10k
+audit's sizes), which a node that places doesn't hold.
+
+**One owner behind a lock** (`--hinters M`, the server's v1 kernel's shape, `crates/kiln/src/hub/legs.rs`):
+its steps a lock each while M threads hint it as fast as they can, against the same owner without
+the lock:
+
+| M | x86, rho 0.5 | x86, rho 0.9 | M3, rho 0.5 | M3, rho 0.9 |
+|---|---|---|---|---|
+| 0 (the lock alone) | 1.09x | 1.08x | 1.38x | 1.43x |
+| 1 | 2.7x | 2.2x | 5.2x | 5.1x |
+| 2 | 4.5x | 3.6x | 25x | 27x |
+| 4 | 13x | 11x | 49x | 41x |
+| 8 | 41x | 35x | 58x | 41x |
+
+Hints came at 3 to 17 million a second, as fast as the threads could; a fleet's runners say
+their room when it changes, a dozen runners a few times a second each. Against a mailbox the
+owner drains itself (`--mailbox M`: each runner's newest word put in a set behind a lock of its
+own, held for the insert, and a flag raised; before each step the owner reads the flag and takes
+the set when it's up, so the owner's records have one writer), run that way the mailbox did
+worse: its owner applied every word its posters made, up to 1,000 a step, where the lock let
+fewer in. At the same words a second (`--rate`, spread over the threads and paced by the clock;
+commit `20318e8b3`), a step's cost over the bare kernel's, for 1 to 8 threads at 10,000 runners,
+rho 0.5 and 0.9, three runs on each machine:
+
+| words a second | x86, lock | x86, mailbox | M3, lock | M3, mailbox |
+|---|---|---|---|---|
+| 10,000 | 1.00-1.42x | 1.02-1.33x | 2.35-5.7x | 1.04-1.30x |
+| 100,000 | 1.03-1.28x | 1.03-1.34x | 2.6-8.8x | 1.06-1.39x |
+| 1,000,000 | 1.29-2.40x | 1.11-1.43x | 2.5-101x | 1.18-21x |
+| 10,000,000 | 1.99-44x | 4.9-47x | 2.5-72x | 17-457x |
+
+With no thread at all the owners cost 1.0x to 1.2x on x86 (a step taken one at a time, the lock's
+with a lock each) and 1.0x to 2.1x on the M3 Ultra. On x86 the two designs cost the same to
+100,000 words a second and the mailbox less at a million. On the M3 Ultra the lock costs 2.4x and
+more from 10,000 a second (why isn't measured here; a contended lock there puts its waiter to sleep
+in the kernel), and its hinters can't get their words in: at a million a second one hinter got 2%
+to 6% of them in. The mailbox there stays within 1.4x to 100,000 words a second; at a million,
+eight posters contending for its own lock cost its owner 2.4x to 21x. At ten million a second (a
+thousand a runner a second, no fleet's) both fail, the lock's hinters shut out and the mailbox's
+owner applying every word that came; unpaced, the M3's mailbox with one poster ran for hours
+without finishing its steps (x86: under a minute). The server's v1 kernel takes its words by mail
+(Adopted, above), its scheduling loop the one writer, and a look takes at most one word a runner
+however many came.
 
 ## What remains
 

@@ -1,0 +1,26 @@
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+host Linux 7.3.3-1-cachyos x86_64 adacachy2
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+rustc 1.98.1 (48a229cea 2026-09-01)
+674161d08555d7eb02f8ae5867c252105d366f35d21dc7a4ae5aa04cd4548b6e  src/unpack.rs
+d68fbebb0324d5a65b3cefe10d8b8ceb48e84500799462a498f63bbdcaa465bf  src/unpack/tests.rs
+bfda00e0826d5c0577283233440f16ec676d8dfa3b68633733a23ac65c03713e  Cargo.toml
+
+running 18 tests
+..................
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+TEST_EXIT 0
+CLIPPY_EXIT 0
+kiln exit 0

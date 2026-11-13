@@ -1,0 +1,112 @@
+# cargo test -p kiln --lib --locked agentfiles, then cargo clippy -p kiln --all-targets --locked -- -D warnings
+#
+# Kiln plan 01a1ce705e4d7008993f5c7291ef4476 (step 25 of 01a1cd8e862e7169a074db3d5fa33f3d), step 2. Ran on
+# adacachy (Linux 7.2.9-2-cachyos x86_64, 32 cores) over ssh, as systemd --user units, in a scratch clone of
+# kiln main 3a4b09005 with this step's change applied (~/.cache/s25-devin-tree-pin, removed after). pin.sh sha256
+# 4cc09f930a07b5198f900f82a94298c438bdb90e050929d67ca4c1eb17b70d6c and pin-tests.sh sha256
+# 21faaad2239a84fd3e0d138d6dbafff217a4ac5450bd84bbd2632877ccf059c3, as committed. job.sh and live.sh beside this
+# file ran them; `===` lines are job.sh's.
+# Compiler progress lines are left out. Clippy's only warnings are vendor/focal-bus's focal-memory's (a deprecated
+# fetch_update), which no line of this step touches; kiln's own code has none.
+
+=== test: cargo test -p kiln --lib --locked agentfiles (2026-11-12T22:05:30Z)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16m 53s
+     Running unittests src/lib.rs (/home/adalundhe/.cache/s25-devin-tree-pin/target/debug/deps/kiln-721748ad308a6d67)
+running 90 tests
+test agentfiles::builtin::antigravity_tests::antigravity_agentfile_passes_shards_own_check ... ok
+test agentfiles::builtin::amp_tests::amp_files_carry_no_signin ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_is_listed_once_with_its_harness_file ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_files_carry_no_signin ... ok
+test agentfiles::builtin::claude_tests::step19_claude_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_agentfile_grants_its_harness_what_it_lists_alone ... ok
+test agentfiles::builtin::amp_tests::amp_harness_file_starts_kinds_program_with_its_state_in_the_volume ... ok
+test agentfiles::builtin::amp_tests::amp_pin_names_both_programs_for_both_platforms ... ok
+test agentfiles::builtin::claude_tests::step19_claude_pin_and_harness_files_hold ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_harness_file_runs_agy_in_ask_mode_with_its_home_in_the_volume ... ok
+test agentfiles::builtin::claude_tests::step19_claude_runs_as_kilns_claude_kind_with_its_home_on_its_volume ... ok
+test agentfiles::builtin::amp_tests::amp_agentfile_grants_its_harness_what_it_lists_alone ... ok
+test agentfiles::builtin::codex_tests::codex_embedded_files_hold_no_credential ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::codex_tests::codex_agentfile_is_exactly_its_base_harness_grants_and_volumes ... ok
+test agentfiles::builtin::codex_tests::codex_harness_json_runs_kilns_command_with_codex_home_in_its_volume ... ok
+test agentfiles::builtin::claude_tests::step19_no_claude_file_holds_a_credential ... ok
+test agentfiles::builtin::devin_tests::step25_devins_agentfile_is_the_layouts ... ok
+test agentfiles::builtin::devin_tests::step25_devins_harness_json_starts_it_as_kiln_does ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_smoke_expects_what_agy_prints ... ok
+test agentfiles::builtin::cursor_tests::step27_no_cursor_file_holds_a_credential ... ok
+test agentfiles::builtin::goose_tests::step23_goose_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::devin_tests::step25_devins_pin_is_cognitions_two_linux_bundles ... ok
+test agentfiles::builtin::goose_tests::step23_no_goose_file_holds_a_credential ... ok
+test agentfiles::builtin::goose_tests::step23_goose_runs_as_kilns_goose_kind_with_its_root_on_its_volume ... ok
+test agentfiles::builtin::goose_tests::step23_goose_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_pin_names_agy_for_both_platforms ... ok
+test agentfiles::builtin::claude_tests::step19_a_claude_pin_that_would_mislead_is_caught ... ok
+test agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::check::tests::step30_a_real_shards_checks_without_resolving_bases ... ok
+test agentfiles::builtin::tests::step19_a_harness_home_is_its_volume_and_none_is_under_tmp ... ok
+test agentfiles::builtin::tests::step23_a_real_shards_checks_every_builtin ... ok
+test agentfiles::builtin::tests::every_builtin_is_a_valid_agentfile_once ... ok
+test agentfiles::builtin::tests::step23_kilns_dockerfile_copies_what_builtins_embed ... ok
+test agentfiles::check::tests::step30_no_result_is_unchecked_saying_shards_last_error ... ok
+test agentfiles::check::tests::step30_a_refusal_without_a_line_in_its_words_names_it ... ok
+test agentfiles::check::tests::step30_warnings_are_diagnostics_that_refuse_nothing ... ok
+test agentfiles::check::tests::step30_the_target_that_stops_shards_says_the_text_passed ... ok
+test agentfiles::cli::tests::step26_a_live_antigravity_context_holds_the_pinned_builds ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it ... ok
+test agentfiles::builtin::goose_tests::step23_a_pin_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::context::tests::step19_harness_dirs_are_named_as_each_builtins_harness_line_takes_them ... ok
+test agentfiles::cli::tests::step19_context_reads_its_words ... ok
+test agentfiles::context::tests::step19_a_recipe_changes_exactly_with_what_a_build_takes ... ok
+test agentfiles::builtin::codex_tests::codex_pin_holds_both_platforms_with_arm64s_rg_in_place ... ok
+test agentfiles::context::tests::step19_modes_are_permissions_and_paths_stay_inside ... ok
+test agentfiles::context::tests::step19_a_variants_build_gets_its_own_harness_file ... ok
+test agentfiles::cli::tests::step19_a_live_claude_context_holds_the_pinned_builds ... ok
+test agentfiles::check::tests::step30_any_other_error_refuses_it_in_shards_words_at_its_line ... ok
+test agentfiles::tests::step30_ls_tree_entries ... ok
+test agentfiles::context::tests::step19_pins_are_read_for_their_builds_alone ... ok
+test agentfiles::unpack::tests::alone_is_a_members_field ... ok
+test agentfiles::unpack::tests::a_target_already_there_is_refused_and_left_as_it_was ... ok
+test agentfiles::tests::step30_names_and_texts ... ok
+test agentfiles::unpack::tests::a_member_held_alone_unpacks_as_its_file_and_nothing_else ... ok
+test agentfiles::unpack::tests::a_member_held_alone_is_held_to_its_size_and_digest ... ok
+test agentfiles::unpack::tests::a_pi_shaped_build_unpacks_its_tree_then_picks_its_members ... ok
+test agentfiles::unpack::tests::a_directory_its_owner_may_not_search_is_kept_and_still_discarded_whole ... ok
+test agentfiles::unpack::tests::a_member_not_held_alone_passes_over_what_is_beside_it ... ok
+test agentfiles::unpack::tests::a_strip_1_tree_appears_whole_with_its_files_directories_and_modes ... ok
+test agentfiles::unpack::tests::devins_shape_unpacks_at_strip_0_with_nothing_beside_it ... ok
+test agentfiles::unpack::tests::a_tree_at_a_path_inside_appears_whole_beside_what_is_there ... ok
+test agentfiles::unpack::tests::a_member_is_one_regular_file_held_to_its_pin ... ok
+test agentfiles::unpack::tests::nothing_of_a_tree_shows_until_all_of_it_is_in ... ok
+test agentfiles::unpack::tests::what_is_not_a_gzip_tar_is_refused_whole ... ok
+test agentfiles::builtin::devin_tests::step25_devins_files_carry_no_credential ... ok
+test agentfiles::unpack::tests::an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing ... ok
+test agentfiles::unpack::tests::the_unpack_object_is_one_form_or_refused ... ok
+test agentfiles::unpack::tests::the_per_arch_directory_appears_only_once_the_whole_archive_is_in ... ok
+test agentfiles::unpack::tests::each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing ... ok
+test agentfiles::unpack::tests::an_archive_cut_short_leaves_nothing_behind ... ok
+test agentfiles::context::unpack_tests::step26_an_agy_shaped_context_holds_bin_agy_as_pinned ... ok
+test agentfiles::context::unpack_tests::step25_a_devin_shaped_context_holds_bin_devin_share_and_harness_json_alone ... ok
+test agentfiles::tests::step30_the_migration_makes_its_tables ... ok
+test agentfiles::tests::step30_a_project_is_listed_for_its_readers_alone ... ok
+test agentfiles::check::tests::step30_shards_is_asked_for_its_check_in_a_folder_of_its_own ... ok
+test agentfiles::context::unpack_tests::step28_a_pi_shaped_context_unpacks_as_pinned ... ok
+test agentfiles::context::tests::step19_a_context_is_written_whole_or_not_at_all ... ok
+test agentfiles::context::unpack_tests::step26_an_agy_archive_failing_a_check_leaves_nothing ... ok
+test agentfiles::tests::step30_a_delete_lets_go_of_texts_no_record_names ... ok
+test agentfiles::tests::step30_a_text_read_back_is_held_to_its_digest ... ok
+test agentfiles::tests::step30_a_person_reaches_only_their_own ... ok
+test agentfiles::tests::step30_a_text_the_store_cant_keep_writes_no_record ... ok
+test agentfiles::tests::step30_who_reaches_everyones ... ok
+test agentfiles::tests::step30_texts_are_kept_once_in_the_store_of_bytes ... ok
+test agentfiles::tests::step30_versions_restore_and_delete ... ok
+test agentfiles::context::unpack_tests::step25_a_devin_bundle_of_another_digest_or_size_is_never_opened ... ok
+test agentfiles::context::unpack_tests::step25_a_devin_bundle_the_unpacker_refuses_leaves_nothing ... ok
+test agentfiles::context::unpack_tests::step28_an_archive_the_unpacker_refuses_leaves_nothing ... ok
+test result: ok. 90 passed; 0 failed; 0 ignored; 0 measured; 4377 filtered out; finished in 0.92s
+=== test exit 0 (2026-11-12T22:22:25Z)
+
+=== clippy: cargo clippy -p kiln --all-targets --locked -- -D warnings (2026-11-12T22:22:25Z)
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6m 54s
+=== clippy exit 0 (2026-11-12T22:29:21Z)

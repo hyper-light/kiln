@@ -1,0 +1,354 @@
+# The skip's landing merge (fb92cb64e: kiln main d6ffa45d8 with p/s20-finish-skip-v1) on adacachy (Linux x86_64),
+# 2026-11-12T23:43Z to 2026-11-13T00:22Z: scripts/step3-finish-linux.sh as systemd user unit
+# s20-finish-1794527029 in a clone of the merge, its cold target ~/.cache/s20-finish/target; then, by hand over
+# ssh, ROOT's R09 command at the merge and step3-live-check.py on the context the CLI made. Codex never run.
+
+host Linux 7.2.9-2-cachyos x86_64 adacachy 2026-11-12T23:43:49Z cpus 32 umask 0022
+ 15:43:49 up 7 days, 19:40, 4552 users,  load average: 164.10, 139.71, 105.18
+cargo 1.99.1 (5f94df478 2026-08-27)
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+HEAD fb92cb64e45b1e5bc38540909da522694068c0cb Merge p/s20-finish-skip-v1 (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 20): Codex's arm6
+2f96cd47d7be3a9f81725e483399f1d26ef50001737d4130c4c406cfc804a3fb  crates/kiln/src/agentfiles/unpack.rs
+4c609975b938b193f436f84c1625634faa137a871ed18b0cb6f24cef812df403  crates/kiln/src/agentfiles/unpack/tests.rs
+3e754c11c562aeb1cdf45e15052b73c70e4130b48f5cc6cf3597ae6b3a34c638  crates/kiln/src/agentfiles/context/unpack_tests.rs
+707f24dd7151d62316c0946de26121a990e96b1bb46b28a2eeff42bc4d4e5477  crates/kiln/src/agentfiles/cli.rs
+53481af727cdf68ac5ce95b131a1db0d0429336963a60a3d952e4691326917fe  .kiln/images/harness-codex/pin.json
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+test agentfiles::builtin::antigravity_tests::antigravity_agentfile_passes_shards_own_check ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_is_listed_once_with_its_harness_file ... ok
+test agentfiles::builtin::amp_tests::amp_files_carry_no_signin ... ok
+test agentfiles::builtin::claude_tests::step19_claude_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_files_carry_no_signin ... ok
+test agentfiles::builtin::claude_tests::step19_claude_pin_and_harness_files_hold ... ok
+test agentfiles::builtin::amp_tests::amp_agentfile_grants_its_harness_what_it_lists_alone ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_agentfile_grants_its_harness_what_it_lists_alone ... ok
+test agentfiles::builtin::claude_tests::step19_claude_runs_as_kilns_claude_kind_with_its_home_on_its_volume ... ok
+test agentfiles::builtin::amp_tests::amp_harness_file_starts_kinds_program_with_its_state_in_the_volume ... ok
+test agentfiles::builtin::codex_tests::codex_embedded_files_hold_no_credential ... ok
+test agentfiles::builtin::codex_tests::codex_agentfile_is_exactly_its_base_harness_grants_and_volumes ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_harness_file_runs_agy_in_ask_mode_with_its_home_in_the_volume ... ok
+test agentfiles::builtin::codex_tests::codex_harness_json_runs_kilns_command_with_codex_home_in_its_volume ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_smoke_expects_what_agy_prints ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::claude_tests::step19_no_claude_file_holds_a_credential ... ok
+test agentfiles::builtin::antigravity_tests::antigravity_pin_names_agy_for_both_platforms ... ok
+test agentfiles::builtin::amp_tests::amp_pin_names_both_programs_for_both_platforms ... ok
+test agentfiles::builtin::devin_tests::step25_devins_agentfile_is_the_layouts ... ok
+test agentfiles::builtin::devin_tests::step25_devins_harness_json_starts_it_as_kiln_does ... ok
+test agentfiles::builtin::cursor_tests::step27_cursor_runs_as_kilns_cursor_kind_launches_it ... ok
+test agentfiles::builtin::devin_tests::step25_devins_pin_is_cognitions_two_linux_bundles ... ok
+test agentfiles::builtin::cursor_tests::step27_no_cursor_file_holds_a_credential ... ok
+test agentfiles::builtin::gemini_tests::step21_a_live_gemini_context_holds_the_pinned_builds ... ok
+test agentfiles::builtin::goose_tests::step23_goose_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::goose_tests::step23_goose_runs_as_kilns_goose_kind_with_its_root_on_its_volume ... ok
+test agentfiles::builtin::claude_tests::step19_a_claude_pin_that_would_mislead_is_caught ... ok
+test agentfiles::builtin::gemini_tests::step21_gemini_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::pi_tests::step28_a_live_pi_context_holds_the_pinned_builds ... ok
+test agentfiles::builtin::tests::step23_a_real_shards_checks_every_builtin ... ok
+test agentfiles::check::tests::step30_a_real_shards_checks_without_resolving_bases ... ok
+test agentfiles::check::tests::step30_a_refusal_without_a_line_in_its_words_names_it ... ok
+test agentfiles::builtin::goose_tests::step23_goose_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::tests::step23_kilns_dockerfile_copies_what_builtins_embed ... ok
+test agentfiles::check::tests::step30_any_other_error_refuses_it_in_shards_words_at_its_line ... ok
+test agentfiles::check::tests::step30_no_result_is_unchecked_saying_shards_last_error ... ok
+test agentfiles::builtin::gemini_tests::step21_gemini_system_settings_turn_its_update_check_off ... ok
+test agentfiles::check::tests::step30_warnings_are_diagnostics_that_refuse_nothing ... ok
+test agentfiles::builtin::opencode_tests::step22_opencode_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::pi_tests::step28_no_pi_file_holds_a_credential ... ok
+test agentfiles::builtin::tests::step19_a_harness_home_is_its_volume_and_none_is_under_tmp ... ok
+test agentfiles::builtin::gemini_tests::step21_gemini_pin_and_harness_file_hold ... ok
+test agentfiles::cli::tests::step26_a_live_antigravity_context_holds_the_pinned_builds ... ok
+test agentfiles::builtin::opencode_tests::step22_opencode_runs_as_kilns_opencode_kind_launches_it ... ok
+test agentfiles::context::tests::step19_a_variants_build_gets_its_own_harness_file ... ok
+test agentfiles::context::tests::step19_a_recipe_changes_exactly_with_what_a_build_takes ... ok
+test agentfiles::builtin::opencode_tests::step22_opencode_agentfile_is_the_plans_shape ... ok
+test agentfiles::builtin::codex_tests::codex_pin_holds_both_platforms_with_arm64s_rg_in_place ... ok
+test agentfiles::builtin::gemini_tests::step21_gemini_runs_as_kilns_gemini_kind_launches_it ... ok
+test agentfiles::context::tests::step19_modes_are_permissions_and_paths_stay_inside ... ok
+test agentfiles::cli::tests::step19_a_live_claude_context_holds_the_pinned_builds ... ok
+test agentfiles::builtin::goose_tests::step23_no_goose_file_holds_a_credential ... ok
+test agentfiles::check::tests::step30_the_target_that_stops_shards_says_the_text_passed ... ok
+test agentfiles::context::tests::step19_pins_are_read_for_their_builds_alone ... ok
+test agentfiles::builtin::cursor_tests::step27_a_cursor_pin_or_harness_file_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::builtin::gemini_tests::step21_gemini_smoke_runs_its_node_on_its_entry ... ok
+test agentfiles::context::tests::step19_harness_dirs_are_named_as_each_builtins_harness_line_takes_them ... ok
+test agentfiles::builtin::tests::every_builtin_is_a_valid_agentfile_once ... ok
+test agentfiles::tests::step30_ls_tree_entries ... ok
+test agentfiles::builtin::pi_tests::step28_pi_runs_as_kilns_pi_kind_with_its_config_on_its_volume ... ok
+test agentfiles::cli::tests::step20_a_live_codex_context_holds_the_pinned_builds ... ok
+test agentfiles::builtin::pi_tests::step28_pi_agentfile_and_pin_are_the_plans_shape ... ok
+test agentfiles::tests::step30_names_and_texts ... ok
+test agentfiles::builtin::pi_tests::step28_pi_pin_and_harness_file_hold ... ok
+test agentfiles::builtin::gemini_tests::step21_no_gemini_file_holds_a_credential ... ok
+test agentfiles::unpack::tests::a_directory_its_owner_may_not_search_is_kept_and_still_discarded_whole ... ok
+test agentfiles::cli::tests::step19_context_reads_its_words ... ok
+test agentfiles::unpack::tests::a_member_held_alone_is_held_to_its_size_and_digest ... ok
+test agentfiles::builtin::goose_tests::step23_a_pin_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::unpack::tests::a_member_held_alone_unpacks_as_its_file_and_nothing_else ... ok
+test agentfiles::unpack::tests::a_skipped_file_counts_in_the_trees_totals ... ok
+test agentfiles::unpack::tests::a_member_not_held_alone_passes_over_what_is_beside_it ... ok
+test agentfiles::unpack::tests::a_target_already_there_is_refused_and_left_as_it_was ... ok
+test agentfiles::unpack::tests::a_tree_at_a_path_inside_appears_whole_beside_what_is_there ... ok
+test agentfiles::unpack::tests::a_trees_skip_is_a_trees_field ... ok
+test agentfiles::unpack::tests::a_strip_1_tree_appears_whole_with_its_files_directories_and_modes ... ok
+test agentfiles::unpack::tests::alone_is_a_members_field ... ok
+test agentfiles::unpack::tests::a_member_is_one_regular_file_held_to_its_pin ... ok
+test agentfiles::unpack::tests::a_pi_shaped_build_unpacks_its_tree_then_picks_its_members ... ok
+test agentfiles::builtin::devin_tests::step25_devins_files_carry_no_credential ... ok
+test agentfiles::unpack::tests::codex_arm64s_tree_skips_its_rg_and_ripgreps_static_rg_takes_its_place ... ok
+test agentfiles::unpack::tests::devins_shape_unpacks_at_strip_0_with_nothing_beside_it ... ok
+test agentfiles::unpack::tests::every_builtins_pinned_unpack_is_a_spec ... ok
+test agentfiles::unpack::tests::a_skipped_path_is_one_regular_file_the_archive_holds ... ok
+test agentfiles::unpack::tests::what_is_not_a_gzip_tar_is_refused_whole ... ok
+test agentfiles::unpack::tests::the_unpack_object_is_one_form_or_refused ... ok
+test agentfiles::unpack::tests::without_its_skip_ripgreps_rg_collides_with_the_packages_and_the_first_stays ... ok
+test agentfiles::builtin::pi_tests::step28_a_pin_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::unpack::tests::the_per_arch_directory_appears_only_once_the_whole_archive_is_in ... ok
+test agentfiles::unpack::tests::nothing_of_a_tree_shows_until_all_of_it_is_in ... ok
+test agentfiles::unpack::tests::an_entry_beside_a_member_held_alone_refuses_the_archive_and_leaves_nothing ... ok
+test agentfiles::builtin::gemini_tests::step21_a_gemini_pin_or_harness_file_that_would_mislead_a_build_is_caught ... ok
+test agentfiles::unpack::tests::each_entry_a_tree_may_not_hold_is_refused_naming_it_and_leaves_nothing ... ok
+test agentfiles::builtin::opencode_tests::step22_no_opencode_file_holds_a_credential ... ok
+test agentfiles::builtin::opencode_tests::step22_an_opencode_pin_or_harness_file_that_would_mislead_is_caught ... ok
+test agentfiles::unpack::tests::an_archive_cut_short_leaves_nothing_behind ... ok
+test agentfiles::context::unpack_tests::step25_a_devin_shaped_context_holds_bin_devin_share_and_harness_json_alone ... ok
+test agentfiles::context::unpack_tests::step20_a_codex_shaped_context_holds_ripgreps_rg_in_place_of_arm64s ... ok
+test agentfiles::check::tests::step30_shards_is_asked_for_its_check_in_a_folder_of_its_own ... ok
+test agentfiles::tests::step30_who_reaches_everyones ... ok
+test agentfiles::tests::step30_a_person_reaches_only_their_own ... ok
+test agentfiles::tests::step30_the_migration_makes_its_tables ... ok
+test agentfiles::tests::step30_a_project_is_listed_for_its_readers_alone ... ok
+test agentfiles::context::unpack_tests::step26_an_agy_shaped_context_holds_bin_agy_as_pinned ... ok
+test agentfiles::tests::step30_a_text_the_store_cant_keep_writes_no_record ... ok
+test agentfiles::tests::step30_a_delete_lets_go_of_texts_no_record_names ... ok
+test agentfiles::context::unpack_tests::step28_a_pi_shaped_context_unpacks_as_pinned ... ok
+test agentfiles::context::unpack_tests::step22_an_opencode_shaped_context_holds_bin_opencode_and_its_license_as_pinned ... ok
+test agentfiles::context::tests::step19_a_context_is_written_whole_or_not_at_all ... ok
+test agentfiles::context::unpack_tests::step26_an_agy_archive_failing_a_check_leaves_nothing ... ok
+test agentfiles::context::unpack_tests::step20_a_codex_skip_that_fails_leaves_nothing ... ok
+test agentfiles::context::unpack_tests::step25_a_devin_bundle_of_another_digest_or_size_is_never_opened ... ok
+test agentfiles::tests::step30_a_text_read_back_is_held_to_its_digest ... ok
+test agentfiles::tests::step30_texts_are_kept_once_in_the_store_of_bytes ... ok
+test agentfiles::tests::step30_versions_restore_and_delete ... ok
+test agentfiles::context::unpack_tests::step28_an_archive_the_unpacker_refuses_leaves_nothing ... ok
+test agentfiles::context::unpack_tests::step25_a_devin_bundle_the_unpacker_refuses_leaves_nothing ... ok
+test result: ok. 119 passed; 0 failed; 0 ignored; 0 measured; 4383 filtered out; finished in 0.80s
+TEST_EXIT 0 2026-11-12T23:58:50Z
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+   Compiling kiln v0.2.0 (/home/adalundhe/.cache/s20-finish/kiln/crates/kiln)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7m 51s
+CLIPPY_EXIT 0 2026-11-13T00:06:43Z
+test agentfiles::cli::tests::step20_a_live_codex_context_holds_the_pinned_builds has been running for over 60 seconds
+TREE linux/amd64 52 entries 540223046 bytes
+TREE linux/arm64 52 entries 481248308 bytes
+MATCH linux/arm64 codex-path/rg c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a
+test agentfiles::cli::tests::step20_a_live_codex_context_holds_the_pinned_builds ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4501 filtered out; finished in 108.09s
+LIVE_TEST_EXIT 0 2026-11-13T00:08:34Z
+   Compiling focal-bus v0.1.0 (/home/adalundhe/.cache/s20-finish/kiln/vendor/focal-bus/crates/focal-bus)
+   Compiling kiln-obs v0.2.0 (/home/adalundhe/.cache/s20-finish/kiln/crates/kiln-obs)
+   Compiling quiver v0.1.0 (/home/adalundhe/.cache/s20-finish/kiln/vendor/quiver/crates/quiver)
+   Compiling kiln v0.2.0 (/home/adalundhe/.cache/s20-finish/kiln/crates/kiln)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5m 09s
+BUILD_EXIT 0 2026-11-13T00:13:44Z
+489e807ddbf4b9ebfac989a26ef6a6278391a517a6b7a557ba9ccb297ee2886f
+CLI_EXIT 0 2026-11-13T00:14:01Z
+CONTEXT Agentfile codex-amd64 codex-arm64 
+DIR codex-amd64 dirs 8 files 44 other 0 bytes 540223046
+DIR codex-arm64 dirs 8 files 44 other 0 bytes 481248308
+e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849  codex-amd64/codex-path/rg
+c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a  codex-arm64/codex-path/rg
+a9672d0fa0dd8fcf8cad136fa0d056b914bc046f5ac3d78f4a5cf390655af56b  codex-amd64/bin/codex
+b581df3989da98e36fccd7d40cc980727a9ee87bcf0e6ef52ffb2544d6a5302f  codex-arm64/bin/codex
+HARNESS_JSON same in both
+LISTING
+-rw-r--r--         2430 Agentfile
+drwxr-xr-x          116 codex-amd64
+drwxr-xr-x           84 codex-amd64/bin
+-rwxr-xr-x    320248296 codex-amd64/bin/codex
+-rwxr-xr-x     79213840 codex-amd64/bin/codex-code-mode-host
+-rwxr-xr-x     81956776 codex-amd64/bin/codex-exec-server
+-rw-r--r--          246 codex-amd64/codex-package.json
+drwxr-xr-x            4 codex-amd64/codex-path
+-rwxr-xr-x      5408904 codex-amd64/codex-path/rg
+drwxr-xr-x           20 codex-amd64/codex-resources
+-rwxr-xr-x       529776 codex-amd64/codex-resources/bwrap
+drwxr-xr-x          120 codex-amd64/codex-resources/voice
+drwxr-xr-x           32 codex-amd64/codex-resources/voice/bin
+-rwxr-xr-x     40487744 codex-amd64/codex-resources/voice/bin/codex-voice-host
+drwxr-xr-x          680 codex-amd64/codex-resources/voice/lib
+drwxr-xr-x          240 codex-amd64/codex-resources/voice/lib/gstreamer-1.0
+-rwxr-xr-x         6488 codex-amd64/codex-resources/voice/lib/gstreamer-1.0/libgstapp.so
+-rwxr-xr-x        41040 codex-amd64/codex-resources/voice/lib/gstreamer-1.0/libgstaudioconvert.so
+-rwxr-xr-x        35264 codex-amd64/codex-resources/voice/lib/gstreamer-1.0/libgstaudioresample.so
+-rwxr-xr-x       479848 codex-amd64/codex-resources/voice/lib/gstreamer-1.0/libgstcoreelements.so
+-rwxr-xr-x        73464 codex-amd64/codex-resources/voice/lib/gstreamer-1.0/libgstopus.so
+-rwxr-xr-x       564072 codex-amd64/codex-resources/voice/lib/gstreamer-1.0/libgstrtpmanager.so
+-rwxr-xr-x       757800 codex-amd64/codex-resources/voice/lib/gstreamer-1.0/libgstrtp.so
+-rwxr-xr-x        63096 codex-amd64/codex-resources/voice/lib/libffi.so.8
+-rwxr-xr-x      2338512 codex-amd64/codex-resources/voice/lib/libgio-2.0.so.0
+-rwxr-xr-x      1521616 codex-amd64/codex-resources/voice/lib/libglib-2.0.so.0
+-rwxr-xr-x        15720 codex-amd64/codex-resources/voice/lib/libgmodule-2.0.so.0
+-rwxr-xr-x       454720 codex-amd64/codex-resources/voice/lib/libgobject-2.0.so.0
+-rwxr-xr-x        30416 codex-amd64/codex-resources/voice/lib/libgstallocators-1.0.so.0
+-rwxr-xr-x       106144 codex-amd64/codex-resources/voice/lib/libgstapp-1.0.so.0
+-rwxr-xr-x       636544 codex-amd64/codex-resources/voice/lib/libgstaudio-1.0.so.0
+-rwxr-xr-x       573072 codex-amd64/codex-resources/voice/lib/libgstbase-1.0.so.0
+-rwxr-xr-x        74192 codex-amd64/codex-resources/voice/lib/libgstnet-1.0.so.0
+-rwxr-xr-x       321880 codex-amd64/codex-resources/voice/lib/libgstpbutils-1.0.so.0
+-rwxr-xr-x      1582088 codex-amd64/codex-resources/voice/lib/libgstreamer-1.0.so.0
+-rwxr-xr-x       211744 codex-amd64/codex-resources/voice/lib/libgstrtp-1.0.so.0
+-rwxr-xr-x       273976 codex-amd64/codex-resources/voice/lib/libgsttag-1.0.so.0
+-rwxr-xr-x      1004720 codex-amd64/codex-resources/voice/lib/libgstvideo-1.0.so.0
+-rwxr-xr-x         6304 codex-amd64/codex-resources/voice/lib/libintl.so.8
+-rwxr-xr-x       565744 codex-amd64/codex-resources/voice/lib/libopus.so.0
+-rwxr-xr-x       442424 codex-amd64/codex-resources/voice/lib/libpcre2-8.so.0
+-rwxr-xr-x       109296 codex-amd64/codex-resources/voice/lib/libz.so.1
+drwxr-xr-x          144 codex-amd64/codex-resources/voice/licenses
+-rw-r--r--        26431 codex-amd64/codex-resources/voice/licenses/LGPL-2.1.txt
+-rw-r--r--         1132 codex-amd64/codex-resources/voice/licenses/libffi.txt
+-rw-r--r--         1945 codex-amd64/codex-resources/voice/licenses/Opus.txt
+-rw-r--r--         4011 codex-amd64/codex-resources/voice/licenses/PCRE2.md
+-rw-r--r--        25292 codex-amd64/codex-resources/voice/licenses/proxy-libintl.txt
+-rw-r--r--         1444 codex-amd64/codex-resources/voice/licenses/sljit.txt
+-rw-r--r--         1002 codex-amd64/codex-resources/voice/licenses/zlib.txt
+-rw-r--r--         4768 codex-amd64/codex-resources/voice/manifest.json
+-rw-r--r--         2403 codex-amd64/codex-resources/voice/NOTICE.md
+-rwxr-xr-x        13941 codex-amd64/codex-resources/voice/runtime.json
+-rw-r--r--         4911 codex-amd64/codex-resources/voice/sources.json
+-rw-r--r--          212 codex-amd64/harness.json
+drwxr-xr-x          116 codex-arm64
+drwxr-xr-x           84 codex-arm64/bin
+-rwxr-xr-x    279318936 codex-arm64/bin/codex
+-rwxr-xr-x     71821664 codex-arm64/bin/codex-code-mode-host
+-rwxr-xr-x     69904328 codex-arm64/bin/codex-exec-server
+-rw-r--r--          247 codex-arm64/codex-package.json
+drwxr-xr-x            4 codex-arm64/codex-path
+-rwxr-xr-x      4466000 codex-arm64/codex-path/rg
+drwxr-xr-x           20 codex-arm64/codex-resources
+-rwxr-xr-x       529168 codex-arm64/codex-resources/bwrap
+drwxr-xr-x          120 codex-arm64/codex-resources/voice
+drwxr-xr-x           32 codex-arm64/codex-resources/voice/bin
+-rwxr-xr-x     41926824 codex-arm64/codex-resources/voice/bin/codex-voice-host
+drwxr-xr-x          680 codex-arm64/codex-resources/voice/lib
+drwxr-xr-x          240 codex-arm64/codex-resources/voice/lib/gstreamer-1.0
+-rwxr-xr-x         7264 codex-arm64/codex-resources/voice/lib/gstreamer-1.0/libgstapp.so
+-rwxr-xr-x        43080 codex-arm64/codex-resources/voice/lib/gstreamer-1.0/libgstaudioconvert.so
+-rwxr-xr-x        36504 codex-arm64/codex-resources/voice/lib/gstreamer-1.0/libgstaudioresample.so
+-rwxr-xr-x       489792 codex-arm64/codex-resources/voice/lib/gstreamer-1.0/libgstcoreelements.so
+-rwxr-xr-x        73272 codex-arm64/codex-resources/voice/lib/gstreamer-1.0/libgstopus.so
+-rwxr-xr-x       588416 codex-arm64/codex-resources/voice/lib/gstreamer-1.0/libgstrtpmanager.so
+-rwxr-xr-x       788168 codex-arm64/codex-resources/voice/lib/gstreamer-1.0/libgstrtp.so
+-rwxr-xr-x        96992 codex-arm64/codex-resources/voice/lib/libffi.so.8
+-rwxr-xr-x      2676352 codex-arm64/codex-resources/voice/lib/libgio-2.0.so.0
+-rwxr-xr-x      1641144 codex-arm64/codex-resources/voice/lib/libglib-2.0.so.0
+-rwxr-xr-x        16624 codex-arm64/codex-resources/voice/lib/libgmodule-2.0.so.0
+-rwxr-xr-x       512048 codex-arm64/codex-resources/voice/lib/libgobject-2.0.so.0
+-rwxr-xr-x        33936 codex-arm64/codex-resources/voice/lib/libgstallocators-1.0.so.0
+-rwxr-xr-x       114824 codex-arm64/codex-resources/voice/lib/libgstapp-1.0.so.0
+-rwxr-xr-x       624776 codex-arm64/codex-resources/voice/lib/libgstaudio-1.0.so.0
+-rwxr-xr-x       593960 codex-arm64/codex-resources/voice/lib/libgstbase-1.0.so.0
+-rwxr-xr-x        79112 codex-arm64/codex-resources/voice/lib/libgstnet-1.0.so.0
+-rwxr-xr-x       356312 codex-arm64/codex-resources/voice/lib/libgstpbutils-1.0.so.0
+-rwxr-xr-x      1766008 codex-arm64/codex-resources/voice/lib/libgstreamer-1.0.so.0
+-rwxr-xr-x       232904 codex-arm64/codex-resources/voice/lib/libgstrtp-1.0.so.0
+-rwxr-xr-x       288056 codex-arm64/codex-resources/voice/lib/libgsttag-1.0.so.0
+-rwxr-xr-x      1102408 codex-arm64/codex-resources/voice/lib/libgstvideo-1.0.so.0
+-rwxr-xr-x         6888 codex-arm64/codex-resources/voice/lib/libintl.so.8
+-rwxr-xr-x       499096 codex-arm64/codex-resources/voice/lib/libopus.so.0
+-rwxr-xr-x       412576 codex-arm64/codex-resources/voice/lib/libpcre2-8.so.0
+-rwxr-xr-x       112752 codex-arm64/codex-resources/voice/lib/libz.so.1
+drwxr-xr-x          144 codex-arm64/codex-resources/voice/licenses
+-rw-r--r--        26431 codex-arm64/codex-resources/voice/licenses/LGPL-2.1.txt
+-rw-r--r--         1132 codex-arm64/codex-resources/voice/licenses/libffi.txt
+-rw-r--r--         1945 codex-arm64/codex-resources/voice/licenses/Opus.txt
+-rw-r--r--         4011 codex-arm64/codex-resources/voice/licenses/PCRE2.md
+-rw-r--r--        25292 codex-arm64/codex-resources/voice/licenses/proxy-libintl.txt
+-rw-r--r--         1444 codex-arm64/codex-resources/voice/licenses/sljit.txt
+-rw-r--r--         1002 codex-arm64/codex-resources/voice/licenses/zlib.txt
+-rw-r--r--         4770 codex-arm64/codex-resources/voice/manifest.json
+-rw-r--r--         2403 codex-arm64/codex-resources/voice/NOTICE.md
+-rwxr-xr-x        14536 codex-arm64/codex-resources/voice/runtime.json
+-rw-r--r--         4911 codex-arm64/codex-resources/voice/sources.json
+-rw-r--r--          212 codex-arm64/harness.json
+
+# ---- then, over ssh (the same clone and its built kiln) ----
+HEAD fb92cb64e45b1e5bc38540909da522694068c0cb host Linux 7.2.9-2-cachyos x86_64 adacachy 2026-11-13T00:21:30Z
+f8e2db5a05bec2ef
+$ kiln agentfiles context codex $R/ctx-arm64 --platform linux/arm64   (ROOT's R09 command)
+489e807ddbf4b9ebfac989a26ef6a6278391a517a6b7a557ba9ccb297ee2886f
+ARM64_ONLY_EXIT 0 2026-11-13T00:21:49Z
+CONTEXT Agentfile codex-arm64 
+DIR codex-arm64 dirs 8 files 44 other 0
+c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a  codex-arm64/codex-path/rg
+755 4466000 codex-arm64/codex-path/rg
+$ python3 -I step3-live-check.py (each pinned file downloaded again, laid out by Python tarfile, every file held to it)
+context: ['Agentfile', 'codex-amd64', 'codex-arm64'] -> MATCH (the Agentfile byte for byte, nothing else beside)
+linux/amd64: files 45, pinned 45, matching 45; missing [], extra [], differing [], bad [] -> MATCH
+linux/arm64: files 45, pinned 45, matching 45; missing [], extra [], differing [], bad [] -> MATCH
+PLATFORMS_MATCHING 2 of 2
+CHECK_EXIT 0 2026-11-13T00:22:01Z
+

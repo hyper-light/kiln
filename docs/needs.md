@@ -281,8 +281,11 @@ saying why it decided as it did:
   program it ran isn't there), or failed with no cause the runner knows. That last is settled by
   comparison: the kind's next run goes elsewhere once; if it goes well there the first runner was
   at fault, if it fails there too the work was, and it keeps its place. A run sent back says "its
-  kind of work last went well there, and no runner was freer". `good_places = false`: among
-  equals runs take turns.
+  kind of work last went well there, and no runner was freer". The CI engine's legs go the same
+  way (docs/lb.md "The CI engine"), their kind their job and matrix, judged by how each attempt
+  ended (succeeded; lost, its infrastructure, image, memory or disk; or failed in its steps or
+  timed out, settled by comparison), and a leg's explanation marks the runner its kind last went
+  well on. `good_places = false`: among equals runs take turns.
 
 **Big items don't starve.** With `[sched] backfill` declared (§21), the first item of each class
 that waits only for room keeps room on the runner where its room frees soonest, from the expected
@@ -770,11 +773,20 @@ device would give a new run's I/O under its load now. The load-balancing kernel 
   each, into its kind's cell on its runner: the count, sum and sum of squares of ln CPU-seconds
   (`run_speed_cells`, migration `20261108-0100`). The fit is ln wall = kind − machine + ln π, π the
   run's parallelism term (wall per CPU-second, the inverse of the CPUs it kept busy), so ln
-  CPU-seconds = kind − machine: least squares over every kind that ran on two or more machines
-  (SPEC's geometric mean on a complete design: Fleming & Wallace 1986), solved exactly from the
-  cells after each run (the machines' Laplacian system), against the fleet's geometric-mean core,
-  then shrunk toward the fleet by empirical Bayes with σ² and τ² estimated from the data (Efron &
-  Morris 1975, Morris 1983): a machine with few runs stays near the reference. A kind is known
+  CPU-seconds = kind − machine, over every kind that ran on two or more machines. A kind's work
+  can differ from machine to machine (a build cached on one compiles everything on another, a leg
+  skips steps on another platform: production's history on 2026-11-12 had one kind 4,000x apart
+  across six machines while repeats on one machine agreed within 1.8x), and no number of runs on
+  one machine averages that away, so a machine's speed is known as far as kinds that agree
+  elsewhere say it: each cell of kind and machine weighed by its kind's variance of the work that
+  differs (the typical kind's by the cells' median standardised residual, each kind at least as
+  noisy as its own cells say about that fit, in one step), solved exactly from the cells after each
+  run that changes a shared kind (the machines' weighted Laplacian system), then shrunk by empirical
+  Bayes (Efron & Morris 1975, Morris 1983) toward the fleet's centre, its median machine, with the
+  fleet's spread taken robustly as well (Paule & Mandel's moment equation with the median): a
+  machine with few runs, or measured only by kinds whose work differs, stays near the reference,
+  the centre's core. Weighing every run alike, as the fit did before, took one run of one such kind
+  as a machine 478x slower than the fleet; `kiln_ci::pace::speed` says how and why. A kind is known
   across machines by its leg key (repository, workflow, job, matrix) or, for a command, its work
   key (its text, and its synced copy's key and folder, or its folder below the home folder).
   Before a fit has a residual degree of freedom, and for a machine sharing no kind with the
