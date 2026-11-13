@@ -1179,9 +1179,17 @@ kiln ships an Agentfile for each harness it drives, `harness-<id>`. Read one on 
   the link kiln drives the harness by, never the network, so no Agentfile grants anything for it.
   A harness that takes any provider (Goose, opencode, Pi) is granted every provider its own build
   reaches at a fixed public host, with their sign-ins. Antigravity is granted every sign-in it
-  documents: your Google account, a Gemini API key, Gemini Enterprise and ADC. A run is to keep only
-  its own provider's or sign-in's hosts, dropped as kiln starts it. Not yet: until the launch does
-  that, a run of these four is granted every host its image names. A cloud platform's model service
+  documents: your Google account, a Gemini API key, Gemini Enterprise and ADC. A run of one of these
+  four keeps only the hosts of the provider or sign-in it uses, and kiln drops the rest as it starts
+  it. kiln tells which one as the harness itself does: from the run's environment, the model the
+  agent is started with, and the harness's own settings in your volume or your project (Goose's
+  `GOOSE_PROVIDER`, opencode's `model`, Pi's `defaultProvider`, Antigravity's sign-in). Whatever it
+  uses, opencode keeps its model catalog and the GitHub hosts it fetches ripgrep from, and Pi keeps
+  `pi.dev`; Goose keeps TypeSafe's host where its auto effort is on. Where kiln can't tell what a run
+  uses (kiln keeps no volume of yours on that machine, a settings file can't be read, the provider or
+  sign-in named is one the image names no hosts for, or nothing says), the run keeps every host its
+  image names, each by name, and the agent says so and why, in its conversation and in its state
+  (`runs.reach`). No run is given a host its image doesn't grant. A cloud platform's model service
   (Bedrock, Vertex AI, Azure), a self-hosted or local server, and a provider whose address you give
   it are none of those: copy kiln's Agentfile into one of yours and add your provider's
   `--egress=HOST:PORT`. Each Agentfile's comments say what each host is for. Each harness's record
@@ -1219,7 +1227,9 @@ kiln's user alone), and reads your sessions there to show and resume them. They 
 kiln's upgrades: a runner started as a new instance keeps them in the same place, and moves there
 any that an older kiln's instance kept in its own folder (`<kiln's state>/instances/<id>/homes/`) as
 it starts, leaving one where it is, and logging why, where kiln already keeps yours for that harness
-or the move fails.
+or the move fails. Beside each harness's volume, never in it, kiln keeps which Agentfile and image
+each of your conversations ran in, and the machine's past sessions name that Agentfile with the
+conversation (`GET /api/harness/history`'s `isolation.image`), for a start that continues it.
 
 Its base is `buildpack-deps:trixie-scm`, pinned by digest: git, an ssh client, curl and CA
 certificates, for both platforms. For your project's own toolchain, copy kiln's Agentfile into one of
@@ -1232,17 +1242,40 @@ to `s28-pi-agentfile`).
 
 - **None in an image.** kiln's Agentfiles carry no credential, and neither should yours: whoever can
   read an image can read what's in it. A key or a token belongs to a run, given to its harness alone.
+- **None inside the microVM.** A run's credential is granted by name, never by value. What its
+  harness holds is a placeholder: a marked random string that stands for that credential in that
+  run, and is worth nothing anywhere else.
+- **Filled in on the way out, for its own hosts alone.** Outside the microVM, its egress ends the TLS
+  of a request to a host the credential is granted to, and puts the real value where the placeholder
+  stands in its `Authorization: Bearer` or `x-api-key` header. A request to any other host leaves as
+  it came, placeholder and all, and one whose host isn't the name its TLS asked for is refused. To
+  allow this, the harness trusts a certificate authority made for its run alone, good only for the
+  granted hosts, and nothing else of the microVM's trust changes. A value a server echoes back is
+  masked before the reply reaches the harness.
+- **Leased as it's needed, given back as the run ends.** The value is fetched from kiln's secret store
+  the first time a request needs it, held outside the microVM while its lease lasts, and every lease
+  is given back as the run ends, however it ends. kiln keeps a ledger of them, so not even a restart
+  of kiln leaves one live past its run's end.
+- **Signing in.** The harness's own sign-in will run inside its microVM, on its own terminal. For
+  Claude Code and Codex, the tokens their providers send back are taken out on the way in: kiln is to
+  keep them, the harness gets placeholders, and its refreshes and sign-outs are answered outside, so a
+  refresh never brings a new token in, and signing out inside ends nothing outside. Codex keeps what
+  it reads of its ID token (your email, plan and account), never its signature. A request that would
+  make an API key from a taken token is refused.
 - **Yours stay in your volume.** What a harness keeps of its sign-in it keeps in your volume, which
-  no other person's agent is given.
-- **Signing in.** The harness's own sign-in, as the account card runs it on a machine today
-  ("Signing harnesses in and out"), will run inside its microVM, on its own terminal. Not yet: kiln
-  has no terminal into a microVM yet.
-- **Where credentials are going.** No real value inside the microVM at all: kiln keeps it (in its
-  secret store, Veil's later), the harness holds a placeholder, and the microVM's own egress puts the
-  real value in only for the hosts that credential is granted to, never for any other. You sign in
-  once, the token's refresh happens outside the microVM, and a run's credentials are revoked as it
-  ends. A harness that pins its certificates, or checks its token itself, gets its value in a file
-  on the microVM's scratch instead, revoked as the run ends, each such case listed. Not yet built.
+  no other person's agent is given. Once its tokens are taken outside, what it keeps there are
+  placeholders.
+- **Not yet.** A request over HTTP/2 isn't filled in: the egress speaks HTTP/1.1 to the harness. A
+  sign-in isn't wired end to end: its tokens don't yet reach kiln's store, and kiln has no terminal
+  into a microVM yet. kiln doesn't yet start a harness through Hex (above), whose part of this isn't
+  on its main yet. And none of this has run in a real microVM yet: the check that no value is
+  anywhere in a run's memory, disk or environment is built, its runs still to come.
+- **When a value has to be inside.** Every harness kiln ships reads its trust from where its run's
+  certificate authority is laid, and none pins its provider's certificates, as its own build shows,
+  so none should need its value inside. Claude Code signed in
+  through an LLM gateway or XAA, and Bedrock credentials from `aws login`, can't be served this way:
+  for them a value in a file on the microVM's scratch, revoked as the run ends, is the last resort,
+  and it isn't built.
 
 ### What an isolated agent can't do
 
@@ -1293,7 +1326,7 @@ What this page describes, once an isolated agent's start goes through:
 | Driving it: sending, steering, interrupting, stopping, models, modes, commands, questions, state, usage limits | Works: kiln speaks the same harness protocol over the microVM's stdio. |
 | Said at once when it can't sign in or reach its provider (State's `trouble`) | Works, as for every agent. |
 | The Changes tab, Commits, Compare, whose a file is, a subagent's edits, change requests | Works: the project is at its own path inside, so kiln reads its diffs, HEAD and checkpoints where it always does. |
-| Continuing a past session | Works: kiln reads its transcript from your volume on the machine. |
+| Continuing a past session | Works: kiln reads its transcript from your volume on the machine, and the machine's past sessions name the Agentfile it ran in. |
 | Its harness's settings, sign-in and memories | Kept in your volume, yours alone; no credential leaves it. |
 | Agents that run agents, and kiln's other tools | Not yet: through kiln's MCP, which comes over the link kiln drives the harness by (its own MCP lane, through the bridge `/run/shards/mcp` each harness names), never the network, on every OS, answered by the runner in its own process; what it starts is isolated too. The launch handing the lane's connections to the runner is still to come. Pi takes no MCP server from kiln. |
 | Skills kiln installs, and kiln's own | Its plugin folders are plugged in read-only at their own paths as it starts. |
