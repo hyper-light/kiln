@@ -406,7 +406,11 @@ const UNLISTED_ROWS: usize = 5;
 /// A round passed the quantum where a poll did in its fill or its window, as the server counted them
 /// (`Held::past_polls`, `Held::past_cpu_polls`); with a build from before it counted, where the longest since the server
 /// started did, which takes in what the server did before the fill (its runners connecting: their first messages' polls
-/// stood for every round, goal 9's step 3).
+/// stood for every round, goal 9's step 3). Where the build says its threads' own time (`Held::counts_own`: Linux), a round
+/// passed it by its own time where a poll ran past it on the CPU and its own time wasn't found within it
+/// (`Held::past_cpu_interrupts_polls`): past it by its own, or with none read. The task clock counts the interrupts and
+/// softirqs the thread's CPU served while it ran, the host's (step 4's), which held socket writes to 820 µs with 24 µs of
+/// their own in probe 22.
 fn listed_markdown(rounds: &[&Round]) -> String {
     /// A path's longest poll, its site and label, the rounds past the quantum, its window's polls past 100 µs a
     /// second (all rounds' added), and their time and the host's.
@@ -425,6 +429,13 @@ fn listed_markdown(rounds: &[&Round]) -> String {
         cpu_seen: bool,
         longest_cpu_ms: f64,
         past_cpu: usize,
+        /// Where the build's shards said their threads' own time: the longest, the rounds that passed the quantum by it
+        /// (or on the CPU with none read), and the time on the CPU and the own time of the polls that said it.
+        own_seen: bool,
+        longest_own_ms: f64,
+        past_own: usize,
+        own_cpu_ms: f64,
+        own_ms: f64,
     }
     let mut o = String::new();
     // A build without the series has nothing to check.
@@ -443,16 +454,18 @@ fn listed_markdown(rounds: &[&Round]) -> String {
     let mut probe_most_ms = 0.0_f64;
     for r in rounds {
         let mut longest_here = vec![0.0_f64; LISTED.len()];
-        let (mut past_here, mut past_cpu_here) = (vec![false; LISTED.len()], vec![false; LISTED.len()]);
+        let (mut past_here, mut past_cpu_here, mut past_own_here) = (vec![false; LISTED.len()], vec![false; LISTED.len()], vec![false; LISTED.len()]);
         let probe_ms = r.held.iter().chain(r.fill_held.iter()).filter(|h| is_probe(&h.site)).map(|h| h.longest_ms).fold(0.0_f64, f64::max);
         probe_most_ms = probe_most_ms.max(probe_ms);
         for (in_window, h) in r.held.iter().map(|h| (true, h)).chain(r.fill_held.iter().map(|h| (false, h))) {
-            // Whether a poll passed the quantum in this phase, by its hold and on the CPU.
+            // Whether a poll passed the quantum in this phase, by its hold and on the CPU; and by its own time, where the build
+            // says it, a poll on the CPU past it that its own time wasn't found within (else as on the CPU).
             let (past, past_cpu) = match quantum_ms {
                 Some(_) if h.counts_past => (h.past_polls > 0.0, h.past_cpu_polls > 0.0),
                 Some(q) => (h.longest_ms > q, h.cpu_polls > 0.0 && h.longest_cpu_ms > q),
                 None => (false, false),
             };
+            let past_own = if h.counts_own && h.counts_past { h.past_cpu_polls - h.past_cpu_interrupts_polls > 0.0 } else { past_cpu };
             let Some(i) = listed(&h.site, &h.label, &net, &http) else {
                 if past {
                     let most = unlisted.entry((h.site.clone(), h.label.clone())).or_default();
@@ -460,9 +473,10 @@ fn listed_markdown(rounds: &[&Round]) -> String {
                 }
                 continue;
             };
-            if let (Some(p), Some(c)) = (past_here.get_mut(i), past_cpu_here.get_mut(i)) {
+            if let (Some(p), Some(c), Some(w)) = (past_here.get_mut(i), past_cpu_here.get_mut(i), past_own_here.get_mut(i)) {
                 *p |= past;
                 *c |= past_cpu;
+                *w |= past_own;
             }
             let Some(p) = paths.get_mut(i) else { continue };
             p.seen = true;
@@ -482,8 +496,14 @@ fn listed_markdown(rounds: &[&Round]) -> String {
                 p.cpu_seen = true;
                 p.longest_cpu_ms = p.longest_cpu_ms.max(h.longest_cpu_ms);
             }
+            if h.counts_own {
+                p.own_seen = true;
+                p.longest_own_ms = p.longest_own_ms.max(h.longest_own_ms);
+                p.own_cpu_ms += h.own_cpu_ms;
+                p.own_ms += h.own_ms;
+            }
         }
-        for (((p, most), past), past_cpu) in paths.iter_mut().zip(&longest_here).zip(&past_here).zip(&past_cpu_here) {
+        for ((((p, most), past), past_cpu), past_own) in paths.iter_mut().zip(&longest_here).zip(&past_here).zip(&past_cpu_here).zip(&past_own_here) {
             if *past {
                 p.past += 1;
                 if *most > probe_ms {
@@ -492,6 +512,9 @@ fn listed_markdown(rounds: &[&Round]) -> String {
             }
             if *past_cpu {
                 p.past_cpu += 1;
+            }
+            if *past_own {
+                p.past_own += 1;
             }
         }
     }
@@ -509,9 +532,17 @@ fn listed_markdown(rounds: &[&Round]) -> String {
             } else {
                 String::new()
             };
+            // By their threads' own time (Linux), the interrupts and softirqs their CPUs served left out too: step 3's own.
+            let by_own = if paths.iter().any(|p| p.own_seen) {
+                let past_own = paths.iter().filter(|p| p.past_own > 0).count();
+                let v = if past_own == 0 { "**met**".to_owned() } else { format!("**not met**, {past_own} of {} ran past it", LISTED.len()) };
+                format!(" By their threads' own time (the interrupts and softirqs their CPUs served left out, the host's): {v}.")
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 o,
-                "\nStep 3's check (goal 9, plan 01a1a87b2cec): no poll past the quantum ({q:.3} ms) from the paths step 2 listed: {verdict}. Past it and past the shards' probes' longest poll too ({probe_most_ms:.3} ms; a probe's own work is tens of microseconds, so that much was the host's), {beyond} of {}.{on_cpu}\n",
+                "\nStep 3's check (goal 9, plan 01a1a87b2cec): no poll past the quantum ({q:.3} ms) from the paths step 2 listed: {verdict}. Past it and past the shards' probes' longest poll too ({probe_most_ms:.3} ms; a probe's own work is tens of microseconds, so that much was the host's), {beyond} of {}.{on_cpu}{by_own}\n",
                 LISTED.len()
             );
         }
@@ -519,20 +550,22 @@ fn listed_markdown(rounds: &[&Round]) -> String {
             let _ = writeln!(o, "\nStep 3's check (goal 9, plan 01a1a87b2cec): these rounds don't say the quantum their shards ran with (a build from before `kiln_shard_quantum_seconds`): `kiln-lab report --quantum-us <µs>` holds them to one.\n");
         }
     }
-    let _ = writeln!(o, "Each path step 2 listed, its longest poll in {n} rounds (the window's and the fill's) and where, the rounds it passed the quantum in, its polls past 100 µs a second in the window (the mean of the rounds), the host's share of their time, and the longest of its polls on the CPU with the rounds that passed the quantum so:\n");
-    let _ = writeln!(o, "| listed path | whose | longest ms | where | rounds past the quantum (and the probe's longest) | polls past 100 µs a second | host's share | longest on the CPU ms | rounds past on the CPU |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+    let _ = writeln!(o, "Each path step 2 listed, its longest poll in {n} rounds (the window's and the fill's) and where, the rounds it passed the quantum in, its polls past 100 µs a second in the window (the mean of the rounds), the host's share of their time, the longest of its polls on the CPU with the rounds that passed the quantum so, and the longest of their threads' own time with the rounds that passed it so and the share of their time on the CPU the interrupts their CPUs served took:\n");
+    let _ = writeln!(o, "| listed path | whose | longest ms | where | rounds past the quantum (and the probe's longest) | polls past 100 µs a second | host's share | longest on the CPU ms | rounds past on the CPU | longest own ms | rounds past by its own | interrupts' share |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
     #[allow(clippy::cast_precision_loss)]
     let rounds_f = n as f64;
     for ((name, whose), p) in LISTED.iter().zip(&paths) {
         let past = quantum_ms.map_or_else(|| "-".to_owned(), |_| format!("{} of {n} ({})", p.past, p.past_probe));
         let (cpu, past_cpu) = if p.cpu_seen { (format!("{:.3}", p.longest_cpu_ms), quantum_ms.map_or_else(|| "-".to_owned(), |_| format!("{} of {n}", p.past_cpu))) } else { ("-".to_owned(), "-".to_owned()) };
+        let (own, past_own) = if p.own_seen { (format!("{:.3}", p.longest_own_ms), quantum_ms.map_or_else(|| "-".to_owned(), |_| format!("{} of {n}", p.past_own))) } else { ("-".to_owned(), "-".to_owned()) };
+        let interrupts = if p.own_cpu_ms > 0.0 { fmt((p.own_cpu_ms - p.own_ms).max(0.0) / p.own_cpu_ms) } else { "-".to_owned() };
         if !p.seen {
-            let _ = writeln!(o, "| {name} | {whose} | - | none past 100 µs | {past} | 0 | - | - | - |");
+            let _ = writeln!(o, "| {name} | {whose} | - | none past 100 µs | {past} | 0 | - | - | - | - | - | - |");
             continue;
         }
         let at = if p.at.1.is_empty() { format!("`{}`", p.at.0) } else { format!("`{}` {}", p.at.0, p.at.1) };
         let host = if p.ms > 0.0 { fmt(p.host_ms / p.ms) } else { "-".to_owned() };
-        let _ = writeln!(o, "| {name} | {whose} | {:.3} | {at} | {past} | {} | {host} | {cpu} | {past_cpu} |", p.longest_ms, fmt(p.polls_s / rounds_f));
+        let _ = writeln!(o, "| {name} | {whose} | {:.3} | {at} | {past} | {} | {host} | {cpu} | {past_cpu} | {own} | {past_own} | {interrupts} |", p.longest_ms, fmt(p.polls_s / rounds_f));
     }
     if !unlisted.is_empty() {
         let mut rows: Vec<((String, String), f64)> = unlisted.into_iter().collect();
@@ -706,8 +739,8 @@ mod tests {
         assert!(md.contains("listed: **not met**, 2 of 11 past it."), "{md}");
         assert!(md.contains("On the CPU, by the shards' own clocks (kiln's code alone, the host's time left out): **not met**, 1 of 11 ran past it."), "{md}");
         let row = |name: &str| md.lines().find(|l| l.starts_with(&format!("| {name} |"))).unwrap_or_default().to_owned();
-        assert!(row("the hub's net loop (its labels `runner …`)").ends_with("| 0.200 | 0 of 1 |"), "{md}");
-        assert!(row("sessions' owners (`harness/copies.rs`)").ends_with("| 0.400 | 1 of 1 |"), "{md}");
+        assert!(row("the hub's net loop (its labels `runner …`)").ends_with("| 0.200 | 0 of 1 | - | - | - |"), "{md}");
+        assert!(row("sessions' owners (`harness/copies.rs`)").ends_with("| 0.400 | 1 of 1 | - | - | - |"), "{md}");
         let held_md = held_markdown([&r].into_iter(), "the window", |r| &r.held);
         assert!(held_md.contains("Of those holds, 25% on the CPU (kiln's code ran) and 75% off it"), "{held_md}");
         assert!(held_md.contains("| 25% | 0.200 |"), "{held_md}");
@@ -728,9 +761,46 @@ mod tests {
         assert!(md.contains("On the CPU, by the shards' own clocks (kiln's code alone, the host's time left out): **not met**, 1 of 11 ran past it."), "{md}");
         let row = |name: &str| md.lines().find(|l| l.starts_with(&format!("| {name} |"))).unwrap_or_default().to_owned();
         assert!(row("the hub's net loop (its labels `runner …`)").contains("| 0.900 | `crates/kiln/src/server.rs:170:9` runner AgentMsg::Offers { .. } | 0 of 1 (0) |"), "{md}");
-        assert!(row("the hub's net loop (its labels `runner …`)").ends_with("| 0.900 | 0 of 1 |"), "{md}");
-        assert!(row("sessions' owners (`harness/copies.rs`)").ends_with("| 0.400 | 1 of 1 |"), "{md}");
+        assert!(row("the hub's net loop (its labels `runner …`)").ends_with("| 0.900 | 0 of 1 | - | - | - |"), "{md}");
+        assert!(row("sessions' owners (`harness/copies.rs`)").ends_with("| 0.400 | 1 of 1 | - | - | - |"), "{md}");
         let calm = round(vec![counted(net, "runner AgentMsg::Offers { .. }", 0.9, 0.0, 0.0)], vec![], Some(266.666));
         assert!(listed_markdown(&[&calm]).contains("from the paths step 2 listed: **met**."), "none past it in the round");
+        assert!(!md.contains("By their threads' own time"), "a build whose shards don't say their own time: no verdict on it");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: where the shards say their threads' own time, the check holds each path to the
+    /// quantum by it too: a round passed it where a poll ran past it on the CPU and its own time wasn't found within it (past
+    /// it by its own, or none read: a site's first poll past the quantum), not where the interrupts its CPU served took it
+    /// past; and each path says its longest own time and the interrupts' share of its time on the CPU. Probe 22: socket
+    /// writes of 230 to 820 µs on the task clock had 8 to 24 µs of their own.
+    #[test]
+    fn g9_s3_the_check_holds_each_paths_own_time_to_the_quantum() {
+        let http = "crates/kiln/src/server.rs:513:29";
+        let owned = |site: &str, label: &str, longest_cpu_ms: f64, own: (f64, f64, f64), past: (f64, f64, f64)| {
+            let (own_cpu_ms, own_ms, longest_own_ms) = own;
+            let (past_cpu_polls, past_own_polls, past_cpu_interrupts_polls) = past;
+            Held { cpu_polls: 4.0, cpu_held_ms: 2.0, cpu_ms: 1.5, longest_cpu_ms, past_polls: past_cpu_polls, past_cpu_polls, counts_past: true, own_polls: 4.0, own_cpu_ms, own_ms, longest_own_ms, past_own_polls, past_cpu_interrupts_polls, counts_own: true, ..held(site, label, longest_cpu_ms) }
+        };
+        let r = round(
+            vec![
+                // Two polls past the quantum on the CPU, both by the interrupts their CPU served: none by their own time.
+                owned(http, "read /api/harness/sessions", 0.84, (2.0, 0.5, 0.12), (2.0, 0.0, 2.0)),
+                // One past it by its own time.
+                owned("crates/kiln/src/harness/copies.rs:1480:13", "owner Update::Events { .. }", 0.7, (1.0, 0.8, 0.64), (1.0, 1.0, 0.0)),
+                // One past it on the CPU with none of its own read (its site's first): past it, as far as anyone can say.
+                owned(http, "write /api/mcp", 0.5, (0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+            ],
+            vec![],
+            Some(266.666),
+        );
+        let md = listed_markdown(&[&r]);
+        assert!(md.contains("On the CPU, by the shards' own clocks (kiln's code alone, the host's time left out): **not met**, 3 of 11 ran past it."), "{md}");
+        assert!(md.contains("By their threads' own time (the interrupts and softirqs their CPUs served left out, the host's): **not met**, 2 of 11 ran past it."), "{md}");
+        let row = |name: &str| md.lines().find(|l| l.starts_with(&format!("| {name} |"))).unwrap_or_default().to_owned();
+        assert!(row("read /api/harness/sessions").ends_with("| 0.840 | 1 of 1 | 0.120 | 0 of 1 | 0.750 |"), "{md}");
+        assert!(row("sessions' owners (`harness/copies.rs`)").ends_with("| 0.700 | 1 of 1 | 0.640 | 1 of 1 | 0.200 |"), "{md}");
+        assert!(row("write /api/mcp").ends_with("| 0.500 | 1 of 1 | 0.000 | 1 of 1 | - |"), "{md}");
+        let interrupts_alone = round(vec![owned(http, "read /api/harness/sessions", 0.84, (2.0, 0.5, 0.12), (2.0, 0.0, 2.0))], vec![], Some(266.666));
+        assert!(listed_markdown(&[&interrupts_alone]).contains("left out, the host's): **met**."), "the interrupts' alone");
     }
 }
