@@ -1286,7 +1286,9 @@ async fn preparation_failed(s: &Session, failure: PreparationFailure) {
 
 enum Ctl {
     Cmd(Box<Command>),
-    /// Owned Reach state changed; publish through this driver, never a stale parallel snapshot.
+    /// Owned Reach state or its input's admission changed; publish through this driver, never a
+    /// stale parallel snapshot. A running harness takes it as [`Ctl::Room`] too: what its input
+    /// held may go now.
     OwnedChanged,
     /// A persisted legacy promotion changed; its body work stays on this owner.
     Promotion,
@@ -4910,9 +4912,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         }
                         }
                         },
-                        // There may be room on its machine now: the skill runs that waited for it
-                        // go, then its queue, if it may go to work now.
-                        Ev::Ctl(Some(Ctl::Room)) => {
+                        // There may be room on its machine now, or its input may take writes again
+                        // (`Session::input_changed`: its journal read back, its fence lifted, its
+                        // promotion done), each of which `Core::has_room` holds work for: the skill
+                        // runs that waited go, then its queue, if it may go to work now (kiln plan
+                        // 01a1cd8e862e7169a074db3d5fa33f3d step 35: a resumed agent's opening prompt,
+                        // held while its input restored, stayed queued).
+                        Ev::Ctl(Some(Ctl::Room | Ctl::OwnedChanged)) => {
                             let mut core = s.core.lock();
                             if !for_room.is_empty() && core.has_room() {
                                 for c in for_room.drain(..) {
@@ -4921,7 +4927,6 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             }
                             adapter.room(&mut core);
                         }
-                        Ev::Ctl(Some(Ctl::OwnedChanged)) => {},
                         Ev::Ctl(Some(Ctl::Promotion)) => progress_promotion(&s, &files).await,
                         Ev::InputBudget => { if publish_input_budget(&s) && promotion_pending(&s) { progress_promotion(&s, &files).await; } },
                         Ev::PromotionJournal => progress_promotion(&s, &files).await,
@@ -6242,6 +6247,105 @@ for line in sys.stdin:
                     .filter(|item| item.get("type").and_then(Value::as_str) == Some("text") && item.get("text").and_then(Value::as_str) == Some("original task")).count();
                 anyhow::ensure!(originals == 1, "{failure}: the original task reached the app-server {originals} times");
             }
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35 (ROOT's runs at eeebb5cbd: Cursor's,
+    /// Gemini's and Goose's resumed sessions idle, each one's opening prompt "queued" for good): a
+    /// session's input takes no writes until its host has read its journal back
+    /// (`Host::replay_session_mail`), so an ACP agent that loads its session sooner has its opening
+    /// prompt held in kiln's queue (`Core::has_room`). Once the journal is read and its host says
+    /// so (`Session::mail_flow`), the prompt goes, though nothing else comes to the session.
+    #[cfg(unix)]
+    #[test]
+    fn s35_a_prompt_held_while_its_input_restores_goes_once_its_input_takes_writes() -> anyhow::Result<()> {
+        use super::super::{admission::{FlowEvent, Input, PhysicalBudget}, inbox::{Inbox, Limits as InboxLimits}, model::Delivery};
+        use serde_json::Value;
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let program = dir.path().join("acp.py");
+            let prompts = dir.path().join("prompts.jsonl");
+            // An ACP agent that loads its sessions, and notes each prompt it's given.
+            std::fs::write(&program, r##"#!/usr/bin/env python3
+import json, os, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
+    elif method == "session/prompt":
+        with open(os.environ["ACP_PROMPTS"], "a") as log:
+            log.write(json.dumps(request["params"]) + "\n")
+        result = {"stopReason": "end_turn"}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"##)?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+            let records = crate::records::open(&dir.path().join("records.db"))?;
+            let input = Input::new(0, PhysicalBudget::new(super::super::state_view::FRAME), Arc::new(Inbox::new(records, InboxLimits::default())));
+            // As its host opens it (`Host::open_seeded`): its input restores until its journal is read.
+            input.controller.lock().restoring().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let (sink, updates) = async_channel::unbounded();
+            let files = Files {
+                host: None,
+                dir: dir.path().to_owned(), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}),
+                carried: Arc::new(|_| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                settle: Arc::new(|_, _, _| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}),
+            };
+            let id = crate::util::new_id();
+            let opening = crate::util::derive_id(&["first-prompt", &id]);
+            let s = start_seeded_input(id, Spec {
+                kind: "gemini".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()),
+                prompt: Some("take it up again".into()), resume: Some("native-session".into()), reach: Some("off".into()),
+                env: vec![("ACP_PROMPTS".into(), prompts.to_string_lossy().into_owned())],
+                ..Spec::default()
+            }, sink, Arc::new(|| {}), files, None, Some(input.clone()))?;
+            let result = async {
+                // Its agent loaded its session: idle, its opening prompt held while its input restores.
+                loop {
+                    if let (_, Update::State { state }) = updates.recv().await? && state.status == Status::Idle {
+                        anyhow::ensure!(state.delivery.get(&opening) == Some(&Delivery::Queued) && state.queue.iter().any(|q| q.id == opening), "the opening prompt went while its input restored: {:?}", state.delivery.get(&opening));
+                        break;
+                    }
+                }
+                // Its journal read: its input takes writes, and its host says so.
+                let capacity = {
+                    let mut controller = input.controller.lock();
+                    controller.restore_complete().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    controller.capacity()
+                };
+                s.mail_flow(FlowEvent::Capacity { capacity });
+                // Nothing else comes to it: a snapshot, asked after that word, is answered once the
+                // session has taken the word.
+                anyhow::ensure!(s.command(Command::Snapshot), "the session took no command");
+                let mut delivery = None;
+                loop {
+                    match updates.recv().await? {
+                        (_, Update::State { state }) => delivery = state.delivery.get(&opening).copied(),
+                        (_, Update::Open { .. }) => break,
+                        _ => {}
+                    }
+                }
+                anyhow::ensure!(matches!(delivery, Some(Delivery::Started | Delivery::Completed)), "its input takes writes, yet its opening prompt stayed {delivery:?}");
+                // Its agent answers it.
+                loop {
+                    if let (_, Update::State { state }) = updates.recv().await? && state.delivery.get(&opening) == Some(&Delivery::Completed) {
+                        break;
+                    }
+                }
+                anyhow::Ok(())
+            }.await;
+            s.close();
+            while !matches!(updates.recv().await?, (_, Update::Closed)) {}
+            result?;
+            let given: Vec<Value> = std::fs::read_to_string(&prompts)?.lines().map(serde_json::from_str).collect::<Result<_, _>>()?;
+            let words: Vec<&str> = given.iter().filter_map(|p| p.pointer("/prompt/0/text").and_then(Value::as_str)).collect();
+            anyhow::ensure!(given.len() == 1 && words == ["take it up again"], "its agent was given {given:?}");
             anyhow::Ok(())
         })
     }
