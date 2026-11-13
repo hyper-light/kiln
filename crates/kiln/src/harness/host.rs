@@ -1338,6 +1338,17 @@ impl Host {
         self.sessions.lock().get(id).cloned()
     }
 
+    /// Whether this runner refuses run `req` before anything of it starts (kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 32): one an agent session here held in a microVM of its own
+    /// asks for, as its client's process tells it or as the run names its agent (`KILN_REACH_AGENT`,
+    /// either enough), runs in a microVM or not at all, never on a bare host, and no runner runs kiln's
+    /// commands in a microVM yet. Unix alone, as its one caller is (`crate::reach::owned::run`).
+    #[cfg(unix)]
+    pub(crate) fn refuses_run(&self, req: &crate::reach::local::RunReq) -> Option<crate::reach::local::Refused> {
+        let isolated = |s: &str| self.get(s).is_some_and(|s| s.spec.lock().isolation.is_some());
+        req.asker.clone().into_iter().chain(crate::reach::keeper::agent_of(&req.env)).find(|s| isolated(s)).map(|session| crate::reach::local::Refused::Isolated { session })
+    }
+
     /// Register under the same admission fence Archive holds, and sync ownership before launch.
     #[cfg(any(unix, test))]
     pub(crate) async fn begin_owned_reach(&self,agent:&str,req:&crate::reach::local::RunReq)->Result<(Arc<crate::reach::owned::Run>,crate::rt::Shutdown),String>{
@@ -1425,15 +1436,24 @@ impl Host {
         // Held in a microVM of its own or not at all (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
         // steps 17 and 32): a machine whose kiln carries no microVM runtime refuses an isolated
         // agent, never running it as a process.
-        if spec.isolation.is_some() && self.microvm().is_none() {
-            anyhow::bail!("{}", crate::sandbox::NO_MICROVM);
+        if spec.isolation.is_some() {
+            if self.microvm().is_none() {
+                anyhow::bail!("{}", crate::sandbox::NO_MICROVM);
+            }
+            // And only as kiln's balancer placed it: under the claim that holds its microVM's room here from its start to
+            // its end, its measured use charged to it (step 32). One that came without one went round the balancer.
+            if spec.claim.is_none() {
+                anyhow::bail!("an isolated agent starts only under the claim kiln's balancer placed it with, which holds its microVM's room here, and none came with it (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32)");
+            }
         }
         let spec = self.like_its_parent(spec);
         let claim = spec.claim.clone();
         let s = self.open_seeded(id, spec, None, None, Vec::new(), false, true)?;
-        // Placed here by a runner's owner: its room is held while it runs (AUDIT M4).
+        // Placed here by a runner's owner: its room is held while it runs, what it uses read from its
+        // own group (AUDIT M4). An isolated one's microVM is charged from its group as its launch names
+        // it (`crate::reach::place::vm_group`, steps 17 and 32).
         if let Some(c) = claim {
-            hold_claim(c, s.id.clone());
+            hold_claim(c, crate::reach::place::Group::Session(s.id.clone()));
         }
         Ok(s)
     }
@@ -3831,11 +3851,11 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
 pub(crate) use tests::stand_in;
 
 /// An agent session placed here under `c` started: this runner's placement holds its room
-/// (AUDIT M4), off the caller's thread.
-fn hold_claim(c: crate::reach::place::Claim, session: String) {
+/// (AUDIT M4), what it uses read from group `at`, off the caller's thread.
+fn hold_claim(c: crate::reach::place::Claim, at: crate::reach::place::Group) {
     let Some(reach) = crate::reach::node::global() else { return };
     crate::rt::spawn(async move {
-        if !reach.session_started(c.clone(), Some(session)).await.unwrap_or(false) {
+        if !reach.session_started(c.clone(), Some(at)).await.unwrap_or(false) {
             tracing::info!(run = %c.run, owner = %c.owner, "an agent session's claim here wasn't live: it runs, and its room isn't held");
         }
     });
@@ -3962,6 +3982,35 @@ mod tests {
     /// comes (a write that failed): 30 s, which no passing run comes near.
     async fn until(host: &Host, holds: impl Fn(&Host) -> bool) -> anyhow::Result<()> {
         crate::rt::timeout(Duration::from_secs(30), host.until(holds)).await.map_err(|_| anyhow::anyhow!("what the test waited for didn't come in 30 s"))
+    }
+
+    /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32: an isolated agent starts here only under
+    /// the claim kiln's balancer placed it with, which holds its microVM's room here for its life.
+    /// Where no microVM holds it, it's refused even under its claim (step 17's `NO_MICROVM`); on a
+    /// machine whose kiln holds microVMs (the simulator's here), one that came without its claim is
+    /// refused too, before anything starts: never as a process.
+    #[test]
+    fn step32_an_isolated_agent_starts_only_under_its_balancers_claim_never_as_a_process() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (sink, _updates) = async_channel::unbounded::<(String, super::super::core::Update)>();
+            let host = Host::new(sink, None, Limits::default());
+            let spec = Spec { isolation: Some(super::super::session::Isolation::microvm()), ..no_harness(dir.path()) };
+            let why = host.open(None, Spec { claim: Some(balancers_claim()), ..spec.clone() }).err().map(|e| format!("{e:#}")).unwrap_or_default();
+            anyhow::ensure!(why == crate::sandbox::NO_MICROVM, "under its claim, with no microVM to hold it: {why}");
+            let (images, _) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
+            host.hold_isolated_in(crate::sandbox::Microvms { sandbox: Arc::new(kiln_seams::sandbox::SimSandbox::new()), images });
+            let why = host.open(None, spec).err().map(|e| format!("{e:#}")).unwrap_or_default();
+            anyhow::ensure!(why.contains("kiln's balancer"), "no claim: {why}");
+            anyhow::ensure!(host.inventory().sessions.is_empty(), "nothing started");
+            Ok(())
+        })
+    }
+
+    /// The claim kiln's balancer places an isolated agent here under (kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 32), which a test's start of one comes with.
+    fn balancers_claim() -> crate::reach::place::Claim {
+        crate::reach::place::Claim { owner: "mac".into(), epoch: 1, run: "session-1".into(), fence: kiln_ci::sched::Fence::default() }
     }
 
     fn no_harness(dir: &std::path::Path) -> Spec {
@@ -5011,8 +5060,9 @@ while True:
         Ok(crate::sandbox::image::Source::Builtin(claude))
     }
 
-    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17: an isolated agent's harness runs as its
-    /// image's member in a microVM of its own (here the machine's microVMs' stand-in,
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17: an isolated agent, started under the claim
+    /// kiln's balancer placed it with (step 32), runs its harness as its image's member in a microVM
+    /// of its own (here the machine's microVMs' stand-in,
     /// `crate::sandbox::fake`), no process of the machine's, and its session drives it as on the
     /// host through the same adapter: it starts, takes a message and answers, is interrupted (the
     /// adapter's control request reaches the member), is stopped by force and starts again on the
@@ -5037,7 +5087,7 @@ while True:
             let vms = Arc::new(crate::sandbox::fake::FakeVms::with(&pinned, "claude", &program).linked(link.clone()));
             host.hold_isolated_in(crate::sandbox::Microvms { sandbox: Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images });
             let cwd = dir.path().to_string_lossy().into_owned();
-            let spec = Spec { kind: "claude".into(), cwd: Some(cwd.clone()), isolation: Some(session::Isolation::microvm()), ..Spec::default() };
+            let spec = Spec { kind: "claude".into(), cwd: Some(cwd.clone()), isolation: Some(session::Isolation::microvm()), claim: Some(balancers_claim()), ..Spec::default() };
             let s = host.open(Some("isolated".into()), spec)?;
             let heard_lines = || std::fs::read_to_string(&heard).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).collect::<Vec<_>>();
             let idle = || s.core.lock().state.status == Status::Idle && !s.core.lock().meta.features.is_empty();
@@ -5109,14 +5159,15 @@ while True:
 
     /// Step 17: a machine whose kiln holds no microVMs refuses an isolated agent before anything
     /// starts, saying so, and never runs it as a process; given microVMs that refuse its launch,
-    /// it opens, and its start fails in their words, nothing of it running anywhere.
+    /// it opens (under the claim kiln's balancer placed it with, step 32), and its start fails in
+    /// their words, nothing of it running anywhere.
     #[test]
     fn s17_an_isolated_agent_is_refused_where_no_microvm_holds_it() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let dir = tempfile::tempdir()?;
             let (tx, _rx) = async_channel::unbounded();
             let host = with_inbox(tx);
-            let spec = Spec { isolation: Some(session::Isolation::microvm()), ..no_harness(dir.path()) };
+            let spec = Spec { isolation: Some(session::Isolation::microvm()), claim: Some(balancers_claim()), ..no_harness(dir.path()) };
             let refused = host.open(Some("nowhere".into()), spec.clone()).err().map(|e| format!("{e:#}")).unwrap_or_default();
             assert_eq!(refused, crate::sandbox::NO_MICROVM);
             assert!(host.get("nowhere").is_none(), "nothing was opened");

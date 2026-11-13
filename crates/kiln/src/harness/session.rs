@@ -20,7 +20,8 @@ fn is_zero_epoch(n: &u64) -> bool {
 }
 
 /// An isolated session's boundary (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 17 and 32), as kiln's T4 isolation
-/// named it: its kind, and the image it boots once one is chosen.
+/// named it: its kind, the image it boots once one is chosen, and its microVM's size where its start
+/// gave one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Isolation {
@@ -30,15 +31,25 @@ pub struct Isolation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub image: Option<String>,
+    /// Its microVM's vCPUs, as CPUs (Shards' `--cpus`): what its placement asks and its claim holds
+    /// (step 32), never what its harness would need as a process. None: its start gave none, so its
+    /// placement asks none and it's charged what it's measured using.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(as = "Option<f64>", optional))]
+    pub cpus: Option<kiln_ci::sched::state::Cpus>,
+    /// Its microVM's memory, bytes (Shards' `--memory`), asked and held as its vCPUs are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub memory: Option<u64>,
 }
 
 impl Isolation {
     /// The kind every isolated session has today.
     pub const MICROVM: &'static str = "microvm";
 
-    /// A microVM of its own, its image not yet chosen.
+    /// A microVM of its own, its image not yet chosen and its size not given.
     pub fn microvm() -> Self {
-        Self { kind: Self::MICROVM.to_owned(), image: None }
+        Self { kind: Self::MICROVM.to_owned(), image: None, cpus: None, memory: None }
     }
 }
 

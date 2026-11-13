@@ -7,6 +7,7 @@ import type { Gpu } from "./Gpu";
 import type { IsolationFacts } from "./IsolationFacts";
 import type { KilnFacts } from "./KilnFacts";
 import type { Mem } from "./Mem";
+import type { Negotiated } from "./Negotiated";
 import type { Net } from "./Net";
 import type { Observation } from "./Observation";
 import type { Storage } from "./Storage";
@@ -95,4 +96,10 @@ storage: Storage | null,
  * by the server for the learned run-time model ([`crate::runtime`]), and not kept with the
  * facts.
  */
-runs: Array<Observation>, };
+runs: Array<Observation>,
+/**
+ * What its own end of its link to the server negotiated (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34):
+ * said with the facts it sends as it connects, kept by the server with that connection, and not kept with the
+ * facts. None from a runner from before it, and in a probe's report.
+ */
+link?: Negotiated, };
