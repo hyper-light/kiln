@@ -107,6 +107,9 @@ pub fn said_marker(lines: &[String], marker: &str) -> bool {
 pub struct End {
     pub url: String,
     pub pointer: String,
+    /// Where `url` answers a list (`GET /api/agents`): the element whose field is this value
+    /// (`{"name": "{machine}"}`: the session's runner), which `pointer` then reads.
+    pub pick: Option<(String, String)>,
 }
 
 /// A link to read, both ends: `VM_E2E_LINKS`' entries. `lanes`: where its report lists its lanes'
@@ -119,15 +122,23 @@ pub struct LinkSpec {
     pub lanes: Option<End>,
 }
 
-/// The links of `VM_E2E_LINKS`: a JSON array of `{"name", "client": {"url", "pointer"}, "server":
-/// {"url", "pointer"}, "lanes"?: {"url", "pointer"}}`, each named as [`REQUIRED_LINKS`] names its hop.
+/// The links of `VM_E2E_LINKS`: a JSON array of `{"name", "client": {"url", "pointer", "pick"?},
+/// "server": {…}, "lanes"?: {…}}`, each named as [`REQUIRED_LINKS`] names its hop; `{session}` and
+/// `{machine}` in a url or a pick are the session's id and its runner's.
 /// Where agent control terminates, and so where each end says its suite, is kiln plan steps 10 and
 /// 11's to decide and build, so ROOT names the endpoints.
 pub fn link_specs(text: &str) -> Result<Vec<LinkSpec>, String> {
     let v: Value = serde_json::from_str(text).map_err(|e| format!("VM_E2E_LINKS isn't JSON: {e}"))?;
     let end = |l: &Value, which: &str| -> Result<End, String> {
         let s = |k: &str| l.pointer(&format!("/{which}/{k}")).and_then(Value::as_str).map(str::to_owned).ok_or_else(|| format!("a link's {which} has no {k}: {l}"));
-        Ok(End { url: s("url")?, pointer: s("pointer")? })
+        let pick = match l.pointer(&format!("/{which}/pick")) {
+            None => None,
+            Some(p) => match p.as_object().map(|o| o.iter().collect::<Vec<_>>()).as_deref() {
+                Some([(field, Value::String(value))]) => Some(((*field).clone(), value.clone())),
+                _ => return Err(format!("a link's {which} pick is one field and its value: {l}")),
+            },
+        };
+        Ok(End { url: s("url")?, pointer: s("pointer")?, pick })
     };
     v.as_array()
         .ok_or_else(|| "VM_E2E_LINKS is a JSON array of links".to_owned())?
@@ -153,6 +164,15 @@ pub struct LinkSuites {
 /// The suite a body says at `pointer`.
 pub fn suite_at(body: &Value, pointer: &str) -> Option<String> {
     body.pointer(pointer).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// What an end reads in `body`: the body itself, or where its `pick` names one of a list's elements,
+/// that element (none when no element has the field at that value).
+pub fn picked<'b>(body: &'b Value, pick: Option<&(String, String)>) -> Option<&'b Value> {
+    match pick {
+        None => Some(body),
+        Some((field, value)) => body.as_array()?.iter().find(|e| e.get(field).and_then(Value::as_str) == Some(value.as_str())),
+    }
 }
 
 /// The lanes' names a body lists at `pointer`.
@@ -1019,7 +1039,12 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     let mut links = Vec::new();
     if let Ok(text) = std::env::var("VM_E2E_LINKS") {
         for l in link_specs(&text).map_err(|e| anyhow::anyhow!(e))? {
-            let read = |e: &End| f.get(&e.url.replace("{session}", &id));
+            let named = |s: &str| s.replace("{session}", &id).replace("{machine}", &f.machine);
+            let read = |e: &End| -> anyhow::Result<Value> {
+                let body = f.get(&named(&e.url))?;
+                let pick = e.pick.as_ref().map(|(field, value)| (field.clone(), named(value)));
+                Ok(picked(&body, pick.as_ref()).cloned().unwrap_or(Value::Null))
+            };
             let end = |e: &End| -> anyhow::Result<Option<String>> { Ok(suite_at(&read(e)?, &e.pointer)) };
             let lanes = l.lanes.as_ref().map(|e| -> anyhow::Result<Option<Vec<String>>> { Ok(lanes_at(&read(e)?, &e.pointer)) }).transpose()?.flatten();
             links.push(LinkSuites { client: end(&l.client)?, server: end(&l.server)?, lanes, name: l.name });

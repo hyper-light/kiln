@@ -76,7 +76,7 @@ mod checks {
     #[test]
     fn s34_links_to_read_are_named_end_by_end() {
         let specs = link_specs(r#"[{"name": "agent-control", "client": {"url": "/api/a/{session}", "pointer": "/suite"}, "server": {"url": "/api/b", "pointer": "/peers/0/secured/suite"}}]"#);
-        assert_eq!(specs, Ok(vec![LinkSpec { name: "agent-control".into(), client: End { url: "/api/a/{session}".into(), pointer: "/suite".into() }, server: End { url: "/api/b".into(), pointer: "/peers/0/secured/suite".into() }, lanes: None }]));
+        assert_eq!(specs, Ok(vec![LinkSpec { name: "agent-control".into(), client: End { url: "/api/a/{session}".into(), pointer: "/suite".into(), pick: None }, server: End { url: "/api/b".into(), pointer: "/peers/0/secured/suite".into(), pick: None }, lanes: None }]));
         assert!(link_specs(r#"[{"name": "half", "client": {"url": "/x", "pointer": "/s"}}]"#).is_err(), "a link with one end");
         assert!(link_specs(r#"[{"client": {"url": "/x", "pointer": "/s"}, "server": {"url": "/y", "pointer": "/s"}}]"#).is_err(), "a link of no name, which no required link can be");
         assert!(link_specs(r#"{"name": "not a list"}"#).is_err());
@@ -87,7 +87,19 @@ mod checks {
         // A link's lanes, where its report lists them (a lanes reader of no pointer, or a list of
         // other than names, is none).
         let carried = link_specs(r#"[{"name": "agent-control", "client": {"url": "/a", "pointer": "/s"}, "server": {"url": "/b", "pointer": "/s"}, "lanes": {"url": "/api/harness/sessions/{session}", "pointer": "/links/0/lanes"}}]"#);
-        assert_eq!(carried.map(|s| s.into_iter().map(|l| l.lanes).collect::<Vec<_>>()), Ok(vec![Some(End { url: "/api/harness/sessions/{session}".into(), pointer: "/links/0/lanes".into() })]));
+        assert_eq!(carried.map(|s| s.into_iter().map(|l| l.lanes).collect::<Vec<_>>()), Ok(vec![Some(End { url: "/api/harness/sessions/{session}".into(), pointer: "/links/0/lanes".into(), pick: None })]));
+        // A runner's link in kiln's list of runners (`GET /api/agents`, step 34's plan step 2): picked by
+        // its name, then read (a pick of no field, or of two, is refused; a list with no such runner reads
+        // nothing).
+        let runner = link_specs(r#"[{"name": "server-runner", "client": {"url": "/api/agents", "pick": {"name": "{machine}"}, "pointer": "/link/runner/suite"}, "server": {"url": "/api/agents", "pick": {"name": "{machine}"}, "pointer": "/link/server/suite"}}]"#);
+        assert_eq!(runner.map(|s| s.into_iter().map(|l| l.client.pick).collect::<Vec<_>>()), Ok(vec![Some(("name".to_owned(), "{machine}".to_owned()))]));
+        assert!(link_specs(r#"[{"name": "x", "client": {"url": "/a", "pointer": "/s", "pick": {}}, "server": {"url": "/b", "pointer": "/s"}}]"#).is_err());
+        assert!(link_specs(r#"[{"name": "x", "client": {"url": "/a", "pointer": "/s", "pick": {"name": "a", "id": "b"}}, "server": {"url": "/b", "pointer": "/s"}}]"#).is_err());
+        let agents = json!([{"name": "other", "link": {"runner": {"suite": "TLS13_CHACHA20_POLY1305_SHA256"}}}, {"name": "box", "link": {"runner": {"suite": REQUIRED_SUITE}, "server": {"suite": REQUIRED_SUITE}}}]);
+        let pick = ("name".to_owned(), "box".to_owned());
+        assert_eq!(picked(&agents, Some(&pick)).and_then(|a| suite_at(a, "/link/runner/suite")).as_deref(), Some(REQUIRED_SUITE));
+        assert_eq!(picked(&agents, Some(&("name".to_owned(), "gone".to_owned()))), None);
+        assert_eq!(picked(&agents, None), Some(&agents));
         assert!(link_specs(r#"[{"name": "x", "client": {"url": "/a", "pointer": "/s"}, "server": {"url": "/b", "pointer": "/s"}, "lanes": {"url": "/c"}}]"#).is_err());
         let report = json!({"links": [{"lanes": ["control", "mcp"]}, {"lanes": ["control", 7]}]});
         assert_eq!(lanes_at(&report, "/links/0/lanes"), Some(vec!["control".to_owned(), "mcp".to_owned()]));

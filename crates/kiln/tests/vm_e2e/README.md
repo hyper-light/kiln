@@ -65,7 +65,7 @@ every one of the five `VM_E2E_*` words below (`untasked`): the stand-in's words 
 | Variable | What |
 |---|---|
 | `VM_E2E=1` | a runner that starts no microVMs fails the run rather than skips it |
-| `VM_E2E_LINKS` | the links to read, each end's path on kiln's API (`{session}`: the session's id) and the JSON pointer to its suite: `[{"name": "agent-control", "client": {"url": "…", "pointer": "…"}, "server": {"url": "…", "pointer": "…"}, "lanes": {"url": "…", "pointer": "…"}}, …]`, one for each of `server-runner`, `kiln-hex`, `agent-control` and `mcp` at least; `agent-control`'s `lanes` is where its report lists its lanes' names, among which a member's `mcp:<member>` lane must be (Shards D254). With kiln plan step 17's report, the agent-control entry is `{"name": "agent-control", "client": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/controller/suite"}, "server": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/endpoint/suite"}, "lanes": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/lanes"}}` |
+| `VM_E2E_LINKS` | the links to read, each end's path on kiln's API (`{session}`: the session's id) and the JSON pointer to its suite: `[{"name": "agent-control", "client": {"url": "…", "pointer": "…"}, "server": {"url": "…", "pointer": "…"}, "lanes": {"url": "…", "pointer": "…"}}, …]`, one for each of `server-runner`, `kiln-hex`, `agent-control` and `mcp` at least; `agent-control`'s `lanes` is where its report lists its lanes' names, among which a member's `mcp:<member>` lane must be (Shards D254). With kiln plan step 17's report, the agent-control entry is `{"name": "agent-control", "client": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/controller/suite"}, "server": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/endpoint/suite"}, "lanes": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/lanes"}}`; and the server-runner entry, read from kiln's list of runners, the session's picked by its name (`{machine}`: step 34's plan step 2, kiln main 458330ae3), is `{"name": "server-runner", "client": {"url": "/api/agents", "pick": {"name": "{machine}"}, "pointer": "/link/runner/suite"}, "server": {"url": "/api/agents", "pick": {"name": "{machine}"}, "pointer": "/link/server/suite"}}` |
 | `VM_E2E_HOST_ROOTS` | pids (comma-separated) of processes besides the runner whose trees hold the session's processes: a daemon its microVMs run under that left the runner's tree |
 | `VM_E2E_PROJECT` | a real project's folder on this host, for a real task (unset: an empty one of the test's own) |
 | `VM_E2E_PROMPT`, `VM_E2E_RESUMED_PROMPT`, `VM_E2E_STEERED_PROMPT`, `VM_E2E_STOPPED_PROMPT`, `VM_E2E_DONE_MARKER` | a real task, the resumed session's turn, a long one to steer into, a long one to stop, and what the harness says at a task's end; `{kind}` in each is the harness's id, `{file}` the file to write. Unset: the stand-in's, for an image ROOT names (the stand-in's); from kiln's own `harness-<kind>` the run skips unless all five are given (fails, with `VM_E2E=1`) |
@@ -192,9 +192,9 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    the host, kiln gives a session its MCP server over the runner's Unix socket alone
    (`harness/kinds.rs`, `local_tools`, `#[cfg(unix)]`; its other twin gives none), so Codex and the ACP
    harnesses on Windows reach it only from a microVM, over item 3's `mcp` lane.
-5. **The server-runner link's ends**: step 34's plan step 2 (AES-256-GCM alone on the link,
-   `net::LINK_PROVIDER`, and each end's negotiated suite on kiln's API). Read through `VM_E2E_LINKS`'
-   `server-runner` entry.
+5. **The server-runner link's ends**: built (step 34's plan step 2, kiln main 458330ae3): AES-256-GCM
+   alone on the link (`net::LINK_PROVIDER`), and each end's suite and group on `GET /api/agents`'s
+   `link` (`server`, `runner`). Read through `VM_E2E_LINKS`' `server-runner` entry (above).
 6. **The kiln-Hex link's Hex end**: step 34's plan step 3, through Hex's lead (the node's own report of
    each peer link's suite and group); the kiln end is step 17's Hex client. Read through
    `VM_E2E_LINKS`' `kiln-hex` entry.
