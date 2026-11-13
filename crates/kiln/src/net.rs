@@ -587,6 +587,57 @@ fn credentials(ca_der: &[u8], leaf: &Leaf) -> anyhow::Result<Credentials> {
     Ok(Credentials { chain, key, roots: vec![CertificateDer::from(ca_der.to_vec())] })
 }
 
+/// The provider of the links between kiln's server and its runners: hyper-quic's node provider, its hybrid
+/// post-quantum key exchange groups as they are, narrowed to `TLS13_AES_256_GCM_SHA384` alone (kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d, step 34: "all such communications should be AESGCM256 bidirectional
+/// encrypted", Ada, 2026-11-11), as reach's links (`crate::reach::e2e`), Hex's and Shards' (its D239) are. A peer
+/// that offers no AES-256-GCM, which TLS 1.3 asks every implementation to (RFC 8446 §9.1), finds no suite in common
+/// and is refused at its handshake. QUIC's Initial packets keep AES-128-GCM under keys of the connection id (RFC 9001
+/// §5), taken from aws-lc-rs's own table (`hyper_quic::crypto::rustls::initial_suite`), not from these suites.
+static LINK_PROVIDER: std::sync::LazyLock<hyper_quic::rustls::crypto::CryptoProvider> = std::sync::LazyLock::new(|| hyper_quic::rustls::crypto::CryptoProvider {
+    cipher_suites: vec![hyper_quic::rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384],
+    ..hyper_quic::crypto::rustls::node_provider().clone()
+});
+
+/// Mutual TLS from `credentials` as `hyper_transport::tls::Tls::mutual` makes it (TLS 1.3 alone; each side presents
+/// its chain and takes only a certificate under the authority's roots; `hyper_transport::tls::ALPN`; the server side
+/// only when `listen`), on [`LINK_PROVIDER`]. hyper-transport takes configurations a project builds and holds them to
+/// its rules (early data off, a protocol named: its `tls` module).
+fn link_tls(credentials: &Credentials, listen: bool) -> anyhow::Result<Tls> {
+    use hyper_quic::rustls;
+    let roots = || -> anyhow::Result<rustls::RootCertStore> {
+        let mut roots = rustls::RootCertStore::empty();
+        for root in &credentials.roots {
+            roots.add(root.clone()).map_err(|e| anyhow::anyhow!("a root: {e}"))?;
+        }
+        anyhow::ensure!(!roots.is_empty(), "no roots to take a peer's certificate under");
+        Ok(roots)
+    };
+    let server = if listen {
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(roots()?, &LINK_PROVIDER)
+            .build()
+            .map_err(|e| anyhow::anyhow!("client verifier: {e}"))?;
+        let mut tls = rustls::ServerConfig::builder_with_provider(&LINK_PROVIDER)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| anyhow::anyhow!("TLS versions: {e}"))?
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(credentials.chain.clone(), credentials.key.clone_key())
+            .map_err(|e| anyhow::anyhow!("server identity: {e}"))?;
+        tls.alpn_protocols = vec![hyper_transport::tls::ALPN.to_vec()];
+        Some(tls)
+    } else {
+        None
+    };
+    let mut client = rustls::ClientConfig::builder_with_provider(&LINK_PROVIDER)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| anyhow::anyhow!("TLS versions: {e}"))?
+        .with_root_certificates(roots()?)
+        .with_client_auth_cert(credentials.chain.clone(), credentials.key.clone_key())
+        .map_err(|e| anyhow::anyhow!("client identity: {e}"))?;
+    client.alpn_protocols = vec![hyper_transport::tls::ALPN.to_vec()];
+    Ok(Tls { server, client })
+}
+
 pub struct Spec {
     pub bind: SocketAddr,
     pub ca_der: Vec<u8>,
@@ -624,8 +675,7 @@ pub const OUT_BYTES: usize = WINDOW as usize;
 /// bounded at `out` bytes. Returns its command handle.
 pub fn start_with(spec: Spec, out: usize, hand: Box<dyn Hand>) -> anyhow::Result<NetHandle> {
     // Validate the TLS material up front so misconfiguration fails loudly at startup.
-    let _ = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
-        .map_err(|r| anyhow::anyhow!("tls config: {r}"))?;
+    let _ = link_tls(&credentials(&spec.ca_der, &spec.leaf)?, spec.server).map_err(|e| anyhow::anyhow!("tls config: {e:#}"))?;
     let (tx, rx) = crate::memory::queue::bounded::<Out>(&crate::memory::owners::NET_OUT, out);
     let name = if spec.server { "kiln-net-server" } else { "kiln-net-agent" };
     std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, hand))?;
@@ -847,8 +897,7 @@ fn sent_by(driver: &AnyDriver) -> u64 {
 
 /// Builds the endpoint and binds its socket; must run on the net thread's shard.
 fn build(spec: &Spec) -> anyhow::Result<AnyDriver> {
-    let tls = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
-        .map_err(|r| anyhow::anyhow!("tls: {r}"))?;
+    let tls = link_tls(&credentials(&spec.ca_der, &spec.leaf)?, spec.server).map_err(|e| anyhow::anyhow!("tls: {e:#}"))?;
     // Its spares as many and as large as its frames have had out at once (goal 11's audit, row B22: `crate::net_budget`).
     let budget = Spares::new(if spec.server { 1 << 30 } else { 256 << 20 });
     let io = Io { batch: 64 };
@@ -2335,6 +2384,118 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// A client configuration as [`link_tls`] makes one, on `provider`: a peer of another provider.
+    fn client_on(provider: &'static hyper_quic::rustls::crypto::CryptoProvider, c: &Credentials) -> anyhow::Result<hyper_quic::rustls::ClientConfig> {
+        use hyper_quic::rustls;
+        let mut roots = rustls::RootCertStore::empty();
+        for root in &c.roots {
+            roots.add(root.clone())?;
+        }
+        let mut client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(c.chain.clone(), c.key.clone_key())?;
+        client.alpn_protocols = vec![hyper_transport::tls::ALPN.to_vec()];
+        Ok(client)
+    }
+
+    /// A server configuration as [`link_tls`] makes one, on `provider`.
+    fn server_on(provider: &'static hyper_quic::rustls::crypto::CryptoProvider, c: &Credentials) -> anyhow::Result<hyper_quic::rustls::ServerConfig> {
+        use hyper_quic::rustls;
+        let mut roots = rustls::RootCertStore::empty();
+        for root in &c.roots {
+            roots.add(root.clone())?;
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider).build()?;
+        let mut server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(c.chain.clone(), c.key.clone_key())?;
+        server.alpn_protocols = vec![hyper_transport::tls::ALPN.to_vec()];
+        Ok(server)
+    }
+
+    /// Runs a TLS handshake between `client` and `server` in memory: Ok with each end's negotiated suite, or the
+    /// first refusal, by the side that refused.
+    fn handshake(mut client: hyper_quic::rustls::ClientConfig, mut server: hyper_quic::rustls::ServerConfig) -> anyhow::Result<Result<(hyper_quic::rustls::CipherSuite, hyper_quic::rustls::CipherSuite), (&'static str, hyper_quic::rustls::Error)>> {
+        use hyper_quic::rustls;
+        let name = rustls::pki_types::ServerName::try_from("localhost")?;
+        // hyper-tls keeps a connection's configuration with its owner, taken again by each call that may advance the
+        // handshake (as `crate::reach::e2e`'s `Conn` holds it).
+        let mut c = rustls::ClientConnection::new(&mut client, name)?;
+        let mut s = rustls::ServerConnection::new(&server)?;
+        // A TLS 1.3 handshake is two flights each way: a bound on a test's loop, not on any handshake.
+        for _ in 0..4 {
+            let mut to_server = Vec::new();
+            while c.wants_write() {
+                c.write_tls(&mut to_server)?;
+            }
+            let mut rd = to_server.as_slice();
+            while !rd.is_empty() {
+                s.read_tls(&mut rd)?;
+                if let Err(e) = s.process_new_packets(&mut server) {
+                    return Ok(Err(("server", e)));
+                }
+            }
+            let mut to_client = Vec::new();
+            while s.wants_write() {
+                s.write_tls(&mut to_client)?;
+            }
+            let mut rd = to_client.as_slice();
+            while !rd.is_empty() {
+                c.read_tls(&mut rd)?;
+                if let Err(e) = c.process_new_packets(&mut client) {
+                    return Ok(Err(("client", e)));
+                }
+            }
+            if !c.is_handshaking() && !s.is_handshaking() {
+                let suite = |n: Option<rustls::SupportedCipherSuite>| n.map(|n| n.suite()).ok_or_else(|| anyhow::anyhow!("no suite negotiated"));
+                return Ok(Ok((suite(c.negotiated_cipher_suite())?, suite(s.negotiated_cipher_suite())?)));
+            }
+        }
+        anyhow::bail!("the handshake never settled")
+    }
+
+    /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34: the server's and a runner's links settle on
+    /// TLS13_AES_256_GCM_SHA384 at both ends, even with a peer that prefers ChaCha20-Poly1305 (red on hyper-quic's
+    /// node provider, which takes its peer's order); and a peer offering ChaCha20-Poly1305 or AES-128-GCM alone finds
+    /// no suite in common either way and is refused at its handshake, typed (re-allowing ChaCha20-Poly1305 in
+    /// [`LINK_PROVIDER`] lets that peer through, failing this).
+    #[test]
+    fn s34_server_runner_links_take_aes_256_gcm_alone_at_both_ends() -> anyhow::Result<()> {
+        use hyper_quic::rustls::{self, CipherSuite, Error, PeerIncompatible, crypto::CryptoProvider, crypto::aws_lc_rs::cipher_suite as suites};
+        static CHACHA_FIRST: std::sync::LazyLock<CryptoProvider> = std::sync::LazyLock::new(|| CryptoProvider {
+            cipher_suites: vec![suites::TLS13_CHACHA20_POLY1305_SHA256, suites::TLS13_AES_256_GCM_SHA384],
+            ..hyper_quic::crypto::rustls::node_provider().clone()
+        });
+        static CHACHA_ONLY: std::sync::LazyLock<CryptoProvider> = std::sync::LazyLock::new(|| CryptoProvider {
+            cipher_suites: vec![suites::TLS13_CHACHA20_POLY1305_SHA256],
+            ..hyper_quic::crypto::rustls::node_provider().clone()
+        });
+        static AES_128_ONLY: std::sync::LazyLock<CryptoProvider> = std::sync::LazyLock::new(|| CryptoProvider {
+            cipher_suites: vec![suites::TLS13_AES_128_GCM_SHA256],
+            ..hyper_quic::crypto::rustls::node_provider().clone()
+        });
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(dir.path())?;
+        let server_creds = credentials(&pki.ca_der, &pki.server_leaf(&[])?)?;
+        let runner_creds = credentials(&pki.ca_der, &pki.issue_local("box")?)?;
+        let server = || -> anyhow::Result<rustls::ServerConfig> { link_tls(&server_creds, true)?.server.ok_or_else(|| anyhow::anyhow!("no server side")) };
+        let runner = || -> anyhow::Result<rustls::ClientConfig> { Ok(link_tls(&runner_creds, false)?.client) };
+        assert!(link_tls(&runner_creds, false)?.server.is_none(), "a runner listens for no one");
+
+        let aes = CipherSuite::TLS13_AES_256_GCM_SHA384;
+        assert_eq!(handshake(runner()?, server()?)?.ok(), Some((aes, aes)), "both ends say AES-256-GCM");
+        assert_eq!(handshake(client_on(&CHACHA_FIRST, &runner_creds)?, server()?)?.ok(), Some((aes, aes)), "a peer preferring ChaCha20-Poly1305 still gets AES-256-GCM");
+        assert_eq!(handshake(runner()?, server_on(&CHACHA_FIRST, &server_creds)?)?.ok(), Some((aes, aes)));
+        for (bad, provider) in [("ChaCha20-Poly1305", &CHACHA_ONLY), ("AES-128-GCM", &AES_128_ONLY)] {
+            let refused = |r: Result<(CipherSuite, CipherSuite), (&'static str, Error)>| matches!(r, Err(("server", Error::PeerIncompatible(PeerIncompatible::NoCipherSuitesInCommon))));
+            assert!(refused(handshake(client_on(provider, &runner_creds)?, server()?)?), "a runner offering {bad} alone is refused by the server");
+            assert!(refused(handshake(runner()?, server_on(provider, &server_creds)?)?), "a server taking {bad} alone refuses the runner");
+        }
+        Ok(())
     }
 }
 

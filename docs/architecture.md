@@ -112,7 +112,9 @@ Browsers can also reach kiln over WebTransport on the HTTP/3 door's own UDP addr
 
 Agents keep one QUIC connection to the server (hyper-transport, mutual TLS: the agent checks the
 server's certificate under the fixed name `kiln-server`, the server the agent's, both against the
-kiln CA). **No ports beyond the HTTP one are required; UDP is used when reachable.** An agent dials
+kiln CA; TLS 1.3 at `TLS13_AES_256_GCM_SHA384` alone under the hybrid post-quantum groups, a peer
+offering no AES-256-GCM refused at its handshake: `net::LINK_PROVIDER`, kiln plan
+01a1cd8e862e7169a074db3d5fa33f3d step 34). **No ports beyond the HTTP one are required; UDP is used when reachable.** An agent dials
 the QUIC address over UDP first. When two direct dials in a row get no answer (or direct dials go
 unanswered for 20 s) it opens the HTTP tunnel instead: a WebSocket to `GET /api/agents/tunnel` on
 the server's HTTP port (`ws://`, or `wss://` when the server URL is `https://`), with a UDP socket
