@@ -21,7 +21,9 @@ prompt asks with words:
                     initialize, then tools/list: `MCP_OK <tools> <first tool>`, or `MCP_FAIL <why>`
     SPAWN=<kind>    an agent of that harness started through kiln's MCP server (`agents_start`), from
                     where this one runs: `SPAWN_OK <its id>`, or `SPAWN_FAIL <why>`
-    SLOW=<ms>       that long between its lines, so a turn lasts long enough to steer and stop
+    SLOW=<ms>       that long between its lines, so a turn lasts long enough to steer into
+    HOLD            no line more once it said what it heard, until it's stopped: a turn only a stop
+                    ends, so a line of it after a stop says the stop wasn't taken
     CONNECT=<host>:<port>
                     whether where it runs reaches <host> on TCP port <port>, as its network says: its
                     resolver's answer for the name (`CONNECT_REFUSED <host>:<port> dns rcode <n>`
@@ -435,6 +437,9 @@ class Turn:
             self.say(spawn(self.servers, kind.group(1)))
         for host, port in re.findall(r"\bCONNECT=([A-Za-z0-9.-]+):(\d+)\b", self.prompt):
             self.say(connect(host, int(port)))
+        if re.search(r"\bHOLD\b", self.prompt):
+            self.stopped.wait()
+            return False
         for n in range(LINES):
             if self.stopped.wait(every):
                 return False

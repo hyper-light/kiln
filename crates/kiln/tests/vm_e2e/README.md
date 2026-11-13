@@ -70,8 +70,14 @@ every one of the five `VM_E2E_*` words below (`untasked`): the stand-in's words 
 | `VM_E2E_PROJECT` | a real project's folder on this host, for a real task (unset: an empty one of the test's own) |
 | `VM_E2E_PROMPT`, `VM_E2E_RESUMED_PROMPT`, `VM_E2E_STEERED_PROMPT`, `VM_E2E_STOPPED_PROMPT`, `VM_E2E_DONE_MARKER` | a real task, the resumed session's turn, a long one to steer into, a long one to stop, and what the harness says at a task's end; `{kind}` in each is the harness's id, `{file}` the file to write. Unset: the stand-in's, for an image ROOT names (the stand-in's); from kiln's own `harness-<kind>` the run skips unless all five are given (fails, with `VM_E2E=1`) |
 | `VM_E2E_IMAGE_<KIND>` | the image a harness's microVM is made from (`agentfile:<id>`), or `stub` for the stand-in (below); unset: kiln's Agentfile for it, `harness-<kind>` |
-| `VM_E2E_TURN_SECS` | how long a turn may take before the test fails (600 unset): a failing test's patience, not a value kiln runs by |
 | `VM_E2E_SERVER`, `VM_E2E_TOKEN`, `VM_E2E_MACHINE`, `VM_E2E_RUNNER_PID`, `VM_E2E_RUNNER_LOG` | ROOT's own kiln (one with the sign-ins and credentials real tasks need) at `http://127.0.0.1:<port>`, its admin token (from a file, never on a command line or in a log), its runner's machine id, that runner's pid and its log (where it writes each call of kiln's MCP over a lane); unset: a server and a runner of the test's own, its headroom off |
+
+No wait has a time of its own (`vm_e2e::Pace`; docs/research/s35-every-harness/waits/README.md). Until a
+harness gives its first answer in a drive, and while it works on a turn the drive asked to be long, a wait
+follows its liveness and progress alone. After that, the slowest answer the harness has given in the drive
+bounds how long it may go without progress. A wait ends at once, typed and saying why, where kiln's own
+word says no answer can come. Each refusal prints the session's state, each of its messages' delivery,
+and its timeline.
 
 On a busy host kiln holds a queued message in its own queue until the machine has room (docs/headroom.md),
 and the drive's turns then wait there. The test's own runner has its headroom off; turn ROOT's runner's off

@@ -152,29 +152,29 @@ fn plant(f: &Fixture) -> anyhow::Result<String> {
 /// A Goose session of kiln's own Agentfile in a microVM, started with no prompt: its id, and kiln's
 /// word on it once it runs the stand-in's image `digest`. A session of any other image is stopped
 /// before it's given a word.
-fn started(f: &Fixture, project: &str, digest: &str) -> anyhow::Result<(String, Value)> {
+fn started(f: &Fixture, pace: &mut vm_e2e::Pace, project: &str, digest: &str) -> anyhow::Result<(String, Value)> {
     let id = vm_e2e::open(f, &json!({"kind": "goose", "cwd": project, "isolation": {"kind": "microvm"}}))?;
-    let ran = vm_e2e::until(f, &id, vm_e2e::turn_within(), "its microVM", |i, _| i.pointer("/runs/image").and_then(Value::as_str).is_some() || vm_e2e::status(i) == "exited");
+    let ran = pace.until(f, &id, vm_e2e::Asked::Kiln, "its microVM", |i, _| i.pointer("/runs/image").and_then(Value::as_str).is_some() || vm_e2e::status(i) == "exited");
     let (info, _) = match ran {
         Ok(seen) => seen,
         Err(e) => {
-            let _ = vm_e2e::stop(f, &id);
+            let _ = pace.stop(f, &id);
             return Err(e);
         }
     };
     let image = info.pointer("/runs/image").and_then(Value::as_str).unwrap_or_default();
     if image != format!("harness-goose@{digest}") {
-        let _ = vm_e2e::stop(f, &id);
+        let _ = pace.stop(f, &id);
         anyhow::bail!("kiln booted {image:?}, not the stand-in built as its Goose image (harness-goose@{digest}): it was stopped, given no word");
     }
     Ok((id, info))
 }
 
 /// The stand-in's `CONNECT=` turn for each of `to`, through kiln: what it said once its turn ran to its end.
-fn probed(f: &Fixture, id: &str, client: &str, to: &[&str]) -> anyhow::Result<(Vec<Value>, Vec<String>)> {
+fn probed(f: &Fixture, pace: &mut vm_e2e::Pace, id: &str, client: &str, to: &[&str]) -> anyhow::Result<(Vec<Value>, Vec<String>)> {
     let words: Vec<String> = to.iter().map(|t| format!("CONNECT={t}")).collect();
     vm_e2e::command(f, id, &json!({"type": "send", "id": client, "text": format!("{} do the task", words.join(" ")), "mode": "queue"}))?;
-    let (_, events) = vm_e2e::until(f, id, vm_e2e::turn_within(), "its turn", |_, e| vm_e2e::said_marker(&vm_e2e::said_after(e, client), vm_e2e::STUB_DONE))?;
+    let (_, events) = pace.until(f, id, vm_e2e::Asked::Message(client), "its turn", |_, e| vm_e2e::said_marker(&vm_e2e::said_after(e, client), vm_e2e::STUB_DONE))?;
     let lines = vm_e2e::said_after(&events, client);
     Ok((events, lines))
 }
@@ -188,6 +188,7 @@ fn in_guest(lines: &[String]) -> anyhow::Result<()> {
 fn s17_a_goose_session_reaches_its_persons_providers_hosts_alone_and_says_so_where_it_cant_tell() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let f = vm_e2e::up_own(dir.path(), RUNNER, &[])?;
+    let mut pace = vm_e2e::Pace::default();
     if !vm_e2e::isolation_ready(&f)? {
         return Ok(());
     }
@@ -200,39 +201,39 @@ fn s17_a_goose_session_reaches_its_persons_providers_hosts_alone_and_says_so_whe
     // Narrowed: the person's home names Anthropic, so the run keeps Anthropic's hosts and Goose's own
     // alone, and the microVM's network refuses another provider Goose's image grants.
     std::fs::write(&config, format!("GOOSE_PROVIDER: {}\n", KEPT.0))?;
-    let (id, info) = started(&f, &project, &digest)?;
+    let (id, info) = started(&f, &mut pace, &project, &digest)?;
     let what = "a session whose home names anthropic";
     anyhow::ensure!(info.pointer("/isolation/person").and_then(Value::as_str) == Some(PERSON), "{what}: kiln says it acts for {:?}", info.pointer("/isolation/person"));
     let hosts = kept_for("goose", &[KEPT.0])?;
     anyhow::ensure!(hosts.iter().any(|h| h == KEPT.1) && !hosts.iter().any(|h| h == DROPPED), "kiln's table for goose keeps {hosts:?} for {}", KEPT.0);
     let reach = info.pointer("/runs/reach").cloned().unwrap_or(Value::Null);
     anyhow::ensure!(reach == json!({"as": "narrowed", "uses": [KEPT.0], "hosts": hosts}), "{what}: its reach is {reach}, not narrowed to {hosts:?}");
-    let (events, lines) = probed(&f, &id, "narrowed-1", &[KEPT.1, DROPPED])?;
+    let (events, lines) = probed(&f, &mut pace, &id, "narrowed-1", &[KEPT.1, DROPPED])?;
     in_guest(&lines).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
     anyhow::ensure!(matches!(connect_said(&lines, KEPT.1), Some(("CONNECT_OK", _))), "{what}: {} wasn't reached from its microVM: {lines:?}", KEPT.1);
     anyhow::ensure!(connect_said(&lines, DROPPED) == Some(("CONNECT_REFUSED", "dns rcode 5")), "{what}: {DROPPED} wasn't refused by its network (REFUSED, RCODE 5): {lines:?}");
     anyhow::ensure!(notices(&events, "warn").iter().all(|n| !n.contains("isn't narrowed")), "{what}: it says it isn't narrowed: {:?}", notices(&events, "warn"));
-    vm_e2e::stop(&f, &id)?;
+    pace.stop(&f, &id)?;
 
     // Whole, and said: the person's config can't be read (a folder where its file is), so kiln can't
     // tell the provider; the run keeps every destination its image names, and the session says why.
     std::fs::remove_file(&config)?;
     std::fs::create_dir_all(&config)?;
-    let (id, info) = started(&f, &project, &digest)?;
+    let (id, info) = started(&f, &mut pace, &project, &digest)?;
     let what = "a session whose home can't be read";
     let reach = info.pointer("/runs/reach").cloned().unwrap_or(Value::Null);
     anyhow::ensure!(
         reach.get("as").and_then(Value::as_str) == Some("whole") && reach.pointer("/why/unread/file").and_then(Value::as_str) == Some(guest_config.as_str()),
         "{what}: its reach is {reach}, not whole for want of reading {guest_config}"
     );
-    let (events, lines) = probed(&f, &id, "whole-1", &[KEPT.1, DROPPED])?;
+    let (events, lines) = probed(&f, &mut pace, &id, "whole-1", &[KEPT.1, DROPPED])?;
     in_guest(&lines).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
     let warned = notices(&events, "warn");
     anyhow::ensure!(warned.iter().any(|n| n.contains("isn't narrowed") && n.contains(&guest_config)), "{what}: no notice says it isn't narrowed, and why: {warned:?}");
     for to in [KEPT.1, DROPPED] {
         anyhow::ensure!(matches!(connect_said(&lines, to), Some(("CONNECT_OK", _))), "{what}: {to}, which its image grants, wasn't reached: {lines:?}");
     }
-    vm_e2e::stop(&f, &id)?;
+    pace.stop(&f, &id)?;
     Ok(())
 }
 

@@ -6,8 +6,11 @@
 //! CP-T7.2). A sandbox says what it holds its runs to ([`Holds`]): what it holds it enforces, and a
 //! launch that asks for what it doesn't hold is refused `Unsupported`, never taken and ignored. The
 //! suite asks its fixture for programs by what they do (echo, exit with a code, use memory, start
-//! processes, connect), so each implementation supplies its own; [`SimSandbox`] runs built-in
-//! programs that do those things.
+//! processes, connect, ask a host with a credential's placeholder), so each implementation supplies
+//! its own; [`SimSandbox`] runs built-in programs that do those things. A run's credentials are
+//! granted by reference ([`CredentialGrant`], Shards' D242; kiln plan 01a1d2b88be57304b972761e2a5c6781
+//! step 6): their values are filled in at its egress, outside its boundary, toward the hosts each
+//! names alone, and never travel in a launch.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -62,6 +65,58 @@ pub enum Egress {
 impl Default for Egress {
     fn default() -> Self {
         Egress::Only(Vec::new())
+    }
+}
+
+impl Egress {
+    /// Whether it lets a run reach `host`: any host, or one it names alone or with a port
+    /// (`host:port`), named in either case (RFC 4343: DNS names compare case-insensitively).
+    fn reaches(&self, host: &str) -> bool {
+        match self {
+            Egress::Any => true,
+            Egress::Only(hosts) => hosts.iter().any(|h| {
+                let named = match h.rsplit_once(':') {
+                    Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+                    _ => h.as_str(),
+                };
+                named.eq_ignore_ascii_case(host)
+            }),
+        }
+    }
+}
+
+/// A credential a run is granted by reference (Shards' D242; kiln plan 01a1d2b88be57304b972761e2a5c6781
+/// step 6): the secret `reference` names in kiln's store ([`crate::Secrets`]), never its value, which
+/// is filled in at the run's egress, outside its boundary, into its requests to each of `toward`'s
+/// hosts and to no other. A grant grants no egress: each host is one its launch's egress reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialGrant {
+    pub reference: String,
+    pub toward: Vec<String>,
+}
+
+impl CredentialGrant {
+    /// Whether it can ever be filled in for `launch`: a reference its store could name
+    /// ([`crate::secrets::check_name`]), and one host at least, each named as TLS names a server
+    /// (a DNS name, never an address, and without a port: RFC 6066 §3) and reached by `launch`'s
+    /// egress; else `Invalid`, naming it by its place among `launch`'s grants.
+    fn check(&self, at: usize, launch: &Launch) -> Result<(), Refusal> {
+        let invalid = |why: String| Err(Refusal::Invalid { what: "a credential grant", why: format!("credentials[{at}]: {why}") });
+        if let Err(e) = crate::secrets::check_name(&self.reference) {
+            return invalid(format!("its reference: {e}"));
+        }
+        if self.toward.is_empty() {
+            return invalid(format!("{} toward no host could never be filled in", self.reference));
+        }
+        for host in &self.toward {
+            if host.is_empty() || host.contains(|c: char| c == ':' || c == '/' || c.is_whitespace()) || host.parse::<std::net::IpAddr>().is_ok() {
+                return invalid(format!("{host:?} is no host a credential is filled in toward: a DNS name, without a port (RFC 6066 §3)"));
+            }
+            if !launch.egress.reaches(host) {
+                return invalid(format!("{host} is no host its egress reaches: a credential grant grants no egress"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -129,20 +184,27 @@ pub struct Holds {
     pub shares: bool,
     /// Signals to a run ([`Run::signal`]).
     pub signals: bool,
+    /// Credentials granted by reference, filled in at a run's egress outside its boundary
+    /// ([`Launch::credentials`]).
+    pub credentials: bool,
 }
 
 impl Holds {
     /// Everything (the simulator's).
-    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true };
+    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true };
 
-    /// `Ok` when `launch`'s weights are on their scale and it asks only for what these hold; else
-    /// its refusal, `Invalid` or `Unsupported`, naming what it asked for.
+    /// `Ok` when `launch`'s weights are on their scale, its credential grants could each be filled
+    /// in, and it asks only for what these hold; else its refusal, `Invalid` or `Unsupported`,
+    /// naming what it asked for.
     pub fn check(&self, launch: &Launch) -> Result<(), Refusal> {
         let l = &launch.limits;
         for (what, w) in [("a cpu weight", l.cpu_weight), ("an io weight", l.io_weight)] {
             if !(WEIGHT_MIN..=WEIGHT_MAX).contains(&w) {
                 return Err(Refusal::Invalid { what, why: format!("{w} (from {WEIGHT_MIN} to {WEIGHT_MAX})") });
             }
+        }
+        for (at, grant) in launch.credentials.iter().enumerate() {
+            grant.check(at, launch)?;
         }
         let refuse = |what: &str| Err(Refusal::Unsupported(what.to_owned()));
         if l.memory_bytes.is_some() && !self.memory {
@@ -158,11 +220,15 @@ impl Holds {
             return refuse("a folder shared at another path or read-only");
         }
         match &launch.egress {
-            Egress::Any => Ok(()),
-            Egress::Only(hosts) if hosts.is_empty() && !self.no_egress => refuse("a run with no egress"),
-            Egress::Only(hosts) if !hosts.is_empty() && !self.egress_by_host => refuse("egress to named hosts alone"),
-            Egress::Only(_) => Ok(()),
+            Egress::Any => {}
+            Egress::Only(hosts) if hosts.is_empty() && !self.no_egress => return refuse("a run with no egress"),
+            Egress::Only(hosts) if !hosts.is_empty() && !self.egress_by_host => return refuse("egress to named hosts alone"),
+            Egress::Only(_) => {}
         }
+        if !launch.credentials.is_empty() && !self.credentials {
+            return refuse("credentials filled in at its egress");
+        }
+        Ok(())
     }
 }
 
@@ -194,12 +260,16 @@ pub struct Launch {
     pub shares: Vec<Share>,
     /// Its environment, over its boundary's own: the machine's on the host, its image's in a
     /// container or a microVM. Secrets don't belong here: they're injected outside the boundary
-    /// (CP-T4.3).
+    /// (CP-T4.3), as its [`credentials`](Self::credentials) are.
     pub env: Vec<(String, String)>,
     pub limits: Limits,
     /// The hosts it may reach; every other is refused.
     pub egress: Egress,
     pub boundary: Boundary,
+    /// Its credentials, granted by reference (Shards' D242): each filled in at its egress, outside
+    /// its boundary, toward the hosts its grant names alone; none by default, when nothing is
+    /// filled in toward any host. A value is never here.
+    pub credentials: Vec<CredentialGrant>,
 }
 
 impl Launch {
@@ -214,6 +284,7 @@ impl Launch {
             limits: Limits::default(),
             egress: Egress::default(),
             boundary: Boundary::Host,
+            credentials: Vec::new(),
         }
     }
 }
@@ -325,6 +396,9 @@ pub const SIM_PENDING: usize = 10_000;
 /// - `hog <bytes>`: uses that much memory, then exits 0;
 /// - `spawn <n>`: starts `n` processes, then exits 0;
 /// - `connect <host>`: exits 0 when the host is granted (or any is), 1 when it's refused;
+/// - `fill <host> <reference>`: asks the host with the credential's placeholder; exits 0, writing
+///   `filled`, when a grant of the credential toward that host fills it in, else 1, the request
+///   gone bare (or refused, where its egress doesn't reach the host);
 /// - `pwd`: writes its working folder.
 ///
 /// A signal ends any of them with its [`Signal::ended_code`]. It holds everything, unless made
@@ -517,6 +591,17 @@ impl Sandbox for SimSandbox {
                         st.say(Output::Exited(Exit::Code(1)));
                     }
                 }
+                "fill" => {
+                    let (host, reference) = (arg(0), arg(1));
+                    let filled = launch.egress.reaches(&host) && launch.credentials.iter().any(|g| g.reference == reference && g.toward.iter().any(|h| h.eq_ignore_ascii_case(&host)));
+                    if filled {
+                        st.say(Output::Stdout(b"filled".to_vec()));
+                        st.say(Output::Exited(Exit::Code(0)));
+                    } else {
+                        st.say(Output::Stderr(format!("{host}: no credential filled in").into_bytes()));
+                        st.say(Output::Exited(Exit::Code(1)));
+                    }
+                }
                 "pwd" => {
                     st.say(Output::Stdout(launch.folder.clone().unwrap_or_else(|| "/".into()).into_bytes()));
                     st.say(Output::Exited(Exit::Code(0)));
@@ -565,6 +650,11 @@ pub trait SandboxFixture: Send + Sync {
     /// Connects to `host` (the suite's names, `api.anthropic.com` and `example.com`, which the
     /// fixture may serve itself), granted `egress`.
     fn connect(&self, host: &str, egress: Egress) -> Launch;
+    /// Asks `host` (one of the suite's names) with credential `reference`'s placeholder, granted
+    /// `credentials` and `egress`: exits 0 when its request reached the host with the credential's
+    /// value filled in, else nonzero. The suite's credentials are its own (`conformance/...`),
+    /// whose values the fixture keeps.
+    fn fill(&self, host: &str, reference: &str, credentials: Vec<CredentialGrant>, egress: Egress) -> Launch;
     /// Writes its working folder, given `folder`.
     fn pwd(&self, folder: &str) -> Launch;
     /// A folder that exists for a run.
@@ -599,6 +689,9 @@ impl SandboxFixture for SimSandboxFixture {
     }
     fn connect(&self, host: &str, egress: Egress) -> Launch {
         Launch { egress, ..Launch::of("connect", &[host]) }
+    }
+    fn fill(&self, host: &str, reference: &str, credentials: Vec<CredentialGrant>, egress: Egress) -> Launch {
+        Launch { egress, credentials, ..Launch::of("fill", &[host, reference]) }
     }
     fn pwd(&self, folder: &str) -> Launch {
         Launch { folder: Some(folder.to_owned()), ..Launch::of("pwd", &[]) }
@@ -819,6 +912,40 @@ fn c12<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c13<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        const CLAUDE: &str = "conformance/anthropic";
+        let egress = || Egress::Only(vec!["api.anthropic.com".to_owned(), "example.com:443".to_owned()]);
+        let granted = |toward: &[&str]| vec![CredentialGrant { reference: CLAUDE.to_owned(), toward: toward.iter().map(|h| (*h).to_owned()).collect() }];
+        // A grant that could never be filled in is refused whatever the sandbox holds.
+        let never = [
+            (granted(&["other.example"]), "a host its egress doesn't reach"),
+            (granted(&[]), "no host"),
+            (granted(&["api.anthropic.com:443"]), "a host with a port"),
+            (granted(&["192.0.2.7"]), "an address"),
+            (vec![CredentialGrant { reference: "not a name".to_owned(), toward: vec!["api.anthropic.com".to_owned()] }], "a reference no store names"),
+        ];
+        for (credentials, what) in never {
+            match f.sandbox().launch(f.fill("api.anthropic.com", CLAUDE, credentials, egress())).await {
+                Err(Refusal::Invalid { .. }) => {}
+                Err(e) => return Err(format!("a credential toward {what}: refused as {e:?}, not Invalid")),
+                Ok(_) => return Err(format!("a credential toward {what} was taken")),
+            }
+        }
+        if !f.sandbox().holds().credentials {
+            return unsupported("a credential filled in at its egress", f.sandbox().launch(f.fill("api.anthropic.com", CLAUDE, granted(&["api.anthropic.com"]), egress())).await);
+        }
+        let filled = fine("launch", f.sandbox().launch(f.fill("api.anthropic.com", CLAUDE, granted(&["api.anthropic.com"]), egress())).await)?;
+        same("its granted host, asked with its placeholder", end(&drain(filled.as_ref()).await), Some(Exit::Code(0)))?;
+        let other = fine("launch", f.sandbox().launch(f.fill("example.com", CLAUDE, granted(&["api.anthropic.com"]), egress())).await)?;
+        ensure(!matches!(end(&drain(other.as_ref()).await), Some(Exit::Code(0))), || "a credential was filled in toward a host its grant doesn't name".into())?;
+        let ungranted = fine("launch", f.sandbox().launch(f.fill("api.anthropic.com", "conformance/openai", granted(&["api.anthropic.com"]), egress())).await)?;
+        ensure(!matches!(end(&drain(ungranted.as_ref()).await), Some(Exit::Code(0))), || "a credential the run isn't granted was filled in".into())?;
+        let none = fine("launch", f.sandbox().launch(f.fill("api.anthropic.com", CLAUDE, Vec::new(), egress())).await)?;
+        ensure(!matches!(end(&drain(none.as_ref()).await), Some(Exit::Code(0))), || "a credential was filled in for a run granted none".into())
+    })
+}
+
 /// The `Sandbox` contract, clause by clause (docs/seams.md, "Sandbox").
 pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
     vec![
@@ -857,6 +984,11 @@ pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
             id: "SANDBOX-12",
             says: "a run on the host has no id of a boundary's and no link, and a run says the same id and link after its end as before",
             check: c12::<F>,
+        },
+        Case {
+            id: "SANDBOX-13",
+            says: "a run's credential, granted by reference toward a host its egress reaches, is filled in toward that host alone: never toward another host it reaches, for a credential it isn't granted, or for a run granted none; a grant toward a host its egress doesn't reach, an address, a host with a port or no host, or by a reference no store names, is refused Invalid; a sandbox that fills in no credentials refuses them Unsupported",
+            check: c13::<F>,
         },
     ]
 }
@@ -926,6 +1058,9 @@ mod tests {
         fn connect(&self, host: &str, egress: Egress) -> Launch {
             Launch { limits: Limits::NONE, ..self.sim.connect(host, egress) }
         }
+        fn fill(&self, host: &str, reference: &str, credentials: Vec<CredentialGrant>, egress: Egress) -> Launch {
+            Launch { limits: Limits::NONE, ..self.sim.fill(host, reference, credentials, egress) }
+        }
         fn pwd(&self, folder: &str) -> Launch {
             free(self.sim.pwd(folder))
         }
@@ -949,7 +1084,7 @@ mod tests {
         let make = || async { Holding { sim: SimSandboxFixture::default(), lies: Some(Liar(SimSandbox::new())) } };
         let report = futures::executor::block_on(run("Sandbox", &cases::<Holding>(), make));
         let failed: Vec<&str> = report.failed.iter().map(|(id, _)| *id).collect();
-        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11"], "{:?}", report.failed);
+        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13"], "{:?}", report.failed);
         assert!(report.failed.iter().all(|(_, why)| why.contains("doesn't hold it")), "{:?}", report.failed);
     }
 
@@ -975,6 +1110,33 @@ mod tests {
         let read_only = Share { writable: false, ..Share::at_its_path("/p") };
         assert_eq!(only_memory.check(&shared(read_only)), Err(Refusal::Unsupported("a folder shared at another path or read-only".into())));
         assert_eq!(Holds::ALL.check(&shared(moved)), Ok(()));
+    }
+
+    /// Kiln plan 01a1d2b88be57304b972761e2a5c6781 step 6 (D242): a credential grant is held to its
+    /// launch's egress (it grants none) and to the host forms TLS names a server by, refused
+    /// `Invalid` before anything it asks is found unheld; one that could be filled in is taken where
+    /// credentials are held and refused `Unsupported` where they aren't.
+    #[test]
+    fn cp_t8_3_a_credential_grant_is_held_to_its_egress_and_refused_where_unheld() {
+        let only_memory = Holds { memory: true, ..Holds::default() };
+        let granted = |toward: &[&str], egress: Egress| Launch {
+            limits: Limits::NONE,
+            egress,
+            credentials: vec![CredentialGrant { reference: "anthropic/ada".into(), toward: toward.iter().map(|h| (*h).to_owned()).collect() }],
+            ..Launch::of("fill", &[])
+        };
+        let named = || Egress::Only(vec!["API.anthropic.com:443".into(), "example.com".into()]);
+        assert_eq!(Holds::ALL.check(&granted(&["api.anthropic.com"], named())), Ok(()), "a host its egress names with a port, in another case");
+        assert_eq!(Holds::ALL.check(&granted(&["example.com"], named())), Ok(()));
+        assert_eq!(Holds::ALL.check(&granted(&["api.anthropic.com"], Egress::Any)), Ok(()));
+        for (toward, egress) in [(&["other.example"][..], named()), (&[][..], named()), (&["api.anthropic.com:443"][..], named()), (&["192.0.2.7"][..], Egress::Any), (&["2001:db8::7"][..], Egress::Any), (&[""][..], Egress::Any)] {
+            let got = only_memory.check(&granted(toward, egress));
+            assert!(matches!(&got, Err(Refusal::Invalid { what: "a credential grant", why }) if why.starts_with("credentials[0]")), "{toward:?}: {got:?}");
+        }
+        let unnamed = Launch { credentials: vec![CredentialGrant { reference: "no spaces".into(), toward: vec!["example.com".into()] }], ..granted(&[], named()) };
+        assert!(matches!(Holds::ALL.check(&unnamed), Err(Refusal::Invalid { .. })), "a reference no store could name");
+        assert_eq!(only_memory.check(&granted(&["api.anthropic.com"], Egress::Any)), Err(Refusal::Unsupported("credentials filled in at its egress".into())));
+        assert_eq!(only_memory.check(&Launch { credentials: Vec::new(), ..granted(&[], Egress::Any) }), Ok(()), "a run granted none asks nothing held");
     }
 
     /// Step 17: a signal ends a simulated run with the code a shell says of it, said once; once

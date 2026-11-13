@@ -409,13 +409,22 @@ memory and processes, and its shares of the CPU and the disk, on cgroup v2's wei
 boundary lets it reach: a process on the host, as kiln runs harnesses today; a microVM's image's own
 grants. In a microVM, what runs is a member of its image (an Agentfile's HARNESS or AGENT), with its
 image's command and the arguments the launch adds. The suite asks its fixture for programs by what
-they do (echo, exit with a code, use memory, start processes, connect), so each implementation
-supplies its own.
+they do (echo, exit with a code, use memory, start processes, connect, ask a host with a credential's
+placeholder), so each implementation supplies its own.
 
 A sandbox says what it holds its runs to (`holds`): a memory limit, a process limit, shares other
 than an even one, no egress at all, egress to named hosts alone, folders shared at another path or
-read-only, signals. What it holds it enforces; a launch that asks for what it doesn't hold is refused
-`Unsupported`, never taken and ignored, and the suite checks both halves.
+read-only, signals, credentials filled in at its egress. What it holds it enforces; a launch that
+asks for what it doesn't hold is refused `Unsupported`, never taken and ignored, and the suite checks
+both halves.
+
+A run's credentials are granted by reference (`CredentialGrant`; Shards' D242, kiln plan
+01a1d2b88be57304b972761e2a5c6781 step 6): a secret's name in kiln's store and the hosts it's filled
+in toward, never its value, which its boundary fills in at the run's egress, outside the boundary,
+into its requests to those hosts alone. A grant grants no egress: each of its hosts is one the
+launch's egress reaches, named as TLS names a server (a DNS name without a port, RFC 6066 §3), and
+its reference is a name the store could hold. A grant that could never be filled in is refused
+`Invalid` before anything it asks is found unheld.
 
 How a limit ends a run, as Linux's cgroup v2 has it (agreed with Hex's track, CP-T7.1): memory when
 the boundary killed it for going over (`memory.events` counts an `oom_kill`); processes when it was
@@ -462,6 +471,7 @@ Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`.
 - **SANDBOX-10** cpu and io weights outside cgroup v2's 1 to 10,000 are refused Invalid; at its ends a run goes ahead where the sandbox holds weights, and is refused Unsupported where it doesn't
 - **SANDBOX-11** a run sent a signal to end ends, its end said once, and a signal after its end is refused Ended; a sandbox that delivers no signals refuses one Unsupported, and its run goes on
 - **SANDBOX-12** a run on the host has no id of a boundary's and no link, and a run says the same id and link after its end as before
+- **SANDBOX-13** a run's credential, granted by reference toward a host its egress reaches, is filled in toward that host alone: never toward another host it reaches, for a credential it isn't granted, or for a run granted none; a grant toward a host its egress doesn't reach, an address, a host with a port or no host, or by a reference no store names, is refused Invalid; a sandbox that fills in no credentials refuses them Unsupported
 
 ## Placement
 

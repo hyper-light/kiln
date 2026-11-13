@@ -4,6 +4,8 @@
 //! build on too.
 //!
 //! - `checks`: the acceptance's checks, against samples (any OS).
+//! - `waits`: the drive's waits, which follow the harness rather than a clock, against samples of
+//!   kiln's word on a session (any OS).
 //! - `stub`: the stand-in harness (`tests/fixtures/vm-stub/harness/stub`) speaking each harness's interface,
 //!   driven as a process (Unix: it's a Python script, as `fake-claude` is).
 //! - `host`: Claude Code's and Codex's interfaces driven through kiln on the host, the stand-in behind
@@ -426,6 +428,207 @@ mod checks {
 }
 
 // =================================================================================================
+// The drive's waits, against samples of kiln's word on a session (kiln plan step 35's waits;
+// docs/research/s35-every-harness/waits/README.md): they follow the harness, never a clock. Each
+// guard's mutation is named beside it.
+// =================================================================================================
+mod waits {
+    use crate::vm_e2e::*;
+    use serde_json::{Value, json};
+    use std::time::Duration;
+
+    fn s(secs: u64) -> Duration {
+        Duration::from_secs(secs)
+    }
+
+    /// kiln's word on session `s1`, its harness a process on its machine that started once.
+    fn word(status: &str) -> Value {
+        json!({"id": "s1", "status": status, "queued": 0, "tasks_running": 0, "runs": {"host": {"pid": 7}}, "starts": [{"at": 1, "runs": {"host": {"pid": 7}}}], "last_activity": 10})
+    }
+
+    /// `v` with `key` set to `value`.
+    fn with(v: &Value, key: &str, value: Value) -> Value {
+        let mut v = v.clone();
+        if let Some(o) = v.as_object_mut() {
+            o.insert(key.to_owned(), value);
+        }
+        v
+    }
+
+    fn user(seq: u64, client: &str, text: &str) -> Value {
+        json!({"id": client, "seq": seq, "at": seq, "kind": "user", "text": text, "client_id": client})
+    }
+
+    fn says(seq: u64, text: &str) -> Value {
+        json!({"id": format!("a{seq}"), "seq": seq, "at": seq, "kind": "assistant", "text": text})
+    }
+
+    /// A refused wait says where the session stands, each of its messages' delivery and what waits in
+    /// its queue, and its timeline, each event's kind, message id and first 80 characters (ROOT's
+    /// ask, 2026-11-13). The wait it replaces said its status, its exit and its words alone: dropping
+    /// any part fails its line.
+    #[test]
+    fn s35_a_refused_wait_says_where_the_session_stands_and_what_happened() {
+        let info = json!({"id": "s1", "status": "idle", "queued": 1, "doing": "Writing", "exit": null, "room_wait": 1234, "last_activity": 99});
+        let state = json!({"delivery": {"m0": "completed", "m1": "queued"}, "queue": [{"id": "m1", "text": "do the task again"}]});
+        let long = "x".repeat(100);
+        let events = vec![
+            user(1, "m0", "do the task"),
+            says(2, &long),
+            json!({"seq": 3, "kind": "tool", "name": "Bash", "status": "running", "output": null, "title": "sleep 600"}),
+            json!({"seq": 4, "kind": "notice", "level": "error", "text": "The agent did not keep the requested mode agent; no prompt was sent."}),
+        ];
+        let text = told(&info, &Ok(state), &events);
+        for w in [r#""status":"idle""#, r#""queued":1"#, r#""doing":"Writing""#, r#""room_wait":1234"#, r#""last_activity":99"#] {
+            assert!(text.contains(w), "{w} in {text}");
+        }
+        assert!(!text.contains("exit"), "a null says nothing: {text}");
+        assert!(text.contains(r#""m1":"queued""#) && text.contains("m1 do the task again"), "{text}");
+        assert!(text.contains("#1 user m0: do the task"), "{text}");
+        assert!(text.contains(&format!("#2 assistant: {}…", "x".repeat(80))) && !text.contains(&"x".repeat(81)), "{text}");
+        assert!(text.contains("#3 tool Bash running: sleep 600"), "{text}");
+        assert!(text.contains("#4 notice error: The agent did not keep"), "{text}");
+        // A state that couldn't be read says why; the rest is said still.
+        let unread = told(&info, &Err(anyhow::anyhow!("no socket")), &events);
+        assert!(unread.contains("couldn't be read: no socket") && unread.contains("#1 user m0"), "{unread}");
+        // The refusal itself: what it waited for, why (typed), then all of that.
+        let refused = Refused { what: "pi's first turn".into(), stall: Stall::Stuck(Stuck::Answered), evidence: text.clone() };
+        assert!(refused.to_string().starts_with("pi's first turn: it is idle") && refused.to_string().ends_with(&text));
+    }
+
+    /// Before its harness's first answer a wait has no clock: alive and silent, it waits on however
+    /// long (the cold start, the person's ruling of 2026-11-13). A picked bound (the 600 s this
+    /// replaces) refuses at the third look.
+    #[test]
+    fn s35_before_its_first_answer_a_wait_follows_its_harness_alone() {
+        let pace = Pace::default();
+        assert_eq!(pace.window(Asked::Opening), None);
+        let mut w = Watch::new(Asked::Opening, pace.window(Asked::Opening));
+        for secs in [0, 1, 600, 86_400] {
+            assert_eq!(w.look(&word("running"), &[], None, false, s(secs)), Verdict::Wait, "at {secs} s");
+        }
+        assert_eq!(w.look(&word("running"), &[], None, true, s(86_401)), Verdict::Done);
+    }
+
+    /// Once its harness answered, the slowest answer it gave in the drive bounds how long a wait may
+    /// go without progress, and progress moves the window on. Learning the last answer rather than the
+    /// slowest, or counting the window from the wait's start rather than its last progress, fails it.
+    #[test]
+    fn s35_its_slowest_answer_bounds_a_wait_without_progress() {
+        let mut pace = Pace::default();
+        for took in [3, 11, 2] {
+            pace.answered(s(took));
+        }
+        assert_eq!(pace.slowest(), Some(s(11)));
+        let window = pace.window(Asked::Message("m"));
+        assert_eq!(window, Some(s(11)));
+        let mut w = Watch::new(Asked::Message("m"), window);
+        let asked = vec![user(1, "m", "go")];
+        assert_eq!(w.look(&word("running"), &asked, None, false, s(0)), Verdict::Wait);
+        let line = vec![user(1, "m", "go"), says(2, "line 00000")];
+        assert_eq!(w.look(&word("running"), &line, None, false, s(10)), Verdict::Wait);
+        assert_eq!(w.look(&word("running"), &line, None, false, s(21)), Verdict::Wait);
+        // kiln's word moving is progress too (its queue, here).
+        let queued = with(&word("running"), "queued", json!(1));
+        assert_eq!(w.look(&queued, &line, None, false, s(30)), Verdict::Wait);
+        assert_eq!(w.look(&queued, &line, None, false, s(41)), Verdict::Wait);
+        assert_eq!(w.look(&queued, &line, None, false, s(42)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
+    }
+
+    /// A turn the drive asked to be long waits as a first does, whatever it learned: no earlier answer
+    /// bounds a turn asked to take longer. Bounding it by the slowest answer refuses it at 2 s.
+    #[test]
+    fn s35_a_turn_asked_to_be_long_follows_its_harness_alone() {
+        let mut pace = Pace::default();
+        pace.answered(s(1));
+        assert_eq!(pace.window(Asked::Steered("steer")), None);
+        let mut w = Watch::new(Asked::Steered("steer"), pace.window(Asked::Steered("steer")));
+        for secs in [0, 2, 3_600] {
+            assert_eq!(w.look(&word("running"), &[user(1, "steer", "STEER x")], None, false, s(secs)), Verdict::Wait);
+        }
+    }
+
+    /// Where kiln's word says its harness is gone for good, a wait refuses at once: no runner holds it;
+    /// its startup refused while its process lives; its process ended where it never started, or kiln's
+    /// next word after its end set no restart. One kiln starts again by itself (`again_at`), or whose
+    /// end kiln hasn't decided on yet, is waited on. Refusing every `exited` refuses kiln's restarts.
+    #[test]
+    fn s35_a_wait_refuses_at_once_where_its_harness_is_gone_for_good() {
+        let look = |info: &Value| Watch::new(Asked::Opening, None).look(info, &[], None, false, s(1));
+        assert_eq!(look(&word("crashed")), Verdict::Refuse(Stall::Stuck(Stuck::Crashed)));
+        let refused = with(&word("exited"), "exit", json!({"error": "Cursor isn't signed in", "at": 5}));
+        assert_eq!(look(&refused), Verdict::Refuse(Stall::Stuck(Stuck::Refused { error: Some("Cursor isn't signed in".into()) })));
+        let ended = with(&with(&word("exited"), "runs", Value::Null), "exit", json!({"code": 1, "at": 5, "again_at": 7}));
+        assert_eq!(look(&ended), Verdict::Wait, "kiln starts it again by itself");
+        let never = with(&with(&ended, "exit", json!({"code": 127, "error": "no such file", "at": 5})), "starts", json!([]));
+        assert_eq!(look(&never), Verdict::Refuse(Stall::Stuck(Stuck::Ended { code: Some(127), error: Some("no such file".into()) })));
+        // Its end, then kiln's word on it: none yet, then one that set no restart.
+        let mut w = Watch::new(Asked::Opening, None);
+        let gone = with(&ended, "exit", json!({"code": 1, "at": 5}));
+        assert_eq!(w.look(&gone, &[], None, false, s(1)), Verdict::Wait);
+        assert_eq!(w.look(&gone, &[], None, false, s(2)), Verdict::Wait, "no word of kiln's since");
+        let gone = with(&gone, "last_activity", json!(11));
+        assert_eq!(w.look(&gone, &[], None, false, s(3)), Verdict::Refuse(Stall::Stuck(Stuck::Ended { code: Some(1), error: None })));
+        // An end of another time is a new one, decided on anew.
+        let mut w = Watch::new(Asked::Opening, None);
+        assert_eq!(w.look(&gone, &[], None, false, s(1)), Verdict::Wait);
+        let gone = with(&with(&gone, "exit", json!({"code": 1, "at": 6})), "last_activity", json!(12));
+        assert_eq!(w.look(&gone, &[], None, false, s(2)), Verdict::Wait);
+        // It waits for a person's answer, which a drive never gives.
+        let asks = with(&word("waiting"), "approvals", json!([{"id": "a1", "title": "Run sleep 600"}]));
+        assert_eq!(look(&asks), Verdict::Refuse(Stall::Stuck(Stuck::Asks(vec!["Run sleep 600".into()]))));
+        // kiln's own work has none of these: it is judged by progress alone.
+        assert_eq!(Watch::new(Asked::Kiln, None).look(&word("crashed"), &[], None, false, s(1)), Verdict::Wait);
+    }
+
+    /// Idle, with what it was asked delivered and over (its delivery `completed`) and nothing else on
+    /// its way, a wait refuses at once: no answer is coming. Whose turn ended only the delivery says:
+    /// a message the harness queued itself (Claude Code's, written mid-turn) is still `sent` as it goes
+    /// idle. Judging by kiln's word without the delivery refuses that one.
+    #[test]
+    fn s35_idle_with_its_message_answered_and_nothing_coming_refuses_at_once() {
+        let idle = word("idle");
+        let events = vec![user(1, "m", "go"), says(2, "STUB_DONE")];
+        let over = json!({"delivery": {"m": "completed"}, "queue": []});
+        let mut w = Watch::new(Asked::Message("m"), None);
+        assert!(w.wants_state(&idle, &events));
+        assert_eq!(w.look(&idle, &events, Some(&over), false, s(1)), Verdict::Refuse(Stall::Stuck(Stuck::Answered)));
+        let wait = |info: &Value, state: Option<&Value>| Watch::new(Asked::Message("m"), None).look(info, &events, state, false, s(1));
+        assert_eq!(wait(&idle, None), Verdict::Wait, "its state unread says nothing");
+        assert_eq!(wait(&idle, Some(&json!({"delivery": {"m": "sent"}, "queue": []}))), Verdict::Wait, "the harness holds it");
+        assert_eq!(wait(&idle, Some(&json!({"delivery": {"m": "completed", "k": "started"}, "queue": []}))), Verdict::Wait, "another under way");
+        assert_eq!(wait(&idle, Some(&json!({"delivery": {"m": "completed"}, "queue": [{"id": "k"}]}))), Verdict::Wait, "kiln's queue holds one");
+        for (key, value) in [("queued", json!(1)), ("room_wait", json!(5)), ("pause", json!({"why": "limit"})), ("last_turn", json!({"at": 3, "how": "cut"}))] {
+            let held = with(&idle, key, value);
+            assert!(!Watch::new(Asked::Message("m"), None).wants_state(&held, &events), "{key}");
+        }
+        assert!(!w.wants_state(&word("running"), &events));
+        // The opening prompt, under kiln's id of the session's own; a message told by words it carries
+        // (sent through kiln's MCP tools), under the client id kiln gave it.
+        let opening = vec![user(1, &opening_id("s1"), "do the task")];
+        let opened = json!({"delivery": {opening_id("s1"): "completed"}, "queue": []});
+        assert_eq!(Watch::new(Asked::Opening, None).look(&idle, &opening, Some(&opened), false, s(1)), Verdict::Refuse(Stall::Stuck(Stuck::Answered)));
+        let carried = vec![json!({"seq": 1, "at": 1, "kind": "user", "text": "SLOW=2000 keep going long-x1", "client_id": "k77"})];
+        assert_eq!(Watch::new(Asked::Message("long-x1"), None).look(&idle, &carried, Some(&json!({"delivery": {"k77": "cancelled"}})), false, s(1)), Verdict::Refuse(Stall::Stuck(Stuck::Answered)));
+        assert!(!Watch::new(Asked::Message("long-x2"), None).wants_state(&idle, &carried), "another's words");
+    }
+
+    /// The stand-in's stopped turn says nothing once it heard, until it's stopped: a line of it after
+    /// the stop was taken says it didn't stop, at once. Uncounted (a real harness's), it is judged by
+    /// idle and progress alone.
+    #[test]
+    fn s35_a_stopped_turn_that_says_more_did_not_stop() {
+        let heard = vec![user(1, "stop", "HOLD"), says(2, "HEARD HOLD")];
+        let mut w = Watch::new(Asked::Stop { said: Some(1) }, None);
+        assert_eq!(w.look(&word("running"), &heard, None, false, s(1)), Verdict::Wait);
+        let more = vec![user(1, "stop", "HOLD"), says(2, "HEARD HOLD"), says(3, "line 00000")];
+        assert_eq!(w.look(&word("running"), &more, None, false, s(2)), Verdict::Refuse(Stall::Stuck(Stuck::NotStopped(vec!["line 00000".into()]))));
+        assert_eq!(Watch::new(Asked::Stop { said: None }, None).look(&word("running"), &more, None, false, s(2)), Verdict::Wait);
+        assert_eq!(w.look(&word("idle"), &heard, None, true, s(3)), Verdict::Done);
+    }
+}
+
+// =================================================================================================
 // The stand-in, driven as a process: each interface's turn, steer, stop and resume, as kiln's
 // adapters speak them.
 // =================================================================================================
@@ -743,6 +946,21 @@ mod stub {
         assert_eq!(said(&done, "/assistantMessageEvent/content").last().map(String::as_str), Some("STUB_DONE"));
         Ok(())
     }
+
+    /// The stand-in's held turn (`HOLD`, the drive's turn to stop) says what it heard, then nothing
+    /// more until it's stopped: only a stop ends it, so a line of it after a stop says the stop wasn't
+    /// taken. A stand-in that doesn't hold says its lines and STUB_DONE on its own.
+    #[test]
+    fn s35_a_held_turn_says_nothing_more_until_it_is_stopped() -> anyhow::Result<()> {
+        let mut s = start("pi", &["--mode", "rpc"], &[], None)?;
+        s.send(&json!({"id": "m1", "type": "prompt", "message": crate::vm_e2e::stub_stopped_turn()}))?;
+        s.until(|v| at(v, "/assistantMessageEvent/content").starts_with("HEARD "))?;
+        s.send(&json!({"id": "a1", "type": "abort"}))?;
+        let rest = s.until(|v| at(v, "/type") == "agent_settled")?;
+        assert_eq!(said(&rest, "/assistantMessageEvent/content"), Vec::<String>::new(), "{rest:?}");
+        assert_eq!(rest.last().and_then(|v| v.get("aborted")), Some(&json!(true)));
+        Ok(())
+    }
 }
 
 // =================================================================================================
@@ -762,6 +980,29 @@ mod host {
     #[test]
     fn s34_codex_through_kiln_on_the_host() -> anyhow::Result<()> {
         crate::vm_e2e::on_host("codex", true)
+    }
+
+    /// A wait on a turn that ended without the word it waits for refuses at once, typed, saying where
+    /// the session stands and what it said (kiln plan step 35's waits): the stand-in's first turn over,
+    /// idle, its opening prompt's delivery completed and nothing queued. Taking out `Stuck::Answered`
+    /// (or naming the opening prompt by another id) leaves it waiting on: a first wait has no clock.
+    #[test]
+    fn s35_a_wait_on_a_turn_answered_without_its_word_refuses_at_once() -> anyhow::Result<()> {
+        use crate::vm_e2e::{Asked, Pace, Refused, Stall, Stuck};
+        if std::process::Command::new("python3").arg("--version").output().is_err() {
+            eprintln!("SKIP: the stand-in harness needs python3");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let f = crate::vm_e2e::host_fixture(dir.path())?;
+        let project = crate::vm_e2e::project(dir.path())?;
+        let id = crate::vm_e2e::open(&f, &serde_json::json!({"kind": "pi", "cwd": project, "prompt": "do the task"}))?;
+        let mut pace = Pace::default();
+        let waited = pace.until(&f, &id, Asked::Opening, "pi's first turn", |_, e| crate::vm_e2e::said_marker(&crate::vm_e2e::said(e), "NEVER-SAID"));
+        let refused = waited.as_ref().err().and_then(|e| e.downcast_ref::<Refused>());
+        anyhow::ensure!(refused.is_some_and(|r| r.stall == Stall::Stuck(Stuck::Answered)), "{waited:?}");
+        anyhow::ensure!(refused.is_some_and(|r| r.evidence.contains(r#""status":"idle""#) && r.evidence.contains("completed") && r.evidence.contains("STUB_DONE")), "{waited:?}");
+        pace.stop(&f, &id)
     }
 }
 

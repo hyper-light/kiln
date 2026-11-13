@@ -56,11 +56,13 @@ pub enum Refused {
     Ledger(String),
 }
 
-/// A value leased to a run: the value, and when its lease ends (Unix ms), past which the run's
+/// A value leased to a run: its lease's id in the store, by which it is given back alone
+/// ([`Broker::release_lease`]), the value, and when its lease ends (Unix ms), past which the run's
 /// egress holds it no longer and asks again; none where its provider gives it no end, so that
 /// it is the run's until the run ends.
 #[derive(Debug)]
 pub struct Leased {
+    pub lease: String,
     pub value: SecretValue,
     pub until_ms: Option<i64>,
 }
@@ -227,7 +229,7 @@ impl Broker {
             return Err(no);
         }
         match self.secrets.read_leased(&lease.id).await {
-            Ok(value) => Ok(Leased { value, until_ms }),
+            Ok(value) => Ok(Leased { lease: lease.id, value, until_ms }),
             Err(e) => {
                 self.revoke(vec![lease.id]).await;
                 Err(e.into())
@@ -248,6 +250,19 @@ impl Broker {
             })
             .await?;
         Ok(self.revoke(held).await)
+    }
+
+    /// One lease of the run whose key is `key` given back before the run's end (D242: one its run
+    /// let go of, lapsed before it was passed on, or given after the run released the rest): revoked
+    /// where the ledger holds it for that run and it is not yet revoked, the revocation kept. Whether
+    /// it was revoked now: a lease the ledger holds for another run, or not at all, is not.
+    pub async fn release_lease(&self, key: &str, lease: &str) -> Result<bool, Refused> {
+        identity(key)?;
+        let (k, id) = (key.to_owned(), lease.to_owned());
+        let held = self
+            .ledger(move |c| Ok(c.query_row("SELECT 1 FROM broker_leases WHERE lease_id = ?1 AND key = ?2 AND revoked_ms IS NULL", params![id, k], |_| Ok(())).optional()?.is_some()))
+            .await?;
+        Ok(held && self.revoke(vec![lease.to_owned()]).await == 1)
     }
 
     /// A run moved (D176 part 6): its key `replaced` gives way to `current`. Kept first, so an ask
@@ -366,7 +381,7 @@ fn held_by(c: &Connection, key: &str) -> anyhow::Result<Vec<String>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use kiln_seams::clock::SimClock;
@@ -383,15 +398,15 @@ mod tests {
 
     /// A store of values and a ledger, once with the simulator and once with kiln's store (step
     /// 5's acceptance: swapping SimSecrets for kiln's store changes no other code), and a clock.
-    struct Under {
-        name: &'static str,
-        secrets: Arc<dyn Secrets>,
-        ledger: Store,
-        clock: SimClock,
+    pub(in crate::secrets) struct Under {
+        pub(in crate::secrets) name: &'static str,
+        pub(in crate::secrets) secrets: Arc<dyn Secrets>,
+        pub(in crate::secrets) ledger: Store,
+        pub(in crate::secrets) clock: SimClock,
     }
 
     impl Under {
-        async fn broker(&self) -> anyhow::Result<Broker> {
+        pub(in crate::secrets) async fn broker(&self) -> anyhow::Result<Broker> {
             Broker::open(Arc::clone(&self.secrets), self.ledger.clone(), Arc::new(self.clock.clone())).await
         }
 
@@ -407,7 +422,7 @@ mod tests {
         }
     }
 
-    async fn unders() -> anyhow::Result<Vec<Under>> {
+    pub(in crate::secrets) async fn unders() -> anyhow::Result<Vec<Under>> {
         let sim = SimClock::new();
         let kiln = super::super::seam::tests::Fixture::new().await?;
         Ok(vec![
@@ -444,6 +459,32 @@ mod tests {
                 u.clock.advance(Duration::from_secs(601));
                 anyhow::ensure!(b.lease(B, "sign-ins/claude/ada/access").await.is_err_and(|e| e == Refused::Ended("sign-ins/claude/ada/access".into())), "{store}: a value past its end leased");
                 anyhow::ensure!(b.lease("not-a-key", "providers/anthropic").await.is_err_and(|e| matches!(e, Refused::Identity(_))), "{store}: a malformed identity leased");
+            }
+            Ok(())
+        })
+    }
+
+    /// A lease given back alone (D242: lapsed, or given after its run released the rest) is revoked
+    /// and kept so, the run's other leases and another run's held on; one the ledger holds for
+    /// another run, or none, is given back by no one but its own run.
+    #[test]
+    fn cp_t8_3_a_lease_given_back_alone_is_revoked_alone() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            for u in unders().await? {
+                let (store, b) = (u.name, u.broker().await?);
+                u.secrets.create("providers/anthropic", v("sk-ant-api03-real")).await.map_err(anyhow::Error::msg)?;
+                let (one, two) = (b.lease(A, "providers/anthropic").await.map_err(anyhow::Error::msg)?, b.lease(A, "providers/anthropic").await.map_err(anyhow::Error::msg)?);
+                let theirs = b.lease(B, "providers/anthropic").await.map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(!b.release_lease(B, &one.lease).await.map_err(anyhow::Error::msg)?, "{store}: another run gave back A's lease");
+                anyhow::ensure!(!b.release_lease(A, "no-such-lease").await.map_err(anyhow::Error::msg)?, "{store}: a lease no run holds was given back");
+                anyhow::ensure!(b.release_lease(A, &one.lease).await.map_err(anyhow::Error::msg)?, "{store}: A's own lease wasn't given back");
+                anyhow::ensure!(u.secrets.read_leased(&one.lease).await == Err(Refusal::Expired), "{store}: a lease given back still reads");
+                anyhow::ensure!(!b.release_lease(A, &one.lease).await.map_err(anyhow::Error::msg)?, "{store}: a lease given back twice");
+                for held in [&two, &theirs] {
+                    anyhow::ensure!(u.secrets.read_leased(&held.lease).await.is_ok(), "{store}: a lease not given back stopped reading");
+                }
+                anyhow::ensure!(b.lease(A, "providers/anthropic").await.is_ok(), "{store}: the run leases on after giving one back");
+                anyhow::ensure!(b.release(A).await.map_err(anyhow::Error::msg)? == 2, "{store}: the run's end didn't revoke the two it held");
             }
             Ok(())
         })

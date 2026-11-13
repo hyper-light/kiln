@@ -22,6 +22,7 @@
 
 #![allow(dead_code, reason = "each test uses what it needs")]
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
@@ -862,41 +863,6 @@ pub fn command(f: &Fixture, id: &str, cmd: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Ends the session (the API's DELETE), and waits until kiln lists it no more.
-pub fn stop(f: &Fixture, id: &str) -> anyhow::Result<()> {
-    let (code, body) = common::http_within(f.port, "DELETE", &format!("/api/harness/sessions/{id}"), &f.admin, None, Duration::from_secs(75))?;
-    anyhow::ensure!(code == 204, "ending {id}: {code} {body}");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let (code, _) = common::http(f.port, "GET", &format!("/api/harness/sessions/{id}"), &f.admin, None)?;
-        if code == 404 {
-            return Ok(());
-        }
-        anyhow::ensure!(Instant::now() < deadline, "{id} was still listed a minute after it was ended");
-        std::thread::sleep(Duration::from_millis(300));
-    }
-}
-
-/// Waits until `done` holds of the session and its events: them then.
-pub fn until(f: &Fixture, id: &str, within: Duration, what: &str, done: impl Fn(&Value, &[Value]) -> bool) -> anyhow::Result<(Value, Vec<Value>)> {
-    let deadline = Instant::now() + within;
-    loop {
-        let (i, e) = (info(f, id)?, events(f, id)?);
-        if done(&i, &e) {
-            return Ok((i, e));
-        }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "{what}: not after {within:?} (status {}, exit {}); it said {:?}\n{}",
-            i.get("status").unwrap_or(&Value::Null),
-            i.get("exit").unwrap_or(&Value::Null),
-            said(&e),
-            f.runner_log()
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
 pub fn status(i: &Value) -> &str {
     i.get("status").and_then(Value::as_str).unwrap_or("")
 }
@@ -912,20 +878,444 @@ pub fn said_after(events: &[Value], client: &str) -> Vec<String> {
 }
 
 // ------------------------------------------------------------------------------------------------
-// The drive: start, steer, interrupt, stop and resume, as a person does through kiln's API
+// Waiting on a session: its harness's liveness and progress, never a clock (kiln plan
+// 01a1cd8e862e7169a074db3d5fa33f3d step 35; docs/research/s35-every-harness/waits/README.md)
 // ------------------------------------------------------------------------------------------------
 
-/// How often a drive looks at a session while it waits.
+/// How often a wait looks at its session: a probe's period, which bounds nothing. kiln's own change
+/// notifications (a session's event stream) would take its place (R05; owed, as the note says).
 const POLL: Duration = Duration::from_millis(250);
 
-/// How long a stop may take to be asked and answered: a turn not stopped by then failed to stop.
-const STOP_WITHIN: Duration = Duration::from_secs(60);
-
-/// How long a turn may take: the stand-in's take seconds, a real task's (ROOT's) minutes. A bound on a
-/// failing test's wait, `VM_E2E_TURN_SECS` where ROOT's tasks need more.
-pub fn turn_within() -> Duration {
-    Duration::from_secs(std::env::var("VM_E2E_TURN_SECS").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(600))
+/// What a wait asked of its harness: how its answer is told, and whether an earlier answer bounds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked<'a> {
+    /// The session's opening prompt, which kiln sends under an id made of the session's own
+    /// (`harness::session`'s `first-prompt`).
+    Opening,
+    /// A message the drive sent, by the client id it sent it under or by words of its own it carries
+    /// (one sent through kiln's MCP tools, which take no client id).
+    Message(&'a str),
+    /// A message steered into a turn the drive asked to be long ([`Ask::steered`]), told as an
+    /// [`Asked::Message`] is. No earlier answer bounds a turn asked to take longer: it waits as a
+    /// drive's first wait does, on its harness's liveness and progress alone.
+    Steered(&'a str),
+    /// The turn under way stopped (an interrupt), which idle answers. `said`: the lines the session
+    /// had said as the stop was taken, where its turn says no more (the stand-in's held turn,
+    /// [`stub_stopped_turn`]); none: not counted.
+    Stop { said: Option<usize> },
+    /// Something kiln does of the session rather than its harness (listing it no more once it was
+    /// ended, listing an agent it started): only its progress and the drive's window judge it.
+    Kiln,
 }
+
+/// Why a session can't answer a wait, as kiln's own word on it says: each a state kiln leaves only at
+/// a person's word, which a drive never gives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stuck {
+    /// No runner holds its harness (`Status::Crashed`): only a person's resume takes it up.
+    Crashed,
+    /// Its startup was refused while its process lives (`exited` with a process still running: an
+    /// ACP agent's refused startup, CP-T3.2): a sign-in or a restart takes it on.
+    Refused { error: Option<String> },
+    /// Its process ended and kiln starts it no more: it never started, or kiln's word after its end
+    /// set no restart (`ExitInfo::again_at`, which kiln sets where it starts it again by itself).
+    Ended { code: Option<i64>, error: Option<String> },
+    /// Idle: what it was asked delivered and its delivery over, and nothing else on its way.
+    Answered,
+    /// It waits for a person's answer: its approvals, by title.
+    Asks(Vec<String>),
+    /// It said more after its stop was taken: those lines.
+    NotStopped(Vec<String>),
+}
+
+impl std::fmt::Display for Stuck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Crashed => write!(f, "no runner holds its harness (crashed): only a person's resume takes it up"),
+            Self::Refused { error } => write!(f, "its startup was refused while its process lives ({}): a sign-in or a restart takes it on", error.as_deref().unwrap_or("kiln gave no reason")),
+            Self::Ended { code, error } => {
+                let code = code.map_or_else(|| "none".to_owned(), |c| c.to_string());
+                write!(f, "its process ended (code {code}, {}) and kiln starts it no more", error.as_deref().unwrap_or("no error"))
+            }
+            Self::Answered => write!(f, "it is idle, what it was asked delivered and its turn over, with nothing queued or under way: no answer is coming"),
+            Self::Asks(titles) => write!(f, "it waits for a person's answer, which a drive never gives: {titles:?}"),
+            Self::NotStopped(lines) => write!(f, "it went on after its stop was taken: {lines:?}"),
+        }
+    }
+}
+
+/// Why a wait ended without its answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stall {
+    /// The session can't answer it.
+    Stuck(Stuck),
+    /// No progress for a whole window as long as the slowest answer its harness gave in this drive.
+    Quiet { quiet: Duration, slowest: Duration },
+}
+
+impl std::fmt::Display for Stall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stuck(s) => std::fmt::Display::fmt(s, f),
+            Self::Quiet { quiet, slowest } => write!(f, "no progress for {quiet:?}, a whole window as long as its slowest answer in this drive ({slowest:?})"),
+        }
+    }
+}
+
+/// A wait's refusal: what it waited for, why it ended (typed), and kiln's word on the session then
+/// ([`told`]).
+#[derive(Debug)]
+pub struct Refused {
+    pub what: String,
+    pub stall: Stall,
+    pub evidence: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}\n{}", self.what, self.stall, self.evidence)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// What a drive has learned of its harness's answers: the slowest so far, each one whole wait from the
+/// drive's ask to its answer; none before its first, the drive's cold start. The one value its waits
+/// are bounded by: nothing is picked, seeded or carried over from another run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pace {
+    slowest: Option<Duration>,
+}
+
+/// What a look at a session tells its wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Its condition holds.
+    Done,
+    /// Its answer may still come.
+    Wait,
+    /// It won't.
+    Refuse(Stall),
+}
+
+/// kiln's word on a session whose change is progress: its harness's and kiln's work on it. Not
+/// `last_activity`, which every state of it kiln is sent moves, the same state again included.
+const MOVES: [&str; 18] = [
+    "status", "queued", "doing", "activity", "turn_started", "last_turn", "exit", "runs", "starts", "approvals", "tasks_running", "subagents", "pause", "frozen", "room_wait", "admission", "harness_session", "mode",
+];
+
+/// kiln's word on a session that a wait's evidence shows: what moves, what holds it, and when kiln
+/// last heard of it.
+const TOLD_FIELDS: [&str; 21] = [
+    "status", "queued", "doing", "activity", "turn_started", "last_turn", "exit", "runs", "starts", "approvals", "tasks_running", "subagents", "pause", "frozen", "room_wait", "admission", "harness_session", "mode", "held", "refused", "last_activity",
+];
+
+/// How much of each event's words a wait's evidence shows: the first 80 characters, as ROOT asked of
+/// it (2026-11-13), whole where shorter.
+const TOLD: usize = 80;
+
+/// One wait's memory of its looks at its session ([`Watch::look`]).
+#[derive(Debug, Clone)]
+pub struct Watch<'a> {
+    asked: Asked<'a>,
+    window: Option<Duration>,
+    /// What of the session moves ([`moving`]), as last seen.
+    seen: Option<Value>,
+    /// When it last moved, from the wait's start: the drive's ask, at zero.
+    moved: Duration,
+    /// An end of its harness's that kiln had set no restart for yet: its `exit.at`, and kiln's word's
+    /// time (`last_activity`) when it was seen.
+    end: Option<(i64, i64)>,
+}
+
+impl<'a> Watch<'a> {
+    pub fn new(asked: Asked<'a>, window: Option<Duration>) -> Self {
+        Self { asked, window, seen: None, moved: Duration::ZERO, end: None }
+    }
+
+    /// The message the wait asked for an answer to, by what [`is_message`] takes: none for a stop and
+    /// for kiln's own work.
+    fn message(&self, info: &Value) -> Option<String> {
+        match self.asked {
+            Asked::Opening => Some(opening_id(info.get("id").and_then(Value::as_str).unwrap_or_default())),
+            Asked::Message(m) | Asked::Steered(m) => Some(m.to_owned()),
+            Asked::Stop { .. } | Asked::Kiln => None,
+        }
+    }
+
+    /// Whether this look's verdict needs the session's state (each of its messages' delivery, which
+    /// only its viewers are sent): kiln's word says it may have answered what it was asked
+    /// ([`may_have_answered`]).
+    pub fn wants_state(&self, info: &Value, events: &[Value]) -> bool {
+        self.message(info).is_some_and(|m| may_have_answered(info, events, &m).is_some())
+    }
+
+    /// A look at kiln's word on the session (`info`), its timeline (`events`) and, where
+    /// [`Watch::wants_state`] asked for it, its state (`state`), `at` after the wait began, `done` its
+    /// caller's condition of them: done; refused at once where kiln's word says no answer can come;
+    /// refused where a window is known and nothing that moves moved for a whole one; else it waits on.
+    pub fn look(&mut self, info: &Value, events: &[Value], state: Option<&Value>, done: bool, at: Duration) -> Verdict {
+        if done {
+            return Verdict::Done;
+        }
+        if let Some(stuck) = self.stuck(info, events, state) {
+            return Verdict::Refuse(Stall::Stuck(stuck));
+        }
+        let now = moving(info, events);
+        if self.seen.as_ref() != Some(&now) {
+            if self.seen.is_some() {
+                self.moved = at;
+            }
+            self.seen = Some(now);
+        }
+        let quiet = at.saturating_sub(self.moved);
+        match self.window {
+            Some(slowest) if quiet > slowest => Verdict::Refuse(Stall::Quiet { quiet, slowest }),
+            _ => Verdict::Wait,
+        }
+    }
+
+    fn stuck(&mut self, info: &Value, events: &[Value], state: Option<&Value>) -> Option<Stuck> {
+        if self.asked == Asked::Kiln {
+            return None;
+        }
+        if let Some(ended) = self.ended(info) {
+            return Some(ended);
+        }
+        let asks: Vec<String> = info.get("approvals").and_then(Value::as_array).into_iter().flatten().map(|a| a.get("title").and_then(Value::as_str).unwrap_or_default().to_owned()).collect();
+        if !asks.is_empty() {
+            return Some(Stuck::Asks(asks));
+        }
+        if let Asked::Stop { said: Some(n) } = self.asked {
+            return said(events).get(n..).filter(|more| !more.is_empty()).map(|more| Stuck::NotStopped(more.to_vec()));
+        }
+        let client = self.message(info).and_then(|m| may_have_answered(info, events, &m))?;
+        state.is_some_and(|s| answered_in(s, &client)).then_some(Stuck::Answered)
+    }
+
+    /// Its harness gone for good, by kiln's word: no runner holds it; its startup refused while its
+    /// process lives; or its process ended with no restart set, where it never started (kiln starts
+    /// again only what started) or kiln has said a word of it since its end and set none. kiln sends
+    /// an end and its decision on it one after the other, so an end with no restart yet is waited on
+    /// until kiln's next word.
+    fn ended(&mut self, info: &Value) -> Option<Stuck> {
+        match status(info) {
+            "crashed" => return Some(Stuck::Crashed),
+            "exited" => {}
+            _ => {
+                self.end = None;
+                return None;
+            }
+        }
+        let exit = info.get("exit").unwrap_or(&Value::Null);
+        let error = exit.get("error").and_then(Value::as_str).map(str::to_owned);
+        if present(info, "runs") {
+            return Some(Stuck::Refused { error });
+        }
+        if present(exit, "again_at") {
+            self.end = None;
+            return None;
+        }
+        let code = exit.get("code").and_then(Value::as_i64);
+        if info.get("starts").and_then(Value::as_array).is_none_or(Vec::is_empty) {
+            return Some(Stuck::Ended { code, error });
+        }
+        let at = exit.get("at").and_then(Value::as_i64).unwrap_or_default();
+        let word = info.get("last_activity").and_then(Value::as_i64).unwrap_or_default();
+        match self.end {
+            Some((seen, then)) if seen == at => (word > then).then_some(Stuck::Ended { code, error }),
+            _ => {
+                self.end = Some((at, word));
+                None
+            }
+        }
+    }
+}
+
+/// Whether `v` has `key`, not null.
+fn present(v: &Value, key: &str) -> bool {
+    v.get(key).is_some_and(|x| !x.is_null())
+}
+
+/// The id kiln sends session `session`'s opening prompt under (`harness::session`: made once, of the
+/// session's own).
+pub fn opening_id(session: &str) -> String {
+    kiln::util::derive_id(&["first-prompt", session])
+}
+
+/// Whether timeline event `e` is message `m`: a person's words under client id `m`, or carrying `m`.
+fn is_message(e: &Value, m: &str) -> bool {
+    !m.is_empty() && e.get("kind").and_then(Value::as_str) == Some("user") && (e.get("client_id").and_then(Value::as_str) == Some(m) || e.get("text").and_then(Value::as_str).is_some_and(|t| t.contains(m)))
+}
+
+/// Where kiln's word says the session may have answered message `m` with nothing more to come: idle,
+/// `m` in its timeline, nothing queued, under way, waiting for room or paused, and its last turn not
+/// one kiln may keep going (`cut`, `limit`). `m`'s client id then, which its delivery is kept under:
+/// whose turn ended only the delivery says ([`answered_in`]), as a harness that queues a message
+/// itself (Claude Code's, written mid-turn) is idle with it still to answer.
+fn may_have_answered(info: &Value, events: &[Value], m: &str) -> Option<String> {
+    let count = |key: &str| info.get(key).and_then(Value::as_u64).unwrap_or_default();
+    let live = info.get("subagents").and_then(Value::as_array).into_iter().flatten().any(|t| t.get("status").and_then(Value::as_str).is_some_and(kiln::harness::model::live_task));
+    let kept = info.get("last_turn").and_then(|t| t.get("how")).and_then(Value::as_str).is_some_and(|how| matches!(how, "cut" | "limit"));
+    let calm = status(info) == "idle" && count("queued") == 0 && count("tasks_running") == 0 && !live && !kept && !["pause", "room_wait", "frozen"].iter().any(|key| present(info, key));
+    if !calm {
+        return None;
+    }
+    events.iter().find(|e| is_message(e, m)).and_then(|e| e.get("client_id")).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Whether the session's `state` says message `client` was answered and nothing else is on its way:
+/// its delivery over (`completed`, `cancelled`), every other message's too, and kiln's queue empty. A
+/// delivery its viewers are sent only a reference to says nothing.
+fn answered_in(state: &Value, client: &str) -> bool {
+    let over = |d: &Value| matches!(d.as_str(), Some("completed" | "cancelled"));
+    let delivery = state.get("delivery").and_then(Value::as_object);
+    delivery.is_some_and(|d| d.get(client).is_some_and(over) && d.values().all(over)) && state.get("queue").and_then(Value::as_array).is_none_or(Vec::is_empty)
+}
+
+/// What of a session moves as its harness and kiln work on it: kiln's word on it ([`MOVES`]) and its
+/// timeline.
+fn moving(info: &Value, events: &[Value]) -> Value {
+    let word: Vec<Value> = MOVES.iter().map(|key| info.get(*key).cloned().unwrap_or(Value::Null)).collect();
+    json!([word, events])
+}
+
+/// `text` on one line: its first [`TOLD`] characters, `…` where it's cut.
+fn head(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(TOLD) {
+        Some((cut, _)) => format!("{}…", flat.get(..cut).unwrap_or_default()),
+        None => flat,
+    }
+}
+
+/// A timeline event on one line: its order, kind, message id (a person's words), tool and status (a
+/// call), level (a notice), and the first [`TOLD`] characters of what it says.
+fn event_line(e: &Value) -> String {
+    let field = |key: &str| e.get(key).and_then(Value::as_str);
+    let mut line = format!("#{} {}", e.get("seq").and_then(Value::as_u64).unwrap_or_default(), field("kind").unwrap_or("?"));
+    for key in ["client_id", "name", "status", "level"] {
+        if let Some(v) = field(key) {
+            let _ = write!(line, " {v}");
+        }
+    }
+    let _ = write!(line, ": {}", head(field("text").or_else(|| field("output")).or_else(|| field("title")).unwrap_or_default()));
+    line
+}
+
+/// kiln's word on a session, for a wait that ended without its answer: where it stands
+/// ([`TOLD_FIELDS`]); each of its messages' delivery and its queue, from its state as its viewers get
+/// it (`state`, or why it couldn't be read); and its timeline, an event a line ([`event_line`]).
+pub fn told(info: &Value, state: &anyhow::Result<Value>, events: &[Value]) -> String {
+    let mut out = String::new();
+    let word: serde_json::Map<String, Value> = TOLD_FIELDS.iter().filter_map(|key| info.get(*key).filter(|v| !v.is_null()).map(|v| ((*key).to_owned(), v.clone()))).collect();
+    let _ = writeln!(out, "kiln's word on it: {}", Value::Object(word));
+    match state {
+        Ok(s) => {
+            let _ = writeln!(out, "its messages' delivery: {}", s.get("delivery").unwrap_or(&Value::Null));
+            let queue: Vec<String> = s.get("queue").and_then(Value::as_array).into_iter().flatten().map(|q| format!("{} {}", q.get("id").and_then(Value::as_str).unwrap_or("?"), head(q.get("text").and_then(Value::as_str).unwrap_or_default()))).collect();
+            let _ = writeln!(out, "its queue: {queue:?}");
+            if let Some(deferred) = s.pointer("/view/deferred").filter(|d| d.as_object().is_some_and(|m| !m.is_empty())) {
+                let _ = writeln!(out, "of its state, sent as references only: {deferred}");
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "its state (each message's delivery, its queue) couldn't be read: {e:#}");
+        }
+    }
+    let _ = writeln!(out, "its timeline, {} events:", events.len());
+    for e in events {
+        let _ = writeln!(out, "  {}", event_line(e));
+    }
+    out
+}
+
+/// The session's state as kiln sends its viewers (each message's delivery, its queue): the state frame
+/// of what its socket sends on attaching.
+fn state_of(f: &Fixture, id: &str) -> anyhow::Result<Value> {
+    let (frames, _) = common::agents::attach(f.port, &f.admin, id, "")?;
+    frames.into_iter().find(|frame| frame.get("t").and_then(Value::as_str) == Some("state")).and_then(|frame| frame.get("state").cloned()).ok_or_else(|| anyhow::anyhow!("its viewers' socket sent no state"))
+}
+
+/// A wait on session `id` refused: typed, with kiln's word on it then and its runner's log.
+fn refused(f: &Fixture, id: &str, what: &str, stall: Stall, info: &Value, events: &[Value]) -> anyhow::Error {
+    let evidence = format!("{}its runner's log, its last lines:\n{}", told(info, &state_of(f, id), events), f.runner_log());
+    anyhow::Error::new(Refused { what: what.to_owned(), stall, evidence })
+}
+
+impl Pace {
+    /// The slowest answer so far.
+    pub fn slowest(&self) -> Option<Duration> {
+        self.slowest
+    }
+
+    /// The longest a wait on `asked` may go without progress: none before the drive's first answer,
+    /// nor for a turn the drive asked to be long ([`Asked::Steered`]), which follow the harness's
+    /// liveness and progress alone.
+    pub fn window(&self, asked: Asked<'_>) -> Option<Duration> {
+        if matches!(asked, Asked::Steered(_)) { None } else { self.slowest }
+    }
+
+    /// An answer that took `took`.
+    pub fn answered(&mut self, took: Duration) {
+        self.slowest = Some(self.slowest.map_or(took, |s| s.max(took)));
+    }
+
+    /// Waits on session `id` until `done` holds of kiln's word on it and its timeline, following its
+    /// harness ([`Watch`]): the time its answer took is learned; refused, typed ([`Refused`]), where
+    /// kiln's word says no answer can come, or once a whole window passes without progress where the
+    /// drive has learned one ([`Pace::window`]).
+    pub fn until(&mut self, f: &Fixture, id: &str, asked: Asked<'_>, what: &str, done: impl Fn(&Value, &[Value]) -> bool) -> anyhow::Result<(Value, Vec<Value>)> {
+        let began = Instant::now();
+        let mut watch = Watch::new(asked, self.window(asked));
+        loop {
+            let (i, e) = (info(f, id)?, events(f, id)?);
+            let held = done(&i, &e);
+            // Its state read only where kiln's word says it may have answered; unread, it says nothing.
+            let state = if !held && watch.wants_state(&i, &e) { state_of(f, id).ok() } else { None };
+            match watch.look(&i, &e, state.as_ref(), held, began.elapsed()) {
+                Verdict::Done => {
+                    self.answered(began.elapsed());
+                    return Ok((i, e));
+                }
+                Verdict::Wait => std::thread::sleep(POLL),
+                Verdict::Refuse(stall) => return Err(refused(f, id, what, stall, &i, &e)),
+            }
+        }
+    }
+
+    /// Waits until kiln lists session `id` no more (it was ended), as [`Pace::until`] waits: on kiln's
+    /// word on it moving while it's listed.
+    pub fn unlisted(&mut self, f: &Fixture, id: &str, what: &str) -> anyhow::Result<()> {
+        let began = Instant::now();
+        let mut watch = Watch::new(Asked::Kiln, self.window(Asked::Kiln));
+        loop {
+            let (code, body) = common::http(f.port, "GET", &format!("/api/harness/sessions/{id}"), &f.admin, None)?;
+            if code == 404 {
+                self.answered(began.elapsed());
+                return Ok(());
+            }
+            anyhow::ensure!(code == 200, "{what}: GET its session: {code} {body}");
+            let i: Value = serde_json::from_str(&body)?;
+            match watch.look(&i, &[], None, false, began.elapsed()) {
+                Verdict::Refuse(stall) => return Err(refused(f, id, what, stall, &i, &[])),
+                Verdict::Done | Verdict::Wait => std::thread::sleep(POLL),
+            }
+        }
+    }
+
+    /// Ends session `id` (the API's DELETE), and waits until kiln lists it no more ([`Pace::unlisted`]).
+    pub fn stop(&mut self, f: &Fixture, id: &str) -> anyhow::Result<()> {
+        // Longer than the server waits for its runner's answer (`hub::COMMAND_WITHIN`).
+        let (code, body) = common::http_within(f.port, "DELETE", &format!("/api/harness/sessions/{id}"), &f.admin, None, Duration::from_secs(75))?;
+        anyhow::ensure!(code == 204, "ending {id}: {code} {body}");
+        self.unlisted(f, id, &format!("ending {id}"))
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// The drive: start, steer, interrupt, stop and resume, as a person does through kiln's API
+// ------------------------------------------------------------------------------------------------
 
 /// The stand-in's long turn, steered into: each line a few looks of the drive apart, so a message
 /// steered in as the drive sees the turn begin lands while it still runs.
@@ -933,10 +1323,10 @@ pub fn stub_steered_turn() -> String {
     format!("SLOW={} keep going", (POLL * 8).as_millis())
 }
 
-/// The stand-in's long turn, stopped: each line [`STOP_WITHIN`] apart, so a turn that wasn't stopped
-/// can't end while the drive waits for its stop.
+/// The stand-in's turn to stop: it holds once it said what it heard, and only a stop ends it, so a
+/// stop that isn't taken shows as the turn going on (no progress, or a line of it after the stop).
 pub fn stub_stopped_turn() -> String {
-    format!("SLOW={} go on until stopped", STOP_WITHIN.as_millis())
+    "HOLD go on until stopped".to_owned()
 }
 
 /// What a drive asks of one harness.
@@ -1040,10 +1430,12 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     let nonce = nonce();
     let mut inventory = Inventory::new(programs);
     let look = |inv: &mut Inventory| if roots.is_empty() { Ok(()) } else { inv.look(roots) };
+    // Each wait follows the harness, bounded by its slowest answer in this drive once it gave one.
+    let mut pace = Pace::default();
 
     // Start: its first turn runs to its end.
     let id = open(f, &ask.spec(&ask.prompt, None))?;
-    let (first_info, events) = until(f, &id, turn_within(), &format!("{kind}'s first turn"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
+    let (first_info, events) = pace.until(f, &id, Asked::Opening, &format!("{kind}'s first turn"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
     look(&mut inventory)?;
     let first = said(&events);
 
@@ -1051,20 +1443,22 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     // next), answered.
     let (long, steer) = (format!("long-{nonce}"), format!("steer-{nonce}"));
     send(f, &id, &long, &ask.steered, "queue")?;
-    until(f, &id, turn_within(), &format!("{kind}'s long turn under way"), |i, e| under_way(i, e, &long))?;
+    pace.until(f, &id, Asked::Message(&long), &format!("{kind}'s long turn under way"), |i, e| under_way(i, e, &long))?;
     send(f, &id, &steer, &format!("STEER {nonce}"), "steer")?;
-    until(f, &id, turn_within(), &format!("{kind} answering what was steered in"), |i, e| {
+    pace.until(f, &id, Asked::Steered(&steer), &format!("{kind} answering what was steered in"), |i, e| {
         status(i) == "idle" && delivered_at(e, &steer).is_some() && (!ask.stub() || said(e).iter().any(|l| (l.starts_with("STEERED ") || l.starts_with("HEARD ")) && l.contains(&nonce)))
     })?;
     look(&mut inventory)?;
 
-    // Interrupt: a turn under way stops at once.
+    // Interrupt: a turn under way stops at once. The stand-in's holds once it said what it heard, and
+    // only a stop ends it: a line of it after the stop was taken says it didn't stop.
     let stop_me = format!("stop-{nonce}");
     send(f, &id, &stop_me, &ask.stopped, "queue")?;
-    until(f, &id, turn_within(), &format!("{kind}'s turn to stop under way"), |i, e| under_way(i, e, &stop_me))?;
+    pace.until(f, &id, Asked::Message(&stop_me), &format!("{kind}'s turn to stop under way"), |i, e| under_way(i, e, &stop_me) && (!ask.stub() || said_after(e, &stop_me).iter().any(|l| l.starts_with("HEARD "))))?;
     look(&mut inventory)?;
     words(f, &id, json!({"type": "interrupt"}))?;
-    let (_, e) = until(f, &id, STOP_WITHIN, &format!("{kind} stopping its turn"), |i, _| status(i) == "idle")?;
+    let held = if ask.stub() { Some(said(&self::events(f, &id)?).len()) } else { None };
+    let (_, e) = pace.until(f, &id, Asked::Stop { said: held }, &format!("{kind} stopping its turn"), |i, _| status(i) == "idle")?;
     if ask.stub() {
         anyhow::ensure!(!said_marker(&said_after(&e, &stop_me), ask.marker), "{kind}: the stopped turn ran to its end");
     }
@@ -1086,21 +1480,16 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     }
 
     // The agent it started from where it runs, and the audit trail's word on its start; then it's
-    // ended.
+    // ended. kiln lists it as it answers its start, inside the first turn: kiln's work, waited on in
+    // the drive's window.
     let (mut child, mut audit) = (None, Vec::new());
     if ask.child {
-        let deadline = Instant::now() + turn_within();
-        let found = loop {
-            let all = f.get("/api/harness/sessions")?;
-            if let Some(c) = all.as_array().into_iter().flatten().find(|s| s.get("parent").and_then(Value::as_str) == Some(id.as_str())) {
-                break c.clone();
-            }
-            anyhow::ensure!(Instant::now() < deadline, "{kind} started no agent from where it runs; it said {first:?}");
-            std::thread::sleep(POLL);
-        };
+        let child_of = || f.get("/api/harness/sessions").ok().and_then(|all| all.as_array().into_iter().flatten().find(|s| s.get("parent").and_then(Value::as_str) == Some(id.as_str())).cloned());
+        pace.until(f, &id, Asked::Kiln, &format!("{kind} started no agent from where it runs that kiln lists; it said {first:?}"), |_, _| child_of().is_some())?;
+        let found = child_of().ok_or_else(|| anyhow::anyhow!("{kind} started no agent from where it runs; it said {first:?}"))?;
         audit = f.get(&format!("/api/audit?q={}&limit=1000", id.get(..8).unwrap_or(&id)))?.as_array().cloned().unwrap_or_default();
         if let Some(c) = found.get("id").and_then(Value::as_str) {
-            stop(f, c)?;
+            pace.stop(f, c)?;
         }
         child = Some(found);
     }
@@ -1108,16 +1497,16 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     // Stop: ended for good.
     let last = info(f, &id)?;
     let hs = last.get("harness_session").and_then(Value::as_str).map(str::to_owned);
-    stop(f, &id)?;
+    pace.stop(f, &id)?;
 
     // Resume: a new session takes its conversation up again, its harness's own session.
     let hs = hs.ok_or_else(|| anyhow::anyhow!("{kind}: kiln knows no harness session of {id} to take up again"))?;
     let resumed = open(f, &ask.spec(&ask.resumed, Some(&hs)))?;
-    let (resumed_info, _) = until(f, &resumed, turn_within(), &format!("{kind} taking its conversation up again"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
+    let (resumed_info, _) = pace.until(f, &resumed, Asked::Opening, &format!("{kind} taking its conversation up again"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
     look(&mut inventory)?;
     let took_up = resumed_info.get("harness_session").unwrap_or(&Value::Null);
     anyhow::ensure!(took_up.as_str() == Some(hs.as_str()), "{kind}: the resumed session's harness session is {took_up}, not {hs}");
-    stop(f, &resumed)?;
+    pace.stop(f, &resumed)?;
     Ok(Drove { id, info: first_info, first, events, links, child, audit, last, resumed, resumed_info, inventory })
 }
 
