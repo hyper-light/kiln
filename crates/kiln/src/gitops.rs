@@ -324,8 +324,9 @@ pub async fn trigger(hub: &Hub, repo: &Repo, t: Trigger) -> anyhow::Result<Vec<R
             false
         }
     };
-    // With `[ci] kiln_workflows` the engine ran the commit's `.kiln/` workflows too: v1 stands aside.
-    if github && hub.cfg.ci.kiln_workflows {
+    // With the repository's `kiln_workflows`, else `[ci] kiln_workflows` (W29-R16), the engine ran
+    // the commit's `.kiln/` workflows too: v1 stands aside.
+    if github && crate::ci::repo_config::kiln_workflows(hub, repo).await {
         return Ok(vec![]);
     }
     let pipelines = load_pipelines_opt(hub, repo, &t.sha, !github).await?;

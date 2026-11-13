@@ -75,7 +75,7 @@ async fn repo_tick(hub: &Hub, repo: &Repo, minute: i64, cache: &mut Cache, live:
     let Some(sha) = refs.get(&head).cloned() else { return Ok(()) };
     live.push((repo.id.clone(), sha.clone()));
     let commit = cache.get(hub, repo, &sha).await?;
-    for (l, i, s) in entries(&commit, hub.cfg.ci.kiln_workflows) {
+    for (l, i, s) in entries(&commit, super::repo_config::kiln_workflows(hub, repo).await) {
         if let Err(e) = entry(hub, repo, &refs, &head, &sha, l, i, s, minute, cache, live).await {
             tracing::warn!(repo = %repo.name, workflow = %l.path, cron = %s.cron, error = %format!("{e:#}"), "a schedule could not run");
         }
@@ -84,8 +84,9 @@ async fn repo_tick(hub: &Hub, repo: &Repo, minute: i64, cache: &mut Cache, live:
 }
 
 /// The schedule entries of a commit's workflows the engine starts, each with its index in its
-/// workflow: GitHub's, and the kiln dialect's only once `[ci] kiln_workflows` takes them off v1,
-/// as for every other event (`events::on_trigger`). v1's scheduler fires them otherwise: with the
+/// workflow: GitHub's, and the kiln dialect's only once the repository's `kiln_workflows`, else
+/// `[ci] kiln_workflows` (W29-R16), takes them off v1, as for every other event
+/// (`events::on_trigger`). v1's scheduler fires them otherwise: with the
 /// engine on and `kiln_workflows` off, both did, and each `.kiln/` schedule ran twice (W28 step 3's
 /// replay: wire-lab's and sim's every night).
 fn entries(commit: &load::Commit, kiln_workflows: bool) -> Vec<(&load::Loaded, usize, &Schedule)> {
