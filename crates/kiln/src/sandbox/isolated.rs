@@ -82,6 +82,9 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
         limits: Limits::NONE,
         egress: Egress::Any,
         boundary: Boundary::MicroVm { image },
+        // No credential granted by reference yet (D242): its harness signs in natively until its sign-in is captured
+        // outside the microVM (plan step 33's steps 6 and 8), so nothing is filled in at its egress.
+        credentials: Vec::new(),
     })
 }
 
