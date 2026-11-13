@@ -1,0 +1,109 @@
+[package]
+name = "hex-cli"
+description = "Hex: the scheduler and runtime: agent scheduling orchestration for infinite scale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "hex"
+path = "src/main.rs"
+
+# The noisy-neighbour benchmark (AC-T7.1.2): a custom harness (fn main), driving the `hex` binary.
+[[bench]]
+name = "noisy_neighbor"
+harness = false
+
+[dependencies]
+serde_json.workspace = true
+hex-client.workspace = true
+# Actual configured Shards backend now initializes on every supported host.
+shards-api.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hex-api.workspace = true
+hex-client.workspace = true
+hex-core.workspace = true
+hex-node.workspace = true
+# `hex node --quic` and `hex node enroll` (src/node.rs; docs/design/hex-quic.md Q9).
+hex-quic.workspace = true
+hex-runtime.workspace = true
+rustix.workspace = true
+# `hex selftest-box tree`'s file hashes (HEX-GUEST-21, selftest/tree.rs).
+sha2.workspace = true
+socket2.workspace = true
+
+# macOS: the box helper daemon subcommand (`hex __box-helper`) drives hex-runtime's macOS daemon, and
+# `hex node` on macOS (native plan step 8b) runs the node over the macOS runtime and its Shards guest,
+# seeding its boxes' pacing from its machine class's records (hex-core's watch).
+[target.'cfg(target_os = "macos")'.dependencies]
+hex-api.workspace = true
+hex-core.workspace = true
+hex-node.workspace = true
+# `hex node --quic` and `hex node enroll` (src/node.rs; docs/design/hex-quic.md Q9).
+hex-quic.workspace = true
+hex-runtime.workspace = true
+rustix.workspace = true
+
+# `hex node` on Windows (native plan step 8): the node over the Windows runtime, and `hex keep`, its
+# keeper. The Windows oci class's launcher (`hex oci-launch`), which HCS runs inside each container
+# (hex_runtime::windows::oci::launch), the selftest's device probe, and `hex setup features`, the Windows
+# node's own bounded feature query for the installer.
+[target.'cfg(target_os = "windows")'.dependencies]
+hex-api.workspace = true
+hex-core.workspace = true
+hex-node.workspace = true
+# `hex node --quic` and `hex node enroll` (src/node.rs; docs/design/hex-quic.md Q9).
+hex-quic.workspace = true
+hex-runtime.workspace = true
+
+[dev-dependencies]
+# The conformance suite over the node's QUIC listener (tests/quic_conformance.rs).
+hex-quic.workspace = true
+# AC-T7.4.1: the managed API controls retain the same fallible native receipt.
+triomphe.workspace = true
+hex-api.workspace = true
+# The oci class through a Shards guest (docs/design/shards-guest.md): its simulator on Linux
+# (tests/node_socket.rs, HEX-GUEST-14) and the real client where a guest is given (tests/guest_real.rs).
+# HEX-GUEST-20 writes its lab's config.json (tests/guest_validation.rs).
+serde_json.workspace = true
+shards-api.workspace = true
+# HEX-GUEST-19 and -20 give roots as tarballs, as §4a's roots may be (tests/guest_real.rs,
+# tests/guest_validation.rs).
+flate2.workspace = true
+# HEX-GUEST-21 names each layer by its sha256, as its image does (tests/guest_tree.rs).
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+# The records the tests' waits take, and their census (tests/completion_backends.rs's on every OS).
+hex-testkit.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+hex-node = { workspace = true, features = ["test-controls"] }
+
+# The macOS process class's conformance test (tests/macos_process_box.rs) drives hex-runtime's macOS
+# runtime with the `hex selftest-box` programs this crate's binary provides.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+hex-core.workspace = true
+hex-client.workspace = true
+
+# The Windows process class's conformance test (tests/windows_process_box.rs) drives hex-runtime's
+# Windows runtime; windows-sys is for the test's own check that a deleted box's grandchild is gone. The
+# oci class's test (tests/windows_oci_box.rs) writes its bundles' config.json with serde_json.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+hex-core.workspace = true
+hex-afunix.workspace = true
+hex-client.workspace = true
+hex-runtime.workspace = true
+serde_json.workspace = true
+windows-sys.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# ROOT-only macOS trusted-entry measurement, off for normal builds.
+native-trusted-entry-measurement = ["hex-runtime/native-trusted-entry-measurement"]

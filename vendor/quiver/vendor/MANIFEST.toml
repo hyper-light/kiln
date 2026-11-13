@@ -1,0 +1,56 @@
+# What Quiver vendors, each project at one revision (kiln's docs/vendoring.md). scripts/vendor.py
+# reads it; kiln, vendoring Quiver, holds every project named here at the same revision.
+format = 1
+
+# Quiver's gate, run after a re-vendor.
+gate = ["bash scripts/gates.sh"]
+
+# Focal's event bus (docs/design/focal-bus.md): the bus and the crates of Focal's it builds on, from
+# Focal's branch `bus-replicated`. The shared crates it builds on are hyper-raft's, taken below at
+# the revision this commit of the bus takes (Focal's vendor/README.md); Focal's own copies of them
+# stay out, and the bus reaches them by name through `[patch.crates-io]` in Quiver's Cargo.toml
+# (the root manifest's change, vendor/focal-bus/UPSTREAM.md).
+[projects.focal-bus]
+kind = "git"
+repository = "https://github.com/hyper-light/focal"
+commit = "9aded7cdf0a596f35039acb9b4e610c52f9d1f0a"
+path = "vendor/focal-bus"
+take = [
+  "Cargo.toml",
+  "LICENSE",
+  "crates/focal-bus",
+  "crates/focal-memory",
+  "crates/focal-platform",
+  "crates/focal-seal",
+  "crates/focal-timing",
+]
+own = ["UPSTREAM.md"]
+
+# hyper-raft's shared crates at the revision Focal's bus takes: the runtime, the transport over QUIC
+# and TLS, the consensus core, the durable shell over the log and the block layer, the liveness
+# stream, sealing at rest, and their measurement and simulation crates.
+[projects.hyper-raft]
+kind = "git"
+repository = "https://github.com/hyper-light/hyper-raft"
+commit = "fb74b59533908472ade7e526eb08117601cede0e"
+path = "vendor/hyper-raft"
+take = [
+  "Cargo.toml",
+  "LICENSE",
+  "crates/hyper-block",
+  "crates/hyper-datagram",
+  "crates/hyper-durable",
+  "crates/hyper-liveness",
+  "crates/hyper-log",
+  "crates/hyper-measure",
+  "crates/hyper-quic",
+  "crates/hyper-raft",
+  "crates/hyper-rt",
+  "crates/hyper-rt-transport",
+  "crates/hyper-seal",
+  "crates/hyper-sim",
+  "crates/hyper-timing",
+  "crates/hyper-tls",
+  "crates/hyper-transport",
+]
+own = ["UPSTREAM.md"]

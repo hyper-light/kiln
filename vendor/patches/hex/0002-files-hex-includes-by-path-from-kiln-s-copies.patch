@@ -1,0 +1,59 @@
+Subject: Files Hex includes by path from kiln's copies
+Why: hex-sim includes hyper-swim's coordinates.rs, and hex-gpu cuda-rust's loader and all-smi's AMD readers, by path from Hex's own vendor/ folder; kiln's copy leaves those copies out for kiln's own (vendor/hyper-raft, vendor/cuda-rust, vendor/all-smi), so the paths name those.
+Kiln-only: kiln's layout: Hex's tree holds its copies at vendor/ inside it
+
+diff --git a/crates/hex-gpu/src/adl.rs b/crates/hex-gpu/src/adl.rs
+index 5813a8c8cb84544eccbf4b015b587b21d98be988..b155bcb819d2106893aa2d047972074a7d9883be 100644
+--- a/crates/hex-gpu/src/adl.rs
++++ b/crates/hex-gpu/src/adl.rs
+@@ -5,9 +5,9 @@
+ //! VRAM in use. The calls go through [`Calls`], ADL itself in production (`sys`) and jupiter's recorded
+ //! answers in the tests.
+ 
+-#[path = "../../../vendor/all-smi/src/device/readers/amd_adl/ffi.rs"]
++#[path = "../../../../all-smi/src/device/readers/amd_adl/ffi.rs"]
+ mod ffi;
+-#[path = "../../../vendor/all-smi/src/device/readers/amd_adl/sensors.rs"]
++#[path = "../../../../all-smi/src/device/readers/amd_adl/sensors.rs"]
+ mod sensors;
+ #[cfg(target_os = "windows")]
+ pub(crate) mod sys;
+diff --git a/crates/hex-gpu/src/amd.rs b/crates/hex-gpu/src/amd.rs
+index c5dc8315a53635404587675c6fafa02d0218a5f1..732fb54e6b794e0e2392a40a320f84c73bed927a 100644
+--- a/crates/hex-gpu/src/amd.rs
++++ b/crates/hex-gpu/src/amd.rs
+@@ -3,7 +3,7 @@
+ //! counters; [`Card::sample`] then makes one `pread` per counter. No ioctl, no device node, no library:
+ //! the counters are world-readable sysfs attributes.
+ 
+-#[path = "../../../vendor/all-smi/crates/all-smi-amd-plugin/src/reader.rs"]
++#[path = "../../../../all-smi/crates/all-smi-amd-plugin/src/reader.rs"]
+ mod counter;
+ #[cfg(test)]
+ mod tests;
+diff --git a/crates/hex-gpu/src/nvml.rs b/crates/hex-gpu/src/nvml.rs
+index d96251bface8d3655118029207cbca1416caf4b1..88b1fb6886f3bb643ad444bfa5c6d0973a4123ac 100644
+--- a/crates/hex-gpu/src/nvml.rs
++++ b/crates/hex-gpu/src/nvml.rs
+@@ -4,7 +4,7 @@
+ //! either, and no call reads two devices. The calls go through [`Calls`], NVML itself in production
+ //! (`sys`) and recorded return values in the tests.
+ 
+-#[path = "../../../vendor/cuda-rust/cuda-bindings/src/dyn_load.rs"]
++#[path = "../../../../cuda-rust/cuda-bindings/src/dyn_load.rs"]
+ pub(crate) mod load;
+ pub(crate) mod sys;
+ #[cfg(test)]
+diff --git a/crates/hex-sim/src/lib.rs b/crates/hex-sim/src/lib.rs
+index 4adbf2b97d4ddff390482f670096cbc740b53ccc..feb7c6cff8e4d71700c683ee420986a4784e1c6b 100644
+--- a/crates/hex-sim/src/lib.rs
++++ b/crates/hex-sim/src/lib.rs
+@@ -76,7 +76,7 @@ pub mod swim;
+ pub mod trace;
+ /// hyper-swim's Vivaldi engine, vendored unchanged from hyper-raft (`vendor/MANIFEST.toml`,
+ /// `docs/design/hex-sim.md` H20): `scripts/vendor.py check` proves it is upstream's, byte for byte.
+-#[path = "../../../vendor/hyper-raft/crates/hyper-swim/src/coordinates.rs"]
++#[path = "../../../../hyper-raft/crates/hyper-swim/src/coordinates.rs"]
+ pub mod vivaldi;
+ pub mod wan;
+ 
