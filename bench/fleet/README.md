@@ -135,8 +135,10 @@ to the limit and lets the witnesses judge. Targets are drawn by a generator seed
 `mono` (its monotonic clock, ns), `host` and `run`. Kinds: `host` (facts, knobs, the controller's
 clock at launch for the skew), `phase`, `daemon`, `pulled`, `first_run`, `first_run_gone`, `ask`,
 `started`, `late`, `start_failed`, `scan` (every scope process, the view, the room, the limit, free
-memory and load), `view_lag`, `witness`, `rtt`, `turn`, `bulk`, `bulk_round`, `bulk_bounded`,
-`bulk_size`, `chaos`, `ended`, `ended_unasked`, `ran_out`, `failed`, `verdict`.
+memory and load), `view_lag`, `witness`, `fill_stopped`, `rtt`, `turn`, `bulk` (and `rtt_failed`,
+`turn_failed`, `bulk_failed` for an operation whose lane ended under it), `bulk_round`,
+`bulk_bounded`, `bulk_size`, `chaos`, `ended`, `ended_unasked`, `ran_out`, `drain_left`,
+`teardown_kill`, `stopped`, `failed`, `verdict`.
 `fleet.py report records.jsonl…` prints the report from them alone.
 
 ## Commands
@@ -220,7 +222,33 @@ real harnesses.
 
 ## Record
 
-Light test, functional, not a measurement (Light test, below, is filled in by the commit that ran it).
+Two light tests on one host, functional, not measurements: a few stub VMs, to show the harness
+fills, measures, takes its chaos, judges and cleans up. The campaign's numbers are ROOT's. Each
+directory under `records/` holds a run's raw records and its summary;
+`python3 bench/fleet/fleet.py report bench/fleet/records/<run>/records.jsonl.gz` prints the summary
+again (the second's byte for byte).
+
+- `records/2026-11-12-adacachy-light-1/`, kiln b82b865aa: adacachy, Linux 7.2.9-2-cachyos x86_64,
+  AMD Ryzen 9 9950X3D2 (32 CPUs), load 43 to 72; shards 0.7.0 test-release, sha256 3298d7d4…
+  (built on adacachy on 2026-11-12 at 14:41 from a tree since removed: its Shards revision is
+  unknown); room mem=1g, 56 VMs at the limit, chaos vm, daemon and client once each, seed 36. FAIL,
+  and each failure the harness's own: 9 `leaked` witnesses that were lags (the first run's VM still
+  exiting, the daemon's view behind its newest VMs, zombies the daemon's kill left), starts charged
+  their wave's later spawns (wave 13: 414 ms of spawns, the first three asks' echoes all read 432 ms
+  in), and EBADF from finalizers at exit. Fixed in c28878d05 and 5e9254453.
+- `records/2026-11-12-adacachy-light-2/`, kiln 5e9254453 (the harness copied with `--rev`, run by a
+  background `kiln run --no-sync`, `KILN_NEEDS=mem=256m`): the same host and binary, load 31 to 48;
+  limit 12 VMs (cost 20.4 MiB, the most a VM held), 26 asks, chaos vm, daemon and client once each,
+  seed 36. PASS: no witness, nothing stray before teardown or left after it, no start failure, no
+  wait run out. One lag of the daemon's view settled in 88 ms; the first run's VM was gone 116 ms
+  after its client returned; spawns took 0.1 to 3.1 ms, and starts in a wave's ask order show no
+  staircase; `nofile` was lifted to 1,048,576.
+
+Light tests (`python3 -m unittest discover -s bench/fleet/tests`), at the revision that adds this
+record: macOS arm64 (this checkout, Python 3.9.6) 44 pass; Linux x86_64 (adacachy, Python 3.14.8) 44
+pass; Windows x86_64 (jupiter, python.org's 3.14.10 embeddable build, its SHA-256 checked, in a
+directory removed after) 34 pass and 10 skip (the lanes, owed below, and the open-file limit, which
+Windows doesn't keep). `mutate.py`: 25 of 25 on macOS.
 
 ## Owed
 
@@ -238,6 +266,12 @@ Light test, functional, not a measurement (Light test, below, is filled in by th
   its round trip a control request and its stream a turn's lines. Chaos on runners needs runners of the
   run's own (a second runner process per machine, `KILN_MACHINE_ID`, joined to a server of the run's
   own): production runners are never restarted.
-- **Windows lanes**: its pipes can't be selected on; the agent there needs a lane per thread.
+- **Windows lanes**: its pipes can't be selected on; the agent there needs a lane per thread. jupiter
+  has no Python of its own (only the Microsoft Store's alias): a run there needs one, as the light
+  tests above had.
+- **A Shards build of a known revision on each host**: the light tests' binary has none (Record).
+  adacachy2 keeps one of ac87190d3 (`~/.cache/s28-shards-ac87190d3/shards`), but its `/home` was
+  full on 2026-11-12 (64 KiB free), so nothing ran there.
 - **Runs**: a few VMs on one Linux host were run (Record). Hundreds across the fleet, macOS hosts
-  (through launchd-run.sh), jupiter, and every chaos round at density are ROOT's.
+  (through launchd-run.sh), jupiter, Linux arm64 (no KVM host), and every chaos round at density are
+  ROOT's.

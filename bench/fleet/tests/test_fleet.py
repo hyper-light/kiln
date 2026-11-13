@@ -263,6 +263,9 @@ class Procs(unittest.TestCase):
             self.assertIn(os.getpid(), t)
             self.assertEqual(under[0], child.pid)
             self.assertGreaterEqual(len(under), 2)
+            # Memory is read for the scope's processes alone, as the scan reads it (Linux's table
+            # leaves it out: smaps_rollup walks every mapping of a process).
+            procs.fill_mem(t, [os.getpid()])
             me = t[os.getpid()]
             self.assertTrue(me.start)
             if sys.platform != "win32":
@@ -647,6 +650,11 @@ class Report(unittest.TestCase):
             self.assertEqual([r["kind"] for r in got], ["rtt", "unparsed"])
             self.assertEqual((got[0]["host"], got[0]["run"], got[0]["ns"]), ("h1", "run1", 5))
             json.dumps(got)
+            import gzip
+
+            with open(path, "rb") as src, gzip.open(path + ".gz", "wb") as dst:
+                dst.write(src.read())
+            self.assertEqual(records.read_all(path + ".gz"), got)
 
 
 if __name__ == "__main__":
