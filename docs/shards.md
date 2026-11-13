@@ -14,7 +14,9 @@ each at one revision, with kiln's recorded changes, and one copy of each project
 - **Hex** is pinned at its `main`, which builds on kiln's Shards revision itself, with a recorded change that
   moves its own pin of hyper-raft to kiln's (`vendor/hex/UPSTREAM.md`). kiln's copy holds Hex's
   `vendor/MANIFEST.toml` and `vendor/patches`, so `scripts/vendor.py check` holds Hex's pins to kiln's as kiln's
-  copy has them: one Shards revision serves Hex and kiln.
+  copy has them: one Shards revision serves Hex and kiln. Hex's pin (`daa36e99`, its main with the joint plan's
+  steps 4 and 12) is interim: Hex's lead is converging Hex's main with its own line of steps 4, 12, 13 and 15, and
+  kiln re-vendors Hex at that converged revision once it lands (`scripts/vendor.py hex <commit>`).
 - **hyper-raft** gains Hex's one change Hex's code calls (`Endpoint::negotiated`, the suite and group a QUIC
   connection negotiated), and Quiver, which records kiln's changes to hyper-raft, records it too
   (`vendor/hyper-raft/UPSTREAM.md`, `vendor/quiver/UPSTREAM.md`).
@@ -88,4 +90,5 @@ the check itself never ended.
 Owed: the smoke and the measurements on macOS (HVF), Linux (KVM) and Windows (WHP), run by the plan's
 coordinator, their numbers recorded here and in Shards' D237; kiln's release pipelines packing Shards for
 each platform they ship (`ci/release/build.sh` cross-builds macOS and Windows on Linux, where Shards' guests
-and a Mac's signing don't build), so releases carry no Shards yet; Hex's own tests at kiln's revision.
+and a Mac's signing don't build), so releases carry no Shards yet; Hex's own tests at kiln's revision; Hex
+re-vendored at its lead's converged main, which ends the interim pin.

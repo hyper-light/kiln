@@ -8,7 +8,8 @@ The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e8
   hyper-transport, and its Shards class on Agentfile images under shards-init) beside 13 and 14, its newest. It pins
   Shards at kiln's own `e82b9403` and hyper-raft at `0856e05`, older than kiln's, and with the first change below its
   crates build on kiln's (`cargo check -p hex-node` in kiln's workspace, then kiln's clippy and the tests of what
-  kiln touches: docs/shards.md).
+  kiln touches: docs/shards.md). The pin is interim: Hex's lead is converging Hex's main with its own line of the
+  joint plan's steps 4, 12, 13 and 15, and kiln re-vendors Hex at that converged revision once it lands.
 - **How kiln uses it:** `hex-node`, and through it Hex's runtime, client, QUIC wire, scheduler simulation, health
   and GPU telemetry, by name; kiln's root `[patch.crates-io]` points the name here, and `seccompiler` (third-party
   code only Hex vendors) at `vendor/seccompiler` here. Nothing of Hex runs in kiln yet: kiln's launch seam takes it
