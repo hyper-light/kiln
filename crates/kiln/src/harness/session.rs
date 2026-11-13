@@ -2602,16 +2602,112 @@ const READ_MAX: u64 = 512 * 1024;
 /// How often the adapter gets a tick while the process runs.
 const TICK: Duration = Duration::from_secs(5);
 
-/// The wait before a harness whose process ended (nobody ending the agent) starts again; twice
-/// the wait before for each that ends after it, at most `AGAIN_MOST`, from `AGAIN_FIRST` again
-/// once one runs `AGAIN_RESET`.
-const AGAIN_FIRST: Duration = Duration::from_secs(2);
-const AGAIN_MOST: Duration = Duration::from_secs(300);
-const AGAIN_RESET: Duration = Duration::from_secs(600);
-/// A harness that ends within `SOON` of each of its last `SOON_TRIES` starts won't start: it
-/// waits for a person.
-const SOON: Duration = Duration::from_secs(20);
-const SOON_TRIES: u32 = 3;
+/// The slowest start that got ready (its launch to its status first leaving `Starting`: its session
+/// open, its first answer) of each harness kind on this machine, as this process saw them: the
+/// harness's own start time, which paces its starts again ([`again`]). Learned, never chosen (R03,
+/// the person, 2026-11-13); none for a kind none of whose starts has got ready here yet, its cold
+/// start, which [`again`] types.
+static READY_SLOWEST: std::sync::LazyLock<Mutex<std::collections::HashMap<&'static str, Duration>>> = std::sync::LazyLock::new(Default::default);
+
+/// The slowest start of harness `kind` that got ready on this machine, none before its first.
+fn ready_slowest(kind: &str) -> Option<Duration> {
+    READY_SLOWEST.lock().get(kind).copied()
+}
+
+/// A start of harness `kind` got ready after `took`: its slowest is at least that.
+fn ready_took(kind: &'static str, took: Duration) {
+    let mut slowest = READY_SLOWEST.lock();
+    let was = slowest.entry(kind).or_insert(took);
+    *was = (*was).max(took);
+}
+
+/// What kiln's restart rule reads of a harness's run that ended, nobody ending the agent: the
+/// evidence it decides by (docs/agents.md, "An agent lives until it's ended").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Ran {
+    /// Its process started at all.
+    launched: bool,
+    /// It got ready: its status left `Starting` (its session open, its first answer).
+    ready: bool,
+    /// kiln started it again by itself after its run before ended (not a person's restart or
+    /// message).
+    again: bool,
+    /// That start again was to pick up a turn its end cut short.
+    picking_up: bool,
+    /// It ended part-way through a turn.
+    cut: bool,
+    /// A turn of its ended in this run.
+    turned: bool,
+}
+
+impl Ran {
+    /// Its status is `status` now: the first that is neither `Starting` nor an end makes it ready,
+    /// and its start's time (`took`; none for a run taken over, which isn't a start) its kind's
+    /// record here.
+    fn saw(&mut self, status: Status, kind: &'static str, took: Option<Duration>) {
+        if !self.ready && matches!(status, Status::Idle | Status::Running | Status::Waiting) {
+            self.ready = true;
+            if let Some(took) = took {
+                ready_took(kind, took);
+            }
+        }
+    }
+}
+
+/// What kiln does once a harness's run ended ([`again`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Again {
+    /// It starts again after this wait.
+    After(Duration),
+    /// It waits for a person (a restart or a message), for this reason.
+    Halt(Halt),
+}
+
+/// Why kiln stopped starting a harness again by itself: each a lack of progress its record shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Halt {
+    /// Its process never started (its program is missing): the start's own error says why.
+    NeverLaunched,
+    /// kiln started it again after it ended, and that start ended before it was ready too.
+    NeverReady,
+    /// kiln started it again to pick up a turn its end cut short, and it ended part-way through a
+    /// turn again, no turn ending in between.
+    CutAgain,
+}
+
+/// kiln's restart rule (R03: every value from the harness's own record, none chosen). A run that
+/// got ready made progress, however soon it ended, and so did one a person asked for; a start
+/// again of kiln's own that ends before ready, or that ends part-way through the turn it picked up
+/// with no turn ended, made none: kiln stops there, rather than after a count of tries. The wait
+/// before a start again is the slowest start of its kind that got ready here (`slowest`), so its
+/// starts never come faster than it can get ready; with none yet (its cold start), there is no
+/// wait: liveness alone, its next start's own readiness, or its end before it, deciding. No wait
+/// grows, so none is capped or reset: a harness that gets no further stops instead.
+fn again(ran: Ran, slowest: Option<Duration>) -> Again {
+    if !ran.launched {
+        Again::Halt(Halt::NeverLaunched)
+    } else if ran.again && !ran.ready {
+        Again::Halt(Halt::NeverReady)
+    } else if ran.again && ran.picking_up && ran.cut && !ran.turned {
+        Again::Halt(Halt::CutAgain)
+    } else {
+        Again::After(slowest.unwrap_or(Duration::ZERO))
+    }
+}
+
+/// Why kiln stopped starting a harness again, in words, `how` how its process ended and
+/// `slowest` the slowest start of its kind that got ready here.
+fn halt_words(halt: Halt, how: &str, slowest: Option<Duration>) -> Option<String> {
+    let record = match slowest {
+        Some(d) => format!("its kind's slowest start that got ready on this machine took {} ms", d.as_millis()),
+        None => "none of its kind's starts on this machine has got ready yet".to_owned(),
+    };
+    match halt {
+        Halt::NeverLaunched => None,
+        Halt::NeverReady => Some(format!("Its process ended before it was ready ({how}) after kiln started it again, so kiln stopped starting it again: a start that never gets ready makes no progress ({record}). Send a message or restart it.")),
+        Halt::CutAgain => Some(format!("Its process ended ({how}) part-way through the turn kiln started it again to pick up, no turn ending in between, so kiln stopped starting it again: that turn makes no progress. Send a message or restart it.")),
+    }
+}
 /// What an agent is told when its process ended part-way through a turn and started again.
 const PICK_UP: &str = "Your process ended part-way through your last turn, and kiln started it again: your conversation is as it was. Pick up where you left off.";
 
@@ -4393,11 +4489,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
         let _ = sink.send((s.id.clone(), u)).await;
     }
     let mut first = !handed;
-    // Its process ending never ends it: how many starts in a row ended soon after, the wait before
-    // its next start, and when that is.
-    let mut soon: u32 = 0;
-    let mut again = AGAIN_FIRST;
+    // Its process ending never ends it: when it starts again by itself, whether its next start is
+    // kiln's own start again (its wait was over, nobody asking: `ours`), and whether that start
+    // picks up a turn its end cut short (`picks_up`): [`again`]'s evidence.
     let mut again_at: Option<Instant>;
+    let mut ours = false;
+    let mut picks_up = false;
     // A message that arrived while the process was down, sent once it is back.
     let mut carry: Vec<Command> = Vec::new();
     // Skill runs sent while there was no room on its machine for it to go to work: run once there
@@ -4513,6 +4610,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             spec.resume = None;
         }
         s.core.lock().harness = Some(kind.name.to_owned());
+        // Its start, timed from before its launch (a microVM's boot is part of it) to its getting
+        // ready (`READY_SLOWEST`).
+        let launching = Instant::now();
         // The process the previous image handed over, still running; else a new one.
         let (mut adapter, spawned, partial, adopted) = match adopt.take() {
             Some(a) => match crate::proc::adopt_duplex(a.process) {
@@ -4592,9 +4692,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 (adapter, spawned, Vec::new(), false)
             }
         };
-        let started = Instant::now();
         again_at = None;
-        let launched = spawned.is_ok();
+        // What kiln's restart rule reads of this run ([`Ran`]): one taken over across an upgrade
+        // isn't a start, so it times none.
+        let mut ran = Ran { launched: spawned.is_ok(), again: std::mem::take(&mut ours), picking_up: std::mem::take(&mut picks_up), ..Ran::default() };
         let mut code = None;
         let mut error = None;
         match spawned {
@@ -5087,6 +5188,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                     let line: Vec<u8> = buf.drain(..=nl).collect();
                                     adapter.line(&mut core, &String::from_utf8_lossy(&line));
                                 }
+                                // Its last lines may say it got ready.
+                                ran.saw(core.state.status, kind.id, (!adopted).then(|| launching.elapsed()));
                             }
                             break;
                         }
@@ -5165,6 +5268,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     let was = s.turn_open.load(std::sync::atomic::Ordering::Relaxed);
                     let open = turn_open(status, was);
+                    // Ready: its session open, its first answer.
+                    ran.saw(status, kind.id, (!adopted).then(|| launching.elapsed()));
+                    ran.turned |= was && !open;
                     s.turn_open.store(open, std::sync::atomic::Ordering::Relaxed);
                     if session != last_session || queue != last_queue || pause != last_pause || open != was {
                         last_session = session;
@@ -5222,44 +5328,50 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
         // crash, an end of its own): an agent lives until a person, or the agent that started it,
         // ends it (docs/agents.md, "An agent lives until it's ended"). It starts again by itself,
         // its conversation resumed and the turn the end cut short picked up first, once there's
-        // room on its machine for it: after `AGAIN_FIRST`, each time twice the wait before (at most
-        // `AGAIN_MOST`), from `AGAIN_FIRST` again once it ran `AGAIN_RESET`. A harness that never
-        // started, or ended within `SOON` of each of its last `SOON_TRIES` starts, won't start: it
+        // room on its machine for it, as kiln's restart rule ([`again`]) reads its record: after
+        // the slowest start of its kind that got ready here (none before the first). A harness
+        // that never started, or whose start again of kiln's own got no further (ended before it
+        // was ready, or part-way through the turn it picked up with no turn ended) won't start: it
         // waits for a person (a restart or a message), saying why.
-        let ran = started.elapsed();
-        if ran >= AGAIN_RESET {
-            again = AGAIN_FIRST;
-        }
-        soon = if ran < SOON { soon.saturating_add(1) } else { 0 };
-        if launched && soon < SOON_TRIES {
-            let cut = s.turn_open.load(std::sync::atomic::Ordering::Relaxed);
-            again_at = Instant::now().checked_add(again);
-            {
-                let mut core = s.core.lock();
-                let now = Core::now();
-                if let Some(x) = core.state.exit.as_mut() {
-                    x.again_at = Some(now.saturating_add(i64::try_from(again.as_millis()).unwrap_or(i64::MAX)));
+        ran.cut = s.turn_open.load(std::sync::atomic::Ordering::Relaxed);
+        let slowest = ready_slowest(kind.id);
+        match again(ran, slowest) {
+            Again::After(wait) => {
+                again_at = Instant::now().checked_add(wait);
+                picks_up = ran.cut;
+                {
+                    let mut core = s.core.lock();
+                    let now = Core::now();
+                    if let Some(x) = core.state.exit.as_mut() {
+                        x.again_at = Some(now.saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX)));
+                    }
+                    let then = if ran.cut { ", and picks up the turn it was on" } else { "" };
+                    core.upsert(&format!("harness-again:{now}"), None, super::model::Body::Notice { level: Level::Warn, text: format!("Its process ended ({}). kiln starts it again{then}: its conversation goes on.", ended_how(code)) });
+                    if ran.cut && !core.state.queue.first().is_some_and(|q| q.text == PICK_UP) {
+                        core.state.queue.insert(0, super::model::QueueItem { id: format!("{}again-{now}", super::core::KEEP_ID), text: PICK_UP.to_owned(), at: now, attachments: Vec::new(), overrides: None, reply_to: None });
+                    }
+                    core.touch_state();
                 }
-                let then = if cut { ", and picks up the turn it was on" } else { "" };
-                core.upsert(&format!("harness-again:{now}"), None, super::model::Body::Notice { level: Level::Warn, text: format!("Its process ended ({}). kiln starts it again{then}: its conversation goes on.", ended_how(code)) });
-                if cut && !core.state.queue.first().is_some_and(|q| q.text == PICK_UP) {
-                    core.state.queue.insert(0, super::model::QueueItem { id: format!("{}again-{now}", super::core::KEEP_ID), text: PICK_UP.to_owned(), at: now, attachments: Vec::new(), overrides: None, reply_to: None });
-                }
-                core.touch_state();
+                flush(&s, &sink, None).await;
+                on_change();
             }
-            flush(&s, &sink, None).await;
-            on_change();
-            again = again.saturating_mul(2).min(AGAIN_MOST);
-        } else if launched {
-            {
-                let mut core = s.core.lock();
-                if let Some(x) = core.state.exit.as_mut() {
-                    x.error.get_or_insert_with(|| format!("It ended within {} s of each of its last {SOON_TRIES} starts, so kiln stopped starting it again: send a message or restart it.", SOON.as_secs()));
+            Again::Halt(halt) => {
+                if let Some(why) = halt_words(halt, &ended_how(code), slowest) {
+                    {
+                        let mut core = s.core.lock();
+                        // Why kiln stopped first, then what the harness said as it ended.
+                        if let Some(x) = core.state.exit.as_mut() {
+                            x.error = Some(match x.error.take() {
+                                Some(said) => format!("{why}\n\n{said}"),
+                                None => why,
+                            });
+                        }
+                        core.touch_state();
+                    }
+                    flush(&s, &sink, None).await;
+                    on_change();
                 }
-                core.touch_state();
             }
-            flush(&s, &sink, None).await;
-            on_change();
         }
         // Skill runs that waited for room go with its next start.
         carry.append(&mut for_room);
@@ -5288,6 +5400,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             }
             // Its process ended without anyone ending it: it starts again when its wait is over.
             let due = again_at;
+            let mut woke = false;
             let wake = async move {
                 match due {
                     Some(at) => crate::rt::sleep(at.saturating_duration_since(Instant::now())).await,
@@ -5301,9 +5414,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
                 () = wake.fuse() => {
                     again_at = None;
+                    woke = true;
                     Ev::Ctl(Some(Ctl::Cmd(Box::new(Command::Restart))))
                 }
             };
+            // A start asked for: kiln's own, its wait over, or a person's (a restart, a message),
+            // which the restart rule reads apart ([`Ran::again`]).
+            if let Ev::Ctl(Some(Ctl::Cmd(c))) = &ev && matches!(**c, Command::Restart | Command::Send { task: None, .. } | Command::SkillRun { .. }) {
+                ours = woke;
+            }
             match ev {
                 Ev::Ctl(Some(Ctl::Cmd(c))) => {
                             let prepared = journal_edit(&s, &files, *c, |core, command| adapter.command(core, command)).await;
@@ -6647,6 +6766,37 @@ sys.exit(1)
             while !matches!(updates.recv().await?, (_, Update::Closed)) {}
             result
         })
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35 (R03): kiln's restart rule decides by
+    /// the run's evidence alone. A start that got ready waits its kind's slowest start that got
+    /// ready (none: its cold start, no wait); a person's start that ends before ready is tried
+    /// again once; kiln's own start again that gets no further stops, typed.
+    #[test]
+    fn s35_the_restart_rule_reads_progress_and_waits_its_kinds_slowest_start() {
+        let slowest = Some(Duration::from_millis(1700));
+        let ran = Ran { launched: true, ..Ran::default() };
+        assert_eq!(again(Ran { launched: false, ..ran }, slowest), Again::Halt(Halt::NeverLaunched));
+        // Ended before ready, its first start or a person's: once more, its own record the wait.
+        assert_eq!(again(ran, slowest), Again::After(Duration::from_millis(1700)));
+        // Cold: nothing learned of its kind here, so no wait; its next start's readiness decides.
+        assert_eq!(again(ran, None), Again::After(Duration::ZERO));
+        // kiln's own start again, ended before ready: no progress.
+        assert_eq!(again(Ran { again: true, ..ran }, slowest), Again::Halt(Halt::NeverReady));
+        // Ready, however soon it ended: progress, on kiln's start again too.
+        let ready = Ran { again: true, ready: true, ..ran };
+        assert_eq!(again(ready, slowest), Again::After(Duration::from_millis(1700)));
+        // Cut part-way through the turn it picked up, no turn ended: no progress.
+        assert_eq!(again(Ran { picking_up: true, cut: true, ..ready }, slowest), Again::Halt(Halt::CutAgain));
+        // A turn ended before it was cut again, or it wasn't picking one up: progress.
+        assert_eq!(again(Ran { picking_up: true, cut: true, turned: true, ..ready }, slowest), Again::After(Duration::from_millis(1700)));
+        assert_eq!(again(Ran { cut: true, ..ready }, slowest), Again::After(Duration::from_millis(1700)));
+        // Each halt says why in words but the one whose start's own error does.
+        assert!(halt_words(Halt::NeverLaunched, "exit 1", slowest).is_none());
+        let words = halt_words(Halt::NeverReady, "exit 1", None).unwrap_or_default();
+        assert!(words.contains("before it was ready") && words.contains("none of its kind's starts") && words.contains("stopped starting it again"), "{words}");
+        let words = halt_words(Halt::CutAgain, "exit 1", slowest).unwrap_or_default();
+        assert!(words.contains("part-way through the turn") && words.contains("stopped starting it again"), "{words}");
     }
 
     /// CP-T3.2: a move gathers what a session was sent and hasn't taken (carried while its harness

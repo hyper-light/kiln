@@ -1600,7 +1600,7 @@ pub struct State {
     #[cfg_attr(test, ts(optional))]
     pub runs: Option<super::session::Runs>,
     /// kiln's record of each start of its harness (`session::Start`): one a start, as kiln's restart
-    /// rule paces them (`AGAIN_*`, `SOON_TRIES`), kept with the session, and handed to kiln's next
+    /// rule paces them (`session::again`), kept with the session, and handed to kiln's next
     /// image with it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub starts: Vec<super::session::Start>,
