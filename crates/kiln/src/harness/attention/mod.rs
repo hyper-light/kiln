@@ -1565,7 +1565,12 @@ mod tests{
                 // the goal, the other agent's message and the person's four messages.
                 let completed=hub.harness.state(&target).is_some_and(|state|state.status==Status::Idle && state.queue.is_empty() && state.turn_started.is_none() && state.delivery.len()==6 && state.delivery.values().all(|delivery|matches!(delivery,super::super::model::Delivery::Completed)));
                 if all_in && completed{break;}
-                anyhow::ensure!(std::time::Instant::now()<deadline,"its messages' turns never ended: all heard {all_in}, state {:?}",hub.harness.state(&target).map(|s|(s.status,s.queue.len(),s.turn_started,s.delivery)));
+                if std::time::Instant::now()>=deadline{
+                    let unheard:Vec<&str>=["from another agent","from the composer","from Mission Control","from the CLI","from MCP"].into_iter().filter(|text|!heard.contains(text)).collect();
+                    let t=target.clone();
+                    let mail=hub.store.call(move|c|{let mut q=c.prepare("SELECT revision,owner,sender,id,disposition,generation,epoch,terminal,substr(body,1,160) FROM agent_mail WHERE recipient=?1 ORDER BY revision")?;Ok(q.query_map([t],|r|Ok(format!("{}|{}|{}|{}|{}|{}|{:?}|{:?}|{}",r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,String>(8)?)))?.collect::<Result<Vec<_>,_>>()?)}).await?;
+                    anyhow::bail!("its messages' turns never ended: unheard {unheard:?}, state {:?}, mail {mail:#?}",hub.harness.state(&target).map(|s|(s.status,s.queue.len(),s.turn_started,s.delivery)));
+                }
                 crate::rt::sleep(std::time::Duration::from_millis(20)).await;
             }
             written_through(&hub,&target).await?;
