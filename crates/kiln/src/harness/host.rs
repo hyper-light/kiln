@@ -2224,6 +2224,13 @@ impl Host {
         for s in sessions { self.replay_session_mail(&s).await; }
     }
 
+    /// [`Host::replay_mail`] of `ids`' sessions alone (those here): a session whose stream started
+    /// over, not every session the runner holds.
+    pub async fn replay_mail_of(&self, ids: &std::collections::BTreeSet<String>) {
+        let sessions: Vec<_> = { let held = self.sessions.lock(); ids.iter().filter_map(|id| held.get(id).cloned()).collect() };
+        for s in sessions { self.replay_session_mail(&s).await; }
+    }
+
     async fn replay_session_mail(&self, s: &Arc<Session>) {
         let Some(inbox) = self.inbox.clone() else {
             let capacity = { let mut c = super::admission::Controller::new(s.epoch(), self.input_budgets.budget()); let _ = c.unavailable(); c.capacity() };

@@ -7,7 +7,7 @@
 //!   bounded uplink buffer and are delivered after reconnecting.
 //! * Serves PTY terminals so the UI can drive this machine.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -732,24 +732,57 @@ impl ReplayBudget {
     }
 }
 
+/// Whose mail journals a replay reads: every session's, or these alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReplayOf {
+    All,
+    Sessions(BTreeSet<String>),
+}
+
+impl ReplayOf {
+    /// What two asks for a replay read together.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Sessions(mut a), Self::Sessions(b)) => {
+                a.extend(b);
+                Self::Sessions(a)
+            }
+            _ => Self::All,
+        }
+    }
+}
+
 enum MailReplay {
     Idle { budget: Option<ReplayBudget> },
     Reading { read: futures::future::BoxFuture<'static, bool>, before: (usize, usize) },
-    Again { read: futures::future::BoxFuture<'static, bool>, before: (usize, usize) },
+    /// Asked for again while reading: `next` is what the next read reads.
+    Again { read: futures::future::BoxFuture<'static, bool>, before: (usize, usize), next: ReplayOf },
 }
 impl Default for MailReplay { fn default() -> Self { Self::Idle { budget: None } } }
 
 impl MailReplay {
+    /// A replay of every session's journal.
     fn request(&mut self, host: Option<&Arc<crate::harness::host::Host>>) {
+        self.request_of(host, ReplayOf::All);
+    }
+
+    /// A replay of `of`'s journals (2026-11-12: a stream that started over had every session's
+    /// journal replayed, each session's mail flow sent again for one session's start).
+    fn request_of(&mut self, host: Option<&Arc<crate::harness::host::Host>>, of: ReplayOf) {
         *self = match std::mem::take(self) {
             Self::Idle { .. } => match host.cloned() {
                 Some(host) => {
                     let before = host.native_budget_counts();
-                    Self::Reading { read: Box::pin(async move { let held = host.replay_mail_transfers().await; host.replay_mail().await; held }), before }
+                    let read: futures::future::BoxFuture<'static, bool> = match of {
+                        ReplayOf::All => Box::pin(async move { let held = host.replay_mail_transfers().await; host.replay_mail().await; held }),
+                        ReplayOf::Sessions(ids) => Box::pin(async move { let held = host.replay_mail_transfers().await; host.replay_mail_of(&ids).await; held }),
+                    };
+                    Self::Reading { read, before }
                 }
                 None => Self::default(),
             },
-            Self::Reading { read, before } | Self::Again { read, before } => Self::Again { read, before },
+            Self::Reading { read, before } => Self::Again { read, before, next: of },
+            Self::Again { read, before, next } => Self::Again { read, before, next: next.and(of) },
         };
     }
 
@@ -778,14 +811,19 @@ impl MailReplay {
 
     fn finish(&mut self, host: Option<&Arc<crate::harness::host::Host>>, held: bool) {
         let (again, before) = match std::mem::take(self) {
-            Self::Reading { before, .. } => (false, before),
-            Self::Again { before, .. } => (true, before),
+            Self::Reading { before, .. } => (None, before),
+            Self::Again { before, next, .. } => (Some(next), before),
             Self::Idle { .. } => return,
         };
         let Some(host) = host else { return };
         let after = host.native_budget_counts();
-        if again || (held && ReplayBudget::new(before).improved(after)) { self.request(Some(host)); }
-        else if held { *self = Self::Idle { budget: Some(ReplayBudget::new(after)) }; }
+        // Room grew while it read: every session's journal again, as before.
+        let next = if held && ReplayBudget::new(before).improved(after) { Some(ReplayOf::All) } else { again };
+        match next {
+            Some(of) => self.request_of(Some(host), of),
+            None if held => *self = Self::Idle { budget: Some(ReplayBudget::new(after)) },
+            None => {}
+        }
     }
 }
 
@@ -4580,10 +4618,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // lacks goes; a stream it lost starts over, its snapshot first.
                     ServerMsg::Wire(frame) => {
                         updates.on_frame(frame);
-                        if restart_updates(&mut updates, harness.as_ref(), &terms, &server_kept, &mut sent_changes)
+                        if let Some(of) = restart_updates(&mut updates, harness.as_ref(), &terms, &server_kept, &mut sent_changes)
                             && proto::feature::speaks(&server_features, proto::feature::MAIL_FLOW)
                         {
-                            mail_replay.request(harness.as_ref());
+                            mail_replay.request_of(harness.as_ref(), of);
                         }
                         flush_updates(&mut updates, &own).await;
                     }
@@ -5633,10 +5671,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // the only unanswered one. The existing picture gate still bounds resets;
                     // while disconnected no new snapshot/journal read is made.
                     if connected && welcomed
-                        && restart_updates(&mut updates, harness.as_ref(), &terms, &server_kept, &mut sent_changes)
+                        && let Some(of) = restart_updates(&mut updates, harness.as_ref(), &terms, &server_kept, &mut sent_changes)
                         && proto::feature::speaks(&server_features, proto::feature::MAIL_FLOW)
                     {
-                        mail_replay.request(harness.as_ref());
+                        mail_replay.request_of(harness.as_ref(), of);
                     }
                     // Straight to the link from this turn, unless what this loop said or took before waits to go
                     // (`flush_updates_now`; goal 10, plan 01a1a87b2dae step 5).
@@ -5956,6 +5994,9 @@ struct SentChanges {
     /// The server takes changesets as patches.
     patches: bool,
     sessions: HashMap<String, HashMap<crate::harness::model::FileKey, u64>>,
+    /// Sessions whose mail flow didn't all go, their streams without room for it
+    /// (`Updates::push_kept`): their journals are replayed at the next replay of any session's.
+    mail_behind: BTreeSet<String>,
 }
 
 impl SentChanges {
@@ -6121,6 +6162,15 @@ fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &cr
         for b in bodies {
             updates.push_after_state(&key, b);
         }
+    } else if matches!(u, Update::MailFlow { .. }) {
+        // Its mail's flow is kept in its journal, which a replay sends again: one with no room goes
+        // without it (`Updates::push_kept`), and the session's next replay sends it.
+        for b in bodies {
+            if !updates.push_kept(&key, b) {
+                sent.mail_behind.insert(session.to_owned());
+                break;
+            }
+        }
     } else {
         for b in bodies {
             updates.push(&key, b);
@@ -6260,21 +6310,23 @@ async fn flush_updates(updates: &mut crate::wire::uplink::Updates, uplink: &Upli
 }
 
 /// Resume actual stale streams from their pictures. A session picture does not contain the
-/// durable source mail journal, so the caller also schedules one journal replay when any session
-/// restarted. `take_stale` retains streams whose preceding picture still waits for its ACK.
+/// durable source mail journal, so the caller also schedules a replay of the journals of the
+/// sessions that restarted, and of those whose mail flow didn't all go (`SentChanges::mail_behind`),
+/// these alone: the sessions returned, none when no session restarted. `take_stale` retains streams
+/// whose preceding picture still waits for its ACK.
 fn restart_updates(
     updates: &mut crate::wire::uplink::Updates,
     host: Option<&Arc<crate::harness::host::Host>>,
     terms: &HashMap<String, (PtySession, Arc<crate::termsess::Session>)>,
     kept: &HashMap<String, proto::KeptSession>,
     sent: &mut SentChanges,
-) -> bool {
-    let mut session_reset = false;
+) -> Option<ReplayOf> {
+    let mut restarted = BTreeSet::new();
     for key in updates.take_stale() {
         if let Some(id) = key.strip_prefix("s:") {
             if let Some(s) = host.and_then(|host| host.get(id)) {
                 start_stream(updates, id, &s, kept.get(id), sent);
-                session_reset = true;
+                restarted.insert(id.to_owned());
             }
         } else if let Some(id) = key.strip_prefix("t:")
             && let Some((_, state)) = terms.get(id)
@@ -6287,7 +6339,11 @@ fn restart_updates(
             }
         }
     }
-    session_reset
+    if restarted.is_empty() {
+        return None;
+    }
+    restarted.append(&mut sent.mail_behind);
+    Some(ReplayOf::Sessions(restarted))
 }
 
 async fn raw_harness_update(own: &Uplink, session: &str, update: &crate::harness::core::Update) {
@@ -7803,6 +7859,29 @@ mod native_handover_tests {
     use crate::harness::model::{State, Status};
     use crate::harness::session::Spec;
     use kiln_seams::clock::SimClock;
+
+    /// 2026-11-12: a stream that started over had every session's mail journal replayed. A
+    /// replay asked for while one reads reads, next, the sessions asked for (theirs together),
+    /// and every session's only when that's what one asked for; then it reads that.
+    #[test]
+    fn a_replay_asked_for_while_reading_reads_the_sessions_asked_for() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (sink, _updates) = async_channel::unbounded();
+            let host = Host::with_records(sink, None, Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())));
+            let of = |ids: &[&str]| ReplayOf::Sessions(ids.iter().map(|s| (*s).to_owned()).collect());
+            let mut replay = MailReplay::Reading { before: host.native_budget_counts(), read: Box::pin(async { false }) };
+            replay.request_of(Some(&host), of(&["a"]));
+            replay.request_of(Some(&host), of(&["b"]));
+            assert!(matches!(&replay, MailReplay::Again { next, .. } if *next == of(&["a", "b"])), "the sessions asked for, together");
+            replay.finish(Some(&host), false);
+            assert!(matches!(replay, MailReplay::Reading { .. }), "then it reads them");
+            replay.request(Some(&host));
+            replay.request_of(Some(&host), of(&["c"]));
+            assert!(matches!(&replay, MailReplay::Again { next: ReplayOf::All, .. }), "every session's once one asked for that");
+            assert_eq!(of(&["a"]).and(ReplayOf::All), ReplayOf::All);
+            Ok(())
+        })
+    }
 
     /// W20: a held mail replay waits for room of its own, the share each session's budget is.
     /// Another session's copy, held or let go of, changes nothing of it (no pool spans every
