@@ -2321,7 +2321,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut relaunch_wanted = successor && supervised && !channel && started_as == Start::ReExecuted;
     let mut relaunch_asked: Option<Instant> = None;
     // AI coding sessions running on this machine (job pods have none), reported as they change.
-    let ai = (!o.ephemeral).then(|| crate::aisessions::Reporter::new(crate::os::home_dir()));
+    let ai = (!o.ephemeral).then(|| crate::aisessions::Reporter::new(crate::os::home_dir()).with_homes(crate::harness::isolated::home::root(&o.state_dir)));
     // Kiln-native agent sessions on this machine (not in job pods, and not in the server's own
     // in-process agent: the server hosts those itself). They outlive the server connection and
     // this process's restarts: each continues its harness session.
@@ -5344,9 +5344,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         Some(ai) => {
                             // Kiln's own sessions here are running, not past.
                             let running = harness.as_ref().map(|h| h.list().into_iter().filter_map(|i| i.harness_session).collect()).unwrap_or_default();
-                            ai.history(req, kind, usize::try_from(limit).unwrap_or(usize::MAX), running, uplink.0.clone());
+                            ai.history(req, kind, usize::try_from(limit).unwrap_or(usize::MAX), running, None, uplink.0.clone());
                         }
                         None => {
+                            own.0.send(Up::Term(AgentMsg::HarnessHistory { req, json: None })).await.ok();
+                        }
+                    },
+                    // Asked for a person: with the conversations kept in their microVM volumes here
+                    // (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
+                    ServerMsg::HarnessHistoryFor { req, json } => match (&ai, serde_json::from_str::<crate::aisessions::Asked>(&json)) {
+                        (Some(ai), Ok(asked)) => {
+                            let running = harness.as_ref().map(|h| h.list().into_iter().filter_map(|i| i.harness_session).collect()).unwrap_or_default();
+                            ai.history(req, asked.kind, usize::try_from(asked.limit).unwrap_or(usize::MAX), running, asked.person, uplink.0.clone());
+                        }
+                        (looks, asked) => {
+                            if let (Some(_), Err(e)) = (looks, &asked) {
+                                tracing::warn!(error = %e, "the server's ask for a person's past sessions couldn't be read");
+                            }
                             own.0.send(Up::Term(AgentMsg::HarnessHistory { req, json: None })).await.ok();
                         }
                     },

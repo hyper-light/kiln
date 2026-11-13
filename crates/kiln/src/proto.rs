@@ -132,8 +132,9 @@ pub enum AgentMsg {
     /// Answer to [`ServerMsg::DirList`]: JSON [`crate::dirs::Listing`]. Appended last: postcard
     /// encodes variants by index.
     DirList { req: u64, json: String },
-    /// Answer to [`ServerMsg::HarnessHistory`]: JSON `[`[`crate::aisessions::PastSession`]`]`,
-    /// `None` when this machine does not look. Appended last: postcard encodes variants by index.
+    /// Answer to [`ServerMsg::HarnessHistory`] and [`ServerMsg::HarnessHistoryFor`]: JSON
+    /// `[`[`crate::aisessions::PastSession`]`]`, `None` when this machine does not look. Appended
+    /// last: postcard encodes variants by index.
     HarnessHistory { req: u64, json: Option<String> },
     /// Repo sync (`crate::sync`, on [`LANE_SYNC`]): `json` a [`crate::sync::wire::Msg`], `raft` the
     /// bytes of the hyper-raft message it carries (empty when none). Only from runners announcing
@@ -791,7 +792,12 @@ pub mod feature {
     /// `Strained` where that owner reads health's words ([`PLACE_HEALTH`]), else as `Draining`:
     /// either way it waits there, taking nothing new.
     pub const PLACE_KEEPER: &str = "place.keeper";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER];
+    /// This runner lists, with its own past conversations, those kept in the asking person's
+    /// microVM volumes here, each saying it ran in one ([`super::ServerMsg::HarnessHistoryFor`];
+    /// kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5). A runner that didn't name it is asked
+    /// as before, for its own alone.
+    pub const HISTORY_VOLUMES: &str = "harness.history-volumes";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1181,6 +1187,12 @@ pub enum ServerMsg {
     /// Authoritative durable transfer phase for the exact manifest, on Control. A receiver
     /// keeps its imported journal fenced until Committed. Only with mail-transfer.
     HarnessMailTransfer { json: String },
+    /// [`ServerMsg::HarnessHistory`] for a person (JSON [`crate::aisessions::Asked`]): this machine's
+    /// past sessions with those kept in that person's microVM volumes here, each saying so (kiln plan
+    /// 01a1d2c16eb074f19cf7ae7f1025c0be step 5); answered by [`AgentMsg::HarnessHistory`]. Only to
+    /// runners that named [`feature::HISTORY_VOLUMES`]. Appended last, after `HarnessMailTransfer`:
+    /// postcard encodes variants by index.
+    HarnessHistoryFor { req: u64, json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -2256,6 +2268,8 @@ mod tests {
             ("Copies", ServerMsg::Copies { json: "{}".into() }),
             ("Skills", ServerMsg::Skills { json: "{}".into() }),
             ("SkillFile", ServerMsg::SkillFile { sha256: "00".into(), offset: 0, data: vec![1], done: true }),
+            ("HarnessMailTransfer", ServerMsg::HarnessMailTransfer { json: "{}".into() }),
+            ("HarnessHistoryFor", ServerMsg::HarnessHistoryFor { req: 1, json: "{}".into() }),
         ];
         // After main's `HarnessArchive` (69) and `HarnessRestoreCopy` (70).
         let mut last = 70u8;

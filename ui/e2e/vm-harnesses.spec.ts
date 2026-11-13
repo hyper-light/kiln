@@ -1,7 +1,8 @@
 // Every harness in a Shards microVM, from kiln's UI (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps
 // 34 and 35; crates/kiln/tests/vm_e2e/README.md). Against the mock: kiln's ten Agentfiles listed read
 // only; Claude Code and Codex started in a microVM from kiln's, refused where the machine starts none;
-// Codex from a person's own. Against ROOT's server (E2E_BASE_URL, E2E_TOKEN, E2E_VM_MACHINE, the name
+// Codex from a person's own; a Codex conversation kept in a person's microVM volume picked up from the
+// composer's past sessions in a microVM, one of the machine's own as a process. Against ROOT's server (E2E_BASE_URL, E2E_TOKEN, E2E_VM_MACHINE, the name
 // of its runner that starts microVMs): each harness started from kiln's Agentfile and from a person's
 // own, its task's turn done, a message steered in, a turn stopped, the agent ended and its conversation
 // picked up again from the composer, all in the page, with kiln's word on each read from its API. A
@@ -140,6 +141,39 @@ test.describe("against the mock", () => {
     await toHarness(page, "Codex");
     await page.getByRole("button", { name: /^More options/ }).click();
     await expect(page.getByLabel("The Agentfile Codex's microVM is made from")).toHaveValue(`agentfile:${mine?.id}`);
+  });
+
+  /** What the composer's start asks for as a past session is picked: the body of its `POST /api/harness/sessions`. */
+  async function pickUp(page: Page, title: string): Promise<{ target?: string; spec?: { kind?: string; resume?: string; isolation?: { kind: string; image?: string } } }> {
+    await page.goto("/agents");
+    await toHarness(page, "Codex");
+    await page.getByRole("button", { name: /^More options/ }).click();
+    await toMachine(page, new RegExp(MOCK_VM));
+    await page.getByRole("button", { name: /^A past session on / }).click();
+    const row = page.locator(".ps-list .ps-row").filter({ hasText: title });
+    const [sent] = await Promise.all([page.waitForRequest((r) => r.method() === "POST" && new URL(r.url()).pathname === "/api/harness/sessions"), row.click()]);
+    await expect(page).toHaveURL(/\/agents\/[0-9a-f]{32}$/);
+    return sent.postDataJSON();
+  }
+
+  test("step35: a Codex conversation kept in a person's microVM volume, picked up from the composer's past sessions, goes on in a microVM", async ({ page }) => {
+    // Plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5: the past sessions say which ran in a microVM, and that one's start names its
+    // conversation and a microVM from kiln's Agentfile for Codex (none kept for Codex in its folder), never a process.
+    await page.goto("/agents");
+    await toHarness(page, "Codex");
+    await page.getByRole("button", { name: /^More options/ }).click();
+    await toMachine(page, new RegExp(MOCK_VM));
+    await page.getByRole("button", { name: /^A past session on / }).click();
+    await expect(page.locator(".ps-list .ps-row").filter({ hasText: "Port the parser to Rust" })).toContainText("in a microVM");
+    await expect(page.locator(".ps-list .ps-row").filter({ hasText: "Speed up the log viewer" })).not.toContainText("in a microVM");
+    expect(await sideways(page)).toBe(0);
+    const isolated = await pickUp(page, "Port the parser to Rust");
+    expect(isolated.spec?.resume).toBe("past-vm-1");
+    expect(isolated.spec?.isolation).toEqual({ kind: "microvm", image: "harness-codex" });
+    // One of the machine's own goes on as a process, as before.
+    const own = await pickUp(page, "Speed up the log viewer");
+    expect(own.spec?.resume).toBe("past-1");
+    expect(own.spec?.isolation).toBeUndefined();
   });
 });
 

@@ -27,6 +27,16 @@ use super::Refusal;
 /// The directory beneath a layout's base for what's in no volume: the microVM's scratch.
 pub const SCRATCH: &str = ".scratch";
 
+/// The directory beneath a kiln's state where it keeps its people's volumes (docs/agents.md, "From
+/// an Agentfile, in a microVM of its own": `<kiln's state>/homes/<you>/<harness>/`).
+pub const HOMES: &str = "homes";
+
+/// Where a kiln whose state is `state` (a runner's state directory, the server's data directory)
+/// keeps its people's volumes: the root [`Layout::new`] takes.
+pub fn root(state: &Path) -> PathBuf {
+    state.join(HOMES)
+}
+
 /// A harness's home when its run environment names none: init's, its scratch (Shards D231,
 /// "its scratch at `/tmp` (`HOME=/tmp`, init's)").
 pub const INIT_HOME: &str = "/tmp";
@@ -266,6 +276,17 @@ pub fn of_builtin(b: &crate::agentfiles::builtin::Builtin) -> (Vec<String>, Vec<
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect();
     (volumes, env)
+}
+
+/// `person`'s volume of `harness` under `root` as kiln's own Agentfile for that harness lays it out
+/// ([`of_builtin`]): how a machine's history reads the conversations kept there once their microVMs are
+/// gone (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5). A person's own Agentfile is built beside
+/// kiln's harness directory (`sandbox::image`), so one made from kiln's keeps this layout. None for a
+/// harness kiln ships no Agentfile for; refused, typed, as [`Layout::new`] refuses.
+pub fn of_kilns(root: &Path, person: &str, harness: &str) -> Result<Option<Layout>, Refusal> {
+    let Some(b) = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == harness) else { return Ok(None) };
+    let (volumes, env) = of_builtin(b);
+    Layout::new(root, person, harness, &volumes, &env).map(Some)
 }
 
 #[cfg(test)]

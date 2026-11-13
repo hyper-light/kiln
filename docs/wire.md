@@ -654,6 +654,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   keeper (`Unsynced`, docs/lb.md "A machine's keeper"); to an owner on a link that didn't name it, a
   runner says it as `Strained`, its why kept, where that owner named `place.health`, else as
   `Draining`.
+  `harness.history-volumes`: the runner answers `ServerMsg::HarnessHistoryFor`, a history asked for a
+  person, listing with its own past sessions those kept in that person's microVM volumes there, each
+  saying it ran in one (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5); a runner that didn't name it
+  is asked `HarnessHistory` and lists its own alone.
 
 ## Registry
 
@@ -714,6 +718,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 77 | `Skills` | | this line: installed skills (what a machine lays out, which session has which) or a folder to read, JSON, to a runner that named `skills` |
 | `ServerMsg` | 78 | `SkillFile` | | this line: a piece of an installed package's file a runner asked for, to a runner that named `skills` |
 | `ServerMsg` | 79 | `HarnessMailTransfer` | | this line: durable journal transfer phase, to a runner that named `mail-transfer` |
+| `ServerMsg` | 80 | `HarnessHistoryFor` | | main (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5): a machine's past sessions for a person, JSON, to a runner that named `harness.history-volumes` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -836,7 +841,7 @@ Four edges are left, and the lab steers clear of each:
 | `UpgradeDone` | answer | Answers `Upgrade`. | As its class says. |
 | `HarnessTaskOutput` | answer | Answers `HarnessTaskOutput`. | As its class says. |
 | `DirList` | answer | Answers `DirList`. | As its class says. |
-| `HarnessHistory` | answer | Answers `HarnessHistory`. | As its class says. |
+| `HarnessHistory` | answer | Answers `HarnessHistory` and `HarnessHistoryFor`. | As its class says. |
 | `Sync` | carried (repo sync's Raft) | Repo sync: hyper-raft acknowledges and resends its own messages. | As its class says. |
 | `FrontDoorStatus` | state | The machine's front door. | Sent on every connect and change, not acknowledged. |
 | `HeadroomStatus` | state | The machine's headroom: its targets, window, held and paced work (docs/headroom.md). | Sent on every connect and when what it decides changes, not acknowledged. |
@@ -970,6 +975,7 @@ Four edges are left, and the lab steers clear of each:
 | `Skills` | state | Installed skills (`crate::skills::place::Manifest`, JSON): every package the machine lays out and which of its sessions has which; or a folder to read for skills, answered by `AgentMsg::Skills` and `AgentMsg::SkillFile`. The newest wins. | New: to runners that named `skills`, as installs and sessions change and on every connect. |
 | `SkillFile` | answer | A piece of an installed package's file the runner asked for (`AgentMsg::Skills` `want`), by its SHA-256, at its offset; the last says so. | New: to runners that named `skills`, in pieces of 512 KiB. |
 | `HarnessMailTransfer` | command, refused while away | Apply the authoritative durable transfer phase for one exact manifest. | Persisted destination readiness precedes source permission to send; Committed precedes activation. |
+| `HarnessHistoryFor` | ask | `HarnessHistory` for a person (`aisessions::Asked`, JSON: `{kind, limit, person}`, the person whoever asked the server): the machine's past sessions with those kept in that person's microVM volumes there, each saying it ran in one (`isolation`). Answered by `HarnessHistory`. | New: to runners that named `harness.history-volumes`; a runner that didn't is asked `HarnessHistory`, and lists its own alone. |
 
 ## Commands to a session: `Command`
 

@@ -461,7 +461,12 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
   }
   if (p === "/api/harness/history" && m === "GET") {
     const kind = url.searchParams.get("kind") ?? "claude";
+    // On a runner that starts microVMs, one kept in the asker's volume there too, saying it ran in a microVM of theirs
+    // (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5), newest.
+    const machine = (url.searchParams.get("target") ?? "local").replace(/^agent:/, "");
+    const inVolume = MICROVM_RUNNERS.has(machine) ? [{ kind, id: "past-vm-1", title: "Port the parser to Rust", cwd: "/home/ada/src/kiln", last_activity: now() - 1800, isolation: { kind: "microvm", person: "owner" } }] : [];
     json(res, 200, [
+      ...inVolume,
       { kind, id: "past-1", title: "Speed up the log viewer", cwd: "/home/ada/src/kiln", branch: "main", last_activity: now() - 3600 },
       { kind, id: "past-2", title: "Trim the release notes", cwd: "/home/ada/src/kiln", last_activity: now() - 86_400 },
     ]);

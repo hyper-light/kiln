@@ -326,6 +326,7 @@ classes! {
         ServerMsg::Skills { .. } => Class::State,
         ServerMsg::SkillFile { .. } => Class::Answer,
         ServerMsg::HarnessMailTransfer { .. } => REFUSED,
+        ServerMsg::HarnessHistoryFor { .. } => Class::Ask,
     }
 }
 

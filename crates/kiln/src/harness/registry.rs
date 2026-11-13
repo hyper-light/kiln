@@ -2783,20 +2783,23 @@ impl Registry {
     }
 
     /// A machine's past sessions, newest first, as JSON (`None`: that machine does not look, e.g.
-    /// an ephemeral runner). The server's own skip what its sessions are running.
-    pub async fn history(&self, hub: &Hub, target: &str, kind: Option<String>, limit: usize) -> anyhow::Result<Option<Value>> {
+    /// an ephemeral runner), with those kept in `person`'s microVM volumes there, each saying so
+    /// (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5). The server's own skip what its sessions
+    /// are running.
+    pub async fn history(&self, hub: &Hub, target: &str, kind: Option<String>, limit: usize, person: Option<String>) -> anyhow::Result<Option<Value>> {
         match Location::of_target(target) {
             Location::Local => {
                 let running: std::collections::HashSet<String> = self.local.list().into_iter().filter_map(|i| i.harness_session).collect();
                 let scanner = Arc::clone(&self.scanner);
+                let homes = super::isolated::home::root(&hub.cfg.server.data_dir);
                 let past = crate::rt::blocking(move || {
                     let mut g = scanner.lock();
-                    g.get_or_insert_with(|| crate::aisessions::Scanner::new(crate::os::home_dir())).history(kind.as_deref(), limit, &running)
+                    g.get_or_insert_with(|| crate::aisessions::Scanner::new(crate::os::home_dir()).with_homes(homes)).history(kind.as_deref(), limit, &running, person.as_deref())
                 })
                 .await?;
                 Ok(Some(serde_json::to_value(past)?))
             }
-            Location::Machine(m) => hub.harness_history(&m, kind, u32::try_from(limit).unwrap_or(u32::MAX)).await?.map(serde_json::to_value).transpose().map_err(Into::into),
+            Location::Machine(m) => hub.harness_history(&m, kind, u32::try_from(limit).unwrap_or(u32::MAX), person).await?.map(serde_json::to_value).transpose().map_err(Into::into),
         }
     }
 
@@ -4928,6 +4931,11 @@ impl Registry {
         .await
         .map_err(|e| format!("{e:#}"))?
         .map_err(|e| format!("{e:#}"))?;
+        // One in a microVM made from its person's own Agentfile: that Agentfile's text, read as theirs
+        // at its latest version, for its machine to build its microVM from again, as at its start (kiln
+        // plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5; `lineage::kept_agentfile`).
+        let person = pkg.spec.isolation.as_ref().and_then(|i| i.person.clone());
+        pkg.spec.agentfile = super::lineage::kept_agentfile(hub, pkg.spec.isolation.as_ref(), person.as_deref()).await?;
         // kiln takes it for the process that held it, which can't hand it on: the package carries
         // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
         let heard = hub.agents.load().get(&from_name).map(|a| a.last_seen).unwrap_or_default();

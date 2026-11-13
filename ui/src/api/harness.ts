@@ -350,6 +350,8 @@ export interface PastSession {
   /** Unix seconds. */
   last_activity: number;
   last_prompt?: string;
+  /** It ran in a microVM of yours (`microvm`), its conversation kept in your volume there: it goes on in one again, never as a process (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5). None: one of the machine's own. */
+  isolation?: Isolation;
 }
 
 export interface Spec {

@@ -1242,6 +1242,7 @@ impl Carries for ServerMsg {
             | ServerMsg::Skills { .. }
             | ServerMsg::SkillFile { .. }
             | ServerMsg::HarnessMailTransfer { .. }
+            | ServerMsg::HarnessHistoryFor { .. }
             | ServerMsg::Later { .. }
             | ServerMsg::Back { .. }) => return Ok(Carried::Nothing(m)),
         };
