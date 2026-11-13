@@ -524,6 +524,12 @@ pub struct Ask {
     /// `none`, a process on its machine (the default), or `microvm`, a microVM of its own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
     /// steps 17 and 32). An isolated agent's agents are isolated whatever it asks ([`isolation_for`]).
     pub isolation: Option<String>,
+    /// The Agentfile its microVM is made from ([`image_for`]): kiln's for its harness
+    /// (`harness-<harness>`), or one of its person's own (`agentfile:<id>`). Naming one isolates it
+    /// (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35).
+    pub image: Option<String>,
+    /// Its harness's own session to take up again, as `Spec::resume` (step 35).
+    pub resume: Option<String>,
     /// A card's helper (`super::about`), when kiln starts one for a person (`agents.about`): never
     /// from what an agent asks (`agents.start` can't hide the agents it starts).
     #[serde(skip)]
@@ -834,17 +840,54 @@ fn not_installed(hub: &Hub, target: &str, kind: &Kind) -> Refused {
 
 /// The isolation an agent starts with (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 17 and 32): what was asked
 /// (`none`, a process on its machine; `microvm`, a microVM of its own), and an isolated parent's,
-/// which its agents keep whatever they ask: one asked as a process under it is refused.
-pub fn isolation_for(asked: Option<&str>, parent: Option<&Info>) -> Result<Option<Isolation>, String> {
+/// which its agents keep whatever they ask: one asked as a process under it is refused. `image`,
+/// an Agentfile [`image_for`] let it name (step 35), makes it a microVM made from that one; else it
+/// keeps its parent's.
+pub fn isolation_for(asked: Option<&str>, image: Option<String>, parent: Option<&Info>) -> Result<Option<Isolation>, String> {
     let inherited = parent.and_then(|p| p.isolation.clone());
-    match asked.map(str::trim) {
-        None | Some("") => Ok(inherited),
-        Some("none") => match inherited {
-            Some(_) => Err("an isolated agent's agents are isolated too: it can't start one as a process on its machine".to_owned()),
-            None => Ok(None),
+    let held = match asked.map(str::trim) {
+        None | Some("") => inherited,
+        Some("none") => match (inherited, &image) {
+            (Some(_), _) => return Err("an isolated agent's agents are isolated too: it can't start one as a process on its machine".to_owned()),
+            (None, Some(_)) => return Err("an Agentfile is what a microVM is made from: `image` can't go with `isolation` \"none\"".to_owned()),
+            (None, None) => None,
         },
-        Some(Isolation::MICROVM) => Ok(Some(inherited.unwrap_or_else(Isolation::microvm))),
-        Some(other) => Err(format!("`isolation` is \"none\" (a process on its machine) or \"microvm\" (a microVM of its own), not {other:?}")),
+        Some(Isolation::MICROVM) => Some(inherited.unwrap_or_else(Isolation::microvm)),
+        Some(other) => return Err(format!("`isolation` is \"none\" (a process on its machine) or \"microvm\" (a microVM of its own), not {other:?}")),
+    };
+    Ok(match image {
+        Some(image) => Some(Isolation { image: Some(image), ..held.unwrap_or_else(Isolation::microvm) }),
+        None => held,
+    })
+}
+
+/// The Agentfile a start names for an isolated agent's microVM (`image`; kiln plan
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 35), as the console offers them (`views/agentfiles/choose.ts`):
+/// kiln's own for its harness, by its name (`harness-<harness>`), or one of `who`'s own, by its id
+/// (`agentfile:<id>`), which another's is as none to (`agentfiles::brief`). Else why not.
+pub async fn image_for(hub: &Hub, who: &crate::agentfiles::Who, kind: &Kind, asked: &str) -> Result<String, Refused> {
+    let name = asked.trim();
+    if let Some(id) = name.strip_prefix(crate::agentfiles::IMAGE) {
+        return match crate::agentfiles::brief(hub, who, id).await {
+            Ok(_) => Ok(name.to_owned()),
+            Err(crate::agentfiles::Error::Missing) => Err((StatusCode::NOT_FOUND, format!("{name} names no Agentfile of yours"))),
+            Err(e) => Err((StatusCode::SERVICE_UNAVAILABLE, format!("couldn't read {name}: {e}"))),
+        };
+    }
+    match crate::agentfiles::builtin::ALL.iter().find(|b| b.name == name) {
+        Some(b) if b.harness == kind.id => Ok(name.to_owned()),
+        Some(b) => Err(bad(format!("{name} is kiln's Agentfile for {}, not {}", b.harness, kind.name))),
+        None => Err(bad(format!("`image` is kiln's Agentfile for its harness (`harness-<harness>`) or one of yours (`{}<id>`), not {name:?}", crate::agentfiles::IMAGE))),
+    }
+}
+
+/// Whose Agentfiles a start may name: its asker's (an agent's, its person's), else the person kiln
+/// starts it for.
+fn whose_agentfiles(by: &Starter) -> Result<crate::agentfiles::Who, Refused> {
+    match (&by.asker, &by.opener) {
+        (Some(asker), _) => crate::agentfiles::Who::of(asker).map_err(|e| (StatusCode::FORBIDDEN, e.to_string())),
+        (None, Some(person)) => Ok(crate::agentfiles::Who { person: person.clone(), all: false }),
+        (None, None) => Err((StatusCode::FORBIDDEN, "a start kiln makes for no one names no Agentfile".to_owned())),
     }
 }
 
@@ -1203,9 +1246,18 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder), not {w:?}"))),
     };
     let count = ask.count.unwrap_or(1).clamp(1, 16);
+    let resume = ask.resume.as_deref().map(str::trim).filter(|r| !r.is_empty()).map(str::to_owned);
+    if resume.is_some() && count > 1 {
+        return Err(bad("one conversation is taken up by one agent: `resume` starts one (`count` 1)"));
+    }
     // A parent's reach off holds its children to its machine.
     let on = by.parent.as_ref().filter(|p| p.reach.as_deref() == Some("off")).map(target_of).or_else(|| ask.on.clone());
-    let isolation = isolation_for(ask.isolation.as_deref(), by.parent.as_ref()).map_err(bad)?;
+    // The Agentfile it names is checked before anything is placed for it.
+    let image = match ask.image.as_deref().map(str::trim).filter(|i| !i.is_empty()) {
+        Some(asked) => Some(image_for(hub, &whose_agentfiles(by)?, kind, asked).await?),
+        None => None,
+    };
+    let isolation = isolation_for(ask.isolation.as_deref(), image, by.parent.as_ref()).map_err(bad)?;
     let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, isolation.is_some(), &ask.queued).await?;
     let checked = async {
         let mut targets: Vec<&str> = placed.iter().map(|(t, _)| t.as_str()).collect();
@@ -1264,6 +1316,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         helper: ask.helper.clone(),
         workspace: volume.then(|| crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() }),
         isolation,
+        resume,
         ..Spec::default()
     };
     tune(&mut spec);
@@ -1334,13 +1387,30 @@ mod tests {
         let host = Info { id: "host-1".into(), ..Info::default() };
         let imaged = Isolation { image: Some("harness-claude".into()), ..Isolation::microvm() };
         let vm = Info { id: "vm-1".into(), isolation: Some(imaged.clone()), ..Info::default() };
-        assert_eq!(isolation_for(None, None)?, None);
-        assert_eq!(isolation_for(Some("none"), Some(&host))?, None);
-        assert_eq!(isolation_for(Some("microvm"), None)?, Some(Isolation::microvm()));
-        assert_eq!(isolation_for(None, Some(&vm))?, Some(imaged.clone()));
-        assert_eq!(isolation_for(Some(" microvm "), Some(&vm))?, Some(imaged));
-        assert!(isolation_for(Some("none"), Some(&vm)).is_err(), "a process under an isolated agent is refused");
-        assert!(isolation_for(Some("container"), None).is_err(), "an isolation kiln doesn't know is refused");
+        assert_eq!(isolation_for(None, None, None)?, None);
+        assert_eq!(isolation_for(Some("none"), None, Some(&host))?, None);
+        assert_eq!(isolation_for(Some("microvm"), None, None)?, Some(Isolation::microvm()));
+        assert_eq!(isolation_for(None, None, Some(&vm))?, Some(imaged.clone()));
+        assert_eq!(isolation_for(Some(" microvm "), None, Some(&vm))?, Some(imaged));
+        assert!(isolation_for(Some("none"), None, Some(&vm)).is_err(), "a process under an isolated agent is refused");
+        assert!(isolation_for(Some("container"), None, None).is_err(), "an isolation kiln doesn't know is refused");
+        Ok(())
+    }
+
+    /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: an Agentfile named makes a microVM made from
+    /// it, asked as one or not; an isolated agent's agent takes its parent's unless it names its own;
+    /// naming one with `isolation` "none" is refused. Dropping the image (`held` alone) fails the first
+    /// two; letting `none` through with an image fails the last.
+    #[test]
+    fn step35_an_agentfile_named_makes_its_microvm() -> Result<(), String> {
+        let mine = || Some("agentfile:0123456789abcdef0123456789abcdef".to_owned());
+        let made = |image: &str| Some(Isolation { image: Some(image.to_owned()), ..Isolation::microvm() });
+        assert_eq!(isolation_for(None, mine(), None)?, made("agentfile:0123456789abcdef0123456789abcdef"), "naming one isolates it");
+        assert_eq!(isolation_for(Some("microvm"), Some("harness-codex".into()), None)?, made("harness-codex"));
+        let vm = Info { id: "vm-1".into(), isolation: made("harness-claude"), ..Info::default() };
+        assert_eq!(isolation_for(None, None, Some(&vm))?, made("harness-claude"), "its parent's, unnamed");
+        assert_eq!(isolation_for(None, mine(), Some(&vm))?, made("agentfile:0123456789abcdef0123456789abcdef"), "its own, named");
+        assert!(isolation_for(Some("none"), mine(), None).is_err_and(|e| e.contains("`image` can't go with")), "a process from an Agentfile is refused");
         Ok(())
     }
 

@@ -36,6 +36,10 @@ pub use check::Check;
 /// What reaches everyone's Agentfiles (an admin's, as the role has every capability).
 pub const MANAGE: &str = "agentfiles.manage";
 
+/// How a start names one of a person's own as an isolated agent's image (`Spec.isolation.image`):
+/// `agentfile:<id>`, as the console's `views/agentfiles/choose.ts` (`keptImage`) names it.
+pub const IMAGE: &str = "agentfile:";
+
 /// An Agentfile's most bytes: the most buildx reads of a Dockerfile (`maxDockerfileSize`, buildx
 /// v0.37.1 build/url.go), which Shards holds the Dockerfiles it fetches to (shards'
 /// `crates/shards/src/build/mod.rs`).
@@ -344,6 +348,11 @@ async fn record(hub: &Hub, who: &Who, id: &str) -> R<Record> {
     let id = id.to_owned();
     let r = hub.store.read(move |c| Ok(get_in(c, &id)?)).await?;
     r.filter(|r| who.reaches(&r.owner)).ok_or(Error::Missing)
+}
+
+/// One the caller reaches, without its text; another's is as none.
+pub async fn brief(hub: &Hub, who: &Who, id: &str) -> R<Brief> {
+    record(hub, who, id).await.map(Record::brief)
 }
 
 /// One the caller reaches, its text read back from `blobs`; another's is as none.
