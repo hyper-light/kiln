@@ -137,6 +137,9 @@ export function AgentHeader({
   // Stop can use HTTP while its socket reconnects; keep that escape available.
   const canStop = running && features.includes("interrupt");
   const canRestart = status === "exited" && features.includes("resume");
+  // Crashed (its harness gone while its machine is up): resumed in place, under its id.
+  const canResume = status === "crashed" && info != null;
+  const onResume = canResume ? () => void harnessApi.resume(info.id).catch(() => undefined) : undefined;
   const left = state?.left_behind ?? info?.left_behind ?? 0;
   const openShell = info?.shell ? () => navigate(`/terminal?session=${encodeURIComponent(info.shell ?? "")}`) : null;
   // Settings always: kiln's own (usage limits) are there whatever the harness offers.
@@ -278,9 +281,9 @@ export function AgentHeader({
           ) : (
             <TurnControl
               {...signal}
-              action={canStop ? "Stop the current turn" : canRestart ? "Restart" : undefined}
-              onClick={canStop ? onStop : canRestart ? () => send({ type: "restart" }) : undefined}
-              restart={canRestart}
+              action={canStop ? "Stop the current turn" : canRestart ? "Restart" : canResume ? "Resume" : undefined}
+              onClick={canStop ? onStop : canRestart ? () => send({ type: "restart" }) : onResume}
+              restart={canRestart || canResume}
             />
           )}
           {onFind && (

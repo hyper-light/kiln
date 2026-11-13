@@ -72,6 +72,29 @@ pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     Ok(moved)
 }
 
+/// A crashed session (`Status::Crashed`) resumed in place: a fresh harness process on its own
+/// machine, under its own id, continuing its conversation the way its harness does
+/// (`super::moving`: Claude Code its own transcript, Codex a thread of its conversation's items,
+/// the rest its conversation in words), so its plans and goal stack stay its own; then each of
+/// its subagents that crashed with it, still its children. One that ended or errored stays so.
+pub async fn resume(hub: &Arc<Hub>, id: &str) -> Result<serde_json::Value, String> {
+    let all = hub.harness.list();
+    let info = all.iter().find(|i| i.id == id).ok_or_else(|| "no such agent".to_owned())?;
+    if info.status != super::model::Status::Crashed {
+        return Err(format!("only a crashed agent is resumed in place: this one is {}", super::wait::stand(info)));
+    }
+    let Some(Location::Machine(machine)) = hub.harness.location(id) else { return Err("it runs on no machine".into()) };
+    let resumed = start_one(hub, id, &machine, true, None, None).await?;
+    let mut children = Vec::new();
+    for c in all.iter().filter(|c| c.parent.as_deref() == Some(id) && c.status == super::model::Status::Crashed) {
+        match start_one(hub, &c.id, &machine, true, None, None).await {
+            Ok(_) => children.push(c.id.clone()),
+            Err(e) => say(hub, &c.id, &format!("Couldn't resume with its agent: {e}")).await,
+        }
+    }
+    Ok(serde_json::json!({ "resumed": resumed, "subagents": children }))
+}
+
 /// [`start`], for session `id` alone.
 async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<String>, model: Option<String>) -> Result<serde_json::Value, String> {
     let to = to.strip_prefix("agent:").unwrap_or(to).to_owned();
@@ -83,11 +106,10 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
         Some(Location::Local) if hub.harness.never_started(id) => "the kiln server".to_owned(),
         _ => return Err("the kiln server keeps the agents it runs once they've started: only one whose harness never started there moves".into()),
     };
-    // Left by its own runner, which is up (a hand-over to a new build that didn't take it: Amphora,
+    // Crashed (its harness gone with the runner process that held it, its machine up: Amphora,
     // 2026-11-12 21:12:49Z): it goes on there again, under its own id, from the server's copy of
     // its conversation, as one whose machine is away does on another.
-    let stranded = info.status == super::model::Status::Disconnected && hub.agents.load().get(&from).is_some_and(|a| a.connected);
-    if from == to && stranded && kind.is_none() {
+    if from == to && info.status == super::model::Status::Crashed && kind.is_none() {
         hub.harness.resume_on(hub, id, &to, Some(info.cwd.clone())).await?;
         return Ok(serde_json::json!({ "moving": to, "from_store": true }));
     }

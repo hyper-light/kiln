@@ -32,6 +32,8 @@ pub enum Stand {
     Idle,
     Offline,
     Ended,
+    /// Its process gone on a machine that's up (`Status::Crashed`): resumed in place.
+    Crashed,
 }
 
 pub fn stand_of(i: &Info) -> Stand {
@@ -46,13 +48,14 @@ pub fn stand_of(i: &Info) -> Stand {
         return Stand::Stopped;
     }
     // Waiting for a limit to reset (a turn under way finishes first).
-    if i.pause.is_some() && !matches!(i.status, Status::Running | Status::Exited | Status::Disconnected) {
+    if i.pause.is_some() && !matches!(i.status, Status::Running | Status::Exited | Status::Disconnected | Status::Crashed) {
         return Stand::Paused;
     }
     match i.status {
         Status::Running | Status::Starting => Stand::Working,
         Status::Idle => Stand::Idle,
         Status::Disconnected => Stand::Offline,
+        Status::Crashed => Stand::Crashed,
         Status::Waiting => Stand::Needs,
         Status::Exited => Stand::Ended,
     }
@@ -208,7 +211,7 @@ impl Watch {
                 let key = needs_key(&info);
                 new_needs(&key, said(Kind::NeedsYou)).then_some((Kind::NeedsYou, key))
             }
-            Stand::Stopped => {
+            Stand::Stopped | Stand::Crashed => {
                 let key = info.exit.as_ref().and_then(|e| e.error.clone()).unwrap_or_default();
                 // Seen alive just before: a crash. Otherwise (first heard, or back from offline)
                 // only one not said yet.
@@ -545,6 +548,7 @@ mod tests {
         assert_eq!(stand_of(&Info { pause: Some(pause.clone()), ..agent(Status::Idle) }), Stand::Paused);
         assert_eq!(stand_of(&Info { pause: Some(pause), ..agent(Status::Running) }), Stand::Working, "its turn finishes first");
         assert_eq!(stand_of(&agent(Status::Disconnected)), Stand::Offline);
+        assert_eq!(stand_of(&agent(Status::Crashed)), Stand::Crashed, "crashed, never offline");
     }
 
     #[test]
