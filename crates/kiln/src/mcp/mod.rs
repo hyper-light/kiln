@@ -218,9 +218,10 @@ const PLAN_TOOLS: &[&str] = &["plans.list", "plans.get", "plans.create", "plans.
 const CI_TOOLS: &[&str] = &["experiments.suggest"];
 
 /// kiln's operations an agent has as tools of its own (`agents_start`, `goals_plan`, `plans_run`,
-/// …): `agents.*` but its credential, `goals.*` but a stack's settings, most of `plans.*`, and
-/// `research.*`. The server says which ([`runner_ask`]'s registry answer), so its agents' MCP
-/// servers offer what it has, however old their runner: a deploy reaches the agents at work.
+/// …): `agents.*` but its credential, `goals.*` but a stack's settings, most of `plans.*`,
+/// `research.*`, and `agentfiles.*`, which reach the Agentfiles of the person it acts for and no one
+/// else's (`crate::agentfiles::Who`). The server says which ([`runner_ask`]'s registry answer), so its
+/// agents' MCP servers offer what it has, however old their runner: a deploy reaches the agents at work.
 pub fn agent_ops() -> Vec<crate::ops::Op> {
     crate::harness::ops::list_ops()
         .into_iter()
@@ -230,6 +231,7 @@ pub fn agent_ops() -> Vec<crate::ops::Op> {
         .chain(crate::goals::ops::list_ops().into_iter().filter(|o| o.name != "goals.settings"))
         .chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name)))
         .chain(crate::research::ops::list_ops())
+        .chain(crate::agentfiles::ops::list_ops())
         .collect()
 }
 
@@ -1620,6 +1622,80 @@ mod tests {
             anyhow::ensure!(runner.as_ref().map(Kept::total) == Some(2), "the runner's page: {runner:?}");
             let principal: String = hub.store.call(|c| Ok(c.query_row("SELECT principal FROM audit2 WHERE action = 'security.wire_refused' AND target = 'mcp_reach' LIMIT 1", [], |r| r.get(0))?)).await?;
             anyhow::ensure!(principal == "agent:s1", "{principal}");
+            Ok(())
+        })
+    }
+
+    /// A hub with agent session `s1` on runner `box`, as reach finds them.
+    async fn session_on_box() -> anyhow::Result<Arc<Hub>> {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        hub.put_agent(crate::hub::tests::live_runner("box", "linux", "x86_64"));
+        hub.harness.ingest(&crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
+        Ok(hub)
+    }
+
+    /// Operation `name` called with `input` by agent session `s1` on runner `box`, through reach.
+    async fn s1_calls(hub: &Arc<Hub>, name: &str, input: Value) -> anyhow::Result<Value> {
+        let q = crate::reach::Question::Call { session: "s1".into(), terminal: String::new(), name: name.into(), input, act: None, hand_on: None };
+        let raw = serde_json::to_value(&q)?;
+        Ok(runner_ask(hub, "box", 0, &q, &raw, None).await)
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 30: an agent on a runner has the Agentfile
+    /// operations as tools of its own, every one of them named in the server's answer for its MCP
+    /// server; `/api/mcp` lists them too, deleting one marked destructive for clients that ask first.
+    #[test]
+    fn step30_agents_on_runners_have_the_agentfiles_tools() -> anyhow::Result<()> {
+        use crate::reach::Question;
+        crate::rt::block_on(async {
+            let hub = session_on_box().await?;
+            let ask = Question::Registry { session: "s1".into(), terminal: String::new() };
+            let a = runner_ask(&hub, "box", 0, &ask, &serde_json::to_value(&ask)?, None).await;
+            let named: Vec<&str> = a.get("agent_tools").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+            let agentfiles: Vec<&str> = crate::agentfiles::ops::list_ops().iter().map(|o| o.name).collect();
+            anyhow::ensure!(!agentfiles.is_empty());
+            let missing: Vec<&&str> = agentfiles.iter().filter(|n| !named.contains(*n)).collect();
+            anyhow::ensure!(missing.is_empty(), "not agents' tools: {missing:?} (named: {named:?})");
+            let listed = answer(&hub, Caller::owner(), br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await;
+            let tools = listed.as_ref().and_then(|l| l.pointer("/result/tools")).and_then(Value::as_array).cloned().unwrap_or_default();
+            for n in &agentfiles {
+                anyhow::ensure!(tools.iter().any(|t| t.get("name") == Some(&json!(tool_name(n)))), "/api/mcp has no tool for {n}");
+            }
+            let delete = tools.iter().find(|t| t.get("name") == Some(&json!("agentfiles_delete")));
+            anyhow::ensure!(delete.and_then(|t| t.pointer("/annotations/destructiveHint")) == Some(&json!(true)), "{delete:?}");
+            Ok(())
+        })
+    }
+
+    /// Step 30: an agent on a runner keeps, reads, changes, restores, lists and deletes an Agentfile
+    /// through reach, each call answered as its operation answers it, the Agentfile its person's (the
+    /// owner's, on a kiln nobody else signs in to). Whose an agent reaches is `agentfiles::tests`'.
+    #[test]
+    fn step30_an_agent_on_a_runner_round_trips_an_agentfile() -> anyhow::Result<()> {
+        const V1: &str = "FROM ubuntu:24.04\nAGENT main FROM ./agent\nCMD [\"claude\"]\n";
+        const V2: &str = "FROM ubuntu:24.04\nAGENT main FROM ./agent\nAGENT helper FROM ./helper\nCMD [\"claude\"]\n";
+        crate::rt::block_on(async {
+            let hub = session_on_box().await?;
+            let at = |v: &Value, p: &str| v.pointer(p).cloned().unwrap_or(Value::Null);
+            let made = s1_calls(&hub, "agentfiles.create", json!({"name": "claude", "text": V1})).await?;
+            let id = at(&made, "/ok/agentfile/id").as_str().unwrap_or_default().to_owned();
+            anyhow::ensure!(!id.is_empty() && at(&made, "/ok/agentfile/version") == json!(1) && at(&made, "/ok/agentfile/owner") == json!("owner"), "{made}");
+            let got = s1_calls(&hub, "agentfiles.get", json!({"id": id})).await?;
+            anyhow::ensure!(at(&got, "/ok/text") == json!(V1) && at(&got, "/ok/version") == json!(1), "{got}");
+            let v2 = s1_calls(&hub, "agentfiles.update", json!({"id": id, "text": V2})).await?;
+            anyhow::ensure!(at(&v2, "/ok/agentfile/version") == json!(2), "{v2}");
+            let vs = s1_calls(&hub, "agentfiles.versions", json!({"id": id})).await?;
+            let listed: Vec<Value> = at(&vs, "/ok/versions").as_array().into_iter().flatten().map(|v| at(v, "/version")).collect();
+            anyhow::ensure!(listed == [json!(2), json!(1)], "{vs}");
+            let v3 = s1_calls(&hub, "agentfiles.restore", json!({"id": id, "version": 1})).await?;
+            anyhow::ensure!(at(&v3, "/ok/agentfile/version") == json!(3) && at(&v3, "/ok/agentfile/text") == json!(V1), "{v3}");
+            let list = s1_calls(&hub, "agentfiles.list", json!({})).await?;
+            let ids: Vec<Value> = at(&list, "/ok/agentfiles").as_array().into_iter().flatten().map(|a| at(a, "/id")).collect();
+            anyhow::ensure!(ids == [json!(id)], "{list}");
+            let gone = s1_calls(&hub, "agentfiles.delete", json!({"id": id})).await?;
+            anyhow::ensure!(at(&gone, "/ok") == json!({"deleted": true}), "{gone}");
+            let after = s1_calls(&hub, "agentfiles.get", json!({"id": id})).await?;
+            anyhow::ensure!(at(&after, "/error") == json!("no such Agentfile") && at(&after, "/status") == json!(404), "{after}");
             Ok(())
         })
     }
