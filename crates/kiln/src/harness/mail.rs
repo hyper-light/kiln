@@ -790,7 +790,10 @@ mod tests {
             let body_bytes = admission::command_bytes(&command).map_err(|error| anyhow::anyhow!("fixture body size: {error:?}"))?;
             let (tx, rx) = async_channel::unbounded();
             let records = Arc::new(kiln_seams::records::SimRecords::new());
-            let host = Host::with_records(tx, None, crate::harness::host::Limits::default(), Arc::new(kiln_seams::clock::SimClock::new()), Some(records));
+            // This test is its host's resource authority: its budget follows shares of its own, which no other test's
+            // host (each built on the server's shares measures them again) resizes under it in a parallel run.
+            let shares = crate::memory::room::Shares::new();
+            let host = Host::with_records_following(tx, None, crate::harness::host::Limits::default(), Arc::new(kiln_seams::clock::SimClock::new()), Some(records), &shares);
             // The session's real authority admits this original representation, but cannot also
             // allocate its counted transaction/driver representation. No Capacity is forged.
             host.set_input_budget(body_bytes);
