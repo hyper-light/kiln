@@ -32,6 +32,7 @@ from typing import Callable, Dict, List, Optional
 
 from . import chaos, derive, hostfacts, lane, procs, witness
 from .hex import Hex
+from .kilnapi import Kiln
 from .records import Records
 from .shards import Shards
 
@@ -56,10 +57,14 @@ class Vm:
 
 
 def driver_for(opts, scope: str):
-    """The placer the run asks VMs of: Shards' daemon (`shards`, the direct driver) or a Hex
-    scheduler of the run's own (`hex`), sized by `--vm`."""
-    if getattr(opts, "driver", "shards") == "hex":
+    """The placer the run asks VMs of: Shards' daemon (`shards`, the direct driver), a Hex
+    scheduler of the run's own (`hex`, sized by `--vm`), or kiln's balancer (`kiln`: isolated agent
+    sessions, kiln's address and token from KILN_URL and KILN_TOKEN)."""
+    driver = getattr(opts, "driver", "shards")
+    if driver == "hex":
         return Hex(opts.hex, opts.shards, scope, needs_room(opts.vm), guest_platform())
+    if driver == "kiln":
+        return Kiln(os.environ.get("KILN_URL", ""), os.environ.get("KILN_TOKEN", ""), opts.kind, opts.shards, scope)
     return Shards(opts.shards, scope)
 
 
@@ -255,14 +260,14 @@ class Agent:
         quiet = self.quiescent()
         if quiet:
             lagging = lambda vs: [v for v in vs if v["witness"] in W.LAGGING]  # noqa: E731
-            first = lagging(W.check(self.ledger, found, view, self.room, self.limit, True))
+            first = lagging(W.check(self.ledger, found, view, self.room, self.limit, True, self.driver.scans))
             if first:
                 began = time.monotonic_ns()
                 latest = {"found": found, "view": view, "err": view_err}
 
                 def settled() -> bool:
                     latest["found"], latest["view"], latest["err"] = self.observe()
-                    return not lagging(W.check(self.ledger, latest["found"], latest["view"], self.room, self.limit, True))
+                    return not lagging(W.check(self.ledger, latest["found"], latest["view"], self.room, self.limit, True, self.driver.scans))
 
                 ok = self.settle(settled, "view.settle")
                 found, view, view_err = latest["found"], latest["view"], latest["err"]
@@ -273,7 +278,7 @@ class Agent:
         if per_vm and max(per_vm) > 0:
             self.cost["mem"] = max(self.cost.get("mem", 0), max(per_vm))
             self.limit = derive.density_limit(self.room, self.cost)
-        violations = W.check(self.ledger, found, view, self.room, self.limit, quiet)
+        violations = W.check(self.ledger, found, view, self.room, self.limit, quiet, self.driver.scans)
         mem = hostfacts.memory()
         rec = self.rec.write(
             "scan", n=self.scans, why=why, quiescent=quiet, vms=len(vms), per_vm_mem=per_vm,
@@ -365,10 +370,11 @@ class Agent:
         return token
 
     def await_placed(self, tokens: List[str]) -> None:
-        """Follows each starting ask's box until the placer says it was made (`started`: asked to
-        made, its start; the placer gives no lane, so no workload's answer is in it), ended or
-        refused, or its learned wait passes. A probe at doubling intervals from 1 ms, as the
-        placer gives no event (R05: a probe, said as one)."""
+        """Follows each starting ask's box (the wave's, and any earlier one still starting) until
+        the placer says it was made (`started`: asked to made, its start; the placer gives no lane,
+        so no workload's answer is in it), ended or refused, or its learned wait passes. A probe at
+        doubling intervals from 1 ms, as the placer gives no event (R05: a probe, said as one)."""
+        tokens = sorted(set(tokens) | set(self.starting()))
 
         def settled() -> bool:
             for t in tokens:
@@ -379,7 +385,7 @@ class Agent:
                 if state == "live":
                     self.ledger[t].move(W.LIVE)
                     self.waits["start"].answered(took)
-                    self.rec.write("started", token=t, start_ns=took, wave=self.wave, concurrency=self.wave_size, by="made")
+                    self.rec.write("started", token=t, start_ns=took, wave=self.wave, concurrency=self.wave_size, by="made", on=self.driver.where(t))
                 elif state != "starting":
                     self.ledger[t].move(W.FAILED)
                     self.rec.write("start_failed", token=t, why=state, after_ns=took, wave=self.wave)
@@ -487,10 +493,15 @@ class Agent:
         last = 0
         while True:
             self.check_stop()
-            if self.limit is None and self.ledger and any(a.state == W.LIVE for a in self.ledger.values()):
+            if not self.driver.scans:
+                # A placer whose VMs run elsewhere admits them itself: the run asks up to the
+                # person's number (`--asks`), and its own refusal or queue is where it is full.
+                room_left = self.o.asks - len(self.live()) - len(self.starting())
+            elif self.limit is None and self.ledger and any(a.state == W.LIVE for a in self.ledger.values()):
                 self.failed("fill", "no VM's memory could be read: no limit can be derived, so nothing more is started")
                 break
-            room_left = 1 if self.limit is None else self.limit - len(self.live()) - len(self.starting())
+            else:
+                room_left = 1 if self.limit is None else self.limit - len(self.live()) - len(self.starting())
             n = derive.next_wave(last, room_left)
             if n <= 0:
                 break
@@ -779,11 +790,12 @@ class Agent:
         stopping = sorted(t for t, a in self.ledger.items() if a.state in (W.LIVE, W.STARTING))
         for t in stopping:
             self.ledger[t].move(W.STOPPING)
-        code, said = self.driver.remove(sorted(t for t, a in self.ledger.items() if a.state != W.REFUSED))
+        # Every ask, refused ones too: a placer that queued one may have started it since.
+        code, said = self.driver.remove(sorted(self.ledger))
         view, _ = self.driver.view()
         if view:
             self.rec.write("drain_left", tokens=sorted(view), removed={"code": code, "said": said[-200:]})
-        self.settle(lambda: not any(p["role"] == "vm" for p in self.scope_procs()), "drain.gone")
+        self.settle(lambda: not any(p["role"] == "vm" for p in self.scope_procs()) and (self.driver.scans or not self.driver.view()[0]), "drain.gone")
         for t, a in sorted(self.ledger.items()):
             if a.state not in (W.ENDED, W.REFUSED):
                 if a.state == W.ASKED:
