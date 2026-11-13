@@ -5144,6 +5144,28 @@ mod tests {
         core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect()
     }
 
+    /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: an isolated Codex is told its project
+    /// as its microVM has it (`sandbox::isolated::guest_path`), in each request that names it: a
+    /// Windows machine's folder at `/work/<name>`, a Unix one at its own path; Codex on its machine
+    /// is told the machine's.
+    #[test]
+    fn s17_an_isolated_codex_is_told_its_guest_folder() {
+        use super::super::session::{Isolation, Spec};
+        for (host, told, isolation) in [(r"C:\src\app", "/work/app", Some(Isolation::microvm())), ("/Users/ada/src/app", "/Users/ada/src/app", Some(Isolation::microvm())), (r"C:\src\app", r"C:\src\app", None)] {
+            let spec = Spec { kind: "codex".into(), cwd: Some(host.into()), isolation, ..Spec::default() };
+            let mut core = Core::new();
+            core.state.cwd = host.into();
+            let mut c = Codex::from_spec(&spec);
+            c.start(&mut core);
+            feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
+            let w = written(&mut core);
+            let said = |method: &str, at: &str| w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some(method)).and_then(|v| v.pointer(at)).cloned();
+            for (method, at) in [("thread/start", "/params/cwd"), ("skills/list", "/params/cwds/0"), ("hooks/list", "/params/cwds/0"), ("config/read", "/params/cwd"), ("plugin/installed", "/params/cwds/0")] {
+                assert_eq!(said(method, at), Some(json!(told)), "{host}: {method}");
+            }
+        }
+    }
+
     /// CP-T3.2: a steer received before turn/start answers still reaches that turn. A second
     /// turn/started notification must not send another copy; explicit Queue keeps waiting.
     #[test]

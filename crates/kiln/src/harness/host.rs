@@ -4230,6 +4230,37 @@ mod tests {
         })
     }
 
+    /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: kiln's copy of an isolated Claude
+    /// Code's conversation is kept where Claude Code in its microVM looks for it, under its project's
+    /// name there (`sandbox::isolated::guest_path`): a Windows machine's folder's `/work/<name>`, a Unix
+    /// one's own path; Claude Code on its machine, the machine's.
+    #[test]
+    fn s17_an_isolated_claudes_copy_is_kept_under_its_guest_folders_name() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            for (host_cwd, told, isolated) in [(r"C:\src\app", "/work/app", true), ("/Users/ada/src/app", "/Users/ada/src/app", true), (r"C:\src\app", r"C:\src\app", false)] {
+                let dir = tempfile::tempdir()?;
+                let (tx, _rx) = async_channel::unbounded();
+                let host = sim(tx, Some(dir.path().join("harness.json")), Limits::default());
+                let session = host.open(Some("copied".into()), no_harness(dir.path()))?;
+                let mut saved = host.recorded(&session);
+                assert!(host.close("copied"));
+                let config = dir.path().join("claude");
+                saved.spec.cwd = Some(host_cwd.into());
+                saved.spec.isolation = isolated.then(session::Isolation::microvm);
+                saved.spec.env.push(("CLAUDE_CONFIG_DIR".into(), config.to_string_lossy().into_owned()));
+                let events = vec![super::super::model::Event { id: "said".into(), seq: 1, at: 1_001, parent: None, by: None, body: Body::Assistant { text: "Keep this context".into(), streaming: false } }];
+                let mut archive = ArchivedSession { saved, state: Default::default(), events, phase: ArchivePhase::Archived, restore_host: None, files: None, copy_items: None, copied: false };
+                archive.prepare_copy().map_err(anyhow::Error::msg)?;
+                let native = archive.saved.spec.resume.clone().ok_or_else(|| anyhow::anyhow!("{host_cwd}: no native conversation"))?;
+                let kept = super::super::handoff::claude_project_dir(&config, told).join(format!("{native}.jsonl"));
+                anyhow::ensure!(kept.is_file(), "{host_cwd}: not at {}", kept.display());
+                let records = std::fs::read_to_string(&kept)?;
+                anyhow::ensure!(records.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter_map(|r| r.get("cwd").cloned()).all(|c| c == told), "{host_cwd}: {records}");
+            }
+            Ok(())
+        })
+    }
+
     /// A crash after archive intent but before active-record removal must not resurrect it.
     #[test]
     fn mc_attention_archived_intent_blocks_restart_of_an_old_active_record() -> anyhow::Result<()> {

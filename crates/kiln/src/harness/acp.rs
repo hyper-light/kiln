@@ -2232,6 +2232,28 @@ mod tests {
         }
     }
 
+    /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: an isolated ACP agent's session is
+    /// opened, new or loaded, in its project as its microVM has it (`sandbox::isolated::guest_path`): a
+    /// Windows machine's folder at `/work/<name>`, a Unix one at its own path; an agent on its machine
+    /// opens it in the machine's.
+    #[test]
+    fn s17_an_isolated_acp_session_opens_in_its_guest_folder() {
+        use super::super::session::{Isolation, Spec};
+        for (host, told, isolation) in [(r"C:\src\app", "/work/app", Some(Isolation::microvm())), ("/Users/ada/src/app", "/Users/ada/src/app", Some(Isolation::microvm())), (r"C:\src\app", r"C:\src\app", None)] {
+            for (resume, method) in [(None, "session/new"), (Some("s0".to_owned()), "session/load")] {
+                let spec = Spec { kind: "gemini".into(), cwd: Some(host.into()), isolation: isolation.clone(), resume, ..Spec::default() };
+                let mut core = TestCore::new();
+                core.state.cwd = host.into();
+                let mut a = Acp::from_spec(&spec);
+                a.start(&mut core);
+                feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}})]);
+                let w = written(&mut core);
+                let opened = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some(method)).and_then(|v| v.pointer("/params/cwd")).cloned();
+                assert_eq!(opened, Some(json!(told)), "{host}: {method}");
+            }
+        }
+    }
+
     fn acp_kinds() -> impl Iterator<Item = &'static str> {
         super::super::kinds::Kind::all().iter().filter(|k| matches!(k.protocol, super::super::kinds::Protocol::Acp(_))).map(|k| k.id)
     }
