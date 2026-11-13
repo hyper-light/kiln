@@ -1,0 +1,51 @@
+# kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 4: probe.sh's output, verbatim (kiln run on adacachy2, Linux x86_64,
+# `nice -n 10 bash ./probe.sh` from a carrier holding probe.sh and listen.py; agy 1.5.7 as .kiln/images/harness-antigravity/pin.json
+# pins it, its tarball and binary checked against the pin's sha256). No message was sent: no turn, no prompt; a throwaway HOME
+# with no credentials.
+cli.tgz: OK
+agy: OK
+== adacachy2 Linux x86_64 | agy 1.5.7 | 2026-11-13T05:26:42Z
+== 1: an http server in agy's own config, its header naming a variable of agy's environment
+Added MCP server "kiln-probe" (http)
+{
+  "mcpServers": {
+    "kiln-probe": {
+      "disabled": false,
+      "headers": {
+        "Authorization": "Bearer ${KILN_PROBE_TOKEN}"
+      },
+      "serverUrl": "http://127.0.0.1:38393/config-mcp"
+    }
+  }
+}
+p1 exit=1
+== 2: an http server given in --settings alone
+p2 exit=1
+Error: --settings: unknown setting "mcpServers"
+
+== 3: a stdio server in agy's own config: what of agy's environment reaches it
+Added MCP server "kiln-stdio" (stdio)
+{
+  "mcpServers": {
+    "kiln-stdio": {
+      "args": [
+        "-c",
+        "printf \"%s\\n\" \"token=${KILN_PROBE_TOKEN:-\u003cunset\u003e}\" \u003e \"$HOME/stdio-env.txt\"; exec cat \u003e /dev/null"
+      ],
+      "command": "sh",
+      "disabled": false
+    }
+  }
+}
+p3 exit=1
+stdio server saw: token=probe-abc123
+== what reached the listener
+{"method": "POST", "path": "/config-mcp", "auth": "Bearer ${KILN_PROBE_TOKEN}", "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/clientCapabilities\":{\"elicitation\":{\"form\":{},\"url\":{}},\"roots\":{\"listChanged\":true}},\"io.modelcontextprotocol/clientInfo\":{\"name\":\"antigravity-client\",\"version\":\"v1.0.0\"},\"io.modelcontextprotocol/protocol"}
+{"method": "POST", "path": "/config-mcp", "auth": "Bearer ${KILN_PROBE_TOKEN}", "body": "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"antigravity-client\",\"version\":\"v1.0.0\"},\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"elicitation\":{\"form\":{},\"url\":{}},\"roots\":{\"listChanged\":true}}}}"}
+{"method": "GET", "path": "/.well-known/oauth-protected-resource/config-mcp", "auth": null, "body": ""}
+{"method": "GET", "path": "/.well-known/oauth-protected-resource", "auth": null, "body": ""}
+== p1 out
+Error: authentication required. Run 'agy' to log in, then retry.
+error: authentication failed or timed out
+{"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"authentication failed or timed out","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"finished_reason":"error"}}
+
