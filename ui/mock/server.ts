@@ -866,6 +866,8 @@ function startRun(repo: Repo, opts: { branch?: string; event?: string; pipeline?
 }
 
 /** kiln's release pipeline (`.kiln/release.yaml`), as System → Builds' Build every platform runs it: a job per platform family, each on a machine of its own. */
+/** The owner's mail scope, as kiln derives one (`api.rs` `me_json`: a SHA-256 in hex). */
+const MAIL_SCOPE = "6d6f636b2d6f776e65722d6d61696c2d73636f70652d76312d30303030303030";
 const RELEASE_UI = { name: "ui", run: "npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build", dur: [5, 8] as [number, number], kind: "npm" };
 const RELEASE_JOBS: JobTpl[] = [
   {
@@ -1742,7 +1744,8 @@ const server = http.createServer(async (req, res) => {
     }
     if (!authed(req)) return err(res, 401, "unauthorized");
 
-    if (p === "/api/me") return json(res, 200, { authenticated: true, version: VERSION, hostname: HOSTNAME });
+    // As kiln answers the owner: its mail scope names whose originals this browser keeps (W20).
+    if (p === "/api/me") return json(res, 200, { authenticated: true, kind: "owner", mail_scope: MAIL_SCOPE, version: VERSION, hostname: HOSTNAME });
     // The browser checks send the long session's machine away for a while (`?ms=`).
     if (p === "/api/mock/away" && m === "POST") {
       sendAway(Number(url.searchParams.get("ms") ?? 10_000));

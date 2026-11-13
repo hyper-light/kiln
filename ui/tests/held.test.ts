@@ -113,3 +113,87 @@ await test("W20: account changes preserve separate originals and cannot edit or 
   );
   setMailScope("account-a");
 });
+
+/** Writes `value` as the saved set, as an older build could have left it. */
+async function savedAs(value: unknown) {
+  await new Promise<void>((resolve, reject) => {
+    const request = indexedDB.open("kiln.agents.held");
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction("held", "readwrite");
+      tx.objectStore("held").put(value, "originals");
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onabort = () => reject(tx.error);
+    };
+  });
+}
+
+await test("composer_send: a saved set an older build left (a file without bytes, rows not a list) never stops a save, and its raw rows are kept", async () => {
+  const before = await readHeld();
+  const poisoned = { ...before, worn: [{ ...original("no-bytes"), owner: "account-a", originals: [{ name: "a.txt", mime: "text/plain" }] }], other: "not a list" };
+  await savedAs(poisoned);
+  assert.equal(await useHeld.getState().ready(), true, "reading the set never fails on what an older build kept");
+  assert.equal(await useHeld.getState().hold("after-poison", original("goes")), true, "a new original is kept after it");
+  const held = await readHeld();
+  assert.equal(held["after-poison"]?.[0]?.text, "original goes");
+  assert.equal(held.worn?.[0]?.text, "original no-bytes", "the message whose file had no bytes stays, without that file");
+  assert.equal(held.worn?.[0]?.originals?.length ?? 0, 0);
+  assert.equal(held.other, undefined, "a row that isn't a list is left out of the set");
+  const kept = await new Promise<unknown[]>((resolve, reject) => {
+    const request = indexedDB.open("kiln.agents.held");
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction("legacy", "readonly");
+      const rows = tx.objectStore("legacy").getAll();
+      tx.oncomplete = () => {
+        db.close();
+        resolve(rows.result);
+      };
+      tx.onabort = () => reject(tx.error);
+    };
+  });
+  assert.ok(
+    kept.some((row) => typeof row === "object" && row !== null && (row as { other?: unknown }).other === "not a list"),
+    "the set as it was is kept beside it",
+  );
+  assert.equal(await useHeld.getState().hold("after-poison", original("again")), true);
+  const again = await new Promise<number>((resolve) => {
+    const request = indexedDB.open("kiln.agents.held");
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction("legacy", "readonly");
+      const n = tx.objectStore("legacy").count();
+      tx.oncomplete = () => {
+        db.close();
+        resolve(n.result);
+      };
+    };
+  });
+  assert.equal(again, kept.length, "the repaired set is written once: no backup on every save");
+});
+
+await test("composer_send: a browser that doesn't promise a strict commit still keeps the original", async () => {
+  const proto = Object.getPrototypeOf(
+    await new Promise<IDBTransaction>((resolve) => {
+      const request = indexedDB.open("kiln.agents.held");
+      request.onsuccess = () => {
+        const tx = request.result.transaction("held", "readonly");
+        resolve(tx);
+        tx.oncomplete = () => request.result.close();
+      };
+    }),
+  ) as object;
+  const own = Object.getOwnPropertyDescriptor(proto, "durability");
+  // As a browser without `durability`: what the transaction is given is never read back.
+  Object.defineProperty(proto, "durability", { configurable: true, get: () => undefined, set: () => {} });
+  try {
+    assert.equal(await useHeld.getState().hold("lax", original("kept-anyway")), true);
+  } finally {
+    if (own) Object.defineProperty(proto, "durability", own);
+    else delete (proto as { durability?: unknown }).durability;
+  }
+  assert.equal((await readHeld()).lax?.[0]?.text, "original kept-anyway");
+});

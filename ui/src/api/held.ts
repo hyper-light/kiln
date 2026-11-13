@@ -77,12 +77,39 @@ function legacyHeld(raw: string | null): RecordSet {
 async function preparedFiles(files?: OriginalFile[]): Promise<OriginalFile[] | undefined> {
   return files ? Promise.all(files.map(async (file) => ({ ...file, bytes: file.bytes ?? (await file.blob.arrayBuffer()) }))) : undefined;
 }
-function restored(held: RecordSet): RecordSet {
+/** How many rows (messages and their files) `value` holds, as the store or `restored` has them. */
+function rowsIn(value: unknown): number {
+  if (!object(value)) return 0;
+  return Object.values(value).reduce<number>(
+    (n, rows) => n + (Array.isArray(rows) ? rows.reduce<number>((m, row) => m + 1 + (object(row) && Array.isArray(row.originals) ? row.originals.length : 0), 0) : 1),
+    0,
+  );
+}
+/** A file kept with its bytes, as `stored` writes one. */
+const keptFile = (file: unknown): file is OriginalFile =>
+  object(file) && typeof file.name === "string" && typeof file.mime === "string" && (file.bytes instanceof ArrayBuffer || file.blob instanceof Blob);
+/**
+ * What this browser kept, as the store holds it, whatever wrote it (2026-11-13: one row an older
+ * build kept — a file without its bytes, an agent's rows not a list — failed every send after it,
+ * for every agent, as every save reads and writes the whole set). A row that isn't a message is
+ * left out, and a file kept without bytes (none to send again) is left out of its message.
+ */
+export function restored(held: unknown): RecordSet {
+  if (!object(held)) return {};
   return Object.fromEntries(
-    Object.entries(held).map(([agent, rows]) => [
-      agent,
-      rows.map((message) => ({ ...message, originals: message.originals?.map((file) => (file.bytes ? { ...file, blob: new Blob([file.bytes], { type: file.mime }) } : file)) })),
-    ]),
+    Object.entries(held).flatMap(([agent, rows]) =>
+      Array.isArray(rows)
+        ? [
+            [
+              agent,
+              rows.filter(validMessage).map((message) => {
+                const files = Array.isArray(message.originals) ? message.originals.filter(keptFile) : undefined;
+                return { ...message, originals: files?.map((file) => (file.bytes ? { ...file, blob: new Blob([file.bytes], { type: file.mime }) } : file)) };
+              }),
+            ],
+          ]
+        : [],
+    ),
   );
 }
 function stored(held: RecordSet) {
@@ -91,10 +118,9 @@ function stored(held: RecordSet) {
       agent,
       rows.map((message) => ({
         ...message,
-        originals: message.originals?.map((file) => {
-          if (!file.bytes) throw new Error("original file bytes are not prepared");
-          return { name: file.name, mime: file.mime, bytes: file.bytes };
-        }),
+        // Only a file's bytes can be kept; one without them (none were read) isn't written, so it
+        // never stops the rest from being kept.
+        originals: message.originals?.flatMap((file) => (file.bytes ? [{ name: file.name, mime: file.mime, bytes: file.bytes }] : [])),
       })),
     ]),
   );
@@ -162,19 +188,14 @@ async function transaction(update: Change): Promise<boolean> {
     tx.onabort = () => (refused ? resolve(false) : reject(new Error("storage transaction aborted")));
     tx.onerror = () => {};
     tx.oncomplete = () => resolve(changed);
-    if (tx.durability !== "strict") {
-      tx.abort();
-      return;
-    }
+    // A browser that can't promise a strict commit (no `durability`, or one it lowered) still keeps
+    // what it can: it never stops a send (the server's waiting holds the message either way).
     const old = store.get("originals");
     old.onsuccess = () => {
-      let previous: RecordSet;
-      try {
-        previous = restored((old.result ?? {}) as RecordSet);
-      } catch {
-        tx.abort();
-        return;
-      }
+      const previous = restored(old.result);
+      // Rows left out as unreadable are kept as they were, beside the set, never dropped unseen.
+      const repaired = rowsIn(old.result) !== rowsIn(previous);
+      if (repaired) tx.objectStore("legacy").add(old.result);
       const migration = store.get("legacy-source");
       migration.onsuccess = () => {
         try {
@@ -194,7 +215,7 @@ async function transaction(update: Change): Promise<boolean> {
             tx.abort();
             return;
           }
-          if (migrated || next !== previous) store.put(stored(next), "originals");
+          if (migrated || repaired || next !== previous) store.put(stored(next), "originals");
           changed = true;
         } catch {
           tx.abort();
@@ -210,7 +231,7 @@ export async function readHeld(): Promise<RecordSet> {
     const request = tx.objectStore("held").get("originals");
     tx.oncomplete = () => {
       try {
-        resolve(restored((request.result ?? {}) as RecordSet));
+        resolve(restored(request.result));
       } catch {
         reject(new Error("saved originals could not be decoded"));
       }

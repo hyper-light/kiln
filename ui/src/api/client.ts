@@ -67,6 +67,19 @@ let custodyScope: string | null = null;
 const custodyListeners = new Set<() => void>();
 
 export const mailScope = () => custodyScope;
+/**
+ * This sign-in's mail scope, asking the server once when it isn't known yet (a page whose first
+ * read didn't carry it): a send waits for who's sending, never refuses for it.
+ */
+export async function identifiedMailScope(): Promise<string | null> {
+  if (custodyScope) return custodyScope;
+  try {
+    await api.me();
+  } catch {
+    /* not signed in, or the server is away: the scope stays unknown */
+  }
+  return custodyScope;
+}
 export function onMailScopeChange(listener: () => void): () => void {
   custodyListeners.add(listener);
   return () => custodyListeners.delete(listener);
