@@ -1710,11 +1710,11 @@ mod tests {
         assert!(sc.running.is_none());
         let _ = sc.history(Some("claude"), 10, &HashSet::new());
         assert!(sc.running.is_some(), "before any scan, the history scans once");
-        assert!(sc.sys.processes().len() > 0, "that scan read the processes");
+        assert!(!sc.sys.processes().is_empty(), "that scan read the processes");
         sc.sys = System::new();
         sc.running = Some(HashSet::from(["running-now".to_owned()]));
         let _ = sc.history(Some("claude"), 10, &HashSet::new());
-        assert_eq!(sc.sys.processes().len(), 0, "a history after a scan reads no process");
+        assert!(sc.sys.processes().is_empty(), "a history after a scan reads no process");
         assert_eq!(sc.running, Some(HashSet::from(["running-now".to_owned()])));
     }
     #[cfg(target_os = "linux")]
