@@ -3818,6 +3818,8 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
         isolation: spec.isolation.clone(),
+        runs: None,
+        starts: Vec::new(),
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info), since: None }, super::core::Update::State { state: Box::new(state) }]
