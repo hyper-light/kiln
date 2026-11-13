@@ -427,17 +427,74 @@ impl Drop for HexRun {
     }
 }
 
+/// #73 part 7 slice 3's surface, its behaviour to come (red).
+pub const USE: &str = "hex.use";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Charge {
+    Final,
+    LastRead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Charged {
+    pub of: Charge,
+    pub cpu_ns: u64,
+    pub footprint_bytes: u64,
+    pub resident_bytes: u64,
+    pub guest_ns: Vec<u64>,
+    pub window_ns: u64,
+}
+
+impl Charged {
+    pub fn of(used: &hex_api::HostUse, of: Charge) -> Self {
+        let window_ns = u64::try_from(used.window.as_nanos()).unwrap_or(u64::MAX);
+        Charged { of, cpu_ns: used.cpu_ns, footprint_bytes: used.footprint_bytes, resident_bytes: used.resident_bytes, guest_ns: used.guest_ns.clone(), window_ns }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Used {
+    pub cpu_milli: u64,
+    pub footprint_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Meter;
+
+impl Meter {
+    pub fn read(&self) -> Result<Used, hex_api::Refusal> {
+        Err(hex_api::Refusal::Invalid { what: "host_use", why: "not read yet".into() })
+    }
+}
+
+impl HexVms {
+    pub fn with_ledger(self, ledger: Arc<dyn kiln_seams::Records>) -> Self {
+        drop(ledger);
+        self
+    }
+
+    pub fn meter(&self, vm: &str) -> Option<Meter> {
+        let _ = vm;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
 
     use hex_api::sim::{SIM_IMAGE, SimRuntime};
-    use hex_api::{BoxId, Destination, Grant, Member, MemberKind, Ports, Proto, Runtime as _};
+    use hex_api::{BoxId, BoxInfo, BoxSpec, Class, Destination, Grant, HostUse, Member, MemberKind, Ports, Proc, Program, Proto, Refusal as H, Runtime, Stdio, Usage};
     use kiln_ci::place::holder::BoxName;
+    use kiln_seams::Records as _;
+    use kiln_seams::records::{Consistency, SimRecords};
     use kiln_seams::sandbox::{Boundary, Egress, Exit, Launch, Limits, Output, Refusal, Run, Sandbox as _, Signal};
 
-    use super::HexVms;
+    use super::{Charge, Charged, HexVms, USE, Used};
 
     /// The sandbox over Hex's simulator, its boxes numbered as a runner process of epoch 7 numbers those of its runs
     /// that reserve nothing.
@@ -526,6 +583,173 @@ mod tests {
                 crate::rt::sleep(std::time::Duration::from_millis(10)).await;
             }
             assert_eq!(sim.list()?, [], "a run let go of takes its box with it");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Hex's simulator with a VM's host use as Hex's image runtime answers it (`host_use`, and the final use
+    /// `delete_with_host_use` answers, its window the whole run, `None` for a box never started), which the
+    /// simulator doesn't model. Read `n` is `use_at(n)`. Its first delete may lose its answer (the box deleted,
+    /// an error said), and its start may be refused.
+    #[derive(Default)]
+    struct Metered {
+        sim: SimRuntime,
+        started: parking_lot::Mutex<std::collections::HashSet<String>>,
+        reads: AtomicU64,
+        deletes: AtomicU64,
+        lose_first_answer: AtomicBool,
+        refuse_start: AtomicBool,
+    }
+
+    /// Read `n` of a VM's use: its CPU time growing as n squared, its window as n, so a read's CPUs are its
+    /// growth since the read before, not its whole run's.
+    fn use_at(n: u64) -> HostUse {
+        HostUse { cpu_ns: n * n * 1_000_000, footprint_bytes: (64 << 20) + n, resident_bytes: (80 << 20) + n, guest_ns: vec![n * 500_000], window: Duration::from_millis(n * 4) }
+    }
+
+    /// A VM's final use, as its delete reads it with its end.
+    fn final_use() -> HostUse {
+        HostUse { cpu_ns: 90_000_000, footprint_bytes: 96 << 20, resident_bytes: 112 << 20, guest_ns: vec![70_000_000], window: Duration::from_secs(1) }
+    }
+
+    impl Runtime for Metered {
+        fn classes(&self) -> Vec<Class> {
+            self.sim.classes()
+        }
+        fn create(&self, spec: BoxSpec) -> Result<BoxInfo, H> {
+            self.sim.create(spec)
+        }
+        fn start(&self, id: &BoxId) -> Result<(), H> {
+            if self.refuse_start.load(Ordering::Acquire) {
+                return Err(H::Invalid { what: "start", why: "refused by the test".into() });
+            }
+            self.sim.start(id)?;
+            self.started.lock().insert(id.to_string());
+            Ok(())
+        }
+        fn exec(&self, id: &BoxId, program: Program, stdio: Stdio) -> Result<Box<dyn Proc>, H> {
+            self.sim.exec(id, program, stdio)
+        }
+        fn run(&self, spec: BoxSpec, program: Program, stdio: Stdio) -> Result<Box<dyn Proc>, H> {
+            self.sim.run(spec, program, stdio)
+        }
+        fn signal(&self, id: &BoxId, signal: hex_api::Signal) -> Result<(), H> {
+            self.sim.signal(id, signal)
+        }
+        fn inspect(&self, id: &BoxId) -> Result<BoxInfo, H> {
+            self.sim.inspect(id)
+        }
+        fn usage(&self, id: &BoxId) -> Result<Usage, H> {
+            self.sim.usage(id)
+        }
+        fn list(&self) -> Result<Vec<BoxInfo>, H> {
+            self.sim.list()
+        }
+        fn delete(&self, id: &BoxId) -> Result<(), H> {
+            self.sim.delete(id)
+        }
+        fn member(&self, id: &BoxId, member: &Member) -> Result<Box<dyn Proc>, H> {
+            self.sim.member(id, member)
+        }
+        fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<HostUse>, H> {
+            self.deletes.fetch_add(1, Ordering::AcqRel);
+            self.sim.delete(id)?;
+            let started = self.started.lock().remove(id.as_str());
+            if self.lose_first_answer.swap(false, Ordering::AcqRel) {
+                return Err(H::Invalid { what: "delete", why: "its answer was lost".into() });
+            }
+            Ok(started.then(final_use))
+        }
+        fn host_use(&self, id: &BoxId) -> Result<HostUse, H> {
+            self.sim.inspect(id)?;
+            Ok(use_at(self.reads.fetch_add(1, Ordering::AcqRel) + 1))
+        }
+    }
+
+    /// The sandbox over [`Metered`], its charges kept in records of its own.
+    fn metered() -> (Arc<Metered>, Arc<SimRecords>, HexVms) {
+        let (rt, records) = (Arc::new(Metered::default()), Arc::new(SimRecords::new()));
+        let n = AtomicU64::new(0);
+        let vms = HexVms::new(Arc::<Metered>::clone(&rt), move || BoxName::Unreserved { epoch: 7, n: n.fetch_add(1, Ordering::Relaxed) }).with_ledger(Arc::<SimRecords>::clone(&records));
+        (rt, records, vms)
+    }
+
+    /// The charge kept for VM `vm`, if any.
+    async fn charged(records: &SimRecords, vm: &str) -> anyhow::Result<Option<Charged>> {
+        let row = records.get(USE, vm.as_bytes(), Consistency::Linearizable).await?;
+        Ok(row.map(|r| serde_json::from_slice(&r.value)).transpose()?)
+    }
+
+    /// Reads its output until its end is said: the charge kept for `vm` at that moment.
+    async fn charged_as_it_ends(run: &dyn Run, records: &SimRecords, vm: &str) -> anyhow::Result<(Exit, Option<Charged>)> {
+        while let Some(said) = run.next().await {
+            if let Output::Exited(end) = said {
+                return Ok((end, charged(records, vm).await?));
+            }
+        }
+        anyhow::bail!("its run ended with no end said")
+    }
+
+    /// #73 part 7 slice 3 (plan step 17): a run's use is read on its charge's cadence through its meter, its CPUs
+    /// over the window since the read before. A kill whose delete loses its answer (its box deleted) has its
+    /// delete asked again as its end is said; that one answers `NoSuchBox`, so the run ended, and it's charged
+    /// the use last read, kept in kiln's records.
+    #[test]
+    fn s17_p7_s3_a_retried_delete_finding_its_box_gone_charges_the_use_last_read() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (rt, records, vms) = metered();
+            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            let meter = vms.meter("kiln-z7-0").ok_or_else(|| anyhow::anyhow!("a live run has its meter"))?;
+            assert_eq!(meter.read()?, Used { cpu_milli: 250, footprint_bytes: use_at(1).footprint_bytes }, "1 ms of CPU over its first 4 ms");
+            assert_eq!(meter.read()?, Used { cpu_milli: 750, footprint_bytes: use_at(2).footprint_bytes }, "3 ms more over 4 ms more");
+            rt.lose_first_answer.store(true, Ordering::Release);
+            run.kill();
+            let (end, kept) = charged_as_it_ends(run.as_ref(), &records, "kiln-z7-0").await?;
+            assert_eq!(end, Exit::Killed);
+            assert_eq!(rt.deletes.load(Ordering::Acquire), 2, "its delete asked again, which found it gone");
+            assert_eq!(kept, Some(Charged::of(&use_at(2), Charge::LastRead)), "charged the use last read");
+            assert_eq!(rt.sim.list()?, []);
+            assert!(matches!(meter.read(), Err(H::NoSuchBox(_))), "a VM gone reads nothing");
+            drop((run, meter));
+            assert!(vms.meter("kiln-z7-0").is_none(), "a run let go of has no meter");
+            anyhow::Ok(())
+        })
+    }
+
+    /// #73 part 7 slice 3: the final use a delete answers is in kiln's records before the run's end is said, both
+    /// for a run that ended on its own and for a kill, whose final use is charged over any use read before it.
+    #[test]
+    fn s17_p7_s3_the_final_use_is_kept_before_its_end_is_said() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (_rt, records, vms) = metered();
+            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            run.close_stdin();
+            let (end, kept) = charged_as_it_ends(run.as_ref(), &records, "kiln-z7-0").await?;
+            assert_eq!(end, Exit::Code(0));
+            assert_eq!(kept, Some(Charged::of(&final_use(), Charge::Final)), "kept as its end is said");
+            let killed = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            vms.meter("kiln-z7-1").ok_or_else(|| anyhow::anyhow!("a live run has its meter"))?.read()?;
+            killed.kill();
+            let (end, kept) = charged_as_it_ends(killed.as_ref(), &records, "kiln-z7-1").await?;
+            assert_eq!(end, Exit::Killed);
+            assert_eq!(kept, Some(Charged::of(&final_use(), Charge::Final)), "its final use, not the one read before");
+            anyhow::Ok(())
+        })
+    }
+
+    /// #73 part 7 slice 3: a run that never started (its start refused) is refused, its box deleted, and charged
+    /// nothing: its delete answers no use, and none was read.
+    #[test]
+    fn s17_p7_s3_a_run_that_never_started_is_charged_nothing() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (rt, records, vms) = metered();
+            rt.refuse_start.store(true, Ordering::Release);
+            let refused = vms.launch(launch(Egress::Only(Vec::new()))).await.err();
+            assert!(matches!(refused, Some(Refusal::Invalid { what: "start", .. })), "{refused:?}");
+            assert_eq!(rt.deletes.load(Ordering::Acquire), 1, "the box it made was deleted");
+            assert_eq!(rt.sim.list()?, []);
+            assert_eq!(charged(&records, "kiln-z7-0").await?, None, "charged nothing");
+            assert!(vms.meter("kiln-z7-0").is_none());
             anyhow::Ok(())
         })
     }
