@@ -273,7 +273,7 @@ pub struct Negotiated {
 /// The link a run's stdio rides into its boundary (a microVM's: Shards' agent control, kiln plan
 /// 01a1cd8e862e7169a074db3d5fa33f3d step 11), as each end says it negotiated: the controller's, on the
 /// machine, and the endpoint's own report from inside; and the lanes its controller was granted on it
-/// as it dialed, by Shards' names (`control`, `stdin:0`, `stdout:0`, `stderr:0`, `exec`, `mcp:0`).
+/// as it dialed, by Shards' names (`control`, `stdout:0`, `stderr:0`, `stdin:0`, `exec`, `socket`, `mcp:0`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
     pub controller: Negotiated,

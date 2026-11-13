@@ -13,6 +13,8 @@
 //!   which the session's adapter speaks to as to a process's pipes (`super::held`).
 //! - **Its folder** is the session's own, at its own path, so what the harness says of its files
 //!   names them as the machine does.
+//! - **What it reaches** past its microVM is its image's destinations narrowed to its session's own
+//!   provider's or sign-in's ([`reach_of`], `super::narrow`), else its image's whole and why.
 //! - **What it can't do yet**, refused rather than done another way: move to another machine, or
 //!   switch to another harness ([`NO_MOVE`], [`NO_SWITCH`]); reach kiln's own tools (plan step 18).
 
@@ -20,6 +22,7 @@ use kiln_seams::sandbox::{Boundary, Egress, Launch, Limits};
 
 use super::Microvms;
 use super::image::Source;
+use super::narrow::{Reach, Whole};
 use crate::agentfiles::builtin;
 use crate::harness::kinds::Kind;
 use crate::harness::session::{Isolation, Spec};
@@ -63,8 +66,9 @@ pub fn source_of<'s>(kind: &Kind, spec: &'s Spec) -> Result<Source<'s>, String> 
 
 /// The seam's launch of `kind` for an isolated `spec`, its microVM booting `image`: its image's
 /// harness member, the arguments past its image's command, in the session's folder at its own path,
-/// with its image's grants narrowed no further and the microVM sized as its boundary sizes one (the
-/// person's sizes reach it through its placement: plan step 32).
+/// with its image's grants (which [`launch`] narrows to what its session uses: [`reach_of`]) and the
+/// microVM sized as its boundary sizes one (the person's sizes reach it through its placement: plan
+/// step 32).
 pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Launch> {
     let cwd = crate::harness::session::resolve_cwd(spec.cwd.as_deref());
     anyhow::ensure!(std::path::Path::new(&cwd).is_dir(), "{cwd} is not a directory on this machine");
@@ -81,18 +85,73 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Laun
     })
 }
 
-/// Starts `kind`'s harness for isolated `spec` in the machine's microVMs `vms`: its image pinned by
-/// its digest (`image::Images::pinned`, built where their store holds none of its content), then its
-/// member's run as the `Duplex` its session drives (`crate::proc::duplex_of_run`); or why not, in the
-/// images' or the sandbox's own words. What its launch takes of the session is checked before
-/// anything is built.
-pub async fn launch(kind: &Kind, spec: &Spec, vms: &Microvms) -> anyhow::Result<crate::proc::Duplex> {
+/// Starts `kind`'s harness for isolated `spec` in the machine's microVMs `vms`: what its microVM
+/// reaches of its image's destinations ([`reach_of`], read from its person's home under `homes`, the
+/// machine's), its image pinned by its digest (`image::Images::pinned`, built where their store holds
+/// none of its content), then its member's run as the `Duplex` its session drives
+/// (`crate::proc::duplex_of_run`); or why not, in the images' or the sandbox's own words. What its
+/// launch takes of the session is checked before anything is built.
+pub async fn launch(kind: &Kind, spec: &Spec, vms: &Microvms, homes: Option<&std::path::Path>) -> anyhow::Result<crate::proc::Duplex> {
     let source = source_of(kind, spec).map_err(anyhow::Error::msg)?;
     let mut launch = launch_of(kind, spec, source.name())?;
+    let reach = match source {
+        Source::Kept { .. } => Reach::Whole { why: Whole::PersonsOwn },
+        Source::Builtin(b) => {
+            let person = spec.isolation.as_ref().and_then(|i| i.person.clone());
+            let (model, homes, project, env) = (spec.model.clone(), homes.map(std::path::Path::to_path_buf), launch.folder.clone(), launch.env.clone());
+            crate::rt::blocking(move || reach_of(b, person.as_deref(), model.as_deref(), homes.as_deref(), project.as_deref(), &env)).await?
+        }
+    };
+    launch.egress = egress_of(&reach);
     let image = vms.images.pinned(source).await.map_err(|r| anyhow::anyhow!("{}'s image, {}: {r}", kind.name, source.name()))?;
     launch.boundary = Boundary::MicroVm { image: image.clone() };
     let run = vms.sandbox.launch(launch).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?;
-    Ok(crate::proc::duplex_of_run(run, image))
+    Ok(crate::proc::duplex_of_run(run, image, reach))
+}
+
+/// What a run of kiln's Agentfile `b` reaches of its image's destinations (`super::narrow`): its
+/// session's own provider's or sign-in's, read as its harness reads them, from its run's environment
+/// as the microVM has it (its image's `run.env`, then `launch_env`), the model its session names, and
+/// its configuration in its person's home under `homes` (`harness::isolated::home::Layout`) or its
+/// project's own (at its own path, `project`, as Shards D235 plugs it in). Whole, saying why, where
+/// its image serves one use or kiln keeps no home for it here. Reads files: off the runtime's threads.
+pub fn reach_of(b: &'static builtin::Builtin, person: Option<&str>, model: Option<&str>, homes: Option<&std::path::Path>, project: Option<&str>, launch_env: &[(String, String)]) -> Reach {
+    if !builtin::destinations::BY_USE.iter().any(|t| t.harness == b.harness) {
+        return Reach::Whole { why: Whole::OneUse };
+    }
+    let (Some(root), Some(person)) = (homes, person) else {
+        return Reach::Whole { why: Whole::NoHome };
+    };
+    let (volumes, image_env) = crate::harness::isolated::home::of_builtin(b);
+    let layout = match crate::harness::isolated::home::Layout::new(root, person, b.harness, &volumes, &image_env) {
+        Ok(layout) => layout,
+        Err(e) => return Reach::Whole { why: Whole::Unread { file: format!("{person}'s home for {}", b.harness), error: e.to_string() } },
+    };
+    let env: Vec<(String, String)> = image_env.into_iter().chain(launch_env.iter().cloned()).collect();
+    let read = |guest: &str| -> Result<Option<String>, String> {
+        let at = match project {
+            Some(p) if std::path::Path::new(guest).starts_with(p) => std::path::PathBuf::from(guest),
+            _ => match layout.host_of(guest) {
+                Some(at) => at,
+                None => return Ok(None),
+            },
+        };
+        match std::fs::read_to_string(&at) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", at.display())),
+        }
+    };
+    super::narrow::reach(b.harness, &super::narrow::Reads { home: &layout.guest_home(), project, env: &env, model, read: &read })
+}
+
+/// The seam's egress for what a run reaches: its image's destinations narrowed to `hosts`, or its
+/// image's own grants, narrowed no further.
+pub fn egress_of(reach: &Reach) -> Egress {
+    match reach {
+        Reach::Narrowed { hosts, .. } => Egress::Only(hosts.clone()),
+        Reach::Whole { .. } => Egress::Any,
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +221,48 @@ mod tests {
         // A folder this machine hasn't is refused before anything starts.
         let gone = Spec { cwd: Some(dir.path().join("gone").to_string_lossy().into_owned()), ..spec("codex") };
         assert!(launch_of(kind("codex")?, &gone, "harness-codex@sha256:00".into()).is_err());
+        Ok(())
+    }
+
+    fn builtin_of(harness: &str) -> anyhow::Result<&'static builtin::Builtin> {
+        builtin::ALL.iter().find(|b| b.harness == harness).ok_or_else(|| anyhow::anyhow!("kiln ships no Agentfile for {harness}"))
+    }
+
+    /// Step 17 part 6: kiln's own Agentfile for a harness of several providers is narrowed to its
+    /// session's, read from its person's home on this machine as `harness::isolated::home` lays it out
+    /// (its run's environment as its image's `run.env` sets it), or from its project at its own path;
+    /// another person's home is never read; with no person or no homes kept, its image stays whole,
+    /// saying why; one of one provider stays whole, no fallback.
+    #[test]
+    fn s17_a_builtins_run_reaches_its_sessions_own_use_read_from_its_persons_home() -> anyhow::Result<()> {
+        let homes = tempfile::tempdir()?;
+        let goose = builtin_of("goose")?;
+        let (volumes, env) = crate::harness::isolated::home::of_builtin(goose);
+        let layout = crate::harness::isolated::home::Layout::new(homes.path(), "user:u1", "goose", &volumes, &env)?;
+        let config = layout.host_of(&format!("{}/.config/goose/config.yaml", layout.guest_home())).ok_or_else(|| anyhow::anyhow!("no host path for goose's config"))?;
+        std::fs::create_dir_all(config.parent().ok_or_else(|| anyhow::anyhow!("a config with no folder"))?)?;
+        std::fs::write(&config, "GOOSE_PROVIDER: anthropic\n")?;
+        let reach = reach_of(goose, Some("user:u1"), None, Some(homes.path()), None, &[]);
+        let Reach::Narrowed { uses, hosts } = &reach else { anyhow::bail!("not narrowed: {reach:?}") };
+        assert_eq!((uses.as_slice(), hosts.as_slice()), (&["anthropic".to_owned()][..], &["api.anthropic.com:443".to_owned()][..]));
+        assert_eq!(egress_of(&reach), Egress::Only(hosts.clone()), "its egress, those alone");
+        // Its run's own environment comes before its configuration.
+        let groq = reach_of(goose, Some("user:u1"), None, Some(homes.path()), None, &[("GOOSE_PROVIDER".to_owned(), "groq".to_owned())]);
+        assert!(matches!(&groq, Reach::Narrowed { uses, .. } if uses == &["groq"]), "{groq:?}");
+        // Another person's home isn't read: theirs says nothing here.
+        assert!(matches!(reach_of(goose, Some("user:u2"), None, Some(homes.path()), None, &[]), Reach::Whole { why: Whole::Untold { .. } }));
+        // No person to read for, or no homes kept on this machine: whole, a fallback the session says.
+        assert_eq!(reach_of(goose, None, None, Some(homes.path()), None, &[]), Reach::Whole { why: Whole::NoHome });
+        assert_eq!(reach_of(goose, Some("user:u1"), None, None, None, &[]), Reach::Whole { why: Whole::NoHome });
+        assert!(Whole::NoHome.is_fallback());
+        assert_eq!(egress_of(&Reach::Whole { why: Whole::NoHome }), Egress::Any);
+        // opencode's project at its own path, read where it is.
+        let project = tempfile::tempdir()?;
+        std::fs::write(project.path().join("opencode.json"), "{\"model\": \"openai/gpt-5\"}")?;
+        let opencode = reach_of(builtin_of("opencode")?, Some("user:u1"), None, Some(homes.path()), project.path().to_str(), &[]);
+        assert!(matches!(&opencode, Reach::Narrowed { uses, .. } if uses == &["openai"]), "{opencode:?}");
+        // One provider's image: its destinations are all its run's.
+        assert_eq!(reach_of(builtin_of("claude")?, Some("user:u1"), None, Some(homes.path()), None, &[]), Reach::Whole { why: Whole::OneUse });
         Ok(())
     }
 }

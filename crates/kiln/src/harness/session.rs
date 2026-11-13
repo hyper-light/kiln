@@ -85,6 +85,12 @@ pub enum Runs {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(test, ts(optional))]
         control: Option<Link>,
+        /// What it reaches past the microVM, of what its image grants (step 17 part 6): its session's
+        /// own provider's or sign-in's destinations, or its image's whole and why. None from a runner
+        /// before it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        reach: Option<crate::sandbox::narrow::Reach>,
     },
 }
 
@@ -99,7 +105,7 @@ pub struct Link {
     /// The endpoint's own report, from inside the microVM.
     pub endpoint: Negotiated,
     /// The lanes its controller was granted on it as it dialed, by Shards' names (`control`,
-    /// `stdin:0`, `stdout:0`, `stderr:0`, `exec`, `mcp:0`). Always said.
+    /// `stdout:0`, `stderr:0`, `stdin:0`, `exec`, `socket`, `mcp:0`). Always said.
     #[serde(default)]
     pub lanes: Vec<String>,
 }
@@ -150,6 +156,18 @@ pub struct Ended {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub code: Option<i32>,
+}
+
+/// What a microVM's session says where its run keeps its image's destinations whole because kiln
+/// couldn't tell what it uses (`narrow::Whole::is_fallback`): none for a narrowed run, or one whose
+/// image's destinations are all its own.
+fn whole_notice(runs: &Runs) -> Option<String> {
+    match runs {
+        Runs::Microvm { reach: Some(crate::sandbox::narrow::Reach::Whole { why }), .. } if why.is_fallback() => {
+            Some(format!("Its network isn't narrowed to its own provider or sign-in, as {why}: it keeps every destination its image names."))
+        }
+        _ => None,
+    }
 }
 
 /// What to start.
@@ -1326,7 +1344,7 @@ impl Session {
     /// upgrade), or one whose end went unseen, which ends now.
     fn began(&self, p: &crate::proc::Duplex) {
         let runs = match (p.boundary(), p.host_pid()) {
-            (Some(held), host_pid) => Runs::Microvm { vm: held.id(), image: held.image().to_owned(), host_pid, control: None },
+            (Some(held), host_pid) => Runs::Microvm { vm: held.id(), image: held.image().to_owned(), host_pid, control: None, reach: Some(held.reach().clone()) },
             (None, Some(pid)) => Runs::Host { pid },
             // A `Duplex` is a process of the machine's or a boundary's run: there's no third.
             (None, None) => return,
@@ -1341,6 +1359,11 @@ impl Session {
                 l.ended = Some(Ended { at: now, code: None });
             }
             starts.push(Start { at: now, runs: runs.clone(), ended: None });
+        }
+        // Its image's destinations kept whole for want of knowing what its session uses: said, never
+        // a silent widening (ROOT, 2026-11-13), once for each start.
+        if let Some(text) = whole_notice(&runs).filter(|_| !taken_over) {
+            core.upsert(&format!("harness-reach:{now}"), None, Body::Notice { level: Level::Warn, text });
         }
         core.state.runs = Some(runs);
         core.touch_state();
@@ -4476,10 +4499,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     // Isolated: its harness is a member of its image in a microVM of its own, through
                     // the machine's microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), and
                     // never a process here; a machine without them refuses it.
-                    None if isolated => match files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm()) {
-                        Some(vms) => crate::sandbox::isolated::launch(kind, &spec, vms.as_ref()).await,
-                        None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
-                    },
+                    None if isolated => {
+                        let host = files.host.as_ref().and_then(std::sync::Weak::upgrade);
+                        match host.as_ref().and_then(|h| h.microvm()) {
+                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, vms.as_ref(), host.as_ref().and_then(|h| h.homes())).await,
+                            None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
+                        }
+                    }
                     // In the session's group of processes where the machine has them, and marked as
                     // its, and so is everything it starts (`survivors`).
                     None => match kind.launch(&spec, &s.id) {
@@ -5426,6 +5452,23 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
 #[cfg(test)]
 mod tests {
     use crate::util::Must as _;
+
+    /// Step 17 part 6: a microVM's run kept whole for want of knowing what its session uses says so,
+    /// and why; one narrowed, one whose image serves one use, and a process of the machine's say
+    /// nothing.
+    #[test]
+    fn s17_a_run_kept_whole_by_a_fallback_says_so() {
+        use crate::sandbox::narrow::{Reach, Whole};
+        let run = |reach| super::Runs::Microvm { vm: None, image: "i@sha256:00".into(), host_pid: None, control: None, reach: Some(reach) };
+        let said = super::whole_notice(&run(Reach::Whole { why: Whole::NoHome })).unwrap_or_default();
+        assert!(said.contains("isn't narrowed") && said.contains("keeps no home"), "{said}");
+        let unread = super::whole_notice(&run(Reach::Whole { why: Whole::Unread { file: "/home/h/x.json".into(), error: "denied".into() } })).unwrap_or_default();
+        assert!(unread.contains("/home/h/x.json couldn't be read: denied"), "{unread}");
+        assert_eq!(super::whole_notice(&run(Reach::Whole { why: Whole::OneUse })), None);
+        assert_eq!(super::whole_notice(&run(Reach::Whole { why: Whole::PersonsOwn })), None);
+        assert_eq!(super::whole_notice(&run(Reach::Narrowed { uses: vec!["anthropic".into()], hosts: vec!["api.anthropic.com:443".into()] })), None);
+        assert_eq!(super::whole_notice(&super::Runs::Host { pid: 1 }), None);
+    }
 
     /// 2026-11-13: a harness line is taken whole however long, in pieces as it comes, and what
     /// follows it is its own line, not the tail of one dropped (resumed Codex sessions held their

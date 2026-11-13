@@ -9,6 +9,8 @@
 //!   member's streams. This kiln carries their runtime once step 16's Shards and Hex are wired in;
 //!   until then a machine holds no isolated agent, and refuses one rather than run it as a process.
 //! - [`isolated`]: an isolated session's launch, its image, and what it can't do yet.
+//! - [`narrow`]: what its microVM reaches past it, of what its image grants: its session's own
+//!   provider's or sign-in's destinations alone, else its image's whole and why.
 //! - [`image`]: what its microVM is made from: its Agentfile's image, built by the carried `shards`
 //!   once for each content, pinned by its digest.
 //! - [`held`]: a boundary's run as the `Duplex` a session drives its harness through, so a session's
@@ -20,6 +22,7 @@ pub mod held;
 pub mod host;
 pub mod image;
 pub mod isolated;
+pub mod narrow;
 
 use std::sync::Arc;
 use std::time::Duration;
