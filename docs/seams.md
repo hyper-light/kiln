@@ -396,41 +396,58 @@ Methods: `push_blob`, `blob`, `push_manifest`, `manifest`, `tags`, `delete_manif
 ## Sandbox
 
 A harness or a CI leg launched in a boundary (the host, a rootless OCI container, a microVM): its
-program, its folder, its limits and the hosts it may reach, its stdio streamed back and its end said
-once, last. Its limits are memory and processes, and its shares of the CPU and the disk, on cgroup
-v2's weights (1 to 10,000, 100 an even share: a build held below an agent). The suite asks its
-fixture for programs by what they do (echo, exit with a code, use memory, start processes,
-connect), so each implementation supplies its own.
+program, its folder and the folders shared with it, its environment, its limits and the hosts it may
+reach, its stdio streamed back, the signals it's sent, and its end said once, last. Its limits are
+memory and processes, and its shares of the CPU and the disk, on cgroup v2's weights (1 to 10,000,
+100 an even share: a build held below an agent). A limit can be none, and a grant can be any host its
+boundary lets it reach: a process on the host, as kiln runs harnesses today; a microVM's image's own
+grants. In a microVM, what runs is a member of its image (an Agentfile's HARNESS or AGENT), with its
+image's command and the arguments the launch adds. The suite asks its fixture for programs by what
+they do (echo, exit with a code, use memory, start processes, connect), so each implementation
+supplies its own.
+
+A sandbox says what it holds its runs to (`holds`): a memory limit, a process limit, shares other
+than an even one, no egress at all, egress to named hosts alone, folders shared at another path or
+read-only, signals. What it holds it enforces; a launch that asks for what it doesn't hold is refused
+`Unsupported`, never taken and ignored, and the suite checks both halves.
 
 How a limit ends a run, as Linux's cgroup v2 has it (agreed with Hex's track, CP-T7.1): memory when
 the boundary killed it for going over (`memory.events` counts an `oom_kill`); processes when it was
 refused one past its limit (`pids.max` fails the fork, the run isn't stopped) and then failed. A run
 refused a process that copes and ends well ends with its code.
 
-- **Implementations:** `host` (today's launch), Shards, then Hex's classes: `process`, `oci`,
-  `firecracker`, `shards` (CP-T4.1, CP-T7.1, CP-T7.2); `kiln_seams::sandbox::SimSandbox`: built-in
-  programs that do those things on the host boundary (a container or a microVM is refused
-  `Unsupported`), 1000 runs at once, 10,000 outputs unread a run (past it, the run is killed).
-- **Used by:** every harness kiln launches and its CI legs, once CP-T4.1 and CP-T7.1 land them.
-- **Passed by:** the simulator, every clause; `host`, Shards and Hex's, when their tracks land them.
+- **Implementations:** `host` (today's launch, which holds none of it: `kiln::sandbox::host`), the
+  microVMs kiln's isolated harnesses run in (`kiln::sandbox`: Shards' members, through Hex, kiln plan
+  01a1cd8e862e7169a074db3d5fa33f3d step 17; docs/isolation.md), then Hex's classes: `process`, `oci`,
+  `firecracker`, `shards` (CP-T7.1, CP-T7.2); `kiln_seams::sandbox::SimSandbox`: built-in programs
+  that do those things on the host boundary (a container or a microVM is refused `Unsupported`),
+  holding everything unless made to hold less, 1000 runs at once, 10,000 outputs unread a run (past
+  it, the run is killed).
+- **Used by:** every isolated harness kiln launches (step 17), and its CI legs once CP-T7.1 lands
+  them.
+- **Passed by:** the simulator, every clause, holding everything and holding nothing; `host`
+  (`kiln::sandbox::host`, on Unix); the microVMs' when their implementation lands on a machine that
+  runs them.
 
-Methods: `launch`, `boundaries`.
+Methods: `launch`, `boundaries`, `holds`.
 
 A launch gives a `Run`: stdin given to it in order, what it says (its output, then its end, once),
-and a kill (its end, unless it had one, is `Killed`).
+signals (refused `Unsupported` where its boundary delivers none), and a kill (its end, unless it had
+one, is `Killed`).
 
-Methods of Run: `stdin`, `close_stdin`, `next`, `kill`.
+Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`.
 
 - **SANDBOX-1** what a run writes reaches its stdout in order, then its end, then nothing
 - **SANDBOX-2** stdin reaches the program in order, and closing it is the end of its input
 - **SANDBOX-3** a run's stderr and exit code are said as they are, and its end comes once, last
 - **SANDBOX-4** a run killed ends Killed, and takes no more input
-- **SANDBOX-5** a run over its memory limit is ended OverLimit(Memory); under it, it runs to its end
-- **SANDBOX-6** a run refused processes past its process limit, that then fails, ends OverLimit(Processes); under it, it runs to its end
-- **SANDBOX-7** a run reaches only the hosts it's granted
+- **SANDBOX-5** a run over its memory limit is ended OverLimit(Memory); under it, it runs to its end; a sandbox that holds no memory limit refuses one Unsupported, and runs a launch without one
+- **SANDBOX-6** a run refused processes past its process limit, that then fails, ends OverLimit(Processes); under it, it runs to its end; a sandbox that holds no process limit refuses one Unsupported, and runs a launch without one
+- **SANDBOX-7** a run reaches only the hosts it's granted, none when granted none, and a host when granted any; a sandbox refuses Unsupported the grants it doesn't hold
 - **SANDBOX-8** a launch of a program that doesn't exist is refused NoSuchProgram
 - **SANDBOX-9** a run works in the folder it's given
-- **SANDBOX-10** cpu and io weights outside cgroup v2's 1 to 10,000 are refused Invalid; at its ends a run goes ahead
+- **SANDBOX-10** cpu and io weights outside cgroup v2's 1 to 10,000 are refused Invalid; at its ends a run goes ahead where the sandbox holds weights, and is refused Unsupported where it doesn't
+- **SANDBOX-11** a run sent a signal to end ends, its end said once, and a signal after its end is refused Ended; a sandbox that delivers no signals refuses one Unsupported, and its run goes on
 
 ## Placement
 
@@ -456,6 +473,42 @@ Methods: `place`, `release`, `nodes`.
 - **PLACEMENT-5** work goes only on nodes with the labels it asks for; none with them, it's refused
 - **PLACEMENT-6** a refusal's why names what's short
 - **PLACEMENT-7** small work fills the cluster exactly to its capacity, and is placed again once some is released
+
+## Capacity
+
+A machine's capacity keeper, as kiln's runner holds room through it (Hex's
+`docs/design/capacity-view.md`; kiln plan `01a1cd8e862e7169a074db3d5fa33f3d`, step 13): links to the
+keeper, each a connection to its port on which the holder's words go in order and the keeper's
+answers come back in that order, with the hints it owes the link between them (CV9). The words are
+Hex's (`hex_api::capacity::{ToKeeper, ToHolder}`), and the order of a holder's words is Hex's holder
+core's, which kiln-ci's `place::holder` drives (docs/lb.md, "A machine's keeper").
+
+- **Implementations:** Hex's keeper on its node, reached over QUIC on its `CAPACITY_PORT` (kiln's
+  `capacity::Quic`, through `hex_quic`); `kiln_seams::capacity::SimCapacity`: Hex's own keeper over
+  records in memory (`hex_api::capacity::sim::SimView`) behind links in memory, its bounds its
+  keeper's (CV8): two links for each holder it serves (one, and the one replacing it), and on each
+  the answers to as many words as one holder may leave unheard (a reserve and two releases for each
+  reservation it may hold, and its hello and its sync), the hints between them coalesced; past
+  either, `Full`.
+- **Used by:** kiln's runner, where its configuration names its machine's keeper (`[capacity]`).
+- **Passed by:** the simulator, every clause, and the keeper it holds Hex's own keeper suite
+  (`hex_api::capacity::conformance`, HEX-CV-1 on); kiln's link to Hex's keeper over QUIC, on two
+  machines (owed).
+
+Methods: `link`.
+
+A link carries words both ways until it ends; dropped, it ends, and the keeper hears its holder is
+away, what that holds staying held (CV5).
+
+Methods of Link: `say`, `hear`.
+
+- **CAPACITY-1** a hello on a new link is welcomed under its epoch, with the machine's room and what is held there
+- **CAPACITY-2** a link's words are answered on it in the order said: a sync, a reserve and a release said together are synced, granted and released in turn
+- **CAPACITY-3** what a holder holds outlives its link: the next link is welcomed with it held, and its sync listing it is answered agreeing
+- **CAPACITY-4** a word under another link's session is closed Session, and the other link's session goes on
+- **CAPACITY-5** a reserve past the room is refused Room with the view, and one asking a GPU by count Devices
+- **CAPACITY-6** another holder's reserve owes a synced link a hint with the view as it is
+- **CAPACITY-7** a hello under an older epoch than its holder's newest is closed OlderEpoch, naming the newest
 
 ## HarnessPort
 

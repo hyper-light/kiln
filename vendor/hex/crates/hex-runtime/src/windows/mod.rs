@@ -1467,6 +1467,12 @@ impl WinRuntime {
     pub fn set_managed_rate(&self, record: NativeRecord<'_>, rate: u64) -> Result<(), Refusal> {
         managed::set_rate(self, record, rate)
     }
+
+    /// Joint plan step 14 (C5 on Windows): the node's last resort ends the managed VM through its receipt, the job this
+    /// node holds.
+    pub fn stop_managed(&self, record: NativeRecord<'_>) -> Result<(), Refusal> {
+        managed::stop(self, record)
+    }
     pub fn managed_usage(&self, record: NativeRecord<'_>) -> Result<Usage, Refusal> {
         managed::usage(self, record)
     }
@@ -1991,7 +1997,7 @@ impl Runtime for WinRuntime {
                 && !self.features_off()?.contains(&WindowsFeature::Containers));
         let (memory, free_memory) =
             sys::memory().map_err(|e| Refusal::os("reading native memory capacity", e))?;
-        let (disk, free_disk) = sys::disk_space(&self.scratch_root)
+        let (disk, free_disk) = scratch_volume(&self.scratch_root)
             .map_err(|e| Refusal::os("reading native disk capacity", e))?;
         let cpu = u64::from(self.processors.get())
             .checked_mul(1000)
@@ -2245,6 +2251,21 @@ fn default_scratch_root() -> PathBuf {
         .join("boxes")
 }
 
+/// The size of the volume `dir` is on and the bytes this user may still write there ([`sys::disk_space`]),
+/// read at `dir`, or while it isn't made yet at its nearest folder that is: the volume it will be made on,
+/// as no folder Hex makes there is a mount point. An outliving node's scratch folder is made by its first
+/// `oci` box, and a scheduler opening over a fresh node reads its capacity before any (joint plan step 13,
+/// HEX-CV-L1). It only reads, and is bounded by `dir`'s components.
+fn scratch_volume(dir: &Path) -> std::io::Result<(u64, u64)> {
+    let mut at = dir;
+    loop {
+        match sys::disk_space(at) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => at = at.parent().ok_or(e)?,
+            read => return read,
+        }
+    }
+}
+
 /// Every standard stream the NUL device: an `oci` box's init has no caller to read it.
 fn null_stdio() -> Result<[OwnedHandle; 3], Refusal> {
     Ok([handle(None)?, handle(None)?, handle(None)?])
@@ -2445,6 +2466,7 @@ mod tests {
                 kind: hex_api::DeviceKind::Gpu,
                 key,
             }],
+            band: 0,
         }
     }
 
@@ -3119,6 +3141,7 @@ mod tests {
             class: ClassSpec::Process,
             owner: None,
             allocation: None,
+            band: 0,
         }
     }
 
@@ -3292,6 +3315,25 @@ mod tests {
             crash(k);
         }
         assert!(own, "the node keeps its records in {:?}", rt.scratch_root);
+    }
+
+    /// AC-T7.4.1 (joint plan step 13, HEX-CV-L1 on Windows): do make a node's runtime as `hex node` does, on a
+    /// keeper folder in a fresh state folder, and read its capacity before any `oci` box has made its scratch
+    /// folder, as a scheduler opening over a fresh node reads it; expect the size of the volume that folder will
+    /// be made on, and the folder still not made.
+    #[test]
+    fn a_fresh_nodes_capacity_is_read_before_its_scratch_folder_is_made() {
+        let (name, state) = (node("fresh"), tempfile::tempdir().unwrap());
+        let rt =
+            WinRuntime::outliving(&name, &state.path().join("keeper"), &keeper("fresh")).unwrap();
+        let read = rt.capacity(Class::Process);
+        let made = rt.scratch_root.exists();
+        if let Some(k) = rt.keeper_pid() {
+            crash(k);
+        }
+        let (volume, _) = sys::disk_space(state.path()).unwrap();
+        assert_eq!(read.unwrap().map(|c| c.total.disk_bytes), Some(volume));
+        assert!(!made, "reading the capacity made {:?}", rt.scratch_root);
     }
 
     /// T-T7.1.2 (native plan step 8): a box taken back after its node AND its keeper both went — its job

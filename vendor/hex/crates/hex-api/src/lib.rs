@@ -39,7 +39,7 @@ pub use devices::{
 };
 pub use grants::{
     Destination, Grant, Member, MemberKind, Ports, Proto, Published, Receiver, check_grants,
-    check_published,
+    check_published, unheld,
 };
 pub use id::BoxId;
 pub use runtime::{
@@ -51,8 +51,8 @@ pub use runtime::{
     RouteReceipt, Runtime, RuntimeCost, Signal, Upstream, Usage, VmSize,
 };
 pub use spec::{
-    Ask, BlockCount, BoxOwner, BoxSpec, Class, ClassSpec, End, ExecLimit, Given, Mount, Network,
-    OciSpec, Program, Rootfs, ShardsImage, Stdio, StringUnit, User, drive_absolute,
+    Ask, BlockCount, BoxOwner, BoxSpec, Class, ClassSpec, End, ExecLimit, Given, ImageMember,
+    Mount, Network, OciSpec, Program, Rootfs, ShardsImage, Stdio, StringUnit, User, drive_absolute,
 };
 
 /// A caller's owned stream: Unix's descriptor becomes a file; Windows keeps the handle's resource kind.

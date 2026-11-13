@@ -59,6 +59,7 @@ impl Fixture for BinFixture {
             bounds,
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         }
     }
 
@@ -109,6 +110,7 @@ fn refused_bundle(config: &serde_json::Value) -> hex_api::Refusal {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(root.path().to_path_buf()),
             owner: None,
+            band: 0,
         })
         .unwrap_err();
     assert!(rt.list().unwrap().is_empty(), "the refused box is left");
@@ -208,6 +210,7 @@ fn a_windows_image_stays_the_hosts_and_a_linux_image_goes_to_the_guest() {
             bounds: Bounds::default(),
             class: ClassSpec::Bundle(dir),
             owner: None,
+            band: 0,
         }
     };
     let windows = bundle(
@@ -347,6 +350,7 @@ fn a_box_past_its_bound_is_refused_at_the_bound() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let mut p = rt
@@ -382,6 +386,7 @@ fn a_box_under_its_bound_runs_and_reports_its_exit() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let mut p = rt
@@ -480,6 +485,7 @@ fn a_node_started_process_past_the_bound_is_refused_and_counted() {
         },
         class: ClassSpec::Process,
         owner: None,
+        band: 0,
     })
     .expect("create");
     let mut held = Vec::new();

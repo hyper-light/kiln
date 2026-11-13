@@ -118,6 +118,7 @@ impl Lab {
             bounds,
             class: ClassSpec::Bundle(dir),
             owner: None,
+            band: 0,
         }
     }
 }
@@ -553,6 +554,7 @@ fn crash_child_node() {
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(dir),
         owner: None,
+        band: 0,
     })
     .expect("create");
     if phase == "started" {

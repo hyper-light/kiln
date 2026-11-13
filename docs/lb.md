@@ -1197,14 +1197,20 @@ however many came.
   still passes each runner's word on to every owner (owners that hear hints, and its own kernel,
   need it), and an owner that hears tokens drops it. Cutting that fan-out needs the server to know
   which owners hear tokens from which runners.
-- A machine's keeper ("A machine's keeper"): the ledger's side and the holding are built (where it
+- A machine's keeper ("A machine's keeper"): built are the ledger's side and the holding (where it
   stands with the keeper, the room and claims the view leaves it, a start's reserve not granted, a
-  run that asks nothing, the holder's waits, Hex's holder core driven, and kiln-ci's simulator
-  against Hex's `SimView`); the runner's shell is not, so nothing names a keeper yet: the holding
-  over `hex_quic::capacity::Link` on `CAPACITY_PORT`, its identity enrolled with kiln's CA by CSR
-  and named in the keeper's configuration, `TLS13_AES_256_GCM_SHA384` asserted, its epoch durable
-  and one more at each start of its process, its records written before each run's process starts,
-  and a keeper named in its configuration; and kiln-seams' capacity seam.
+  run that asks nothing, the holder's waits, Hex's holder core driven, kiln-ci's simulator against
+  Hex's `SimView`), kiln-seams' `Capacity` seam (its simulator Hex's own keeper, CAPACITY-1 to 7,
+  and Hex's keeper suite on it), the holder's identity (`crate::capacity`: kiln's CA as Hex's
+  `enroll::Ca`, passing HEX-ENROLL-1 to 5; `POST /api/agents/capacity`, the machine's proof naming
+  the holder), and its link (`capacity::Quic`: `TLS13_AES_256_GCM_SHA384` asserted, framed by
+  `hex_core::capacity`, passing CAPACITY-1 to 7 against Hex's keeper over loopback QUIC). Not yet:
+  the runner's node driving the holding over that link, so nothing names a keeper yet: `[capacity]`
+  naming the keeper (its address and its certificate's name), the holding's epoch the runner's
+  durable one and its survivors from its records (each run's reservation kept with its record
+  before its process starts), every start path (a placed run's spec, a kernel start, local runs, CI
+  legs, sessions, hand-offs) waiting on its reserve's grant, and each run's reservation released as
+  it ends.
 
 ## GPU fit and load (W05-R03, W05-R22, W05-R23, W13-R01)
 

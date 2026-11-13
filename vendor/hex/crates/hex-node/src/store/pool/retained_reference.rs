@@ -96,6 +96,7 @@ fn a_referenced_backing_generation_cannot_be_removed_or_rearmed() {
             },
             backing: Some(row.key),
         }),
+        band: 0,
     };
     spec.check().unwrap();
     store

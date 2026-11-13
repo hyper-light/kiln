@@ -151,6 +151,7 @@ impl Lab {
             devices: Vec::new(),
             allocation: Some(allocation),
             route: None,
+            band: 0,
         };
         spec.check().unwrap();
         BoxRecord::new(spec, Phase::Creating, Vec::new())

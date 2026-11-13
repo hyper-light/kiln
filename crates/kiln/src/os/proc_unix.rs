@@ -336,6 +336,9 @@ pub struct Duplex {
     /// The shard its stdout's reader read its first chunk on (`usize::MAX` before it read one, or off every shard).
     #[cfg(test)]
     read_on: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Held by a boundary, no process of this machine's (a microVM's member, kiln plan step 17): its
+    /// pipes are the boundary's run's, and so are its end and its stop ([`Duplex::held`]).
+    boundary: Option<std::sync::Arc<crate::sandbox::held::Held>>,
 }
 
 /// A harness process let go of by one image of this process for the next (an in-place upgrade):
@@ -376,6 +379,11 @@ impl Duplex {
     /// are copied (kept open across the exec just before it: [`Detached::keep_across_exec`]).
     /// `None` when they can't be (the process is then left as it is, still running).
     pub async fn detach(&mut self) -> Option<Detached> {
+        // A boundary's run has no descriptors of this process's to carry across an exec: it stops,
+        // and starts again in the next image, its conversation going on.
+        if self.boundary.is_some() {
+            return None;
+        }
         let copy = |raw: i32| -> Option<OwnedFd> {
             use std::os::fd::BorrowedFd;
             #[allow(unsafe_code)]
@@ -401,9 +409,14 @@ impl Duplex {
         use std::os::fd::IntoRawFd as _;
         Some(Detached { pid: self.pid, stdin: input.into_raw_fd(), stdout: out.into_raw_fd(), stderr: err.into_raw_fd(), foreign: self.foreign })
     }
-    /// SIGTERM the group, then SIGKILL whatever is left after `grace` (without waiting here).
+    /// SIGTERM the group, then SIGKILL whatever is left after `grace` (without waiting here). Held by
+    /// a boundary, it's ended as its boundary ends a run ([`crate::sandbox::held::Held::terminate`]).
     #[allow(clippy::disallowed_methods)] // (e) SIGTERM's grace before SIGKILL: an operation's deadline
     pub fn terminate(&self, grace: Duration) {
+        if let Some(held) = &self.boundary {
+            held.terminate(grace);
+            return;
+        }
         let Ok(pgid) = i32::try_from(self.pid) else { return };
         if pgid <= 0 {
             return;
@@ -413,6 +426,36 @@ impl Duplex {
             crate::rt::sleep(grace).await;
             let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
         });
+    }
+}
+
+impl Duplex {
+    /// A harness a boundary holds, from its run's pipes and end ([`crate::sandbox::held::pump`]):
+    /// no process of this machine's, so no pid ([`Duplex::host_pid`]), nothing to hand over, and its
+    /// stop its boundary's.
+    pub fn held(parts: crate::sandbox::held::Parts) -> Duplex {
+        Duplex {
+            pid: 0,
+            stdin: parts.stdin,
+            stdout: parts.stdout,
+            stderr: parts.stderr,
+            exit: parts.exit,
+            usage: None,
+            fds: [-1; 3],
+            foreign: false,
+            stop: None,
+            stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            written: None,
+            read: None,
+            #[cfg(test)]
+            read_on: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+            boundary: Some(parts.held),
+        }
+    }
+
+    /// Its process on this machine, where it is one; none for a harness a boundary holds.
+    pub fn host_pid(&self) -> Option<u32> {
+        self.boundary.is_none().then_some(self.pid)
     }
 }
 
@@ -633,8 +676,8 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
         });
         rx
     };
-    let stdout = reader(out, 256);
-    let stderr = reader(err, 64);
+    let stdout = reader(out, crate::proc::STDOUT_CHUNKS);
+    let stderr = reader(err, crate::proc::STDERR_CHUNKS);
     drop(reading_tx);
     let (in_tx, in_rx) = crate::memory::queue::unbounded::<Vec<u8>>(&crate::memory::owners::CHANNELS);
     let (written_tx, written_rx) = oneshot::channel();
@@ -662,6 +705,7 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
         read: Some(read_rx),
         #[cfg(test)]
         read_on,
+        boundary: None,
     })
 }
 

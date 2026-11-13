@@ -104,6 +104,7 @@ export type { IncidentSeen } from "./IncidentSeen";
 export type { InstanceView } from "./InstanceView";
 export type { Inventory } from "./Inventory";
 export type { Isolation } from "./Isolation";
+export type { IsolationFacts } from "./IsolationFacts";
 export type { Job } from "./Job";
 export type { JobResources } from "./JobResources";
 export type { JobStep } from "./JobStep";

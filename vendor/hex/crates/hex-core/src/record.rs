@@ -66,6 +66,13 @@ pub struct BoxRecord {
     /// record without it reads as `None` (append-only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_resort: Option<hex_api::LearnedEnd>,
+    /// The VM lifetime's place in its node's start order (joint plan step 14, C3): the store's count of the VM lifetimes
+    /// it had begun when it began this one, so a VM begun later holds a larger one, kept across the node's restarts. The
+    /// learned charge's rule takes its VMs in this order wherever it orders them, never by their scopes. Outside the
+    /// spec, so no native commitment covers it. Added within version 1, so a record without it, begun by an earlier node
+    /// agent, reads as `None` (append-only) until its store counts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<u64>,
 }
 
 /// The host's boot session as its kernel names it, a new one each boot: Linux's
@@ -186,18 +193,20 @@ impl BoxRecord {
             native_scope: None,
             boot: None,
             last_resort: None,
+            started: None,
         }
     }
 
-    /// A fresh Store write adds its generated scope, and the boot session it is written in, without cloning
-    /// the original workload or allocating a parallel record. The flattened source has no scope field in
-    /// this case.
+    /// A fresh Store write adds its generated scope, the lifetime's place `started` in its node's start order (joint
+    /// plan step 14, C3), and the boot session it is written in, without cloning the original workload or allocating a
+    /// parallel record. The flattened source has neither a scope nor a place in this case.
     pub fn encode_fresh_scope(
         &self,
         scope: NativeScope,
+        started: u64,
         boot: Option<&BootSession>,
     ) -> Result<Vec<u8>, Refusal> {
-        if self.native_scope.is_some() || self.phase != Phase::Creating {
+        if self.native_scope.is_some() || self.started.is_some() || self.phase != Phase::Creating {
             let message = "only a fresh Creating record can introduce a native scope";
             let mut why = String::new();
             why.try_reserve_exact(message.len())
@@ -216,6 +225,7 @@ impl BoxRecord {
             #[serde(flatten)]
             original: &'a BoxRecord,
             native_scope: NativeScope,
+            started: u64,
             #[serde(skip_serializing_if = "Option::is_none")]
             boot: Option<&'a BootSession>,
         }
@@ -233,6 +243,7 @@ impl BoxRecord {
         encode_record(&Fresh {
             original,
             native_scope: scope,
+            started,
             boot: if original.boot.is_some() { None } else { boot },
         })
     }
@@ -420,6 +431,7 @@ mod tests {
             class: ClassSpec::Process,
             owner: None,
             allocation: None,
+            band: 0,
         };
         BoxRecord::new(
             spec,
@@ -621,22 +633,34 @@ mod tests {
                 .contains("native_scope")
         );
         assert_eq!(BoxRecord::decode(&legacy).unwrap().native_scope, None);
+        assert!(
+            !String::from_utf8(legacy.clone())
+                .unwrap()
+                .contains("started")
+        );
+        assert_eq!(BoxRecord::decode(&legacy).unwrap().started, None);
         let scope = NativeScope::from_bytes([0x31; 16]);
-        let encoded = original.encode_fresh_scope(scope, None).unwrap();
+        let encoded = original.encode_fresh_scope(scope, 5, None).unwrap();
         let decoded = BoxRecord::decode(&encoded).unwrap();
         assert_eq!(decoded.spec, original.spec);
         assert_eq!(decoded.phase, Phase::Creating);
         assert_eq!(decoded.native_scope, Some(scope));
         assert_eq!(decoded.native_scope.unwrap().bytes(), &[0x31; 16]);
+        assert_eq!(decoded.started, Some(5));
         assert_eq!(original.native_scope, None);
         assert_eq!(original.encode().unwrap(), legacy);
         assert!(
             decoded
-                .encode_fresh_scope(NativeScope::from_bytes([0x32; 16]), None)
+                .encode_fresh_scope(NativeScope::from_bytes([0x32; 16]), 6, None)
                 .is_err()
         );
+        let placed = BoxRecord {
+            started: Some(5),
+            ..original.clone()
+        };
+        assert!(placed.encode_fresh_scope(scope, 6, None).is_err());
         original.phase = Phase::Ready;
-        assert!(original.encode_fresh_scope(scope, None).is_err());
+        assert!(original.encode_fresh_scope(scope, 5, None).is_err());
     }
 
     /// AC-T7.4.1: malformed scope width cannot decode as a legacy record without scope.
@@ -645,7 +669,7 @@ mod tests {
         let mut original = record();
         original.phase = Phase::Creating;
         let bytes = original
-            .encode_fresh_scope(NativeScope::from_bytes([7; 16]), None)
+            .encode_fresh_scope(NativeScope::from_bytes([7; 16]), 1, None)
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         for width in [0, 1, 15, 17, 32] {
@@ -680,7 +704,7 @@ mod tests {
             let mut original = record();
             original.phase = Phase::Creating;
             let scope = NativeScope::from_bytes(bytes);
-            let decoded = BoxRecord::decode(&original.encode_fresh_scope(scope, None).unwrap()).unwrap();
+            let decoded = BoxRecord::decode(&original.encode_fresh_scope(scope, 1, None).unwrap()).unwrap();
             prop_assert_eq!(decoded.native_scope, Some(scope));
             prop_assert_eq!(scope.bytes(), &bytes);
         }
@@ -733,14 +757,14 @@ mod tests {
         fresh.phase = Phase::Creating;
         let scope = NativeScope::from_bytes([9; 16]);
         let made =
-            BoxRecord::decode(&fresh.encode_fresh_scope(scope, Some(&one)).unwrap()).unwrap();
+            BoxRecord::decode(&fresh.encode_fresh_scope(scope, 1, Some(&one)).unwrap()).unwrap();
         assert_eq!(
             (made.native_scope, made.boot.as_ref()),
             (Some(scope), Some(&one))
         );
         fresh.boot = Some(two.clone());
         let moved =
-            BoxRecord::decode(&fresh.encode_fresh_scope(scope, Some(&one)).unwrap()).unwrap();
+            BoxRecord::decode(&fresh.encode_fresh_scope(scope, 1, Some(&one)).unwrap()).unwrap();
         assert_eq!(moved.boot.as_ref(), Some(&one));
     }
 

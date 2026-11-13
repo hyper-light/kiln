@@ -80,6 +80,10 @@ tar.workspace = true
 tempfile.workspace = true
 # The records the tests' waits take, and their census (tests/completion_backends.rs's on every OS).
 hex-testkit.workspace = true
+# Joint plan step 14's fleet driver (tests/charge_fleet.rs): hex-sim reckons a run's windows as its own runs do, and
+# hex-wait rests between them to each one's deadline, on macOS too.
+hex-sim.workspace = true
+hex-wait.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 hex-node = { workspace = true, features = ["test-controls"] }

@@ -1103,9 +1103,12 @@ None is a process on its machine, as agents start without one. Its start names i
 microVM's image (`spec.isolation: {kind: "microvm", image}`, docs/api.md "Agentfiles"). It goes
 only to a runner that says it starts microVMs (its facts' `virt.microvm`), and anywhere else it's
 refused, never run as a process; where the machine picked would refuse it, the composer says so
-under the row. A runner's kiln starts no microVM itself yet: kiln holds Shards and Hex now
-(docs/shards.md), but it doesn't yet start a harness through Hex (the plan's step 17), so until then
-such a start is refused there, saying so.
+under the row. Once such a start goes through, its harness runs as its image's HARNESS member, its
+stdio the member's streams, and its session drives it through the same adapter as on the host: it
+starts, is steered, interrupted, resumed and stopped as a process is (docs/isolation.md, step 17).
+A runner's kiln starts no microVM itself yet: kiln holds Shards and Hex now (docs/shards.md), but it
+doesn't yet start a harness through Hex (the plan's step 17), so until then such a start is refused
+there, saying so (its facts' `isolation.why_not`).
 
 **Agentfiles** (Agents → Agentfiles, `/agents/agentfiles`) keeps yours: each opened on its own page
 in the code editor's Agentfile mode, checked by Shards as it's typed (`POST /api/agentfiles/check`,
@@ -1207,6 +1210,9 @@ to `s28-pi-agentfile`).
   kiln's Agentfiles don't make yet.
 - **Use a tool its image doesn't have.** The project's toolchain comes from the image: build your
   own Agentfile on your project's image (above).
+- **Move to another machine, or switch to another harness.** Not yet: it stays where it started, in
+  the harness it started with, and says so when asked. To go on elsewhere or in another harness, end
+  it and start a new one there.
 - **Not yet**, as well as the start itself: the project at its own path; a terminal into the
   microVM, its sign-in and exec there; kiln reading its sessions from your volume to resume them;
   and the commands it asks kiln to run on other machines, which run in microVMs too or not at all,

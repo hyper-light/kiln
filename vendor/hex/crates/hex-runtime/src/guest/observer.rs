@@ -593,6 +593,7 @@ fn observe_receipt(
             io_max: bounds.io_max,
             pids_max: bounds.pids_max,
         },
+        band: 0,
     };
     spec.check_run()?;
     receipt.set_attempt(Attempt {

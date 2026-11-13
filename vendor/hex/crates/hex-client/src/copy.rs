@@ -4,16 +4,59 @@
 //! socket, the node gives that connection's end to the caller's client with the exec's answer.
 
 use std::io::{self, PipeReader, Read, Write};
+use std::sync::{Arc, OnceLock};
 
 use hex_api::Refusal;
 
+/// What cut a stream short, once something has: the error its reading ended with before its end, as a reset or its
+/// link's end makes it (docs/design/hex-quic.md Q11). Shared by whoever reads the stream (a carried stream's copy, a
+/// bridge) and the program it is of, whose end then says so.
+#[derive(Clone, Debug, Default)]
+pub struct Cut(Arc<OnceLock<(io::ErrorKind, String)>>);
+
+impl Cut {
+    /// Records `e` as what cut the stream, the first such alone.
+    pub fn record(&self, e: &io::Error) {
+        let _ = self.0.set((e.kind(), e.to_string()));
+    }
+
+    /// What cut the stream, once something has.
+    pub fn error(&self) -> Option<io::Error> {
+        self.0
+            .get()
+            .map(|(kind, why)| io::Error::new(*kind, why.clone()))
+    }
+}
+
+/// A program's output streams whose cut its end tells, each by its name.
+pub type Cuts = Vec<(&'static str, Cut)>;
+
+/// A stream read for a copy, its read's error recorded as its cut.
+struct Watched<R> {
+    from: R,
+    cut: Cut,
+}
+
+impl<R: Read> Read for Watched<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let read = self.from.read(bytes);
+        if let Err(e) = &read
+            && e.kind() != io::ErrorKind::Interrupted
+        {
+            self.cut.record(e);
+        }
+        read
+    }
+}
+
 /// Copies `from` into `to` on a thread of its own until either ends, then hands `to` to `ended`: a program's
 /// output, from its stream's connection into the caller's pipe. Its end is the stream's: the caller sees stdout
-/// end, as with a pipe, or the program sees its write fail once the caller's pipe has no reader; there is no one
-/// else to tell.
+/// end, as with a pipe, or the program sees its write fail once the caller's pipe has no reader. A read that fails
+/// cut the stream short: `cut` records it before the caller's pipe ends, and the program's end says so.
 pub(crate) fn copy<R, W>(
-    mut from: R,
+    from: R,
     mut to: W,
+    cut: Cut,
     ended: impl FnOnce(W) + Send + 'static,
 ) -> Result<(), Refusal>
 where
@@ -23,6 +66,7 @@ where
     std::thread::Builder::new()
         .name("hex-client-stdio".to_owned())
         .spawn(move || {
+            let mut from = Watched { from, cut };
             let _ = io::copy(&mut from, &mut to);
             ended(to);
         })
@@ -60,7 +104,36 @@ pub(crate) struct DuplexIo(pub(crate) crate::guest::DuplexOwner);
 
 impl Read for DuplexIo {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        Waiting(&mut *self.0).read(bytes)
+    }
+}
+
+/// A guest connection read as every read of one must wait: on macOS in poll(2) first ([`wait_readable`]), then the
+/// read; elsewhere the read itself.
+pub(crate) struct Waiting<'a>(pub(crate) &'a mut dyn crate::guest::Duplex);
+
+impl Read for Waiting<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        #[cfg(target_os = "macos")]
+        wait_readable(self.0.handle())?;
         self.0.read(bytes)
+    }
+}
+
+/// Waits in poll(2) until `conn` has bytes or its end to read. On macOS a read waiting in recv(2) on a Unix stream
+/// socket can sleep through its peer's half-close: XNU's `uipc_rcvd` lets go of the reader's socket to take its
+/// peer's lock first, and a shutdown landing then wakes no one (Shards M236: 360 of 50,000 readers asleep), where
+/// poll(2) sees it (0 of 50,000). So no read of one waits in the read (Shards D175).
+#[cfg(target_os = "macos")]
+pub fn wait_readable(conn: crate::guest::Handle<'_>) -> io::Result<()> {
+    use rustix::event::{PollFd, PollFlags};
+    loop {
+        let mut ready = [PollFd::from_borrowed_fd(conn, PollFlags::IN)];
+        match rustix::event::poll(&mut ready, None) {
+            Ok(_) => return Ok(()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 
@@ -112,7 +185,8 @@ pub(crate) fn copy_in(from: PipeReader, to: impl Feed) -> Result<(), Refusal> {
 /// port.
 #[cfg(not(unix))]
 pub(crate) fn copy_in(from: PipeReader, to: impl Feed) -> Result<(), Refusal> {
-    copy(from, to, |to| to.end_sending())
+    // The caller's own pipe is read here, no stream of a program: its cut is no one's.
+    copy(from, to, Cut::default(), |to| to.end_sending())
 }
 
 /// The stdin copier's loop: waits on the caller's pipe and the connection together, copying what the pipe gives,
@@ -158,3 +232,6 @@ fn feed(mut from: PipeReader, mut to: impl Feed, unit: usize) {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests;

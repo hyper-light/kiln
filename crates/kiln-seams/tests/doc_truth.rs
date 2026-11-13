@@ -192,6 +192,14 @@ fn seams() -> Vec<Seam> {
             bounds: vec![format!("{} placements", count(placement::SIM_PLACED as u64))],
         },
         Seam {
+            title: "Capacity",
+            file: "capacity.rs",
+            tr: "Capacity",
+            more: &["Link"],
+            cases: said(&capacity::cases::<capacity::SimCapacityFixture>()),
+            bounds: Vec::new(),
+        },
+        Seam {
             title: "HarnessPort",
             file: "harness.rs",
             tr: "HarnessPort",

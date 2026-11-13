@@ -27,6 +27,7 @@ pub mod limits;
 pub mod link;
 pub mod tls;
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
@@ -52,9 +53,9 @@ pub enum Refused {
     /// hyper-transport refused, as it says.
     #[error("the transport refused: {refusal}")]
     Transport { refusal: hyper_transport::Refusal },
-    /// The peer's certificate isn't one kiln's CA issued, or names another peer than the one dialed: refused at the
-    /// handshake, on either side (docs/design/hex-quic.md Q5).
-    #[error("the peer's identity isn't one kiln's CA enrolled for it")]
+    /// The peer's certificate isn't one kiln's CA issued, names another peer than the one dialed, or names a peer the
+    /// endpoint it reached doesn't admit: refused at the handshake, on either side (docs/design/hex-quic.md Q5, Q10).
+    #[error("the peer's identity isn't one kiln's CA enrolled for it, or one the endpoint admits")]
     Identity,
     /// Nothing answered: the path, a timeout or a reset.
     #[error("the peer didn't answer")]
@@ -110,6 +111,27 @@ impl Refused {
     }
 }
 
+/// Which of the peers kiln's CA enrolled may open a connection to an endpoint (docs/design/hex-quic.md Q10). Any other
+/// is refused at its handshake, as a peer kiln's CA didn't enroll is ([`Refused::Identity`] on its side), and is
+/// charged to no identity, so it holds none of the endpoint's connections.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Admits {
+    /// Every peer kiln's CA enrolled: a node's, whose peers (kiln's balancer, the fleet's nodes) no configuration lists.
+    Enrolled,
+    /// The peers enrolled as these names alone: a capacity lane's holders (docs/design/capacity-view.md CV8, CV9).
+    Named(BTreeSet<String>),
+}
+
+impl Admits {
+    /// Whether a connection opened by the peer whose certificate names `name` is admitted.
+    pub(crate) fn admits(&self, name: &str) -> bool {
+        match self {
+            Admits::Enrolled => true,
+            Admits::Named(names) => names.contains(name),
+        }
+    }
+}
+
 /// What an endpoint is made with.
 pub struct Config {
     pub credentials: tls::Credentials,
@@ -130,8 +152,14 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// Binds `config.bind` and starts the driver.
+    /// Binds `config.bind` and starts the driver, admitting every peer kiln's CA enrolled ([`Admits::Enrolled`]).
     pub fn start(config: Config) -> Result<Self, Refused> {
+        Self::start_admitting(config, Admits::Enrolled)
+    }
+
+    /// Binds `config.bind` and starts the driver, admitting the connections of the peers `admits` names alone: the
+    /// rule holds from the endpoint's first datagram.
+    pub fn start_admitting(config: Config, admits: Admits) -> Result<Self, Refused> {
         let limits = limits::limits(config.shape);
         let derived = limits::derived(config.shape, &limits);
         let budget = limits::budget(&limits);
@@ -142,7 +170,8 @@ impl Endpoint {
             limits,
             congestion: Default::default(),
         };
-        let started = Driver::start(ep, budget, config.bind, derived, config.serves)?;
+        let started =
+            Driver::start_admitting(ep, budget, config.bind, derived, config.serves, admits)?;
         Ok(Self {
             commands: started.commands,
             accepts: started.accepts,
@@ -166,7 +195,10 @@ impl Endpoint {
         address: SocketAddr,
         deadline: Option<Instant>,
     ) -> Result<PeerId, Refused> {
-        let (reply, answer) = sync_channel(1);
+        let (reply, answer) = hex_wait::mpsc::sync_channel(1).map_err(|why| Refused::Os {
+            op: "making a dial's answer",
+            why: why.to_string(),
+        })?;
         self.commands.send(Command::Dial {
             name: name.to_owned(),
             address,

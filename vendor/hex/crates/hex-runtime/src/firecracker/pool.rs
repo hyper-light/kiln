@@ -575,11 +575,11 @@ impl FirecrackerRuntime {
                 return Ok(accepted);
             }
             // Its VMM pins all its RAM for DMA, the observer VM given its GPUs whole: refused before anything is
-            // granted or launched where its memlock can't hold that (FirecrackerRuntime::dma_memlock).
+            // granted or launched where its memlock can't hold that (vfio::Host::dma_memlock).
             let memlock = if grant.devices.is_empty() {
                 None
             } else {
-                Self::dma_memlock(grant.allocation.guest()?.mem_bytes)?
+                self.host.dma_memlock(grant.allocation.guest()?.mem_bytes)?
             };
             let record = transaction.grant_pool(&grant)?;
             self.preflight_backing(&record)?;
@@ -993,6 +993,7 @@ pub(super) mod tests {
                     .unwrap(),
                 backing: Some(source.key),
             }),
+            band: 0,
         };
         spec.check().unwrap();
         let mut boxed = BoxRecord::new(spec, Phase::Ready, Vec::new());

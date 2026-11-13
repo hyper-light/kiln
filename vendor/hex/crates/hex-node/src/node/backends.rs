@@ -1168,6 +1168,7 @@ mod forward_route_tests {
             devices: Vec::new(),
             allocation,
             route: None,
+            band: 0,
         }
     }
 
@@ -1283,6 +1284,7 @@ mod preflight_dispatch_tests {
             devices: Vec::new(),
             allocation: None,
             route: None,
+            band: 0,
         };
         let mut record = BoxRecord::new(spec, Phase::Creating, Vec::new());
         for phase in [Phase::Creating, Phase::Deleting] {
