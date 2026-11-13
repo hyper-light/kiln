@@ -169,6 +169,9 @@ mod opencode_tests;
 mod gemini_tests;
 
 #[cfg(test)]
+mod grants_tests;
+
+#[cfg(test)]
 mod tests {
     /// Each is what a person's Agentfile must be (a name an image may have, a text Shards may read), and
     /// no two share a name.

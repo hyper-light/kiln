@@ -423,9 +423,9 @@ fn step21_gemini_pin_and_harness_file_hold() -> anyhow::Result<()> {
     let env = strings(h.pointer("/run/env")).unwrap_or_default();
     anyhow::ensure!(env == ["HOME=/home/gemini", "GEMINI_CLI_SYSTEM_SETTINGS_PATH=/harness/gemini/system-settings.json"], "{env:?}");
     let home = env.iter().find_map(|e| e.strip_prefix("HOME=")).unwrap_or_default();
-    anyhow::ensure!(harness_volumes(gemini.text, "gemini") == ["/workspace", home], "HOME {home} isn't Gemini's second volume");
+    anyhow::ensure!(harness_volumes(gemini.text, "gemini") == [home], "HOME {home} isn't Gemini's one volume");
     let moved = gemini.text.replace("harness /home/gemini FOR", "harness /home/gemini/.gemini FOR");
-    anyhow::ensure!(harness_volumes(&moved, "gemini") != ["/workspace", home]);
+    anyhow::ensure!(harness_volumes(&moved, "gemini") != [home]);
     Ok(())
 }
 
@@ -544,8 +544,8 @@ fn step21_gemini_system_settings_turn_its_update_check_off() -> anyhow::Result<(
 }
 
 /// Gemini's Agentfile is the plan's shape: ARG BASE by digest and ARG TARGETARCH alone, the pinned
-/// harness per platform, exactly the bring-up's three grants, exactly its two harness volumes, and no
-/// ENV or RUN.
+/// harness per platform, its hosts by name (step 18's grants), its HOME as its one
+/// harness volume, and no ENV or RUN.
 #[test]
 fn step21_gemini_agentfile_is_the_plans_shape() -> anyhow::Result<()> {
     let want = [
@@ -553,16 +553,12 @@ fn step21_gemini_agentfile_is_the_plans_shape() -> anyhow::Result<()> {
         "FROM ${BASE}",
         "ARG TARGETARCH",
         "HARNESS gemini FROM ./gemini-${TARGETARCH}",
-        "NETWORK --dns --egress=443/tcp provider FOR gemini",
-        "EXPOSE --harnesses=gemini 443/tcp AS egress FOR provider",
-        "CONNECT gemini WITH gemini ON provider",
-        "VOLUME --target-kind=harness /workspace FOR gemini",
-        "VOLUME --target-kind=harness /home/gemini FOR gemini",
     ];
+    let want: Vec<String> = want.iter().map(|l| (*l).to_owned()).chain(super::grants_tests::grant_lines("gemini")).chain([super::grants_tests::volume_line("gemini")]).collect();
     let text = gemini()?.text;
     anyhow::ensure!(instructions(text) == want, "{:#?}", instructions(text));
-    for changed in [format!("{text}RUN npm install -g @google/gemini-cli\n"), format!("{text}ENV PATH=/harness/gemini/node/bin:$PATH\n"), text.replace("443/tcp provider", "80/tcp provider")] {
-        anyhow::ensure!(instructions(&changed) != want, "{changed}");
+    for changed in [format!("{text}RUN npm install -g @google/gemini-cli\n"), format!("{text}ENV PATH=/harness/gemini/node/bin:$PATH\n"), text.replace(" 443/tcp ", " 80/tcp ")] {
+        anyhow::ensure!(changed != text && instructions(&changed) != want, "{changed}");
     }
     Ok(())
 }

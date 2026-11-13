@@ -16,6 +16,12 @@ kind: string,
  */
 image?: string, 
 /**
+ * The person whose volume its harness's configuration is on (`owner`, `user:<id>`; kiln plan
+ * step 18, `harness::isolated::home`): whom it acts for, set by kiln from who started it (its
+ * parent's, for an isolated agent's agents), never from what was asked.
+ */
+person?: string, 
+/**
  * Its microVM's vCPUs, as CPUs (Shards' `--cpus`): what its placement asks and its claim holds
  * (step 32), never what its harness would need as a process. None: its start gave none, so its
  * placement asks none and it's charged what it's measured using.

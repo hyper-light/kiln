@@ -56,6 +56,8 @@ pub mod homes;
 pub mod history;
 pub mod host;
 pub mod inbox;
+/// What kiln assumes of a harness's host, held inside a microVM of its own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 18).
+pub mod isolated;
 pub mod kept;
 pub mod kinds;
 pub mod limit;
@@ -90,6 +92,8 @@ pub mod state_view;
 pub mod stores;
 pub mod streams;
 pub mod transcript;
+/// What keeps a harness from its provider, as its own stream says it (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 18).
+pub mod trouble;
 pub mod visuals;
 pub mod wait;
 pub mod webrtc;

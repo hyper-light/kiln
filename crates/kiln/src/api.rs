@@ -6373,21 +6373,31 @@ struct HarnessOpen {
     ids: Vec<String>,
 }
 
+/// What an agent's start takes of the spec it was asked with: what's kiln's to say is kiln's.
+fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::authz::Caller>) {
+    // Ending a process found running is asked for with a take-over, never with a spec.
+    spec.takeover_stop = false;
+    // Who started an agent, the plan run it works for, and whether it's that agent's subagent are
+    // kiln's to say (`agents.start`, `plans.run`, a goal stack's steps side by side), never what's
+    // asked.
+    spec.parent = None;
+    spec.plan_run = None;
+    spec.helper = None;
+    spec.subagent = false;
+    // The text of a person's own Agentfile is read by kiln, as theirs, never taken from what's asked.
+    spec.agentfile = None;
+    // An isolated agent's person, whose volume its harness's configuration is on, is whoever asks
+    // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18): never what's asked.
+    if let Some(i) = spec.isolation.as_mut() {
+        i.person = caller.and_then(crate::harness::lineage::person_of);
+    }
+}
+
 async fn harness_open(hub: &Hub, req: Request) -> R {
     let attention_at = crate::util::now_ms();
     let caller = caller_of(hub, req.headers()).await;
     let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    // Ending a process found running is asked for with a take-over, never with a spec.
-    body.spec.takeover_stop = false;
-    // Who started an agent, the plan run it works for, and whether it's that agent's subagent are
-    // kiln's to say (`agents.start`, `plans.run`, a goal stack's steps side by side), never what's
-    // asked.
-    body.spec.parent = None;
-    body.spec.plan_run = None;
-    body.spec.helper = None;
-    body.spec.subagent = false;
-    // The text of a person's own Agentfile is read by kiln, as theirs, never taken from what's asked.
-    body.spec.agentfile = None;
+    as_asked(&mut body.spec, caller.as_ref());
     // A workspace of its own is asked for by its kind alone (its machine makes it), and only of a
     // machine that can make one: one that can't would let it work in the folder itself, unasked.
     match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {
@@ -8142,6 +8152,26 @@ fn back(connected: u64, before: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    /// What's kiln's to say of an agent's start is never what's asked: an isolated agent's person,
+    /// whose volume holds its harness's sign-in (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step
+    /// 18), is whoever asks, a forged one replaced, none without a caller.
+    #[test]
+    fn step18_an_isolated_agents_person_is_whoever_asks() {
+        use crate::harness::session::{Isolation, Spec};
+        let forged = || Spec { kind: "claude".into(), parent: Some("p".into()), subagent: true, isolation: Some(Isolation { person: Some("user:someone-else".into()), ..Isolation::microvm() }), ..Spec::default() };
+        let mut spec = forged();
+        as_asked(&mut spec, Some(&crate::authz::Caller::owner()));
+        assert_eq!(spec.isolation.and_then(|i| i.person).as_deref(), Some("owner"));
+        assert!(spec.parent.is_none() && !spec.subagent);
+        let mut spec = forged();
+        as_asked(&mut spec, None);
+        assert_eq!(spec.isolation.map(|i| i.person), Some(None));
+        // Not isolated, nothing is made isolated.
+        let mut spec = Spec { kind: "claude".into(), ..Spec::default() };
+        as_asked(&mut spec, Some(&crate::authz::Caller::owner()));
+        assert!(spec.isolation.is_none());
+    }
+
     use super::*;
 
     /// A socket's sending half as a test sees it: what was sent it, and how often it was flushed. One `slow` takes

@@ -1,0 +1,4 @@
+{"method":"turn/started","params":{"threadId":"th1","turn":{"id":"t1","status":"inProgress","items":[]}}}
+{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"stream disconnected before completion: failed to lookup address information: Try again"},"willRetry":true,"threadId":"th1","turnId":"t1"}}
+{"method":"error","params":{"error":{"message":"Reconnecting... 3/5","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"stream disconnected before completion: failed to lookup address information: Try again"},"willRetry":true,"threadId":"th1","turnId":"t1"}}
+{"method":"error","params":{"error":{"message":"Reconnecting... waiting for network","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"Connection failed"},"willRetry":true,"threadId":"th1","turnId":"t1"}}

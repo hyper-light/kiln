@@ -5,6 +5,7 @@
   "run": {
     "command": ["opencode", "acp"],
     "env": [
+      "HOME=/home/opencode",
       "XDG_CONFIG_HOME=/home/opencode/.config",
       "XDG_DATA_HOME=/home/opencode/.local/share",
       "XDG_STATE_HOME=/home/opencode/.local/state",

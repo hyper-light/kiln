@@ -3545,6 +3545,11 @@ impl Codex {
     }
 
     fn notification(&mut self, core: &mut Core, method: &str, p: Value) {
+        // A credential refused or a provider unreached, said at its first retry (`super::trouble`):
+        // a child thread's is its parent's, as they share one sign-in and one network.
+        if let Some(seen) = super::trouble::of_codex(method, &p) {
+            super::trouble::take(core, seen);
+        }
         // One app-server can report child threads too. Their turns must not end the parent's.
         if method != "serverRequest/resolved"
             && let (Some(own), Some(thread)) = (self.thread.as_deref(), p.get("threadId").and_then(Value::as_str))
