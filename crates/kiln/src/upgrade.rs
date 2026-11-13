@@ -22,8 +22,11 @@ use serde::{Deserialize, Serialize};
 /// A machine's usual runner (no `--instance`).
 pub const MAIN: &str = "main";
 
+/// The folder beneath kiln's state its runner's instances keep their own folders in.
+pub const INSTANCES: &str = "instances";
+
 pub fn instance_dir(state_dir: &Path, id: &str) -> PathBuf {
-    state_dir.join("instances").join(id)
+    state_dir.join(INSTANCES).join(id)
 }
 
 /// Where a runner keeps its own mutable files: its instance directory, else the state directory.

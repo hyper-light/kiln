@@ -1951,6 +1951,8 @@ impl Registry {
             tracing::info!(mirrors = ?restore_auto, "the conversation store is empty: it is restored from a mirror's copy once one connects");
         }
         let local = Host::with_clock(tx, Some(dir.join("local.json")), Limits::default(), clock);
+        // Its people's volumes beside its record: the server's folder outlives its process.
+        local.keep_homes(super::isolated::home::root(&dir));
         // The server's own agents' workspaces of their own are kept beside their record.
         crate::workspace::slates::init(&dir);
         super::whose::note_kiln(&dir);

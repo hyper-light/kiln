@@ -1743,9 +1743,21 @@ fn gone_here(session: &str, moved: &std::collections::HashSet<crate::instances::
 /// can't go on here it is stopped and the session starts again from its record (an error, saying so).
 #[cfg(unix)]
 /// A runner's harness host: its records in its own folder (`own_dir`, its instance's where it runs as
-/// one: `upgrade::own_dir`, which an upgrade replaces), beside kiln's state (`state_dir`).
-fn harness_host(sink: impl Into<crate::harness::session::Sink>, _state_dir: &std::path::Path, own_dir: &std::path::Path, limits: crate::harness::host::Limits) -> Arc<crate::harness::host::Host> {
-    crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), limits)
+/// one: `upgrade::own_dir`, which an upgrade replaces), and its people's volumes beneath kiln's state
+/// (`state_dir`), which outlives every instance; those an instance kept in its own folder first moved
+/// there, each said (`isolated::home::adopt`).
+fn harness_host(sink: impl Into<crate::harness::session::Sink>, state_dir: &std::path::Path, own_dir: &std::path::Path, limits: crate::harness::host::Limits) -> Arc<crate::harness::host::Host> {
+    use crate::harness::isolated::home::{self, Adopted};
+    let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), limits);
+    for a in home::adopt(state_dir) {
+        match a {
+            Adopted::Moved { from, to } => tracing::info!(from = %from.display(), to = %to.display(), "a person's harness home kept by an earlier instance, moved beneath kiln's state"),
+            Adopted::Kept { from, to } => tracing::warn!(from = %from.display(), to = %to.display(), "a person's harness home kept by an earlier instance is left where it is: kiln's state keeps one for that person and harness"),
+            Adopted::Unmoved { from, to, why } => tracing::warn!(from = %from.display(), to = %to.display(), why = %why, "a person's harness home kept by an earlier instance couldn't be moved beneath kiln's state; it's left where it is"),
+        }
+    }
+    h.keep_homes(home::root(state_dir));
+    h
 }
 
 async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, mut rec: crate::harness::host::Saved, handed: Option<Box<crate::harness::session::Handed>>, hand_on: Option<String>, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
@@ -7039,6 +7051,16 @@ mod tests {
             let homes = b.homes().ok_or_else(|| anyhow::anyhow!("instance b keeps no volumes"))?;
             let found = std::fs::read_to_string(homes.join("owner").join("claude").join("history.jsonl"));
             anyhow::ensure!(found.as_deref().ok() == Some("kept\n"), "instance b keeps volumes at {}, and doesn't find instance a's: {found:?}", homes.display());
+            drop(b);
+            // One an older kiln's instance kept in its own folder is moved to where the next one keeps them.
+            let older = crate::upgrade::instance_dir(state.path(), "a").join("homes").join("user:u1").join("goose");
+            std::fs::create_dir_all(&older)?;
+            std::fs::write(older.join("config.yaml"), "GOOSE_PROVIDER: anthropic\n")?;
+            let (tx, _rx) = async_channel::unbounded();
+            let c = harness_host(tx, state.path(), &crate::upgrade::instance_dir(state.path(), "c"), Limits::default());
+            let homes = c.homes().ok_or_else(|| anyhow::anyhow!("instance c keeps no volumes"))?;
+            anyhow::ensure!(std::fs::read_to_string(homes.join("user:u1").join("goose").join("config.yaml")).is_ok(), "an older instance's volume wasn't adopted into {}", homes.display());
+            anyhow::ensure!(!older.exists(), "{} was copied, not moved", older.display());
             Ok(())
         })
     }

@@ -117,7 +117,7 @@ fn config_of(f: &Fixture) -> anyhow::Result<(PathBuf, String)> {
     let (volumes, env) = kiln::harness::isolated::home::of_builtin(b);
     let root = env.iter().find(|(k, _)| k == "GOOSE_PATH_ROOT").map(|(_, v)| v.clone()).ok_or_else(|| anyhow::anyhow!("kiln's Goose image roots no GOOSE_PATH_ROOT"))?;
     let guest = format!("{root}/config/config.yaml");
-    let homes = vm_e2e::own_state(&f.dir, RUNNER).join("homes");
+    let homes = kiln::harness::isolated::home::root(&vm_e2e::own_state(&f.dir, RUNNER));
     let layout = kiln::harness::isolated::home::Layout::new(&homes, PERSON, b.harness, &volumes, &env).map_err(|e| anyhow::anyhow!("{PERSON}'s home for goose: {e}"))?;
     let host = layout.host_of(&guest).ok_or_else(|| anyhow::anyhow!("{guest} is on no volume of the person's"))?;
     Ok((host, guest))

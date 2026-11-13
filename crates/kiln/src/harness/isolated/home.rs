@@ -31,10 +31,50 @@ pub const SCRATCH: &str = ".scratch";
 /// an Agentfile, in a microVM of its own": `<kiln's state>/homes/<you>/<harness>/`).
 pub const HOMES: &str = "homes";
 
-/// Where a kiln whose harness host keeps its records in `state` keeps its people's volumes
-/// (`harness::host::Host::homes`): the root [`Layout::new`] takes.
+/// Where a kiln keeps its people's volumes (`harness::host::Host::homes`): beneath its `state`, the
+/// folder that outlives a runner's instances (`upgrade::own_dir`), never an instance's own, so a
+/// person's volumes stay where they were across each upgrade. The root [`Layout::new`] takes.
 pub fn root(state: &Path) -> PathBuf {
     state.join(HOMES)
+}
+
+/// What became of a harness's home that a runner's instance kept in its own folder, as kiln did
+/// before its volumes were kept beneath its state (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Adopted {
+    /// Moved to where kiln keeps its people's volumes.
+    Moved { from: PathBuf, to: PathBuf },
+    /// Left where it was: kiln already keeps a home of that person's for that harness.
+    Kept { from: PathBuf, to: PathBuf },
+    /// Left where it was: it couldn't be moved, in the OS's words.
+    Unmoved { from: PathBuf, to: PathBuf, why: String },
+}
+
+/// Each person's harness homes kept in an instance's own folder (`<state>/instances/<id>/homes`) moved
+/// beneath `state` (`root`), where kiln keeps none for that person and harness; each said, none
+/// dropped.
+pub fn adopt(state: &Path) -> Vec<Adopted> {
+    let dirs = |at: &Path| -> Vec<std::fs::DirEntry> {
+        std::fs::read_dir(at).map(|d| d.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).collect()).unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    for instance in dirs(&state.join(crate::upgrade::INSTANCES)) {
+        for person in dirs(&instance.path().join(HOMES)) {
+            for harness in dirs(&person.path()) {
+                let (from, to) = (harness.path(), root(state).join(person.file_name()).join(harness.file_name()));
+                if to.exists() {
+                    out.push(Adopted::Kept { from, to });
+                    continue;
+                }
+                let moved = to.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::rename(&from, &to));
+                out.push(match moved {
+                    Ok(()) => Adopted::Moved { from, to },
+                    Err(e) => Adopted::Unmoved { from, to, why: e.to_string() },
+                });
+            }
+        }
+    }
+    out
 }
 
 /// A harness's home when its run environment names none: init's, its scratch (Shards D231,
@@ -293,8 +333,40 @@ pub fn of_kilns(root: &Path, person: &str, harness: &str) -> Result<Option<Layou
 mod tests {
     use std::path::Path;
 
-    use super::{Layout, Mount, SCRATCH, guest_plain, of_builtin, person_dir};
+    use super::{Adopted, Layout, Mount, SCRATCH, adopt, guest_plain, of_builtin, person_dir, root};
     use crate::harness::isolated::Refusal;
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17: a home an instance kept in its own folder is
+    /// moved beneath kiln's state; one kiln already keeps there is left as it is, and so is the
+    /// instance's, said; nothing is dropped.
+    #[test]
+    fn s17_an_instances_homes_are_adopted_into_kilns_state_and_none_is_dropped() -> anyhow::Result<()> {
+        let state = tempfile::tempdir()?;
+        let old = crate::upgrade::instance_dir(state.path(), "a").join(super::HOMES);
+        for (person, harness) in [("owner", "claude"), ("user:u1", "goose")] {
+            let d = old.join(person).join(harness);
+            std::fs::create_dir_all(&d)?;
+            std::fs::write(d.join("kept.txt"), format!("{person} {harness}"))?;
+        }
+        let taken = root(state.path()).join("owner").join("claude");
+        std::fs::create_dir_all(&taken)?;
+        std::fs::write(taken.join("kept.txt"), "kiln's own")?;
+        let mut said = adopt(state.path());
+        said.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        let moved_to = root(state.path()).join("user:u1").join("goose");
+        assert_eq!(
+            said,
+            [
+                Adopted::Kept { from: old.join("owner").join("claude"), to: taken.clone() },
+                Adopted::Moved { from: old.join("user:u1").join("goose"), to: moved_to.clone() },
+            ]
+        );
+        assert_eq!(std::fs::read_to_string(moved_to.join("kept.txt"))?, "user:u1 goose");
+        assert_eq!(std::fs::read_to_string(taken.join("kept.txt"))?, "kiln's own");
+        assert_eq!(std::fs::read_to_string(old.join("owner").join("claude").join("kept.txt"))?, "owner claude", "the one kept stays where it was");
+        assert!(adopt(state.path()).iter().all(|a| matches!(a, Adopted::Kept { .. })), "adopted once");
+        Ok(())
+    }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
