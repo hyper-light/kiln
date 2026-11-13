@@ -1738,10 +1738,6 @@ fn gone_here(session: &str, moved: &std::collections::HashSet<crate::instances::
     !moved.contains(&crate::instances::Owned::Agent(session.to_owned()))
 }
 
-/// (The new build's runner.) An agent session handed over: with its harness process, whose pipes
-/// came as `fds` (stdin, stdout, stderr); else started again from its record. When its process
-/// can't go on here it is stopped and the session starts again from its record (an error, saying so).
-#[cfg(unix)]
 /// A runner's harness host: its records in its own folder (`own_dir`, its instance's where it runs as
 /// one: `upgrade::own_dir`, which an upgrade replaces), and its people's volumes beneath kiln's state
 /// (`state_dir`), which outlives every instance; those an instance kept in its own folder first moved
@@ -1760,6 +1756,10 @@ fn harness_host(sink: impl Into<crate::harness::session::Sink>, state_dir: &std:
     h
 }
 
+/// (The new build's runner.) An agent session handed over: with its harness process, whose pipes
+/// came as `fds` (stdin, stdout, stderr); else started again from its record. When its process
+/// can't go on here it is stopped and the session starts again from its record (an error, saying so).
+#[cfg(unix)]
 async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, mut rec: crate::harness::host::Saved, handed: Option<Box<crate::harness::session::Handed>>, hand_on: Option<String>, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
     use std::os::fd::IntoRawFd as _;
     let Some(h) = h else { return Err("this runner runs no agent sessions".to_owned()) };
@@ -6421,6 +6421,7 @@ async fn installed_identity(given: crate::proto::IdentityGiven, state_dir: PathB
 /// This process was promoted (blue/green): the sessions it took over held at the epoch they go on
 /// at, each let go of so its ask for the next epoch (the one the hand-on names) may go
 /// ([`ask_agent_identity`], `custody::to_ask`), as `(session, epoch it goes on at now)`.
+#[cfg(any(unix, test))]
 fn promoted_asks() -> Vec<(String, u64)> {
     crate::runner::custody::promoted()
 }

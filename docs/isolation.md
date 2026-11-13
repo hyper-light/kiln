@@ -173,6 +173,28 @@ Owed, each with whose it is:
   person's own lays them out, made before it starts; and beside them kiln notes where its harness keeps
   its conversations, where a history finds them.
 
+### Part 7's clauses, where they're met
+
+Step 17 part 7 (#73): sessions launch through Hex's member call (`Call::Member`) and image class,
+their `Duplex` the member's stdio; interrupt, stop and kill mapped to the member's signals and Hex's
+stop. Each clause, as kiln main has it (paths under `crates/kiln/src`):
+
+| Clause | Where | Held by |
+|---|---|---|
+| Launch through the image class | `sandbox/hexvm.rs:223-225`: the box's spec is `ClassSpec::ShardsImage`, its image pinned, its harness an `ImageMember` given the launch's environment, folder and arguments | `hexvm::tests::s17_p7_a_members_run_echoes_its_stdin_ends_and_its_box_goes` |
+| Launch through the member call | `sandbox/hexvm.rs:311-318` (`boot`): create, start, then `Runtime::member`, the call Hex's node serves for `Call::Member` (`hex-client` `calls.rs:2998`, `hex-node` `serve.rs:2105`); kiln holds Hex's image runtime in process (`sandbox/mod.rs:71-76`, `ImageRuntime::new`) | the same test, over Hex's `SimRuntime` |
+| Its `Duplex` the member's stdio | `sandbox/hexvm.rs:378-380` (the member's `Proc::streams`: stdin, stdout, stderr, all three or refused); `sandbox/isolated.rs:115,168` → `proc.rs:39` (`duplex_of_run`) → `sandbox/held.rs:43-62` (`pump`: the `Duplex`'s pipes the run's) → `os/proc_unix.rs:436`, `os/proc_windows.rs:520` (`Duplex::held`) | `hexvm::tests::s17_p7_a_members_run_…` (stdin in order, back on stdout); `held::tests::s17_a_held_run_takes_its_input_in_order_and_ends_at_its_end`, `s17_a_held_duplex_is_no_process_…` |
+| Interrupt → the member's signal | Every harness interrupts in its own protocol on the member's stdin, as on the host (`harness/claude.rs:826`, `codex.rs:1510`, `acp.rs:570`, `pi.rs:361`, `antigravity.rs:287`). The seam's `Signal::Interrupt` is Hex's INT to the box (`sandbox/hexvm.rs:526-534`), which Hex refuses for an image box's members, `Awaits(MemberSignal)` (Hex's `guest/image.rs:1333`; its simulator's `signal_vm` alike), kiln's `Unsupported` (`hexvm.rs:330`); `HOLDS.signals` stays false until Hex delivers it | `hexvm::tests::s17_p7_a_kill_and_a_drop_delete_the_box` (refused, the run going on); `harness::host::tests::s17_` (the control request at its member) |
+| Stop → the member's signal, then Hex's stop | `harness/session.rs:4953,5029,5115,5120,5135` call `Duplex::terminate` → `os/proc_unix.rs:417`, `os/proc_windows.rs:511` → `sandbox/held.rs:110-124` (`Held::terminate`): `Signal::Terminate` (Hex's TERM, refused as above), so the end of its input, then `Run::kill` once its grace passes | `held::tests::s17_terminate_signals_where_it_can_else_ends_its_input_then_kills`; `hexvm::tests::s17_p7_a_kill_…` |
+| Kill → Hex's stop | `sandbox/hexvm.rs:537-542` (`Run::kill`) and `557` (drop) → `finish`, `hexvm.rs:175`: Hex's `delete_with_host_use`, which stops the box's VM and removes it (Hex's `guest/image.rs:1470`, `delete_image_used`, its final use read "just before its delete's stop"; its `MemberProc`: "the box's stop (`signal(KILL)`, `delete`)"); its end `Exit::Killed`, said once its box is gone, its charge kept first | `hexvm::tests::s17_p7_a_kill_and_a_drop_delete_the_box`, `s17_p7_s3_the_final_use_is_kept_before_its_end_is_said`, `s17_p7_s3_a_retried_delete_finding_its_box_gone_…` |
+
+A held run is never stopped by a process id: its `Duplex` has none (`host_pid`, and `detach` answers none
+at `os/proc_unix.rs:384`), so the handover paths that stop a harness by its pid (`harness/host.rs`
+`stop_process`, `agent.rs:3161,3273`) never take it, and the session terminates it through its boundary
+instead (`harness/session.rs:4953`). Hex's own member signal (`Upstream::MemberSignal`, Shards'
+agent-control endpoint) is upstream's: once Hex delivers it, `Run::signal` reaches the member with no
+change of kiln's beyond `HOLDS.signals`.
+
 ## Tests
 
 - `cargo test -p kiln-seams sandbox`: the suite, the simulator holding everything and holding nothing,

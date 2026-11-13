@@ -437,7 +437,7 @@ fn realtime_why(refusal: &hyper_rt::compute::Refusal) -> String {
 /// (docs/priority.md, "macOS" and "Windows"; goal 9, plan 01a1a87b2cec step 4), said after its refusal.
 fn realtime_instead() -> &'static str {
     if cfg!(target_os = "macos") {
-        "; instead the server's launchd job runs at ProcessType Interactive and its legs and agents below normal (nice 10), so the scheduler runs the shards first on every core"
+        "; instead the server's launchd job runs at ProcessType Interactive and its legs and agents below normal (nice PRIO_MAX, 20, the lowest priority there is), so the scheduler runs the shards first on every core"
     } else if cfg!(windows) {
         "; instead the server runs above normal priority and its legs and agents below normal, in jobs of their own, and a waking thread of a higher priority level takes its CPU at once"
     } else {

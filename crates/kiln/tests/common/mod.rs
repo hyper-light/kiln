@@ -4,7 +4,6 @@
 //! others': a throwaway kiln server ([`start`]) and the HTTP they speak to it ([`http`]).
 #![allow(dead_code, reason = "each test file uses what it needs")]
 
-#[cfg(unix)]
 pub mod agents;
 #[cfg(unix)]
 pub mod custody;
