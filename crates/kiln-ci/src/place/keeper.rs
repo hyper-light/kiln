@@ -42,8 +42,10 @@ pub struct View {
     /// Everything held there: the host's own admissions and every holder's reservations, this
     /// runner's among them.
     pub held: Amounts,
-    /// This runner's reservations among `held`: what the keeper granted it that it hasn't released,
-    /// its holder's own count (which each sync holds to the keeper's, CV5).
+    /// This runner's reservations among `held` for the runs its ledger holds: what the keeper
+    /// granted their starts that it hasn't released (`place::holder`). An earlier process's runs
+    /// that outlived it, and releases not yet answered, count as everyone else's, so the view never
+    /// says more room than the keeper has.
     pub own: Amounts,
     /// The most claims asking something this runner may hold live there at once, each one's room
     /// reserved through the keeper as one reservation: the most its holder may hold (Hex's
@@ -267,9 +269,22 @@ pub enum NotGranted {
     /// The keeper granted another amount than its reserve asked, which its holder gave back
     /// (`Disagrees`).
     Disagrees,
-    /// No answer came, its wait ended as [`Waits`] says (the holder core's `Event::Unanswered`, or
-    /// `NotNow::Down` where its link was down as it asked, which is `Died`).
+    /// No answer came, its wait ended as [`Waits`] says (the holder core's `Event::Unanswered`):
+    /// its link died, or the keeper reset it or closed its session for one it opens again
+    /// (`Closed { Session | NotSynced | Scope }`), or the keeper stalled.
     Unanswered(WaitEnded),
+    /// It asks GPUs, which the keeper grants no holder by count (`Refused { Devices }`, CV3: until
+    /// device grants by identity). The ledger offers no such claim where a keeper is known.
+    Devices,
+    /// It asks nothing (`Refused { Empty }`). Its holder says no such reserve: a run that asks
+    /// nothing starts without one.
+    Empty,
+    /// This process of its runner has numbered every reservation its epoch can (the holder core's
+    /// `NotNow::Exhausted`): its next process's epoch numbers them anew.
+    Exhausted,
+    /// No reserve was said, or the keeper closed its session for good: the runner isn't synced
+    /// with its machine's keeper (CV11), and why.
+    Unsynced(Unsynced),
 }
 
 impl NotGranted {
@@ -282,6 +297,10 @@ impl NotGranted {
             NotGranted::Unanswered(WaitEnded::Died) => "its reserve went unanswered: its link to its machine's capacity keeper ended",
             NotGranted::Unanswered(WaitEnded::Reset) => "its reserve went unanswered: its machine's capacity keeper started again",
             NotGranted::Unanswered(WaitEnded::Stalled) => "its reserve went unanswered: its machine's capacity keeper answered nothing for longer than the slowest answer it has given",
+            NotGranted::Devices => "its machine's capacity keeper refused its reserve: it asks GPUs, which the keeper grants no holder by count",
+            NotGranted::Empty => "its machine's capacity keeper refused its reserve as asking nothing",
+            NotGranted::Exhausted => "this runner's process has numbered every reservation it can: its next process numbers them anew",
+            NotGranted::Unsynced(why) => why.why(),
         }
     }
 }
