@@ -922,12 +922,41 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
             }
         }
     });
-    let Ok(mut first) = crate::rt::timeout(Duration::from_secs(10), req_rx.recv()).await.unwrap_or(Err(async_channel::RecvError)) else { return };
-    // A run's asker: the agent session the client's process belongs to, if any.
+    let Ok(first) = crate::rt::timeout(Duration::from_secs(10), req_rx.recv()).await.unwrap_or(Err(async_channel::RecvError)) else { return };
+    answer(handle, me, first, req_rx, ev_tx, host, Peer::Process(peer_pid(&fd))).await;
+    let _ = out.await;
+}
+
+/// Who a request comes from, as what carried it says: a process of this machine at the other end
+/// of the reach socket (where the system says which), or an isolated session's own lane into this
+/// process (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 18, Shards D254), which names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Peer {
+    /// A process of this machine, by its pid where the system says.
+    #[cfg(unix)]
+    Process(Option<u32>),
+    /// An agent session whose harness runs in a microVM of its own, asking over its lane.
+    Session(String),
+}
+
+/// A request answered on `ev_tx`, whatever carried it ([`Peer`]): what follows it on `req_rx` is a
+/// run's input and signals. Every platform has it; only Unix has the socket that carries it from a
+/// process ([`serve`]).
+pub(super) async fn answer(handle: Handle, me: String, mut first: Req, req_rx: crate::memory::queue::Receiver<Req>, ev_tx: crate::memory::queue::Sender<Ev>, host: Option<std::sync::Arc<crate::harness::host::Host>>, peer: Peer) {
+    // A run's asker: the agent session its client belongs to, if any; a lane's is its session.
     if let Req::Run(r) | Req::RunReuse(r) = &mut first {
-        let pid = peer_pid(&fd);
-        r.client = pid;
-        r.asker = crate::rt::blocking(move || pid.and_then(crate::runner::custody::session_of_pid)).await.ok().flatten();
+        match &peer {
+            #[cfg(unix)]
+            Peer::Process(pid) => {
+                let pid = *pid;
+                r.client = pid;
+                r.asker = crate::rt::blocking(move || pid.and_then(crate::runner::custody::session_of_pid)).await.ok().flatten();
+            }
+            Peer::Session(session) => {
+                r.client = None;
+                r.asker = Some(session.clone());
+            }
+        }
     }
     match first {
         Req::Status => {
@@ -962,15 +991,88 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
             };
             let _ = ev_tx.send(ev).await;
         }
-        Req::Run(r) => super::owned::run(host,&handle, &me, *r, ev_tx.clone(), req_rx,false).await,
-        Req::RunReuse(r) => super::owned::run(host,&handle, &me, *r, ev_tx.clone(), req_rx,true).await,
-        Req::Told(json) => { let _ = ev_tx.send(super::told::heard(&json, peer_pid(&fd)).await).await; }
+        Req::Run(r) => owned_run(host, &handle, &me, *r, ev_tx.clone(), req_rx, false).await,
+        Req::RunReuse(r) => owned_run(host, &handle, &me, *r, ev_tx.clone(), req_rx, true).await,
+        Req::Told(json) => {
+            let _ = ev_tx.send(super::told::heard(&json, &peer).await).await;
+        }
         Req::Input(_) | Req::InputEnd | Req::Signal(_) => {
             let _ = ev_tx.send(Ev::Error("nothing is running on this connection".into())).await;
         }
     }
-    drop(ev_tx);
-    let _ = out.await;
+}
+
+/// A run asked of this runner, as its owned launches run it (`super::owned::run`).
+#[cfg(unix)]
+async fn owned_run(host: Option<std::sync::Arc<crate::harness::host::Host>>, handle: &Handle, me: &str, req: RunReq, ev: crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>, reuse: bool) {
+    super::owned::run(host, handle, me, req, ev, ctl, reuse).await;
+}
+
+/// Where this runner's owned launches don't run (W05-R07: only Unix's admit them), a run is refused.
+#[cfg(not(unix))]
+async fn owned_run(_host: Option<std::sync::Arc<crate::harness::host::Host>>, _handle: &Handle, _me: &str, _req: RunReq, ev: crate::memory::queue::Sender<Ev>, _ctl: crate::memory::queue::Receiver<Req>, _reuse: bool) {
+    let _ = ev.send(Ev::Error(OWNED_UNIX.into())).await;
+}
+
+/// Why a run can't be asked of this runner where its owned launches don't run.
+#[cfg(not(unix))]
+const OWNED_UNIX: &str = "a run from an agent's MCP needs this runner's own launches, which only a Unix runner holds today (docs/ci.md W05-R07)";
+
+/// This runner asked in its own process, as its reach socket is asked, with no socket: an isolated
+/// session's MCP over its lane (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 18, Shards D254), on
+/// every platform. Each [`Here::ask`] is one request, as a connection to the socket is.
+#[derive(Clone)]
+pub struct Here {
+    pub handle: Handle,
+    /// This runner's name.
+    pub me: String,
+    pub host: Option<std::sync::Arc<crate::harness::host::Host>>,
+    /// The isolated session asking: a run's asker, and whom its runs' news is for.
+    pub session: String,
+}
+
+impl Here {
+    /// One request's connection.
+    pub fn ask(&self) -> Asked {
+        let (req_tx, req_rx) = crate::memory::queue::unbounded::<Req>(&crate::memory::owners::CHANNELS);
+        let (ev_tx, ev_rx) = crate::memory::queue::unbounded::<Ev>(&crate::memory::owners::CHANNELS);
+        Asked { here: self.clone(), req_tx, waiting: Some((req_rx, ev_tx)), ev_rx }
+    }
+}
+
+/// One request of [`Here`]'s: the first sent is answered, as the socket answers it ([`answer`]),
+/// and what's sent after it is a run's input and signals. For a thread of its own, as a socket
+/// [`Client`] is: its sends and reads wait.
+pub struct Asked {
+    here: Here,
+    req_tx: crate::memory::queue::Sender<Req>,
+    /// Until the first request: what its answer takes.
+    waiting: Option<(crate::memory::queue::Receiver<Req>, crate::memory::queue::Sender<Ev>)>,
+    ev_rx: crate::memory::queue::Receiver<Ev>,
+}
+
+impl Asked {
+    pub fn send(&mut self, r: &Req) -> anyhow::Result<()> {
+        match self.waiting.take() {
+            Some((req_rx, ev_tx)) => {
+                let h = self.here.clone();
+                let first = r.clone();
+                crate::rt::spawn(async move { answer(h.handle, h.me, first, req_rx, ev_tx, h.host, Peer::Session(h.session)).await });
+                Ok(())
+            }
+            None => self.req_tx.send_blocking(r.clone()).map_err(|_| anyhow::anyhow!("the runner has answered this request: nothing more goes on it")),
+        }
+    }
+
+    /// The next event; None once its answer is done.
+    pub fn event(&mut self) -> anyhow::Result<Option<Ev>> {
+        Ok(self.ev_rx.recv_blocking().ok())
+    }
+
+    /// A second handle on it, to send a run's input or signals while another thread reads.
+    pub fn sender(&self) -> crate::memory::queue::Sender<Req> {
+        self.req_tx.clone()
+    }
 }
 
 /// A client of the local socket (the CLI and the MCP server).
