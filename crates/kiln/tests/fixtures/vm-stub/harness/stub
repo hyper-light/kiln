@@ -32,6 +32,7 @@ prompt asks with words:
                     `CONNECT_OK <host>:<port> <address>`, or `CONNECT_FAIL <host>:<port> <why>`. Its
                     resolver is /etc/resolv.conf's first nameserver, or `VM_STUB_RESOLVER`
                     (`<address>:<port>`); a failing turn waits `VM_STUB_CONNECT_SECS` (20) for each
+                    of its resolver's answer and the connection, then says `CONNECT_FAIL`
 
 A message steered into a running turn is said as `STEERED <its words>`. A stopped turn ends where it
 was, as its harness ends one (Claude Code's interrupt, Codex's turn/interrupt, ACP's session/cancel,
