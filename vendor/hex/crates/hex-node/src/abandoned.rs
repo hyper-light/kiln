@@ -101,6 +101,7 @@ mod tests {
                     bounds: Bounds::default(),
                     class: ClassSpec::Process,
                     owner: None,
+                    band: 0,
                 },
                 Phase::Ready,
                 Vec::new(),

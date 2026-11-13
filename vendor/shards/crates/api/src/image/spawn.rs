@@ -1,0 +1,768 @@
+//! The run host's process (`shards api-run`, D231), started holding its three standard streams
+//! alone, whatever else this process holds inheritable as it starts, as every program its
+//! orchestrator starts does (CVE-2024-21626's class):
+//! - On Unix, posix_spawn(3), file actions putting its stdin, stdout and stderr on 0, 1 and 2, its
+//!   signal mask emptied and SIGPIPE's action its default, as std's spawn sets them. Apple's takes
+//!   `POSIX_SPAWN_CLOEXEC_DEFAULT`, so no other descriptor goes with it: macOS's pipe, socket,
+//!   socketpair and accept take no close-on-exec flag, so a descriptor another thread has just made
+//!   waits unmarked until that thread marks it. Linux makes every descriptor close-on-exec as it
+//!   makes it (pipe2, SOCK_CLOEXEC, accept4, O_CLOEXEC).
+//! - On Windows, CreateProcessW with a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` of inheritable copies of
+//!   those three alone, so no handle another part of this process has made inheritable for a child
+//!   of its own goes with it, as std's spawn, inheriting with no list, would give it.
+//!
+//! It is waited for while left unreaped, killed while it is unreaped, and reaped, as the session's
+//! watcher and stop need it.
+
+use std::ffi::OsString;
+use std::io;
+use std::path::Path;
+
+pub(super) use imp::Process;
+
+/// A run host started, and the ends of its standard streams this process holds.
+#[derive(Debug)]
+pub(super) struct Started {
+    pub(super) process: Process,
+    pub(super) stdin: io::PipeWriter,
+    pub(super) stdout: io::PipeReader,
+    pub(super) stderr: io::PipeReader,
+}
+
+/// Starts `program` with `args`, its environment this process's with `env` over it, and its
+/// standard streams pipes to this process. A `program` named without a directory is found on
+/// `PATH`, as std's spawn finds one.
+pub(super) fn start(program: &Path, args: &[&str], env: &[(OsString, OsString)]) -> io::Result<Started> {
+    let (child_in, stdin) = io::pipe()?;
+    let (stdout, child_out) = io::pipe()?;
+    let (stderr, child_err) = io::pipe()?;
+    #[cfg(unix)]
+    let ends = {
+        use std::os::fd::AsFd as _;
+        [child_in.as_fd(), child_out.as_fd(), child_err.as_fd()]
+    };
+    #[cfg(windows)]
+    let ends = {
+        use std::os::windows::io::AsHandle as _;
+        [child_in.as_handle(), child_out.as_handle(), child_err.as_handle()]
+    };
+    let process = imp::spawn(program, args, &environment(env), ends)?;
+    // The host holds its own ends now; this process's go.
+    drop((child_in, child_out, child_err));
+    Ok(Started {
+        process,
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
+/// This process's environment with `over` over it: a variable `over` names replaces this
+/// process's of that name (on Windows, of that name in any letter case, as Windows compares
+/// them), a later one an earlier.
+fn environment(over: &[(OsString, OsString)]) -> Vec<(OsString, OsString)> {
+    let same = |a: &OsString, b: &OsString| {
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let mut env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    for (name, value) in over {
+        env.retain(|(had, _)| !same(had, name));
+        env.push((name.clone(), value.clone()));
+    }
+    env
+}
+
+#[cfg(unix)]
+mod imp {
+    use std::ffi::{CString, OsString};
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Path;
+
+    /// The run host's process, by its pid: this process's child until it is reaped.
+    #[derive(Debug)]
+    pub(in crate::image) struct Process {
+        pid: libc::pid_t,
+    }
+
+    impl Process {
+        /// Waits for it to exit, leaving it unreaped.
+        pub(in crate::image) fn awaited(&self) -> io::Result<()> {
+            let id = libc::id_t::try_from(self.pid).map_err(|_| io::Error::other("a negative pid"))?;
+            loop {
+                // SAFETY: a siginfo_t, plain data, for waitid(2) to fill.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                // SAFETY: waitid(2) of our own child into `info`; WNOWAIT leaves it unreaped.
+                let r =
+                    unsafe { libc::waitid(libc::P_PID, id, &raw mut info, libc::WEXITED | libc::WNOWAIT) };
+                if r == 0 {
+                    return Ok(());
+                }
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+        }
+
+        /// Kills it at once. Only while it is unreaped: the caller holds what says so.
+        pub(in crate::image) fn kill(&self) {
+            // SAFETY: kill(2) of our own child, unreaped while the caller says so.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        }
+
+        /// Reaps it, once it has exited.
+        pub(in crate::image) fn reap(&self) -> io::Result<()> {
+            let mut status = 0;
+            loop {
+                // SAFETY: waitpid(2) of our own child, which it reaps, its status into `status`.
+                if unsafe { libc::waitpid(self.pid, &raw mut status, 0) } == self.pid {
+                    return Ok(());
+                }
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// A NUL-free copy of `bytes`, as an exec takes them.
+    fn c(bytes: &[u8], what: &str) -> io::Result<CString> {
+        CString::new(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{what} holds a NUL byte")))
+    }
+
+    /// A posix_spawn(3) call's answer: 0, or the error's number itself.
+    fn done(r: libc::c_int) -> io::Result<()> {
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(r))
+        }
+    }
+
+    /// A spawn's attributes, destroyed as they drop.
+    struct Attributes(*mut libc::posix_spawnattr_t);
+
+    impl Drop for Attributes {
+        fn drop(&mut self) {
+            // SAFETY: initialized by posix_spawnattr_init before this was made, destroyed once.
+            unsafe { libc::posix_spawnattr_destroy(self.0) };
+        }
+    }
+
+    /// A spawn's file actions, destroyed as they drop.
+    struct Actions(*mut libc::posix_spawn_file_actions_t);
+
+    impl Drop for Actions {
+        fn drop(&mut self) {
+            // SAFETY: initialized by posix_spawn_file_actions_init before this was made, destroyed once.
+            unsafe { libc::posix_spawn_file_actions_destroy(self.0) };
+        }
+    }
+
+    /// An empty signal set, or one of `signal` alone.
+    fn signals(signal: Option<libc::c_int>) -> io::Result<libc::sigset_t> {
+        let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: sigemptyset(3) writes the whole set it is given.
+        if unsafe { libc::sigemptyset(set.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if let Some(signal) = signal {
+            // SAFETY: a set sigemptyset initialized, and a signal of this platform's.
+            if unsafe { libc::sigaddset(set.as_mut_ptr(), signal) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        // SAFETY: initialized by sigemptyset above.
+        Ok(unsafe { set.assume_init() })
+    }
+
+    /// Spawns `program` with `args` and exactly `env`, its stdin, stdout and stderr `ends`.
+    pub(in crate::image) fn spawn(
+        program: &Path,
+        args: &[&str],
+        env: &[(OsString, OsString)],
+        ends: [BorrowedFd<'_>; 3],
+    ) -> io::Result<Process> {
+        let path = c(program.as_os_str().as_bytes(), "the program's path")?;
+        let mut argv = vec![path.clone()];
+        for arg in args {
+            argv.push(c(arg.as_bytes(), "an argument")?);
+        }
+        let vars = env
+            .iter()
+            .map(|(name, value)| c(&[name.as_bytes(), b"=", value.as_bytes()].concat(), "a variable"))
+            .collect::<io::Result<Vec<CString>>>()?;
+        let argv: Vec<*mut libc::c_char> = argv
+            .iter()
+            .map(|a| a.as_ptr().cast_mut())
+            .chain(std::iter::once(std::ptr::null_mut()))
+            .collect();
+        let envp: Vec<*mut libc::c_char> = vars
+            .iter()
+            .map(|v| v.as_ptr().cast_mut())
+            .chain(std::iter::once(std::ptr::null_mut()))
+            .collect();
+        // Each end at 3 or past, so no dup2 onto 0, 1 or 2 replaces one not yet put there.
+        let mut moved: Vec<OwnedFd> = Vec::new();
+        let mut fds = [0; 3];
+        for (fd, end) in fds.iter_mut().zip(ends) {
+            *fd = if end.as_raw_fd() < 3 {
+                let high = end.try_clone_to_owned()?;
+                let raw = high.as_raw_fd();
+                moved.push(high);
+                raw
+            } else {
+                end.as_raw_fd()
+            };
+        }
+
+        let mut attr_storage = MaybeUninit::<libc::posix_spawnattr_t>::uninit();
+        let attr = attr_storage.as_mut_ptr();
+        // SAFETY: posix_spawnattr_init writes the attributes object `attr` points at.
+        done(unsafe { libc::posix_spawnattr_init(attr) })?;
+        let _attr = Attributes(attr);
+        #[cfg(target_vendor = "apple")]
+        let flags =
+            libc::POSIX_SPAWN_SETSIGMASK | libc::POSIX_SPAWN_SETSIGDEF | libc::POSIX_SPAWN_CLOEXEC_DEFAULT;
+        #[cfg(not(target_vendor = "apple"))]
+        let flags = libc::POSIX_SPAWN_SETSIGMASK | libc::POSIX_SPAWN_SETSIGDEF;
+        let flags = libc::c_short::try_from(flags)
+            .map_err(|_| io::Error::other("posix_spawn's flags past a short"))?;
+        let (none, pipe) = (signals(None)?, signals(Some(libc::SIGPIPE))?);
+        // SAFETY: an initialized attributes object, and signal sets alive for the calls.
+        unsafe {
+            done(libc::posix_spawnattr_setflags(attr, flags))?;
+            done(libc::posix_spawnattr_setsigmask(attr, &raw const none))?;
+            done(libc::posix_spawnattr_setsigdefault(attr, &raw const pipe))?;
+        }
+
+        let mut actions_storage = MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
+        let actions = actions_storage.as_mut_ptr();
+        // SAFETY: posix_spawn_file_actions_init writes the file actions object `actions` points at.
+        done(unsafe { libc::posix_spawn_file_actions_init(actions) })?;
+        let _actions = Actions(actions);
+        for (fd, to) in fds.into_iter().zip(0..) {
+            // SAFETY: an initialized file actions object; `fd` is open until the spawn below.
+            done(unsafe { libc::posix_spawn_file_actions_adddup2(actions, fd, to) })?;
+        }
+
+        let mut pid: libc::pid_t = 0;
+        let on_path = !program.as_os_str().as_bytes().contains(&b'/');
+        // SAFETY: `path`, and each of `argv` and `envp`, NUL-terminated strings in null-terminated
+        // arrays, are alive for the call, as are the initialized `actions` and `attr`; `pid` is
+        // written where it succeeds.
+        let r = unsafe {
+            if on_path {
+                libc::posix_spawnp(
+                    &raw mut pid,
+                    path.as_ptr(),
+                    actions,
+                    attr,
+                    argv.as_ptr(),
+                    envp.as_ptr(),
+                )
+            } else {
+                libc::posix_spawn(
+                    &raw mut pid,
+                    path.as_ptr(),
+                    actions,
+                    attr,
+                    argv.as_ptr(),
+                    envp.as_ptr(),
+                )
+            }
+        };
+        done(r)?;
+        drop(moved);
+        Ok(Process { pid })
+    }
+}
+
+#[cfg(windows)]
+mod imp {
+    use std::ffi::{OsStr, OsString};
+    use std::io;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::{AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle};
+    use std::path::{Path, PathBuf};
+
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, INFINITE, InitializeProcThreadAttributeList,
+        LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute,
+        WaitForSingleObject,
+    };
+
+    /// The run host's process, by a handle of its own, which names it alone until it drops.
+    #[derive(Debug)]
+    pub(in crate::image) struct Process {
+        handle: OwnedHandle,
+    }
+
+    impl Process {
+        /// Waits for it to exit.
+        pub(in crate::image) fn awaited(&self) -> io::Result<()> {
+            // SAFETY: a process handle this value owns.
+            if unsafe { WaitForSingleObject(self.handle.as_raw_handle(), INFINITE) } == WAIT_OBJECT_0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        /// Kills it at once.
+        pub(in crate::image) fn kill(&self) {
+            // SAFETY: a process handle this value owns; a process already ended refuses it, harmlessly.
+            unsafe { TerminateProcess(self.handle.as_raw_handle(), 1) };
+        }
+
+        /// Nothing to reap on Windows: the handle names its process until it drops, and no other
+        /// process takes its identity before then.
+        pub(in crate::image) fn reap(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A NUL-free wide copy of `text`.
+    fn wide(text: &OsStr, what: &str) -> io::Result<Vec<u16>> {
+        let wide: Vec<u16> = text.encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{what} holds a NUL"),
+            ));
+        }
+        Ok(wide)
+    }
+
+    /// `program` as CreateProcessW is given it: a path with a directory as it is; a bare name found
+    /// on `PATH`, as it is or, with no extension, as an `.exe`, as std's spawn finds one.
+    fn resolve(program: &Path) -> io::Result<PathBuf> {
+        if program.is_absolute() || program.components().count() > 1 {
+            return Ok(program.to_path_buf());
+        }
+        let mut names = vec![program.to_path_buf()];
+        if program.extension().is_none() {
+            names.push(program.with_extension("exe"));
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        for dir in std::env::split_paths(&path) {
+            for name in &names {
+                let found = dir.join(name);
+                if found.is_file() {
+                    return Ok(found);
+                }
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} is in no directory of PATH", program.display()),
+        ))
+    }
+
+    /// `arg` on `line` as the C runtime's parser (and CommandLineToArgvW) reads it back: as it is
+    /// where it holds no space, tab or quote; else quoted, each quote escaped, and each run of
+    /// backslashes before a quote or the closing quote doubled.
+    fn quote(arg: &OsStr, line: &mut Vec<u16>) -> io::Result<()> {
+        let (quote, backslash) = (u16::from(b'"'), u16::from(b'\\'));
+        let arg = wide(arg, "an argument")?;
+        if !arg.is_empty()
+            && !arg
+                .iter()
+                .any(|&c| c == u16::from(b' ') || c == u16::from(b'\t') || c == quote)
+        {
+            line.extend_from_slice(&arg);
+            return Ok(());
+        }
+        line.push(quote);
+        let mut backslashes = 0usize;
+        for c in arg {
+            if c == backslash {
+                backslashes = backslashes.saturating_add(1);
+            } else {
+                if c == quote {
+                    line.extend(std::iter::repeat_n(backslash, backslashes.saturating_add(1)));
+                }
+                backslashes = 0;
+            }
+            line.push(c);
+        }
+        line.extend(std::iter::repeat_n(backslash, backslashes));
+        line.push(quote);
+        Ok(())
+    }
+
+    /// The command line CreateProcessW takes: the program, then each argument, NUL-terminated.
+    fn command_line(program: &Path, args: &[&str]) -> io::Result<Vec<u16>> {
+        let mut line = Vec::new();
+        quote(program.as_os_str(), &mut line)?;
+        for arg in args {
+            line.push(u16::from(b' '));
+            quote(OsStr::new(arg), &mut line)?;
+        }
+        line.push(0);
+        Ok(line)
+    }
+
+    /// The environment block CreateProcessW takes with `CREATE_UNICODE_ENVIRONMENT`: each
+    /// `NAME=VALUE` NUL-terminated, sorted by name in any letter case as Windows keeps them, the
+    /// block ending in one NUL more.
+    fn block(env: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
+        let upper = |c: u16| u8::try_from(c).map_or(c, |b| u16::from(b.to_ascii_uppercase()));
+        let mut vars = env
+            .iter()
+            .map(|(name, value)| {
+                let name = wide(name, "a variable's name")?;
+                // A name holds no `=` past its first character (`=C:` is a drive's directory).
+                if name.is_empty() || name.iter().skip(1).any(|&c| c == u16::from(b'=')) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a variable's name holds `=`",
+                    ));
+                }
+                Ok((name, wide(value, "a variable's value")?))
+            })
+            .collect::<io::Result<Vec<(Vec<u16>, Vec<u16>)>>>()?;
+        vars.sort_by(|(a, _), (b, _)| a.iter().map(|&c| upper(c)).cmp(b.iter().map(|&c| upper(c))));
+        let mut block = Vec::new();
+        for (name, value) in vars {
+            block.extend(name);
+            block.push(u16::from(b'='));
+            block.extend(value);
+            block.push(0);
+        }
+        if block.is_empty() {
+            block.push(0);
+        }
+        block.push(0);
+        Ok(block)
+    }
+
+    /// An inheritable copy of `end`, for this child's handle list alone, closed as it drops.
+    fn inheritable(end: BorrowedHandle<'_>) -> io::Result<OwnedHandle> {
+        let mut copy: HANDLE = std::ptr::null_mut();
+        // SAFETY: duplicates a handle this process holds, within this process, as an inheritable
+        // copy written to `copy`.
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                end.as_raw_handle(),
+                GetCurrentProcess(),
+                &raw mut copy,
+                0,
+                1,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: DuplicateHandle succeeded, so `copy` is a handle this process now owns.
+        Ok(unsafe { OwnedHandle::from_raw_handle(copy) })
+    }
+
+    /// A process-thread attribute list of one attribute, in storage of its own, deleted as it drops.
+    struct Attributes {
+        list: LPPROC_THREAD_ATTRIBUTE_LIST,
+        _storage: Vec<usize>,
+    }
+
+    impl Attributes {
+        fn one() -> io::Result<Attributes> {
+            let mut size = 0usize;
+            // SAFETY: with no list, the call writes only the size one attribute takes into `size`,
+            // failing as documented.
+            unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &raw mut size) };
+            if size == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let words = size.div_ceil(size_of::<usize>());
+            let mut storage = Vec::new();
+            storage
+                .try_reserve_exact(words)
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+            storage.resize(words, 0usize);
+            let list = storage.as_mut_ptr().cast::<core::ffi::c_void>();
+            // SAFETY: `list` points at `size` writable bytes, aligned for a pointer, the size the call
+            // above asked for one attribute.
+            if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &raw mut size) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Attributes {
+                list,
+                _storage: storage,
+            })
+        }
+    }
+
+    impl Drop for Attributes {
+        fn drop(&mut self) {
+            // SAFETY: initialized above, deleted once, its storage alive until after this.
+            unsafe { DeleteProcThreadAttributeList(self.list) };
+        }
+    }
+
+    /// Spawns `program` with `args` and exactly `env`, its stdin, stdout and stderr `ends`.
+    pub(in crate::image) fn spawn(
+        program: &Path,
+        args: &[&str],
+        env: &[(OsString, OsString)],
+        ends: [BorrowedHandle<'_>; 3],
+    ) -> io::Result<Process> {
+        let program = resolve(program)?;
+        let mut application = wide(program.as_os_str(), "the program's path")?;
+        application.push(0);
+        let mut line = command_line(&program, args)?;
+        let block = block(env)?;
+        let [input, output, error] = ends;
+        let copies = [inheritable(input)?, inheritable(output)?, inheritable(error)?];
+        let handles: [HANDLE; 3] = copies.each_ref().map(|copy| copy.as_raw_handle());
+        let attributes = Attributes::one()?;
+        let handle_list = usize::try_from(PROC_THREAD_ATTRIBUTE_HANDLE_LIST)
+            .map_err(|_| io::Error::other("the handle-list attribute's number past a usize"))?;
+        // SAFETY: an initialized list of one attribute; `handles`, three live inheritable handles, and
+        // the list are alive until CreateProcessW below has returned; the size is theirs.
+        let ok = unsafe {
+            UpdateProcThreadAttribute(
+                attributes.list,
+                0,
+                handle_list,
+                handles.as_ptr().cast(),
+                size_of_val(&handles),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: STARTUPINFOEXW and PROCESS_INFORMATION are plain data, all zeros their empty state.
+        let (mut info, mut started): (STARTUPINFOEXW, PROCESS_INFORMATION) =
+            unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+        info.StartupInfo.cb = u32::try_from(size_of::<STARTUPINFOEXW>())
+            .map_err(|_| io::Error::other("STARTUPINFOEXW past a DWORD"))?;
+        info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        let [input, output, error] = handles;
+        info.StartupInfo.hStdInput = input;
+        info.StartupInfo.hStdOutput = output;
+        info.StartupInfo.hStdError = error;
+        info.lpAttributeList = attributes.list;
+        // SAFETY: `application` is NUL-terminated, `line` a NUL-terminated writable buffer (the call
+        // may write it), `block` a double-NUL-terminated UTF-16 block; `info` and its list and
+        // handles are alive for the call, and `started` is written where it succeeds. Handles are
+        // inherited (TRUE) as the handle list names them, and no others.
+        let ok = unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                block.as_ptr().cast(),
+                std::ptr::null(),
+                (&raw const info).cast::<STARTUPINFOW>(),
+                &raw mut started,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateProcessW succeeded, so both handles are this process's to own.
+        let (handle, thread) = unsafe {
+            (
+                OwnedHandle::from_raw_handle(started.hProcess),
+                OwnedHandle::from_raw_handle(started.hThread),
+            )
+        };
+        drop(thread);
+        drop((attributes, copies));
+        Ok(Process { handle })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// The variable under which the leak check runs, in a test process of its own.
+    #[cfg(any(target_os = "macos", windows))]
+    const ALONE: &str = "SHARDS_API_SPAWN_ALONE";
+
+    /// A program that reads its stdin to its end, saying each line with its argument in it, by its
+    /// path: findstr on Windows, grep on macOS.
+    #[cfg(any(target_os = "macos", windows))]
+    fn reader() -> PathBuf {
+        if cfg!(windows) {
+            let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+            PathBuf::from(root).join("System32").join("findstr.exe")
+        } else {
+            PathBuf::from("/usr/bin/grep")
+        }
+    }
+
+    /// Leaves `write` inheritable: as a descriptor another thread has made and not yet marked
+    /// close-on-exec is on macOS, or a handle another part of this process made inheritable for a
+    /// child of its own is on Windows.
+    #[cfg(any(target_os = "macos", windows))]
+    fn inheritable(write: &io::PipeWriter) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: fcntl(2) of a descriptor `write` owns, clearing its close-on-exec flag.
+            assert_eq!(unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFD, 0) }, 0);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+            // SAFETY: a pipe handle `write` owns, alive for the call.
+            let ok = unsafe {
+                SetHandleInformation(write.as_raw_handle(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+            };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+        }
+    }
+
+    /// Whether every write end of `read`'s pipe is gone, every process's: a read that would wait
+    /// finds its end (Unix), or a look at it finds it broken (Windows), at once.
+    #[cfg(any(target_os = "macos", windows))]
+    fn writers_gone(read: &io::PipeReader) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: fcntl(2) of a descriptor `read` owns, making its reads not wait.
+            let set = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+            assert_eq!(set, 0);
+            match (&*read).read(&mut [0u8; 1]) {
+                Ok(0) => true,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
+                other => panic!("a read of a pipe nothing was written to: {other:?}"),
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, GetLastError};
+            use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+            let mut ready = 0u32;
+            // SAFETY: a pipe handle `read` owns; only the count is asked for, into `ready`.
+            let ok = unsafe {
+                PeekNamedPipe(
+                    read.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &raw mut ready,
+                    std::ptr::null_mut(),
+                )
+            };
+            // SAFETY: reads this thread's last error, which the failed call above set.
+            ok == 0 && unsafe { GetLastError() } == ERROR_BROKEN_PIPE
+        }
+    }
+
+    /// D231's run host holds its three standard streams alone, as every program its orchestrator
+    /// starts does: do leave a pipe's write end inheritable in this process, then start a run host
+    /// and let go of that end. Expect: the pipe's read end finds every writer gone, the run host
+    /// holding none of it. It runs in a test process of its own, so no other test's spawn holds that
+    /// end for its moment: one in flight beside it holds every descriptor of this process until its
+    /// exec closes them, and std's on Windows inherits it. Linux makes every descriptor
+    /// close-on-exec as it makes it (pipe2, SOCK_CLOEXEC, accept4, O_CLOEXEC), so none waits
+    /// unmarked there.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn a_run_host_holds_no_end_it_was_not_given() {
+        if std::env::var_os(ALONE).is_some() {
+            let (read, write) = io::pipe().unwrap();
+            inheritable(&write);
+            let started = start(&reader(), &["api-run"], &[]).unwrap();
+            drop(write);
+            let gone = writers_gone(&read);
+            drop(started.stdin);
+            started.process.awaited().unwrap();
+            started.process.reap().unwrap();
+            assert!(
+                gone,
+                "the run host holds the write end of a pipe it was never given"
+            );
+            return;
+        }
+        let alone = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "image::spawn::tests::a_run_host_holds_no_end_it_was_not_given",
+                "--test-threads=1",
+            ])
+            .env(ALONE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            alone.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&alone.stdout),
+            String::from_utf8_lossy(&alone.stderr)
+        );
+    }
+
+    /// Do start a run host with a variable over this process's environment, write it lines and end
+    /// its stdin. Expect: its stdout says the variable and the line it was asked for, its stderr
+    /// nothing, and it ends.
+    #[test]
+    fn a_run_host_takes_its_environment_and_speaks_on_its_streams() {
+        let env = [("SHARDS_API_SPAWN_TEST".into(), "said".into())];
+        // Each says the variable, then reads its stdin to its end, saying the line asked for.
+        let started = if cfg!(windows) {
+            let cmd = PathBuf::from("cmd");
+            let args = [
+                "/d",
+                "/q",
+                "/c",
+                "echo",
+                "%SHARDS_API_SPAWN_TEST%&",
+                "findstr",
+                "api-run",
+            ];
+            start(&cmd, &args, &env)
+        } else {
+            let sh = PathBuf::from("sh");
+            start(
+                &sh,
+                &["-c", "printf '%s\\n' \"$SHARDS_API_SPAWN_TEST\"; grep api-run"],
+                &env,
+            )
+        }
+        .unwrap();
+        let Started {
+            process,
+            mut stdin,
+            mut stdout,
+            mut stderr,
+        } = started;
+        stdin.write_all(b"other\napi-run\n").unwrap();
+        drop(stdin);
+        let mut said = String::new();
+        stdout.read_to_string(&mut said).unwrap();
+        let mut why = String::new();
+        stderr.read_to_string(&mut why).unwrap();
+        process.awaited().unwrap();
+        process.reap().unwrap();
+        let lines: Vec<&str> = said.lines().map(str::trim_end).collect();
+        assert_eq!(lines, ["said", "api-run"], "{said:?}");
+        assert_eq!(why, "");
+    }
+}

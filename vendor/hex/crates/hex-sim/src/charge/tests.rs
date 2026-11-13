@@ -431,6 +431,29 @@ fn w14_the_last_resort_ends_only_a_vm_past_its_budget() {
     );
 }
 
+/// Joint plan step 14 (AC-T7.4.1), C3's order in C5 (ROOT, 2026-11-12): within a band the later begun bears the
+/// contention, so of VMs equally past their budgets the last resort ends the later. A node's VMs are keyed in the order
+/// it began them (its learners key them by their records' places in its start order). Do admit VMs 1 then 2, one band,
+/// at 2 GiB each in a 4 GiB budget, no slack left, and let each hold 3 GiB, each 1 GiB past its budget. Expect VM 2
+/// ended.
+#[test]
+fn w14_of_vms_equally_past_their_budgets_the_later_begun_is_ended() {
+    let mut n = node(res(16_000, 4 * GIB, 0));
+    for id in [1, 2] {
+        n.admit(
+            id,
+            class_of(u8::try_from(id).unwrap(), 1_000, 2 * GIB),
+            0,
+            1,
+        )
+        .unwrap();
+    }
+    for id in [1, 2] {
+        n.observe(id, &sample(0, 3 * GIB)).unwrap();
+    }
+    assert_eq!(ended(&n), Some(2));
+}
+
 /// Joint plan step 14 (AC-T7.4.1), C5 as ROOT took it (2026-11-12): a VM `memory.high` holds within its budget is
 /// never ended for growth to come. Do warm two VMs of 4 GiB allocations at 2 GiB each in an 8 GiB budget, so each is
 /// booked at 2 GiB with a 4 GiB budget, and let the first hold 3 GiB, past its booking but within its budget, while the

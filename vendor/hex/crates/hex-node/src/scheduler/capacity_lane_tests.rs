@@ -7,12 +7,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use hex_api::capacity::{Amounts, Close, Event, Holder, Out, ToHolder, ToKeeper};
+use hex_api::capacity::{Amounts, Close, Event, Holder, Out, ToKeeper};
 use hex_core::patience::Patience;
 use hex_core::schedule as dto;
 use hex_quic::capacity::Link;
 use hex_quic::enroll::{self, sim::SimCa, store};
-use hex_quic::{Endpoint, Shape};
+use hex_quic::{Endpoint, PeerId, Refused, Shape};
 use hex_testkit::waits::{until, within};
 
 use super::{CapacityHolder, CapacityLane, Config, Report, Service};
@@ -25,6 +25,7 @@ static AWAY: Patience = Patience::measuring("test.hex_node.capacity_lane.away");
 
 const SCHEDULER: &str = "scheduler.capacity.test";
 const KILN: &str = "kiln-a.capacity.test";
+const KILN_B: &str = "kiln-b.capacity.test";
 
 fn loopback() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
@@ -61,8 +62,8 @@ fn kept() -> (Report, Arc<Mutex<Vec<String>>>) {
     (report, lines)
 }
 
-/// A link to the lane at `address` from a new endpoint `ca` enrolls as `name`.
-fn linked(ca: &SimCa, address: SocketAddr, name: &str) -> (Endpoint, Link) {
+/// A new endpoint `ca` enrolls as `name`, and its dial of the lane at `address`: the lane's peer id, or why not.
+fn dialed(ca: &SimCa, address: SocketAddr, name: &str) -> (Endpoint, Result<PeerId, Refused>) {
     ca.admit(name, name.as_bytes());
     let end = Endpoint::start(hex_quic::Config {
         credentials: enroll::enroll(ca, name, name.as_bytes().to_vec()).unwrap(),
@@ -75,8 +76,14 @@ fn linked(ca: &SimCa, address: SocketAddr, name: &str) -> (Endpoint, Link) {
         },
     })
     .unwrap();
-    let peer = within(&DIAL, |by| end.dial(SCHEDULER, address, by)).unwrap();
-    let link = Link::open(&end, peer).unwrap();
+    let peer = within(&DIAL, |by| end.dial(SCHEDULER, address, by));
+    (end, peer)
+}
+
+/// A link to the lane at `address` from a new endpoint `ca` enrolls as `name`.
+fn linked(ca: &SimCa, address: SocketAddr, name: &str) -> (Endpoint, Link) {
+    let (end, peer) = dialed(ca, address, name);
+    let link = Link::open(&end, peer.unwrap()).unwrap();
     (end, link)
 }
 
@@ -104,12 +111,14 @@ fn forget(service: &Service, holder: &str) -> Option<dto::Forget> {
         .forget
 }
 
-/// AC-T7.4.1, CV6, CV8, CV9: a scheduler whose configuration names a capacity lane on loopback, its enrollment, and
-/// kiln-a alone; kiln-a joins and the scheduler refreshes; a peer kiln's CA enrolled but the lane doesn't name says
-/// hello; the person releases kiln-a while it is connected, again once its link has ended, and a name never seen.
-/// Expect the lane bound, kiln-a welcomed and hinted the measured room after the scheduler's own word; the other peer
-/// closed as not authorized and that logged; the release refused as connected, then done and logged as
-/// `hex.capacity event=forgotten`, and the name never seen unknown. (This scheduler has no backend, so its node runs
+/// AC-T7.4.1, CV6, CV8, CV9, CV11: a scheduler whose configuration names a capacity lane on loopback, its enrollment,
+/// and kiln-a and kiln-b alone; kiln-a joins before the scheduler takes any command; kiln-b says hello as kiln-a; the
+/// person releases kiln-a while it is connected, again once its link has ended, and a name never seen. Expect the lane
+/// bound, kiln-a welcomed with the machine's measured room (a keeper started knows its room before a holder reserves,
+/// with no command of Hex's to measure it); kiln-b's hello closed as not authorized and
+/// that logged; the release refused as connected, then done and logged as `hex.capacity event=forgotten`, and the name
+/// never seen unknown. (A peer the lane doesn't name never reaches it: refused at its handshake,
+/// `a_peer_the_lane_doesnt_name_holds_none_of_its_connections`. This scheduler has no backend, so its node runs
 /// nothing and keeps no reservation of a holder's, CV8: the grant through the node's view is
 /// `placement::view::tests::a_holder_reaches_the_nodes_keeper_over_quic`.)
 #[test]
@@ -121,10 +130,10 @@ fn the_scheduler_serves_its_capacity_view_to_the_holders_it_names_alone() {
     let lane = CapacityLane {
         bind: loopback(),
         credentials,
-        holders: vec![CapacityHolder {
-            name: KILN.into(),
-            user: None,
-        }],
+        holders: [KILN, KILN_B]
+            .into_iter()
+            .map(|name| CapacityHolder { name: name.into() })
+            .collect(),
     };
     let (report, lines) = kept();
     let service = Service::open(&config(dir.path(), Some(lane)), report).unwrap();
@@ -138,21 +147,17 @@ fn the_scheduler_serves_its_capacity_view_to_the_holders_it_names_alone() {
         matches!(joined.as_slice(), [Event::Synced { agree: true, .. }]),
         "{joined:?}"
     );
-    service.command(dto::Command::Retry).unwrap();
-    let hint = within(&HEAR, |by| link.hear(by)).unwrap();
-    let ToHolder::Hint { view, .. } = hint.clone() else {
-        panic!("no hint after the scheduler measured its room: {hint:?}");
-    };
-    assert!(view.room.cpu_milli >= 1000, "{view:?}");
-    let mut out = Out::default();
-    kiln.hear(hint, &mut out);
-    assert_eq!(kiln.view().map(|v| v.room), Some(view.room));
+    let view = kiln.view().unwrap();
+    assert!(
+        view.room.cpu_milli >= 1000,
+        "welcomed before the room was measured: {view:?}"
+    );
 
-    let (_other_end, mut other) = linked(&ca, address, "mallory.capacity.test");
-    let mut mallory = Holder::start("mallory.capacity.test".into(), 1, 4, &[]).unwrap();
-    let hello = mallory.connect().unwrap();
+    let (_b_end, mut posing_link) = linked(&ca, address, KILN_B);
+    let mut posing = Holder::start(KILN.into(), 2, 4, &[]).unwrap();
+    let hello = posing.connect().unwrap();
     assert_eq!(
-        talk(&mut other, &mut mallory, vec![hello]),
+        talk(&mut posing_link, &mut posing, vec![hello]),
         vec![Event::Closed(Close::NotAuthorized)]
     );
     assert!(
@@ -191,6 +196,47 @@ fn the_scheduler_serves_its_capacity_view_to_the_holders_it_names_alone() {
     service.shutdown().unwrap();
 }
 
+/// AC-T7.4.1, CV8, CV9 (goal 13's finding; docs/design/hex-quic.md Q10): a lane that names kiln-a alone holds that
+/// holder's two connections (Q8); two peers kiln's CA enrolled but the lane doesn't name dial it and keep their
+/// endpoints up; then kiln-a dials and says hello. Expect each unnamed peer refused at its handshake, typed
+/// (`Refused::Identity`), so it holds none of the lane's connections, and kiln-a welcomed and synced.
+#[test]
+fn a_peer_the_lane_doesnt_name_holds_none_of_its_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = SimCa::new().unwrap();
+    let credentials = dir.path().join("enrollment");
+    enrolled_in(&ca, &credentials, SCHEDULER);
+    let lane = CapacityLane {
+        bind: loopback(),
+        credentials,
+        holders: vec![CapacityHolder { name: KILN.into() }],
+    };
+    let (report, _) = kept();
+    let service = Service::open(&config(dir.path(), Some(lane)), report).unwrap();
+    let address = service.capacity_address().unwrap();
+
+    let unnamed: Vec<(Endpoint, Result<PeerId, Refused>)> =
+        ["mallory-1.capacity.test", "mallory-2.capacity.test"]
+            .into_iter()
+            .map(|name| dialed(&ca, address, name))
+            .collect();
+    let (kiln_end, kiln_peer) = dialed(&ca, address, KILN);
+    let kiln_peer = kiln_peer
+        .unwrap_or_else(|why| panic!("the lane refused kiln-a, the holder it names: {why:?}"));
+    let mut link = Link::open(&kiln_end, kiln_peer).unwrap();
+    let mut kiln = Holder::start(KILN.into(), 1, 4, &[]).unwrap();
+    let hello = kiln.connect().unwrap();
+    let joined = talk(&mut link, &mut kiln, vec![hello]);
+    assert!(
+        matches!(joined.as_slice(), [Event::Synced { agree: true, .. }]),
+        "{joined:?}"
+    );
+    for (_, dial) in &unnamed {
+        assert_eq!(dial.as_ref().err(), Some(&Refused::Identity), "{dial:?}");
+    }
+    service.shutdown().unwrap();
+}
+
 /// AC-T7.4.1, CV9: a scheduler whose configuration names no capacity lane, then one whose lane's enrollment has
 /// begun but kiln's CA hasn't answered. Expect the first to bind nothing for one and to refuse the person's release,
 /// typed; the second refused at its open, typed, before anything is bound.
@@ -222,10 +268,7 @@ fn without_a_lane_nothing_is_bound_and_a_release_is_refused() {
     let lane = CapacityLane {
         bind: loopback(),
         credentials: begun,
-        holders: vec![CapacityHolder {
-            name: KILN.into(),
-            user: None,
-        }],
+        holders: vec![CapacityHolder { name: KILN.into() }],
     };
     let (report, _) = kept();
     let opened = Service::open(&config(&dir.path().join("some"), Some(lane)), report);

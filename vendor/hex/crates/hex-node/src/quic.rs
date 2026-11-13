@@ -45,27 +45,17 @@ pub fn ports(staging: bool) -> Vec<u32> {
 }
 
 /// A node endpoint's shape at `limits` (docs/design/hex-quic.md Q8), each number the node's own: as many peers as its
-/// connections bound, and for one peer every connection to its ports that can do work at once: a control connection
-/// for each call the node runs at once (`in_flight`, its workers: a connection past them has no call to run), each
-/// running program's streams and each gathering exec's ([`Bounds::unnamed`]), one log connection (a second reads the
-/// same lines), and where it stages a staging connection for each call it runs at once. hyper-transport grows to these
-/// and lays none out ahead (vendor/patches/hyper-raft/0003); hyper-quic lays out a table of the lanes a connected peer
-/// may open (quinn's `StreamsState::new`), a row each, so a peer costs that table while it is connected.
+/// connections bound, and for one peer every connection to its ports that can do work at once
+/// ([`hex_quic::limits::peer_lanes`] of its calls in flight, `serve::limits`: a stdio connection is named and copied by
+/// a thread of its own, [`streams`], so one past its threads has none, whatever its programs), the derivation its
+/// clients hold themselves to. hyper-transport grows to these and lays none out ahead
+/// (vendor/patches/hyper-raft/0003); hyper-quic lays out a table of the lanes a connected peer may open (quinn's
+/// `StreamsState::new`), a row each, on the driver's thread as the peer's first datagram comes, so a peer costs that
+/// table while it is connected and no peer is answered while it is laid out.
 pub fn shape(limits: &Limits, staging: bool) -> Shape {
-    let bounds = Bounds::of(limits);
-    let streams = limits
-        .programs
-        .saturating_mul(wire::MAX_FDS)
-        .saturating_add(bounds.unnamed);
-    let staged = if staging { limits.in_flight } else { 0 };
-    let lanes = limits
-        .in_flight
-        .saturating_add(streams)
-        .saturating_add(1)
-        .saturating_add(staged);
     Shape {
         connections: limits.connections,
-        lanes: u32::try_from(lanes).unwrap_or(u32::MAX),
+        lanes: hex_quic::limits::peer_lanes(limits.in_flight, staging),
     }
 }
 

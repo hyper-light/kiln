@@ -284,3 +284,49 @@ fn a_member_that_ended_before_its_hold_is_not_held_and_the_scope_stays_certain()
     let scope = held.boxed.state.vm.as_ref().unwrap();
     assert!(scope.watchable(held.boxed.state.id.as_ref()).unwrap());
 }
+
+/// AC-T7.4.1 (the original of the helper's Control failure that a restarted node's preflight then refused:
+/// "original native scope failure ... proc_signal_with_audittoken ... ESRCH"): the held member execs, so the
+/// scope's end is refused by its hold's token (ESRCH) and captures a fresh one; the member then ends before
+/// that fresh token's signal (ended and reaped here, inside the signal's seam, as a member exiting on its own
+/// races the watcher). Do: end the member by its stale hold. Expect it gone, nothing more signalled, and the
+/// scope still Running: a member its fresh token is refused for too has ended, the end the scope's signal
+/// wanted, never a failure of the scope.
+#[test]
+fn a_member_that_ends_before_its_fresh_tokens_signal_is_gone_and_the_scope_stays_certain() {
+    let mut held = Held::new();
+    held.exec_in_its_read();
+    let member = held
+        .boxed
+        .state
+        .held()
+        .unwrap()
+        .stopped
+        .get(&held.pid)
+        .unwrap();
+    let child = &mut held.child;
+    let state = &held.boxed.state;
+    let mut sends = 0;
+    let killed = state.signal_stopped_by(member, sys::MemberSignal::Kill, |token, signal| {
+        sends += 1;
+        if sends == 2 {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        sys::signal_member(token, signal)
+    });
+    assert_eq!(
+        sends, 2,
+        "the stale hold's token wasn't refused and a fresh one signalled"
+    );
+    assert!(
+        matches!(killed, Ok(None)),
+        "{:?}",
+        killed.map(|signalled| signalled.map(|member| member.pid))
+    );
+    let scope = held.boxed.state.vm.as_ref().unwrap();
+    assert!(
+        scope.watchable(held.boxed.state.id.as_ref()).unwrap(),
+        "the scope left Running"
+    );
+}

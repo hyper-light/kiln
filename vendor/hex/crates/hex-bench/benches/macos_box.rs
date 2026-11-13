@@ -112,6 +112,7 @@ mod macos {
             },
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         })
         .expect("create");
         // Each member allocates far past the whole bound, so the box's summed footprint races up until the
@@ -163,6 +164,7 @@ mod macos {
             },
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         })
         .expect("create");
         let hold = BOUND / 100 * percent;

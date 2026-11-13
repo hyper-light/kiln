@@ -279,6 +279,7 @@ fn run_probe(
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(bundle.path().to_path_buf()),
         owner: None,
+        band: 0,
     };
     node.create(spec).map_err(|e| e.to_string())?;
     // delete runs whatever happens, so no container is left behind.

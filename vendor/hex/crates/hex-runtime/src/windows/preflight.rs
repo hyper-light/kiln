@@ -355,6 +355,7 @@ mod tests {
             devices: Vec::new(),
             allocation: None,
             route: None,
+            band: 0,
         }
     }
 

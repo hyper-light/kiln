@@ -2534,12 +2534,12 @@ mod tests {
             assert_eq!(
                 owner.launches.load(Ordering::SeqCst),
                 usize::from(allowed),
-                "stale or unknown LUID reached the canonical native launcher"
+                "stale or unknown LUID reached the canonical native launcher: {result:?}"
             );
             assert_eq!(
                 owner.queries.load(Ordering::SeqCst),
                 1,
-                "the SAME initialized provider must establish the preboot join"
+                "the SAME initialized provider must establish the preboot join: {result:?}"
             );
             if allowed {
                 // The model launcher refuses after the join: no VM or readiness.

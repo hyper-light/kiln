@@ -406,7 +406,12 @@ fn charges<R: hex_node::recorded::Recover + Send + Sync + 'static>(
 ) {
     let mut err = std::io::stderr().lock();
     match node.start_charges() {
-        Ok(unheld) => {
+        Ok((window, unheld)) => {
+            let _ = writeln!(
+                err,
+                "hex node: the charge learner's window is {} ns",
+                window.as_nanos()
+            );
             for why in unheld {
                 let _ = writeln!(err, "hex node: the charge learner can't hold this: {why}");
             }
@@ -516,6 +521,14 @@ fn host(args: &Args) -> Result<Hosted, (u8, String)> {
         })
         .transpose()?;
     node.install_backends(firecracker, shards).map_err(failed)?;
+    // What a fleet's driver reads the learner's windows by (joint plan step 14): none where no VM backend runs it.
+    if let Some(window) = node.charge_window() {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "hex node: the charge learner's window is {} ns",
+            window.as_nanos()
+        );
+    }
     // Recovery removes a box it can't take back; say which and why, so nothing is dropped unseen
     // (CLAUDE.md §3), before the socket opens.
     say_recovered(&node.recover().map_err(failed)?);
@@ -822,9 +835,10 @@ fn configured_guest(
             &why,
         ))
     })?;
-    // The Shards class on Agentfile images (joint plan step 12): Shards' image boot where this host can
-    // run it and its waits seeded from their records, or the refusal naming what each awaits (the host's
-    // run host, the record to take), which a create of the class then says.
+    // The Shards class on Agentfile images (joint plan step 12): Shards' image boot, which every host runs, or
+    // the refusal naming this node's SHARDS_KERNEL and SHARDS_INIT where its run hosts couldn't take them as a
+    // pair, read here once; and its waits seeded from their records, or the refusal naming the record to take.
+    // A create of the class says either.
     let mut guest = GuestRuntime::new(Arc::new(provider), config)
         .recorded_at(backend_path(state, "@guest").map_err(failed)?)
         .with_runtime_paths(paths)

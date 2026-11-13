@@ -44,6 +44,8 @@ struct Counting {
     fail_start: AtomicBool,
     fail_delete: AtomicBool,
     fail_record: Mutex<Option<PathBuf>>,
+    /// The band of each spec it was asked to create, in order.
+    bands: Mutex<Vec<u8>>,
 }
 
 impl Runtime for Counting {
@@ -52,6 +54,7 @@ impl Runtime for Counting {
     }
     fn create(&self, spec: BoxSpec) -> Result<BoxInfo, Refusal> {
         self.creates.fetch_add(1, Ordering::SeqCst);
+        self.bands.lock().unwrap().push(spec.band);
         let info = self.sim.create(spec)?;
         if let Some(path) = self.fail_record.lock().unwrap().take() {
             std::fs::create_dir(path).unwrap();
@@ -130,6 +133,7 @@ fn request() -> (Demand, Payload) {
             },
             class: ClassSpec::Process,
             owner: None,
+            band: 0,
         },
         start: false,
     };
@@ -555,6 +559,32 @@ fn local(driver: &Driver, step: Step) -> Step {
         notices.extend(next.notices);
     }
     panic!("local peer did not quiesce")
+}
+
+/// Joint plan step 14 (AC-T7.4.1), C5: a submitted box's priority band reaches the box its node makes. Do submit a
+/// payload in band 3 and let its node make it. Expect the spec its runtime is asked to create in band 3, as the payload
+/// the node keeps for it is.
+#[test]
+fn w14_a_submitted_band_reaches_the_box_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = Arc::new(Counting::default());
+    let driver = boot(dir.path(), rt.clone());
+    let (d, mut p) = request();
+    p.spec.band = 3;
+    let (key, step) = driver.submit(d, p).unwrap();
+    local(&driver, step);
+    assert_eq!(*rt.bands.lock().unwrap(), [3]);
+    assert_eq!(
+        driver
+            .lock()
+            .unwrap()
+            .rows
+            .payload("ran", key)
+            .unwrap()
+            .spec
+            .band,
+        3
+    );
 }
 
 /// AC-T7.4.1: an actual empty process box remains admitted until actual Runtime.delete.

@@ -8,7 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
-use crate::Refusal;
+use crate::{Refusal, Upstream};
 
 /// Which of its image's Agentfile declarations a member is: an `AGENT` or a `HARNESS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -33,25 +33,31 @@ impl Member {
     /// Whether its name is one Shards' Agentfile parser takes, BuildKit's stage name `^[a-z][a-z0-9._-]*$`
     /// (`valid_stage_name`), within [`Member::MAX_NAME`].
     fn check(&self, at: usize) -> Result<(), Refusal> {
+        self.check_named(&format!("grants[{at}].member"))
+            .map_err(invalid)
+    }
+
+    /// [`Member::check`]'s rule, its refusal naming the field `field` it was read from.
+    pub(crate) fn check_named(&self, field: &str) -> Result<(), String> {
         let name = &self.name;
         if name.is_empty() || name.len() > Self::MAX_NAME {
-            return Err(invalid(format!(
-                "grants[{at}].member.name {name:?} isn't 1 to {} bytes",
+            return Err(format!(
+                "{field}.name {name:?} isn't 1 to {} bytes",
                 Self::MAX_NAME
-            )));
+            ));
         }
         if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
-            return Err(invalid(format!(
-                "grants[{at}].member.name {name:?} doesn't start with a lowercase letter"
-            )));
+            return Err(format!(
+                "{field}.name {name:?} doesn't start with a lowercase letter"
+            ));
         }
         if let Some(c) = name.chars().find(|c| {
             !(c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
         }) {
-            return Err(invalid(format!(
-                "grants[{at}].member.name {name:?} holds {c:?}: a member's name is lowercase letters, digits, \
+            return Err(format!(
+                "{field}.name {name:?} holds {c:?}: a member's name is lowercase letters, digits, \
                  '.', '_' and '-'"
-            )));
+            ));
         }
         Ok(())
     }
@@ -127,6 +133,9 @@ impl Destination {
     pub const MAX_NAME: usize = 253;
     /// Longest label: RFC 1035 §2.3.4.
     pub const MAX_LABEL: usize = 63;
+    /// The name Shards' destinations give the VM's own host (D236, Docker Desktop's name for it), which its network
+    /// process takes to the host's loopback: the host is a [`Grant::Host`]'s alone, so no egress names it.
+    pub const SHARDS_HOST: &str = "host.docker.internal";
 
     fn check(&self, at: usize) -> Result<(), Refusal> {
         match self {
@@ -247,11 +256,14 @@ pub struct Published {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Receiver {
-    /// The member the image's Agentfile gives the port coming in (Shards D122). A publish is granted only on a run of
-    /// the members alone, which Shards' run host refuses a port no member is given; on a run with a command of its
-    /// own, which takes every such port, it is refused `Awaits(PublishReceiver)`. Shards 482c5d78's image boot names
-    /// no receiver, so Hex can't verify it is the grant's member: N6's gap, recorded here until Shards names it.
+    /// The member the image's Agentfile gives the port coming in (Shards D122), unverified: Shards 482c5d78's image
+    /// boot named no receiver. No run reports it since Shards names one ([`Receiver::Named`]); its tag stays, the
+    /// wire being append-only.
     Declared,
+    /// The grant's member, which Shards' image boot names as the port's one receiver (D231's `Bound::to`), at the
+    /// member's own port there: the published port, or the one an `EXPOSE` maps it to (D122). A run whose port
+    /// reaches another member too, or none (its own command), is stopped as its boot returns (N6).
+    Named { port: u16 },
 }
 
 /// Whether every grant is well formed and no flow is named twice, refused by the field that fails, never dropped or
@@ -397,7 +409,39 @@ fn check_name(at: usize, name: &str) -> Result<(), Refusal> {
                 .to_owned(),
         );
     }
+    if name == Destination::SHARDS_HOST {
+        return refused(
+            "is the VM's own host, as Shards names it (D236): the VM's host is a host grant"
+                .to_owned(),
+        );
+    }
     Ok(())
+}
+
+/// What Shards owes Hex before an image's boot can hold `grants` exactly (N4), if anything: the first grant Shards'
+/// destinations (D236: TCP to a host's name, an IPv4 address or the host itself) can't express at all awaits its own
+/// capability, UDP to a name ([`Upstream::MemberGrantsByName`]), to an address, or to an IPv6 address by TCP
+/// ([`Upstream::MemberGrantsByAddress`]), and the host's service by UDP ([`Upstream::MemberHostService`]). Every other
+/// grant is held: a destination by TCP kept for its own members alone, which the run host holds every member of the
+/// image to before the VM starts (Hex's recorded change to Shards, vendor/shards UPSTREAM.md), and a publish to the
+/// receiver Shards names (N6).
+pub fn unheld(grants: &[Grant]) -> Option<Upstream> {
+    grants.iter().find_map(|grant| match grant {
+        Grant::Egress {
+            to: Destination::Name(_),
+            ports,
+            ..
+        } if ports.proto == Proto::Udp => Some(Upstream::MemberGrantsByName),
+        Grant::Egress {
+            to: Destination::Address(address),
+            ports,
+            ..
+        } if address.is_ipv6() || ports.proto == Proto::Udp => {
+            Some(Upstream::MemberGrantsByAddress)
+        }
+        Grant::Host { ports, .. } if ports.proto == Proto::Udp => Some(Upstream::MemberHostService),
+        Grant::Egress { .. } | Grant::Host { .. } | Grant::Publish { .. } => None,
+    })
 }
 
 /// One member's egress to one destination, or its reach to the host, of one protocol: grants of one key whose ports

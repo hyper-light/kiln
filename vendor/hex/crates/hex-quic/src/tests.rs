@@ -25,6 +25,8 @@ static READ: Patience = Patience::measuring("test.hex_quic.read");
 static ROOM: Patience = Patience::measuring("test.hex_quic.room");
 /// Room for a stopped reader's bytes: the grants its reader gives only once it reads again.
 static HELD_ROOM: Patience = Patience::measuring("test.hex_quic.held_room");
+/// A peer's Reset that follows its End, come to the reader.
+static RESET_AFTER_END: Patience = Patience::measuring("test.hex_quic.reset_after_end");
 /// A peer's reset, come to a connection whose owner hasn't read.
 static RESET: Patience = Patience::measuring("test.hex_quic.reset");
 
@@ -210,6 +212,128 @@ fn hex_quic_15_an_unserved_port_is_refused_by_type() {
     assert_eq!(conn.gone(), Some(Why::NoPort));
 }
 
+/// What `owner` holds now, read without waiting and kept in `got`: whether its end has come.
+fn drained(owner: &mut bridge::Local, got: &mut Vec<u8>) -> bool {
+    let mut buf = [0u8; 64];
+    loop {
+        match std::io::Read::read(owner, &mut buf) {
+            Ok(0) => return true,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => panic!("reading a bridged socket: {e}"),
+        }
+    }
+}
+
+/// AC-T7.4.1 (joint plan step 4, Q3; HEX-QUIC-23's lost stdout, 2026-11-12): what a peer wrote before its End reaches
+/// the reader, whatever ends the connection after it. Do: as the node relays a program's stdout (`hex-node`
+/// `quic::stream_conn`), the node writes a line on a stdio connection, ends its half and lets the connection go with
+/// the client's half still open, so its Reset follows its End; the client bridges the connection (`link::Link`'s
+/// dial) only once that Reset has come, as a bridge whose reader the scheduler ran late reads it; then again with the
+/// client's endpoint ended before its bridge reads. Expect: each bridged socket reads the line, then its end.
+#[test]
+fn ac_t7_4_1_what_a_peer_wrote_before_its_end_outlasts_its_reset() {
+    let ca = SimCa::new().unwrap();
+    let node = node(&ca, "node-ended.test");
+    for endpoint_ended in [false, true] {
+        let client = client(enrolled(
+            &ca,
+            &format!("client-ended-{endpoint_ended}.test"),
+        ));
+        let peer = within(&DIAL, |by| {
+            client.dial("node-ended.test", node.local_addr(), by)
+        })
+        .unwrap();
+        let conn = client.open(peer, STDIO_PORT).unwrap();
+        let (_, there) = within(&ACCEPT, |by| node.accept(STDIO_PORT, by)).unwrap();
+        within(&ROOM, |by| there.write_all(b"line\n", by)).unwrap();
+        within(&ROOM, |by| there.end(by)).unwrap();
+        drop(there);
+        until(&RESET_AFTER_END, "the node's Reset after its End", || {
+            conn.gone() == Some(Why::Gone)
+        })
+        .unwrap();
+        if endpoint_ended {
+            drop(client);
+        }
+        let mut owner = bridge::socket(conn).unwrap();
+        owner.set_nonblocking(true).unwrap();
+        let mut got = Vec::new();
+        until(&READ, "the bridged line and its end", || {
+            drained(&mut owner, &mut got)
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "line\n",
+            "the client's endpoint ended before its bridge read: {endpoint_ended}"
+        );
+    }
+}
+
+/// How a bridged stream's owner read its end: the peer's End, or the connection cut short, as the read's error says.
+#[derive(Debug, PartialEq, Eq)]
+enum Ending {
+    Ended,
+    Cut(std::io::ErrorKind),
+}
+
+/// What `owner` holds now, read without waiting and kept in `got`: its end, once it has come.
+fn ending(owner: &mut hex_client::guest::DuplexOwner, got: &mut Vec<u8>) -> Option<Ending> {
+    let mut buf = [0u8; 64];
+    loop {
+        match std::io::Read::read(&mut **owner, &mut buf) {
+            Ok(0) => return Some(Ending::Ended),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Some(Ending::Cut(e.kind())),
+        }
+    }
+}
+
+/// AC-T7.4.1 (joint plan step 4, Q3; hex-quic.md Q11, route (b)): a stream cut short reads as cut, never as ended. Do:
+/// the client's link bridges a stdio connection (`link::Link`'s dial); the node writes a line on it and, once the line
+/// has gone, resets the connection with no End; then again with the node ending its half instead. Expect the cut
+/// stream to read the line, then a reset (`ConnectionReset`), and the ended one the line, then its end.
+#[test]
+fn ac_t7_4_1_a_stream_cut_short_reads_as_cut() {
+    use hex_client::guest::Link as _;
+    let ca = SimCa::new().unwrap();
+    let node = node(&ca, "node-cut.test");
+    let client = std::sync::Arc::new(client(enrolled(&ca, "client-cut.test")));
+    let peer = within(&DIAL, |by| {
+        client.dial("node-cut.test", node.local_addr(), by)
+    })
+    .unwrap();
+    let link = link::Link::new(std::sync::Arc::clone(&client), peer);
+    for (cut, expected) in [
+        (true, Ending::Cut(std::io::ErrorKind::ConnectionReset)),
+        (false, Ending::Ended),
+    ] {
+        let mut owner = link.dial(STDIO_PORT).unwrap();
+        owner.set_nonblocking(true).unwrap();
+        let (_, there) = within(&ACCEPT, |by| node.accept(STDIO_PORT, by)).unwrap();
+        within(&ROOM, |by| there.write_all(b"line\n", by)).unwrap();
+        if cut {
+            // Its frame gone to the driver, ahead of the Reset on the connection's lane.
+            until(&ROOM, "the line gone to the driver", || there.writable()).unwrap();
+            there.reset(Why::Gone);
+        } else {
+            within(&ROOM, |by| there.end(by)).unwrap();
+        }
+        let (mut got, mut end) = (Vec::new(), None);
+        until(&READ, "the bridged line and its end", || {
+            end = ending(&mut owner, &mut got);
+            end.is_some()
+        })
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&got), "line\n", "cut: {cut}");
+        assert_eq!(end, Some(expected), "cut: {cut}");
+    }
+}
+
 /// A provider that shares everything with Hex's links but its suites.
 fn offering(suites: &[rustls::SupportedCipherSuite]) -> rustls::crypto::CryptoProvider {
     rustls::crypto::CryptoProvider {
@@ -309,4 +433,212 @@ fn hex_quic_14_an_unenrolled_peer_is_refused_identity() {
     })
     .unwrap_err();
     assert_eq!(refused, Refused::Identity, "{refused}");
+}
+
+/// The link falling silent (AC-T7.4.1; HEX-QUIC-25 B3, 2026-11-12): a relay in front of the node, and the bridges of a
+/// connection whose link ends with nothing said.
+#[cfg(unix)]
+mod silent {
+    use std::io::ErrorKind;
+    use std::net::{SocketAddr, UdpSocket};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use hex_client::guest::{DuplexOwner, Link as _};
+    use hex_core::patience::Patience;
+    use hex_core::stream::STDIO_PORT;
+    use hex_testkit::waits::{until, within};
+    use rustix::event::{PollFd, PollFlags, Timespec};
+
+    use super::{ACCEPT, DIAL, READ, ROOM, client, enrolled, loopback, node, read_exactly};
+    use crate::enroll::sim::SimCa;
+    use crate::link;
+
+    /// The client's connection ending once its link has fallen silent: QUIC's idle timeout (Q8), nothing said.
+    static IDLE_END: Patience = Patience::measuring("test.hex_quic.idle_end");
+    /// A bridge letting its owner's socket go once its connection has ended.
+    static LET_GO: Patience = Patience::measuring("test.hex_quic.bridge_let_go");
+
+    /// A UDP relay in front of a node: it passes datagrams both ways until it falls silent, then takes every datagram
+    /// and passes none, its sockets still bound, so the link ends with nothing said, no close and no ICMP, as with a
+    /// node that stops answering or a successor bound to its port (HEX-QUIC-25 B3).
+    struct Relay {
+        addr: SocketAddr,
+        silent: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Relay {
+        fn start(node: SocketAddr) -> Self {
+            let front = UdpSocket::bind(loopback()).unwrap();
+            let back = UdpSocket::bind(loopback()).unwrap();
+            back.connect(node).unwrap();
+            front.set_nonblocking(true).unwrap();
+            back.set_nonblocking(true).unwrap();
+            let addr = front.local_addr().unwrap();
+            let silent = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (quiet, done) = (Arc::clone(&silent), Arc::clone(&stop));
+            let thread = std::thread::spawn(move || {
+                // A UDP datagram's most: its length is 16 bits (RFC 768).
+                let mut buf = vec![0u8; usize::from(u16::MAX)];
+                let mut client = None;
+                while !done.load(Ordering::Acquire) {
+                    let mut ready = [
+                        PollFd::new(&front, PollFlags::IN),
+                        PollFd::new(&back, PollFlags::IN),
+                    ];
+                    let _ = rustix::event::poll(&mut ready, None);
+                    let pass = !quiet.load(Ordering::Acquire);
+                    while let Ok((n, from)) = front.recv_from(&mut buf) {
+                        client = Some(from);
+                        if pass {
+                            let _ = back.send(&buf[..n]);
+                        }
+                    }
+                    while let Ok(n) = back.recv(&mut buf) {
+                        if pass && let Some(to) = client {
+                            let _ = front.send_to(&buf[..n], to);
+                        }
+                    }
+                }
+            });
+            Self {
+                addr,
+                silent,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        /// From now on the relay passes nothing.
+        fn silence(&self) {
+            self.silent.store(true, Ordering::Release);
+        }
+    }
+
+    impl Drop for Relay {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            // Its wait ends with a datagram.
+            if let Ok(waker) = UdpSocket::bind(loopback()) {
+                let _ = waker.send_to(&[0], self.addr);
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// What `owner` holds now, read without waiting (its socket non-blocking) and kept in `got`: whether its end has
+    /// come (an end of input, a reset, or the cut of its connection's close, Q11).
+    fn drain(owner: &mut DuplexOwner, got: &mut Vec<u8>) -> bool {
+        let mut buf = [0u8; 64];
+        loop {
+            match owner.read(&mut buf) {
+                Ok(0) => return true,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return false,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    return true;
+                }
+                Err(e) => panic!("reading a bridged socket: {e}"),
+            }
+        }
+    }
+
+    /// Whether the bridge has let `owner`'s socket go: the pair's other end is closed, so it can't be written to
+    /// (poll(2)'s POLLHUP for writing: on Linux a socket shut both ways, on macOS one that can send no more).
+    fn let_go(owner: &DuplexOwner) -> bool {
+        let mut ready = [PollFd::from_borrowed_fd(owner.handle(), PollFlags::OUT)];
+        let now = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        rustix::event::poll(&mut ready, Some(&now)).is_ok()
+            && ready[0]
+                .revents()
+                .intersects(PollFlags::HUP | PollFlags::ERR)
+    }
+
+    /// AC-T7.4.1 (HEX-QUIC-25 B3, 2026-11-12; Q3): a connection's end ends every bridge on it, however each stood. Do:
+    /// over a relay, bridge three of a program's stdio connections as the client dials them (`link::Link`): one the node
+    /// wrote a line on and then ended, as a program's stdout at its program's end, read to its end and written on after
+    /// it, its owner's half still open; one open both ways, as a stdin its program reads; then the relay falls silent,
+    /// taking every datagram and passing none, and a third is dialed as the link goes, its Open lost. Expect: the
+    /// client's connection ends at QUIC's idle timeout, with no close and no ICMP, and every bridge then lets its
+    /// owner's socket go: its read ends, and a write is refused, none taken.
+    #[test]
+    fn ac_t7_4_1_a_connections_end_lets_every_bridged_socket_go() {
+        let ca = SimCa::new().unwrap();
+        let node = node(&ca, "node-silent.test");
+        let relay = Relay::start(node.local_addr());
+        let client = Arc::new(client(enrolled(&ca, "client-silent.test")));
+        let peer = within(&DIAL, |by| client.dial("node-silent.test", relay.addr, by)).unwrap();
+        let link = link::Link::new(Arc::clone(&client), peer);
+        // A program's stdout at its program's end: a line, then the node's End; its owner's half stays open.
+        let mut ended = link.dial(STDIO_PORT).unwrap();
+        ended.set_nonblocking(true).unwrap();
+        let (_, ended_there) = within(&ACCEPT, |by| node.accept(STDIO_PORT, by)).unwrap();
+        within(&ROOM, |by| ended_there.write_all(b"line\n", by)).unwrap();
+        within(&ROOM, |by| ended_there.end(by)).unwrap();
+        let mut got = Vec::new();
+        until(&READ, "the ended stream's line and end", || {
+            drain(&mut ended, &mut got)
+        })
+        .unwrap();
+        assert_eq!(got, b"line\n");
+        ended.write_all(b"after\n").unwrap();
+        assert_eq!(read_exactly(&ended_there, 6), b"after\n");
+        // A program's stdin, open both ways.
+        let mut open = link.dial(STDIO_PORT).unwrap();
+        open.write_all(b"in\n").unwrap();
+        open.set_nonblocking(true).unwrap();
+        let (_, open_there) = within(&ACCEPT, |by| node.accept(STDIO_PORT, by)).unwrap();
+        assert_eq!(read_exactly(&open_there, 3), b"in\n");
+        // The connection's end comes to the test on a connection of its own on the link.
+        let sentinel = client.open(peer, STDIO_PORT).unwrap();
+        within(&ROOM, |by| sentinel.write_all(b"s", by)).unwrap();
+        let (_, sentinel_there) = within(&ACCEPT, |by| node.accept(STDIO_PORT, by)).unwrap();
+        assert_eq!(read_exactly(&sentinel_there, 1), b"s");
+        relay.silence();
+        // Dialed as the link goes: its Open never reaches the node.
+        let mut opening = link.dial(STDIO_PORT).unwrap();
+        opening.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        let end = within(&IDLE_END, |by| sentinel.read(&mut byte, by)).unwrap_err();
+        assert_eq!(end.kind(), ErrorKind::ConnectionAborted, "{end}");
+        for (what, owner) in [
+            ("open", &mut open),
+            ("opening", &mut opening),
+            ("ended", &mut ended),
+        ] {
+            eprintln!(
+                "the connection ended: waiting for the {what} stream's bridge to let its socket go"
+            );
+            until(
+                &LET_GO,
+                &format!("the {what} stream's socket let go"),
+                || let_go(owner),
+            )
+            .unwrap();
+            let mut rest = Vec::new();
+            assert!(
+                drain(owner, &mut rest),
+                "the {what} stream's read didn't end"
+            );
+            assert!(
+                owner.write(b"x").is_err(),
+                "the {what} stream took a write after its connection ended"
+            );
+        }
+        drop((ended_there, open_there, sentinel_there));
+    }
 }

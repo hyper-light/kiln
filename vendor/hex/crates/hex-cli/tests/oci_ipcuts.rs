@@ -343,6 +343,7 @@ fn make(node: &Node, id: &str, bundle: PathBuf) -> BoxId {
         bounds: Bounds::default(),
         class: ClassSpec::Bundle(bundle),
         owner: None,
+        band: 0,
     })
     .unwrap_or_else(|e| panic!("create {id}: {e}"));
     node.start(&id).unwrap();

@@ -474,6 +474,42 @@ Methods: `place`, `release`, `nodes`.
 - **PLACEMENT-6** a refusal's why names what's short
 - **PLACEMENT-7** small work fills the cluster exactly to its capacity, and is placed again once some is released
 
+## Capacity
+
+A machine's capacity keeper, as kiln's runner holds room through it (Hex's
+`docs/design/capacity-view.md`; kiln plan `01a1cd8e862e7169a074db3d5fa33f3d`, step 13): links to the
+keeper, each a connection to its port on which the holder's words go in order and the keeper's
+answers come back in that order, with the hints it owes the link between them (CV9). The words are
+Hex's (`hex_api::capacity::{ToKeeper, ToHolder}`), and the order of a holder's words is Hex's holder
+core's, which kiln-ci's `place::holder` drives (docs/lb.md, "A machine's keeper").
+
+- **Implementations:** Hex's keeper on its node, reached over QUIC on its `CAPACITY_PORT` (kiln's
+  `capacity::Quic`, through `hex_quic`); `kiln_seams::capacity::SimCapacity`: Hex's own keeper over
+  records in memory (`hex_api::capacity::sim::SimView`) behind links in memory, its bounds its
+  keeper's (CV8): two links for each holder it serves (one, and the one replacing it), and on each
+  the answers to as many words as one holder may leave unheard (a reserve and two releases for each
+  reservation it may hold, and its hello and its sync), the hints between them coalesced; past
+  either, `Full`.
+- **Used by:** kiln's runner, where its configuration names its machine's keeper (`[capacity]`).
+- **Passed by:** the simulator, every clause, and the keeper it holds Hex's own keeper suite
+  (`hex_api::capacity::conformance`, HEX-CV-1 on); kiln's link to Hex's keeper over QUIC, on two
+  machines (owed).
+
+Methods: `link`.
+
+A link carries words both ways until it ends; dropped, it ends, and the keeper hears its holder is
+away, what that holds staying held (CV5).
+
+Methods of Link: `say`, `hear`.
+
+- **CAPACITY-1** a hello on a new link is welcomed under its epoch, with the machine's room and what is held there
+- **CAPACITY-2** a link's words are answered on it in the order said: a sync, a reserve and a release said together are synced, granted and released in turn
+- **CAPACITY-3** what a holder holds outlives its link: the next link is welcomed with it held, and its sync listing it is answered agreeing
+- **CAPACITY-4** a word under another link's session is closed Session, and the other link's session goes on
+- **CAPACITY-5** a reserve past the room is refused Room with the view, and one asking a GPU by count Devices
+- **CAPACITY-6** another holder's reserve owes a synced link a hint with the view as it is
+- **CAPACITY-7** a hello under an older epoch than its holder's newest is closed OlderEpoch, naming the newest
+
 ## HarnessPort
 
 kiln's agents as the code that drives them sees them: who they are, what their harness takes (its
