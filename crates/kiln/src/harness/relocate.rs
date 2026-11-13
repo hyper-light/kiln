@@ -85,6 +85,7 @@ pub async fn resume(hub: &Arc<Hub>, id: &str) -> Result<serde_json::Value, Strin
     }
     let Some(Location::Machine(machine)) = hub.harness.location(id) else { return Err("it runs on no machine".into()) };
     let resumed = start_one(hub, id, &machine, true, None, None).await?;
+    say(hub, id, &resumed_how(&info.kind)).await;
     let mut children = Vec::new();
     for c in all.iter().filter(|c| c.parent.as_deref() == Some(id) && c.status == super::model::Status::Crashed) {
         match start_one(hub, &c.id, &machine, true, None, None).await {
@@ -93,6 +94,19 @@ pub async fn resume(hub: &Arc<Hub>, id: &str) -> Result<serde_json::Value, Strin
         }
     }
     Ok(serde_json::json!({ "resumed": resumed, "subagents": children }))
+}
+
+/// What a crashed session of harness `kind` is resumed as, in its timeline: in its own conversation
+/// where its harness keeps one kiln can continue, else said plainly that it's given it in words.
+fn resumed_how(kind: &str) -> String {
+    use super::kinds::{Kind, Protocol};
+    let named = Kind::get(kind).map_or(kind, |k| k.name);
+    match Kind::get(kind).map(|k| k.protocol) {
+        Some(Protocol::ClaudeStreamJson) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own conversation."),
+        Some(Protocol::CodexAppServer) => format!("It crashed and is resumed in place: a fresh {named} process going on in a thread made of its conversation."),
+        Some(Protocol::Terminal) | None => format!("It crashed and can't be resumed in its own conversation: {named} keeps none kiln can continue."),
+        Some(_) => format!("It crashed and is resumed in place: {named} keeps no conversation kiln can continue, so a fresh process is given it in words."),
+    }
 }
 
 /// [`start`], for session `id` alone.
@@ -325,5 +339,24 @@ mod tests {
         assert_eq!(homed("/tmp", Some("/tmp")), "~");
         assert_eq!(homed("/srv/app", Some("/home/kiln")), "/srv/app");
         assert_eq!(homed("/srv/app", None), "/srv/app");
+    }
+
+    /// Ada, 2026-11-12: a crashed session of every harness kiln supports says how it's resumed in
+    /// place: in its own conversation where its harness keeps one kiln continues (Claude Code), a
+    /// thread of it (Codex), else plainly that it's given it in words, never pretending.
+    #[test]
+    fn resume_in_place_says_how_every_harness_goes_on() {
+        use super::super::kinds::{Kind, Protocol};
+        for k in Kind::all() {
+            let said = resumed_how(k.id);
+            assert!(said.contains(k.name), "{}: {said}", k.id);
+            match k.protocol {
+                Protocol::ClaudeStreamJson => assert!(said.contains("its own conversation"), "{said}"),
+                Protocol::CodexAppServer => assert!(said.contains("a thread made of its conversation"), "{said}"),
+                Protocol::Terminal => assert!(said.contains("can't be resumed"), "{said}"),
+                _ => assert!(said.contains("in words"), "{}: {said}", k.id),
+            }
+        }
+        assert!(resumed_how("no-such-harness").contains("can't be resumed"));
     }
 }
