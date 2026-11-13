@@ -10,6 +10,12 @@ pub use crate::os::proc::{Detached, Duplex, Running, adopt_duplex, interrupt_gro
 /// and an upgrade's new kiln (`agent`'s `binary_runs`).
 pub const VERSION_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Most of a harness's stdout chunks its [`Duplex`] holds unread, and of its stderr's: the bounds
+/// its session's loop reads against, the same for a process of this machine's (`os::proc`) and for
+/// a run its boundary holds (`crate::sandbox::held`).
+pub const STDOUT_CHUNKS: usize = 256;
+pub const STDERR_CHUNKS: usize = 64;
+
 /// [`spawn_duplex_in`] on the blocking pool, never on a shard: joining a group can wait. A group
 /// headroom paces is frozen for part of each period, and so is a process that joins it between
 /// fork and exec, while `spawn` waits for that exec. On a shard the wait stops everything else the

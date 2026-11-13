@@ -1370,6 +1370,27 @@ mod tests {
         })
     }
 
+    /// Step 17: a runner that says why it holds no isolated agent (its facts' `isolation.why_not`) is
+    /// refused in its own words; one from before those facts, in kiln's.
+    #[test]
+    fn s17_an_isolated_agent_refused_on_a_runner_says_the_runners_own_reason() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let why = "this runner has no hypervisor it can use";
+            let said = |name: &str, isolation: Option<kiln_ci::facts::Isolation>| crate::hub::AgentLive {
+                facts: Some(Box::new(kiln_ci::facts::RunnerFacts { isolation, ..Default::default() })),
+                ..crate::hub::tests::live_runner(name, "linux", "x86_64")
+            };
+            hub.put_agent(said("no-hypervisor", Some(kiln_ci::facts::Isolation { available: false, hypervisor: None, why_not: Some(why.to_owned()) })));
+            hub.put_agent(said("older", None));
+            let refused = isolation_on(&hub, "agent:no-hypervisor").err().unwrap_or_default();
+            anyhow::ensure!(refused.ends_with(why), "the runner's own reason: {refused}");
+            let older = isolation_on(&hub, "agent:older").err().unwrap_or_default();
+            anyhow::ensure!(older.contains("once it carries their runtime"), "kiln's reason: {older}");
+            Ok(())
+        })
+    }
+
     /// How far `caller` reached `id` before goal 10 (plan 01a1a87b2dae step 2) gave the callers who
     /// see every session their answer without asking the store: what `access` must still answer.
     async fn access_before(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Access {

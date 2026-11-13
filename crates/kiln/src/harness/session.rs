@@ -3262,10 +3262,20 @@ struct Move {
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
-/// `now`: the turn under way isn't waited for (the caller interrupts it).
+/// `now`: the turn under way isn't waited for (the caller interrupts it). None: an isolated agent
+/// doesn't go to another machine (its microVM and what its harness keeps there are this one's, kiln
+/// plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), refused before anything of it stops, saying so.
 #[allow(clippy::too_many_arguments)]
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool) -> Move {
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool) -> Option<Move> {
+    // Its spec before its core: never the one lock inside the other.
+    let isolated = s.spec.lock().isolation.is_some();
     let mut core = s.core.lock();
+    if isolated && !local {
+        let text = format!("Couldn't move to {to}: {} — it goes on here", crate::sandbox::isolated::NO_MOVE);
+        core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text });
+        core.touch_state();
+        return None;
+    }
     core.hold = true;
     let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
     let picks_up = now && busy;
@@ -3281,7 +3291,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     };
     core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
     core.touch_state();
-    Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local }
+    Some(Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local })
 }
 
 /// A person pauses it, or resumes it (`Command::Pause` without a task): its processes held stopped by
@@ -3810,11 +3820,6 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
     let reach = crate::reach::node::global().ok_or_else(|| "this runner can't reach other runners (an older one?)".to_owned())?;
     let me = reach.name().to_owned();
     let mut spec = s.resume_spec();
-    // Its microVM and what its harness keeps there are this machine's: refused, never carried to run
-    // elsewhere as something else (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17).
-    if spec.isolation.is_some() {
-        return Err(crate::sandbox::isolated::NO_MOVE.to_owned());
-    }
     // Going on there in another harness: its timeline says so (there too, as it travels with it).
     if let Some(to) = mv.kind {
         if !(kind.switchable() && to.switchable()) {
@@ -4478,12 +4483,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 }
                             }
                             Command::MoveTo { to, cwd, note, now, kind: into, model, local } => {
-                                let mv = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local);
-                                // Not waiting for the turn: it stops here, and goes on there.
-                                if mv.picks_up {
-                                    adapter.command(&mut s.core.lock(), Command::Interrupt);
+                                if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local) {
+                                    // Not waiting for the turn: it stops here, and goes on there.
+                                    if mv.picks_up {
+                                        adapter.command(&mut s.core.lock(), Command::Interrupt);
+                                    }
+                                    moving = Some(mv);
                                 }
-                                moving = Some(mv);
                             }
                             Command::Moving { text } => moving_note(&s, &text),
                             // What it left running that kiln took back over: kiln stops it.
@@ -5015,8 +5021,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     // Another runner: it goes there, now.
                     Command::MoveTo { to, cwd, note, now, kind: into, model, local } => {
-                        moving = Some(move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local));
-                        break;
+                        if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local) {
+                            moving = Some(mv);
+                            break;
+                        }
                     }
                     Command::Moving { text } => moving_note(&s, &text),
                     Command::StopTask { task } if task.starts_with(crate::reach::owned::PREFIX) => {

@@ -180,3 +180,17 @@ async fn read(rx: &crate::memory::queue::Receiver<Vec<u8>>, open: bool) -> Optio
     }
     rx.recv().await.ok()
 }
+
+#[cfg(test)]
+mod tests {
+    /// Step 17: a machine whose kiln carries no microVM runtime says so in its facts, and why (one
+    /// answer, which `virt.microvm` says too); its hypervisor is the one the runner found.
+    #[test]
+    fn s17_a_machine_without_microvms_says_why_in_its_facts() {
+        let with_kvm = super::facts(true);
+        assert!(!with_kvm.available);
+        assert_eq!(with_kvm.why_not.as_deref(), Some(super::NO_MICROVM));
+        assert_eq!(with_kvm.hypervisor.as_deref(), cfg!(target_os = "linux").then_some("KVM"));
+        assert_eq!(super::facts(false).hypervisor, None);
+    }
+}

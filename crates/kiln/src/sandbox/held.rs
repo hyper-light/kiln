@@ -16,11 +16,6 @@ use std::time::Duration;
 use futures::channel::oneshot;
 use kiln_seams::sandbox::{Exit, Output, Refusal, Run, Signal};
 
-/// Most of a run's stdout chunks waiting to be read, and of its stderr's: a host process's pipes'
-/// (`os::proc`'s readers' channels), whose bounds the session's loop was measured against.
-const STDOUT_PLACES: usize = 256;
-const STDERR_PLACES: usize = 64;
-
 /// A boundary's run, and whether its end has come.
 pub struct Held {
     run: Arc<dyn Run>,
@@ -42,8 +37,9 @@ pub struct Parts {
 pub fn pump(run: Box<dyn Run>) -> Parts {
     let held = Arc::new(Held { run: Arc::from(run), ended: AtomicBool::new(false), changed: crate::rt::Changed::new() });
     let (in_tx, in_rx) = crate::memory::queue::unbounded::<Vec<u8>>(&crate::memory::owners::CHANNELS);
-    let (out_tx, stdout) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, STDOUT_PLACES);
-    let (err_tx, stderr) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, STDERR_PLACES);
+    // A process's pipes' bounds, so its session's loop reads it as it reads a process.
+    let (out_tx, stdout) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, crate::proc::STDOUT_CHUNKS);
+    let (err_tx, stderr) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, crate::proc::STDERR_CHUNKS);
     let (exit_tx, exit) = oneshot::channel();
     let writer = Arc::clone(&held);
     drop(crate::rt::spawn(async move {
@@ -135,8 +131,8 @@ mod tests {
     use super::*;
     use kiln_seams::sandbox::{Holds, Launch, Sandbox as _, SimSandbox};
 
-    fn launched(s: &SimSandbox, program: &str) -> anyhow::Result<Parts> {
-        let run = crate::rt::block_on(s.launch(Launch::of(program, &[]))).map_err(anyhow::Error::msg)?;
+    async fn launched(s: &SimSandbox, program: &str) -> anyhow::Result<Parts> {
+        let run = s.launch(Launch::of(program, &[])).await.map_err(anyhow::Error::msg)?;
         Ok(pump(run))
     }
 
@@ -145,7 +141,7 @@ mod tests {
     #[test]
     fn s17_a_held_run_takes_its_input_in_order_and_ends_at_its_end() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let p = launched(&SimSandbox::new(), "echo")?;
+            let p = launched(&SimSandbox::new(), "echo").await?;
             for line in ["one\n", "two\n", "three\n"] {
                 p.stdin.send(line.as_bytes().to_vec()).await.map_err(|_| anyhow::anyhow!("its stdin closed"))?;
             }
@@ -166,18 +162,34 @@ mod tests {
     #[test]
     fn s17_terminate_signals_where_it_can_else_ends_its_input_then_kills() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let signalled = launched(&SimSandbox::new(), "wait")?;
+            let signalled = launched(&SimSandbox::new(), "wait").await?;
             signalled.held.terminate(Duration::from_secs(30));
             assert_eq!(crate::rt::timeout(Duration::from_secs(10), signalled.exit).await?.ok().flatten(), Some(Signal::Terminate.ended_code()));
             // An echo ends at its input's end: unsignalled, terminate ends it so, before its grace.
             let unsignalled = SimSandbox::holding(Holds { signals: false, ..Holds::ALL });
-            let echo = launched(&unsignalled, "echo")?;
+            let echo = launched(&unsignalled, "echo").await?;
             echo.held.terminate(Duration::from_secs(30));
             assert_eq!(crate::rt::timeout(Duration::from_secs(10), echo.exit).await?.ok().flatten(), Some(0), "its input's end ended it");
             // One that ignores its input's end is killed once its grace is over: no code.
-            let deaf = launched(&unsignalled, "wait")?;
+            let deaf = launched(&unsignalled, "wait").await?;
             deaf.held.terminate(Duration::from_millis(50));
             assert_eq!(crate::rt::timeout(Duration::from_secs(10), deaf.exit).await?.ok().flatten(), None, "killed past its grace");
+            Ok(())
+        })
+    }
+
+    /// Step 17: a held run is a `Duplex` its session drives as a process's, but none of this
+    /// machine's: no pid, nothing to hand to the next image across an upgrade, and its stop its
+    /// boundary's (a signal to end, where its boundary delivers one).
+    #[test]
+    fn s17_a_held_duplex_is_no_process_hands_nothing_over_and_stops_through_its_boundary() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let run = SimSandbox::new().launch(Launch::of("wait", &[])).await.map_err(anyhow::Error::msg)?;
+            let mut p = crate::proc::duplex_of_run(run);
+            assert_eq!(p.host_pid(), None);
+            assert!(p.detach().await.is_none(), "nothing of it is this process's to hand over");
+            p.terminate(Duration::from_secs(30));
+            assert_eq!(crate::rt::timeout(Duration::from_secs(10), &mut p.exit).await?.ok().flatten(), Some(Signal::Terminate.ended_code()));
             Ok(())
         })
     }

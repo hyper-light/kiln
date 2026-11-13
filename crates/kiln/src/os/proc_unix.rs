@@ -676,8 +676,8 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
         });
         rx
     };
-    let stdout = reader(out, 256);
-    let stderr = reader(err, 64);
+    let stdout = reader(out, crate::proc::STDOUT_CHUNKS);
+    let stderr = reader(err, crate::proc::STDERR_CHUNKS);
     drop(reading_tx);
     let (in_tx, in_rx) = crate::memory::queue::unbounded::<Vec<u8>>(&crate::memory::owners::CHANNELS);
     let (written_tx, written_rx) = oneshot::channel();

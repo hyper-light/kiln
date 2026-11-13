@@ -4995,8 +4995,9 @@ while True:
     /// `crate::sandbox::fake`), no process of the machine's, and its session drives it as on the
     /// host through the same adapter: it starts, takes a message and answers, is interrupted (the
     /// adapter's control request reaches the member), is stopped by force and starts again on the
-    /// same conversation (resumed through the launch's arguments past its image's command), and
-    /// ends with nothing of it left running.
+    /// same conversation (resumed through the launch's arguments past its image's command), is
+    /// refused a switch to another harness and a move to another machine (each said, its member
+    /// going on, launched no more), and ends with nothing of it left running.
     #[cfg(unix)]
     #[test]
     fn s17_an_isolated_agent_runs_in_its_microvm_and_is_driven_as_on_the_host() -> anyhow::Result<()> {
@@ -5035,9 +5036,22 @@ while True:
             let conversation_id = conversation.clone().unwrap_or_default();
             assert!(resumed.args.windows(2).any(|w| w == ["--resume", conversation_id.as_str()]), "resumed through its launch's arguments: {:?}", resumed.args);
             until_it("it back", 60, idle).await?;
+            let answers = || s.core.lock().events().filter(|e| matches!(e.body, super::super::model::Body::Assistant { .. })).count();
             assert!(host.command("isolated", message("m2", "and again")));
-            until_it("m2's turn, over", 60, || idle() && s.core.lock().events().filter(|e| matches!(e.body, super::super::model::Body::Assistant { .. })).count() >= 2).await?;
+            until_it("m2's turn, over", 60, || idle() && answers() >= 2).await?;
             assert_eq!(s.core.lock().state.harness_session, conversation, "the same conversation");
+            // Neither switched to another harness nor moved to another machine: each refused before
+            // anything of it stops, saying why, and its member goes on, launched no more.
+            let launches = vms.launched().len();
+            let said = |words: &str| s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains(words)));
+            assert!(host.command("isolated", Command::SetModel { model: "gpt-5.5".into(), kind: Some("codex".into()) }));
+            until_it("its switch refused", 60, || said(crate::sandbox::isolated::NO_SWITCH)).await?;
+            assert!(host.command("isolated", Command::MoveTo { to: "elsewhere".into(), cwd: cwd.clone(), note: None, now: true, kind: None, model: None, local: false }));
+            until_it("its move refused", 60, || said(crate::sandbox::isolated::NO_MOVE)).await?;
+            assert!(host.command("isolated", message("m3", "still here")));
+            until_it("m3's turn, over", 60, || idle() && answers() >= 3).await?;
+            assert_eq!(vms.launched().len(), launches, "its member went on: nothing was launched again");
+            assert!(!s.core.lock().hold, "nothing waits on a move or a switch");
             // Ended: nothing of it runs on afterwards.
             let members: std::collections::HashSet<u32> = heard_lines().iter().filter_map(|w| w.get("pid").and_then(serde_json::Value::as_u64)).filter_map(|p| u32::try_from(p).ok()).collect();
             assert!(members.len() >= 2, "two runs of its member read what it was sent: {members:?}");

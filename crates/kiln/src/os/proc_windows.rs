@@ -662,8 +662,8 @@ fn serve(pid: u32, stdin: Option<File>, stdout: Option<File>, stderr: Option<Fil
         stderr.as_ref().map_or(0, |f| handle_to_i64(f.as_raw_handle())),
     ];
     let stopped = Arc::new(AtomicBool::new(false));
-    let (out_tx, stdout_rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, 256);
-    let (err_tx, stderr_rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, 64);
+    let (out_tx, stdout_rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, crate::proc::STDOUT_CHUNKS);
+    let (err_tx, stderr_rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, crate::proc::STDERR_CHUNKS);
     let mut readers = Vec::new();
     if let Some(p) = stdout {
         readers.push(pump_handed("kiln-harness-out", p, Arc::clone(&stopped), move |c| out_tx.send_blocking(c.to_vec()).is_ok())?);
