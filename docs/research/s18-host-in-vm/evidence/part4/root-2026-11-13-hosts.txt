@@ -1,0 +1,7 @@
+ROOT's item for goal 61 on the built-ins' provider hosts, 2026-11-13, verbatim.
+
+[1] As ROOT sent it to goal 61's agent (a70dd91d73879f8a5), ~05:2xZ:
+One item that falls in your owned paths (.kiln/images/harness-*/ grants): networks are default deny, so each built-in harness Agentfile must name exactly the provider hosts its harness reaches, and nothing else. Step 16 made that possible: Shards' D236 destinations by name, checked in-process. Today no built-in names them, so in a microVM no harness reaches its provider. For each of the ten, grant only the hosts its vendor documents, citing the vendor's docs in the harness record. Check each with the in-process Agentfile check's unit tests, on one Mac. If it's more than a slice, plan it as its own step of goal 61.
+
+[2] As ROOT restated it in the goal agent's brief:
+Added by ROOT: each of the ten built-in harness Agentfiles names exactly the provider hosts its vendor documents (default deny, D236 destinations by name), cited in the harness record and checked by the in-process Agentfile check's unit tests. If it's big, plan it as its own step.

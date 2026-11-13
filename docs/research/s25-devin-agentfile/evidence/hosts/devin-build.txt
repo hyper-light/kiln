@@ -1,0 +1,14 @@
+== devin: https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-x86_64-unknown-linux.tar.gz
+   archive sha256 6a19997b5fc2d6ba1a8c341d4e2b12f1b78cad5d415ee9c0ca413a8d52a99562 (pin.json's, matched on download); file bin/devin, sha256 1e5e27535f2e7ee19d4bfbec95096361e539aeec5f2a5a9cbacdfb89bf050ad9
+## https://server.codeium.com: 1 occurrence(s); first 1:
+   @149722830: 3x......unexpected end of stream with incomplete envelopeHTTP body stream error while reading Connect responsehttps://server.codeium.comWINDSURF_API_SERVER_URLtracing::span::activecalled `Result::unwrap()` on an `Err` valueassertion failed: self.
+## https://unleash.codeium.com/api/: 1 occurrence(s); first 1:
+   @141299840: story failed: using build-default ZDR fallbackfailed to fetch release manifestWhat domain do you use Devin on?https://unleash.codeium.com/api/Failed to serialize hooks configfailed to wait on remote processnew eventrejected peer requestError sending re
+## WINDSURF_API_SERVER_URL: 3 occurrence(s); first 1:
+   @141290474: embership: ...Logged in (via ..)....  File:              .....  API server:        ..  (overridden from .. by WINDSURF_API_SERVER_URL)...  API server:        .....  Devin webapp:      https://.....  Devin API:         .....  Credentials path: 
+
+== devin: https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-x86_64-unknown-linux.tar.gz
+   archive sha256 6a19997b5fc2d6ba1a8c341d4e2b12f1b78cad5d415ee9c0ca413a8d52a99562 (pin.json's, matched on download); file share/devin/docs/reference/partner-builds.mdx, sha256 d8ab680927c48373b837da253985f7634c97879319bb3dce44cd81f98ed0ea36
+## The API key is only sent to `api.devin.ai`: 1 occurrence(s); first 1:
+   @3126: orization = "Bearer $env:DEVIN_API_KEY"; "x-cog-org-id" = $env:DEVIN_ORG_ID } | iex.    ```.  </Tab>.</Tabs>..The API key is only sent to `api.devin.ai`. The installer:..1. Detects your platform (macOS/Linux/Windows, x86_64/arm64).2. Fetches the release manifest
+

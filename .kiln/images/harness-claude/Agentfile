@@ -27,13 +27,16 @@ HARNESS claude FROM ./claude-${TARGETARCH}-${CLAUDE_LIBC}
 # harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
 # name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
 # resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
-# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
-# docs/research/s18-host-in-vm says where each host comes from).
-# - api.anthropic.com, claude.ai and platform.claude.com: Claude Code's API, and the sign-in and
-#   token refresh of claude.ai and Console accounts (code.claude.com/docs/en/network-config, "Network
-#   access requirements"). The rest of that list is a page a sign-in opens in the person's browser,
-#   a feature kiln doesn't drive (claude.ai's connectors, plugins' downloads, Chrome, artifacts), an
-#   update (off: DISABLE_UPDATES) or telemetry, and goes nowhere.
+# port or protocol goes out. 443 is HTTPS's port (RFC 9110 4.2.2). Each host is cited to its vendor's own
+# documentation, or, where that names a wildcard or nothing, to the vendor's own source or build, in its
+# harness's record's "Hosts by name" (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18, part 4):
+# docs/research/s19-claude-agentfile/README.md, from Anthropic's network docs (code.claude.com/docs/en/network-config.md,
+# "Network access requirements"):
+# - api.anthropic.com: Claude Code's API.
+# - claude.ai: a claude.ai account's sign-in.
+# - platform.claude.com: a Console account's sign-in, and a claude.ai sign-in's token exchange, refresh and revocation.
+# The rest of that list is a page a sign-in opens in the person's browser, a feature kiln doesn't drive (claude.ai's
+# connectors, plugins' downloads, Chrome, artifacts), an update (off: DISABLE_UPDATES) or telemetry, and goes nowhere.
 # kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
 # kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
 NETWORK --egress=api.anthropic.com:443 --egress=claude.ai:443 --egress=platform.claude.com:443 provider FOR claude

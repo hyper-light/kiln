@@ -1,0 +1,38 @@
+Numbered excerpts of openai/codex at tag rust-v0.167.2 (the pinned Codex), fetched 2026-11-13 with curl -L. Each file's
+whole SHA-256 is given, so these lines can be checked against the tag's file.
+
+== https://raw.githubusercontent.com/openai/codex/rust-v0.167.2/codex-rs/cli/src/doctor.rs
+   sha256 b3c964ba4a9a6944eae11d7ea036c55e48d9be2d62e926af35ffec7e5906e372  164585 bytes  (lines naming: https://chatgpt.com/backend-api/codex/responses, https://api.openai.com/v1/responses, https://api.openai.com/v1")
+  2690          .or_else(|| {
+  2691              (mode == ProviderAuthReachabilityMode::ApiKey).then_some("https://api.openai.com/v1")
+  2692          })
+   ...
+  2700              url: provider_url_for_path(
+  2701                  provider_base_url.unwrap_or("https://api.openai.com/v1"),
+  2702                  "responses",
+   ...
+  2834                      .expected("GET /models returns 2xx, 401, or 403")
+  2835                      .remedy("Set base_url to the provider API root, for example https://api.openai.com/v1")
+  2836                      .field("route probe"),
+   ...
+  3941                  label: "openai API".to_string(),
+  3942                  url: "https://api.openai.com/v1/responses".to_string(),
+  3943                  required: true,
+   ...
+  3954                  label: "ChatGPT".to_string(),
+  3955                  url: "https://chatgpt.com/backend-api/codex/responses".to_string(),
+  3956                  required: true,
+   ...
+  4016              check.issues[0].remedy.as_deref(),
+  4017              Some("Set base_url to the provider API root, for example https://api.openai.com/v1")
+  4018          );
+
+== https://raw.githubusercontent.com/openai/codex/rust-v0.167.2/codex-rs/login/src/server.rs
+   sha256 2f66d1c033e3918bc8bfda0cdad047c4553c10ec6a33ef8f80a7f9d6c2b47c10  42009 bytes  (lines naming: DEFAULT_ISSUER: &str)
+    78  pub(super) const DEFAULT_ISSUER: &str = "https://auth.openai.com";
+
+== https://raw.githubusercontent.com/openai/codex/rust-v0.167.2/codex-rs/login/src/auth/manager.rs
+   sha256 584348a470e6d7f147962bf5d642d23859f60a85772aac1e916032d414756a90  142895 bytes  (lines naming: REFRESH_TOKEN_URL: &str, REVOKE_TOKEN_URL: &str)
+   230  const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+   231  pub(super) const REVOKE_TOKEN_URL: &str = "https://auth.openai.com/oauth/revoke";
+

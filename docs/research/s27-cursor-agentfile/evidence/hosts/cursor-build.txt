@@ -1,0 +1,16 @@
+== cursor: https://downloads.cursor.com/lab/2026.11.11-b912975/linux/x64/agent-cli-package.tar.gz
+   archive sha256 be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91 (pin.json's, matched on download); file dist-package/5006.index.js, sha256 cf811c4520453d7226087d38f9416f1004b307ea68e80733fdec394dc7f49cc1
+## api2direct.cursor.sh: 1 occurrence(s); first 1:
+   @44549: acePath:ue,loadSessionMcpServers:Ae});const We=r.includes("api2.cursor.sh"),je=We?r.replace("api2.cursor.sh","api2direct.cursor.sh"):r,Be=We?"api2.cursor.sh":void 0,Qe=!0===P,Ze=await(0,te.n)(),et=await(0,oe.ib)({name:A,workingDirectory:ue,
+
+== cursor: https://downloads.cursor.com/lab/2026.11.11-b912975/linux/x64/agent-cli-package.tar.gz
+   archive sha256 be01f42ad334f81d05a9992fcf060a52cc746f52cc451e849eb652146a6e3c91 (pin.json's, matched on download); file dist-package/index.js, sha256 b5864666017cb0ff29ea7885a9ab408eec36535dadeaa8dcf44d150b46d63401
+## /auth/poll: 2 occurrence(s); first 1:
+   @3308979: async function({uuid:t,verifier:e,apiBaseUrl:r=E(),signal:n,onGiveUp:s,fetch:i=C,parseResult:o}){const a=`${r}/auth/poll`,c=1e3,u=1e4,d=await _();let m,p,f=0,h=0;const g=Date.now(),y=e=>{try{s?.({uuid:t,elapsedMs:Math.max(0,Date.n
+## /auth/exchange_user_api_key: 1 occurrence(s); first 1:
+   @3310408: ??C;try{const e=(0,s.XX)({"Content-Type":"application/json",Authorization:`Bearer ${t}`,...n}),a=await i(`${r}/auth/exchange_user_api_key`,{method:"POST",headers:e,body:JSON.stringify({})});if(403===a.status){if(I(await a.json().catch((()=>{}))))t
+## https://repo42.cursor.sh: 1 occurrence(s); first 1:
+   @1616889: wait ut)():ut,(0,st.O)(),(0,nt.e)(),(0,D.K)({shouldIgnoreSignal:()=>(0,O.y1)()});const dt=["text","json"],mt="https://repo42.cursor.sh";function pt(t){return"string"==typeof t&&t!==mt?[t]:[]}function ft(){const t=process.argv.slice(2);for(const
+## agentnUrl: 4 occurrence(s); first 1:
+   @2208422: es("lclhst.build")||t.includes("staging.cursor.sh")||t.includes("dev-staging.cursor.sh")||n?t:r?.agentUrl&&r?.agentnUrl?e?r.agentUrl:r.agentnUrl:t}},"./src/utils/suppress-max-listeners-warning.ts"(t,e,r){"use strict";r.d(e,{O:()=
+

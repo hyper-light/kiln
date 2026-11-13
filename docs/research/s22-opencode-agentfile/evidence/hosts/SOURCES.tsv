@@ -1,0 +1,9 @@
+file	url (fetched 2026-11-13 with curl -L)	sha256
+providers.md	https://opencode.ai/docs/providers.md	b3b18400a1f4f320785fac00adc41dfb03469ac1ab92ac361f08945f17c3ab29
+network.md	https://opencode.ai/docs/network.md	3d83e9802831cea6b2456a61db2b020b90493688886c517f5dca40d4478c9730
+models.md	https://opencode.ai/docs/models.md	533ec23167b445fec082f5e24d7621d9977d01f0eabc35dc37868797c642bd17
+cli-providers.md	https://opencode.ai/docs/cli/providers.md	e8dd9e28796d78f03381c89c4dbf28a6a12863064781b77dbd93c32163a8b8f6
+hosts.tsv	kiln's table: each host, its provider ids, opencode's catalog or source at v2.2.7 (URL, SHA-256) and its provider's own page (URL, fetch date, SHA-256, quote)	7d6060dfed9dc5905083dac650aee7e3691cd30cfa0b496d2edc987b49c20229
+opencode-source-excerpts.txt	kiln's numbered excerpt of opencode's source at v2.2.7: each file's URL and whole SHA-256 are inside	7c99f41b7060369c61df458d9e26990dfba1562e5d77d14605f1da560f213a92
+opencode-catalog-rule.txt	kiln's record (sources and hashes inside)	d64bd6b99264e480326ee90b6cae951e6da047532e309b67fbc9c0e6664952c3
+ripgrep-redirect.txt	kiln's record (sources and hashes inside)	518f272891bf5aae8d1c86d589ee674f5e6fa263d4fe17047c08055384b20d91

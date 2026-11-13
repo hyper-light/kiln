@@ -199,3 +199,73 @@ tests, and nothing of opencode's changed; ROOT owns Windows clippy on the landed
 
 **Owed, ROOT's:** image builds for both platforms in each libc, and the version smoke (`--version`
 alone) in a microVM on each arch.
+
+## Hosts by name
+
+Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18, part 4 (plan 01a1d2bd5014705d918ad1f2ce1154f2, step 4).
+`.kiln/images/harness-opencode/Agentfile` grants 218 hosts by name (Shards D236), on TCP 443, HTTPS's port (RFC 9110
+§4.2.2), and nothing else.
+
+**The rule** is ROOT's call of 2026-11-13, made on the person's bar of zero breaks against today
+(`docs/research/s18-host-in-vm/evidence/part4/root-2026-11-13-providers.txt`). The image names every provider that
+opencode's pinned build reaches at a fixed public host. Each host is cited to that provider's own API docs and to
+opencode's own source. A host neither backs is dropped. Each run is narrowed at launch to the provider it's
+configured for; that narrowing is the launch's (goal 60, plan step 17). The plan had said "each provider their docs
+list". ROOT's call replaces that, because opencode's docs (`evidence/hosts/providers.md`, `models.md`) list
+providers only as "a provider and model catalog from models.dev".
+
+**Where its providers come from.** opencode 2.2.7 doesn't read models.dev. It reads the opencode team's own catalog
+from `models.opencode.ai`: `packages/core/src/models-dev.ts`'s `defaultSource` and `catalogPath`, a snapshot bundled
+in the build and refreshed live. It drives each catalog provider through its own `@opencode/ai` packages, at the
+catalog's `base_url`. So the 207 catalog hosts are those of every chat, decision and image model's API whose package
+the build ships, at an https address with a fixed public name. That rule and its sources are in
+`evidence/hosts/opencode-catalog-rule.txt`, and `docs/research/s18-host-in-vm/evidence/part4/scripts/oc_hosts.py`
+makes the list from the catalog as fetched on 2026-11-13 (its SHA-256 is in `hosts.tsv`).
+
+**Each host's citations** are in `evidence/hosts/hosts.tsv`, one row per host and source: its provider ids, what it's
+for, the harness source (the catalog's entry, or opencode's file at tag v2.2.7, each with its SHA-256; numbered lines
+in `opencode-source-excerpts.txt`), and its provider's own page (URL, fetch date, the page's SHA-256 and the words
+naming the host). 128 hosts are named on their provider's own page. One, `api.githubcopilot.com`, falls under
+GitHub's documented wildcard `*.githubcopilot.com`. For 89, no page of the provider's own docs that kiln could
+fetch names the host, so those rest on opencode's catalog alone, as said in each row. Provider pages are cited by
+quote and hash rather than saved whole: they're the providers' documents, not opencode's, and together run to about
+27 MB, mostly HTML. opencode's own pages are saved whole in `evidence/hosts/` (`SOURCES.tsv`).
+
+Hosts that aren't the catalog's, all from opencode's source at v2.2.7:
+
+| Host | Provider ids | For | Provider's own page | Harness source |
+|---|---|---|---|---|
+| `api.cloudflare.com` | cloudflare-workers-ai | Cloudflare Workers AI (its account is in the path) | names it: https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/ | `packages/ai/src/providers/cloudflare-shared.ts` |
+| `api.digitalocean.com` | digitalocean | DigitalOcean's model routers, after its sign-in | none found: the harness's source alone | `packages/core/src/plugin/provider/digitalocean.ts` |
+| `api.github.com` | github-copilot | GitHub Copilot entitlement (copilot_internal/user) | names it: https://docs.github.com/en/copilot/reference/copilot-allowlist-reference.md | `packages/core/src/plugin/provider/github-copilot.ts` |
+| `api.poe.com` | poe | Poe sign-in's token exchange | names it: https://creator.poe.com/docs/external-applications/openai-compatible-api | `packages/core/src/plugin/provider/poe.ts` |
+| `auth.openai.com` | openai | ChatGPT sign-in and its token refresh | names it: https://learn.chatgpt.com/docs/app-server.md | `packages/core/src/plugin/provider/chatgpt.ts`, `packages/core/src/plugin/provider/openai.ts` |
+| `auth.x.ai` | xai | xAI sign-in | none found: the harness's source alone | `packages/core/src/plugin/provider/xai.ts` |
+| `chatgpt.com` | openai | ChatGPT's Codex backend (backend-api/codex) for a ChatGPT sign-in | names it: https://learn.chatgpt.com/docs/enterprise/connect-to-a-gateway.md | `packages/core/src/plugin/provider/openai.ts` |
+| `gateway.ai.cloudflare.com` | cloudflare-ai-gateway | Cloudflare AI Gateway (its account and gateway are in the path) | names it: https://developers.cloudflare.com/ai-gateway/get-started/ | `packages/ai/src/providers/cloudflare-ai-gateway.ts` |
+| `github.com` | every-provider(ripgrep) github-copilot | GitHub Copilot device sign-in (login/device/code, login/oauth/access_token); ripgrep 15.1.0's release download, where its base has no rg | names it: https://docs.github.com/en/copilot/reference/copilot-allowlist-reference.md | `packages/core/src/plugin/provider/github-copilot.ts`, `packages/core/src/ripgrep/binary.ts` |
+| `gitlab.com` | gitlab | GitLab sign-in, its token refresh and GitLab's API | names it: https://docs.gitlab.com/api/oauth2/ | `packages/core/src/plugin/provider/gitlab.ts` |
+| `models.opencode.ai` | every-provider(catalog) | opencode's model catalog (its default source, refreshed live) | none found: the harness's source alone | `packages/core/src/models-dev.ts` |
+| `release-assets.githubusercontent.com` | every-provider(ripgrep) | where github.com sends ripgrep's release download (302, observed 2026-11-13) | names it: https://api.github.com/meta | `packages/core/src/ripgrep/binary.ts` |
+
+Not granted:
+- **Azure, Amazon Bedrock and Google Vertex AI:** their host follows the person's resource or region (ROOT's call).
+- **Local runtimes** (Ollama, LM Studio, vLLM).
+- **A custom provider or a `baseURL` override:** the person gives that host.
+- **npm** (`registry.npmjs.org`): for a provider package or plugin the build doesn't ship.
+
+Each of those needs an Agentfile of the person's own.
+
+**Changed from part 2** (32 hosts):
+- `models.dev` is dropped: this build doesn't fetch it. `models.opencode.ai` replaces it.
+- `api.typesafe.ai` is dropped: no catalog provider routes there. The build's `typesafe-ai` package serves other
+  providers' decision models at those providers' own hosts.
+- Added: every other catalog provider's host, Cloudflare's two hosts, and `api.digitalocean.com` and `auth.x.ai` for
+  their sign-ins.
+
+**A known limit:** a provider the live catalog adds after 2026-11-13 is unreachable from this image until its list is
+remade (`oc_hosts.py`).
+
+**Which provider a run uses** is for the launch (goal 60) to narrow to. opencode documents it as the config's `model`,
+`provider/model` (`evidence/hosts/models.md`, "Defaults"), or a session's own pick, among the providers the person
+has connected (`opencode auth list`, `evidence/hosts/cli-providers.md`).

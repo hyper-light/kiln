@@ -3,33 +3,108 @@
 //! nothing for kiln's MCP, which rides the link kiln drives its harness by (that link's own `mcp` lane,
 //! Shards D254), never the network; its project plugged in at its host path (Shards D235), so no
 //! volume holds it; and its HOME the person's volume, whole, `/home/<harness>`. Every harness's own
-//! tests pin these lines from here. Where each host comes from is docs/research/s18-host-in-vm.
+//! tests pin these lines from here. Each host is cited, to its vendor's own documentation or, where that names a
+//! wildcard or nothing, to the vendor's own source or build, in its harness's record's "Hosts by name"
+//! (docs/research/s19-claude-agentfile to s28-pi-agentfile; step 18's part 4).
 
 use super::ALL;
 
 /// Each built-in's harness and the hosts it reaches by name, as its NETWORK line names them (sorted, once
-/// each), and nothing else ([`destinations`]).
+/// each), and nothing else ([`destinations`]): each list its harness's record's, which the comment above it names.
 const HOSTS: &[(&str, &[&str])] = &[
-    // code.claude.com/docs/en/network-config, "Network access requirements".
+    // docs/research/s19-claude-agentfile, "Hosts by name": Anthropic's network docs.
     ("claude", &["api.anthropic.com:443", "claude.ai:443", "platform.claude.com:443"]),
-    // codex-rs rust-v0.167.2: cli/src/doctor.rs, login/src/server.rs, login/src/auth/manager.rs.
+    // docs/research/s20-codex-agentfile, "Hosts by name": OpenAI's pages and codex-rs rust-v0.167.2 (its docs list no hosts).
     ("codex", &["api.openai.com:443", "auth.openai.com:443", "chatgpt.com:443"]),
-    // gemini-cli v0.68.0 (code_assist/server.ts, oauth2.ts), @google/genai 1.30.0, google-auth-library 10.9.0.
+    // docs/research/s21-gemini-agentfile, "Hosts by name": Google's docs and gemini-cli v0.68.0's own sources.
     ("gemini", &["cloudcode-pa.googleapis.com:443", "generativelanguage.googleapis.com:443", "oauth2.googleapis.com:443", "www.googleapis.com:443"]),
-    // step 26's probes (its model service), agy 1.5.7's own build (Google's token endpoint).
-    ("antigravity", &["cloudcode-pa.googleapis.com:443", "oauth2.googleapis.com:443"]),
-    // cursor.com/docs/enterprise/network-configuration, and the CLI 2026.11.11-b912975's own code.
-    ("cursor", &["agent.api5.cursor.sh:443", "agent.global.api5.cursor.sh:443", "agent.us.api5.cursor.sh:443", "agentn.api5.cursor.sh:443", "agentn.global.api5.cursor.sh:443", "agentn.us.api5.cursor.sh:443", "api2.cursor.sh:443", "api2direct.cursor.sh:443", "api5.cursor.sh:443", "repo42.cursor.sh:443"]),
-    // Devin 3000.12.43's own build (its API servers), step 25's research f14 (its feature flags).
+    // docs/research/s26-agy-agentfile, "Hosts by name": Antigravity's and Google's docs and agy 1.5.7's build; its four sign-ins, ROOT's call (destinations::BY_USE).
+    ("antigravity", &[
+        "aiplatform.eu.rep.googleapis.com:443", "aiplatform.googleapis.com:443", "aiplatform.us.rep.googleapis.com:443",
+        "businessaicode.eu.rep.googleapis.com:443", "businessaicode.googleapis.com:443", "businessaicode.us.rep.googleapis.com:443",
+        "cloudcode-pa.googleapis.com:443", "discoveryengine.googleapis.com:443", "eu-discoveryengine.googleapis.com:443",
+        "generativelanguage.googleapis.com:443", "oauth2.googleapis.com:443", "sts.googleapis.com:443", "us-discoveryengine.googleapis.com:443"
+    ]),
+    // docs/research/s27-cursor-agentfile, "Hosts by name": Cursor's network docs, and its CLI's own code for api2direct (in *.cursor.sh).
+    ("cursor", &[
+        "agent.api5.cursor.sh:443", "agent.global.api5.cursor.sh:443", "agent.us.api5.cursor.sh:443", "agentn.api5.cursor.sh:443",
+        "agentn.global.api5.cursor.sh:443", "agentn.us.api5.cursor.sh:443", "api2.cursor.sh:443", "api2direct.cursor.sh:443", "api5.cursor.sh:443",
+        "repo42.cursor.sh:443"
+    ]),
+    // docs/research/s25-devin-agentfile, "Hosts by name": Devin's allowlist, and its build for the hosts in its .codeium.com.
     ("devin", &["api.devin.ai:443", "server.codeium.com:443", "unleash.codeium.com:443"]),
-    // Amp 0.0.1794456033-gb2ff22's own build ("AMP_URL optionally overrides ampcode.com").
+    // docs/research/s24-amp-agentfile, "Hosts by name": Amp's docs and its own build.
     ("amp", &["ampcode.com:443"]),
-    // Goose 1.59.0: crates/goose/src/providers (declarative and coded), goose-providers' constants.
-    ("goose", &["ai-gateway.vercel.sh:443", "ai.salad.cloud:443", "aihubmix.com:443", "api.aigateway.sh:443", "api.aimlapi.com:443", "api.anthropic.com:443", "api.avian.io:443", "api.cerebras.ai:443", "api.deepseek.com:443", "api.empiriolabs.ai:443", "api.eurouter.ai:443", "api.fireworks.ai:443", "api.friendli.ai:443", "api.github.com:443", "api.githubcopilot.com:443", "api.gondola-ai.com:443", "api.groq.com:443", "api.inceptionlabs.ai:443", "api.intelligence.io.solutions:443", "api.kimi.com:443", "api.meta.ai:443", "api.minimax.io:443", "api.mistral.ai:443", "api.novita.ai:443", "api.openai.com:443", "api.opper.ai:443", "api.orcarouter.ai:443", "api.perplexity.ai:443", "api.router.tetrate.ai:443", "api.routerplex.com:443", "api.sakana.ai:443", "api.saygm.com:443", "api.scaleway.ai:443", "api.tensorix.ai:443", "api.together.xyz:443", "api.trustedrouter.com:443", "api.typesafe.ai:443", "api.venice.ai:443", "api.x.ai:443", "api.z.ai:443", "auth.kimi.com:443", "auth.meta.com:443", "auth.openai.com:443", "auth.x.ai:443", "chatgpt.com:443", "cloud-api.near.ai:443", "cloudcode-pa.googleapis.com:443", "dashscope-intl.aliyuncs.com:443", "futurmix.ai:443", "generativelanguage.googleapis.com:443", "github.com:443", "huggingface.co:443", "inference.celeris.ai:443", "integrate.api.nvidia.com:443", "nano-gpt.com:443", "oai.endpoints.kepler.ai.cloud.ovh.net:443", "oauth2.googleapis.com:443", "ollama.com:443", "opencode.ai:443", "openrouter.ai:443", "router.huggingface.co:443", "router.pleum.ai:443", "spark-api-open.xf-yun.com:443", "www.googleapis.com:443"]),
-    // OpenCode 2.2.7's pinned build: its provider modules, its sign-ins and its ripgrep; step 22's f21 (models.dev).
-    ("opencode", &["ai-gateway.vercel.sh:443", "api.anthropic.com:443", "api.cerebras.ai:443", "api.cohere.ai:443", "api.deepinfra.com:443", "api.deepseek.com:443", "api.fireworks.ai:443", "api.github.com:443", "api.githubcopilot.com:443", "api.groq.com:443", "api.meta.ai:443", "api.minimax.io:443", "api.mistral.ai:443", "api.moonshot.ai:443", "api.openai.com:443", "api.poe.com:443", "api.together.xyz:443", "api.typesafe.ai:443", "api.venice.ai:443", "api.x.ai:443", "api.z.ai:443", "auth.openai.com:443", "chatgpt.com:443", "generativelanguage.googleapis.com:443", "github.com:443", "gitlab.com:443", "inference.baseten.co:443", "inference.do-ai.run:443", "models.dev:443", "opencode.ai:443", "openrouter.ai:443", "release-assets.githubusercontent.com:443"]),
-    // pi 1.5.2's pinned build: its model catalog's base URLs, its sign-ins (auth/oauth); step 28's f19 (pi.dev).
-    ("pi", &["ai-gateway.vercel.sh:443", "api.ant-ling.com:443", "api.anthropic.com:443", "api.cerebras.ai:443", "api.deepseek.com:443", "api.fireworks.ai:443", "api.github.com:443", "api.groq.com:443", "api.individual.githubcopilot.com:443", "api.kimi.com:443", "api.meta.ai:443", "api.minimax.io:443", "api.minimaxi.com:443", "api.mistral.ai:443", "api.moonshot.ai:443", "api.moonshot.cn:443", "api.openai.com:443", "api.together.ai:443", "api.typesafe.ai:443", "api.x.ai:443", "api.xiaomimimo.com:443", "api.z.ai:443", "auth.kimi.com:443", "auth.meta.com:443", "auth.openai.com:443", "auth.x.ai:443", "chatgpt.com:443", "claude.ai:443", "generativelanguage.googleapis.com:443", "github.com:443", "inference.baseten.co:443", "integrate.api.nvidia.com:443", "open.bigmodel.cn:443", "opencode.ai:443", "openrouter.ai:443", "pi.dev:443", "platform.claude.com:443", "radius.pi.dev:443", "router.huggingface.co:443", "token-plan-ams.xiaomimimo.com:443", "token-plan-cn.xiaomimimo.com:443", "token-plan-sgp.xiaomimimo.com:443", "token-plan.ap-southeast-1.maas.aliyuncs.com:443", "token-plan.cn-beijing.maas.aliyuncs.com:443"]),
+    // docs/research/s23-goose-agentfile, "Hosts by name" and evidence/hosts/hosts.tsv: every provider Goose 1.59.0 reaches (ROOT's call).
+    ("goose", &[
+        "ai-gateway.vercel.sh:443", "ai.salad.cloud:443", "aihubmix.com:443", "api.aigateway.sh:443", "api.aimlapi.com:443", "api.anthropic.com:443",
+        "api.avian.io:443", "api.cerebras.ai:443", "api.deepseek.com:443", "api.empiriolabs.ai:443", "api.eurouter.ai:443", "api.fireworks.ai:443",
+        "api.friendli.ai:443", "api.github.com:443", "api.githubcopilot.com:443", "api.gondola-ai.com:443", "api.groq.com:443", "api.inceptionlabs.ai:443",
+        "api.intelligence.io.solutions:443", "api.kimi.com:443", "api.meta.ai:443", "api.minimax.io:443", "api.mistral.ai:443", "api.moonshot.cn:443",
+        "api.novita.ai:443", "api.openai.com:443", "api.opper.ai:443", "api.orcarouter.ai:443", "api.perplexity.ai:443", "api.router.tetrate.ai:443",
+        "api.routerplex.com:443", "api.routstr.com:443", "api.sakana.ai:443", "api.saygm.com:443", "api.scaleway.ai:443", "api.tensorix.ai:443",
+        "api.together.xyz:443", "api.trustedrouter.com:443", "api.typesafe.ai:443", "api.venice.ai:443", "api.x.ai:443", "api.z.ai:443", "auth.kimi.com:443",
+        "auth.meta.com:443", "auth.openai.com:443", "auth.x.ai:443", "chatgpt.com:443", "cloud-api.near.ai:443", "cloudcode-pa.googleapis.com:443",
+        "dashscope-intl.aliyuncs.com:443", "futurmix.ai:443", "generativelanguage.googleapis.com:443", "github.com:443", "huggingface.co:443",
+        "inference.celeris.ai:443", "integrate.api.nvidia.com:443", "maas-token-api.cn-huabei-1.xf-yun.com:443", "nano-gpt.com:443",
+        "oai.endpoints.kepler.ai.cloud.ovh.net:443", "oauth2.googleapis.com:443", "ollama.com:443", "open.bigmodel.cn:443", "opencode.ai:443",
+        "openrouter.ai:443", "router.huggingface.co:443", "router.pleum.ai:443", "spark-api-open.xf-yun.com:443"
+    ]),
+    // docs/research/s22-opencode-agentfile, "Hosts by name" and evidence/hosts/hosts.tsv: every provider opencode 2.2.7 reaches (ROOT's call).
+    ("opencode", &[
+        "agentrouter.org:443", "ai-gateway.helicone.ai:443", "ai-gateway.vercel.sh:443", "ai.zenifra.com:443", "aihubmix.com:443", "aki.io:443",
+        "api-gw.klok.ipaas.se:443", "api-inference.modelscope.cn:443", "api-sherlock.cloudferro.com:443", "api.302.ai:443", "api.abliteration.ai:443",
+        "api.above.dev:443", "api.ai-router.dev:443", "api.ai21.com:443", "api.aiand.com:443", "api.aimlapi.com:443", "api.aixy-gateway.com:443",
+        "api.ambient.xyz:443", "api.anthropic.com:443", "api.anyapi.ai:443", "api.arcee.ai:443", "api.auriko.ai:443", "api.bee.heossi.com:443",
+        "api.berget.ai:443", "api.cerebras.ai:443", "api.clarifai.com:443", "api.claudin.io:443", "api.cline.bot:443", "api.cloudflare.com:443",
+        "api.code.umans.ai:443", "api.cohere.ai:443", "api.cohere.com:443", "api.commandcode.ai:443", "api.cortecs.ai:443", "api.crossmodel.ai:443",
+        "api.deepinfra.com:443", "api.deepseek.com:443", "api.digitalocean.com:443", "api.dinference.com:443", "api.edenai.run:443", "api.empiriolabs.ai:443",
+        "api.engy.ai:443", "api.eu.munito.ai:443", "api.fastino.ai:443", "api.fireworks.ai:443", "api.freemodel.dev:443", "api.friendli.ai:443",
+        "api.getlilac.com:443", "api.github.com:443", "api.githubcopilot.com:443", "api.gmi-serving.com:443", "api.greenpt.ai:443", "api.groq.com:443",
+        "api.hpc-ai.com:443", "api.impossibl.com:443", "api.inceptionlabs.ai:443", "api.inceptron.io:443", "api.inco.ai:443",
+        "api.inference.boundless.network:443", "api.inference.crusoecloud.com:443", "api.inference.wandb.ai:443", "api.intelligence.io.solutions:443",
+        "api.iteracompute.com:443", "api.jalapeno-cloud.ai:443", "api.jiekou.ai:443", "api.kilo.ai:443", "api.kimi.ai:443", "api.kimi.com:443",
+        "api.koscompute.com:443", "api.lab.vispark.in:443", "api.lkeap.cloud.tencent.com:443", "api.llmgateway.io:443", "api.llmtech.eu:443",
+        "api.longcat.chat:443", "api.lowrouter.ai:443", "api.lucidquery.com:443", "api.meganova.ai:443", "api.melious.ai:443", "api.meta.ai:443",
+        "api.minimax.cn:443", "api.minimax.io:443", "api.mistral.ai:443", "api.modeloracle.com:443", "api.modular.com:443", "api.moonshot.ai:443",
+        "api.moonshot.cn:443", "api.morphllm.com:443", "api.munito.ai:443", "api.nan.builders:443", "api.neuralwatt.com:443", "api.nova.amazon.com:443",
+        "api.novita.ai:443", "api.ofox.ai:443", "api.openai-compat.model-serving.eu01.onstackit.cloud:443", "api.openai.com:443", "api.openreason.app:443",
+        "api.opper.ai:443", "api.orcarouter.ai:443", "api.paretoinference.com:443", "api.pendra.ai:443", "api.perplexity.ai:443", "api.pinference.ai:443",
+        "api.poe.com:443", "api.qhaigc.net:443", "api.qnaigc.com:443", "api.reflection.ai:443", "api.regolo.ai:443", "api.routing.run:443",
+        "api.runinfra.ai:443", "api.sakana.ai:443", "api.sambanova.ai:443", "api.sarvam.ai:443", "api.scaleway.ai:443", "api.scnet.cn:443", "api.scx.ai:443",
+        "api.siliconflow.cn:443", "api.siliconflow.com:443", "api.stdcmpt.com:443", "api.stepfun.ai:443", "api.stepfun.com:443", "api.subconscious.dev:443",
+        "api.synthetic.new:443", "api.tbox.cn:443", "api.temprhq.io:443", "api.tensorx.ai:443", "api.thegrid.ai:443", "api.together.xyz:443",
+        "api.tokenfactory.nebius.com:443", "api.tokengo.com:443", "api.tokenrouter.com:443", "api.trustedrouter.com:443", "api.unorouter.com:443",
+        "api.upstage.ai:443", "api.venice.ai:443", "api.vivgrid.com:443", "api.vultrinference.com:443", "api.wallabytoken.com:443", "api.withhopper.com:443",
+        "api.x.ai:443", "api.xiaomimimo.com:443", "api.z.ai:443", "api.zeldoc.ai:443", "apihub.agnes-ai.com:443", "app.frogbot.ai:443",
+        "ark.ap-southeast.bytepluses.com:443", "ark.cn-beijing.volces.com:443", "auth.openai.com:443", "auth.x.ai:443", "cc.freemodel.dev:443",
+        "chat.d.run:443", "chatgpt.com:443", "cloud-api.near.ai:443", "coding-intl.dashscope.aliyuncs.com:443", "coding-plan-endpoint.kuaecloud.net:443",
+        "coding.dashscope.aliyuncs.com:443", "daoxe.com:443", "dashscope-intl.aliyuncs.com:443", "dashscope.aliyuncs.com:443", "developer.amd.com.cn:443",
+        "echo.tracerml.ai:443", "gateway.ai.cloudflare.com:443", "generativelanguage.googleapis.com:443", "github.com:443", "gitlab.com:443",
+        "go.fastrouter.ai:443", "hyper.charm.land:443", "infer.flow7.org:443", "inference.baseten.co:443", "inference.coralbricks.ai:443",
+        "inference.do-ai.run:443", "inference.generativeai.us-chicago-1.oci.oraclecloud.com:443", "inference.hetzner.com:443", "inference.net:443",
+        "inference.poolside.ai:443", "inference.runanywhere.ai:443", "inference.tinfoil.sh:443", "inference.us-west.modal.direct:443",
+        "integrate.api.nvidia.com:443", "kenari.id:443", "llm.chutes.ai:443", "llm.submodel.ai:443", "llmtr.com:443", "maas-api.ebcloud.com:443",
+        "microquickjs.com:443", "moark.com:443", "model.inferx.net:443", "modelishub.com:443", "models.mixlayer.ai:443", "models.opencode.ai:443",
+        "models.think.evroc.com:443", "nano-gpt.com:443", "oai.endpoints.kepler.ai.cloud.ovh.net:443", "ollama.com:443", "open.bigmodel.cn:443",
+        "openai.blueclaw.network:443", "openai.bothub.ru:443", "opencode.ai:443", "openrouter.ai:443", "pass.wafer.ai:443",
+        "release-assets.githubusercontent.com:443", "routellm.abacus.ai:443", "router.huggingface.co:443", "router.inference.ai.exchange:443",
+        "router.neosmith.ai:443", "router.requesty.ai:443", "tinker.thinkingmachines.dev:443", "token-plan-ams.xiaomimimo.com:443",
+        "token-plan-cn.xiaomimimo.com:443", "token-plan-sgp.xiaomimimo.com:443", "token-plan.ap-southeast-1.maas.aliyuncs.com:443",
+        "token-plan.cn-beijing.maas.aliyuncs.com:443", "token-plan.maas.qianwenaiapi.com:443", "token-plan.maas.qwencloudapi.com:443",
+        "token.sensenova.cn:443", "tokenhub.tencentmaas.com:443", "vancine.com:443", "www.xpersona.co:443", "zenmux.ai:443"
+    ]),
+    // docs/research/s28-pi-agentfile, "Hosts by name" and evidence/hosts/hosts.tsv: every provider pi 1.5.2 reaches (ROOT's call).
+    ("pi", &[
+        "ai-gateway.vercel.sh:443", "api.ant-ling.com:443", "api.anthropic.com:443", "api.cerebras.ai:443", "api.cloudflare.com:443", "api.deepseek.com:443",
+        "api.fireworks.ai:443", "api.github.com:443", "api.groq.com:443", "api.individual.githubcopilot.com:443", "api.kimi.com:443", "api.meta.ai:443",
+        "api.minimax.io:443", "api.minimaxi.com:443", "api.mistral.ai:443", "api.moonshot.ai:443", "api.moonshot.cn:443", "api.openai.com:443",
+        "api.together.ai:443", "api.typesafe.ai:443", "api.x.ai:443", "api.xiaomimimo.com:443", "api.z.ai:443", "auth.kimi.com:443", "auth.meta.com:443",
+        "auth.openai.com:443", "auth.x.ai:443", "chatgpt.com:443", "gateway.ai.cloudflare.com:443", "generativelanguage.googleapis.com:443", "github.com:443",
+        "inference.baseten.co:443", "integrate.api.nvidia.com:443", "open.bigmodel.cn:443", "opencode.ai:443", "openrouter.ai:443", "pi.dev:443",
+        "platform.claude.com:443", "radius.pi.dev:443", "router.huggingface.co:443", "token-plan-ams.xiaomimimo.com:443", "token-plan-cn.xiaomimimo.com:443",
+        "token-plan-sgp.xiaomimimo.com:443", "token-plan.ap-southeast-1.maas.aliyuncs.com:443", "token-plan.cn-beijing.maas.aliyuncs.com:443"
+    ]),
 ];
 
 /// kiln's own port on its machine, where it serves its MCP (its `http_addr`, as `crate::config::Server`
@@ -217,6 +292,109 @@ fn step18_shards_grants_each_builtin_its_hosts_alone_and_nothing_for_kilns_mcp()
     for (what, text) in wider {
         let g = shards_grants(&text)?;
         anyhow::ensure!(text != claude.text && (!g.egress.is_empty() || g.dns), "{what} read as no wider: {g:?}");
+    }
+    Ok(())
+}
+
+/// One built-in's [`super::destinations::BY_USE`] table.
+fn by_use(harness: &str) -> anyhow::Result<&'static super::destinations::ByUse> {
+    super::destinations::BY_USE.iter().find(|b| b.harness == harness).ok_or_else(|| anyhow::anyhow!("no hosts by use for {harness}"))
+}
+
+/// What breaks a built-in's hosts by use: its rows and what every run keeps, together, aren't its image's hosts; a row
+/// is empty, unsorted or names a host twice; or two rows share an id.
+fn by_use_problems(harness: &str, always: &[&str], by: &[(&str, &[&str])]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut all: Vec<&str> = always.iter().copied().chain(by.iter().flat_map(|(_, h)| h.iter().copied())).collect();
+    all.sort_unstable();
+    all.dedup();
+    let image = hosts(harness);
+    if all != image {
+        found.push(format!("together {all:?}, not the image's {image:?}"));
+    }
+    let once = |h: &[&str]| h.is_sorted() && h.windows(2).all(|w| w.first() != w.get(1));
+    if !once(always) {
+        found.push(format!("what every run keeps, {always:?}, isn't sorted once each"));
+    }
+    for (id, hosts) in by {
+        if hosts.is_empty() || !once(hosts) {
+            found.push(format!("{id}: {hosts:?} isn't sorted once each"));
+        }
+    }
+    let mut ids: Vec<&str> = by.iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable();
+    if ids.windows(2).any(|w| w.first() == w.get(1)) {
+        found.push(format!("an id twice among {ids:?}"));
+    }
+    found
+}
+
+/// Each built-in that serves more than one provider or sign-in has its hosts by use (`destinations::BY_USE`, what
+/// kiln's launch is to keep a run to, plan step 17), and its rows with what every run keeps are its image's hosts
+/// together, each row sorted once each and each id once. A row with a host fewer, a host its image doesn't name, or an
+/// id twice is caught.
+#[test]
+fn step18_each_builtins_hosts_by_use_are_its_image_together() -> anyhow::Result<()> {
+    let tables = super::destinations::BY_USE;
+    let mut harnesses: Vec<&str> = tables.iter().map(|b| b.harness).collect();
+    harnesses.sort_unstable();
+    anyhow::ensure!(harnesses == ["antigravity", "goose", "opencode", "pi"], "hosts by use for {harnesses:?}");
+    for b in tables {
+        let found = by_use_problems(b.harness, b.always, b.by);
+        anyhow::ensure!(found.is_empty(), "{}: {found:?}", b.harness);
+    }
+    let pi = by_use("pi")?;
+    let rows: Vec<(&str, Vec<&str>)> = pi.by.iter().map(|(id, h)| (*id, h.to_vec())).collect();
+    let fewer: Vec<(&str, Vec<&str>)> = rows.iter().map(|(id, h)| (*id, h.iter().copied().filter(|x| !(*id == "groq" && *x == "api.groq.com:443")).collect())).collect();
+    let more: Vec<(&str, Vec<&str>)> = rows.iter().map(|(id, h)| (*id, h.iter().copied().chain((*id == "groq").then_some("example.com:443")).collect())).collect();
+    let twice: Vec<(&str, Vec<&str>)> = rows.iter().cloned().chain(rows.first().cloned()).collect();
+    for (what, bent) in [("a host fewer", fewer), ("a host more", more), ("an id twice", twice)] {
+        let bent: Vec<(&str, &[&str])> = bent.iter().map(|(id, h)| (*id, h.as_slice())).collect();
+        anyhow::ensure!(!by_use_problems("pi", pi.always, &bent).is_empty(), "{what} passed");
+    }
+    Ok(())
+}
+
+/// Antigravity's sign-ins (`destinations::BY_USE`'s rows for it) are its image's hosts together; none is an mTLS twin,
+/// which a client uses only with a device certificate (Google's AIP-4114) and no microVM holds; every enterprise
+/// location keeps the global endpoints its sign-in asks (enterprise.md: `businessaicode` and `cloudcode-pa`); and a
+/// personal account's or a key's sign-in takes no enterprise host. Bent sets are caught.
+#[test]
+fn step18_agy_sign_ins_name_the_image_together_and_no_mtls_host() -> anyhow::Result<()> {
+    fn problems(sign_ins: &[(&str, &[&str])]) -> Vec<String> {
+        let mut found = by_use_problems("antigravity", &[], sign_ins);
+        let enterprise = |h: &str| ["businessaicode", "aiplatform", "discoveryengine"].iter().any(|s| h.contains(s));
+        for (name, hosts) in sign_ins {
+            if let Some(h) = hosts.iter().find(|h| h.contains(".mtls.")) {
+                found.push(format!("{name}: {h}, an mTLS twin"));
+            }
+            if name.starts_with("enterprise-") && !["businessaicode.googleapis.com:443", "cloudcode-pa.googleapis.com:443"].iter().all(|g| hosts.contains(g)) {
+                found.push(format!("{name}: without the global endpoints its sign-in asks"));
+            }
+            if ["google-account", "gemini-api-key"].contains(name) && hosts.iter().any(|h| enterprise(h)) {
+                found.push(format!("{name}: an enterprise host"));
+            }
+        }
+        found
+    }
+    let agy = by_use("antigravity")?;
+    anyhow::ensure!(agy.always.is_empty(), "agy keeps {:?} whatever its sign-in", agy.always);
+    anyhow::ensure!(problems(agy.by).is_empty(), "{:?}", problems(agy.by));
+    let without = |name: &str, host: &str| -> Vec<(String, Vec<&'static str>)> {
+        agy.by.iter().map(|(n, h)| ((*n).to_owned(), h.iter().copied().filter(|x| !(*n == name && *x == host)).collect())).collect()
+    };
+    let with = |name: &str, host: &'static str| -> Vec<(String, Vec<&'static str>)> {
+        agy.by.iter().map(|(n, h)| ((*n).to_owned(), h.iter().copied().chain((*n == name).then_some(host)).collect())).collect()
+    };
+    let bent = [
+        ("a host fewer", without("gemini-api-key", "generativelanguage.googleapis.com:443")),
+        ("an mTLS twin", with("enterprise-global", "businessaicode.mtls.googleapis.com:443")),
+        ("a location without its global endpoint", without("enterprise-us", "businessaicode.googleapis.com:443")),
+        ("a personal account given an enterprise host", with("google-account", "discoveryengine.googleapis.com:443")),
+    ];
+    for (what, sets) in bent {
+        let sets: Vec<(&str, &[&str])> = sets.iter().map(|(n, h)| (n.as_str(), h.as_slice())).collect();
+        anyhow::ensure!(!problems(&sets).is_empty(), "{what} passed");
     }
     Ok(())
 }

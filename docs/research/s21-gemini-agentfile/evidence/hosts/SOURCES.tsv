@@ -1,0 +1,5 @@
+file	url (fetched 2026-11-13 with curl -L)	sha256
+gemini-code-assist-network-access.html	https://developers.google.com/gemini-code-assist/docs/network-access (as published, sha256 828e2ef92174380a84f79711446aba4ba9c0d5be1385a0c77ee253dbfa252d7c; saved with its 9 embedded Google browser API keys redacted; and its 1 OAuth client id redacted)	29b721489607649d3a7c2aee2921b2d4734291e5077b05b28c6001a1afdd568f
+gemini-api-reference.md	https://ai.google.dev/api.md	7e66971e5699e5b0aea05b13b3e9030c811004fbdda0cd964c5f87bbabf9f6c4
+google-oauth-native-app.html	https://developers.google.com/identity/protocols/oauth2/native-app (as published, sha256 dfef9d465c8e6994bdef379614228ae41b2b2c6245ab5517f34aff4342bfad7c; saved with its 9 embedded Google browser API keys redacted; and its 1 OAuth client id and its 2 example refresh tokens redacted; and its 1 example signed token redacted)	e22cd588d23089880a4a933520f72a90f502679a3c45f47d5c6d0a5b4efa31a4
+google-oauth2-v2-discovery.json	https://www.googleapis.com/discovery/v1/apis/oauth2/v2/rest	4a1d6b68a866302b8ea5ab414b02d7a847b9d9336c4a7485d395041c5e916e16
