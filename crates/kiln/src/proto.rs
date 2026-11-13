@@ -785,7 +785,13 @@ pub mod feature {
     /// older runner process of its machine, an ACP agent or Antigravity continues its own
     /// conversation rather than taking it in words (Ada, 2026-11-13).
     pub const NATIVE_RESUME: &str = "native-resume";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME];
+    /// An owner that reads a runner's word that it isn't synced with its machine's capacity keeper
+    /// (`kiln_ci::place::msg::Reason::Unsynced`; docs/lb.md "A machine's keeper", Hex's
+    /// capacity-view.md CV11). To an owner on a link that didn't name it, a runner says it as
+    /// `Strained` where that owner reads health's words ([`PLACE_HEALTH`]), else as `Draining`:
+    /// either way it waits there, taking nothing new.
+    pub const PLACE_KEEPER: &str = "place.keeper";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {

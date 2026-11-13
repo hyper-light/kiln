@@ -108,6 +108,25 @@ fn l1_l2_a_strained_or_barred_runner_is_widened_past() -> Result<(), String> {
     Ok(())
 }
 
+/// Hex's capacity-view.md CV11: probed runners that say they aren't synced with their machine's
+/// capacity keeper admit nothing new there, so the owner places the run elsewhere: it probes the
+/// other two drawn afresh, as past strained runners. Were such a runner waited at as one short of
+/// room is, the owner would wait where it probed.
+#[test]
+fn cv11_a_runner_not_synced_with_its_keeper_is_widened_past() -> Result<(), String> {
+    let mut o = Owner::new("me", 1);
+    let _ = o.machines((0..4).map(|i| machine(&format!("lin-{i}"), "linux", "x86_64", 8, 16)).collect());
+    let probes = |acts: &[Act]| told(acts).into_iter().filter(|(_, w)| *w == "probe").map(|(r, _)| r).collect::<Vec<String>>();
+    let first = probes(&o.ask(ask("r1", "linux/amd64,cpus=2")?, 0));
+    let [a, b] = first.as_slice() else { return Err(format!("two drawn: {first:?}")) };
+    let unsynced = || waiting("r1", Reason::Unsynced { why: "joining".into() }, 1, Estimate::default(), res(8, 16));
+    let _ = o.heard(a, unsynced(), 1);
+    let more = probes(&o.heard(b, unsynced(), 2));
+    assert_eq!(more.len(), 2, "the other two probed: {more:?}");
+    assert!(more.iter().all(|r| !first.contains(r)), "{first:?} then {more:?}");
+    Ok(())
+}
+
 /// Never names the need no runner meets and the runner nearest to it; a Linux run is probed at the
 /// Linux runners alone; one whose link is down isn't probed, and counts as link down.
 #[test]

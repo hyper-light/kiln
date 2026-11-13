@@ -274,6 +274,51 @@ runner takes no work: draining (an upgrade pending, or `[runner] on_battery`) or
 Under room tokens a cordon leaves no room to hold, so every token is cut to none and each owner
 that held some is told; the room that comes back is no owner's run's, so the first watcher's.
 
+## A machine's keeper
+
+Where Hex's node keeps a machine's room (Hex's `docs/design/capacity-view.md`; kiln plan
+`01a1cd8e862e7169a074db3d5fa33f3d`, step 13), Hex's boxes and kiln's runs admit against one ledger
+there, the keeper's: kiln's runner is a holder, which reserves a run's room through the keeper and
+starts the run only on the keeper's grant (CV1). Two admitters on one room each checking only their
+own books oversubscribe it by construction ("multiple schedulers may attempt to claim the same
+resource simultaneously": Omega, Schwarzkopf et al., EuroSys 2013, §3); one commit point that
+validates is what keeps deciders working on copies safe (§3.4). The runner's ledger
+(`place::runner::Admission`, `place::keeper`) takes where it stands with its keeper as an input,
+`Admission::keeper_said`:
+
+- **None known** (`Keeper::None`): it admits on its own measured room, as ever. A keeper is known
+  only where the runner's configuration names one: off until declared.
+- **Unsynced** (`Keeper::Unsynced`: joining, not served, superseded by a newer process of the
+  runner, or closed for a word it couldn't take): nothing new is admitted there (CV11). Its kernel
+  is cordoned as for a battery or strain (above), so its words say no room and owners' kernels pick
+  elsewhere; its waiting runs are told `Unsynced`, why in words, which owners widen past as past a
+  strained runner, so probing places the work elsewhere too; what runs goes on, held in the keeper's
+  books. A run starts here only on its reserve's grant, and no reserve is said while unsynced, so a
+  start under a claim offered before lapses and the run waits here again, saying why. A keeper that
+  stops answering is never taken for none: that would double-book what it still holds (CV10).
+- **Synced** (`Keeper::Synced`: the keeper's view as its last answer or hint said it, and what of it
+  is the runner's own): the room it admits against, overcommitted and not, is held to what the view
+  leaves it, the machine's room less what everyone else holds, the keeper's own rule (CV3: a charge
+  fits iff `c <= room - local - foreign`). Its CPUs are never overcommitted past that room, which the
+  keeper grants nothing past whatever `overcommit_cpu` says; a run asking GPUs never runs where a
+  keeper is known, as a keeper grants no holder GPUs by count (CV3, until device grants by identity).
+  The kernel's budget stays the runner's own (`cap`): what others hold is room the ledger doesn't
+  hold, so it reaches the kernel as its `outside`, through `sync_fast`. A view over its room (the
+  room measured below what is held) admits nothing new until it fits, and what runs keeps its room.
+
+The view is the decider's copy (CV7): the keeper validates every reserve, so a stale view costs a
+refusal and a placement again, never a double booking. Its `own` is the holder's reservations whose
+work may run; one being released counts as another's until the keeper's word drops it, so the view
+never says more room than the keeper has. A release goes on the runner's one ordered link before any
+later reserve, so the room of a run that ended here is the keeper's again by the time the next run's
+reserve reaches it. No number here is the ledger's own: each is the keeper's measured room and books,
+or the runner's.
+
+Its words to owners from before it: `Unsynced` is appended to the waiting reasons under the link
+feature `place.keeper` (docs/wire.md); to an owner whose link didn't name it a runner says `Strained`,
+its why kept, or `Draining` where the owner doesn't read health's words either. The offers hint says
+it as its `Strained` state, with its why, which every server reads.
+
 ## Good places
 
 An assignment succeeds when the work lands on the node that lets it complete as quickly, as
@@ -1092,6 +1137,15 @@ however many came.
   still passes each runner's word on to every owner (owners that hear hints, and its own kernel,
   need it), and an owner that hears tokens drops it. Cutting that fan-out needs the server to know
   which owners hear tokens from which runners.
+- A machine's keeper ("A machine's keeper"): the ledger's side is built; the runner's shell as the
+  keeper's holder is not, so nothing names a keeper yet. It waits on Hex's `hex_api::capacity`
+  vendored in kiln: `Holder` driven over `hex_quic::capacity::Link` on `CAPACITY_PORT`, its identity
+  enrolled with kiln's CA by CSR and named in the keeper's configuration, its epoch durable and one
+  more at each start of its process, a reserve before each run's process starts and the process
+  started only on its grant, a release once its work can no longer run, each sync listing every
+  reservation whose work may still run, its waits learned by hex-core's `Patience`, and each change
+  said to `Admission::keeper_said`; and kiln-ci's simulator driving that holder against Hex's
+  `capacity::sim::SimView` under crash seeds.
 
 ## GPU fit and load (W05-R03, W05-R22, W05-R23, W13-R01)
 
