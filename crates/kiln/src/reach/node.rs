@@ -97,6 +97,10 @@ pub struct Config {
     /// kiln's root (its CA, DER), which the custody records another runner hands this one chain to
     /// (docs/ci.md W27-R08, `super::custody`).
     pub root: Vec<u8>,
+    /// The machine's capacity keeper (`[capacity]`, docs/lb.md "A machine's keeper"): where it's
+    /// named, every start here reserves its room through it and starts on its grant alone. None:
+    /// it admits on its own room, as ever.
+    pub capacity: Option<crate::capacity::KeeperAt>,
 }
 
 /// Something another runner hands this one to take over, whole: `reply` says whether it was.
@@ -159,7 +163,7 @@ const ADOPT_PIECE: usize = 1 << 20;
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, adopt_policy: crate::harness::moving::stream::StoragePolicy::Unknown, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), place: kiln_ci::place::runner::Settings::default(), version: wire::VERSION, root: Vec::new() }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, adopt_policy: crate::harness::moving::stream::StoragePolicy::Unknown, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), place: kiln_ci::place::runner::Settings::default(), version: wire::VERSION, root: Vec::new(), capacity: None }
     }
 }
 
@@ -224,6 +228,14 @@ pub enum In {
     /// The time the detector's timer asked for (`kiln_ci::detect`, LB03): an answer a send owed
     /// may be overdue.
     Overdue,
+    /// A link to this machine's capacity keeper opened (`crate::capacity::links`; docs/lb.md "A
+    /// machine's keeper"): placement's holding says its words on `say`, in order, until it ends.
+    KeeperLinked(crate::memory::queue::Sender<kiln_seams::capacity::ToKeeper>),
+    /// The keeper's word on that link: an answer to the oldest word said, or a hint.
+    KeeperHeard(kiln_seams::capacity::ToHolder),
+    /// That link ended: `Died` (its transport found the keeper gone) or `Reset` (the keeper
+    /// started again, or reset it).
+    KeeperEnded(kiln_ci::place::keeper::WaitEnded),
 }
 
 /// What local tools ask of the node.
@@ -792,6 +804,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         place_held: std::collections::VecDeque::new(),
         session_asks: Vec::new(),
         root: Arc::clone(&root),
+        keeper: Keeping::default(),
     };
     let busy = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&busy);
@@ -801,6 +814,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         let _keep = keep;
         let mut node = node;
         node.place_open().await;
+        node.keeper_open().await;
         node.timers();
         loop {
             let first = futures::select_biased! {
@@ -1187,6 +1201,33 @@ struct Node {
     session_asks: Vec<(u64, Box<kiln_ci::place::ask::Ask>)>,
     /// kiln's root, as `cfg.root` (what other runners' custody records chain to).
     root: Arc<Vec<u8>>,
+    /// What waits on this machine's capacity keeper (docs/lb.md "A machine's keeper").
+    keeper: Keeping,
+}
+
+/// What a node with a capacity keeper keeps for it (docs/lb.md "A machine's keeper"): the link its
+/// holding's words go on now (placement's number for it, and where they go), and what its server
+/// coming back wakes (the link's first steps not done yet); and each start that waits for its
+/// reserve's answer: this node's own runs' (`Local::PlaceStarting`), CI legs', agent sessions', and
+/// the specs come for runs whose starts wait, each answered once placement decides it, and the steps
+/// that decision makes due here ([`Due`]).
+#[derive(Default)]
+struct Keeping {
+    say: Option<(u64, crate::memory::queue::Sender<kiln_seams::capacity::ToKeeper>)>,
+    wake: Option<crate::memory::queue::Sender<()>>,
+    starting: HashMap<String, Vec<oneshot::Sender<bool>>>,
+    legs: HashMap<String, Vec<oneshot::Sender<Result<(), String>>>>,
+    sessions: HashMap<(String, u64, String), Vec<oneshot::Sender<bool>>>,
+    specs: HashMap<(String, u64), ((String, String), RunSpec, Option<String>)>,
+    due: VecDeque<Due>,
+}
+
+/// A step placement's decision on a start that waited for its reserve makes due in the node.
+enum Due {
+    /// Spec `id` of asker `peer`, held, is started or refused now.
+    Spec(String, u64),
+    /// This node's own run `run` is started (`true`) or not: answered once its start is kept.
+    Started(String, bool),
 }
 
 impl Node {
@@ -1212,6 +1253,11 @@ impl Node {
                     crate::runner::custody::calls_connected();
                     // The keeper of copies tells the server what's here, and hears its rules.
                     self.cfg.using.connected();
+                    // The capacity keeper's link tries again what it couldn't do without the server
+                    // (its holder's enrollment).
+                    if let Some(wake) = &self.keeper.wake {
+                        let _ = wake.try_send(());
+                    }
                 }
                 // It says again what it takes once it's back.
                 self.server_unread &= up;
@@ -1301,11 +1347,30 @@ impl Node {
                 self.detect_at = None;
                 self.overdue().await;
             }
+            In::KeeperLinked(say) => {
+                let outs = self.place.keeper_linked(crate::util::now_ms());
+                self.keeper.say = Some((self.place.keeper_link(), say));
+                self.place_do(outs).await;
+            }
+            In::KeeperHeard(word) => {
+                let outs = self.place.keeper_heard(word, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            In::KeeperEnded(how) => {
+                self.keeper.say = None;
+                let outs = self.place.keeper_ended(how, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
         }
         loop {
             while !self.place_later.is_empty() {
                 let outs = std::mem::take(&mut self.place_later);
                 self.place_do(outs).await;
+            }
+            // What placement's decisions on starts that waited for their reserves made due here.
+            if !self.keeper.due.is_empty() {
+                self.keeper_due().await;
+                continue;
             }
             // The measure this input made due (a run's start or end, the OS's events: W05-R26),
             // read once its words are out: no decision waits on a read.
@@ -1496,6 +1561,52 @@ impl Node {
         }
     }
 
+    /// This machine's capacity keeper, where `[capacity]` names it (docs/lb.md "A machine's
+    /// keeper"): placement holds through it from now on, its survivors those its records list, and
+    /// its link opens apart from this loop (`crate::capacity::hold`), each link said here as it
+    /// opens and ends. Before any word: until its first sync is answered nothing new starts here.
+    async fn keeper_open(&mut self) {
+        let Some(at) = self.cfg.capacity.clone() else { return };
+        let outs = self.place.keeper_start(crate::util::now_ms());
+        self.place_do(outs).await;
+        // A holding that couldn't start leaves the runner taking nothing new, saying why: no link.
+        if !self.place.holds() {
+            return;
+        }
+        let (wake, woken) = crate::memory::queue::unbounded::<()>(&crate::memory::owners::CHANNELS);
+        self.keeper.wake = Some(wake);
+        tracing::info!(keeper = %at.address, name = %at.name, "this runner holds its runs' room through its machine's capacity keeper");
+        crate::rt::spawn(crate::capacity::hold(at, self.tx.clone(), woken));
+    }
+
+    /// What placement's decisions on starts that waited for their reserves made due here: a spec
+    /// held for its verdict started or refused now, and this node's own run's start answered once
+    /// it's kept (LB03), as an answer at once is ([`Local::PlaceStarting`]).
+    async fn keeper_due(&mut self) {
+        while let Some(due) = self.keeper.due.pop_front() {
+            match due {
+                Due::Spec(peer, id) => {
+                    let Some((key, spec, with)) = self.keeper.specs.remove(&(peer, id)) else { continue };
+                    match with {
+                        Some(with) => self.start_run_with(&key, spec, &with).await,
+                        None => self.start_run(&key, spec).await,
+                    }
+                }
+                Due::Started(run, ok) => {
+                    let replies = self.keeper.starting.remove(&run).unwrap_or_default();
+                    let kept = !ok || self.place_commit().await;
+                    if !kept {
+                        let outs = self.place.unstarted(&run, crate::util::now_ms());
+                        self.place_do(outs).await;
+                    }
+                    for reply in replies {
+                        let _ = reply.send(ok && kept);
+                    }
+                }
+            }
+        }
+    }
+
     async fn place_send(&mut self, outs: Vec<super::place::Out>) {
         use super::place::{Out, Placed};
         for o in outs {
@@ -1537,6 +1648,27 @@ impl Node {
                         && (tx.send(placed).await.is_err() || done)
                     {
                         self.placing.remove(&run);
+                    }
+                }
+                // Said on the keeper's link it was made for alone: one since ended took its words
+                // with it, and its holding knows they went unanswered (CV9).
+                Out::KeeperSay { link, word } => {
+                    if let Some((at, say)) = &self.keeper.say
+                        && *at == link
+                    {
+                        let _ = say.try_send(word);
+                    }
+                }
+                Out::SpecReady { peer, id } => self.keeper.due.push_back(Due::Spec(peer, id)),
+                Out::Started { run, ok } => self.keeper.due.push_back(Due::Started(run, ok)),
+                Out::Leg { run, verdict } => {
+                    for reply in self.keeper.legs.remove(&run).unwrap_or_default() {
+                        let _ = reply.send(verdict.clone());
+                    }
+                }
+                Out::Session { claim, ok } => {
+                    for reply in self.keeper.sessions.remove(&(claim.owner, claim.epoch, claim.run)).unwrap_or_default() {
+                        let _ = reply.send(ok);
                     }
                 }
             }
@@ -1732,6 +1864,8 @@ impl Node {
     /// Send what every link has waiting.
     async fn flush(&mut self) {
         self.place_commit().await;
+        // What publishing it made due (a start that waited for its reserve, decided).
+        self.keeper_due().await;
         for id in std::mem::take(&mut self.dirty) {
             self.send_frames(&id, None).await;
         }
@@ -2481,6 +2615,12 @@ impl Node {
                 self.refuse_run(key, id, why).await;
                 return;
             }
+            // Its start waits for its reserve's answer from this machine's capacity keeper: held
+            // until placement decides it (`Out::SpecReady`), neither started nor refused.
+            super::place::Spec::Wait => {
+                self.keeper.specs.insert((key.0.clone(), id), (key.clone(), spec, None));
+                return;
+            }
             // Its record kept before its process starts (LB03): one not kept never starts.
             super::place::Spec::Start { .. } if !kept => {
                 let outs = self.place.ended(&key.0, id, false, crate::util::now_ms());
@@ -2612,6 +2752,11 @@ impl Node {
     async fn start_run_with(&mut self, key: &(String, String), spec: RunSpec, with: &str) {
         let id = spec.id;
         self.start_run(key, spec).await;
+        // Held for its start's verdict: what its asker knew of it held with it.
+        if let Some(held) = self.keeper.specs.get_mut(&(key.0.clone(), id)) {
+            held.2 = Some(with.to_owned());
+            return;
+        }
         if let Some(r) = self.served.get_mut(key).and_then(|s| s.runs.get_mut(&id)).filter(|r| r.doing.is_none()) {
             r.doing = super::history::doing(with);
         }
@@ -2914,8 +3059,15 @@ impl Node {
                 }
             }
             Local::Leg { ask, reply } => {
+                let run = ask.run.clone();
                 let (verdict, outs) = self.place.leg(*ask, crate::util::now_ms());
-                let _ = reply.send(verdict);
+                match verdict {
+                    Some(verdict) => {
+                        let _ = reply.send(verdict);
+                    }
+                    // Its reserve waits for the keeper's answer: answered then (`Out::Leg`).
+                    None => self.keeper.legs.entry(run).or_default().push(reply),
+                }
                 self.place_do(outs).await;
             }
             Local::LegEnded { run, ok } => {
@@ -2924,7 +3076,13 @@ impl Node {
             }
             Local::SessionStarted { claim, session, reply } => {
                 let (ok, outs) = self.place.session_start(&claim, session.as_deref(), crate::util::now_ms());
-                let _ = reply.send(ok);
+                match ok {
+                    Some(ok) => {
+                        let _ = reply.send(ok);
+                    }
+                    // Its reserve waits for the keeper's answer: answered then (`Out::Session`).
+                    None => self.keeper.sessions.entry((claim.owner, claim.epoch, claim.run)).or_default().push(reply),
+                }
                 self.place_do(outs).await;
             }
             Local::SessionEnded { claim } => {
@@ -2934,6 +3092,12 @@ impl Node {
             Local::PlaceStarting { run, runner, fence, reply } => {
                 let (ok, outs) = self.place.starting(&run, &runner, fence, crate::util::now_ms());
                 self.place_do(outs).await;
+                let Some(ok) = ok else {
+                    // Its reserve waits for the keeper's answer: answered then, once kept
+                    // (`Out::Started`).
+                    self.keeper.starting.entry(run).or_default().push(reply);
+                    return;
+                };
                 // Its start is said only once it's kept (LB03): a restart then knows it may have run.
                 let kept = !ok || self.place_commit().await;
                 if !kept {
@@ -3151,7 +3315,7 @@ impl Node {
     fn due(&self, now: Instant) -> Option<Instant> {
         // What a batch's flush left for an input's end (a link it dropped: placement's word on that;
         // a measure it made due) is due at once: the timer's input ends as every input does.
-        if !self.place_later.is_empty() || self.place.measure_due() {
+        if !self.place_later.is_empty() || self.place.measure_due() || !self.keeper.due.is_empty() {
             return Some(now);
         }
         let asked = self.asked.values().filter_map(|at| directory_due(*at));

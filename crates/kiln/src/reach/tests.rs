@@ -118,6 +118,7 @@ async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], 
         place: kiln_ci::place::runner::Settings::default(),
         version: super::wire::VERSION,
         root: Vec::new(),
+        capacity: None,
     };
     let (mac, mac_out) = node::start(Config { objects: mac_objects, version: mac_version, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) })?;
     let (linux, linux_out) = node::start(Config { objects: linux_objects, version: linux_version, ..cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)) })?;

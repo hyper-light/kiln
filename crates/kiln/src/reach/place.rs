@@ -35,6 +35,7 @@ use crate::proto::feature;
 use kiln_ci::place::handoff::{Ballot, Handle, Word};
 
 mod handoff;
+mod holder;
 
 /// The owner a CI leg's room is held for in a runner's admission (AUDIT M4, docs/needs.md E5):
 /// the CI engine that assigned it. No runner can be named so (a `:` is in no host name).
@@ -350,6 +351,22 @@ pub enum Out {
     /// Tell the agent session that asked for a run what it's owed (LB03): a run taken up from
     /// before this node's restart, whose asker's own channel went with that process.
     Told { asker: super::told::Answers, answer: Answer },
+    /// Say `word` to this machine's capacity keeper on its link `link` ([`Placer::keeper_link`]),
+    /// after every word said before it there; none where that link has ended (docs/lb.md "A
+    /// machine's keeper").
+    KeeperSay { link: u64, word: kiln_seams::capacity::ToKeeper },
+    /// Spec `id` of asker `peer`, whose start waited for its reserve, is decided: [`Placer::spec`]
+    /// says what to do with it now.
+    SpecReady { peer: String, id: u64 },
+    /// This node's own run `run`, whose start waited for its reserve, started here (`true`) or
+    /// not: what [`Placer::starting`] would have answered.
+    Started { run: String, ok: bool },
+    /// CI leg `run`, whose admission waited for its reserve: admitted, or why not, as
+    /// [`Placer::leg`] would have answered.
+    Leg { run: String, verdict: Result<(), String> },
+    /// The agent session under `claim`, whose start waited for its reserve, started (its claim was
+    /// live) or not, as [`Placer::session_start`] would have answered.
+    Session { claim: Claim, ok: bool },
 }
 
 /// What came of a spec a placing asker sent ([`Placer::spec`]).
@@ -361,6 +378,9 @@ pub enum Spec {
     Refuse(String),
     /// Not placed: an asker from before placement, or a run it didn't place; as before.
     Unplaced,
+    /// Not yet: its start waits for its reserve's answer from this machine's capacity keeper,
+    /// decided as [`Out::SpecReady`] says (docs/lb.md "A machine's keeper").
+    Wait,
 }
 
 /// Placement in one node: its owner and its runner's admission.
@@ -370,8 +390,11 @@ pub struct Placer {
     owner: Owner,
     admission: Admission,
     /// Specs a placing asker's start was answered for: by (asker, spec id), the run and whether to
-    /// start it.
-    specs: BTreeMap<(String, u64), (String, u64, Result<(), String>)>,
+    /// start it, none while its start waits for its reserve (docs/lb.md "A machine's keeper").
+    specs: BTreeMap<(String, u64), (String, u64, Option<Result<(), String>>)>,
+    /// Its machine's capacity keeper, where one is named (`[capacity]`, [`holder`]): every start
+    /// here holds its room through it.
+    keeper: Option<holder::Holder>,
     /// Runs started here for an owner, by (asker, spec id): its epoch and run.
     started: BTreeMap<(String, u64), (u64, String)>,
     /// The last directory, for the owner's machines.
@@ -869,7 +892,7 @@ impl Placer {
         let mut owner = Owner::seeded(me, epoch, rand::random());
         owner.configure(&settings);
         let init = Init { me: me.to_owned(), epoch, since: None, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner, admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default() }
+        Placer { me: me.to_owned(), epoch, owner, admission: Admission::new(init, now), specs: BTreeMap::new(), keeper: None, started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default() }
     }
 
     /// It measures its machine itself on events, with `sensor` (AUDIT L1, L2; W05-R26).
@@ -1128,12 +1151,14 @@ impl Placer {
     }
 
     /// The local run `run` is about to start on `runner` under `fence`: whether it still may
-    /// ([`Owner::starting`]); for this runner, its admission says whether it starts (`New`).
-    pub fn starting(&mut self, run: &str, runner: &str, fence: Fence, now: i64) -> (bool, Vec<Out>) {
+    /// ([`Owner::starting`]); for this runner, its admission says whether it starts (`New`), on its
+    /// reserve's grant where a capacity keeper is named: none while that waits, answered then as
+    /// [`Out::Started`] (docs/lb.md "A machine's keeper").
+    pub fn starting(&mut self, run: &str, runner: &str, fence: Fence, now: i64) -> (Option<bool>, Vec<Out>) {
         // The kernel's start of a run it placed (docs/lb.md): its ask, handle and epoch.
         let fast = self.owner.fast_start(run, fence);
         if !self.owner.starting(run, runner, fence) {
-            return (false, Vec::new());
+            return (Some(false), Vec::new());
         }
         // A kernel start is its run's first word at a runner, or its next after the last declined
         // (a runner it went to before holds nothing): `runner` joins the run's members freely, kept
@@ -1145,25 +1170,25 @@ impl Placer {
             self.hand.acc.probed(&Handle::new(&self.me, self.epoch, run), members);
         }
         if runner != self.me {
-            return (true, Vec::new());
+            return (Some(true), Vec::new());
         }
-        let mut said = Vec::new();
+        let (mut said, mut out) = (Vec::new(), Vec::new());
         // Its tenant's usage elsewhere, carried here as a start to another runner carries it (W05-R32).
         let elsewhere = self.owner.start_carry(run);
         let me = Peer { name: &self.me, epoch: self.epoch };
+        let (name, epoch) = (self.me.clone(), self.epoch);
         let started = match fast {
             Some((ask, _, kernel, at)) => {
                 self.admission.carried(me, run, Some(&*ask), elsewhere, now, &mut said);
-                let (name, epoch) = (self.me.clone(), self.epoch);
-                self.fast(&name, epoch, ask, kernel, at, now, &mut said)
+                self.kernel_start(&name, epoch, ask, kernel, at, Some(holder::Then::Local), now, &mut said, &mut out)
             }
             None => {
                 self.admission.carried(me, run, None, elsewhere, now, &mut said);
-                self.admission.start(me, run, fence, now, &mut said)
+                self.claim_start(&name, epoch, run, fence, Some(holder::Then::Local), now, &mut said, &mut out)
             }
         };
-        let out = self.said(said, now);
-        (started == Some(Start::New), out)
+        out.extend(self.said(said, now));
+        (started.map(|s| s == Some(Start::New)), out)
     }
 
     /// The start of run `run` on `runner` under `fence`, said with the spec id it's for, and with
@@ -1194,15 +1219,18 @@ impl Placer {
         self.said(said, now)
     }
 
-    /// A run of this node's here ended (`ok`: its process exited).
+    /// A run of this node's here ended (`ok`: its process exited): its reservation through its
+    /// machine's capacity keeper given back after its record.
     pub fn local_ended(&mut self, run: &str, ok: bool, now: i64) -> Vec<Out> {
         let (me, epoch) = (self.me.clone(), self.epoch);
         self.ungrouped(&me, epoch, run);
         let mut said = Vec::new();
-        let me = Peer { name: &self.me, epoch: self.epoch };
-        self.admission.ended(me, run, ok, now, &mut said);
-        self.admission.ack(me, run);
-        self.said(said, now)
+        let peer = Peer { name: &self.me, epoch: self.epoch };
+        self.admission.ended(peer, run, ok, now, &mut said);
+        self.admission.ack(peer, run);
+        let mut out = self.said(said, now);
+        out.extend(self.keeper_release(&me, epoch, run, now));
+        out
     }
 
     /// An owner's word, from runner `peer`'s link (`Ask::Place`).
@@ -1252,13 +1280,10 @@ impl Placer {
             ToRunner::Decline { run, fence } => self.admission.decline(from, &run, fence, now, &mut said),
             ToRunner::Start { run, fence, elsewhere } => {
                 self.admission.carried(from, &run, None, elsewhere, now, &mut said);
-                let started = self.admission.start(from, &run, fence, now, &mut said);
+                let then = e.spec.map(|id| holder::Then::Spec { peer: peer.to_owned(), id });
+                let started = self.claim_start(peer, e.epoch, &run, fence, then, now, &mut said, &mut out);
                 if let Some(spec) = e.spec {
-                    let verdict = match started {
-                        Some(Start::New) => Ok(()),
-                        Some(Start::Already) => Err(format!("{run} ran here already: it isn't started again")),
-                        None => Err(format!("{run}'s claim here isn't live: it isn't started")),
-                    };
+                    let verdict = started.map(|s| holder::claim_verdict(&run, s));
                     self.specs.insert((peer.to_owned(), spec), (run, e.epoch, verdict));
                 }
             }
@@ -1269,13 +1294,10 @@ impl Placer {
             ToRunner::Fast { ask, kernel, epoch, elsewhere } => {
                 let run = ask.run.clone();
                 self.admission.carried(from, &run, Some(&*ask), elsewhere, now, &mut said);
-                let started = self.fast(peer, e.epoch, ask, kernel.handle(), epoch, now, &mut said);
+                let then = e.spec.map(|id| holder::Then::Spec { peer: peer.to_owned(), id });
+                let started = self.kernel_start(peer, e.epoch, ask, kernel.handle(), epoch, then, now, &mut said, &mut out);
                 if let Some(spec) = e.spec {
-                    let verdict = match started {
-                        Some(Start::New) => Ok(()),
-                        Some(Start::Already) => Err(format!("{run} ran here already: it isn't started again")),
-                        None => Err(format!("{run} has no room here now: it isn't started")),
-                    };
+                    let verdict = started.map(|s| holder::kernel_verdict(&run, s));
                     self.specs.insert((peer.to_owned(), spec), (run, e.epoch, verdict));
                 }
             }
@@ -1297,13 +1319,17 @@ impl Placer {
 
     /// A spec came from runner `peer` (`Ask::Run`): what to do with it.
     pub fn spec(&mut self, peer: &str, id: u64) -> Spec {
-        match self.specs.remove(&(peer.to_owned(), id)) {
-            Some((run, epoch, Ok(()))) => {
-                self.started.insert((peer.to_owned(), id), (epoch, run.clone()));
+        let key = (peer.to_owned(), id);
+        if self.specs.get(&key).is_some_and(|(_, _, verdict)| verdict.is_none()) {
+            return Spec::Wait;
+        }
+        match self.specs.remove(&key) {
+            Some((run, epoch, Some(Ok(())))) => {
+                self.started.insert(key, (epoch, run.clone()));
                 Spec::Start { run }
             }
-            Some((_, _, Err(why))) => Spec::Refuse(why),
-            None => Spec::Unplaced,
+            Some((_, _, Some(Err(why)))) => Spec::Refuse(why),
+            Some((_, _, None)) | None => Spec::Unplaced,
         }
     }
 
@@ -1336,6 +1362,8 @@ impl Placer {
         let mut said = Vec::new();
         self.admission.ended_as(Peer { name: peer, epoch }, &run, ok, how, now, &mut said);
         let mut out = self.said(said, now);
+        // Its reservation through its machine's capacity keeper goes back after its record.
+        out.extend(self.keeper_release(peer, epoch, &run, now));
         // Its end to its claimant, or handed off if its owner can't be reached; the room it freed
         // may be what a waiting run of such an owner needs (LB03).
         out.extend(self.hand_ended(peer, epoch, &run, now));
@@ -1445,6 +1473,7 @@ impl Placer {
             "queued": queued,
             "next": self.admission.timer(),
             "links": self.links,
+            "keeper": self.keeper_view(),
         })
     }
 
@@ -1457,12 +1486,16 @@ impl Placer {
         let mut said = Vec::new();
         self.admission.tick(now, &mut said);
         out.extend(self.said(said, now));
+        // Its machine's capacity keeper, answering nothing past the slowest answer it has given,
+        // is stalled: each reserve waiting on it isn't granted (docs/lb.md "Waits").
+        out.extend(self.keeper_woke(now));
         out
     }
 
-    /// When to be told the time again.
+    /// When to be told the time again: its owner's, its admission's, its budgets' and its holding's
+    /// soonest (the wait on its machine's capacity keeper ending, `holder`).
     pub fn timer(&self) -> Option<i64> {
-        [self.owner.timer(), self.admission.timer(), self.budget.timer()].into_iter().flatten().min()
+        [self.owner.timer(), self.admission.timer(), self.budget.timer(), self.keeper_due()].into_iter().flatten().min()
     }
 
     /// The runners this node's owner has told something (to link to again).
@@ -1474,7 +1507,17 @@ impl Placer {
     /// the same ledger as the runs owners place here, now or not at all. Room for it now, its
     /// claim is taken and started at once (held until [`Self::leg_ended`]); none, refused saying
     /// why, and the engine places it elsewhere or later (it queues in the engine, never here).
-    pub fn leg(&mut self, ask: Ask, now: i64) -> (Result<(), String>, Vec<Out>) {
+    /// Where a capacity keeper is named its room is reserved through it first, the leg admitted on
+    /// the grant alone: none while that waits, answered then as [`Out::Leg`] (docs/lb.md "A
+    /// machine's keeper").
+    pub fn leg(&mut self, ask: Ask, now: i64) -> (Option<Result<(), String>>, Vec<Out>) {
+        let mut out = Vec::new();
+        let verdict = self.leg_start(ask, now, &mut out);
+        (verdict, out)
+    }
+
+    /// [`Self::leg`] now, its room reserved where a keeper is named (`holder`).
+    fn leg_now(&mut self, ask: Ask, now: i64) -> (Result<(), String>, Vec<Out>) {
         let run = ask.run.clone();
         let ci = Peer { name: CI, epoch: self.epoch };
         let mut said = Vec::new();
@@ -1548,7 +1591,8 @@ impl Placer {
         (verdict, self.said(rest, now))
     }
 
-    /// CI leg `run` ended here (`ok`: its process exited): its room is free at once.
+    /// CI leg `run` ended here (`ok`: its process exited): its room is free at once, its
+    /// reservation through its machine's capacity keeper given back.
     pub fn leg_ended(&mut self, run: &str, ok: bool, now: i64) -> Vec<Out> {
         let ci = Peer { name: CI, epoch: self.epoch };
         self.groups.remove(&(CI.to_owned(), self.epoch, run.to_owned()));
@@ -1557,7 +1601,10 @@ impl Placer {
         self.admission.ack(ci, run);
         self.machine_changed();
         said.retain(|(to, _)| to != CI);
-        self.said(said, now)
+        let mut out = self.said(said, now);
+        let epoch = self.epoch;
+        out.extend(self.keeper_release(CI, epoch, run, now));
+        out
     }
 
     /// This runner takes nothing new while `draining` (an upgrade pending, or retiring), or does
@@ -1582,40 +1629,55 @@ impl Placer {
     /// An agent session placed here under claim `c` started (AUDIT M4): its room is held from now
     /// until [`Self::session_ended`], as a run's is. Its owner's word that it may (`Start`) is the
     /// claim the server gave the session; this runner's word that it started goes to that owner.
-    /// A claim that isn't live here any more starts nothing (`false`).
-    pub fn session_start(&mut self, c: &Claim, session: Option<&str>, now: i64) -> (bool, Vec<Out>) {
+    /// A claim that isn't live here any more starts nothing (`false`). Where a capacity keeper is
+    /// named it starts on its reserve's grant alone: none while that waits, answered then as
+    /// [`Out::Session`] (docs/lb.md "A machine's keeper").
+    pub fn session_start(&mut self, c: &Claim, session: Option<&str>, now: i64) -> (Option<bool>, Vec<Out>) {
         if let Some(id) = session {
             self.grouped(&c.owner, c.epoch, &c.run, Group::Session(id.to_owned()));
         }
         self.load_changed();
-        let mut said = Vec::new();
+        let (mut said, mut out) = (Vec::new(), Vec::new());
         let started = if c.owner == self.me {
             // Its owner is this node: its start was taken as it was told to go (`starting`).
             self.admission.spawned(Peer { name: &self.me, epoch: self.epoch }, &c.run, &mut said);
-            true
+            Some(true)
         } else {
-            let from = Peer { name: &c.owner, epoch: c.epoch };
-            match self.admission.start(from, &c.run, c.fence, now, &mut said) {
-                Some(Start::New | Start::Already) => {
-                    self.admission.spawned(from, &c.run, &mut said);
-                    true
-                }
-                None => false,
-            }
+            self.claim_start(&c.owner, c.epoch, &c.run, c.fence, Some(holder::Then::Session(c.clone())), now, &mut said, &mut out).map(|started| self.session_began(c, started, &mut said))
         };
-        (started, self.said(said, now))
+        out.extend(self.said(said, now));
+        (started, out)
+    }
+
+    /// The agent session under claim `c` started here as `started` says: told to its owner as
+    /// spawned once it did (`New`, or `Already`: it runs here), whether it did.
+    fn session_began(&mut self, c: &Claim, started: Option<Start>, said: &mut Vec<(String, ToOwner)>) -> bool {
+        let from = Peer { name: &c.owner, epoch: c.epoch };
+        match started {
+            Some(Start::New | Start::Already) => {
+                self.admission.spawned(from, &c.run, said);
+                true
+            }
+            None => false,
+        }
     }
 
     /// An agent session placed here under claim `c` ended (closed, or gone on elsewhere): its
-    /// room is free at once.
+    /// room is free at once, its reservation through its machine's capacity keeper given back.
     pub fn session_ended(&mut self, c: &Claim, now: i64) -> Vec<Out> {
         self.ungrouped(&c.owner, c.epoch, &c.run);
         if c.owner == self.me {
-            return self.local_ended(&c.run, true, now);
+            let mut out = self.local_ended(&c.run, true, now);
+            // One this node's process before this one placed, its reservation listed again as it
+            // went on past that process (`holder`): given back under its claim's epoch.
+            out.extend(self.keeper_release(&c.owner, c.epoch, &c.run, now));
+            return out;
         }
         let mut said = Vec::new();
         self.admission.ended(Peer { name: &c.owner, epoch: c.epoch }, &c.run, true, now, &mut said);
-        self.said(said, now)
+        let mut out = self.said(said, now);
+        out.extend(self.keeper_release(&c.owner, c.epoch, &c.run, now));
+        out
     }
 
     /// The runner's admission, for views (`/api/reach/offers`).
@@ -1823,15 +1885,18 @@ impl Placer {
                         }
                         ToRunner::Take { run, fence } => self.admission.take(me, &run, fence, now, &mut said),
                         ToRunner::Decline { run, fence } => self.admission.decline(me, &run, fence, now, &mut said),
+                        // Its start on its reserve's grant, where a capacity keeper is named, as any
+                        // start here (`holder`).
                         ToRunner::Start { run, fence, elsewhere } => {
                             self.admission.carried(me, &run, None, elsewhere, now, &mut said);
-                            self.admission.start(me, &run, fence, now, &mut said);
+                            let (name, e) = (self.me.clone(), self.epoch);
+                            let _ = self.claim_start(&name, e, &run, fence, None, now, &mut said, &mut out);
                         }
                         ToRunner::Ack { run } => self.admission.ack(me, &run),
                         ToRunner::Fast { ask, kernel, epoch, elsewhere } => {
                             self.admission.carried(me, &ask.run, Some(&*ask), elsewhere, now, &mut said);
                             let (name, e) = (self.me.clone(), self.epoch);
-                            let _ = self.fast(&name, e, ask, kernel.handle(), epoch, now, &mut said);
+                            let _ = self.kernel_start(&name, e, ask, kernel.handle(), epoch, None, now, &mut said, &mut out);
                         }
                         ToRunner::Sync => self.admission.sync(me, now, &mut said),
                         // This node's owner hears its own runner's hints, never its tokens: it is
@@ -2049,7 +2114,7 @@ mod measure_tests {
         assert!(reads(&p) == before && !p.measure_due(), "a probe read the machine, or made a measure due");
         let (verdict, _) = p.leg(Ask { run: "leg".into(), ..Ask::default() }, 200);
         assert_eq!(reads(&p), before, "a leg's verdict read the machine");
-        assert_eq!(p.measure_due(), verdict.is_ok(), "a leg's start (only) makes a measure due");
+        assert_eq!(p.measure_due(), matches!(verdict, Some(Ok(()))), "a leg's start (only) makes a measure due");
         let _ = p.local_ended("r0", true, 300);
         assert!(reads(&p) == before && p.measure_due(), "a run's end read the machine at once, or made no measure due");
         p.machine_changed();
@@ -2179,7 +2244,7 @@ mod durable_tests {
         seen.extend(carry(o, d, outs, false, 5_000).await?);
         let fence = go(&seen).ok_or_else(|| anyhow::anyhow!("no go: {seen:?}"))?;
         let (ok, outs) = o.starting(run, "doer", fence, 5_001);
-        anyhow::ensure!(ok, "its claim is held");
+        anyhow::ensure!(ok == Some(true), "its claim is held");
         carry(o, d, outs, false, 5_001).await?;
         let word = o.start_word(run, fence, 1);
         let outs = d.told("asker", &word, 5_002);
@@ -2245,7 +2310,7 @@ mod durable_tests {
             seen.extend(carry(&mut o, &mut d, outs, false, 5_000).await?);
             let fence = go(&seen).ok_or_else(|| anyhow::anyhow!("no go"))?;
             let (ok, _) = o.starting("r-2", "doer", fence, 5_001);
-            anyhow::ensure!(ok);
+            anyhow::ensure!(ok == Some(true));
             // It ends here, before the start is kept: nothing was said.
             drop(o);
             let (mut o, outs) = boot("asker", 2, &ra, &["doer"]).await?;
@@ -2276,7 +2341,7 @@ mod durable_tests {
             start(&mut o, &mut d, "session-1", Some("session:claude")).await?;
             let leg = Ask { run: "leg-1".into(), needs: Needs { request: Resources { cpu: Cpus::whole(1), mem: GIB, disk: 0, gpu: 0 }, ..Needs::default() }, ..Ask::default() };
             let (verdict, _) = d.leg(leg, 5_100);
-            anyhow::ensure!(verdict.is_ok(), "{verdict:?}");
+            anyhow::ensure!(matches!(verdict, Some(Ok(()))), "{verdict:?}");
             keep(&mut d).await?;
             // The runner's process ends; the next starts from its records.
             drop(d);

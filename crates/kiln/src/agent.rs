@@ -2020,6 +2020,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let microvm_ca = ca.clone();
     // kiln's root, which a hand-over's word the server signs chains to (docs/ci.md W27-R08).
     let root = ca.clone();
+    // The machine's certificate, its capacity holder's proof (docs/lb.md "A machine's keeper").
+    let machine_leaf = leaf.clone();
     // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
     // from the settings it stored at once, and keeps running while the server is away.
     let front_door = (!o.ephemeral && !o.outpost).then(|| {
@@ -2155,7 +2157,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 kiln_ci::place::runner::Settings::default()
             })
         });
-        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), on_battery, place, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
+        // `[capacity]`: the machine's capacity keeper its runs' room is held through, none until
+        // both its address and its certificate's name are declared (docs/lb.md "A machine's keeper").
+        let keeper = own.as_ref().and_then(|c| {
+            c.capacity.keeper().unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "no capacity keeper is held through here");
+                None
+            })
+        });
+        let capacity = keeper.map(|(address, keeper_name)| crate::capacity::KeeperAt {
+            address,
+            name: keeper_name,
+            dir: o.state_dir.join("capacity"),
+            server_url: o.server_url.clone(),
+            ca_pem: crate::pki::cert_pem(&root),
+            machine_name: name.clone(),
+            machine: machine_leaf.clone(),
+        });
+        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), on_battery, place, capacity, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
         (Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start(cfg))
     });
     let reach = reach.and_then(|(using, mirrors, started)| match started {
