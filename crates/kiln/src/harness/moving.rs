@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn resume_in_place_every_harness_starts_natively_on_its_own_id() -> anyhow::Result<()> {
         use super::super::kinds::{Kind, Protocol};
-        let has = |a: &[String], f: &str| a.windows(2).any(|w| w[0] == f && w[1] == "own-1");
+        let has = |a: &[String], f: &str| a.windows(2).any(|w| matches!(w, [flag, v] if flag == f && v == "own-1"));
         let asked = |core: &mut super::super::core::Core, method: &str| -> Option<Value> {
             core.take_writes().iter().filter_map(|w| serde_json::from_str::<Value>(w).ok()).find(|v| v.get("method").and_then(Value::as_str) == Some(method))
         };

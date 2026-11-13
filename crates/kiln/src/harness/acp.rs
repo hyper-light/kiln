@@ -1570,7 +1570,7 @@ impl Acp {
                     None => {
                         if self.resume.is_some() {
                             let how = if self.context.is_some() { "starting a new one, given the conversation in words" } else { "starting a new one" };
-                            self.notice(core, Level::Warn, &format!("This agent cannot load earlier sessions; {how}."));
+                            self.notice(core, Level::Warn, format!("This agent cannot load earlier sessions; {how}."));
                         }
                         self.request(core, Pending::Session, "session/new", json!({"cwd": cwd, "mcpServers": self.mcp}));
                     }
