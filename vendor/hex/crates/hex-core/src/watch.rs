@@ -182,6 +182,50 @@ pub struct Limit {
     pub processes: Option<u64>,
 }
 
+/// Refuses, by name, the first bound in `bounds` macOS can't hold of a process box, never dropping it (CLAUDE.md §3),
+/// as Windows' job refuses its own (`crate::job::limits`). macOS caps no group of processes' CPU: its CPU monitor only
+/// reports or ends a process past a rate, and Hex's CPU control holds its managed VMs alone. It throttles no memory at a
+/// level: a footprint limit ends a process past it. And it holds no disk share, latency target or throughput cap. The
+/// bounds it holds are a box's memory and processes, the watcher's ([`Limit`]), and its CPU weight, as its QoS clamp.
+pub fn check(bounds: &hex_api::Bounds) -> Result<(), hex_api::Refusal> {
+    let unheld = [
+        (
+            bounds.cpu_max_milli.is_some(),
+            "cpu_max_milli",
+            "macOS caps no group of processes' CPU: its CPU monitor only reports or ends a process past a rate, and \
+             Hex's CPU control holds its managed VMs alone",
+        ),
+        (
+            bounds.memory_high.is_some(),
+            "memory_high",
+            "macOS throttles no process's memory at a level: a footprint limit ends a process past it",
+        ),
+        (
+            bounds.io_weight.is_some(),
+            "io_weight",
+            "the process class holds no disk share on macOS",
+        ),
+        (
+            bounds.io_latency_us.is_some(),
+            "io_latency_us",
+            "the process class holds no disk latency target on macOS",
+        ),
+        (
+            bounds.io_max.is_some(),
+            "io_max",
+            "the process class holds no disk throughput cap on macOS",
+        ),
+    ];
+    match unheld.into_iter().find(|(named, _, _)| *named) {
+        Some((_, what, why)) => Err(hex_api::Refusal::Platform {
+            what,
+            platform: "macos",
+            why: why.to_owned(),
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Where a member is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Life {
@@ -635,6 +679,70 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
+
+    /// AC-T7.4.1 (CLAUDE.md §3; ROOT, 2026-11-13): the bounds macOS holds of a process box pass, and each it can't is
+    /// refused by name. Do check a box bounded at its memory, processes and CPU weight, then that box at each of a CPU
+    /// cap, a memory level and the three disk bounds; expect the first held and each other refused as macOS's, naming
+    /// its bound.
+    #[test]
+    fn a_bound_macos_cant_hold_is_refused_by_name() {
+        let held = hex_api::Bounds {
+            memory_max: Some(GIB),
+            pids_max: Some(64),
+            cpu_weight: Some(50),
+            ..hex_api::Bounds::default()
+        };
+        assert_eq!(check(&held), Ok(()));
+        let unheld = [
+            (
+                "cpu_max_milli",
+                hex_api::Bounds {
+                    cpu_max_milli: Some(363),
+                    ..held.clone()
+                },
+            ),
+            (
+                "memory_high",
+                hex_api::Bounds {
+                    memory_high: Some(512 * MIB),
+                    ..held.clone()
+                },
+            ),
+            (
+                "io_weight",
+                hex_api::Bounds {
+                    io_weight: Some(100),
+                    ..held.clone()
+                },
+            ),
+            (
+                "io_latency_us",
+                hex_api::Bounds {
+                    io_latency_us: Some(1_000),
+                    ..held.clone()
+                },
+            ),
+            (
+                "io_max",
+                hex_api::Bounds {
+                    io_max: Some(hex_api::IoRates {
+                        read_bps: Some(MIB),
+                        ..hex_api::IoRates::default()
+                    }),
+                    ..held.clone()
+                },
+            ),
+        ];
+        for (bound, bounds) in unheld {
+            assert!(
+                matches!(
+                    check(&bounds),
+                    Err(hex_api::Refusal::Platform { what, platform: "macos", .. }) if what == bound
+                ),
+                "{bound}"
+            );
+        }
+    }
 
     /// AC-T7.4.1/R01: a deterministic real capacity-overflow refusal cannot change lifecycle facts.
     /// This exercises Vec's checked allocation boundary, not host OOM or a native failure campaign.

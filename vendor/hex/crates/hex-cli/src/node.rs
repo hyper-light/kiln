@@ -4,6 +4,7 @@
 //!   hex node --socket <path> --state <dir> [--box-root <cgroup dir>]
 //!            [--quic <address> --credentials <dir> [--staged <dir>]]
 //!   hex node enroll --name <name> --credentials <dir>
+//!   hex node links --socket <path>
 //!
 //! With `--quic` it serves the same seam over QUIC too (docs/design/hex-quic.md Q9): its listener binds `<address>`
 //! and presents the enrollment kept in `--credentials` (its key, made by `hex node enroll`, and kiln's CA's answer to
@@ -12,7 +13,8 @@
 //! stdout before its `ready`. On Linux `--staged` names where it stages file trees over QUIC; a macOS or Windows node
 //! stages none, on any transport. Without `--quic` it binds no QUIC listener. `hex node enroll` begins an enrollment:
 //! a key made here, kept in `<dir>` for this user alone, and its request for kiln's CA, whose path it says as
-//! `request <path>`.
+//! `request <path>`. `hex node links` asks the node serving `<path>` for its links over QUIC (docs/design/hex-quic.md
+//! Q12) and says each as `link <peer> suite <suite> group <group>`.
 //!
 //! On macOS (native plan step 8b) the node is the macOS runtime's `process` class with its boxes'
 //! records kept in `--state` ([`hex_node::recorded::Recorded`]), and, where a Shards guest is configured
@@ -70,6 +72,7 @@ pub fn main(args: &[String]) -> u8 {
     }
     let ran = match args {
         [verb, rest @ ..] if verb == "enroll" => enroll(rest),
+        [verb, rest @ ..] if verb == "links" => links(rest),
         _ => serve(args),
     };
     match ran {
@@ -113,10 +116,45 @@ fn enroll(args: &[String]) -> Result<(), (u8, String)> {
         .map_err(|e| (1, format!("saying the request's path: {e}")))
 }
 
+const LINKS_USAGE: &str = "usage: hex node links --socket <path>";
+
+/// `hex node links --socket <path>`: asks the node serving `<path>` for its links over QUIC
+/// ([`hex_client::Client::links`], docs/design/hex-quic.md Q12) and says each on a line of stdout ([`link_line`]). A
+/// node serving no QUIC listener refuses, typed, and that is said on stderr (exit 1).
+fn links(args: &[String]) -> Result<(), (u8, String)> {
+    let [flag, socket] = args else {
+        return Err((2, LINKS_USAGE.to_owned()));
+    };
+    if flag != "--socket" {
+        return Err((2, format!("unknown argument {flag:?}\n{LINKS_USAGE}")));
+    }
+    let client = hex_client::Client::connect(Path::new(socket)).map_err(|e| (1, e.to_string()))?;
+    let links = client.links().map_err(|e| (1, e.to_string()))?;
+    let mut out = std::io::stdout().lock();
+    links
+        .iter()
+        .try_for_each(|link| out.write_all(link_line(link).as_bytes()))
+        .and_then(|()| out.flush())
+        .map_err(|e| (1, format!("saying the node's links: {e}")))
+}
+
+/// A link as `hex node links` says it: `link <peer> suite <suite> group <group>`, the suite and group as rustls's Debug
+/// names their registries' values, as kiln's reach links say theirs (`TLS13_AES_256_GCM_SHA384`,
+/// `secp384r1MLKEM1024`; one it gives no name as `CipherSuite(0x…)`), and `group none` where the handshake named none.
+/// A peer is its certificate's DNS name, which holds no space, so the line's words are its fields.
+fn link_line(link: &hex_core::wire::Link) -> String {
+    let suite = hex_quic::CipherSuite::from(link.suite);
+    let group = link.group.map_or_else(
+        || "none".to_owned(),
+        |group| format!("{:?}", hex_quic::NamedGroup::from(group)),
+    );
+    format!("link {} suite {suite:?} group {group}\n", link.peer)
+}
+
 #[cfg(target_os = "linux")]
-const USAGE: &str = "usage: hex node --socket <path> --state <dir> [--box-root <cgroup dir>] [--quic <address> --credentials <dir> [--staged <dir>]] | hex node --descriptors [--state <dir>] | hex node enroll --name <name> --credentials <dir>";
+const USAGE: &str = "usage: hex node --socket <path> --state <dir> [--box-root <cgroup dir>] [--quic <address> --credentials <dir> [--staged <dir>]] | hex node --descriptors [--state <dir>] | hex node enroll --name <name> --credentials <dir> | hex node links --socket <path>";
 #[cfg(not(target_os = "linux"))]
-const USAGE: &str = "usage: hex node --socket <path> --state <dir> [--quic <address> --credentials <dir>] | hex node enroll --name <name> --credentials <dir>";
+const USAGE: &str = "usage: hex node --socket <path> --state <dir> [--quic <address> --credentials <dir>] | hex node enroll --name <name> --credentials <dir> | hex node links --socket <path>";
 
 /// `hex node --descriptors [--state <dir>]`: what a node of this process's owner, its state under `state` (`/` where
 /// none is named), running VM boxes where a backend is configured as `hex node` reads it, needs of its soft
@@ -793,6 +831,7 @@ fn guest_requested() -> bool {
         hex_runtime::guest::ENV_SHARDS_BIN,
         hex_runtime::guest::ENV_KERNEL,
         hex_runtime::guest::ENV_INITRD,
+        hex_runtime::guest::ENV_IMAGE,
         hex_runtime::guest::ENV_CPUS,
         hex_runtime::guest::ENV_MEMORY_MIB,
         hex_runtime::guest::ENV_GPU,
@@ -1057,6 +1096,42 @@ mod tests {
                     .starts_with("--staged names where a Linux node stages")
             );
         }
+    }
+
+    /// HEX-QUIC-31 (docs/design/hex-quic.md Q12): `hex node links` says each link on a line of its own, the suite and
+    /// group by rustls's names, a value rustls gives no name by its number, and `none` for a handshake that named no
+    /// group; it takes `--socket <path>` alone. Do: say a link under AES-256-GCM and SecP384r1MLKEM1024, one under a
+    /// suite and a group rustls doesn't name, and one with no group; give the verb no socket and another flag.
+    /// Expect: the three lines; each argument list refused as a usage (2) before anything is reached.
+    #[test]
+    fn hex_quic_31_hex_node_links_says_each_link_as_a_line() {
+        let link = |suite, group| hex_core::wire::Link {
+            peer: "kiln.links.test".to_owned(),
+            suite,
+            group,
+        };
+        assert_eq!(
+            link_line(&link(0x1302, Some(0x11ed))),
+            "link kiln.links.test suite TLS13_AES_256_GCM_SHA384 group secp384r1MLKEM1024\n"
+        );
+        assert_eq!(
+            link_line(&link(0x1306, Some(0x0a0a))),
+            "link kiln.links.test suite CipherSuite(0x1306) group NamedGroup(0xa0a)\n"
+        );
+        assert_eq!(
+            link_line(&link(0x1302, None)),
+            "link kiln.links.test suite TLS13_AES_256_GCM_SHA384 group none\n"
+        );
+        let given = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        assert_eq!(links(&given(&[])).err().unwrap().0, 2);
+        assert_eq!(links(&given(&["--socket"])).err().unwrap().0, 2);
+        let why = links(&given(&["--state", "/s"])).err().unwrap();
+        assert_eq!(why.0, 2);
+        assert!(
+            why.1.starts_with("unknown argument \"--state\""),
+            "{}",
+            why.1
+        );
     }
 
     #[cfg(target_os = "linux")]

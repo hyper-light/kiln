@@ -1,0 +1,63 @@
+Numbered excerpts of opencode's own source at its pin, fetched 2026-11-13 with curl -L: each file's lines naming
+the hosts its row in hosts.tsv cites it for, with the whole file's SHA-256, so each line can be checked against the tag.
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/ai/src/providers/cloudflare-ai-gateway.ts
+   sha256 3b0c056975724e899e008829700ece047e9e99f2876695be8644e1dcc417b71c  7566 bytes  (lines naming: gateway.ai.cloudflare.com)
+    53    `https://gateway.ai.cloudflare.com/v1/${encodeURIComponent(CloudflareShared.requireAccountId(input, id, "CloudflareAIGateway"))}/${encodeURIComponent(gatewayId(input))}/${provider}`
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/ai/src/providers/cloudflare-shared.ts
+   sha256 87038a97ce6d64ea7989182465ace52be068419ce349c63b8072a2d463a52f02  1203 bytes  (lines naming: api.cloudflare.com)
+    16    return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(requireAccountId(input, provider, name))}/ai/v1`
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/core/src/models-dev.ts
+   sha256 0c31c35c88881a9e4c2ba46f9a7890f824f9e93586b46583da168808e897fa61  30113 bytes  (lines naming: models.opencode.ai)
+   494  const defaultSource = "https://models.opencode.ai"
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/core/src/plugin/provider/chatgpt.ts
+   sha256 1448985473a9d5ae23cb5cf9ec6dc4583ad810d77279401a17d26a9f6246f0eb  22834 bytes  (lines naming: auth.openai.com)
+    24  const issuer = "https://auth.openai.com"
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/core/src/plugin/provider/digitalocean.ts
+   sha256 19ea1d0203091e253cc43b7e9cce1c495337d28600126041ebf5b9acb16eac5c  8862 bytes  (lines naming: api.digitalocean.com)
+    24  const routersEndpoint = "https://api.digitalocean.com/v2/gen-ai/models/routers"
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/core/src/plugin/provider/github-copilot.ts
+   sha256 fc90b17e141f0cf0290b0e82e26dd393587e801662cd063537bec3a29a7e3d5f  28207 bytes  (lines naming: api.github.com, github.com)
+    71              { label: "GitHub.com", value: "github.com", description: "Public" },
+   ...
+    90          const domain = enterprise ? normalizeDomain(enterpriseUrl ?? "") : "github.com"
+   ...
+   451    return `${enterprise ? `https://api.${normalizeDomain(enterprise)}` : "https://api.github.com"}/copilot_internal/user`
+   ...
+   463      return "This GitHub account is not signed up for GitHub Copilot. Sign up for Copilot Free at https://github.com/features/copilot/plans and connect again."
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/core/src/plugin/provider/gitlab.ts
+   sha256 fc8380ed968b019d9a85d8d9e26985acbaaf97a51b96c06b40b51a8370124879  22339 bytes  (lines naming: gitlab.com)
+    23  // redirect URI http://127.0.0.1:8080/callback on gitlab.com. Self-managed instances
+   ...
+    30  const gitlabComHost = "gitlab.com"
+   ...
+   140                description: "Leave the default to use gitlab.com, or enter your self-managed GitLab URL.",
+   ...
+   310                : (process.env.GITLAB_INSTANCE_URL ?? "https://gitlab.com"),
+   ...
+   358    return process.env.GITLAB_INSTANCE_URL ?? "https://gitlab.com"
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/core/src/plugin/provider/openai.ts
+   sha256 7eb047bcab5cbb44282259914dcb10897a8d589570789a92f2131822c40913d0  16912 bytes  (lines naming: auth.openai.com, chatgpt.com)
+    18  const issuer = "https://auth.openai.com"
+   ...
+    24  const codexBaseURL = "https://chatgpt.com/backend-api/codex"
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/core/src/plugin/provider/poe.ts
+   sha256 5774214f0105f27657da0669577c2e1904a87204928868009d87a1ed32dc36be  7862 bytes  (lines naming: api.poe.com)
+   132          HttpClientRequest.post("https://api.poe.com/token").pipe(
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/core/src/plugin/provider/xai.ts
+   sha256 0a7fd5d4c8ef942a6a2302d360be93e84c24a3c350de5c5ce21ab5eb2338da9f  8769 bytes  (lines naming: auth.x.ai)
+    10  const issuer = "https://auth.x.ai/oauth2"
+
+== https://raw.githubusercontent.com/anomalyco/opencode/v2.2.7/packages/core/src/ripgrep/binary.ts
+   sha256 cb0866ec835b78eb18eb783198b1959a82469fbd7bfd1f21793d743310831755  7236 bytes  (lines naming: github.com, release-assets.githubusercontent.com)
+   132              const url = `https://github.com/BurntSushi/ripgrep/releases/download/${VERSION}/${filename}`
+

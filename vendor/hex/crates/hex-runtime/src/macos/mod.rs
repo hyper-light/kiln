@@ -632,6 +632,8 @@ impl Runtime for MacRuntime {
                     .to_owned(),
             });
         };
+        // A bound macOS can't hold of a process box is refused, typed, never dropped, in either mode (CLAUDE.md §3).
+        hex_core::watch::check(&spec.bounds)?;
         if let Some(bu) = &self.helper {
             return bu.create(&spec);
         }

@@ -1,0 +1,7 @@
+file	url (fetched 2026-11-13 with curl -L)	sha256
+providers.md	https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/coding-agent/docs/providers.md	9809a2199aea9e0c247caa688bfd33cfce1f293ad0fbd2feb9481148aecd7366
+models.md	https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/coding-agent/docs/models.md	a1a373ac64d62afc3a039d7b614caf1216d3ef9c9278179f9d859eee5ca0855d
+settings.md	https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/coding-agent/docs/settings.md	a0579b5f63a92f96e60e2397d0c2eebfe0ca9957395c146eb682ab1d823bd43a
+cli.md	https://raw.githubusercontent.com/earendil-works/pi/v1.5.2/packages/coding-agent/docs/cli.md	d3b719dafaa11c93841059eb02d0167403e26a19d8845ca54aad3443c58952fc
+hosts.tsv	kiln's table: each host, its provider ids, pi's source at v1.5.2 (URL, SHA-256) and its provider's own page (URL, fetch date, SHA-256, quote)	1f84f400d0fb22e1f9c0ab5416b472ddfa4afdb37d43c746b6db74cec0de885c
+pi-source-excerpts.txt	kiln's numbered excerpt of pi's source at v1.5.2: each file's URL and whole SHA-256 are inside	6fb9fe4b70fd93075f0ced5dc18f5ef8db4709edbd7c052caf34c2899f8c366d

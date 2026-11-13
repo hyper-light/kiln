@@ -107,3 +107,26 @@ subagent finished it on branch p/s21-finish-v1. This file is the finish's record
 | R12 | The one fetcher and unpacker, the one table; pin.sh in the shape of its siblings'. |
 | R15 | Implementer scope: unit and light integration tests; smokes and real-VM runs are ROOT's. |
 | R16 | Nothing reclaimed; this step's build folders on adacachy are under ~/.cache/s21-finish. |
+
+## Hosts by name
+
+Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18, part 4 (plan 01a1d2bd5014705d918ad1f2ce1154f2, step 4).
+`.kiln/images/harness-gemini/Agentfile` grants these hosts by name (Shards D236), on TCP 443, HTTPS's port (RFC 9110
+§4.2.2), and nothing else. Gemini CLI's own docs (geminicli.com) name none of them. Each host is cited to Google's own
+documentation of it, saved as Google publishes it in `evidence/hosts/` (`SOURCES.tsv`: URL, fetch date 2026-11-13,
+SHA-256). Each is also cited to the pinned build's source, which step 18 saved in
+`docs/research/s18-host-in-vm/evidence/` (`gemini-cli-v0.68.0/`, `genai-v1.30.0/`, `google-auth-library-10.9.0/`).
+
+| Host | For | Google's page | The build's source |
+|---|---|---|---|
+| `cloudcode-pa.googleapis.com` | Code Assist, where a Google sign-in's turns go | "Control network access to Gemini Code Assist", `gemini-code-assist-network-access.html`: "the Gemini Code Assist endpoint ( https://cloudcode-pa.googleapis.com ). Don't use wildcards" | gemini-cli `code_assist/server.ts` 73: `CODE_ASSIST_ENDPOINT` |
+| `generativelanguage.googleapis.com` | the Gemini API, signed in with a key | the Gemini API reference, `gemini-api-reference.md` (ai.google.dev/api.md): `https://generativelanguage.googleapis.com` | @google/genai 1.30.0 `src/_api_client.ts` 158 |
+| `oauth2.googleapis.com` | Google's token endpoint: the sign-in's code exchange, its refresh, and the check that a token isn't revoked | "OAuth 2.0 for iOS & Desktop Apps", `google-oauth-native-app.html`: `https://oauth2.googleapis.com/token` and `/revoke` | google-auth-library 10.9.0 `build/src/auth/oauth2client.js` 87-90 |
+| `www.googleapis.com` | the signed-in account's user info, which Gemini CLI caches after a sign-in | Google's OAuth2 API definition, its discovery document `google-oauth2-v2-discovery.json`: rootUrl `https://www.googleapis.com/`, `oauth2.userinfo.get` at `oauth2/v2/userinfo` | gemini-cli `oauth2.ts` 796 |
+
+Not granted:
+- usage statistics (`play.googleapis.com`);
+- Vertex AI's regional hosts (`{location}-aiplatform.googleapis.com`, which the person's region places);
+- npm's update check, which is off.
+
+Unchanged from part 2.

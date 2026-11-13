@@ -583,6 +583,8 @@ fn kind(r: &Refusal) -> &'static str {
             crate::Upstream::RingPinsWithinRoom => "Awaits(RingPinsWithinRoom)",
             crate::Upstream::LiveMove => "Awaits(LiveMove)",
             crate::Upstream::MemberDestinations => "Awaits(MemberDestinations)",
+            crate::Upstream::NestedChannel => "Awaits(NestedChannel)",
+            crate::Upstream::RatePeriod => "Awaits(RatePeriod)",
         },
     }
 }

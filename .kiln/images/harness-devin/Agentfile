@@ -30,13 +30,17 @@ HARNESS devin FROM ./devin-${TARGETARCH}
 # harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
 # name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
 # resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
-# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
-# docs/research/s18-host-in-vm says where each host comes from).
-# - server.codeium.com: Devin's API server for a Windsurf account, the default its build names
-#   (WINDSURF_API_SERVER_URL moves it); api.devin.ai: the same for a devin.ai account;
-#   unleash.codeium.com: its feature flags, asked as it starts (f14). Its error reports (Sentry), its
-#   updater's manifests (static.devin.ai, static.windsurf.com; no updater in this layout, f26), its
-#   sign-in page (app.devin.ai, in the person's browser) and `devin ssh` go nowhere.
+# port or protocol goes out. 443 is HTTPS's port (RFC 9110 4.2.2). Each host is cited to its vendor's own
+# documentation, or, where that names a wildcard or nothing, to the vendor's own source or build, in its
+# harness's record's "Hosts by name" (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18, part 4):
+# docs/research/s25-devin-agentfile/README.md, from Devin's allowlist (docs.devin.ai/desktop/troubleshooting/
+# windsurf-common-issues.md) and Devin 3000.12.43's own build:
+# - api.devin.ai: Devin's API server for a devin.ai account, and the ACP live WebSocket (by name in the allowlist).
+# - server.codeium.com: its API server for a Windsurf account, the default its build names (WINDSURF_API_SERVER_URL
+#   moves it), within the allowlist's .codeium.com.
+# - unleash.codeium.com: its feature flags, asked as it starts, within the same .codeium.com.
+# Its error reports (Sentry), its updater's manifests (static.devin.ai, static.windsurf.com; no updater in this layout,
+# f26), its sign-in page (app.devin.ai, in the person's browser) and `devin ssh` go nowhere.
 # kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
 # kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
 NETWORK --egress=api.devin.ai:443 --egress=server.codeium.com:443 --egress=unleash.codeium.com:443 provider FOR devin

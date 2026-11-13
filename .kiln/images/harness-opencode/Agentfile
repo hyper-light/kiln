@@ -38,19 +38,91 @@ HARNESS opencode FROM ./opencode-${TARGETARCH}-${OPENCODE_LIBC}
 # harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
 # name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
 # resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
-# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
-# docs/research/s18-host-in-vm says where each host comes from).
-# - opencode takes the provider its person configures, so each provider its pinned build carries at
-#   a fixed public host is granted (its provider modules' base URLs), with the sign-in hosts of those
-#   it signs in to itself (ChatGPT, GitHub Copilot, GitLab); opencode.ai (OpenCode Zen and Go);
-#   models.dev, its model catalog (f21); and github.com with release-assets.githubusercontent.com,
-#   for the ripgrep it fetches, checked against its own SHA-256s, where its base has none (f21). Not
-#   granted: a cloud platform's model service, which its own account places (Bedrock, Vertex AI,
-#   Azure, Cloudflare, SAP AI Core, Snowflake); a local or self-hosted server; and npm, for providers
-#   its build lacks and plugins. Each of those needs an Agentfile of your own, made from this one.
+# port or protocol goes out. 443 is HTTPS's port (RFC 9110 4.2.2). Each host is cited to its vendor's own
+# documentation, or, where that names a wildcard or nothing, to the vendor's own source or build, in its
+# harness's record's "Hosts by name" (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18, part 4):
+# docs/research/s22-opencode-agentfile/README.md and its evidence/hosts/hosts.tsv: every provider opencode 2.2.7
+# reaches at a fixed public host: its catalog's (models.opencode.ai, the opencode team's own, which it refreshes
+# live), each through a package the build ships, with Cloudflare's two hosts, the sign-in hosts of those it signs
+# in to itself, and github.com with release-assets.githubusercontent.com for the ripgrep it fetches where its base
+# has none. Not granted: a provider whose account, resource or region places its host (Azure, Bedrock, Vertex AI);
+# a local server; a host the person gives; and npm, for providers its build lacks and plugins. Each of those needs
+# an Agentfile of your own, made from this one.
+# Each host is cited to its provider's own API docs and to the harness's own source, or to that source alone where
+# no page of the provider's own docs names it (ROOT's call of 2026-11-13, the person's bar: zero breaks against
+# today); kiln's launch is to keep only the session's own provider's hosts (plan step 17). Each host, by its provider:
+#   agentrouter.org (agentrouter), ai-gateway.helicone.ai (helicone), ai-gateway.vercel.sh (vercel), ai.zenifra.com
+#   (zenifra), aihubmix.com (aihubmix), aki.io (aki-io), api-gw.klok.ipaas.se (klokintegration),
+#   api-inference.modelscope.cn (modelscope), api-sherlock.cloudferro.com (cloudferro-sherlock), api.302.ai (302ai),
+#   api.abliteration.ai (abliteration-ai), api.above.dev (above), api.ai-router.dev (ai-router), api.ai21.com
+#   (ai21), api.aiand.com (aiand), api.aimlapi.com (aimlapi), api.aixy-gateway.com (aixy), api.ambient.xyz
+#   (ambient), api.anthropic.com (anthropic), api.anyapi.ai (anyapi), api.arcee.ai (arcee), api.auriko.ai (auriko),
+#   api.bee.heossi.com (bee), api.berget.ai (berget), api.cerebras.ai (cerebras), api.clarifai.com (clarifai),
+#   api.claudin.io (claudinio), api.cline.bot (cline-pass), api.cloudflare.com (cloudflare-workers-ai),
+#   api.code.umans.ai (umans-ai, umans-ai-coding-plan), api.cohere.ai (cohere), api.cohere.com (cohere),
+#   api.commandcode.ai (commandcode), api.cortecs.ai (cortecs), api.crossmodel.ai (crossmodel), api.deepinfra.com
+#   (deepinfra), api.deepseek.com (deepseek), api.digitalocean.com (digitalocean), api.dinference.com (dinference),
+#   api.edenai.run (edenai), api.empiriolabs.ai (empiriolabs), api.engy.ai (engy), api.eu.munito.ai (munito-eu),
+#   api.fastino.ai (pioneer), api.fireworks.ai (fireworks-ai), api.freemodel.dev (freemodel), api.friendli.ai
+#   (friendli), api.getlilac.com (lilac), api.github.com (github-copilot), api.githubcopilot.com (github-copilot),
+#   api.gmi-serving.com (gmicloud), api.greenpt.ai (greenpt), api.groq.com (groq), api.hpc-ai.com (hpc-ai),
+#   api.impossibl.com (impossibl), api.inceptionlabs.ai (inception), api.inceptron.io (inceptron), api.inco.ai
+#   (inco), api.inference.boundless.network (boundless), api.inference.crusoecloud.com (crusoe),
+#   api.inference.wandb.ai (wandb), api.intelligence.io.solutions (io-net), api.iteracompute.com (iteracompute),
+#   api.jalapeno-cloud.ai (jalapeno), api.jiekou.ai (jiekou), api.kilo.ai (kilo), api.kimi.ai
+#   (kimi-code-plan-global), api.kimi.com (kimi-code-plan-cn), api.koscompute.com (kosmik), api.lab.vispark.in
+#   (vispark), api.lkeap.cloud.tencent.com (tencent-coding-plan, tencent-token-plan), api.llmgateway.io (llmgateway,
+#   llmgateway-providers), api.llmtech.eu (llmtech), api.longcat.chat (longcat), api.lowrouter.ai (lowrouter),
+#   api.lucidquery.com (lucidquery), api.meganova.ai (meganova), api.melious.ai (melious), api.meta.ai (meta),
+#   api.minimax.cn (minimax-cn, minimax-cn-coding-plan), api.minimax.io (minimax, minimax-coding-plan),
+#   api.mistral.ai (mistral), api.modeloracle.com (model-oracle-ai), api.modular.com (modular), api.moonshot.ai
+#   (moonshotai), api.moonshot.cn (moonshotai-cn), api.morphllm.com (morph), api.munito.ai (munito),
+#   api.nan.builders (nan), api.neuralwatt.com (neuralwatt), api.nova.amazon.com (nova), api.novita.ai (novita-ai),
+#   api.ofox.ai (ofox), api.openai-compat.model-serving.eu01.onstackit.cloud (stackit), api.openai.com (openai),
+#   api.openreason.app (openreason), api.opper.ai (opper), api.orcarouter.ai (orcarouter), api.paretoinference.com
+#   (pareto), api.pendra.ai (pendra), api.perplexity.ai (perplexity, perplexity-agent), api.pinference.ai (prime),
+#   api.poe.com (poe), api.qhaigc.net (qihang-ai), api.qnaigc.com (qiniu-ai), api.reflection.ai (reflection),
+#   api.regolo.ai (regolo-ai), api.routing.run (routing-run), api.runinfra.ai (runinfra), api.sakana.ai (sakana),
+#   api.sambanova.ai (sambanova), api.sarvam.ai (sarvam), api.scaleway.ai (scaleway), api.scnet.cn
+#   (scnet-token-plan), api.scx.ai (scx-ai), api.siliconflow.cn (siliconflow-cn), api.siliconflow.com (siliconflow),
+#   api.stdcmpt.com (standardcompute), api.stepfun.ai (stepfun-ai, stepfun-ai-step-plan), api.stepfun.com (stepfun,
+#   stepfun-step-plan), api.subconscious.dev (subconscious), api.synthetic.new (synthetic), api.tbox.cn (bailing),
+#   api.temprhq.io (tempr), api.tensorx.ai (tensorx), api.thegrid.ai (the-grid-ai), api.together.xyz (togetherai),
+#   api.tokenfactory.nebius.com (nebius), api.tokengo.com (tokengo), api.tokenrouter.com (tokenrouter),
+#   api.trustedrouter.com (trustedrouter), api.unorouter.com (unorouter), api.upstage.ai (upstage), api.venice.ai
+#   (venice), api.vivgrid.com (vivgrid), api.vultrinference.com (vultr), api.wallabytoken.com (wallaby),
+#   api.withhopper.com (hopper), api.x.ai (xai), api.xiaomimimo.com (xiaomi), api.z.ai (zai, zai-coding-plan),
+#   api.zeldoc.ai (zeldoc), apihub.agnes-ai.com (agnes), app.frogbot.ai (frogbot), ark.ap-southeast.bytepluses.com
+#   (byteplus), ark.cn-beijing.volces.com (volcengine, volcengine-coding-plan), auth.openai.com (openai), auth.x.ai
+#   (xai), cc.freemodel.dev (freemodel), chat.d.run (drun), chatgpt.com (openai), cloud-api.near.ai (nearai),
+#   coding-intl.dashscope.aliyuncs.com (alibaba-coding-plan), coding-plan-endpoint.kuaecloud.net
+#   (kuae-cloud-coding-plan), coding.dashscope.aliyuncs.com (alibaba-coding-plan-cn), daoxe.com (daoxe),
+#   dashscope-intl.aliyuncs.com (alibaba), dashscope.aliyuncs.com (alibaba-cn), developer.amd.com.cn (amd),
+#   echo.tracerml.ai (echo), gateway.ai.cloudflare.com (cloudflare-ai-gateway), generativelanguage.googleapis.com
+#   (google), github.com (github-copilot, every-provider(ripgrep)), gitlab.com (gitlab), go.fastrouter.ai
+#   (fastrouter), hyper.charm.land (hyper), infer.flow7.org (infer), inference.baseten.co (baseten),
+#   inference.coralbricks.ai (coralbricks), inference.do-ai.run (digitalocean),
+#   inference.generativeai.us-chicago-1.oci.oraclecloud.com (oci), inference.hetzner.com (hetzner), inference.net
+#   (inference), inference.poolside.ai (poolside), inference.runanywhere.ai (wally), inference.tinfoil.sh (tinfoil),
+#   inference.us-west.modal.direct (modal), integrate.api.nvidia.com (nvidia), kenari.id (kenari), llm.chutes.ai
+#   (chutes), llm.submodel.ai (submodel), llmtr.com (llmtr), maas-api.ebcloud.com (ebcloud), microquickjs.com
+#   (ainetcafe), moark.com (moark), model.inferx.net (inferx), modelishub.com (modelis), models.mixlayer.ai
+#   (mixlayer), models.opencode.ai (every-provider(catalog)), models.think.evroc.com (evroc), nano-gpt.com
+#   (nano-gpt), oai.endpoints.kepler.ai.cloud.ovh.net (ovhcloud), ollama.com (ollama-cloud), open.bigmodel.cn
+#   (zhipuai, zhipuai-coding-plan), openai.blueclaw.network (blueclaw), openai.bothub.ru (bothub), opencode.ai
+#   (opencode, opencode-go), openrouter.ai (openrouter), pass.wafer.ai (wafer.ai),
+#   release-assets.githubusercontent.com (every-provider(ripgrep)), routellm.abacus.ai (abacus),
+#   router.huggingface.co (huggingface), router.inference.ai.exchange (liquid), router.neosmith.ai (neosmith),
+#   router.requesty.ai (requesty), tinker.thinkingmachines.dev (thinkingmachines), token-plan-ams.xiaomimimo.com
+#   (xiaomi-token-plan-ams), token-plan-cn.xiaomimimo.com (xiaomi-token-plan-cn), token-plan-sgp.xiaomimimo.com
+#   (xiaomi-token-plan-sgp), token-plan.ap-southeast-1.maas.aliyuncs.com (alibaba-token-plan),
+#   token-plan.cn-beijing.maas.aliyuncs.com (alibaba-token-plan-cn), token-plan.maas.qianwenaiapi.com
+#   (alibaba-token-plan-cn), token-plan.maas.qwencloudapi.com (alibaba-token-plan), token.sensenova.cn (sensenova),
+#   tokenhub.tencentmaas.com (tencent-tokenhub), vancine.com (vancine), www.xpersona.co (xpersona), zenmux.ai
+#   (zenmux).
 # kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
 # kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
-NETWORK --egress=ai-gateway.vercel.sh:443 --egress=api.anthropic.com:443 --egress=api.cerebras.ai:443 --egress=api.cohere.ai:443 --egress=api.deepinfra.com:443 --egress=api.deepseek.com:443 --egress=api.fireworks.ai:443 --egress=api.github.com:443 --egress=api.githubcopilot.com:443 --egress=api.groq.com:443 --egress=api.meta.ai:443 --egress=api.minimax.io:443 --egress=api.mistral.ai:443 --egress=api.moonshot.ai:443 --egress=api.openai.com:443 --egress=api.poe.com:443 --egress=api.together.xyz:443 --egress=api.typesafe.ai:443 --egress=api.venice.ai:443 --egress=api.x.ai:443 --egress=api.z.ai:443 --egress=auth.openai.com:443 --egress=chatgpt.com:443 --egress=generativelanguage.googleapis.com:443 --egress=github.com:443 --egress=gitlab.com:443 --egress=inference.baseten.co:443 --egress=inference.do-ai.run:443 --egress=models.dev:443 --egress=opencode.ai:443 --egress=openrouter.ai:443 --egress=release-assets.githubusercontent.com:443 provider FOR opencode
+NETWORK --egress=agentrouter.org:443 --egress=ai-gateway.helicone.ai:443 --egress=ai-gateway.vercel.sh:443 --egress=ai.zenifra.com:443 --egress=aihubmix.com:443 --egress=aki.io:443 --egress=api-gw.klok.ipaas.se:443 --egress=api-inference.modelscope.cn:443 --egress=api-sherlock.cloudferro.com:443 --egress=api.302.ai:443 --egress=api.abliteration.ai:443 --egress=api.above.dev:443 --egress=api.ai-router.dev:443 --egress=api.ai21.com:443 --egress=api.aiand.com:443 --egress=api.aimlapi.com:443 --egress=api.aixy-gateway.com:443 --egress=api.ambient.xyz:443 --egress=api.anthropic.com:443 --egress=api.anyapi.ai:443 --egress=api.arcee.ai:443 --egress=api.auriko.ai:443 --egress=api.bee.heossi.com:443 --egress=api.berget.ai:443 --egress=api.cerebras.ai:443 --egress=api.clarifai.com:443 --egress=api.claudin.io:443 --egress=api.cline.bot:443 --egress=api.cloudflare.com:443 --egress=api.code.umans.ai:443 --egress=api.cohere.ai:443 --egress=api.cohere.com:443 --egress=api.commandcode.ai:443 --egress=api.cortecs.ai:443 --egress=api.crossmodel.ai:443 --egress=api.deepinfra.com:443 --egress=api.deepseek.com:443 --egress=api.digitalocean.com:443 --egress=api.dinference.com:443 --egress=api.edenai.run:443 --egress=api.empiriolabs.ai:443 --egress=api.engy.ai:443 --egress=api.eu.munito.ai:443 --egress=api.fastino.ai:443 --egress=api.fireworks.ai:443 --egress=api.freemodel.dev:443 --egress=api.friendli.ai:443 --egress=api.getlilac.com:443 --egress=api.github.com:443 --egress=api.githubcopilot.com:443 --egress=api.gmi-serving.com:443 --egress=api.greenpt.ai:443 --egress=api.groq.com:443 --egress=api.hpc-ai.com:443 --egress=api.impossibl.com:443 --egress=api.inceptionlabs.ai:443 --egress=api.inceptron.io:443 --egress=api.inco.ai:443 --egress=api.inference.boundless.network:443 --egress=api.inference.crusoecloud.com:443 --egress=api.inference.wandb.ai:443 --egress=api.intelligence.io.solutions:443 --egress=api.iteracompute.com:443 --egress=api.jalapeno-cloud.ai:443 --egress=api.jiekou.ai:443 --egress=api.kilo.ai:443 --egress=api.kimi.ai:443 --egress=api.kimi.com:443 --egress=api.koscompute.com:443 --egress=api.lab.vispark.in:443 --egress=api.lkeap.cloud.tencent.com:443 --egress=api.llmgateway.io:443 --egress=api.llmtech.eu:443 --egress=api.longcat.chat:443 --egress=api.lowrouter.ai:443 --egress=api.lucidquery.com:443 --egress=api.meganova.ai:443 --egress=api.melious.ai:443 --egress=api.meta.ai:443 --egress=api.minimax.cn:443 --egress=api.minimax.io:443 --egress=api.mistral.ai:443 --egress=api.modeloracle.com:443 --egress=api.modular.com:443 --egress=api.moonshot.ai:443 --egress=api.moonshot.cn:443 --egress=api.morphllm.com:443 --egress=api.munito.ai:443 --egress=api.nan.builders:443 --egress=api.neuralwatt.com:443 --egress=api.nova.amazon.com:443 --egress=api.novita.ai:443 --egress=api.ofox.ai:443 --egress=api.openai-compat.model-serving.eu01.onstackit.cloud:443 --egress=api.openai.com:443 --egress=api.openreason.app:443 --egress=api.opper.ai:443 --egress=api.orcarouter.ai:443 --egress=api.paretoinference.com:443 --egress=api.pendra.ai:443 --egress=api.perplexity.ai:443 --egress=api.pinference.ai:443 --egress=api.poe.com:443 --egress=api.qhaigc.net:443 --egress=api.qnaigc.com:443 --egress=api.reflection.ai:443 --egress=api.regolo.ai:443 --egress=api.routing.run:443 --egress=api.runinfra.ai:443 --egress=api.sakana.ai:443 --egress=api.sambanova.ai:443 --egress=api.sarvam.ai:443 --egress=api.scaleway.ai:443 --egress=api.scnet.cn:443 --egress=api.scx.ai:443 --egress=api.siliconflow.cn:443 --egress=api.siliconflow.com:443 --egress=api.stdcmpt.com:443 --egress=api.stepfun.ai:443 --egress=api.stepfun.com:443 --egress=api.subconscious.dev:443 --egress=api.synthetic.new:443 --egress=api.tbox.cn:443 --egress=api.temprhq.io:443 --egress=api.tensorx.ai:443 --egress=api.thegrid.ai:443 --egress=api.together.xyz:443 --egress=api.tokenfactory.nebius.com:443 --egress=api.tokengo.com:443 --egress=api.tokenrouter.com:443 --egress=api.trustedrouter.com:443 --egress=api.unorouter.com:443 --egress=api.upstage.ai:443 --egress=api.venice.ai:443 --egress=api.vivgrid.com:443 --egress=api.vultrinference.com:443 --egress=api.wallabytoken.com:443 --egress=api.withhopper.com:443 --egress=api.x.ai:443 --egress=api.xiaomimimo.com:443 --egress=api.z.ai:443 --egress=api.zeldoc.ai:443 --egress=apihub.agnes-ai.com:443 --egress=app.frogbot.ai:443 --egress=ark.ap-southeast.bytepluses.com:443 --egress=ark.cn-beijing.volces.com:443 --egress=auth.openai.com:443 --egress=auth.x.ai:443 --egress=cc.freemodel.dev:443 --egress=chat.d.run:443 --egress=chatgpt.com:443 --egress=cloud-api.near.ai:443 --egress=coding-intl.dashscope.aliyuncs.com:443 --egress=coding-plan-endpoint.kuaecloud.net:443 --egress=coding.dashscope.aliyuncs.com:443 --egress=daoxe.com:443 --egress=dashscope-intl.aliyuncs.com:443 --egress=dashscope.aliyuncs.com:443 --egress=developer.amd.com.cn:443 --egress=echo.tracerml.ai:443 --egress=gateway.ai.cloudflare.com:443 --egress=generativelanguage.googleapis.com:443 --egress=github.com:443 --egress=gitlab.com:443 --egress=go.fastrouter.ai:443 --egress=hyper.charm.land:443 --egress=infer.flow7.org:443 --egress=inference.baseten.co:443 --egress=inference.coralbricks.ai:443 --egress=inference.do-ai.run:443 --egress=inference.generativeai.us-chicago-1.oci.oraclecloud.com:443 --egress=inference.hetzner.com:443 --egress=inference.net:443 --egress=inference.poolside.ai:443 --egress=inference.runanywhere.ai:443 --egress=inference.tinfoil.sh:443 --egress=inference.us-west.modal.direct:443 --egress=integrate.api.nvidia.com:443 --egress=kenari.id:443 --egress=llm.chutes.ai:443 --egress=llm.submodel.ai:443 --egress=llmtr.com:443 --egress=maas-api.ebcloud.com:443 --egress=microquickjs.com:443 --egress=moark.com:443 --egress=model.inferx.net:443 --egress=modelishub.com:443 --egress=models.mixlayer.ai:443 --egress=models.opencode.ai:443 --egress=models.think.evroc.com:443 --egress=nano-gpt.com:443 --egress=oai.endpoints.kepler.ai.cloud.ovh.net:443 --egress=ollama.com:443 --egress=open.bigmodel.cn:443 --egress=openai.blueclaw.network:443 --egress=openai.bothub.ru:443 --egress=opencode.ai:443 --egress=openrouter.ai:443 --egress=pass.wafer.ai:443 --egress=release-assets.githubusercontent.com:443 --egress=routellm.abacus.ai:443 --egress=router.huggingface.co:443 --egress=router.inference.ai.exchange:443 --egress=router.neosmith.ai:443 --egress=router.requesty.ai:443 --egress=tinker.thinkingmachines.dev:443 --egress=token-plan-ams.xiaomimimo.com:443 --egress=token-plan-cn.xiaomimimo.com:443 --egress=token-plan-sgp.xiaomimimo.com:443 --egress=token-plan.ap-southeast-1.maas.aliyuncs.com:443 --egress=token-plan.cn-beijing.maas.aliyuncs.com:443 --egress=token-plan.maas.qianwenaiapi.com:443 --egress=token-plan.maas.qwencloudapi.com:443 --egress=token.sensenova.cn:443 --egress=tokenhub.tencentmaas.com:443 --egress=vancine.com:443 --egress=www.xpersona.co:443 --egress=zenmux.ai:443 provider FOR opencode
 EXPOSE --harnesses=opencode 443/tcp AS egress FOR provider
 CONNECT opencode WITH opencode ON provider
 

@@ -3,11 +3,12 @@
 The microVMs kiln's harnesses run in (`docs/shards.md`; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16), at
 the one Shards revision kiln and Hex build on.
 
-- **Upstream:** https://github.com/hyper-light/shards, commit `e82b9403b863718930fe9f224186d3ae862bfd61`
-  (2026-11-12), MIT (`LICENSE`): its `main`, the one revision kiln's copy of Hex pins too. It has Shards' D237
-  (landed at `e55eea10`), a `shards` built to be carried (`SHARDS_HELPERS=beside`) that starts the VM and network
-  processes beside it, which the program carrying it wrote out and signed; and `shards-afunix`'s fix of a blocking
-  read on Windows that slept through its peer's end (`7ea3ce27`, PM M536), which Hex's client and node link.
+- **Upstream:** https://github.com/hyper-light/shards, commit `1389dc0b60c92d33b3897af6d08690d7a459bba0`
+  (2026-11-12), MIT (`LICENSE`): its `main`, the one revision kiln's copy of Hex pins too (Hex `025aae6d`, which
+  makes no change to Shards). Beside what `e82b9403` had (D237's `shards` built to be carried, `shards-afunix`'s
+  fix of a read that slept through its peer's end, PM M536), it has the two changes Hex had made to its image API:
+  each member's reach of the destinations kept (D246) and the run host started holding its three standard
+  streams alone (D248).
 - **How kiln uses it:**
   - its Agentfile parser and build checks, `shards-agentfile`, linked: every Agentfile kiln keeps is checked in
     kiln's own process (`crates/kiln/src/agentfiles/check.rs`);
@@ -34,12 +35,9 @@ Each change is recorded in `vendor/patches/shards/`, applied in this order on up
 | File | Change | Why | Recorded as |
 |---|---|---|---|
 | `Cargo.toml`, `Cargo.lock` | aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0 from crates.io, their lock entries holding the SHA-256s upstream's `vendor/README.md` lists, instead of from `vendor/` | upstream's copies are those crates.io packages byte for byte, and kiln vendors aws-lc-rs itself (`vendor/aws-lc-rs`, 1.18.2 with Mantle's change): kiln's tree holds one copy of each project. Shards' own crates name 1.18.1 and aws-lc-sys 0.45.0 (`shards-sigstore` calls it), so its build keeps those versions; as T4 took it on 2026-10-21 | `0001-aws-lc-rs-and-aws-lc-sys-from-crates-io.patch` |
-| `crates/api/Cargo.toml`, `crates/api/src/image.rs`, `crates/api/src/image/session.rs`, `crates/api/src/image/spawn.rs` | the run host (`shards api-run`) started holding its three standard streams alone: through posix_spawn with file actions for 0, 1 and 2 (`POSIX_SPAWN_CLOEXEC_DEFAULT` on Apple's), and through `CreateProcessW` with a handle list of those three alone | Hex's change to Shards (its joint plan step 12), which Hex's copy of Shards carries at this revision and kiln's one copy carries with it: std's `Command` hands the run host whatever another thread of its orchestrator holds inheritable at that moment, on macOS and Windows | `0002-image-the-run-host-started-holding-its-three-standard.patch` |
-| `crates/api/src/image/wire.rs` | each member's reach of the destinations kept, which its run host holds it to (D236, the image channel's version 9) | Hex's change to Shards (its joint plan step 15), carried as the one above: a harness held to exactly the providers and host its grants name, a run refused before its VM starts where a member would reach other than that | `0003-image-each-member-s-reach-of-the-destinations-kept-which-its.patch` |
 
-The first change is kiln's layout alone (`Kiln-only:`), so it isn't offered upstream. The second and third are
-Hex's own, offered to Shards by Hex's lead (their records in `vendor/hex/vendor/patches/shards` are kiln's, byte for
-byte: `vendor/hex/UPSTREAM.md`).
+The change is kiln's layout alone (`Kiln-only:`), so it isn't offered upstream. Hex's two changes to Shards'
+image API are upstream's own since D246 and D248, so neither kiln's copy nor Hex's carries them.
 
 ## Taking a newer upstream
 

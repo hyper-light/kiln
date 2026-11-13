@@ -434,9 +434,14 @@ impl Relay {
         writer: &Arc<Mutex<hex_client::guest::DuplexOwner>>,
     ) -> Result<(), Gone> {
         let exec = match wire::read_request_apart(message, wire::MAX_MESSAGE) {
-            Ok((header, Request::Call(Call::Exec { streams, .. } | Call::Run { streams, .. }))) => {
-                Some((header, streams))
-            }
+            Ok((
+                header,
+                Request::Call(
+                    Call::Exec { streams, .. }
+                    | Call::Run { streams, .. }
+                    | Call::Member { streams, .. },
+                ),
+            )) => Some((header, streams)),
             _ => None,
         };
         let Some((header, streams)) = exec else {

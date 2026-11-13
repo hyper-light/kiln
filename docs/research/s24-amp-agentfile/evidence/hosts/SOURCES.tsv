@@ -1,0 +1,5 @@
+file	url (fetched 2026-11-13 with curl -L)	sha256
+llms.txt	https://ampcode.com/llms.txt	53dee757772773b2d11668551c68a6af10f3a0dc1ad1f8746dbce4a765d5ecf2
+cli-settings.md	https://ampcode.com/docs/markdown/cli/settings	e59b5fdeaccdd5f83674e45d39083b836d3e9baf48ad58a18c3ad4701afc3778
+cli-runners.md	https://ampcode.com/docs/markdown/cli/runners	09fab4a27812367951cc4551c643db6bd772a8c56d0a43048496b8e5b097fb24
+amp-build.txt	kiln's excerpt of Amp 0.0.1794456033-gb2ff22's pinned build (its URL and SHA-256 inside)	bccaead412eed6a414da10a3318937bdbfe8f529e396899acc9c5fd1f5cccb13

@@ -102,6 +102,66 @@ pub trait Runtime: Send + Sync {
             ),
         })
     }
+
+    /// Tells box `id`'s guest the room its caller's budget leaves it (D188; Shards' D241; joint plan step 14, C7): the
+    /// caller's budget-left for the box, everything the VM holds coming out of it, in bytes past what the box holds now,
+    /// negative where the budget is short of that (its guest then reclaims its file pages); none lifts the hold.
+    /// Answers the bytes the guest holds itself within past what it uses, none where no budget holds it, waiting for
+    /// that answer while the box runs. A class whose boxes have no guest to tell refuses it, naming the class.
+    fn room(&self, id: &BoxId, room: Option<i64>) -> Result<Option<u64>, Refusal> {
+        let _ = room;
+        Err(Refusal::Invalid {
+            what: "room",
+            why: format!(
+                "box {id} isn't a Shards image box: only its guest holds itself within a room"
+            ),
+        })
+    }
+
+    /// Holds box `id`'s vCPUs together to `rate` milli-CPU of the host's time (Shards' D247; joint plan step 14, C4),
+    /// none lifting the hold. Answers what its VM holds them to, none where nothing does, waiting for that answer while
+    /// the box runs. A class whose boxes have no vCPUs to hold refuses it, naming the class.
+    fn rate(
+        &self,
+        id: &BoxId,
+        rate: Option<std::num::NonZeroU64>,
+    ) -> Result<Option<std::num::NonZeroU64>, Refusal> {
+        let _ = rate;
+        Err(Refusal::Invalid {
+            what: "rate",
+            why: format!(
+                "box {id} isn't a Shards image box: only its VM holds its vCPUs to a rate"
+            ),
+        })
+    }
+
+    /// What box `id`'s VM costs its host beside its guest, as its run host reads its VM process (Shards' D241; joint
+    /// plan steps 12 and 14, C1): counters since the VM booted, so a reader's window is between two of its reads.
+    /// Refused, typed, for a part its run host didn't read, never read as none, for a box not running, and by a class
+    /// whose boxes run no VM process of their own, naming the class.
+    fn host_use(&self, id: &BoxId) -> Result<HostUse, Refusal> {
+        Err(Refusal::Invalid {
+            what: "host_use",
+            why: format!(
+                "box {id} runs no VM process of its own: only a Shards image VM's run host reads its cost"
+            ),
+        })
+    }
+}
+
+/// What a box's VM costs its host beside its guest (Shards' D241, `Stats::microvm`; joint plan steps 12 and 14), each
+/// a counter since the VM booted, as its run host read its VM process.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostUse {
+    /// Its VM process's CPU time, user and system together, in nanoseconds: its vCPUs' guest time among it, read just
+    /// before it, so this less their sum is its VMM's own.
+    pub cpu_ns: u64,
+    /// Its own memory, as memory per VM is counted: macOS's physical footprint, Linux's anonymous resident pages,
+    /// Windows' private working set.
+    pub footprint_bytes: u64,
+    pub resident_bytes: u64,
+    /// Nanoseconds each vCPU has run the guest, by vCPU index, one for each vCPU of the VM's size.
+    pub guest_ns: Vec<u64>,
 }
 
 /// CPU milli, memory bytes and writable-volume bytes; devices are not inferred from a pool.
@@ -953,6 +1013,35 @@ impl LearnedEnd {
     }
 }
 
+/// Joint plan step 14 (C1; ROOT, 2026-11-13): a profile's VMM overhead past its envelope as its node's learner has seen
+/// it, each dimension the most its VMs' windows showed past the envelope, or none yet: its cold start, typed, never a
+/// zero. A window in which a VM ran into its CPU cap is no CPU sample (Karn's point, decision 9).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearnedOverhead {
+    pub cpu_milli: Option<u64>,
+    pub mem_bytes: Option<u64>,
+    pub disk_bytes: Option<u64>,
+}
+
+impl LearnedOverhead {
+    /// Whether no window has shown any of it yet: its profile's cold start.
+    pub fn cold(&self) -> bool {
+        self.cpu_milli.is_none() && self.mem_bytes.is_none() && self.disk_bytes.is_none()
+    }
+}
+
+/// Joint plan step 14 (C1): one profile's ceiling on a class's capacity answer: what a VM of it is admitted at, its
+/// receipt's guest envelope ([`Allocation::guest`]), and the VMM overhead its node has learned past it. A VM's ceiling
+/// is the envelope and the overhead, the envelope alone in a dimension still cold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearnedCeiling {
+    pub profile: [u8; 32],
+    pub envelope: CapacityResources,
+    pub overhead: LearnedOverhead,
+}
+
 /// Joint plan step 14 (C2, C8): what a node learned of one class's microVMs, carried on its capacity answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -982,9 +1071,28 @@ pub struct Learned {
         deserialize_with = "Learned::deserialize_ends"
     )]
     pub ended: Vec<LearnedEnd>,
+    /// Each offered profile's ceiling (C1), at most one per profile and envelope. Added after the ends, so absent
+    /// means none (append-only).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "Learned::deserialize_ceilings"
+    )]
+    pub ceilings: Vec<LearnedCeiling>,
 }
 
 impl Learned {
+    /// At most [`MAX_LEARNED_PRIORS`]: one for each profile it offers.
+    pub fn deserialize_ceilings<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<LearnedCeiling>, D::Error> {
+        bounded_values(
+            deserializer,
+            MAX_LEARNED_PRIORS,
+            "learned ceilings exceed a class's profiles",
+        )
+    }
+
     /// At most [`MAX_LEARNED_PRIORS`].
     pub fn deserialize_priors<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -1019,8 +1127,25 @@ impl Learned {
     }
 
     /// At most [`MAX_LEARNED_PRIORS`] priors, each booking within its ceiling, no profile and ceiling twice; at most
-    /// [`MAX_LEARNED_HOLDINGS`] holdings, no box twice; at most as many ends.
+    /// [`MAX_LEARNED_HOLDINGS`] holdings, no box twice; at most as many ends; at most [`MAX_LEARNED_PRIORS`]
+    /// ceilings, no profile and envelope twice.
     pub fn check(&self) -> Result<(), Refusal> {
+        if self.ceilings.len() > MAX_LEARNED_PRIORS {
+            return Err(Refusal::Exhausted {
+                what: "learned ceilings",
+                bound: MAX_LEARNED_PRIORS,
+            });
+        }
+        for (at, ceiling) in self.ceilings.iter().enumerate() {
+            if self.ceilings.iter().take(at).any(|earlier| {
+                earlier.profile == ceiling.profile && earlier.envelope == ceiling.envelope
+            }) {
+                return Err(Refusal::Invalid {
+                    what: "learned ceilings",
+                    why: "a profile and envelope repeat".to_owned(),
+                });
+            }
+        }
         if self.ended.len() > MAX_LEARNED_HOLDINGS {
             return Err(Refusal::Exhausted {
                 what: "learned ends",
@@ -1092,6 +1217,7 @@ impl Learned {
             used: self.used,
             holdings,
             ended,
+            ceilings: copy_capacity_values(&self.ceilings, "learned ceilings")?,
         })
     }
 }
@@ -1860,7 +1986,9 @@ pub enum Upstream {
     /// alone.
     MemberGrantsByName,
     /// What a runtime nested under shards-init needs: a delegated cgroup subtree, CAP_SYS_ADMIN for
-    /// its boxes' namespaces and DRM render nodes, granted by name.
+    /// its boxes' namespaces and DRM render nodes, granted by name. Given in part since Shards 66113379:
+    /// D234's nesting grant (shards-api's `ImageSpec::nesting`) gives the subtree and the capabilities. Not given
+    /// yet: its GPUs' identities and render nodes (D234's `gpus=`, which no image boot's GPU selection carries).
     NestedRuntime,
     /// The Windows host of an image's run: `shards api-run` on Windows, which Shards gives since
     /// 731b5e54 (D231). No call awaits it now; its place in [`Upstream::ALL`] stays, as the node's
@@ -1899,16 +2027,25 @@ pub enum Upstream {
     /// (joint plan step 14, C5).
     LiveMove,
     /// A destination (D236: a host's name, an IPv4 address or the host itself, by TCP) kept for the members an
-    /// orchestrator grants it alone. Given by Hex's recorded change to Shards (vendor/shards and vendor/shards-gpu,
-    /// change 0002: each member's reach in D231's narrowing, held by the run host before the VM starts), so no call
+    /// orchestrator grants it alone. Given by Shards' D246 (7a4ef5c02, upstream from Hex's change 0002, which Hex no
+    /// longer carries): each member's reach in D231's narrowing, held by the run host before the VM starts, so no call
     /// awaits it now (joint plan step 15, docs/design/network-grants.md N4). Its tag stays, the wire being
     /// append-only.
     MemberDestinations,
+    /// A host's connection to a runtime it nests under shards-init: Hex's node, its init the run's own command under
+    /// D234's grant (docs/design/node-under-shards-init.md §5). The node's relay listens on AF_UNIX sockets there, as
+    /// the workload's filter refuses vsock. Shards' agent-control endpoint (D238) has no lane that carries a connection
+    /// to such a socket, and D231's run host binds no endpoint (Shards 7a4ef5c0).
+    NestedChannel,
+    /// The period a Shards VM's rate holds over (D247's hold is D191's governor, its period CFS's), as Shards' API
+    /// says it: shards-api exposes neither a call nor a const for it, so a learner capping a VM through its rate can't
+    /// take its window from it (joint plan step 14, C1).
+    RatePeriod,
 }
 
 impl Upstream {
     /// Every capability, in the order the node's wire tags them.
-    pub const ALL: [Upstream; 15] = [
+    pub const ALL: [Upstream; 17] = [
         Upstream::GuestCpuTimePerVcpu,
         Upstream::MemberExec,
         Upstream::MemberGrantsByName,
@@ -1924,6 +2061,8 @@ impl Upstream {
         Upstream::RingPinsWithinRoom,
         Upstream::LiveMove,
         Upstream::MemberDestinations,
+        Upstream::NestedChannel,
+        Upstream::RatePeriod,
     ];
 }
 
@@ -1962,6 +2101,12 @@ impl std::fmt::Display for Upstream {
             Self::LiveMove => "a running Shards microVM moved to another machine (Shards' D176)",
             Self::MemberDestinations => {
                 "a Shards destination kept for the members granted it alone (given by Hex's recorded Shards change)"
+            }
+            Self::NestedChannel => {
+                "a connection to a runtime nested under shards-init (a lane of Shards' agent-control endpoint to its socket)"
+            }
+            Self::RatePeriod => {
+                "the period a Shards VM's rate holds over (D191's governor), which shards-api doesn't expose"
             }
         })
     }

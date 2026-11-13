@@ -18,19 +18,44 @@ HARNESS goose FROM ./goose-${TARGETARCH}
 # harness alone, which it joins with no flow to any member, and TCP out to the hosts below alone, by
 # name, through the network's boundary (--egress) and the microVM's (EXPOSE ... AS egress). Each name
 # resolves for it through the agents' resolver, and no other does. Nothing comes in; no other host,
-# port or protocol goes out (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18:
-# docs/research/s18-host-in-vm says where each host comes from).
-# - Goose takes the provider its person configures, so each provider Goose 1.59.0 carries at a fixed
-#   public host is granted (crates/goose/src/providers: its declarative definitions and its
-#   providers' own constants), with the sign-in hosts of those it signs in to itself (ChatGPT,
-#   Gemini's Code Assist, GitHub Copilot, Hugging Face, Kimi, Meta, xAI). Not granted: a cloud
-#   platform's model service, which its own account places (Bedrock, Vertex AI, Azure, Databricks,
-#   Snowflake); a local or self-hosted server (Ollama, LM Studio, LiteLLM ...); and a provider whose
-#   host its person gives (an environment variable's). Each of those needs an Agentfile of your own,
-#   made from this one.
+# port or protocol goes out. 443 is HTTPS's port (RFC 9110 4.2.2). Each host is cited to its vendor's own
+# documentation, or, where that names a wildcard or nothing, to the vendor's own source or build, in its
+# harness's record's "Hosts by name" (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18, part 4):
+# docs/research/s23-goose-agentfile/README.md and its evidence/hosts/hosts.tsv: every provider Goose 1.59.0
+# reaches at a fixed public host, with the sign-in hosts of those it signs in to itself, and TypeSafe's for its auto
+# effort. Not granted: a provider whose account, resource or region places its host (Bedrock, SageMaker, Azure,
+# Databricks, Snowflake, Vertex AI, Tanzu); a local or self-hosted server (Ollama, LM Studio, LiteLLM ...); and a host
+# the person gives (an environment variable's, a custom provider's). Each of those needs an Agentfile of your own,
+# made from this one.
+# Each host is cited to its provider's own API docs and to the harness's own source, or to that source alone where
+# no page of the provider's own docs names it (ROOT's call of 2026-11-13, the person's bar: zero breaks against
+# today); kiln's launch is to keep only the session's own provider's hosts (plan step 17). Each host, by its provider:
+#   ai-gateway.vercel.sh (Vercel AI Gateway), ai.salad.cloud (SaladCloud AI Gateway), aihubmix.com (AIHubMix),
+#   api.aigateway.sh (AIgateway), api.aimlapi.com (AI/ML API), api.anthropic.com (Anthropic), api.avian.io (Avian),
+#   api.cerebras.ai (Cerebras), api.deepseek.com (DeepSeek), api.empiriolabs.ai (EmpirioLabs AI), api.eurouter.ai
+#   (EUrouter), api.fireworks.ai (Fireworks AI), api.friendli.ai (Friendli AI), api.github.com (GitHub Copilot
+#   token), api.githubcopilot.com (GitHub Copilot), api.gondola-ai.com (Gondola), api.groq.com (Groq),
+#   api.inceptionlabs.ai (Inception), api.intelligence.io.solutions (IO Intelligence), api.kimi.com (Kimi Code),
+#   api.meta.ai (Meta | Meta (Muse Code)), api.minimax.io (MiniMax), api.mistral.ai (Mistral AI), api.moonshot.cn
+#   (Moonshot), api.novita.ai (Novita AI), api.openai.com (OpenAI), api.opper.ai (Opper), api.orcarouter.ai
+#   (OrcaRouter), api.perplexity.ai (Perplexity), api.router.tetrate.ai (Tetrate Agent Router Service),
+#   api.routerplex.com (RouterPlex), api.routstr.com (Routstr), api.sakana.ai (Sakana AI), api.saygm.com (SayGM),
+#   api.scaleway.ai (Scaleway), api.tensorix.ai (Tensorix), api.together.xyz (Together AI), api.trustedrouter.com
+#   (TrustedRouter), api.typesafe.ai (TypeSafe, for auto effort (GOOSE_AUTO_EFFORT_ENABLED and TYPESAFE_API_KEY)),
+#   api.venice.ai (Venice.ai), api.x.ai (xAI), api.z.ai (Z.AI | Z.AI Coding Plan), auth.kimi.com (Kimi Code
+#   sign-in), auth.meta.com (Meta (Muse Code) sign-in), auth.openai.com (ChatGPT Codex sign-in), auth.x.ai (xAI
+#   sign-in), chatgpt.com (ChatGPT Codex), cloud-api.near.ai (NEAR AI Cloud), cloudcode-pa.googleapis.com (Gemini
+#   (Google sign-in, Code Assist)), dashscope-intl.aliyuncs.com (Alibaba (Qwen)), futurmix.ai (FuturMix),
+#   generativelanguage.googleapis.com (Gemini), github.com (GitHub Copilot device sign-in), huggingface.co (Hugging
+#   Face sign-in), inference.celeris.ai (Celeris), integrate.api.nvidia.com (NVIDIA),
+#   maas-token-api.cn-huabei-1.xf-yun.com (iFlytek Astron MaaS), nano-gpt.com (NanoGPT),
+#   oai.endpoints.kepler.ai.cloud.ovh.net (OVHcloud), oauth2.googleapis.com (Gemini (Google sign-in) token
+#   endpoint), ollama.com (Ollama Cloud), open.bigmodel.cn (Zhipu AI), opencode.ai (OpenCode Go | OpenCode Zen |
+#   OpenCode Zen and Go), openrouter.ai (OpenRouter), router.huggingface.co (Hugging Face), router.pleum.ai
+#   (PleumRouter), spark-api-open.xf-yun.com (iFlytek Spark).
 # kiln's MCP isn't granted here, nor in any of kiln's Agentfiles: it reaches the harness over the link
 # kiln drives it by, as that link's own `mcp` lane (Shards D254), never over the network.
-NETWORK --egress=ai-gateway.vercel.sh:443 --egress=ai.salad.cloud:443 --egress=aihubmix.com:443 --egress=api.aigateway.sh:443 --egress=api.aimlapi.com:443 --egress=api.anthropic.com:443 --egress=api.avian.io:443 --egress=api.cerebras.ai:443 --egress=api.deepseek.com:443 --egress=api.empiriolabs.ai:443 --egress=api.eurouter.ai:443 --egress=api.fireworks.ai:443 --egress=api.friendli.ai:443 --egress=api.github.com:443 --egress=api.githubcopilot.com:443 --egress=api.gondola-ai.com:443 --egress=api.groq.com:443 --egress=api.inceptionlabs.ai:443 --egress=api.intelligence.io.solutions:443 --egress=api.kimi.com:443 --egress=api.meta.ai:443 --egress=api.minimax.io:443 --egress=api.mistral.ai:443 --egress=api.novita.ai:443 --egress=api.openai.com:443 --egress=api.opper.ai:443 --egress=api.orcarouter.ai:443 --egress=api.perplexity.ai:443 --egress=api.router.tetrate.ai:443 --egress=api.routerplex.com:443 --egress=api.sakana.ai:443 --egress=api.saygm.com:443 --egress=api.scaleway.ai:443 --egress=api.tensorix.ai:443 --egress=api.together.xyz:443 --egress=api.trustedrouter.com:443 --egress=api.typesafe.ai:443 --egress=api.venice.ai:443 --egress=api.x.ai:443 --egress=api.z.ai:443 --egress=auth.kimi.com:443 --egress=auth.meta.com:443 --egress=auth.openai.com:443 --egress=auth.x.ai:443 --egress=chatgpt.com:443 --egress=cloud-api.near.ai:443 --egress=cloudcode-pa.googleapis.com:443 --egress=dashscope-intl.aliyuncs.com:443 --egress=futurmix.ai:443 --egress=generativelanguage.googleapis.com:443 --egress=github.com:443 --egress=huggingface.co:443 --egress=inference.celeris.ai:443 --egress=integrate.api.nvidia.com:443 --egress=nano-gpt.com:443 --egress=oai.endpoints.kepler.ai.cloud.ovh.net:443 --egress=oauth2.googleapis.com:443 --egress=ollama.com:443 --egress=opencode.ai:443 --egress=openrouter.ai:443 --egress=router.huggingface.co:443 --egress=router.pleum.ai:443 --egress=spark-api-open.xf-yun.com:443 --egress=www.googleapis.com:443 provider FOR goose
+NETWORK --egress=ai-gateway.vercel.sh:443 --egress=ai.salad.cloud:443 --egress=aihubmix.com:443 --egress=api.aigateway.sh:443 --egress=api.aimlapi.com:443 --egress=api.anthropic.com:443 --egress=api.avian.io:443 --egress=api.cerebras.ai:443 --egress=api.deepseek.com:443 --egress=api.empiriolabs.ai:443 --egress=api.eurouter.ai:443 --egress=api.fireworks.ai:443 --egress=api.friendli.ai:443 --egress=api.github.com:443 --egress=api.githubcopilot.com:443 --egress=api.gondola-ai.com:443 --egress=api.groq.com:443 --egress=api.inceptionlabs.ai:443 --egress=api.intelligence.io.solutions:443 --egress=api.kimi.com:443 --egress=api.meta.ai:443 --egress=api.minimax.io:443 --egress=api.mistral.ai:443 --egress=api.moonshot.cn:443 --egress=api.novita.ai:443 --egress=api.openai.com:443 --egress=api.opper.ai:443 --egress=api.orcarouter.ai:443 --egress=api.perplexity.ai:443 --egress=api.router.tetrate.ai:443 --egress=api.routerplex.com:443 --egress=api.routstr.com:443 --egress=api.sakana.ai:443 --egress=api.saygm.com:443 --egress=api.scaleway.ai:443 --egress=api.tensorix.ai:443 --egress=api.together.xyz:443 --egress=api.trustedrouter.com:443 --egress=api.typesafe.ai:443 --egress=api.venice.ai:443 --egress=api.x.ai:443 --egress=api.z.ai:443 --egress=auth.kimi.com:443 --egress=auth.meta.com:443 --egress=auth.openai.com:443 --egress=auth.x.ai:443 --egress=chatgpt.com:443 --egress=cloud-api.near.ai:443 --egress=cloudcode-pa.googleapis.com:443 --egress=dashscope-intl.aliyuncs.com:443 --egress=futurmix.ai:443 --egress=generativelanguage.googleapis.com:443 --egress=github.com:443 --egress=huggingface.co:443 --egress=inference.celeris.ai:443 --egress=integrate.api.nvidia.com:443 --egress=maas-token-api.cn-huabei-1.xf-yun.com:443 --egress=nano-gpt.com:443 --egress=oai.endpoints.kepler.ai.cloud.ovh.net:443 --egress=oauth2.googleapis.com:443 --egress=ollama.com:443 --egress=open.bigmodel.cn:443 --egress=opencode.ai:443 --egress=openrouter.ai:443 --egress=router.huggingface.co:443 --egress=router.pleum.ai:443 --egress=spark-api-open.xf-yun.com:443 provider FOR goose
 EXPOSE --harnesses=goose 443/tcp AS egress FOR provider
 CONNECT goose WITH goose ON provider
 
