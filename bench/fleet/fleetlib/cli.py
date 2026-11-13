@@ -11,7 +11,7 @@ import sys
 from typing import List
 
 from . import controller, records, report
-from .agent import Agent
+from .agent import Agent, needs_room
 from .records import Records
 
 LABEL = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -29,6 +29,9 @@ def host_main(argv: List[str]) -> int:
     p.add_argument("--out", required=True, help="the run's directory on this host: records.jsonl, logs, and the scope (s/) it removes at the end")
     p.add_argument("--label", default=socket.gethostname().split(".")[0], help="this host's name in the records")
     p.add_argument("--shards", required=True, help="the shards binary under test")
+    p.add_argument("--driver", choices=("shards", "hex"), default="shards", help="who places the VMs: Shards' daemon (shards, the direct driver) or a Hex scheduler of the run's own (hex)")
+    p.add_argument("--hex", default="", help="the hex binary under test (--driver hex)")
+    p.add_argument("--vm", default="", help="each VM's size, as the run asks Hex to admit it: cpus=N,mem=SIZE (--driver hex; Hex sizes a VM by what it admits, never by Shards' default)")
     p.add_argument("--image", required=True, help="the workload's image, pinned by digest (NAME@sha256:...)")
     p.add_argument("--ballast", type=int, default=0, help="bytes the workload holds resident before it answers, from a recorded harness's footprint (README, the profile); 0: the stub's own")
     p.add_argument("--needs", default=os.environ.get("KILN_NEEDS", ""), help="the room the run is held to, as kiln run's --needs says it (default: KILN_NEEDS)")
@@ -48,6 +51,13 @@ def host_main(argv: List[str]) -> int:
         p.error(f"--image {o.image!r} isn't pinned by a digest: a tag that moves between hosts or runs would measure another image")
     if o.deadline_s <= 0:
         p.error("--deadline-s must be positive")
+    if o.driver == "hex":
+        vm = needs_room(o.vm)
+        if not o.hex:
+            p.error("--driver hex needs --hex, the hex binary under test")
+        if vm["cpu"] is None or vm["mem"] is None or vm["cpu"] <= 0 or vm["cpu"] % 1000 or vm["mem"] <= 0:
+            p.error(f"--vm {o.vm!r}: whole CPUs and a memory size (cpus=1,mem=512m): a Shards VM's vCPUs are whole")
+        o.hex = os.path.abspath(os.path.expanduser(o.hex))
     o.out = os.path.abspath(os.path.expanduser(o.out))
     o.shards = os.path.abspath(os.path.expanduser(o.shards))
     rec = Records(os.path.join(o.out, "records.jsonl"), o.label, os.path.basename(os.path.dirname(o.out)) or o.label, sys.stdout if o.echo else None)
