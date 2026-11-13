@@ -176,8 +176,8 @@ def _mac_rusage(pid: int):
     return int(info.phys_footprint), cpu_ns, str(info.proc_start_abstime)
 
 
-def _mac_table() -> Dict[int, Proc]:
-    out = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,stat=,args="], capture_output=True, text=True, errors="replace", check=False).stdout
+def _mac_ps(*select: str) -> Dict[int, Proc]:
+    out = subprocess.run(["ps", *select, "-ww", "-o", "pid=,ppid=,stat=,args="], capture_output=True, text=True, errors="replace", check=False).stdout
     table: Dict[int, Proc] = {}
     for line in out.splitlines():
         parts = line.split(None, 3)
@@ -194,6 +194,10 @@ def _mac_table() -> Dict[int, Proc]:
             mem, cpu_ns, start = got
             table[pid] = Proc(pid, ppid, name, args, start, mem, "footprint", cpu_ns, zombie)
     return table
+
+
+def _mac_table() -> Dict[int, Proc]:
+    return _mac_ps("-ax")
 
 
 # --------------------------------------------------------------------------------- Windows
@@ -252,8 +256,12 @@ def fill_mem(procs_: Dict[int, Proc], pids: Iterable[int]) -> None:
 
 
 def one(pid: int) -> Optional[Proc]:
+    """One process, read alone (an ask reads its client's start this way, so a wave's asks
+    never read the whole table each)."""
     if sys.platform.startswith("linux"):
         return _linux_one(pid, 1_000_000_000 // os.sysconf("SC_CLK_TCK"))
+    if sys.platform == "darwin":
+        return _mac_ps("-p", str(pid)).get(pid)
     return table().get(pid)
 
 

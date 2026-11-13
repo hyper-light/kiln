@@ -112,6 +112,20 @@ class Lanes:
             pass
         s.wfd = -1
 
+    def drop(self, name: str) -> None:
+        """Forgets lane `name`: neither of its ends is watched any more (its owner closes them,
+        and a descriptor number the OS gives out again is never found still registered)."""
+        s = self.streams.pop(name, None)
+        if s is None:
+            return
+        self._want_write(s, False)
+        if s.open:
+            s.open = False
+            try:
+                self.sel.unregister(s.rfd)
+            except (KeyError, ValueError):
+                pass
+
     def busy(self) -> int:
         return sum(1 for s in self.streams.values() if s.op is not None)
 
@@ -163,21 +177,31 @@ class Lanes:
                     time.sleep(timeout)
                 return until()
             for key, mask in self.sel.select(timeout):
-                s: Stream = key.data
-                if mask & selectors.EVENT_WRITE and key.fd == s.wfd and s.op is not None:
-                    op = s.op
-                    try:
-                        op.sent += os.write(s.wfd, op.out[op.sent : op.sent + (1 << 20)])
-                    except BlockingIOError:
-                        pass
-                    except OSError as e:
-                        self._end(s, f"write: {e}")
-                        continue
-                    if op.sent >= len(op.out):
-                        self._want_write(s, False)
-                if mask & selectors.EVENT_READ and key.fd == s.rfd:
-                    self._read(s)
+                self._serve(key, mask)
         return True
+
+    def poll(self) -> None:
+        """Serves what is ready now, without waiting: a wave's lanes are served between its
+        spawns, so an echo that came is never charged the spawns after it."""
+        if self.sel.get_map():
+            for key, mask in self.sel.select(0):
+                self._serve(key, mask)
+
+    def _serve(self, key: selectors.SelectorKey, mask: int) -> None:
+        s: Stream = key.data
+        if mask & selectors.EVENT_WRITE and key.fd == s.wfd and s.op is not None:
+            op = s.op
+            try:
+                op.sent += os.write(s.wfd, op.out[op.sent : op.sent + (1 << 20)])
+            except BlockingIOError:
+                pass
+            except OSError as e:
+                self._end(s, f"write: {e}")
+                return
+            if op.sent >= len(op.out):
+                self._want_write(s, False)
+        if mask & selectors.EVENT_READ and key.fd == s.rfd:
+            self._read(s)
 
     def _read(self, s: Stream) -> None:
         try:

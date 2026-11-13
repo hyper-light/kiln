@@ -37,6 +37,11 @@ MUTATIONS = [
     ("agent.py", "                last_t = now\n        return True", "                return False\n        return True", "a stall never cuts a batch short"),
     ("agent.py", "            if first:\n", "            if False:\n", "a lag settles before it is judged"),
     ("shards.py", "if p is None or p.zombie or", "if p is None or", "zombies are no VMs"),
+    ("shards.py", "        for pid in under | named:\n            p = table.get(pid)", "        self.macs = {}\n        for pid in under | named:\n            p = table.get(pid)", "a network process is the run's while it lives"),
+    ("agent.py", "            self.lanes.poll()\n", "", "a wave's echoes are read between its spawns"),
+    ("agent.py", "        for f in (v.popen.stdin, v.popen.stdout):", "        for f in ():", "an ended ask's descriptors close"),
+    ("agent.py", "        except OSError as e:\n            # The host gave the harness no client", "        except ValueError as e:\n            # The host gave the harness no client", "a refused spawn is typed"),
+    ("shards.py", "rec[\"vm\"] = self.macs.get(_flag(p.args, \"--mac\") or \"\", 0)", "rec[\"vm\"] = self.macs.get(_flag(p.args, \"--mac\") or \"\")", "a network process with no VM ever is an orphan"),
 ]
 
 

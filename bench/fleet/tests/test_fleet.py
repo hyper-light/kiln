@@ -5,6 +5,7 @@ here; the live campaign is ROOT's (README).
 Run: python3 -m unittest discover -s bench/fleet/tests -v
 """
 
+import gc
 import json
 import os
 import random
@@ -17,7 +18,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from fleetlib import chaos, derive, lane, procs, records, report, stats, witness  # noqa: E402
+from fleetlib import chaos, derive, hostfacts, lane, procs, records, report, stats, witness  # noqa: E402
 from fleetlib.agent import needs_room  # noqa: E402
 from fleetlib.shards import Shards  # noqa: E402
 
@@ -262,6 +263,9 @@ class Procs(unittest.TestCase):
             self.assertIn(os.getpid(), t)
             self.assertEqual(under[0], child.pid)
             self.assertGreaterEqual(len(under), 2)
+            # Memory is read for the scope's processes alone, as the scan reads it (Linux's table
+            # leaves it out: smaps_rollup walks every mapping of a process).
+            procs.fill_mem(t, [os.getpid()])
             me = t[os.getpid()]
             self.assertTrue(me.start)
             if sys.platform != "win32":
@@ -273,6 +277,17 @@ class Procs(unittest.TestCase):
                 except OSError:
                     pass
             child.wait()
+
+    @unittest.skipIf(sys.platform == "win32", "Windows keeps no open-file rlimit")
+    def test_the_open_file_limit_is_lifted_to_the_most_the_os_lets_a_process_hold(self):
+        import resource
+
+        soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        got = hostfacts.raise_nofile()
+        self.assertEqual(got, [int(x) for x in resource.getrlimit(resource.RLIMIT_NOFILE)])
+        self.assertGreaterEqual(got[0], soft)
+        if sys.platform.startswith("linux"):
+            self.assertEqual(got[0], got[1])
 
     def test_kill_refuses_a_pid_whose_start_differs(self):
         p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -323,6 +338,7 @@ class Scan(unittest.TestCase):
         home_scope = "/tmp/fleet-x/s"
         sh = Shards.__new__(Shards)
         sh.home = home_scope + "/h"
+        sh.macs = {}
         P = procs.Proc
         t = {
             100: P(100, 1, "shards", ["shards", "run", "daemon"], "1", 10, "pss", 0),
@@ -343,6 +359,36 @@ class Scan(unittest.TestCase):
         self.assertEqual(got[102]["vm"], 103)
         self.assertEqual(got[201]["vm"], 200)
         self.assertEqual((got[103]["role"], got[101]["role"]), ("vm", "shards"))
+
+    def test_a_network_process_outliving_its_vm_is_found_and_is_an_orphan(self):
+        sh = Shards.__new__(Shards)
+        sh.home = "/tmp/fleet-x/s/h"
+        sh.macs = {}
+        P = procs.Proc
+        vm = P(200, 1, "shards-vm", ["shards-vm", "run", "--net", "5,6,7,0a:02", "--kernel", sh.home + "/guest/k"], "5", 300, "pss", 0)
+        net = P(201, 1, "shards-net", ["shards-net", "--mac", "0a:02"], "6", 20, "pss", 0)
+        before = sh.scan({200: vm, 201: net}, [])
+        self.assertEqual(W.check(live_ledger("a"), before, {"a": [200]}, {"mem": 10_000}, None, True), [])
+        # The VM is gone; its network process lingers, reparented, naming no home.
+        after = sh.scan({201: net}, [])
+        self.assertEqual([(p["pid"], p["vm"]) for p in after], [(201, 200)])
+        ledger = live_ledger("a")
+        ledger["a"].move(W.KILLED)
+        ledger["a"].move(W.ENDED)
+        self.assertEqual([v["witness"] for v in W.check(ledger, after, {}, {"mem": 10_000}, None, True)], ["orphan"])
+
+    def test_a_network_process_under_the_daemon_with_no_vm_ever_is_an_orphan(self):
+        sh = Shards.__new__(Shards)
+        sh.home = "/tmp/fleet-x/s/h"
+        sh.macs = {}
+        P = procs.Proc
+        t = {
+            100: P(100, 1, "shards", ["shards", "run", "daemon"], "1", 10, "pss", 0),
+            102: P(102, 100, "shards-net", ["shards-net", "--mac", "0a:09"], "3", 20, "pss", 0),
+        }
+        got = sh.scan(t, [100])
+        self.assertEqual([(p["pid"], p["vm"]) for p in got], [(102, 0)])
+        self.assertEqual([v["witness"] for v in W.check({}, got, {}, {"mem": 10_000}, None, True)], ["orphan"])
 
 
 class Settle(unittest.TestCase):
@@ -419,6 +465,89 @@ def lane_agent(d, deadline_s, needs, workloads):
         a.vms[t] = Vm(t, i, p, "", 0, 1)
         a.lanes.add(lane.Stream(t, p.stdin.fileno(), p.stdout.fileno(), lambda why: None, p.stdin.close))
     return a, rec, ps
+
+
+def shards_agent(d, delay_s=0.0, binary=None):
+    """An agent on the real direct driver whose `shards` is a stand-in that is `cat` (each VM a
+    local echo; `list` and `remove` answer nothing), each spawn `delay_s` slow."""
+    from types import SimpleNamespace
+
+    from fleetlib.agent import Agent
+
+    if binary is None:
+        binary = os.path.join(d, "shards")
+        with open(binary, "w") as f:
+            f.write("#!/bin/sh\nexec cat\n")
+        os.chmod(binary, 0o755)
+    o = SimpleNamespace(deadline_s=60, out=d, shards=binary, seed=1, needs="mem=1g", label="h", image="i@sha256:00",
+                        ballast=0, chaos="none", rounds=0, repo=d, rev="", controller_t=0, keep_home=False)
+    rec = records.Records(os.path.join(d, "r.jsonl"), "h", "run")
+    a = Agent(o, rec)
+    os.makedirs(a.logs, exist_ok=True)
+    a.waits["start"].answered(1_000_000_000)
+    a.scan = lambda why: {}
+    if delay_s:
+        real = a.shards.start_vm
+
+        def slow(*args, **kw):
+            time.sleep(delay_s)
+            return real(*args, **kw)
+
+        a.shards.start_vm = slow
+    return a, rec
+
+
+def open_fds():
+    # Earlier tests' cyclic garbage (agents, their pipes) is collected first, never mid-count.
+    gc.collect()
+    return len(os.listdir("/dev/fd"))
+
+
+@unittest.skipIf(sys.platform == "win32", "lanes select on pipes, which Windows can't (README, Owed)")
+class Asks(unittest.TestCase):
+    """Asks on the real direct driver, each VM a local `cat`."""
+
+    def test_a_waves_echoes_are_read_between_its_spawns_not_after_them(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = shards_agent(d, delay_s=0.5)
+            tokens = a.ask_wave(5)
+            a.serve(lambda: all(a.ledger[t].state != W.STARTING for t in tokens), "start")
+            a.drain()
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            starts = {r["token"]: r["start_ns"] for r in got if r["kind"] == "started"}
+            spawns = [r["spawn_ns"] for r in got if r["kind"] == "ask"]
+            self.assertEqual(sorted(starts), sorted(tokens))
+            self.assertTrue(all(s >= 500_000_000 for s in spawns), spawns)
+            # Read only after the wave's spawns, the first ask's start could be no less than all
+            # five of them: read between them, it is charged its own and those under way until its
+            # echo came.
+            self.assertLess(starts[tokens[0]], sum(spawns), (starts, spawns))
+
+    def test_an_ended_ask_leaves_no_descriptor_behind(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = shards_agent(d)
+            before = open_fds()
+            tokens = a.ask_wave(5)
+            a.serve(lambda: all(a.ledger[t].state != W.STARTING for t in tokens), "start")
+            self.assertEqual(len(a.live()), 5)
+            self.assertGreater(open_fds(), before)
+            a.drain()
+            self.assertEqual(open_fds(), before)
+            self.assertEqual(a.states(), {W.ENDED: 5})
+            rec.close()
+
+    def test_a_spawn_the_host_refuses_is_a_typed_refusal_that_stops_the_fill(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = shards_agent(d, binary=os.path.join(d, "missing"))
+            a.fill("test")
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            failed = [r for r in got if r["kind"] == "start_failed"]
+            self.assertEqual(a.states(), {W.REFUSED: 1})
+            self.assertEqual((len(failed), failed[0]["refused"]), (1, True))
+            self.assertTrue(failed[0]["why"].startswith("spawn: "), failed[0])
+            self.assertEqual([r["refused"] for r in got if r["kind"] == "fill_stopped"], [[failed[0]["token"]]])
 
 
 @unittest.skipIf(sys.platform == "win32", "lanes select on pipes, which Windows can't (README, Owed)")
@@ -521,6 +650,11 @@ class Report(unittest.TestCase):
             self.assertEqual([r["kind"] for r in got], ["rtt", "unparsed"])
             self.assertEqual((got[0]["host"], got[0]["run"], got[0]["ns"]), ("h1", "run1", 5))
             json.dumps(got)
+            import gzip
+
+            with open(path, "rb") as src, gzip.open(path + ".gz", "wb") as dst:
+                dst.write(src.read())
+            self.assertEqual(records.read_all(path + ".gz"), got)
 
 
 if __name__ == "__main__":

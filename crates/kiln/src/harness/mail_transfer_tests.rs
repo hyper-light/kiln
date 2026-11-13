@@ -103,14 +103,11 @@ fn same_certificate_with_a_new_instance_cannot_pass_stored_transfer_principal_ga
             let restarted=join(&hub,b,"machine-destination","destination-restarted",3).map_err(refusal)?;
             assert_eq!(restarted.peer,original.peer);assert_eq!(restarted.machine,original.machine);assert_ne!(restarted.instance,original.instance);
             assert!(hub.instances.load().current_connection(b));assert_eq!(hub.instances.load().owner(&Owned::Agent(session.into())),Some(b));
-            // 2026-11-13: the destination's process restarted, its sessions with it (a runner
-            // restart keeps them): the machine's newest process holds what it held, at its
-            // committed epoch. Before, it never could, and they read offline with their mail held.
-            assert!(allows_claim(&hub,b,session,Some(2)).await,"the destination's successor on its machine holds its sessions");
-            assert!(!allows_claim(&hub,b,session,Some(1)).await,"still at the committed epoch");
-            assert!(allows_generic_adoption(&hub,b,session,true).await);
-            assert!(dispatch_ready(&hub,session,&capacity(2)).await.map_err(refusal)?);
-            assert_eq!(send(&hub,&original,TransferDown::Committed { manifest:committed.manifest.clone() }).await,Err(Refusal::Unavailable),"the original process is gone");
+            assert!(!allows_claim(&hub,b,session,Some(2)).await,"same certificate and valid epoch are insufficient after instance change");
+            assert!(!allows_claim(&hub,b,session,None).await,"inventory also requires the stored instance");
+            assert!(!allows_generic_adoption(&hub,b,session,true).await);
+            assert!(!dispatch_ready(&hub,session,&capacity(2)).await.map_err(refusal)?);
+            assert_eq!(send(&hub,&original,TransferDown::Committed { manifest:committed.manifest.clone() }).await,Err(Refusal::Stale));
             assert_eq!(handoffs::latest(&hub.store,session.into()).await.map_err(refusal)?,Some(committed),"new process metadata cannot rewrite durable authenticated binding");
             Ok(())
         }.await;
@@ -119,29 +116,71 @@ fn same_certificate_with_a_new_instance_cannot_pass_stored_transfer_principal_ga
     })
 }
 
-/// 2026-11-13: while a handover's source lives, only it holds the session and mail waits; a
-/// process still alive on the machine fences off one that isn't the machine's newest; and once the
-/// source is gone (a runner restart left three handovers Prepared, Amphora's among them) the
-/// destination that was ready for it holds it, and mail goes there.
+/// 2026-11-12: adacachy's runner started again as a new process, and the sessions a committed
+/// hand-over had bound to its old process were never claimable: their Opens dropped, their mail
+/// refused as a stale owner's, their streams started over without end. The process that
+/// superseded the binding's, holding the session past the binding's epoch, claims it and gets
+/// its mail; at the binding's epoch, or with no epoch, it doesn't (the instance fence stands),
+/// and while the old process is connected no other process does.
 #[test]
-fn a_handover_its_source_left_unfinished_is_held_by_the_destination() -> anyhow::Result<()> {
+fn superseded_binding_lets_its_successor_past_the_epoch_claim() -> anyhow::Result<()> {
     crate::rt::block_on(async {
         let hub=crate::hub::tests::scratch_hub().await?;
         let result: anyhow::Result<()>=async {
-            let session="transfer-source-gone";let (a,b)=(0x1a_u64,0x1b_u64);
-            let source=join(&hub,a,"machine-one","old-process",1).map_err(refusal)?;
-            let destination=join(&hub,b,"machine-one","new-process",2).map_err(refusal)?;
-            let manifest=manifest("source-gone",session,0)?;
-            handoffs::offer(&hub.store,manifest.clone(),source,destination.clone()).await.map_err(refusal)?;
-            assert_eq!(handoffs::prepare(&hub.store,manifest,destination).await.map_err(refusal)?.phase,Phase::Prepared);
+            let session="transfer-superseded-binding";let (a,b,c)=(0x1a_u64,0x1b_u64,0x1c_u64);
+            let source=join(&hub,a,"machine-source","source-instance",1).map_err(refusal)?;
+            let bound=join(&hub,b,"machine-held","held-old",2).map_err(refusal)?;
+            commit(&hub,manifest("superseded-binding",session,4)?,source,bound).await?;
+            // A second process of the machine while the bound one is connected: no claim.
+            join(&hub,c,"machine-held","held-other",3).map_err(refusal)?;
+            assert!(!allows_claim(&hub,c,session,Some(6)).await,"the bound process is connected: no other process claims");
+            // The bound process ends; its machine's runner starts again.
+            hub.instances.update(|instances|{instances.lost(b);instances.lost(c);});
+            join(&hub,b,"machine-held","held-new",4).map_err(refusal)?;
             hub.instances.update(|instances|instances.own(Owned::Agent(session.into()),b));
-            assert!(!allows_claim(&hub,b,session,Some(1)).await,"its source lives: the handover may still finish");
-            assert!(!dispatch_ready(&hub,session,&capacity(1)).await.map_err(refusal)?,"mail waits for it");
-            assert!(allows_claim(&hub,a,session,Some(0)).await,"the source still holds it");
-            hub.instances.update(|instances|instances.connected(a));
-            assert!(allows_claim(&hub,b,session,Some(1)).await,"the source gone, the destination holds it");
-            assert!(allows_generic_adoption(&hub,b,session,true).await);
-            assert!(dispatch_ready(&hub,session,&capacity(1)).await.map_err(refusal)?,"its mail goes");
+            assert!(!allows_claim(&hub,b,session,Some(5)).await,"at the binding's epoch the fence stands");
+            assert!(!allows_claim(&hub,b,session,None).await,"an inventory carries no epoch: the fence stands");
+            assert!(!dispatch_ready(&hub,session,&capacity(5)).await.map_err(refusal)?);
+            assert!(allows_claim(&hub,b,session,Some(6)).await,"past the binding's epoch its successor claims it");
+            assert!(dispatch_ready(&hub,session,&capacity(6)).await.map_err(refusal)?,"and its mail goes to it");
+            Ok(())
+        }.await;
+        hub.shutdown.cancel();
+        result
+    })
+}
+
+/// 2026-11-12, Amphora: a hand-over its source's process prepared and then left (that process
+/// superseded) stood prepared for good, its session unclaimable and its mail held. It commits for
+/// the destination that prepared it and is connected; with that destination gone too it aborts.
+#[test]
+fn unfinished_handover_of_a_superseded_source_settles() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub=crate::hub::tests::scratch_hub().await?;
+        let result: anyhow::Result<()>=async {
+            let (a,b)=(0x2a_u64,0x2b_u64);
+            let source=join(&hub,a,"machine-one","one-old",1).map_err(refusal)?;
+            let destination=join(&hub,b,"machine-one","one-next",2).map_err(refusal)?;
+            let committed="transfer-prepared-live";
+            let m=manifest("prepared-live",committed,0)?;
+            handoffs::offer(&hub.store,m.clone(),source.clone(),destination.clone()).await.map_err(refusal)?;
+            handoffs::prepare(&hub.store,m,destination.clone()).await.map_err(refusal)?;
+            let aborted="transfer-offered-gone";
+            let n=manifest("offered-gone",aborted,0)?;
+            handoffs::offer(&hub.store,n,source,destination).await.map_err(refusal)?;
+            // While the source is connected nothing moves.
+            assert!(!allows_claim(&hub,b,committed,Some(1)).await);
+            assert_eq!(handoffs::latest(&hub.store,committed.into()).await.map_err(refusal)?.map(|r|r.phase),Some(Phase::Prepared));
+            // The source's process ends and its runner starts again.
+            hub.instances.update(|instances|{instances.lost(a);});
+            join(&hub,a,"machine-one","one-again",3).map_err(refusal)?;
+            hub.instances.update(|instances|instances.own(Owned::Agent(committed.into()),b));
+            assert!(allows_claim(&hub,b,committed,Some(1)).await,"the prepared destination claims it at its epoch");
+            assert_eq!(handoffs::latest(&hub.store,committed.into()).await.map_err(refusal)?.map(|r|r.phase),Some(Phase::Committed));
+            assert!(dispatch_ready(&hub,committed,&capacity(1)).await.map_err(refusal)?);
+            // Offered only (never prepared): aborted, the session back with its source's epoch.
+            assert!(dispatch_ready(&hub,aborted,&capacity(0)).await.map_err(refusal)?);
+            assert_eq!(handoffs::latest(&hub.store,aborted.into()).await.map_err(refusal)?.map(|r|r.phase),Some(Phase::Aborted));
             Ok(())
         }.await;
         hub.shutdown.cancel();
