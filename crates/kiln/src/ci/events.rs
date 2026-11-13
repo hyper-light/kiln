@@ -44,8 +44,10 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
     }
     // A manual run of one pipeline runs that one only.
     let wanted = |l: &load::Loaded| t.pipeline.as_deref().is_none_or(|p| l.path == p || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(p));
-    // GitHub's workflows; the kiln dialect's too once `[ci] kiln_workflows` takes them off v1.
-    let engine_runs = |l: &load::Loaded| l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows;
+    // GitHub's workflows; the kiln dialect's too once the repository's `kiln_workflows`, else the
+    // server's `[ci] kiln_workflows`, takes them off v1 (W29-R16).
+    let kiln = super::repo_config::kiln_workflows(hub, repo).await;
+    let engine_runs = |l: &load::Loaded| l.dialect == kiln_ci::expr::Dialect::Gha || kiln;
     let running: Vec<&load::Loaded> = commit.workflows.iter().filter(|l| l.runs && engine_runs(l) && wanted(l)).collect();
     if running.is_empty() {
         return Ok(false);
@@ -67,7 +69,8 @@ pub async fn start_one(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<Op
         return Ok(None);
     }
     let commit = load::load(hub, repo, &t.sha).await?;
-    let engine_runs = |l: &load::Loaded| l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows;
+    let kiln = super::repo_config::kiln_workflows(hub, repo).await;
+    let engine_runs = |l: &load::Loaded| l.dialect == kiln_ci::expr::Dialect::Gha || kiln;
     let Some(l) = commit.workflows.iter().find(|l| l.runs && engine_runs(l) && (l.path == p || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(p))) else { return Ok(None) };
     let event = event(hub, repo, t).await;
     let (message, author) = gitops::commit_info(hub, repo, &t.sha).await;
