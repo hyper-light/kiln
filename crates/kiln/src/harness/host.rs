@@ -702,7 +702,7 @@ pub struct Host {
     /// Where this machine holds isolated agents' harnesses, microVMs of their own (kiln plan
     /// 01a1cd8e862e7169a074db3d5fa33f3d step 17, `crate::sandbox::microvm`): none where its kiln
     /// carries no microVM runtime, and then it holds no isolated agent.
-    microvm: Mutex<Option<Arc<dyn kiln_seams::Sandbox>>>,
+    microvm: Mutex<Option<Arc<crate::sandbox::Microvms>>>,
 }
 
 /// Most of what waits in one session's lane: past it, what's sent is refused (a message, `Full`).
@@ -998,15 +998,15 @@ impl Host {
 
     /// Where this machine holds isolated agents' harnesses (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
     /// step 17): its microVMs, where its kiln carries their runtime.
-    pub fn microvm(&self) -> Option<Arc<dyn kiln_seams::Sandbox>> {
+    pub fn microvm(&self) -> Option<Arc<crate::sandbox::Microvms>> {
         self.microvm.lock().clone()
     }
 
-    /// Holds isolated agents' harnesses in `sandbox` from now on: a test's stand-in for the
-    /// machine's microVMs.
+    /// Holds isolated agents' harnesses in `vms` from now on: a test's stand-in for the machine's
+    /// microVMs.
     #[cfg(test)]
-    pub fn hold_isolated_in(&self, sandbox: Arc<dyn kiln_seams::Sandbox>) {
-        *self.microvm.lock() = Some(sandbox);
+    pub fn hold_isolated_in(&self, vms: crate::sandbox::Microvms) {
+        *self.microvm.lock() = Some(Arc::new(vms));
     }
 
     /// Takes no messages (`on`), or takes them again: a new build that takes its sessions over from
@@ -5003,6 +5003,12 @@ while True:
         Ok((program, heard))
     }
 
+    /// Kiln's Agentfile for Claude Code, as an isolated session started with none named is made from.
+    fn claude_image() -> anyhow::Result<crate::sandbox::image::Source<'static>> {
+        let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("kiln ships no Agentfile for Claude Code"))?;
+        Ok(crate::sandbox::image::Source::Builtin(claude))
+    }
+
     /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17: an isolated agent's harness runs as its
     /// image's member in a microVM of its own (here the machine's microVMs' stand-in,
     /// `crate::sandbox::fake`), no process of the machine's, and its session drives it as on the
@@ -5020,8 +5026,10 @@ while True:
             let (program, heard) = stand_in(dir.path())?;
             let (tx, _rx) = async_channel::unbounded();
             let host = with_inbox(tx);
-            let vms = Arc::new(crate::sandbox::fake::FakeVms::with("harness-claude", "claude", &program));
-            host.hold_isolated_in(Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>);
+            // Its image already in the store of the machine's microVMs, as its build left it: nothing is built.
+            let (images, pinned) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
+            let vms = Arc::new(crate::sandbox::fake::FakeVms::with(&pinned, "claude", &program));
+            host.hold_isolated_in(crate::sandbox::Microvms { sandbox: Arc::clone(&vms) as Arc<dyn kiln_seams::Sandbox>, images });
             let cwd = dir.path().to_string_lossy().into_owned();
             let spec = Spec { kind: "claude".into(), cwd: Some(cwd.clone()), isolation: Some(session::Isolation::microvm()), ..Spec::default() };
             let s = host.open(Some("isolated".into()), spec)?;
@@ -5031,7 +5039,8 @@ while True:
             assert_eq!(*s.pid.lock(), None, "no process of the machine's is its harness");
             let first = vms.launched();
             let launch = first.first().ok_or_else(|| anyhow::anyhow!("nothing was launched"))?;
-            assert_eq!((launch.program.as_str(), &launch.boundary, launch.folder.as_deref()), ("claude", &Boundary::MicroVm { image: "harness-claude".into() }, Some(cwd.as_str())));
+            assert_eq!((launch.program.as_str(), &launch.boundary, launch.folder.as_deref()), ("claude", &Boundary::MicroVm { image: pinned.clone() }, Some(cwd.as_str())));
+            assert!(pinned.starts_with("harness-claude@sha256:"), "kiln's image for Claude Code, pinned by its digest: {pinned}");
             assert!(launch.args.iter().any(|a| a == "--session-id"), "its session's own flags, past its image's: {:?}", launch.args);
             // Steered: a message is a turn, answered.
             assert!(host.command("isolated", message("m1", "hello")));
@@ -5088,7 +5097,8 @@ while True:
             assert_eq!(refused, crate::sandbox::NO_MICROVM);
             assert!(host.get("nowhere").is_none(), "nothing was opened");
             // The simulator holds no microVM run: the launch is refused, typed, and said as its end.
-            host.hold_isolated_in(Arc::new(kiln_seams::sandbox::SimSandbox::new()));
+            let (images, _) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
+            host.hold_isolated_in(crate::sandbox::Microvms { sandbox: Arc::new(kiln_seams::sandbox::SimSandbox::new()), images });
             let s = host.open(Some("somewhere".into()), spec)?;
             let said = crate::rt::timeout(Duration::from_secs(60), async {
                 loop {

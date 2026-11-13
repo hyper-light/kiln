@@ -132,6 +132,12 @@ pub struct Spec {
     /// are isolated too. A machine that can't hold it so refuses it, never running it as a process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<Isolation>,
+    /// The text of the Agentfile `isolation`'s image names where it's one of a person's own
+    /// (`agentfile:<id>`), as kiln's server read it from their Agentfiles as it started, at its
+    /// latest version (`harness::lineage::kept_agentfile`), for its machine to build its microVM
+    /// from. Set by kiln, never from what was asked (`POST /api/harness/sessions` drops it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentfile: Option<String>,
     /// What a person branched it from (`Command::Branch`): a session's id, or `<session>/<task>`
     /// for one of that session's harness's own subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,6 +186,7 @@ impl Default for Spec {
             subagent: false,
             workspace: None,
             isolation: None,
+            agentfile: None,
             variant_of: None,
         }
     }
@@ -4281,7 +4288,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     // the machine's microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), and
                     // never a process here; a machine without them refuses it.
                     None if isolated => match files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm()) {
-                        Some(sandbox) => crate::sandbox::isolated::launch(kind, &spec, sandbox.as_ref()).await,
+                        Some(vms) => crate::sandbox::isolated::launch(kind, &spec, vms.as_ref()).await,
                         None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
                     },
                     // In the session's group of processes where the machine has them, and marked as

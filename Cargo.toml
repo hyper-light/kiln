@@ -92,6 +92,7 @@ rquickjs-sys = { path = "vendor/shards/vendor/rquickjs-sys" }
 seccompiler = { path = "vendor/hex/vendor/seccompiler" }
 shards-agentfile = { path = "vendor/shards/crates/agentfile" }
 shards-api = { path = "vendor/shards/crates/api" }
+shards-image = { path = "vendor/shards/crates/image" }
 quiver = { path = "vendor/quiver/crates/quiver" }
 quiver-api = { path = "vendor/quiver/crates/quiver-api" }
 # vorpal, the search across a change (docs/ci.md W26-R07): its crates, the tree-sitter runtime it
