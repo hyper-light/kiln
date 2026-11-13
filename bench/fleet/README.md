@@ -27,13 +27,60 @@ whole stack a run measured. Hex is driven through its own scheduler's command li
   (the hard limit; on macOS kern.maxfilesperproc, where a shell's soft limit is 256) and records it
   (`nofile` in its `host` record); an ask whose client the host can't spawn is refused, typed
   (`start_failed`, `refused`), and the fill stops there. An ended ask's descriptors close with it.
-- **The driver** decides how a VM is asked for. Built: `shards`, the direct driver (below), which is
-  the baseline every placer is held to and the harness's light test. Owed: `hex` and `kiln`
-  (Owed, below).
+- **The driver** decides how a VM is asked for: `shards`, the direct driver (below), the baseline
+  every placer is held to and the harness's light test; `hex`, a Hex scheduler of the run's own
+  ("The hex driver", below). Owed: `kiln` (Owed, below).
 
 `kiln run`'s stdin is buffered until it ends (measured: eight lines written 2 s apart all arrived
 after the last), so it carries no commands to a running agent: each agent runs its plan on its own
 clock, and the controller only starts, collects and reports.
+
+## The hex driver
+
+`--driver hex --hex HEX --shards SHARDS --vm cpus=N,mem=SIZE`: the agent starts `hex node --socket
+--state` and `hex schedule serve --config` in its scope, as its children, each serving once it says
+`ready <socket>` (Hex's laptop deployment: one node, Hex's docs/scheduler-live.md). An ask is a
+`Submit` of a `ShardsImage` box (Hex's docs/design/shards-image-class.md: the image pinned by digest,
+the stub's command, class `shards` on the guest's `linux/<arch>`) through `hex schedule call`; its key
+is followed by `Status` until Hex says the box was made (its start: ask to made, no workload's
+answer, as Hex gives no lane into it), ended or refused; `Delete` removes it. The VM is the size the
+run asks Hex to admit (`--vm`, the person's input, recorded): Hex sizes a VM by what it admits, never
+by Shards' default. A refusal is recorded in Hex's own words (`start_failed`, `refused: Awaits(...)`)
+and stops the fill. The node takes its guest from the environment the agent is given (Hex's
+GuestConfig::from_env), with SHARDS_BIN the binary under test and SHARDS_HOME in the scope, where the
+image is pulled (Hex's node reads its Shards home from its environment as Shards does: confirmed by
+the live run, below).
+
+- **The view** is Hex's records: the boxes it holds made and not ended. A box's run host (`shards
+  api-run` under the node) names no box and Hex's records name no process, so the view names none,
+  and the witnesses judge such asks by count: fewer run hosts than live boxes is `lost`, more is
+  `leaked` (a doubled and a lost box cancel there; a placer that names its processes is judged one by
+  one). A box Hex says ended under a live ask is `ended_unasked`, as a lane's end is for the direct
+  driver.
+- **The scan** counts each run host as one VM, its memory and CPU its whole tree's (the run host's
+  own, its VM's and its network process's: what a VM costs the host through Hex).
+- **Chaos**: `vm` kills one run host (its tree then awaited gone); `node` and `scheduler` kill Hex's
+  own process, start it again in the same state, and settle until each live ask is either held by Hex
+  or ended. The asks Hex then says ended are `killed` and removed.
+- **The hold** has no lane into a VM: its round trips and streams are recorded owed (`hold_owed`), and
+  the report says so beside the start, which it names as the placer's word that the VM was made.
+
+Its live run waits on, each recorded typed if met first: Hex's waits' records (`image_boot`,
+`image_stats`, `image_stop`, ROOT's census; until they are in Hex every create outside the census is
+refused); Linux hosts alone (macOS `Awaits(RunHostStdioOnly)`, Windows `Awaits(WindowsRunHost)`);
+member exec (Shards' step 11) for round trips and streams; one host per Hex cluster until peers'
+SSH trust is set up (a forced command a peer, an administrator's step); and a run host that survives
+its node's kill is `Held` (`Awaits(AttachAfterCrash)`), refusing even a `Delete`, so `node` chaos
+leaves such VMs until Shards gives attach (the run reports them `left`).
+
+```sh
+kiln run --on HOST --needs mem=16g,cpus=8 -- \
+  nice -n 10 python3 bench/fleet/fleet.py host --driver hex --hex /path/to/hex --shards /path/to/shards \
+    --vm cpus=1,mem=512m --out "$OUT" --label HOST \
+    --image 'IMAGE@sha256:…' --chaos vm,node,scheduler --rounds 3 --deadline-s 3600 --seed 36
+```
+
+In a plan, a host (or the plan) says `"driver": "hex"`, `"hex": PATH` and `"vm": "cpus=1,mem=512m"`.
 
 ## The direct driver and its workload
 
@@ -214,8 +261,11 @@ network process found and judged `orphan` after its VM and daemon are gone, a la
 one that doesn't, asks on the real direct driver with a stand-in `shards` that is an echo (a wave's
 echoes read between its slow spawns, no descriptor left by an ended ask, a spawn the host refuses
 and a lane it can't serve typed and stopping the fill), a hold over echo lanes (every kind of sample
-on every lane), a mute lane's stall backed off to the run's deadline, and the report. `mutate.py
-[WORDS…]` removes each of 31 guards (or those whose description holds a word) in a copy and requires
+on every lane), a mute lane's stall backed off to the run's deadline, the hex driver over a stand-in
+hex (`tests/fake_hex.py`: a run that fills, takes `vm`, `node` and `scheduler` chaos and leaves
+nothing; a refusal typed in Hex's words stopping the fill), asks a placer names no process for judged
+by count, and the report. `mutate.py
+[WORDS…]` removes each of 35 guards (or those whose description holds a word) in a copy and requires
 the tests to fail.
 
 ## The profile
@@ -309,14 +359,9 @@ adas-mac-studio.local-2 (25 KB/s Wi-Fi) or jupiter (its kiln runs held by the he
 
 ## Owed
 
-- **The `hex` driver** (steps 12 to 15): asks as `hex schedule call --socket … Submit` with a
-  `ShardsImage` box (Hex's `docs/scheduler-live.md`), `Status` until created, `Delete`; the view from
-  Hex's records and each node's run hosts (`shards api-run` under `hex node`); the room from the
-  machine's capacity view (step 13, `docs/design/capacity-view.md`); chaos on `hex node`,
-  `hex schedule serve` and the peers' tunnels, each a process the agent starts. Hex's image class boots
-  on Linux only today (`Awaits(RunHostStdioOnly)` on macOS, `Awaits(WindowsRunHost)` on Windows) and
-  gives a member's stdio no lane yet (`Awaits(MemberExec)`, step 11), and a create is refused until
-  its waits are recorded outside the census (Hex `docs/design/shards-image-class.md` §6, §8).
+- **The `hex` driver's live run** ("The hex driver" says what it waits on), the room from Hex's
+  capacity view (step 13, `docs/design/capacity-view.md`) rather than `--needs`, and chaos on peers'
+  tunnels once peers are set up.
 - **The `kiln` driver** (steps 17 and 32): an isolated session started by `agents.start` with
   `isolation: microvm`, its harness kiln's fake Claude Code (`crates/kiln/tests/fixtures/fake-claude`,
   no model, no account) in a user Agentfile; placed by the balancer among runners with `virt.microvm`;

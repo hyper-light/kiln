@@ -162,6 +162,19 @@ class Witnesses(unittest.TestCase):
     def kinds(self, found):
         return sorted(v["witness"] for v in found)
 
+    def test_asks_a_placer_names_no_process_for_are_judged_by_count(self):
+        ledger = live_ledger("a", "b")
+        view = {"a": None, "b": None}
+        vm = lambda pid: {"pid": pid, "role": "vm", "mem": 1000}  # noqa: E731
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10), vm(20)], view, self.room, None, True)), [])
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10)], view, self.room, None, True)), ["lost"])
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10), vm(20), vm(30)], view, self.room, None, True)), ["leaked"])
+        # A live ask the placer no longer holds is lost, and one it holds for an ask that ended is unasked.
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10)], {"a": None}, self.room, None, True)), ["lost"])
+        ledger["b"].move(W.STOPPING)
+        ledger["b"].move(W.ENDED)
+        self.assertEqual(self.kinds(W.check(ledger, [vm(10), vm(20)], view, self.room, None, True)), ["leaked", "unasked"])
+
     def test_a_clean_scope_has_no_violation(self):
         ledger, scan, view = self.clean()
         self.assertEqual(W.check(ledger, scan, view, self.room, 4, True), [])
@@ -616,13 +629,13 @@ def shards_agent(d, delay_s=0.0, binary=None):
     a.waits["start"].answered(1_000_000_000)
     a.scan = lambda why: {}
     if delay_s:
-        real = a.shards.start_vm
+        real = a.driver.start_vm
 
         def slow(*args, **kw):
             time.sleep(delay_s)
             return real(*args, **kw)
 
-        a.shards.start_vm = slow
+        a.driver.start_vm = slow
     return a, rec
 
 
@@ -769,6 +782,88 @@ class Hold(unittest.TestCase):
             self.assertEqual([r.get("at") for r in outs if "at" in r], ["the run's deadline"])
             self.assertGreaterEqual(time.monotonic_ns(), a.deadline_ns)
             self.assertGreater(a.deadline_ns, began)
+
+
+def hex_agent(d, refuse=None, needs="mem=120m", refuse_after=0):
+    """An agent on the hex driver over the stand-in hex (tests/fake_hex.py) and the echo stand-in
+    `shards`."""
+    from types import SimpleNamespace
+
+    from fleetlib.agent import Agent
+
+    fake = os.path.join(d, "hex")
+    with open(fake, "w") as f:
+        f.write(f"#!{sys.executable}\n" + open(os.path.join(HERE, "fake_hex.py")).read())
+    os.chmod(fake, 0o755)
+    if refuse:
+        os.environ["FAKE_HEX_REFUSE"] = refuse
+        os.environ["FAKE_HEX_REFUSE_AFTER"] = str(refuse_after)
+    else:
+        os.environ.pop("FAKE_HEX_REFUSE", None)
+    o = SimpleNamespace(deadline_s=60, out=d, shards=standin_shards(d), hex=fake, vm="cpus=1,mem=64m", driver="hex", seed=1, needs=needs, label="h",
+                        image="i@sha256:00", ballast=0, chaos="vm,node,scheduler", rounds=1, repo=d, rev="", controller_t=0, keep_home=False)
+    rec = records.Records(os.path.join(d, "r.jsonl"), "h", "run")
+    return Agent(o, rec), rec
+
+
+@unittest.skipIf(sys.platform == "win32", "the stand-in hex is a POSIX script (Hex's image class boots no VM on Windows yet)")
+class HexDriver(unittest.TestCase):
+    """The hex driver over a stand-in that answers Submit, Status and Delete as Hex documents them."""
+
+    def tearDown(self):
+        os.environ.pop("FAKE_HEX_REFUSE", None)
+        os.environ.pop("FAKE_HEX_REFUSE_AFTER", None)
+
+    def test_a_run_fills_takes_its_chaos_and_leaves_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = hex_agent(d)
+            code = a.run()
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            kinds = [r["kind"] for r in got]
+            self.assertEqual([r for r in got if r["kind"] in ("failed", "witness")], [])
+            self.assertEqual(code, 0)
+            starts = [r for r in got if r["kind"] == "started"]
+            self.assertTrue(starts and all(r["by"] == "made" for r in starts), starts)
+            self.assertIn("hold_owed", kinds)
+            chaos = {r["action"]: r for r in got if r["kind"] == "chaos"}
+            self.assertEqual(sorted(chaos), ["node", "scheduler", "vm"])
+            self.assertEqual(chaos["vm"]["kill"], "killed")
+            self.assertEqual((chaos["vm"]["ended"], chaos["node"]["ended"], chaos["scheduler"]["ended"]), (1, 0, 0))
+            last = [r for r in got if r["kind"] == "verdict"][-1]
+            self.assertEqual(last["left"], [])
+            self.assertEqual(a.states().get(W.LIVE, 0), 0)
+            text = report.render(got)
+            self.assertIn("start (ask to the placer's word that it was made)", text)
+            self.assertIn("round trips and streams: owed (the hex driver gives no lane into a VM)", text)
+            self.assertIn("verdict: PASS", text)
+
+    def test_a_refused_create_is_typed_in_hexs_words_and_stops_the_fill(self):
+        with tempfile.TemporaryDirectory() as d:
+            # The first box is taken (the setup's first run), every ask after it refused.
+            a, rec = hex_agent(d, refuse="Awaits(RunHostStdioOnly)", refuse_after=1)
+            self.assertTrue(a.setup())
+            a.fill("test")
+            a.drain()
+            a.teardown()
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            failed = [r for r in got if r["kind"] == "start_failed"]
+            self.assertEqual(len(failed), 1)
+            self.assertEqual((failed[0]["refused"], failed[0]["why"]), (True, "refused: Awaits(RunHostStdioOnly)"))
+            self.assertEqual([r["refused"] for r in got if r["kind"] == "fill_stopped"], [[failed[0]["token"]]])
+            self.assertEqual(a.states(), {W.REFUSED: 1})
+
+    def test_a_first_box_hex_refuses_ends_the_setup_typed_and_leaves_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, rec = hex_agent(d, refuse="Awaits(WindowsRunHost)")
+            code = a.run()
+            rec.close()
+            got = records.read_all(os.path.join(d, "r.jsonl"))
+            failed = [(r["what"], r["why"]) for r in got if r["kind"] == "failed"]
+            self.assertEqual(failed, [("first_run", "refused: Awaits(WindowsRunHost)")])
+            self.assertEqual([r["left"] for r in got if r["kind"] == "verdict" and r["at"] == "after teardown"], [[]])
+            self.assertEqual(code, 3)
 
 
 class Report(unittest.TestCase):
