@@ -4296,8 +4296,12 @@ impl Hub {
             FromRunner::HarnessInventory(inv) => {
                 let mut inv = *inv;
                 let mut allowed = Vec::new();
+                // Each at the epoch it reports there (none from a runner from before): what lets the
+                // process that superseded a hand-over's keep the sessions it went on with, as their
+                // Opens do (`mail_transfer::allows_claim`; 2026-11-12).
                 for id in std::mem::take(&mut inv.sessions) {
-                    if crate::harness::mail_transfer::allows_claim(self, peer, &id, None).await { allowed.push(id); }
+                    let epoch = inv.epochs.get(&id).copied();
+                    if crate::harness::mail_transfer::allows_claim(self, peer, &id, epoch).await { allowed.push(id); }
                 }
                 inv.sessions = allowed;
                 // A copy it kept of a session that went on elsewhere since isn't its own: it's

@@ -12,7 +12,7 @@ import platform
 import socket
 import subprocess
 import sys
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 def _run(args, cwd: Optional[str] = None) -> str:
@@ -54,6 +54,29 @@ def memory() -> Dict[str, Optional[int]]:
         except (ValueError, KeyError, TypeError):
             return {"total": None, "available": None}
     return {"total": None, "available": None}
+
+
+def raise_nofile() -> Optional[List[int]]:
+    """Lifts this process's open-file limit to the most the OS lets it hold, its hard limit (on
+    macOS, kern.maxfilesperproc where the hard limit is unlimited): each live VM's lane holds two
+    descriptors, so a host's hundreds need more than a shell's soft limit (macOS's is 256).
+    Returns [soft, hard] as they are after; None where there are none (Windows)."""
+    try:
+        import resource
+    except ImportError:
+        return None
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = hard
+    if sys.platform == "darwin":
+        cap = _run(["sysctl", "-n", "kern.maxfilesperproc"])
+        if cap.isdigit() and (hard == resource.RLIM_INFINITY or int(cap) < hard):
+            want = int(cap)
+    if want != resource.RLIM_INFINITY and want > soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+        except (ValueError, OSError):
+            pass
+    return [int(x) for x in resource.getrlimit(resource.RLIMIT_NOFILE)]
 
 
 def cpu_model() -> str:

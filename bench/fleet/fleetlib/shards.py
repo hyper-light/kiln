@@ -10,7 +10,11 @@ stdin and stdout, which are the lane; closing its stdin ends `cat` and so the ru
 The view (the placer's word on which VM process runs each ask) is `shards inspect vm`'s
 `.State.Pid`. The scan is the OS's: the daemon's descendants, and, for what a daemon that died
 left behind, every process whose arguments name the run's home, with each `shards-net` paired to
-its `shards-vm` by the MAC address both are given.
+its `shards-vm` by the MAC address both are given. A network process starts under its VM's
+parent and names no home (Shards' netproc.rs, D183), so once a dead daemon's VM is gone too
+nothing but its MAC ties it to the run: every MAC a scan has paired with one of the run's VMs is
+kept, and a network process with one is the run's for as long as it lives (`orphan` once its VM
+is gone).
 """
 
 from __future__ import annotations
@@ -37,6 +41,8 @@ class Shards:
         self.env.update({"SHARDS_HOME": self.home, "DOCKER_CONFIG": self.config, "SHARDS_LOCAL_STORE": "none", "SHARDS_POOL": "0"})
         self.daemon: Optional[subprocess.Popen] = None
         self.daemon_start = ""
+        # Every MAC a scan has paired with one of the run's VMs, and that VM's pid.
+        self.macs: Dict[str, int] = {}
 
     def command(self, *args: str, timeout_s: Optional[float] = None) -> Tuple[int, str, str]:
         p = subprocess.run([self.binary, *args], env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=timeout_s, check=False)
@@ -61,8 +67,8 @@ class Shards:
         """Starts the home's daemon as this process's child and waits for it to serve: its pid file
         naming it and its request slots made (D185), then a client answered by it."""
         os.makedirs(self.config, exist_ok=True)
-        log = open(log_path, "ab")
-        self.daemon = subprocess.Popen([self.binary, "run", "daemon"], env=self.env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        with open(log_path, "ab") as log:
+            self.daemon = subprocess.Popen([self.binary, "run", "daemon"], env=self.env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         me = str(self.daemon.pid)
         pidfile = os.path.join(self.home, "daemon.pid")
         # A one-time probe at doubling intervals from 1 ms: O(log T) reads for a wait of T, none
@@ -118,8 +124,9 @@ class Shards:
             argv += ["sh", "-c", f"head -c {ballast} /dev/zero > /tmp/.ballast && exec cat"]
         else:
             argv += ["cat"]
-        err = open(stderr_path, "ab")
-        return subprocess.Popen(argv, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, bufsize=0)
+        # The child keeps its own copy of the log's descriptor; ours closes as it starts.
+        with open(stderr_path, "ab") as err:
+            return subprocess.Popen(argv, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, bufsize=0)
 
     def remove(self, tokens: List[str]) -> Tuple[int, str]:
         if not tokens:
@@ -157,14 +164,13 @@ class Shards:
         under = set(procs.descendants(table, roots))
         named = {p.pid for p in table.values() if any(self.home in a for a in p.args)}
         procs.fill_mem(table, under | named)
-        vm_by_mac: Dict[str, int] = {}
         for pid in under | named:
             p = table.get(pid)
             if p is not None and p.name == "shards-vm" and not p.zombie:
                 mac = _flag(p.args, "--net")
                 if mac:
-                    vm_by_mac[mac.split(",")[-1]] = pid
-        nets = {p.pid for p in table.values() if p.name == "shards-net" and _flag(p.args, "--mac") in vm_by_mac}
+                    self.macs[mac.split(",")[-1]] = pid
+        nets = {p.pid for p in table.values() if p.name == "shards-net" and _flag(p.args, "--mac") in self.macs}
         procs.fill_mem(table, nets)
         out: List[Dict[str, object]] = []
         for pid in sorted(under | named | nets):
@@ -174,7 +180,8 @@ class Shards:
             role = "vm" if p.name == "shards-vm" else "net" if p.name == "shards-net" else "shards"
             rec: Dict[str, object] = {"pid": pid, "start": p.start, "role": role, "mem": p.mem, "cpu_ns": p.cpu_ns}
             if role == "net":
-                rec["vm"] = vm_by_mac.get(_flag(p.args, "--mac") or "")
+                # Its VM's pid; 0 where no VM of the run's ever had its MAC.
+                rec["vm"] = self.macs.get(_flag(p.args, "--mac") or "", 0)
             out.append(rec)
         return out
 

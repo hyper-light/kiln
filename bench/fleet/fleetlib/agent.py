@@ -274,12 +274,20 @@ class Agent:
         a = W.Ask(token)
         self.ledger[token] = a
         asked = time.perf_counter_ns()
-        popen = self.shards.start_vm(token, self.o.image, self.o.ballast, os.path.join(self.logs, f"vm-{token}.err"))
+        try:
+            popen = self.shards.start_vm(token, self.o.image, self.o.ballast, os.path.join(self.logs, f"vm-{token}.err"))
+        except OSError as e:
+            # The host gave the harness no client (no descriptor or process left): refused here,
+            # typed, and the fill stops at it.
+            a.move(W.REFUSED)
+            self.rec.write("start_failed", token=token, why=f"spawn: {e}", wave=self.wave, refused=True)
+            return token
+        spawned = time.perf_counter_ns() - asked
         client = procs.one(popen.pid)
         v = Vm(token, self.seq, popen, client.start if client else "", asked, self.wave)
         self.vms[token] = v
         a.move(W.STARTING)
-        self.rec.write("ask", token=token, wave=self.wave, client_pid=popen.pid)
+        self.rec.write("ask", token=token, wave=self.wave, client_pid=popen.pid, spawn_ns=spawned)
         if popen.stdin is None or popen.stdout is None:
             a.move(W.FAILED)
             self.rec.write("start_failed", token=token, why="the client has no pipes", wave=self.wave)
@@ -321,12 +329,14 @@ class Agent:
             except subprocess.TimeoutExpired:
                 self.waits["reap"].ran_out(time.monotonic_ns() - began)
                 self.rec.write("ran_out", wait="reap", token=token, after_ns=time.monotonic_ns() - began)
-        stream = self.lanes.streams.pop(token, None)
-        if stream is not None and stream.open:
-            try:
-                self.lanes.sel.unregister(stream.rfd)
-            except (KeyError, ValueError):
-                pass
+        self.lanes.drop(token)
+        # Its descriptors go with it: a host's hundreds of asks would run the agent out of them.
+        for f in (v.popen.stdin, v.popen.stdout):
+            if f is not None:
+                try:
+                    f.close()
+                except OSError:
+                    pass
         if a.state in (W.LIVE, W.STARTING):
             a.move(W.STOPPING)
         if a.state in (W.STOPPING, W.KILLED, W.FAILED):
@@ -342,13 +352,14 @@ class Agent:
             self.failed("setup", f"{self.scope} exists: each run takes a scope of its own")
             return False
         os.makedirs(self.scope)
+        nofile = hostfacts.raise_nofile()
         facts = hostfacts.facts(self.o.repo)
         if self.o.rev:
             facts["kiln_rev"], facts["kiln_dirty"] = self.o.rev, False
         self.rec.write(
             "host", facts=facts, shards=self.o.shards, shards_sha256=self.shards.identity(), image=self.o.image,
             ballast=self.o.ballast, needs=self.o.needs, room=self.room, seed=self.o.seed, chaos=self.o.chaos, rounds=self.o.rounds,
-            deadline_s=self.o.deadline_s, driver="shards", controller_t=self.o.controller_t,
+            deadline_s=self.o.deadline_s, driver="shards", controller_t=self.o.controller_t, nofile=nofile,
         )
         if self.room.get("mem") is None:
             self.failed("setup", "no memory room: run the agent through `kiln run --needs mem=…`, which holds it to that room (KILN_NEEDS), or give --needs")
@@ -404,10 +415,11 @@ class Agent:
                 break
             self.wave += 1
             self.wave_size = n
-            tokens = [self.ask() for _ in range(n)]
+            tokens = self.ask_wave(n)
             self.serve(lambda ts=tokens: all(self.ledger[t].state != W.STARTING for t in ts), "start")
-            refused = [t for t in tokens if self.ledger[t].state == W.FAILED]
-            for t in refused:
+            failed = [t for t in tokens if self.ledger[t].state == W.FAILED]
+            refused = failed + [t for t in tokens if self.ledger[t].state == W.REFUSED]
+            for t in failed:
                 self.finish(t)
             self.scan(f"wave {self.wave}")
             if refused:
@@ -416,6 +428,20 @@ class Agent:
                 break
             last = n
         self.phase("fill", "end", live=len(self.live()), limit=self.limit, cost=dict(self.cost))
+
+    def ask_wave(self, n: int) -> List[str]:
+        """`n` asks at once, the lanes served between their spawns (`Lanes.poll`): an echo that
+        came while the next VM was being asked is read as that spawn returns, so a start is
+        charged at most the one spawn under way as it came (each ask's `spawn_ns`), never the
+        rest of its wave's. A refused ask ends the wave."""
+        tokens: List[str] = []
+        for _ in range(n):
+            t = self.ask()
+            tokens.append(t)
+            self.lanes.poll()
+            if self.ledger[t].state == W.REFUSED:
+                break
+        return tokens
 
     def ops(self, counts: Dict[str, int], make: Callable[[int], bytes], kind: str, units: float = 1, **tags: object) -> List[float]:
         """`counts[lane]` operations on each lane, one outstanding per lane, every lane at once;
