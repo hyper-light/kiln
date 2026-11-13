@@ -3920,6 +3920,52 @@ mod tests {
         assert_eq!(pipes("c"), Some((300, 301, 302, false)), "no carried descriptors: its record's, unchanged");
     }
 
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: a session's opening prompt, adopted
+    /// from its queue or its provider flight with no journal row, is its opener's, a person's
+    /// (`Spec::opener`, the owner writing as `admin`), held to no depth; what else its queue holds
+    /// with no row, an agent's word among it, is still held to the depth, as before.
+    #[test]
+    fn s35_a_legacy_adopted_opening_prompt_is_its_openers_and_held_to_no_depth() -> anyhow::Result<()> {
+        use super::super::admission::{FlightProtocol, Input, LegacyFlight};
+        crate::rt::block_on(async {
+            for (flying, opener, writes_as) in [(false, "user:ada", "user:ada"), (true, "owner", "admin")] {
+                let directory = tempfile::tempdir()?;
+                let records = crate::records::open(&directory.path().join("records.db"))?;
+                let (sink, _updates) = async_channel::unbounded();
+                let host = Host::with_records(sink, None, Limits::default(), Arc::new(SimClock::new()), Some(records));
+                let spec = Spec { opener: Some(opener.into()), prompt: Some("map the repository".into()), ..no_harness(directory.path()) };
+                let session = host.open(Some(format!("s35-opening-{flying}")), spec)?;
+                host.settled(&session.id).await;
+                crate::rt::timeout(super::super::registry::ANSWER_WAIT, session.close_wait()).await.map_err(|_| anyhow::anyhow!("fixture owner did not stop"))?;
+                let inbox = host.inbox().cloned().ok_or_else(|| anyhow::anyhow!("fixture journal missing"))?;
+                let input = Input::new(0, host.input_budgets.budget(), Arc::clone(&inbox));
+                let opening = crate::util::derive_id(&["first-prompt", &session.id]);
+                let agents = "0123456789abcdef0123456789abcdef".to_owned();
+                let queued = |id: &str, text: &str| QueueItem { id: id.into(), text: text.into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None };
+                {
+                    let mut core = session.core.lock();
+                    core.input = Some(input.clone());
+                    core.state.epoch = 0;
+                    core.state.status = Status::Running;
+                    core.state.manual_resume = false;
+                    core.writes.clear();
+                    core.state.queue = vec![queued(&agents, "a word from agent a1")];
+                    if flying { core.input_legacy_flights = vec![LegacyFlight { id: opening.clone(), protocol: FlightProtocol::Claude, request: None }]; }
+                    else { core.state.queue.push(queued(&opening, "map the repository")); }
+                }
+                host.set_input_budget(super::super::state_view::FRAME);
+                host.reconcile_legacy_mail(&session, &input, LegacyReconciliation::Journal).await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                let peer = |id: &str| input.controller.lock().lease(id).map(|lease| lease.peer.clone());
+                anyhow::ensure!(peer(&opening).as_deref() == Some(writes_as), "the opening prompt is its opener's ({writes_as}), flying {flying}: {:?}", peer(&opening));
+                anyhow::ensure!(super::super::mail::person(writes_as), "{writes_as} is a person, held to no depth");
+                let kept = inbox.pending(&session.id, &opening).await?.ok_or_else(|| anyhow::anyhow!("the opening prompt has no durable row"))?;
+                anyhow::ensure!(kept.lease.peer == writes_as, "its durable row says whose it is: {:?}", kept.lease.peer);
+                anyhow::ensure!(peer(&agents).is_some_and(|p| !super::super::mail::person(&p)), "what else it held is still held to the depth: {:?}", peer(&agents));
+            }
+            Ok(())
+        })
+    }
+
     /// The journal failure is the real Host adoption path, not a synthetic consumption event.
     /// Certificate verification is covered by the isolated native upgrade proof; this fixture
     /// drives the owner/journal ordering beneath that boundary on real file-backed Records.

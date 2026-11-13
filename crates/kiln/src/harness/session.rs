@@ -325,6 +325,13 @@ pub struct Spec {
     /// the same ledger as CI legs and commands. Set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<crate::reach::place::Claim>,
+    /// Whom it acts for, the person whose words its opening prompt (`prompt`) is
+    /// (`lineage::person_of`'s form: `owner`, `user:<id>`; kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 35): its input admits that prompt as theirs, held to
+    /// no depth (`mail::person`). Set by kiln, never from what was asked; none from a server before
+    /// it, or for a start that acts for no person, and the prompt is then held to the depth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opener: Option<String>,
 }
 
 fn yes() -> bool {
@@ -366,6 +373,7 @@ impl Default for Spec {
             isolation: None,
             agentfile: None,
             variant_of: None,
+            opener: None,
         }
     }
 }

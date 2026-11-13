@@ -4595,6 +4595,14 @@ impl Registry {
         self.resolve(hub, id, c, pending).await
     }
 
+    /// [`Registry::command`] for whoever sent it (`sender`, as `ops::key_scope` names a caller:
+    /// `admin`, `user:<id>`, `agent:<id>`): an API call's command (kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 35).
+    pub async fn command_from(&self, hub: &Hub, id: &str, sender: &str, c: Command) -> Sent {
+        let _ = sender;
+        self.command(hub, id, c).await
+    }
+
     /// The shared publication path for authenticated producers. Receipt means durable server
     /// custody only; actual source admission and consumption are separate owner events.
     #[allow(clippy::too_many_arguments, reason = "authenticated custody binds the existing recipient, command, proof, principal, sender and explicit status together")]
@@ -8721,6 +8729,35 @@ mod tests {
             anyhow::ensure!(waiting(&sent), "an agent's is taken and waits for its capacity: {sent:?}");
             let Pending::Now(own) = hub.harness.dispatch(&hub, "s1", send("m6")).await else { anyhow::bail!("kiln's own went on to an inbox, not to custody") };
             anyhow::ensure!(waiting(&own), "and kiln's own: {own:?}");
+            Ok(())
+        })
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: a message an API call sends (`POST
+    /// /api/harness/sessions/:id/command`, no idempotency key) goes into custody as its sender's,
+    /// never as kiln's own (`server`). A person's (`admin`, `user:<id>`) waits in the persons' part,
+    /// held to no depth and taking no agent's turn; an agent's is held to the recipient's depth.
+    #[test]
+    fn s35_an_api_message_goes_into_custody_as_its_senders_a_persons_held_to_no_depth() -> anyhow::Result<()> {
+        use super::super::model::SendMode;
+        use crate::proto::{AgentMsg, CAP_INBOX, CAP_UNREAD, CAP_WIRE};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::hub_with_runner(crate::rt::clock(), "mac", CAP_UNREAD | CAP_WIRE | CAP_INBOX).await?;
+            hub.instances.update(|i| i.set_features(1, vec![crate::proto::feature::MAIL_FLOW.to_owned()]));
+            let open = Update::Open { info: Box::new(Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
+            crate::hub::tests::hear_item(&hub, 1, "s:s1#a1", 1, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&open)? }).await?;
+            anyhow::ensure!(!super::super::mail_delivery::legacy_owner(&hub, "s1"), "its runner speaks mail-flow");
+            let send = |id: &str| Command::Send { id: id.into(), text: "how far along is it?".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+            for (sender, id) in [("user:ada", "m1"), ("admin", "m2"), ("agent:a1", "m3")] {
+                let sent = hub.harness.command_from(&hub, "s1", sender, send(id)).await;
+                anyhow::ensure!(matches!(sent, Sent::Published(ref r) if r.disposition == super::super::mail::Disposition::Waiting), "{sender}'s is taken and waits: {sent:?}");
+            }
+            let demand = super::super::mail::waiting_peers(&hub.store, "s1".into(), 0, super::super::state_view::FRAME).await?;
+            let mut senders: Vec<String> = demand.items.iter().map(|head| head.peer.clone()).collect();
+            senders.sort();
+            anyhow::ensure!(senders == ["admin", "agent:a1", "user:ada"], "each waits as its sender's, none as kiln's own: {senders:?}");
+            let persons: Vec<&str> = senders.iter().map(String::as_str).filter(|s| super::super::mail::person(s)).collect();
+            anyhow::ensure!(persons == ["admin", "user:ada"], "the persons' are held to no depth, the agent's to the depth: {persons:?}");
             Ok(())
         })
     }
