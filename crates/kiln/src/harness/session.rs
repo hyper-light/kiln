@@ -1284,7 +1284,9 @@ async fn preparation_failed(s: &Session, failure: PreparationFailure) {
 
 enum Ctl {
     Cmd(Box<Command>),
-    /// Owned Reach state changed; publish through this driver, never a stale parallel snapshot.
+    /// Owned Reach state or its input's admission changed; publish through this driver, never a
+    /// stale parallel snapshot. A running harness takes it as [`Ctl::Room`] too: what its input
+    /// held may go now.
     OwnedChanged,
     /// A persisted legacy promotion changed; its body work stays on this owner.
     Promotion,
@@ -4903,9 +4905,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         }
                         }
                         },
-                        // There may be room on its machine now: the skill runs that waited for it
-                        // go, then its queue, if it may go to work now.
-                        Ev::Ctl(Some(Ctl::Room)) => {
+                        // There may be room on its machine now, or its input may take writes again
+                        // (`Session::input_changed`: its journal read back, its fence lifted, its
+                        // promotion done), each of which `Core::has_room` holds work for: the skill
+                        // runs that waited go, then its queue, if it may go to work now (kiln plan
+                        // 01a1cd8e862e7169a074db3d5fa33f3d step 35: a resumed agent's opening prompt,
+                        // held while its input restored, stayed queued).
+                        Ev::Ctl(Some(Ctl::Room | Ctl::OwnedChanged)) => {
                             let mut core = s.core.lock();
                             if !for_room.is_empty() && core.has_room() {
                                 for c in for_room.drain(..) {
@@ -4914,7 +4920,6 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             }
                             adapter.room(&mut core);
                         }
-                        Ev::Ctl(Some(Ctl::OwnedChanged)) => {},
                         Ev::Ctl(Some(Ctl::Promotion)) => progress_promotion(&s, &files).await,
                         Ev::InputBudget => { if publish_input_budget(&s) && promotion_pending(&s) { progress_promotion(&s, &files).await; } },
                         Ev::PromotionJournal => progress_promotion(&s, &files).await,
