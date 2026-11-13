@@ -969,6 +969,7 @@ impl Host {
             |d| d.join("attachments"),
         );
         let handovers = file.as_ref().and_then(|f| f.parent()).map(Handovers::of);
+        let homes = file.as_ref().and_then(|f| f.parent()).map(|d| d.join("homes"));
         let host = Arc::new_cyclic(|me| Self {
             input_budgets: super::admission::SessionBudgets::default(),
             sessions: Mutex::new(HashMap::new()),
@@ -995,7 +996,7 @@ impl Host {
             held: AtomicBool::new(false),
             handovers,
             microvm: Mutex::new(crate::sandbox::microvm()),
-            homes: file.as_ref().and_then(|f| f.parent()).map(|d| d.join("homes")),
+            homes,
         });
         crate::memory::room::follow_input(&host);
         host
@@ -5113,7 +5114,7 @@ while True:
             until_it("its link, said", 60, || matches!(s.info().runs, Some(session::Runs::Microvm { control: Some(_), .. }))).await?;
             // Claude Code's image serves one provider: its destinations are all its run's, kept whole, no fallback said.
             let one_use = crate::sandbox::narrow::Reach::Whole { why: crate::sandbox::narrow::Whole::OneUse };
-            assert_eq!(s.info().runs, Some(session::Runs::Microvm { vm: Some("fake-vm-1".into()), image: pinned.clone(), host_pid: None, control: Some(link.clone().into()), reach: Some(one_use) }));
+            assert_eq!(s.info().runs, Some(session::Runs::Microvm { vm: Some("fake-vm-1".into()), image: pinned.clone(), host_pid: None, control: Some(link.clone().into()), reach: Some(Box::new(one_use)) }));
             assert_eq!(launch.egress, kiln_seams::sandbox::Egress::Any, "its image's own grants, narrowed no further");
             assert!(!s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains("isn't narrowed"))), "no fallback to say");
             let info = serde_json::to_value(s.info())?;
