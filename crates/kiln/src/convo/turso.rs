@@ -550,6 +550,51 @@ impl Link<'_> {
         self.conn.prepare(sql).map_err(fail)
     }
 
+    /// As [`super::store::Engine::unended`], on this link's connection (a reader's beside the writer).
+    fn unended(&self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        let mut stmt = self.prepare(sql::SESSIONS_UNENDED)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[int(since)], |r| {
+            if let (Ok(id), Ok(info)) = (r.get::<String>(0), r.get::<String>(1)) {
+                out.push(Unended { id, info, meta: r.get::<String>(2).ok(), state: r.get::<String>(3).ok(), machine: r.get::<String>(4).ok() });
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// As [`super::store::Engine::ended`], on this link's connection.
+    fn ended(&self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        let mut stmt = self.prepare(sql::SESSIONS_ENDED_AFTER)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[int(after.0), txt(after.1), int(i64::try_from(limit).unwrap_or(i64::MAX))], |r| {
+            if let (Ok(id), Ok(at)) = (r.get::<String>(0), r.get::<i64>(1)) {
+                out.push((id, at));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// As [`super::store::Engine::kept`], on this link's connection.
+    fn kept(&self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        let mut get = self.prepare(sql::SESSION_GET)?;
+        let mut kept: Option<Kept> = None;
+        self.run(&mut get, &[Value::from_text(session.to_owned())], |r| {
+            let s = |i: usize| r.get::<String>(i).ok();
+            kept = Some(Kept { info: s(0), meta: s(1), state: s(2), changes: s(3), updated_at: r.get::<i64>(4).unwrap_or(0), closed_at: r.get::<i64>(5).ok(), events: Vec::new() });
+            Ok(())
+        })?;
+        let mut events = self.event_rows(sql::EVENTS_LAST, &[Value::from_text(session.to_owned()), int(i64::try_from(last).unwrap_or(i64::MAX))])?;
+        if kept.is_none() && events.is_empty() {
+            return Ok(None);
+        }
+        events.reverse();
+        let mut k = kept.unwrap_or_default();
+        k.events = events;
+        Ok(Some(k))
+    }
+
     /// Run `stmt` with `params`, handing each row to `each`.
     fn run(&self, stmt: &mut Statement, params: &[Value], mut each: impl FnMut(&TRow) -> anyhow::Result<()>) -> anyhow::Result<()> {
         self.run_while(stmt, params, |r| each(r).map(|()| true))
@@ -694,6 +739,18 @@ impl TursoRead {
 impl Read for TursoRead {
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         self.link().events(session, before, limit)
+    }
+
+    fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        self.link().unended(since)
+    }
+
+    fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        self.link().kept(session, last)
+    }
+
+    fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        self.link().ended(after, limit)
     }
 }
 
