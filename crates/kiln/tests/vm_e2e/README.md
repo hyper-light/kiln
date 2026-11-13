@@ -54,7 +54,9 @@ cargo test -p kiln --test vm_harnesses host::     # Linux, macOS (python3): Clau
 ```
 
 `step34::` skips, in the runner's own words (`facts.isolation.why_not`), until the runner a test
-starts says it starts microVMs (`facts.virt.microvm`: kiln plan steps 16 and 17).
+starts says it starts microVMs (`facts.virt.microvm`: kiln plan steps 16 and 17). From kiln's own
+image for a harness (`harness-<kind>`: the vendor's CLI) it then skips until ROOT gives a real task,
+every one of the five `VM_E2E_*` words below (`untasked`): the stand-in's words never go to a model.
 
 ## The microVM runs (ROOT)
 
@@ -66,7 +68,7 @@ starts says it starts microVMs (`facts.virt.microvm`: kiln plan steps 16 and 17)
 | `VM_E2E_LINKS` | the links to read, each end's path on kiln's API (`{session}`: the session's id) and the JSON pointer to its suite: `[{"name": "agent-control", "client": {"url": "…", "pointer": "…"}, "server": {"url": "…", "pointer": "…"}}, …]`, one for each of `server-runner`, `kiln-hex`, `agent-control` and `mcp` at least |
 | `VM_E2E_HOST_ROOTS` | pids (comma-separated) of processes besides the runner whose trees hold the session's processes: a daemon its microVMs run under that left the runner's tree |
 | `VM_E2E_PROJECT` | a real project's folder on this host, for a real task (unset: an empty one of the test's own) |
-| `VM_E2E_PROMPT`, `VM_E2E_RESUMED_PROMPT`, `VM_E2E_STEERED_PROMPT`, `VM_E2E_STOPPED_PROMPT`, `VM_E2E_DONE_MARKER` | a real task, the resumed session's turn, a long one to steer into, a long one to stop, and what the harness says at a task's end; `{kind}` in each is the harness's id, `{file}` the file to write. Unset: the stand-in's |
+| `VM_E2E_PROMPT`, `VM_E2E_RESUMED_PROMPT`, `VM_E2E_STEERED_PROMPT`, `VM_E2E_STOPPED_PROMPT`, `VM_E2E_DONE_MARKER` | a real task, the resumed session's turn, a long one to steer into, a long one to stop, and what the harness says at a task's end; `{kind}` in each is the harness's id, `{file}` the file to write. Unset: the stand-in's, for an image ROOT names (the stand-in's); from kiln's own `harness-<kind>` the run skips unless all five are given (fails, with `VM_E2E=1`) |
 | `VM_E2E_IMAGE_<KIND>` | the image a harness's microVM is made from (`agentfile:<id>`); unset: kiln's Agentfile for it, `harness-<kind>` |
 | `VM_E2E_TURN_SECS` | how long a turn may take before the test fails (600 unset): a failing test's patience, not a value kiln runs by |
 | `VM_E2E_SERVER`, `VM_E2E_TOKEN`, `VM_E2E_MACHINE`, `VM_E2E_RUNNER_PID` | ROOT's own kiln (one with the sign-ins and credentials real tasks need) at `http://127.0.0.1:<port>`, its admin token (from a file, never on a command line or in a log), its runner's machine id and that runner's pid; unset: a server and a runner of the test's own, its headroom off |
@@ -157,6 +159,11 @@ no `VM_E2E_PROMPT`.
   shows it), and step 34's Claude Code run stops at its interrupt step until then.
 
 - Each link's ends: no surface says them yet (the table above names whose each is).
+- kiln's MCP from inside: kiln's own Agentfiles (`.kiln/images/harness-claude`, `harness-codex`) grant
+  their provider's 443/tcp alone, no reach to kiln's MCP server, and no runner serves `/api/mcp` to a
+  microVM yet: step 18 (its `host.docker.internal:<port>` form and refusals, on `p/s18-host-in-vm-v1`)
+  and the runner's loopback `/api/mcp` (step 35's) own it. Until both land, `mcp_round_trip` fails
+  step 34's runs, saying so.
 - That an isolated session holds no process of the host: step 17's `Duplex::host_pid` is none, but no
   API says so; the process trees and the kernel line stand for it.
 - A harness that ran a process on the host and ended it between two looks: the looks see the harness

@@ -289,8 +289,11 @@ def spawn(servers, kind):
         text = "".join(b.get("text", "") for b in res.get("content") or [] if isinstance(b, dict))
         if res.get("isError"):
             return "SPAWN_FAIL %s" % (text or "agents_start was refused")
-        found = re.search(r"\b[0-9a-f]{32}\b", text)
-        return "SPAWN_OK %s" % (found.group(0) if found else "?")
+        # agents_start's reply: {"agents": [<each started, its id>], "parent": <the asker's id>}; one
+        # queued for room starts none yet.
+        reply = json.loads(text) if text.startswith("{") else {}
+        started = [a.get("id") for a in reply.get("agents") or [] if isinstance(a, dict) and a.get("id")]
+        return "SPAWN_OK %s" % (started[0] if started else "?")
     except (OSError, ValueError) as e:
         return "SPAWN_FAIL %s" % e
     finally:

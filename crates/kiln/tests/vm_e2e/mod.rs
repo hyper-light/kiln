@@ -982,6 +982,22 @@ pub fn task(var: &str, kind: &str, probe: &str, stub: String) -> String {
     std::env::var(var).map(|p| p.replace("{kind}", kind).replace("{file}", probe)).unwrap_or(stub)
 }
 
+/// The words of a real task, each of a real harness's turns: ROOT's alone.
+pub const TASK_WORDS: [&str; 5] = ["VM_E2E_PROMPT", "VM_E2E_RESUMED_PROMPT", "VM_E2E_STEERED_PROMPT", "VM_E2E_STOPPED_PROMPT", "VM_E2E_DONE_MARKER"];
+
+/// Why a drive of `kind` from `image` doesn't run, or none. kiln's own image for a harness
+/// (`.kiln/images/harness-<kind>`) runs the vendor's CLI, which takes ROOT's task alone: never the
+/// stand-in's words sent to a model, so each of [`TASK_WORDS`] not `given` is named. An image ROOT
+/// names (`VM_E2E_IMAGE_<KIND>`, `agentfile:<id>`: the stand-in's) takes the stand-in's where ROOT
+/// gives none.
+pub fn untasked(kind: &str, image: &str, given: impl Fn(&str) -> bool) -> Option<String> {
+    if !image.starts_with("harness-") {
+        return None;
+    }
+    let missing: Vec<&str> = TASK_WORDS.iter().copied().filter(|v| !given(v)).collect();
+    (!missing.is_empty()).then(|| format!("SKIP: {kind} from {image} is the vendor's own CLI, which takes ROOT's task alone, and {} isn't given", missing.join(", ")))
+}
+
 /// The project: ROOT's (`VM_E2E_PROJECT`, a real project's folder on this host), else one made under
 /// `dir`. Canonical, as a harness reports its folder (macOS's /var is /private/var), and without the
 /// verbatim prefix canonicalizing adds on Windows, which kiln's paths don't carry.
@@ -1022,8 +1038,14 @@ fn written_and_removed(project: &str, probe: &str) -> Result<(), String> {
 /// else: kiln holds it isolated; the project at its host path, inside and out; kiln's MCP from
 /// inside where kiln gives it (`mcp`), and an agent started from there (`child`); no harness in the
 /// session's process trees on the host at any look; a Linux kernel of its own; every link's suite at
-/// both ends.
+/// both ends. A vendor's own CLI runs only with ROOT's task ([`untasked`]): it skips without it, and
+/// `VM_E2E=1` makes that a failure.
 pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool, child: bool) -> anyhow::Result<()> {
+    if let Some(why) = untasked(kind, image, |v| std::env::var_os(v).is_some()) {
+        anyhow::ensure!(!isolation_required(), "{why} (VM_E2E=1 requires a real task)");
+        eprintln!("{why}");
+        return Ok(());
+    }
     let marker = std::env::var("VM_E2E_DONE_MARKER").unwrap_or_else(|_| STUB_DONE.to_owned());
     let probe = probe_name();
     let prompt = task("VM_E2E_PROMPT", kind, &probe, stub_prompt(kind, mcp, child, &probe));

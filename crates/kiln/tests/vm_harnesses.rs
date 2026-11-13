@@ -247,6 +247,19 @@ mod checks {
     }
 
     #[test]
+    fn s34_a_vendors_own_cli_takes_roots_task_alone() {
+        // kiln's own image for a harness, none of ROOT's words or one short: it doesn't run, saying
+        // what's missing (dropping the guard sends the stand-in's words to the vendor's model).
+        let none = untasked("codex", "harness-codex", |_| false).unwrap_or_default();
+        assert!(none.starts_with("SKIP:") && TASK_WORDS.iter().all(|v| none.contains(v)), "{none}");
+        let short = untasked("claude", "harness-claude", |v| v != "VM_E2E_STOPPED_PROMPT").unwrap_or_default();
+        assert!(short.ends_with("VM_E2E_STOPPED_PROMPT isn't given"), "{short}");
+        // Every word ROOT's, or an image ROOT names (the stand-in's Agentfile): it runs.
+        assert_eq!(untasked("claude", "harness-claude", |_| true), None);
+        assert_eq!(untasked("codex", "agentfile:01a1d2c1ef09707daafe3fe9b77754e6", |_| false), None);
+    }
+
+    #[test]
     fn s35_an_agent_started_from_inside_is_isolated_and_placed() {
         let directory = json!({"runners": [
             {"name": "vm-mac", "facts": {"virt": {"microvm": true}}},
