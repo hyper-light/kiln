@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { ownAgentAction } from "@/lib/own-agent-action";
-import { ApiError, mailScope, onAuthChange, onMailScopeChange, request, wsUrl } from "@/api/client";
+import { ApiError, identifiedMailScope, mailScope, onAuthChange, onMailScopeChange, request, wsUrl } from "@/api/client";
 import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import { readFrame, unread } from "./frames";
@@ -1523,27 +1523,42 @@ export class SessionStore {
     return true;
   };
 
-  /** Only transaction completion transfers the caller's original into browser custody. */
+  /**
+   * Sends `c`, its original kept in this browser first where the browser can keep it. Keeping it
+   * here is a copy, never a gate (2026-11-13: a browser that couldn't keep one sent nothing, to
+   * any agent): the server's durable waiting holds what's sent, so a sign-in not identified yet is
+   * asked for, and storage that can't take it sends it without this browser's copy.
+   */
   sendMail = async (c: Extract<Command, { type: "send" }>, originals?: Held["originals"]): Promise<boolean> => {
-    const owner = mailScope();
     this.promote();
-    if (this.disposed || !owner) return false;
-    if (!(await useHeld.getState().ready())) {
-      this.patch({ error: useHeld.getState().error });
-      return false;
-    }
-    if (this.disposed || owner !== mailScope()) return false;
-    const previous = this.originals().find((message) => message.id === c.id);
+    if (this.disposed) return false;
+    const owner = await identifiedMailScope();
+    if (this.disposed) return false;
+    const previous = owner ? this.originals().find((message) => message.id === c.id) : undefined;
     if (previous?.custody && JSON.stringify(heldCommand(previous)) !== JSON.stringify(c)) {
       this.patch({ error: "That message identity already belongs to different saved words or files. Keep the original and send the edit as a new message." });
       return false;
     }
     const at = previous?.at ?? Date.now();
-    if (!(await useHeld.getState().hold(this.id, heldFrom(c, at, { custody: "offered", wait: this.mailWake() ?? undefined, publication: previous?.publication, originals })))) {
-      this.patch({ error: useHeld.getState().error });
-      return false;
+    const kept =
+      !!owner &&
+      owner === mailScope() &&
+      (await useHeld.getState().ready()) &&
+      (await useHeld.getState().hold(this.id, heldFrom(c, at, { custody: "offered", wait: this.mailWake() ?? undefined, publication: previous?.publication, originals })));
+    if (this.disposed) return kept;
+    if (!kept) {
+      this.patch({ error: "Sent without this browser's copy: it couldn't keep one." });
+      // Nothing here holds it to offer once the socket opens: the server takes it now and holds it.
+      if (this.ws?.readyState !== WebSocket.OPEN) {
+        try {
+          await harnessApi.command(this.id, c, c.id);
+          return true;
+        } catch (e) {
+          this.patch({ error: e instanceof Error ? e.message : String(e) });
+          return false;
+        }
+      }
     }
-    if (owner !== mailScope() || this.disposed) return true;
     this.track(c);
     if (this.ws?.readyState === WebSocket.OPEN) this.offerMail(c, at);
     else {

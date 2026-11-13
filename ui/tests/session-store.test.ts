@@ -874,7 +874,7 @@ await test("W20: an early committed source receipt binds only the authenticated 
   }
 });
 
-await test("W20: browser storage refusal retains caller ownership and sends no new communication", async () => {
+await test("composer_send: browser storage that refuses still sends the message, once, without this browser's copy", async () => {
   const store = new SessionStore("storage-refused");
   const off = store.subscribe(() => {});
   const ws = Socket.all.at(-1)!;
@@ -882,11 +882,12 @@ await test("W20: browser storage refusal retains caller ownership and sends no n
     mailSnapshot(store, ws);
     await tick();
     storageFails = true;
-    assert.equal(await store.sendMail({ type: "send", id: "not-transferred", text: "still in composer", mode: "queue", attachments: [{ name: "a", mime: "text/plain", data_base64: "YQ==" }] }), false);
-    assert.equal(commands(ws).length, 0);
+    // 2026-11-13: storage that can't take it never stops the send; the server's waiting holds it.
+    assert.equal(await store.sendMail({ type: "send", id: "not-transferred", text: "goes anyway", mode: "queue", attachments: [{ name: "a", mime: "text/plain", data_base64: "YQ==" }] }), true);
+    assert.equal(commands(ws).length, 1);
     storageFails = false;
-    assert.equal(await original(store.id, "not-transferred"), undefined);
-    assert.match(store.get().error ?? "", /original|Nothing new was sent/);
+    assert.equal(await original(store.id, "not-transferred"), undefined, "no browser copy was kept");
+    assert.match(store.get().error ?? "", /without this browser's copy/);
   } finally {
     storageFails = false;
     store.dispose();
