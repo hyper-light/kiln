@@ -3956,7 +3956,11 @@ impl Hub {
         match *update {
             crate::harness::core::Update::MailFlow { event } => {
                 let owner = self.instances.load().owner(&crate::instances::Owned::Agent(session.clone()));
-                if owner == Some(peer) && self.peers.load().contains_key(&peer) && self.harness.runs_on(&session, runner) {
+                // Only a session kiln knows runs there settles its mail: `runs_on` says yes of
+                // one it doesn't know, and each of its reports failed as stale, thousands a
+                // minute (2026-11-13: three live sessions a handover's check had locked out). Its
+                // next Open brings it back, and its journal is replayed then.
+                if owner == Some(peer) && self.peers.load().contains_key(&peer) && self.harness.located_on(&session, runner) {
                     let from = crate::harness::registry::Location::Machine(runner.to_string());
                     if let Err(error) = crate::harness::mail_delivery::flow(self, &session, from, *event).await {
                         tracing::warn!(session = %session, error = %error, "source communication receipt remains unacknowledged");
@@ -4659,6 +4663,14 @@ impl Hub {
         }
         if !jobs.is_empty() {
             self.lost_instances.update(|l| l.insert(peer, (name.to_owned(), Instant::now(), jobs.clone())));
+        }
+        // The process that outranked a drained one is gone (retired: its identity with it, above):
+        // the drained one is the machine's newest now, and takes work again once it connects anew,
+        // where the server says it isn't drained (W05-R04). Left as it was, it refused every run
+        // placed by what it can do until something else made it reconnect.
+        if let Some(p) = self.instances.update(|i| i.undrain_newest(name)) {
+            tracing::info!(agent = name, peer = p, "the runner process that outranked this machine's other one is gone: that one is its newest again and reconnects to take new work");
+            let _ = self.net.command(crate::net::Out::Disconnect { peer: p }).await;
         }
         self.newest_changed(name).await;
     }

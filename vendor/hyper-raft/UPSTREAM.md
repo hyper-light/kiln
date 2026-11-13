@@ -33,6 +33,7 @@ Each change is recorded in `vendor/patches/hyper-raft/`, applied in this order o
 | `crates/hyper-block/Cargo.toml`, `crates/hyper-rt-transport/Cargo.toml` | hyper-rt taken by path from kiln's own runtime (`../../../../crates/kiln-rt`), not from `../hyper-rt` | kiln's runtime is its own copy of hyper-rt (kiln's `crates/kiln-rt/ORIGIN.md`), which kiln's `[patch.crates-io]` gives every crate that names hyper-rt: these two take it by path, which a patch can't reach, and two path packages named `hyper-rt` 0.1.0 can't share a lock file. `crates/hyper-rt` here stays upstream's, and no crate kiln builds takes it (hyper-tls takes it only for its own tests, which kiln doesn't build) | `0002-hyper-rt-from-kiln-s-own-runtime-crates-kiln-rt.patch` |
 | `crates/hyper-rt-transport/src/driver.rs`, `crates/hyper-rt-transport/tests/received.rs` | `Driver::poll_received` and `Driver::received`: `poll_event`'s turn split at its seam, an event the turn's receive half made handed out before the turn's sends, which the caller then makes with `flush` in the same turn (the method's doc says what it owes, and what holding it costs); `poll_event` built from the same pieces (`receive`, the receive half, given the turn's context and whether it's the poll's last, as upstream's turn takes them since `fb74b59`; `turns`, the loop), doing what it did; a test of both | kiln's net thread hands what comes in to its shards before the turn's sends (kiln's goal 10, plan 01a1a87b2dae step 5): `poll_event` sends before it hands out a turn's first event, so each frame waited for the acknowledgements, retransmissions and data its turn sent | `0003-driver-poll-received-a-turn-s-events-before-its-sends.patch` |
 | `crates/hyper-tls/src/conn.rs` | `ConnectionCommon::set_max_fragment_size`: the largest record a connection sends, set as it goes (header and all; `None`, TLS's own), as the configuration's `max_fragment_size` sets it when the connection is made | kiln's browser protocol socket keeps each TLS record at most its chunk, which follows the path's rate (kiln's goal 3, plan 01a1a832eb2f711f9c6f51d88effe89d step 3): the configuration's is fixed when the connection is made, before the server knows the connection carries that socket or what its chunk is, and a 16 KiB record holds an urgent frame 2.6 s at 50 kbit/s | `0004-hyper-tls-a-connection-s-largest-record-set-as-it-goes.patch` |
+| `crates/hyper-transport/src/endpoint.rs` | `Endpoint::negotiated`: the TLS 1.3 suite and key exchange group the connection to a peer negotiated, read from hyper-quic's handshake data | Hex's change (its `vendor/patches/hyper-raft/0002`), which its `hex-quic` calls to assert that every link of the joint kiln, Hex and Shards plan takes `TLS13_AES_256_GCM_SHA384` alone (Ada, 2026-11-11): kiln holds it so Hex builds on kiln's one hyper-raft (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16) | `0005-hyper-transport-says-which-suite-and-group-a-connection.patch` |
 
 The first change is Quiver's and kiln's policy, not hyper-raft's, so it isn't offered upstream: hyper-durable
 calls `RamStore` slates' case (each write complete as it's submitted), and gating it in hyper-raft
@@ -49,6 +50,15 @@ half upstream's new one), where the crate's tests pass with it and its clippy is
 Focal's bus and Mantle hold this revision's driver byte for byte and call `event` and `poll_event`,
 whose turns are the same; only kiln's net thread calls `received`. Quiver records kiln's changes to
 hyper-raft (`scripts/vendor.py check` holds its pins to them), so it takes this one too.
+
+The fifth change is Hex's own, taken as Hex recorded it (2026-11-11): it adds a method and changes no other.
+Hex's other two changes to hyper-transport are not kiln's: one takes hyper-quic without its qlog traces, which
+in kiln's build would turn serde_json's `preserve_order` off for every crate kiln links (hyper-transport's
+dependency is what turns it on now, kiln's own asking hyper-quic without its default features); the other
+grows hyper-transport's spare buffers as they're needed rather than at the start, a change of memory, not of
+what Hex calls. kiln's copy of Hex records kiln's changes (vendor/hex/UPSTREAM.md); the three are for Hex and
+kiln to agree on. Quiver, which records kiln's changes to hyper-raft, takes this one too
+(vendor/quiver/UPSTREAM.md).
 
 An earlier change, IOCP's widened AFD poll issued only once the old one's cancel completes (Jupiter,
 2026-10-24), was a fix of hyper-raft's own: hyper-raft carries it since `53a28a0` (with its test,

@@ -415,27 +415,18 @@ fn antigravity_files_carry_no_signin() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Shards' own check of the Agentfile, where a test names a `shards` (`KILN_TEST_SHARDS`, as
-/// `check`'s tests do): it parses, its names and grants hold, and Shards finds nothing to say. Its
-/// CONNECT joining the harness to another, with no port, grants nothing (default deny): Shards
-/// refuses it at that line.
+/// Shards' own check of the Agentfile, in kiln's process (`check::lint`, kiln plan 01a1cd8e step 16):
+/// it parses, its names and grants hold, and Shards finds nothing to say. Its CONNECT joining the
+/// harness to another, with no port, grants nothing (default deny): Shards refuses it at that line.
 #[test]
 fn antigravity_agentfile_passes_shards_own_check() -> anyhow::Result<()> {
-    let Some(bin) = std::env::var_os("KILN_TEST_SHARDS") else {
-        eprintln!("skipped: KILN_TEST_SHARDS names no shards binary");
-        return Ok(());
-    };
     let text = agy()?.text;
-    crate::rt::block_on(async move {
-        let root = tempfile::tempdir()?;
-        let shards = std::path::Path::new(&bin);
-        let c = super::super::check::run(shards, root.path(), text).await;
-        ensure!(c.checked && c.diagnostics.is_empty(), "{c:?}");
-        let broken = text.replace("CONNECT antigravity WITH antigravity ON provider", "CONNECT antigravity WITH nobody ON provider");
-        let line = broken.lines().position(|l| l.starts_with("CONNECT ")).map(|i| i + 1).ok_or_else(|| anyhow!("the Agentfile has no CONNECT line"))?;
-        ensure!(broken != text, "the Agentfile's CONNECT line isn't the harness's own");
-        let c = super::super::check::run(shards, root.path(), &broken).await;
-        ensure!(c.refusal().is_some_and(|r| r.contains(&format!("line {line}"))), "{c:?}");
-        Ok(())
-    })
+    let c = super::super::check::lint(text);
+    ensure!(c.checked && c.diagnostics.is_empty(), "{c:?}");
+    let broken = text.replace("CONNECT antigravity WITH antigravity ON provider", "CONNECT antigravity WITH nobody ON provider");
+    let line = broken.lines().position(|l| l.starts_with("CONNECT ")).map(|i| i + 1).ok_or_else(|| anyhow!("the Agentfile has no CONNECT line"))?;
+    ensure!(broken != text, "the Agentfile's CONNECT line isn't the harness's own");
+    let c = super::super::check::lint(&broken);
+    ensure!(c.refusal().is_some_and(|r| r.contains(&format!("line {line}"))), "{c:?}");
+    Ok(())
 }

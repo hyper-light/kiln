@@ -1,0 +1,23 @@
+# The way a root node makes a pruned create's mount namespace by default follows this record (decision 6's update,
+# "the faster path is the default"). hex-runtime reads this file at build time (mntns::RECORD); change the record
+# and the default follows, with nothing else to edit.
+#
+# One line per way: the way (copy, empty, tree), then its create p50 through the seam in ms on a Linux 7.1+ bench
+# host of record and the run that measured it, or `unmeasured`. All three measured in one record, the lines stand in
+# the order its reader ranked them (mntns_record.py, the lead's rule of 2026-11-09: by create p50 where a sign test on
+# the rounds below shows a difference at the record's 95%, else by part 19 p99 at the heaviest load, then create p99
+# there), and the default is the first of them the node can take. Otherwise it is the prediction, in order of
+# preference, with its basis.
+#
+# Goal 17's record (mntns-host-20261109T171050Z at 0c29b3ec, adacachy2, Linux 7.3.3; phase B, the three ways alone, 2
+# passes at 6 and 12 busy loops, 299 rounds each): no way's create p50 is below each other's at 95% (copy below tree
+# in 658 of 1,196 rounds, below empty in 604, tree below empty in 533; 627 needed), so the tail ranks them: part 19 p99
+# at 12 loops, best of 2, copy 183 us, empty 243, tree 457 (the other pass: 211, 294, 246). The copy leads, then empty,
+# below tree by p50 at 95% once the copy is placed, then tree.
+copy 0.382 mntns-host-20261109T171050Z 0c29b3ec
+empty 0.380 mntns-host-20261109T171050Z 0c29b3ec
+tree 0.386 mntns-host-20261109T171050Z 0c29b3ec
+prediction: tree copy empty
+# The prediction's basis, which a record with a way unmeasured would fall back to: mount-lock holds a lifecycle, tree 3,
+# copy 5, empty 5 (docs/research/runtime/goal6-mntns.md §4); empty last, since a 7.0 kernel serves it with the copy
+# after a refused clone.

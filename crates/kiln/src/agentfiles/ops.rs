@@ -101,7 +101,7 @@ async fn check(cx: Cx, v: Value) -> Out {
     if let Some(p) = super::text_problem(text) {
         return Err((StatusCode::BAD_REQUEST, p));
     }
-    json_of(&super::check::check(&cx.hub, text).await)
+    json_of(&super::check::check(text).await)
 }
 
 /// The operations, in the order they are listed.
@@ -127,7 +127,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentfiles.create",
-            summary: "Keep an Agentfile of yours: its `name` (an image's: lowercase letters and digits joined by `.`, `_` or `-`; once among yours) and its `text`. Shards checks the text first (its parser, the Agentfile's directives, names and grants, no base pulled): one it refuses isn't kept, and its words say why and where. Answers the Agentfile (version 1) and what Shards said (`check`: its warnings, or `checked: false` and why, where this server has no Shards).",
+            summary: "Keep an Agentfile of yours: its `name` (an image's: lowercase letters and digits joined by `.`, `_` or `-`; once among yours) and its `text`. Shards checks the text first (its parser, the Agentfile's directives, names and grants, no base pulled): one it refuses isn't kept, and its words say why and where. Answers the Agentfile (version 1) and what Shards said (`check`: its warnings, in Shards' words).",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentfilesCreate>(),

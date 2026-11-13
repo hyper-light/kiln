@@ -6111,7 +6111,7 @@ while True:
             until_it("m2 waiting behind m1's turn", 30, || s.core.lock().state.queue.iter().any(|q| q.id == "m2")).await?;
             // The server asks the older process to hand it to the newest (`crate::handovers`): it
             // goes once m1's turn is over.
-            assert!(older.command("h", Command::MoveTo { to: String::new(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true }));
+            assert!(older.command("h", Command::MoveTo { to: String::new(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native: false }));
             // Its package, in pieces, as the server gets them, passed on to the newer process.
             let mut bytes = Vec::new();
             let got = crate::rt::timeout(Duration::from_secs(60), async {

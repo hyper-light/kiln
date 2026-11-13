@@ -251,11 +251,13 @@ A crashed agent is resumed in place (`agents.resume`, `POST /api/harness/session
 page's **Resume**): a fresh harness process on its own machine, under its own id, from the server's
 copy of its conversation, so its plans and goal stack stay its own, and each of its subagents that
 crashed with it is resumed with it, still its child (one that ended or errored stays so). Never
-beside a process of it: only a crashed agent is resumed so, and no runner holds a crashed one. How
-its conversation goes on is its harness's: Claude Code resumes its own transcript; Codex goes on in
-a thread of its conversation's items; ACP agents, Antigravity and the other harnesses kiln keeps no
-record of are given the conversation in words with their first message (`harness/moving.rs`), which
-its timeline says.
+beside a process of it: only a crashed agent is resumed so, and no runner holds a crashed one. Its
+harness's own record of the conversation is on its machine, so every harness goes on in its own
+conversation, by its own id (`moving::Carry::Native`): Claude Code `--resume`, Codex `thread/resume`
+of its thread, Antigravity `--conversation`, Pi `--session-id`, and an ACP agent (Devin, Gemini CLI,
+OpenCode, Goose, Amp, Cursor) `session/load` of its session where it advertises `loadSession`. One
+that doesn't load sessions starts a new one, given the conversation in words with its first
+message, and says so. Its timeline says which.
 
 **Not on Windows yet** (owed, Windows parity: kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, 2026-11-12).
 W20's native hand-over moves a native session between kiln processes with its descriptors passed

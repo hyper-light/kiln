@@ -5,14 +5,17 @@ same bytes read back, and a transfer is a stream written while its echo is read.
 comes back is checked against what was written: a lane that returns other bytes is `corrupt`, a
 forbidden effect, never a sample.
 
-One event loop (selectors over non-blocking pipes) serves every VM's lane at once, so the host's
-round trips are taken concurrently, one outstanding per VM, as a fleet of controllers would, with
-no thread handoff inside a timed span. A lane's read end stays watched while it is open, so its
-end (the client's exit) is an event, not a probe. The loop's own cost is measured beside the VMs'
-as the floor: the same operations on a local `cat` process through the same loop.
+On Linux and macOS one event loop (selectors over non-blocking pipes, `Selected`) serves every
+VM's lane at once, so the host's round trips are taken concurrently, one outstanding per VM, as a
+fleet of controllers would, with no thread handoff inside a timed span. A lane's read end stays
+watched while it is open, so its end (the client's exit) is an event, not a probe. The loop's own
+cost is measured beside the VMs' as the floor: the same operations on a local `cat` process
+through the same loop.
 
-Windows: its pipes can't be selected on (selectors waits on sockets alone there), so lanes there
-are owed (README, Owed).
+On Windows select() takes sockets alone (Python's select docs), so each lane's reader and writer
+block in threads of their own (`Threaded`): the reader checks each byte as it comes and times an
+operation where its last byte is read, in that thread, and hands the agent's thread only the
+outcome, so no handoff sits inside a timed span there either. `Lanes` is the host's.
 """
 
 from __future__ import annotations
@@ -20,12 +23,19 @@ from __future__ import annotations
 import array
 import json
 import os
+import queue
 import selectors
 import sys
+import threading
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 Done = Callable[[bool, int, str], None]
+
+# The most one read or write moves: no pipe an unprivileged process makes holds more (pipe(7):
+# /proc/sys/fs/pipe-max-size, 1 MiB by default; 64 KiB on macOS, a few KiB on Windows), so a call
+# never moves less than it could for want of this bound, which only caps the buffer a read takes.
+IO_MOST = 1 << 20
 
 _PATTERNS: Dict[int, bytes] = {}
 _WORD = "I" if array.array("I").itemsize == 4 else "L"
@@ -75,25 +85,48 @@ class Stream:
         self.closer = closer
         self.op: Optional[Op] = None
         self.open = True
-        os.set_blocking(wfd, False)
-        os.set_blocking(rfd, False)
+        # Threaded's: the writer's work.
+        self.jobs: "queue.SimpleQueue[object]" = queue.SimpleQueue()
 
 
-class Lanes:
+class _Lanes:
+    """What both kinds of lanes share: the lanes by name and their operations in flight."""
+
     def __init__(self) -> None:
-        self.sel = selectors.DefaultSelector()
         self.streams: Dict[str, Stream] = {}
 
+    def _start(self, name: str, out: bytes, done: Done) -> Optional[Stream]:
+        s = self.streams.get(name)
+        if s is None or not s.open or s.op is not None:
+            return None
+        s.op = Op(out, done)
+        return s
+
+    def busy(self) -> int:
+        return sum(1 for s in self.streams.values() if s.op is not None)
+
+    def outstanding(self) -> Dict[str, int]:
+        """Each lane's operation in flight, and how long it has been (ns)."""
+        now = time.perf_counter_ns()
+        return {name: now - s.op.began for name, s in sorted(self.streams.items()) if s.op is not None}
+
+
+class Selected(_Lanes):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sel = selectors.DefaultSelector()
+
     def add(self, stream: Stream) -> None:
+        os.set_blocking(stream.wfd, False)
+        os.set_blocking(stream.rfd, False)
         self.streams[stream.name] = stream
         self.sel.register(stream.rfd, selectors.EVENT_READ, stream)
 
     def begin(self, name: str, out: bytes, done: Done) -> bool:
         """Starts writing `out` on lane `name`; False when the lane is gone, closed or busy."""
-        s = self.streams.get(name)
-        if s is None or not s.open or s.op is not None:
+        s = self._start(name, out, done)
+        if s is None:
             return False
-        s.op = Op(out, done)
         self._want_write(s, True)
         return True
 
@@ -125,14 +158,6 @@ class Lanes:
                 self.sel.unregister(s.rfd)
             except (KeyError, ValueError):
                 pass
-
-    def busy(self) -> int:
-        return sum(1 for s in self.streams.values() if s.op is not None)
-
-    def outstanding(self) -> Dict[str, int]:
-        """Each lane's operation in flight, and how long it has been (ns)."""
-        now = time.perf_counter_ns()
-        return {name: now - s.op.began for name, s in sorted(self.streams.items()) if s.op is not None}
 
     def _want_write(self, s: Stream, on: bool) -> None:
         if s.wfd < 0:
@@ -192,7 +217,7 @@ class Lanes:
         if mask & selectors.EVENT_WRITE and key.fd == s.wfd and s.op is not None:
             op = s.op
             try:
-                op.sent += os.write(s.wfd, op.out[op.sent : op.sent + (1 << 20)])
+                op.sent += os.write(s.wfd, op.out[op.sent : op.sent + IO_MOST])
             except BlockingIOError:
                 pass
             except OSError as e:
@@ -205,7 +230,7 @@ class Lanes:
 
     def _read(self, s: Stream) -> None:
         try:
-            chunk = os.read(s.rfd, 1 << 20)
+            chunk = os.read(s.rfd, IO_MOST)
         except BlockingIOError:
             return
         except OSError as e:
@@ -225,3 +250,178 @@ class Lanes:
         if op.got >= len(op.out):
             s.op = None
             op.done(True, time.perf_counter_ns() - op.began, "")
+
+
+# The writer's word that the lane's input ends (CLOSE) or that the lane was dropped (STOP).
+_CLOSE = object()
+_STOP = object()
+
+# What a lane's thread hands the agent's thread: its lane, the operation done (with its time) or
+# None, and the time (ns) or why the lane ended.
+Event = Tuple[Stream, Optional[Op], object]
+
+
+class Threaded(_Lanes):
+    """Windows' lanes: a reader and a writer thread a lane, each blocking on a duplicate of its
+    descriptor that it alone closes, so a descriptor the agent closes and the OS numbers again is
+    never one a lane thread reads or writes. What the threads learn reaches the agent's thread as
+    events (`events`), served by `run` and `poll` as the selector's readiness is; the agent's
+    callbacks run there alone."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: "queue.SimpleQueue[Event]" = queue.SimpleQueue()
+
+    def add(self, stream: Stream) -> None:
+        """Starts the lane's threads. An OSError when the OS gives no descriptor or thread for it:
+        the lane is never served, and what was started for it ends."""
+        rd = os.dup(stream.rfd)
+        try:
+            wd = os.dup(stream.wfd)
+        except OSError:
+            os.close(rd)
+            raise
+        self.streams[stream.name] = stream
+        mine = [wd, rd]
+        try:
+            for role, run, fd in (("w", self._writer, wd), ("r", self._reader, rd)):
+                threading.Thread(target=run, args=(stream, fd), name=f"lane-{stream.name}-{role}", daemon=True).start()
+                mine.remove(fd)
+        except RuntimeError as e:
+            for fd in mine:
+                os.close(fd)
+            self.drop(stream.name)
+            raise OSError(f"no thread for lane {stream.name}: {e}") from e
+
+    def begin(self, name: str, out: bytes, done: Done) -> bool:
+        """Starts writing `out` on lane `name`; False when the lane is gone, closed or busy."""
+        s = self._start(name, out, done)
+        if s is None:
+            return False
+        s.jobs.put(s.op)
+        return True
+
+    def close(self, name: str) -> None:
+        """Ends what we write on `name`: the agent's own end now, the writer's once what it holds
+        is written; then `cat` ends, and its VM's run."""
+        s = self.streams.get(name)
+        if s is None or s.wfd < 0:
+            return
+        try:
+            if s.closer is not None:
+                s.closer()
+            else:
+                os.close(s.wfd)
+        except OSError:
+            pass
+        s.wfd = -1
+        s.jobs.put(_CLOSE)
+
+    def drop(self, name: str) -> None:
+        """Forgets lane `name`: its threads say nothing more and end with their pipes."""
+        s = self.streams.pop(name, None)
+        if s is None:
+            return
+        s.open = False
+        s.jobs.put(_STOP)
+
+    def _writer(self, s: Stream, fd: int) -> None:
+        why: Optional[str] = None
+        try:
+            while True:
+                job = s.jobs.get()
+                if not isinstance(job, Op):
+                    return
+                out = memoryview(job.out)
+                sent = 0
+                while sent < len(out):
+                    try:
+                        sent += os.write(fd, out[sent:])
+                    except OSError as e:
+                        why = f"write: {e}"
+                        return
+        finally:
+            os.close(fd)
+            if why is not None:
+                self.events.put((s, None, why))
+
+    def _reader(self, s: Stream, fd: int) -> None:
+        why: Optional[str] = None
+        try:
+            while why is None:
+                try:
+                    chunk = os.read(fd, IO_MOST)
+                except OSError as e:
+                    why = f"read: {e}"
+                    break
+                now = time.perf_counter_ns()
+                if not chunk:
+                    why = "ended"
+                    break
+                op = s.op
+                if op is None:
+                    why = f"corrupt: {len(chunk)} bytes came back with nothing written"
+                elif chunk != op.out[op.got : op.got + len(chunk)]:
+                    why = f"corrupt: {len(chunk)} bytes at offset {op.got} differ from what was written"
+                else:
+                    op.got += len(chunk)
+                    if op.got >= len(op.out):
+                        # Bytes past it before the agent's thread hears of it differ from the
+                        # empty rest of `out`: corrupt, as with nothing written.
+                        self.events.put((s, op, now - op.began))
+        finally:
+            os.close(fd)
+            if why is not None:
+                self.events.put((s, None, why))
+
+    def _serve(self, event: Event) -> None:
+        s, op, what = event
+        # A dropped lane's late word reaches no one: its ask is over.
+        if self.streams.get(s.name) is not s:
+            return
+        if op is not None:
+            if s.op is op:
+                s.op = None
+                op.done(True, int(what), "")  # type: ignore[call-overload]
+            return
+        if not s.open:
+            return
+        s.open = False
+        s.jobs.put(_STOP)
+        op, s.op = s.op, None
+        if op is not None:
+            op.done(False, time.perf_counter_ns() - op.began, str(what))
+        s.ended(str(what))
+
+    def run(self, until: Callable[[], bool], deadline_ns: Optional[int]) -> bool:
+        """Serves every lane until `until()` holds (True), or the monotonic deadline passes or no
+        event can come (False, unless `until()` holds then)."""
+        while not until():
+            timeout = None
+            if deadline_ns is not None:
+                left = deadline_ns - time.monotonic_ns()
+                if left <= 0:
+                    return until()
+                timeout = left / 1e9
+            if not self.streams and self.events.empty():
+                # No lane to serve: nothing can make `until` hold but time, so wait it out.
+                if timeout is not None:
+                    time.sleep(timeout)
+                return until()
+            try:
+                self._serve(self.events.get(timeout=timeout))
+            except queue.Empty:
+                continue
+        return True
+
+    def poll(self) -> None:
+        """Serves what has come, without waiting."""
+        while True:
+            try:
+                event = self.events.get_nowait()
+            except queue.Empty:
+                return
+            self._serve(event)
+
+
+Lanes = Threaded if sys.platform == "win32" else Selected

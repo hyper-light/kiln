@@ -78,7 +78,13 @@ kind?: string, model?: string,
  * this one's place (a take-over, `harness::handover`). Same disk, same home: nothing of
  * its folder or its harness's record travels, and it goes by way of the server.
  */
-local?: boolean, } | { "type": "moving", text: string, } | { "type": "handed_over", error?: string, unsure?: boolean, by_newest?: boolean, 
+local?: boolean, 
+/**
+ * With `local`: the newer process reads a package that goes on natively from the harness's
+ * own record here (`proto::feature::NATIVE_RESUME`), so an ACP agent or Antigravity goes on
+ * in its own conversation; else (an older build, a rollback) its conversation goes in words.
+ */
+native?: boolean, } | { "type": "moving", text: string, } | { "type": "handed_over", error?: string, unsure?: boolean, by_newest?: boolean, 
 /**
  * With an `error`: no newer process of the machine runs to take it, so the process takes
  * the try back unless one took it before, as on a refusal (CP-T3.2, `super::handing`).

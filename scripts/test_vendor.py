@@ -433,6 +433,48 @@ class Pins(VendorTestCase):
         code, err = lab.vendor("demo", c, "--no-gate")
         self.assertEqual(code, 0, err)
 
+    def test_a_product_whose_manifest_kiln_holds_is_held_to_kilns_pins_by_a_recorded_change(self) -> None:
+        """As Hex at Shards and hyper-raft revisions older than kiln's: kiln's copy holds the product's
+        manifest, its first take is written with the pins that disagree said, and the change that moves
+        them to kiln's, recorded, is what the check and the next re-vendor read."""
+        lab = self.lab
+        theirs, ours = "a" * 40, "b" * 40
+        c = self.product_pinning(theirs)
+        lab.manifest(c, extra=self.kiln_vendors_other(ours), take='["src", "LICENSE", "vendor/MANIFEST.toml"]')
+        code, err = lab.vendor("demo", c, "--no-gate")
+        self.assertEqual(code, 1, err)
+        self.assertIn(f"takes other at {theirs}; kiln takes other at {ours}", err)
+        self.assertIn("move them to kiln's there, and record it", err)
+        held = lab.kiln / "vendor/demo/vendor/MANIFEST.toml"
+        self.assertTrue(held.is_file())
+        self.assertFalse((lab.kiln / "vendor/demo/vendor/other").exists())
+        code, err = lab.vendor("check", "demo")
+        self.assertEqual(code, 1, err)
+        held.write_text(held.read_text().replace(theirs, ours))
+        code, err = lab.vendor("record", "demo", "other at kiln's revision", "--why", "kiln holds one copy of other")
+        self.assertEqual(code, 0, err)
+        write(lab.kiln, {"vendor/demo/UPSTREAM.md": "| vendor/MANIFEST.toml | other at kiln's | one copy | 0001-other-at-kiln-s-revision.patch |\n"})
+        code, err = lab.vendor("check", "demo")
+        self.assertEqual(code, 0, err)
+        # A re-vendor carries the change, and the pins it leaves agree.
+        code, err = lab.vendor("demo", c, "--no-gate")
+        self.assertEqual(code, 0, err)
+
+    def test_a_product_whose_records_kiln_holds_is_held_to_kilns_records_of_the_shared_project(self) -> None:
+        lab = self.lab
+        pin = "a" * 40
+        c = self.product_pinning(pin, change=b"Subject: x\nWhy: y\n\ndiff --git a/x b/x\n")
+        lab.manifest(c, extra=self.kiln_vendors_other(pin), take='["src", "LICENSE", "vendor/MANIFEST.toml", "vendor/patches"]')
+        code, err = lab.vendor("demo", c, "--no-gate")
+        self.assertEqual(code, 1, err)
+        self.assertIn("records other changes to other than kiln does (0001-x.patch)", err)
+        (lab.kiln / "vendor/demo/vendor/patches/other/0001-x.patch").unlink()
+        code, err = lab.vendor("record", "demo", "kiln's records of other", "--why", "kiln records no change to other")
+        self.assertEqual(code, 0, err)
+        write(lab.kiln, {"vendor/demo/UPSTREAM.md": "| vendor/patches/other | kiln's | one record | 0001-kiln-s-records-of-other.patch |\n"})
+        code, err = lab.vendor("check", "demo")
+        self.assertEqual(code, 0, err)
+
     def test_kilns_copy_of_a_product_must_leave_its_copy_of_a_shared_project_out(self) -> None:
         lab = self.lab
         pin = "a" * 40

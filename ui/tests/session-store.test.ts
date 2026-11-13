@@ -79,7 +79,7 @@ IDBDatabase.prototype.transaction = function (...args) {
 const { setMailScope } = await import("../src/api/client.ts");
 setMailScope("test-mail-scope");
 const { SessionStore } = await import("../src/api/harness.ts");
-const { readHeld } = await import("../src/api/held.ts");
+const { flushHeld, readHeld, useHeld } = await import("../src/api/held.ts");
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 const event = (seq: number) => ({ id: `e${seq}`, seq, at: seq, kind: "assistant", text: "text" });
 const state = { status: "running", tasks: [], delivery: {}, dropped: 0 };
@@ -723,12 +723,8 @@ const mailSnapshot = (store: InstanceType<typeof SessionStore>, ws: Socket, gene
 };
 const commands = (ws: Socket) => ws.sent.map((wire) => JSON.parse(wire)).filter((wire) => wire.t === "cmd" && wire.c?.type === "send");
 const original = async (agent: string, id: string) => (await readHeld())[agent]?.find((message) => message.id === id);
-const completed = async (condition: () => boolean) => {
-  for (let turn = 0; turn < 100 && !condition(); turn += 1) await tick();
-  assert.ok(condition(), "the queued transaction/event completed");
-};
 
-await test("W20: a retained pending receipt preserves full originals across store retirement and only source admission settles them", async () => {
+await test("composer_send: the server's receipt lets this browser's copy go, and a reload offers nothing it already holds", async () => {
   const store = new SessionStore("durable-original");
   const off = store.subscribe(() => {});
   const ws = Socket.all.at(-1)!;
@@ -739,36 +735,22 @@ await test("W20: a retained pending receipt preserves full originals across stor
     mailSnapshot(store, ws);
     await tick();
     assert.equal(await store.sendMail(c), true);
+    await flushHeld();
+    assert.deepEqual((await original(store.id, c.id))?.attachments, c.attachments, "until the server takes it, this browser keeps its copy");
     ws.frame({ t: "ack", id: c.id, outcome: "pending", publication: receipt });
     await tick();
-    assert.equal(store.get().outgoing[0]?.state, "retained");
-    assert.deepEqual((await original(store.id, c.id))?.attachments, c.attachments, "inline bytes survive Pending and local serialization");
+    assert.equal(store.get().outgoing[0]?.state, "retained", "shown as held by Kiln");
+    await flushHeld();
+    assert.equal(await original(store.id, c.id), undefined, "the server's receipt lets this browser's copy go");
     store.dispose();
     const resumed = new SessionStore(store.id);
     const stop = resumed.subscribe(() => {});
     const next = Socket.all.at(-1)!;
     try {
-      await completed(() => resumed.get().outgoing[0]?.state === "retained");
-      assert.equal(resumed.get().outgoing[0]?.state, "retained");
       mailSnapshot(resumed, next);
-      await completed(() => commands(next).length > 0);
-      assert.deepEqual(
-        commands(next).map((wire) => wire.c),
-        [c],
-        "a reconnect reconciles the same ID/body/files",
-      );
-      next.frame({
-        t: "mail_flow",
-        event: { event: "accepted", token: { revision: 401, generation: 1 }, epoch: 0, capacity: capacity(2) },
-        publication: { ...receipt, generation: 1, disposition: "admitted" },
-        mail_scope: "test-mail-scope",
-      });
       await tick();
-      assert.equal(await original(store.id, c.id), undefined, "only a positive current-source receipt releases browser body custody");
-      assert.equal(resumed.get().outgoing[0]?.state, "sent");
-      next.frame({ t: "ack", id: c.id, outcome: "pending", publication: receipt });
       await tick();
-      assert.equal(resumed.get().outgoing[0]?.state, "sent", "a delayed publisher Pending cannot regress source admission");
+      assert.equal(commands(next).length, 0, "what the server holds isn't offered again from here");
     } finally {
       resumed.dispose();
       stop();
@@ -874,7 +856,7 @@ await test("W20: an early committed source receipt binds only the authenticated 
   }
 });
 
-await test("W20: browser storage refusal retains caller ownership and sends no new communication", async () => {
+await test("composer_send: browser storage that refuses still sends the message, once, and keeps its copy in memory", async () => {
   const store = new SessionStore("storage-refused");
   const off = store.subscribe(() => {});
   const ws = Socket.all.at(-1)!;
@@ -882,11 +864,14 @@ await test("W20: browser storage refusal retains caller ownership and sends no n
     mailSnapshot(store, ws);
     await tick();
     storageFails = true;
-    assert.equal(await store.sendMail({ type: "send", id: "not-transferred", text: "still in composer", mode: "queue", attachments: [{ name: "a", mime: "text/plain", data_base64: "YQ==" }] }), false);
-    assert.equal(commands(ws).length, 0);
+    // 2026-11-13: storage that can't take it never stops the send; the server's waiting holds it.
+    assert.equal(await store.sendMail({ type: "send", id: "not-transferred", text: "goes anyway", mode: "queue", attachments: [{ name: "a", mime: "text/plain", data_base64: "YQ==" }] }), true);
+    assert.equal(commands(ws).length, 1, "it went on the socket at once");
+    await flushHeld();
     storageFails = false;
-    assert.equal(await original(store.id, "not-transferred"), undefined);
-    assert.match(store.get().error ?? "", /original|Nothing new was sent/);
+    assert.equal(await original(store.id, "not-transferred"), undefined, "IndexedDB has no copy");
+    assert.equal(useHeld.getState().held[store.id]?.find((m) => m.id === "not-transferred")?.text, "goes anyway", "this page's memory still has it");
+    assert.match(useHeld.getState().error ?? "", /couldn't keep a copy/);
   } finally {
     storageFails = false;
     store.dispose();
