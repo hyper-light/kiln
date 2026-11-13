@@ -13,4 +13,10 @@ kind: string,
 /**
  * The image it boots, once chosen (step 31's choice per harness and project).
  */
-image?: string, };
+image?: string, 
+/**
+ * The person whose volume its harness's configuration is on (`owner`, `user:<id>`; kiln plan
+ * step 18, `harness::isolated::home`): whom it acts for, set by kiln from who started it (its
+ * parent's, for an isolated agent's agents), never from what was asked.
+ */
+person?: string, };

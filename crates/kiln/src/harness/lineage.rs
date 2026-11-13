@@ -1247,6 +1247,15 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         }
     };
     let target = placed.first().map_or_else(|| "local".to_owned(), |(t, _)| t.clone());
+    // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
+    // person they act for's.
+    let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
+    // An isolated one's harness configuration is on its person's volume (step 18): theirs, as kiln
+    // knows who asked, else its parent's.
+    let isolation = isolation.map(|mut i| {
+        i.person = person.clone().or(i.person.take());
+        i
+    });
     // Its folder: the one asked for, else its parent's where they share a machine, else home.
     let cwd = ask.cwd.clone().filter(|c| !c.trim().is_empty()).or_else(|| by.parent.as_ref().filter(|p| placed.iter().all(|(t, _)| same_machine(p, t))).map(|p| p.cwd.clone()).filter(|c| !c.is_empty()));
     let mut spec = Spec {
@@ -1287,9 +1296,6 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         }
         at += n;
     }
-    // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
-    // person they act for's.
-    let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
     for i in &infos {
         if let Some(o) = &by.opener {
             let _ = hub.store.kv_set(crate::mcp::opener_key(&i.id), o.clone()).await;

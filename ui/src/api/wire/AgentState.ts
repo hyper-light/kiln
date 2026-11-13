@@ -23,6 +23,7 @@ import type { StatusItem } from "./StatusItem";
 import type { Switching } from "./Switching";
 import type { Task } from "./Task";
 import type { Todo } from "./Todo";
+import type { Trouble } from "./Trouble";
 import type { TurnEnd } from "./TurnEnd";
 import type { Usage } from "./Usage";
 import type { JsonValue } from "./serde_json/JsonValue";
@@ -194,6 +195,12 @@ switching?: Switching,
  * the queue.
  */
 pause?: Pause, 
+/**
+ * What keeps its harness from its provider, as its harness's own stream says it: a credential
+ * refused, or a provider it can't reach (`harness::trouble`). Said at its harness's first
+ * retry, not once it gives up, and standing until its model answers again.
+ */
+trouble?: Trouble, 
 /**
  * Since when (Unix ms) it waits for room on its machine to go to work: as many of its agents
  * are at work as its limit lets be (`harness::limit`). What it was sent waits in its queue

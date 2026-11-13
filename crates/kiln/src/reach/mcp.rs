@@ -42,7 +42,7 @@ const CODE_OUTPUT_MAX: usize = 1_000_000;
 const WAIT_DEFAULT_S: u64 = 600;
 /// A program runs this long by default, and at most `CODE_WALL_MAX`.
 const CODE_WALL_DEFAULT: Duration = Duration::from_secs(600);
-const CODE_WALL_MAX: Duration = Duration::from_secs(3600);
+pub(crate) const CODE_WALL_MAX: Duration = Duration::from_secs(3600);
 /// kiln's operations, as the server lists them, are asked for again after this.
 const REGISTRY_TTL: Duration = Duration::from_secs(60);
 /// Word of what it couldn't read on its way to the server at once, at most.

@@ -1658,6 +1658,12 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub pause: Option<Pause>,
+    /// What keeps its harness from its provider, as its harness's own stream says it: a credential
+    /// refused, or a provider it can't reach (`harness::trouble`). Said at its harness's first
+    /// retry, not once it gives up, and standing until its model answers again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub trouble: Option<super::trouble::Trouble>,
     /// Since when (Unix ms) it waits for room on its machine to go to work: as many of its agents
     /// are at work as its limit lets be (`harness::limit`). What it was sent waits in its queue
     /// meanwhile, and goes once there's room, the longest waiting first.
