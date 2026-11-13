@@ -155,6 +155,11 @@ impl Default for Shares {
 /// The server's.
 static SHARES: Shares = Shares::new();
 
+/// The server's shares themselves: what each source host's input follows ([`Shares::follow_input`]).
+pub fn server() -> &'static Shares {
+    &SHARES
+}
+
 /// The server's share now ([`Shares::share`]).
 pub fn share() -> usize {
     SHARES.share()
@@ -168,10 +173,6 @@ pub fn runners(n: usize) -> usize {
 /// One of the server's queues sized by its share ([`Shares::follow`]).
 pub fn follow(room: &Arc<Room>) {
     SHARES.follow(room);
-}
-
-pub fn follow_input<T: ShareFollower + 'static>(input: &Arc<T>) {
-    SHARES.follow_input(input);
 }
 
 /// The server's share measured again ([`Shares::measure`]): the kernel said memory is short.
