@@ -18,9 +18,10 @@
 //! It costs microseconds. On Linux a read is a handful of small procfs/sysfs files, each read
 //! into a stack buffer no bigger than the lines it needs (the first line of `/proc/stat`, the
 //! first lines of `/proc/meminfo`, the three pressure files and the runner's own cgroup's), one
-//! `statvfs`, and the work volume's device counters (one line of `/proc/diskstats`). macOS: two
-//! Mach calls, one `statfs`, one `sysctl`, one Core Foundation property and the device's IOKit
-//! `Statistics`. Windows: `GetSystemTimes`, `GlobalMemoryStatusEx`, `GetDiskFreeSpaceExW` and one
+//! `statvfs`, and the work volume's device counters (one line of `/proc/diskstats`). macOS: three
+//! Mach calls (each CPU's ticks, their answer's memory given back, and the host's pages), one
+//! `statfs`, one `sysctl`, one Core Foundation property and the device's IOKit `Statistics`.
+//! Windows: `GetSystemTimes`, `GlobalMemoryStatusEx`, `GetDiskFreeSpaceExW` and one
 //! `IOCTL_DISK_PERFORMANCE`. No process is enumerated, nothing is started.
 //!
 //! The per-OS reads are in `crate::os::sense`; this module turns two of them into a [`Measure`]

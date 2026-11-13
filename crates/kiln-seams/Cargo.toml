@@ -14,6 +14,9 @@ hex = "0.4.3"
 # A machine's capacity keeper (`capacity`): Hex's words, its keeper over records in memory and its own
 # keeper suite, vendored at vendor/hex (kiln's [patch.crates-io] names the copy).
 hex-api = "=0.1.0"
+# What each end of a link negotiated (`sandbox::Link`): kiln-ci's `facts::Negotiated`, kiln's one type for
+# it, which runners' facts carry too (kiln-ci depends on no other crate of kiln's).
+kiln-ci = { path = "../kiln-ci" }
 parking_lot = "0.12.5"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 regex = "1.13.1"

@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use super::common;
 
 /// The one TLS 1.3 suite every control link negotiates (kiln plan step 3; the plan's "every link uses
-/// TLS13_AES_256_GCM_SHA384 only"), as rustls names it (`reach::e2e`'s `Negotiated::suite`). QUIC's
+/// TLS13_AES_256_GCM_SHA384 only"), as rustls names it (`kiln_ci::facts::Negotiated::suite`). QUIC's
 /// Initial packets stay AES-128-GCM under keys derived from the connection id (RFC 9001 §5): they carry
 /// no application data and are no link's negotiated suite.
 pub const REQUIRED_SUITE: &str = "TLS13_AES_256_GCM_SHA384";

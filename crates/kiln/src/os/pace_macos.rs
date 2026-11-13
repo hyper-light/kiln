@@ -8,7 +8,7 @@
 //! - the run queue: the 1-minute load average (`vm.loadavg`, the scheduler's exponentially decayed
 //!   count of runnable threads);
 //! - swap: `vm.swapusage` and `host_statistics64`'s `HOST_VM_INFO64` `swapins` (pages swapped in
-//!   from the compressor's swap files);
+//!   from the compressor's swap files), read with the host's pages ([`kiln_ci::facts::VmPages`]);
 //! - the battery: IOKit's power sources (`IOPSCopyPowerSourcesInfo`: the internal battery's `Power
 //!   Source State` and capacity);
 //! - the work device's counters ([`crate::os::sense_disk_macos`]).
@@ -35,42 +35,6 @@ const POWER: &CStr = c"com.apple.system.powersources.source";
 /// changes", and as the source does: the battery's charge as it moves.
 const REMAINING: &CStr = c"com.apple.system.powersources.timeremaining";
 
-type MachPort = u32;
-
-/// `vm_statistics64` (`mach/vm_statistics.h`), 38 `integer_t`s.
-#[repr(C)]
-#[derive(Default)]
-struct VmStatistics64 {
-    free_count: u32,
-    active_count: u32,
-    inactive_count: u32,
-    wire_count: u32,
-    zero_fill_count: u64,
-    reactivations: u64,
-    pageins: u64,
-    pageouts: u64,
-    faults: u64,
-    cow_faults: u64,
-    lookups: u64,
-    hits: u64,
-    purges: u64,
-    purgeable_count: u32,
-    speculative_count: u32,
-    decompressions: u64,
-    compressions: u64,
-    swapins: u64,
-    swapouts: u64,
-    compressor_page_count: u32,
-    throttled_count: u32,
-    external_page_count: u32,
-    internal_page_count: u32,
-    total_uncompressed_pages_in_compressor: u64,
-}
-
-const _: () = assert!(std::mem::size_of::<VmStatistics64>() == 152);
-/// `HOST_VM_INFO64` (`mach/host_info.h`).
-const HOST_VM_INFO64: i32 = 4;
-
 /// `struct xsw_usage` (`sys/sysctl.h`).
 #[repr(C)]
 #[derive(Default)]
@@ -91,10 +55,6 @@ struct LoadAvg {
 }
 
 unsafe extern "C" {
-    fn mach_host_self() -> MachPort;
-    fn host_statistics64(host: MachPort, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
-    fn mach_port_deallocate(task: MachPort, name: MachPort) -> i32;
-    static mach_task_self_: MachPort;
     fn notify_register_check(name: *const c_char, out_token: *mut c_int) -> u32;
     fn notify_register_file_descriptor(name: *const c_char, notify_fd: *mut c_int, flags: c_int, out_token: *mut c_int) -> u32;
     fn notify_get_state(token: c_int, state: *mut u64) -> u32;
@@ -122,16 +82,10 @@ fn sysctl<T: Default>(name: &CStr) -> Option<T> {
     (rc == 0 && len == std::mem::size_of::<T>()).then_some(v)
 }
 
+/// Pages swapped in so far, from the one reading of the host's VM statistics
+/// ([`kiln_ci::facts::VmPages`], [`crate::os::sense::memory_pages`]).
 fn swapins() -> Option<u64> {
-    // SAFETY: Mach calls with a buffer of the size they're told; the host port given back.
-    unsafe {
-        let host = mach_host_self();
-        let mut v = VmStatistics64::default();
-        let mut count = u32::try_from(std::mem::size_of::<VmStatistics64>() / std::mem::size_of::<i32>()).unwrap_or(0);
-        let rc = host_statistics64(host, HOST_VM_INFO64, (&raw mut v).cast(), &raw mut count);
-        mach_port_deallocate(mach_task_self_, host);
-        (rc == 0).then_some(v.swapins)
-    }
+    crate::os::sense::memory_pages().map(|(pages, _)| pages.swapins)
 }
 
 /// The internal battery: on battery or not, and how full; none without one.

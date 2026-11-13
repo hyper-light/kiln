@@ -76,8 +76,11 @@ pub struct RunnerFacts {
     pub link: Option<Negotiated>,
 }
 
-/// What one end of a TLS 1.3 connection negotiated, as rustls names its cipher suite and key exchange group
-/// (`TLS13_AES_256_GCM_SHA384`, `secp384r1MLKEM1024`): a link's `secured`, as kiln's reach says its links'.
+/// What one end of a TLS 1.3 connection negotiated: its cipher suite and key exchange group, as rustls
+/// names them (`TLS13_AES_256_GCM_SHA384`, `secp384r1MLKEM1024`), or by their IANA code where rustls names
+/// none (`0x1303`). kiln's one type for it: a runner's link to the server (`RunnerFacts::link`), a reach
+/// link's `secured`, and both ends of the link a sandboxed run's stdio rides (`kiln_seams::sandbox::Link`,
+/// a session's `AgentLink`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -330,6 +333,9 @@ pub struct VmPages {
     /// `compressor_page_count`: the pages holding what the compressor pressed small, memory in use
     /// that didn't fit.
     pub compressor: u64,
+    /// `swapins`: pages swapped in from the compressor's swap files since the host started, what its
+    /// pace reads its swap-ins a second from (docs/needs.md, "Swap").
+    pub swapins: u64,
 }
 
 impl VmPages {
@@ -460,22 +466,22 @@ mod tests {
         // A 64 GiB Mac at 06:40:14Z, nine compilers at once: 61,999 of 62,464 MiB of swap in use,
         // load 91. Its runner read 25 GB free (its free, active and inactive pages), and work was
         // placed on it. Its speculative pages weren't kept: `free` is "Pages free" alone.
-        let swapping = VmPages { free: 3_805, active: 769_543, inactive: 750_125, compressor: 2_309_113 };
+        let swapping = VmPages { free: 3_805, active: 769_543, inactive: 750_125, compressor: 2_309_113, ..VmPages::default() };
         assert_eq!(swapping.room(page), 3_805 * page, "its compressor holds more pages than are inactive: its free pages alone");
         // A 36 GiB Mac at 07:23:27Z, six kiln compiles at once moved onto it: 22,584 of 23,552 MiB
         // of swap in use, load 23. Its runner said 13 GB free.
-        let crowded = VmPages { free: 3_971 + 31_637, active: 442_304, inactive: 408_933, compressor: 1_287_005 };
+        let crowded = VmPages { free: 3_971 + 31_637, active: 442_304, inactive: 408_933, compressor: 1_287_005, ..VmPages::default() };
         assert_eq!(crowded.room(page), 35_608 * page, "the same: its free pages alone");
         // The same Mac at 06:55:29Z, its builds moved off: 37,347 of 38,912 MiB of swap in use, and
         // the kernel's pressure level 1, normal.
-        let after = VmPages { free: 539_938 + 696_358, active: 1_266_849, inactive: 782_394, compressor: 564_488 };
+        let after = VmPages { free: 539_938 + 696_358, active: 1_266_849, inactive: 782_394, compressor: 564_488, ..VmPages::default() };
         assert_eq!(after.room(page), (1_236_296 + 217_906) * page);
         // A 128 GiB desktop Mac at 06:55:25Z, load 41: 10,745 of 12,288 MiB of swap in use, its
         // pressure level normal.
-        let desktop = VmPages { free: 337_310 + 472_318, active: 2_731_319, inactive: 2_259_298, compressor: 2_028_728 };
+        let desktop = VmPages { free: 337_310 + 472_318, active: 2_731_319, inactive: 2_259_298, compressor: 2_028_728, ..VmPages::default() };
         assert_eq!(desktop.room(page), (809_628 + 230_570) * page);
         // An idle 36 GiB Mac at 06:55:39Z, load 2.4: 1,809 of 3,072 MiB of swap in use.
-        let idle = VmPages { free: 563_065 + 132_218, active: 719_425, inactive: 628_564, compressor: 95_903 };
+        let idle = VmPages { free: 563_065 + 132_218, active: 719_425, inactive: 628_564, compressor: 95_903, ..VmPages::default() };
         assert_eq!(idle.room(page), (695_283 + 532_661) * page);
     }
 }

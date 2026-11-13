@@ -296,13 +296,6 @@ pub struct Tls {
     closed: bool,
 }
 
-/// What a link negotiated, for logs and status.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Negotiated {
-    pub suite: String,
-    pub group: String,
-}
-
 impl Tls {
     /// The side that opens a link: proves `me`, accepts only `peer_fingerprint`.
     pub fn client(me: &Identity, peer_fingerprint: &str) -> anyhow::Result<Self> {
@@ -413,9 +406,10 @@ impl Tls {
         self.closed
     }
 
-    pub fn negotiated(&self) -> Option<Negotiated> {
+    /// What the link negotiated, for logs and status (a link's `secured`), once its handshake has.
+    pub fn negotiated(&self) -> Option<kiln_ci::facts::Negotiated> {
         let (suite, group) = with_conn!(&self.conn, c => (c.negotiated_cipher_suite(), c.negotiated_key_exchange_group()));
-        Some(Negotiated { suite: format!("{:?}", suite?.suite()), group: format!("{:?}", group?.name()) })
+        Some(kiln_ci::facts::Negotiated { suite: format!("{:?}", suite?.suite()), group: format!("{:?}", group?.name()) })
     }
 }
 
