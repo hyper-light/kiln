@@ -5039,7 +5039,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let heard = dir.join("heard.jsonl");
         let fake = dir.join("fake-claude.py");
-        std::fs::write(&fake, r##"import json, os, sys, time, uuid
+        std::fs::write(&fake, r##"import json, math, os, sys, time, uuid
 HEARD = sys.argv[1]
 args = sys.argv[2:]
 def out(o):
@@ -5056,6 +5056,7 @@ while True:
     line = sys.stdin.readline()
     if not line:
         break
+    started = time.monotonic_ns()
     with open(HEARD, "a") as f:
         f.write(json.dumps({"pid": os.getpid(), "line": line.strip()}) + "\n")
     try:
@@ -5075,7 +5076,10 @@ while True:
         if "long" in json.dumps(m.get("message")):
             time.sleep(60)
         out({"type": "assistant", "message": {"id": "msg_%s" % uuid.uuid4(), "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "done"}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}}, "parent_tool_use_id": None, "session_id": session})
-        out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+        # Claude Code's result for a turn that took its message (W20): which message it took, and how long the turn
+        # took, as kiln's consumption reads them (claude.rs `inputs_consumed`).
+        elapsed_ms = math.ceil((time.monotonic_ns() - started) / 1000000)
+        out({"type": "result", "subtype": "success", "terminal_reason": "completed", "is_error": False, "duration_ms": elapsed_ms, "duration_api_ms": elapsed_ms, "num_turns": 1, "user_message_uuid": uid, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
         out({"type": "command_lifecycle", "command_uuid": uid, "state": "completed", "session_id": session})
 "##)?;
         let program = dir.join("claude-stand-in");
